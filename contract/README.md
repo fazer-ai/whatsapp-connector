@@ -58,3 +58,30 @@ theirs, and the connector is always upgraded first.
   client fetches over HTTP; outbound media carries a URL the connector fetches.
 - Errors use the closed `error_code` enum, which maps 1:1 to
   `Whatsapp::Session::Errors::*` on the Ruby side.
+
+## RPC results
+
+The `reply` frame carries `result` as an opaque object: the schema does not describe
+it per command type, because a result is only ever read by the caller of that one
+command. What the two sides agreed on is listed here, and both implementations are
+written against this table.
+
+| Command | `result` |
+|---|---|
+| `session.connect`, `session.status` | `connection_state` (also carries `reachout_time_lock` and `new_chat_cap` when the account has them) |
+| `admin.ping` | `{ "inst": string, "version": string, "sessions": integer }` |
+| `message.send`, `message.edit`, `message.react` | `{ "message_id": string, "timestamp": timestamp_ms, "client_ref": string\|null }` |
+| `message.revoke` | `null` |
+| `message.download_media` | `media_ref` (a `url` kind, valid until `expires_at`) |
+| `contact.check` | array of `{ "phone": digits, "exists": boolean, "address": address\|null }` |
+| `contact.profile_picture` | `{ "url": string\|null }` |
+| `contact.info`, `contact.resolve` | `party` |
+| `group.create`, `group.info` | `group_info` |
+| `group.list` | array of `group_info` |
+| `group.invite.get` | `{ "code": string, "url": string\|null }` |
+| `group.participants.update`, `group.join_requests.update` | array of `{ "address": address, "status": "success"\|"failed", "code": error_code\|null }` |
+| `group.join_requests.list` | array of `{ "party": party, "requested_at": timestamp_ms }` |
+| `group.leave`, `group.name.set`, `group.description.set`, `group.photo.set`, `group.settings.set` | `null` |
+
+A command whose result is `null` still answers `{"ok": true}`: the caller is waiting
+for the confirmation, not for data.
