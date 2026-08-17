@@ -35,6 +35,24 @@ the schema describes the **decoded** frame, where `v`, `epoch`, `seq`, `ts` and
 `seq` is monotonic per `(sid, epoch)` and, together with the per-session shard
 assignment, is what lets the consumer drop out-of-order redeliveries.
 
+Around those four keys sit the ones that decide who reads and who writes. They are not
+frames, but both sides have to agree on them, so they are part of the contract:
+
+| Key | Type | Owner | Meaning |
+|---|---|---|---|
+| `wa:meta` | HASH | connector | `protocol_min`, `protocol_max`, `event_shards`; a connector whose `event_shards` disagrees refuses to start |
+| `wa:instances`, `wa:instance:<inst>` | SET, HASH (PX 15s) | connector | live instances and what they advertise: `version`, `protocol_min`, `protocol_max`, `advertise_url`, `media_token` |
+| `wa:sessions`, `wa:session:<sid>` | SET, HASH | connector | last known state of a session: `state`, `owner`, `epoch`, `phone`, `desired`, `quarantine` |
+| `wa:lease:<sid>`, `wa:lease-epoch:<sid>` | STRING | connector | which instance owns a session, and the epoch it owns it under |
+| `wa:idem:<sid>:<key>` | STRING | connector | command idempotency (`msg:<message_id>` for sends) |
+| `wa:events:<shard>:lease` | STRING (EX 30s) | client | which consumer reads a shard; exactly one at a time, which is what preserves order |
+| `wa:consumer:<cid>` | STRING (EX 15s) | client | consumer heartbeat and the shards it holds |
+| `wa:cursor:<sid>` | STRING | client | last `epoch:seq` the client processed for a session |
+| `wa:dlq:events`, `wa:dlq:commands` | LIST | either | entries that failed after retries, kept for an operator to inspect |
+
+The client reads events with a consumer group named `chatwoot`, created at `0` so that
+whatever the connector published while no client was running is still delivered.
+
 ## Compatibility
 
 `v` is the major version. Additive changes (new event type, new optional field) do
