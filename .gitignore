@@ -1,4 +1,22 @@
+# Build output
 /bin/
+/dist/
+*.test
+*.out
+coverage.txt
+
+# Runtime data (media blobs, sqlite store)
 /data/
 *.db
+*.db-shm
+*.db-wal
+
+# Local env
 .env
+.env.*
+!.env.example
+
+# Editors / OS
+.DS_Store
+.idea/
+*.swp

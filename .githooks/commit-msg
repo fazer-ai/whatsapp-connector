@@ -1,0 +1,30 @@
+#!/bin/sh
+# Conventional Commits, same convention as the other fazer.ai repositories:
+#   type(optional scope)!: subject
+set -e
+
+subject=$(sed -n '1p' "$1")
+
+# Let git's own generated messages through (merges, reverts, fixups).
+case "$subject" in
+  "Merge "*|"Revert "*|"fixup!"*|"squash!"*|"#"*) exit 0 ;;
+esac
+
+types='build|chore|ci|docs|feat|fix|perf|refactor|revert|style|test'
+if ! printf '%s' "$subject" | grep -Eq "^($types)(\([a-z0-9._/-]+\))?!?: .+"; then
+  cat >&2 <<MSG
+Commit message does not follow Conventional Commits:
+
+  $subject
+
+Expected: <type>(<scope>): <subject>
+Types:    $types
+Example:  feat(protocol): add the pairing.passkey_request event
+MSG
+  exit 1
+fi
+
+if [ "${#subject}" -gt 100 ]; then
+  echo "Commit subject is longer than 100 characters." >&2
+  exit 1
+fi

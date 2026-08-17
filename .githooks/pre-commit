@@ -1,0 +1,27 @@
+#!/bin/sh
+# Fast feedback on what is about to be committed. Installed by `make hooks`
+# (git config core.hooksPath .githooks); bypass with `git commit --no-verify`.
+set -e
+
+staged() {
+  git diff --cached --name-only --diff-filter=ACMR -- "$@"
+}
+
+go_files=$(staged '*.go')
+contract_files=$(staged 'contract/*')
+
+if [ -n "$go_files" ]; then
+  unformatted=$(printf '%s\n' "$go_files" | xargs gofmt -l)
+  if [ -n "$unformatted" ]; then
+    echo "gofmt: the following staged files need formatting (run 'make fmt'):" >&2
+    printf '%s\n' "$unformatted" >&2
+    exit 1
+  fi
+  go vet ./... >&2
+fi
+
+# The contract is the source of truth for both sides of the wire: never let it be
+# committed in a state the Go binding disagrees with.
+if [ -n "$go_files" ] || [ -n "$contract_files" ]; then
+  go test ./internal/protocol >&2
+fi
