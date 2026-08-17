@@ -171,6 +171,7 @@ var AllCommandTypes = []CommandType{
 var rpcCommands = map[CommandType]bool{
 	CommandSessionConnect:          true,
 	CommandSessionStatus:           true,
+	CommandSessionUpdate:           true,
 	CommandAdminPing:               true,
 	CommandMessageSend:             true,
 	CommandMessageEdit:             true,

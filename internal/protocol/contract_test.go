@@ -78,6 +78,31 @@ func TestEveryFixtureTypeIsKnown(t *testing.T) {
 	}
 }
 
+// A command fixture carrying reply_to is a golden example of an RPC, so the two ways
+// of saying "this command answers" have to agree. Without this, a fixture can promise a
+// reply for a command no implementation ever replies to, and the caller hangs until its
+// deadline. That is exactly how pairing.request_code shipped wrong.
+func TestReplyToMatchesRPCClassification(t *testing.T) {
+	for name, fixture := range fixtures(t, "command") {
+		frame, ok := fixture.(map[string]any)
+		if !ok {
+			t.Fatalf("command fixture %s is not an object", name)
+		}
+		commandType := protocol.CommandType(frame["type"].(string))
+		_, hasReplyTo := frame["reply_to"]
+		_, hasDeadline := frame["deadline"]
+
+		t.Run(name, func(t *testing.T) {
+			if isRPC := protocol.IsRPC(commandType); hasReplyTo != isRPC {
+				t.Fatalf("fixture has reply_to=%v but IsRPC(%s)=%v", hasReplyTo, commandType, isRPC)
+			}
+			if hasDeadline && !hasReplyTo {
+				t.Fatalf("fixture carries a deadline without a reply_to: nobody would read the expiry")
+			}
+		})
+	}
+}
+
 func TestErrorCodesMatchSchema(t *testing.T) {
 	var document struct {
 		Definitions struct {
