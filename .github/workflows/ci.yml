@@ -54,3 +54,20 @@ jobs:
           path: coverage.txt
           if-no-files-found: error
           retention-days: 7
+
+  image:
+    name: Image builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Built, not pushed: the point is that a change cannot break the release build
+      # without CI saying so on the pull request that made it.
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

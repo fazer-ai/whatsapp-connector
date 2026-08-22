@@ -8,9 +8,9 @@ through [whatsmeow](https://github.com/tulir/whatsmeow), and exchanges canonical
 events and commands with its clients over Redis Streams.
 
 > [!IMPORTANT]
-> **Status: contract and Go binding only.** The service itself lands in milestones
-> M0..M6 (see [Roadmap](#roadmap)). `contract/` is published first because both
-> sides of the wire are written against it.
+> **Status: M0.** The transport, the ownership leases and the service skeleton are
+> here and run against a fake engine; nothing talks to WhatsApp yet. The real engine
+> lands in M1 (see [Roadmap](#roadmap)).
 
 ## Why a separate service
 
@@ -48,12 +48,20 @@ so a client can drop anything it has already seen or that comes from a stale own
 ## Layout
 
 ```
-contract/            protocol v1: JSON Schema + golden fixtures (source of truth)
-internal/protocol/   Go binding for the contract: frames, type catalog, error codes
+contract/                 protocol v1: JSON Schema + golden fixtures (source of truth)
+cmd/connector/            the binary: serve, healthcheck, version
+internal/protocol/        Go binding for the contract: frames, type catalog, error codes
+internal/redisx/          the Redis key layout, and the session to shard mapping
+internal/transport/       publish, read commands, reply — Redis Streams behind an interface
+internal/cluster/         leases, epochs and the instance registry: who owns a session
+internal/session/         one account: the event pump and the per-session command queue
+internal/engine/          the WhatsApp side behind an interface, plus a fake for tests
+internal/observability/   the redacting logger and the metric set
+internal/httpserver/      /healthz, /readyz, /metrics
+internal/app/             configuration and the run loop that ties them together
 ```
 
-The rest of the tree (`cmd/`, `internal/{transport,cluster,session,engine,store,media}`)
-arrives with M0 onward.
+`internal/{store,media}` arrive with M1 and M2.
 
 ## Protocol
 
@@ -74,8 +82,9 @@ map and the compatibility rules. In short:
 ## Development
 
 Requirements: Go (version in `go.mod`) and
-[golangci-lint](https://golangci-lint.run/) v2. Redis and Postgres join once the
-service itself exists.
+[golangci-lint](https://golangci-lint.run/) v2. The tests bring their own Redis
+(`miniredis`), so nothing has to be running to `make check`. Postgres joins with the
+store in M1.
 
 ```bash
 make setup   # git hooks + module download
@@ -86,6 +95,34 @@ make help    # every target
 `make setup` points git at the versioned hooks in `.githooks/`: `pre-commit` refuses
 unformatted Go and runs the contract test, `commit-msg` enforces Conventional
 Commits.
+
+### Running one
+
+```bash
+docker run --rm -p 6379:6379 redis:7-alpine   # in another terminal
+REDIS_URL=redis://127.0.0.1:6379 WAC_ENGINE=fake go run ./cmd/connector serve
+```
+
+`WAC_ENGINE=fake` is the only engine in this build: it pairs instantly, publishes the
+same frames a real session would, and answers the commands the contract's result table
+names. It is what the end-to-end tests run against, and what an operator can point a
+client at to see the whole path work.
+
+### Configuration
+
+| Variable | Default | What it is |
+|---|---|---|
+| `REDIS_URL` | `redis://127.0.0.1:6379` | The Redis shared with the client. Deliberately not `WAC_`-prefixed: both sides read the same variable, so they cannot be pointed at different servers |
+| `REDIS_PASSWORD` | — | Overrides the password in the URL, for deployments that pass the two separately |
+| `WAC_INSTANCE` | the hostname | This instance's id. In a container the hostname is the container id, which is unique per replica |
+| `WAC_REDIS_PREFIX` | `wa:` | Namespaces every key, so one Redis can host two independent fleets |
+| `WAC_EVENT_SHARDS` | `8` | How many event streams the fleet publishes to. Fleet-wide and effectively permanent: an instance that disagrees with what is recorded refuses to start |
+| `WAC_ENGINE` | `fake` | `fake` today; `whatsmeow` from M1 |
+| `WAC_HTTP_ADDR` | `:8080` | Where `/healthz`, `/readyz` and `/metrics` listen |
+| `WAC_ADVERTISE_URL` | derived | How clients reach this instance for media |
+| `WAC_LEASE_TTL` | `30s` | How long a session lease survives without a renewal |
+| `WAC_HEARTBEAT` | `5s` | How often leases are renewed and the instance re-announces |
+| `WAC_LOG_LEVEL` | `info` | zerolog level |
 
 ### Changing the protocol
 
@@ -101,7 +138,7 @@ Commits.
 
 | Milestone | Scope |
 |---|---|
-| **M0** | Skeleton, Redis Streams transport, lease/ownership port, fake engine, health and metrics, Docker image, publish pipeline |
+| **M0** ✅ | Skeleton, Redis Streams transport, lease/ownership port, fake engine, health and metrics, Docker image, publish pipeline |
 | **M1** | whatsmeow engine: QR pairing, session state, logout/ban/outdated handling, own reconnect loop, fenced Postgres store |
 | **M2** | Messages in and out (text, media, location, contact, reaction, edit, revoke, quoted, mentions), receipts, read marks, chat presence, idempotent sends |
 | **M3** | Groups, presence, contacts, calls |

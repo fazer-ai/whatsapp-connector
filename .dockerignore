@@ -1,0 +1,8 @@
+.git
+.github
+.claude
+.githooks
+*.md
+coverage.txt
+bin
+dist

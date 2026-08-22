@@ -1,0 +1,237 @@
+package app
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/rs/zerolog"
+
+	"github.com/fazer-ai/whatsapp-connector/internal/cluster"
+	"github.com/fazer-ai/whatsapp-connector/internal/engine"
+	"github.com/fazer-ai/whatsapp-connector/internal/engine/fake"
+	"github.com/fazer-ai/whatsapp-connector/internal/httpserver"
+	"github.com/fazer-ai/whatsapp-connector/internal/observability"
+	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
+	"github.com/fazer-ai/whatsapp-connector/internal/redisx"
+	"github.com/fazer-ai/whatsapp-connector/internal/session"
+	"github.com/fazer-ai/whatsapp-connector/internal/transport/redisstream"
+)
+
+// Version is the build's version, set by the linker in a release build.
+var Version = "dev"
+
+// ShutdownGrace is how long a stopping instance is given to release its sessions. It
+// is the reason `stop_grace_period` in the compose file is generous: a release is a
+// peer picking the session up in seconds instead of waiting out the lease.
+const ShutdownGrace = 20 * time.Second
+
+// Connector is a running instance.
+type Connector struct {
+	cfg      Config
+	log      zerolog.Logger
+	metrics  *observability.Metrics
+	client   *redisx.Client
+	leases   *cluster.Leases
+	registry *cluster.Registry
+	manager  *session.Manager
+	engine   engine.Engine
+	streams  *redisstream.Streams
+	http     *httpserver.Server
+}
+
+// New builds a connector: it dials Redis, agrees with the fleet on the shard count,
+// and prepares everything without listening or reading yet.
+//
+//nolint:gocritic // zerolog.Logger is designed to be copied; every With() returns one by value
+func New(cfg *Config, log zerolog.Logger) (*Connector, error) {
+	client, err := redisx.New(redisx.Config{
+		URL: cfg.RedisURL, Password: cfg.RedisPass, Prefix: cfg.RedisPrefix, Shards: cfg.EventShards,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := client.Ping(context.Background(), 5*time.Second); err != nil {
+		return nil, err
+	}
+	if err := client.ClaimMeta(context.Background(), redisx.Meta{
+		ProtocolMin: protocol.MinVersion, ProtocolMax: protocol.Version, Shards: cfg.EventShards,
+	}); err != nil {
+		return nil, err
+	}
+
+	waEngine, err := newEngine(cfg.Engine)
+	if err != nil {
+		return nil, err
+	}
+
+	streams, err := redisstream.New(client, redisstream.Options{Instance: cfg.Instance})
+	if err != nil {
+		return nil, err
+	}
+
+	metrics := observability.New()
+	leases := cluster.NewLeases(client, cfg.Instance, cluster.Options{TTL: cfg.LeaseTTL})
+	manager := session.NewManager(&session.ManagerConfig{
+		Instance: cfg.Instance, Engine: waEngine, Leases: leases,
+		Publisher: streams, Replier: streams, NewID: newFrameID, Logger: log,
+	})
+
+	c := &Connector{
+		cfg: *cfg, log: log, metrics: metrics, client: client, leases: leases,
+		registry: cluster.NewRegistry(client, 3*cfg.Heartbeat), manager: manager, engine: waEngine,
+	}
+	c.http = httpserver.New(httpserver.Options{
+		Addr: cfg.HTTPAddr, Health: c, Registry: metrics.Registry,
+		Version: Version, Instance: cfg.Instance,
+	})
+	c.streams = streams
+	return c, nil
+}
+
+// Ready reports whether this instance can serve. Redis is the whole of it: without it
+// the connector can neither publish nor be told anything, and reporting ready would
+// have an orchestrator send it traffic it cannot act on.
+func (c *Connector) Ready(ctx context.Context) error {
+	return c.client.Ping(ctx, 2*time.Second)
+}
+
+// Sessions is how many sessions this instance runs.
+func (c *Connector) Sessions() int { return c.manager.Count() }
+
+// Run serves until the context ends or a signal arrives, then releases the sessions.
+func (c *Connector) Run(ctx context.Context) error {
+	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	httpErr := make(chan error, 1)
+	go func() { httpErr <- c.http.Start() }()
+
+	c.log.Info().
+		Str("addr", c.cfg.HTTPAddr).
+		Str("engine", c.cfg.Engine).
+		Int("shards", c.cfg.EventShards).
+		Msg("connector is up")
+
+	err := c.loop(ctx, httpErr)
+	c.shutdown()
+	return err
+}
+
+// loop is the instance's single scheduler: it reads commands, hands them to the
+// manager, and on every tick renews the leases and says it is alive.
+//
+// Reading and renewing share a goroutine because a read that blocks is bounded by the
+// transport's block interval, which is well under the lease TTL: a separate goroutine
+// would buy nothing and would need the manager's map to be safe for one more writer.
+func (c *Connector) loop(ctx context.Context, httpErr <-chan error) error {
+	heartbeat := time.NewTicker(c.cfg.Heartbeat)
+	defer heartbeat.Stop()
+
+	c.announce(ctx)
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case err := <-httpErr:
+			if err != nil {
+				return fmt.Errorf("app: http server: %w", err)
+			}
+			return nil
+		case <-heartbeat.C:
+			c.manager.RenewAll(ctx)
+			c.announce(ctx)
+			c.metrics.SessionsRunning.Set(float64(c.manager.Count()))
+		default:
+			c.readCommands(ctx)
+		}
+	}
+}
+
+func (c *Connector) readCommands(ctx context.Context) {
+	sids := c.manager.SIDs()
+	deliveries, err := c.streams.Read(ctx, sids)
+	if err != nil {
+		if ctx.Err() == nil {
+			c.log.Error().Err(err).Msg("failed to read commands")
+		}
+		return
+	}
+	for i := range deliveries {
+		c.manager.Dispatch(ctx, &deliveries[i])
+	}
+}
+
+func (c *Connector) announce(ctx context.Context) {
+	err := c.registry.Announce(ctx, &cluster.Presence{
+		Instance: c.cfg.Instance, Version: Version,
+		ProtocolMin: protocol.MinVersion, ProtocolMax: protocol.Version,
+		AdvertiseURL: c.cfg.AdvertiseURL, MediaToken: c.cfg.MediaToken,
+		Sessions: c.manager.Count(),
+	})
+	if err != nil && ctx.Err() == nil {
+		c.log.Warn().Err(err).Msg("failed to announce this instance")
+	}
+}
+
+// shutdown gives the sessions back rather than letting their leases expire, which is
+// the difference between a peer picking them up now and one TTL from now.
+func (c *Connector) shutdown() {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(context.Background()), ShutdownGrace)
+	defer cancel()
+
+	c.manager.StopAll(ctx)
+	if err := c.registry.Withdraw(ctx, c.cfg.Instance); err != nil {
+		c.log.Warn().Err(err).Msg("failed to withdraw this instance")
+	}
+	if err := c.http.Shutdown(ctx); err != nil {
+		c.log.Warn().Err(err).Msg("failed to stop the http server")
+	}
+	if err := c.engine.Close(); err != nil {
+		c.log.Warn().Err(err).Msg("failed to close the engine")
+	}
+	if err := c.client.Close(); err != nil {
+		c.log.Warn().Err(err).Msg("failed to close the redis client")
+	}
+	c.log.Info().Msg("connector is down")
+}
+
+func newEngine(name string) (engine.Engine, error) {
+	switch name {
+	case "fake":
+		return fake.New(), nil
+	case "whatsmeow":
+		// M1 brings it. Refusing is right: starting with the fake engine because the
+		// real one is missing would pair nothing and report every session healthy.
+		return nil, errors.New("app: the whatsmeow engine is not in this build yet")
+	default:
+		return nil, fmt.Errorf("app: unknown engine %q", name)
+	}
+}
+
+// newFrameID mints the id every frame carries. Random rather than sequential: ids from
+// two instances share one stream, and a counter would collide across them.
+func newFrameID() string {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		// crypto/rand failing is the process being unable to do anything safely.
+		panic(fmt.Sprintf("app: read random: %v", err))
+	}
+	return hex.EncodeToString(raw[:])
+}
+
+// Hostname is the default instance name: in a container it is the container id, which
+// is unique per replica and stable for its life.
+func Hostname() string {
+	name, err := os.Hostname()
+	if err != nil {
+		return ""
+	}
+	return name
+}
