@@ -74,6 +74,12 @@ theirs, and the connector is always upgraded first.
   Providers that cannot accept a caller-supplied id use `client_ref` instead.
 - Media bytes never travel in a frame. Inbound media carries a `media_ref` the
   client fetches over HTTP; outbound media carries a URL the connector fetches.
+- An absent field and an explicit `null` mean the same thing to a client, so a field
+  that has to distinguish "there is none" from "this producer does not say" carries
+  its own flag. `group_info.has_picture` is the one such field today: a `picture_url`
+  of `null` cannot tell a group with no photo from a snapshot that does not mention
+  one, and the client needs the difference to clear a photo removed while its session
+  was out of the group. A producer that cannot answer leaves it out.
 - Errors use the closed `error_code` enum, which maps 1:1 to
   `Whatsapp::Session::Errors::*` on the Ruby side.
 
