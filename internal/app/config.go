@@ -1,0 +1,113 @@
+// Package app wires the connector together: configuration, the run loop, and the
+// shutdown that gives sessions back to the fleet instead of letting them expire.
+package app
+
+import (
+	"fmt"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/fazer-ai/whatsapp-connector/internal/redisx"
+)
+
+// Config is the whole configuration, read from the environment.
+//
+// Every name is prefixed `WAC_` except the Redis address, which is deliberately
+// `REDIS_URL`: the connector shares one Redis with its client and reads the same
+// variable the client's compose file already sets, so the two cannot be pointed at
+// different servers by an operator setting only one of them.
+type Config struct {
+	Instance     string
+	RedisURL     string
+	RedisPass    string
+	RedisPrefix  string
+	EventShards  int
+	Engine       string
+	HTTPAddr     string
+	AdvertiseURL string
+	MediaToken   string
+	LogLevel     string
+	LeaseTTL     time.Duration
+	Heartbeat    time.Duration
+}
+
+// DefaultEventShards is how many event streams a fleet publishes to. It is fleet-wide
+// and effectively permanent: changing it re-hashes every session onto a different
+// stream, so an instance that disagrees with what is recorded refuses to start.
+const DefaultEventShards = 8
+
+// LoadConfig reads the environment. It fails on a value it cannot parse rather than
+// falling back to a default, because a misspelled number in a deployment is a bug to
+// see at startup, not a setting silently ignored.
+func LoadConfig(hostname string) (Config, error) {
+	shards, err := envInt("WAC_EVENT_SHARDS", DefaultEventShards)
+	if err != nil {
+		return Config{}, err
+	}
+	leaseTTL, err := envDuration("WAC_LEASE_TTL", 30*time.Second)
+	if err != nil {
+		return Config{}, err
+	}
+	heartbeat, err := envDuration("WAC_HEARTBEAT", 5*time.Second)
+	if err != nil {
+		return Config{}, err
+	}
+
+	cfg := Config{
+		Instance:     envString("WAC_INSTANCE", hostname),
+		RedisURL:     envString("REDIS_URL", ""),
+		RedisPass:    envString("REDIS_PASSWORD", ""),
+		RedisPrefix:  envString("WAC_REDIS_PREFIX", redisx.DefaultPrefix),
+		EventShards:  shards,
+		Engine:       envString("WAC_ENGINE", "fake"),
+		HTTPAddr:     envString("WAC_HTTP_ADDR", ":8080"),
+		AdvertiseURL: envString("WAC_ADVERTISE_URL", ""),
+		MediaToken:   envString("WAC_MEDIA_TOKEN", ""),
+		LogLevel:     envString("WAC_LOG_LEVEL", "info"),
+		LeaseTTL:     leaseTTL,
+		Heartbeat:    heartbeat,
+	}
+	if cfg.Instance == "" {
+		return Config{}, fmt.Errorf("app: WAC_INSTANCE is empty and the hostname is unknown")
+	}
+	if cfg.EventShards <= 0 {
+		return Config{}, fmt.Errorf("app: WAC_EVENT_SHARDS must be positive, got %d", cfg.EventShards)
+	}
+	if cfg.AdvertiseURL == "" {
+		cfg.AdvertiseURL = "http://" + cfg.Instance + strings.TrimPrefix(cfg.HTTPAddr, "0.0.0.0")
+	}
+	return cfg, nil
+}
+
+func envString(name, fallback string) string {
+	if value, ok := os.LookupEnv(name); ok && value != "" {
+		return value
+	}
+	return fallback
+}
+
+func envInt(name string, fallback int) (int, error) {
+	raw, ok := os.LookupEnv(name)
+	if !ok || raw == "" {
+		return fallback, nil
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("app: %s is not a number: %q", name, raw)
+	}
+	return value, nil
+}
+
+func envDuration(name string, fallback time.Duration) (time.Duration, error) {
+	raw, ok := os.LookupEnv(name)
+	if !ok || raw == "" {
+		return fallback, nil
+	}
+	value, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("app: %s is not a duration: %q", name, raw)
+	}
+	return value, nil
+}
