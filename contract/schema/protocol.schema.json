@@ -233,7 +233,7 @@
         "from_me": { "type": "boolean" },
         "timestamp": { "$ref": "#/definitions/timestamp_ms" },
         "content": { "$ref": "#/definitions/content" },
-        "quoted_id": { "type": ["string", "null"] },
+        "quoted_id": { "anyOf": [{ "$ref": "#/definitions/message_id" }, { "type": "null" }] },
         "mentions": { "type": "array", "items": { "$ref": "#/definitions/address" } },
         "referral": { "type": ["object", "null"], "description": "Click-to-WhatsApp ad context" },
         "entry_point": { "type": ["object", "null"] },
@@ -550,7 +550,7 @@
       "properties": {
         "command_id": { "type": "string" },
         "command_type": { "type": "string" },
-        "message_id": { "type": ["string", "null"] },
+        "message_id": { "anyOf": [{ "$ref": "#/definitions/message_id" }, { "type": "null" }] },
         "error": { "$ref": "#/definitions/error" }
       },
       "required": ["command_type", "error"],
@@ -859,7 +859,7 @@
       "type": "object",
       "properties": {
         "chat": { "$ref": "#/definitions/address" },
-        "last_message_id": { "type": ["string", "null"] },
+        "last_message_id": { "anyOf": [{ "$ref": "#/definitions/message_id" }, { "type": "null" }] },
         "from_me": { "type": "boolean" }
       },
       "required": ["chat"],
@@ -868,7 +868,7 @@
     "history_anchor": {
       "type": "object",
       "properties": {
-        "id": { "type": "string" },
+        "id": { "$ref": "#/definitions/message_id" },
         "timestamp": { "$ref": "#/definitions/timestamp_ms" },
         "from_me": { "type": "boolean" }
       },

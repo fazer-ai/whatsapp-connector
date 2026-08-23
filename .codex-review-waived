@@ -1,0 +1,3 @@
+contract/schema/protocol.schema.json: Require an idempotency key for history requests  # PR#3
+contract/fixtures/commands/history_request.json: Require an idempotency key for history requests  # PR#3
+contract/schema/protocol.schema.json: Require a usable anchor for native history requests  # PR#3
