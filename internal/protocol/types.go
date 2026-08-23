@@ -65,6 +65,7 @@ const (
 	CommandMessageMarkRead         CommandType = "message.mark_read"
 	CommandMessageMarkUnread       CommandType = "message.mark_unread"
 	CommandMessageDownloadMedia    CommandType = "message.download_media"
+	CommandHistoryRequest          CommandType = "history.request"
 	CommandPresenceSet             CommandType = "presence.set"
 	CommandPresenceSubscribe       CommandType = "presence.subscribe"
 	CommandChatPresence            CommandType = "chat.presence"
@@ -144,6 +145,7 @@ var AllCommandTypes = []CommandType{
 	CommandMessageMarkRead,
 	CommandMessageMarkUnread,
 	CommandMessageDownloadMedia,
+	CommandHistoryRequest,
 	CommandPresenceSet,
 	CommandPresenceSubscribe,
 	CommandChatPresence,
@@ -178,6 +180,7 @@ var rpcCommands = map[CommandType]bool{
 	CommandMessageRevoke:           true,
 	CommandMessageReact:            true,
 	CommandMessageDownloadMedia:    true,
+	CommandHistoryRequest:          true,
 	CommandContactCheck:            true,
 	CommandContactProfilePicture:   true,
 	CommandContactInfo:             true,

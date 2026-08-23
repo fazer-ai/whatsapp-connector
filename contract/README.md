@@ -96,6 +96,7 @@ written against this table.
 | `admin.ping` | `{ "inst": string, "version": string, "sessions": integer }` |
 | `message.send`, `message.edit`, `message.react` | `{ "message_id": string, "timestamp": timestamp_ms, "client_ref": string\|null }` |
 | `message.revoke` | `null` |
+| `history.request` | `null`. The phone answers later, as `history.sync` events, and may never answer at all: the reply says the request went out, not that history is coming |
 | `message.download_media` | `media_ref` (a `url` kind, valid until `expires_at`) |
 | `contact.check` | array of `{ "phone": digits, "exists": boolean, "address": address\|null }` |
 | `contact.profile_picture` | `{ "url": string\|null }` |
