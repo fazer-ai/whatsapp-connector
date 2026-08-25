@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -162,11 +163,17 @@ func deliveryBatch(n int) (*batch, *atomic.Int64) {
 }
 
 // The drain claims and then dispatches, and the two share one deadline. Handing dispatch
-// the loop's context instead opens a fresh budget on every pass, so a drain that has
-// already spent its claim time goes on holding the goroutine that renews every lease this
-// instance holds for a budget more, and for another on the pass after that.
+// the loop's context instead opens a fresh budget on top of whatever the claim spent, so a
+// drain that has already spent most of its time goes on holding the goroutine that renews
+// every lease this instance holds for a budget more, and for another on the pass after
+// that.
 func TestADrainDispatchesOnWhatIsLeftOfItsOwnDeadline(t *testing.T) {
 	t.Parallel()
+
+	// A short lease keeps the test quick; what it is measuring is the deadline dispatch
+	// is handed, not how long anything takes.
+	const leaseTTL = 600 * time.Millisecond
+	const slowClaim = 150 * time.Millisecond
 
 	server := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
@@ -184,26 +191,27 @@ func TestADrainDispatchesOnWhatIsLeftOfItsOwnDeadline(t *testing.T) {
 	}
 	streams := newStreams("inst-a")
 	dead := newStreams("inst-dead")
-	answered := &countingReplier{}
+	dispatched := &deadlineReplier{}
 	manager := session.NewManager(&session.ManagerConfig{
 		Instance: "inst-a", Engine: fake.New(),
 		Leases:    cluster.NewLeases(client, "inst-a", cluster.Options{}),
-		Publisher: quietPublisher{}, Replier: answered,
+		Publisher: quietPublisher{}, Replier: dispatched,
 		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
 	})
 	ctx := context.Background()
 	t.Cleanup(func() { manager.StopAll(ctx) })
 
 	connector := &Connector{
-		cfg: Config{LeaseTTL: 200 * time.Millisecond}, log: zerolog.Nop(),
+		cfg: Config{LeaseTTL: leaseTTL}, log: zerolog.Nop(),
 		manager: manager, streams: streams,
 	}
 
-	// A command the previous owner of the session read and never acknowledged.
+	// An admin.ping, because the manager answers that one on the dispatch goroutine: the
+	// deadline it is answered under is the deadline the drain handed dispatch.
 	if _, err := dead.Read(ctx, []string{"s1"}); err != nil {
 		t.Fatalf("priming Read: %v", err)
 	}
-	writeStatusCommand(t, client, "s1")
+	writePing(t, client, "s1")
 	if taken, err := dead.Read(ctx, []string{"s1"}); err != nil || len(taken) != 1 {
 		t.Fatalf("the previous owner read %d commands (err=%v), want 1", len(taken), err)
 	}
@@ -211,56 +219,79 @@ func TestADrainDispatchesOnWhatIsLeftOfItsOwnDeadline(t *testing.T) {
 		t.Fatalf("Adopt: %v", err)
 	}
 
-	// The claim comes back with the drain's deadline already spent, which is the whole
-	// case: what is dispatched after it is what tells the two deadlines apart.
-	rdb.AddHook(spendsTheDeadline{on: func(cmd redis.Cmder) bool { return cmd.Name() == "xclaim" }})
+	// The claim spends most of the drain's deadline, which is the case that tells the two
+	// contexts apart: what is left of the pass, or a whole budget over again.
+	var once sync.Once
+	rdb.AddHook(slowClaims{on: func(cmd redis.Cmder) bool {
+		slow := false
+		if cmd.Name() == "xclaim" {
+			once.Do(func() { slow = true })
+		}
+		return slow
+	}, delay: slowClaim})
 
-	if undrained := connector.drainAdopted(ctx); len(undrained) != 1 {
-		t.Fatalf("the drain reported %v undrained, want [s1]", undrained)
+	connector.drainAdopted(ctx)
+
+	left, ok := dispatched.left()
+	if !ok {
+		t.Fatal("nothing was dispatched, so there is no deadline to look at")
 	}
-
-	// Long enough for a dispatched command to have been answered on the session's own
-	// goroutine, which is where the reply is written.
-	time.Sleep(200 * time.Millisecond)
-	if answered.count.Load() != 0 {
-		t.Fatalf("%d commands were carried out on a deadline the drain had already spent",
-			answered.count.Load())
+	if left > leaseTTL/3-slowClaim/2 {
+		t.Fatalf("dispatch was given %s, which is a fresh budget rather than what was left of the drain's %s",
+			left, leaseTTL/3)
 	}
 }
 
-// spendsTheDeadline lets a command through and then waits out whatever deadline its
-// caller was working to, which is what a Redis having a bad minute does to a pass.
-type spendsTheDeadline struct{ on func(redis.Cmder) bool }
+// slowClaims makes a claim take a fixed slice of the deadline its caller is working to.
+type slowClaims struct {
+	on    func(redis.Cmder) bool
+	delay time.Duration
+}
 
-func (spendsTheDeadline) DialHook(next redis.DialHook) redis.DialHook { return next }
+func (slowClaims) DialHook(next redis.DialHook) redis.DialHook { return next }
 
-func (spendsTheDeadline) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+func (slowClaims) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
 	return next
 }
 
-func (h spendsTheDeadline) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+func (h slowClaims) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
 	return func(ctx context.Context, cmd redis.Cmder) error {
 		err := next(ctx, cmd)
 		if h.on(cmd) {
-			if deadline, ok := ctx.Deadline(); ok {
-				time.Sleep(time.Until(deadline) + time.Millisecond)
-			}
+			time.Sleep(h.delay)
 		}
 		return err
 	}
 }
 
-type countingReplier struct{ count atomic.Int64 }
+// deadlineReplier records how long the command it answered had left, which is the deadline
+// whoever dispatched it was working to.
+type deadlineReplier struct {
+	mu        sync.Mutex
+	remaining time.Duration
+	seen      bool
+}
 
-func (r *countingReplier) Reply(context.Context, string, protocol.Reply) error {
-	r.count.Add(1)
+func (r *deadlineReplier) Reply(ctx context.Context, _ string, _ protocol.Reply) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if deadline, ok := ctx.Deadline(); ok && !r.seen {
+		r.remaining = time.Until(deadline)
+		r.seen = true
+	}
 	return nil
 }
 
-func writeStatusCommand(t *testing.T, client *redisx.Client, sid string) {
+func (r *deadlineReplier) left() (time.Duration, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.remaining, r.seen
+}
+
+func writePing(t *testing.T, client *redisx.Client, sid string) {
 	t.Helper()
 	command := &protocol.Command{
-		V: protocol.Version, ID: "c1", Type: protocol.CommandSessionStatus,
+		V: protocol.Version, ID: "c1", Type: protocol.CommandAdminPing,
 		SID: sid, TS: time.Now().UnixMilli(), ReplyTo: "reply-c1", Payload: json.RawMessage(`{}`),
 	}
 	fields, err := command.Fields()
@@ -271,5 +302,83 @@ func writeStatusCommand(t *testing.T, client *redisx.Client, sid string) {
 		Stream: client.Keys().Commands(sid), Values: fields,
 	}).Err(); err != nil {
 		t.Fatalf("XAdd: %v", err)
+	}
+}
+
+// The same rule on the heartbeat's own reclaim. A heartbeat configured close to the lease
+// makes a claim that spends its pass plus a fresh dispatch budget longer than the lease
+// this goroutine is renewing, and the sessions whose renewals it delayed are taken by
+// peers while this instance still holds their sockets open.
+func TestAReclaimDispatchesOnWhatIsLeftOfItsOwnDeadline(t *testing.T) {
+	t.Parallel()
+
+	const heartbeat = 600 * time.Millisecond
+	const slowClaim = 150 * time.Millisecond
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+
+	newStreams := func(instance string) *redisstream.Streams {
+		streams, err := redisstream.New(client, redisstream.Options{
+			Instance: instance, Block: 50 * time.Millisecond, ClaimMinIdle: time.Millisecond,
+		})
+		if err != nil {
+			t.Fatalf("redisstream.New: %v", err)
+		}
+		return streams
+	}
+	streams := newStreams("inst-a")
+	dead := newStreams("inst-dead")
+	dispatched := &deadlineReplier{}
+	manager := session.NewManager(&session.ManagerConfig{
+		Instance: "inst-a", Engine: fake.New(),
+		Leases:    cluster.NewLeases(client, "inst-a", cluster.Options{}),
+		Publisher: quietPublisher{}, Replier: dispatched,
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	ctx := context.Background()
+	t.Cleanup(func() { manager.StopAll(ctx) })
+
+	connector := &Connector{
+		// A lease far longer than the heartbeat, which is what makes a fresh dispatch
+		// budget tell itself apart from what is left of the pass.
+		cfg: Config{LeaseTTL: 30 * time.Second, Heartbeat: heartbeat}, log: zerolog.Nop(),
+		manager: manager, streams: streams,
+	}
+
+	if _, err := dead.Read(ctx, []string{"s1"}); err != nil {
+		t.Fatalf("priming Read: %v", err)
+	}
+	writePing(t, client, "s1")
+	if taken, err := dead.Read(ctx, []string{"s1"}); err != nil || len(taken) != 1 {
+		t.Fatalf("the previous owner read %d commands (err=%v), want 1", len(taken), err)
+	}
+	if _, err := manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	// Already drained, so the reclaim is what picks this up.
+	manager.TakeNewlyAdopted()
+	time.Sleep(5 * time.Millisecond)
+
+	var once sync.Once
+	rdb.AddHook(slowClaims{on: func(cmd redis.Cmder) bool {
+		slow := false
+		if cmd.Name() == "xclaim" {
+			once.Do(func() { slow = true })
+		}
+		return slow
+	}, delay: slowClaim})
+
+	connector.reclaimCommands(ctx)
+
+	left, ok := dispatched.left()
+	if !ok {
+		t.Fatal("nothing was dispatched, so there is no deadline to look at")
+	}
+	if left > heartbeat/2-slowClaim/2 {
+		t.Fatalf("dispatch was given %s, which is a fresh budget rather than what was left of the pass's %s",
+			left, heartbeat/2)
 	}
 }

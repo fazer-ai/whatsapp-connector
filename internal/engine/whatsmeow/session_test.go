@@ -2068,3 +2068,42 @@ func validateAgainstContract(t *testing.T, definition string, payload json.RawMe
 		}
 	}
 }
+
+// Retiring a conversation clears it and only then publishes and puts its socket back. A
+// replacement installed in between is one the attempt that just ended disconnects the
+// socket of, and marks stale: the operator's corrected attempt fails for reasons belonging
+// to the one before it.
+func TestAReplacementPairingWaitsForTheOneItReplaces(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "")
+	run := session.startPairing(t.Context(), func() {})
+
+	// publishPairingFailure takes this to change the socket's state, so holding it pins
+	// the retirement exactly where a replacement would slip in.
+	session.transition.Lock()
+	retired := make(chan struct{})
+	go func() {
+		defer close(retired)
+		session.publishPairing(run, wm.QRChannelTimeout, true)
+	}()
+	if emission := next(t, session); emission.Type != protocol.EventPairingError {
+		t.Fatalf("published %q, want the pairing failure", emission.Type)
+	}
+
+	started := make(chan *pairingRun, 1)
+	go func() { started <- session.startPairing(t.Context(), func() {}) }()
+	select {
+	case <-started:
+		t.Fatal("a replacement started while the attempt before it was still being torn down")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	session.transition.Unlock()
+	<-retired
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the replacement never started once the attempt before it was done")
+	}
+}

@@ -135,6 +135,12 @@ type Session struct {
 	// runs counts the conversations this session has started. Paired with nonce it is
 	// what gives each one a name the client can answer to.
 	runs uint64
+	// pairingMu serialises retiring a conversation and putting its socket back with
+	// starting the next one. Retirement clears s.pairing and only then publishes and
+	// disconnects, and a replacement installed in between is one the attempt that just
+	// ended disconnects the socket of: the operator's corrected attempt fails for reasons
+	// belonging to the one before it.
+	pairingMu sync.Mutex
 	// nonce is this session's own, drawn once when it is built. A count alone starts
 	// over whenever a session is rebuilt — a restart, a lease moving — so the first
 	// conversation of the new one would answer to the name the last one used, and an
@@ -655,6 +661,9 @@ func (s *Session) settleHangUp() {
 // refuses, because whatsmeow will not open a second pairing channel on a live socket,
 // and the operator is stuck until the codes run out.
 func (s *Session) abandonPairing(run *pairingRun, client *wm.Client, reason string, err error) {
+	s.pairingMu.Lock()
+	defer s.pairingMu.Unlock()
+
 	// Only if this run is still the current one. These calls can be detached from the
 	// command that started them, and the operator's corrected attempt may already own
 	// the socket: tearing that one down would be this attempt failing the next one.
@@ -1041,6 +1050,9 @@ func (s *Session) pairingActive() bool {
 
 // startPairing makes a run the current one and ends whatever it replaces.
 func (s *Session) startPairing(ctx context.Context, cancel context.CancelFunc) *pairingRun {
+	s.pairingMu.Lock()
+	defer s.pairingMu.Unlock()
+
 	s.runs++
 	run := &pairingRun{
 		id:     s.sid + "-" + s.nonce + "-" + strconv.FormatUint(s.runs, 10),
@@ -1375,6 +1387,9 @@ func (s *Session) pairingNamed(id string) (*pairingRun, error) {
 // socket the next one just opened, and a retry at the end of a pairing failing for
 // reasons of its own.
 func (s *Session) finishPairing(run *pairingRun, reason string, err error) {
+	s.pairingMu.Lock()
+	defer s.pairingMu.Unlock()
+
 	if !s.endPairing(run) {
 		return
 	}

@@ -212,7 +212,11 @@ func (c *Connector) reclaimCommands(ctx context.Context) {
 		}
 		return
 	}
-	c.dispatchWithin(ctx, deliveries)
+	// The pass's own deadline, not the loop's. dispatchWithin would otherwise open a
+	// fresh budget on top of whatever the claim spent, and a heartbeat configured close
+	// to the lease makes that sum longer than the lease this goroutine is renewing. What
+	// does not fit is released, keeps its age, and comes back on the next tick.
+	c.dispatchWithin(pass, deliveries)
 }
 
 // budget is how long one batch of commands may hold the loop. It is a third of the
