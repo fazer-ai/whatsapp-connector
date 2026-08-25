@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -113,6 +114,9 @@ type Session struct {
 	// replaced it: functions are not comparable, and "is this still mine" is the whole
 	// question.
 	pairing *pairingRun
+	// closing is what the engine wants told when this session ends, so a session that
+	// is over stops being something the engine hands out or holds on to.
+	closing func()
 }
 
 // pairingRun is one pairing conversation.
@@ -137,6 +141,15 @@ func newSession(sid string, client *wm.Client, container *store.Container, log z
 	s.adopt(client)
 	go s.forward()
 	return s
+}
+
+// onClose registers what to run once this session has ended. The engine uses it to drop
+// the session from its cache; nothing else does, and it is set before the session is
+// handed out, so it never changes under a Close.
+func (s *Session) onClose(fn func()) {
+	s.mu.Lock()
+	s.closing = fn
+	s.mu.Unlock()
 }
 
 // identityOf reads what a client was built knowing. Safe before the client is running,
@@ -543,12 +556,29 @@ func (s *Session) abandonPairing(run *pairingRun, client *wm.Client) {
 	s.markStale()
 }
 
+// digitsOf keeps the digits of a phone number and drops the rest, which is what
+// whatsmeow does to it before pairing.
+func digitsOf(phone string) string {
+	var digits strings.Builder
+	for _, r := range phone {
+		if r >= '0' && r <= '9' {
+			digits.WriteRune(r)
+		}
+	}
+	return digits.String()
+}
+
 // pairWithCode connects and asks WhatsApp for a code the operator types on the phone.
 //
 // whatsmeow needs the socket up before it can ask, and it reports readiness by putting
 // the first QR code on the pairing channel. Waiting for that is what makes the request
 // land on an established connection rather than a sleep that is usually long enough.
-func (s *Session) pairWithCode(ctx context.Context, phone string) error {
+func (s *Session) pairWithCode(ctx context.Context, rawPhone string) error {
+	// whatsmeow strips everything that is not a digit before it asks, so a number typed
+	// with a plus and spaces pairs perfectly well. The number this session then reports
+	// has to be the one it actually paired: `pairing.code` promises digits, and a client
+	// that validates the contract drops the event over the plus it sent us itself.
+	phone := digitsOf(rawPhone)
 	if phone == "" {
 		return protocol.NewError(protocol.ErrorInvalidPayload, "code pairing needs the phone number to pair")
 	}
@@ -753,7 +783,15 @@ func (s *Session) Close() error {
 	s.closed = true
 	run := s.pairing
 	s.pairing = nil
+	closing := s.closing
 	s.mu.Unlock()
+
+	// Announced first, while the teardown below still has a socket to close. The engine
+	// only drops a cache entry here, and a session it can no longer hand out is the
+	// point: an Open racing this must build a new client rather than get this one back.
+	if closing != nil {
+		closing()
+	}
 
 	if run != nil {
 		run.cancel()

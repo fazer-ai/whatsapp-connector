@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	"github.com/santhosh-tekuri/jsonschema/v6"
 	wm "go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waAdv"
 	"go.mau.fi/whatsmeow/types"
@@ -1125,5 +1126,111 @@ func TestAPairingThatEndedTakesTheConnectionWithIt(t *testing.T) {
 	}
 	if state := session.state(); state != "close" {
 		t.Fatalf("state = %q after the pairing ended, want close", state)
+	}
+}
+
+// A fleet member that has handed its sessions on never opens those accounts again, so
+// an entry kept until the next Open of the same id is one kept forever: every whatsmeow
+// client the instance ever ran, with the device credentials and channels behind it.
+func TestAClosedSessionLeavesTheEngineCache(t *testing.T) {
+	t.Parallel()
+	container := openStore(t)
+	waEngine := New(container, "fazer.ai test", zerolog.Nop())
+	t.Cleanup(func() {
+		if err := waEngine.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	})
+
+	for _, sid := range []string{"sid-1", "sid-2", "sid-3"} {
+		opened, err := waEngine.Open(t.Context(), sid)
+		if err != nil {
+			t.Fatalf("Open %s: %v", sid, err)
+		}
+		// The lease moved, so the layer above closes it and never asks for it again.
+		if err := opened.Close(); err != nil {
+			t.Fatalf("Close %s: %v", sid, err)
+		}
+	}
+
+	waEngine.mu.Lock()
+	held := len(waEngine.sessions)
+	waEngine.mu.Unlock()
+	if held != 0 {
+		t.Fatalf("the engine still holds %d closed sessions", held)
+	}
+}
+
+// The same rule must not reach past the session that ended: a closed session and the one
+// that replaced it share an id, and the replacement is the one still running.
+func TestClosingASessionDoesNotEvictItsReplacement(t *testing.T) {
+	t.Parallel()
+	container := openStore(t)
+	waEngine := New(container, "fazer.ai test", zerolog.Nop())
+	t.Cleanup(func() {
+		if err := waEngine.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	})
+
+	first, err := waEngine.Open(t.Context(), "sid-1")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	replacement, err := waEngine.Open(t.Context(), "sid-1")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if replacement == first {
+		t.Fatal("Open handed back a closed session")
+	}
+
+	// Closing the first one a second time must not take the running one with it.
+	if err := first.Close(); err != nil {
+		t.Fatalf("Close again: %v", err)
+	}
+	again, err := waEngine.Open(t.Context(), "sid-1")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if again != replacement {
+		t.Fatal("the engine built a second client over the credentials a live session is using")
+	}
+}
+
+// whatsmeow strips a phone number down to its digits before it pairs, so a number typed
+// with a plus and spaces pairs fine. What it must not do is leave this session reporting
+// the number it was handed: `pairing.code` promises digits, and a client that validates
+// the contract drops the event over the plus it sent us itself.
+func TestAPairedNumberIsReportedAsDigits(t *testing.T) {
+	t.Parallel()
+
+	compiler := jsonschema.NewCompiler()
+	digits, err := compiler.Compile(
+		filepath.Join("..", "..", "..", "contract", "schema", "protocol.schema.json") + "#/definitions/digits",
+	)
+	if err != nil {
+		t.Fatalf("compile the contract's phone number: %v", err)
+	}
+
+	for name, test := range map[string]struct{ typed, want string }{
+		"already digits":     {"5511999990001", "5511999990001"},
+		"an international +": {"+5511999990001", "5511999990001"},
+		"spaced and dashed":  {"+55 11 99999-0001", "5511999990001"},
+		"in brackets":        {"+55 (11) 99999 0001", "5511999990001"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			got := digitsOf(test.typed)
+			if got != test.want {
+				t.Fatalf("%q would be reported as %q, want %q", test.typed, got, test.want)
+			}
+			if err := digits.Validate(got); err != nil {
+				t.Fatalf("%q is not what the contract calls a phone number: %v", got, err)
+			}
+		})
 	}
 }

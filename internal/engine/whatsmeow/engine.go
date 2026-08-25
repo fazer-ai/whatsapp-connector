@@ -78,21 +78,51 @@ func (e *Engine) Open(ctx context.Context, sid string) (engine.Session, error) {
 
 	wa := newLibraryLogger(e.log, sid)
 	session := newSession(sid, wm.NewClient(device, wa), e.store, e.log, wa)
+	// Registered before the session can be handed out, so a close that happens while
+	// this function is still running is not one nobody hears about.
+	session.onClose(func() { e.forget(sid, session) })
 
 	e.mu.Lock()
-	defer e.mu.Unlock()
+	// Unlocked before any Close below. A closing session calls back into forget, which
+	// takes this lock, and holding it across the call would have the two wait on each
+	// other.
 	if e.closed {
+		e.mu.Unlock()
 		_ = session.Close()
 		return nil, errors.New("whatsmeow: the engine is closed")
 	}
 	// Open can be reached twice for one session. The second caller must get the first
 	// session rather than a second client on the same credentials.
 	if winner, ok := e.sessions[sid]; ok && !winner.Closed() {
+		e.mu.Unlock()
 		_ = session.Close()
 		return winner, nil
 	}
 	e.sessions[sid] = session
+	e.mu.Unlock()
+
+	// A close that landed before the entry existed found nothing to remove, so the
+	// entry it should have taken is this one.
+	if session.Closed() {
+		e.forget(sid, session)
+	}
 	return session, nil
+}
+
+// forget drops a session from the cache once it is closed.
+//
+// Without it an entry lives until the same account is opened here again, which for a
+// fleet member that has handed its sessions on is never: it would go on holding every
+// whatsmeow client it ever ran, each with the device credentials and channels behind it.
+//
+// The session is compared and not just the id, because a closed session and the one
+// that replaced it share an id, and the replacement is the one still running.
+func (e *Engine) forget(sid string, session *Session) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.sessions[sid] == session {
+		delete(e.sessions, sid)
+	}
 }
 
 // Close shuts every session down.

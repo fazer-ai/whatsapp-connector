@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sort"
 	"sync"
 	"time"
 
@@ -38,6 +39,13 @@ type Manager struct {
 	// their previous owner left pending drained before anything newer is read for them.
 	newlyMu sync.Mutex
 	newly   []string
+
+	// orphans are leases of sessions this instance has stopped and could not hand back.
+	// The Redis key still names this instance, and every wake for such a session is
+	// answered "owned elsewhere" and acknowledged, so nobody runs it until the key
+	// expires. Kept here so the next tick tries the release again.
+	orphanMu sync.Mutex
+	orphans  map[string]struct{}
 }
 
 // ManagerConfig is what a manager needs.
@@ -67,6 +75,7 @@ func NewManager(cfg *ManagerConfig) *Manager {
 		now:       cfg.Now,
 		log:       cfg.Logger,
 		sessions:  make(map[string]*Session),
+		orphans:   make(map[string]struct{}),
 	}
 }
 
@@ -127,6 +136,8 @@ func (m *Manager) Adopt(ctx context.Context, sid string) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Won again, so a hand-back still queued for it is now about a live lease.
+	m.forgetOrphan(sid)
 
 	engineSession, err := m.engine.Open(io, sid)
 	if err != nil {
@@ -243,9 +254,60 @@ func (m *Manager) Release(ctx context.Context, sid string) {
 	if ok {
 		session.Stop()
 	}
+	m.abandon(ctx, sid)
+}
+
+// abandon hands back the lease of a session this instance is no longer running.
+//
+// A release that does not reach Redis is kept and tried again on the next tick. The key
+// still names this instance until it expires, and while it does every wake for that
+// session finds the lease taken, is acknowledged, and retires: the session is then left
+// unowned with nothing scheduled to pick it up.
+func (m *Manager) abandon(ctx context.Context, sid string) {
 	if _, err := m.leases.Release(ctx, sid); err != nil {
-		m.log.Warn().Err(err).Str("sid", sid).Msg("failed to release a lease")
+		m.log.Warn().Err(err).Str("sid", sid).Msg("could not hand a lease back; will try again")
+		m.orphanMu.Lock()
+		m.orphans[sid] = struct{}{}
+		m.orphanMu.Unlock()
+		return
 	}
+	m.forgetOrphan(sid)
+}
+
+// releaseOrphans retries the hand-backs that did not reach Redis.
+//
+// A session adopted again in the meantime is dropped from the list rather than
+// released: the lease it holds now is a live one, and the release compares the instance
+// and nothing else, so it would delete the lease of a session this instance is running.
+func (m *Manager) releaseOrphans(ctx context.Context) {
+	m.orphanMu.Lock()
+	if len(m.orphans) == 0 {
+		m.orphanMu.Unlock()
+		return
+	}
+	sids := make([]string, 0, len(m.orphans))
+	for sid := range m.orphans {
+		sids = append(sids, sid)
+	}
+	m.orphanMu.Unlock()
+
+	sort.Strings(sids)
+	for _, sid := range sids {
+		m.mu.RLock()
+		_, running := m.sessions[sid]
+		m.mu.RUnlock()
+		if running {
+			m.forgetOrphan(sid)
+			continue
+		}
+		m.abandon(ctx, sid)
+	}
+}
+
+func (m *Manager) forgetOrphan(sid string) {
+	m.orphanMu.Lock()
+	delete(m.orphans, sid)
+	m.orphanMu.Unlock()
 }
 
 // Dispatch routes one command. It answers by itself for the two it can answer without
@@ -353,6 +415,7 @@ func (m *Manager) ack(ctx context.Context, delivery *transport.Delivery) {
 // instance has lost. It is the loop that turns "the lease expired" into "the socket is
 // closed", which is what keeps two instances off one account.
 func (m *Manager) RenewAll(ctx context.Context) {
+	m.releaseOrphans(ctx)
 	for _, sid := range m.SIDs() {
 		err := m.leases.Renew(ctx, sid)
 		if err == nil {
@@ -382,6 +445,17 @@ func (m *Manager) RenewAll(ctx context.Context) {
 		if ok {
 			session.Stop()
 		}
+		if errors.Is(err, cluster.ErrNotOwner) {
+			// Somebody else's now, and Renew has already forgotten it locally. Nothing
+			// to hand back, and the release only ever deletes a key naming this
+			// instance, so asking would cost a round trip to be told no.
+			continue
+		}
+		// The renewal may well have been applied and only the answer lost, which leaves
+		// a key naming this instance for a full TTL after the session it named stopped.
+		// Not knowing is the reason to hand it back explicitly rather than to wait the
+		// key out.
+		m.abandon(ctx, sid)
 	}
 }
 

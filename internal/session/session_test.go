@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -779,5 +780,208 @@ func TestASessionThatMovedOnIsNoLongerWaitingToBeDrained(t *testing.T) {
 	manager.ReturnAdopted([]string{"s1"})
 	if waiting := manager.TakeNewlyAdopted(); len(waiting) != 0 {
 		t.Fatalf("a session this instance no longer runs was put back to be drained: %v", waiting)
+	}
+}
+
+// errNoAnswer is a Redis call that failed. From the caller it reads the same whether the
+// server never saw it or saw it and the reply was lost, which is the whole reason the
+// renew loop cannot simply believe a failure.
+var errNoAnswer = errors.New("the answer never came back")
+
+// brokenReplies fails the lease scripts on their way through, in the two ways that
+// differ where it matters. `lose` lets the script run and then reports it as failed,
+// which is the ambiguous renewal: applied, the lease alive a full TTL longer, and the
+// instance that asked unable to know. `drop` fails before the script runs, which is the
+// call that never landed at all. Nothing outside a hook can build either.
+type brokenReplies struct {
+	lose func(redis.Cmder) bool
+	drop func(redis.Cmder) bool
+}
+
+func (brokenReplies) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (brokenReplies) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+
+func (h brokenReplies) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if h.drop != nil && h.drop(cmd) {
+			cmd.SetErr(errNoAnswer)
+			return errNoAnswer
+		}
+		err := next(ctx, cmd)
+		if err != nil || h.lose == nil || !h.lose(cmd) {
+			return err
+		}
+		cmd.SetErr(errNoAnswer)
+		return errNoAnswer
+	}
+}
+
+// isScript keeps a hook off the plain commands a test reads state with, and off the
+// SETNX an instance acquires a lease with.
+func isScript(cmd redis.Cmder) bool { return strings.HasPrefix(cmd.Name(), "eval") }
+
+// mentions reports whether a command carries a key, which is how a test tells the two
+// lease scripts apart: only the hand-back names the cooldown.
+func mentions(cmd redis.Cmder, key string) bool {
+	for _, arg := range cmd.Args() {
+		if text, ok := arg.(string); ok && text == key {
+			return true
+		}
+	}
+	return false
+}
+
+// losesRenewals fails every renewal after it has been applied, and leaves the hand-back
+// alone.
+func losesRenewals(cooldownKey string) brokenReplies {
+	return brokenReplies{lose: func(cmd redis.Cmder) bool {
+		return isScript(cmd) && !mentions(cmd, cooldownKey)
+	}}
+}
+
+// A renewal whose answer was lost has still been applied, so the lease outlives by a
+// full TTL the session it named. Every wake for that session then finds it owned, is
+// acknowledged, and retires, which leaves the account running nowhere.
+func TestRenewAllHandsBackTheLeaseOfASessionItStopped(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+	keys := client.Keys()
+
+	clock := &steppingClock{now: time.Now()}
+	leases := cluster.NewLeases(client, "inst-a", cluster.Options{Clock: clock})
+	manager := session.NewManager(&session.ManagerConfig{
+		Instance: "inst-a", Engine: fake.New(), Leases: leases,
+		Publisher: newRecorder(), Replier: newRecorder(),
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	ctx := context.Background()
+
+	if _, err := manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+
+	rdb.AddHook(losesRenewals(keys.Cooldown("s1")))
+	clock.step(cluster.DefaultTTL + time.Second)
+	manager.RenewAll(ctx)
+
+	if got := manager.Count(); got != 0 {
+		t.Fatalf("the manager still runs %d sessions on a lease that ran out", got)
+	}
+	peer := cluster.NewLeases(client, "inst-b", cluster.Options{Clock: clock})
+	if _, err := peer.Acquire(ctx, "s1"); err != nil {
+		t.Fatalf("a peer could not take over a session this instance stopped: %v", err)
+	}
+}
+
+// And when the hand-back itself does not land, it is the next tick's job: a lease naming
+// an instance that is not running the session is the same outage whether one round trip
+// failed or two.
+func TestAHandBackThatDidNotLandIsTriedAgain(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+	keys := client.Keys()
+
+	clock := &steppingClock{now: time.Now()}
+	leases := cluster.NewLeases(client, "inst-a", cluster.Options{Clock: clock})
+	manager := session.NewManager(&session.ManagerConfig{
+		Instance: "inst-a", Engine: fake.New(), Leases: leases,
+		Publisher: newRecorder(), Replier: newRecorder(),
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	ctx := context.Background()
+
+	if _, err := manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+
+	var away atomic.Bool
+	away.Store(true)
+	hook := losesRenewals(keys.Cooldown("s1"))
+	hook.drop = func(cmd redis.Cmder) bool {
+		return away.Load() && isScript(cmd) && mentions(cmd, keys.Cooldown("s1"))
+	}
+	rdb.AddHook(hook)
+
+	clock.step(cluster.DefaultTTL + time.Second)
+	manager.RenewAll(ctx)
+
+	if got, err := rdb.Get(ctx, keys.Lease("s1")).Result(); err != nil || got != "inst-a" {
+		t.Fatalf("the lease should still be there for the retry to find (got %q, %v)", got, err)
+	}
+
+	// Redis answers again. Nothing renews this session any more, so the only thing left
+	// that can hand its lease back is the tick itself.
+	away.Store(false)
+	manager.RenewAll(ctx)
+
+	peer := cluster.NewLeases(client, "inst-b", cluster.Options{Clock: clock})
+	if _, err := peer.Acquire(ctx, "s1"); err != nil {
+		t.Fatalf("a peer could not take over after the hand-back was retried: %v", err)
+	}
+}
+
+// The other side of that retry: a session taken again owns its lease for real, and a
+// hand-back still queued for it compares the instance and nothing else, so it would
+// delete a live one.
+func TestAQueuedHandBackDoesNotTouchALeaseTakenAgain(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+	keys := client.Keys()
+
+	clock := &steppingClock{now: time.Now()}
+	leases := cluster.NewLeases(client, "inst-a", cluster.Options{Clock: clock})
+	manager := session.NewManager(&session.ManagerConfig{
+		Instance: "inst-a", Engine: fake.New(), Leases: leases,
+		Publisher: newRecorder(), Replier: newRecorder(),
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	ctx := context.Background()
+
+	if _, err := manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+
+	var away atomic.Bool
+	away.Store(true)
+	hook := losesRenewals(keys.Cooldown("s1"))
+	hook.drop = func(cmd redis.Cmder) bool {
+		return away.Load() && isScript(cmd) && mentions(cmd, keys.Cooldown("s1"))
+	}
+	rdb.AddHook(hook)
+
+	clock.step(cluster.DefaultTTL + time.Second)
+	manager.RenewAll(ctx)
+	away.Store(false)
+
+	// The orphaned key runs out on its own, and a wake arrives before the next tick:
+	// this instance takes the session back, under a lease it now really holds.
+	server.Del(keys.Lease("s1"))
+	clock.step(cluster.DefaultTTL + time.Second)
+	if _, err := manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("re-adopting: %v", err)
+	}
+
+	manager.RenewAll(ctx)
+
+	if got := manager.Count(); got != 1 {
+		t.Fatalf("the retry stopped a session this instance had taken again (running %d)", got)
+	}
+	if got, err := rdb.Get(ctx, keys.Lease("s1")).Result(); err != nil || got != "inst-a" {
+		t.Fatalf("the retry deleted the lease of a running session (got %q, %v)", got, err)
 	}
 }
