@@ -1,5 +1,14 @@
+# PR#3: both still stand, and both are the same answer as the logout below. The
+# connector has no idempotency layer at all yet, for any command; invariant 5 lands with
+# `message.send` in M2 and covers every command at once, so a key on this one command
+# would be a second mechanism to retire. Removing these lines does not decide anything.
 contract/schema/protocol.schema.json: Require an idempotency key for history requests  # PR#3
 contract/fixtures/commands/history_request.json: Require an idempotency key for history requests  # PR#3
+# PR#3: real, and deferred to the engine that has to serve it. `before` is optional and
+# whatsmeow needs an anchor message to build a history sync request, so a native request
+# without one cannot be served. Requiring it in the contract now would also bind the
+# uazapi adapter, which does not need it, and history is M3. The engine refusing an
+# unanchored request with a reason the operator can read is the shape to settle on then.
 contract/schema/protocol.schema.json: Require a usable anchor for native history requests  # PR#3
 internal/store/store.go: Fence device writes against lease loss  # PR#5 — real, and not a patch: whatsmeow writes through its own SQL layer where a statement carries no session identity, so a fence has to be per-session all the way down (one container per session, or a session-aware driver wrapper). That is M2, when this package starts owning writes of its own. The lease plus the heartbeat teardown bound the window meanwhile, and the roadmap says it is open.
 internal/engine/whatsmeow/session.go: Deduplicate logout before calling WhatsApp  # PR#6 — real, and not the place to fix it: the connector has no idempotency layer at all yet, for any command. Invariant 5 lands with `message.send` in M2, where the same machinery covers logout. Building one mechanism for logout alone would be a second one to retire.
