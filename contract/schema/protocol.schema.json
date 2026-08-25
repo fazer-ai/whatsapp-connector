@@ -501,7 +501,7 @@
         "request_id": { "type": "string" },
         "code": { "type": "string" }
       },
-      "required": ["request_id", "code"],
+      "required": ["code"],
       "additionalProperties": true
     },
     "event_message_received": {

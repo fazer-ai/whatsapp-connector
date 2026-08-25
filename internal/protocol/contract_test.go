@@ -302,3 +302,40 @@ func read(t *testing.T, path string, into any) {
 		t.Fatalf("parse %s: %v", path, err)
 	}
 }
+
+// A field cannot become required inside a protocol version. A connector pinned to an
+// earlier v1 contract goes on sending the frame it was built to send, and a client
+// vendoring this one has to keep accepting it: the version is what says whether the two
+// can talk, and it has not moved.
+//
+// The frames listed here are the ones a version of this contract has published without a
+// field a later one added. Adding to the list is how a new optional field is recorded;
+// making one required is what bumps the version instead.
+func TestAFieldAddedInsideAVersionStaysOptional(t *testing.T) {
+	t.Parallel()
+
+	for name, test := range map[string]struct {
+		definition string
+		payload    string
+	}{
+		"a passkey confirmation from before it was addressable": {
+			definition: "event_pairing_passkey_confirmation",
+			payload:    `{"code":"4821"}`,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			schema := compile(t, "#/definitions/"+test.definition)
+			var decoded any
+			if err := json.Unmarshal([]byte(test.payload), &decoded); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if err := schema.Validate(decoded); err != nil {
+				t.Fatalf("a frame an earlier %s published no longer validates: %v", protocolVersionLabel(), err)
+			}
+		})
+	}
+}
+
+// protocolVersionLabel is the version this contract advertises, for the message above.
+func protocolVersionLabel() string { return "v" + strconv.Itoa(protocol.Version) }
