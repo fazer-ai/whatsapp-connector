@@ -695,3 +695,60 @@ func TestATerminalOutcomeEndsTheReconnect(t *testing.T) {
 		})
 	}
 }
+
+// whatsmeow's auto-reconnect can already be past its wait when a disconnect lands, and
+// it then opens a socket nobody asked for, after the command has answered `close`.
+func TestASocketThatComesBackAfterADisconnectIsClosedAgain(t *testing.T) {
+	t.Parallel()
+	session, _ := newTestSession(t, "5511999990001")
+
+	session.handle(&waEvents.Connected{})
+	next(t, session)
+	if err := session.Disconnect(t.Context()); err != nil {
+		t.Fatalf("Disconnect: %v", err)
+	}
+	if emission := next(t, session); emission.Type != protocol.EventSessionState {
+		t.Fatalf("published %q on a disconnect", emission.Type)
+	}
+
+	// The reconnect that was already in flight.
+	session.handle(&waEvents.Connected{})
+
+	select {
+	case emission := <-session.Events():
+		t.Fatalf("an uninvited socket published %q as if the operator had asked", emission.Type)
+	case <-time.After(200 * time.Millisecond):
+	}
+	if state := session.state(); state != "close" {
+		t.Fatalf("the session reports %q after a disconnect it performed", state)
+	}
+
+	// A connect the operator did ask for clears the mark, so the next connection counts.
+	_ = session.Connect(t.Context(), engine.ConnectRequest{Pairing: "resume"})
+	session.handle(&waEvents.Connected{})
+	if emission := next(t, session); emission.Type != protocol.EventSessionState {
+		t.Fatalf("published %q on a connection the operator asked for", emission.Type)
+	}
+}
+
+// A reconnect already under way is not a reason to start a second one: dialling
+// alongside whatsmeow's retry loses the race about half the time and answers the caller
+// with ErrAlreadyConnected for a socket that was recovering perfectly well.
+func TestResumeLeavesAReconnectAlone(t *testing.T) {
+	t.Parallel()
+	session, _ := newTestSession(t, "5511999990001")
+
+	session.handle(&waEvents.Connected{})
+	next(t, session)
+	session.handle(&waEvents.Disconnected{})
+	next(t, session)
+
+	if err := session.Connect(t.Context(), engine.ConnectRequest{Pairing: "resume"}); err != nil {
+		t.Fatalf("resuming a reconnecting session: %v", err)
+	}
+	select {
+	case emission := <-session.Events():
+		t.Fatalf("a resume during a reconnect published %q", emission.Type)
+	case <-time.After(200 * time.Millisecond):
+	}
+}

@@ -108,11 +108,21 @@ func New(cfg *Config, log zerolog.Logger) (*Connector, error) {
 	return c, nil
 }
 
-// Ready reports whether this instance can serve. Redis is the whole of it: without it
-// the connector can neither publish nor be told anything, and reporting ready would
-// have an orchestrator send it traffic it cannot act on.
+// Ready reports whether this instance can serve: Redis, without which it can neither
+// publish nor be told anything, and the device store when the engine has one.
 func (c *Connector) Ready(ctx context.Context) error {
-	return c.client.Ping(ctx, 2*time.Second)
+	if err := c.client.Ping(ctx, 2*time.Second); err != nil {
+		return err
+	}
+	if c.store == nil {
+		return nil
+	}
+	// The database is not only a startup dependency: adopting a session reads its
+	// device and pairing one writes it. Reporting ready without it has an orchestrator
+	// send this instance sessions it cannot open.
+	pingCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	return c.store.Ping(pingCtx)
 }
 
 // Sessions is how many sessions this instance runs.

@@ -88,6 +88,15 @@ func Open(ctx context.Context, address string, log zerolog.Logger) (*Container, 
 	return c, nil
 }
 
+// Ping reports whether the database is answering. Readiness asks, because a session
+// cannot be opened or paired without it.
+func (c *Container) Ping(ctx context.Context) error {
+	if err := c.db.PingContext(ctx); err != nil {
+		return fmt.Errorf("store: ping: %w", err)
+	}
+	return nil
+}
+
 // Devices is whatsmeow's own store, which the engine hands to a client.
 func (c *Container) Devices() *sqlstore.Container { return c.devices }
 

@@ -68,6 +68,10 @@ type Session struct {
 	// socket nobody is waiting for. This is the answer to "is it connecting" that costs
 	// no lock.
 	dialing bool
+	// hungUp is an explicit disconnect this session performed and has not been asked to
+	// undo. whatsmeow's own reconnect can already be past its wait when that lands, and
+	// it then opens a socket nobody asked for, after the command has answered `close`.
+	hungUp bool
 	// reconnecting is whatsmeow retrying a paired socket on its own, which runs outside
 	// this session's dial. Without it a status would report `close` while the event
 	// stream says reconnecting, and a resume would start a second dial alongside it.
@@ -149,6 +153,13 @@ func (s *Session) adopt(client *wm.Client) bool {
 	// message it cannot publish instead of telling WhatsApp it was delivered: the
 	// invariant is that losing an event costs a redelivery, never a message.
 	client.SynchronousAck = true
+	// The history dump has an acknowledgement of its own that the handler gate does not
+	// cover: whatsmeow downloads it and receipts it on its own. Both are turned off
+	// together, because receipting a dump nobody published is the same loss as
+	// acknowledging a message nobody published, and M6 is where the dump gets somewhere
+	// to go.
+	client.ManualHistorySyncDownload = true
+	client.DisableManualHistorySyncReceipt = true
 
 	phone, lid := identityOf(client)
 
@@ -211,6 +222,16 @@ func (s *Session) setReconnecting(reconnecting bool) {
 // offline is a connection that is down and not coming back on its own. Every terminal
 // outcome goes through it, because leaving the retry flag up after whatsmeow has given
 // up reports a session as reconnecting forever.
+// undoHangUp reports whether a connection arrived while an explicit disconnect still
+// stands, clearing the mark either way: one uninvited socket is answered once.
+func (s *Session) undoHangUp() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	standing := s.hungUp
+	s.hungUp = false
+	return standing
+}
+
 func (s *Session) offline() {
 	s.mu.Lock()
 	s.connected = false
@@ -233,6 +254,10 @@ func (s *Session) Connect(ctx context.Context, req engine.ConnectRequest) error 
 	if s.isClosed() {
 		return errors.New("whatsmeow: the session is closed")
 	}
+	s.mu.Lock()
+	s.hungUp = false
+	s.mu.Unlock()
+
 	if req.Proxy != nil && req.Proxy.URL != "" {
 		// Decoding it is not honouring it. Connecting directly for a deployment that
 		// asked for egress routing puts its own address on the wire, and does it
@@ -270,7 +295,10 @@ func (s *Session) resume(ctx context.Context) error {
 		return protocol.NewError(protocol.ErrorNotPaired,
 			"this session has not paired, so there is nothing to resume")
 	}
-	if state := s.state(); state == "open" || state == "connecting" {
+	if state := s.state(); state == "open" || state == "connecting" || state == "reconnecting" {
+		// whatsmeow is already on it. Dialling alongside its retry loses the race about
+		// half the time and answers the caller with `ErrAlreadyConnected` for a socket
+		// that was recovering perfectly well.
 		return nil
 	}
 
@@ -481,6 +509,9 @@ func (s *Session) Disconnect(ctx context.Context) error {
 	if err := s.hangUp(ctx, s.current()); err != nil {
 		return err
 	}
+	s.mu.Lock()
+	s.hungUp = true
+	s.mu.Unlock()
 	s.offline()
 	s.emit(protocol.EventSessionState, map[string]any{"state": "close", "reason": "disconnect_requested"})
 	return nil
@@ -921,6 +952,13 @@ func (s *Session) handle(rawEvent any) bool {
 		s.log.Debug().Msg("refusing to acknowledge an inbound message this build cannot publish")
 		return false
 	case *waEvents.Connected:
+		if s.undoHangUp() {
+			// A reconnect that was already past its wait when the disconnect landed. The
+			// command has answered `close`, so this socket is one nobody asked for.
+			s.log.Info().Msg("closing a socket that came back after a disconnect")
+			go s.current().Disconnect()
+			return true
+		}
 		s.setConnected(true)
 		s.emit(protocol.EventSessionState, s.sessionState())
 	case *waEvents.Disconnected:
