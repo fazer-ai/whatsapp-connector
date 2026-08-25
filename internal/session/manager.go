@@ -142,7 +142,12 @@ func (m *Manager) Adopt(ctx context.Context, sid string) (*Session, error) {
 		return nil, err
 	}
 
-	session := New(ctx, &Config{
+	// Detached from the caller on purpose. The context that reaches Adopt bounds the
+	// work of adopting, and the caller may hand in one that expires in seconds to keep a
+	// slow store off the goroutine that renews leases. A session built on that context
+	// would be torn down along with it, which is a connector that pairs an account and
+	// drops it. Sessions end when StopAll or a lost lease ends them, and nothing else.
+	session := New(context.WithoutCancel(ctx), &Config{
 		Instance: m.instance, Lease: lease, Leases: m.leases, Engine: engineSession,
 		Publisher: m.publisher, Replier: m.replier, NewID: m.newID, Now: m.now, Logger: m.log,
 	})

@@ -74,6 +74,11 @@ type Session struct {
 	// nothing outside the library can put it in that state, so a test cannot otherwise
 	// reach the path where a disconnect outlives its deadline.
 	disconnect func(*wm.Client)
+
+	// transition serialises a change to the socket's state with the event announcing
+	// it. It is not mu: emit can block on a full inbox, and holding the session's own
+	// lock across that would stop everything that reads state, Close included.
+	transition sync.Mutex
 	closed     bool
 	// dialing is true while a connect is in flight. whatsmeow holds its socket lock for
 	// the length of one, and every question asked of the client takes that lock for
@@ -1070,6 +1075,17 @@ func (s *Session) handle(rawEvent any) bool {
 		s.log.Debug().Msg("refusing to acknowledge an inbound message this build cannot publish")
 		return false
 	case *waEvents.Connected:
+		// whatsmeow dispatches from whichever goroutine produced the event, so a
+		// Disconnected and the Connected that follows it can be handled at the same
+		// time. Holding this across both the state change and the event it announces is
+		// what keeps the two from crossing: without it one handler can write its state,
+		// be overtaken, and publish afterwards, leaving `session.status` saying one
+		// thing and the last event on the stream saying the other. Which of two
+		// simultaneous transitions lands last is whatsmeow's to decide and not knowable
+		// here; that they agree is not.
+		s.transition.Lock()
+		defer s.transition.Unlock()
+
 		if s.undoHangUp() {
 			// A reconnect that was already past its wait when the disconnect landed. The
 			// command has answered `close`, so this socket is one nobody asked for.
@@ -1080,6 +1096,9 @@ func (s *Session) handle(rawEvent any) bool {
 		s.setConnected(true)
 		s.emit(protocol.EventSessionState, s.sessionState())
 	case *waEvents.Disconnected:
+		s.transition.Lock()
+		defer s.transition.Unlock()
+
 		s.setConnected(false)
 		// whatsmeow only reconnects a device it has an id for, so a drop before pairing
 		// finishes is the end of that attempt. Reporting it as reconnecting leaves the
@@ -1093,6 +1112,9 @@ func (s *Session) handle(rawEvent any) bool {
 	case *waEvents.LoggedOut:
 		s.loggedOut(event)
 	case *waEvents.StreamReplaced:
+		s.transition.Lock()
+		defer s.transition.Unlock()
+
 		// whatsmeow suppresses the ordinary Disconnected for this one, so nothing else
 		// would take the connection down and the session would report itself open over a
 		// stream somebody else now holds.

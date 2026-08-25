@@ -336,3 +336,51 @@ func TestConcurrentWritersDoNotCollide(t *testing.T) {
 		t.Errorf("a concurrent writer failed: %v", err)
 	}
 }
+
+// The rule is one session per account, and Bind used to enforce it by reading the
+// competing mappings and then writing. Two pairings of the same number landing together
+// both read nothing and both write, so the account ends up on two sessions and the
+// displacement never happens: the second session's socket works while the first's
+// credentials are still on file, and a restart hands the account to whichever row is
+// found. A constraint is the only version of that check two writers cannot both pass.
+func TestOneAccountKeepsOneMappingUnderConcurrentPairings(t *testing.T) {
+	t.Parallel()
+	container := open(t)
+	ctx := t.Context()
+
+	const account = "5511999990001"
+	const pairings = 8
+
+	var wg sync.WaitGroup
+	failures := make(chan error, pairings)
+	for i := range pairings {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			jid, err := types.ParseJID(fmt.Sprintf("%s:%d@s.whatsapp.net", account, deviceCounter.Add(1)))
+			if err != nil {
+				failures <- err
+				return
+			}
+			// A pairing that loses the race is a pairing refused, which is a correct
+			// outcome; a pairing that wins and leaves a second mapping behind is not.
+			if err := container.Bind(ctx, fmt.Sprintf("sid-%d", i), jid); err != nil {
+				failures <- err
+			}
+		}()
+	}
+	wg.Wait()
+	close(failures)
+
+	var bound int
+	for i := range pairings {
+		if _, ok, err := container.JID(ctx, fmt.Sprintf("sid-%d", i)); err != nil {
+			t.Fatalf("JID: %v", err)
+		} else if ok {
+			bound++
+		}
+	}
+	if bound != 1 {
+		t.Fatalf("%d sessions hold the same account, want exactly 1", bound)
+	}
+}

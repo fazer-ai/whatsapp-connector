@@ -315,7 +315,12 @@ func (c *Container) migrate(ctx context.Context) error {
 			account  TEXT   NOT NULL,
 			bound_at BIGINT NOT NULL
 		)`,
-		`CREATE INDEX IF NOT EXISTS wac_session_device_account ON wac_session_device (account)`,
+		// Unique, not just indexed. The rule is one session per account, and Bind
+		// enforced it by reading the competing mappings and then writing: two instances
+		// pairing the same number at once both read nothing, both write, and the account
+		// ends up on two sessions with the displacement never happening. A constraint is
+		// the only version of that check two transactions cannot both pass.
+		`CREATE UNIQUE INDEX IF NOT EXISTS wac_session_device_account ON wac_session_device (account)`,
 	}
 	for _, statement := range statements {
 		if _, err := c.db.ExecContext(ctx, statement); err != nil {

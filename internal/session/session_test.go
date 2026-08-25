@@ -585,13 +585,25 @@ func TestAnAdoptedSessionOutlivesTheBoundOnItsAdoption(t *testing.T) {
 	})
 	t.Cleanup(func() { manager.StopAll(context.Background()) })
 
-	if _, err := manager.Adopt(context.Background(), "s1"); err != nil {
+	// The context that adopts is the one the caller bounds to keep a slow store off the
+	// goroutine that renews leases, so it can be over seconds later or cancelled outright.
+	ctx, cancel := context.WithCancel(context.Background())
+	if _, err := manager.Adopt(ctx, "s1"); err != nil {
 		t.Fatalf("Adopt: %v", err)
 	}
+	cancel()
+
 	time.Sleep(session.AdoptTimeout + 500*time.Millisecond)
 	if got := manager.Count(); got != 1 {
-		t.Fatalf("the manager runs %d sessions after the adoption's own deadline passed, want 1", got)
+		t.Fatalf("the manager runs %d sessions after the context that adopted them ended, want 1", got)
 	}
+
+	// Still running, not merely still counted.
+	acked := atomic.Bool{}
+	manager.Dispatch(context.Background(), status("c-after", "s1", &acked))
+	waitUntil(t, "the session to answer a command after the adoption context ended", func() bool {
+		return manager.Count() == 1 && !acked.Load()
+	})
 }
 
 // The wake that reaches a peer after an instance died is only useful once the lease

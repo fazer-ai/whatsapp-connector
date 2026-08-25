@@ -215,6 +215,11 @@ func (c *Connector) reclaimCommands(ctx context.Context) {
 	c.dispatchWithin(ctx, deliveries)
 }
 
+// budget is how long one batch of commands may hold the loop. It is a third of the
+// lease, so a batch that spends all of it still leaves two thirds for the renewal that
+// follows.
+func (c *Connector) budget() time.Duration { return c.cfg.LeaseTTL / 3 }
+
 // dispatchWithin carries out what a reclaim took, and stops when it has spent as long
 // as this goroutine can afford.
 //
@@ -224,8 +229,8 @@ func (c *Connector) reclaimCommands(ctx context.Context) {
 // instance holds — and the sessions whose renewals it delays are handed to peers while
 // this instance still holds their sockets open. What is not dispatched is released, so
 // it stays pending and comes back on a later pass.
-func (c *Connector) dispatchWithin(ctx context.Context, deliveries []transport.Delivery) {
-	budget, cancel := context.WithTimeout(ctx, c.cfg.LeaseTTL/3)
+func (c *Connector) dispatchWithin(ctx context.Context, deliveries []transport.Delivery) bool {
+	budget, cancel := context.WithTimeout(ctx, c.budget())
 	defer cancel()
 
 	for i := range deliveries {
@@ -236,11 +241,15 @@ func (c *Connector) dispatchWithin(ctx context.Context, deliveries []transport.D
 				}
 			}
 			c.log.Warn().Int("left", len(deliveries)-i).
-				Msg("a reclaim pass ran out of its budget; the rest stays pending")
-			return
+				Msg("a batch of commands ran out of its budget; the rest stays pending")
+			return false
 		}
-		c.manager.Dispatch(ctx, &deliveries[i])
+		// The budget, not the loop's own context. A wake starting just before the
+		// deadline would otherwise run its whole adoption past it, which is most of the
+		// budget again on the goroutine that has renewals waiting behind it.
+		c.manager.Dispatch(budget, &deliveries[i])
 	}
+	return true
 }
 
 // maxReclaimStreams is how many session streams one reclaim pass looks at. The control
@@ -304,9 +313,11 @@ func (c *Connector) drainAdopted(ctx context.Context) []string {
 			return nil
 		}
 		// One pass takes at most ReadCount per stream, so a session with a long backlog
-		// needs several before anything newer may be read for it.
-		for i := range deliveries {
-			c.manager.Dispatch(ctx, &deliveries[i])
+		// needs several before anything newer may be read for it. A pass cut short by
+		// the budget has left entries pending, so the session is not drained either.
+		if !c.dispatchWithin(ctx, deliveries) {
+			c.manager.ReturnAdopted(adopted)
+			return adopted
 		}
 	}
 
@@ -334,9 +345,7 @@ func (c *Connector) readCommands(ctx context.Context) {
 		}
 		return
 	}
-	for i := range deliveries {
-		c.manager.Dispatch(ctx, &deliveries[i])
-	}
+	c.dispatchWithin(ctx, deliveries)
 }
 
 func (c *Connector) announce(ctx context.Context) {
