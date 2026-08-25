@@ -95,8 +95,8 @@ func TestASenderCarriesBothIdentifiersWhenWhatsAppSendsBoth(t *testing.T) {
 		PushName: "Alice",
 	}
 
-	party := partyOf(info)
-	if party == nil {
+	party, named := partyOf(info)
+	if !named || party == nil {
 		t.Fatal("a sender WhatsApp named twice was left off the message")
 	}
 	if party.LID != "112233445566" || party.Phone != "5511999990001" {
@@ -107,19 +107,42 @@ func TestASenderCarriesBothIdentifiersWhenWhatsAppSendsBoth(t *testing.T) {
 	}
 }
 
-func TestASenderTheContractCannotNameIsLeftOffRatherThanPublishedEmpty(t *testing.T) {
+func TestASenderTheContractCannotNameStopsTheMessageRatherThanGoingOutEmpty(t *testing.T) {
 	t.Parallel()
 
-	// The contract requires a party to carry a phone number or a LID. An object with
-	// neither fails the schema, and a message carrying one is refused whole by a client
-	// that validates — so the field goes rather than the message.
+	// A bridged Messenger account: WhatsApp named a sender and the contract has no way
+	// to say who it is. Publishing the message without the field is the tempting
+	// answer and the wrong one, because a client reading an unattributed message in a
+	// direct chat takes it for the person on the other side of it.
 	info := &waTypes.MessageInfo{
-		MessageSource: waTypes.MessageSource{Sender: waTypes.NewJID("13135550002", waTypes.BotServer)},
-		PushName:      "A bot",
+		MessageSource: waTypes.MessageSource{Sender: waTypes.NewJID("13135550002", waTypes.MessengerServer)},
+		PushName:      "Somebody",
 	}
 
-	if party := partyOf(info); party != nil {
-		t.Fatalf("a sender with neither identifier was published as %+v", party)
+	party, named := partyOf(info)
+	if named {
+		t.Fatalf("a sender the contract cannot name was accepted as %+v", party)
+	}
+}
+
+// The other half: a chat that has no per-message sender at all. A newsletter post is
+// the ordinary case, and the contract makes `sender` nullable for it, so the message is
+// fine and there is simply nobody to attribute it to.
+func TestAChatWithNoSenderPublishesTheMessageWithoutOne(t *testing.T) {
+	t.Parallel()
+
+	info := &waTypes.MessageInfo{
+		MessageSource: waTypes.MessageSource{
+			Chat: waTypes.NewJID("120363111111111111", waTypes.NewsletterServer),
+		},
+	}
+
+	party, named := partyOf(info)
+	if !named {
+		t.Fatal("a chat with no sender was refused, and the contract allows one")
+	}
+	if party != nil {
+		t.Fatalf("a chat with no sender invented %+v", party)
 	}
 }
 
@@ -426,5 +449,80 @@ func TestACodeRequestKeepsTheGroupSubscriptionTheClientAskedFor(t *testing.T) {
 
 	if !session.wantsGroups() {
 		t.Fatal("asking for a pairing code turned the group subscription off")
+	}
+}
+
+// whatsmeow unwraps an edit into the shape a new message arrives in, so an edited text
+// looks exactly like a fresh one by the time anything here sees it. Publishing it as
+// message.received loses the correction and spends the acknowledgement that was the
+// only way to get it back.
+func TestAnEditedMessageIsNotPublishedAsANewOne(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.deliverWait = 50 * time.Millisecond
+
+	edited := textMessage("3EB0ABCDEF", "bom dia, corrigido")
+	edited.IsEdit = true
+	edited.Info.Edit = waTypes.EditAttributeMessageEdit
+
+	acknowledged := make(chan bool, 1)
+	go func() { acknowledged <- session.receive(edited) }()
+
+	select {
+	case emission := <-session.Events():
+		t.Fatalf("an edit was published as %s, and the contract has message.edited for it", emission.Type)
+	case <-time.After(100 * time.Millisecond):
+	}
+	select {
+	case got := <-acknowledged:
+		if got {
+			t.Fatal("an edit nothing published was acknowledged, so WhatsApp will not send it again")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the handler never came back from an edit")
+	}
+}
+
+func TestAMessageFromOneOfMetasBotsIsDroppedAndAcknowledged(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name    string
+		prepare func(*waEvents.Message)
+	}{
+		{"a chat with the assistant itself", func(m *waEvents.Message) {
+			m.Info.Chat = waTypes.NewJID("13135550002", waTypes.DefaultUserServer)
+			m.Info.Sender = m.Info.Chat
+		}},
+		{"the assistant replying inline in somebody else's chat", func(m *waEvents.Message) {
+			m.Info.Sender = waTypes.NewJID("13135550002", waTypes.DefaultUserServer)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			session, _ := newTestSession(t, "5511999990001")
+			session.deliverWait = 50 * time.Millisecond
+			message := textMessage("3EB0BOT", "eu sou a Meta AI")
+			tc.prepare(message)
+
+			acknowledged := make(chan bool, 1)
+			go func() { acknowledged <- session.receive(message) }()
+
+			select {
+			case emission := <-session.Events():
+				t.Fatalf("a bot's message was published as %s", emission.Type)
+			case <-time.After(100 * time.Millisecond):
+			}
+			select {
+			case got := <-acknowledged:
+				if !got {
+					t.Fatal("a chat with an assistant was left for WhatsApp to redeliver for good")
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("the handler never came back from a bot's message")
+			}
+		})
 	}
 }

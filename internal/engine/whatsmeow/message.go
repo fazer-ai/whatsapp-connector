@@ -67,7 +67,14 @@ func addressOf(jid waTypes.JID) (protocol.Address, bool) {
 // depends on the chat's addressing mode, so neither is the one to build on: a client
 // that only ever stored the phone number still has to recognise the LID as the same
 // person the first time a chat switches.
-func partyOf(info *waTypes.MessageInfo) *protocol.Party {
+func partyOf(info *waTypes.MessageInfo) (*protocol.Party, bool) {
+	if info.Sender.IsEmpty() && info.SenderAlt.IsEmpty() {
+		// A chat with no per-message sender, which is what a newsletter post is. The
+		// contract makes `sender` nullable for exactly this, so there is nothing wrong
+		// with the message and nothing to attribute it to.
+		return nil, true
+	}
+
 	party := protocol.Party{PushName: info.PushName}
 	if info.VerifiedName != nil {
 		party.VerifiedName = info.VerifiedName.Details.GetVerifiedName()
@@ -82,12 +89,13 @@ func partyOf(info *waTypes.MessageInfo) *protocol.Party {
 		}
 	}
 	if party.Phone == "" && party.LID == "" {
-		// The contract requires one of the two. A sender with neither is not a party
-		// the client can do anything with, and an object that fails the schema is worse
-		// than an absent one: the whole message would be refused rather than the field.
-		return nil
+		// WhatsApp named a sender and the contract has no way to say who it is. Leaving
+		// the field off would publish the message anyway, and a client reading an
+		// unattributed message in a direct chat takes it for the person on the other
+		// side of it, which puts somebody else's words in their mouth.
+		return nil, false
 	}
-	return &party
+	return &party, true
 }
 
 // inboundOf renders an inbound message the way the contract carries it, and reports
@@ -95,8 +103,21 @@ func partyOf(info *waTypes.MessageInfo) *protocol.Party {
 // milestone saying the message is somebody else's to deliver, which upstream turns
 // into a withheld acknowledgement, so WhatsApp keeps it and sends it again.
 func inboundOf(event *waEvents.Message) (protocol.InboundMessage, bool) {
+	if event.IsEdit || event.Info.Edit != waTypes.EditAttributeEmpty {
+		// whatsmeow unwraps an edit and hands back the corrected text in the shape a
+		// new message arrives in, so nothing further down can tell the two apart. The
+		// contract has `message.edited` for this and M2 has yet to reach it: publishing
+		// it as a message received would either duplicate the original in the
+		// conversation or be deduplicated away, and either way the correction is lost
+		// and the acknowledgement spends the one redelivery it had.
+		return protocol.InboundMessage{}, false
+	}
 	chat, ok := addressOf(event.Info.Chat)
 	if !ok || event.Info.ID == "" {
+		return protocol.InboundMessage{}, false
+	}
+	sender, named := partyOf(&event.Info)
+	if !named {
 		return protocol.InboundMessage{}, false
 	}
 	body, context, ok := textOf(event.Message)
@@ -107,7 +128,7 @@ func inboundOf(event *waEvents.Message) (protocol.InboundMessage, bool) {
 	message := protocol.InboundMessage{
 		ID:        event.Info.ID,
 		Chat:      chat,
-		Sender:    partyOf(&event.Info),
+		Sender:    sender,
 		FromMe:    event.Info.IsFromMe,
 		Timestamp: event.Info.Timestamp.UnixMilli(),
 		Content:   protocol.Text(body),
@@ -162,6 +183,15 @@ func mentionsOf(context *waE2E.ContextInfo) []protocol.Address {
 // emits describes something that already happened, while this one is the reason the
 // message is allowed to leave the phone.
 func (s *Session) receive(event *waEvents.Message) bool {
+	if event.Info.Sender.IsBot() || event.Info.Chat.IsBot() {
+		// Meta's assistants, either in a chat of their own or replying inline in
+		// somebody else's. The contract has no kind for them on purpose, so no slice of
+		// this milestone is going to deliver one: acknowledged rather than refused,
+		// because a chat with an assistant would otherwise redeliver for good.
+		s.log.Debug().Str("message_id", event.Info.ID).Msg("dropping a message from one of Meta's own bots")
+		return true
+	}
+
 	if chat, named := addressOf(event.Info.Chat); named && chat.Kind == protocol.AddressGroup && !s.wantsGroups() {
 		// Acknowledged and published nowhere, which is the opposite of what happens to
 		// a message this build cannot render. The client asked for direct chats only,
