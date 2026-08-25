@@ -8,9 +8,11 @@ through [whatsmeow](https://github.com/tulir/whatsmeow), and exchanges canonical
 events and commands with its clients over Redis Streams.
 
 > [!IMPORTANT]
-> **Status: M0.** The transport, the ownership leases and the service skeleton are
-> here and run against a fake engine; nothing talks to WhatsApp yet. The real engine
-> lands in M1 (see [Roadmap](#roadmap)).
+> **Status: M1, pairing.** A session now pairs with a real WhatsApp account, over a
+> QR code or a code typed on the phone, resumes across restarts, and reports what the
+> connection is doing. It cannot carry messages yet: those arrive with M2, and until
+> then every message command is refused rather than acknowledged (see
+> [Roadmap](#roadmap)).
 
 ## Why a separate service
 
@@ -104,10 +106,24 @@ docker run --rm -p 6379:6379 redis:7-alpine   # in another terminal
 REDIS_URL=redis://127.0.0.1:6379 WAC_ENGINE=fake go run ./cmd/connector serve
 ```
 
-`WAC_ENGINE=fake` is the only engine in this build: it pairs instantly, publishes the
-same frames a real session would, and answers the commands the contract's result table
-names. It is what the end-to-end tests run against, and what an operator can point a
-client at to see the whole path work.
+`WAC_ENGINE=fake` pairs instantly with nothing behind it, publishes the same frames a
+real session would, and answers the commands the contract's result table names. It is
+what the tests run against, and what an operator can point a client at to see the whole
+path work without a phone.
+
+`WAC_ENGINE=whatsmeow` is the real thing, and it needs somewhere to keep a pairing:
+
+```bash
+REDIS_URL=redis://127.0.0.1:6379 \
+  WAC_ENGINE=whatsmeow WAC_DATABASE_URL=sqlite:wa.db \
+  go run ./cmd/connector serve
+```
+
+Postgres (`postgres://…`) is what a fleet runs, since a session that moves between
+instances has to find its device wherever it lands. SQLite is the single-instance case.
+Starting the whatsmeow engine without a database is refused rather than defaulted: a
+connector with nowhere to keep a pairing asks every session to scan a QR code on every
+restart, and reports itself healthy while doing it.
 
 ### Configuration
 
@@ -118,7 +134,8 @@ client at to see the whole path work.
 | `WAC_INSTANCE` | the hostname | This instance's id. In a container the hostname is the container id, which is unique per replica |
 | `WAC_REDIS_PREFIX` | `wa:` | Namespaces every key, so one Redis can host two independent fleets |
 | `WAC_EVENT_SHARDS` | `8` | How many event streams the fleet publishes to. Fleet-wide and effectively permanent: an instance that disagrees with what is recorded refuses to start |
-| `WAC_ENGINE` | `fake` | `fake` today; `whatsmeow` from M1 |
+| `WAC_ENGINE` | `fake` | `whatsmeow` for a real account, `fake` for a fleet with nothing behind it |
+| `WAC_DATABASE_URL` | none | Where pairings live. `postgres://…`, `sqlite:…` or `file:…`. Required by the `whatsmeow` engine |
 | `WAC_HTTP_ADDR` | `:8080` | Where `/healthz`, `/readyz` and `/metrics` listen |
 | `WAC_ADVERTISE_URL` | derived | How clients reach this instance for media |
 | `WAC_LEASE_TTL` | `30s` | How long a session lease survives without a renewal |
@@ -140,7 +157,7 @@ client at to see the whole path work.
 | Milestone | Scope |
 |---|---|
 | **M0** ✅ | Skeleton, Redis Streams transport, lease/ownership port, fake engine, health and metrics, Docker image, publish pipeline |
-| **M1** | whatsmeow engine: QR pairing, session state, logout/ban/outdated handling, own reconnect loop, fenced Postgres store |
+| **M1** 🚧 | whatsmeow engine: QR and code pairing, session state, logout/ban/outdated handling, the device store. Reconnect backoff and the store-level fence are still open |
 | **M2** | Messages in and out (text, media, location, contact, reaction, edit, revoke, quoted, mentions), receipts, read marks, chat presence, idempotent sends |
 | **M3** | Groups, presence, contacts, calls |
 | **M4** | Multi-instance under load, quarantine, metrics/lag/DLQ, operations docs |

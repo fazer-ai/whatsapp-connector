@@ -38,9 +38,12 @@ type Engine interface {
 
 // Session is one WhatsApp account as this connector holds it.
 //
-// Everything blocking takes a context. Nothing here retries: reconnection is a policy
-// the session manager owns, because it is the only layer that knows whether this
-// instance still holds the lease.
+// Everything blocking takes a context. An engine may recover its own socket, and the
+// whatsmeow one has to: WhatsApp closes the stream in the middle of pairing and
+// expects the client back, so a client that never reconnects never finishes pairing.
+// What an engine must not do is decide whether this instance still owns the account.
+// That is the layer above, which holds the lease and closes the session the moment it
+// is gone.
 type Session interface {
 	// Connect starts pairing or resumes a stored session. Progress arrives on Events,
 	// not as a return value: pairing is a conversation, not a call.
@@ -67,5 +70,15 @@ type ConnectRequest struct {
 	Pairing string `json:"pairing"`
 	// Phone is required by code pairing and ignored otherwise.
 	Phone string `json:"phone,omitempty"`
-	Proxy string `json:"proxy,omitempty"`
+	// DeviceName is what the account's linked-devices list shows.
+	DeviceName string `json:"device_name,omitempty"`
+	// Proxy is an object in the contract, not a string: decoding it as one made every
+	// connect carrying a proxy fail to parse before it reached an engine.
+	Proxy *ProxyRequest `json:"proxy,omitempty"`
+}
+
+// ProxyRequest is the proxy half of `session.connect`. Honouring it is M5; parsing it
+// is here so a client that sends one is not answered with invalid_payload.
+type ProxyRequest struct {
+	URL string `json:"url,omitempty"`
 }

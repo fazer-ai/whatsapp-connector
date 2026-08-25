@@ -255,3 +255,24 @@ func TestAnInstanceWithADifferentShardCountRefusesToStart(t *testing.T) {
 		t.Fatal("an instance with a different shard count started")
 	}
 }
+
+// A whatsmeow engine with nowhere to keep a pairing is a deployment that asks every
+// session to scan a QR code on every restart while reporting itself healthy. Refusing
+// at startup is what turns that into a message an operator sees once.
+func TestTheRealEngineRefusesToStartWithoutADatabase(t *testing.T) {
+	t.Setenv("WAC_ENGINE", "whatsmeow")
+	t.Setenv("WAC_DATABASE_URL", "")
+
+	if _, err := app.LoadConfig("connector-test"); err == nil {
+		t.Fatal("the whatsmeow engine started with no database url")
+	}
+
+	t.Setenv("WAC_DATABASE_URL", "sqlite:wa.db")
+	cfg, err := app.LoadConfig("connector-test")
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.DatabaseURL != "sqlite:wa.db" {
+		t.Fatalf("the config carries %q", cfg.DatabaseURL)
+	}
+}

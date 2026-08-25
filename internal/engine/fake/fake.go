@@ -25,6 +25,9 @@ const QRData = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="
 // PairingCode is the code the fake issues for code pairing.
 const PairingCode = "K7QP2M4X"
 
+// PairedPhone is the number the fake reports having paired.
+const PairedPhone = "5511999990001"
+
 // Engine hands out fake sessions and remembers them, so a test can reach into one it
 // has already handed to the layer under test.
 type Engine struct {
@@ -109,8 +112,11 @@ func (s *Session) Connect(_ context.Context, req engine.ConnectRequest) error {
 	}
 
 	if req.Pairing != "resume" {
+		// `phone`, not an address: the schema requires the digits at the top level, and
+		// a fake that publishes a shape the contract rejects is an end-to-end check that
+		// proves the client would refuse the real thing.
 		s.emit(protocol.EventPairingSuccess, map[string]any{
-			"address":  map[string]any{"kind": "phone", "id": "5511999990001"},
+			"phone":    PairedPhone,
 			"platform": "fake",
 		})
 	}

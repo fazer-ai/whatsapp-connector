@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -16,11 +15,13 @@ import (
 	"github.com/fazer-ai/whatsapp-connector/internal/cluster"
 	"github.com/fazer-ai/whatsapp-connector/internal/engine"
 	"github.com/fazer-ai/whatsapp-connector/internal/engine/fake"
+	meow "github.com/fazer-ai/whatsapp-connector/internal/engine/whatsmeow"
 	"github.com/fazer-ai/whatsapp-connector/internal/httpserver"
 	"github.com/fazer-ai/whatsapp-connector/internal/observability"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 	"github.com/fazer-ai/whatsapp-connector/internal/redisx"
 	"github.com/fazer-ai/whatsapp-connector/internal/session"
+	"github.com/fazer-ai/whatsapp-connector/internal/store"
 	"github.com/fazer-ai/whatsapp-connector/internal/transport/redisstream"
 )
 
@@ -42,6 +43,7 @@ type Connector struct {
 	registry *cluster.Registry
 	manager  *session.Manager
 	engine   engine.Engine
+	store    *store.Container
 	streams  *redisstream.Streams
 	http     *httpserver.Server
 }
@@ -66,7 +68,7 @@ func New(cfg *Config, log zerolog.Logger) (*Connector, error) {
 		return nil, err
 	}
 
-	waEngine, err := newEngine(cfg.Engine)
+	waEngine, devices, err := newEngine(context.Background(), cfg, log)
 	if err != nil {
 		return nil, err
 	}
@@ -86,6 +88,7 @@ func New(cfg *Config, log zerolog.Logger) (*Connector, error) {
 	c := &Connector{
 		cfg: *cfg, log: log, metrics: metrics, client: client, leases: leases,
 		registry: cluster.NewRegistry(client, 3*cfg.Heartbeat), manager: manager, engine: waEngine,
+		store: devices,
 	}
 	c.http = httpserver.New(httpserver.Options{
 		Addr: cfg.HTTPAddr, Health: c, Registry: metrics.Registry,
@@ -196,22 +199,33 @@ func (c *Connector) shutdown() {
 	if err := c.engine.Close(); err != nil {
 		c.log.Warn().Err(err).Msg("failed to close the engine")
 	}
+	if c.store != nil {
+		if err := c.store.Close(); err != nil {
+			c.log.Warn().Err(err).Msg("failed to close the store")
+		}
+	}
 	if err := c.client.Close(); err != nil {
 		c.log.Warn().Err(err).Msg("failed to close the redis client")
 	}
 	c.log.Info().Msg("connector is down")
 }
 
-func newEngine(name string) (engine.Engine, error) {
-	switch name {
-	case "fake":
-		return fake.New(), nil
-	case "whatsmeow":
-		// M1 brings it. Refusing is right: starting with the fake engine because the
-		// real one is missing would pair nothing and report every session healthy.
-		return nil, errors.New("app: the whatsmeow engine is not in this build yet")
+// newEngine builds the WhatsApp side. The store comes back with it because only the
+// whatsmeow engine has one, and whoever built it has to close it.
+//
+//nolint:gocritic // zerolog.Logger is designed to be copied; every With() returns one by value
+func newEngine(ctx context.Context, cfg *Config, log zerolog.Logger) (engine.Engine, *store.Container, error) {
+	switch cfg.Engine {
+	case EngineFake:
+		return fake.New(), nil, nil
+	case EngineWhatsmeow:
+		devices, err := store.Open(ctx, cfg.DatabaseURL)
+		if err != nil {
+			return nil, nil, err
+		}
+		return meow.New(devices, log), devices, nil
 	default:
-		return nil, fmt.Errorf("app: unknown engine %q", name)
+		return nil, nil, fmt.Errorf("app: unknown engine %q", cfg.Engine)
 	}
 }
 

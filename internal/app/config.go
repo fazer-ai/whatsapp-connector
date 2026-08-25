@@ -25,6 +25,7 @@ type Config struct {
 	RedisPrefix  string
 	EventShards  int
 	Engine       string
+	DatabaseURL  string
 	HTTPAddr     string
 	AdvertiseURL string
 	MediaToken   string
@@ -32,6 +33,12 @@ type Config struct {
 	LeaseTTL     time.Duration
 	Heartbeat    time.Duration
 }
+
+// The engines this build can run.
+const (
+	EngineFake      = "fake"
+	EngineWhatsmeow = "whatsmeow"
+)
 
 // DefaultEventShards is how many event streams a fleet publishes to. It is fleet-wide
 // and effectively permanent: changing it re-hashes every session onto a different
@@ -62,6 +69,7 @@ func LoadConfig(hostname string) (Config, error) {
 		RedisPrefix:  envString("WAC_REDIS_PREFIX", redisx.DefaultPrefix),
 		EventShards:  shards,
 		Engine:       envString("WAC_ENGINE", "fake"),
+		DatabaseURL:  envString("WAC_DATABASE_URL", ""),
 		HTTPAddr:     envString("WAC_HTTP_ADDR", ":8080"),
 		AdvertiseURL: envString("WAC_ADVERTISE_URL", ""),
 		MediaToken:   envString("WAC_MEDIA_TOKEN", ""),
@@ -74,6 +82,12 @@ func LoadConfig(hostname string) (Config, error) {
 	}
 	if cfg.EventShards <= 0 {
 		return Config{}, fmt.Errorf("app: WAC_EVENT_SHARDS must be positive, got %d", cfg.EventShards)
+	}
+	if cfg.Engine == EngineWhatsmeow && cfg.DatabaseURL == "" {
+		// A whatsmeow engine with nowhere to keep a pairing would ask every session to
+		// scan a QR code on every restart, which is a deployment that looks healthy and
+		// is not.
+		return Config{}, fmt.Errorf("app: WAC_DATABASE_URL is required when WAC_ENGINE is %q", EngineWhatsmeow)
 	}
 	if cfg.AdvertiseURL == "" {
 		cfg.AdvertiseURL = "http://" + cfg.Instance + strings.TrimPrefix(cfg.HTTPAddr, "0.0.0.0")

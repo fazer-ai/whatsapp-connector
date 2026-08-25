@@ -1,0 +1,422 @@
+package whatsmeow
+
+import (
+	"bytes"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"image/png"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/rs/zerolog"
+	wm "go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/proto/waAdv"
+	"go.mau.fi/whatsmeow/types"
+	waEvents "go.mau.fi/whatsmeow/types/events"
+
+	"github.com/fazer-ai/whatsapp-connector/internal/engine"
+	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
+	"github.com/fazer-ai/whatsapp-connector/internal/store"
+)
+
+func TestQRDataURLIsAnImageTheContractAccepts(t *testing.T) {
+	t.Parallel()
+
+	url, err := qrDataURL("2@abc,def,ghi")
+	if err != nil {
+		t.Fatalf("qrDataURL: %v", err)
+	}
+
+	const prefix = "data:image/png;base64,"
+	if !strings.HasPrefix(url, prefix) {
+		t.Fatalf("the pairing image does not carry the prefix the schema requires: %.40s", url)
+	}
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(url, prefix))
+	if err != nil {
+		t.Fatalf("the pairing image is not base64: %v", err)
+	}
+	if _, err := png.Decode(bytes.NewReader(raw)); err != nil {
+		t.Fatalf("the pairing image is not a png: %v", err)
+	}
+}
+
+func TestConnectRefusesWhatItCannotDo(t *testing.T) {
+	t.Parallel()
+
+	for name, test := range map[string]struct {
+		request engine.ConnectRequest
+		code    protocol.ErrorCode
+	}{
+		"an unknown pairing mode": {
+			request: engine.ConnectRequest{Pairing: "carrier-pigeon"},
+			code:    protocol.ErrorInvalidPayload,
+		},
+		"code pairing with no number": {
+			request: engine.ConnectRequest{Pairing: "code"},
+			code:    protocol.ErrorInvalidPayload,
+		},
+		"resuming a session that never paired": {
+			request: engine.ConnectRequest{Pairing: "resume"},
+			code:    protocol.ErrorNotPaired,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			session, _ := newTestSession(t, "")
+
+			err := session.Connect(t.Context(), test.request)
+			var coded *protocol.Error
+			if !errors.As(err, &coded) {
+				t.Fatalf("Connect returned %v, want a protocol error", err)
+			}
+			if coded.Code != test.code {
+				t.Fatalf("Connect answered %q, want %q", coded.Code, test.code)
+			}
+		})
+	}
+}
+
+func TestExecuteAnswersTheSessionAndRefusesTheRest(t *testing.T) {
+	t.Parallel()
+	session, _ := newTestSession(t, "")
+
+	result, err := session.Execute(t.Context(), &protocol.Command{Type: protocol.CommandSessionStatus})
+	if err != nil {
+		t.Fatalf("session.status: %v", err)
+	}
+	var status struct {
+		State string `json:"state"`
+		Phone string `json:"phone"`
+	}
+	if err := json.Unmarshal(result, &status); err != nil {
+		t.Fatalf("unmarshal the status: %v", err)
+	}
+	if status.State != "close" {
+		t.Fatalf("an unconnected session reports %q, want close", status.State)
+	}
+
+	// M2 brings the sends. Until then a refusal is the honest answer: acknowledging a
+	// send this build cannot make would lose the message and report success.
+	if _, err := session.Execute(t.Context(), &protocol.Command{Type: protocol.CommandMessageSend}); !errors.Is(err, engine.ErrNotSupported) {
+		t.Fatalf("message.send answered %v, want ErrNotSupported", err)
+	}
+}
+
+func TestStatusCarriesTheAddressOncePaired(t *testing.T) {
+	t.Parallel()
+	session, _ := newTestSession(t, "5511999990001")
+
+	result, err := session.Execute(t.Context(), &protocol.Command{Type: protocol.CommandSessionStatus})
+	if err != nil {
+		t.Fatalf("session.status: %v", err)
+	}
+	var status map[string]any
+	if err := json.Unmarshal(result, &status); err != nil {
+		t.Fatalf("unmarshal the status: %v", err)
+	}
+	if status["phone"] != "5511999990001" {
+		t.Fatalf("the status carries phone=%v", status["phone"])
+	}
+}
+
+func TestHandleTranslatesWhatWhatsappReports(t *testing.T) {
+	t.Parallel()
+
+	for name, test := range map[string]struct {
+		event any
+		want  protocol.EventType
+		check func(t *testing.T, payload map[string]any)
+	}{
+		"a connection": {
+			event: &waEvents.Connected{},
+			want:  protocol.EventSessionState,
+			check: func(t *testing.T, payload map[string]any) {
+				if payload["state"] != "close" {
+					t.Fatalf("state=%v on a client that never connected", payload["state"])
+				}
+			},
+		},
+		"a disconnection": {
+			event: &waEvents.Disconnected{},
+			want:  protocol.EventSessionState,
+			check: func(t *testing.T, payload map[string]any) {
+				if payload["state"] != "reconnecting" {
+					t.Fatalf("state=%v, want reconnecting", payload["state"])
+				}
+			},
+		},
+		"another device taking the stream": {
+			event: &waEvents.StreamReplaced{},
+			want:  protocol.EventSessionStreamReplaced,
+		},
+		"a temporary ban": {
+			event: &waEvents.TemporaryBan{Code: waEvents.TempBanReason(101), Expire: time.Hour},
+			want:  protocol.EventSessionTemporaryBan,
+			check: func(t *testing.T, payload map[string]any) {
+				ban, ok := payload["ban"].(map[string]any)
+				if !ok {
+					t.Fatalf("the ban is %T, want an object", payload["ban"])
+				}
+				if ban["kind"] != "temporary" {
+					t.Fatalf("kind=%v, want temporary", ban["kind"])
+				}
+				if _, ok := ban["expires_at"].(float64); !ok {
+					t.Fatalf("expires_at is %T, want a timestamp", ban["expires_at"])
+				}
+			},
+		},
+		"a build WhatsApp refuses": {
+			event: &waEvents.ClientOutdated{},
+			want:  protocol.EventSessionClientOutdated,
+		},
+		"a connect failure": {
+			event: &waEvents.ConnectFailure{Reason: waEvents.ConnectFailureServiceUnavailable, Message: "later"},
+			want:  protocol.EventSessionConnectFailure,
+			check: func(t *testing.T, payload map[string]any) {
+				if payload["reason"] == nil || payload["code"] == nil {
+					t.Fatalf("the failure carries reason=%v code=%v", payload["reason"], payload["code"])
+				}
+			},
+		},
+		"a successful pairing": {
+			event: &waEvents.PairSuccess{
+				ID:       types.JID{User: "5511999990001", Server: types.DefaultUserServer},
+				LID:      types.JID{User: "192676662091991", Server: types.HiddenUserServer},
+				Platform: "android",
+			},
+			want: protocol.EventPairingSuccess,
+			check: func(t *testing.T, payload map[string]any) {
+				if payload["phone"] != "5511999990001" {
+					t.Fatalf("phone=%v", payload["phone"])
+				}
+				if payload["lid"] != "192676662091991" {
+					t.Fatalf("lid=%v", payload["lid"])
+				}
+			},
+		},
+		"a failed pairing": {
+			event: &waEvents.PairError{Error: errors.New("the phone said no")},
+			want:  protocol.EventPairingError,
+			check: func(t *testing.T, payload map[string]any) {
+				if payload["message"] != "the phone said no" {
+					t.Fatalf("message=%v", payload["message"])
+				}
+			},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			session, _ := newTestSession(t, "")
+
+			session.handle(test.event)
+			emission := next(t, session)
+			if emission.Type != test.want {
+				t.Fatalf("published %q, want %q", emission.Type, test.want)
+			}
+			if test.check != nil {
+				test.check(t, decode(t, emission.Payload))
+			}
+		})
+	}
+}
+
+func TestBeingLoggedOutForgetsTheDevice(t *testing.T) {
+	t.Parallel()
+	session, container := newTestSession(t, "5511999990001")
+
+	if _, bound, err := container.JID(t.Context(), session.sid); err != nil || !bound {
+		t.Fatalf("the session is not bound to begin with (bound=%v, err=%v)", bound, err)
+	}
+
+	session.handle(&waEvents.LoggedOut{OnConnect: true})
+
+	emission := next(t, session)
+	if emission.Type != protocol.EventSessionLoggedOut {
+		t.Fatalf("published %q, want %q", emission.Type, protocol.EventSessionLoggedOut)
+	}
+	if payload := decode(t, emission.Payload); payload["on_connect"] != true {
+		t.Fatalf("on_connect=%v, want true", payload["on_connect"])
+	}
+
+	// Credentials WhatsApp has revoked are worse than none: a session that keeps them
+	// looks resumable and fails every reconnect.
+	if _, bound, err := container.JID(t.Context(), session.sid); err != nil || bound {
+		t.Fatalf("the device survived a logout (bound=%v, err=%v)", bound, err)
+	}
+}
+
+func TestPairingChannelIsTranslated(t *testing.T) {
+	t.Parallel()
+
+	for name, test := range map[string]struct {
+		item wm.QRChannelItem
+		want protocol.EventType
+	}{
+		"a code":            {item: wm.QRChannelItem{Event: "code", Code: "2@a,b,c", Timeout: 20 * time.Second}, want: protocol.EventPairingQR},
+		"nobody scanned it": {item: wm.QRChannelTimeout, want: protocol.EventPairingError},
+		"an outdated build": {item: wm.QRChannelClientOutdated, want: protocol.EventSessionClientOutdated},
+		"an error": {
+			item: wm.QRChannelItem{Event: "error", Error: errors.New("no")},
+			want: protocol.EventPairingError,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			session, _ := newTestSession(t, "")
+
+			session.publishPairing(test.item, true)
+			if emission := next(t, session); emission.Type != test.want {
+				t.Fatalf("published %q, want %q", emission.Type, test.want)
+			}
+		})
+	}
+}
+
+func TestCodePairingDoesNotPublishImages(t *testing.T) {
+	t.Parallel()
+	session, _ := newTestSession(t, "")
+
+	// An operator who asked for a code is not looking at an image, and publishing both
+	// would offer the dashboard two ways to pair one session.
+	session.publishPairing(wm.QRChannelItem{Event: "code", Code: "2@a,b,c"}, false)
+	session.publishPairing(wm.QRChannelTimeout, false)
+
+	if emission := next(t, session); emission.Type != protocol.EventPairingError {
+		t.Fatalf("published %q first, want the timeout alone", emission.Type)
+	}
+}
+
+func TestCloseEndsTheEventChannelAndIsSafeTwice(t *testing.T) {
+	t.Parallel()
+	session, _ := newTestSession(t, "")
+
+	if err := session.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if _, open := <-session.Events(); open {
+		t.Fatal("Events is still open after Close")
+	}
+	if err := session.Close(); err != nil {
+		t.Fatalf("the second Close: %v", err)
+	}
+	if !session.Closed() {
+		t.Fatal("Closed reports false after Close")
+	}
+}
+
+func TestEngineKeepsOneSessionPerAccount(t *testing.T) {
+	t.Parallel()
+	container := openStore(t)
+	waEngine := New(container, zerolog.Nop())
+	t.Cleanup(func() {
+		if err := waEngine.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	})
+
+	first, err := waEngine.Open(t.Context(), "sid-1")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	again, err := waEngine.Open(t.Context(), "sid-1")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if first != again {
+		t.Fatal("a second Open built a second client on one account's credentials")
+	}
+
+	// A closed session holds a socket that cannot be reopened, so the next Open has to
+	// build a new one rather than hand back one that will never connect.
+	if err := first.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	replacement, err := waEngine.Open(t.Context(), "sid-1")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if replacement == first {
+		t.Fatal("Open handed back a closed session")
+	}
+}
+
+// newTestSession builds a session on a real device store and no socket. A phone number
+// makes it a paired one.
+func newTestSession(t *testing.T, phone string) (*Session, *store.Container) {
+	t.Helper()
+
+	container := openStore(t)
+	sid := "sid-" + t.Name()
+	device, err := container.Device(t.Context(), sid)
+	if err != nil {
+		t.Fatalf("Device: %v", err)
+	}
+	if phone != "" {
+		jid, err := types.ParseJID(phone + "@" + types.DefaultUserServer)
+		if err != nil {
+			t.Fatalf("ParseJID: %v", err)
+		}
+		device.ID = &jid
+		device.Account = &waAdv.ADVSignedDeviceIdentity{
+			Details:             make([]byte, 32),
+			AccountSignature:    make([]byte, 64),
+			AccountSignatureKey: make([]byte, 32),
+			DeviceSignature:     make([]byte, 64),
+		}
+		if err := container.Devices().PutDevice(t.Context(), device); err != nil {
+			t.Fatalf("PutDevice: %v", err)
+		}
+		if err := container.Bind(t.Context(), sid, jid); err != nil {
+			t.Fatalf("Bind: %v", err)
+		}
+	}
+
+	session := newSession(sid, wm.NewClient(device, nil), container, zerolog.Nop())
+	t.Cleanup(func() { _ = session.Close() })
+	return session, container
+}
+
+func openStore(t *testing.T) *store.Container {
+	t.Helper()
+
+	address := "file:" + filepath.Join(t.TempDir(), "wac.db") + "?_pragma=foreign_keys(1)"
+	container, err := store.Open(t.Context(), address)
+	if err != nil {
+		t.Fatalf("Open the store: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := container.Close(); err != nil {
+			t.Errorf("Close the store: %v", err)
+		}
+	})
+	return container
+}
+
+// next reads the emission the session just published, or fails rather than hanging.
+func next(t *testing.T, session *Session) engine.Emission {
+	t.Helper()
+
+	select {
+	case emission, ok := <-session.Events():
+		if !ok {
+			t.Fatal("the session published nothing and closed")
+		}
+		return emission
+	case <-time.After(2 * time.Second):
+		t.Fatal("the session published nothing")
+		return engine.Emission{}
+	}
+}
+
+func decode(t *testing.T, payload json.RawMessage) map[string]any {
+	t.Helper()
+
+	var decoded map[string]any
+	if err := json.Unmarshal(payload, &decoded); err != nil {
+		t.Fatalf("unmarshal the payload: %v", err)
+	}
+	return decoded
+}
