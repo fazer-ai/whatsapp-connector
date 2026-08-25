@@ -21,6 +21,9 @@ import (
 	"github.com/fazer-ai/whatsapp-connector/internal/store"
 )
 
+// deviceNameOnce guards the one write to whatsmeow's process-wide device properties.
+var deviceNameOnce sync.Once
+
 // Engine hands out one session per account, backed by a shared device store.
 type Engine struct {
 	store *store.Container
@@ -43,7 +46,11 @@ type Engine struct {
 //nolint:gocritic // zerolog.Logger is designed to be copied; every With() returns one by value
 func New(container *store.Container, deviceName string, log zerolog.Logger) *Engine {
 	if deviceName != "" {
-		waStore.DeviceProps.Os = proto.String(deviceName)
+		// Written exactly once, because it is written to a package-level value whatsmeow
+		// reads from its pairing handshake: a second engine assigning it is a write with
+		// no lock against a read on another goroutine. The first name wins, which is the
+		// deployment's own, since a process runs one engine.
+		deviceNameOnce.Do(func() { waStore.DeviceProps.Os = proto.String(deviceName) })
 	}
 	return &Engine{
 		store:    container,

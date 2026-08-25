@@ -1234,3 +1234,131 @@ func TestAPairedNumberIsReportedAsDigits(t *testing.T) {
 		})
 	}
 }
+
+// whatsmeow can have queued a Connected before a disconnect landed, and that handler
+// clears the hang-up guard before it records the connection. A hang-up settling in
+// between is one whose `close` the handler then paints over with `open`: the socket is
+// down, the session says it is up, and no later event corrects it, because whatsmeow
+// publishes nothing more for a socket it already closed.
+func TestAHangUpThatFinishedIsNeverPaintedOverByALateConnect(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	// Read as they arrive, or the inbox fills and the handlers stop being what is under
+	// test.
+	go func() {
+		//nolint:revive // an empty body is the point: keep the forwarder moving
+		for range session.Events() {
+		}
+	}()
+
+	// The deterministic half: a hang-up has to wait for a socket transition already in
+	// progress, the same way every other one does. Nothing outside the session can pin a
+	// handler mid-transition, so this is what pins the rule itself.
+	session.transition.Lock()
+	settled := make(chan struct{})
+	go func() { defer close(settled); session.settleHangUp() }()
+	select {
+	case <-settled:
+		t.Fatal("a hang-up settled while another socket transition was in progress")
+	case <-time.After(50 * time.Millisecond):
+	}
+	session.transition.Unlock()
+	<-settled
+
+	for round := range 500 {
+		// Back to where a hang-up starts: a socket that is up and no guard standing.
+		session.setConnected(true)
+		session.mu.Lock()
+		session.hungUp = false
+		session.mu.Unlock()
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); session.handle(&waEvents.Connected{}) }()
+		go func() { defer wg.Done(); session.settleHangUp() }()
+		wg.Wait()
+
+		if state := session.state(); state != "close" {
+			t.Fatalf("round %d: a hang-up that finished left the session reporting %q", round, state)
+		}
+	}
+}
+
+// A dial that never reached WhatsApp produces no whatsmeow event, so a pairing that only
+// answered its caller leaves the `connecting` it published standing for good.
+func TestAPairingDialThatFailedIsReported(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "")
+	run := session.startPairing(func() {})
+	session.setDialing(true)
+
+	session.abandonPairing(run, session.current(), "connect_failed", errors.New("no route to host"))
+
+	if emission := next(t, session); emission.Type != protocol.EventPairingError {
+		t.Fatalf("published %q, want the pairing failure", emission.Type)
+	}
+	emission := next(t, session)
+	if emission.Type != protocol.EventSessionState {
+		t.Fatalf("published %q, want the connection going down with the attempt", emission.Type)
+	}
+	var body struct {
+		State  string `json:"state"`
+		Reason string `json:"reason"`
+	}
+	if err := json.Unmarshal(emission.Payload, &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if body.State != "close" {
+		t.Fatalf("the attempt ended with the session reporting %q", body.State)
+	}
+	if state := session.state(); state != "close" {
+		t.Fatalf("session.status still answers %q for a pairing that ended", state)
+	}
+}
+
+// The reader of the pairing channel reports WhatsApp's own outcomes through the same
+// gate, so a run that ends here while a timeout is being published must not publish a
+// second failure on top of it.
+func TestAPairingIsGivenUpOnOnlyOnce(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "")
+	run := session.startPairing(func() {})
+
+	session.abandonPairing(run, session.current(), "connect_failed", errors.New("no route to host"))
+	session.abandonPairing(run, session.current(), "connect_failed", errors.New("no route to host"))
+
+	if emission := next(t, session); emission.Type != protocol.EventPairingError {
+		t.Fatalf("published %q, want the pairing failure", emission.Type)
+	}
+	if emission := next(t, session); emission.Type != protocol.EventSessionState {
+		t.Fatalf("published %q, want the connection going down", emission.Type)
+	}
+	select {
+	case emission := <-session.Events():
+		t.Fatalf("the second attempt to give up published %q as well", emission.Type)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// whatsmeow keeps the device name in a package-level value it reads from the pairing
+// handshake, so an engine assigning it is a write with no lock against every other one.
+func TestBuildingEnginesAtOnceDoesNotRaceOverTheDeviceName(t *testing.T) {
+	t.Parallel()
+
+	container := openStore(t)
+	var wg sync.WaitGroup
+	for i := range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			waEngine := New(container, fmt.Sprintf("fazer.ai test %d", i), zerolog.Nop())
+			if err := waEngine.Close(); err != nil {
+				t.Errorf("Close: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+}

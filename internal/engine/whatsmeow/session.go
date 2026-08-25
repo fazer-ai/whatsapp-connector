@@ -462,10 +462,7 @@ func (s *Session) pairWithQR(ctx context.Context) error {
 	go s.readPairing(run, codes)
 
 	s.emit(protocol.EventSessionState, map[string]any{"state": "connecting"})
-	abandon := func(err error) {
-		s.publishPairingFailure("connect_failed", err)
-		s.abandonPairing(run, client)
-	}
+	abandon := func(err error) { s.abandonPairing(run, client, "connect_failed", err) }
 	if err := s.dial(ctx, client, abandon); err != nil {
 		s.giveUpOn(ctx, run, client, err)
 		return fmt.Errorf("whatsmeow: connect %s: %w", s.sid, err)
@@ -482,9 +479,14 @@ func (s *Session) pairWithQR(ctx context.Context) error {
 // deadline it just escaped.
 func (s *Session) giveUpOn(ctx context.Context, run *pairingRun, client *wm.Client, err error) {
 	if errors.Is(err, ctx.Err()) && ctx.Err() != nil {
+		// The dial is still running and reports its own outcome when it detaches.
 		return
 	}
-	go s.abandonPairing(run, client)
+	// Reported, not just torn down. The `connecting` this attempt published is still
+	// standing, and nothing else will take it down: a dial that never reached WhatsApp
+	// produces no whatsmeow event, so a failure that only answered its caller leaves
+	// every client watching the stream connecting for good.
+	go s.abandonPairing(run, client, "connect_failed", err)
 }
 
 // hangUp closes the socket without holding the session's command queue behind a dial.
@@ -520,7 +522,16 @@ func (s *Session) hangUp(ctx context.Context, client *wm.Client) error {
 }
 
 // settleHangUp records a socket this session took down on purpose.
+//
+// Held under transition like every other socket transition, and for the same reason.
+// whatsmeow can have queued a Connected before the disconnect landed: without this, that
+// handler reads hungUp before this sets it, publishes `close` here, and then sets the
+// state to connected and publishes `open` on top of it. A socket that is down would then
+// be reported open for good, with nothing arriving later to correct it.
 func (s *Session) settleHangUp() {
+	s.transition.Lock()
+	defer s.transition.Unlock()
+
 	s.mu.Lock()
 	if s.closed {
 		// The session is being torn down; its own Close publishes nothing and neither
@@ -539,12 +550,18 @@ func (s *Session) settleHangUp() {
 // corrected connect can start a new one. Without the disconnect the next GetQRChannel
 // refuses, because whatsmeow will not open a second pairing channel on a live socket,
 // and the operator is stuck until the codes run out.
-func (s *Session) abandonPairing(run *pairingRun, client *wm.Client) {
+func (s *Session) abandonPairing(run *pairingRun, client *wm.Client, reason string, err error) {
 	// Only if this run is still the current one. These calls can be detached from the
 	// command that started them, and the operator's corrected attempt may already own
 	// the socket: tearing that one down would be this attempt failing the next one.
 	if !s.endPairing(run) {
 		return
+	}
+	// Published from inside that gate, because the reader of the pairing channel takes
+	// the same one for the outcomes WhatsApp reports. Outside it, an attempt that ends
+	// here while its reader is reporting a timeout publishes both.
+	if reason != "" {
+		s.publishPairingFailure(reason, err)
 	}
 	run.cancel()
 	client.Disconnect()
@@ -612,7 +629,7 @@ func (s *Session) pairWithCode(ctx context.Context, rawPhone string) error {
 	if err := s.dial(ctx, client, nil); err != nil {
 		// Off the executor when the dial is still running: Disconnect waits on the lock
 		// that dial is holding, and this attempt is over either way.
-		go s.abandonPairing(run, client)
+		go s.abandonPairing(run, client, "connect_failed", err)
 		return fmt.Errorf("whatsmeow: connect %s: %w", s.sid, err)
 	}
 
@@ -626,7 +643,7 @@ func (s *Session) pairWithCode(ctx context.Context, rawPhone string) error {
 		// Unlike a QR conversation, this one cannot carry on without its command:
 		// nothing else will ever call PairPhone. Left up, the socket refuses the
 		// operator's next attempt at GetQRChannel until WhatsApp's own codes run out.
-		go s.abandonPairing(run, client)
+		go s.abandonPairing(run, client, "connect_failed", ctx.Err())
 		return fmt.Errorf("whatsmeow: %s did not reach the server in time: %w", s.sid, ctx.Err())
 	case <-s.done:
 		return errors.New("whatsmeow: the session closed before it could ask for a code")
@@ -636,8 +653,9 @@ func (s *Session) pairWithCode(ctx context.Context, rawPhone string) error {
 	if err != nil {
 		// A number WhatsApp refuses is the ordinary case here, and the operator is about
 		// to type a corrected one. Leaving the pairing socket up would refuse that next
-		// attempt too, for reasons that have nothing to do with the number.
-		s.abandonPairing(run, client)
+		// attempt too, for reasons that have nothing to do with the number. The reply
+		// carries the reason; this is what takes the connection down with the attempt.
+		s.abandonPairing(run, client, "code_refused", err)
 		if coded := codeForPairPhone(err); coded != nil {
 			return coded
 		}
@@ -1122,6 +1140,10 @@ func pairingFailureMessage(reason string) string {
 		return "WhatsApp accepted the code but the pairing could not be completed"
 	case "err-scanned-without-multidevice":
 		return "that account still has to turn multi-device on before it can be linked"
+	case "code_refused":
+		return "WhatsApp would not send a pairing code to that number"
+	case "connect_failed":
+		return "the connector could not reach WhatsApp"
 	default:
 		return "the pairing did not complete"
 	}
