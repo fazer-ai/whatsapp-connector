@@ -126,6 +126,10 @@ type Session struct {
 	// replaced it: functions are not comparable, and "is this still mine" is the whole
 	// question.
 	pairing *pairingRun
+	// hangingUp is a disconnect this session started and has not seen finish. whatsmeow
+	// holds its socket lock for the length of a dial and Disconnect waits for the same
+	// lock, so a disconnect can outlive the command that asked for it.
+	hangingUp chan struct{}
 	// runs counts the conversations this session has started, which is what gives each
 	// one a name the client can answer to.
 	runs uint64
@@ -349,6 +353,15 @@ func (s *Session) Connect(ctx context.Context, req engine.ConnectRequest) error 
 			fmt.Sprintf("%q is not a pairing mode this connector knows", req.Pairing))
 	}
 
+	// Waited for before the guard comes down, and before anything is dialled. A
+	// disconnect that outlived its command is still going to close the socket, and a
+	// connect answered `open` in between is one the older command then closes underneath:
+	// the two take effect in the opposite order to the one they were sent in, which is
+	// the whole thing a session's own queue exists to prevent.
+	if err := s.awaitHangUp(ctx); err != nil {
+		return err
+	}
+
 	// Cleared here and not on the way in. hungUp is what rejects a Connected event the
 	// library had already queued when a manual disconnect completed, and a manual
 	// disconnect is followed by no Disconnected event to undo it. A request refused
@@ -381,6 +394,28 @@ func (s *Session) Connect(ctx context.Context, req engine.ConnectRequest) error 
 		s.transition.Unlock()
 	}
 	return err
+}
+
+// awaitHangUp waits for a disconnect this session started and has not seen finish.
+//
+// The command that asked for it was answered with a failure when it ran out of time, and
+// the socket goes down a moment later regardless. Whoever comes next has to wait for that
+// to land rather than read the socket that is still up as one it may keep.
+func (s *Session) awaitHangUp(ctx context.Context) error {
+	s.mu.Lock()
+	pending := s.hangingUp
+	s.mu.Unlock()
+	if pending == nil {
+		return nil
+	}
+	select {
+	case <-pending:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("whatsmeow: %s is still disconnecting: %w", s.sid, ctx.Err())
+	case <-s.done:
+		return errors.New("whatsmeow: the session closed while a disconnect was finishing")
+	}
 }
 
 // resume reconnects a session that has already paired. Asking to resume one that has
@@ -541,6 +576,9 @@ func (s *Session) giveUpOn(ctx context.Context, run *pairingRun, client *wm.Clie
 // actually interrupts the dial; this is the part that stops waiting.
 func (s *Session) hangUp(ctx context.Context, client *wm.Client) error {
 	done := make(chan struct{})
+	s.mu.Lock()
+	s.hangingUp = done
+	s.mu.Unlock()
 	go func() {
 		defer close(done)
 		s.disconnect(client)

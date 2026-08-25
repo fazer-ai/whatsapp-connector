@@ -1918,3 +1918,61 @@ func TestAPairingThatEndedPutsTheSocketBack(t *testing.T) {
 		t.Fatal("the client was left for the next attempt to inherit the finished channel")
 	}
 }
+
+// whatsmeow holds its socket lock for the length of a dial and Disconnect waits for the
+// same lock, so a disconnect can outlive the command that asked for it: that command is
+// answered with a failure and the socket goes down a moment later regardless. A connect
+// answered `open` in between is one the older disconnect then closes underneath, which is
+// the two commands taking effect in the opposite order to the one they were sent in.
+func TestAConnectWaitsForADisconnectThatOutlivedItsCommand(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	blocked := make(chan struct{})
+	t.Cleanup(func() { close(blocked) })
+	session.disconnect = func(*wm.Client) { <-blocked }
+	session.setConnected(true)
+
+	brief, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	if err := session.Disconnect(brief); err == nil {
+		t.Fatal("a disconnect still holding the socket was reported as done")
+	}
+
+	// The socket is still up, and the disconnect that will close it has not landed.
+	next, cancelNext := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancelNext()
+	if err := session.Connect(next, engine.ConnectRequest{Pairing: "resume"}); err == nil {
+		t.Fatal("a connect was answered while the disconnect before it was still going")
+	}
+}
+
+// And once it lands, the next connect goes through rather than waiting for good.
+func TestAConnectGoesAheadOnceTheDisconnectLanded(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	release := make(chan struct{})
+	session.disconnect = func(*wm.Client) { <-release }
+	session.setConnected(true)
+
+	brief, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	if err := session.Disconnect(brief); err == nil {
+		t.Fatal("a disconnect still holding the socket was reported as done")
+	}
+	close(release)
+
+	waited := make(chan error, 1)
+	go func() {
+		waited <- session.awaitHangUp(t.Context())
+	}()
+	select {
+	case err := <-waited:
+		if err != nil {
+			t.Fatalf("waiting for a disconnect that landed: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a disconnect that finished is still being waited on")
+	}
+}
