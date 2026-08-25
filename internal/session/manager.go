@@ -293,6 +293,11 @@ func (m *Manager) releaseOrphans(ctx context.Context) {
 
 	sort.Strings(sids)
 	for _, sid := range sids {
+		if ctx.Err() != nil {
+			// Out of the window. What was not reached is still in the map, so the next
+			// tick starts where this one stopped.
+			return
+		}
 		m.mu.RLock()
 		_, running := m.sessions[sid]
 		m.mu.RUnlock()
@@ -415,7 +420,12 @@ func (m *Manager) ack(ctx context.Context, delivery *transport.Delivery) {
 // instance has lost. It is the loop that turns "the lease expired" into "the socket is
 // closed", which is what keeps two instances off one account.
 func (m *Manager) RenewAll(ctx context.Context) {
-	m.releaseOrphans(ctx)
+	// Renewals first, and nothing before them. Every hand-back is a Redis round trip
+	// that can hang, and a lease left unrenewed because this goroutine was busy with
+	// them is a session a peer takes while this instance still holds its socket open:
+	// the cost of a hand-back arriving a tick late is one session unowned for a few
+	// seconds, the cost of a renewal that never ran is every session on the instance.
+	var released []string
 	for _, sid := range m.SIDs() {
 		err := m.leases.Renew(ctx, sid)
 		if err == nil {
@@ -454,10 +464,23 @@ func (m *Manager) RenewAll(ctx context.Context) {
 		// The renewal may well have been applied and only the answer lost, which leaves
 		// a key naming this instance for a full TTL after the session it named stopped.
 		// Not knowing is the reason to hand it back explicitly rather than to wait the
-		// key out.
-		m.abandon(ctx, sid)
+		// key out. Done below, with everything else that is not a renewal.
+		released = append(released, sid)
 	}
+
+	// What is left of the tick goes to the hand-backs, and only what a lease can spare
+	// of it. One that does not fit is tried again on the next tick.
+	window, cancel := context.WithTimeout(ctx, m.leases.TTL()/releaseShare)
+	defer cancel()
+	for _, sid := range released {
+		m.abandon(window, sid)
+	}
+	m.releaseOrphans(window)
 }
+
+// releaseShare is the fraction of a lease one tick may spend handing leases back, which
+// leaves the rest of it for the renewals that already ran and the ones on the next tick.
+const releaseShare = 3
 
 // StopAll releases every session, which is what a SIGTERM does before the process
 // exits: a released lease is one a peer can take immediately instead of waiting a full

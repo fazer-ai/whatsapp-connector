@@ -1649,3 +1649,44 @@ func TestAPairingIsRetiredBeforeItsOutcomeIsPublished(t *testing.T) {
 	session.transition.Unlock()
 	<-published
 }
+
+// whatsmeow publishes these three only from the branch that told the socket to stay down,
+// so nothing is going to reconnect and nothing else is going to take the state with it. A
+// Connected the socket produced on its way out would otherwise put the session back up
+// over a connection whatsmeow will not make again, and a resume would then find nothing to
+// do.
+func TestAnEndedConnectionRefusesTheConnectQueuedBehindIt(t *testing.T) {
+	t.Parallel()
+
+	for name, arrive := range map[string]func(*Session){
+		"a temporary ban": func(session *Session) {
+			session.handle(&waEvents.TemporaryBan{Code: waEvents.TempBanReason(101)})
+		},
+		"a client WhatsApp will not talk to": func(session *Session) {
+			session.handle(&waEvents.ClientOutdated{})
+		},
+		"a connection WhatsApp refused": func(session *Session) {
+			session.handle(&waEvents.ConnectFailure{Reason: waEvents.ConnectFailureReason(400)})
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			session, _ := newTestSession(t, "5511999990001")
+			session.setConnected(true)
+
+			arrive(session)
+			drain(t, session)
+
+			session.handle(&waEvents.Connected{})
+
+			if state := session.state(); state == "open" {
+				t.Fatal("a connection queued behind the end of the socket put the session back up")
+			}
+			select {
+			case emission := <-session.Events():
+				t.Fatalf("published %q for a socket whatsmeow will not make again", emission.Type)
+			case <-time.After(100 * time.Millisecond):
+			}
+		})
+	}
+}

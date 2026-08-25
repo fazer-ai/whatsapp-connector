@@ -160,3 +160,116 @@ func deliveryBatch(n int) (*batch, *atomic.Int64) {
 	}
 	return b, released
 }
+
+// The drain claims and then dispatches, and the two share one deadline. Handing dispatch
+// the loop's context instead opens a fresh budget on every pass, so a drain that has
+// already spent its claim time goes on holding the goroutine that renews every lease this
+// instance holds for a budget more, and for another on the pass after that.
+func TestADrainDispatchesOnWhatIsLeftOfItsOwnDeadline(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+
+	newStreams := func(instance string) *redisstream.Streams {
+		streams, err := redisstream.New(client, redisstream.Options{
+			Instance: instance, Block: 50 * time.Millisecond, ClaimMinIdle: time.Millisecond,
+		})
+		if err != nil {
+			t.Fatalf("redisstream.New: %v", err)
+		}
+		return streams
+	}
+	streams := newStreams("inst-a")
+	dead := newStreams("inst-dead")
+	answered := &countingReplier{}
+	manager := session.NewManager(&session.ManagerConfig{
+		Instance: "inst-a", Engine: fake.New(),
+		Leases:    cluster.NewLeases(client, "inst-a", cluster.Options{}),
+		Publisher: quietPublisher{}, Replier: answered,
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	ctx := context.Background()
+	t.Cleanup(func() { manager.StopAll(ctx) })
+
+	connector := &Connector{
+		cfg: Config{LeaseTTL: 200 * time.Millisecond}, log: zerolog.Nop(),
+		manager: manager, streams: streams,
+	}
+
+	// A command the previous owner of the session read and never acknowledged.
+	if _, err := dead.Read(ctx, []string{"s1"}); err != nil {
+		t.Fatalf("priming Read: %v", err)
+	}
+	writeStatusCommand(t, client, "s1")
+	if taken, err := dead.Read(ctx, []string{"s1"}); err != nil || len(taken) != 1 {
+		t.Fatalf("the previous owner read %d commands (err=%v), want 1", len(taken), err)
+	}
+	if _, err := manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+
+	// The claim comes back with the drain's deadline already spent, which is the whole
+	// case: what is dispatched after it is what tells the two deadlines apart.
+	rdb.AddHook(spendsTheDeadline{on: func(cmd redis.Cmder) bool { return cmd.Name() == "xclaim" }})
+
+	if undrained := connector.drainAdopted(ctx); len(undrained) != 1 {
+		t.Fatalf("the drain reported %v undrained, want [s1]", undrained)
+	}
+
+	// Long enough for a dispatched command to have been answered on the session's own
+	// goroutine, which is where the reply is written.
+	time.Sleep(200 * time.Millisecond)
+	if answered.count.Load() != 0 {
+		t.Fatalf("%d commands were carried out on a deadline the drain had already spent",
+			answered.count.Load())
+	}
+}
+
+// spendsTheDeadline lets a command through and then waits out whatever deadline its
+// caller was working to, which is what a Redis having a bad minute does to a pass.
+type spendsTheDeadline struct{ on func(redis.Cmder) bool }
+
+func (spendsTheDeadline) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (spendsTheDeadline) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+
+func (h spendsTheDeadline) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		err := next(ctx, cmd)
+		if h.on(cmd) {
+			if deadline, ok := ctx.Deadline(); ok {
+				time.Sleep(time.Until(deadline) + time.Millisecond)
+			}
+		}
+		return err
+	}
+}
+
+type countingReplier struct{ count atomic.Int64 }
+
+func (r *countingReplier) Reply(context.Context, string, protocol.Reply) error {
+	r.count.Add(1)
+	return nil
+}
+
+func writeStatusCommand(t *testing.T, client *redisx.Client, sid string) {
+	t.Helper()
+	command := &protocol.Command{
+		V: protocol.Version, ID: "c1", Type: protocol.CommandSessionStatus,
+		SID: sid, TS: time.Now().UnixMilli(), ReplyTo: "reply-c1", Payload: json.RawMessage(`{}`),
+	}
+	fields, err := command.Fields()
+	if err != nil {
+		t.Fatalf("Fields: %v", err)
+	}
+	if err := client.XAdd(t.Context(), &redis.XAddArgs{
+		Stream: client.Keys().Commands(sid), Values: fields,
+	}).Err(); err != nil {
+		t.Fatalf("XAdd: %v", err)
+	}
+}

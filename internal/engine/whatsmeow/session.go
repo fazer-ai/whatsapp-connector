@@ -1308,6 +1308,16 @@ func (s *Session) handle(rawEvent any) bool {
 		s.offline()
 		s.emit(protocol.EventSessionStreamReplaced, map[string]any{})
 	case *waEvents.TemporaryBan:
+		// Terminal, all three of these: whatsmeow only publishes them from the branch
+		// that told the socket to stay down, so nothing is going to reconnect and
+		// nothing else is going to take the state with it. A Connected the socket
+		// produced on its way out would otherwise put the session back up over a
+		// connection whatsmeow will not make again, and a resume would then find
+		// nothing to do.
+		s.transition.Lock()
+		defer s.transition.Unlock()
+
+		s.refuseLateConnect()
 		s.offline()
 		ban := map[string]any{"kind": "temporary", "reason": event.Code.String()}
 		if event.Expire > 0 {
@@ -1317,6 +1327,10 @@ func (s *Session) handle(rawEvent any) bool {
 		}
 		s.emit(protocol.EventSessionTemporaryBan, map[string]any{"ban": ban})
 	case *waEvents.ClientOutdated:
+		s.transition.Lock()
+		defer s.transition.Unlock()
+
+		s.refuseLateConnect()
 		s.offline()
 		if s.pairingActive() {
 			// The pairing reader publishes this one: whatsmeow delivers it here and to
@@ -1326,6 +1340,10 @@ func (s *Session) handle(rawEvent any) bool {
 		}
 		s.emit(protocol.EventSessionClientOutdated, map[string]any{})
 	case *waEvents.ConnectFailure:
+		s.transition.Lock()
+		defer s.transition.Unlock()
+
+		s.refuseLateConnect()
 		s.offline()
 		s.emit(protocol.EventSessionConnectFailure, map[string]any{
 			"reason": event.Reason.String(), "code": int(event.Reason),

@@ -985,3 +985,96 @@ func TestAQueuedHandBackDoesNotTouchALeaseTakenAgain(t *testing.T) {
 		t.Fatalf("the retry deleted the lease of a running session (got %q, %v)", got, err)
 	}
 }
+
+// Hand-backs are Redis round trips that can hang, and they run on the goroutine that
+// renews every lease this instance holds. Doing them first means a Redis having a bad
+// minute costs the renewals: peers acquire the sessions while this instance still holds
+// their sockets open, which is the one thing the lease exists to prevent.
+func TestRenewalsComeBeforeHandBacks(t *testing.T) {
+	t.Parallel()
+
+	// A short lease, so the window a tick gives its hand-backs is short too: what is
+	// under test is the order, and the window is what keeps the tick from running past
+	// the thing it is protecting.
+	const ttl = 300 * time.Millisecond
+	const hang = 4 * ttl
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+	keys := client.Keys()
+
+	clock := &steppingClock{now: time.Now()}
+	leases := cluster.NewLeases(client, "inst-a", cluster.Options{TTL: ttl, Margin: ttl / 10, Clock: clock})
+	manager := session.NewManager(&session.ManagerConfig{
+		Instance: "inst-a", Engine: fake.New(), Leases: leases,
+		Publisher: newRecorder(), Replier: newRecorder(),
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	ctx := context.Background()
+
+	// One session goes stale and is stopped, which leaves a lease to hand back. Another
+	// is running perfectly well and has to be renewed.
+	for _, sid := range []string{"s1", "s2"} {
+		if _, err := manager.Adopt(ctx, sid); err != nil {
+			t.Fatalf("Adopt %s: %v", sid, err)
+		}
+	}
+	var away atomic.Bool
+	hook := losesRenewals(keys.Cooldown("s1"))
+	hook.drop = func(cmd redis.Cmder) bool {
+		return away.Load() && isScript(cmd) && mentions(cmd, keys.Cooldown("s1"))
+	}
+	rdb.AddHook(hook)
+	away.Store(true)
+	clock.step(ttl + time.Millisecond)
+	manager.RenewAll(ctx)
+	away.Store(false)
+
+	// s1's hand-back is queued. From here every hand-back hangs for longer than a lease,
+	// and the renewal of the live session must not be waiting behind it.
+	rdb.AddHook(slowCommands{slow: func(cmd redis.Cmder) bool {
+		return isScript(cmd) && mentions(cmd, keys.Cooldown("s1"))
+	}, delay: hang})
+
+	if _, err := manager.Adopt(ctx, "s2"); err != nil {
+		t.Fatalf("re-adopting s2: %v", err)
+	}
+	before := time.Now()
+	manager.RenewAll(ctx)
+
+	if got := manager.Count(); got != 1 {
+		t.Fatalf("the live session was dropped while a hand-back was hanging (running %d)", got)
+	}
+	if spent := time.Since(before); spent >= hang {
+		t.Fatalf("the tick waited %s on a hand-back, longer than the %s lease it was renewing", spent, ttl)
+	}
+}
+
+// slowCommands makes a command take longer than the lease it is holding up, which is what
+// a Redis having a bad minute looks like from here.
+type slowCommands struct {
+	slow  func(redis.Cmder) bool
+	delay time.Duration
+}
+
+func (slowCommands) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (slowCommands) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+
+func (h slowCommands) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if h.slow(cmd) {
+			select {
+			case <-time.After(h.delay):
+			case <-ctx.Done():
+				cmd.SetErr(ctx.Err())
+				return ctx.Err()
+			}
+		}
+		return next(ctx, cmd)
+	}
+}

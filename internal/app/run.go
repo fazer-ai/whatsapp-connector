@@ -325,7 +325,11 @@ func (c *Connector) drainAdopted(ctx context.Context) []string {
 		// One pass takes at most ReadCount per stream, so a session with a long backlog
 		// needs several before anything newer may be read for it. A pass cut short by
 		// the budget has left entries pending, so the session is not drained either.
-		if !c.dispatchWithin(ctx, deliveries) {
+		// The drain's own deadline, not the loop's: dispatchWithin would otherwise open a
+		// fresh budget on every one of these passes, and a drain that already spent its
+		// claim time would go on holding the goroutine that renews every lease this
+		// instance holds for several budgets more.
+		if !c.dispatchWithin(pass, deliveries) {
 			c.manager.ReturnAdopted(adopted)
 			return adopted
 		}
