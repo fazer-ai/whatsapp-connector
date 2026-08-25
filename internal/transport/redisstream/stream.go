@@ -477,10 +477,14 @@ func (s *Streams) deliveriesWithIDs(result []redis.XStream) (out []transport.Del
 
 func (s *Streams) acker(stream, id string, release func()) func(context.Context) error {
 	return func(ctx context.Context) error {
-		defer release()
 		if err := s.client.XAck(ctx, stream, ConsumerGroup, id).Err(); err != nil {
+			// Still marked as being carried out here, on purpose. The command ran, and
+			// the entry is pending only because the acknowledgement did not land: letting
+			// go of the marker would have the next reclaim hand it back to this same
+			// process and run it a second time, side effects and all.
 			return fmt.Errorf("redisstream: ack %s on %s: %w", id, stream, err)
 		}
+		release()
 		return nil
 	}
 }

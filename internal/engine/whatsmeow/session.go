@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -13,7 +14,7 @@ import (
 	"github.com/rs/zerolog"
 	qrcode "github.com/skip2/go-qrcode"
 	wm "go.mau.fi/whatsmeow"
-	"go.mau.fi/whatsmeow/types"
+	waTypes "go.mau.fi/whatsmeow/types"
 	waEvents "go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 
@@ -125,6 +126,9 @@ type Session struct {
 	// replaced it: functions are not comparable, and "is this still mine" is the whole
 	// question.
 	pairing *pairingRun
+	// runs counts the conversations this session has started, which is what gives each
+	// one a name the client can answer to.
+	runs uint64
 	// closing is what the engine wants told when this session ends, so a session that
 	// is over stops being something the engine hands out or holds on to.
 	closing func()
@@ -132,6 +136,10 @@ type Session struct {
 
 // pairingRun is one pairing conversation.
 type pairingRun struct {
+	// id names this conversation on the wire. The passkey exchange is the one part of
+	// pairing where the client answers back, and an answer meant for an attempt the
+	// operator has already replaced would be sent to WhatsApp as if it were this one's.
+	id     string
 	cancel context.CancelFunc
 	// done is closed when this conversation is cancelled. whatsmeow only watches the
 	// pairing context from the goroutine that emits codes, and that goroutine is started
@@ -599,6 +607,12 @@ func (s *Session) abandonPairing(run *pairingRun, client *wm.Client, reason stri
 	if reason != "" {
 		s.publishPairingFailure(reason, err)
 	}
+	s.tearDownPairing(run, client)
+}
+
+// tearDownPairing puts the socket back where a corrected connect can start a new
+// conversation on it. The caller has already retired the run.
+func (s *Session) tearDownPairing(run *pairingRun, client *wm.Client) {
 	run.cancel()
 	client.Disconnect()
 
@@ -874,9 +888,14 @@ func (s *Session) isStale() bool {
 // M1 answers the one command that is about the session itself. Everything else is
 // refused rather than answered with a plausible shape: a connector that acknowledged a
 // send it cannot make would lose the message and report success.
-func (s *Session) Execute(_ context.Context, command *protocol.Command) (json.RawMessage, error) {
-	if command.Type == protocol.CommandSessionStatus {
+func (s *Session) Execute(ctx context.Context, command *protocol.Command) (json.RawMessage, error) {
+	switch command.Type {
+	case protocol.CommandSessionStatus:
 		return json.Marshal(s.status())
+	case protocol.CommandPairingPasskeyResponse:
+		return nil, s.answerPasskey(ctx, command)
+	case protocol.CommandPairingPasskeyConfirm:
+		return nil, s.confirmPasskey(ctx, command)
 	}
 	return nil, engine.ErrNotSupported
 }
@@ -962,7 +981,12 @@ func (s *Session) pairingActive() bool {
 
 // startPairing makes a run the current one and ends whatever it replaces.
 func (s *Session) startPairing(ctx context.Context, cancel context.CancelFunc) *pairingRun {
-	run := &pairingRun{cancel: cancel, done: ctx.Done()}
+	s.runs++
+	run := &pairingRun{
+		id:     s.sid + "-" + strconv.FormatUint(s.runs, 10),
+		cancel: cancel,
+		done:   ctx.Done(),
+	}
 	s.mu.Lock()
 	previous := s.pairing
 	s.pairing = run
@@ -1168,6 +1192,22 @@ func (s *Session) publishPairing(run *pairingRun, item wm.QRChannelItem, publish
 	case "success":
 		// pairing.success is published from the PairSuccess event, which is the one
 		// that carries the address that was paired.
+	case wm.QRChannelEventPasskeyRequest:
+		// Progress, not an outcome. WhatsApp is asking the operator's browser to sign a
+		// WebAuthn challenge, and the conversation carries on once it answers: treating
+		// this as terminal is a pairing that dies on every account WhatsApp routes this
+		// way, with a reason that names none of it.
+		s.publishPasskeyRequest(run, item.PasskeyRequest)
+	case wm.QRChannelEventPasskeyResponse:
+		// Also progress: the code the operator checks against the one on the phone.
+		// whatsmeow answers by itself when WhatsApp says the check can be skipped, and
+		// then this item never arrives.
+		if item.PasskeyConfirmation == nil {
+			return
+		}
+		s.emit(protocol.EventPairingPasskeyConfirmation, map[string]any{
+			"request_id": run.id, "code": item.PasskeyConfirmation.Code,
+		})
 	case "err-client-outdated":
 		s.emit(protocol.EventSessionClientOutdated, map[string]any{})
 	case "timeout":
@@ -1177,6 +1217,93 @@ func (s *Session) publishPairing(run *pairingRun, item wm.QRChannelItem, publish
 	default:
 		s.finishPairing(run, item.Event, item.Error)
 	}
+}
+
+// publishPasskeyRequest hands the operator's client the challenge WhatsApp wants signed.
+//
+// The public key travels exactly as whatsmeow parsed it: the contract calls it WebAuthn
+// PublicKeyCredentialRequestOptions with base64url fields, which is what these types
+// already marshal to. Re-shaping it here would be a second place for the two to drift.
+func (s *Session) publishPasskeyRequest(run *pairingRun, request *waEvents.PairPasskeyRequest) {
+	if request == nil || request.PublicKey == nil {
+		s.finishPairing(run, "passkey_error", errors.New("WhatsApp asked for a passkey and sent no challenge"))
+		return
+	}
+	publicKey, err := json.Marshal(request.PublicKey)
+	if err != nil {
+		s.finishPairing(run, "passkey_error", err)
+		return
+	}
+	s.emit(protocol.EventPairingPasskeyRequest, map[string]any{
+		"request_id": run.id, "public_key": json.RawMessage(publicKey),
+	})
+}
+
+// answerPasskey hands WhatsApp the assertion the operator's browser produced.
+func (s *Session) answerPasskey(ctx context.Context, command *protocol.Command) error {
+	var body struct {
+		RequestID  string                    `json:"request_id"`
+		Credential *waTypes.WebAuthnResponse `json:"credential"`
+	}
+	if err := json.Unmarshal(command.Payload, &body); err != nil {
+		return protocol.NewError(protocol.ErrorInvalidPayload, "the passkey credential could not be read")
+	}
+	if body.Credential == nil {
+		return protocol.NewError(protocol.ErrorInvalidPayload, "a passkey response has to carry a credential")
+	}
+	run, err := s.pairingNamed(body.RequestID)
+	if err != nil {
+		return err
+	}
+	if err := s.current().SendPasskeyResponse(ctx, body.Credential); err != nil {
+		s.finishPairing(run, "passkey_error", err)
+		return protocol.NewError(protocol.ErrorWaError, "WhatsApp would not accept that passkey")
+	}
+	return nil
+}
+
+// confirmPasskey tells WhatsApp the operator checked the code against their phone. A
+// operator who says it does not match is one WhatsApp must not be told anything by: the
+// attempt ends here instead.
+func (s *Session) confirmPasskey(ctx context.Context, command *protocol.Command) error {
+	var body struct {
+		RequestID string `json:"request_id"`
+		Confirmed bool   `json:"confirmed"`
+	}
+	if err := json.Unmarshal(command.Payload, &body); err != nil {
+		return protocol.NewError(protocol.ErrorInvalidPayload, "the passkey confirmation could not be read")
+	}
+	run, err := s.pairingNamed(body.RequestID)
+	if err != nil {
+		return err
+	}
+	if !body.Confirmed {
+		s.finishPairing(run, "passkey_refused", nil)
+		return nil
+	}
+	if err := s.current().SendPasskeyConfirmation(ctx); err != nil {
+		s.finishPairing(run, "passkey_error", err)
+		return protocol.NewError(protocol.ErrorWaError, "WhatsApp would not accept that confirmation")
+	}
+	return nil
+}
+
+// pairingNamed is the conversation an answer belongs to, if it is still the one running.
+//
+// An answer that names an attempt the operator has already replaced is refused rather
+// than sent: WhatsApp would take it as this attempt's, and the operator would be watching
+// a pairing that fails for a reason belonging to the one before it.
+func (s *Session) pairingNamed(id string) (*pairingRun, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pairing == nil {
+		return nil, protocol.NewError(protocol.ErrorNotPaired, "this session has no pairing waiting for an answer")
+	}
+	if id != s.pairing.id {
+		return nil, protocol.NewError(protocol.ErrorNotPaired,
+			"that answer belongs to a pairing attempt this session has moved on from")
+	}
+	return s.pairing, nil
 }
 
 // finishPairing publishes the end of a conversation, once, and only while it is still
@@ -1192,13 +1319,19 @@ func (s *Session) finishPairing(run *pairingRun, reason string, err error) {
 		return
 	}
 	s.publishPairingFailure(reason, err)
+	// The socket does not always go with the outcome. A code scanned on a phone without
+	// multidevice leaves the client connected with its pairing channel live, and
+	// whatsmeow will not open a second one on a live socket: the operator's corrected
+	// attempt is then refused until WhatsApp's own codes run out, for a reason that has
+	// nothing to do with it.
+	s.tearDownPairing(run, s.current())
 }
 
 // bind records the pairing before whatsmeow writes the device, which is what keeps a
 // crash between the two from leaving credentials no session claims. Refusing here
 // cancels the pairing, which is the right outcome: a device we cannot attribute is one
 // no restart can find again.
-func (s *Session) bind(jid types.JID, _, _ string) bool {
+func (s *Session) bind(jid waTypes.JID, _, _ string) bool {
 	// From the session's own lifetime: a pairing that lands after this instance lost
 	// the account would otherwise overwrite the mapping the new owner is writing.
 	ctx, cancel := context.WithTimeout(s.ctx, bindTimeout)

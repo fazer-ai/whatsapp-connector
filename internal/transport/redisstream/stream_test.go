@@ -3,6 +3,7 @@ package redisstream_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strconv"
 	"strings"
 	"sync"
@@ -800,4 +801,71 @@ func isRestore(cmd redis.Cmder) bool {
 		}
 	}
 	return false
+}
+
+// A command that ran and could not be acknowledged is pending only because the
+// acknowledgement did not land. Letting go of the marker that says this process is
+// carrying it out has the next reclaim hand it straight back here and run it a second
+// time, side effects and all.
+func TestACommandWhoseAcknowledgementFailedIsNotRunAgain(t *testing.T) {
+	t.Parallel()
+
+	f := newFleet(t)
+	rdb := redis.NewClient(&redis.Options{Addr: f.server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", shards)
+	streams, err := redisstream.New(client, redisstream.Options{
+		Instance: "inst-a", Block: 50 * time.Millisecond, ClaimMinIdle: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("redisstream.New: %v", err)
+	}
+	ctx := context.Background()
+
+	if _, err := streams.Read(ctx, []string{"s1"}); err != nil {
+		t.Fatalf("priming Read: %v", err)
+	}
+	writeCommand(t, f, f.client.Keys().Commands("s1"), command("c1", "s1", "c1"))
+	taken, err := streams.Read(ctx, []string{"s1"})
+	if err != nil || len(taken) != 1 {
+		t.Fatalf("Read returned %d commands (err=%v), want 1", len(taken), err)
+	}
+
+	// The command runs, and the acknowledgement is what fails.
+	rdb.AddHook(brokenAcks{})
+	if err := taken[0].Ack(ctx); err == nil {
+		t.Fatal("the acknowledgement was reported as having landed")
+	}
+
+	// Past the minimum idle, so the only thing keeping the entry from coming back is the
+	// marker saying this process carried it out.
+	time.Sleep(10 * time.Millisecond)
+	claimed, err := streams.Claim(ctx, []string{"s1"})
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if len(claimed) != 0 {
+		t.Fatalf("a command that already ran was handed back %d times to run again", len(claimed))
+	}
+}
+
+// brokenAcks fails every acknowledgement, which is a Redis having a bad second between a
+// command finishing and its entry being retired.
+type brokenAcks struct{}
+
+func (brokenAcks) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (brokenAcks) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+
+func (brokenAcks) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if cmd.Name() == "xack" {
+			err := errors.New("the acknowledgement never landed")
+			cmd.SetErr(err)
+			return err
+		}
+		return next(ctx, cmd)
+	}
 }

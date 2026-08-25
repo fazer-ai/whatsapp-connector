@@ -18,7 +18,7 @@ import (
 	"github.com/santhosh-tekuri/jsonschema/v6"
 	wm "go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waAdv"
-	"go.mau.fi/whatsmeow/types"
+	waTypes "go.mau.fi/whatsmeow/types"
 	waEvents "go.mau.fi/whatsmeow/types/events"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/engine"
@@ -208,8 +208,8 @@ func TestHandleTranslatesWhatWhatsappReports(t *testing.T) {
 		},
 		"a successful pairing": {
 			event: &waEvents.PairSuccess{
-				ID:       types.JID{User: "5511999990001", Server: types.DefaultUserServer},
-				LID:      types.JID{User: "192676662091991", Server: types.HiddenUserServer},
+				ID:       waTypes.JID{User: "5511999990001", Server: waTypes.DefaultUserServer},
+				LID:      waTypes.JID{User: "192676662091991", Server: waTypes.HiddenUserServer},
 				Platform: "android",
 			},
 			want: protocol.EventPairingSuccess,
@@ -430,7 +430,7 @@ func newTestSession(t *testing.T, phone string) (*Session, *store.Container) {
 	}
 	if phone != "" {
 		// A companion device JID, the way WhatsApp issues one.
-		jid, err := types.ParseJID(phone + ":12@" + types.DefaultUserServer)
+		jid, err := waTypes.ParseJID(phone + ":12@" + waTypes.DefaultUserServer)
 		if err != nil {
 			t.Fatalf("ParseJID: %v", err)
 		}
@@ -1806,5 +1806,115 @@ func TestARefusedConnectPutsTheDisconnectGuardBack(t *testing.T) {
 			case <-time.After(100 * time.Millisecond):
 			}
 		})
+	}
+}
+
+// WhatsApp routes some accounts through a passkey handoff: it asks the operator's browser
+// to sign a WebAuthn challenge, and the pairing carries on once it answers. Treating
+// those items as a terminal outcome is a pairing that dies on every one of those accounts,
+// under a reason that names none of it.
+func TestAPasskeyHandoffIsRelayedInsteadOfEndingThePairing(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "")
+	run := session.startPairing(t.Context(), func() {})
+
+	challenge := &waTypes.WebAuthnPublicKey{
+		Challenge: []byte("a challenge"), Timeout: 60000, RelyingPartID: "web.whatsapp.com",
+		UserVerification: "required",
+	}
+	session.publishPairing(run, wm.QRChannelItem{
+		Event: wm.QRChannelEventPasskeyRequest, PasskeyRequest: &waEvents.PairPasskeyRequest{PublicKey: challenge},
+	}, true)
+
+	emission := next(t, session)
+	if emission.Type != protocol.EventPairingPasskeyRequest {
+		t.Fatalf("published %q, want the passkey challenge", emission.Type)
+	}
+	var request struct {
+		RequestID string                     `json:"request_id"`
+		PublicKey *waTypes.WebAuthnPublicKey `json:"public_key"`
+	}
+	if err := json.Unmarshal(emission.Payload, &request); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if request.RequestID != run.id {
+		t.Fatalf("the challenge names %q, want the attempt's own %q", request.RequestID, run.id)
+	}
+	if request.PublicKey == nil || request.PublicKey.RelyingPartID != challenge.RelyingPartID {
+		t.Fatalf("the challenge did not survive the trip: %+v", request.PublicKey)
+	}
+	if !session.isCurrentPairing(run) {
+		t.Fatal("the attempt was retired over an item that is progress, not an outcome")
+	}
+
+	// And the code the operator checks against their phone is progress too.
+	session.publishPairing(run, wm.QRChannelItem{
+		Event:               wm.QRChannelEventPasskeyResponse,
+		PasskeyConfirmation: &waEvents.PairPasskeyConfirmation{Code: "ABCD-1234"},
+	}, true)
+
+	emission = next(t, session)
+	if emission.Type != protocol.EventPairingPasskeyConfirmation {
+		t.Fatalf("published %q, want the passkey confirmation code", emission.Type)
+	}
+	if !session.isCurrentPairing(run) {
+		t.Fatal("the attempt was retired over the confirmation code")
+	}
+}
+
+// An answer naming an attempt this session has moved on from is refused rather than sent:
+// WhatsApp would take it as the current one's, and the operator would be watching a
+// pairing that fails for a reason belonging to the one before it.
+func TestAPasskeyAnswerForAnotherAttemptIsRefused(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "")
+	stale := session.startPairing(t.Context(), func() {})
+	session.startPairing(t.Context(), func() {})
+
+	for name, command := range map[string]*protocol.Command{
+		"a credential": {
+			V: protocol.Version, ID: "c1", Type: protocol.CommandPairingPasskeyResponse,
+			SID: "s1", TS: 1787000000000,
+			Payload: json.RawMessage(`{"request_id":"` + stale.id + `","credential":{"id":"x","type":"public-key"}}`),
+		},
+		"a confirmation": {
+			V: protocol.Version, ID: "c2", Type: protocol.CommandPairingPasskeyConfirm,
+			SID: "s1", TS: 1787000000000,
+			Payload: json.RawMessage(`{"request_id":"` + stale.id + `","confirmed":true}`),
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := session.Execute(t.Context(), command)
+			var coded *protocol.Error
+			if !errors.As(err, &coded) {
+				t.Fatalf("Execute returned %v, want a protocol error", err)
+			}
+		})
+	}
+}
+
+// Some terminal outcomes leave the socket up. A code scanned on a phone without
+// multidevice is the one that matters: whatsmeow will not open a second pairing channel
+// on a live socket, so the operator's corrected attempt is refused until WhatsApp's own
+// codes run out, for a reason that has nothing to do with it.
+func TestAPairingThatEndedPutsTheSocketBack(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "")
+	cancelled := make(chan struct{})
+	run := session.startPairing(t.Context(), func() { close(cancelled) })
+
+	session.publishPairing(run, wm.QRChannelScannedWithoutMultidevice, true)
+	drain(t, session)
+
+	select {
+	case <-cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("the attempt kept its pairing channel open, so a corrected one cannot start")
+	}
+	if !session.isStale() {
+		t.Fatal("the client was left for the next attempt to inherit the finished channel")
 	}
 }
