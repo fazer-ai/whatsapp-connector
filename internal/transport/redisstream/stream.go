@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -54,6 +55,28 @@ type Streams struct {
 	client *redisx.Client
 	opts   Options
 	groups *groupCache
+
+	// inFlight is what this process has handed out and not finished with. A consumer
+	// group cannot tell "still running here" from "left behind here" — both are
+	// entries pending under this instance's name — and reclaiming the first duplicates
+	// a running command while never reclaiming the second loses it in a fleet of one.
+	inFlightMu sync.Mutex
+	inFlight   map[string]struct{}
+
+	// unrun is what was claimed and handed back without being carried out, with the age
+	// each entry needs put back. XCLAIM resets an entry's idle to zero, so one released
+	// afterwards is one no instance may reclaim for a whole ClaimMinIdle, however long
+	// it had already been waiting: a wake that arrived late then waits the delay a
+	// second time, and the session it names runs nowhere for both.
+	unrunMu sync.Mutex
+	unrun   map[string][]unrunEntry
+}
+
+// unrunEntry is one entry given back without being carried out, and the idle time it
+// had before this process claimed it.
+type unrunEntry struct {
+	id   string
+	idle time.Duration
 }
 
 // New returns the transport. It creates no keys: a stream and its group are created on
@@ -81,7 +104,11 @@ func New(client *redisx.Client, opts Options) (*Streams, error) {
 	if opts.ReadCount <= 0 {
 		opts.ReadCount = DefaultReadCount
 	}
-	return &Streams{client: client, opts: opts, groups: newGroupCache()}, nil
+	return &Streams{
+		client: client, opts: opts, groups: newGroupCache(),
+		inFlight: make(map[string]struct{}),
+		unrun:    make(map[string][]unrunEntry),
+	}, nil
 }
 
 // Publish appends an event to its session's shard.
@@ -162,13 +189,133 @@ func (s *Streams) Read(ctx context.Context, sids []string) ([]transport.Delivery
 		}
 		return nil, fmt.Errorf("redisstream: read commands: %w", err)
 	}
-	return s.deliveries(result), nil
+	var out []transport.Delivery
+	for _, stream := range result {
+		taken, ids := s.deliveriesWithIDs([]redis.XStream{stream})
+		// A read entry starts at zero idle and stays there until somebody touches it, so
+		// one this instance gives back unrun is claimable by nobody — not by `>`, which
+		// returns only what no consumer has taken, and not by a claim, which will not
+		// look at it for a whole delay. Recording the delay as its age has the next
+		// reclaim see it instead, which for a command carrying a deadline is the
+		// difference between running late and expiring unrun.
+		s.rememberAge(stream.Stream, s.opts.ClaimMinIdle, taken, ids)
+		out = append(out, taken...)
+	}
+	return out, nil
 }
 
 // Claim takes over commands another instance read and never acknowledged, which is
 // what happens when it is killed between reading a command and carrying it out.
 func (s *Streams) Claim(ctx context.Context, sids []string) ([]transport.Delivery, error) {
-	streams := s.streamsFor(sids)
+	// First, because it is what makes this pass able to see what the last one gave back.
+	s.restoreUnrun(ctx)
+	return s.claim(ctx, s.sessionStreams(sids), s.opts.ClaimMinIdle)
+}
+
+// ClaimControl takes over what is pending on the control stream.
+//
+// Apart from the session streams, and not merely ahead of them. A claim that fails over
+// any one stream releases everything it took, so a control entry taken alongside a window
+// of sessions is thrown away whenever a session in that window fails — and a window that
+// spends the whole deadline never reaches the control stream at all. Either way the
+// casualty is `session.wake`, which is the command that puts a session from a dead
+// instance back on an instance: it would then be the one command that never runs on
+// exactly the Redis that makes it necessary.
+func (s *Streams) ClaimControl(ctx context.Context) ([]transport.Delivery, error) {
+	s.restoreUnrun(ctx)
+	return s.claim(ctx, []string{s.client.Keys().Control()}, s.opts.ClaimMinIdle)
+}
+
+// restoreUnrun puts back the age XCLAIM erased on the entries this process took and gave
+// back without carrying out.
+//
+// A claim resets an entry's idle to zero, so one released afterwards is unreclaimable by
+// anybody for a whole ClaimMinIdle, however long it had been waiting before this process
+// touched it. A wake that was already overdue then waits the delay twice over, and the
+// session it names runs nowhere for both.
+//
+// Age is put back rather than the entry being kept for this instance alone: an entry
+// only this process could take again is one it can starve every peer out of, by claiming
+// it and giving it back on every heartbeat.
+func (s *Streams) restoreUnrun(ctx context.Context) {
+	s.unrunMu.Lock()
+	pending := s.unrun
+	s.unrun = make(map[string][]unrunEntry)
+	s.unrunMu.Unlock()
+
+	for stream, entries := range pending {
+		byIdle := make(map[time.Duration][]string)
+		for _, entry := range entries {
+			if s.running(stream, entry.id) {
+				// Taken again since it was given back. Putting an age on an entry this
+				// process is carrying out is how a peer comes to run it alongside.
+				continue
+			}
+			byIdle[entry.idle] = append(byIdle[entry.idle], entry.id)
+		}
+		for idle, ids := range byIdle {
+			args := make([]any, 0, len(ids)+3)
+			args = append(args, ConsumerGroup, s.opts.Instance, idle.Milliseconds())
+			for _, id := range ids {
+				args = append(args, id)
+			}
+			if err := restoreAgeScript.Run(ctx, s.client, []string{stream}, args...).Err(); err != nil {
+				// Nothing to retry. The entries are still pending and still come back,
+				// just no sooner than the delay: what is lost here is the age, not the
+				// command.
+				continue
+			}
+		}
+	}
+}
+
+// restoreAgeScript puts an entry's idle time back, and only while this instance is still
+// the one holding it.
+//
+// One operation, because the two halves cannot be separated: XCLAIM transfers an entry
+// without ever asking who holds it, so between a check that said "still mine" and a claim
+// that acts on it a peer can take the entry and start carrying it out. The age would then
+// pull it back mid-flight, the command would run twice, and for a wake that means
+// retiring the only wake there was while the peer's adoption is still going.
+//
+// Raw XCLAIM inside, because go-redis models neither IDLE nor JUSTID: IDLE is the whole
+// point, and JUSTID keeps the delivery counter from moving for a hand-back that delivered
+// nothing.
+var restoreAgeScript = redis.NewScript(`
+local group, consumer, idle = ARGV[1], ARGV[2], ARGV[3]
+for i = 4, #ARGV do
+  local id = ARGV[i]
+  local pending = redis.call("XPENDING", KEYS[1], group, "IDLE", 0, id, id, 1)
+  if pending[1] and pending[1][2] == consumer then
+    redis.call("XCLAIM", KEYS[1], group, consumer, 0, id, "IDLE", idle, "JUSTID")
+  end
+end
+return 1
+`)
+
+// ClaimSessions takes over what is pending on these sessions' own streams, and looks at
+// nothing else.
+//
+// It is what a session just adopted needs before anything newer is read for it. The
+// heartbeat's own reclaim is not enough on its own: it runs on a tick and over the
+// sessions this instance already had, so a command abandoned by the previous owner would
+// still be sitting pending while a fresh `>` read hands over commands that arrived after
+// it. A `session.disconnect` running after the `session.connect` that replaced it leaves
+// the account in the state nobody asked for, and per-session order is the one thing the
+// single stream is for.
+// It waits for nothing, unlike the heartbeat's reclaim. The min-idle there is what
+// stops one instance taking work another is still doing, and that question is already
+// settled here: this instance holds the lease, so whoever held these entries has lost
+// it and is being torn down. Waiting the same delay would mean the abandoned command
+// arrives after the newer one every time, which is the reordering this exists to
+// prevent. What is left is the heartbeat or so between a lease moving and the old
+// owner noticing, where a command could run twice; that is invariant 5's ground, and
+// M2's.
+func (s *Streams) ClaimSessions(ctx context.Context, sids []string) ([]transport.Delivery, error) {
+	return s.claim(ctx, s.sessionStreams(sids), 0)
+}
+
+func (s *Streams) claim(ctx context.Context, streams []string, minIdle time.Duration) ([]transport.Delivery, error) {
 	if len(streams) == 0 {
 		return nil, nil
 	}
@@ -177,41 +324,165 @@ func (s *Streams) Claim(ctx context.Context, sids []string) ([]transport.Deliver
 	}
 
 	var claimed []transport.Delivery
+	// Every early return past this point has to let go of what it already took: a
+	// delivery handed out is one this process is counted as running, and one nobody
+	// dispatched is a command that never runs again until the process restarts.
+	fail := func(err error) ([]transport.Delivery, error) {
+		for i := range claimed {
+			if claimed[i].Release != nil {
+				claimed[i].Release()
+			}
+		}
+		return nil, err
+	}
 	for _, stream := range streams {
-		messages, _, err := s.client.XAutoClaim(ctx, &redis.XAutoClaimArgs{
+		ids, err := s.reclaimable(ctx, stream, minIdle)
+		switch {
+		case isNoGroup(err):
+			s.groups.forget(stream)
+			continue
+		case err != nil:
+			return fail(err)
+		case len(ids) == 0:
+			continue
+		}
+
+		messages, err := s.client.XClaim(ctx, &redis.XClaimArgs{
 			Stream:   stream,
 			Group:    ConsumerGroup,
 			Consumer: s.opts.Instance,
-			MinIdle:  s.opts.ClaimMinIdle,
-			Start:    "0-0",
-			Count:    s.opts.ReadCount,
+			MinIdle:  minIdle,
+			Messages: ids,
 		}).Result()
 		switch {
 		case isNoGroup(err):
 			s.groups.forget(stream)
 			continue
 		case err != nil && !errors.Is(err, redis.Nil):
-			return nil, fmt.Errorf("redisstream: claim %s: %w", stream, err)
+			return fail(fmt.Errorf("redisstream: claim %s: %w", stream, err))
 		}
-		claimed = append(claimed, s.deliveries([]redis.XStream{{Stream: stream, Messages: messages}})...)
+		taken, ids := s.deliveriesWithIDs([]redis.XStream{{Stream: stream, Messages: messages}})
+		if minIdle > 0 {
+			s.rememberAge(stream, minIdle, taken, ids)
+		}
+		claimed = append(claimed, taken...)
 	}
 	return claimed, nil
 }
 
+// rememberAge has each delivery record, if it is given back unrun, the age it should
+// come back with. For a claim that is the age the claim erased; for a read it is the
+// reclaim delay itself, because a read entry has no age to erase and one given back
+// would otherwise be invisible to both halves of this transport: `>` returns only what
+// nobody has taken, and a claim will not look at it until the delay has passed.
+//
+// Forfeit is the same release without the record, which is what an instance that took
+// its turn and failed gives back.
+func (s *Streams) rememberAge(stream string, idle time.Duration, deliveries []transport.Delivery, ids []string) {
+	for i := range deliveries {
+		id := ids[i]
+		release := deliveries[i].Release
+		deliveries[i].Forfeit = release
+		deliveries[i].Release = func() {
+			if release != nil {
+				release()
+			}
+			s.unrunMu.Lock()
+			s.unrun[stream] = append(s.unrun[stream], unrunEntry{id: id, idle: idle})
+			s.unrunMu.Unlock()
+		}
+	}
+}
+
+// reclaimable is the pending entries worth taking over: idle long enough, and held by
+// somebody else.
+//
+// The second half is the reason this is not one XAUTOCLAIM call. A command runs on the
+// session's own executor, not on the loop that read it, so it is still pending while it
+// runs; one that takes longer than the min-idle would be handed back to the very
+// consumer already executing it, and dispatched a second time alongside the first.
+// Acknowledging the original does not retire the copy. XPENDING is the only form that
+// says who holds an entry.
+func (s *Streams) reclaimable(ctx context.Context, stream string, minIdle time.Duration) ([]string, error) {
+	ids := make([]string, 0, s.opts.ReadCount)
+	start := "-"
+
+	// Paged, because the filter is what makes a page yield nothing: entries this
+	// process is still running stay pending for as long as they run, and a page full of
+	// them would hide everything behind it on every heartbeat, forever. The page cap is
+	// there so one heartbeat cannot walk an arbitrarily long list.
+	for range maxPendingPages {
+		pending, err := s.client.XPendingExt(ctx, &redis.XPendingExtArgs{
+			Stream: stream,
+			Group:  ConsumerGroup,
+			Idle:   minIdle,
+			Start:  start,
+			End:    "+",
+			Count:  s.opts.ReadCount,
+		}).Result()
+		switch {
+		case errors.Is(err, redis.Nil):
+			return ids, nil
+		case isNoGroup(err):
+			return nil, err
+		case err != nil:
+			return nil, fmt.Errorf("redisstream: list what is pending on %s: %w", stream, err)
+		case len(pending) == 0:
+			return ids, nil
+		}
+
+		for _, entry := range pending {
+			if entry.ID == start {
+				// The page starts inclusively, so the entry the last page ended on
+				// comes back once more.
+				continue
+			}
+			// Only what this process is still carrying out is skipped. The consumer
+			// name is the wrong question: a command this instance left behind before it
+			// restarted, and a wake it deliberately left pending, are both pending under
+			// this same name and both have to come back.
+			if s.running(stream, entry.ID) {
+				continue
+			}
+			ids = append(ids, entry.ID)
+		}
+		if len(ids) >= int(s.opts.ReadCount) || int64(len(pending)) < s.opts.ReadCount {
+			return ids, nil
+		}
+		start = pending[len(pending)-1].ID
+	}
+	return ids, nil
+}
+
+// maxPendingPages bounds how much of the pending list one reclaim walks. The next
+// heartbeat carries on from the front, so nothing is lost by stopping.
+const maxPendingPages = 8
+
 // streamsFor is the per-session command streams plus the control one. Control is
 // always read: it carries `session.wake`, which is how a session with no owner gets
 // one, so an instance that only listened to what it already owns would never hear it.
+// streamsFor is what one read covers: the sessions this instance owns and the stream
+// addressed to no session in particular. A read blocks on all of them at once, so there
+// is nothing for the control stream to be starved by; a claim walks them one at a time
+// and gives up on all of them together, which is why it keeps the two apart.
 func (s *Streams) streamsFor(sids []string) []string {
+	return append(s.sessionStreams(sids), s.client.Keys().Control())
+}
+
+// sessionStreams is the per-session command streams and nothing else.
+func (s *Streams) sessionStreams(sids []string) []string {
 	keys := s.client.Keys()
 	streams := make([]string, 0, len(sids)+1)
 	for _, sid := range sids {
 		streams = append(streams, keys.Commands(sid))
 	}
-	return append(streams, keys.Control())
+	return streams
 }
 
-func (s *Streams) deliveries(result []redis.XStream) []transport.Delivery {
-	var out []transport.Delivery
+// deliveriesWithIDs is the deliveries plus the stream entry each one came from, which
+// both callers need to say what they took: the ids line up with the deliveries, and a
+// frame that could not be read is in neither.
+func (s *Streams) deliveriesWithIDs(result []redis.XStream) (out []transport.Delivery, ids []string) {
 	for _, stream := range result {
 		for _, message := range stream.Messages {
 			command, err := protocol.ParseCommand(toFields(message.Values))
@@ -223,22 +494,57 @@ func (s *Streams) deliveries(result []redis.XStream) []transport.Delivery {
 				s.ackUnreadable(stream.Stream, message.ID)
 				continue
 			}
+			held := s.hold(stream.Stream, message.ID)
 			out = append(out, transport.Delivery{
 				Command: command,
-				Ack:     s.acker(stream.Stream, message.ID),
+				Ack:     s.acker(stream.Stream, message.ID, held),
+				Release: held,
 			})
+			ids = append(ids, message.ID)
 		}
 	}
-	return out
+	return out, ids
 }
 
-func (s *Streams) acker(stream, id string) func(context.Context) error {
+func (s *Streams) acker(stream, id string, release func()) func(context.Context) error {
 	return func(ctx context.Context) error {
 		if err := s.client.XAck(ctx, stream, ConsumerGroup, id).Err(); err != nil {
+			// Still marked as being carried out here, on purpose. The command ran, and
+			// the entry is pending only because the acknowledgement did not land: letting
+			// go of the marker would have the next reclaim hand it back to this same
+			// process and run it a second time, side effects and all.
 			return fmt.Errorf("redisstream: ack %s on %s: %w", id, stream, err)
 		}
+		release()
 		return nil
 	}
+}
+
+// hold records that this process has handed an entry out and is not finished with it.
+// The returned function is what says it is: it runs once, on the ack or on the release,
+// whichever comes.
+func (s *Streams) hold(stream, id string) func() {
+	key := stream + "\x00" + id
+	s.inFlightMu.Lock()
+	s.inFlight[key] = struct{}{}
+	s.inFlightMu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.inFlightMu.Lock()
+			delete(s.inFlight, key)
+			s.inFlightMu.Unlock()
+		})
+	}
+}
+
+// running reports whether this process is still carrying an entry out.
+func (s *Streams) running(stream, id string) bool {
+	s.inFlightMu.Lock()
+	defer s.inFlightMu.Unlock()
+	_, held := s.inFlight[stream+"\x00"+id]
+	return held
 }
 
 func (s *Streams) ackUnreadable(stream, id string) {

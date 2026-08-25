@@ -497,7 +497,10 @@
     },
     "event_pairing_passkey_confirmation": {
       "type": "object",
-      "properties": { "code": { "type": "string" } },
+      "properties": {
+        "request_id": { "type": "string" },
+        "code": { "type": "string" }
+      },
       "required": ["code"],
       "additionalProperties": true
     },

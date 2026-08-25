@@ -45,6 +45,12 @@ type Session struct {
 	stop     context.CancelFunc
 	done     chan struct{}
 	stopOnce sync.Once
+
+	// queueMu guards the door to commands rather than the channel itself: the executor
+	// has to be able to say "nothing more comes in" and then empty what is left,
+	// without a command slipping in between the two.
+	queueMu  sync.Mutex
+	stopping bool
 }
 
 // Config is what a session needs to run.
@@ -111,12 +117,59 @@ func (s *Session) Epoch() uint64 { return s.lease.Epoch }
 // Offer hands a command to the session. It reports false when the backlog is full, so
 // the caller answers `rate_limited` instead of queueing work whose deadline will have
 // passed before it is reached.
-func (s *Session) Offer(delivery *transport.Delivery) bool {
+// Offer hands a command to this session's executor.
+//
+// The three answers are three different things for the caller to do, which is why this
+// is not a bool: a busy session refuses the command, a stopping one has to leave it
+// pending for whoever takes the account next, and only the first two are the same from
+// the client's side.
+type Offer int
+
+const (
+	// OfferAccepted means the command is queued and this session owns answering it.
+	OfferAccepted Offer = iota
+	// OfferBusy means the queue is full. The client is told so.
+	OfferBusy
+	// OfferStopped means this session is going away. The command is not this
+	// instance's to answer or to refuse.
+	OfferStopped
+)
+
+// Offer queues a command, or says why it did not.
+func (s *Session) Offer(delivery *transport.Delivery) Offer {
+	s.queueMu.Lock()
+	defer s.queueMu.Unlock()
+	if s.stopping {
+		return OfferStopped
+	}
 	select {
 	case s.commands <- delivery:
-		return true
+		return OfferAccepted
 	default:
-		return false
+		return OfferBusy
+	}
+}
+
+// abandonQueue lets go of everything still waiting when the executor stops.
+//
+// A queued delivery has been read from Redis and not acknowledged, so as far as the
+// transport is concerned this process is still carrying it out and will not reclaim it.
+// Dropping it silently means the command runs nowhere until another instance claims it
+// or this one restarts. Releasing says out loud that nothing here is going to run it.
+func (s *Session) abandonQueue() {
+	s.queueMu.Lock()
+	s.stopping = true
+	s.queueMu.Unlock()
+
+	for {
+		select {
+		case delivery := <-s.commands:
+			if delivery.Release != nil {
+				delivery.Release()
+			}
+		default:
+			return
+		}
 	}
 }
 
@@ -183,7 +236,15 @@ func (s *Session) publish(ctx context.Context, emission engine.Emission) {
 // the order they were sent" means. A slow send delays the next command of the same
 // session and nothing else.
 func (s *Session) execute(ctx context.Context) {
+	defer s.abandonQueue()
 	for {
+		// Checked before the select, and not only inside it. With both cases ready the
+		// select picks either one, so a session that is already stopping could start one
+		// more command and answer it on behalf of an account this instance no longer
+		// owns, instead of leaving it for whoever does.
+		if ctx.Err() != nil {
+			return
+		}
 		select {
 		case <-ctx.Done():
 			return
@@ -200,10 +261,20 @@ func (s *Session) run(ctx context.Context, delivery *transport.Delivery) {
 	result, err := s.carryOut(ctx, &command)
 	s.answer(ctx, &command, result, err)
 
-	// Acknowledged either way. A command that failed has been answered, and leaving it
-	// pending would have another instance run it again after this one restarts, which
-	// for a send is a duplicate message rather than a retry.
-	if ackErr := delivery.Ack(ctx); ackErr != nil && ctx.Err() == nil {
+	// Acknowledged either way, and on a deadline of its own. A command that failed has
+	// been answered, and leaving it pending would have another instance run it again
+	// after this one restarts, which for a send is a duplicate message rather than a
+	// retry.
+	//
+	// Detached from the session's context because this session is exactly what may have
+	// just ended. An acknowledgement refused for the cancellation leaves the entry marked
+	// as being carried out here, on purpose, so a reclaim does not run it twice: every
+	// later claim then skips it, and if this same instance adopts the session again the
+	// marker is still standing. The command is neither retired nor retried until the
+	// process restarts. The work is over by this point; what is left has to happen.
+	retire, cancel := context.WithTimeout(context.WithoutCancel(ctx), ackTimeout)
+	defer cancel()
+	if ackErr := delivery.Ack(retire); ackErr != nil {
 		log.Error().Err(ackErr).Msg("failed to acknowledge a command")
 	}
 }

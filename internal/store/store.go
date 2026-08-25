@@ -20,11 +20,13 @@
 package store
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -69,15 +71,28 @@ func Open(ctx context.Context, address string, log zerolog.Logger) (*Container, 
 		return nil, err
 	}
 
-	devices, err := sqlstore.New(ctx, dialect, dsn, nil)
-	if err != nil {
-		return nil, fmt.Errorf("store: open the device store: %w", err)
-	}
-
+	// One pool, not two. whatsmeow's store and this package's own table live in the
+	// same database, and opening them separately gave SQLite two independent sets of
+	// connections writing one file: the first real pairing filled the log with
+	// `database is locked (5)` from whatsmeow trying to save an identity key while the
+	// mapping was being written, and a message that cannot have its identity saved
+	// cannot be decrypted.
 	db, err := sql.Open(dialect, dsn)
 	if err != nil {
-		_ = devices.Close()
 		return nil, fmt.Errorf("store: open %s: %w", dialect, err)
+	}
+	if dialect == dialectSQLite {
+		// A file holds one writer at a time whatever the pool says, and a pool that
+		// hands out more connections than that only converts waiting into
+		// `database is locked`. Serialising here is what makes busy_timeout the
+		// backstop rather than the mechanism.
+		db.SetMaxOpenConns(1)
+	}
+
+	devices := sqlstore.NewWithDB(db, dialect, nil)
+	if err := devices.Upgrade(ctx); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("store: open the device store: %w", err)
 	}
 
 	c := &Container{db: db, devices: devices, dialect: dialect, log: log}
@@ -88,12 +103,26 @@ func Open(ctx context.Context, address string, log zerolog.Logger) (*Container, 
 	return c, nil
 }
 
+// Ping reports whether the database is answering. Readiness asks, because a session
+// cannot be opened or paired without it.
+func (c *Container) Ping(ctx context.Context) error {
+	if err := c.db.PingContext(ctx); err != nil {
+		return fmt.Errorf("store: ping: %w", err)
+	}
+	return nil
+}
+
+// DB is the pool, for the tests that have to look at the schema itself. Nothing in the
+// connector reaches for it: everything else goes through the methods above.
+func (c *Container) DB() *sql.DB { return c.db }
+
 // Devices is whatsmeow's own store, which the engine hands to a client.
 func (c *Container) Devices() *sqlstore.Container { return c.devices }
 
-// Close releases both handles.
+// Close releases the pool. There is only one, and whatsmeow's container wraps it
+// rather than owning it, so closing it here is the whole of it.
 func (c *Container) Close() error {
-	return errors.Join(c.devices.Close(), c.db.Close())
+	return c.db.Close()
 }
 
 // Device returns the device a session should connect with: the stored one when that
@@ -171,10 +200,18 @@ func (c *Container) Bind(ctx context.Context, sid string, jid types.JID) error {
 		return fmt.Errorf("store: bind %s: %w", sid, err)
 	}
 
-	// The devices the displaced mappings pointed at are credentials nothing can reach
-	// any more, and WhatsApp has already unlinked them. Failing the pairing over one
-	// that will not delete would be the worse outcome, so this is reported and not
-	// raised.
+	// The devices the displaced mappings pointed at are credentials no session can reach
+	// any more, so they are deleted rather than left to accumulate. Failing the pairing
+	// over one that will not delete would be the worse outcome, so this is reported and
+	// not raised.
+	//
+	// What this does not do is end the displaced session. WhatsApp allows an account
+	// several companion devices, so pairing a second one does not unlink the first: if
+	// the displaced session is running somewhere, its socket goes on working against the
+	// account with credentials that are no longer written down, and it is only on the
+	// next restart that it finds itself unpaired. Ending it needs a session-scoped stop
+	// that reaches whichever instance runs it, which is the same fleet-wide machinery
+	// M2 brings for the write fence, and is tracked with it.
 	for _, old := range displaced {
 		c.deleteDevice(ctx, old)
 	}
@@ -284,14 +321,155 @@ func (c *Container) migrate(ctx context.Context) error {
 			account  TEXT   NOT NULL,
 			bound_at BIGINT NOT NULL
 		)`,
-		`CREATE INDEX IF NOT EXISTS wac_session_device_account ON wac_session_device (account)`,
+		// The account index was not unique to begin with, and `IF NOT EXISTS` on the
+		// same name is a no-op against a store that already has it: an upgraded database
+		// would keep the old one and never gain the constraint. Dropped by name and
+		// replaced under a new one, so the rename is what proves the new index exists.
+		`DROP INDEX IF EXISTS wac_session_device_account`,
+		// Unique, not just indexed. The rule is one session per account, and Bind
+		// enforced it by reading the competing mappings and then writing: two instances
+		// pairing the same number at once both read nothing, both write, and the account
+		// ends up on two sessions with the displacement never happening. A constraint is
+		// the only version of that check two transactions cannot both pass.
+		`CREATE UNIQUE INDEX IF NOT EXISTS wac_session_device_one_per_account ON wac_session_device (account)`,
 	}
-	for _, statement := range statements {
+	for _, statement := range statements[:1] {
+		if _, err := c.db.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("store: create wac_session_device: %w", err)
+		}
+	}
+	if err := c.dropDuplicateMappings(ctx); err != nil {
+		return err
+	}
+	for _, statement := range statements[1:] {
 		if _, err := c.db.ExecContext(ctx, statement); err != nil {
 			return fmt.Errorf("store: create wac_session_device: %w", err)
 		}
 	}
 	return nil
+}
+
+// dropDuplicateMappings clears out whatever the old, permissive account index let
+// through, so a unique one can be built over it.
+//
+// The rule was always one session per account, so a second mapping is a row that should
+// never have been written. Which one to keep is decided by the credentials and not by
+// the clock: Bind writes the mapping before whatsmeow writes the device, so an instance
+// that died mid-pairing leaves the newest mapping of all pointing at a device that never
+// existed. Keeping that one deletes a working device to preserve an empty row, Device
+// then unbinds the survivor for having no credentials, and an upgrade has made an
+// account that was paired pair again. So the winner is the most recent mapping whose
+// device is actually on disk, and only when none of them has one does it fall back to
+// the most recent outright, which is the best a set of empty rows allows.
+//
+// The devices the losers named go with them, the way Bind takes a displaced device: no
+// mapping can reach them afterwards, and leaving them is leaving authentication material
+// on disk that nothing will ever use or clean up.
+func (c *Container) dropDuplicateMappings(ctx context.Context) error {
+	const contested = `
+		SELECT sid, jid, account, bound_at FROM wac_session_device
+		WHERE account IN (
+			SELECT account FROM wac_session_device GROUP BY account HAVING COUNT(*) > 1
+		)`
+
+	rows, err := c.db.QueryContext(ctx, contested)
+	if err != nil {
+		return fmt.Errorf("store: find the mappings the old index allowed: %w", err)
+	}
+	type mapping struct {
+		sid      string
+		jid      types.JID
+		readable bool
+		boundAt  int64
+	}
+	byAccount := map[string][]mapping{}
+	for rows.Next() {
+		var sid, raw, account string
+		var boundAt int64
+		if err := rows.Scan(&sid, &raw, &account, &boundAt); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("store: read the mappings the old index allowed: %w", err)
+		}
+		held := mapping{sid: sid, boundAt: boundAt}
+		if jid, parseErr := types.ParseJID(raw); parseErr != nil {
+			c.log.Warn().Str("sid", sid).Msg("a duplicate mapping holds an unreadable jid; leaving its device alone")
+		} else {
+			held.jid, held.readable = jid, true
+		}
+		byAccount[account] = append(byAccount[account], held)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return fmt.Errorf("store: read the mappings the old index allowed: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("store: read the mappings the old index allowed: %w", err)
+	}
+
+	var displaced []mapping
+	for _, candidates := range byAccount {
+		slices.SortFunc(candidates, func(a, b mapping) int {
+			if a.boundAt != b.boundAt {
+				return cmp.Compare(b.boundAt, a.boundAt)
+			}
+			return cmp.Compare(b.sid, a.sid)
+		})
+		// Newest first, so the first one holding credentials is both the most recent
+		// mapping and a usable one. Zero is the fallback the loop leaves standing.
+		winner := 0
+		for i, candidate := range candidates {
+			if !candidate.readable {
+				continue
+			}
+			held, err := c.hasDevice(ctx, candidate.jid)
+			if err != nil {
+				// Not "no credentials". A lookup that failed says nothing about what is
+				// on disk, and reading it as absence is how the mapping that has the
+				// device becomes a loser and gets deleted — the very thing this rule
+				// exists to prevent. The duplicates keep for another start; the unique
+				// index this precedes will not be built either, so nothing here is
+				// half-done.
+				return fmt.Errorf("store: read the device of %s: %w", candidate.sid, err)
+			}
+			if held {
+				winner = i
+				break
+			}
+		}
+		for i, candidate := range candidates {
+			if i != winner {
+				displaced = append(displaced, candidate)
+			}
+		}
+	}
+	if len(displaced) == 0 {
+		return nil
+	}
+
+	for _, old := range displaced {
+		if _, err := c.db.ExecContext(ctx,
+			c.rebind(`DELETE FROM wac_session_device WHERE sid = ?`), old.sid); err != nil {
+			return fmt.Errorf("store: drop the mapping of %s: %w", old.sid, err)
+		}
+		if old.readable {
+			c.deleteDevice(ctx, old.jid)
+		}
+	}
+	c.log.Warn().Int("dropped", len(displaced)).
+		Msg("more than one session held the same account; the losing mappings and their devices are gone")
+	return nil
+}
+
+// hasDevice reports whether whatsmeow still holds the credentials a mapping names. The
+// error is returned rather than folded into the answer, because "there is no device" and
+// "this could not be read" are the same value and opposite facts: one is a row to drop,
+// the other is a question nobody has answered.
+func (c *Container) hasDevice(ctx context.Context, jid types.JID) (bool, error) {
+	device, err := c.devices.GetDevice(ctx, jid)
+	if err != nil {
+		return false, err
+	}
+	return device != nil, nil
 }
 
 // rebind turns `?` placeholders into `$1`-style ones for Postgres. Writing every
@@ -329,20 +507,36 @@ func parseURL(address string) (dialect, dsn string, err error) {
 	case strings.HasPrefix(address, "postgres://"), strings.HasPrefix(address, "postgresql://"):
 		return dialectPostgres, address, nil
 	case strings.HasPrefix(address, "file:"):
-		return dialectSQLite, withForeignKeys(address), nil
+		return dialectSQLite, sqliteDefaults(address), nil
 	case strings.HasPrefix(address, "sqlite://"):
-		return dialectSQLite, withForeignKeys("file:" + strings.TrimPrefix(address, "sqlite://")), nil
+		return dialectSQLite, sqliteDefaults("file:" + strings.TrimPrefix(address, "sqlite://")), nil
 	case strings.HasPrefix(address, "sqlite:"):
-		return dialectSQLite, withForeignKeys("file:" + strings.TrimPrefix(address, "sqlite:")), nil
+		return dialectSQLite, sqliteDefaults("file:" + strings.TrimPrefix(address, "sqlite:")), nil
 	default:
 		return "", "", fmt.Errorf("store: %q is not a database url this connector understands", address)
 	}
 }
 
-// withForeignKeys turns the pragma on, because whatsmeow refuses to bring its schema up
-// without it and the driver leaves it off. Asking an operator to know that and spell it
-// in the url is asking them to debug `foreign keys are not enabled` on first boot.
-func withForeignKeys(dsn string) string {
+// sqliteDefaults fills in what the driver leaves off and whatsmeow needs on. An
+// operator who spells any of these themselves keeps their value; the defaults are for
+// the url the README documents, which is a path and nothing else.
+//
+// Each one is here because of a failure, not a preference:
+//
+//   - foreign_keys: whatsmeow refuses to bring its schema up without it, so first boot
+//     dies on `foreign keys are not enabled`.
+//   - journal_mode(WAL): the default rollback journal blocks every reader for the
+//     length of a write, and whatsmeow reads on the decrypt path while it writes on the
+//     receipt path.
+//   - busy_timeout: without it a contended write returns `database is locked` on the
+//     spot instead of waiting. That is what a live pairing produced: identity keys that
+//     could not be saved, messages that then could not be decrypted, and an app state
+//     sync that failed because the key share it needed was inside one of them.
+//   - _txlock=immediate: a transaction that starts out reading and later writes has to
+//     upgrade its lock, and two of those upgrading at once is a deadlock SQLite breaks
+//     by failing one of them, which no timeout can save. Taking the write lock at BEGIN
+//     turns that into ordinary waiting.
+func sqliteDefaults(dsn string) string {
 	base, query, _ := strings.Cut(dsn, "?")
 	values, err := url.ParseQuery(query)
 	if err != nil {
@@ -350,11 +544,28 @@ func withForeignKeys(dsn string) string {
 		// hide which half they got wrong.
 		return dsn
 	}
-	for _, pragma := range values["_pragma"] {
-		if strings.HasPrefix(pragma, "foreign_keys") {
-			return dsn
+
+	for pragma, setting := range map[string]string{
+		"foreign_keys": "foreign_keys(1)",
+		"journal_mode": "journal_mode(WAL)",
+		"busy_timeout": "busy_timeout(10000)",
+	} {
+		if !hasPragma(values["_pragma"], pragma) {
+			values.Add("_pragma", setting)
 		}
 	}
-	values.Add("_pragma", "foreign_keys(1)")
+	if values.Get("_txlock") == "" {
+		values.Set("_txlock", "immediate")
+	}
 	return base + "?" + values.Encode()
+}
+
+// hasPragma reports whether the operator already set one, whatever they set it to.
+func hasPragma(pragmas []string, name string) bool {
+	for _, pragma := range pragmas {
+		if strings.HasPrefix(strings.TrimSpace(pragma), name) {
+			return true
+		}
+	}
+	return false
 }

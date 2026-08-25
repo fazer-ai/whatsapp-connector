@@ -28,6 +28,30 @@ type Delivery struct {
 	// called after the command has been carried out (or definitively refused), never
 	// before: an un-acked command is one another instance can claim after a crash.
 	Ack func(context.Context) error
+	// Release says this instance is walking away from the command without having
+	// carried it out, and without acknowledging it: a wake it could not act on, a
+	// command for a session it does not own. The command stays pending and becomes
+	// claimable again, by any instance including this one.
+	//
+	// It exists because "still being carried out here" and "left behind here" are
+	// different states that a consumer group cannot tell apart: both are entries
+	// pending under this instance's name. Reclaiming the first duplicates a command
+	// that is still running; never reclaiming the second loses it for good in a fleet
+	// of one.
+	Release func()
+	// Forfeit is Release for a command this instance took its turn at and could not
+	// carry out. Both leave it pending; what differs is where it comes back.
+	//
+	// A reclaimed entry has the age the claim erased put back by Release, so a peer can
+	// take it at once rather than waiting the delay a second time. An entry that keeps
+	// its age is the oldest one on every pass, though, so an instance that fails on it
+	// takes it first again next pass, and again — and the entries behind it, which is
+	// every other wake, never get their turn. Forfeit gives that place up: the entry
+	// waits out the reclaim delay like a command whose instance died, which is what one
+	// this instance tried and could not run has come to resemble.
+	//
+	// Nil where the delivery has no age to give up, and then Release is the whole story.
+	Forfeit func()
 }
 
 // CommandReader delivers the commands addressed to the sessions this instance owns,
@@ -37,9 +61,20 @@ type CommandReader interface {
 	// interval elapses. An empty slice with a nil error means "nothing this round",
 	// which is the ordinary case and not a failure.
 	Read(ctx context.Context, sids []string) ([]Delivery, error)
-	// Claim takes over commands left pending by an instance that stopped. It is what
-	// makes a command survive the death of the instance that was about to run it.
+	// Claim takes over commands left pending on these sessions' own streams by an
+	// instance that stopped. It is what makes a command survive the death of the
+	// instance that was about to run it.
 	Claim(ctx context.Context, sids []string) ([]Delivery, error)
+	// ClaimControl is Claim over the stream addressed to no session in particular. It
+	// is separate because a wake is what puts a session from a dead instance back on an
+	// instance: sharing a call with the session streams has it taken last, under
+	// whatever deadline they left, and released along with them when any one of them
+	// fails.
+	ClaimControl(ctx context.Context) ([]Delivery, error)
+	// ClaimSessions is Claim over these sessions' own streams and nothing else. It is
+	// what a session just adopted needs before anything newer is read for it, so that a
+	// command its previous owner abandoned is not overtaken by one that arrived later.
+	ClaimSessions(ctx context.Context, sids []string) ([]Delivery, error)
 }
 
 // Replier answers an RPC command.

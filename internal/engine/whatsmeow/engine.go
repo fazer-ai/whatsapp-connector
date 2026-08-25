@@ -1,0 +1,151 @@
+// Package whatsmeow is the real WhatsApp side: one whatsmeow client per session,
+// translated into the canonical events the contract names.
+//
+// Nothing above this package imports whatsmeow, and nothing in it decides ownership.
+// A session runs here for as long as the layer above says this instance owns it, and
+// that layer closes it the moment the lease is gone.
+package whatsmeow
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
+
+	"github.com/rs/zerolog"
+	wm "go.mau.fi/whatsmeow"
+	waStore "go.mau.fi/whatsmeow/store"
+	"google.golang.org/protobuf/proto"
+
+	"github.com/fazer-ai/whatsapp-connector/internal/engine"
+	"github.com/fazer-ai/whatsapp-connector/internal/store"
+)
+
+// deviceNameOnce guards the one write to whatsmeow's process-wide device properties.
+var deviceNameOnce sync.Once
+
+// Engine hands out one session per account, backed by a shared device store.
+type Engine struct {
+	store *store.Container
+	log   zerolog.Logger
+
+	mu       sync.Mutex
+	sessions map[string]*Session
+	closed   bool
+}
+
+// New returns an engine over an open store.
+//
+// The device name is set once, process-wide, because that is the only place whatsmeow
+// keeps it: `store.DeviceProps` is a package-level value read during the pairing
+// handshake, so a per-session name would mean mutating a global in the middle of every
+// pairing and racing every other session doing the same. `session.connect` carries a
+// `device_name` the contract promises, and this is why it cannot be honoured per
+// session; the deployment's own name is what the account's linked-devices list shows.
+//
+//nolint:gocritic // zerolog.Logger is designed to be copied; every With() returns one by value
+func New(container *store.Container, deviceName string, log zerolog.Logger) *Engine {
+	if deviceName != "" {
+		// Written exactly once, because it is written to a package-level value whatsmeow
+		// reads from its pairing handshake: a second engine assigning it is a write with
+		// no lock against a read on another goroutine. The first name wins, which is the
+		// deployment's own, since a process runs one engine.
+		deviceNameOnce.Do(func() { waStore.DeviceProps.Os = proto.String(deviceName) })
+	}
+	return &Engine{
+		store:    container,
+		log:      log,
+		sessions: make(map[string]*Session),
+	}
+}
+
+// Open prepares a session with the device it paired, or a fresh one when it has not
+// paired yet. It does not touch the network.
+func (e *Engine) Open(ctx context.Context, sid string) (engine.Session, error) {
+	e.mu.Lock()
+	if e.closed {
+		e.mu.Unlock()
+		return nil, errors.New("whatsmeow: the engine is closed")
+	}
+	if existing, ok := e.sessions[sid]; ok {
+		if !existing.Closed() {
+			e.mu.Unlock()
+			return existing, nil
+		}
+		// A closed session holds a socket that cannot be reopened, so the next Open
+		// builds a new client rather than handing back one that will never connect.
+		delete(e.sessions, sid)
+	}
+	e.mu.Unlock()
+
+	device, err := e.store.Device(ctx, sid)
+	if err != nil {
+		return nil, fmt.Errorf("whatsmeow: open %s: %w", sid, err)
+	}
+
+	wa := newLibraryLogger(e.log, sid)
+	session := newSession(sid, wm.NewClient(device, wa), e.store, e.log, wa)
+	// Registered before the session can be handed out, so a close that happens while
+	// this function is still running is not one nobody hears about.
+	session.onClose(func() { e.forget(sid, session) })
+
+	e.mu.Lock()
+	// Unlocked before any Close below. A closing session calls back into forget, which
+	// takes this lock, and holding it across the call would have the two wait on each
+	// other.
+	if e.closed {
+		e.mu.Unlock()
+		_ = session.Close()
+		return nil, errors.New("whatsmeow: the engine is closed")
+	}
+	// Open can be reached twice for one session. The second caller must get the first
+	// session rather than a second client on the same credentials.
+	if winner, ok := e.sessions[sid]; ok && !winner.Closed() {
+		e.mu.Unlock()
+		_ = session.Close()
+		return winner, nil
+	}
+	e.sessions[sid] = session
+	e.mu.Unlock()
+
+	// A close that landed before the entry existed found nothing to remove, so the
+	// entry it should have taken is this one.
+	if session.Closed() {
+		e.forget(sid, session)
+	}
+	return session, nil
+}
+
+// forget drops a session from the cache once it is closed.
+//
+// Without it an entry lives until the same account is opened here again, which for a
+// fleet member that has handed its sessions on is never: it would go on holding every
+// whatsmeow client it ever ran, each with the device credentials and channels behind it.
+//
+// The session is compared and not just the id, because a closed session and the one
+// that replaced it share an id, and the replacement is the one still running.
+func (e *Engine) forget(sid string, session *Session) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.sessions[sid] == session {
+		delete(e.sessions, sid)
+	}
+}
+
+// Close shuts every session down.
+func (e *Engine) Close() error {
+	e.mu.Lock()
+	sessions := make([]*Session, 0, len(e.sessions))
+	for _, session := range e.sessions {
+		sessions = append(sessions, session)
+	}
+	e.sessions = make(map[string]*Session)
+	e.closed = true
+	e.mu.Unlock()
+
+	var errs []error
+	for _, session := range sessions {
+		errs = append(errs, session.Close())
+	}
+	return errors.Join(errs...)
+}

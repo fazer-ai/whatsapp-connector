@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"strconv"
 	"testing"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/fazer-ai/whatsapp-connector/internal/app"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 	"github.com/fazer-ai/whatsapp-connector/internal/redisx"
+	"github.com/fazer-ai/whatsapp-connector/internal/transport/redisstream"
 )
 
 // client is the Chatwoot side, reduced to what M0 has to prove: it wakes a session,
@@ -84,7 +86,7 @@ func (c *client) events(ctx context.Context, sid string) []protocol.Event {
 }
 
 // start runs one connector against the given Redis and stops it when the test ends.
-func start(t *testing.T, addr, instance string) *app.Connector {
+func start(t *testing.T, addr, instance string, env map[string]string) *app.Connector {
 	t.Helper()
 	t.Setenv("REDIS_URL", "redis://"+addr)
 	t.Setenv("WAC_INSTANCE", instance)
@@ -93,6 +95,9 @@ func start(t *testing.T, addr, instance string) *app.Connector {
 	// heartbeat so a lease renewal happens within the test's lifetime.
 	t.Setenv("WAC_HTTP_ADDR", "127.0.0.1:0")
 	t.Setenv("WAC_HEARTBEAT", "200ms")
+	for name, value := range env {
+		t.Setenv(name, value)
+	}
 
 	cfg, err := app.LoadConfig("test-host")
 	if err != nil {
@@ -133,7 +138,7 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 // command comes back answered, and the events land on the session's shard in order.
 func TestFleetAdoptsASessionAndAnswersACommand(t *testing.T) {
 	server := miniredis.RunT(t)
-	connector := start(t, server.Addr(), "inst-a")
+	connector := start(t, server.Addr(), "inst-a", nil)
 	c := newClient(t, server.Addr())
 	ctx := context.Background()
 
@@ -162,8 +167,8 @@ func TestFleetAdoptsASessionAndAnswersACommand(t *testing.T) {
 // holds: two live sockets on one WhatsApp account is what the lease exists to stop.
 func TestOnlyOneInstanceRunsASession(t *testing.T) {
 	server := miniredis.RunT(t)
-	first := start(t, server.Addr(), "inst-a")
-	second := start(t, server.Addr(), "inst-b")
+	first := start(t, server.Addr(), "inst-a", nil)
+	second := start(t, server.Addr(), "inst-b", nil)
 	c := newClient(t, server.Addr())
 
 	const sid = "2f1c6f0e-0000-4000-8000-000000000002"
@@ -187,7 +192,7 @@ func TestOnlyOneInstanceRunsASession(t *testing.T) {
 // instance happened to read it.
 func TestCommandForAnUnownedSessionIsNotAnswered(t *testing.T) {
 	server := miniredis.RunT(t)
-	start(t, server.Addr(), "inst-a")
+	start(t, server.Addr(), "inst-a", nil)
 	c := newClient(t, server.Addr())
 	ctx := context.Background()
 
@@ -206,7 +211,7 @@ func TestCommandForAnUnownedSessionIsNotAnswered(t *testing.T) {
 
 func TestPublishedEventsCarryTheOwnersEpochInOrder(t *testing.T) {
 	server := miniredis.RunT(t)
-	connector := start(t, server.Addr(), "inst-a")
+	connector := start(t, server.Addr(), "inst-a", nil)
 	c := newClient(t, server.Addr())
 	ctx := context.Background()
 
@@ -244,7 +249,7 @@ func TestPublishedEventsCarryTheOwnersEpochInOrder(t *testing.T) {
 // from, and there is no recovering from that after the fact.
 func TestAnInstanceWithADifferentShardCountRefusesToStart(t *testing.T) {
 	server := miniredis.RunT(t)
-	start(t, server.Addr(), "inst-a")
+	start(t, server.Addr(), "inst-a", nil)
 
 	t.Setenv("WAC_EVENT_SHARDS", "16")
 	cfg, err := app.LoadConfig("test-host")
@@ -253,5 +258,318 @@ func TestAnInstanceWithADifferentShardCountRefusesToStart(t *testing.T) {
 	}
 	if _, err := app.New(&cfg, zerolog.Nop()); err == nil {
 		t.Fatal("an instance with a different shard count started")
+	}
+}
+
+// A whatsmeow engine with nowhere to keep a pairing is a deployment that asks every
+// session to scan a QR code on every restart while reporting itself healthy. Refusing
+// at startup is what turns that into a message an operator sees once.
+func TestTheRealEngineRefusesToStartWithoutADatabase(t *testing.T) {
+	t.Setenv("WAC_ENGINE", "whatsmeow")
+	t.Setenv("WAC_DATABASE_URL", "")
+
+	if _, err := app.LoadConfig("connector-test"); err == nil {
+		t.Fatal("the whatsmeow engine started with no database url")
+	}
+
+	t.Setenv("WAC_DATABASE_URL", "sqlite:wa.db")
+	cfg, err := app.LoadConfig("connector-test")
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.DatabaseURL != "sqlite:wa.db" {
+		t.Fatalf("the config carries %q", cfg.DatabaseURL)
+	}
+}
+
+// An instance that dies between reading a wake and acting on it leaves that wake in the
+// group's pending list, where no later read will ever see it: `>` only returns entries
+// nobody has taken. The same thing happens on purpose when this connector cannot adopt
+// a woken session and leaves the wake for someone else. Either way, the session stays
+// unowned until something claims the entry, so the loop has to.
+func TestAWakeLeftPendingIsPickedUpAgain(t *testing.T) {
+	server := miniredis.RunT(t)
+	c := newClient(t, server.Addr())
+	ctx := context.Background()
+
+	const sid = "2f1c6f0e-0000-4000-8000-000000000009"
+	control := c.key.Control()
+
+	// The shape an instance leaves behind when it is killed mid-command: the group
+	// exists, the wake was read by a consumer that is now gone, and nothing acked it.
+	if err := c.rdb.XGroupCreateMkStream(ctx, control, redisstream.ConsumerGroup, "0").Err(); err != nil {
+		t.Fatalf("create the group: %v", err)
+	}
+	c.send(ctx, control, &protocol.Command{
+		V: protocol.Version, ID: "wake-pending", Type: protocol.CommandSessionWake, SID: sid,
+		TS: time.Now().UnixMilli(), Payload: json.RawMessage(`{"desired":"connected"}`),
+	})
+	taken, err := c.rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
+		Group: redisstream.ConsumerGroup, Consumer: "inst-dead", Streams: []string{control, ">"}, Count: 10,
+	}).Result()
+	if err != nil {
+		t.Fatalf("read as the instance that died: %v", err)
+	}
+	if len(taken) != 1 || len(taken[0].Messages) != 1 {
+		t.Fatalf("the dead instance read %v, want one wake", taken)
+	}
+
+	// A live instance now starts. A plain read will never show it this entry.
+	connector := start(t, server.Addr(), "inst-a", map[string]string{"WAC_LEASE_TTL": "1s", "WAC_CLAIM_MIN_IDLE": "1500ms"})
+	waitFor(t, "the pending wake to be reclaimed and acted on", func() bool {
+		return connector.Sessions() == 1
+	})
+}
+
+// Fitting inside the lease is not enough on its own. Reading, dispatching and renewing
+// are one goroutine, so the renewal that follows a read comes a heartbeat, plus however
+// long that read waited on Redis, plus however long its batch took, after the one before
+// it. Longer than the lease and every session on the instance is acquired by a peer while
+// this one still holds their sockets open, which is the one thing the lease exists to
+// prevent — and a read landing just before a tick is an ordinary minute, not a corner.
+func TestAHeartbeatHasToLeaveRoomForTheReadAndBatchBeforeIt(t *testing.T) {
+	t.Setenv("WAC_LEASE_TTL", "30s")
+	t.Setenv("WAC_CLAIM_MIN_IDLE", "45s")
+
+	// A 30s lease leaves 20s once a batch has had its third, and a heartbeat spends its
+	// own length plus half of it again on the read: 14s is the first that does not fit.
+	// 19s is what a check that counted the batch and forgot the read would have let
+	// through, at roughly 34s between renewals.
+	for _, heartbeat := range []string{"14s", "19s", "25s"} {
+		t.Setenv("WAC_HEARTBEAT", heartbeat)
+		if _, err := app.LoadConfig("connector-test"); err == nil {
+			t.Fatalf("a %s heartbeat started against a 30s lease, so a read and its batch can outlive the lease",
+				heartbeat)
+		}
+	}
+
+	t.Setenv("WAC_HEARTBEAT", "13s")
+	if _, err := app.LoadConfig("connector-test"); err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+
+	// And the read is bounded by the heartbeat rather than fixed, which is what makes the
+	// arithmetic above hold on a deployment that tunes one of them.
+	if block := app.ReadBlock(13 * time.Second); block >= 13*time.Second {
+		t.Fatalf("a read may wait %s against a 13s heartbeat", block)
+	}
+}
+
+// A wake is acknowledged when adoption finds the session already owned, because in a
+// fleet that means somebody else is running it. That answer is only true while the
+// owner is alive: an instance that reads a wake, wins the lease and dies before
+// acknowledging leaves a lease that outlives it by up to the whole TTL, and a peer
+// claiming inside that window retires the only wake there was. Refusing the
+// configuration is what keeps the window from existing.
+func TestTheReclaimDelayHasToOutlastALease(t *testing.T) {
+	t.Setenv("WAC_LEASE_TTL", "30s")
+
+	for _, idle := range []string{"29s", "30s"} {
+		t.Setenv("WAC_CLAIM_MIN_IDLE", idle)
+		if _, err := app.LoadConfig("connector-test"); err == nil {
+			t.Fatalf("a reclaim delay of %s started against a 30s lease", idle)
+		}
+	}
+
+	t.Setenv("WAC_CLAIM_MIN_IDLE", "31s")
+	if _, err := app.LoadConfig("connector-test"); err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+
+	// And the default is derived rather than fixed, so raising the lease raises it too.
+	os.Unsetenv("WAC_CLAIM_MIN_IDLE")
+	t.Setenv("WAC_LEASE_TTL", "2m")
+	cfg, err := app.LoadConfig("connector-test")
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.ClaimMinIdle <= cfg.LeaseTTL {
+		t.Fatalf("the default reclaim delay is %s against a %s lease", cfg.ClaimMinIdle, cfg.LeaseTTL)
+	}
+}
+
+// Commands for one session are ordered by being on one stream read by one consumer. A
+// command its previous owner read and abandoned is off that stream until somebody
+// reclaims it, so an instance that adopts the session and reads `>` first hands over
+// commands that arrived later and runs them out of order. The example is the one that
+// costs an operator something: a `session.disconnect` landing behind the
+// `session.connect` that replaced it leaves the account in the state nobody asked for.
+func TestASessionIsDrainedBeforeAnythingNewerIsReadForIt(t *testing.T) {
+	server := miniredis.RunT(t)
+	c := newClient(t, server.Addr())
+	ctx := context.Background()
+
+	const sid = "2f1c6f0e-0000-4000-8000-00000000000a"
+	commands := c.key.Commands(sid)
+
+	// The previous owner read a disconnect and died before carrying it out.
+	if err := c.rdb.XGroupCreateMkStream(ctx, commands, redisstream.ConsumerGroup, "0").Err(); err != nil {
+		t.Fatalf("create the group: %v", err)
+	}
+	c.send(ctx, commands, &protocol.Command{
+		V: protocol.Version, ID: "disconnect-old", Type: protocol.CommandSessionDisconnect, SID: sid,
+		TS: time.Now().UnixMilli(), Payload: json.RawMessage(`{}`),
+	})
+	taken, err := c.rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
+		Group: redisstream.ConsumerGroup, Consumer: "inst-dead", Streams: []string{commands, ">"}, Count: 10,
+	}).Result()
+	if err != nil || len(taken) != 1 || len(taken[0].Messages) != 1 {
+		t.Fatalf("the dead instance read %v (err=%v), want one command", taken, err)
+	}
+
+	// And then the operator reconnected, which is the command that must win.
+	c.send(ctx, commands, &protocol.Command{
+		V: protocol.Version, ID: "connect-new", Type: protocol.CommandSessionConnect, SID: sid,
+		TS: time.Now().UnixMilli(), ReplyTo: "connect-new", Payload: json.RawMessage(`{"pairing":"resume"}`),
+	})
+	c.send(ctx, c.key.Control(), &protocol.Command{
+		V: protocol.Version, ID: "wake-order", Type: protocol.CommandSessionWake, SID: sid,
+		TS: time.Now().UnixMilli(), Payload: json.RawMessage(`{"desired":"connected"}`),
+	})
+
+	connector := start(t, server.Addr(), "inst-a", map[string]string{
+		"WAC_LEASE_TTL": "3s", "WAC_CLAIM_MIN_IDLE": "3500ms",
+	})
+	waitFor(t, "the session to be adopted", func() bool { return connector.Sessions() == 1 })
+
+	if reply := c.await(ctx, "connect-new", 10*time.Second); !reply.OK {
+		t.Fatalf("the connect was refused: %+v", reply)
+	}
+
+	// Held past the reclaim delay: without the drain, the abandoned disconnect comes
+	// back on a later heartbeat and undoes the connect that replaced it.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		c.send(ctx, commands, &protocol.Command{
+			V: protocol.Version, ID: "status-" + strconv.FormatInt(time.Now().UnixNano(), 10),
+			Type: protocol.CommandSessionStatus, SID: sid, TS: time.Now().UnixMilli(),
+			ReplyTo: "status-check", Payload: json.RawMessage(`{}`),
+		})
+		reply := c.await(ctx, "status-check", 5*time.Second)
+		if !reply.OK {
+			t.Fatalf("session.status was refused: %+v", reply)
+		}
+		var status map[string]any
+		if err := json.Unmarshal(reply.Result, &status); err != nil {
+			t.Fatalf("unmarshal the status: %v", err)
+		}
+		if status["connection"] != "open" {
+			t.Fatalf("connection=%v after the abandoned disconnect came back, want open", status["connection"])
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// One claim takes at most ReadCount entries per stream, so a session whose previous
+// owner left more than that behind is only half drained by a single pass. Reading `>`
+// after that half hands over commands that arrived later and runs them ahead of the
+// rest, which is the same reordering as draining nothing at all — just harder to see.
+func TestASessionWithALongBacklogIsDrainedBeforeItIsRead(t *testing.T) {
+	server := miniredis.RunT(t)
+	c := newClient(t, server.Addr())
+	ctx := context.Background()
+
+	const sid = "2f1c6f0e-0000-4000-8000-00000000000b"
+	// More than one claim can take, so finishing the drain needs several passes.
+	const backlog = redisstream.DefaultReadCount + 5
+	commands := c.key.Commands(sid)
+
+	if err := c.rdb.XGroupCreateMkStream(ctx, commands, redisstream.ConsumerGroup, "0").Err(); err != nil {
+		t.Fatalf("create the group: %v", err)
+	}
+	for i := range backlog {
+		c.send(ctx, commands, &protocol.Command{
+			V: protocol.Version, ID: "disconnect-" + strconv.Itoa(i), Type: protocol.CommandSessionDisconnect,
+			SID: sid, TS: time.Now().UnixMilli(), Payload: json.RawMessage(`{}`),
+		})
+	}
+	taken, err := c.rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
+		Group: redisstream.ConsumerGroup, Consumer: "inst-dead", Streams: []string{commands, ">"}, Count: backlog,
+	}).Result()
+	if err != nil || len(taken) != 1 || len(taken[0].Messages) != backlog {
+		t.Fatalf("the dead instance read %v (err=%v), want %d commands", taken, err, backlog)
+	}
+
+	// The operator's reconnect, which arrived after every one of them.
+	c.send(ctx, commands, &protocol.Command{
+		V: protocol.Version, ID: "connect-after", Type: protocol.CommandSessionConnect, SID: sid,
+		TS: time.Now().UnixMilli(), ReplyTo: "connect-after", Payload: json.RawMessage(`{"pairing":"resume"}`),
+	})
+	c.send(ctx, c.key.Control(), &protocol.Command{
+		V: protocol.Version, ID: "wake-backlog", Type: protocol.CommandSessionWake, SID: sid,
+		TS: time.Now().UnixMilli(), Payload: json.RawMessage(`{"desired":"connected"}`),
+	})
+
+	connector := start(t, server.Addr(), "inst-a", map[string]string{
+		"WAC_LEASE_TTL": "3s", "WAC_CLAIM_MIN_IDLE": "3500ms",
+	})
+	waitFor(t, "the session to be adopted", func() bool { return connector.Sessions() == 1 })
+
+	if reply := c.await(ctx, "connect-after", 15*time.Second); !reply.OK {
+		t.Fatalf("the connect was refused: %+v", reply)
+	}
+
+	// Held past the reclaim delay: a disconnect left behind by the drain comes back on a
+	// later heartbeat and undoes the connect that replaced it.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		c.send(ctx, commands, &protocol.Command{
+			V: protocol.Version, ID: "status-" + strconv.FormatInt(time.Now().UnixNano(), 10),
+			Type: protocol.CommandSessionStatus, SID: sid, TS: time.Now().UnixMilli(),
+			ReplyTo: "backlog-check", Payload: json.RawMessage(`{}`),
+		})
+		reply := c.await(ctx, "backlog-check", 5*time.Second)
+		if !reply.OK {
+			t.Fatalf("session.status was refused: %+v", reply)
+		}
+		var status map[string]any
+		if err := json.Unmarshal(reply.Result, &status); err != nil {
+			t.Fatalf("unmarshal the status: %v", err)
+		}
+		if status["connection"] != "open" {
+			t.Fatalf("connection=%v after a disconnect the drain left behind came back, want open", status["connection"])
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// A non-positive lease is accepted by cluster.NewLeases, which substitutes its own
+// default, so the leases go on working while everything derived from the configured
+// value here does not: the dispatch budget is a third of it, and a zero budget is a
+// context that has already expired, so every command read is released again unrun. An
+// instance that takes work, does none of it, and reports itself healthy.
+func TestATimingThatCannotWorkIsRefusedAtStartup(t *testing.T) {
+	for name, env := range map[string]map[string]string{
+		"a lease of no length": {
+			"WAC_LEASE_TTL": "0s", "WAC_CLAIM_MIN_IDLE": "1s", "WAC_HEARTBEAT": "1s",
+		},
+		"a lease that runs backwards": {
+			"WAC_LEASE_TTL": "-30s", "WAC_CLAIM_MIN_IDLE": "1s", "WAC_HEARTBEAT": "1s",
+		},
+		"a heartbeat of no length": {
+			"WAC_LEASE_TTL": "30s", "WAC_CLAIM_MIN_IDLE": "45s", "WAC_HEARTBEAT": "0s",
+		},
+		"a heartbeat the lease cannot outlast": {
+			"WAC_LEASE_TTL": "30s", "WAC_CLAIM_MIN_IDLE": "45s", "WAC_HEARTBEAT": "30s",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			for key, value := range env {
+				t.Setenv(key, value)
+			}
+			if _, err := app.LoadConfig("connector-test"); err == nil {
+				t.Fatalf("%s started", name)
+			}
+		})
+	}
+
+	// And the timing a deployment actually runs still starts.
+	for key, value := range map[string]string{
+		"WAC_LEASE_TTL": "30s", "WAC_CLAIM_MIN_IDLE": "45s", "WAC_HEARTBEAT": "5s",
+	} {
+		t.Setenv(key, value)
+	}
+	if _, err := app.LoadConfig("connector-test"); err != nil {
+		t.Fatalf("LoadConfig: %v", err)
 	}
 }
