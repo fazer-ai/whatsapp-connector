@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -54,6 +55,13 @@ type Streams struct {
 	client *redisx.Client
 	opts   Options
 	groups *groupCache
+
+	// inFlight is what this process has handed out and not finished with. A consumer
+	// group cannot tell "still running here" from "left behind here" — both are
+	// entries pending under this instance's name — and reclaiming the first duplicates
+	// a running command while never reclaiming the second loses it in a fleet of one.
+	inFlightMu sync.Mutex
+	inFlight   map[string]struct{}
 }
 
 // New returns the transport. It creates no keys: a stream and its group are created on
@@ -81,7 +89,10 @@ func New(client *redisx.Client, opts Options) (*Streams, error) {
 	if opts.ReadCount <= 0 {
 		opts.ReadCount = DefaultReadCount
 	}
-	return &Streams{client: client, opts: opts, groups: newGroupCache()}, nil
+	return &Streams{
+		client: client, opts: opts, groups: newGroupCache(),
+		inFlight: make(map[string]struct{}),
+	}, nil
 }
 
 // Publish appends an event to its session's shard.
@@ -218,32 +229,59 @@ func (s *Streams) Claim(ctx context.Context, sids []string) ([]transport.Deliver
 // Acknowledging the original does not retire the copy. XPENDING is the only form that
 // says who holds an entry.
 func (s *Streams) reclaimable(ctx context.Context, stream string) ([]string, error) {
-	pending, err := s.client.XPendingExt(ctx, &redis.XPendingExtArgs{
-		Stream: stream,
-		Group:  ConsumerGroup,
-		Idle:   s.opts.ClaimMinIdle,
-		Start:  "-",
-		End:    "+",
-		Count:  s.opts.ReadCount,
-	}).Result()
-	switch {
-	case errors.Is(err, redis.Nil):
-		return nil, nil
-	case isNoGroup(err):
-		return nil, err
-	case err != nil:
-		return nil, fmt.Errorf("redisstream: list what is pending on %s: %w", stream, err)
-	}
+	ids := make([]string, 0, s.opts.ReadCount)
+	start := "-"
 
-	ids := make([]string, 0, len(pending))
-	for _, entry := range pending {
-		if entry.Consumer == s.opts.Instance {
-			continue
+	// Paged, because the filter is what makes a page yield nothing: entries this
+	// process is still running stay pending for as long as they run, and a page full of
+	// them would hide everything behind it on every heartbeat, forever. The page cap is
+	// there so one heartbeat cannot walk an arbitrarily long list.
+	for range maxPendingPages {
+		pending, err := s.client.XPendingExt(ctx, &redis.XPendingExtArgs{
+			Stream: stream,
+			Group:  ConsumerGroup,
+			Idle:   s.opts.ClaimMinIdle,
+			Start:  start,
+			End:    "+",
+			Count:  s.opts.ReadCount,
+		}).Result()
+		switch {
+		case errors.Is(err, redis.Nil):
+			return ids, nil
+		case isNoGroup(err):
+			return nil, err
+		case err != nil:
+			return nil, fmt.Errorf("redisstream: list what is pending on %s: %w", stream, err)
+		case len(pending) == 0:
+			return ids, nil
 		}
-		ids = append(ids, entry.ID)
+
+		for _, entry := range pending {
+			if entry.ID == start {
+				// The page starts inclusively, so the entry the last page ended on
+				// comes back once more.
+				continue
+			}
+			// Only what this process is still carrying out is skipped. The consumer
+			// name is the wrong question: a command this instance left behind before it
+			// restarted, and a wake it deliberately left pending, are both pending under
+			// this same name and both have to come back.
+			if s.running(stream, entry.ID) {
+				continue
+			}
+			ids = append(ids, entry.ID)
+		}
+		if len(ids) >= int(s.opts.ReadCount) || int64(len(pending)) < s.opts.ReadCount {
+			return ids, nil
+		}
+		start = pending[len(pending)-1].ID
 	}
 	return ids, nil
 }
+
+// maxPendingPages bounds how much of the pending list one reclaim walks. The next
+// heartbeat carries on from the front, so nothing is lost by stopping.
+const maxPendingPages = 8
 
 // streamsFor is the per-session command streams plus the control one. Control is
 // always read: it carries `session.wake`, which is how a session with no owner gets
@@ -270,22 +308,52 @@ func (s *Streams) deliveries(result []redis.XStream) []transport.Delivery {
 				s.ackUnreadable(stream.Stream, message.ID)
 				continue
 			}
+			held := s.hold(stream.Stream, message.ID)
 			out = append(out, transport.Delivery{
 				Command: command,
-				Ack:     s.acker(stream.Stream, message.ID),
+				Ack:     s.acker(stream.Stream, message.ID, held),
+				Release: held,
 			})
 		}
 	}
 	return out
 }
 
-func (s *Streams) acker(stream, id string) func(context.Context) error {
+func (s *Streams) acker(stream, id string, release func()) func(context.Context) error {
 	return func(ctx context.Context) error {
+		defer release()
 		if err := s.client.XAck(ctx, stream, ConsumerGroup, id).Err(); err != nil {
 			return fmt.Errorf("redisstream: ack %s on %s: %w", id, stream, err)
 		}
 		return nil
 	}
+}
+
+// hold records that this process has handed an entry out and is not finished with it.
+// The returned function is what says it is: it runs once, on the ack or on the release,
+// whichever comes.
+func (s *Streams) hold(stream, id string) func() {
+	key := stream + "\x00" + id
+	s.inFlightMu.Lock()
+	s.inFlight[key] = struct{}{}
+	s.inFlightMu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.inFlightMu.Lock()
+			delete(s.inFlight, key)
+			s.inFlightMu.Unlock()
+		})
+	}
+}
+
+// running reports whether this process is still carrying an entry out.
+func (s *Streams) running(stream, id string) bool {
+	s.inFlightMu.Lock()
+	defer s.inFlightMu.Unlock()
+	_, held := s.inFlight[stream+"\x00"+id]
+	return held
 }
 
 func (s *Streams) ackUnreadable(stream, id string) {

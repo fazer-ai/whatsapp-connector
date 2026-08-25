@@ -194,10 +194,18 @@ func (c *Container) Bind(ctx context.Context, sid string, jid types.JID) error {
 		return fmt.Errorf("store: bind %s: %w", sid, err)
 	}
 
-	// The devices the displaced mappings pointed at are credentials nothing can reach
-	// any more, and WhatsApp has already unlinked them. Failing the pairing over one
-	// that will not delete would be the worse outcome, so this is reported and not
-	// raised.
+	// The devices the displaced mappings pointed at are credentials no session can reach
+	// any more, so they are deleted rather than left to accumulate. Failing the pairing
+	// over one that will not delete would be the worse outcome, so this is reported and
+	// not raised.
+	//
+	// What this does not do is end the displaced session. WhatsApp allows an account
+	// several companion devices, so pairing a second one does not unlink the first: if
+	// the displaced session is running somewhere, its socket goes on working against the
+	// account with credentials that are no longer written down, and it is only on the
+	// next restart that it finds itself unpaired. Ending it needs a session-scoped stop
+	// that reaches whichever instance runs it, which is the same fleet-wide machinery
+	// M2 brings for the write fence, and is tracked with it.
 	for _, old := range displaced {
 		c.deleteDevice(ctx, old)
 	}

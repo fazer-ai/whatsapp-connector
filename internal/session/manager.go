@@ -192,7 +192,9 @@ func (m *Manager) Dispatch(ctx context.Context, delivery *transport.Delivery) {
 	if !running {
 		// Not ours. Leaving it un-acknowledged is the point: the instance that does own
 		// the session reads the same stream, and an instance that owns nothing must not
-		// swallow a command on its way there.
+		// swallow a command on its way there. Released, so it does not read as work this
+		// process is still doing and become unclaimable.
+		release(delivery)
 		return
 	}
 	if !session.Offer(delivery) {
@@ -220,6 +222,7 @@ func (m *Manager) wake(ctx context.Context, delivery *transport.Delivery) {
 		// stopped the adoption — a database that was away, a store that could not be
 		// read — may well be over by the time this is reclaimed.
 		m.log.Error().Err(err).Str("sid", sid).Msg("failed to adopt a woken session; leaving the wake pending")
+		release(delivery)
 		return
 	}
 	m.ack(ctx, delivery)
@@ -248,6 +251,14 @@ func (m *Manager) refuse(ctx context.Context, delivery *transport.Delivery, fail
 		})
 	}
 	m.ack(ctx, delivery)
+}
+
+// release says this instance is done with a delivery it did not carry out. A transport
+// that does not track its own in-flight work leaves it nil, and there is nothing to say.
+func release(delivery *transport.Delivery) {
+	if delivery.Release != nil {
+		delivery.Release()
+	}
 }
 
 func (m *Manager) ack(ctx context.Context, delivery *transport.Delivery) {

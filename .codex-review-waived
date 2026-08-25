@@ -13,3 +13,15 @@ contract/schema/protocol.schema.json: Require a usable anchor for native history
 internal/store/store.go: Fence device writes against lease loss  # PR#5 — real, and not a patch: whatsmeow writes through its own SQL layer where a statement carries no session identity, so a fence has to be per-session all the way down (one container per session, or a session-aware driver wrapper). That is M2, when this package starts owning writes of its own. The lease plus the heartbeat teardown bound the window meanwhile, and the roadmap says it is open.
 internal/engine/whatsmeow/session.go: Deduplicate logout before calling WhatsApp  # PR#6 — real, and not the place to fix it: the connector has no idempotency layer at all yet, for any command. Invariant 5 lands with `message.send` in M2, where the same machinery covers logout. Building one mechanism for logout alone would be a second one to retire.
 internal/engine/whatsmeow/session.go: Reuse an in-flight dial for pairing retries  # PR#6 — real, and a design rather than a guard: joining an existing dial means a shared result every caller can wait on, which is the same machinery M2 needs for idempotent sends. Building a one-off here would be a second one to retire. The retry meanwhile fails with ErrAlreadyConnected and the operator tries again, which is visible rather than silent.
+# PR#6: real, and it needs the machinery M2 brings rather than a guard here. A second
+# session pairing an account displaces the first mapping and deletes its device, but the
+# displaced session's socket keeps working: WhatsApp allows several companion devices, so
+# the new pairing does not unlink the old one, and only the next restart finds it
+# unpaired. Ending it means reaching whichever instance runs it, which is a session-scoped
+# stop over the fleet, the same thing the write fence above needs. Refusing the pairing
+# instead is the other candidate and was not taken in M1: an operator whose old inbox was
+# removed without a logout would have no way left to pair the number at all, and deciding
+# that trade needs the Chatwoot side of the flow, not this package. The premise that made
+# the deletion look safe ("WhatsApp has already unlinked them") was wrong and is corrected
+# in the code comment.
+internal/store/store.go: Reject pairings that displace a live session  # PR#6

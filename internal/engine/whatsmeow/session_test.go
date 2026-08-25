@@ -871,3 +871,45 @@ func waitForBlockedInbox(t *testing.T, session *Session) {
 	}
 	t.Fatal("the inbox never filled")
 }
+
+// hungUp is what rejects a Connected event whatsmeow had already queued when a manual
+// disconnect completed, and a manual disconnect is followed by no Disconnected event to
+// undo it. A connect request that is refused before it does anything must therefore
+// leave the guard standing: dropping it would let that stale event report a session
+// that is down as open, permanently, with nothing arriving later to correct it.
+func TestARefusedConnectLeavesTheDisconnectGuardStanding(t *testing.T) {
+	t.Parallel()
+
+	for name, request := range map[string]engine.ConnectRequest{
+		"a pairing mode nobody knows": {Pairing: "telepathy"},
+		"a proxy this build cannot honour": {
+			Pairing: "resume", Proxy: &engine.ProxyRequest{URL: "socks5://127.0.0.1:1080"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			session, _ := newTestSession(t, "5511999990001")
+			if err := session.Disconnect(t.Context()); err != nil {
+				t.Fatalf("Disconnect: %v", err)
+			}
+			if !session.disconnected() {
+				t.Fatal("the guard was not raised by the disconnect")
+			}
+
+			if err := session.Connect(t.Context(), request); err == nil {
+				t.Fatal("the request was accepted")
+			}
+			if !session.disconnected() {
+				t.Fatal("a refused connect dropped the guard, so a queued Connected event can still report this session open")
+			}
+		})
+	}
+}
+
+// disconnected reports whether the manual-disconnect guard is still standing.
+func (s *Session) disconnected() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.hungUp
+}

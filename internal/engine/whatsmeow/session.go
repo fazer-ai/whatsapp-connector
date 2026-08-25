@@ -269,9 +269,6 @@ func (s *Session) Connect(ctx context.Context, req engine.ConnectRequest) error 
 	if s.isClosed() {
 		return errors.New("whatsmeow: the session is closed")
 	}
-	s.mu.Lock()
-	s.hungUp = false
-	s.mu.Unlock()
 
 	if req.Proxy != nil && req.Proxy.URL != "" {
 		// Decoding it is not honouring it. Connecting directly for a deployment that
@@ -289,16 +286,27 @@ func (s *Session) Connect(ctx context.Context, req engine.ConnectRequest) error 
 		}
 	}
 
+	if req.Pairing != "resume" && req.Pairing != "qr" && req.Pairing != "code" {
+		return protocol.NewError(protocol.ErrorInvalidPayload,
+			fmt.Sprintf("%q is not a pairing mode this connector knows", req.Pairing))
+	}
+
+	// Cleared here and not on the way in. hungUp is what rejects a Connected event the
+	// library had already queued when a manual disconnect completed, and a manual
+	// disconnect is followed by no Disconnected event to undo it. A request refused
+	// above would have dropped the guard and left that stale event free to report a
+	// session that is down as open, with nothing arriving later to correct it.
+	s.mu.Lock()
+	s.hungUp = false
+	s.mu.Unlock()
+
 	switch req.Pairing {
 	case "resume":
 		return s.resume(ctx)
 	case "qr":
 		return s.pairWithQR(ctx)
-	case "code":
-		return s.pairWithCode(ctx, req.Phone)
 	default:
-		return protocol.NewError(protocol.ErrorInvalidPayload,
-			fmt.Sprintf("%q is not a pairing mode this connector knows", req.Pairing))
+		return s.pairWithCode(ctx, req.Phone)
 	}
 }
 

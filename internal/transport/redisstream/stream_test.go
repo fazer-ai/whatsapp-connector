@@ -3,6 +3,7 @@ package redisstream_test
 import (
 	"context"
 	"encoding/json"
+	"strconv"
 	"testing"
 	"time"
 
@@ -451,5 +452,82 @@ func TestClaimLeavesThisConsumersOwnWorkAlone(t *testing.T) {
 	peer := claimEventually(t, f.streams(t, "inst-b"), []string{"s1"})
 	if len(peer) != 1 || peer[0].Command.ID != "c-slow" {
 		t.Fatalf("a peer claimed %v, want the pending command", peer)
+	}
+}
+
+// The other half of the rule above. A wake this connector deliberately left pending,
+// and a command it walked away from because it owns no such session, are both entries
+// pending under this instance's own name. In a fleet of one there is nobody else to
+// take them, so releasing them has to make them claimable here.
+func TestAReleasedCommandComesBackToTheSameInstance(t *testing.T) {
+	t.Parallel()
+
+	f := newFleet(t)
+	streams := f.streams(t, "inst-a")
+	ctx := context.Background()
+
+	if _, err := streams.Read(ctx, []string{"s1"}); err != nil {
+		t.Fatalf("priming Read: %v", err)
+	}
+	writeCommand(t, f, f.client.Keys().Commands("s1"), command("c-left", "s1", "c-left"))
+	taken, err := streams.Read(ctx, []string{"s1"})
+	if err != nil || len(taken) != 1 {
+		t.Fatalf("Read returned %d commands (err=%v), want 1", len(taken), err)
+	}
+
+	// Walked away from without being carried out.
+	taken[0].Release()
+
+	claimed := claimEventually(t, streams, []string{"s1"})
+	if len(claimed) != 1 || claimed[0].Command.ID != "c-left" {
+		t.Fatalf("the instance reclaimed %v, want the command it left behind", claimed)
+	}
+}
+
+// Entries this process is still running stay pending for as long as they run, so a page
+// full of them would hide everything behind it on every heartbeat, forever.
+func TestClaimLooksPastAPageItCannotUse(t *testing.T) {
+	t.Parallel()
+
+	f := newFleet(t)
+	const page = 4
+	streams, err := redisstream.New(f.client, redisstream.Options{
+		Instance: "inst-a", Block: 50 * time.Millisecond,
+		ClaimMinIdle: time.Millisecond, ReadCount: page,
+	})
+	if err != nil {
+		t.Fatalf("redisstream.New: %v", err)
+	}
+	ctx := context.Background()
+	stream := f.client.Keys().Commands("s1")
+
+	if _, err := streams.Read(ctx, []string{"s1"}); err != nil {
+		t.Fatalf("priming Read: %v", err)
+	}
+	// Two full pages of commands this process takes and never finishes, and one behind
+	// them that a peer abandoned.
+	for i := range page * 2 {
+		writeCommand(t, f, stream, command("c-busy-"+strconv.Itoa(i), "s1", ""))
+	}
+	for held := 0; held < page*2; {
+		taken, err := streams.Read(ctx, []string{"s1"})
+		if err != nil {
+			t.Fatalf("Read: %v", err)
+		}
+		if len(taken) == 0 {
+			t.Fatalf("only %d of %d commands were taken", held, page*2)
+		}
+		held += len(taken)
+	}
+
+	writeCommand(t, f, stream, command("c-abandoned", "s1", ""))
+	abandoned := f.streams(t, "inst-dead")
+	if taken, err := abandoned.Read(ctx, []string{"s1"}); err != nil || len(taken) != 1 {
+		t.Fatalf("the peer read %d commands (err=%v), want 1", len(taken), err)
+	}
+
+	claimed := claimEventually(t, streams, []string{"s1"})
+	if len(claimed) != 1 || claimed[0].Command.ID != "c-abandoned" {
+		t.Fatalf("claimed %v, want only the command the peer abandoned", claimed)
 	}
 }

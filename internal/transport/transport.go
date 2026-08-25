@@ -28,6 +28,17 @@ type Delivery struct {
 	// called after the command has been carried out (or definitively refused), never
 	// before: an un-acked command is one another instance can claim after a crash.
 	Ack func(context.Context) error
+	// Release says this instance is walking away from the command without having
+	// carried it out, and without acknowledging it: a wake it could not act on, a
+	// command for a session it does not own. The command stays pending and becomes
+	// claimable again, by any instance including this one.
+	//
+	// It exists because "still being carried out here" and "left behind here" are
+	// different states that a consumer group cannot tell apart: both are entries
+	// pending under this instance's name. Reclaiming the first duplicates a command
+	// that is still running; never reclaiming the second loses it for good in a fleet
+	// of one.
+	Release func()
 }
 
 // CommandReader delivers the commands addressed to the sessions this instance owns,
