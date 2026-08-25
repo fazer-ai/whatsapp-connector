@@ -314,8 +314,41 @@ func TestAWakeLeftPendingIsPickedUpAgain(t *testing.T) {
 	}
 
 	// A live instance now starts. A plain read will never show it this entry.
-	connector := start(t, server.Addr(), "inst-a", map[string]string{"WAC_CLAIM_MIN_IDLE": "10ms"})
+	connector := start(t, server.Addr(), "inst-a", map[string]string{"WAC_LEASE_TTL": "1s", "WAC_CLAIM_MIN_IDLE": "1500ms"})
 	waitFor(t, "the pending wake to be reclaimed and acted on", func() bool {
 		return connector.Sessions() == 1
 	})
+}
+
+// A wake is acknowledged when adoption finds the session already owned, because in a
+// fleet that means somebody else is running it. That answer is only true while the
+// owner is alive: an instance that reads a wake, wins the lease and dies before
+// acknowledging leaves a lease that outlives it by up to the whole TTL, and a peer
+// claiming inside that window retires the only wake there was. Refusing the
+// configuration is what keeps the window from existing.
+func TestTheReclaimDelayHasToOutlastALease(t *testing.T) {
+	t.Setenv("WAC_LEASE_TTL", "30s")
+
+	for _, idle := range []string{"29s", "30s"} {
+		t.Setenv("WAC_CLAIM_MIN_IDLE", idle)
+		if _, err := app.LoadConfig("connector-test"); err == nil {
+			t.Fatalf("a reclaim delay of %s started against a 30s lease", idle)
+		}
+	}
+
+	t.Setenv("WAC_CLAIM_MIN_IDLE", "31s")
+	if _, err := app.LoadConfig("connector-test"); err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+
+	// And the default is derived rather than fixed, so raising the lease raises it too.
+	os.Unsetenv("WAC_CLAIM_MIN_IDLE")
+	t.Setenv("WAC_LEASE_TTL", "2m")
+	cfg, err := app.LoadConfig("connector-test")
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.ClaimMinIdle <= cfg.LeaseTTL {
+		t.Fatalf("the default reclaim delay is %s against a %s lease", cfg.ClaimMinIdle, cfg.LeaseTTL)
+	}
 }

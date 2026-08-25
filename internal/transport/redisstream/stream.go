@@ -178,13 +178,23 @@ func (s *Streams) Claim(ctx context.Context, sids []string) ([]transport.Deliver
 
 	var claimed []transport.Delivery
 	for _, stream := range streams {
-		messages, _, err := s.client.XAutoClaim(ctx, &redis.XAutoClaimArgs{
+		ids, err := s.reclaimable(ctx, stream)
+		switch {
+		case isNoGroup(err):
+			s.groups.forget(stream)
+			continue
+		case err != nil:
+			return nil, err
+		case len(ids) == 0:
+			continue
+		}
+
+		messages, err := s.client.XClaim(ctx, &redis.XClaimArgs{
 			Stream:   stream,
 			Group:    ConsumerGroup,
 			Consumer: s.opts.Instance,
 			MinIdle:  s.opts.ClaimMinIdle,
-			Start:    "0-0",
-			Count:    s.opts.ReadCount,
+			Messages: ids,
 		}).Result()
 		switch {
 		case isNoGroup(err):
@@ -196,6 +206,43 @@ func (s *Streams) Claim(ctx context.Context, sids []string) ([]transport.Deliver
 		claimed = append(claimed, s.deliveries([]redis.XStream{{Stream: stream, Messages: messages}})...)
 	}
 	return claimed, nil
+}
+
+// reclaimable is the pending entries worth taking over: idle long enough, and held by
+// somebody else.
+//
+// The second half is the reason this is not one XAUTOCLAIM call. A command runs on the
+// session's own executor, not on the loop that read it, so it is still pending while it
+// runs; one that takes longer than the min-idle would be handed back to the very
+// consumer already executing it, and dispatched a second time alongside the first.
+// Acknowledging the original does not retire the copy. XPENDING is the only form that
+// says who holds an entry.
+func (s *Streams) reclaimable(ctx context.Context, stream string) ([]string, error) {
+	pending, err := s.client.XPendingExt(ctx, &redis.XPendingExtArgs{
+		Stream: stream,
+		Group:  ConsumerGroup,
+		Idle:   s.opts.ClaimMinIdle,
+		Start:  "-",
+		End:    "+",
+		Count:  s.opts.ReadCount,
+	}).Result()
+	switch {
+	case errors.Is(err, redis.Nil):
+		return nil, nil
+	case isNoGroup(err):
+		return nil, err
+	case err != nil:
+		return nil, fmt.Errorf("redisstream: list what is pending on %s: %w", stream, err)
+	}
+
+	ids := make([]string, 0, len(pending))
+	for _, entry := range pending {
+		if entry.Consumer == s.opts.Instance {
+			continue
+		}
+		ids = append(ids, entry.ID)
+	}
+	return ids, nil
 }
 
 // streamsFor is the per-session command streams plus the control one. Control is

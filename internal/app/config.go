@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/redisx"
-	"github.com/fazer-ai/whatsapp-connector/internal/transport/redisstream"
 )
 
 // Config is the whole configuration, read from the environment.
@@ -74,7 +73,9 @@ func LoadConfig(hostname string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	claimMinIdle, err := envDuration("WAC_CLAIM_MIN_IDLE", redisstream.DefaultClaimMinIdle)
+	// Derived from the lease rather than fixed, because the two are one rule: see the
+	// check below.
+	claimMinIdle, err := envDuration("WAC_CLAIM_MIN_IDLE", leaseTTL+leaseTTL/2)
 	if err != nil {
 		return Config{}, err
 	}
@@ -98,6 +99,19 @@ func LoadConfig(hostname string) (Config, error) {
 	}
 	if cfg.Instance == "" {
 		return Config{}, fmt.Errorf("app: WAC_INSTANCE is empty and the hostname is unknown")
+	}
+	if cfg.ClaimMinIdle <= cfg.LeaseTTL {
+		// A wake is acknowledged when adoption finds the session already owned, because
+		// in a fleet that means somebody else is running it. That is only true while the
+		// owner is alive. An instance that reads a wake, wins the lease and dies before
+		// acknowledging leaves a lease that outlives it by up to the whole TTL, and a
+		// peer claiming the wake inside that window is told "already owned" about an
+		// instance that is gone, acknowledges the only wake there was, and leaves the
+		// session unowned for good. Claiming strictly later than the lease can survive is
+		// what makes that answer true.
+		return Config{}, fmt.Errorf(
+			"app: WAC_CLAIM_MIN_IDLE (%s) must be longer than WAC_LEASE_TTL (%s), or a wake can be "+
+				"reclaimed while the lease that answered it is still alive", cfg.ClaimMinIdle, cfg.LeaseTTL)
 	}
 	if cfg.EventShards <= 0 {
 		return Config{}, fmt.Errorf("app: WAC_EVENT_SHARDS must be positive, got %d", cfg.EventShards)

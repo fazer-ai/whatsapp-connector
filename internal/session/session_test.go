@@ -593,3 +593,47 @@ func TestAnAdoptedSessionOutlivesTheBoundOnItsAdoption(t *testing.T) {
 		t.Fatalf("the manager runs %d sessions after the adoption's own deadline passed, want 1", got)
 	}
 }
+
+// The wake that reaches a peer after an instance died is only useful once the lease
+// that instance left behind has run out. Before that the peer is told the session is
+// already owned, which is true of a lease and false of anybody running it, and the
+// whole point of the reclaim delay outlasting the lease is that this moment has already
+// passed by the time a wake can be claimed.
+func TestAPeerTakesOverOnceTheDeadOwnersLeaseRunsOut(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	const ttl = 30 * time.Second
+	build := func(instance string) *session.Manager {
+		rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+		t.Cleanup(func() { _ = rdb.Close() })
+		manager := session.NewManager(&session.ManagerConfig{
+			Instance: instance, Engine: fake.New(),
+			Leases:    cluster.NewLeases(redisx.Wrap(rdb, "wa:", 8), instance, cluster.Options{TTL: ttl}),
+			Publisher: newRecorder(), Replier: newRecorder(),
+			NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+		})
+		t.Cleanup(func() { manager.StopAll(context.Background()) })
+		return manager
+	}
+
+	dead, peer := build("inst-dead"), build("inst-peer")
+	ctx := context.Background()
+
+	if _, err := dead.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("the first instance could not adopt: %v", err)
+	}
+	// And now it is gone, without releasing anything. Its lease is still in Redis.
+	if _, err := peer.Adopt(ctx, "s1"); !errors.Is(err, cluster.ErrNotOwner) {
+		t.Fatalf("the peer adopted a leased session, err=%v", err)
+	}
+
+	server.FastForward(ttl + time.Second)
+
+	if _, err := peer.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("the peer could not take over an expired lease: %v", err)
+	}
+	if got := peer.Count(); got != 1 {
+		t.Fatalf("the peer runs %d sessions, want 1", got)
+	}
+}

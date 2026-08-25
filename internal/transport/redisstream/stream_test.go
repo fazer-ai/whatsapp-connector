@@ -415,3 +415,41 @@ func claimEventually(t *testing.T, streams *redisstream.Streams, sids []string) 
 		time.Sleep(5 * time.Millisecond)
 	}
 }
+
+// A command runs on the session's own executor, not on the loop that read it, so it is
+// still pending while it runs. One that takes longer than the min-idle would otherwise
+// be handed back to the very consumer already executing it and dispatched a second time
+// alongside the first, which acknowledging the original does not undo.
+func TestClaimLeavesThisConsumersOwnWorkAlone(t *testing.T) {
+	t.Parallel()
+
+	f := newFleet(t)
+	streams := f.streams(t, "inst-a")
+	ctx := context.Background()
+
+	if _, err := streams.Read(ctx, []string{"s1"}); err != nil {
+		t.Fatalf("priming Read: %v", err)
+	}
+	writeCommand(t, f, f.client.Keys().Commands("s1"), command("c-slow", "s1", "c-slow"))
+	taken, err := streams.Read(ctx, []string{"s1"})
+	if err != nil || len(taken) != 1 {
+		t.Fatalf("Read returned %d commands (err=%v), want 1", len(taken), err)
+	}
+
+	// Still executing, so still pending, and by now idle for longer than the min-idle.
+	time.Sleep(20 * time.Millisecond)
+
+	claimed, err := streams.Claim(ctx, []string{"s1"})
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if len(claimed) != 0 {
+		t.Fatalf("an instance reclaimed %d of its own in-flight commands", len(claimed))
+	}
+
+	// A peer still takes it over, which is what makes the instance dying recoverable.
+	peer := claimEventually(t, f.streams(t, "inst-b"), []string{"s1"})
+	if len(peer) != 1 || peer[0].Command.ID != "c-slow" {
+		t.Fatalf("a peer claimed %v, want the pending command", peer)
+	}
+}

@@ -91,6 +91,10 @@ func (m *Manager) Count() int {
 // retried, because the wake it came from is left unacknowledged and reclaimed.
 const AdoptTimeout = 5 * time.Second
 
+// releaseTimeout bounds handing a lease back after an adoption that could not finish.
+// Short, because nothing waits on it and the lease expires on its own anyway.
+const releaseTimeout = 2 * time.Second
+
 // Adopt takes a session over: wins the lease, opens it on the engine, and starts it.
 // It returns cluster.ErrNotOwner when another instance holds it, which is the ordinary
 // answer in a fleet and not a failure.
@@ -123,7 +127,13 @@ func (m *Manager) Adopt(ctx context.Context, sid string) (*Session, error) {
 	if err != nil {
 		// The lease is held for a session that cannot run. Holding it would keep every
 		// other instance from trying, so it goes back.
-		_, _ = m.leases.Release(context.WithoutCancel(ctx), sid)
+		//
+		// Bounded on its own, and detached from the caller: the reason the adoption
+		// failed is often the reason Redis is slow, and an unbounded cleanup would spend
+		// the deadline this function just enforced on retries nobody is waiting for.
+		release, cancelRelease := context.WithTimeout(context.WithoutCancel(ctx), releaseTimeout)
+		_, _ = m.leases.Release(release, sid)
+		cancelRelease()
 		return nil, err
 	}
 
