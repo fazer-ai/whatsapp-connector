@@ -20,11 +20,13 @@
 package store
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -351,42 +353,50 @@ func (c *Container) migrate(ctx context.Context) error {
 // through, so a unique one can be built over it.
 //
 // The rule was always one session per account, so a second mapping is a row that should
-// never have been written, and the most recent binding is the one WhatsApp actually
-// paired. The devices the others named go with them, the way Bind takes a displaced
-// device: no mapping can reach them afterwards, and leaving them is leaving
-// authentication material on disk that nothing will ever use or clean up.
+// never have been written. Which one to keep is decided by the credentials and not by
+// the clock: Bind writes the mapping before whatsmeow writes the device, so an instance
+// that died mid-pairing leaves the newest mapping of all pointing at a device that never
+// existed. Keeping that one deletes a working device to preserve an empty row, Device
+// then unbinds the survivor for having no credentials, and an upgrade has made an
+// account that was paired pair again. So the winner is the most recent mapping whose
+// device is actually on disk, and only when none of them has one does it fall back to
+// the most recent outright, which is the best a set of empty rows allows.
+//
+// The devices the losers named go with them, the way Bind takes a displaced device: no
+// mapping can reach them afterwards, and leaving them is leaving authentication material
+// on disk that nothing will ever use or clean up.
 func (c *Container) dropDuplicateMappings(ctx context.Context) error {
-	const losers = `
-		SELECT sid, jid FROM wac_session_device
-		WHERE EXISTS (
-			SELECT 1 FROM wac_session_device newer
-			WHERE newer.account = wac_session_device.account
-			  AND (newer.bound_at > wac_session_device.bound_at
-			       OR (newer.bound_at = wac_session_device.bound_at AND newer.sid > wac_session_device.sid))
+	const contested = `
+		SELECT sid, jid, account, bound_at FROM wac_session_device
+		WHERE account IN (
+			SELECT account FROM wac_session_device GROUP BY account HAVING COUNT(*) > 1
 		)`
 
-	rows, err := c.db.QueryContext(ctx, losers)
+	rows, err := c.db.QueryContext(ctx, contested)
 	if err != nil {
 		return fmt.Errorf("store: find the mappings the old index allowed: %w", err)
 	}
 	type mapping struct {
-		sid string
-		jid types.JID
+		sid      string
+		jid      types.JID
+		readable bool
+		boundAt  int64
 	}
-	var displaced []mapping
+	byAccount := map[string][]mapping{}
 	for rows.Next() {
-		var sid, raw string
-		if err := rows.Scan(&sid, &raw); err != nil {
+		var sid, raw, account string
+		var boundAt int64
+		if err := rows.Scan(&sid, &raw, &account, &boundAt); err != nil {
 			_ = rows.Close()
 			return fmt.Errorf("store: read the mappings the old index allowed: %w", err)
 		}
-		jid, parseErr := types.ParseJID(raw)
-		if parseErr != nil {
+		held := mapping{sid: sid, boundAt: boundAt}
+		if jid, parseErr := types.ParseJID(raw); parseErr != nil {
 			c.log.Warn().Str("sid", sid).Msg("a duplicate mapping holds an unreadable jid; leaving its device alone")
-			displaced = append(displaced, mapping{sid: sid})
-			continue
+		} else {
+			held.jid, held.readable = jid, true
 		}
-		displaced = append(displaced, mapping{sid: sid, jid: jid})
+		byAccount[account] = append(byAccount[account], held)
 	}
 	if err := rows.Err(); err != nil {
 		_ = rows.Close()
@@ -394,6 +404,30 @@ func (c *Container) dropDuplicateMappings(ctx context.Context) error {
 	}
 	if err := rows.Close(); err != nil {
 		return fmt.Errorf("store: read the mappings the old index allowed: %w", err)
+	}
+
+	var displaced []mapping
+	for _, candidates := range byAccount {
+		slices.SortFunc(candidates, func(a, b mapping) int {
+			if a.boundAt != b.boundAt {
+				return cmp.Compare(b.boundAt, a.boundAt)
+			}
+			return cmp.Compare(b.sid, a.sid)
+		})
+		// Newest first, so the first one holding credentials is both the most recent
+		// mapping and a usable one. Zero is the fallback the loop leaves standing.
+		winner := 0
+		for i, candidate := range candidates {
+			if candidate.readable && c.hasDevice(ctx, candidate.jid) {
+				winner = i
+				break
+			}
+		}
+		for i, candidate := range candidates {
+			if i != winner {
+				displaced = append(displaced, candidate)
+			}
+		}
 	}
 	if len(displaced) == 0 {
 		return nil
@@ -404,13 +438,25 @@ func (c *Container) dropDuplicateMappings(ctx context.Context) error {
 			c.rebind(`DELETE FROM wac_session_device WHERE sid = ?`), old.sid); err != nil {
 			return fmt.Errorf("store: drop the mapping of %s: %w", old.sid, err)
 		}
-		if !old.jid.IsEmpty() {
+		if old.readable {
 			c.deleteDevice(ctx, old.jid)
 		}
 	}
 	c.log.Warn().Int("dropped", len(displaced)).
-		Msg("more than one session held the same account; the older mappings and their devices are gone")
+		Msg("more than one session held the same account; the losing mappings and their devices are gone")
 	return nil
+}
+
+// hasDevice reports whether whatsmeow still holds the credentials a mapping names. A
+// read that fails answers no, which costs the row its candidacy and never its contents:
+// a mapping this cannot vouch for is not one to keep a working device out of.
+func (c *Container) hasDevice(ctx context.Context, jid types.JID) bool {
+	device, err := c.devices.GetDevice(ctx, jid)
+	if err != nil {
+		c.log.Warn().Err(err).Msg("failed to read a duplicate mapping's device")
+		return false
+	}
+	return device != nil
 }
 
 // rebind turns `?` placeholders into `$1`-style ones for Postgres. Writing every

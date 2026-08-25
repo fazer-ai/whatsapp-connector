@@ -387,6 +387,90 @@ func TestOneAccountKeepsOneMappingUnderConcurrentPairings(t *testing.T) {
 
 // The account index shipped non-unique, and `CREATE UNIQUE INDEX IF NOT EXISTS` under
 // the same name is a no-op against a database that already has it. An upgraded store
+// Bind writes the mapping before whatsmeow writes the device, so an instance that died
+// mid-pairing leaves the newest mapping of all pointing at a device that never existed.
+// Reading `bound_at` alone as "this is the pairing that took" then deletes the working
+// device to preserve the empty row, Device unbinds the survivor for having no
+// credentials, and an upgrade has made a paired account pair again.
+func TestAnUpgradeKeepsTheMappingThatStillHasItsCredentials(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "wac.db")
+	address := "sqlite:" + path
+
+	old, err := store.Open(t.Context(), address, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	db := old.DB()
+	if _, err := db.ExecContext(t.Context(), `DROP INDEX IF EXISTS wac_session_device_one_per_account`); err != nil {
+		t.Fatalf("drop the new index: %v", err)
+	}
+	if _, err := db.ExecContext(t.Context(),
+		`CREATE INDEX IF NOT EXISTS wac_session_device_account ON wac_session_device (account)`); err != nil {
+		t.Fatalf("recreate the old index: %v", err)
+	}
+
+	// The pairing that took, and the credentials whatsmeow wrote beside it.
+	paired, err := types.ParseJID("5511999990001:1@s.whatsapp.net")
+	if err != nil {
+		t.Fatalf("ParseJID: %v", err)
+	}
+	device := old.Devices().NewDevice()
+	device.ID = &paired
+	device.Account = &waAdv.ADVSignedDeviceIdentity{
+		Details:             make([]byte, 32),
+		AccountSignature:    make([]byte, 64),
+		AccountSignatureKey: make([]byte, 32),
+		DeviceSignature:     make([]byte, 64),
+	}
+	if err := old.Devices().PutDevice(t.Context(), device); err != nil {
+		t.Fatalf("PutDevice: %v", err)
+	}
+	if _, err := db.ExecContext(t.Context(),
+		`INSERT INTO wac_session_device (sid, jid, account, bound_at) VALUES (?, ?, ?, ?)`,
+		"sid-paired", paired.String(), "5511999990001", int64(1)); err != nil {
+		t.Fatalf("write the paired mapping: %v", err)
+	}
+	// And the one that did not: newer, and with nothing behind it.
+	if _, err := db.ExecContext(t.Context(),
+		`INSERT INTO wac_session_device (sid, jid, account, bound_at) VALUES (?, ?, ?, ?)`,
+		"sid-halfway", "5511999990001:2@s.whatsapp.net", "5511999990001", int64(2)); err != nil {
+		t.Fatalf("write the half-written mapping: %v", err)
+	}
+	if err := old.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	upgraded, err := store.Open(t.Context(), address, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	t.Cleanup(func() { _ = upgraded.Close() })
+
+	if _, bound, err := upgraded.JID(t.Context(), "sid-halfway"); err != nil || bound {
+		t.Fatalf("the mapping with no device behind it survived (bound=%v, err=%v)", bound, err)
+	}
+	if jid, bound, err := upgraded.JID(t.Context(), "sid-paired"); err != nil || !bound || jid != paired {
+		t.Fatalf("the paired mapping is gone (jid=%v, bound=%v, err=%v)", jid, bound, err)
+	}
+
+	// And its credentials with it, which is what makes the session resumable rather than
+	// a mapping Device unbinds on the next connect.
+	if stored, err := upgraded.Devices().GetDevice(t.Context(), paired); err != nil {
+		t.Fatalf("GetDevice: %v", err)
+	} else if stored == nil {
+		t.Fatal("the upgrade deleted the only device the account had")
+	}
+	resumed, err := upgraded.Device(t.Context(), "sid-paired")
+	if err != nil {
+		t.Fatalf("Device: %v", err)
+	}
+	if resumed.ID == nil || *resumed.ID != paired {
+		t.Fatalf("the session came back unpaired (%v), want %v", resumed.ID, paired)
+	}
+}
+
 // would keep the permissive index, never gain the constraint, and go on letting two
 // sessions hold one account while every test on a fresh database passed.
 func TestAnOlderStoreGainsTheAccountConstraint(t *testing.T) {
