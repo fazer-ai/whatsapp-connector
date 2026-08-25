@@ -256,7 +256,7 @@ func TestTerminalPairingOutcomesArePublishedOnce(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			session, _ := newTestSession(t, "")
-			session.setPairing(func() {})
+			session.startPairing(func() {})
 
 			session.handle(event)
 
@@ -466,4 +466,28 @@ func decode(t *testing.T, payload json.RawMessage) map[string]any {
 		t.Fatalf("unmarshal the payload: %v", err)
 	}
 	return decoded
+}
+
+// whatsmeow debug-logs the material this connector must never write down: its pairing
+// channel logs every raw QR code, and its client logs the nodes it sends and receives.
+// The process redactor masks phone-shaped tokens and nothing else, so a deployment set
+// to debug for an unrelated reason would ship pairing credentials to wherever its logs
+// go.
+func TestTheLibraryLoggerDropsItsDebugOutput(t *testing.T) {
+	t.Parallel()
+
+	var written bytes.Buffer
+	logger := newLibraryLogger(zerolog.New(&written).Level(zerolog.DebugLevel))
+
+	logger.Debugf("Emitting QR code %s", "2@secret,pairing,code")
+	logger.Sub("qrchannel").Debugf("Sending node %s", "<iq to=s.whatsapp.net>")
+	if written.Len() != 0 {
+		t.Fatalf("the library logger wrote its debug output: %s", written.String())
+	}
+
+	// What an operator needs when a session will not connect still gets through.
+	logger.Warnf("Failed to connect")
+	if !strings.Contains(written.String(), "Failed to connect") {
+		t.Fatalf("the library logger dropped a warning: %s", written.String())
+	}
 }

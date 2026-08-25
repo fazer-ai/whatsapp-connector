@@ -68,10 +68,15 @@ type Session struct {
 	// lock.
 	phone string
 	lid   string
-	// pairing cancels the goroutine reading the QR channel, so a second Connect does
-	// not leave a previous pairing conversation publishing codes nobody asked for.
-	pairing context.CancelFunc
+	// pairing is the conversation currently open, if any. It is a pointer rather than a
+	// bare cancel func so a finished run can clear itself without clearing the one that
+	// replaced it: functions are not comparable, and "is this still mine" is the whole
+	// question.
+	pairing *pairingRun
 }
+
+// pairingRun is one pairing conversation.
+type pairingRun struct{ cancel context.CancelFunc }
 
 //nolint:gocritic // zerolog.Logger is designed to be copied; every With() returns one by value
 func newSession(sid string, client *wm.Client, container *store.Container, log zerolog.Logger, wa waLog.Logger) *Session {
@@ -233,16 +238,50 @@ func (s *Session) pairWithQR(ctx context.Context) error {
 		cancel()
 		return fmt.Errorf("whatsmeow: open the pairing channel of %s: %w", s.sid, err)
 	}
-	s.setPairing(cancel)
+	run := s.startPairing(cancel)
 
-	go s.readPairing(codes)
+	go s.readPairing(run, codes)
 
 	if err := s.dial(ctx, client); err != nil {
-		s.abandonPairing(client)
+		s.giveUpOn(ctx, client, err)
 		return fmt.Errorf("whatsmeow: connect %s: %w", s.sid, err)
 	}
 	s.emit(protocol.EventSessionState, map[string]any{"state": "connecting"})
 	return nil
+}
+
+// giveUpOn tears a pairing attempt down for a dial that failed, and leaves it alone for
+// one the caller merely stopped waiting for.
+//
+// The distinction matters twice over: the conversation is documented to outlive the
+// command, and tearing it down calls Disconnect, which would wait on the socket lock
+// the still-running dial is holding — putting the executor right back behind the
+// deadline it just escaped.
+func (s *Session) giveUpOn(ctx context.Context, client *wm.Client, err error) {
+	if errors.Is(err, ctx.Err()) && ctx.Err() != nil {
+		return
+	}
+	s.abandonPairing(client)
+}
+
+// hangUp closes the socket without holding the session's command queue behind a dial.
+//
+// whatsmeow keeps its socket lock for the length of a connect, and Disconnect waits for
+// that same lock, so a disconnect arriving mid-handshake would otherwise sit there long
+// past its deadline and then report success. Cancelling the session context is what
+// actually interrupts the dial; this is the part that stops waiting.
+func (s *Session) hangUp(ctx context.Context, client *wm.Client) {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		client.Disconnect()
+	}()
+
+	select {
+	case <-done:
+	case <-ctx.Done():
+	case <-s.done:
+	}
 }
 
 // abandonPairing gives up a pairing conversation and puts the socket back where a
@@ -250,7 +289,7 @@ func (s *Session) pairWithQR(ctx context.Context) error {
 // refuses, because whatsmeow will not open a second pairing channel on a live socket,
 // and the operator is stuck until the codes run out.
 func (s *Session) abandonPairing(client *wm.Client) {
-	s.setPairing(nil)
+	s.cancelPairing()
 	client.Disconnect()
 }
 
@@ -274,18 +313,18 @@ func (s *Session) pairWithCode(ctx context.Context, phone string) error {
 		cancel()
 		return fmt.Errorf("whatsmeow: open the pairing channel of %s: %w", s.sid, err)
 	}
-	s.setPairing(cancel)
+	run := s.startPairing(cancel)
 
 	// The QR codes themselves are dropped: an operator who asked for a code is not
 	// looking at an image, and publishing both would have the dashboard show two ways
 	// to pair the same session.
 	ready := make(chan struct{})
 	go func() {
-		s.readPairingWith(codes, func() { close(ready) }, false)
+		s.readPairingWith(run, codes, func() { close(ready) }, false)
 	}()
 
 	if err := s.dial(ctx, client); err != nil {
-		s.abandonPairing(client)
+		s.giveUpOn(ctx, client, err)
 		return fmt.Errorf("whatsmeow: connect %s: %w", s.sid, err)
 	}
 	s.emit(protocol.EventSessionState, map[string]any{"state": "connecting"})
@@ -293,7 +332,6 @@ func (s *Session) pairWithCode(ctx context.Context, phone string) error {
 	select {
 	case <-ready:
 	case <-ctx.Done():
-		s.abandonPairing(client)
 		return fmt.Errorf("whatsmeow: %s did not reach the server in time: %w", s.sid, ctx.Err())
 	case <-s.done:
 		return errors.New("whatsmeow: the session closed before it could ask for a code")
@@ -305,6 +343,9 @@ func (s *Session) pairWithCode(ctx context.Context, phone string) error {
 		// to type a corrected one. Leaving the pairing socket up would refuse that next
 		// attempt too, for reasons that have nothing to do with the number.
 		s.abandonPairing(client)
+		if coded := codeForPairPhone(err); coded != nil {
+			return coded
+		}
 		return fmt.Errorf("whatsmeow: request a pairing code for %s: %w", s.sid, err)
 	}
 	s.emit(protocol.EventPairingCode, map[string]any{"code": code, "phone": phone})
@@ -312,9 +353,9 @@ func (s *Session) pairWithCode(ctx context.Context, phone string) error {
 }
 
 // Disconnect drops the socket and keeps the credentials.
-func (s *Session) Disconnect(_ context.Context) error {
-	s.setPairing(nil)
-	s.current().Disconnect()
+func (s *Session) Disconnect(ctx context.Context) error {
+	s.cancelPairing()
+	s.hangUp(ctx, s.current())
 	s.emit(protocol.EventSessionState, map[string]any{"state": "close", "reason": "disconnect_requested"})
 	return nil
 }
@@ -322,7 +363,7 @@ func (s *Session) Disconnect(_ context.Context) error {
 // Logout ends the session on WhatsApp's side and forgets the credentials here, so the
 // next connect has to pair again.
 func (s *Session) Logout(ctx context.Context) error {
-	s.setPairing(nil)
+	s.cancelPairing()
 	if err := s.current().Logout(ctx); err != nil {
 		return fmt.Errorf("whatsmeow: log %s out: %w", s.sid, err)
 	}
@@ -383,12 +424,12 @@ func (s *Session) Close() error {
 		return nil
 	}
 	s.closed = true
-	cancel := s.pairing
+	run := s.pairing
 	s.pairing = nil
 	s.mu.Unlock()
 
-	if cancel != nil {
-		cancel()
+	if run != nil {
+		run.cancel()
 	}
 	// Cancelled first, and that order is the whole point: whatsmeow holds its socket
 	// lock for the length of a dial, and Disconnect waits for the same lock. Cancelling
@@ -429,13 +470,37 @@ func (s *Session) pairingActive() bool {
 	return s.pairing != nil
 }
 
-func (s *Session) setPairing(cancel context.CancelFunc) {
+// startPairing makes a run the current one and ends whatever it replaces.
+func (s *Session) startPairing(cancel context.CancelFunc) *pairingRun {
+	run := &pairingRun{cancel: cancel}
 	s.mu.Lock()
 	previous := s.pairing
-	s.pairing = cancel
+	s.pairing = run
 	s.mu.Unlock()
 	if previous != nil {
-		previous()
+		previous.cancel()
+	}
+	return run
+}
+
+// endPairing clears a run that has finished, and does nothing when another has already
+// taken its place.
+func (s *Session) endPairing(run *pairingRun) {
+	s.mu.Lock()
+	if s.pairing == run {
+		s.pairing = nil
+	}
+	s.mu.Unlock()
+}
+
+// cancelPairing ends whatever conversation is open.
+func (s *Session) cancelPairing() {
+	s.mu.Lock()
+	previous := s.pairing
+	s.pairing = nil
+	s.mu.Unlock()
+	if previous != nil {
+		previous.cancel()
 	}
 }
 
@@ -515,14 +580,19 @@ func (s *Session) emit(eventType protocol.EventType, payload any) {
 }
 
 // readPairing publishes the QR codes and the outcome of the pairing.
-func (s *Session) readPairing(codes <-chan wm.QRChannelItem) {
-	s.readPairingWith(codes, nil, true)
+func (s *Session) readPairing(run *pairingRun, codes <-chan wm.QRChannelItem) {
+	s.readPairingWith(run, codes, nil, true)
 }
 
 // readPairingWith drains the pairing channel. `onFirst` fires once the server has
 // answered at all, which is what code pairing waits for, and `publishCodes` is false
 // for the code flow, which has no image to show.
-func (s *Session) readPairingWith(codes <-chan wm.QRChannelItem, onFirst func(), publishCodes bool) {
+func (s *Session) readPairingWith(run *pairingRun, codes <-chan wm.QRChannelItem, onFirst func(), publishCodes bool) {
+	// Cleared on the way out, however it ends. A run left marked open after a successful
+	// pairing goes on claiming every later outcome, and the events it claims are then
+	// published by nobody: the QR channel's own handler is long gone.
+	defer s.endPairing(run)
+
 	first := true
 	for item := range codes {
 		if item.Event == "code" && first {
@@ -594,6 +664,21 @@ func (s *Session) bind(jid types.JID, _, _ string) bool {
 // session. It is short because WhatsApp is waiting on the other side of it.
 const bindTimeout = 5 * time.Second
 
+// codeForPairPhone names the refusals the caller can fix. Left as an internal error
+// they reach the dashboard as "the connector could not carry out the command", which
+// tells an operator nothing about the number they typed.
+func codeForPairPhone(err error) error {
+	switch {
+	case errors.Is(err, wm.ErrPhoneNumberTooShort):
+		return protocol.NewError(protocol.ErrorInvalidPayload, "that number is too short to pair")
+	case errors.Is(err, wm.ErrPhoneNumberIsNotInternational):
+		return protocol.NewError(protocol.ErrorInvalidPayload,
+			"that number needs its country code and no leading zero")
+	default:
+		return nil
+	}
+}
+
 func qrDataURL(code string) (string, error) {
 	png, err := qrcode.Encode(code, qrcode.Medium, qrSize)
 	if err != nil {
@@ -664,7 +749,9 @@ func (s *Session) handle(rawEvent any) {
 func (s *Session) loggedOut(event *waEvents.LoggedOut) {
 	// The credentials are gone on WhatsApp's side, so keeping them here would have
 	// every reconnect fail with a session that looks resumable and is not.
-	ctx, cancel := context.WithTimeout(context.Background(), bindTimeout)
+	// On the session's own lifetime: `Forget` unbinds the mapping, so a stale owner
+	// finishing this after the account moved would erase what the new owner wrote.
+	ctx, cancel := context.WithTimeout(s.ctx, bindTimeout)
 	defer cancel()
 	if err := s.store.Forget(ctx, s.sid); err != nil {
 		s.log.Error().Err(err).Msg("failed to forget the device of a session that was logged out")
@@ -677,7 +764,7 @@ func (s *Session) loggedOut(event *waEvents.LoggedOut) {
 	// holding its handler lock for read, and rebuilding takes the same lock for write.
 	// Doing it here is a deadlock against ourselves, and the shutdown behind it.
 	go func() {
-		if err := s.rebuild(context.WithoutCancel(s.ctx)); err != nil {
+		if err := s.rebuild(s.ctx); err != nil {
 			s.log.Error().Err(err).Msg("failed to put a logged-out session back on a fresh client")
 		}
 	}()

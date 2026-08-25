@@ -38,7 +38,7 @@ func New(container *store.Container, log zerolog.Logger) *Engine {
 	return &Engine{
 		store:    container,
 		log:      log,
-		waLog:    waLog.Zerolog(log.With().Str("component", "whatsmeow").Logger()),
+		waLog:    newLibraryLogger(log),
 		sessions: make(map[string]*Session),
 	}
 }
