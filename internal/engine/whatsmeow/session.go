@@ -160,6 +160,13 @@ func (s *Session) adopt(client *wm.Client) bool {
 	// to go.
 	client.ManualHistorySyncDownload = true
 	client.DisableManualHistorySyncReceipt = true
+	// Refusing the ack only keeps a message if the redelivery can still be read.
+	// Decrypting advances the Signal ratchet and that advance is persisted, so the
+	// second copy of the same ciphertext fails with an old-counter error, is skipped
+	// without a dispatch, and is acknowledged anyway: the loss moves to the redelivery
+	// instead of being prevented. The buffer keeps the plaintext, keyed by the
+	// ciphertext, until a handler accepts it.
+	client.EnableDecryptedEventBuffer = true
 
 	phone, lid := identityOf(client)
 
@@ -309,7 +316,12 @@ func (s *Session) resume(ctx context.Context) error {
 	client := s.current()
 	s.emit(protocol.EventSessionState, map[string]any{"state": "connecting"})
 	if err := s.dial(ctx, client); err != nil {
-		s.emit(protocol.EventSessionState, map[string]any{"state": "close", "reason": "connect_failed"})
+		// Only when the dial itself failed. A caller that stopped waiting leaves the
+		// connect running, and a `close` published over it is a terminal state the very
+		// next event contradicts.
+		if !errors.Is(err, ctx.Err()) || ctx.Err() == nil {
+			s.emit(protocol.EventSessionState, map[string]any{"state": "close", "reason": "connect_failed"})
+		}
 		return fmt.Errorf("whatsmeow: resume %s: %w", s.sid, err)
 	}
 	return nil
@@ -429,6 +441,12 @@ func (s *Session) abandonPairing(run *pairingRun, client *wm.Client) {
 	}
 	run.cancel()
 	client.Disconnect()
+
+	// Cancelling the context is not enough to close whatsmeow's QR channel: it only
+	// looks at that context from the loop that emits codes, which a pairing failing
+	// before its first code never reaches. The subscription and its reader would then
+	// outlive the attempt and join the next one, so the client is replaced instead.
+	s.markStale()
 }
 
 // pairWithCode connects and asks WhatsApp for a code the operator types on the phone.
@@ -522,6 +540,11 @@ func (s *Session) Disconnect(ctx context.Context) error {
 func (s *Session) Logout(ctx context.Context) error {
 	s.cancelPairing()
 	if err := s.current().Logout(ctx); err != nil {
+		// whatsmeow unlinks the device before it deletes the local one, so an error here
+		// can mean WhatsApp already accepted the logout. Leaving the session as it was
+		// would have it report itself open over credentials that are gone.
+		s.offline()
+		s.markStale()
 		return fmt.Errorf("whatsmeow: log %s out: %w", s.sid, err)
 	}
 	s.offline()

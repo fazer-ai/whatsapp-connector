@@ -12,9 +12,10 @@ events and commands with its clients over Redis Streams.
 > QR code or a code typed on the phone, resumes across restarts, and reports what the
 > connection is doing. It cannot carry messages yet: those arrive with M2. Until then
 > every message command is refused rather than acknowledged, and an inbound message is
-> left unacknowledged on WhatsApp's side, so the account keeps it and delivers it again
-> once there is somewhere to put it. A number paired on this build therefore accumulates
-> an undelivered backlog (see [Roadmap](#roadmap)).
+> left unacknowledged on WhatsApp's side, with its plaintext buffered so the redelivery
+> can still be read: the account keeps the message and delivers it again once there is
+> somewhere to put it. A number paired on this build therefore accumulates an
+> undelivered backlog (see [Roadmap](#roadmap)).
 
 ## Why a separate service
 

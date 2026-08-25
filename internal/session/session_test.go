@@ -3,6 +3,7 @@ package session_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -14,6 +15,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/cluster"
+	"github.com/fazer-ai/whatsapp-connector/internal/engine"
 	"github.com/fazer-ai/whatsapp-connector/internal/engine/fake"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 	"github.com/fazer-ai/whatsapp-connector/internal/redisx"
@@ -462,3 +464,45 @@ func (c *steppingClock) step(d time.Duration) {
 	c.now = c.now.Add(d)
 	c.mu.Unlock()
 }
+
+// Every instance reads the control stream through one consumer group, so acknowledging
+// a wake nobody could act on retires it: the session then stays unowned until a client
+// happens to send another. Whatever stopped the adoption may well be over by the time
+// the wake is reclaimed.
+func TestAWakeThatCouldNotBeAdoptedStaysPending(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+
+	manager := session.NewManager(&session.ManagerConfig{
+		Instance: "inst-a", Engine: refusingEngine{}, Leases: cluster.NewLeases(client, "inst-a", cluster.Options{}),
+		Publisher: newRecorder(), Replier: newRecorder(),
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+
+	acked := false
+	delivery := &transport.Delivery{
+		Command: protocol.Command{V: protocol.Version, ID: "c1", Type: protocol.CommandSessionWake, SID: "s1"},
+		Ack:     func(context.Context) error { acked = true; return nil },
+	}
+	manager.Dispatch(context.Background(), delivery)
+
+	if acked {
+		t.Fatal("a wake nobody could act on was acknowledged, so nothing will retry it")
+	}
+	if got := manager.Count(); got != 0 {
+		t.Fatalf("the manager runs %d sessions after a refused adoption", got)
+	}
+}
+
+// refusingEngine cannot open anything, which is what a database that is away looks like
+// from the manager.
+type refusingEngine struct{}
+
+func (refusingEngine) Open(context.Context, string) (engine.Session, error) {
+	return nil, errors.New("the store is unreachable")
+}
+func (refusingEngine) Close() error { return nil }

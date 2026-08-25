@@ -185,7 +185,13 @@ func (m *Manager) wake(ctx context.Context, delivery *transport.Delivery) {
 	switch {
 	case err == nil, errors.Is(err, cluster.ErrNotOwner):
 	default:
-		m.log.Error().Err(err).Str("sid", sid).Msg("failed to adopt a woken session")
+		// Left unacknowledged on purpose. Every instance reads this stream through one
+		// consumer group, so acknowledging a wake nobody could act on retires it: the
+		// session then stays unowned until a client happens to send another. Whatever
+		// stopped the adoption — a database that was away, a store that could not be
+		// read — may well be over by the time this is reclaimed.
+		m.log.Error().Err(err).Str("sid", sid).Msg("failed to adopt a woken session; leaving the wake pending")
+		return
 	}
 	m.ack(ctx, delivery)
 }
