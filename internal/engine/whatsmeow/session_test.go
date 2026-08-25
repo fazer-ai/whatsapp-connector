@@ -496,14 +496,24 @@ func TestTheLibraryLoggerDropsItsDebugOutput(t *testing.T) {
 
 	logger.Debugf("Emitting QR code %s", "2@secret,pairing,code")
 	logger.Sub("qrchannel").Debugf("Sending node %s", "<iq to=s.whatsapp.net>")
+	// Info is where the library announces an authentication and a pairing, by JID.
+	logger.Infof("Successfully paired %s", "5511999990001:12@s.whatsapp.net")
 	if written.Len() != 0 {
-		t.Fatalf("the library logger wrote its debug output: %s", written.String())
+		t.Fatalf("the library logger wrote what it was not meant to: %s", written.String())
 	}
 
-	// What an operator needs when a session will not connect still gets through.
-	logger.Warnf("Failed to connect")
-	if !strings.Contains(written.String(), "Failed to connect") {
-		t.Fatalf("the library logger dropped a warning: %s", written.String())
+	// What an operator needs when a session will not connect still gets through, minus
+	// the payload the library carries along with it.
+	logger.Warnf("Failed to send node %s", "0aQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	out := written.String()
+	if !strings.Contains(out, "Failed to send node") {
+		t.Fatalf("the library logger dropped a warning: %s", out)
+	}
+	if strings.Contains(out, "0aQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=") {
+		t.Fatalf("the library logger wrote the payload out: %s", out)
+	}
+	if !strings.Contains(out, "[redacted]") {
+		t.Fatalf("the payload was dropped rather than masked: %s", out)
 	}
 }
 
@@ -546,5 +556,44 @@ func TestACancelledPairingRunPublishesNothingMore(t *testing.T) {
 	case emission := <-session.Events():
 		t.Fatalf("a cancelled run published %q", emission.Type)
 	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// whatsmeow suppresses the ordinary Disconnected when another client takes the stream,
+// so nothing else would bring the connection down and the session would go on
+// reporting itself open over a stream somebody else now holds.
+func TestAReplacedStreamStopsReportingOpen(t *testing.T) {
+	t.Parallel()
+	session, _ := newTestSession(t, "5511999990001")
+
+	session.handle(&waEvents.Connected{})
+	next(t, session)
+	if state := session.state(); state != "open" {
+		t.Fatalf("a connected session reports %q", state)
+	}
+
+	session.handle(&waEvents.StreamReplaced{})
+	if emission := next(t, session); emission.Type != protocol.EventSessionStreamReplaced {
+		t.Fatalf("published %q, want %q", emission.Type, protocol.EventSessionStreamReplaced)
+	}
+	if state := session.state(); state != "close" {
+		t.Fatalf("a replaced stream still reports %q", state)
+	}
+}
+
+// The dial returns as soon as the socket is up and the pairing conversation runs on
+// from there, so a session in the middle of one is connecting. Calling it closed has
+// the reply to session.connect overwrite the `connecting` it just published, while the
+// operator is looking at a code.
+func TestAPairingSessionReportsConnecting(t *testing.T) {
+	t.Parallel()
+	session, _ := newTestSession(t, "")
+
+	if state := session.state(); state != "close" {
+		t.Fatalf("an idle session reports %q", state)
+	}
+	session.startPairing(func() {})
+	if state := session.state(); state != "connecting" {
+		t.Fatalf("a session mid-pairing reports %q, want connecting", state)
 	}
 }

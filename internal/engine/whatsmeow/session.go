@@ -333,7 +333,7 @@ func (s *Session) giveUpOn(ctx context.Context, run *pairingRun, client *wm.Clie
 // that same lock, so a disconnect arriving mid-handshake would otherwise sit there long
 // past its deadline and then report success. Cancelling the session context is what
 // actually interrupts the dial; this is the part that stops waiting.
-func (s *Session) hangUp(ctx context.Context, client *wm.Client) {
+func (s *Session) hangUp(ctx context.Context, client *wm.Client) error {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -342,8 +342,14 @@ func (s *Session) hangUp(ctx context.Context, client *wm.Client) {
 
 	select {
 	case <-done:
+		return nil
 	case <-ctx.Done():
+		// The socket is still up, held by a dial this had to queue behind. Answering the
+		// caller with success would have it record a session as closed while events from
+		// that connection are still on their way.
+		return fmt.Errorf("whatsmeow: %s was still connecting: %w", s.sid, ctx.Err())
 	case <-s.done:
+		return nil
 	}
 }
 
@@ -430,8 +436,10 @@ func (s *Session) pairWithCode(ctx context.Context, phone string) error {
 // Disconnect drops the socket and keeps the credentials.
 func (s *Session) Disconnect(ctx context.Context) error {
 	s.cancelPairing()
+	if err := s.hangUp(ctx, s.current()); err != nil {
+		return err
+	}
 	s.setConnected(false)
-	s.hangUp(ctx, s.current())
 	s.emit(protocol.EventSessionState, map[string]any{"state": "close", "reason": "disconnect_requested"})
 	return nil
 }
@@ -654,7 +662,7 @@ func (s *Session) sessionState() map[string]any {
 // that believed it would never reconnect again.
 func (s *Session) state() string {
 	s.mu.Lock()
-	closed, dialing, connected := s.closed, s.dialing, s.connected
+	closed, dialing, connected, pairing := s.closed, s.dialing, s.connected, s.pairing != nil
 	s.mu.Unlock()
 
 	switch {
@@ -662,7 +670,11 @@ func (s *Session) state() string {
 		return "close"
 	case connected:
 		return "open"
-	case dialing:
+	case dialing, pairing:
+		// The dial returns as soon as the socket is up, and the pairing conversation
+		// runs on from there. Calling that closed would have the reply to session.connect
+		// overwrite the `connecting` it just published, while the operator is looking at
+		// a code.
 		return "connecting"
 	default:
 		return "close"
@@ -843,8 +855,13 @@ func (s *Session) handle(rawEvent any) {
 	case *waEvents.LoggedOut:
 		s.loggedOut(event)
 	case *waEvents.StreamReplaced:
+		// whatsmeow suppresses the ordinary Disconnected for this one, so nothing else
+		// would take the connection down and the session would report itself open over a
+		// stream somebody else now holds.
+		s.setConnected(false)
 		s.emit(protocol.EventSessionStreamReplaced, map[string]any{})
 	case *waEvents.TemporaryBan:
+		s.setConnected(false)
 		ban := map[string]any{"kind": "temporary", "reason": event.Code.String()}
 		if event.Expire > 0 {
 			// A zero duration is whatsmeow saying it does not know when the ban lifts.
@@ -861,12 +878,17 @@ func (s *Session) handle(rawEvent any) {
 		}
 		s.emit(protocol.EventSessionClientOutdated, map[string]any{})
 	case *waEvents.ConnectFailure:
+		s.setConnected(false)
 		s.emit(protocol.EventSessionConnectFailure, map[string]any{
 			"reason": event.Reason.String(), "code": int(event.Reason),
 		})
 	case *waEvents.PairSuccess:
 		s.paired(event)
 	case *waEvents.PairError:
+		// Whatever the QR channel does with this, the client is on a device whatsmeow
+		// may have half-written: an id with no credentials, or one it marked deleted.
+		// The next attempt would be refused by the library rather than by WhatsApp.
+		s.markStale()
 		if s.pairingActive() {
 			return
 		}
@@ -877,6 +899,8 @@ func (s *Session) handle(rawEvent any) {
 }
 
 func (s *Session) loggedOut(event *waEvents.LoggedOut) {
+	s.setConnected(false)
+
 	// The credentials are gone on WhatsApp's side, so keeping them here would have
 	// every reconnect fail with a session that looks resumable and is not.
 	// On the session's own lifetime: `Forget` unbinds the mapping, so a stale owner

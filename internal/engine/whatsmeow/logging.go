@@ -1,20 +1,22 @@
 package whatsmeow
 
 import (
+	"fmt"
+	"regexp"
+
 	"github.com/rs/zerolog"
 	waLog "go.mau.fi/whatsmeow/util/log"
 )
 
-// quietLogger passes whatsmeow's logging through, minus its debug level.
+// quietLogger is what whatsmeow is allowed to write down.
 //
-// whatsmeow debug-logs the material the connector must never write down: the pairing
-// channel logs every raw QR code it emits, and the client logs the nodes it sends and
-// receives. The process redactor masks phone-shaped tokens and nothing else, so a
-// deployment set to debug for an unrelated reason would ship pairing credentials and
-// session internals to wherever its logs go.
-//
-// Warnings and errors stay: those are what an operator needs when a session will not
-// connect, and they are written for a human rather than for a protocol trace.
+// The library logs the material this connector must never keep. Its pairing channel
+// logs every raw QR code at debug, its client logs the nodes it sends and receives, and
+// its info lines announce an authentication and a pairing by JID. What survives here is
+// the warning and the error, which is what an operator reads when a session will not
+// connect, with the payloads inside them masked: the process redactor covers
+// phone-shaped tokens and nothing else, so key material and node dumps would go out
+// intact.
 type quietLogger struct {
 	log zerolog.Logger
 }
@@ -34,13 +36,30 @@ func newLibraryLogger(log zerolog.Logger, sid string) waLog.Logger {
 	return &quietLogger{log: entry.Logger()}
 }
 
-func (l *quietLogger) Warnf(msg string, args ...any)  { l.log.Warn().Msgf(msg, args...) }
-func (l *quietLogger) Errorf(msg string, args ...any) { l.log.Error().Msgf(msg, args...) }
-func (l *quietLogger) Infof(msg string, args ...any)  { l.log.Info().Msgf(msg, args...) }
+func (l *quietLogger) Warnf(msg string, args ...any)  { l.log.Warn().Msg(mask(msg, args...)) }
+func (l *quietLogger) Errorf(msg string, args ...any) { l.log.Error().Msg(mask(msg, args...)) }
 
-// Debugf is where the credentials are, so it goes nowhere.
+// Infof and Debugf go nowhere. Debug is where the pairing codes and the protocol nodes
+// are; info is where the library announces an authentication and a pairing, by JID. The
+// connector reports its own session lifecycle as events, which is where a reader should
+// be looking for it anyway.
+func (l *quietLogger) Infof(string, ...any)  {}
 func (l *quietLogger) Debugf(string, ...any) {}
 
 func (l *quietLogger) Sub(module string) waLog.Logger {
 	return &quietLogger{log: l.log.With().Str("module", module).Logger()}
+}
+
+// secretShaped is a run long enough to be key material, a node dump or a base64 blob
+// rather than a word. whatsmeow embeds those in warnings and errors as context, and
+// none of it is anything an operator acts on.
+var secretShaped = regexp.MustCompile(`[A-Za-z0-9+/=_-]{24,}`)
+
+// mask renders a library line with its long payloads taken out.
+func mask(msg string, args ...any) string {
+	rendered := msg
+	if len(args) > 0 {
+		rendered = fmt.Sprintf(msg, args...)
+	}
+	return secretShaped.ReplaceAllString(rendered, "[redacted]")
 }
