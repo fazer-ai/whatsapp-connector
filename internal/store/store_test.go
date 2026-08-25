@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -271,5 +272,67 @@ func TestSQLiteOpensWithoutSpellingOutThePragma(t *testing.T) {
 	}
 	if err := container.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
+	}
+}
+
+// whatsmeow writes its own tables from every path it has at once: a receipt saves a
+// session while a decrypt saves an identity while the connector records a pairing. The
+// first live pairing turned that into a wall of `database is locked (5)`, which is not
+// cosmetic: an identity key that cannot be saved is a message that cannot be decrypted,
+// and the app state key share inside one of those is why the account's contacts and
+// chats never synced either.
+//
+// The test writes through both halves of the container at once, which is the shape that
+// failed. It is not a stress test and a passing run is not a promise about a busy
+// deployment; it is a floor, and the floor is that ordinary concurrent use does not
+// return an error.
+func TestConcurrentWritersDoNotCollide(t *testing.T) {
+	t.Parallel()
+	container := open(t)
+	ctx := t.Context()
+
+	const writers = 8
+	const rounds = 12
+
+	failures := make(chan error, writers*rounds*2)
+	var wg sync.WaitGroup
+	for writer := range writers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for round := range rounds {
+				jid, err := types.ParseJID(fmt.Sprintf("55119999%05d:%d@s.whatsapp.net", writer, round+1))
+				if err != nil {
+					failures <- err
+					return
+				}
+				device := container.Devices().NewDevice()
+				device.ID = &jid
+				device.Account = &waAdv.ADVSignedDeviceIdentity{
+					Details:             make([]byte, 32),
+					AccountSignature:    make([]byte, 64),
+					AccountSignatureKey: make([]byte, 32),
+					DeviceSignature:     make([]byte, 64),
+				}
+				if err := container.Devices().PutDevice(ctx, device); err != nil {
+					failures <- fmt.Errorf("PutDevice: %w", err)
+					return
+				}
+				if err := container.Bind(ctx, fmt.Sprintf("sid-%d", writer), jid); err != nil {
+					failures <- fmt.Errorf("Bind: %w", err)
+					return
+				}
+				if _, _, err := container.JID(ctx, fmt.Sprintf("sid-%d", writer)); err != nil {
+					failures <- fmt.Errorf("JID: %w", err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(failures)
+
+	for err := range failures {
+		t.Errorf("a concurrent writer failed: %v", err)
 	}
 }

@@ -69,15 +69,28 @@ func Open(ctx context.Context, address string, log zerolog.Logger) (*Container, 
 		return nil, err
 	}
 
-	devices, err := sqlstore.New(ctx, dialect, dsn, nil)
-	if err != nil {
-		return nil, fmt.Errorf("store: open the device store: %w", err)
-	}
-
+	// One pool, not two. whatsmeow's store and this package's own table live in the
+	// same database, and opening them separately gave SQLite two independent sets of
+	// connections writing one file: the first real pairing filled the log with
+	// `database is locked (5)` from whatsmeow trying to save an identity key while the
+	// mapping was being written, and a message that cannot have its identity saved
+	// cannot be decrypted.
 	db, err := sql.Open(dialect, dsn)
 	if err != nil {
-		_ = devices.Close()
 		return nil, fmt.Errorf("store: open %s: %w", dialect, err)
+	}
+	if dialect == dialectSQLite {
+		// A file holds one writer at a time whatever the pool says, and a pool that
+		// hands out more connections than that only converts waiting into
+		// `database is locked`. Serialising here is what makes busy_timeout the
+		// backstop rather than the mechanism.
+		db.SetMaxOpenConns(1)
+	}
+
+	devices := sqlstore.NewWithDB(db, dialect, nil)
+	if err := devices.Upgrade(ctx); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("store: open the device store: %w", err)
 	}
 
 	c := &Container{db: db, devices: devices, dialect: dialect, log: log}
@@ -100,9 +113,10 @@ func (c *Container) Ping(ctx context.Context) error {
 // Devices is whatsmeow's own store, which the engine hands to a client.
 func (c *Container) Devices() *sqlstore.Container { return c.devices }
 
-// Close releases both handles.
+// Close releases the pool. There is only one, and whatsmeow's container wraps it
+// rather than owning it, so closing it here is the whole of it.
 func (c *Container) Close() error {
-	return errors.Join(c.devices.Close(), c.db.Close())
+	return c.db.Close()
 }
 
 // Device returns the device a session should connect with: the stored one when that
@@ -338,20 +352,36 @@ func parseURL(address string) (dialect, dsn string, err error) {
 	case strings.HasPrefix(address, "postgres://"), strings.HasPrefix(address, "postgresql://"):
 		return dialectPostgres, address, nil
 	case strings.HasPrefix(address, "file:"):
-		return dialectSQLite, withForeignKeys(address), nil
+		return dialectSQLite, sqliteDefaults(address), nil
 	case strings.HasPrefix(address, "sqlite://"):
-		return dialectSQLite, withForeignKeys("file:" + strings.TrimPrefix(address, "sqlite://")), nil
+		return dialectSQLite, sqliteDefaults("file:" + strings.TrimPrefix(address, "sqlite://")), nil
 	case strings.HasPrefix(address, "sqlite:"):
-		return dialectSQLite, withForeignKeys("file:" + strings.TrimPrefix(address, "sqlite:")), nil
+		return dialectSQLite, sqliteDefaults("file:" + strings.TrimPrefix(address, "sqlite:")), nil
 	default:
 		return "", "", fmt.Errorf("store: %q is not a database url this connector understands", address)
 	}
 }
 
-// withForeignKeys turns the pragma on, because whatsmeow refuses to bring its schema up
-// without it and the driver leaves it off. Asking an operator to know that and spell it
-// in the url is asking them to debug `foreign keys are not enabled` on first boot.
-func withForeignKeys(dsn string) string {
+// sqliteDefaults fills in what the driver leaves off and whatsmeow needs on. An
+// operator who spells any of these themselves keeps their value; the defaults are for
+// the url the README documents, which is a path and nothing else.
+//
+// Each one is here because of a failure, not a preference:
+//
+//   - foreign_keys: whatsmeow refuses to bring its schema up without it, so first boot
+//     dies on `foreign keys are not enabled`.
+//   - journal_mode(WAL): the default rollback journal blocks every reader for the
+//     length of a write, and whatsmeow reads on the decrypt path while it writes on the
+//     receipt path.
+//   - busy_timeout: without it a contended write returns `database is locked` on the
+//     spot instead of waiting. That is what a live pairing produced: identity keys that
+//     could not be saved, messages that then could not be decrypted, and an app state
+//     sync that failed because the key share it needed was inside one of them.
+//   - _txlock=immediate: a transaction that starts out reading and later writes has to
+//     upgrade its lock, and two of those upgrading at once is a deadlock SQLite breaks
+//     by failing one of them, which no timeout can save. Taking the write lock at BEGIN
+//     turns that into ordinary waiting.
+func sqliteDefaults(dsn string) string {
 	base, query, _ := strings.Cut(dsn, "?")
 	values, err := url.ParseQuery(query)
 	if err != nil {
@@ -359,11 +389,28 @@ func withForeignKeys(dsn string) string {
 		// hide which half they got wrong.
 		return dsn
 	}
-	for _, pragma := range values["_pragma"] {
-		if strings.HasPrefix(pragma, "foreign_keys") {
-			return dsn
+
+	for pragma, setting := range map[string]string{
+		"foreign_keys": "foreign_keys(1)",
+		"journal_mode": "journal_mode(WAL)",
+		"busy_timeout": "busy_timeout(10000)",
+	} {
+		if !hasPragma(values["_pragma"], pragma) {
+			values.Add("_pragma", setting)
 		}
 	}
-	values.Add("_pragma", "foreign_keys(1)")
+	if values.Get("_txlock") == "" {
+		values.Set("_txlock", "immediate")
+	}
 	return base + "?" + values.Encode()
+}
+
+// hasPragma reports whether the operator already set one, whatever they set it to.
+func hasPragma(pragmas []string, name string) bool {
+	for _, pragma := range pragmas {
+		if strings.HasPrefix(strings.TrimSpace(pragma), name) {
+			return true
+		}
+	}
+	return false
 }
