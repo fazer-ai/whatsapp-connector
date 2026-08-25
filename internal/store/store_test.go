@@ -2,20 +2,26 @@ package store_test
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 
+	"github.com/rs/zerolog"
 	"go.mau.fi/whatsmeow/proto/waAdv"
 	"go.mau.fi/whatsmeow/types"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/store"
 )
 
+// deviceCounter gives every pairing its own device part, the way WhatsApp does.
+var deviceCounter atomic.Uint32
+
 func TestOpenRejectsAnUnknownURL(t *testing.T) {
 	t.Parallel()
 
 	for _, url := range []string{"", "mysql://localhost/wa", "/var/lib/wa.db"} {
-		if _, err := store.Open(t.Context(), url); err == nil {
+		if _, err := store.Open(t.Context(), url, zerolog.Nop()); err == nil {
 			t.Fatalf("opened %q, want an error", url)
 		}
 	}
@@ -156,8 +162,8 @@ func TestBindRefusesAnIncompleteCall(t *testing.T) {
 func open(t *testing.T) *store.Container {
 	t.Helper()
 
-	address := "file:" + filepath.Join(t.TempDir(), "wac.db") + "?_pragma=foreign_keys(1)"
-	container, err := store.Open(t.Context(), address)
+	address := "sqlite:" + filepath.Join(t.TempDir(), "wac.db")
+	container, err := store.Open(t.Context(), address, zerolog.Nop())
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -174,8 +180,10 @@ func open(t *testing.T) *store.Container {
 func pair(t *testing.T, container *store.Container, sid, phone string) types.JID {
 	t.Helper()
 	ctx := context.Background()
-
-	jid, err := types.ParseJID(phone + "@s.whatsapp.net")
+	// WhatsApp issues a companion device JID, device part and all, and that is the key
+	// whatsmeow files the device under. Each pairing gets its own, the way a real one
+	// does.
+	jid, err := types.ParseJID(fmt.Sprintf("%s:%d@s.whatsapp.net", phone, deviceCounter.Add(1)))
 	if err != nil {
 		t.Fatalf("ParseJID: %v", err)
 	}
@@ -196,4 +204,72 @@ func pair(t *testing.T, container *store.Container, sid, phone string) types.JID
 		t.Fatalf("Bind: %v", err)
 	}
 	return jid
+}
+
+// WhatsApp pairs a companion device and names it with the device part attached. That
+// full JID is the key whatsmeow files the device under, so a mapping that drops it
+// finds nothing on the next boot, reads the session as unpaired, and asks the operator
+// to scan another code for a session that never stopped being paired.
+func TestDeviceResumesACompanionDeviceJID(t *testing.T) {
+	t.Parallel()
+	container := open(t)
+	ctx := t.Context()
+
+	jid := pair(t, container, "sid-1", "5511999990001")
+	if jid.Device == 0 {
+		t.Fatalf("the test paired %s, which carries no device part", jid)
+	}
+
+	device, err := container.Device(ctx, "sid-1")
+	if err != nil {
+		t.Fatalf("Device: %v", err)
+	}
+	if device.ID == nil {
+		t.Fatal("a paired companion device came back unpaired")
+	}
+	if device.ID.String() != jid.String() {
+		t.Fatalf("resumed %s, want %s", device.ID, jid)
+	}
+}
+
+// Re-pairing an account issues a new device rather than reusing the old one, so the
+// rule is one session per account and the credentials it displaces are deleted: they
+// are unreachable, and WhatsApp has already unlinked them.
+func TestBindDeletesTheDeviceItDisplaces(t *testing.T) {
+	t.Parallel()
+	container := open(t)
+	ctx := t.Context()
+
+	old := pair(t, container, "sid-old", "5511999990001")
+	fresh := pair(t, container, "sid-new", "5511999990001")
+	if old.String() == fresh.String() {
+		t.Fatal("the test paired the same device twice")
+	}
+
+	if _, bound, err := container.JID(ctx, "sid-old"); err != nil || bound {
+		t.Fatalf("the displaced session is still bound (bound=%v, err=%v)", bound, err)
+	}
+	stored, err := container.Devices().GetDevice(ctx, old)
+	if err != nil {
+		t.Fatalf("GetDevice: %v", err)
+	}
+	if stored != nil {
+		t.Fatal("the displaced device survived, holding credentials nothing can reach")
+	}
+}
+
+// whatsmeow refuses to bring its schema up on SQLite with foreign keys off, and the
+// driver leaves them off. An operator writing the documented url should not have to
+// know that.
+func TestSQLiteOpensWithoutSpellingOutThePragma(t *testing.T) {
+	t.Parallel()
+
+	address := "sqlite:" + filepath.Join(t.TempDir(), "wac.db")
+	container, err := store.Open(t.Context(), address, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("Open %q: %v", address, err)
+	}
+	if err := container.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
 }

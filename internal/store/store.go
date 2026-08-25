@@ -8,9 +8,15 @@
 // and every session would pair again.
 //
 // Ownership is arbitrated by the Redis lease, not here: one instance runs a session at
-// a time, so one process at a time writes that session's device. The store-level fence
-// arrives with the message store in M2, where this package owns writes of its own that
-// a stale owner could otherwise interleave.
+// a time, and the layer above tears a session down within a heartbeat of losing it.
+//
+// That leaves a window, and closing it is an architecture change rather than a guard.
+// whatsmeow writes through its own SQL layer, where a statement carries no session
+// identity, so a fence would have to be per-session all the way down: one container per
+// session, or a driver wrapper that knows which session it is serving. Both are M2, and
+// M2 is when this package starts owning writes of its own, which is what makes the
+// question urgent. Until then the lease and the heartbeat are the whole of it, and this
+// is documented in the roadmap as open rather than solved.
 package store
 
 import (
@@ -18,9 +24,12 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/rs/zerolog"
 
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
@@ -43,6 +52,7 @@ type Container struct {
 	db      *sql.DB
 	devices *sqlstore.Container
 	dialect string
+	log     zerolog.Logger
 }
 
 // Open dials the database, brings both schemas up to date, and returns the container.
@@ -51,24 +61,26 @@ type Container struct {
 // `sqlite:…` or `file:…` is SQLite. Nothing is guessed from the file system, so a
 // typo fails here rather than silently opening a local file in a deployment that meant
 // to reach a server.
-func Open(ctx context.Context, url string) (*Container, error) {
-	dialect, address, err := parseURL(url)
+//
+//nolint:gocritic // zerolog.Logger is designed to be copied; every With() returns one by value
+func Open(ctx context.Context, address string, log zerolog.Logger) (*Container, error) {
+	dialect, dsn, err := parseURL(address)
 	if err != nil {
 		return nil, err
 	}
 
-	devices, err := sqlstore.New(ctx, dialect, address, nil)
+	devices, err := sqlstore.New(ctx, dialect, dsn, nil)
 	if err != nil {
 		return nil, fmt.Errorf("store: open the device store: %w", err)
 	}
 
-	db, err := sql.Open(dialect, address)
+	db, err := sql.Open(dialect, dsn)
 	if err != nil {
 		_ = devices.Close()
 		return nil, fmt.Errorf("store: open %s: %w", dialect, err)
 	}
 
-	c := &Container{db: db, devices: devices, dialect: dialect}
+	c := &Container{db: db, devices: devices, dialect: dialect, log: log}
 	if err := c.migrate(ctx); err != nil {
 		_ = c.Close()
 		return nil, err
@@ -118,6 +130,11 @@ func (c *Container) Device(ctx context.Context, sid string) (*store.Device, erro
 // process that dies mid-pairing leaves a mapping to a device that does not exist yet,
 // which Device treats as unpaired. The other order would leave a stored device no
 // session claims, which nothing can clean up because nothing knows whose it was.
+//
+// The JID is stored exactly as WhatsApp issued it, device part included, because that
+// is the key whatsmeow files the device under and the one `GetDevice` answers to.
+// Normalising it away would leave every restart looking up a device that is there
+// under a name we no longer hold, reading it as unpaired, and pairing again.
 func (c *Container) Bind(ctx context.Context, sid string, jid types.JID) error {
 	if sid == "" {
 		return errors.New("store: bind needs a session id")
@@ -126,29 +143,83 @@ func (c *Container) Bind(ctx context.Context, sid string, jid types.JID) error {
 		return fmt.Errorf("store: bind %s needs a jid", sid)
 	}
 
+	// An account belongs to one session, and re-pairing it issues a new device rather
+	// than reusing the old one, so the match is on the account and not on the device.
+	displaced, err := c.displacedBy(ctx, sid, jid.User)
+	if err != nil {
+		return err
+	}
+
 	tx, err := c.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("store: bind %s: %w", sid, err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	// A device belongs to one session. Re-pairing the same number under a different
-	// session id is the case this covers, and leaving both rows would give two sessions
-	// one set of credentials.
-	if _, err := tx.ExecContext(ctx, c.rebind(`DELETE FROM wac_session_device WHERE jid = ? AND sid <> ?`),
-		jid.ToNonAD().String(), sid); err != nil {
+	if _, err := tx.ExecContext(ctx, c.rebind(`DELETE FROM wac_session_device WHERE account = ? AND sid <> ?`),
+		jid.User, sid); err != nil {
 		return fmt.Errorf("store: bind %s: %w", sid, err)
 	}
 	if _, err := tx.ExecContext(ctx, c.rebind(`
-		INSERT INTO wac_session_device (sid, jid, bound_at) VALUES (?, ?, ?)
-		ON CONFLICT (sid) DO UPDATE SET jid = excluded.jid, bound_at = excluded.bound_at`),
-		sid, jid.ToNonAD().String(), time.Now().UnixMilli()); err != nil {
+		INSERT INTO wac_session_device (sid, jid, account, bound_at) VALUES (?, ?, ?, ?)
+		ON CONFLICT (sid) DO UPDATE SET
+			jid = excluded.jid, account = excluded.account, bound_at = excluded.bound_at`),
+		sid, jid.String(), jid.User, time.Now().UnixMilli()); err != nil {
 		return fmt.Errorf("store: bind %s: %w", sid, err)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("store: bind %s: %w", sid, err)
 	}
+
+	// The devices the displaced mappings pointed at are credentials nothing can reach
+	// any more, and WhatsApp has already unlinked them. Failing the pairing over one
+	// that will not delete would be the worse outcome, so this is reported and not
+	// raised.
+	for _, old := range displaced {
+		c.deleteDevice(ctx, old)
+	}
 	return nil
+}
+
+// displacedBy lists the devices bound to an account under some other session.
+func (c *Container) displacedBy(ctx context.Context, sid, account string) ([]types.JID, error) {
+	rows, err := c.db.QueryContext(ctx,
+		c.rebind(`SELECT jid FROM wac_session_device WHERE account = ? AND sid <> ?`), account, sid)
+	if err != nil {
+		return nil, fmt.Errorf("store: read the mappings of %s: %w", account, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var displaced []types.JID
+	for rows.Next() {
+		var raw string
+		if err := rows.Scan(&raw); err != nil {
+			return nil, fmt.Errorf("store: read the mappings of %s: %w", account, err)
+		}
+		jid, err := types.ParseJID(raw)
+		if err != nil {
+			c.log.Warn().Str("sid", sid).Msg("a mapping holds an unreadable jid; leaving its device alone")
+			continue
+		}
+		displaced = append(displaced, jid)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: read the mappings of %s: %w", account, err)
+	}
+	return displaced, nil
+}
+
+func (c *Container) deleteDevice(ctx context.Context, jid types.JID) {
+	device, err := c.devices.GetDevice(ctx, jid)
+	if err != nil || device == nil {
+		if err != nil {
+			c.log.Warn().Err(err).Msg("failed to read a displaced device")
+		}
+		return
+	}
+	if err := c.devices.DeleteDevice(ctx, device); err != nil {
+		c.log.Warn().Err(err).Msg("failed to delete a displaced device")
+	}
 }
 
 // Forget deletes a session's device and its mapping, which is what a logout means:
@@ -206,14 +277,19 @@ func (c *Container) unbind(ctx context.Context, sid string) error {
 // migrate creates what this package owns. whatsmeow's own schema is brought up by
 // sqlstore.New, so this covers the mapping table alone.
 func (c *Container) migrate(ctx context.Context) error {
-	const schema = `
+	statements := []string{`
 		CREATE TABLE IF NOT EXISTS wac_session_device (
 			sid      TEXT   PRIMARY KEY,
 			jid      TEXT   NOT NULL UNIQUE,
+			account  TEXT   NOT NULL,
 			bound_at BIGINT NOT NULL
-		)`
-	if _, err := c.db.ExecContext(ctx, schema); err != nil {
-		return fmt.Errorf("store: create wac_session_device: %w", err)
+		)`,
+		`CREATE INDEX IF NOT EXISTS wac_session_device_account ON wac_session_device (account)`,
+	}
+	for _, statement := range statements {
+		if _, err := c.db.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("store: create wac_session_device: %w", err)
+		}
 	}
 	return nil
 }
@@ -245,20 +321,40 @@ const (
 	dialectSQLite   = "sqlite"
 )
 
-// parseURL splits a database url into the dialect and the address the driver wants.
-func parseURL(url string) (dialect, address string, err error) {
+// parseURL splits a database url into the dialect and the dsn the driver wants.
+func parseURL(address string) (dialect, dsn string, err error) {
 	switch {
-	case url == "":
+	case address == "":
 		return "", "", ErrNoDatabase
-	case strings.HasPrefix(url, "postgres://"), strings.HasPrefix(url, "postgresql://"):
-		return dialectPostgres, url, nil
-	case strings.HasPrefix(url, "file:"):
-		return dialectSQLite, url, nil
-	case strings.HasPrefix(url, "sqlite://"):
-		return dialectSQLite, "file:" + strings.TrimPrefix(url, "sqlite://"), nil
-	case strings.HasPrefix(url, "sqlite:"):
-		return dialectSQLite, "file:" + strings.TrimPrefix(url, "sqlite:"), nil
+	case strings.HasPrefix(address, "postgres://"), strings.HasPrefix(address, "postgresql://"):
+		return dialectPostgres, address, nil
+	case strings.HasPrefix(address, "file:"):
+		return dialectSQLite, withForeignKeys(address), nil
+	case strings.HasPrefix(address, "sqlite://"):
+		return dialectSQLite, withForeignKeys("file:" + strings.TrimPrefix(address, "sqlite://")), nil
+	case strings.HasPrefix(address, "sqlite:"):
+		return dialectSQLite, withForeignKeys("file:" + strings.TrimPrefix(address, "sqlite:")), nil
 	default:
-		return "", "", fmt.Errorf("store: %q is not a database url this connector understands", url)
+		return "", "", fmt.Errorf("store: %q is not a database url this connector understands", address)
 	}
+}
+
+// withForeignKeys turns the pragma on, because whatsmeow refuses to bring its schema up
+// without it and the driver leaves it off. Asking an operator to know that and spell it
+// in the url is asking them to debug `foreign keys are not enabled` on first boot.
+func withForeignKeys(dsn string) string {
+	base, query, _ := strings.Cut(dsn, "?")
+	values, err := url.ParseQuery(query)
+	if err != nil {
+		// An unparseable query is the operator's to fix, and rewriting it here would
+		// hide which half they got wrong.
+		return dsn
+	}
+	for _, pragma := range values["_pragma"] {
+		if strings.HasPrefix(pragma, "foreign_keys") {
+			return dsn
+		}
+	}
+	values.Add("_pragma", "foreign_keys(1)")
+	return base + "?" + values.Encode()
 }

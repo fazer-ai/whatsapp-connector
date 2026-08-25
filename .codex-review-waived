@@ -1,3 +1,4 @@
 contract/schema/protocol.schema.json: Require an idempotency key for history requests  # PR#3
 contract/fixtures/commands/history_request.json: Require an idempotency key for history requests  # PR#3
 contract/schema/protocol.schema.json: Require a usable anchor for native history requests  # PR#3
+internal/store/store.go: Fence device writes against lease loss  # PR#5 — real, and not a patch: whatsmeow writes through its own SQL layer where a statement carries no session identity, so a fence has to be per-session all the way down (one container per session, or a session-aware driver wrapper). That is M2, when this package starts owning writes of its own. The lease plus the heartbeat teardown bound the window meanwhile, and the roadmap says it is open.
