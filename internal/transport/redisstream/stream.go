@@ -62,6 +62,21 @@ type Streams struct {
 	// a running command while never reclaiming the second loses it in a fleet of one.
 	inFlightMu sync.Mutex
 	inFlight   map[string]struct{}
+
+	// unrun is what was claimed and handed back without being carried out, with the age
+	// each entry needs put back. XCLAIM resets an entry's idle to zero, so one released
+	// afterwards is one no instance may reclaim for a whole ClaimMinIdle, however long
+	// it had already been waiting: a wake that arrived late then waits the delay a
+	// second time, and the session it names runs nowhere for both.
+	unrunMu sync.Mutex
+	unrun   map[string][]unrunEntry
+}
+
+// unrunEntry is one entry given back without being carried out, and the idle time it
+// had before this process claimed it.
+type unrunEntry struct {
+	id   string
+	idle time.Duration
 }
 
 // New returns the transport. It creates no keys: a stream and its group are created on
@@ -92,6 +107,7 @@ func New(client *redisx.Client, opts Options) (*Streams, error) {
 	return &Streams{
 		client: client, opts: opts, groups: newGroupCache(),
 		inFlight: make(map[string]struct{}),
+		unrun:    make(map[string][]unrunEntry),
 	}, nil
 }
 
@@ -179,7 +195,56 @@ func (s *Streams) Read(ctx context.Context, sids []string) ([]transport.Delivery
 // Claim takes over commands another instance read and never acknowledged, which is
 // what happens when it is killed between reading a command and carrying it out.
 func (s *Streams) Claim(ctx context.Context, sids []string) ([]transport.Delivery, error) {
+	// First, because it is what makes this pass able to see what the last one gave back.
+	s.restoreUnrun(ctx)
 	return s.claim(ctx, s.streamsFor(sids), s.opts.ClaimMinIdle)
+}
+
+// restoreUnrun puts back the age XCLAIM erased on the entries this process took and gave
+// back without carrying out.
+//
+// A claim resets an entry's idle to zero, so one released afterwards is unreclaimable by
+// anybody for a whole ClaimMinIdle, however long it had been waiting before this process
+// touched it. A wake that was already overdue then waits the delay twice over, and the
+// session it names runs nowhere for both.
+//
+// Age is put back rather than the entry being kept for this instance alone: an entry
+// only this process could take again is one it can starve every peer out of, by claiming
+// it and giving it back on every heartbeat.
+func (s *Streams) restoreUnrun(ctx context.Context) {
+	s.unrunMu.Lock()
+	pending := s.unrun
+	s.unrun = make(map[string][]unrunEntry)
+	s.unrunMu.Unlock()
+
+	for stream, entries := range pending {
+		byIdle := make(map[time.Duration][]string)
+		for _, entry := range entries {
+			if s.running(stream, entry.id) {
+				// Taken again since it was given back. Putting an age on an entry this
+				// process is carrying out is how a peer comes to run it alongside.
+				continue
+			}
+			byIdle[entry.idle] = append(byIdle[entry.idle], entry.id)
+		}
+		for idle, ids := range byIdle {
+			// Raw, because go-redis models neither IDLE nor JUSTID on XCLAIM: IDLE is
+			// the whole point, and JUSTID keeps the delivery counter from moving for a
+			// hand-back that delivered nothing.
+			args := make([]any, 0, len(ids)+8)
+			args = append(args, "XCLAIM", stream, ConsumerGroup, s.opts.Instance, 0)
+			for _, id := range ids {
+				args = append(args, id)
+			}
+			args = append(args, "IDLE", idle.Milliseconds(), "JUSTID")
+			if err := s.client.Do(ctx, args...).Err(); err != nil && !errors.Is(err, redis.Nil) {
+				// Nothing to retry. The entries are still pending and still come back,
+				// just no sooner than the delay: what is lost here is the age, not the
+				// command.
+				continue
+			}
+		}
+	}
 }
 
 // ClaimSessions takes over what is pending on these sessions' own streams, and looks at
@@ -250,9 +315,31 @@ func (s *Streams) claim(ctx context.Context, streams []string, minIdle time.Dura
 		case err != nil && !errors.Is(err, redis.Nil):
 			return fail(fmt.Errorf("redisstream: claim %s: %w", stream, err))
 		}
-		claimed = append(claimed, s.deliveries([]redis.XStream{{Stream: stream, Messages: messages}})...)
+		taken, ids := s.deliveriesWithIDs([]redis.XStream{{Stream: stream, Messages: messages}})
+		if minIdle > 0 {
+			s.rememberAge(stream, minIdle, taken, ids)
+		}
+		claimed = append(claimed, taken...)
 	}
 	return claimed, nil
+}
+
+// rememberAge has each delivery record, if it is given back unrun, the age this claim
+// has just erased. A claim with no minimum idle takes nothing worth putting back: those
+// entries are fresh, and the drain that took them asks for them again with no delay.
+func (s *Streams) rememberAge(stream string, idle time.Duration, deliveries []transport.Delivery, ids []string) {
+	for i := range deliveries {
+		id := ids[i]
+		release := deliveries[i].Release
+		deliveries[i].Release = func() {
+			if release != nil {
+				release()
+			}
+			s.unrunMu.Lock()
+			s.unrun[stream] = append(s.unrun[stream], unrunEntry{id: id, idle: idle})
+			s.unrunMu.Unlock()
+		}
+	}
 }
 
 // reclaimable is the pending entries worth taking over: idle long enough, and held by
@@ -337,7 +424,14 @@ func (s *Streams) sessionStreams(sids []string) []string {
 }
 
 func (s *Streams) deliveries(result []redis.XStream) []transport.Delivery {
-	var out []transport.Delivery
+	out, _ := s.deliveriesWithIDs(result)
+	return out
+}
+
+// deliveriesWithIDs is deliveries plus the stream entry each one came from, which a
+// claim needs to say what it took: the ids line up with the deliveries, and a frame that
+// could not be read is in neither.
+func (s *Streams) deliveriesWithIDs(result []redis.XStream) (out []transport.Delivery, ids []string) {
 	for _, stream := range result {
 		for _, message := range stream.Messages {
 			command, err := protocol.ParseCommand(toFields(message.Values))
@@ -355,9 +449,10 @@ func (s *Streams) deliveries(result []redis.XStream) []transport.Delivery {
 				Ack:     s.acker(stream.Stream, message.ID, held),
 				Release: held,
 			})
+			ids = append(ids, message.ID)
 		}
 	}
-	return out
+	return out, ids
 }
 
 func (s *Streams) acker(stream, id string, release func()) func(context.Context) error {

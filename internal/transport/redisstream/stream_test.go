@@ -531,3 +531,107 @@ func TestClaimLooksPastAPageItCannotUse(t *testing.T) {
 		t.Fatalf("claimed %v, want only the command the peer abandoned", claimed)
 	}
 }
+
+// XCLAIM resets an entry's idle to zero, so an entry claimed and then handed back is one
+// no instance may reclaim for a whole ClaimMinIdle, however long it had already been
+// waiting. A wake that arrived late then waits the delay twice over, and the session it
+// names runs nowhere for both.
+func TestAClaimedCommandHandedBackKeepsItsAge(t *testing.T) {
+	t.Parallel()
+
+	const minIdle = 10 * time.Second
+	f := newFleet(t)
+	patient, err := redisstream.New(f.client, redisstream.Options{
+		Instance: "inst-alive", Block: 50 * time.Millisecond, ClaimMinIdle: minIdle,
+	})
+	if err != nil {
+		t.Fatalf("redisstream.New: %v", err)
+	}
+	dead := f.streams(t, "inst-dead")
+	ctx := context.Background()
+
+	if _, err := dead.Read(ctx, []string{"s1"}); err != nil {
+		t.Fatalf("priming Read: %v", err)
+	}
+	writeCommand(t, f, f.client.Keys().Commands("s1"), command("c1", "s1", "c1"))
+	taken, err := dead.Read(ctx, []string{"s1"})
+	if err != nil || len(taken) != 1 {
+		t.Fatalf("the first instance read %d commands (err=%v), want 1", len(taken), err)
+	}
+	// And then it dies, without acknowledging. The entry waits out the delay.
+	clock := time.Now().UTC()
+	tick := func(d time.Duration) { clock = clock.Add(d); f.server.SetTime(clock) }
+	tick(minIdle + time.Second)
+
+	claimed, err := patient.Claim(ctx, []string{"s1"})
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("Claim returned %d commands (err=%v), want 1", len(claimed), err)
+	}
+	// The batch ran out of its budget, so this one is handed back unrun. No time passes:
+	// the whole point is that it is already old enough and must not start over.
+	claimed[0].Release()
+	tick(time.Millisecond)
+
+	again, err := patient.Claim(ctx, []string{"s1"})
+	if err != nil {
+		t.Fatalf("the second Claim: %v", err)
+	}
+	if len(again) != 1 {
+		t.Fatalf("a command handed back unrun came back %d times, want 1: it is waiting out the delay a second time", len(again))
+	}
+	if again[0].Command.ID != "c1" {
+		t.Fatalf("claimed command id = %q, want c1", again[0].Command.ID)
+	}
+}
+
+// And what is being carried out keeps its zero: putting an age back on an entry this
+// process is still running is how a peer comes to run it alongside.
+func TestAgeIsNotPutBackOnWhatIsStillRunning(t *testing.T) {
+	t.Parallel()
+
+	const minIdle = 10 * time.Second
+	f := newFleet(t)
+	patient, err := redisstream.New(f.client, redisstream.Options{
+		Instance: "inst-alive", Block: 50 * time.Millisecond, ClaimMinIdle: minIdle,
+	})
+	if err != nil {
+		t.Fatalf("redisstream.New: %v", err)
+	}
+	dead := f.streams(t, "inst-dead")
+	ctx := context.Background()
+
+	if _, err := dead.Read(ctx, []string{"s1"}); err != nil {
+		t.Fatalf("priming Read: %v", err)
+	}
+	writeCommand(t, f, f.client.Keys().Commands("s1"), command("c1", "s1", "c1"))
+	if taken, err := dead.Read(ctx, []string{"s1"}); err != nil || len(taken) != 1 {
+		t.Fatalf("the first instance read %d commands (err=%v), want 1", len(taken), err)
+	}
+	clock := time.Now().UTC()
+	tick := func(d time.Duration) { clock = clock.Add(d); f.server.SetTime(clock) }
+	tick(minIdle + time.Second)
+
+	claimed, err := patient.Claim(ctx, []string{"s1"})
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("Claim returned %d commands (err=%v), want 1", len(claimed), err)
+	}
+	claimed[0].Release()
+	tick(time.Millisecond)
+
+	// Taken again, and this time it is being carried out.
+	running, err := patient.Claim(ctx, []string{"s1"})
+	if err != nil || len(running) != 1 {
+		t.Fatalf("the second Claim returned %d commands (err=%v), want 1", len(running), err)
+	}
+	tick(minIdle + time.Second)
+
+	// A third pass must find nothing: the entry is running here, and the age of the
+	// hand-back before it is not a reason to offer it to anybody.
+	third, err := patient.Claim(ctx, []string{"s1"})
+	if err != nil {
+		t.Fatalf("the third Claim: %v", err)
+	}
+	if len(third) != 0 {
+		t.Fatalf("a command being carried out was offered again (%d)", len(third))
+	}
+}

@@ -76,6 +76,12 @@ type Session struct {
 	// reach the path where a disconnect outlives its deadline.
 	disconnect func(*wm.Client)
 
+	// logout ends the session on WhatsApp's side. A field for the same reason as the two
+	// above: whatsmeow refuses to log out a client that never connected, so nothing
+	// outside the library can reach the path where WhatsApp has revoked the device and
+	// the local cleanup is what fails.
+	logout func(context.Context, *wm.Client) error
+
 	// transition serialises a change to the socket's state with the event announcing
 	// it. It is not mu: emit can block on a full inbox, and holding the session's own
 	// lock across that would stop everything that reads state, Close included.
@@ -144,6 +150,7 @@ func newSession(sid string, client *wm.Client, container *store.Container, log z
 		cancel:     cancel,
 		detach:     func(client *wm.Client, id uint32) { client.RemoveEventHandler(id) },
 		disconnect: func(client *wm.Client) { client.Disconnect() },
+		logout:     func(ctx context.Context, client *wm.Client) error { return client.Logout(ctx) },
 	}
 	s.adopt(client)
 	go s.forward()
@@ -682,7 +689,7 @@ func (s *Session) Disconnect(ctx context.Context) error {
 // next connect has to pair again.
 func (s *Session) Logout(ctx context.Context) error {
 	s.cancelPairing()
-	if err := s.current().Logout(ctx); err != nil {
+	if err := s.logout(ctx, s.current()); err != nil {
 		s.offline()
 		// whatsmeow unlinks the device before it deletes the local one, so an error
 		// after the request went out can mean WhatsApp already accepted the logout, and
@@ -699,20 +706,20 @@ func (s *Session) Logout(ctx context.Context) error {
 		return fmt.Errorf("whatsmeow: log %s out: %w", s.sid, err)
 	}
 	s.offline()
+	// Published as soon as WhatsApp has accepted it, ahead of every local step. From
+	// here the device is revoked whatever this process manages to do next, and that is
+	// the fact the client acts on: putting a database round trip in front of it means a
+	// store that stopped answering leaves the operator looking at a session that was
+	// logged out minutes ago, on credentials WhatsApp threw away.
+	s.emit(protocol.EventSessionLoggedOut, map[string]any{"reason": "logout_requested"})
+
 	if err := s.store.Forget(ctx, s.sid); err != nil {
-		// WhatsApp has already accepted the logout, so the client here is on a deleted
-		// device whatever happens next. Leaving without saying so strands the session on
-		// it until something re-adopts it.
+		// The client here is on a deleted device whatever happens next, and the mapping
+		// still points at it: rebuilding on top of that would hand the fresh client the
+		// very credentials WhatsApp threw away.
 		s.markStale()
 		return err
 	}
-
-	// Published before the rebuild, not after. WhatsApp has revoked the device and the
-	// credentials are gone from the store; that is the fact the client acts on, and
-	// putting a database round trip in front of it means a store that stops answering
-	// leaves the operator looking at a session that was logged out minutes ago.
-	s.emit(protocol.EventSessionLoggedOut, map[string]any{"reason": "logout_requested"})
-
 	if err := s.rebuild(ctx); err != nil {
 		s.markStale()
 		return err

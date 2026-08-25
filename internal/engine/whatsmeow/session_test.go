@@ -1428,3 +1428,46 @@ func TestAPairingReaderStopsWhenTheSessionCloses(t *testing.T) {
 		t.Fatal("a closed session left a pairing reader waiting for good")
 	}
 }
+
+// WhatsApp revokes the device before anything local runs, so from the moment Logout
+// returns the account is unlinked whatever this process manages to do next. Holding the
+// news behind a database round trip means a store that stopped answering leaves the
+// operator looking at a session that was logged out minutes ago, over credentials
+// WhatsApp threw away.
+func TestALogoutWhatsappAcceptedIsPublishedEvenWhenTheCleanupFails(t *testing.T) {
+	t.Parallel()
+
+	session, container := newTestSession(t, "5511999990001")
+	session.logout = func(context.Context, *wm.Client) error { return nil }
+	// The store stops answering the moment after WhatsApp accepted the logout.
+	if err := container.Close(); err != nil {
+		t.Fatalf("Close the store: %v", err)
+	}
+
+	if err := session.Logout(t.Context()); err == nil {
+		t.Fatal("a cleanup that failed was reported as a logout that went through")
+	}
+
+	emission := next(t, session)
+	if emission.Type != protocol.EventSessionLoggedOut {
+		t.Fatalf("published %q, want the account being logged out", emission.Type)
+	}
+	if state := session.state(); state == "open" {
+		t.Fatal("the session still reports itself open over credentials WhatsApp revoked")
+	}
+}
+
+// And the ordinary logout still says so once, in front of the rebuild.
+func TestALogoutThatWentThroughIsPublishedBeforeTheRebuild(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.logout = func(context.Context, *wm.Client) error { return nil }
+
+	if err := session.Logout(t.Context()); err != nil {
+		t.Fatalf("Logout: %v", err)
+	}
+	if emission := next(t, session); emission.Type != protocol.EventSessionLoggedOut {
+		t.Fatalf("published %q, want the account being logged out", emission.Type)
+	}
+}
