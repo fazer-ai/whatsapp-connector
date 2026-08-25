@@ -159,9 +159,9 @@ func (s *Session) Connect(ctx context.Context, req engine.ConnectRequest) error 
 
 	switch req.Pairing {
 	case "resume":
-		return s.resume()
+		return s.resume(ctx)
 	case "qr":
-		return s.pairWithQR()
+		return s.pairWithQR(ctx)
 	case "code":
 		return s.pairWithCode(ctx, req.Phone)
 	default:
@@ -173,7 +173,7 @@ func (s *Session) Connect(ctx context.Context, req engine.ConnectRequest) error 
 // resume reconnects a session that has already paired. Asking to resume one that has
 // not is a client bug rather than a reason to silently start a pairing the operator
 // is not watching for.
-func (s *Session) resume() error {
+func (s *Session) resume(ctx context.Context) error {
 	if phone, _ := s.identity(); phone == "" {
 		return protocol.NewError(protocol.ErrorNotPaired,
 			"this session has not paired, so there is nothing to resume")
@@ -182,11 +182,32 @@ func (s *Session) resume() error {
 	if client.IsConnected() {
 		return nil
 	}
-	if err := client.ConnectContext(s.ctx); err != nil {
+	if err := s.dial(ctx, client); err != nil {
 		return fmt.Errorf("whatsmeow: resume %s: %w", s.sid, err)
 	}
 	s.emit(protocol.EventSessionState, map[string]any{"state": "connecting"})
 	return nil
+}
+
+// dial connects, and stops waiting when the command that asked for it does.
+//
+// The socket belongs to the session and not to the command, so a deadline that passes
+// mid-handshake answers the caller and leaves the dial running: the alternative, handing
+// whatsmeow a context that dies with the RPC, would also kill the reconnect loop it
+// starts from the same one. What the deadline must not do is hold the session's command
+// queue, which is single-file, behind a network round trip nobody is waiting for.
+func (s *Session) dial(ctx context.Context, client *wm.Client) error {
+	dialed := make(chan error, 1)
+	go func() { dialed <- client.ConnectContext(s.ctx) }()
+
+	select {
+	case err := <-dialed:
+		return err
+	case <-ctx.Done():
+		return fmt.Errorf("whatsmeow: %s was still connecting: %w", s.sid, ctx.Err())
+	case <-s.done:
+		return errors.New("whatsmeow: the session closed while it was connecting")
+	}
 }
 
 // pairWithQR connects and publishes the codes WhatsApp issues until one is scanned.
@@ -194,16 +215,15 @@ func (s *Session) resume() error {
 // The channel has to be taken before connecting: it is how whatsmeow reports the
 // outcome of the pairing, and asking for it afterwards misses the first code.
 //
-// It takes no context of its own: pairing outlives the command that started it, running
-// on the session's lifetime until a code is scanned, the codes run out, or Close ends
-// it. Tying it to the command's deadline would cancel the conversation the moment the
-// caller stopped waiting for the first code.
-func (s *Session) pairWithQR() error {
+// The conversation itself outlives the command that started it, running on the
+// session's lifetime until a code is scanned, the codes run out, or Close ends it. Only
+// the wait for the socket honours the command's deadline.
+func (s *Session) pairWithQR(ctx context.Context) error {
 	if phone, _ := s.identity(); phone != "" {
 		// Already paired. A client asking for a QR code here means the operator hit
 		// connect on an inbox that is simply disconnected, and resuming is what they
 		// meant.
-		return s.resume()
+		return s.resume(ctx)
 	}
 
 	client := s.current()
@@ -217,7 +237,7 @@ func (s *Session) pairWithQR() error {
 
 	go s.readPairing(codes)
 
-	if err := client.ConnectContext(s.ctx); err != nil {
+	if err := s.dial(ctx, client); err != nil {
 		s.abandonPairing(client)
 		return fmt.Errorf("whatsmeow: connect %s: %w", s.sid, err)
 	}
@@ -244,7 +264,7 @@ func (s *Session) pairWithCode(ctx context.Context, phone string) error {
 		return protocol.NewError(protocol.ErrorInvalidPayload, "code pairing needs the phone number to pair")
 	}
 	if paired, _ := s.identity(); paired != "" {
-		return s.resume()
+		return s.resume(ctx)
 	}
 
 	client := s.current()
@@ -264,7 +284,7 @@ func (s *Session) pairWithCode(ctx context.Context, phone string) error {
 		s.readPairingWith(codes, func() { close(ready) }, false)
 	}()
 
-	if err := client.ConnectContext(s.ctx); err != nil {
+	if err := s.dial(ctx, client); err != nil {
 		s.abandonPairing(client)
 		return fmt.Errorf("whatsmeow: connect %s: %w", s.sid, err)
 	}
@@ -323,6 +343,12 @@ func (s *Session) Logout(ctx context.Context) error {
 // pairing again, fails on a session the manager is still perfectly happy to run, and
 // the only way out is to release and re-adopt it.
 func (s *Session) rebuild(ctx context.Context) error {
+	if s.isClosed() {
+		// Nothing left to pair with. A session that closed while this was on its way is
+		// one the layer above has already given up.
+		return nil
+	}
+
 	device, err := s.store.Device(ctx, s.sid)
 	if err != nil {
 		return fmt.Errorf("whatsmeow: rebuild %s: %w", s.sid, err)
@@ -364,12 +390,14 @@ func (s *Session) Close() error {
 	if cancel != nil {
 		cancel()
 	}
+	// Cancelled first, and that order is the whole point: whatsmeow holds its socket
+	// lock for the length of a dial, and Disconnect waits for the same lock. Cancelling
+	// afterwards would never run, and a lease handover would wait out the handshake.
+	s.cancel()
+
 	client := s.current()
 	client.RemoveEventHandler(s.handlerID)
 	client.Disconnect()
-	// Cancels the dials the client is in the middle of, so a Close during a handshake
-	// is not a wait behind one.
-	s.cancel()
 
 	close(s.done)
 	s.drain()
@@ -391,6 +419,14 @@ func (s *Session) isClosed() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.closed
+}
+
+// pairingActive reports whether a pairing conversation is open, which is what decides
+// who publishes an outcome both paths are told about.
+func (s *Session) pairingActive() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.pairing != nil
 }
 
 func (s *Session) setPairing(cancel context.CancelFunc) {
@@ -542,7 +578,9 @@ func (s *Session) publishPairing(item wm.QRChannelItem, publishCodes bool) {
 // cancels the pairing, which is the right outcome: a device we cannot attribute is one
 // no restart can find again.
 func (s *Session) bind(jid types.JID, _, _ string) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), bindTimeout)
+	// From the session's own lifetime: a pairing that lands after this instance lost
+	// the account would otherwise overwrite the mapping the new owner is writing.
+	ctx, cancel := context.WithTimeout(s.ctx, bindTimeout)
 	defer cancel()
 
 	if err := s.store.Bind(ctx, s.sid, jid); err != nil {
@@ -579,7 +617,14 @@ func (s *Session) handle(rawEvent any) {
 	case *waEvents.Connected:
 		s.emit(protocol.EventSessionState, s.sessionState())
 	case *waEvents.Disconnected:
-		s.emit(protocol.EventSessionState, map[string]any{"state": "reconnecting", "reason": "disconnected"})
+		// whatsmeow only reconnects a device it has an id for, so a drop before pairing
+		// finishes is the end of that attempt. Reporting it as reconnecting leaves the
+		// dashboard waiting on something nothing is going to do.
+		state := "reconnecting"
+		if phone, _ := s.identity(); phone == "" {
+			state = "close"
+		}
+		s.emit(protocol.EventSessionState, map[string]any{"state": state, "reason": "disconnected"})
 	case *waEvents.LoggedOut:
 		s.loggedOut(event)
 	case *waEvents.StreamReplaced:
@@ -593,6 +638,12 @@ func (s *Session) handle(rawEvent any) {
 		}
 		s.emit(protocol.EventSessionTemporaryBan, map[string]any{"ban": ban})
 	case *waEvents.ClientOutdated:
+		if s.pairingActive() {
+			// The pairing reader publishes this one: whatsmeow delivers it here and to
+			// the QR channel both, and two canonical events for one outcome is worse
+			// than either.
+			return
+		}
 		s.emit(protocol.EventSessionClientOutdated, map[string]any{})
 	case *waEvents.ConnectFailure:
 		s.emit(protocol.EventSessionConnectFailure, map[string]any{
@@ -601,6 +652,9 @@ func (s *Session) handle(rawEvent any) {
 	case *waEvents.PairSuccess:
 		s.paired(event)
 	case *waEvents.PairError:
+		if s.pairingActive() {
+			return
+		}
 		s.emit(protocol.EventPairingError, map[string]any{
 			"reason": "pair_error", "message": errorText(event.Error),
 		})
@@ -615,12 +669,18 @@ func (s *Session) loggedOut(event *waEvents.LoggedOut) {
 	if err := s.store.Forget(ctx, s.sid); err != nil {
 		s.log.Error().Err(err).Msg("failed to forget the device of a session that was logged out")
 	}
-	if err := s.rebuild(ctx); err != nil {
-		s.log.Error().Err(err).Msg("failed to put a logged-out session back on a fresh client")
-	}
 	s.emit(protocol.EventSessionLoggedOut, map[string]any{
 		"reason": event.Reason.String(), "on_connect": event.OnConnect,
 	})
+
+	// Off this goroutine, and that is not a preference: whatsmeow dispatches events
+	// holding its handler lock for read, and rebuilding takes the same lock for write.
+	// Doing it here is a deadlock against ourselves, and the shutdown behind it.
+	go func() {
+		if err := s.rebuild(context.WithoutCancel(s.ctx)); err != nil {
+			s.log.Error().Err(err).Msg("failed to put a logged-out session back on a fresh client")
+		}
+	}()
 }
 
 func (s *Session) paired(event *waEvents.PairSuccess) {

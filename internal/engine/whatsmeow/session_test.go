@@ -133,6 +133,7 @@ func TestHandleTranslatesWhatWhatsappReports(t *testing.T) {
 
 	for name, test := range map[string]struct {
 		event any
+		phone string
 		want  protocol.EventType
 		check func(t *testing.T, payload map[string]any)
 	}{
@@ -145,12 +146,25 @@ func TestHandleTranslatesWhatWhatsappReports(t *testing.T) {
 				}
 			},
 		},
-		"a disconnection": {
+		"a disconnection while paired": {
 			event: &waEvents.Disconnected{},
+			phone: "5511999990001",
 			want:  protocol.EventSessionState,
 			check: func(t *testing.T, payload map[string]any) {
 				if payload["state"] != "reconnecting" {
 					t.Fatalf("state=%v, want reconnecting", payload["state"])
+				}
+			},
+		},
+		// whatsmeow only reconnects a device it has an id for, so a drop before pairing
+		// finishes ends that attempt. Calling it reconnecting leaves the dashboard
+		// waiting on something nothing is going to do.
+		"a disconnection before pairing finished": {
+			event: &waEvents.Disconnected{},
+			want:  protocol.EventSessionState,
+			check: func(t *testing.T, payload map[string]any) {
+				if payload["state"] != "close" {
+					t.Fatalf("state=%v, want close", payload["state"])
 				}
 			},
 		},
@@ -215,7 +229,7 @@ func TestHandleTranslatesWhatWhatsappReports(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			session, _ := newTestSession(t, "")
+			session, _ := newTestSession(t, test.phone)
 
 			session.handle(test.event)
 			emission := next(t, session)
@@ -224,6 +238,32 @@ func TestHandleTranslatesWhatWhatsappReports(t *testing.T) {
 			}
 			if test.check != nil {
 				test.check(t, decode(t, emission.Payload))
+			}
+		})
+	}
+}
+
+// whatsmeow delivers a terminal pairing outcome to every handler, the QR channel's
+// included, so publishing from both paths turns one outcome into two canonical events
+// with two sequence numbers.
+func TestTerminalPairingOutcomesArePublishedOnce(t *testing.T) {
+	t.Parallel()
+
+	for name, event := range map[string]any{
+		"an outdated build": any(&waEvents.ClientOutdated{}),
+		"a failed pairing":  any(&waEvents.PairError{Error: errors.New("no")}),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			session, _ := newTestSession(t, "")
+			session.setPairing(func() {})
+
+			session.handle(event)
+
+			select {
+			case emission := <-session.Events():
+				t.Fatalf("the general handler published %q while a pairing was open", emission.Type)
+			case <-time.After(200 * time.Millisecond):
 			}
 		})
 	}
