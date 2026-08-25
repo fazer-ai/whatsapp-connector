@@ -187,6 +187,19 @@ func (m *Manager) TakeNewlyAdopted() []string {
 	return taken
 }
 
+// ReturnAdopted puts sessions back among the ones waiting to be drained, for a caller
+// that took them and could not finish. They go to the front: they were adopted before
+// anything else on the list, and until their pending commands are taken over nothing
+// newer for them can safely be read.
+func (m *Manager) ReturnAdopted(sids []string) {
+	if len(sids) == 0 {
+		return
+	}
+	m.newlyMu.Lock()
+	m.newly = append(sids, m.newly...)
+	m.newlyMu.Unlock()
+}
+
 // Release stops a session and gives up its lease.
 func (m *Manager) Release(ctx context.Context, sid string) {
 	m.mu.Lock()

@@ -23,6 +23,7 @@ import (
 	"github.com/fazer-ai/whatsapp-connector/internal/redisx"
 	"github.com/fazer-ai/whatsapp-connector/internal/session"
 	"github.com/fazer-ai/whatsapp-connector/internal/store"
+	"github.com/fazer-ai/whatsapp-connector/internal/transport"
 	"github.com/fazer-ai/whatsapp-connector/internal/transport/redisstream"
 )
 
@@ -211,7 +212,33 @@ func (c *Connector) reclaimCommands(ctx context.Context) {
 		}
 		return
 	}
+	c.dispatchWithin(ctx, deliveries)
+}
+
+// dispatchWithin carries out what a reclaim took, and stops when it has spent as long
+// as this goroutine can afford.
+//
+// Reclaimed deliveries are mostly wakes, and a wake is the one command that blocks: it
+// adopts a session, which reads the store. A batch of them can therefore run for
+// several times the adoption bound, on the goroutine that renews every lease this
+// instance holds — and the sessions whose renewals it delays are handed to peers while
+// this instance still holds their sockets open. What is not dispatched is released, so
+// it stays pending and comes back on a later pass.
+func (c *Connector) dispatchWithin(ctx context.Context, deliveries []transport.Delivery) {
+	budget, cancel := context.WithTimeout(ctx, c.cfg.LeaseTTL/3)
+	defer cancel()
+
 	for i := range deliveries {
+		if budget.Err() != nil {
+			for rest := i; rest < len(deliveries); rest++ {
+				if deliveries[rest].Release != nil {
+					deliveries[rest].Release()
+				}
+			}
+			c.log.Warn().Int("left", len(deliveries)-i).
+				Msg("a reclaim pass ran out of its budget; the rest stays pending")
+			return
+		}
 		c.manager.Dispatch(ctx, &deliveries[i])
 	}
 }
@@ -247,32 +274,59 @@ func (c *Connector) windowOver(sids []string) []string {
 	return window
 }
 
+// maxDrainPasses bounds one attempt at emptying a newly adopted session's pending list.
+// A session with more waiting than a few passes can take is one whose remaining entries
+// are better left to the next iteration than paid for on this goroutine all at once.
+const maxDrainPasses = 4
+
 // drainAdopted takes over what the previous owner of a freshly adopted session left
-// pending, before this instance reads anything newer for it.
-func (c *Connector) drainAdopted(ctx context.Context) {
+// pending, and returns the sessions it could not finish.
+//
+// Those must not be read from until they are drained. A pending entry is off the stream
+// until somebody claims it, so a `>` read hands over commands that arrived after it, and
+// per-session order is the one thing that stream is for.
+func (c *Connector) drainAdopted(ctx context.Context) []string {
 	adopted := c.manager.TakeNewlyAdopted()
 	if len(adopted) == 0 {
-		return
+		return nil
 	}
-	deliveries, err := c.streams.ClaimSessions(ctx, adopted)
-	if err != nil {
-		if ctx.Err() == nil {
-			c.log.Error().Err(err).Msg("failed to drain what a newly adopted session had pending")
+
+	for range maxDrainPasses {
+		deliveries, err := c.streams.ClaimSessions(ctx, adopted)
+		if err != nil {
+			if ctx.Err() == nil {
+				c.log.Error().Err(err).Msg("failed to drain what a newly adopted session had pending")
+			}
+			c.manager.ReturnAdopted(adopted)
+			return adopted
 		}
-		return
+		if len(deliveries) == 0 {
+			return nil
+		}
+		// One pass takes at most ReadCount per stream, so a session with a long backlog
+		// needs several before anything newer may be read for it.
+		for i := range deliveries {
+			c.manager.Dispatch(ctx, &deliveries[i])
+		}
 	}
-	for i := range deliveries {
-		c.manager.Dispatch(ctx, &deliveries[i])
-	}
+
+	c.manager.ReturnAdopted(adopted)
+	return adopted
 }
 
 func (c *Connector) readCommands(ctx context.Context) {
 	// Before the read, not after: a session adopted a moment ago may have commands its
 	// previous owner abandoned, and reading `>` for it first would hand over what
 	// arrived later and run it out of order.
-	c.drainAdopted(ctx)
+	undrained := c.drainAdopted(ctx)
 
 	sids := c.manager.SIDs()
+	if len(undrained) > 0 {
+		// Left out of this read rather than skipping the read altogether: the control
+		// stream and every other session carry on, and these come back as soon as their
+		// backlog is taken over.
+		sids = slices.DeleteFunc(sids, func(sid string) bool { return slices.Contains(undrained, sid) })
+	}
 	deliveries, err := c.streams.Read(ctx, sids)
 	if err != nil {
 		if ctx.Err() == nil {

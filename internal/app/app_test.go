@@ -425,3 +425,76 @@ func TestASessionIsDrainedBeforeAnythingNewerIsReadForIt(t *testing.T) {
 		time.Sleep(200 * time.Millisecond)
 	}
 }
+
+// One claim takes at most ReadCount entries per stream, so a session whose previous
+// owner left more than that behind is only half drained by a single pass. Reading `>`
+// after that half hands over commands that arrived later and runs them ahead of the
+// rest, which is the same reordering as draining nothing at all — just harder to see.
+func TestASessionWithALongBacklogIsDrainedBeforeItIsRead(t *testing.T) {
+	server := miniredis.RunT(t)
+	c := newClient(t, server.Addr())
+	ctx := context.Background()
+
+	const sid = "2f1c6f0e-0000-4000-8000-00000000000b"
+	// More than one claim can take, so finishing the drain needs several passes.
+	const backlog = redisstream.DefaultReadCount + 5
+	commands := c.key.Commands(sid)
+
+	if err := c.rdb.XGroupCreateMkStream(ctx, commands, redisstream.ConsumerGroup, "0").Err(); err != nil {
+		t.Fatalf("create the group: %v", err)
+	}
+	for i := range backlog {
+		c.send(ctx, commands, &protocol.Command{
+			V: protocol.Version, ID: "disconnect-" + strconv.Itoa(i), Type: protocol.CommandSessionDisconnect,
+			SID: sid, TS: time.Now().UnixMilli(), Payload: json.RawMessage(`{}`),
+		})
+	}
+	taken, err := c.rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
+		Group: redisstream.ConsumerGroup, Consumer: "inst-dead", Streams: []string{commands, ">"}, Count: backlog,
+	}).Result()
+	if err != nil || len(taken) != 1 || len(taken[0].Messages) != backlog {
+		t.Fatalf("the dead instance read %v (err=%v), want %d commands", taken, err, backlog)
+	}
+
+	// The operator's reconnect, which arrived after every one of them.
+	c.send(ctx, commands, &protocol.Command{
+		V: protocol.Version, ID: "connect-after", Type: protocol.CommandSessionConnect, SID: sid,
+		TS: time.Now().UnixMilli(), ReplyTo: "connect-after", Payload: json.RawMessage(`{"pairing":"resume"}`),
+	})
+	c.send(ctx, c.key.Control(), &protocol.Command{
+		V: protocol.Version, ID: "wake-backlog", Type: protocol.CommandSessionWake, SID: sid,
+		TS: time.Now().UnixMilli(), Payload: json.RawMessage(`{"desired":"connected"}`),
+	})
+
+	connector := start(t, server.Addr(), "inst-a", map[string]string{
+		"WAC_LEASE_TTL": "3s", "WAC_CLAIM_MIN_IDLE": "3500ms",
+	})
+	waitFor(t, "the session to be adopted", func() bool { return connector.Sessions() == 1 })
+
+	if reply := c.await(ctx, "connect-after", 15*time.Second); !reply.OK {
+		t.Fatalf("the connect was refused: %+v", reply)
+	}
+
+	// Held past the reclaim delay: a disconnect left behind by the drain comes back on a
+	// later heartbeat and undoes the connect that replaced it.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		c.send(ctx, commands, &protocol.Command{
+			V: protocol.Version, ID: "status-" + strconv.FormatInt(time.Now().UnixNano(), 10),
+			Type: protocol.CommandSessionStatus, SID: sid, TS: time.Now().UnixMilli(),
+			ReplyTo: "backlog-check", Payload: json.RawMessage(`{}`),
+		})
+		reply := c.await(ctx, "backlog-check", 5*time.Second)
+		if !reply.OK {
+			t.Fatalf("session.status was refused: %+v", reply)
+		}
+		var status map[string]any
+		if err := json.Unmarshal(reply.Result, &status); err != nil {
+			t.Fatalf("unmarshal the status: %v", err)
+		}
+		if status["connection"] != "open" {
+			t.Fatalf("connection=%v after a disconnect the drain left behind came back, want open", status["connection"])
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
