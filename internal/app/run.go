@@ -219,7 +219,7 @@ func newEngine(ctx context.Context, cfg *Config, log zerolog.Logger) (engine.Eng
 	case EngineFake:
 		return fake.New(), nil, nil
 	case EngineWhatsmeow:
-		devices, err := store.Open(ctx, cfg.DatabaseURL)
+		devices, err := store.Open(ctx, cfg.DatabaseURL, log)
 		if err != nil {
 			return nil, nil, err
 		}

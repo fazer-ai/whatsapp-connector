@@ -355,7 +355,8 @@ func newTestSession(t *testing.T, phone string) (*Session, *store.Container) {
 		t.Fatalf("Device: %v", err)
 	}
 	if phone != "" {
-		jid, err := types.ParseJID(phone + "@" + types.DefaultUserServer)
+		// A companion device JID, the way WhatsApp issues one.
+		jid, err := types.ParseJID(phone + ":12@" + types.DefaultUserServer)
 		if err != nil {
 			t.Fatalf("ParseJID: %v", err)
 		}
@@ -382,8 +383,8 @@ func newTestSession(t *testing.T, phone string) (*Session, *store.Container) {
 func openStore(t *testing.T) *store.Container {
 	t.Helper()
 
-	address := "file:" + filepath.Join(t.TempDir(), "wac.db") + "?_pragma=foreign_keys(1)"
-	container, err := store.Open(t.Context(), address)
+	address := "sqlite:" + filepath.Join(t.TempDir(), "wac.db")
+	container, err := store.Open(t.Context(), address, zerolog.Nop())
 	if err != nil {
 		t.Fatalf("Open the store: %v", err)
 	}
