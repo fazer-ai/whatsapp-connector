@@ -413,9 +413,9 @@ func TestAReclaimDispatchesOnWhatIsLeftOfItsOwnDeadline(t *testing.T) {
 	t.Parallel()
 
 	// The heartbeat is split between the control pass and the session window, so what
-	// bounds this dispatch is a quarter of it. Sized so the slow claim spends half of
-	// that quarter and leaves the other half visibly short of a fresh budget.
-	const heartbeat = 1200 * time.Millisecond
+	// bounds this dispatch is half of it. Sized so the slow claim spends half of that
+	// half and leaves the other half visibly short of a fresh budget.
+	const heartbeat = 600 * time.Millisecond
 	const slowClaim = 150 * time.Millisecond
 
 	server := miniredis.RunT(t)
@@ -483,7 +483,7 @@ func TestAReclaimDispatchesOnWhatIsLeftOfItsOwnDeadline(t *testing.T) {
 	if !ok {
 		t.Fatal("nothing was dispatched, so there is no deadline to look at")
 	}
-	if budget := heartbeat / reclaimPasses / 2; left > budget-slowClaim/2 {
+	if budget := heartbeat / reclaimPasses; left > budget-slowClaim/2 {
 		t.Fatalf("dispatch was given %s, which is a fresh budget rather than what was left of the pass's %s",
 			left, budget)
 	}

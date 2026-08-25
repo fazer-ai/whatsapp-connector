@@ -394,7 +394,11 @@ func (m *Manager) wake(ctx context.Context, delivery *transport.Delivery) {
 		// stopped the adoption — a database that was away, a store that could not be
 		// read — may well be over by the time this is reclaimed.
 		m.log.Error().Err(err).Str("sid", sid).Msg("failed to adopt a woken session; leaving the wake pending")
-		release(delivery)
+		// Forfeited rather than released: this instance took its turn at it. Keeping the
+		// age would put it back at the head of the pending list, where this instance
+		// takes it first again on the next pass, and again — and the wakes behind it,
+		// which are the sessions nobody is running either, would never get a turn.
+		forfeit(delivery)
 		return
 	}
 	m.ack(ctx, delivery)
@@ -431,6 +435,17 @@ func release(delivery *transport.Delivery) {
 	if delivery.Release != nil {
 		delivery.Release()
 	}
+}
+
+// forfeit gives a command back the way an instance that tried it and failed gives it
+// back: still pending, but without the place in the queue that a command nobody has
+// touched keeps.
+func forfeit(delivery *transport.Delivery) {
+	if delivery.Forfeit != nil {
+		delivery.Forfeit()
+		return
+	}
+	release(delivery)
 }
 
 func (m *Manager) ack(ctx context.Context, delivery *transport.Delivery) {

@@ -604,6 +604,113 @@ func TestAClaimedCommandHandedBackKeepsItsAge(t *testing.T) {
 	}
 }
 
+// An instance that took its turn at a command and could not run it gives it back the
+// other way. Keeping the age puts it at the head of the pending list, which is where the
+// next claim takes it from — so an instance that keeps failing on it takes it first every
+// pass, spends the pass on it, and the entries behind it never get a turn at all. For a
+// wake that is every other session nobody is running.
+func TestAForfeitedCommandGivesUpItsPlaceInTheQueue(t *testing.T) {
+	t.Parallel()
+
+	const minIdle = 10 * time.Second
+	f := newFleet(t)
+	patient, err := redisstream.New(f.client, redisstream.Options{
+		Instance: "inst-alive", Block: 50 * time.Millisecond, ClaimMinIdle: minIdle,
+	})
+	if err != nil {
+		t.Fatalf("redisstream.New: %v", err)
+	}
+	dead := f.streams(t, "inst-dead")
+	ctx := context.Background()
+
+	if _, err := dead.Read(ctx, []string{"s1"}); err != nil {
+		t.Fatalf("priming Read: %v", err)
+	}
+	writeCommand(t, f, f.client.Keys().Commands("s1"), command("c1", "s1", "c1"))
+	if taken, err := dead.Read(ctx, []string{"s1"}); err != nil || len(taken) != 1 {
+		t.Fatalf("the first instance read %d commands (err=%v), want 1", len(taken), err)
+	}
+	clock := time.Now().UTC()
+	tick := func(d time.Duration) { clock = clock.Add(d); f.server.SetTime(clock) }
+	tick(minIdle + time.Second)
+
+	claimed, err := patient.Claim(ctx, []string{"s1"})
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("Claim returned %d commands (err=%v), want 1", len(claimed), err)
+	}
+	if claimed[0].Forfeit == nil {
+		t.Fatal("a claimed command came back with no way to give up its age")
+	}
+	claimed[0].Forfeit()
+	tick(time.Millisecond)
+
+	// The claim erased its age and the forfeit did not put it back, so it waits out the
+	// delay from here, the way a command whose instance died does.
+	again, err := patient.Claim(ctx, []string{"s1"})
+	if err != nil {
+		t.Fatalf("the second Claim: %v", err)
+	}
+	if len(again) != 0 {
+		t.Fatalf("a forfeited command was taken again straight away (%d), so nothing behind it moves", len(again))
+	}
+
+	// Still pending, though: forfeiting is not acknowledging, and the command runs once
+	// the delay is out.
+	tick(minIdle + time.Second)
+	later, err := patient.Claim(ctx, []string{"s1"})
+	if err != nil || len(later) != 1 {
+		t.Fatalf("the third Claim returned %d commands (err=%v), want the forfeited command back", len(later), err)
+	}
+	if later[0].Command.ID != "c1" {
+		t.Fatalf("claimed command id = %q, want c1", later[0].Command.ID)
+	}
+}
+
+// A read entry starts at zero idle and nothing moves it, so one this instance gives back
+// unrun is invisible to both halves of this transport: `>` returns only what no consumer
+// has taken, and a claim will not look at it until a whole delay has passed. A command
+// carrying a deadline shorter than that expires without ever having been tried.
+func TestAReadCommandGivenBackIsReclaimableAtOnce(t *testing.T) {
+	t.Parallel()
+
+	const minIdle = 10 * time.Second
+	f := newFleet(t)
+	streams, err := redisstream.New(f.client, redisstream.Options{
+		Instance: "inst-alive", Block: 50 * time.Millisecond, ClaimMinIdle: minIdle,
+	})
+	if err != nil {
+		t.Fatalf("redisstream.New: %v", err)
+	}
+	ctx := context.Background()
+
+	if _, err := streams.Read(ctx, []string{"s1"}); err != nil {
+		t.Fatalf("priming Read: %v", err)
+	}
+	writeCommand(t, f, f.client.Keys().Commands("s1"), command("c1", "s1", "c1"))
+	read, err := streams.Read(ctx, []string{"s1"})
+	if err != nil || len(read) != 1 {
+		t.Fatalf("Read returned %d commands (err=%v), want 1", len(read), err)
+	}
+
+	clock := time.Now().UTC()
+	tick := func(d time.Duration) { clock = clock.Add(d); f.server.SetTime(clock) }
+
+	// The batch ran out of its budget before this one was dispatched.
+	read[0].Release()
+	tick(time.Millisecond)
+
+	again, err := streams.Claim(ctx, []string{"s1"})
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if len(again) != 1 {
+		t.Fatalf("a read command given back unrun came back %d times, want 1: it is waiting out the whole delay", len(again))
+	}
+	if again[0].Command.ID != "c1" {
+		t.Fatalf("claimed command id = %q, want c1", again[0].Command.ID)
+	}
+}
+
 // And what is being carried out keeps its zero: putting an age back on an entry this
 // process is still running is how a peer comes to run it alongside.
 func TestAgeIsNotPutBackOnWhatIsStillRunning(t *testing.T) {

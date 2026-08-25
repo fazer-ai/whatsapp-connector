@@ -484,10 +484,12 @@ func TestAWakeThatCouldNotBeAdoptedStaysPending(t *testing.T) {
 		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
 	})
 
-	acked := false
+	acked, released, forfeited := false, false, false
 	delivery := &transport.Delivery{
 		Command: protocol.Command{V: protocol.Version, ID: "c1", Type: protocol.CommandSessionWake, SID: "s1"},
 		Ack:     func(context.Context) error { acked = true; return nil },
+		Release: func() { released = true },
+		Forfeit: func() { forfeited = true },
 	}
 	manager.Dispatch(context.Background(), delivery)
 
@@ -496,6 +498,13 @@ func TestAWakeThatCouldNotBeAdoptedStaysPending(t *testing.T) {
 	}
 	if got := manager.Count(); got != 0 {
 		t.Fatalf("the manager runs %d sessions after a refused adoption", got)
+	}
+	// Given back the way an instance that took its turn gives it back. Released instead,
+	// it keeps the age that makes it the oldest entry pending, so this instance takes it
+	// first on the next pass, and again — and every wake behind it, which is every other
+	// session nobody is running, never gets a turn.
+	if released || !forfeited {
+		t.Fatalf("the wake was released=%v forfeited=%v, want forfeited", released, forfeited)
 	}
 }
 

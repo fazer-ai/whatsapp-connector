@@ -39,6 +39,19 @@ type Delivery struct {
 	// that is still running; never reclaiming the second loses it for good in a fleet
 	// of one.
 	Release func()
+	// Forfeit is Release for a command this instance took its turn at and could not
+	// carry out. Both leave it pending; what differs is where it comes back.
+	//
+	// A reclaimed entry has the age the claim erased put back by Release, so a peer can
+	// take it at once rather than waiting the delay a second time. An entry that keeps
+	// its age is the oldest one on every pass, though, so an instance that fails on it
+	// takes it first again next pass, and again — and the entries behind it, which is
+	// every other wake, never get their turn. Forfeit gives that place up: the entry
+	// waits out the reclaim delay like a command whose instance died, which is what one
+	// this instance tried and could not run has come to resemble.
+	//
+	// Nil where the delivery has no age to give up, and then Release is the whole story.
+	Forfeit func()
 }
 
 // CommandReader delivers the commands addressed to the sessions this instance owns,

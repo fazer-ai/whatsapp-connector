@@ -189,7 +189,19 @@ func (s *Streams) Read(ctx context.Context, sids []string) ([]transport.Delivery
 		}
 		return nil, fmt.Errorf("redisstream: read commands: %w", err)
 	}
-	return s.deliveries(result), nil
+	var out []transport.Delivery
+	for _, stream := range result {
+		taken, ids := s.deliveriesWithIDs([]redis.XStream{stream})
+		// A read entry starts at zero idle and stays there until somebody touches it, so
+		// one this instance gives back unrun is claimable by nobody — not by `>`, which
+		// returns only what no consumer has taken, and not by a claim, which will not
+		// look at it for a whole delay. Recording the delay as its age has the next
+		// reclaim see it instead, which for a command carrying a deadline is the
+		// difference between running late and expiring unrun.
+		s.rememberAge(stream.Stream, s.opts.ClaimMinIdle, taken, ids)
+		out = append(out, taken...)
+	}
+	return out, nil
 }
 
 // Claim takes over commands another instance read and never acknowledged, which is
@@ -358,13 +370,19 @@ func (s *Streams) claim(ctx context.Context, streams []string, minIdle time.Dura
 	return claimed, nil
 }
 
-// rememberAge has each delivery record, if it is given back unrun, the age this claim
-// has just erased. A claim with no minimum idle takes nothing worth putting back: those
-// entries are fresh, and the drain that took them asks for them again with no delay.
+// rememberAge has each delivery record, if it is given back unrun, the age it should
+// come back with. For a claim that is the age the claim erased; for a read it is the
+// reclaim delay itself, because a read entry has no age to erase and one given back
+// would otherwise be invisible to both halves of this transport: `>` returns only what
+// nobody has taken, and a claim will not look at it until the delay has passed.
+//
+// Forfeit is the same release without the record, which is what an instance that took
+// its turn and failed gives back.
 func (s *Streams) rememberAge(stream string, idle time.Duration, deliveries []transport.Delivery, ids []string) {
 	for i := range deliveries {
 		id := ids[i]
 		release := deliveries[i].Release
+		deliveries[i].Forfeit = release
 		deliveries[i].Release = func() {
 			if release != nil {
 				release()
@@ -461,14 +479,9 @@ func (s *Streams) sessionStreams(sids []string) []string {
 	return streams
 }
 
-func (s *Streams) deliveries(result []redis.XStream) []transport.Delivery {
-	out, _ := s.deliveriesWithIDs(result)
-	return out
-}
-
-// deliveriesWithIDs is deliveries plus the stream entry each one came from, which a
-// claim needs to say what it took: the ids line up with the deliveries, and a frame that
-// could not be read is in neither.
+// deliveriesWithIDs is the deliveries plus the stream entry each one came from, which
+// both callers need to say what they took: the ids line up with the deliveries, and a
+// frame that could not be read is in neither.
 func (s *Streams) deliveriesWithIDs(result []redis.XStream) (out []transport.Delivery, ids []string) {
 	for _, stream := range result {
 		for _, message := range stream.Messages {

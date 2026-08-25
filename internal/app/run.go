@@ -218,9 +218,12 @@ func (c *Connector) reclaimCommands(ctx context.Context) {
 //
 // So: a window of streams rather than all of them, moving on each pass so every session
 // is reached within a few heartbeats, and a deadline that leaves the two passes together
-// well inside the heartbeat.
+// inside one heartbeat. One heartbeat is the figure the adoption bound is already sized
+// against — a single adoption may delay one renewal and no more — so this is the largest
+// the reclaim can be without moving that line, and cutting it further only means an
+// adoption that never reaches the bound it was given.
 func (c *Connector) reclaimPass(ctx context.Context, take func(context.Context) ([]transport.Delivery, error)) {
-	pass, cancel := context.WithTimeout(ctx, c.cfg.Heartbeat/reclaimPasses/2)
+	pass, cancel := context.WithTimeout(ctx, c.cfg.Heartbeat/reclaimPasses)
 	defer cancel()
 
 	deliveries, err := take(pass)
