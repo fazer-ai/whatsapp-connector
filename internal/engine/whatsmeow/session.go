@@ -90,6 +90,10 @@ type Session struct {
 	// the real bound; nothing else changes it.
 	storeLimit time.Duration
 
+	// deliverWait bounds how long an inbound message waits to hear that its event was
+	// published. A field for the same reason as storeLimit, and for no other.
+	deliverWait time.Duration
+
 	// transition serialises a change to the socket's state with the event announcing
 	// it. It is not mu: emit can block on a full inbox, and holding the session's own
 	// lock across that would stop everything that reads state, Close included.
@@ -184,7 +188,8 @@ func newSession(sid string, client *wm.Client, container *store.Container, log z
 		nonce:      sessionNonce(),
 		logout:     func(ctx context.Context, client *wm.Client) error { return client.Logout(ctx) },
 
-		storeLimit: bindTimeout,
+		storeLimit:  bindTimeout,
+		deliverWait: deliverTimeout,
 	}
 	s.adopt(client)
 	go s.forward()
@@ -1571,9 +1576,11 @@ func pairingFailureMessage(reason string) string {
 func (s *Session) handle(rawEvent any) bool {
 	switch event := rawEvent.(type) {
 	case *waEvents.Message:
-		// M2 brings these. Refusing the ack is what keeps them on the phone until then.
-		s.log.Debug().Msg("refusing to acknowledge an inbound message this build cannot publish")
-		return false
+		// The one handler that blocks, and the only place the ack invariant is decided:
+		// WhatsApp is told the account has the message after the client does, never
+		// before. Everything this build cannot render yet is still refused, which is
+		// what keeps it on the phone for a later milestone.
+		return s.receive(event)
 	case *waEvents.Connected:
 		// whatsmeow dispatches from whichever goroutine produced the event, so a
 		// Disconnected and the Connected that follows it can be handled at the same

@@ -212,6 +212,7 @@ func (s *Session) publish(ctx context.Context, emission engine.Emission) {
 		// cannot recover from. Dropping it costs an event; the new owner republishes
 		// the state it finds.
 		s.log.Warn().Str("type", string(emission.Type)).Msg("dropped an emission from a session owned elsewhere")
+		settle(emission, errLostOwnership)
 		return
 	}
 
@@ -227,8 +228,25 @@ func (s *Session) publish(ctx context.Context, emission engine.Emission) {
 		Inst:    s.instance,
 		Payload: emission.Payload,
 	}
-	if err := s.publisher.Publish(ctx, &event); err != nil && ctx.Err() == nil {
+	err := s.publisher.Publish(ctx, &event)
+	if err != nil && ctx.Err() == nil {
 		s.log.Error().Err(err).Str("type", string(emission.Type)).Msg("failed to publish an event")
+	}
+	settle(emission, err)
+}
+
+// errLostOwnership is what an emission dropped for a session this instance no longer
+// owns settles with. The engine waiting on it has to hear something: an inbound
+// message whose callback never fires is one WhatsApp is never told about either way,
+// and the session would sit there until it timed out rather than letting the account
+// be redelivered to whoever owns it now.
+var errLostOwnership = errors.New("session: dropped an emission from a session owned elsewhere")
+
+// settle reports a publish outcome to an engine that asked for one. Most emissions do
+// not: they are things the client is told about, not things WhatsApp is waiting on.
+func settle(emission engine.Emission, err error) {
+	if emission.Settle != nil {
+		emission.Settle(err)
 	}
 }
 

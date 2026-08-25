@@ -221,6 +221,29 @@ func (s *Session) Close() error {
 // or a disconnection that nothing above asked for.
 func (s *Session) Emit(eventType protocol.EventType, payload any) { s.emit(eventType, payload) }
 
+// EmitDurable publishes an emission that wants to hear what became of it, which is the
+// shape a real engine uses for anything WhatsApp is holding an acknowledgement on. The
+// callback is what a test asserts against: it is the only place the layer above says
+// out loud whether the client can be assumed to have the event.
+func (s *Session) EmitDurable(eventType protocol.EventType, payload any, settle func(error)) {
+	body, err := marshal(payload)
+	if err != nil {
+		settle(err)
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		settle(errors.New("fake: session is closed"))
+		return
+	}
+	select {
+	case s.events <- engine.Emission{Type: eventType, Payload: body, Settle: settle}:
+	default:
+		settle(errors.New("fake: nobody is reading the emissions"))
+	}
+}
+
 func (s *Session) emit(eventType protocol.EventType, payload any) {
 	body, err := marshal(payload)
 	if err != nil {

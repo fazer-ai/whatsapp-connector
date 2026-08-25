@@ -165,9 +165,10 @@ func TestLiveHangUpAndBack(t *testing.T) {
 	}
 }
 
-// TestLiveListen holds a paired session open and prints what arrives. It asserts
-// nothing beyond the connection staying up: it is the phase where a human sends
-// messages from another phone and reads the log.
+// TestLiveListen holds a paired session open and waits for a real message. A human
+// sends a text from another phone, and the phase passes only if it comes back out as
+// the event the contract names: it is the one check that the whole inbound path works
+// against WhatsApp rather than against a fixture.
 func TestLiveListen(t *testing.T) {
 	window := 2 * time.Minute
 	if raw := os.Getenv("WAC_LIVE_SECONDS"); raw != "" {
@@ -186,8 +187,26 @@ func TestLiveListen(t *testing.T) {
 	}
 	events.awaitState(t, "open", 2*time.Minute)
 
-	t.Logf("listening for %s; send a message to the paired number now", window)
-	time.Sleep(window)
+	fmt.Fprintf(os.Stderr, "send a text to the paired number now; waiting up to %s\n", window)
+	received := events.await(t, protocol.EventMessageReceived, window)
+
+	var body struct {
+		Message struct {
+			ID      string                      `json:"id"`
+			Chat    struct{ Kind, ID string }   `json:"chat"`
+			Content struct{ Type, Body string } `json:"content"`
+		} `json:"message"`
+	}
+	if err := json.Unmarshal(received.Payload, &body); err != nil {
+		t.Fatalf("unmarshal the message: %v", err)
+	}
+	if body.Message.ID == "" || body.Message.Chat.ID == "" {
+		t.Fatalf("the message arrived without an id or a chat: %s", received.Payload)
+	}
+	if body.Message.Content.Type != "text" || body.Message.Content.Body == "" {
+		t.Fatalf("the message arrived without a text body: %s", received.Payload)
+	}
+	t.Logf("received %q from %s:%s", body.Message.Content.Body, body.Message.Chat.Kind, body.Message.Chat.ID)
 
 	if state := session.state(); state != "open" {
 		t.Fatalf("the session did not stay up: state=%s", state)
@@ -315,6 +334,13 @@ func watch(t *testing.T, session *Session) *recorder {
 	go func() {
 		for emission := range session.Events() {
 			r.record(emission)
+			// This harness stands in for the publisher, so it owes the same answer:
+			// an inbound message waits here for word that its event landed, and a
+			// reader that only drains the channel leaves every one of them stalled
+			// until the session gives up and refuses the acknowledgement.
+			if emission.Settle != nil {
+				emission.Settle(nil)
+			}
 			select {
 			case r.seen <- emission:
 			default:
