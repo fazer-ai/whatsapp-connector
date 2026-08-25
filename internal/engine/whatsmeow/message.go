@@ -68,13 +68,6 @@ func addressOf(jid waTypes.JID) (protocol.Address, bool) {
 // that only ever stored the phone number still has to recognise the LID as the same
 // person the first time a chat switches.
 func partyOf(info *waTypes.MessageInfo) (*protocol.Party, bool) {
-	if info.Sender.IsEmpty() && info.SenderAlt.IsEmpty() {
-		// A chat with no per-message sender, which is what a newsletter post is. The
-		// contract makes `sender` nullable for exactly this, so there is nothing wrong
-		// with the message and nothing to attribute it to.
-		return nil, true
-	}
-
 	party := protocol.Party{PushName: info.PushName}
 	if info.VerifiedName != nil {
 		party.VerifiedName = info.VerifiedName.Details.GetVerifiedName()
@@ -88,14 +81,22 @@ func partyOf(info *waTypes.MessageInfo) (*protocol.Party, bool) {
 			party.LID = address.ID
 		}
 	}
-	if party.Phone == "" && party.LID == "" {
-		// WhatsApp named a sender and the contract has no way to say who it is. Leaving
-		// the field off would publish the message anyway, and a client reading an
-		// unattributed message in a direct chat takes it for the person on the other
-		// side of it, which puts somebody else's words in their mouth.
-		return nil, false
+	if party.Phone != "" || party.LID != "" {
+		return &party, true
 	}
-	return &party, true
+
+	// Nobody to name, and the two reasons this happens could not be further apart.
+	if info.Sender == info.Chat {
+		// The chat posting as itself, which is what a newsletter is: whatsmeow sets the
+		// sender to the channel's own JID, and a channel is not a person in a
+		// conversation. The contract makes `sender` nullable for exactly this.
+		return nil, true
+	}
+	// WhatsApp named somebody the contract has no way to describe. Leaving the field
+	// off would publish the message anyway, and a client reading an unattributed
+	// message in a direct chat takes it for the person on the other side of it, which
+	// puts somebody else's words in their mouth.
+	return nil, false
 }
 
 // inboundOf renders an inbound message the way the contract carries it, and reports

@@ -125,25 +125,39 @@ func TestASenderTheContractCannotNameStopsTheMessageRatherThanGoingOutEmpty(t *t
 	}
 }
 
-// The other half: a chat that has no per-message sender at all. A newsletter post is
-// the ordinary case, and the contract makes `sender` nullable for it, so the message is
-// fine and there is simply nobody to attribute it to.
-func TestAChatWithNoSenderPublishesTheMessageWithoutOne(t *testing.T) {
+// The other half, and the one that decides whether a whole chat type works at all.
+// whatsmeow sets a newsletter post's sender to the channel's own JID rather than
+// leaving it empty, so a rule written around an absent sender withholds every post a
+// channel ever publishes and has WhatsApp redeliver them for good.
+func TestANewsletterPostIsPublishedWithNoSenderToAttributeItTo(t *testing.T) {
 	t.Parallel()
 
-	info := &waTypes.MessageInfo{
-		MessageSource: waTypes.MessageSource{
-			Chat: waTypes.NewJID("120363111111111111", waTypes.NewsletterServer),
+	channel := waTypes.NewJID("120363111111111111", waTypes.NewsletterServer)
+	event := &waEvents.Message{
+		Info: waTypes.MessageInfo{
+			ID:        "3EB0NEWS",
+			Timestamp: time.UnixMilli(1755000002000),
+			MessageSource: waTypes.MessageSource{
+				// The channel is both ends of it, which is how whatsmeow reports one.
+				Chat:   channel,
+				Sender: channel,
+			},
 		},
+		Message: &waE2E.Message{Conversation: proto.String("edição de hoje")},
 	}
 
-	party, named := partyOf(info)
-	if !named {
-		t.Fatal("a chat with no sender was refused, and the contract allows one")
+	message, ok := inboundOf(event)
+	if !ok {
+		t.Fatal("a newsletter post was withheld, so the channel would redeliver it for good")
 	}
-	if party != nil {
-		t.Fatalf("a chat with no sender invented %+v", party)
+	if message.Sender != nil {
+		t.Fatalf("a newsletter post invented a sender: %+v", message.Sender)
 	}
+	if message.Chat.Kind != protocol.AddressNewsletter {
+		t.Fatalf("the post is addressed to %+v, want the newsletter", message.Chat)
+	}
+
+	validateInboundAgainstContract(t, &message)
 }
 
 func TestAPlainTextMessageIsRenderedTheWayTheContractCarriesIt(t *testing.T) {
