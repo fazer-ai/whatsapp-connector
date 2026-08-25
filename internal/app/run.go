@@ -89,7 +89,9 @@ func New(cfg *Config, log zerolog.Logger) (*Connector, error) {
 		return nil, err
 	}
 
-	streams, err := redisstream.New(client, redisstream.Options{Instance: cfg.Instance, ClaimMinIdle: cfg.ClaimMinIdle})
+	streams, err := redisstream.New(client, redisstream.Options{
+		Instance: cfg.Instance, ClaimMinIdle: cfg.ClaimMinIdle, Block: ReadBlock(cfg.Heartbeat),
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -244,6 +246,17 @@ func (c *Connector) reclaimPass(ctx context.Context, take func(context.Context) 
 // for. The configuration is checked against it, because it is the renewal that follows
 // the batch that has to still be inside the lease.
 const dispatchShare = 3
+
+// readBlockShare is the fraction of a heartbeat a read may wait on Redis for. Derived
+// rather than fixed, because it is the same goroutine again: a read that blocks past the
+// tick delays every renewal behind it by however long it blocked, and a fixed five
+// seconds is most of a heartbeat on one deployment and none of it on another.
+const readBlockShare = 2
+
+// ReadBlock is how long the transport waits for a command before answering "nothing this
+// round". Exported because the configuration is checked against it and the check has to
+// be the same arithmetic as the wiring.
+func ReadBlock(heartbeat time.Duration) time.Duration { return heartbeat / readBlockShare }
 
 // budget is how long one batch of commands may hold the loop. It is a third of the
 // lease, so a batch that spends all of it still leaves two thirds for the renewal that

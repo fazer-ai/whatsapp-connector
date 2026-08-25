@@ -1752,6 +1752,62 @@ func TestConnectRefusesTheOptionsThisBuildDoesNotCarryOut(t *testing.T) {
 	}
 }
 
+// A manual disconnect is followed by no Disconnected, so the guard that refuses the
+// Connected whatsmeow had already queued has to come off for the next connect — and the
+// state that decides whether that connect dials has to be read in the same breath.
+// Read afterwards, the queued Connected lands in between: the guard is down, so it is
+// announced rather than refused, and the resume is told the session is already open over
+// a socket that is down for good, with nothing arriving later to say otherwise.
+func TestDroppingTheHangUpGuardAndReadingTheStateIsOneStep(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setConnected(true)
+	session.settleHangUp()
+	if emission := next(t, session); emission.Type != protocol.EventSessionState {
+		t.Fatalf("published %q, want the socket coming down", emission.Type)
+	}
+
+	// The Connected handler takes this for the length of the transition it announces, so
+	// holding it here is the queued event caught mid-flight.
+	session.transition.Lock()
+	standing := make(chan string, 1)
+	go func() { standing <- session.dropHangUp() }()
+
+	select {
+	case state := <-standing:
+		t.Fatalf("the guard came down and answered %q without waiting for the transition in flight", state)
+	case <-time.After(100 * time.Millisecond):
+	}
+	session.transition.Unlock()
+
+	if state := <-standing; state != "close" {
+		t.Fatalf("the connect was handed %q for a socket the operator closed, so it will not dial", state)
+	}
+}
+
+// And the guard still does its job on the way through: a Connected the library had queued
+// before the disconnect completed is answered by closing that socket, not by announcing
+// it.
+func TestAConnectQueuedBehindADisconnectIsStillRefused(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setConnected(true)
+	session.settleHangUp()
+	drain(t, session)
+
+	session.handle(&waEvents.Connected{})
+	if state := session.dropHangUp(); state != "close" {
+		t.Fatalf("the connect was handed %q over a socket that is down", state)
+	}
+	select {
+	case emission := <-session.Events():
+		t.Fatalf("published %q for a socket the operator had already closed", emission.Type)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
 // whatsmeow dispatches Disconnected from a goroutine of its own, so a remote drop that
 // landed just before a disconnect completed is handled just after it. Taking it at face
 // value publishes `reconnecting` on top of the `close` that settled, for a socket

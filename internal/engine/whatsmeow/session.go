@@ -404,23 +404,26 @@ func (s *Session) Connect(ctx context.Context, req engine.ConnectRequest) error 
 		return err
 	}
 
-	// Cleared here and not on the way in. hungUp is what rejects a Connected event the
+	// Dropped here and not on the way in. hungUp is what rejects a Connected event the
 	// library had already queued when a manual disconnect completed, and a manual
 	// disconnect is followed by no Disconnected event to undo it. A request refused
 	// above would have dropped the guard and left that stale event free to report a
 	// session that is down as open, with nothing arriving later to correct it.
-	s.mu.Lock()
-	s.hungUp = false
-	s.mu.Unlock()
+	//
+	// The state comes back with it because the two are one decision. Asked separately,
+	// the queued Connected lands in between: the guard is down, so it is announced rather
+	// than refused, and the resume below is then told the session is already open — over
+	// a socket that is down for good, and with nothing arriving later to say so.
+	standing := s.dropHangUp()
 
 	var err error
 	switch req.Pairing {
 	case "resume":
-		err = s.resume(ctx)
+		err = s.resume(ctx, standing)
 	case "qr":
-		err = s.pairWithQR(ctx)
+		err = s.pairWithQR(ctx, standing)
 	default:
-		err = s.pairWithCode(ctx, req.Phone)
+		err = s.pairWithCode(ctx, req.Phone, standing)
 	}
 	if err != nil && s.state() == "close" {
 		// Refused before anything was opened: a resume on a session that never paired, a
@@ -463,12 +466,12 @@ func (s *Session) awaitHangUp(ctx context.Context) error {
 // resume reconnects a session that has already paired. Asking to resume one that has
 // not is a client bug rather than a reason to silently start a pairing the operator
 // is not watching for.
-func (s *Session) resume(ctx context.Context) error {
+func (s *Session) resume(ctx context.Context, state string) error {
 	if phone, _ := s.identity(); phone == "" {
 		return protocol.NewError(protocol.ErrorNotPaired,
 			"this session has not paired, so there is nothing to resume")
 	}
-	if state := s.state(); state == "open" || state == "connecting" || state == "reconnecting" {
+	if state == "open" || state == "connecting" || state == "reconnecting" {
 		// whatsmeow is already on it. Dialling alongside its retry loses the race about
 		// half the time and answers the caller with `ErrAlreadyConnected` for a socket
 		// that was recovering perfectly well.
@@ -563,12 +566,14 @@ func (s *Session) awaitDetachedDial(dialed <-chan error, onDetached func(error))
 // The conversation itself outlives the command that started it, running on the
 // session's lifetime until a code is scanned, the codes run out, or Close ends it. Only
 // the wait for the socket honours the command's deadline.
-func (s *Session) pairWithQR(ctx context.Context) error {
+// `standing` is the state as it stood when the guard came off, which is what a resume
+// from here has to decide on: see dropHangUp.
+func (s *Session) pairWithQR(ctx context.Context, standing string) error {
 	if phone, _ := s.identity(); phone != "" {
 		// Already paired. A client asking for a QR code here means the operator hit
 		// connect on an inbox that is simply disconnected, and resuming is what they
 		// meant.
-		return s.resume(ctx)
+		return s.resume(ctx, standing)
 	}
 
 	client := s.current()
@@ -723,7 +728,7 @@ func digitsOf(phone string) string {
 // whatsmeow needs the socket up before it can ask, and it reports readiness by putting
 // the first QR code on the pairing channel. Waiting for that is what makes the request
 // land on an established connection rather than a sleep that is usually long enough.
-func (s *Session) pairWithCode(ctx context.Context, rawPhone string) error {
+func (s *Session) pairWithCode(ctx context.Context, rawPhone, standing string) error {
 	// whatsmeow strips everything that is not a digit before it asks, so a number typed
 	// with a plus and spaces pairs perfectly well. The number this session then reports
 	// has to be the one it actually paired: `pairing.code` promises digits, and a client
@@ -733,7 +738,7 @@ func (s *Session) pairWithCode(ctx context.Context, rawPhone string) error {
 		return protocol.NewError(protocol.ErrorInvalidPayload, "code pairing needs the phone number to pair")
 	}
 	if paired, _ := s.identity(); paired != "" {
-		return s.resume(ctx)
+		return s.resume(ctx, standing)
 	}
 
 	client := s.current()
@@ -872,6 +877,24 @@ func (s *Session) settleLogout() {
 
 	s.refuseLateConnect()
 	s.offline()
+}
+
+// dropHangUp takes the guard down and answers with the state as it stood at that moment.
+//
+// One step, under transition, because a caller that drops the guard and then asks
+// separately can be answered by the very event the guard was there to refuse. Held
+// across both, a Connected the library had queued for the old socket is either handled
+// entirely before — refused, and the socket it came from closed — or entirely after,
+// by which point this request has already decided to dial and the worst it costs is a
+// second `open` behind the first.
+func (s *Session) dropHangUp() string {
+	s.transition.Lock()
+	defer s.transition.Unlock()
+
+	s.mu.Lock()
+	s.hungUp = false
+	s.mu.Unlock()
+	return s.state()
 }
 
 // hangUpStanding reports whether the guard is up, without taking it down. The Connected

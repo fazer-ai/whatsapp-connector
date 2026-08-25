@@ -321,29 +321,37 @@ func TestAWakeLeftPendingIsPickedUpAgain(t *testing.T) {
 	})
 }
 
-// Fitting inside the lease is not enough on its own. Commands are dispatched on the
-// goroutine that renews, and a batch may hold it for a third of the lease, so a batch
-// that starts just before a tick puts the renewal that follows a heartbeat plus that
-// third after the one before it. Longer than the lease and every session on the instance
-// is acquired by a peer while this one still holds their sockets open, which is the one
-// thing the lease exists to prevent — and a batch landing on a tick is an ordinary
-// minute, not a corner.
-func TestAHeartbeatHasToLeaveRoomForTheBatchBeforeIt(t *testing.T) {
+// Fitting inside the lease is not enough on its own. Reading, dispatching and renewing
+// are one goroutine, so the renewal that follows a read comes a heartbeat, plus however
+// long that read waited on Redis, plus however long its batch took, after the one before
+// it. Longer than the lease and every session on the instance is acquired by a peer while
+// this one still holds their sockets open, which is the one thing the lease exists to
+// prevent — and a read landing just before a tick is an ordinary minute, not a corner.
+func TestAHeartbeatHasToLeaveRoomForTheReadAndBatchBeforeIt(t *testing.T) {
 	t.Setenv("WAC_LEASE_TTL", "30s")
 	t.Setenv("WAC_CLAIM_MIN_IDLE", "45s")
 
-	// 20s is exactly the lease less the third a batch may spend, so the renewal lands on
-	// the moment the lease runs out. Anything above it lands after.
-	for _, heartbeat := range []string{"20s", "25s"} {
+	// A 30s lease leaves 20s once a batch has had its third, and a heartbeat spends its
+	// own length plus half of it again on the read: 14s is the first that does not fit.
+	// 19s is what a check that counted the batch and forgot the read would have let
+	// through, at roughly 34s between renewals.
+	for _, heartbeat := range []string{"14s", "19s", "25s"} {
 		t.Setenv("WAC_HEARTBEAT", heartbeat)
 		if _, err := app.LoadConfig("connector-test"); err == nil {
-			t.Fatalf("a %s heartbeat started against a 30s lease, so a batch can outlive the lease", heartbeat)
+			t.Fatalf("a %s heartbeat started against a 30s lease, so a read and its batch can outlive the lease",
+				heartbeat)
 		}
 	}
 
-	t.Setenv("WAC_HEARTBEAT", "19s")
+	t.Setenv("WAC_HEARTBEAT", "13s")
 	if _, err := app.LoadConfig("connector-test"); err != nil {
 		t.Fatalf("LoadConfig: %v", err)
+	}
+
+	// And the read is bounded by the heartbeat rather than fixed, which is what makes the
+	// arithmetic above hold on a deployment that tunes one of them.
+	if block := app.ReadBlock(13 * time.Second); block >= 13*time.Second {
+		t.Fatalf("a read may wait %s against a 13s heartbeat", block)
 	}
 }
 
