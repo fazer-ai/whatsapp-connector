@@ -292,6 +292,18 @@ func TestBeingLoggedOutForgetsTheDevice(t *testing.T) {
 	if _, bound, err := container.JID(t.Context(), session.sid); err != nil || bound {
 		t.Fatalf("the device survived a logout (bound=%v, err=%v)", bound, err)
 	}
+
+	// And the client behind it is a new one. whatsmeow marks the device deleted rather
+	// than emptying it, so a session left on the old client answers every later call
+	// with ErrDeviceDeleted, including the pairing a client does next.
+	if phone, _ := session.identity(); phone != "" {
+		t.Fatalf("the session still reports %q after being logged out", phone)
+	}
+	err := session.Connect(t.Context(), engine.ConnectRequest{Pairing: "resume"})
+	var coded *protocol.Error
+	if !errors.As(err, &coded) || coded.Code != protocol.ErrorNotPaired {
+		t.Fatalf("resuming a logged-out session answered %v, want not_paired", err)
+	}
 }
 
 func TestPairingChannelIsTranslated(t *testing.T) {

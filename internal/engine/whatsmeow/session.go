@@ -62,6 +62,16 @@ type Session struct {
 	client    *wm.Client
 	handlerID uint32
 	closed    bool
+	// dialing is true while a connect is in flight. whatsmeow holds its socket lock for
+	// the length of one, and every question asked of the client takes that lock for
+	// read, so a dial that outlived its command would block the next command on a
+	// socket nobody is waiting for. This is the answer to "is it connecting" that costs
+	// no lock.
+	dialing bool
+	// stale is a client whose device whatsmeow deleted and whose replacement could not
+	// be built. Nothing works on it, so the next connect tries the rebuild again rather
+	// than talking to it.
+	stale bool
 	// phone and lid are this session's copy of what it paired. whatsmeow assigns the
 	// same fields on its pairing goroutine, so reading them off the client from a
 	// command is a race; this is written from the event handler and read under the
@@ -97,10 +107,26 @@ func newSession(sid string, client *wm.Client, container *store.Container, log z
 	return s
 }
 
+// identityOf reads what a client was built knowing. Safe before the client is running,
+// which is the only time this is called: once it is, whatsmeow assigns the same fields
+// from its pairing goroutine.
+func identityOf(client *wm.Client) (phone, lid string) {
+	if id := client.Store.ID; id != nil {
+		phone = id.User
+	}
+	if stored := client.Store.LID; !stored.IsEmpty() {
+		lid = stored.User
+	}
+	return phone, lid
+}
+
 // adopt takes a client over: it wires the callbacks, subscribes to its events, and
 // copies out the identity it was built with. Nothing else assigns s.client, so the
 // logout path can hand over a replacement without a second code path.
-func (s *Session) adopt(client *wm.Client) {
+// It reports false when the session closed while this was happening, in which case the
+// client it was handed is disconnected and nothing is kept: a handler on a closed
+// session is one nothing will ever remove.
+func (s *Session) adopt(client *wm.Client) bool {
 	// WhatsApp itself demands a reconnect in the middle of pairing: the server closes
 	// the stream with a 515 and expects the client back. Turning whatsmeow's reconnect
 	// off would leave every pairing hanging one step from done, so the socket's own
@@ -111,26 +137,27 @@ func (s *Session) adopt(client *wm.Client) {
 	client.PrePairCallback = s.bind
 	client.BackgroundEventCtx = s.ctx
 
-	phone, lid := "", ""
-	if id := client.Store.ID; id != nil {
-		phone = id.User
-	}
-	if stored := client.Store.LID; !stored.IsEmpty() {
-		lid = stored.User
-	}
+	phone, lid := identityOf(client)
+
+	// Subscribed before the swap, so the client is never live with nobody listening,
+	// and both halves are one lifecycle step: a Close that lands between them would
+	// otherwise leave a handler on a client the session no longer knows about.
+	handlerID := client.AddEventHandler(s.handle)
 
 	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		client.RemoveEventHandler(handlerID)
+		client.Disconnect()
+		return false
+	}
 	s.client = client
+	s.handlerID = handlerID
 	s.phone = phone
 	s.lid = lid
+	s.stale = false
 	s.mu.Unlock()
-
-	// Subscribed after the fields are set, so the first event cannot find a session
-	// halfway through adopting the client that produced it.
-	handlerID := client.AddEventHandler(s.handle)
-	s.mu.Lock()
-	s.handlerID = handlerID
-	s.mu.Unlock()
+	return true
 }
 
 // current is the client this session is on right now.
@@ -144,6 +171,12 @@ func (s *Session) identity() (phone, lid string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.phone, s.lid
+}
+
+func (s *Session) setDialing(dialing bool) {
+	s.mu.Lock()
+	s.dialing = dialing
+	s.mu.Unlock()
 }
 
 func (s *Session) setIdentity(phone, lid string) {
@@ -160,6 +193,14 @@ func (s *Session) Events() <-chan engine.Emission { return s.events }
 func (s *Session) Connect(ctx context.Context, req engine.ConnectRequest) error {
 	if s.isClosed() {
 		return errors.New("whatsmeow: the session is closed")
+	}
+	if s.isStale() {
+		// The device behind this client was deleted and its replacement could not be
+		// built at the time. Nothing on it works, so the connect that would have failed
+		// is the connect that repairs it.
+		if err := s.rebuild(ctx); err != nil {
+			return fmt.Errorf("whatsmeow: %s is still without a usable device: %w", s.sid, err)
+		}
 	}
 
 	switch req.Pairing {
@@ -183,14 +224,20 @@ func (s *Session) resume(ctx context.Context) error {
 		return protocol.NewError(protocol.ErrorNotPaired,
 			"this session has not paired, so there is nothing to resume")
 	}
-	client := s.current()
-	if client.IsConnected() {
+	if state := s.state(); state == "open" || state == "connecting" {
 		return nil
 	}
+
+	// Published before the dial, not after: whatsmeow can report the connection from
+	// its own goroutine while ConnectContext is still returning, and a `connecting`
+	// queued behind that `open` leaves the client believing the session never finished
+	// connecting.
+	client := s.current()
+	s.emit(protocol.EventSessionState, map[string]any{"state": "connecting"})
 	if err := s.dial(ctx, client); err != nil {
+		s.emit(protocol.EventSessionState, map[string]any{"state": "close", "reason": "connect_failed"})
 		return fmt.Errorf("whatsmeow: resume %s: %w", s.sid, err)
 	}
-	s.emit(protocol.EventSessionState, map[string]any{"state": "connecting"})
 	return nil
 }
 
@@ -202,8 +249,13 @@ func (s *Session) resume(ctx context.Context) error {
 // starts from the same one. What the deadline must not do is hold the session's command
 // queue, which is single-file, behind a network round trip nobody is waiting for.
 func (s *Session) dial(ctx context.Context, client *wm.Client) error {
+	s.setDialing(true)
 	dialed := make(chan error, 1)
-	go func() { dialed <- client.ConnectContext(s.ctx) }()
+	go func() {
+		err := client.ConnectContext(s.ctx)
+		s.setDialing(false)
+		dialed <- err
+	}()
 
 	select {
 	case err := <-dialed:
@@ -242,11 +294,11 @@ func (s *Session) pairWithQR(ctx context.Context) error {
 
 	go s.readPairing(run, codes)
 
+	s.emit(protocol.EventSessionState, map[string]any{"state": "connecting"})
 	if err := s.dial(ctx, client); err != nil {
-		s.giveUpOn(ctx, client, err)
+		s.giveUpOn(ctx, run, client, err)
 		return fmt.Errorf("whatsmeow: connect %s: %w", s.sid, err)
 	}
-	s.emit(protocol.EventSessionState, map[string]any{"state": "connecting"})
 	return nil
 }
 
@@ -257,11 +309,11 @@ func (s *Session) pairWithQR(ctx context.Context) error {
 // command, and tearing it down calls Disconnect, which would wait on the socket lock
 // the still-running dial is holding — putting the executor right back behind the
 // deadline it just escaped.
-func (s *Session) giveUpOn(ctx context.Context, client *wm.Client, err error) {
+func (s *Session) giveUpOn(ctx context.Context, run *pairingRun, client *wm.Client, err error) {
 	if errors.Is(err, ctx.Err()) && ctx.Err() != nil {
 		return
 	}
-	s.abandonPairing(client)
+	go s.abandonPairing(run, client)
 }
 
 // hangUp closes the socket without holding the session's command queue behind a dial.
@@ -288,8 +340,14 @@ func (s *Session) hangUp(ctx context.Context, client *wm.Client) {
 // corrected connect can start a new one. Without the disconnect the next GetQRChannel
 // refuses, because whatsmeow will not open a second pairing channel on a live socket,
 // and the operator is stuck until the codes run out.
-func (s *Session) abandonPairing(client *wm.Client) {
-	s.cancelPairing()
+func (s *Session) abandonPairing(run *pairingRun, client *wm.Client) {
+	// Only if this run is still the current one. These calls can be detached from the
+	// command that started them, and the operator's corrected attempt may already own
+	// the socket: tearing that one down would be this attempt failing the next one.
+	if !s.endPairing(run) {
+		return
+	}
+	run.cancel()
 	client.Disconnect()
 }
 
@@ -323,13 +381,13 @@ func (s *Session) pairWithCode(ctx context.Context, phone string) error {
 		s.readPairingWith(run, codes, func() { close(ready) }, false)
 	}()
 
+	s.emit(protocol.EventSessionState, map[string]any{"state": "connecting"})
 	if err := s.dial(ctx, client); err != nil {
 		// Off the executor when the dial is still running: Disconnect waits on the lock
 		// that dial is holding, and this attempt is over either way.
-		go s.abandonPairing(client)
+		go s.abandonPairing(run, client)
 		return fmt.Errorf("whatsmeow: connect %s: %w", s.sid, err)
 	}
-	s.emit(protocol.EventSessionState, map[string]any{"state": "connecting"})
 
 	select {
 	case <-ready:
@@ -337,7 +395,7 @@ func (s *Session) pairWithCode(ctx context.Context, phone string) error {
 		// Unlike a QR conversation, this one cannot carry on without its command:
 		// nothing else will ever call PairPhone. Left up, the socket refuses the
 		// operator's next attempt at GetQRChannel until WhatsApp's own codes run out.
-		go s.abandonPairing(client)
+		go s.abandonPairing(run, client)
 		return fmt.Errorf("whatsmeow: %s did not reach the server in time: %w", s.sid, ctx.Err())
 	case <-s.done:
 		return errors.New("whatsmeow: the session closed before it could ask for a code")
@@ -348,7 +406,7 @@ func (s *Session) pairWithCode(ctx context.Context, phone string) error {
 		// A number WhatsApp refuses is the ordinary case here, and the operator is about
 		// to type a corrected one. Leaving the pairing socket up would refuse that next
 		// attempt too, for reasons that have nothing to do with the number.
-		s.abandonPairing(client)
+		s.abandonPairing(run, client)
 		if coded := codeForPairPhone(err); coded != nil {
 			return coded
 		}
@@ -377,6 +435,7 @@ func (s *Session) Logout(ctx context.Context) error {
 		return err
 	}
 	if err := s.rebuild(ctx); err != nil {
+		s.markStale()
 		return err
 	}
 	s.emit(protocol.EventSessionLoggedOut, map[string]any{"reason": "logout_requested"})
@@ -401,12 +460,30 @@ func (s *Session) rebuild(ctx context.Context) error {
 		return fmt.Errorf("whatsmeow: rebuild %s: %w", s.sid, err)
 	}
 
-	previous := s.current()
-	previous.RemoveEventHandler(s.handlerID)
+	s.mu.Lock()
+	previous, handlerID := s.client, s.handlerID
+	s.mu.Unlock()
+	previous.RemoveEventHandler(handlerID)
 	previous.Disconnect()
 
-	s.adopt(wm.NewClient(device, s.waLog))
+	// A false here is the session having closed while this ran, which adopt has already
+	// cleaned up after. There is nothing left to do either way.
+	_ = s.adopt(wm.NewClient(device, s.waLog))
 	return nil
+}
+
+// markStale records that this session is on a client nothing works on. The next connect
+// tries the rebuild again rather than talking to it.
+func (s *Session) markStale() {
+	s.mu.Lock()
+	s.stale = true
+	s.mu.Unlock()
+}
+
+func (s *Session) isStale() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.stale
 }
 
 // Execute carries out one command.
@@ -442,8 +519,10 @@ func (s *Session) Close() error {
 	// afterwards would never run, and a lease handover would wait out the handshake.
 	s.cancel()
 
-	client := s.current()
-	client.RemoveEventHandler(s.handlerID)
+	s.mu.Lock()
+	client, handlerID := s.client, s.handlerID
+	s.mu.Unlock()
+	client.RemoveEventHandler(handlerID)
 	client.Disconnect()
 
 	close(s.done)
@@ -489,14 +568,16 @@ func (s *Session) startPairing(cancel context.CancelFunc) *pairingRun {
 	return run
 }
 
-// endPairing clears a run that has finished, and does nothing when another has already
-// taken its place.
-func (s *Session) endPairing(run *pairingRun) {
+// endPairing clears a run that has finished and reports whether it was still the
+// current one. A run that has been replaced owns nothing any more.
+func (s *Session) endPairing(run *pairingRun) bool {
 	s.mu.Lock()
-	if s.pairing == run {
-		s.pairing = nil
+	defer s.mu.Unlock()
+	if s.pairing != run {
+		return false
 	}
-	s.mu.Unlock()
+	s.pairing = nil
+	return true
 }
 
 // cancelPairing ends whatever conversation is open.
@@ -540,14 +621,21 @@ func (s *Session) sessionState() map[string]any {
 	return payload
 }
 
+// state answers without taking whatsmeow's socket lock, which a dial holds for its
+// whole length. `IsConnected` reads under that lock, so asking it here would put every
+// status behind a connect nobody is waiting for; `IsLoggedIn` is a flag, and the dial in
+// flight is this session's own bookkeeping.
 func (s *Session) state() string {
-	client := s.current()
+	s.mu.Lock()
+	closed, dialing, client := s.closed, s.dialing, s.client
+	s.mu.Unlock()
+
 	switch {
-	case s.isClosed():
+	case closed:
 		return "close"
 	case client.IsLoggedIn():
 		return "open"
-	case client.IsConnected():
+	case dialing:
 		return "connecting"
 	default:
 		return "close"
@@ -597,7 +685,7 @@ func (s *Session) readPairingWith(run *pairingRun, codes <-chan wm.QRChannelItem
 	// Cleared on the way out, however it ends. A run left marked open after a successful
 	// pairing goes on claiming every later outcome, and the events it claims are then
 	// published by nobody: the QR channel's own handler is long gone.
-	defer s.endPairing(run)
+	defer func() { _ = s.endPairing(run) }()
 
 	first := true
 	for item := range codes {
@@ -771,6 +859,10 @@ func (s *Session) loggedOut(event *waEvents.LoggedOut) {
 	// the deleted device answers it with an error for a state that had already passed.
 	go func() {
 		if err := s.rebuild(s.ctx); err != nil {
+			// The event still goes out: the account was logged out whatever happened
+			// here, and a client left waiting for that news is worse off than one told
+			// late that its next connect has to try again.
+			s.markStale()
 			s.log.Error().Err(err).Msg("failed to put a logged-out session back on a fresh client")
 		}
 		s.emit(protocol.EventSessionLoggedOut, map[string]any{
