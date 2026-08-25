@@ -32,6 +32,13 @@ func addressOf(jid waTypes.JID) (protocol.Address, bool) {
 	if jid.User == "" {
 		return protocol.Address{}, false
 	}
+	if jid.IsBot() {
+		// Meta's own assistants, which reach an account on the ordinary phone server
+		// under a reserved range as well as on the bot one. Mapping the legacy form by
+		// its server alone hands a client a phone number it can open a conversation
+		// with and reply to, for something that is not a person.
+		return protocol.Address{}, false
+	}
 	switch jid.Server {
 	case waTypes.DefaultUserServer, waTypes.LegacyUserServer, waTypes.HostedServer:
 		return protocol.Address{Kind: protocol.AddressPhone, ID: jid.User}, true
@@ -155,6 +162,17 @@ func mentionsOf(context *waE2E.ContextInfo) []protocol.Address {
 // emits describes something that already happened, while this one is the reason the
 // message is allowed to leave the phone.
 func (s *Session) receive(event *waEvents.Message) bool {
+	if chat, named := addressOf(event.Info.Chat); named && chat.Kind == protocol.AddressGroup && !s.wantsGroups() {
+		// Acknowledged and published nowhere, which is the opposite of what happens to
+		// a message this build cannot render. The client asked for direct chats only,
+		// so nobody is ever going to want this one, and withholding the acknowledgement
+		// would have WhatsApp redeliver every group message the account ever receives
+		// for as long as the session is up.
+		s.log.Debug().Str("message_id", event.Info.ID).
+			Msg("dropping a group message the client did not subscribe to")
+		return true
+	}
+
 	message, ok := inboundOf(event)
 	if !ok {
 		s.log.Debug().Str("message_id", event.Info.ID).

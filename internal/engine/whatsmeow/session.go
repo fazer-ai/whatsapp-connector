@@ -94,6 +94,11 @@ type Session struct {
 	// published. A field for the same reason as storeLimit, and for no other.
 	deliverWait time.Duration
 
+	// groups is the last connect's `groups`: whether the client wants group chats
+	// alongside direct ones. Guarded by mu, written by Connect and read by every
+	// inbound message.
+	groups bool
+
 	// transition serialises a change to the socket's state with the event announcing
 	// it. It is not mu: emit can block on a full inbox, and holding the session's own
 	// lock across that would stop everything that reads state, Close included.
@@ -349,6 +354,18 @@ func (s *Session) offline() {
 	s.mu.Unlock()
 }
 
+func (s *Session) setGroups(groups bool) {
+	s.mu.Lock()
+	s.groups = groups
+	s.mu.Unlock()
+}
+
+func (s *Session) wantsGroups() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.groups
+}
+
 func (s *Session) setIdentity(phone, lid string) {
 	s.mu.Lock()
 	s.phone = phone
@@ -375,9 +392,8 @@ func (s *Session) Connect(ctx context.Context, req engine.ConnectRequest) error 
 	// Same rule as the proxy, and for the same reason: these ask the connector to do
 	// something, and a build that does not do it answers `open` to a client that will
 	// then wait for a call to be refused, or for a backlog to arrive, and never find out
-	// it was never going to happen. `groups` is not on this list because it selects among
-	// conversation traffic and this build delivers none: it becomes a promise in M2, when
-	// there is something for it to leave out.
+	// it was never going to happen. `groups` is not on this list because it is honoured
+	// now that there is conversation traffic to leave out.
 	if req.Calls != nil && req.Calls.AutoReject {
 		return protocol.NewError(protocol.ErrorUnsupported,
 			"this connector does not answer incoming calls yet")
@@ -399,6 +415,11 @@ func (s *Session) Connect(ctx context.Context, req engine.ConnectRequest) error 
 		return protocol.NewError(protocol.ErrorInvalidPayload,
 			fmt.Sprintf("%q is not a pairing mode this connector knows", req.Pairing))
 	}
+
+	// Recorded on every connect the session accepts, because the client sends it on
+	// every connect and it is a property of the subscription rather than of the device.
+	// It is read once there is traffic to leave out.
+	s.setGroups(req.Groups)
 
 	// Waited for before the guard comes down, and before anything is dialled. A
 	// disconnect that outlived its command is still going to close the socket, and a
@@ -1037,7 +1058,12 @@ func (s *Session) requestCode(ctx context.Context, command *protocol.Command) er
 	if err := json.Unmarshal(command.Payload, &body); err != nil {
 		return protocol.NewError(protocol.ErrorInvalidPayload, "the pairing request could not be read")
 	}
-	return s.Connect(ctx, engine.ConnectRequest{Pairing: "code", Phone: body.Phone})
+	// The subscription comes along, because this is a connect like any other and the
+	// client is not sending one: leaving it out would turn group traffic off on a
+	// session that had asked for it, at the moment it asked for a pairing code.
+	return s.Connect(ctx, engine.ConnectRequest{
+		Pairing: "code", Phone: body.Phone, Groups: s.wantsGroups(),
+	})
 }
 
 // Close ends the session. Events is closed before it returns.

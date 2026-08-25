@@ -10,7 +10,8 @@ events and commands with its clients over Redis Streams.
 > [!IMPORTANT]
 > **Status: M2, inbound text.** A session pairs with a real WhatsApp account, resumes
 > across restarts, and now publishes the text messages that arrive on it, quotes and
-> mentions included. Everything else is still M2's to finish: media, location and
+> mentions included. `groups` on the connect decides whether group chats come with
+> them. Everything else is still M2's to finish: media, location and
 > contacts inbound, and every outbound command, which is refused rather than
 > acknowledged. What this build cannot render is left unacknowledged on WhatsApp's
 > side, with its plaintext buffered so the redelivery can still be read: the account

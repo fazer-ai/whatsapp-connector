@@ -11,6 +11,7 @@ import (
 	waEvents "go.mau.fi/whatsmeow/types/events"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/fazer-ai/whatsapp-connector/internal/engine"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 )
 
@@ -62,6 +63,9 @@ func TestAnAddressTheContractCannotNameIsRefusedRatherThanGuessedAt(t *testing.T
 		jid  waTypes.JID
 	}{
 		{"a bot", waTypes.NewJID("13135550002", waTypes.BotServer)},
+		// The same assistant on the ordinary phone server, which is how Meta AI reaches
+		// most accounts. Its server says nothing; only the reserved range does.
+		{"a bot on the phone server", waTypes.NewJID("13135550002", waTypes.DefaultUserServer)},
 		{"an interop bridge", waTypes.NewJID("13135550002", waTypes.InteropServer)},
 		{"a Messenger account", waTypes.NewJID("13135550002", waTypes.MessengerServer)},
 		{"a server with no user", waTypes.NewJID("", waTypes.DefaultUserServer)},
@@ -341,4 +345,86 @@ func validateInboundAgainstContract(t *testing.T, message *protocol.InboundMessa
 		t.Fatalf("marshal the message: %v", err)
 	}
 	validateAgainstContract(t, "inbound_message", payload)
+}
+
+func TestAGroupMessageIsDroppedAndAcknowledgedWhenTheClientAskedForDirectChatsOnly(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	// `groups` defaults to false on the client, so this is what an ordinary inbox looks
+	// like. Acknowledging is the whole point: refusing would leave WhatsApp redelivering
+	// every group message the account gets, for as long as the session is up.
+	message := textMessage("3EB0GROUP", "bom dia a todos")
+	message.Info.Chat = waTypes.NewJID("120363000000000000", waTypes.GroupServer)
+
+	// Off the test goroutine and on a short bound, so a session that publishes this
+	// after all fails on the assertion below rather than sitting out the real wait.
+	session.deliverWait = 50 * time.Millisecond
+	acknowledged := make(chan bool, 1)
+	go func() { acknowledged <- session.receive(message) }()
+
+	select {
+	case emission := <-session.Events():
+		t.Fatalf("a group message the client did not ask for was published as %s", emission.Type)
+	case <-time.After(100 * time.Millisecond):
+	}
+	select {
+	case got := <-acknowledged:
+		if !got {
+			t.Fatal("a group message nobody subscribed to was left for WhatsApp to redeliver forever")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the handler never came back from a message it published nothing for")
+	}
+}
+
+func TestAGroupMessageIsPublishedOnceTheClientSubscribesToGroups(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	// A resume during a reconnect, which is the one connect that settles without a
+	// socket. What is being checked is that Connect records the subscription at all.
+	session.handle(&waEvents.Connected{})
+	next(t, session)
+	session.handle(&waEvents.Disconnected{})
+	next(t, session)
+	if err := session.Connect(t.Context(), engine.ConnectRequest{Pairing: "resume", Groups: true}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	message := textMessage("3EB0GROUP", "bom dia a todos")
+	message.Info.Chat = waTypes.NewJID("120363000000000000", waTypes.GroupServer)
+
+	acknowledged := make(chan bool, 1)
+	go func() { acknowledged <- session.receive(message) }()
+
+	emission := next(t, session)
+	if emission.Type != protocol.EventMessageReceived {
+		t.Fatalf("the session published %s for a group message, want %s", emission.Type, protocol.EventMessageReceived)
+	}
+	emission.Settle(nil)
+	if got := <-acknowledged; !got {
+		t.Fatal("a group message that was published was left unacknowledged")
+	}
+}
+
+// A code request is a connect the client did not send, so it has to carry the
+// subscription the client already asked for. Losing it here turns group traffic off on
+// a live session at the moment somebody asks for a pairing code.
+func TestACodeRequestKeepsTheGroupSubscriptionTheClientAskedFor(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "")
+	session.setGroups(true)
+
+	// The connect underneath fails: there is no socket here. What matters is what it was
+	// asked for on the way, which the session records before it dials.
+	_ = session.requestCode(t.Context(), &protocol.Command{
+		Type:    protocol.CommandPairingRequestCode,
+		Payload: json.RawMessage(`{"phone":"5511999990001"}`),
+	})
+
+	if !session.wantsGroups() {
+		t.Fatal("asking for a pairing code turned the group subscription off")
+	}
 }

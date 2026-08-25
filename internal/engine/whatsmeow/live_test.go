@@ -206,8 +206,6 @@ func TestLiveListen(t *testing.T) {
 	if body.Message.Content.Type != "text" || body.Message.Content.Body == "" {
 		t.Fatalf("the message arrived without a text body: %s", received.Payload)
 	}
-	t.Logf("received %q from %s:%s", body.Message.Content.Body, body.Message.Chat.Kind, body.Message.Chat.ID)
-
 	if state := session.state(); state != "open" {
 		t.Fatalf("the session did not stay up: state=%s", state)
 	}
