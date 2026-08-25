@@ -635,3 +635,63 @@ func TestAgeIsNotPutBackOnWhatIsStillRunning(t *testing.T) {
 		t.Fatalf("a command being carried out was offered again (%d)", len(third))
 	}
 }
+
+// A hand-back left alone for longer than the delay is one any peer may take, and XCLAIM
+// transfers an entry without ever asking who holds it. Putting an age back on one
+// somebody else is carrying out hands it to this instance mid-flight: the command runs
+// twice, and for a wake that means retiring the only wake there was while the peer's
+// adoption is still going.
+func TestAgeIsNotPutBackOnWhatAPeerHasTaken(t *testing.T) {
+	t.Parallel()
+
+	const minIdle = 10 * time.Second
+	f := newFleet(t)
+	newStreams := func(instance string) *redisstream.Streams {
+		streams, err := redisstream.New(f.client, redisstream.Options{
+			Instance: instance, Block: 50 * time.Millisecond, ClaimMinIdle: minIdle,
+		})
+		if err != nil {
+			t.Fatalf("redisstream.New: %v", err)
+		}
+		return streams
+	}
+	patient := newStreams("inst-alive")
+	peer := newStreams("inst-peer")
+	dead := f.streams(t, "inst-dead")
+	ctx := context.Background()
+
+	if _, err := dead.Read(ctx, []string{"s1"}); err != nil {
+		t.Fatalf("priming Read: %v", err)
+	}
+	writeCommand(t, f, f.client.Keys().Commands("s1"), command("c1", "s1", "c1"))
+	if taken, err := dead.Read(ctx, []string{"s1"}); err != nil || len(taken) != 1 {
+		t.Fatalf("the first instance read %d commands (err=%v), want 1", len(taken), err)
+	}
+
+	clock := time.Now().UTC()
+	tick := func(d time.Duration) { clock = clock.Add(d); f.server.SetTime(clock) }
+	tick(minIdle + time.Second)
+
+	claimed, err := patient.Claim(ctx, []string{"s1"})
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("Claim returned %d commands (err=%v), want 1", len(claimed), err)
+	}
+	claimed[0].Release()
+
+	// And then this instance is away for longer than the delay, so a peer takes the
+	// entry over and starts carrying it out.
+	tick(minIdle + time.Second)
+	running, err := peer.Claim(ctx, []string{"s1"})
+	if err != nil || len(running) != 1 {
+		t.Fatalf("the peer claimed %d commands (err=%v), want 1", len(running), err)
+	}
+
+	tick(time.Millisecond)
+	back, err := patient.Claim(ctx, []string{"s1"})
+	if err != nil {
+		t.Fatalf("Claim after the peer took it: %v", err)
+	}
+	if len(back) != 0 {
+		t.Fatalf("took back %d commands a peer is carrying out", len(back))
+	}
+}

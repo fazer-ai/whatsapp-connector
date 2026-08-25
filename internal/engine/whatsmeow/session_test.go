@@ -1539,3 +1539,81 @@ func TestALateConnectDoesNotReviveALoggedOutSession(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 }
+
+// whatsmeow dispatches from whichever goroutine produced the event, so authentication
+// finishing can land after the thing that ended the connection. A terminal transition
+// that does not refuse it is one the handler paints over: `open` on top of the event
+// that just said the socket is gone, with nothing arriving later to correct it.
+func TestATerminalTransitionRefusesTheConnectQueuedBehindIt(t *testing.T) {
+	t.Parallel()
+
+	for name, end := range map[string]func(*Session){
+		"a stream somebody else took": func(session *Session) {
+			session.handle(&waEvents.StreamReplaced{})
+		},
+		"a pairing that failed": func(session *Session) {
+			session.publishPairingFailure("timeout", nil)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			session, _ := newTestSession(t, "5511999990001")
+			session.setConnected(true)
+
+			end(session)
+			drain(t, session)
+
+			session.handle(&waEvents.Connected{})
+
+			if state := session.state(); state == "open" {
+				t.Fatal("a connection queued behind the end of the socket put the session back up")
+			}
+			select {
+			case emission := <-session.Events():
+				t.Fatalf("published %q after the socket was gone", emission.Type)
+			case <-time.After(100 * time.Millisecond):
+			}
+		})
+	}
+}
+
+// drain reads whatever a transition published, so what follows it is what a test is
+// looking at.
+func drain(t *testing.T, session *Session) {
+	t.Helper()
+	for {
+		select {
+		case _, open := <-session.Events():
+			if !open {
+				return
+			}
+		case <-time.After(100 * time.Millisecond):
+			return
+		}
+	}
+}
+
+// A logout that never left this process is the commonest way to reach a session
+// whatsmeow is already reconnecting. Treating it as a socket this session is done with
+// would have the reconnect closed the moment it lands, for a command that failed and
+// kept its credentials.
+func TestALogoutThatNeverLeftLeavesTheReconnectAlone(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.logout = func(context.Context, *wm.Client) error { return wm.ErrNotConnected }
+
+	if err := session.Logout(t.Context()); err == nil {
+		t.Fatal("a logout that never left was reported as one that went through")
+	}
+
+	// whatsmeow's own reconnect finishes.
+	session.handle(&waEvents.Connected{})
+
+	if state := session.state(); state != "open" {
+		t.Fatalf("the session reports %q after a reconnect it should have kept", state)
+	}
+	if emission := next(t, session); emission.Type != protocol.EventSessionState {
+		t.Fatalf("published %q, want the session coming back up", emission.Type)
+	}
+}

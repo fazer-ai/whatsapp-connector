@@ -553,9 +553,9 @@ func (s *Session) settleHangUp() {
 		s.mu.Unlock()
 		return
 	}
-	s.hungUp = true
 	s.mu.Unlock()
 
+	s.refuseLateConnect()
 	s.offline()
 	s.emit(protocol.EventSessionState, map[string]any{"state": "close", "reason": "disconnect_requested"})
 }
@@ -690,14 +690,20 @@ func (s *Session) Disconnect(ctx context.Context) error {
 func (s *Session) Logout(ctx context.Context) error {
 	s.cancelPairing()
 	if err := s.logout(ctx, s.current()); err != nil {
-		s.settleLogout()
 		if sentNothing(err) {
 			// Nothing was sent, and the device is untouched on both sides. Clearing
 			// credentials that still resume would cost the operator a fresh pairing for
 			// a logout that visibly failed, while WhatsApp goes on listing the device
 			// they asked to remove.
+			//
+			// Not settled as a logout either, and that is the same point twice: the
+			// commonest way to get here is a session whatsmeow is already reconnecting,
+			// and a guard raised now would have this session close the socket that comes
+			// back — for a command that failed and kept its credentials.
+			s.offline()
 			return fmt.Errorf("whatsmeow: log %s out: %w", s.sid, err)
 		}
+		s.settleLogout()
 		// The request went out. whatsmeow unlinks the device before it deletes the local
 		// one and disconnects in between, so this failure can be the deletion alone:
 		// WhatsApp has revoked the device and this session is holding credentials that
@@ -744,10 +750,25 @@ func (s *Session) settleLogout() {
 	s.transition.Lock()
 	defer s.transition.Unlock()
 
+	s.refuseLateConnect()
+	s.offline()
+}
+
+// refuseLateConnect raises the guard that has a Connected from a socket this session is
+// done with closed instead of announced.
+//
+// whatsmeow dispatches from whichever goroutine produced the event, so authentication
+// finishing can land after the thing that ended the connection. Without this the handler
+// puts the state back to connected and publishes `open` on top of whatever terminal event
+// just went out, over a socket nobody is on. The next connect clears it, which is where
+// it is cleared for a manual disconnect too.
+//
+// The caller holds transition: this is one half of a socket transition, not one of its
+// own.
+func (s *Session) refuseLateConnect() {
 	s.mu.Lock()
 	s.hungUp = true
 	s.mu.Unlock()
-	s.offline()
 }
 
 // sentNothing reports whether a logout failed before it reached WhatsApp, which is the
@@ -1188,6 +1209,7 @@ func (s *Session) publishPairingFailure(reason string, err error) {
 	s.transition.Lock()
 	defer s.transition.Unlock()
 
+	s.refuseLateConnect()
 	s.offline()
 	s.emit(protocol.EventSessionState, map[string]any{"state": "close", "reason": "pairing_" + reason})
 }
@@ -1265,7 +1287,9 @@ func (s *Session) handle(rawEvent any) bool {
 
 		// whatsmeow suppresses the ordinary Disconnected for this one, so nothing else
 		// would take the connection down and the session would report itself open over a
-		// stream somebody else now holds.
+		// stream somebody else now holds. The guard goes with it: a Connected this socket
+		// produced before it was replaced would otherwise put the session back up.
+		s.refuseLateConnect()
 		s.offline()
 		s.emit(protocol.EventSessionStreamReplaced, map[string]any{})
 	case *waEvents.TemporaryBan:

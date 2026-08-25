@@ -218,11 +218,20 @@ func (s *Streams) restoreUnrun(ctx context.Context) {
 	s.unrunMu.Unlock()
 
 	for stream, entries := range pending {
+		here := s.pendingHere(ctx, stream)
 		byIdle := make(map[time.Duration][]string)
 		for _, entry := range entries {
 			if s.running(stream, entry.id) {
 				// Taken again since it was given back. Putting an age on an entry this
 				// process is carrying out is how a peer comes to run it alongside.
+				continue
+			}
+			if _, mine := here[entry.id]; !mine {
+				// Acknowledged, or taken over by a peer while this instance was away for
+				// longer than the delay. XCLAIM does not ask who holds an entry, so an
+				// age put on this one would take it back out from under whoever is
+				// running it, and for a wake that means retiring the only wake there was
+				// while their adoption is still going.
 				continue
 			}
 			byIdle[entry.idle] = append(byIdle[entry.idle], entry.id)
@@ -340,6 +349,38 @@ func (s *Streams) rememberAge(stream string, idle time.Duration, deliveries []tr
 			s.unrunMu.Unlock()
 		}
 	}
+}
+
+// pendingHere is what is still pending under this instance's own name on a stream.
+//
+// It is what tells a hand-back this process may put an age back on from one a peer has
+// since taken: an entry released and left alone for longer than the delay is one anybody
+// may have claimed, and XCLAIM transfers an entry without ever asking who holds it.
+func (s *Streams) pendingHere(ctx context.Context, stream string) map[string]struct{} {
+	here := make(map[string]struct{})
+	start := "-"
+	// Paged and capped the same way reclaimable is, and for the same reason: this runs
+	// on the goroutine that renews every lease this instance holds.
+	for range maxPendingPages {
+		pending, err := s.client.XPendingExt(ctx, &redis.XPendingExtArgs{
+			Stream: stream, Group: ConsumerGroup, Consumer: s.opts.Instance,
+			Start: start, End: "+", Count: s.opts.ReadCount,
+		}).Result()
+		if err != nil || len(pending) == 0 {
+			// Nothing is put back rather than everything: an age not restored costs the
+			// delay once more, an age restored on somebody else's entry costs a command
+			// that runs twice.
+			return here
+		}
+		for _, entry := range pending {
+			here[entry.ID] = struct{}{}
+		}
+		if int64(len(pending)) < s.opts.ReadCount {
+			return here
+		}
+		start = pending[len(pending)-1].ID
+	}
+	return here
 }
 
 // reclaimable is the pending entries worth taking over: idle long enough, and held by
