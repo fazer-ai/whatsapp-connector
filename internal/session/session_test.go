@@ -466,6 +466,49 @@ func (c *steppingClock) step(d time.Duration) {
 	c.mu.Unlock()
 }
 
+// A batch is dispatched under a budget, so a command that finishes as that budget runs
+// out would have its acknowledgement refused by the deadline rather than by Redis. That
+// is not a retry: an entry whose ack did not land stays marked as being carried out here,
+// on purpose, so a reclaim does not run it twice — and every later claim then skips it.
+// In a fleet of one that is a command nothing retires until the process restarts.
+func TestACommandThatWasCarriedOutIsRetiredEvenOutOfTime(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+
+	manager := session.NewManager(&session.ManagerConfig{
+		Instance: "inst-a", Engine: fake.New(), Leases: cluster.NewLeases(client, "inst-a", cluster.Options{}),
+		Publisher: newRecorder(), Replier: newRecorder(),
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+
+	// Spent by the time the command is done with, which is what a batch that ran to the
+	// end of its budget hands the last command in it.
+	spent, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	var acked bool
+	delivery := &transport.Delivery{
+		Command: protocol.Command{V: protocol.Version, ID: "c1", Type: protocol.CommandAdminPing, SID: "s1"},
+		Ack: func(ctx context.Context) error {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			acked = true
+			return nil
+		},
+		Release: func() { t.Error("a command that was carried out was given back instead of retired") },
+	}
+	manager.Dispatch(spent, delivery)
+
+	if !acked {
+		t.Fatal("the acknowledgement was refused by the budget the command had already outlived")
+	}
+}
+
 // Every instance reads the control stream through one consumer group, so acknowledging
 // a wake nobody could act on retires it: the session then stays unowned until a client
 // happens to send another. Whatever stopped the adoption may well be over by the time

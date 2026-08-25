@@ -448,8 +448,23 @@ func forfeit(delivery *transport.Delivery) {
 	release(delivery)
 }
 
+// ackTimeout bounds retiring a command that has already been carried out. Short,
+// because nothing waits on it.
+const ackTimeout = 2 * time.Second
+
+// ack retires a command, on a deadline of its own rather than the caller's.
+//
+// A batch is dispatched under a budget, so a command that finishes as that budget runs
+// out would have its acknowledgement refused by the deadline rather than by Redis. That
+// is not a retry: an entry whose ack did not land stays marked as being carried out here,
+// on purpose, so that a reclaim does not run it a second time — and every later claim
+// then skips it. In a fleet of one it is a command nothing retires until the process
+// restarts. The work is already done by this point; what is left is bookkeeping that has
+// to happen whether or not the batch had time for it.
 func (m *Manager) ack(ctx context.Context, delivery *transport.Delivery) {
-	if err := delivery.Ack(ctx); err != nil && ctx.Err() == nil {
+	retire, cancel := context.WithTimeout(context.WithoutCancel(ctx), ackTimeout)
+	defer cancel()
+	if err := delivery.Ack(retire); err != nil {
 		m.log.Error().Err(err).Str("cmd_id", delivery.Command.ID).Msg("failed to acknowledge a command")
 	}
 }

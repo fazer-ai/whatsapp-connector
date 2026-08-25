@@ -120,6 +120,20 @@ func LoadConfig(hostname string) (Config, error) {
 			"app: WAC_HEARTBEAT (%s) must be shorter than WAC_LEASE_TTL (%s), or a lease expires "+
 				"before the tick that would renew it", cfg.Heartbeat, cfg.LeaseTTL)
 	}
+	if cfg.Heartbeat+cfg.LeaseTTL/dispatchShare >= cfg.LeaseTTL {
+		// Fitting inside the TTL is not enough on its own. Commands are dispatched on the
+		// goroutine that renews, and a batch may hold it for a third of the lease, so the
+		// renewal that follows a batch happens a heartbeat plus that third after the one
+		// before it. Longer than the lease and the leases are gone by then: peers acquire
+		// the accounts and this instance goes on holding their sockets open, which is the
+		// one thing the lease exists to prevent. A batch that starts just before a tick
+		// is ordinary, not a corner, so this is a deployment that breaks on a busy
+		// minute rather than one that never works.
+		return Config{}, fmt.Errorf(
+			"app: WAC_HEARTBEAT (%s) plus the dispatch budget (%s) must be shorter than WAC_LEASE_TTL "+
+				"(%s), or a batch delays the renewal past the lease it is renewing",
+			cfg.Heartbeat, cfg.LeaseTTL/dispatchShare, cfg.LeaseTTL)
+	}
 	if cfg.ClaimMinIdle <= cfg.LeaseTTL {
 		// A wake is acknowledged when adoption finds the session already owned, because
 		// in a fleet that means somebody else is running it. That is only true while the

@@ -240,10 +240,15 @@ func (c *Connector) reclaimPass(ctx context.Context, take func(context.Context) 
 	c.dispatchWithin(pass, deliveries)
 }
 
+// dispatchShare is the fraction of the lease one batch of commands may hold the loop
+// for. The configuration is checked against it, because it is the renewal that follows
+// the batch that has to still be inside the lease.
+const dispatchShare = 3
+
 // budget is how long one batch of commands may hold the loop. It is a third of the
 // lease, so a batch that spends all of it still leaves two thirds for the renewal that
 // follows.
-func (c *Connector) budget() time.Duration { return c.cfg.LeaseTTL / 3 }
+func (c *Connector) budget() time.Duration { return c.cfg.LeaseTTL / dispatchShare }
 
 // dispatchWithin carries out what a reclaim took, and stops when it has spent as long
 // as this goroutine can afford.

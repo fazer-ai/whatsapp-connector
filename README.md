@@ -143,7 +143,7 @@ restart, and reports itself healthy while doing it.
 | `WAC_HTTP_ADDR` | `:8080` | Where `/healthz`, `/readyz` and `/metrics` listen |
 | `WAC_ADVERTISE_URL` | derived | How clients reach this instance for media |
 | `WAC_LEASE_TTL` | `30s` | How long a session lease survives without a renewal |
-| `WAC_HEARTBEAT` | `5s` | How often leases are renewed and the instance re-announces |
+| `WAC_HEARTBEAT` | `5s` | How often leases are renewed and the instance re-announces. Must leave room for the batch before it: `heartbeat + lease/3 < lease` |
 | `WAC_CLAIM_MIN_IDLE` | `1.5 × lease` | How long a command sits unacknowledged before another instance takes it over. Must exceed `WAC_LEASE_TTL` |
 | `WAC_LOG_LEVEL` | `info` | zerolog level |
 

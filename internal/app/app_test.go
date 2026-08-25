@@ -321,6 +321,32 @@ func TestAWakeLeftPendingIsPickedUpAgain(t *testing.T) {
 	})
 }
 
+// Fitting inside the lease is not enough on its own. Commands are dispatched on the
+// goroutine that renews, and a batch may hold it for a third of the lease, so a batch
+// that starts just before a tick puts the renewal that follows a heartbeat plus that
+// third after the one before it. Longer than the lease and every session on the instance
+// is acquired by a peer while this one still holds their sockets open, which is the one
+// thing the lease exists to prevent — and a batch landing on a tick is an ordinary
+// minute, not a corner.
+func TestAHeartbeatHasToLeaveRoomForTheBatchBeforeIt(t *testing.T) {
+	t.Setenv("WAC_LEASE_TTL", "30s")
+	t.Setenv("WAC_CLAIM_MIN_IDLE", "45s")
+
+	// 20s is exactly the lease less the third a batch may spend, so the renewal lands on
+	// the moment the lease runs out. Anything above it lands after.
+	for _, heartbeat := range []string{"20s", "25s"} {
+		t.Setenv("WAC_HEARTBEAT", heartbeat)
+		if _, err := app.LoadConfig("connector-test"); err == nil {
+			t.Fatalf("a %s heartbeat started against a 30s lease, so a batch can outlive the lease", heartbeat)
+		}
+	}
+
+	t.Setenv("WAC_HEARTBEAT", "19s")
+	if _, err := app.LoadConfig("connector-test"); err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+}
+
 // A wake is acknowledged when adoption finds the session already owned, because in a
 // fleet that means somebody else is running it. That answer is only true while the
 // owner is alive: an instance that reads a wake, wins the lease and dies before
