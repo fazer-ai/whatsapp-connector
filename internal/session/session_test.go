@@ -637,3 +637,102 @@ func TestAPeerTakesOverOnceTheDeadOwnersLeaseRunsOut(t *testing.T) {
 		t.Fatalf("the peer runs %d sessions, want 1", got)
 	}
 }
+
+// heldEngine is a session whose one command never finishes on its own, which is what
+// lets a test put a second command in the queue behind it and keep it there.
+type heldEngine struct {
+	hold    chan struct{}
+	events  chan engine.Emission
+	entered atomic.Bool
+}
+
+func newHeldEngine() *heldEngine {
+	return &heldEngine{hold: make(chan struct{}), events: make(chan engine.Emission)}
+}
+
+func (e *heldEngine) Open(context.Context, string) (engine.Session, error) { return e, nil }
+func (e *heldEngine) Events() <-chan engine.Emission                       { return e.events }
+func (e *heldEngine) Connect(context.Context, engine.ConnectRequest) error { return nil }
+func (e *heldEngine) Disconnect(context.Context) error                     { return nil }
+func (e *heldEngine) Logout(context.Context) error                         { return nil }
+
+func (e *heldEngine) Execute(ctx context.Context, _ *protocol.Command) (json.RawMessage, error) {
+	e.entered.Store(true)
+	select {
+	case <-e.hold:
+	case <-ctx.Done():
+	}
+	return json.RawMessage(`{}`), nil
+}
+
+func (e *heldEngine) Close() error {
+	close(e.events)
+	return nil
+}
+
+// A command sitting in a session's queue has been read from Redis and not acknowledged,
+// so the transport counts it as work this process is still doing and will not reclaim
+// it. Dropping it when the session stops means it runs nowhere at all until another
+// instance claims it or this one restarts, which is the failure the reclaim exists to
+// prevent, reintroduced one layer up.
+func TestStoppingASessionLetsGoOfWhatWasStillQueued(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	held := newHeldEngine()
+	manager := session.NewManager(&session.ManagerConfig{
+		Instance: "inst-a", Engine: held,
+		Leases:    cluster.NewLeases(redisx.Wrap(rdb, "wa:", 8), "inst-a", cluster.Options{}),
+		Publisher: newRecorder(), Replier: newRecorder(),
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	ctx := context.Background()
+	if _, err := manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+
+	var releasedFirst, releasedSecond atomic.Bool
+	running := status("c1", "s1", &releasedFirst)
+	queued := status("c2", "s1", &releasedSecond)
+
+	manager.Dispatch(ctx, running)
+	// The executor has to have taken the first one, or the second is not behind it.
+	waitUntil(t, "the first command to reach the engine", func() bool {
+		return manager.Count() == 1 && held.taken()
+	})
+	manager.Dispatch(ctx, queued)
+
+	manager.StopAll(ctx)
+
+	if !releasedSecond.Load() {
+		t.Fatal("a command left in the queue was dropped, so nothing will ever reclaim it")
+	}
+}
+
+// taken reports whether the engine has been asked to carry a command out.
+func (e *heldEngine) taken() bool { return e.entered.Load() }
+
+func status(id, sid string, released *atomic.Bool) *transport.Delivery {
+	return &transport.Delivery{
+		Command: protocol.Command{
+			V: protocol.Version, ID: id, Type: protocol.CommandSessionStatus,
+			SID: sid, TS: 1787000000000, Payload: json.RawMessage(`{}`),
+		},
+		Ack:     func(context.Context) error { return nil },
+		Release: func() { released.Store(true) },
+	}
+}
+
+func waitUntil(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}

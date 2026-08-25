@@ -68,7 +68,13 @@ type Session struct {
 	// dispatch, so a test cannot otherwise tell a Close that releases the handler first
 	// from one that waits on it forever.
 	detach func(*wm.Client, uint32)
-	closed bool
+
+	// disconnect closes the socket. A field for the same reason as detach: whatsmeow
+	// holds its socket lock for the length of a dial and Disconnect waits for it, and
+	// nothing outside the library can put it in that state, so a test cannot otherwise
+	// reach the path where a disconnect outlives its deadline.
+	disconnect func(*wm.Client)
+	closed     bool
 	// dialing is true while a connect is in flight. whatsmeow holds its socket lock for
 	// the length of one, and every question asked of the client takes that lock for
 	// read, so a dial that outlived its command would block the next command on a
@@ -111,16 +117,17 @@ type pairingRun struct{ cancel context.CancelFunc }
 func newSession(sid string, client *wm.Client, container *store.Container, log zerolog.Logger, wa waLog.Logger) *Session {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Session{
-		sid:    sid,
-		store:  container,
-		log:    log.With().Str("sid", sid).Logger(),
-		waLog:  wa,
-		inbox:  make(chan engine.Emission, inboxDepth),
-		events: make(chan engine.Emission),
-		done:   make(chan struct{}),
-		ctx:    ctx,
-		cancel: cancel,
-		detach: func(client *wm.Client, id uint32) { client.RemoveEventHandler(id) },
+		sid:        sid,
+		store:      container,
+		log:        log.With().Str("sid", sid).Logger(),
+		waLog:      wa,
+		inbox:      make(chan engine.Emission, inboxDepth),
+		events:     make(chan engine.Emission),
+		done:       make(chan struct{}),
+		ctx:        ctx,
+		cancel:     cancel,
+		detach:     func(client *wm.Client, id uint32) { client.RemoveEventHandler(id) },
+		disconnect: func(client *wm.Client) { client.Disconnect() },
 	}
 	s.adopt(client)
 	go s.forward()
@@ -331,7 +338,10 @@ func (s *Session) resume(ctx context.Context) error {
 	// connecting.
 	client := s.current()
 	s.emit(protocol.EventSessionState, map[string]any{"state": "connecting"})
-	if err := s.dial(ctx, client); err != nil {
+	reportFailure := func(error) {
+		s.emit(protocol.EventSessionState, map[string]any{"state": "close", "reason": "connect_failed"})
+	}
+	if err := s.dial(ctx, client, reportFailure); err != nil {
 		// Only when the dial itself failed. A caller that stopped waiting leaves the
 		// connect running, and a `close` published over it is a terminal state the very
 		// next event contradicts.
@@ -350,7 +360,7 @@ func (s *Session) resume(ctx context.Context) error {
 // whatsmeow a context that dies with the RPC, would also kill the reconnect loop it
 // starts from the same one. What the deadline must not do is hold the session's command
 // queue, which is single-file, behind a network round trip nobody is waiting for.
-func (s *Session) dial(ctx context.Context, client *wm.Client) error {
+func (s *Session) dial(ctx context.Context, client *wm.Client, onDetached func(error)) error {
 	s.setDialing(true)
 	dialed := make(chan error, 1)
 	go func() {
@@ -363,10 +373,36 @@ func (s *Session) dial(ctx context.Context, client *wm.Client) error {
 	case err := <-dialed:
 		return err
 	case <-ctx.Done():
+		// The caller is answered and the dial carries on, so somebody still has to say
+		// how it ended. Without this the client sits on the `connecting` published just
+		// before it, for as long as the session lasts: nothing else reports a connect
+		// that failed after its command gave up.
+		go s.awaitDetachedDial(dialed, onDetached)
 		return fmt.Errorf("whatsmeow: %s was still connecting: %w", s.sid, ctx.Err())
 	case <-s.done:
 		return errors.New("whatsmeow: the session closed while it was connecting")
 	}
+}
+
+// awaitDetachedDial reports a dial that failed after the command that asked for it had
+// already been answered. A successful one needs nobody: whatsmeow announces it as a
+// Connected event, which the handler turns into the state the client is waiting for.
+func (s *Session) awaitDetachedDial(dialed <-chan error, onDetached func(error)) {
+	var err error
+	select {
+	case err = <-dialed:
+	case <-s.done:
+		return
+	}
+	if err == nil || onDetached == nil {
+		return
+	}
+	if s.ctx.Err() != nil {
+		// The dial was interrupted by the session ending, which is not a failure a
+		// client acts on and not a state anything will contradict.
+		return
+	}
+	onDetached(err)
 }
 
 // pairWithQR connects and publishes the codes WhatsApp issues until one is scanned.
@@ -397,7 +433,11 @@ func (s *Session) pairWithQR(ctx context.Context) error {
 	go s.readPairing(run, codes)
 
 	s.emit(protocol.EventSessionState, map[string]any{"state": "connecting"})
-	if err := s.dial(ctx, client); err != nil {
+	abandon := func(err error) {
+		s.publishPairingFailure("connect_failed", err)
+		s.abandonPairing(run, client)
+	}
+	if err := s.dial(ctx, client, abandon); err != nil {
 		s.giveUpOn(ctx, run, client, err)
 		return fmt.Errorf("whatsmeow: connect %s: %w", s.sid, err)
 	}
@@ -428,7 +468,13 @@ func (s *Session) hangUp(ctx context.Context, client *wm.Client) error {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		client.Disconnect()
+		s.disconnect(client)
+		// Settled here rather than by the caller, because a disconnect that outlives its
+		// deadline still happens. The caller is told it failed and stops; the socket goes
+		// down a moment later regardless, and a session that never recorded it would go
+		// on reporting itself open over a connection that no longer exists, with no close
+		// event to correct it.
+		s.settleHangUp()
 	}()
 
 	select {
@@ -442,6 +488,22 @@ func (s *Session) hangUp(ctx context.Context, client *wm.Client) error {
 	case <-s.done:
 		return nil
 	}
+}
+
+// settleHangUp records a socket this session took down on purpose.
+func (s *Session) settleHangUp() {
+	s.mu.Lock()
+	if s.closed {
+		// The session is being torn down; its own Close publishes nothing and neither
+		// should this.
+		s.mu.Unlock()
+		return
+	}
+	s.hungUp = true
+	s.mu.Unlock()
+
+	s.offline()
+	s.emit(protocol.EventSessionState, map[string]any{"state": "close", "reason": "disconnect_requested"})
 }
 
 // abandonPairing gives up a pairing conversation and puts the socket back where a
@@ -499,7 +561,9 @@ func (s *Session) pairWithCode(ctx context.Context, phone string) error {
 	}()
 
 	s.emit(protocol.EventSessionState, map[string]any{"state": "connecting"})
-	if err := s.dial(ctx, client); err != nil {
+	// Nothing to report if this one detaches: the attempt is torn down below whatever
+	// the dial goes on to do, and a code pairing cannot continue without its command.
+	if err := s.dial(ctx, client, nil); err != nil {
 		// Off the executor when the dial is still running: Disconnect waits on the lock
 		// that dial is holding, and this attempt is over either way.
 		go s.abandonPairing(run, client)
@@ -540,15 +604,7 @@ func (s *Session) pairWithCode(ctx context.Context, phone string) error {
 // Disconnect drops the socket and keeps the credentials.
 func (s *Session) Disconnect(ctx context.Context) error {
 	s.cancelPairing()
-	if err := s.hangUp(ctx, s.current()); err != nil {
-		return err
-	}
-	s.mu.Lock()
-	s.hungUp = true
-	s.mu.Unlock()
-	s.offline()
-	s.emit(protocol.EventSessionState, map[string]any{"state": "close", "reason": "disconnect_requested"})
-	return nil
+	return s.hangUp(ctx, s.current())
 }
 
 // Logout ends the session on WhatsApp's side and forgets the credentials here, so the

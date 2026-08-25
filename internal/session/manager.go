@@ -197,8 +197,14 @@ func (m *Manager) Dispatch(ctx context.Context, delivery *transport.Delivery) {
 		release(delivery)
 		return
 	}
-	if !session.Offer(delivery) {
+	switch session.Offer(delivery) {
+	case OfferAccepted:
+	case OfferBusy:
 		m.refuse(ctx, delivery, protocol.NewError(protocol.ErrorRateLimited, "the session has too many commands waiting"))
+	case OfferStopped:
+		// This instance is letting the account go. Refusing would answer for an owner
+		// it is no longer, so the command stays pending for whoever takes it next.
+		release(delivery)
 	}
 }
 

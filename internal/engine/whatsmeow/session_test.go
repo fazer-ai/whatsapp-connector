@@ -2,6 +2,7 @@ package whatsmeow
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -912,4 +913,97 @@ func (s *Session) disconnected() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.hungUp
+}
+
+// whatsmeow holds its socket lock for the length of a dial and Disconnect waits for the
+// same lock, so a disconnect arriving mid-handshake outlives its deadline. The command
+// is answered as failed and the socket goes down a moment later regardless: a session
+// that recorded nothing would go on reporting itself open over a connection that no
+// longer exists, with no close event to correct it.
+func TestADisconnectThatOutlivesItsDeadlineIsStillRecorded(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setConnected(true)
+
+	holding := make(chan struct{})
+	session.disconnect = func(*wm.Client) { <-holding }
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if err := session.Disconnect(ctx); err == nil {
+		t.Fatal("a disconnect that could not close the socket reported success")
+	}
+	if state := session.state(); state != "open" {
+		t.Fatalf("state = %q before the socket actually closed, want open", state)
+	}
+
+	// And now the socket does close, long after the caller gave up.
+	close(holding)
+
+	emission := next(t, session)
+	if emission.Type != protocol.EventSessionState {
+		t.Fatalf("published %q, want a session state", emission.Type)
+	}
+	var body struct {
+		State  string `json:"state"`
+		Reason string `json:"reason"`
+	}
+	if err := json.Unmarshal(emission.Payload, &body); err != nil {
+		t.Fatalf("unmarshal the state: %v", err)
+	}
+	if body.State != "close" || body.Reason != "disconnect_requested" {
+		t.Fatalf("published %+v, want close/disconnect_requested", body)
+	}
+	if !session.disconnected() {
+		t.Fatal("the guard against a queued Connected event was never raised")
+	}
+}
+
+// A dial the caller stopped waiting for still has to say how it ended, or the client
+// sits on the `connecting` published just before it for as long as the session lasts.
+func TestADetachedDialReportsOnlyWhatIsWorthReporting(t *testing.T) {
+	t.Parallel()
+
+	t.Run("a failure is reported", func(t *testing.T) {
+		t.Parallel()
+		session, _ := newTestSession(t, "5511999990001")
+
+		reported := make(chan error, 1)
+		dialed := make(chan error, 1)
+		dialed <- errors.New("the server hung up")
+		session.awaitDetachedDial(dialed, func(err error) { reported <- err })
+
+		select {
+		case err := <-reported:
+			if err == nil {
+				t.Fatal("reported a nil failure")
+			}
+		default:
+			t.Fatal("a dial that failed after its command gave up reported nothing")
+		}
+	})
+
+	t.Run("a success needs nobody", func(t *testing.T) {
+		t.Parallel()
+		session, _ := newTestSession(t, "5511999990001")
+
+		dialed := make(chan error, 1)
+		dialed <- nil
+		session.awaitDetachedDial(dialed, func(error) {
+			t.Error("a connect that succeeded was reported as a failure; whatsmeow announces it itself")
+		})
+	})
+
+	t.Run("the session ending is not a failure", func(t *testing.T) {
+		t.Parallel()
+		session, _ := newTestSession(t, "5511999990001")
+		session.cancel()
+
+		dialed := make(chan error, 1)
+		dialed <- context.Canceled
+		session.awaitDetachedDial(dialed, func(error) {
+			t.Error("a dial interrupted by the session ending was published as a connect failure")
+		})
+	})
 }
