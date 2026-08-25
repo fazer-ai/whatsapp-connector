@@ -147,8 +147,11 @@ func (m *Manager) Adopt(ctx context.Context, sid string) (*Session, error) {
 		// Bounded on its own, and detached from the caller: the reason the adoption
 		// failed is often the reason Redis is slow, and an unbounded cleanup would spend
 		// the deadline this function just enforced on retries nobody is waiting for.
+		//
+		// Through abandon, so a hand-back that does not get through is tried again rather
+		// than left as a key naming an instance that is running nothing.
 		release, cancelRelease := context.WithTimeout(context.WithoutCancel(ctx), releaseTimeout)
-		_, _ = m.leases.Release(release, sid)
+		m.abandon(release, sid)
 		cancelRelease()
 		return nil, err
 	}
@@ -309,6 +312,15 @@ func (m *Manager) releaseOrphans(ctx context.Context) {
 	}
 }
 
+// handingBack reports whether a lease this instance failed to give up is still queued to
+// be tried again.
+func (m *Manager) handingBack(sid string) bool {
+	m.orphanMu.Lock()
+	defer m.orphanMu.Unlock()
+	_, queued := m.orphans[sid]
+	return queued
+}
+
 func (m *Manager) forgetOrphan(sid string) {
 	m.orphanMu.Lock()
 	delete(m.orphans, sid)
@@ -363,7 +375,18 @@ func (m *Manager) wake(ctx context.Context, delivery *transport.Delivery) {
 
 	_, err := m.Adopt(ctx, sid)
 	switch {
-	case err == nil, errors.Is(err, cluster.ErrNotOwner):
+	case err == nil:
+	case errors.Is(err, cluster.ErrNotOwner):
+		if m.handingBack(sid) {
+			// Owned by this instance, which is running nothing and is still trying to
+			// give the lease up. Acknowledging here on the grounds that somebody else has
+			// it retires the only thing that would have started the session, and once the
+			// stale key expires there is nothing left to start it at all.
+			m.log.Warn().Str("sid", sid).
+				Msg("a wake found a lease this instance is still handing back; leaving it pending")
+			release(delivery)
+			return
+		}
 	default:
 		// Left unacknowledged on purpose. Every instance reads this stream through one
 		// consumer group, so acknowledging a wake nobody could act on retires it: the

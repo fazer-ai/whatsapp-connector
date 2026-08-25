@@ -82,6 +82,11 @@ type Session struct {
 	// the local cleanup is what fails.
 	logout func(context.Context, *wm.Client) error
 
+	// storeLimit bounds the store work an event handler does before it can publish what
+	// the event was. A field only so a test can make a store that stalls take less than
+	// the real bound; nothing else changes it.
+	storeLimit time.Duration
+
 	// transition serialises a change to the socket's state with the event announcing
 	// it. It is not mu: emit can block on a full inbox, and holding the session's own
 	// lock across that would stop everything that reads state, Close included.
@@ -151,6 +156,8 @@ func newSession(sid string, client *wm.Client, container *store.Container, log z
 		detach:     func(client *wm.Client, id uint32) { client.RemoveEventHandler(id) },
 		disconnect: func(client *wm.Client) { client.Disconnect() },
 		logout:     func(ctx context.Context, client *wm.Client) error { return client.Logout(ctx) },
+
+		storeLimit: bindTimeout,
 	}
 	s.adopt(client)
 	go s.forward()
@@ -696,11 +703,12 @@ func (s *Session) Logout(ctx context.Context) error {
 			// a logout that visibly failed, while WhatsApp goes on listing the device
 			// they asked to remove.
 			//
-			// Not settled as a logout either, and that is the same point twice: the
-			// commonest way to get here is a session whatsmeow is already reconnecting,
-			// and a guard raised now would have this session close the socket that comes
-			// back — for a command that failed and kept its credentials.
-			s.offline()
+			// The state is left exactly as it was, and that is the same point twice: the
+			// commonest way to get here is a session whatsmeow is already reconnecting.
+			// A guard raised now would have this session close the socket that comes
+			// back, and calling it offline would have `session.status` answer `close`
+			// for a reconnect that is going perfectly well — and a resume start a second
+			// dial alongside it.
 			return fmt.Errorf("whatsmeow: log %s out: %w", s.sid, err)
 		}
 		s.settleLogout()
@@ -785,6 +793,16 @@ func sentNothing(err error) bool {
 // call on that client answers ErrDeviceDeleted. Without this the documented next step,
 // pairing again, fails on a session the manager is still perfectly happy to run, and
 // the only way out is to release and re-adopt it.
+// rebuildWithin is rebuild on a bound, for the paths that have something to publish
+// afterwards. The session's own lifetime is not a deadline: a database that stalls on the
+// device lookup would hold this for as long as the process runs, and the event waiting
+// behind it is the one telling the client WhatsApp revoked the account.
+func (s *Session) rebuildWithin() error {
+	ctx, cancel := context.WithTimeout(s.ctx, s.storeLimit)
+	defer cancel()
+	return s.rebuild(ctx)
+}
+
 func (s *Session) rebuild(ctx context.Context) error {
 	if s.isClosed() {
 		// Nothing left to pair with. A session that closed while this was on its way is
@@ -1370,7 +1388,7 @@ func (s *Session) loggedOut(event *waEvents.LoggedOut) {
 	// every reconnect fail with a session that looks resumable and is not.
 	// On the session's own lifetime: `Forget` unbinds the mapping, so a stale owner
 	// finishing this after the account moved would erase what the new owner wrote.
-	ctx, cancel := context.WithTimeout(s.ctx, bindTimeout)
+	ctx, cancel := context.WithTimeout(s.ctx, s.storeLimit)
 	defer cancel()
 	cleaned := true
 	if err := s.store.Forget(ctx, s.sid); err != nil {
@@ -1395,7 +1413,7 @@ func (s *Session) loggedOut(event *waEvents.LoggedOut) {
 		// session healthy again.
 		if !cleaned {
 			s.markStale()
-		} else if err := s.rebuild(s.ctx); err != nil {
+		} else if err := s.rebuildWithin(); err != nil {
 			s.markStale()
 			s.log.Error().Err(err).Msg("failed to put a logged-out session back on a fresh client")
 		}

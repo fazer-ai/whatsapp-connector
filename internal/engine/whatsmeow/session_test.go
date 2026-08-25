@@ -1690,3 +1690,54 @@ func TestAnEndedConnectionRefusesTheConnectQueuedBehindIt(t *testing.T) {
 		})
 	}
 }
+
+// A logout attempted while whatsmeow is reconnecting comes back before anything is sent,
+// and the reconnect is still going. Calling the session offline there has `session.status`
+// answer `close` for a connection that is coming back, and a resume start a second dial
+// alongside the library's own.
+func TestALogoutThatNeverLeftLeavesTheStateAsItWas(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.logout = func(context.Context, *wm.Client) error { return wm.ErrNotConnected }
+	session.setConnected(false)
+	session.setReconnecting(true)
+
+	if err := session.Logout(t.Context()); err == nil {
+		t.Fatal("a logout that never left was reported as one that went through")
+	}
+	if state := session.state(); state != "reconnecting" {
+		t.Fatalf("the session reports %q for a reconnect the library is still running", state)
+	}
+}
+
+// The cleanup and the rebuild both run before the event that tells a client WhatsApp
+// revoked the account, and neither may take the session's whole lifetime: a database that
+// stalls would hold the news for as long as the process runs.
+func TestAnExternalLogoutIsPublishedEvenWhenTheStoreStalls(t *testing.T) {
+	t.Parallel()
+
+	session, container := newTestSession(t, "5511999990001")
+	session.storeLimit = 100 * time.Millisecond
+
+	// The store keeps one connection, so holding it is what makes every query after it
+	// wait: a database that stalls rather than one that answers with an error.
+	held, err := container.DB().Conn(t.Context())
+	if err != nil {
+		t.Fatalf("take the store's connection: %v", err)
+	}
+	t.Cleanup(func() { _ = held.Close() })
+
+	before := time.Now()
+	session.handle(&waEvents.LoggedOut{OnConnect: false, Reason: waEvents.ConnectFailureLoggedOut})
+
+	if emission := next(t, session); emission.Type != protocol.EventSessionLoggedOut {
+		t.Fatalf("published %q, want the account being logged out", emission.Type)
+	}
+	// The bound is what makes the news arrive at all: on the session's own lifetime, a
+	// store that never answers holds it for as long as the process runs.
+	if spent := time.Since(before); spent > 20*session.storeLimit {
+		t.Fatalf("the account being logged out took %s to reach the client, on a store bound of %s",
+			spent, session.storeLimit)
+	}
+}

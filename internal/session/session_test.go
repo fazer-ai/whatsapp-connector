@@ -1078,3 +1078,62 @@ func (h slowCommands) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
 		return next(ctx, cmd)
 	}
 }
+
+// A wake is acknowledged when adoption finds the session already owned, because in a
+// fleet that means somebody else is running it. It does not mean that when the lease
+// refusing the adoption is one this instance failed to give up: nobody is running the
+// session, and acknowledging retires the only thing that would have started it. Once the
+// stale key expires there is nothing left to start it at all.
+func TestAWakeRefusedByThisInstancesOwnStaleLeaseStaysPending(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+	keys := client.Keys()
+
+	clock := &steppingClock{now: time.Now()}
+	leases := cluster.NewLeases(client, "inst-a", cluster.Options{Clock: clock})
+	manager := session.NewManager(&session.ManagerConfig{
+		Instance: "inst-a", Engine: fake.New(), Leases: leases,
+		Publisher: newRecorder(), Replier: newRecorder(),
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	ctx := context.Background()
+
+	if _, err := manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+
+	// The lease goes stale while Redis is unreachable, and the hand-back does not land:
+	// the key still names this instance, which is running nothing.
+	var away atomic.Bool
+	away.Store(true)
+	hook := losesRenewals(keys.Cooldown("s1"))
+	hook.drop = func(cmd redis.Cmder) bool {
+		return away.Load() && isScript(cmd) && mentions(cmd, keys.Cooldown("s1"))
+	}
+	rdb.AddHook(hook)
+	clock.step(cluster.DefaultTTL + time.Second)
+	manager.RenewAll(ctx)
+
+	acked := &atomic.Bool{}
+	released := &atomic.Bool{}
+	wake := &transport.Delivery{
+		Command: protocol.Command{
+			V: protocol.Version, ID: "wake-1", Type: protocol.CommandSessionWake,
+			SID: "s1", TS: time.Now().UnixMilli(), Payload: json.RawMessage(`{"desired":"connected"}`),
+		},
+		Ack:     func(context.Context) error { acked.Store(true); return nil },
+		Release: func() { released.Store(true) },
+	}
+	manager.Dispatch(ctx, wake)
+
+	if acked.Load() {
+		t.Fatal("the wake was retired on the word of a lease this instance is still handing back")
+	}
+	if !released.Load() {
+		t.Fatal("the wake was neither carried out nor let go of, so nothing will reclaim it")
+	}
+}
