@@ -2,7 +2,9 @@ package whatsmeow
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -130,9 +132,15 @@ type Session struct {
 	// holds its socket lock for the length of a dial and Disconnect waits for the same
 	// lock, so a disconnect can outlive the command that asked for it.
 	hangingUp chan struct{}
-	// runs counts the conversations this session has started, which is what gives each
-	// one a name the client can answer to.
+	// runs counts the conversations this session has started. Paired with nonce it is
+	// what gives each one a name the client can answer to.
 	runs uint64
+	// nonce is this session's own, drawn once when it is built. A count alone starts
+	// over whenever a session is rebuilt — a restart, a lease moving — so the first
+	// conversation of the new one would answer to the name the last one used, and an
+	// answer still in flight from before would be sent to WhatsApp against a challenge
+	// it was never meant for.
+	nonce string
 	// closing is what the engine wants told when this session ends, so a session that
 	// is over stops being something the engine hands out or holds on to.
 	closing func()
@@ -167,6 +175,7 @@ func newSession(sid string, client *wm.Client, container *store.Container, log z
 		cancel:     cancel,
 		detach:     func(client *wm.Client, id uint32) { client.RemoveEventHandler(id) },
 		disconnect: func(client *wm.Client) { client.Disconnect() },
+		nonce:      sessionNonce(),
 		logout:     func(ctx context.Context, client *wm.Client) error { return client.Logout(ctx) },
 
 		storeLimit: bindTimeout,
@@ -183,6 +192,19 @@ func (s *Session) onClose(fn func()) {
 	s.mu.Lock()
 	s.closing = fn
 	s.mu.Unlock()
+}
+
+// sessionNonce is what makes one session's pairing names its own.
+//
+// The clock is the fallback rather than the answer: two sessions built in the same
+// nanosecond would share a name, and a rebuild after a restart is exactly when that is
+// least unlikely.
+func sessionNonce() string {
+	raw := make([]byte, 8)
+	if _, err := rand.Read(raw); err != nil {
+		return strconv.FormatInt(time.Now().UnixNano(), 36)
+	}
+	return hex.EncodeToString(raw)
 }
 
 // identityOf reads what a client was built knowing. Safe before the client is running,
@@ -1021,7 +1043,7 @@ func (s *Session) pairingActive() bool {
 func (s *Session) startPairing(ctx context.Context, cancel context.CancelFunc) *pairingRun {
 	s.runs++
 	run := &pairingRun{
-		id:     s.sid + "-" + strconv.FormatUint(s.runs, 10),
+		id:     s.sid + "-" + s.nonce + "-" + strconv.FormatUint(s.runs, 10),
 		cancel: cancel,
 		done:   ctx.Done(),
 	}

@@ -497,8 +497,11 @@
     },
     "event_pairing_passkey_confirmation": {
       "type": "object",
-      "properties": { "code": { "type": "string" } },
-      "required": ["code"],
+      "properties": {
+        "request_id": { "type": "string" },
+        "code": { "type": "string" }
+      },
+      "required": ["request_id", "code"],
       "additionalProperties": true
     },
     "event_message_received": {

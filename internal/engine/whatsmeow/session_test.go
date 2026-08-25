@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"image/png"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -1974,5 +1975,96 @@ func TestAConnectGoesAheadOnceTheDisconnectLanded(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("a disconnect that finished is still being waited on")
+	}
+}
+
+// A count alone starts over whenever a session is rebuilt — a restart, a lease moving —
+// so the first conversation of the new one would answer to the name the last one used. An
+// answer still in flight from before would then be sent to WhatsApp against a challenge it
+// was never meant for, and end the attempt the operator is watching.
+func TestAPairingNameIsNotReusedByASessionRebuilt(t *testing.T) {
+	t.Parallel()
+
+	names := make(map[string]struct{})
+	for range 8 {
+		// A rebuilt session for the same account, which is what a restart or a lease
+		// moving leaves behind.
+		session, _ := newTestSession(t, "")
+		run := session.startPairing(t.Context(), func() {})
+		if _, seen := names[run.id]; seen {
+			t.Fatalf("a rebuilt session answers to %q, the name one before it used", run.id)
+		}
+		names[run.id] = struct{}{}
+	}
+}
+
+// And the confirmation carries the name the client answers with, or there is no way to
+// address the reply.
+func TestThePasskeyConfirmationCarriesTheNameToAnswerWith(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "")
+	run := session.startPairing(t.Context(), func() {})
+
+	session.publishPairing(run, wm.QRChannelItem{
+		Event:               wm.QRChannelEventPasskeyResponse,
+		PasskeyConfirmation: &waEvents.PairPasskeyConfirmation{Code: "4821"},
+	}, true)
+
+	emission := next(t, session)
+	var body struct {
+		RequestID string `json:"request_id"`
+		Code      string `json:"code"`
+	}
+	if err := json.Unmarshal(emission.Payload, &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if body.RequestID != run.id {
+		t.Fatalf("the confirmation names %q, want the attempt's own %q", body.RequestID, run.id)
+	}
+	validateAgainstContract(t, "event_pairing_passkey_confirmation", emission.Payload)
+}
+
+// validateAgainstContract checks a payload against the definition the contract names, and
+// then that the contract names every field it carries.
+//
+// The second half is the one that matters here: the schema accepts extra properties, so a
+// field the connector publishes and the schema does not declare validates perfectly and is
+// invisible to a client generated from the contract — which for a `request_id` means no way
+// to address the reply it exists to be answered with.
+func validateAgainstContract(t *testing.T, definition string, payload json.RawMessage) {
+	t.Helper()
+
+	path := filepath.Join("..", "..", "..", "contract", "schema", "protocol.schema.json")
+	compiler := jsonschema.NewCompiler()
+	schema, err := compiler.Compile(path + "#/definitions/" + definition)
+	if err != nil {
+		t.Fatalf("compile %s: %v", definition, err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(payload, &decoded); err != nil {
+		t.Fatalf("unmarshal the payload for %s: %v", definition, err)
+	}
+	if err := schema.Validate(decoded); err != nil {
+		t.Fatalf("the payload does not match %s: %v", definition, err)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read the contract: %v", err)
+	}
+	var contract struct {
+		Definitions map[string]struct {
+			Properties map[string]json.RawMessage `json:"properties"`
+		} `json:"definitions"`
+	}
+	if err := json.Unmarshal(raw, &contract); err != nil {
+		t.Fatalf("read the contract: %v", err)
+	}
+	declared := contract.Definitions[definition].Properties
+	for field := range decoded {
+		if _, ok := declared[field]; !ok {
+			t.Fatalf("%s carries %q and the contract does not name it", definition, field)
+		}
 	}
 }
