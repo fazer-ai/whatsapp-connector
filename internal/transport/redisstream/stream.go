@@ -218,7 +218,6 @@ func (s *Streams) restoreUnrun(ctx context.Context) {
 	s.unrunMu.Unlock()
 
 	for stream, entries := range pending {
-		here := s.pendingHere(ctx, stream)
 		byIdle := make(map[time.Duration][]string)
 		for _, entry := range entries {
 			if s.running(stream, entry.id) {
@@ -226,27 +225,15 @@ func (s *Streams) restoreUnrun(ctx context.Context) {
 				// process is carrying out is how a peer comes to run it alongside.
 				continue
 			}
-			if _, mine := here[entry.id]; !mine {
-				// Acknowledged, or taken over by a peer while this instance was away for
-				// longer than the delay. XCLAIM does not ask who holds an entry, so an
-				// age put on this one would take it back out from under whoever is
-				// running it, and for a wake that means retiring the only wake there was
-				// while their adoption is still going.
-				continue
-			}
 			byIdle[entry.idle] = append(byIdle[entry.idle], entry.id)
 		}
 		for idle, ids := range byIdle {
-			// Raw, because go-redis models neither IDLE nor JUSTID on XCLAIM: IDLE is
-			// the whole point, and JUSTID keeps the delivery counter from moving for a
-			// hand-back that delivered nothing.
-			args := make([]any, 0, len(ids)+8)
-			args = append(args, "XCLAIM", stream, ConsumerGroup, s.opts.Instance, 0)
+			args := make([]any, 0, len(ids)+3)
+			args = append(args, ConsumerGroup, s.opts.Instance, idle.Milliseconds())
 			for _, id := range ids {
 				args = append(args, id)
 			}
-			args = append(args, "IDLE", idle.Milliseconds(), "JUSTID")
-			if err := s.client.Do(ctx, args...).Err(); err != nil && !errors.Is(err, redis.Nil) {
+			if err := restoreAgeScript.Run(ctx, s.client, []string{stream}, args...).Err(); err != nil {
 				// Nothing to retry. The entries are still pending and still come back,
 				// just no sooner than the delay: what is lost here is the age, not the
 				// command.
@@ -255,6 +242,30 @@ func (s *Streams) restoreUnrun(ctx context.Context) {
 		}
 	}
 }
+
+// restoreAgeScript puts an entry's idle time back, and only while this instance is still
+// the one holding it.
+//
+// One operation, because the two halves cannot be separated: XCLAIM transfers an entry
+// without ever asking who holds it, so between a check that said "still mine" and a claim
+// that acts on it a peer can take the entry and start carrying it out. The age would then
+// pull it back mid-flight, the command would run twice, and for a wake that means
+// retiring the only wake there was while the peer's adoption is still going.
+//
+// Raw XCLAIM inside, because go-redis models neither IDLE nor JUSTID: IDLE is the whole
+// point, and JUSTID keeps the delivery counter from moving for a hand-back that delivered
+// nothing.
+var restoreAgeScript = redis.NewScript(`
+local group, consumer, idle = ARGV[1], ARGV[2], ARGV[3]
+for i = 4, #ARGV do
+  local id = ARGV[i]
+  local pending = redis.call("XPENDING", KEYS[1], group, "IDLE", 0, id, id, 1)
+  if pending[1] and pending[1][2] == consumer then
+    redis.call("XCLAIM", KEYS[1], group, consumer, 0, id, "IDLE", idle, "JUSTID")
+  end
+end
+return 1
+`)
 
 // ClaimSessions takes over what is pending on these sessions' own streams, and looks at
 // nothing else.
@@ -349,38 +360,6 @@ func (s *Streams) rememberAge(stream string, idle time.Duration, deliveries []tr
 			s.unrunMu.Unlock()
 		}
 	}
-}
-
-// pendingHere is what is still pending under this instance's own name on a stream.
-//
-// It is what tells a hand-back this process may put an age back on from one a peer has
-// since taken: an entry released and left alone for longer than the delay is one anybody
-// may have claimed, and XCLAIM transfers an entry without ever asking who holds it.
-func (s *Streams) pendingHere(ctx context.Context, stream string) map[string]struct{} {
-	here := make(map[string]struct{})
-	start := "-"
-	// Paged and capped the same way reclaimable is, and for the same reason: this runs
-	// on the goroutine that renews every lease this instance holds.
-	for range maxPendingPages {
-		pending, err := s.client.XPendingExt(ctx, &redis.XPendingExtArgs{
-			Stream: stream, Group: ConsumerGroup, Consumer: s.opts.Instance,
-			Start: start, End: "+", Count: s.opts.ReadCount,
-		}).Result()
-		if err != nil || len(pending) == 0 {
-			// Nothing is put back rather than everything: an age not restored costs the
-			// delay once more, an age restored on somebody else's entry costs a command
-			// that runs twice.
-			return here
-		}
-		for _, entry := range pending {
-			here[entry.ID] = struct{}{}
-		}
-		if int64(len(pending)) < s.opts.ReadCount {
-			return here
-		}
-		start = pending[len(pending)-1].ID
-	}
-	return here
 }
 
 // reclaimable is the pending entries worth taking over: idle long enough, and held by

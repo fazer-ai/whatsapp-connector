@@ -1617,3 +1617,35 @@ func TestALogoutThatNeverLeftLeavesTheReconnectAlone(t *testing.T) {
 		t.Fatalf("published %q, want the session coming back up", emission.Type)
 	}
 }
+
+// A terminal outcome takes the connection down and raises the guard that refuses a late
+// connect. Retiring the run it belongs to has to happen first: a replacement attempt
+// starting in between would have this one close the socket it just opened, and the
+// operator's retry would fail for reasons of its own.
+func TestAPairingIsRetiredBeforeItsOutcomeIsPublished(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "")
+	run := session.startPairing(t.Context(), func() {})
+
+	// publishPairingFailure takes this to change the socket's state, so holding it pins
+	// the publication where a replacement attempt would start.
+	session.transition.Lock()
+	published := make(chan struct{})
+	go func() {
+		defer close(published)
+		session.publishPairing(run, wm.QRChannelTimeout, true)
+	}()
+
+	// The pairing error goes out before the state change, so waiting for it is what puts
+	// the publication inside the window under test.
+	if emission := next(t, session); emission.Type != protocol.EventPairingError {
+		t.Fatalf("published %q, want the pairing failure", emission.Type)
+	}
+	if session.isCurrentPairing(run) {
+		t.Fatal("a run publishing its terminal outcome is still the one a replacement would replace")
+	}
+
+	session.transition.Unlock()
+	<-published
+}

@@ -1138,12 +1138,27 @@ func (s *Session) publishPairing(run *pairingRun, item wm.QRChannelItem, publish
 	case "err-client-outdated":
 		s.emit(protocol.EventSessionClientOutdated, map[string]any{})
 	case "timeout":
-		s.publishPairingFailure("timeout", nil)
+		s.finishPairing(run, "timeout", nil)
 	case "error":
-		s.publishPairingFailure("error", item.Error)
+		s.finishPairing(run, "error", item.Error)
 	default:
-		s.publishPairingFailure(item.Event, item.Error)
+		s.finishPairing(run, item.Event, item.Error)
 	}
+}
+
+// finishPairing publishes the end of a conversation, once, and only while it is still
+// the one this session is on.
+//
+// Retiring it and publishing have to be one step in that order. A terminal outcome takes
+// the connection down and raises the guard that refuses a late connect: done a moment
+// after the operator's replacement attempt has started, that is this attempt closing the
+// socket the next one just opened, and a retry at the end of a pairing failing for
+// reasons of its own.
+func (s *Session) finishPairing(run *pairingRun, reason string, err error) {
+	if !s.endPairing(run) {
+		return
+	}
+	s.publishPairingFailure(reason, err)
 }
 
 // bind records the pairing before whatsmeow writes the device, which is what keeps a

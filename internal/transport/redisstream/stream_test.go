@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"strconv"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -694,4 +696,108 @@ func TestAgeIsNotPutBackOnWhatAPeerHasTaken(t *testing.T) {
 	if len(back) != 0 {
 		t.Fatalf("took back %d commands a peer is carrying out", len(back))
 	}
+}
+
+// The check and the age update have to be one operation. A peer that claims the entry in
+// between is one already carrying the command out, and an age put on it then pulls it
+// back mid-flight: the command runs twice, and for a wake that means retiring the only
+// wake there was while the peer's adoption is still going.
+func TestAgeIsNotPutBackOnAPeerThatCameInBetween(t *testing.T) {
+	t.Parallel()
+
+	const minIdle = 10 * time.Second
+	f := newFleet(t)
+	rdb := redis.NewClient(&redis.Options{Addr: f.server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	hooked := redisx.Wrap(rdb, "wa:", shards)
+
+	newStreams := func(client *redisx.Client, instance string) *redisstream.Streams {
+		streams, err := redisstream.New(client, redisstream.Options{
+			Instance: instance, Block: 50 * time.Millisecond, ClaimMinIdle: minIdle,
+		})
+		if err != nil {
+			t.Fatalf("redisstream.New: %v", err)
+		}
+		return streams
+	}
+	patient := newStreams(hooked, "inst-alive")
+	peer := newStreams(f.client, "inst-peer")
+	dead := f.streams(t, "inst-dead")
+	ctx := context.Background()
+
+	if _, err := dead.Read(ctx, []string{"s1"}); err != nil {
+		t.Fatalf("priming Read: %v", err)
+	}
+	writeCommand(t, f, f.client.Keys().Commands("s1"), command("c1", "s1", "c1"))
+	if taken, err := dead.Read(ctx, []string{"s1"}); err != nil || len(taken) != 1 {
+		t.Fatalf("the first instance read %d commands (err=%v), want 1", len(taken), err)
+	}
+
+	clock := time.Now().UTC()
+	tick := func(d time.Duration) { clock = clock.Add(d); f.server.SetTime(clock) }
+	tick(minIdle + time.Second)
+
+	claimed, err := patient.Claim(ctx, []string{"s1"})
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("Claim returned %d commands (err=%v), want 1", len(claimed), err)
+	}
+	claimed[0].Release()
+	tick(minIdle + time.Second)
+
+	// From here the peer takes the entry over on the way into the restore, which is the
+	// window a check done separately from the update leaves open.
+	var once sync.Once
+	rdb.AddHook(beforeRestore{do: func() {
+		once.Do(func() {
+			running, err := peer.Claim(ctx, []string{"s1"})
+			if err != nil || len(running) != 1 {
+				t.Errorf("the peer claimed %d commands (err=%v), want 1", len(running), err)
+			}
+		})
+	}})
+
+	back, err := patient.Claim(ctx, []string{"s1"})
+	if err != nil {
+		t.Fatalf("Claim after the peer came in: %v", err)
+	}
+	if len(back) != 0 {
+		t.Fatalf("took back %d commands a peer had started carrying out", len(back))
+	}
+}
+
+// beforeRestore runs something of the test's just before the age restore reaches Redis,
+// which is the only way to put a peer inside a window that is meant not to exist.
+type beforeRestore struct{ do func() }
+
+func (beforeRestore) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (beforeRestore) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+
+func (h beforeRestore) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if isRestore(cmd) {
+			h.do()
+		}
+		return next(ctx, cmd)
+	}
+}
+
+// isRestore is the age restore on its way out, whether it goes as a script or as the
+// XCLAIM a check-then-claim would send.
+func isRestore(cmd redis.Cmder) bool {
+	name := cmd.Name()
+	if name == "xclaim" {
+		return true
+	}
+	if !strings.HasPrefix(name, "eval") {
+		return false
+	}
+	for _, arg := range cmd.Args() {
+		if text, ok := arg.(string); ok && strings.Contains(text, "XCLAIM") {
+			return true
+		}
+	}
+	return false
 }
