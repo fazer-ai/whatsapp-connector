@@ -120,7 +120,14 @@ type Session struct {
 }
 
 // pairingRun is one pairing conversation.
-type pairingRun struct{ cancel context.CancelFunc }
+type pairingRun struct {
+	cancel context.CancelFunc
+	// done is closed when this conversation is cancelled. whatsmeow only watches the
+	// pairing context from the goroutine that emits codes, and that goroutine is started
+	// by the first QR event: a conversation whose dial failed before one arrived leaves
+	// its output channel open for good, so the reader needs something else to wake on.
+	done <-chan struct{}
+}
 
 //nolint:gocritic // zerolog.Logger is designed to be copied; every With() returns one by value
 func newSession(sid string, client *wm.Client, container *store.Container, log zerolog.Logger, wa waLog.Logger) *Session {
@@ -457,7 +464,7 @@ func (s *Session) pairWithQR(ctx context.Context) error {
 		cancel()
 		return fmt.Errorf("whatsmeow: open the pairing channel of %s: %w", s.sid, err)
 	}
-	run := s.startPairing(cancel)
+	run := s.startPairing(pairCtx, cancel)
 
 	go s.readPairing(run, codes)
 
@@ -610,7 +617,7 @@ func (s *Session) pairWithCode(ctx context.Context, rawPhone string) error {
 		cancel()
 		return fmt.Errorf("whatsmeow: open the pairing channel of %s: %w", s.sid, err)
 	}
-	run := s.startPairing(cancel)
+	run := s.startPairing(pairCtx, cancel)
 
 	// The QR codes themselves are dropped: an operator who asked for a code is not
 	// looking at an image, and publishing both would have the dashboard show two ways
@@ -870,8 +877,8 @@ func (s *Session) pairingActive() bool {
 }
 
 // startPairing makes a run the current one and ends whatever it replaces.
-func (s *Session) startPairing(cancel context.CancelFunc) *pairingRun {
-	run := &pairingRun{cancel: cancel}
+func (s *Session) startPairing(ctx context.Context, cancel context.CancelFunc) *pairingRun {
+	run := &pairingRun{cancel: cancel, done: ctx.Done()}
 	s.mu.Lock()
 	previous := s.pairing
 	s.pairing = run
@@ -1012,7 +1019,36 @@ func (s *Session) readPairingWith(run *pairingRun, codes <-chan wm.QRChannelItem
 	defer func() { _ = s.endPairing(run) }()
 
 	first := true
-	for item := range codes {
+	// Called on every way out but the one where a code arrived: whoever is waiting for
+	// the connection is waiting for something that will never come.
+	nothingArrived := func() {
+		if first && onFirst != nil {
+			onFirst(false)
+		}
+	}
+
+	for {
+		var item wm.QRChannelItem
+		var open bool
+		select {
+		case item, open = <-codes:
+			if !open {
+				nothingArrived()
+				return
+			}
+		case <-run.done:
+			// Given up on. Ranging the channel alone would not end here: whatsmeow closes
+			// it from the goroutine that emits codes, and a conversation whose dial failed
+			// before the first code never started one. This reader would then wait on it
+			// for the life of the process, holding the session and the client behind it,
+			// once per failed attempt.
+			nothingArrived()
+			return
+		case <-s.done:
+			nothingArrived()
+			return
+		}
+
 		if item.Event == "code" && first {
 			first = false
 			if onFirst != nil {
@@ -1020,11 +1056,6 @@ func (s *Session) readPairingWith(run *pairingRun, codes <-chan wm.QRChannelItem
 			}
 		}
 		s.publishPairing(run, item, publishCodes)
-	}
-	if first && onFirst != nil {
-		// The channel ended before a single code arrived, so whoever is waiting for the
-		// connection is waiting for something that will never come.
-		onFirst(false)
 	}
 }
 

@@ -100,6 +100,26 @@ func LoadConfig(hostname string) (Config, error) {
 	if cfg.Instance == "" {
 		return Config{}, fmt.Errorf("app: WAC_INSTANCE is empty and the hostname is unknown")
 	}
+	if cfg.LeaseTTL <= 0 {
+		// cluster.NewLeases substitutes its own default for a non-positive TTL, so the
+		// leases would work while everything derived from this value here would not: the
+		// dispatch budget is a third of it, and a zero budget is a context that has
+		// already expired, so every command is released the moment it is read. An
+		// instance that reads work and does none of it, reporting itself healthy.
+		return Config{}, fmt.Errorf("app: WAC_LEASE_TTL must be positive, got %s", cfg.LeaseTTL)
+	}
+	if cfg.Heartbeat <= 0 {
+		return Config{}, fmt.Errorf("app: WAC_HEARTBEAT must be positive, got %s", cfg.Heartbeat)
+	}
+	if cfg.Heartbeat >= cfg.LeaseTTL {
+		// Leases are renewed on the heartbeat and on nothing else, so a heartbeat that
+		// does not fit inside the TTL is one where every lease is already stale when the
+		// tick that would have renewed it arrives: every session on the instance is
+		// stopped, every tick, for as long as it runs.
+		return Config{}, fmt.Errorf(
+			"app: WAC_HEARTBEAT (%s) must be shorter than WAC_LEASE_TTL (%s), or a lease expires "+
+				"before the tick that would renew it", cfg.Heartbeat, cfg.LeaseTTL)
+	}
 	if cfg.ClaimMinIdle <= cfg.LeaseTTL {
 		// A wake is acknowledged when adoption finds the session already owned, because
 		// in a fleet that means somebody else is running it. That is only true while the

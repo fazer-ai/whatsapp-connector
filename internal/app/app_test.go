@@ -498,3 +498,44 @@ func TestASessionWithALongBacklogIsDrainedBeforeItIsRead(t *testing.T) {
 		time.Sleep(200 * time.Millisecond)
 	}
 }
+
+// A non-positive lease is accepted by cluster.NewLeases, which substitutes its own
+// default, so the leases go on working while everything derived from the configured
+// value here does not: the dispatch budget is a third of it, and a zero budget is a
+// context that has already expired, so every command read is released again unrun. An
+// instance that takes work, does none of it, and reports itself healthy.
+func TestATimingThatCannotWorkIsRefusedAtStartup(t *testing.T) {
+	for name, env := range map[string]map[string]string{
+		"a lease of no length": {
+			"WAC_LEASE_TTL": "0s", "WAC_CLAIM_MIN_IDLE": "1s", "WAC_HEARTBEAT": "1s",
+		},
+		"a lease that runs backwards": {
+			"WAC_LEASE_TTL": "-30s", "WAC_CLAIM_MIN_IDLE": "1s", "WAC_HEARTBEAT": "1s",
+		},
+		"a heartbeat of no length": {
+			"WAC_LEASE_TTL": "30s", "WAC_CLAIM_MIN_IDLE": "45s", "WAC_HEARTBEAT": "0s",
+		},
+		"a heartbeat the lease cannot outlast": {
+			"WAC_LEASE_TTL": "30s", "WAC_CLAIM_MIN_IDLE": "45s", "WAC_HEARTBEAT": "30s",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			for key, value := range env {
+				t.Setenv(key, value)
+			}
+			if _, err := app.LoadConfig("connector-test"); err == nil {
+				t.Fatalf("%s started", name)
+			}
+		})
+	}
+
+	// And the timing a deployment actually runs still starts.
+	for key, value := range map[string]string{
+		"WAC_LEASE_TTL": "30s", "WAC_CLAIM_MIN_IDLE": "45s", "WAC_HEARTBEAT": "5s",
+	} {
+		t.Setenv(key, value)
+	}
+	if _, err := app.LoadConfig("connector-test"); err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+}

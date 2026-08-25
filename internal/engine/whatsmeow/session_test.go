@@ -270,7 +270,7 @@ func TestTerminalPairingOutcomesArePublishedOnce(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			session, _ := newTestSession(t, "")
-			session.startPairing(func() {})
+			session.startPairing(t.Context(), func() {})
 
 			session.handle(event)
 
@@ -338,7 +338,7 @@ func TestPairingChannelIsTranslated(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			session, _ := newTestSession(t, "")
-			run := session.startPairing(func() {})
+			run := session.startPairing(t.Context(), func() {})
 
 			session.publishPairing(run, test.item, true)
 			if emission := next(t, session); emission.Type != test.want {
@@ -351,7 +351,7 @@ func TestPairingChannelIsTranslated(t *testing.T) {
 func TestCodePairingDoesNotPublishImages(t *testing.T) {
 	t.Parallel()
 	session, _ := newTestSession(t, "")
-	run := session.startPairing(func() {})
+	run := session.startPairing(t.Context(), func() {})
 
 	// An operator who asked for a code is not looking at an image, and publishing both
 	// would offer the dashboard two ways to pair one session.
@@ -560,7 +560,7 @@ func TestACancelledPairingRunPublishesNothingMore(t *testing.T) {
 	t.Parallel()
 	session, _ := newTestSession(t, "")
 
-	run := session.startPairing(func() {})
+	run := session.startPairing(t.Context(), func() {})
 	session.cancelPairing()
 
 	session.publishPairing(run, wm.QRChannelItem{Event: "code", Code: "2@a,b,c"}, true)
@@ -605,7 +605,7 @@ func TestAPairingSessionReportsConnecting(t *testing.T) {
 	if state := session.state(); state != "close" {
 		t.Fatalf("an idle session reports %q", state)
 	}
-	session.startPairing(func() {})
+	session.startPairing(t.Context(), func() {})
 	if state := session.state(); state != "connecting" {
 		t.Fatalf("a session mid-pairing reports %q, want connecting", state)
 	}
@@ -1291,7 +1291,7 @@ func TestAPairingDialThatFailedIsReported(t *testing.T) {
 	t.Parallel()
 
 	session, _ := newTestSession(t, "")
-	run := session.startPairing(func() {})
+	run := session.startPairing(t.Context(), func() {})
 	session.setDialing(true)
 
 	session.abandonPairing(run, session.current(), "connect_failed", errors.New("no route to host"))
@@ -1325,7 +1325,7 @@ func TestAPairingIsGivenUpOnOnlyOnce(t *testing.T) {
 	t.Parallel()
 
 	session, _ := newTestSession(t, "")
-	run := session.startPairing(func() {})
+	run := session.startPairing(t.Context(), func() {})
 
 	session.abandonPairing(run, session.current(), "connect_failed", errors.New("no route to host"))
 	session.abandonPairing(run, session.current(), "connect_failed", errors.New("no route to host"))
@@ -1361,4 +1361,70 @@ func TestBuildingEnginesAtOnceDoesNotRaceOverTheDeviceName(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+// whatsmeow closes its pairing channel from the goroutine that emits codes, and that
+// goroutine is started by the first QR event. An attempt whose dial failed before one
+// arrived therefore leaves the channel open for good: a reader that only ranges over it
+// waits there for the life of the process, holding the session and the client behind it,
+// once for every failed attempt.
+func TestAPairingReaderStopsWhenTheAttemptIsGivenUpOn(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "")
+	pairCtx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	run := session.startPairing(pairCtx, cancel)
+
+	// Never closed, and never written to: whatsmeow's channel when the dial failed
+	// before the first code.
+	codes := make(chan wm.QRChannelItem)
+	ready := make(chan bool, 1)
+	reading := make(chan struct{})
+	go func() {
+		defer close(reading)
+		session.readPairingWith(run, codes, func(arrived bool) { ready <- arrived }, false)
+	}()
+
+	session.abandonPairing(run, session.current(), "connect_failed", errors.New("no route to host"))
+
+	select {
+	case <-reading:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the reader is still waiting on a channel whatsmeow is never going to close")
+	}
+	select {
+	case arrived := <-ready:
+		if arrived {
+			t.Fatal("the reader reported a code that never came")
+		}
+	default:
+		t.Fatal("nothing was told to the caller waiting for the connection")
+	}
+}
+
+// The same for a session that is shut down while an attempt is open.
+func TestAPairingReaderStopsWhenTheSessionCloses(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "")
+	pairCtx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	run := session.startPairing(pairCtx, cancel)
+
+	codes := make(chan wm.QRChannelItem)
+	reading := make(chan struct{})
+	go func() {
+		defer close(reading)
+		session.readPairingWith(run, codes, nil, true)
+	}()
+
+	if err := session.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	select {
+	case <-reading:
+	case <-time.After(2 * time.Second):
+		t.Fatal("a closed session left a pairing reader waiting for good")
+	}
 }
