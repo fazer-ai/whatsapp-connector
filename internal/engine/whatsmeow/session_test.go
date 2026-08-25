@@ -1741,3 +1741,32 @@ func TestAnExternalLogoutIsPublishedEvenWhenTheStoreStalls(t *testing.T) {
 			spent, session.storeLimit)
 	}
 }
+
+// WhatsApp can revoke a device while authentication is still finishing, and whatsmeow
+// expects that disconnect and publishes nothing more for it. A Connected it had already
+// queued would then set the state back to connected and publish `open` after
+// session.logged_out, over an account that is gone, with nothing arriving later to
+// correct it.
+func TestALateConnectDoesNotReviveAnAccountWhatsappRevoked(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.storeLimit = 100 * time.Millisecond
+	session.setConnected(true)
+
+	session.handle(&waEvents.LoggedOut{OnConnect: false, Reason: waEvents.ConnectFailureLoggedOut})
+	if emission := next(t, session); emission.Type != protocol.EventSessionLoggedOut {
+		t.Fatalf("published %q, want the account being logged out", emission.Type)
+	}
+
+	session.handle(&waEvents.Connected{})
+
+	if state := session.state(); state == "open" {
+		t.Fatal("a connection queued behind the revocation put the session back up")
+	}
+	select {
+	case emission := <-session.Events():
+		t.Fatalf("published %q for an account WhatsApp has revoked", emission.Type)
+	case <-time.After(100 * time.Millisecond):
+	}
+}

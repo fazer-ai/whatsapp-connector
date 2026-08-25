@@ -1382,7 +1382,12 @@ func (s *Session) handle(rawEvent any) bool {
 }
 
 func (s *Session) loggedOut(event *waEvents.LoggedOut) {
-	s.offline()
+	// Settled like a logout this session asked for, because from here it is the same
+	// thing: whatsmeow expects this disconnect and publishes nothing more for it, so a
+	// Connected it had already queued would set the state back to connected and publish
+	// `open` after session.logged_out, over an account WhatsApp has revoked, with nothing
+	// arriving later to correct it.
+	s.settleLogout()
 
 	// The credentials are gone on WhatsApp's side, so keeping them here would have
 	// every reconnect fail with a session that looks resumable and is not.
