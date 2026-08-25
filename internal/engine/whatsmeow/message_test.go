@@ -540,3 +540,51 @@ func TestAMessageFromOneOfMetasBotsIsDroppedAndAcknowledged(t *testing.T) {
 		})
 	}
 }
+
+// A broadcast list is a way of sending, not a place a conversation happens: the
+// recipient sees the message in the direct chat with whoever sent it. Publishing the
+// list as the chat hands the client an address it never opens a conversation for, and
+// the acknowledgement goes out anyway, so the message exists on the recipient's phone
+// and nowhere else.
+func TestAnIncomingBroadcastIsAddressedToTheChatTheRecipientSeesItIn(t *testing.T) {
+	t.Parallel()
+
+	sender := waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)
+	event := textMessage("3EB0CAST", "promoção de hoje")
+	event.Info.Chat = waTypes.NewJID("5511999990002-1600000000", waTypes.BroadcastServer)
+	event.Info.Sender = sender
+	event.Info.IsGroup = true
+
+	message, ok := inboundOf(event)
+	if !ok {
+		t.Fatal("a broadcast a recipient can read was withheld")
+	}
+	want := protocol.Address{Kind: protocol.AddressPhone, ID: "5511999990002"}
+	if message.Chat != want {
+		t.Fatalf("the broadcast is addressed to %+v, want the direct chat %+v", message.Chat, want)
+	}
+	if message.Sender == nil || message.Sender.Phone != "5511999990002" {
+		t.Fatalf("the broadcast lost the sender it should be attributed to: %+v", message.Sender)
+	}
+
+	validateInboundAgainstContract(t, &message)
+}
+
+// The status feed rides the same server and is not a broadcast list. It stays where it
+// is, because the client drops it on purpose rather than for want of an address.
+func TestAStatusPostStaysOnTheStatusFeed(t *testing.T) {
+	t.Parallel()
+
+	event := textMessage("3EB0STATUS", "bom dia")
+	event.Info.Chat = waTypes.StatusBroadcastJID
+	event.Info.Sender = waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)
+	event.Info.IsGroup = true
+
+	message, ok := inboundOf(event)
+	if !ok {
+		t.Fatal("a status post was withheld")
+	}
+	if message.Chat.Kind != protocol.AddressStatus {
+		t.Fatalf("a status post is addressed to %+v, want the status feed", message.Chat)
+	}
+}
