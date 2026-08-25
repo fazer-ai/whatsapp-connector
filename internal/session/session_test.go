@@ -776,6 +776,58 @@ func TestStoppingASessionLetsGoOfWhatWasStillQueued(t *testing.T) {
 	}
 }
 
+// And the one that was running is retired rather than left half-way. The session's
+// context is exactly what has just been cancelled, so an acknowledgement made on it is
+// refused for the cancellation — and an entry whose ack did not land stays marked as
+// being carried out here, on purpose, so a reclaim does not run it twice. Every later
+// claim then skips it, this same instance included if it adopts the session again, and
+// the command is neither retired nor retried until the process restarts.
+func TestACommandRunningWhenItsSessionStopsIsStillRetired(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	held := newHeldEngine()
+	manager := session.NewManager(&session.ManagerConfig{
+		Instance: "inst-a", Engine: held,
+		Leases:    cluster.NewLeases(redisx.Wrap(rdb, "wa:", 8), "inst-a", cluster.Options{}),
+		Publisher: newRecorder(), Replier: newRecorder(),
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	ctx := context.Background()
+	if _, err := manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+
+	var acked atomic.Bool
+	running := &transport.Delivery{
+		Command: protocol.Command{
+			V: protocol.Version, ID: "c1", Type: protocol.CommandSessionStatus,
+			SID: "s1", TS: 1787000000000, Payload: json.RawMessage(`{}`),
+		},
+		Ack: func(ctx context.Context) error {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			acked.Store(true)
+			return nil
+		},
+		Release: func() { t.Error("a command that ran was given back instead of retired") },
+	}
+
+	manager.Dispatch(ctx, running)
+	waitUntil(t, "the command to reach the engine", func() bool {
+		return manager.Count() == 1 && held.taken()
+	})
+
+	// Which is what releases the engine: heldEngine answers the cancellation, so the
+	// command finishes on a session whose context has just gone.
+	manager.StopAll(ctx)
+
+	waitUntil(t, "the command that ran to be acknowledged", acked.Load)
+}
+
 // taken reports whether the engine has been asked to carry a command out.
 func (e *heldEngine) taken() bool { return e.entered.Load() }
 
