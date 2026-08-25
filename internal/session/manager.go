@@ -231,15 +231,22 @@ func (m *Manager) RenewAll(ctx context.Context) {
 			continue
 		}
 		if !errors.Is(err, cluster.ErrNotOwner) {
-			// A Redis blip is not proof the lease moved. The local freshness check
-			// stops the session acting on its own once the TTL runs out, so the right
-			// thing here is to try again next tick rather than to hand a live session
-			// away on one failed round trip.
-			m.log.Warn().Err(err).Str("sid", sid).Msg("could not renew a lease")
-			continue
+			if _, fresh := m.leases.Owned(sid); fresh {
+				// A Redis blip is not proof the lease moved, and the lease has not run
+				// out yet, so the right thing is to try again next tick rather than to
+				// hand a live session away on one failed round trip.
+				m.log.Warn().Err(err).Str("sid", sid).Msg("could not renew a lease")
+				continue
+			}
+			// It has run out. Whatever Redis is doing, a peer is now free to take this
+			// session, and a socket left open here would be the second one on the
+			// account: WhatsApp answers that by replacing the stream, and both owners
+			// write the same device meanwhile. Not knowing is the reason to let go, not
+			// a reason to hold on.
+			m.log.Warn().Err(err).Str("sid", sid).Msg("a lease went stale while unreachable; stopping the session")
+		} else {
+			m.log.Warn().Str("sid", sid).Msg("lost a lease; stopping the session")
 		}
-
-		m.log.Warn().Str("sid", sid).Msg("lost a lease; stopping the session")
 		m.mu.Lock()
 		session, ok := m.sessions[sid]
 		delete(m.sessions, sid)

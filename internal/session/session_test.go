@@ -370,3 +370,95 @@ func TestRenewAllDropsASessionWhoseLeaseMoved(t *testing.T) {
 		t.Fatal("the engine session is still connected after the lease moved")
 	}
 }
+
+// A Redis that stops answering is not proof the lease moved, so a renewal failure alone
+// is worth another tick. What is not worth another tick is a lease that has run out: a
+// peer is then free to take the session, and a socket still open here would be the
+// second one on the account. WhatsApp answers that by replacing the stream, and both
+// owners write the same device meanwhile.
+func TestRenewAllDropsASessionWhoseLeaseWentStaleWhileRedisWasUnreachable(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+
+	clock := &steppingClock{now: time.Now()}
+	leases := cluster.NewLeases(client, "inst-a", cluster.Options{Clock: clock})
+	fakeEngine := fake.New()
+	manager := session.NewManager(&session.ManagerConfig{
+		Instance: "inst-a", Engine: fakeEngine, Leases: leases,
+		Publisher: newRecorder(), Replier: newRecorder(),
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	ctx := context.Background()
+
+	if _, err := manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+
+	// The lease runs out and Redis is unreachable, so the renewal fails with something
+	// other than "you are not the owner": nobody can say who owns it now.
+	clock.step(cluster.DefaultTTL + time.Second)
+	server.Close()
+
+	manager.RenewAll(ctx)
+
+	if got := manager.Count(); got != 0 {
+		t.Fatalf("the manager still runs %d sessions on a lease that ran out", got)
+	}
+	engineSession, _ := fakeEngine.Session("s1")
+	if engineSession.Connected() {
+		t.Fatal("the engine session is still connected on a lease that ran out")
+	}
+}
+
+// The other half of the same rule: a blip that does not outlast the lease costs a tick,
+// not a session.
+func TestRenewAllKeepsASessionWhoseLeaseIsStillFresh(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+
+	leases := cluster.NewLeases(client, "inst-a", cluster.Options{})
+	fakeEngine := fake.New()
+	manager := session.NewManager(&session.ManagerConfig{
+		Instance: "inst-a", Engine: fakeEngine, Leases: leases,
+		Publisher: newRecorder(), Replier: newRecorder(),
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	ctx := context.Background()
+
+	if _, err := manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	server.Close()
+
+	manager.RenewAll(ctx)
+
+	if got := manager.Count(); got != 1 {
+		t.Fatalf("the manager dropped a session on one failed round trip (running %d)", got)
+	}
+}
+
+// steppingClock is the lease clock under a test's control.
+type steppingClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (c *steppingClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *steppingClock) step(d time.Duration) {
+	c.mu.Lock()
+	c.now = c.now.Add(d)
+	c.mu.Unlock()
+}

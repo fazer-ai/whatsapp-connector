@@ -136,6 +136,7 @@ restart, and reports itself healthy while doing it.
 | `WAC_EVENT_SHARDS` | `8` | How many event streams the fleet publishes to. Fleet-wide and effectively permanent: an instance that disagrees with what is recorded refuses to start |
 | `WAC_ENGINE` | `fake` | `whatsmeow` for a real account, `fake` for a fleet with nothing behind it |
 | `WAC_DATABASE_URL` | none | Where pairings live. `postgres://…`, `sqlite:…` or `file:…`. Required by the `whatsmeow` engine |
+| `WAC_DEVICE_NAME` | `fazer.ai` | What the account's linked-devices list shows. Fleet-wide, not per session: whatsmeow keeps device properties process-wide |
 | `WAC_HTTP_ADDR` | `:8080` | Where `/healthz`, `/readyz` and `/metrics` listen |
 | `WAC_ADVERTISE_URL` | derived | How clients reach this instance for media |
 | `WAC_LEASE_TTL` | `30s` | How long a session lease survives without a renewal |

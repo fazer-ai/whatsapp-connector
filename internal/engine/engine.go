@@ -70,7 +70,9 @@ type ConnectRequest struct {
 	Pairing string `json:"pairing"`
 	// Phone is required by code pairing and ignored otherwise.
 	Phone string `json:"phone,omitempty"`
-	// DeviceName is what the account's linked-devices list shows.
+	// DeviceName is what the account's linked-devices list shows. The whatsmeow engine
+	// cannot honour it per session: the library keeps device properties process-wide,
+	// so the deployment's own name is used instead.
 	DeviceName string `json:"device_name,omitempty"`
 	// Proxy is an object in the contract, not a string: decoding it as one made every
 	// connect carrying a proxy fail to parse before it reached an engine.

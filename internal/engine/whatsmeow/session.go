@@ -324,7 +324,9 @@ func (s *Session) pairWithCode(ctx context.Context, phone string) error {
 	}()
 
 	if err := s.dial(ctx, client); err != nil {
-		s.giveUpOn(ctx, client, err)
+		// Off the executor when the dial is still running: Disconnect waits on the lock
+		// that dial is holding, and this attempt is over either way.
+		go s.abandonPairing(client)
 		return fmt.Errorf("whatsmeow: connect %s: %w", s.sid, err)
 	}
 	s.emit(protocol.EventSessionState, map[string]any{"state": "connecting"})
@@ -332,6 +334,10 @@ func (s *Session) pairWithCode(ctx context.Context, phone string) error {
 	select {
 	case <-ready:
 	case <-ctx.Done():
+		// Unlike a QR conversation, this one cannot carry on without its command:
+		// nothing else will ever call PairPhone. Left up, the socket refuses the
+		// operator's next attempt at GetQRChannel until WhatsApp's own codes run out.
+		go s.abandonPairing(client)
 		return fmt.Errorf("whatsmeow: %s did not reach the server in time: %w", s.sid, ctx.Err())
 	case <-s.done:
 		return errors.New("whatsmeow: the session closed before it could ask for a code")
@@ -756,17 +762,20 @@ func (s *Session) loggedOut(event *waEvents.LoggedOut) {
 	if err := s.store.Forget(ctx, s.sid); err != nil {
 		s.log.Error().Err(err).Msg("failed to forget the device of a session that was logged out")
 	}
-	s.emit(protocol.EventSessionLoggedOut, map[string]any{
-		"reason": event.Reason.String(), "on_connect": event.OnConnect,
-	})
-
 	// Off this goroutine, and that is not a preference: whatsmeow dispatches events
 	// holding its handler lock for read, and rebuilding takes the same lock for write.
 	// Doing it here is a deadlock against ourselves, and the shutdown behind it.
+	//
+	// The event waits for the replacement. A client that reacts to session.logged_out
+	// by pairing again is the expected next step, and reaching a session still holding
+	// the deleted device answers it with an error for a state that had already passed.
 	go func() {
 		if err := s.rebuild(s.ctx); err != nil {
 			s.log.Error().Err(err).Msg("failed to put a logged-out session back on a fresh client")
 		}
+		s.emit(protocol.EventSessionLoggedOut, map[string]any{
+			"reason": event.Reason.String(), "on_connect": event.OnConnect,
+		})
 	}()
 }
 

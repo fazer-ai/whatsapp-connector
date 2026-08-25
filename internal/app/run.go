@@ -223,7 +223,7 @@ func newEngine(ctx context.Context, cfg *Config, log zerolog.Logger) (engine.Eng
 		if err != nil {
 			return nil, nil, err
 		}
-		return meow.New(devices, log), devices, nil
+		return meow.New(devices, cfg.DeviceName, log), devices, nil
 	default:
 		return nil, nil, fmt.Errorf("app: unknown engine %q", cfg.Engine)
 	}

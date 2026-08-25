@@ -14,7 +14,9 @@ import (
 
 	"github.com/rs/zerolog"
 	wm "go.mau.fi/whatsmeow"
+	waStore "go.mau.fi/whatsmeow/store"
 	waLog "go.mau.fi/whatsmeow/util/log"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/engine"
 	"github.com/fazer-ai/whatsapp-connector/internal/store"
@@ -33,8 +35,18 @@ type Engine struct {
 
 // New returns an engine over an open store.
 //
+// The device name is set once, process-wide, because that is the only place whatsmeow
+// keeps it: `store.DeviceProps` is a package-level value read during the pairing
+// handshake, so a per-session name would mean mutating a global in the middle of every
+// pairing and racing every other session doing the same. `session.connect` carries a
+// `device_name` the contract promises, and this is why it cannot be honoured per
+// session; the deployment's own name is what the account's linked-devices list shows.
+//
 //nolint:gocritic // zerolog.Logger is designed to be copied; every With() returns one by value
-func New(container *store.Container, log zerolog.Logger) *Engine {
+func New(container *store.Container, deviceName string, log zerolog.Logger) *Engine {
+	if deviceName != "" {
+		waStore.DeviceProps.Os = proto.String(deviceName)
+	}
 	return &Engine{
 		store:    container,
 		log:      log,

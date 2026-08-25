@@ -356,7 +356,7 @@ func TestCloseEndsTheEventChannelAndIsSafeTwice(t *testing.T) {
 func TestEngineKeepsOneSessionPerAccount(t *testing.T) {
 	t.Parallel()
 	container := openStore(t)
-	waEngine := New(container, zerolog.Nop())
+	waEngine := New(container, "fazer.ai test", zerolog.Nop())
 	t.Cleanup(func() {
 		if err := waEngine.Close(); err != nil {
 			t.Errorf("Close: %v", err)

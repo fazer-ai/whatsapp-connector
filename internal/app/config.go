@@ -26,6 +26,7 @@ type Config struct {
 	EventShards  int
 	Engine       string
 	DatabaseURL  string
+	DeviceName   string
 	HTTPAddr     string
 	AdvertiseURL string
 	MediaToken   string
@@ -39,6 +40,11 @@ const (
 	EngineFake      = "fake"
 	EngineWhatsmeow = "whatsmeow"
 )
+
+// DefaultDeviceName is what the account's linked-devices list shows for a session this
+// connector paired. It is fleet-wide rather than per session, because whatsmeow keeps
+// device properties process-wide.
+const DefaultDeviceName = "fazer.ai"
 
 // DefaultEventShards is how many event streams a fleet publishes to. It is fleet-wide
 // and effectively permanent: changing it re-hashes every session onto a different
@@ -70,6 +76,7 @@ func LoadConfig(hostname string) (Config, error) {
 		EventShards:  shards,
 		Engine:       envString("WAC_ENGINE", "fake"),
 		DatabaseURL:  envString("WAC_DATABASE_URL", ""),
+		DeviceName:   envString("WAC_DEVICE_NAME", DefaultDeviceName),
 		HTTPAddr:     envString("WAC_HTTP_ADDR", ":8080"),
 		AdvertiseURL: envString("WAC_ADVERTISE_URL", ""),
 		MediaToken:   envString("WAC_MEDIA_TOKEN", ""),
