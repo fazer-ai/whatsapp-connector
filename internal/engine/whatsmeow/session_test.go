@@ -648,3 +648,50 @@ func TestAReconnectingSessionSaysSo(t *testing.T) {
 		t.Fatalf("a recovered session reports %q", state)
 	}
 }
+
+// Decoding a proxy is not honouring one. Connecting directly for a deployment that
+// asked for egress routing puts its own address on the wire, and does it silently.
+func TestAProxyIsRefusedRatherThanIgnored(t *testing.T) {
+	t.Parallel()
+	session, _ := newTestSession(t, "5511999990001")
+
+	err := session.Connect(t.Context(), engine.ConnectRequest{
+		Pairing: "resume",
+		Proxy:   &engine.ProxyRequest{URL: "socks5://10.0.0.9:1080"},
+	})
+	var coded *protocol.Error
+	if !errors.As(err, &coded) || coded.Code != protocol.ErrorUnsupported {
+		t.Fatalf("a connect carrying a proxy answered %v, want unsupported", err)
+	}
+}
+
+// whatsmeow stops retrying once the connection ends for a reason retrying cannot fix.
+// A session left holding the retry flag reports itself reconnecting forever.
+func TestATerminalOutcomeEndsTheReconnect(t *testing.T) {
+	t.Parallel()
+
+	for name, event := range map[string]any{
+		"a temporary ban":            any(&waEvents.TemporaryBan{Expire: time.Hour}),
+		"a connect failure":          any(&waEvents.ConnectFailure{Reason: waEvents.ConnectFailureServiceUnavailable}),
+		"another device taking over": any(&waEvents.StreamReplaced{}),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			session, _ := newTestSession(t, "5511999990001")
+
+			session.handle(&waEvents.Connected{})
+			next(t, session)
+			session.handle(&waEvents.Disconnected{})
+			next(t, session)
+			if state := session.state(); state != "reconnecting" {
+				t.Fatalf("a dropped session reports %q", state)
+			}
+
+			session.handle(event)
+			next(t, session)
+			if state := session.state(); state != "close" {
+				t.Fatalf("%s left the session reporting %q", name, state)
+			}
+		})
+	}
+}

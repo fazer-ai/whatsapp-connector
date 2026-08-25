@@ -208,6 +208,16 @@ func (s *Session) setReconnecting(reconnecting bool) {
 	s.mu.Unlock()
 }
 
+// offline is a connection that is down and not coming back on its own. Every terminal
+// outcome goes through it, because leaving the retry flag up after whatsmeow has given
+// up reports a session as reconnecting forever.
+func (s *Session) offline() {
+	s.mu.Lock()
+	s.connected = false
+	s.reconnecting = false
+	s.mu.Unlock()
+}
+
 func (s *Session) setIdentity(phone, lid string) {
 	s.mu.Lock()
 	s.phone = phone
@@ -223,11 +233,18 @@ func (s *Session) Connect(ctx context.Context, req engine.ConnectRequest) error 
 	if s.isClosed() {
 		return errors.New("whatsmeow: the session is closed")
 	}
+	if req.Proxy != nil && req.Proxy.URL != "" {
+		// Decoding it is not honouring it. Connecting directly for a deployment that
+		// asked for egress routing puts its own address on the wire, and does it
+		// silently; per-session proxies are M5.
+		return protocol.NewError(protocol.ErrorUnsupported,
+			"this connector does not route a session through a proxy yet")
+	}
 	if s.isStale() {
 		// The device behind this client was deleted and its replacement could not be
 		// built at the time. Nothing on it works, so the connect that would have failed
 		// is the connect that repairs it.
-		if err := s.rebuild(ctx); err != nil {
+		if err := s.recover(ctx); err != nil {
 			return fmt.Errorf("whatsmeow: %s is still without a usable device: %w", s.sid, err)
 		}
 	}
@@ -464,8 +481,7 @@ func (s *Session) Disconnect(ctx context.Context) error {
 	if err := s.hangUp(ctx, s.current()); err != nil {
 		return err
 	}
-	s.setConnected(false)
-	s.setReconnecting(false)
+	s.offline()
 	s.emit(protocol.EventSessionState, map[string]any{"state": "close", "reason": "disconnect_requested"})
 	return nil
 }
@@ -477,7 +493,7 @@ func (s *Session) Logout(ctx context.Context) error {
 	if err := s.current().Logout(ctx); err != nil {
 		return fmt.Errorf("whatsmeow: log %s out: %w", s.sid, err)
 	}
-	s.setConnected(false)
+	s.offline()
 	if err := s.store.Forget(ctx, s.sid); err != nil {
 		// WhatsApp has already accepted the logout, so the client here is on a deleted
 		// device whatever happens next. Leaving without saying so strands the session on
@@ -521,6 +537,19 @@ func (s *Session) rebuild(ctx context.Context) error {
 	// cleaned up after. There is nothing left to do either way.
 	_ = s.adopt(wm.NewClient(device, s.waLog))
 	return nil
+}
+
+// recover puts a session that was logged out back where a fresh pairing can start:
+// the revoked credentials gone, and a client that is not the deleted one.
+//
+// Both halves, because a cleanup that failed leaves the mapping pointing at the revoked
+// device, and rebuilding from that hands the session the very credentials WhatsApp
+// threw away. Doing them together is what makes the retry a retry.
+func (s *Session) recover(ctx context.Context) error {
+	if err := s.store.Forget(ctx, s.sid); err != nil {
+		return err
+	}
+	return s.rebuild(ctx)
 }
 
 // markStale records that this session is on a client nothing works on. The next connect
@@ -911,10 +940,10 @@ func (s *Session) handle(rawEvent any) bool {
 		// whatsmeow suppresses the ordinary Disconnected for this one, so nothing else
 		// would take the connection down and the session would report itself open over a
 		// stream somebody else now holds.
-		s.setConnected(false)
+		s.offline()
 		s.emit(protocol.EventSessionStreamReplaced, map[string]any{})
 	case *waEvents.TemporaryBan:
-		s.setConnected(false)
+		s.offline()
 		ban := map[string]any{"kind": "temporary", "reason": event.Code.String()}
 		if event.Expire > 0 {
 			// A zero duration is whatsmeow saying it does not know when the ban lifts.
@@ -923,6 +952,7 @@ func (s *Session) handle(rawEvent any) bool {
 		}
 		s.emit(protocol.EventSessionTemporaryBan, map[string]any{"ban": ban})
 	case *waEvents.ClientOutdated:
+		s.offline()
 		if s.pairingActive() {
 			// The pairing reader publishes this one: whatsmeow delivers it here and to
 			// the QR channel both, and two canonical events for one outcome is worse
@@ -931,7 +961,7 @@ func (s *Session) handle(rawEvent any) bool {
 		}
 		s.emit(protocol.EventSessionClientOutdated, map[string]any{})
 	case *waEvents.ConnectFailure:
-		s.setConnected(false)
+		s.offline()
 		s.emit(protocol.EventSessionConnectFailure, map[string]any{
 			"reason": event.Reason.String(), "code": int(event.Reason),
 		})
@@ -951,7 +981,7 @@ func (s *Session) handle(rawEvent any) bool {
 }
 
 func (s *Session) loggedOut(event *waEvents.LoggedOut) {
-	s.setConnected(false)
+	s.offline()
 
 	// The credentials are gone on WhatsApp's side, so keeping them here would have
 	// every reconnect fail with a session that looks resumable and is not.
@@ -959,7 +989,9 @@ func (s *Session) loggedOut(event *waEvents.LoggedOut) {
 	// finishing this after the account moved would erase what the new owner wrote.
 	ctx, cancel := context.WithTimeout(s.ctx, bindTimeout)
 	defer cancel()
+	cleaned := true
 	if err := s.store.Forget(ctx, s.sid); err != nil {
+		cleaned = false
 		s.log.Error().Err(err).Msg("failed to forget the device of a session that was logged out")
 	}
 	// Off this goroutine, and that is not a preference: whatsmeow dispatches events
@@ -970,10 +1002,17 @@ func (s *Session) loggedOut(event *waEvents.LoggedOut) {
 	// by pairing again is the expected next step, and reaching a session still holding
 	// the deleted device answers it with an error for a state that had already passed.
 	go func() {
-		if err := s.rebuild(s.ctx); err != nil {
-			// The event still goes out: the account was logged out whatever happened
-			// here, and a client left waiting for that news is worse off than one told
-			// late that its next connect has to try again.
+		// The event goes out either way: the account was logged out whatever happened
+		// here, and a client left waiting for that news is worse off than one told late
+		// that its next connect has to try again.
+		//
+		// Rebuilding on top of a cleanup that failed would be worse than not rebuilding:
+		// the mapping still points at the revoked device, so the fresh client would be
+		// handed the very credentials WhatsApp threw away, and `adopt` would call the
+		// session healthy again.
+		if !cleaned {
+			s.markStale()
+		} else if err := s.rebuild(s.ctx); err != nil {
 			s.markStale()
 			s.log.Error().Err(err).Msg("failed to put a logged-out session back on a fresh client")
 		}
