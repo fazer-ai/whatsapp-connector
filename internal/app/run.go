@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"slices"
 	"syscall"
 	"time"
 
@@ -50,6 +51,10 @@ type Connector struct {
 	store    *store.Container
 	streams  *redisstream.Streams
 	http     *httpserver.Server
+
+	// reclaimCursor is where the next reclaim pass starts. Read and written only by the
+	// loop goroutine, which is also the only one that reclaims.
+	reclaimCursor int
 }
 
 // New builds a connector: it dials Redis, agrees with the fleet on the shard count,
@@ -187,7 +192,19 @@ func (c *Connector) loop(ctx context.Context, httpErr <-chan error) error {
 // so the session it named would stay unowned until a client happened to send another
 // command, and the pending list would grow for as long as the instance ran.
 func (c *Connector) reclaimCommands(ctx context.Context) {
-	deliveries, err := c.streams.Claim(ctx, c.manager.SIDs())
+	// Bounded twice over, because this runs on the goroutine that renews every lease
+	// this instance holds. It costs at least one round trip per stream, so an instance
+	// with many sessions, or a Redis having a bad minute, could spend longer here than a
+	// lease survives — and the sessions whose leases went unrenewed are then acquired by
+	// peers while this instance still holds their sockets open.
+	//
+	// So: a window of streams rather than all of them, moving on each pass so every
+	// session is reached within a few heartbeats, and a deadline well inside the
+	// heartbeat for the whole thing.
+	pass, cancel := context.WithTimeout(ctx, c.cfg.Heartbeat/2)
+	defer cancel()
+
+	deliveries, err := c.streams.Claim(pass, c.nextReclaimWindow())
 	if err != nil {
 		if ctx.Err() == nil {
 			c.log.Error().Err(err).Msg("failed to reclaim commands")
@@ -199,7 +216,62 @@ func (c *Connector) reclaimCommands(ctx context.Context) {
 	}
 }
 
+// maxReclaimStreams is how many session streams one reclaim pass looks at. The control
+// stream is read on every pass regardless: it is where a wake lands, and a wake nobody
+// takes is a session nobody runs.
+const maxReclaimStreams = 16
+
+// nextReclaimWindow is the slice of owned sessions this pass covers. It rotates, so a
+// fleet member holding hundreds of sessions still reaches all of them, a few heartbeats
+// apart, without any one pass holding up a renewal.
+func (c *Connector) nextReclaimWindow() []string {
+	return c.windowOver(c.manager.SIDs())
+}
+
+func (c *Connector) windowOver(sids []string) []string {
+	if len(sids) <= maxReclaimStreams {
+		return sids
+	}
+	// SIDs comes off a map, so the order is not stable between calls and the cursor
+	// cannot index into it meaningfully. Sorting is what makes the rotation cover
+	// everything rather than resampling at random.
+	slices.Sort(sids)
+
+	start := c.reclaimCursor % len(sids)
+	c.reclaimCursor = (start + maxReclaimStreams) % len(sids)
+
+	window := make([]string, 0, maxReclaimStreams)
+	for i := range maxReclaimStreams {
+		window = append(window, sids[(start+i)%len(sids)])
+	}
+	return window
+}
+
+// drainAdopted takes over what the previous owner of a freshly adopted session left
+// pending, before this instance reads anything newer for it.
+func (c *Connector) drainAdopted(ctx context.Context) {
+	adopted := c.manager.TakeNewlyAdopted()
+	if len(adopted) == 0 {
+		return
+	}
+	deliveries, err := c.streams.ClaimSessions(ctx, adopted)
+	if err != nil {
+		if ctx.Err() == nil {
+			c.log.Error().Err(err).Msg("failed to drain what a newly adopted session had pending")
+		}
+		return
+	}
+	for i := range deliveries {
+		c.manager.Dispatch(ctx, &deliveries[i])
+	}
+}
+
 func (c *Connector) readCommands(ctx context.Context) {
+	// Before the read, not after: a session adopted a moment ago may have commands its
+	// previous owner abandoned, and reading `>` for it first would hand over what
+	// arrived later and run it out of order.
+	c.drainAdopted(ctx)
+
 	sids := c.manager.SIDs()
 	deliveries, err := c.streams.Read(ctx, sids)
 	if err != nil {

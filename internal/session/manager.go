@@ -33,6 +33,11 @@ type Manager struct {
 
 	mu       sync.RWMutex
 	sessions map[string]*Session
+
+	// newly is the sessions adopted since the loop last asked, waiting to have what
+	// their previous owner left pending drained before anything newer is read for them.
+	newlyMu sync.Mutex
+	newly   []string
 }
 
 // ManagerConfig is what a manager needs.
@@ -154,8 +159,32 @@ func (m *Manager) Adopt(ctx context.Context, sid string) (*Session, error) {
 	m.sessions[sid] = session
 	m.mu.Unlock()
 
+	m.newlyMu.Lock()
+	m.newly = append(m.newly, sid)
+	m.newlyMu.Unlock()
+
 	m.log.Info().Str("sid", sid).Uint64("epoch", lease.Epoch).Msg("adopted a session")
 	return session, nil
+}
+
+// TakeNewlyAdopted returns the sessions adopted since it was last called, and forgets
+// them.
+//
+// The caller uses it to drain what the previous owner left pending before it reads
+// anything newer for those sessions. Commands for one session are ordered by being on
+// one stream read by one consumer, and a command abandoned mid-flight is off that stream
+// until it is reclaimed: without this it comes back after commands that arrived later,
+// which for a disconnect landing behind the connect that replaced it is the account left
+// in the state nobody asked for.
+func (m *Manager) TakeNewlyAdopted() []string {
+	m.newlyMu.Lock()
+	defer m.newlyMu.Unlock()
+	if len(m.newly) == 0 {
+		return nil
+	}
+	taken := m.newly
+	m.newly = nil
+	return taken
 }
 
 // Release stops a session and gives up its lease.

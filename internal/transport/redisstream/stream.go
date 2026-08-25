@@ -179,7 +179,32 @@ func (s *Streams) Read(ctx context.Context, sids []string) ([]transport.Delivery
 // Claim takes over commands another instance read and never acknowledged, which is
 // what happens when it is killed between reading a command and carrying it out.
 func (s *Streams) Claim(ctx context.Context, sids []string) ([]transport.Delivery, error) {
-	streams := s.streamsFor(sids)
+	return s.claim(ctx, s.streamsFor(sids), s.opts.ClaimMinIdle)
+}
+
+// ClaimSessions takes over what is pending on these sessions' own streams, and looks at
+// nothing else.
+//
+// It is what a session just adopted needs before anything newer is read for it. The
+// heartbeat's own reclaim is not enough on its own: it runs on a tick and over the
+// sessions this instance already had, so a command abandoned by the previous owner would
+// still be sitting pending while a fresh `>` read hands over commands that arrived after
+// it. A `session.disconnect` running after the `session.connect` that replaced it leaves
+// the account in the state nobody asked for, and per-session order is the one thing the
+// single stream is for.
+// It waits for nothing, unlike the heartbeat's reclaim. The min-idle there is what
+// stops one instance taking work another is still doing, and that question is already
+// settled here: this instance holds the lease, so whoever held these entries has lost
+// it and is being torn down. Waiting the same delay would mean the abandoned command
+// arrives after the newer one every time, which is the reordering this exists to
+// prevent. What is left is the heartbeat or so between a lease moving and the old
+// owner noticing, where a command could run twice; that is invariant 5's ground, and
+// M2's.
+func (s *Streams) ClaimSessions(ctx context.Context, sids []string) ([]transport.Delivery, error) {
+	return s.claim(ctx, s.sessionStreams(sids), 0)
+}
+
+func (s *Streams) claim(ctx context.Context, streams []string, minIdle time.Duration) ([]transport.Delivery, error) {
 	if len(streams) == 0 {
 		return nil, nil
 	}
@@ -188,14 +213,25 @@ func (s *Streams) Claim(ctx context.Context, sids []string) ([]transport.Deliver
 	}
 
 	var claimed []transport.Delivery
+	// Every early return past this point has to let go of what it already took: a
+	// delivery handed out is one this process is counted as running, and one nobody
+	// dispatched is a command that never runs again until the process restarts.
+	fail := func(err error) ([]transport.Delivery, error) {
+		for i := range claimed {
+			if claimed[i].Release != nil {
+				claimed[i].Release()
+			}
+		}
+		return nil, err
+	}
 	for _, stream := range streams {
-		ids, err := s.reclaimable(ctx, stream)
+		ids, err := s.reclaimable(ctx, stream, minIdle)
 		switch {
 		case isNoGroup(err):
 			s.groups.forget(stream)
 			continue
 		case err != nil:
-			return nil, err
+			return fail(err)
 		case len(ids) == 0:
 			continue
 		}
@@ -204,7 +240,7 @@ func (s *Streams) Claim(ctx context.Context, sids []string) ([]transport.Deliver
 			Stream:   stream,
 			Group:    ConsumerGroup,
 			Consumer: s.opts.Instance,
-			MinIdle:  s.opts.ClaimMinIdle,
+			MinIdle:  minIdle,
 			Messages: ids,
 		}).Result()
 		switch {
@@ -212,7 +248,7 @@ func (s *Streams) Claim(ctx context.Context, sids []string) ([]transport.Deliver
 			s.groups.forget(stream)
 			continue
 		case err != nil && !errors.Is(err, redis.Nil):
-			return nil, fmt.Errorf("redisstream: claim %s: %w", stream, err)
+			return fail(fmt.Errorf("redisstream: claim %s: %w", stream, err))
 		}
 		claimed = append(claimed, s.deliveries([]redis.XStream{{Stream: stream, Messages: messages}})...)
 	}
@@ -228,7 +264,7 @@ func (s *Streams) Claim(ctx context.Context, sids []string) ([]transport.Deliver
 // consumer already executing it, and dispatched a second time alongside the first.
 // Acknowledging the original does not retire the copy. XPENDING is the only form that
 // says who holds an entry.
-func (s *Streams) reclaimable(ctx context.Context, stream string) ([]string, error) {
+func (s *Streams) reclaimable(ctx context.Context, stream string, minIdle time.Duration) ([]string, error) {
 	ids := make([]string, 0, s.opts.ReadCount)
 	start := "-"
 
@@ -240,7 +276,7 @@ func (s *Streams) reclaimable(ctx context.Context, stream string) ([]string, err
 		pending, err := s.client.XPendingExt(ctx, &redis.XPendingExtArgs{
 			Stream: stream,
 			Group:  ConsumerGroup,
-			Idle:   s.opts.ClaimMinIdle,
+			Idle:   minIdle,
 			Start:  start,
 			End:    "+",
 			Count:  s.opts.ReadCount,
@@ -287,12 +323,17 @@ const maxPendingPages = 8
 // always read: it carries `session.wake`, which is how a session with no owner gets
 // one, so an instance that only listened to what it already owns would never hear it.
 func (s *Streams) streamsFor(sids []string) []string {
+	return append(s.sessionStreams(sids), s.client.Keys().Control())
+}
+
+// sessionStreams is the per-session command streams and nothing else.
+func (s *Streams) sessionStreams(sids []string) []string {
 	keys := s.client.Keys()
 	streams := make([]string, 0, len(sids)+1)
 	for _, sid := range sids {
 		streams = append(streams, keys.Commands(sid))
 	}
-	return append(streams, keys.Control())
+	return streams
 }
 
 func (s *Streams) deliveries(result []redis.XStream) []transport.Delivery {

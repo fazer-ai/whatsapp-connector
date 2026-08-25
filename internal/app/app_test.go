@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"strconv"
 	"testing"
 	"time"
 
@@ -350,5 +351,77 @@ func TestTheReclaimDelayHasToOutlastALease(t *testing.T) {
 	}
 	if cfg.ClaimMinIdle <= cfg.LeaseTTL {
 		t.Fatalf("the default reclaim delay is %s against a %s lease", cfg.ClaimMinIdle, cfg.LeaseTTL)
+	}
+}
+
+// Commands for one session are ordered by being on one stream read by one consumer. A
+// command its previous owner read and abandoned is off that stream until somebody
+// reclaims it, so an instance that adopts the session and reads `>` first hands over
+// commands that arrived later and runs them out of order. The example is the one that
+// costs an operator something: a `session.disconnect` landing behind the
+// `session.connect` that replaced it leaves the account in the state nobody asked for.
+func TestASessionIsDrainedBeforeAnythingNewerIsReadForIt(t *testing.T) {
+	server := miniredis.RunT(t)
+	c := newClient(t, server.Addr())
+	ctx := context.Background()
+
+	const sid = "2f1c6f0e-0000-4000-8000-00000000000a"
+	commands := c.key.Commands(sid)
+
+	// The previous owner read a disconnect and died before carrying it out.
+	if err := c.rdb.XGroupCreateMkStream(ctx, commands, redisstream.ConsumerGroup, "0").Err(); err != nil {
+		t.Fatalf("create the group: %v", err)
+	}
+	c.send(ctx, commands, &protocol.Command{
+		V: protocol.Version, ID: "disconnect-old", Type: protocol.CommandSessionDisconnect, SID: sid,
+		TS: time.Now().UnixMilli(), Payload: json.RawMessage(`{}`),
+	})
+	taken, err := c.rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
+		Group: redisstream.ConsumerGroup, Consumer: "inst-dead", Streams: []string{commands, ">"}, Count: 10,
+	}).Result()
+	if err != nil || len(taken) != 1 || len(taken[0].Messages) != 1 {
+		t.Fatalf("the dead instance read %v (err=%v), want one command", taken, err)
+	}
+
+	// And then the operator reconnected, which is the command that must win.
+	c.send(ctx, commands, &protocol.Command{
+		V: protocol.Version, ID: "connect-new", Type: protocol.CommandSessionConnect, SID: sid,
+		TS: time.Now().UnixMilli(), ReplyTo: "connect-new", Payload: json.RawMessage(`{"pairing":"resume"}`),
+	})
+	c.send(ctx, c.key.Control(), &protocol.Command{
+		V: protocol.Version, ID: "wake-order", Type: protocol.CommandSessionWake, SID: sid,
+		TS: time.Now().UnixMilli(), Payload: json.RawMessage(`{"desired":"connected"}`),
+	})
+
+	connector := start(t, server.Addr(), "inst-a", map[string]string{
+		"WAC_LEASE_TTL": "3s", "WAC_CLAIM_MIN_IDLE": "3500ms",
+	})
+	waitFor(t, "the session to be adopted", func() bool { return connector.Sessions() == 1 })
+
+	if reply := c.await(ctx, "connect-new", 10*time.Second); !reply.OK {
+		t.Fatalf("the connect was refused: %+v", reply)
+	}
+
+	// Held past the reclaim delay: without the drain, the abandoned disconnect comes
+	// back on a later heartbeat and undoes the connect that replaced it.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		c.send(ctx, commands, &protocol.Command{
+			V: protocol.Version, ID: "status-" + strconv.FormatInt(time.Now().UnixNano(), 10),
+			Type: protocol.CommandSessionStatus, SID: sid, TS: time.Now().UnixMilli(),
+			ReplyTo: "status-check", Payload: json.RawMessage(`{}`),
+		})
+		reply := c.await(ctx, "status-check", 5*time.Second)
+		if !reply.OK {
+			t.Fatalf("session.status was refused: %+v", reply)
+		}
+		var status map[string]any
+		if err := json.Unmarshal(reply.Result, &status); err != nil {
+			t.Fatalf("unmarshal the status: %v", err)
+		}
+		if status["connection"] != "open" {
+			t.Fatalf("connection=%v after the abandoned disconnect came back, want open", status["connection"])
+		}
+		time.Sleep(200 * time.Millisecond)
 	}
 }

@@ -51,6 +51,10 @@ type CommandReader interface {
 	// Claim takes over commands left pending by an instance that stopped. It is what
 	// makes a command survive the death of the instance that was about to run it.
 	Claim(ctx context.Context, sids []string) ([]Delivery, error)
+	// ClaimSessions is Claim over these sessions' own streams and nothing else. It is
+	// what a session just adopted needs before anything newer is read for it, so that a
+	// command its previous owner abandoned is not overtaken by one that arrived later.
+	ClaimSessions(ctx context.Context, sids []string) ([]Delivery, error)
 }
 
 // Replier answers an RPC command.

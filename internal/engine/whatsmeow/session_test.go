@@ -10,6 +10,7 @@ import (
 	"image/png"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1006,4 +1007,57 @@ func TestADetachedDialReportsOnlyWhatIsWorthReporting(t *testing.T) {
 			t.Error("a dial interrupted by the session ending was published as a connect failure")
 		})
 	})
+}
+
+// whatsmeow dispatches from whichever goroutine produced the event, so a Disconnected
+// and the Connected that follows it can be handled at the same time. Which of the two
+// lands last is the library's to decide and not knowable here; what must not happen is
+// the two crossing, so that `session.status` says one thing while the last event on the
+// stream says the other and nothing ever reconciles them.
+func TestConcurrentSocketEventsLeaveStateAndStreamAgreeing(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+
+	// Read as they arrive, or the inbox fills and the emits stop being the thing under
+	// test.
+	last := make(chan string, 512)
+	go func() {
+		for emission := range session.Events() {
+			if emission.Type != protocol.EventSessionState {
+				continue
+			}
+			var body struct {
+				State string `json:"state"`
+			}
+			if err := json.Unmarshal(emission.Payload, &body); err != nil {
+				return
+			}
+			last <- body.State
+		}
+	}()
+
+	const pairs = 64
+	var wg sync.WaitGroup
+	for range pairs {
+		wg.Add(2)
+		go func() { defer wg.Done(); session.handle(&waEvents.Connected{}) }()
+		go func() { defer wg.Done(); session.handle(&waEvents.Disconnected{}) }()
+	}
+	wg.Wait()
+
+	// Every handler published exactly one state, and all of them have to be read: the
+	// forwarder is still delivering when the last handler returns, and a test that
+	// stopped at whatever had arrived would be comparing against the wrong event.
+	var reported string
+	for range pairs * 2 {
+		select {
+		case reported = <-last:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the states published were never all delivered")
+		}
+	}
+	if state := session.state(); state != reported {
+		t.Fatalf("session.status says %q while the last event said %q", state, reported)
+	}
 }
