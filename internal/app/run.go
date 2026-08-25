@@ -300,8 +300,18 @@ func (c *Connector) drainAdopted(ctx context.Context) []string {
 		return nil
 	}
 
+	// The same budget as a dispatch batch, for the same reason: this walks every
+	// adopted stream, up to maxDrainPasses times, on the goroutine that renews every
+	// lease this instance holds.
+	pass, cancel := context.WithTimeout(ctx, c.budget())
+	defer cancel()
+
 	for range maxDrainPasses {
-		deliveries, err := c.streams.ClaimSessions(ctx, adopted)
+		if pass.Err() != nil {
+			c.manager.ReturnAdopted(adopted)
+			return adopted
+		}
+		deliveries, err := c.streams.ClaimSessions(pass, adopted)
 		if err != nil {
 			if ctx.Err() == nil {
 				c.log.Error().Err(err).Msg("failed to drain what a newly adopted session had pending")

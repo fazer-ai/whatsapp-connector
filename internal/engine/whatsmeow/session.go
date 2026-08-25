@@ -234,6 +234,9 @@ func (s *Session) setDialing(dialing bool) {
 func (s *Session) setConnected(connected bool) {
 	s.mu.Lock()
 	s.connected = connected
+	// Either way the dial is over: whatsmeow has answered for it, with an
+	// authenticated session or with the socket going down again.
+	s.dialing = false
 	if connected {
 		s.reconnecting = false
 	}
@@ -263,6 +266,7 @@ func (s *Session) offline() {
 	s.mu.Lock()
 	s.connected = false
 	s.reconnecting = false
+	s.dialing = false
 	s.mu.Unlock()
 }
 
@@ -370,7 +374,14 @@ func (s *Session) dial(ctx context.Context, client *wm.Client, onDetached func(e
 	dialed := make(chan error, 1)
 	go func() {
 		err := client.ConnectContext(s.ctx)
-		s.setDialing(false)
+		if err != nil {
+			s.setDialing(false)
+		}
+		// On success the flag stands until whatsmeow says the session is authenticated.
+		// ConnectContext returns once the socket is up, and the handshake that follows is
+		// asynchronous: clearing it here leaves a window where nothing is dialing, nothing
+		// is connected, and `session.status` answers `close` — which is the reply
+		// `session.connect` carries back for a resume that is going perfectly well.
 		dialed <- err
 	}()
 

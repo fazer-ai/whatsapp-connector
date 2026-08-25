@@ -384,3 +384,61 @@ func TestOneAccountKeepsOneMappingUnderConcurrentPairings(t *testing.T) {
 		t.Fatalf("%d sessions hold the same account, want exactly 1", bound)
 	}
 }
+
+// The account index shipped non-unique, and `CREATE UNIQUE INDEX IF NOT EXISTS` under
+// the same name is a no-op against a database that already has it. An upgraded store
+// would keep the permissive index, never gain the constraint, and go on letting two
+// sessions hold one account while every test on a fresh database passed.
+func TestAnOlderStoreGainsTheAccountConstraint(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "wac.db")
+	address := "sqlite:" + path
+
+	// The shape the first version left behind: a permissive index, and two mappings for
+	// one account that it allowed through.
+	old, err := store.Open(t.Context(), address, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	db := old.DB()
+	if _, err := db.ExecContext(t.Context(), `DROP INDEX IF EXISTS wac_session_device_one_per_account`); err != nil {
+		t.Fatalf("drop the new index: %v", err)
+	}
+	if _, err := db.ExecContext(t.Context(),
+		`CREATE INDEX IF NOT EXISTS wac_session_device_account ON wac_session_device (account)`); err != nil {
+		t.Fatalf("recreate the old index: %v", err)
+	}
+	for i, sid := range []string{"sid-old", "sid-newer"} {
+		if _, err := db.ExecContext(t.Context(),
+			`INSERT INTO wac_session_device (sid, jid, account, bound_at) VALUES (?, ?, ?, ?)`,
+			sid, fmt.Sprintf("5511999990001:%d@s.whatsapp.net", i+1), "5511999990001", int64(i+1)); err != nil {
+			t.Fatalf("write the duplicate mapping: %v", err)
+		}
+	}
+	if err := old.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Opened again by this version, which is what an upgrade is.
+	upgraded, err := store.Open(t.Context(), address, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	t.Cleanup(func() { _ = upgraded.Close() })
+
+	if _, bound, err := upgraded.JID(t.Context(), "sid-old"); err != nil || bound {
+		t.Fatalf("the older of two mappings survived (bound=%v, err=%v)", bound, err)
+	}
+	if _, bound, err := upgraded.JID(t.Context(), "sid-newer"); err != nil || !bound {
+		t.Fatalf("the mapping that should have been kept is gone (bound=%v, err=%v)", bound, err)
+	}
+
+	// And the constraint is really there now, not merely named.
+	_, err = upgraded.DB().ExecContext(t.Context(),
+		`INSERT INTO wac_session_device (sid, jid, account, bound_at) VALUES (?, ?, ?, ?)`,
+		"sid-third", "5511999990001:9@s.whatsapp.net", "5511999990001", 99)
+	if err == nil {
+		t.Fatal("a second mapping for one account was accepted after the upgrade")
+	}
+}

@@ -110,6 +110,10 @@ func (c *Container) Ping(ctx context.Context) error {
 	return nil
 }
 
+// DB is the pool, for the tests that have to look at the schema itself. Nothing in the
+// connector reaches for it: everything else goes through the methods above.
+func (c *Container) DB() *sql.DB { return c.db }
+
 // Devices is whatsmeow's own store, which the engine hands to a client.
 func (c *Container) Devices() *sqlstore.Container { return c.devices }
 
@@ -315,12 +319,27 @@ func (c *Container) migrate(ctx context.Context) error {
 			account  TEXT   NOT NULL,
 			bound_at BIGINT NOT NULL
 		)`,
+		// The account index was not unique to begin with, and `IF NOT EXISTS` on the
+		// same name is a no-op against a store that already has it: an upgraded database
+		// would keep the old one and never gain the constraint. Dropped by name and
+		// replaced under a new one, so the rename is what proves the new index exists.
+		`DROP INDEX IF EXISTS wac_session_device_account`,
+		// Whatever the old index allowed through has to go before a unique one can be
+		// built. The rule was always one session per account, so a second mapping is a
+		// row that should never have been written; the most recent binding is the one
+		// WhatsApp actually paired, and the rest name devices nothing can reach.
+		`DELETE FROM wac_session_device WHERE EXISTS (
+			SELECT 1 FROM wac_session_device newer
+			WHERE newer.account = wac_session_device.account
+			  AND (newer.bound_at > wac_session_device.bound_at
+			       OR (newer.bound_at = wac_session_device.bound_at AND newer.sid > wac_session_device.sid))
+		)`,
 		// Unique, not just indexed. The rule is one session per account, and Bind
 		// enforced it by reading the competing mappings and then writing: two instances
 		// pairing the same number at once both read nothing, both write, and the account
 		// ends up on two sessions with the displacement never happening. A constraint is
 		// the only version of that check two transactions cannot both pass.
-		`CREATE UNIQUE INDEX IF NOT EXISTS wac_session_device_account ON wac_session_device (account)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS wac_session_device_one_per_account ON wac_session_device (account)`,
 	}
 	for _, statement := range statements {
 		if _, err := c.db.ExecContext(ctx, statement); err != nil {

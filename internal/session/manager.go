@@ -189,7 +189,32 @@ func (m *Manager) TakeNewlyAdopted() []string {
 	}
 	taken := m.newly
 	m.newly = nil
-	return taken
+	return m.stillRunning(taken)
+}
+
+// stillRunning drops the sessions this instance has since let go of.
+//
+// A drain claims with no minimum idle, on the grounds that this instance holds the
+// lease. Once it does not, that reasoning is gone: claiming would take the current
+// owner's commands out from under it, dispatch them as belonging to nobody, and release
+// them again on every pass.
+func (m *Manager) stillRunning(sids []string) []string {
+	if len(sids) == 0 {
+		return nil
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	kept := sids[:0]
+	for _, sid := range sids {
+		if _, running := m.sessions[sid]; running {
+			kept = append(kept, sid)
+		}
+	}
+	if len(kept) == 0 {
+		return nil
+	}
+	return kept
 }
 
 // ReturnAdopted puts sessions back among the ones waiting to be drained, for a caller
@@ -197,6 +222,10 @@ func (m *Manager) TakeNewlyAdopted() []string {
 // anything else on the list, and until their pending commands are taken over nothing
 // newer for them can safely be read.
 func (m *Manager) ReturnAdopted(sids []string) {
+	if len(sids) == 0 {
+		return
+	}
+	sids = m.stillRunning(sids)
 	if len(sids) == 0 {
 		return
 	}

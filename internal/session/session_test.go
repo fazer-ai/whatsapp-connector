@@ -748,3 +748,36 @@ func waitUntil(t *testing.T, what string, cond func() bool) {
 	}
 	t.Fatalf("timed out waiting for %s", what)
 }
+
+// A drain claims with no minimum idle, on the grounds that this instance holds the
+// lease. Once it does not, that reasoning is gone: claiming would take the current
+// owner's commands out from under it, dispatch them as belonging to nobody, and release
+// them again on every pass, so the account that actually owns them never drains.
+func TestASessionThatMovedOnIsNoLongerWaitingToBeDrained(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	manager := session.NewManager(&session.ManagerConfig{
+		Instance: "inst-a", Engine: fake.New(),
+		Leases:    cluster.NewLeases(redisx.Wrap(rdb, "wa:", 8), "inst-a", cluster.Options{}),
+		Publisher: newRecorder(), Replier: newRecorder(),
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	ctx := context.Background()
+	if _, err := manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+
+	// Handed to a peer, or shut down here; either way this instance stops running it.
+	manager.StopAll(ctx)
+
+	if waiting := manager.TakeNewlyAdopted(); len(waiting) != 0 {
+		t.Fatalf("a session this instance no longer runs is still queued for a drain: %v", waiting)
+	}
+	manager.ReturnAdopted([]string{"s1"})
+	if waiting := manager.TakeNewlyAdopted(); len(waiting) != 0 {
+		t.Fatalf("a session this instance no longer runs was put back to be drained: %v", waiting)
+	}
+}

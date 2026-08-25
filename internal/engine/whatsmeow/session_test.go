@@ -1061,3 +1061,33 @@ func TestConcurrentSocketEventsLeaveStateAndStreamAgreeing(t *testing.T) {
 		t.Fatalf("session.status says %q while the last event said %q", state, reported)
 	}
 }
+
+// ConnectContext returns once the socket is up, and the handshake that authenticates
+// the session runs on from there. A dial that clears its own flag on the way out leaves
+// a window where nothing is dialing, nothing is connected, and the state machine falls
+// through to `close` — which is what `session.connect` carries back as its reply for a
+// resume that is going perfectly well.
+func TestASocketThatIsUpButNotYetAuthenticatedStillReadsAsConnecting(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+
+	session.setDialing(true)
+	if state := session.state(); state != "connecting" {
+		t.Fatalf("state = %q while dialling, want connecting", state)
+	}
+
+	// whatsmeow announcing the authenticated session is what ends the dial.
+	session.handle(&waEvents.Connected{})
+	if state := session.state(); state != "open" {
+		t.Fatalf("state = %q after Connected, want open", state)
+	}
+
+	// And a connection that goes down ends it too, or a session that never came back
+	// would report itself connecting for as long as it lived.
+	session.setDialing(true)
+	session.offline()
+	if state := session.state(); state != "close" {
+		t.Fatalf("state = %q after the connection was given up on, want close", state)
+	}
+}

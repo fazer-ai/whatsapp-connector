@@ -106,6 +106,15 @@ func TestLiveResume(t *testing.T) {
 	if err := session.Connect(t.Context(), engine.ConnectRequest{Pairing: "resume"}); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
+
+	// Read the moment Connect returns, which is the moment the reply to
+	// `session.connect` is built. ConnectContext comes back once the socket is up and
+	// the handshake runs on from there, so this is the window where a session that is
+	// connecting perfectly well can be reported as closed.
+	if state := session.state(); state == "close" {
+		t.Fatal("a resume in progress reported itself closed, which is the reply the client acts on")
+	}
+
 	events.awaitState(t, "open", 2*time.Minute)
 
 	if events.count(protocol.EventPairingQR) > 0 {
