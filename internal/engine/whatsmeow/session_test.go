@@ -1896,6 +1896,76 @@ func TestAPasskeyAnswerForAnotherAttemptIsRefused(t *testing.T) {
 	}
 }
 
+// An outdated build ends a pairing without a Disconnected behind it: whatsmeow tells the
+// socket to stay down and publishes nothing more. The state has to come down with it, and
+// it does because the general handler goes offline before it stands aside for the QR
+// reader to publish the event. Pinning that here because the split reads as if the reader
+// owned both halves: leave the state to it and `session.status` answers `connecting` for a
+// connection nothing is going to make.
+func TestAnOutdatedBuildDuringPairingLeavesTheSessionClosed(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "")
+	run := session.startPairing(t.Context(), func() {})
+	session.setDialing(true)
+
+	// The order whatsmeow dispatches in: our handler is registered when the client is
+	// built, before GetQRChannel adds the reader's.
+	session.handle(&waEvents.ClientOutdated{})
+	session.publishPairing(run, wm.QRChannelClientOutdated, true)
+	// whatsmeow closes the pairing channel behind a terminal item, which is what retires
+	// the run in the reader.
+	session.endPairing(run)
+
+	if emission := next(t, session); emission.Type != protocol.EventSessionClientOutdated {
+		t.Fatalf("published %q, want the outdated build", emission.Type)
+	}
+	if state := session.state(); state != "close" {
+		t.Fatalf("the session reports %q after an outdated build ended its pairing, want close", state)
+	}
+}
+
+// The contract requires `confirmed`, and the reason it does is that its two values mean
+// opposite things to the operator: one carries the pairing on, the other ends it. Read
+// into a plain bool an absent flag becomes the second one, so a client that sends a
+// truncated payload ends the attempt and is told it succeeded, which is exactly what it
+// is told when the operator genuinely refused.
+func TestAConfirmationThatSaysNothingIsRefusedRatherThanReadAsNo(t *testing.T) {
+	t.Parallel()
+
+	for name, payload := range map[string]string{
+		"an omitted flag": `{"request_id":%q}`,
+		"a null flag":     `{"request_id":%q,"confirmed":null}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			session, _ := newTestSession(t, "")
+			run := session.startPairing(t.Context(), func() {})
+
+			_, err := session.Execute(t.Context(), &protocol.Command{
+				V: protocol.Version, ID: "c1", Type: protocol.CommandPairingPasskeyConfirm,
+				SID: "s1", TS: 1787000000000,
+				Payload: json.RawMessage(fmt.Sprintf(payload, run.id)),
+			})
+
+			var coded *protocol.Error
+			if !errors.As(err, &coded) || coded.Code != protocol.ErrorInvalidPayload {
+				t.Fatalf("Execute answered %v, want invalid_payload", err)
+			}
+			// And the attempt it named is untouched: the operator's browser can still
+			// answer once it sends a payload that says something.
+			if !session.isCurrentPairing(run) {
+				t.Fatal("a payload that said nothing ended the pairing the operator is watching")
+			}
+			select {
+			case emission := <-session.Events():
+				t.Fatalf("published %q for a confirmation that carried no answer", emission.Type)
+			case <-time.After(100 * time.Millisecond):
+			}
+		})
+	}
+}
+
 // Some terminal outcomes leave the socket up. A code scanned on a phone without
 // multidevice is the one that matters: whatsmeow will not open a second pairing channel
 // on a live socket, so the operator's corrected attempt is refused until WhatsApp's own

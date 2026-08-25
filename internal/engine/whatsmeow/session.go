@@ -1340,16 +1340,24 @@ func (s *Session) answerPasskey(ctx context.Context, command *protocol.Command) 
 func (s *Session) confirmPasskey(ctx context.Context, command *protocol.Command) error {
 	var body struct {
 		RequestID string `json:"request_id"`
-		Confirmed bool   `json:"confirmed"`
+		Confirmed *bool  `json:"confirmed"`
 	}
 	if err := json.Unmarshal(command.Payload, &body); err != nil {
 		return protocol.NewError(protocol.ErrorInvalidPayload, "the passkey confirmation could not be read")
+	}
+	// An absent flag is not a refusal. Read into a plain bool it becomes one, so a
+	// truncated payload ends the pairing the operator is watching and answers success:
+	// the same answer the connector gives when they genuinely said the code did not
+	// match, and nothing downstream could tell a client bug from a decision.
+	if body.Confirmed == nil {
+		return protocol.NewError(protocol.ErrorInvalidPayload,
+			"a passkey confirmation has to say whether the code matched")
 	}
 	run, err := s.pairingNamed(body.RequestID)
 	if err != nil {
 		return err
 	}
-	if !body.Confirmed {
+	if !*body.Confirmed {
 		s.finishPairing(run, "passkey_refused", nil)
 		return nil
 	}
