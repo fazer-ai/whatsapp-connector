@@ -350,14 +350,29 @@ func (s *Session) Connect(ctx context.Context, req engine.ConnectRequest) error 
 	s.hungUp = false
 	s.mu.Unlock()
 
+	var err error
 	switch req.Pairing {
 	case "resume":
-		return s.resume(ctx)
+		err = s.resume(ctx)
 	case "qr":
-		return s.pairWithQR(ctx)
+		err = s.pairWithQR(ctx)
 	default:
-		return s.pairWithCode(ctx, req.Phone)
+		err = s.pairWithCode(ctx, req.Phone)
 	}
+	if err != nil && s.state() == "close" {
+		// Refused before anything was opened: a resume on a session that never paired, a
+		// code pairing with no number, a pairing channel that could not be opened. The
+		// guard that was standing before this request has to go back up, or a Connected
+		// the library had queued before the manual disconnect reports a socket that is
+		// down as open, with nothing arriving later to correct it.
+		//
+		// Only when nothing started. A dial still in flight reads as connecting, and its
+		// own failure raises the guard where it belongs.
+		s.transition.Lock()
+		s.refuseLateConnect()
+		s.transition.Unlock()
+	}
+	return err
 }
 
 // resume reconnects a session that has already paired. Asking to resume one that has

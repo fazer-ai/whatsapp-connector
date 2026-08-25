@@ -1770,3 +1770,41 @@ func TestALateConnectDoesNotReviveAnAccountWhatsappRevoked(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 }
+
+// A connect drops the guard on the way in, because a manual disconnect is followed by no
+// event that would undo it. A request refused before anything is opened has to put it
+// back: otherwise a Connected the library queued before that disconnect reports a socket
+// that is down as open, and nothing arrives later to correct it.
+func TestARefusedConnectPutsTheDisconnectGuardBack(t *testing.T) {
+	t.Parallel()
+
+	for name, request := range map[string]engine.ConnectRequest{
+		"resuming a session that never paired": {Pairing: "resume"},
+		"code pairing with no number":          {Pairing: "code"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			session, _ := newTestSession(t, "")
+			session.setConnected(true)
+
+			// The operator disconnects, and whatsmeow has a Connected already on its way.
+			session.settleHangUp()
+			drain(t, session)
+
+			if err := session.Connect(t.Context(), request); err == nil {
+				t.Fatal("the request was accepted, so there is no guard to put back")
+			}
+
+			session.handle(&waEvents.Connected{})
+
+			if state := session.state(); state == "open" {
+				t.Fatal("a connection queued before the disconnect put the session back up")
+			}
+			select {
+			case emission := <-session.Events():
+				t.Fatalf("published %q for a socket the operator had disconnected", emission.Type)
+			case <-time.After(100 * time.Millisecond):
+			}
+		})
+	}
+}
