@@ -57,11 +57,12 @@ internal/cluster/         leases, epochs and the instance registry: who owns a s
 internal/session/         one account: the event pump and the per-session command queue
 internal/engine/          the WhatsApp side behind an interface, plus a fake for tests
 internal/observability/   the redacting logger and the metric set
+internal/store/           the device store and which session paired which device
 internal/httpserver/      /healthz, /readyz, /metrics
 internal/app/             configuration and the run loop that ties them together
 ```
 
-`internal/{store,media}` arrive with M1 and M2.
+`internal/media` arrives with M2.
 
 ## Protocol
 
