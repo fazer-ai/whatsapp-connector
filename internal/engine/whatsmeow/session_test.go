@@ -1692,6 +1692,35 @@ func TestAnEndedConnectionRefusesTheConnectQueuedBehindIt(t *testing.T) {
 	}
 }
 
+// The contract carries a standalone `pairing.request_code`, and it asks for the same
+// thing a connect with `pairing: "code"` asks for. Refusing it as not supported by a
+// build that advertises code pairing leaves a client holding a command the contract gave
+// it and nothing to do with it.
+func TestARequestForACodeReachesTheCodePairing(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "")
+
+	// Without a number, which is where the code flow stops before it touches the
+	// network — and the message it stops with is the one only that flow produces, so it
+	// says which path the command took and not merely that it was not refused outright.
+	_, err := session.Execute(t.Context(), &protocol.Command{
+		V: protocol.Version, ID: "c1", Type: protocol.CommandPairingRequestCode,
+		SID: "s1", TS: 1787000000000, Payload: json.RawMessage(`{"phone":"+++"}`),
+	})
+
+	if errors.Is(err, engine.ErrNotSupported) {
+		t.Fatal("a command the contract carries was refused as one this connector does not know")
+	}
+	var coded *protocol.Error
+	if !errors.As(err, &coded) || coded.Code != protocol.ErrorInvalidPayload {
+		t.Fatalf("Execute answered %v, want invalid_payload from the code pairing", err)
+	}
+	if !strings.Contains(coded.Message, "code pairing") {
+		t.Fatalf("the refusal reads %q, which is not the code flow answering", coded.Message)
+	}
+}
+
 // A connect option is a thing the client asked the connector to do, and a build that does
 // not do it must say so rather than answer `open`. The client is then waiting for a call
 // to be refused, or for a backlog to arrive, with nothing on the stream to tell it that

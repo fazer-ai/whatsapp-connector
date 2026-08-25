@@ -418,7 +418,20 @@ func (c *Container) dropDuplicateMappings(ctx context.Context) error {
 		// mapping and a usable one. Zero is the fallback the loop leaves standing.
 		winner := 0
 		for i, candidate := range candidates {
-			if candidate.readable && c.hasDevice(ctx, candidate.jid) {
+			if !candidate.readable {
+				continue
+			}
+			held, err := c.hasDevice(ctx, candidate.jid)
+			if err != nil {
+				// Not "no credentials". A lookup that failed says nothing about what is
+				// on disk, and reading it as absence is how the mapping that has the
+				// device becomes a loser and gets deleted — the very thing this rule
+				// exists to prevent. The duplicates keep for another start; the unique
+				// index this precedes will not be built either, so nothing here is
+				// half-done.
+				return fmt.Errorf("store: read the device of %s: %w", candidate.sid, err)
+			}
+			if held {
 				winner = i
 				break
 			}
@@ -447,16 +460,16 @@ func (c *Container) dropDuplicateMappings(ctx context.Context) error {
 	return nil
 }
 
-// hasDevice reports whether whatsmeow still holds the credentials a mapping names. A
-// read that fails answers no, which costs the row its candidacy and never its contents:
-// a mapping this cannot vouch for is not one to keep a working device out of.
-func (c *Container) hasDevice(ctx context.Context, jid types.JID) bool {
+// hasDevice reports whether whatsmeow still holds the credentials a mapping names. The
+// error is returned rather than folded into the answer, because "there is no device" and
+// "this could not be read" are the same value and opposite facts: one is a row to drop,
+// the other is a question nobody has answered.
+func (c *Container) hasDevice(ctx context.Context, jid types.JID) (bool, error) {
 	device, err := c.devices.GetDevice(ctx, jid)
 	if err != nil {
-		c.log.Warn().Err(err).Msg("failed to read a duplicate mapping's device")
-		return false
+		return false, err
 	}
-	return device != nil
+	return device != nil, nil
 }
 
 // rebind turns `?` placeholders into `$1`-style ones for Postgres. Writing every

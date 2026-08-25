@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"path/filepath"
 	"sync"
@@ -387,6 +388,87 @@ func TestOneAccountKeepsOneMappingUnderConcurrentPairings(t *testing.T) {
 
 // The account index shipped non-unique, and `CREATE UNIQUE INDEX IF NOT EXISTS` under
 // the same name is a no-op against a database that already has it. An upgraded store
+// "There is no device" and "the device could not be read" are the same value out of a
+// lookup and opposite facts. Read as absence, a row this store cannot parse costs its
+// mapping the contest, and the winner is then the half-written one — so the upgrade
+// deletes the mapping of a session that was paired, over a device that was there all
+// along. The migration stops instead: the duplicates keep, and so does the account.
+func TestAnUpgradeStopsRatherThanGuessAtCredentialsItCannotRead(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "wac.db")
+	address := "sqlite:" + path
+
+	old, err := store.Open(t.Context(), address, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	db := old.DB()
+	if _, err := db.ExecContext(t.Context(), `DROP INDEX IF EXISTS wac_session_device_one_per_account`); err != nil {
+		t.Fatalf("drop the new index: %v", err)
+	}
+	if _, err := db.ExecContext(t.Context(),
+		`CREATE INDEX IF NOT EXISTS wac_session_device_account ON wac_session_device (account)`); err != nil {
+		t.Fatalf("recreate the old index: %v", err)
+	}
+
+	paired, err := types.ParseJID("5511999990001:1@s.whatsapp.net")
+	if err != nil {
+		t.Fatalf("ParseJID: %v", err)
+	}
+	device := old.Devices().NewDevice()
+	device.ID = &paired
+	device.Account = &waAdv.ADVSignedDeviceIdentity{
+		Details:             make([]byte, 32),
+		AccountSignature:    make([]byte, 64),
+		AccountSignatureKey: make([]byte, 32),
+		DeviceSignature:     make([]byte, 64),
+	}
+	if err := old.Devices().PutDevice(t.Context(), device); err != nil {
+		t.Fatalf("PutDevice: %v", err)
+	}
+	// The row is there and holds the credentials; what it will not do is come back out.
+	if _, err := db.ExecContext(t.Context(),
+		`UPDATE whatsmeow_device SET facebook_uuid = 'not-a-uuid' WHERE jid = ?`, paired.String()); err != nil {
+		t.Fatalf("make the device unreadable: %v", err)
+	}
+	if _, err := db.ExecContext(t.Context(),
+		`INSERT INTO wac_session_device (sid, jid, account, bound_at) VALUES (?, ?, ?, ?)`,
+		"sid-paired", paired.String(), "5511999990001", int64(1)); err != nil {
+		t.Fatalf("write the paired mapping: %v", err)
+	}
+	if _, err := db.ExecContext(t.Context(),
+		`INSERT INTO wac_session_device (sid, jid, account, bound_at) VALUES (?, ?, ?, ?)`,
+		"sid-halfway", "5511999990001:2@s.whatsapp.net", "5511999990001", int64(2)); err != nil {
+		t.Fatalf("write the half-written mapping: %v", err)
+	}
+	if err := old.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	upgraded, err := store.Open(t.Context(), address, zerolog.Nop())
+	if err == nil {
+		t.Cleanup(func() { _ = upgraded.Close() })
+		t.Fatal("the upgrade chose a winner while it could not tell whether the other had credentials")
+	}
+
+	// And it chose nothing on the way out: the mapping that names the device is still
+	// there, so a start once the store reads again finds the account where it left it.
+	check, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("reopen the file: %v", err)
+	}
+	t.Cleanup(func() { _ = check.Close() })
+	var mappings int
+	if err := check.QueryRowContext(t.Context(),
+		`SELECT COUNT(*) FROM wac_session_device WHERE sid = ?`, "sid-paired").Scan(&mappings); err != nil {
+		t.Fatalf("count the mappings: %v", err)
+	}
+	if mappings != 1 {
+		t.Fatalf("the paired mapping was deleted on the way out (%d rows)", mappings)
+	}
+}
+
 // Bind writes the mapping before whatsmeow writes the device, so an instance that died
 // mid-pairing leaves the newest mapping of all pointing at a device that never existed.
 // Reading `bound_at` alone as "this is the pairing that took" then deletes the working

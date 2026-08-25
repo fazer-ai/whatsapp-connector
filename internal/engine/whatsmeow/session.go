@@ -988,8 +988,28 @@ func (s *Session) Execute(ctx context.Context, command *protocol.Command) (json.
 		return nil, s.answerPasskey(ctx, command)
 	case protocol.CommandPairingPasskeyConfirm:
 		return nil, s.confirmPasskey(ctx, command)
+	case protocol.CommandPairingRequestCode:
+		return nil, s.requestCode(ctx, command)
 	}
 	return nil, engine.ErrNotSupported
+}
+
+// requestCode is `pairing.request_code`, which asks for the same thing a connect with
+// `pairing: "code"` asks for and is answered the same way.
+//
+// Through Connect rather than straight to pairWithCode: everything that guards a connect
+// guards this too. A disconnect still on its way down has to be waited out, the guard
+// that refuses a socket this session is done with has to come off, and a client whose
+// device was deleted underneath it has to be rebuilt first. Reaching past all of that to
+// the pairing itself is a second way into the same state with none of the rules.
+func (s *Session) requestCode(ctx context.Context, command *protocol.Command) error {
+	var body struct {
+		Phone string `json:"phone"`
+	}
+	if err := json.Unmarshal(command.Payload, &body); err != nil {
+		return protocol.NewError(protocol.ErrorInvalidPayload, "the pairing request could not be read")
+	}
+	return s.Connect(ctx, engine.ConnectRequest{Pairing: "code", Phone: body.Phone})
 }
 
 // Close ends the session. Events is closed before it returns.
