@@ -10,9 +10,11 @@ events and commands with its clients over Redis Streams.
 > [!IMPORTANT]
 > **Status: M1, pairing.** A session now pairs with a real WhatsApp account, over a
 > QR code or a code typed on the phone, resumes across restarts, and reports what the
-> connection is doing. It cannot carry messages yet: those arrive with M2, and until
-> then every message command is refused rather than acknowledged (see
-> [Roadmap](#roadmap)).
+> connection is doing. It cannot carry messages yet: those arrive with M2. Until then
+> every message command is refused rather than acknowledged, and an inbound message is
+> left unacknowledged on WhatsApp's side, so the account keeps it and delivers it again
+> once there is somewhere to put it. A number paired on this build therefore accumulates
+> an undelivered backlog (see [Roadmap](#roadmap)).
 
 ## Why a separate service
 

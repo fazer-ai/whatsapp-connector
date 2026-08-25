@@ -68,6 +68,10 @@ type Session struct {
 	// socket nobody is waiting for. This is the answer to "is it connecting" that costs
 	// no lock.
 	dialing bool
+	// reconnecting is whatsmeow retrying a paired socket on its own, which runs outside
+	// this session's dial. Without it a status would report `close` while the event
+	// stream says reconnecting, and a resume would start a second dial alongside it.
+	reconnecting bool
 	// connected is what the socket is actually doing, kept from the events that report
 	// it. whatsmeow's own IsLoggedIn is set on authentication and cleared only by a
 	// stream error, so it stays true through a Disconnect and cannot answer this.
@@ -140,13 +144,18 @@ func (s *Session) adopt(client *wm.Client) bool {
 	client.EnableAutoReconnect = true
 	client.PrePairCallback = s.bind
 	client.BackgroundEventCtx = s.ctx
+	// The ack for an inbound message waits for the handlers, and a handler that reports
+	// failure stops it being sent at all. That pairing is what lets this build refuse a
+	// message it cannot publish instead of telling WhatsApp it was delivered: the
+	// invariant is that losing an event costs a redelivery, never a message.
+	client.SynchronousAck = true
 
 	phone, lid := identityOf(client)
 
 	// Subscribed before the swap, so the client is never live with nobody listening,
 	// and both halves are one lifecycle step: a Close that lands between them would
 	// otherwise leave a handler on a client the session no longer knows about.
-	handlerID := client.AddEventHandler(s.handle)
+	handlerID := client.AddEventHandlerWithSuccessStatus(s.handle)
 
 	s.mu.Lock()
 	if s.closed {
@@ -187,6 +196,15 @@ func (s *Session) setDialing(dialing bool) {
 func (s *Session) setConnected(connected bool) {
 	s.mu.Lock()
 	s.connected = connected
+	if connected {
+		s.reconnecting = false
+	}
+	s.mu.Unlock()
+}
+
+func (s *Session) setReconnecting(reconnecting bool) {
+	s.mu.Lock()
+	s.reconnecting = reconnecting
 	s.mu.Unlock()
 }
 
@@ -393,9 +411,12 @@ func (s *Session) pairWithCode(ctx context.Context, phone string) error {
 	// The QR codes themselves are dropped: an operator who asked for a code is not
 	// looking at an image, and publishing both would have the dashboard show two ways
 	// to pair the same session.
-	ready := make(chan struct{})
+	// Buffered and carrying the answer: readiness is a code having arrived, and a
+	// channel that ended without one is a pairing that already failed. Calling PairPhone
+	// on that socket adds a second, meaningless failure on top of the real one.
+	ready := make(chan bool, 1)
 	go func() {
-		s.readPairingWith(run, codes, func() { close(ready) }, false)
+		s.readPairingWith(run, codes, func(arrived bool) { ready <- arrived }, false)
 	}()
 
 	s.emit(protocol.EventSessionState, map[string]any{"state": "connecting"})
@@ -407,7 +428,11 @@ func (s *Session) pairWithCode(ctx context.Context, phone string) error {
 	}
 
 	select {
-	case <-ready:
+	case arrived := <-ready:
+		if !arrived {
+			return protocol.NewError(protocol.ErrorWaError,
+				"WhatsApp ended the pairing before it offered a code")
+		}
 	case <-ctx.Done():
 		// Unlike a QR conversation, this one cannot carry on without its command:
 		// nothing else will ever call PairPhone. Left up, the socket refuses the
@@ -440,6 +465,7 @@ func (s *Session) Disconnect(ctx context.Context) error {
 		return err
 	}
 	s.setConnected(false)
+	s.setReconnecting(false)
 	s.emit(protocol.EventSessionState, map[string]any{"state": "close", "reason": "disconnect_requested"})
 	return nil
 }
@@ -662,7 +688,8 @@ func (s *Session) sessionState() map[string]any {
 // that believed it would never reconnect again.
 func (s *Session) state() string {
 	s.mu.Lock()
-	closed, dialing, connected, pairing := s.closed, s.dialing, s.connected, s.pairing != nil
+	closed, dialing, connected := s.closed, s.dialing, s.connected
+	pairing, reconnecting := s.pairing != nil, s.reconnecting
 	s.mu.Unlock()
 
 	switch {
@@ -670,6 +697,8 @@ func (s *Session) state() string {
 		return "close"
 	case connected:
 		return "open"
+	case reconnecting:
+		return "reconnecting"
 	case dialing, pairing:
 		// The dial returns as soon as the socket is up, and the pairing conversation
 		// runs on from there. Calling that closed would have the reply to session.connect
@@ -720,7 +749,7 @@ func (s *Session) readPairing(run *pairingRun, codes <-chan wm.QRChannelItem) {
 // readPairingWith drains the pairing channel. `onFirst` fires once the server has
 // answered at all, which is what code pairing waits for, and `publishCodes` is false
 // for the code flow, which has no image to show.
-func (s *Session) readPairingWith(run *pairingRun, codes <-chan wm.QRChannelItem, onFirst func(), publishCodes bool) {
+func (s *Session) readPairingWith(run *pairingRun, codes <-chan wm.QRChannelItem, onFirst func(bool), publishCodes bool) {
 	// Cleared on the way out, however it ends. A run left marked open after a successful
 	// pairing goes on claiming every later outcome, and the events it claims are then
 	// published by nobody: the QR channel's own handler is long gone.
@@ -731,7 +760,7 @@ func (s *Session) readPairingWith(run *pairingRun, codes <-chan wm.QRChannelItem
 		if item.Event == "code" && first {
 			first = false
 			if onFirst != nil {
-				onFirst()
+				onFirst(true)
 			}
 		}
 		s.publishPairing(run, item, publishCodes)
@@ -739,7 +768,7 @@ func (s *Session) readPairingWith(run *pairingRun, codes <-chan wm.QRChannelItem
 	if first && onFirst != nil {
 		// The channel ended before a single code arrived, so whoever is waiting for the
 		// connection is waiting for something that will never come.
-		onFirst()
+		onFirst(false)
 	}
 }
 
@@ -771,15 +800,11 @@ func (s *Session) publishPairing(run *pairingRun, item wm.QRChannelItem, publish
 	case "err-client-outdated":
 		s.emit(protocol.EventSessionClientOutdated, map[string]any{})
 	case "timeout":
-		s.emit(protocol.EventPairingError, map[string]any{
-			"reason": "timeout", "message": "nobody scanned the code before it ran out",
-		})
+		s.publishPairingFailure("timeout", nil)
 	case "error":
-		s.emit(protocol.EventPairingError, map[string]any{
-			"reason": "error", "message": errorText(item.Error),
-		})
+		s.publishPairingFailure("error", item.Error)
 	default:
-		s.emit(protocol.EventPairingError, map[string]any{"reason": item.Event, "message": errorText(item.Error)})
+		s.publishPairingFailure(item.Event, item.Error)
 	}
 }
 
@@ -827,18 +852,45 @@ func qrDataURL(code string) (string, error) {
 	return "data:image/png;base64," + base64.StdEncoding.EncodeToString(png), nil
 }
 
-func errorText(err error) any {
-	if err == nil {
-		return nil
+// publishPairingFailure names what went wrong without putting the library's own words
+// on the wire. A `PairDatabaseError` or a protobuf failure carries SQL and internals
+// that mean nothing to an operator and should not reach a client's UI; the detail stays
+// in the log, where whoever is debugging it can find it.
+func (s *Session) publishPairingFailure(reason string, err error) {
+	if err != nil {
+		s.log.Warn().Err(err).Str("reason", reason).Msg("a pairing failed")
 	}
-	return err.Error()
+	s.emit(protocol.EventPairingError, map[string]any{
+		"reason": reason, "message": pairingFailureMessage(reason),
+	})
 }
 
-// handle turns what whatsmeow reports into what the contract names. Anything with no
-// canonical shape is left alone here rather than published as `raw`: M1 is the session
-// lifecycle, and the message events arrive with M2.
-func (s *Session) handle(rawEvent any) {
+// pairingFailureMessage is the stable sentence a client shows for each reason.
+func pairingFailureMessage(reason string) string {
+	switch reason {
+	case "timeout":
+		return "nobody scanned the code before it ran out"
+	case "pair_error":
+		return "WhatsApp accepted the code but the pairing could not be completed"
+	case "err-scanned-without-multidevice":
+		return "that account still has to turn multi-device on before it can be linked"
+	default:
+		return "the pairing did not complete"
+	}
+}
+
+// handle turns what whatsmeow reports into what the contract names.
+//
+// It reports whether whatsmeow may acknowledge what it just delivered. A false leaves
+// the message unacknowledged on WhatsApp's side, so the account keeps it and delivers
+// it again, which is the only honest answer while this build has nowhere to put it: an
+// acknowledged message nobody published is a message that is simply gone.
+func (s *Session) handle(rawEvent any) bool {
 	switch event := rawEvent.(type) {
+	case *waEvents.Message:
+		// M2 brings these. Refusing the ack is what keeps them on the phone until then.
+		s.log.Debug().Msg("refusing to acknowledge an inbound message this build cannot publish")
+		return false
 	case *waEvents.Connected:
 		s.setConnected(true)
 		s.emit(protocol.EventSessionState, s.sessionState())
@@ -851,6 +903,7 @@ func (s *Session) handle(rawEvent any) {
 		if phone, _ := s.identity(); phone == "" {
 			state = "close"
 		}
+		s.setReconnecting(state == "reconnecting")
 		s.emit(protocol.EventSessionState, map[string]any{"state": state, "reason": "disconnected"})
 	case *waEvents.LoggedOut:
 		s.loggedOut(event)
@@ -874,7 +927,7 @@ func (s *Session) handle(rawEvent any) {
 			// The pairing reader publishes this one: whatsmeow delivers it here and to
 			// the QR channel both, and two canonical events for one outcome is worse
 			// than either.
-			return
+			return true
 		}
 		s.emit(protocol.EventSessionClientOutdated, map[string]any{})
 	case *waEvents.ConnectFailure:
@@ -890,12 +943,11 @@ func (s *Session) handle(rawEvent any) {
 		// The next attempt would be refused by the library rather than by WhatsApp.
 		s.markStale()
 		if s.pairingActive() {
-			return
+			return true
 		}
-		s.emit(protocol.EventPairingError, map[string]any{
-			"reason": "pair_error", "message": errorText(event.Error),
-		})
+		s.publishPairingFailure("pair_error", event.Error)
 	}
+	return true
 }
 
 func (s *Session) loggedOut(event *waEvents.LoggedOut) {

@@ -219,11 +219,20 @@ func TestHandleTranslatesWhatWhatsappReports(t *testing.T) {
 			},
 		},
 		"a failed pairing": {
-			event: &waEvents.PairError{Error: errors.New("the phone said no")},
+			event: &waEvents.PairError{Error: errors.New("pair-database: insert into whatsmeow_device failed")},
 			want:  protocol.EventPairingError,
 			check: func(t *testing.T, payload map[string]any) {
-				if payload["message"] != "the phone said no" {
-					t.Fatalf("message=%v", payload["message"])
+				if payload["reason"] != "pair_error" {
+					t.Fatalf("reason=%v", payload["reason"])
+				}
+				// The library's own words carry SQL and internals that mean nothing to an
+				// operator and have no business in a client's UI.
+				message, _ := payload["message"].(string)
+				if strings.Contains(message, "whatsmeow_device") || strings.Contains(message, "insert into") {
+					t.Fatalf("the library's error text reached the wire: %q", message)
+				}
+				if message == "" {
+					t.Fatal("the failure travelled without a message")
 				}
 			},
 		},
@@ -595,5 +604,47 @@ func TestAPairingSessionReportsConnecting(t *testing.T) {
 	session.startPairing(func() {})
 	if state := session.state(); state != "connecting" {
 		t.Fatalf("a session mid-pairing reports %q, want connecting", state)
+	}
+}
+
+// An acknowledged message nobody published is a message that is gone. Until M2 can put
+// one on the stream, refusing the ack is what leaves it on the phone, which is the
+// invariant: losing an event costs a redelivery, never a message.
+func TestAnInboundMessageIsNotAcknowledged(t *testing.T) {
+	t.Parallel()
+	session, _ := newTestSession(t, "5511999990001")
+
+	if session.handle(&waEvents.Message{}) {
+		t.Fatal("the session let WhatsApp mark an inbound message delivered")
+	}
+
+	// Everything it does handle is acknowledged as usual.
+	if !session.handle(&waEvents.Connected{}) {
+		t.Fatal("the session refused an event it publishes")
+	}
+}
+
+// whatsmeow retries a paired socket on its own, outside this session's dial. A status
+// answered from the dial alone would say `close` while the event stream says
+// reconnecting, and a resume would start a second dial alongside the retry.
+func TestAReconnectingSessionSaysSo(t *testing.T) {
+	t.Parallel()
+	session, _ := newTestSession(t, "5511999990001")
+
+	session.handle(&waEvents.Connected{})
+	next(t, session)
+
+	session.handle(&waEvents.Disconnected{})
+	if emission := next(t, session); emission.Type != protocol.EventSessionState {
+		t.Fatalf("published %q on a drop", emission.Type)
+	}
+	if state := session.state(); state != "reconnecting" {
+		t.Fatalf("a dropped paired session reports %q, want reconnecting", state)
+	}
+
+	session.handle(&waEvents.Connected{})
+	next(t, session)
+	if state := session.state(); state != "open" {
+		t.Fatalf("a recovered session reports %q", state)
 	}
 }
