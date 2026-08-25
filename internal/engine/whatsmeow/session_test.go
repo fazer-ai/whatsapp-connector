@@ -1471,3 +1471,71 @@ func TestALogoutThatWentThroughIsPublishedBeforeTheRebuild(t *testing.T) {
 		t.Fatalf("published %q, want the account being logged out", emission.Type)
 	}
 }
+
+// whatsmeow unlinks the device, disconnects, and only then deletes the local one, so a
+// logout that fails can be the deletion alone: WhatsApp has already revoked the device.
+// A command that answers with an error and says nothing else leaves the client treating
+// an account it no longer has as paired.
+func TestALogoutThatFailedAfterTheRequestWentOutIsStillReported(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.logout = func(context.Context, *wm.Client) error {
+		return errors.New("error deleting data from store: database is closed")
+	}
+
+	if err := session.Logout(t.Context()); err == nil {
+		t.Fatal("a logout that failed was reported as one that went through")
+	}
+	if emission := next(t, session); emission.Type != protocol.EventSessionLoggedOut {
+		t.Fatalf("published %q, want the account being logged out", emission.Type)
+	}
+}
+
+// And a logout that never left this process says nothing: the device is untouched on
+// both sides, and telling the operator it is gone costs them a pairing for a command
+// that visibly failed.
+func TestALogoutThatNeverLeftSaysNothing(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.logout = func(context.Context, *wm.Client) error { return wm.ErrNotLoggedIn }
+
+	if err := session.Logout(t.Context()); err == nil {
+		t.Fatal("a logout that never left was reported as one that went through")
+	}
+	select {
+	case emission := <-session.Events():
+		t.Fatalf("published %q for a logout that never reached WhatsApp", emission.Type)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// Authentication can have queued a Connected before the unlink landed. Left ungated, that
+// handler sets the state back to connected and publishes `open` on top of
+// session.logged_out, over credentials the account has revoked.
+func TestALateConnectDoesNotReviveALoggedOutSession(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.logout = func(context.Context, *wm.Client) error { return nil }
+	session.setConnected(true)
+
+	if err := session.Logout(t.Context()); err != nil {
+		t.Fatalf("Logout: %v", err)
+	}
+	if emission := next(t, session); emission.Type != protocol.EventSessionLoggedOut {
+		t.Fatalf("published %q, want the account being logged out", emission.Type)
+	}
+
+	session.handle(&waEvents.Connected{})
+
+	if state := session.state(); state == "open" {
+		t.Fatal("a connection queued behind the unlink put a logged-out session back up")
+	}
+	select {
+	case emission := <-session.Events():
+		t.Fatalf("published %q after the account was logged out", emission.Type)
+	case <-time.After(100 * time.Millisecond):
+	}
+}

@@ -690,22 +690,25 @@ func (s *Session) Disconnect(ctx context.Context) error {
 func (s *Session) Logout(ctx context.Context) error {
 	s.cancelPairing()
 	if err := s.logout(ctx, s.current()); err != nil {
-		s.offline()
-		// whatsmeow unlinks the device before it deletes the local one, so an error
-		// after the request went out can mean WhatsApp already accepted the logout, and
-		// a session left as it was would report itself open over credentials that are
-		// gone. Marking it stale is what has the next connect clear them.
-		//
-		// These three happen before anything is sent, though, and there the device is
-		// untouched on both sides. Clearing credentials that still resume would cost the
-		// operator a fresh pairing for a logout that visibly failed, while WhatsApp goes
-		// on listing the device they asked to remove.
-		if !sentNothing(err) {
-			s.markStale()
+		s.settleLogout()
+		if sentNothing(err) {
+			// Nothing was sent, and the device is untouched on both sides. Clearing
+			// credentials that still resume would cost the operator a fresh pairing for
+			// a logout that visibly failed, while WhatsApp goes on listing the device
+			// they asked to remove.
+			return fmt.Errorf("whatsmeow: log %s out: %w", s.sid, err)
 		}
+		// The request went out. whatsmeow unlinks the device before it deletes the local
+		// one and disconnects in between, so this failure can be the deletion alone:
+		// WhatsApp has revoked the device and this session is holding credentials that
+		// are gone. Marking it stale is what has the next connect clear them, and saying
+		// so is what keeps a client from going on treating the account as paired. The
+		// command still answers with the error it got.
+		s.markStale()
+		s.emit(protocol.EventSessionLoggedOut, map[string]any{"reason": "logout_requested"})
 		return fmt.Errorf("whatsmeow: log %s out: %w", s.sid, err)
 	}
-	s.offline()
+	s.settleLogout()
 	// Published as soon as WhatsApp has accepted it, ahead of every local step. From
 	// here the device is revoked whatever this process manages to do next, and that is
 	// the fact the client acts on: putting a database round trip in front of it means a
@@ -725,6 +728,26 @@ func (s *Session) Logout(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+// settleLogout records a socket the account no longer has, and refuses the connection
+// whatsmeow may still have queued behind the unlink.
+//
+// Held under transition, like every other socket transition, and it takes the hang-up
+// guard with it. Without both, a Connected that authentication produced before the
+// unlink lands after this, sets the state back to connected and publishes `open` on top
+// of `session.logged_out` — over credentials the account has revoked, and the rebuild
+// that follows clears the flag without publishing anything that would correct the
+// stream. The next connect clears the guard, which is where it is cleared for a manual
+// disconnect too.
+func (s *Session) settleLogout() {
+	s.transition.Lock()
+	defer s.transition.Unlock()
+
+	s.mu.Lock()
+	s.hungUp = true
+	s.mu.Unlock()
+	s.offline()
 }
 
 // sentNothing reports whether a logout failed before it reached WhatsApp, which is the
