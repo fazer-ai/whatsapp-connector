@@ -409,10 +409,32 @@ func TestAnOlderStoreGainsTheAccountConstraint(t *testing.T) {
 		`CREATE INDEX IF NOT EXISTS wac_session_device_account ON wac_session_device (account)`); err != nil {
 		t.Fatalf("recreate the old index: %v", err)
 	}
+	var stale types.JID
 	for i, sid := range []string{"sid-old", "sid-newer"} {
+		raw := fmt.Sprintf("5511999990001:%d@s.whatsapp.net", i+1)
+		jid, err := types.ParseJID(raw)
+		if err != nil {
+			t.Fatalf("ParseJID: %v", err)
+		}
+		if sid == "sid-old" {
+			stale = jid
+		}
+		// With the credentials whatsmeow keeps beside it, so the upgrade has something
+		// to leave behind if it only deletes the mapping.
+		device := old.Devices().NewDevice()
+		device.ID = &jid
+		device.Account = &waAdv.ADVSignedDeviceIdentity{
+			Details:             make([]byte, 32),
+			AccountSignature:    make([]byte, 64),
+			AccountSignatureKey: make([]byte, 32),
+			DeviceSignature:     make([]byte, 64),
+		}
+		if err := old.Devices().PutDevice(t.Context(), device); err != nil {
+			t.Fatalf("PutDevice: %v", err)
+		}
 		if _, err := db.ExecContext(t.Context(),
 			`INSERT INTO wac_session_device (sid, jid, account, bound_at) VALUES (?, ?, ?, ?)`,
-			sid, fmt.Sprintf("5511999990001:%d@s.whatsapp.net", i+1), "5511999990001", int64(i+1)); err != nil {
+			sid, raw, "5511999990001", int64(i+1)); err != nil {
 			t.Fatalf("write the duplicate mapping: %v", err)
 		}
 	}
@@ -432,6 +454,15 @@ func TestAnOlderStoreGainsTheAccountConstraint(t *testing.T) {
 	}
 	if _, bound, err := upgraded.JID(t.Context(), "sid-newer"); err != nil || !bound {
 		t.Fatalf("the mapping that should have been kept is gone (bound=%v, err=%v)", bound, err)
+	}
+
+	// The device the dropped mapping named goes with it. Nothing can reach it once its
+	// mapping is gone, so leaving it is leaving authentication material on disk that
+	// nothing will ever use or clean up.
+	if stored, err := upgraded.Devices().GetDevice(t.Context(), stale); err != nil {
+		t.Fatalf("GetDevice: %v", err)
+	} else if stored != nil {
+		t.Fatal("the device of the dropped mapping survived, unreachable and unclaimed")
 	}
 
 	// And the constraint is really there now, not merely named.

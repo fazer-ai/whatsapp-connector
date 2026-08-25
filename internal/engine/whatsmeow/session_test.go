@@ -1091,3 +1091,39 @@ func TestASocketThatIsUpButNotYetAuthenticatedStillReadsAsConnecting(t *testing.
 		t.Fatalf("state = %q after the connection was given up on, want close", state)
 	}
 }
+
+// whatsmeow closes the socket when a pairing runs out of codes and publishes no
+// Disconnected for a device that never paired, so nothing else takes the connection
+// state down. The dial flag would stand and `session.status` would answer `connecting`
+// for a pairing that ended minutes ago, which is a dashboard spinning on nothing.
+func TestAPairingThatEndedTakesTheConnectionWithIt(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "")
+	session.setDialing(true)
+	if state := session.state(); state != "connecting" {
+		t.Fatalf("state = %q while pairing, want connecting", state)
+	}
+
+	session.publishPairingFailure("timeout", nil)
+
+	if emission := next(t, session); emission.Type != protocol.EventPairingError {
+		t.Fatalf("published %q first, want the pairing error", emission.Type)
+	}
+	emission := next(t, session)
+	if emission.Type != protocol.EventSessionState {
+		t.Fatalf("published %q, want the state the pairing left behind", emission.Type)
+	}
+	var body struct {
+		State string `json:"state"`
+	}
+	if err := json.Unmarshal(emission.Payload, &body); err != nil {
+		t.Fatalf("unmarshal the state: %v", err)
+	}
+	if body.State != "close" {
+		t.Fatalf("published state %q, want close", body.State)
+	}
+	if state := session.state(); state != "close" {
+		t.Fatalf("state = %q after the pairing ended, want close", state)
+	}
+}

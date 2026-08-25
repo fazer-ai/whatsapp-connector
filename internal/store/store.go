@@ -324,16 +324,6 @@ func (c *Container) migrate(ctx context.Context) error {
 		// would keep the old one and never gain the constraint. Dropped by name and
 		// replaced under a new one, so the rename is what proves the new index exists.
 		`DROP INDEX IF EXISTS wac_session_device_account`,
-		// Whatever the old index allowed through has to go before a unique one can be
-		// built. The rule was always one session per account, so a second mapping is a
-		// row that should never have been written; the most recent binding is the one
-		// WhatsApp actually paired, and the rest name devices nothing can reach.
-		`DELETE FROM wac_session_device WHERE EXISTS (
-			SELECT 1 FROM wac_session_device newer
-			WHERE newer.account = wac_session_device.account
-			  AND (newer.bound_at > wac_session_device.bound_at
-			       OR (newer.bound_at = wac_session_device.bound_at AND newer.sid > wac_session_device.sid))
-		)`,
 		// Unique, not just indexed. The rule is one session per account, and Bind
 		// enforced it by reading the competing mappings and then writing: two instances
 		// pairing the same number at once both read nothing, both write, and the account
@@ -341,11 +331,85 @@ func (c *Container) migrate(ctx context.Context) error {
 		// the only version of that check two transactions cannot both pass.
 		`CREATE UNIQUE INDEX IF NOT EXISTS wac_session_device_one_per_account ON wac_session_device (account)`,
 	}
-	for _, statement := range statements {
+	for _, statement := range statements[:1] {
 		if _, err := c.db.ExecContext(ctx, statement); err != nil {
 			return fmt.Errorf("store: create wac_session_device: %w", err)
 		}
 	}
+	if err := c.dropDuplicateMappings(ctx); err != nil {
+		return err
+	}
+	for _, statement := range statements[1:] {
+		if _, err := c.db.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("store: create wac_session_device: %w", err)
+		}
+	}
+	return nil
+}
+
+// dropDuplicateMappings clears out whatever the old, permissive account index let
+// through, so a unique one can be built over it.
+//
+// The rule was always one session per account, so a second mapping is a row that should
+// never have been written, and the most recent binding is the one WhatsApp actually
+// paired. The devices the others named go with them, the way Bind takes a displaced
+// device: no mapping can reach them afterwards, and leaving them is leaving
+// authentication material on disk that nothing will ever use or clean up.
+func (c *Container) dropDuplicateMappings(ctx context.Context) error {
+	const losers = `
+		SELECT sid, jid FROM wac_session_device
+		WHERE EXISTS (
+			SELECT 1 FROM wac_session_device newer
+			WHERE newer.account = wac_session_device.account
+			  AND (newer.bound_at > wac_session_device.bound_at
+			       OR (newer.bound_at = wac_session_device.bound_at AND newer.sid > wac_session_device.sid))
+		)`
+
+	rows, err := c.db.QueryContext(ctx, losers)
+	if err != nil {
+		return fmt.Errorf("store: find the mappings the old index allowed: %w", err)
+	}
+	type mapping struct {
+		sid string
+		jid types.JID
+	}
+	var displaced []mapping
+	for rows.Next() {
+		var sid, raw string
+		if err := rows.Scan(&sid, &raw); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("store: read the mappings the old index allowed: %w", err)
+		}
+		jid, parseErr := types.ParseJID(raw)
+		if parseErr != nil {
+			c.log.Warn().Str("sid", sid).Msg("a duplicate mapping holds an unreadable jid; leaving its device alone")
+			displaced = append(displaced, mapping{sid: sid})
+			continue
+		}
+		displaced = append(displaced, mapping{sid: sid, jid: jid})
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return fmt.Errorf("store: read the mappings the old index allowed: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("store: read the mappings the old index allowed: %w", err)
+	}
+	if len(displaced) == 0 {
+		return nil
+	}
+
+	for _, old := range displaced {
+		if _, err := c.db.ExecContext(ctx,
+			c.rebind(`DELETE FROM wac_session_device WHERE sid = ?`), old.sid); err != nil {
+			return fmt.Errorf("store: drop the mapping of %s: %w", old.sid, err)
+		}
+		if !old.jid.IsEmpty() {
+			c.deleteDevice(ctx, old.jid)
+		}
+	}
+	c.log.Warn().Int("dropped", len(displaced)).
+		Msg("more than one session held the same account; the older mappings and their devices are gone")
 	return nil
 }
 

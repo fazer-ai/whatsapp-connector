@@ -651,11 +651,17 @@ func (s *Session) Logout(ctx context.Context) error {
 		s.markStale()
 		return err
 	}
+
+	// Published before the rebuild, not after. WhatsApp has revoked the device and the
+	// credentials are gone from the store; that is the fact the client acts on, and
+	// putting a database round trip in front of it means a store that stops answering
+	// leaves the operator looking at a session that was logged out minutes ago.
+	s.emit(protocol.EventSessionLoggedOut, map[string]any{"reason": "logout_requested"})
+
 	if err := s.rebuild(ctx); err != nil {
 		s.markStale()
 		return err
 	}
-	s.emit(protocol.EventSessionLoggedOut, map[string]any{"reason": "logout_requested"})
 	return nil
 }
 
@@ -1057,6 +1063,16 @@ func (s *Session) publishPairingFailure(reason string, err error) {
 	s.emit(protocol.EventPairingError, map[string]any{
 		"reason": reason, "message": pairingFailureMessage(reason),
 	})
+
+	// The connection went with it. whatsmeow closes the socket when the codes run out
+	// and publishes no Disconnected for an unpaired device, so nothing else would take
+	// the state down: the dial flag would stand and `session.status` would answer
+	// `connecting` for a pairing that ended minutes ago.
+	s.transition.Lock()
+	defer s.transition.Unlock()
+
+	s.offline()
+	s.emit(protocol.EventSessionState, map[string]any{"state": "close", "reason": "pairing_" + reason})
 }
 
 // pairingFailureMessage is the stable sentence a client shows for each reason.
