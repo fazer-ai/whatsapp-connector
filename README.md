@@ -144,6 +144,7 @@ restart, and reports itself healthy while doing it.
 | `WAC_ADVERTISE_URL` | derived | How clients reach this instance for media |
 | `WAC_LEASE_TTL` | `30s` | How long a session lease survives without a renewal |
 | `WAC_HEARTBEAT` | `5s` | How often leases are renewed and the instance re-announces |
+| `WAC_CLAIM_MIN_IDLE` | `30s` | How long a command sits unacknowledged before another instance takes it over |
 | `WAC_LOG_LEVEL` | `info` | zerolog level |
 
 ### Changing the protocol

@@ -84,6 +84,13 @@ func (m *Manager) Count() int {
 	return len(m.sessions)
 }
 
+// AdoptTimeout bounds the store and lease work one adoption does.
+//
+// Sized against the defaults it runs under: a 30s lease renewed every 5s. A single
+// adoption may delay one heartbeat and no more, and an adoption that runs out is
+// retried, because the wake it came from is left unacknowledged and reclaimed.
+const AdoptTimeout = 5 * time.Second
+
 // Adopt takes a session over: wins the lease, opens it on the engine, and starts it.
 // It returns cluster.ErrNotOwner when another instance holds it, which is the ordinary
 // answer in a fleet and not a failure.
@@ -95,12 +102,24 @@ func (m *Manager) Adopt(ctx context.Context, sid string) (*Session, error) {
 		return existing, nil
 	}
 
-	lease, err := m.leases.Acquire(ctx, sid)
+	// Bounded, and bounded around the I/O only. Commands are dispatched on the same
+	// goroutine that renews every lease this instance holds, so a store that blocks here
+	// stops all of them from being renewed: their leases expire, peers acquire the
+	// accounts, and the sockets this instance still holds open go on talking to WhatsApp.
+	// A session that fails to start is one wake; a renewal that never runs is every
+	// session on the instance.
+	//
+	// The session itself is built on the caller's context, which is the instance's
+	// lifetime and has to outlive this.
+	io, cancelIO := context.WithTimeout(ctx, AdoptTimeout)
+	defer cancelIO()
+
+	lease, err := m.leases.Acquire(io, sid)
 	if err != nil {
 		return nil, err
 	}
 
-	engineSession, err := m.engine.Open(ctx, sid)
+	engineSession, err := m.engine.Open(io, sid)
 	if err != nil {
 		// The lease is held for a session that cannot run. Holding it would keep every
 		// other instance from trying, so it goes back.

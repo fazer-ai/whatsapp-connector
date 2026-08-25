@@ -14,6 +14,7 @@ import (
 	"github.com/fazer-ai/whatsapp-connector/internal/app"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 	"github.com/fazer-ai/whatsapp-connector/internal/redisx"
+	"github.com/fazer-ai/whatsapp-connector/internal/transport/redisstream"
 )
 
 // client is the Chatwoot side, reduced to what M0 has to prove: it wakes a session,
@@ -84,7 +85,7 @@ func (c *client) events(ctx context.Context, sid string) []protocol.Event {
 }
 
 // start runs one connector against the given Redis and stops it when the test ends.
-func start(t *testing.T, addr, instance string) *app.Connector {
+func start(t *testing.T, addr, instance string, env map[string]string) *app.Connector {
 	t.Helper()
 	t.Setenv("REDIS_URL", "redis://"+addr)
 	t.Setenv("WAC_INSTANCE", instance)
@@ -93,6 +94,9 @@ func start(t *testing.T, addr, instance string) *app.Connector {
 	// heartbeat so a lease renewal happens within the test's lifetime.
 	t.Setenv("WAC_HTTP_ADDR", "127.0.0.1:0")
 	t.Setenv("WAC_HEARTBEAT", "200ms")
+	for name, value := range env {
+		t.Setenv(name, value)
+	}
 
 	cfg, err := app.LoadConfig("test-host")
 	if err != nil {
@@ -133,7 +137,7 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 // command comes back answered, and the events land on the session's shard in order.
 func TestFleetAdoptsASessionAndAnswersACommand(t *testing.T) {
 	server := miniredis.RunT(t)
-	connector := start(t, server.Addr(), "inst-a")
+	connector := start(t, server.Addr(), "inst-a", nil)
 	c := newClient(t, server.Addr())
 	ctx := context.Background()
 
@@ -162,8 +166,8 @@ func TestFleetAdoptsASessionAndAnswersACommand(t *testing.T) {
 // holds: two live sockets on one WhatsApp account is what the lease exists to stop.
 func TestOnlyOneInstanceRunsASession(t *testing.T) {
 	server := miniredis.RunT(t)
-	first := start(t, server.Addr(), "inst-a")
-	second := start(t, server.Addr(), "inst-b")
+	first := start(t, server.Addr(), "inst-a", nil)
+	second := start(t, server.Addr(), "inst-b", nil)
 	c := newClient(t, server.Addr())
 
 	const sid = "2f1c6f0e-0000-4000-8000-000000000002"
@@ -187,7 +191,7 @@ func TestOnlyOneInstanceRunsASession(t *testing.T) {
 // instance happened to read it.
 func TestCommandForAnUnownedSessionIsNotAnswered(t *testing.T) {
 	server := miniredis.RunT(t)
-	start(t, server.Addr(), "inst-a")
+	start(t, server.Addr(), "inst-a", nil)
 	c := newClient(t, server.Addr())
 	ctx := context.Background()
 
@@ -206,7 +210,7 @@ func TestCommandForAnUnownedSessionIsNotAnswered(t *testing.T) {
 
 func TestPublishedEventsCarryTheOwnersEpochInOrder(t *testing.T) {
 	server := miniredis.RunT(t)
-	connector := start(t, server.Addr(), "inst-a")
+	connector := start(t, server.Addr(), "inst-a", nil)
 	c := newClient(t, server.Addr())
 	ctx := context.Background()
 
@@ -244,7 +248,7 @@ func TestPublishedEventsCarryTheOwnersEpochInOrder(t *testing.T) {
 // from, and there is no recovering from that after the fact.
 func TestAnInstanceWithADifferentShardCountRefusesToStart(t *testing.T) {
 	server := miniredis.RunT(t)
-	start(t, server.Addr(), "inst-a")
+	start(t, server.Addr(), "inst-a", nil)
 
 	t.Setenv("WAC_EVENT_SHARDS", "16")
 	cfg, err := app.LoadConfig("test-host")
@@ -275,4 +279,43 @@ func TestTheRealEngineRefusesToStartWithoutADatabase(t *testing.T) {
 	if cfg.DatabaseURL != "sqlite:wa.db" {
 		t.Fatalf("the config carries %q", cfg.DatabaseURL)
 	}
+}
+
+// An instance that dies between reading a wake and acting on it leaves that wake in the
+// group's pending list, where no later read will ever see it: `>` only returns entries
+// nobody has taken. The same thing happens on purpose when this connector cannot adopt
+// a woken session and leaves the wake for someone else. Either way, the session stays
+// unowned until something claims the entry, so the loop has to.
+func TestAWakeLeftPendingIsPickedUpAgain(t *testing.T) {
+	server := miniredis.RunT(t)
+	c := newClient(t, server.Addr())
+	ctx := context.Background()
+
+	const sid = "2f1c6f0e-0000-4000-8000-000000000009"
+	control := c.key.Control()
+
+	// The shape an instance leaves behind when it is killed mid-command: the group
+	// exists, the wake was read by a consumer that is now gone, and nothing acked it.
+	if err := c.rdb.XGroupCreateMkStream(ctx, control, redisstream.ConsumerGroup, "0").Err(); err != nil {
+		t.Fatalf("create the group: %v", err)
+	}
+	c.send(ctx, control, &protocol.Command{
+		V: protocol.Version, ID: "wake-pending", Type: protocol.CommandSessionWake, SID: sid,
+		TS: time.Now().UnixMilli(), Payload: json.RawMessage(`{"desired":"connected"}`),
+	})
+	taken, err := c.rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
+		Group: redisstream.ConsumerGroup, Consumer: "inst-dead", Streams: []string{control, ">"}, Count: 10,
+	}).Result()
+	if err != nil {
+		t.Fatalf("read as the instance that died: %v", err)
+	}
+	if len(taken) != 1 || len(taken[0].Messages) != 1 {
+		t.Fatalf("the dead instance read %v, want one wake", taken)
+	}
+
+	// A live instance now starts. A plain read will never show it this entry.
+	connector := start(t, server.Addr(), "inst-a", map[string]string{"WAC_CLAIM_MIN_IDLE": "10ms"})
+	waitFor(t, "the pending wake to be reclaimed and acted on", func() bool {
+		return connector.Sessions() == 1
+	})
 }

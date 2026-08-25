@@ -61,7 +61,14 @@ type Session struct {
 	mu        sync.Mutex
 	client    *wm.Client
 	handlerID uint32
-	closed    bool
+
+	// detach removes the event handler from a client. It is a field only so the
+	// teardown order can be held to: whatsmeow runs a handler under a lock that
+	// RemoveEventHandler also takes, and nothing outside the library can make it
+	// dispatch, so a test cannot otherwise tell a Close that releases the handler first
+	// from one that waits on it forever.
+	detach func(*wm.Client, uint32)
+	closed bool
 	// dialing is true while a connect is in flight. whatsmeow holds its socket lock for
 	// the length of one, and every question asked of the client takes that lock for
 	// read, so a dial that outlived its command would block the next command on a
@@ -113,6 +120,7 @@ func newSession(sid string, client *wm.Client, container *store.Container, log z
 		done:   make(chan struct{}),
 		ctx:    ctx,
 		cancel: cancel,
+		detach: func(client *wm.Client, id uint32) { client.RemoveEventHandler(id) },
 	}
 	s.adopt(client)
 	go s.forward()
@@ -540,11 +548,19 @@ func (s *Session) Disconnect(ctx context.Context) error {
 func (s *Session) Logout(ctx context.Context) error {
 	s.cancelPairing()
 	if err := s.current().Logout(ctx); err != nil {
-		// whatsmeow unlinks the device before it deletes the local one, so an error here
-		// can mean WhatsApp already accepted the logout. Leaving the session as it was
-		// would have it report itself open over credentials that are gone.
 		s.offline()
-		s.markStale()
+		// whatsmeow unlinks the device before it deletes the local one, so an error
+		// after the request went out can mean WhatsApp already accepted the logout, and
+		// a session left as it was would report itself open over credentials that are
+		// gone. Marking it stale is what has the next connect clear them.
+		//
+		// These three happen before anything is sent, though, and there the device is
+		// untouched on both sides. Clearing credentials that still resume would cost the
+		// operator a fresh pairing for a logout that visibly failed, while WhatsApp goes
+		// on listing the device they asked to remove.
+		if !sentNothing(err) {
+			s.markStale()
+		}
 		return fmt.Errorf("whatsmeow: log %s out: %w", s.sid, err)
 	}
 	s.offline()
@@ -561,6 +577,14 @@ func (s *Session) Logout(ctx context.Context) error {
 	}
 	s.emit(protocol.EventSessionLoggedOut, map[string]any{"reason": "logout_requested"})
 	return nil
+}
+
+// sentNothing reports whether a logout failed before it reached WhatsApp, which is the
+// case where the stored credentials are still exactly as good as they were.
+func sentNothing(err error) bool {
+	return errors.Is(err, wm.ErrNotConnected) ||
+		errors.Is(err, wm.ErrNotLoggedIn) ||
+		errors.Is(err, wm.ErrClientIsNil)
 }
 
 // rebuild puts the session on a fresh client.
@@ -584,7 +608,7 @@ func (s *Session) rebuild(ctx context.Context) error {
 	s.mu.Lock()
 	previous, handlerID := s.client, s.handlerID
 	s.mu.Unlock()
-	previous.RemoveEventHandler(handlerID)
+	s.detach(previous, handlerID)
 	previous.Disconnect()
 
 	// A false here is the session having closed while this ran, which adopt has already
@@ -656,10 +680,17 @@ func (s *Session) Close() error {
 	s.mu.Lock()
 	client, handlerID := s.client, s.handlerID
 	s.mu.Unlock()
-	client.RemoveEventHandler(handlerID)
+
+	// Closed before the handler is removed, and that order matters as much as the one
+	// above. whatsmeow holds its handler lock while a handler runs and RemoveEventHandler
+	// waits for the same lock; a handler sitting in emit with a full inbox is released
+	// only by this channel. Removing first would have the two wait on each other, with
+	// the socket still open and the lease already gone.
+	close(s.done)
+
+	s.detach(client, handlerID)
 	client.Disconnect()
 
-	close(s.done)
 	s.drain()
 	return nil
 }

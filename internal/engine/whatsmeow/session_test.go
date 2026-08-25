@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"image/png"
 	"path/filepath"
 	"strings"
@@ -751,4 +752,122 @@ func TestResumeLeavesAReconnectAlone(t *testing.T) {
 		t.Fatalf("a resume during a reconnect published %q", emission.Type)
 	case <-time.After(200 * time.Millisecond):
 	}
+}
+
+// A logout that never left the machine has not revoked anything. whatsmeow answers
+// ErrNotConnected before it sends the unlink request, and the device is then exactly as
+// good as it was: still paired, still resumable, and still listed on the operator's
+// phone. Treating that as "WhatsApp may have accepted it" costs them a fresh pairing
+// for a logout that visibly failed, and leaves the device they asked to remove linked.
+func TestALogoutThatNeverReachedWhatsappKeepsTheCredentials(t *testing.T) {
+	t.Parallel()
+
+	session, container := newTestSession(t, "5511999990001")
+
+	// Not connected, which is where a logout arrives when the socket is already down.
+	err := session.Logout(t.Context())
+	if err == nil {
+		t.Fatal("a logout on a disconnected client reported success")
+	}
+	if !errors.Is(err, wm.ErrNotConnected) {
+		t.Fatalf("Logout failed with %v, want ErrNotConnected", err)
+	}
+
+	if session.isStale() {
+		t.Fatal("the session was marked stale, so the next connect would delete credentials that still resume")
+	}
+	if _, bound, err := container.JID(t.Context(), session.sid); err != nil || !bound {
+		t.Fatalf("the pairing was forgotten anyway (bound=%v, err=%v)", bound, err)
+	}
+}
+
+// The other half of the same rule: a failure the server answered with means the unlink
+// may well have been carried out, and a session that kept its credentials would report
+// itself open over a device WhatsApp has already thrown away.
+func TestOnlyAPreSendFailureCountsAsHavingSentNothing(t *testing.T) {
+	t.Parallel()
+
+	for name, test := range map[string]struct {
+		err  error
+		want bool
+	}{
+		"the socket was down":        {err: wm.ErrNotConnected, want: true},
+		"there was no device at all": {err: fmt.Errorf("wrapped: %w", wm.ErrNotLoggedIn), want: true},
+		"the client was nil":         {err: wm.ErrClientIsNil, want: true},
+		"the server refused it":      {err: errors.New("error sending logout request: server said no"), want: false},
+		"the store could not be emptied": {
+			err: fmt.Errorf("error deleting data from store: %w", errors.New("disk full")), want: false,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if got := sentNothing(test.err); got != test.want {
+				t.Fatalf("sentNothing(%v) = %v, want %v", test.err, got, test.want)
+			}
+		})
+	}
+}
+
+// whatsmeow calls its handlers under a lock that RemoveEventHandler also waits for, so
+// a handler blocked inside emit can only be released by the channel Close closes.
+// Removing the handler first would have the two wait on each other, with the socket
+// still open and the lease already gone, which is the one thing the teardown exists to
+// prevent.
+//
+// The library half of that cannot be driven from a test: nothing outside whatsmeow can
+// make it dispatch an event. So the removal is a field, and this stands in for the
+// library by refusing to return until the publisher it is standing in front of has been
+// released. A Close that removes before it closes never gets past it.
+func TestCloseReleasesABlockedHandlerBeforeWaitingOnIt(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "")
+
+	// Nothing reads Events, so the forwarder parks on its first send and the inbox
+	// fills behind it, leaving a publisher blocked exactly where a whatsmeow callback
+	// would be.
+	blocked := make(chan struct{})
+	go func() {
+		defer close(blocked)
+		for range inboxDepth + 8 {
+			session.emit(protocol.EventSessionState, map[string]any{"state": "open"})
+		}
+	}()
+	waitForBlockedInbox(t, session)
+
+	session.detach = func(*wm.Client, uint32) {
+		// What RemoveEventHandler does: wait for the in-flight handler to return.
+		select {
+		case <-blocked:
+		case <-time.After(5 * time.Second):
+			t.Error("the handler was still blocked when Close came to remove it")
+		}
+	}
+
+	closed := make(chan error, 1)
+	go func() { closed <- session.Close() }()
+
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close did not return with a publisher blocked on a full inbox")
+	}
+}
+
+// waitForBlockedInbox waits until the session cannot take another emission without
+// blocking, which is the state the test above needs before it starts.
+func waitForBlockedInbox(t *testing.T, session *Session) {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(session.inbox) == inboxDepth {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("the inbox never filled")
 }

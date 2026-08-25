@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/redisx"
+	"github.com/fazer-ai/whatsapp-connector/internal/transport/redisstream"
 )
 
 // Config is the whole configuration, read from the environment.
@@ -33,6 +34,12 @@ type Config struct {
 	LogLevel     string
 	LeaseTTL     time.Duration
 	Heartbeat    time.Duration
+	// ClaimMinIdle is how long a command has to sit unacknowledged before another
+	// instance takes it over. It bounds how long a session stays unowned after the
+	// instance that woke it died, and it has to stay comfortably above the time a
+	// healthy instance spends carrying one command out, or a slow adoption gets stolen
+	// from underneath itself.
+	ClaimMinIdle time.Duration
 }
 
 // The engines this build can run.
@@ -67,6 +74,10 @@ func LoadConfig(hostname string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	claimMinIdle, err := envDuration("WAC_CLAIM_MIN_IDLE", redisstream.DefaultClaimMinIdle)
+	if err != nil {
+		return Config{}, err
+	}
 
 	cfg := Config{
 		Instance:     envString("WAC_INSTANCE", hostname),
@@ -83,6 +94,7 @@ func LoadConfig(hostname string) (Config, error) {
 		LogLevel:     envString("WAC_LOG_LEVEL", "info"),
 		LeaseTTL:     leaseTTL,
 		Heartbeat:    heartbeat,
+		ClaimMinIdle: claimMinIdle,
 	}
 	if cfg.Instance == "" {
 		return Config{}, fmt.Errorf("app: WAC_INSTANCE is empty and the hostname is unknown")

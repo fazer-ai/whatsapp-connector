@@ -83,7 +83,7 @@ func New(cfg *Config, log zerolog.Logger) (*Connector, error) {
 		return nil, err
 	}
 
-	streams, err := redisstream.New(client, redisstream.Options{Instance: cfg.Instance})
+	streams, err := redisstream.New(client, redisstream.Options{Instance: cfg.Instance, ClaimMinIdle: cfg.ClaimMinIdle})
 	if err != nil {
 		return nil, err
 	}
@@ -169,11 +169,33 @@ func (c *Connector) loop(ctx context.Context, httpErr <-chan error) error {
 			return nil
 		case <-heartbeat.C:
 			c.manager.RenewAll(ctx)
+			c.reclaimCommands(ctx)
 			c.announce(ctx)
 			c.metrics.SessionsRunning.Set(float64(c.manager.Count()))
 		default:
 			c.readCommands(ctx)
 		}
+	}
+}
+
+// reclaimCommands takes over what nobody acknowledged: what another instance read
+// before it was killed, and what this one deliberately left pending when it could not
+// adopt a woken session.
+//
+// Without it `>` is the only thing ever read, and an entry that reaches the group's
+// pending list stays there. A wake left pending on purpose would then never come back,
+// so the session it named would stay unowned until a client happened to send another
+// command, and the pending list would grow for as long as the instance ran.
+func (c *Connector) reclaimCommands(ctx context.Context) {
+	deliveries, err := c.streams.Claim(ctx, c.manager.SIDs())
+	if err != nil {
+		if ctx.Err() == nil {
+			c.log.Error().Err(err).Msg("failed to reclaim commands")
+		}
+		return
+	}
+	for i := range deliveries {
+		c.manager.Dispatch(ctx, &deliveries[i])
 	}
 }
 

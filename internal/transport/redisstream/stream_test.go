@@ -33,8 +33,11 @@ func newFleet(t *testing.T) fleet {
 func (f fleet) streams(t *testing.T, instance string) *redisstream.Streams {
 	t.Helper()
 	// A short block keeps a read that finds nothing from holding the test for the
-	// production interval.
-	streams, err := redisstream.New(f.client, redisstream.Options{Instance: instance, Block: 50 * time.Millisecond})
+	// production interval, and a short min-idle keeps a reclaim from waiting out the
+	// thirty seconds a fleet gives a peer to finish what it took.
+	streams, err := redisstream.New(f.client, redisstream.Options{
+		Instance: instance, Block: 50 * time.Millisecond, ClaimMinIdle: time.Millisecond,
+	})
 	if err != nil {
 		t.Fatalf("redisstream.New: %v", err)
 	}
@@ -313,3 +316,102 @@ func toFields(values map[string]any) map[string]string {
 }
 
 var _ transport.Transport = (*redisstream.Streams)(nil)
+
+// An entry a consumer read and never acknowledged is invisible to every later read:
+// `>` only ever returns what nobody has taken. Claim is the only way back to it, which
+// makes it the difference between an instance dying mid-command and that command being
+// lost, and between a wake left pending on purpose and a session nobody ever adopts.
+func TestClaimTakesOverWhatWasNeverAcknowledged(t *testing.T) {
+	t.Parallel()
+
+	f := newFleet(t)
+	dead := f.streams(t, "inst-dead")
+	alive := f.streams(t, "inst-alive")
+	ctx := context.Background()
+
+	if _, err := dead.Read(ctx, []string{"s1"}); err != nil {
+		t.Fatalf("priming Read: %v", err)
+	}
+	writeCommand(t, f, f.client.Keys().Commands("s1"), command("c1", "s1", "c1"))
+
+	taken, err := dead.Read(ctx, []string{"s1"})
+	if err != nil || len(taken) != 1 {
+		t.Fatalf("the first instance read %d commands (err=%v), want 1", len(taken), err)
+	}
+	// And then it dies, without acknowledging.
+
+	fresh, err := alive.Read(ctx, []string{"s1"})
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if len(fresh) != 0 {
+		t.Fatalf("a plain read returned %d commands; the entry is pending, not new", len(fresh))
+	}
+
+	claimed := claimEventually(t, alive, []string{"s1"})
+	if len(claimed) != 1 {
+		t.Fatalf("Claim returned %d commands, want 1", len(claimed))
+	}
+	if claimed[0].Command.ID != "c1" {
+		t.Errorf("claimed command id = %q, want c1", claimed[0].Command.ID)
+	}
+
+	// Acknowledging it is what retires it, so a third instance finds nothing left.
+	if err := claimed[0].Ack(ctx); err != nil {
+		t.Fatalf("Ack: %v", err)
+	}
+	again, err := f.streams(t, "inst-third").Claim(ctx, []string{"s1"})
+	if err != nil {
+		t.Fatalf("Claim after an ack: %v", err)
+	}
+	if len(again) != 0 {
+		t.Fatalf("an acknowledged command was claimed again (%d)", len(again))
+	}
+}
+
+// A wake rides the control stream, and a wake that could not be acted on is exactly the
+// entry this connector leaves pending on purpose. Claiming only the owned sessions
+// would never look at the stream it is on.
+func TestClaimLooksAtControlToo(t *testing.T) {
+	t.Parallel()
+
+	f := newFleet(t)
+	dead := f.streams(t, "inst-dead")
+	alive := f.streams(t, "inst-alive")
+	ctx := context.Background()
+
+	if _, err := dead.Read(ctx, nil); err != nil {
+		t.Fatalf("priming Read: %v", err)
+	}
+	writeCommand(t, f, f.client.Keys().Control(), command("c-wake", "s9", ""))
+	if taken, err := dead.Read(ctx, nil); err != nil || len(taken) != 1 {
+		t.Fatalf("the first instance read %d commands (err=%v), want 1", len(taken), err)
+	}
+
+	// No owned sessions at all, which is the state an instance is in when the wake it
+	// could not act on is the only thing outstanding.
+	claimed := claimEventually(t, alive, nil)
+	if len(claimed) != 1 || claimed[0].Command.ID != "c-wake" {
+		t.Fatalf("Claim returned %v, want the pending wake", claimed)
+	}
+}
+
+// claimEventually retries until the pending entry is older than the min-idle. Nothing
+// about the wait is the behaviour under test: an entry is only claimable once it has
+// been idle long enough, and asserting on the first attempt would be asserting on how
+// fast the test itself ran.
+func claimEventually(t *testing.T, streams *redisstream.Streams, sids []string) []transport.Delivery {
+	t.Helper()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		claimed, err := streams.Claim(context.Background(), sids)
+		if err != nil {
+			t.Fatalf("Claim: %v", err)
+		}
+		if len(claimed) > 0 || time.Now().After(deadline) {
+			return claimed
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}

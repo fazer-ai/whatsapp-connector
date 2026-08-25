@@ -506,3 +506,90 @@ func (refusingEngine) Open(context.Context, string) (engine.Session, error) {
 	return nil, errors.New("the store is unreachable")
 }
 func (refusingEngine) Close() error { return nil }
+
+// stalledEngine is a store that has stopped answering: Open blocks until whoever asked
+// gives up. It is what a database in the middle of a failover looks like from here.
+type stalledEngine struct {
+	entered chan struct{}
+	once    sync.Once
+}
+
+func (e *stalledEngine) Open(ctx context.Context, _ string) (engine.Session, error) {
+	e.once.Do(func() { close(e.entered) })
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (e *stalledEngine) Close() error { return nil }
+
+// Commands are dispatched on the same goroutine that renews every lease this instance
+// holds. An adoption that waits on a database therefore stops all of them from being
+// renewed: their leases expire, peers acquire the accounts, and the sockets this
+// instance still holds open go on talking to WhatsApp. One session failing to start is
+// the cheaper outcome by a wide margin.
+func TestAdoptGivesUpOnAStoreThatStoppedAnswering(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	leases := cluster.NewLeases(redisx.Wrap(rdb, "wa:", 8), "inst-a", cluster.Options{})
+	stalled := &stalledEngine{entered: make(chan struct{})}
+	manager := session.NewManager(&session.ManagerConfig{
+		Instance: "inst-a", Engine: stalled, Leases: leases,
+		Publisher: newRecorder(), Replier: newRecorder(),
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	t.Cleanup(func() { manager.StopAll(context.Background()) })
+
+	started := time.Now()
+	_, err := manager.Adopt(context.Background(), "s1")
+	elapsed := time.Since(started)
+
+	if err == nil {
+		t.Fatal("Adopt returned successfully from a store that never answered")
+	}
+	if elapsed > 2*session.AdoptTimeout {
+		t.Fatalf("Adopt waited %s on an unbounded context, want about %s", elapsed, session.AdoptTimeout)
+	}
+	select {
+	case <-stalled.entered:
+	default:
+		t.Fatal("the engine was never asked, so the timeout proved nothing")
+	}
+
+	// The lease goes back, or every other instance is kept off an account nobody runs.
+	if manager.Count() != 0 {
+		t.Fatalf("the manager runs %d sessions after a failed adoption", manager.Count())
+	}
+	other := cluster.NewLeases(redisx.Wrap(rdb, "wa:", 8), "inst-b", cluster.Options{})
+	if _, err := other.Acquire(context.Background(), "s1"); err != nil {
+		t.Fatalf("a peer could not take the released lease: %v", err)
+	}
+}
+
+// The bound belongs to the I/O and not to the session. A session built on the bounded
+// context would be torn down a few seconds after it was adopted, which is a connector
+// that pairs an account and drops it.
+func TestAnAdoptedSessionOutlivesTheBoundOnItsAdoption(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	leases := cluster.NewLeases(redisx.Wrap(rdb, "wa:", 8), "inst-a", cluster.Options{})
+	manager := session.NewManager(&session.ManagerConfig{
+		Instance: "inst-a", Engine: fake.New(), Leases: leases,
+		Publisher: newRecorder(), Replier: newRecorder(),
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	t.Cleanup(func() { manager.StopAll(context.Background()) })
+
+	if _, err := manager.Adopt(context.Background(), "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	time.Sleep(session.AdoptTimeout + 500*time.Millisecond)
+	if got := manager.Count(); got != 1 {
+		t.Fatalf("the manager runs %d sessions after the adoption's own deadline passed, want 1", got)
+	}
+}
