@@ -7,39 +7,43 @@ type EventType string
 
 // Every event type in the contract, grouped as the catalog groups them.
 const (
-	EventSessionState               EventType = "session.state"
-	EventSessionLoggedOut           EventType = "session.logged_out"
-	EventSessionStreamReplaced      EventType = "session.stream_replaced"
-	EventSessionTemporaryBan        EventType = "session.temporary_ban"
-	EventSessionClientOutdated      EventType = "session.client_outdated"
-	EventSessionConnectFailure      EventType = "session.connect_failure"
-	EventPairingQR                  EventType = "pairing.qr"
-	EventPairingCode                EventType = "pairing.code"
-	EventPairingSuccess             EventType = "pairing.success"
-	EventPairingError               EventType = "pairing.error"
-	EventPairingPasskeyRequest      EventType = "pairing.passkey_request"
-	EventPairingPasskeyConfirmation EventType = "pairing.passkey_confirmation"
-	EventMessageReceived            EventType = "message.received"
-	EventMessageReceipt             EventType = "message.receipt"
-	EventMessageEdited              EventType = "message.edited"
-	EventMessageRevoked             EventType = "message.revoked"
-	EventMessageReaction            EventType = "message.reaction"
-	EventMediaDownloadFailed        EventType = "media.download_failed"
-	EventCommandFailed              EventType = "command.failed"
-	EventChatPresence               EventType = "chat.presence"
-	EventPresenceUpdate             EventType = "presence.update"
-	EventContactPictureChanged      EventType = "contact.picture_changed"
-	EventContactIdentityChanged     EventType = "contact.identity_changed"
-	EventGroupJoined                EventType = "group.joined"
-	EventGroupUpdated               EventType = "group.updated"
-	EventGroupPictureChanged        EventType = "group.picture_changed"
-	EventGroupActivity              EventType = "group.activity"
-	EventAccountReachoutTimelock    EventType = "account.reachout_timelock"
-	EventAccountNewChatCap          EventType = "account.new_chat_cap"
-	EventCallOffer                  EventType = "call.offer"
-	EventCallTerminate              EventType = "call.terminate"
-	EventHistorySync                EventType = "history.sync"
-	EventRaw                        EventType = "raw"
+	EventSessionState          EventType = "session.state"
+	EventSessionLoggedOut      EventType = "session.logged_out"
+	EventSessionStreamReplaced EventType = "session.stream_replaced"
+	EventSessionTemporaryBan   EventType = "session.temporary_ban"
+	EventSessionClientOutdated EventType = "session.client_outdated"
+	EventSessionConnectFailure EventType = "session.connect_failure"
+	// The replay of what a session missed while it was down, bracketed by a preview and
+	// a completion. Only a backend whose library receives it can emit these.
+	EventSessionOfflineSyncPreview   EventType = "session.offline_sync_preview"
+	EventSessionOfflineSyncCompleted EventType = "session.offline_sync_completed"
+	EventPairingQR                   EventType = "pairing.qr"
+	EventPairingCode                 EventType = "pairing.code"
+	EventPairingSuccess              EventType = "pairing.success"
+	EventPairingError                EventType = "pairing.error"
+	EventPairingPasskeyRequest       EventType = "pairing.passkey_request"
+	EventPairingPasskeyConfirmation  EventType = "pairing.passkey_confirmation"
+	EventMessageReceived             EventType = "message.received"
+	EventMessageReceipt              EventType = "message.receipt"
+	EventMessageEdited               EventType = "message.edited"
+	EventMessageRevoked              EventType = "message.revoked"
+	EventMessageReaction             EventType = "message.reaction"
+	EventMediaDownloadFailed         EventType = "media.download_failed"
+	EventCommandFailed               EventType = "command.failed"
+	EventChatPresence                EventType = "chat.presence"
+	EventPresenceUpdate              EventType = "presence.update"
+	EventContactPictureChanged       EventType = "contact.picture_changed"
+	EventContactIdentityChanged      EventType = "contact.identity_changed"
+	EventGroupJoined                 EventType = "group.joined"
+	EventGroupUpdated                EventType = "group.updated"
+	EventGroupPictureChanged         EventType = "group.picture_changed"
+	EventGroupActivity               EventType = "group.activity"
+	EventAccountReachoutTimelock     EventType = "account.reachout_timelock"
+	EventAccountNewChatCap           EventType = "account.new_chat_cap"
+	EventCallOffer                   EventType = "call.offer"
+	EventCallTerminate               EventType = "call.terminate"
+	EventHistorySync                 EventType = "history.sync"
+	EventRaw                         EventType = "raw"
 )
 
 // CommandType is the discriminator of a command frame.
@@ -96,6 +100,8 @@ var AllEventTypes = []EventType{
 	EventSessionTemporaryBan,
 	EventSessionClientOutdated,
 	EventSessionConnectFailure,
+	EventSessionOfflineSyncPreview,
+	EventSessionOfflineSyncCompleted,
 	EventPairingQR,
 	EventPairingCode,
 	EventPairingSuccess,
