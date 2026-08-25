@@ -68,7 +68,7 @@ func (e *Engine) Open(ctx context.Context, sid string) (engine.Session, error) {
 	}
 
 	client := wm.NewClient(device, e.waLog.Sub(sid))
-	session := newSession(sid, client, e.store, e.log)
+	session := newSession(sid, client, e.store, e.log, e.waLog.Sub(sid))
 
 	e.mu.Lock()
 	defer e.mu.Unlock()

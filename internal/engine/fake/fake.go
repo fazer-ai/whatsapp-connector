@@ -172,11 +172,15 @@ func (s *Session) Execute(_ context.Context, command *protocol.Command) (json.Ra
 
 	switch command.Type {
 	case protocol.CommandSessionStatus:
-		state := "close"
+		// A `connection_state`, whose key is `connection`. The `session.state` event
+		// reporting the same change spells it `state`, and answering the RPC with the
+		// event's shape leaves the caller without the field the result requires.
+		state := map[string]any{"connection": "close"}
 		if connected {
-			state = "open"
+			state["connection"] = "open"
+			state["phone_number"] = PairedPhone
 		}
-		return marshal(map[string]any{"state": state})
+		return marshal(state)
 	case protocol.CommandMessageSend, protocol.CommandMessageEdit, protocol.CommandMessageReact:
 		if !connected {
 			return nil, errNotConnected

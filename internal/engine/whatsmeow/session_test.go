@@ -16,6 +16,7 @@ import (
 	"go.mau.fi/whatsmeow/proto/waAdv"
 	"go.mau.fi/whatsmeow/types"
 	waEvents "go.mau.fi/whatsmeow/types/events"
+	waLog "go.mau.fi/whatsmeow/util/log"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/engine"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
@@ -87,15 +88,17 @@ func TestExecuteAnswersTheSessionAndRefusesTheRest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("session.status: %v", err)
 	}
+	// The RPC result is a `connection_state`, whose key is `connection`. The event that
+	// reports the same change spells it `state`, and answering the RPC with the event's
+	// shape leaves the caller without the one field the result requires.
 	var status struct {
-		State string `json:"state"`
-		Phone string `json:"phone"`
+		Connection string `json:"connection"`
 	}
 	if err := json.Unmarshal(result, &status); err != nil {
 		t.Fatalf("unmarshal the status: %v", err)
 	}
-	if status.State != "close" {
-		t.Fatalf("an unconnected session reports %q, want close", status.State)
+	if status.Connection != "close" {
+		t.Fatalf("an unconnected session reports %q, want close", status.Connection)
 	}
 
 	// M2 brings the sends. Until then a refusal is the honest answer: acknowledging a
@@ -117,8 +120,11 @@ func TestStatusCarriesTheAddressOncePaired(t *testing.T) {
 	if err := json.Unmarshal(result, &status); err != nil {
 		t.Fatalf("unmarshal the status: %v", err)
 	}
-	if status["phone"] != "5511999990001" {
-		t.Fatalf("the status carries phone=%v", status["phone"])
+	if status["phone_number"] != "5511999990001" {
+		t.Fatalf("the status carries phone_number=%v", status["phone_number"])
+	}
+	if status["phone"] != nil {
+		t.Fatalf("the status carries the event's key too: phone=%v", status["phone"])
 	}
 }
 
@@ -375,7 +381,7 @@ func newTestSession(t *testing.T, phone string) (*Session, *store.Container) {
 		}
 	}
 
-	session := newSession(sid, wm.NewClient(device, nil), container, zerolog.Nop())
+	session := newSession(sid, wm.NewClient(device, nil), container, zerolog.Nop(), waLog.Noop)
 	t.Cleanup(func() { _ = session.Close() })
 	return session, container
 }

@@ -63,6 +63,41 @@ func TestPairingBurstMatchesTheContract(t *testing.T) {
 	}
 }
 
+// The reply to session.connect and session.status is a `connection_state`, which is a
+// different shape from the `session.state` event that reports the same change. The fake
+// is what the end-to-end check reads, so a fake answering with the event's shape would
+// prove the client accepts a reply it must reject.
+func TestSessionStatusAnswersAConnectionState(t *testing.T) {
+	t.Parallel()
+
+	waEngine := fake.New()
+	t.Cleanup(func() { _ = waEngine.Close() })
+	session, err := waEngine.Open(t.Context(), "sid-1")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := session.Connect(t.Context(), engine.ConnectRequest{Pairing: "qr"}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	result, err := session.Execute(t.Context(), &protocol.Command{Type: protocol.CommandSessionStatus})
+	if err != nil {
+		t.Fatalf("session.status: %v", err)
+	}
+	validateAgainst(t, "connection_state", result)
+
+	var status map[string]any
+	if err := json.Unmarshal(result, &status); err != nil {
+		t.Fatalf("unmarshal the status: %v", err)
+	}
+	if status["connection"] != "open" {
+		t.Fatalf("connection=%v, want open", status["connection"])
+	}
+	if status["state"] != nil {
+		t.Fatalf("the result carries the event's key too: state=%v", status["state"])
+	}
+}
+
 // validate checks one payload against the definition the contract names for its type.
 func validate(t *testing.T, eventType protocol.EventType, payload json.RawMessage) {
 	t.Helper()
@@ -74,18 +109,25 @@ func validate(t *testing.T, eventType protocol.EventType, payload json.RawMessag
 		}
 	}
 
+	validateAgainst(t, pointer, payload)
+}
+
+// validateAgainst checks a payload against one definition in the contract's schema.
+func validateAgainst(t *testing.T, definition string, payload json.RawMessage) {
+	t.Helper()
+
 	compiler := jsonschema.NewCompiler()
 	path := filepath.Join("..", "..", "..", "contract", "schema", "protocol.schema.json")
-	schema, err := compiler.Compile(path + "#/definitions/" + pointer)
+	schema, err := compiler.Compile(path + "#/definitions/" + definition)
 	if err != nil {
-		t.Fatalf("compile %s: %v", pointer, err)
+		t.Fatalf("compile %s: %v", definition, err)
 	}
 
 	var decoded any
 	if err := json.Unmarshal(payload, &decoded); err != nil {
-		t.Fatalf("unmarshal the payload of %s: %v", eventType, err)
+		t.Fatalf("unmarshal the payload for %s: %v", definition, err)
 	}
 	if err := schema.Validate(decoded); err != nil {
-		t.Fatalf("the payload of %s does not match the contract: %v", eventType, err)
+		t.Fatalf("the payload does not match %s: %v", definition, err)
 	}
 }
