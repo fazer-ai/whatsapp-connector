@@ -68,6 +68,10 @@ type Session struct {
 	// socket nobody is waiting for. This is the answer to "is it connecting" that costs
 	// no lock.
 	dialing bool
+	// connected is what the socket is actually doing, kept from the events that report
+	// it. whatsmeow's own IsLoggedIn is set on authentication and cleared only by a
+	// stream error, so it stays true through a Disconnect and cannot answer this.
+	connected bool
 	// stale is a client whose device whatsmeow deleted and whose replacement could not
 	// be built. Nothing works on it, so the next connect tries the rebuild again rather
 	// than talking to it.
@@ -156,6 +160,7 @@ func (s *Session) adopt(client *wm.Client) bool {
 	s.phone = phone
 	s.lid = lid
 	s.stale = false
+	s.connected = false
 	s.mu.Unlock()
 	return true
 }
@@ -176,6 +181,12 @@ func (s *Session) identity() (phone, lid string) {
 func (s *Session) setDialing(dialing bool) {
 	s.mu.Lock()
 	s.dialing = dialing
+	s.mu.Unlock()
+}
+
+func (s *Session) setConnected(connected bool) {
+	s.mu.Lock()
+	s.connected = connected
 	s.mu.Unlock()
 }
 
@@ -419,6 +430,7 @@ func (s *Session) pairWithCode(ctx context.Context, phone string) error {
 // Disconnect drops the socket and keeps the credentials.
 func (s *Session) Disconnect(ctx context.Context) error {
 	s.cancelPairing()
+	s.setConnected(false)
 	s.hangUp(ctx, s.current())
 	s.emit(protocol.EventSessionState, map[string]any{"state": "close", "reason": "disconnect_requested"})
 	return nil
@@ -431,7 +443,12 @@ func (s *Session) Logout(ctx context.Context) error {
 	if err := s.current().Logout(ctx); err != nil {
 		return fmt.Errorf("whatsmeow: log %s out: %w", s.sid, err)
 	}
+	s.setConnected(false)
 	if err := s.store.Forget(ctx, s.sid); err != nil {
+		// WhatsApp has already accepted the logout, so the client here is on a deleted
+		// device whatever happens next. Leaving without saying so strands the session on
+		// it until something re-adopts it.
+		s.markStale()
 		return err
 	}
 	if err := s.rebuild(ctx); err != nil {
@@ -547,6 +564,13 @@ func (s *Session) isClosed() bool {
 	return s.closed
 }
 
+// isCurrentPairing reports whether a run is still the one this session is on.
+func (s *Session) isCurrentPairing(run *pairingRun) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.pairing == run
+}
+
 // pairingActive reports whether a pairing conversation is open, which is what decides
 // who publishes an outcome both paths are told about.
 func (s *Session) pairingActive() bool {
@@ -621,19 +645,22 @@ func (s *Session) sessionState() map[string]any {
 	return payload
 }
 
-// state answers without taking whatsmeow's socket lock, which a dial holds for its
-// whole length. `IsConnected` reads under that lock, so asking it here would put every
-// status behind a connect nobody is waiting for; `IsLoggedIn` is a flag, and the dial in
-// flight is this session's own bookkeeping.
+// state answers without asking the client anything.
+//
+// Every question whatsmeow answers about its socket takes the lock a dial holds for its
+// whole length, so asking here would put every status behind a connect nobody is
+// waiting for. Its one lock-free answer, IsLoggedIn, is set on authentication and
+// cleared only by a stream error: it stays true through a Disconnect, and a session
+// that believed it would never reconnect again.
 func (s *Session) state() string {
 	s.mu.Lock()
-	closed, dialing, client := s.closed, s.dialing, s.client
+	closed, dialing, connected := s.closed, s.dialing, s.connected
 	s.mu.Unlock()
 
 	switch {
 	case closed:
 		return "close"
-	case client.IsLoggedIn():
+	case connected:
 		return "open"
 	case dialing:
 		return "connecting"
@@ -695,7 +722,7 @@ func (s *Session) readPairingWith(run *pairingRun, codes <-chan wm.QRChannelItem
 				onFirst()
 			}
 		}
-		s.publishPairing(item, publishCodes)
+		s.publishPairing(run, item, publishCodes)
 	}
 	if first && onFirst != nil {
 		// The channel ended before a single code arrived, so whoever is waiting for the
@@ -704,7 +731,14 @@ func (s *Session) readPairingWith(run *pairingRun, codes <-chan wm.QRChannelItem
 	}
 }
 
-func (s *Session) publishPairing(item wm.QRChannelItem, publishCodes bool) {
+func (s *Session) publishPairing(run *pairingRun, item wm.QRChannelItem, publishCodes bool) {
+	if !s.isCurrentPairing(run) {
+		// The operator disconnected or started over while this item was being rendered.
+		// An expired code or a terminal error from an attempt nobody is watching lands
+		// after the state that replaced it.
+		return
+	}
+
 	switch item.Event {
 	case "code":
 		if !publishCodes {
@@ -794,8 +828,10 @@ func errorText(err error) any {
 func (s *Session) handle(rawEvent any) {
 	switch event := rawEvent.(type) {
 	case *waEvents.Connected:
+		s.setConnected(true)
 		s.emit(protocol.EventSessionState, s.sessionState())
 	case *waEvents.Disconnected:
+		s.setConnected(false)
 		// whatsmeow only reconnects a device it has an id for, so a drop before pairing
 		// finishes is the end of that attempt. Reporting it as reconnecting leaves the
 		// dashboard waiting on something nothing is going to do.

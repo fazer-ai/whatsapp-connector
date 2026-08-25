@@ -21,9 +21,17 @@ type quietLogger struct {
 
 // newLibraryLogger returns the logger handed to whatsmeow.
 //
+// The session id is a field of its own rather than the first Sub: whatsmeow makes its
+// own Sub calls for its modules, each overwriting the last, and a line that loses the
+// sid is a line nobody can tie to an account.
+//
 //nolint:gocritic // zerolog.Logger is designed to be copied; every With() returns one by value
-func newLibraryLogger(log zerolog.Logger) waLog.Logger {
-	return &quietLogger{log: log.With().Str("component", "whatsmeow").Logger()}
+func newLibraryLogger(log zerolog.Logger, sid string) waLog.Logger {
+	entry := log.With().Str("component", "whatsmeow")
+	if sid != "" {
+		entry = entry.Str("sid", sid)
+	}
+	return &quietLogger{log: entry.Logger()}
 }
 
 func (l *quietLogger) Warnf(msg string, args ...any)  { l.log.Warn().Msgf(msg, args...) }

@@ -15,7 +15,6 @@ import (
 	"github.com/rs/zerolog"
 	wm "go.mau.fi/whatsmeow"
 	waStore "go.mau.fi/whatsmeow/store"
-	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/engine"
@@ -26,7 +25,6 @@ import (
 type Engine struct {
 	store *store.Container
 	log   zerolog.Logger
-	waLog waLog.Logger
 
 	mu       sync.Mutex
 	sessions map[string]*Session
@@ -50,7 +48,6 @@ func New(container *store.Container, deviceName string, log zerolog.Logger) *Eng
 	return &Engine{
 		store:    container,
 		log:      log,
-		waLog:    newLibraryLogger(log),
 		sessions: make(map[string]*Session),
 	}
 }
@@ -79,8 +76,8 @@ func (e *Engine) Open(ctx context.Context, sid string) (engine.Session, error) {
 		return nil, fmt.Errorf("whatsmeow: open %s: %w", sid, err)
 	}
 
-	client := wm.NewClient(device, e.waLog.Sub(sid))
-	session := newSession(sid, client, e.store, e.log, e.waLog.Sub(sid))
+	wa := newLibraryLogger(e.log, sid)
+	session := newSession(sid, wm.NewClient(device, wa), e.store, e.log, wa)
 
 	e.mu.Lock()
 	defer e.mu.Unlock()

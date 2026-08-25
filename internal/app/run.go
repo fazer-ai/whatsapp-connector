@@ -28,6 +28,10 @@ import (
 // Version is the build's version, set by the linker in a release build.
 var Version = "dev"
 
+// StartupTimeout bounds the work New does before it can serve: dialling Redis, and
+// bringing the device store's schema up.
+const StartupTimeout = 60 * time.Second
+
 // ShutdownGrace is how long a stopping instance is given to release its sessions. It
 // is the reason `stop_grace_period` in the compose file is generous: a release is a
 // peer picking the session up in seconds instead of waiting out the lease.
@@ -68,7 +72,13 @@ func New(cfg *Config, log zerolog.Logger) (*Connector, error) {
 		return nil, err
 	}
 
-	waEngine, devices, err := newEngine(context.Background(), cfg, log)
+	// Bounded: an unreachable database or a migration that will not finish would
+	// otherwise leave the process starting forever, which an orchestrator reads as a
+	// container that is simply slow.
+	startupCtx, cancelStartup := context.WithTimeout(context.Background(), StartupTimeout)
+	defer cancelStartup()
+
+	waEngine, devices, err := newEngine(startupCtx, cfg, log)
 	if err != nil {
 		return nil, err
 	}

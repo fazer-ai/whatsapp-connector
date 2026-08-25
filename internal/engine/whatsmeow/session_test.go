@@ -16,7 +16,6 @@ import (
 	"go.mau.fi/whatsmeow/proto/waAdv"
 	"go.mau.fi/whatsmeow/types"
 	waEvents "go.mau.fi/whatsmeow/types/events"
-	waLog "go.mau.fi/whatsmeow/util/log"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/engine"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
@@ -141,8 +140,10 @@ func TestHandleTranslatesWhatWhatsappReports(t *testing.T) {
 			event: &waEvents.Connected{},
 			want:  protocol.EventSessionState,
 			check: func(t *testing.T, payload map[string]any) {
-				if payload["state"] != "close" {
-					t.Fatalf("state=%v on a client that never connected", payload["state"])
+				// whatsmeow emits this once the socket is up and authenticated, which is
+				// the whole of what open means.
+				if payload["state"] != "open" {
+					t.Fatalf("state=%v after a connection", payload["state"])
 				}
 			},
 		},
@@ -324,8 +325,9 @@ func TestPairingChannelIsTranslated(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			session, _ := newTestSession(t, "")
+			run := session.startPairing(func() {})
 
-			session.publishPairing(test.item, true)
+			session.publishPairing(run, test.item, true)
 			if emission := next(t, session); emission.Type != test.want {
 				t.Fatalf("published %q, want %q", emission.Type, test.want)
 			}
@@ -336,11 +338,12 @@ func TestPairingChannelIsTranslated(t *testing.T) {
 func TestCodePairingDoesNotPublishImages(t *testing.T) {
 	t.Parallel()
 	session, _ := newTestSession(t, "")
+	run := session.startPairing(func() {})
 
 	// An operator who asked for a code is not looking at an image, and publishing both
 	// would offer the dashboard two ways to pair one session.
-	session.publishPairing(wm.QRChannelItem{Event: "code", Code: "2@a,b,c"}, false)
-	session.publishPairing(wm.QRChannelTimeout, false)
+	session.publishPairing(run, wm.QRChannelItem{Event: "code", Code: "2@a,b,c"}, false)
+	session.publishPairing(run, wm.QRChannelTimeout, false)
 
 	if emission := next(t, session); emission.Type != protocol.EventPairingError {
 		t.Fatalf("published %q first, want the timeout alone", emission.Type)
@@ -433,7 +436,7 @@ func newTestSession(t *testing.T, phone string) (*Session, *store.Container) {
 		}
 	}
 
-	session := newSession(sid, wm.NewClient(device, nil), container, zerolog.Nop(), waLog.Noop)
+	session := newSession(sid, wm.NewClient(device, nil), container, zerolog.Nop(), newLibraryLogger(zerolog.Nop(), sid))
 	t.Cleanup(func() { _ = session.Close() })
 	return session, container
 }
@@ -489,7 +492,7 @@ func TestTheLibraryLoggerDropsItsDebugOutput(t *testing.T) {
 	t.Parallel()
 
 	var written bytes.Buffer
-	logger := newLibraryLogger(zerolog.New(&written).Level(zerolog.DebugLevel))
+	logger := newLibraryLogger(zerolog.New(&written).Level(zerolog.DebugLevel), "sid-1")
 
 	logger.Debugf("Emitting QR code %s", "2@secret,pairing,code")
 	logger.Sub("qrchannel").Debugf("Sending node %s", "<iq to=s.whatsapp.net>")
@@ -501,5 +504,47 @@ func TestTheLibraryLoggerDropsItsDebugOutput(t *testing.T) {
 	logger.Warnf("Failed to connect")
 	if !strings.Contains(written.String(), "Failed to connect") {
 		t.Fatalf("the library logger dropped a warning: %s", written.String())
+	}
+}
+
+// whatsmeow sets its logged-in flag on authentication and clears it only on a stream
+// error, so it stays true through a Disconnect. A session that trusted it would report
+// a disconnected account as open and short-circuit every reconnect.
+func TestADisconnectedSessionDoesNotReportItselfOpen(t *testing.T) {
+	t.Parallel()
+	session, _ := newTestSession(t, "5511999990001")
+
+	session.handle(&waEvents.Connected{})
+	if emission := next(t, session); emission.Type != protocol.EventSessionState {
+		t.Fatalf("published %q on connecting", emission.Type)
+	}
+	if state := session.state(); state != "open" {
+		t.Fatalf("a connected session reports %q", state)
+	}
+
+	if err := session.Disconnect(t.Context()); err != nil {
+		t.Fatalf("Disconnect: %v", err)
+	}
+	if state := session.state(); state != "close" {
+		t.Fatalf("a disconnected session reports %q, want close", state)
+	}
+}
+
+// An item rendered after the operator gave up on that attempt lands after the state
+// that replaced it, which is how a dashboard ends up showing an expired code over a
+// live pairing.
+func TestACancelledPairingRunPublishesNothingMore(t *testing.T) {
+	t.Parallel()
+	session, _ := newTestSession(t, "")
+
+	run := session.startPairing(func() {})
+	session.cancelPairing()
+
+	session.publishPairing(run, wm.QRChannelItem{Event: "code", Code: "2@a,b,c"}, true)
+
+	select {
+	case emission := <-session.Events():
+		t.Fatalf("a cancelled run published %q", emission.Type)
+	case <-time.After(200 * time.Millisecond):
 	}
 }
