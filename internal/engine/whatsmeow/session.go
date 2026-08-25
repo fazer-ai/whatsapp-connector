@@ -367,6 +367,20 @@ func (s *Session) Connect(ctx context.Context, req engine.ConnectRequest) error 
 		return protocol.NewError(protocol.ErrorUnsupported,
 			"this connector does not route a session through a proxy yet")
 	}
+	// Same rule as the proxy, and for the same reason: these ask the connector to do
+	// something, and a build that does not do it answers `open` to a client that will
+	// then wait for a call to be refused, or for a backlog to arrive, and never find out
+	// it was never going to happen. `groups` is not on this list because it selects among
+	// conversation traffic and this build delivers none: it becomes a promise in M2, when
+	// there is something for it to leave out.
+	if req.Calls != nil && req.Calls.AutoReject {
+		return protocol.NewError(protocol.ErrorUnsupported,
+			"this connector does not answer incoming calls yet")
+	}
+	if req.HistorySync {
+		return protocol.NewError(protocol.ErrorUnsupported,
+			"this connector does not import the phone's history yet")
+	}
 	if s.isStale() {
 		// The device behind this client was deleted and its replacement could not be
 		// built at the time. Nothing on it works, so the connect that would have failed
@@ -858,6 +872,15 @@ func (s *Session) settleLogout() {
 
 	s.refuseLateConnect()
 	s.offline()
+}
+
+// hangUpStanding reports whether the guard is up, without taking it down. The Connected
+// handler is what consumes it, one uninvited socket answered once; everything else only
+// wants to know that the socket it is hearing from is one this session has finished with.
+func (s *Session) hangUpStanding() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.hungUp
 }
 
 // refuseLateConnect raises the guard that has a Connected from a socket this session is
@@ -1534,6 +1557,18 @@ func (s *Session) handle(rawEvent any) bool {
 		defer s.transition.Unlock()
 
 		s.setConnected(false)
+		if s.hangUpStanding() {
+			// A drop from a socket this session is already done with. whatsmeow
+			// dispatches this one from a goroutine of its own, so a remote drop landing
+			// just before a disconnect completes is handled just after it: the `close`
+			// that settled has `reconnecting` published on top of it, for a socket
+			// whatsmeow was told to stay off and is not going to dial again. And the
+			// flag outlives the event, because the Connected that follows is answered by
+			// closing the socket rather than by clearing it — so resume reads the session
+			// as one whatsmeow is already recovering and returns without dialling, for
+			// good.
+			return true
+		}
 		// whatsmeow only reconnects a device it has an id for, so a drop before pairing
 		// finishes is the end of that attempt. Reporting it as reconnecting leaves the
 		// dashboard waiting on something nothing is going to do.

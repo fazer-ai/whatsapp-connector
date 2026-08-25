@@ -48,9 +48,16 @@ type CommandReader interface {
 	// interval elapses. An empty slice with a nil error means "nothing this round",
 	// which is the ordinary case and not a failure.
 	Read(ctx context.Context, sids []string) ([]Delivery, error)
-	// Claim takes over commands left pending by an instance that stopped. It is what
-	// makes a command survive the death of the instance that was about to run it.
+	// Claim takes over commands left pending on these sessions' own streams by an
+	// instance that stopped. It is what makes a command survive the death of the
+	// instance that was about to run it.
 	Claim(ctx context.Context, sids []string) ([]Delivery, error)
+	// ClaimControl is Claim over the stream addressed to no session in particular. It
+	// is separate because a wake is what puts a session from a dead instance back on an
+	// instance: sharing a call with the session streams has it taken last, under
+	// whatever deadline they left, and released along with them when any one of them
+	// fails.
+	ClaimControl(ctx context.Context) ([]Delivery, error)
 	// ClaimSessions is Claim over these sessions' own streams and nothing else. It is
 	// what a session just adopted needs before anything newer is read for it, so that a
 	// command its previous owner abandoned is not overtaken by one that arrived later.

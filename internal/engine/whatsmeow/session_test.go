@@ -1692,6 +1692,77 @@ func TestAnEndedConnectionRefusesTheConnectQueuedBehindIt(t *testing.T) {
 	}
 }
 
+// A connect option is a thing the client asked the connector to do, and a build that does
+// not do it must say so rather than answer `open`. The client is then waiting for a call
+// to be refused, or for a backlog to arrive, with nothing on the stream to tell it that
+// neither was ever going to happen — which is the same silence the proxy check exists to
+// break. The canonical connect fixture sends both fields, so this is what a client really
+// puts on the wire and not a shape invented for the test.
+func TestConnectRefusesTheOptionsThisBuildDoesNotCarryOut(t *testing.T) {
+	t.Parallel()
+
+	for name, payload := range map[string]string{
+		"auto-rejecting calls": `{"pairing":"resume","calls":{"auto_reject":true}}`,
+		"importing history":    `{"pairing":"resume","history_sync":true}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			session, _ := newTestSession(t, "5511999990001")
+
+			var request engine.ConnectRequest
+			if err := json.Unmarshal([]byte(payload), &request); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+
+			err := session.Connect(t.Context(), request)
+			var coded *protocol.Error
+			if !errors.As(err, &coded) || coded.Code != protocol.ErrorUnsupported {
+				t.Fatalf("Connect answered %v, want unsupported", err)
+			}
+		})
+	}
+}
+
+// whatsmeow dispatches Disconnected from a goroutine of its own, so a remote drop that
+// landed just before a disconnect completed is handled just after it. Taking it at face
+// value publishes `reconnecting` on top of the `close` that settled, for a socket
+// whatsmeow was told to stay off and will not dial again — and the flag outlives the
+// event, because the Connected that follows is answered by closing the socket rather than
+// by clearing it. resume then reads the session as one whatsmeow is already recovering
+// and returns without dialling, which is a session that never comes back.
+func TestADropFromASocketAlreadyHungUpDoesNotAnnounceARetry(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setConnected(true)
+
+	session.settleHangUp()
+	if emission := next(t, session); emission.Type != protocol.EventSessionState {
+		t.Fatalf("published %q, want the socket coming down", emission.Type)
+	}
+
+	// The remote drop whatsmeow had already queued.
+	session.handle(&waEvents.Disconnected{})
+
+	if state := session.state(); state != "close" {
+		t.Fatalf("the session reports %q after a drop it had already closed over, want close", state)
+	}
+	select {
+	case emission := <-session.Events():
+		t.Fatalf("published %q on top of the close the operator asked for", emission.Type)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// And the Connected that follows does not clear it either: that handler answers an
+	// uninvited socket by closing it. So the state resume reads has to be right here and
+	// not a moment later, because nothing after this corrects it.
+	session.handle(&waEvents.Connected{})
+	drain(t, session)
+	if state := session.state(); state != "close" {
+		t.Fatalf("the session reports %q, which resume takes as a recovery to leave alone", state)
+	}
+}
+
 // A logout attempted while whatsmeow is reconnecting comes back before anything is sent,
 // and the reconnect is still going. Calling the session offline there has `session.status`
 // answer `close` for a connection that is coming back, and a resume start a second dial

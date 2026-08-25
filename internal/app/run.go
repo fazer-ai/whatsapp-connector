@@ -193,19 +193,37 @@ func (c *Connector) loop(ctx context.Context, httpErr <-chan error) error {
 // so the session it named would stay unowned until a client happened to send another
 // command, and the pending list would grow for as long as the instance ran.
 func (c *Connector) reclaimCommands(ctx context.Context) {
-	// Bounded twice over, because this runs on the goroutine that renews every lease
-	// this instance holds. It costs at least one round trip per stream, so an instance
-	// with many sessions, or a Redis having a bad minute, could spend longer here than a
-	// lease survives — and the sessions whose leases went unrenewed are then acquired by
-	// peers while this instance still holds their sockets open.
-	//
-	// So: a window of streams rather than all of them, moving on each pass so every
-	// session is reached within a few heartbeats, and a deadline well inside the
-	// heartbeat for the whole thing.
-	pass, cancel := context.WithTimeout(ctx, c.cfg.Heartbeat/2)
+	// The control stream on a pass of its own, and first. `session.wake` lives there,
+	// and a wake is what puts a session from a dead instance back on an instance. Taken
+	// alongside a window of session streams it is taken last, under whatever deadline
+	// they left, and released along with them when any one of them fails — so the
+	// command that exists for a Redis having a bad minute would be the one command that
+	// never runs during one.
+	c.reclaimPass(ctx, func(pass context.Context) ([]transport.Delivery, error) {
+		return c.streams.ClaimControl(pass)
+	})
+	c.reclaimPass(ctx, func(pass context.Context) ([]transport.Delivery, error) {
+		return c.streams.Claim(pass, c.nextReclaimWindow())
+	})
+}
+
+// reclaimPass takes over one set of streams and dispatches what it took, under a deadline
+// of its own.
+//
+// Bounded twice over, because this runs on the goroutine that renews every lease this
+// instance holds. It costs at least one round trip per stream, so an instance with many
+// sessions, or a Redis having a bad minute, could spend longer here than a lease survives
+// — and the sessions whose leases went unrenewed are then acquired by peers while this
+// instance still holds their sockets open.
+//
+// So: a window of streams rather than all of them, moving on each pass so every session
+// is reached within a few heartbeats, and a deadline that leaves the two passes together
+// well inside the heartbeat.
+func (c *Connector) reclaimPass(ctx context.Context, take func(context.Context) ([]transport.Delivery, error)) {
+	pass, cancel := context.WithTimeout(ctx, c.cfg.Heartbeat/reclaimPasses/2)
 	defer cancel()
 
-	deliveries, err := c.streams.Claim(pass, c.nextReclaimWindow())
+	deliveries, err := take(pass)
 	if err != nil {
 		if ctx.Err() == nil {
 			c.log.Error().Err(err).Msg("failed to reclaim commands")
@@ -256,9 +274,14 @@ func (c *Connector) dispatchWithin(ctx context.Context, deliveries []transport.D
 	return true
 }
 
+// reclaimPasses is how many independent passes one heartbeat's reclaim is made of: the
+// control stream and the session window. Each gets half of what the reclaim as a whole
+// may spend, so keeping them apart costs the goroutine nothing.
+const reclaimPasses = 2
+
 // maxReclaimStreams is how many session streams one reclaim pass looks at. The control
-// stream is read on every pass regardless: it is where a wake lands, and a wake nobody
-// takes is a session nobody runs.
+// stream is reclaimed on every heartbeat regardless, on a pass of its own: it is where a
+// wake lands, and a wake nobody takes is a session nobody runs.
 const maxReclaimStreams = 16
 
 // nextReclaimWindow is the slice of owned sessions this pass covers. It rotates, so a

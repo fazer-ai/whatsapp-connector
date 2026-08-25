@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -290,6 +291,14 @@ func (r *deadlineReplier) left() (time.Duration, bool) {
 
 func writePing(t *testing.T, client *redisx.Client, sid string) {
 	t.Helper()
+	writePingTo(t, client, client.Keys().Commands(sid), sid)
+}
+
+// writePingTo is writePing onto whichever stream the caller is asking about. The control
+// stream carries commands addressed to no session in particular, and a ping is one of
+// them: it answers, which is how a test sees that it was dispatched at all.
+func writePingTo(t *testing.T, client *redisx.Client, stream, sid string) {
+	t.Helper()
 	command := &protocol.Command{
 		V: protocol.Version, ID: "c1", Type: protocol.CommandAdminPing,
 		SID: sid, TS: time.Now().UnixMilli(), ReplyTo: "reply-c1", Payload: json.RawMessage(`{}`),
@@ -299,9 +308,100 @@ func writePing(t *testing.T, client *redisx.Client, sid string) {
 		t.Fatalf("Fields: %v", err)
 	}
 	if err := client.XAdd(t.Context(), &redis.XAddArgs{
-		Stream: client.Keys().Commands(sid), Values: fields,
+		Stream: stream, Values: fields,
 	}).Err(); err != nil {
 		t.Fatalf("XAdd: %v", err)
+	}
+}
+
+// failCommands makes the commands a test names come back as a Redis that is refusing.
+type failCommands struct {
+	on func(redis.Cmder) bool
+}
+
+func (failCommands) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (failCommands) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+
+func (h failCommands) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if h.on(cmd) {
+			err := errors.New("redis is having a bad minute")
+			cmd.SetErr(err)
+			return err
+		}
+		return next(ctx, cmd)
+	}
+}
+
+// `session.wake` rides the control stream, and it is the command that puts a session from
+// a dead instance back on an instance. Claimed alongside a window of session streams it
+// is claimed last, and a claim that fails over any stream releases everything it took —
+// so one bad session stream discards the control entries too, and nothing retries them
+// beyond leaving them pending. On a Redis that is failing steadily that makes the wake
+// the one command that never runs during exactly the minute it exists for.
+func TestAFailingSessionClaimDoesNotTakeTheControlStreamWithIt(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+
+	newStreams := func(instance string) *redisstream.Streams {
+		streams, err := redisstream.New(client, redisstream.Options{
+			Instance: instance, Block: 50 * time.Millisecond, ClaimMinIdle: time.Millisecond,
+		})
+		if err != nil {
+			t.Fatalf("redisstream.New: %v", err)
+		}
+		return streams
+	}
+	streams := newStreams("inst-a")
+	dead := newStreams("inst-dead")
+	dispatched := &deadlineReplier{}
+	manager := session.NewManager(&session.ManagerConfig{
+		Instance: "inst-a", Engine: fake.New(),
+		Leases:    cluster.NewLeases(client, "inst-a", cluster.Options{}),
+		Publisher: quietPublisher{}, Replier: dispatched,
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	ctx := context.Background()
+	t.Cleanup(func() { manager.StopAll(ctx) })
+
+	connector := &Connector{
+		cfg: Config{LeaseTTL: 30 * time.Second, Heartbeat: time.Second}, log: zerolog.Nop(),
+		manager: manager, streams: streams,
+	}
+
+	// Left pending on the control stream by an instance that stopped.
+	control := client.Keys().Control()
+	if _, err := dead.Read(ctx, nil); err != nil {
+		t.Fatalf("priming Read: %v", err)
+	}
+	writePingTo(t, client, control, "s1")
+	if taken, err := dead.Read(ctx, nil); err != nil || len(taken) != 1 {
+		t.Fatalf("the previous owner read %d commands (err=%v), want 1", len(taken), err)
+	}
+	// And a session this instance owns, so the window has a stream to fail over.
+	if _, err := manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	manager.TakeNewlyAdopted()
+	time.Sleep(5 * time.Millisecond)
+
+	owned := client.Keys().Commands("s1")
+	rdb.AddHook(failCommands{on: func(cmd redis.Cmder) bool {
+		return len(cmd.Args()) > 1 && cmd.Args()[1] == owned &&
+			(cmd.Name() == "xpending" || cmd.Name() == "xclaim")
+	}})
+
+	connector.reclaimCommands(ctx)
+
+	if _, ok := dispatched.left(); !ok {
+		t.Fatal("the control stream's pending command went unreclaimed because a session stream failed")
 	}
 }
 
@@ -312,7 +412,10 @@ func writePing(t *testing.T, client *redisx.Client, sid string) {
 func TestAReclaimDispatchesOnWhatIsLeftOfItsOwnDeadline(t *testing.T) {
 	t.Parallel()
 
-	const heartbeat = 600 * time.Millisecond
+	// The heartbeat is split between the control pass and the session window, so what
+	// bounds this dispatch is a quarter of it. Sized so the slow claim spends half of
+	// that quarter and leaves the other half visibly short of a fresh budget.
+	const heartbeat = 1200 * time.Millisecond
 	const slowClaim = 150 * time.Millisecond
 
 	server := miniredis.RunT(t)
@@ -362,10 +465,13 @@ func TestAReclaimDispatchesOnWhatIsLeftOfItsOwnDeadline(t *testing.T) {
 	manager.TakeNewlyAdopted()
 	time.Sleep(5 * time.Millisecond)
 
+	// On the session stream's own claim: the control stream is reclaimed on a pass of
+	// its own, and slowing that one would be measuring the wrong deadline.
+	stream := client.Keys().Commands("s1")
 	var once sync.Once
 	rdb.AddHook(slowClaims{on: func(cmd redis.Cmder) bool {
 		slow := false
-		if cmd.Name() == "xclaim" {
+		if cmd.Name() == "xclaim" && len(cmd.Args()) > 1 && cmd.Args()[1] == stream {
 			once.Do(func() { slow = true })
 		}
 		return slow
@@ -377,8 +483,8 @@ func TestAReclaimDispatchesOnWhatIsLeftOfItsOwnDeadline(t *testing.T) {
 	if !ok {
 		t.Fatal("nothing was dispatched, so there is no deadline to look at")
 	}
-	if left > heartbeat/2-slowClaim/2 {
+	if budget := heartbeat / reclaimPasses / 2; left > budget-slowClaim/2 {
 		t.Fatalf("dispatch was given %s, which is a fresh budget rather than what was left of the pass's %s",
-			left, heartbeat/2)
+			left, budget)
 	}
 }

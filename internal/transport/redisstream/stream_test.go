@@ -374,9 +374,10 @@ func TestClaimTakesOverWhatWasNeverAcknowledged(t *testing.T) {
 }
 
 // A wake rides the control stream, and a wake that could not be acted on is exactly the
-// entry this connector leaves pending on purpose. Claiming only the owned sessions
-// would never look at the stream it is on.
-func TestClaimLooksAtControlToo(t *testing.T) {
+// entry this connector leaves pending on purpose. It is reclaimed apart from the session
+// streams so that neither a window that spent the whole deadline nor one stream in it
+// failing can take the wake down with it, but reclaimed it must be.
+func TestTheControlStreamIsReclaimedOnItsOwn(t *testing.T) {
 	t.Parallel()
 
 	f := newFleet(t)
@@ -394,9 +395,17 @@ func TestClaimLooksAtControlToo(t *testing.T) {
 
 	// No owned sessions at all, which is the state an instance is in when the wake it
 	// could not act on is the only thing outstanding.
-	claimed := claimEventually(t, alive, nil)
+	claimed := takeEventually(t, func() ([]transport.Delivery, error) {
+		return alive.ClaimControl(context.Background())
+	})
 	if len(claimed) != 1 || claimed[0].Command.ID != "c-wake" {
-		t.Fatalf("Claim returned %v, want the pending wake", claimed)
+		t.Fatalf("ClaimControl returned %v, want the pending wake", claimed)
+	}
+
+	// And the session claim leaves it alone, which is what keeps the two apart: a window
+	// of sessions that fails or runs out of deadline never had the wake to lose.
+	if session, err := f.streams(t, "inst-third").Claim(context.Background(), nil); err != nil || len(session) != 0 {
+		t.Fatalf("the session claim took %d control entries (err=%v), want none", len(session), err)
 	}
 }
 
@@ -406,12 +415,20 @@ func TestClaimLooksAtControlToo(t *testing.T) {
 // fast the test itself ran.
 func claimEventually(t *testing.T, streams *redisstream.Streams, sids []string) []transport.Delivery {
 	t.Helper()
+	return takeEventually(t, func() ([]transport.Delivery, error) {
+		return streams.Claim(context.Background(), sids)
+	})
+}
+
+// takeEventually is claimEventually over whichever claim the caller is asking about.
+func takeEventually(t *testing.T, take func() ([]transport.Delivery, error)) []transport.Delivery {
+	t.Helper()
 
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		claimed, err := streams.Claim(context.Background(), sids)
+		claimed, err := take()
 		if err != nil {
-			t.Fatalf("Claim: %v", err)
+			t.Fatalf("claim: %v", err)
 		}
 		if len(claimed) > 0 || time.Now().After(deadline) {
 			return claimed

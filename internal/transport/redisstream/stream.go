@@ -197,7 +197,21 @@ func (s *Streams) Read(ctx context.Context, sids []string) ([]transport.Delivery
 func (s *Streams) Claim(ctx context.Context, sids []string) ([]transport.Delivery, error) {
 	// First, because it is what makes this pass able to see what the last one gave back.
 	s.restoreUnrun(ctx)
-	return s.claim(ctx, s.streamsFor(sids), s.opts.ClaimMinIdle)
+	return s.claim(ctx, s.sessionStreams(sids), s.opts.ClaimMinIdle)
+}
+
+// ClaimControl takes over what is pending on the control stream.
+//
+// Apart from the session streams, and not merely ahead of them. A claim that fails over
+// any one stream releases everything it took, so a control entry taken alongside a window
+// of sessions is thrown away whenever a session in that window fails — and a window that
+// spends the whole deadline never reaches the control stream at all. Either way the
+// casualty is `session.wake`, which is the command that puts a session from a dead
+// instance back on an instance: it would then be the one command that never runs on
+// exactly the Redis that makes it necessary.
+func (s *Streams) ClaimControl(ctx context.Context) ([]transport.Delivery, error) {
+	s.restoreUnrun(ctx)
+	return s.claim(ctx, []string{s.client.Keys().Control()}, s.opts.ClaimMinIdle)
 }
 
 // restoreUnrun puts back the age XCLAIM erased on the entries this process took and gave
@@ -429,6 +443,10 @@ const maxPendingPages = 8
 // streamsFor is the per-session command streams plus the control one. Control is
 // always read: it carries `session.wake`, which is how a session with no owner gets
 // one, so an instance that only listened to what it already owns would never hear it.
+// streamsFor is what one read covers: the sessions this instance owns and the stream
+// addressed to no session in particular. A read blocks on all of them at once, so there
+// is nothing for the control stream to be starved by; a claim walks them one at a time
+// and gives up on all of them together, which is why it keeps the two apart.
 func (s *Streams) streamsFor(sids []string) []string {
 	return append(s.sessionStreams(sids), s.client.Keys().Control())
 }

@@ -77,6 +77,21 @@ type ConnectRequest struct {
 	// Proxy is an object in the contract, not a string: decoding it as one made every
 	// connect carrying a proxy fail to parse before it reached an engine.
 	Proxy *ProxyRequest `json:"proxy,omitempty"`
+	// Groups asks for group chats alongside direct ones. Nothing selects on it yet
+	// because nothing is delivered yet: M2 is what brings conversation traffic, and
+	// until then this chooses between nothing and nothing.
+	Groups bool `json:"groups,omitempty"`
+	// HistorySync asks for the backlog the phone holds. Honouring it is M6.
+	HistorySync bool `json:"history_sync,omitempty"`
+	// Calls is the call half of `session.connect`.
+	Calls *CallsRequest `json:"calls,omitempty"`
+}
+
+// CallsRequest is what a session asks the connector to do about incoming calls.
+// Honouring it is M3.
+type CallsRequest struct {
+	// AutoReject has the connector refuse an incoming call rather than let it ring.
+	AutoReject bool `json:"auto_reject,omitempty"`
 }
 
 // ProxyRequest is the proxy half of `session.connect`. Honouring it is M5; parsing it
