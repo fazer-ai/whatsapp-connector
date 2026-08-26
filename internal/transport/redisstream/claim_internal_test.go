@@ -61,7 +61,7 @@ func TestAFailedClaimLetsGoOfWhatItAlreadyTook(t *testing.T) {
 	}
 	time.Sleep(5 * time.Millisecond)
 
-	claimed, err := streams.claim(ctx, []string{first, second}, time.Millisecond)
+	claimed, err := streams.claim(ctx, []string{first, second}, time.Millisecond, 0)
 	if err == nil {
 		t.Fatal("the claim reported success over a stream it could not read")
 	}

@@ -1107,3 +1107,52 @@ func TestACommandWithinTheBoundIsStillTakenOver(t *testing.T) {
 		t.Fatalf("the dead letter list holds %d records (err=%v), want none", len(records), err)
 	}
 }
+
+// The age bound protects a command whose repeat needs a record of the first run, and the
+// control stream carries neither kind: admin.ping asks a question, and a wake is
+// arbitrated by the lease. A wake is also the only thing that gets a stranded session
+// running again, and a fleet down longer than the bound is exactly when there is one, so
+// retiring it there leaves the session unowned with nothing scheduled to pick it up.
+func TestAWakeIsNeverTooOldToTakeOver(t *testing.T) {
+	t.Parallel()
+
+	const (
+		minIdle = 10 * time.Second
+		maxIdle = time.Hour
+	)
+	f := newFleet(t)
+	patient, err := redisstream.New(f.client, redisstream.Options{
+		Instance: "inst-alive", Block: 50 * time.Millisecond,
+		ClaimMinIdle: minIdle, ClaimMaxIdle: maxIdle,
+	})
+	if err != nil {
+		t.Fatalf("redisstream.New: %v", err)
+	}
+	dead := f.streams(t, "inst-dead")
+	ctx := context.Background()
+
+	if _, err := dead.Read(ctx, nil); err != nil {
+		t.Fatalf("priming Read: %v", err)
+	}
+	wake := command("w1", "s1", "")
+	wake.Type = protocol.CommandSessionWake
+	writeCommand(t, f, f.client.Keys().Control(), wake)
+	if taken, err := dead.Read(ctx, nil); err != nil || len(taken) != 1 {
+		t.Fatalf("the first instance read %d commands (err=%v), want the wake", len(taken), err)
+	}
+
+	// It dies without acknowledging, and the whole fleet stays down past the bound.
+	clock := time.Now().UTC()
+	f.server.SetTime(clock.Add(maxIdle + time.Minute))
+
+	claimed, err := patient.ClaimControl(ctx)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("ClaimControl returned %d commands (err=%v), want the wake", len(claimed), err)
+	}
+	if claimed[0].Command.ID != "w1" {
+		t.Fatalf("claimed command id = %q, want w1", claimed[0].Command.ID)
+	}
+	if records, err := f.client.LRange(ctx, f.client.Keys().DLQCommands(), 0, -1).Result(); err != nil || len(records) != 0 {
+		t.Fatalf("the dead letter list holds %d records (err=%v), want none: a retired wake strands its session", len(records), err)
+	}
+}

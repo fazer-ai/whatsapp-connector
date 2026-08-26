@@ -233,7 +233,7 @@ func (s *Streams) Read(ctx context.Context, sids []string) ([]transport.Delivery
 func (s *Streams) Claim(ctx context.Context, sids []string) ([]transport.Delivery, error) {
 	// First, because it is what makes this pass able to see what the last one gave back.
 	s.restoreUnrun(ctx)
-	return s.claim(ctx, s.sessionStreams(sids), s.opts.ClaimMinIdle)
+	return s.claim(ctx, s.sessionStreams(sids), s.opts.ClaimMinIdle, s.opts.ClaimMaxIdle)
 }
 
 // ClaimControl takes over what is pending on the control stream.
@@ -247,7 +247,14 @@ func (s *Streams) Claim(ctx context.Context, sids []string) ([]transport.Deliver
 // exactly the Redis that makes it necessary.
 func (s *Streams) ClaimControl(ctx context.Context) ([]transport.Delivery, error) {
 	s.restoreUnrun(ctx)
-	return s.claim(ctx, []string{s.client.Keys().Control()}, s.opts.ClaimMinIdle)
+	// No age bound here. What retirement protects is a command whose repeat needs a
+	// record of the first run, and the control stream carries neither kind: `admin.ping`
+	// asks a question, and `session.wake` is arbitrated by the lease, so running it
+	// twice adopts a session that is already adopted. A wake is also the only thing that
+	// gets a stranded session running again, and a fleet down longer than the bound is
+	// exactly when there is one — retiring it there would leave the session unowned
+	// until something unrelated happened to wake it.
+	return s.claim(ctx, []string{s.client.Keys().Control()}, s.opts.ClaimMinIdle, 0)
 }
 
 // restoreUnrun puts back the age XCLAIM erased on the entries this process took and gave
@@ -336,10 +343,10 @@ return 1
 // owner noticing, where a command could run twice; that is invariant 5's ground, and
 // M2's.
 func (s *Streams) ClaimSessions(ctx context.Context, sids []string) ([]transport.Delivery, error) {
-	return s.claim(ctx, s.sessionStreams(sids), 0)
+	return s.claim(ctx, s.sessionStreams(sids), 0, s.opts.ClaimMaxIdle)
 }
 
-func (s *Streams) claim(ctx context.Context, streams []string, minIdle time.Duration) ([]transport.Delivery, error) {
+func (s *Streams) claim(ctx context.Context, streams []string, minIdle, maxIdle time.Duration) ([]transport.Delivery, error) {
 	if len(streams) == 0 {
 		return nil, nil
 	}
@@ -360,7 +367,7 @@ func (s *Streams) claim(ctx context.Context, streams []string, minIdle time.Dura
 		return nil, err
 	}
 	for _, stream := range streams {
-		ids, expired, err := s.reclaimable(ctx, stream, minIdle)
+		ids, expired, err := s.reclaimable(ctx, stream, minIdle, maxIdle)
 		switch {
 		case isNoGroup(err):
 			s.groups.forget(stream)
@@ -422,7 +429,9 @@ func (s *Streams) rememberAge(stream string, idle time.Duration, deliveries []tr
 
 // reclaimable is the pending entries worth taking over: idle long enough, held by
 // somebody else, and not so old that nothing can be known about them any more. The
-// second list is that last group, which the caller retires rather than runs.
+// second list is that last group, which the caller retires rather than runs; a maxIdle
+// of zero asks for no such group, which is what a stream whose commands are safe to
+// repeat wants.
 //
 // The second half is the reason this is not one XAUTOCLAIM call. A command runs on the
 // session's own executor, not on the loop that read it, so it is still pending while it
@@ -430,7 +439,7 @@ func (s *Streams) rememberAge(stream string, idle time.Duration, deliveries []tr
 // consumer already executing it, and dispatched a second time alongside the first.
 // Acknowledging the original does not retire the copy. XPENDING is the only form that
 // says who holds an entry.
-func (s *Streams) reclaimable(ctx context.Context, stream string, minIdle time.Duration) (ids, expired []string, err error) {
+func (s *Streams) reclaimable(ctx context.Context, stream string, minIdle, maxIdle time.Duration) (ids, expired []string, err error) {
 	ids = make([]string, 0, s.opts.ReadCount)
 	start := "-"
 
@@ -471,7 +480,7 @@ func (s *Streams) reclaimable(ctx context.Context, stream string, minIdle time.D
 			if s.running(stream, entry.ID) {
 				continue
 			}
-			if entry.Idle > s.opts.ClaimMaxIdle {
+			if maxIdle > 0 && entry.Idle > maxIdle {
 				// Older than anything that could say whether it already ran. Taking it
 				// over would be carrying out a command on a guess, so it is retired
 				// instead, which is the one outcome that neither runs it twice nor

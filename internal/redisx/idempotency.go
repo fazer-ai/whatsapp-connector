@@ -56,6 +56,21 @@ func (i *Idempotency) Recall(ctx context.Context, sid, key string) (json.RawMess
 	case err != nil:
 		return nil, false, fmt.Errorf("redisx: recall %s of %s: %w", key, sid, err)
 	}
+	// Asked about is kept: a record only has to outlive the entry it answers for, and
+	// the entry announces itself by being asked about. Without this the two clocks run
+	// independently, the record from a fixed point after the command ran and the entry
+	// for as long as acknowledgements keep failing, and an entry still being handed
+	// around outlives the only thing that can say it already ran.
+	//
+	// Best effort on purpose. The answer is already in hand, and refusing to give it
+	// because the expiry could not be pushed out would turn a shortened record into no
+	// record at all.
+	// Best effort on purpose, and ignored rather than reported: the answer is already
+	// in hand, and refusing to give it because the expiry could not be pushed out would
+	// turn a shortened record into no record at all. What a failure here costs is the
+	// original expiry, which is where this stood before, and the transport's own age
+	// bound is what stands behind it.
+	_ = i.client.Expire(ctx, i.client.Keys().Idempotency(sid, key), i.ttl).Err()
 	if len(stored) == 0 {
 		// A command whose result carried no data. It still ran, and answering that is
 		// the point: `null` and "never happened" are the same bytes and not the same

@@ -1795,3 +1795,46 @@ func TestACommandWhoseRecordCannotBeReadIsHandedBackRatherThanRun(t *testing.T) 
 		t.Fatalf("the account was logged out %d times on a record nobody could read", got)
 	}
 }
+
+// A command cut off by the session ending is not a command that failed. The reply would
+// go out on the same dead context and be dropped without a word, and acknowledging it
+// afterwards retires a send that may never have reached WhatsApp, with nobody told. It
+// is handed back for the next owner, which under the caller's own message id costs a
+// redelivery rather than a message.
+func TestACommandCutOffByTheSessionEndingIsHandedBack(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	ctx := context.Background()
+	if _, err := h.manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, _ := h.engine.Session("s1")
+	if err := engineSession.Connect(ctx, engine.ConnectRequest{Pairing: "resume"}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	release := engineSession.Hold()
+	defer release()
+
+	var acked, forfeited atomic.Bool
+	handed := delivery(&protocol.Command{
+		V: protocol.Version, ID: "c1", Type: protocol.CommandMessageSend, SID: "s1", ReplyTo: "c1",
+		Payload: json.RawMessage(`{"message_id":"m1","to":{"kind":"phone","id":"5511999999999"},"content":{"type":"text","body":"oi"}}`),
+	}, &acked)
+	handed.Forfeit = func() { forfeited.Store(true) }
+	h.manager.Dispatch(ctx, handed)
+
+	// In flight before the session is taken away, or the command never reaches the
+	// engine and the test proves only that a queued delivery is released.
+	waitFor(t, "the send to reach the engine", func() bool { return len(engineSession.Commands()) == 1 })
+	h.manager.Release(ctx, "s1")
+
+	waitFor(t, "the command to be handed back", forfeited.Load)
+	if acked.Load() {
+		t.Fatal("a send that was cut off mid-flight was retired anyway")
+	}
+	if _, answered := h.recorder.reply("c1"); answered {
+		t.Fatal("a send that was cut off mid-flight was answered on a dead context")
+	}
+}

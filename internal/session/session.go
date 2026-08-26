@@ -353,6 +353,20 @@ func (s *Session) run(ctx context.Context, delivery *transport.Delivery) {
 		forfeit(delivery)
 		return
 	}
+	if err != nil && ctx.Err() != nil {
+		// The session went away underneath this command: the lease moved, or the process
+		// is coming down. What failed is this instance's turn at it, not the command, and
+		// the reply would go out on the same dead context and be dropped without a word,
+		// leaving the caller with nothing and the entry retired.
+		//
+		// Handed back instead, which is the same trade invariant 4 makes for events: a
+		// send that was cut off may already be in somebody's chat, and the next owner
+		// resends under the id the caller picked, so the cost is a redelivery WhatsApp
+		// discards rather than a message nobody ever hears about again.
+		log.Warn().Err(err).Msg("gave a command back after the session ended under it")
+		forfeit(delivery)
+		return
+	}
 	s.answer(ctx, &command, result, err)
 
 	// Acknowledged either way, and on a deadline of its own. A command that failed has

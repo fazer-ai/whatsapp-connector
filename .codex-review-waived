@@ -40,3 +40,18 @@ internal/store/store.go: Reject pairings that displace a live session  # PR#6
 internal/engine/whatsmeow/send.go: Populate quoted content before sending replies  # PR#9
 internal/engine/whatsmeow/send.go: Include the original payload in quoted messages  # PR#9
 internal/engine/whatsmeow/send.go: Include the original message in quote context  # PR#9
+# PR#9: real, deliberate, and already named where it is taken. `ClaimSessions` passes a
+# zero min-idle on purpose (`stream.go`, and the comment there says so): the new owner
+# holds the lease, so whoever held those entries has lost it, and waiting the delay would
+# put the abandoned command after the newer one every time, which is the reordering the
+# call exists to prevent. What is left is the heartbeat or so between a lease moving and
+# the old owner noticing. The suggested fix does not close it: a reservation taken before
+# the side effect says an attempt was made, never whether it landed, so an instance that
+# crashes between the two leaves the next one choosing between dropping a message that
+# never went out and sending one that already did — which is why the record is written
+# after the fact and not reserved before it. Two concurrent runners is what invariant 5
+# covers, and for a send the caller's `message_id` is what covers it: the same stanza id
+# twice is discarded by the receiving client. Closing it properly is fencing the engine's
+# writes on the lease, which is the M2 waiver above and needs a session-scoped stop over
+# the fleet rather than a lock here.
+internal/session/session.go: Serialize same-key commands before running them  # PR#9
