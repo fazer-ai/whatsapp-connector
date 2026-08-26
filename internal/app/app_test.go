@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strconv"
 	"testing"
 	"time"
@@ -756,6 +757,45 @@ func TestTheMediaEndpointIsServedByARunningConnector(t *testing.T) {
 	handler.ServeHTTP(withoutToken, httptest.NewRequestWithContext(t.Context(), http.MethodGet, blob, http.NoBody))
 	if withoutToken.Code != http.StatusUnauthorized {
 		t.Fatalf("an unauthenticated request answered %d, want 401: the token is not reaching the handler", withoutToken.Code)
+	}
+}
+
+// The store has two consumers and the endpoint is only one of them: a session downloads
+// the file of an inbound message straight into it, which is why the store is built
+// before the engine rather than after it.
+//
+// Nothing observable from out here separates an engine that was handed the store from
+// one that was not, except the one refusal the engine has: a store it can publish no
+// address for. So that refusal is what says the store reached it, and the connector
+// built the other way round is the control that says the refusal is not something else.
+func TestTheBlobStoreReachesTheEngineAndNotOnlyTheEndpoint(t *testing.T) {
+	server := miniredis.RunT(t)
+	t.Setenv("WAC_INSTANCE", "inst-a")
+	t.Setenv("REDIS_URL", "redis://"+server.Addr())
+	t.Setenv("WAC_HTTP_ADDR", "127.0.0.1:0")
+	t.Setenv("WAC_MEDIA_ROOT", t.TempDir())
+	t.Setenv("WAC_MEDIA_TOKEN", "s3cret")
+	t.Setenv("WAC_ENGINE", "whatsmeow")
+	t.Setenv("WAC_DATABASE_URL", "sqlite:"+filepath.Join(t.TempDir(), "wa.db"))
+
+	cfg, err := app.LoadConfig("host")
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if _, err := app.New(&cfg, zerolog.Nop()); err != nil {
+		t.Fatalf("a connector with everything the media path needs was refused: %v", err)
+	}
+
+	// Blanked rather than left unset, because LoadConfig derives one for a deployment
+	// that gives none. A blob lives on the disk of whoever downloaded it, so a session
+	// that cannot name its own instance has no reference to hand a client.
+	//
+	// On a database of its own: the two connectors each open a pool, and SQLite holds
+	// one writer per file however many pools ask.
+	cfg.AdvertiseURL = ""
+	cfg.DatabaseURL = "sqlite:" + filepath.Join(t.TempDir(), "wa.db")
+	if _, err := app.New(&cfg, zerolog.Nop()); err == nil {
+		t.Fatal("a connector was built whose sessions hold a store they can publish no address for")
 	}
 }
 

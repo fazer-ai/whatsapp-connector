@@ -146,7 +146,7 @@ func TestANewsletterPostIsPublishedWithNoSenderToAttributeItTo(t *testing.T) {
 		Message: &waE2E.Message{Conversation: proto.String("edição de hoje")},
 	}
 
-	message, ok := inboundOf(event)
+	message, _, ok := inboundOf(event, plainBody)
 	if !ok {
 		t.Fatal("a newsletter post was withheld, so the channel would redeliver it for good")
 	}
@@ -176,7 +176,7 @@ func TestAPlainTextMessageIsRenderedTheWayTheContractCarriesIt(t *testing.T) {
 		Message: &waE2E.Message{Conversation: proto.String("bom dia")},
 	}
 
-	message, ok := inboundOf(event)
+	message, _, ok := inboundOf(event, plainBody)
 	if !ok {
 		t.Fatal("a plain text message is the one thing this build can carry, and it was refused")
 	}
@@ -221,7 +221,7 @@ func TestAnExtendedTextMessageCarriesTheQuoteTheMentionsAndTheTimer(t *testing.T
 		}},
 	}
 
-	message, ok := inboundOf(event)
+	message, _, ok := inboundOf(event, plainBody)
 	if !ok {
 		t.Fatal("an extended text message was refused")
 	}
@@ -555,7 +555,7 @@ func TestAnIncomingBroadcastIsAddressedToTheChatTheRecipientSeesItIn(t *testing.
 	event.Info.Sender = sender
 	event.Info.IsGroup = true
 
-	message, ok := inboundOf(event)
+	message, _, ok := inboundOf(event, plainBody)
 	if !ok {
 		t.Fatal("a broadcast a recipient can read was withheld")
 	}
@@ -580,7 +580,7 @@ func TestAStatusPostStaysOnTheStatusFeed(t *testing.T) {
 	event.Info.Sender = waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)
 	event.Info.IsGroup = true
 
-	message, ok := inboundOf(event)
+	message, _, ok := inboundOf(event, plainBody)
 	if !ok {
 		t.Fatal("a status post was withheld")
 	}
@@ -688,7 +688,7 @@ func TestAnEchoFromAnotherDeviceCarriesNoSender(t *testing.T) {
 	event.Info.Sender = account
 	event.Info.IsFromMe = true
 
-	message, ok := inboundOf(event)
+	message, _, ok := inboundOf(event, plainBody)
 	if !ok {
 		t.Fatal("an echo of the account's own send was withheld")
 	}
@@ -719,13 +719,13 @@ func TestAnEditedNewsletterPostIsNotPublishedAsTheOriginal(t *testing.T) {
 		OriginalTS: time.UnixMilli(1755000002000),
 	}
 
-	if _, ok := inboundOf(event); ok {
+	if _, _, ok := inboundOf(event, plainBody); ok {
 		t.Fatal("a channel's correction was published under the original post's id")
 	}
 
 	// The uncorrected post still goes out: what is refused is the edit, not the channel.
 	event.NewsletterMeta = nil
-	if _, ok := inboundOf(event); !ok {
+	if _, _, ok := inboundOf(event, plainBody); !ok {
 		t.Fatal("an ordinary newsletter post was withheld along with the edits")
 	}
 }

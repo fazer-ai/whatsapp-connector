@@ -391,7 +391,7 @@ func TestCloseEndsTheEventChannelAndIsSafeTwice(t *testing.T) {
 func TestEngineKeepsOneSessionPerAccount(t *testing.T) {
 	t.Parallel()
 	container := openStore(t)
-	waEngine := New(container, "fazer.ai test", zerolog.Nop())
+	waEngine := mustEngine(t, container, Options{DeviceName: "fazer.ai test"}, zerolog.Nop())
 	t.Cleanup(func() {
 		if err := waEngine.Close(); err != nil {
 			t.Errorf("Close: %v", err)
@@ -426,6 +426,20 @@ func TestEngineKeepsOneSessionPerAccount(t *testing.T) {
 
 // newTestSession builds a session on a real device store and no socket. A phone number
 // makes it a paired one.
+// mustEngine builds an engine and fails the test rather than the run when it cannot.
+// The only refusal it has is a misconfiguration, which no test here is arranging.
+//
+//nolint:gocritic // zerolog.Logger is designed to be copied; every With() returns one by value
+func mustEngine(t *testing.T, container *store.Container, opts Options, log zerolog.Logger) *Engine {
+	t.Helper()
+
+	waEngine, err := New(container, opts, log)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return waEngine
+}
+
 func newTestSession(t *testing.T, phone string) (*Session, *store.Container) {
 	t.Helper()
 
@@ -456,7 +470,7 @@ func newTestSession(t *testing.T, phone string) (*Session, *store.Container) {
 		}
 	}
 
-	session := newSession(sid, wm.NewClient(device, nil), container, zerolog.Nop(), newLibraryLogger(zerolog.Nop(), sid))
+	session := newSession(sid, wm.NewClient(device, nil), container, MediaOptions{}, zerolog.Nop(), newLibraryLogger(zerolog.Nop(), sid))
 	t.Cleanup(func() { _ = session.Close() })
 	return session, container
 }
@@ -1144,7 +1158,7 @@ func TestAPairingThatEndedTakesTheConnectionWithIt(t *testing.T) {
 func TestAClosedSessionLeavesTheEngineCache(t *testing.T) {
 	t.Parallel()
 	container := openStore(t)
-	waEngine := New(container, "fazer.ai test", zerolog.Nop())
+	waEngine := mustEngine(t, container, Options{DeviceName: "fazer.ai test"}, zerolog.Nop())
 	t.Cleanup(func() {
 		if err := waEngine.Close(); err != nil {
 			t.Errorf("Close: %v", err)
@@ -1175,7 +1189,7 @@ func TestAClosedSessionLeavesTheEngineCache(t *testing.T) {
 func TestClosingASessionDoesNotEvictItsReplacement(t *testing.T) {
 	t.Parallel()
 	container := openStore(t)
-	waEngine := New(container, "fazer.ai test", zerolog.Nop())
+	waEngine := mustEngine(t, container, Options{DeviceName: "fazer.ai test"}, zerolog.Nop())
 	t.Cleanup(func() {
 		if err := waEngine.Close(); err != nil {
 			t.Errorf("Close: %v", err)
@@ -1363,7 +1377,13 @@ func TestBuildingEnginesAtOnceDoesNotRaceOverTheDeviceName(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			waEngine := New(container, fmt.Sprintf("fazer.ai test %d", i), zerolog.Nop())
+			// Not mustEngine: a Fatalf from a goroutine that is not the test's own
+			// ends that goroutine and leaves the test believing it passed.
+			waEngine, err := New(container, Options{DeviceName: fmt.Sprintf("fazer.ai test %d", i)}, zerolog.Nop())
+			if err != nil {
+				t.Errorf("New: %v", err)
+				return
+			}
 			if err := waEngine.Close(); err != nil {
 				t.Errorf("Close: %v", err)
 			}

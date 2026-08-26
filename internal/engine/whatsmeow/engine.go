@@ -24,9 +24,20 @@ import (
 // deviceNameOnce guards the one write to whatsmeow's process-wide device properties.
 var deviceNameOnce sync.Once
 
+// Options is everything an engine needs beyond its device store.
+type Options struct {
+	// DeviceName is what the account's linked-devices list shows.
+	DeviceName string
+	// Media is where a session puts the file of an inbound message. The zero value is
+	// an instance with nowhere to write, which publishes media messages with no file to
+	// fetch.
+	Media MediaOptions
+}
+
 // Engine hands out one session per account, backed by a shared device store.
 type Engine struct {
 	store *store.Container
+	media MediaOptions
 	log   zerolog.Logger
 
 	mu       sync.Mutex
@@ -43,9 +54,16 @@ type Engine struct {
 // `device_name` the contract promises, and this is why it cannot be honoured per
 // session; the deployment's own name is what the account's linked-devices list shows.
 //
+// An engine that was given a blob store and no address to advertise it under is
+// refused rather than run: the reference it would publish is a path with no host, and a
+// client reading one has no way to tell it apart from a URL it simply cannot reach.
+//
 //nolint:gocritic // zerolog.Logger is designed to be copied; every With() returns one by value
-func New(container *store.Container, deviceName string, log zerolog.Logger) *Engine {
-	if deviceName != "" {
+func New(container *store.Container, opts Options, log zerolog.Logger) (*Engine, error) {
+	if opts.Media.Blobs != nil && opts.Media.BaseURL == "" {
+		return nil, errors.New("whatsmeow: a blob store needs the address this instance is reached at")
+	}
+	if deviceName := opts.DeviceName; deviceName != "" {
 		// Written exactly once, because it is written to a package-level value whatsmeow
 		// reads from its pairing handshake: a second engine assigning it is a write with
 		// no lock against a read on another goroutine. The first name wins, which is the
@@ -54,9 +72,10 @@ func New(container *store.Container, deviceName string, log zerolog.Logger) *Eng
 	}
 	return &Engine{
 		store:    container,
+		media:    opts.Media,
 		log:      log,
 		sessions: make(map[string]*Session),
-	}
+	}, nil
 }
 
 // Open prepares a session with the device it paired, or a fresh one when it has not
@@ -84,7 +103,7 @@ func (e *Engine) Open(ctx context.Context, sid string) (engine.Session, error) {
 	}
 
 	wa := newLibraryLogger(e.log, sid)
-	session := newSession(sid, wm.NewClient(device, wa), e.store, e.log, wa)
+	session := newSession(sid, wm.NewClient(device, wa), e.store, e.media, e.log, wa)
 	// Registered before the session can be handed out, so a close that happens while
 	// this function is still running is not one nobody hears about.
 	session.onClose(func() { e.forget(sid, session) })

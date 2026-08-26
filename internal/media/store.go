@@ -164,6 +164,12 @@ func (s *Store) Close() error {
 // network wants before it starts rather than after.
 func (s *Store) MaxBlob() int64 { return s.opts.MaxBlob }
 
+// TTL is how long a blob is kept without being asked for. A caller publishing a
+// reference to one needs it to say when the reference lapses, and being told sooner
+// than the truth is the safe direction: every hand-out puts the clock back, so a blob
+// somebody is still collecting outlives the expiry that was published for it.
+func (s *Store) TTL() time.Duration { return s.opts.TTL }
+
 // Put reads a blob in and returns what it stored.
 //
 // The bytes land in a temporary file first and are renamed into place once they are all

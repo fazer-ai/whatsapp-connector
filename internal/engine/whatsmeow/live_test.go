@@ -329,7 +329,7 @@ func liveSession(t *testing.T) (*Session, *store.Container) {
 	})
 	t.Logf("store: %s", path)
 
-	waEngine := New(container, "fazer.ai live check", log)
+	waEngine := mustEngine(t, container, Options{DeviceName: "fazer.ai live check"}, log)
 	t.Cleanup(func() {
 		if err := waEngine.Close(); err != nil {
 			t.Errorf("close the engine: %v", err)
