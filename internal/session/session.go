@@ -431,20 +431,63 @@ func (s *Session) carryOut(ctx context.Context, command *protocol.Command) (json
 		// the same instant the work finished, and a record that is not written is a
 		// command that gets carried out again.
 		//
-		// A failure here is logged and the command is still answered and retired, which
-		// is the one place this layer knowingly leaves a window. Giving the delivery back
-		// instead would not close it: the side effect has already happened, so the
-		// redelivery would find no record and do it a second time, turning a risk into a
-		// certainty. What covers it is the caller naming the message.
-		record, cancel := context.WithTimeout(context.WithoutCancel(ctx), ledgerTimeout)
-		defer cancel()
-		if err := s.ledger.Remember(record, s.sid, key, result); err != nil {
-			s.log.Error().Err(err).Str("cmd_id", command.ID).Str("key", key).
-				Msg("carried a command out and could not record it; a redelivery will do it again")
-		}
+		// Tried more than once, because the side effect has already happened and this is
+		// the only thing left that can stop it happening again. A Redis that refuses one
+		// call and answers the next is the common shape of a failure here, and giving up
+		// on the first refusal spends the whole window on it.
+		//
+		// A failure that outlasts the attempts is logged and the command is still
+		// answered and retired, which is the one place this layer knowingly leaves a
+		// window. Giving the delivery back instead would not close it: the side effect
+		// has already happened, so the redelivery would find no record and do it a
+		// second time, turning a risk into a certainty. What covers what is left is the
+		// caller naming the message.
+		s.remember(ctx, command, key, result)
 	}
 	return result, err
 }
+
+// remember writes the record of a command that ran, and keeps trying inside a bounded
+// window rather than giving up on the first refusal.
+//
+// Detached from the command's context, because its deadline may have run out in the
+// same instant the work finished, and a record that is not written is a command that
+// gets carried out again. Bounded all the same: this runs on the session's executor, so
+// every attempt is a command behind it that is not running.
+func (s *Session) remember(ctx context.Context, command *protocol.Command, key string, result json.RawMessage) {
+	write, cancel := context.WithTimeout(context.WithoutCancel(ctx), ledgerWindow)
+	defer cancel()
+
+	var err error
+	for attempt := range ledgerAttempts {
+		if attempt > 0 {
+			select {
+			case <-write.Done():
+				// Out of window. The error from the last attempt is what gets reported.
+			case <-time.After(ledgerBackoff):
+			}
+			if write.Err() != nil {
+				break
+			}
+		}
+		if err = s.ledger.Remember(write, s.sid, key, result); err == nil {
+			return
+		}
+	}
+	s.log.Error().Err(err).Str("cmd_id", command.ID).Str("key", key).
+		Msg("carried a command out and could not record it; a redelivery will do it again")
+}
+
+// ledgerWindow bounds the whole of that, and ledgerAttempts and ledgerBackoff divide it
+// up. Short in total for the same reason a single read is: the record sits in the same
+// Redis the command arrived through, so one that is not answering promptly is one
+// nothing else is getting through either, and the window is time the session spends not
+// running the commands behind this one.
+const (
+	ledgerWindow   = 5 * time.Second
+	ledgerAttempts = 3
+	ledgerBackoff  = 200 * time.Millisecond
+)
 
 // ledgerTimeout bounds a read or a write of the record. It is short because the record
 // sits in the same Redis the command arrived through: one that is not answering

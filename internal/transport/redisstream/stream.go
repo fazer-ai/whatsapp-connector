@@ -8,11 +8,10 @@ package redisstream
 
 import (
 	"context"
-	"encoding/json"
+
 	"errors"
 	"fmt"
-	"strconv"
-	"strings"
+
 	"sync"
 	"time"
 
@@ -39,20 +38,6 @@ const (
 	DefaultReadCount     = 64
 )
 
-// DefaultClaimMaxIdle is how long an entry may exist before this transport stops
-// taking it over and retires it to the dead letter list instead.
-//
-// It is the idempotency TTL, and the two have to move together: what makes a reclaim
-// safe is the record of whether the command already ran, and that record is what
-// expires. An entry older than the record is one no instance can decide about, so
-// carrying it out would be a guess with a side effect on the other end of it, and the
-// dead letter list is where the contract puts what a human has to look at.
-const DefaultClaimMaxIdle = redisx.DefaultIdempotencyTTL
-
-// dlqMaxLen bounds the dead letter list. It is a record for an operator, not a queue,
-// and one nobody reads must not be able to fill the instance.
-const dlqMaxLen = 1000
-
 // Options configures the streams. The zero value asks for the defaults above.
 type Options struct {
 	// Instance is this connector's id. It is the consumer name inside the group, so
@@ -64,7 +49,6 @@ type Options struct {
 	Block         time.Duration
 	ReplyTTL      time.Duration
 	ClaimMinIdle  time.Duration
-	ClaimMaxIdle  time.Duration
 	ReadCount     int64
 }
 
@@ -118,14 +102,6 @@ func New(client *redisx.Client, opts Options) (*Streams, error) {
 	}
 	if opts.ClaimMinIdle <= 0 {
 		opts.ClaimMinIdle = DefaultClaimMinIdle
-	}
-	if opts.ClaimMaxIdle <= 0 {
-		opts.ClaimMaxIdle = DefaultClaimMaxIdle
-	}
-	if opts.ClaimMaxIdle <= opts.ClaimMinIdle {
-		return nil, fmt.Errorf(
-			"redisstream: entries are retired after %s and not taken over before %s, so none is ever reclaimed",
-			opts.ClaimMaxIdle, opts.ClaimMinIdle)
 	}
 	if opts.ReadCount <= 0 {
 		opts.ReadCount = DefaultReadCount
@@ -235,7 +211,7 @@ func (s *Streams) Read(ctx context.Context, sids []string) ([]transport.Delivery
 func (s *Streams) Claim(ctx context.Context, sids []string) ([]transport.Delivery, error) {
 	// First, because it is what makes this pass able to see what the last one gave back.
 	s.restoreUnrun(ctx)
-	return s.claim(ctx, s.sessionStreams(sids), s.opts.ClaimMinIdle, s.opts.ClaimMaxIdle)
+	return s.claim(ctx, s.sessionStreams(sids), s.opts.ClaimMinIdle)
 }
 
 // ClaimControl takes over what is pending on the control stream.
@@ -249,14 +225,7 @@ func (s *Streams) Claim(ctx context.Context, sids []string) ([]transport.Deliver
 // exactly the Redis that makes it necessary.
 func (s *Streams) ClaimControl(ctx context.Context) ([]transport.Delivery, error) {
 	s.restoreUnrun(ctx)
-	// No age bound here. What retirement protects is a command whose repeat needs a
-	// record of the first run, and the control stream carries neither kind: `admin.ping`
-	// asks a question, and `session.wake` is arbitrated by the lease, so running it
-	// twice adopts a session that is already adopted. A wake is also the only thing that
-	// gets a stranded session running again, and a fleet down longer than the bound is
-	// exactly when there is one — retiring it there would leave the session unowned
-	// until something unrelated happened to wake it.
-	return s.claim(ctx, []string{s.client.Keys().Control()}, s.opts.ClaimMinIdle, 0)
+	return s.claim(ctx, []string{s.client.Keys().Control()}, s.opts.ClaimMinIdle)
 }
 
 // restoreUnrun puts back the age XCLAIM erased on the entries this process took and gave
@@ -345,10 +314,10 @@ return 1
 // owner noticing, where a command could run twice; that is invariant 5's ground, and
 // M2's.
 func (s *Streams) ClaimSessions(ctx context.Context, sids []string) ([]transport.Delivery, error) {
-	return s.claim(ctx, s.sessionStreams(sids), 0, s.opts.ClaimMaxIdle)
+	return s.claim(ctx, s.sessionStreams(sids), 0)
 }
 
-func (s *Streams) claim(ctx context.Context, streams []string, minIdle, maxIdle time.Duration) ([]transport.Delivery, error) {
+func (s *Streams) claim(ctx context.Context, streams []string, minIdle time.Duration) ([]transport.Delivery, error) {
 	if len(streams) == 0 {
 		return nil, nil
 	}
@@ -369,16 +338,14 @@ func (s *Streams) claim(ctx context.Context, streams []string, minIdle, maxIdle 
 		return nil, err
 	}
 	for _, stream := range streams {
-		ids, expired, err := s.reclaimable(ctx, stream, minIdle, maxIdle)
+		ids, err := s.reclaimable(ctx, stream, minIdle)
 		switch {
 		case isNoGroup(err):
 			s.groups.forget(stream)
 			continue
 		case err != nil:
 			return fail(err)
-		}
-		s.retire(ctx, stream, expired)
-		if len(ids) == 0 {
+		case len(ids) == 0:
 			continue
 		}
 
@@ -429,11 +396,8 @@ func (s *Streams) rememberAge(stream string, idle time.Duration, deliveries []tr
 	}
 }
 
-// reclaimable is the pending entries worth taking over: idle long enough, held by
-// somebody else, and not so old that nothing can be known about them any more. The
-// second list is that last group, which the caller retires rather than runs; a maxIdle
-// of zero asks for no such group, which is what a stream whose commands are safe to
-// repeat wants.
+// reclaimable is the pending entries worth taking over: idle long enough, and held by
+// somebody else.
 //
 // The second half is the reason this is not one XAUTOCLAIM call. A command runs on the
 // session's own executor, not on the loop that read it, so it is still pending while it
@@ -441,31 +405,9 @@ func (s *Streams) rememberAge(stream string, idle time.Duration, deliveries []tr
 // consumer already executing it, and dispatched a second time alongside the first.
 // Acknowledging the original does not retire the copy. XPENDING is the only form that
 // says who holds an entry.
-func (s *Streams) reclaimable(ctx context.Context, stream string, minIdle, maxIdle time.Duration) (ids, expired []string, err error) {
-	ids = make([]string, 0, s.opts.ReadCount)
+func (s *Streams) reclaimable(ctx context.Context, stream string, minIdle time.Duration) ([]string, error) {
+	ids := make([]string, 0, s.opts.ReadCount)
 	start := "-"
-
-	// The bound is read off the entry's own id, not off its idle time, because idle is
-	// the time since the last delivery attempt and every XCLAIM puts it back to zero.
-	// An entry claimed and handed back on each pass would keep looking new while the
-	// record of whether it ran expires underneath it, which is the one case this bound
-	// exists for. A stream id carries the millisecond it was written, and nothing resets
-	// that. Only a delivered entry is ever in the pending list, so an id this old is an
-	// entry that has been going round rather than one nobody has read yet.
-	//
-	// The clock is Redis's own, since that is what stamped the ids.
-	var cutoff string
-	if maxIdle > 0 {
-		now, err := s.client.Time(ctx).Result()
-		if err != nil {
-			// The bound cannot be applied without it, and refusing to reclaim anything
-			// would strand every session. Reclaiming as if nothing had aged out is the
-			// behaviour from before the bound, and the next pass reads the clock again.
-			maxIdle = 0
-		} else {
-			cutoff = strconv.FormatInt(now.Add(-maxIdle).UnixMilli(), 10)
-		}
-	}
 
 	// Paged, because the filter is what makes a page yield nothing: entries this
 	// process is still running stay pending for as long as they run, and a page full of
@@ -482,13 +424,13 @@ func (s *Streams) reclaimable(ctx context.Context, stream string, minIdle, maxId
 		}).Result()
 		switch {
 		case errors.Is(err, redis.Nil):
-			return ids, expired, nil
+			return ids, nil
 		case isNoGroup(err):
-			return nil, expired, err
+			return nil, err
 		case err != nil:
-			return nil, expired, fmt.Errorf("redisstream: list what is pending on %s: %w", stream, err)
+			return nil, fmt.Errorf("redisstream: list what is pending on %s: %w", stream, err)
 		case len(pending) == 0:
-			return ids, expired, nil
+			return ids, nil
 		}
 
 		for _, entry := range pending {
@@ -504,87 +446,14 @@ func (s *Streams) reclaimable(ctx context.Context, stream string, minIdle, maxId
 			if s.running(stream, entry.ID) {
 				continue
 			}
-			if maxIdle > 0 && olderThan(entry.ID, cutoff) {
-				// Older than anything that could say whether it already ran. Taking it
-				// over would be carrying out a command on a guess, so it is retired
-				// instead, which is the one outcome that neither runs it twice nor
-				// leaves it pending for the next heartbeat to reconsider.
-				expired = append(expired, entry.ID)
-				continue
-			}
 			ids = append(ids, entry.ID)
 		}
 		if len(ids) >= int(s.opts.ReadCount) || int64(len(pending)) < s.opts.ReadCount {
-			return ids, expired, nil
+			return ids, nil
 		}
 		start = pending[len(pending)-1].ID
 	}
-	return ids, expired, nil
-}
-
-// olderThan reports whether a stream id was written before the millisecond named by
-// cutoff. Both are `<ms>-<seq>`, or in cutoff's case the millisecond alone, so the
-// comparison is on the number before the dash: same width means a string compare would
-// do, but ids are not padded and an unreadable one has to count as young rather than be
-// retired on a parse failure.
-func olderThan(id, cutoff string) bool {
-	ms, _, found := strings.Cut(id, "-")
-	if !found {
-		return false
-	}
-	written, err := strconv.ParseInt(ms, 10, 64)
-	if err != nil {
-		return false
-	}
-	limit, err := strconv.ParseInt(cutoff, 10, 64)
-	if err != nil {
-		return false
-	}
-	return written < limit
-}
-
-// retire takes entries out of the pending list for good and leaves a copy of each on
-// the dead letter list, which is where the contract keeps what the connector would not
-// carry out.
-//
-// The copy is written before the acknowledgement, so a failure in between costs a
-// duplicate record rather than a command nobody can see any more. An entry the stream
-// has already trimmed away has no copy to make, and the acknowledgement is still worth
-// sending: it is what clears the pending list of an id that no longer exists.
-func (s *Streams) retire(ctx context.Context, stream string, ids []string) {
-	keys := s.client.Keys()
-	for _, id := range ids {
-		entries, err := s.client.XRange(ctx, stream, id, id).Result()
-		if err != nil && !errors.Is(err, redis.Nil) {
-			// Nothing is retired without a record of it. The entry stays pending and
-			// the next heartbeat comes back to it.
-			continue
-		}
-		if len(entries) > 0 {
-			record, err := json.Marshal(dlqEntry{
-				Stream: stream, ID: id, Reason: "pending longer than the record of whether it ran",
-				MaxIdle: s.opts.ClaimMaxIdle.String(), Fields: toFields(entries[0].Values),
-			})
-			if err != nil {
-				continue
-			}
-			if err := s.client.LPush(ctx, keys.DLQCommands(), record).Err(); err != nil {
-				continue
-			}
-			s.client.LTrim(ctx, keys.DLQCommands(), 0, dlqMaxLen-1)
-		}
-		_ = s.client.XAck(ctx, stream, ConsumerGroup, id).Err()
-	}
-}
-
-// dlqEntry is one retired command as an operator reads it: where it was, how long it
-// sat there, and the frame itself.
-type dlqEntry struct {
-	Stream  string            `json:"stream"`
-	ID      string            `json:"id"`
-	Reason  string            `json:"reason"`
-	MaxIdle string            `json:"max_idle"`
-	Fields  map[string]string `json:"fields"`
+	return ids, nil
 }
 
 // maxPendingPages bounds how much of the pending list one reclaim walks. The next

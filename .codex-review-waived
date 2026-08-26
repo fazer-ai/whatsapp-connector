@@ -55,3 +55,19 @@ internal/engine/whatsmeow/send.go: Include the original message in quote context
 # writes on the lease, which is the M2 waiver above and needs a session-scoped stop over
 # the fleet rather than a lock here.
 internal/session/session.go: Serialize same-key commands before running them  # PR#9
+# PR#9: real, and the bound that was built for it in this same PR is out again, because
+# both attempts at one were worse than the hole. A pending entry carries no honest age:
+# XPENDING's idle is the time since the last delivery and every XCLAIM resets it, so an
+# entry going round never ages; the stream id is the moment the command was enqueued, not
+# the moment it first ran, so a command that waited a day unread and was only just picked
+# up looks identical to one that has been going round for a day, and retiring on it drops
+# a command that never ran. Knowing when an entry first became pending means writing that
+# down per delivery, which is a key per command on the hot path and a key class the
+# contract does not have. What is in place instead couples the two lifetimes from the
+# other side: Recall pushes the record's expiry out, so a record outlives any entry
+# anybody is still asking about. What is left is a fleet down longer than the TTL with a
+# command still pending, which is a day-long outage; for a send the caller's message_id
+# is what covers the repeat, and the commands where it would bite are the ones the roadmap
+# fences on the lease.
+internal/redisx/idempotency.go: Keep ledger entries through all possible redeliveries  # PR#9
+internal/transport/redisstream/stream.go: Age pending commands from first delivery, not enqueue time  # PR#9

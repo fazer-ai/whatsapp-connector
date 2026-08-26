@@ -121,6 +121,26 @@ type ledger struct {
 	inner *redisx.Idempotency
 	mu    sync.Mutex
 	err   error
+
+	// writes counts every attempt at a record, and refuseWrites is how many of them are
+	// turned away before the store is let through. A Redis that refuses one call and
+	// answers the next is the shape of failure the write retry is there for.
+	writes       int
+	refuseWrites int
+}
+
+// refuseWritesFor turns the next n attempts at a record away, whatever the read side is
+// doing.
+func (l *ledger) refuseWritesFor(n int) {
+	l.mu.Lock()
+	l.refuseWrites = n
+	l.mu.Unlock()
+}
+
+func (l *ledger) attempts() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.writes
 }
 
 func (l *ledger) refuse(err error) {
@@ -143,8 +163,20 @@ func (l *ledger) Recall(ctx context.Context, sid, key string) (json.RawMessage, 
 }
 
 func (l *ledger) Remember(ctx context.Context, sid, key string, result json.RawMessage) error {
-	if err := l.refusal(); err != nil {
+	l.mu.Lock()
+	l.writes++
+	refusing := l.refuseWrites > 0
+	if refusing {
+		l.refuseWrites--
+	}
+	err := l.err
+	l.mu.Unlock()
+
+	switch {
+	case err != nil:
 		return err
+	case refusing:
+		return errors.New("redis refused the write")
 	}
 	return l.inner.Remember(ctx, sid, key, result)
 }
@@ -1887,5 +1919,41 @@ func TestASendThatLandedAsTheSessionEndedIsStillAnswered(t *testing.T) {
 	}
 	if !acked.Load() {
 		t.Fatal("a send that landed and was answered was left pending")
+	}
+}
+
+// The side effect has already happened by the time the record is written, so the record
+// is the only thing left that can stop it happening again. A Redis that refuses one call
+// and answers the next is the common shape of a failure there, and giving up on the
+// first refusal spends the whole window on it.
+func TestARecordRefusedOnceIsStillWritten(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	ctx := context.Background()
+	if _, err := h.manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, _ := h.engine.Session("s1")
+	h.ledger.refuseWritesFor(2)
+
+	logout := &protocol.Command{
+		V: protocol.Version, ID: "c1", Type: protocol.CommandSessionLogout, SID: "s1", ReplyTo: "c1",
+		Payload: json.RawMessage(`{}`),
+	}
+	var acked atomic.Bool
+	h.manager.Dispatch(ctx, delivery(logout, &acked))
+	waitFor(t, "the logout to be retired", acked.Load)
+	if got := h.ledger.attempts(); got < 3 {
+		t.Fatalf("the record was attempted %d times, want the refusals to have been tried past", got)
+	}
+
+	// The same frame again, which is what the transport hands back. It is answered from
+	// the record the retry managed to write.
+	var ackedAgain atomic.Bool
+	h.manager.Dispatch(ctx, delivery(logout, &ackedAgain))
+	waitFor(t, "the redelivery to be retired", ackedAgain.Load)
+	if got := engineSession.LoggedOut(); got != 1 {
+		t.Fatalf("the account was logged out %d times, want once", got)
 	}
 }

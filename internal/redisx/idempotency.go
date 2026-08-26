@@ -17,11 +17,14 @@ import (
 // A day is far past that and costs one small string per message; forgetting too early
 // is a duplicate side effect, and forgetting too late is nothing at all.
 //
-// Nothing bounds how long an entry stays pending on its own, so the transport is what
-// makes "far past that" true: redisstream retires an entry idle longer than this one
-// rather than take it over. The two constants move together, and changing this one
-// without that one puts a command back in front of an instance that has no way left of
-// telling whether it already ran.
+// Nothing bounds how long an entry stays pending on its own, so what makes "far past
+// that" true is Recall pushing the expiry out: an entry still being handed around is one
+// somebody is still asking about, and asking is what keeps the answer alive. What is
+// left over is a fleet down for longer than this with a command pending, which comes
+// back to a record that has gone and carries the command out again. Bounding the entry
+// instead was tried and taken back out: a pending entry carries no honest age — its idle
+// resets on every claim, and its id is the moment it was enqueued rather than the moment
+// it first ran — so every bound built on one retired commands that had never run.
 const DefaultIdempotencyTTL = 24 * time.Hour
 
 // Idempotency remembers what a command did, so a redelivery answers with the first
