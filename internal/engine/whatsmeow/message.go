@@ -104,7 +104,7 @@ func partyOf(info *waTypes.MessageInfo) (*protocol.Party, bool) {
 // milestone saying the message is somebody else's to deliver, which upstream turns
 // into a withheld acknowledgement, so WhatsApp keeps it and sends it again.
 func inboundOf(event *waEvents.Message) (protocol.InboundMessage, bool) {
-	if event.IsEdit || event.Info.Edit != waTypes.EditAttributeEmpty {
+	if event.IsEdit || event.Info.Edit != waTypes.EditAttributeEmpty || newsletterEdit(event) {
 		// whatsmeow unwraps an edit and hands back the corrected text in the shape a
 		// new message arrives in, so nothing further down can tell the two apart. The
 		// contract has `message.edited` for this and M2 has yet to reach it: publishing
@@ -155,6 +155,17 @@ func inboundOf(event *waEvents.Message) (protocol.InboundMessage, bool) {
 		Ephemeral: context.GetExpiration(),
 	}
 	return message, true
+}
+
+// newsletterEdit reports whether a newsletter post is a correction of an earlier one.
+//
+// A channel's edit does not arrive wrapped the way an ordinary one does: whatsmeow says
+// so on the type itself, and what comes through is the new body under the original
+// message's id, with the only sign of it being a timestamp off to the side. Published
+// as a message received, a client that deduplicates on the id throws the correction
+// away and the acknowledgement makes sure it is never sent again.
+func newsletterEdit(event *waEvents.Message) bool {
+	return event.NewsletterMeta != nil && !event.NewsletterMeta.EditTS.IsZero()
 }
 
 // textOf pulls the body and the context out of the two shapes WhatsApp sends text in.

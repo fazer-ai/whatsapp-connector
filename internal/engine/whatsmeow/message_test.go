@@ -701,3 +701,31 @@ func TestAnEchoFromAnotherDeviceCarriesNoSender(t *testing.T) {
 
 	validateInboundAgainstContract(t, &message)
 }
+
+// A channel's edit does not arrive wrapped the way an ordinary one does. What comes
+// through is the corrected body under the original post's id, with an edit timestamp
+// off to the side and nothing else to tell it apart, so a client that deduplicates on
+// the id throws the correction away and the acknowledgement makes sure it is never
+// sent again.
+func TestAnEditedNewsletterPostIsNotPublishedAsTheOriginal(t *testing.T) {
+	t.Parallel()
+
+	channel := waTypes.NewJID("120363111111111111", waTypes.NewsletterServer)
+	event := textMessage("3EB0NEWS", "edição de hoje, corrigida")
+	event.Info.Chat = channel
+	event.Info.Sender = channel
+	event.NewsletterMeta = &waEvents.NewsletterMessageMeta{
+		EditTS:     time.UnixMilli(1755000003000),
+		OriginalTS: time.UnixMilli(1755000002000),
+	}
+
+	if _, ok := inboundOf(event); ok {
+		t.Fatal("a channel's correction was published under the original post's id")
+	}
+
+	// The uncorrected post still goes out: what is refused is the edit, not the channel.
+	event.NewsletterMeta = nil
+	if _, ok := inboundOf(event); !ok {
+		t.Fatal("an ordinary newsletter post was withheld along with the edits")
+	}
+}
