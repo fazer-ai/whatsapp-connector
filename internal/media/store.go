@@ -98,6 +98,15 @@ type Store struct {
 	// that answers 404. Handing out is cheap and concurrent; evicting is neither, and
 	// it is the only thing that has to be alone.
 	collecting sync.RWMutex
+
+	// writing is the ids this process has a Put in flight for. A download can take
+	// longer than the TTL, and its temporary file then reads to the sweep as one an
+	// interrupted write abandoned: collecting it unlinks a file that is still being
+	// written into, the copy carries on into an inode with no name, and the rename at
+	// the end fails on a blob that was on its way. Only this process writes to this
+	// root, so knowing it here is knowing it.
+	writingMu sync.Mutex
+	writing   map[string]struct{}
 }
 
 // New prepares the store, creating the root if it is not there.
@@ -134,7 +143,7 @@ func New(opts Options) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("media: open %s: %w", opts.Root, err)
 	}
-	return &Store{opts: opts, root: root}, nil
+	return &Store{opts: opts, root: root, writing: map[string]struct{}{}}, nil
 }
 
 // Close lets go of the directory handle.
@@ -173,6 +182,15 @@ func (s *Store) Put(ctx context.Context, source io.Reader, about *Blob) (Blob, e
 	stored := *about
 	stored.ID = id
 	stored.StoredAt = s.opts.Now().UnixMilli()
+
+	s.writingMu.Lock()
+	s.writing[id] = struct{}{}
+	s.writingMu.Unlock()
+	defer func() {
+		s.writingMu.Lock()
+		delete(s.writing, id)
+		s.writingMu.Unlock()
+	}()
 
 	path := s.pathOf(id)
 	if err := s.root.MkdirAll(shardOf(id), 0o700); err != nil {
@@ -229,6 +247,11 @@ func (s *Store) Put(ctx context.Context, source io.Reader, about *Blob) (Blob, e
 		_ = s.root.Remove(s.aboutPath(id))
 		return Blob{}, fmt.Errorf("media: name %s: %w", id, err)
 	}
+	// Stamped now rather than left with the time the temporary file picked up when the
+	// first byte landed. The age is how long since anybody wanted this, and a download
+	// that took longer than the TTL would otherwise arrive already expired.
+	now := s.opts.Now()
+	_ = s.root.Chtimes(path, now, now)
 	return stored, nil
 }
 
@@ -325,7 +348,10 @@ func (s *Store) Sweep(ctx context.Context) (dropped int, freed int64, err error)
 		}
 	}
 
-	take := func(entry held) bool {
+	// take removes one entry and answers what it still costs: nothing when it went, its
+	// whole cost when it did not, and the description alone when the bytes went and the
+	// description would not follow.
+	take := func(entry held) int64 {
 		// Read again, immediately before removing, and with nothing able to touch it in
 		// between. The snapshot is minutes old by now and Open touches a blob it hands
 		// out, so a blob collected since the walk is one somebody is using: dropping it
@@ -333,14 +359,23 @@ func (s *Store) Sweep(ctx context.Context) (dropped int, freed int64, err error)
 		s.collecting.Lock()
 		defer s.collecting.Unlock()
 		if info, err := s.root.Stat(s.pathOf(entry.id)); err == nil && info.ModTime().After(entry.touched) {
-			return false
+			return entry.charged
 		}
-		if dropErr := s.drop(entry.id); dropErr != nil {
+		bytesGone, dropErr := s.drop(entry.id)
+		if dropErr != nil {
 			failed = errors.Join(failed, dropErr)
-			return false
+		}
+		if !bytesGone {
+			return entry.charged
 		}
 		dropped, freed = dropped+1, freed+entry.size
-		return true
+		if dropErr != nil {
+			// The bytes went and the description would not follow. Charging the whole
+			// entry would have the sweep evict other blobs to make room for a payload
+			// that is not there any more.
+			return blocks(entry.about)
+		}
+		return 0
 	}
 
 	cutoff := s.opts.Now().Add(-s.opts.TTL)
@@ -350,13 +385,17 @@ func (s *Store) Sweep(ctx context.Context) (dropped int, freed int64, err error)
 		if err := ctx.Err(); err != nil {
 			return dropped, freed, errors.Join(failed, err)
 		}
-		// Counted whenever it is still here, including one that refused to go and one
-		// that was collected between the walk and now: what the quota has to be measured
-		// against is the disk, not the intention.
-		if entry.touched.Before(cutoff) && take(entry) {
+		// Counted for whatever is still here, including an entry that refused to go and
+		// one that was collected between the walk and now: what the quota has to be
+		// measured against is the disk, not the intention.
+		entry.charged = entry.cost()
+		if entry.touched.Before(cutoff) {
+			entry.charged = take(entry)
+		}
+		if entry.charged == 0 {
 			continue
 		}
-		total += entry.cost()
+		total += entry.charged
 		kept = append(kept, entry)
 	}
 
@@ -374,9 +413,7 @@ func (s *Store) Sweep(ctx context.Context) (dropped int, freed int64, err error)
 		if total <= s.opts.Quota {
 			break
 		}
-		if take(entry) {
-			total -= entry.cost()
-		}
+		total -= entry.charged - take(entry)
 	}
 	return dropped, freed, failed
 }
@@ -390,6 +427,12 @@ type held struct {
 	size    int64
 	about   int64
 	touched time.Time
+
+	// charged is what this entry still costs, which is its whole cost until something
+	// removes part of it. Kept apart from size and about rather than written back over
+	// them, because cost() is derived from those two and folding a remainder into them
+	// makes the next reading of it wrong.
+	charged int64
 }
 
 // blockSize is what one file is charged at least, and what its length is rounded up to.
@@ -480,7 +523,7 @@ func (s *Store) list(ctx context.Context) (blobs []held, leftovers []string, ski
 			// ask for it, so the sweep is what collects it — but only once it is old
 			// enough to be nobody's, since a write in progress right now looks exactly
 			// like one that was abandoned.
-			if aged {
+			if aged && !s.isWriting(strings.TrimPrefix(name, tempPrefix)) {
 				leftovers = append(leftovers, path)
 			}
 		case path == s.aboutPath(strings.TrimSuffix(name, aboutSuffix)):
@@ -526,6 +569,14 @@ func (s *Store) list(ctx context.Context) (blobs []held, leftovers []string, ski
 	return blobs, leftovers, skipped, nil
 }
 
+// isWriting reports whether a Put has this id in flight.
+func (s *Store) isWriting(id string) bool {
+	s.writingMu.Lock()
+	defer s.writingMu.Unlock()
+	_, found := s.writing[id]
+	return found
+}
+
 // drop removes a blob and says whether the bytes actually went. The bytes go first: a
 // description without them is unservable and the sweep collects it, while bytes without
 // a description would be served as an unnamed file of unknown type.
@@ -533,17 +584,19 @@ func (s *Store) list(ctx context.Context) (blobs []held, leftovers []string, ski
 // The answer is what the sweep counts on. A volume that has gone read-only refuses every
 // removal, and a sweep that counted those as freed would report a cache it had emptied
 // while the disk stayed full, every minute, with nothing said.
-func (s *Store) drop(id string) error {
-	if err := s.root.Remove(s.pathOf(id)); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("media: drop %s: %w", id, err)
+func (s *Store) drop(id string) (bytesGone bool, err error) {
+	if removeErr := s.root.Remove(s.pathOf(id)); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+		return false, fmt.Errorf("media: drop %s: %w", id, removeErr)
 	}
 	// Reported as well, because the sweep subtracts the whole cost of the entry and the
 	// description is part of that: a long one left behind is disk the accounting has
 	// stopped counting, which is how the cache sits over quota with nothing said.
-	if err := s.root.Remove(s.aboutPath(id)); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("media: drop the description of %s: %w", id, err)
+	// The bytes are gone either way by this point, and saying so is what keeps the sweep
+	// from evicting other blobs to make room for a payload that is not there any more.
+	if removeErr := s.root.Remove(s.aboutPath(id)); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+		return true, fmt.Errorf("media: drop the description of %s: %w", id, removeErr)
 	}
-	return nil
+	return true, nil
 }
 
 const (

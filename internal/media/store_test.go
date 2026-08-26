@@ -777,3 +777,134 @@ func TestADescriptionThatWillNotGoIsReported(t *testing.T) {
 		t.Fatalf("the description went after all, so the test proves nothing: %v", err)
 	}
 }
+
+// A download can take longer than the TTL. Its temporary file then reads to the sweep as
+// one an interrupted write abandoned, and collecting it unlinks a file that is still
+// being written into: the copy carries on into an inode with no name and the rename at
+// the end fails on a blob that was on its way.
+func TestAWriteInFlightIsNotCollectedForBeingSlow(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	clock := func() time.Time { return now }
+	// A minute of TTL against a write that takes longer than that.
+	store, _ := newStore(t, media.Options{TTL: time.Minute, Now: clock})
+
+	arrived := make(chan struct{})
+	release := make(chan struct{})
+	slow := io.MultiReader(strings.NewReader("the first bytes"), &announce{arrived: arrived, wait: release})
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := store.Put(t.Context(), slow, &media.Blob{})
+		done <- err
+	}()
+
+	<-arrived
+	// Well past the TTL, with the write still going.
+	now = now.Add(time.Hour)
+	if _, _, err := store.Sweep(t.Context()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	close(release)
+
+	if err := <-done; err != nil {
+		t.Fatalf("a write that outlasted the TTL was collected from under itself: %v", err)
+	}
+}
+
+// announce says when it has been reached and then waits to be let go.
+type announce struct {
+	arrived chan struct{}
+	wait    chan struct{}
+	done    bool
+}
+
+func (a *announce) Read([]byte) (int, error) {
+	if !a.done {
+		a.done = true
+		close(a.arrived)
+		<-a.wait
+	}
+	return 0, io.EOF
+}
+
+// The age is how long since anybody wanted a blob. Left with the time its temporary file
+// picked up when the first byte landed, a download that took longer than the TTL arrives
+// already expired and the next sweep drops it before anyone can collect it.
+func TestABlobIsAsOldAsItsArrivalRatherThanItsFirstByte(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	clock := func() time.Time { return now }
+	store, _ := newStore(t, media.Options{TTL: time.Minute, Now: clock})
+
+	arrived := make(chan struct{})
+	release := make(chan struct{})
+	slow := io.MultiReader(strings.NewReader("the first bytes"), &announce{arrived: arrived, wait: release})
+
+	stored := make(chan media.Blob, 1)
+	go func() {
+		blob, err := store.Put(t.Context(), slow, &media.Blob{})
+		if err != nil {
+			t.Errorf("Put: %v", err)
+		}
+		stored <- blob
+	}()
+
+	<-arrived
+	now = now.Add(time.Hour)
+	close(release)
+	blob := <-stored
+
+	if _, _, err := store.Sweep(t.Context()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if _, _, err := store.Open(blob.ID); err != nil {
+		t.Fatalf("a blob whose download outlasted the TTL was dropped on arrival: %v", err)
+	}
+}
+
+// The bytes going and the description staying leaves the payload's disk free. Charging
+// the whole entry anyway has the sweep evict other blobs to make room for something that
+// is not there any more.
+func TestBytesThatWentAreNotStillChargedForWhenTheDescriptionStays(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	clock := func() time.Time { return now }
+	// Twenty-two kibibytes: the two that matter cost sixteen, and the stuck one costs
+	// four once its bytes are accounted as gone and twelve if they are not. Only the
+	// second reading puts the cache over the quota and starts evicting.
+	store, root := newStore(t, media.Options{TTL: time.Hour, Quota: 22 << 10, MaxBlob: 4 << 10, Now: clock})
+
+	stuck := put(t, store, "will half go", &media.Blob{})
+	// The description is replaced by a directory with something in it, so the bytes can
+	// go and it cannot.
+	about := filepath.Join(root, stuck.ID[5:7], stuck.ID+".json")
+	if err := os.Remove(about); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(about, "in the way"), 0o700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+
+	// Two more, well within the quota once the stuck one's bytes are accounted as gone.
+	now = now.Add(time.Minute)
+	wanted := []string{put(t, store, "keep me", &media.Blob{}).ID, put(t, store, "and me", &media.Blob{}).ID}
+
+	// Only the first is past the TTL.
+	now = now.Add(90 * time.Minute)
+	for _, id := range wanted {
+		read(t, store, id)
+	}
+	if _, _, err := store.Sweep(t.Context()); err == nil {
+		t.Fatal("a sweep that could not remove a description reported a clean pass")
+	}
+
+	for _, id := range wanted {
+		if _, _, err := store.Open(id); err != nil {
+			t.Fatalf("%s was evicted to make room for bytes that had already gone: %v", id, err)
+		}
+	}
+}
