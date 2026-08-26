@@ -6,7 +6,6 @@ import (
 	"io"
 	"mime"
 	"net/http"
-	"path"
 	"strings"
 	"time"
 )
@@ -58,12 +57,12 @@ func Handler(opts HandlerOptions) http.Handler {
 		if about.Mime != "" {
 			w.Header().Set("Content-Type", about.Mime)
 		}
-		if about.Filename != "" {
+		if name := baseName(about.Filename); name != "" {
 			// The name only, and quoted by the standard encoder: it comes off a message
 			// somebody else wrote, so a path or a quote in it must not reach the header
 			// as one.
 			w.Header().Set("Content-Disposition",
-				mime.FormatMediaType("attachment", map[string]string{"filename": path.Base(about.Filename)}))
+				mime.FormatMediaType("attachment", map[string]string{"filename": name}))
 		}
 		if about.SHA256 != "" {
 			w.Header().Set("ETag", `"`+about.SHA256+`"`)
@@ -74,6 +73,26 @@ func Handler(opts HandlerOptions) http.Handler {
 		// since a blob's modification time is when it was last collected.
 		http.ServeContent(w, r, about.Filename, zeroTime, body)
 	})
+}
+
+// baseName is the last segment of a filename, and the empty string for one that has no
+// segment worth sending.
+//
+// Both separators, because path.Base only knows the forward one and the name comes off a
+// message that may have been sent from Windows: `..\..\secret` and `C:\Users\x\photo.jpg`
+// are one segment to it and go out whole, which puts something that reads as a traversal
+// in front of whatever the client does with the name. A segment that is only dots is
+// dropped rather than sent, since it names nothing and every consumer reads it as a
+// directory.
+func baseName(filename string) string {
+	name := filename
+	if cut := strings.LastIndexAny(name, `/\`); cut >= 0 {
+		name = name[cut+1:]
+	}
+	if strings.Trim(name, ".") == "" {
+		return ""
+	}
+	return name
 }
 
 // authorized compares in constant time, so the endpoint does not tell a caller how much

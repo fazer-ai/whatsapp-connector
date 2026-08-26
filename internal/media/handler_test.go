@@ -172,3 +172,46 @@ func TestAFilenameFromAMessageCannotShapeTheHeader(t *testing.T) {
 func parseDisposition(header string) (kind string, params map[string]string, err error) {
 	return mime.ParseMediaType(header)
 }
+
+// path.Base only knows the forward slash, and the name comes off a message that may have
+// been sent from Windows: a backslash path is one segment to it and goes out whole,
+// putting something that reads as a traversal in front of whatever the client does with
+// the name.
+func TestAWindowsPathInAFilenameIsCutDownToTheName(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string]string{
+		`..\..\secret`:            "secret",
+		`C:\Users\x\photo.jpg`:    "photo.jpg",
+		`/var/tmp/../etc/passwd`:  "passwd",
+		`mixed/slashes\photo.png`: "photo.png",
+		// Names that are only dots name nothing, and every consumer reads them as a
+		// directory.
+		`..`:      "",
+		`.`:       "",
+		`foo/..`:  "",
+		`foo\...`: "",
+	}
+
+	for filename, want := range cases {
+		store, _ := newStore(t, media.Options{})
+		stored := put(t, store, "the bytes", &media.Blob{Filename: filename})
+		handler := serve(t, store, "s3cret")
+
+		rec := request(t, handler, http.MethodGet, "/media/"+stored.ID, "Bearer s3cret")
+		got := rec.Header().Get("Content-Disposition")
+		if want == "" {
+			if got != "" {
+				t.Fatalf("filename %q produced Content-Disposition %q, want none", filename, got)
+			}
+			continue
+		}
+		if strings.ContainsAny(got, `/\`) {
+			t.Fatalf("filename %q produced Content-Disposition %q, which still carries a path", filename, got)
+		}
+		_, params, err := parseDisposition(got)
+		if err != nil || params["filename"] != want {
+			t.Fatalf("filename %q produced %q, want the name %q (err=%v)", filename, got, want, err)
+		}
+	}
+}

@@ -71,3 +71,12 @@ internal/session/session.go: Serialize same-key commands before running them  # 
 # fences on the lease.
 internal/redisx/idempotency.go: Keep ledger entries through all possible redeliveries  # PR#9
 internal/transport/redisstream/stream.go: Age pending commands from first delivery, not enqueue time  # PR#9
+# PR#15: correct in general and answered the way the finding itself allows, by requiring
+# a context-aware source rather than pretending a wrapper can interrupt a read. Nothing
+# outside a read can end one that has already entered a syscall: a goroutine plus a select
+# returns from Put while the abandoned read goes on writing into a temporary file the
+# caller is about to remove, which trades a stall for a corruption. The requirement is
+# stated on Put, and both callers this has satisfy it — whatsmeow's download hands over
+# bytes already in memory, and an HTTP body from a request carrying the context unblocks
+# when the context does. The check before each read is what covers a source that yields.
+internal/media/store.go: Interrupt the underlying read on cancellation  # PR#15

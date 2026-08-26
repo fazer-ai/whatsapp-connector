@@ -745,3 +745,35 @@ func (b blockUntil) Read([]byte) (int, error) {
 	<-b
 	return 0, io.EOF
 }
+
+// The sweep subtracts the whole cost of an entry, and the description is part of that. A
+// description left behind after its bytes went is disk the accounting has stopped
+// counting, which is how the cache sits over quota with nothing said.
+func TestADescriptionThatWillNotGoIsReported(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	clock := func() time.Time { return now }
+	store, root := newStore(t, media.Options{TTL: time.Hour, Now: clock})
+	stored := put(t, store, "the bytes", &media.Blob{})
+
+	// The description is replaced by a directory with something in it, which is a file
+	// the blob beside it can be removed without and this one cannot: a removal that
+	// fails for the description alone, which permissions on the shard cannot produce
+	// because they stop both.
+	about := filepath.Join(root, stored.ID[5:7], stored.ID+".json")
+	if err := os.Remove(about); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(about, "in the way"), 0o700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+
+	now = now.Add(2 * time.Hour)
+	if _, _, err := store.Sweep(t.Context()); err == nil {
+		t.Fatal("a sweep that could not remove a description reported a clean pass")
+	}
+	if _, err := os.Stat(about); err != nil {
+		t.Fatalf("the description went after all, so the test proves nothing: %v", err)
+	}
+}

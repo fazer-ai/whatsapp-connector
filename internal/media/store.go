@@ -156,6 +156,15 @@ func (s *Store) MaxBlob() int64 { return s.opts.MaxBlob }
 // the sweep collects rather than a file that lies about its length. The description is
 // written before the bytes are named, for the same reason in the other direction: a
 // blob without one is unservable, so it must not be the state a crash can leave.
+//
+// The source has to answer to ctx itself, and this is a requirement on the caller rather
+// than something the store can arrange. A read that has already entered a syscall cannot
+// be interrupted from the outside: checking the context before each read, which is what
+// happens below, returns promptly from a source that yields between reads and does
+// nothing at all for one that is blocked inside one. The two callers this has both
+// satisfy it — whatsmeow's download hands over bytes that are already in memory, and an
+// HTTP body from a request carrying ctx unblocks when ctx does — and a source that does
+// neither holds the session that owns the write for as long as its far end feels like it.
 func (s *Store) Put(ctx context.Context, source io.Reader, about *Blob) (Blob, error) {
 	id, err := newID()
 	if err != nil {
@@ -186,9 +195,9 @@ func (s *Store) Put(ctx context.Context, source io.Reader, about *Blob) (Blob, e
 		_ = s.root.Remove(tempName)
 	}()
 
-	// The source is a download off somebody else's network, so it can stall for as long
-	// as that network feels like it. Reading through the context is what lets the
-	// session that owns this let go of it when its lease moves or the process stops.
+	// Read through the context, so a source that yields between reads is given up on
+	// rather than waited out. What this cannot do is interrupt a read already inside a
+	// syscall, and no wrapper can: see the note on the requirement above.
 	source = &reading{ctx: ctx, from: source}
 
 	digest := sha256.New()
@@ -263,6 +272,13 @@ func (s *Store) Open(id string) (io.ReadSeekCloser, Blob, error) {
 	if !validID(id) {
 		return nil, Blob{}, ErrNotFound
 	}
+	// Held across the whole hand-out, not only the touch. An eviction landing between
+	// the open and the touch unlinks the blob, the touch then fails quietly, and this
+	// returns a descriptor to a file that is no longer there: a HEAD that answers 200
+	// and a GET that answers 404, which is the pair the lock exists to prevent.
+	s.collecting.RLock()
+	defer s.collecting.RUnlock()
+
 	about, err := s.readAbout(id)
 	if err != nil {
 		return nil, Blob{}, err
@@ -277,9 +293,7 @@ func (s *Store) Open(id string) (io.ReadSeekCloser, Blob, error) {
 	now := s.opts.Now()
 	// Best effort: a blob that could not be touched is one the sweep may drop sooner
 	// than it should, which costs a download and not the answer being given here.
-	s.collecting.RLock()
 	_ = s.root.Chtimes(s.pathOf(id), now, now)
-	s.collecting.RUnlock()
 	return file, about, nil
 }
 
@@ -520,11 +534,15 @@ func (s *Store) list(ctx context.Context) (blobs []held, leftovers []string, ski
 // removal, and a sweep that counted those as freed would report a cache it had emptied
 // while the disk stayed full, every minute, with nothing said.
 func (s *Store) drop(id string) error {
-	err := s.root.Remove(s.pathOf(id))
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := s.root.Remove(s.pathOf(id)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("media: drop %s: %w", id, err)
 	}
-	_ = s.root.Remove(s.aboutPath(id))
+	// Reported as well, because the sweep subtracts the whole cost of the entry and the
+	// description is part of that: a long one left behind is disk the accounting has
+	// stopped counting, which is how the cache sits over quota with nothing said.
+	if err := s.root.Remove(s.aboutPath(id)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("media: drop the description of %s: %w", id, err)
+	}
 	return nil
 }
 
