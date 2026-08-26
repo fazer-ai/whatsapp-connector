@@ -8,20 +8,22 @@ through [whatsmeow](https://github.com/tulir/whatsmeow), and exchanges canonical
 events and commands with its clients over Redis Streams.
 
 > [!IMPORTANT]
-> **Status: M2, inbound text.** A session pairs with a real WhatsApp account, resumes
-> across restarts, and now publishes the text messages that arrive on it, quotes and
-> mentions included. `groups` on the connect decides whether group chats come with
-> them. Everything else is still M2's to finish: media, location and
-> contacts inbound, and every outbound command, which is refused rather than
-> acknowledged. What this build cannot render is left unacknowledged on WhatsApp's
-> side, with its plaintext buffered so the redelivery can still be read: the account
-> keeps the message and delivers it again once there is somewhere to put it. A number
-> paired on this build therefore still accumulates a backlog of everything that is not
-> text (see [Roadmap](#roadmap)).
+> **Status: M2, text both ways.** A session pairs with a real WhatsApp account, resumes
+> across restarts, publishes the text messages that arrive on it, and sends text back:
+> quotes, mentions and the chat's disappearing-message timer included. `groups` on the
+> connect decides whether group chats come with them. Everything else is still M2's to
+> finish: media, location and contacts, in either direction, and the commands that act
+> on a message that already exists. What this build cannot render is left
+> unacknowledged on WhatsApp's side, with its plaintext buffered so the redelivery can
+> still be read: the account keeps the message and delivers it again once there is
+> somewhere to put it. A number paired on this build therefore still accumulates a
+> backlog of everything that is not text (see [Roadmap](#roadmap)).
 >
 > A message is acknowledged to WhatsApp only after its event reaches the stream, so
 > losing Redis costs a redelivery and never a message. The client deduplicates on the
-> message id, which is what makes that trade safe.
+> message id, which is what makes that trade safe. A send works the same way from the
+> other side: the caller names the message, so a command redelivered after a lost
+> acknowledgement goes out under the same id and the recipient sees one message.
 
 ## Why a separate service
 
@@ -169,7 +171,7 @@ restart, and reports itself healthy while doing it.
 |---|---|
 | **M0** ✅ | Skeleton, Redis Streams transport, lease/ownership port, fake engine, health and metrics, Docker image, publish pipeline |
 | **M1** ✅ | whatsmeow engine: QR and code pairing, session state, logout/ban/outdated handling, the device store. Reconnect backoff and the store-level fence are still open |
-| **M2** 🚧 | Messages in and out (text, media, location, contact, reaction, edit, revoke, quoted, mentions), receipts, read marks, chat presence, idempotent sends. Inbound text is in |
+| **M2** 🚧 | Messages in and out (text, media, location, contact, reaction, edit, revoke, quoted, mentions), receipts, read marks, chat presence, idempotent sends. Text is in, both ways |
 | **M3** | Groups, presence, contacts, calls |
 | **M4** | Multi-instance under load, quarantine, metrics/lag/DLQ, operations docs |
 | **M5** | Pairing code, passkey relay, per-session proxy, account limits |
