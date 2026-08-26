@@ -193,8 +193,17 @@ func (s *Session) Done() <-chan struct{} { return s.done }
 func (s *Session) pump(ctx context.Context) {
 	events := s.engine.Events()
 	for {
+		if ctx.Err() != nil {
+			// Checked ahead of the select rather than inside it, because a select whose
+			// cases are both ready picks at random: a pump that is being stopped would
+			// publish an event under an epoch it is giving up, or not, depending on the
+			// scheduler. Stopping means stopping.
+			s.abandonPending(events)
+			return
+		}
 		select {
 		case <-ctx.Done():
+			s.abandonPending(events)
 			return
 		case emission, ok := <-events:
 			if !ok {
@@ -234,6 +243,28 @@ func (s *Session) publish(ctx context.Context, emission engine.Emission) {
 	}
 	settle(emission, err)
 }
+
+// abandonPending settles what the engine has already handed over and this pump is no
+// longer going to publish. An engine waiting on a callback that never comes is one
+// holding WhatsApp's acknowledgement for a message this instance is done with, and it
+// would hold it until its own bound ran out rather than letting the account be
+// redelivered to whoever takes the session next.
+func (s *Session) abandonPending(events <-chan engine.Emission) {
+	for {
+		select {
+		case emission, ok := <-events:
+			if !ok {
+				return
+			}
+			settle(emission, errStopped)
+		default:
+			return
+		}
+	}
+}
+
+// errStopped is what an emission this pump stopped before publishing settles with.
+var errStopped = errors.New("session: the pump stopped before the event was published")
 
 // errLostOwnership is what an emission dropped for a session this instance no longer
 // owns settles with. The engine waiting on it has to hear something: an inbound

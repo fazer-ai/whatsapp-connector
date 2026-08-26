@@ -33,6 +33,8 @@ type recorder struct {
 	// refuse is what Publish answers with, for the tests that need a stream nothing
 	// reaches. A Redis that is down is not a case a fake can be talked into otherwise.
 	refuse error
+	// gate holds a publish open, for the tests that need the pump busy.
+	gate chan struct{}
 }
 
 func newRecorder() *recorder {
@@ -41,12 +43,30 @@ func newRecorder() *recorder {
 
 func (r *recorder) Publish(_ context.Context, event *protocol.Event) error {
 	r.mu.Lock()
+	gate := r.gate
+	r.gate = nil
+	r.mu.Unlock()
+	if gate != nil {
+		<-gate
+	}
+
+	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.refuse != nil {
 		return r.refuse
 	}
 	r.events = append(r.events, *event)
 	return nil
+}
+
+// hold makes the next publish block until the returned func is called, which is the
+// only way to catch the pump mid-publish with something else already queued behind it.
+func (r *recorder) hold() func() {
+	gate := make(chan struct{})
+	r.mu.Lock()
+	r.gate = gate
+	r.mu.Unlock()
+	return func() { close(gate) }
 }
 
 func (r *recorder) failWith(err error) {
@@ -1363,5 +1383,71 @@ func TestAnEventDroppedForALeaseThatMovedIsSettledAsAFailure(t *testing.T) {
 	}
 	if got := len(rec.published()); got != 0 {
 		t.Fatalf("the stream holds %d events written under a lease that moved", got)
+	}
+}
+
+// The publisher owes a callback for every emission it takes, the ones it drops
+// included. A pump that stops with a durable emission already handed to it and answers
+// nothing leaves the engine holding WhatsApp's acknowledgement for a message this
+// instance is done with, until its own bound runs out, instead of letting the account
+// be redelivered to whoever takes the session next.
+func TestAnEventAPumpStoppedBeforePublishingIsStillSettled(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	ctx := context.Background()
+	if _, err := h.manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, ok := h.engine.Session("s1")
+	if !ok {
+		t.Fatal("the engine has no session after Adopt")
+	}
+
+	// Connected first, so the fake reports the close below by going back down. Adopt on
+	// its own opens a session without dialling anything.
+	if err := engineSession.Connect(ctx, engine.ConnectRequest{Pairing: "resume"}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	waitFor(t, "the session to report itself open", func() bool { return len(h.recorder.published()) == 1 })
+
+	// The first emission holds the pump inside Publish; the second queues up behind it
+	// and is what the shutdown finds still in hand.
+	release := h.recorder.hold()
+	first := make(chan error, 1)
+	engineSession.EmitDurable(protocol.EventMessageReceived, map[string]any{"message": "one"},
+		func(err error) { first <- err })
+	waitFor(t, "the pump to be busy publishing", func() bool {
+		h.recorder.mu.Lock()
+		defer h.recorder.mu.Unlock()
+		return h.recorder.gate == nil
+	})
+
+	second := make(chan error, 1)
+	engineSession.EmitDurable(protocol.EventMessageReceived, map[string]any{"message": "two"},
+		func(err error) { second <- err })
+
+	stopped := make(chan struct{})
+	go func() {
+		h.manager.StopAll(context.Background())
+		close(stopped)
+	}()
+	// Stop cancels the pump and closes the engine session before it waits for the
+	// goroutines, and the fake reports the close by going disconnected. Waiting for it
+	// is what puts the release below after the cancel rather than racing it.
+	waitFor(t, "the session to be stopped", func() bool { return !engineSession.Connected() })
+	release()
+
+	select {
+	case err := <-second:
+		if err == nil {
+			t.Fatal("an event a stopped pump never published settled as published")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("an event a stopped pump never published was never settled")
+	}
+	<-stopped
+	if err := <-first; err != nil {
+		t.Fatalf("the event the pump was publishing when it was stopped settled as %v", err)
 	}
 }

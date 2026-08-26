@@ -247,14 +247,22 @@ func (s *Session) deliver(eventType protocol.EventType, payload any) bool {
 		Payload: body,
 		Settle:  func(err error) { settled <- err },
 	}
+	// Started before the emission is queued, not after: the inbox is bounded, and a
+	// pump stalled behind a publisher that answers neither way fills it. Timing only
+	// the publish would leave the handler waiting here with nothing to release it,
+	// which is the state the bound exists to keep whatsmeow out of.
+	timeout := time.NewTimer(s.deliverWait)
+	defer timeout.Stop()
 	select {
 	case s.inbox <- emission:
+	case <-timeout.C:
+		s.log.Warn().Str("type", string(eventType)).Dur("waited", s.deliverWait).
+			Msg("withholding an acknowledgement for an event that could not be queued")
+		return false
 	case <-s.done:
 		return false
 	}
 
-	timeout := time.NewTimer(s.deliverWait)
-	defer timeout.Stop()
 	select {
 	case err := <-settled:
 		if err != nil {

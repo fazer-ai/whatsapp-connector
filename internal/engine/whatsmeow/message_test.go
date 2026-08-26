@@ -588,3 +588,54 @@ func TestAStatusPostStaysOnTheStatusFeed(t *testing.T) {
 		t.Fatalf("a status post is addressed to %+v, want the status feed", message.Chat)
 	}
 }
+
+// The bound has to cover the queueing, not just the publish. The inbox is finite, and
+// a pump stalled behind a publisher that answers neither way fills it; a handler that
+// waits there has nothing to release it, which is the state whatsmeow answers by
+// starting the next node alongside it and losing the session's ordering.
+func TestAMessageThatCannotEvenBeQueuedIsLeftUnacknowledgedWithinTheBound(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.deliverWait = 50 * time.Millisecond
+
+	filler := engine.Emission{
+		Type: protocol.EventChatPresence, Payload: json.RawMessage(`{"state":"composing"}`),
+	}
+	// Nobody reads Events here, so the forwarder takes one emission and blocks handing
+	// it over. Waiting for it to do that before filling the rest is what makes the
+	// inbox stay full: filling first races the forwarder for the slot it frees, and a
+	// queue with one slot left is a queue that accepts the message.
+	session.inbox <- filler
+	waitUntil(t, "the forwarder to be holding an emission", func() bool { return len(session.inbox) == 0 })
+	for range cap(session.inbox) {
+		session.inbox <- filler
+	}
+
+	acknowledged := make(chan bool, 1)
+	go func() { acknowledged <- session.receive(textMessage("3EB0FULL", "bom dia")) }()
+
+	select {
+	case got := <-acknowledged:
+		if got {
+			t.Fatal("a message that never even reached the pump was acknowledged to WhatsApp")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the handler is still waiting on an inbox nothing is going to drain")
+	}
+}
+
+// waitUntil polls a condition rather than sleeping for one, so a machine that is slow
+// today does not turn into a failure and a fast one does not turn into a fixed cost.
+func waitUntil(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}

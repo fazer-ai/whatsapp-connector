@@ -29,6 +29,11 @@ type Emission struct {
 	// acknowledgement back until the event is durable, which is the whole difference
 	// between losing Redis costing a redelivery and losing Redis costing a message.
 	// An emission that leaves it nil is published like any other and nobody waits.
+	//
+	// The publisher owes the callback for every emission it takes, including the ones
+	// it drops. What it cannot answer for is an emission the engine hands over after
+	// nobody is reading any more, so an engine that waits on this must have a way out
+	// of its own when its session ends.
 	Settle func(error)
 }
 
