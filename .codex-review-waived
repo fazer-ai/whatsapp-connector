@@ -112,3 +112,13 @@ internal/engine/whatsmeow/media.go: Keep media references usable across redelive
 # to answer is unbounded and it may never answer. `message.download_media` is where the
 # caller asked, is waiting, and brought a deadline, which is what #18 describes.
 internal/engine/whatsmeow/media.go: Retry 404 and 410 media through the phone  # PR#16
+# PR#16: real, correctly described, and it is M2.2c rather than a hole in M2.2b. Filed as
+# #19 with the window that makes it matter named: a deploy landing in the seconds between
+# publishing the event and the client fetching the blob leaves a URL for an instance that
+# is gone, the refresh answers `unsupported`, and Chatwoot flags the message for good. The
+# fix is not a guard here — the connector cannot rebuild a blob from the ref, because
+# re-downloading needs the directPath, mediaKey and hashes off the original proto and
+# nothing keeps a message once its event is out. So it is a table in internal/store, a
+# command handler, and a retention policy: the slice #19 describes, which #18 also wants.
+# Folding it in here would double a PR whose subject is the inbound half.
+internal/engine/whatsmeow/media.go: Implement stale blob refresh before issuing local refs  # PR#16

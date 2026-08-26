@@ -18,7 +18,10 @@ events and commands with its clients over Redis Streams.
 > attachment is unavailable rather than loading forever. A file sent to be seen once is
 > announced the same way and never kept: a blob is served for as long as anybody keeps
 > asking for it, so storing one would turn something the sender expected to disappear
-> into something the account holds indefinitely. Everything else is still M2's
+> into something the account holds indefinitely. A blob lives on the instance that
+> downloaded it and for a bounded time, and the command that rebuilds one that is gone
+> (`message.download_media`) is M2.2c: until it lands, an attachment does not survive the
+> instance being replaced between the event and the client's fetch (#19). Everything else is still M2's
 > to finish: media outbound, location and contacts either way, and the commands that act
 > on a message that already exists. What this build cannot render is left
 > unacknowledged on WhatsApp's side, with its plaintext buffered so the redelivery can
