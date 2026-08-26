@@ -70,7 +70,11 @@ type Blob struct {
 	Filename string `json:"filename,omitempty"`
 	Size     int64  `json:"size"`
 	SHA256   string `json:"sha256,omitempty"`
-	StoredAt int64  `json:"stored_at"`
+	// StoredAt is when this blob's clock started, in epoch milliseconds. It is the
+	// moment the write was committed and not the moment it began: the age the sweep
+	// reads is stamped at the end of Put, so a caller publishing an expiry from the
+	// start would take a long download off the life of what it stored.
+	StoredAt int64 `json:"stored_at"`
 }
 
 // Options configures the store. The zero value asks for the defaults above.
@@ -193,7 +197,6 @@ func (s *Store) Put(ctx context.Context, source io.Reader, about *Blob) (Blob, e
 	}
 	stored := *about
 	stored.ID = id
-	stored.StoredAt = s.opts.Now().UnixMilli()
 
 	s.writingMu.Lock()
 	s.writing[id] = struct{}{}
@@ -250,27 +253,39 @@ func (s *Store) Put(ctx context.Context, source io.Reader, about *Blob) (Blob, e
 		return Blob{}, fmt.Errorf("media: finish %s: %w", id, err)
 	}
 
+	// Read once and used for both, so the description says the same thing about this
+	// blob's age as the stamp the sweep reads. A caller publishing an expiry from the
+	// description is otherwise told a blob dies sooner than the store will drop it, by
+	// however long the download took, and a client seeing a lapsed reference goes and
+	// asks for the whole file again.
+	now := s.opts.Now()
 	stored.Size = written
 	stored.SHA256 = hex.EncodeToString(digest.Sum(nil))
+	stored.StoredAt = now.UnixMilli()
 	if err := s.writeAbout(id, &stored); err != nil {
 		return Blob{}, err
+	}
+	// Stamped rather than left with the time the temporary file picked up when the first
+	// byte landed: the age is how long since anybody wanted this, and a download that
+	// took longer than the TTL would otherwise arrive already expired.
+	//
+	// Stamped before it is named, and not after. A stamp that lands after the rename
+	// leaves a window in which the canonical file carries the temporary file's time,
+	// which for a slow download is old enough to evict, and a sweep landing in that
+	// window deletes a blob the caller is about to be handed. Renaming does not touch
+	// the file's own time, so stamping first and naming second closes the window rather
+	// than racing inside it: a file is never both canonical and unstamped.
+	//
+	// A stamp that will not go on is a failed commit, not a detail: the blob would be
+	// served under a time the next sweep reads as expired. Given up on instead, so what
+	// the caller gets is an error it can retry.
+	if err := s.root.Chtimes(tempName, now, now); err != nil {
+		_ = s.root.Remove(s.aboutPath(id))
+		return Blob{}, fmt.Errorf("media: stamp %s: %w", id, err)
 	}
 	if err := s.root.Rename(tempName, path); err != nil {
 		_ = s.root.Remove(s.aboutPath(id))
 		return Blob{}, fmt.Errorf("media: name %s: %w", id, err)
-	}
-	// Stamped now rather than left with the time the temporary file picked up when the
-	// first byte landed. The age is how long since anybody wanted this, and a download
-	// that took longer than the TTL would otherwise arrive already expired.
-	//
-	// A stamp that will not go on is a failed commit, not a detail: the blob would be
-	// published under an id the next sweep deletes, and the caller would hand a client
-	// a reference to bytes that are already on their way out. Taken back instead, so
-	// what the caller gets is an error it can retry.
-	now := s.opts.Now()
-	if err := s.root.Chtimes(path, now, now); err != nil {
-		_, _ = s.drop(id)
-		return Blob{}, fmt.Errorf("media: stamp %s: %w", id, err)
 	}
 	return stored, nil
 }

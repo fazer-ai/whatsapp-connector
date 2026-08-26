@@ -3,6 +3,7 @@ package whatsmeow
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -27,6 +28,13 @@ import (
 // storedAt is the clock the blob store keeps for these tests, so an expiry can be
 // asserted against a number rather than against whatever the wall clock said.
 var storedAt = time.UnixMilli(1755000000000)
+
+// The metadata whatsmeow insists on before it will go and look: a direct path that is a
+// path, and a ciphertext digest of the right length. A test about what happens to the
+// file carries it, so what it exercises is the download and not the check in front of it.
+const directPath = "/v/t62.7118-24/file"
+
+func encSHA256() []byte { return make([]byte, sha256.Size) }
 
 func TestEachMediaKindIsRenderedTheWayTheContractCarriesIt(t *testing.T) {
 	t.Parallel()
@@ -227,6 +235,7 @@ func TestAMediaMessageIsPublishedWithTheBlobItWasStoredIn(t *testing.T) {
 	event := mediaEvent("3EB0IMAGE", &waE2E.Message{ImageMessage: &waE2E.ImageMessage{
 		Mimetype: proto.String("image/jpeg"), Caption: proto.String("olha isso"),
 		FileLength: proto.Uint64(999999),
+		DirectPath: proto.String(directPath), MediaKey: []byte("key"), FileEncSHA256: encSHA256(),
 	}})
 
 	emissions, acknowledged := deliver(t, session, event, 1)
@@ -285,6 +294,7 @@ func TestAMediaMessageCarriesTheQuoteTheMentionsAndTheTimerItCameWith(t *testing
 
 	event := mediaEvent("3EB0DOC", &waE2E.Message{DocumentMessage: &waE2E.DocumentMessage{
 		Mimetype: proto.String("application/pdf"), FileName: proto.String("contrato.pdf"),
+		DirectPath: proto.String(directPath), MediaKey: []byte("key"), FileEncSHA256: encSHA256(),
 		ContextInfo: &waE2E.ContextInfo{
 			StanzaID: proto.String("3EB0ABCDEF"), Expiration: proto.Uint32(604800),
 			MentionedJID: []string{"5511999990001@" + waTypes.DefaultUserServer},
@@ -321,6 +331,7 @@ func TestAFileThatIsNotComingIsAnnouncedAfterTheMessageItBelongsTo(t *testing.T)
 
 	event := mediaEvent("3EB0GONE", &waE2E.Message{ImageMessage: &waE2E.ImageMessage{
 		Mimetype: proto.String("image/jpeg"), Caption: proto.String("olha isso"),
+		DirectPath: proto.String(directPath), MediaKey: []byte("key"), FileEncSHA256: encSHA256(),
 	}})
 
 	emissions, acknowledged := deliver(t, session, event, 2)
@@ -437,8 +448,10 @@ func TestAFileTheSenderSaysIsTooBigIsRefusedBeforeItIsDownloaded(t *testing.T) {
 	session, downloads := mediaSession(t, media.Options{MaxBlob: 1024, Quota: 1 << 20})
 	downloads.answer([]byte("nunca pedido"), nil)
 
+	// Well formed, so what refuses it is the size and not the check in front of it.
 	event := mediaEvent("3EB0HUGE", &waE2E.Message{VideoMessage: &waE2E.VideoMessage{
 		Mimetype: proto.String("video/mp4"), FileLength: proto.Uint64(1 << 30),
+		DirectPath: proto.String(directPath), MediaKey: []byte("key"), FileEncSHA256: encSHA256(),
 	}})
 
 	emissions, acknowledged := deliver(t, session, event, 2)
@@ -461,6 +474,7 @@ func TestAFileThatRunsPastTheCapOnTheWayInIsRefusedByTheStore(t *testing.T) {
 
 	event := mediaEvent("3EB0LIED", &waE2E.Message{ImageMessage: &waE2E.ImageMessage{
 		Mimetype: proto.String("image/jpeg"), FileLength: proto.Uint64(4),
+		DirectPath: proto.String(directPath), MediaKey: []byte("key"), FileEncSHA256: encSHA256(),
 	}})
 
 	emissions, acknowledged := deliver(t, session, event, 2)
@@ -541,7 +555,7 @@ func TestMetadataThatCanNeverDescribeAFileIsGivenUpOnRatherThanRetriedForever(t 
 		{
 			name: "a ciphertext digest that is not a SHA-256",
 			image: &waE2E.ImageMessage{
-				Mimetype: proto.String("image/jpeg"), DirectPath: proto.String("/v/t62.7118-24/file"),
+				Mimetype: proto.String("image/jpeg"), DirectPath: proto.String(directPath),
 				MediaKey: []byte("key"), FileEncSHA256: []byte("too short"),
 			},
 			want: reasonCorrupt,
@@ -575,8 +589,8 @@ func TestWellFormedMetadataIsStillDownloaded(t *testing.T) {
 	downloads.answer([]byte("guardado"), nil)
 
 	event := mediaEvent("3EB0OK", &waE2E.Message{ImageMessage: &waE2E.ImageMessage{
-		Mimetype: proto.String("image/jpeg"), DirectPath: proto.String("/v/t62.7118-24/file"),
-		MediaKey: []byte("key"), FileEncSHA256: make([]byte, 32),
+		Mimetype: proto.String("image/jpeg"), DirectPath: proto.String(directPath),
+		MediaKey: []byte("key"), FileEncSHA256: encSHA256(),
 	}})
 
 	emissions, acknowledged := deliver(t, session, event, 1)
@@ -678,6 +692,7 @@ func TestAnOrdinaryFileIsStillKeptWhenTheViewOnceFlagIsAbsent(t *testing.T) {
 
 	event := mediaEvent("3EB0KEPT", &waE2E.Message{ImageMessage: &waE2E.ImageMessage{
 		Mimetype: proto.String("image/jpeg"), ViewOnce: proto.Bool(false),
+		DirectPath: proto.String(directPath), MediaKey: []byte("key"), FileEncSHA256: encSHA256(),
 	}})
 
 	emissions, acknowledged := deliver(t, session, event, 1)
@@ -717,9 +732,10 @@ func TestAMessageThisBuildRefusesIsNeverDownloadedFirst(t *testing.T) {
 	}
 }
 
-// The reference is a path with no host without it, and a client reading one has no way
-// to tell it from a URL it simply cannot reach.
-func TestAnEngineGivenABlobStoreAndNoAddressIsRefused(t *testing.T) {
+// A reference is published after the message it belongs to has been acknowledged, so an
+// address a client cannot fetch from costs the file rather than an error somebody sees.
+// It is checked once, where an operator finds out from a container that will not start.
+func TestAnEngineIsRefusedWhenBlobsCouldNotBeFetchedFromWhereItWouldPublishThem(t *testing.T) {
 	t.Parallel()
 
 	container := openStore(t)
@@ -729,8 +745,63 @@ func TestAnEngineGivenABlobStoreAndNoAddressIsRefused(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = blobs.Close() })
 
-	if _, err := New(container, Options{Media: MediaOptions{Blobs: blobs}}, zerolog.Nop()); err == nil {
-		t.Fatal("an engine that would publish a reference with no host was built anyway")
+	for _, tc := range []struct {
+		name string
+		base string
+	}{
+		{"nothing at all", ""},
+		// The ordinary way to get this wrong. url.Parse reads it as the scheme
+		// `connector` with an opaque body rather than refusing it, so nothing downstream
+		// would notice.
+		{"the scheme left off", "connector:8080"},
+		{"a scheme nothing fetches over", "redis://connector:8080"},
+		{"no host to reach", "http:///media"},
+		// The id is appended as a path segment, so anything after it would end up in
+		// front of the query rather than behind it.
+		{"a query the id would be appended in front of", "http://connector:8080/?token=x"},
+		{"a fragment", "http://connector:8080/#here"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			opts := Options{Media: MediaOptions{Blobs: blobs, BaseURL: tc.base}}
+			if _, err := New(container, opts, zerolog.Nop()); err == nil {
+				t.Fatalf("an engine publishing blobs under %q was built anyway", tc.base)
+			}
+		})
+	}
+}
+
+// And the addresses a deployment really uses are taken, including one advertised under a
+// path of its own, which is how an instance sits behind somebody else's host.
+func TestAnEngineTakesTheAddressesBlobsCanBeFetchedFrom(t *testing.T) {
+	t.Parallel()
+
+	container := openStore(t)
+	blobs, err := media.New(media.Options{Root: t.TempDir()})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = blobs.Close() })
+
+	for _, base := range []string{
+		"http://connector-a1b2c3:8080",
+		"https://connector.internal",
+		"http://gateway.internal/connector-a1b2c3",
+		"http://connector-a1b2c3:8080/",
+	} {
+		t.Run(base, func(t *testing.T) {
+			t.Parallel()
+
+			opts := Options{Media: MediaOptions{Blobs: blobs, BaseURL: base}}
+			waEngine, err := New(container, opts, zerolog.Nop())
+			if err != nil {
+				t.Fatalf("an address a client can fetch from was refused: %v", err)
+			}
+			if err := waEngine.Close(); err != nil {
+				t.Fatalf("Close: %v", err)
+			}
+		})
 	}
 }
 
@@ -799,7 +870,8 @@ func (f failingBlobs) TTL() time.Duration { return media.DefaultTTL }
 // happens to the file rather than about how the message is rendered.
 func imageEvent(id string) *waEvents.Message {
 	return mediaEvent(id, &waE2E.Message{ImageMessage: &waE2E.ImageMessage{
-		Mimetype: proto.String("image/jpeg"),
+		Mimetype:   proto.String("image/jpeg"),
+		DirectPath: proto.String(directPath), MediaKey: []byte("key"), FileEncSHA256: encSHA256(),
 	}})
 }
 

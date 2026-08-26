@@ -900,68 +900,46 @@ func TestBytesThatWentAreNotStillChargedForWhenTheDescriptionStays(t *testing.T)
 	}
 }
 
-// A Put that has renamed its bytes into place and not yet stamped them leaves the
-// canonical file there with the temporary file's time on it, which is old enough to
-// evict. A sweep landing there deletes a blob the caller is about to be handed.
-func TestABlobIsNotEvictedBetweenItsRenameAndItsStamp(t *testing.T) {
+// A file is never both canonical and unstamped. Until it is stamped it carries whatever
+// time the temporary file had, which for a slow download is old enough to evict, so a
+// stamp landing after the rename leaves a window in which a sweep deletes a blob the
+// caller is about to be handed. Stamping before the rename closes it: what appears under
+// the canonical name is already carrying the store's own clock.
+func TestABlobIsStampedBeforeItIsNamed(t *testing.T) {
 	t.Parallel()
 
-	var (
-		now   = time.Now()
-		store *media.Store
-		root  string
-		reads int
-		swept bool
-	)
-	// The clock is the seam again: Put reads it once for the description and once more
-	// to stamp the blob after the rename, so the second read is the window between the
-	// two — which is where a sweep on its own goroutine lands in production. The file is
-	// back-dated there as well, because until the stamp it carries whatever time the
-	// temporary file had, and a slow download's is old.
-	clock := func() time.Time {
-		reads++
-		if reads == 2 && !swept {
-			swept = true
-			backdate(t, root, now.Add(-time.Hour))
-			if _, _, err := store.Sweep(context.WithoutCancel(t.Context())); err != nil {
-				t.Errorf("the sweep in the window failed: %v", err)
-			}
-		}
-		return now
-	}
-	built, dir := newStore(t, media.Options{TTL: time.Minute, Now: clock})
-	store, root = built, dir
+	// Nowhere near the wall clock, so a file left with the time its bytes were written
+	// cannot pass for one the store stamped.
+	committed := time.Unix(1_700_000_000, 0)
+	store, root := newStore(t, media.Options{Now: func() time.Time { return committed }})
 
 	stored, err := store.Put(t.Context(), strings.NewReader("arriving"), &media.Blob{})
 	if err != nil {
 		t.Fatalf("Put: %v", err)
 	}
-	if !swept {
-		t.Fatal("no sweep ran in the window, so the test proves nothing")
+
+	about, err := os.Stat(filepath.Join(root, stored.ID[5:7], stored.ID))
+	if err != nil {
+		t.Fatalf("stat the blob: %v", err)
 	}
-	if _, _, err := store.Open(stored.ID); err != nil {
-		t.Fatalf("a blob was evicted between its rename and its stamp: %v", err)
+	if !about.ModTime().Equal(committed) {
+		t.Fatalf("the named blob carries %s, want the store's own clock %s", about.ModTime(), committed)
+	}
+	// And the description agrees with it, because a caller publishing an expiry reads
+	// the description and a sweep reads the file.
+	if stored.StoredAt != committed.UnixMilli() {
+		t.Fatalf("the description says the blob was stored at %d and the file says %d",
+			stored.StoredAt, committed.UnixMilli())
 	}
 }
 
-// backdate puts an old time on every blob under root, which is what a file renamed out
-// of a slow download carries until it is stamped.
-func backdate(t *testing.T, root string, when time.Time) {
-	t.Helper()
-	_ = filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
-		if err != nil || entry.IsDir() || !strings.HasPrefix(entry.Name(), "blob_") {
-			return nil //nolint:nilerr // best effort in a test helper
-		}
-		_ = os.Chtimes(path, when, when)
-		return nil
-	})
-}
-
-// A stamp that will not go on is a failed commit, not a detail. The blob would be
-// published under an id carrying the temporary file's old time, which the next sweep
-// deletes, so the caller would hand a client a reference to bytes already on their way
-// out.
-func TestAStampThatWillNotGoOnFailsTheWrite(t *testing.T) {
+// A write that cannot be committed hands back nothing and leaves nothing behind.
+//
+// The description is written before the bytes are stamped and named, so a failure past
+// that point has already put a file on disk. Left there it is an orphan: disk the
+// accounting counts against the quota with no blob under it, which is how a cache sits
+// over its limit with nothing to show for it.
+func TestAWriteThatCannotBeCommittedLeavesNoDescriptionBehind(t *testing.T) {
 	t.Parallel()
 
 	var (
@@ -969,13 +947,13 @@ func TestAStampThatWillNotGoOnFailsTheWrite(t *testing.T) {
 		root  string
 		reads int
 	)
-	// Put reads the clock once for the description and once more to stamp the blob after
-	// the rename, so the second read is the moment before the stamp. The file is taken
-	// away there, which is what the stamp then fails on.
+	// Put reads the clock once, after the bytes are all in and before it describes,
+	// stamps and names them. The arriving file is taken away there, which is what the
+	// commit then fails on.
 	clock := func() time.Time {
 		reads++
-		if reads == 2 {
-			removeBlobs(t, root)
+		if reads == 1 {
+			removeArriving(t, root)
 		}
 		return now
 	}
@@ -984,18 +962,38 @@ func TestAStampThatWillNotGoOnFailsTheWrite(t *testing.T) {
 
 	stored, err := store.Put(t.Context(), strings.NewReader("arriving"), &media.Blob{})
 	if err == nil {
-		t.Fatalf("a blob that could not be stamped was published as %s", stored.ID)
+		t.Fatalf("a blob that could not be committed was published as %s", stored.ID)
 	}
 	if stored.ID != "" {
 		t.Fatalf("a failed write handed back an id: %+v", stored)
 	}
+	if left := descriptions(t, root); len(left) != 0 {
+		t.Fatalf("a failed write left %v behind, which the quota goes on counting", left)
+	}
 }
 
-// removeBlobs takes every blob under root away, which is what the stamp above fails on.
-func removeBlobs(t *testing.T, root string) {
+// descriptions is every blob description under root, which after a failed write should
+// be none.
+func descriptions(t *testing.T, root string) []string {
+	t.Helper()
+
+	var found []string
+	_ = filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil || entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			return nil //nolint:nilerr // best effort in a test helper
+		}
+		found = append(found, path)
+		return nil
+	})
+	return found
+}
+
+// removeArriving takes away every blob whose bytes are still arriving, which is what the
+// stamp above fails on.
+func removeArriving(t *testing.T, root string) {
 	t.Helper()
 	_ = filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
-		if err != nil || entry.IsDir() || !strings.HasPrefix(entry.Name(), "blob_") {
+		if err != nil || entry.IsDir() || !strings.HasPrefix(entry.Name(), ".blob_") {
 			return nil //nolint:nilerr // best effort in a test helper
 		}
 		_ = os.Remove(path)

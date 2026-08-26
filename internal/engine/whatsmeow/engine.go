@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"sync"
 
 	"github.com/rs/zerolog"
@@ -60,8 +61,10 @@ type Engine struct {
 //
 //nolint:gocritic // zerolog.Logger is designed to be copied; every With() returns one by value
 func New(container *store.Container, opts Options, log zerolog.Logger) (*Engine, error) {
-	if opts.Media.Blobs != nil && opts.Media.BaseURL == "" {
-		return nil, errors.New("whatsmeow: a blob store needs the address this instance is reached at")
+	if opts.Media.Blobs != nil {
+		if err := reachableAt(opts.Media.BaseURL); err != nil {
+			return nil, err
+		}
 	}
 	if deviceName := opts.DeviceName; deviceName != "" {
 		// Written exactly once, because it is written to a package-level value whatsmeow
@@ -76,6 +79,39 @@ func New(container *store.Container, opts Options, log zerolog.Logger) (*Engine,
 		log:      log,
 		sessions: make(map[string]*Session),
 	}, nil
+}
+
+// reachableAt reports whether blobs published under this address could be fetched.
+//
+// It is checked once, at startup, rather than found out per message: a reference is
+// published after the message it belongs to has been acknowledged, so an address a
+// client cannot fetch from costs the file rather than an error somebody sees. An
+// operator who left the scheme off, which is the ordinary way to get this wrong, is told
+// so by a container that will not start.
+func reachableAt(base string) error {
+	if base == "" {
+		return errors.New("whatsmeow: a blob store needs the address this instance is reached at")
+	}
+	address, err := url.Parse(base)
+	if err != nil {
+		return fmt.Errorf("whatsmeow: %q is not an address blobs can be published under: %w", base, err)
+	}
+	if address.Scheme != "http" && address.Scheme != "https" {
+		// Covers the bare `host:port`, which url.Parse reads as the scheme `host` with
+		// an opaque body rather than refusing.
+		return fmt.Errorf(
+			"whatsmeow: blobs are published under %q, and a client fetches them over http or https", base)
+	}
+	if address.Host == "" {
+		return fmt.Errorf("whatsmeow: blobs are published under %q, which names no host", base)
+	}
+	if address.RawQuery != "" || address.Fragment != "" {
+		// The id is appended as a path segment, so anything after it would end up in
+		// front of the query rather than behind it.
+		return fmt.Errorf(
+			"whatsmeow: blobs are published under %q, and a blob's id is appended to it as a path", base)
+	}
+	return nil
 }
 
 // Open prepares a session with the device it paired, or a fresh one when it has not
