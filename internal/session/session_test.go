@@ -1451,3 +1451,68 @@ func TestAnEventAPumpStoppedBeforePublishingIsStillSettled(t *testing.T) {
 		t.Fatalf("the event the pump was publishing when it was stopped settled as %v", err)
 	}
 }
+
+// Two instances, which is where the dangerous bugs live. A lease can run out while a
+// write is in flight, and the peer that takes the session publishes under a higher
+// epoch immediately: the event lands behind one the client has already seen from a
+// newer owner, and the contract lets a client drop what comes from a stale owner. A
+// successful write is therefore not proof the client has it, so an engine holding
+// WhatsApp's acknowledgement on that answer would spend the redelivery that was the
+// only way to get the message back.
+func TestAnEventPublishedUnderALeaseThatMovedMidWriteIsSettledAsAFailure(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+
+	clock := &steppingClock{now: time.Now()}
+	leases := cluster.NewLeases(client, "inst-a", cluster.Options{Clock: clock})
+	fakeEngine := fake.New()
+	rec := newRecorder()
+	manager := session.NewManager(&session.ManagerConfig{
+		Instance: "inst-a", Engine: fakeEngine, Leases: leases, Publisher: rec, Replier: rec,
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	t.Cleanup(func() { manager.StopAll(context.Background()) })
+
+	ctx := context.Background()
+	if _, err := manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, ok := fakeEngine.Session("s1")
+	if !ok {
+		t.Fatal("the engine has no session after Adopt")
+	}
+
+	release := rec.hold()
+	settled := make(chan error, 1)
+	engineSession.EmitDurable(protocol.EventMessageReceived, map[string]any{"message": "one"},
+		func(err error) { settled <- err })
+	waitFor(t, "the pump to be busy publishing", func() bool {
+		rec.mu.Lock()
+		defer rec.mu.Unlock()
+		return rec.gate == nil
+	})
+
+	// The write is in flight. The lease runs out and inst-b takes the session, which is
+	// exactly the window this check exists for: the ownership was there when the pump
+	// looked, and gone by the time the write landed.
+	clock.step(cluster.DefaultTTL + time.Second)
+	server.FastForward(cluster.DefaultTTL + time.Second)
+	peer := cluster.NewLeases(client, "inst-b", cluster.Options{Clock: clock})
+	if _, err := peer.Acquire(ctx, "s1"); err != nil {
+		t.Fatalf("inst-b Acquire: %v", err)
+	}
+	release()
+
+	select {
+	case err := <-settled:
+		if err == nil {
+			t.Fatal("an event written under an epoch a peer had already replaced settled as published")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("an event written under a lease that moved was never settled")
+	}
+}

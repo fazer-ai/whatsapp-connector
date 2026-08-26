@@ -241,7 +241,31 @@ func (s *Session) publish(ctx context.Context, emission engine.Emission) {
 	if err != nil && ctx.Err() == nil {
 		s.log.Error().Err(err).Str("type", string(emission.Type)).Msg("failed to publish an event")
 	}
+	if err == nil {
+		err = s.stillOwned()
+	}
 	settle(emission, err)
+}
+
+// stillOwned reports whether the epoch an event was just published under is the one
+// this instance holds, and it is checked after the publish and not only before it.
+//
+// A lease can run out while the write is in flight, and a peer that takes the session
+// publishes under a higher epoch straight away. The event then lands behind one the
+// client has already seen from a newer owner, and the contract lets a client drop what
+// comes from a stale owner: `wa:cursor:<sid>` is the last `epoch:seq` it processed. So
+// a successful write is not proof the client has it, and an engine holding WhatsApp's
+// acknowledgement on that answer would spend the redelivery that was the only way to
+// get the message back. Saying so costs a redelivery, which the client deduplicates on
+// the message id, and that is the trade this whole path is built on.
+func (s *Session) stillOwned() error {
+	lease, owned := s.leases.Owned(s.sid)
+	if owned && lease.Epoch == s.lease.Epoch {
+		return nil
+	}
+	s.log.Warn().Uint64("epoch", s.lease.Epoch).
+		Msg("published an event under an epoch this instance no longer holds")
+	return errLostOwnership
 }
 
 // abandonPending settles what the engine has already handed over and this pump is no

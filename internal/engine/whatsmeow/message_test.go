@@ -639,3 +639,38 @@ func waitUntil(t *testing.T, what string, cond func() bool) {
 	}
 	t.Fatalf("timed out waiting for %s", what)
 }
+
+// A refusal must not take effect. Everything after the validation in Connect changes
+// the session, so a connect that is going to be refused has to be refused before it
+// gets there: the caller sees a failed command, and a session that had quietly turned
+// group traffic off underneath it goes on acknowledging and dropping group messages
+// until the next connect that happens to succeed.
+func TestARefusedConnectLeavesTheGroupSubscriptionAlone(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name    string
+		request engine.ConnectRequest
+	}{
+		{"code pairing with no phone", engine.ConnectRequest{Pairing: "code"}},
+		{"a pairing mode this connector does not know", engine.ConnectRequest{Pairing: "telepathy"}},
+		{"a proxy this build cannot route through", engine.ConnectRequest{
+			Pairing: "resume", Proxy: &engine.ProxyRequest{URL: "socks5://127.0.0.1:1080"},
+		}},
+		{"a history import this build cannot do", engine.ConnectRequest{Pairing: "resume", HistorySync: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			session, _ := newTestSession(t, "5511999990001")
+			session.setGroups(true)
+
+			if err := session.Connect(t.Context(), tc.request); err == nil {
+				t.Fatal("the connect was accepted, and this case exists because it is refused")
+			}
+			if !session.wantsGroups() {
+				t.Fatal("a refused connect turned the group subscription off")
+			}
+		})
+	}
+}

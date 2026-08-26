@@ -70,8 +70,11 @@ type Leases struct {
 	margin   time.Duration
 	cooldown time.Duration
 
-	mu    sync.RWMutex
-	held  map[string]*held
+	mu sync.RWMutex
+	// held by value, not by pointer: Owned answers from local state on every write, and
+	// an entry that can escape the lock as a pointer is one a renewal can be rewriting
+	// while a caller reads it.
+	held  map[string]held
 	clock Clock
 }
 
@@ -118,7 +121,7 @@ func NewLeases(client *redisx.Client, instance string, opts Options) *Leases {
 		ttl:      opts.TTL,
 		margin:   opts.Margin,
 		cooldown: opts.Cooldown,
-		held:     make(map[string]*held),
+		held:     make(map[string]held),
 		clock:    opts.Clock,
 	}
 }
@@ -155,7 +158,7 @@ func (l *Leases) Acquire(ctx context.Context, sid string) (Lease, error) {
 	}
 
 	l.mu.Lock()
-	l.held[sid] = &held{epoch: uint64(epoch), renewedAt: l.clock.Now()} //nolint:gosec // INCR from 0 never returns a negative
+	l.held[sid] = held{epoch: uint64(epoch), renewedAt: l.clock.Now()} //nolint:gosec // INCR from 0 never returns a negative
 	l.mu.Unlock()
 
 	return Lease{SID: sid, Epoch: uint64(epoch)}, nil //nolint:gosec // same
@@ -178,6 +181,7 @@ func (l *Leases) Renew(ctx context.Context, sid string) error {
 	l.mu.Lock()
 	if entry, ok := l.held[sid]; ok {
 		entry.renewedAt = l.clock.Now()
+		l.held[sid] = entry
 	}
 	l.mu.Unlock()
 	return nil

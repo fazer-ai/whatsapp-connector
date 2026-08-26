@@ -415,10 +415,19 @@ func (s *Session) Connect(ctx context.Context, req engine.ConnectRequest) error 
 		return protocol.NewError(protocol.ErrorInvalidPayload,
 			fmt.Sprintf("%q is not a pairing mode this connector knows", req.Pairing))
 	}
+	if req.Pairing == "code" && digitsOf(req.Phone) == "" {
+		// Checked here rather than only where it is used, because everything below this
+		// point changes the session, and a refusal that has already changed it is a
+		// command that failed and took effect.
+		return protocol.NewError(protocol.ErrorInvalidPayload, "code pairing needs the phone number to pair")
+	}
 
-	// Recorded on every connect the session accepts, because the client sends it on
-	// every connect and it is a property of the subscription rather than of the device.
-	// It is read once there is traffic to leave out.
+	// Recorded once the request is one the session is going to act on, because the
+	// client sends it on every connect and it is a property of the subscription rather
+	// than of the device. A refused connect leaves the subscription alone: the caller
+	// sees a failed command, and a session that had quietly turned group traffic off
+	// underneath it would go on acknowledging and dropping group messages until the
+	// next connect that happened to succeed.
 	s.setGroups(req.Groups)
 
 	// Waited for before the guard comes down, and before anything is dialled. A

@@ -236,3 +236,38 @@ func TestReleaseArmsTheCooldown(t *testing.T) {
 		t.Fatal("release left the lease in place")
 	}
 }
+
+// Owned answers from local state on every write, and the renew loop rewrites that state
+// on its own goroutine. The two have to be safe together, and an entry that escaped the
+// lock as a pointer was not: the reader saw a renewal timestamp mid-write.
+func TestOwnedAndRenewAreSafeTogether(t *testing.T) {
+	t.Parallel()
+
+	_, leases, _ := newFleet(t, newClock())
+	ctx := context.Background()
+	if _, err := leases.Acquire(ctx, "s1"); err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for range 200 {
+			if err := leases.Renew(ctx, "s1"); err != nil {
+				t.Errorf("Renew: %v", err)
+				return
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for range 200 {
+			if _, owned := leases.Owned("s1"); !owned {
+				t.Error("a lease being renewed reported itself lost")
+				return
+			}
+		}
+	}()
+	wg.Wait()
+}
