@@ -237,11 +237,20 @@ func TestLiveSend(t *testing.T) {
 	if messageID == "" {
 		messageID = session.current().GenerateMessageID()
 	}
-	payload, err := json.Marshal(map[string]any{
+	body := map[string]any{
 		"message_id": messageID,
 		"to":         map[string]any{"kind": "phone", "id": to},
 		"content":    map[string]any{"type": "text", "body": "conector nativo, fatia de envio"},
-	})
+	}
+	if quoted := os.Getenv("WAC_LIVE_QUOTE"); quoted != "" {
+		// The half no unit test can answer: the quote goes out as a stanza id and a
+		// participant, with no copy of the message it answers, because the caller does
+		// not send one and this connector keeps no messages. Whether the recipient's
+		// client renders it from the id alone is a question for a phone.
+		body["quoted"] = map[string]any{"id": quoted, "from_me": false}
+		body["content"] = map[string]any{"type": "text", "body": "conector nativo, respondendo a mensagem acima"}
+	}
+	payload, err := json.Marshal(body)
 	if err != nil {
 		t.Fatalf("build the send: %v", err)
 	}
