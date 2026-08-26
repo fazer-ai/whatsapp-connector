@@ -25,3 +25,15 @@ internal/engine/whatsmeow/session.go: Reuse an in-flight dial for pairing retrie
 # the deletion look safe ("WhatsApp has already unlinked them") was wrong and is corrected
 # in the code comment.
 internal/store/store.go: Reject pairings that displace a live session  # PR#6
+# PR#9: raised three rounds running, and checked on a phone rather than argued about. A
+# quoted reply was sent live with only a stanza id and a participant, and the recipient's
+# client rendered the quote from its own copy of the original. The claim that WhatsApp
+# needs the message embedded in ContextInfo is wrong for the case that matters; where it
+# would bite is a device that does not have the original, and neither the caller nor this
+# connector holds one to embed: Chatwoot's `quoted` is {id, participant, from_me} and no
+# messages are kept here. Carrying content would be a contract change in two repositories
+# for a case a phone says is already working, and refusing quotes would drop the frame off
+# an agent's reply instead.
+internal/engine/whatsmeow/send.go: Populate quoted content before sending replies  # PR#9
+internal/engine/whatsmeow/send.go: Include the original payload in quoted messages  # PR#9
+internal/engine/whatsmeow/send.go: Include the original message in quote context  # PR#9

@@ -277,6 +277,10 @@ func TestWhatsAppsOwnRefusalsKeepTheirMeaning(t *testing.T) {
 		// client retries a number that can never receive anything.
 		{"a number nobody has registered", errors.New("no LID found for 5511999999999@s.whatsapp.net from server"),
 			protocol.ErrorRecipientNotOnWhatsapp},
+		// This connector's own limit, not WhatsApp's, and the two mean different things
+		// to a caller: a refusal is worth trying again and a limit never is.
+		{"a broadcast list, which the library does not send to", wm.ErrBroadcastListUnsupported,
+			protocol.ErrorUnsupported},
 		{"anything this does not name", errors.New("something new in the protocol"), protocol.ErrorWaError},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

@@ -270,6 +270,13 @@ func sendFailure(err error) error {
 		// their side puts this back to where it is without one.
 		return protocol.NewError(protocol.ErrorRecipientNotOnWhatsapp,
 			"that number is not on WhatsApp")
+	case errors.Is(err, wm.ErrBroadcastListUnsupported):
+		// The library's own limit, not WhatsApp's, and the codes mean different things
+		// to a caller: a refusal is worth trying again and a limit never is. Reported as
+		// the former, a client retries a broadcast list for as long as it keeps the
+		// message.
+		return protocol.NewError(protocol.ErrorUnsupported,
+			"this connector cannot send to a broadcast list yet")
 	case errors.Is(err, wm.ErrUnknownServer), errors.Is(err, wm.ErrRecipientADJID):
 		return protocol.NewError(protocol.ErrorInvalidPayload, "that is not an address a message can be sent to")
 	default:
