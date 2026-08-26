@@ -164,7 +164,7 @@ func (s *Store) Put(source io.Reader, about *Blob) (Blob, error) {
 	// temporary name only has to be one the sweep recognises as an unfinished write,
 	// and one it can read an id back out of so it never touches a file it did not
 	// write.
-	tempName := shardOf(id) + "/" + tempPrefix + id
+	tempName := s.tempPath(id)
 	temp, err := s.root.OpenFile(tempName, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return Blob{}, fmt.Errorf("media: open a temporary file for %s: %w", id, err)
@@ -185,10 +185,12 @@ func (s *Store) Put(source io.Reader, about *Blob) (Blob, error) {
 	// the top of the range makes that arithmetic wrap: the limit goes negative, the
 	// reader answers EOF straight away, and every file is stored empty. A source with
 	// nothing left is one that fitted exactly.
-	if more, err := source.Read(make([]byte, 1)); more > 0 {
-		return Blob{}, fmt.Errorf("%w: more than %d bytes", ErrTooLarge, s.opts.MaxBlob)
-	} else if err != nil && !errors.Is(err, io.EOF) {
-		return Blob{}, fmt.Errorf("media: store %s: %w", id, err)
+	//
+	// Asked until it answers, because a reader is allowed to return no bytes and no
+	// error, which means nothing happened rather than there is nothing left. Taking one
+	// of those for EOF renames the first MaxBlob bytes and calls it a whole file.
+	if err := s.refuseIfMore(source); err != nil {
+		return Blob{}, err
 	}
 	if err := temp.Close(); err != nil {
 		return Blob{}, fmt.Errorf("media: finish %s: %w", id, err)
@@ -204,6 +206,23 @@ func (s *Store) Put(source io.Reader, about *Blob) (Blob, error) {
 		return Blob{}, fmt.Errorf("media: name %s: %w", id, err)
 	}
 	return stored, nil
+}
+
+// refuseIfMore reports a source that still has something in it once the cap has been
+// read, and nothing for one that fitted exactly.
+func (s *Store) refuseIfMore(source io.Reader) error {
+	one := make([]byte, 1)
+	for {
+		switch read, err := source.Read(one); {
+		case read > 0:
+			return fmt.Errorf("%w: more than %d bytes", ErrTooLarge, s.opts.MaxBlob)
+		case errors.Is(err, io.EOF):
+			return nil
+		case err != nil:
+			return fmt.Errorf("media: read past the cap: %w", err)
+		}
+		// No bytes and no error: nothing happened. Asked again.
+	}
 }
 
 // Open hands back a blob's bytes and what is known about it. The caller closes the
@@ -240,14 +259,15 @@ func (s *Store) Open(id string) (io.ReadSeekCloser, Blob, error) {
 // Called on a tick rather than from Put, so the cost lands on the loop that expects it
 // instead of on the message that happened to fill the disk.
 func (s *Store) Sweep(ctx context.Context) (dropped int, freed int64, err error) {
-	blobs, leftovers, err := s.list(ctx)
+	blobs, leftovers, skipped, err := s.list(ctx)
 	if err != nil {
 		return 0, 0, err
 	}
 
 	// One error is kept rather than the first one returned, so a single undeletable
-	// file does not stop the sweep from clearing everything behind it.
-	var failed error
+	// file does not stop the sweep from clearing everything behind it. The shards that
+	// could not be read start it off: what is in them is not in the accounting below.
+	failed := skipped
 	for _, path := range leftovers {
 		if err := ctx.Err(); err != nil {
 			return dropped, freed, errors.Join(failed, err)
@@ -316,8 +336,12 @@ func (s *Store) Sweep(ctx context.Context) (dropped int, freed int64, err error)
 
 // held is one blob as the sweep sees it: what it costs and when it was last collected.
 type held struct {
-	id      string
+	id string
+	// size is the bytes, and about the description beside them. The description is
+	// measured rather than assumed: a filename comes off a message somebody else wrote,
+	// so it is not a fixed cost and a long one would sit outside the quota entirely.
 	size    int64
+	about   int64
 	touched time.Time
 }
 
@@ -334,11 +358,11 @@ const blockSize int64 = 4 << 10
 // cost is what a blob is charged against the quota: its bytes and its description's,
 // each rounded up to a block.
 func (b held) cost() int64 {
-	payload := blocks(b.size)
-	if payload > math.MaxInt64-blockSize {
+	payload, about := blocks(b.size), blocks(b.about)
+	if payload > math.MaxInt64-about {
 		return math.MaxInt64
 	}
-	return payload + blockSize
+	return payload + about
 }
 
 func blocks(size int64) int64 {
@@ -359,11 +383,15 @@ func blocks(size int64) int64 {
 // It removes nothing. Every removal the sweep makes goes through one place, so the
 // accounting and the cancellation checks are written once rather than in each branch
 // that happens to delete something.
-func (s *Store) list(ctx context.Context) (blobs []held, leftovers []string, err error) {
+func (s *Store) list(ctx context.Context) (blobs []held, leftovers []string, skipped, err error) {
 	// The paths a description was found at, keyed by the id it describes, checked
 	// against the blobs at the end: a description whose blob is not here describes
 	// nothing.
 	described := map[string]string{}
+	// What each description actually takes, merged into its blob once the walk is done:
+	// the two are separate files and the walk meets them in whatever order the
+	// directory hands them over.
+	sidecars := map[string]int64{}
 	err = fs.WalkDir(s.root.FS(), ".", func(path string, entry fs.DirEntry, err error) error {
 		if walkErr := ctx.Err(); walkErr != nil {
 			// A walk of a large cache on a slow disk is exactly what a shutdown must not
@@ -379,8 +407,11 @@ func (s *Store) list(ctx context.Context) (blobs []held, leftovers []string, err
 			return fmt.Errorf("media: read %s: %w", s.opts.Root, err)
 		case err != nil:
 			// One directory inside it, which is not a reason to abandon the sweep: what
-			// is walked still gets swept, and the next pass tries this again.
-			return nil //nolint:nilerr // deliberate, see above
+			// is walked still gets swept. Reported all the same, because the blobs in an
+			// unreadable shard vanish from the accounting and the quota is then measured
+			// against a fraction of the disk, indefinitely and silently.
+			skipped = errors.Join(skipped, fmt.Errorf("media: read %s: %w", path, err))
+			return nil
 		case entry.IsDir():
 			return nil
 		}
@@ -389,7 +420,7 @@ func (s *Store) list(ctx context.Context) (blobs []held, leftovers []string, err
 			return nil //nolint:nilerr // gone between the walk and the stat, which the sweep wanted anyway
 		}
 		switch name, aged := entry.Name(), info.ModTime().Before(s.opts.Now().Add(-s.opts.TTL)); {
-		case strings.HasPrefix(name, tempPrefix) && validID(strings.TrimPrefix(name, tempPrefix)):
+		case path == s.tempPath(strings.TrimPrefix(name, tempPrefix)):
 			// A write that was interrupted. It is named after nothing and nobody can
 			// ask for it, so the sweep is what collects it — but only once it is old
 			// enough to be nobody's, since a write in progress right now looks exactly
@@ -397,7 +428,7 @@ func (s *Store) list(ctx context.Context) (blobs []held, leftovers []string, err
 			if aged {
 				leftovers = append(leftovers, path)
 			}
-		case strings.HasSuffix(name, aboutSuffix) && validID(strings.TrimSuffix(name, aboutSuffix)):
+		case path == s.aboutPath(strings.TrimSuffix(name, aboutSuffix)):
 			// A description is normally accounted for with the blob it describes. One
 			// on its own is what a crash between the two writes leaves behind, and
 			// nothing else will ever collect it: no request names it and no blob drop
@@ -405,8 +436,10 @@ func (s *Store) list(ctx context.Context) (blobs []held, leftovers []string, err
 			// written the description and not yet named the bytes is indistinguishable
 			// from one that never will, and collecting that one loses a blob that is
 			// about to exist.
+			id := strings.TrimSuffix(name, aboutSuffix)
+			sidecars[id] = info.Size()
 			if aged {
-				described[strings.TrimSuffix(name, aboutSuffix)] = path
+				described[id] = path
 			}
 		case validID(name) && path == s.pathOf(name):
 			// Its canonical place, and only there. A file with a blob's name somewhere
@@ -422,19 +455,20 @@ func (s *Store) list(ctx context.Context) (blobs []held, leftovers []string, err
 		return nil
 	})
 	if err != nil {
-		return nil, nil, fmt.Errorf("media: walk %s: %w", s.opts.Root, err)
+		return nil, nil, skipped, fmt.Errorf("media: walk %s: %w", s.opts.Root, err)
 	}
 
 	present := make(map[string]struct{}, len(blobs))
-	for _, entry := range blobs {
-		present[entry.id] = struct{}{}
+	for i := range blobs {
+		blobs[i].about = sidecars[blobs[i].id]
+		present[blobs[i].id] = struct{}{}
 	}
 	for id, path := range described {
 		if _, found := present[id]; !found {
 			leftovers = append(leftovers, path)
 		}
 	}
-	return blobs, leftovers, nil
+	return blobs, leftovers, skipped, nil
 }
 
 // drop removes a blob and says whether the bytes actually went. The bytes go first: a
@@ -467,9 +501,40 @@ const (
 // The shard is the first byte of the random half, not the first two characters of the
 // id: every id starts `blob_`, so taking those would put every blob in one directory
 // and the sharding would exist in the layout and nowhere on disk.
-func shardOf(id string) string              { return id[len(idPrefix) : len(idPrefix)+2] }
-func (s *Store) pathOf(id string) string    { return shardOf(id) + "/" + id }
-func (s *Store) aboutPath(id string) string { return s.pathOf(id) + aboutSuffix }
+// All four answer the empty string for anything that is not an id this store issues,
+// which is never a path the walk can be at: a name off the disk is compared against
+// these rather than taken apart, so a foreign one matches nothing instead of being
+// sliced into a directory that does not exist.
+func shardOf(id string) string {
+	if !validID(id) {
+		return ""
+	}
+	return id[len(idPrefix) : len(idPrefix)+2]
+}
+
+func (s *Store) pathOf(id string) string {
+	shard := shardOf(id)
+	if shard == "" {
+		return ""
+	}
+	return shard + "/" + id
+}
+
+func (s *Store) aboutPath(id string) string {
+	path := s.pathOf(id)
+	if path == "" {
+		return ""
+	}
+	return path + aboutSuffix
+}
+
+func (s *Store) tempPath(id string) string {
+	shard := shardOf(id)
+	if shard == "" {
+		return ""
+	}
+	return shard + "/" + tempPrefix + id
+}
 
 func (s *Store) writeAbout(id string, about *Blob) error {
 	body, err := json.Marshal(about)

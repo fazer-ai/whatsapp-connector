@@ -591,3 +591,120 @@ func TestASweepThatCannotCollectALeftoverSaysSo(t *testing.T) {
 		t.Fatal("a sweep that could not collect an interrupted write reported a clean pass")
 	}
 }
+
+// A leftover is only a leftover in the place this store would have written it. A root
+// pointed at a shared directory has subdirectories of its own, and a name that looks
+// like one of this store's temporary files or descriptions somewhere else in that tree
+// belongs to whoever put it there.
+func TestLeftoversAreOnlyCollectedWhereTheyWouldHaveBeenWritten(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	clock := func() time.Time { return now }
+	store, root := newStore(t, media.Options{TTL: time.Hour, Now: clock})
+
+	const id = "blob_deadbeef0011223344556677"
+	elsewhere := filepath.Join(root, "somebody-elses-cache")
+	if err := os.MkdirAll(elsewhere, 0o700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	foreign := []string{
+		filepath.Join(elsewhere, "."+id),
+		filepath.Join(elsewhere, id+".json"),
+		// The right shard name, the wrong depth.
+		filepath.Join(elsewhere, "."+id+".json"),
+	}
+	for _, path := range foreign {
+		if err := os.WriteFile(path, []byte("not this store's"), 0o600); err != nil {
+			t.Fatalf("WriteFile %s: %v", path, err)
+		}
+	}
+
+	now = now.Add(2 * time.Hour)
+	if _, _, err := store.Sweep(t.Context()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	for _, path := range foreign {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("the sweep removed %s, which is not where it writes: %v", path, err)
+		}
+	}
+}
+
+// A shard that cannot be read takes every blob in it out of the accounting, so the quota
+// is measured against a fraction of the disk. Silently, and for as long as the
+// permissions stay that way.
+func TestAnUnreadableShardIsReported(t *testing.T) {
+	t.Parallel()
+
+	store, root := newStore(t, media.Options{TTL: time.Hour})
+	stored := put(t, store, "in an unreadable shard", &media.Blob{})
+
+	shard := filepath.Join(root, stored.ID[5:7])
+	if err := os.Chmod(shard, 0o000); err != nil {
+		t.Fatalf("Chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(shard, 0o700) })
+
+	if _, _, err := store.Sweep(t.Context()); err == nil {
+		t.Fatal("a sweep that could not read a shard reported a clean pass")
+	}
+}
+
+// The description carries a filename off a message somebody else wrote, so it is not a
+// fixed cost. One large enough to matter sits entirely outside a quota that assumes a
+// block for it.
+func TestALargeDescriptionIsChargedForWhatItTakes(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	clock := func() time.Time { return now }
+	// Room for one small blob and one small description, twice over.
+	store, _ := newStore(t, media.Options{TTL: time.Hour, Quota: 16 << 10, MaxBlob: 4 << 10, Now: clock})
+
+	small := put(t, store, "x", &media.Blob{})
+	now = now.Add(time.Minute)
+	// A filename of six kibibytes, so the description takes two blocks rather than the
+	// one a fixed charge assumes. The pair then costs 20 KiB against a 16 KiB quota;
+	// charged a block each they would come to exactly 16 and nothing would be dropped.
+	put(t, store, "y", &media.Blob{Filename: strings.Repeat("n", 6<<10)})
+
+	dropped, _, err := store.Sweep(t.Context())
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if dropped != 1 {
+		t.Fatalf("the sweep dropped %d blobs: a description is being charged a block whatever it takes", dropped)
+	}
+	if _, _, err := store.Open(small.ID); !errors.Is(err, media.ErrNotFound) {
+		t.Fatalf("the sweep kept the older blob: %v", err)
+	}
+}
+
+// A reader may answer no bytes and no error, which means nothing happened rather than
+// there is nothing left. Taking one of those for the end of the file renames the first
+// MaxBlob bytes and reports a whole one.
+func TestASourceThatPausesIsNotMistakenForOneThatEnded(t *testing.T) {
+	t.Parallel()
+
+	store, _ := newStore(t, media.Options{MaxBlob: 4, Quota: 1 << 20})
+
+	// Four bytes, then one pause, then more: exactly the shape that reads as an exact
+	// fit to a single lookahead.
+	source := io.MultiReader(strings.NewReader("0123"), &pause{}, strings.NewReader("456"))
+	if _, err := store.Put(source, &media.Blob{}); !errors.Is(err, media.ErrTooLarge) {
+		t.Fatalf("a source with more bytes after a pause answered with %v, want ErrTooLarge", err)
+	}
+}
+
+// pause answers once with nothing at all, which io.Reader permits and which means
+// nothing happened.
+type pause struct{ done bool }
+
+func (p *pause) Read([]byte) (int, error) {
+	if p.done {
+		return 0, io.EOF
+	}
+	p.done = true
+	return 0, nil
+}
