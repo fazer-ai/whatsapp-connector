@@ -8,10 +8,8 @@ package redisstream
 
 import (
 	"context"
-
 	"errors"
 	"fmt"
-
 	"sync"
 	"time"
 
