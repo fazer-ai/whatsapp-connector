@@ -102,7 +102,9 @@ func reachableAt(base string) error {
 		return fmt.Errorf(
 			"whatsmeow: blobs are published under %q, and a client fetches them over http or https", base)
 	}
-	if address.Host == "" {
+	if address.Hostname() == "" {
+		// Hostname rather than Host: `http://:8080` parses with an authority of
+		// ":8080", which is a port and nobody to ask for it.
 		return fmt.Errorf("whatsmeow: blobs are published under %q, which names no host", base)
 	}
 	if address.Port() == "0" {

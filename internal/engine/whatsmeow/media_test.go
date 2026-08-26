@@ -756,6 +756,9 @@ func TestAnEngineIsRefusedWhenBlobsCouldNotBeFetchedFromWhereItWouldPublishThem(
 		{"the scheme left off", "connector:8080"},
 		{"a scheme nothing fetches over", "redis://connector:8080"},
 		{"no host to reach", "http:///media"},
+		// Parses with an authority of ":8080", which is a port and nobody to ask for it.
+		// It is also what the derivation builds for an instance with no name.
+		{"a port and nobody to ask for it", "http://:8080"},
 		// The id is appended as a path segment, so anything after it would end up in
 		// front of the query rather than behind it.
 		{"a query the id would be appended in front of", "http://connector:8080/?token=x"},
