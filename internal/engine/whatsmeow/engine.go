@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/rs/zerolog"
@@ -140,9 +141,12 @@ func reachableAt(base string) error {
 			return fmt.Errorf("whatsmeow: blobs are published under %q, and %q is not a port to dial", base, port)
 		}
 	}
-	if address.RawQuery != "" || address.Fragment != "" {
-		// The id is appended as a path segment, so anything after it would end up in
-		// front of the query rather than behind it.
+	if strings.ContainsAny(base, "?#") {
+		// Read off the raw address rather than off the parsed fields, because the parse
+		// hides the two shapes that matter: a bare `?` leaves RawQuery empty and is
+		// recorded only in ForceQuery, and a bare `#` is recorded nowhere at all. Both
+		// still take the id with them — the blob's id is appended as a path segment, so
+		// `http://host/?` publishes a query of `/media/<id>` and reaches nothing.
 		return fmt.Errorf(
 			"whatsmeow: blobs are published under %q, and a blob's id is appended to it as a path", base)
 	}

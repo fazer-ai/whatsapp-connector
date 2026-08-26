@@ -809,6 +809,10 @@ func TestAnEngineIsRefusedWhenBlobsCouldNotBeFetchedFromWhereItWouldPublishThem(
 		// front of the query rather than behind it.
 		{"a query the id would be appended in front of", "http://connector:8080/?token=x"},
 		{"a fragment", "http://connector:8080/#here"},
+		// The two the parse hides: a bare `?` is recorded only in ForceQuery, and a bare
+		// `#` is recorded nowhere at all.
+		{"a query delimiter with nothing after it", "http://connector:8080/?"},
+		{"a fragment delimiter with nothing after it", "http://connector:8080/#"},
 		// "Every interface" to a listener, "this machine" to whoever dials it, so a
 		// client elsewhere connects to itself.
 		{"an address to listen on rather than one to reach", "http://0.0.0.0:8080"},
