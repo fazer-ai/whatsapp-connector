@@ -13,6 +13,7 @@ import (
 
 	wm "go.mau.fi/whatsmeow"
 	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
+	waEvents "go.mau.fi/whatsmeow/types/events"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/media"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
@@ -48,6 +49,11 @@ const (
 	// reasonTooLarge is a file past what this instance keeps, whether the sender said
 	// so up front or the bytes said so on the way in.
 	reasonTooLarge = "too_large"
+	// reasonViewOnce is a file the sender meant to be seen once and then be gone. It is
+	// not a failure to download and it is published as one on purpose: the client's
+	// answer to both is the same bubble, and there is no field on the contract yet that
+	// says why this one is unavailable.
+	reasonViewOnce = "view_once"
 	// reasonNoStore is an instance with nowhere to put a file. The message is still
 	// worth publishing: its caption, its name and its size are on the event, so the
 	// client renders a bubble whose file is unavailable rather than an empty one.
@@ -198,10 +204,25 @@ func thumbnailOf(mime string, raw []byte) string {
 // reference and the reason travels behind it, because a bubble that says the file is
 // unavailable is worth more to an agent than a message that never arrives. A download
 // that may work next time is a refusal, and the message stays on the phone.
-func (s *Session) mediaBody(ctx context.Context, message *waE2E.Message) (body, bool) {
-	part, ok := attachmentOf(message)
+func (s *Session) mediaBody(ctx context.Context, event *waEvents.Message) (body, bool) {
+	part, ok := attachmentOf(event.Message)
 	if !ok {
 		return body{}, false
+	}
+	if viewOnce(event) {
+		// Never fetched, so there is nothing to keep. A blob is served for as long as
+		// anybody keeps asking for it — every hand-out puts its clock back — so storing
+		// one of these turns a file the sender expected to disappear into one the
+		// account holds indefinitely, replicated wherever its attachments go.
+		//
+		// The message still goes out: an agent seeing an unavailable attachment knows
+		// somebody sent something, which is worth more than a message WhatsApp
+		// redelivers for good and nobody ever reads. Delivering the file is a decision
+		// with a contract change behind it (a flag on the content, and a blob handed out
+		// once), and this is the side of it that can still be changed.
+		s.log.Info().Str("message_id", event.Info.ID).Str("kind", string(part.content.Kind)).
+			Msg("publishing a view-once message without keeping the file it carried")
+		return body{content: part.content, context: part.context, failure: reasonViewOnce}, true
 	}
 
 	download, cancel := context.WithTimeout(ctx, s.downloadWait)
@@ -226,6 +247,19 @@ func (s *Session) mediaBody(ctx context.Context, message *waE2E.Message) (body, 
 	// can actually fetch.
 	part.content.Size = ref.Size
 	return body{content: part.content, context: part.context}, true
+}
+
+// viewOnce reports whether the sender meant this file to be seen once and then be gone.
+//
+// Both halves are read because they are set by different paths: whatsmeow raises the
+// flag on the event when it unwraps one of the three view-once envelopes, and the
+// sender's own field rides on the media itself. A document and a sticker have no such
+// field, which is WhatsApp's answer to whether either can be sent this way.
+func viewOnce(event *waEvents.Message) bool {
+	return event.IsViewOnce ||
+		event.Message.GetImageMessage().GetViewOnce() ||
+		event.Message.GetVideoMessage().GetViewOnce() ||
+		event.Message.GetAudioMessage().GetViewOnce()
 }
 
 // fetch downloads the file of a media message, stores it, and returns the reference a

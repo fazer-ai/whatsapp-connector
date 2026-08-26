@@ -80,3 +80,14 @@ internal/transport/redisstream/stream.go: Age pending commands from first delive
 # bytes already in memory, and an HTTP body from a request carrying the context unblocks
 # when the context does. The check before each read is what covers a source that yields.
 internal/media/store.go: Interrupt the underlying read on cancellation  # PR#15
+# PR#16: real, and filed as #17 rather than patched here. whatsmeow's Download is
+# io.ReadAll over the response body and holds ciphertext and plaintext at once, so the
+# peak is the file itself and not WAC_MEDIA_MAX_BLOB; the declared FileLength is checked
+# before a byte moves, which covers an honest sender and not a lying one, and the store's
+# cap then refuses on the way in, by which point the memory is already spent. Closing it
+# means streaming into the store instead of through memory: whatsmeow has
+# DownloadToFile, and os.Root.OpenFile returns something that satisfies its File, but the
+# store has to grow a second way in that commits (digest, description, rename, stamp) as
+# the same code Put does, or the two accountings drift. That is its own change, which is
+# what #17 describes. It takes a sender deliberately lying about the length to reach.
+internal/engine/whatsmeow/media.go: Enforce the blob limit while downloading  # PR#16

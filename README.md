@@ -15,7 +15,10 @@ events and commands with its clients over Redis Streams.
 > video, audio, document or sticker is downloaded as it arrives, kept in this instance's
 > blob cache and published as a reference the client fetches over HTTP; a file WhatsApp
 > will not serve again is announced with `media.download_failed` so the bubble says the
-> attachment is unavailable rather than loading forever. Everything else is still M2's
+> attachment is unavailable rather than loading forever. A file sent to be seen once is
+> announced the same way and never kept: a blob is served for as long as anybody keeps
+> asking for it, so storing one would turn something the sender expected to disappear
+> into something the account holds indefinitely. Everything else is still M2's
 > to finish: media outbound, location and contacts either way, and the commands that act
 > on a message that already exists. What this build cannot render is left
 > unacknowledged on WhatsApp's side, with its plaintext buffered so the redelivery can

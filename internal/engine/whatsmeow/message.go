@@ -115,7 +115,12 @@ type body struct {
 // It is an argument to inboundOf rather than a call inside it because rendering the
 // body of a media message means fetching the file over the network, and a message the
 // envelope around it is going to refuse must not cost a download first.
-type renderBody func(*waE2E.Message) (body, bool)
+//
+// It takes the whole event and not just the message, because some of what decides how a
+// body is rendered is what whatsmeow found around it rather than what is left inside:
+// a view-once wrapper is unwrapped before a handler sees it, and only the flag on the
+// event says it was ever there.
+type renderBody func(*waEvents.Message) (body, bool)
 
 // inboundOf renders an inbound message the way the contract carries it, and reports
 // whether this build can carry it at all. A false is not an error: it is this
@@ -160,7 +165,7 @@ func inboundOf(event *waEvents.Message, render renderBody) (protocol.InboundMess
 		}
 	}
 	// Asked for last, once every question about the envelope has been answered.
-	said, ok := render(event.Message)
+	said, ok := render(event)
 	if !ok {
 		return protocol.InboundMessage{}, "", false
 	}
@@ -194,18 +199,18 @@ func newsletterEdit(event *waEvents.Message) bool {
 // The download is the reason this is a method: it is the session that has the socket to
 // pull the bytes over and the store to put them in.
 func (s *Session) bodyOf(ctx context.Context) renderBody {
-	return func(message *waE2E.Message) (body, bool) {
-		if plain, ok := plainBody(message); ok {
+	return func(event *waEvents.Message) (body, bool) {
+		if plain, ok := plainBody(event); ok {
 			return plain, true
 		}
-		return s.mediaBody(ctx, message)
+		return s.mediaBody(ctx, event)
 	}
 }
 
 // plainBody renders a message whose whole body is text, which is the one kind that
 // needs nothing fetched to render.
-func plainBody(message *waE2E.Message) (body, bool) {
-	text, info, ok := textOf(message)
+func plainBody(event *waEvents.Message) (body, bool) {
+	text, info, ok := textOf(event.Message)
 	if !ok {
 		return body{}, false
 	}

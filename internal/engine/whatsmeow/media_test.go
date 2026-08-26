@@ -515,6 +515,94 @@ func TestAnInstanceWithNowhereToPutAFileSaysSoRatherThanPublishingAnEmptyBubble(
 	assertFailure(t, emissions[1], reasonNoStore)
 }
 
+// A file sent to be seen once is not kept. A blob is served for as long as anybody
+// keeps asking for it, so storing one turns something the sender expected to disappear
+// into something the account holds indefinitely.
+func TestAFileSentToBeSeenOnceIsNeverKept(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name  string
+		build func() *waEvents.Message
+	}{
+		{
+			// whatsmeow unwraps the three view-once envelopes before a handler sees the
+			// message, and the flag on the event is all that is left of one.
+			name: "unwrapped from a view-once envelope",
+			build: func() *waEvents.Message {
+				event := imageEvent("3EB0ONCE")
+				event.IsViewOnce = true
+				return event
+			},
+		},
+		{
+			name: "an image carrying the sender's own flag",
+			build: func() *waEvents.Message {
+				return mediaEvent("3EB0ONCE", &waE2E.Message{ImageMessage: &waE2E.ImageMessage{
+					Mimetype: proto.String("image/jpeg"), ViewOnce: proto.Bool(true),
+				}})
+			},
+		},
+		{
+			name: "a video carrying the sender's own flag",
+			build: func() *waEvents.Message {
+				return mediaEvent("3EB0ONCE", &waE2E.Message{VideoMessage: &waE2E.VideoMessage{
+					Mimetype: proto.String("video/mp4"), ViewOnce: proto.Bool(true),
+				}})
+			},
+		},
+		{
+			name: "a voice note carrying the sender's own flag",
+			build: func() *waEvents.Message {
+				return mediaEvent("3EB0ONCE", &waE2E.Message{AudioMessage: &waE2E.AudioMessage{
+					Mimetype: proto.String("audio/ogg"), PTT: proto.Bool(true),
+					ViewOnce: proto.Bool(true),
+				}})
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			session, downloads := mediaSession(t, media.Options{})
+			downloads.answer([]byte("nunca guardado"), nil)
+
+			emissions, acknowledged := deliver(t, session, tc.build(), 2)
+			if !acknowledged {
+				t.Fatal("a view-once message was left for WhatsApp to redeliver for good")
+			}
+			if downloads.count() != 0 {
+				t.Fatalf("a file the sender meant to be seen once was downloaded %d times", downloads.count())
+			}
+			if content := mediaContentOf(t, emissions[0]); content.Ref != nil {
+				t.Fatalf("a view-once file was handed out as %+v", content.Ref)
+			}
+			assertFailure(t, emissions[1], reasonViewOnce)
+		})
+	}
+}
+
+// And the other side of it: an ordinary file with the flag absent is kept as before, so
+// the check is on the flag rather than on the media type carrying it.
+func TestAnOrdinaryFileIsStillKeptWhenTheViewOnceFlagIsAbsent(t *testing.T) {
+	t.Parallel()
+
+	session, downloads := mediaSession(t, media.Options{})
+	downloads.answer([]byte("guardado"), nil)
+
+	event := mediaEvent("3EB0KEPT", &waE2E.Message{ImageMessage: &waE2E.ImageMessage{
+		Mimetype: proto.String("image/jpeg"), ViewOnce: proto.Bool(false),
+	}})
+
+	emissions, acknowledged := deliver(t, session, event, 1)
+	if !acknowledged {
+		t.Fatal("an ordinary image was left unacknowledged")
+	}
+	if content := mediaContentOf(t, emissions[0]); content.Ref == nil {
+		t.Fatal("an ordinary image was published with no file to fetch")
+	}
+}
+
 // Rendering the body is the last thing that happens, and it has to stay that way: a
 // message the envelope around it refuses must not cost a download first, both for the
 // transfer and for the ninety seconds it would spend not answering whatsmeow.
