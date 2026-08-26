@@ -1,5 +1,7 @@
 package protocol
 
+import "encoding/json"
+
 // EventType is the discriminator of an event frame. The set is closed: an unknown
 // type means the peer speaks a newer protocol and the frame must be skipped, not
 // guessed at.
@@ -174,12 +176,14 @@ var AllCommandTypes = []CommandType{
 	CommandCallReject,
 }
 
-// rpcCommands are the commands whose caller blocks on a reply. Everything else is
-// fire and forget: the caller learns about failures through command.failed.
 // readOnlyCommands are the commands that ask a question and change nothing. They are
 // the ones a redelivery has to carry out again rather than be answered from a record:
 // what a session's state was a minute ago is not what it is now, and handing back the
 // old answer is worse than doing the work twice.
+//
+// Membership here is by type, and one command's type is not enough to place it:
+// `group.invite.get` reads the invite code with `revoke` unset and rotates it when the
+// field is true, so it is listed and then asked about its payload below.
 var readOnlyCommands = map[CommandType]bool{
 	CommandSessionStatus:         true,
 	CommandAdminPing:             true,
@@ -197,8 +201,51 @@ var readOnlyCommands = map[CommandType]bool{
 // carrying it out once. Everything the contract does not name as a question is assumed
 // to change something, so a command added without thinking about it is deduplicated
 // rather than repeated.
-func (t CommandType) ChangesSomething() bool { return !readOnlyCommands[t] }
+//
+// It reads the payload rather than only the type, because `group.invite.get` is both:
+// the read hands back the group's current invite code, and `revoke: true` rotates it
+// first, so a redelivery of that one rotates a code nobody has seen yet and answers
+// with a different one than the reply that was lost.
+func (c *Command) ChangesSomething() bool {
+	if !readOnlyCommands[c.Type] {
+		return true
+	}
+	if c.Type == CommandGroupInviteGet {
+		var body struct {
+			Revoke bool `json:"revoke"`
+		}
+		// An unreadable payload is not a question. It fails on the way to the engine
+		// either way, and the assumption that keeps a redelivery from repeating work
+		// is the one that costs nothing when it is wrong.
+		if err := json.Unmarshal(c.Payload, &body); err != nil {
+			return true
+		}
+		return body.Revoke
+	}
+	return false
+}
 
+// messageIDKeyed are the commands whose `message_id` names the message the command
+// itself puts on the wire. Those are the ones the contract remembers as
+// `msg:<message_id>`, and the id being the caller's own is what makes the key hold
+// across frames rather than only across redeliveries of one.
+//
+// `message.download_media` is deliberately absent even though its payload is required
+// to carry a `message_id`: there the field names a message that already exists, so
+// keying by it borrows the namespace of the send that created it, and a client asking
+// for the media of a message it sent would be answered with that send's result.
+var messageIDKeyed = map[CommandType]bool{
+	CommandMessageSend:  true,
+	CommandMessageEdit:  true,
+	CommandMessageReact: true,
+}
+
+// NamesItsOwnMessage reports whether a `message_id` in this command's payload is the id
+// of the message the command creates.
+func (t CommandType) NamesItsOwnMessage() bool { return messageIDKeyed[t] }
+
+// rpcCommands are the commands whose caller blocks on a reply. Everything else is
+// fire and forget: the caller learns about failures through command.failed.
 var rpcCommands = map[CommandType]bool{
 	CommandSessionConnect:          true,
 	CommandSessionStatus:           true,

@@ -469,22 +469,28 @@ func (s *Session) alreadyDid(ctx context.Context, key string) (json.RawMessage, 
 // idempotencyKey is what a command is remembered under, and the empty string for one
 // that names nothing to be remembered by.
 //
-// A command that names its own message is keyed by it, which is the contract's
-// `msg:<message_id>`: the caller picks the id, so every redelivery of that command
-// names the same one. Everything else is keyed by the `idempotency_key` the frame
+// A command that names the message it is about to put on the wire is keyed by it,
+// which is the contract's `msg:<message_id>`: the caller picks the id, so every
+// redelivery of that command names the same one, and so does a resend the caller makes
+// of its own accord. Everything else is keyed by the `idempotency_key` the frame
 // carries, which is a field of the command and not of its payload.
 func idempotencyKey(command *protocol.Command) string {
-	if !command.Type.ChangesSomething() {
+	if !command.ChangesSomething() {
 		// A question, and the answer is only worth having if it is current. Answering a
 		// redelivered `session.status` from a record would report the state the session
 		// was in when it was first asked.
 		return ""
 	}
-	var body struct {
-		MessageID string `json:"message_id"`
-	}
-	if err := json.Unmarshal(command.Payload, &body); err == nil && body.MessageID != "" {
-		return "msg:" + body.MessageID
+	// Only where the id is the command's own creation. `message.download_media` also
+	// carries a `message_id`, and there it names a message somebody else's command
+	// created, so keying by it would answer a download with the result of the send.
+	if command.Type.NamesItsOwnMessage() {
+		var body struct {
+			MessageID string `json:"message_id"`
+		}
+		if err := json.Unmarshal(command.Payload, &body); err == nil && body.MessageID != "" {
+			return "msg:" + body.MessageID
+		}
 	}
 	if command.IdempotencyKey != "" {
 		return command.IdempotencyKey

@@ -993,3 +993,117 @@ func (brokenAcks) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
 		return next(ctx, cmd)
 	}
 }
+
+// What makes a reclaim safe is the record of whether the command already ran, and that
+// record expires. An entry that outlived it is one no instance can decide about, so
+// taking it over would be carrying out a side effect on a guess. It is retired to the
+// dead letter list instead, which is neither running it a second time nor leaving it
+// pending for every later heartbeat to reconsider.
+func TestACommandOlderThanTheRecordOfItIsRetiredRatherThanRun(t *testing.T) {
+	t.Parallel()
+
+	const (
+		minIdle = 10 * time.Second
+		maxIdle = time.Hour
+	)
+	f := newFleet(t)
+	patient, err := redisstream.New(f.client, redisstream.Options{
+		Instance: "inst-alive", Block: 50 * time.Millisecond,
+		ClaimMinIdle: minIdle, ClaimMaxIdle: maxIdle,
+	})
+	if err != nil {
+		t.Fatalf("redisstream.New: %v", err)
+	}
+	dead := f.streams(t, "inst-dead")
+	ctx := context.Background()
+	stream := f.client.Keys().Commands("s1")
+
+	if _, err := dead.Read(ctx, []string{"s1"}); err != nil {
+		t.Fatalf("priming Read: %v", err)
+	}
+	writeCommand(t, f, stream, command("c1", "s1", "c1"))
+	taken, err := dead.Read(ctx, []string{"s1"})
+	if err != nil || len(taken) != 1 {
+		t.Fatalf("the first instance read %d commands (err=%v), want 1", len(taken), err)
+	}
+
+	// It dies without acknowledging, and the whole fleet is down long enough for the
+	// record of what that command did to expire.
+	clock := time.Now().UTC()
+	tick := func(d time.Duration) { clock = clock.Add(d); f.server.SetTime(clock) }
+	tick(maxIdle + time.Minute)
+
+	claimed, err := patient.Claim(ctx, []string{"s1"})
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if len(claimed) != 0 {
+		t.Fatalf("claimed %d commands nobody could tell had already run, want none", len(claimed))
+	}
+
+	pending, err := f.client.XPending(ctx, stream, redisstream.ConsumerGroup).Result()
+	if err != nil {
+		t.Fatalf("XPending: %v", err)
+	}
+	if pending.Count != 0 {
+		t.Fatalf("%d entries are still pending, so every later heartbeat reconsiders them", pending.Count)
+	}
+
+	records, err := f.client.LRange(ctx, f.client.Keys().DLQCommands(), 0, -1).Result()
+	if err != nil {
+		t.Fatalf("LRange: %v", err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("the dead letter list holds %d records, want the one command that was dropped", len(records))
+	}
+	var record struct {
+		Stream string            `json:"stream"`
+		Fields map[string]string `json:"fields"`
+	}
+	if err := json.Unmarshal([]byte(records[0]), &record); err != nil {
+		t.Fatalf("the dead letter record is not readable: %v", err)
+	}
+	if record.Stream != stream || record.Fields["id"] != "c1" {
+		t.Fatalf("the dead letter record names %s/%q, want %s/c1", record.Stream, record.Fields["id"], stream)
+	}
+}
+
+// The bound is on the age of the entry, not on the fleet's memory of it: a command that
+// has only been waiting out the reclaim delay is exactly what a claim exists to pick up.
+func TestACommandWithinTheBoundIsStillTakenOver(t *testing.T) {
+	t.Parallel()
+
+	const (
+		minIdle = 10 * time.Second
+		maxIdle = time.Hour
+	)
+	f := newFleet(t)
+	patient, err := redisstream.New(f.client, redisstream.Options{
+		Instance: "inst-alive", Block: 50 * time.Millisecond,
+		ClaimMinIdle: minIdle, ClaimMaxIdle: maxIdle,
+	})
+	if err != nil {
+		t.Fatalf("redisstream.New: %v", err)
+	}
+	dead := f.streams(t, "inst-dead")
+	ctx := context.Background()
+
+	if _, err := dead.Read(ctx, []string{"s1"}); err != nil {
+		t.Fatalf("priming Read: %v", err)
+	}
+	writeCommand(t, f, f.client.Keys().Commands("s1"), command("c1", "s1", "c1"))
+	if taken, err := dead.Read(ctx, []string{"s1"}); err != nil || len(taken) != 1 {
+		t.Fatalf("the first instance read %d commands (err=%v), want 1", len(taken), err)
+	}
+
+	clock := time.Now().UTC()
+	f.server.SetTime(clock.Add(minIdle + time.Second))
+
+	claimed, err := patient.Claim(ctx, []string{"s1"})
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("Claim returned %d commands (err=%v), want the one the peer abandoned", len(claimed), err)
+	}
+	if records, err := f.client.LRange(ctx, f.client.Keys().DLQCommands(), 0, -1).Result(); err != nil || len(records) != 0 {
+		t.Fatalf("the dead letter list holds %d records (err=%v), want none", len(records), err)
+	}
+}

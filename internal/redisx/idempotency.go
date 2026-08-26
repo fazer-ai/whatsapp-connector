@@ -16,6 +16,12 @@ import (
 // reclaimed by another instance, because that is the redelivery this record answers.
 // A day is far past that and costs one small string per message; forgetting too early
 // is a duplicate side effect, and forgetting too late is nothing at all.
+//
+// Nothing bounds how long an entry stays pending on its own, so the transport is what
+// makes "far past that" true: redisstream retires an entry idle longer than this one
+// rather than take it over. The two constants move together, and changing this one
+// without that one puts a command back in front of an instance that has no way left of
+// telling whether it already ran.
 const DefaultIdempotencyTTL = 24 * time.Hour
 
 // Idempotency remembers what a command did, so a redelivery answers with the first
