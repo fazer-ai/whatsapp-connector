@@ -252,9 +252,37 @@ func TestLiveMedia(t *testing.T) {
 	events.awaitState(t, "open", 2*time.Minute)
 
 	window := liveWindow(t, 3*time.Minute)
-	say("send a PHOTO, VIDEO, VOICE NOTE, DOCUMENT or STICKER to the paired number now; waiting up to %s", window)
-	received := events.await(t, protocol.EventMessageReceived, window)
+	// One file proves the path; several prove the translation, and each kind is the only
+	// one that carries something: a document has the filename, a voice note the flag and
+	// the duration, a sticker the PNG preview where every other kind has a JPEG one.
+	wanted := liveCount(t)
+	say("send %d file(s) to the paired number now — photo, video, VOICE NOTE, DOCUMENT, STICKER; waiting up to %s",
+		wanted, window)
 
+	seen := map[protocol.MediaKind]int{}
+	deadline := time.Now().Add(window)
+	for i := 1; i <= wanted; i++ {
+		left := time.Until(deadline)
+		if left <= 0 {
+			t.Fatalf("only %d of %d files arrived before the window closed", i-1, wanted)
+		}
+		content := oneLiveFile(t, events, endpoint.URL, token, left)
+		seen[content.Kind]++
+		say("%d/%d done", i, wanted)
+	}
+	say("kinds that arrived: %v", seen)
+
+	if state := session.state(); state != "open" {
+		t.Fatalf("the session did not stay up: state=%s", state)
+	}
+}
+
+// oneLiveFile waits for one media message, checks what the contract says about it, and
+// fetches the bytes from the URL the event carried.
+func oneLiveFile(t *testing.T, events *recorder, base, token string, within time.Duration) protocol.MediaContent {
+	t.Helper()
+
+	received := events.await(t, protocol.EventMessageReceived, within)
 	var body struct {
 		Message struct {
 			ID      string                `json:"id"`
@@ -279,7 +307,7 @@ func TestLiveMedia(t *testing.T) {
 	if ref.Kind != protocol.MediaRefConnectorBlob || ref.ID == "" || ref.URL == "" || ref.SHA256 == "" {
 		t.Fatalf("the reference does not describe a blob on this instance: %+v", ref)
 	}
-	if want := endpoint.URL + "/media/" + ref.ID; ref.URL != want {
+	if want := base + "/media/" + ref.ID; ref.URL != want {
 		t.Fatalf("the reference points at %q, want %q", ref.URL, want)
 	}
 
@@ -305,14 +333,33 @@ func TestLiveMedia(t *testing.T) {
 	if refused := fetchBlob(t, ref.URL, ""); refused.status != http.StatusUnauthorized {
 		t.Fatalf("fetching without the token answered %d, want 401", refused.status)
 	}
-	if state := session.state(); state != "open" {
-		t.Fatalf("the session did not stay up: state=%s", state)
+	return content
+}
+
+// liveCount is how many files this phase waits for.
+func liveCount(t *testing.T) int {
+	t.Helper()
+
+	raw := os.Getenv("WAC_LIVE_FILES")
+	if raw == "" {
+		return 1
 	}
+	count, err := strconv.Atoi(raw)
+	if err != nil || count < 1 {
+		t.Fatalf("WAC_LIVE_FILES=%q: want a positive count", raw)
+	}
+	return count
 }
 
 // TestLiveViewOnce is the decision this build makes about a file sent to be seen once:
 // the message goes out, the file is not kept, and the preview does not travel either.
-// It needs a human to send one, which is why it is a phase and not a unit test.
+//
+// It usually does not get that far, and finding out is what it was written for. WhatsApp
+// does not hand a view-once message to a companion device: what arrives is a stub with no
+// ciphertext (`Unavailable message ... type: "view_once"`), which whatsmeow acknowledges
+// while asking the primary phone to send the real one over. If the phone answers, this
+// phase sees the message and the assertions below hold. If it does not, nothing arrives
+// at all, which is issue #20 rather than a failure of this code.
 func TestLiveViewOnce(t *testing.T) {
 	const token = "live-check"
 
