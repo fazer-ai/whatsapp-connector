@@ -801,6 +801,37 @@ func TestTheAdvertisedAddressIsDerivedFromThePortAndNotFromTheBindHost(t *testin
 		}
 	})
 
+	// A colon with nothing after it is worse than an address that is not one: it splits
+	// without complaint and a listener takes any free port, so the instance comes up,
+	// answers on a port nobody was told about, and publishes blobs under a bare colon
+	// that every client reads as port 80.
+	for _, addr := range []string{":", "127.0.0.1:"} {
+		t.Run("a colon with no port after it: "+addr, func(t *testing.T) {
+			t.Setenv("WAC_INSTANCE", "inst-a")
+			t.Setenv("WAC_HTTP_ADDR", addr)
+
+			if _, err := app.LoadConfig("host"); err == nil {
+				t.Fatal("an address a listener answers on any free port was accepted")
+			}
+		})
+	}
+
+	// An instance addressed by an IPv6 literal is written in brackets. Pasting a colon
+	// in builds `http://2001:db8::1:8080`, which parses -- as that host and that port --
+	// and is a URL no client can dial.
+	t.Run("an instance addressed by an IPv6 literal", func(t *testing.T) {
+		t.Setenv("WAC_INSTANCE", "2001:db8::1")
+		t.Setenv("WAC_HTTP_ADDR", ":8080")
+
+		cfg, err := app.LoadConfig("host")
+		if err != nil {
+			t.Fatalf("LoadConfig: %v", err)
+		}
+		if cfg.AdvertiseURL != "http://[2001:db8::1]:8080" {
+			t.Fatalf("an IPv6 instance advertises %q, want it in brackets", cfg.AdvertiseURL)
+		}
+	})
+
 	// And an address the operator gave is taken as given: it is the one they can say
 	// something the derivation cannot know, such as the host in front of the fleet.
 	t.Run("one the operator said", func(t *testing.T) {

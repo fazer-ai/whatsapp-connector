@@ -339,7 +339,12 @@ func unfetchable(part wm.DownloadableMessage) error {
 		// instead, with a plain error, on every attempt forever.
 		return refused{reason: reasonUnreferenced, err: errors.New("the direct path cannot be parsed as one")}
 	}
-	if digest := part.GetFileEncSHA256(); len(digest) != 0 && len(digest) != sha256.Size {
+	// nil rather than empty, because that is the line whatsmeow draws: a nil digest is
+	// unencrypted media and it drops the key to match, while a digest that is present
+	// and empty keeps the key, takes the encrypted path, and fails the length check
+	// there with a plain error. A field encoded on the wire as empty unmarshals to a
+	// non-nil slice of length zero, so the two are told apart by nil alone.
+	if digest := part.GetFileEncSHA256(); digest != nil && len(digest) != sha256.Size {
 		return refused{
 			reason: reasonCorrupt,
 			err:    fmt.Errorf("the ciphertext digest is %d bytes and a SHA-256 is %d", len(digest), sha256.Size),

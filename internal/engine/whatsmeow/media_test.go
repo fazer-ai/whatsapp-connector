@@ -579,6 +579,19 @@ func TestMetadataThatCanNeverDescribeAFileIsGivenUpOnRatherThanRetriedForever(t 
 			},
 			want: reasonCorrupt,
 		},
+		{
+			// Present and empty, which is not the same as absent: a field encoded on the
+			// wire as empty unmarshals to a non-nil slice of length zero, and whatsmeow
+			// reads only nil as "unencrypted". This one keeps the media key, takes the
+			// encrypted path and fails its length check there, with a plain error that
+			// would be read as worth another go.
+			name: "a ciphertext digest the sender left empty",
+			image: &waE2E.ImageMessage{
+				Mimetype: proto.String("image/jpeg"), DirectPath: proto.String(directPath),
+				MediaKey: []byte("key"), FileEncSHA256: []byte{},
+			},
+			want: reasonCorrupt,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -823,6 +836,15 @@ func TestAnEngineIsRefusedWhenBlobsCouldNotBeFetchedFromWhereItWouldPublishThem(
 		// url.Parse only checks that a port is digits, so both of these come through it.
 		{"the same port spelled differently", "http://connector:00"},
 		{"a port past the end of the range", "http://connector:99999"},
+		// Port() answers "" for this exactly as it does for an address that names no
+		// port at all, and a client reads the two the same way: as port 80.
+		{"a colon with no port after it", "http://connector:"},
+		{"the same with no port and no host", "http://:"},
+		// An IPv6 literal is written in brackets inside an authority, and url.Parse is
+		// what refuses this one. Pinned here rather than guarded against separately: a
+		// check of our own for it could be deleted with every test still passing, which
+		// is a guard that only reads as one.
+		{"an IPv6 address left unbracketed", "http://2001:db8::1:8080"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -855,6 +877,10 @@ func TestAnEngineTakesTheAddressesBlobsCanBeFetchedFrom(t *testing.T) {
 		// Not refused with the wildcards: an instance sharing a network namespace with
 		// its client is a deployment somebody really runs.
 		"http://127.0.0.1:8080",
+		// Bracketed, which is how an IPv6 literal is written in an authority, and the
+		// port left off entirely, which is a fine thing to publish under.
+		"http://[2001:db8::1]:8080",
+		"http://[::1]:8080",
 	} {
 		t.Run(base, func(t *testing.T) {
 			t.Parallel()

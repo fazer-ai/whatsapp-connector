@@ -224,7 +224,19 @@ func LoadConfig(hostname string) (Config, error) {
 		if err != nil {
 			return Config{}, fmt.Errorf("app: WAC_HTTP_ADDR %q is not an address to listen on: %w", cfg.HTTPAddr, err)
 		}
-		cfg.AdvertiseURL = "http://" + cfg.Instance + ":" + port
+		if port == "" {
+			// `:` and `host:` are addresses to listen on: they split without complaint
+			// and a listener given either takes whatever port is free. There is nothing
+			// to advertise then, and the derived address would carry a bare colon that
+			// every client reads as port 80.
+			return Config{}, fmt.Errorf(
+				"app: WAC_HTTP_ADDR %q names no port, and a listener given none takes any free one, "+
+					"which is not a port the rest of the deployment can be told to come back to", cfg.HTTPAddr)
+		}
+		// JoinHostPort rather than pasting a colon in: an instance addressed by an IPv6
+		// literal is written in brackets, and without them `2001:db8::1:8080` still
+		// parses, as that host and that port, into a URL no client can dial.
+		cfg.AdvertiseURL = "http://" + net.JoinHostPort(cfg.Instance, port)
 	}
 	return cfg, nil
 }

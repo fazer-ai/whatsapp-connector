@@ -131,6 +131,14 @@ func reachableAt(base string) error {
 			"whatsmeow: blobs are published under %q, which is an address to listen on rather than one to reach",
 			base)
 	}
+	if strings.HasSuffix(address.Host, ":") {
+		// Port() cannot tell this apart: it answers "" both for an address that names no
+		// port, which is a fine thing to publish under, and for one whose port is a
+		// colon with nothing after it, which a client reads as 80 and dials a listener
+		// that is somebody else.
+		return fmt.Errorf(
+			"whatsmeow: blobs are published under %q, whose colon is followed by no port", base)
+	}
 	if port := address.Port(); port != "" {
 		// url.Parse only checks that a port is digits, so 99999 and 00 both come through
 		// it. Range-checked rather than compared against "0": zero is what a listener
