@@ -40,9 +40,16 @@ type Options struct {
 	Registry *prometheus.Registry
 	Version  string
 	Instance string
+	// Media serves the bytes of inbound media messages. Left out, the routes are not
+	// registered at all rather than registered and refusing: an instance with no blob
+	// store answers 404 for them, which is what a client that reaches the wrong
+	// instance should hear.
+	Media http.Handler
 }
 
 // New builds the server without listening.
+//
+//nolint:gocritic // one call at startup; a pointer here would only invite a caller to keep it
 func New(opts Options) *Server {
 	if opts.Addr == "" {
 		opts.Addr = DefaultAddr
@@ -59,6 +66,13 @@ func New(opts Options) *Server {
 	mux.HandleFunc("GET /readyz", s.ready)
 	if opts.Registry != nil {
 		mux.Handle("GET /metrics", promhttp.HandlerFor(opts.Registry, promhttp.HandlerOpts{}))
+	}
+	if opts.Media != nil {
+		// HEAD as well as GET, because a client checking whether a blob is still there
+		// before queueing a download should not have to pull the file to find out. The
+		// standard library answers a HEAD from a GET handler by dropping the body.
+		mux.Handle("GET /media/{id}", opts.Media)
+		mux.Handle("HEAD /media/{id}", opts.Media)
 	}
 
 	s.server = &http.Server{

@@ -72,11 +72,11 @@ internal/session/         one account: the event pump and the per-session comman
 internal/engine/          the WhatsApp side behind an interface, plus a fake for tests
 internal/observability/   the redacting logger and the metric set
 internal/store/           the device store and which session paired which device
+internal/media/           the blob cache for inbound media, and the endpoint that serves it
 internal/httpserver/      /healthz, /readyz, /metrics
 internal/app/             configuration and the run loop that ties them together
 ```
 
-`internal/media` arrives with M2.
 
 ## Protocol
 
@@ -151,6 +151,12 @@ restart, and reports itself healthy while doing it.
 | `WAC_DEVICE_NAME` | `fazer.ai` | What the account's linked-devices list shows. Fleet-wide, not per session: whatsmeow keeps device properties process-wide |
 | `WAC_HTTP_ADDR` | `:8080` | Where `/healthz`, `/readyz` and `/metrics` listen |
 | `WAC_ADVERTISE_URL` | derived | How clients reach this instance for media |
+| `WAC_MEDIA_ROOT` | unset | Where inbound media is cached. Unset turns the store and the endpoint off |
+| `WAC_MEDIA_TOKEN` | unset | Bearer token the media endpoint requires. Required whenever `WAC_MEDIA_ROOT` is set: the endpoint hands out message contents |
+| `WAC_MEDIA_TTL` | `24h` | How long a blob is kept without being collected. The cache is walked every half of it, between a second and a minute, so a short TTL is swept often |
+| `WAC_MEDIA_QUOTA` | `2GiB` | Disk the blobs may take, counted in whole blocks and including each blob's description. Over it, the least recently collected go first |
+| `WAC_MEDIA_MAX_BLOB` | `100MiB` | The largest single file this instance keeps |
+| `WAC_MEDIA_BLOCK_SIZE` | `4KiB` | The allocation unit of the volume the cache sits on. Set it to match a filesystem formatted with larger units, or every file is undercharged against the quota |
 | `WAC_LEASE_TTL` | `30s` | How long a session lease survives without a renewal |
 | `WAC_HEARTBEAT` | `5s` | How often leases are renewed and the instance re-announces. Also bounds how long a read waits on Redis (half a heartbeat), and has to leave room for the read and the batch before it: `1.5 × heartbeat + lease/3 < lease` |
 | `WAC_CLAIM_MIN_IDLE` | `1.5 × lease` | How long a command sits unacknowledged before another instance takes it over. Must exceed `WAC_LEASE_TTL` |

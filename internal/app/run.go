@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"slices"
@@ -18,6 +20,7 @@ import (
 	"github.com/fazer-ai/whatsapp-connector/internal/engine/fake"
 	meow "github.com/fazer-ai/whatsapp-connector/internal/engine/whatsmeow"
 	"github.com/fazer-ai/whatsapp-connector/internal/httpserver"
+	"github.com/fazer-ai/whatsapp-connector/internal/media"
 	"github.com/fazer-ai/whatsapp-connector/internal/observability"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 	"github.com/fazer-ai/whatsapp-connector/internal/redisx"
@@ -52,6 +55,7 @@ type Connector struct {
 	store    *store.Container
 	streams  *redisstream.Streams
 	http     *httpserver.Server
+	blobs    *media.Store
 
 	// reclaimCursor is where the next reclaim pass starts. Read and written only by the
 	// loop goroutine, which is also the only one that reclaims.
@@ -109,9 +113,27 @@ func New(cfg *Config, log zerolog.Logger) (*Connector, error) {
 		registry: cluster.NewRegistry(client, 3*cfg.Heartbeat), manager: manager, engine: waEngine,
 		store: devices,
 	}
+
+	// Only when the deployment gave it somewhere to write. An instance with no blob
+	// store does not register the endpoint at all, so a client that reaches it hears
+	// 404 and asks the session for the bytes again, which is what it does for a blob
+	// that has aged out anyway.
+	var blobHandler http.Handler
+	if cfg.MediaRoot != "" {
+		blobs, err := media.New(media.Options{
+			Root: cfg.MediaRoot, TTL: cfg.MediaTTL,
+			Quota: cfg.MediaQuota, MaxBlob: cfg.MediaMaxBlob, BlockSize: cfg.MediaBlockSize,
+		})
+		if err != nil {
+			return nil, err
+		}
+		c.blobs = blobs
+		blobHandler = media.Handler(media.HandlerOptions{Blobs: blobs, Token: cfg.MediaToken})
+	}
+
 	c.http = httpserver.New(httpserver.Options{
 		Addr: cfg.HTTPAddr, Health: c, Registry: metrics.Registry,
-		Version: Version, Instance: cfg.Instance,
+		Version: Version, Instance: cfg.Instance, Media: blobHandler,
 	})
 	c.streams = streams
 	return c, nil
@@ -134,6 +156,10 @@ func (c *Connector) Ready(ctx context.Context) error {
 	return c.store.Ping(pingCtx)
 }
 
+// Handler is what the HTTP server serves, so a test can exercise the routes this
+// instance actually registered without going through a socket.
+func (c *Connector) Handler() http.Handler { return c.http.Handler() }
+
 // Sessions is how many sessions this instance runs.
 func (c *Connector) Sessions() int { return c.manager.Count() }
 
@@ -145,6 +171,14 @@ func (c *Connector) Run(ctx context.Context) error {
 	httpErr := make(chan error, 1)
 	go func() { httpErr <- c.http.Start() }()
 
+	// On a context of its own rather than on the one the loop watches, because the loop
+	// has an exit the context knows nothing about: an HTTP server that cannot listen
+	// ends the run while nothing has cancelled anything. Waiting on a sweeper that is
+	// still ticking would hang the process on exactly the startup failure it is trying
+	// to report.
+	sweeping, stopSweeping := context.WithCancel(ctx)
+	swept := c.sweepBlobs(sweeping)
+
 	c.log.Info().
 		Str("addr", c.cfg.HTTPAddr).
 		Str("engine", c.cfg.Engine).
@@ -153,6 +187,17 @@ func (c *Connector) Run(ctx context.Context) error {
 
 	err := c.loop(ctx, httpErr)
 	c.shutdown()
+	// After the loop, so the sweep is not walking a directory the shutdown is still
+	// writing to, and waited for, so the process does not exit mid-rename.
+	stopSweeping()
+	<-swept
+	if c.blobs != nil {
+		// After the sweeper has stopped, so nothing is walking the directory through a
+		// handle that is being closed.
+		if closeErr := c.blobs.Close(); closeErr != nil {
+			c.log.Warn().Err(closeErr).Msg("could not close the media store")
+		}
+	}
 	return err
 }
 
@@ -185,6 +230,68 @@ func (c *Connector) loop(ctx context.Context, httpErr <-chan error) error {
 			c.readCommands(ctx)
 		}
 	}
+}
+
+// The bounds on how often the media cache is walked. What the cadence decides is how
+// long a blob outlives the age it was supposed to be kept for, and how long the disk
+// stays over quota after a burst; what it costs is a walk of the whole cache.
+//
+// A minute is the ceiling because that is short enough for both against any ordinary
+// TTL. The floor is there because the cadence follows the TTL down: a deployment that
+// asks for a minute of retention and is swept once a minute keeps its media for two, so
+// a short TTL has to be swept often to mean anything, and a second is as often as this
+// is willing to walk a cache that may be large.
+const (
+	blobSweepMax = time.Minute
+	blobSweepMin = time.Second
+)
+
+// BlobSweep is how often to walk, for a store keeping blobs for ttl. Half the TTL, so a
+// blob outlives it by at most half again rather than by a whole fixed interval.
+func BlobSweep(ttl time.Duration) time.Duration {
+	return min(max(ttl/2, blobSweepMin), blobSweepMax)
+}
+
+// sweepBlobs drops the media nobody collected, on a goroutine of its own. The returned
+// channel closes once it has stopped.
+//
+// Not on the heartbeat, and this is the point rather than tidiness: that goroutine is
+// what renews every lease this instance holds, and a walk of a cache with many files on
+// a slow disk can outlast a lease. Peers would then adopt sessions whose sockets are
+// still open here, which is the one invariant nothing downstream can recover from. The
+// sweep has no deadline it must meet, so it gets its own goroutine and can take as long
+// as the disk makes it take.
+func (c *Connector) sweepBlobs(ctx context.Context) <-chan struct{} {
+	done := make(chan struct{})
+	if c.blobs == nil {
+		close(done)
+		return done
+	}
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(BlobSweep(c.cfg.MediaTTL))
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+			dropped, freed, err := c.blobs.Sweep(ctx)
+			switch {
+			case errors.Is(err, context.Canceled):
+				// The sweep gave up because the process is stopping, which is what was
+				// asked of it.
+				return
+			case err != nil:
+				c.log.Warn().Err(err).Msg("could not sweep the media store")
+			case dropped > 0:
+				c.log.Debug().Int("blobs", dropped).Int64("bytes", freed).
+					Msg("dropped media nobody collected")
+			}
+		}
+	}()
+	return done
 }
 
 // reclaimCommands takes over what nobody acknowledged: what another instance read

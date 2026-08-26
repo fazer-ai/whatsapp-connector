@@ -3,6 +3,9 @@ package app_test
 import (
 	"context"
 	"encoding/json"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strconv"
 	"testing"
@@ -571,5 +574,213 @@ func TestATimingThatCannotWorkIsRefusedAtStartup(t *testing.T) {
 	}
 	if _, err := app.LoadConfig("connector-test"); err != nil {
 		t.Fatalf("LoadConfig: %v", err)
+	}
+}
+
+// The media endpoint hands out message contents, and the token is the only thing in
+// front of it. A deployment that sets a store and forgets the token would open it to
+// anything that can reach the port, so it is refused at startup rather than served.
+func TestAMediaStoreWithNoTokenIsRefused(t *testing.T) {
+	t.Setenv("WAC_INSTANCE", "inst-a")
+	t.Setenv("WAC_MEDIA_ROOT", t.TempDir())
+	t.Setenv("WAC_MEDIA_TOKEN", "")
+
+	if _, err := app.LoadConfig("host"); err == nil {
+		t.Fatal("a media store with no token was accepted")
+	}
+}
+
+// A size is what an operator sizing a volume is working in, so the suffixes are the
+// powers of two and a value that is not a size fails at startup rather than falling back
+// to a default nobody asked for.
+func TestMediaSizesAreReadAsSizes(t *testing.T) {
+	t.Setenv("WAC_INSTANCE", "inst-a")
+	t.Setenv("WAC_MEDIA_ROOT", t.TempDir())
+	t.Setenv("WAC_MEDIA_TOKEN", "s3cret")
+
+	t.Setenv("WAC_MEDIA_QUOTA", "4 GiB")
+	t.Setenv("WAC_MEDIA_MAX_BLOB", "50MiB")
+	cfg, err := app.LoadConfig("host")
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.MediaQuota != 4<<30 {
+		t.Fatalf("the quota read as %d, want 4 GiB", cfg.MediaQuota)
+	}
+	if cfg.MediaMaxBlob != 50<<20 {
+		t.Fatalf("the per-blob cap read as %d, want 50 MiB", cfg.MediaMaxBlob)
+	}
+
+	// The last one is what wraps the multiplication: positive going in, and negative or
+	// a small positive coming out, which media.New then reads as unset and replaces with
+	// a default nobody asked for.
+	for _, bad := range []string{"lots", "-1", "0", "4GB", "4 gib", "9223372036854775807 GiB"} {
+		t.Setenv("WAC_MEDIA_QUOTA", bad)
+		if _, err := app.LoadConfig("host"); err == nil {
+			t.Fatalf("WAC_MEDIA_QUOTA=%q was accepted", bad)
+		}
+	}
+}
+
+// A non-positive TTL parses as a duration and is then silently replaced by the store's
+// own default, so a deployment that asked for something else keeps a day of blobs and is
+// told nothing. The setting is honoured or the instance does not start.
+func TestANonPositiveMediaTTLIsRefused(t *testing.T) {
+	t.Setenv("WAC_INSTANCE", "inst-a")
+	t.Setenv("WAC_MEDIA_ROOT", t.TempDir())
+	t.Setenv("WAC_MEDIA_TOKEN", "s3cret")
+
+	for _, bad := range []string{"0s", "-1h"} {
+		t.Setenv("WAC_MEDIA_TTL", bad)
+		if _, err := app.LoadConfig("host"); err == nil {
+			t.Fatalf("WAC_MEDIA_TTL=%q was accepted", bad)
+		}
+	}
+}
+
+// One blob larger than the whole budget evicts the cache and then itself, which is a
+// deployment that looks configured and caches nothing.
+func TestAPerBlobCapLargerThanTheQuotaIsRefused(t *testing.T) {
+	t.Setenv("WAC_INSTANCE", "inst-a")
+	t.Setenv("WAC_MEDIA_ROOT", t.TempDir())
+	t.Setenv("WAC_MEDIA_TOKEN", "s3cret")
+	t.Setenv("WAC_MEDIA_QUOTA", "10MiB")
+	t.Setenv("WAC_MEDIA_MAX_BLOB", "100MiB")
+
+	if _, err := app.LoadConfig("host"); err == nil {
+		t.Fatal("a per-blob cap larger than the whole quota was accepted")
+	}
+}
+
+// The run loop has an exit the context knows nothing about: an HTTP server that cannot
+// listen ends it while nothing has cancelled anything. A sweeper watching only that
+// context would still be ticking, and waiting for it hangs the process on exactly the
+// startup failure it is trying to report.
+func TestAStartupFailureIsReportedRatherThanHungOn(t *testing.T) {
+	var listener net.ListenConfig
+	occupied, err := listener.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	t.Cleanup(func() { _ = occupied.Close() })
+
+	server := miniredis.RunT(t)
+	t.Setenv("WAC_INSTANCE", "inst-a")
+	t.Setenv("REDIS_URL", "redis://"+server.Addr())
+	t.Setenv("WAC_HTTP_ADDR", occupied.Addr().String())
+	t.Setenv("WAC_MEDIA_ROOT", t.TempDir())
+	t.Setenv("WAC_MEDIA_TOKEN", "s3cret")
+
+	cfg, err := app.LoadConfig("host")
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	connector, err := app.New(&cfg, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("app.New: %v", err)
+	}
+
+	// Background rather than a cancellable context, which is what the binary passes:
+	// the point is that nothing cancels this and the run still has to come back.
+	done := make(chan error, 1)
+	go func() { done <- connector.Run(context.Background()) }()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("a connector that could not listen reported a clean run")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the run never came back: a startup failure is being waited on rather than reported")
+	}
+}
+
+// A fixed cadence ignores a TTL shorter than itself: a deployment asking to keep media
+// for a second would keep it for a minute, which is the opposite of what a short
+// retention is set for. The walk costs real time on a large cache, so it follows the TTL
+// down only to a floor and never above a minute.
+func TestTheSweepCadenceFollowsTheRetention(t *testing.T) {
+	t.Parallel()
+
+	cases := map[time.Duration]time.Duration{
+		24 * time.Hour:   time.Minute,
+		10 * time.Minute: time.Minute,
+		time.Minute:      30 * time.Second,
+		10 * time.Second: 5 * time.Second,
+		time.Second:      time.Second,
+		time.Millisecond: time.Second,
+	}
+	for ttl, want := range cases {
+		if got := app.BlobSweep(ttl); got != want {
+			t.Fatalf("a %s retention is swept every %s, want %s", ttl, got, want)
+		}
+	}
+}
+
+// The media endpoint reaches a client only if every piece between the setting and the
+// socket is wired: the store is built, the handler is given the token, and the routes are
+// registered. Each of those is covered on its own; this is the one that would notice a
+// connector that reads WAC_MEDIA_ROOT and serves nothing.
+func TestTheMediaEndpointIsServedByARunningConnector(t *testing.T) {
+	server := miniredis.RunT(t)
+	t.Setenv("WAC_INSTANCE", "inst-a")
+	t.Setenv("REDIS_URL", "redis://"+server.Addr())
+	t.Setenv("WAC_HTTP_ADDR", "127.0.0.1:0")
+	t.Setenv("WAC_MEDIA_ROOT", t.TempDir())
+	t.Setenv("WAC_MEDIA_TOKEN", "s3cret")
+
+	cfg, err := app.LoadConfig("host")
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	connector, err := app.New(&cfg, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("app.New: %v", err)
+	}
+
+	// The mux the running server serves, exercised without a socket: a port of zero is
+	// only known after Start, and what is being checked is the wiring rather than the
+	// listener.
+	handler := connector.Handler()
+	const blob = "/media/blob_000102030405060708090a0b"
+
+	withToken := httptest.NewRecorder()
+	authorized := httptest.NewRequestWithContext(t.Context(), http.MethodGet, blob, http.NoBody)
+	authorized.Header.Set("Authorization", "Bearer s3cret")
+	handler.ServeHTTP(withToken, authorized)
+	if withToken.Code != http.StatusNotFound {
+		t.Fatalf("a blob that is not there answered %d, want 404: the route is not reaching the store", withToken.Code)
+	}
+
+	withoutToken := httptest.NewRecorder()
+	handler.ServeHTTP(withoutToken, httptest.NewRequestWithContext(t.Context(), http.MethodGet, blob, http.NoBody))
+	if withoutToken.Code != http.StatusUnauthorized {
+		t.Fatalf("an unauthenticated request answered %d, want 401: the token is not reaching the handler", withoutToken.Code)
+	}
+}
+
+// And the other way: a connector with no media root serves no media at all, so a client
+// that reaches the wrong instance hears 404 rather than a 401 it would read as an
+// operational problem to escalate.
+func TestAConnectorWithNoMediaRootServesNoMedia(t *testing.T) {
+	server := miniredis.RunT(t)
+	t.Setenv("WAC_INSTANCE", "inst-a")
+	t.Setenv("REDIS_URL", "redis://"+server.Addr())
+	t.Setenv("WAC_MEDIA_ROOT", "")
+
+	cfg, err := app.LoadConfig("host")
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	connector, err := app.New(&cfg, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("app.New: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	connector.Handler().ServeHTTP(rec, httptest.NewRequestWithContext(
+		t.Context(), http.MethodGet, "/media/blob_000102030405060708090a0b", http.NoBody))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("an instance with no media store answered %d, want 404", rec.Code)
 	}
 }

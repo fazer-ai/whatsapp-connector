@@ -4,11 +4,13 @@ package app
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/fazer-ai/whatsapp-connector/internal/media"
 	"github.com/fazer-ai/whatsapp-connector/internal/redisx"
 )
 
@@ -30,9 +32,21 @@ type Config struct {
 	HTTPAddr     string
 	AdvertiseURL string
 	MediaToken   string
-	LogLevel     string
-	LeaseTTL     time.Duration
-	Heartbeat    time.Duration
+	// MediaRoot is where this instance keeps the bytes of inbound media. Empty turns
+	// the blob store off, and with it the media endpoint: an instance with nowhere to
+	// put a file publishes messages without a blob to fetch rather than filling a
+	// directory it was not given.
+	MediaRoot    string
+	MediaTTL     time.Duration
+	MediaQuota   int64
+	MediaMaxBlob int64
+	// MediaBlockSize is the allocation unit of the volume the media root sits on, which
+	// is what the quota is counted in. A volume formatted with larger units than the
+	// default undercharges every file by the difference.
+	MediaBlockSize int64
+	LogLevel       string
+	LeaseTTL       time.Duration
+	Heartbeat      time.Duration
 	// ClaimMinIdle is how long a command has to sit unacknowledged before another
 	// instance takes it over. It bounds how long a session stays unowned after the
 	// instance that woke it died, and it has to stay comfortably above the time a
@@ -79,23 +93,44 @@ func LoadConfig(hostname string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	mediaTTL, err := envDuration("WAC_MEDIA_TTL", media.DefaultTTL)
+	if err != nil {
+		return Config{}, err
+	}
+	mediaQuota, err := envBytes("WAC_MEDIA_QUOTA", media.DefaultQuota)
+	if err != nil {
+		return Config{}, err
+	}
+	mediaMaxBlob, err := envBytes("WAC_MEDIA_MAX_BLOB", media.DefaultMaxBlob)
+	if err != nil {
+		return Config{}, err
+	}
+	mediaBlockSize, err := envBytes("WAC_MEDIA_BLOCK_SIZE", media.DefaultBlockSize)
+	if err != nil {
+		return Config{}, err
+	}
 
 	cfg := Config{
-		Instance:     envString("WAC_INSTANCE", hostname),
-		RedisURL:     envString("REDIS_URL", ""),
-		RedisPass:    envString("REDIS_PASSWORD", ""),
-		RedisPrefix:  envString("WAC_REDIS_PREFIX", redisx.DefaultPrefix),
-		EventShards:  shards,
-		Engine:       envString("WAC_ENGINE", "fake"),
-		DatabaseURL:  envString("WAC_DATABASE_URL", ""),
-		DeviceName:   envString("WAC_DEVICE_NAME", DefaultDeviceName),
-		HTTPAddr:     envString("WAC_HTTP_ADDR", ":8080"),
-		AdvertiseURL: envString("WAC_ADVERTISE_URL", ""),
-		MediaToken:   envString("WAC_MEDIA_TOKEN", ""),
-		LogLevel:     envString("WAC_LOG_LEVEL", "info"),
-		LeaseTTL:     leaseTTL,
-		Heartbeat:    heartbeat,
-		ClaimMinIdle: claimMinIdle,
+		Instance:       envString("WAC_INSTANCE", hostname),
+		RedisURL:       envString("REDIS_URL", ""),
+		RedisPass:      envString("REDIS_PASSWORD", ""),
+		RedisPrefix:    envString("WAC_REDIS_PREFIX", redisx.DefaultPrefix),
+		EventShards:    shards,
+		Engine:         envString("WAC_ENGINE", "fake"),
+		DatabaseURL:    envString("WAC_DATABASE_URL", ""),
+		DeviceName:     envString("WAC_DEVICE_NAME", DefaultDeviceName),
+		HTTPAddr:       envString("WAC_HTTP_ADDR", ":8080"),
+		AdvertiseURL:   envString("WAC_ADVERTISE_URL", ""),
+		MediaToken:     envString("WAC_MEDIA_TOKEN", ""),
+		MediaRoot:      envString("WAC_MEDIA_ROOT", ""),
+		MediaTTL:       mediaTTL,
+		MediaQuota:     mediaQuota,
+		MediaMaxBlob:   mediaMaxBlob,
+		MediaBlockSize: mediaBlockSize,
+		LogLevel:       envString("WAC_LOG_LEVEL", "info"),
+		LeaseTTL:       leaseTTL,
+		Heartbeat:      heartbeat,
+		ClaimMinIdle:   claimMinIdle,
 	}
 	if cfg.Instance == "" {
 		return Config{}, fmt.Errorf("app: WAC_INSTANCE is empty and the hostname is unknown")
@@ -156,10 +191,61 @@ func LoadConfig(hostname string) (Config, error) {
 		// is not.
 		return Config{}, fmt.Errorf("app: WAC_DATABASE_URL is required when WAC_ENGINE is %q", EngineWhatsmeow)
 	}
+	if cfg.MediaTTL <= 0 {
+		// media.New substitutes its own default for a non-positive TTL, so a deployment
+		// that asked for something else would keep a day's worth of blobs and report
+		// nothing about it. The setting is honoured or the instance does not start.
+		return Config{}, fmt.Errorf("app: WAC_MEDIA_TTL must be positive, got %s", cfg.MediaTTL)
+	}
+	if cfg.MediaMaxBlob > cfg.MediaQuota {
+		// One blob would evict everything else and then itself. media.New refuses this
+		// as well; saying so here is what puts it in front of an operator alongside the
+		// other two settings rather than inside a subsystem's constructor.
+		return Config{}, fmt.Errorf(
+			"app: WAC_MEDIA_MAX_BLOB (%d) is larger than WAC_MEDIA_QUOTA (%d), so a blob at the cap "+
+				"evicts the whole cache and then itself", cfg.MediaMaxBlob, cfg.MediaQuota)
+	}
+	if cfg.MediaRoot != "" && cfg.MediaToken == "" {
+		// The endpoint hands out message contents, and its only guard is the token. A
+		// store with no token would serve them to anything that can reach the port, so
+		// the deployment is refused rather than quietly opened.
+		return Config{}, fmt.Errorf("app: WAC_MEDIA_TOKEN is required when WAC_MEDIA_ROOT is set")
+	}
 	if cfg.AdvertiseURL == "" {
 		cfg.AdvertiseURL = "http://" + cfg.Instance + strings.TrimPrefix(cfg.HTTPAddr, "0.0.0.0")
 	}
 	return cfg, nil
+}
+
+// envBytes reads a size. Plain digits are bytes, and the usual suffixes are the powers
+// of two rather than of ten, because the setting is a disk budget and that is the unit
+// an operator sizing a volume is working in.
+func envBytes(name string, fallback int64) (int64, error) {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback, nil
+	}
+	scale := int64(1)
+	for suffix, factor := range map[string]int64{"KiB": 1 << 10, "MiB": 1 << 20, "GiB": 1 << 30} {
+		if trimmed, found := strings.CutSuffix(raw, suffix); found {
+			raw, scale = strings.TrimSpace(trimmed), factor
+			break
+		}
+	}
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("app: %s must be a size in bytes, optionally suffixed KiB, MiB or GiB: %w", name, err)
+	}
+	if value <= 0 {
+		return 0, fmt.Errorf("app: %s must be positive, got %d", name, value)
+	}
+	if value > math.MaxInt64/scale {
+		// Checked before the multiplication rather than after: past this the product
+		// wraps, and a budget that wrapped is either negative, which reads as unset and
+		// is replaced by a default, or a small positive number nobody asked for.
+		return 0, fmt.Errorf("app: %s is larger than this can count in bytes", name)
+	}
+	return value * scale, nil
 }
 
 func envString(name, fallback string) string {
