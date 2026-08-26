@@ -32,7 +32,7 @@ func newStore(t *testing.T, opts media.Options) (store *media.Store, root string
 
 func put(t *testing.T, store *media.Store, body string, about *media.Blob) media.Blob {
 	t.Helper()
-	stored, err := store.Put(strings.NewReader(body), about)
+	stored, err := store.Put(t.Context(), strings.NewReader(body), about)
 	if err != nil {
 		t.Fatalf("Put: %v", err)
 	}
@@ -125,10 +125,10 @@ func TestABlobPastTheCapIsRefusedAndLeavesNothingBehind(t *testing.T) {
 
 	store, root := newStore(t, media.Options{MaxBlob: 8, Quota: 1 << 20})
 
-	if _, err := store.Put(bytes.NewReader(bytes.Repeat([]byte("x"), 8)), &media.Blob{}); err != nil {
+	if _, err := store.Put(t.Context(), bytes.NewReader(bytes.Repeat([]byte("x"), 8)), &media.Blob{}); err != nil {
 		t.Fatalf("a blob exactly at the cap was refused: %v", err)
 	}
-	_, err := store.Put(bytes.NewReader(bytes.Repeat([]byte("x"), 9)), &media.Blob{})
+	_, err := store.Put(t.Context(), bytes.NewReader(bytes.Repeat([]byte("x"), 9)), &media.Blob{})
 	if !errors.Is(err, media.ErrTooLarge) {
 		t.Fatalf("a blob past the cap answered with %v, want ErrTooLarge", err)
 	}
@@ -692,7 +692,7 @@ func TestASourceThatPausesIsNotMistakenForOneThatEnded(t *testing.T) {
 	// Four bytes, then one pause, then more: exactly the shape that reads as an exact
 	// fit to a single lookahead.
 	source := io.MultiReader(strings.NewReader("0123"), &pause{}, strings.NewReader("456"))
-	if _, err := store.Put(source, &media.Blob{}); !errors.Is(err, media.ErrTooLarge) {
+	if _, err := store.Put(t.Context(), source, &media.Blob{}); !errors.Is(err, media.ErrTooLarge) {
 		t.Fatalf("a source with more bytes after a pause answered with %v, want ErrTooLarge", err)
 	}
 }
@@ -707,4 +707,41 @@ func (p *pause) Read([]byte) (int, error) {
 	}
 	p.done = true
 	return 0, nil
+}
+
+// The source is a download off somebody else's network, so it can stall for as long as
+// that network feels like it. The session that owns the write has to be able to let go
+// of it when its lease moves or the process stops.
+func TestAStalledWriteGivesUpWithTheContext(t *testing.T) {
+	t.Parallel()
+
+	store, _ := newStore(t, media.Options{})
+	ctx, cancel := context.WithCancel(t.Context())
+
+	// Answers a little and then never again, which is a socket that has gone quiet.
+	stalled := io.MultiReader(strings.NewReader("the first bytes"), blockUntil(ctx.Done()))
+	done := make(chan error, 1)
+	go func() {
+		_, err := store.Put(ctx, stalled, &media.Blob{})
+		done <- err
+	}()
+
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("a stalled write answered with %v, want the cancellation", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a stalled write did not come back: the session cannot let go of it")
+	}
+}
+
+// blockUntil is a reader that answers nothing until the channel closes, then reports the
+// end of the file. It is a socket waiting on bytes that are not coming.
+type blockUntil <-chan struct{}
+
+func (b blockUntil) Read([]byte) (int, error) {
+	<-b
+	return 0, io.EOF
 }

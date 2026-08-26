@@ -33,6 +33,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -88,6 +89,15 @@ type Options struct {
 type Store struct {
 	opts Options
 	root *os.Root
+
+	// collecting is held for reading while a blob is being handed out and for writing
+	// while one is being evicted. Reading the time and then removing on it is two
+	// operations, and an Open that lands between them touches a blob the sweep is
+	// already committed to deleting: the recheck sees the old time, the removal
+	// succeeds because Unix lets it, and a HEAD that answered 200 is followed by a GET
+	// that answers 404. Handing out is cheap and concurrent; evicting is neither, and
+	// it is the only thing that has to be alone.
+	collecting sync.RWMutex
 }
 
 // New prepares the store, creating the root if it is not there.
@@ -146,7 +156,7 @@ func (s *Store) MaxBlob() int64 { return s.opts.MaxBlob }
 // the sweep collects rather than a file that lies about its length. The description is
 // written before the bytes are named, for the same reason in the other direction: a
 // blob without one is unservable, so it must not be the state a crash can leave.
-func (s *Store) Put(source io.Reader, about *Blob) (Blob, error) {
+func (s *Store) Put(ctx context.Context, source io.Reader, about *Blob) (Blob, error) {
 	id, err := newID()
 	if err != nil {
 		return Blob{}, err
@@ -175,6 +185,11 @@ func (s *Store) Put(source io.Reader, about *Blob) (Blob, error) {
 		_ = temp.Close()
 		_ = s.root.Remove(tempName)
 	}()
+
+	// The source is a download off somebody else's network, so it can stall for as long
+	// as that network feels like it. Reading through the context is what lets the
+	// session that owns this let go of it when its lease moves or the process stops.
+	source = &reading{ctx: ctx, from: source}
 
 	digest := sha256.New()
 	written, err := io.Copy(io.MultiWriter(temp, digest), io.LimitReader(source, s.opts.MaxBlob))
@@ -206,6 +221,20 @@ func (s *Store) Put(source io.Reader, about *Blob) (Blob, error) {
 		return Blob{}, fmt.Errorf("media: name %s: %w", id, err)
 	}
 	return stored, nil
+}
+
+// reading is a source that gives up when the context does. io.Copy has no way to be
+// interrupted, so the check goes on the read it is already making.
+type reading struct {
+	ctx  context.Context
+	from io.Reader
+}
+
+func (r *reading) Read(into []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.from.Read(into) //nolint:wrapcheck // a pass-through reader; wrapping would hide io.EOF
 }
 
 // refuseIfMore reports a source that still has something in it once the cap has been
@@ -248,7 +277,9 @@ func (s *Store) Open(id string) (io.ReadSeekCloser, Blob, error) {
 	now := s.opts.Now()
 	// Best effort: a blob that could not be touched is one the sweep may drop sooner
 	// than it should, which costs a download and not the answer being given here.
+	s.collecting.RLock()
 	_ = s.root.Chtimes(s.pathOf(id), now, now)
+	s.collecting.RUnlock()
 	return file, about, nil
 }
 
@@ -281,10 +312,12 @@ func (s *Store) Sweep(ctx context.Context) (dropped int, freed int64, err error)
 	}
 
 	take := func(entry held) bool {
-		// Read again, immediately before removing. The snapshot is minutes old by now
-		// and Open touches a blob it hands out, so a blob collected since the walk is
-		// one somebody is using: dropping it on the stale time turns a HEAD that
-		// answered 200 into a GET that answers 404.
+		// Read again, immediately before removing, and with nothing able to touch it in
+		// between. The snapshot is minutes old by now and Open touches a blob it hands
+		// out, so a blob collected since the walk is one somebody is using: dropping it
+		// on the stale time turns a HEAD that answered 200 into a GET that answers 404.
+		s.collecting.Lock()
+		defer s.collecting.Unlock()
 		if info, err := s.root.Stat(s.pathOf(entry.id)); err == nil && info.ModTime().After(entry.touched) {
 			return false
 		}
@@ -416,8 +449,16 @@ func (s *Store) list(ctx context.Context) (blobs []held, leftovers []string, ski
 			return nil
 		}
 		info, err := entry.Info()
+		if errors.Is(err, os.ErrNotExist) {
+			// Gone between the walk and the stat, which is what the sweep wanted anyway.
+			return nil
+		}
 		if err != nil {
-			return nil //nolint:nilerr // gone between the walk and the stat, which the sweep wanted anyway
+			// Anything else and the file is still there and unmeasured: it drops out of
+			// the quota accounting while the sweep reports a clean pass, so the cache
+			// can sit over budget for as long as the condition lasts.
+			skipped = errors.Join(skipped, fmt.Errorf("media: measure %s: %w", path, err))
+			return nil
 		}
 		switch name, aged := entry.Name(), info.ModTime().Before(s.opts.Now().Add(-s.opts.TTL)); {
 		case path == s.tempPath(strings.TrimPrefix(name, tempPrefix)):
