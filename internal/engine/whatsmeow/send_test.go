@@ -271,6 +271,12 @@ func TestWhatsAppsOwnRefusalsKeepTheirMeaning(t *testing.T) {
 		// give up on a message that is already in somebody's chat.
 		{"the command's deadline running out", context.DeadlineExceeded, protocol.ErrorTimeout},
 		{"the command being abandoned", context.Canceled, protocol.ErrorTimeout},
+		// whatsmeow sends every direct message under a LID and looks one up for a number
+		// that has none cached. A number nobody registered has none to find, and that is
+		// permanent: as a WhatsApp refusal it reads as something to try again, and a
+		// client retries a number that can never receive anything.
+		{"a number nobody has registered", errors.New("no LID found for 5511999999999@s.whatsapp.net from server"),
+			protocol.ErrorRecipientNotOnWhatsapp},
 		{"anything this does not name", errors.New("something new in the protocol"), protocol.ErrorWaError},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -299,5 +305,44 @@ func assertCode(t *testing.T, err error, want protocol.ErrorCode) {
 	}
 	if coded.Code != want {
 		t.Fatalf("the failure is %q, want %q", coded.Code, want)
+	}
+}
+
+// Which identity a message goes out under is whatsmeow's rule, not a preference: a
+// direct chat is sent under the LID whichever way the caller addressed it, because the
+// library looks the LID up and replaces the destination with it. A quote attributed
+// under the other form is one a client cannot match to anybody.
+func TestAQuoteOfThisAccountsOwnMessageUsesTheIdentityItWasSentUnder(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		to   waTypes.JID
+		want string
+	}{
+		{"a direct chat the caller addressed by phone", peer, "89572297961476@" + waTypes.HiddenUserServer},
+		{"a direct chat the caller addressed by LID",
+			waTypes.NewJID("167392323834034", waTypes.HiddenUserServer), "89572297961476@" + waTypes.HiddenUserServer},
+		// A group is sent under the LID only when the group itself is LID-addressed,
+		// which is behind a lookup this connector would pay a round trip for on the send
+		// path. Being wrong costs a quote the recipient cannot attribute, which is where
+		// it was before it was attributed at all.
+		{"a group", groupChat, "5511999990001@" + waTypes.DefaultUserServer},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			session, _ := newTestSession(t, "5511999990001")
+			session.setIdentity("5511999990001", "89572297961476")
+
+			message, err := textToSend(quotingRequest("3EB0ORIGINAL", true, nil), session.ownJID(tc.to), tc.to)
+			if err != nil {
+				t.Fatalf("textToSend: %v", err)
+			}
+			got := message.GetExtendedTextMessage().GetContextInfo().GetParticipant()
+			if got != tc.want {
+				t.Fatalf("the quote attributes this account as %q, want %q", got, tc.want)
+			}
+		})
 	}
 }

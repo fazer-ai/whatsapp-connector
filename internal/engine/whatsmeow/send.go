@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	wm "go.mau.fi/whatsmeow"
 	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
@@ -91,7 +92,7 @@ func (s *Session) send(ctx context.Context, command *protocol.Command) (json.Raw
 	// doing, and answering `not_connected` to one sends it away to wait for a
 	// connection that would not have helped.
 	client := s.current()
-	message, err := textToSend(&req, ownJID(client, to), to)
+	message, err := textToSend(&req, s.ownJID(to), to)
 	if err != nil {
 		return nil, err
 	}
@@ -104,7 +105,13 @@ func (s *Session) send(ctx context.Context, command *protocol.Command) (json.Raw
 		// to do.
 		return nil, protocol.NewError(protocol.ErrorNotPaired, "this session has no WhatsApp account to send from")
 	}
-	if !client.IsConnected() {
+	if s.state() != "open" {
+		// The session's own state, not whatsmeow's. IsConnected takes the socket lock,
+		// which a dial holds for its whole handshake, so a send that arrived during a
+		// resume would wait there without watching its own deadline and hold the
+		// session's queue behind it. It also goes true when the websocket opens and
+		// before the account is authenticated, which is a send onto a stream WhatsApp
+		// has not accepted yet.
 		return nil, protocol.NewError(protocol.ErrorNotConnected, "the session is not connected to WhatsApp")
 	}
 
@@ -140,15 +147,32 @@ func textToSend(req *sendRequest, own, to waTypes.JID) (*waE2E.Message, error) {
 	}}, nil
 }
 
-// ownJID is this account's own address, in the form the chat is addressed by. WhatsApp
-// names the same account by phone number in one chat and by LID in the next, and a
-// quote attributed under the other one is a quote a client cannot match to anybody.
-func ownJID(client *wm.Client, to waTypes.JID) waTypes.JID {
-	if to.Server == waTypes.HiddenUserServer && !client.Store.LID.IsEmpty() {
-		return client.Store.LID.ToNonAD()
+// ownJID is this account's own address, in the form a message to this chat is sent
+// under. A quote attributed under the other form is one a client cannot match to
+// anybody, and WhatsApp names the same account by phone number in one chat and by LID
+// in the next.
+//
+// Which form it is, is whatsmeow's own rule rather than a guess: a direct chat is sent
+// under the LID whichever way the caller addressed it, because the library looks the
+// LID up and replaces the destination with it. A group is sent under the LID only when
+// the group itself is LID-addressed, and that is behind a cached lookup this connector
+// would have to pay a round trip for on the send path, so the phone number is used
+// there. The cost of being wrong is a quote of this account's own message that the
+// recipient cannot attribute, which is what it was before it was attributed at all.
+//
+// Read from the session's snapshot and not from the store, because whatsmeow writes
+// those fields from its pairing goroutine.
+func (s *Session) ownJID(to waTypes.JID) waTypes.JID {
+	phone, lid := s.identity()
+	direct := to.Server == waTypes.DefaultUserServer || to.Server == waTypes.HiddenUserServer
+	if direct && lid != "" {
+		return waTypes.NewJID(lid, waTypes.HiddenUserServer)
 	}
-	if client.Store.ID != nil {
-		return client.Store.ID.ToNonAD()
+	if phone != "" {
+		return waTypes.NewJID(phone, waTypes.DefaultUserServer)
+	}
+	if lid != "" {
+		return waTypes.NewJID(lid, waTypes.HiddenUserServer)
 	}
 	return waTypes.EmptyJID
 }
@@ -215,6 +239,10 @@ func contextToSend(req *sendRequest, own, to waTypes.JID) (*waE2E.ContextInfo, e
 	return alongside, nil
 }
 
+// noLIDForNumber is how whatsmeow says a number has no LID, which is how it says the
+// number is not on WhatsApp.
+const noLIDForNumber = "no LID found for"
+
 // sendFailure turns whatsmeow's answer into a code a client can branch on. Anything
 // this does not name degrades to wa_error rather than leaking a library's wording into
 // somebody's dashboard.
@@ -232,6 +260,16 @@ func sendFailure(err error) error {
 		// duplicate anything. A refusal here would have it give up on a message that is
 		// already in somebody's chat.
 		return protocol.NewError(protocol.ErrorTimeout, "WhatsApp did not answer whether the message went out")
+	case strings.Contains(err.Error(), noLIDForNumber):
+		// whatsmeow sends every direct message under a LID, and looks one up for a
+		// number that does not have it cached. A number nobody has registered has none
+		// to find, and the answer is permanent: reported as a WhatsApp refusal it reads
+		// as something to try again, and a client retries a number that can never
+		// receive anything. Matched on the text because the library builds it with
+		// fmt.Errorf and there is no sentinel to compare against; a wording change on
+		// their side puts this back to where it is without one.
+		return protocol.NewError(protocol.ErrorRecipientNotOnWhatsapp,
+			"that number is not on WhatsApp")
 	case errors.Is(err, wm.ErrUnknownServer), errors.Is(err, wm.ErrRecipientADJID):
 		return protocol.NewError(protocol.ErrorInvalidPayload, "that is not an address a message can be sent to")
 	default:
