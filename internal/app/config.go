@@ -40,9 +40,13 @@ type Config struct {
 	MediaTTL     time.Duration
 	MediaQuota   int64
 	MediaMaxBlob int64
-	LogLevel     string
-	LeaseTTL     time.Duration
-	Heartbeat    time.Duration
+	// MediaBlockSize is the allocation unit of the volume the media root sits on, which
+	// is what the quota is counted in. A volume formatted with larger units than the
+	// default undercharges every file by the difference.
+	MediaBlockSize int64
+	LogLevel       string
+	LeaseTTL       time.Duration
+	Heartbeat      time.Duration
 	// ClaimMinIdle is how long a command has to sit unacknowledged before another
 	// instance takes it over. It bounds how long a session stays unowned after the
 	// instance that woke it died, and it has to stay comfortably above the time a
@@ -101,27 +105,32 @@ func LoadConfig(hostname string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	mediaBlockSize, err := envBytes("WAC_MEDIA_BLOCK_SIZE", media.DefaultBlockSize)
+	if err != nil {
+		return Config{}, err
+	}
 
 	cfg := Config{
-		Instance:     envString("WAC_INSTANCE", hostname),
-		RedisURL:     envString("REDIS_URL", ""),
-		RedisPass:    envString("REDIS_PASSWORD", ""),
-		RedisPrefix:  envString("WAC_REDIS_PREFIX", redisx.DefaultPrefix),
-		EventShards:  shards,
-		Engine:       envString("WAC_ENGINE", "fake"),
-		DatabaseURL:  envString("WAC_DATABASE_URL", ""),
-		DeviceName:   envString("WAC_DEVICE_NAME", DefaultDeviceName),
-		HTTPAddr:     envString("WAC_HTTP_ADDR", ":8080"),
-		AdvertiseURL: envString("WAC_ADVERTISE_URL", ""),
-		MediaToken:   envString("WAC_MEDIA_TOKEN", ""),
-		MediaRoot:    envString("WAC_MEDIA_ROOT", ""),
-		MediaTTL:     mediaTTL,
-		MediaQuota:   mediaQuota,
-		MediaMaxBlob: mediaMaxBlob,
-		LogLevel:     envString("WAC_LOG_LEVEL", "info"),
-		LeaseTTL:     leaseTTL,
-		Heartbeat:    heartbeat,
-		ClaimMinIdle: claimMinIdle,
+		Instance:       envString("WAC_INSTANCE", hostname),
+		RedisURL:       envString("REDIS_URL", ""),
+		RedisPass:      envString("REDIS_PASSWORD", ""),
+		RedisPrefix:    envString("WAC_REDIS_PREFIX", redisx.DefaultPrefix),
+		EventShards:    shards,
+		Engine:         envString("WAC_ENGINE", "fake"),
+		DatabaseURL:    envString("WAC_DATABASE_URL", ""),
+		DeviceName:     envString("WAC_DEVICE_NAME", DefaultDeviceName),
+		HTTPAddr:       envString("WAC_HTTP_ADDR", ":8080"),
+		AdvertiseURL:   envString("WAC_ADVERTISE_URL", ""),
+		MediaToken:     envString("WAC_MEDIA_TOKEN", ""),
+		MediaRoot:      envString("WAC_MEDIA_ROOT", ""),
+		MediaTTL:       mediaTTL,
+		MediaQuota:     mediaQuota,
+		MediaMaxBlob:   mediaMaxBlob,
+		MediaBlockSize: mediaBlockSize,
+		LogLevel:       envString("WAC_LOG_LEVEL", "info"),
+		LeaseTTL:       leaseTTL,
+		Heartbeat:      heartbeat,
+		ClaimMinIdle:   claimMinIdle,
 	}
 	if cfg.Instance == "" {
 		return Config{}, fmt.Errorf("app: WAC_INSTANCE is empty and the hostname is unknown")

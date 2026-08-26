@@ -122,7 +122,7 @@ func New(cfg *Config, log zerolog.Logger) (*Connector, error) {
 	if cfg.MediaRoot != "" {
 		blobs, err := media.New(media.Options{
 			Root: cfg.MediaRoot, TTL: cfg.MediaTTL,
-			Quota: cfg.MediaQuota, MaxBlob: cfg.MediaMaxBlob,
+			Quota: cfg.MediaQuota, MaxBlob: cfg.MediaMaxBlob, BlockSize: cfg.MediaBlockSize,
 		})
 		if err != nil {
 			return nil, err

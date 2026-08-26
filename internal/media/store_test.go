@@ -1002,3 +1002,79 @@ func removeBlobs(t *testing.T, root string) {
 		return nil
 	})
 }
+
+// A volume formatted with larger allocation units than the default undercharges every
+// file by the difference, so a cache of tiny blobs consumes much more than the quota
+// while the sweep calculates a total below it and evicts nothing.
+func TestTheQuotaIsCountedInTheVolumesAllocationUnit(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	clock := func() time.Time { return now }
+	// Sixty-four kibibytes to a unit, so one blob and its description take 128 KiB and
+	// two of them do not fit in the 160 KiB budget. Counted in the four-kibibyte
+	// default the pair would come to 16 KiB and nothing would be dropped.
+	store, _ := newStore(t, media.Options{
+		TTL: time.Hour, Quota: 160 << 10, MaxBlob: 32 << 10, BlockSize: 64 << 10, Now: clock,
+	})
+
+	first := put(t, store, "x", &media.Blob{})
+	now = now.Add(time.Minute)
+	second := put(t, store, "y", &media.Blob{})
+
+	dropped, _, err := store.Sweep(t.Context())
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if dropped != 1 {
+		t.Fatalf("the sweep dropped %d blobs, want the one over quota: the volume hands out 64 KiB at a time", dropped)
+	}
+	if _, _, err := store.Open(first.ID); !errors.Is(err, media.ErrNotFound) {
+		t.Fatalf("the sweep kept the older of the two: %v", err)
+	}
+	if _, _, err := store.Open(second.ID); err != nil {
+		t.Fatalf("the sweep dropped the newer of the two: %v", err)
+	}
+}
+
+// The walk lists a directory in one go and then works through it, and a Put can finish in
+// between: the listing has the description and not the blob, which by the time the
+// removal runs is renamed into place and out of the in-flight set. Removing on the walk's
+// answer there takes the description of a blob that was just handed to a caller.
+func TestADescriptionIsNotCollectedFromAPutThatFinishedMeanwhile(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	clock := func() time.Time { return now }
+	store, root := newStore(t, media.Options{TTL: time.Hour, Now: clock})
+
+	// The state the walk would have snapshotted: a description whose blob is not there
+	// yet. The blob then appears, which is the rename landing between the listing and
+	// the removal.
+	stored := put(t, store, "arrived meanwhile", &media.Blob{})
+	blob := filepath.Join(root, stored.ID[5:7], stored.ID)
+	moved := blob + ".moved"
+	if err := os.Rename(blob, moved); err != nil {
+		t.Fatalf("Rename: %v", err)
+	}
+
+	// A sweep whose listing is taken with the blob away and whose removal runs with it
+	// back. The clock is read once, for the cutoff, which is after the walk.
+	var restored bool
+	store2, _ := newStore(t, media.Options{TTL: time.Hour, Root: root, Now: func() time.Time {
+		if !restored {
+			restored = true
+			if err := os.Rename(moved, blob); err != nil {
+				t.Errorf("Rename back: %v", err)
+			}
+		}
+		return now
+	}})
+
+	if _, _, err := store2.Sweep(t.Context()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if _, _, err := store2.Open(stored.ID); err != nil {
+		t.Fatalf("the description of a blob that arrived mid-sweep was collected: %v", err)
+	}
+}

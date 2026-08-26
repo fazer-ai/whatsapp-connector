@@ -82,7 +82,10 @@ type Options struct {
 	TTL     time.Duration
 	Quota   int64
 	MaxBlob int64
-	Now     func() time.Time
+	// BlockSize is the volume's allocation unit, which is what the quota is counted in.
+	// The zero value asks for DefaultBlockSize.
+	BlockSize int64
+	Now       func() time.Time
 }
 
 // Store is the blob cache.
@@ -123,11 +126,14 @@ func New(opts Options) (*Store, error) {
 	if opts.MaxBlob <= 0 {
 		opts.MaxBlob = DefaultMaxBlob
 	}
+	if opts.BlockSize <= 0 {
+		opts.BlockSize = DefaultBlockSize
+	}
 	// Against what a blob actually costs, not its length: the description beside it and
 	// the rounding to whole blocks are part of the budget, so a cap that only fits
 	// under the quota before they are counted is one where a blob at the cap evicts
 	// everything else and then itself.
-	if cost := (held{size: opts.MaxBlob}).cost(); cost > opts.Quota {
+	if cost := (held{size: opts.MaxBlob}).cost(opts.BlockSize); cost > opts.Quota {
 		return nil, fmt.Errorf(
 			"media: one blob of %d bytes takes %d on disk once its description and the block size are counted, "+
 				"and the whole quota is %d, so a blob at the cap evicts everything else and then itself",
@@ -340,19 +346,26 @@ func (s *Store) Sweep(ctx context.Context) (dropped int, freed int64, err error)
 		return 0, 0, err
 	}
 
+	// One reading for the whole pass, taken before anything is removed, so every
+	// decision in it is made against the same notion of now.
+	cutoff := s.opts.Now().Add(-s.opts.TTL)
+
 	// One error is kept rather than the first one returned, so a single undeletable
 	// file does not stop the sweep from clearing everything behind it. The shards that
 	// could not be read start it off: what is in them is not in the accounting below.
 	failed := skipped
-	for _, path := range leftovers {
+	for _, entry := range leftovers {
 		if err := ctx.Err(); err != nil {
 			return dropped, freed, errors.Join(failed, err)
 		}
-		if err := s.root.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if s.stillWanted(entry) {
+			continue
+		}
+		if err := s.root.Remove(entry.path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			// Silence here reads as a clean sweep while the file is still on the disk,
 			// and it is not counted against the quota either, so nothing would ever
 			// notice up to one whole blob's worth of it.
-			failed = errors.Join(failed, fmt.Errorf("media: collect %s: %w", path, err))
+			failed = errors.Join(failed, fmt.Errorf("media: collect %s: %w", entry.path, err))
 		}
 	}
 
@@ -388,12 +401,11 @@ func (s *Store) Sweep(ctx context.Context) (dropped int, freed int64, err error)
 			// The bytes went and the description would not follow. Charging the whole
 			// entry would have the sweep evict other blobs to make room for a payload
 			// that is not there any more.
-			return blocks(entry.about)
+			return blocks(entry.about, s.opts.BlockSize)
 		}
 		return 0
 	}
 
-	cutoff := s.opts.Now().Add(-s.opts.TTL)
 	var total int64
 	kept := blobs[:0]
 	for _, entry := range blobs {
@@ -403,7 +415,7 @@ func (s *Store) Sweep(ctx context.Context) (dropped int, freed int64, err error)
 		// Counted for whatever is still here, including an entry that refused to go and
 		// one that was collected between the walk and now: what the quota has to be
 		// measured against is the disk, not the intention.
-		entry.charged = entry.cost()
+		entry.charged = entry.cost(s.opts.BlockSize)
 		if entry.touched.Before(cutoff) {
 			entry.charged = take(entry)
 		}
@@ -433,6 +445,17 @@ func (s *Store) Sweep(ctx context.Context) (dropped int, freed int64, err error)
 	return dropped, freed, failed
 }
 
+// leftover is a file that belongs to nobody: a write that was interrupted, or a
+// description whose blob is not here. The id it names is kept so the state can be asked
+// about again at the moment of removal rather than only at the moment of the walk.
+type leftover struct {
+	id   string
+	path string
+	// describes marks a description, which is the one of the two that can stop being a
+	// leftover between the walk and the removal.
+	describes bool
+}
+
 // held is one blob as the sweep sees it: what it costs and when it was last collected.
 type held struct {
 	id string
@@ -450,36 +473,42 @@ type held struct {
 	charged int64
 }
 
-// blockSize is what one file is charged at least, and what its length is rounded up to.
+// DefaultBlockSize is what one file is charged at least, and what its length is rounded
+// up to, unless the deployment says otherwise.
 //
 // The quota is a disk budget, and a filesystem does not hand out bytes: it hands out
-// blocks, and a file also costs an inode and a directory entry. A cache of ten thousand
-// tiny stickers measured by the sum of their lengths reads as a few megabytes while the
-// volume it sits on is much fuller than that, and the eviction that should have started
-// never does. Four kibibytes is the common block size rather than a measured one, so
-// this is an approximation on the safe side, not an accounting of the actual extents.
-const blockSize int64 = 4 << 10
+// allocation units, and a file also costs an inode and a directory entry. A cache of ten
+// thousand tiny stickers measured by the sum of their lengths reads as a few megabytes
+// while the volume it sits on is much fuller, and the eviction that should have started
+// never does.
+//
+// Four kibibytes because that is what ext4, xfs and apfs hand out by default. It is a
+// setting rather than a constant because a volume formatted with larger units — 64 KiB
+// is not unusual on a tuned filesystem — undercharges every file by the difference, and
+// this cannot ask the filesystem without giving up on being portable. Raising the
+// default instead would have every ordinary deployment evict far too eagerly.
+const DefaultBlockSize int64 = 4 << 10
 
 // cost is what a blob is charged against the quota: its bytes and its description's,
-// each rounded up to a block.
-func (b held) cost() int64 {
-	payload, about := blocks(b.size), blocks(b.about)
+// each rounded up to an allocation unit.
+func (b held) cost(unit int64) int64 {
+	payload, about := blocks(b.size, unit), blocks(b.about, unit)
 	if payload > math.MaxInt64-about {
 		return math.MaxInt64
 	}
 	return payload + about
 }
 
-func blocks(size int64) int64 {
+func blocks(size, unit int64) int64 {
 	if size <= 0 {
 		// An empty file still costs an inode and a directory entry.
-		return blockSize
+		return unit
 	}
-	if size > math.MaxInt64-blockSize {
+	if size > math.MaxInt64-unit {
 		// Rounding up would wrap, and a file this size is already every block there is.
 		return size
 	}
-	return (size + blockSize - 1) / blockSize * blockSize
+	return (size + unit - 1) / unit * unit
 }
 
 // list walks the store and reports what it found: the blobs, and the paths of the files
@@ -488,7 +517,7 @@ func blocks(size int64) int64 {
 // It removes nothing. Every removal the sweep makes goes through one place, so the
 // accounting and the cancellation checks are written once rather than in each branch
 // that happens to delete something.
-func (s *Store) list(ctx context.Context) (blobs []held, leftovers []string, skipped, err error) {
+func (s *Store) list(ctx context.Context) (blobs []held, leftovers []leftover, skipped, err error) {
 	// The paths a description was found at, keyed by the id it describes, checked
 	// against the blobs at the end: a description whose blob is not here describes
 	// nothing.
@@ -543,8 +572,8 @@ func (s *Store) list(ctx context.Context) (blobs []held, leftovers []string, ski
 			// against the quota either — waiting a day would leave up to one MaxBlob of
 			// each of them on the disk while every sweep reported the cache within
 			// budget.
-			if !s.isWriting(strings.TrimPrefix(name, tempPrefix)) {
-				leftovers = append(leftovers, path)
+			if id := strings.TrimPrefix(name, tempPrefix); !s.isWriting(id) {
+				leftovers = append(leftovers, leftover{id: id, path: path})
 			}
 		case path == s.aboutPath(strings.TrimSuffix(name, aboutSuffix)):
 			// A description is normally accounted for with the blob it describes. One
@@ -585,10 +614,28 @@ func (s *Store) list(ctx context.Context) (blobs []held, leftovers []string, ski
 	}
 	for id, path := range described {
 		if _, found := present[id]; !found {
-			leftovers = append(leftovers, path)
+			leftovers = append(leftovers, leftover{id: id, path: path, describes: true})
 		}
 	}
 	return blobs, leftovers, skipped, nil
+}
+
+// stillWanted asks again, at the moment of removal, whether a leftover is one.
+//
+// The walk takes its listing of a directory in one go and then works through it, and a
+// Put can finish in between: the listing has the description and not the blob, which by
+// the time this reads it is renamed into place and out of the in-flight set. Removing on
+// the walk's answer there takes the description of a blob that was just handed to a
+// caller, and every Open of it afterwards reports it missing.
+func (s *Store) stillWanted(entry leftover) bool {
+	if s.isWriting(entry.id) {
+		return true
+	}
+	if !entry.describes {
+		return false
+	}
+	_, err := s.root.Stat(s.pathOf(entry.id))
+	return err == nil
 }
 
 // isWriting reports whether a Put has this id in flight.
