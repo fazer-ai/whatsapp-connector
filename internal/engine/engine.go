@@ -23,6 +23,18 @@ var ErrNotSupported = errors.New("engine: command not supported")
 type Emission struct {
 	Type    protocol.EventType
 	Payload json.RawMessage
+	// Settle, when it is set, is called exactly once with the outcome of publishing
+	// this emission: nil once the client can be assumed to have it, an error when it
+	// never reached the stream. It is what lets an engine hold WhatsApp's own
+	// acknowledgement back until the event is durable, which is the whole difference
+	// between losing Redis costing a redelivery and losing Redis costing a message.
+	// An emission that leaves it nil is published like any other and nobody waits.
+	//
+	// The publisher owes the callback for every emission it takes, including the ones
+	// it drops. What it cannot answer for is an emission the engine hands over after
+	// nobody is reading any more, so an engine that waits on this must have a way out
+	// of its own when its session ends.
+	Settle func(error)
 }
 
 // Engine opens sessions. One process has one engine; a session is one WhatsApp

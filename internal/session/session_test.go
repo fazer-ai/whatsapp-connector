@@ -30,6 +30,11 @@ type recorder struct {
 	mu      sync.Mutex
 	events  []protocol.Event
 	replies map[string]protocol.Reply
+	// refuse is what Publish answers with, for the tests that need a stream nothing
+	// reaches. A Redis that is down is not a case a fake can be talked into otherwise.
+	refuse error
+	// gate holds a publish open, for the tests that need the pump busy.
+	gate chan struct{}
 }
 
 func newRecorder() *recorder {
@@ -38,9 +43,36 @@ func newRecorder() *recorder {
 
 func (r *recorder) Publish(_ context.Context, event *protocol.Event) error {
 	r.mu.Lock()
+	gate := r.gate
+	r.gate = nil
+	r.mu.Unlock()
+	if gate != nil {
+		<-gate
+	}
+
+	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.refuse != nil {
+		return r.refuse
+	}
 	r.events = append(r.events, *event)
 	return nil
+}
+
+// hold makes the next publish block until the returned func is called, which is the
+// only way to catch the pump mid-publish with something else already queued behind it.
+func (r *recorder) hold() func() {
+	gate := make(chan struct{})
+	r.mu.Lock()
+	r.gate = gate
+	r.mu.Unlock()
+	return func() { close(gate) }
+}
+
+func (r *recorder) failWith(err error) {
+	r.mu.Lock()
+	r.refuse = err
+	r.mu.Unlock()
 }
 
 func (r *recorder) Reply(_ context.Context, replyTo string, reply protocol.Reply) error {
@@ -1239,5 +1271,248 @@ func TestAWakeRefusedByThisInstancesOwnStaleLeaseStaysPending(t *testing.T) {
 	}
 	if !released.Load() {
 		t.Fatal("the wake was neither carried out nor let go of, so nothing will reclaim it")
+	}
+}
+
+// The whole reason an engine can hold WhatsApp's acknowledgement back: the pump is the
+// only thing that knows whether an event reached the stream, so it is the only thing
+// that can say so. Nothing above it may assume a published event without hearing this.
+func TestAnEventThatReachedTheStreamIsSettledAsPublished(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	if _, err := h.manager.Adopt(context.Background(), "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, ok := h.engine.Session("s1")
+	if !ok {
+		t.Fatal("the engine has no session after Adopt")
+	}
+
+	settled := make(chan error, 1)
+	engineSession.EmitDurable(protocol.EventMessageReceived, map[string]any{"message": "one"},
+		func(err error) { settled <- err })
+
+	select {
+	case err := <-settled:
+		if err != nil {
+			t.Fatalf("an event that was published settled as %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("an event that was published was never settled, so nothing above can ever acknowledge it")
+	}
+	if got := len(h.recorder.published()); got != 1 {
+		t.Fatalf("the stream holds %d events, want the one that was settled as published", got)
+	}
+}
+
+// The half that costs a message if it is wrong. A publish that failed and settled as a
+// success is an inbound message acknowledged to WhatsApp and delivered to nobody:
+// WhatsApp drops it, the client never had it, and there is no redelivery to recover it.
+func TestAnEventThatNeverReachedTheStreamIsSettledAsAFailure(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	if _, err := h.manager.Adopt(context.Background(), "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, ok := h.engine.Session("s1")
+	if !ok {
+		t.Fatal("the engine has no session after Adopt")
+	}
+	refused := errors.New("redis is unreachable")
+	h.recorder.failWith(refused)
+
+	settled := make(chan error, 1)
+	engineSession.EmitDurable(protocol.EventMessageReceived, map[string]any{"message": "one"},
+		func(err error) { settled <- err })
+
+	select {
+	case err := <-settled:
+		if !errors.Is(err, refused) {
+			t.Fatalf("an event the stream refused settled as %v, want the publisher's own error", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("an event the stream refused was never settled")
+	}
+}
+
+// An emission dropped because the lease moved has to settle too. The engine waiting on
+// it is holding a message off WhatsApp's acknowledgement queue, and a callback that
+// never fires leaves it waiting out its own bound instead of letting the account be
+// redelivered to whoever owns it now.
+func TestAnEventDroppedForALeaseThatMovedIsSettledAsAFailure(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+
+	clock := &steppingClock{now: time.Now()}
+	leases := cluster.NewLeases(redisx.Wrap(rdb, "wa:", 8), "inst-a", cluster.Options{Clock: clock})
+	fakeEngine := fake.New()
+	rec := newRecorder()
+	manager := session.NewManager(&session.ManagerConfig{
+		Instance: "inst-a", Engine: fakeEngine, Leases: leases, Publisher: rec, Replier: rec,
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	t.Cleanup(func() { manager.StopAll(context.Background()) })
+
+	if _, err := manager.Adopt(context.Background(), "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, ok := fakeEngine.Session("s1")
+	if !ok {
+		t.Fatal("the engine has no session after Adopt")
+	}
+	// The lease goes stale under the session, which is what a handover looks like from
+	// the pump: it is still running, and it is no longer allowed to write an epoch.
+	clock.step(cluster.DefaultTTL + time.Second)
+
+	settled := make(chan error, 1)
+	engineSession.EmitDurable(protocol.EventMessageReceived, map[string]any{"message": "one"},
+		func(err error) { settled <- err })
+
+	select {
+	case err := <-settled:
+		if err == nil {
+			t.Fatal("an event dropped for a lease this instance no longer holds settled as published")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("an event dropped for a lease that moved was never settled")
+	}
+	if got := len(rec.published()); got != 0 {
+		t.Fatalf("the stream holds %d events written under a lease that moved", got)
+	}
+}
+
+// The publisher owes a callback for every emission it takes, the ones it drops
+// included. A pump that stops with a durable emission already handed to it and answers
+// nothing leaves the engine holding WhatsApp's acknowledgement for a message this
+// instance is done with, until its own bound runs out, instead of letting the account
+// be redelivered to whoever takes the session next.
+func TestAnEventAPumpStoppedBeforePublishingIsStillSettled(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	ctx := context.Background()
+	if _, err := h.manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, ok := h.engine.Session("s1")
+	if !ok {
+		t.Fatal("the engine has no session after Adopt")
+	}
+
+	// Connected first, so the fake reports the close below by going back down. Adopt on
+	// its own opens a session without dialling anything.
+	if err := engineSession.Connect(ctx, engine.ConnectRequest{Pairing: "resume"}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	waitFor(t, "the session to report itself open", func() bool { return len(h.recorder.published()) == 1 })
+
+	// The first emission holds the pump inside Publish; the second queues up behind it
+	// and is what the shutdown finds still in hand.
+	release := h.recorder.hold()
+	first := make(chan error, 1)
+	engineSession.EmitDurable(protocol.EventMessageReceived, map[string]any{"message": "one"},
+		func(err error) { first <- err })
+	waitFor(t, "the pump to be busy publishing", func() bool {
+		h.recorder.mu.Lock()
+		defer h.recorder.mu.Unlock()
+		return h.recorder.gate == nil
+	})
+
+	second := make(chan error, 1)
+	engineSession.EmitDurable(protocol.EventMessageReceived, map[string]any{"message": "two"},
+		func(err error) { second <- err })
+
+	stopped := make(chan struct{})
+	go func() {
+		h.manager.StopAll(context.Background())
+		close(stopped)
+	}()
+	// Stop cancels the pump and closes the engine session before it waits for the
+	// goroutines, and the fake reports the close by going disconnected. Waiting for it
+	// is what puts the release below after the cancel rather than racing it.
+	waitFor(t, "the session to be stopped", func() bool { return !engineSession.Connected() })
+	release()
+
+	select {
+	case err := <-second:
+		if err == nil {
+			t.Fatal("an event a stopped pump never published settled as published")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("an event a stopped pump never published was never settled")
+	}
+	<-stopped
+	if err := <-first; err != nil {
+		t.Fatalf("the event the pump was publishing when it was stopped settled as %v", err)
+	}
+}
+
+// Two instances, which is where the dangerous bugs live. A lease can run out while a
+// write is in flight, and the peer that takes the session publishes under a higher
+// epoch immediately: the event lands behind one the client has already seen from a
+// newer owner, and the contract lets a client drop what comes from a stale owner. A
+// successful write is therefore not proof the client has it, so an engine holding
+// WhatsApp's acknowledgement on that answer would spend the redelivery that was the
+// only way to get the message back.
+func TestAnEventPublishedUnderALeaseThatMovedMidWriteIsSettledAsAFailure(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+
+	clock := &steppingClock{now: time.Now()}
+	leases := cluster.NewLeases(client, "inst-a", cluster.Options{Clock: clock})
+	fakeEngine := fake.New()
+	rec := newRecorder()
+	manager := session.NewManager(&session.ManagerConfig{
+		Instance: "inst-a", Engine: fakeEngine, Leases: leases, Publisher: rec, Replier: rec,
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	t.Cleanup(func() { manager.StopAll(context.Background()) })
+
+	ctx := context.Background()
+	if _, err := manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, ok := fakeEngine.Session("s1")
+	if !ok {
+		t.Fatal("the engine has no session after Adopt")
+	}
+
+	release := rec.hold()
+	settled := make(chan error, 1)
+	engineSession.EmitDurable(protocol.EventMessageReceived, map[string]any{"message": "one"},
+		func(err error) { settled <- err })
+	waitFor(t, "the pump to be busy publishing", func() bool {
+		rec.mu.Lock()
+		defer rec.mu.Unlock()
+		return rec.gate == nil
+	})
+
+	// The write is in flight. The lease runs out and inst-b takes the session, which is
+	// exactly the window this check exists for: the ownership was there when the pump
+	// looked, and gone by the time the write landed.
+	clock.step(cluster.DefaultTTL + time.Second)
+	server.FastForward(cluster.DefaultTTL + time.Second)
+	peer := cluster.NewLeases(client, "inst-b", cluster.Options{Clock: clock})
+	if _, err := peer.Acquire(ctx, "s1"); err != nil {
+		t.Fatalf("inst-b Acquire: %v", err)
+	}
+	release()
+
+	select {
+	case err := <-settled:
+		if err == nil {
+			t.Fatal("an event written under an epoch a peer had already replaced settled as published")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("an event written under a lease that moved was never settled")
 	}
 }

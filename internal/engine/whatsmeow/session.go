@@ -90,6 +90,15 @@ type Session struct {
 	// the real bound; nothing else changes it.
 	storeLimit time.Duration
 
+	// deliverWait bounds how long an inbound message waits to hear that its event was
+	// published. A field for the same reason as storeLimit, and for no other.
+	deliverWait time.Duration
+
+	// groups is the last connect's `groups`: whether the client wants group chats
+	// alongside direct ones. Guarded by mu, written by Connect and read by every
+	// inbound message.
+	groups bool
+
 	// transition serialises a change to the socket's state with the event announcing
 	// it. It is not mu: emit can block on a full inbox, and holding the session's own
 	// lock across that would stop everything that reads state, Close included.
@@ -184,7 +193,8 @@ func newSession(sid string, client *wm.Client, container *store.Container, log z
 		nonce:      sessionNonce(),
 		logout:     func(ctx context.Context, client *wm.Client) error { return client.Logout(ctx) },
 
-		storeLimit: bindTimeout,
+		storeLimit:  bindTimeout,
+		deliverWait: deliverTimeout,
 	}
 	s.adopt(client)
 	go s.forward()
@@ -344,6 +354,18 @@ func (s *Session) offline() {
 	s.mu.Unlock()
 }
 
+func (s *Session) setGroups(groups bool) {
+	s.mu.Lock()
+	s.groups = groups
+	s.mu.Unlock()
+}
+
+func (s *Session) wantsGroups() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.groups
+}
+
 func (s *Session) setIdentity(phone, lid string) {
 	s.mu.Lock()
 	s.phone = phone
@@ -370,9 +392,8 @@ func (s *Session) Connect(ctx context.Context, req engine.ConnectRequest) error 
 	// Same rule as the proxy, and for the same reason: these ask the connector to do
 	// something, and a build that does not do it answers `open` to a client that will
 	// then wait for a call to be refused, or for a backlog to arrive, and never find out
-	// it was never going to happen. `groups` is not on this list because it selects among
-	// conversation traffic and this build delivers none: it becomes a promise in M2, when
-	// there is something for it to leave out.
+	// it was never going to happen. `groups` is not on this list because it is honoured
+	// now that there is conversation traffic to leave out.
 	if req.Calls != nil && req.Calls.AutoReject {
 		return protocol.NewError(protocol.ErrorUnsupported,
 			"this connector does not answer incoming calls yet")
@@ -394,6 +415,20 @@ func (s *Session) Connect(ctx context.Context, req engine.ConnectRequest) error 
 		return protocol.NewError(protocol.ErrorInvalidPayload,
 			fmt.Sprintf("%q is not a pairing mode this connector knows", req.Pairing))
 	}
+	if req.Pairing == "code" && digitsOf(req.Phone) == "" {
+		// Checked here rather than only where it is used, because everything below this
+		// point changes the session, and a refusal that has already changed it is a
+		// command that failed and took effect.
+		return protocol.NewError(protocol.ErrorInvalidPayload, "code pairing needs the phone number to pair")
+	}
+
+	// Recorded once the request is one the session is going to act on, because the
+	// client sends it on every connect and it is a property of the subscription rather
+	// than of the device. A refused connect leaves the subscription alone: the caller
+	// sees a failed command, and a session that had quietly turned group traffic off
+	// underneath it would go on acknowledging and dropping group messages until the
+	// next connect that happened to succeed.
+	s.setGroups(req.Groups)
 
 	// Waited for before the guard comes down, and before anything is dialled. A
 	// disconnect that outlived its command is still going to close the socket, and a
@@ -1032,7 +1067,12 @@ func (s *Session) requestCode(ctx context.Context, command *protocol.Command) er
 	if err := json.Unmarshal(command.Payload, &body); err != nil {
 		return protocol.NewError(protocol.ErrorInvalidPayload, "the pairing request could not be read")
 	}
-	return s.Connect(ctx, engine.ConnectRequest{Pairing: "code", Phone: body.Phone})
+	// The subscription comes along, because this is a connect like any other and the
+	// client is not sending one: leaving it out would turn group traffic off on a
+	// session that had asked for it, at the moment it asked for a pairing code.
+	return s.Connect(ctx, engine.ConnectRequest{
+		Pairing: "code", Phone: body.Phone, Groups: s.wantsGroups(),
+	})
 }
 
 // Close ends the session. Events is closed before it returns.
@@ -1571,9 +1611,11 @@ func pairingFailureMessage(reason string) string {
 func (s *Session) handle(rawEvent any) bool {
 	switch event := rawEvent.(type) {
 	case *waEvents.Message:
-		// M2 brings these. Refusing the ack is what keeps them on the phone until then.
-		s.log.Debug().Msg("refusing to acknowledge an inbound message this build cannot publish")
-		return false
+		// The one handler that blocks, and the only place the ack invariant is decided:
+		// WhatsApp is told the account has the message after the client does, never
+		// before. Everything this build cannot render yet is still refused, which is
+		// what keeps it on the phone for a later milestone.
+		return s.receive(event)
 	case *waEvents.Connected:
 		// whatsmeow dispatches from whichever goroutine produced the event, so a
 		// Disconnected and the Connected that follows it can be handled at the same
