@@ -127,9 +127,16 @@ func inboundOf(event *waEvents.Message) (protocol.InboundMessage, bool) {
 	if !ok || event.Info.ID == "" {
 		return protocol.InboundMessage{}, false
 	}
-	sender, named := partyOf(&event.Info)
-	if !named {
-		return protocol.InboundMessage{}, false
+	var sender *protocol.Party
+	if !event.Info.IsFromMe {
+		// An echo carries no sender, which is what the contract's own fixture for one
+		// says and what the client reads: `from_me` is the whole answer to who sent it,
+		// and naming the account itself there files the operator's own number as the
+		// party in a conversation with somebody else.
+		var named bool
+		if sender, named = partyOf(&event.Info); !named {
+			return protocol.InboundMessage{}, false
+		}
 	}
 	body, context, ok := textOf(event.Message)
 	if !ok {

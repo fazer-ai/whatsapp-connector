@@ -674,3 +674,30 @@ func TestARefusedConnectLeavesTheGroupSubscriptionAlone(t *testing.T) {
 		})
 	}
 }
+
+// A message this account sent from another linked device. WhatsApp names the account
+// as the sender, and the contract's own echo fixture carries none: `from_me` is the
+// whole answer to who sent it, and naming the account there files the operator's own
+// number as a party in a conversation with somebody else.
+func TestAnEchoFromAnotherDeviceCarriesNoSender(t *testing.T) {
+	t.Parallel()
+
+	account := waTypes.NewJID("5511999990001", waTypes.DefaultUserServer)
+	event := textMessage("3EB0ECHO", "resposta enviada pelo celular")
+	event.Info.Chat = waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)
+	event.Info.Sender = account
+	event.Info.IsFromMe = true
+
+	message, ok := inboundOf(event)
+	if !ok {
+		t.Fatal("an echo of the account's own send was withheld")
+	}
+	if !message.FromMe {
+		t.Fatal("the echo does not say it came from this account")
+	}
+	if message.Sender != nil {
+		t.Fatalf("the echo named %+v as the sender, and the contract's fixture carries none", message.Sender)
+	}
+
+	validateInboundAgainstContract(t, &message)
+}
