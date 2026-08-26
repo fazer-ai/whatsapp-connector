@@ -515,6 +515,80 @@ func TestAnInstanceWithNowhereToPutAFileSaysSoRatherThanPublishingAnEmptyBubble(
 	assertFailure(t, emissions[1], reasonNoStore)
 }
 
+// Metadata that can never describe a file is the one shape where "try again" is a loop:
+// whatsmeow answers both of these with a plain error rather than a sentinel, so without
+// the check the message is withheld and WhatsApp redelivers exactly the same metadata,
+// for good.
+func TestMetadataThatCanNeverDescribeAFileIsGivenUpOnRatherThanRetriedForever(t *testing.T) {
+	t.Parallel()
+
+	// The path is pasted into a URL under whichever media host answers, so one that is
+	// not a path names nothing there. whatsmeow refuses it before it dials.
+	digest := make([]byte, 32)
+	for _, tc := range []struct {
+		name  string
+		image *waE2E.ImageMessage
+		want  string
+	}{
+		{
+			name: "a direct path that is not a path",
+			image: &waE2E.ImageMessage{
+				Mimetype: proto.String("image/jpeg"), DirectPath: proto.String("v/t62.7118-24/nope"),
+				MediaKey: []byte("key"), FileEncSHA256: digest,
+			},
+			want: reasonUnreferenced,
+		},
+		{
+			name: "a ciphertext digest that is not a SHA-256",
+			image: &waE2E.ImageMessage{
+				Mimetype: proto.String("image/jpeg"), DirectPath: proto.String("/v/t62.7118-24/file"),
+				MediaKey: []byte("key"), FileEncSHA256: []byte("too short"),
+			},
+			want: reasonCorrupt,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			session, downloads := mediaSession(t, media.Options{})
+			downloads.answer([]byte("nunca pedido"), nil)
+
+			emissions, acknowledged := deliver(t, session,
+				mediaEvent("3EB0BADMETA", &waE2E.Message{ImageMessage: tc.image}), 2)
+			if !acknowledged {
+				t.Fatal("a message that can only ever fail the same way was left to be redelivered forever")
+			}
+			if downloads.count() != 0 {
+				t.Fatalf("metadata that describes no file still cost %d downloads", downloads.count())
+			}
+			assertFailure(t, emissions[1], tc.want)
+		})
+	}
+}
+
+// And the control: metadata that is well formed is still handed to whatsmeow, so the
+// check refuses what cannot work rather than standing between every message and its file.
+func TestWellFormedMetadataIsStillDownloaded(t *testing.T) {
+	t.Parallel()
+
+	session, downloads := mediaSession(t, media.Options{})
+	downloads.answer([]byte("guardado"), nil)
+
+	event := mediaEvent("3EB0OK", &waE2E.Message{ImageMessage: &waE2E.ImageMessage{
+		Mimetype: proto.String("image/jpeg"), DirectPath: proto.String("/v/t62.7118-24/file"),
+		MediaKey: []byte("key"), FileEncSHA256: make([]byte, 32),
+	}})
+
+	emissions, acknowledged := deliver(t, session, event, 1)
+	if !acknowledged || downloads.count() != 1 {
+		t.Fatalf("a well formed message was downloaded %d times and acknowledged %v",
+			downloads.count(), acknowledged)
+	}
+	if content := mediaContentOf(t, emissions[0]); content.Ref == nil {
+		t.Fatal("a well formed message was published with no file to fetch")
+	}
+}
+
 // A file sent to be seen once is not kept. A blob is served for as long as anybody
 // keeps asking for it, so storing one turns something the sender expected to disappear
 // into something the account holds indefinitely.

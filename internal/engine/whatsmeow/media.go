@@ -3,6 +3,7 @@ package whatsmeow
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -285,6 +286,10 @@ func (s *Session) fetch(ctx context.Context, part *attachment) (protocol.MediaRe
 		}
 	}
 
+	if err := unfetchable(part.download); err != nil {
+		return protocol.MediaRef{}, err
+	}
+
 	data, err := s.download(ctx, s.current(), part.download)
 	if err != nil {
 		return protocol.MediaRef{}, downloadFailure(err)
@@ -309,6 +314,30 @@ func (s *Session) fetch(ctx context.Context, part *attachment) (protocol.MediaRe
 		Size: stored.Size, Mime: stored.Mime, SHA256: stored.SHA256,
 		ExpiresAt: stored.StoredAt + s.blobs.TTL().Milliseconds(),
 	}, nil
+}
+
+// unfetchable reports metadata that can never describe a file, with the reason to
+// publish, and nil for metadata worth trying.
+//
+// whatsmeow answers both of these with a plain error rather than one of its sentinels,
+// so without the check they fall to the transient arm of downloadFailure: the message is
+// withheld, WhatsApp redelivers it carrying exactly the same metadata, and it fails
+// exactly the same way, for good. Checked here rather than matched on the text whatsmeow
+// writes, which is not part of its contract and changes when it likes.
+func unfetchable(part wm.DownloadableMessage) error {
+	if !strings.HasPrefix(part.GetDirectPath(), "/") {
+		// The path is pasted into a URL under whichever media host answers, so one that
+		// is not a path names nothing there. Reported without the value: it is a
+		// fragment of a URL to somebody's file, and nothing in a log needs it.
+		return refused{reason: reasonUnreferenced, err: errors.New("the direct path is not a path")}
+	}
+	if digest := part.GetFileEncSHA256(); len(digest) != 0 && len(digest) != sha256.Size {
+		return refused{
+			reason: reasonCorrupt,
+			err:    fmt.Errorf("the ciphertext digest is %d bytes and a SHA-256 is %d", len(digest), sha256.Size),
+		}
+	}
+	return nil
 }
 
 // downloadFailure classifies what whatsmeow said about a download.
