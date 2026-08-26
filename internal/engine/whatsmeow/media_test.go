@@ -763,9 +763,16 @@ func TestAnEngineIsRefusedWhenBlobsCouldNotBeFetchedFromWhereItWouldPublishThem(
 		// front of the query rather than behind it.
 		{"a query the id would be appended in front of", "http://connector:8080/?token=x"},
 		{"a fragment", "http://connector:8080/#here"},
+		// "Every interface" to a listener, "this machine" to whoever dials it, so a
+		// client elsewhere connects to itself.
+		{"an address to listen on rather than one to reach", "http://0.0.0.0:8080"},
+		{"the same in the other family", "http://[::]:8080"},
 		// What a listener reads as any free port, which is not one anybody can be told
 		// to come back to.
 		{"the port a listener picks for itself", "http://connector:0"},
+		// url.Parse only checks that a port is digits, so both of these come through it.
+		{"the same port spelled differently", "http://connector:00"},
+		{"a port past the end of the range", "http://connector:99999"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -795,6 +802,9 @@ func TestAnEngineTakesTheAddressesBlobsCanBeFetchedFrom(t *testing.T) {
 		"https://connector.internal",
 		"http://gateway.internal/connector-a1b2c3",
 		"http://connector-a1b2c3:8080/",
+		// Not refused with the wildcards: an instance sharing a network namespace with
+		// its client is a deployment somebody really runs.
+		"http://127.0.0.1:8080",
 	} {
 		t.Run(base, func(t *testing.T) {
 			t.Parallel()
@@ -806,6 +816,48 @@ func TestAnEngineTakesTheAddressesBlobsCanBeFetchedFrom(t *testing.T) {
 			}
 			if err := waEngine.Close(); err != nil {
 				t.Fatalf("Close: %v", err)
+			}
+		})
+	}
+}
+
+// A blob's clock starts when the file is stored and its reference is published
+// afterwards, with a message allowed to spend deliverTimeout waiting for the publisher.
+// A cache that keeps a blob for less than that hands out references the sweeper has
+// already collected.
+func TestAnEngineIsRefusedWhenBlobsWouldNotOutlastTheMessagesThatNameThem(t *testing.T) {
+	t.Parallel()
+
+	container := openStore(t)
+	for _, tc := range []struct {
+		name    string
+		ttl     time.Duration
+		refused bool
+	}{
+		{"gone before the message is even published", time.Second, true},
+		{"exactly as long as the wait, which is a coin toss", deliverTimeout, true},
+		{"outlasting the wait", deliverTimeout + time.Second, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			blobs, err := media.New(media.Options{Root: t.TempDir(), TTL: tc.ttl})
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			t.Cleanup(func() { _ = blobs.Close() })
+
+			opts := Options{Media: MediaOptions{Blobs: blobs, BaseURL: "http://connector-a1b2c3:8080"}}
+			waEngine, err := New(container, opts, zerolog.Nop())
+			switch {
+			case tc.refused && err == nil:
+				t.Fatalf("an engine keeping blobs for %s was built anyway", tc.ttl)
+			case !tc.refused && err != nil:
+				t.Fatalf("an engine keeping blobs for %s was refused: %v", tc.ttl, err)
+			case err == nil:
+				if err := waEngine.Close(); err != nil {
+					t.Fatalf("Close: %v", err)
+				}
 			}
 		})
 	}

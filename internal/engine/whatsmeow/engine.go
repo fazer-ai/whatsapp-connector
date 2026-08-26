@@ -10,7 +10,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
+	"strconv"
 	"sync"
 
 	"github.com/rs/zerolog"
@@ -65,6 +67,17 @@ func New(container *store.Container, opts Options, log zerolog.Logger) (*Engine,
 		if err := reachableAt(opts.Media.BaseURL); err != nil {
 			return nil, err
 		}
+		if ttl := opts.Media.Blobs.TTL(); ttl <= deliverTimeout {
+			// The clock starts when the file is stored and the reference is published
+			// afterwards, with a message allowed to spend deliverTimeout waiting for the
+			// publisher. A cache that keeps a blob for less than that hands out
+			// references the sweeper has already collected, which the client reads as
+			// media that is gone.
+			return nil, fmt.Errorf(
+				"whatsmeow: blobs are kept for %s and a message may spend %s waiting to be published, "+
+					"so a reference could name a blob that was swept before the client was told about it",
+				ttl, deliverTimeout)
+		}
 	}
 	if deviceName := opts.DeviceName; deviceName != "" {
 		// Written exactly once, because it is written to a package-level value whatsmeow
@@ -102,15 +115,30 @@ func reachableAt(base string) error {
 		return fmt.Errorf(
 			"whatsmeow: blobs are published under %q, and a client fetches them over http or https", base)
 	}
-	if address.Hostname() == "" {
+	host := address.Hostname()
+	if host == "" {
 		// Hostname rather than Host: `http://:8080` parses with an authority of
 		// ":8080", which is a port and nobody to ask for it.
 		return fmt.Errorf("whatsmeow: blobs are published under %q, which names no host", base)
 	}
-	if address.Port() == "0" {
-		// What a listener reads as "any free port", which is not a port anybody can be
-		// told to come back to.
-		return fmt.Errorf("whatsmeow: blobs are published under %q, and nothing can be fetched from port 0", base)
+	if ip := net.ParseIP(host); ip != nil && ip.IsUnspecified() {
+		// `0.0.0.0` and `::` say "every interface" to a listener and mean "this machine"
+		// to whoever dials them, so a client elsewhere connects to itself. Loopback is
+		// not refused with them: an instance sharing a network namespace with its client
+		// is a deployment somebody really runs.
+		return fmt.Errorf(
+			"whatsmeow: blobs are published under %q, which is an address to listen on rather than one to reach",
+			base)
+	}
+	if port := address.Port(); port != "" {
+		// url.Parse only checks that a port is digits, so 99999 and 00 both come through
+		// it. Range-checked rather than compared against "0": zero is what a listener
+		// reads as "any free port", which is not a port anybody can be told to come back
+		// to, and it is spelled more than one way.
+		number, err := strconv.Atoi(port)
+		if err != nil || number < 1 || number > 65535 {
+			return fmt.Errorf("whatsmeow: blobs are published under %q, and %q is not a port to dial", base, port)
+		}
 	}
 	if address.RawQuery != "" || address.Fragment != "" {
 		// The id is appended as a path segment, so anything after it would end up in

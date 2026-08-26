@@ -122,3 +122,14 @@ internal/engine/whatsmeow/media.go: Retry 404 and 410 media through the phone  #
 # command handler, and a retention policy: the slice #19 describes, which #18 also wants.
 # Folding it in here would double a PR whose subject is the inbound half.
 internal/engine/whatsmeow/media.go: Implement stale blob refresh before issuing local refs  # PR#16
+# PR#16: real, narrow, and folded into #19 with the reasoning in a comment there. A blob
+# can be dropped by the sweep's quota pass between Put returning and the event naming it
+# being published; the age pass cannot, because this PR refuses a cache whose TTL does
+# not outlast the delivery bound. The two local fixes are both worse than waiting for
+# #19: pinning until the event settles is a store API change whose forgotten release
+# leaves a blob nothing ever evicts and a quota that lies, and a grace window on the LRU
+# pass trades a silent lost attachment for a quota that overshoots by whatever arrives in
+# one window. Once `message.download_media` exists, a blob that is gone costs a round
+# trip instead of the attachment, which is what makes the window ordinary rather than
+# fatal.
+internal/engine/whatsmeow/media.go: Keep blobs pinned until publication settles  # PR#16
