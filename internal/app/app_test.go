@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strconv"
 	"testing"
@@ -712,5 +714,73 @@ func TestTheSweepCadenceFollowsTheRetention(t *testing.T) {
 		if got := app.BlobSweep(ttl); got != want {
 			t.Fatalf("a %s retention is swept every %s, want %s", ttl, got, want)
 		}
+	}
+}
+
+// The media endpoint reaches a client only if every piece between the setting and the
+// socket is wired: the store is built, the handler is given the token, and the routes are
+// registered. Each of those is covered on its own; this is the one that would notice a
+// connector that reads WAC_MEDIA_ROOT and serves nothing.
+func TestTheMediaEndpointIsServedByARunningConnector(t *testing.T) {
+	server := miniredis.RunT(t)
+	t.Setenv("WAC_INSTANCE", "inst-a")
+	t.Setenv("REDIS_URL", "redis://"+server.Addr())
+	t.Setenv("WAC_HTTP_ADDR", "127.0.0.1:0")
+	t.Setenv("WAC_MEDIA_ROOT", t.TempDir())
+	t.Setenv("WAC_MEDIA_TOKEN", "s3cret")
+
+	cfg, err := app.LoadConfig("host")
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	connector, err := app.New(&cfg, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("app.New: %v", err)
+	}
+
+	// The mux the running server serves, exercised without a socket: a port of zero is
+	// only known after Start, and what is being checked is the wiring rather than the
+	// listener.
+	handler := connector.Handler()
+	const blob = "/media/blob_000102030405060708090a0b"
+
+	withToken := httptest.NewRecorder()
+	authorized := httptest.NewRequestWithContext(t.Context(), http.MethodGet, blob, http.NoBody)
+	authorized.Header.Set("Authorization", "Bearer s3cret")
+	handler.ServeHTTP(withToken, authorized)
+	if withToken.Code != http.StatusNotFound {
+		t.Fatalf("a blob that is not there answered %d, want 404: the route is not reaching the store", withToken.Code)
+	}
+
+	withoutToken := httptest.NewRecorder()
+	handler.ServeHTTP(withoutToken, httptest.NewRequestWithContext(t.Context(), http.MethodGet, blob, http.NoBody))
+	if withoutToken.Code != http.StatusUnauthorized {
+		t.Fatalf("an unauthenticated request answered %d, want 401: the token is not reaching the handler", withoutToken.Code)
+	}
+}
+
+// And the other way: a connector with no media root serves no media at all, so a client
+// that reaches the wrong instance hears 404 rather than a 401 it would read as an
+// operational problem to escalate.
+func TestAConnectorWithNoMediaRootServesNoMedia(t *testing.T) {
+	server := miniredis.RunT(t)
+	t.Setenv("WAC_INSTANCE", "inst-a")
+	t.Setenv("REDIS_URL", "redis://"+server.Addr())
+	t.Setenv("WAC_MEDIA_ROOT", "")
+
+	cfg, err := app.LoadConfig("host")
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	connector, err := app.New(&cfg, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("app.New: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	connector.Handler().ServeHTTP(rec, httptest.NewRequestWithContext(
+		t.Context(), http.MethodGet, "/media/blob_000102030405060708090a0b", http.NoBody))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("an instance with no media store answered %d, want 404", rec.Code)
 	}
 }

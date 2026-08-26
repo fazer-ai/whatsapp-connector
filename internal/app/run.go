@@ -156,6 +156,10 @@ func (c *Connector) Ready(ctx context.Context) error {
 	return c.store.Ping(pingCtx)
 }
 
+// Handler is what the HTTP server serves, so a test can exercise the routes this
+// instance actually registered without going through a socket.
+func (c *Connector) Handler() http.Handler { return c.http.Handler() }
+
 // Sessions is how many sessions this instance runs.
 func (c *Connector) Sessions() int { return c.manager.Count() }
 
