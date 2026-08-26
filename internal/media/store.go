@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"os"
 	"sort"
 	"strings"
@@ -103,9 +104,15 @@ func New(opts Options) (*Store, error) {
 	if opts.MaxBlob <= 0 {
 		opts.MaxBlob = DefaultMaxBlob
 	}
-	if opts.MaxBlob > opts.Quota {
-		return nil, fmt.Errorf("media: one blob may be %d bytes but all of them together only %d, so a blob at the cap evicts everything else and then itself",
-			opts.MaxBlob, opts.Quota)
+	// Against what a blob actually costs, not its length: the description beside it and
+	// the rounding to whole blocks are part of the budget, so a cap that only fits
+	// under the quota before they are counted is one where a blob at the cap evicts
+	// everything else and then itself.
+	if cost := (held{size: opts.MaxBlob}).cost(); cost > opts.Quota {
+		return nil, fmt.Errorf(
+			"media: one blob of %d bytes takes %d on disk once its description and the block size are counted, "+
+				"and the whole quota is %d, so a blob at the cap evicts everything else and then itself",
+			opts.MaxBlob, cost, opts.Quota)
 	}
 	if opts.Now == nil {
 		opts.Now = time.Now
@@ -233,15 +240,34 @@ func (s *Store) Open(id string) (io.ReadSeekCloser, Blob, error) {
 // Called on a tick rather than from Put, so the cost lands on the loop that expects it
 // instead of on the message that happened to fill the disk.
 func (s *Store) Sweep(ctx context.Context) (dropped int, freed int64, err error) {
-	blobs, err := s.list(ctx)
+	blobs, leftovers, err := s.list(ctx)
 	if err != nil {
 		return 0, 0, err
 	}
 
 	// One error is kept rather than the first one returned, so a single undeletable
-	// blob does not stop the sweep from clearing everything behind it.
+	// file does not stop the sweep from clearing everything behind it.
 	var failed error
+	for _, path := range leftovers {
+		if err := ctx.Err(); err != nil {
+			return dropped, freed, errors.Join(failed, err)
+		}
+		if err := s.root.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			// Silence here reads as a clean sweep while the file is still on the disk,
+			// and it is not counted against the quota either, so nothing would ever
+			// notice up to one whole blob's worth of it.
+			failed = errors.Join(failed, fmt.Errorf("media: collect %s: %w", path, err))
+		}
+	}
+
 	take := func(entry held) bool {
+		// Read again, immediately before removing. The snapshot is minutes old by now
+		// and Open touches a blob it hands out, so a blob collected since the walk is
+		// one somebody is using: dropping it on the stale time turns a HEAD that
+		// answered 200 into a GET that answers 404.
+		if info, err := s.root.Stat(s.pathOf(entry.id)); err == nil && info.ModTime().After(entry.touched) {
+			return false
+		}
 		if dropErr := s.drop(entry.id); dropErr != nil {
 			failed = errors.Join(failed, dropErr)
 			return false
@@ -257,12 +283,13 @@ func (s *Store) Sweep(ctx context.Context) (dropped int, freed int64, err error)
 		if err := ctx.Err(); err != nil {
 			return dropped, freed, errors.Join(failed, err)
 		}
-		// Counted whenever it is still here, including one that refused to go: what the
-		// quota has to be measured against is the disk, not the intention.
+		// Counted whenever it is still here, including one that refused to go and one
+		// that was collected between the walk and now: what the quota has to be measured
+		// against is the disk, not the intention.
 		if entry.touched.Before(cutoff) && take(entry) {
 			continue
 		}
-		total += entry.size
+		total += entry.cost()
 		kept = append(kept, entry)
 	}
 
@@ -281,7 +308,7 @@ func (s *Store) Sweep(ctx context.Context) (dropped int, freed int64, err error)
 			break
 		}
 		if take(entry) {
-			total -= entry.size
+			total -= entry.cost()
 		}
 	}
 	return dropped, freed, failed
@@ -294,12 +321,50 @@ type held struct {
 	touched time.Time
 }
 
-func (s *Store) list(ctx context.Context) ([]held, error) {
-	var out []held
-	// The ids a description was found for, checked against the blobs at the end: a
-	// description whose blob is not here describes nothing.
-	var described []string
-	err := fs.WalkDir(s.root.FS(), ".", func(path string, entry fs.DirEntry, err error) error {
+// blockSize is what one file is charged at least, and what its length is rounded up to.
+//
+// The quota is a disk budget, and a filesystem does not hand out bytes: it hands out
+// blocks, and a file also costs an inode and a directory entry. A cache of ten thousand
+// tiny stickers measured by the sum of their lengths reads as a few megabytes while the
+// volume it sits on is much fuller than that, and the eviction that should have started
+// never does. Four kibibytes is the common block size rather than a measured one, so
+// this is an approximation on the safe side, not an accounting of the actual extents.
+const blockSize int64 = 4 << 10
+
+// cost is what a blob is charged against the quota: its bytes and its description's,
+// each rounded up to a block.
+func (b held) cost() int64 {
+	payload := blocks(b.size)
+	if payload > math.MaxInt64-blockSize {
+		return math.MaxInt64
+	}
+	return payload + blockSize
+}
+
+func blocks(size int64) int64 {
+	if size <= 0 {
+		// An empty file still costs an inode and a directory entry.
+		return blockSize
+	}
+	if size > math.MaxInt64-blockSize {
+		// Rounding up would wrap, and a file this size is already every block there is.
+		return size
+	}
+	return (size + blockSize - 1) / blockSize * blockSize
+}
+
+// list walks the store and reports what it found: the blobs, and the paths of the files
+// that are nobody's — an interrupted write, or a description whose blob is not here.
+//
+// It removes nothing. Every removal the sweep makes goes through one place, so the
+// accounting and the cancellation checks are written once rather than in each branch
+// that happens to delete something.
+func (s *Store) list(ctx context.Context) (blobs []held, leftovers []string, err error) {
+	// The paths a description was found at, keyed by the id it describes, checked
+	// against the blobs at the end: a description whose blob is not here describes
+	// nothing.
+	described := map[string]string{}
+	err = fs.WalkDir(s.root.FS(), ".", func(path string, entry fs.DirEntry, err error) error {
 		if walkErr := ctx.Err(); walkErr != nil {
 			// A walk of a large cache on a slow disk is exactly what a shutdown must not
 			// have to wait out, and the process is stopping anyway: what this pass has
@@ -330,7 +395,7 @@ func (s *Store) list(ctx context.Context) ([]held, error) {
 			// enough to be nobody's, since a write in progress right now looks exactly
 			// like one that was abandoned.
 			if aged {
-				_ = s.root.Remove(path)
+				leftovers = append(leftovers, path)
 			}
 		case strings.HasSuffix(name, aboutSuffix) && validID(strings.TrimSuffix(name, aboutSuffix)):
 			// A description is normally accounted for with the blob it describes. One
@@ -341,7 +406,7 @@ func (s *Store) list(ctx context.Context) ([]held, error) {
 			// from one that never will, and collecting that one loses a blob that is
 			// about to exist.
 			if aged {
-				described = append(described, strings.TrimSuffix(name, aboutSuffix))
+				described[strings.TrimSuffix(name, aboutSuffix)] = path
 			}
 		case validID(name) && path == s.pathOf(name):
 			// Its canonical place, and only there. A file with a blob's name somewhere
@@ -349,7 +414,7 @@ func (s *Store) list(ctx context.Context) ([]held, error) {
 			// sweep would remove whatever is at the canonical path — nothing, or the
 			// real blob of the same name — and count this one's bytes as freed either
 			// way.
-			out = append(out, held{id: name, size: info.Size(), touched: info.ModTime()})
+			blobs = append(blobs, held{id: name, size: info.Size(), touched: info.ModTime()})
 		}
 		// Anything else was not written by this store. The root is a directory an
 		// operator points at, and one that turns out to hold something else is a
@@ -357,19 +422,19 @@ func (s *Store) list(ctx context.Context) ([]held, error) {
 		return nil
 	})
 	if err != nil {
-		return nil, fmt.Errorf("media: walk %s: %w", s.opts.Root, err)
+		return nil, nil, fmt.Errorf("media: walk %s: %w", s.opts.Root, err)
 	}
 
-	present := make(map[string]struct{}, len(out))
-	for _, entry := range out {
+	present := make(map[string]struct{}, len(blobs))
+	for _, entry := range blobs {
 		present[entry.id] = struct{}{}
 	}
-	for _, id := range described {
+	for id, path := range described {
 		if _, found := present[id]; !found {
-			_ = s.root.Remove(s.aboutPath(id))
+			leftovers = append(leftovers, path)
 		}
 	}
-	return out, nil
+	return blobs, leftovers, nil
 }
 
 // drop removes a blob and says whether the bytes actually went. The bytes go first: a

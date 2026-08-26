@@ -197,8 +197,11 @@ func TestTheSweepDropsTheLeastRecentlyCollectedFirst(t *testing.T) {
 
 	now := time.Now()
 	clock := func() time.Time { return now }
-	// Room for two of the three, so the sweep has to choose.
-	store, _ := newStore(t, media.Options{TTL: time.Hour, Quota: 20, MaxBlob: 10, Now: clock})
+	// Room for two of the three, so the sweep has to choose. A blob costs a block for
+	// its bytes and a block for its description however short it is, so the quota is
+	// written in those rather than in the lengths.
+	const oneBlob = 8 << 10
+	store, _ := newStore(t, media.Options{TTL: time.Hour, Quota: 2 * oneBlob, MaxBlob: 4 << 10, Now: clock})
 
 	first := put(t, store, "0123456789", &media.Blob{})
 	now = now.Add(time.Minute)
@@ -482,5 +485,109 @@ func TestAClosedStoreLetsGoOfTheDirectory(t *testing.T) {
 	}
 	if _, _, err := store.Sweep(t.Context()); err == nil {
 		t.Fatal("a closed store swept through a handle it had let go of")
+	}
+}
+
+// The quota is a disk budget, and a filesystem hands out blocks rather than bytes. A
+// cache of many tiny files measured by the sum of their lengths reads as almost nothing
+// while the volume it sits on is much fuller, and the eviction that should have started
+// never does.
+func TestTinyBlobsAreChargedWhatTheyCostOnDisk(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	clock := func() time.Time { return now }
+	// Eight kibibytes: room for one blob and its description, and no more.
+	store, _ := newStore(t, media.Options{TTL: time.Hour, Quota: 8 << 10, MaxBlob: 4 << 10, Now: clock})
+
+	first := put(t, store, "x", &media.Blob{})
+	now = now.Add(time.Minute)
+	second := put(t, store, "y", &media.Blob{})
+
+	// Two one-byte files are two bytes by their lengths and two whole blocks plus two
+	// descriptions on the disk.
+	dropped, _, err := store.Sweep(t.Context())
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if dropped != 1 {
+		t.Fatalf("the sweep dropped %d blobs, want the one over quota: two one-byte files are not two bytes of disk", dropped)
+	}
+	if _, _, err := store.Open(first.ID); !errors.Is(err, media.ErrNotFound) {
+		t.Fatalf("the sweep kept the older of the two: %v", err)
+	}
+	if _, _, err := store.Open(second.ID); err != nil {
+		t.Fatalf("the sweep dropped the newer of the two: %v", err)
+	}
+}
+
+// The snapshot the sweep works from is minutes old by the time it evicts, and Open
+// touches a blob it hands out. A blob collected in between is one somebody is using, and
+// dropping it on the stale time turns a HEAD that answered 200 into a GET that answers
+// 404.
+func TestABlobCollectedSinceTheWalkIsNotEvicted(t *testing.T) {
+	t.Parallel()
+
+	var (
+		now   = time.Now()
+		root  string
+		blob  string
+		reads int
+	)
+	// The clock is the seam. The sweep reads it once per file while it walks and once
+	// more for the cutoff after the walk has finished, so the second read is the moment
+	// between the snapshot and the eviction — which is where a GET lands in production,
+	// and the only place a test can put one without a hook that exists for tests.
+	clock := func() time.Time {
+		reads++
+		if reads == 2 && blob != "" {
+			touched := now.Add(time.Second)
+			if err := os.Chtimes(filepath.Join(root, blob[5:7], blob), touched, touched); err != nil {
+				t.Errorf("Chtimes: %v", err)
+			}
+		}
+		return now
+	}
+	store, dir := newStore(t, media.Options{TTL: time.Hour, Now: clock})
+	root = dir
+	stored := put(t, store, "in use", &media.Blob{})
+
+	// Past the TTL, so the walk sees it as aged out and the sweep sets out to drop it.
+	now = now.Add(2 * time.Hour)
+	reads, blob = 0, stored.ID
+
+	if _, _, err := store.Sweep(t.Context()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if _, _, err := store.Open(stored.ID); err != nil {
+		t.Fatalf("a blob collected between the walk and the eviction was dropped anyway: %v", err)
+	}
+}
+
+// An interrupted write that will not go is up to a whole blob of disk that no accounting
+// covers: it is not a blob, so nothing charges it against the quota, and a sweep that
+// swallowed the failure reports a clean pass every minute while it sits there.
+func TestASweepThatCannotCollectALeftoverSaysSo(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	clock := func() time.Time { return now }
+	store, root := newStore(t, media.Options{TTL: time.Hour, Now: clock})
+
+	shard := filepath.Join(root, "de")
+	if err := os.MkdirAll(shard, 0o700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(shard, ".blob_deadbeef0011223344556677"), []byte("half"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if err := os.Chmod(shard, 0o500); err != nil {
+		t.Fatalf("Chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(shard, 0o700) })
+
+	now = now.Add(2 * time.Hour)
+	if _, _, err := store.Sweep(t.Context()); err == nil {
+		t.Fatal("a sweep that could not collect an interrupted write reported a clean pass")
 	}
 }

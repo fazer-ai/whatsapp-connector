@@ -154,7 +154,7 @@ restart, and reports itself healthy while doing it.
 | `WAC_MEDIA_ROOT` | unset | Where inbound media is cached. Unset turns the store and the endpoint off |
 | `WAC_MEDIA_TOKEN` | unset | Bearer token the media endpoint requires. Required whenever `WAC_MEDIA_ROOT` is set: the endpoint hands out message contents |
 | `WAC_MEDIA_TTL` | `24h` | How long a blob is kept without being collected |
-| `WAC_MEDIA_QUOTA` | `2GiB` | Disk the blobs may take. Over it, the least recently collected go first |
+| `WAC_MEDIA_QUOTA` | `2GiB` | Disk the blobs may take, counted in whole blocks and including each blob's description. Over it, the least recently collected go first |
 | `WAC_MEDIA_MAX_BLOB` | `100MiB` | The largest single file this instance keeps |
 | `WAC_LEASE_TTL` | `30s` | How long a session lease survives without a renewal |
 | `WAC_HEARTBEAT` | `5s` | How often leases are renewed and the instance re-announces. Also bounds how long a read waits on Redis (half a heartbeat), and has to leave room for the read and the batch before it: `1.5 × heartbeat + lease/3 < lease` |
