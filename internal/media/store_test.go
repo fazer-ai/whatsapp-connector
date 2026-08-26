@@ -235,11 +235,11 @@ func TestTheSweepCollectsAnInterruptedWrite(t *testing.T) {
 	clock := func() time.Time { return now }
 	store, root := newStore(t, media.Options{TTL: time.Hour, Now: clock})
 
-	shard := filepath.Join(root, "bl")
+	shard := filepath.Join(root, "de")
 	if err := os.MkdirAll(shard, 0o700); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
 	}
-	orphan := filepath.Join(shard, ".blob_deadbeef.tmp")
+	orphan := filepath.Join(shard, ".blob_deadbeef0011223344556677")
 	if err := os.WriteFile(orphan, []byte("half a file"), 0o600); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
@@ -290,7 +290,9 @@ func TestBlobsAreSpreadAcrossShards(t *testing.T) {
 func TestTheSweepCollectsADescriptionWithNoBlob(t *testing.T) {
 	t.Parallel()
 
-	store, root := newStore(t, media.Options{TTL: time.Hour})
+	now := time.Now()
+	clock := func() time.Time { return now }
+	store, root := newStore(t, media.Options{TTL: time.Hour, Now: clock})
 	kept := put(t, store, "still here", &media.Blob{})
 
 	// The blob goes, its description stays, which is the state a crash between the two
@@ -305,13 +307,56 @@ func TestTheSweepCollectsADescriptionWithNoBlob(t *testing.T) {
 		t.Fatalf("the description should still be here: %v", err)
 	}
 
+	// Not while it is new: a Put that has written the description and not yet named the
+	// bytes looks exactly like this, and collecting it there loses a blob that is about
+	// to exist.
 	if _, _, err := store.Sweep(); err != nil {
 		t.Fatalf("Sweep: %v", err)
+	}
+	if _, err := os.Stat(orphanAbout); err != nil {
+		t.Fatalf("the sweep took a description a Put may still be finishing: %v", err)
+	}
+
+	// Two hours on, with the blob that is describing something collected in between so
+	// it is not simply aged out along with the orphan.
+	now = now.Add(2 * time.Hour)
+	read(t, store, kept.ID)
+	if _, _, err := store.Sweep(); err != nil {
+		t.Fatalf("the second Sweep: %v", err)
 	}
 	if _, err := os.Stat(orphanAbout); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("a description with no blob survived the sweep: %v", err)
 	}
 	if _, _, err := store.Open(kept.ID); err != nil {
 		t.Fatalf("the sweep took a description that was describing something: %v", err)
+	}
+}
+
+// The root is a directory an operator points at, and one that turns out to hold
+// something else is a misconfiguration to leave alone. A store that tidies a directory
+// it was pointed at by mistake deletes somebody's files, and a name that is not a blob
+// id is not one this can take apart into a path either.
+func TestTheSweepLeavesFilesItDidNotWriteAlone(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	clock := func() time.Time { return now }
+	store, root := newStore(t, media.Options{TTL: time.Hour, Now: clock})
+
+	foreign := []string{"notes.txt", ".hidden", "x", "blob_short", ".blob_short", "config.json"}
+	for _, name := range foreign {
+		if err := os.WriteFile(filepath.Join(root, name), []byte("somebody else's"), 0o600); err != nil {
+			t.Fatalf("WriteFile %s: %v", name, err)
+		}
+	}
+
+	now = now.Add(2 * time.Hour)
+	if _, _, err := store.Sweep(); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	for _, name := range foreign {
+		if _, err := os.Stat(filepath.Join(root, name)); err != nil {
+			t.Fatalf("the sweep removed %s, which it did not write: %v", name, err)
+		}
 	}
 }

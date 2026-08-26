@@ -153,8 +153,10 @@ func (s *Store) Put(source io.Reader, about *Blob) (Blob, error) {
 	}
 
 	// Named rather than handed to CreateTemp, because the id is already unique: the
-	// temporary name only has to be one the sweep recognises as an unfinished write.
-	tempName := shardOf(id) + "/." + id
+	// temporary name only has to be one the sweep recognises as an unfinished write,
+	// and one it can read an id back out of so it never touches a file it did not
+	// write.
+	tempName := shardOf(id) + "/" + tempPrefix + id
 	temp, err := s.root.OpenFile(tempName, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return Blob{}, fmt.Errorf("media: open a temporary file for %s: %w", id, err)
@@ -282,29 +284,36 @@ func (s *Store) list() ([]held, error) {
 		case entry.IsDir():
 			return nil
 		}
-		name := entry.Name()
-		if strings.HasPrefix(name, ".") {
-			// A write that was interrupted. It is named after nothing and nobody can
-			// ask for it, so the sweep is what collects it.
-			if info, statErr := entry.Info(); statErr == nil && info.ModTime().Before(s.opts.Now().Add(-s.opts.TTL)) {
-				_ = s.root.Remove(path)
-			}
-			return nil
-		}
 		info, err := entry.Info()
 		if err != nil {
 			return nil //nolint:nilerr // gone between the walk and the stat, which the sweep wanted anyway
 		}
-		if id, isAbout := strings.CutSuffix(name, aboutSuffix); isAbout {
+		switch name, aged := entry.Name(), info.ModTime().Before(s.opts.Now().Add(-s.opts.TTL)); {
+		case strings.HasPrefix(name, tempPrefix) && validID(strings.TrimPrefix(name, tempPrefix)):
+			// A write that was interrupted. It is named after nothing and nobody can
+			// ask for it, so the sweep is what collects it — but only once it is old
+			// enough to be nobody's, since a write in progress right now looks exactly
+			// like one that was abandoned.
+			if aged {
+				_ = s.root.Remove(path)
+			}
+		case strings.HasSuffix(name, aboutSuffix) && validID(strings.TrimSuffix(name, aboutSuffix)):
 			// A description is normally accounted for with the blob it describes. One
-			// on its own is what a crash between the two writes, or between the two
-			// removals, leaves behind: nothing will ever ask for it and no blob will
-			// ever be dropped that takes it with it, so the sweep is the only thing
-			// that collects it.
-			described = append(described, id)
-			return nil
+			// on its own is what a crash between the two writes leaves behind, and
+			// nothing else will ever collect it: no request names it and no blob drop
+			// takes it along. Aged first for the same reason as above — a Put that has
+			// written the description and not yet named the bytes is indistinguishable
+			// from one that never will, and collecting that one loses a blob that is
+			// about to exist.
+			if aged {
+				described = append(described, strings.TrimSuffix(name, aboutSuffix))
+			}
+		case validID(name):
+			out = append(out, held{id: name, size: info.Size(), touched: info.ModTime()})
 		}
-		out = append(out, held{id: name, size: info.Size(), touched: info.ModTime()})
+		// Anything else was not written by this store. The root is a directory an
+		// operator points at, and one that turns out to hold something else is a
+		// misconfiguration to leave alone rather than a directory to tidy.
 		return nil
 	})
 	if err != nil {
@@ -331,7 +340,13 @@ func (s *Store) drop(id string) {
 	_ = s.root.Remove(s.aboutPath(id))
 }
 
-const aboutSuffix = ".json"
+const (
+	aboutSuffix = ".json"
+	// tempPrefix marks a blob whose bytes are still arriving. A dot so an ordinary
+	// listing does not show it, and the id after it so the sweep can tell a file this
+	// store abandoned from one that was already in the directory.
+	tempPrefix = "."
+)
 
 // Paths are relative to the root and always spelled with a forward slash, which is what
 // os.Root takes on every platform.

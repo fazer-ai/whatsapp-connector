@@ -3,6 +3,7 @@ package app_test
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"os"
 	"strconv"
 	"testing"
@@ -646,5 +647,48 @@ func TestAPerBlobCapLargerThanTheQuotaIsRefused(t *testing.T) {
 
 	if _, err := app.LoadConfig("host"); err == nil {
 		t.Fatal("a per-blob cap larger than the whole quota was accepted")
+	}
+}
+
+// The run loop has an exit the context knows nothing about: an HTTP server that cannot
+// listen ends it while nothing has cancelled anything. A sweeper watching only that
+// context would still be ticking, and waiting for it hangs the process on exactly the
+// startup failure it is trying to report.
+func TestAStartupFailureIsReportedRatherThanHungOn(t *testing.T) {
+	var listener net.ListenConfig
+	occupied, err := listener.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	t.Cleanup(func() { _ = occupied.Close() })
+
+	server := miniredis.RunT(t)
+	t.Setenv("WAC_INSTANCE", "inst-a")
+	t.Setenv("REDIS_URL", "redis://"+server.Addr())
+	t.Setenv("WAC_HTTP_ADDR", occupied.Addr().String())
+	t.Setenv("WAC_MEDIA_ROOT", t.TempDir())
+	t.Setenv("WAC_MEDIA_TOKEN", "s3cret")
+
+	cfg, err := app.LoadConfig("host")
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	connector, err := app.New(&cfg, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("app.New: %v", err)
+	}
+
+	// Background rather than a cancellable context, which is what the binary passes:
+	// the point is that nothing cancels this and the run still has to come back.
+	done := make(chan error, 1)
+	go func() { done <- connector.Run(context.Background()) }()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("a connector that could not listen reported a clean run")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the run never came back: a startup failure is being waited on rather than reported")
 	}
 }

@@ -166,7 +166,13 @@ func (c *Connector) Run(ctx context.Context) error {
 	httpErr := make(chan error, 1)
 	go func() { httpErr <- c.http.Start() }()
 
-	swept := c.sweepBlobs(ctx)
+	// On a context of its own rather than on the one the loop watches, because the loop
+	// has an exit the context knows nothing about: an HTTP server that cannot listen
+	// ends the run while nothing has cancelled anything. Waiting on a sweeper that is
+	// still ticking would hang the process on exactly the startup failure it is trying
+	// to report.
+	sweeping, stopSweeping := context.WithCancel(ctx)
+	swept := c.sweepBlobs(sweeping)
 
 	c.log.Info().
 		Str("addr", c.cfg.HTTPAddr).
@@ -178,6 +184,7 @@ func (c *Connector) Run(ctx context.Context) error {
 	c.shutdown()
 	// After the loop, so the sweep is not walking a directory the shutdown is still
 	// writing to, and waited for, so the process does not exit mid-rename.
+	stopSweeping()
 	<-swept
 	return err
 }
