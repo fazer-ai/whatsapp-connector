@@ -530,7 +530,9 @@ func TestAFileSentToBeSeenOnceIsNeverKept(t *testing.T) {
 			// message, and the flag on the event is all that is left of one.
 			name: "unwrapped from a view-once envelope",
 			build: func() *waEvents.Message {
-				event := imageEvent("3EB0ONCE")
+				event := mediaEvent("3EB0ONCE", &waE2E.Message{ImageMessage: &waE2E.ImageMessage{
+					Mimetype: proto.String("image/jpeg"), JPEGThumbnail: []byte{0xFF, 0xD8, 0xFF, 0xE0},
+				}})
 				event.IsViewOnce = true
 				return event
 			},
@@ -540,6 +542,7 @@ func TestAFileSentToBeSeenOnceIsNeverKept(t *testing.T) {
 			build: func() *waEvents.Message {
 				return mediaEvent("3EB0ONCE", &waE2E.Message{ImageMessage: &waE2E.ImageMessage{
 					Mimetype: proto.String("image/jpeg"), ViewOnce: proto.Bool(true),
+					JPEGThumbnail: []byte{0xFF, 0xD8, 0xFF, 0xE0},
 				}})
 			},
 		},
@@ -548,6 +551,7 @@ func TestAFileSentToBeSeenOnceIsNeverKept(t *testing.T) {
 			build: func() *waEvents.Message {
 				return mediaEvent("3EB0ONCE", &waE2E.Message{VideoMessage: &waE2E.VideoMessage{
 					Mimetype: proto.String("video/mp4"), ViewOnce: proto.Bool(true),
+					JPEGThumbnail: []byte{0xFF, 0xD8, 0xFF, 0xE0},
 				}})
 			},
 		},
@@ -574,8 +578,16 @@ func TestAFileSentToBeSeenOnceIsNeverKept(t *testing.T) {
 			if downloads.count() != 0 {
 				t.Fatalf("a file the sender meant to be seen once was downloaded %d times", downloads.count())
 			}
-			if content := mediaContentOf(t, emissions[0]); content.Ref != nil {
+			content := mediaContentOf(t, emissions[0])
+			if content.Ref != nil {
 				t.Fatalf("a view-once file was handed out as %+v", content.Ref)
+			}
+			// The preview is the same picture at a lower resolution, and it travels
+			// inside the event: leaving it on keeps in Redis and in front of every
+			// client exactly what not storing the file was for.
+			if content.Thumbnail != "" {
+				t.Fatalf("a view-once message carried a preview of what it was not supposed to keep: %q",
+					content.Thumbnail)
 			}
 			assertFailure(t, emissions[1], reasonViewOnce)
 		})

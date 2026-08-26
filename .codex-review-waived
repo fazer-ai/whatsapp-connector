@@ -91,3 +91,24 @@ internal/media/store.go: Interrupt the underlying read on cancellation  # PR#15
 # the same code Put does, or the two accountings drift. That is its own change, which is
 # what #17 describes. It takes a sender deliberately lying about the length to reach.
 internal/engine/whatsmeow/media.go: Enforce the blob limit while downloading  # PR#16
+# PR#16: wrong for this client, and the client says so in its own code. The premise is
+# that a redelivered message is deduplicated and the replacement reference thrown away.
+# Chatwoot's MessageReceived answers a stored message with `duplicate_of(stored)`, which
+# calls `MessageWriter.fetch_media_for(stored, message)` — and `media_in` reads the media
+# off the message that just arrived, not off the stored row, so the fetch is queued with
+# the new owner's ref. There is a spec for it ("queues the download again when a retry
+# finds the message already stored") and a comment naming the case. It stands down only
+# when the bytes are already attached, which is the case where nothing is needed. A blob
+# being instance-local is the contract's own design rather than an oversight: the
+# `connector_blob` kind exists because a file lives on the disk of whoever downloaded it,
+# and the client's MediaRef.PROVIDER_KINDS says the same from the other side.
+internal/engine/whatsmeow/media.go: Keep media references usable across redelivery  # PR#16
+# PR#16: real for 404 and 410, wrong for 403, and filed as #18. The recovery is
+# SendMediaRetryReceipt plus the MediaRetry answer, and it cannot be bolted onto this
+# path: the client's answer to `media.download_failed` is `is_unsupported` and a refusal
+# to fetch again, so the retry has to happen before the failure is published, and the
+# inbound path is on whatsmeow's node handler with five minutes before a session loses
+# its ordering — of which the download already spends 90s. Waiting on the sender's phone
+# to answer is unbounded and it may never answer. `message.download_media` is where the
+# caller asked, is waiting, and brought a deadline, which is what #18 describes.
+internal/engine/whatsmeow/media.go: Retry 404 and 410 media through the phone  # PR#16

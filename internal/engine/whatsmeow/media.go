@@ -220,6 +220,10 @@ func (s *Session) mediaBody(ctx context.Context, event *waEvents.Message) (body,
 		// redelivers for good and nobody ever reads. Delivering the file is a decision
 		// with a contract change behind it (a flag on the content, and a blob handed out
 		// once), and this is the side of it that can still be changed.
+		// The preview goes with it. A thumbnail is the same picture at a lower
+		// resolution and it travels inside the event, so leaving it on would put in
+		// Redis and in front of every client exactly what not storing the file was for.
+		part.content.Thumbnail = ""
 		s.log.Info().Str("message_id", event.Info.ID).Str("kind", string(part.content.Kind)).
 			Msg("publishing a view-once message without keeping the file it carried")
 		return body{content: part.content, context: part.context, failure: reasonViewOnce}, true
