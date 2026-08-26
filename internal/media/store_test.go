@@ -315,22 +315,10 @@ func TestTheSweepCollectsADescriptionWithNoBlob(t *testing.T) {
 		t.Fatalf("the description should still be here: %v", err)
 	}
 
-	// Not while it is new: a Put that has written the description and not yet named the
-	// bytes looks exactly like this, and collecting it there loses a blob that is about
-	// to exist.
+	// No time is allowed to pass: what tells a description a Put is still finishing from
+	// one a crash left behind is the in-flight set, not the clock.
 	if _, _, err := store.Sweep(t.Context()); err != nil {
 		t.Fatalf("Sweep: %v", err)
-	}
-	if _, err := os.Stat(orphanAbout); err != nil {
-		t.Fatalf("the sweep took a description a Put may still be finishing: %v", err)
-	}
-
-	// Two hours on, with the blob that is describing something collected in between so
-	// it is not simply aged out along with the orphan.
-	now = now.Add(2 * time.Hour)
-	read(t, store, kept.ID)
-	if _, _, err := store.Sweep(t.Context()); err != nil {
-		t.Fatalf("the second Sweep: %v", err)
 	}
 	if _, err := os.Stat(orphanAbout); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("a description with no blob survived the sweep: %v", err)
@@ -537,13 +525,13 @@ func TestABlobCollectedSinceTheWalkIsNotEvicted(t *testing.T) {
 		blob  string
 		reads int
 	)
-	// The clock is the seam. The sweep reads it once per file while it walks and once
-	// more for the cutoff after the walk has finished, so the second read is the moment
-	// between the snapshot and the eviction — which is where a GET lands in production,
-	// and the only place a test can put one without a hook that exists for tests.
 	clock := func() time.Time {
 		reads++
-		if reads == 2 && blob != "" {
+		// The sweep reads the clock once, for the cutoff, and it does that after the
+		// walk has taken its snapshot: this is the window between the snapshot and the
+		// eviction, which is where a GET lands in production and the only place a test
+		// can put one without a hook that exists for tests.
+		if reads == 1 && blob != "" {
 			touched := now.Add(time.Second)
 			if err := os.Chtimes(filepath.Join(root, blob[5:7], blob), touched, touched); err != nil {
 				t.Errorf("Chtimes: %v", err)
@@ -965,6 +953,52 @@ func backdate(t *testing.T, root string, when time.Time) {
 			return nil //nolint:nilerr // best effort in a test helper
 		}
 		_ = os.Chtimes(path, when, when)
+		return nil
+	})
+}
+
+// A stamp that will not go on is a failed commit, not a detail. The blob would be
+// published under an id carrying the temporary file's old time, which the next sweep
+// deletes, so the caller would hand a client a reference to bytes already on their way
+// out.
+func TestAStampThatWillNotGoOnFailsTheWrite(t *testing.T) {
+	t.Parallel()
+
+	var (
+		now   = time.Now()
+		root  string
+		reads int
+	)
+	// Put reads the clock once for the description and once more to stamp the blob after
+	// the rename, so the second read is the moment before the stamp. The file is taken
+	// away there, which is what the stamp then fails on.
+	clock := func() time.Time {
+		reads++
+		if reads == 2 {
+			removeBlobs(t, root)
+		}
+		return now
+	}
+	store, dir := newStore(t, media.Options{Now: clock})
+	root = dir
+
+	stored, err := store.Put(t.Context(), strings.NewReader("arriving"), &media.Blob{})
+	if err == nil {
+		t.Fatalf("a blob that could not be stamped was published as %s", stored.ID)
+	}
+	if stored.ID != "" {
+		t.Fatalf("a failed write handed back an id: %+v", stored)
+	}
+}
+
+// removeBlobs takes every blob under root away, which is what the stamp above fails on.
+func removeBlobs(t *testing.T, root string) {
+	t.Helper()
+	_ = filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil || entry.IsDir() || !strings.HasPrefix(entry.Name(), "blob_") {
+			return nil //nolint:nilerr // best effort in a test helper
+		}
+		_ = os.Remove(path)
 		return nil
 	})
 }

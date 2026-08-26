@@ -250,8 +250,16 @@ func (s *Store) Put(ctx context.Context, source io.Reader, about *Blob) (Blob, e
 	// Stamped now rather than left with the time the temporary file picked up when the
 	// first byte landed. The age is how long since anybody wanted this, and a download
 	// that took longer than the TTL would otherwise arrive already expired.
+	//
+	// A stamp that will not go on is a failed commit, not a detail: the blob would be
+	// published under an id the next sweep deletes, and the caller would hand a client
+	// a reference to bytes that are already on their way out. Taken back instead, so
+	// what the caller gets is an error it can retry.
 	now := s.opts.Now()
-	_ = s.root.Chtimes(path, now, now)
+	if err := s.root.Chtimes(path, now, now); err != nil {
+		_, _ = s.drop(id)
+		return Blob{}, fmt.Errorf("media: stamp %s: %w", id, err)
+	}
 	return stored, nil
 }
 
@@ -524,7 +532,7 @@ func (s *Store) list(ctx context.Context) (blobs []held, leftovers []string, ski
 			skipped = errors.Join(skipped, fmt.Errorf("media: measure %s: %w", path, err))
 			return nil
 		}
-		switch name, aged := entry.Name(), info.ModTime().Before(s.opts.Now().Add(-s.opts.TTL)); {
+		switch name := entry.Name(); {
 		case path == s.tempPath(strings.TrimPrefix(name, tempPrefix)):
 			// A write that was interrupted. It is named after nothing and nobody can
 			// ask for it, so the sweep is what collects it.
@@ -542,13 +550,15 @@ func (s *Store) list(ctx context.Context) (blobs []held, leftovers []string, ski
 			// A description is normally accounted for with the blob it describes. One
 			// on its own is what a crash between the two writes leaves behind, and
 			// nothing else will ever collect it: no request names it and no blob drop
-			// takes it along. Aged first for the same reason as above — a Put that has
-			// written the description and not yet named the bytes is indistinguishable
-			// from one that never will, and collecting that one loses a blob that is
-			// about to exist.
+			// takes it along.
+			//
+			// Asked of the in-flight set for the same reason the temporary files are: a
+			// Put that has written the description and not yet named the bytes looks
+			// exactly like one that never will, and collecting that one leaves bytes
+			// that every Open reports as missing.
 			id := strings.TrimSuffix(name, aboutSuffix)
 			sidecars[id] = info.Size()
-			if aged {
+			if !s.isWriting(id) {
 				described[id] = path
 			}
 		case validID(name) && path == s.pathOf(name):
