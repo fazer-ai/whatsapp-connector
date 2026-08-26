@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net/url"
 	"strings"
 	"time"
 
@@ -325,11 +326,18 @@ func (s *Session) fetch(ctx context.Context, part *attachment) (protocol.MediaRe
 // exactly the same way, for good. Checked here rather than matched on the text whatsmeow
 // writes, which is not part of its contract and changes when it likes.
 func unfetchable(part wm.DownloadableMessage) error {
-	if !strings.HasPrefix(part.GetDirectPath(), "/") {
+	path := part.GetDirectPath()
+	if !strings.HasPrefix(path, "/") {
 		// The path is pasted into a URL under whichever media host answers, so one that
 		// is not a path names nothing there. Reported without the value: it is a
 		// fragment of a URL to somebody's file, and nothing in a log needs it.
 		return refused{reason: reasonUnreferenced, err: errors.New("the direct path is not a path")}
+	}
+	if _, err := url.Parse(path); err != nil {
+		// A leading slash is not enough: whatsmeow pastes the whole thing into a URL and
+		// builds a request out of it, so a bad escape or a control character fails there
+		// instead, with a plain error, on every attempt forever.
+		return refused{reason: reasonUnreferenced, err: errors.New("the direct path cannot be parsed as one")}
 	}
 	if digest := part.GetFileEncSHA256(); len(digest) != 0 && len(digest) != sha256.Size {
 		return refused{
@@ -369,7 +377,12 @@ func downloadFailure(err error) error {
 		return refused{reason: reasonUnreferenced, err: err}
 
 	default:
-		return fmt.Errorf("download the file of a media message: %w", err)
+		// Masked rather than wrapped whole. whatsmeow builds the media request URL out of
+		// the direct path and the hash, and a transport failure comes back carrying that
+		// URL: it is how the ciphertext is fetched, so it belongs in a log no more than
+		// the file does. The chain is dropped with it, which costs nothing — this is the
+		// arm that means "unclassified", and nothing branches on what is in it.
+		return fmt.Errorf("download the file of a media message: %s", redact(err.Error()))
 	}
 }
 

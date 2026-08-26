@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -553,6 +554,24 @@ func TestMetadataThatCanNeverDescribeAFileIsGivenUpOnRatherThanRetriedForever(t 
 			want: reasonUnreferenced,
 		},
 		{
+			// A leading slash is not enough: whatsmeow pastes the whole thing into a URL
+			// and builds a request out of it, which is where a bad escape fails.
+			name: "a direct path with an escape that is not one",
+			image: &waE2E.ImageMessage{
+				Mimetype: proto.String("image/jpeg"), DirectPath: proto.String("/v/t62.7118-24/bad%zz"),
+				MediaKey: []byte("key"), FileEncSHA256: digest,
+			},
+			want: reasonUnreferenced,
+		},
+		{
+			name: "a direct path carrying a control character",
+			image: &waE2E.ImageMessage{
+				Mimetype: proto.String("image/jpeg"), DirectPath: proto.String("/v/t62.7118-24/fi\x00le"),
+				MediaKey: []byte("key"), FileEncSHA256: digest,
+			},
+			want: reasonUnreferenced,
+		},
+		{
 			name: "a ciphertext digest that is not a SHA-256",
 			image: &waE2E.ImageMessage{
 				Mimetype: proto.String("image/jpeg"), DirectPath: proto.String(directPath),
@@ -600,6 +619,33 @@ func TestWellFormedMetadataIsStillDownloaded(t *testing.T) {
 	}
 	if content := mediaContentOf(t, emissions[0]); content.Ref == nil {
 		t.Fatal("a well formed message was published with no file to fetch")
+	}
+}
+
+// whatsmeow builds the media request URL out of the direct path and the hash, and a
+// transport failure comes back carrying that whole URL. It is how the ciphertext is
+// fetched, so it must not reach a log any more than the file itself does.
+func TestATransportFailureDoesNotCarryTheMediaURLIntoALog(t *testing.T) {
+	t.Parallel()
+
+	const capability = "AbCdEf0123456789GhIjKlMnOpQrStUvWxYz012345"
+	failed := &url.Error{
+		Op:  "Get",
+		URL: "https://mmg.whatsapp.net/v/t62.7118-24/" + capability + ".enc?hash=" + capability,
+		Err: errors.New("dial tcp: connection refused"),
+	}
+
+	err := downloadFailure(failed)
+	var giveUp refused
+	if errors.As(err, &giveUp) {
+		t.Fatalf("a connection that was refused was given up on for good: %+v", giveUp)
+	}
+	if strings.Contains(err.Error(), capability) {
+		t.Fatalf("the media URL went out whole: %s", err)
+	}
+	// And what an operator actually reads is still there.
+	if !strings.Contains(err.Error(), "connection refused") {
+		t.Fatalf("the reason went out with the URL: %s", err)
 	}
 }
 
