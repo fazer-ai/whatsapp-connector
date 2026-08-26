@@ -1612,3 +1612,40 @@ func TestACommandThatFailedIsNotRememberedAsDone(t *testing.T) {
 		t.Fatalf("the engine saw %d attempts, want the failure and the retry", got)
 	}
 }
+
+// The key a command is remembered under. A send names its own message and is keyed by
+// it; everything else brings an idempotency_key, which the frame carries rather than
+// the payload. Reading it from the payload leaves every non-send command undeduplicated
+// while looking like it is covered.
+func TestACommandIsKeyedByWhateverNamesItOnlyOnce(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	ctx := context.Background()
+	if _, err := h.manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, _ := h.engine.Session("s1")
+
+	logout := &protocol.Command{
+		V: protocol.Version, ID: "c1", Type: protocol.CommandSessionLogout, SID: "s1", ReplyTo: "c1",
+		IdempotencyKey: "logout-once", Payload: json.RawMessage(`{}`),
+	}
+	var acked atomic.Bool
+	h.manager.Dispatch(ctx, delivery(logout, &acked))
+	waitFor(t, "the logout to be answered", func() bool { _, ok := h.recorder.reply("c1"); return ok })
+
+	redelivered := *logout
+	redelivered.ID = "c2"
+	redelivered.ReplyTo = "c2"
+	var ackedAgain atomic.Bool
+	h.manager.Dispatch(ctx, delivery(&redelivered, &ackedAgain))
+	waitFor(t, "the redelivery to be answered", func() bool { _, ok := h.recorder.reply("c2"); return ok })
+
+	if reply, _ := h.recorder.reply("c2"); !reply.OK {
+		t.Fatalf("the redelivered logout was refused: %+v", reply.Error)
+	}
+	if got := engineSession.LoggedOut(); got != 1 {
+		t.Fatalf("the account was logged out %d times, want once", got)
+	}
+}

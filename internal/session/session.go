@@ -428,21 +428,20 @@ func (s *Session) alreadyDid(ctx context.Context, key string) (json.RawMessage, 
 }
 
 // idempotencyKey is what a command is remembered under, and the empty string for one
-// that names nothing to be remembered by. A send is keyed by the message it is sending,
-// which the caller names; everything else that asks to be carried out once brings an
-// idempotency_key of its own.
+// that names nothing to be remembered by.
+//
+// A command that names its own message is keyed by it, which is the contract's
+// `msg:<message_id>`: the caller picks the id, so every redelivery of that command
+// names the same one. Everything else is keyed by the `idempotency_key` the frame
+// carries, which is a field of the command and not of its payload.
 func idempotencyKey(command *protocol.Command) string {
 	var body struct {
-		MessageID      string `json:"message_id"`
-		IdempotencyKey string `json:"idempotency_key"`
+		MessageID string `json:"message_id"`
 	}
-	if err := json.Unmarshal(command.Payload, &body); err != nil {
-		return ""
-	}
-	if body.MessageID != "" {
+	if err := json.Unmarshal(command.Payload, &body); err == nil && body.MessageID != "" {
 		return "msg:" + body.MessageID
 	}
-	return body.IdempotencyKey
+	return command.IdempotencyKey
 }
 
 // The three lifecycle commands go to the engine's own methods rather than through

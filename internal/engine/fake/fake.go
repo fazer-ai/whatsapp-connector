@@ -86,6 +86,7 @@ type Session struct {
 	events    chan engine.Emission
 	closed    bool
 	connected bool
+	loggedOut int
 	commands  []protocol.Command
 }
 
@@ -141,9 +142,18 @@ func (s *Session) Disconnect(_ context.Context) error {
 func (s *Session) Logout(_ context.Context) error {
 	s.mu.Lock()
 	s.connected = false
+	s.loggedOut++
 	s.mu.Unlock()
 	s.emit(protocol.EventSessionLoggedOut, map[string]any{"reason": "logout_requested"})
 	return nil
+}
+
+// LoggedOut counts how many times the account was unlinked, which is what a test
+// asserting a command ran once rather than twice looks at.
+func (s *Session) LoggedOut() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.loggedOut
 }
 
 // Connected reports whether Connect has run and nothing has taken it back.
