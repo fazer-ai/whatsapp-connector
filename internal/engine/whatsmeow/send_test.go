@@ -1,6 +1,7 @@
 package whatsmeow
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"testing"
@@ -105,18 +106,90 @@ func TestASendThisConnectorCannotMakeIsRefusedWithItsOwnCode(t *testing.T) {
 	}
 }
 
-// A send on a session whose socket is down. Answering anything but this leaves a caller
-// believing a message went out over a connection that is not there.
-func TestASendOnASessionThatIsNotConnectedSaysSo(t *testing.T) {
+// The two states a send can be refused for, and they are not the same answer: one has
+// the client pair an account, the other has it wait for a connection to come back. An
+// unpaired session is never connected either, so asking about the socket first makes
+// the pairing answer unreachable and leaves the client waiting on something nothing is
+// going to do.
+func TestASendSaysWhichOfTheSessionsOwnStatesRefusedIt(t *testing.T) {
 	t.Parallel()
 
-	session, _ := newTestSession(t, "5511999990001")
-	_, err := session.send(t.Context(), &protocol.Command{
-		Type: protocol.CommandMessageSend,
-		Payload: json.RawMessage(`{"message_id":"3EB0ABCDEF",
-			"to":{"kind":"phone","id":"5511999990002"},"content":{"type":"text","body":"oi"}}`),
-	})
-	assertCode(t, err, protocol.ErrorNotConnected)
+	for _, tc := range []struct {
+		name  string
+		phone string
+		want  protocol.ErrorCode
+	}{
+		{"a session that never paired", "", protocol.ErrorNotPaired},
+		{"a paired session whose socket is down", "5511999990001", protocol.ErrorNotConnected},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			session, _ := newTestSession(t, tc.phone)
+			_, err := session.send(t.Context(), &protocol.Command{
+				Type: protocol.CommandMessageSend,
+				Payload: json.RawMessage(`{"message_id":"3EB0ABCDEF",
+					"to":{"kind":"phone","id":"5511999990002"},"content":{"type":"text","body":"oi"}}`),
+			})
+			assertCode(t, err, tc.want)
+		})
+	}
+}
+
+// A quote a client cannot attribute is a quote it renders as coming from nobody. The
+// caller can only name the participant for somebody else's message in a group, so the
+// two cases it cannot fill in are the ones this session has to.
+func TestAQuoteIsAttributedToWhoeverWroteTheMessageItAnswers(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name   string
+		quoted func() *sendRequest
+		to     waTypes.JID
+		want   string
+	}{
+		{"the caller named the participant itself", func() *sendRequest {
+			return quotingRequest("3EB0ORIGINAL", false, &protocol.Address{
+				Kind: protocol.AddressPhone, ID: "5511999990003",
+			})
+		}, groupChat, "5511999990003@" + waTypes.DefaultUserServer},
+		{"a quote of this account's own message", func() *sendRequest {
+			return quotingRequest("3EB0ORIGINAL", true, nil)
+		}, groupChat, ownAccount.String()},
+		{"a quote in a direct chat, where the only other party wrote it", func() *sendRequest {
+			return quotingRequest("3EB0ORIGINAL", false, nil)
+		}, peer, peer.String()},
+		{"somebody else's message in a group the caller did not name", func() *sendRequest {
+			return quotingRequest("3EB0ORIGINAL", false, nil)
+		}, groupChat, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			message, err := textToSend(tc.quoted(), ownAccount, tc.to)
+			if err != nil {
+				t.Fatalf("textToSend: %v", err)
+			}
+			info := message.GetExtendedTextMessage().GetContextInfo()
+			if info.GetStanzaID() != "3EB0ORIGINAL" {
+				t.Fatalf("the quote points at %q", info.GetStanzaID())
+			}
+			if got := info.GetParticipant(); got != tc.want {
+				t.Fatalf("the quote attributes the original to %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func quotingRequest(id string, fromMe bool, participant *protocol.Address) *sendRequest {
+	req := &sendRequest{MessageID: "3EB0"}
+	req.Content.Type, req.Content.Body = "text", "answering that"
+	req.Quoted = &struct {
+		ID          string            `json:"id"`
+		Participant *protocol.Address `json:"participant"`
+		FromMe      bool              `json:"from_me"`
+	}{ID: id, Participant: participant, FromMe: fromMe}
+	return req
 }
 
 // The plain shape is what a phone sends for a bare line of text, and every client
@@ -128,7 +201,7 @@ func TestABareTextGoesOutInTheShapeAPhoneWouldSendIt(t *testing.T) {
 	req := &sendRequest{MessageID: "3EB0"}
 	req.Content.Type, req.Content.Body = "text", "bom dia"
 
-	message, err := textToSend(req)
+	message, err := textToSend(req, ownAccount, peer)
 	if err != nil {
 		t.Fatalf("textToSend: %v", err)
 	}
@@ -155,7 +228,7 @@ func TestATextThatCarriesSomethingElseGoesOutWithIt(t *testing.T) {
 		FromMe      bool              `json:"from_me"`
 	}{ID: "3EB0ORIGINAL", Participant: &protocol.Address{Kind: protocol.AddressLID, ID: "167392323834034"}}
 
-	message, err := textToSend(req)
+	message, err := textToSend(req, ownAccount, peer)
 	if err != nil {
 		t.Fatalf("textToSend: %v", err)
 	}
@@ -193,6 +266,11 @@ func TestWhatsAppsOwnRefusalsKeepTheirMeaning(t *testing.T) {
 		// The message may well have gone out: what timed out is the answer, not the
 		// send. Saying so is what lets the caller retry under the same id.
 		{"an answer that never came", wm.ErrMessageTimedOut, protocol.ErrorTimeout},
+		// The command's own deadline, not WhatsApp's. Same reasoning and the same answer:
+		// what ran out is the answer, not the send, and a refusal would have the caller
+		// give up on a message that is already in somebody's chat.
+		{"the command's deadline running out", context.DeadlineExceeded, protocol.ErrorTimeout},
+		{"the command being abandoned", context.Canceled, protocol.ErrorTimeout},
 		{"anything this does not name", errors.New("something new in the protocol"), protocol.ErrorWaError},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -202,6 +280,15 @@ func TestWhatsAppsOwnRefusalsKeepTheirMeaning(t *testing.T) {
 		})
 	}
 }
+
+// The two addresses every send has: the account it goes out from and the chat it goes
+// to. A quote needs both, because the caller can only name the participant for somebody
+// else's message in a group.
+var (
+	ownAccount = waTypes.NewJID("5511999990001", waTypes.DefaultUserServer)
+	peer       = waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)
+	groupChat  = waTypes.NewJID("120363000000000000", waTypes.GroupServer)
+)
 
 func assertCode(t *testing.T, err error, want protocol.ErrorCode) {
 	t.Helper()

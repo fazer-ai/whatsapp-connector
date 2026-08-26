@@ -86,15 +86,28 @@ func (s *Session) send(ctx context.Context, command *protocol.Command) (json.Raw
 		return nil, err
 	}
 
-	message, err := textToSend(&req)
+	// Built before the session's own state is checked, and that order is deliberate: a
+	// payload this connector can never send is the caller's bug whatever the socket is
+	// doing, and answering `not_connected` to one sends it away to wait for a
+	// connection that would not have helped.
+	client := s.current()
+	message, err := textToSend(&req, ownJID(client, to), to)
 	if err != nil {
 		return nil, err
 	}
 
-	client := s.current()
+	if phone, _ := s.identity(); phone == "" {
+		// Asked before the socket, because an unpaired session is never connected and
+		// the two answers send a client down different roads: one pairs an account, the
+		// other waits for a connection to come back. Answering `not_connected` to a
+		// session that has no account leaves it waiting for something nothing is going
+		// to do.
+		return nil, protocol.NewError(protocol.ErrorNotPaired, "this session has no WhatsApp account to send from")
+	}
 	if !client.IsConnected() {
 		return nil, protocol.NewError(protocol.ErrorNotConnected, "the session is not connected to WhatsApp")
 	}
+
 	sent, err := client.SendMessage(ctx, to, message, wm.SendRequestExtra{ID: req.MessageID})
 	if err != nil {
 		return nil, sendFailure(err)
@@ -113,8 +126,8 @@ func (s *Session) send(ctx context.Context, command *protocol.Command) (json.Raw
 // a phone sends and what every client renders without thinking about it. The extended
 // shape is for a message that carries something else: a quote, a mention, or the
 // chat's disappearing-message timer.
-func textToSend(req *sendRequest) (*waE2E.Message, error) {
-	alongside, err := contextToSend(req)
+func textToSend(req *sendRequest, own, to waTypes.JID) (*waE2E.Message, error) {
+	alongside, err := contextToSend(req, own, to)
 	if err != nil {
 		return nil, err
 	}
@@ -127,8 +140,45 @@ func textToSend(req *sendRequest) (*waE2E.Message, error) {
 	}}, nil
 }
 
+// ownJID is this account's own address, in the form the chat is addressed by. WhatsApp
+// names the same account by phone number in one chat and by LID in the next, and a
+// quote attributed under the other one is a quote a client cannot match to anybody.
+func ownJID(client *wm.Client, to waTypes.JID) waTypes.JID {
+	if to.Server == waTypes.HiddenUserServer && !client.Store.LID.IsEmpty() {
+		return client.Store.LID.ToNonAD()
+	}
+	if client.Store.ID != nil {
+		return client.Store.ID.ToNonAD()
+	}
+	return waTypes.EmptyJID
+}
+
+// quotedParticipant names who wrote the message being answered.
+//
+// A caller only knows that for somebody else's message in a group; for its own it has
+// nobody to name, and for a direct chat it does not send one at all. Left off, a client
+// has a quote it cannot attribute. Both of the cases the caller cannot fill in are ones
+// this session can: its own account wrote it, or the only other party in the chat did.
+func quotedParticipant(req *sendRequest, own, to waTypes.JID) (waTypes.JID, error) {
+	if req.Quoted.Participant != nil {
+		return jidOf(*req.Quoted.Participant)
+	}
+	if req.Quoted.FromMe {
+		return own, nil
+	}
+	if to.Server == waTypes.GroupServer {
+		// Somebody else's message in a group, and the caller did not say whose. Guessing
+		// would attribute it to the group itself.
+		return waTypes.EmptyJID, nil
+	}
+	return to, nil
+}
+
 // contextToSend builds what goes alongside the body, and nil when nothing does.
-func contextToSend(req *sendRequest) (*waE2E.ContextInfo, error) {
+//
+// `own` is this account's own address and `to` is the chat, both of which the quote
+// needs and the caller cannot always supply.
+func contextToSend(req *sendRequest, own, to waTypes.JID) (*waE2E.ContextInfo, error) {
 	var alongside *waE2E.ContextInfo
 	ensure := func() *waE2E.ContextInfo {
 		if alongside == nil {
@@ -140,11 +190,11 @@ func contextToSend(req *sendRequest) (*waE2E.ContextInfo, error) {
 	if req.Quoted != nil && req.Quoted.ID != "" {
 		quote := ensure()
 		quote.StanzaID = proto.String(req.Quoted.ID)
-		if req.Quoted.Participant != nil {
-			participant, err := jidOf(*req.Quoted.Participant)
-			if err != nil {
-				return nil, err
-			}
+		participant, err := quotedParticipant(req, own, to)
+		if err != nil {
+			return nil, err
+		}
+		if !participant.IsEmpty() {
 			quote.Participant = proto.String(participant.String())
 		}
 	}
@@ -174,10 +224,13 @@ func sendFailure(err error) error {
 		return protocol.NewError(protocol.ErrorNotPaired, "the session has no WhatsApp account to send from")
 	case errors.Is(err, wm.ErrNotConnected):
 		return protocol.NewError(protocol.ErrorNotConnected, "the session is not connected to WhatsApp")
-	case errors.Is(err, wm.ErrMessageTimedOut), errors.Is(err, wm.ErrIQTimedOut):
-		// The message may well have gone out: what timed out is the answer, not the
-		// send. Saying so is what lets the caller retry under the same id, which is the
-		// one retry that cannot duplicate anything.
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled),
+		errors.Is(err, wm.ErrMessageTimedOut), errors.Is(err, wm.ErrIQTimedOut):
+		// The message may well have gone out: what ran out is the answer, not the send,
+		// whether the deadline was the command's or WhatsApp's. Saying so is what lets
+		// the caller retry under the same id, which is the one retry that cannot
+		// duplicate anything. A refusal here would have it give up on a message that is
+		// already in somebody's chat.
 		return protocol.NewError(protocol.ErrorTimeout, "WhatsApp did not answer whether the message went out")
 	case errors.Is(err, wm.ErrUnknownServer), errors.Is(err, wm.ErrRecipientADJID):
 		return protocol.NewError(protocol.ErrorInvalidPayload, "that is not an address a message can be sent to")
