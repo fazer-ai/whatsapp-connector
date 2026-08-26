@@ -4,6 +4,7 @@ package app
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -181,6 +182,20 @@ func LoadConfig(hostname string) (Config, error) {
 		// is not.
 		return Config{}, fmt.Errorf("app: WAC_DATABASE_URL is required when WAC_ENGINE is %q", EngineWhatsmeow)
 	}
+	if cfg.MediaTTL <= 0 {
+		// media.New substitutes its own default for a non-positive TTL, so a deployment
+		// that asked for something else would keep a day's worth of blobs and report
+		// nothing about it. The setting is honoured or the instance does not start.
+		return Config{}, fmt.Errorf("app: WAC_MEDIA_TTL must be positive, got %s", cfg.MediaTTL)
+	}
+	if cfg.MediaMaxBlob > cfg.MediaQuota {
+		// One blob would evict everything else and then itself. media.New refuses this
+		// as well; saying so here is what puts it in front of an operator alongside the
+		// other two settings rather than inside a subsystem's constructor.
+		return Config{}, fmt.Errorf(
+			"app: WAC_MEDIA_MAX_BLOB (%d) is larger than WAC_MEDIA_QUOTA (%d), so a blob at the cap "+
+				"evicts the whole cache and then itself", cfg.MediaMaxBlob, cfg.MediaQuota)
+	}
 	if cfg.MediaRoot != "" && cfg.MediaToken == "" {
 		// The endpoint hands out message contents, and its only guard is the token. A
 		// store with no token would serve them to anything that can reach the port, so
@@ -214,6 +229,12 @@ func envBytes(name string, fallback int64) (int64, error) {
 	}
 	if value <= 0 {
 		return 0, fmt.Errorf("app: %s must be positive, got %d", name, value)
+	}
+	if value > math.MaxInt64/scale {
+		// Checked before the multiplication rather than after: past this the product
+		// wraps, and a budget that wrapped is either negative, which reads as unset and
+		// is replaced by a default, or a small positive number nobody asked for.
+		return 0, fmt.Errorf("app: %s is larger than this can count in bytes", name)
 	}
 	return value * scale, nil
 }

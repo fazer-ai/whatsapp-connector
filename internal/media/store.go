@@ -270,6 +270,9 @@ type held struct {
 
 func (s *Store) list() ([]held, error) {
 	var out []held
+	// The ids a description was found for, checked against the blobs at the end: a
+	// description whose blob is not here describes nothing.
+	var described []string
 	err := fs.WalkDir(s.root.FS(), ".", func(path string, entry fs.DirEntry, err error) error {
 		switch {
 		case err != nil:
@@ -288,18 +291,34 @@ func (s *Store) list() ([]held, error) {
 			}
 			return nil
 		}
-		if strings.HasSuffix(name, aboutSuffix) {
-			return nil
-		}
 		info, err := entry.Info()
 		if err != nil {
 			return nil //nolint:nilerr // gone between the walk and the stat, which the sweep wanted anyway
+		}
+		if id, isAbout := strings.CutSuffix(name, aboutSuffix); isAbout {
+			// A description is normally accounted for with the blob it describes. One
+			// on its own is what a crash between the two writes, or between the two
+			// removals, leaves behind: nothing will ever ask for it and no blob will
+			// ever be dropped that takes it with it, so the sweep is the only thing
+			// that collects it.
+			described = append(described, id)
+			return nil
 		}
 		out = append(out, held{id: name, size: info.Size(), touched: info.ModTime()})
 		return nil
 	})
 	if err != nil {
 		return nil, fmt.Errorf("media: walk %s: %w", s.opts.Root, err)
+	}
+
+	present := make(map[string]struct{}, len(out))
+	for _, entry := range out {
+		present[entry.id] = struct{}{}
+	}
+	for _, id := range described {
+		if _, found := present[id]; !found {
+			_ = s.root.Remove(s.aboutPath(id))
+		}
 	}
 	return out, nil
 }
@@ -316,7 +335,11 @@ const aboutSuffix = ".json"
 
 // Paths are relative to the root and always spelled with a forward slash, which is what
 // os.Root takes on every platform.
-func shardOf(id string) string              { return id[:2] }
+//
+// The shard is the first byte of the random half, not the first two characters of the
+// id: every id starts `blob_`, so taking those would put every blob in one directory
+// and the sharding would exist in the layout and nowhere on disk.
+func shardOf(id string) string              { return id[len(idPrefix) : len(idPrefix)+2] }
 func (s *Store) pathOf(id string) string    { return shardOf(id) + "/" + id }
 func (s *Store) aboutPath(id string) string { return s.pathOf(id) + aboutSuffix }
 

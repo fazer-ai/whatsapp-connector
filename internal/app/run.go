@@ -166,6 +166,8 @@ func (c *Connector) Run(ctx context.Context) error {
 	httpErr := make(chan error, 1)
 	go func() { httpErr <- c.http.Start() }()
 
+	swept := c.sweepBlobs(ctx)
+
 	c.log.Info().
 		Str("addr", c.cfg.HTTPAddr).
 		Str("engine", c.cfg.Engine).
@@ -174,6 +176,9 @@ func (c *Connector) Run(ctx context.Context) error {
 
 	err := c.loop(ctx, httpErr)
 	c.shutdown()
+	// After the loop, so the sweep is not walking a directory the shutdown is still
+	// writing to, and waited for, so the process does not exit mid-rename.
+	<-swept
 	return err
 }
 
@@ -201,7 +206,6 @@ func (c *Connector) loop(ctx context.Context, httpErr <-chan error) error {
 			c.manager.RenewAll(ctx)
 			c.reclaimCommands(ctx)
 			c.announce(ctx)
-			c.sweepBlobs()
 			c.metrics.SessionsRunning.Set(float64(c.manager.Count()))
 		default:
 			c.readCommands(ctx)
@@ -209,21 +213,47 @@ func (c *Connector) loop(ctx context.Context, httpErr <-chan error) error {
 	}
 }
 
-// sweepBlobs drops the media nobody collected. On the heartbeat rather than on the way
-// in, so the cost of a full disk lands on the loop that expects it instead of on the
-// message that happened to fill it.
-func (c *Connector) sweepBlobs() {
+// blobSweep is how often the media cache is walked. It is far shorter than the TTL and
+// far longer than the heartbeat: what it bounds is how long the disk stays over quota
+// after a burst, and walking a large cache costs real time.
+const blobSweep = time.Minute
+
+// sweepBlobs drops the media nobody collected, on a goroutine of its own. The returned
+// channel closes once it has stopped.
+//
+// Not on the heartbeat, and this is the point rather than tidiness: that goroutine is
+// what renews every lease this instance holds, and a walk of a cache with many files on
+// a slow disk can outlast a lease. Peers would then adopt sessions whose sockets are
+// still open here, which is the one invariant nothing downstream can recover from. The
+// sweep has no deadline it must meet, so it gets its own goroutine and can take as long
+// as the disk makes it take.
+func (c *Connector) sweepBlobs(ctx context.Context) <-chan struct{} {
+	done := make(chan struct{})
 	if c.blobs == nil {
-		return
+		close(done)
+		return done
 	}
-	dropped, freed, err := c.blobs.Sweep()
-	if err != nil {
-		c.log.Warn().Err(err).Msg("could not sweep the media store")
-		return
-	}
-	if dropped > 0 {
-		c.log.Debug().Int("blobs", dropped).Int64("bytes", freed).Msg("dropped media nobody collected")
-	}
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(blobSweep)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+			dropped, freed, err := c.blobs.Sweep()
+			switch {
+			case err != nil:
+				c.log.Warn().Err(err).Msg("could not sweep the media store")
+			case dropped > 0:
+				c.log.Debug().Int("blobs", dropped).Int64("bytes", freed).
+					Msg("dropped media nobody collected")
+			}
+		}
+	}()
+	return done
 }
 
 // reclaimCommands takes over what nobody acknowledged: what another instance read

@@ -252,3 +252,66 @@ func TestTheSweepCollectsAnInterruptedWrite(t *testing.T) {
 		t.Fatalf("the interrupted write is still on disk: %v", err)
 	}
 }
+
+// Every id starts `blob_`, so a shard taken off the front of the id is the same two
+// characters for every blob: the sharding would be in the layout and nowhere on disk,
+// and one directory would hold the whole cache.
+func TestBlobsAreSpreadAcrossShards(t *testing.T) {
+	t.Parallel()
+
+	store, root := newStore(t, media.Options{})
+	for range 64 {
+		put(t, store, "x", &media.Blob{})
+	}
+
+	shards := map[string]struct{}{}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			shards[entry.Name()] = struct{}{}
+		}
+	}
+	if len(shards) < 8 {
+		t.Fatalf("64 blobs landed in %d directories (%v), which is one directory for the whole cache", len(shards), shards)
+	}
+	for name := range shards {
+		if strings.HasPrefix(name, "bl") {
+			t.Fatalf("the shard %q is the id's prefix rather than anything that varies", name)
+		}
+	}
+}
+
+// A crash between the description and the bytes, or between the two removals in a drop,
+// leaves a description on its own. Nothing will ever ask for it and no blob will ever be
+// dropped that takes it along, so the sweep is the only thing that can collect it.
+func TestTheSweepCollectsADescriptionWithNoBlob(t *testing.T) {
+	t.Parallel()
+
+	store, root := newStore(t, media.Options{TTL: time.Hour})
+	kept := put(t, store, "still here", &media.Blob{})
+
+	// The blob goes, its description stays, which is the state a crash between the two
+	// removals leaves.
+	orphanID := put(t, store, "gone", &media.Blob{}).ID
+	blobPath := filepath.Join(root, orphanID[5:7], orphanID)
+	if err := os.Remove(blobPath); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	orphanAbout := blobPath + ".json"
+	if _, err := os.Stat(orphanAbout); err != nil {
+		t.Fatalf("the description should still be here: %v", err)
+	}
+
+	if _, _, err := store.Sweep(); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if _, err := os.Stat(orphanAbout); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a description with no blob survived the sweep: %v", err)
+	}
+	if _, _, err := store.Open(kept.ID); err != nil {
+		t.Fatalf("the sweep took a description that was describing something: %v", err)
+	}
+}

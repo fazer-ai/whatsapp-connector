@@ -608,10 +608,43 @@ func TestMediaSizesAreReadAsSizes(t *testing.T) {
 		t.Fatalf("the per-blob cap read as %d, want 50 MiB", cfg.MediaMaxBlob)
 	}
 
-	for _, bad := range []string{"lots", "-1", "0", "4GB", "4 gib"} {
+	// The last one is what wraps the multiplication: positive going in, and negative or
+	// a small positive coming out, which media.New then reads as unset and replaces with
+	// a default nobody asked for.
+	for _, bad := range []string{"lots", "-1", "0", "4GB", "4 gib", "9223372036854775807 GiB"} {
 		t.Setenv("WAC_MEDIA_QUOTA", bad)
 		if _, err := app.LoadConfig("host"); err == nil {
 			t.Fatalf("WAC_MEDIA_QUOTA=%q was accepted", bad)
 		}
+	}
+}
+
+// A non-positive TTL parses as a duration and is then silently replaced by the store's
+// own default, so a deployment that asked for something else keeps a day of blobs and is
+// told nothing. The setting is honoured or the instance does not start.
+func TestANonPositiveMediaTTLIsRefused(t *testing.T) {
+	t.Setenv("WAC_INSTANCE", "inst-a")
+	t.Setenv("WAC_MEDIA_ROOT", t.TempDir())
+	t.Setenv("WAC_MEDIA_TOKEN", "s3cret")
+
+	for _, bad := range []string{"0s", "-1h"} {
+		t.Setenv("WAC_MEDIA_TTL", bad)
+		if _, err := app.LoadConfig("host"); err == nil {
+			t.Fatalf("WAC_MEDIA_TTL=%q was accepted", bad)
+		}
+	}
+}
+
+// One blob larger than the whole budget evicts the cache and then itself, which is a
+// deployment that looks configured and caches nothing.
+func TestAPerBlobCapLargerThanTheQuotaIsRefused(t *testing.T) {
+	t.Setenv("WAC_INSTANCE", "inst-a")
+	t.Setenv("WAC_MEDIA_ROOT", t.TempDir())
+	t.Setenv("WAC_MEDIA_TOKEN", "s3cret")
+	t.Setenv("WAC_MEDIA_QUOTA", "10MiB")
+	t.Setenv("WAC_MEDIA_MAX_BLOB", "100MiB")
+
+	if _, err := app.LoadConfig("host"); err == nil {
+		t.Fatal("a per-blob cap larger than the whole quota was accepted")
 	}
 }
