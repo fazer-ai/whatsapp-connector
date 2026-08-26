@@ -228,10 +228,25 @@ func (c *Connector) loop(ctx context.Context, httpErr <-chan error) error {
 	}
 }
 
-// blobSweep is how often the media cache is walked. It is far shorter than the TTL and
-// far longer than the heartbeat: what it bounds is how long the disk stays over quota
-// after a burst, and walking a large cache costs real time.
-const blobSweep = time.Minute
+// The bounds on how often the media cache is walked. What the cadence decides is how
+// long a blob outlives the age it was supposed to be kept for, and how long the disk
+// stays over quota after a burst; what it costs is a walk of the whole cache.
+//
+// A minute is the ceiling because that is short enough for both against any ordinary
+// TTL. The floor is there because the cadence follows the TTL down: a deployment that
+// asks for a minute of retention and is swept once a minute keeps its media for two, so
+// a short TTL has to be swept often to mean anything, and a second is as often as this
+// is willing to walk a cache that may be large.
+const (
+	blobSweepMax = time.Minute
+	blobSweepMin = time.Second
+)
+
+// BlobSweep is how often to walk, for a store keeping blobs for ttl. Half the TTL, so a
+// blob outlives it by at most half again rather than by a whole fixed interval.
+func BlobSweep(ttl time.Duration) time.Duration {
+	return min(max(ttl/2, blobSweepMin), blobSweepMax)
+}
 
 // sweepBlobs drops the media nobody collected, on a goroutine of its own. The returned
 // channel closes once it has stopped.
@@ -250,7 +265,7 @@ func (c *Connector) sweepBlobs(ctx context.Context) <-chan struct{} {
 	}
 	go func() {
 		defer close(done)
-		ticker := time.NewTicker(blobSweep)
+		ticker := time.NewTicker(BlobSweep(c.cfg.MediaTTL))
 		defer ticker.Stop()
 		for {
 			select {

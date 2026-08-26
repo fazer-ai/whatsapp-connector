@@ -692,3 +692,25 @@ func TestAStartupFailureIsReportedRatherThanHungOn(t *testing.T) {
 		t.Fatal("the run never came back: a startup failure is being waited on rather than reported")
 	}
 }
+
+// A fixed cadence ignores a TTL shorter than itself: a deployment asking to keep media
+// for a second would keep it for a minute, which is the opposite of what a short
+// retention is set for. The walk costs real time on a large cache, so it follows the TTL
+// down only to a floor and never above a minute.
+func TestTheSweepCadenceFollowsTheRetention(t *testing.T) {
+	t.Parallel()
+
+	cases := map[time.Duration]time.Duration{
+		24 * time.Hour:   time.Minute,
+		10 * time.Minute: time.Minute,
+		time.Minute:      30 * time.Second,
+		10 * time.Second: 5 * time.Second,
+		time.Second:      time.Second,
+		time.Millisecond: time.Second,
+	}
+	for ttl, want := range cases {
+		if got := app.BlobSweep(ttl); got != want {
+			t.Fatalf("a %s retention is swept every %s, want %s", ttl, got, want)
+		}
+	}
+}

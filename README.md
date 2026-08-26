@@ -153,7 +153,7 @@ restart, and reports itself healthy while doing it.
 | `WAC_ADVERTISE_URL` | derived | How clients reach this instance for media |
 | `WAC_MEDIA_ROOT` | unset | Where inbound media is cached. Unset turns the store and the endpoint off |
 | `WAC_MEDIA_TOKEN` | unset | Bearer token the media endpoint requires. Required whenever `WAC_MEDIA_ROOT` is set: the endpoint hands out message contents |
-| `WAC_MEDIA_TTL` | `24h` | How long a blob is kept without being collected |
+| `WAC_MEDIA_TTL` | `24h` | How long a blob is kept without being collected. The cache is walked every half of it, between a second and a minute, so a short TTL is swept often |
 | `WAC_MEDIA_QUOTA` | `2GiB` | Disk the blobs may take, counted in whole blocks and including each blob's description. Over it, the least recently collected go first |
 | `WAC_MEDIA_MAX_BLOB` | `100MiB` | The largest single file this instance keeps |
 | `WAC_LEASE_TTL` | `30s` | How long a session lease survives without a renewal |
