@@ -2,6 +2,7 @@ package redisx_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -145,5 +146,74 @@ func TestPingReachesTheServer(t *testing.T) {
 	client := newTestClient(t, 8)
 	if err := client.Ping(context.Background(), time.Second); err != nil {
 		t.Fatalf("Ping: %v", err)
+	}
+}
+
+// A command with no result still ran, and answering that is the point: `null` and
+// "never happened" are the same bytes on the way out and not the same thing.
+func TestARememberedCommandWithNoResultIsStillRemembered(t *testing.T) {
+	t.Parallel()
+
+	client := newTestClient(t, 8)
+	ledger := redisx.NewIdempotency(client, time.Minute)
+	ctx := context.Background()
+
+	if _, found, err := ledger.Recall(ctx, "s1", "msg:3EB0"); err != nil || found {
+		t.Fatalf("a command nobody ran came back as found=%v, err=%v", found, err)
+	}
+	if err := ledger.Remember(ctx, "s1", "msg:3EB0", nil); err != nil {
+		t.Fatalf("Remember: %v", err)
+	}
+	result, found, err := ledger.Recall(ctx, "s1", "msg:3EB0")
+	if err != nil {
+		t.Fatalf("Recall: %v", err)
+	}
+	if !found {
+		t.Fatal("a command that was remembered came back as one that never ran")
+	}
+	if len(result) != 0 {
+		t.Fatalf("a command with no result came back carrying %s", result)
+	}
+}
+
+// The first run is the one every redelivery has to be answered with, or two answers to
+// one command disagree about what it did.
+func TestRememberingACommandTwiceKeepsTheFirstAnswer(t *testing.T) {
+	t.Parallel()
+
+	client := newTestClient(t, 8)
+	ledger := redisx.NewIdempotency(client, time.Minute)
+	ctx := context.Background()
+
+	if err := ledger.Remember(ctx, "s1", "msg:3EB0", json.RawMessage(`{"timestamp":1}`)); err != nil {
+		t.Fatalf("Remember: %v", err)
+	}
+	if err := ledger.Remember(ctx, "s1", "msg:3EB0", json.RawMessage(`{"timestamp":2}`)); err != nil {
+		t.Fatalf("Remember again: %v", err)
+	}
+
+	result, _, err := ledger.Recall(ctx, "s1", "msg:3EB0")
+	if err != nil {
+		t.Fatalf("Recall: %v", err)
+	}
+	if string(result) != `{"timestamp":1}` {
+		t.Fatalf("the second answer overwrote the first: %s", result)
+	}
+}
+
+// One session's record must not answer another's: the key is the caller's message id,
+// and two sessions naming the same message are two different sends.
+func TestARecordBelongsToOneSession(t *testing.T) {
+	t.Parallel()
+
+	client := newTestClient(t, 8)
+	ledger := redisx.NewIdempotency(client, time.Minute)
+	ctx := context.Background()
+
+	if err := ledger.Remember(ctx, "s1", "msg:3EB0", json.RawMessage(`{"timestamp":1}`)); err != nil {
+		t.Fatalf("Remember: %v", err)
+	}
+	if _, found, err := ledger.Recall(ctx, "s2", "msg:3EB0"); err != nil || found {
+		t.Fatalf("another session's send came back as already done (found=%v, err=%v)", found, err)
 	}
 }

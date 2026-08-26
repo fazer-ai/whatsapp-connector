@@ -111,7 +111,8 @@ func newHarness(t *testing.T) harness {
 	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
 	t.Cleanup(func() { _ = rdb.Close() })
 
-	leases := cluster.NewLeases(redisx.Wrap(rdb, "wa:", 8), "inst-a", cluster.Options{})
+	client := redisx.Wrap(rdb, "wa:", 8)
+	leases := cluster.NewLeases(client, "inst-a", cluster.Options{})
 	fakeEngine := fake.New()
 	rec := newRecorder()
 
@@ -120,6 +121,7 @@ func newHarness(t *testing.T) harness {
 	var ids atomic.Int64
 	manager := session.NewManager(&session.ManagerConfig{
 		Instance: "inst-a", Engine: fakeEngine, Leases: leases, Publisher: rec, Replier: rec,
+		Ledger: redisx.NewIdempotency(client, 0),
 		NewID:  func() string { return "evt-" + strconv.FormatInt(ids.Add(1), 10) },
 		Logger: zerolog.Nop(),
 	})
@@ -1514,5 +1516,99 @@ func TestAnEventPublishedUnderALeaseThatMovedMidWriteIsSettledAsAFailure(t *test
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("an event written under a lease that moved was never settled")
+	}
+}
+
+// Invariant 5: a command redelivered after its acknowledgement was lost must not have
+// its side effect a second time. For a send that is somebody's conversation showing two
+// of the same message, which is the one failure a retry is supposed to prevent.
+func TestARedeliveredSendIsAnsweredWithoutSendingAgain(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	ctx := context.Background()
+	if _, err := h.manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, ok := h.engine.Session("s1")
+	if !ok {
+		t.Fatal("the engine has no session after Adopt")
+	}
+	if err := engineSession.Connect(ctx, engine.ConnectRequest{Pairing: "resume"}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	send := &protocol.Command{
+		V: protocol.Version, ID: "c1", Type: protocol.CommandMessageSend, SID: "s1", ReplyTo: "c1",
+		Payload: json.RawMessage(`{"message_id":"3EB0ABCDEF","to":{"kind":"phone","id":"5511999990002"},
+			"content":{"type":"text","body":"oi"}}`),
+	}
+	var acked atomic.Bool
+	h.manager.Dispatch(ctx, delivery(send, &acked))
+	waitFor(t, "the send to be answered", func() bool { _, ok := h.recorder.reply("c1"); return ok })
+	first, _ := h.recorder.reply("c1")
+
+	// The same command again, which is what a lost acknowledgement produces: the
+	// transport reclaims it and hands it to whoever owns the session now.
+	redelivered := *send
+	redelivered.ID = "c2"
+	redelivered.ReplyTo = "c2"
+	var ackedAgain atomic.Bool
+	h.manager.Dispatch(ctx, delivery(&redelivered, &ackedAgain))
+	waitFor(t, "the redelivery to be answered", func() bool { _, ok := h.recorder.reply("c2"); return ok })
+	second, _ := h.recorder.reply("c2")
+
+	if got := len(engineSession.Commands()); got != 1 {
+		t.Fatalf("the engine was asked to send %d times, want once", got)
+	}
+	if !second.OK {
+		t.Fatalf("the redelivery was refused: %+v", second.Error)
+	}
+	if string(second.Result) != string(first.Result) {
+		t.Fatalf("the redelivery answered %s, and the first run answered %s", second.Result, first.Result)
+	}
+}
+
+// A refusal is the caller's to try again. Remembering one would answer every later
+// attempt with it, so a number that was briefly unreachable would stay unreachable.
+func TestACommandThatFailedIsNotRememberedAsDone(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	ctx := context.Background()
+	if _, err := h.manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, _ := h.engine.Session("s1")
+
+	// Not connected, so the fake refuses the send.
+	send := &protocol.Command{
+		V: protocol.Version, ID: "c1", Type: protocol.CommandMessageSend, SID: "s1", ReplyTo: "c1",
+		Payload: json.RawMessage(`{"message_id":"3EB0ABCDEF","to":{"kind":"phone","id":"5511999990002"},
+			"content":{"type":"text","body":"oi"}}`),
+	}
+	var acked atomic.Bool
+	h.manager.Dispatch(ctx, delivery(send, &acked))
+	waitFor(t, "the send to be refused", func() bool { _, ok := h.recorder.reply("c1"); return ok })
+	if reply, _ := h.recorder.reply("c1"); reply.OK {
+		t.Fatal("the fake accepted a send on a session that is not connected")
+	}
+
+	// Now it can be sent, and the earlier failure must not be standing in for it.
+	if err := engineSession.Connect(ctx, engine.ConnectRequest{Pairing: "resume"}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	retry := *send
+	retry.ID = "c2"
+	retry.ReplyTo = "c2"
+	var ackedAgain atomic.Bool
+	h.manager.Dispatch(ctx, delivery(&retry, &ackedAgain))
+	waitFor(t, "the retry to be answered", func() bool { _, ok := h.recorder.reply("c2"); return ok })
+
+	if reply, _ := h.recorder.reply("c2"); !reply.OK {
+		t.Fatalf("a retry of a command that had failed was refused: %+v", reply.Error)
+	}
+	if got := len(engineSession.Commands()); got != 2 {
+		t.Fatalf("the engine saw %d attempts, want the failure and the retry", got)
 	}
 }

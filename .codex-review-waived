@@ -11,7 +11,10 @@ contract/fixtures/commands/history_request.json: Require an idempotency key for 
 # unanchored request with a reason the operator can read is the shape to settle on then.
 contract/schema/protocol.schema.json: Require a usable anchor for native history requests  # PR#3
 internal/store/store.go: Fence device writes against lease loss  # PR#5 — real, and not a patch: whatsmeow writes through its own SQL layer where a statement carries no session identity, so a fence has to be per-session all the way down (one container per session, or a session-aware driver wrapper). That is M2, when this package starts owning writes of its own. The lease plus the heartbeat teardown bound the window meanwhile, and the roadmap says it is open.
-internal/engine/whatsmeow/session.go: Deduplicate logout before calling WhatsApp  # PR#6 — real, and not the place to fix it: the connector has no idempotency layer at all yet, for any command. Invariant 5 lands with `message.send` in M2, where the same machinery covers logout. Building one mechanism for logout alone would be a second one to retire.
+# PR#6's logout deduplication is no longer waived: the idempotency layer it was waiting
+# for landed with `message.send` in PR#9, and `wa:idem:<sid>:<key>` now covers every
+# command that carries an `idempotency_key`. A logout that brings one is deduplicated
+# like any other command.
 internal/engine/whatsmeow/session.go: Reuse an in-flight dial for pairing retries  # PR#6 — real, and a design rather than a guard: joining an existing dial means a shared result every caller can wait on, which is the same machinery M2 needs for idempotent sends. Building a one-off here would be a second one to retire. The retry meanwhile fails with ErrAlreadyConnected and the operator tries again, which is visible rather than silent.
 # PR#6: real, and it needs the machinery M2 brings rather than a guard here. A second
 # session pairing an account displaces the first mapping and deletes its device, but the

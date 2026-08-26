@@ -31,6 +31,7 @@ type Session struct {
 	engine    engine.Session
 	publisher transport.Publisher
 	replier   transport.Replier
+	ledger    Ledger
 	newID     IDFunc
 	now       func() time.Time
 	log       zerolog.Logger
@@ -61,6 +62,7 @@ type Config struct {
 	Engine    engine.Session
 	Publisher transport.Publisher
 	Replier   transport.Replier
+	Ledger    Ledger
 	NewID     IDFunc
 	Now       func() time.Time
 	Logger    zerolog.Logger
@@ -90,6 +92,7 @@ func New(ctx context.Context, cfg *Config) *Session {
 		leases:    cfg.Leases,
 		engine:    cfg.Engine,
 		publisher: cfg.Publisher,
+		ledger:    cfg.Ledger,
 		replier:   cfg.Replier,
 		newID:     cfg.NewID,
 		now:       cfg.Now,
@@ -287,6 +290,16 @@ func (s *Session) abandonPending(events <-chan engine.Emission) {
 	}
 }
 
+// Ledger remembers what a command did, so a redelivery is answered with the first
+// run's result instead of carrying it out a second time. Invariant 5 in AGENTS.md is
+// this and nothing else.
+type Ledger interface {
+	// Recall answers what a command with this key did, and whether it ran at all.
+	Recall(ctx context.Context, sid, key string) (json.RawMessage, bool, error)
+	// Remember records what a command did, without overwriting an earlier answer.
+	Remember(ctx context.Context, sid, key string, result json.RawMessage) error
+}
+
 // errStopped is what an emission this pump stopped before publishing settles with.
 var errStopped = errors.New("session: the pump stopped before the event was published")
 
@@ -362,13 +375,74 @@ func (s *Session) carryOut(ctx context.Context, command *protocol.Command) (json
 		return nil, protocol.NewError(protocol.ErrorExpired, "the command deadline passed before it was reached")
 	}
 
+	key := idempotencyKey(command)
+	if result, ok := s.alreadyDid(ctx, key); ok {
+		// Only successes are remembered, so a recalled command is one that worked.
+		return result, nil
+	}
+
 	execCtx := ctx
 	if command.Deadline > 0 {
 		var cancel context.CancelFunc
 		execCtx, cancel = context.WithDeadline(ctx, time.UnixMilli(command.Deadline))
 		defer cancel()
 	}
-	return s.lifecycle(execCtx, command)
+
+	result, err := s.lifecycle(execCtx, command)
+	if err == nil && key != "" && s.ledger != nil {
+		// Only a success is remembered. A failure is the caller's to try again, and a
+		// remembered one would answer every later attempt with the same refusal.
+		//
+		// Written after the fact and not reserved before it, because a reservation
+		// cannot be resolved: an entry saying an attempt was made says nothing about
+		// whether it landed, so an instance reclaiming the command would have to choose
+		// between dropping a message that never went out and sending one that already
+		// did. What covers that window is the caller naming the message, so a resend
+		// carries the id the first attempt used.
+		if err := s.ledger.Remember(context.WithoutCancel(ctx), s.sid, key, result); err != nil {
+			s.log.Warn().Err(err).Str("cmd_id", command.ID).
+				Msg("could not remember a command that was carried out")
+		}
+	}
+	return result, err
+}
+
+// alreadyDid answers a command this session has already carried out. A Redis that
+// cannot be read is not an answer, so the command runs: doing it twice is the thing
+// this is for, and refusing every command whenever the record is unreachable would
+// stop the connector over the bookkeeping rather than over the work.
+func (s *Session) alreadyDid(ctx context.Context, key string) (json.RawMessage, bool) {
+	if key == "" || s.ledger == nil {
+		return nil, false
+	}
+	result, found, err := s.ledger.Recall(ctx, s.sid, key)
+	if err != nil {
+		s.log.Warn().Err(err).Str("key", key).Msg("could not read whether a command had already run")
+		return nil, false
+	}
+	if !found {
+		return nil, false
+	}
+	s.log.Info().Str("key", key).Msg("answered a redelivered command with what the first one did")
+	return result, true
+}
+
+// idempotencyKey is what a command is remembered under, and the empty string for one
+// that names nothing to be remembered by. A send is keyed by the message it is sending,
+// which the caller names; everything else that asks to be carried out once brings an
+// idempotency_key of its own.
+func idempotencyKey(command *protocol.Command) string {
+	var body struct {
+		MessageID      string `json:"message_id"`
+		IdempotencyKey string `json:"idempotency_key"`
+	}
+	if err := json.Unmarshal(command.Payload, &body); err != nil {
+		return ""
+	}
+	if body.MessageID != "" {
+		return "msg:" + body.MessageID
+	}
+	return body.IdempotencyKey
 }
 
 // The three lifecycle commands go to the engine's own methods rather than through

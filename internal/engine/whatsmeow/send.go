@@ -211,7 +211,14 @@ func contextToSend(req *sendRequest, own, to waTypes.JID) (*waE2E.ContextInfo, e
 		return alongside
 	}
 
-	if req.Quoted != nil && req.Quoted.ID != "" {
+	if req.Quoted != nil {
+		if req.Quoted.ID == "" {
+			// Skipping it would send the message without the frame the caller asked for
+			// and report success, so the reply lands stripped of what it was answering
+			// and nobody finds out. The contract requires the id for this reason.
+			return nil, protocol.NewError(protocol.ErrorInvalidPayload,
+				"a quote has to name the message it is answering")
+		}
 		quote := ensure()
 		quote.StanzaID = proto.String(req.Quoted.ID)
 		participant, err := quotedParticipant(req, own, to)

@@ -21,9 +21,10 @@ events and commands with its clients over Redis Streams.
 >
 > A message is acknowledged to WhatsApp only after its event reaches the stream, so
 > losing Redis costs a redelivery and never a message. The client deduplicates on the
-> message id, which is what makes that trade safe. A send works the same way from the
-> other side: the caller names the message, so a command redelivered after a lost
-> acknowledgement goes out under the same id and the recipient sees one message.
+> message id, which is what makes that trade safe. A send is answered from the other
+> end of the same trade: what a command did is remembered under
+> `wa:idem:<sid>:<key>`, so a redelivery is answered with the first run's result
+> instead of being carried out again.
 
 ## Why a separate service
 
