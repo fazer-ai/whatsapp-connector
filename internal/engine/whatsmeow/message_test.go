@@ -244,18 +244,21 @@ func TestAMessageThisBuildCannotRenderIsLeftUnacknowledged(t *testing.T) {
 
 	session, _ := newTestSession(t, "5511999990001")
 
-	// An image, which M2 reaches in a later slice. Refusing the acknowledgement is what
-	// keeps it on WhatsApp's side until there is somewhere to put it; rendering it as
-	// text or as unsupported would spend the one redelivery it gets.
-	acknowledged := session.receive(&waEvents.Message{
-		Info: waTypes.MessageInfo{
-			ID: "3EB0IMAGE",
-			MessageSource: waTypes.MessageSource{
-				Chat: waTypes.NewJID("5511999990001", waTypes.DefaultUserServer),
-			},
-		},
-		Message: &waE2E.Message{ImageMessage: &waE2E.ImageMessage{Mimetype: proto.String("image/jpeg")}},
-	})
+	// A location, which M2 reaches in a later slice. Refusing the acknowledgement is
+	// what keeps it on WhatsApp's side until there is something to render it as;
+	// rendering it as text or as unsupported would spend the one redelivery it gets.
+	//
+	// The envelope is a complete one on purpose. The body is the whole subject here,
+	// and an event missing its sender is refused before the body is ever looked at:
+	// this test read as passing for that reason alone once media stopped being a body
+	// this build cannot render.
+	event := textMessage("3EB0LOCATION", "")
+	event.Message = &waE2E.Message{LocationMessage: &waE2E.LocationMessage{
+		DegreesLatitude:  proto.Float64(-23.5505),
+		DegreesLongitude: proto.Float64(-46.6333),
+	}}
+
+	acknowledged := session.receive(event)
 	if acknowledged {
 		t.Fatal("a message this build cannot publish was acknowledged to WhatsApp anyway")
 	}
