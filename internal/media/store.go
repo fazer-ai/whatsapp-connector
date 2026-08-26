@@ -20,6 +20,7 @@
 package media
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -169,14 +170,18 @@ func (s *Store) Put(source io.Reader, about *Blob) (Blob, error) {
 	}()
 
 	digest := sha256.New()
-	// One byte past the cap, so a source that is exactly at it is kept and one over is
-	// refused rather than silently truncated.
-	written, err := io.Copy(io.MultiWriter(temp, digest), io.LimitReader(source, s.opts.MaxBlob+1))
+	written, err := io.Copy(io.MultiWriter(temp, digest), io.LimitReader(source, s.opts.MaxBlob))
 	if err != nil {
 		return Blob{}, fmt.Errorf("media: store %s: %w", id, err)
 	}
-	if written > s.opts.MaxBlob {
-		return Blob{}, fmt.Errorf("%w: %d bytes", ErrTooLarge, written)
+	// Asked for one more byte rather than reading one past the cap, because a cap at
+	// the top of the range makes that arithmetic wrap: the limit goes negative, the
+	// reader answers EOF straight away, and every file is stored empty. A source with
+	// nothing left is one that fitted exactly.
+	if more, err := source.Read(make([]byte, 1)); more > 0 {
+		return Blob{}, fmt.Errorf("%w: more than %d bytes", ErrTooLarge, s.opts.MaxBlob)
+	} else if err != nil && !errors.Is(err, io.EOF) {
+		return Blob{}, fmt.Errorf("media: store %s: %w", id, err)
 	}
 	if err := temp.Close(); err != nil {
 		return Blob{}, fmt.Errorf("media: finish %s: %w", id, err)
@@ -227,19 +232,34 @@ func (s *Store) Open(id string) (io.ReadSeekCloser, Blob, error) {
 //
 // Called on a tick rather than from Put, so the cost lands on the loop that expects it
 // instead of on the message that happened to fill the disk.
-func (s *Store) Sweep() (dropped int, freed int64, err error) {
-	held, err := s.list()
+func (s *Store) Sweep(ctx context.Context) (dropped int, freed int64, err error) {
+	blobs, err := s.list(ctx)
 	if err != nil {
 		return 0, 0, err
 	}
 
+	// One error is kept rather than the first one returned, so a single undeletable
+	// blob does not stop the sweep from clearing everything behind it.
+	var failed error
+	take := func(entry held) bool {
+		if dropErr := s.drop(entry.id); dropErr != nil {
+			failed = errors.Join(failed, dropErr)
+			return false
+		}
+		dropped, freed = dropped+1, freed+entry.size
+		return true
+	}
+
 	cutoff := s.opts.Now().Add(-s.opts.TTL)
 	var total int64
-	kept := held[:0]
-	for _, entry := range held {
-		if entry.touched.Before(cutoff) {
-			s.drop(entry.id)
-			dropped, freed = dropped+1, freed+entry.size
+	kept := blobs[:0]
+	for _, entry := range blobs {
+		if err := ctx.Err(); err != nil {
+			return dropped, freed, errors.Join(failed, err)
+		}
+		// Counted whenever it is still here, including one that refused to go: what the
+		// quota has to be measured against is the disk, not the intention.
+		if entry.touched.Before(cutoff) && take(entry) {
 			continue
 		}
 		total += entry.size
@@ -247,20 +267,24 @@ func (s *Store) Sweep() (dropped int, freed int64, err error) {
 	}
 
 	if total <= s.opts.Quota {
-		return dropped, freed, nil
+		return dropped, freed, failed
 	}
 	// Least recently handed out first, which is the order they stop being worth the
 	// disk in: a blob nobody has come for is one the client will ask the session for
 	// again if it ever does.
 	sort.Slice(kept, func(i, j int) bool { return kept[i].touched.Before(kept[j].touched) })
 	for _, entry := range kept {
+		if err := ctx.Err(); err != nil {
+			return dropped, freed, errors.Join(failed, err)
+		}
 		if total <= s.opts.Quota {
 			break
 		}
-		s.drop(entry.id)
-		dropped, freed, total = dropped+1, freed+entry.size, total-entry.size
+		if take(entry) {
+			total -= entry.size
+		}
 	}
-	return dropped, freed, nil
+	return dropped, freed, failed
 }
 
 // held is one blob as the sweep sees it: what it costs and when it was last collected.
@@ -270,16 +294,27 @@ type held struct {
 	touched time.Time
 }
 
-func (s *Store) list() ([]held, error) {
+func (s *Store) list(ctx context.Context) ([]held, error) {
 	var out []held
 	// The ids a description was found for, checked against the blobs at the end: a
 	// description whose blob is not here describes nothing.
 	var described []string
 	err := fs.WalkDir(s.root.FS(), ".", func(path string, entry fs.DirEntry, err error) error {
+		if walkErr := ctx.Err(); walkErr != nil {
+			// A walk of a large cache on a slow disk is exactly what a shutdown must not
+			// have to wait out, and the process is stopping anyway: what this pass has
+			// found so far is thrown away rather than acted on.
+			return walkErr
+		}
 		switch {
+		case err != nil && path == ".":
+			// The root itself. Nothing is walked and nothing is swept, and swallowing it
+			// makes an unreadable store look exactly like an empty one: the sweep would
+			// report success every minute while the disk filled.
+			return fmt.Errorf("media: read %s: %w", s.opts.Root, err)
 		case err != nil:
-			// A directory that cannot be read is not a reason to abandon the sweep:
-			// what is walked still gets swept, and the next pass tries this again.
+			// One directory inside it, which is not a reason to abandon the sweep: what
+			// is walked still gets swept, and the next pass tries this again.
 			return nil //nolint:nilerr // deliberate, see above
 		case entry.IsDir():
 			return nil
@@ -308,7 +343,12 @@ func (s *Store) list() ([]held, error) {
 			if aged {
 				described = append(described, strings.TrimSuffix(name, aboutSuffix))
 			}
-		case validID(name):
+		case validID(name) && path == s.pathOf(name):
+			// Its canonical place, and only there. A file with a blob's name somewhere
+			// else in the tree is not that blob: dropping it goes by the id, so the
+			// sweep would remove whatever is at the canonical path — nothing, or the
+			// real blob of the same name — and count this one's bytes as freed either
+			// way.
 			out = append(out, held{id: name, size: info.Size(), touched: info.ModTime()})
 		}
 		// Anything else was not written by this store. The root is a directory an
@@ -332,12 +372,20 @@ func (s *Store) list() ([]held, error) {
 	return out, nil
 }
 
-// drop removes a blob. The bytes go first: a description without them is unservable and
-// the sweep collects it, while bytes without a description would be served as an
-// unnamed file of unknown type.
-func (s *Store) drop(id string) {
-	_ = s.root.Remove(s.pathOf(id))
+// drop removes a blob and says whether the bytes actually went. The bytes go first: a
+// description without them is unservable and the sweep collects it, while bytes without
+// a description would be served as an unnamed file of unknown type.
+//
+// The answer is what the sweep counts on. A volume that has gone read-only refuses every
+// removal, and a sweep that counted those as freed would report a cache it had emptied
+// while the disk stayed full, every minute, with nothing said.
+func (s *Store) drop(id string) error {
+	err := s.root.Remove(s.pathOf(id))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("media: drop %s: %w", id, err)
+	}
 	_ = s.root.Remove(s.aboutPath(id))
+	return nil
 }
 
 const (

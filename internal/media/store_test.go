@@ -2,10 +2,12 @@ package media_test
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -173,7 +175,7 @@ func TestTheSweepDropsWhatNobodyCameFor(t *testing.T) {
 	// And now the first one is past its hour while the second is half an hour into a
 	// new one.
 	now = now.Add(31 * time.Minute)
-	dropped, freed, err := store.Sweep()
+	dropped, freed, err := store.Sweep(t.Context())
 	if err != nil {
 		t.Fatalf("Sweep: %v", err)
 	}
@@ -209,7 +211,7 @@ func TestTheSweepDropsTheLeastRecentlyCollectedFirst(t *testing.T) {
 	now = now.Add(time.Minute)
 	read(t, store, first.ID)
 
-	dropped, _, err := store.Sweep()
+	dropped, _, err := store.Sweep(t.Context())
 	if err != nil {
 		t.Fatalf("Sweep: %v", err)
 	}
@@ -245,7 +247,7 @@ func TestTheSweepCollectsAnInterruptedWrite(t *testing.T) {
 	}
 
 	now = now.Add(2 * time.Hour)
-	if _, _, err := store.Sweep(); err != nil {
+	if _, _, err := store.Sweep(t.Context()); err != nil {
 		t.Fatalf("Sweep: %v", err)
 	}
 	if _, err := os.Stat(orphan); !errors.Is(err, os.ErrNotExist) {
@@ -310,7 +312,7 @@ func TestTheSweepCollectsADescriptionWithNoBlob(t *testing.T) {
 	// Not while it is new: a Put that has written the description and not yet named the
 	// bytes looks exactly like this, and collecting it there loses a blob that is about
 	// to exist.
-	if _, _, err := store.Sweep(); err != nil {
+	if _, _, err := store.Sweep(t.Context()); err != nil {
 		t.Fatalf("Sweep: %v", err)
 	}
 	if _, err := os.Stat(orphanAbout); err != nil {
@@ -321,7 +323,7 @@ func TestTheSweepCollectsADescriptionWithNoBlob(t *testing.T) {
 	// it is not simply aged out along with the orphan.
 	now = now.Add(2 * time.Hour)
 	read(t, store, kept.ID)
-	if _, _, err := store.Sweep(); err != nil {
+	if _, _, err := store.Sweep(t.Context()); err != nil {
 		t.Fatalf("the second Sweep: %v", err)
 	}
 	if _, err := os.Stat(orphanAbout); !errors.Is(err, os.ErrNotExist) {
@@ -351,12 +353,134 @@ func TestTheSweepLeavesFilesItDidNotWriteAlone(t *testing.T) {
 	}
 
 	now = now.Add(2 * time.Hour)
-	if _, _, err := store.Sweep(); err != nil {
+	if _, _, err := store.Sweep(t.Context()); err != nil {
 		t.Fatalf("Sweep: %v", err)
 	}
 	for _, name := range foreign {
 		if _, err := os.Stat(filepath.Join(root, name)); err != nil {
 			t.Fatalf("the sweep removed %s, which it did not write: %v", name, err)
 		}
+	}
+}
+
+// A volume that has gone read-only refuses every removal. Counting those as freed would
+// have the sweep report a cache it had emptied while the disk stayed full, every minute,
+// with nothing said.
+func TestASweepThatCannotDropSaysSoRatherThanCountingIt(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	clock := func() time.Time { return now }
+	store, root := newStore(t, media.Options{TTL: time.Hour, Now: clock})
+	stored := put(t, store, "cannot go", &media.Blob{})
+
+	// The shard is made unwritable, which is what a read-only volume looks like to one
+	// removal.
+	shard := filepath.Join(root, stored.ID[5:7])
+	if err := os.Chmod(shard, 0o500); err != nil {
+		t.Fatalf("Chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(shard, 0o700) })
+
+	now = now.Add(2 * time.Hour)
+	dropped, freed, err := store.Sweep(t.Context())
+	if err == nil {
+		t.Fatal("a sweep that could not remove anything reported success")
+	}
+	if dropped != 0 || freed != 0 {
+		t.Fatalf("the sweep counted %d blobs and %d bytes it did not actually free", dropped, freed)
+	}
+}
+
+// A shutdown must not wait out a walk of a large cache on a slow disk, and what the pass
+// has found by then is not worth acting on: the process is stopping either way.
+func TestASweepStopsWhenTheProcessIs(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	clock := func() time.Time { return now }
+	store, _ := newStore(t, media.Options{TTL: time.Hour, Now: clock})
+	stored := put(t, store, "would have gone", &media.Blob{})
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	now = now.Add(2 * time.Hour)
+	if _, _, err := store.Sweep(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("a sweep asked to stop answered with %v, want the cancellation", err)
+	}
+	if _, _, err := store.Open(stored.ID); err != nil {
+		t.Fatalf("a sweep that was asked to stop dropped a blob anyway: %v", err)
+	}
+}
+
+// A file with a blob's name somewhere else in the tree is not that blob. Dropping goes
+// by the id, so the sweep would remove whatever sits at the canonical path — nothing, or
+// the real blob of the same name — and count this one's bytes as freed either way.
+func TestABlobIsOnlyItselfInItsOwnShard(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	clock := func() time.Time { return now }
+	store, root := newStore(t, media.Options{TTL: time.Hour, Now: clock})
+	genuine := put(t, store, "the real one", &media.Blob{})
+
+	// The same name, in the wrong place.
+	impostor := filepath.Join(root, "zz", genuine.ID)
+	if err := os.MkdirAll(filepath.Dir(impostor), 0o700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(impostor, []byte("not the real one"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	// The real blob is collected, so only the impostor is old enough to tempt the sweep.
+	now = now.Add(2 * time.Hour)
+	read(t, store, genuine.ID)
+	if _, _, err := store.Sweep(t.Context()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+
+	if _, _, err := store.Open(genuine.ID); err != nil {
+		t.Fatalf("the sweep dropped the real blob on account of a file elsewhere: %v", err)
+	}
+	if _, err := os.Stat(impostor); err != nil {
+		t.Fatalf("the sweep removed a file that is not in the layout it writes: %v", err)
+	}
+}
+
+// A cap at the top of the range makes a one-byte lookahead wrap: the limit goes
+// negative, the reader answers EOF straight away, and every file is stored empty.
+func TestAnEnormousCapDoesNotStoreEveryBlobEmpty(t *testing.T) {
+	t.Parallel()
+
+	store, _ := newStore(t, media.Options{MaxBlob: math.MaxInt64, Quota: math.MaxInt64})
+	stored := put(t, store, "the bytes are here", &media.Blob{})
+
+	if stored.Size != int64(len("the bytes are here")) {
+		t.Fatalf("the blob measures %d, want what was written", stored.Size)
+	}
+	if body, _ := read(t, store, stored.ID); body != "the bytes are here" {
+		t.Fatalf("the blob reads back as %q", body)
+	}
+}
+
+// The store holds a directory handle for the life of the process. Closing it is what
+// releases the descriptor, and a store that has been closed refuses rather than reaching
+// through a handle that is gone.
+func TestAClosedStoreLetsGoOfTheDirectory(t *testing.T) {
+	t.Parallel()
+
+	store, _ := newStore(t, media.Options{})
+	stored := put(t, store, "the bytes", &media.Blob{})
+
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if _, _, err := store.Open(stored.ID); err == nil {
+		t.Fatal("a closed store served a blob through a handle it had let go of")
+	}
+	if _, _, err := store.Sweep(t.Context()); err == nil {
+		t.Fatal("a closed store swept through a handle it had let go of")
 	}
 }

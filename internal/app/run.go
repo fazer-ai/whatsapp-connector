@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -186,6 +187,13 @@ func (c *Connector) Run(ctx context.Context) error {
 	// writing to, and waited for, so the process does not exit mid-rename.
 	stopSweeping()
 	<-swept
+	if c.blobs != nil {
+		// After the sweeper has stopped, so nothing is walking the directory through a
+		// handle that is being closed.
+		if closeErr := c.blobs.Close(); closeErr != nil {
+			c.log.Warn().Err(closeErr).Msg("could not close the media store")
+		}
+	}
 	return err
 }
 
@@ -250,8 +258,12 @@ func (c *Connector) sweepBlobs(ctx context.Context) <-chan struct{} {
 				return
 			case <-ticker.C:
 			}
-			dropped, freed, err := c.blobs.Sweep()
+			dropped, freed, err := c.blobs.Sweep(ctx)
 			switch {
+			case errors.Is(err, context.Canceled):
+				// The sweep gave up because the process is stopping, which is what was
+				// asked of it.
+				return
 			case err != nil:
 				c.log.Warn().Err(err).Msg("could not sweep the media store")
 			case dropped > 0:
