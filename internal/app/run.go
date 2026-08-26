@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"slices"
@@ -18,6 +19,7 @@ import (
 	"github.com/fazer-ai/whatsapp-connector/internal/engine/fake"
 	meow "github.com/fazer-ai/whatsapp-connector/internal/engine/whatsmeow"
 	"github.com/fazer-ai/whatsapp-connector/internal/httpserver"
+	"github.com/fazer-ai/whatsapp-connector/internal/media"
 	"github.com/fazer-ai/whatsapp-connector/internal/observability"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 	"github.com/fazer-ai/whatsapp-connector/internal/redisx"
@@ -52,6 +54,7 @@ type Connector struct {
 	store    *store.Container
 	streams  *redisstream.Streams
 	http     *httpserver.Server
+	blobs    *media.Store
 
 	// reclaimCursor is where the next reclaim pass starts. Read and written only by the
 	// loop goroutine, which is also the only one that reclaims.
@@ -109,9 +112,27 @@ func New(cfg *Config, log zerolog.Logger) (*Connector, error) {
 		registry: cluster.NewRegistry(client, 3*cfg.Heartbeat), manager: manager, engine: waEngine,
 		store: devices,
 	}
+
+	// Only when the deployment gave it somewhere to write. An instance with no blob
+	// store does not register the endpoint at all, so a client that reaches it hears
+	// 404 and asks the session for the bytes again, which is what it does for a blob
+	// that has aged out anyway.
+	var blobHandler http.Handler
+	if cfg.MediaRoot != "" {
+		blobs, err := media.New(media.Options{
+			Root: cfg.MediaRoot, TTL: cfg.MediaTTL,
+			Quota: cfg.MediaQuota, MaxBlob: cfg.MediaMaxBlob,
+		})
+		if err != nil {
+			return nil, err
+		}
+		c.blobs = blobs
+		blobHandler = media.Handler(media.HandlerOptions{Blobs: blobs, Token: cfg.MediaToken})
+	}
+
 	c.http = httpserver.New(httpserver.Options{
 		Addr: cfg.HTTPAddr, Health: c, Registry: metrics.Registry,
-		Version: Version, Instance: cfg.Instance,
+		Version: Version, Instance: cfg.Instance, Media: blobHandler,
 	})
 	c.streams = streams
 	return c, nil
@@ -180,10 +201,28 @@ func (c *Connector) loop(ctx context.Context, httpErr <-chan error) error {
 			c.manager.RenewAll(ctx)
 			c.reclaimCommands(ctx)
 			c.announce(ctx)
+			c.sweepBlobs()
 			c.metrics.SessionsRunning.Set(float64(c.manager.Count()))
 		default:
 			c.readCommands(ctx)
 		}
+	}
+}
+
+// sweepBlobs drops the media nobody collected. On the heartbeat rather than on the way
+// in, so the cost of a full disk lands on the loop that expects it instead of on the
+// message that happened to fill it.
+func (c *Connector) sweepBlobs() {
+	if c.blobs == nil {
+		return
+	}
+	dropped, freed, err := c.blobs.Sweep()
+	if err != nil {
+		c.log.Warn().Err(err).Msg("could not sweep the media store")
+		return
+	}
+	if dropped > 0 {
+		c.log.Debug().Int("blobs", dropped).Int64("bytes", freed).Msg("dropped media nobody collected")
 	}
 }
 

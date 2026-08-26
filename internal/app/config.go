@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/fazer-ai/whatsapp-connector/internal/media"
 	"github.com/fazer-ai/whatsapp-connector/internal/redisx"
 )
 
@@ -30,6 +31,14 @@ type Config struct {
 	HTTPAddr     string
 	AdvertiseURL string
 	MediaToken   string
+	// MediaRoot is where this instance keeps the bytes of inbound media. Empty turns
+	// the blob store off, and with it the media endpoint: an instance with nowhere to
+	// put a file publishes messages without a blob to fetch rather than filling a
+	// directory it was not given.
+	MediaRoot    string
+	MediaTTL     time.Duration
+	MediaQuota   int64
+	MediaMaxBlob int64
 	LogLevel     string
 	LeaseTTL     time.Duration
 	Heartbeat    time.Duration
@@ -79,6 +88,18 @@ func LoadConfig(hostname string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	mediaTTL, err := envDuration("WAC_MEDIA_TTL", media.DefaultTTL)
+	if err != nil {
+		return Config{}, err
+	}
+	mediaQuota, err := envBytes("WAC_MEDIA_QUOTA", media.DefaultQuota)
+	if err != nil {
+		return Config{}, err
+	}
+	mediaMaxBlob, err := envBytes("WAC_MEDIA_MAX_BLOB", media.DefaultMaxBlob)
+	if err != nil {
+		return Config{}, err
+	}
 
 	cfg := Config{
 		Instance:     envString("WAC_INSTANCE", hostname),
@@ -92,6 +113,10 @@ func LoadConfig(hostname string) (Config, error) {
 		HTTPAddr:     envString("WAC_HTTP_ADDR", ":8080"),
 		AdvertiseURL: envString("WAC_ADVERTISE_URL", ""),
 		MediaToken:   envString("WAC_MEDIA_TOKEN", ""),
+		MediaRoot:    envString("WAC_MEDIA_ROOT", ""),
+		MediaTTL:     mediaTTL,
+		MediaQuota:   mediaQuota,
+		MediaMaxBlob: mediaMaxBlob,
 		LogLevel:     envString("WAC_LOG_LEVEL", "info"),
 		LeaseTTL:     leaseTTL,
 		Heartbeat:    heartbeat,
@@ -156,10 +181,41 @@ func LoadConfig(hostname string) (Config, error) {
 		// is not.
 		return Config{}, fmt.Errorf("app: WAC_DATABASE_URL is required when WAC_ENGINE is %q", EngineWhatsmeow)
 	}
+	if cfg.MediaRoot != "" && cfg.MediaToken == "" {
+		// The endpoint hands out message contents, and its only guard is the token. A
+		// store with no token would serve them to anything that can reach the port, so
+		// the deployment is refused rather than quietly opened.
+		return Config{}, fmt.Errorf("app: WAC_MEDIA_TOKEN is required when WAC_MEDIA_ROOT is set")
+	}
 	if cfg.AdvertiseURL == "" {
 		cfg.AdvertiseURL = "http://" + cfg.Instance + strings.TrimPrefix(cfg.HTTPAddr, "0.0.0.0")
 	}
 	return cfg, nil
+}
+
+// envBytes reads a size. Plain digits are bytes, and the usual suffixes are the powers
+// of two rather than of ten, because the setting is a disk budget and that is the unit
+// an operator sizing a volume is working in.
+func envBytes(name string, fallback int64) (int64, error) {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback, nil
+	}
+	scale := int64(1)
+	for suffix, factor := range map[string]int64{"KiB": 1 << 10, "MiB": 1 << 20, "GiB": 1 << 30} {
+		if trimmed, found := strings.CutSuffix(raw, suffix); found {
+			raw, scale = strings.TrimSpace(trimmed), factor
+			break
+		}
+	}
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("app: %s must be a size in bytes, optionally suffixed KiB, MiB or GiB: %w", name, err)
+	}
+	if value <= 0 {
+		return 0, fmt.Errorf("app: %s must be positive, got %d", name, value)
+	}
+	return value * scale, nil
 }
 
 func envString(name, fallback string) string {

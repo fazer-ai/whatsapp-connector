@@ -573,3 +573,45 @@ func TestATimingThatCannotWorkIsRefusedAtStartup(t *testing.T) {
 		t.Fatalf("LoadConfig: %v", err)
 	}
 }
+
+// The media endpoint hands out message contents, and the token is the only thing in
+// front of it. A deployment that sets a store and forgets the token would open it to
+// anything that can reach the port, so it is refused at startup rather than served.
+func TestAMediaStoreWithNoTokenIsRefused(t *testing.T) {
+	t.Setenv("WAC_INSTANCE", "inst-a")
+	t.Setenv("WAC_MEDIA_ROOT", t.TempDir())
+	t.Setenv("WAC_MEDIA_TOKEN", "")
+
+	if _, err := app.LoadConfig("host"); err == nil {
+		t.Fatal("a media store with no token was accepted")
+	}
+}
+
+// A size is what an operator sizing a volume is working in, so the suffixes are the
+// powers of two and a value that is not a size fails at startup rather than falling back
+// to a default nobody asked for.
+func TestMediaSizesAreReadAsSizes(t *testing.T) {
+	t.Setenv("WAC_INSTANCE", "inst-a")
+	t.Setenv("WAC_MEDIA_ROOT", t.TempDir())
+	t.Setenv("WAC_MEDIA_TOKEN", "s3cret")
+
+	t.Setenv("WAC_MEDIA_QUOTA", "4 GiB")
+	t.Setenv("WAC_MEDIA_MAX_BLOB", "50MiB")
+	cfg, err := app.LoadConfig("host")
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.MediaQuota != 4<<30 {
+		t.Fatalf("the quota read as %d, want 4 GiB", cfg.MediaQuota)
+	}
+	if cfg.MediaMaxBlob != 50<<20 {
+		t.Fatalf("the per-blob cap read as %d, want 50 MiB", cfg.MediaMaxBlob)
+	}
+
+	for _, bad := range []string{"lots", "-1", "0", "4GB", "4 gib"} {
+		t.Setenv("WAC_MEDIA_QUOTA", bad)
+		if _, err := app.LoadConfig("host"); err == nil {
+			t.Fatalf("WAC_MEDIA_QUOTA=%q was accepted", bad)
+		}
+	}
+}
