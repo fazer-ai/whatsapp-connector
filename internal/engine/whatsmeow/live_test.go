@@ -15,6 +15,8 @@
 //	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveResume
 //	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveHangUpAndBack
 //	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveListen
+//	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveMedia
+//	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveViewOnce
 //	WAC_LIVE_TO=<number> go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveSend
 //	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveLogout
 //
@@ -24,9 +26,13 @@
 package whatsmeow
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -38,6 +44,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/engine"
+	"github.com/fazer-ai/whatsapp-connector/internal/media"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 	"github.com/fazer-ai/whatsapp-connector/internal/store"
 )
@@ -171,14 +178,7 @@ func TestLiveHangUpAndBack(t *testing.T) {
 // the event the contract names: it is the one check that the whole inbound path works
 // against WhatsApp rather than against a fixture.
 func TestLiveListen(t *testing.T) {
-	window := 2 * time.Minute
-	if raw := os.Getenv("WAC_LIVE_SECONDS"); raw != "" {
-		seconds, err := strconv.Atoi(raw)
-		if err != nil {
-			t.Fatalf("WAC_LIVE_SECONDS=%q: %v", raw, err)
-		}
-		window = time.Duration(seconds) * time.Second
-	}
+	window := liveWindow(t, 2*time.Minute)
 
 	session, _ := liveSession(t)
 	events := watch(t, session)
@@ -210,6 +210,214 @@ func TestLiveListen(t *testing.T) {
 	if state := session.state(); state != "open" {
 		t.Fatalf("the session did not stay up: state=%s", state)
 	}
+}
+
+// TestLiveMedia is the media half of TestLiveListen, and the only check that walks the
+// whole path end to end: WhatsApp encrypts a file, whatsmeow fetches and decrypts it,
+// the store keeps it, the event says where to fetch it, and the endpoint hands it back
+// over HTTP against a bearer token. Every step of that has a unit test and none of them
+// had ever run against a file somebody really sent.
+//
+// The endpoint is served here on a throwaway port and the reference is published under
+// it, which is what makes the URL on the event the URL that is actually fetched: a
+// reference nobody dials proves nothing about whether it could be dialled.
+func TestLiveMedia(t *testing.T) {
+	const token = "live-check"
+
+	root := filepath.Join(liveDir(t), "blobs")
+	blobs, err := media.New(media.Options{Root: root})
+	if err != nil {
+		t.Fatalf("open the blob store at %s: %v", root, err)
+	}
+	t.Cleanup(func() {
+		if err := blobs.Close(); err != nil {
+			t.Errorf("close the blob store: %v", err)
+		}
+	})
+	t.Logf("blobs: %s", root)
+
+	// Started before the session, because the engine refuses a store it has no address
+	// to publish under and the address is this server's.
+	mux := http.NewServeMux()
+	mux.Handle("GET /media/{id}", media.Handler(media.HandlerOptions{Blobs: blobs, Token: token}))
+	endpoint := httptest.NewServer(mux)
+	t.Cleanup(endpoint.Close)
+
+	session, _ := liveSessionWith(t, MediaOptions{Blobs: blobs, BaseURL: endpoint.URL})
+	events := watch(t, session)
+
+	if err := session.Connect(t.Context(), engine.ConnectRequest{Pairing: "resume"}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	events.awaitState(t, "open", 2*time.Minute)
+
+	window := liveWindow(t, 3*time.Minute)
+	say("send a PHOTO, VIDEO, VOICE NOTE, DOCUMENT or STICKER to the paired number now; waiting up to %s", window)
+	received := events.await(t, protocol.EventMessageReceived, window)
+
+	var body struct {
+		Message struct {
+			ID      string                `json:"id"`
+			Content protocol.MediaContent `json:"content"`
+		} `json:"message"`
+	}
+	if err := json.Unmarshal(received.Payload, &body); err != nil {
+		t.Fatalf("unmarshal the message: %v", err)
+	}
+	content := body.Message.Content
+	if content.Type != "media" {
+		t.Fatalf("that was not a media message (%s). Send a file rather than a text.", content.Type)
+	}
+	if content.Ref == nil {
+		t.Fatalf("the message arrived with nothing to fetch: %s", received.Payload)
+	}
+	say("got a %s: mime=%q filename=%q size=%d duration=%d voice_note=%v thumbnail=%dB",
+		content.Kind, content.Mime, content.Filename, content.Size, content.Duration,
+		content.VoiceNote, len(content.Thumbnail))
+
+	ref := content.Ref
+	if ref.Kind != protocol.MediaRefConnectorBlob || ref.ID == "" || ref.URL == "" || ref.SHA256 == "" {
+		t.Fatalf("the reference does not describe a blob on this instance: %+v", ref)
+	}
+	if want := endpoint.URL + "/media/" + ref.ID; ref.URL != want {
+		t.Fatalf("the reference points at %q, want %q", ref.URL, want)
+	}
+
+	// The whole point of the phase: fetch what the client would fetch, from the URL the
+	// event carried, with the token the registry publishes.
+	fetched := fetchBlob(t, ref.URL, token)
+	if fetched.status != http.StatusOK {
+		t.Fatalf("fetching the blob answered %d: %s", fetched.status, fetched.body)
+	}
+	if int64(len(fetched.body)) != ref.Size {
+		t.Fatalf("the blob is %d bytes and the reference says %d", len(fetched.body), ref.Size)
+	}
+	if digest := fmt.Sprintf("%x", sha256.Sum256(fetched.body)); digest != ref.SHA256 {
+		t.Fatalf("the bytes hash to %s and the reference says %s", digest, ref.SHA256)
+	}
+	if content.Mime != "" && fetched.mime != content.Mime {
+		t.Fatalf("the endpoint served %q and the message said %q", fetched.mime, content.Mime)
+	}
+	say("fetched %d bytes from %s, digest matches", len(fetched.body), ref.URL)
+
+	// And the other half of the endpoint: what guards a URL that hands out somebody's
+	// file is the token, and nothing else.
+	if refused := fetchBlob(t, ref.URL, ""); refused.status != http.StatusUnauthorized {
+		t.Fatalf("fetching without the token answered %d, want 401", refused.status)
+	}
+	if state := session.state(); state != "open" {
+		t.Fatalf("the session did not stay up: state=%s", state)
+	}
+}
+
+// TestLiveViewOnce is the decision this build makes about a file sent to be seen once:
+// the message goes out, the file is not kept, and the preview does not travel either.
+// It needs a human to send one, which is why it is a phase and not a unit test.
+func TestLiveViewOnce(t *testing.T) {
+	const token = "live-check"
+
+	root := filepath.Join(liveDir(t), "blobs")
+	blobs, err := media.New(media.Options{Root: root})
+	if err != nil {
+		t.Fatalf("open the blob store at %s: %v", root, err)
+	}
+	t.Cleanup(func() { _ = blobs.Close() })
+
+	mux := http.NewServeMux()
+	mux.Handle("GET /media/{id}", media.Handler(media.HandlerOptions{Blobs: blobs, Token: token}))
+	endpoint := httptest.NewServer(mux)
+	t.Cleanup(endpoint.Close)
+
+	session, _ := liveSessionWith(t, MediaOptions{Blobs: blobs, BaseURL: endpoint.URL})
+	events := watch(t, session)
+
+	if err := session.Connect(t.Context(), engine.ConnectRequest{Pairing: "resume"}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	events.awaitState(t, "open", 2*time.Minute)
+
+	window := liveWindow(t, 3*time.Minute)
+	say("send a VIEW ONCE photo or video to the paired number now; waiting up to %s", window)
+	received := events.await(t, protocol.EventMessageReceived, window)
+
+	var body struct {
+		Message struct {
+			ID      string                `json:"id"`
+			Content protocol.MediaContent `json:"content"`
+		} `json:"message"`
+	}
+	if err := json.Unmarshal(received.Payload, &body); err != nil {
+		t.Fatalf("unmarshal the message: %v", err)
+	}
+	content := body.Message.Content
+	if content.Type != "media" {
+		t.Fatalf("that was not a media message (%s). Send a view-once photo.", content.Type)
+	}
+	if content.Ref != nil {
+		t.Fatalf("a view-once file was kept and handed out as %+v", content.Ref)
+	}
+	if content.Thumbnail != "" {
+		t.Fatalf("a view-once message carried a %d-byte preview of what was not kept", len(content.Thumbnail))
+	}
+
+	// Published after the message and never instead of it, which is what lets the client
+	// find the message it belongs to.
+	failure := events.await(t, protocol.EventMediaDownloadFailed, 30*time.Second)
+	var why protocol.MediaDownloadFailure
+	if err := json.Unmarshal(failure.Payload, &why); err != nil {
+		t.Fatalf("unmarshal the failure: %v", err)
+	}
+	if why.MessageID != body.Message.ID || why.Reason != reasonViewOnce {
+		t.Fatalf("the failure is %+v, want %s for %s", why, reasonViewOnce, body.Message.ID)
+	}
+	say("a view-once %s arrived, nothing was kept, and the client was told why", content.Kind)
+}
+
+// fetched is one answer from the media endpoint.
+type fetched struct {
+	status int
+	mime   string
+	body   []byte
+}
+
+// fetchBlob asks the endpoint for a blob the way the client does. An empty token sends
+// no header at all, which is the unauthenticated case rather than a wrong one.
+func fetchBlob(t *testing.T, url, token string) fetched {
+	t.Helper()
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, url, http.NoBody)
+	if err != nil {
+		t.Fatalf("build the request: %v", err)
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	answer, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("fetch %s: %v", url, err)
+	}
+	defer func() { _ = answer.Body.Close() }()
+
+	read, err := io.ReadAll(answer.Body)
+	if err != nil {
+		t.Fatalf("read the blob: %v", err)
+	}
+	return fetched{status: answer.StatusCode, mime: answer.Header.Get("Content-Type"), body: read}
+}
+
+// liveWindow is how long a phase waits for a human to send something.
+func liveWindow(t *testing.T, fallback time.Duration) time.Duration {
+	t.Helper()
+
+	raw := os.Getenv("WAC_LIVE_SECONDS")
+	if raw == "" {
+		return fallback
+	}
+	seconds, err := strconv.Atoi(raw)
+	if err != nil {
+		t.Fatalf("WAC_LIVE_SECONDS=%q: %v", raw, err)
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 // TestLiveSend sends a text from the paired account, which is the half no fake can
@@ -248,7 +456,7 @@ func TestLiveSend(t *testing.T) {
 		// not send one and this connector keeps no messages. Whether the recipient's
 		// client renders it from the id alone is a question for a phone.
 		body["quoted"] = map[string]any{"id": quoted, "from_me": false}
-		body["content"] = map[string]any{"type": "text", "body": "conector nativo, respondendo a mensagem acima"}
+		body["content"] = map[string]any{"type": "text", "body": "conector nativo, em resposta a mensagem acima"}
 	}
 	payload, err := json.Marshal(body)
 	if err != nil {
@@ -303,8 +511,16 @@ func TestLiveLogout(t *testing.T) {
 	}
 }
 
-// liveSession opens the durable store and one session on it.
+// liveSession opens the durable store and one session on it, with nowhere to keep a
+// file. Every phase but the media ones wants that.
 func liveSession(t *testing.T) (*Session, *store.Container) {
+	t.Helper()
+
+	return liveSessionWith(t, MediaOptions{})
+}
+
+// liveSessionWith is the same, with somewhere to put the file of an inbound message.
+func liveSessionWith(t *testing.T, blobs MediaOptions) (*Session, *store.Container) {
 	t.Helper()
 
 	path := os.Getenv("WAC_LIVE_DB")
@@ -329,7 +545,7 @@ func liveSession(t *testing.T) (*Session, *store.Container) {
 	})
 	t.Logf("store: %s", path)
 
-	waEngine := mustEngine(t, container, Options{DeviceName: "fazer.ai live check"}, log)
+	waEngine := mustEngine(t, container, Options{DeviceName: "fazer.ai live check", Media: blobs}, log)
 	t.Cleanup(func() {
 		if err := waEngine.Close(); err != nil {
 			t.Errorf("close the engine: %v", err)
