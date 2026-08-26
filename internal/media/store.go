@@ -358,6 +358,13 @@ func (s *Store) Sweep(ctx context.Context) (dropped int, freed int64, err error)
 		// on the stale time turns a HEAD that answered 200 into a GET that answers 404.
 		s.collecting.Lock()
 		defer s.collecting.Unlock()
+		if s.isWriting(entry.id) {
+			// A Put that has renamed its bytes into place and not yet stamped them.
+			// The canonical file is there with the temporary file's time on it, which
+			// is old enough to evict, and the caller is about to be handed a blob that
+			// this would have deleted.
+			return entry.charged
+		}
 		if info, err := s.root.Stat(s.pathOf(entry.id)); err == nil && info.ModTime().After(entry.touched) {
 			return entry.charged
 		}
@@ -520,10 +527,15 @@ func (s *Store) list(ctx context.Context) (blobs []held, leftovers []string, ski
 		switch name, aged := entry.Name(), info.ModTime().Before(s.opts.Now().Add(-s.opts.TTL)); {
 		case path == s.tempPath(strings.TrimPrefix(name, tempPrefix)):
 			// A write that was interrupted. It is named after nothing and nobody can
-			// ask for it, so the sweep is what collects it — but only once it is old
-			// enough to be nobody's, since a write in progress right now looks exactly
-			// like one that was abandoned.
-			if aged && !s.isWriting(strings.TrimPrefix(name, tempPrefix)) {
+			// ask for it, so the sweep is what collects it.
+			//
+			// Straight away rather than after the TTL, because the in-flight set is the
+			// whole answer: only this process writes to this root, so a temporary file
+			// it is not writing is one a crash or a restart left, and it is not charged
+			// against the quota either — waiting a day would leave up to one MaxBlob of
+			// each of them on the disk while every sweep reported the cache within
+			// budget.
+			if !s.isWriting(strings.TrimPrefix(name, tempPrefix)) {
 				leftovers = append(leftovers, path)
 			}
 		case path == s.aboutPath(strings.TrimSuffix(name, aboutSuffix)):

@@ -249,7 +249,10 @@ func TestTheSweepCollectsAnInterruptedWrite(t *testing.T) {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	now = now.Add(2 * time.Hour)
+	// No time is allowed to pass. The in-flight set is the whole answer — only this
+	// process writes to this root, so a temporary file it is not writing is one a crash
+	// or a restart left — and waiting a day would leave up to one MaxBlob of each of
+	// them on the disk while every sweep reported the cache within budget.
 	if _, _, err := store.Sweep(t.Context()); err != nil {
 		t.Fatalf("Sweep: %v", err)
 	}
@@ -907,4 +910,61 @@ func TestBytesThatWentAreNotStillChargedForWhenTheDescriptionStays(t *testing.T)
 			t.Fatalf("%s was evicted to make room for bytes that had already gone: %v", id, err)
 		}
 	}
+}
+
+// A Put that has renamed its bytes into place and not yet stamped them leaves the
+// canonical file there with the temporary file's time on it, which is old enough to
+// evict. A sweep landing there deletes a blob the caller is about to be handed.
+func TestABlobIsNotEvictedBetweenItsRenameAndItsStamp(t *testing.T) {
+	t.Parallel()
+
+	var (
+		now   = time.Now()
+		store *media.Store
+		root  string
+		reads int
+		swept bool
+	)
+	// The clock is the seam again: Put reads it once for the description and once more
+	// to stamp the blob after the rename, so the second read is the window between the
+	// two — which is where a sweep on its own goroutine lands in production. The file is
+	// back-dated there as well, because until the stamp it carries whatever time the
+	// temporary file had, and a slow download's is old.
+	clock := func() time.Time {
+		reads++
+		if reads == 2 && !swept {
+			swept = true
+			backdate(t, root, now.Add(-time.Hour))
+			if _, _, err := store.Sweep(context.WithoutCancel(t.Context())); err != nil {
+				t.Errorf("the sweep in the window failed: %v", err)
+			}
+		}
+		return now
+	}
+	built, dir := newStore(t, media.Options{TTL: time.Minute, Now: clock})
+	store, root = built, dir
+
+	stored, err := store.Put(t.Context(), strings.NewReader("arriving"), &media.Blob{})
+	if err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if !swept {
+		t.Fatal("no sweep ran in the window, so the test proves nothing")
+	}
+	if _, _, err := store.Open(stored.ID); err != nil {
+		t.Fatalf("a blob was evicted between its rename and its stamp: %v", err)
+	}
+}
+
+// backdate puts an old time on every blob under root, which is what a file renamed out
+// of a slow download carries until it is stamped.
+func backdate(t *testing.T, root string, when time.Time) {
+	t.Helper()
+	_ = filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil || entry.IsDir() || !strings.HasPrefix(entry.Name(), "blob_") {
+			return nil //nolint:nilerr // best effort in a test helper
+		}
+		_ = os.Chtimes(path, when, when)
+		return nil
+	})
 }
