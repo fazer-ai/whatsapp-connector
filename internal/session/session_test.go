@@ -77,7 +77,13 @@ func (r *recorder) failWith(err error) {
 	r.mu.Unlock()
 }
 
-func (r *recorder) Reply(_ context.Context, replyTo string, reply protocol.Reply) error {
+func (r *recorder) Reply(ctx context.Context, replyTo string, reply protocol.Reply) error {
+	// Refused on a dead context, the way a Redis client is. A recorder that took the
+	// reply anyway would let every test pass that meant to prove an answer survives the
+	// session ending, because the answer would be recorded from the dying context too.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.replies[replyTo] = reply
@@ -1836,5 +1842,50 @@ func TestACommandCutOffByTheSessionEndingIsHandedBack(t *testing.T) {
 	}
 	if _, answered := h.recorder.reply("c1"); answered {
 		t.Fatal("a send that was cut off mid-flight was answered on a dead context")
+	}
+}
+
+// The other side of that race: WhatsApp accepts the send in the same instant the lease
+// moves. The command worked and there is a record of it, so handing it back would be
+// wrong — but answering on the dying context drops the reply while the acknowledgement
+// retires the command, and the caller is left with nothing about a message that is
+// already in somebody's chat. The answer goes out detached, like the acknowledgement.
+func TestASendThatLandedAsTheSessionEndedIsStillAnswered(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	ctx := context.Background()
+	if _, err := h.manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, _ := h.engine.Session("s1")
+	if err := engineSession.Connect(ctx, engine.ConnectRequest{Pairing: "resume"}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	release := engineSession.HoldUntilCanceled()
+	defer release()
+
+	var acked, forfeited atomic.Bool
+	handed := delivery(&protocol.Command{
+		V: protocol.Version, ID: "c1", Type: protocol.CommandMessageSend, SID: "s1", ReplyTo: "c1",
+		Payload: json.RawMessage(`{"message_id":"m1","to":{"kind":"phone","id":"5511999999999"},"content":{"type":"text","body":"oi"}}`),
+	}, &acked)
+	handed.Forfeit = func() { forfeited.Store(true) }
+	h.manager.Dispatch(ctx, handed)
+
+	waitFor(t, "the send to reach the engine", func() bool { return len(engineSession.Commands()) == 1 })
+	h.manager.Release(ctx, "s1")
+
+	waitFor(t, "the send to be answered", func() bool { _, ok := h.recorder.reply("c1"); return ok })
+	reply, _ := h.recorder.reply("c1")
+	if !reply.OK {
+		t.Fatalf("a send that landed was answered with a failure: %+v", reply.Error)
+	}
+	if forfeited.Load() {
+		t.Fatal("a send that landed was handed back for another instance to send again")
+	}
+	if !acked.Load() {
+		t.Fatal("a send that landed and was answered was left pending")
 	}
 }

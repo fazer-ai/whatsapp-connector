@@ -52,7 +52,7 @@ func TestWhatACommandIsRememberedUnder(t *testing.T) {
 			ID: "c4", Type: protocol.CommandMessageDownloadMedia, IdempotencyKey: "download-once",
 			Payload: json.RawMessage(`{"message_id":"m1"}`),
 		},
-		want: "download-once",
+		want: "idem:download-once",
 	}, {
 		// Reading the invite code changes nothing, and the answer is only worth having
 		// if it is current.
@@ -72,6 +72,16 @@ func TestWhatACommandIsRememberedUnder(t *testing.T) {
 			Payload: json.RawMessage(`{"group":{"kind":"group","id":"g1"},"revoke":true}`),
 		},
 		want: "cmd:c6",
+	}, {
+		// The caller picks this string and the schema takes any, so an unprefixed one
+		// reading `msg:m1` would be answered from the record of the send of m1: a logout
+		// reported successful over an account that is still paired.
+		name: "a caller's own key cannot reach into the message namespace",
+		command: protocol.Command{
+			ID: "c9", Type: protocol.CommandSessionLogout, IdempotencyKey: "msg:m1",
+			Payload: json.RawMessage(`{}`),
+		},
+		want: "idem:msg:m1",
 	}, {
 		name: "a question is asked again",
 		command: protocol.Command{

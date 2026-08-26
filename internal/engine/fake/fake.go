@@ -89,6 +89,8 @@ type Session struct {
 	loggedOut int
 	commands  []protocol.Command
 	held      chan struct{}
+
+	heldSucceeds bool
 }
 
 func newSession(sid string) *Session {
@@ -189,7 +191,12 @@ func (s *Session) Execute(ctx context.Context, command *protocol.Command) (json.
 		select {
 		case <-held:
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			if !s.holdSucceeds() {
+				return nil, ctx.Err()
+			}
+			// Held the other way: the send landed in the same instant the context died,
+			// which is the race a caller cannot be left out of. Falls through to the
+			// ordinary result.
 		}
 	}
 
@@ -226,10 +233,17 @@ func (s *Session) Execute(ctx context.Context, command *protocol.Command) (json.
 // Hold makes every later Execute wait before it does anything, until the returned
 // function is called or the command's context ends. It is how a test puts a command in
 // flight and then takes the session away underneath it.
-func (s *Session) Hold() func() {
+func (s *Session) Hold() func() { return s.hold(false) }
+
+// HoldUntilCanceled is Hold for the other side of that race: the command is in flight,
+// the context dies, and the work turns out to have landed anyway. It is what a send
+// WhatsApp accepted in the same instant the lease moved looks like from here.
+func (s *Session) HoldUntilCanceled() func() { return s.hold(true) }
+
+func (s *Session) hold(succeeds bool) func() {
 	release := make(chan struct{})
 	s.mu.Lock()
-	s.held = release
+	s.held, s.heldSucceeds = release, succeeds
 	s.mu.Unlock()
 	return sync.OnceFunc(func() {
 		s.mu.Lock()
@@ -237,6 +251,12 @@ func (s *Session) Hold() func() {
 		s.mu.Unlock()
 		close(release)
 	})
+}
+
+func (s *Session) holdSucceeds() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.heldSucceeds
 }
 
 // Events is the emission channel. It is closed by Close.

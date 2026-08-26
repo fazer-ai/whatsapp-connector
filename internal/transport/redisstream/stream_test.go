@@ -1156,3 +1156,61 @@ func TestAWakeIsNeverTooOldToTakeOver(t *testing.T) {
 		t.Fatalf("the dead letter list holds %d records (err=%v), want none: a retired wake strands its session", len(records), err)
 	}
 }
+
+// Idle time is the time since the last delivery attempt, and every claim puts it back to
+// zero. An entry that keeps being taken over and handed back therefore keeps looking new
+// no matter how long it has really been going round, while the record of whether it ran
+// expires on its own clock underneath it. The bound reads the entry's own id instead,
+// which carries the millisecond it was written and is never reset.
+func TestAnEntryGoingRoundStillAgesOut(t *testing.T) {
+	t.Parallel()
+
+	const (
+		minIdle = 10 * time.Second
+		maxIdle = time.Hour
+	)
+	f := newFleet(t)
+	patient, err := redisstream.New(f.client, redisstream.Options{
+		Instance: "inst-alive", Block: 50 * time.Millisecond,
+		ClaimMinIdle: minIdle, ClaimMaxIdle: maxIdle,
+	})
+	if err != nil {
+		t.Fatalf("redisstream.New: %v", err)
+	}
+	dead := f.streams(t, "inst-dead")
+	ctx := context.Background()
+
+	if _, err := dead.Read(ctx, []string{"s1"}); err != nil {
+		t.Fatalf("priming Read: %v", err)
+	}
+	writeCommand(t, f, f.client.Keys().Commands("s1"), command("c1", "s1", "c1"))
+	if taken, err := dead.Read(ctx, []string{"s1"}); err != nil || len(taken) != 1 {
+		t.Fatalf("the first instance read %d commands (err=%v), want 1", len(taken), err)
+	}
+
+	clock := time.Now().UTC()
+	tick := func(d time.Duration) { clock = clock.Add(d); f.server.SetTime(clock) }
+
+	// Old, but not yet past the bound, so it is taken over and then given back unrun:
+	// the batch it landed in ran out of its budget. That hand-back is what puts an
+	// idle-based age back to zero.
+	tick(maxIdle - 5*time.Minute)
+	claimed, err := patient.Claim(ctx, []string{"s1"})
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("Claim returned %d commands (err=%v), want the abandoned one", len(claimed), err)
+	}
+	claimed[0].Release()
+
+	// By now it was written well over the bound ago, whatever its last delivery says.
+	tick(10 * time.Minute)
+	again, err := patient.Claim(ctx, []string{"s1"})
+	if err != nil {
+		t.Fatalf("the second Claim: %v", err)
+	}
+	if len(again) != 0 {
+		t.Fatalf("claimed %d commands past the bound, want none: every hand-back put the age back to zero", len(again))
+	}
+	if records, err := f.client.LRange(ctx, f.client.Keys().DLQCommands(), 0, -1).Result(); err != nil || len(records) != 1 {
+		t.Fatalf("the dead letter list holds %d records (err=%v), want the one that aged out", len(records), err)
+	}
+}

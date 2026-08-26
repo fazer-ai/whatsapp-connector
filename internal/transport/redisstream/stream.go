@@ -11,6 +11,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -37,7 +39,7 @@ const (
 	DefaultReadCount     = 64
 )
 
-// DefaultClaimMaxIdle is how long an entry may sit pending before this transport stops
+// DefaultClaimMaxIdle is how long an entry may exist before this transport stops
 // taking it over and retires it to the dead letter list instead.
 //
 // It is the idempotency TTL, and the two have to move together: what makes a reclaim
@@ -443,6 +445,28 @@ func (s *Streams) reclaimable(ctx context.Context, stream string, minIdle, maxId
 	ids = make([]string, 0, s.opts.ReadCount)
 	start := "-"
 
+	// The bound is read off the entry's own id, not off its idle time, because idle is
+	// the time since the last delivery attempt and every XCLAIM puts it back to zero.
+	// An entry claimed and handed back on each pass would keep looking new while the
+	// record of whether it ran expires underneath it, which is the one case this bound
+	// exists for. A stream id carries the millisecond it was written, and nothing resets
+	// that. Only a delivered entry is ever in the pending list, so an id this old is an
+	// entry that has been going round rather than one nobody has read yet.
+	//
+	// The clock is Redis's own, since that is what stamped the ids.
+	var cutoff string
+	if maxIdle > 0 {
+		now, err := s.client.Time(ctx).Result()
+		if err != nil {
+			// The bound cannot be applied without it, and refusing to reclaim anything
+			// would strand every session. Reclaiming as if nothing had aged out is the
+			// behaviour from before the bound, and the next pass reads the clock again.
+			maxIdle = 0
+		} else {
+			cutoff = strconv.FormatInt(now.Add(-maxIdle).UnixMilli(), 10)
+		}
+	}
+
 	// Paged, because the filter is what makes a page yield nothing: entries this
 	// process is still running stay pending for as long as they run, and a page full of
 	// them would hide everything behind it on every heartbeat, forever. The page cap is
@@ -480,7 +504,7 @@ func (s *Streams) reclaimable(ctx context.Context, stream string, minIdle, maxId
 			if s.running(stream, entry.ID) {
 				continue
 			}
-			if maxIdle > 0 && entry.Idle > maxIdle {
+			if maxIdle > 0 && olderThan(entry.ID, cutoff) {
 				// Older than anything that could say whether it already ran. Taking it
 				// over would be carrying out a command on a guess, so it is retired
 				// instead, which is the one outcome that neither runs it twice nor
@@ -496,6 +520,27 @@ func (s *Streams) reclaimable(ctx context.Context, stream string, minIdle, maxId
 		start = pending[len(pending)-1].ID
 	}
 	return ids, expired, nil
+}
+
+// olderThan reports whether a stream id was written before the millisecond named by
+// cutoff. Both are `<ms>-<seq>`, or in cutoff's case the millisecond alone, so the
+// comparison is on the number before the dash: same width means a string compare would
+// do, but ids are not padded and an unreadable one has to count as young rather than be
+// retired on a parse failure.
+func olderThan(id, cutoff string) bool {
+	ms, _, found := strings.Cut(id, "-")
+	if !found {
+		return false
+	}
+	written, err := strconv.ParseInt(ms, 10, 64)
+	if err != nil {
+		return false
+	}
+	limit, err := strconv.ParseInt(cutoff, 10, 64)
+	if err != nil {
+		return false
+	}
+	return written < limit
 }
 
 // retire takes entries out of the pending list for good and leaves a copy of each on

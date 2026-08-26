@@ -367,21 +367,23 @@ func (s *Session) run(ctx context.Context, delivery *transport.Delivery) {
 		forfeit(delivery)
 		return
 	}
-	s.answer(ctx, &command, result, err)
-
-	// Acknowledged either way, and on a deadline of its own. A command that failed has
-	// been answered, and leaving it pending would have another instance run it again
-	// after this one restarts, which for a send is a duplicate message rather than a
-	// retry.
+	// The answer and the acknowledgement both go out detached from the session's
+	// context, because this session is exactly what may have just ended. The work is
+	// over by this point and what is left has to happen: a send can succeed in the same
+	// instant the lease moves, and answering that on the dying context drops the reply
+	// while the acknowledgement retires the command, leaving the caller with nothing
+	// about a message that is already in somebody's chat.
 	//
-	// Detached from the session's context because this session is exactly what may have
-	// just ended. An acknowledgement refused for the cancellation leaves the entry marked
-	// as being carried out here, on purpose, so a reclaim does not run it twice: every
-	// later claim then skips it, and if this same instance adopts the session again the
-	// marker is still standing. The command is neither retired nor retried until the
-	// process restarts. The work is over by this point; what is left has to happen.
+	// Acknowledged whether the command worked or not. A command that failed has been
+	// answered, and leaving it pending would have another instance run it again after
+	// this one restarts, which for a send is a duplicate message rather than a retry.
+	// An acknowledgement refused anyway leaves the entry marked as being carried out
+	// here, on purpose, so a reclaim does not run it twice: every later claim then skips
+	// it, and if this same instance adopts the session again the marker is still
+	// standing. The command is neither retired nor retried until the process restarts.
 	retire, cancel := context.WithTimeout(context.WithoutCancel(ctx), ackTimeout)
 	defer cancel()
+	s.answer(retire, &command, result, err)
 	if ackErr := delivery.Ack(retire); ackErr != nil {
 		log.Error().Err(ackErr).Msg("failed to acknowledge a command")
 	}
@@ -507,13 +509,17 @@ func idempotencyKey(command *protocol.Command) string {
 		}
 	}
 	if command.IdempotencyKey != "" {
-		return command.IdempotencyKey
+		// Prefixed, because the caller picks this string and the schema takes any: one
+		// reading `msg:m1` on a logout would be answered from the record of the send of
+		// m1, and report an account unlinked that is still paired.
+		return "idem:" + command.IdempotencyKey
 	}
 	// Neither, which the contract's own `session.logout` fixture is. The command's id
 	// is what is left, and it is enough for the redelivery this exists to stop: the
 	// transport hands back the same entry, so the same frame arrives carrying the same
 	// id. A client that sends a second command of its own gets a new id and is not
-	// covered, which is what `idempotency_key` is for.
+	// covered, which is what `idempotency_key` is for. Prefixed for the same reason as
+	// above: a command id is a caller's string too.
 	return "cmd:" + command.ID
 }
 
