@@ -760,6 +760,9 @@ func TestAnEngineIsRefusedWhenBlobsCouldNotBeFetchedFromWhereItWouldPublishThem(
 		// front of the query rather than behind it.
 		{"a query the id would be appended in front of", "http://connector:8080/?token=x"},
 		{"a fragment", "http://connector:8080/#here"},
+		// What a listener reads as any free port, which is not one anybody can be told
+		// to come back to.
+		{"the port a listener picks for itself", "http://connector:0"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()

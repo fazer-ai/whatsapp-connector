@@ -5,6 +5,7 @@ package app
 import (
 	"fmt"
 	"math"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -212,7 +213,18 @@ func LoadConfig(hostname string) (Config, error) {
 		return Config{}, fmt.Errorf("app: WAC_MEDIA_TOKEN is required when WAC_MEDIA_ROOT is set")
 	}
 	if cfg.AdvertiseURL == "" {
-		cfg.AdvertiseURL = "http://" + cfg.Instance + strings.TrimPrefix(cfg.HTTPAddr, "0.0.0.0")
+		// From the port alone, never from the host the listener binds to. The two answer
+		// different questions: a bind host says which interface to accept on, and the
+		// advertised host says how the rest of the deployment reaches this instance.
+		// Pasting the first into the second built `http://<instance>127.0.0.1:8080` for
+		// anything but the two spellings of "every interface", which resolves nowhere —
+		// and a blob is published under it after the message has been acknowledged, so
+		// what that costs is the file.
+		_, port, err := net.SplitHostPort(cfg.HTTPAddr)
+		if err != nil {
+			return Config{}, fmt.Errorf("app: WAC_HTTP_ADDR %q is not an address to listen on: %w", cfg.HTTPAddr, err)
+		}
+		cfg.AdvertiseURL = "http://" + cfg.Instance + ":" + port
 	}
 	return cfg, nil
 }

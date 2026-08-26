@@ -105,6 +105,11 @@ func reachableAt(base string) error {
 	if address.Host == "" {
 		return fmt.Errorf("whatsmeow: blobs are published under %q, which names no host", base)
 	}
+	if address.Port() == "0" {
+		// What a listener reads as "any free port", which is not a port anybody can be
+		// told to come back to.
+		return fmt.Errorf("whatsmeow: blobs are published under %q, and nothing can be fetched from port 0", base)
+	}
 	if address.RawQuery != "" || address.Fragment != "" {
 		// The id is appended as a path segment, so anything after it would end up in
 		// front of the query rather than behind it.
