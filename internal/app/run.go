@@ -100,7 +100,8 @@ func New(cfg *Config, log zerolog.Logger) (*Connector, error) {
 	leases := cluster.NewLeases(client, cfg.Instance, cluster.Options{TTL: cfg.LeaseTTL})
 	manager := session.NewManager(&session.ManagerConfig{
 		Instance: cfg.Instance, Engine: waEngine, Leases: leases,
-		Publisher: streams, Replier: streams, NewID: newFrameID, Logger: log,
+		Publisher: streams, Replier: streams, Ledger: redisx.NewIdempotency(client, 0),
+		NewID: newFrameID, Logger: log,
 	})
 
 	c := &Connector{

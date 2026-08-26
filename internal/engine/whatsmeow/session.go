@@ -1035,9 +1035,8 @@ func (s *Session) isStale() bool {
 
 // Execute carries out one command.
 //
-// M1 answers the one command that is about the session itself. Everything else is
-// refused rather than answered with a plausible shape: a connector that acknowledged a
-// send it cannot make would lose the message and report success.
+// What is not here is refused rather than answered with a plausible shape: a connector
+// that acknowledged a send it cannot make would lose the message and report success.
 func (s *Session) Execute(ctx context.Context, command *protocol.Command) (json.RawMessage, error) {
 	switch command.Type {
 	case protocol.CommandSessionStatus:
@@ -1048,6 +1047,8 @@ func (s *Session) Execute(ctx context.Context, command *protocol.Command) (json.
 		return nil, s.confirmPasskey(ctx, command)
 	case protocol.CommandPairingRequestCode:
 		return nil, s.requestCode(ctx, command)
+	case protocol.CommandMessageSend:
+		return s.send(ctx, command)
 	}
 	return nil, engine.ErrNotSupported
 }

@@ -11,7 +11,10 @@ contract/fixtures/commands/history_request.json: Require an idempotency key for 
 # unanchored request with a reason the operator can read is the shape to settle on then.
 contract/schema/protocol.schema.json: Require a usable anchor for native history requests  # PR#3
 internal/store/store.go: Fence device writes against lease loss  # PR#5 — real, and not a patch: whatsmeow writes through its own SQL layer where a statement carries no session identity, so a fence has to be per-session all the way down (one container per session, or a session-aware driver wrapper). That is M2, when this package starts owning writes of its own. The lease plus the heartbeat teardown bound the window meanwhile, and the roadmap says it is open.
-internal/engine/whatsmeow/session.go: Deduplicate logout before calling WhatsApp  # PR#6 — real, and not the place to fix it: the connector has no idempotency layer at all yet, for any command. Invariant 5 lands with `message.send` in M2, where the same machinery covers logout. Building one mechanism for logout alone would be a second one to retire.
+# PR#6's logout deduplication is no longer waived: the idempotency layer it was waiting
+# for landed with `message.send` in PR#9, and `wa:idem:<sid>:<key>` now covers every
+# command that carries an `idempotency_key`. A logout that brings one is deduplicated
+# like any other command.
 internal/engine/whatsmeow/session.go: Reuse an in-flight dial for pairing retries  # PR#6 — real, and a design rather than a guard: joining an existing dial means a shared result every caller can wait on, which is the same machinery M2 needs for idempotent sends. Building a one-off here would be a second one to retire. The retry meanwhile fails with ErrAlreadyConnected and the operator tries again, which is visible rather than silent.
 # PR#6: real, and it needs the machinery M2 brings rather than a guard here. A second
 # session pairing an account displaces the first mapping and deletes its device, but the
@@ -25,3 +28,46 @@ internal/engine/whatsmeow/session.go: Reuse an in-flight dial for pairing retrie
 # the deletion look safe ("WhatsApp has already unlinked them") was wrong and is corrected
 # in the code comment.
 internal/store/store.go: Reject pairings that displace a live session  # PR#6
+# PR#9: raised three rounds running, and checked on a phone rather than argued about. A
+# quoted reply was sent live with only a stanza id and a participant, and the recipient's
+# client rendered the quote from its own copy of the original. The claim that WhatsApp
+# needs the message embedded in ContextInfo is wrong for the case that matters; where it
+# would bite is a device that does not have the original, and neither the caller nor this
+# connector holds one to embed: Chatwoot's `quoted` is {id, participant, from_me} and no
+# messages are kept here. Carrying content would be a contract change in two repositories
+# for a case a phone says is already working, and refusing quotes would drop the frame off
+# an agent's reply instead.
+internal/engine/whatsmeow/send.go: Populate quoted content before sending replies  # PR#9
+internal/engine/whatsmeow/send.go: Include the original payload in quoted messages  # PR#9
+internal/engine/whatsmeow/send.go: Include the original message in quote context  # PR#9
+# PR#9: real, deliberate, and already named where it is taken. `ClaimSessions` passes a
+# zero min-idle on purpose (`stream.go`, and the comment there says so): the new owner
+# holds the lease, so whoever held those entries has lost it, and waiting the delay would
+# put the abandoned command after the newer one every time, which is the reordering the
+# call exists to prevent. What is left is the heartbeat or so between a lease moving and
+# the old owner noticing. The suggested fix does not close it: a reservation taken before
+# the side effect says an attempt was made, never whether it landed, so an instance that
+# crashes between the two leaves the next one choosing between dropping a message that
+# never went out and sending one that already did — which is why the record is written
+# after the fact and not reserved before it. Two concurrent runners is what invariant 5
+# covers, and for a send the caller's `message_id` is what covers it: the same stanza id
+# twice is discarded by the receiving client. Closing it properly is fencing the engine's
+# writes on the lease, which is the M2 waiver above and needs a session-scoped stop over
+# the fleet rather than a lock here.
+internal/session/session.go: Serialize same-key commands before running them  # PR#9
+# PR#9: real, and the bound that was built for it in this same PR is out again, because
+# both attempts at one were worse than the hole. A pending entry carries no honest age:
+# XPENDING's idle is the time since the last delivery and every XCLAIM resets it, so an
+# entry going round never ages; the stream id is the moment the command was enqueued, not
+# the moment it first ran, so a command that waited a day unread and was only just picked
+# up looks identical to one that has been going round for a day, and retiring on it drops
+# a command that never ran. Knowing when an entry first became pending means writing that
+# down per delivery, which is a key per command on the hot path and a key class the
+# contract does not have. What is in place instead couples the two lifetimes from the
+# other side: Recall pushes the record's expiry out, so a record outlives any entry
+# anybody is still asking about. What is left is a fleet down longer than the TTL with a
+# command still pending, which is a day-long outage; for a send the caller's message_id
+# is what covers the repeat, and the commands where it would bite are the ones the roadmap
+# fences on the lease.
+internal/redisx/idempotency.go: Keep ledger entries through all possible redeliveries  # PR#9
+internal/transport/redisstream/stream.go: Age pending commands from first delivery, not enqueue time  # PR#9

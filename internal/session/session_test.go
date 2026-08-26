@@ -1,9 +1,11 @@
 package session_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"sync"
@@ -75,7 +77,13 @@ func (r *recorder) failWith(err error) {
 	r.mu.Unlock()
 }
 
-func (r *recorder) Reply(_ context.Context, replyTo string, reply protocol.Reply) error {
+func (r *recorder) Reply(ctx context.Context, replyTo string, reply protocol.Reply) error {
+	// Refused on a dead context, the way a Redis client is. A recorder that took the
+	// reply anyway would let every test pass that meant to prove an answer survives the
+	// session ending, because the answer would be recorded from the dying context too.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.replies[replyTo] = reply
@@ -102,7 +110,75 @@ type harness struct {
 	leases   *cluster.Leases
 	engine   *fake.Engine
 	recorder *recorder
+	ledger   *ledger
 	manager  *session.Manager
+}
+
+// ledger is the harness's idempotency store, with a switch for the tests that need one
+// nothing can read. A Redis that is up and a Redis that answers are different things,
+// and only the second one is an answer about whether a command already ran.
+type ledger struct {
+	inner *redisx.Idempotency
+	mu    sync.Mutex
+	err   error
+
+	// writes counts every attempt at a record, and refuseWrites is how many of them are
+	// turned away before the store is let through. A Redis that refuses one call and
+	// answers the next is the shape of failure the write retry is there for.
+	writes       int
+	refuseWrites int
+}
+
+// refuseWritesFor turns the next n attempts at a record away, whatever the read side is
+// doing.
+func (l *ledger) refuseWritesFor(n int) {
+	l.mu.Lock()
+	l.refuseWrites = n
+	l.mu.Unlock()
+}
+
+func (l *ledger) attempts() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.writes
+}
+
+func (l *ledger) refuse(err error) {
+	l.mu.Lock()
+	l.err = err
+	l.mu.Unlock()
+}
+
+func (l *ledger) refusal() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.err
+}
+
+func (l *ledger) Recall(ctx context.Context, sid, key string) (json.RawMessage, bool, error) {
+	if err := l.refusal(); err != nil {
+		return nil, false, err
+	}
+	return l.inner.Recall(ctx, sid, key)
+}
+
+func (l *ledger) Remember(ctx context.Context, sid, key string, result json.RawMessage) error {
+	l.mu.Lock()
+	l.writes++
+	refusing := l.refuseWrites > 0
+	if refusing {
+		l.refuseWrites--
+	}
+	err := l.err
+	l.mu.Unlock()
+
+	switch {
+	case err != nil:
+		return err
+	case refusing:
+		return errors.New("redis refused the write")
+	}
+	return l.inner.Remember(ctx, sid, key, result)
 }
 
 func newHarness(t *testing.T) harness {
@@ -111,20 +187,23 @@ func newHarness(t *testing.T) harness {
 	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
 	t.Cleanup(func() { _ = rdb.Close() })
 
-	leases := cluster.NewLeases(redisx.Wrap(rdb, "wa:", 8), "inst-a", cluster.Options{})
+	client := redisx.Wrap(rdb, "wa:", 8)
+	leases := cluster.NewLeases(client, "inst-a", cluster.Options{})
 	fakeEngine := fake.New()
 	rec := newRecorder()
 
 	// Minted from the pump goroutine while the test reads what it published, so the
 	// counter is atomic like every other cross-goroutine value here.
+	book := &ledger{inner: redisx.NewIdempotency(client, 0)}
 	var ids atomic.Int64
 	manager := session.NewManager(&session.ManagerConfig{
 		Instance: "inst-a", Engine: fakeEngine, Leases: leases, Publisher: rec, Replier: rec,
+		Ledger: book,
 		NewID:  func() string { return "evt-" + strconv.FormatInt(ids.Add(1), 10) },
 		Logger: zerolog.Nop(),
 	})
 	t.Cleanup(func() { manager.StopAll(context.Background()) })
-	return harness{leases: leases, engine: fakeEngine, recorder: rec, manager: manager}
+	return harness{leases: leases, engine: fakeEngine, recorder: rec, ledger: book, manager: manager}
 }
 
 func delivery(cmd *protocol.Command, acked *atomic.Bool) *transport.Delivery {
@@ -1514,5 +1593,367 @@ func TestAnEventPublishedUnderALeaseThatMovedMidWriteIsSettledAsAFailure(t *test
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("an event written under a lease that moved was never settled")
+	}
+}
+
+// Invariant 5: a command redelivered after its acknowledgement was lost must not have
+// its side effect a second time. For a send that is somebody's conversation showing two
+// of the same message, which is the one failure a retry is supposed to prevent.
+func TestARedeliveredSendIsAnsweredWithoutSendingAgain(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	ctx := context.Background()
+	if _, err := h.manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, ok := h.engine.Session("s1")
+	if !ok {
+		t.Fatal("the engine has no session after Adopt")
+	}
+	if err := engineSession.Connect(ctx, engine.ConnectRequest{Pairing: "resume"}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	send := &protocol.Command{
+		V: protocol.Version, ID: "c1", Type: protocol.CommandMessageSend, SID: "s1", ReplyTo: "c1",
+		Payload: json.RawMessage(`{"message_id":"3EB0ABCDEF","to":{"kind":"phone","id":"5511999990002"},
+			"content":{"type":"text","body":"oi"}}`),
+	}
+	var acked atomic.Bool
+	h.manager.Dispatch(ctx, delivery(send, &acked))
+	waitFor(t, "the send to be answered", func() bool { _, ok := h.recorder.reply("c1"); return ok })
+	first, _ := h.recorder.reply("c1")
+
+	// The same command again, which is what a lost acknowledgement produces: the
+	// transport reclaims it and hands it to whoever owns the session now.
+	redelivered := *send
+	redelivered.ID = "c2"
+	redelivered.ReplyTo = "c2"
+	var ackedAgain atomic.Bool
+	h.manager.Dispatch(ctx, delivery(&redelivered, &ackedAgain))
+	waitFor(t, "the redelivery to be answered", func() bool { _, ok := h.recorder.reply("c2"); return ok })
+	second, _ := h.recorder.reply("c2")
+
+	if got := len(engineSession.Commands()); got != 1 {
+		t.Fatalf("the engine was asked to send %d times, want once", got)
+	}
+	if !second.OK {
+		t.Fatalf("the redelivery was refused: %+v", second.Error)
+	}
+	if string(second.Result) != string(first.Result) {
+		t.Fatalf("the redelivery answered %s, and the first run answered %s", second.Result, first.Result)
+	}
+}
+
+// A refusal is the caller's to try again. Remembering one would answer every later
+// attempt with it, so a number that was briefly unreachable would stay unreachable.
+func TestACommandThatFailedIsNotRememberedAsDone(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	ctx := context.Background()
+	if _, err := h.manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, _ := h.engine.Session("s1")
+
+	// Not connected, so the fake refuses the send.
+	send := &protocol.Command{
+		V: protocol.Version, ID: "c1", Type: protocol.CommandMessageSend, SID: "s1", ReplyTo: "c1",
+		Payload: json.RawMessage(`{"message_id":"3EB0ABCDEF","to":{"kind":"phone","id":"5511999990002"},
+			"content":{"type":"text","body":"oi"}}`),
+	}
+	var acked atomic.Bool
+	h.manager.Dispatch(ctx, delivery(send, &acked))
+	waitFor(t, "the send to be refused", func() bool { _, ok := h.recorder.reply("c1"); return ok })
+	if reply, _ := h.recorder.reply("c1"); reply.OK {
+		t.Fatal("the fake accepted a send on a session that is not connected")
+	}
+
+	// Now it can be sent, and the earlier failure must not be standing in for it.
+	if err := engineSession.Connect(ctx, engine.ConnectRequest{Pairing: "resume"}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	retry := *send
+	retry.ID = "c2"
+	retry.ReplyTo = "c2"
+	var ackedAgain atomic.Bool
+	h.manager.Dispatch(ctx, delivery(&retry, &ackedAgain))
+	waitFor(t, "the retry to be answered", func() bool { _, ok := h.recorder.reply("c2"); return ok })
+
+	if reply, _ := h.recorder.reply("c2"); !reply.OK {
+		t.Fatalf("a retry of a command that had failed was refused: %+v", reply.Error)
+	}
+	if got := len(engineSession.Commands()); got != 2 {
+		t.Fatalf("the engine saw %d attempts, want the failure and the retry", got)
+	}
+}
+
+// The key a command is remembered under. A send names its own message and is keyed by
+// it; everything else brings an idempotency_key, which the frame carries rather than
+// the payload. Reading it from the payload leaves every non-send command undeduplicated
+// while looking like it is covered.
+func TestACommandIsKeyedByWhateverNamesItOnlyOnce(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	ctx := context.Background()
+	if _, err := h.manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, _ := h.engine.Session("s1")
+
+	logout := &protocol.Command{
+		V: protocol.Version, ID: "c1", Type: protocol.CommandSessionLogout, SID: "s1", ReplyTo: "c1",
+		IdempotencyKey: "logout-once", Payload: json.RawMessage(`{}`),
+	}
+	var acked atomic.Bool
+	h.manager.Dispatch(ctx, delivery(logout, &acked))
+	waitFor(t, "the logout to be answered", func() bool { _, ok := h.recorder.reply("c1"); return ok })
+
+	redelivered := *logout
+	redelivered.ID = "c2"
+	redelivered.ReplyTo = "c2"
+	var ackedAgain atomic.Bool
+	h.manager.Dispatch(ctx, delivery(&redelivered, &ackedAgain))
+	waitFor(t, "the redelivery to be answered", func() bool { _, ok := h.recorder.reply("c2"); return ok })
+
+	if reply, _ := h.recorder.reply("c2"); !reply.OK {
+		t.Fatalf("the redelivered logout was refused: %+v", reply.Error)
+	}
+	if got := engineSession.LoggedOut(); got != 1 {
+		t.Fatalf("the account was logged out %d times, want once", got)
+	}
+}
+
+// The contract's own session.logout fixture carries no idempotency_key, so a layer that
+// keys only on one leaves the command it most needs to cover uncovered. The command's
+// id is what is left, and it is enough for a transport redelivery: the same entry comes
+// back carrying the same frame.
+func TestASideEffectWithNoKeyOfItsOwnIsKeyedByTheCommandItArrivedAs(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	ctx := context.Background()
+	if _, err := h.manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, _ := h.engine.Session("s1")
+
+	// The same frame twice, which is what the transport hands back: same id, same
+	// reply address. Each delivery is waited on through its own acknowledgement,
+	// because the reply is written to the same place both times and seeing one there
+	// says nothing about which delivery put it there.
+	logout := &protocol.Command{
+		V: protocol.Version, ID: "c1", Type: protocol.CommandSessionLogout, SID: "s1", ReplyTo: "c1",
+		Payload: json.RawMessage(`{}`),
+	}
+	for i := range 2 {
+		var acked atomic.Bool
+		h.manager.Dispatch(ctx, delivery(logout, &acked))
+		waitFor(t, fmt.Sprintf("delivery %d to be retired", i+1), acked.Load)
+	}
+
+	if got := engineSession.LoggedOut(); got != 1 {
+		t.Fatalf("the account was logged out %d times, want once", got)
+	}
+}
+
+// A question has to be asked again. Answering a redelivered session.status from a
+// record reports the state the session was in when it was first asked, which is the one
+// answer that is certainly stale.
+func TestAQuestionIsAskedAgainRatherThanAnsweredFromARecord(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	ctx := context.Background()
+	if _, err := h.manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, _ := h.engine.Session("s1")
+
+	// The same frame twice, so a layer that keyed questions as well as side effects
+	// would have the second one answered from the first one's record.
+	status := &protocol.Command{
+		V: protocol.Version, ID: "c1", Type: protocol.CommandSessionStatus, SID: "s1", ReplyTo: "c1",
+		Payload: json.RawMessage(`{}`),
+	}
+	var acked atomic.Bool
+	h.manager.Dispatch(ctx, delivery(status, &acked))
+	waitFor(t, "the first question to be retired", acked.Load)
+	if first, _ := h.recorder.reply("c1"); !bytes.Contains(first.Result, []byte(`"close"`)) {
+		t.Fatalf("an unconnected session first reported %s", first.Result)
+	}
+
+	// The session comes up, and the same question arrives again.
+	if err := engineSession.Connect(ctx, engine.ConnectRequest{Pairing: "resume"}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	var ackedAgain atomic.Bool
+	h.manager.Dispatch(ctx, delivery(status, &ackedAgain))
+	waitFor(t, "the second question to be retired", ackedAgain.Load)
+
+	second, _ := h.recorder.reply("c1")
+	if !bytes.Contains(second.Result, []byte(`"open"`)) {
+		t.Fatalf("an open session reported %s, which is the answer from before it came up", second.Result)
+	}
+}
+
+// Nobody knows whether it already ran, and both of the other answers are wrong: running
+// it risks a second side effect, and refusing it reports a failure for a command that
+// may have worked. It is handed back instead, for whoever claims it next to ask again.
+func TestACommandWhoseRecordCannotBeReadIsHandedBackRatherThanRun(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	ctx := context.Background()
+	if _, err := h.manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, _ := h.engine.Session("s1")
+	h.ledger.refuse(errors.New("redis is unreachable"))
+
+	var acked, forfeited atomic.Bool
+	handed := delivery(&protocol.Command{
+		V: protocol.Version, ID: "c1", Type: protocol.CommandSessionLogout, SID: "s1", ReplyTo: "c1",
+		Payload: json.RawMessage(`{}`),
+	}, &acked)
+	handed.Forfeit = func() { forfeited.Store(true) }
+	h.manager.Dispatch(ctx, handed)
+
+	waitFor(t, "the command to be handed back", forfeited.Load)
+	if acked.Load() {
+		t.Fatal("a command nobody could tell had run was retired anyway")
+	}
+	if _, answered := h.recorder.reply("c1"); answered {
+		t.Fatal("a command nobody could tell had run was answered anyway")
+	}
+	if got := engineSession.LoggedOut(); got != 0 {
+		t.Fatalf("the account was logged out %d times on a record nobody could read", got)
+	}
+}
+
+// A command cut off by the session ending is not a command that failed. The reply would
+// go out on the same dead context and be dropped without a word, and acknowledging it
+// afterwards retires a send that may never have reached WhatsApp, with nobody told. It
+// is handed back for the next owner, which under the caller's own message id costs a
+// redelivery rather than a message.
+func TestACommandCutOffByTheSessionEndingIsHandedBack(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	ctx := context.Background()
+	if _, err := h.manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, _ := h.engine.Session("s1")
+	if err := engineSession.Connect(ctx, engine.ConnectRequest{Pairing: "resume"}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	release := engineSession.Hold()
+	defer release()
+
+	var acked, forfeited atomic.Bool
+	handed := delivery(&protocol.Command{
+		V: protocol.Version, ID: "c1", Type: protocol.CommandMessageSend, SID: "s1", ReplyTo: "c1",
+		Payload: json.RawMessage(`{"message_id":"m1","to":{"kind":"phone","id":"5511999999999"},"content":{"type":"text","body":"oi"}}`),
+	}, &acked)
+	handed.Forfeit = func() { forfeited.Store(true) }
+	h.manager.Dispatch(ctx, handed)
+
+	// In flight before the session is taken away, or the command never reaches the
+	// engine and the test proves only that a queued delivery is released.
+	waitFor(t, "the send to reach the engine", func() bool { return len(engineSession.Commands()) == 1 })
+	h.manager.Release(ctx, "s1")
+
+	waitFor(t, "the command to be handed back", forfeited.Load)
+	if acked.Load() {
+		t.Fatal("a send that was cut off mid-flight was retired anyway")
+	}
+	if _, answered := h.recorder.reply("c1"); answered {
+		t.Fatal("a send that was cut off mid-flight was answered on a dead context")
+	}
+}
+
+// The other side of that race: WhatsApp accepts the send in the same instant the lease
+// moves. The command worked and there is a record of it, so handing it back would be
+// wrong — but answering on the dying context drops the reply while the acknowledgement
+// retires the command, and the caller is left with nothing about a message that is
+// already in somebody's chat. The answer goes out detached, like the acknowledgement.
+func TestASendThatLandedAsTheSessionEndedIsStillAnswered(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	ctx := context.Background()
+	if _, err := h.manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, _ := h.engine.Session("s1")
+	if err := engineSession.Connect(ctx, engine.ConnectRequest{Pairing: "resume"}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	release := engineSession.HoldUntilCanceled()
+	defer release()
+
+	var acked, forfeited atomic.Bool
+	handed := delivery(&protocol.Command{
+		V: protocol.Version, ID: "c1", Type: protocol.CommandMessageSend, SID: "s1", ReplyTo: "c1",
+		Payload: json.RawMessage(`{"message_id":"m1","to":{"kind":"phone","id":"5511999999999"},"content":{"type":"text","body":"oi"}}`),
+	}, &acked)
+	handed.Forfeit = func() { forfeited.Store(true) }
+	h.manager.Dispatch(ctx, handed)
+
+	waitFor(t, "the send to reach the engine", func() bool { return len(engineSession.Commands()) == 1 })
+	h.manager.Release(ctx, "s1")
+
+	waitFor(t, "the send to be answered", func() bool { _, ok := h.recorder.reply("c1"); return ok })
+	reply, _ := h.recorder.reply("c1")
+	if !reply.OK {
+		t.Fatalf("a send that landed was answered with a failure: %+v", reply.Error)
+	}
+	if forfeited.Load() {
+		t.Fatal("a send that landed was handed back for another instance to send again")
+	}
+	if !acked.Load() {
+		t.Fatal("a send that landed and was answered was left pending")
+	}
+}
+
+// The side effect has already happened by the time the record is written, so the record
+// is the only thing left that can stop it happening again. A Redis that refuses one call
+// and answers the next is the common shape of a failure there, and giving up on the
+// first refusal spends the whole window on it.
+func TestARecordRefusedOnceIsStillWritten(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	ctx := context.Background()
+	if _, err := h.manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, _ := h.engine.Session("s1")
+	h.ledger.refuseWritesFor(2)
+
+	logout := &protocol.Command{
+		V: protocol.Version, ID: "c1", Type: protocol.CommandSessionLogout, SID: "s1", ReplyTo: "c1",
+		Payload: json.RawMessage(`{}`),
+	}
+	var acked atomic.Bool
+	h.manager.Dispatch(ctx, delivery(logout, &acked))
+	waitFor(t, "the logout to be retired", acked.Load)
+	if got := h.ledger.attempts(); got < 3 {
+		t.Fatalf("the record was attempted %d times, want the refusals to have been tried past", got)
+	}
+
+	// The same frame again, which is what the transport hands back. It is answered from
+	// the record the retry managed to write.
+	var ackedAgain atomic.Bool
+	h.manager.Dispatch(ctx, delivery(logout, &ackedAgain))
+	waitFor(t, "the redelivery to be retired", ackedAgain.Load)
+	if got := engineSession.LoggedOut(); got != 1 {
+		t.Fatalf("the account was logged out %d times, want once", got)
 	}
 }

@@ -15,6 +15,7 @@
 //	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveResume
 //	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveHangUpAndBack
 //	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveListen
+//	WAC_LIVE_TO=<number> go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveSend
 //	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveLogout
 //
 // The store is deliberately not a t.TempDir: resuming is the thing being checked, and
@@ -209,6 +210,72 @@ func TestLiveListen(t *testing.T) {
 	if state := session.state(); state != "open" {
 		t.Fatalf("the session did not stay up: state=%s", state)
 	}
+}
+
+// TestLiveSend sends a text from the paired account, which is the half no fake can
+// check: what a unit test can prove is that the request was built and refused
+// correctly, and what only WhatsApp can answer is whether it took the message.
+//
+// Send twice with the same WAC_LIVE_MESSAGE_ID to see the idempotency for yourself. The
+// caller names the message, so both sends go out under one id and the recipient's own
+// client shows one message. That last part is on the phone, not in here.
+func TestLiveSend(t *testing.T) {
+	to := os.Getenv("WAC_LIVE_TO")
+	if to == "" {
+		t.Skip("set WAC_LIVE_TO to the number this account should send to")
+	}
+
+	session, _ := liveSession(t)
+	events := watch(t, session)
+
+	if err := session.Connect(t.Context(), engine.ConnectRequest{Pairing: "resume"}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	events.awaitState(t, "open", 2*time.Minute)
+
+	messageID := os.Getenv("WAC_LIVE_MESSAGE_ID")
+	if messageID == "" {
+		messageID = session.current().GenerateMessageID()
+	}
+	body := map[string]any{
+		"message_id": messageID,
+		"to":         map[string]any{"kind": "phone", "id": to},
+		"content":    map[string]any{"type": "text", "body": "conector nativo, fatia de envio"},
+	}
+	if quoted := os.Getenv("WAC_LIVE_QUOTE"); quoted != "" {
+		// The half no unit test can answer: the quote goes out as a stanza id and a
+		// participant, with no copy of the message it answers, because the caller does
+		// not send one and this connector keeps no messages. Whether the recipient's
+		// client renders it from the id alone is a question for a phone.
+		body["quoted"] = map[string]any{"id": quoted, "from_me": false}
+		body["content"] = map[string]any{"type": "text", "body": "conector nativo, respondendo a mensagem acima"}
+	}
+	payload, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("build the send: %v", err)
+	}
+
+	result, err := session.Execute(t.Context(), &protocol.Command{
+		Type: protocol.CommandMessageSend, Payload: payload,
+	})
+	if err != nil {
+		t.Fatalf("message.send: %v", err)
+	}
+
+	var sent struct {
+		MessageID string `json:"message_id"`
+		Timestamp int64  `json:"timestamp"`
+	}
+	if err := json.Unmarshal(result, &sent); err != nil {
+		t.Fatalf("unmarshal the result: %v", err)
+	}
+	if sent.MessageID != messageID {
+		t.Fatalf("the send came back as %q, and the caller named it %q", sent.MessageID, messageID)
+	}
+	if sent.Timestamp == 0 {
+		t.Fatal("the send came back without the timestamp WhatsApp stamped it with")
+	}
+	fmt.Fprintf(os.Stderr, "sent %s at %s\n", sent.MessageID, time.UnixMilli(sent.Timestamp))
 }
 
 // TestLiveLogout unlinks the device. It is the last phase, and running it means the

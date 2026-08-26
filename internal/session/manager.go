@@ -28,6 +28,7 @@ type Manager struct {
 	leases    *cluster.Leases
 	publisher transport.Publisher
 	replier   transport.Replier
+	ledger    Ledger
 	newID     IDFunc
 	now       func() time.Time
 	log       zerolog.Logger
@@ -55,9 +56,12 @@ type ManagerConfig struct {
 	Leases    *cluster.Leases
 	Publisher transport.Publisher
 	Replier   transport.Replier
-	NewID     IDFunc
-	Now       func() time.Time
-	Logger    zerolog.Logger
+	// Ledger is where a command's outcome is remembered. Leaving it out turns the
+	// idempotency invariant off, which only a test that is not exercising it should do.
+	Ledger Ledger
+	NewID  IDFunc
+	Now    func() time.Time
+	Logger zerolog.Logger
 }
 
 // NewManager returns a manager owning no sessions yet.
@@ -71,6 +75,7 @@ func NewManager(cfg *ManagerConfig) *Manager {
 		leases:    cfg.Leases,
 		publisher: cfg.Publisher,
 		replier:   cfg.Replier,
+		ledger:    cfg.Ledger,
 		newID:     cfg.NewID,
 		now:       cfg.Now,
 		log:       cfg.Logger,
@@ -163,7 +168,8 @@ func (m *Manager) Adopt(ctx context.Context, sid string) (*Session, error) {
 	// drops it. Sessions end when StopAll or a lost lease ends them, and nothing else.
 	session := New(context.WithoutCancel(ctx), &Config{
 		Instance: m.instance, Lease: lease, Leases: m.leases, Engine: engineSession,
-		Publisher: m.publisher, Replier: m.replier, NewID: m.newID, Now: m.now, Logger: m.log,
+		Publisher: m.publisher, Replier: m.replier, Ledger: m.ledger,
+		NewID: m.newID, Now: m.now, Logger: m.log,
 	})
 
 	m.mu.Lock()

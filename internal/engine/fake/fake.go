@@ -86,7 +86,11 @@ type Session struct {
 	events    chan engine.Emission
 	closed    bool
 	connected bool
+	loggedOut int
 	commands  []protocol.Command
+	held      chan struct{}
+
+	heldSucceeds bool
 }
 
 func newSession(sid string) *Session {
@@ -141,9 +145,18 @@ func (s *Session) Disconnect(_ context.Context) error {
 func (s *Session) Logout(_ context.Context) error {
 	s.mu.Lock()
 	s.connected = false
+	s.loggedOut++
 	s.mu.Unlock()
 	s.emit(protocol.EventSessionLoggedOut, map[string]any{"reason": "logout_requested"})
 	return nil
+}
+
+// LoggedOut counts how many times the account was unlinked, which is what a test
+// asserting a command ran once rather than twice looks at.
+func (s *Session) LoggedOut() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.loggedOut
 }
 
 // Connected reports whether Connect has run and nothing has taken it back.
@@ -164,11 +177,28 @@ func (s *Session) Commands() []protocol.Command {
 // names. Anything it does not know is refused rather than answered with a guess: a
 // fake that invents a result shape is a test that passes against a contract nobody
 // implements.
-func (s *Session) Execute(_ context.Context, command *protocol.Command) (json.RawMessage, error) {
+func (s *Session) Execute(ctx context.Context, command *protocol.Command) (json.RawMessage, error) {
 	s.mu.Lock()
 	s.commands = append(s.commands, *command)
 	connected := s.connected
+	held := s.held
 	s.mu.Unlock()
+
+	if held != nil {
+		// In flight, which is the state a real send spends most of its time in. What
+		// comes back when the context dies under it is the context's own error, the way
+		// whatsmeow reports a call that was cut off rather than answered.
+		select {
+		case <-held:
+		case <-ctx.Done():
+			if !s.holdSucceeds() {
+				return nil, ctx.Err()
+			}
+			// Held the other way: the send landed in the same instant the context died,
+			// which is the race a caller cannot be left out of. Falls through to the
+			// ordinary result.
+		}
+	}
 
 	switch command.Type {
 	case protocol.CommandSessionStatus:
@@ -198,6 +228,35 @@ func (s *Session) Execute(_ context.Context, command *protocol.Command) (json.Ra
 	default:
 		return nil, engine.ErrNotSupported
 	}
+}
+
+// Hold makes every later Execute wait before it does anything, until the returned
+// function is called or the command's context ends. It is how a test puts a command in
+// flight and then takes the session away underneath it.
+func (s *Session) Hold() func() { return s.hold(false) }
+
+// HoldUntilCanceled is Hold for the other side of that race: the command is in flight,
+// the context dies, and the work turns out to have landed anyway. It is what a send
+// WhatsApp accepted in the same instant the lease moved looks like from here.
+func (s *Session) HoldUntilCanceled() func() { return s.hold(true) }
+
+func (s *Session) hold(succeeds bool) func() {
+	release := make(chan struct{})
+	s.mu.Lock()
+	s.held, s.heldSucceeds = release, succeeds
+	s.mu.Unlock()
+	return sync.OnceFunc(func() {
+		s.mu.Lock()
+		s.held = nil
+		s.mu.Unlock()
+		close(release)
+	})
+}
+
+func (s *Session) holdSucceeds() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.heldSucceeds
 }
 
 // Events is the emission channel. It is closed by Close.

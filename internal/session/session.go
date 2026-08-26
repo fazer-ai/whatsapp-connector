@@ -31,6 +31,7 @@ type Session struct {
 	engine    engine.Session
 	publisher transport.Publisher
 	replier   transport.Replier
+	ledger    Ledger
 	newID     IDFunc
 	now       func() time.Time
 	log       zerolog.Logger
@@ -61,6 +62,7 @@ type Config struct {
 	Engine    engine.Session
 	Publisher transport.Publisher
 	Replier   transport.Replier
+	Ledger    Ledger
 	NewID     IDFunc
 	Now       func() time.Time
 	Logger    zerolog.Logger
@@ -90,6 +92,7 @@ func New(ctx context.Context, cfg *Config) *Session {
 		leases:    cfg.Leases,
 		engine:    cfg.Engine,
 		publisher: cfg.Publisher,
+		ledger:    cfg.Ledger,
 		replier:   cfg.Replier,
 		newID:     cfg.NewID,
 		now:       cfg.Now,
@@ -287,6 +290,16 @@ func (s *Session) abandonPending(events <-chan engine.Emission) {
 	}
 }
 
+// Ledger remembers what a command did, so a redelivery is answered with the first
+// run's result instead of carrying it out a second time. Invariant 5 in AGENTS.md is
+// this and nothing else.
+type Ledger interface {
+	// Recall answers what a command with this key did, and whether it ran at all.
+	Recall(ctx context.Context, sid, key string) (json.RawMessage, bool, error)
+	// Remember records what a command did, without overwriting an earlier answer.
+	Remember(ctx context.Context, sid, key string, result json.RawMessage) error
+}
+
 // errStopped is what an emission this pump stopped before publishing settles with.
 var errStopped = errors.New("session: the pump stopped before the event was published")
 
@@ -332,21 +345,45 @@ func (s *Session) run(ctx context.Context, delivery *transport.Delivery) {
 	log := s.log.With().Str("cmd_id", command.ID).Str("type", string(command.Type)).Logger()
 
 	result, err := s.carryOut(ctx, &command)
-	s.answer(ctx, &command, result, err)
-
-	// Acknowledged either way, and on a deadline of its own. A command that failed has
-	// been answered, and leaving it pending would have another instance run it again
-	// after this one restarts, which for a send is a duplicate message rather than a
-	// retry.
+	if errors.Is(err, errUnknownWhetherItRan) {
+		// Neither answered nor retired: nobody knows whether this already ran, and both of
+		// the other choices are wrong. Handed back so whoever claims it next can ask again
+		// once the record is readable.
+		log.Warn().Err(err).Msg("gave a command back rather than risk carrying it out twice")
+		forfeit(delivery)
+		return
+	}
+	if err != nil && ctx.Err() != nil {
+		// The session went away underneath this command: the lease moved, or the process
+		// is coming down. What failed is this instance's turn at it, not the command, and
+		// the reply would go out on the same dead context and be dropped without a word,
+		// leaving the caller with nothing and the entry retired.
+		//
+		// Handed back instead, which is the same trade invariant 4 makes for events: a
+		// send that was cut off may already be in somebody's chat, and the next owner
+		// resends under the id the caller picked, so the cost is a redelivery WhatsApp
+		// discards rather than a message nobody ever hears about again.
+		log.Warn().Err(err).Msg("gave a command back after the session ended under it")
+		forfeit(delivery)
+		return
+	}
+	// The answer and the acknowledgement both go out detached from the session's
+	// context, because this session is exactly what may have just ended. The work is
+	// over by this point and what is left has to happen: a send can succeed in the same
+	// instant the lease moves, and answering that on the dying context drops the reply
+	// while the acknowledgement retires the command, leaving the caller with nothing
+	// about a message that is already in somebody's chat.
 	//
-	// Detached from the session's context because this session is exactly what may have
-	// just ended. An acknowledgement refused for the cancellation leaves the entry marked
-	// as being carried out here, on purpose, so a reclaim does not run it twice: every
-	// later claim then skips it, and if this same instance adopts the session again the
-	// marker is still standing. The command is neither retired nor retried until the
-	// process restarts. The work is over by this point; what is left has to happen.
+	// Acknowledged whether the command worked or not. A command that failed has been
+	// answered, and leaving it pending would have another instance run it again after
+	// this one restarts, which for a send is a duplicate message rather than a retry.
+	// An acknowledgement refused anyway leaves the entry marked as being carried out
+	// here, on purpose, so a reclaim does not run it twice: every later claim then skips
+	// it, and if this same instance adopts the session again the marker is still
+	// standing. The command is neither retired nor retried until the process restarts.
 	retire, cancel := context.WithTimeout(context.WithoutCancel(ctx), ackTimeout)
 	defer cancel()
+	s.answer(retire, &command, result, err)
 	if ackErr := delivery.Ack(retire); ackErr != nil {
 		log.Error().Err(ackErr).Msg("failed to acknowledge a command")
 	}
@@ -362,13 +399,171 @@ func (s *Session) carryOut(ctx context.Context, command *protocol.Command) (json
 		return nil, protocol.NewError(protocol.ErrorExpired, "the command deadline passed before it was reached")
 	}
 
+	key := idempotencyKey(command)
+	result, done, err := s.alreadyDid(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	if done {
+		// Only successes are remembered, so a recalled command is one that worked.
+		return result, nil
+	}
+
 	execCtx := ctx
 	if command.Deadline > 0 {
 		var cancel context.CancelFunc
 		execCtx, cancel = context.WithDeadline(ctx, time.UnixMilli(command.Deadline))
 		defer cancel()
 	}
-	return s.lifecycle(execCtx, command)
+
+	result, err = s.lifecycle(execCtx, command)
+	if err == nil && key != "" && s.ledger != nil {
+		// Only a success is remembered. A failure is the caller's to try again, and a
+		// remembered one would answer every later attempt with the same refusal.
+		//
+		// Written after the fact and not reserved before it, because a reservation
+		// cannot be resolved: an entry saying an attempt was made says nothing about
+		// whether it landed, so an instance reclaiming the command would have to choose
+		// between dropping a message that never went out and sending one that already
+		// did. What covers that window is the caller naming the message, so a resend
+		// carries the id the first attempt used.
+		// On a context of its own, because the command's deadline may have run out in
+		// the same instant the work finished, and a record that is not written is a
+		// command that gets carried out again.
+		//
+		// Tried more than once, because the side effect has already happened and this is
+		// the only thing left that can stop it happening again. A Redis that refuses one
+		// call and answers the next is the common shape of a failure here, and giving up
+		// on the first refusal spends the whole window on it.
+		//
+		// A failure that outlasts the attempts is logged and the command is still
+		// answered and retired, which is the one place this layer knowingly leaves a
+		// window. Giving the delivery back instead would not close it: the side effect
+		// has already happened, so the redelivery would find no record and do it a
+		// second time, turning a risk into a certainty. What covers what is left is the
+		// caller naming the message.
+		s.remember(ctx, command, key, result)
+	}
+	return result, err
+}
+
+// remember writes the record of a command that ran, and keeps trying inside a bounded
+// window rather than giving up on the first refusal.
+//
+// Detached from the command's context, because its deadline may have run out in the
+// same instant the work finished, and a record that is not written is a command that
+// gets carried out again. Bounded all the same: this runs on the session's executor, so
+// every attempt is a command behind it that is not running.
+func (s *Session) remember(ctx context.Context, command *protocol.Command, key string, result json.RawMessage) {
+	write, cancel := context.WithTimeout(context.WithoutCancel(ctx), ledgerWindow)
+	defer cancel()
+
+	var err error
+	for attempt := range ledgerAttempts {
+		if attempt > 0 {
+			select {
+			case <-write.Done():
+				// Out of window. The error from the last attempt is what gets reported.
+			case <-time.After(ledgerBackoff):
+			}
+			if write.Err() != nil {
+				break
+			}
+		}
+		if err = s.ledger.Remember(write, s.sid, key, result); err == nil {
+			return
+		}
+	}
+	s.log.Error().Err(err).Str("cmd_id", command.ID).Str("key", key).
+		Msg("carried a command out and could not record it; a redelivery will do it again")
+}
+
+// ledgerWindow bounds the whole of that, and ledgerAttempts and ledgerBackoff divide it
+// up. Short in total for the same reason a single read is: the record sits in the same
+// Redis the command arrived through, so one that is not answering promptly is one
+// nothing else is getting through either, and the window is time the session spends not
+// running the commands behind this one.
+const (
+	ledgerWindow   = 5 * time.Second
+	ledgerAttempts = 3
+	ledgerBackoff  = 200 * time.Millisecond
+)
+
+// ledgerTimeout bounds a read or a write of the record. It is short because the record
+// sits in the same Redis the command arrived through: one that is not answering
+// promptly is one nothing else is getting through either.
+const ledgerTimeout = 3 * time.Second
+
+// errUnknownWhetherItRan is what a command whose record cannot be read answers with. It
+// never reaches a caller: the delivery is handed back instead, so whoever claims it next
+// can ask again once Redis is answering.
+var errUnknownWhetherItRan = errors.New("session: cannot tell whether the command has already run")
+
+// alreadyDid answers a command this session has already carried out.
+//
+// A record that cannot be read is not a record saying no. Running the command anyway
+// would carry out a side effect whose first outcome is unknown, which is the one thing
+// invariant 5 forbids, so the command is neither run nor refused: it is handed back for
+// another claim. The store is the same Redis the command arrived through, so one that
+// cannot answer this is one the reply and the acknowledgement would not reach either,
+// and the delivery was coming round again regardless.
+func (s *Session) alreadyDid(ctx context.Context, key string) (json.RawMessage, bool, error) {
+	if key == "" || s.ledger == nil {
+		return nil, false, nil
+	}
+	read, cancel := context.WithTimeout(ctx, ledgerTimeout)
+	defer cancel()
+
+	result, found, err := s.ledger.Recall(read, s.sid, key)
+	if err != nil {
+		return nil, false, fmt.Errorf("%w: %w", errUnknownWhetherItRan, err)
+	}
+	if !found {
+		return nil, false, nil
+	}
+	s.log.Info().Str("key", key).Msg("answered a redelivered command with what the first one did")
+	return result, true, nil
+}
+
+// idempotencyKey is what a command is remembered under, and the empty string for one
+// that names nothing to be remembered by.
+//
+// A command that names the message it is about to put on the wire is keyed by it,
+// which is the contract's `msg:<message_id>`: the caller picks the id, so every
+// redelivery of that command names the same one, and so does a resend the caller makes
+// of its own accord. Everything else is keyed by the `idempotency_key` the frame
+// carries, which is a field of the command and not of its payload.
+func idempotencyKey(command *protocol.Command) string {
+	if !command.ChangesSomething() {
+		// A question, and the answer is only worth having if it is current. Answering a
+		// redelivered `session.status` from a record would report the state the session
+		// was in when it was first asked.
+		return ""
+	}
+	// Only where the id is the command's own creation. `message.download_media` also
+	// carries a `message_id`, and there it names a message somebody else's command
+	// created, so keying by it would answer a download with the result of the send.
+	if command.Type.NamesItsOwnMessage() {
+		var body struct {
+			MessageID string `json:"message_id"`
+		}
+		if err := json.Unmarshal(command.Payload, &body); err == nil && body.MessageID != "" {
+			return "msg:" + body.MessageID
+		}
+	}
+	if command.IdempotencyKey != "" {
+		// Prefixed, because the caller picks this string and the schema takes any: one
+		// reading `msg:m1` on a logout would be answered from the record of the send of
+		// m1, and report an account unlinked that is still paired.
+		return "idem:" + command.IdempotencyKey
+	}
+	// Neither, which the contract's own `session.logout` fixture is. The command's id
+	// is what is left, and it is enough for the redelivery this exists to stop: the
+	// transport hands back the same entry, so the same frame arrives carrying the same
+	// id. A client that sends a second command of its own gets a new id and is not
+	// covered, which is what `idempotency_key` is for. Prefixed for the same reason as
+	// above: a command id is a caller's string too.
+	return "cmd:" + command.ID
 }
 
 // The three lifecycle commands go to the engine's own methods rather than through

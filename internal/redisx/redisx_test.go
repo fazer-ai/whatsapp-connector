@@ -2,6 +2,7 @@ package redisx_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -145,5 +146,115 @@ func TestPingReachesTheServer(t *testing.T) {
 	client := newTestClient(t, 8)
 	if err := client.Ping(context.Background(), time.Second); err != nil {
 		t.Fatalf("Ping: %v", err)
+	}
+}
+
+// A command with no result still ran, and answering that is the point: `null` and
+// "never happened" are the same bytes on the way out and not the same thing.
+func TestARememberedCommandWithNoResultIsStillRemembered(t *testing.T) {
+	t.Parallel()
+
+	client := newTestClient(t, 8)
+	ledger := redisx.NewIdempotency(client, time.Minute)
+	ctx := context.Background()
+
+	if _, found, err := ledger.Recall(ctx, "s1", "msg:3EB0"); err != nil || found {
+		t.Fatalf("a command nobody ran came back as found=%v, err=%v", found, err)
+	}
+	if err := ledger.Remember(ctx, "s1", "msg:3EB0", nil); err != nil {
+		t.Fatalf("Remember: %v", err)
+	}
+	result, found, err := ledger.Recall(ctx, "s1", "msg:3EB0")
+	if err != nil {
+		t.Fatalf("Recall: %v", err)
+	}
+	if !found {
+		t.Fatal("a command that was remembered came back as one that never ran")
+	}
+	if len(result) != 0 {
+		t.Fatalf("a command with no result came back carrying %s", result)
+	}
+}
+
+// The first run is the one every redelivery has to be answered with, or two answers to
+// one command disagree about what it did.
+func TestRememberingACommandTwiceKeepsTheFirstAnswer(t *testing.T) {
+	t.Parallel()
+
+	client := newTestClient(t, 8)
+	ledger := redisx.NewIdempotency(client, time.Minute)
+	ctx := context.Background()
+
+	if err := ledger.Remember(ctx, "s1", "msg:3EB0", json.RawMessage(`{"timestamp":1}`)); err != nil {
+		t.Fatalf("Remember: %v", err)
+	}
+	if err := ledger.Remember(ctx, "s1", "msg:3EB0", json.RawMessage(`{"timestamp":2}`)); err != nil {
+		t.Fatalf("Remember again: %v", err)
+	}
+
+	result, _, err := ledger.Recall(ctx, "s1", "msg:3EB0")
+	if err != nil {
+		t.Fatalf("Recall: %v", err)
+	}
+	if string(result) != `{"timestamp":1}` {
+		t.Fatalf("the second answer overwrote the first: %s", result)
+	}
+}
+
+// One session's record must not answer another's: the key is the caller's message id,
+// and two sessions naming the same message are two different sends.
+func TestARecordBelongsToOneSession(t *testing.T) {
+	t.Parallel()
+
+	client := newTestClient(t, 8)
+	ledger := redisx.NewIdempotency(client, time.Minute)
+	ctx := context.Background()
+
+	if err := ledger.Remember(ctx, "s1", "msg:3EB0", json.RawMessage(`{"timestamp":1}`)); err != nil {
+		t.Fatalf("Remember: %v", err)
+	}
+	if _, found, err := ledger.Recall(ctx, "s2", "msg:3EB0"); err != nil || found {
+		t.Fatalf("another session's send came back as already done (found=%v, err=%v)", found, err)
+	}
+}
+
+// The record and the entry it answers for run on independent clocks: the record expires
+// a fixed time after the command ran, and the entry stays pending for as long as
+// acknowledgements keep failing and peers keep reclaiming it. Being asked about is what
+// ties them together — an entry still being handed around is one somebody is still
+// asking about, and the record has to outlive it or the next reclaim runs the side
+// effect a second time.
+func TestARecordStillBeingAskedAboutIsKept(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+
+	const ttl = time.Minute
+	ledger := redisx.NewIdempotency(client, ttl)
+	ctx := context.Background()
+
+	if err := ledger.Remember(ctx, "s1", "msg:3EB0", json.RawMessage(`{"ok":true}`)); err != nil {
+		t.Fatalf("Remember: %v", err)
+	}
+
+	// Most of the way to expiry, which is where a long redelivery lands.
+	server.FastForward(ttl - 5*time.Second)
+	if _, found, err := ledger.Recall(ctx, "s1", "msg:3EB0"); err != nil || !found {
+		t.Fatalf("the record came back as found=%v, err=%v", found, err)
+	}
+
+	// Past where it would have expired on the original clock.
+	server.FastForward(10 * time.Second)
+	if _, found, err := ledger.Recall(ctx, "s1", "msg:3EB0"); err != nil || !found {
+		t.Fatalf("a record asked about a moment before it expired was let go anyway (found=%v, err=%v)", found, err)
+	}
+
+	// And it is an extension, not a lease that never ends: nothing asks, it goes.
+	server.FastForward(ttl + time.Second)
+	if _, found, err := ledger.Recall(ctx, "s1", "msg:3EB0"); err != nil || found {
+		t.Fatalf("a record nobody asked about outlived its own expiry (found=%v, err=%v)", found, err)
 	}
 }
