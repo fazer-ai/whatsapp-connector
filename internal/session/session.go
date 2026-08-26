@@ -345,6 +345,14 @@ func (s *Session) run(ctx context.Context, delivery *transport.Delivery) {
 	log := s.log.With().Str("cmd_id", command.ID).Str("type", string(command.Type)).Logger()
 
 	result, err := s.carryOut(ctx, &command)
+	if errors.Is(err, errUnknownWhetherItRan) {
+		// Neither answered nor retired: nobody knows whether this already ran, and both of
+		// the other choices are wrong. Handed back so whoever claims it next can ask again
+		// once the record is readable.
+		log.Warn().Err(err).Msg("gave a command back rather than risk carrying it out twice")
+		forfeit(delivery)
+		return
+	}
 	s.answer(ctx, &command, result, err)
 
 	// Acknowledged either way, and on a deadline of its own. A command that failed has
@@ -376,7 +384,11 @@ func (s *Session) carryOut(ctx context.Context, command *protocol.Command) (json
 	}
 
 	key := idempotencyKey(command)
-	if result, ok := s.alreadyDid(ctx, key); ok {
+	result, done, err := s.alreadyDid(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	if done {
 		// Only successes are remembered, so a recalled command is one that worked.
 		return result, nil
 	}
@@ -388,7 +400,7 @@ func (s *Session) carryOut(ctx context.Context, command *protocol.Command) (json
 		defer cancel()
 	}
 
-	result, err := s.lifecycle(execCtx, command)
+	result, err = s.lifecycle(execCtx, command)
 	if err == nil && key != "" && s.ledger != nil {
 		// Only a success is remembered. A failure is the caller's to try again, and a
 		// remembered one would answer every later attempt with the same refusal.
@@ -399,32 +411,59 @@ func (s *Session) carryOut(ctx context.Context, command *protocol.Command) (json
 		// between dropping a message that never went out and sending one that already
 		// did. What covers that window is the caller naming the message, so a resend
 		// carries the id the first attempt used.
-		if err := s.ledger.Remember(context.WithoutCancel(ctx), s.sid, key, result); err != nil {
-			s.log.Warn().Err(err).Str("cmd_id", command.ID).
-				Msg("could not remember a command that was carried out")
+		// On a context of its own, because the command's deadline may have run out in
+		// the same instant the work finished, and a record that is not written is a
+		// command that gets carried out again.
+		//
+		// A failure here is logged and the command is still answered and retired, which
+		// is the one place this layer knowingly leaves a window. Giving the delivery back
+		// instead would not close it: the side effect has already happened, so the
+		// redelivery would find no record and do it a second time, turning a risk into a
+		// certainty. What covers it is the caller naming the message.
+		record, cancel := context.WithTimeout(context.WithoutCancel(ctx), ledgerTimeout)
+		defer cancel()
+		if err := s.ledger.Remember(record, s.sid, key, result); err != nil {
+			s.log.Error().Err(err).Str("cmd_id", command.ID).Str("key", key).
+				Msg("carried a command out and could not record it; a redelivery will do it again")
 		}
 	}
 	return result, err
 }
 
-// alreadyDid answers a command this session has already carried out. A Redis that
-// cannot be read is not an answer, so the command runs: doing it twice is the thing
-// this is for, and refusing every command whenever the record is unreachable would
-// stop the connector over the bookkeeping rather than over the work.
-func (s *Session) alreadyDid(ctx context.Context, key string) (json.RawMessage, bool) {
+// ledgerTimeout bounds a read or a write of the record. It is short because the record
+// sits in the same Redis the command arrived through: one that is not answering
+// promptly is one nothing else is getting through either.
+const ledgerTimeout = 3 * time.Second
+
+// errUnknownWhetherItRan is what a command whose record cannot be read answers with. It
+// never reaches a caller: the delivery is handed back instead, so whoever claims it next
+// can ask again once Redis is answering.
+var errUnknownWhetherItRan = errors.New("session: cannot tell whether the command has already run")
+
+// alreadyDid answers a command this session has already carried out.
+//
+// A record that cannot be read is not a record saying no. Running the command anyway
+// would carry out a side effect whose first outcome is unknown, which is the one thing
+// invariant 5 forbids, so the command is neither run nor refused: it is handed back for
+// another claim. The store is the same Redis the command arrived through, so one that
+// cannot answer this is one the reply and the acknowledgement would not reach either,
+// and the delivery was coming round again regardless.
+func (s *Session) alreadyDid(ctx context.Context, key string) (json.RawMessage, bool, error) {
 	if key == "" || s.ledger == nil {
-		return nil, false
+		return nil, false, nil
 	}
-	result, found, err := s.ledger.Recall(ctx, s.sid, key)
+	read, cancel := context.WithTimeout(ctx, ledgerTimeout)
+	defer cancel()
+
+	result, found, err := s.ledger.Recall(read, s.sid, key)
 	if err != nil {
-		s.log.Warn().Err(err).Str("key", key).Msg("could not read whether a command had already run")
-		return nil, false
+		return nil, false, fmt.Errorf("%w: %w", errUnknownWhetherItRan, err)
 	}
 	if !found {
-		return nil, false
+		return nil, false, nil
 	}
 	s.log.Info().Str("key", key).Msg("answered a redelivered command with what the first one did")
-	return result, true
+	return result, true, nil
 }
 
 // idempotencyKey is what a command is remembered under, and the empty string for one
@@ -435,13 +474,27 @@ func (s *Session) alreadyDid(ctx context.Context, key string) (json.RawMessage, 
 // names the same one. Everything else is keyed by the `idempotency_key` the frame
 // carries, which is a field of the command and not of its payload.
 func idempotencyKey(command *protocol.Command) string {
+	if !command.Type.ChangesSomething() {
+		// A question, and the answer is only worth having if it is current. Answering a
+		// redelivered `session.status` from a record would report the state the session
+		// was in when it was first asked.
+		return ""
+	}
 	var body struct {
 		MessageID string `json:"message_id"`
 	}
 	if err := json.Unmarshal(command.Payload, &body); err == nil && body.MessageID != "" {
 		return "msg:" + body.MessageID
 	}
-	return command.IdempotencyKey
+	if command.IdempotencyKey != "" {
+		return command.IdempotencyKey
+	}
+	// Neither, which the contract's own `session.logout` fixture is. The command's id
+	// is what is left, and it is enough for the redelivery this exists to stop: the
+	// transport hands back the same entry, so the same frame arrives carrying the same
+	// id. A client that sends a second command of its own gets a new id and is not
+	// covered, which is what `idempotency_key` is for.
+	return "cmd:" + command.ID
 }
 
 // The three lifecycle commands go to the engine's own methods rather than through

@@ -1,9 +1,11 @@
 package session_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"sync"
@@ -102,7 +104,43 @@ type harness struct {
 	leases   *cluster.Leases
 	engine   *fake.Engine
 	recorder *recorder
+	ledger   *ledger
 	manager  *session.Manager
+}
+
+// ledger is the harness's idempotency store, with a switch for the tests that need one
+// nothing can read. A Redis that is up and a Redis that answers are different things,
+// and only the second one is an answer about whether a command already ran.
+type ledger struct {
+	inner *redisx.Idempotency
+	mu    sync.Mutex
+	err   error
+}
+
+func (l *ledger) refuse(err error) {
+	l.mu.Lock()
+	l.err = err
+	l.mu.Unlock()
+}
+
+func (l *ledger) refusal() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.err
+}
+
+func (l *ledger) Recall(ctx context.Context, sid, key string) (json.RawMessage, bool, error) {
+	if err := l.refusal(); err != nil {
+		return nil, false, err
+	}
+	return l.inner.Recall(ctx, sid, key)
+}
+
+func (l *ledger) Remember(ctx context.Context, sid, key string, result json.RawMessage) error {
+	if err := l.refusal(); err != nil {
+		return err
+	}
+	return l.inner.Remember(ctx, sid, key, result)
 }
 
 func newHarness(t *testing.T) harness {
@@ -118,15 +156,16 @@ func newHarness(t *testing.T) harness {
 
 	// Minted from the pump goroutine while the test reads what it published, so the
 	// counter is atomic like every other cross-goroutine value here.
+	book := &ledger{inner: redisx.NewIdempotency(client, 0)}
 	var ids atomic.Int64
 	manager := session.NewManager(&session.ManagerConfig{
 		Instance: "inst-a", Engine: fakeEngine, Leases: leases, Publisher: rec, Replier: rec,
-		Ledger: redisx.NewIdempotency(client, 0),
+		Ledger: book,
 		NewID:  func() string { return "evt-" + strconv.FormatInt(ids.Add(1), 10) },
 		Logger: zerolog.Nop(),
 	})
 	t.Cleanup(func() { manager.StopAll(context.Background()) })
-	return harness{leases: leases, engine: fakeEngine, recorder: rec, manager: manager}
+	return harness{leases: leases, engine: fakeEngine, recorder: rec, ledger: book, manager: manager}
 }
 
 func delivery(cmd *protocol.Command, acked *atomic.Bool) *transport.Delivery {
@@ -1647,5 +1686,112 @@ func TestACommandIsKeyedByWhateverNamesItOnlyOnce(t *testing.T) {
 	}
 	if got := engineSession.LoggedOut(); got != 1 {
 		t.Fatalf("the account was logged out %d times, want once", got)
+	}
+}
+
+// The contract's own session.logout fixture carries no idempotency_key, so a layer that
+// keys only on one leaves the command it most needs to cover uncovered. The command's
+// id is what is left, and it is enough for a transport redelivery: the same entry comes
+// back carrying the same frame.
+func TestASideEffectWithNoKeyOfItsOwnIsKeyedByTheCommandItArrivedAs(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	ctx := context.Background()
+	if _, err := h.manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, _ := h.engine.Session("s1")
+
+	// The same frame twice, which is what the transport hands back: same id, same
+	// reply address. Each delivery is waited on through its own acknowledgement,
+	// because the reply is written to the same place both times and seeing one there
+	// says nothing about which delivery put it there.
+	logout := &protocol.Command{
+		V: protocol.Version, ID: "c1", Type: protocol.CommandSessionLogout, SID: "s1", ReplyTo: "c1",
+		Payload: json.RawMessage(`{}`),
+	}
+	for i := range 2 {
+		var acked atomic.Bool
+		h.manager.Dispatch(ctx, delivery(logout, &acked))
+		waitFor(t, fmt.Sprintf("delivery %d to be retired", i+1), acked.Load)
+	}
+
+	if got := engineSession.LoggedOut(); got != 1 {
+		t.Fatalf("the account was logged out %d times, want once", got)
+	}
+}
+
+// A question has to be asked again. Answering a redelivered session.status from a
+// record reports the state the session was in when it was first asked, which is the one
+// answer that is certainly stale.
+func TestAQuestionIsAskedAgainRatherThanAnsweredFromARecord(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	ctx := context.Background()
+	if _, err := h.manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, _ := h.engine.Session("s1")
+
+	// The same frame twice, so a layer that keyed questions as well as side effects
+	// would have the second one answered from the first one's record.
+	status := &protocol.Command{
+		V: protocol.Version, ID: "c1", Type: protocol.CommandSessionStatus, SID: "s1", ReplyTo: "c1",
+		Payload: json.RawMessage(`{}`),
+	}
+	var acked atomic.Bool
+	h.manager.Dispatch(ctx, delivery(status, &acked))
+	waitFor(t, "the first question to be retired", acked.Load)
+	if first, _ := h.recorder.reply("c1"); !bytes.Contains(first.Result, []byte(`"close"`)) {
+		t.Fatalf("an unconnected session first reported %s", first.Result)
+	}
+
+	// The session comes up, and the same question arrives again.
+	if err := engineSession.Connect(ctx, engine.ConnectRequest{Pairing: "resume"}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	var ackedAgain atomic.Bool
+	h.manager.Dispatch(ctx, delivery(status, &ackedAgain))
+	waitFor(t, "the second question to be retired", ackedAgain.Load)
+
+	second, _ := h.recorder.reply("c1")
+	if !bytes.Contains(second.Result, []byte(`"open"`)) {
+		t.Fatalf("an open session reported %s, which is the answer from before it came up", second.Result)
+	}
+}
+
+// Nobody knows whether it already ran, and both of the other answers are wrong: running
+// it risks a second side effect, and refusing it reports a failure for a command that
+// may have worked. It is handed back instead, for whoever claims it next to ask again.
+func TestACommandWhoseRecordCannotBeReadIsHandedBackRatherThanRun(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	ctx := context.Background()
+	if _, err := h.manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, _ := h.engine.Session("s1")
+	h.ledger.refuse(errors.New("redis is unreachable"))
+
+	var acked, forfeited atomic.Bool
+	handed := delivery(&protocol.Command{
+		V: protocol.Version, ID: "c1", Type: protocol.CommandSessionLogout, SID: "s1", ReplyTo: "c1",
+		Payload: json.RawMessage(`{}`),
+	}, &acked)
+	handed.Forfeit = func() { forfeited.Store(true) }
+	h.manager.Dispatch(ctx, handed)
+
+	waitFor(t, "the command to be handed back", forfeited.Load)
+	if acked.Load() {
+		t.Fatal("a command nobody could tell had run was retired anyway")
+	}
+	if _, answered := h.recorder.reply("c1"); answered {
+		t.Fatal("a command nobody could tell had run was answered anyway")
+	}
+	if got := engineSession.LoggedOut(); got != 0 {
+		t.Fatalf("the account was logged out %d times on a record nobody could read", got)
 	}
 }

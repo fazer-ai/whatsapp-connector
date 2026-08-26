@@ -176,6 +176,29 @@ var AllCommandTypes = []CommandType{
 
 // rpcCommands are the commands whose caller blocks on a reply. Everything else is
 // fire and forget: the caller learns about failures through command.failed.
+// readOnlyCommands are the commands that ask a question and change nothing. They are
+// the ones a redelivery has to carry out again rather than be answered from a record:
+// what a session's state was a minute ago is not what it is now, and handing back the
+// old answer is worse than doing the work twice.
+var readOnlyCommands = map[CommandType]bool{
+	CommandSessionStatus:         true,
+	CommandAdminPing:             true,
+	CommandContactCheck:          true,
+	CommandContactProfilePicture: true,
+	CommandContactInfo:           true,
+	CommandContactResolve:        true,
+	CommandGroupInfo:             true,
+	CommandGroupList:             true,
+	CommandGroupInviteGet:        true,
+	CommandGroupJoinRequestsList: true,
+}
+
+// ChangesSomething reports whether carrying this command out twice is different from
+// carrying it out once. Everything the contract does not name as a question is assumed
+// to change something, so a command added without thinking about it is deduplicated
+// rather than repeated.
+func (t CommandType) ChangesSomething() bool { return !readOnlyCommands[t] }
+
 var rpcCommands = map[CommandType]bool{
 	CommandSessionConnect:          true,
 	CommandSessionStatus:           true,
