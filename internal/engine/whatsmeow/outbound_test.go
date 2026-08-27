@@ -512,9 +512,18 @@ func TestOnlyAJPEGPreviewTravelsWithTheFile(t *testing.T) {
 		t.Fatalf("the preview arrived as %q", got)
 	}
 
+	pngBytes := base64.StdEncoding.EncodeToString([]byte("\x89PNG\r\n\x1a\n png-ish"))
 	for _, tc := range []struct{ name, kind, thumbnail string }{
 		{"a PNG where an image wants a JPEG", "image", "data:image/png;base64," + preview},
 		{"a JPEG where a sticker wants a PNG", "sticker", "data:image/jpeg;base64," + preview},
+		// The label agrees with the kind and the bytes disagree with the label. The
+		// field is named for a format and a recipient's client reads the field, so this
+		// is the same broken preview by a longer route -- and it is the route a label
+		// check cannot see.
+		{"PNG bytes under a JPEG label", "image", "data:image/jpeg;base64," + pngBytes},
+		{"JPEG bytes under a sticker's PNG label", "sticker", "data:image/png;base64," + preview},
+		{"bytes that are no image at all", "image",
+			"data:image/jpeg;base64," + base64.StdEncoding.EncodeToString([]byte("not an image"))},
 		{"something that is not base64", "image", "data:image/jpeg;base64,não é base64"},
 		{"a preview too big to travel in a frame", "image",
 			"data:image/jpeg;base64," + strings.Repeat("A", thumbnailLimit)},
@@ -2063,6 +2072,17 @@ func TestAStickerAndAVoiceNoteAreLabelledWithWhatTheyCanOnlyBe(t *testing.T) {
 			`"kind":"audio","voice_note":true,"mime":"audio/ogg"`, "", "", "audio/ogg; codecs=opus"},
 		{"a voice note the reference named without the codec",
 			`"kind":"audio","voice_note":true`, "audio/ogg", "", "audio/ogg; codecs=opus"},
+		// And `application/octet-stream` is not a claim about the format, whoever
+		// repeats it: a store that lost the type, a proxy that labels every body a
+		// stream of bytes, a caller passing either along.
+		{"a voice note the caller calls a stream of bytes",
+			`"kind":"audio","voice_note":true,"mime":"application/octet-stream"`,
+			"", "", "audio/ogg; codecs=opus"},
+		{"a sticker the reference calls a stream of bytes",
+			`"kind":"sticker"`, "application/octet-stream", "", "image/webp"},
+		{"a document the caller calls a stream of bytes, named by its extension",
+			`"kind":"document","filename":"a.pdf","mime":"application/octet-stream"`,
+			"", "", "application/pdf"},
 		// And a stated type that names a different format is information, not something
 		// to correct.
 		{"a sticker the caller says is a PNG", `"kind":"sticker","mime":"image/png"`, "", "", "image/png"},
@@ -2088,8 +2108,10 @@ func TestAStickerAndAVoiceNoteAreLabelledWithWhatTheyCanOnlyBe(t *testing.T) {
 				got = message.GetStickerMessage().GetMimetype()
 			case message.GetAudioMessage() != nil:
 				got = message.GetAudioMessage().GetMimetype()
+			case message.GetDocumentMessage() != nil:
+				got = message.GetDocumentMessage().GetMimetype()
 			default:
-				t.Fatalf("that did not go out as a sticker or an audio: %v", message)
+				t.Fatalf("that did not go out as a sticker, an audio or a document: %v", message)
 			}
 			if got != tc.want {
 				t.Fatalf("the file went out as %q, want %q", got, tc.want)
@@ -2218,9 +2240,11 @@ func TestAMetadataAddressIsNeverDialled(t *testing.T) {
 		// Where ECS answers for a task role, which is the same credentials by another
 		// address and is why the range goes rather than the one address.
 		{"the task role endpoint next to it", "169.254.170.2:80", true},
-		// AWS answers IMDS here on an IPv6 instance. Unique-local, so the range cannot
-		// go with it: that is the range a private IPv6 network serves from.
+		// Each of these answers outside the link-local range, and each sits in a range
+		// something else legitimately uses, so each goes as one address.
 		{"AWS's IPv6 metadata endpoint", "[fd00:ec2::254]:80", true},
+		{"GCP's IPv6 metadata endpoint", "[fd20:ce::254]:80", true},
+		{"Alibaba Cloud's metadata endpoint", "100.100.100.200:80", true},
 		// Every one of these is somewhere a deployment does serve media from.
 		{"the client next door on a compose network", "10.0.0.4:3000", false},
 		{"the client on the same host", "127.0.0.1:3000", false},
@@ -2228,6 +2252,10 @@ func TestAMetadataAddressIsNeverDialled(t *testing.T) {
 		{"a private IPv6 network, which is the range the address above sits in",
 			"[fd00:ec2::1]:3000", false},
 		{"another private IPv6 network", "[fd12:3456:789a::1]:3000", false},
+		{"the range GCP's endpoint sits in", "[fd20:ce::1]:3000", false},
+		// 100.64.0.0/10 is shared address space, which is where a Tailscale network
+		// lives, so it is the address that goes and not the range.
+		{"a host on a Tailscale network", "100.100.100.201:3000", false},
 		{"a storage service on the internet", "93.184.216.34:443", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

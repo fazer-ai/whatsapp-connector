@@ -167,7 +167,8 @@ internal/store/media.go: Fence media writes with the ownership epoch  # PR#22
 # read of an internal HTTP service adds little to what they hold. What it does add is
 # the metadata service: it answers with credentials rather than data, so reaching it
 # escalates a compromised client into the cloud account. Those addresses are refused as
-# of this PR -- the link-local range and AWS's IPv6 one -- on the dial rather than on the
+# of this PR -- the link-local range, and the addresses each cloud answers on outside it
+# -- on the dial rather than on the
 # URL, so a name that resolves to one and every redirect hop are covered, and the
 # transport does not proxy, because a proxied dial is to the proxy. The general closure
 # is an operator-configured

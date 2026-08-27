@@ -868,20 +868,18 @@ func isToken(name string) bool {
 // see canonical.
 func mimeToSend(content *mediaContent, served string) string {
 	only := onlyTypeFor(content)
-	if content.Mime != "" {
+	if !unknownType(content.Mime) {
 		return canonical(content.Mime, only)
 	}
 	// The reference's own, which is what this connector puts on one it issues: a caller
 	// forwarding a file it received hands back the type the blob was stored under, and
 	// ignoring it loses exactly the cases that depend on it -- a sticker is a webp and a
 	// voice note an opus, and neither renders as anything else.
-	if content.Ref != nil && content.Ref.Mime != "" {
+	if content.Ref != nil && !unknownType(content.Ref.Mime) {
 		return canonical(content.Ref.Mime, only)
 	}
 
-	// The server named something, and `application/octet-stream` is what one says when it
-	// does not know.
-	if base, _, err := mime.ParseMediaType(served); err == nil && base != "application/octet-stream" {
+	if !unknownType(served) {
 		return canonical(served, only)
 	}
 	if only != "" {
@@ -914,6 +912,22 @@ func canonical(stated, only string) string {
 		return only
 	}
 	return stated
+}
+
+// unknownType reports whether a stated type says nothing about what the file is.
+//
+// `application/octet-stream` is what one says when it does not know, and it is that
+// whoever said it: a proxy labelling every body a stream of bytes, a store that lost the
+// type, a caller repeating either. Treating it as a claim is how a voice note goes out
+// described as a stream of bytes, which WhatsApp drops without a word -- the same failure
+// the codec parameter causes, by the other end of the same ladder.
+//
+// An unparseable one is not this: it is somebody saying something that cannot be read,
+// and what to do with it is decided further down, where the kind and the extension have
+// had their turn.
+func unknownType(stated string) bool {
+	base, _, err := mime.ParseMediaType(stated)
+	return stated == "" || (err == nil && base == "application/octet-stream")
 }
 
 // sameFormat reports whether a type the kind guarantees describes the same format as one
@@ -991,6 +1005,17 @@ func thumbnailBytes(uri string, kind protocol.MediaKind) ([]byte, error) {
 	if err != nil {
 		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
 			fmt.Sprintf("that preview is not base64: %v", err))
+	}
+	// The label is what the caller says the bytes are, and the field they go into is
+	// named for a format. Where the two disagree the bytes are the ones that can be
+	// checked, and a recipient's client reads the field rather than the label: PNG bytes
+	// in the JPEG field render as a broken preview on every client that takes the field
+	// at its word, with the send reporting success. Refused rather than filed by what
+	// they turn out to be, because a caller whose preview does not match its own label is
+	// a caller with a bug, and answering it is how it gets found.
+	if found, _, _ := strings.Cut(http.DetectContentType(raw), ";"); found != format {
+		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
+			fmt.Sprintf("that preview says it is a %s and its bytes are a %s", format, found))
 	}
 	return raw, nil
 }
@@ -1157,12 +1182,26 @@ func (c *counting) Read(into []byte) (int, error) {
 // errMetadataAddress is an address no file is fetched from.
 var errMetadataAddress = errors.New("whatsmeow: that address answers with credentials")
 
-// awsMetadataV6 is where AWS answers IMDS on an IPv6-enabled instance.
+// metadataAddresses are the metadata services that answer somewhere other than the
+// link-local range, each named on its own.
 //
-// Named on its own because it is unique-local, which is the range a private IPv6 network
-// serves from. Refusing the range would refuse the deployments this exists to keep
-// working; refusing the one address costs nothing.
-var awsMetadataV6 = netip.MustParseAddr("fd00:ec2::254")
+// Each sits in a range something else legitimately uses, so the range cannot go with the
+// address: `fd00:ec2::/32` and `fd20:ce::/32` are unique-local, which is what a private
+// IPv6 network serves from, and `100.64.0.0/10` is shared address space, which is where
+// a Tailscale network lives. Refusing one address out of each costs nothing.
+//
+// A list of known endpoints is not a boundary, and this one is not complete by
+// construction: a cloud that answers somewhere new is reachable until it is named here.
+// What would be complete is an allowlist of the hosts this connector may fetch from,
+// which is #31 and needs an operator to configure it.
+var metadataAddresses = map[netip.Addr]struct{}{
+	// AWS, on an IPv6-enabled instance.
+	netip.MustParseAddr("fd00:ec2::254"): {},
+	// GCP, on an IPv6-only instance.
+	netip.MustParseAddr("fd20:ce::254"): {},
+	// Alibaba Cloud.
+	netip.MustParseAddr("100.100.100.200"): {},
+}
 
 // fetchTransport is what a caller's URL is fetched over.
 //
@@ -1219,15 +1258,19 @@ func refuseMetadataAddress(_, address string, _ syscall.RawConn) error {
 	return nil
 }
 
-// refusedAddress reports whether an address is one of the two metadata services.
+// refusedAddress reports whether an address is one a metadata service answers on.
 //
-// Link-local as a range rather than 169.254.169.254 alone: the whole of it is
+// Link-local as a whole range rather than 169.254.169.254 alone: all of it is
 // unroutable, nothing serves media from it, and naming the single address would leave
 // the ones a cloud answers alongside it (169.254.170.2 is where ECS answers for a task
-// role) reachable for nothing gained.
+// role) reachable for nothing gained. Everywhere else, one address at a time.
 func refusedAddress(address netip.Addr) bool {
 	unmapped := address.Unmap()
-	return unmapped.IsLinkLocalUnicast() || unmapped.IsLinkLocalMulticast() || unmapped == awsMetadataV6
+	if unmapped.IsLinkLocalUnicast() || unmapped.IsLinkLocalMulticast() {
+		return true
+	}
+	_, refused := metadataAddresses[unmapped]
+	return refused
 }
 
 // retrieveOverHTTP fetches the caller's URL.
