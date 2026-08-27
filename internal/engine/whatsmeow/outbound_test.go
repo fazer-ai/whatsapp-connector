@@ -2201,9 +2201,10 @@ func TestASizeNoFileCouldHaveIsRefused(t *testing.T) {
 //
 // The private network as a whole is not refused, and cannot be: the client sits next to
 // this connector and hands over an address on their own network, which is the ordinary
-// case and not an attack. So what is asserted here is both halves -- the metadata range
-// refused, and everything else this connector actually fetches from still dialled.
-func TestALinkLocalAddressIsNeverDialled(t *testing.T) {
+// case and not an attack. So what is asserted here is both halves -- the addresses that
+// answer with credentials refused, and everything else this connector actually fetches
+// from still dialled. The second half is what decides how wide the first can be.
+func TestAMetadataAddressIsNeverDialled(t *testing.T) {
 	t.Parallel()
 
 	for _, tc := range []struct {
@@ -2214,18 +2215,26 @@ func TestALinkLocalAddressIsNeverDialled(t *testing.T) {
 		{"it in the v6 form a resolver can answer with", "[::ffff:169.254.169.254]:80", true},
 		{"an IPv6 link-local address", "[fe80::1]:80", true},
 		{"the whole link-local range, not one address", "169.254.1.2:8080", true},
+		// Where ECS answers for a task role, which is the same credentials by another
+		// address and is why the range goes rather than the one address.
+		{"the task role endpoint next to it", "169.254.170.2:80", true},
+		// AWS answers IMDS here on an IPv6 instance. Unique-local, so the range cannot
+		// go with it: that is the range a private IPv6 network serves from.
+		{"AWS's IPv6 metadata endpoint", "[fd00:ec2::254]:80", true},
 		// Every one of these is somewhere a deployment does serve media from.
 		{"the client next door on a compose network", "10.0.0.4:3000", false},
 		{"the client on the same host", "127.0.0.1:3000", false},
 		{"it over IPv6", "[::1]:3000", false},
-		{"a private v6 network", "[fd00:ec2::254]:3000", false},
+		{"a private IPv6 network, which is the range the address above sits in",
+			"[fd00:ec2::1]:3000", false},
+		{"another private IPv6 network", "[fd12:3456:789a::1]:3000", false},
 		{"a storage service on the internet", "93.184.216.34:443", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			switch err := refuseLinkLocal("tcp", tc.address, nil); {
-			case tc.refused && !errors.Is(err, errLinkLocal):
+			switch err := refuseMetadataAddress("tcp", tc.address, nil); {
+			case tc.refused && !errors.Is(err, errMetadataAddress):
 				t.Fatalf("%s was dialled, answering %v", tc.address, err)
 			case !tc.refused && err != nil:
 				t.Fatalf("%s was refused: %v", tc.address, err)
@@ -2255,4 +2264,17 @@ func TestAFetchRedirectedIntoTheMetadataRangeIsRefusedAsThePayload(t *testing.T)
 		t.Fatal("the fetch followed the redirect into the metadata range")
 	}
 	assertCode(t, err, protocol.ErrorInvalidPayload)
+}
+
+// A proxied fetch dials the proxy, so the dial control would be about the proxy's address
+// while the proxy fetches whatever it was asked for. net/http proxies exactly when this
+// field is set, and the default transport sets it from HTTP_PROXY -- which means an
+// environment variable inherited from an image, or exported for something else in the
+// same container, would turn the refusal above off and say nothing about it.
+func TestTheFetchTransportDoesNotProxy(t *testing.T) {
+	t.Parallel()
+
+	if fetchTransport.Proxy != nil {
+		t.Fatal("the fetch proxies, so what it refuses is the proxy's address")
+	}
 }

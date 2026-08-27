@@ -1154,34 +1154,47 @@ func (c *counting) Read(into []byte) (int, error) {
 	return read, nil
 }
 
-// errLinkLocal is an address no file is fetched from.
-var errLinkLocal = errors.New("whatsmeow: that address is link-local")
+// errMetadataAddress is an address no file is fetched from.
+var errMetadataAddress = errors.New("whatsmeow: that address answers with credentials")
 
-// fetchTransport is what a caller's URL is fetched over: the default transport with a
-// dial that refuses a link-local address.
+// awsMetadataV6 is where AWS answers IMDS on an IPv6-enabled instance.
+//
+// Named on its own because it is unique-local, which is the range a private IPv6 network
+// serves from. Refusing the range would refuse the deployments this exists to keep
+// working; refusing the one address costs nothing.
+var awsMetadataV6 = netip.MustParseAddr("fd00:ec2::254")
+
+// fetchTransport is what a caller's URL is fetched over.
 //
 // This is not a refusal to fetch from the private network. Fetching from the private
 // network is the design -- the client sits next to this connector and hands over an
 // address on their own network, which is what INTERNAL_HOST_URL exists to be -- and a
 // connector that refused one would not fetch a single attachment in the deployment the
-// contract describes. What this refuses is the one range whose answer is credentials
-// rather than a file: 169.254.169.254 is the instance metadata endpoint on every major
-// cloud, and a fetch of it hands the host's own keys to whatever WhatsApp number the
-// command named. No deployment serves media from there, so nothing is lost by never
-// dialling it.
+// contract describes. What it refuses is where the answer is credentials rather than a
+// file: 169.254.169.254 is the instance metadata endpoint on every major cloud, and a
+// fetch of it hands the host's own keys to whatever WhatsApp number the command named.
+// No deployment serves media from there, so nothing is lost by never dialling it. See
+// #31 for the general question, which an allowlist is the only real answer to.
 //
 // Checked on the address actually dialled rather than on the host in the URL, which is
 // what makes it cover a name that resolves to one, a name that resolves to one only on
 // the second lookup, and every redirect hop -- they all dial through this.
+//
 // The settings are net/http's own defaults, spelled out rather than cloned off
 // DefaultTransport: the dial has to be replaced anyway, and a clone would leave what the
-// rest of them are somewhere else.
+// rest of them are somewhere else. With one deliberate difference -- this transport does
+// not proxy, where the default reads HTTP_PROXY from the environment. A proxied fetch
+// dials the proxy, so the check below would be about the proxy's address while the proxy
+// fetches whatever it was asked for: an environment variable that happened to be set,
+// inherited from an image or exported for something else in the same container, would
+// turn this off and say nothing. What is given up is a deployment that reaches its own
+// client, or a presigned storage URL, only through a proxy. None exists, and adding one
+// deliberately is a smaller thing than losing the guarantee by accident.
 var fetchTransport = &http.Transport{
-	Proxy: http.ProxyFromEnvironment,
 	DialContext: (&net.Dialer{
 		Timeout:   30 * time.Second,
 		KeepAlive: 30 * time.Second,
-		Control:   refuseLinkLocal,
+		Control:   refuseMetadataAddress,
 	}).DialContext,
 	ForceAttemptHTTP2:     true,
 	MaxIdleConns:          100,
@@ -1190,8 +1203,8 @@ var fetchTransport = &http.Transport{
 	ExpectContinueTimeout: time.Second,
 }
 
-// refuseLinkLocal is the dial fetchTransport is built on.
-func refuseLinkLocal(_, address string, _ syscall.RawConn) error {
+// refuseMetadataAddress is the dial fetchTransport is built on.
+func refuseMetadataAddress(_, address string, _ syscall.RawConn) error {
 	host, _, err := net.SplitHostPort(address)
 	if err != nil {
 		host = address
@@ -1200,10 +1213,21 @@ func refuseLinkLocal(_, address string, _ syscall.RawConn) error {
 	// that will not parse as one is not something this can judge. The schemes that could
 	// put a path here are refused before any dial is attempted.
 	parsed, err := netip.ParseAddr(host)
-	if err == nil && (parsed.IsLinkLocalUnicast() || parsed.IsLinkLocalMulticast()) {
-		return fmt.Errorf("%w: %s", errLinkLocal, parsed)
+	if err == nil && refusedAddress(parsed) {
+		return fmt.Errorf("%w: %s", errMetadataAddress, parsed)
 	}
 	return nil
+}
+
+// refusedAddress reports whether an address is one of the two metadata services.
+//
+// Link-local as a range rather than 169.254.169.254 alone: the whole of it is
+// unroutable, nothing serves media from it, and naming the single address would leave
+// the ones a cloud answers alongside it (169.254.170.2 is where ECS answers for a task
+// role) reachable for nothing gained.
+func refusedAddress(address netip.Addr) bool {
+	unmapped := address.Unmap()
+	return unmapped.IsLinkLocalUnicast() || unmapped.IsLinkLocalMulticast() || unmapped == awsMetadataV6
 }
 
 // retrieveOverHTTP fetches the caller's URL.
@@ -1238,7 +1262,7 @@ func retrieveOverHTTP(ctx context.Context, address string, headers map[string]st
 		// it is retried for as long as the caller keeps the message.
 		return source{}, protocol.NewError(protocol.ErrorInvalidPayload,
 			fmt.Sprintf("the address of the file to send redirects more than %d times", fetchRedirects))
-	case errors.Is(err, errLinkLocal):
+	case errors.Is(err, errMetadataAddress):
 		// The caller's address resolved to the metadata endpoint's range. Deterministic
 		// as far as this side is concerned -- and where it is not, where a name answers
 		// differently on the next lookup, that is the rebinding this refuses and not a

@@ -165,10 +165,12 @@ internal/store/media.go: Fence media writes with the ownership epoch  # PR#22
 # client from its own routes, and whoever can write to the command stream can already
 # send arbitrary messages from the operator's account and read every inbound one, so a
 # read of an internal HTTP service adds little to what they hold. What it does add is
-# one range: the instance metadata endpoint answers with credentials rather than data,
-# and reaching it escalates a compromised client into the cloud account. That range is
-# refused as of this PR, on the dial rather than on the URL, so a name that resolves to
-# it and every redirect hop are covered. The general closure is an operator-configured
+# the metadata service: it answers with credentials rather than data, so reaching it
+# escalates a compromised client into the cloud account. Those addresses are refused as
+# of this PR -- the link-local range and AWS's IPv6 one -- on the dial rather than on the
+# URL, so a name that resolves to one and every redirect hop are covered, and the
+# transport does not proxy, because a proxied dial is to the proxy. The general closure
+# is an operator-configured
 # allowlist of hosts this connector fetches from, which is config somebody has to set
 # and a decision the contract has to carry; registered as #31.
 internal/engine/whatsmeow/outbound.go: Reject private-network media fetch targets  # PR#27
