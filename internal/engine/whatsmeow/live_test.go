@@ -679,6 +679,92 @@ func TestLiveSend(t *testing.T) {
 	fmt.Fprintf(os.Stderr, "sent %s at %s\n", sent.MessageID, time.UnixMilli(sent.Timestamp))
 }
 
+// TestLiveActOnAMessage is M2.5's outbound half against a real recipient: a message
+// corrected, one reacted to, and one deleted.
+//
+// This is the phase the unit tests cannot stand in for, and the reason is the same for
+// all three. Each names a message that already exists with a key, and WhatsApp accepts a
+// key that resolves to nothing exactly as readily as one that resolves: the send answers
+// with a timestamp either way, and nothing afterwards says which happened. A test on this
+// side can check that the key was built from the right parts. Only a recipient's client
+// can say whether the parts were the right ones.
+//
+// Two messages are sent rather than one, so everything is on screen at the end. The first
+// is corrected and reacted to and stays; the second is deleted. A single message would
+// leave the earlier steps invisible behind the deletion.
+func TestLiveActOnAMessage(t *testing.T) {
+	to := os.Getenv("WAC_LIVE_TO")
+	if to == "" {
+		t.Skip("set WAC_LIVE_TO to the number this account should send to")
+	}
+
+	session, _ := liveSession(t)
+	events := watch(t, session)
+	if err := session.Connect(t.Context(), engine.ConnectRequest{Pairing: "resume"}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	events.awaitState(t, "open", 2*time.Minute)
+
+	chat := map[string]any{"kind": "phone", "id": to}
+	standing := liveSendOne(t, session, to, map[string]any{
+		"type": "text", "body": "conector nativo: esta mensagem vai ser corrigida",
+	})
+	doomed := liveSendOne(t, session, to, map[string]any{
+		"type": "text", "body": "conector nativo: esta mensagem vai ser apagada",
+	})
+
+	liveActOne(t, session, protocol.CommandMessageEdit, map[string]any{
+		"to": chat, "target_id": standing,
+		"content": map[string]any{"type": "text", "body": "conector nativo: corrigida"},
+	})
+	// On the account's own message, which is the only kind of target this phase has: the
+	// other branch, a reaction on the contact's message, needs an id from their side and
+	// is what WAC_LIVE_REACT_TO is for.
+	liveActOne(t, session, protocol.CommandMessageReact, map[string]any{
+		"to": chat, "target_id": standing, "target_from_me": true, "emoji": "❤️",
+	})
+	liveActOne(t, session, protocol.CommandMessageRevoke, map[string]any{
+		"to": chat, "target_id": doomed,
+	})
+
+	// A reaction on somebody else's message builds a different key -- `from_me` false,
+	// and in a direct chat no participant -- and a key that is wrong there fails the same
+	// silent way. Point this at an id the recipient sent to exercise it.
+	if theirs := os.Getenv("WAC_LIVE_REACT_TO"); theirs != "" {
+		liveActOne(t, session, protocol.CommandMessageReact, map[string]any{
+			"to": chat, "target_id": theirs, "emoji": "👍",
+		})
+	}
+	// And taking one off is a reaction with an empty emoji, not a command of its own.
+	if os.Getenv("WAC_LIVE_UNREACT") != "" {
+		liveActOne(t, session, protocol.CommandMessageReact, map[string]any{
+			"to": chat, "target_id": standing, "target_from_me": true, "emoji": "",
+		})
+	}
+
+	fmt.Fprintf(os.Stderr, "check the recipient: %s reads \"corrigida\", carries the reaction, "+
+		"and says it was edited; %s is gone\n", standing, doomed)
+}
+
+// liveActOne runs one of the three commands that act on an existing message and fails on
+// anything but a clean answer. What it cannot check is the part that matters, which is
+// why it prints and the phase ends with a look at the phone.
+func liveActOne(t *testing.T, session *Session, kind protocol.CommandType, payload map[string]any) {
+	t.Helper()
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("build the %s: %v", kind, err)
+	}
+	result, err := session.Execute(t.Context(), &protocol.Command{
+		Type: kind, ID: "live-" + string(kind), Payload: body,
+	})
+	if err != nil {
+		t.Fatalf("%s: %v", kind, err)
+	}
+	fmt.Fprintf(os.Stderr, "%s on %v answered %s\n", kind, payload["target_id"], result)
+}
+
 // TestLiveLogout unlinks the device. It is the last phase, and running it means the
 // next run starts at TestLivePairWithQR again.
 // TestLiveSendMedia is M2.4 against a real recipient: a file fetched over HTTP, uploaded
