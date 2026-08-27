@@ -262,9 +262,37 @@ func contactsToSend(content *contactsContent, alongside *waE2E.ContextInfo) (*wa
 		return &waE2E.Message{ContactMessage: cards[0]}, nil
 	}
 	return &waE2E.Message{ContactsArrayMessage: &waE2E.ContactsArrayMessage{
+		DisplayName: proto.String(stackLabel(cards)),
 		Contacts:    cards,
 		ContextInfo: alongside,
 	}}, nil
+}
+
+// namesInLabel is how many of a stack's cards are spelled out in its label. Enough to
+// recognise the stack, short enough that fifty cards do not produce a label of fifty
+// names.
+const namesInLabel = 3
+
+// stackLabel is what a stack of cards is called in the recipient's chat.
+//
+// WhatsApp reads this as the label for the whole stack, and a stack sent without one
+// arrives blank on the clients that show it. The contract has no aggregate label -- it
+// carries the cards and nothing about them together -- so it is built from the names.
+//
+// Built from the names rather than from a phrase, and that is deliberate: this string is
+// read by the recipient, in whatever language they use, and this connector has no idea
+// what that is. "Ana, Bruno" reads the same everywhere; "Ana and 2 others" would be
+// English in somebody's Portuguese chat. The overflow is a count for the same reason.
+func stackLabel(cards []*waE2E.ContactMessage) string {
+	names := make([]string, 0, namesInLabel)
+	for _, card := range cards[:min(len(cards), namesInLabel)] {
+		names = append(names, card.GetDisplayName())
+	}
+	label := strings.Join(names, ", ")
+	if rest := len(cards) - len(names); rest > 0 {
+		label += fmt.Sprintf(" +%d", rest)
+	}
+	return label
 }
 
 // contactCard turns one entry into the card WhatsApp carries.

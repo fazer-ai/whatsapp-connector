@@ -1892,3 +1892,41 @@ func TestWhyAFetchFailedIsSaidWithoutRepeatingTheLibrary(t *testing.T) {
 		})
 	}
 }
+
+// WhatsApp reads DisplayName as the label for the whole stack, and a stack sent without
+// one arrives blank on the clients that show it. The contract has no aggregate label, so
+// it is built from the names -- which also keeps it out of a language this connector has
+// no way to know.
+func TestAStackOfCardsIsLabelledWithWhoIsInIt(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name  string
+		count int
+		want  string
+	}{
+		{"two", 2, "Contato 1, Contato 2"},
+		{"exactly as many as are spelled out", 3, "Contato 1, Contato 2, Contato 3"},
+		{"more than fit", 6, "Contato 1, Contato 2, Contato 3 +3"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			entries := make([]string, 0, tc.count)
+			for i := 1; i <= tc.count; i++ {
+				entries = append(entries, fmt.Sprintf(
+					`{"display_name":"Contato %d","phone":"551199999000%d"}`, i, i))
+			}
+			req := requestOf(t, `{"message_id":"3EB0","to":{"kind":"phone","id":"5511999990001"},
+				"content":{"type":"contacts","contacts":[`+strings.Join(entries, ",")+`]}}`)
+
+			message, _, err := planBody(req, nil, 1<<20)
+			if err != nil {
+				t.Fatalf("planBody: %v", err)
+			}
+			if got := message.GetContactsArrayMessage().GetDisplayName(); got != tc.want {
+				t.Fatalf("the stack is labelled %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
