@@ -729,10 +729,22 @@ func TestLiveActOnAMessage(t *testing.T) {
 
 	// A reaction on somebody else's message builds a different key -- `from_me` false,
 	// and in a direct chat no participant -- and a key that is wrong there fails the same
-	// silent way. Point this at an id the recipient sent to exercise it.
+	// silent way. Set WAC_LIVE_REACT_TO to an id the recipient sent, or to `wait` to have
+	// the phase take the next message they send: an id copied by hand is an id nobody
+	// copies, and the branch then never runs.
 	if theirs := os.Getenv("WAC_LIVE_REACT_TO"); theirs != "" {
+		// Reacted in the chat the message arrived in, which is not always the one this
+		// phase sends to: the key carries the chat as its `remoteJID`, and a direct chat
+		// this account addresses by phone can deliver under a LID chat. Reacting to the
+		// phone chat then names a message that chat does not hold. An id given by hand
+		// has no event to take a chat from and falls back to the one being sent to,
+		// which is the reason `wait` is the better way to run this.
+		where := chat
+		if theirs == "wait" {
+			theirs, where = liveAwaitTheirMessage(t, events, liveWindow(t, 2*time.Minute))
+		}
 		liveActOne(t, session, protocol.CommandMessageReact, map[string]any{
-			"to": chat, "target_id": theirs, "emoji": "👍",
+			"to": where, "target_id": theirs, "emoji": "👍",
 		})
 	}
 	// And taking one off is a reaction with an empty emoji, not a command of its own.
@@ -746,6 +758,40 @@ func TestLiveActOnAMessage(t *testing.T) {
 		"and says it was edited; %s is gone\n", standing, doomed)
 }
 
+// liveAwaitTheirMessage is the next message the recipient sends: its id, and the chat it
+// arrived in. Both, because the chat is half of the key and is not always the one this
+// phase addresses -- see the caller.
+//
+// Waiting rather than taking an id by hand is what makes this branch get run at all: an
+// id somebody has to copy off a phone is an id nobody copies.
+func liveAwaitTheirMessage(
+	t *testing.T, events *recorder, window time.Duration,
+) (id string, chat map[string]any) {
+	t.Helper()
+
+	fmt.Fprintf(os.Stderr, "send a text from the recipient's phone now; waiting up to %s\n", window)
+	received := events.await(t, protocol.EventMessageReceived, window)
+	var body struct {
+		Message struct {
+			ID     string `json:"id"`
+			FromMe bool   `json:"from_me"`
+			Chat   struct {
+				Kind string `json:"kind"`
+				ID   string `json:"id"`
+			} `json:"chat"`
+		} `json:"message"`
+	}
+	if err := json.Unmarshal(received.Payload, &body); err != nil {
+		t.Fatalf("unmarshal the message: %v", err)
+	}
+	if body.Message.ID == "" || body.Message.Chat.ID == "" || body.Message.FromMe {
+		// An echo of this account's own send would build the other key entirely, which
+		// is the one the rest of the phase already covers.
+		t.Fatalf("that is not a message from the other side: %s", received.Payload)
+	}
+	return body.Message.ID, map[string]any{"kind": body.Message.Chat.Kind, "id": body.Message.Chat.ID}
+}
+
 // liveActOne runs one of the three commands that act on an existing message and fails on
 // anything but a clean answer. What it cannot check is the part that matters, which is
 // why it prints and the phase ends with a look at the phone.
@@ -756,8 +802,13 @@ func liveActOne(t *testing.T, session *Session, kind protocol.CommandType, paylo
 	if err != nil {
 		t.Fatalf("build the %s: %v", kind, err)
 	}
+	// The command id has to differ per action, and this phase runs two reactions. It is
+	// what the stanza id is derived from when the payload names none, so two actions
+	// sharing one go out under the same id and the recipient discards the second as a
+	// duplicate of the first -- which is the mechanism working, and it would read here as
+	// the reaction silently failing. The target is what makes them different.
 	result, err := session.Execute(t.Context(), &protocol.Command{
-		Type: kind, ID: "live-" + string(kind), Payload: body,
+		Type: kind, ID: fmt.Sprintf("live-%s-%v", kind, payload["target_id"]), Payload: body,
 	})
 	if err != nil {
 		t.Fatalf("%s: %v", kind, err)
