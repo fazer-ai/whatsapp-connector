@@ -25,11 +25,8 @@ import (
 type sendRequest struct {
 	MessageID string           `json:"message_id"`
 	To        protocol.Address `json:"to"`
-	Content   struct {
-		Type string `json:"type"`
-		Body string `json:"body"`
-	} `json:"content"`
-	Quoted *struct {
+	Content   json.RawMessage  `json:"content"`
+	Quoted    *struct {
 		ID          string            `json:"id"`
 		Participant *protocol.Address `json:"participant"`
 		FromMe      bool              `json:"from_me"`
@@ -72,16 +69,6 @@ func (s *Session) send(ctx context.Context, command *protocol.Command) (json.Raw
 	if req.MessageID == "" {
 		return nil, protocol.NewError(protocol.ErrorInvalidPayload, "a send has to name the message it is sending")
 	}
-	if req.Content.Type != "text" {
-		// Refused rather than sent as something else. A caller told its message went
-		// out has no reason to send it again, so a media message quietly delivered as
-		// its caption is one nobody finds out about.
-		return nil, protocol.NewError(protocol.ErrorUnsupported,
-			fmt.Sprintf("this connector cannot send %q yet", req.Content.Type))
-	}
-	if req.Content.Body == "" {
-		return nil, protocol.NewError(protocol.ErrorInvalidPayload, "a text message with no body is not a message")
-	}
 	to, err := jidOf(req.To)
 	if err != nil {
 		return nil, err
@@ -92,7 +79,11 @@ func (s *Session) send(ctx context.Context, command *protocol.Command) (json.Raw
 	// doing, and answering `not_connected` to one sends it away to wait for a
 	// connection that would not have helped.
 	client := s.current()
-	message, err := textToSend(&req, s.ownJID(to), to)
+	alongside, err := contextToSend(&req, s.ownJID(to), to)
+	if err != nil {
+		return nil, err
+	}
+	message, plan, err := planBody(&req, alongside, s.sendLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -115,6 +106,18 @@ func (s *Session) send(ctx context.Context, command *protocol.Command) (json.Raw
 		return nil, protocol.NewError(protocol.ErrorNotConnected, "the session is not connected to WhatsApp")
 	}
 
+	if plan != nil {
+		// The half of the body that needs the network, and the only reason the two are
+		// split: fetching a file and uploading it is work worth spending on a session
+		// that can actually send, and everything above was refused before the socket was
+		// consulted at all.
+		building, cancel := context.WithTimeout(ctx, s.uploadWait)
+		defer cancel()
+		if message, err = s.mediaToSend(building, plan, alongside); err != nil {
+			return nil, err
+		}
+	}
+
 	sent, err := client.SendMessage(ctx, to, message, wm.SendRequestExtra{ID: req.MessageID})
 	if err != nil {
 		return nil, sendFailure(err)
@@ -133,16 +136,15 @@ func (s *Session) send(ctx context.Context, command *protocol.Command) (json.Raw
 // a phone sends and what every client renders without thinking about it. The extended
 // shape is for a message that carries something else: a quote, a mention, or the
 // chat's disappearing-message timer.
-func textToSend(req *sendRequest, own, to waTypes.JID) (*waE2E.Message, error) {
-	alongside, err := contextToSend(req, own, to)
-	if err != nil {
-		return nil, err
+func textToSend(content *textContent, alongside *waE2E.ContextInfo) (*waE2E.Message, error) {
+	if content.Body == "" {
+		return nil, protocol.NewError(protocol.ErrorInvalidPayload, "a text message with no body is not a message")
 	}
 	if alongside == nil {
-		return &waE2E.Message{Conversation: proto.String(req.Content.Body)}, nil
+		return &waE2E.Message{Conversation: proto.String(content.Body)}, nil
 	}
 	return &waE2E.Message{ExtendedTextMessage: &waE2E.ExtendedTextMessage{
-		Text:        proto.String(req.Content.Body),
+		Text:        proto.String(content.Body),
 		ContextInfo: alongside,
 	}}, nil
 }

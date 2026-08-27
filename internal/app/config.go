@@ -53,6 +53,12 @@ type Config struct {
 	// file, which is the window where the answer can be anything but a failure. Longer
 	// than that retains keys to files WhatsApp has already dropped.
 	MediaRefetch time.Duration
+	// MediaSendMax is the largest file this instance will send. It is deliberately not
+	// the blob cap: that one bounds what an inbound file costs this instance's disk, and
+	// an instance given no blob root at all still sends. What this bounds is a fetch
+	// from an address the caller chose and an upload to WhatsApp, neither of which
+	// touches the cache.
+	MediaSendMax int64
 	LogLevel     string
 	LeaseTTL     time.Duration
 	Heartbeat    time.Duration
@@ -144,6 +150,10 @@ func LoadConfig(hostname string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	mediaSendMax, err := envBytes("WAC_MEDIA_SEND_MAX", media.DefaultSendMax)
+	if err != nil {
+		return Config{}, err
+	}
 
 	cfg := Config{
 		Instance:       envString("WAC_INSTANCE", hostname),
@@ -163,6 +173,7 @@ func LoadConfig(hostname string) (Config, error) {
 		MediaQuota:     mediaQuota,
 		MediaMaxBlob:   mediaMaxBlob,
 		MediaBlockSize: mediaBlockSize,
+		MediaSendMax:   mediaSendMax,
 		LogLevel:       envString("WAC_LOG_LEVEL", "info"),
 		LeaseTTL:       leaseTTL,
 		Heartbeat:      heartbeat,
@@ -244,6 +255,11 @@ func LoadConfig(hostname string) (Config, error) {
 		return Config{}, fmt.Errorf(
 			"app: WAC_MEDIA_REFETCH_TTL (%s) is shorter than WAC_MEDIA_TTL (%s), so a file would stop being "+
 				"recoverable before the blob naming it expires", cfg.MediaRefetch, cfg.MediaTTL)
+	}
+	if cfg.MediaSendMax <= 0 {
+		return Config{}, fmt.Errorf(
+			"app: WAC_MEDIA_SEND_MAX must be positive, got %d: zero is not "+
+				"\"no limit\", it is an instance that refuses every file it is asked to send", cfg.MediaSendMax)
 	}
 	if cfg.MediaMaxBlob > cfg.MediaQuota {
 		// One blob would evict everything else and then itself. media.New refuses this

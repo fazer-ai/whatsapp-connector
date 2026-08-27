@@ -157,3 +157,21 @@ internal/protocol/types.go: Preserve idempotency for media downloads  # PR#22
 # package doc has called open since M1, and neither belongs in the PR that made the
 # first write.
 internal/store/media.go: Fence media writes with the ownership epoch  # PR#22
+# PR#27: the concern is real and the prescription is not. Refusing a private-network
+# address would not fetch a single attachment in the deployment the contract describes:
+# the client sits next to this connector and hands over an address on their own network,
+# which is what INTERNAL_HOST_URL exists to be, and the contract's own fixture is
+# `http://rails:3000/...`. Nor is the producer a stranger -- `ref.url` is built by the
+# client from its own routes, and whoever can write to the command stream can already
+# send arbitrary messages from the operator's account and read every inbound one, so a
+# read of an internal HTTP service adds little to what they hold. What it does add is
+# the metadata service: it answers with credentials rather than data, so reaching it
+# escalates a compromised client into the cloud account. Those addresses are refused as
+# of this PR -- the link-local range, and the addresses each cloud answers on outside it
+# -- on the dial rather than on the
+# URL, so a name that resolves to one and every redirect hop are covered, and the
+# transport does not proxy, because a proxied dial is to the proxy. The general closure
+# is an operator-configured
+# allowlist of hosts this connector fetches from, which is config somebody has to set
+# and a decision the contract has to carry; registered as #31.
+internal/engine/whatsmeow/outbound.go: Reject private-network media fetch targets  # PR#27

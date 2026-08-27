@@ -17,6 +17,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/app"
+	"github.com/fazer-ai/whatsapp-connector/internal/media"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 	"github.com/fazer-ai/whatsapp-connector/internal/redisx"
 	"github.com/fazer-ai/whatsapp-connector/internal/transport/redisstream"
@@ -1001,5 +1002,47 @@ func TestAConnectorWithNoMediaRootServesNoMedia(t *testing.T) {
 		t.Context(), http.MethodGet, "/media/blob_000102030405060708090a0b", http.NoBody))
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("an instance with no media store answered %d, want 404", rec.Code)
+	}
+}
+
+// Sending does not go through the blob cache, so an instance told to keep nothing still
+// has to be able to send. A cap that only existed alongside a media root would make
+// every such instance refuse every file, which is a deployment that looks configured and
+// cannot send an attachment.
+func TestTheSendCapDoesNotDependOnHavingABlobStore(t *testing.T) {
+	t.Setenv("WAC_INSTANCE", "inst-a")
+
+	cfg, err := app.LoadConfig("host")
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.MediaRoot != "" {
+		t.Fatal("this test is about an instance with no media root, and it has one")
+	}
+	if cfg.MediaSendMax != media.DefaultSendMax {
+		t.Fatalf("the send cap read as %d with no media root, want %d", cfg.MediaSendMax, media.DefaultSendMax)
+	}
+
+	t.Setenv("WAC_MEDIA_SEND_MAX", "16 MiB")
+	cfg, err = app.LoadConfig("host")
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.MediaSendMax != 16<<20 {
+		t.Fatalf("the send cap read as %d, want 16 MiB", cfg.MediaSendMax)
+	}
+}
+
+// Zero is not "no limit": it is an instance that refuses every file it is asked to send,
+// which is a setting an operator would find out about from an agent whose attachment
+// never goes out.
+func TestANonPositiveSendCapIsRefused(t *testing.T) {
+	t.Setenv("WAC_INSTANCE", "inst-a")
+
+	for _, bad := range []string{"0", "-1", "lots", "16MB"} {
+		t.Setenv("WAC_MEDIA_SEND_MAX", bad)
+		if _, err := app.LoadConfig("host"); err == nil {
+			t.Fatalf("WAC_MEDIA_SEND_MAX=%q was accepted", bad)
+		}
 	}
 }

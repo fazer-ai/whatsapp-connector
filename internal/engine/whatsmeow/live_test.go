@@ -18,7 +18,11 @@
 //	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveMedia
 //	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveRefetch
 //	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveViewOnce
-//	WAC_LIVE_TO=<number> go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveSend
+//	WAC_LIVE_TO=<number> go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveSend$
+//	WAC_LIVE_TO=<number> go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveSendMedia
+//	  (WAC_LIVE_FILE names the file; WAC_LIVE_VOICE=1 sends it as a voice note)
+//	WAC_LIVE_TO=<number> go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveSendLocation
+//	WAC_LIVE_TO=<number> go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveSendContacts
 //	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveLogout
 //
 // The store is deliberately not a t.TempDir: resuming is the thing being checked, and
@@ -32,6 +36,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -676,6 +681,230 @@ func TestLiveSend(t *testing.T) {
 
 // TestLiveLogout unlinks the device. It is the last phase, and running it means the
 // next run starts at TestLivePairWithQR again.
+// TestLiveSendMedia is M2.4 against a real recipient: a file fetched over HTTP, uploaded
+// to WhatsApp, and rendered in somebody's chat.
+//
+// A fake upload proves the plumbing and nothing else. What only WhatsApp and a recipient
+// client can answer is whether the key this build derives decrypts on the other side,
+// whether the mimetype it sends is one the client renders rather than files as an
+// attachment, and whether a sticker uploaded under the image key arrives as a sticker.
+// Every one of those fails as something the recipient sees and the sender does not.
+//
+// The file is served from this process, so the fetch is a real HTTP round trip against a
+// real address, headers included. Point WAC_LIVE_FILE at a file to send your own.
+func TestLiveSendMedia(t *testing.T) {
+	to := os.Getenv("WAC_LIVE_TO")
+	if to == "" {
+		t.Skip("set WAC_LIVE_TO to the number this account should send to")
+	}
+	const token = "live-check"
+
+	file, name, kind := liveFileToSend(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /outbound/{name}", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+token {
+			// Asserted by serving a 401: the send then fails with the reason, which is
+			// how this phase would report a header that did not travel.
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", liveMime(name))
+		w.Header().Set("Content-Length", strconv.Itoa(len(file)))
+		_, _ = w.Write(file)
+	})
+	endpoint := httptest.NewServer(mux)
+	t.Cleanup(endpoint.Close)
+
+	session, _ := liveSession(t)
+	events := watch(t, session)
+	if err := session.Connect(t.Context(), engine.ConnectRequest{Pairing: "resume"}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	events.awaitState(t, "open", 2*time.Minute)
+
+	// A voice note is not something a filename can say: an .ogg is as likely to be music,
+	// and what makes one is the caller setting the flag. It is worth its own run because
+	// it is the one kind whose type this build fills in on its own.
+	if os.Getenv("WAC_LIVE_VOICE") != "" {
+		kind = "audio"
+	}
+	content := map[string]any{
+		"type": "media", "kind": kind, "filename": name, "size": len(file),
+		"voice_note": os.Getenv("WAC_LIVE_VOICE") != "",
+		"ref": map[string]any{
+			"kind": "url", "url": endpoint.URL + "/outbound/" + name,
+			"headers": map[string]any{"Authorization": "Bearer " + token},
+		},
+	}
+	// Only where WhatsApp has somewhere to put one. A caption on an audio or a sticker is
+	// refused on the payload, so a phase that added one to everything would fail before
+	// fetching anything and never exercise the file at all.
+	if captions[protocol.MediaKind(kind)] {
+		content["caption"] = "conector nativo, fatia de saída"
+	}
+	// WAC_LIVE_DURATION is how long the caller says an audio or a video runs. Worth being
+	// able to leave off as well as set: what a recipient does with a length it was not
+	// given is a question for a phone.
+	// WAC_LIVE_MIME pins what the message says the file is, for telling a type WhatsApp
+	// refuses apart from one it merely renders differently.
+	if forced := os.Getenv("WAC_LIVE_MIME"); forced != "" {
+		content["mime"] = forced
+	}
+	if raw := os.Getenv("WAC_LIVE_DURATION"); raw != "" {
+		seconds, err := strconv.Atoi(raw)
+		if err != nil || seconds < 0 {
+			t.Fatalf("WAC_LIVE_DURATION=%q: want a duration in seconds", raw)
+		}
+		content["duration"] = seconds
+	}
+	sent := liveSendOne(t, session, to, content)
+	say("sent a %s (%d bytes) as %s -- check the recipient renders it, not just receives it", kind, len(file), sent)
+}
+
+// TestLiveSendLocation and TestLiveSendContacts are the two bodies that carry no file.
+// They are here for the same reason as the media phase: what they render as on the other
+// side is not something a protobuf comparison can answer.
+func TestLiveSendLocation(t *testing.T) {
+	to := os.Getenv("WAC_LIVE_TO")
+	if to == "" {
+		t.Skip("set WAC_LIVE_TO to the number this account should send to")
+	}
+
+	session, _ := liveSession(t)
+	events := watch(t, session)
+	if err := session.Connect(t.Context(), engine.ConnectRequest{Pairing: "resume"}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	events.awaitState(t, "open", 2*time.Minute)
+
+	sent := liveSendOne(t, session, to, map[string]any{
+		"type": "location", "latitude": -25.4284, "longitude": -49.2733,
+		"name": "Praça Tiradentes", "address": "Curitiba, PR",
+	})
+	say("sent a pin as %s -- check it shows the name and the address, not two numbers", sent)
+}
+
+func TestLiveSendContacts(t *testing.T) {
+	to := os.Getenv("WAC_LIVE_TO")
+	if to == "" {
+		t.Skip("set WAC_LIVE_TO to the number this account should send to")
+	}
+
+	session, _ := liveSession(t)
+	events := watch(t, session)
+	if err := session.Connect(t.Context(), engine.ConnectRequest{Pairing: "resume"}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	events.awaitState(t, "open", 2*time.Minute)
+
+	// A name with a semicolon in it on purpose: a vCard reads one as structure, and the
+	// escaping this build does is only ever confirmed by a recipient rendering the name
+	// in one piece.
+	one := liveSendOne(t, session, to, map[string]any{
+		"type": "contacts",
+		"contacts": []map[string]any{
+			{"display_name": "Souza; Ana", "phone": to},
+		},
+	})
+	say("sent one card as %s -- check the name reads as one line and tapping it opens a chat", one)
+
+	several := liveSendOne(t, session, to, map[string]any{
+		"type": "contacts",
+		"contacts": []map[string]any{
+			{"display_name": "Souza; Ana", "phone": to},
+			{"display_name": "Bruno", "phone": to},
+		},
+	})
+	say("sent two cards as %s -- check they arrive as a stack rather than as one card", several)
+}
+
+// liveSendOne sends one body and answers the id WhatsApp stamped it with.
+func liveSendOne(t *testing.T, session *Session, to string, content map[string]any) string {
+	t.Helper()
+
+	messageID := session.current().GenerateMessageID()
+	payload, err := json.Marshal(map[string]any{
+		"message_id": messageID,
+		"to":         map[string]any{"kind": "phone", "id": to},
+		"content":    content,
+	})
+	if err != nil {
+		t.Fatalf("build the send: %v", err)
+	}
+
+	result, err := session.Execute(t.Context(), &protocol.Command{
+		Type: protocol.CommandMessageSend, Payload: payload,
+	})
+	if err != nil {
+		t.Fatalf("message.send: %v", err)
+	}
+	var sent struct {
+		MessageID string `json:"message_id"`
+		Timestamp int64  `json:"timestamp"`
+	}
+	if err := json.Unmarshal(result, &sent); err != nil {
+		t.Fatalf("unmarshal the result: %v", err)
+	}
+	if sent.MessageID != messageID {
+		t.Fatalf("the send came back as %q, and the caller named it %q", sent.MessageID, messageID)
+	}
+	if sent.Timestamp == 0 {
+		t.Fatal("the send came back without the timestamp WhatsApp stamped it with")
+	}
+	return sent.MessageID
+}
+
+// liveFileToSend is what the media phase sends: the operator's own file when WAC_LIVE_FILE
+// names one, and a small generated JPEG otherwise, so the phase runs with nothing set up.
+func liveFileToSend(t *testing.T) (content []byte, name, kind string) {
+	t.Helper()
+
+	if path := os.Getenv("WAC_LIVE_FILE"); path != "" {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		name = filepath.Base(path)
+		return raw, name, liveKind(name)
+	}
+	// A one-pixel JPEG, so the phase has something real to upload with nothing prepared.
+	// Small on purpose: what is being checked is the round trip, not the transfer.
+	raw, err := base64.StdEncoding.DecodeString(
+		"/9j/4AAQSkZJRgABAQEAYABgAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0a" +
+			"HBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/wAALCAABAAEBAREA/8QAFAABAAAAAAAA" +
+			"AAAAAAAAAAAACf/EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAD8AKp//2Q==")
+	if err != nil {
+		t.Fatalf("decode the built-in file: %v", err)
+	}
+	return raw, "pixel.jpg", "image"
+}
+
+// liveKind guesses the contract's kind from a filename, so an operator pointing
+// WAC_LIVE_FILE at a PDF does not also have to say what a PDF is.
+func liveKind(name string) string {
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".jpg", ".jpeg", ".png":
+		return "image"
+	case ".mp4", ".mov":
+		return "video"
+	case ".ogg", ".opus", ".mp3", ".m4a":
+		return "audio"
+	case ".webp":
+		return "sticker"
+	default:
+		return "document"
+	}
+}
+
+// liveMime is what the little server labels the file with, so the phase also exercises
+// the fallback that reads the mimetype off the response.
+func liveMime(name string) string {
+	if guessed := mime.TypeByExtension(strings.ToLower(filepath.Ext(name))); guessed != "" {
+		return guessed
+	}
+	return "application/octet-stream"
+}
+
 func TestLiveLogout(t *testing.T) {
 	if os.Getenv("WAC_LIVE_LOGOUT") != "yes" {
 		t.Skip("set WAC_LIVE_LOGOUT=yes to unlink the device")

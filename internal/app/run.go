@@ -107,6 +107,9 @@ func New(cfg *Config, log zerolog.Logger) (connector *Connector, err error) {
 		blobHandler http.Handler
 		mediaOpts   meow.MediaOptions
 	)
+	// Set whether or not there is a blob root: sending a file does not go through the
+	// cache, and an instance told to keep nothing still has to be able to send.
+	mediaOpts.SendMax = cfg.MediaSendMax
 	if cfg.MediaRoot != "" {
 		blobs, err = media.New(media.Options{
 			Root: cfg.MediaRoot, TTL: cfg.MediaTTL,
@@ -126,7 +129,7 @@ func New(cfg *Config, log zerolog.Logger) (connector *Connector, err error) {
 		blobHandler = media.Handler(media.HandlerOptions{Blobs: blobs, Token: cfg.MediaToken})
 		// Assigned only in here. A nil *media.Store put in the interface is not a nil
 		// interface, and every session would then take the store path and fail on it.
-		mediaOpts = meow.MediaOptions{Blobs: blobs, BaseURL: cfg.AdvertiseURL}
+		mediaOpts.Blobs, mediaOpts.BaseURL = blobs, cfg.AdvertiseURL
 	}
 
 	waEngine, devices, err := newEngine(startupCtx, cfg, mediaOpts, log)

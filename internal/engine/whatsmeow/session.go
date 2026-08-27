@@ -1,6 +1,7 @@
 package whatsmeow
 
 import (
+	"cmp"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
@@ -8,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,6 +23,7 @@ import (
 	waLog "go.mau.fi/whatsmeow/util/log"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/engine"
+	"github.com/fazer-ai/whatsapp-connector/internal/media"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 	"github.com/fazer-ai/whatsapp-connector/internal/store"
 )
@@ -103,6 +106,22 @@ type Session struct {
 	// answer a download, so a test cannot otherwise reach either side of the split
 	// between a failure worth retrying and one that is permanent.
 	download func(context.Context, *wm.Client, wm.DownloadableMessage) ([]byte, error)
+
+	// uploadWait bounds how long an outbound media message spends fetching its file and
+	// handing it to WhatsApp. A field for the same reason as the three above it.
+	uploadWait time.Duration
+
+	// retrieve fetches the bytes of an outbound file from the address the caller named,
+	// and uploadFile hands them to WhatsApp. Fields for the same reason as download:
+	// nothing outside an HTTP server and a real socket can make either of them fail the
+	// way this has to answer for, so a test cannot otherwise reach the split between a
+	// caller's bad address and a server having a bad minute.
+	retrieve   func(ctx context.Context, address string, headers map[string]string) (source, error)
+	uploadFile func(context.Context, *wm.Client, wm.MediaType, io.Reader) (wm.UploadResponse, error)
+
+	// sendLimit is the largest file this session will send. Not the blob cap: an
+	// instance with nowhere to keep an inbound file still sends one.
+	sendLimit int64
 
 	// blobs is where the file of an inbound message is kept, and blobBase the address a
 	// client fetches it from. Nil when the deployment gave this instance nowhere to
@@ -215,12 +234,16 @@ func newSession(
 		download: func(ctx context.Context, client *wm.Client, part wm.DownloadableMessage) ([]byte, error) {
 			return client.Download(ctx, part) //nolint:wrapcheck // classified by downloadFailure, which needs the sentinels
 		},
-		blobs:    blobs.Blobs,
-		blobBase: blobs.BaseURL,
+		retrieve:   retrieveOverHTTP,
+		uploadFile: uploadOverClient,
+		sendLimit:  cmp.Or(blobs.SendMax, media.DefaultSendMax),
+		blobs:      blobs.Blobs,
+		blobBase:   blobs.BaseURL,
 
 		storeLimit:   bindTimeout,
 		deliverWait:  deliverTimeout,
 		downloadWait: downloadTimeout,
+		uploadWait:   uploadTimeout,
 	}
 	s.adopt(client)
 	go s.forward()
