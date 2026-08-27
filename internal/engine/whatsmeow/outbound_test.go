@@ -1334,6 +1334,12 @@ func TestWhereACallersHeadersStopOnARedirect(t *testing.T) {
 		{"another host", "https://storage.example/a", "https://elsewhere.example/b", false},
 		{"a downgrade to plaintext on the same name", "https://storage.example/a", "http://storage.example/a", false},
 		{"another port on the same name", "https://storage.example/a", "https://storage.example:8443/a", false},
+		// The same origin spelled differently, which a string comparison reads as another
+		// one: the caller then loses its credentials and the fetch answers 401.
+		{"the same host in another case", "https://storage.example/a", "https://STORAGE.example/b", true},
+		{"the scheme's own port written out", "https://storage.example/a", "https://storage.example:443/b", true},
+		{"the scheme's own port written out on http", "http://storage.example/a", "http://storage.example:80/b", true},
+		{"the port dropped from a plaintext address", "http://storage.example:80/a", "http://storage.example/b", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -2077,5 +2083,63 @@ func TestTwoHeadersThatAreTheSameHeaderAreRefused(t *testing.T) {
 		"Authorization": "Bearer a", "X-API-Key": "b", "Accept": "*/*",
 	}); err != nil {
 		t.Fatalf("three different headers were refused: %v", err)
+	}
+}
+
+// Set on a request's header map, Host does nothing: net/http takes the authority from
+// Request.Host or from the URL and ignores the field. Accepted silently, a reference that
+// needs virtual-host addressing fetches from somewhere else entirely and says it worked.
+func TestAHostHeaderIsRefusedRatherThanSilentlyIgnored(t *testing.T) {
+	t.Parallel()
+
+	for _, name := range []string{"Host", "host", "HOST"} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			session, serving, _ := outboundSession(t)
+			serving.answer([]byte("bytes"), "")
+
+			_, err := session.send(t.Context(), &protocol.Command{
+				Type: protocol.CommandMessageSend,
+				Payload: json.RawMessage(`{"message_id":"3EB0","to":{"kind":"phone","id":"5511999990001"},
+					"content":{"type":"media","kind":"image","ref":{"kind":"url",
+					"url":"http://10.0.0.5/blob.jpg","headers":{"` + name + `":"storage.example"}}}}`),
+			})
+			assertCode(t, err, protocol.ErrorInvalidPayload)
+			if serving.count() != 0 {
+				t.Fatalf("a fetch that would have gone somewhere else was still made %d time(s)", serving.count())
+			}
+		})
+	}
+}
+
+// A negative size is not an absent one, which is what every check below it would read it
+// as: the contract says `minimum: 0` and nothing validates a command against the schema
+// at runtime, so a negative silently turns off the comparison that catches a file
+// arriving short.
+func TestASizeNoFileCouldHaveIsRefused(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct{ name, content string }{
+		{"on the message", `"size":-1,"ref":{"kind":"url","url":"http://rails:3000/blob.jpg"}`},
+		{"on the reference", `"ref":{"kind":"url","url":"http://rails:3000/blob.jpg","size":-1}`},
+		{"on both", `"size":-4096,"ref":{"kind":"url","url":"http://rails:3000/blob.jpg","size":-4096}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			session, serving, _ := outboundSession(t)
+			serving.answer([]byte("metade do arquivo"), "")
+
+			_, err := session.send(t.Context(), &protocol.Command{
+				Type: protocol.CommandMessageSend,
+				Payload: json.RawMessage(`{"message_id":"3EB0","to":{"kind":"phone","id":"5511999990001"},
+					"content":{"type":"media","kind":"image",` + tc.content + `}}`),
+			})
+			assertCode(t, err, protocol.ErrorInvalidPayload)
+			if serving.count() != 0 {
+				t.Fatalf("a payload the contract forbids still cost %d fetch(es)", serving.count())
+			}
+		})
 	}
 }

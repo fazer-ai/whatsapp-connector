@@ -454,6 +454,14 @@ func planMedia(content *mediaContent, limit int64) (*mediaPlan, error) {
 	// the one it has. Refused before the transfer, the same way an inbound file is
 	// refused on the sender's claim.
 	for _, declared := range [...]int64{content.Size, content.Ref.Size} {
+		if declared < 0 {
+			// Not the same as absent, which is what every check below would read it as:
+			// the contract says `minimum: 0` and nothing validates a command against the
+			// schema at runtime, so a negative here silently turns off the comparison
+			// that catches a file arriving short.
+			return nil, protocol.NewError(protocol.ErrorInvalidPayload,
+				fmt.Sprintf("%d is not a size a file can have", declared))
+		}
 		if declared > 0 && declared > limit {
 			return nil, protocol.NewError(protocol.ErrorMediaTooLarge,
 				fmt.Sprintf("the caller says %d bytes and this instance sends at most %d", declared, limit))
@@ -780,6 +788,17 @@ func sendableHeaders(headers map[string]string) error {
 	seen := make(map[string]string, len(headers))
 	for name := range headers {
 		folded := strings.ToLower(name)
+		if folded == "host" {
+			// Set on a request's header map, this one does nothing: net/http takes the
+			// authority from Request.Host or from the URL and ignores the field. Accepted
+			// silently, a reference that needs virtual-host addressing fetches from
+			// somewhere else entirely and says it worked. Honouring it would mean
+			// carrying it through the redirects as something that is not a header, which
+			// is a feature nothing here has asked for; the address is where a host
+			// belongs.
+			return protocol.NewError(protocol.ErrorInvalidPayload,
+				"Host is not a header this connector can send: put the host in the address")
+		}
 		if first, repeated := seen[folded]; repeated {
 			return protocol.NewError(protocol.ErrorInvalidPayload,
 				fmt.Sprintf("%q and %q are the same header, and which one would be sent is not decided anywhere",
@@ -1187,7 +1206,7 @@ func followingRedirects(headers map[string]string) func(*http.Request, []*http.R
 		// The scheme is half of that origin. A redirect from https to http on the same
 		// name is the classic downgrade: compared by host alone the destination looks
 		// like the same trusted place, and the credential goes out in plaintext.
-		if hop.URL.Scheme != via[0].URL.Scheme || hop.URL.Host != via[0].URL.Host {
+		if !sameOrigin(hop.URL, via[0].URL) {
 			for name := range headers {
 				hop.Header.Del(name)
 			}
@@ -1201,6 +1220,29 @@ func followingRedirects(headers map[string]string) func(*http.Request, []*http.R
 		}
 		return nil
 	}
+}
+
+// sameOrigin reports whether a redirect stayed where the caller pointed it.
+//
+// Compared as origins rather than as strings, because the same origin is spelled several
+// ways: a host name is case-insensitive, and a port left off means the scheme's own. A
+// redirect from `storage.example` to `STORAGE.example:443` reaches the same server, and
+// read as a different one it costs the caller its credentials and the fetch answers 401.
+func sameOrigin(hop, first *url.URL) bool {
+	return strings.EqualFold(hop.Scheme, first.Scheme) &&
+		strings.EqualFold(hop.Hostname(), first.Hostname()) &&
+		effectivePort(hop) == effectivePort(first)
+}
+
+// effectivePort is the port an address reaches, named or implied by its scheme.
+func effectivePort(address *url.URL) string {
+	if port := address.Port(); port != "" {
+		return port
+	}
+	if strings.EqualFold(address.Scheme, "https") {
+		return "443"
+	}
+	return "80"
 }
 
 // statusFailure splits what the caller's own server said into the answers a client acts
