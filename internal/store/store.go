@@ -368,6 +368,8 @@ func (c *Container) migrate(ctx context.Context) error {
 		`CREATE TABLE IF NOT EXISTS wac_media_part (
 			sid             TEXT   NOT NULL,
 			message_id      TEXT   NOT NULL,
+			chat_kind       TEXT   NOT NULL,
+			chat_id         TEXT   NOT NULL,
 			kind            TEXT   NOT NULL,
 			direct_path     TEXT   NOT NULL,
 			media_key       TEXT   NOT NULL,

@@ -39,7 +39,7 @@ func TestAFileIsFetchedAgainAfterTheBlobItWasPublishedWithIsGone(t *testing.T) {
 	// The instance that wrote it is replaced, and the blob goes with it.
 	replaceInstance(t, session)
 
-	second := refetch(t, session, "3EB0AGAIN")
+	second := refetch(t, session, "3EB0AGAIN", nil)
 	if second.URL == first.URL {
 		t.Fatal("the refetch handed back the address of an instance that is gone")
 	}
@@ -67,7 +67,7 @@ func TestAMessageNothingWasKeptForIsGivenUpOnRatherThanRetried(t *testing.T) {
 	session, _ := mediaSession(t, media.Options{})
 	connect(session)
 
-	_, err := refetchErr(session, "3EB0NEVER")
+	_, err := refetchErr(session, "3EB0NEVER", nil)
 	assertCode(t, err, protocol.ErrorMediaUnavailable)
 }
 
@@ -84,7 +84,7 @@ func TestAFileIsNotFetchedAgainWhileTheSessionIsDown(t *testing.T) {
 	}
 
 	disconnect(session)
-	_, err := refetchErr(session, "3EB0DOWN")
+	_, err := refetchErr(session, "3EB0DOWN", nil)
 	assertCode(t, err, protocol.ErrorNotConnected)
 	if downloads.count() != 1 {
 		t.Fatalf("a session that is down still spent %d downloads", downloads.count()-1)
@@ -100,7 +100,7 @@ func TestARefetchByAnInstanceWithNowhereToPutTheFileIsRetriedRatherThanGivenUpOn
 	session, _ := newTestSession(t, "5511999990001")
 	connect(session)
 
-	_, err := refetchErr(session, "3EB0NOROOT")
+	_, err := refetchErr(session, "3EB0NOROOT", nil)
 	assertCode(t, err, protocol.ErrorInternal)
 }
 
@@ -217,6 +217,88 @@ func TestTheLengthKeptIsTheOneThatWasWrittenAndNotTheOneTheSenderClaimed(t *test
 	}
 }
 
+// A message id is the sender's to choose, so two chats under one account can carry the
+// same one and the second row replaces the first. Rare enough that this cannot resolve
+// it -- the client keys by message id too -- but it must not resolve it wrongly: handing
+// the file over would put one conversation's attachment in another's thread.
+func TestADownloadForADifferentChatThanTheOneOnRecordIsRefused(t *testing.T) {
+	t.Parallel()
+
+	session, downloads := mediaSession(t, media.Options{})
+	downloads.answer([]byte("os mesmos bytes"), nil)
+	connect(session)
+	if _, acknowledged := deliver(t, session, imageEvent("3EB0MINE"), 1); !acknowledged {
+		t.Fatal("a media message with a file was left unacknowledged")
+	}
+
+	_, err := refetchErr(session, "3EB0MINE", &protocol.Address{Kind: protocol.AddressPhone, ID: "5511000000000"})
+	assertCode(t, err, protocol.ErrorMediaUnavailable)
+	if downloads.count() != 1 {
+		t.Fatalf("a refused download still fetched the file (%d downloads)", downloads.count())
+	}
+
+	// And the chat it really is filed under is served, so the check is a check and not a
+	// refusal of everything.
+	chat, ok := chatOf(imageEvent("3EB0MINE"))
+	if !ok {
+		t.Fatal("the test event has no chat")
+	}
+	if ref := refetch(t, session, "3EB0MINE", &chat); ref.ID == "" {
+		t.Fatal("a download naming the chat the message is in was not served")
+	}
+}
+
+// The command makes `chat` optional, and a caller that omits it is no worse off than
+// before this column existed.
+func TestADownloadThatNamesNoChatIsStillServed(t *testing.T) {
+	t.Parallel()
+
+	session, downloads := mediaSession(t, media.Options{})
+	downloads.answer([]byte("os mesmos bytes"), nil)
+	connect(session)
+	if _, acknowledged := deliver(t, session, imageEvent("3EB0NOCHAT"), 1); !acknowledged {
+		t.Fatal("a media message with a file was left unacknowledged")
+	}
+
+	if ref := refetch(t, session, "3EB0NOCHAT", nil); ref.ID == "" {
+		t.Fatal("a download that named no chat was not served")
+	}
+}
+
+// The chat a file is filed under is the one the event was published under, and the two
+// come from the same function so they cannot drift apart.
+func TestTheChatAFileIsFiledUnderIsTheOneItsMessageWasPublishedUnder(t *testing.T) {
+	t.Parallel()
+
+	session, downloads := mediaSession(t, media.Options{})
+	downloads.answer([]byte("os mesmos bytes"), nil)
+	connect(session)
+
+	emissions, acknowledged := deliver(t, session, imageEvent("3EB0FILED"), 1)
+	if !acknowledged {
+		t.Fatal("a media message with a file was left unacknowledged")
+	}
+	var published struct {
+		Message protocol.InboundMessage `json:"message"`
+	}
+	raw, err := json.Marshal(emissions[0].Payload)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if err := json.Unmarshal(raw, &published); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+
+	kept, found, err := session.store.MediaPart(t.Context(), session.sid, "3EB0FILED")
+	if err != nil || !found {
+		t.Fatalf("a message that was downloaded was not kept (found=%v, err=%v)", found, err)
+	}
+	if kept.ChatKind != string(published.Message.Chat.Kind) || kept.ChatID != published.Message.Chat.ID {
+		t.Fatalf("the file is filed under %s:%s and its message was published under %s:%s",
+			kept.ChatKind, kept.ChatID, published.Message.Chat.Kind, published.Message.Chat.ID)
+	}
+}
+
 // --- helpers ------------------------------------------------------------------------
 
 func connect(session *Session) {
@@ -232,18 +314,18 @@ func disconnect(session *Session) {
 }
 
 // refetch runs `message.download_media` and insists it worked.
-func refetch(t *testing.T, session *Session, messageID string) protocol.MediaRef {
+func refetch(t *testing.T, session *Session, messageID string, chat *protocol.Address) protocol.MediaRef {
 	t.Helper()
 
-	ref, err := refetchErr(session, messageID)
+	ref, err := refetchErr(session, messageID, chat)
 	if err != nil {
 		t.Fatalf("message.download_media(%s): %v", messageID, err)
 	}
 	return ref
 }
 
-func refetchErr(session *Session, messageID string) (protocol.MediaRef, error) {
-	payload, err := json.Marshal(map[string]string{"message_id": messageID})
+func refetchErr(session *Session, messageID string, chat *protocol.Address) (protocol.MediaRef, error) {
+	payload, err := json.Marshal(map[string]any{"message_id": messageID, "chat": chat})
 	if err != nil {
 		return protocol.MediaRef{}, err
 	}

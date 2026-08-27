@@ -25,6 +25,12 @@ import (
 type MediaPart struct {
 	SID       string
 	MessageID string
+	// ChatKind and ChatID are the chat the message was published under. They are not
+	// part of the key -- see PutMediaPart for why -- and they are here so a lookup can
+	// tell that the row it found belongs to a different conversation than the one asking
+	// for it, and refuse rather than hand over somebody else's file.
+	ChatKind string
+	ChatID   string
 	// Kind is the contract's media kind, and it decides which of whatsmeow's message
 	// types the download is rebuilt as, which is how whatsmeow knows the media type.
 	Kind string
@@ -51,6 +57,13 @@ type MediaPart struct {
 // later delivery carries the fresher coordinates, so an older write landing afterwards
 // has nothing to add and can only take something away.
 //
+// The key is the session and the message, and the chat is a column rather than part of
+// it. Making it part of the key would give a message id in two chats a row each, and the
+// client's own command makes `chat` optional -- so a lookup arriving without one would
+// have two rows to choose between and no way to choose. Kept as a column, a lookup that
+// does bring a chat can tell it found somebody else's row and refuse; one that does not
+// is no worse off than before.
+//
 // That case is not hypothetical: ownership of a session moves between instances, and the
 // old owner's handler can still be inside this call when the new one writes. This does
 // not fence the write against a lost lease -- it cannot, there is no epoch in this schema
@@ -67,17 +80,18 @@ func (c *Container) PutMediaPart(ctx context.Context, part *MediaPart, now time.
 
 	const upsert = `
 		INSERT INTO wac_media_part
-			(sid, message_id, kind, direct_path, media_key, file_enc_sha256, file_sha256,
-			 file_length, mime, filename, stored_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			(sid, message_id, chat_kind, chat_id, kind, direct_path, media_key,
+			 file_enc_sha256, file_sha256, file_length, mime, filename, stored_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (sid, message_id) DO UPDATE SET
+			chat_kind = excluded.chat_kind, chat_id = excluded.chat_id,
 			kind = excluded.kind, direct_path = excluded.direct_path, media_key = excluded.media_key,
 			file_enc_sha256 = excluded.file_enc_sha256, file_sha256 = excluded.file_sha256,
 			file_length = excluded.file_length, mime = excluded.mime, filename = excluded.filename,
 			stored_at = excluded.stored_at
 		WHERE excluded.stored_at > wac_media_part.stored_at`
 	_, err := c.db.ExecContext(ctx, c.rebind(upsert),
-		part.SID, part.MessageID, part.Kind, part.DirectPath,
+		part.SID, part.MessageID, part.ChatKind, part.ChatID, part.Kind, part.DirectPath,
 		encode(part.MediaKey), encode(part.FileEncSHA256), encode(part.FileSHA256),
 		part.FileLength, part.Mime, part.Filename, stamp)
 	if err != nil {
@@ -90,13 +104,14 @@ func (c *Container) PutMediaPart(ctx context.Context, part *MediaPart, now time.
 // for it at all.
 func (c *Container) MediaPart(ctx context.Context, sid, messageID string) (MediaPart, bool, error) {
 	const query = `
-		SELECT kind, direct_path, media_key, file_enc_sha256, file_sha256,
+		SELECT chat_kind, chat_id, kind, direct_path, media_key, file_enc_sha256, file_sha256,
 		       file_length, mime, filename, stored_at
 		FROM wac_media_part WHERE sid = ? AND message_id = ?`
 
 	part := MediaPart{SID: sid, MessageID: messageID}
 	var key, encDigest, digest string
 	err := c.db.QueryRowContext(ctx, c.rebind(query), sid, messageID).Scan(
+		&part.ChatKind, &part.ChatID,
 		&part.Kind, &part.DirectPath, &key, &encDigest, &digest,
 		&part.FileLength, &part.Mime, &part.Filename, &part.StoredAt)
 	if errors.Is(err, sql.ErrNoRows) {

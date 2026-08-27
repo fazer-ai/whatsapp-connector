@@ -16,6 +16,7 @@ var storedAt = time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
 func samplePart(sid, messageID string) store.MediaPart {
 	return store.MediaPart{
 		SID: sid, MessageID: messageID, Kind: "image",
+		ChatKind: "phone", ChatID: "5511999990002",
 		DirectPath:    "/v/t62.7118-24/file.enc",
 		MediaKey:      bytes.Repeat([]byte{1}, 32),
 		FileEncSHA256: bytes.Repeat([]byte{2}, 32),

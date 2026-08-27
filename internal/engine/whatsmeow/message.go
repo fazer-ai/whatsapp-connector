@@ -139,17 +139,7 @@ func inboundOf(event *waEvents.Message, render renderBody) (protocol.InboundMess
 		// and the acknowledgement spends the one redelivery it had.
 		return protocol.InboundMessage{}, "", false
 	}
-	chatJID := event.Info.Chat
-	if event.Info.IsIncomingBroadcast() {
-		// Somebody sent this through a broadcast list, and WhatsApp shows it to the
-		// recipient in the direct chat with whoever sent it, not under the list.
-		// whatsmeow says so on the event, and addressing the list instead sends the
-		// message to a chat the client does not open conversations for, after
-		// acknowledging it: a message the recipient can see on their own phone and
-		// nowhere else. The status feed is not a broadcast list and is not touched.
-		chatJID = event.Info.Sender
-	}
-	chat, ok := addressOf(chatJID)
+	chat, ok := chatOf(event)
 	if !ok || event.Info.ID == "" {
 		return protocol.InboundMessage{}, "", false
 	}
@@ -182,6 +172,24 @@ func inboundOf(event *waEvents.Message, render renderBody) (protocol.InboundMess
 		Ephemeral: said.context.GetExpiration(),
 	}
 	return message, said.failure, true
+}
+
+// chatOf is which chat a message belongs to, and it is one function because two places
+// have to agree on the answer: the address the event is published under, and the one the
+// file kept for that message is filed under. A second copy of this rule would drift, and
+// the drift would file a message's file in a chat the message is not in.
+func chatOf(event *waEvents.Message) (protocol.Address, bool) {
+	chatJID := event.Info.Chat
+	if event.Info.IsIncomingBroadcast() {
+		// Somebody sent this through a broadcast list, and WhatsApp shows it to the
+		// recipient in the direct chat with whoever sent it, not under the list.
+		// whatsmeow says so on the event, and addressing the list instead sends the
+		// message to a chat the client does not open conversations for, after
+		// acknowledging it: a message the recipient can see on their own phone and
+		// nowhere else. The status feed is not a broadcast list and is not touched.
+		chatJID = event.Info.Sender
+	}
+	return addressOf(chatJID)
 }
 
 // newsletterEdit reports whether a newsletter post is a correction of an earlier one.

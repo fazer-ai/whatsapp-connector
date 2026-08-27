@@ -260,7 +260,7 @@ func (s *Session) mediaBody(ctx context.Context, event *waEvents.Message) (body,
 	// against the cap rather than the one the sender announced. The two only differ for
 	// a sender who understated, and that is exactly the file a lowered cap should stop
 	// before it is downloaded rather than after.
-	s.remember(event.Info.ID, &part)
+	s.remember(event, &part)
 	return body{content: part.content, context: part.context}, true
 }
 
@@ -418,12 +418,18 @@ func (s *Session) blobURL(id string) string {
 // A failure here is logged rather than returned. The message has its file now and the
 // client is about to be handed a reference that works; withholding it because a later
 // refetch might not be possible trades a message that arrives for one that might.
-func (s *Session) remember(messageID string, part *attachment) {
+func (s *Session) remember(event *waEvents.Message, part *attachment) {
 	ctx, cancel := context.WithTimeout(s.ctx, s.storeLimit)
 	defer cancel()
 
+	messageID := event.Info.ID
+	// Through chatOf, which is what the event was published under. Recomputing it here
+	// would be a second copy of the broadcast rule, and a copy that drifted would file a
+	// message's file under a chat the message is not in.
+	chat, _ := chatOf(event)
 	kept := store.MediaPart{
-		SID: s.sid, MessageID: messageID, Kind: string(part.content.Kind),
+		SID: s.sid, MessageID: messageID,
+		ChatKind: string(chat.Kind), ChatID: chat.ID, Kind: string(part.content.Kind),
 		DirectPath: part.download.GetDirectPath(), MediaKey: part.download.GetMediaKey(),
 		FileEncSHA256: part.download.GetFileEncSHA256(), FileSHA256: part.download.GetFileSHA256(),
 		FileLength: part.content.Size, Mime: part.content.Mime, Filename: part.content.Filename,
@@ -443,7 +449,8 @@ func (s *Session) remember(messageID string, part *attachment) {
 // happened here.
 func (s *Session) downloadMedia(ctx context.Context, command *protocol.Command) (json.RawMessage, error) {
 	var body struct {
-		MessageID string `json:"message_id"`
+		MessageID string            `json:"message_id"`
+		Chat      *protocol.Address `json:"chat"`
 	}
 	if err := json.Unmarshal(command.Payload, &body); err != nil {
 		return nil, protocol.NewError(protocol.ErrorInvalidPayload, "a download has to say whose file it wants")
@@ -469,6 +476,19 @@ func (s *Session) downloadMedia(ctx context.Context, command *protocol.Command) 
 		// coordinates back, and the client is better off saying so than retrying.
 		return nil, protocol.NewError(protocol.ErrorMediaUnavailable,
 			"nothing is kept for that message to fetch its file with")
+	}
+
+	if body.Chat != nil && (string(body.Chat.Kind) != kept.ChatKind || body.Chat.ID != kept.ChatID) {
+		// A message id is the sender's to choose, so two chats under one account can
+		// carry the same one and the second row replaces the first. Vanishingly rare and
+		// the client keys by message id too, so it is not a case this can resolve -- but
+		// it is one this must not resolve wrongly: handing back the file would put one
+		// conversation's attachment in another's thread. The chat is optional on the
+		// command, so this only fires when the caller brought one.
+		s.log.Warn().Str("message_id", body.MessageID).
+			Msg("refusing a download whose message is filed under a different chat")
+		return nil, protocol.NewError(protocol.ErrorMediaUnavailable,
+			"what is kept for that message belongs to a different chat")
 	}
 
 	if s.state() != "open" {
