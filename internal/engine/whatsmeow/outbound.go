@@ -323,11 +323,12 @@ func planMedia(content *outboundContent, limit int64) (*mediaPlan, error) {
 		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
 			fmt.Sprintf("%q is not a kind of file this contract carries", content.Kind))
 	}
-	if content.Kind == protocol.MediaSticker && content.Caption != "" {
-		// Dropped silently, a caption the caller wrote never reaches anybody and the
-		// send reports success. WhatsApp has nowhere to put one on a sticker.
+	if content.Caption != "" && !captions[content.Kind] {
+		// Dropped silently, a caption the caller wrote never reaches anybody and the send
+		// reports success. WhatsApp has nowhere to put one on either of these: neither
+		// StickerMessage nor AudioMessage has the field at all.
 		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
-			"a sticker carries no caption: send the text as its own message")
+			fmt.Sprintf("a %s carries no caption: send the text as its own message", content.Kind))
 	}
 	address, err := fetchable(content.Ref)
 	if err != nil {
@@ -339,11 +340,19 @@ func planMedia(content *outboundContent, limit int64) (*mediaPlan, error) {
 		return nil, protocol.NewError(protocol.ErrorMediaTooLarge,
 			fmt.Sprintf("the caller says %d bytes and this instance sends at most %d", declared, limit))
 	}
-	thumbnail, err := thumbnailBytes(content.Thumbnail)
+	thumbnail, err := thumbnailBytes(content.Thumbnail, content.Kind)
 	if err != nil {
 		return nil, err
 	}
 	return &mediaPlan{address: address, thumbnail: thumbnail}, nil
+}
+
+// captions are the kinds WhatsApp gives somewhere to put one. An audio and a sticker have
+// no such field, so a caption on either is text that would go nowhere.
+var captions = map[protocol.MediaKind]bool{
+	protocol.MediaImage:    true,
+	protocol.MediaVideo:    true,
+	protocol.MediaDocument: true,
 }
 
 // mediaToSend fetches the file the plan names and hands it to WhatsApp.
@@ -370,11 +379,51 @@ func (s *Session) mediaToSend(
 	case errors.Is(err, errTooLarge):
 		return nil, protocol.NewError(protocol.ErrorMediaTooLarge,
 			fmt.Sprintf("that file is larger than the %d bytes this instance sends", s.sendLimit))
+	case capped.failed != nil:
+		// Asked before the upload's own error, because it is the cause of it when there
+		// is one: the file stopped arriving, and WhatsApp never got the chance to refuse
+		// anything. Reported the other way round, an operator goes looking at WhatsApp.
+		return nil, sourceStopped(capped.failed)
 	case err != nil:
 		return nil, err
 	}
 
+	// And the half whatsmeow hides: it pads and encrypts whatever it managed to read, so
+	// a body that ended early is a perfectly valid upload of the wrong file and there is
+	// nowhere earlier than here to notice.
+	if err := allOfIt(file.size, &uploaded); err != nil {
+		return nil, err
+	}
+
 	return renderMedia(content, &uploaded, mimeToSend(content, file.mime), plan.thumbnail, alongside), nil
+}
+
+// sourceStopped is a file that stopped arriving partway through.
+//
+// Retryable on purpose: the same fetch may well arrive whole next time, and the caller
+// still holds the only copy of what it wanted to send. `internal` for the same reason as
+// every other failure of the caller's own address, which is issue #26.
+func sourceStopped(err error) error {
+	return protocol.NewError(protocol.ErrorInternal,
+		fmt.Sprintf("the file to send stopped arriving partway through: %v", bareError(err)))
+}
+
+// allOfIt refuses an upload of less than the address said it was sending.
+//
+// It catches what the reader cannot: cbcutil.EncryptStream treats io.ErrUnexpectedEOF
+// exactly like io.EOF, so a body that ended early against its own Content-Length reaches
+// the reader as a clean end of stream and is uploaded as a whole file. Sent as it stands,
+// the recipient gets a file that is half there and the sender is told it worked.
+func allOfIt(declared int64, uploaded *wm.UploadResponse) error {
+	if declared < 0 {
+		// A chunked response says nothing up front, and there is nothing to compare.
+		return nil
+	}
+	if sent := int64(uploaded.FileLength); sent != declared { //nolint:gosec // a length this side counted
+		return protocol.NewError(protocol.ErrorInternal,
+			fmt.Sprintf("the address of the file to send promised %d bytes and delivered %d", declared, sent))
+	}
+	return nil
 }
 
 // safeAddress is an address with its query dropped, for putting in a message.
@@ -476,12 +525,26 @@ func filenameExt(filename string) string {
 	return strings.ToLower(filename[dot:])
 }
 
+// previewFormat is the image a kind's preview field holds.
+//
+// WhatsApp names the field after the format, and each leaf type has exactly one: a
+// sticker carries a PNG and everything else a JPEG. Which is also what this connector
+// publishes on the way in, so a caller forwarding a file it received hands back the
+// format the same kind expects.
+func previewFormat(kind protocol.MediaKind) string {
+	if kind == protocol.MediaSticker {
+		return "image/png"
+	}
+	return "image/jpeg"
+}
+
 // thumbnailBytes decodes the inline preview the caller supplied, and answers nil when
 // there is none.
 //
-// Only a JPEG is carried: the field WhatsApp reads is named for the format, and a PNG
-// put in it renders as a broken preview on clients that take it at its word.
-func thumbnailBytes(uri string) ([]byte, error) {
+// The format is checked rather than trusted: the bytes go into a field named for one, and
+// the wrong image in it renders as a broken preview on every client that takes the field
+// at its word.
+func thumbnailBytes(uri string, kind protocol.MediaKind) ([]byte, error) {
 	if uri == "" {
 		return nil, nil
 	}
@@ -489,10 +552,11 @@ func thumbnailBytes(uri string) ([]byte, error) {
 		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
 			fmt.Sprintf("that preview is %d bytes and at most %d travel in a frame", len(uri), thumbnailLimit))
 	}
-	const prefix = "data:image/jpeg;base64,"
+	format := previewFormat(kind)
+	prefix := "data:" + format + ";base64,"
 	if !strings.HasPrefix(uri, prefix) {
 		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
-			"a preview has to be a base64 data: URI of a JPEG")
+			fmt.Sprintf("the preview of a %s has to be a base64 data: URI of a %s", kind, format))
 	}
 	raw, err := base64.StdEncoding.DecodeString(uri[len(prefix):])
 	if err != nil {
@@ -558,9 +622,12 @@ func renderMedia(
 		return &waE2E.Message{StickerMessage: &waE2E.StickerMessage{
 			URL: &uploaded.URL, DirectPath: &uploaded.DirectPath, MediaKey: uploaded.MediaKey,
 			FileEncSHA256: uploaded.FileEncSHA256, FileSHA256: uploaded.FileSHA256,
-			FileLength:  proto.Uint64(uploaded.FileLength),
-			Mimetype:    proto.String(mimetype),
-			ContextInfo: alongside,
+			FileLength: proto.Uint64(uploaded.FileLength),
+			Mimetype:   proto.String(mimetype),
+			// The one leaf type whose preview field is a PNG, which is also the format
+			// this connector publishes a sticker's preview in.
+			PngThumbnail: thumbnail,
+			ContextInfo:  alongside,
 		}}
 	}
 }
@@ -603,6 +670,13 @@ type counting struct {
 	from  io.Reader
 	limit int64
 	read  int64
+	// failed is the last error the source gave that was not a clean end of stream.
+	//
+	// Kept because whatsmeow throws it away: cbcutil.EncryptStream treats
+	// io.ErrUnexpectedEOF exactly like io.EOF, pads what it has and encrypts it, so a
+	// body that stopped halfway is uploaded as a whole file and the send reports success.
+	// The recipient gets half an image and the sender is never told.
+	failed error
 }
 
 func (c *counting) Read(into []byte) (int, error) {
@@ -621,8 +695,12 @@ func (c *counting) Read(into []byte) (int, error) {
 	if c.read > c.limit {
 		return 0, errTooLarge
 	}
-	if err != nil {
+	if err != nil && !errors.Is(err, io.EOF) {
+		c.failed = err
 		return read, err //nolint:wrapcheck // the reader's own error, passed through unchanged
+	}
+	if err != nil {
+		return read, err //nolint:wrapcheck // io.EOF, which every reader is entitled to return
 	}
 	return read, nil
 }

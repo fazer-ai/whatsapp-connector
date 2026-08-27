@@ -471,19 +471,77 @@ func TestOnlyAJPEGPreviewTravelsWithTheFile(t *testing.T) {
 		t.Fatalf("the preview arrived as %q", got)
 	}
 
-	for _, tc := range []struct{ name, thumbnail string }{
-		{"a PNG", "data:image/png;base64," + preview},
-		{"something that is not base64", "data:image/jpeg;base64,não é base64"},
-		{"a preview too big to travel in a frame", "data:image/jpeg;base64," + strings.Repeat("A", thumbnailLimit)},
+	for _, tc := range []struct{ name, kind, thumbnail string }{
+		{"a PNG where an image wants a JPEG", "image", "data:image/png;base64," + preview},
+		{"a JPEG where a sticker wants a PNG", "sticker", "data:image/jpeg;base64," + preview},
+		{"something that is not base64", "image", "data:image/jpeg;base64,não é base64"},
+		{"a preview too big to travel in a frame", "image",
+			"data:image/jpeg;base64," + strings.Repeat("A", thumbnailLimit)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
 			req := requestOf(t, `{"message_id":"3EB0","to":{"kind":"phone","id":"5511999990001"},
-				"content":{"type":"media","kind":"image","thumbnail":`+mustJSON(t, tc.thumbnail)+`,
-				"ref":{"kind":"url","url":"http://rails:3000/blob.jpg"}}}`)
+				"content":{"type":"media","kind":"`+tc.kind+`","thumbnail":`+mustJSON(t, tc.thumbnail)+`,
+				"ref":{"kind":"url","url":"http://rails:3000/blob"}}}`)
 			_, _, err := planBody(req, nil, 1<<20)
 			assertCode(t, err, protocol.ErrorInvalidPayload)
+		})
+	}
+}
+
+// A sticker's preview is a PNG on the way in and a PNG on the way out, and it goes in the
+// field named for it. Refused as a JPEG, a caller forwarding a sticker it just received
+// cannot send it back; put in JPEGThumbnail, the preview never renders.
+func TestAStickersPreviewIsAPNGInTheFieldNamedForIt(t *testing.T) {
+	t.Parallel()
+
+	session, serving, _ := outboundSession(t)
+	serving.answer([]byte("webp"), "")
+	png := base64.StdEncoding.EncodeToString([]byte("\x89PNG\r\n\x1a\n png-ish"))
+	message := mustSendBody(t, session, `{"message_id":"3EB0","to":{"kind":"phone","id":"5511999990001"},
+		"content":{"type":"media","kind":"sticker","mime":"image/webp",
+		"thumbnail":"data:image/png;base64,`+png+`",
+		"ref":{"kind":"url","url":"http://rails:3000/blob.webp"}}}`)
+
+	sticker := message.GetStickerMessage()
+	if got := string(sticker.GetPngThumbnail()); got != "\x89PNG\r\n\x1a\n png-ish" {
+		t.Fatalf("the sticker's preview arrived as %q", got)
+	}
+}
+
+// whatsmeow pads and encrypts whatever it managed to read: cbcutil.EncryptStream treats
+// io.ErrUnexpectedEOF exactly like io.EOF. A body that stopped halfway therefore uploads
+// as a whole file, the send reports success, and the recipient gets half an image while
+// the sender is never told.
+func TestAFileThatStoppedArrivingIsNotSentAsAWholeOne(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		body io.Reader
+		size int64
+	}{
+		{"the connection broke mid-stream", iotest.TimeoutReader(strings.NewReader("os primeiros bytes e mais")), -1},
+		{"the body ended early and whatsmeow read it as a clean end",
+			io.MultiReader(strings.NewReader("metade do arquivo"), errorReader{io.ErrUnexpectedEOF}), -1},
+		{"the source ended early against what it promised", strings.NewReader("curto demais"), 4096},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			session, serving, _ := outboundSession(t)
+			serving.answerStream(tc.body, tc.size, "")
+
+			_, err := session.send(t.Context(), &protocol.Command{
+				Type: protocol.CommandMessageSend,
+				Payload: json.RawMessage(`{"message_id":"3EB0","to":{"kind":"phone","id":"5511999990001"},
+					"content":{"type":"media","kind":"image",
+					"ref":{"kind":"url","url":"http://rails:3000/blob.jpg"}}}`),
+			})
+			// Retryable: the same fetch may arrive whole next time, and the caller holds
+			// the only copy of what it wanted to send.
+			assertCode(t, err, protocol.ErrorInternal)
 		})
 	}
 }
@@ -502,6 +560,10 @@ func TestAFileThisConnectorCannotGoAndGetIsRefusedOnThePayload(t *testing.T) {
 			`{"type":"media","kind":"hologram","ref":{"kind":"url","url":"http://rails:3000/blob"}}`},
 		{"a sticker with a caption", `{"type":"media","kind":"sticker","caption":"olha",
 			"ref":{"kind":"url","url":"http://rails:3000/blob.webp"}}`},
+		{"an audio with a caption", `{"type":"media","kind":"audio","caption":"escuta isso",
+			"ref":{"kind":"url","url":"http://rails:3000/blob.ogg"}}`},
+		{"a voice note with a caption", `{"type":"media","kind":"audio","voice_note":true,"caption":"escuta",
+			"ref":{"kind":"url","url":"http://rails:3000/blob.ogg"}}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -791,7 +853,15 @@ func (u *uploads) hand(
 ) (wm.UploadResponse, error) {
 	// Read to the end first: the cap is enforced by the reader whatsmeow is handed, so a
 	// fake that never reads is a fake where the cap never fires.
+	//
+	// And it ends the way cbcutil.EncryptStream ends, which is the behaviour the code
+	// under test has to survive: io.ErrUnexpectedEOF is treated exactly like io.EOF, so a
+	// body that stopped halfway looks here like a file that finished. A fake that
+	// returned that error instead would be a fake where the check for it never fires.
 	drained, readErr := io.Copy(io.Discard, from)
+	if errors.Is(readErr, io.ErrUnexpectedEOF) {
+		readErr = nil
+	}
 
 	u.mu.Lock()
 	defer u.mu.Unlock()
@@ -846,6 +916,12 @@ func mustJSON(t *testing.T, value string) string {
 	}
 	return string(encoded)
 }
+
+// errorReader is a source that has already failed, for composing a body that stops
+// partway through.
+type errorReader struct{ err error }
+
+func (e errorReader) Read([]byte) (int, error) { return 0, e.err }
 
 func peerJID(t *testing.T) waTypes.JID {
 	t.Helper()
