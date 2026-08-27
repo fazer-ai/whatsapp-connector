@@ -277,6 +277,11 @@ func (c *Container) Forget(ctx context.Context, sid string) error {
 			}
 		}
 	}
+	// Before the mapping goes, so a failure here leaves a session that can still be
+	// found and swept rather than rows nothing will ever name again.
+	if err := c.forgetMediaParts(ctx, sid); err != nil {
+		return err
+	}
 	return c.unbind(ctx, sid)
 }
 
@@ -312,15 +317,26 @@ func (c *Container) unbind(ctx context.Context, sid string) error {
 }
 
 // migrate creates what this package owns. whatsmeow's own schema is brought up by
-// sqlstore.New, so this covers the mapping table alone.
+// sqlstore.New, so this covers the mapping table and the media parts.
+//
+// The mapping table is brought up on its own and first, because the duplicates in it
+// have to be cleared out before the unique index that forbids them can be built.
 func (c *Container) migrate(ctx context.Context) error {
-	statements := []string{`
+	const mapping = `
 		CREATE TABLE IF NOT EXISTS wac_session_device (
 			sid      TEXT   PRIMARY KEY,
 			jid      TEXT   NOT NULL UNIQUE,
 			account  TEXT   NOT NULL,
 			bound_at BIGINT NOT NULL
-		)`,
+		)`
+	if _, err := c.db.ExecContext(ctx, mapping); err != nil {
+		return fmt.Errorf("store: create wac_session_device: %w", err)
+	}
+	if err := c.dropDuplicateMappings(ctx); err != nil {
+		return err
+	}
+
+	for _, statement := range []string{
 		// The account index was not unique to begin with, and `IF NOT EXISTS` on the
 		// same name is a no-op against a store that already has it: an upgraded database
 		// would keep the old one and never gain the constraint. Dropped by name and
@@ -332,18 +348,34 @@ func (c *Container) migrate(ctx context.Context) error {
 		// ends up on two sessions with the displacement never happening. A constraint is
 		// the only version of that check two transactions cannot both pass.
 		`CREATE UNIQUE INDEX IF NOT EXISTS wac_session_device_one_per_account ON wac_session_device (account)`,
-	}
-	for _, statement := range statements[:1] {
+		// How to fetch a message's file a second time, for as long as the deployment is
+		// willing to. Keyed by the session as well as the message, because a message id
+		// is WhatsApp's to reuse across accounts and this table is read by whichever
+		// instance holds the session when the client comes back.
+		//
+		// Keys and digests are TEXT holding base64 rather than bytes: it is the same
+		// column in both dialects, and three fields of 32 bytes is not a size worth a
+		// difference in the schema for.
+		`CREATE TABLE IF NOT EXISTS wac_media_part (
+			sid             TEXT   NOT NULL,
+			message_id      TEXT   NOT NULL,
+			kind            TEXT   NOT NULL,
+			direct_path     TEXT   NOT NULL,
+			media_key       TEXT   NOT NULL,
+			file_enc_sha256 TEXT   NOT NULL,
+			file_sha256     TEXT   NOT NULL,
+			file_length     BIGINT NOT NULL,
+			mime            TEXT   NOT NULL,
+			filename        TEXT   NOT NULL,
+			stored_at       BIGINT NOT NULL,
+			PRIMARY KEY (sid, message_id)
+		)`,
+		// The sweep reads nothing but the clock, and it runs on a table with a row per
+		// media message the deployment ever received.
+		`CREATE INDEX IF NOT EXISTS wac_media_part_stored_at ON wac_media_part (stored_at)`,
+	} {
 		if _, err := c.db.ExecContext(ctx, statement); err != nil {
-			return fmt.Errorf("store: create wac_session_device: %w", err)
-		}
-	}
-	if err := c.dropDuplicateMappings(ctx); err != nil {
-		return err
-	}
-	for _, statement := range statements[1:] {
-		if _, err := c.db.ExecContext(ctx, statement); err != nil {
-			return fmt.Errorf("store: create wac_session_device: %w", err)
+			return fmt.Errorf("store: bring the connector's own schema up: %w", err)
 		}
 	}
 	return nil

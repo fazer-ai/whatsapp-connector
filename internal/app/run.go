@@ -195,6 +195,7 @@ func (c *Connector) Run(ctx context.Context) error {
 	// to report.
 	sweeping, stopSweeping := context.WithCancel(ctx)
 	swept := c.sweepBlobs(sweeping)
+	sweptParts := c.sweepMediaParts(sweeping)
 
 	c.log.Info().
 		Str("addr", c.cfg.HTTPAddr).
@@ -208,6 +209,7 @@ func (c *Connector) Run(ctx context.Context) error {
 	// writing to, and waited for, so the process does not exit mid-rename.
 	stopSweeping()
 	<-swept
+	<-sweptParts
 	if c.blobs != nil {
 		// After the sweeper has stopped, so nothing is walking the directory through a
 		// handle that is being closed.
@@ -305,6 +307,56 @@ func (c *Connector) sweepBlobs(ctx context.Context) <-chan struct{} {
 			case dropped > 0:
 				c.log.Debug().Int("blobs", dropped).Int64("bytes", freed).
 					Msg("dropped media nobody collected")
+			}
+		}
+	}()
+	return done
+}
+
+// PartSweep is how often to sweep, for a deployment keeping refetch metadata for ttl.
+//
+// An hour at most, and a twentieth of the retention below that. The bound is loose on
+// purpose: unlike a blob cache, nothing is waiting on this to free anything, and a row
+// outliving its retention by an hour costs a row. What it must not do is run so often
+// that a fleet of instances spends its day deleting nothing from the same table.
+func PartSweep(ttl time.Duration) time.Duration {
+	return min(max(ttl/20, time.Minute), time.Hour)
+}
+
+// sweepMediaParts drops the refetch metadata that has outlived its retention.
+//
+// Its own goroutine for the same reason the blob sweep has one: it must not sit on the
+// heartbeat, which is what renews every lease this instance holds. A DELETE over a large
+// table on a busy database is not a thing to put in front of a lease.
+//
+// Every instance sweeps, and they sweep the same rows. That is not a race worth
+// coordinating away: the statement is idempotent, the loser deletes nothing, and a
+// leader election for a DELETE would be more machinery than the problem.
+func (c *Connector) sweepMediaParts(ctx context.Context) <-chan struct{} {
+	done := make(chan struct{})
+	if c.store == nil {
+		close(done)
+		return done
+	}
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(PartSweep(c.cfg.MediaRefetch))
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+			dropped, err := c.store.SweepMediaParts(ctx, time.Now().Add(-c.cfg.MediaRefetch))
+			switch {
+			case errors.Is(err, context.Canceled):
+				return
+			case err != nil:
+				c.log.Warn().Err(err).Msg("could not sweep what was kept to fetch files again")
+			case dropped > 0:
+				c.log.Debug().Int64("messages", dropped).
+					Msg("dropped what was kept to fetch the files of messages past their retention")
 			}
 		}
 	}()
