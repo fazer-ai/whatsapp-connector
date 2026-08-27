@@ -1173,15 +1173,22 @@ var errLinkLocal = errors.New("whatsmeow: that address is link-local")
 // Checked on the address actually dialled rather than on the host in the URL, which is
 // what makes it cover a name that resolves to one, a name that resolves to one only on
 // the second lookup, and every redirect hop -- they all dial through this.
-var fetchTransport = func() *http.Transport {
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.DialContext = (&net.Dialer{
+// The settings are net/http's own defaults, spelled out rather than cloned off
+// DefaultTransport: the dial has to be replaced anyway, and a clone would leave what the
+// rest of them are somewhere else.
+var fetchTransport = &http.Transport{
+	Proxy: http.ProxyFromEnvironment,
+	DialContext: (&net.Dialer{
 		Timeout:   30 * time.Second,
 		KeepAlive: 30 * time.Second,
 		Control:   refuseLinkLocal,
-	}).DialContext
-	return transport
-}()
+	}).DialContext,
+	ForceAttemptHTTP2:     true,
+	MaxIdleConns:          100,
+	IdleConnTimeout:       90 * time.Second,
+	TLSHandshakeTimeout:   10 * time.Second,
+	ExpectContinueTimeout: time.Second,
+}
 
 // refuseLinkLocal is the dial fetchTransport is built on.
 func refuseLinkLocal(_, address string, _ syscall.RawConn) error {
@@ -1193,10 +1200,7 @@ func refuseLinkLocal(_, address string, _ syscall.RawConn) error {
 	// that will not parse as one is not something this can judge. The schemes that could
 	// put a path here are refused before any dial is attempted.
 	parsed, err := netip.ParseAddr(host)
-	if err != nil {
-		return nil
-	}
-	if parsed.IsLinkLocalUnicast() || parsed.IsLinkLocalMulticast() {
+	if err == nil && (parsed.IsLinkLocalUnicast() || parsed.IsLinkLocalMulticast()) {
 		return fmt.Errorf("%w: %s", errLinkLocal, parsed)
 	}
 	return nil
