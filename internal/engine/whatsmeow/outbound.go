@@ -345,19 +345,31 @@ func vcardOf(name, digits string) string {
 	return strings.Join([]string{
 		"BEGIN:VCARD",
 		"VERSION:" + vcardVersion,
-		"N:;" + vcardEscape(name) + ";;;",
-		"FN:" + vcardEscape(name),
+		// N is positional -- family;given;middle;prefix;suffix -- so a semicolon inside
+		// the name would add a field rather than be part of one. Dropped rather than
+		// escaped, for the reason on vcardText: nothing reading this undoes an escape,
+		// so escaping it puts a backslash in the name instead. FN below carries the name
+		// as it was written, and FN is what is displayed.
+		"N:;" + strings.ReplaceAll(vcardText(name), ";", " ") + ";;;",
+		"FN:" + vcardText(name),
 		"TEL;type=CELL;type=VOICE;waid=" + digits + ":+" + digits,
 		"END:VCARD",
 	}, "\n") + "\n"
 }
 
-// vcardEscape quotes what a vCard reads as structure. Left in, a name with a comma or a
-// semicolon in it splits into fields the recipient's client renders as separate parts of
-// a name.
-func vcardEscape(value string) string {
-	replacer := strings.NewReplacer("\\", "\\\\", ";", "\\;", ",", "\\,", "\n", "\\n", "\r", "")
-	return replacer.Replace(value)
+// vcardText is a value written the way WhatsApp writes one, which is the only way worth
+// writing it: verbatim, with only what would break a line taken out.
+//
+// RFC 2426 says a semicolon in a text value must be escaped with a backslash, and doing
+// that is wrong here. The RFC is not what reads this back -- the recipient's WhatsApp is,
+// and it does not undo the escape: a card written `FN:Souza\; Ana` is shown as
+// `Souza\; Ana`, backslash and all. The contract's own fixture of a card WhatsApp sent
+// escapes nothing either (`N:Dias;Carlos;;;`, `FN:Carlos Dias`).
+//
+// A newline is the one thing that cannot go through: a value carrying one ends the
+// property early and everything after it is read as another line of the card.
+func vcardText(value string) string {
+	return strings.NewReplacer("\r", "", "\n", " ").Replace(value)
 }
 
 // vcardUnescape is the inverse of vcardEscape, for reading a value back off a card
@@ -398,9 +410,10 @@ func vcardName(card string) string {
 			continue
 		}
 		if property, _, _ := strings.Cut(name, ";"); strings.EqualFold(property, "FN") {
-			// Unescaped on the way out: what is on the card is vCard's own encoding, and
-			// WhatsApp's display name is a plain string. Copied across as it stands, a
-			// name written `Souza\; Ana` is shown with the backslash in it.
+			// Unescaped on the way out, for a card this connector did not write: a
+			// client that follows RFC 2426 escapes a semicolon, and copying that across
+			// verbatim would show the backslash. Cards written here carry no escapes at
+			// all -- see vcardText -- so this does nothing to them.
 			return vcardUnescape(strings.TrimSpace(value))
 		}
 	}
@@ -861,16 +874,24 @@ func mimeToSend(content *mediaContent, served string) string {
 	if content.Ref != nil && content.Ref.Mime != "" {
 		return content.Ref.Mime
 	}
+
+	only := onlyTypeFor(content)
 	if base, _, err := mime.ParseMediaType(served); err == nil && base != "application/octet-stream" {
-		// The parameters travel with it: what is being decided here is only whether the
-		// server said anything useful, and `application/octet-stream` is what a server
-		// says when it does not know.
+		// The server named something. It still loses to the kind's own type when the two
+		// are the same format said with less detail: a voice note served as `audio/ogg`
+		// is an `audio/ogg; codecs=opus` that lost its parameter on the way, and WhatsApp
+		// does not render the one without it -- it drops the message and says nothing,
+		// which is how this was found. A server naming a different format is telling us
+		// something else and keeps saying it.
+		if sameFormat(base, only) {
+			return only
+		}
+		// The parameters travel with it: what was decided here is only whether the server
+		// said anything useful, and `application/octet-stream` is what one says when it
+		// does not know.
 		return served
 	}
-	// Ahead of the filename, because it is not a guess: what the caller already said the
-	// message is leaves only one type the file can be, and the extension would answer
-	// `audio/ogg` for a voice note that WhatsApp only plays as opus.
-	if only := onlyTypeFor(content); only != "" {
+	if only != "" {
 		return only
 	}
 	if ext := filenameExt(content.Filename); ext != "" {
@@ -884,6 +905,16 @@ func mimeToSend(content *mediaContent, served string) string {
 		return served
 	}
 	return "application/octet-stream"
+}
+
+// sameFormat reports whether a type the kind guarantees describes the same format as one
+// somebody else named, ignoring the parameters that are the point of preferring it.
+func sameFormat(base, guaranteed string) bool {
+	if guaranteed == "" {
+		return false
+	}
+	only, _, err := mime.ParseMediaType(guaranteed)
+	return err == nil && strings.EqualFold(only, base)
 }
 
 // onlyTypeFor is the type a body can be when the caller has already said what it is

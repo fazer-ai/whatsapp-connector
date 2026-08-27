@@ -20,6 +20,7 @@
 //	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveViewOnce
 //	WAC_LIVE_TO=<number> go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveSend$
 //	WAC_LIVE_TO=<number> go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveSendMedia
+//	  (WAC_LIVE_FILE names the file; WAC_LIVE_VOICE=1 sends it as a voice note)
 //	WAC_LIVE_TO=<number> go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveSendLocation
 //	WAC_LIVE_TO=<number> go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveSendContacts
 //	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveLogout
@@ -721,8 +722,15 @@ func TestLiveSendMedia(t *testing.T) {
 	}
 	events.awaitState(t, "open", 2*time.Minute)
 
+	// A voice note is not something a filename can say: an .ogg is as likely to be music,
+	// and what makes one is the caller setting the flag. It is worth its own run because
+	// it is the one kind whose type this build fills in on its own.
+	if os.Getenv("WAC_LIVE_VOICE") != "" {
+		kind = "audio"
+	}
 	content := map[string]any{
 		"type": "media", "kind": kind, "filename": name, "size": len(file),
+		"voice_note": os.Getenv("WAC_LIVE_VOICE") != "",
 		"ref": map[string]any{
 			"kind": "url", "url": endpoint.URL + "/outbound/" + name,
 			"headers": map[string]any{"Authorization": "Bearer " + token},
@@ -733,6 +741,21 @@ func TestLiveSendMedia(t *testing.T) {
 	// fetching anything and never exercise the file at all.
 	if captions[protocol.MediaKind(kind)] {
 		content["caption"] = "conector nativo, fatia de saída"
+	}
+	// WAC_LIVE_DURATION is how long the caller says an audio or a video runs. Worth being
+	// able to leave off as well as set: what a recipient does with a length it was not
+	// given is a question for a phone.
+	// WAC_LIVE_MIME pins what the message says the file is, for telling a type WhatsApp
+	// refuses apart from one it merely renders differently.
+	if forced := os.Getenv("WAC_LIVE_MIME"); forced != "" {
+		content["mime"] = forced
+	}
+	if raw := os.Getenv("WAC_LIVE_DURATION"); raw != "" {
+		seconds, err := strconv.Atoi(raw)
+		if err != nil || seconds < 0 {
+			t.Fatalf("WAC_LIVE_DURATION=%q: want a duration in seconds", raw)
+		}
+		content["duration"] = seconds
 	}
 	sent := liveSendOne(t, session, to, content)
 	say("sent a %s (%d bytes) as %s -- check the recipient renders it, not just receives it", kind, len(file), sent)

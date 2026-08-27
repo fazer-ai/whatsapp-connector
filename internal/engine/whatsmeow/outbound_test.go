@@ -182,17 +182,48 @@ func TestACardIsWrittenForANameAndANumber(t *testing.T) {
 	}
 }
 
-// A vCard reads semicolons and commas as structure. A name carrying one, and people's
-// names do, splits into fields the recipient's client renders as parts of a name.
-func TestANameIsEscapedIntoTheCardRatherThanSplittingIt(t *testing.T) {
+// The name goes on the card as it was written. RFC 2426 says a semicolon in a text value
+// must be escaped, and doing that is wrong here: the recipient's WhatsApp is what reads
+// this back and it does not undo the escape, so `FN:Souza\; Ana` is shown with the
+// backslash in it. Found on a real phone, not in a unit test.
+func TestANameGoesOnTheCardAsItWasWritten(t *testing.T) {
 	t.Parallel()
 
 	written := vcardOf("Souza; Ana, Dra.", "5511999990002")
-	if !strings.Contains(written, `FN:Souza\; Ana\, Dra.`) {
-		t.Fatalf("the name went in unescaped:\n%s", written)
+	if !strings.Contains(written, "FN:Souza; Ana, Dra.") {
+		t.Fatalf("the name did not go in as it was written:\n%s", written)
+	}
+	if strings.Contains(written, `\`) {
+		t.Fatalf("the card carries an escape nothing reading it will undo:\n%s", written)
 	}
 	if strings.Count(written, "\nFN:") != 1 {
 		t.Fatalf("the card has more than one FN line:\n%s", written)
+	}
+
+	// N is positional, so the same semicolon there would add a field rather than be part
+	// of one. It is dropped rather than escaped, and FN carries the real name.
+	for _, line := range strings.Split(written, "\n") {
+		if !strings.HasPrefix(line, "N:") {
+			continue
+		}
+		if fields := strings.Split(line, ";"); len(fields) != 5 {
+			t.Fatalf("N has %d fields rather than five: %q", len(fields), line)
+		}
+	}
+
+	// A newline cannot travel: it would end the property early and everything after it
+	// would be read as another line of the card.
+	// Asserted on the lines rather than on the text: with the newline turned into a space
+	// the name still reads `Ana BEGIN:VCARD`, and that is fine -- it is one value on one
+	// line. What must not happen is a second line appearing.
+	lines := strings.Split(strings.TrimSuffix(vcardOf("Ana\nBEGIN:VCARD", "5511999990002"), "\n"), "\n")
+	if len(lines) != 6 {
+		t.Fatalf("a name with a newline in it wrote %d lines rather than six:\n%q", len(lines), lines)
+	}
+	for i, line := range lines {
+		if i > 0 && strings.HasPrefix(line, "BEGIN:VCARD") {
+			t.Fatalf("a name with a newline in it started a second card:\n%q", lines)
+		}
 	}
 }
 
@@ -1529,7 +1560,9 @@ func TestANameReadOffACardComesBackUnescaped(t *testing.T) {
 	}
 
 	// And the round trip: what this connector writes, it reads back as what went in.
-	const name = `Souza; Ana, Dra. \ III`
+	// Without a backslash in it, because nothing this connector writes carries one and a
+	// literal backslash in a name is what the unescape above would eat.
+	const name = "Souza; Ana, Dra. III"
 	written := vcardOf(name, "5511999990002")
 	if got := vcardName(written); got != name {
 		t.Fatalf("a name written and read back came out %q, want %q", got, name)
@@ -2017,6 +2050,12 @@ func TestAStickerAndAVoiceNoteAreLabelledWithWhatTheyCanOnlyBe(t *testing.T) {
 			"application/octet-stream", "audio/ogg; codecs=opus"},
 		// An ordinary audio can be anything, so the extension still decides.
 		{"an ordinary audio file", `"kind":"audio","filename":"a.mp3"`, "", "audio/mpeg"},
+		// The case that made every voice note vanish: a server naming the same format
+		// with less detail than the kind guarantees. WhatsApp drops an `audio/ogg` that
+		// is not told it is opus, and says nothing about it.
+		{"a voice note the server named without the codec", `"kind":"audio","voice_note":true`,
+			"audio/ogg", "audio/ogg; codecs=opus"},
+		{"a sticker the server named as a plain webp", `"kind":"sticker"`, "image/webp", "image/webp"},
 		// And a stated type is information, not something to correct.
 		{"a sticker the caller says is a PNG", `"kind":"sticker","mime":"image/png"`, "", "image/png"},
 		{"a sticker the server says is a PNG", `"kind":"sticker"`, "image/png", "image/png"},
