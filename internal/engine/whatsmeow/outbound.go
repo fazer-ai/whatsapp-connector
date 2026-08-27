@@ -3,6 +3,7 @@ package whatsmeow
 import (
 	"context"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -279,6 +280,32 @@ func vcardEscape(value string) string {
 	return replacer.Replace(value)
 }
 
+// vcardUnescape is the inverse of vcardEscape, for reading a value back off a card
+// somebody else wrote.
+//
+// Written as a scan rather than as a chain of replacements: unescaping `\;` and then
+// `\\` turns a literal backslash followed by a semicolon into a semicolon, which is a
+// different name from the one on the card.
+func vcardUnescape(value string) string {
+	var out strings.Builder
+	out.Grow(len(value))
+	for i := 0; i < len(value); i++ {
+		if value[i] != '\\' || i+1 >= len(value) {
+			out.WriteByte(value[i])
+			continue
+		}
+		i++
+		switch value[i] {
+		case 'n', 'N':
+			out.WriteByte('\n')
+		default:
+			// `\;`, `\,`, `\\` and anything else escaped: the character itself.
+			out.WriteByte(value[i])
+		}
+	}
+	return out.String()
+}
+
 // vcardName reads FN off a card, for a caller that sent one without saying what to
 // label it. Empty when the card has no FN, which is a card this connector will not send.
 func vcardName(card string) string {
@@ -291,7 +318,10 @@ func vcardName(card string) string {
 			continue
 		}
 		if property, _, _ := strings.Cut(name, ";"); strings.EqualFold(property, "FN") {
-			return strings.TrimSpace(value)
+			// Unescaped on the way out: what is on the card is vCard's own encoding, and
+			// WhatsApp's display name is a plain string. Copied across as it stands, a
+			// name written `Souza\; Ana` is shown with the backslash in it.
+			return vcardUnescape(strings.TrimSpace(value))
 		}
 	}
 	return ""
@@ -402,8 +432,34 @@ func (s *Session) mediaToSend(
 	if err := allOfIt(file.size, &uploaded); err != nil {
 		return nil, err
 	}
+	if err := theSameFile(content.Ref.SHA256, &uploaded); err != nil {
+		return nil, err
+	}
 
 	return renderMedia(content, &uploaded, mimeToSend(content, file.mime), plan.thumbnail, alongside), nil
+}
+
+// theSameFile refuses bytes that are not the ones the reference named.
+//
+// A length says how much arrived and a digest says what did. Compared only by length, a
+// proxy serving a stale or misrouted blob of the same size sends somebody else's file
+// under this message, and the command reports success.
+//
+// Final rather than retryable, and for the reason the length check is not: the same
+// address answers with the same wrong bytes every time. `media_unavailable` is what the
+// caller already reads when the file its reference names is not there, and what is there
+// instead being a different file is the same answer.
+func theSameFile(want string, uploaded *wm.UploadResponse) error {
+	if want == "" {
+		// The contract makes it optional, and most references travel without one.
+		return nil
+	}
+	if got := hex.EncodeToString(uploaded.FileSHA256); !strings.EqualFold(got, want) {
+		return protocol.NewError(protocol.ErrorMediaUnavailable,
+			fmt.Sprintf("the reference names a file that hashes to %s and the address served one that hashes to %s",
+				want, got))
+	}
+	return nil
 }
 
 // sourceStopped is a file that stopped arriving partway through.
@@ -565,6 +621,13 @@ func isToken(name string) bool {
 func mimeToSend(content *outboundContent, served string) string {
 	if content.Mime != "" {
 		return content.Mime
+	}
+	// The reference's own, which is what this connector puts on one it issues: a caller
+	// forwarding a file it received hands back the type the blob was stored under, and
+	// ignoring it loses exactly the cases that depend on it -- a sticker is a webp and a
+	// voice note an opus, and neither renders as anything else.
+	if content.Ref != nil && content.Ref.Mime != "" {
+		return content.Ref.Mime
 	}
 	if base, _, err := mime.ParseMediaType(served); err == nil && base != "application/octet-stream" {
 		// The parameters travel with it: what is being decided here is only whether the

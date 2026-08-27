@@ -2,7 +2,9 @@ package whatsmeow
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1414,5 +1416,116 @@ func TestWhatTheServerCalledTheFileArrivesWithItsParameters(t *testing.T) {
 
 	if file.mime != served {
 		t.Fatalf("the server said %q and the fetch read %q", served, file.mime)
+	}
+}
+
+// The reference carries what the blob was stored as, and this connector puts it there
+// itself. Ignored, a caller forwarding a file it received loses exactly the types that
+// depend on being named: a sticker is a webp and a voice note an opus.
+func TestTheReferencesOwnTypeIsUsedWhenNothingElseSaysWhatTheFileIs(t *testing.T) {
+	t.Parallel()
+
+	session, serving, _ := outboundSession(t)
+	// A proxy that labels everything a stream of bytes, which is the case this exists for.
+	serving.answer([]byte("webp"), "application/octet-stream")
+
+	message := mustSendBody(t, session, `{"message_id":"3EB0","to":{"kind":"phone","id":"5511999990001"},
+		"content":{"type":"media","kind":"sticker","ref":{"kind":"connector_blob","id":"blob_a1",
+		"url":"http://connector-a1b2c3:8080/media/blob_a1","mime":"image/webp"}}}`)
+	if got := message.GetStickerMessage().GetMimetype(); got != "image/webp" {
+		t.Fatalf("the sticker went out as %q, and the reference said image/webp", got)
+	}
+
+	// And the caller's own word on the message still wins over it.
+	session, serving, _ = outboundSession(t)
+	serving.answer([]byte("bytes"), "")
+	message = mustSendBody(t, session, `{"message_id":"3EB0","to":{"kind":"phone","id":"5511999990001"},
+		"content":{"type":"media","kind":"document","mime":"application/pdf",
+		"ref":{"kind":"url","url":"http://rails:3000/blob","mime":"text/plain"}}}`)
+	if got := message.GetDocumentMessage().GetMimetype(); got != "application/pdf" {
+		t.Fatalf("the document went out as %q, and the content said application/pdf", got)
+	}
+}
+
+// A length says how much arrived and a digest says what did. Compared only by length, a
+// proxy serving a stale or misrouted blob of the same size sends somebody else's file
+// under this message and the command reports success.
+func TestBytesThatAreNotTheOnesTheReferenceNamedAreNotSent(t *testing.T) {
+	t.Parallel()
+
+	const file = "os bytes do arquivo"
+	right := sha256.Sum256([]byte(file))
+	wrong := sha256.Sum256([]byte("outra coisa inteiramente"))
+
+	send := func(t *testing.T, digest string) error {
+		t.Helper()
+
+		session, serving, uploads := outboundSession(t)
+		serving.answer([]byte(file), "image/jpeg")
+		// The fake answers a fixed response, so the digest it reports has to be the one
+		// the bytes actually hash to or this would test the fake's opinion.
+		uploads.answer(&wm.UploadResponse{
+			URL: "https://mmg.whatsapp.net/d/f/x.enc", DirectPath: "/v/t62/x.enc",
+			MediaKey: []byte("k"), FileEncSHA256: []byte("e"), FileSHA256: right[:],
+			FileLength: uint64(len(file)),
+		}, nil)
+
+		_, err := session.send(t.Context(), &protocol.Command{
+			Type: protocol.CommandMessageSend,
+			Payload: json.RawMessage(`{"message_id":"3EB0","to":{"kind":"phone","id":"5511999990001"},
+				"content":{"type":"media","kind":"image","ref":{"kind":"url",
+				"url":"http://rails:3000/blob.jpg","sha256":"` + digest + `"}}}`),
+		})
+		return err
+	}
+
+	// Final rather than retryable: the same address answers with the same wrong bytes
+	// every time, and this is the answer a caller already reads for a reference whose
+	// file is not there.
+	assertCode(t, send(t, hex.EncodeToString(wrong[:])), protocol.ErrorMediaUnavailable)
+
+	// The matching one gets past the check; the send itself needs a socket.
+	var coded *protocol.Error
+	if err := send(t, strings.ToUpper(hex.EncodeToString(right[:]))); errors.As(err, &coded) &&
+		coded.Code == protocol.ErrorMediaUnavailable {
+		t.Fatalf("the right file was refused, and hex is not case-sensitive: %v", err)
+	}
+}
+
+// vCard escaping is the card's own encoding and WhatsApp's display name is a plain
+// string. Copied across as it stands, a name written `Souza\; Ana` is shown with the
+// backslash in it, which is what the recipient sees.
+func TestANameReadOffACardComesBackUnescaped(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct{ name, on, want string }{
+		{"a semicolon", `Souza\; Ana`, "Souza; Ana"},
+		{"a comma", `Souza\, Ana`, "Souza, Ana"},
+		{"a backslash", `Souza \\ Ana`, `Souza \ Ana`},
+		{"a backslash before a semicolon", `Souza \\; Ana`, `Souza \; Ana`},
+		{"a newline", `Ana\nSouza`, "Ana\nSouza"},
+		{"nothing to unescape", "Ana Souza", "Ana Souza"},
+		{"a trailing backslash", `Ana \`, `Ana \`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			card, err := contactCard(&outboundContact{
+				Vcard: "BEGIN:VCARD\nVERSION:3.0\nFN:" + tc.on + "\nEND:VCARD\n",
+			})
+			if err != nil {
+				t.Fatalf("contactCard: %v", err)
+			}
+			if got := card.GetDisplayName(); got != tc.want {
+				t.Fatalf("the card is labelled %q, want %q", got, tc.want)
+			}
+		})
+	}
+
+	// And the round trip: what this connector writes, it reads back as what went in.
+	const name = `Souza; Ana, Dra. \ III`
+	written := vcardOf(name, "5511999990002")
+	if got := vcardName(written); got != name {
+		t.Fatalf("a name written and read back came out %q, want %q", got, name)
 	}
 }
