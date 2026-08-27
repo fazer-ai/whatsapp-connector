@@ -5,7 +5,9 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -1076,9 +1078,13 @@ func TestASignedAddressDoesNotTravelIntoTheFailure(t *testing.T) {
 			t.Fatalf("the failure carries %q from the signed address:\n%s", secret, err)
 		}
 	}
-	// And it still says which address it was, or naming it at all is pointless.
-	if !strings.Contains(err.Error(), "/bucket/file.pdf") {
+	// And it still says which storage was not answering, or naming it at all is
+	// pointless. The path is not repeated: with Active Storage it is the credential.
+	if !strings.Contains(err.Error(), "http://"+closed) {
 		t.Fatalf("the failure does not say which address failed:\n%s", err)
+	}
+	if strings.Contains(err.Error(), "/bucket/file.pdf") {
+		t.Fatalf("the failure repeated the path:\n%s", err)
 	}
 }
 
@@ -1087,11 +1093,14 @@ func TestARedactedAddressStillSaysWhichOneItWas(t *testing.T) {
 	t.Parallel()
 
 	for _, tc := range []struct{ raw, want string }{
-		{"https://s3.example.com/bucket/file.pdf?X-Amz-Signature=secret", "https://s3.example.com/bucket/file.pdf"},
-		{"http://rails:3000/blobs/proxy/abc/a.pdf", "http://rails:3000/blobs/proxy/abc/a.pdf"},
-		{"https://user:pass@host/file", "https://host/file"},
-		{"https://host/file#frag", "https://host/file"},
-		{"://nonsense", "[unparseable]"},
+		{"https://s3.example.com/bucket/file.pdf?X-Amz-Signature=secret", "https://s3.example.com"},
+		// The signed blob id is in the path here, and it is a bearer token for that file.
+		{"http://rails:3000/rails/active_storage/blobs/proxy/eyJfcmFpbHMiOnsibWVzc2FnZSI6/a.pdf",
+			"http://rails:3000"},
+		{"https://user:pass@host/file", "https://host"},
+		{"https://host/file#frag", "https://host"},
+		{"://nonsense", "[redacted]"},
+		{"file:///etc/passwd", "file:[redacted]"},
 	} {
 		t.Run(tc.raw, func(t *testing.T) {
 			t.Parallel()
@@ -1100,8 +1109,10 @@ func TestARedactedAddressStillSaysWhichOneItWas(t *testing.T) {
 			if got != tc.want {
 				t.Fatalf("safeAddress(%q) = %q, want %q", tc.raw, got, tc.want)
 			}
-			if strings.Contains(got, "secret") || strings.Contains(got, "pass") {
-				t.Fatalf("safeAddress(%q) kept a credential: %q", tc.raw, got)
+			for _, secret := range []string{"secret", "pass", "eyJfcmFpbHMiOnsibWVzc2FnZSI6", "passwd"} {
+				if strings.Contains(got, secret) {
+					t.Fatalf("safeAddress(%q) kept %q: %q", tc.raw, secret, got)
+				}
 			}
 		})
 	}
@@ -1164,4 +1175,125 @@ func TestANumberIsReducedToDigitsBeforeItBecomesAWAID(t *testing.T) {
 	if _, err := contactCard(&outboundContact{DisplayName: "Ana", Phone: "sem número"}); err == nil {
 		t.Fatal("a contact whose number has no digits in it was accepted")
 	}
+}
+
+// net/http drops Authorization, Cookie and WWW-Authenticate of its own accord when a
+// redirect leaves the host, and nothing else. A reference authenticated with a vendor's
+// own header would otherwise arrive at whoever the first host chose to point at, carrying
+// a credential that still works.
+func TestACallersHeadersDoNotFollowARedirectOffItsOwnHost(t *testing.T) {
+	t.Parallel()
+
+	var landed http.Header
+	elsewhere := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		landed = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/pdf")
+		_, _ = w.Write([]byte("bytes"))
+	}))
+	t.Cleanup(elsewhere.Close)
+
+	var kept http.Header
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		kept = r.Header.Clone()
+		http.Redirect(w, r, elsewhere.URL+"/file.pdf", http.StatusFound)
+	}))
+	t.Cleanup(origin.Close)
+
+	file, err := retrieveOverHTTP(t.Context(), origin.URL+"/file.pdf", map[string]string{
+		"X-API-Key":     "sk_live_deadbeef",
+		"Authorization": "Bearer t",
+	})
+	if err != nil {
+		t.Fatalf("retrieveOverHTTP: %v", err)
+	}
+	defer func() { _ = file.body.Close() }()
+
+	// The host the caller named gets what the caller sent, or the reference does not open.
+	if kept.Get("X-API-Key") != "sk_live_deadbeef" {
+		t.Fatalf("the host the caller named did not receive its own header: %v", kept)
+	}
+	for _, name := range []string{"X-API-Key", "Authorization"} {
+		if got := landed.Get(name); got != "" {
+			t.Fatalf("%s followed the redirect to another host with %q", name, got)
+		}
+	}
+}
+
+// A chain that does not end is the caller's address to fix, not a minute to wait out.
+// Reported as retryable it is retried for as long as the caller keeps the message.
+func TestAnEndlessRedirectIsTheCallersToFixRatherThanToRetry(t *testing.T) {
+	t.Parallel()
+
+	var loop *httptest.Server
+	loop = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, loop.URL+"/again", http.StatusFound)
+	}))
+	t.Cleanup(loop.Close)
+
+	_, err := retrieveOverHTTP(t.Context(), loop.URL+"/file.pdf", nil)
+	assertCode(t, err, protocol.ErrorInvalidPayload)
+}
+
+// A header the HTTP client would refuse anyway is refused here instead. Left to the
+// client, the failure is indistinguishable from a server that would not answer, so it is
+// reported as worth trying again and the same reference is retried forever.
+func TestAHeaderNoClientWouldSendIsRefusedOnThePayload(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct{ name, headers string }{
+		{"a newline in the value", `{"X-API-Key":"sk\nX-Injected: yes"}`},
+		{"a carriage return in the value", `{"X-API-Key":"sk\rmore"}`},
+		{"a colon in the name", `{"X-API:Key":"sk"}`},
+		{"a space in the name", `{"X API Key":"sk"}`},
+		{"a name that is not there at all", `{"":"sk"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			req := requestOf(t, `{"message_id":"3EB0","to":{"kind":"phone","id":"5511999990001"},
+				"content":{"type":"media","kind":"image","ref":{"kind":"url",
+				"url":"http://rails:3000/blob.jpg","headers":`+tc.headers+`}}}`)
+			_, _, err := planBody(req, nil, 1<<20)
+			assertCode(t, err, protocol.ErrorInvalidPayload)
+		})
+	}
+}
+
+// A cap set to the largest int64 there is used to wrap the probe byte to a negative
+// length, and slicing to that is a panic: an accepted configuration that took the whole
+// connector down on an ordinary send.
+func TestTheLargestCapThereIsDoesNotTakeTheConnectorDown(t *testing.T) {
+	t.Parallel()
+
+	session, serving, _ := outboundSession(t)
+	session.sendLimit = math.MaxInt64
+	serving.answer([]byte("os bytes do arquivo"), "image/jpeg")
+
+	message := mustSendBody(t, session, `{"message_id":"3EB0","to":{"kind":"phone","id":"5511999990001"},
+		"content":{"type":"media","kind":"image","ref":{"kind":"url","url":"http://rails:3000/blob.jpg"}}}`)
+	if message.GetImageMessage() == nil {
+		t.Fatal("a send under the largest cap there is did not produce an image")
+	}
+}
+
+// The deadline can land before the headers arrive or while the body is being read, and it
+// is the same budget running out either way. Answered differently, one half of one
+// deadline reports itself as this connector breaking.
+func TestADeadlineLandingMidBodyIsTheSameAnswerAsOneLandingBeforeIt(t *testing.T) {
+	t.Parallel()
+
+	session, serving, _ := outboundSession(t)
+	// Headers already in, and then the body stops because the command's budget ran out.
+	serving.answerStream(io.MultiReader(
+		strings.NewReader("metade do arquivo"),
+		errorReader{fmt.Errorf("read tcp: %w", context.DeadlineExceeded)},
+	), -1, "image/jpeg")
+
+	_, err := session.send(t.Context(), &protocol.Command{
+		Type: protocol.CommandMessageSend,
+		Payload: json.RawMessage(`{"message_id":"3EB0","to":{"kind":"phone","id":"5511999990001"},
+			"content":{"type":"media","kind":"image",
+			"ref":{"kind":"url","url":"http://rails:3000/blob.jpg"}}}`),
+	})
+	assertCode(t, err, protocol.ErrorTimeout)
 }

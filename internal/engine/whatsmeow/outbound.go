@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"mime"
 	"net/http"
 	"net/url"
@@ -38,6 +39,10 @@ const uploadTimeout = 2 * time.Minute
 // ordinary on a storage service that signs its URLs; a chain longer than this is a loop
 // or a misconfiguration, and following it costs a request per hop.
 const fetchRedirects = 5
+
+// errTooManyRedirects is a chain that did not end. Deterministic, so it is the caller's
+// reference to fix rather than something to try again.
+var errTooManyRedirects = errors.New("whatsmeow: the address of the file to send redirects without ending")
 
 // vcardVersion is the vCard the connector writes when the caller gave it a number and a
 // name rather than a card. 3.0 because that is what WhatsApp's own clients send and what
@@ -340,6 +345,9 @@ func planMedia(content *outboundContent, limit int64) (*mediaPlan, error) {
 		return nil, protocol.NewError(protocol.ErrorMediaTooLarge,
 			fmt.Sprintf("the caller says %d bytes and this instance sends at most %d", declared, limit))
 	}
+	if err := sendableHeaders(content.Ref.Headers); err != nil {
+		return nil, err
+	}
 	thumbnail, err := thumbnailBytes(content.Thumbnail, content.Kind)
 	if err != nil {
 		return nil, err
@@ -404,6 +412,14 @@ func (s *Session) mediaToSend(
 // still holds the only copy of what it wanted to send. `internal` for the same reason as
 // every other failure of the caller's own address, which is issue #26.
 func sourceStopped(err error) error {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		// The deadline landed while the body was being read rather than before the
+		// headers arrived. It is the same budget running out either way, and the caller
+		// is about to stop waiting; answered as anything else, the two halves of one
+		// deadline report themselves differently.
+		return protocol.NewError(protocol.ErrorTimeout,
+			"the file to send did not arrive before this command's deadline")
+	}
 	return protocol.NewError(protocol.ErrorInternal,
 		fmt.Sprintf("the file to send stopped arriving partway through: %v", bareError(err)))
 }
@@ -426,25 +442,28 @@ func allOfIt(declared int64, uploaded *wm.UploadResponse) error {
 	return nil
 }
 
-// safeAddress is an address with its query dropped, for putting in a message.
+// safeAddress is where a fetch was pointed, with nothing that opens it.
 //
-// A reference from the client is very often a signed URL: the credential is the query,
-// and it is valid for as long as the signature says. The reply this goes into is stored
-// by the caller and read back out of its logs, so echoing the whole thing writes a
-// working credential somewhere it outlives the send. What is left still identifies which
-// address failed, which is the whole reason to name it.
+// A reference from the client is very often a signed URL, and which part of it is the
+// credential depends on who signed it: S3 and its imitators put the signature in the
+// query, and Rails Active Storage puts a signed blob id in the path, where it is a
+// bearer token for that file. The reply this goes into is stored by the caller and read
+// back out of its logs, so anything kept here outlives the send it was minted for.
+//
+// So only the scheme and the host survive. That is enough for the thing an operator
+// reads this to learn -- which storage was not answering -- and the caller already knows
+// which file it asked for, because it wrote the reference.
 func safeAddress(raw string) string {
 	parsed, err := url.Parse(raw)
-	if err != nil {
-		// Unparseable, so there is no query to separate out and no way to be sure what
-		// is in it. The scheme is all that can be said safely.
+	if err != nil || parsed.Host == "" {
+		// Unparseable, or an address with no host to name. Either way there is no way to
+		// be sure which part of it opens anything, so none of it is repeated.
 		if scheme, _, found := strings.Cut(raw, ":"); found && scheme != "" {
-			return scheme + ":[unparseable]"
+			return scheme + ":[redacted]"
 		}
-		return "[unparseable]"
+		return "[redacted]"
 	}
-	parsed.RawQuery, parsed.Fragment, parsed.User = "", "", nil
-	return parsed.String()
+	return parsed.Scheme + "://" + parsed.Host
 }
 
 // bareError is the failure without the request line Go wraps it in.
@@ -491,6 +510,30 @@ func fetchable(ref *protocol.MediaRef) (string, error) {
 			fmt.Sprintf("%s names no host to fetch from", safeAddress(ref.URL)))
 	}
 	return ref.URL, nil
+}
+
+// sendableHeaders refuses a header the HTTP client would refuse anyway.
+//
+// It refuses it here instead, and that is the whole point: rejected by the client, the
+// failure is indistinguishable from a server that would not answer, so it is reported as
+// worth trying again and the same reference is retried for as long as the caller keeps
+// the message. A header with a newline in it will never be sendable, whoever is asked.
+func sendableHeaders(headers map[string]string) error {
+	for name, value := range headers {
+		if name == "" || strings.ContainsAny(name, " \t\r\n:") {
+			return protocol.NewError(protocol.ErrorInvalidPayload,
+				fmt.Sprintf("%q is not a header name", name))
+		}
+		for _, char := range []byte(value) {
+			// What the HTTP client itself allows in a value: printable bytes and a tab.
+			// A carriage return or a newline here is what a header injection looks like.
+			if char != '\t' && (char < ' ' || char == 0x7f) {
+				return protocol.NewError(protocol.ErrorInvalidPayload,
+					fmt.Sprintf("the value of %q carries a character a header cannot", name))
+			}
+		}
+	}
+	return nil
 }
 
 // mimeToSend decides what to tell WhatsApp the file is.
@@ -687,7 +730,15 @@ func (c *counting) Read(into []byte) (int, error) {
 	// is exactly the cap from one that is larger: a reader is under no obligation to
 	// report EOF alongside the last bytes rather than on the read after them, so a
 	// counter that refused at the cap would refuse a file the setting says it sends.
-	if room := c.limit - c.read + 1; int64(len(into)) > room {
+	//
+	// The probe byte is added only when there is room in an int64 for it. A cap set to
+	// the largest one there is would otherwise wrap to a negative length, and slicing to
+	// that is a panic that takes the whole connector down on an ordinary send.
+	room := c.limit - c.read
+	if room < math.MaxInt64 {
+		room++
+	}
+	if int64(len(into)) > room {
 		into = into[:room]
 	}
 	read, err := c.from.Read(into)
@@ -723,15 +774,34 @@ func retrieveOverHTTP(ctx context.Context, address string, headers map[string]st
 	}
 
 	client := &http.Client{
-		CheckRedirect: func(_ *http.Request, via []*http.Request) error {
-			if len(via) >= fetchRedirects {
-				return fmt.Errorf("stopped after %d redirects", fetchRedirects)
+		CheckRedirect: func(hop *http.Request, via []*http.Request) error {
+			// Strictly greater: via holds the requests already made, so on the first
+			// redirect it has one entry. Comparing with >= would follow one hop fewer
+			// than the constant says.
+			if len(via) > fetchRedirects {
+				return errTooManyRedirects
+			}
+			// net/http drops Authorization, Cookie and WWW-Authenticate of its own accord
+			// when a redirect leaves the host, and nothing else: a reference authenticated
+			// with X-API-Key or a vendor's own header would arrive at whoever the first
+			// host chose to point at, carrying a working credential. The caller's headers
+			// are what open its storage, so they go no further than the host it named.
+			if hop.URL.Host != via[0].URL.Host {
+				for name := range headers {
+					hop.Header.Del(name)
+				}
 			}
 			return nil
 		},
 	}
 	answer, err := client.Do(request)
 	switch {
+	case errors.Is(err, errTooManyRedirects):
+		// Deterministic: the same reference redirects the same way every time, so this is
+		// the caller's address to fix and not a minute to wait out. Reported as retryable
+		// it is retried for as long as the caller keeps the message.
+		return source{}, protocol.NewError(protocol.ErrorInvalidPayload,
+			fmt.Sprintf("the address of the file to send redirects more than %d times", fetchRedirects))
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
 		// Asked about first, because this one is already accounted for: the deadline is
 		// the caller's own and it has run out, so the caller is about to stop waiting
