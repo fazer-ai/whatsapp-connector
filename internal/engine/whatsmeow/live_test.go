@@ -679,6 +679,156 @@ func TestLiveSend(t *testing.T) {
 	fmt.Fprintf(os.Stderr, "sent %s at %s\n", sent.MessageID, time.UnixMilli(sent.Timestamp))
 }
 
+// TestLiveActOnAMessage is M2.5's outbound half against a real recipient: a message
+// corrected, one reacted to, and one deleted.
+//
+// This is the phase the unit tests cannot stand in for, and the reason is the same for
+// all three. Each names a message that already exists with a key, and WhatsApp accepts a
+// key that resolves to nothing exactly as readily as one that resolves: the send answers
+// with a timestamp either way, and nothing afterwards says which happened. A test on this
+// side can check that the key was built from the right parts. Only a recipient's client
+// can say whether the parts were the right ones.
+//
+// Two messages are sent rather than one, so everything is on screen at the end. The first
+// is corrected and reacted to and stays; the second is deleted. A single message would
+// leave the earlier steps invisible behind the deletion.
+func TestLiveActOnAMessage(t *testing.T) {
+	to := os.Getenv("WAC_LIVE_TO")
+	if to == "" {
+		t.Skip("set WAC_LIVE_TO to the number this account should send to")
+	}
+
+	session, _ := liveSession(t)
+	events := watch(t, session)
+	if err := session.Connect(t.Context(), engine.ConnectRequest{Pairing: "resume"}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	events.awaitState(t, "open", 2*time.Minute)
+
+	chat := map[string]any{"kind": "phone", "id": to}
+	standing := liveSendOne(t, session, to, map[string]any{
+		"type": "text", "body": "conector nativo: esta mensagem vai ser corrigida",
+	})
+	doomed := liveSendOne(t, session, to, map[string]any{
+		"type": "text", "body": "conector nativo: esta mensagem vai ser apagada",
+	})
+
+	liveActOne(t, session, protocol.CommandMessageEdit, map[string]any{
+		"to": chat, "target_id": standing,
+		"content": map[string]any{"type": "text", "body": "conector nativo: corrigida"},
+	})
+	// On the account's own message, which is the only kind of target this phase has: the
+	// other branch, a reaction on the contact's message, needs an id from their side and
+	// is what WAC_LIVE_REACT_TO is for.
+	liveActOne(t, session, protocol.CommandMessageReact, map[string]any{
+		"to": chat, "target_id": standing, "target_from_me": true, "emoji": "❤️",
+	})
+	liveActOne(t, session, protocol.CommandMessageRevoke, map[string]any{
+		"to": chat, "target_id": doomed,
+	})
+
+	// A reaction on somebody else's message builds a different key -- `from_me` false,
+	// and in a direct chat no participant -- and a key that is wrong there fails the same
+	// silent way. Set WAC_LIVE_REACT_TO to an id the recipient sent, or to `wait` to have
+	// the phase take the next message they send: an id copied by hand is an id nobody
+	// copies, and the branch then never runs.
+	if theirs := os.Getenv("WAC_LIVE_REACT_TO"); theirs != "" {
+		// Reacted in the chat the message arrived in, which is not always the one this
+		// phase sends to: the key carries the chat as its `remoteJID`, and a direct chat
+		// this account addresses by phone can deliver under a LID chat. Reacting to the
+		// phone chat then names a message that chat does not hold. An id given by hand
+		// has no event to take a chat from and falls back to the one being sent to,
+		// which is the reason `wait` is the better way to run this.
+		where := chat
+		if theirs == "wait" {
+			theirs, where = liveAwaitTheirMessage(t, events, liveWindow(t, 2*time.Minute))
+		}
+		emoji := "👍"
+		if pick := os.Getenv("WAC_LIVE_REACT_EMOJI"); pick != "" {
+			// A reaction replaces the sender's previous one, so telling a second run
+			// apart from the first needs a different one.
+			emoji = pick
+		}
+		liveActOne(t, session, protocol.CommandMessageReact, map[string]any{
+			"to": where, "target_id": theirs, "emoji": emoji,
+		})
+	}
+	// And taking one off is a reaction with an empty emoji, not a command of its own.
+	reaction := "carries the reaction"
+	if os.Getenv("WAC_LIVE_UNREACT") != "" {
+		liveActOne(t, session, protocol.CommandMessageReact, map[string]any{
+			"to": chat, "target_id": standing, "target_from_me": true, "emoji": "",
+		})
+		reaction = "carries no reaction, the one put on it having been taken off"
+	}
+
+	fmt.Fprintf(os.Stderr, "check the recipient: %s reads \"corrigida\", %s, "+
+		"and says it was edited; %s is gone\n", standing, reaction, doomed)
+}
+
+// liveAwaitTheirMessage is the next message the recipient sends: its id, and the chat it
+// arrived in. Both, because the chat is half of the key and is not always the one this
+// phase addresses -- see the caller.
+//
+// Waiting rather than taking an id by hand is what makes this branch get run at all: an
+// id somebody has to copy off a phone is an id nobody copies.
+func liveAwaitTheirMessage(
+	t *testing.T, events *recorder, window time.Duration,
+) (id string, chat map[string]any) {
+	t.Helper()
+
+	fmt.Fprintf(os.Stderr, "send a text from the recipient's phone now; waiting up to %s\n", window)
+	received := events.await(t, protocol.EventMessageReceived, window)
+	var body struct {
+		Message struct {
+			ID     string `json:"id"`
+			FromMe bool   `json:"from_me"`
+			Chat   struct {
+				Kind string `json:"kind"`
+				ID   string `json:"id"`
+			} `json:"chat"`
+		} `json:"message"`
+	}
+	if err := json.Unmarshal(received.Payload, &body); err != nil {
+		t.Fatalf("unmarshal the message: %v", err)
+	}
+	if body.Message.ID == "" || body.Message.Chat.ID == "" || body.Message.FromMe {
+		// An echo of this account's own send would build the other key entirely, which
+		// is the one the rest of the phase already covers.
+		t.Fatalf("that is not a message from the other side: %s", received.Payload)
+	}
+	return body.Message.ID, map[string]any{"kind": body.Message.Chat.Kind, "id": body.Message.Chat.ID}
+}
+
+// liveActOne runs one of the three commands that act on an existing message and fails on
+// anything but a clean answer. What it cannot check is the part that matters, which is
+// why it prints and the phase ends with a look at the phone.
+func liveActOne(t *testing.T, session *Session, kind protocol.CommandType, payload map[string]any) {
+	t.Helper()
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("build the %s: %v", kind, err)
+	}
+	// The command id is what the stanza id is derived from when the payload names none,
+	// so two actions sharing one go out under the same id and the recipient discards the
+	// second as a duplicate of the first. That is the mechanism working, and in here it
+	// would read as the action silently failing.
+	//
+	// Taken from the payload rather than from a field picked out of it, because picking
+	// has to be redone every time the phase grows an action: the type and the target were
+	// enough until a reaction and its removal, which differ only in the emoji. Two
+	// identical payloads are the same command and should collide; anything else is a
+	// different one.
+	result, err := session.Execute(t.Context(), &protocol.Command{
+		Type: kind, ID: fmt.Sprintf("live-%s-%x", kind, sha256.Sum256(body)), Payload: body,
+	})
+	if err != nil {
+		t.Fatalf("%s: %v", kind, err)
+	}
+	fmt.Fprintf(os.Stderr, "%s on %v answered %s\n", kind, payload["target_id"], result)
+}
+
 // TestLiveLogout unlinks the device. It is the last phase, and running it means the
 // next run starts at TestLivePairWithQR again.
 // TestLiveSendMedia is M2.4 against a real recipient: a file fetched over HTTP, uploaded

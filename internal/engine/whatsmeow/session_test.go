@@ -109,12 +109,25 @@ func TestExecuteAnswersTheSessionAndRefusesTheRest(t *testing.T) {
 	// acknowledging a command this build cannot carry out would lose whatever it was
 	// asked to do and report success.
 	for _, unsupported := range []protocol.CommandType{
-		protocol.CommandMessageEdit, protocol.CommandMessageRevoke, protocol.CommandMessageReact,
 		protocol.CommandMessageMarkRead, protocol.CommandChatPresence,
 	} {
 		if _, err := session.Execute(t.Context(), &protocol.Command{Type: unsupported}); !errors.Is(err, engine.ErrNotSupported) {
 			t.Fatalf("%s answered %v, want ErrNotSupported", unsupported, err)
 		}
+	}
+
+	// And the three that act on an existing message are reached now, which is a
+	// different thing from being carried out: an empty payload names no message, so what
+	// comes back says the payload is wrong rather than that the command is unknown. A
+	// client told `unsupported` stops asking, so the two answers cannot be swapped.
+	for _, reached := range []protocol.CommandType{
+		protocol.CommandMessageEdit, protocol.CommandMessageRevoke, protocol.CommandMessageReact,
+	} {
+		_, err := session.Execute(t.Context(), &protocol.Command{Type: reached, Payload: json.RawMessage(`{}`)})
+		if errors.Is(err, engine.ErrNotSupported) {
+			t.Fatalf("%s is wired up and still answers ErrNotSupported", reached)
+		}
+		assertCode(t, err, protocol.ErrorInvalidPayload)
 	}
 }
 

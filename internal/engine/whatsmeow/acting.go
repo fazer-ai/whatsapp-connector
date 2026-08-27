@@ -1,0 +1,424 @@
+package whatsmeow
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+
+	wm "go.mau.fi/whatsmeow"
+
+	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
+	waTypes "go.mau.fi/whatsmeow/types"
+
+	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
+)
+
+// The three commands that act on a message that already exists.
+//
+// None of them is a verb of its own on the wire: WhatsApp carries an edit, a revoke and
+// a reaction as ordinary messages whose body says what they do to another one. So all
+// three end where a send ends, and what differs is the body they build, the key they
+// build it around, and the answer the contract's table says they give back.
+//
+// What they have in common is that key. Every one of them names a message somebody
+// already has, and naming it wrongly is the failure that matters: WhatsApp accepts a key
+// that resolves to nothing, the send reports success, and the recipient sees no edit, no
+// deletion and no reaction. There is no acknowledgement that says otherwise, so what
+// cannot be built correctly is refused here instead.
+
+// editRequest, revokeRequest and reactRequest are three shapes rather than one wide one.
+//
+// The contract gives each command its own payload, and they overlap only in naming a
+// chat and a target. Decoded through a single struct, a field one of them adds later
+// under a name another already reads differently would change what the other means --
+// which is the compatibility the contract's additive rule exists to keep.
+type editRequest struct {
+	MessageID string           `json:"message_id"`
+	To        protocol.Address `json:"to"`
+	TargetID  string           `json:"target_id"`
+	Content   json.RawMessage  `json:"content"`
+}
+
+type revokeRequest struct {
+	To          protocol.Address  `json:"to"`
+	TargetID    string            `json:"target_id"`
+	Participant *protocol.Address `json:"participant"`
+}
+
+type reactRequest struct {
+	MessageID    string           `json:"message_id"`
+	To           protocol.Address `json:"to"`
+	TargetID     string           `json:"target_id"`
+	TargetFromMe bool             `json:"target_from_me"`
+	// A pointer, because the two ways this can be missing mean opposite things: an empty
+	// string is how the contract says "take the reaction off", and no field at all is a
+	// caller that did not say what to react with. Decoded into a string both arrive as
+	// "" and every malformed command would silently remove a reaction instead.
+	Emoji             *string           `json:"emoji"`
+	TargetParticipant *protocol.Address `json:"target_participant"`
+}
+
+// edit carries out `message.edit`.
+func (s *Session) edit(ctx context.Context, command *protocol.Command) (json.RawMessage, error) {
+	var req editRequest
+	if err := json.Unmarshal(command.Payload, &req); err != nil {
+		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
+			"an edit has to say which message it corrects, in which chat, and to what")
+	}
+	if req.TargetID == "" {
+		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
+			"an edit has to name the message it corrects")
+	}
+	to, err := jidOf(req.To)
+	if err != nil {
+		return nil, err
+	}
+	corrected, err := editedBody(req.Content)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.readyToSend(); err != nil {
+		return nil, err
+	}
+
+	client := s.current()
+	// The key BuildEdit puts together is `from_me: true` and nothing else, which is the
+	// whole of what WhatsApp allows: a message is edited by whoever sent it. The
+	// contract carries no way to say otherwise for exactly that reason.
+	sent, err := s.putOnTheWire(ctx, to, s.orDerived(command, req.MessageID),
+		client.BuildEdit(to, req.TargetID, corrected))
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(map[string]any{
+		"message_id": sent.ID,
+		"timestamp":  sent.Timestamp.UnixMilli(),
+		"client_ref": nil,
+	})
+}
+
+// revoke carries out `message.revoke`.
+func (s *Session) revoke(ctx context.Context, command *protocol.Command) (json.RawMessage, error) {
+	var req revokeRequest
+	if err := json.Unmarshal(command.Payload, &req); err != nil {
+		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
+			"a revoke has to say which message it deletes and in which chat")
+	}
+	if req.TargetID == "" {
+		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
+			"a revoke has to name the message it deletes")
+	}
+	to, err := jidOf(req.To)
+	if err != nil {
+		return nil, err
+	}
+	// Absent is the ordinary case and means the account's own message. Present is a
+	// group admin deleting somebody else's, and it is passed on as it stands even in a
+	// chat where WhatsApp will not act on it: the contract puts no condition on the
+	// field, and a connector that added one would refuse a payload a client is entitled
+	// to send.
+	sender, err := jidOfMaybe(req.Participant)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.readyToSend(); err != nil {
+		return nil, err
+	}
+	// The same question a reaction's participant answers, for the same reason: an admin
+	// deleting somebody's message in a group names them in the key.
+	if sender, err = s.asTheGroupAddresses(ctx, to, sender); err != nil {
+		return nil, err
+	}
+
+	client := s.current()
+	// Derived like the other two, even though a revoke's payload has no id field of its
+	// own to leave out. The window is the same one: the record that answers a redelivery
+	// is written after the send, so a crash between them sends this again, and a fresh
+	// stanza id is a second revoke the receiving client has no way to recognise as the
+	// first. What it does with one whose target is already gone is its business, and
+	// not something to find out per outage.
+	//
+	// Ignored on a channel, where whatsmeow rewrites the stanza id to the target's,
+	// which is how a channel names what is being deleted. That is already idempotent by
+	// construction: the id is the target's, so the retry carries the same one.
+	if _, err := s.putOnTheWire(ctx, to, s.orDerived(command, ""),
+		client.BuildRevoke(to, sender, req.TargetID)); err != nil {
+		return nil, err
+	}
+	// `null`, which is what the contract's table says a revoke answers. There is no id
+	// worth handing back: the message this puts on the wire exists to make another one
+	// disappear, and nothing ever refers to it again.
+	return json.Marshal(nil)
+}
+
+// react carries out `message.react`.
+func (s *Session) react(ctx context.Context, command *protocol.Command) (json.RawMessage, error) {
+	var req reactRequest
+	if err := json.Unmarshal(command.Payload, &req); err != nil {
+		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
+			"a reaction has to say which message it is on, in which chat, and with what")
+	}
+	if req.TargetID == "" {
+		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
+			"a reaction has to name the message it is on")
+	}
+	if req.Emoji == nil {
+		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
+			"a reaction has to say what to react with, and an empty one takes it off")
+	}
+	if req.To.Kind == protocol.AddressStatus {
+		// A reaction to somebody's status is a message to that person on WhatsApp, and
+		// this is not the path that sends one. `status@broadcast` is where an account
+		// publishes its own status, so SendMessage asks whatsmeow for the account's
+		// status audience and encrypts the stanza to every contact in it: the author
+		// gets it only if they happen to be in that list, and everybody else in it gets
+		// an envelope about a status they may never have seen. Refused until #36 sends
+		// it where it belongs.
+		//
+		// A revoke is not refused with it: deleting one's own status is exactly a
+		// message to that audience, so the fan-out there is the point rather than the
+		// bug.
+		return nil, protocol.NewError(protocol.ErrorUnsupported,
+			"this connector cannot react to a status yet")
+	}
+	if req.To.Kind == protocol.AddressNewsletter {
+		// A channel takes a reaction through a node of its own, keyed by the post's
+		// `server_id` rather than by a message key -- whatsmeow has NewsletterSendReaction
+		// for it, and the contract carries no field the server id could arrive in. Sent
+		// the ordinary way it goes out as a message naming a key the channel cannot
+		// resolve, and the send reports success. Refused until #34 does it properly.
+		//
+		// An edit and a revoke are not in the same position and are not refused:
+		// whatsmeow recognises both on the newsletter path and rewrites the stanza id to
+		// the target's, which is how a channel names what is being changed.
+		return nil, protocol.NewError(protocol.ErrorUnsupported,
+			"this connector cannot react to a channel post yet")
+	}
+	to, err := jidOf(req.To)
+	if err != nil {
+		return nil, err
+	}
+	sender, err := whoSentTheTarget(&req, to)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.readyToSend(); err != nil {
+		return nil, err
+	}
+	if sender, err = s.asTheGroupAddresses(ctx, to, sender); err != nil {
+		return nil, err
+	}
+
+	client := s.current()
+	sent, err := s.putOnTheWire(ctx, to, s.orDerived(command, req.MessageID),
+		client.BuildReaction(to, sender, req.TargetID, *req.Emoji))
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(map[string]any{
+		"message_id": sent.ID,
+		"timestamp":  sent.Timestamp.UnixMilli(),
+		"client_ref": nil,
+	})
+}
+
+// whoSentTheTarget is the JID a reaction's key is built around, and getting it wrong is
+// the silent failure this whole file is written against: WhatsApp accepts a reaction
+// whose key resolves to no message, answers with a timestamp, and nobody ever sees it.
+//
+// An empty JID is how whatsmeow's BuildMessageKey is told the target is the account's
+// own, so that is what a caller saying `target_from_me` gets back.
+func whoSentTheTarget(req *reactRequest, chat waTypes.JID) (waTypes.JID, error) {
+	if req.TargetFromMe {
+		if req.TargetParticipant != nil {
+			// Both, and they cannot both be true. Guessing which one the caller meant
+			// puts the reaction on somebody else's message or on none at all, and the
+			// send says it worked either way.
+			return waTypes.EmptyJID, protocol.NewError(protocol.ErrorInvalidPayload,
+				"a reaction cannot be on the account's own message and on somebody else's at once")
+		}
+		return waTypes.EmptyJID, nil
+	}
+	if req.TargetParticipant != nil {
+		return jidOf(*req.TargetParticipant)
+	}
+	switch chat.Server {
+	case waTypes.DefaultUserServer, waTypes.HiddenUserServer:
+		// A chat with one other person: whoever it is with is who sent everything in it
+		// that the account did not, so the chat names the sender on its own.
+		return chat, nil
+	default:
+		// Anywhere else there are many, and the key needs the one. Refused rather than
+		// sent with the chat in the sender's place: that builds a key naming a message
+		// the group itself sent, which is no message, and the reaction lands nowhere.
+		return waTypes.EmptyJID, protocol.NewError(protocol.ErrorInvalidPayload,
+			fmt.Sprintf("a reaction on somebody else's message in a %s has to say whose", req.To.Kind))
+	}
+}
+
+// asTheGroupAddresses rewrites a participant into the addressing its group uses.
+//
+// A group is addressed by phone number or by LID, and a message key in it names its
+// sender in whichever of the two the group is on. The client does not know which: this
+// connector publishes a sender as both, and the one a client hands back is whichever it
+// files contacts under -- Chatwoot answers with the LID whenever it has one. Passed
+// through into a key for a group still on phone numbers, that names a participant no
+// message in it was ever sent by, and WhatsApp accepts the key, answers with a timestamp
+// and shows nothing. whatsmeow does not rewrite it either: it picks the addressing for
+// the stanza and leaves the key in the body as it was built.
+//
+// Costs a round trip for the group's metadata, and only on a group whose key names a
+// participant -- a direct chat's does not, which is where this is not called at all.
+//
+// The two failures are answered differently, which is the point of splitting them. Not
+// being able to read the group leaves the participant as the caller gave it: that is what
+// this did before, no worse, and refusing a reaction because a metadata query had a bad
+// second would break one that mostly works. Reading the group and then having nothing to
+// translate with is the other half: the namespace is known to be wrong and there is
+// nothing to build a right one from, so it is refused rather than sent to be ignored.
+func (s *Session) asTheGroupAddresses(
+	ctx context.Context, chat, participant waTypes.JID,
+) (waTypes.JID, error) {
+	if participant.IsEmpty() || chat.Server != waTypes.GroupServer {
+		return participant, nil
+	}
+	read := s.groupMode
+	if read == nil {
+		read = s.groupModeOverSocket
+	}
+	info, err := read(ctx, chat)
+	if err != nil {
+		s.log.Warn().Err(err).Str("chat", chat.String()).
+			Msg("could not read the group's addressing, sending the participant as it came")
+		return participant, nil
+	}
+	// Kept as the contract's own kind rather than the server behind it, because it ends
+	// up in a message that crosses the wire, where an address is `{kind, id}` and never a
+	// raw JID.
+	wanted, wantedServer := protocol.AddressPhone, waTypes.DefaultUserServer
+	if info == waTypes.AddressingModeLID {
+		wanted, wantedServer = protocol.AddressLID, waTypes.HiddenUserServer
+	}
+	if participant.Server == wantedServer {
+		return participant, nil
+	}
+	alt, err := s.current().Store.GetAltJID(ctx, participant)
+	switch {
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+		// The caller's own budget, and it has run out. Reported as anything else the
+		// send reads as this connector breaking.
+		return waTypes.EmptyJID, protocol.NewError(protocol.ErrorTimeout,
+			"the mapping this group's addressing needs did not arrive before the command's deadline")
+	case err != nil:
+		// The store having a bad second, which the next attempt may well not have. It is
+		// not the caller's payload and must not be answered as one: told its address is
+		// wrong, a client stops sending it.
+		//
+		// What went wrong is logged and not sent. A reply crosses into a client's UI, and
+		// a driver's own words there are noise to whoever reads them and a description of
+		// this deployment's insides to whoever does not -- the same reason the fetch
+		// answers out of a closed vocabulary rather than repeating net/http.
+		s.log.Warn().Err(err).Str("chat", chat.String()).Str("participant", participant.String()).
+			Msg("could not look up how a participant is addressed in a group")
+		return waTypes.EmptyJID, protocol.NewError(protocol.ErrorInternal,
+			"could not look up how that participant is addressed in the group")
+	case alt.IsEmpty():
+		// Asked and answered: there is no mapping, so there is no key naming this
+		// participant that the group would resolve, and the next attempt says the same.
+		//
+		// Named the way the caller named it, which is also the only way an address is
+		// allowed to cross: a JID in here would put `@s.whatsapp.net` in a client's UI
+		// and its own server names in this connector's replies.
+		named, _ := addressOf(participant)
+		return waTypes.EmptyJID, protocol.NewError(protocol.ErrorInvalidPayload,
+			fmt.Sprintf("that group names its senders by %s, and this session has no %s for the %s %s",
+				wanted, wanted, named.Kind, named.ID))
+	}
+	return alt, nil
+}
+
+// groupModeOverSocket asks WhatsApp how a group addresses its members.
+func (s *Session) groupModeOverSocket(ctx context.Context, chat waTypes.JID) (waTypes.AddressingMode, error) {
+	info, err := s.current().GetGroupInfo(ctx, chat)
+	if err != nil {
+		return "", err
+	}
+	return info.AddressingMode, nil
+}
+
+// jidOfMaybe is jidOf for a field the contract makes optional, where absent and an
+// explicit null mean the same thing and neither is an error.
+func jidOfMaybe(address *protocol.Address) (waTypes.JID, error) {
+	if address == nil {
+		return waTypes.EmptyJID, nil
+	}
+	return jidOf(*address)
+}
+
+// orDerived is the id to put a message on the wire under.
+//
+// The contract requires one on a send and makes it optional on an edit and a reaction,
+// so this fills in what a caller left out. Derived rather than generated, because the id
+// is what carries invariant 5 the last mile: a stanza id is what the receiving client
+// deduplicates on, so a command whose reply was lost has to arrive under the same one or
+// it lands a second edit and a second reaction. The window is narrow and real -- the
+// session layer answers a redelivery from its record, and the record is written after
+// the send, so a crash between the two is a command that runs twice.
+//
+// Seeded with what the session layer keys that record on, so the two agree on which
+// commands are the same one: the caller's `idempotency_key` where there is one, and the
+// command's own id otherwise. The session id and the command type go in as well, so two
+// sessions handed the same key do not send each other's stanza id.
+func (s *Session) orDerived(command *protocol.Command, messageID string) string {
+	if messageID != "" {
+		return messageID
+	}
+	seed := command.IdempotencyKey
+	if seed == "" {
+		seed = command.ID
+	}
+	if seed == "" {
+		// Nothing identifies this command, so nothing can make it idempotent. A derived
+		// id would be the same for every command of this type on this session, and the
+		// receiving client would discard all but the first as duplicates -- which is
+		// worse than the repeat this exists to stop.
+		return s.current().GenerateMessageID()
+	}
+	sum := sha256.Sum256([]byte(s.sid + "\x00" + string(command.Type) + "\x00" + seed))
+	// The shape whatsmeow generates, so nothing downstream can tell one of these from
+	// one of its own.
+	return wm.WebMessageIDPrefix + strings.ToUpper(hex.EncodeToString(sum[:9]))
+}
+
+// editedBody renders what a message is being corrected to.
+//
+// Text only, and that is a limitation rather than a reading of the contract: WhatsApp
+// does let a caption be edited, but the message that carries the correction has to be
+// the whole media message again -- upload coordinates, keys and hashes -- and nothing
+// here keeps those once a send is done. Building one without them puts a message on the
+// wire whose file resolves to nothing. See #32.
+func editedBody(raw json.RawMessage) (*waE2E.Message, error) {
+	var body struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(raw, &body); err != nil || body.Type == "" {
+		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
+			"an edit has to say what the message is being corrected to")
+	}
+	if body.Type != "text" {
+		return nil, protocol.NewError(protocol.ErrorUnsupported,
+			fmt.Sprintf("this connector cannot correct a message to %q yet", body.Type))
+	}
+	content, err := decodeBody[textContent](raw, body.Type)
+	if err != nil {
+		return nil, err
+	}
+	// No context alongside it. The contract's edit payload carries no quote and no
+	// mentions, so there is nothing to put in one, and a correction that invented an
+	// empty context would drop the quote the original was sent with.
+	return textToSend(&content, nil)
+}
