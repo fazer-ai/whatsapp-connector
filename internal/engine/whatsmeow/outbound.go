@@ -370,11 +370,15 @@ func planMedia(content *outboundContent, limit int64) (*mediaPlan, error) {
 	if err != nil {
 		return nil, err
 	}
-	if declared := content.Size; declared > 0 && declared > limit {
-		// Refused before the transfer rather than after it, on the caller's own claim,
-		// the same way an inbound file is refused on the sender's.
-		return nil, protocol.NewError(protocol.ErrorMediaTooLarge,
-			fmt.Sprintf("the caller says %d bytes and this instance sends at most %d", declared, limit))
+	// Both of the caller's own numbers: the contract carries a size on the content and
+	// another on the reference, and a client that fills in only one of them is filling in
+	// the one it has. Refused before the transfer, the same way an inbound file is
+	// refused on the sender's claim.
+	for _, declared := range [...]int64{content.Size, content.Ref.Size} {
+		if declared > 0 && declared > limit {
+			return nil, protocol.NewError(protocol.ErrorMediaTooLarge,
+				fmt.Sprintf("the caller says %d bytes and this instance sends at most %d", declared, limit))
+		}
 	}
 	if err := sendableHeaders(content.Ref.Headers); err != nil {
 		return nil, err
@@ -441,6 +445,9 @@ func (s *Session) mediaToSend(
 		return nil, err
 	}
 	if err := allOfIt(content.Size, &uploaded); err != nil {
+		return nil, err
+	}
+	if err := allOfIt(content.Ref.Size, &uploaded); err != nil {
 		return nil, err
 	}
 	if err := theSameFile(content.Ref.SHA256, &uploaded); err != nil {
@@ -772,7 +779,7 @@ func renderMedia(
 			ContextInfo: alongside,
 		}}
 	case protocol.MediaDocument:
-		return &waE2E.Message{DocumentMessage: &waE2E.DocumentMessage{
+		document := &waE2E.DocumentMessage{
 			URL: &uploaded.URL, DirectPath: &uploaded.DirectPath, MediaKey: uploaded.MediaKey,
 			FileEncSHA256: uploaded.FileEncSHA256, FileSHA256: uploaded.FileSHA256,
 			FileLength: proto.Uint64(uploaded.FileLength),
@@ -780,6 +787,17 @@ func renderMedia(
 			FileName:   optional(content.Filename), Caption: optional(content.Caption),
 			JPEGThumbnail: thumbnail,
 			ContextInfo:   alongside,
+		}
+		if content.Caption == "" {
+			return &waE2E.Message{DocumentMessage: document}
+		}
+		// A document sent with a caption travels inside an envelope of its own, and it is
+		// the only leaf type that does. whatsmeow unwraps one on the way in -- which is
+		// how this connector sees a plain DocumentMessage when a caption was sent -- and
+		// never builds one on the way out, so a caption put on the bare leaf is one a
+		// current client has no reason to look for.
+		return &waE2E.Message{DocumentWithCaptionMessage: &waE2E.FutureProofMessage{
+			Message: &waE2E.Message{DocumentMessage: document},
 		}}
 	default:
 		return &waE2E.Message{StickerMessage: &waE2E.StickerMessage{

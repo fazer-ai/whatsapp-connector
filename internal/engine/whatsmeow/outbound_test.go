@@ -330,14 +330,11 @@ func TestEachKindOfFileGoesOutAsItsOwnShape(t *testing.T) {
 				}
 			}},
 		{"a document", `{"type":"media","kind":"document","mime":"application/pdf","filename":"proposta.pdf",
-			"caption":"segue","ref":{"kind":"url","url":"http://rails:3000/blob.pdf"}}`,
+			"ref":{"kind":"url","url":"http://rails:3000/blob.pdf"}}`,
 			func(t *testing.T, m *waE2E.Message) {
 				document := m.GetDocumentMessage()
 				if document.GetFileName() != "proposta.pdf" {
 					t.Fatalf("the document is named %q", document.GetFileName())
-				}
-				if document.GetCaption() != "segue" {
-					t.Fatalf("the document's caption is %q", document.GetCaption())
 				}
 			}},
 		{"a sticker", `{"type":"media","kind":"sticker","mime":"image/webp",
@@ -1593,4 +1590,80 @@ func TestADigestNoFileCouldMatchIsRefusedBeforeTheTransfer(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A document sent with a caption travels inside an envelope of its own, and it is the
+// only leaf type that does. whatsmeow unwraps one on the way in and never builds one on
+// the way out, so a caption put on the bare leaf is one a current client has no reason to
+// look for: the file arrives and the text does not, while the send reports success.
+func TestADocumentWithACaptionTravelsInTheEnvelopeWhatsAppUses(t *testing.T) {
+	t.Parallel()
+
+	session, serving, _ := outboundSession(t)
+	serving.answer([]byte("pdf"), "application/pdf")
+	message := mustSendBody(t, session, `{"message_id":"3EB0","to":{"kind":"phone","id":"5511999990001"},
+		"content":{"type":"media","kind":"document","mime":"application/pdf","filename":"proposta.pdf",
+		"caption":"segue a proposta","ref":{"kind":"url","url":"http://rails:3000/blob.pdf"}}}`)
+
+	if message.GetDocumentMessage() != nil {
+		t.Fatal("a captioned document went out as a bare leaf, where the caption is not looked for")
+	}
+	inner := message.GetDocumentWithCaptionMessage().GetMessage().GetDocumentMessage()
+	if inner == nil {
+		t.Fatalf("the envelope carries no document: %v", message)
+	}
+	if inner.GetCaption() != "segue a proposta" {
+		t.Fatalf("the caption inside the envelope is %q", inner.GetCaption())
+	}
+	if inner.GetFileName() != "proposta.pdf" {
+		t.Fatalf("the document inside the envelope is named %q", inner.GetFileName())
+	}
+	// The quote and the timer belong to the leaf, which is where whatsmeow reads them
+	// from once it has unwrapped the envelope.
+	if inner.GetURL() == "" || inner.GetMediaKey() == nil {
+		t.Fatal("the document inside the envelope carries nothing to fetch")
+	}
+
+	// And a document without one stays a bare leaf, which is what WhatsApp sends.
+	session, serving, _ = outboundSession(t)
+	serving.answer([]byte("pdf"), "application/pdf")
+	plain := mustSendBody(t, session, `{"message_id":"3EB0","to":{"kind":"phone","id":"5511999990001"},
+		"content":{"type":"media","kind":"document","mime":"application/pdf","filename":"proposta.pdf",
+		"ref":{"kind":"url","url":"http://rails:3000/blob.pdf"}}}`)
+	if plain.GetDocumentMessage() == nil {
+		t.Fatal("a document with no caption was wrapped in the caption envelope")
+	}
+}
+
+// The contract carries a size on the content and another on the reference, and a client
+// that fills in only one of them is filling in the one it has. Reading only the first
+// leaves the other unchecked in both directions: a file too big to send is fetched, and a
+// stale one shorter than the reference says goes out as what was asked for.
+func TestTheReferencesOwnSizeIsHeldToAsWell(t *testing.T) {
+	t.Parallel()
+
+	session, serving, uploads := outboundSession(t)
+	session.sendLimit = 1 << 10
+	serving.answer([]byte("bytes"), "")
+	_, err := session.send(t.Context(), &protocol.Command{
+		Type: protocol.CommandMessageSend,
+		Payload: json.RawMessage(`{"message_id":"3EB0","to":{"kind":"phone","id":"5511999990001"},
+			"content":{"type":"media","kind":"image",
+			"ref":{"kind":"url","url":"http://rails:3000/blob.jpg","size":1048576}}}`),
+	})
+	assertCode(t, err, protocol.ErrorMediaTooLarge)
+	if serving.count() != 0 || uploads.count() != 0 {
+		t.Fatalf("a file refused on the reference's own number still cost %d fetch(es) and %d upload(s)",
+			serving.count(), uploads.count())
+	}
+
+	session, serving, _ = outboundSession(t)
+	serving.answer([]byte("metade do arquivo"), "image/jpeg")
+	_, err = session.send(t.Context(), &protocol.Command{
+		Type: protocol.CommandMessageSend,
+		Payload: json.RawMessage(`{"message_id":"3EB0","to":{"kind":"phone","id":"5511999990001"},
+			"content":{"type":"media","kind":"image",
+			"ref":{"kind":"url","url":"http://rails:3000/blob.jpg","size":4096}}}`),
+	})
+	assertCode(t, err, protocol.ErrorInternal)
 }

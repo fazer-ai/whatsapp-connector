@@ -728,7 +728,10 @@ func TestLiveSendMedia(t *testing.T) {
 			"headers": map[string]any{"Authorization": "Bearer " + token},
 		},
 	}
-	if kind != "sticker" {
+	// Only where WhatsApp has somewhere to put one. A caption on an audio or a sticker is
+	// refused on the payload, so a phase that added one to everything would fail before
+	// fetching anything and never exercise the file at all.
+	if captions[protocol.MediaKind(kind)] {
 		content["caption"] = "conector nativo, fatia de saída"
 	}
 	sent := liveSendOne(t, session, to, content)
