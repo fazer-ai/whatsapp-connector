@@ -61,5 +61,12 @@ func mask(msg string, args ...any) string {
 	if len(args) > 0 {
 		rendered = fmt.Sprintf(msg, args...)
 	}
-	return secretShaped.ReplaceAllString(rendered, "[redacted]")
+	return redact(rendered)
+}
+
+// redact is the same for a line that is already rendered, which is what an error this
+// package writes down itself is: a media request URL is built out of the direct path
+// and the hash, and both are long enough to match.
+func redact(line string) string {
+	return secretShaped.ReplaceAllString(line, "[redacted]")
 }

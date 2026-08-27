@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strconv"
 	"testing"
 	"time"
@@ -756,6 +757,138 @@ func TestTheMediaEndpointIsServedByARunningConnector(t *testing.T) {
 	handler.ServeHTTP(withoutToken, httptest.NewRequestWithContext(t.Context(), http.MethodGet, blob, http.NoBody))
 	if withoutToken.Code != http.StatusUnauthorized {
 		t.Fatalf("an unauthenticated request answered %d, want 401: the token is not reaching the handler", withoutToken.Code)
+	}
+}
+
+// The bind host and the advertised host answer different questions: one says which
+// interface to accept on, the other says how the rest of the deployment reaches this
+// instance. Pasting the first into the second built `http://<instance>127.0.0.1:8080`
+// for anything but the two spellings of "every interface", and a blob is published under
+// it after the message has been acknowledged, so what that costs is the file.
+func TestTheAdvertisedAddressIsDerivedFromThePortAndNotFromTheBindHost(t *testing.T) {
+	for _, tc := range []struct {
+		addr string
+		want string
+	}{
+		{":8080", "http://inst-a:8080"},
+		{"0.0.0.0:8080", "http://inst-a:8080"},
+		{"127.0.0.1:8080", "http://inst-a:8080"},
+		{"[::]:8080", "http://inst-a:8080"},
+		{"[::1]:9000", "http://inst-a:9000"},
+	} {
+		t.Run(tc.addr, func(t *testing.T) {
+			t.Setenv("WAC_INSTANCE", "inst-a")
+			t.Setenv("WAC_HTTP_ADDR", tc.addr)
+
+			cfg, err := app.LoadConfig("host")
+			if err != nil {
+				t.Fatalf("LoadConfig: %v", err)
+			}
+			if cfg.AdvertiseURL != tc.want {
+				t.Fatalf("binding %s advertises %q, want %q", tc.addr, cfg.AdvertiseURL, tc.want)
+			}
+		})
+	}
+
+	// An address with no port at all is a deployment that will not listen either, and
+	// deriving something from it would only move the failure to the first media message.
+	t.Run("an address that is not one", func(t *testing.T) {
+		t.Setenv("WAC_INSTANCE", "inst-a")
+		t.Setenv("WAC_HTTP_ADDR", "8080")
+
+		if _, err := app.LoadConfig("host"); err == nil {
+			t.Fatal("an address with no port was accepted")
+		}
+	})
+
+	// A colon with nothing after it is worse than an address that is not one: it splits
+	// without complaint and a listener takes any free port, so the instance comes up,
+	// answers on a port nobody was told about, and publishes blobs under a bare colon
+	// that every client reads as port 80.
+	for _, addr := range []string{":", "127.0.0.1:"} {
+		t.Run("a colon with no port after it: "+addr, func(t *testing.T) {
+			t.Setenv("WAC_INSTANCE", "inst-a")
+			t.Setenv("WAC_HTTP_ADDR", addr)
+
+			if _, err := app.LoadConfig("host"); err == nil {
+				t.Fatal("an address a listener answers on any free port was accepted")
+			}
+		})
+	}
+
+	// An instance addressed by an IPv6 literal is written in brackets. Pasting a colon
+	// in builds `http://2001:db8::1:8080`, which parses -- as that host and that port --
+	// and is a URL no client can dial.
+	t.Run("an instance addressed by an IPv6 literal", func(t *testing.T) {
+		t.Setenv("WAC_INSTANCE", "2001:db8::1")
+		t.Setenv("WAC_HTTP_ADDR", ":8080")
+
+		cfg, err := app.LoadConfig("host")
+		if err != nil {
+			t.Fatalf("LoadConfig: %v", err)
+		}
+		if cfg.AdvertiseURL != "http://[2001:db8::1]:8080" {
+			t.Fatalf("an IPv6 instance advertises %q, want it in brackets", cfg.AdvertiseURL)
+		}
+	})
+
+	// And an address the operator gave is taken as given: it is the one they can say
+	// something the derivation cannot know, such as the host in front of the fleet.
+	t.Run("one the operator said", func(t *testing.T) {
+		t.Setenv("WAC_INSTANCE", "inst-a")
+		t.Setenv("WAC_HTTP_ADDR", "127.0.0.1:8080")
+		t.Setenv("WAC_ADVERTISE_URL", "https://gateway.internal/inst-a")
+
+		cfg, err := app.LoadConfig("host")
+		if err != nil {
+			t.Fatalf("LoadConfig: %v", err)
+		}
+		if cfg.AdvertiseURL != "https://gateway.internal/inst-a" {
+			t.Fatalf("the operator's own address became %q", cfg.AdvertiseURL)
+		}
+	})
+}
+
+// The store has two consumers and the endpoint is only one of them: a session downloads
+// the file of an inbound message straight into it, which is why the store is built
+// before the engine rather than after it.
+//
+// Nothing observable from out here separates an engine that was handed the store from
+// one that was not, except the one refusal the engine has: a store it can publish no
+// address for. So that refusal is what says the store reached it, and the connector
+// built the other way round is the control that says the refusal is not something else.
+func TestTheBlobStoreReachesTheEngineAndNotOnlyTheEndpoint(t *testing.T) {
+	server := miniredis.RunT(t)
+	t.Setenv("WAC_INSTANCE", "inst-a")
+	t.Setenv("REDIS_URL", "redis://"+server.Addr())
+	t.Setenv("WAC_HTTP_ADDR", "127.0.0.1:0")
+	t.Setenv("WAC_MEDIA_ROOT", t.TempDir())
+	t.Setenv("WAC_MEDIA_TOKEN", "s3cret")
+	t.Setenv("WAC_ENGINE", "whatsmeow")
+	t.Setenv("WAC_DATABASE_URL", "sqlite:"+filepath.Join(t.TempDir(), "wa.db"))
+	// Said rather than derived, because the bind port here is zero: the listener reads
+	// that as any free port, and a blob published under it names one nobody can come
+	// back to.
+	t.Setenv("WAC_ADVERTISE_URL", "http://inst-a:8080")
+
+	cfg, err := app.LoadConfig("host")
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if _, err := app.New(&cfg, zerolog.Nop()); err != nil {
+		t.Fatalf("a connector with everything the media path needs was refused: %v", err)
+	}
+
+	// Blanked rather than left unset, because LoadConfig derives one for a deployment
+	// that gives none. A blob lives on the disk of whoever downloaded it, so a session
+	// that cannot name its own instance has no reference to hand a client.
+	//
+	// On a database of its own: the two connectors each open a pool, and SQLite holds
+	// one writer per file however many pools ask.
+	cfg.AdvertiseURL = ""
+	cfg.DatabaseURL = "sqlite:" + filepath.Join(t.TempDir(), "wa.db")
+	if _, err := app.New(&cfg, zerolog.Nop()); err == nil {
+		t.Fatal("a connector was built whose sessions hold a store they can publish no address for")
 	}
 }
 

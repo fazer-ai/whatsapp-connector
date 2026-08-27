@@ -66,7 +66,7 @@ type Connector struct {
 // and prepares everything without listening or reading yet.
 //
 //nolint:gocritic // zerolog.Logger is designed to be copied; every With() returns one by value
-func New(cfg *Config, log zerolog.Logger) (*Connector, error) {
+func New(cfg *Config, log zerolog.Logger) (connector *Connector, err error) {
 	client, err := redisx.New(redisx.Config{
 		URL: cfg.RedisURL, Password: cfg.RedisPass, Prefix: cfg.RedisPrefix, Shards: cfg.EventShards,
 	})
@@ -88,7 +88,41 @@ func New(cfg *Config, log zerolog.Logger) (*Connector, error) {
 	startupCtx, cancelStartup := context.WithTimeout(context.Background(), StartupTimeout)
 	defer cancelStartup()
 
-	waEngine, devices, err := newEngine(startupCtx, cfg, log)
+	// The blob store comes first: a session downloads the file of an inbound message
+	// straight into it, so the engine has to be built knowing whether there is one.
+	//
+	// Only when the deployment gave it somewhere to write. An instance with no blob
+	// store does not register the endpoint at all, so a client that reaches it hears
+	// 404 and asks the session for the bytes again, which is what it does for a blob
+	// that has aged out anyway.
+	var (
+		blobs       *media.Store
+		blobHandler http.Handler
+		mediaOpts   meow.MediaOptions
+	)
+	if cfg.MediaRoot != "" {
+		blobs, err = media.New(media.Options{
+			Root: cfg.MediaRoot, TTL: cfg.MediaTTL,
+			Quota: cfg.MediaQuota, MaxBlob: cfg.MediaMaxBlob, BlockSize: cfg.MediaBlockSize,
+		})
+		if err != nil {
+			return nil, err
+		}
+		// Opening the store before the engine also put it before every remaining way
+		// this function gives up, and the store holds its root directory open. Let go
+		// of unless a connector is actually returned to hold it.
+		defer func() {
+			if connector == nil {
+				_ = blobs.Close()
+			}
+		}()
+		blobHandler = media.Handler(media.HandlerOptions{Blobs: blobs, Token: cfg.MediaToken})
+		// Assigned only in here. A nil *media.Store put in the interface is not a nil
+		// interface, and every session would then take the store path and fail on it.
+		mediaOpts = meow.MediaOptions{Blobs: blobs, BaseURL: cfg.AdvertiseURL}
+	}
+
+	waEngine, devices, err := newEngine(startupCtx, cfg, mediaOpts, log)
 	if err != nil {
 		return nil, err
 	}
@@ -111,24 +145,7 @@ func New(cfg *Config, log zerolog.Logger) (*Connector, error) {
 	c := &Connector{
 		cfg: *cfg, log: log, metrics: metrics, client: client, leases: leases,
 		registry: cluster.NewRegistry(client, 3*cfg.Heartbeat), manager: manager, engine: waEngine,
-		store: devices,
-	}
-
-	// Only when the deployment gave it somewhere to write. An instance with no blob
-	// store does not register the endpoint at all, so a client that reaches it hears
-	// 404 and asks the session for the bytes again, which is what it does for a blob
-	// that has aged out anyway.
-	var blobHandler http.Handler
-	if cfg.MediaRoot != "" {
-		blobs, err := media.New(media.Options{
-			Root: cfg.MediaRoot, TTL: cfg.MediaTTL,
-			Quota: cfg.MediaQuota, MaxBlob: cfg.MediaMaxBlob, BlockSize: cfg.MediaBlockSize,
-		})
-		if err != nil {
-			return nil, err
-		}
-		c.blobs = blobs
-		blobHandler = media.Handler(media.HandlerOptions{Blobs: blobs, Token: cfg.MediaToken})
+		store: devices, blobs: blobs,
 	}
 
 	c.http = httpserver.New(httpserver.Options{
@@ -561,7 +578,9 @@ func (c *Connector) shutdown() {
 // whatsmeow engine has one, and whoever built it has to close it.
 //
 //nolint:gocritic // zerolog.Logger is designed to be copied; every With() returns one by value
-func newEngine(ctx context.Context, cfg *Config, log zerolog.Logger) (engine.Engine, *store.Container, error) {
+func newEngine(
+	ctx context.Context, cfg *Config, blobs meow.MediaOptions, log zerolog.Logger,
+) (engine.Engine, *store.Container, error) {
 	switch cfg.Engine {
 	case EngineFake:
 		return fake.New(), nil, nil
@@ -570,7 +589,14 @@ func newEngine(ctx context.Context, cfg *Config, log zerolog.Logger) (engine.Eng
 		if err != nil {
 			return nil, nil, err
 		}
-		return meow.New(devices, cfg.DeviceName, log), devices, nil
+		waEngine, err := meow.New(devices, meow.Options{DeviceName: cfg.DeviceName, Media: blobs}, log)
+		if err != nil {
+			// The container is this function's until it is handed over, and an engine
+			// that refused to be built never took it.
+			_ = devices.Close()
+			return nil, nil, err
+		}
+		return waEngine, devices, nil
 	default:
 		return nil, nil, fmt.Errorf("app: unknown engine %q", cfg.Engine)
 	}

@@ -1,6 +1,7 @@
 package whatsmeow
 
 import (
+	"context"
 	"encoding/json"
 	"time"
 
@@ -99,11 +100,36 @@ func partyOf(info *waTypes.MessageInfo) (*protocol.Party, bool) {
 	return nil, false
 }
 
+// body is what a message says, in the terms the contract carries it in.
+type body struct {
+	content any
+	context *waE2E.ContextInfo
+	// failure is why this message's file is not coming, empty when there is nothing to
+	// say. It is announced after the message, never instead of it.
+	failure string
+}
+
+// renderBody turns the message WhatsApp sent into the body the contract carries, and
+// reports whether this build can carry it at all.
+//
+// It is an argument to inboundOf rather than a call inside it because rendering the
+// body of a media message means fetching the file over the network, and a message the
+// envelope around it is going to refuse must not cost a download first.
+//
+// It takes the whole event and not just the message, because some of what decides how a
+// body is rendered is what whatsmeow found around it rather than what is left inside:
+// a view-once wrapper is unwrapped before a handler sees it, and only the flag on the
+// event says it was ever there.
+type renderBody func(*waEvents.Message) (body, bool)
+
 // inboundOf renders an inbound message the way the contract carries it, and reports
 // whether this build can carry it at all. A false is not an error: it is this
 // milestone saying the message is somebody else's to deliver, which upstream turns
 // into a withheld acknowledgement, so WhatsApp keeps it and sends it again.
-func inboundOf(event *waEvents.Message) (protocol.InboundMessage, bool) {
+//
+// The second return is the failure to announce once the message itself is out, empty
+// for a message with nothing missing.
+func inboundOf(event *waEvents.Message, render renderBody) (protocol.InboundMessage, string, bool) {
 	if event.IsEdit || event.Info.Edit != waTypes.EditAttributeEmpty || newsletterEdit(event) {
 		// whatsmeow unwraps an edit and hands back the corrected text in the shape a
 		// new message arrives in, so nothing further down can tell the two apart. The
@@ -111,7 +137,7 @@ func inboundOf(event *waEvents.Message) (protocol.InboundMessage, bool) {
 		// it as a message received would either duplicate the original in the
 		// conversation or be deduplicated away, and either way the correction is lost
 		// and the acknowledgement spends the one redelivery it had.
-		return protocol.InboundMessage{}, false
+		return protocol.InboundMessage{}, "", false
 	}
 	chatJID := event.Info.Chat
 	if event.Info.IsIncomingBroadcast() {
@@ -125,7 +151,7 @@ func inboundOf(event *waEvents.Message) (protocol.InboundMessage, bool) {
 	}
 	chat, ok := addressOf(chatJID)
 	if !ok || event.Info.ID == "" {
-		return protocol.InboundMessage{}, false
+		return protocol.InboundMessage{}, "", false
 	}
 	var sender *protocol.Party
 	if !event.Info.IsFromMe {
@@ -135,12 +161,13 @@ func inboundOf(event *waEvents.Message) (protocol.InboundMessage, bool) {
 		// party in a conversation with somebody else.
 		var named bool
 		if sender, named = partyOf(&event.Info); !named {
-			return protocol.InboundMessage{}, false
+			return protocol.InboundMessage{}, "", false
 		}
 	}
-	body, context, ok := textOf(event.Message)
+	// Asked for last, once every question about the envelope has been answered.
+	said, ok := render(event)
 	if !ok {
-		return protocol.InboundMessage{}, false
+		return protocol.InboundMessage{}, "", false
 	}
 
 	message := protocol.InboundMessage{
@@ -149,12 +176,12 @@ func inboundOf(event *waEvents.Message) (protocol.InboundMessage, bool) {
 		Sender:    sender,
 		FromMe:    event.Info.IsFromMe,
 		Timestamp: event.Info.Timestamp.UnixMilli(),
-		Content:   protocol.Text(body),
-		QuotedID:  context.GetStanzaID(),
-		Mentions:  mentionsOf(context),
-		Ephemeral: context.GetExpiration(),
+		Content:   said.content,
+		QuotedID:  said.context.GetStanzaID(),
+		Mentions:  mentionsOf(said.context),
+		Ephemeral: said.context.GetExpiration(),
 	}
-	return message, true
+	return message, said.failure, true
 }
 
 // newsletterEdit reports whether a newsletter post is a correction of an earlier one.
@@ -168,9 +195,31 @@ func newsletterEdit(event *waEvents.Message) bool {
 	return event.NewsletterMeta != nil && !event.NewsletterMeta.EditTS.IsZero()
 }
 
+// bodyOf renders what a message says: its text, or its file once that has been fetched.
+// The download is the reason this is a method: it is the session that has the socket to
+// pull the bytes over and the store to put them in.
+func (s *Session) bodyOf(ctx context.Context) renderBody {
+	return func(event *waEvents.Message) (body, bool) {
+		if plain, ok := plainBody(event); ok {
+			return plain, true
+		}
+		return s.mediaBody(ctx, event)
+	}
+}
+
+// plainBody renders a message whose whole body is text, which is the one kind that
+// needs nothing fetched to render.
+func plainBody(event *waEvents.Message) (body, bool) {
+	text, info, ok := textOf(event.Message)
+	if !ok {
+		return body{}, false
+	}
+	return body{content: protocol.Text(text), context: info}, true
+}
+
 // textOf pulls the body and the context out of the two shapes WhatsApp sends text in.
-// A message with neither is one of the many types M2 has yet to reach, and saying so
-// is the caller's cue to leave it on the phone.
+// A message with neither is either a media message or one of the types M2 has yet to
+// reach, and saying so is the caller's cue to try the next renderer.
 func textOf(message *waE2E.Message) (string, *waE2E.ContextInfo, bool) {
 	if extended := message.GetExtendedTextMessage(); extended != nil {
 		// The shape WhatsApp uses the moment a message has anything attached to it: a
@@ -186,8 +235,8 @@ func textOf(message *waE2E.Message) (string, *waE2E.ContextInfo, bool) {
 // mentionsOf renders the addresses a message tagged. An unparseable or unnameable one
 // is dropped rather than refused: a mention is an annotation on the body, and losing
 // one is not worth withholding the message it annotates.
-func mentionsOf(context *waE2E.ContextInfo) []protocol.Address {
-	mentioned := context.GetMentionedJID()
+func mentionsOf(info *waE2E.ContextInfo) []protocol.Address {
+	mentioned := info.GetMentionedJID()
 	if len(mentioned) == 0 {
 		return nil
 	}
@@ -232,13 +281,25 @@ func (s *Session) receive(event *waEvents.Message) bool {
 		return true
 	}
 
-	message, ok := inboundOf(event)
+	message, failure, ok := inboundOf(event, s.bodyOf(s.ctx))
 	if !ok {
 		s.log.Debug().Str("message_id", event.Info.ID).
 			Msg("refusing to acknowledge an inbound message this build cannot publish")
 		return false
 	}
-	return s.deliver(protocol.EventMessageReceived, map[string]any{"message": message})
+	if !s.deliver(protocol.EventMessageReceived, map[string]any{"message": message}) {
+		return false
+	}
+	if failure == "" {
+		return true
+	}
+	// After the message and never instead of it: the client looks the message up to
+	// flag its bubble, and a failure that arrives first names one nobody has stored.
+	// A failure that cannot be published leaves the acknowledgement withheld, so the
+	// redelivery is what gets the pair out in order.
+	return s.deliver(protocol.EventMediaDownloadFailed, protocol.MediaDownloadFailure{
+		Chat: message.Chat, MessageID: message.ID, Reason: failure,
+	})
 }
 
 // deliver emits and waits for the publisher to say what became of it.

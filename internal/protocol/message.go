@@ -61,3 +61,94 @@ type InboundMessage struct {
 	// is not on a timer.
 	Ephemeral uint32 `json:"ephemeral,omitempty"`
 }
+
+// MediaKind is what sort of file a media message carries. The contract's enum is
+// smaller than WhatsApp's own set of message types on purpose: an animated GIF is a
+// video, a voice note is an audio with `voice_note` set, and an animated sticker is
+// still a sticker. A client renders five things rather than fifteen.
+type MediaKind string
+
+// The media kinds the contract defines.
+const (
+	MediaImage    MediaKind = "image"
+	MediaVideo    MediaKind = "video"
+	MediaAudio    MediaKind = "audio"
+	MediaDocument MediaKind = "document"
+	MediaSticker  MediaKind = "sticker"
+)
+
+// MediaRefKind is how the bytes behind a media message are reached. The enum is shared
+// across every provider that speaks this contract, so a client written against it can
+// resolve a reference without knowing which one issued it.
+type MediaRefKind string
+
+// The reference kinds the contract defines.
+const (
+	// MediaRefURL is a URL whoever holds it can fetch. It is what an outbound
+	// attachment carries and what survives being handed on.
+	MediaRefURL MediaRefKind = "url"
+	// MediaRefConnectorBlob is a file on the instance that downloaded it, served over
+	// that instance's own HTTP port against the token the registry publishes. It means
+	// nothing to anybody else, and it is what this connector issues.
+	MediaRefConnectorBlob MediaRefKind = "connector_blob"
+	// MediaRefUazapiMessage is a message id only the Uazapi instance that saw it can
+	// resolve. This connector never issues one; the constant is here because the enum
+	// is the contract's, not this implementation's.
+	MediaRefUazapiMessage MediaRefKind = "uazapi_message"
+)
+
+// MediaRef is how a client fetches the bytes of a media message. Media never travels
+// inside a frame: an event says where the file is, and the client goes and gets it.
+type MediaRef struct {
+	Kind    MediaRefKind      `json:"kind"`
+	ID      string            `json:"id,omitempty"`
+	URL     string            `json:"url,omitempty"`
+	Headers map[string]string `json:"headers,omitempty"`
+	Size    int64             `json:"size,omitempty"`
+	Mime    string            `json:"mime,omitempty"`
+	SHA256  string            `json:"sha256,omitempty"`
+	// ExpiresAt is when the issuer stops promising to serve this, in epoch
+	// milliseconds. A blob cache drops what nobody collects, so a reference is a
+	// reference to a file for a while and not for good: a client that finds it lapsed
+	// asks the session for the bytes again rather than telling an agent the media is
+	// gone.
+	ExpiresAt int64 `json:"expires_at,omitempty"`
+}
+
+// MediaContent is a message whose body is a file.
+//
+// Everything but the reference describes the file well enough to render a bubble
+// without having fetched it: the caption reads, the name and size show, and the
+// thumbnail stands in until the bytes arrive. A nil Ref is the file not coming, which
+// is what `media.download_failed` explains.
+type MediaContent struct {
+	Type      string    `json:"type"`
+	Kind      MediaKind `json:"kind"`
+	Mime      string    `json:"mime,omitempty"`
+	Filename  string    `json:"filename,omitempty"`
+	Caption   string    `json:"caption,omitempty"`
+	VoiceNote bool      `json:"voice_note"`
+	Size      int64     `json:"size,omitempty"`
+	// Duration is how long an audio or a video runs, in seconds.
+	Duration uint32 `json:"duration,omitempty"`
+	// Thumbnail is a data: URI small enough to travel inside the frame, which is the
+	// one exception to media never doing so.
+	Thumbnail string    `json:"thumbnail,omitempty"`
+	Ref       *MediaRef `json:"ref,omitempty"`
+}
+
+// Media returns the content of a media message of the given kind, for a caller that
+// fills in what it knows about the file.
+func Media(kind MediaKind) MediaContent { return MediaContent{Type: "media", Kind: kind} }
+
+// MediaDownloadFailure is `media.download_failed`: the bytes of a message the client
+// already has are not coming, and asking again would not help.
+//
+// It is published after the message it is about, never instead of it. The client looks
+// the message up to flag it, and a failure that arrives first names a message nobody
+// has stored yet.
+type MediaDownloadFailure struct {
+	Chat      Address `json:"chat"`
+	MessageID string  `json:"message_id"`
+	Reason    string  `json:"reason"`
+}

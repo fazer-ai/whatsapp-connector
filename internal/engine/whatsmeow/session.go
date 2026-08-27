@@ -94,6 +94,23 @@ type Session struct {
 	// published. A field for the same reason as storeLimit, and for no other.
 	deliverWait time.Duration
 
+	// downloadWait bounds how long an inbound media message spends fetching its file.
+	// A field for the same reason as the two above it, and for no other.
+	downloadWait time.Duration
+
+	// download fetches the bytes of a media message. A field for the same reason as
+	// detach and the two below it: nothing outside whatsmeow can make a real client
+	// answer a download, so a test cannot otherwise reach either side of the split
+	// between a failure worth retrying and one that is permanent.
+	download func(context.Context, *wm.Client, wm.DownloadableMessage) ([]byte, error)
+
+	// blobs is where the file of an inbound message is kept, and blobBase the address a
+	// client fetches it from. Nil when the deployment gave this instance nowhere to
+	// write: media messages are then published with no file to fetch rather than
+	// filling a directory nobody asked for.
+	blobs    Blobs
+	blobBase string
+
 	// groups is the last connect's `groups`: whether the client wants group chats
 	// alongside direct ones. Guarded by mu, written by Connect and read by every
 	// inbound message.
@@ -176,7 +193,10 @@ type pairingRun struct {
 }
 
 //nolint:gocritic // zerolog.Logger is designed to be copied; every With() returns one by value
-func newSession(sid string, client *wm.Client, container *store.Container, log zerolog.Logger, wa waLog.Logger) *Session {
+func newSession(
+	sid string, client *wm.Client, container *store.Container,
+	blobs MediaOptions, log zerolog.Logger, wa waLog.Logger,
+) *Session {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Session{
 		sid:        sid,
@@ -192,9 +212,15 @@ func newSession(sid string, client *wm.Client, container *store.Container, log z
 		disconnect: func(client *wm.Client) { client.Disconnect() },
 		nonce:      sessionNonce(),
 		logout:     func(ctx context.Context, client *wm.Client) error { return client.Logout(ctx) },
+		download: func(ctx context.Context, client *wm.Client, part wm.DownloadableMessage) ([]byte, error) {
+			return client.Download(ctx, part) //nolint:wrapcheck // classified by downloadFailure, which needs the sentinels
+		},
+		blobs:    blobs.Blobs,
+		blobBase: blobs.BaseURL,
 
-		storeLimit:  bindTimeout,
-		deliverWait: deliverTimeout,
+		storeLimit:   bindTimeout,
+		deliverWait:  deliverTimeout,
+		downloadWait: downloadTimeout,
 	}
 	s.adopt(client)
 	go s.forward()

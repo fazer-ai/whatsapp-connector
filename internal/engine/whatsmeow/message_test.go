@@ -146,7 +146,7 @@ func TestANewsletterPostIsPublishedWithNoSenderToAttributeItTo(t *testing.T) {
 		Message: &waE2E.Message{Conversation: proto.String("edição de hoje")},
 	}
 
-	message, ok := inboundOf(event)
+	message, _, ok := inboundOf(event, plainBody)
 	if !ok {
 		t.Fatal("a newsletter post was withheld, so the channel would redeliver it for good")
 	}
@@ -176,7 +176,7 @@ func TestAPlainTextMessageIsRenderedTheWayTheContractCarriesIt(t *testing.T) {
 		Message: &waE2E.Message{Conversation: proto.String("bom dia")},
 	}
 
-	message, ok := inboundOf(event)
+	message, _, ok := inboundOf(event, plainBody)
 	if !ok {
 		t.Fatal("a plain text message is the one thing this build can carry, and it was refused")
 	}
@@ -221,7 +221,7 @@ func TestAnExtendedTextMessageCarriesTheQuoteTheMentionsAndTheTimer(t *testing.T
 		}},
 	}
 
-	message, ok := inboundOf(event)
+	message, _, ok := inboundOf(event, plainBody)
 	if !ok {
 		t.Fatal("an extended text message was refused")
 	}
@@ -244,18 +244,21 @@ func TestAMessageThisBuildCannotRenderIsLeftUnacknowledged(t *testing.T) {
 
 	session, _ := newTestSession(t, "5511999990001")
 
-	// An image, which M2 reaches in a later slice. Refusing the acknowledgement is what
-	// keeps it on WhatsApp's side until there is somewhere to put it; rendering it as
-	// text or as unsupported would spend the one redelivery it gets.
-	acknowledged := session.receive(&waEvents.Message{
-		Info: waTypes.MessageInfo{
-			ID: "3EB0IMAGE",
-			MessageSource: waTypes.MessageSource{
-				Chat: waTypes.NewJID("5511999990001", waTypes.DefaultUserServer),
-			},
-		},
-		Message: &waE2E.Message{ImageMessage: &waE2E.ImageMessage{Mimetype: proto.String("image/jpeg")}},
-	})
+	// A location, which M2 reaches in a later slice. Refusing the acknowledgement is
+	// what keeps it on WhatsApp's side until there is something to render it as;
+	// rendering it as text or as unsupported would spend the one redelivery it gets.
+	//
+	// The envelope is a complete one on purpose. The body is the whole subject here,
+	// and an event missing its sender is refused before the body is ever looked at:
+	// this test read as passing for that reason alone once media stopped being a body
+	// this build cannot render.
+	event := textMessage("3EB0LOCATION", "")
+	event.Message = &waE2E.Message{LocationMessage: &waE2E.LocationMessage{
+		DegreesLatitude:  proto.Float64(-23.5505),
+		DegreesLongitude: proto.Float64(-46.6333),
+	}}
+
+	acknowledged := session.receive(event)
 	if acknowledged {
 		t.Fatal("a message this build cannot publish was acknowledged to WhatsApp anyway")
 	}
@@ -555,7 +558,7 @@ func TestAnIncomingBroadcastIsAddressedToTheChatTheRecipientSeesItIn(t *testing.
 	event.Info.Sender = sender
 	event.Info.IsGroup = true
 
-	message, ok := inboundOf(event)
+	message, _, ok := inboundOf(event, plainBody)
 	if !ok {
 		t.Fatal("a broadcast a recipient can read was withheld")
 	}
@@ -580,7 +583,7 @@ func TestAStatusPostStaysOnTheStatusFeed(t *testing.T) {
 	event.Info.Sender = waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)
 	event.Info.IsGroup = true
 
-	message, ok := inboundOf(event)
+	message, _, ok := inboundOf(event, plainBody)
 	if !ok {
 		t.Fatal("a status post was withheld")
 	}
@@ -688,7 +691,7 @@ func TestAnEchoFromAnotherDeviceCarriesNoSender(t *testing.T) {
 	event.Info.Sender = account
 	event.Info.IsFromMe = true
 
-	message, ok := inboundOf(event)
+	message, _, ok := inboundOf(event, plainBody)
 	if !ok {
 		t.Fatal("an echo of the account's own send was withheld")
 	}
@@ -719,13 +722,13 @@ func TestAnEditedNewsletterPostIsNotPublishedAsTheOriginal(t *testing.T) {
 		OriginalTS: time.UnixMilli(1755000002000),
 	}
 
-	if _, ok := inboundOf(event); ok {
+	if _, _, ok := inboundOf(event, plainBody); ok {
 		t.Fatal("a channel's correction was published under the original post's id")
 	}
 
 	// The uncorrected post still goes out: what is refused is the edit, not the channel.
 	event.NewsletterMeta = nil
-	if _, ok := inboundOf(event); !ok {
+	if _, _, ok := inboundOf(event, plainBody); !ok {
 		t.Fatal("an ordinary newsletter post was withheld along with the edits")
 	}
 }

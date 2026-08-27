@@ -10,6 +10,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
+	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/rs/zerolog"
@@ -24,9 +28,20 @@ import (
 // deviceNameOnce guards the one write to whatsmeow's process-wide device properties.
 var deviceNameOnce sync.Once
 
+// Options is everything an engine needs beyond its device store.
+type Options struct {
+	// DeviceName is what the account's linked-devices list shows.
+	DeviceName string
+	// Media is where a session puts the file of an inbound message. The zero value is
+	// an instance with nowhere to write, which publishes media messages with no file to
+	// fetch.
+	Media MediaOptions
+}
+
 // Engine hands out one session per account, backed by a shared device store.
 type Engine struct {
 	store *store.Container
+	media MediaOptions
 	log   zerolog.Logger
 
 	mu       sync.Mutex
@@ -43,9 +58,29 @@ type Engine struct {
 // `device_name` the contract promises, and this is why it cannot be honoured per
 // session; the deployment's own name is what the account's linked-devices list shows.
 //
+// An engine that was given a blob store and no address to advertise it under is
+// refused rather than run: the reference it would publish is a path with no host, and a
+// client reading one has no way to tell it apart from a URL it simply cannot reach.
+//
 //nolint:gocritic // zerolog.Logger is designed to be copied; every With() returns one by value
-func New(container *store.Container, deviceName string, log zerolog.Logger) *Engine {
-	if deviceName != "" {
+func New(container *store.Container, opts Options, log zerolog.Logger) (*Engine, error) {
+	if opts.Media.Blobs != nil {
+		if err := reachableAt(opts.Media.BaseURL); err != nil {
+			return nil, err
+		}
+		if ttl := opts.Media.Blobs.TTL(); ttl <= deliverTimeout {
+			// The clock starts when the file is stored and the reference is published
+			// afterwards, with a message allowed to spend deliverTimeout waiting for the
+			// publisher. A cache that keeps a blob for less than that hands out
+			// references the sweeper has already collected, which the client reads as
+			// media that is gone.
+			return nil, fmt.Errorf(
+				"whatsmeow: blobs are kept for %s and a message may spend %s waiting to be published, "+
+					"so a reference could name a blob that was swept before the client was told about it",
+				ttl, deliverTimeout)
+		}
+	}
+	if deviceName := opts.DeviceName; deviceName != "" {
 		// Written exactly once, because it is written to a package-level value whatsmeow
 		// reads from its pairing handshake: a second engine assigning it is a write with
 		// no lock against a read on another goroutine. The first name wins, which is the
@@ -54,9 +89,76 @@ func New(container *store.Container, deviceName string, log zerolog.Logger) *Eng
 	}
 	return &Engine{
 		store:    container,
+		media:    opts.Media,
 		log:      log,
 		sessions: make(map[string]*Session),
+	}, nil
+}
+
+// reachableAt reports whether blobs published under this address could be fetched.
+//
+// It is checked once, at startup, rather than found out per message: a reference is
+// published after the message it belongs to has been acknowledged, so an address a
+// client cannot fetch from costs the file rather than an error somebody sees. An
+// operator who left the scheme off, which is the ordinary way to get this wrong, is told
+// so by a container that will not start.
+func reachableAt(base string) error {
+	if base == "" {
+		return errors.New("whatsmeow: a blob store needs the address this instance is reached at")
 	}
+	address, err := url.Parse(base)
+	if err != nil {
+		return fmt.Errorf("whatsmeow: %q is not an address blobs can be published under: %w", base, err)
+	}
+	if address.Scheme != "http" && address.Scheme != "https" {
+		// Covers the bare `host:port`, which url.Parse reads as the scheme `host` with
+		// an opaque body rather than refusing.
+		return fmt.Errorf(
+			"whatsmeow: blobs are published under %q, and a client fetches them over http or https", base)
+	}
+	host := address.Hostname()
+	if host == "" {
+		// Hostname rather than Host: `http://:8080` parses with an authority of
+		// ":8080", which is a port and nobody to ask for it.
+		return fmt.Errorf("whatsmeow: blobs are published under %q, which names no host", base)
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsUnspecified() {
+		// `0.0.0.0` and `::` say "every interface" to a listener and mean "this machine"
+		// to whoever dials them, so a client elsewhere connects to itself. Loopback is
+		// not refused with them: an instance sharing a network namespace with its client
+		// is a deployment somebody really runs.
+		return fmt.Errorf(
+			"whatsmeow: blobs are published under %q, which is an address to listen on rather than one to reach",
+			base)
+	}
+	if strings.HasSuffix(address.Host, ":") {
+		// Port() cannot tell this apart: it answers "" both for an address that names no
+		// port, which is a fine thing to publish under, and for one whose port is a
+		// colon with nothing after it, which a client reads as 80 and dials a listener
+		// that is somebody else.
+		return fmt.Errorf(
+			"whatsmeow: blobs are published under %q, whose colon is followed by no port", base)
+	}
+	if port := address.Port(); port != "" {
+		// url.Parse only checks that a port is digits, so 99999 and 00 both come through
+		// it. Range-checked rather than compared against "0": zero is what a listener
+		// reads as "any free port", which is not a port anybody can be told to come back
+		// to, and it is spelled more than one way.
+		number, err := strconv.Atoi(port)
+		if err != nil || number < 1 || number > 65535 {
+			return fmt.Errorf("whatsmeow: blobs are published under %q, and %q is not a port to dial", base, port)
+		}
+	}
+	if strings.ContainsAny(base, "?#") {
+		// Read off the raw address rather than off the parsed fields, because the parse
+		// hides the two shapes that matter: a bare `?` leaves RawQuery empty and is
+		// recorded only in ForceQuery, and a bare `#` is recorded nowhere at all. Both
+		// still take the id with them — the blob's id is appended as a path segment, so
+		// `http://host/?` publishes a query of `/media/<id>` and reaches nothing.
+		return fmt.Errorf(
+			"whatsmeow: blobs are published under %q, and a blob's id is appended to it as a path", base)
+	}
+	return nil
 }
 
 // Open prepares a session with the device it paired, or a fresh one when it has not
@@ -84,7 +186,7 @@ func (e *Engine) Open(ctx context.Context, sid string) (engine.Session, error) {
 	}
 
 	wa := newLibraryLogger(e.log, sid)
-	session := newSession(sid, wm.NewClient(device, wa), e.store, e.log, wa)
+	session := newSession(sid, wm.NewClient(device, wa), e.store, e.media, e.log, wa)
 	// Registered before the session can be handed out, so a close that happens while
 	// this function is still running is not one nobody hears about.
 	session.onClose(func() { e.forget(sid, session) })

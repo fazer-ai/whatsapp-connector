@@ -5,6 +5,7 @@ package app
 import (
 	"fmt"
 	"math"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -212,7 +213,30 @@ func LoadConfig(hostname string) (Config, error) {
 		return Config{}, fmt.Errorf("app: WAC_MEDIA_TOKEN is required when WAC_MEDIA_ROOT is set")
 	}
 	if cfg.AdvertiseURL == "" {
-		cfg.AdvertiseURL = "http://" + cfg.Instance + strings.TrimPrefix(cfg.HTTPAddr, "0.0.0.0")
+		// From the port alone, never from the host the listener binds to. The two answer
+		// different questions: a bind host says which interface to accept on, and the
+		// advertised host says how the rest of the deployment reaches this instance.
+		// Pasting the first into the second built `http://<instance>127.0.0.1:8080` for
+		// anything but the two spellings of "every interface", which resolves nowhere —
+		// and a blob is published under it after the message has been acknowledged, so
+		// what that costs is the file.
+		_, port, err := net.SplitHostPort(cfg.HTTPAddr)
+		if err != nil {
+			return Config{}, fmt.Errorf("app: WAC_HTTP_ADDR %q is not an address to listen on: %w", cfg.HTTPAddr, err)
+		}
+		if port == "" {
+			// `:` and `host:` are addresses to listen on: they split without complaint
+			// and a listener given either takes whatever port is free. There is nothing
+			// to advertise then, and the derived address would carry a bare colon that
+			// every client reads as port 80.
+			return Config{}, fmt.Errorf(
+				"app: WAC_HTTP_ADDR %q names no port, and a listener given none takes any free one, "+
+					"which is not a port the rest of the deployment can be told to come back to", cfg.HTTPAddr)
+		}
+		// JoinHostPort rather than pasting a colon in: an instance addressed by an IPv6
+		// literal is written in brackets, and without them `2001:db8::1:8080` still
+		// parses, as that host and that port, into a URL no client can dial.
+		cfg.AdvertiseURL = "http://" + net.JoinHostPort(cfg.Instance, port)
 	}
 	return cfg, nil
 }

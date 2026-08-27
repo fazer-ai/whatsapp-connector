@@ -8,16 +8,29 @@ through [whatsmeow](https://github.com/tulir/whatsmeow), and exchanges canonical
 events and commands with its clients over Redis Streams.
 
 > [!IMPORTANT]
-> **Status: M2, text both ways.** A session pairs with a real WhatsApp account, resumes
-> across restarts, publishes the text messages that arrive on it, and sends text back:
-> quotes, mentions and the chat's disappearing-message timer included. `groups` on the
-> connect decides whether group chats come with them. Everything else is still M2's to
-> finish: media, location and contacts, in either direction, and the commands that act
+> **Status: M2, text both ways and media inbound.** A session pairs with a real WhatsApp
+> account, resumes across restarts, publishes the text messages that arrive on it, and
+> sends text back: quotes, mentions and the chat's disappearing-message timer included.
+> `groups` on the connect decides whether group chats come with them. An inbound image,
+> video, audio, document or sticker is downloaded as it arrives, kept in this instance's
+> blob cache and published as a reference the client fetches over HTTP; a file WhatsApp
+> will not serve again is announced with `media.download_failed` so the bubble says the
+> attachment is unavailable rather than loading forever. A file sent to be seen once is
+> announced the same way and never kept: a blob is served for as long as anybody keeps
+> asking for it, so storing one would turn something the sender expected to disappear
+> into something the account holds indefinitely. WhatsApp usually does not hand one to a
+> linked device at all, and what it sends instead reaches the inbox as nothing until
+> [#20](https://github.com/fazer-ai/whatsapp-connector/issues/20) lands. A blob lives on the instance that
+> downloaded it and for a bounded time, and the command that rebuilds one that is gone
+> (`message.download_media`) is M2.2c: until it lands, an attachment does not survive the
+> instance being replaced between the event and the client's fetch (#19). Everything else is still M2's
+> to finish: media outbound, location and contacts either way, and the commands that act
 > on a message that already exists. What this build cannot render is left
 > unacknowledged on WhatsApp's side, with its plaintext buffered so the redelivery can
 > still be read: the account keeps the message and delivers it again once there is
 > somewhere to put it. A number paired on this build therefore still accumulates a
-> backlog of everything that is not text (see [Roadmap](#roadmap)).
+> backlog of everything that is neither text nor an inbound file (see
+> [Roadmap](#roadmap)).
 >
 > A message is acknowledged to WhatsApp only after its event reaches the stream, so
 > losing Redis costs a redelivery and never a message. The client deduplicates on the
@@ -151,7 +164,7 @@ restart, and reports itself healthy while doing it.
 | `WAC_DEVICE_NAME` | `fazer.ai` | What the account's linked-devices list shows. Fleet-wide, not per session: whatsmeow keeps device properties process-wide |
 | `WAC_HTTP_ADDR` | `:8080` | Where `/healthz`, `/readyz` and `/metrics` listen |
 | `WAC_ADVERTISE_URL` | derived | How clients reach this instance for media |
-| `WAC_MEDIA_ROOT` | unset | Where inbound media is cached. Unset turns the store and the endpoint off |
+| `WAC_MEDIA_ROOT` | unset | Where inbound media is cached. Unset turns the store and the endpoint off, and every media message is then published with `media.download_failed` behind it |
 | `WAC_MEDIA_TOKEN` | unset | Bearer token the media endpoint requires. Required whenever `WAC_MEDIA_ROOT` is set: the endpoint hands out message contents |
 | `WAC_MEDIA_TTL` | `24h` | How long a blob is kept without being collected. The cache is walked every half of it, between a second and a minute, so a short TTL is swept often |
 | `WAC_MEDIA_QUOTA` | `2GiB` | Disk the blobs may take, counted in whole blocks and including each blob's description. Over it, the least recently collected go first |
@@ -178,7 +191,7 @@ restart, and reports itself healthy while doing it.
 |---|---|
 | **M0** ✅ | Skeleton, Redis Streams transport, lease/ownership port, fake engine, health and metrics, Docker image, publish pipeline |
 | **M1** ✅ | whatsmeow engine: QR and code pairing, session state, logout/ban/outdated handling, the device store. Reconnect backoff and the store-level fence are still open |
-| **M2** 🚧 | Messages in and out (text, media, location, contact, reaction, edit, revoke, quoted, mentions), receipts, read marks, chat presence, idempotent sends. Text is in, both ways |
+| **M2** 🚧 | Messages in and out (text, media, location, contact, reaction, edit, revoke, quoted, mentions), receipts, read marks, chat presence, idempotent sends. Text is in both ways, and inbound media is downloaded and served |
 | **M3** | Groups, presence, contacts, calls |
 | **M4** | Multi-instance under load, quarantine, metrics/lag/DLQ, operations docs |
 | **M5** | Pairing code, passkey relay, per-session proxy, account limits |
