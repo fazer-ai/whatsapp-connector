@@ -46,8 +46,17 @@ type MediaPart struct {
 // PutMediaPart records how to fetch a message's file again, replacing whatever was
 // there for the same message.
 //
-// Last write wins on purpose: a message that arrives twice is the same file both times,
-// and the second delivery carries metadata at least as fresh as the first.
+// The newest write wins, and the WHERE is what makes that true rather than "whichever
+// statement ran last". A message that arrives twice is the same file both times and the
+// later delivery carries the fresher coordinates, so an older write landing afterwards
+// has nothing to add and can only take something away.
+//
+// That case is not hypothetical: ownership of a session moves between instances, and the
+// old owner's handler can still be inside this call when the new one writes. This does
+// not fence the write against a lost lease -- it cannot, there is no epoch in this schema
+// and adding one is the architecture change the package doc calls open -- it removes the
+// harm reordering does here, which is a stale directPath installed over a fresh one and a
+// later download answered with a 404.
 func (c *Container) PutMediaPart(ctx context.Context, part *MediaPart, now time.Time) error {
 	if part.SID == "" || part.MessageID == "" {
 		return fmt.Errorf("store: a media part needs a session and a message, got %q and %q", part.SID, part.MessageID)
@@ -65,7 +74,8 @@ func (c *Container) PutMediaPart(ctx context.Context, part *MediaPart, now time.
 			kind = excluded.kind, direct_path = excluded.direct_path, media_key = excluded.media_key,
 			file_enc_sha256 = excluded.file_enc_sha256, file_sha256 = excluded.file_sha256,
 			file_length = excluded.file_length, mime = excluded.mime, filename = excluded.filename,
-			stored_at = excluded.stored_at`
+			stored_at = excluded.stored_at
+		WHERE excluded.stored_at > wac_media_part.stored_at`
 	_, err := c.db.ExecContext(ctx, c.rebind(upsert),
 		part.SID, part.MessageID, part.Kind, part.DirectPath,
 		encode(part.MediaKey), encode(part.FileEncSHA256), encode(part.FileSHA256),

@@ -97,6 +97,44 @@ func TestARedeliveredMessageReplacesWhatWasKeptForIt(t *testing.T) {
 	}
 }
 
+// Ownership of a session moves between instances, and the old owner's handler can still
+// be inside this call when the new owner has already written. The older write has nothing
+// to add and can only take something away: a stale direct path installed over a fresh one
+// is a download answered with a 404, which is the failure this whole table exists to
+// prevent.
+//
+// This is not a fence against a lost lease -- there is no epoch in the schema and adding
+// one is an architecture change -- it is the write being monotonic in time, which is what
+// removes the harm reordering does here.
+func TestAWriteThatArrivesLateDoesNotOverwriteANewerOne(t *testing.T) {
+	t.Parallel()
+	container := open(t)
+
+	fresh := samplePart("sid-1", "3EB0RACE")
+	fresh.DirectPath = "/v/t62.7118-24/fresh.enc"
+	if err := container.PutMediaPart(t.Context(), &fresh, storedAt); err != nil {
+		t.Fatalf("PutMediaPart: %v", err)
+	}
+
+	// The old owner's write, made before the fresh one and landing after it.
+	stale := samplePart("sid-1", "3EB0RACE")
+	stale.DirectPath = "/v/t62.7118-24/stale.enc"
+	if err := container.PutMediaPart(t.Context(), &stale, storedAt.Add(-time.Minute)); err != nil {
+		t.Fatalf("PutMediaPart: %v", err)
+	}
+
+	got, _, err := container.MediaPart(t.Context(), "sid-1", "3EB0RACE")
+	if err != nil {
+		t.Fatalf("MediaPart: %v", err)
+	}
+	if got.DirectPath != fresh.DirectPath {
+		t.Fatalf("the direct path is %q, want the one the newer write left", got.DirectPath)
+	}
+	if got.StoredAt != storedAt.UnixMilli() {
+		t.Fatalf("the row is stamped %d, want the newer write's %d", got.StoredAt, storedAt.UnixMilli())
+	}
+}
+
 // A message nobody kept anything for is not an error: it is the ordinary answer for a
 // text message, and for one whose retention has run out.
 func TestAMessageNothingWasKeptForIsNotAnError(t *testing.T) {

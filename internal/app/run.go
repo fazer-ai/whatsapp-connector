@@ -193,9 +193,15 @@ func (c *Connector) Run(ctx context.Context) error {
 	// ends the run while nothing has cancelled anything. Waiting on a sweeper that is
 	// still ticking would hang the process on exactly the startup failure it is trying
 	// to report.
-	sweeping, stopSweeping := context.WithCancel(ctx)
-	swept := c.sweepBlobs(sweeping)
-	sweptParts := c.sweepMediaParts(sweeping)
+	// Two sweepers on two contexts, because their orders around the shutdown are
+	// opposite ones. The blob sweep must not walk a directory the shutdown is still
+	// writing to, so it stops after. The database sweep holds a statement on the pool
+	// the shutdown closes, so it stops before: sql.DB.Close waits for what is in flight,
+	// and a sweeper still ticking behind it answers ErrConnDone on every pass.
+	sweepingBlobs, stopBlobSweep := context.WithCancel(ctx)
+	swept := c.sweepBlobs(sweepingBlobs)
+	sweepingParts, stopPartSweep := context.WithCancel(ctx)
+	sweptParts := c.sweepMediaParts(sweepingParts)
 
 	c.log.Info().
 		Str("addr", c.cfg.HTTPAddr).
@@ -204,12 +210,15 @@ func (c *Connector) Run(ctx context.Context) error {
 		Msg("connector is up")
 
 	err := c.loop(ctx, httpErr)
+	// Before the shutdown, which closes the pool this one is querying.
+	stopPartSweep()
+	<-sweptParts
+
 	c.shutdown()
 	// After the loop, so the sweep is not walking a directory the shutdown is still
 	// writing to, and waited for, so the process does not exit mid-rename.
-	stopSweeping()
+	stopBlobSweep()
 	<-swept
-	<-sweptParts
 	if c.blobs != nil {
 		// After the sweeper has stopped, so nothing is walking the directory through a
 		// handle that is being closed.

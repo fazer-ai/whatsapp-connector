@@ -37,22 +37,26 @@ func TestWhatACommandIsRememberedUnder(t *testing.T) {
 		},
 		want: "msg:m2",
 	}, {
-		// Here `message_id` names a message that already exists, and the send that
-		// created it is keyed by that same id. Sharing the key would answer the
-		// download with the send's result, and the other way round.
-		name: "a media download does not borrow the id of the send that created the message",
+		// A download is carried out again rather than answered from a record. Its answer
+		// is a reference to a blob on one instance, good until a TTL, so a remembered
+		// one is an address that answers nothing -- handed back on the very path that
+		// exists to recover an attachment. Spending the download twice is the cheaper of
+		// the two, and it is bounded.
+		name: "a media download is asked again rather than answered from a record",
 		command: protocol.Command{
 			ID: "c3", Type: protocol.CommandMessageDownloadMedia,
 			Payload: json.RawMessage(`{"message_id":"m1"}`),
 		},
-		want: "cmd:c3",
+		want: "",
 	}, {
-		name: "a media download prefers the key its own frame carries",
+		// Not even with a key of its own. What makes the old answer unusable is that it
+		// went stale, and the caller's key says nothing about that.
+		name: "a media download is asked again even when its frame carries a key",
 		command: protocol.Command{
 			ID: "c4", Type: protocol.CommandMessageDownloadMedia, IdempotencyKey: "download-once",
 			Payload: json.RawMessage(`{"message_id":"m1"}`),
 		},
-		want: "idem:download-once",
+		want: "",
 	}, {
 		// Reading the invite code changes nothing, and the answer is only worth having
 		// if it is current.
@@ -103,5 +107,16 @@ func TestWhatACommandIsRememberedUnder(t *testing.T) {
 				t.Fatalf("%s is remembered under %q, want %q", tc.command.Type, got, tc.want)
 			}
 		})
+	}
+}
+
+// Belt and braces behind the rule above, and the reason it is worth keeping: if a
+// download were ever remembered again, its `message_id` names a message somebody else's
+// command created, and keying by it would answer the download with that send's result.
+func TestADownloadDoesNotBorrowTheIDNamespaceOfTheSendThatCreatedItsMessage(t *testing.T) {
+	t.Parallel()
+
+	if protocol.CommandMessageDownloadMedia.NamesItsOwnMessage() {
+		t.Fatal("a download would be remembered under the id of the send that created its message")
 	}
 }
