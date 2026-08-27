@@ -2,7 +2,11 @@ package whatsmeow
 
 import (
 	"encoding/json"
+	"errors"
+	"strings"
 	"testing"
+
+	wm "go.mau.fi/whatsmeow"
 
 	waTypes "go.mau.fi/whatsmeow/types"
 
@@ -227,5 +231,107 @@ func TestOnlyATextBodyCanBeCorrected(t *testing.T) {
 	}
 	if got := corrected.GetConversation(); got != "corrigido" {
 		t.Fatalf("the correction reads %q", got)
+	}
+}
+
+// Invariant 5 says a redelivered command must not duplicate a side effect, and for a
+// message the last mile of that is the stanza id: the receiving client is what discards
+// the second copy, and it discards on the id. The session layer answers a redelivery from
+// its record, but the record is written after the send, so a crash between the two hands
+// the same command to this code twice -- and an id made up on the spot is different each
+// time, which lands a second edit and a second reaction.
+func TestAnIdTheCallerLeftOutIsTheSameOnTheSecondTry(t *testing.T) {
+	t.Parallel()
+
+	session, _, _ := outboundSession(t)
+	for _, tc := range []struct {
+		name    string
+		command *protocol.Command
+	}{
+		{"a command identified by its own id", &protocol.Command{
+			Type: protocol.CommandMessageReact, ID: "cmd_000012"}},
+		{"one identified by the caller's key", &protocol.Command{
+			Type: protocol.CommandMessageReact, ID: "cmd_000012", IdempotencyKey: "react-once"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			first := session.orDerived(tc.command, "")
+			if again := session.orDerived(tc.command, ""); again != first {
+				t.Fatalf("the same command went out as %s and then as %s", first, again)
+			}
+			if !strings.HasPrefix(first, wm.WebMessageIDPrefix) || len(first) != len(wm.WebMessageIDPrefix)+18 {
+				t.Fatalf("%q is not the shape whatsmeow generates", first)
+			}
+		})
+	}
+
+	// A different command is a different message, and two of them sharing a stanza id
+	// would have the recipient discard the second as a duplicate of the first.
+	react := session.orDerived(&protocol.Command{Type: protocol.CommandMessageReact, ID: "cmd_a"}, "")
+	for _, other := range []*protocol.Command{
+		{Type: protocol.CommandMessageReact, ID: "cmd_b"},
+		{Type: protocol.CommandMessageEdit, ID: "cmd_a"},
+		{Type: protocol.CommandMessageReact, ID: "cmd_a", IdempotencyKey: "somebody's key"},
+	} {
+		if got := session.orDerived(other, ""); got == react {
+			t.Fatalf("%s/%s took the same stanza id as react/cmd_a", other.Type, other.ID)
+		}
+	}
+
+	// And the caller's own id still wins, which is the ordinary case.
+	if got := session.orDerived(&protocol.Command{Type: protocol.CommandMessageReact, ID: "cmd_a"}, "3EB0CAFE"); got != "3EB0CAFE" {
+		t.Fatalf("the caller named %q and the message went out as %q", "3EB0CAFE", got)
+	}
+}
+
+// A channel names the post a reaction is on with a server id, not with a message key, and
+// carries it on a node of its own. Sent the ordinary way it goes out naming a key the
+// channel cannot resolve, WhatsApp accepts it, and nobody sees a reaction. See #34.
+//
+// An edit and a revoke are not in the same position: whatsmeow recognises both on the
+// newsletter path and rewrites the stanza id to the target's, so they are not refused and
+// a test that refused all three would pin the wrong rule.
+func TestOnlyAReactionIsRefusedOnAChannel(t *testing.T) {
+	t.Parallel()
+
+	session, _, _ := outboundSession(t)
+	const channel = `"to":{"kind":"newsletter","id":"120363000000000000"}`
+
+	_, err := session.react(t.Context(), &protocol.Command{
+		Type:    protocol.CommandMessageReact,
+		Payload: json.RawMessage(`{` + channel + `,"target_id":"3EB0A1B2C3D4E5F60718","emoji":"👍"}`),
+	})
+	assertCode(t, err, protocol.ErrorUnsupported)
+
+	// The other two reach the wire, where an unconnected session is what stops them --
+	// which is a different answer from `unsupported`, and the point.
+	for _, tc := range []struct {
+		name string
+		run  func() error
+	}{
+		{"an edit of a channel post", func() error {
+			_, err := session.edit(t.Context(), &protocol.Command{
+				Type: protocol.CommandMessageEdit,
+				Payload: json.RawMessage(`{` + channel + `,"target_id":"3EB0A1B2C3D4E5F60718",
+					"content":{"type":"text","body":"corrigido"}}`)})
+			return err
+		}},
+		{"a revoke of one", func() error {
+			_, err := session.revoke(t.Context(), &protocol.Command{
+				Type:    protocol.CommandMessageRevoke,
+				Payload: json.RawMessage(`{` + channel + `,"target_id":"3EB0A1B2C3D4E5F60718"}`)})
+			return err
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := tc.run()
+			var coded *protocol.Error
+			if errors.As(err, &coded) && coded.Code == protocol.ErrorUnsupported {
+				t.Fatalf("%s was refused as unsupported, and whatsmeow carries it: %v", tc.name, err)
+			}
+		})
 	}
 }

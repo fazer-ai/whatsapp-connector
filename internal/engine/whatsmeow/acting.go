@@ -2,8 +2,13 @@ package whatsmeow
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strings"
+
+	wm "go.mau.fi/whatsmeow"
 
 	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
 	waTypes "go.mau.fi/whatsmeow/types"
@@ -83,7 +88,7 @@ func (s *Session) edit(ctx context.Context, command *protocol.Command) (json.Raw
 	// The key BuildEdit puts together is `from_me: true` and nothing else, which is the
 	// whole of what WhatsApp allows: a message is edited by whoever sent it. The
 	// contract carries no way to say otherwise for exactly that reason.
-	sent, err := s.putOnTheWire(ctx, to, s.orGenerated(req.MessageID),
+	sent, err := s.putOnTheWire(ctx, to, s.orDerived(command, req.MessageID),
 		client.BuildEdit(to, req.TargetID, corrected))
 	if err != nil {
 		return nil, err
@@ -148,6 +153,19 @@ func (s *Session) react(ctx context.Context, command *protocol.Command) (json.Ra
 		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
 			"a reaction has to say what to react with, and an empty one takes it off")
 	}
+	if req.To.Kind == protocol.AddressNewsletter {
+		// A channel takes a reaction through a node of its own, keyed by the post's
+		// `server_id` rather than by a message key -- whatsmeow has NewsletterSendReaction
+		// for it, and the contract carries no field the server id could arrive in. Sent
+		// the ordinary way it goes out as a message naming a key the channel cannot
+		// resolve, and the send reports success. Refused until #34 does it properly.
+		//
+		// An edit and a revoke are not in the same position and are not refused:
+		// whatsmeow recognises both on the newsletter path and rewrites the stanza id to
+		// the target's, which is how a channel names what is being changed.
+		return nil, protocol.NewError(protocol.ErrorUnsupported,
+			"this connector cannot react to a channel post yet")
+	}
 	to, err := jidOf(req.To)
 	if err != nil {
 		return nil, err
@@ -161,7 +179,7 @@ func (s *Session) react(ctx context.Context, command *protocol.Command) (json.Ra
 	}
 
 	client := s.current()
-	sent, err := s.putOnTheWire(ctx, to, s.orGenerated(req.MessageID),
+	sent, err := s.putOnTheWire(ctx, to, s.orDerived(command, req.MessageID),
 		client.BuildReaction(to, sender, req.TargetID, *req.Emoji))
 	if err != nil {
 		return nil, err
@@ -216,19 +234,39 @@ func jidOfMaybe(address *protocol.Address) (waTypes.JID, error) {
 	return jidOf(*address)
 }
 
-// orGenerated is the id to put a message on the wire under.
+// orDerived is the id to put a message on the wire under.
 //
 // The contract requires one on a send and makes it optional on an edit and a reaction,
-// so this fills in what a caller left out. It is worth knowing what that costs the
-// caller: an id of their own is what makes a retry of a command whose reply was lost
-// arrive under the same stanza id and be discarded by the receiving client. One
-// generated here is new every time, so the retry lands a second edit or a second
-// reaction instead.
-func (s *Session) orGenerated(messageID string) string {
+// so this fills in what a caller left out. Derived rather than generated, because the id
+// is what carries invariant 5 the last mile: a stanza id is what the receiving client
+// deduplicates on, so a command whose reply was lost has to arrive under the same one or
+// it lands a second edit and a second reaction. The window is narrow and real -- the
+// session layer answers a redelivery from its record, and the record is written after
+// the send, so a crash between the two is a command that runs twice.
+//
+// Seeded with what the session layer keys that record on, so the two agree on which
+// commands are the same one: the caller's `idempotency_key` where there is one, and the
+// command's own id otherwise. The session id and the command type go in as well, so two
+// sessions handed the same key do not send each other's stanza id.
+func (s *Session) orDerived(command *protocol.Command, messageID string) string {
 	if messageID != "" {
 		return messageID
 	}
-	return s.current().GenerateMessageID()
+	seed := command.IdempotencyKey
+	if seed == "" {
+		seed = command.ID
+	}
+	if seed == "" {
+		// Nothing identifies this command, so nothing can make it idempotent. A derived
+		// id would be the same for every command of this type on this session, and the
+		// receiving client would discard all but the first as duplicates -- which is
+		// worse than the repeat this exists to stop.
+		return s.current().GenerateMessageID()
+	}
+	sum := sha256.Sum256([]byte(s.sid + "\x00" + string(command.Type) + "\x00" + seed))
+	// The shape whatsmeow generates, so nothing downstream can tell one of these from
+	// one of its own.
+	return wm.WebMessageIDPrefix + strings.ToUpper(hex.EncodeToString(sum[:9]))
 }
 
 // editedBody renders what a message is being corrected to.
