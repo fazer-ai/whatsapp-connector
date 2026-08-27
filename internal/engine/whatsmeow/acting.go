@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -288,7 +289,21 @@ func (s *Session) asTheGroupAddresses(
 		return participant, nil
 	}
 	alt, err := s.current().Store.GetAltJID(ctx, participant)
-	if err != nil || alt.IsEmpty() {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+		// The caller's own budget, and it has run out. Reported as anything else the
+		// send reads as this connector breaking.
+		return waTypes.EmptyJID, protocol.NewError(protocol.ErrorTimeout,
+			"the mapping this group's addressing needs did not arrive before the command's deadline")
+	case err != nil:
+		// The store having a bad second, which the next attempt may well not have. It is
+		// not the caller's payload and must not be answered as one: told its address is
+		// wrong, a client stops sending it.
+		return waTypes.EmptyJID, protocol.NewError(protocol.ErrorInternal,
+			fmt.Sprintf("could not look up how %s is addressed in that group: %v", participant, err))
+	case alt.IsEmpty():
+		// Asked and answered: there is no mapping, so there is no key naming this
+		// participant that the group would resolve, and the next attempt says the same.
 		return waTypes.EmptyJID, protocol.NewError(protocol.ErrorInvalidPayload,
 			fmt.Sprintf("that group names its senders by %s and this session cannot place %s among them",
 				wanted, participant))

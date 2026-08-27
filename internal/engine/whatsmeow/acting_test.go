@@ -498,19 +498,40 @@ func TestAParticipantIsPutInTheGroupsOwnNamespace(t *testing.T) {
 		}
 	})
 
-	// And the other failure, which is not the same: the namespace is known to be wrong
-	// and there is nothing to translate with, so the key can only be built naming
-	// somebody the group has never heard of.
-	t.Run("a participant this session cannot place", func(t *testing.T) {
+	// And the failures once the group has been read, which are three different things and
+	// have to answer as three. A client told its address is wrong stops sending it, so a
+	// store having a bad second must never come back as that.
+	t.Run("the mapping cannot be looked up", func(t *testing.T) {
 		t.Parallel()
 
-		session, _, _ := outboundSession(t)
-		session.groupMode = func(context.Context, waTypes.JID) (waTypes.AddressingMode, error) {
-			return waTypes.AddressingModePN, nil
+		for _, tc := range []struct {
+			name        string
+			participant string
+			ctx         func(*testing.T) context.Context
+			want        protocol.ErrorCode
+		}{
+			// Asked and answered: no mapping exists, so no key naming this participant
+			// would resolve, and the next attempt says the same.
+			{"nobody by that name is in the group", "999999999999999@lid",
+				func(t *testing.T) context.Context { return t.Context() }, protocol.ErrorInvalidPayload},
+			// The caller's own budget running out, which is not their address being wrong.
+			{"the command ran out of time", "999999999999999@lid", func(t *testing.T) context.Context {
+				ctx, cancel := context.WithCancel(t.Context())
+				cancel()
+				return ctx
+			}, protocol.ErrorTimeout},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+
+				session, _, _ := outboundSession(t)
+				session.groupMode = func(context.Context, waTypes.JID) (waTypes.AddressingMode, error) {
+					return waTypes.AddressingModePN, nil
+				}
+				_, err := session.asTheGroupAddresses(tc.ctx(t), mustJID(t, group), mustJID(t, tc.participant))
+				assertCode(t, err, tc.want)
+			})
 		}
-		_, err := session.asTheGroupAddresses(t.Context(),
-			mustJID(t, group), mustJID(t, "999999999999999@lid"))
-		assertCode(t, err, protocol.ErrorInvalidPayload)
 	})
 }
 
