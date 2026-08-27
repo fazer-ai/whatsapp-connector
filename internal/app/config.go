@@ -90,6 +90,10 @@ const DefaultEventShards = 8
 // It is not sized larger because what is kept is the key to somebody's file. WhatsApp
 // stops serving the file at some point of its own, and past that this table would be
 // retaining keys to bytes nobody can fetch, which is cost with no answer behind it.
+//
+// A floor rather than the value: a deployment keeping blobs for longer than this keeps
+// the coordinates at least that long too, or the reference lapses while the message is
+// still unrecoverable.
 const DefaultMediaRefetch = 7 * 24 * time.Hour
 
 // LoadConfig reads the environment. It fails on a value it cannot parse rather than
@@ -114,11 +118,17 @@ func LoadConfig(hostname string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	mediaRefetch, err := envDuration("WAC_MEDIA_REFETCH_TTL", DefaultMediaRefetch)
+	mediaTTL, err := envDuration("WAC_MEDIA_TTL", media.DefaultTTL)
 	if err != nil {
 		return Config{}, err
 	}
-	mediaTTL, err := envDuration("WAC_MEDIA_TTL", media.DefaultTTL)
+	// Read after the blob TTL and never below it, which is the same rule as the check
+	// further down and the reason this cannot be a constant: a deployment already
+	// keeping blobs for longer than the default would otherwise be refused on upgrade by
+	// a setting it has never heard of, over a relation it did nothing to break. An
+	// explicitly shorter one is still refused, because that is an operator asking for
+	// the window this exists to close.
+	mediaRefetch, err := envDuration("WAC_MEDIA_REFETCH_TTL", max(DefaultMediaRefetch, mediaTTL))
 	if err != nil {
 		return Config{}, err
 	}

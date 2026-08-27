@@ -170,7 +170,7 @@ restart, and reports itself healthy while doing it.
 | `WAC_MEDIA_QUOTA` | `2GiB` | Disk the blobs may take, counted in whole blocks and including each blob's description. Over it, the least recently collected go first |
 | `WAC_MEDIA_MAX_BLOB` | `100MiB` | The largest single file this instance keeps |
 | `WAC_MEDIA_BLOCK_SIZE` | `4KiB` | The allocation unit of the volume the cache sits on. Set it to match a filesystem formatted with larger units, or every file is undercharged against the quota |
-| `WAC_MEDIA_REFETCH_TTL` | `168h` | How long a message can still be asked for its file again, after the blob it was published with has gone. Must be at least `WAC_MEDIA_TTL`. What is kept for that long is a row per media message holding the key to the file, so it is retention rather than cache |
+| `WAC_MEDIA_REFETCH_TTL` | `168h`, or `WAC_MEDIA_TTL` when that is longer | How long a message can still be asked for its file again, after the blob it was published with has gone. Must be at least `WAC_MEDIA_TTL`, which is why the default follows it up. What is kept for that long is a row per media message holding the key to the file, so it is retention rather than cache |
 | `WAC_LEASE_TTL` | `30s` | How long a session lease survives without a renewal |
 | `WAC_HEARTBEAT` | `5s` | How often leases are renewed and the instance re-announces. Also bounds how long a read waits on Redis (half a heartbeat), and has to leave room for the read and the batch before it: `1.5 × heartbeat + lease/3 < lease` |
 | `WAC_CLAIM_MIN_IDLE` | `1.5 × lease` | How long a command sits unacknowledged before another instance takes it over. Must exceed `WAC_LEASE_TTL` |

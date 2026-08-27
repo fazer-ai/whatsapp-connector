@@ -352,24 +352,38 @@ func (c *Connector) sweepMediaParts(ctx context.Context) <-chan struct{} {
 		ticker := time.NewTicker(PartSweep(c.cfg.MediaRefetch))
 		defer ticker.Stop()
 		for {
+			// Swept before the first tick rather than after it. The cadence runs to an
+			// hour and every restart builds a new ticker, so a fleet that ships several
+			// times a day would reach the first tick on none of its instances: the
+			// retention an operator configured would be a setting nothing ever enforces,
+			// and the table would grow for the life of the deployment. The blob sweep
+			// does not need this because its cadence tops out at a minute.
+			if done := c.sweepPartsOnce(ctx); done {
+				return
+			}
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
 			}
-			dropped, err := c.store.SweepMediaParts(ctx, time.Now().Add(-c.cfg.MediaRefetch))
-			switch {
-			case errors.Is(err, context.Canceled):
-				return
-			case err != nil:
-				c.log.Warn().Err(err).Msg("could not sweep what was kept to fetch files again")
-			case dropped > 0:
-				c.log.Debug().Int64("messages", dropped).
-					Msg("dropped what was kept to fetch the files of messages past their retention")
-			}
 		}
 	}()
 	return done
+}
+
+// sweepPartsOnce makes one pass and reports whether the sweeper should stop.
+func (c *Connector) sweepPartsOnce(ctx context.Context) bool {
+	dropped, err := c.store.SweepMediaParts(ctx, time.Now().Add(-c.cfg.MediaRefetch))
+	switch {
+	case errors.Is(err, context.Canceled):
+		return true
+	case err != nil:
+		c.log.Warn().Err(err).Msg("could not sweep what was kept to fetch files again")
+	case dropped > 0:
+		c.log.Debug().Int64("messages", dropped).
+			Msg("dropped what was kept to fetch the files of messages past their retention")
+	}
+	return false
 }
 
 // reclaimCommands takes over what nobody acknowledged: what another instance read
