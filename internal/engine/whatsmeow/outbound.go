@@ -24,10 +24,14 @@ import (
 // handing it to WhatsApp.
 //
 // A send answers a command, so what this competes with is the caller's own deadline
-// rather than the ordering of a session's inbound messages. The contract's commands
-// carry one and it is usually shorter than this; what this is for is the send that
-// arrived without one, so a file coming from an address that accepts the connection and
-// then says nothing cannot hold a session's command queue open indefinitely.
+// rather than the ordering of a session's inbound messages. The contract's commands carry
+// one and the session applies it, so this is only ever the ceiling for a send that
+// arrived without one: it stops a file coming from an address that accepts the connection
+// and then says nothing from holding a session's command queue open indefinitely.
+//
+// In practice the caller's deadline is much shorter than this and it is what decides
+// whether a large file can be sent at all. See #29: the supported client allows 18
+// seconds, which no file near WAC_MEDIA_SEND_MAX will fetch and upload inside.
 const uploadTimeout = 2 * time.Minute
 
 // fetchRedirects is how many hops a fetch of the caller's URL will follow. Redirects are
@@ -230,7 +234,12 @@ func contactCard(entry *outboundContact) (*waE2E.ContactMessage, error) {
 		}, nil
 	}
 
-	phone := strings.TrimSpace(entry.Phone)
+	// Reduced to digits rather than trimmed: a number reaches this connector however a
+	// human typed it into a CRM, and the contract's own fixture carries
+	// `+55 41 98888-1111`. The waid parameter is what makes the card open a chat, and
+	// WhatsApp matches it against an account by its digits: one carrying spaces and
+	// hyphens matches nobody, so the card renders and does nothing when it is tapped.
+	phone := digitsOf(entry.Phone)
 	if phone == "" || name == "" {
 		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
 			"a contact has to carry a vcard, or a name and a phone number to write one from")
@@ -246,8 +255,7 @@ func contactCard(entry *outboundContact) (*waE2E.ContactMessage, error) {
 // The WAID parameter is what makes the card actionable: without it a recipient sees a
 // number to copy, and with it the card opens the chat. Written the way WhatsApp's own
 // clients write it, because the recipient's client is what parses this back.
-func vcardOf(name, phone string) string {
-	digits := strings.TrimPrefix(phone, "+")
+func vcardOf(name, digits string) string {
 	return strings.Join([]string{
 		"BEGIN:VCARD",
 		"VERSION:" + vcardVersion,
@@ -369,6 +377,40 @@ func (s *Session) mediaToSend(
 	return renderMedia(content, &uploaded, mimeToSend(content, file.mime), plan.thumbnail, alongside), nil
 }
 
+// safeAddress is an address with its query dropped, for putting in a message.
+//
+// A reference from the client is very often a signed URL: the credential is the query,
+// and it is valid for as long as the signature says. The reply this goes into is stored
+// by the caller and read back out of its logs, so echoing the whole thing writes a
+// working credential somewhere it outlives the send. What is left still identifies which
+// address failed, which is the whole reason to name it.
+func safeAddress(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		// Unparseable, so there is no query to separate out and no way to be sure what
+		// is in it. The scheme is all that can be said safely.
+		if scheme, _, found := strings.Cut(raw, ":"); found && scheme != "" {
+			return scheme + ":[unparseable]"
+		}
+		return "[unparseable]"
+	}
+	parsed.RawQuery, parsed.Fragment, parsed.User = "", "", nil
+	return parsed.String()
+}
+
+// bareError is the failure without the request line Go wraps it in.
+//
+// url.Error prints the method and the whole URL alongside the cause, so the query rides
+// into any message built from it. Unwrapping keeps the cause, which is the part that says
+// what went wrong.
+func bareError(err error) error {
+	var wrapped *url.Error
+	if errors.As(err, &wrapped) && wrapped.Err != nil {
+		return wrapped.Err
+	}
+	return err
+}
+
 // fetchable answers the address to fetch from, or says why there is not one.
 func fetchable(ref *protocol.MediaRef) (string, error) {
 	if ref == nil {
@@ -387,7 +429,7 @@ func fetchable(ref *protocol.MediaRef) (string, error) {
 	parsed, err := url.Parse(ref.URL)
 	if err != nil {
 		return "", protocol.NewError(protocol.ErrorInvalidPayload,
-			fmt.Sprintf("%q is not an address: %v", ref.URL, err))
+			fmt.Sprintf("that reference is not an address: %v", bareError(err)))
 	}
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
 		// A `file:` URL would have this instance read its own disk and send whatever is
@@ -397,7 +439,7 @@ func fetchable(ref *protocol.MediaRef) (string, error) {
 	}
 	if parsed.Host == "" {
 		return "", protocol.NewError(protocol.ErrorInvalidPayload,
-			fmt.Sprintf("%q names no host to fetch from", ref.URL))
+			fmt.Sprintf("%s names no host to fetch from", safeAddress(ref.URL)))
 	}
 	return ref.URL, nil
 }
@@ -596,7 +638,7 @@ func retrieveOverHTTP(ctx context.Context, address string, headers map[string]st
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, address, http.NoBody)
 	if err != nil {
 		return source{}, protocol.NewError(protocol.ErrorInvalidPayload,
-			fmt.Sprintf("that is not an address a file can be fetched from: %v", err))
+			fmt.Sprintf("that is not an address a file can be fetched from: %v", bareError(err)))
 	}
 	for name, value := range headers {
 		request.Header.Set(name, value)
@@ -611,7 +653,16 @@ func retrieveOverHTTP(ctx context.Context, address string, headers map[string]st
 		},
 	}
 	answer, err := client.Do(request)
-	if err != nil {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+		// Asked about first, because this one is already accounted for: the deadline is
+		// the caller's own and it has run out, so the caller is about to stop waiting
+		// whatever this answers. Folded into the failure below it would be reported as
+		// this connector breaking, and the send would look like a bug rather than a
+		// budget. See #29 for how short that budget actually is.
+		return source{}, protocol.NewError(protocol.ErrorTimeout,
+			"the file to send did not arrive before this command's deadline")
+	case err != nil:
 		// Worth trying again: the address may be a service that is restarting, and the
 		// caller holds the only copy of what it wanted to send. Reported as `internal`
 		// because the contract has no code for a dependency the caller itself named
@@ -619,7 +670,7 @@ func retrieveOverHTTP(ctx context.Context, address string, headers map[string]st
 		// is not a lie about who timed out. The message says whose fault it actually is,
 		// and the missing code is issue #26.
 		return source{}, protocol.NewError(protocol.ErrorInternal,
-			fmt.Sprintf("could not fetch the file to send: %v", err))
+			fmt.Sprintf("could not fetch %s: %v", safeAddress(address), bareError(err)))
 	}
 	if answer.StatusCode != http.StatusOK {
 		_ = answer.Body.Close()

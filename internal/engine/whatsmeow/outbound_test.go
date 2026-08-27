@@ -6,10 +6,14 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
 	"testing/iotest"
+	"time"
 
 	wm "go.mau.fi/whatsmeow"
 	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
@@ -961,5 +965,127 @@ func TestAFileToANewsletterIsRefusedRatherThanSentUnresolvable(t *testing.T) {
 		"content":{"type":"text","body":"oi"}}`)
 	if _, _, err := planBody(text, nil, 1<<20); err != nil {
 		t.Fatalf("a text to a newsletter was refused as well: %v", err)
+	}
+}
+
+// A reference from the client is very often a signed URL, and the credential is the
+// query. The reply is stored by the caller and read back out of its logs, so a message
+// carrying the whole address writes a working credential somewhere it outlives the send.
+//
+// Against the real fetch rather than the fake one: what has to redact is
+// retrieveOverHTTP, and a fake standing in for it would only ever prove the fake redacts.
+func TestASignedAddressDoesNotTravelIntoTheFailure(t *testing.T) {
+	t.Parallel()
+
+	// A listener opened and closed, so the port is one nothing answers on and the fetch
+	// fails without waiting for anything.
+	var listening net.ListenConfig
+	listener, err := listening.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	closed := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	signed := "http://" + closed + "/bucket/file.pdf" +
+		"?X-Amz-Credential=AKIAEXAMPLE&X-Amz-Signature=deadbeefcafe&X-Amz-Expires=900"
+	_, err = retrieveOverHTTP(t.Context(), signed, nil)
+	if err == nil {
+		t.Fatal("fetching from a port nothing answers on reported success")
+	}
+	for _, secret := range []string{"X-Amz-Signature", "deadbeefcafe", "AKIAEXAMPLE", "X-Amz-Credential"} {
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("the failure carries %q from the signed address:\n%s", secret, err)
+		}
+	}
+	// And it still says which address it was, or naming it at all is pointless.
+	if !strings.Contains(err.Error(), "/bucket/file.pdf") {
+		t.Fatalf("the failure does not say which address failed:\n%s", err)
+	}
+}
+
+// safeAddress has to keep saying which address failed, or naming it at all is pointless.
+func TestARedactedAddressStillSaysWhichOneItWas(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct{ raw, want string }{
+		{"https://s3.example.com/bucket/file.pdf?X-Amz-Signature=secret", "https://s3.example.com/bucket/file.pdf"},
+		{"http://rails:3000/blobs/proxy/abc/a.pdf", "http://rails:3000/blobs/proxy/abc/a.pdf"},
+		{"https://user:pass@host/file", "https://host/file"},
+		{"https://host/file#frag", "https://host/file"},
+		{"://nonsense", "[unparseable]"},
+	} {
+		t.Run(tc.raw, func(t *testing.T) {
+			t.Parallel()
+
+			got := safeAddress(tc.raw)
+			if got != tc.want {
+				t.Fatalf("safeAddress(%q) = %q, want %q", tc.raw, got, tc.want)
+			}
+			if strings.Contains(got, "secret") || strings.Contains(got, "pass") {
+				t.Fatalf("safeAddress(%q) kept a credential: %q", tc.raw, got)
+			}
+		})
+	}
+}
+
+// The deadline is the caller's own and it has already run out, so the caller is about to
+// stop waiting whatever this answers. Reported as this connector breaking, a send that
+// simply did not fit in its budget reads as a bug rather than as a budget.
+func TestAFetchThatOutlivedTheDeadlineIsATimeoutRatherThanABreakage(t *testing.T) {
+	t.Parallel()
+
+	// A server that accepts the connection and then says nothing, which is the shape this
+	// exists for: a refused connection fails immediately and never reaches the deadline.
+	blocking := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	t.Cleanup(blocking.Close)
+
+	expiring, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+
+	_, err := retrieveOverHTTP(expiring, blocking.URL+"/blob.pdf", nil)
+	assertCode(t, err, protocol.ErrorTimeout)
+}
+
+// A number reaches this connector however a human typed it into a CRM, and the contract's
+// own fixture carries one with spaces and a hyphen. WhatsApp matches the waid against an
+// account by its digits, so a card carrying the formatting renders and does nothing when
+// it is tapped, which is a failure only the recipient sees.
+func TestANumberIsReducedToDigitsBeforeItBecomesAWAID(t *testing.T) {
+	t.Parallel()
+
+	for _, typed := range []string{
+		"+55 41 98888-1111", "+554198881111", "55 (41) 98888-1111", "  +55-41-98888-1111  ",
+	} {
+		t.Run(typed, func(t *testing.T) {
+			t.Parallel()
+
+			card, err := contactCard(&outboundContact{DisplayName: "Ana", Phone: typed})
+			if err != nil {
+				t.Fatalf("contactCard(%q): %v", typed, err)
+			}
+			vcard := card.GetVcard()
+			for _, line := range strings.Split(vcard, "\n") {
+				if !strings.HasPrefix(line, "TEL") {
+					continue
+				}
+				if strings.ContainsAny(line, " ()-") && !strings.Contains(line, "TEL;type") {
+					t.Fatalf("the TEL line kept formatting: %q", line)
+				}
+			}
+			if !strings.Contains(vcard, "waid=554198881111:") && !strings.Contains(vcard, "waid=5541988881111:") {
+				t.Fatalf("the waid is not the digits of %q:\n%s", typed, vcard)
+			}
+		})
+	}
+
+	// And a number that is no number at all, which would otherwise write a card whose
+	// waid matches nobody.
+	if _, err := contactCard(&outboundContact{DisplayName: "Ana", Phone: "sem número"}); err == nil {
+		t.Fatal("a contact whose number has no digits in it was accepted")
 	}
 }
