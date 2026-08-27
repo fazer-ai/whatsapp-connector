@@ -2194,3 +2194,65 @@ func TestASizeNoFileCouldHaveIsRefused(t *testing.T) {
 		})
 	}
 }
+
+// 169.254.169.254 is the instance metadata endpoint on every major cloud, and what it
+// answers is the host's own credentials. A fetch of it uploads them to whatever WhatsApp
+// number the command named, and the send reports success.
+//
+// The private network as a whole is not refused, and cannot be: the client sits next to
+// this connector and hands over an address on their own network, which is the ordinary
+// case and not an attack. So what is asserted here is both halves -- the metadata range
+// refused, and everything else this connector actually fetches from still dialled.
+func TestALinkLocalAddressIsNeverDialled(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name, address string
+		refused       bool
+	}{
+		{"the metadata endpoint", "169.254.169.254:80", true},
+		{"it in the v6 form a resolver can answer with", "[::ffff:169.254.169.254]:80", true},
+		{"an IPv6 link-local address", "[fe80::1]:80", true},
+		{"the whole link-local range, not one address", "169.254.1.2:8080", true},
+		// Every one of these is somewhere a deployment does serve media from.
+		{"the client next door on a compose network", "10.0.0.4:3000", false},
+		{"the client on the same host", "127.0.0.1:3000", false},
+		{"it over IPv6", "[::1]:3000", false},
+		{"a private v6 network", "[fd00:ec2::254]:3000", false},
+		{"a storage service on the internet", "93.184.216.34:443", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			switch err := refuseLinkLocal("tcp", tc.address, nil); {
+			case tc.refused && !errors.Is(err, errLinkLocal):
+				t.Fatalf("%s was dialled, answering %v", tc.address, err)
+			case !tc.refused && err != nil:
+				t.Fatalf("%s was refused: %v", tc.address, err)
+			}
+		})
+	}
+}
+
+// The refusal is on the dial rather than on the host in the URL, which is what makes it
+// cover a redirect: an address the client vouches for that bounces one hop into the
+// metadata range is the shape that gets past a check of the caller's own URL.
+//
+// And it is the caller's reference to fix, not a minute to wait out. Classified as
+// retryable the same address is dialled again for as long as the caller keeps the
+// message.
+func TestAFetchRedirectedIntoTheMetadataRangeIsRefusedAsThePayload(t *testing.T) {
+	t.Parallel()
+
+	serving := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "http://169.254.169.254/latest/meta-data/", http.StatusFound)
+	}))
+	t.Cleanup(serving.Close)
+
+	file, err := retrieveOverHTTP(t.Context(), serving.URL+"/blob", nil)
+	if err == nil {
+		_ = file.body.Close()
+		t.Fatal("the fetch followed the redirect into the metadata range")
+	}
+	assertCode(t, err, protocol.ErrorInvalidPayload)
+}

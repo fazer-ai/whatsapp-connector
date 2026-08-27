@@ -16,6 +16,7 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
@@ -1153,6 +1154,54 @@ func (c *counting) Read(into []byte) (int, error) {
 	return read, nil
 }
 
+// errLinkLocal is an address no file is fetched from.
+var errLinkLocal = errors.New("whatsmeow: that address is link-local")
+
+// fetchTransport is what a caller's URL is fetched over: the default transport with a
+// dial that refuses a link-local address.
+//
+// This is not a refusal to fetch from the private network. Fetching from the private
+// network is the design -- the client sits next to this connector and hands over an
+// address on their own network, which is what INTERNAL_HOST_URL exists to be -- and a
+// connector that refused one would not fetch a single attachment in the deployment the
+// contract describes. What this refuses is the one range whose answer is credentials
+// rather than a file: 169.254.169.254 is the instance metadata endpoint on every major
+// cloud, and a fetch of it hands the host's own keys to whatever WhatsApp number the
+// command named. No deployment serves media from there, so nothing is lost by never
+// dialling it.
+//
+// Checked on the address actually dialled rather than on the host in the URL, which is
+// what makes it cover a name that resolves to one, a name that resolves to one only on
+// the second lookup, and every redirect hop -- they all dial through this.
+var fetchTransport = func() *http.Transport {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DialContext = (&net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+		Control:   refuseLinkLocal,
+	}).DialContext
+	return transport
+}()
+
+// refuseLinkLocal is the dial fetchTransport is built on.
+func refuseLinkLocal(_, address string, _ syscall.RawConn) error {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		host = address
+	}
+	// A dial control is handed an address that has already been resolved, so anything
+	// that will not parse as one is not something this can judge. The schemes that could
+	// put a path here are refused before any dial is attempted.
+	parsed, err := netip.ParseAddr(host)
+	if err != nil {
+		return nil
+	}
+	if parsed.IsLinkLocalUnicast() || parsed.IsLinkLocalMulticast() {
+		return fmt.Errorf("%w: %s", errLinkLocal, parsed)
+	}
+	return nil
+}
+
 // retrieveOverHTTP fetches the caller's URL.
 //
 // The address comes from the client, which is the only thing this connector takes
@@ -1170,7 +1219,7 @@ func retrieveOverHTTP(ctx context.Context, address string, headers map[string]st
 		request.Header.Set(name, value)
 	}
 
-	client := &http.Client{CheckRedirect: followingRedirects(headers)}
+	client := &http.Client{Transport: fetchTransport, CheckRedirect: followingRedirects(headers)}
 	answer, err := client.Do(request)
 	switch {
 	case errors.Is(err, errNotOverHTTP):
@@ -1185,6 +1234,14 @@ func retrieveOverHTTP(ctx context.Context, address string, headers map[string]st
 		// it is retried for as long as the caller keeps the message.
 		return source{}, protocol.NewError(protocol.ErrorInvalidPayload,
 			fmt.Sprintf("the address of the file to send redirects more than %d times", fetchRedirects))
+	case errors.Is(err, errLinkLocal):
+		// The caller's address resolved to the metadata endpoint's range. Deterministic
+		// as far as this side is concerned -- and where it is not, where a name answers
+		// differently on the next lookup, that is the rebinding this refuses and not a
+		// minute to wait out. Reported as retryable it would be dialled again for as
+		// long as the caller keeps the message.
+		return source{}, protocol.NewError(protocol.ErrorInvalidPayload,
+			"the address of the file to send resolves to a link-local address")
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
 		// Asked about first, because this one is already accounted for: the deadline is
 		// the caller's own and it has run out, so the caller is about to stop waiting
