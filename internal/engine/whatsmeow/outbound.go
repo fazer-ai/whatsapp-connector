@@ -591,7 +591,8 @@ func retrieveOverHTTP(ctx context.Context, address string, headers map[string]st
 		// caller holds the only copy of what it wanted to send. Reported as `internal`
 		// because the contract has no code for a dependency the caller itself named
 		// being down, and of the codes it does have this is the only retryable one that
-		// is not a lie about who timed out. The message says whose fault it actually is.
+		// is not a lie about who timed out. The message says whose fault it actually is,
+		// and the missing code is issue #26.
 		return source{}, protocol.NewError(protocol.ErrorInternal,
 			fmt.Sprintf("could not fetch the file to send: %v", err))
 	}
@@ -624,7 +625,7 @@ func statusFailure(status int) error {
 	case status >= 500:
 		// `internal` for the same reason as the unreachable case above: retryable, and
 		// the contract has nothing that says the caller's own server is having a bad
-		// minute.
+		// minute (#26).
 		return protocol.NewError(protocol.ErrorInternal,
 			"the address of the file to send answered "+strconv.Itoa(status))
 	default:
