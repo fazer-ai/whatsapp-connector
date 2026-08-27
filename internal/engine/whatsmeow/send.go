@@ -78,7 +78,6 @@ func (s *Session) send(ctx context.Context, command *protocol.Command) (json.Raw
 	// payload this connector can never send is the caller's bug whatever the socket is
 	// doing, and answering `not_connected` to one sends it away to wait for a
 	// connection that would not have helped.
-	client := s.current()
 	alongside, err := contextToSend(&req, s.ownJID(to), to)
 	if err != nil {
 		return nil, err
@@ -88,22 +87,8 @@ func (s *Session) send(ctx context.Context, command *protocol.Command) (json.Raw
 		return nil, err
 	}
 
-	if phone, _ := s.identity(); phone == "" {
-		// Asked before the socket, because an unpaired session is never connected and
-		// the two answers send a client down different roads: one pairs an account, the
-		// other waits for a connection to come back. Answering `not_connected` to a
-		// session that has no account leaves it waiting for something nothing is going
-		// to do.
-		return nil, protocol.NewError(protocol.ErrorNotPaired, "this session has no WhatsApp account to send from")
-	}
-	if s.state() != "open" {
-		// The session's own state, not whatsmeow's. IsConnected takes the socket lock,
-		// which a dial holds for its whole handshake, so a send that arrived during a
-		// resume would wait there without watching its own deadline and hold the
-		// session's queue behind it. It also goes true when the websocket opens and
-		// before the account is authenticated, which is a send onto a stream WhatsApp
-		// has not accepted yet.
-		return nil, protocol.NewError(protocol.ErrorNotConnected, "the session is not connected to WhatsApp")
+	if err := s.readyToSend(); err != nil {
+		return nil, err
 	}
 
 	if plan != nil {
@@ -118,9 +103,9 @@ func (s *Session) send(ctx context.Context, command *protocol.Command) (json.Raw
 		}
 	}
 
-	sent, err := client.SendMessage(ctx, to, message, wm.SendRequestExtra{ID: req.MessageID})
+	sent, err := s.putOnTheWire(ctx, to, req.MessageID, message)
 	if err != nil {
-		return nil, sendFailure(err)
+		return nil, err
 	}
 
 	return json.Marshal(map[string]any{
@@ -128,6 +113,45 @@ func (s *Session) send(ctx context.Context, command *protocol.Command) (json.Raw
 		"timestamp":  sent.Timestamp.UnixMilli(),
 		"client_ref": req.ClientRef,
 	})
+}
+
+// readyToSend refuses a session that cannot put anything on the wire, and the order of
+// the two questions is the answer to a different one each.
+func (s *Session) readyToSend() error {
+	if phone, _ := s.identity(); phone == "" {
+		// Asked before the socket, because an unpaired session is never connected and
+		// the two answers send a client down different roads: one pairs an account, the
+		// other waits for a connection to come back. Answering `not_connected` to a
+		// session that has no account leaves it waiting for something nothing is going
+		// to do.
+		return protocol.NewError(protocol.ErrorNotPaired, "this session has no WhatsApp account to send from")
+	}
+	if s.state() != "open" {
+		// The session's own state, not whatsmeow's. IsConnected takes the socket lock,
+		// which a dial holds for its whole handshake, so a send that arrived during a
+		// resume would wait there without watching its own deadline and hold the
+		// session's queue behind it. It also goes true when the websocket opens and
+		// before the account is authenticated, which is a send onto a stream WhatsApp
+		// has not accepted yet.
+		return protocol.NewError(protocol.ErrorNotConnected, "the session is not connected to WhatsApp")
+	}
+	return nil
+}
+
+// putOnTheWire hands a built message to WhatsApp under the id the caller named.
+//
+// The id is the caller's on purpose: WhatsApp uses it as the stanza id, so a message that
+// went out and lost its reply can be sent again under the same one and the receiving
+// client discards the second copy. That is the one retry that cannot duplicate anything,
+// and it is why every command that creates a message carries an id of its own.
+func (s *Session) putOnTheWire(
+	ctx context.Context, to waTypes.JID, messageID string, message *waE2E.Message,
+) (wm.SendResponse, error) {
+	sent, err := s.current().SendMessage(ctx, to, message, wm.SendRequestExtra{ID: messageID})
+	if err != nil {
+		return wm.SendResponse{}, sendFailure(err)
+	}
+	return sent, nil
 }
 
 // textToSend renders the text and whatever rides along with it.

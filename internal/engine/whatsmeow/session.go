@@ -1098,6 +1098,12 @@ func (s *Session) Execute(ctx context.Context, command *protocol.Command) (json.
 		return nil, s.requestCode(ctx, command)
 	case protocol.CommandMessageSend:
 		return s.send(ctx, command)
+	case protocol.CommandMessageEdit:
+		return s.edit(ctx, command)
+	case protocol.CommandMessageRevoke:
+		return s.revoke(ctx, command)
+	case protocol.CommandMessageReact:
+		return s.react(ctx, command)
 	case protocol.CommandMessageDownloadMedia:
 		return s.downloadMedia(ctx, command)
 	}
