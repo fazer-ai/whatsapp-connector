@@ -981,6 +981,13 @@ func followingRedirects(headers map[string]string) func(*http.Request, []*http.R
 			for name := range headers {
 				hop.Header.Del(name)
 			}
+			// And the one net/http adds by itself. It fills Referer with the whole
+			// previous URL, query and all, and the previous URL is the signed one: the
+			// credential this was careful not to put in a message would arrive at the
+			// redirect's destination and in its access log. Deleted here rather than
+			// prevented, because the client sets it just before calling this
+			// (net/http/client.go:696, then 699).
+			hop.Header.Del("Referer")
 		}
 		return nil
 	}

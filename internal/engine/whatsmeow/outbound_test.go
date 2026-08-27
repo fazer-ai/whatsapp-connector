@@ -1667,3 +1667,34 @@ func TestTheReferencesOwnSizeIsHeldToAsWell(t *testing.T) {
 	})
 	assertCode(t, err, protocol.ErrorInternal)
 }
+
+// net/http fills Referer with the whole previous URL, query and all, and the previous URL
+// is the signed one. It skips the header on an https-to-http downgrade and on nothing
+// else, so a cross-origin hop carries the credential this connector was careful not to
+// put in a message into the destination's access log.
+func TestTheSignedAddressDoesNotFollowTheRedirectAsAReferer(t *testing.T) {
+	t.Parallel()
+
+	const signed = "https://storage.example/bucket/file.pdf?X-Amz-Signature=deadbeefcafe"
+	hop := requestTo(t, "https://elsewhere.example/file.pdf", nil)
+	// What the client itself does just before calling the policy.
+	hop.Header.Set("Referer", signed)
+
+	if err := followingRedirects(nil)(hop, []*http.Request{requestTo(t, signed, nil)}); err != nil {
+		t.Fatalf("the hop was refused: %v", err)
+	}
+	if got := hop.Header.Get("Referer"); got != "" {
+		t.Fatalf("the signed address followed the redirect as a Referer: %q", got)
+	}
+
+	// On the same origin it is somebody's own log about their own URL, and removing it
+	// would be this connector rewriting an ordinary request for no gain.
+	same := requestTo(t, "https://storage.example/bucket/other.pdf", nil)
+	same.Header.Set("Referer", signed)
+	if err := followingRedirects(nil)(same, []*http.Request{requestTo(t, signed, nil)}); err != nil {
+		t.Fatalf("the hop was refused: %v", err)
+	}
+	if got := same.Header.Get("Referer"); got != signed {
+		t.Fatalf("a hop on the same origin lost its Referer: %q", got)
+	}
+}
