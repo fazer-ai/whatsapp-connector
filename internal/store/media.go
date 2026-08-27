@@ -144,6 +144,11 @@ func (c *Container) MediaPart(ctx context.Context, sid, messageID string) (Media
 	return part, true, nil
 }
 
+// mediaSweepBatch is how many rows one delete takes. Small enough that the pause it
+// puts on the rest of the store is short, large enough that a week of a busy account is
+// a handful of statements rather than a thousand.
+const mediaSweepBatch = 500
+
 // SweepMediaParts drops what was kept for messages older than the cutoff, and reports
 // how many rows went.
 //
@@ -152,19 +157,46 @@ func (c *Container) MediaPart(ctx context.Context, sid, messageID string) (Media
 // rather than a cache one -- see MediaRefetch in the app config for why it is the length
 // it is.
 func (c *Container) SweepMediaParts(ctx context.Context, before time.Time) (int64, error) {
-	result, err := c.db.ExecContext(ctx,
-		c.rebind(`DELETE FROM wac_media_part WHERE stored_at < ?`), before.UnixMilli())
-	if err != nil {
-		return 0, fmt.Errorf("store: drop the media parts kept past their retention: %w", err)
+	var dropped int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return dropped, err
+		}
+		// One batch per statement, rather than the backlog in one. On SQLite the whole
+		// connector shares a single connection, so a delete is not something the rest of
+		// the process waits out politely: an instance coming back after a long outage
+		// sweeps on its way in, which is exactly when sessions are being adopted on a
+		// five-second budget, and a backlog large enough to outlast it would fail the
+		// adoption and publish media with nothing filed to fetch it again. Batching is
+		// the whole fix and a deadline is not needed on top of it: the pool hands the
+		// connection to the waiter that queued first, so work that arrives mid-sweep is
+		// served in the gap between two statements instead of after all of them.
+		//
+		// Written as a subquery because neither dialect takes a LIMIT on DELETE itself,
+		// and the row-value IN below is the form both of them do take.
+		result, err := c.db.ExecContext(ctx, c.rebind(
+			`DELETE FROM wac_media_part WHERE (sid, message_id) IN (
+                            SELECT sid, message_id FROM wac_media_part WHERE stored_at < ? LIMIT ?)`),
+			before.UnixMilli(), mediaSweepBatch)
+		if err != nil {
+			return dropped, fmt.Errorf("store: drop the media parts kept past their retention: %w", err)
+		}
+		batch, err := result.RowsAffected()
+		if err != nil {
+			// The delete went through; only the count did not come back. Both drivers
+			// this connector uses report it, and the interface allows not to, so a sweep
+			// that worked is not turned into a failure over how much it says it did.
+			// It does end the pass, though: without a count there is no way to tell a
+			// batch that emptied the backlog from one that filled itself, and looping on
+			// the guess is how this becomes a delete that never returns. Whatever is
+			// left waits for the next tick.
+			return dropped, nil //nolint:nilerr // the statement succeeded, only its count is missing
+		}
+		dropped += batch
+		if batch < mediaSweepBatch {
+			return dropped, nil
+		}
 	}
-	dropped, err := result.RowsAffected()
-	if err != nil {
-		// The delete went through; only the count did not come back. Both drivers this
-		// connector uses report it, and the interface allows not to, so a sweep that
-		// worked is not turned into a failure over how much it says it did.
-		return 0, nil //nolint:nilerr // the statement succeeded, only its count is missing
-	}
-	return dropped, nil
 }
 
 // Keys and digests are kept base64 rather than as bytes: the column is then TEXT in both

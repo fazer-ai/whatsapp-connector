@@ -60,6 +60,13 @@ type Connector struct {
 	// reclaimCursor is where the next reclaim pass starts. Read and written only by the
 	// loop goroutine, which is also the only one that reclaims.
 	reclaimCursor int
+
+	// partSwept is signalled after every completed pass of the refetch sweep, and only
+	// the tests set it. What they have to know is that the loop made its pass, and the
+	// two ways of learning that without a signal are both wrong: polling the table on a
+	// clock is the wall-clock synchronisation AGENTS.md rules out, and calling one pass
+	// directly stops exercising the loop, which is the thing under test.
+	partSwept chan<- struct{}
 }
 
 // New builds a connector: it dials Redis, agrees with the fleet on the shard count,
@@ -360,6 +367,14 @@ func (c *Connector) sweepMediaParts(ctx context.Context) <-chan struct{} {
 			// does not need this because its cadence tops out at a minute.
 			if done := c.sweepPartsOnce(ctx); done {
 				return
+			}
+			if c.partSwept != nil {
+				// Never blocking: a listener that has stopped reading must not be able
+				// to hold the sweep still.
+				select {
+				case c.partSwept <- struct{}{}:
+				default:
+				}
 			}
 			select {
 			case <-ctx.Done():

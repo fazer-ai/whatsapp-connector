@@ -23,31 +23,30 @@ func TestTheRefetchSweepRunsBeforeItsFirstTick(t *testing.T) {
 	container := openTestStore(t)
 	seedExpiredPart(t, container, "sid-1", "3EB0OLD")
 
+	passes := make(chan struct{}, 1)
 	connector := &Connector{
-		cfg:   Config{MediaRefetch: DefaultMediaRefetch},
-		log:   zerolog.Nop(),
-		store: container,
+		cfg:       Config{MediaRefetch: DefaultMediaRefetch},
+		log:       zerolog.Nop(),
+		store:     container,
+		partSwept: passes,
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	swept := connector.sweepMediaParts(ctx)
 
-	// The first tick of this sweeper is an hour away, so anything that happens inside
-	// the next few seconds is the pass the loop makes on its way in and nothing else.
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		_, found, err := container.MediaPart(t.Context(), "sid-1", "3EB0OLD")
-		if err != nil {
-			t.Fatalf("MediaPart: %v", err)
-		}
-		if !found {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("a row past its retention was still there long after the sweeper started, " +
-				"and its first tick is an hour away")
-		}
-		time.Sleep(10 * time.Millisecond)
+	// Awaited rather than polled for: the first tick of this sweeper is an hour away, so
+	// the only pass that can arrive here is the one the loop makes on its way in.
+	select {
+	case <-passes:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the sweeper made no pass at all, and its first tick is an hour away")
+	}
+	_, found, err := container.MediaPart(t.Context(), "sid-1", "3EB0OLD")
+	if err != nil {
+		t.Fatalf("MediaPart: %v", err)
+	}
+	if found {
+		t.Fatal("the pass the loop makes on its way in left a row past its retention behind")
 	}
 
 	cancel()
