@@ -2,6 +2,7 @@ package whatsmeow
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
@@ -378,6 +379,9 @@ func planMedia(content *outboundContent, limit int64) (*mediaPlan, error) {
 	if err := sendableHeaders(content.Ref.Headers); err != nil {
 		return nil, err
 	}
+	if err := matchable(content.Ref.SHA256); err != nil {
+		return nil, err
+	}
 	thumbnail, err := thumbnailBytes(content.Thumbnail, content.Kind)
 	if err != nil {
 		return nil, err
@@ -429,7 +433,14 @@ func (s *Session) mediaToSend(
 	// And the half whatsmeow hides: it pads and encrypts whatever it managed to read, so
 	// a body that ended early is a perfectly valid upload of the wrong file and there is
 	// nowhere earlier than here to notice.
+	// Both claims, because they are made by different parties about the same bytes: the
+	// caller says what it stored and the address says what it is sending. A stale blob
+	// served with a Content-Length that agrees with itself passes the second and fails
+	// the first.
 	if err := allOfIt(file.size, &uploaded); err != nil {
+		return nil, err
+	}
+	if err := allOfIt(content.Size, &uploaded); err != nil {
 		return nil, err
 	}
 	if err := theSameFile(content.Ref.SHA256, &uploaded); err != nil {
@@ -487,13 +498,14 @@ func sourceStopped(err error) error {
 // the reader as a clean end of stream and is uploaded as a whole file. Sent as it stands,
 // the recipient gets a file that is half there and the sender is told it worked.
 func allOfIt(declared int64, uploaded *wm.UploadResponse) error {
-	if declared < 0 {
-		// A chunked response says nothing up front, and there is nothing to compare.
+	if declared <= 0 {
+		// Nothing was claimed: a chunked response says nothing up front, and the
+		// contract makes the caller's own size optional.
 		return nil
 	}
 	if sent := int64(uploaded.FileLength); sent != declared { //nolint:gosec // a length this side counted
 		return protocol.NewError(protocol.ErrorInternal,
-			fmt.Sprintf("the address of the file to send promised %d bytes and delivered %d", declared, sent))
+			fmt.Sprintf("the file to send was said to be %d bytes and %d arrived", declared, sent))
 	}
 	return nil
 }
@@ -566,6 +578,25 @@ func fetchable(ref *protocol.MediaRef) (string, error) {
 			fmt.Sprintf("%s names no host to fetch from", safeAddress(ref.URL)))
 	}
 	return ref.URL, nil
+}
+
+// matchable refuses a digest no file could ever hash to.
+//
+// Checked here rather than where it is compared, which is after the file has been fetched
+// and uploaded: a digest of the wrong length can only ever fail, so leaving it until then
+// spends a transfer of up to the whole send limit and leaves an upload on WhatsApp that
+// nothing will ever refer to. And the answer is different -- a mismatch is the address
+// serving the wrong file, while this is the caller's own payload.
+func matchable(digest string) error {
+	if digest == "" {
+		// The contract makes it optional, and most references travel without one.
+		return nil
+	}
+	if _, err := hex.DecodeString(digest); err != nil || len(digest) != sha256.Size*2 {
+		return protocol.NewError(protocol.ErrorInvalidPayload,
+			fmt.Sprintf("%q is not a SHA-256 any file could hash to", digest))
+	}
+	return nil
 }
 
 // sendableHeaders refuses a header the HTTP client would refuse anyway.

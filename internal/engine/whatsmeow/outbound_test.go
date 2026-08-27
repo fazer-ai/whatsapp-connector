@@ -1529,3 +1529,68 @@ func TestANameReadOffACardComesBackUnescaped(t *testing.T) {
 		t.Fatalf("a name written and read back came out %q, want %q", got, name)
 	}
 }
+
+// The caller says what it stored and the address says what it is sending, and they are
+// two parties making a claim about the same bytes. A stale blob served with a
+// Content-Length that agrees with itself satisfies the second and not the first, so
+// checking only the transport's number sends a shortened file and reports success.
+func TestAFileSmallerThanTheCallerSaidIsNotSentAsWhatWasAskedFor(t *testing.T) {
+	t.Parallel()
+
+	const stale = "metade do arquivo"
+	session, serving, _ := outboundSession(t)
+	// Self-consistent on the wire: the server declares exactly what it sends.
+	serving.answer([]byte(stale), "image/jpeg")
+
+	_, err := session.send(t.Context(), &protocol.Command{
+		Type: protocol.CommandMessageSend,
+		Payload: json.RawMessage(`{"message_id":"3EB0","to":{"kind":"phone","id":"5511999990001"},
+			"content":{"type":"media","kind":"image","size":4096,
+			"ref":{"kind":"url","url":"http://rails:3000/blob.jpg"}}}`),
+	})
+	assertCode(t, err, protocol.ErrorInternal)
+
+	// And a caller that said nothing is not held to a number it never gave.
+	session, serving, _ = outboundSession(t)
+	serving.answer([]byte(stale), "image/jpeg")
+	message := mustSendBody(t, session, `{"message_id":"3EB0","to":{"kind":"phone","id":"5511999990001"},
+		"content":{"type":"media","kind":"image","ref":{"kind":"url","url":"http://rails:3000/blob.jpg"}}}`)
+	if message.GetImageMessage() == nil {
+		t.Fatal("a send that declared no size was refused for not matching one")
+	}
+}
+
+// A digest of the wrong length can only ever fail, so leaving it until the comparison
+// spends a transfer of up to the whole send limit and leaves an upload on WhatsApp that
+// nothing will ever refer to.
+func TestADigestNoFileCouldMatchIsRefusedBeforeTheTransfer(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct{ name, digest string }{
+		{"too short", "abc123"},
+		{"too long", strings.Repeat("ab", 33)},
+		{"not hexadecimal", strings.Repeat("z", 64)},
+		{"a base64 digest, which is somebody else's encoding", "3q2+7wAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			session, serving, uploads := outboundSession(t)
+			serving.answer([]byte("bytes"), "")
+
+			_, err := session.send(t.Context(), &protocol.Command{
+				Type: protocol.CommandMessageSend,
+				Payload: json.RawMessage(`{"message_id":"3EB0","to":{"kind":"phone","id":"5511999990001"},
+					"content":{"type":"media","kind":"image","ref":{"kind":"url",
+					"url":"http://rails:3000/blob.jpg","sha256":"` + tc.digest + `"}}}`),
+			})
+			// The caller's own payload, not the address serving the wrong file, so the
+			// answer is not the one a mismatch gets.
+			assertCode(t, err, protocol.ErrorInvalidPayload)
+			if serving.count() != 0 || uploads.count() != 0 {
+				t.Fatalf("a digest nothing could match still cost %d fetch(es) and %d upload(s)",
+					serving.count(), uploads.count())
+			}
+		})
+	}
+}
