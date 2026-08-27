@@ -1582,6 +1582,13 @@ func TestANameReadOffACardComesBackUnescaped(t *testing.T) {
 // two parties making a claim about the same bytes. A stale blob served with a
 // Content-Length that agrees with itself satisfies the second and not the first, so
 // checking only the transport's number sends a shortened file and reports success.
+//
+// And the two disagreements are answered differently, because they are different events.
+// The transport's own number not adding up is a transfer that stopped, and the next one
+// may carry the whole file. The caller's number not matching what the address serves is
+// two records of the same file disagreeing, which the next fetch reproduces exactly:
+// answered as a truncation it costs the fetch and the upload again for as long as the
+// caller keeps the message, and answers the same thing every time.
 func TestAFileSmallerThanTheCallerSaidIsNotSentAsWhatWasAskedFor(t *testing.T) {
 	t.Parallel()
 
@@ -1596,7 +1603,7 @@ func TestAFileSmallerThanTheCallerSaidIsNotSentAsWhatWasAskedFor(t *testing.T) {
 			"content":{"type":"media","kind":"image","size":4096,
 			"ref":{"kind":"url","url":"http://rails:3000/blob.jpg"}}}`),
 	})
-	assertCode(t, err, protocol.ErrorInternal)
+	assertCode(t, err, protocol.ErrorMediaUnavailable)
 
 	// And a caller that said nothing is not held to a number it never gave.
 	session, serving, _ = outboundSession(t)
@@ -1716,7 +1723,9 @@ func TestTheReferencesOwnSizeIsHeldToAsWell(t *testing.T) {
 			"content":{"type":"media","kind":"image",
 			"ref":{"kind":"url","url":"http://rails:3000/blob.jpg","size":4096}}}`),
 	})
-	assertCode(t, err, protocol.ErrorInternal)
+	// The reference's number is the same kind of claim as the caller's, and gets the
+	// same answer: not a transfer that stopped, and not worth another one.
+	assertCode(t, err, protocol.ErrorMediaUnavailable)
 }
 
 // net/http fills Referer with the whole previous URL, query and all, and the previous URL
@@ -2083,6 +2092,17 @@ func TestAStickerAndAVoiceNoteAreLabelledWithWhatTheyCanOnlyBe(t *testing.T) {
 		{"a document the caller calls a stream of bytes, named by its extension",
 			`"kind":"document","filename":"a.pdf","mime":"application/octet-stream"`,
 			"", "", "application/pdf"},
+		// Nor is one that cannot be read a claim. Passed on it reaches WhatsApp as a type
+		// it cannot parse, and ahead of the kind's own it is the voice note losing its
+		// codec by a third route. Two shapes, because Go's parser fails at two depths:
+		// a parameter it cannot read, where the base type is still there to be had, and
+		// a type that is not one at all.
+		{"a voice note whose type has a parameter that will not parse",
+			`"kind":"audio","voice_note":true,"mime":"audio/ogg; codecs"`, "", "", "audio/ogg; codecs=opus"},
+		{"a document with one, falling through to its extension",
+			`"kind":"document","filename":"a.pdf","mime":"application/pdf; ="`, "", "", "application/pdf"},
+		{"a type that is not one, with nothing left to go on",
+			`"kind":"document","mime":"audio ogg"`, "", "", "application/octet-stream"},
 		// And a stated type that names a different format is information, not something
 		// to correct.
 		{"a sticker the caller says is a PNG", `"kind":"sticker","mime":"image/png"`, "", "", "image/png"},
@@ -2304,5 +2324,28 @@ func TestTheFetchTransportDoesNotProxy(t *testing.T) {
 
 	if fetchTransport.Proxy != nil {
 		t.Fatal("the fetch proxies, so what it refuses is the proxy's address")
+	}
+}
+
+// whatsmeow answers ErrBroadcastListUnsupported for every broadcast list but
+// status@broadcast, so the send is refused whatever it carries. For a file it is refused
+// after the fetch and the upload: up to WAC_MEDIA_SEND_MAX moved for a message that could
+// never go out, and an upload left on WhatsApp that nothing will ever refer to.
+func TestAFileForABroadcastListIsRefusedBeforeItIsFetched(t *testing.T) {
+	t.Parallel()
+
+	session, serving, uploads := outboundSession(t)
+	serving.answer([]byte("bytes"), "image/jpeg")
+
+	_, err := session.send(t.Context(), &protocol.Command{
+		Type: protocol.CommandMessageSend,
+		Payload: json.RawMessage(`{"message_id":"3EB0","to":{"kind":"broadcast","id":"120363000000000000"},
+			"content":{"type":"media","kind":"image",
+			"ref":{"kind":"url","url":"http://rails:3000/blob.jpg"}}}`),
+	})
+	assertCode(t, err, protocol.ErrorUnsupported)
+	if serving.count() != 0 || uploads.count() != 0 {
+		t.Fatalf("a message that could never go out cost %d fetch(es) and %d upload(s)",
+			serving.count(), uploads.count())
 	}
 }

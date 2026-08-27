@@ -166,6 +166,17 @@ func planBody(req *sendRequest, alongside *waE2E.ContextInfo, limit int64) (*waE
 		message, err := contactsToSend(&content, alongside)
 		return message, nil, err
 	case "media":
+		if req.To.Kind == protocol.AddressBroadcast {
+			// whatsmeow serves a broadcast list from getBroadcastListParticipants, which
+			// answers ErrBroadcastListUnsupported for everything but status@broadcast.
+			// The send is therefore refused whatever it carries, and sendFailure already
+			// says so -- but for a file it says so after the fetch and the upload, which
+			// is up to WAC_MEDIA_SEND_MAX moved for a message that could never go out,
+			// and an upload on WhatsApp nothing will ever refer to. The same answer,
+			// before the transfer.
+			return nil, nil, protocol.NewError(protocol.ErrorUnsupported,
+				"this connector cannot send to a broadcast list yet")
+		}
 		if req.To.Kind == protocol.AddressNewsletter {
 			// A newsletter takes its media unencrypted, through a different upload call,
 			// and the message has to carry the handle that upload answers with. Sent the
@@ -558,10 +569,10 @@ func (s *Session) mediaToSend(
 	if err := allOfIt(file.size, &uploaded); err != nil {
 		return nil, err
 	}
-	if err := allOfIt(content.Size, &uploaded); err != nil {
+	if err := theSameSize(content.Size, &uploaded, "the file to send is"); err != nil {
 		return nil, err
 	}
-	if err := allOfIt(content.Ref.Size, &uploaded); err != nil {
+	if err := theSameSize(content.Ref.Size, &uploaded, "the reference names a file of"); err != nil {
 		return nil, err
 	}
 	if err := theSameFile(content.Ref.SHA256, &uploaded); err != nil {
@@ -642,7 +653,8 @@ func sourceStopped(err error) error {
 		fmt.Sprintf("the file to send stopped arriving partway through: %s", whyUnreachable(err)))
 }
 
-// allOfIt refuses an upload of less than the address said it was sending.
+// allOfIt refuses an upload of less than the address said in its own Content-Length it
+// was sending.
 //
 // It catches what the reader cannot: cbcutil.EncryptStream treats io.ErrUnexpectedEOF
 // exactly like io.EOF, so a body that ended early against its own Content-Length reaches
@@ -650,13 +662,36 @@ func sourceStopped(err error) error {
 // the recipient gets a file that is half there and the sender is told it worked.
 func allOfIt(declared int64, uploaded *wm.UploadResponse) error {
 	if declared <= 0 {
-		// Nothing was claimed: a chunked response says nothing up front, and the
-		// contract makes the caller's own size optional.
+		// Nothing was claimed: a chunked response says nothing up front.
 		return nil
 	}
 	if sent := int64(uploaded.FileLength); sent != declared { //nolint:gosec // a length this side counted
+		// Retryable, and it is the one of the three that is: what the address said it
+		// was sending and what arrived disagree, which is a transfer that stopped, and
+		// the next one may well carry the whole file.
 		return protocol.NewError(protocol.ErrorInternal,
 			fmt.Sprintf("the file to send was said to be %d bytes and %d arrived", declared, sent))
+	}
+	return nil
+}
+
+// theSameSize refuses bytes that are not the size the caller or its reference named.
+//
+// The same disagreement as theSameFile and answered the same way, because it is the same
+// question asked with a cheaper claim: what somebody said the file is, against what the
+// address served. Neither is a transfer that stopped -- the address served all it meant
+// to, and the length it declared was honoured -- so neither is worth another fetch and
+// another upload. Answered as a truncation it is exactly that, every time the caller
+// keeps the message, and the answer never changes.
+func theSameSize(declared int64, uploaded *wm.UploadResponse, whose string) error {
+	if declared <= 0 {
+		// The contract makes both of these optional, and most references travel without
+		// either.
+		return nil
+	}
+	if sent := int64(uploaded.FileLength); sent != declared { //nolint:gosec // a length this side counted
+		return protocol.NewError(protocol.ErrorMediaUnavailable,
+			fmt.Sprintf("%s %d bytes and the address served %d", whose, declared, sent))
 	}
 	return nil
 }
@@ -890,11 +925,9 @@ func mimeToSend(content *mediaContent, served string) string {
 			return guessed
 		}
 	}
-	if served != "" {
-		// Unparseable or the generic type, and nothing better was found: repeated as it
-		// stands, because it is still what the server said the bytes are.
-		return served
-	}
+	// Nothing said anything a recipient could use: everything above was empty, generic,
+	// or unreadable, and the last of those is not repeated -- what the server said is
+	// only worth passing on while it can be read.
 	return "application/octet-stream"
 }
 
@@ -922,12 +955,14 @@ func canonical(stated, only string) string {
 // described as a stream of bytes, which WhatsApp drops without a word -- the same failure
 // the codec parameter causes, by the other end of the same ladder.
 //
-// An unparseable one is not this: it is somebody saying something that cannot be read,
-// and what to do with it is decided further down, where the kind and the extension have
-// had their turn.
+// One that will not parse says nothing either, and is worse: `audio/ogg;` reaches
+// WhatsApp as a type it cannot read, and passed on ahead of the kind's own it is a voice
+// note that goes out without its codec by another route. Skipped rather than refused,
+// because the ladder below has a real answer for it -- the kind, then the extension --
+// and refusing the send would drop an attachment over a trailing semicolon.
 func unknownType(stated string) bool {
 	base, _, err := mime.ParseMediaType(stated)
-	return stated == "" || (err == nil && base == "application/octet-stream")
+	return stated == "" || err != nil || base == "application/octet-stream"
 }
 
 // sameFormat reports whether a type the kind guarantees describes the same format as one
