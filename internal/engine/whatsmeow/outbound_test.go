@@ -1930,3 +1930,67 @@ func TestAStackOfCardsIsLabelledWithWhoIsInIt(t *testing.T) {
 		})
 	}
 }
+
+// The caller's own address is checked before anything is fetched, and a redirect is that
+// address asking for somewhere else one step later. Left to net/http, the refusal arrives
+// as an error this side reads as worth retrying, and the same reference redirects the
+// same way every time.
+func TestARedirectSomewhereThisConnectorDoesNotFetchFromIsRefused(t *testing.T) {
+	t.Parallel()
+
+	for _, target := range []string{
+		"file:///etc/passwd",
+		"ftp://storage.example/f.pdf",
+		"gopher://storage.example/f.pdf",
+	} {
+		t.Run(target, func(t *testing.T) {
+			t.Parallel()
+
+			sending := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				// Written by hand: http.Redirect would not object either, and what is
+				// under test is this connector's own policy.
+				w.Header().Set("Location", target)
+				w.WriteHeader(http.StatusFound)
+			}))
+			t.Cleanup(sending.Close)
+
+			_, err := retrieveOverHTTP(t.Context(), sending.URL+"/f.pdf", nil)
+			assertCode(t, err, protocol.ErrorInvalidPayload)
+		})
+	}
+}
+
+// And the same check on the address the caller wrote, which is where it started.
+func TestOnlyAnHTTPAddressIsFetchedFrom(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name    string
+		address string
+		ok      bool
+	}{
+		{"http", "http://storage.example/f.pdf", true},
+		{"https", "https://storage.example/f.pdf", true},
+		{"a file on this instance's disk", "file:///etc/passwd", false},
+		{"another protocol entirely", "ftp://storage.example/f.pdf", false},
+		{"no host", "http:///f.pdf", false},
+		{"no scheme", "//storage.example/f.pdf", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			parsed, err := url.Parse(tc.address)
+			if err != nil {
+				t.Fatalf("Parse(%q): %v", tc.address, err)
+			}
+			switch err := overHTTP(parsed); {
+			case tc.ok && err != nil:
+				t.Fatalf("%q was refused: %v", tc.address, err)
+			case !tc.ok && err == nil:
+				t.Fatalf("%q was accepted", tc.address)
+			case !tc.ok && !errors.Is(err, errNotOverHTTP):
+				t.Fatalf("%q was refused with %v, which the fetch cannot classify", tc.address, err)
+			}
+		})
+	}
+}

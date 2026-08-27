@@ -717,17 +717,33 @@ func fetchable(ref *protocol.MediaRef) (string, error) {
 		return "", protocol.NewError(protocol.ErrorInvalidPayload,
 			"that reference is not an address")
 	}
-	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		// A `file:` URL would have this instance read its own disk and send whatever is
-		// at that path, which is not something a message body should be able to ask for.
-		return "", protocol.NewError(protocol.ErrorInvalidPayload,
-			fmt.Sprintf("%q is not an address this connector fetches over", parsed.Scheme))
-	}
-	if parsed.Host == "" {
-		return "", protocol.NewError(protocol.ErrorInvalidPayload,
-			fmt.Sprintf("%s names no host to fetch from", safeAddress(ref.URL)))
+	if err := overHTTP(parsed); err != nil {
+		return "", protocol.NewError(protocol.ErrorInvalidPayload, err.Error())
 	}
 	return ref.URL, nil
+}
+
+// errNotOverHTTP is an address this connector does not fetch over. Deterministic, so it
+// is the caller's reference to fix rather than something to try again -- which matters on
+// a redirect, where the alternative is net/http refusing it as an error this side reports
+// as retryable and the same reference is retried for as long as the caller keeps the
+// message.
+var errNotOverHTTP = errors.New("whatsmeow: that is not an address this connector fetches over")
+
+// overHTTP is what makes an address one a file can be fetched from, checked on the
+// caller's own URL and again on every hop it redirects to.
+//
+// A `file:` URL would have this instance read its own disk and send whatever is at that
+// path, which is not something a message body should be able to ask for, and a redirect
+// is a message body asking for it one step later.
+func overHTTP(address *url.URL) error {
+	if address.Scheme != "http" && address.Scheme != "https" {
+		return fmt.Errorf("%w: %q", errNotOverHTTP, address.Scheme)
+	}
+	if address.Host == "" {
+		return fmt.Errorf("%w: it names no host", errNotOverHTTP)
+	}
+	return nil
 }
 
 // matchable refuses a digest no file could ever hash to.
@@ -1058,6 +1074,12 @@ func retrieveOverHTTP(ctx context.Context, address string, headers map[string]st
 	client := &http.Client{CheckRedirect: followingRedirects(headers)}
 	answer, err := client.Do(request)
 	switch {
+	case errors.Is(err, errNotOverHTTP):
+		// The caller's address redirected somewhere this connector does not fetch from.
+		// Left to net/http, the refusal arrives as an error this side reads as worth
+		// retrying, and the same reference redirects the same way every time.
+		return source{}, protocol.NewError(protocol.ErrorInvalidPayload,
+			"the address of the file to send redirects somewhere this connector cannot fetch from")
 	case errors.Is(err, errTooManyRedirects):
 		// Deterministic: the same reference redirects the same way every time, so this is
 		// the caller's address to fix and not a minute to wait out. Reported as retryable
@@ -1111,6 +1133,9 @@ func followingRedirects(headers map[string]string) func(*http.Request, []*http.R
 		// constant says.
 		if len(via) > fetchRedirects {
 			return errTooManyRedirects
+		}
+		if err := overHTTP(hop.URL); err != nil {
+			return err
 		}
 		// net/http drops Authorization, Cookie and WWW-Authenticate of its own accord
 		// when a redirect leaves the host, and nothing else: a reference authenticated
