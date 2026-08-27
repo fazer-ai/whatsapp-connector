@@ -51,6 +51,15 @@ const (
 	// cap the Chatwoot side downloads with, so a file this refuses is one that would
 	// have been refused on arrival anyway.
 	DefaultMaxBlob int64 = 100 << 20
+	// DefaultSendMax is the largest file this connector will send. It is not a property
+	// of the cache and nothing here reads it: it lives beside the blob caps because it
+	// is the same decision seen from the other direction, and a deployment that raises
+	// one and forgets the other ends up accepting a file it cannot send back.
+	//
+	// WhatsApp's own ceiling is per type and moves on its own schedule. A file past it
+	// is refused by WhatsApp with an answer the caller is told, which is a better place
+	// to learn it than a table in here that goes stale.
+	DefaultSendMax int64 = 100 << 20
 )
 
 // ErrNotFound is what a blob that is not here answers with. It is the ordinary case

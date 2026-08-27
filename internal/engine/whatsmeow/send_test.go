@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	wm "go.mau.fi/whatsmeow"
+	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
 	waTypes "go.mau.fi/whatsmeow/types"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
@@ -83,9 +84,12 @@ func TestASendThisConnectorCannotMakeIsRefusedWithItsOwnCode(t *testing.T) {
 			"content":{"type":"text","body":""}}`, protocol.ErrorInvalidPayload},
 		{"an address with no id", `{"message_id":"3EB0","to":{"kind":"phone","id":""},
 			"content":{"type":"text","body":"oi"}}`, protocol.ErrorInvalidPayload},
-		{"an image, which a later slice brings", `{"message_id":"3EB0",
-			"to":{"kind":"phone","id":"5511999990001"},"content":{"type":"media","kind":"image"}}`,
+		{"a reaction, which a later slice brings", `{"message_id":"3EB0",
+			"to":{"kind":"phone","id":"5511999990001"},"content":{"type":"reaction","emoji":"\u2764\ufe0f"}}`,
 			protocol.ErrorUnsupported},
+		{"an image naming no file to send", `{"message_id":"3EB0",
+			"to":{"kind":"phone","id":"5511999990001"},"content":{"type":"media","kind":"image"}}`,
+			protocol.ErrorInvalidPayload},
 		{"a quote that names no message", `{"message_id":"3EB0",
 			"to":{"kind":"phone","id":"5511999990001"},"content":{"type":"text","body":"oi"},
 			"quoted":{}}`, protocol.ErrorInvalidPayload},
@@ -169,9 +173,9 @@ func TestAQuoteIsAttributedToWhoeverWroteTheMessageItAnswers(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			message, err := textToSend(tc.quoted(), ownAccount, tc.to)
+			message, err := textWith(tc.quoted(), ownAccount, tc.to)
 			if err != nil {
-				t.Fatalf("textToSend: %v", err)
+				t.Fatalf("textWith: %v", err)
 			}
 			info := message.GetExtendedTextMessage().GetContextInfo()
 			if info.GetStanzaID() != "3EB0ORIGINAL" {
@@ -182,6 +186,17 @@ func TestAQuoteIsAttributedToWhoeverWroteTheMessageItAnswers(t *testing.T) {
 			}
 		})
 	}
+}
+
+// textWith renders a text message the way send does: the context that rides along is
+// built first and the body is built around it. They were one function until every other
+// outbound body needed the same context.
+func textWith(req *sendRequest, own, to waTypes.JID) (*waE2E.Message, error) {
+	alongside, err := contextToSend(req, own, to)
+	if err != nil {
+		return nil, err
+	}
+	return textToSend(req, alongside)
 }
 
 func quotingRequest(id string, fromMe bool, participant *protocol.Address) *sendRequest {
@@ -204,9 +219,9 @@ func TestABareTextGoesOutInTheShapeAPhoneWouldSendIt(t *testing.T) {
 	req := &sendRequest{MessageID: "3EB0"}
 	req.Content.Type, req.Content.Body = "text", "bom dia"
 
-	message, err := textToSend(req, ownAccount, peer)
+	message, err := textWith(req, ownAccount, peer)
 	if err != nil {
-		t.Fatalf("textToSend: %v", err)
+		t.Fatalf("textWith: %v", err)
 	}
 	if message.GetConversation() != "bom dia" {
 		t.Fatalf("a bare text went out as %+v", message)
@@ -231,9 +246,9 @@ func TestATextThatCarriesSomethingElseGoesOutWithIt(t *testing.T) {
 		FromMe      bool              `json:"from_me"`
 	}{ID: "3EB0ORIGINAL", Participant: &protocol.Address{Kind: protocol.AddressLID, ID: "167392323834034"}}
 
-	message, err := textToSend(req, ownAccount, peer)
+	message, err := textWith(req, ownAccount, peer)
 	if err != nil {
-		t.Fatalf("textToSend: %v", err)
+		t.Fatalf("textWith: %v", err)
 	}
 	extended := message.GetExtendedTextMessage()
 	if extended == nil {
@@ -342,9 +357,9 @@ func TestAQuoteOfThisAccountsOwnMessageUsesTheIdentityItWasSentUnder(t *testing.
 			session, _ := newTestSession(t, "5511999990001")
 			session.setIdentity("5511999990001", "89572297961476")
 
-			message, err := textToSend(quotingRequest("3EB0ORIGINAL", true, nil), session.ownJID(tc.to), tc.to)
+			message, err := textWith(quotingRequest("3EB0ORIGINAL", true, nil), session.ownJID(tc.to), tc.to)
 			if err != nil {
-				t.Fatalf("textToSend: %v", err)
+				t.Fatalf("textWith: %v", err)
 			}
 			got := message.GetExtendedTextMessage().GetContextInfo().GetParticipant()
 			if got != tc.want {

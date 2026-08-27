@@ -100,6 +100,11 @@ type MediaOptions struct {
 	// that instance: a URL pointing at the service in front of the fleet reaches a
 	// different one on every request and answers 404 from all but one.
 	BaseURL string
+	// SendMax is the largest file a session will send. It belongs here for the subject
+	// rather than for the store: the two are independent, and an instance given no blob
+	// root at all still sends. The zero value asks for DefaultSendMax, so an engine
+	// built without one is not an engine that refuses every file.
+	SendMax int64
 }
 
 // attachment is the media part of a message: what the contract says about the file, the
