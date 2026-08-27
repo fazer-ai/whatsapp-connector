@@ -277,11 +277,12 @@ func (c *Container) Forget(ctx context.Context, sid string) error {
 			}
 		}
 	}
-	// Before the mapping goes, so a failure here leaves a session that can still be
-	// found and swept rather than rows nothing will ever name again.
-	if err := c.forgetMediaParts(ctx, sid); err != nil {
-		return err
-	}
+	// The media parts go with the mapping, by the cascade on wac_media_part rather than
+	// by a delete here. An explicit one would only cover the case the constraint already
+	// covers -- foreign keys are on in both dialects, and whatsmeow refuses to bring its
+	// own schema up without them, so a store with them off does not boot at all -- and
+	// it would leave the case a delete cannot cover, which is a write already on its way
+	// when the mapping goes.
 	return c.unbind(ctx, sid)
 }
 
@@ -356,6 +357,14 @@ func (c *Container) migrate(ctx context.Context) error {
 		// Keys and digests are TEXT holding base64 rather than bytes: it is the same
 		// column in both dialects, and three fields of 32 bytes is not a size worth a
 		// difference in the schema for.
+		//
+		// The foreign key is what makes a row impossible for a session that is not
+		// bound, and it is doing more than tidiness. Ownership moves between instances,
+		// so the old owner's handler can still be inside a write when the session has
+		// already been unpaired here: the delete finds nothing to take, the write lands
+		// afterwards as an insert, and a session that no longer exists is left holding
+		// the key to somebody's file until the retention sweep. No ordering argument
+		// closes that -- the constraint does, by refusing the parentless row outright.
 		`CREATE TABLE IF NOT EXISTS wac_media_part (
 			sid             TEXT   NOT NULL,
 			message_id      TEXT   NOT NULL,
@@ -368,7 +377,8 @@ func (c *Container) migrate(ctx context.Context) error {
 			mime            TEXT   NOT NULL,
 			filename        TEXT   NOT NULL,
 			stored_at       BIGINT NOT NULL,
-			PRIMARY KEY (sid, message_id)
+			PRIMARY KEY (sid, message_id),
+			FOREIGN KEY (sid) REFERENCES wac_session_device (sid) ON DELETE CASCADE
 		)`,
 		// The sweep reads nothing but the clock, and it runs on a table with a row per
 		// media message the deployment ever received.

@@ -30,6 +30,7 @@ func samplePart(sid, messageID string) store.MediaPart {
 func TestWhatIsKeptToFetchAFileComesBackExactly(t *testing.T) {
 	t.Parallel()
 	container := open(t)
+	pair(t, container, "sid-1", "5511999990001")
 
 	want := samplePart("sid-1", "3EB0IMAGE")
 	if err := container.PutMediaPart(t.Context(), &want, storedAt); err != nil {
@@ -56,6 +57,8 @@ func TestWhatIsKeptToFetchAFileComesBackExactly(t *testing.T) {
 func TestWhatIsKeptForOneSessionIsNotReadByAnother(t *testing.T) {
 	t.Parallel()
 	container := open(t)
+	pair(t, container, "sid-1", "5511999990001")
+	pair(t, container, "sid-2", "5511999990002")
 
 	part := samplePart("sid-1", "3EB0SAME")
 	if err := container.PutMediaPart(t.Context(), &part, storedAt); err != nil {
@@ -71,6 +74,7 @@ func TestWhatIsKeptForOneSessionIsNotReadByAnother(t *testing.T) {
 func TestARedeliveredMessageReplacesWhatWasKeptForIt(t *testing.T) {
 	t.Parallel()
 	container := open(t)
+	pair(t, container, "sid-1", "5511999990001")
 
 	first := samplePart("sid-1", "3EB0AGAIN")
 	if err := container.PutMediaPart(t.Context(), &first, storedAt); err != nil {
@@ -109,6 +113,7 @@ func TestARedeliveredMessageReplacesWhatWasKeptForIt(t *testing.T) {
 func TestAWriteThatArrivesLateDoesNotOverwriteANewerOne(t *testing.T) {
 	t.Parallel()
 	container := open(t)
+	pair(t, container, "sid-1", "5511999990001")
 
 	fresh := samplePart("sid-1", "3EB0RACE")
 	fresh.DirectPath = "/v/t62.7118-24/fresh.enc"
@@ -155,6 +160,7 @@ func TestAMessageNothingWasKeptForIsNotAnError(t *testing.T) {
 func TestWhatOutlivedItsRetentionIsSweptAndTheRestIsLeft(t *testing.T) {
 	t.Parallel()
 	container := open(t)
+	pair(t, container, "sid-1", "5511999990001")
 
 	old := samplePart("sid-1", "3EB0OLD")
 	fresh := samplePart("sid-1", "3EB0FRESH")
@@ -204,6 +210,32 @@ func TestForgettingASessionTakesWhatWasKeptToFetchItsFiles(t *testing.T) {
 	}
 	if _, found, _ := container.MediaPart(t.Context(), "sid-2", "3EB0KEEP"); !found {
 		t.Fatal("unpairing one session took another session's keys with it")
+	}
+}
+
+// The window a delete cannot close: the old owner's write is already on its way when the
+// session is unpaired here, so the delete finds nothing to take and the write lands
+// afterwards as an insert. Left standing, that is a session that no longer exists holding
+// the key to somebody's file until the retention sweep.
+func TestAWriteThatOutlivesTheSessionItBelongsToIsRefused(t *testing.T) {
+	t.Parallel()
+	container := open(t)
+	pair(t, container, "sid-1", "5511999990001")
+
+	part := samplePart("sid-1", "3EB0LATE")
+	if err := container.PutMediaPart(t.Context(), &part, storedAt); err != nil {
+		t.Fatalf("PutMediaPart: %v", err)
+	}
+	if err := container.Forget(t.Context(), "sid-1"); err != nil {
+		t.Fatalf("Forget: %v", err)
+	}
+
+	later := samplePart("sid-1", "3EB0LATE")
+	if err := container.PutMediaPart(t.Context(), &later, storedAt.Add(time.Minute)); err == nil {
+		t.Fatal("a write that arrived after its session was unpaired put the key to a file back")
+	}
+	if _, found, _ := container.MediaPart(t.Context(), "sid-1", "3EB0LATE"); found {
+		t.Fatal("a session that no longer exists is holding the key to a file")
 	}
 }
 

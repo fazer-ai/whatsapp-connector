@@ -152,16 +152,6 @@ func (c *Container) SweepMediaParts(ctx context.Context, before time.Time) (int6
 	return dropped, nil
 }
 
-// forgetMediaParts drops everything kept for a session. Called when a session is
-// unpaired: what is in this table is the key to somebody's files, and a session that no
-// longer exists is not going to be asked for them.
-func (c *Container) forgetMediaParts(ctx context.Context, sid string) error {
-	if _, err := c.db.ExecContext(ctx, c.rebind(`DELETE FROM wac_media_part WHERE sid = ?`), sid); err != nil {
-		return fmt.Errorf("store: drop the media parts of %s: %w", sid, err)
-	}
-	return nil
-}
-
 // Keys and digests are kept base64 rather than as bytes: the column is then TEXT in both
 // dialects, which spares the schema and the driver round trip a difference that buys
 // nothing here. Three fields of 32 bytes each is not a size worth a dialect for.
