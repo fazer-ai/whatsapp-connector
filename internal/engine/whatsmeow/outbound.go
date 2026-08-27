@@ -61,12 +61,14 @@ type outboundContent struct {
 	Thumbnail string             `json:"thumbnail"`
 	Ref       *protocol.MediaRef `json:"ref"`
 
-	// Location.
-	Latitude  float64 `json:"latitude"`
-	Longitude float64 `json:"longitude"`
-	Name      string  `json:"name"`
-	Address   string  `json:"address"`
-	Live      bool    `json:"live"`
+	// Location. Pointers because the contract requires both and a missing one decodes to
+	// zero, which is a real place: a body that names neither would go out as a pin in the
+	// Gulf of Guinea and report success.
+	Latitude  *float64 `json:"latitude"`
+	Longitude *float64 `json:"longitude"`
+	Name      string   `json:"name"`
+	Address   string   `json:"address"`
+	Live      bool     `json:"live"`
 
 	// Contacts.
 	Contacts []outboundContact `json:"contacts"`
@@ -114,6 +116,16 @@ func planBody(req *sendRequest, alongside *waE2E.ContextInfo, limit int64) (*waE
 		message, err := contactsToSend(req, alongside)
 		return message, nil, err
 	case "media":
+		if req.To.Kind == protocol.AddressNewsletter {
+			// A newsletter takes its media unencrypted, through a different upload call,
+			// and the message has to carry the handle that upload answers with. Sent the
+			// ordinary way it goes out with coordinates nobody can resolve, and the send
+			// reports success: the caller has no reason to try again and the followers
+			// see a broken attachment. Refused until #28 does it properly, because
+			// nothing here can exercise the newsletter path.
+			return nil, nil, protocol.NewError(protocol.ErrorUnsupported,
+				"this connector cannot send a file to a newsletter yet")
+		}
 		plan, err := planMedia(&req.Content, limit)
 		return nil, plan, err
 	default:
@@ -128,13 +140,18 @@ func planBody(req *sendRequest, alongside *waE2E.ContextInfo, limit int64) (*waE
 // locationToSend renders a pin on a map.
 func locationToSend(req *sendRequest, alongside *waE2E.ContextInfo) (*waE2E.Message, error) {
 	content := &req.Content
-	if content.Latitude < -90 || content.Latitude > 90 {
+	if content.Latitude == nil || content.Longitude == nil {
 		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
-			fmt.Sprintf("%v is not a latitude", content.Latitude))
+			"a location has to name both of its coordinates")
 	}
-	if content.Longitude < -180 || content.Longitude > 180 {
+	latitude, longitude := *content.Latitude, *content.Longitude
+	if latitude < -90 || latitude > 90 {
 		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
-			fmt.Sprintf("%v is not a longitude", content.Longitude))
+			fmt.Sprintf("%v is not a latitude", latitude))
+	}
+	if longitude < -180 || longitude > 180 {
+		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
+			fmt.Sprintf("%v is not a longitude", longitude))
 	}
 	if content.Live {
 		// A live location is a message WhatsApp expects to be updated for as long as it
@@ -147,8 +164,8 @@ func locationToSend(req *sendRequest, alongside *waE2E.ContextInfo) (*waE2E.Mess
 	}
 
 	location := &waE2E.LocationMessage{
-		DegreesLatitude:  proto.Float64(content.Latitude),
-		DegreesLongitude: proto.Float64(content.Longitude),
+		DegreesLatitude:  proto.Float64(latitude),
+		DegreesLongitude: proto.Float64(longitude),
 		ContextInfo:      alongside,
 	}
 	if content.Name != "" {
@@ -339,7 +356,7 @@ func (s *Session) mediaToSend(
 
 	// Counted rather than trusted: a server that understates Content-Length, or sends
 	// none at all, would otherwise stream past the cap into a temporary file.
-	capped := &counting{from: file.body, left: s.sendLimit}
+	capped := &counting{from: file.body, limit: s.sendLimit}
 	uploaded, err := s.upload(ctx, mediaTypes[content.Kind], capped)
 	switch {
 	case errors.Is(err, errTooLarge):
@@ -541,19 +558,27 @@ var errTooLarge = errors.New("whatsmeow: the file is past the cap for a send")
 // claim, a chunked response carries none at all, and whatsmeow streams what it is given
 // into a temporary file before it knows how big it is.
 type counting struct {
-	from io.Reader
-	left int64
+	from  io.Reader
+	limit int64
+	read  int64
 }
 
 func (c *counting) Read(into []byte) (int, error) {
-	if c.left <= 0 {
+	if c.read > c.limit {
 		return 0, errTooLarge
 	}
-	if int64(len(into)) > c.left {
-		into = into[:c.left]
+	// One byte past the cap may be read, and only one. It is what separates a file that
+	// is exactly the cap from one that is larger: a reader is under no obligation to
+	// report EOF alongside the last bytes rather than on the read after them, so a
+	// counter that refused at the cap would refuse a file the setting says it sends.
+	if room := c.limit - c.read + 1; int64(len(into)) > room {
+		into = into[:room]
 	}
 	read, err := c.from.Read(into)
-	c.left -= int64(read)
+	c.read += int64(read)
+	if c.read > c.limit {
+		return 0, errTooLarge
+	}
 	if err != nil {
 		return read, err //nolint:wrapcheck // the reader's own error, passed through unchanged
 	}
@@ -622,6 +647,15 @@ func statusFailure(status int) error {
 		// without the header that opens it, or with one that has since been rotated.
 		return protocol.NewError(protocol.ErrorMediaUnavailable,
 			"the address of the file to send refused this connector: "+strconv.Itoa(status))
+	case status == http.StatusTooManyRequests:
+		// The caller's own server asking to be left alone for a moment. Read as a
+		// permanent mistake, a client abandons a file that is there and would have been
+		// served on the next attempt.
+		return protocol.NewError(protocol.ErrorRateLimited,
+			"the address of the file to send is rate limiting this connector")
+	case status == http.StatusRequestTimeout:
+		return protocol.NewError(protocol.ErrorTimeout,
+			"the address of the file to send timed out on its own request")
 	case status >= 500:
 		// `internal` for the same reason as the unreachable case above: retryable, and
 		// the contract has nothing that says the caller's own server is having a bad

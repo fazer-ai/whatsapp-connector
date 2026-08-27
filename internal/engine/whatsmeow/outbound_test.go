@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/iotest"
 
 	wm "go.mau.fi/whatsmeow"
 	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
@@ -583,6 +584,8 @@ func TestWhatTheCallersOwnServerAnsweredDecidesWhetherItIsWorthAnotherGo(t *test
 		{"the file has been deleted", 410, protocol.ErrorMediaUnavailable},
 		{"the reference travelled without its header", 401, protocol.ErrorMediaUnavailable},
 		{"the header no longer opens it", 403, protocol.ErrorMediaUnavailable},
+		{"the caller's own server is asking to be left alone", 429, protocol.ErrorRateLimited},
+		{"the caller's own server timed out on its own request", 408, protocol.ErrorTimeout},
 		{"the caller's own server is having a bad minute", 503, protocol.ErrorInternal},
 		{"the caller's own server broke", 500, protocol.ErrorInternal},
 		{"the caller asked for something the server did not understand", 400, protocol.ErrorInvalidPayload},
@@ -848,4 +851,115 @@ func peerJID(t *testing.T) waTypes.JID {
 		t.Fatalf("ParseJID: %v", err)
 	}
 	return jid
+}
+
+// A file exactly the size of the cap is a file the setting says this instance sends. A
+// counter that refuses at the cap instead of past it turns the documented "at most" into
+// "less than", and the caller has no way to see the difference from the message.
+func TestAFileExactlyTheSizeOfTheCapGoesOut(t *testing.T) {
+	t.Parallel()
+
+	const limit = 64
+	for _, tc := range []struct {
+		name  string
+		bytes int
+		sends bool
+	}{
+		{"one byte under the cap", limit - 1, true},
+		{"exactly the cap", limit, true},
+		{"one byte over it", limit + 1, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			session, serving, _ := outboundSession(t)
+			session.sendLimit = limit
+			// Handed out a few bytes at a time, because what decides this is whether the
+			// reader reports EOF alongside the last bytes or on the read after them, and
+			// a single-chunk source only ever exercises one of those.
+			serving.answerStream(iotest.OneByteReader(strings.NewReader(strings.Repeat("x", tc.bytes))), -1, "")
+
+			_, err := session.send(t.Context(), &protocol.Command{
+				Type: protocol.CommandMessageSend,
+				Payload: json.RawMessage(`{"message_id":"3EB0","to":{"kind":"phone","id":"5511999990001"},
+					"content":{"type":"media","kind":"image",
+					"ref":{"kind":"url","url":"http://rails:3000/blob.jpg"}}}`),
+			})
+			if tc.sends {
+				// The send itself needs a socket, so getting past the upload is the
+				// whole assertion: what must not happen is being refused for size.
+				var coded *protocol.Error
+				if errors.As(err, &coded) && coded.Code == protocol.ErrorMediaTooLarge {
+					t.Fatalf("a file of %d bytes was refused against a cap of %d", tc.bytes, limit)
+				}
+				return
+			}
+			assertCode(t, err, protocol.ErrorMediaTooLarge)
+		})
+	}
+}
+
+// A location that names neither coordinate decodes to zero, which is a real place off
+// the coast of Africa. The contract requires both, and a pin sent there reports success:
+// the caller has no reason to send it again and the recipient gets somewhere nobody meant.
+func TestALocationMissingACoordinateIsRefusedRatherThanSentToZero(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct{ name, content string }{
+		{"neither coordinate", `{"type":"location"}`},
+		{"no latitude", `{"type":"location","longitude":-49.2733}`},
+		{"no longitude", `{"type":"location","latitude":-25.4284}`},
+		{"both null", `{"type":"location","latitude":null,"longitude":null}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			req := requestOf(t, `{"message_id":"3EB0","to":{"kind":"phone","id":"5511999990001"},
+				"content":`+tc.content+`}`)
+			_, _, err := planBody(req, nil, 1<<20)
+			assertCode(t, err, protocol.ErrorInvalidPayload)
+		})
+	}
+
+	// And the coordinates that are a real place: zero is refused for being absent, not
+	// for being zero, so a caller that means the Gulf of Guinea can still say so.
+	req := requestOf(t, `{"message_id":"3EB0","to":{"kind":"phone","id":"5511999990001"},
+		"content":{"type":"location","latitude":0,"longitude":0}}`)
+	message, _, err := planBody(req, nil, 1<<20)
+	if err != nil {
+		t.Fatalf("a location that names zero twice was refused: %v", err)
+	}
+	if message.GetLocationMessage() == nil {
+		t.Fatal("a location at zero did not go out as one")
+	}
+}
+
+// A newsletter takes its media unencrypted, through a different upload call, and the
+// message has to carry the handle that upload answers with. Sent the ordinary way it goes
+// out with coordinates nobody can resolve while the send reports success, which is the
+// one outcome this connector refuses everywhere else.
+func TestAFileToANewsletterIsRefusedRatherThanSentUnresolvable(t *testing.T) {
+	t.Parallel()
+
+	session, serving, uploads := outboundSession(t)
+	serving.answer([]byte("bytes"), "")
+
+	_, err := session.send(t.Context(), &protocol.Command{
+		Type: protocol.CommandMessageSend,
+		Payload: json.RawMessage(`{"message_id":"3EB0","to":{"kind":"newsletter","id":"120363000000000000"},
+			"content":{"type":"media","kind":"image","ref":{"kind":"url","url":"http://rails:3000/blob.jpg"}}}`),
+	})
+	assertCode(t, err, protocol.ErrorUnsupported)
+	if serving.count() != 0 || uploads.count() != 0 {
+		t.Fatalf("a file that was never going to arrive was fetched %d and uploaded %d time(s)",
+			serving.count(), uploads.count())
+	}
+
+	// Everything else still reaches a newsletter: it is the file that cannot, not the
+	// address.
+	text := requestOf(t, `{"message_id":"3EB0","to":{"kind":"newsletter","id":"120363000000000000"},
+		"content":{"type":"text","body":"oi"}}`)
+	if _, _, err := planBody(text, nil, 1<<20); err != nil {
+		t.Fatalf("a text to a newsletter was refused as well: %v", err)
+	}
 }
