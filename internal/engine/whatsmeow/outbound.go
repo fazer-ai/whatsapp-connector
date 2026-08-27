@@ -1,8 +1,10 @@
 package whatsmeow
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -12,10 +14,12 @@ import (
 	"io/fs"
 	"math"
 	"mime"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	wm "go.mau.fi/whatsmeow"
@@ -475,7 +479,12 @@ func (s *Session) mediaToSend(
 	// Counted rather than trusted: a server that understates Content-Length, or sends
 	// none at all, would otherwise stream past the cap into a temporary file.
 	capped := &counting{from: file.body, limit: s.sendLimit}
-	uploaded, err := s.upload(ctx, mediaTypes[content.Kind], capped)
+	// Buffered so the first bytes can be looked at without being taken out of the stream:
+	// whether a sticker animates is in its header and nowhere in the contract.
+	peeking := bufio.NewReaderSize(capped, webpHeader)
+	animated := animatedWebP(peeking)
+
+	uploaded, err := s.upload(ctx, mediaTypes[content.Kind], peeking)
 	switch {
 	case errors.Is(err, errTooLarge):
 		return nil, protocol.NewError(protocol.ErrorMediaTooLarge,
@@ -509,7 +518,37 @@ func (s *Session) mediaToSend(
 		return nil, err
 	}
 
-	return renderMedia(content, &uploaded, mimeToSend(content, file.mime), plan.thumbnail, alongside), nil
+	return renderMedia(content, &uploaded, mimeToSend(content, file.mime), plan.thumbnail, animated, alongside), nil
+}
+
+// webpHeader is how far into a file the animation flag can be: `RIFF`, the size, `WEBP`,
+// the `VP8X` chunk header and its size, and then the flags byte.
+const webpHeader = 21
+
+// animatedWebP reports whether the bytes about to be uploaded are an animated sticker.
+//
+// Read off the file because there is nowhere else to read it from: the contract carries
+// one sticker kind on purpose ("an animated sticker is still a sticker"), so a caller
+// forwarding one it received has no field to say so in. Left unset, WhatsApp encodes the
+// message as a static sticker and the recipient sees one frame of something that was
+// meant to move.
+//
+// A file that is not a WebP at all, or is too short to say, is not animated, and that is
+// the same answer as before this existed: nothing here refuses a file over its header.
+func animatedWebP(peeking *bufio.Reader) bool {
+	header, err := peeking.Peek(webpHeader)
+	if err != nil || len(header) < webpHeader {
+		return false
+	}
+	if string(header[0:4]) != "RIFF" || string(header[8:12]) != "WEBP" {
+		return false
+	}
+	// Only the extended format has flags at all; a plain `VP8 ` or `VP8L` is one frame.
+	if string(header[12:16]) != "VP8X" {
+		return false
+	}
+	const animationFlag = 0x02
+	return header[20]&animationFlag != 0
 }
 
 // theSameFile refuses bytes that are not the ones the reference named.
@@ -550,7 +589,7 @@ func sourceStopped(err error) error {
 			"the file to send did not arrive before this command's deadline")
 	}
 	return protocol.NewError(protocol.ErrorInternal,
-		fmt.Sprintf("the file to send stopped arriving partway through: %v", bareError(err)))
+		fmt.Sprintf("the file to send stopped arriving partway through: %s", whyUnreachable(err)))
 }
 
 // allOfIt refuses an upload of less than the address said it was sending.
@@ -596,17 +635,38 @@ func safeAddress(raw string) string {
 	return parsed.Scheme + "://" + parsed.Host
 }
 
-// bareError is the failure without the request line Go wraps it in.
+// whyUnreachable says what went wrong with a fetch, in words this connector chose.
 //
-// url.Error prints the method and the whole URL alongside the cause, so the query rides
-// into any message built from it. Unwrapping keeps the cause, which is the part that says
-// what went wrong.
-func bareError(err error) error {
-	var wrapped *url.Error
-	if errors.As(err, &wrapped) && wrapped.Err != nil {
-		return wrapped.Err
+// None of the library's own text is repeated, and that is the point rather than caution.
+// net/http writes addresses into its errors in more places than are worth chasing one at
+// a time: url.Error carries the request line, a Location that will not parse is quoted
+// whole, and a redirect's own failure carries the hop. Every one of those can be a signed
+// URL, the reply is stored by the caller and read back out of its logs, and the fourth
+// time a class of bug turns up the answer is to close the door rather than to patch the
+// gap. What is left is a closed vocabulary: enough to tell DNS from a refused connection
+// from a certificate, and nothing that came from outside.
+func whyUnreachable(err error) string {
+	var dns *net.DNSError
+	var cert *tls.CertificateVerificationError
+	var record tls.RecordHeaderError
+	var timeout net.Error
+
+	switch {
+	case errors.As(err, &dns):
+		return "its host does not resolve"
+	case errors.Is(err, syscall.ECONNREFUSED):
+		return "nothing is listening there"
+	case errors.Is(err, syscall.ECONNRESET):
+		return "it closed the connection"
+	case errors.Is(err, syscall.EHOSTUNREACH), errors.Is(err, syscall.ENETUNREACH):
+		return "it cannot be reached from this instance"
+	case errors.As(err, &cert), errors.As(err, &record):
+		return "its certificate was not accepted"
+	case errors.As(err, &timeout) && timeout.Timeout():
+		return "it did not answer in time"
+	default:
+		return "it could not be reached"
 	}
-	return err
 }
 
 // fetchable answers the address to fetch from, or says why there is not one.
@@ -627,7 +687,7 @@ func fetchable(ref *protocol.MediaRef) (string, error) {
 	parsed, err := url.Parse(ref.URL)
 	if err != nil {
 		return "", protocol.NewError(protocol.ErrorInvalidPayload,
-			fmt.Sprintf("that reference is not an address: %v", bareError(err)))
+			"that reference is not an address")
 	}
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
 		// A `file:` URL would have this instance read its own disk and send whatever is
@@ -798,7 +858,7 @@ func thumbnailBytes(uri string, kind protocol.MediaKind) ([]byte, error) {
 // name, a voice note its flag and its length, a sticker neither.
 func renderMedia(
 	content *mediaContent, uploaded *wm.UploadResponse,
-	mimetype string, thumbnail []byte, alongside *waE2E.ContextInfo,
+	mimetype string, thumbnail []byte, animated bool, alongside *waE2E.ContextInfo,
 ) *waE2E.Message {
 	switch content.Kind {
 	case protocol.MediaImage:
@@ -863,6 +923,7 @@ func renderMedia(
 			// The one leaf type whose preview field is a PNG, which is also the format
 			// this connector publishes a sticker's preview in.
 			PngThumbnail: thumbnail,
+			IsAnimated:   optionalTrue(animated),
 			ContextInfo:  alongside,
 		}}
 	}
@@ -960,7 +1021,7 @@ func retrieveOverHTTP(ctx context.Context, address string, headers map[string]st
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, address, http.NoBody)
 	if err != nil {
 		return source{}, protocol.NewError(protocol.ErrorInvalidPayload,
-			fmt.Sprintf("that is not an address a file can be fetched from: %v", bareError(err)))
+			"that is not an address a file can be fetched from")
 	}
 	for name, value := range headers {
 		request.Header.Set(name, value)
@@ -991,7 +1052,7 @@ func retrieveOverHTTP(ctx context.Context, address string, headers map[string]st
 		// is not a lie about who timed out. The message says whose fault it actually is,
 		// and the missing code is issue #26.
 		return source{}, protocol.NewError(protocol.ErrorInternal,
-			fmt.Sprintf("could not fetch %s: %v", safeAddress(address), bareError(err)))
+			fmt.Sprintf("could not fetch the file to send from %s: %s", safeAddress(address), whyUnreachable(err)))
 	}
 	if answer.StatusCode != http.StatusOK {
 		_ = answer.Body.Close()

@@ -14,8 +14,10 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"testing/iotest"
 	"time"
@@ -1791,5 +1793,102 @@ func TestADiskThisInstanceCouldNotWriteIsNotWhatsAppRefusingTheFile(t *testing.T
 	assertCode(t, err, protocol.ErrorInternal)
 	if strings.Contains(err.Error(), "WhatsApp") {
 		t.Fatalf("a disk of this instance's own was reported as WhatsApp: %v", err)
+	}
+}
+
+// The contract carries one sticker kind on purpose, so a caller forwarding an animated
+// one has no field to say so in. Left unset, WhatsApp encodes the message as a static
+// sticker and the recipient sees one frame of something that was meant to move.
+func TestAnAnimatedStickerIsSentAsOne(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name     string
+		file     []byte
+		animated bool
+	}{
+		{"an animated webp", webpFile(t, "VP8X", 0x02|0x10), true},
+		{"a still webp in the extended format", webpFile(t, "VP8X", 0x10), false},
+		{"a plain webp, which has no flags at all", webpFile(t, "VP8 ", 0), false},
+		{"a lossless webp", webpFile(t, "VP8L", 0), false},
+		{"something that is not a webp", []byte("\x89PNG\r\n\x1a\n and then some more bytes"), false},
+		{"a file too short to say", []byte("RIFF"), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			session, serving, _ := outboundSession(t)
+			serving.answer(tc.file, "image/webp")
+			message := mustSendBody(t, session, `{"message_id":"3EB0","to":{"kind":"phone","id":"5511999990001"},
+				"content":{"type":"media","kind":"sticker","mime":"image/webp",
+				"ref":{"kind":"url","url":"http://rails:3000/blob.webp"}}}`)
+
+			sticker := message.GetStickerMessage()
+			if sticker.GetIsAnimated() != tc.animated {
+				t.Fatalf("the sticker went out with is_animated=%v, want %v",
+					sticker.GetIsAnimated(), tc.animated)
+			}
+			// And whatever was peeked at is still uploaded: reading the header must not
+			// take it out of the file.
+			if got := int(sticker.GetFileLength()); got != len(tc.file) {
+				t.Fatalf("%d bytes were uploaded and the file is %d", got, len(tc.file))
+			}
+		})
+	}
+}
+
+// webpFile builds a header the animation flag can be read out of, followed by enough
+// bytes that the peek has something to work with.
+func webpFile(t *testing.T, chunk string, flags byte) []byte {
+	t.Helper()
+
+	if len(chunk) != 4 {
+		t.Fatalf("%q is not a four-character chunk name", chunk)
+	}
+	file := make([]byte, 0, 64)
+	file = append(file, "RIFF"...)
+	file = append(file, 0, 0, 0, 0)
+	file = append(file, "WEBP"...)
+	file = append(file, chunk...)
+	file = append(file, 0, 0, 0, 0, flags)
+	return append(file, "os bytes do sticker"...)
+}
+
+// Every failure of the caller's own address is said in words this connector chose.
+// net/http writes addresses into its errors in more places than are worth chasing one at
+// a time, and a signed URL in any of them ends up in the caller's logs.
+func TestWhyAFetchFailedIsSaidWithoutRepeatingTheLibrary(t *testing.T) {
+	t.Parallel()
+
+	const signed = "https://storage.example/f.pdf?X-Amz-Signature=deadbeefcafe"
+	for _, tc := range []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"a host that does not resolve", &net.DNSError{Err: "no such host", Name: "storage.example"},
+			"its host does not resolve"},
+		{"nothing listening", &net.OpError{Op: "dial", Err: syscall.ECONNREFUSED}, "nothing is listening there"},
+		{"a connection cut", &net.OpError{Op: "read", Err: syscall.ECONNRESET}, "it closed the connection"},
+		{"a network with no route", &net.OpError{Op: "dial", Err: syscall.EHOSTUNREACH},
+			"it cannot be reached from this instance"},
+		// The shape this round was about: net/http quotes an unparseable Location whole.
+		{"a redirect nobody can parse", fmt.Errorf(`failed to parse Location header %q: invalid URI`, signed),
+			"it could not be reached"},
+		{"anything else", errors.New("some new thing net/http says, carrying " + signed),
+			"it could not be reached"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			// Wrapped the way the client wraps it, so the unwrapping is exercised too.
+			wrapped := &url.Error{Op: "Get", URL: signed, Err: tc.err}
+			if got := whyUnreachable(wrapped); got != tc.want {
+				t.Fatalf("whyUnreachable = %q, want %q", got, tc.want)
+			}
+			if strings.Contains(whyUnreachable(wrapped), "deadbeefcafe") {
+				t.Fatal("the reason carries the signature out of the address")
+			}
+		})
 	}
 }
