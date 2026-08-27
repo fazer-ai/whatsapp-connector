@@ -5,9 +5,11 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"math"
 	"mime"
 	"net/http"
@@ -51,39 +53,46 @@ var errTooManyRedirects = errors.New("whatsmeow: the address of the file to send
 // every one of them parses back.
 const vcardVersion = "3.0"
 
-// outboundContent is `message.send`'s content, wide enough for every body this connector
-// can send. It is one struct rather than a union because JSON gives no discriminated
-// union and the type field is the discriminator: what each body actually requires is
-// checked by the function that renders it, where the error can say what is missing.
-type outboundContent struct {
-	Type string `json:"type"`
+// The four bodies `message.send` can carry, one struct each.
+//
+// One struct each rather than one wide one, and the difference is not tidiness. Every arm
+// of the contract's `content` says `additionalProperties: true`, and AGENTS.md promises
+// that a client can add an optional field without anything else having to know. Decoded
+// into a single struct covering all four, a field one arm adds under a name another arm
+// already uses at a different type fails the whole command -- and it fails it for
+// messages of the type that never carried the field at all.
+type (
+	textContent struct {
+		Body string `json:"body"`
+	}
 
-	// Text.
-	Body string `json:"body"`
+	mediaContent struct {
+		Kind      protocol.MediaKind `json:"kind"`
+		Mime      string             `json:"mime"`
+		Filename  string             `json:"filename"`
+		Caption   string             `json:"caption"`
+		VoiceNote bool               `json:"voice_note"`
+		Size      int64              `json:"size"`
+		Duration  uint32             `json:"duration"`
+		Thumbnail string             `json:"thumbnail"`
+		Ref       *protocol.MediaRef `json:"ref"`
+	}
 
-	// Media.
-	Kind      protocol.MediaKind `json:"kind"`
-	Mime      string             `json:"mime"`
-	Filename  string             `json:"filename"`
-	Caption   string             `json:"caption"`
-	VoiceNote bool               `json:"voice_note"`
-	Size      int64              `json:"size"`
-	Duration  uint32             `json:"duration"`
-	Thumbnail string             `json:"thumbnail"`
-	Ref       *protocol.MediaRef `json:"ref"`
+	locationContent struct {
+		// Pointers because the contract requires both and a missing one decodes to zero,
+		// which is a real place: a body that names neither would go out as a pin in the
+		// Gulf of Guinea and report success.
+		Latitude  *float64 `json:"latitude"`
+		Longitude *float64 `json:"longitude"`
+		Name      string   `json:"name"`
+		Address   string   `json:"address"`
+		Live      bool     `json:"live"`
+	}
 
-	// Location. Pointers because the contract requires both and a missing one decodes to
-	// zero, which is a real place: a body that names neither would go out as a pin in the
-	// Gulf of Guinea and report success.
-	Latitude  *float64 `json:"latitude"`
-	Longitude *float64 `json:"longitude"`
-	Name      string   `json:"name"`
-	Address   string   `json:"address"`
-	Live      bool     `json:"live"`
-
-	// Contacts.
-	Contacts []outboundContact `json:"contacts"`
-}
+	contactsContent struct {
+		Contacts []outboundContact `json:"contacts"`
+	}
+)
 
 // outboundContact is one card in a `contacts` body.
 type outboundContact struct {
@@ -95,11 +104,17 @@ type outboundContact struct {
 // mediaPlan is a media body that has passed everything the payload alone can be judged
 // on, and still has to be fetched and uploaded.
 type mediaPlan struct {
+	content mediaContent
 	// address is where the bytes are, already checked as one this connector fetches
 	// over.
 	address string
 	// thumbnail is the caller's inline preview, decoded.
 	thumbnail []byte
+}
+
+// bodyType is the discriminator, read on its own before anything else is decoded.
+type bodyType struct {
+	Type string `json:"type"`
 }
 
 // planBody works out what the caller asked to send, without touching the network.
@@ -112,19 +127,38 @@ type mediaPlan struct {
 // hand, is work worth spending only on a session that can actually send, so it waits
 // until the session is known to be up.
 //
-// The context that rides along is passed in rather than built here because it is the
-// same for every body: a quote, a mention and the chat's disappearing-message timer
-// belong to the message, not to what is in it.
+// The type is read first and only its own arm is decoded after it, so a field one arm
+// adds cannot fail a message of another type. The context that rides along is passed in
+// rather than built here because it is the same for every body: a quote, a mention and
+// the chat's disappearing-message timer belong to the message, not to what is in it.
 func planBody(req *sendRequest, alongside *waE2E.ContextInfo, limit int64) (*waE2E.Message, *mediaPlan, error) {
-	switch req.Content.Type {
+	var body bodyType
+	if err := json.Unmarshal(req.Content, &body); err != nil {
+		return nil, nil, protocol.NewError(protocol.ErrorInvalidPayload,
+			"a send has to say what kind of body it is sending")
+	}
+
+	switch body.Type {
 	case "text":
-		message, err := textToSend(req, alongside)
+		content, err := decodeBody[textContent](req.Content, body.Type)
+		if err != nil {
+			return nil, nil, err
+		}
+		message, err := textToSend(&content, alongside)
 		return message, nil, err
 	case "location":
-		message, err := locationToSend(req, alongside)
+		content, err := decodeBody[locationContent](req.Content, body.Type)
+		if err != nil {
+			return nil, nil, err
+		}
+		message, err := locationToSend(&content, alongside)
 		return message, nil, err
 	case "contacts":
-		message, err := contactsToSend(req, alongside)
+		content, err := decodeBody[contactsContent](req.Content, body.Type)
+		if err != nil {
+			return nil, nil, err
+		}
+		message, err := contactsToSend(&content, alongside)
 		return message, nil, err
 	case "media":
 		if req.To.Kind == protocol.AddressNewsletter {
@@ -137,20 +171,33 @@ func planBody(req *sendRequest, alongside *waE2E.ContextInfo, limit int64) (*waE
 			return nil, nil, protocol.NewError(protocol.ErrorUnsupported,
 				"this connector cannot send a file to a newsletter yet")
 		}
-		plan, err := planMedia(&req.Content, limit)
+		content, err := decodeBody[mediaContent](req.Content, body.Type)
+		if err != nil {
+			return nil, nil, err
+		}
+		plan, err := planMedia(&content, limit)
 		return nil, plan, err
 	default:
 		// Refused rather than sent as something else. A caller told its message went out
 		// has no reason to send it again, so a body quietly delivered as its caption is
 		// one nobody finds out about.
 		return nil, nil, protocol.NewError(protocol.ErrorUnsupported,
-			fmt.Sprintf("this connector cannot send %q yet", req.Content.Type))
+			fmt.Sprintf("this connector cannot send %q yet", body.Type))
 	}
 }
 
+// decodeBody reads one arm of the content, named so the refusal says which one.
+func decodeBody[T any](raw json.RawMessage, kind string) (T, error) {
+	var body T
+	if err := json.Unmarshal(raw, &body); err != nil {
+		return body, protocol.NewError(protocol.ErrorInvalidPayload,
+			fmt.Sprintf("that is not a %s body: %v", kind, err))
+	}
+	return body, nil
+}
+
 // locationToSend renders a pin on a map.
-func locationToSend(req *sendRequest, alongside *waE2E.ContextInfo) (*waE2E.Message, error) {
-	content := &req.Content
+func locationToSend(content *locationContent, alongside *waE2E.ContextInfo) (*waE2E.Message, error) {
 	if content.Latitude == nil || content.Longitude == nil {
 		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
 			"a location has to name both of its coordinates")
@@ -193,14 +240,14 @@ func locationToSend(req *sendRequest, alongside *waE2E.ContextInfo) (*waE2E.Mess
 // WhatsApp has two shapes and they are not interchangeable: one card goes as a
 // ContactMessage and several go as a ContactsArrayMessage. A single card sent as an
 // array renders as a list of one on some clients and as nothing on others.
-func contactsToSend(req *sendRequest, alongside *waE2E.ContextInfo) (*waE2E.Message, error) {
-	if len(req.Content.Contacts) == 0 {
+func contactsToSend(content *contactsContent, alongside *waE2E.ContextInfo) (*waE2E.Message, error) {
+	if len(content.Contacts) == 0 {
 		return nil, protocol.NewError(protocol.ErrorInvalidPayload, "a contacts message with no contacts is not a message")
 	}
 
-	cards := make([]*waE2E.ContactMessage, 0, len(req.Content.Contacts))
-	for i := range req.Content.Contacts {
-		card, err := contactCard(&req.Content.Contacts[i])
+	cards := make([]*waE2E.ContactMessage, 0, len(content.Contacts))
+	for i := range content.Contacts {
+		card, err := contactCard(&content.Contacts[i])
 		if err != nil {
 			return nil, err
 		}
@@ -354,7 +401,7 @@ var mediaTypes = map[protocol.MediaKind]wm.MediaType{
 // planMedia judges a media body on the payload alone: what kind of file it is, whether
 // there is an address to fetch it from, whether the caller already says it is too big,
 // and whether the preview it carries is one that travels.
-func planMedia(content *outboundContent, limit int64) (*mediaPlan, error) {
+func planMedia(content *mediaContent, limit int64) (*mediaPlan, error) {
 	if _, known := mediaTypes[content.Kind]; !known {
 		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
 			fmt.Sprintf("%q is not a kind of file this contract carries", content.Kind))
@@ -380,6 +427,14 @@ func planMedia(content *outboundContent, limit int64) (*mediaPlan, error) {
 				fmt.Sprintf("the caller says %d bytes and this instance sends at most %d", declared, limit))
 		}
 	}
+	if content.Size > 0 && content.Ref.Size > 0 && content.Size != content.Ref.Size {
+		// No file satisfies both, so this is a payload that can only ever fail. Left to
+		// be found out where the two are compared, it fails after the whole transfer,
+		// answers something retryable, and every retry repeats an impossible upload.
+		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
+			fmt.Sprintf("the message says the file is %d bytes and its reference says %d",
+				content.Size, content.Ref.Size))
+	}
 	if err := sendableHeaders(content.Ref.Headers); err != nil {
 		return nil, err
 	}
@@ -390,7 +445,7 @@ func planMedia(content *outboundContent, limit int64) (*mediaPlan, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &mediaPlan{address: address, thumbnail: thumbnail}, nil
+	return &mediaPlan{content: *content, address: address, thumbnail: thumbnail}, nil
 }
 
 // captions are the kinds WhatsApp gives somewhere to put one. An audio and a sticker have
@@ -403,9 +458,9 @@ var captions = map[protocol.MediaKind]bool{
 
 // mediaToSend fetches the file the plan names and hands it to WhatsApp.
 func (s *Session) mediaToSend(
-	ctx context.Context, req *sendRequest, plan *mediaPlan, alongside *waE2E.ContextInfo,
+	ctx context.Context, plan *mediaPlan, alongside *waE2E.ContextInfo,
 ) (*waE2E.Message, error) {
-	content := &req.Content
+	content := &plan.content
 	file, err := s.retrieve(ctx, plan.address, content.Ref.Headers)
 	if err != nil {
 		return nil, err
@@ -656,7 +711,7 @@ func isToken(name string) bool {
 // The caller's own word comes first: it knows what it stored, and the address it named
 // may be a proxy that labels everything a stream of bytes. What the server said is the
 // fallback, and the filename's extension is the last resort.
-func mimeToSend(content *outboundContent, served string) string {
+func mimeToSend(content *mediaContent, served string) string {
 	if content.Mime != "" {
 		return content.Mime
 	}
@@ -742,7 +797,7 @@ func thumbnailBytes(uri string, kind protocol.MediaKind) ([]byte, error) {
 // fields they do not share are the ones that matter to a recipient: a document has its
 // name, a voice note its flag and its length, a sticker neither.
 func renderMedia(
-	content *outboundContent, uploaded *wm.UploadResponse,
+	content *mediaContent, uploaded *wm.UploadResponse,
 	mimetype string, thumbnail []byte, alongside *waE2E.ContextInfo,
 ) *waE2E.Message {
 	switch content.Kind {
@@ -1058,6 +1113,17 @@ func (s *Session) upload(ctx context.Context, kind wm.MediaType, from io.Reader)
 	}
 }
 
+// isPathError reports a failure that happened against this instance's own filesystem.
+//
+// It is what separates the two halves of an upload: whatsmeow encrypts into a temporary
+// file first and only then talks to WhatsApp, and every way the first half fails --
+// creating, writing to, or seeking that file -- arrives wrapped in an *fs.PathError,
+// which nothing on the network side produces.
+func isPathError(err error) bool {
+	var path *fs.PathError
+	return errors.As(err, &path)
+}
+
 // uploadFailure turns whatsmeow's answer into a code the caller can act on. An upload
 // that failed sent nothing, so unlike a send there is no message in somebody's chat to
 // be careful about: what matters is only whether trying again could work.
@@ -1073,6 +1139,13 @@ func uploadFailure(err error) error {
 		// under the same message id and the upload happens again, which costs a transfer
 		// and duplicates nothing.
 		return protocol.NewError(protocol.ErrorTimeout, "WhatsApp did not answer the upload")
+	case isPathError(err):
+		// The upload stages the encrypted file on disk before it sends anything, so a
+		// temporary directory that is read-only or full fails here without WhatsApp
+		// having been contacted at all. Reported as WhatsApp refusing the file, an
+		// operator goes looking at WhatsApp for a disk of their own.
+		return protocol.NewError(protocol.ErrorInternal,
+			"this instance could not stage the file to send")
 	default:
 		return protocol.NewError(protocol.ErrorWaError, "WhatsApp would not take the file")
 	}

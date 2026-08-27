@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"math"
 	"net"
 	"net/http"
@@ -778,7 +779,7 @@ func mustSendBody(t *testing.T, session *Session, payload string) *waE2E.Message
 	if plan == nil {
 		return message
 	}
-	message, err = session.mediaToSend(t.Context(), req, plan, alongside)
+	message, err = session.mediaToSend(t.Context(), plan, alongside)
 	if err != nil {
 		t.Fatalf("mediaToSend: %v", err)
 	}
@@ -1696,5 +1697,99 @@ func TestTheSignedAddressDoesNotFollowTheRedirectAsAReferer(t *testing.T) {
 	}
 	if got := same.Header.Get("Referer"); got != signed {
 		t.Fatalf("a hop on the same origin lost its Referer: %q", got)
+	}
+}
+
+// Every arm of the contract's content says `additionalProperties: true`, and AGENTS.md
+// promises a client can add an optional field without anything else having to know.
+// Decoded into one struct covering all four bodies, a field one arm adds under a name
+// another arm uses at a different type fails the whole command -- for messages of the
+// type that never carried the field at all.
+func TestAFieldOneBodyDoesNotKnowAboutDoesNotFailAnother(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct{ name, payload string }{
+		// `size` is an integer on a media body, and here it is a string on a text one.
+		{"a text carrying a field media types as a number",
+			`{"type":"text","body":"oi","size":"unknown"}`},
+		// `contacts` is an array on a contacts body.
+		{"a text carrying a field contacts types as an array",
+			`{"type":"text","body":"oi","contacts":"none"}`},
+		// `latitude` is a number on a location body.
+		{"a text carrying a field location types as a number",
+			`{"type":"text","body":"oi","latitude":"unknown"}`},
+		// And a field nothing has ever defined, which is the ordinary additive case.
+		{"a text carrying a field nothing has defined",
+			`{"type":"text","body":"oi","scheduled_for":"2027-01-01T00:00:00Z"}`},
+		{"a location carrying a field media types as a string",
+			`{"type":"location","latitude":-25.4,"longitude":-49.2,"mime":42}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			req := requestOf(t, `{"message_id":"3EB0","to":{"kind":"phone","id":"5511999990001"},
+				"content":`+tc.payload+`}`)
+			if _, _, err := planBody(req, nil, 1<<20); err != nil {
+				t.Fatalf("a body carrying a field of another arm was refused: %v", err)
+			}
+		})
+	}
+}
+
+// Two numbers about the same file that cannot both be right. Left to be found out where
+// they are compared, the payload fails after the whole transfer, answers something
+// retryable, and every retry repeats an impossible upload.
+func TestTwoSizesThatCannotBothBeRightAreRefusedBeforeTheTransfer(t *testing.T) {
+	t.Parallel()
+
+	session, serving, uploads := outboundSession(t)
+	serving.answer([]byte("bytes"), "")
+
+	_, err := session.send(t.Context(), &protocol.Command{
+		Type: protocol.CommandMessageSend,
+		Payload: json.RawMessage(`{"message_id":"3EB0","to":{"kind":"phone","id":"5511999990001"},
+			"content":{"type":"media","kind":"image","size":4096,
+			"ref":{"kind":"url","url":"http://rails:3000/blob.jpg","size":2048}}}`),
+	})
+	assertCode(t, err, protocol.ErrorInvalidPayload)
+	if serving.count() != 0 || uploads.count() != 0 {
+		t.Fatalf("a payload that could only fail still cost %d fetch(es) and %d upload(s)",
+			serving.count(), uploads.count())
+	}
+
+	// Two that agree are the ordinary case: Chatwoot fills both from one blob.
+	session, serving, _ = outboundSession(t)
+	serving.answer([]byte("os bytes do arquivo"), "image/jpeg")
+	message := mustSendBody(t, session, `{"message_id":"3EB0","to":{"kind":"phone","id":"5511999990001"},
+		"content":{"type":"media","kind":"image","size":19,
+		"ref":{"kind":"url","url":"http://rails:3000/blob.jpg","size":19}}}`)
+	if message.GetImageMessage() == nil {
+		t.Fatal("two sizes that agree were refused")
+	}
+}
+
+// The upload stages the encrypted file on disk before it sends anything, so a temporary
+// directory that is read-only or full fails without WhatsApp having been contacted.
+// Reported as WhatsApp refusing the file, an operator goes looking at WhatsApp for a disk
+// of their own.
+func TestADiskThisInstanceCouldNotWriteIsNotWhatsAppRefusingTheFile(t *testing.T) {
+	t.Parallel()
+
+	session, serving, uploads := outboundSession(t)
+	serving.answer([]byte("bytes"), "")
+	// The shape whatsmeow's own staging failures arrive in: os.CreateTemp, Write and Seek
+	// all answer with one of these, and nothing on the network side does.
+	uploads.answer(nil, fmt.Errorf("failed to create temporary file: %w",
+		&fs.PathError{Op: "open", Path: "/tmp/whatsmeow-upload-123", Err: fs.ErrPermission}))
+
+	_, err := session.send(t.Context(), &protocol.Command{
+		Type: protocol.CommandMessageSend,
+		Payload: json.RawMessage(`{"message_id":"3EB0","to":{"kind":"phone","id":"5511999990001"},
+			"content":{"type":"media","kind":"image",
+			"ref":{"kind":"url","url":"http://rails:3000/blob.jpg"}}}`),
+	})
+	assertCode(t, err, protocol.ErrorInternal)
+	if strings.Contains(err.Error(), "WhatsApp") {
+		t.Fatalf("a disk of this instance's own was reported as WhatsApp: %v", err)
 	}
 }

@@ -25,7 +25,7 @@ import (
 type sendRequest struct {
 	MessageID string           `json:"message_id"`
 	To        protocol.Address `json:"to"`
-	Content   outboundContent  `json:"content"`
+	Content   json.RawMessage  `json:"content"`
 	Quoted    *struct {
 		ID          string            `json:"id"`
 		Participant *protocol.Address `json:"participant"`
@@ -113,7 +113,7 @@ func (s *Session) send(ctx context.Context, command *protocol.Command) (json.Raw
 		// consulted at all.
 		building, cancel := context.WithTimeout(ctx, s.uploadWait)
 		defer cancel()
-		if message, err = s.mediaToSend(building, &req, plan, alongside); err != nil {
+		if message, err = s.mediaToSend(building, plan, alongside); err != nil {
 			return nil, err
 		}
 	}
@@ -136,15 +136,15 @@ func (s *Session) send(ctx context.Context, command *protocol.Command) (json.Raw
 // a phone sends and what every client renders without thinking about it. The extended
 // shape is for a message that carries something else: a quote, a mention, or the
 // chat's disappearing-message timer.
-func textToSend(req *sendRequest, alongside *waE2E.ContextInfo) (*waE2E.Message, error) {
-	if req.Content.Body == "" {
+func textToSend(content *textContent, alongside *waE2E.ContextInfo) (*waE2E.Message, error) {
+	if content.Body == "" {
 		return nil, protocol.NewError(protocol.ErrorInvalidPayload, "a text message with no body is not a message")
 	}
 	if alongside == nil {
-		return &waE2E.Message{Conversation: proto.String(req.Content.Body)}, nil
+		return &waE2E.Message{Conversation: proto.String(content.Body)}, nil
 	}
 	return &waE2E.Message{ExtendedTextMessage: &waE2E.ExtendedTextMessage{
-		Text:        proto.String(req.Content.Body),
+		Text:        proto.String(content.Body),
 		ContextInfo: alongside,
 	}}, nil
 }

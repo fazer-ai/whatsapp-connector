@@ -196,12 +196,15 @@ func textWith(req *sendRequest, own, to waTypes.JID) (*waE2E.Message, error) {
 	if err != nil {
 		return nil, err
 	}
-	return textToSend(req, alongside)
+	content, err := decodeBody[textContent](req.Content, "text")
+	if err != nil {
+		return nil, err
+	}
+	return textToSend(&content, alongside)
 }
 
 func quotingRequest(id string, fromMe bool, participant *protocol.Address) *sendRequest {
-	req := &sendRequest{MessageID: "3EB0"}
-	req.Content.Type, req.Content.Body = "text", "answering that"
+	req := &sendRequest{MessageID: "3EB0", Content: json.RawMessage(`{"type":"text","body":"answering that"}`)}
 	req.Quoted = &struct {
 		ID          string            `json:"id"`
 		Participant *protocol.Address `json:"participant"`
@@ -216,8 +219,7 @@ func quotingRequest(id string, fromMe bool, participant *protocol.Address) *send
 func TestABareTextGoesOutInTheShapeAPhoneWouldSendIt(t *testing.T) {
 	t.Parallel()
 
-	req := &sendRequest{MessageID: "3EB0"}
-	req.Content.Type, req.Content.Body = "text", "bom dia"
+	req := &sendRequest{MessageID: "3EB0", Content: json.RawMessage(`{"type":"text","body":"bom dia"}`)}
 
 	message, err := textWith(req, ownAccount, peer)
 	if err != nil {
@@ -239,7 +241,7 @@ func TestATextThatCarriesSomethingElseGoesOutWithIt(t *testing.T) {
 		Mentions:  []protocol.Address{{Kind: protocol.AddressPhone, ID: "5511999990002"}},
 		Ephemeral: 604800,
 	}
-	req.Content.Type, req.Content.Body = "text", "@5511999990002 bom dia"
+	req.Content = json.RawMessage(`{"type":"text","body":"@5511999990002 bom dia"}`)
 	req.Quoted = &struct {
 		ID          string            `json:"id"`
 		Participant *protocol.Address `json:"participant"`
