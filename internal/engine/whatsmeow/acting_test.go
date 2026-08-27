@@ -1,13 +1,15 @@
 package whatsmeow
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	wm "go.mau.fi/whatsmeow"
-
+	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
 	waTypes "go.mau.fi/whatsmeow/types"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
@@ -331,6 +333,88 @@ func TestOnlyAReactionIsRefusedOnAChannel(t *testing.T) {
 			var coded *protocol.Error
 			if errors.As(err, &coded) && coded.Code == protocol.ErrorUnsupported {
 				t.Fatalf("%s was refused as unsupported, and whatsmeow carries it: %v", tc.name, err)
+			}
+		})
+	}
+}
+
+// wire records what a command actually handed to WhatsApp, which is the only place the
+// stanza id and the built body can be looked at: everything before it is a decision, and
+// a test of the decision alone passes whether or not the command uses it.
+type wire struct {
+	to      waTypes.JID
+	id      string
+	message *waE2E.Message
+	err     error
+}
+
+func (w *wire) hand(
+	_ context.Context, to waTypes.JID, id string, message *waE2E.Message,
+) (wm.SendResponse, error) {
+	w.to, w.id, w.message = to, id, message
+	if w.err != nil {
+		return wm.SendResponse{}, w.err
+	}
+	return wm.SendResponse{ID: id, Timestamp: time.Unix(1755440000, 0)}, nil
+}
+
+func actingSession(t *testing.T) (*Session, *wire) {
+	t.Helper()
+
+	session, _, _ := outboundSession(t)
+	sent := &wire{}
+	session.handOver = sent.hand
+	return session, sent
+}
+
+// All three go out under an id nothing else will take, and a redelivery has to take the
+// same one: the record that answers it is written after the send, so a crash between them
+// hands the command to this code again, and the receiving client deduplicates on the
+// stanza id. Asserted on what reached the wire rather than on the helper that decides it,
+// because a command that computed the right id and then sent another passes the second
+// and fails the first.
+func TestEachOfTheThreeGoesOutUnderAnIdARetryWillRepeat(t *testing.T) {
+	t.Parallel()
+
+	const chat = `"to":{"kind":"phone","id":"5511999990002"}`
+	for _, tc := range []struct {
+		name    string
+		kind    protocol.CommandType
+		payload string
+		run     func(*Session, *protocol.Command) error
+	}{
+		{"an edit", protocol.CommandMessageEdit,
+			`{` + chat + `,"target_id":"3EB0TARGET","content":{"type":"text","body":"corrigido"}}`,
+			func(s *Session, c *protocol.Command) error { _, err := s.edit(t.Context(), c); return err }},
+		{"a revoke", protocol.CommandMessageRevoke,
+			`{` + chat + `,"target_id":"3EB0TARGET"}`,
+			func(s *Session, c *protocol.Command) error { _, err := s.revoke(t.Context(), c); return err }},
+		{"a reaction", protocol.CommandMessageReact,
+			`{` + chat + `,"target_id":"3EB0TARGET","emoji":"👍"}`,
+			func(s *Session, c *protocol.Command) error { _, err := s.react(t.Context(), c); return err }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			command := &protocol.Command{Type: tc.kind, ID: "cmd_000042", Payload: json.RawMessage(tc.payload)}
+			session, sent := actingSession(t)
+			if err := tc.run(session, command); err != nil {
+				t.Fatalf("%s: %v", tc.name, err)
+			}
+			first := sent.id
+			if first == "" {
+				t.Fatal("that went out with no stanza id at all")
+			}
+
+			// The same command again, on a session that never saw the first: this is the
+			// redelivery, not a second call on warmed-up state.
+			second, sentAgain := actingSession(t)
+			if err := tc.run(second, command); err != nil {
+				t.Fatalf("the redelivery of %s: %v", tc.name, err)
+			}
+			if sentAgain.id != first {
+				t.Fatalf("the redelivery went out as %s and the first as %s, so the recipient "+
+					"sees two", sentAgain.id, first)
 			}
 		})
 	}

@@ -147,11 +147,24 @@ func (s *Session) readyToSend() error {
 func (s *Session) putOnTheWire(
 	ctx context.Context, to waTypes.JID, messageID string, message *waE2E.Message,
 ) (wm.SendResponse, error) {
-	sent, err := s.current().SendMessage(ctx, to, message, wm.SendRequestExtra{ID: messageID})
+	hand := s.handOver
+	if hand == nil {
+		hand = s.overSocket
+	}
+	sent, err := hand(ctx, to, messageID, message)
 	if err != nil {
 		return wm.SendResponse{}, sendFailure(err)
 	}
 	return sent, nil
+}
+
+// overSocket is the ordinary way a message leaves: whatsmeow's own send, on whichever
+// client the session holds when it is called rather than one read earlier, so a message
+// built before a reconnect is not sent on the socket that reconnect replaced.
+func (s *Session) overSocket(
+	ctx context.Context, to waTypes.JID, messageID string, message *waE2E.Message,
+) (wm.SendResponse, error) {
+	return s.current().SendMessage(ctx, to, message, wm.SendRequestExtra{ID: messageID})
 }
 
 // textToSend renders the text and whatever rides along with it.

@@ -18,6 +18,7 @@ import (
 	"github.com/rs/zerolog"
 	qrcode "github.com/skip2/go-qrcode"
 	wm "go.mau.fi/whatsmeow"
+	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
 	waTypes "go.mau.fi/whatsmeow/types"
 	waEvents "go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
@@ -118,6 +119,14 @@ type Session struct {
 	// caller's bad address and a server having a bad minute.
 	retrieve   func(ctx context.Context, address string, headers map[string]string) (source, error)
 	uploadFile func(context.Context, *wm.Client, wm.MediaType, io.Reader) (wm.UploadResponse, error)
+
+	// deliver hands a built message to WhatsApp. A field for the same reason again, and
+	// for one more: what a command decides to put on the wire -- the body, the key that
+	// names another message, the stanza id a retry has to arrive under -- is only
+	// observable here. A test without this seam can check the pieces and not that the
+	// command uses them, which is the difference between covering a rule and covering
+	// the function that was supposed to apply it.
+	handOver func(context.Context, waTypes.JID, string, *waE2E.Message) (wm.SendResponse, error)
 
 	// sendLimit is the largest file this session will send. Not the blob cap: an
 	// instance with nowhere to keep an inbound file still sends one.

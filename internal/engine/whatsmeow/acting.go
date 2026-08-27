@@ -129,7 +129,18 @@ func (s *Session) revoke(ctx context.Context, command *protocol.Command) (json.R
 	}
 
 	client := s.current()
-	if _, err := s.putOnTheWire(ctx, to, "", client.BuildRevoke(to, sender, req.TargetID)); err != nil {
+	// Derived like the other two, even though a revoke's payload has no id field of its
+	// own to leave out. The window is the same one: the record that answers a redelivery
+	// is written after the send, so a crash between them sends this again, and a fresh
+	// stanza id is a second revoke the receiving client has no way to recognise as the
+	// first. What it does with one whose target is already gone is its business, and
+	// not something to find out per outage.
+	//
+	// Ignored on a channel, where whatsmeow rewrites the stanza id to the target's,
+	// which is how a channel names what is being deleted. That is already idempotent by
+	// construction: the id is the target's, so the retry carries the same one.
+	if _, err := s.putOnTheWire(ctx, to, s.orDerived(command, ""),
+		client.BuildRevoke(to, sender, req.TargetID)); err != nil {
 		return nil, err
 	}
 	// `null`, which is what the contract's table says a revoke answers. There is no id
