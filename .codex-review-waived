@@ -175,3 +175,22 @@ internal/store/media.go: Fence media writes with the ownership epoch  # PR#22
 # allowlist of hosts this connector fetches from, which is config somebody has to set
 # and a decision the contract has to carry; registered as #31.
 internal/engine/whatsmeow/outbound.go: Reject private-network media fetch targets  # PR#27
+# PR#33: the mechanism is right and the consequence is not, and the consequence was
+# checked on a phone rather than argued about. whatsmeow does replace the destination of
+# every direct message to a phone JID with the contact's LID (send.go, the
+# DefaultUserServer branch, unconditional and an error if no LID is found), and it leaves
+# the key in the body as it was built -- so the key does name the chat in a different
+# namespace from the stanza carrying it. What does not follow is that the action lands
+# nowhere. Sent live against a real account: an edit, a revoke and a reaction on this
+# account's own messages with the chat addressed by phone all appeared, and then the
+# case this finding is really about -- a reaction on the CONTACT's message, chat addressed
+# by phone, which is the one combination the earlier runs had not covered -- replaced the
+# reaction already on it. The recipient's client resolves the key regardless of which
+# namespace names the chat.
+#
+# Normalising anyway would be changing what goes on the wire on a theory, against
+# evidence, on a path that is working. That is the same trade this PR's own history got
+# wrong twice in the slice before it. What would reopen it: a client that does not
+# resolve it, or WhatsApp tightening the key match -- both of which show up as an action
+# reported successful and not visible, which is what the live phase exists to catch.
+internal/engine/whatsmeow/acting.go: Normalize direct chats before building target keys  # PR#33

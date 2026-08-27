@@ -743,8 +743,14 @@ func TestLiveActOnAMessage(t *testing.T) {
 		if theirs == "wait" {
 			theirs, where = liveAwaitTheirMessage(t, events, liveWindow(t, 2*time.Minute))
 		}
+		emoji := "👍"
+		if pick := os.Getenv("WAC_LIVE_REACT_EMOJI"); pick != "" {
+			// A reaction replaces the sender's previous one, so telling a second run
+			// apart from the first needs a different one.
+			emoji = pick
+		}
 		liveActOne(t, session, protocol.CommandMessageReact, map[string]any{
-			"to": where, "target_id": theirs, "emoji": "👍",
+			"to": where, "target_id": theirs, "emoji": emoji,
 		})
 	}
 	// And taking one off is a reaction with an empty emoji, not a command of its own.
