@@ -565,6 +565,33 @@ func TestAParticipantIsPutInTheGroupsOwnNamespace(t *testing.T) {
 		}
 	})
 
+	// An address that crosses the wire is `{kind, id}` and never a raw JID, and a refusal
+	// carrying one is still crossing: a message goes into the reply, and from there into a
+	// client's UI and whatever it ships its telemetry to. The server names in a JID say
+	// nothing to whoever reads them and something about this connector's insides to
+	// whoever does not.
+	t.Run("the refusal names the participant the way the caller did", func(t *testing.T) {
+		t.Parallel()
+
+		session, _, _ := outboundSession(t)
+		session.groupMode = func(context.Context, waTypes.JID) (waTypes.AddressingMode, error) {
+			return waTypes.AddressingModePN, nil
+		}
+		_, err := session.asTheGroupAddresses(t.Context(),
+			mustJID(t, group), mustJID(t, "999999999999999@lid"))
+		assertCode(t, err, protocol.ErrorInvalidPayload)
+
+		for _, raw := range []string{"@", "s.whatsapp.net", "@lid"} {
+			if strings.Contains(err.Error(), raw) {
+				t.Fatalf("the refusal carries %q, which is a JID and not an address: %v", raw, err)
+			}
+		}
+		// And it still says which one, or the caller cannot act on it.
+		if !strings.Contains(err.Error(), "999999999999999") {
+			t.Fatalf("the refusal does not say which participant it is about: %v", err)
+		}
+	})
+
 	// The store failing for its own reasons, which is neither of those, and whose words
 	// stop here: a reply crosses into a client's UI, where a driver's own text is noise to
 	// whoever reads it and a description of this deployment's insides to whoever does not.

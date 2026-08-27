@@ -296,11 +296,14 @@ func (s *Session) asTheGroupAddresses(
 			Msg("could not read the group's addressing, sending the participant as it came")
 		return participant, nil
 	}
-	wanted := waTypes.DefaultUserServer
+	// Kept as the contract's own kind rather than the server behind it, because it ends
+	// up in a message that crosses the wire, where an address is `{kind, id}` and never a
+	// raw JID.
+	wanted, wantedServer := protocol.AddressPhone, waTypes.DefaultUserServer
 	if info == waTypes.AddressingModeLID {
-		wanted = waTypes.HiddenUserServer
+		wanted, wantedServer = protocol.AddressLID, waTypes.HiddenUserServer
 	}
-	if participant.Server == wanted {
+	if participant.Server == wantedServer {
 		return participant, nil
 	}
 	alt, err := s.current().Store.GetAltJID(ctx, participant)
@@ -326,9 +329,14 @@ func (s *Session) asTheGroupAddresses(
 	case alt.IsEmpty():
 		// Asked and answered: there is no mapping, so there is no key naming this
 		// participant that the group would resolve, and the next attempt says the same.
+		//
+		// Named the way the caller named it, which is also the only way an address is
+		// allowed to cross: a JID in here would put `@s.whatsapp.net` in a client's UI
+		// and its own server names in this connector's replies.
+		named, _ := addressOf(participant)
 		return waTypes.EmptyJID, protocol.NewError(protocol.ErrorInvalidPayload,
-			fmt.Sprintf("that group names its senders by %s and this session cannot place %s among them",
-				wanted, participant))
+			fmt.Sprintf("that group names its senders by %s, and this session has no %s for the %s %s",
+				wanted, wanted, named.Kind, named.ID))
 	}
 	return alt, nil
 }
