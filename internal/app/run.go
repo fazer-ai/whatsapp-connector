@@ -60,6 +60,13 @@ type Connector struct {
 	// reclaimCursor is where the next reclaim pass starts. Read and written only by the
 	// loop goroutine, which is also the only one that reclaims.
 	reclaimCursor int
+
+	// partSwept is signalled after every completed pass of the refetch sweep, and only
+	// the tests set it. What they have to know is that the loop made its pass, and the
+	// two ways of learning that without a signal are both wrong: polling the table on a
+	// clock is the wall-clock synchronisation AGENTS.md rules out, and calling one pass
+	// directly stops exercising the loop, which is the thing under test.
+	partSwept chan<- struct{}
 }
 
 // New builds a connector: it dials Redis, agrees with the fleet on the shard count,
@@ -193,8 +200,15 @@ func (c *Connector) Run(ctx context.Context) error {
 	// ends the run while nothing has cancelled anything. Waiting on a sweeper that is
 	// still ticking would hang the process on exactly the startup failure it is trying
 	// to report.
-	sweeping, stopSweeping := context.WithCancel(ctx)
-	swept := c.sweepBlobs(sweeping)
+	// Two sweepers on two contexts, because their orders around the shutdown are
+	// opposite ones. The blob sweep must not walk a directory the shutdown is still
+	// writing to, so it stops after. The database sweep holds a statement on the pool
+	// the shutdown closes, so it stops before: sql.DB.Close waits for what is in flight,
+	// and a sweeper still ticking behind it answers ErrConnDone on every pass.
+	sweepingBlobs, stopBlobSweep := context.WithCancel(ctx)
+	swept := c.sweepBlobs(sweepingBlobs)
+	sweepingParts, stopPartSweep := context.WithCancel(ctx)
+	sweptParts := c.sweepMediaParts(sweepingParts)
 
 	c.log.Info().
 		Str("addr", c.cfg.HTTPAddr).
@@ -203,10 +217,14 @@ func (c *Connector) Run(ctx context.Context) error {
 		Msg("connector is up")
 
 	err := c.loop(ctx, httpErr)
+	// Before the shutdown, which closes the pool this one is querying.
+	stopPartSweep()
+	<-sweptParts
+
 	c.shutdown()
 	// After the loop, so the sweep is not walking a directory the shutdown is still
 	// writing to, and waited for, so the process does not exit mid-rename.
-	stopSweeping()
+	stopBlobSweep()
 	<-swept
 	if c.blobs != nil {
 		// After the sweeper has stopped, so nothing is walking the directory through a
@@ -309,6 +327,78 @@ func (c *Connector) sweepBlobs(ctx context.Context) <-chan struct{} {
 		}
 	}()
 	return done
+}
+
+// PartSweep is how often to sweep, for a deployment keeping refetch metadata for ttl.
+//
+// An hour at most, and a twentieth of the retention below that. The bound is loose on
+// purpose: unlike a blob cache, nothing is waiting on this to free anything, and a row
+// outliving its retention by an hour costs a row. What it must not do is run so often
+// that a fleet of instances spends its day deleting nothing from the same table.
+func PartSweep(ttl time.Duration) time.Duration {
+	return min(max(ttl/20, time.Minute), time.Hour)
+}
+
+// sweepMediaParts drops the refetch metadata that has outlived its retention.
+//
+// Its own goroutine for the same reason the blob sweep has one: it must not sit on the
+// heartbeat, which is what renews every lease this instance holds. A DELETE over a large
+// table on a busy database is not a thing to put in front of a lease.
+//
+// Every instance sweeps, and they sweep the same rows. That is not a race worth
+// coordinating away: the statement is idempotent, the loser deletes nothing, and a
+// leader election for a DELETE would be more machinery than the problem.
+func (c *Connector) sweepMediaParts(ctx context.Context) <-chan struct{} {
+	done := make(chan struct{})
+	if c.store == nil {
+		close(done)
+		return done
+	}
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(PartSweep(c.cfg.MediaRefetch))
+		defer ticker.Stop()
+		for {
+			// Swept before the first tick rather than after it. The cadence runs to an
+			// hour and every restart builds a new ticker, so a fleet that ships several
+			// times a day would reach the first tick on none of its instances: the
+			// retention an operator configured would be a setting nothing ever enforces,
+			// and the table would grow for the life of the deployment. The blob sweep
+			// does not need this because its cadence tops out at a minute.
+			if done := c.sweepPartsOnce(ctx); done {
+				return
+			}
+			if c.partSwept != nil {
+				// Never blocking: a listener that has stopped reading must not be able
+				// to hold the sweep still.
+				select {
+				case c.partSwept <- struct{}{}:
+				default:
+				}
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+	return done
+}
+
+// sweepPartsOnce makes one pass and reports whether the sweeper should stop.
+func (c *Connector) sweepPartsOnce(ctx context.Context) bool {
+	dropped, err := c.store.SweepMediaParts(ctx, time.Now().Add(-c.cfg.MediaRefetch))
+	switch {
+	case errors.Is(err, context.Canceled):
+		return true
+	case err != nil:
+		c.log.Warn().Err(err).Msg("could not sweep what was kept to fetch files again")
+	case dropped > 0:
+		c.log.Debug().Int64("messages", dropped).
+			Msg("dropped what was kept to fetch the files of messages past their retention")
+	}
+	return false
 }
 
 // reclaimCommands takes over what nobody acknowledged: what another instance read

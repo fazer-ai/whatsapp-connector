@@ -16,6 +16,7 @@
 //	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveHangUpAndBack
 //	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveListen
 //	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveMedia
+//	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveRefetch
 //	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveViewOnce
 //	WAC_LIVE_TO=<number> go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveSend
 //	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveLogout
@@ -266,7 +267,7 @@ func TestLiveMedia(t *testing.T) {
 		if left <= 0 {
 			t.Fatalf("only %d of %d files arrived before the window closed", i-1, wanted)
 		}
-		content := oneLiveFile(t, events, endpoint.URL, token, left)
+		_, content := oneLiveFile(t, events, endpoint.URL, token, left)
 		seen[content.Kind]++
 		say("%d/%d done", i, wanted)
 	}
@@ -278,8 +279,9 @@ func TestLiveMedia(t *testing.T) {
 }
 
 // oneLiveFile waits for one media message, checks what the contract says about it, and
-// fetches the bytes from the URL the event carried.
-func oneLiveFile(t *testing.T, events *recorder, base, token string, within time.Duration) protocol.MediaContent {
+// fetches the bytes from the URL the event carried. The id comes back with the content
+// because a message is asked about again by name.
+func oneLiveFile(t *testing.T, events *recorder, base, token string, within time.Duration) (string, protocol.MediaContent) {
 	t.Helper()
 
 	received := events.await(t, protocol.EventMessageReceived, within)
@@ -333,7 +335,7 @@ func oneLiveFile(t *testing.T, events *recorder, base, token string, within time
 	if refused := fetchBlob(t, ref.URL, ""); refused.status != http.StatusUnauthorized {
 		t.Fatalf("fetching without the token answered %d, want 401", refused.status)
 	}
-	return content
+	return body.Message.ID, content
 }
 
 // liveCount is how many files this phase waits for.
@@ -349,6 +351,145 @@ func liveCount(t *testing.T) int {
 		t.Fatalf("WAC_LIVE_FILES=%q: want a positive count", raw)
 	}
 	return count
+}
+
+// TestLiveRefetch is M2.2c against the real CDN. A blob is instance-local and
+// time-bounded, so the address published with a message stops working, and what has to
+// hold is that the coordinates filed with it are still enough to fetch the same file
+// again minutes or days later. A fake downloader cannot answer that: whether a
+// `directPath` outlives its blob, and whether the key kept with it still decrypts what
+// comes back, is WhatsApp's answer to give.
+//
+// Run it with no file in hand and it asks for one. Run it with WAC_LIVE_REFETCH_ID set
+// to a message a previous run filed, and it fetches that one instead, which is the same
+// check across a real restart rather than across a sweep.
+func TestLiveRefetch(t *testing.T) {
+	const token = "live-check"
+
+	// This phase's own root, thrown away with it: the file not being cached is the
+	// premise, and a root shared with the media phase would start out holding it.
+	root := t.TempDir()
+
+	// The sweep reads the clock through the store, so the phase moves the clock instead
+	// of waiting a TTL out. A TTL short enough to expire on its own would be racing the
+	// download of the very message being set up.
+	var ahead atomic.Int64
+	blobs, err := media.New(media.Options{
+		Root: root,
+		TTL:  5 * time.Minute,
+		Now:  func() time.Time { return time.Now().Add(time.Duration(ahead.Load())) },
+	})
+	if err != nil {
+		t.Fatalf("open the blob store at %s: %v", root, err)
+	}
+	t.Cleanup(func() {
+		if err := blobs.Close(); err != nil {
+			t.Errorf("close the blob store: %v", err)
+		}
+	})
+
+	mux := http.NewServeMux()
+	mux.Handle("GET /media/{id}", media.Handler(media.HandlerOptions{Blobs: blobs, Token: token}))
+	endpoint := httptest.NewServer(mux)
+	t.Cleanup(endpoint.Close)
+
+	session, container := liveSessionWith(t, MediaOptions{Blobs: blobs, BaseURL: endpoint.URL})
+	events := watch(t, session)
+
+	if err := session.Connect(t.Context(), engine.ConnectRequest{Pairing: "resume"}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	events.awaitState(t, "open", 2*time.Minute)
+
+	// gone is the reference the message was published with, and it is only known when
+	// this run is the one that received it.
+	messageID, gone := os.Getenv("WAC_LIVE_REFETCH_ID"), protocol.MediaRef{}
+	if messageID == "" {
+		window := liveWindow(t, 3*time.Minute)
+		say("send ONE file to the paired number now; waiting up to %s", window)
+
+		var content protocol.MediaContent
+		messageID, content = oneLiveFile(t, events, endpoint.URL, token, window)
+		gone = *content.Ref
+		say("message %s — pass it as WAC_LIVE_REFETCH_ID on a later run to check the same thing across a restart", messageID)
+
+		// The premise, made true the way production makes it true: the blob ages out
+		// and the sweep collects it.
+		ahead.Store(int64(10 * time.Minute))
+		dropped, freed, err := blobs.Sweep(t.Context())
+		ahead.Store(0)
+		if err != nil {
+			t.Fatalf("sweep the blob store: %v", err)
+		}
+		if dropped == 0 {
+			t.Fatal("the sweep collected nothing, so the file this phase is about is still cached and nothing below would be proven")
+		}
+		say("swept %d blob(s), %d bytes freed", dropped, freed)
+
+		if still := fetchBlob(t, gone.URL, token); still.status != http.StatusNotFound {
+			t.Fatalf("the address published with the message still answers %d, want 404", still.status)
+		}
+	}
+
+	// What makes the refetch possible at all is a row, not a file. Reading it here says
+	// which of the two is missing when the command below fails.
+	kept, found, err := container.MediaPart(t.Context(), liveSID, messageID)
+	if err != nil {
+		t.Fatalf("read what was filed for %s: %v", messageID, err)
+	}
+	if !found {
+		t.Fatalf("nothing was filed for %s, so there is nothing to fetch again", messageID)
+	}
+	say("filed: kind=%s mime=%q filename=%q size=%d", kept.Kind, kept.Mime, kept.Filename, kept.FileLength)
+
+	again := refetch(t, session, messageID, nil)
+	if again.Kind != protocol.MediaRefConnectorBlob {
+		t.Fatalf("the refetch answered a %q reference, want the blob it just wrote", again.Kind)
+	}
+	if want := endpoint.URL + "/media/" + again.ID; again.URL != want {
+		t.Fatalf("the refetch published under %q, want %q", again.URL, want)
+	}
+	if gone.ID != "" {
+		if again.ID == gone.ID {
+			t.Fatal("the refetch handed back the blob that was swept")
+		}
+		if again.Size != gone.Size || again.SHA256 != gone.SHA256 {
+			t.Fatalf("the refetch served %d bytes (%s), want the same file as %d (%s)",
+				again.Size, again.SHA256, gone.Size, gone.SHA256)
+		}
+	}
+
+	// The whole point: these bytes came from WhatsApp just now, on coordinates that
+	// outlived the file they were filed with.
+	fetched := fetchBlob(t, again.URL, token)
+	if fetched.status != http.StatusOK {
+		t.Fatalf("fetching the refetched blob answered %d: %s", fetched.status, fetched.body)
+	}
+	if int64(len(fetched.body)) != again.Size {
+		t.Fatalf("the blob is %d bytes and the reference says %d", len(fetched.body), again.Size)
+	}
+	if digest := fmt.Sprintf("%x", sha256.Sum256(fetched.body)); digest != again.SHA256 {
+		t.Fatalf("the bytes hash to %s and the reference says %s", digest, again.SHA256)
+	}
+	say("fetched %d bytes from %s, digest matches", len(fetched.body), again.URL)
+
+	// Asking twice is what a redelivered command does, and it is answered by paying for
+	// the file a second time rather than by handing back the first answer. That cost is
+	// issue #24; what is checked here is that the answer is at least a working one.
+	twice := refetch(t, session, messageID, nil)
+	if twice.ID == again.ID {
+		t.Fatalf("two refetches named the same blob %s, which the ledger is not supposed to be keeping", twice.ID)
+	}
+	if twice.SHA256 != again.SHA256 {
+		t.Fatalf("the second refetch served %s and the first served %s", twice.SHA256, again.SHA256)
+	}
+	if repeat := fetchBlob(t, twice.URL, token); repeat.status != http.StatusOK {
+		t.Fatalf("fetching the second refetch answered %d: %s", repeat.status, repeat.body)
+	}
+
+	if state := session.state(); state != "open" {
+		t.Fatalf("the session did not stay up: state=%s", state)
+	}
 }
 
 // TestLiveViewOnce is the decision this build makes about a file sent to be seen once:

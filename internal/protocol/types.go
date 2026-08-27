@@ -185,8 +185,16 @@ var AllCommandTypes = []CommandType{
 // `group.invite.get` reads the invite code with `revoke` unset and rotates it when the
 // field is true, so it is listed and then asked about its payload below.
 var readOnlyCommands = map[CommandType]bool{
-	CommandSessionStatus:         true,
-	CommandAdminPing:             true,
+	CommandSessionStatus: true,
+	CommandAdminPing:     true,
+	// It writes a blob and spends a download, so it is not free -- but carrying it out
+	// twice is not different from carrying it out once, and that is what this map is
+	// about. Its answer is the one result in the contract that goes stale by
+	// construction: a reference to a blob on one instance, good until a TTL. Remembered
+	// and handed to a redelivery, it is an address that answers nothing, on the very
+	// path that exists to recover an attachment. Doing the work again is cheaper than
+	// that, and bounded.
+	CommandMessageDownloadMedia:  true,
 	CommandContactCheck:          true,
 	CommandContactProfilePicture: true,
 	CommandContactInfo:           true,

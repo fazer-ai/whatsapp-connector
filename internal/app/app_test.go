@@ -639,6 +639,92 @@ func TestANonPositiveMediaTTLIsRefused(t *testing.T) {
 	}
 }
 
+// Keeping how to fetch a file again for less time than the blob itself lives leaves a
+// window where the reference has lapsed and the message cannot be recovered either,
+// which is the exact failure the retention exists to prevent.
+func TestARefetchRetentionShorterThanTheBlobsThemselvesIsRefused(t *testing.T) {
+	t.Setenv("WAC_INSTANCE", "inst-a")
+	t.Setenv("WAC_MEDIA_ROOT", t.TempDir())
+	t.Setenv("WAC_MEDIA_TOKEN", "s3cret")
+	t.Setenv("WAC_MEDIA_TTL", "48h")
+	t.Setenv("WAC_MEDIA_REFETCH_TTL", "24h")
+
+	if _, err := app.LoadConfig("host"); err == nil {
+		t.Fatal("a retention shorter than the blobs it outlasts was accepted")
+	}
+}
+
+// An upgrade must not refuse a deployment over a setting it has never heard of. An
+// operator keeping blobs for longer than the default retention was configured correctly
+// before this variable existed, and a fixed fallback would have the relation check below
+// stop their connector from starting.
+func TestADeploymentKeepingBlobsLongerThanTheDefaultRetentionStillStarts(t *testing.T) {
+	t.Setenv("WAC_INSTANCE", "inst-a")
+	t.Setenv("WAC_MEDIA_ROOT", t.TempDir())
+	t.Setenv("WAC_MEDIA_TOKEN", "s3cret")
+	t.Setenv("WAC_MEDIA_TTL", "720h")
+
+	cfg, err := app.LoadConfig("host")
+	if err != nil {
+		t.Fatalf("a deployment that was valid before this setting existed was refused: %v", err)
+	}
+	if cfg.MediaRefetch < cfg.MediaTTL {
+		t.Fatalf("blobs are kept %s and their coordinates %s, which lapses first", cfg.MediaTTL, cfg.MediaRefetch)
+	}
+}
+
+// And a deployment that keeps blobs for less than the default retention keeps the
+// default, rather than following the TTL down to something shorter than a week.
+func TestAShortBlobTTLDoesNotDragTheRetentionDownWithIt(t *testing.T) {
+	t.Setenv("WAC_INSTANCE", "inst-a")
+	t.Setenv("WAC_MEDIA_ROOT", t.TempDir())
+	t.Setenv("WAC_MEDIA_TOKEN", "s3cret")
+	t.Setenv("WAC_MEDIA_TTL", "1h")
+
+	cfg, err := app.LoadConfig("host")
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.MediaRefetch != app.DefaultMediaRefetch {
+		t.Fatalf("the retention is %s, want the default %s", cfg.MediaRefetch, app.DefaultMediaRefetch)
+	}
+}
+
+// The same reasoning as the media TTL: a non-positive duration parses, and a retention
+// nobody honours is one an operator finds out about from a message that lost its file.
+func TestANonPositiveRefetchRetentionIsRefused(t *testing.T) {
+	t.Setenv("WAC_INSTANCE", "inst-a")
+	t.Setenv("WAC_MEDIA_ROOT", t.TempDir())
+	t.Setenv("WAC_MEDIA_TOKEN", "s3cret")
+
+	for _, bad := range []string{"0s", "-1h"} {
+		t.Setenv("WAC_MEDIA_REFETCH_TTL", bad)
+		if _, err := app.LoadConfig("host"); err == nil {
+			t.Fatalf("WAC_MEDIA_REFETCH_TTL=%q was accepted", bad)
+		}
+	}
+}
+
+// Nothing waits on this sweep to free anything, so it is bounded loosely on both ends:
+// often enough that a row does not outlive its retention by much, rarely enough that a
+// fleet does not spend its day deleting nothing from the same table.
+func TestTheRefetchSweepCadenceIsBoundedAtBothEnds(t *testing.T) {
+	t.Parallel()
+
+	cases := map[time.Duration]time.Duration{
+		7 * 24 * time.Hour:  time.Hour,
+		30 * 24 * time.Hour: time.Hour,
+		2 * time.Hour:       6 * time.Minute,
+		10 * time.Minute:    time.Minute,
+		time.Second:         time.Minute,
+	}
+	for ttl, want := range cases {
+		if got := app.PartSweep(ttl); got != want {
+			t.Fatalf("a %s retention is swept every %s, want %s", ttl, got, want)
+		}
+	}
+}
+
 // One blob larger than the whole budget evicts the cache and then itself, which is a
 // deployment that looks configured and caches nothing.
 func TestAPerBlobCapLargerThanTheQuotaIsRefused(t *testing.T) {

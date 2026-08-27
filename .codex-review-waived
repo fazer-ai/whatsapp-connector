@@ -133,3 +133,27 @@ internal/engine/whatsmeow/media.go: Implement stale blob refresh before issuing 
 # trip instead of the attachment, which is what makes the window ordinary rather than
 # fatal.
 internal/engine/whatsmeow/media.go: Keep blobs pinned until publication settles  # PR#16
+# PR#22: the cost is real and it is the one that was chosen. A download recalled from
+# the ledger is a `connector_blob` URL naming one instance and good until a TTL, and the
+# whole point of the command is that both of those lapse: the recalled answer is an
+# address that fetches nothing, handed back on the path that exists to recover an
+# attachment. Re-running costs at most one file under WAC_MEDIA_MAX_BLOB, against a
+# quota twenty times that, and only on a transport redelivery or a caller's own retry —
+# neither of which is the ordinary path, where MediaFetchJob asks once per message.
+# The two alternatives are both worse here: a blob id derived from the message would put
+# a message id inside a URL the connector serves, and validating a recalled ref before
+# returning it cannot work across instances, which is exactly the case that matters.
+# Registered as #24 rather than only waived, because the cost is worth revisiting once
+# there is a way to validate a ref that another instance issued.
+internal/protocol/types.go: Preserve idempotency for media downloads  # PR#22
+# PR#22: the finding is right that the monotonic stamp is not a fence, and #22 does not
+# claim it is — the comment on the write says so, and #23 carries the gap with the three
+# candidate designs and what each costs. What #22 does close is the half a fence would
+# not have covered anyway: a write arriving after the session was unpaired now fails on
+# the foreign key rather than inserting a parentless row that holds the key to a file.
+# Building the epoch fence here means either a column on every table this package owns
+# with the epoch read from the lease, or a session-aware driver wrapper that whatsmeow's
+# sqlstore would have to accept. Both are the architecture change internal/store's own
+# package doc has called open since M1, and neither belongs in the PR that made the
+# first write.
+internal/store/media.go: Fence media writes with the ownership epoch  # PR#22

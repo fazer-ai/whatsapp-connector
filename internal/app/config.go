@@ -45,9 +45,17 @@ type Config struct {
 	// is what the quota is counted in. A volume formatted with larger units than the
 	// default undercharges every file by the difference.
 	MediaBlockSize int64
-	LogLevel       string
-	LeaseTTL       time.Duration
-	Heartbeat      time.Duration
+	// MediaRefetch is how long a message can still be asked for its file again. It is a
+	// retention decision rather than a cache one: what is kept for that long is the key
+	// to somebody's file, one row per media message the deployment received.
+	//
+	// The default is longer than any blob lives and shorter than WhatsApp keeps the
+	// file, which is the window where the answer can be anything but a failure. Longer
+	// than that retains keys to files WhatsApp has already dropped.
+	MediaRefetch time.Duration
+	LogLevel     string
+	LeaseTTL     time.Duration
+	Heartbeat    time.Duration
 	// ClaimMinIdle is how long a command has to sit unacknowledged before another
 	// instance takes it over. It bounds how long a session stays unowned after the
 	// instance that woke it died, and it has to stay comfortably above the time a
@@ -72,6 +80,22 @@ const DefaultDeviceName = "fazer.ai"
 // stream, so an instance that disagrees with what is recorded refuses to start.
 const DefaultEventShards = 8
 
+// DefaultMediaRefetch is how long a message can still be asked for its file again.
+//
+// It is sized by what has to be survivable, not by what WhatsApp does: a deploy landing
+// between an event and its download, a queue that fell behind, the client's own retry
+// ladder, and an operator noticing a broken attachment a few days later and asking for
+// it again. A week covers all of those and costs a few hundred bytes a message.
+//
+// It is not sized larger because what is kept is the key to somebody's file. WhatsApp
+// stops serving the file at some point of its own, and past that this table would be
+// retaining keys to bytes nobody can fetch, which is cost with no answer behind it.
+//
+// A floor rather than the value: a deployment keeping blobs for longer than this keeps
+// the coordinates at least that long too, or the reference lapses while the message is
+// still unrecoverable.
+const DefaultMediaRefetch = 7 * 24 * time.Hour
+
 // LoadConfig reads the environment. It fails on a value it cannot parse rather than
 // falling back to a default, because a misspelled number in a deployment is a bug to
 // see at startup, not a setting silently ignored.
@@ -95,6 +119,16 @@ func LoadConfig(hostname string) (Config, error) {
 		return Config{}, err
 	}
 	mediaTTL, err := envDuration("WAC_MEDIA_TTL", media.DefaultTTL)
+	if err != nil {
+		return Config{}, err
+	}
+	// Read after the blob TTL and never below it, which is the same rule as the check
+	// further down and the reason this cannot be a constant: a deployment already
+	// keeping blobs for longer than the default would otherwise be refused on upgrade by
+	// a setting it has never heard of, over a relation it did nothing to break. An
+	// explicitly shorter one is still refused, because that is an operator asking for
+	// the window this exists to close.
+	mediaRefetch, err := envDuration("WAC_MEDIA_REFETCH_TTL", max(DefaultMediaRefetch, mediaTTL))
 	if err != nil {
 		return Config{}, err
 	}
@@ -125,6 +159,7 @@ func LoadConfig(hostname string) (Config, error) {
 		MediaToken:     envString("WAC_MEDIA_TOKEN", ""),
 		MediaRoot:      envString("WAC_MEDIA_ROOT", ""),
 		MediaTTL:       mediaTTL,
+		MediaRefetch:   mediaRefetch,
 		MediaQuota:     mediaQuota,
 		MediaMaxBlob:   mediaMaxBlob,
 		MediaBlockSize: mediaBlockSize,
@@ -197,6 +232,18 @@ func LoadConfig(hostname string) (Config, error) {
 		// that asked for something else would keep a day's worth of blobs and report
 		// nothing about it. The setting is honoured or the instance does not start.
 		return Config{}, fmt.Errorf("app: WAC_MEDIA_TTL must be positive, got %s", cfg.MediaTTL)
+	}
+	if cfg.MediaRefetch <= 0 {
+		return Config{}, fmt.Errorf("app: WAC_MEDIA_REFETCH_TTL must be positive, got %s", cfg.MediaRefetch)
+	}
+	if cfg.MediaRefetch < cfg.MediaTTL {
+		// The whole point of keeping how to fetch a file again is to answer after the
+		// blob has gone. Retaining it for less than the blob lives leaves a window where
+		// the reference has lapsed and the message cannot be recovered either, which is
+		// the failure this exists to prevent.
+		return Config{}, fmt.Errorf(
+			"app: WAC_MEDIA_REFETCH_TTL (%s) is shorter than WAC_MEDIA_TTL (%s), so a file would stop being "+
+				"recoverable before the blob naming it expires", cfg.MediaRefetch, cfg.MediaTTL)
 	}
 	if cfg.MediaMaxBlob > cfg.MediaQuota {
 		// One blob would evict everything else and then itself. media.New refuses this

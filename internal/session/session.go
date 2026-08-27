@@ -542,7 +542,9 @@ func idempotencyKey(command *protocol.Command) string {
 	}
 	// Only where the id is the command's own creation. `message.download_media` also
 	// carries a `message_id`, and there it names a message somebody else's command
-	// created, so keying by it would answer a download with the result of the send.
+	// created, so keying by it would answer a download with the result of the send. It
+	// no longer reaches this line -- it is a question, and returns above -- and it stays
+	// out of that table anyway, because the two reasons are independent.
 	if command.Type.NamesItsOwnMessage() {
 		var body struct {
 			MessageID string `json:"message_id"`
