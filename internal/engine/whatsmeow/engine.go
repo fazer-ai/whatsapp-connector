@@ -81,10 +81,17 @@ func New(container *store.Container, opts Options, log zerolog.Logger) (*Engine,
 		}
 	}
 	if deviceName := opts.DeviceName; deviceName != "" {
-		// Written exactly once, because it is written to a package-level value whatsmeow
-		// reads from its pairing handshake: a second engine assigning it is a write with
-		// no lock against a read on another goroutine. The first name wins, which is the
-		// deployment's own, since a process runs one engine.
+		// A package-level value in whatsmeow, read by its pairing handshake while
+		// marshalling the registration payload. Written exactly once so a second engine
+		// cannot assign it, and the first name wins, which is the deployment's own since
+		// a process runs one engine.
+		//
+		// What keeps the write off the racing side is not the Once, which orders it
+		// against another write and not against that read: it is that this runs while
+		// the engine is being built, before it has a session, let alone a client with a
+		// socket. A process that built a second engine while the first was pairing would
+		// have the Once find nothing to do, so there is still only ever the one write --
+		// and it is already long done.
 		deviceNameOnce.Do(func() { waStore.DeviceProps.Os = proto.String(deviceName) })
 	}
 	return &Engine{
