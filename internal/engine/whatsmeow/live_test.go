@@ -748,14 +748,16 @@ func TestLiveActOnAMessage(t *testing.T) {
 		})
 	}
 	// And taking one off is a reaction with an empty emoji, not a command of its own.
+	reaction := "carries the reaction"
 	if os.Getenv("WAC_LIVE_UNREACT") != "" {
 		liveActOne(t, session, protocol.CommandMessageReact, map[string]any{
 			"to": chat, "target_id": standing, "target_from_me": true, "emoji": "",
 		})
+		reaction = "carries no reaction, the one put on it having been taken off"
 	}
 
-	fmt.Fprintf(os.Stderr, "check the recipient: %s reads \"corrigida\", carries the reaction, "+
-		"and says it was edited; %s is gone\n", standing, doomed)
+	fmt.Fprintf(os.Stderr, "check the recipient: %s reads \"corrigida\", %s, "+
+		"and says it was edited; %s is gone\n", standing, reaction, doomed)
 }
 
 // liveAwaitTheirMessage is the next message the recipient sends: its id, and the chat it
@@ -802,13 +804,18 @@ func liveActOne(t *testing.T, session *Session, kind protocol.CommandType, paylo
 	if err != nil {
 		t.Fatalf("build the %s: %v", kind, err)
 	}
-	// The command id has to differ per action, and this phase runs two reactions. It is
-	// what the stanza id is derived from when the payload names none, so two actions
-	// sharing one go out under the same id and the recipient discards the second as a
-	// duplicate of the first -- which is the mechanism working, and it would read here as
-	// the reaction silently failing. The target is what makes them different.
+	// The command id is what the stanza id is derived from when the payload names none,
+	// so two actions sharing one go out under the same id and the recipient discards the
+	// second as a duplicate of the first. That is the mechanism working, and in here it
+	// would read as the action silently failing.
+	//
+	// Taken from the payload rather than from a field picked out of it, because picking
+	// has to be redone every time the phase grows an action: the type and the target were
+	// enough until a reaction and its removal, which differ only in the emoji. Two
+	// identical payloads are the same command and should collide; anything else is a
+	// different one.
 	result, err := session.Execute(t.Context(), &protocol.Command{
-		Type: kind, ID: fmt.Sprintf("live-%s-%v", kind, payload["target_id"]), Payload: body,
+		Type: kind, ID: fmt.Sprintf("live-%s-%x", kind, sha256.Sum256(body)), Payload: body,
 	})
 	if err != nil {
 		t.Fatalf("%s: %v", kind, err)
