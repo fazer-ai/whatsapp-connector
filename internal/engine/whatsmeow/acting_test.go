@@ -533,6 +533,46 @@ func TestAParticipantIsPutInTheGroupsOwnNamespace(t *testing.T) {
 			})
 		}
 	})
+
+	// The store failing for its own reasons, which is neither of those, and whose words
+	// stop here: a reply crosses into a client's UI, where a driver's own text is noise to
+	// whoever reads it and a description of this deployment's insides to whoever does not.
+	t.Run("the store could not answer", func(t *testing.T) {
+		t.Parallel()
+
+		const secret = "pq: relation \"whatsmeow_lid_map\" does not exist"
+		session, _, _ := outboundSession(t)
+		session.groupMode = func(context.Context, waTypes.JID) (waTypes.AddressingMode, error) {
+			return waTypes.AddressingModePN, nil
+		}
+		session.current().Store.LIDs = brokenLIDs{err: errors.New(secret)}
+
+		_, err := session.asTheGroupAddresses(t.Context(), mustJID(t, group), mustJID(t, lid))
+		assertCode(t, err, protocol.ErrorInternal)
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("the driver's own words went to the client: %v", err)
+		}
+	})
+}
+
+// brokenLIDs is a mapping store that only ever fails, which is the one way the real one
+// cannot be made to behave from a test.
+type brokenLIDs struct{ err error }
+
+func (b brokenLIDs) PutManyLIDMappings(context.Context, []waStore.LIDMapping) error { return b.err }
+func (b brokenLIDs) PutLIDMapping(context.Context, waTypes.JID, waTypes.JID) error  { return b.err }
+func (b brokenLIDs) GetPNForLID(context.Context, waTypes.JID) (waTypes.JID, error) {
+	return waTypes.EmptyJID, b.err
+}
+
+func (b brokenLIDs) GetLIDForPN(context.Context, waTypes.JID) (waTypes.JID, error) {
+	return waTypes.EmptyJID, b.err
+}
+
+func (b brokenLIDs) GetManyLIDsForPNs(
+	context.Context, []waTypes.JID,
+) (map[waTypes.JID]waTypes.JID, error) {
+	return nil, b.err
 }
 
 func mustJID(t *testing.T, raw string) waTypes.JID {

@@ -299,8 +299,15 @@ func (s *Session) asTheGroupAddresses(
 		// The store having a bad second, which the next attempt may well not have. It is
 		// not the caller's payload and must not be answered as one: told its address is
 		// wrong, a client stops sending it.
+		//
+		// What went wrong is logged and not sent. A reply crosses into a client's UI, and
+		// a driver's own words there are noise to whoever reads them and a description of
+		// this deployment's insides to whoever does not -- the same reason the fetch
+		// answers out of a closed vocabulary rather than repeating net/http.
+		s.log.Warn().Err(err).Str("chat", chat.String()).Str("participant", participant.String()).
+			Msg("could not look up how a participant is addressed in a group")
 		return waTypes.EmptyJID, protocol.NewError(protocol.ErrorInternal,
-			fmt.Sprintf("could not look up how %s is addressed in that group: %v", participant, err))
+			"could not look up how that participant is addressed in the group")
 	case alt.IsEmpty():
 		// Asked and answered: there is no mapping, so there is no key naming this
 		// participant that the group would resolve, and the next attempt says the same.
