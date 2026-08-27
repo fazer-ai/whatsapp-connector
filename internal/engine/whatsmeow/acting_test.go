@@ -288,6 +288,37 @@ func TestAnIdTheCallerLeftOutIsTheSameOnTheSecondTry(t *testing.T) {
 	}
 }
 
+// A reaction to somebody's status is a message to that person, and the ordinary send path
+// cannot address one: `status@broadcast` is where an account publishes its own status, so
+// the stanza is encrypted to every contact in that account's status audience. The author
+// gets it only if they happen to be in that list, and everybody else in it gets an
+// envelope about a status they may never have seen. See #36.
+//
+// A revoke is not refused with it: deleting one's own status is exactly a message to that
+// audience, and a test that refused both would pin the wrong rule.
+func TestOnlyAReactionIsRefusedOnAStatus(t *testing.T) {
+	t.Parallel()
+
+	session, _, _ := outboundSession(t)
+	const status = `"to":{"kind":"status","id":"status"}`
+
+	_, err := session.react(t.Context(), &protocol.Command{
+		Type: protocol.CommandMessageReact,
+		Payload: json.RawMessage(`{` + status + `,"target_id":"3EB0A1B2C3D4E5F60718","emoji":"👍",
+			"target_participant":{"kind":"phone","id":"5511999990003"}}`),
+	})
+	assertCode(t, err, protocol.ErrorUnsupported)
+
+	_, revoked := session.revoke(t.Context(), &protocol.Command{
+		Type:    protocol.CommandMessageRevoke,
+		Payload: json.RawMessage(`{` + status + `,"target_id":"3EB0A1B2C3D4E5F60718"}`),
+	})
+	var coded *protocol.Error
+	if errors.As(revoked, &coded) && coded.Code == protocol.ErrorUnsupported {
+		t.Fatalf("deleting one's own status was refused as unsupported: %v", revoked)
+	}
+}
+
 // A channel names the post a reaction is on with a server id, not with a message key, and
 // carries it on a node of its own. Sent the ordinary way it goes out naming a key the
 // channel cannot resolve, WhatsApp accepts it, and nobody sees a reaction. See #34.

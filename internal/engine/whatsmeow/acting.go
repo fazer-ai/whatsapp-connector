@@ -170,6 +170,21 @@ func (s *Session) react(ctx context.Context, command *protocol.Command) (json.Ra
 		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
 			"a reaction has to say what to react with, and an empty one takes it off")
 	}
+	if req.To.Kind == protocol.AddressStatus {
+		// A reaction to somebody's status is a message to that person on WhatsApp, and
+		// this is not the path that sends one. `status@broadcast` is where an account
+		// publishes its own status, so SendMessage asks whatsmeow for the account's
+		// status audience and encrypts the stanza to every contact in it: the author
+		// gets it only if they happen to be in that list, and everybody else in it gets
+		// an envelope about a status they may never have seen. Refused until #36 sends
+		// it where it belongs.
+		//
+		// A revoke is not refused with it: deleting one's own status is exactly a
+		// message to that audience, so the fan-out there is the point rather than the
+		// bug.
+		return nil, protocol.NewError(protocol.ErrorUnsupported,
+			"this connector cannot react to a status yet")
+	}
 	if req.To.Kind == protocol.AddressNewsletter {
 		// A channel takes a reaction through a node of its own, keyed by the post's
 		// `server_id` rather than by a message key -- whatsmeow has NewsletterSendReaction
