@@ -862,34 +862,26 @@ func isToken(name string) bool {
 //
 // The caller's own word comes first: it knows what it stored, and the address it named
 // may be a proxy that labels everything a stream of bytes. What the server said is the
-// fallback, and the filename's extension is the last resort.
+// fallback, and the filename's extension is the last resort. Whoever it comes from, a
+// type that is the kind's own said with less detail is corrected to the kind's own --
+// see canonical.
 func mimeToSend(content *mediaContent, served string) string {
+	only := onlyTypeFor(content)
 	if content.Mime != "" {
-		return content.Mime
+		return canonical(content.Mime, only)
 	}
 	// The reference's own, which is what this connector puts on one it issues: a caller
 	// forwarding a file it received hands back the type the blob was stored under, and
 	// ignoring it loses exactly the cases that depend on it -- a sticker is a webp and a
 	// voice note an opus, and neither renders as anything else.
 	if content.Ref != nil && content.Ref.Mime != "" {
-		return content.Ref.Mime
+		return canonical(content.Ref.Mime, only)
 	}
 
-	only := onlyTypeFor(content)
+	// The server named something, and `application/octet-stream` is what one says when it
+	// does not know.
 	if base, _, err := mime.ParseMediaType(served); err == nil && base != "application/octet-stream" {
-		// The server named something. It still loses to the kind's own type when the two
-		// are the same format said with less detail: a voice note served as `audio/ogg`
-		// is an `audio/ogg; codecs=opus` that lost its parameter on the way, and WhatsApp
-		// does not render the one without it -- it drops the message and says nothing,
-		// which is how this was found. A server naming a different format is telling us
-		// something else and keeps saying it.
-		if sameFormat(base, only) {
-			return only
-		}
-		// The parameters travel with it: what was decided here is only whether the server
-		// said anything useful, and `application/octet-stream` is what one says when it
-		// does not know.
-		return served
+		return canonical(served, only)
 	}
 	if only != "" {
 		return only
@@ -905,6 +897,22 @@ func mimeToSend(content *mediaContent, served string) string {
 		return served
 	}
 	return "application/octet-stream"
+}
+
+// canonical is the type to send for one somebody stated.
+//
+// It is what they said, except when the kind's own type is the same format with more
+// detail, and then it is the kind's own. A voice note stated as `audio/ogg` is an
+// `audio/ogg; codecs=opus` that lost its parameter somewhere -- in a store that keeps
+// base types, in a proxy, in a header -- and WhatsApp does not render the one without
+// it: it drops the message and says nothing, which is how this was found. Where the two
+// name different formats the stated one is saying something, and it keeps saying it: a
+// caller that calls a sticker a PNG is not to be corrected here.
+func canonical(stated, only string) string {
+	if base, _, err := mime.ParseMediaType(stated); err == nil && sameFormat(base, only) {
+		return only
+	}
+	return stated
 }
 
 // sameFormat reports whether a type the kind guarantees describes the same format as one

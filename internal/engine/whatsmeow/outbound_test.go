@@ -2041,34 +2041,46 @@ func TestOnlyAnHTTPAddressIsFetchedFrom(t *testing.T) {
 func TestAStickerAndAVoiceNoteAreLabelledWithWhatTheyCanOnlyBe(t *testing.T) {
 	t.Parallel()
 
-	for _, tc := range []struct{ name, content, served, want string }{
-		{"a sticker nobody named", `"kind":"sticker"`, "application/octet-stream", "image/webp"},
-		{"a sticker the server would not name", `"kind":"sticker"`, "", "image/webp"},
-		{"a voice note nobody named", `"kind":"audio","voice_note":true`, "", "audio/ogg; codecs=opus"},
+	for _, tc := range []struct{ name, content, ref, served, want string }{
+		{"a sticker nobody named", `"kind":"sticker"`, "", "application/octet-stream", "image/webp"},
+		{"a sticker the server would not name", `"kind":"sticker"`, "", "", "image/webp"},
+		{"a voice note nobody named", `"kind":"audio","voice_note":true`, "", "", "audio/ogg; codecs=opus"},
 		// The extension would answer `audio/ogg`, which WhatsApp does not play as a note.
 		{"a voice note named only by its extension", `"kind":"audio","voice_note":true,"filename":"a.ogg"`,
-			"application/octet-stream", "audio/ogg; codecs=opus"},
+			"", "application/octet-stream", "audio/ogg; codecs=opus"},
 		// An ordinary audio can be anything, so the extension still decides.
-		{"an ordinary audio file", `"kind":"audio","filename":"a.mp3"`, "", "audio/mpeg"},
+		{"an ordinary audio file", `"kind":"audio","filename":"a.mp3"`, "", "", "audio/mpeg"},
 		// The case that made every voice note vanish: a server naming the same format
 		// with less detail than the kind guarantees. WhatsApp drops an `audio/ogg` that
 		// is not told it is opus, and says nothing about it.
 		{"a voice note the server named without the codec", `"kind":"audio","voice_note":true`,
-			"audio/ogg", "audio/ogg; codecs=opus"},
-		{"a sticker the server named as a plain webp", `"kind":"sticker"`, "image/webp", "image/webp"},
-		// And a stated type is information, not something to correct.
-		{"a sticker the caller says is a PNG", `"kind":"sticker","mime":"image/png"`, "", "image/png"},
-		{"a sticker the server says is a PNG", `"kind":"sticker"`, "image/png", "image/png"},
+			"", "audio/ogg", "audio/ogg; codecs=opus"},
+		{"a sticker the server named as a plain webp", `"kind":"sticker"`, "", "image/webp", "image/webp"},
+		// The same loss reaches here by two more doors, and the send reports success
+		// through all three. A store that keeps base types hands the caller back
+		// `audio/ogg` for the note it holds, and the caller repeats it.
+		{"a voice note the caller named without the codec",
+			`"kind":"audio","voice_note":true,"mime":"audio/ogg"`, "", "", "audio/ogg; codecs=opus"},
+		{"a voice note the reference named without the codec",
+			`"kind":"audio","voice_note":true`, "audio/ogg", "", "audio/ogg; codecs=opus"},
+		// And a stated type that names a different format is information, not something
+		// to correct.
+		{"a sticker the caller says is a PNG", `"kind":"sticker","mime":"image/png"`, "", "", "image/png"},
+		{"a sticker the reference says is a PNG", `"kind":"sticker"`, "image/png", "", "image/png"},
+		{"a sticker the server says is a PNG", `"kind":"sticker"`, "", "image/png", "image/png"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
 			session, serving, _ := outboundSession(t)
 			serving.answer([]byte("bytes"), tc.served)
+			ref := `"ref":{"kind":"url","url":"http://rails:3000/blob"`
+			if tc.ref != "" {
+				ref += `,"mime":"` + tc.ref + `"`
+			}
 			message := mustSendBody(t, session, `{"message_id":"3EB0",
 				"to":{"kind":"phone","id":"5511999990001"},
-				"content":{"type":"media",`+tc.content+`,
-				"ref":{"kind":"url","url":"http://rails:3000/blob"}}}`)
+				"content":{"type":"media",`+tc.content+`,`+ref+`}}}`)
 
 			var got string
 			switch {
