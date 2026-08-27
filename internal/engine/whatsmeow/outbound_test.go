@@ -437,7 +437,13 @@ func TestWhatTheFileIsCalledFallsBackInThatOrder(t *testing.T) {
 	for _, tc := range []struct{ name, content, served, want string }{
 		{"the caller said so", `"mime":"application/pdf","filename":"a.pdf"`, "text/html", "application/pdf"},
 		{"the server said so", `"filename":"a.pdf"`, "image/png", "image/png"},
+		// The parameters are part of what the file is: a voice note trimmed to
+		// `audio/ogg` reaches the recipient described as something else.
+		{"the server said so, with parameters", `"filename":"a.ogg"`,
+			"audio/ogg; codecs=opus", "audio/ogg; codecs=opus"},
 		{"only the name is left", `"filename":"proposta.pdf"`, "application/octet-stream", "application/pdf"},
+		{"the generic type with parameters is still generic", `"filename":"proposta.pdf"`,
+			"application/octet-stream; charset=binary", "application/pdf"},
 		{"nothing said anything", `"filename":"proposta"`, "", "application/octet-stream"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1246,6 +1252,12 @@ func TestAHeaderNoClientWouldSendIsRefusedOnThePayload(t *testing.T) {
 		{"a colon in the name", `{"X-API:Key":"sk"}`},
 		{"a space in the name", `{"X API Key":"sk"}`},
 		{"a name that is not there at all", `{"":"sk"}`},
+		// Not obviously wrong to look at, and rejected by the transport all the same,
+		// which is where the classification would go wrong.
+		{"parentheses in the name", `{"X(API)":"sk"}`},
+		{"an at sign in the name", `{"X@Key":"sk"}`},
+		{"a comma in the name", `{"X,Key":"sk"}`},
+		{"a slash in the name", `{"X/Key":"sk"}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -1296,4 +1308,111 @@ func TestADeadlineLandingMidBodyIsTheSameAnswerAsOneLandingBeforeIt(t *testing.T
 			"ref":{"kind":"url","url":"http://rails:3000/blob.jpg"}}}`),
 	})
 	assertCode(t, err, protocol.ErrorTimeout)
+}
+
+// Where the caller's headers stop. net/http drops Authorization, Cookie and
+// WWW-Authenticate of its own accord when a redirect leaves the host, and nothing else,
+// so anything a vendor authenticates with is this policy's to stop.
+//
+// Against the policy rather than through a pair of servers: the downgrade case needs TLS
+// on one side and plaintext on the other, and reaching it through a real fetch means
+// swapping the process-wide transport out from under every other test.
+func TestWhereACallersHeadersStopOnARedirect(t *testing.T) {
+	t.Parallel()
+
+	const secret = "sk_live_deadbeef"
+	for _, tc := range []struct {
+		name    string
+		from    string
+		to      string
+		carries bool
+	}{
+		{"the same origin", "https://storage.example/a", "https://storage.example/b", true},
+		{"another path on the same origin", "https://storage.example/a", "https://storage.example/deep/b", true},
+		{"another host", "https://storage.example/a", "https://elsewhere.example/b", false},
+		{"a downgrade to plaintext on the same name", "https://storage.example/a", "http://storage.example/a", false},
+		{"another port on the same name", "https://storage.example/a", "https://storage.example:8443/a", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			headers := map[string]string{"X-API-Key": secret}
+			first := requestTo(t, tc.from, headers)
+			hop := requestTo(t, tc.to, headers)
+
+			if err := followingRedirects(headers)(hop, []*http.Request{first}); err != nil {
+				t.Fatalf("the hop was refused: %v", err)
+			}
+			carried := hop.Header.Get("X-API-Key") == secret
+			if carried != tc.carries {
+				t.Fatalf("the credential carried=%v to %s, want %v", carried, tc.to, tc.carries)
+			}
+		})
+	}
+}
+
+// How far the chain is followed. via holds the requests already made, so the count is off
+// by one from the obvious reading, and the constant is what the refusal quotes.
+func TestARedirectChainIsFollowedAsFarAsTheConstantSays(t *testing.T) {
+	t.Parallel()
+
+	policy := followingRedirects(nil)
+	hop := requestTo(t, "https://storage.example/b", nil)
+	for made := 1; made <= fetchRedirects; made++ {
+		via := make([]*http.Request, made)
+		for i := range via {
+			via[i] = requestTo(t, "https://storage.example/a", nil)
+		}
+		if err := policy(hop, via); err != nil {
+			t.Fatalf("hop %d of %d was refused: %v", made, fetchRedirects, err)
+		}
+	}
+
+	via := make([]*http.Request, fetchRedirects+1)
+	for i := range via {
+		via[i] = requestTo(t, "https://storage.example/a", nil)
+	}
+	if err := policy(hop, via); !errors.Is(err, errTooManyRedirects) {
+		t.Fatalf("the chain past %d hops answered %v", fetchRedirects, err)
+	}
+}
+
+func requestTo(t *testing.T, address string, headers map[string]string) *http.Request {
+	t.Helper()
+
+	request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, address, http.NoBody)
+	if err != nil {
+		t.Fatalf("NewRequest(%q): %v", address, err)
+	}
+	for name, value := range headers {
+		request.Header.Set(name, value)
+	}
+	return request
+}
+
+// The parameters are part of what the file is: `audio/ogg; codecs=opus` is what a voice
+// note is, and trimmed to `audio/ogg` it reaches the recipient described as something
+// else.
+//
+// Against the real fetch, because that is where the header is read. The fake hands back
+// whatever a test set, so it would report this working whether or not anything trims.
+func TestWhatTheServerCalledTheFileArrivesWithItsParameters(t *testing.T) {
+	t.Parallel()
+
+	const served = "audio/ogg; codecs=opus"
+	serving := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", served)
+		_, _ = w.Write([]byte("bytes"))
+	}))
+	t.Cleanup(serving.Close)
+
+	file, err := retrieveOverHTTP(t.Context(), serving.URL+"/voice.ogg", nil)
+	if err != nil {
+		t.Fatalf("retrieveOverHTTP: %v", err)
+	}
+	defer func() { _ = file.body.Close() }()
+
+	if file.mime != served {
+		t.Fatalf("the server said %q and the fetch read %q", served, file.mime)
+	}
 }

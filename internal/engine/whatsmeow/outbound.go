@@ -520,7 +520,7 @@ func fetchable(ref *protocol.MediaRef) (string, error) {
 // the message. A header with a newline in it will never be sendable, whoever is asked.
 func sendableHeaders(headers map[string]string) error {
 	for name, value := range headers {
-		if name == "" || strings.ContainsAny(name, " \t\r\n:") {
+		if !isToken(name) {
 			return protocol.NewError(protocol.ErrorInvalidPayload,
 				fmt.Sprintf("%q is not a header name", name))
 		}
@@ -536,6 +536,27 @@ func sendableHeaders(headers map[string]string) error {
 	return nil
 }
 
+// isToken reports whether a string is a header name.
+//
+// The whole grammar rather than a handful of characters that are obviously wrong: what
+// this exists to catch is a name the transport will reject, and the transport checks
+// against this list. A check that only looked for spaces and colons would let `X(API)`
+// through, and the refusal would then arrive from the transport as something to retry.
+func isToken(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, char := range []byte(name) {
+		switch {
+		case char >= 'a' && char <= 'z', char >= 'A' && char <= 'Z', char >= '0' && char <= '9':
+		case strings.IndexByte("!#$%&'*+-.^_`|~", char) >= 0:
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // mimeToSend decides what to tell WhatsApp the file is.
 //
 // The caller's own word comes first: it knows what it stored, and the address it named
@@ -545,7 +566,10 @@ func mimeToSend(content *outboundContent, served string) string {
 	if content.Mime != "" {
 		return content.Mime
 	}
-	if served != "" && served != "application/octet-stream" {
+	if base, _, err := mime.ParseMediaType(served); err == nil && base != "application/octet-stream" {
+		// The parameters travel with it: what is being decided here is only whether the
+		// server said anything useful, and `application/octet-stream` is what a server
+		// says when it does not know.
 		return served
 	}
 	if ext := filenameExt(content.Filename); ext != "" {
@@ -554,6 +578,8 @@ func mimeToSend(content *outboundContent, served string) string {
 		}
 	}
 	if served != "" {
+		// Unparseable or the generic type, and nothing better was found: repeated as it
+		// stands, because it is still what the server said the bytes are.
 		return served
 	}
 	return "application/octet-stream"
@@ -773,27 +799,7 @@ func retrieveOverHTTP(ctx context.Context, address string, headers map[string]st
 		request.Header.Set(name, value)
 	}
 
-	client := &http.Client{
-		CheckRedirect: func(hop *http.Request, via []*http.Request) error {
-			// Strictly greater: via holds the requests already made, so on the first
-			// redirect it has one entry. Comparing with >= would follow one hop fewer
-			// than the constant says.
-			if len(via) > fetchRedirects {
-				return errTooManyRedirects
-			}
-			// net/http drops Authorization, Cookie and WWW-Authenticate of its own accord
-			// when a redirect leaves the host, and nothing else: a reference authenticated
-			// with X-API-Key or a vendor's own header would arrive at whoever the first
-			// host chose to point at, carrying a working credential. The caller's headers
-			// are what open its storage, so they go no further than the host it named.
-			if hop.URL.Host != via[0].URL.Host {
-				for name := range headers {
-					hop.Header.Del(name)
-				}
-			}
-			return nil
-		},
-	}
+	client := &http.Client{CheckRedirect: followingRedirects(headers)}
 	answer, err := client.Do(request)
 	switch {
 	case errors.Is(err, errTooManyRedirects):
@@ -828,8 +834,44 @@ func retrieveOverHTTP(ctx context.Context, address string, headers map[string]st
 	return source{
 		body: answer.Body,
 		size: answer.ContentLength,
-		mime: strings.TrimSpace(strings.Split(answer.Header.Get("Content-Type"), ";")[0]),
+		// Kept whole, parameters and all. `audio/ogg; codecs=opus` is what a voice note
+		// is, and trimmed to `audio/ogg` it reaches the recipient described as something
+		// else. What the base type is needed for is the comparison in mimeToSend, which
+		// parses it there rather than throwing the rest away here.
+		mime: strings.TrimSpace(answer.Header.Get("Content-Type")),
 	}, nil
+}
+
+// followingRedirects is the policy for a fetch of the caller's URL: how far it follows,
+// and what it stops carrying on the way.
+//
+// A function of its own rather than a closure written inline, because what it decides is
+// worth testing without a TLS server and a swapped-out process-wide transport standing
+// between the test and the decision.
+func followingRedirects(headers map[string]string) func(*http.Request, []*http.Request) error {
+	return func(hop *http.Request, via []*http.Request) error {
+		// Strictly greater: via holds the requests already made, so on the first redirect
+		// it has one entry. Comparing with >= would follow one hop fewer than the
+		// constant says.
+		if len(via) > fetchRedirects {
+			return errTooManyRedirects
+		}
+		// net/http drops Authorization, Cookie and WWW-Authenticate of its own accord
+		// when a redirect leaves the host, and nothing else: a reference authenticated
+		// with X-API-Key or a vendor's own header would arrive at whoever the first host
+		// chose to point at, carrying a working credential. The caller's headers are what
+		// open its storage, so they go no further than the origin it named.
+		//
+		// The scheme is half of that origin. A redirect from https to http on the same
+		// name is the classic downgrade: compared by host alone the destination looks
+		// like the same trusted place, and the credential goes out in plaintext.
+		if hop.URL.Scheme != via[0].URL.Scheme || hop.URL.Host != via[0].URL.Host {
+			for name := range headers {
+				hop.Header.Del(name)
+			}
+		}
+		return nil
+	}
 }
 
 // statusFailure splits what the caller's own server said into the answers a client acts
