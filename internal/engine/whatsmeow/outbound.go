@@ -772,6 +772,22 @@ func matchable(digest string) error {
 // worth trying again and the same reference is retried for as long as the caller keeps
 // the message. A header with a newline in it will never be sendable, whoever is asked.
 func sendableHeaders(headers map[string]string) error {
+	// Two names that differ only in case are one header on the wire: http.Header.Set
+	// canonicalises both onto the same field, and which of them survives is decided by
+	// the order Go happens to walk the map in, which is deliberately not the same twice.
+	// A reference carrying `Authorization` and `authorization` would then send one
+	// credential on one attempt and the other on the next.
+	seen := make(map[string]string, len(headers))
+	for name := range headers {
+		folded := strings.ToLower(name)
+		if first, repeated := seen[folded]; repeated {
+			return protocol.NewError(protocol.ErrorInvalidPayload,
+				fmt.Sprintf("%q and %q are the same header, and which one would be sent is not decided anywhere",
+					first, name))
+		}
+		seen[folded] = name
+	}
+
 	for name, value := range headers {
 		if !isToken(name) {
 			return protocol.NewError(protocol.ErrorInvalidPayload,
@@ -832,6 +848,12 @@ func mimeToSend(content *mediaContent, served string) string {
 		// says when it does not know.
 		return served
 	}
+	// Ahead of the filename, because it is not a guess: what the caller already said the
+	// message is leaves only one type the file can be, and the extension would answer
+	// `audio/ogg` for a voice note that WhatsApp only plays as opus.
+	if only := onlyTypeFor(content); only != "" {
+		return only
+	}
 	if ext := filenameExt(content.Filename); ext != "" {
 		if guessed := mime.TypeByExtension(ext); guessed != "" {
 			return guessed
@@ -843,6 +865,25 @@ func mimeToSend(content *mediaContent, served string) string {
 		return served
 	}
 	return "application/octet-stream"
+}
+
+// onlyTypeFor is the type a body can be when the caller has already said what it is
+// sending, and empty for the kinds that can be anything.
+//
+// A sticker is a webp on WhatsApp and a voice note is opus in ogg, and neither renders as
+// anything else: labelled `application/octet-stream` because nothing named the file, one
+// arrives as a broken sticker and the other as a note that will not play, while the send
+// reports success. It does not override a type anybody stated -- a caller that says a
+// sticker is a PNG is saying something, and it is not this function's to correct.
+func onlyTypeFor(content *mediaContent) string {
+	switch {
+	case content.Kind == protocol.MediaSticker:
+		return "image/webp"
+	case content.Kind == protocol.MediaAudio && content.VoiceNote:
+		return "audio/ogg; codecs=opus"
+	default:
+		return ""
+	}
 }
 
 // filenameExt is the extension of a name, lowercased, or empty when there is none.

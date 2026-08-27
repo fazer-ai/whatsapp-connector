@@ -1994,3 +1994,88 @@ func TestOnlyAnHTTPAddressIsFetchedFrom(t *testing.T) {
 		})
 	}
 }
+
+// A sticker is a webp on WhatsApp and a voice note is opus in ogg, and neither renders as
+// anything else. Labelled with the generic type because nothing named the file, one
+// arrives as a broken sticker and the other as a note that will not play, while the send
+// reports success.
+func TestAStickerAndAVoiceNoteAreLabelledWithWhatTheyCanOnlyBe(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct{ name, content, served, want string }{
+		{"a sticker nobody named", `"kind":"sticker"`, "application/octet-stream", "image/webp"},
+		{"a sticker the server would not name", `"kind":"sticker"`, "", "image/webp"},
+		{"a voice note nobody named", `"kind":"audio","voice_note":true`, "", "audio/ogg; codecs=opus"},
+		// The extension would answer `audio/ogg`, which WhatsApp does not play as a note.
+		{"a voice note named only by its extension", `"kind":"audio","voice_note":true,"filename":"a.ogg"`,
+			"application/octet-stream", "audio/ogg; codecs=opus"},
+		// An ordinary audio can be anything, so the extension still decides.
+		{"an ordinary audio file", `"kind":"audio","filename":"a.mp3"`, "", "audio/mpeg"},
+		// And a stated type is information, not something to correct.
+		{"a sticker the caller says is a PNG", `"kind":"sticker","mime":"image/png"`, "", "image/png"},
+		{"a sticker the server says is a PNG", `"kind":"sticker"`, "image/png", "image/png"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			session, serving, _ := outboundSession(t)
+			serving.answer([]byte("bytes"), tc.served)
+			message := mustSendBody(t, session, `{"message_id":"3EB0",
+				"to":{"kind":"phone","id":"5511999990001"},
+				"content":{"type":"media",`+tc.content+`,
+				"ref":{"kind":"url","url":"http://rails:3000/blob"}}}`)
+
+			var got string
+			switch {
+			case message.GetStickerMessage() != nil:
+				got = message.GetStickerMessage().GetMimetype()
+			case message.GetAudioMessage() != nil:
+				got = message.GetAudioMessage().GetMimetype()
+			default:
+				t.Fatalf("that did not go out as a sticker or an audio: %v", message)
+			}
+			if got != tc.want {
+				t.Fatalf("the file went out as %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// Two names that differ only in case are one header on the wire, and which of them
+// survives is decided by the order Go happens to walk the map in, which is deliberately
+// not the same twice. A reference carrying both would send one credential on one attempt
+// and the other on the next.
+func TestTwoHeadersThatAreTheSameHeaderAreRefused(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct{ name, headers string }{
+		{"the same name in two cases", `{"Authorization":"Bearer a","authorization":"Bearer b"}`},
+		{"a vendor header in two cases", `{"X-API-Key":"a","x-api-key":"b"}`},
+		{"three of them", `{"Accept":"a","accept":"b","ACCEPT":"c"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			session, serving, _ := outboundSession(t)
+			serving.answer([]byte("bytes"), "")
+
+			_, err := session.send(t.Context(), &protocol.Command{
+				Type: protocol.CommandMessageSend,
+				Payload: json.RawMessage(`{"message_id":"3EB0","to":{"kind":"phone","id":"5511999990001"},
+					"content":{"type":"media","kind":"image","ref":{"kind":"url",
+					"url":"http://rails:3000/blob.jpg","headers":` + tc.headers + `}}}`),
+			})
+			assertCode(t, err, protocol.ErrorInvalidPayload)
+			if serving.count() != 0 {
+				t.Fatalf("a request nobody could reproduce was still sent %d time(s)", serving.count())
+			}
+		})
+	}
+
+	// Different headers are the ordinary case and stay so.
+	if err := sendableHeaders(map[string]string{
+		"Authorization": "Bearer a", "X-API-Key": "b", "Accept": "*/*",
+	}); err != nil {
+		t.Fatalf("three different headers were refused: %v", err)
+	}
+}
