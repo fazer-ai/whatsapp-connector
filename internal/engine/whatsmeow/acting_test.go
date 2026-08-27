@@ -10,6 +10,7 @@ import (
 
 	wm "go.mau.fi/whatsmeow"
 	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
+	waStore "go.mau.fi/whatsmeow/store"
 	waTypes "go.mau.fi/whatsmeow/types"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
@@ -415,6 +416,172 @@ func TestEachOfTheThreeGoesOutUnderAnIdARetryWillRepeat(t *testing.T) {
 			if sentAgain.id != first {
 				t.Fatalf("the redelivery went out as %s and the first as %s, so the recipient "+
 					"sees two", sentAgain.id, first)
+			}
+		})
+	}
+}
+
+// A group is addressed by phone number or by LID, and a message key in it names its
+// sender in whichever the group is on. The client cannot know which -- this connector
+// publishes a sender as both, and Chatwoot hands back the LID whenever it has one
+// (message_sender.rb, target_participant via Address.for_contact) -- so a key built from
+// what it sends can name a participant no message in that group was ever sent by.
+// WhatsApp accepts it, stamps it, and shows nothing.
+func TestAParticipantIsPutInTheGroupsOwnNamespace(t *testing.T) {
+	t.Parallel()
+
+	const (
+		group = "120363000000000000@g.us"
+		pn    = "5511999990003@s.whatsapp.net"
+		lid   = "182736451928374@lid"
+	)
+	for _, tc := range []struct {
+		name, participant, want string
+		mode                    waTypes.AddressingMode
+		modeErr                 bool
+		refused                 bool
+	}{
+		{name: "a LID where the group is on phone numbers", participant: lid, want: pn,
+			mode: waTypes.AddressingModePN},
+		{name: "a phone number where the group is on LIDs", participant: pn, want: lid,
+			mode: waTypes.AddressingModeLID},
+		// Already right, so nothing is looked up and nothing changes.
+		{name: "a LID where the group is on LIDs", participant: lid, want: lid,
+			mode: waTypes.AddressingModeLID},
+		{name: "a phone number where the group is on phone numbers", participant: pn, want: pn,
+			mode: waTypes.AddressingModePN},
+		// The group could not be read. Left as it came, which is what this did before and
+		// is no worse: refusing over a metadata query having a bad second would break a
+		// reaction that mostly works.
+		{name: "a group that could not be read", participant: lid, want: lid, modeErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			session, _, _ := outboundSession(t)
+			session.groupMode = func(context.Context, waTypes.JID) (waTypes.AddressingMode, error) {
+				if tc.modeErr {
+					return "", errors.New("no route to WhatsApp")
+				}
+				return tc.mode, nil
+			}
+			mustMap(t, session, pn, lid)
+
+			got, err := session.asTheGroupAddresses(t.Context(), mustJID(t, group), mustJID(t, tc.participant))
+			if err != nil {
+				t.Fatalf("asTheGroupAddresses: %v", err)
+			}
+			if got.String() != tc.want {
+				t.Fatalf("the key names %s, want %s", got, tc.want)
+			}
+		})
+	}
+
+	// A direct chat's key carries no participant at all, so there is nothing to place and
+	// nothing to look up: a round trip here would be spent on every reaction in every
+	// one-to-one chat.
+	t.Run("a direct chat is left alone", func(t *testing.T) {
+		t.Parallel()
+
+		session, _, _ := outboundSession(t)
+		session.groupMode = func(context.Context, waTypes.JID) (waTypes.AddressingMode, error) {
+			t.Error("a direct chat asked WhatsApp how its group addresses members")
+			return "", nil
+		}
+		direct := mustJID(t, "5511999990002@s.whatsapp.net")
+		got, err := session.asTheGroupAddresses(t.Context(), direct, direct)
+		if err != nil {
+			t.Fatalf("asTheGroupAddresses: %v", err)
+		}
+		if got != direct {
+			t.Fatalf("a direct chat's sender came back as %s", got)
+		}
+	})
+
+	// And the other failure, which is not the same: the namespace is known to be wrong
+	// and there is nothing to translate with, so the key can only be built naming
+	// somebody the group has never heard of.
+	t.Run("a participant this session cannot place", func(t *testing.T) {
+		t.Parallel()
+
+		session, _, _ := outboundSession(t)
+		session.groupMode = func(context.Context, waTypes.JID) (waTypes.AddressingMode, error) {
+			return waTypes.AddressingModePN, nil
+		}
+		_, err := session.asTheGroupAddresses(t.Context(),
+			mustJID(t, group), mustJID(t, "999999999999999@lid"))
+		assertCode(t, err, protocol.ErrorInvalidPayload)
+	})
+}
+
+func mustJID(t *testing.T, raw string) waTypes.JID {
+	t.Helper()
+
+	jid, err := waTypes.ParseJID(raw)
+	if err != nil {
+		t.Fatalf("ParseJID(%q): %v", raw, err)
+	}
+	return jid
+}
+
+func mustMap(t *testing.T, session *Session, pn, lid string) {
+	t.Helper()
+
+	if err := session.current().Store.LIDs.PutManyLIDMappings(t.Context(), []waStore.LIDMapping{
+		{LID: mustJID(t, lid), PN: mustJID(t, pn)},
+	}); err != nil {
+		t.Fatalf("PutManyLIDMappings: %v", err)
+	}
+}
+
+// And both commands that name a participant have to use it. Asserted on the key that
+// reached the wire, because a command that resolves the participant and then builds the
+// key from the unresolved one passes every test of the resolving and still names somebody
+// the group has never sent a message from.
+func TestBothCommandsPutTheParticipantOnTheWireResolved(t *testing.T) {
+	t.Parallel()
+
+	const (
+		group = `"to":{"kind":"group","id":"120363000000000000"}`
+		pn    = "5511999990003@s.whatsapp.net"
+		lid   = "182736451928374@lid"
+	)
+	for _, tc := range []struct {
+		name        string
+		run         func(*Session, *protocol.Command) error
+		kind        protocol.CommandType
+		payload     string
+		participant func(*waE2E.Message) string
+	}{
+		{"a reaction", func(s *Session, c *protocol.Command) error { _, err := s.react(t.Context(), c); return err },
+			protocol.CommandMessageReact,
+			`{` + group + `,"target_id":"3EB0TARGET","emoji":"👍",
+				"target_participant":{"kind":"lid","id":"182736451928374"}}`,
+			func(m *waE2E.Message) string { return m.GetReactionMessage().GetKey().GetParticipant() }},
+		{"an admin revoke", func(s *Session, c *protocol.Command) error { _, err := s.revoke(t.Context(), c); return err },
+			protocol.CommandMessageRevoke,
+			`{` + group + `,"target_id":"3EB0TARGET",
+				"participant":{"kind":"lid","id":"182736451928374"}}`,
+			func(m *waE2E.Message) string { return m.GetProtocolMessage().GetKey().GetParticipant() }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			session, sent := actingSession(t)
+			// A group still on phone numbers, which is where the LID the client sends
+			// names nobody.
+			session.groupMode = func(context.Context, waTypes.JID) (waTypes.AddressingMode, error) {
+				return waTypes.AddressingModePN, nil
+			}
+			mustMap(t, session, pn, lid)
+
+			if err := tc.run(session, &protocol.Command{
+				Type: tc.kind, ID: "cmd_000042", Payload: json.RawMessage(tc.payload),
+			}); err != nil {
+				t.Fatalf("%s: %v", tc.name, err)
+			}
+			if got := tc.participant(sent.message); got != pn {
+				t.Fatalf("the key names %q, want %q", got, pn)
 			}
 		})
 	}

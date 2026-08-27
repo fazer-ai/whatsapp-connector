@@ -127,6 +127,11 @@ func (s *Session) revoke(ctx context.Context, command *protocol.Command) (json.R
 	if err := s.readyToSend(); err != nil {
 		return nil, err
 	}
+	// The same question a reaction's participant answers, for the same reason: an admin
+	// deleting somebody's message in a group names them in the key.
+	if sender, err = s.asTheGroupAddresses(ctx, to, sender); err != nil {
+		return nil, err
+	}
 
 	client := s.current()
 	// Derived like the other two, even though a revoke's payload has no id field of its
@@ -188,6 +193,9 @@ func (s *Session) react(ctx context.Context, command *protocol.Command) (json.Ra
 	if err := s.readyToSend(); err != nil {
 		return nil, err
 	}
+	if sender, err = s.asTheGroupAddresses(ctx, to, sender); err != nil {
+		return nil, err
+	}
 
 	client := s.current()
 	sent, err := s.putOnTheWire(ctx, to, s.orDerived(command, req.MessageID),
@@ -234,6 +242,67 @@ func whoSentTheTarget(req *reactRequest, chat waTypes.JID) (waTypes.JID, error) 
 		return waTypes.EmptyJID, protocol.NewError(protocol.ErrorInvalidPayload,
 			fmt.Sprintf("a reaction on somebody else's message in a %s has to say whose", req.To.Kind))
 	}
+}
+
+// asTheGroupAddresses rewrites a participant into the addressing its group uses.
+//
+// A group is addressed by phone number or by LID, and a message key in it names its
+// sender in whichever of the two the group is on. The client does not know which: this
+// connector publishes a sender as both, and the one a client hands back is whichever it
+// files contacts under -- Chatwoot answers with the LID whenever it has one. Passed
+// through into a key for a group still on phone numbers, that names a participant no
+// message in it was ever sent by, and WhatsApp accepts the key, answers with a timestamp
+// and shows nothing. whatsmeow does not rewrite it either: it picks the addressing for
+// the stanza and leaves the key in the body as it was built.
+//
+// Costs a round trip for the group's metadata, and only on a group whose key names a
+// participant -- a direct chat's does not, which is where this is not called at all.
+//
+// The two failures are answered differently, which is the point of splitting them. Not
+// being able to read the group leaves the participant as the caller gave it: that is what
+// this did before, no worse, and refusing a reaction because a metadata query had a bad
+// second would break one that mostly works. Reading the group and then having nothing to
+// translate with is the other half: the namespace is known to be wrong and there is
+// nothing to build a right one from, so it is refused rather than sent to be ignored.
+func (s *Session) asTheGroupAddresses(
+	ctx context.Context, chat, participant waTypes.JID,
+) (waTypes.JID, error) {
+	if participant.IsEmpty() || chat.Server != waTypes.GroupServer {
+		return participant, nil
+	}
+	read := s.groupMode
+	if read == nil {
+		read = s.groupModeOverSocket
+	}
+	info, err := read(ctx, chat)
+	if err != nil {
+		s.log.Warn().Err(err).Str("chat", chat.String()).
+			Msg("could not read the group's addressing, sending the participant as it came")
+		return participant, nil
+	}
+	wanted := waTypes.DefaultUserServer
+	if info == waTypes.AddressingModeLID {
+		wanted = waTypes.HiddenUserServer
+	}
+	if participant.Server == wanted {
+		return participant, nil
+	}
+	alt, err := s.current().Store.GetAltJID(ctx, participant)
+	if err != nil || alt.IsEmpty() {
+		return waTypes.EmptyJID, protocol.NewError(protocol.ErrorInvalidPayload,
+			fmt.Sprintf("that group names its senders by %s and this session cannot place %s among them",
+				wanted, participant))
+	}
+	return alt, nil
+}
+
+// groupModeOverSocket asks WhatsApp how a group addresses its members.
+func (s *Session) groupModeOverSocket(ctx context.Context, chat waTypes.JID) (waTypes.AddressingMode, error) {
+	info, err := s.current().GetGroupInfo(ctx, chat)
+	if err != nil {
+		return "", err
+	}
+	return info.AddressingMode, nil
 }
 
 // jidOfMaybe is jidOf for a field the contract makes optional, where absent and an
