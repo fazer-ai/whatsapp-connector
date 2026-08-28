@@ -1385,6 +1385,32 @@ func (s *Session) forward() {
 	}
 }
 
+// offer publishes without ever waiting for room, and drops what does not fit.
+//
+// The blocking emit is right for everything that has to arrive: the inbox filling means
+// the publisher is behind, and holding the node handler until it catches up is how a
+// message survives. Presence is the opposite and needs the opposite -- it describes a
+// moment, so one that waits out a backlog is published as a fact about now that stopped
+// being true minutes ago, and the wait itself holds WhatsApp's node handler for as long
+// as the publisher is down.
+//
+// Dropped rather than coalesced. What is lost is a second of somebody's typing, and the
+// next event says what is true instead of correcting what was published; keeping a slot
+// per chat to overwrite would be state to age out for the same answer.
+func (s *Session) offer(eventType protocol.EventType, payload any) {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		s.log.Error().Err(err).Str("type", string(eventType)).Msg("failed to render an event payload")
+		return
+	}
+	select {
+	case s.inbox <- engine.Emission{Type: eventType, Payload: body}:
+	default:
+		s.log.Debug().Str("type", string(eventType)).
+			Msg("dropping a transient event the publisher had no room for")
+	}
+}
+
 func (s *Session) emit(eventType protocol.EventType, payload any) {
 	body, err := json.Marshal(payload)
 	if err != nil {

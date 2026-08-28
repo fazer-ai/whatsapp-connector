@@ -22,8 +22,12 @@ import (
 // and the state that would have corrected it -- the pause, or the message itself -- was
 // already published while the stale one was being retried.
 //
-// So these publish and acknowledge, whatever happens. What is lost when the publisher is
-// down is a second of somebody's typing, and it is replaced by the next event.
+// So these publish and acknowledge, whatever happens -- and they publish through offer
+// rather than emit, which is the same decision one layer down. emit waits for room in
+// the inbox, and waiting is the thing this must not do: a backlog would hold WhatsApp's
+// node handler for as long as the publisher is down and then deliver a `composing` about
+// a minute that has passed. What is lost when there is no room is a second of somebody's
+// typing, and the next event replaces it.
 func (s *Session) chatPresence(event *waEvents.ChatPresence) bool {
 	chat, addressable := addressOf(event.Chat)
 	if !addressable {
@@ -38,7 +42,7 @@ func (s *Session) chatPresence(event *waEvents.ChatPresence) bool {
 	if sender.Phone != "" || sender.LID != "" {
 		published.Sender = &sender
 	}
-	s.emit(protocol.EventChatPresence, published)
+	s.offer(protocol.EventChatPresence, published)
 	return true
 }
 
@@ -61,7 +65,7 @@ func (s *Session) presence(event *waEvents.Presence) bool {
 		seen := event.LastSeen.UnixMilli()
 		published.LastSeen = &seen
 	}
-	s.emit(protocol.EventPresenceUpdate, published)
+	s.offer(protocol.EventPresenceUpdate, published)
 	return true
 }
 

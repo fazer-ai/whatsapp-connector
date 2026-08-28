@@ -220,7 +220,8 @@ func (s *Session) Execute(ctx context.Context, command *protocol.Command) (json.
 			"timestamp":  time.Now().UnixMilli(),
 			"client_ref": nil,
 		})
-	case protocol.CommandMessageRevoke, protocol.CommandMessageMarkRead, protocol.CommandChatPresence:
+	case protocol.CommandMessageRevoke, protocol.CommandMessageMarkRead,
+		protocol.CommandChatPresence, protocol.CommandPresenceSet, protocol.CommandPresenceSubscribe:
 		if !connected {
 			return nil, errNotConnected
 		}

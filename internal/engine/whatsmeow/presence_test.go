@@ -263,3 +263,51 @@ func presencePublishedBy(t *testing.T, session *Session, want protocol.EventType
 	}
 	return emission
 }
+
+// The decision one layer down, and the one the rest of this file would be undone by.
+// emit waits for room in the inbox, and waiting is the thing presence must not do: a
+// backlog holds WhatsApp's node handler for as long as the publisher is down and then
+// delivers a `composing` about a minute that has passed.
+//
+// The inbox is filled first, so what is measured is the full state rather than a race
+// for it.
+func TestTypingIsDroppedRatherThanQueuedBehindABacklog(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	// Filled until the channel itself refuses, rather than by counting to inboxDepth:
+	// the pump takes one out and blocks handing it on, so a count leaves a slot free and
+	// the blocking path would not block either.
+	filled := 0
+	for {
+		select {
+		case session.inbox <- engine.Emission{Type: protocol.EventSessionState, Payload: []byte(`{}`)}:
+			filled++
+			continue
+		default:
+		}
+		break
+	}
+	if filled == 0 {
+		t.Fatal("the inbox took nothing at all")
+	}
+
+	typing := &waEvents.ChatPresence{
+		MessageSource: waTypes.MessageSource{
+			Chat:   waTypes.NewJID("5511999990002", waTypes.DefaultUserServer),
+			Sender: waTypes.NewJID("5511999990002", waTypes.DefaultUserServer),
+		},
+		State: waTypes.ChatPresenceComposing,
+	}
+
+	handled := make(chan bool, 1)
+	go func() { handled <- session.chatPresence(typing) }()
+	select {
+	case got := <-handled:
+		if !got {
+			t.Error("a typing indicator was left for WhatsApp to send again")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a typing indicator waited for room in a full inbox, holding WhatsApp's node handler")
+	}
+}
