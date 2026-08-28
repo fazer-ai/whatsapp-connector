@@ -385,6 +385,16 @@ func TestWhatIsNotAMessageIsAcknowledgedRatherThanShownToAnAgent(t *testing.T) {
 				EncIV:                   make([]byte, 12),
 			},
 		}},
+		// Every sealed type but the correction, which has an event of its own and is
+		// opened before this runs.
+		{"a poll edited under the seal of the message it edits", &waE2E.Message{
+			SecretEncryptedMessage: &waE2E.SecretEncryptedMessage{
+				TargetMessageKey: messageKey(subject),
+				SecretEncType:    waE2E.SecretEncryptedMessage_POLL_EDIT.Enum(),
+				EncPayload:       []byte("cifrado"),
+				EncIV:            make([]byte, 12),
+			},
+		}},
 		{"a scheduled call being called off", &waE2E.Message{
 			ScheduledCallEditMessage: &waE2E.ScheduledCallEditMessage{
 				Key:      messageKey(subject),

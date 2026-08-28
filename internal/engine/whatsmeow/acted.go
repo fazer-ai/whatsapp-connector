@@ -270,6 +270,11 @@ func changeOf(event *waEvents.Message) change {
 func marksAMessage(message *waE2E.Message) bool {
 	return message.GetPollUpdateMessage() != nil ||
 		message.GetPollAddOptionMessage() != nil ||
+		// The whole arm, not a list of its types. It carries a targetMessageKey by
+		// construction, so every one of them changes a message that already exists: a
+		// poll edited, an option added, an event edited, a message scheduled. The one
+		// the contract has an event for -- a correction -- was opened before this ran.
+		message.GetSecretEncryptedMessage() != nil ||
 		message.GetEncEventResponseMessage() != nil ||
 		message.GetKeepInChatMessage() != nil ||
 		message.GetPinInChatMessage() != nil ||
