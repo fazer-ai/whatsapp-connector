@@ -1,10 +1,14 @@
 package whatsmeow
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
+	wm "go.mau.fi/whatsmeow"
 	waTypes "go.mau.fi/whatsmeow/types"
 	waEvents "go.mau.fi/whatsmeow/types/events"
 
@@ -256,5 +260,113 @@ func TestAReadMarkWithNoStateIsARead(t *testing.T) {
 	}
 	if kind := markReadKinds["played"]; kind != waTypes.ReceiptTypePlayed {
 		t.Fatalf("a played mark resolved to %q", kind)
+	}
+}
+
+// A group receipt names whose message it is on, and whatsmeow puts that on the node only
+// when it has one: without it the write succeeds and the mark lands nowhere. A direct
+// chat is the opposite -- whatsmeow drops the participant there -- so the requirement is
+// the group's alone.
+func TestAReadMarkInAGroupHasToSayWhoseMessagesTheyAre(t *testing.T) {
+	t.Parallel()
+
+	session, _, _ := outboundSession(t)
+	_, err := session.markRead(t.Context(), &protocol.Command{
+		Type: protocol.CommandMessageMarkRead,
+		Payload: json.RawMessage(`{"chat":{"kind":"group","id":"120363041234567890"},
+			"message_ids":["3EB0A1B2C3D4E5F60718"]}`),
+	})
+	assertCode(t, err, protocol.ErrorInvalidPayload)
+
+	// And a direct chat with no sender is not refused with it: there is nobody else the
+	// receipt could be about.
+	_, err = session.markRead(t.Context(), &protocol.Command{
+		Type: protocol.CommandMessageMarkRead,
+		Payload: json.RawMessage(`{"chat":{"kind":"phone","id":"5511999990002"},
+			"message_ids":["3EB0A1B2C3D4E5F60718"]}`),
+	})
+	// It gets no further than the socket it does not have, which is a different answer
+	// from being told its payload is wrong.
+	assertCode(t, err, protocol.ErrorNotConnected)
+}
+
+// The id list is checked for what is in it and not only for how long it is. whatsmeow
+// builds the receipt around ids[0] without looking at it, so an empty one goes out as a
+// node naming no message, reports no error, and is remembered under its idempotency key.
+func TestAReadMarkOverAMessageWithNoIDIsRefused(t *testing.T) {
+	t.Parallel()
+
+	session, _, _ := outboundSession(t)
+	for _, payload := range []string{
+		`{"chat":{"kind":"phone","id":"5511999990002"},"message_ids":[""]}`,
+		`{"chat":{"kind":"phone","id":"5511999990002"},"message_ids":["3EB0A1B2C3D4E5F60718",""]}`,
+	} {
+		_, err := session.markRead(t.Context(), &protocol.Command{
+			Type: protocol.CommandMessageMarkRead, Payload: json.RawMessage(payload),
+		})
+		assertCode(t, err, protocol.ErrorInvalidPayload)
+	}
+}
+
+// What a caller branches on. Told `wa_error` for a session that is simply not connected,
+// a client retries against WhatsApp instead of waiting for the session to come back --
+// and the library's own text does not belong in a reply either way.
+func TestAReadMarkThatCouldNotGoOutIsNamedInTheContractsOwnWords(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		err  error
+		want protocol.ErrorCode
+	}{
+		{"no account to mark from", wm.ErrNotLoggedIn, protocol.ErrorNotPaired},
+		{"not connected", wm.ErrNotConnected, protocol.ErrorNotConnected},
+		{"the command's deadline", context.DeadlineExceeded, protocol.ErrorTimeout},
+		{"whatsapp never answered", wm.ErrIQTimedOut, protocol.ErrorTimeout},
+		{"anything else", errors.New("a socket write said something about a file descriptor"),
+			protocol.ErrorWaError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := markFailure(tc.err)
+			assertCode(t, err, tc.want)
+			if strings.Contains(err.Error(), "file descriptor") {
+				t.Errorf("the library's own words crossed into the reply: %v", err)
+			}
+		})
+	}
+}
+
+// The other half of the group case: a client holding an address from an older event may
+// well have the namespace the group no longer answers in. Sent as it came, the
+// participant is one WhatsApp cannot resolve, and nothing says so. What is asserted here
+// is the wiring -- that the read mark asks at all -- because the normalisation itself is
+// covered where it lives.
+func TestAReadMarkInAGroupNormalisesWhoWroteTheMessages(t *testing.T) {
+	t.Parallel()
+
+	session, _, _ := outboundSession(t)
+	asked := make(chan waTypes.JID, 1)
+	session.groupMode = func(_ context.Context, chat waTypes.JID) (waTypes.AddressingMode, error) {
+		asked <- chat
+		return waTypes.AddressingModeLID, nil
+	}
+
+	// The send itself has no socket to go out on, and that is not what is being read.
+	_, _ = session.markRead(t.Context(), &protocol.Command{
+		Type: protocol.CommandMessageMarkRead,
+		Payload: json.RawMessage(`{"chat":{"kind":"group","id":"120363041234567890"},
+			"sender":{"kind":"phone","id":"5511999990002"},
+			"message_ids":["3EB0A1B2C3D4E5F60718"]}`),
+	})
+
+	select {
+	case chat := <-asked:
+		if chat.User != "120363041234567890" {
+			t.Errorf("the read mark asked about %s", chat)
+		}
+	default:
+		t.Fatal("the read mark sent the participant in whichever namespace it came in")
 	}
 }

@@ -3,8 +3,11 @@ package whatsmeow
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"slices"
 	"time"
 
+	wm "go.mau.fi/whatsmeow"
 	waTypes "go.mau.fi/whatsmeow/types"
 	waEvents "go.mau.fi/whatsmeow/types/events"
 
@@ -121,6 +124,15 @@ func (s *Session) markRead(ctx context.Context, command *protocol.Command) (json
 		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
 			"a read mark has to name at least one message")
 	}
+	if slices.Contains(req.MessageIDs, "") {
+		// The length check above passes a list of empty strings, and whatsmeow builds
+		// the receipt around ids[0] without looking at it. The node goes out naming no
+		// message, sendNode reports no error, and the command is acknowledged and
+		// remembered under its idempotency key -- so the retry that would have worked
+		// never happens.
+		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
+			"a read mark cannot name a message with no id")
+	}
 	kind, named := markReadKinds[req.Type]
 	if !named {
 		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
@@ -136,14 +148,52 @@ func (s *Session) markRead(ctx context.Context, command *protocol.Command) (json
 			return nil, err
 		}
 	}
+	if chat.Server == waTypes.GroupServer && sender.IsEmpty() {
+		// whatsmeow puts `participant` on the node only when it has one, and a group
+		// receipt without it names nobody's message. The write succeeds and the read
+		// mark lands nowhere, which is the silent failure this whole path is written
+		// against.
+		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
+			"a read mark in a group has to name who wrote the messages")
+	}
 	if err := s.readyToSend(); err != nil {
+		return nil, err
+	}
+	// A group answers in one namespace or the other, and a client holding the address
+	// from an older event may well have the other one. Sent as it came, the participant
+	// is one WhatsApp cannot resolve -- and, as above, nothing says so.
+	if sender, err = s.asTheGroupAddresses(ctx, chat, sender); err != nil {
 		return nil, err
 	}
 
 	if err := s.current().MarkRead(ctx, req.MessageIDs, time.Now(), chat, sender, kind); err != nil {
-		return nil, protocol.NewError(protocol.ErrorWaError, err.Error())
+		s.log.Warn().Err(err).Str("chat", chat.String()).Msg("a read mark did not go out")
+		return nil, markFailure(err)
 	}
 	return nil, nil
+}
+
+// markFailure names what went wrong in the contract's own words.
+//
+// The library's text does not cross into a reply: it is noise to whoever reads it and a
+// description of this deployment's insides to whoever does not. And the codes are what a
+// caller branches on -- told `wa_error` for a disconnect, a client retries against
+// WhatsApp instead of waiting for the session to come back.
+func markFailure(err error) error {
+	switch {
+	case errors.Is(err, wm.ErrNotLoggedIn):
+		return protocol.NewError(protocol.ErrorNotPaired,
+			"the session has no WhatsApp account to mark anything read from")
+	case errors.Is(err, wm.ErrNotConnected):
+		return protocol.NewError(protocol.ErrorNotConnected,
+			"the session is not connected to WhatsApp")
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled),
+		errors.Is(err, wm.ErrIQTimedOut):
+		return protocol.NewError(protocol.ErrorTimeout,
+			"the read mark did not go out before the command's deadline")
+	default:
+		return protocol.NewError(protocol.ErrorWaError, "WhatsApp did not take the read mark")
+	}
 }
 
 // markReadKinds is the contract's two, with the empty string among them because `type`
