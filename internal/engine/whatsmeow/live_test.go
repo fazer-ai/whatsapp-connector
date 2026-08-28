@@ -406,6 +406,12 @@ func liveCheckTheDeletion(t *testing.T, emission engine.Emission, target string)
 // only way to know they were made right is to watch one happen. Exactly one bubble is
 // the pass condition, and every extra event this phase saw is printed so a wrong one can
 // be read rather than guessed at.
+//
+// A dropped vote publishes nothing, though, and nothing is also what a vote nobody cast
+// looks like. So a text sent after the vote is what closes the phase: it proves the
+// session was up and delivering across the moment the vote crossed, which turns the
+// silence in between into evidence instead of an absence. Ending on the poll itself
+// would leave no window for the vote to be seen in at all.
 func TestLiveWatchAShare(t *testing.T) {
 	window := liveWindow(t, 5*time.Minute)
 
@@ -418,7 +424,11 @@ func TestLiveWatchAShare(t *testing.T) {
 	events.awaitState(t, "open", 2*time.Minute)
 
 	fmt.Fprintf(os.Stderr,
-		"now, from the other phone: send a location, send a contact card, and create a poll and vote in it.\nwaiting up to %s\n",
+		"now, from the other phone, once each and in this order:\n"+
+			"  1. a location\n  2. a contact card\n  3. a new poll, then vote in it\n"+
+			"  4. any text, last of all, which is what closes this phase\n"+
+			"send each of them exactly once: a kind sent twice is indistinguishable from a leak and fails the phase.\n"+
+			"waiting up to %s\n",
 		window)
 
 	seen := map[string]map[string]any{}
@@ -457,7 +467,7 @@ collect:
 				fmt.Fprintf(os.Stderr, "a second %s: %s\n", kind, emission.Payload)
 			}
 			seen[kind] = body.Message.Content
-			if len(seen) == 3 {
+			if len(seen) == 4 {
 				break collect
 			}
 		case <-deadline:
@@ -465,7 +475,7 @@ collect:
 		}
 	}
 
-	for _, want := range []string{"location", "contacts", "unsupported"} {
+	for _, want := range []string{"location", "contacts", "unsupported", "text"} {
 		if _, arrived := seen[want]; !arrived {
 			t.Errorf("no %s arrived within %s; what did: %v", want, window, keysOf(seen))
 		}
@@ -503,6 +513,12 @@ collect:
 		// The whole point of the machinery filter. A vote, a key rotation or a result
 		// snapshot published as a message received is a bubble an agent cannot read, at
 		// the rate people vote.
+		//
+		// Nothing here can tell that apart from the same kind sent twice by hand, so the
+		// extras are printed above with their ids: read them against the phone before
+		// believing the filter leaked. Narrowing this to the placeholder kind would be
+		// the tempting fix and the wrong one -- a live location update has a renderer,
+		// so the flooding case this counter exists for arrives as a second `location`.
 		t.Errorf("%d event(s) arrived that should not have been messages at all", extra)
 	}
 	if state := session.state(); state != "open" {
