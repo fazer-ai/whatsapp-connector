@@ -259,16 +259,26 @@ func alongside(message *waE2E.Message) *waE2E.ContextInfo {
 // because this runs on whatsmeow's node handler and a crafted stanza could nest forever.
 const wrappersDeep = 4
 
+// aMessage is the name of the message type itself, which is how a field that nests one
+// is told from every other field that holds a message.
+var aMessage = (&waE2E.Message{}).ProtoReflect().Descriptor().FullName()
+
 // annotating is alongside, with the descent that finds it when a body arrives wrapped.
 //
-// Twenty-seven of the message's arms are a wrapper carrying another message, and
-// whatsmeow unwraps six of them before a handler sees the event. What is left -- a
-// spoiler, a group mention, a question -- keeps the annotation on what is inside rather
-// than on the wrapper, so a placeholder that only looked at the top published a reply
-// that answers nothing.
+// Thirty-two of the message's arms nest another message, and whatsmeow unwraps six of
+// them before a handler sees the event. What is left -- a spoiler, a group mention, a
+// question -- keeps the annotation on what is inside rather than on the wrapper, so a
+// placeholder that only looked at the top published a reply that answers nothing.
 //
-// Only a wrapper is followed. The quoted message hanging off a contextInfo is a message
-// too, and descending into that one would answer with somebody else's annotation.
+// The descent is on the nesting rather than on the wrapper's type, which is the whole
+// point: twenty-seven of those arms are a FutureProofMessage and five are not -- a
+// comment, a payment and a request for one carrying their note, a device's own send, and
+// a protocol message carrying the body it corrects -- and matching the named type would
+// have followed the twenty-seven and dropped the annotation of the other five.
+//
+// Only a nested message is followed. The quoted message hanging off a contextInfo is a
+// message too, and descending into that one would answer with somebody else's
+// annotation; it is never reached because a contextInfo is not itself a message arm.
 func annotating(message *waE2E.Message, left int) *waE2E.ContextInfo {
 	if message == nil || left == 0 {
 		return nil
@@ -287,8 +297,17 @@ func annotating(message *waE2E.Message, left int) *waE2E.ContextInfo {
 				return annotated
 			}
 		}
-		if wrapper, wrapped := arm.Interface().(*waE2E.FutureProofMessage); wrapped {
-			if annotated := annotating(wrapper.GetMessage(), left-1); annotated != nil {
+		nested := arm.Descriptor().Fields()
+		for j := range nested.Len() {
+			wrapped := nested.Get(j)
+			if wrapped.Kind() != protoreflect.MessageKind || wrapped.IsList() || wrapped.IsMap() {
+				continue
+			}
+			if wrapped.Message().FullName() != aMessage || !arm.Has(wrapped) {
+				continue
+			}
+			inner, _ := arm.Get(wrapped).Message().Interface().(*waE2E.Message)
+			if annotated := annotating(inner, left-1); annotated != nil {
 				return annotated
 			}
 		}

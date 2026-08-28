@@ -166,6 +166,46 @@ func TestAPlaceholderKeepsTheAnnotationOfABodyThatArrivedWrapped(t *testing.T) {
 	assertPlaceholderKeptItsAnnotation(t, session, event)
 }
 
+// The same thing through the wrappers that are not a FutureProofMessage. Five arms nest a
+// message under a type of their own, whatsmeow unwraps none of them, and a descent that
+// matched on the wrapper's type instead of on the nesting followed the twenty-seven that
+// share a name and lost the annotation of exactly these.
+func TestAPlaceholderKeepsTheAnnotationOfABodyWrappedInSomethingOtherThanAFutureProof(t *testing.T) {
+	t.Parallel()
+
+	unreadable := func() *waE2E.Message {
+		return &waE2E.Message{PollCreationMessage: &waE2E.PollCreationMessage{
+			Name:        proto.String("almoço?"),
+			ContextInfo: annotatedContext(),
+		}}
+	}
+
+	for _, tc := range []struct {
+		name string
+		body *waE2E.Message
+	}{
+		{"a comment on a channel post", &waE2E.Message{
+			CommentMessage: &waE2E.CommentMessage{Message: unreadable()},
+		}},
+		{"the note on a payment", &waE2E.Message{
+			SendPaymentMessage: &waE2E.SendPaymentMessage{NoteMessage: unreadable()},
+		}},
+		{"the note on a request for one", &waE2E.Message{
+			RequestPaymentMessage: &waE2E.RequestPaymentMessage{NoteMessage: unreadable()},
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			session, _ := newTestSession(t, "5511999990001")
+			event := textMessage("3EB0OTHERWRAP", "")
+			event.Message = tc.body
+
+			assertPlaceholderKeptItsAnnotation(t, session, event)
+		})
+	}
+}
+
 func annotatedContext() *waE2E.ContextInfo {
 	return &waE2E.ContextInfo{
 		StanzaID:      proto.String("3EB0QUOTED"),
