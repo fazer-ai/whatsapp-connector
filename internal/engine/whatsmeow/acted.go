@@ -83,7 +83,8 @@ func changeOf(event *waEvents.Message) change {
 	case event.IsEdit,
 		event.Info.Edit == waTypes.EditAttributeMessageEdit,
 		event.Info.Edit == waTypes.EditAttributeAdminEdit,
-		newsletterEdit(event):
+		newsletterEdit(event),
+		resentEdit(event):
 		return editOf(event)
 
 	case revokes(event):
@@ -199,12 +200,42 @@ func theCorrection(event *waEvents.Message) (target string, corrected *waE2E.Mes
 	if edit := event.Message.GetProtocolMessage(); edit != nil {
 		return edit.GetKey().GetID(), edit.GetEditedMessage(), stampedAt(edit.GetTimestampMS(), event)
 	}
-	if event.SourceWebMsg != nil {
-		// Taken apart already. The edit's own clock went with the protocol message, and
-		// what is left is the stanza's, which is the closest thing to it that survived.
-		return event.Info.ID, event.Message, event.Info.Timestamp.UnixMilli()
+	if resentEdit(event) {
+		// Taken apart already, and the clock went with the protocol message the parser
+		// left out of the event. It is still on the raw message the parser kept, at the
+		// millisecond the stanza's own second cannot hold -- and that difference is the
+		// whole of the order between two corrections of one message made in the same
+		// second. Truncated, the client is left with a tie and arrival to break it,
+		// which is the thing that was out of order to begin with.
+		return event.Info.ID, event.Message, stampedAt(theRawEdit(event.RawMessage).GetTimestampMS(), event)
 	}
 	return "", nil, 0
+}
+
+// resentEdit reports whether the parser for the resend door took an edit apart on the
+// way in.
+//
+// It is read off what the parser did rather than off a flag, because the flag is only
+// half there: IsEdit is raised for the shape that arrived inside an EditedMessage
+// envelope and not for the one that did not, while the id is rewritten for both. And
+// that rewrite is the tell -- the parser replaces the event's id with the corrected
+// message's only when what it unwrapped was an edit, so an id that no longer matches the
+// one on the web message it was built from is the parser saying so. Without this, the
+// envelope-less shape arrives looking like an ordinary message under the id of the
+// message it was correcting, which is the id a client would then find and overwrite.
+func resentEdit(event *waEvents.Message) bool {
+	return event.SourceWebMsg != nil && event.Info.ID != event.SourceWebMsg.GetKey().GetID()
+}
+
+// theRawEdit is the protocol message a correction was taken out of, read back off the
+// raw message the parser kept. Both shapes are read because both are shapes that parser
+// accepts: it unwraps an EditedMessage envelope before it looks, and it looks at what is
+// there when there is no envelope.
+func theRawEdit(raw *waE2E.Message) *waE2E.ProtocolMessage {
+	if wrapped := raw.GetEditedMessage().GetMessage(); wrapped != nil {
+		return wrapped.GetProtocolMessage()
+	}
+	return raw.GetProtocolMessage()
 }
 
 // correctedContent renders what a message says now that it has been corrected.

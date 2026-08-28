@@ -124,43 +124,66 @@ func TestAnEditNamesTheMessageItCorrectsRatherThanTheStanzaCarryingIt(t *testing
 func TestAnEditThatCameBackThroughAResendIsStillPublished(t *testing.T) {
 	t.Parallel()
 
-	session, _ := newTestSession(t, "5511999990001")
-	chat := waTypes.NewJID("5511999990001", waTypes.DefaultUserServer)
-	resent := &waWeb.WebMessageInfo{
-		Key: &waCommon.MessageKey{
-			RemoteJID: proto.String(chat.String()),
-			FromMe:    proto.Bool(false),
-			ID:        proto.String(carrier),
-		},
-		MessageTimestamp: proto.Uint64(1755000009),
-		PushName:         proto.String("Alice"),
-		Message: &waE2E.Message{EditedMessage: &waE2E.FutureProofMessage{
-			Message: &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{
-				Key:           messageKey(subject),
-				Type:          waE2E.ProtocolMessage_MESSAGE_EDIT.Enum(),
-				EditedMessage: &waE2E.Message{Conversation: proto.String("bom dia, corrigido")},
-				TimestampMS:   proto.Int64(1755000009000),
-			}},
+	correction := &waE2E.ProtocolMessage{
+		Key:           messageKey(subject),
+		Type:          waE2E.ProtocolMessage_MESSAGE_EDIT.Enum(),
+		EditedMessage: &waE2E.Message{Conversation: proto.String("bom dia, corrigido")},
+		// Off the second the stanza carries, which is the whole point of reading it: the
+		// web message's own clock has no room for the milliseconds that order two
+		// corrections made inside one second.
+		TimestampMS: proto.Int64(1755000009750),
+	}
+
+	for _, tc := range []struct {
+		name string
+		raw  *waE2E.Message
+	}{
+		{"inside the envelope it was sent in", &waE2E.Message{
+			EditedMessage: &waE2E.FutureProofMessage{Message: &waE2E.Message{ProtocolMessage: correction}},
 		}},
-	}
-	event, err := session.current().ParseWebMessage(chat, resent)
-	if err != nil {
-		t.Fatalf("ParseWebMessage: %v", err)
-	}
+		// The parser takes this one apart too, and raises no flag doing it. Read as an
+		// ordinary message it lands under the id of the message it was correcting.
+		{"with the envelope already off it", &waE2E.Message{ProtocolMessage: correction}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
-	emission := publishedBy(t, session, event)
-	if emission.Type != protocol.EventMessageEdited {
-		t.Fatalf("a resent edit was published as %s, want %s", emission.Type, protocol.EventMessageEdited)
-	}
-	validateAgainstContract(t, "event_message_edited", emission.Payload)
+			session, _ := newTestSession(t, "5511999990001")
+			chat := waTypes.NewJID("5511999990001", waTypes.DefaultUserServer)
+			resent := &waWeb.WebMessageInfo{
+				Key: &waCommon.MessageKey{
+					RemoteJID: proto.String(chat.String()),
+					FromMe:    proto.Bool(false),
+					ID:        proto.String(carrier),
+				},
+				MessageTimestamp: proto.Uint64(1755000009),
+				PushName:         proto.String("Alice"),
+				Message:          tc.raw,
+			}
+			event, err := session.current().ParseWebMessage(chat, resent)
+			if err != nil {
+				t.Fatalf("ParseWebMessage: %v", err)
+			}
 
-	payload := decode(t, emission.Payload)
-	if payload["message_id"] != subject {
-		t.Fatalf("the resent edit corrects %v, want %q", payload["message_id"], subject)
-	}
-	content, _ := payload["content"].(map[string]any)
-	if content["body"] != "bom dia, corrigido" {
-		t.Fatalf("the resent edit reads %v", content)
+			emission := publishedBy(t, session, event)
+			if emission.Type != protocol.EventMessageEdited {
+				t.Fatalf("a resent edit was published as %s, want %s", emission.Type, protocol.EventMessageEdited)
+			}
+			validateAgainstContract(t, "event_message_edited", emission.Payload)
+
+			payload := decode(t, emission.Payload)
+			if payload["message_id"] != subject {
+				t.Fatalf("the resent edit corrects %v, want %q", payload["message_id"], subject)
+			}
+			content, _ := payload["content"].(map[string]any)
+			if content["body"] != "bom dia, corrigido" {
+				t.Fatalf("the resent edit reads %v", content)
+			}
+			if payload["timestamp"] != float64(1755000009750) {
+				t.Fatalf("the resent edit is stamped %v, and the correction's own clock reads 1755000009750",
+					payload["timestamp"])
+			}
+		})
 	}
 }
 
