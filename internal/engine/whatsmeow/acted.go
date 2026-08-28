@@ -1,6 +1,11 @@
 package whatsmeow
 
 import (
+	"context"
+	"errors"
+
+	wm "go.mau.fi/whatsmeow"
+
 	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
 	waTypes "go.mau.fi/whatsmeow/types"
 	waEvents "go.mau.fi/whatsmeow/types/events"
@@ -49,6 +54,15 @@ type change struct {
 	// an emoji or a phone number: this is the log of the fact that something happened,
 	// not of what was said.
 	why string
+	// err is what went wrong where something did. zerolog drops a nil one, so every
+	// verdict logs the same way whether or not there was an error behind it.
+	err error
+}
+
+// because attaches what went wrong to a drop or a withhold.
+func (c change) because(err error) change {
+	c.err = err
+	return c
 }
 
 func publishing(kind protocol.EventType, payload any) change {
@@ -58,6 +72,105 @@ func publishing(kind protocol.EventType, payload any) change {
 func dropping(why string) change { return change{verdict: dropChange, why: why} }
 
 func withholding(why string) change { return change{verdict: withholdChange, why: why} }
+
+// changed is changeOf plus the one arm that cannot be decided by reading the stanza.
+//
+// A correction arrives sealed under the secret of the message it corrects, and opening
+// it takes the device store the socket writes rather than anything on the wire. That is
+// not an exotic shape: a phone editing a message in a plain one-to-one chat sends this,
+// and the wrapped protocol message the library also knows how to build is what arrives
+// through other doors. Measured against a real phone, not read off a specification.
+func (s *Session) changed(event *waEvents.Message) change {
+	sealed := event.Message.GetSecretEncryptedMessage()
+	// Comparing the type is safe on a nil message because MESSAGE_EDIT is not the zero
+	// value of that enum -- UNKNOWN is. The other things sealed this way are a poll
+	// edit, an event edit and a schedule, and the contract carries none of them.
+	if sealed.GetSecretEncType() == waE2E.SecretEncryptedMessage_MESSAGE_EDIT {
+		return s.unsealedCorrection(event, sealed)
+	}
+	return changeOf(event)
+}
+
+// unsealedCorrection opens a sealed correction and renders it, or says why it could not.
+//
+// The two ways it fails are not the same answer, and getting that backwards is the
+// mistake this milestone has already made twice in both directions. A secret this
+// session never had is final: it was stored when the message being corrected arrived,
+// and a redelivery brings the same ciphertext and no key -- so it is acknowledged and
+// the correction is lost, rather than kept and redelivered for as long as the session is
+// up. A socket that is not up yet, or a store that ran out of time, is not final, and
+// that one is kept.
+//
+// Anything else -- a payload that will not decrypt, a store that answered with an error
+// of its own -- is treated as final. It costs one correction, loudly, against a
+// redelivery loop that costs every one after it too.
+func (s *Session) unsealedCorrection(event *waEvents.Message, sealed *waE2E.SecretEncryptedMessage) change {
+	target := sealed.GetTargetMessageKey().GetID()
+	if target == "" {
+		return dropping("dropping a sealed correction that names no message to correct")
+	}
+	chat, sender, addressed := whereAndWho(event)
+	if !addressed {
+		return withholding("withholding an acknowledgement for a sealed correction this build cannot address")
+	}
+
+	open := s.unseal
+	if open == nil {
+		open = s.unsealOverStore
+	}
+	// Bounded, because this runs on whatsmeow's own node handler: a store that never
+	// answers would hold the socket's next node behind it with nothing to release it.
+	ctx, cancel := context.WithTimeout(s.ctx, s.storeLimit)
+	defer cancel()
+
+	plain, err := open(ctx, event)
+	switch {
+	case errors.Is(err, wm.ErrNotLoggedIn), errors.Is(err, wm.ErrClientIsNil),
+		errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+		return withholding("withholding an acknowledgement for a correction this session could not reach its keys for").because(err)
+	case err != nil:
+		return dropping("dropping a correction this session has no key for").because(err)
+	}
+
+	corrected, at := theSealedBody(plain, event)
+	content, renderable := correctedContent(corrected)
+	if !renderable {
+		return withholding("withholding an acknowledgement for a sealed correction whose new body this build cannot render")
+	}
+	return publishing(protocol.EventMessageEdited, protocol.MessageEdited{
+		Chat:      chat,
+		Sender:    sender,
+		MessageID: target,
+		FromMe:    event.Info.IsFromMe,
+		Content:   content,
+		Timestamp: at,
+	})
+}
+
+// unsealOverStore is what opens a sealed change when nothing has replaced it: the
+// socket's own device store, where the secret of every message this session has seen was
+// put as it arrived.
+func (s *Session) unsealOverStore(ctx context.Context, event *waEvents.Message) (*waE2E.Message, error) {
+	return s.current().DecryptSecretEncryptedMessage(ctx, event)
+}
+
+// theSealedBody is what a sealed correction says the message now reads, and when.
+//
+// What a phone really sends is the wrapper: measured against one, the plaintext of a
+// correction made in a direct chat is the protocol message an unsealed correction
+// carries, and the clock inside it is what makes the published timestamp land on a
+// millisecond rather than on the stanza's second. That is the branch that fires.
+//
+// The other is the fallback for a plaintext that is the new body on its own, which is
+// what the field the payload is unmarshalled into allows and what nothing has been seen
+// to send. It is here because the alternative to rendering it is refusing it, and the
+// envelope carries no clock of its own to stamp it with.
+func theSealedBody(plain *waE2E.Message, event *waEvents.Message) (corrected *waE2E.Message, at int64) {
+	if inner := plain.GetProtocolMessage(); inner.GetType() == waE2E.ProtocolMessage_MESSAGE_EDIT {
+		return inner.GetEditedMessage(), stampedAt(inner.GetTimestampMS(), event)
+	}
+	return plain, event.Info.Timestamp.UnixMilli()
+}
 
 // changeOf reads a stanza as something done to a message that already exists, and says
 // so when it is not one.
@@ -72,20 +185,14 @@ func changeOf(event *waEvents.Message) change {
 	case event.Message.GetReactionMessage() != nil:
 		return reactionOf(event, event.Message.GetReactionMessage())
 
-	case event.Message.GetEncReactionMessage() != nil,
-		event.Message.GetSecretEncryptedMessage().GetSecretEncType() == waE2E.SecretEncryptedMessage_MESSAGE_EDIT:
-		// Sealed under the secret of the message it is about, which is how a community
-		// announcement group carries a reaction and how WhatsApp carries some
-		// corrections. Reading either takes the socket and that secret, and the target
-		// is on the envelope rather than inside the plaintext -- a slice of its own, not
-		// a branch of this one. Kept on the phone, because a build that learns to read
-		// them can still publish it; ahead of the edit arm, because a sealed correction
-		// carries the same attribute an ordinary one does and would otherwise be taken
-		// apart looking for a key that is not there.
-		//
-		// Comparing the type is safe on a nil message because MESSAGE_EDIT is not the
-		// zero value of that enum -- UNKNOWN is.
-		return withholding("withholding an acknowledgement for a change encrypted under a message secret this build does not read")
+	case event.Message.GetEncReactionMessage() != nil:
+		// A community announcement group seals its reactions under the secret of the
+		// message being reacted to. Opening one takes the device store the way a sealed
+		// correction does, and the target it names is on the envelope rather than in the
+		// plaintext -- but unlike a correction it is not the ordinary shape, and every
+		// reaction in a direct chat arrives in the clear. Kept on the phone, because a
+		// build that learns to read them can still publish it. Issue #38.
+		return withholding("withholding an acknowledgement for a reaction sealed under a message secret this build does not read")
 
 	case event.IsEdit,
 		event.Info.Edit == waTypes.EditAttributeMessageEdit,

@@ -224,16 +224,17 @@ func TestLiveListen(t *testing.T) {
 // deletes it, and each of those has to come back out as its own event naming the message
 // it is about.
 //
-// It is the phase no fixture can stand in for. Every one of these arrives as an ordinary
-// message stanza whose body says what it does to another one, and the shapes are
-// whatsmeow's reading of what WhatsApp really sends -- an edit wrapped one way, a channel
-// edit another, a deletion with an attribute and a key, a reaction with a timestamp of
-// its own. A test that builds those shapes by hand is a test of the builder.
+// It is the phase no fixture can stand in for, and the first run proved it: the shapes
+// are whatsmeow's reading of what WhatsApp really sends, and what a phone really sends
+// for a correction turned out not to be the shape the library documents building. Two of
+// the four passed and the edit was refused, which is a thing only a phone could say.
 //
-// One session, one message, four prompts, in the order WhatsApp allows them: a deleted
-// message cannot be reacted to and an edit has fifteen minutes.
+// Everything is asked for at once and collected in whatever order it arrives. Waiting on
+// one step at a time reads better and is wrong: a step that never lands sits on the
+// events of every step after it, and the run then reports the one thing it was waiting
+// for instead of everything it saw.
 func TestLiveWatchAMessageChange(t *testing.T) {
-	window := liveWindow(t, 2*time.Minute)
+	window := liveWindow(t, 5*time.Minute)
 
 	session, _ := liveSession(t)
 	events := watch(t, session)
@@ -244,14 +245,67 @@ func TestLiveWatchAMessageChange(t *testing.T) {
 	events.awaitState(t, "open", 2*time.Minute)
 
 	target, _ := liveAwaitTheirMessage(t, events, window)
-	fmt.Fprintf(os.Stderr, "watching message %s\n", target)
+	fmt.Fprintf(os.Stderr,
+		"now, on the other phone, to that message: edit it, react to it, take the reaction back, delete it for everyone.\nwaiting up to %s\n",
+		window)
 
-	say := func(what string) {
-		fmt.Fprintf(os.Stderr, "%s on the other phone now; waiting up to %s\n", what, window)
+	var edited, revoked engine.Emission
+	var reactions []engine.Emission
+	deadline := time.After(window)
+
+collect:
+	for {
+		select {
+		case emission, ok := <-events.seen:
+			if !ok {
+				t.Fatal("the session ended before the phase finished")
+			}
+			switch emission.Type {
+			case protocol.EventMessageEdited:
+				edited = emission
+			case protocol.EventMessageRevoked:
+				revoked = emission
+			case protocol.EventMessageReaction:
+				// Kept whole rather than counted: a reaction on some other message in
+				// the account would otherwise be read as the answer to one of these.
+				reactions = append(reactions, emission)
+			}
+			if edited.Type != "" && revoked.Type != "" && len(reactions) >= 2 {
+				break collect
+			}
+		case <-deadline:
+			break collect
+		}
 	}
 
-	say("edit that message")
-	edited := events.await(t, protocol.EventMessageEdited, window)
+	missing := []string{}
+	if edited.Type == "" {
+		missing = append(missing, "the correction")
+	}
+	if revoked.Type == "" {
+		missing = append(missing, "the deletion")
+	}
+	if len(reactions) < 2 {
+		missing = append(missing, fmt.Sprintf("%d of the two reactions", 2-len(reactions)))
+	}
+	if len(missing) > 0 {
+		// All of them at once. Reporting only the first leaves a second run to find the
+		// second, and every run of this phase costs a human at a phone.
+		t.Fatalf("%s never arrived within %s", strings.Join(missing, " and "), window)
+	}
+
+	liveCheckTheCorrection(t, edited, target)
+	liveCheckTheReactions(t, reactions, target)
+	liveCheckTheDeletion(t, revoked, target)
+
+	if state := session.state(); state != "open" {
+		t.Fatalf("the session did not stay up: state=%s", state)
+	}
+}
+
+func liveCheckTheCorrection(t *testing.T, emission engine.Emission, target string) {
+	t.Helper()
+
 	var correction struct {
 		MessageID string `json:"message_id"`
 		FromMe    bool   `json:"from_me"`
@@ -260,75 +314,30 @@ func TestLiveWatchAMessageChange(t *testing.T) {
 			Body string `json:"body"`
 		} `json:"content"`
 	}
-	if err := json.Unmarshal(edited.Payload, &correction); err != nil {
+	if err := json.Unmarshal(emission.Payload, &correction); err != nil {
 		t.Fatalf("unmarshal the edit: %v", err)
 	}
 	switch {
 	case correction.MessageID != target:
-		// The stanza carrying an edit has an id of its own, and publishing that one
+		// The stanza carrying a correction has an id of its own, and publishing that one
 		// leaves the client looking for a message nobody ever stored.
 		t.Fatalf("the edit corrects %q, and the message being edited is %q", correction.MessageID, target)
 	case correction.FromMe:
-		t.Fatalf("somebody else's edit was published as the account's own: %s", edited.Payload)
+		t.Fatalf("somebody else's edit was published as the account's own: %s", emission.Payload)
 	case correction.Content.Type != "text" || correction.Content.Body == "":
-		t.Fatalf("the edit arrived with no new body: %s", edited.Payload)
+		t.Fatalf("the edit arrived with no new body: %s", emission.Payload)
 	}
 	fmt.Fprintf(os.Stderr, "edit: %s now reads %q\n", correction.MessageID, correction.Content.Body)
-
-	say("react to that message")
-	put := liveReaction(t, events, window, target)
-	if put.Emoji == "" {
-		t.Fatalf("a reaction arrived with no emoji, which is how a removal is spelled: %s", put.Raw)
-	}
-	if put.ID == "" || put.ID == target {
-		// The client deduplicates on the reaction's own id and matches its own sends by
-		// it. The target's id in that field would collide with the message itself.
-		t.Fatalf("the reaction has no id of its own: %s", put.Raw)
-	}
-
-	say("take that reaction back")
-	taken := liveReaction(t, events, window, target)
-	if taken.Emoji != "" {
-		t.Fatalf("taking a reaction back arrived as %q rather than as an empty emoji: %s", taken.Emoji, taken.Raw)
-	}
-
-	say("delete that message for everyone")
-	revoked := events.await(t, protocol.EventMessageRevoked, window)
-	var deletion struct {
-		MessageID string `json:"message_id"`
-		By        string `json:"by"`
-	}
-	if err := json.Unmarshal(revoked.Payload, &deletion); err != nil {
-		t.Fatalf("unmarshal the deletion: %v", err)
-	}
-	if deletion.MessageID != target {
-		t.Fatalf("the deletion names %q, and the message deleted is %q", deletion.MessageID, target)
-	}
-	if deletion.By != "contact" {
-		// `self` is what the client applies to its own deletions, files and all. Saying
-		// it about somebody else's would destroy an attachment nobody asked it to.
-		t.Fatalf("somebody else's deletion was published as by=%q", deletion.By)
-	}
-	if state := session.state(); state != "open" {
-		t.Fatalf("the session did not stay up: state=%s", state)
-	}
 }
 
-// liveReaction waits for the next reaction on one message, failing on one that annotates
-// anything else: the phase is about a message it picked, and a stray reaction elsewhere
-// in the account would otherwise be read as the answer to the prompt.
-func liveReaction(t *testing.T, events *recorder, window time.Duration, target string) struct {
-	ID, Emoji, Raw string
-} {
+// liveCheckTheReactions reads the two halves of putting a reaction on and taking it off.
+// Which arrives first is not assumed: they are told apart by the emoji, because that is
+// what tells them apart on the wire.
+func liveCheckTheReactions(t *testing.T, emissions []engine.Emission, target string) {
 	t.Helper()
 
-	deadline := time.Now().Add(window)
-	for {
-		left := time.Until(deadline)
-		if left <= 0 {
-			t.Fatalf("no reaction on %s arrived within %s", target, window)
-		}
-		emission := events.await(t, protocol.EventMessageReaction, left)
+	var put, taken []byte
+	for _, emission := range emissions {
 		var body struct {
 			ID       string `json:"id"`
 			TargetID string `json:"target_id"`
@@ -339,13 +348,48 @@ func liveReaction(t *testing.T, events *recorder, window time.Duration, target s
 			t.Fatalf("unmarshal the reaction: %v", err)
 		}
 		if body.TargetID != target {
-			fmt.Fprintf(os.Stderr, "ignoring a reaction on %s, waiting for one on %s\n", body.TargetID, target)
+			fmt.Fprintf(os.Stderr, "ignoring a reaction on %s\n", body.TargetID)
 			continue
 		}
 		if body.FromMe {
 			t.Fatalf("somebody else's reaction was published as the account's own: %s", emission.Payload)
 		}
-		return struct{ ID, Emoji, Raw string }{body.ID, body.Emoji, string(emission.Payload)}
+		if body.ID == "" || body.ID == target {
+			// The client deduplicates on the reaction's own id and matches its own sends
+			// by it. The target's id in that field would collide with the message.
+			t.Fatalf("the reaction has no id of its own: %s", emission.Payload)
+		}
+		if body.Emoji == "" {
+			taken = emission.Payload
+		} else {
+			put = emission.Payload
+		}
+	}
+	if put == nil {
+		t.Fatalf("no reaction on %s carried an emoji", target)
+	}
+	if taken == nil {
+		t.Fatalf("taking the reaction back never arrived as an empty emoji, which is how a removal is spelled")
+	}
+}
+
+func liveCheckTheDeletion(t *testing.T, emission engine.Emission, target string) {
+	t.Helper()
+
+	var deletion struct {
+		MessageID string `json:"message_id"`
+		By        string `json:"by"`
+	}
+	if err := json.Unmarshal(emission.Payload, &deletion); err != nil {
+		t.Fatalf("unmarshal the deletion: %v", err)
+	}
+	if deletion.MessageID != target {
+		t.Fatalf("the deletion names %q, and the message deleted is %q", deletion.MessageID, target)
+	}
+	if deletion.By != "contact" {
+		// `self` is what the client applies to its own deletions, files and all. Saying
+		// it about somebody else's would destroy an attachment nobody asked it to.
+		t.Fatalf("somebody else's deletion was published as by=%q", deletion.By)
 	}
 }
 

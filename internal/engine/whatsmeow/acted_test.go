@@ -1,8 +1,12 @@
 package whatsmeow
 
 import (
+	"context"
+	"errors"
 	"testing"
 	"time"
+
+	wm "go.mau.fi/whatsmeow"
 
 	waCommon "go.mau.fi/whatsmeow/proto/waCommon"
 	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
@@ -192,6 +196,100 @@ func TestAnEditThatCameBackThroughAResendIsStillPublished(t *testing.T) {
 			if payload["timestamp"] != float64(1755000009750) {
 				t.Fatalf("the resent edit is stamped %v, and the correction's own clock reads 1755000009750",
 					payload["timestamp"])
+			}
+		})
+	}
+}
+
+// This is the shape a correction really arrives in. A phone editing a message in a plain
+// one-to-one chat seals the new body under the secret of the message it is correcting and
+// puts the target on the envelope; the wrapped protocol message the library also builds
+// is what comes through other doors. Measured against a real phone -- the first live run
+// of this phase published two of the three events and refused the edit, which is what
+// sent this arm back for the socket it needs.
+func TestASealedCorrectionIsOpenedAndPublished(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name  string
+		plain *waE2E.Message
+		want  float64
+	}{
+		// The plaintext is a whole message, and WhatsApp is free to put the correction
+		// in either place.
+		{"the new body on its own", &waE2E.Message{
+			Conversation: proto.String("bom dia, corrigido"),
+		}, 1755000000000},
+		{"the new body inside the protocol message an unsealed one carries", &waE2E.Message{
+			ProtocolMessage: &waE2E.ProtocolMessage{
+				Key:           messageKey(subject),
+				Type:          waE2E.ProtocolMessage_MESSAGE_EDIT.Enum(),
+				EditedMessage: &waE2E.Message{Conversation: proto.String("bom dia, corrigido")},
+				TimestampMS:   proto.Int64(1755000009750),
+			},
+		}, 1755000009750},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			session, _ := newTestSession(t, "5511999990001")
+			session.unseal = func(context.Context, *waEvents.Message) (*waE2E.Message, error) {
+				return tc.plain, nil
+			}
+
+			emission := publishedBy(t, session, sealedEditEvent(carrier, subject))
+			if emission.Type != protocol.EventMessageEdited {
+				t.Fatalf("a sealed correction was published as %s, want %s", emission.Type, protocol.EventMessageEdited)
+			}
+			validateAgainstContract(t, "event_message_edited", emission.Payload)
+
+			payload := decode(t, emission.Payload)
+			if payload["message_id"] != subject {
+				// The envelope is the only place a sealed correction names its target.
+				t.Fatalf("the sealed correction corrects %v, want %q", payload["message_id"], subject)
+			}
+			content, _ := payload["content"].(map[string]any)
+			if content["type"] != "text" || content["body"] != "bom dia, corrigido" {
+				t.Fatalf("the sealed correction reads %v", content)
+			}
+			if payload["timestamp"] != tc.want {
+				t.Fatalf("the sealed correction is stamped %v, want %v", payload["timestamp"], tc.want)
+			}
+		})
+	}
+}
+
+// The two ways opening one fails are not the same answer, and this milestone has got
+// that backwards in both directions already. A key that was never stored is not going to
+// be handed over by a redelivery; a socket that is not up yet will be.
+func TestASealedCorrectionIsKeptOnlyWhileTheKeysMayStillArrive(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name    string
+		failure error
+		keep    bool
+	}{
+		{"a secret this session never had", wm.ErrOriginalMessageSecretNotFound, false},
+		{"a payload that will not decrypt", errors.New("message authentication failed"), false},
+		{"a socket that is not up yet", wm.ErrNotLoggedIn, true},
+		{"a store that ran out of time", context.DeadlineExceeded, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			session, _ := newTestSession(t, "5511999990001")
+			session.deliverWait = 50 * time.Millisecond
+			session.unseal = func(context.Context, *waEvents.Message) (*waE2E.Message, error) {
+				return nil, tc.failure
+			}
+
+			acknowledged := publishedNothing(t, session, sealedEditEvent(carrier, subject))
+			switch {
+			case tc.keep && acknowledged:
+				t.Fatal("a correction whose keys may still arrive was acknowledged, so WhatsApp will not send it again")
+			case !tc.keep && !acknowledged:
+				t.Fatal("a correction nothing is ever going to open was left for WhatsApp to redeliver for good")
 			}
 		})
 	}
@@ -387,20 +485,6 @@ func TestWhatALaterBuildCouldPublishIsKeptOnThePhone(t *testing.T) {
 			}}
 			return editEvent(carrier, subject, corrected, 1755000009000)
 		}},
-		{"a correction encrypted under a message secret", func() *waEvents.Message {
-			event := textMessage(carrier, "")
-			// It carries the attribute an ordinary correction carries, so nothing but
-			// the sealed body separates the two: taken apart looking for a key it does
-			// not have, it is acknowledged away and the correction is gone for good.
-			event.Info.Edit = waTypes.EditAttributeMessageEdit
-			event.Message = &waE2E.Message{SecretEncryptedMessage: &waE2E.SecretEncryptedMessage{
-				TargetMessageKey: messageKey(subject),
-				SecretEncType:    waE2E.SecretEncryptedMessage_MESSAGE_EDIT.Enum(),
-				EncPayload:       []byte("cifrado"),
-				EncIV:            make([]byte, 12),
-			}}
-			return event
-		}},
 		{"a reaction encrypted under a message secret", func() *waEvents.Message {
 			event := textMessage(carrier, "")
 			event.Message = &waE2E.Message{EncReactionMessage: &waE2E.EncReactionMessage{
@@ -527,6 +611,22 @@ func editEvent(stanzaID, targetID string, corrected *waE2E.Message, at int64) *w
 		Type:          waE2E.ProtocolMessage_MESSAGE_EDIT.Enum(),
 		EditedMessage: corrected,
 		TimestampMS:   proto.Int64(at),
+	}}
+	return event
+}
+
+// sealedEditEvent is a correction as a phone really sends one: the new body sealed under
+// the secret of the message being corrected, the target on the envelope, and the same
+// edit attribute an unsealed correction carries -- so nothing but the sealed body
+// separates the two on the way in.
+func sealedEditEvent(stanzaID, targetID string) *waEvents.Message {
+	event := textMessage(stanzaID, "")
+	event.Info.Edit = waTypes.EditAttributeMessageEdit
+	event.Message = &waE2E.Message{SecretEncryptedMessage: &waE2E.SecretEncryptedMessage{
+		TargetMessageKey: messageKey(targetID),
+		SecretEncType:    waE2E.SecretEncryptedMessage_MESSAGE_EDIT.Enum(),
+		EncPayload:       []byte("cifrado"),
+		EncIV:            make([]byte, 12),
 	}}
 	return event
 }

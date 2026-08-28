@@ -280,7 +280,7 @@ func (s *Session) receive(event *waEvents.Message) bool {
 		return true
 	}
 
-	switch what := changeOf(event); what.verdict {
+	switch what := s.changed(event); what.verdict {
 	case publishChange:
 		// Not a message this account received, but something done to one it already has.
 		// It waits on the publisher exactly as a message does: WhatsApp redelivers what
@@ -288,10 +288,10 @@ func (s *Session) receive(event *waEvents.Message) bool {
 		// the conversation never learns about.
 		return s.deliver(what.kind, what.payload)
 	case dropChange:
-		s.log.Info().Str("message_id", event.Info.ID).Msg(what.why)
+		s.log.Info().Err(what.err).Str("message_id", event.Info.ID).Msg(what.why)
 		return true
 	case withholdChange:
-		s.log.Warn().Str("message_id", event.Info.ID).Msg(what.why)
+		s.log.Warn().Err(what.err).Str("message_id", event.Info.ID).Msg(what.why)
 		return false
 	}
 
