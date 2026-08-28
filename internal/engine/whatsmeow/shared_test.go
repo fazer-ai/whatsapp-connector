@@ -6,6 +6,7 @@ import (
 	"time"
 
 	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
+	waEvents "go.mau.fi/whatsmeow/types/events"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/engine"
@@ -139,15 +140,43 @@ func TestAPlaceholderKeepsWhatTheMessageWasAnnotatedWith(t *testing.T) {
 	session, _ := newTestSession(t, "5511999990001")
 	event := textMessage("3EB0POLLREPLY", "")
 	event.Message = &waE2E.Message{PollCreationMessage: &waE2E.PollCreationMessage{
-		Name: proto.String("almoço?"),
-		ContextInfo: &waE2E.ContextInfo{
-			StanzaID:      proto.String("3EB0QUOTED"),
-			MentionedJID:  []string{"5511999990002@s.whatsapp.net"},
-			Expiration:    proto.Uint32(604800),
-			Participant:   proto.String("5511999990001@s.whatsapp.net"),
-			QuotedMessage: &waE2E.Message{Conversation: proto.String("onde vamos?")},
-		},
+		Name: proto.String("almoço?"), ContextInfo: annotatedContext(),
 	}}
+
+	assertPlaceholderKeptItsAnnotation(t, session, event)
+}
+
+// Twenty-seven of the message's arms are a wrapper carrying another message, and
+// whatsmeow unwraps six of them before a handler sees the event. What is left keeps the
+// annotation on what is inside, so a placeholder that only looks at the top publishes a
+// reply that answers nothing.
+func TestAPlaceholderKeepsTheAnnotationOfABodyThatArrivedWrapped(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	event := textMessage("3EB0WRAPPED", "")
+	event.Message = &waE2E.Message{SpoilerMessage: &waE2E.FutureProofMessage{
+		Message: &waE2E.Message{PollCreationMessage: &waE2E.PollCreationMessage{
+			Name:        proto.String("almoço?"),
+			ContextInfo: annotatedContext(),
+		}},
+	}}
+
+	assertPlaceholderKeptItsAnnotation(t, session, event)
+}
+
+func annotatedContext() *waE2E.ContextInfo {
+	return &waE2E.ContextInfo{
+		StanzaID:      proto.String("3EB0QUOTED"),
+		MentionedJID:  []string{"5511999990002@s.whatsapp.net"},
+		Expiration:    proto.Uint32(604800),
+		Participant:   proto.String("5511999990001@s.whatsapp.net"),
+		QuotedMessage: &waE2E.Message{Conversation: proto.String("onde vamos?")},
+	}
+}
+
+func assertPlaceholderKeptItsAnnotation(t *testing.T, session *Session, event *waEvents.Message) {
+	t.Helper()
 
 	emission := publishedBy(t, session, event)
 	message, _ := decode(t, emission.Payload)["message"].(map[string]any)

@@ -251,7 +251,26 @@ func unreadableBody(event *waEvents.Message) (body, bool) {
 // message carries one body, so the two agree today; a message that somehow carried two
 // would otherwise answer differently on different runs.
 func alongside(message *waE2E.Message) *waE2E.ContextInfo {
-	if message == nil {
+	return annotating(message, wrappersDeep)
+}
+
+// wrappersDeep bounds how far in a body may be wrapped before this stops looking. Two is
+// what WhatsApp sends -- a spoiler inside a group mention -- and the bound is here
+// because this runs on whatsmeow's node handler and a crafted stanza could nest forever.
+const wrappersDeep = 4
+
+// annotating is alongside, with the descent that finds it when a body arrives wrapped.
+//
+// Twenty-seven of the message's arms are a wrapper carrying another message, and
+// whatsmeow unwraps six of them before a handler sees the event. What is left -- a
+// spoiler, a group mention, a question -- keeps the annotation on what is inside rather
+// than on the wrapper, so a placeholder that only looked at the top published a reply
+// that answers nothing.
+//
+// Only a wrapper is followed. The quoted message hanging off a contextInfo is a message
+// too, and descending into that one would answer with somebody else's annotation.
+func annotating(message *waE2E.Message, left int) *waE2E.ContextInfo {
+	if message == nil || left == 0 {
 		return nil
 	}
 	reflected := message.ProtoReflect()
@@ -263,11 +282,15 @@ func alongside(message *waE2E.Message) *waE2E.ContextInfo {
 		}
 		arm := reflected.Get(field).Message()
 		annotation := arm.Descriptor().Fields().ByName("contextInfo")
-		if annotation == nil || !arm.Has(annotation) {
-			continue
+		if annotation != nil && arm.Has(annotation) {
+			if annotated, ok := arm.Get(annotation).Message().Interface().(*waE2E.ContextInfo); ok {
+				return annotated
+			}
 		}
-		if annotated, ok := arm.Get(annotation).Message().Interface().(*waE2E.ContextInfo); ok {
-			return annotated
+		if wrapper, wrapped := arm.Interface().(*waE2E.FutureProofMessage); wrapped {
+			if annotated := annotating(wrapper.GetMessage(), left-1); annotated != nil {
+				return annotated
+			}
 		}
 	}
 	return nil
