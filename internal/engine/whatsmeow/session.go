@@ -1492,8 +1492,11 @@ func (s *Session) post(key string, eventType protocol.EventType, payload any, li
 	}
 
 	s.boardMu.Lock()
-	_, waiting := s.board[key]
-	if !waiting && len(s.board) >= s.boardCap {
+	if _, waiting := s.board[key]; !waiting && len(s.board) >= s.boardCap && !s.evictAMoment() {
+		// Full, and nothing on it worth less than this. A state that corrects something
+		// the client has already been shown is the last thing to drop, so a moment goes
+		// first: what is lost there is a typing indicator, and what would be lost here is
+		// the stop that clears one.
 		s.boardMu.Unlock()
 		s.log.Debug().Str("type", string(eventType)).
 			Msg("dropping presence for a chat the board had no room for")
@@ -1507,6 +1510,31 @@ func (s *Session) post(key string, eventType protocol.EventType, payload any, li
 	default:
 		// Already awake. One signal is enough: the forwarder takes the whole board.
 	}
+}
+
+// evictAMoment makes room by dropping the perishable entry with the least life left in
+// it, and reports whether it found one. Called with boardMu held.
+//
+// The least life left rather than any of them, so the choice does not depend on which
+// order a map happens to be walked in and the one dropped is the one closest to being
+// worthless anyway.
+func (s *Session) evictAMoment() bool {
+	var oldest string
+	var least time.Duration
+	found := false
+	for key, emission := range s.board {
+		if emission.Expires == nil {
+			continue
+		}
+		if left := emission.Expires(); !found || left < least {
+			oldest, least, found = key, left, true
+		}
+	}
+	if !found {
+		return false
+	}
+	delete(s.board, oldest)
+	return true
 }
 
 func (s *Session) takeBoard() []engine.Emission {

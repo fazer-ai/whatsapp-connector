@@ -577,3 +577,77 @@ func TestATypingIndicatorIsRefusedWhereItHasNowhereToShow(t *testing.T) {
 		})
 	}
 }
+
+// In a group the state belongs to a participant, not to the chat. Keyed by the chat
+// alone, Bob starting to type replaces Alice's stop -- and if Alice's typing had already
+// been published, the client is left showing her typing for good.
+func TestAGroupsTypingIsKeptPerPersonRatherThanPerChat(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.groups = true
+	session.picked = make(chan struct{}, 1)
+	blockTheForwarder(t, session)
+
+	group := waTypes.NewJID("120363041234567890", waTypes.GroupServer)
+	alice := waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)
+	bob := waTypes.NewJID("5511999990003", waTypes.DefaultUserServer)
+
+	session.chatPresence(&waEvents.ChatPresence{
+		MessageSource: waTypes.MessageSource{Chat: group, Sender: alice, IsGroup: true},
+		State:         waTypes.ChatPresencePaused,
+	})
+	session.chatPresence(&waEvents.ChatPresence{
+		MessageSource: waTypes.MessageSource{Chat: group, Sender: bob, IsGroup: true},
+		State:         waTypes.ChatPresenceComposing,
+	})
+
+	waiting := onBoard(session)
+	if len(waiting) != 2 {
+		t.Fatalf("%d presences are waiting, and two people in the group did two different things", len(waiting))
+	}
+	states := map[string]bool{}
+	for _, emission := range waiting {
+		states[stateOf(t, emission)] = true
+	}
+	if !states["paused"] || !states["composing"] {
+		t.Errorf("what is waiting is %v, want one person's stop and the other's typing", states)
+	}
+}
+
+// A board with no room left is where the last thing to drop is a state that corrects
+// something the client has already been shown. What is lost by dropping a moment is a
+// typing indicator; what would be lost by dropping the stop is the thing that clears one.
+func TestAFullBoardGivesUpAMomentBeforeAStop(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.boardCap = 2
+	session.picked = make(chan struct{}, 1)
+	blockTheForwarder(t, session)
+
+	typing := func(phone string, state waTypes.ChatPresence) {
+		jid := waTypes.NewJID(phone, waTypes.DefaultUserServer)
+		session.chatPresence(&waEvents.ChatPresence{
+			MessageSource: waTypes.MessageSource{Chat: jid, Sender: jid}, State: state,
+		})
+	}
+	typing("5511999990002", waTypes.ChatPresenceComposing)
+	typing("5511999990003", waTypes.ChatPresenceComposing)
+	// Full now, and this is a chat the board has nothing for.
+	typing("5511999990004", waTypes.ChatPresencePaused)
+
+	waiting := onBoard(session)
+	if len(waiting) != 2 {
+		t.Fatalf("the board is holding %d, and its cap is 2", len(waiting))
+	}
+	stops := 0
+	for _, emission := range waiting {
+		if stateOf(t, emission) == "paused" {
+			stops++
+		}
+	}
+	if stops != 1 {
+		t.Error("a stop was dropped for a board full of typing, and nothing will clear what it was going to clear")
+	}
+}
