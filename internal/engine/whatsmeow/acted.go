@@ -226,15 +226,12 @@ func changeOf(event *waEvents.Message) change {
 		// agent's thread every time a group's membership changes.
 		return dropping("dropping a sender key distribution, which is how a group stays readable rather than something somebody sent")
 
-	case event.Message.GetProtocolMessage() != nil:
-		// Machinery rather than something somebody sent: a history sync notification, an
-		// app state key share, the answer to a peer request. whatsmeow acts on these
-		// itself and none of them carries anything a conversation shows, so the
-		// placeholder the message path would otherwise give this would put the account's
-		// own housekeeping in an agent's thread, once per sync. Answered here because it
-		// is the last thing a protocol message can be: the two that a client does act on
-		// were taken above.
-		return dropping("dropping a protocol message, which is machinery rather than something somebody sent")
+	case housekeeping(event.Message.GetProtocolMessage()):
+		// The account's own plumbing: a history sync notification, an app state key
+		// share, the answer to a peer request. whatsmeow acts on these itself and none
+		// carries anything a conversation shows, so the placeholder the message path
+		// would otherwise give them is a bubble in an agent's thread once per sync.
+		return dropping("dropping a protocol message that is the account's own plumbing")
 
 	case event.Info.Edit != waTypes.EditAttributeEmpty:
 		// WhatsApp added something. Loud rather than silent, and kept on the phone: a
@@ -243,6 +240,43 @@ func changeOf(event *waEvents.Message) change {
 		return withholding("withholding an acknowledgement for a way of changing a message this build does not know")
 	}
 	return change{verdict: notAChange}
+}
+
+// housekeeping reports whether a protocol message is the account's own plumbing rather
+// than something a person did.
+//
+// It is a list of what to drop and not a list of what to keep, and that direction is the
+// whole design. WhatsApp adds types to this enum -- it is past thirty and still growing
+// -- and the two ways of being wrong about a new one are not the same size: read as
+// plumbing it is acknowledged and gone, and read as something a person did it is a
+// bubble an agent can see and ask about. So an unknown type falls through to the
+// placeholder, and only what has been looked at and found to be plumbing is dropped.
+//
+// What is deliberately not here: sharing a phone number, setting a disappearing timer, a
+// reminder, a chat theme, a label change. Each is somebody acting in the conversation,
+// and the contract has an `unsupported` reason -- `protocol` -- that says exactly that.
+func housekeeping(message *waE2E.ProtocolMessage) bool {
+	if message == nil {
+		return false
+	}
+	switch message.GetType() {
+	case waE2E.ProtocolMessage_EPHEMERAL_SYNC_RESPONSE,
+		waE2E.ProtocolMessage_HISTORY_SYNC_NOTIFICATION,
+		waE2E.ProtocolMessage_APP_STATE_SYNC_KEY_SHARE,
+		waE2E.ProtocolMessage_APP_STATE_SYNC_KEY_REQUEST,
+		waE2E.ProtocolMessage_MSG_FANOUT_BACKFILL_REQUEST,
+		waE2E.ProtocolMessage_INITIAL_SECURITY_NOTIFICATION_SETTING_SYNC,
+		waE2E.ProtocolMessage_APP_STATE_FATAL_EXCEPTION_NOTIFICATION,
+		waE2E.ProtocolMessage_PEER_DATA_OPERATION_REQUEST_MESSAGE,
+		waE2E.ProtocolMessage_PEER_DATA_OPERATION_REQUEST_RESPONSE_MESSAGE,
+		waE2E.ProtocolMessage_MEDIA_NOTIFY_MESSAGE,
+		waE2E.ProtocolMessage_CLOUD_API_THREAD_CONTROL_NOTIFICATION,
+		waE2E.ProtocolMessage_LID_MIGRATION_MAPPING_SYNC,
+		waE2E.ProtocolMessage_COEX_STATE_SYNC:
+		return true
+	default:
+		return false
+	}
 }
 
 // revokes reports whether this stanza deletes a message rather than carrying one.

@@ -213,7 +213,7 @@ func TestWhatIsNotAMessageIsAcknowledgedRatherThanShownToAnAgent(t *testing.T) {
 		name string
 		body *waE2E.Message
 	}{
-		{"the account's own housekeeping", &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{
+		{"the account's own plumbing", &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{
 			Type: waE2E.ProtocolMessage_HISTORY_SYNC_NOTIFICATION.Enum(),
 			HistorySyncNotification: &waE2E.HistorySyncNotification{
 				FileLength: proto.Uint64(1024),
@@ -244,6 +244,39 @@ func TestWhatIsNotAMessageIsAcknowledgedRatherThanShownToAnAgent(t *testing.T) {
 
 			if !publishedNothing(t, session, event) {
 				t.Fatal("something that is not a message was left for WhatsApp to redeliver for good")
+			}
+		})
+	}
+}
+
+// The other side of the same list, and the side that matters. A protocol message is not
+// automatically plumbing: some of them are somebody acting in the conversation, and
+// acknowledging one is losing it. The contract has a reason that says exactly this.
+func TestAProtocolMessageSomebodySentIsShownRatherThanDropped(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		kind waE2E.ProtocolMessage_Type
+	}{
+		// The answer to WhatsApp's "share your phone number" prompt: a contact deciding
+		// to be reachable, dropped by a blanket rule and gone.
+		{"a contact sharing their phone number", waE2E.ProtocolMessage_SHARE_PHONE_NUMBER},
+		{"a disappearing timer being set", waE2E.ProtocolMessage_EPHEMERAL_SETTING},
+		// Nobody has looked at this one, which is the point of the list running the
+		// other way: an unread type is visible rather than silently gone.
+		{"a type nobody has looked at yet", waE2E.ProtocolMessage_REMINDER_MESSAGE},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			session, _ := newTestSession(t, "5511999990001")
+			event := textMessage("3EB0SOMEBODY", "")
+			event.Message = &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{Type: tc.kind.Enum()}}
+
+			content := inboundContentOf(t, publishedBy(t, session, event))
+			if content["type"] != "unsupported" || content["reason"] != "protocol" {
+				t.Fatalf("something somebody did was published as %v, want the protocol placeholder", content)
 			}
 		})
 	}

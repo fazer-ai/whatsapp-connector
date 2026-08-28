@@ -238,10 +238,18 @@ func unreadableBody(event *waEvents.Message) (body, bool) {
 // separates a poll from a stanza that carried nothing at all, and a client shows the
 // difference.
 func whyUnreadable(event *waEvents.Message) protocol.UnsupportedReason {
-	if bodyless(event.Message) {
+	switch {
+	case bodyless(event.Message):
 		return protocol.UnsupportedEmpty
+	case event.Message.GetProtocolMessage() != nil:
+		// One that is not the account's own plumbing, which changeOf already dropped.
+		// What is left is somebody acting in the conversation in a way the contract does
+		// not carry -- sharing their phone number, putting a timer on the chat -- and
+		// this reason is what the contract has for saying so.
+		return protocol.UnsupportedProtocol
+	default:
+		return protocol.UnsupportedUnknownType
 	}
-	return protocol.UnsupportedUnknownType
 }
 
 // bodyless reports whether a message is nothing but what rides along with one.
