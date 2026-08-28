@@ -1957,3 +1957,70 @@ func TestARecordRefusedOnceIsStillWritten(t *testing.T) {
 		t.Fatalf("the account was logged out %d times, want once", got)
 	}
 }
+
+// The engine can only bound what it holds. Everything after the handoff -- a stream that
+// is retrying, a Redis that is coming back -- happens here, and it is exactly the delay
+// that makes a typing indicator wrong rather than late. So the last check is here, and a
+// moment that has passed is dropped rather than written.
+func TestATransientEventThatWentStaleIsNotWrittenToTheStream(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	if _, err := h.manager.Adopt(context.Background(), "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, ok := h.engine.Session("s1")
+	if !ok {
+		t.Fatal("the engine has no session after Adopt")
+	}
+
+	settled := make(chan error, 1)
+	engineSession.EmitPerishable(protocol.EventChatPresence, map[string]any{"state": "composing"},
+		func() bool { return false }, func(err error) { settled <- err })
+
+	select {
+	case err := <-settled:
+		// Not an error: nothing failed, the event stopped being worth writing. Settled
+		// as a failure it would look like the stream refusing, which is a different
+		// thing and one an engine may act on.
+		if err != nil {
+			t.Fatalf("a moment that had passed settled as %v, and nothing failed", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a moment that had passed was never settled, so the engine waits forever")
+	}
+	if got := len(h.recorder.published()); got != 0 {
+		t.Fatalf("the stream holds %d events, and a moment that had passed is not one to write", got)
+	}
+}
+
+// And the control, because a check that drops everything would pass the test above: a
+// moment that is still true is written like anything else.
+func TestATransientEventThatIsStillTrueIsWritten(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	if _, err := h.manager.Adopt(context.Background(), "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, ok := h.engine.Session("s1")
+	if !ok {
+		t.Fatal("the engine has no session after Adopt")
+	}
+
+	settled := make(chan error, 1)
+	engineSession.EmitPerishable(protocol.EventChatPresence, map[string]any{"state": "composing"},
+		func() bool { return true }, func(err error) { settled <- err })
+
+	select {
+	case err := <-settled:
+		if err != nil {
+			t.Fatalf("a moment that was still true settled as %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a moment that was still true was never settled")
+	}
+	if got := len(h.recorder.published()); got != 1 {
+		t.Fatalf("the stream holds %d events, want the one that was still true", got)
+	}
+}

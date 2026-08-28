@@ -487,10 +487,13 @@ func TestAMomentIsNotHeldWaitingForAReaderThatIsBusy(t *testing.T) {
 	// perishable event must not be what a durable one is queued behind.
 	session.chatPresence(&waEvents.ChatPresence{MessageSource: source, State: waTypes.ChatPresencePaused})
 
-	// Waiting out the bound, which is the subject here rather than a way to synchronise
-	// with the pump: what is being read is whether the handoff gives up, and it cannot
-	// be observed before it has had the chance to.
-	time.Sleep(4 * session.handoffWait)
+	// Waiting on the pump taking the stop rather than on a clock: it can only reach the
+	// stop after it has given up on the typing, so this is the give-up itself saying so.
+	select {
+	case <-session.picked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the forwarder never gave up on the typing")
+	}
 
 	emission := next(t, session)
 	if emission.Type != protocol.EventChatPresence {

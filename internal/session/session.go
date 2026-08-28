@@ -228,6 +228,18 @@ func (s *Session) publish(ctx context.Context, emission engine.Emission) {
 		return
 	}
 
+	if emission.Fresh != nil && !emission.Fresh() {
+		// A moment that has passed, and the last place it can be stopped. The engine
+		// checks this too, and the check there only covers the handoff: everything after
+		// it -- a stream that is retrying, a Redis that is coming back -- happens here,
+		// and it is exactly the delay that makes a typing indicator wrong rather than
+		// late. Not an error: nothing failed, the event stopped being worth writing.
+		s.log.Debug().Str("type", string(emission.Type)).
+			Msg("dropped a transient emission that is no longer true")
+		settle(emission, nil)
+		return
+	}
+
 	s.seq++
 	event := protocol.Event{
 		V:       protocol.Version,
