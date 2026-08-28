@@ -303,6 +303,14 @@ func TestASharedCardCarriesItsNameItsNumberAndTheCardItself(t *testing.T) {
 			Vcard: proto.String("BEGIN:VCARD\nVERSION:3.0\nitem1.FN:Carlos Dias\n" +
 				"item2.TEL;type=CELL;waid=5541988881111:+55 41 98888-1111\nEND:VCARD\n"),
 		}, "Carlos Dias", "+55 41 98888-1111"},
+		// RFC 2426 breaks a property past 75 octets and starts the next line with one
+		// space that is not part of the value, which is what an address book exports. A
+		// TEL with a few parameters is past 75 before the number begins.
+		{"folded across physical lines", &waE2E.ContactMessage{
+			Vcard: proto.String("BEGIN:VCARD\nVERSION:3.0\nFN:Carlos D\n ias\n" +
+				"item2.TEL;type=CELL;type=VOICE;type=pref;waid=5541988881111\n" +
+				" :+55 41 98888-1111\nEND:VCARD\n"),
+		}, "Carlos Dias", "+55 41 98888-1111"},
 		// A TEL whose value says nothing this connector can use. The account behind the
 		// card is in the parameter, which is what makes it worth falling back to.
 		{"reachable only through the waid parameter", &waE2E.ContactMessage{

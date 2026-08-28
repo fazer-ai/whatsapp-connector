@@ -431,8 +431,8 @@ func vcardValue(card, want string) string {
 // that needs them: WhatsApp puts the account behind a card in a parameter on TEL rather
 // than in any value.
 func vcardLine(card, want string) (value, parameters string) {
-	for line := range strings.SplitSeq(card, "\n") {
-		trimmed := strings.TrimRight(line, "\r")
+	for line := range strings.SplitSeq(vcardUnfold(card), "\n") {
+		trimmed := line
 		name, raw, found := strings.Cut(trimmed, ":")
 		if !found {
 			continue
@@ -450,6 +450,30 @@ func vcardLine(card, want string) (value, parameters string) {
 		}
 	}
 	return "", ""
+}
+
+// vcardUnfold joins the physical lines a card was wrapped across back into the logical
+// ones it was written as, for reading only: what is published stays as it arrived.
+//
+// RFC 2426 breaks a property longer than 75 octets and starts the next line with a single
+// space or tab that is not part of the value, and an address book exporting a card does
+// this routinely -- a TEL with a few parameters is past 75 before the number begins.
+// Reading the physical lines gives a name cut in half, and when the break lands before
+// the colon it gives no property at all, so the card publishes an empty number.
+func vcardUnfold(card string) string {
+	lines := strings.Split(card, "\n")
+	unfolded := make([]string, 0, len(lines))
+	for _, line := range lines {
+		trimmed := strings.TrimRight(line, "\r")
+		if len(unfolded) > 0 && trimmed != "" && (trimmed[0] == ' ' || trimmed[0] == '\t') {
+			// The one whitespace that did the folding, and only that one: a value may
+			// well begin with a space of its own on the line after it.
+			unfolded[len(unfolded)-1] += trimmed[1:]
+			continue
+		}
+		unfolded = append(unfolded, trimmed)
+	}
+	return strings.Join(unfolded, "\n")
 }
 
 // source is the bytes of an outbound file, as the address the caller named serves them.
