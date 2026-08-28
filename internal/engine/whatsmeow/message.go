@@ -238,21 +238,27 @@ func unreadableBody(event *waEvents.Message) (body, bool) {
 // separates a poll from a stanza that carried nothing at all, and a client shows the
 // difference.
 func whyUnreadable(event *waEvents.Message) protocol.UnsupportedReason {
-	if empty(event.Message) {
+	if bodyless(event.Message) {
 		return protocol.UnsupportedEmpty
 	}
 	return protocol.UnsupportedUnknownType
 }
 
-// empty reports whether a message arrived carrying nothing a reader could act on.
+// bodyless reports whether a message is nothing but what rides along with one.
 //
-// The context info does not count. It rides along on a message rather than being one,
-// and WhatsApp attaches it to stanzas whose body is genuinely absent -- read as content,
-// every one of those would be published as a message of an unknown type instead of as
-// the empty thing it is.
-func empty(message *waE2E.Message) bool {
-	return message == nil ||
-		proto.Equal(message, &waE2E.Message{MessageContextInfo: message.GetMessageContextInfo()})
+// Two things do. The context info is an annotation, and a group's sender key is what
+// makes the group's messages readable; WhatsApp attaches both to stanzas whose body is
+// genuinely absent. Counted as content, every one of those reads as a message of an
+// unknown type rather than as the empty thing it is.
+//
+// A stanza that is nothing but the key is not empty, it is housekeeping, and changeOf
+// takes it before this is ever asked. What is left here really did arrive carrying
+// nothing, which is a reason the contract names.
+func bodyless(message *waE2E.Message) bool {
+	return message == nil || proto.Equal(message, &waE2E.Message{
+		MessageContextInfo:           message.GetMessageContextInfo(),
+		SenderKeyDistributionMessage: message.GetSenderKeyDistributionMessage(),
+	})
 }
 
 // plainBody renders a message whose whole body is text, which is the one kind that

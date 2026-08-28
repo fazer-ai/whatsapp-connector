@@ -210,6 +210,22 @@ func changeOf(event *waEvents.Message) change {
 		// every pin in every chat would redeliver for good.
 		return dropping("dropping a pin, which the contract does not carry")
 
+	case event.Message.GetPollUpdateMessage() != nil:
+		// A vote updates a poll that already exists, the way a reaction updates a
+		// message. The contract has an event for the reaction and none for this, and a
+		// vote published as a message received would put a bubble in the thread for
+		// something that is not a bubble on the voter's phone either -- one per voter,
+		// per poll. It belongs with the poll, whenever the contract carries one.
+		return dropping("dropping a poll vote, which updates a message rather than adding one")
+
+	case bodyless(event.Message) && event.Message.GetSenderKeyDistributionMessage() != nil:
+		// A group handing out the key its messages are readable with. It usually rides
+		// along with the message it was sent for, and then that message is what gets
+		// rendered; alone, whatsmeow files it and nothing is left for anybody to read.
+		// The placeholder the message path would otherwise give it is a bubble in an
+		// agent's thread every time a group's membership changes.
+		return dropping("dropping a sender key distribution, which is how a group stays readable rather than something somebody sent")
+
 	case event.Message.GetProtocolMessage() != nil:
 		// Machinery rather than something somebody sent: a history sync notification, an
 		// app state key share, the answer to a peer request. whatsmeow acts on these

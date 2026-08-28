@@ -27,6 +27,10 @@ func sharedBody(event *waEvents.Message) (body, bool) {
 		content := protocol.Location(pin.GetDegreesLatitude(), pin.GetDegreesLongitude())
 		content.Name = pin.GetName()
 		content.Address = pin.GetAddress()
+		// This shape carries a live one too, and not only the shape below it. Read off
+		// the sender rather than off which arm arrived: a moving pin published as static
+		// is the one reading a client must not make, and it makes it either way.
+		content.Live = pin.GetIsLive()
 		return body{content: content, context: pin.GetContextInfo()}, true
 
 	case message.GetLiveLocationMessage() != nil:

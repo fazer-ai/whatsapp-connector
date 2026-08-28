@@ -36,6 +36,26 @@ func TestAPinOnAMapIsPublishedWithItsCoordinates(t *testing.T) {
 	}
 }
 
+// A live pin arrives in either shape, and the sender is what says which it is. Read off
+// the arm alone, the one below is published as a static pin at the position the sender
+// has already left.
+func TestALivePinInTheStaticShapeStillSaysSo(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	event := textMessage("3EB0PINLIVE", "")
+	event.Message = &waE2E.Message{LocationMessage: &waE2E.LocationMessage{
+		DegreesLatitude:  proto.Float64(-23.5505),
+		DegreesLongitude: proto.Float64(-46.6333),
+		IsLive:           proto.Bool(true),
+	}}
+
+	content := inboundContentOf(t, publishedBy(t, session, event))
+	if content["live"] != true {
+		t.Fatalf("a moving pin was published as a static one: %v", content)
+	}
+}
+
 // A live pin is where the sender was when they started, and nothing here follows the
 // updates that come after. Published with `live` set rather than as an ordinary pin,
 // because a stale position shown as current is the one reading a client must not make.
@@ -182,24 +202,73 @@ func TestABodyWithNoArmIsPublishedAsAPlaceholderRatherThanRedeliveredForGood(t *
 	}
 }
 
-// Machinery rather than something somebody sent. The placeholder above would put the
-// account's own housekeeping in an agent's thread, once per sync.
-func TestProtocolMachineryIsAcknowledgedRatherThanShownToAnAgent(t *testing.T) {
+// What is not something somebody sent gets no bubble at all. The placeholder is for a
+// message this build cannot read, not for everything that travels as one: each of these
+// would otherwise be an unreadable bubble in an agent's thread, at the rate the account
+// syncs, a group changes members, or a poll is voted in.
+func TestWhatIsNotAMessageIsAcknowledgedRatherThanShownToAnAgent(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		body *waE2E.Message
+	}{
+		{"the account's own housekeeping", &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{
+			Type: waE2E.ProtocolMessage_HISTORY_SYNC_NOTIFICATION.Enum(),
+			HistorySyncNotification: &waE2E.HistorySyncNotification{
+				FileLength: proto.Uint64(1024),
+			},
+		}}},
+		// whatsmeow files this and dispatches it anyway, so it reaches the same handler
+		// a message does.
+		{"a group handing out the key its messages are readable with", &waE2E.Message{
+			SenderKeyDistributionMessage: &waE2E.SenderKeyDistributionMessage{
+				GroupID:                             proto.String("120363000000000000@g.us"),
+				AxolotlSenderKeyDistributionMessage: []byte("chave"),
+			},
+		}},
+		{"a vote, which updates a poll rather than adding a message", &waE2E.Message{
+			PollUpdateMessage: &waE2E.PollUpdateMessage{
+				PollCreationMessageKey: messageKey(subject),
+			},
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			session, _ := newTestSession(t, "5511999990001")
+			session.deliverWait = 50 * time.Millisecond
+			event := textMessage("3EB0NOTAMESSAGE", "")
+			event.Info.IsFromMe = true
+			event.Message = tc.body
+
+			if !publishedNothing(t, session, event) {
+				t.Fatal("something that is not a message was left for WhatsApp to redeliver for good")
+			}
+		})
+	}
+}
+
+// The key usually rides along with the message it was sent to make readable, and then
+// that message is what the agent sees. Dropped on the pair, a group's first message from
+// a new member disappears.
+func TestAMessageCarryingAGroupsKeyIsStillTheMessage(t *testing.T) {
 	t.Parallel()
 
 	session, _ := newTestSession(t, "5511999990001")
-	session.deliverWait = 50 * time.Millisecond
-	event := textMessage("3EB0SYNC", "")
-	event.Info.IsFromMe = true
-	event.Message = &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{
-		Type: waE2E.ProtocolMessage_HISTORY_SYNC_NOTIFICATION.Enum(),
-		HistorySyncNotification: &waE2E.HistorySyncNotification{
-			FileLength: proto.Uint64(1024),
+	session.setGroups(true)
+	event := textMessage("3EB0WITHKEY", "")
+	event.Message = &waE2E.Message{
+		Conversation: proto.String("bom dia"),
+		SenderKeyDistributionMessage: &waE2E.SenderKeyDistributionMessage{
+			GroupID:                             proto.String("120363000000000000@g.us"),
+			AxolotlSenderKeyDistributionMessage: []byte("chave"),
 		},
-	}}
+	}
 
-	if !publishedNothing(t, session, event) {
-		t.Fatal("the account's own housekeeping was left for WhatsApp to redeliver for good")
+	content := inboundContentOf(t, publishedBy(t, session, event))
+	if content["type"] != "text" || content["body"] != "bom dia" {
+		t.Fatalf("a message that carried a group key was published as %v", content)
 	}
 }
 
