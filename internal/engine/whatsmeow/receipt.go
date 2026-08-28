@@ -31,7 +31,38 @@ func (s *Session) receipt(event *waEvents.Receipt) bool {
 			Msg("dropping a receipt the contract does not name")
 		return true
 	}
-	return s.deliver(protocol.EventMessageReceipt, published)
+	if s.publisherStalled() {
+		// A publisher that just took the whole budget and answered nothing. Waiting for
+		// it again is what puts a grouped receipt past the node watchdog, and the answer
+		// is the same either way: the acknowledgement is withheld and WhatsApp sends the
+		// receipt again.
+		s.log.Debug().Str("receipt", string(event.Type)).
+			Msg("withholding a receipt while the publisher is not answering")
+		return false
+	}
+	delivered := s.deliver(protocol.EventMessageReceipt, published)
+	s.publisherAnswered(delivered)
+	return delivered
+}
+
+// publisherStalled reports whether the last receipt was left unpublished recently enough
+// that the next one is not worth waiting on.
+//
+// The window is the delivery budget itself, so a publisher that has stopped answering
+// costs one wait per budget rather than one per receipt, and a publisher that comes back
+// is asked again as soon as the window is out. Bounded that way rather than by a flag,
+// because a flag only cleared by a success is never cleared: nothing would try again.
+func (s *Session) publisherStalled() bool {
+	until := s.stalledUntil.Load()
+	return until != 0 && time.Now().UnixNano() < until
+}
+
+func (s *Session) publisherAnswered(delivered bool) {
+	if delivered {
+		s.stalledUntil.Store(0)
+		return
+	}
+	s.stalledUntil.Store(time.Now().Add(s.deliverWait).UnixNano())
 }
 
 // receiptOf maps whatsmeow's receipt onto the contract's four, and reports whether the

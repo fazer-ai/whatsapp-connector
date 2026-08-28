@@ -370,3 +370,67 @@ func TestAReadMarkInAGroupNormalisesWhoWroteTheMessages(t *testing.T) {
 		t.Fatal("the read mark sent the participant in whichever namespace it came in")
 	}
 }
+
+// One receipt node is not one event. whatsmeow expands a grouped receipt into a dispatch
+// per participant and carries on through the ones that fail, so a group read by six
+// people is six calls into this handler. Six full waits is thirty times the budget and
+// past the five minutes whatsmeow gives a node before it starts the next one alongside
+// it -- and two node handlers at once is the ordering guarantee gone.
+//
+// What is measured is the wall clock across the burst, because that is the thing that
+// breaks: the first call is allowed to wait, and the ones behind it are not.
+func TestABurstOfReceiptsWaitsOnAStalledPublisherOnlyOnce(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.deliverWait = 200 * time.Millisecond
+
+	const participants = 6
+	started := time.Now()
+	for range participants {
+		if session.receipt(receiptEvent(waTypes.ReceiptTypeRead, "3EB0RECEIPT")) {
+			t.Fatal("a receipt nobody published was acknowledged")
+		}
+	}
+	spent := time.Since(started)
+
+	// One budget for the burst, not one per participant. The bound is generous on
+	// purpose: what would fail this is the linear growth, which is 6x away.
+	if spent > 3*session.deliverWait {
+		t.Errorf("six receipts against a stalled publisher spent %s, and the budget is %s",
+			spent, session.deliverWait)
+	}
+}
+
+// And the other half, which is what keeps the gate from being a one-way door: a
+// publisher that comes back is asked again. Cleared only by a success, nothing would
+// ever try, and the session would stop publishing receipts for good.
+func TestAReceiptIsPublishedAgainOnceThePublisherAnswers(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.deliverWait = 100 * time.Millisecond
+
+	if session.receipt(receiptEvent(waTypes.ReceiptTypeRead, "3EB0STALL")) {
+		t.Fatal("a receipt nobody published was acknowledged")
+	}
+	if !session.publisherStalled() {
+		t.Fatal("a publisher that answered nothing is not recorded as stalled")
+	}
+
+	// The publisher was slow rather than gone, so what it was handed is still queued.
+	// Left there it would be the next thing read, and the check below would pass on the
+	// wrong event.
+	stale := next(t, session)
+	stale.Settle(nil)
+
+	// The window is the budget, so waiting it out is what a real burst does between
+	// nodes. Measured against the recorded deadline rather than slept past blindly.
+	for session.publisherStalled() {
+		time.Sleep(10 * time.Millisecond)
+	}
+	receiptPublishedBy(t, session, receiptEvent(waTypes.ReceiptTypeRead, "3EB0AGAIN"))
+	if session.publisherStalled() {
+		t.Error("a publisher that answered is still recorded as stalled")
+	}
+}

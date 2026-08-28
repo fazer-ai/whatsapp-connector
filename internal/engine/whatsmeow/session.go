@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -97,6 +98,18 @@ type Session struct {
 	// deliverWait bounds how long an inbound message waits to hear that its event was
 	// published. A field for the same reason as storeLimit, and for no other.
 	deliverWait time.Duration
+
+	// stalledUntil is when a receipt is worth handing to the publisher again, in
+	// monotonic nanoseconds, and zero while it is.
+	//
+	// It exists because one receipt node is not one event: whatsmeow expands a grouped
+	// receipt into a dispatch per participant and carries on through the ones that fail,
+	// so a group of six read by six people is six calls into the handler. Each waiting
+	// out deliverWait puts the node past the five minutes whatsmeow gives a handler
+	// before it starts the next one alongside it, and two node handlers running at once
+	// is the ordering guarantee gone. Waiting once per window and refusing the rest
+	// costs a redelivery, which is the trade the whole path is built on.
+	stalledUntil atomic.Int64
 
 	// downloadWait bounds how long an inbound media message spends fetching its file.
 	// A field for the same reason as the two above it, and for no other.
