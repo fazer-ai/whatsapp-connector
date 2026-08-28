@@ -300,10 +300,24 @@ func TestWhatIsNotAMessageIsAcknowledgedRatherThanShownToAnAgent(t *testing.T) {
 				AxolotlSenderKeyDistributionMessage: []byte("chave"),
 			},
 		}},
-		{"a vote, which updates a poll rather than adding a message", &waE2E.Message{
+		{"the other three shapes key material travels in", &waE2E.Message{
+			GroupRootKeyShare: &waE2E.GroupRootKeyShare{},
+		}},
+		{"a vote, which marks a poll rather than adding a message", &waE2E.Message{
 			PollUpdateMessage: &waE2E.PollUpdateMessage{
 				PollCreationMessageKey: messageKey(subject),
 			},
+		}},
+		{"an option somebody added to a poll", &waE2E.Message{
+			PollAddOptionMessage: &waE2E.PollAddOptionMessage{
+				PollCreationMessageKey: messageKey(subject),
+			},
+		}},
+		{"a disappearing message being kept", &waE2E.Message{
+			KeepInChatMessage: &waE2E.KeepInChatMessage{Key: messageKey(subject)},
+		}},
+		{"a message being pinned", &waE2E.Message{
+			PinInChatMessage: &waE2E.PinInChatMessage{Key: messageKey(subject)},
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

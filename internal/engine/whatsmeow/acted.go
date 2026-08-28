@@ -210,21 +210,22 @@ func changeOf(event *waEvents.Message) change {
 		// every pin in every chat would redeliver for good.
 		return dropping("dropping a pin, which the contract does not carry")
 
-	case event.Message.GetPollUpdateMessage() != nil:
-		// A vote updates a poll that already exists, the way a reaction updates a
-		// message. The contract has an event for the reaction and none for this, and a
-		// vote published as a message received would put a bubble in the thread for
-		// something that is not a bubble on the voter's phone either -- one per voter,
-		// per poll. It belongs with the poll, whenever the contract carries one.
-		return dropping("dropping a poll vote, which updates a message rather than adding one")
+	case marksAMessage(event.Message):
+		// Something done to a message that already exists, in a way the contract has no
+		// event for. The three it does have were taken above; what is left is a poll's
+		// own machinery and the two ways WhatsApp marks a message rather than replacing
+		// it. None of them is a bubble on the sender's phone either, which is the test --
+		// a vote published as a message received is one bubble per voter for something
+		// the voter never sent.
+		return dropping("dropping something that marks a message rather than adding one")
 
-	case bodyless(event.Message) && event.Message.GetSenderKeyDistributionMessage() != nil:
-		// A group handing out the key its messages are readable with. It usually rides
-		// along with the message it was sent for, and then that message is what gets
-		// rendered; alone, whatsmeow files it and nothing is left for anybody to read.
-		// The placeholder the message path would otherwise give it is a bubble in an
-		// agent's thread every time a group's membership changes.
-		return dropping("dropping a sender key distribution, which is how a group stays readable rather than something somebody sent")
+	case bodyless(event.Message) && keyMaterial(event.Message):
+		// A group handing out what makes its messages readable. It rides along with the
+		// message it was sent for as often as it arrives alone, and then that message is
+		// what gets rendered; alone, whatsmeow files it and nothing is left to read. The
+		// placeholder the message path would otherwise give it is a bubble in an agent's
+		// thread every time a group's membership changes.
+		return dropping("dropping key material, which is how a conversation stays readable rather than something somebody sent")
 
 	case housekeeping(event.Message.GetProtocolMessage()):
 		// The account's own plumbing: a history sync notification, an app state key
@@ -240,6 +241,35 @@ func changeOf(event *waEvents.Message) change {
 		return withholding("withholding an acknowledgement for a way of changing a message this build does not know")
 	}
 	return change{verdict: notAChange}
+}
+
+// marksAMessage reports whether a stanza changes a message that already exists rather
+// than adding one, in a way the contract has no event for.
+//
+// Both lists here and the one below were read off the message descriptor rather than
+// grown one report at a time: three review rounds in a row found another arm that
+// belonged on one of them, which is what a list assembled from whatever turned up looks
+// like. What is on them is what a sweep of the descriptor found; what is not is a
+// message, and gets the placeholder.
+//
+// A poll's result snapshot is not here, and reading the descriptor is what settled it:
+// unlike a vote and an added option it names no poll at all, so it is WhatsApp posting a
+// tally as its own bubble rather than changing one that exists.
+func marksAMessage(message *waE2E.Message) bool {
+	return message.GetPollUpdateMessage() != nil ||
+		message.GetPollAddOptionMessage() != nil ||
+		message.GetKeepInChatMessage() != nil ||
+		message.GetPinInChatMessage() != nil
+}
+
+// keyMaterial reports whether a stanza carries what keeps a conversation readable: the
+// sender key a group hands out, and the three other shapes WhatsApp distributes keys in.
+// whatsmeow files each of them and dispatches the event anyway.
+func keyMaterial(message *waE2E.Message) bool {
+	return message.GetSenderKeyDistributionMessage() != nil ||
+		message.GetFastRatchetKeySenderKeyDistributionMessage() != nil ||
+		message.GetGroupRootKeyShare() != nil ||
+		message.GetRootSecretDistributeMessage() != nil
 }
 
 // housekeeping reports whether a protocol message is the account's own plumbing rather

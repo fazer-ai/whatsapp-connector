@@ -8,7 +8,6 @@ import (
 	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
 	waTypes "go.mau.fi/whatsmeow/types"
 	waEvents "go.mau.fi/whatsmeow/types/events"
-	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/engine"
@@ -303,10 +302,29 @@ func whyUnreadable(event *waEvents.Message) protocol.UnsupportedReason {
 // takes it before this is ever asked. What is left here really did arrive carrying
 // nothing, which is a reason the contract names.
 func bodyless(message *waE2E.Message) bool {
-	return message == nil || proto.Equal(message, &waE2E.Message{
-		MessageContextInfo:           message.GetMessageContextInfo(),
-		SenderKeyDistributionMessage: message.GetSenderKeyDistributionMessage(),
+	if message == nil {
+		return true
+	}
+	said := false
+	message.ProtoReflect().Range(func(field protoreflect.FieldDescriptor, _ protoreflect.Value) bool {
+		if _, along := ridesAlong[field.Name()]; along {
+			return true
+		}
+		said = true
+		return false
 	})
+	return !said
+}
+
+// ridesAlong is what is attached to a message rather than being one. The annotation is
+// one; the rest is the key material that makes the conversation readable, which WhatsApp
+// sends both on its own and bolted to the message it was sent for.
+var ridesAlong = map[protoreflect.Name]struct{}{
+	"messageContextInfo":                         {},
+	"senderKeyDistributionMessage":               {},
+	"fastRatchetKeySenderKeyDistributionMessage": {},
+	"groupRootKeyShare":                          {},
+	"rootSecretDistributeMessage":                {},
 }
 
 // plainBody renders a message whose whole body is text, which is the one kind that
