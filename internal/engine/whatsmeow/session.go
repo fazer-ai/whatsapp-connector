@@ -128,6 +128,14 @@ type Session struct {
 	// the function that was supposed to apply it.
 	handOver func(context.Context, waTypes.JID, string, *waE2E.Message) (wm.SendResponse, error)
 
+	// unseal opens a change WhatsApp sealed under the secret of the message it is
+	// about. A field for the same reason as the ones above: the key lives in the
+	// device store the socket writes, so nothing that does not have one can reach
+	// either side of what this has to answer for -- a secret that was never stored and
+	// a socket that is not up yet are not the same answer, and only one of them is
+	// worth another delivery.
+	unseal func(context.Context, *waEvents.Message) (*waE2E.Message, error)
+
 	// groupMode is how a group addresses its members, which decides the namespace a
 	// message key in it names a sender by. A field because reading it is a round trip to
 	// WhatsApp, and a test cannot otherwise reach either branch of what depends on it.

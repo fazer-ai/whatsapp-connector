@@ -18,6 +18,7 @@
 //	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveMedia
 //	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveRefetch
 //	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveViewOnce
+//	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveWatchAMessageChange
 //	WAC_LIVE_TO=<number> go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveSend$
 //	WAC_LIVE_TO=<number> go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveSendMedia
 //	  (WAC_LIVE_FILE names the file; WAC_LIVE_VOICE=1 sends it as a voice note)
@@ -215,6 +216,180 @@ func TestLiveListen(t *testing.T) {
 	}
 	if state := session.state(); state != "open" {
 		t.Fatalf("the session did not stay up: state=%s", state)
+	}
+}
+
+// TestLiveWatchAMessageChange is M2.5's inbound half against a real phone: somebody on
+// the other side corrects a message, reacts to it, takes the reaction back and finally
+// deletes it, and each of those has to come back out as its own event naming the message
+// it is about.
+//
+// It is the phase no fixture can stand in for, and the first run proved it: the shapes
+// are whatsmeow's reading of what WhatsApp really sends, and what a phone really sends
+// for a correction turned out not to be the shape the library documents building. Two of
+// the four passed and the edit was refused, which is a thing only a phone could say.
+//
+// Everything is asked for at once and collected in whatever order it arrives. Waiting on
+// one step at a time reads better and is wrong: a step that never lands sits on the
+// events of every step after it, and the run then reports the one thing it was waiting
+// for instead of everything it saw.
+func TestLiveWatchAMessageChange(t *testing.T) {
+	window := liveWindow(t, 5*time.Minute)
+
+	session, _ := liveSession(t)
+	events := watch(t, session)
+
+	if err := session.Connect(t.Context(), engine.ConnectRequest{Pairing: "resume"}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	events.awaitState(t, "open", 2*time.Minute)
+
+	target, _ := liveAwaitTheirMessage(t, events, window)
+	fmt.Fprintf(os.Stderr,
+		"now, on the other phone, to that message: edit it, react to it, take the reaction back, delete it for everyone.\nwaiting up to %s\n",
+		window)
+
+	var edited, revoked engine.Emission
+	var reactions []engine.Emission
+	deadline := time.After(window)
+
+collect:
+	for {
+		select {
+		case emission, ok := <-events.seen:
+			if !ok {
+				t.Fatal("the session ended before the phase finished")
+			}
+			switch emission.Type {
+			case protocol.EventMessageEdited:
+				edited = emission
+			case protocol.EventMessageRevoked:
+				revoked = emission
+			case protocol.EventMessageReaction:
+				// Kept whole rather than counted: a reaction on some other message in
+				// the account would otherwise be read as the answer to one of these.
+				reactions = append(reactions, emission)
+			}
+			if edited.Type != "" && revoked.Type != "" && len(reactions) >= 2 {
+				break collect
+			}
+		case <-deadline:
+			break collect
+		}
+	}
+
+	missing := []string{}
+	if edited.Type == "" {
+		missing = append(missing, "the correction")
+	}
+	if revoked.Type == "" {
+		missing = append(missing, "the deletion")
+	}
+	if len(reactions) < 2 {
+		missing = append(missing, fmt.Sprintf("%d of the two reactions", 2-len(reactions)))
+	}
+	if len(missing) > 0 {
+		// All of them at once. Reporting only the first leaves a second run to find the
+		// second, and every run of this phase costs a human at a phone.
+		t.Fatalf("%s never arrived within %s", strings.Join(missing, " and "), window)
+	}
+
+	liveCheckTheCorrection(t, edited, target)
+	liveCheckTheReactions(t, reactions, target)
+	liveCheckTheDeletion(t, revoked, target)
+
+	if state := session.state(); state != "open" {
+		t.Fatalf("the session did not stay up: state=%s", state)
+	}
+}
+
+func liveCheckTheCorrection(t *testing.T, emission engine.Emission, target string) {
+	t.Helper()
+
+	var correction struct {
+		MessageID string `json:"message_id"`
+		FromMe    bool   `json:"from_me"`
+		Content   struct {
+			Type string `json:"type"`
+			Body string `json:"body"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(emission.Payload, &correction); err != nil {
+		t.Fatalf("unmarshal the edit: %v", err)
+	}
+	switch {
+	case correction.MessageID != target:
+		// The stanza carrying a correction has an id of its own, and publishing that one
+		// leaves the client looking for a message nobody ever stored.
+		t.Fatalf("the edit corrects %q, and the message being edited is %q", correction.MessageID, target)
+	case correction.FromMe:
+		t.Fatalf("somebody else's edit was published as the account's own: %s", emission.Payload)
+	case correction.Content.Type != "text" || correction.Content.Body == "":
+		t.Fatalf("the edit arrived with no new body: %s", emission.Payload)
+	}
+	fmt.Fprintf(os.Stderr, "edit: %s now reads %q\n", correction.MessageID, correction.Content.Body)
+}
+
+// liveCheckTheReactions reads the two halves of putting a reaction on and taking it off.
+// Which arrives first is not assumed: they are told apart by the emoji, because that is
+// what tells them apart on the wire.
+func liveCheckTheReactions(t *testing.T, emissions []engine.Emission, target string) {
+	t.Helper()
+
+	var put, taken []byte
+	for _, emission := range emissions {
+		var body struct {
+			ID       string `json:"id"`
+			TargetID string `json:"target_id"`
+			Emoji    string `json:"emoji"`
+			FromMe   bool   `json:"from_me"`
+		}
+		if err := json.Unmarshal(emission.Payload, &body); err != nil {
+			t.Fatalf("unmarshal the reaction: %v", err)
+		}
+		if body.TargetID != target {
+			fmt.Fprintf(os.Stderr, "ignoring a reaction on %s\n", body.TargetID)
+			continue
+		}
+		if body.FromMe {
+			t.Fatalf("somebody else's reaction was published as the account's own: %s", emission.Payload)
+		}
+		if body.ID == "" || body.ID == target {
+			// The client deduplicates on the reaction's own id and matches its own sends
+			// by it. The target's id in that field would collide with the message.
+			t.Fatalf("the reaction has no id of its own: %s", emission.Payload)
+		}
+		if body.Emoji == "" {
+			taken = emission.Payload
+		} else {
+			put = emission.Payload
+		}
+	}
+	if put == nil {
+		t.Fatalf("no reaction on %s carried an emoji", target)
+	}
+	if taken == nil {
+		t.Fatalf("taking the reaction back never arrived as an empty emoji, which is how a removal is spelled")
+	}
+}
+
+func liveCheckTheDeletion(t *testing.T, emission engine.Emission, target string) {
+	t.Helper()
+
+	var deletion struct {
+		MessageID string `json:"message_id"`
+		By        string `json:"by"`
+	}
+	if err := json.Unmarshal(emission.Payload, &deletion); err != nil {
+		t.Fatalf("unmarshal the deletion: %v", err)
+	}
+	if deletion.MessageID != target {
+		t.Fatalf("the deletion names %q, and the message deleted is %q", deletion.MessageID, target)
+	}
+	if deletion.By != "contact" {
+		// `self` is what the client applies to its own deletions, files and all. Saying
+		// it about somebody else's would destroy an attachment nobody asked it to.
+		t.Fatalf("somebody else's deletion was published as by=%q", deletion.By)
 	}
 }
 

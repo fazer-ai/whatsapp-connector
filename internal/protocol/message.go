@@ -152,3 +152,61 @@ type MediaDownloadFailure struct {
 	MessageID string  `json:"message_id"`
 	Reason    string  `json:"reason"`
 }
+
+// MessageEdited is `message.edited`: somebody corrected a message the client already
+// has. MessageID names the message being corrected, never the stanza that carries the
+// correction, because the client's whole job here is to find the bubble and rewrite it.
+//
+// Content is the message as it now reads. A media caption edit carries the media arm
+// with the new caption and no Ref: an edit changes what a message says and never the
+// file it carries, so the reference the client got with the original message is still
+// the right one, and issuing a second one would mint a second blob for the same bytes.
+type MessageEdited struct {
+	Chat      Address `json:"chat"`
+	Sender    *Party  `json:"sender,omitempty"`
+	MessageID string  `json:"message_id"`
+	FromMe    bool    `json:"from_me"`
+	Content   any     `json:"content"`
+	Timestamp int64   `json:"timestamp"`
+}
+
+// RevokedBy is who deleted a message for everyone, from the account's point of view.
+type RevokedBy string
+
+// The revokers the contract names. There is no third arm for a group admin deleting
+// somebody else's message: the account either performed the deletion or it did not, and
+// `sender` is what says who it was.
+const (
+	RevokedByContact RevokedBy = "contact"
+	RevokedBySelf    RevokedBy = "self"
+)
+
+// MessageRevoked is `message.revoked`: a message the client already has was deleted for
+// everyone. The two revokers are not the same event to a client — a deletion this
+// account performed is applied the way its own deletion is, files included, while one
+// somebody else performed only flags the bubble and leaves the text an agent can still
+// read.
+type MessageRevoked struct {
+	Chat      Address   `json:"chat"`
+	Sender    *Party    `json:"sender,omitempty"`
+	MessageID string    `json:"message_id"`
+	By        RevokedBy `json:"by"`
+	Timestamp int64     `json:"timestamp"`
+}
+
+// MessageReaction is `message.reaction`: somebody put an emoji on a message, or took
+// one back.
+//
+// ID is the reaction's own message id, which is what makes it deduplicable and what
+// matches the echo of a reaction this client sent. Emoji is never omitted: an empty one
+// is the removal, and leaving the field out would read as a reaction with no emoji
+// rather than as the reaction being taken back.
+type MessageReaction struct {
+	ID        string  `json:"id"`
+	Chat      Address `json:"chat"`
+	Sender    *Party  `json:"sender,omitempty"`
+	FromMe    bool    `json:"from_me"`
+	TargetID  string  `json:"target_id"`
+	Emoji     string  `json:"emoji"`
+	Timestamp int64   `json:"timestamp"`
+}
