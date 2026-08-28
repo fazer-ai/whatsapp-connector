@@ -233,6 +233,25 @@ func (c *Command) ChangesSomething() bool {
 	return false
 }
 
+// RepeatableCommands are the commands worth carrying out again rather than answering
+// from a record of the first time.
+//
+// Not questions -- each of them writes a node -- so they are apart from
+// readOnlyCommands, and the reason is the other way round: it is not that repeating them
+// is harmless, it is that *not* repeating them is not. What they set belongs to the
+// socket that set it. WhatsApp forgets an account's availability and every presence
+// subscription when the connection goes, and whatsmeow replays neither on the next one,
+// so a redelivery that lands on a new socket and is answered from the ledger reports a
+// success over a connection where nothing was done.
+//
+// `chat.presence` is deliberately not here. Skipping it costs a typing indicator nobody
+// sees, and carrying it out again long after the fact shows one that is not true -- so
+// unlike these two, repeating is not the safer of the two mistakes.
+var RepeatableCommands = map[CommandType]bool{
+	CommandPresenceSet:       true,
+	CommandPresenceSubscribe: true,
+}
+
 // messageIDKeyed are the commands whose `message_id` names the message the command
 // itself puts on the wire. Those are the ones the contract remembers as
 // `msg:<message_id>`, and the id being the caller's own is what makes the key hold

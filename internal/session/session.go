@@ -574,6 +574,12 @@ func idempotencyKey(command *protocol.Command) string {
 		// was in when it was first asked.
 		return ""
 	}
+	if protocol.RepeatableCommands[command.Type] {
+		// Not a question, and still not worth remembering: what it set belongs to a
+		// socket that may be gone by the time the redelivery lands, and the record would
+		// report a success over a connection where nothing was done.
+		return ""
+	}
 	// Only where the id is the command's own creation. `message.download_media` also
 	// carries a `message_id`, and there it names a message somebody else's command
 	// created, so keying by it would answer a download with the result of the send. It

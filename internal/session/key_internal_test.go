@@ -120,3 +120,39 @@ func TestADownloadDoesNotBorrowTheIDNamespaceOfTheSendThatCreatedItsMessage(t *t
 		t.Fatal("a download would be remembered under the id of the send that created its message")
 	}
 }
+
+// A command whose effect belongs to the socket that carried it out cannot be answered
+// from a record of the first time. WhatsApp forgets an account's availability and its
+// presence subscriptions when the connection goes and whatsmeow replays neither, so a
+// redelivery that lands on a new socket and is answered from the ledger reports a
+// success over a connection where nothing was done.
+func TestAPresenceIsCarriedOutAgainRatherThanRecalled(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name       string
+		command    protocol.CommandType
+		remembered bool
+	}{
+		{"setting availability", protocol.CommandPresenceSet, false},
+		{"subscribing to somebody", protocol.CommandPresenceSubscribe, false},
+		// Skipping this one costs a typing indicator nobody sees; carrying it out again
+		// long after shows one that is not true. Repeating is not the safer mistake.
+		{"a typing indicator", protocol.CommandChatPresence, true},
+		{"a send", protocol.CommandMessageSend, true},
+		// And the other reason a command is not remembered, which is a different one: an
+		// answer worth having only while it is current.
+		{"a question", protocol.CommandSessionStatus, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			key := idempotencyKey(&protocol.Command{
+				Type: tc.command, ID: "c1", IdempotencyKey: "k1", Payload: json.RawMessage(`{}`),
+			})
+			if remembered := key != ""; remembered != tc.remembered {
+				t.Errorf("%s is remembered under %q, and it should be %v", tc.command, key, tc.remembered)
+			}
+		})
+	}
+}
