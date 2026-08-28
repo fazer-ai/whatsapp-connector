@@ -219,4 +219,5 @@ internal/engine/whatsmeow/receipt.go: Fail group read marks when normalization f
 # lost on any ordinary reconnect, redelivery or no. That is registered as its own issue
 # rather than folded in here, because the subscription set it would have to keep is
 # unbounded by construction and deciding how to bound it is not this slice's decision.
+# Registered as #46.
 internal/protocol/types.go: Preserve idempotency for redelivered presence commands  # PR#45
