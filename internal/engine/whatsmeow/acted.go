@@ -210,6 +210,30 @@ func changeOf(event *waEvents.Message) change {
 		// every pin in every chat would redeliver for good.
 		return dropping("dropping a pin, which the contract does not carry")
 
+	case marksAMessage(event.Message):
+		// Something done to a message that already exists, in a way the contract has no
+		// event for. The three it does have were taken above; what is left is a poll's
+		// own machinery and the two ways WhatsApp marks a message rather than replacing
+		// it. None of them is a bubble on the sender's phone either, which is the test --
+		// a vote published as a message received is one bubble per voter for something
+		// the voter never sent.
+		return dropping("dropping something that marks a message rather than adding one")
+
+	case bodyless(event.Message) && keyMaterial(event.Message):
+		// A group handing out what makes its messages readable. It rides along with the
+		// message it was sent for as often as it arrives alone, and then that message is
+		// what gets rendered; alone, whatsmeow files it and nothing is left to read. The
+		// placeholder the message path would otherwise give it is a bubble in an agent's
+		// thread every time a group's membership changes.
+		return dropping("dropping key material, which is how a conversation stays readable rather than something somebody sent")
+
+	case housekeeping(event.Message.GetProtocolMessage()):
+		// The account's own plumbing: a history sync notification, an app state key
+		// share, the answer to a peer request. whatsmeow acts on these itself and none
+		// carries anything a conversation shows, so the placeholder the message path
+		// would otherwise give them is a bubble in an agent's thread once per sync.
+		return dropping("dropping a protocol message that is the account's own plumbing")
+
 	case event.Info.Edit != waTypes.EditAttributeEmpty:
 		// WhatsApp added something. Loud rather than silent, and kept on the phone: a
 		// build that learns what it is can still publish it, and guessing from the body
@@ -217,6 +241,119 @@ func changeOf(event *waEvents.Message) change {
 		return withholding("withholding an acknowledgement for a way of changing a message this build does not know")
 	}
 	return change{verdict: notAChange}
+}
+
+// marksAMessage reports whether a stanza changes a message that already exists rather
+// than adding one, in a way the contract has no event for.
+//
+// Both lists here and the one below were read off the message descriptor rather than
+// grown one report at a time: three review rounds in a row found another arm that
+// belonged on one of them, which is what a list assembled from whatever turned up looks
+// like. What is on them is what a sweep of the descriptor found; what is not is a
+// message, and gets the placeholder.
+//
+// The candidates were found mechanically rather than argued over: every arm carrying a
+// WACommon.MessageKey names a message that already exists, and there are twenty-two of
+// them. Naming one is necessary and is not sufficient, which is the line -- a quote names
+// the message it answers and is still a message, a payment names the request it settles
+// and is still a payment. What is here is what says nothing of its own: a vote, an added
+// option, an RSVP, a call being rescheduled, a request being declined or cancelled, a
+// message being kept or pinned.
+//
+// A poll's result snapshot is deliberately not here, and reading the descriptor is what
+// settled it: unlike a vote and an added option it names no poll at all, so it is
+// WhatsApp posting a tally as its own bubble.
+//
+// The sticker resync is the odd one out and carries no key: it marks nothing and it is
+// not key material either, it is a list of file hashes and a timestamp asking for a pack
+// to be sent again. It has nowhere better to be than the list of what is not a message.
+//
+// A key is how most of them name what they mark, and not the only way, which is what the
+// key sweep alone could not see: a split payment update names its split by id and the
+// person by JID, and those two fields are the whole arm. So the sweep that settles this
+// list is over the arms carrying no field that could hold anything a person said -- and
+// running it over the descriptor turns up eleven, seven of them already here or in
+// keyMaterial. Of the four left, three are their own bubble rather than a mark on
+// somebody else's: a payment invite is an invitation, a placeholder is WhatsApp saying a
+// message exists that this device may not read, and a status link preview's style
+// travels with the status it decorates. The fourth is the split payment update.
+func marksAMessage(message *waE2E.Message) bool {
+	return message.GetPollUpdateMessage() != nil ||
+		message.GetPollAddOptionMessage() != nil ||
+		// The whole arm, not a list of its types. It carries a targetMessageKey by
+		// construction, so every one of them changes a message that already exists: a
+		// poll edited, an option added, an event edited, a message scheduled. The one
+		// the contract has an event for -- a correction -- was opened before this ran.
+		message.GetSecretEncryptedMessage() != nil ||
+		message.GetEncEventResponseMessage() != nil ||
+		message.GetKeepInChatMessage() != nil ||
+		message.GetPinInChatMessage() != nil ||
+		message.GetScheduledCallEditMessage() != nil ||
+		message.GetDeclinePaymentRequestMessage() != nil ||
+		message.GetCancelPaymentRequestMessage() != nil ||
+		message.GetStickerSyncRmrMessage() != nil ||
+		message.GetSplitPaymentUpdateMessage() != nil ||
+		movedAgain(message.GetLiveLocationMessage())
+}
+
+// movedAgain reports whether a live location is a further position rather than the start
+// of the share.
+//
+// Read off the sequence number, which is the field the protocol has for exactly this and
+// the reason it is right whichever arm carries the announcement: if the share starts as a
+// LocationMessage with `isLive`, every one of these is a position and every one has a
+// sequence; if it starts as a LiveLocationMessage, that one is the first and carries
+// none. Either way what publishes is the start and what drops is the stream -- which
+// otherwise arrives as a bubble every few seconds for as long as somebody is walking.
+func movedAgain(moving *waE2E.LiveLocationMessage) bool {
+	return moving != nil && moving.GetSequenceNumber() > 0
+}
+
+// keyMaterial reports whether a stanza carries what keeps a conversation readable: the
+// sender key a group hands out, and the three other shapes WhatsApp distributes keys in.
+// whatsmeow files each of them and dispatches the event anyway.
+func keyMaterial(message *waE2E.Message) bool {
+	return message.GetSenderKeyDistributionMessage() != nil ||
+		message.GetFastRatchetKeySenderKeyDistributionMessage() != nil ||
+		message.GetGroupRootKeyShare() != nil ||
+		message.GetRootSecretDistributeMessage() != nil
+}
+
+// housekeeping reports whether a protocol message is the account's own plumbing rather
+// than something a person did.
+//
+// It is a list of what to drop and not a list of what to keep, and that direction is the
+// whole design. WhatsApp adds types to this enum -- it is past thirty and still growing
+// -- and the two ways of being wrong about a new one are not the same size: read as
+// plumbing it is acknowledged and gone, and read as something a person did it is a
+// bubble an agent can see and ask about. So an unknown type falls through to the
+// placeholder, and only what has been looked at and found to be plumbing is dropped.
+//
+// What is deliberately not here: sharing a phone number, setting a disappearing timer, a
+// reminder, a chat theme, a label change. Each is somebody acting in the conversation,
+// and the contract has an `unsupported` reason -- `protocol` -- that says exactly that.
+func housekeeping(message *waE2E.ProtocolMessage) bool {
+	if message == nil {
+		return false
+	}
+	switch message.GetType() {
+	case waE2E.ProtocolMessage_EPHEMERAL_SYNC_RESPONSE,
+		waE2E.ProtocolMessage_HISTORY_SYNC_NOTIFICATION,
+		waE2E.ProtocolMessage_APP_STATE_SYNC_KEY_SHARE,
+		waE2E.ProtocolMessage_APP_STATE_SYNC_KEY_REQUEST,
+		waE2E.ProtocolMessage_MSG_FANOUT_BACKFILL_REQUEST,
+		waE2E.ProtocolMessage_INITIAL_SECURITY_NOTIFICATION_SETTING_SYNC,
+		waE2E.ProtocolMessage_APP_STATE_FATAL_EXCEPTION_NOTIFICATION,
+		waE2E.ProtocolMessage_PEER_DATA_OPERATION_REQUEST_MESSAGE,
+		waE2E.ProtocolMessage_PEER_DATA_OPERATION_REQUEST_RESPONSE_MESSAGE,
+		waE2E.ProtocolMessage_MEDIA_NOTIFY_MESSAGE,
+		waE2E.ProtocolMessage_CLOUD_API_THREAD_CONTROL_NOTIFICATION,
+		waE2E.ProtocolMessage_LID_MIGRATION_MAPPING_SYNC,
+		waE2E.ProtocolMessage_COEX_STATE_SYNC:
+		return true
+	default:
+		return false
+	}
 }
 
 // revokes reports whether this stanza deletes a message rather than carrying one.

@@ -210,3 +210,76 @@ type MessageReaction struct {
 	Emoji     string  `json:"emoji"`
 	Timestamp int64   `json:"timestamp"`
 }
+
+// LocationContent is a pin on a map. The coordinates are the whole message: there is
+// nothing to fetch, which is what separates it from every other content that is not text.
+type LocationContent struct {
+	Type      string  `json:"type"`
+	Latitude  float64 `json:"latitude"`
+	Longitude float64 `json:"longitude"`
+	Name      string  `json:"name,omitempty"`
+	Address   string  `json:"address,omitempty"`
+	// Live says the sender is still moving and WhatsApp expects the pin to be updated.
+	// It is carried so a client can say so rather than showing a stale pin as current.
+	Live bool `json:"live"`
+}
+
+// Location returns the content of a pin, for a caller that fills in what it knows.
+func Location(latitude, longitude float64) LocationContent {
+	return LocationContent{Type: "location", Latitude: latitude, Longitude: longitude}
+}
+
+// Contact is one card in a share.
+//
+// The vCard is carried verbatim and the other two are read out of it, because the card
+// may hold several numbers, an email and a company that these fields cannot express: a
+// client that renders a row wants the name and the number, and one that stores the
+// contact wants everything.
+type Contact struct {
+	DisplayName string `json:"display_name,omitempty"`
+	Phone       string `json:"phone,omitempty"`
+	Vcard       string `json:"vcard,omitempty"`
+}
+
+// ContactsContent is one or more cards somebody shared.
+type ContactsContent struct {
+	Type     string    `json:"type"`
+	Contacts []Contact `json:"contacts"`
+}
+
+// Contacts returns the content of a share.
+func Contacts(cards []Contact) ContactsContent {
+	return ContactsContent{Type: "contacts", Contacts: cards}
+}
+
+// UnsupportedReason is why a message arrived without a body a client can render.
+type UnsupportedReason string
+
+// The reasons the contract defines.
+const (
+	// UnsupportedUnknownType is a body this build has no arm for: a poll, an order, a
+	// card this milestone has yet to reach.
+	UnsupportedUnknownType UnsupportedReason = "unknown_type"
+	// UnsupportedUndecryptable is a message whose ciphertext could not be opened.
+	UnsupportedUndecryptable UnsupportedReason = "undecryptable"
+	// UnsupportedProtocol is machinery rather than a message.
+	UnsupportedProtocol UnsupportedReason = "protocol"
+	// UnsupportedEmpty is a message that arrived carrying nothing at all.
+	UnsupportedEmpty UnsupportedReason = "empty"
+)
+
+// UnsupportedContent is a message that arrived and cannot be rendered.
+//
+// It is a placeholder and it is the point: an agent seeing a bubble they cannot read
+// knows somebody sent something, and can ask. The alternative this replaces was
+// withholding the acknowledgement, which leaves WhatsApp redelivering the same message
+// for as long as the session is up and shows the agent nothing either way.
+type UnsupportedContent struct {
+	Type   string            `json:"type"`
+	Reason UnsupportedReason `json:"reason"`
+}
+
+// Unsupported returns the content of a message nothing here can render.
+func Unsupported(reason UnsupportedReason) UnsupportedContent {
+	return UnsupportedContent{Type: "unsupported", Reason: reason}
+}

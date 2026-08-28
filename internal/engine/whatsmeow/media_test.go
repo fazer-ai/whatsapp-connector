@@ -407,6 +407,9 @@ func TestADownloadIsOnlyGivenUpOnWhenAnotherAttemptWouldFailTheSameWay(t *testin
 	}
 }
 
+// It also guards the placeholder. A body with no arm is published as unsupported rather
+// than withheld, and a file whose bytes may arrive next time is the opposite case: reached
+// through that path it would be acknowledged, spending the redelivery the retry was for.
 func TestADownloadThatMayWorkNextTimeLeavesTheMessageOnThePhone(t *testing.T) {
 	t.Parallel()
 

@@ -19,6 +19,7 @@
 //	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveRefetch
 //	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveViewOnce
 //	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveWatchAMessageChange
+//	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveWatchAShare
 //	WAC_LIVE_TO=<number> go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveSend$
 //	WAC_LIVE_TO=<number> go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveSendMedia
 //	  (WAC_LIVE_FILE names the file; WAC_LIVE_VOICE=1 sends it as a voice note)
@@ -42,6 +43,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -391,6 +393,146 @@ func liveCheckTheDeletion(t *testing.T, emission engine.Emission, target string)
 		// it about somebody else's would destroy an attachment nobody asked it to.
 		t.Fatalf("somebody else's deletion was published as by=%q", deletion.By)
 	}
+}
+
+// TestLiveWatchAShare is the rest of the inbound content union against a real phone: a
+// pin on a map, a card out of an address book, and a poll -- which is not a body this
+// build has an arm for and is therefore the check that the placeholder does what it was
+// built for.
+//
+// The poll is the one that could not be reasoned about. It arrives as a creation, and
+// then as a vote, and in a group it drags key material along with it; each of those is a
+// separate decision this slice made about what is a message and what is not, and the
+// only way to know they were made right is to watch one happen. Exactly one bubble is
+// the pass condition, and every extra event this phase saw is printed so a wrong one can
+// be read rather than guessed at.
+//
+// A dropped vote publishes nothing, though, and nothing is also what a vote nobody cast
+// looks like. So a text sent after the vote is what closes the phase: it proves the
+// session was up and delivering across the moment the vote crossed, which turns the
+// silence in between into evidence instead of an absence. Ending on the poll itself
+// would leave no window for the vote to be seen in at all.
+func TestLiveWatchAShare(t *testing.T) {
+	window := liveWindow(t, 5*time.Minute)
+
+	session, _ := liveSession(t)
+	events := watch(t, session)
+
+	if err := session.Connect(t.Context(), engine.ConnectRequest{Pairing: "resume"}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	events.awaitState(t, "open", 2*time.Minute)
+
+	fmt.Fprintf(os.Stderr,
+		"now, from the other phone, once each and in this order:\n"+
+			"  1. a location\n  2. a contact card\n  3. a new poll, then vote in it\n"+
+			"  4. any text, last of all, which is what closes this phase\n"+
+			"send each of them exactly once: a kind sent twice is indistinguishable from a leak and fails the phase.\n"+
+			"waiting up to %s\n",
+		window)
+
+	seen := map[string]map[string]any{}
+	extra := 0
+	deadline := time.After(window)
+
+collect:
+	for {
+		select {
+		case emission, ok := <-events.seen:
+			if !ok {
+				t.Fatal("the session ended before the phase finished")
+			}
+			if emission.Type != protocol.EventMessageReceived {
+				continue
+			}
+			var body struct {
+				Message struct {
+					ID      string         `json:"id"`
+					FromMe  bool           `json:"from_me"`
+					Content map[string]any `json:"content"`
+				} `json:"message"`
+			}
+			if err := json.Unmarshal(emission.Payload, &body); err != nil {
+				t.Fatalf("unmarshal the message: %v", err)
+			}
+			if body.Message.FromMe {
+				continue
+			}
+			kind, _ := body.Message.Content["type"].(string)
+			if _, already := seen[kind]; already {
+				// A second bubble of a kind this phase already has is the interesting
+				// failure: it is what a vote or a key rotation published as a message
+				// looks like from the outside.
+				extra++
+				fmt.Fprintf(os.Stderr, "a second %s: %s\n", kind, emission.Payload)
+			}
+			seen[kind] = body.Message.Content
+			if len(seen) == 4 {
+				break collect
+			}
+		case <-deadline:
+			break collect
+		}
+	}
+
+	for _, want := range []string{"location", "contacts", "unsupported", "text"} {
+		if _, arrived := seen[want]; !arrived {
+			t.Errorf("no %s arrived within %s; what did: %v", want, window, keysOf(seen))
+		}
+	}
+	if t.Failed() {
+		return
+	}
+
+	pin := seen["location"]
+	if pin["latitude"] == nil || pin["longitude"] == nil {
+		t.Errorf("the pin arrived without coordinates: %v", pin)
+	}
+	fmt.Fprintf(os.Stderr, "pin: %v\n", pin)
+
+	cards, _ := seen["contacts"]["contacts"].([]any)
+	if len(cards) == 0 {
+		t.Errorf("the share arrived with no cards: %v", seen["contacts"])
+	} else {
+		card, _ := cards[0].(map[string]any)
+		if card["display_name"] == nil || card["display_name"] == "" {
+			// Read off the card when WhatsApp does not put it beside one, which is the
+			// half no fixture could have said was needed.
+			t.Errorf("the card arrived with no name: %v", card)
+		}
+		if card["phone"] == nil || card["phone"] == "" {
+			t.Errorf("the card arrived with no number: %v", card)
+		}
+		fmt.Fprintf(os.Stderr, "card: %v\n", card)
+	}
+
+	if reason := seen["unsupported"]["reason"]; reason != "unknown_type" {
+		t.Errorf("the poll was called %v, and it is a body with no arm rather than an empty one", reason)
+	}
+	if extra > 0 {
+		// The whole point of the machinery filter. A vote, a key rotation or a result
+		// snapshot published as a message received is a bubble an agent cannot read, at
+		// the rate people vote.
+		//
+		// Nothing here can tell that apart from the same kind sent twice by hand, so the
+		// extras are printed above with their ids: read them against the phone before
+		// believing the filter leaked. Narrowing this to the placeholder kind would be
+		// the tempting fix and the wrong one -- a live location update has a renderer,
+		// so the flooding case this counter exists for arrives as a second `location`.
+		t.Errorf("%d event(s) arrived that should not have been messages at all", extra)
+	}
+	if state := session.state(); state != "open" {
+		t.Fatalf("the session did not stay up: state=%s", state)
+	}
+}
+
+func keysOf(seen map[string]map[string]any) []string {
+	kinds := make([]string, 0, len(seen))
+	for kind := range seen {
+		kinds = append(kinds, kind)
+	}
+	sort.Strings(kinds)
+	return kinds
 }
 
 // TestLiveMedia is the media half of TestLiveListen, and the only check that walks the

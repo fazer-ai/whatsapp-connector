@@ -8,6 +8,7 @@ import (
 	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
 	waTypes "go.mau.fi/whatsmeow/types"
 	waEvents "go.mau.fi/whatsmeow/types/events"
+	"google.golang.org/protobuf/reflect/protoreflect"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/engine"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
@@ -202,8 +203,178 @@ func (s *Session) bodyOf(ctx context.Context) renderBody {
 		if plain, ok := plainBody(event); ok {
 			return plain, true
 		}
-		return s.mediaBody(ctx, event)
+		if shared, ok := sharedBody(event); ok {
+			return shared, true
+		}
+		if _, isAFile := attachmentOf(event.Message); isAFile {
+			// Asked before mediaBody rather than after it, and the difference is the
+			// whole reason the placeholder below is safe. A false from mediaBody means
+			// two opposite things -- this is not a file, or this is a file whose bytes
+			// may arrive next time -- and a placeholder reached through the second one
+			// would acknowledge a message whose download was worth retrying, spending
+			// the redelivery the retry was for.
+			return s.mediaBody(ctx, event)
+		}
+		return unreadableBody(event)
 	}
+}
+
+// unreadableBody is the placeholder for a message this build cannot render.
+//
+// It is what closes the last of the redelivery loops. Refusing the acknowledgement is
+// the right answer for an envelope that cannot be addressed, because a later build with
+// the same message can still publish it -- but for a body with no arm it buys nothing: a
+// poll is a poll on every redelivery, and the agent sees neither the message nor the
+// reason nothing arrived. A bubble they cannot read still says somebody sent something,
+// which is enough to ask.
+//
+// The cost is real and it is the trade being made: a message published as unsupported is
+// stored as unsupported, so a build that later learns the type does not go back for it.
+func unreadableBody(event *waEvents.Message) (body, bool) {
+	// The annotation goes with it. A poll sent as a reply is still a reply, and a client
+	// that never learns what it answered cannot thread it -- the placeholder is the one
+	// renderer that cannot lose this, because it is the one that runs for every arm
+	// nobody has written a renderer for.
+	return body{content: protocol.Unsupported(whyUnreadable(event)), context: alongside(event.Message)}, true
+}
+
+// alongside is the annotation a message carries, whichever arm it arrived in: the quote
+// it answers, the accounts it tags, the chat's disappearing timer.
+//
+// Every body WhatsApp defines keeps that in a `contextInfo` of its own rather than on the
+// message, and each renderer above reads its own by name. The placeholder cannot: it
+// exists for the arms nothing here knows, so naming them is the one thing it must not do.
+// It reads the field that is set instead, which is the same answer for an arm WhatsApp
+// adds tomorrow.
+//
+// In field order rather than through Range, whose order protobuf does not promise. A
+// message carries one body, so the two agree today; a message that somehow carried two
+// would otherwise answer differently on different runs.
+func alongside(message *waE2E.Message) *waE2E.ContextInfo {
+	return annotating(message, wrappersDeep)
+}
+
+// wrappersDeep bounds how far in a body may be wrapped before this stops looking. Two is
+// what WhatsApp sends -- a spoiler inside a group mention -- and the bound is here
+// because this runs on whatsmeow's node handler and a crafted stanza could nest forever.
+const wrappersDeep = 4
+
+// aMessage is the name of the message type itself, which is how a field that nests one
+// is told from every other field that holds a message.
+var aMessage = (&waE2E.Message{}).ProtoReflect().Descriptor().FullName()
+
+// annotating is alongside, with the descent that finds it when a body arrives wrapped.
+//
+// Thirty-two of the message's arms nest another message, and whatsmeow unwraps six of
+// them before a handler sees the event. What is left -- a spoiler, a group mention, a
+// question -- keeps the annotation on what is inside rather than on the wrapper, so a
+// placeholder that only looked at the top published a reply that answers nothing.
+//
+// The descent is on the nesting rather than on the wrapper's type, which is the whole
+// point: twenty-seven of those arms are a FutureProofMessage and five are not -- a
+// comment, a payment and a request for one carrying their note, a device's own send, and
+// a protocol message carrying the body it corrects -- and matching the named type would
+// have followed the twenty-seven and dropped the annotation of the other five.
+//
+// Only a nested message is followed. The quoted message hanging off a contextInfo is a
+// message too, and descending into that one would answer with somebody else's
+// annotation; it is never reached because a contextInfo is not itself a message arm.
+func annotating(message *waE2E.Message, left int) *waE2E.ContextInfo {
+	if message == nil || left == 0 {
+		return nil
+	}
+	reflected := message.ProtoReflect()
+	fields := reflected.Descriptor().Fields()
+	for i := range fields.Len() {
+		field := fields.Get(i)
+		if field.Kind() != protoreflect.MessageKind || field.IsList() || field.IsMap() || !reflected.Has(field) {
+			continue
+		}
+		arm := reflected.Get(field).Message()
+		annotation := arm.Descriptor().Fields().ByName("contextInfo")
+		if annotation != nil && arm.Has(annotation) {
+			if annotated, ok := arm.Get(annotation).Message().Interface().(*waE2E.ContextInfo); ok {
+				return annotated
+			}
+		}
+		nested := arm.Descriptor().Fields()
+		for j := range nested.Len() {
+			wrapped := nested.Get(j)
+			if wrapped.Kind() != protoreflect.MessageKind || wrapped.IsList() || wrapped.IsMap() {
+				continue
+			}
+			if wrapped.Message().FullName() != aMessage || !arm.Has(wrapped) {
+				continue
+			}
+			inner, _ := arm.Get(wrapped).Message().Interface().(*waE2E.Message)
+			if annotated := annotating(inner, left-1); annotated != nil {
+				return annotated
+			}
+		}
+	}
+	return nil
+}
+
+// whyUnreadable is which of the contract's reasons this message arrived with. It is what
+// separates a poll from a stanza that carried nothing at all, and a client shows the
+// difference.
+func whyUnreadable(event *waEvents.Message) protocol.UnsupportedReason {
+	switch {
+	case bodyless(event.Message):
+		return protocol.UnsupportedEmpty
+	case event.Message.GetProtocolMessage() != nil:
+		// One that is not the account's own plumbing, which changeOf already dropped.
+		// What is left is somebody acting in the conversation in a way the contract does
+		// not carry -- sharing their phone number, putting a timer on the chat -- and
+		// this reason is what the contract has for saying so.
+		return protocol.UnsupportedProtocol
+	default:
+		return protocol.UnsupportedUnknownType
+	}
+}
+
+// bodyless reports whether a message is nothing but what rides along with one.
+//
+// Two things do. The context info is an annotation, and a group's sender key is what
+// makes the group's messages readable; WhatsApp attaches both to stanzas whose body is
+// genuinely absent. Counted as content, every one of those reads as a message of an
+// unknown type rather than as the empty thing it is.
+//
+// A stanza that is nothing but the key is not empty, it is housekeeping, and changeOf
+// takes it before this is ever asked. What is left here really did arrive carrying
+// nothing, which is a reason the contract names.
+func bodyless(message *waE2E.Message) bool {
+	if message == nil {
+		return true
+	}
+	if len(message.ProtoReflect().GetUnknown()) > 0 {
+		// An arm WhatsApp added after this descriptor was generated. protobuf keeps it
+		// here and Range never visits it, so a stanza made of nothing else reads as
+		// empty -- and one that also carried a group's key would be dropped as key
+		// material and never seen at all. What nobody here knows about is exactly what
+		// the placeholder exists for.
+		return false
+	}
+	said := false
+	message.ProtoReflect().Range(func(field protoreflect.FieldDescriptor, _ protoreflect.Value) bool {
+		if _, along := ridesAlong[field.Name()]; along {
+			return true
+		}
+		said = true
+		return false
+	})
+	return !said
+}
+
+// ridesAlong is what is attached to a message rather than being one. The annotation is
+// one; the rest is the key material that makes the conversation readable, which WhatsApp
+// sends both on its own and bolted to the message it was sent for.
+var ridesAlong = map[protoreflect.Name]struct{}{
+	"messageContextInfo":                         {},
+	"senderKeyDistributionMessage":               {},
+	"fastRatchetKeySenderKeyDistributionMessage": {},
+	"groupRootKeyShare":                          {},
+	"rootSecretDistributeMessage":                {},
 }
 
 // plainBody renders a message whose whole body is text, which is the one kind that

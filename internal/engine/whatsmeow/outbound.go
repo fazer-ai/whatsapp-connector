@@ -412,24 +412,68 @@ func vcardUnescape(value string) string {
 
 // vcardName reads FN off a card, for a caller that sent one without saying what to
 // label it. Empty when the card has no FN, which is a card this connector will not send.
-func vcardName(card string) string {
-	for line := range strings.SplitSeq(card, "\n") {
-		trimmed := strings.TrimRight(line, "\r")
-		// The property may carry parameters (`FN;CHARSET=UTF-8:...`), so the match is on
-		// the name up to the first delimiter rather than on a prefix with a colon.
-		name, value, found := strings.Cut(trimmed, ":")
+func vcardName(card string) string { return vcardValue(card, "FN") }
+
+// vcardValue reads one property off a card, with its parameters and its escapes taken
+// off. Empty when the card does not carry it.
+//
+// The property may carry parameters (`FN;CHARSET=UTF-8:...`), so the match is on the
+// name up to the first delimiter rather than on a prefix with a colon. And the value is
+// unescaped, for a card this connector did not write: a client that follows RFC 2426
+// escapes a semicolon, and copying that across verbatim would show the backslash. Cards
+// written here carry no escapes at all -- see vcardText -- so this does nothing to them.
+func vcardValue(card, want string) string {
+	value, _ := vcardLine(card, want)
+	return value
+}
+
+// vcardLine is vcardValue plus the parameters the property carried, for the one caller
+// that needs them: WhatsApp puts the account behind a card in a parameter on TEL rather
+// than in any value.
+func vcardLine(card, want string) (value, parameters string) {
+	for line := range strings.SplitSeq(vcardUnfold(card), "\n") {
+		trimmed := line
+		name, raw, found := strings.Cut(trimmed, ":")
 		if !found {
 			continue
 		}
-		if property, _, _ := strings.Cut(name, ";"); strings.EqualFold(property, "FN") {
-			// Unescaped on the way out, for a card this connector did not write: a
-			// client that follows RFC 2426 escapes a semicolon, and copying that across
-			// verbatim would show the backslash. Cards written here carry no escapes at
-			// all -- see vcardText -- so this does nothing to them.
-			return vcardUnescape(strings.TrimSpace(value))
+		property, params, _ := strings.Cut(name, ";")
+		// A property may be written in a group -- `item1.TEL;waid=...:+...` -- which is
+		// how several address books export a card, and the group is not part of the
+		// property's name. A name never carries a dot otherwise, so this takes nothing
+		// off a card that was not grouped.
+		if _, ungrouped, grouped := strings.Cut(property, "."); grouped {
+			property = ungrouped
+		}
+		if strings.EqualFold(property, want) {
+			return vcardUnescape(strings.TrimSpace(raw)), params
 		}
 	}
-	return ""
+	return "", ""
+}
+
+// vcardUnfold joins the physical lines a card was wrapped across back into the logical
+// ones it was written as, for reading only: what is published stays as it arrived.
+//
+// RFC 2426 breaks a property longer than 75 octets and starts the next line with a single
+// space or tab that is not part of the value, and an address book exporting a card does
+// this routinely -- a TEL with a few parameters is past 75 before the number begins.
+// Reading the physical lines gives a name cut in half, and when the break lands before
+// the colon it gives no property at all, so the card publishes an empty number.
+func vcardUnfold(card string) string {
+	lines := strings.Split(card, "\n")
+	unfolded := make([]string, 0, len(lines))
+	for _, line := range lines {
+		trimmed := strings.TrimRight(line, "\r")
+		if len(unfolded) > 0 && trimmed != "" && (trimmed[0] == ' ' || trimmed[0] == '\t') {
+			// The one whitespace that did the folding, and only that one: a value may
+			// well begin with a space of its own on the line after it.
+			unfolded[len(unfolded)-1] += trimmed[1:]
+			continue
+		}
+		unfolded = append(unfolded, trimmed)
+	}
+	return strings.Join(unfolded, "\n")
 }
 
 // source is the bytes of an outbound file, as the address the caller named serves them.
