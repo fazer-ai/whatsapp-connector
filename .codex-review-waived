@@ -176,3 +176,25 @@ internal/store/media.go: Fence media writes with the ownership epoch  # PR#22
 # resolve it, or WhatsApp tightening the key match -- both of which show up as an action
 # reported successful and not visible, which is what the live phase exists to catch.
 internal/engine/whatsmeow/acting.go: Normalize direct chats before building target keys  # PR#33
+# PR#43: the finding is right about the mechanism and wrong about the remedy, and the
+# remedy would put this path out of step with the one it was copied from. A read mark in
+# a group whose addressing could not be read is sent with the participant as it came, and
+# if the group answers in the other namespace WhatsApp resolves nothing and the ticks do
+# not turn. That is real. What does not follow is that refusing is better: the addressing
+# comes from GetGroupInfo, which is a live IQ with no cache, so a refusal fires on every
+# transient failure of that query -- including the majority of calls where the caller's
+# namespace was already the right one and the mark would have worked. It trades a
+# probable success for a certain failure, and neither outcome loses anything: the ticks
+# not turning is recoverable by marking again, the same way a reaction that lands nowhere
+# is. The reaction path made exactly this call, in the other direction, and wrote the
+# reasoning down in acting_test.go ("refusing over a metadata query having a bad second
+# would break a reaction that mostly works"). Applying strictness to one of the two and
+# not the other would leave them inconsistent with no reason for it. The failed lookup is
+# logged where it happens, which is the visibility this is worth.
+#
+# Where the line actually falls, since the same PR does refuse over a failed query one
+# function down: the account's read-receipt setting. That one fails open -- the read is
+# disclosed to somebody and cannot be taken back -- while this one fails closed, and the
+# worst of it is that nothing happened and the caller marks again. The rule is the
+# direction of the failure, not the query.
+internal/engine/whatsmeow/receipt.go: Fail group read marks when normalization fails  # PR#43

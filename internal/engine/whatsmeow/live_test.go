@@ -43,6 +43,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -1644,4 +1645,144 @@ func (r *recorder) awaitState(t *testing.T, want string, within time.Duration) {
 			t.Fatalf("the session did not report %q within %s", want, within)
 		}
 	}
+}
+
+// TestLiveWatchAReceipt is the receipt half against a real phone, and it is the only
+// thing that can answer the question this slice is built on: which of whatsmeow's eleven
+// receipt types WhatsApp actually sends for an ordinary message, and in what order.
+//
+// The mapping table in receipt.go was read off the library's own constants, which says
+// what each type means and not which ones arrive. A direct chat is the case every
+// deployment is made of, and until one is watched the whole file is a reading.
+//
+// Both receipts are collected in any order rather than one after the other. WhatsApp
+// coalesces a chat being opened into a single read over everything unread in it, so the
+// delivered and the read can arrive together, and a phase that waited for one and then
+// the other would consume the second while waiting for the first.
+func TestLiveWatchAReceipt(t *testing.T) {
+	to := os.Getenv("WAC_LIVE_TO")
+	if to == "" {
+		t.Skip("set WAC_LIVE_TO to the number this account should send to")
+	}
+	window := liveWindow(t, 5*time.Minute)
+
+	session, _ := liveSession(t)
+	events := watch(t, session)
+
+	if err := session.Connect(t.Context(), engine.ConnectRequest{Pairing: "resume"}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	events.awaitState(t, "open", 2*time.Minute)
+
+	payload, err := json.Marshal(map[string]any{
+		"message_id": session.current().GenerateMessageID(),
+		"to":         map[string]any{"kind": "phone", "id": to},
+		"content":    map[string]any{"type": "text", "body": "conector nativo, fatia de recibos"},
+	})
+	if err != nil {
+		t.Fatalf("build the send: %v", err)
+	}
+	result, err := session.Execute(t.Context(), &protocol.Command{
+		Type: protocol.CommandMessageSend, Payload: payload,
+	})
+	if err != nil {
+		t.Fatalf("message.send: %v", err)
+	}
+	var sent struct {
+		MessageID string `json:"message_id"`
+	}
+	if err := json.Unmarshal(result, &sent); err != nil {
+		t.Fatalf("unmarshal the send: %v", err)
+	}
+
+	fmt.Fprintf(os.Stderr,
+		"a message went out to %s. leave it unread for a moment, then open the chat and read it.\nwaiting up to %s\n",
+		to, window)
+
+	seen := map[string]map[string]any{}
+	deadline := time.After(window)
+
+collect:
+	for {
+		select {
+		case emission, ok := <-events.seen:
+			if !ok {
+				t.Fatal("the session ended before the phase finished")
+			}
+			if emission.Type != protocol.EventMessageReceipt {
+				continue
+			}
+			body := struct {
+				MessageIDs []string       `json:"message_ids"`
+				Type       string         `json:"type"`
+				Chat       map[string]any `json:"chat"`
+				Part       map[string]any `json:"participant"`
+			}{}
+			if err := json.Unmarshal(emission.Payload, &body); err != nil {
+				t.Fatalf("unmarshal a receipt: %v", err)
+			}
+			if !slices.Contains(body.MessageIDs, sent.MessageID) {
+				// A receipt over something else in the same chat, which is ordinary and
+				// says nothing about the message this phase sent.
+				fmt.Fprintf(os.Stderr, "a %s over other messages: %v\n", body.Type, body.MessageIDs)
+				continue
+			}
+			seen[body.Type] = map[string]any{"chat": body.Chat, "participant": body.Part}
+			if len(seen) == 2 {
+				break collect
+			}
+		case <-deadline:
+			break collect
+		}
+	}
+
+	for _, want := range []string{"delivered", "read"} {
+		if _, arrived := seen[want]; !arrived {
+			t.Errorf("no %s arrived within %s; what did: %v", want, window, keysOf(seen))
+		}
+	}
+	if t.Failed() {
+		return
+	}
+	for kind, receipt := range seen {
+		// Who reported it, which is the field that separates a receipt about a message
+		// this account sent from one about a message it read somewhere else. In a direct
+		// chat the contact is both the chat and the participant, and that is the reading
+		// no fixture could have confirmed.
+		fmt.Fprintf(os.Stderr, "%s: chat=%v participant=%v\n", kind, receipt["chat"], receipt["participant"])
+		if receipt["participant"] == nil {
+			t.Errorf("the %s receipt does not say whose device reported it", kind)
+		}
+	}
+
+	// The other direction, which no assertion here can reach: the proof is two blue
+	// ticks appearing on the other phone, and only whoever is holding it can see them.
+	fmt.Fprintln(os.Stderr, "now send a message from that phone, so the read mark has something to be about.")
+	inbound := events.await(t, protocol.EventMessageReceived, window)
+	arrived := struct {
+		Message struct {
+			ID   string `json:"id"`
+			Chat struct {
+				Kind string `json:"kind"`
+				ID   string `json:"id"`
+			} `json:"chat"`
+		} `json:"message"`
+	}{}
+	if err := json.Unmarshal(inbound.Payload, &arrived); err != nil {
+		t.Fatalf("unmarshal the inbound message: %v", err)
+	}
+	mark, err := json.Marshal(map[string]any{
+		"chat":        map[string]any{"kind": arrived.Message.Chat.Kind, "id": arrived.Message.Chat.ID},
+		"message_ids": []string{arrived.Message.ID},
+	})
+	if err != nil {
+		t.Fatalf("build the read mark: %v", err)
+	}
+	if _, err := session.Execute(t.Context(), &protocol.Command{
+		Type: protocol.CommandMessageMarkRead, Payload: mark,
+	}); err != nil {
+		t.Fatalf("message.mark_read: %v", err)
+	}
+	fmt.Fprintf(os.Stderr, "marked %s read. check the other phone: the message it just sent should show two blue ticks.\n",
+		arrived.Message.ID)
 }

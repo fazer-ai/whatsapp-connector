@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -98,6 +99,18 @@ type Session struct {
 	// published. A field for the same reason as storeLimit, and for no other.
 	deliverWait time.Duration
 
+	// stalledUntil is when a receipt is worth handing to the publisher again, in
+	// monotonic nanoseconds, and zero while it is.
+	//
+	// It exists because one receipt node is not one event: whatsmeow expands a grouped
+	// receipt into a dispatch per participant and carries on through the ones that fail,
+	// so a group of six read by six people is six calls into the handler. Each waiting
+	// out deliverWait puts the node past the five minutes whatsmeow gives a handler
+	// before it starts the next one alongside it, and two node handlers running at once
+	// is the ordering guarantee gone. Waiting once per window and refusing the rest
+	// costs a redelivery, which is the trade the whole path is built on.
+	stalledUntil atomic.Int64
+
 	// downloadWait bounds how long an inbound media message spends fetching its file.
 	// A field for the same reason as the two above it, and for no other.
 	downloadWait time.Duration
@@ -135,6 +148,14 @@ type Session struct {
 	// a socket that is not up yet are not the same answer, and only one of them is
 	// worth another delivery.
 	unseal func(context.Context, *waEvents.Message) (*waE2E.Message, error)
+
+	// elapsed is the monotonic reading the publisher window is measured with, and nil is
+	// the real one. A seam so a test can hold the clock still instead of racing it.
+	elapsed func() time.Duration
+
+	// privacyKnown reports whether this account's own privacy settings could be read.
+	// A seam for the same reason as the ones below it: nil is the real one.
+	privacyKnown func(context.Context) error
 
 	// groupMode is how a group addresses its members, which decides the namespace a
 	// message key in it names a sender by. A field because reading it is a round trip to
@@ -1128,6 +1149,8 @@ func (s *Session) Execute(ctx context.Context, command *protocol.Command) (json.
 		return s.react(ctx, command)
 	case protocol.CommandMessageDownloadMedia:
 		return s.downloadMedia(ctx, command)
+	case protocol.CommandMessageMarkRead:
+		return s.markRead(ctx, command)
 	}
 	return nil, engine.ErrNotSupported
 }
@@ -1696,6 +1719,10 @@ func (s *Session) handle(rawEvent any) bool {
 		// before. Everything this build cannot render yet is still refused, which is
 		// what keeps it on the phone for a later milestone.
 		return s.receive(event)
+	case *waEvents.Receipt:
+		// The other handler that can withhold an acknowledgement, and for the same
+		// reason: a tick nobody published never turns, and the client cannot ask again.
+		return s.receipt(event)
 	case *waEvents.Connected:
 		// whatsmeow dispatches from whichever goroutine produced the event, so a
 		// Disconnected and the Connected that follows it can be handled at the same
