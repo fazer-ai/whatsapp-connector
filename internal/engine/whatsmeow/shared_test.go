@@ -385,6 +385,15 @@ func TestWhatIsNotAMessageIsAcknowledgedRatherThanShownToAnAgent(t *testing.T) {
 				EncIV:                   make([]byte, 12),
 			},
 		}},
+		{"a scheduled call being called off", &waE2E.Message{
+			ScheduledCallEditMessage: &waE2E.ScheduledCallEditMessage{
+				Key:      messageKey(subject),
+				EditType: waE2E.ScheduledCallEditMessage_CANCEL.Enum(),
+			},
+		}},
+		{"a payment request being declined", &waE2E.Message{
+			DeclinePaymentRequestMessage: &waE2E.DeclinePaymentRequestMessage{Key: messageKey(subject)},
+		}},
 		{"a sticker pack being asked for again", &waE2E.Message{
 			StickerSyncRmrMessage: &waE2E.StickerSyncRMRMessage{
 				Filehash:         []string{"abc"},
