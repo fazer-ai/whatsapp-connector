@@ -402,14 +402,14 @@ func TestAMomentThatWentStaleIsNotPublishedLate(t *testing.T) {
 		t.Fatalf("%d events were queued, want the typing", len(queued))
 	}
 	typing := queued[0]
-	if typing.Fresh == nil {
+	if typing.Expires == nil {
 		t.Fatal("a typing indicator was queued with no sense of when it stops being true")
 	}
-	if !typing.Fresh() {
+	if typing.Expires() <= 0 {
 		t.Error("a typing indicator was stale the moment it was queued")
 	}
 	now = presenceLife
-	if typing.Fresh() {
+	if typing.Expires() > 0 {
 		t.Error("a typing indicator is still worth publishing after its whole life")
 	}
 
@@ -419,7 +419,7 @@ func TestAMomentThatWentStaleIsNotPublishedLate(t *testing.T) {
 	if len(stops) != 1 {
 		t.Fatalf("%d events were queued, want the stop", len(stops))
 	}
-	if stops[0].Fresh != nil {
+	if stops[0].Expires != nil {
 		t.Error("a stop was queued as something that expires")
 	}
 }
@@ -530,7 +530,7 @@ func TestAnAvailabilityIsAFactRatherThanAMoment(t *testing.T) {
 		if emission.Type != protocol.EventPresenceUpdate {
 			continue
 		}
-		if emission.Fresh != nil {
+		if emission.Expires != nil {
 			t.Error("an availability was queued as something that expires")
 		}
 		var body struct {

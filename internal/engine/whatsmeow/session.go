@@ -1391,7 +1391,7 @@ func (s *Session) forward() {
 				// here rather than racing it reads this.
 				s.picked <- struct{}{}
 			}
-			if emission.Fresh == nil {
+			if emission.Expires == nil {
 				select {
 				case s.events <- emission:
 				case <-s.done:
@@ -1399,7 +1399,7 @@ func (s *Session) forward() {
 				}
 				continue
 			}
-			if !emission.Fresh() {
+			if emission.Expires() <= 0 {
 				// A moment that has passed. Publishing it now would state as current
 				// something the session already knows is not, and the correction was
 				// dropped behind the same backlog that made this late.
@@ -1478,7 +1478,7 @@ func (s *Session) offerWithin(eventType protocol.EventType, payload any, life ti
 	emission := engine.Emission{Type: eventType, Payload: body}
 	if life > 0 {
 		perishes := s.since() + life
-		emission.Fresh = func() bool { return s.since() < perishes }
+		emission.Expires = func() time.Duration { return perishes - s.since() }
 	}
 	select {
 	case s.inbox <- emission:

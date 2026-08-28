@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"time"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 )
@@ -36,16 +37,22 @@ type Emission struct {
 	// of its own when its session ends.
 	Settle func(error)
 
-	// Fresh, when it is set, reports whether this emission is still worth publishing by
-	// the time the publisher reaches it. Nil is always, which is every event that states
+	// Expires, when it is set, reports how much longer this emission is worth publishing
+	// for; zero or less is not any more. Nil is forever, which is every event that states
 	// a fact: a message, a receipt, a session's state.
 	//
 	// It exists for the few that state a moment instead. A typing indicator that waited
 	// out a backlog is published as a claim about now, and now has moved; the state that
 	// would have corrected it was already dropped for the same backlog. An engine that
-	// sets this is saying the event is worth nothing late, and the publisher owes the
-	// Settle callback for it either way.
-	Fresh func() bool
+	// sets this is saying the event is worth nothing late.
+	//
+	// A remaining time rather than a yes or no, because the publisher has to bound the
+	// write and not merely decide before it: a stream that is retrying through an outage
+	// can take longer than the whole life of the event, and a check that ran before it
+	// started has already been answered by the time it lands. The publisher owes the
+	// Settle callback either way, and an emission dropped for age settles as a success:
+	// nothing failed, it stopped being worth writing.
+	Expires func() time.Duration
 }
 
 // Engine opens sessions. One process has one engine; a session is one WhatsApp

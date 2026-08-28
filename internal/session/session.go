@@ -228,16 +228,29 @@ func (s *Session) publish(ctx context.Context, emission engine.Emission) {
 		return
 	}
 
-	if emission.Fresh != nil && !emission.Fresh() {
-		// A moment that has passed, and the last place it can be stopped. The engine
-		// checks this too, and the check there only covers the handoff: everything after
-		// it -- a stream that is retrying, a Redis that is coming back -- happens here,
-		// and it is exactly the delay that makes a typing indicator wrong rather than
-		// late. Not an error: nothing failed, the event stopped being worth writing.
-		s.log.Debug().Str("type", string(emission.Type)).
-			Msg("dropped a transient emission that is no longer true")
-		settle(emission, nil)
-		return
+	// outlives is the caller's own context, kept when a moment's remaining life is put
+	// in front of it, so a deadline this function imposed can be told from one the caller
+	// had. Nil when nothing was imposed.
+	var outlives context.Context
+	if emission.Expires != nil {
+		// A moment, and this is the last place it can be stopped. The engine bounds what
+		// it holds; everything after that -- a stream that is retrying, a Redis that is
+		// coming back -- happens here, and it is exactly the delay that makes a typing
+		// indicator wrong rather than late.
+		//
+		// The remaining life bounds the write rather than being checked before it. A
+		// check alone would pass and then sit inside a Publish that outlasts the whole
+		// event, which is the outage this is for.
+		left := emission.Expires()
+		if left <= 0 {
+			s.log.Debug().Str("type", string(emission.Type)).
+				Msg("dropped a transient emission that is no longer true")
+			settle(emission, nil)
+			return
+		}
+		bounded, cancel := context.WithTimeout(ctx, left)
+		defer cancel()
+		outlives, ctx = ctx, bounded
 	}
 
 	s.seq++
@@ -253,6 +266,15 @@ func (s *Session) publish(ctx context.Context, emission engine.Emission) {
 		Payload: emission.Payload,
 	}
 	err := s.publisher.Publish(ctx, &event)
+	if err != nil && outlives != nil && outlives.Err() == nil && errors.Is(err, context.DeadlineExceeded) {
+		// The write was still going when the event stopped being worth making, and the
+		// deadline that ended it was this function's own rather than the caller's.
+		// Nothing failed, so nothing above should hear that anything did.
+		s.log.Debug().Str("type", string(emission.Type)).
+			Msg("gave up on a transient emission that went stale mid-write")
+		settle(emission, nil)
+		return
+	}
 	if err != nil && ctx.Err() == nil {
 		s.log.Error().Err(err).Str("type", string(emission.Type)).Msg("failed to publish an event")
 	}
