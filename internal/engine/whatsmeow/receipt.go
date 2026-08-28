@@ -68,7 +68,7 @@ func (s *Session) receipt(event *waEvents.Receipt) bool {
 // as wall time took to catch up, and every receipt would be withheld until it did.
 func (s *Session) publisherStalled() bool {
 	until := s.stalledUntil.Load()
-	return until != 0 && time.Since(sinceStart) < time.Duration(until)
+	return until != 0 && s.since() < time.Duration(until)
 }
 
 func (s *Session) publisherAnswered(delivered bool) {
@@ -76,7 +76,14 @@ func (s *Session) publisherAnswered(delivered bool) {
 		s.stalledUntil.Store(0)
 		return
 	}
-	s.stalledUntil.Store(int64(time.Since(sinceStart) + s.deliverWait))
+	s.stalledUntil.Store(int64(s.since() + s.deliverWait))
+}
+
+func (s *Session) since() time.Duration {
+	if s.elapsed != nil {
+		return s.elapsed()
+	}
+	return time.Since(sinceStart)
 }
 
 // sinceStart is what the window is measured from: a reading taken once, carrying the
@@ -222,13 +229,13 @@ func (s *Session) markRead(ctx context.Context, command *protocol.Command) (json
 			return nil, err
 		}
 	}
-	if chat.Server == waTypes.GroupServer && sender.IsEmpty() {
-		// whatsmeow puts `participant` on the node only when it has one, and a group
-		// receipt without it names nobody's message. The write succeeds and the read
-		// mark lands nowhere, which is the silent failure this whole path is written
-		// against.
+	if authored[req.Chat.Kind] && sender.IsEmpty() {
+		// whatsmeow puts `participant` on the node only when it has one, and a receipt
+		// in a chat whose messages have an author of their own names nobody's message
+		// without it. The write succeeds and the read mark lands nowhere, which is the
+		// silent failure this whole path is written against.
 		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
-			"a read mark in a group has to name who wrote the messages")
+			"a read mark here has to name who wrote the messages")
 	}
 	if err := s.readyToSend(); err != nil {
 		return nil, err
@@ -299,6 +306,20 @@ func markFailure(err error, refused string) error {
 	default:
 		return protocol.NewError(protocol.ErrorWaError, refused)
 	}
+}
+
+// authored are the chats whose messages have an author the chat itself does not name, so
+// a receipt in one is about somebody rather than about the chat.
+//
+// It is whatsmeow's own line, read off MarkRead: it puts `participant` on the node for
+// every chat but a direct one, and drops it silently for a direct one whether or not a
+// sender was given. A channel is left out on purpose -- a post's author is the channel,
+// so the participant would repeat the chat and requiring it would refuse a mark that
+// works.
+var authored = map[protocol.AddressKind]bool{
+	protocol.AddressGroup:     true,
+	protocol.AddressBroadcast: true,
+	protocol.AddressStatus:    true,
 }
 
 // markReadKinds is the contract's two, with the empty string among them because `type`

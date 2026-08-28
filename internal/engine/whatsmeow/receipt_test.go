@@ -263,33 +263,6 @@ func TestAReadMarkWithNoStateIsARead(t *testing.T) {
 	}
 }
 
-// A group receipt names whose message it is on, and whatsmeow puts that on the node only
-// when it has one: without it the write succeeds and the mark lands nowhere. A direct
-// chat is the opposite -- whatsmeow drops the participant there -- so the requirement is
-// the group's alone.
-func TestAReadMarkInAGroupHasToSayWhoseMessagesTheyAre(t *testing.T) {
-	t.Parallel()
-
-	session, _, _ := outboundSession(t)
-	_, err := session.markRead(t.Context(), &protocol.Command{
-		Type: protocol.CommandMessageMarkRead,
-		Payload: json.RawMessage(`{"chat":{"kind":"group","id":"120363041234567890"},
-			"message_ids":["3EB0A1B2C3D4E5F60718"]}`),
-	})
-	assertCode(t, err, protocol.ErrorInvalidPayload)
-
-	// And a direct chat with no sender is not refused with it: there is nobody else the
-	// receipt could be about.
-	_, err = session.markRead(t.Context(), &protocol.Command{
-		Type: protocol.CommandMessageMarkRead,
-		Payload: json.RawMessage(`{"chat":{"kind":"phone","id":"5511999990002"},
-			"message_ids":["3EB0A1B2C3D4E5F60718"]}`),
-	})
-	// It gets no further than the socket it does not have, which is a different answer
-	// from being told its payload is wrong.
-	assertCode(t, err, protocol.ErrorNotConnected)
-}
-
 // The id list is checked for what is in it and not only for how long it is. whatsmeow
 // builds the receipt around ids[0] without looking at it, so an empty one goes out as a
 // node naming no message, reports no error, and is remembered under its idempotency key.
@@ -373,65 +346,105 @@ func TestAReadMarkInAGroupNormalisesWhoWroteTheMessages(t *testing.T) {
 
 // One receipt node is not one event. whatsmeow expands a grouped receipt into a dispatch
 // per participant and carries on through the ones that fail, so a group read by six
-// people is six calls into this handler. Six full waits is thirty times the budget and
-// past the five minutes whatsmeow gives a node before it starts the next one alongside
-// it -- and two node handlers at once is the ordering guarantee gone.
+// people is six calls into this handler. Six full waits is past the five minutes
+// whatsmeow gives a node before it starts the next one alongside it -- and two node
+// handlers at once is the ordering guarantee gone.
 //
-// What is measured is the wall clock across the burst, because that is the thing that
-// breaks: the first call is allowed to wait, and the ones behind it are not.
+// What is asserted is how many of the six reached the publisher, rather than how long
+// the burst took: elapsed wall time answers the same question and answers it differently
+// on a loaded machine. The clock is held still so the window cannot expire mid-burst.
 func TestABurstOfReceiptsWaitsOnAStalledPublisherOnlyOnce(t *testing.T) {
 	t.Parallel()
 
 	session, _ := newTestSession(t, "5511999990001")
-	session.deliverWait = 200 * time.Millisecond
+	session.deliverWait = 50 * time.Millisecond
+	session.elapsed = func() time.Duration { return 0 }
 
 	const participants = 6
-	started := time.Now()
-	for range participants {
-		if session.receipt(receiptEvent(waTypes.ReceiptTypeRead, "3EB0RECEIPT")) {
-			t.Fatal("a receipt nobody published was acknowledged")
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for range participants {
+			if session.receipt(receiptEvent(waTypes.ReceiptTypeRead, "3EB0RECEIPT")) {
+				t.Error("a receipt nobody published was acknowledged")
+				return
+			}
 		}
-	}
-	spent := time.Since(started)
+	}()
 
-	// One budget for the burst, not one per participant. The bound is generous on
-	// purpose: what would fail this is the linear growth, which is 6x away.
-	if spent > 3*session.deliverWait {
-		t.Errorf("six receipts against a stalled publisher spent %s, and the budget is %s",
-			spent, session.deliverWait)
+	// The one that was handed over, which is the gate letting the first through.
+	handed := next(t, session)
+	handed.Settle(errors.New("the publisher is down"))
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the burst never finished")
+	}
+	// And nothing else was. Every call has returned by now, so anything the gate let
+	// through is already queued behind this one.
+	select {
+	case extra := <-session.Events():
+		t.Fatalf("a second receipt reached a publisher that had stopped answering: %s", extra.Payload)
+	default:
 	}
 }
 
-// And the other half, which is what keeps the gate from being a one-way door: a
-// publisher that comes back is asked again. Cleared only by a success, nothing would
+// And the other half, which is what keeps the gate from being a one-way door: the window
+// runs out and the publisher is asked again. Cleared only by a success, nothing would
 // ever try, and the session would stop publishing receipts for good.
-func TestAReceiptIsPublishedAgainOnceThePublisherAnswers(t *testing.T) {
+//
+// The clock is held rather than waited on, so what is asserted is the rule and not the
+// scheduler.
+func TestAReceiptIsPublishedAgainOnceTheWindowRunsOut(t *testing.T) {
 	t.Parallel()
 
 	session, _ := newTestSession(t, "5511999990001")
-	session.deliverWait = 100 * time.Millisecond
+	session.deliverWait = time.Minute
+	now := time.Duration(0)
+	session.elapsed = func() time.Duration { return now }
 
-	if session.receipt(receiptEvent(waTypes.ReceiptTypeRead, "3EB0STALL")) {
-		t.Fatal("a receipt nobody published was acknowledged")
-	}
+	session.publisherAnswered(false)
 	if !session.publisherStalled() {
 		t.Fatal("a publisher that answered nothing is not recorded as stalled")
 	}
-
-	// The publisher was slow rather than gone, so what it was handed is still queued.
-	// Left there it would be the next thing read, and the check below would pass on the
-	// wrong event.
-	stale := next(t, session)
-	stale.Settle(nil)
-
-	// The window is the budget, so waiting it out is what a real burst does between
-	// nodes. Measured against the recorded deadline rather than slept past blindly.
-	for session.publisherStalled() {
-		time.Sleep(10 * time.Millisecond)
+	now = session.deliverWait - time.Nanosecond
+	if !session.publisherStalled() {
+		t.Error("the window ran out early")
 	}
-	receiptPublishedBy(t, session, receiptEvent(waTypes.ReceiptTypeRead, "3EB0AGAIN"))
+	now = session.deliverWait
+	if session.publisherStalled() {
+		t.Error("the window never ran out, so nothing would ever ask the publisher again")
+	}
+
+	// And a publisher that answers clears it outright, rather than leaving the rest of
+	// the window to expire over a publisher that is already back.
+	session.publisherAnswered(false)
+	session.publisherAnswered(true)
 	if session.publisherStalled() {
 		t.Error("a publisher that answered is still recorded as stalled")
+	}
+}
+
+// The window is an interval, and an interval taken off the wall clock is not one: a host
+// whose clock steps backwards -- an NTP correction, a suspend, a container's clock being
+// set -- would hold the deadline ahead for as long as wall time took to catch up, and
+// every receipt would be withheld until it did.
+//
+// What is read is the deadline itself, because that is where the difference is visible
+// without moving the host's clock: an elapsed time since this process started is a
+// handful of milliseconds, and a wall-clock stamp is nineteen digits.
+func TestThePublisherWindowIsMeasuredOnAClockThatOnlyMovesForward(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.deliverWait = time.Minute
+
+	session.publisherAnswered(false)
+	// Any wall-clock reading in nanoseconds is past 1.5e18 and has been since 2017. An
+	// elapsed time cannot reach it without this process having run for fifty years.
+	if until := session.stalledUntil.Load(); until > int64(time.Hour) {
+		t.Errorf("the deadline is %d, which is a wall-clock stamp rather than an elapsed time", until)
 	}
 }
 
@@ -482,40 +495,6 @@ func TestABroadcastReceiptIsPublishedUnderTheChatItsMessageIsIn(t *testing.T) {
 	chat, _ := payload["chat"].(map[string]any)
 	if chat["kind"] != "phone" || chat["id"] != "5511999990002" {
 		t.Errorf("the receipt is filed under %v, and its message is in the direct chat with 5511999990002", chat)
-	}
-}
-
-// The window is an interval, and an interval taken off the wall clock is not one: a host
-// whose clock steps backwards -- an NTP correction, a suspend, a container's clock being
-// set -- would hold the deadline ahead for as long as wall time took to catch up, and
-// every receipt would be withheld until it did.
-//
-// What is read is the deadline itself, because that is where the difference is visible
-// without moving the host's clock: an elapsed time since this process started is a
-// handful of milliseconds, and a wall-clock stamp is nineteen digits.
-func TestThePublisherWindowIsMeasuredOnAClockThatOnlyMovesForward(t *testing.T) {
-	t.Parallel()
-
-	session, _ := newTestSession(t, "5511999990001")
-	session.deliverWait = 60 * time.Millisecond
-
-	session.publisherAnswered(false)
-	if !session.publisherStalled() {
-		t.Fatal("a publisher that answered nothing is not recorded as stalled")
-	}
-	// Any wall-clock reading in nanoseconds is past 1.5e18 and has been since 2017. An
-	// elapsed time cannot reach it without this process having run for fifty years.
-	if until := session.stalledUntil.Load(); until > int64(time.Hour) {
-		t.Errorf("the deadline is %d, which is a wall-clock stamp rather than an elapsed time", until)
-	}
-
-	// And it still runs out, which is what keeps the gate from being a one-way door.
-	deadline := time.Now().Add(2 * time.Second)
-	for session.publisherStalled() {
-		if time.Now().After(deadline) {
-			t.Fatal("the window never ran out")
-		}
-		time.Sleep(5 * time.Millisecond)
 	}
 }
 
@@ -586,6 +565,47 @@ func TestAReadMarkIsRefusedWhenTheAccountsOwnSettingCannotBeRead(t *testing.T) {
 			}); err == nil {
 				t.Fatal("a mark went out over a session with no socket")
 			}
+		})
+	}
+}
+
+// A broadcast list and the status feed are chats whose messages have an author of their
+// own, so a receipt in one is about somebody rather than about the chat. whatsmeow puts
+// the participant on the node for every chat but a direct one, and without a sender it
+// puts none: the write succeeds and the mark lands nowhere.
+func TestAReadMarkWhereMessagesHaveAnAuthorHasToNameThem(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name   string
+		chat   string
+		author bool
+	}{
+		{"a group", `{"kind":"group","id":"120363041234567890"}`, true},
+		{"a broadcast list", `{"kind":"broadcast","id":"5511999990001"}`, true},
+		{"the status feed", `{"kind":"status","id":"status"}`, true},
+		// A post's author is the channel, so the participant would repeat the chat and
+		// requiring it would refuse a mark that works.
+		{"a channel", `{"kind":"newsletter","id":"120363041234567890@newsletter"}`, false},
+		{"a direct chat", `{"kind":"phone","id":"5511999990002"}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			session, _, _ := outboundSession(t)
+			session.privacyKnown = func(context.Context) error { return nil }
+			_, err := session.markRead(t.Context(), &protocol.Command{
+				Type: protocol.CommandMessageMarkRead,
+				Payload: json.RawMessage(`{"chat":` + tc.chat +
+					`,"message_ids":["3EB0A1B2C3D4E5F60718"]}`),
+			})
+			if tc.author {
+				assertCode(t, err, protocol.ErrorInvalidPayload)
+				return
+			}
+			// Not refused over the participant: it gets as far as the socket it does not
+			// have, which is a different answer from being told its payload is wrong.
+			assertCode(t, err, protocol.ErrorNotConnected)
 		})
 	}
 }

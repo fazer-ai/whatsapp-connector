@@ -149,6 +149,10 @@ type Session struct {
 	// worth another delivery.
 	unseal func(context.Context, *waEvents.Message) (*waE2E.Message, error)
 
+	// elapsed is the monotonic reading the publisher window is measured with, and nil is
+	// the real one. A seam so a test can hold the clock still instead of racing it.
+	elapsed func() time.Duration
+
 	// privacyKnown reports whether this account's own privacy settings could be read.
 	// A seam for the same reason as the ones below it: nil is the real one.
 	privacyKnown func(context.Context) error
