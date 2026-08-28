@@ -83,11 +83,13 @@ func (s *Session) presence(event *waEvents.Presence) bool {
 		seen := event.LastSeen.UnixMilli()
 		published.LastSeen = &seen
 	}
-	if event.Unavailable {
-		s.offer(protocol.EventPresenceUpdate, published)
-	} else {
-		s.offerFresh(protocol.EventPresenceUpdate, published)
-	}
+	// Both states through offer, and neither perishes. Somebody being online is a fact
+	// that holds until they go away, not a moment -- classifying it with the typing was
+	// the mistake, and it had a cost: an `unavailable` already queued while the newer
+	// `available` was dropped for the same backlog leaves a client showing somebody
+	// offline who is not, with nothing coming to correct it. Queued behind each other
+	// they arrive in order and the last one wins.
+	s.offer(protocol.EventPresenceUpdate, published)
 	return true
 }
 
@@ -212,6 +214,15 @@ func (s *Session) chatPresenceCommand(ctx context.Context, command *protocol.Com
 	if !named {
 		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
 			"a chat presence is composing, recording or paused, and nothing else")
+	}
+	switch req.Chat.Kind {
+	case protocol.AddressPhone, protocol.AddressLID, protocol.AddressGroup:
+	default:
+		// A channel, a broadcast list and the status feed have nowhere to show one, and
+		// SendChatPresence only reports that the node was written -- so the command comes
+		// back successful and nothing anywhere is typing.
+		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
+			"a typing indicator has nowhere to show in that chat")
 	}
 	chat, err := jidOf(req.Chat)
 	if err != nil {

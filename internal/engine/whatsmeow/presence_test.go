@@ -347,6 +347,7 @@ func TestAStopIsOfferedWhereTheTypingItStopsIsNot(t *testing.T) {
 	t.Parallel()
 
 	session, _ := newTestSession(t, "5511999990001")
+	session.picked = make(chan struct{}, 1)
 	// Two fillers, because the pump takes one out and blocks handing it on. The second
 	// is what makes the inbox non-empty -- the publisher not keeping up -- and it also
 	// stops the pump competing for what is queued after it.
@@ -385,6 +386,7 @@ func TestAMomentThatWentStaleIsNotPublishedLate(t *testing.T) {
 	session, _ := newTestSession(t, "5511999990001")
 	now := time.Duration(0)
 	session.elapsed = func() time.Duration { return now }
+	session.picked = make(chan struct{}, 1)
 	// One filler, so the pump is holding it and not competing for what follows. The
 	// inbox itself is left empty, which is what the typing needs to be accepted at all.
 	blockThePump(t, session, 1)
@@ -425,25 +427,25 @@ func TestAMomentThatWentStaleIsNotPublishedLate(t *testing.T) {
 // blockThePump parks the forwarding goroutine on an emission nobody is reading, so what
 // is queued after this stays in the inbox for the test to look at rather than being
 // carried off mid-assertion.
+//
+// It waits on the pump saying it took one rather than on a clock saying it probably has:
+// a poll that gives up after a fixed spell fails on a loaded machine over a session that
+// is behaving perfectly.
 func blockThePump(t *testing.T, session *Session, fillers int) {
 	t.Helper()
 
 	for range fillers {
 		select {
 		case session.inbox <- engine.Emission{Type: protocol.EventSessionState, Payload: []byte(`{}`)}:
-		case <-time.After(time.Second):
+		case <-time.After(2 * time.Second):
 			t.Fatal("the inbox would not take a filler")
 		}
 	}
-	// The pump takes the first one within a scheduling quantum and then blocks handing
-	// it on, which is the state every assertion below depends on.
-	for range 100 {
-		if len(session.inbox) == fillers-1 {
-			return
-		}
-		time.Sleep(time.Millisecond)
+	select {
+	case <-session.picked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the forwarder never took anything off the inbox")
 	}
-	t.Fatalf("the pump never picked up, and the inbox is holding %d", len(session.inbox))
 }
 
 func queuedIn(session *Session) []engine.Emission {
@@ -456,5 +458,123 @@ func queuedIn(session *Session) []engine.Emission {
 		default:
 		}
 		return queued
+	}
+}
+
+// The freshness check is only as good as the wait after it. An unbounded handoff passes
+// the check and then sits on a reader that is busy, and what comes out the other side is
+// exactly the stale event the check exists to stop.
+func TestAMomentIsNotHeldWaitingForAReaderThatIsBusy(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.handoffWait = 50 * time.Millisecond
+	session.picked = make(chan struct{}, 1)
+
+	source := waTypes.MessageSource{
+		Chat:   waTypes.NewJID("5511999990002", waTypes.DefaultUserServer),
+		Sender: waTypes.NewJID("5511999990002", waTypes.DefaultUserServer),
+	}
+	session.chatPresence(&waEvents.ChatPresence{MessageSource: source, State: waTypes.ChatPresenceComposing})
+	select {
+	case <-session.picked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the forwarder never took the typing off the inbox")
+	}
+
+	// Nobody is reading, and the moment is given up on rather than held. A stop behind
+	// it then reaches the reader that finally shows up, which is the whole point: a
+	// perishable event must not be what a durable one is queued behind.
+	session.chatPresence(&waEvents.ChatPresence{MessageSource: source, State: waTypes.ChatPresencePaused})
+
+	// Waiting out the bound, which is the subject here rather than a way to synchronise
+	// with the pump: what is being read is whether the handoff gives up, and it cannot
+	// be observed before it has had the chance to.
+	time.Sleep(4 * session.handoffWait)
+
+	emission := next(t, session)
+	if emission.Type != protocol.EventChatPresence {
+		t.Fatalf("what came through is %s", emission.Type)
+	}
+	var body struct {
+		State string `json:"state"`
+	}
+	if err := json.Unmarshal(emission.Payload, &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if body.State != "paused" {
+		t.Errorf("a %s was held on a reader that was not there, and the stop waited behind it", body.State)
+	}
+}
+
+// Somebody being online is a fact that holds until they go away, not a moment.
+// Classified with the typing it perishes, and then an `unavailable` already queued
+// outlives the newer `available` that was dropped for the same backlog: a client left
+// showing somebody offline who is not, with nothing coming to correct it.
+func TestAnAvailabilityIsAFactRatherThanAMoment(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.picked = make(chan struct{}, 1)
+	blockThePump(t, session, 2)
+
+	from := waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)
+	session.presence(&waEvents.Presence{From: from, Unavailable: true})
+	session.presence(&waEvents.Presence{From: from})
+
+	states := []string{}
+	for _, emission := range queuedIn(session) {
+		if emission.Type != protocol.EventPresenceUpdate {
+			continue
+		}
+		if emission.Fresh != nil {
+			t.Error("an availability was queued as something that expires")
+		}
+		var body struct {
+			State string `json:"state"`
+		}
+		if err := json.Unmarshal(emission.Payload, &body); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		states = append(states, body.State)
+	}
+	// Both, in order, so the last one is what the client ends up with. Either dropped
+	// and the client's last word is the wrong one.
+	if len(states) != 2 || states[0] != "unavailable" || states[1] != "available" {
+		t.Errorf("what reached the queue is %v, want the going away and the coming back", states)
+	}
+}
+
+// A typing indicator has nowhere to show in a channel, a broadcast list or the status
+// feed, and SendChatPresence reports only that the node was written -- so the command
+// comes back successful and nothing anywhere is typing.
+func TestATypingIndicatorIsRefusedWhereItHasNowhereToShow(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name    string
+		chat    string
+		refused bool
+	}{
+		{"a channel", `{"kind":"newsletter","id":"120363041234567890@newsletter"}`, true},
+		{"a broadcast list", `{"kind":"broadcast","id":"5511999990001"}`, true},
+		{"the status feed", `{"kind":"status","id":"status"}`, true},
+		{"a direct chat", `{"kind":"phone","id":"5511999990002"}`, false},
+		{"a group", `{"kind":"group","id":"120363041234567890"}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			session, _, _ := outboundSession(t)
+			_, err := session.chatPresenceCommand(t.Context(), &protocol.Command{
+				Type:    protocol.CommandChatPresence,
+				Payload: json.RawMessage(`{"chat":` + tc.chat + `,"state":"composing"}`),
+			})
+			if tc.refused {
+				assertCode(t, err, protocol.ErrorInvalidPayload)
+				return
+			}
+			assertCode(t, err, protocol.ErrorNotConnected)
+		})
 	}
 }

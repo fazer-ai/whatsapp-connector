@@ -149,6 +149,15 @@ type Session struct {
 	// worth another delivery.
 	unseal func(context.Context, *waEvents.Message) (*waE2E.Message, error)
 
+	// handoffWait bounds how long a moment waits on a reader that is busy. A field for
+	// the same reason as deliverWait, and for no other.
+	handoffWait time.Duration
+
+	// picked, when it is set, receives once for every emission the forwarder takes off
+	// the inbox, before it tries to hand it on. A seam so a test can know the pump is
+	// parked rather than sleeping until it probably is.
+	picked chan struct{}
+
 	// elapsed is the monotonic reading the publisher window is measured with, and nil is
 	// the real one. A seam so a test can hold the clock still instead of racing it.
 	elapsed func() time.Duration
@@ -285,6 +294,7 @@ func newSession(
 
 		storeLimit:   bindTimeout,
 		deliverWait:  deliverTimeout,
+		handoffWait:  perishableHandoff,
 		downloadWait: downloadTimeout,
 		uploadWait:   uploadTimeout,
 	}
@@ -1376,7 +1386,20 @@ func (s *Session) forward() {
 		case <-s.done:
 			return
 		case emission := <-s.inbox:
-			if emission.Fresh != nil && !emission.Fresh() {
+			if s.picked != nil {
+				// Taken, and about to be handed on. A test that needs the pump parked
+				// here rather than racing it reads this.
+				s.picked <- struct{}{}
+			}
+			if emission.Fresh == nil {
+				select {
+				case s.events <- emission:
+				case <-s.done:
+					return
+				}
+				continue
+			}
+			if !emission.Fresh() {
 				// A moment that has passed. Publishing it now would state as current
 				// something the session already knows is not, and the correction was
 				// dropped behind the same backlog that made this late.
@@ -1384,11 +1407,20 @@ func (s *Session) forward() {
 					Msg("dropping a transient event that waited too long to still be true")
 				continue
 			}
+			// Bounded, because the check above is only as good as the wait after it: an
+			// unbounded handoff would pass the check and then sit on a reader that is
+			// busy, and what came out would be exactly the stale event the check is for.
+			handoff := time.NewTimer(s.handoffWait)
 			select {
 			case s.events <- emission:
+			case <-handoff.C:
+				s.log.Debug().Str("type", string(emission.Type)).
+					Msg("dropping a transient event the reader was not there for")
 			case <-s.done:
+				handoff.Stop()
 				return
 			}
+			handoff.Stop()
 		}
 	}
 }
@@ -1397,6 +1429,11 @@ func (s *Session) forward() {
 // more than the event does: whatever came next was either published or dropped for the
 // same backlog, and a client shown the old one has no way to learn better.
 const presenceLife = 10 * time.Second
+
+// perishableHandoff bounds how long a moment waits on a reader that is busy. Short,
+// because everything past it is added to how stale the event is by the time somebody
+// sees it, and a moment is worth nothing stale.
+const perishableHandoff = time.Second
 
 // offer publishes without ever waiting for room, and drops what does not fit.
 //
