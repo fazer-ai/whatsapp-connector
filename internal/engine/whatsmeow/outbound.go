@@ -438,6 +438,13 @@ func vcardLine(card, want string) (value, parameters string) {
 			continue
 		}
 		property, params, _ := strings.Cut(name, ";")
+		// A property may be written in a group -- `item1.TEL;waid=...:+...` -- which is
+		// how several address books export a card, and the group is not part of the
+		// property's name. A name never carries a dot otherwise, so this takes nothing
+		// off a card that was not grouped.
+		if _, ungrouped, grouped := strings.Cut(property, "."); grouped {
+			property = ungrouped
+		}
 		if strings.EqualFold(property, want) {
 			return vcardUnescape(strings.TrimSpace(raw)), params
 		}

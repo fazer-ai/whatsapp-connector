@@ -24,6 +24,15 @@ func sharedBody(event *waEvents.Message) (body, bool) {
 	switch {
 	case message.GetLocationMessage() != nil:
 		pin := message.GetLocationMessage()
+		if pin.DegreesLatitude == nil || pin.DegreesLongitude == nil {
+			// Both getters answer zero for a field that is not there, so a pin missing
+			// one is published at the equator or in the Gulf of Guinea -- somewhere the
+			// sender has never been, rendered as where they are. Said to be unrenderable
+			// instead, which files it with everything else this build cannot read rather
+			// than inventing a position for it. The outbound path refuses the same thing
+			// for the same reason.
+			return body{}, false
+		}
 		content := protocol.Location(pin.GetDegreesLatitude(), pin.GetDegreesLongitude())
 		content.Name = pin.GetName()
 		content.Address = pin.GetAddress()
@@ -43,6 +52,9 @@ func sharedBody(event *waEvents.Message) (body, bool) {
 		// `name` because that is the only text the contract has for a pin, and because a
 		// client renders the two together.
 		moving := message.GetLiveLocationMessage()
+		if moving.DegreesLatitude == nil || moving.DegreesLongitude == nil {
+			return body{}, false
+		}
 		content := protocol.Location(moving.GetDegreesLatitude(), moving.GetDegreesLongitude())
 		content.Name = moving.GetCaption()
 		content.Live = true

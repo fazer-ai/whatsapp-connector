@@ -81,6 +81,73 @@ func TestALivePinSaysTheSenderIsStillMoving(t *testing.T) {
 	}
 }
 
+// Both getters answer zero for a coordinate that is not there, so a pin missing one is
+// published somewhere the sender has never been, rendered as where they are.
+func TestAPinMissingACoordinateIsNotPublishedAsAPlaceInTheGulfOfGuinea(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		body *waE2E.Message
+	}{
+		{"a pin with no latitude", &waE2E.Message{LocationMessage: &waE2E.LocationMessage{
+			DegreesLongitude: proto.Float64(-46.6333),
+		}}},
+		{"a live pin with no longitude", &waE2E.Message{LiveLocationMessage: &waE2E.LiveLocationMessage{
+			DegreesLatitude: proto.Float64(-23.5505),
+		}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			session, _ := newTestSession(t, "5511999990001")
+			event := textMessage("3EB0NOWHERE", "")
+			event.Message = tc.body
+
+			content := inboundContentOf(t, publishedBy(t, session, event))
+			if content["type"] == "location" {
+				t.Fatalf("a pin missing a coordinate was published as a place: %v", content)
+			}
+			if content["type"] != "unsupported" {
+				t.Fatalf("a pin missing a coordinate was published as %v", content)
+			}
+		})
+	}
+}
+
+// A body this build cannot read is still a reply, still tags people, and is still on the
+// chat's timer. The placeholder is the one renderer that must not lose that: it is the
+// one that runs for every arm nobody has written a renderer for.
+func TestAPlaceholderKeepsWhatTheMessageWasAnnotatedWith(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	event := textMessage("3EB0POLLREPLY", "")
+	event.Message = &waE2E.Message{PollCreationMessage: &waE2E.PollCreationMessage{
+		Name: proto.String("almoço?"),
+		ContextInfo: &waE2E.ContextInfo{
+			StanzaID:      proto.String("3EB0QUOTED"),
+			MentionedJID:  []string{"5511999990002@s.whatsapp.net"},
+			Expiration:    proto.Uint32(604800),
+			Participant:   proto.String("5511999990001@s.whatsapp.net"),
+			QuotedMessage: &waE2E.Message{Conversation: proto.String("onde vamos?")},
+		},
+	}}
+
+	emission := publishedBy(t, session, event)
+	message, _ := decode(t, emission.Payload)["message"].(map[string]any)
+	if message["quoted_id"] != "3EB0QUOTED" {
+		t.Errorf("the placeholder answers %v, and the poll was a reply to %q", message["quoted_id"], "3EB0QUOTED")
+	}
+	if message["ephemeral"] != float64(604800) {
+		t.Errorf("the placeholder is on timer %v, want the chat's own", message["ephemeral"])
+	}
+	mentions, _ := message["mentions"].([]any)
+	if len(mentions) != 1 {
+		t.Errorf("the placeholder tags %v", message["mentions"])
+	}
+}
+
 func TestASharedCardCarriesItsNameItsNumberAndTheCardItself(t *testing.T) {
 	t.Parallel()
 
@@ -100,6 +167,12 @@ func TestASharedCardCarriesItsNameItsNumberAndTheCardItself(t *testing.T) {
 		// one is a row with no label unless the card is read.
 		{"named only on the card", &waE2E.ContactMessage{
 			Vcard: proto.String(vcard),
+		}, "Carlos Dias", "+55 41 98888-1111"},
+		// How several address books export a card: the property carries a group, and the
+		// group is not part of its name.
+		{"written with property groups", &waE2E.ContactMessage{
+			Vcard: proto.String("BEGIN:VCARD\nVERSION:3.0\nitem1.FN:Carlos Dias\n" +
+				"item2.TEL;type=CELL;waid=5541988881111:+55 41 98888-1111\nEND:VCARD\n"),
 		}, "Carlos Dias", "+55 41 98888-1111"},
 		// A TEL whose value says nothing this connector can use. The account behind the
 		// card is in the parameter, which is what makes it worth falling back to.

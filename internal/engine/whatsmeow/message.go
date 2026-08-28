@@ -9,6 +9,7 @@ import (
 	waTypes "go.mau.fi/whatsmeow/types"
 	waEvents "go.mau.fi/whatsmeow/types/events"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/engine"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
@@ -231,7 +232,46 @@ func (s *Session) bodyOf(ctx context.Context) renderBody {
 // The cost is real and it is the trade being made: a message published as unsupported is
 // stored as unsupported, so a build that later learns the type does not go back for it.
 func unreadableBody(event *waEvents.Message) (body, bool) {
-	return body{content: protocol.Unsupported(whyUnreadable(event))}, true
+	// The annotation goes with it. A poll sent as a reply is still a reply, and a client
+	// that never learns what it answered cannot thread it -- the placeholder is the one
+	// renderer that cannot lose this, because it is the one that runs for every arm
+	// nobody has written a renderer for.
+	return body{content: protocol.Unsupported(whyUnreadable(event)), context: alongside(event.Message)}, true
+}
+
+// alongside is the annotation a message carries, whichever arm it arrived in: the quote
+// it answers, the accounts it tags, the chat's disappearing timer.
+//
+// Every body WhatsApp defines keeps that in a `contextInfo` of its own rather than on the
+// message, and each renderer above reads its own by name. The placeholder cannot: it
+// exists for the arms nothing here knows, so naming them is the one thing it must not do.
+// It reads the field that is set instead, which is the same answer for an arm WhatsApp
+// adds tomorrow.
+//
+// In field order rather than through Range, whose order protobuf does not promise. A
+// message carries one body, so the two agree today; a message that somehow carried two
+// would otherwise answer differently on different runs.
+func alongside(message *waE2E.Message) *waE2E.ContextInfo {
+	if message == nil {
+		return nil
+	}
+	reflected := message.ProtoReflect()
+	fields := reflected.Descriptor().Fields()
+	for i := range fields.Len() {
+		field := fields.Get(i)
+		if field.Kind() != protoreflect.MessageKind || field.IsList() || field.IsMap() || !reflected.Has(field) {
+			continue
+		}
+		arm := reflected.Get(field).Message()
+		annotation := arm.Descriptor().Fields().ByName("contextInfo")
+		if annotation == nil || !arm.Has(annotation) {
+			continue
+		}
+		if annotated, ok := arm.Get(annotation).Message().Interface().(*waE2E.ContextInfo); ok {
+			return annotated
+		}
+	}
+	return nil
 }
 
 // whyUnreadable is which of the contract's reasons this message arrived with. It is what
