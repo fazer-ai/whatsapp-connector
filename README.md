@@ -8,18 +8,17 @@ through [whatsmeow](https://github.com/tulir/whatsmeow), and exchanges canonical
 events and commands with its clients over Redis Streams.
 
 > [!IMPORTANT]
-> **Status: M2, text both ways, media both ways, and location and contacts outbound.** A
-> session pairs with a real WhatsApp account, resumes across restarts, publishes the text
-> messages that arrive on it, and sends text back: quotes, mentions and the chat's
-> disappearing-message timer included. `groups` on the connect decides whether group chats
-> come with them. An inbound image, video, audio, document or sticker is downloaded as it
-> arrives, kept in this instance's blob cache and published as a reference the client
-> fetches over HTTP; a file WhatsApp will not serve again is announced with
-> `media.download_failed` so the bubble says the attachment is unavailable rather than
-> loading forever. A blob lives on the instance that downloaded it and for a bounded time,
-> and `message.download_media` fetches the file again from the coordinates kept beside the
-> message, so an attachment survives the instance being replaced between the event and the
-> client's fetch.
+> **Status: M2 is in, both ways.** A session pairs with a real WhatsApp account, resumes
+> across restarts, publishes the text messages that arrive on it, and sends text back:
+> quotes, mentions and the chat's disappearing-message timer included. `groups` on the
+> connect decides whether group chats come with them. An inbound image, video, audio,
+> document or sticker is downloaded as it arrives, kept in this instance's blob cache and
+> published as a reference the client fetches over HTTP; a file WhatsApp will not serve
+> again is announced with `media.download_failed` so the bubble says the attachment is
+> unavailable rather than loading forever. A blob lives on the instance that downloaded it
+> and for a bounded time, and `message.download_media` fetches the file again from the
+> coordinates kept beside the message, so an attachment survives the instance being
+> replaced between the event and the client's fetch.
 >
 > Outbound, a media message names a URL this connector fetches, with whatever headers open
 > it, and streams to WhatsApp without holding the file in memory; a location goes out as a
@@ -34,13 +33,25 @@ events and commands with its clients over Redis Streams.
 > sender expected to disappear into something the account holds indefinitely. WhatsApp
 > usually does not hand one to a linked device at all, and what it sends instead reaches
 > the inbox as nothing until
-> [#20](https://github.com/fazer-ai/whatsapp-connector/issues/20) lands. Everything else is
-> still M2's to finish: location and contacts on the way in, and the commands that act on a
-> message that already exists. What this build cannot render is left unacknowledged on
-> WhatsApp's side, with its plaintext buffered so the redelivery can still be read: the
+> [#20](https://github.com/fazer-ai/whatsapp-connector/issues/20) lands. What this build
+> cannot render is left unacknowledged on WhatsApp's side, with its plaintext buffered so
+> the redelivery can still be read: the
 > account keeps the message and delivers it again once there is somewhere to put it. A
 > number paired on this build therefore still accumulates a backlog of everything it cannot
 > render (see [Roadmap](#roadmap)).
+>
+> Around the messages, what a conversation looks like while nobody is writing one: the
+> ticks a message collects on their way to being read, a read mark this account can set
+> on somebody else's, the typing and recording indicators both ways, and whether a
+> contact is at their phone. A `composing` or a `recording` is the one shape here that
+> describes a moment rather than a fact, and it is the only thing this connector drops
+> when it goes stale instead of retrying it: delivered a minute late it is somebody shown
+> typing who stopped long ago, and the state that would have corrected it went out while
+> the stale one was still on its way. The stop that ends a burst is not like that, and
+> neither is an availability -- both hold until something says otherwise. None of it
+> survives a reconnect, though: WhatsApp forgets the availability and the subscriptions
+> alike, so a client resubscribes and republishes what it wants shown
+> ([#46](https://github.com/fazer-ai/whatsapp-connector/issues/46)).
 >
 > A message is acknowledged to WhatsApp only after its event reaches the stream, so
 > losing Redis costs a redelivery and never a message. The client deduplicates on the
@@ -203,8 +214,8 @@ restart, and reports itself healthy while doing it.
 |---|---|
 | **M0** ✅ | Skeleton, Redis Streams transport, lease/ownership port, fake engine, health and metrics, Docker image, publish pipeline |
 | **M1** ✅ | whatsmeow engine: QR and code pairing, session state, logout/ban/outdated handling, the device store. Reconnect backoff and the store-level fence are still open |
-| **M2** 🚧 | Messages in and out (text, media, location, contact, reaction, edit, revoke, quoted, mentions), receipts, read marks, chat presence, idempotent sends. All of them are in both ways, and a body this build has no arm for arrives as a placeholder rather than disappearing. Still open: receipts, read marks and chat presence |
-| **M3** | Groups, presence, contacts, calls |
+| **M2** ✅ | Messages in and out (text, media, location, contact, reaction, edit, revoke, quoted, mentions), receipts, read marks, chat presence, account presence, idempotent sends. All of them are in both ways, and a body this build has no arm for arrives as a placeholder rather than disappearing. What it leaves behind is in the issues rather than here: a message WhatsApp will not hand to a linked device still reaches nobody ([#20](https://github.com/fazer-ai/whatsapp-connector/issues/20)), and presence does not survive a reconnect ([#46](https://github.com/fazer-ai/whatsapp-connector/issues/46)) |
+| **M3** | Groups, contacts, calls |
 | **M4** | Multi-instance under load, quarantine, metrics/lag/DLQ, operations docs |
 | **M5** | Pairing code, passkey relay, per-session proxy, account limits |
 | **M6** | Opt-in history sync |
