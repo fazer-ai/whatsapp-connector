@@ -101,6 +101,13 @@ var sinceStart = time.Now()
 //	peer_msg       -> dropped     plumbing
 //	hist_sync      -> dropped     plumbing
 //
+// The library says played is a view-once being opened. Against a real phone it also
+// arrives coalesced with a chat being opened, over messages of its own, so what it
+// covers is wider than the doc says. That changes nothing here, since both are the
+// contract's `played`, and it is written down because the reading was narrower than the
+// thing -- and because `sender` and the coalescing were readings too until a phone sent
+// them.
+//
 // The two `-self` shapes are the ones worth arguing about, and they are published for
 // what they cost either way: dropping them means a client can never learn that the
 // person behind the account read the conversation on their phone, and there is nothing
