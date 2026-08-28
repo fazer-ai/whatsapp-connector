@@ -2,6 +2,7 @@ package whatsmeow
 
 import (
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
@@ -720,5 +721,66 @@ func TestTheBoardIsPublishedInTheOrderItWasWrittenIn(t *testing.T) {
 	}
 	if first, last := stateOf(t, taken[0]), stateOf(t, taken[1]); first != "composing" || last != "paused" {
 		t.Errorf("the board came off as %s then %s, and they were written the other way round", first, last)
+	}
+}
+
+// A stop is the end of a typing burst and there is nothing after it. Lost to a publisher
+// having a bad second it is not sent again by WhatsApp and not superseded by anything, so
+// the client keeps showing somebody typing until that person does something else -- which
+// may be never.
+func TestAStopGoesBackOnTheBoardWhenItsPublishFails(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.picked = make(chan struct{}, 1)
+
+	source := waTypes.MessageSource{
+		Chat:   waTypes.NewJID("5511999990002", waTypes.DefaultUserServer),
+		Sender: waTypes.NewJID("5511999990002", waTypes.DefaultUserServer),
+	}
+	session.chatPresence(&waEvents.ChatPresence{MessageSource: source, State: waTypes.ChatPresencePaused})
+
+	emission := next(t, session)
+	if emission.Settle == nil {
+		t.Fatal("a stop was published with no way to hear that it never landed")
+	}
+	emission.Settle(errors.New("redis is unreachable"))
+
+	waiting := onBoard(session)
+	if len(waiting) != 1 {
+		t.Fatalf("%d presences are on the board, and the stop that never landed should be", len(waiting))
+	}
+	if state := stateOf(t, waiting[0]); state != "paused" {
+		t.Errorf("what went back is a %s", state)
+	}
+}
+
+// And it does not go back over something newer. The state that is waiting was written
+// after the one that failed, so putting the older one back would publish it last and
+// leave the client with the state before the one it already has.
+func TestAFailedStopDoesNotDisplaceTheStateAfterIt(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.picked = make(chan struct{}, 1)
+
+	source := waTypes.MessageSource{
+		Chat:   waTypes.NewJID("5511999990002", waTypes.DefaultUserServer),
+		Sender: waTypes.NewJID("5511999990002", waTypes.DefaultUserServer),
+	}
+	session.chatPresence(&waEvents.ChatPresence{MessageSource: source, State: waTypes.ChatPresencePaused})
+	emission := next(t, session)
+
+	// They started typing again while the stop was still in flight.
+	blockTheForwarder(t, session)
+	session.chatPresence(&waEvents.ChatPresence{MessageSource: source, State: waTypes.ChatPresenceComposing})
+	emission.Settle(errors.New("redis is unreachable"))
+
+	waiting := onBoard(session)
+	if len(waiting) != 1 {
+		t.Fatalf("%d presences are on the board, want only the newer one", len(waiting))
+	}
+	if state := stateOf(t, waiting[0]); state != "composing" {
+		t.Errorf("what is waiting is a %s, and the newer state was the typing", state)
 	}
 }

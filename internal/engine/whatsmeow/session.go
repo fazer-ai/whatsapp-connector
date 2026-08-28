@@ -1457,8 +1457,12 @@ type posted struct {
 func (s *Session) handOn(emission engine.Emission) bool {
 	if s.picked != nil {
 		// Taken, and about to be handed on. A test that needs the forwarder parked here
-		// rather than racing it reads this.
-		s.picked <- struct{}{}
+		// rather than racing it reads this. Never waits: a hook that can hold the
+		// forwarder is a hook that can hang the thing it was put there to watch.
+		select {
+		case s.picked <- struct{}{}:
+		default:
+		}
 	}
 	if emission.Expires == nil {
 		select {
@@ -1502,6 +1506,14 @@ func (s *Session) post(key string, eventType protocol.EventType, payload any, li
 	if life > 0 {
 		perishes := s.since() + life
 		emission.Expires = func() time.Duration { return perishes - s.since() }
+	} else {
+		// A state that corrects something the client has already been shown, and there
+		// is nothing after it: a stop is the end of a typing burst, and somebody going
+		// away is the end of them being there. Lost to a publisher having a bad second
+		// it is not sent again by WhatsApp and not superseded by anything, so the client
+		// is left with the state before it until that person does something else --
+		// which may be never.
+		emission.Settle = s.putBack(key, eventType, body)
 	}
 
 	s.boardMu.Lock()
@@ -1549,6 +1561,37 @@ func (s *Session) evictAMoment() bool {
 	}
 	delete(s.board, oldest)
 	return true
+}
+
+// putBack returns the callback that gives a durable presence one more go at the board
+// when the publish it was handed to failed.
+//
+// One more, and not a loop: a publisher that is down stays down for longer than any
+// number of immediate retries, and the point here is a bad second rather than an outage.
+// Something already waiting under the same key is newer than this by construction, and
+// putting this back over it would publish the older state last.
+func (s *Session) putBack(key string, eventType protocol.EventType, body json.RawMessage) func(error) {
+	return func(err error) {
+		if err == nil {
+			return
+		}
+		s.boardMu.Lock()
+		defer s.boardMu.Unlock()
+		if _, waiting := s.board[key]; waiting {
+			return
+		}
+		if len(s.board) >= s.boardCap && !s.evictAMoment() {
+			return
+		}
+		s.boardSeq++
+		s.board[key] = posted{seq: s.boardSeq, emission: engine.Emission{Type: eventType, Payload: body}}
+		s.log.Debug().Str("type", string(eventType)).
+			Msg("putting a presence back on the board after a publish that failed")
+		select {
+		case s.ready <- struct{}{}:
+		default:
+		}
+	}
 }
 
 func (s *Session) takeBoard() []engine.Emission {
