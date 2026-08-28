@@ -203,7 +203,7 @@ restart, and reports itself healthy while doing it.
 |---|---|
 | **M0** ✅ | Skeleton, Redis Streams transport, lease/ownership port, fake engine, health and metrics, Docker image, publish pipeline |
 | **M1** ✅ | whatsmeow engine: QR and code pairing, session state, logout/ban/outdated handling, the device store. Reconnect backoff and the store-level fence are still open |
-| **M2** 🚧 | Messages in and out (text, media, location, contact, reaction, edit, revoke, quoted, mentions), receipts, read marks, chat presence, idempotent sends. Text and media are in both ways; location, contacts, edits, revokes and reactions go out. Still open: all five on the way in, plus receipts, read marks and chat presence |
+| **M2** 🚧 | Messages in and out (text, media, location, contact, reaction, edit, revoke, quoted, mentions), receipts, read marks, chat presence, idempotent sends. All of them are in both ways, and a body this build has no arm for arrives as a placeholder rather than disappearing. Still open: receipts, read marks and chat presence |
 | **M3** | Groups, presence, contacts, calls |
 | **M4** | Multi-instance under load, quarantine, metrics/lag/DLQ, operations docs |
 | **M5** | Pairing code, passkey relay, per-session proxy, account limits |
