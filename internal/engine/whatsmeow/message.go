@@ -8,6 +8,7 @@ import (
 	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
 	waTypes "go.mau.fi/whatsmeow/types"
 	waEvents "go.mau.fi/whatsmeow/types/events"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/engine"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
@@ -202,8 +203,56 @@ func (s *Session) bodyOf(ctx context.Context) renderBody {
 		if plain, ok := plainBody(event); ok {
 			return plain, true
 		}
-		return s.mediaBody(ctx, event)
+		if shared, ok := sharedBody(event); ok {
+			return shared, true
+		}
+		if _, isAFile := attachmentOf(event.Message); isAFile {
+			// Asked before mediaBody rather than after it, and the difference is the
+			// whole reason the placeholder below is safe. A false from mediaBody means
+			// two opposite things -- this is not a file, or this is a file whose bytes
+			// may arrive next time -- and a placeholder reached through the second one
+			// would acknowledge a message whose download was worth retrying, spending
+			// the redelivery the retry was for.
+			return s.mediaBody(ctx, event)
+		}
+		return unreadableBody(event)
 	}
+}
+
+// unreadableBody is the placeholder for a message this build cannot render.
+//
+// It is what closes the last of the redelivery loops. Refusing the acknowledgement is
+// the right answer for an envelope that cannot be addressed, because a later build with
+// the same message can still publish it -- but for a body with no arm it buys nothing: a
+// poll is a poll on every redelivery, and the agent sees neither the message nor the
+// reason nothing arrived. A bubble they cannot read still says somebody sent something,
+// which is enough to ask.
+//
+// The cost is real and it is the trade being made: a message published as unsupported is
+// stored as unsupported, so a build that later learns the type does not go back for it.
+func unreadableBody(event *waEvents.Message) (body, bool) {
+	return body{content: protocol.Unsupported(whyUnreadable(event))}, true
+}
+
+// whyUnreadable is which of the contract's reasons this message arrived with. It is what
+// separates a poll from a stanza that carried nothing at all, and a client shows the
+// difference.
+func whyUnreadable(event *waEvents.Message) protocol.UnsupportedReason {
+	if empty(event.Message) {
+		return protocol.UnsupportedEmpty
+	}
+	return protocol.UnsupportedUnknownType
+}
+
+// empty reports whether a message arrived carrying nothing a reader could act on.
+//
+// The context info does not count. It rides along on a message rather than being one,
+// and WhatsApp attaches it to stanzas whose body is genuinely absent -- read as content,
+// every one of those would be published as a message of an unknown type instead of as
+// the empty thing it is.
+func empty(message *waE2E.Message) bool {
+	return message == nil ||
+		proto.Equal(message, &waE2E.Message{MessageContextInfo: message.GetMessageContextInfo()})
 }
 
 // plainBody renders a message whose whole body is text, which is the one kind that

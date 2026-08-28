@@ -412,24 +412,37 @@ func vcardUnescape(value string) string {
 
 // vcardName reads FN off a card, for a caller that sent one without saying what to
 // label it. Empty when the card has no FN, which is a card this connector will not send.
-func vcardName(card string) string {
+func vcardName(card string) string { return vcardValue(card, "FN") }
+
+// vcardValue reads one property off a card, with its parameters and its escapes taken
+// off. Empty when the card does not carry it.
+//
+// The property may carry parameters (`FN;CHARSET=UTF-8:...`), so the match is on the
+// name up to the first delimiter rather than on a prefix with a colon. And the value is
+// unescaped, for a card this connector did not write: a client that follows RFC 2426
+// escapes a semicolon, and copying that across verbatim would show the backslash. Cards
+// written here carry no escapes at all -- see vcardText -- so this does nothing to them.
+func vcardValue(card, want string) string {
+	value, _ := vcardLine(card, want)
+	return value
+}
+
+// vcardLine is vcardValue plus the parameters the property carried, for the one caller
+// that needs them: WhatsApp puts the account behind a card in a parameter on TEL rather
+// than in any value.
+func vcardLine(card, want string) (value, parameters string) {
 	for line := range strings.SplitSeq(card, "\n") {
 		trimmed := strings.TrimRight(line, "\r")
-		// The property may carry parameters (`FN;CHARSET=UTF-8:...`), so the match is on
-		// the name up to the first delimiter rather than on a prefix with a colon.
-		name, value, found := strings.Cut(trimmed, ":")
+		name, raw, found := strings.Cut(trimmed, ":")
 		if !found {
 			continue
 		}
-		if property, _, _ := strings.Cut(name, ";"); strings.EqualFold(property, "FN") {
-			// Unescaped on the way out, for a card this connector did not write: a
-			// client that follows RFC 2426 escapes a semicolon, and copying that across
-			// verbatim would show the backslash. Cards written here carry no escapes at
-			// all -- see vcardText -- so this does nothing to them.
-			return vcardUnescape(strings.TrimSpace(value))
+		property, params, _ := strings.Cut(name, ";")
+		if strings.EqualFold(property, want) {
+			return vcardUnescape(strings.TrimSpace(raw)), params
 		}
 	}
-	return ""
+	return "", ""
 }
 
 // source is the bytes of an outbound file, as the address the caller named serves them.

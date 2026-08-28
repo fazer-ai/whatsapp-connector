@@ -210,6 +210,16 @@ func changeOf(event *waEvents.Message) change {
 		// every pin in every chat would redeliver for good.
 		return dropping("dropping a pin, which the contract does not carry")
 
+	case event.Message.GetProtocolMessage() != nil:
+		// Machinery rather than something somebody sent: a history sync notification, an
+		// app state key share, the answer to a peer request. whatsmeow acts on these
+		// itself and none of them carries anything a conversation shows, so the
+		// placeholder the message path would otherwise give this would put the account's
+		// own housekeeping in an agent's thread, once per sync. Answered here because it
+		// is the last thing a protocol message can be: the two that a client does act on
+		// were taken above.
+		return dropping("dropping a protocol message, which is machinery rather than something somebody sent")
+
 	case event.Info.Edit != waTypes.EditAttributeEmpty:
 		// WhatsApp added something. Loud rather than silent, and kept on the phone: a
 		// build that learns what it is can still publish it, and guessing from the body
