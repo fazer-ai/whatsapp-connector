@@ -43,10 +43,13 @@ func sharedBody(event *waEvents.Message) (body, bool) {
 		return body{content: content, context: pin.GetContextInfo()}, true
 
 	case message.GetLiveLocationMessage() != nil:
-		// The pin the sender is still moving. WhatsApp updates it with further messages
-		// and nothing here follows those yet, so what the client gets is where they were
-		// when they started -- which is why `live` is carried rather than dropped: a
-		// stale pin shown as current is the one reading a client must not make.
+		// The pin the sender is still moving, at the moment they started. What comes
+		// after is a stream of positions, and a stream published a message at a time is
+		// a bubble every few seconds for as long as the share lasts -- so only the start
+		// of it is a message here, and the rest is dropped by changeOf.
+		//
+		// `live` is carried rather than the pin being dropped, because a stale position
+		// shown as current is the one reading a client must not make.
 		//
 		// A live location has a caption where a static one has a place name. It goes in
 		// `name` because that is the only text the contract has for a pin, and because a

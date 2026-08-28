@@ -259,7 +259,21 @@ func marksAMessage(message *waE2E.Message) bool {
 	return message.GetPollUpdateMessage() != nil ||
 		message.GetPollAddOptionMessage() != nil ||
 		message.GetKeepInChatMessage() != nil ||
-		message.GetPinInChatMessage() != nil
+		message.GetPinInChatMessage() != nil ||
+		movedAgain(message.GetLiveLocationMessage())
+}
+
+// movedAgain reports whether a live location is a further position rather than the start
+// of the share.
+//
+// Read off the sequence number, which is the field the protocol has for exactly this and
+// the reason it is right whichever arm carries the announcement: if the share starts as a
+// LocationMessage with `isLive`, every one of these is a position and every one has a
+// sequence; if it starts as a LiveLocationMessage, that one is the first and carries
+// none. Either way what publishes is the start and what drops is the stream -- which
+// otherwise arrives as a bubble every few seconds for as long as somebody is walking.
+func movedAgain(moving *waE2E.LiveLocationMessage) bool {
+	return moving != nil && moving.GetSequenceNumber() > 0
 }
 
 // keyMaterial reports whether a stanza carries what keeps a conversation readable: the

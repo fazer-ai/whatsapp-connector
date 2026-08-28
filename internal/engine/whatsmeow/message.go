@@ -305,6 +305,14 @@ func bodyless(message *waE2E.Message) bool {
 	if message == nil {
 		return true
 	}
+	if len(message.ProtoReflect().GetUnknown()) > 0 {
+		// An arm WhatsApp added after this descriptor was generated. protobuf keeps it
+		// here and Range never visits it, so a stanza made of nothing else reads as
+		// empty -- and one that also carried a group's key would be dropped as key
+		// material and never seen at all. What nobody here knows about is exactly what
+		// the placeholder exists for.
+		return false
+	}
 	said := false
 	message.ProtoReflect().Range(func(field protoreflect.FieldDescriptor, _ protoreflect.Value) bool {
 		if _, along := ridesAlong[field.Name()]; along {

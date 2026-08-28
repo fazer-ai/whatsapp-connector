@@ -148,6 +148,50 @@ func TestAPlaceholderKeepsWhatTheMessageWasAnnotatedWith(t *testing.T) {
 	}
 }
 
+// protobuf keeps an arm newer than this descriptor in the unknown bytes, and Range never
+// visits it. Read as empty, a message made of nothing else loses its reason -- and one
+// that also carried a group's key is dropped as key material and never seen at all,
+// which is the opposite of what the placeholder is for.
+func TestAnArmNewerThanThisBuildIsStillPublished(t *testing.T) {
+	t.Parallel()
+
+	// Field 9999, length-delimited: a body this descriptor has no name for.
+	newer := &waE2E.Message{}
+	newer.ProtoReflect().SetUnknown([]byte{0xfa, 0xe1, 0x03, 0x02, 0x68, 0x69})
+
+	for _, tc := range []struct {
+		name  string
+		build func() *waE2E.Message
+	}{
+		{"on its own", func() *waE2E.Message { return newer }},
+		{"alongside a group's key", func() *waE2E.Message {
+			withKey := &waE2E.Message{SenderKeyDistributionMessage: &waE2E.SenderKeyDistributionMessage{
+				GroupID:                             proto.String("120363000000000000@g.us"),
+				AxolotlSenderKeyDistributionMessage: []byte("chave"),
+			}}
+			withKey.ProtoReflect().SetUnknown(newer.ProtoReflect().GetUnknown())
+			return withKey
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			session, _ := newTestSession(t, "5511999990001")
+			session.setGroups(true)
+			event := textMessage("3EB0NEWER", "")
+			event.Message = tc.build()
+
+			content := inboundContentOf(t, publishedBy(t, session, event))
+			if content["type"] != "unsupported" {
+				t.Fatalf("an arm newer than this build was published as %v", content)
+			}
+			if content["reason"] != "unknown_type" {
+				t.Fatalf("an arm newer than this build was called %v, and it is not empty", content["reason"])
+			}
+		})
+	}
+}
+
 func TestASharedCardCarriesItsNameItsNumberAndTheCardItself(t *testing.T) {
 	t.Parallel()
 
@@ -318,6 +362,14 @@ func TestWhatIsNotAMessageIsAcknowledgedRatherThanShownToAnAgent(t *testing.T) {
 		}},
 		{"a message being pinned", &waE2E.Message{
 			PinInChatMessage: &waE2E.PinInChatMessage{Key: messageKey(subject)},
+		}},
+		// Every few seconds for as long as somebody is walking, if it were a message.
+		{"a further position in a live share", &waE2E.Message{
+			LiveLocationMessage: &waE2E.LiveLocationMessage{
+				DegreesLatitude:  proto.Float64(-23.5505),
+				DegreesLongitude: proto.Float64(-46.6333),
+				SequenceNumber:   proto.Int64(7),
+			},
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
