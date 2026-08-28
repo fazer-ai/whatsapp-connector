@@ -267,6 +267,16 @@ func changeOf(event *waEvents.Message) change {
 // The sticker resync is the odd one out and carries no key: it marks nothing and it is
 // not key material either, it is a list of file hashes and a timestamp asking for a pack
 // to be sent again. It has nowhere better to be than the list of what is not a message.
+//
+// A key is how most of them name what they mark, and not the only way, which is what the
+// key sweep alone could not see: a split payment update names its split by id and the
+// person by JID, and those two fields are the whole arm. So the sweep that settles this
+// list is over the arms carrying no field that could hold anything a person said -- and
+// running it over the descriptor turns up eleven, seven of them already here or in
+// keyMaterial. Of the four left, three are their own bubble rather than a mark on
+// somebody else's: a payment invite is an invitation, a placeholder is WhatsApp saying a
+// message exists that this device may not read, and a status link preview's style
+// travels with the status it decorates. The fourth is the split payment update.
 func marksAMessage(message *waE2E.Message) bool {
 	return message.GetPollUpdateMessage() != nil ||
 		message.GetPollAddOptionMessage() != nil ||
@@ -282,6 +292,7 @@ func marksAMessage(message *waE2E.Message) bool {
 		message.GetDeclinePaymentRequestMessage() != nil ||
 		message.GetCancelPaymentRequestMessage() != nil ||
 		message.GetStickerSyncRmrMessage() != nil ||
+		message.GetSplitPaymentUpdateMessage() != nil ||
 		movedAgain(message.GetLiveLocationMessage())
 }
 

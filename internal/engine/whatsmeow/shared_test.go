@@ -2,6 +2,7 @@ package whatsmeow
 
 import (
 	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -301,6 +302,100 @@ func TestASharedCardCarriesItsNameItsNumberAndTheCardItself(t *testing.T) {
 	}
 }
 
+// Media never travels inside a frame, and a card is the one place it could arrive
+// already inside one: a contact picture is base64 in the card's own text, so a card
+// published verbatim puts a file on the wire in a field nothing can fetch and nothing
+// bounds. What has to survive is everything the contract reads off the card.
+//
+// Both wrappings are here because they are what a card in the wild is written in, and
+// they look nothing alike: RFC 2426 folds a long value under a leading space, while a
+// vCard 2.1 base64 block is left flush against the margin and ends on a blank line. A
+// strip that only understood folding would keep the second one's file and, worse, read
+// the lines after it as part of the card.
+func TestACardArrivesWithoutTheFilesItCarried(t *testing.T) {
+	t.Parallel()
+
+	const picture = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8U"
+
+	for _, tc := range []struct {
+		name string
+		card string
+	}{
+		{"folded under a space, the way RFC 2426 says", "BEGIN:VCARD\nVERSION:3.0\n" +
+			"FN:Carlos Dias\nPHOTO;ENCODING=b;TYPE=JPEG:" + picture + "\n " + picture +
+			"\n " + picture + "\nTEL;type=CELL;waid=5541988881111:+55 41 98888-1111\nEND:VCARD\n"},
+		{"left flush, the way a vCard 2.1 block is", "BEGIN:VCARD\nVERSION:2.1\n" +
+			"FN:Carlos Dias\nPHOTO;ENCODING=BASE64;JPEG:\n" + picture + "\n" + picture +
+			"\n\nTEL;type=CELL;waid=5541988881111:+55 41 98888-1111\nEND:VCARD\n"},
+		// The group is not part of the property's name, so a stripper matching on the
+		// whole token keeps the file on every card an address book exported.
+		{"written with a property group", "BEGIN:VCARD\nVERSION:3.0\n" +
+			"item1.FN:Carlos Dias\nitem2.PHOTO;ENCODING=b:" + picture +
+			"\nitem3.TEL;type=CELL;waid=5541988881111:+55 41 98888-1111\nEND:VCARD\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			session, _ := newTestSession(t, "5511999990001")
+			event := textMessage("3EB0PHOTO", "")
+			event.Message = &waE2E.Message{ContactMessage: &waE2E.ContactMessage{
+				Vcard: proto.String(tc.card),
+			}}
+
+			content := inboundContentOf(t, publishedBy(t, session, event))
+			cards, _ := content["contacts"].([]any)
+			if len(cards) != 1 {
+				t.Fatalf("one card was published as %d", len(cards))
+			}
+			card, _ := cards[0].(map[string]any)
+
+			published, _ := card["vcard"].(string)
+			if strings.Contains(published, picture) {
+				t.Errorf("the picture went out on the wire inside the card: %q", published)
+			}
+			if strings.Contains(strings.ToUpper(published), "PHOTO") {
+				t.Errorf("the property the picture was on is still on the card: %q", published)
+			}
+			// The point of stripping rather than dropping the card: what the contract
+			// reads off it has to come through untouched.
+			if card["display_name"] != "Carlos Dias" {
+				t.Errorf("the card is labelled %v, want %q", card["display_name"], "Carlos Dias")
+			}
+			if card["phone"] != "+55 41 98888-1111" {
+				t.Errorf("the card's number reads %v, want %q", card["phone"], "+55 41 98888-1111")
+			}
+			if !strings.Contains(published, "END:VCARD") {
+				t.Errorf("the card lost its end: %q", published)
+			}
+		})
+	}
+}
+
+// The other half, and the one that says the strip is a strip and not a rewrite: a card
+// carrying no file is published byte for byte as it arrived.
+func TestACardCarryingNoFileIsPublishedAsItArrived(t *testing.T) {
+	t.Parallel()
+
+	const card = "BEGIN:VCARD\nVERSION:3.0\nN:Dias;Carlos;;;\nFN:Carlos Dias\n" +
+		"ORG:Acme\nEMAIL;type=INTERNET:carlos@acme.example\n" +
+		"TEL;type=CELL;waid=5541988881111:+55 41 98888-1111\nEND:VCARD\n"
+
+	session, _ := newTestSession(t, "5511999990001")
+	event := textMessage("3EB0PLAINCARD", "")
+	event.Message = &waE2E.Message{ContactMessage: &waE2E.ContactMessage{
+		Vcard: proto.String(card),
+	}}
+
+	content := inboundContentOf(t, publishedBy(t, session, event))
+	cards, _ := content["contacts"].([]any)
+	if len(cards) != 1 {
+		t.Fatalf("one card was published as %d", len(cards))
+	}
+	if published, _ := cards[0].(map[string]any)["vcard"].(string); published != card {
+		t.Errorf("the card was rewritten on the way out:\n got %q\nwant %q", published, card)
+	}
+}
+
 func TestAStackOfCardsIsPublishedAsAllOfThem(t *testing.T) {
 	t.Parallel()
 
@@ -445,6 +540,15 @@ func TestWhatIsNotAMessageIsAcknowledgedRatherThanShownToAnAgent(t *testing.T) {
 				DegreesLatitude:  proto.Float64(-23.5505),
 				DegreesLongitude: proto.Float64(-46.6333),
 				SequenceNumber:   proto.Int64(7),
+			},
+		}},
+		// The one that names what it marks without a key: a split by id and a person by
+		// JID, and those two fields are the whole arm. Every status change on a bill
+		// being divided, as a bubble, if this were a message.
+		{"somebody's share of a split payment changing", &waE2E.Message{
+			SplitPaymentUpdateMessage: &waE2E.SplitPaymentUpdateMessage{
+				SplitID:        proto.String("split-1"),
+				ParticipantJID: proto.String("5541988881111@s.whatsapp.net"),
 			},
 		}},
 	} {

@@ -116,7 +116,7 @@ func aPlace(latitude, longitude *float64) bool {
 // rather than leaving it to each client is what keeps two clients from disagreeing about
 // what a card is called.
 func cardShared(card *waE2E.ContactMessage) protocol.Contact {
-	vcard := card.GetVcard()
+	vcard := vcardWithoutFiles(card.GetVcard())
 	shared := protocol.Contact{DisplayName: card.GetDisplayName(), Vcard: vcard}
 	if shared.DisplayName == "" {
 		// WhatsApp shows the display name and not the card, so a share that arrives
@@ -125,6 +125,72 @@ func cardShared(card *waE2E.ContactMessage) protocol.Contact {
 	}
 	shared.Phone = vcardPhone(vcard)
 	return shared
+}
+
+// vcardFiles are the properties whose value can be a file rather than a string. A card
+// out of an address book carries a contact's picture in PHOTO, and a card built by hand
+// can carry a company mark, a pronunciation clip or a certificate the same way.
+var vcardFiles = map[string]struct{}{"PHOTO": {}, "LOGO": {}, "SOUND": {}, "KEY": {}}
+
+// vcardWithoutFiles is the card with those properties taken out.
+//
+// Media never travels inside a frame -- it goes by reference, fetched from this
+// connector against a token -- and a card is the one place it could arrive already
+// inside one: a PHOTO is base64 in the card's own text, so publishing the card verbatim
+// would put a file on the wire in a field nothing can fetch and nothing bounds. It is
+// also the only field on any event whose size is the sender's to choose.
+//
+// The whole property goes, not only the inline form. A PHOTO written as a URI is small
+// enough to carry, and it is an address on somebody else's server that a client rendering
+// the card would dial for a picture, which is a fetch this connector would be handing out
+// rather than making. One rule covers both, and what the contract exists to carry -- the
+// name and the number -- is not in any of these properties.
+func vcardWithoutFiles(card string) string {
+	if card == "" {
+		return card
+	}
+	kept := strings.Builder{}
+	kept.Grow(len(card))
+	dropping := false
+	for line := range strings.SplitSeq(card, "\n") {
+		if property, names := vcardProperty(line); names {
+			_, dropping = vcardFiles[strings.ToUpper(property)]
+		}
+		// A line that names no property continues the one above it, and a file's base64
+		// is written across many of them. Which way the sender's client wrapped them --
+		// folded under a space the way RFC 2426 says, or left flush the way vCard 2.1
+		// blocks are -- does not matter here: neither can be read as a property, so both
+		// belong to whatever was dropped or kept last.
+		if dropping {
+			continue
+		}
+		kept.WriteString(line)
+		kept.WriteString("\n")
+	}
+	return strings.TrimSuffix(kept.String(), "\n")
+}
+
+// vcardProperty is the name a line declares, and false for a line that declares none.
+//
+// Base64 is what this has to tell a property from, and it cannot be one: the alphabet has
+// no colon in it, so a line of it never parses as `NAME:value`.
+func vcardProperty(line string) (string, bool) {
+	trimmed := strings.TrimRight(line, "\r")
+	if trimmed == "" || trimmed[0] == ' ' || trimmed[0] == '\t' {
+		return "", false
+	}
+	name, _, found := strings.Cut(trimmed, ":")
+	if !found {
+		return "", false
+	}
+	property, _, _ := strings.Cut(name, ";")
+	if _, ungrouped, grouped := strings.Cut(property, "."); grouped {
+		property = ungrouped
+	}
+	if property == "" || strings.ContainsAny(property, " \t") {
+		return "", false
+	}
+	return property, true
 }
 
 // vcardPhone is the number on a card, as the sender's client wrote it.
