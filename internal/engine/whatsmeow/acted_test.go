@@ -6,6 +6,7 @@ import (
 
 	waCommon "go.mau.fi/whatsmeow/proto/waCommon"
 	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
+	waWeb "go.mau.fi/whatsmeow/proto/waWeb"
 	waTypes "go.mau.fi/whatsmeow/types"
 	waEvents "go.mau.fi/whatsmeow/types/events"
 	"google.golang.org/protobuf/proto"
@@ -108,6 +109,58 @@ func TestAnEditNamesTheMessageItCorrectsRatherThanTheStanzaCarryingIt(t *testing
 	}
 	if payload["timestamp"] != float64(1755000009000) {
 		t.Errorf("the edit is stamped %v, want the editor's own clock", payload["timestamp"])
+	}
+}
+
+// A message that did not reach this device the first time comes back through another
+// door, and whatsmeow's parser for that door takes an edit apart on the way in: the
+// corrected body becomes the message, the target becomes the id on the event, and the
+// protocol message the ordinary shape keeps its key in is gone. Read the ordinary way
+// that correction names nothing and is silently acknowledged away.
+//
+// Parsed by the library rather than assembled here on purpose. The shape is whatsmeow's
+// and not this repository's, and a hand-built imitation of it would go on passing after
+// the library changed it.
+func TestAnEditThatCameBackThroughAResendIsStillPublished(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	chat := waTypes.NewJID("5511999990001", waTypes.DefaultUserServer)
+	resent := &waWeb.WebMessageInfo{
+		Key: &waCommon.MessageKey{
+			RemoteJID: proto.String(chat.String()),
+			FromMe:    proto.Bool(false),
+			ID:        proto.String(carrier),
+		},
+		MessageTimestamp: proto.Uint64(1755000009),
+		PushName:         proto.String("Alice"),
+		Message: &waE2E.Message{EditedMessage: &waE2E.FutureProofMessage{
+			Message: &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{
+				Key:           messageKey(subject),
+				Type:          waE2E.ProtocolMessage_MESSAGE_EDIT.Enum(),
+				EditedMessage: &waE2E.Message{Conversation: proto.String("bom dia, corrigido")},
+				TimestampMS:   proto.Int64(1755000009000),
+			}},
+		}},
+	}
+	event, err := session.current().ParseWebMessage(chat, resent)
+	if err != nil {
+		t.Fatalf("ParseWebMessage: %v", err)
+	}
+
+	emission := publishedBy(t, session, event)
+	if emission.Type != protocol.EventMessageEdited {
+		t.Fatalf("a resent edit was published as %s, want %s", emission.Type, protocol.EventMessageEdited)
+	}
+	validateAgainstContract(t, "event_message_edited", emission.Payload)
+
+	payload := decode(t, emission.Payload)
+	if payload["message_id"] != subject {
+		t.Fatalf("the resent edit corrects %v, want %q", payload["message_id"], subject)
+	}
+	content, _ := payload["content"].(map[string]any)
+	if content["body"] != "bom dia, corrigido" {
+		t.Fatalf("the resent edit reads %v", content)
 	}
 }
 

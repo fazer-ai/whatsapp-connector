@@ -175,16 +175,36 @@ func editOf(event *waEvents.Message) change {
 // theCorrection pulls the three things an edit is: which message it corrects, what that
 // message now says, and when the correction was made.
 //
-// A channel's edit is shaped differently from everybody else's, and whatsmeow says so on
-// the event rather than in the stanza: the new body arrives unwrapped, under the
-// original post's id, with the edit's own clock off to the side. Read the ordinary way
-// it is a fresh post under an id the client already has.
+// An edit arrives in three shapes, and only the first is the one it was sent in.
+//
+// A channel's is shaped differently from everybody else's, and whatsmeow says so on the
+// event rather than in the stanza: the new body arrives unwrapped, under the original
+// post's id, with the edit's own clock off to the side. Read the ordinary way it is a
+// fresh post under an id the client already has.
+//
+// The third is not WhatsApp's doing at all. A message that did not reach this device the
+// first time comes back through another door -- the resend of a placeholder, a history
+// sync -- and whatsmeow's parser for that door takes the edit apart for its caller: the
+// corrected body becomes the message, the target becomes the id on the event, and the
+// only thing left saying an edit was ever wrapped here is the flag. There is no protocol
+// message left to find a key in, so read the ordinary way that correction names nothing
+// and is dropped.
+//
+// The protocol message wins where there is one, because that shape is unambiguous and
+// the wrapper does not have to have carried an edit to be there.
 func theCorrection(event *waEvents.Message) (target string, corrected *waE2E.Message, at int64) {
 	if newsletterEdit(event) {
 		return event.Info.ID, event.Message, event.NewsletterMeta.EditTS.UnixMilli()
 	}
-	edit := event.Message.GetProtocolMessage()
-	return edit.GetKey().GetID(), edit.GetEditedMessage(), stampedAt(edit.GetTimestampMS(), event)
+	if edit := event.Message.GetProtocolMessage(); edit != nil {
+		return edit.GetKey().GetID(), edit.GetEditedMessage(), stampedAt(edit.GetTimestampMS(), event)
+	}
+	if event.SourceWebMsg != nil {
+		// Taken apart already. The edit's own clock went with the protocol message, and
+		// what is left is the stanza's, which is the closest thing to it that survived.
+		return event.Info.ID, event.Message, event.Info.Timestamp.UnixMilli()
+	}
+	return "", nil, 0
 }
 
 // correctedContent renders what a message says now that it has been corrected.
