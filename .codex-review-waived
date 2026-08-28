@@ -198,3 +198,25 @@ internal/engine/whatsmeow/acting.go: Normalize direct chats before building targ
 # worst of it is that nothing happened and the caller marks again. The rule is the
 # direction of the failure, not the query.
 internal/engine/whatsmeow/receipt.go: Fail group read marks when normalization fails  # PR#43
+# PR#45: this is the reverse of what round 6 of the same review asked for, and the
+# invariant it cites does not say what it is read as saying. Invariant 5 is that a
+# redelivered command must not duplicate a side effect. `presence.set` and
+# `presence.subscribe` do not have one to duplicate: the second application leaves
+# WhatsApp in the state the first one did -- available is available, subscribed is
+# subscribed -- so repeating them is not a second effect, it is the same effect asserted
+# again. A send is the shape the invariant is about, and it is in the ledger.
+#
+# What the exclusion buys is the failure that is not recoverable. Availability and every
+# subscription belong to the socket that set them; WhatsApp forgets both when the
+# connection goes and whatsmeow replays neither. A redelivery answered from the ledger
+# reports success over a connection where nothing was done, and nothing after that ever
+# corrects it -- there is no second chance the way a dropped receipt has one. Between an
+# operation applied twice to the same end and one reported as applied and never applied,
+# the second is the one worth avoiding.
+#
+# The remedy proposed instead -- replay the desired presence when a new socket connects --
+# is the better design and a larger one, and it fixes something this does not: presence is
+# lost on any ordinary reconnect, redelivery or no. That is registered as its own issue
+# rather than folded in here, because the subscription set it would have to keep is
+# unbounded by construction and deciding how to bound it is not this slice's decision.
+internal/protocol/types.go: Preserve idempotency for redelivered presence commands  # PR#45

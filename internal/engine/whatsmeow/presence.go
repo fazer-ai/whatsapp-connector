@@ -67,8 +67,14 @@ func (s *Session) chatPresence(event *waEvents.ChatPresence) bool {
 	// participant: keyed by the chat alone, Bob starting to type replaces Alice's stop
 	// and the client is left showing Alice typing for good. In a direct chat the sender
 	// is the chat, so this is the same key either way.
-	s.post(string(protocol.EventChatPresence)+":"+string(chat.Kind)+":"+chat.ID+":"+whoIsTyping(published.Sender),
-		protocol.EventChatPresence, published, life)
+	//
+	// The JID WhatsApp put on the event, rather than the contract's party built from it.
+	// That party carries whichever of the two identifiers happened to arrive, so a
+	// `composing` naming only a number and the `paused` after it naming a number and a
+	// LID would be two keys for one person -- and then nothing coalesces and the order
+	// they come off the board in decides whether the client ends up showing the stop.
+	s.post(string(protocol.EventChatPresence)+":"+string(chat.Kind)+":"+chat.ID+":"+
+		event.Sender.ToNonAD().String(), protocol.EventChatPresence, published, life)
 	return true
 }
 
@@ -99,16 +105,6 @@ func (s *Session) presence(event *waEvents.Presence) bool {
 	s.post(string(protocol.EventPresenceUpdate)+":"+party.Phone+":"+party.LID,
 		protocol.EventPresenceUpdate, published, 0)
 	return true
-}
-
-// whoIsTyping names the participant a chat presence is about, for the key it is kept
-// under. The empty string for a sender the contract could not name, which is one key for
-// all of them and no worse than the chat alone.
-func whoIsTyping(sender *protocol.Party) string {
-	if sender == nil {
-		return ""
-	}
-	return sender.Phone + "/" + sender.LID
 }
 
 // typingOf is the contract's three states out of whatsmeow's two.

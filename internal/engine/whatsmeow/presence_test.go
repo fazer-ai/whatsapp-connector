@@ -651,3 +651,38 @@ func TestAFullBoardGivesUpAMomentBeforeAStop(t *testing.T) {
 		t.Error("a stop was dropped for a board full of typing, and nothing will clear what it was going to clear")
 	}
 }
+
+// One person is one key, whichever of WhatsApp's two identifiers happened to arrive on
+// each event. Keyed by the party built from them, a `composing` naming only a number and
+// the `paused` after it naming a number and a LID are two entries for one person --
+// nothing coalesces, and which one the client ends up showing is decided by the order
+// they come off the board in.
+func TestOnePersonIsOneKeyWhicheverIdentifiersArrive(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.picked = make(chan struct{}, 1)
+	blockTheForwarder(t, session)
+
+	chat := waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)
+	session.chatPresence(&waEvents.ChatPresence{
+		MessageSource: waTypes.MessageSource{Chat: chat, Sender: chat},
+		State:         waTypes.ChatPresenceComposing,
+	})
+	session.chatPresence(&waEvents.ChatPresence{
+		MessageSource: waTypes.MessageSource{
+			Chat: chat, Sender: chat,
+			// The same person, with the other identifier alongside this time.
+			SenderAlt: waTypes.NewJID("167392323834034", waTypes.HiddenUserServer),
+		},
+		State: waTypes.ChatPresencePaused,
+	})
+
+	waiting := onBoard(session)
+	if len(waiting) != 1 {
+		t.Fatalf("%d presences are waiting for one person, and only their last state should be", len(waiting))
+	}
+	if state := stateOf(t, waiting[0]); state != "paused" {
+		t.Errorf("what is waiting is a %s, and the person's last state was the stop", state)
+	}
+}
