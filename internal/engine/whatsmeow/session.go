@@ -1376,6 +1376,14 @@ func (s *Session) forward() {
 		case <-s.done:
 			return
 		case emission := <-s.inbox:
+			if emission.Fresh != nil && !emission.Fresh() {
+				// A moment that has passed. Publishing it now would state as current
+				// something the session already knows is not, and the correction was
+				// dropped behind the same backlog that made this late.
+				s.log.Debug().Str("type", string(emission.Type)).
+					Msg("dropping a transient event that waited too long to still be true")
+				continue
+			}
 			select {
 			case s.events <- emission:
 			case <-s.done:
@@ -1385,26 +1393,58 @@ func (s *Session) forward() {
 	}
 }
 
+// presenceLife is how long a moment is worth publishing for. Past it the session knows
+// more than the event does: whatever came next was either published or dropped for the
+// same backlog, and a client shown the old one has no way to learn better.
+const presenceLife = 10 * time.Second
+
 // offer publishes without ever waiting for room, and drops what does not fit.
 //
 // The blocking emit is right for everything that has to arrive: the inbox filling means
 // the publisher is behind, and holding the node handler until it catches up is how a
-// message survives. Presence is the opposite and needs the opposite -- it describes a
-// moment, so one that waits out a backlog is published as a fact about now that stopped
-// being true minutes ago, and the wait itself holds WhatsApp's node handler for as long
-// as the publisher is down.
+// message survives. A moment is the opposite -- the wait itself holds WhatsApp's node
+// handler for as long as the publisher is down, and what comes out the other side is a
+// fact about a minute that has passed.
 //
-// Dropped rather than coalesced. What is lost is a second of somebody's typing, and the
-// next event says what is true instead of correcting what was published; keeping a slot
-// per chat to overwrite would be state to age out for the same answer.
+// For a state that stays true once it is true -- somebody stopped typing, somebody went
+// away -- that is the whole of it: offered whenever there is any room at all, and never
+// stale, because nothing about it expires.
 func (s *Session) offer(eventType protocol.EventType, payload any) {
+	s.offerWithin(eventType, payload, 0)
+}
+
+// offerFresh is the same for a state that is only true while it lasts, and it is
+// stricter in both directions: it goes in only while the publisher is keeping up, and it
+// is thrown away rather than published if it goes stale waiting.
+//
+// The two rules answer the sequence a single one cannot. A typing indicator queued
+// behind a backlog outlives the stop that would clear it, because the stop is dropped
+// for the same full inbox and there is no event after a stop. Requiring an empty inbox
+// means the typing was accepted only while the publisher was keeping up; the freshness
+// means that if it then stopped keeping up, the typing is discarded rather than
+// published late. For both to fail, the publisher would have to be keeping up and not.
+func (s *Session) offerFresh(eventType protocol.EventType, payload any) {
+	if len(s.inbox) > 0 {
+		s.log.Debug().Str("type", string(eventType)).
+			Msg("dropping a transient event the publisher was already behind on")
+		return
+	}
+	s.offerWithin(eventType, payload, presenceLife)
+}
+
+func (s *Session) offerWithin(eventType protocol.EventType, payload any, life time.Duration) {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		s.log.Error().Err(err).Str("type", string(eventType)).Msg("failed to render an event payload")
 		return
 	}
+	emission := engine.Emission{Type: eventType, Payload: body}
+	if life > 0 {
+		perishes := s.since() + life
+		emission.Fresh = func() bool { return s.since() < perishes }
+	}
 	select {
-	case s.inbox <- engine.Emission{Type: eventType, Payload: body}:
+	case s.inbox <- emission:
 	default:
 		s.log.Debug().Str("type", string(eventType)).
 			Msg("dropping a transient event the publisher had no room for")

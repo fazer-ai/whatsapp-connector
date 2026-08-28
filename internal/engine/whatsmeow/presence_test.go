@@ -76,8 +76,8 @@ func TestAChatPresenceGoesOutAsTheStateAndTheMediaTogether(t *testing.T) {
 				t.Errorf("%s goes out as %q/%q, want %q/%q", tc.state, state, media, tc.want, tc.media)
 			}
 			// And back, because the two directions have to agree on the same three names.
-			if back := typingOf(state, media); back != tc.state {
-				t.Errorf("%s came back as %s", tc.state, back)
+			if back, named := typingOf(state, media); !named || back != tc.state {
+				t.Errorf("%s came back as %s (named=%v)", tc.state, back, named)
 			}
 		})
 	}
@@ -309,5 +309,152 @@ func TestTypingIsDroppedRatherThanQueuedBehindABacklog(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("a typing indicator waited for room in a full inbox, holding WhatsApp's node handler")
+	}
+}
+
+// whatsmeow logs a chat state it does not recognise and dispatches the event anyway, so
+// anything WhatsApp adds arrives here as itself. Read as "not paused, so typing" it
+// becomes activity nobody reported -- and the contract has no placeholder for a typing
+// indicator the way it has one for a body, so there is nothing honest to publish.
+func TestATypingStateThisBuildHasNoNameForIsNotRoundedToTheNearestOne(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	event := &waEvents.ChatPresence{
+		MessageSource: waTypes.MessageSource{
+			Chat:   waTypes.NewJID("5511999990002", waTypes.DefaultUserServer),
+			Sender: waTypes.NewJID("5511999990002", waTypes.DefaultUserServer),
+		},
+		State: waTypes.ChatPresence("sketching"),
+	}
+
+	if !session.chatPresence(event) {
+		t.Fatal("a state nobody can render was left for WhatsApp to send again")
+	}
+	select {
+	case emission := <-session.Events():
+		t.Fatalf("a state WhatsApp invented was published as one of ours: %s", emission.Payload)
+	case <-time.After(500 * time.Millisecond):
+	}
+}
+
+// A stop is what clears a typing indicator, and there is no event after a stop. Dropped
+// behind the typing it stops, it leaves a client showing somebody typing with nothing
+// coming to correct it -- so the two states do not take the same path: the stop is
+// offered whenever there is any room at all, and the typing only while the publisher is
+// keeping up.
+func TestAStopIsOfferedWhereTheTypingItStopsIsNot(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	// Two fillers, because the pump takes one out and blocks handing it on. The second
+	// is what makes the inbox non-empty -- the publisher not keeping up -- and it also
+	// stops the pump competing for what is queued after it.
+	blockThePump(t, session, 2)
+
+	source := waTypes.MessageSource{
+		Chat:   waTypes.NewJID("5511999990002", waTypes.DefaultUserServer),
+		Sender: waTypes.NewJID("5511999990002", waTypes.DefaultUserServer),
+	}
+	session.chatPresence(&waEvents.ChatPresence{MessageSource: source, State: waTypes.ChatPresenceComposing})
+	session.chatPresence(&waEvents.ChatPresence{MessageSource: source, State: waTypes.ChatPresencePaused})
+
+	states := []string{}
+	for _, emission := range queuedIn(session) {
+		if emission.Type != protocol.EventChatPresence {
+			continue
+		}
+		var body struct {
+			State string `json:"state"`
+		}
+		if err := json.Unmarshal(emission.Payload, &body); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		states = append(states, body.State)
+	}
+	if len(states) != 1 || states[0] != "paused" {
+		t.Errorf("what was queued behind a publisher already behind is %v, and only the stop should have been", states)
+	}
+}
+
+// The other half of the same rule: a moment that waited too long is thrown away instead
+// of published, because the session already knows more than the event does.
+func TestAMomentThatWentStaleIsNotPublishedLate(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	now := time.Duration(0)
+	session.elapsed = func() time.Duration { return now }
+	// One filler, so the pump is holding it and not competing for what follows. The
+	// inbox itself is left empty, which is what the typing needs to be accepted at all.
+	blockThePump(t, session, 1)
+
+	source := waTypes.MessageSource{
+		Chat:   waTypes.NewJID("5511999990002", waTypes.DefaultUserServer),
+		Sender: waTypes.NewJID("5511999990002", waTypes.DefaultUserServer),
+	}
+	session.chatPresence(&waEvents.ChatPresence{MessageSource: source, State: waTypes.ChatPresenceComposing})
+
+	queued := queuedIn(session)
+	if len(queued) != 1 {
+		t.Fatalf("%d events were queued, want the typing", len(queued))
+	}
+	typing := queued[0]
+	if typing.Fresh == nil {
+		t.Fatal("a typing indicator was queued with no sense of when it stops being true")
+	}
+	if !typing.Fresh() {
+		t.Error("a typing indicator was stale the moment it was queued")
+	}
+	now = presenceLife
+	if typing.Fresh() {
+		t.Error("a typing indicator is still worth publishing after its whole life")
+	}
+
+	// And a stop never goes stale: it states something that stays true.
+	session.chatPresence(&waEvents.ChatPresence{MessageSource: source, State: waTypes.ChatPresencePaused})
+	stops := queuedIn(session)
+	if len(stops) != 1 {
+		t.Fatalf("%d events were queued, want the stop", len(stops))
+	}
+	if stops[0].Fresh != nil {
+		t.Error("a stop was queued as something that expires")
+	}
+}
+
+// blockThePump parks the forwarding goroutine on an emission nobody is reading, so what
+// is queued after this stays in the inbox for the test to look at rather than being
+// carried off mid-assertion.
+func blockThePump(t *testing.T, session *Session, fillers int) {
+	t.Helper()
+
+	for range fillers {
+		select {
+		case session.inbox <- engine.Emission{Type: protocol.EventSessionState, Payload: []byte(`{}`)}:
+		case <-time.After(time.Second):
+			t.Fatal("the inbox would not take a filler")
+		}
+	}
+	// The pump takes the first one within a scheduling quantum and then blocks handing
+	// it on, which is the state every assertion below depends on.
+	for range 100 {
+		if len(session.inbox) == fillers-1 {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("the pump never picked up, and the inbox is holding %d", len(session.inbox))
+}
+
+func queuedIn(session *Session) []engine.Emission {
+	queued := []engine.Emission{}
+	for {
+		select {
+		case emission := <-session.inbox:
+			queued = append(queued, emission)
+			continue
+		default:
+		}
+		return queued
 	}
 }

@@ -22,12 +22,17 @@ import (
 // and the state that would have corrected it -- the pause, or the message itself -- was
 // already published while the stale one was being retried.
 //
-// So these publish and acknowledge, whatever happens -- and they publish through offer
-// rather than emit, which is the same decision one layer down. emit waits for room in
-// the inbox, and waiting is the thing this must not do: a backlog would hold WhatsApp's
-// node handler for as long as the publisher is down and then deliver a `composing` about
-// a minute that has passed. What is lost when there is no room is a second of somebody's
-// typing, and the next event replaces it.
+// So these publish and acknowledge, whatever happens -- and never through emit, which
+// waits for room in the inbox. Waiting is the thing this must not do: a backlog would
+// hold WhatsApp's node handler for as long as the publisher is down and then deliver a
+// `composing` about a minute that has passed.
+//
+// Which of the two lossy paths depends on whether the state expires. `composing`,
+// `recording` and `available` are moments and go through offerFresh; `paused` and
+// `unavailable` stay true once they are true, and go through offer. The split is not a
+// nicety: a stop is what clears a typing indicator, and there is no event after a stop,
+// so a stop dropped behind the typing it stops is a client left showing somebody typing
+// with nothing coming to correct it.
 func (s *Session) chatPresence(event *waEvents.ChatPresence) bool {
 	chat, addressable := addressOf(event.Chat)
 	if !addressable {
@@ -36,13 +41,26 @@ func (s *Session) chatPresence(event *waEvents.ChatPresence) bool {
 	if chat.Kind == protocol.AddressGroup && !s.wantsGroups() {
 		return true
 	}
-	published := protocol.ChatPresence{Chat: chat, State: typingOf(event.State, event.Media)}
+	state, named := typingOf(event.State, event.Media)
+	if !named {
+		// A state this build has no name for. Published as the nearest one it does have,
+		// it is a claim WhatsApp never made -- and unlike a message, the contract has no
+		// placeholder for a typing indicator, so there is nothing honest to put here.
+		s.log.Debug().Str("state", string(event.State)).
+			Msg("dropping a chat presence the contract does not name")
+		return true
+	}
+	published := protocol.ChatPresence{Chat: chat, State: state}
 	sender := protocol.Party{}
 	naming(&sender, event.Sender, event.SenderAlt)
 	if sender.Phone != "" || sender.LID != "" {
 		published.Sender = &sender
 	}
-	s.offer(protocol.EventChatPresence, published)
+	if state == protocol.TypingPaused {
+		s.offer(protocol.EventChatPresence, published)
+	} else {
+		s.offerFresh(protocol.EventChatPresence, published)
+	}
 	return true
 }
 
@@ -65,7 +83,11 @@ func (s *Session) presence(event *waEvents.Presence) bool {
 		seen := event.LastSeen.UnixMilli()
 		published.LastSeen = &seen
 	}
-	s.offer(protocol.EventPresenceUpdate, published)
+	if event.Unavailable {
+		s.offer(protocol.EventPresenceUpdate, published)
+	} else {
+		s.offerFresh(protocol.EventPresenceUpdate, published)
+	}
 	return true
 }
 
@@ -75,14 +97,21 @@ func (s *Session) presence(event *waEvents.Presence) bool {
 // it, and audio is what makes the bubble say recording instead of typing. Read as two
 // states the recording is published as typing, and the client shows the wrong verb for
 // every voice note anybody starts.
-func typingOf(state waTypes.ChatPresence, media waTypes.ChatPresenceMedia) protocol.TypingState {
-	if state == waTypes.ChatPresencePaused {
-		return protocol.TypingPaused
+// Unknown is refused rather than rounded to the nearest one, and reports so. whatsmeow
+// logs a state it does not recognise and dispatches the event anyway, so anything
+// WhatsApp adds arrives here as itself -- and read as "not paused, so typing" it becomes
+// activity nobody reported.
+func typingOf(state waTypes.ChatPresence, media waTypes.ChatPresenceMedia) (protocol.TypingState, bool) {
+	switch state {
+	case waTypes.ChatPresencePaused:
+		return protocol.TypingPaused, true
+	case waTypes.ChatPresenceComposing:
+		if media == waTypes.ChatPresenceMediaAudio {
+			return protocol.TypingRecording, true
+		}
+		return protocol.TypingComposing, true
 	}
-	if media == waTypes.ChatPresenceMediaAudio {
-		return protocol.TypingRecording
-	}
-	return protocol.TypingComposing
+	return "", false
 }
 
 // composingOf is the inverse, for a client saying what to show on the other phone.

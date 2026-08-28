@@ -35,6 +35,17 @@ type Emission struct {
 	// nobody is reading any more, so an engine that waits on this must have a way out
 	// of its own when its session ends.
 	Settle func(error)
+
+	// Fresh, when it is set, reports whether this emission is still worth publishing by
+	// the time the publisher reaches it. Nil is always, which is every event that states
+	// a fact: a message, a receipt, a session's state.
+	//
+	// It exists for the few that state a moment instead. A typing indicator that waited
+	// out a backlog is published as a claim about now, and now has moved; the state that
+	// would have corrected it was already dropped for the same backlog. An engine that
+	// sets this is saying the event is worth nothing late, and the publisher owes the
+	// Settle callback for it either way.
+	Fresh func() bool
 }
 
 // Engine opens sessions. One process has one engine; a session is one WhatsApp
