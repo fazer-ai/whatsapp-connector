@@ -469,38 +469,6 @@ func TestACodeRequestKeepsTheGroupSubscriptionTheClientAskedFor(t *testing.T) {
 	}
 }
 
-// whatsmeow unwraps an edit into the shape a new message arrives in, so an edited text
-// looks exactly like a fresh one by the time anything here sees it. Publishing it as
-// message.received loses the correction and spends the acknowledgement that was the
-// only way to get it back.
-func TestAnEditedMessageIsNotPublishedAsANewOne(t *testing.T) {
-	t.Parallel()
-
-	session, _ := newTestSession(t, "5511999990001")
-	session.deliverWait = 50 * time.Millisecond
-
-	edited := textMessage("3EB0ABCDEF", "bom dia, corrigido")
-	edited.IsEdit = true
-	edited.Info.Edit = waTypes.EditAttributeMessageEdit
-
-	acknowledged := make(chan bool, 1)
-	go func() { acknowledged <- session.receive(edited) }()
-
-	select {
-	case emission := <-session.Events():
-		t.Fatalf("an edit was published as %s, and the contract has message.edited for it", emission.Type)
-	case <-time.After(100 * time.Millisecond):
-	}
-	select {
-	case got := <-acknowledged:
-		if got {
-			t.Fatal("an edit nothing published was acknowledged, so WhatsApp will not send it again")
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("the handler never came back from an edit")
-	}
-}
-
 func TestAMessageFromOneOfMetasBotsIsDroppedAndAcknowledged(t *testing.T) {
 	t.Parallel()
 
@@ -705,30 +673,22 @@ func TestAnEchoFromAnotherDeviceCarriesNoSender(t *testing.T) {
 	validateInboundAgainstContract(t, &message)
 }
 
-// A channel's edit does not arrive wrapped the way an ordinary one does. What comes
-// through is the corrected body under the original post's id, with an edit timestamp
-// off to the side and nothing else to tell it apart, so a client that deduplicates on
-// the id throws the correction away and the acknowledgement makes sure it is never
-// sent again.
-func TestAnEditedNewsletterPostIsNotPublishedAsTheOriginal(t *testing.T) {
+// A channel's correction and a channel's post are the same shape: the corrected body
+// arrives under the original post's id, with an edit timestamp off to the side and
+// nothing else to tell the two apart. That timestamp is the whole of the difference, so
+// a post without one has to keep going out as a post -- refusing every channel message
+// that looks like a correction would take the channel with it.
+func TestAChannelPostWithNoEditTimestampIsStillAPost(t *testing.T) {
 	t.Parallel()
 
+	session, _ := newTestSession(t, "5511999990001")
 	channel := waTypes.NewJID("120363111111111111", waTypes.NewsletterServer)
-	event := textMessage("3EB0NEWS", "edição de hoje, corrigida")
+	event := textMessage("3EB0NEWS", "edição de hoje")
 	event.Info.Chat = channel
 	event.Info.Sender = channel
-	event.NewsletterMeta = &waEvents.NewsletterMessageMeta{
-		EditTS:     time.UnixMilli(1755000003000),
-		OriginalTS: time.UnixMilli(1755000002000),
-	}
 
-	if _, _, ok := inboundOf(event, plainBody); ok {
-		t.Fatal("a channel's correction was published under the original post's id")
-	}
-
-	// The uncorrected post still goes out: what is refused is the edit, not the channel.
-	event.NewsletterMeta = nil
-	if _, _, ok := inboundOf(event, plainBody); !ok {
-		t.Fatal("an ordinary newsletter post was withheld along with the edits")
+	emission := publishedBy(t, session, event)
+	if emission.Type != protocol.EventMessageReceived {
+		t.Fatalf("an ordinary channel post was published as %s", emission.Type)
 	}
 }

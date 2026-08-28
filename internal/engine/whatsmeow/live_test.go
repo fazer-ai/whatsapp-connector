@@ -18,6 +18,7 @@
 //	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveMedia
 //	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveRefetch
 //	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveViewOnce
+//	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveWatchAMessageChange
 //	WAC_LIVE_TO=<number> go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveSend$
 //	WAC_LIVE_TO=<number> go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveSendMedia
 //	  (WAC_LIVE_FILE names the file; WAC_LIVE_VOICE=1 sends it as a voice note)
@@ -215,6 +216,136 @@ func TestLiveListen(t *testing.T) {
 	}
 	if state := session.state(); state != "open" {
 		t.Fatalf("the session did not stay up: state=%s", state)
+	}
+}
+
+// TestLiveWatchAMessageChange is M2.5's inbound half against a real phone: somebody on
+// the other side corrects a message, reacts to it, takes the reaction back and finally
+// deletes it, and each of those has to come back out as its own event naming the message
+// it is about.
+//
+// It is the phase no fixture can stand in for. Every one of these arrives as an ordinary
+// message stanza whose body says what it does to another one, and the shapes are
+// whatsmeow's reading of what WhatsApp really sends -- an edit wrapped one way, a channel
+// edit another, a deletion with an attribute and a key, a reaction with a timestamp of
+// its own. A test that builds those shapes by hand is a test of the builder.
+//
+// One session, one message, four prompts, in the order WhatsApp allows them: a deleted
+// message cannot be reacted to and an edit has fifteen minutes.
+func TestLiveWatchAMessageChange(t *testing.T) {
+	window := liveWindow(t, 2*time.Minute)
+
+	session, _ := liveSession(t)
+	events := watch(t, session)
+
+	if err := session.Connect(t.Context(), engine.ConnectRequest{Pairing: "resume"}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	events.awaitState(t, "open", 2*time.Minute)
+
+	target, _ := liveAwaitTheirMessage(t, events, window)
+	fmt.Fprintf(os.Stderr, "watching message %s\n", target)
+
+	say := func(what string) {
+		fmt.Fprintf(os.Stderr, "%s on the other phone now; waiting up to %s\n", what, window)
+	}
+
+	say("edit that message")
+	edited := events.await(t, protocol.EventMessageEdited, window)
+	var correction struct {
+		MessageID string `json:"message_id"`
+		FromMe    bool   `json:"from_me"`
+		Content   struct {
+			Type string `json:"type"`
+			Body string `json:"body"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(edited.Payload, &correction); err != nil {
+		t.Fatalf("unmarshal the edit: %v", err)
+	}
+	switch {
+	case correction.MessageID != target:
+		// The stanza carrying an edit has an id of its own, and publishing that one
+		// leaves the client looking for a message nobody ever stored.
+		t.Fatalf("the edit corrects %q, and the message being edited is %q", correction.MessageID, target)
+	case correction.FromMe:
+		t.Fatalf("somebody else's edit was published as the account's own: %s", edited.Payload)
+	case correction.Content.Type != "text" || correction.Content.Body == "":
+		t.Fatalf("the edit arrived with no new body: %s", edited.Payload)
+	}
+	fmt.Fprintf(os.Stderr, "edit: %s now reads %q\n", correction.MessageID, correction.Content.Body)
+
+	say("react to that message")
+	put := liveReaction(t, events, window, target)
+	if put.Emoji == "" {
+		t.Fatalf("a reaction arrived with no emoji, which is how a removal is spelled: %s", put.Raw)
+	}
+	if put.ID == "" || put.ID == target {
+		// The client deduplicates on the reaction's own id and matches its own sends by
+		// it. The target's id in that field would collide with the message itself.
+		t.Fatalf("the reaction has no id of its own: %s", put.Raw)
+	}
+
+	say("take that reaction back")
+	taken := liveReaction(t, events, window, target)
+	if taken.Emoji != "" {
+		t.Fatalf("taking a reaction back arrived as %q rather than as an empty emoji: %s", taken.Emoji, taken.Raw)
+	}
+
+	say("delete that message for everyone")
+	revoked := events.await(t, protocol.EventMessageRevoked, window)
+	var deletion struct {
+		MessageID string `json:"message_id"`
+		By        string `json:"by"`
+	}
+	if err := json.Unmarshal(revoked.Payload, &deletion); err != nil {
+		t.Fatalf("unmarshal the deletion: %v", err)
+	}
+	if deletion.MessageID != target {
+		t.Fatalf("the deletion names %q, and the message deleted is %q", deletion.MessageID, target)
+	}
+	if deletion.By != "contact" {
+		// `self` is what the client applies to its own deletions, files and all. Saying
+		// it about somebody else's would destroy an attachment nobody asked it to.
+		t.Fatalf("somebody else's deletion was published as by=%q", deletion.By)
+	}
+	if state := session.state(); state != "open" {
+		t.Fatalf("the session did not stay up: state=%s", state)
+	}
+}
+
+// liveReaction waits for the next reaction on one message, failing on one that annotates
+// anything else: the phase is about a message it picked, and a stray reaction elsewhere
+// in the account would otherwise be read as the answer to the prompt.
+func liveReaction(t *testing.T, events *recorder, window time.Duration, target string) struct {
+	ID, Emoji, Raw string
+} {
+	t.Helper()
+
+	deadline := time.Now().Add(window)
+	for {
+		left := time.Until(deadline)
+		if left <= 0 {
+			t.Fatalf("no reaction on %s arrived within %s", target, window)
+		}
+		emission := events.await(t, protocol.EventMessageReaction, left)
+		var body struct {
+			ID       string `json:"id"`
+			TargetID string `json:"target_id"`
+			Emoji    string `json:"emoji"`
+			FromMe   bool   `json:"from_me"`
+		}
+		if err := json.Unmarshal(emission.Payload, &body); err != nil {
+			t.Fatalf("unmarshal the reaction: %v", err)
+		}
+		if body.TargetID != target {
+			fmt.Fprintf(os.Stderr, "ignoring a reaction on %s, waiting for one on %s\n", body.TargetID, target)
+			continue
+		}
+		if body.FromMe {
+			t.Fatalf("somebody else's reaction was published as the account's own: %s", emission.Payload)
+		}
+		return struct{ ID, Emoji, Raw string }{body.ID, body.Emoji, string(emission.Payload)}
 	}
 }
 

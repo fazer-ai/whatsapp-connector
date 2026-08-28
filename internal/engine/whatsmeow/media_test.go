@@ -772,8 +772,11 @@ func TestAMessageThisBuildRefusesIsNeverDownloadedFirst(t *testing.T) {
 	session, downloads := mediaSession(t, media.Options{})
 	downloads.answer([]byte("bytes"), nil)
 
-	event := imageEvent("3EB0EDIT")
-	event.IsEdit = true
+	// Somebody the contract has no way to name, which inboundOf refuses on the envelope
+	// alone -- before anything asks what the message says.
+	event := imageEvent("3EB0NAMELESS")
+	event.Info.Sender = waTypes.NewJID("someone", "unknown.server")
+	event.Info.SenderAlt = waTypes.EmptyJID
 
 	acknowledged := make(chan bool, 1)
 	go func() { acknowledged <- session.receive(event) }()
@@ -781,7 +784,7 @@ func TestAMessageThisBuildRefusesIsNeverDownloadedFirst(t *testing.T) {
 	select {
 	case got := <-acknowledged:
 		if got {
-			t.Fatal("an edit was acknowledged as a message received")
+			t.Fatal("a message nothing published was acknowledged")
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("the handler never came back")

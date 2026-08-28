@@ -130,15 +130,6 @@ type renderBody func(*waEvents.Message) (body, bool)
 // The second return is the failure to announce once the message itself is out, empty
 // for a message with nothing missing.
 func inboundOf(event *waEvents.Message, render renderBody) (protocol.InboundMessage, string, bool) {
-	if event.IsEdit || event.Info.Edit != waTypes.EditAttributeEmpty || newsletterEdit(event) {
-		// whatsmeow unwraps an edit and hands back the corrected text in the shape a
-		// new message arrives in, so nothing further down can tell the two apart. The
-		// contract has `message.edited` for this and M2 has yet to reach it: publishing
-		// it as a message received would either duplicate the original in the
-		// conversation or be deduplicated away, and either way the correction is lost
-		// and the acknowledgement spends the one redelivery it had.
-		return protocol.InboundMessage{}, "", false
-	}
 	chat, ok := chatOf(event)
 	if !ok || event.Info.ID == "" {
 		return protocol.InboundMessage{}, "", false
@@ -287,6 +278,21 @@ func (s *Session) receive(event *waEvents.Message) bool {
 		s.log.Debug().Str("message_id", event.Info.ID).
 			Msg("dropping a group message the client did not subscribe to")
 		return true
+	}
+
+	switch what := changeOf(event); what.verdict {
+	case publishChange:
+		// Not a message this account received, but something done to one it already has.
+		// It waits on the publisher exactly as a message does: WhatsApp redelivers what
+		// is not acknowledged, and a correction or a deletion nobody published is one
+		// the conversation never learns about.
+		return s.deliver(what.kind, what.payload)
+	case dropChange:
+		s.log.Info().Str("message_id", event.Info.ID).Msg(what.why)
+		return true
+	case withholdChange:
+		s.log.Warn().Str("message_id", event.Info.ID).Msg(what.why)
+		return false
 	}
 
 	message, failure, ok := inboundOf(event, s.bodyOf(s.ctx))
