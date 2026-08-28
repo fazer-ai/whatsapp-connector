@@ -24,7 +24,7 @@ func sharedBody(event *waEvents.Message) (body, bool) {
 	switch {
 	case message.GetLocationMessage() != nil:
 		pin := message.GetLocationMessage()
-		if pin.DegreesLatitude == nil || pin.DegreesLongitude == nil {
+		if !aPlace(pin.DegreesLatitude, pin.DegreesLongitude) {
 			// Both getters answer zero for a field that is not there, so a pin missing
 			// one is published at the equator or in the Gulf of Guinea -- somewhere the
 			// sender has never been, rendered as where they are. Said to be unrenderable
@@ -55,7 +55,7 @@ func sharedBody(event *waEvents.Message) (body, bool) {
 		// `name` because that is the only text the contract has for a pin, and because a
 		// client renders the two together.
 		moving := message.GetLiveLocationMessage()
-		if moving.DegreesLatitude == nil || moving.DegreesLongitude == nil {
+		if !aPlace(moving.DegreesLatitude, moving.DegreesLongitude) {
 			return body{}, false
 		}
 		content := protocol.Location(moving.GetDegreesLatitude(), moving.GetDegreesLongitude())
@@ -89,6 +89,22 @@ func sharedBody(event *waEvents.Message) (body, bool) {
 	default:
 		return body{}, false
 	}
+}
+
+// aPlace reports whether a pair of coordinates names somewhere on Earth.
+//
+// Three ways they do not, and the range check answers all three because every comparison
+// against a value that is not a number is false. A missing coordinate reads as zero and
+// puts the pin in the Gulf of Guinea. One out of range is a pin nobody can draw. And one
+// that is not a number at all is the worst of them: JSON has no way to write it, so the
+// event would fail to render, the acknowledgement would be withheld, and the message
+// would redeliver for as long as the session is up -- a loop inside the change that
+// exists to end loops.
+func aPlace(latitude, longitude *float64) bool {
+	if latitude == nil || longitude == nil {
+		return false
+	}
+	return *latitude >= -90 && *latitude <= 90 && *longitude >= -180 && *longitude <= 180
 }
 
 // cardShared renders one card.

@@ -254,12 +254,19 @@ func changeOf(event *waEvents.Message) change {
 //
 // A poll's result snapshot is not here, and reading the descriptor is what settled it:
 // unlike a vote and an added option it names no poll at all, so it is WhatsApp posting a
-// tally as its own bubble rather than changing one that exists.
+// tally as its own bubble rather than changing one that exists. An RSVP is here for the
+// mirror reason -- it names the event it answers, the same way a vote names its poll.
+//
+// The sticker resync is the odd one out: it marks nothing and it is not key material
+// either, it is a list of file hashes and a timestamp asking for a pack to be sent
+// again. It has nowhere better to be than the list of what is not a message.
 func marksAMessage(message *waE2E.Message) bool {
 	return message.GetPollUpdateMessage() != nil ||
 		message.GetPollAddOptionMessage() != nil ||
+		message.GetEncEventResponseMessage() != nil ||
 		message.GetKeepInChatMessage() != nil ||
 		message.GetPinInChatMessage() != nil ||
+		message.GetStickerSyncRmrMessage() != nil ||
 		movedAgain(message.GetLiveLocationMessage())
 }
 

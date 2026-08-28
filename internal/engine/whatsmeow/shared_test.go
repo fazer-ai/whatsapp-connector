@@ -1,6 +1,7 @@
 package whatsmeow
 
 import (
+	"math"
 	"testing"
 	"time"
 
@@ -96,6 +97,20 @@ func TestAPinMissingACoordinateIsNotPublishedAsAPlaceInTheGulfOfGuinea(t *testin
 		{"a live pin with no longitude", &waE2E.Message{LiveLocationMessage: &waE2E.LiveLocationMessage{
 			DegreesLatitude: proto.Float64(-23.5505),
 		}}},
+		{"a pin nobody can draw", &waE2E.Message{LocationMessage: &waE2E.LocationMessage{
+			DegreesLatitude:  proto.Float64(500),
+			DegreesLongitude: proto.Float64(-46.6333),
+		}}},
+		// The worst of the three, and the reason this is a range check rather than a nil
+		// check: JSON has no way to write one, so the event fails to render, the
+		// acknowledgement is withheld, and the message redelivers for as long as the
+		// session is up -- a loop inside the change that exists to end loops.
+		{"a pin at a coordinate that is not a number", &waE2E.Message{
+			LocationMessage: &waE2E.LocationMessage{
+				DegreesLatitude:  proto.Float64(math.NaN()),
+				DegreesLongitude: proto.Float64(math.Inf(1)),
+			},
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -362,6 +377,19 @@ func TestWhatIsNotAMessageIsAcknowledgedRatherThanShownToAnAgent(t *testing.T) {
 		}},
 		{"a message being pinned", &waE2E.Message{
 			PinInChatMessage: &waE2E.PinInChatMessage{Key: messageKey(subject)},
+		}},
+		{"an RSVP, which names the event it answers", &waE2E.Message{
+			EncEventResponseMessage: &waE2E.EncEventResponseMessage{
+				EventCreationMessageKey: messageKey(subject),
+				EncPayload:              []byte("cifrado"),
+				EncIV:                   make([]byte, 12),
+			},
+		}},
+		{"a sticker pack being asked for again", &waE2E.Message{
+			StickerSyncRmrMessage: &waE2E.StickerSyncRMRMessage{
+				Filehash:         []string{"abc"},
+				RequestTimestamp: proto.Int64(1755000000),
+			},
 		}},
 		// Every few seconds for as long as somebody is walking, if it were a message.
 		{"a further position in a live share", &waE2E.Message{
