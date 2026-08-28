@@ -72,13 +72,20 @@ func changeOf(event *waEvents.Message) change {
 	case event.Message.GetReactionMessage() != nil:
 		return reactionOf(event, event.Message.GetReactionMessage())
 
-	case event.Message.GetEncReactionMessage() != nil:
-		// A community announcement group encrypts its reactions under the secret of the
-		// message being reacted to. Reading one takes the socket and that secret, and
-		// the target it names is on the envelope rather than inside the plaintext --
-		// which is a slice of its own, not a branch of this one. Kept on the phone,
-		// because a build that learns to read them can still publish it.
-		return withholding("withholding an acknowledgement for a reaction encrypted under a message secret this build does not read")
+	case event.Message.GetEncReactionMessage() != nil,
+		event.Message.GetSecretEncryptedMessage().GetSecretEncType() == waE2E.SecretEncryptedMessage_MESSAGE_EDIT:
+		// Sealed under the secret of the message it is about, which is how a community
+		// announcement group carries a reaction and how WhatsApp carries some
+		// corrections. Reading either takes the socket and that secret, and the target
+		// is on the envelope rather than inside the plaintext -- a slice of its own, not
+		// a branch of this one. Kept on the phone, because a build that learns to read
+		// them can still publish it; ahead of the edit arm, because a sealed correction
+		// carries the same attribute an ordinary one does and would otherwise be taken
+		// apart looking for a key that is not there.
+		//
+		// Comparing the type is safe on a nil message because MESSAGE_EDIT is not the
+		// zero value of that enum -- UNKNOWN is.
+		return withholding("withholding an acknowledgement for a change encrypted under a message secret this build does not read")
 
 	case event.IsEdit,
 		event.Info.Edit == waTypes.EditAttributeMessageEdit,
@@ -207,7 +214,7 @@ func theCorrection(event *waEvents.Message) (target string, corrected *waE2E.Mes
 		// whole of the order between two corrections of one message made in the same
 		// second. Truncated, the client is left with a tie and arrival to break it,
 		// which is the thing that was out of order to begin with.
-		return event.Info.ID, event.Message, stampedAt(theRawEdit(event.RawMessage).GetTimestampMS(), event)
+		return event.Info.ID, event.Message, stampedAt(theResentCorrection(event).GetTimestampMS(), event)
 	}
 	return "", nil, 0
 }
@@ -227,15 +234,20 @@ func resentEdit(event *waEvents.Message) bool {
 	return event.SourceWebMsg != nil && event.Info.ID != event.SourceWebMsg.GetKey().GetID()
 }
 
-// theRawEdit is the protocol message a correction was taken out of, read back off the
-// raw message the parser kept. Both shapes are read because both are shapes that parser
-// accepts: it unwraps an EditedMessage envelope before it looks, and it looks at what is
-// there when there is no envelope.
-func theRawEdit(raw *waE2E.Message) *waE2E.ProtocolMessage {
-	if wrapped := raw.GetEditedMessage().GetMessage(); wrapped != nil {
-		return wrapped.GetProtocolMessage()
-	}
-	return raw.GetProtocolMessage()
+// theResentCorrection is the protocol message a correction was taken out of, read back
+// off the raw message the parser kept.
+//
+// The unwrapping is the library's own, run again on a copy, because the parser unwraps
+// before it looks and the envelopes it goes through are its list to grow: a correction
+// the account made from another device arrives inside a DeviceSentMessage, one in a
+// disappearing chat inside an EphemeralMessage. A hand-written copy of that list would
+// drift, and what drifts off is the clock -- the correction still publishes, at the
+// stanza's second instead of its own millisecond.
+//
+// The copy is what keeps this from touching the event: UnwrapRaw writes as it reads.
+func theResentCorrection(event *waEvents.Message) *waE2E.ProtocolMessage {
+	replayed := (&waEvents.Message{RawMessage: event.RawMessage}).UnwrapRaw()
+	return replayed.Message.GetProtocolMessage()
 }
 
 // correctedContent renders what a message says now that it has been corrected.
@@ -279,6 +291,14 @@ func revokeOf(event *waEvents.Message) change {
 	// Who performed the deletion, not who wrote what was deleted. A group admin removing
 	// somebody else's message is the account's own act when the account is that admin,
 	// and `sender` is what says who it was in every other case.
+	//
+	// A channel cannot answer it at all. whatsmeow does not work out `from_me` for a
+	// newsletter stanza -- it says so, in as many words, where it fills the rest of the
+	// source in -- so the account deleting its own post from another device is
+	// indistinguishable here from the channel's owner deleting one. Both are published
+	// as the contact's, because the two mistakes are not the same size: the client keeps
+	// the text and the files of a contact's deletion and destroys them for its own, so
+	// guessing `self` would take an agent's copy of a post nobody asked it to.
 	by := protocol.RevokedByContact
 	if event.Info.IsFromMe {
 		by = protocol.RevokedBySelf

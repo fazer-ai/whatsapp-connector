@@ -144,6 +144,16 @@ func TestAnEditThatCameBackThroughAResendIsStillPublished(t *testing.T) {
 		// The parser takes this one apart too, and raises no flag doing it. Read as an
 		// ordinary message it lands under the id of the message it was correcting.
 		{"with the envelope already off it", &waE2E.Message{ProtocolMessage: correction}},
+		// One the account made from another device. The parser goes through this
+		// envelope before it looks for the edit, and so must anything reading the raw
+		// message back for the clock the parser left behind.
+		{"inside the envelope another of the account's devices sent it in", &waE2E.Message{
+			DeviceSentMessage: &waE2E.DeviceSentMessage{Message: &waE2E.Message{
+				EditedMessage: &waE2E.FutureProofMessage{
+					Message: &waE2E.Message{ProtocolMessage: correction},
+				},
+			}},
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -376,6 +386,20 @@ func TestWhatALaterBuildCouldPublishIsKeptOnThePhone(t *testing.T) {
 				DegreesLongitude: proto.Float64(-46.6),
 			}}
 			return editEvent(carrier, subject, corrected, 1755000009000)
+		}},
+		{"a correction encrypted under a message secret", func() *waEvents.Message {
+			event := textMessage(carrier, "")
+			// It carries the attribute an ordinary correction carries, so nothing but
+			// the sealed body separates the two: taken apart looking for a key it does
+			// not have, it is acknowledged away and the correction is gone for good.
+			event.Info.Edit = waTypes.EditAttributeMessageEdit
+			event.Message = &waE2E.Message{SecretEncryptedMessage: &waE2E.SecretEncryptedMessage{
+				TargetMessageKey: messageKey(subject),
+				SecretEncType:    waE2E.SecretEncryptedMessage_MESSAGE_EDIT.Enum(),
+				EncPayload:       []byte("cifrado"),
+				EncIV:            make([]byte, 12),
+			}}
+			return event
 		}},
 		{"a reaction encrypted under a message secret", func() *waEvents.Message {
 			event := textMessage(carrier, "")
