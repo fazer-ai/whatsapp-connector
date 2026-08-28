@@ -31,6 +31,16 @@ func (s *Session) receipt(event *waEvents.Receipt) bool {
 			Msg("dropping a receipt the contract does not name")
 		return true
 	}
+	if published.Chat.Kind == protocol.AddressGroup && !s.wantsGroups() {
+		// The same boundary the message path draws, and for the same reason: the client
+		// asked for direct chats only, so it never got the messages these are about and
+		// could not apply them if it did. Acknowledged rather than withheld, because
+		// nobody is ever going to want this one and withholding would have WhatsApp
+		// redeliver every group receipt the account gets for as long as it is up.
+		s.log.Debug().Str("receipt", string(event.Type)).
+			Msg("dropping a group receipt the client did not subscribe to")
+		return true
+	}
 	if s.publisherStalled() {
 		// A publisher that just took the whole budget and answered nothing. Waiting for
 		// it again is what puts a grouped receipt past the node watchdog, and the answer
@@ -52,9 +62,13 @@ func (s *Session) receipt(event *waEvents.Receipt) bool {
 // costs one wait per budget rather than one per receipt, and a publisher that comes back
 // is asked again as soon as the window is out. Bounded that way rather than by a flag,
 // because a flag only cleared by a success is never cleared: nothing would try again.
+// Measured against a monotonic base rather than the wall clock. UnixNano drops Go's
+// monotonic reading, so a host whose clock steps backwards -- an NTP correction, a
+// suspend, a container's clock being set -- would leave the deadline ahead for as long
+// as wall time took to catch up, and every receipt would be withheld until it did.
 func (s *Session) publisherStalled() bool {
 	until := s.stalledUntil.Load()
-	return until != 0 && time.Now().UnixNano() < until
+	return until != 0 && time.Since(sinceStart) < time.Duration(until)
 }
 
 func (s *Session) publisherAnswered(delivered bool) {
@@ -62,8 +76,12 @@ func (s *Session) publisherAnswered(delivered bool) {
 		s.stalledUntil.Store(0)
 		return
 	}
-	s.stalledUntil.Store(time.Now().Add(s.deliverWait).UnixNano())
+	s.stalledUntil.Store(int64(time.Since(sinceStart) + s.deliverWait))
 }
+
+// sinceStart is what the window is measured from: a reading taken once, carrying the
+// monotonic clock, so every elapsed time derived from it is monotonic too.
+var sinceStart = time.Now()
 
 // receiptOf maps whatsmeow's receipt onto the contract's four, and reports whether the
 // contract has a name for it at all.
@@ -97,7 +115,7 @@ func receiptOf(event *waEvents.Receipt) (protocol.MessageReceipt, bool) {
 	if !named || len(event.MessageIDs) == 0 {
 		return protocol.MessageReceipt{}, false
 	}
-	chat, addressable := addressOf(event.Chat)
+	chat, addressable := addressOf(receiptChatJID(event))
 	if !addressable {
 		return protocol.MessageReceipt{}, false
 	}
@@ -121,6 +139,24 @@ func receiptOf(event *waEvents.Receipt) (protocol.MessageReceipt, bool) {
 		}
 	}
 	return published, true
+}
+
+// receiptChatJID is the chat a receipt belongs to, which is not always the one on it.
+//
+// A message somebody sent through a broadcast list is published under the direct chat
+// with them rather than under the list, because that is where the recipient's own phone
+// shows it -- and a receipt published under the list would be about a message the client
+// filed somewhere else, so it could never be applied.
+//
+// The rule is the same and the field is not, which is why this is not chatOf. On a
+// message the other party is the sender; on a receipt the sender is this account's own
+// device and whatsmeow puts the peer in BroadcastListOwner, a field that exists for
+// exactly this case and is empty in every other.
+func receiptChatJID(event *waEvents.Receipt) waTypes.JID {
+	if !event.BroadcastListOwner.IsEmpty() {
+		return event.BroadcastListOwner
+	}
+	return event.Chat
 }
 
 var receiptKinds = map[waTypes.ReceiptType]protocol.ReceiptKind{

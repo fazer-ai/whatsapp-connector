@@ -434,3 +434,87 @@ func TestAReceiptIsPublishedAgainOnceThePublisherAnswers(t *testing.T) {
 		t.Error("a publisher that answered is still recorded as stalled")
 	}
 }
+
+// The boundary the message path already draws. A client that asked for direct chats only
+// never got the group's messages, so a receipt about one is an event it could not apply
+// even if it wanted to -- and withholding it would have WhatsApp redeliver every group
+// receipt the account gets for as long as the session is up.
+func TestAGroupReceiptIsDroppedWhenTheClientAskedForDirectChatsOnly(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.deliverWait = 50 * time.Millisecond
+	event := receiptEvent(waTypes.ReceiptTypeRead, "3EB0RECEIPT")
+	event.Chat = waTypes.NewJID("120363041234567890", waTypes.GroupServer)
+	event.IsGroup = true
+
+	acknowledged := make(chan bool, 1)
+	go func() { acknowledged <- session.receipt(event) }()
+	select {
+	case emission := <-session.Events():
+		t.Fatalf("a group receipt reached a direct-only client: %s", emission.Payload)
+	case got := <-acknowledged:
+		if !got {
+			t.Fatal("a group receipt nobody wants was left for WhatsApp to send again")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the handler never came back")
+	}
+}
+
+// A message sent through a broadcast list is published under the direct chat with
+// whoever sent it, because that is where the recipient's own phone shows it. A receipt
+// published under the list would be about a message the client filed somewhere else.
+//
+// The field is not the one the message path reads: there the other party is the sender,
+// and here the sender is this account's own device.
+func TestABroadcastReceiptIsPublishedUnderTheChatItsMessageIsIn(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	event := receiptEvent(waTypes.ReceiptTypeReadSelf, "3EB0RECEIPT")
+	event.Chat = waTypes.NewJID("5511999990001", waTypes.BroadcastServer)
+	event.Sender = waTypes.NewJID("5511999990001", waTypes.DefaultUserServer)
+	event.IsFromMe = true
+	event.BroadcastListOwner = waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)
+
+	payload := decode(t, receiptPublishedBy(t, session, event).Payload)
+	chat, _ := payload["chat"].(map[string]any)
+	if chat["kind"] != "phone" || chat["id"] != "5511999990002" {
+		t.Errorf("the receipt is filed under %v, and its message is in the direct chat with 5511999990002", chat)
+	}
+}
+
+// The window is an interval, and an interval taken off the wall clock is not one: a host
+// whose clock steps backwards -- an NTP correction, a suspend, a container's clock being
+// set -- would hold the deadline ahead for as long as wall time took to catch up, and
+// every receipt would be withheld until it did.
+//
+// What is read is the deadline itself, because that is where the difference is visible
+// without moving the host's clock: an elapsed time since this process started is a
+// handful of milliseconds, and a wall-clock stamp is nineteen digits.
+func TestThePublisherWindowIsMeasuredOnAClockThatOnlyMovesForward(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.deliverWait = 60 * time.Millisecond
+
+	session.publisherAnswered(false)
+	if !session.publisherStalled() {
+		t.Fatal("a publisher that answered nothing is not recorded as stalled")
+	}
+	// Any wall-clock reading in nanoseconds is past 1.5e18 and has been since 2017. An
+	// elapsed time cannot reach it without this process having run for fifty years.
+	if until := session.stalledUntil.Load(); until > int64(time.Hour) {
+		t.Errorf("the deadline is %d, which is a wall-clock stamp rather than an elapsed time", until)
+	}
+
+	// And it still runs out, which is what keeps the gate from being a one-way door.
+	deadline := time.Now().Add(2 * time.Second)
+	for session.publisherStalled() {
+		if time.Now().After(deadline) {
+			t.Fatal("the window never ran out")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
