@@ -265,19 +265,19 @@ func presencePublishedBy(t *testing.T, session *Session, want protocol.EventType
 }
 
 // The decision one layer down, and the one the rest of this file would be undone by.
-// emit waits for room in the inbox, and waiting is the thing presence must not do: a
-// backlog holds WhatsApp's node handler for as long as the publisher is down and then
-// delivers a `composing` about a minute that has passed.
+// The inbox waits for room, and waiting is the thing presence must not do: a full one
+// holds WhatsApp's node handler for as long as the publisher is down and then delivers a
+// `composing` about a minute that has passed.
 //
-// The inbox is filled first, so what is measured is the full state rather than a race
-// for it.
-func TestTypingIsDroppedRatherThanQueuedBehindABacklog(t *testing.T) {
+// The inbox is filled to refusal first, so what is read is the full state rather than a
+// race for it.
+func TestTypingDoesNotWaitOnAnInboxThatIsFull(t *testing.T) {
 	t.Parallel()
 
 	session, _ := newTestSession(t, "5511999990001")
 	// Filled until the channel itself refuses, rather than by counting to inboxDepth:
-	// the pump takes one out and blocks handing it on, so a count leaves a slot free and
-	// the blocking path would not block either.
+	// the forwarder takes one out and blocks handing it on, so a count would leave a slot
+	// free and a path that waits for room would not have to wait.
 	filled := 0
 	for {
 		select {
@@ -308,7 +308,7 @@ func TestTypingIsDroppedRatherThanQueuedBehindABacklog(t *testing.T) {
 			t.Error("a typing indicator was left for WhatsApp to send again")
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("a typing indicator waited for room in a full inbox, holding WhatsApp's node handler")
+		t.Fatal("a typing indicator waited on a full inbox, holding WhatsApp's node handler")
 	}
 }
 
@@ -338,20 +338,17 @@ func TestATypingStateThisBuildHasNoNameForIsNotRoundedToTheNearestOne(t *testing
 	}
 }
 
-// A stop is what clears a typing indicator, and there is no event after a stop. Dropped
-// behind the typing it stops, it leaves a client showing somebody typing with nothing
-// coming to correct it -- so the two states do not take the same path: the stop is
-// offered whenever there is any room at all, and the typing only while the publisher is
-// keeping up.
-func TestAStopIsOfferedWhereTheTypingItStopsIsNot(t *testing.T) {
+// A stop is what clears a typing indicator, and there is no event after a stop. Queued
+// behind the typing it stops it is what a full inbox drops, and the client is left
+// showing somebody typing with nothing coming to correct it. On the board it replaces
+// that typing instead, keyed by the chat, so what is waiting is always the last thing
+// the chat did.
+func TestAStopReplacesTheTypingItStops(t *testing.T) {
 	t.Parallel()
 
 	session, _ := newTestSession(t, "5511999990001")
 	session.picked = make(chan struct{}, 1)
-	// Two fillers, because the pump takes one out and blocks handing it on. The second
-	// is what makes the inbox non-empty -- the publisher not keeping up -- and it also
-	// stops the pump competing for what is queued after it.
-	blockThePump(t, session, 2)
+	blockTheForwarder(t, session)
 
 	source := waTypes.MessageSource{
 		Chat:   waTypes.NewJID("5511999990002", waTypes.DefaultUserServer),
@@ -360,21 +357,36 @@ func TestAStopIsOfferedWhereTheTypingItStopsIsNot(t *testing.T) {
 	session.chatPresence(&waEvents.ChatPresence{MessageSource: source, State: waTypes.ChatPresenceComposing})
 	session.chatPresence(&waEvents.ChatPresence{MessageSource: source, State: waTypes.ChatPresencePaused})
 
-	states := []string{}
-	for _, emission := range queuedIn(session) {
-		if emission.Type != protocol.EventChatPresence {
-			continue
-		}
-		var body struct {
-			State string `json:"state"`
-		}
-		if err := json.Unmarshal(emission.Payload, &body); err != nil {
-			t.Fatalf("unmarshal: %v", err)
-		}
-		states = append(states, body.State)
+	waiting := onBoard(session)
+	if len(waiting) != 1 {
+		t.Fatalf("%d presences are waiting for one chat, and only its last state should be", len(waiting))
 	}
-	if len(states) != 1 || states[0] != "paused" {
-		t.Errorf("what was queued behind a publisher already behind is %v, and only the stop should have been", states)
+	if state := stateOf(t, waiting[0]); state != "paused" {
+		t.Errorf("what is waiting is a %s, and the chat's last state was the stop", state)
+	}
+	if waiting[0].Expires != nil {
+		t.Error("a stop was posted as something that expires")
+	}
+}
+
+// Two chats are two states, not one: the board is keyed by chat, so a busy conversation
+// does not evict a quiet one's stop.
+func TestOneChatsTypingDoesNotDisplaceAnothers(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.picked = make(chan struct{}, 1)
+	blockTheForwarder(t, session)
+
+	for _, phone := range []string{"5511999990002", "5511999990003"} {
+		jid := waTypes.NewJID(phone, waTypes.DefaultUserServer)
+		session.chatPresence(&waEvents.ChatPresence{
+			MessageSource: waTypes.MessageSource{Chat: jid, Sender: jid},
+			State:         waTypes.ChatPresenceComposing,
+		})
+	}
+	if waiting := onBoard(session); len(waiting) != 2 {
+		t.Errorf("%d presences are waiting, and two chats were typing", len(waiting))
 	}
 }
 
@@ -387,9 +399,7 @@ func TestAMomentThatWentStaleIsNotPublishedLate(t *testing.T) {
 	now := time.Duration(0)
 	session.elapsed = func() time.Duration { return now }
 	session.picked = make(chan struct{}, 1)
-	// One filler, so the pump is holding it and not competing for what follows. The
-	// inbox itself is left empty, which is what the typing needs to be accepted at all.
-	blockThePump(t, session, 1)
+	blockTheForwarder(t, session)
 
 	source := waTypes.MessageSource{
 		Chat:   waTypes.NewJID("5511999990002", waTypes.DefaultUserServer),
@@ -397,68 +407,65 @@ func TestAMomentThatWentStaleIsNotPublishedLate(t *testing.T) {
 	}
 	session.chatPresence(&waEvents.ChatPresence{MessageSource: source, State: waTypes.ChatPresenceComposing})
 
-	queued := queuedIn(session)
-	if len(queued) != 1 {
-		t.Fatalf("%d events were queued, want the typing", len(queued))
+	waiting := onBoard(session)
+	if len(waiting) != 1 {
+		t.Fatalf("%d presences are waiting, want the typing", len(waiting))
 	}
-	typing := queued[0]
+	typing := waiting[0]
 	if typing.Expires == nil {
-		t.Fatal("a typing indicator was queued with no sense of when it stops being true")
+		t.Fatal("a typing indicator was posted with no sense of when it stops being true")
 	}
 	if typing.Expires() <= 0 {
-		t.Error("a typing indicator was stale the moment it was queued")
+		t.Error("a typing indicator was stale the moment it was posted")
 	}
 	now = presenceLife
 	if typing.Expires() > 0 {
 		t.Error("a typing indicator is still worth publishing after its whole life")
 	}
-
-	// And a stop never goes stale: it states something that stays true.
-	session.chatPresence(&waEvents.ChatPresence{MessageSource: source, State: waTypes.ChatPresencePaused})
-	stops := queuedIn(session)
-	if len(stops) != 1 {
-		t.Fatalf("%d events were queued, want the stop", len(stops))
-	}
-	if stops[0].Expires != nil {
-		t.Error("a stop was queued as something that expires")
-	}
 }
 
-// blockThePump parks the forwarding goroutine on an emission nobody is reading, so what
-// is queued after this stays in the inbox for the test to look at rather than being
+// blockTheForwarder parks the forwarding goroutine on an emission nobody is reading, so
+// what is posted after this stays where the test can look at it rather than being
 // carried off mid-assertion.
 //
-// It waits on the pump saying it took one rather than on a clock saying it probably has:
-// a poll that gives up after a fixed spell fails on a loaded machine over a session that
-// is behaving perfectly.
-func blockThePump(t *testing.T, session *Session, fillers int) {
+// It waits on the forwarder saying it took one rather than on a clock saying it probably
+// has: a poll that gives up after a fixed spell fails on a loaded machine over a session
+// that is behaving perfectly.
+func blockTheForwarder(t *testing.T, session *Session) {
 	t.Helper()
 
-	for range fillers {
-		select {
-		case session.inbox <- engine.Emission{Type: protocol.EventSessionState, Payload: []byte(`{}`)}:
-		case <-time.After(2 * time.Second):
-			t.Fatal("the inbox would not take a filler")
-		}
+	select {
+	case session.inbox <- engine.Emission{Type: protocol.EventSessionState, Payload: []byte(`{}`)}:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the inbox would not take a filler")
 	}
 	select {
 	case <-session.picked:
 	case <-time.After(5 * time.Second):
-		t.Fatal("the forwarder never took anything off the inbox")
+		t.Fatal("the forwarder never took anything to hand on")
 	}
 }
 
-func queuedIn(session *Session) []engine.Emission {
-	queued := []engine.Emission{}
-	for {
-		select {
-		case emission := <-session.inbox:
-			queued = append(queued, emission)
-			continue
-		default:
-		}
-		return queued
+func onBoard(session *Session) []engine.Emission {
+	session.boardMu.Lock()
+	defer session.boardMu.Unlock()
+	waiting := make([]engine.Emission, 0, len(session.board))
+	for _, emission := range session.board {
+		waiting = append(waiting, emission)
 	}
+	return waiting
+}
+
+func stateOf(t *testing.T, emission engine.Emission) string {
+	t.Helper()
+
+	var body struct {
+		State string `json:"state"`
+	}
+	if err := json.Unmarshal(emission.Payload, &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	return body.State
 }
 
 // The freshness check is only as good as the wait after it. An unbounded handoff passes
@@ -510,41 +517,30 @@ func TestAMomentIsNotHeldWaitingForAReaderThatIsBusy(t *testing.T) {
 	}
 }
 
-// Somebody being online is a fact that holds until they go away, not a moment.
-// Classified with the typing it perishes, and then an `unavailable` already queued
-// outlives the newer `available` that was dropped for the same backlog: a client left
+// Somebody being online is a fact that holds until they go away, not a moment. Neither
+// state expires, and the newer one replaces the older on the board rather than queueing
+// behind it: an `unavailable` that outlived the `available` after it leaves a client
 // showing somebody offline who is not, with nothing coming to correct it.
-func TestAnAvailabilityIsAFactRatherThanAMoment(t *testing.T) {
+func TestAnAvailabilityIsAFactAndTheLastOneWins(t *testing.T) {
 	t.Parallel()
 
 	session, _ := newTestSession(t, "5511999990001")
 	session.picked = make(chan struct{}, 1)
-	blockThePump(t, session, 2)
+	blockTheForwarder(t, session)
 
 	from := waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)
 	session.presence(&waEvents.Presence{From: from, Unavailable: true})
 	session.presence(&waEvents.Presence{From: from})
 
-	states := []string{}
-	for _, emission := range queuedIn(session) {
-		if emission.Type != protocol.EventPresenceUpdate {
-			continue
-		}
-		if emission.Expires != nil {
-			t.Error("an availability was queued as something that expires")
-		}
-		var body struct {
-			State string `json:"state"`
-		}
-		if err := json.Unmarshal(emission.Payload, &body); err != nil {
-			t.Fatalf("unmarshal: %v", err)
-		}
-		states = append(states, body.State)
+	waiting := onBoard(session)
+	if len(waiting) != 1 {
+		t.Fatalf("%d presences are waiting for one party, and only its last state should be", len(waiting))
 	}
-	// Both, in order, so the last one is what the client ends up with. Either dropped
-	// and the client's last word is the wrong one.
-	if len(states) != 2 || states[0] != "unavailable" || states[1] != "available" {
-		t.Errorf("what reached the queue is %v, want the going away and the coming back", states)
+	if waiting[0].Expires != nil {
+		t.Error("an availability was posted as something that expires")
+	}
+	if state := stateOf(t, waiting[0]); state != "available" {
+		t.Errorf("what is waiting says %s, and the party's last state was the coming back", state)
 	}
 }
 

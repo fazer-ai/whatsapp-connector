@@ -22,17 +22,20 @@ import (
 // and the state that would have corrected it -- the pause, or the message itself -- was
 // already published while the stale one was being retried.
 //
-// So these publish and acknowledge, whatever happens -- and never through emit, which
-// waits for room in the inbox. Waiting is the thing this must not do: a backlog would
-// hold WhatsApp's node handler for as long as the publisher is down and then deliver a
+// So these publish and acknowledge, whatever happens -- and never through the inbox,
+// which waits for room. Waiting is the thing this must not do: a backlog would hold
+// WhatsApp's node handler for as long as the publisher is down and then deliver a
 // `composing` about a minute that has passed.
 //
-// Which of the two lossy paths depends on whether the state expires. `composing`,
-// `recording` and `available` are moments and go through offerFresh; `paused` and
-// `unavailable` stay true once they are true, and go through offer. The split is not a
-// nicety: a stop is what clears a typing indicator, and there is no event after a stop,
-// so a stop dropped behind the typing it stops is a client left showing somebody typing
-// with nothing coming to correct it.
+// They go on the board instead, keyed by the chat, so the newest state of a chat
+// replaces whatever that chat had waiting. A queue is the wrong shape here: what matters
+// is the last thing somebody did, and a FIFO keeps the first. Behind a backlog a queued
+// `composing` outlives the `paused` there was no room for, and there is no event after a
+// stop, so the client is left showing somebody typing with nothing coming.
+//
+// The `composing` and `recording` also carry how long they are worth publishing for,
+// because they describe a moment; the `paused` does not, and neither does an
+// availability, because both stay true until something says otherwise.
 func (s *Session) chatPresence(event *waEvents.ChatPresence) bool {
 	chat, addressable := addressOf(event.Chat)
 	if !addressable {
@@ -56,11 +59,12 @@ func (s *Session) chatPresence(event *waEvents.ChatPresence) bool {
 	if sender.Phone != "" || sender.LID != "" {
 		published.Sender = &sender
 	}
+	life := presenceLife
 	if state == protocol.TypingPaused {
-		s.offer(protocol.EventChatPresence, published)
-	} else {
-		s.offerFresh(protocol.EventChatPresence, published)
+		life = 0
 	}
+	s.post(string(protocol.EventChatPresence)+":"+string(chat.Kind)+":"+chat.ID,
+		protocol.EventChatPresence, published, life)
 	return true
 }
 
@@ -83,13 +87,13 @@ func (s *Session) presence(event *waEvents.Presence) bool {
 		seen := event.LastSeen.UnixMilli()
 		published.LastSeen = &seen
 	}
-	// Both states through offer, and neither perishes. Somebody being online is a fact
-	// that holds until they go away, not a moment -- classifying it with the typing was
-	// the mistake, and it had a cost: an `unavailable` already queued while the newer
-	// `available` was dropped for the same backlog leaves a client showing somebody
-	// offline who is not, with nothing coming to correct it. Queued behind each other
-	// they arrive in order and the last one wins.
-	s.offer(protocol.EventPresenceUpdate, published)
+	// Neither state perishes. Somebody being online is a fact that holds until they go
+	// away, not a moment -- classifying it with the typing was the mistake, and it had a
+	// cost: an `unavailable` already queued while the newer `available` was dropped for
+	// the same backlog leaves a client showing somebody offline who is not. On the board
+	// the later one replaces the earlier, which is the same answer without the ordering.
+	s.post(string(protocol.EventPresenceUpdate)+":"+party.Phone+":"+party.LID,
+		protocol.EventPresenceUpdate, published, 0)
 	return true
 }
 

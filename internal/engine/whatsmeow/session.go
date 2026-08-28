@@ -153,6 +153,20 @@ type Session struct {
 	// the same reason as deliverWait, and for no other.
 	handoffWait time.Duration
 
+	// board holds the newest presence per chat that has not reached the publisher yet,
+	// and ready wakes the forwarder for it.
+	//
+	// A queue is the wrong shape for presence and every fix short of this one was a
+	// narrower version of the same bug: what matters is the last thing somebody did, and
+	// a FIFO preserves the first. Behind a backlog a queued `composing` outlives the
+	// `paused` dropped for want of room, and there is no event after a stop -- so the
+	// client is left showing somebody typing with nothing coming. Keyed by chat, the
+	// stop replaces the typing it stops instead of queueing behind it.
+	board    map[string]engine.Emission
+	boardMu  sync.Mutex
+	boardCap int
+	ready    chan struct{}
+
 	// picked, when it is set, receives once for every emission the forwarder takes off
 	// the inbox, before it tries to hand it on. A seam so a test can know the pump is
 	// parked rather than sleeping until it probably is.
@@ -295,6 +309,9 @@ func newSession(
 		storeLimit:   bindTimeout,
 		deliverWait:  deliverTimeout,
 		handoffWait:  perishableHandoff,
+		board:        make(map[string]engine.Emission),
+		boardCap:     boardDepth,
+		ready:        make(chan struct{}, 1),
 		downloadWait: downloadTimeout,
 		uploadWait:   uploadTimeout,
 	}
@@ -1385,49 +1402,26 @@ func (s *Session) forward() {
 		select {
 		case <-s.done:
 			return
-		case emission := <-s.inbox:
-			if s.picked != nil {
-				// Taken, and about to be handed on. A test that needs the pump parked
-				// here rather than racing it reads this.
-				s.picked <- struct{}{}
-			}
-			if emission.Expires == nil {
-				select {
-				case s.events <- emission:
-				case <-s.done:
+		case <-s.ready:
+			// Everything the board is holding, newest per chat, in no promised order
+			// between chats. Presence is about who is doing what, so one chat's typing
+			// arriving before another's says nothing wrong.
+			for _, emission := range s.takeBoard() {
+				if !s.handOn(emission) {
 					return
 				}
-				continue
 			}
-			if emission.Expires() <= 0 {
-				// A moment that has passed. Publishing it now would state as current
-				// something the session already knows is not, and the correction was
-				// dropped behind the same backlog that made this late.
-				s.log.Debug().Str("type", string(emission.Type)).
-					Msg("dropping a transient event that waited too long to still be true")
-				continue
-			}
-			// Bounded, because the check above is only as good as the wait after it: an
-			// unbounded handoff would pass the check and then sit on a reader that is
-			// busy, and what came out would be exactly the stale event the check is for.
-			handoff := time.NewTimer(s.handoffWait)
-			select {
-			case s.events <- emission:
-			case <-handoff.C:
-				s.log.Debug().Str("type", string(emission.Type)).
-					Msg("dropping a transient event the reader was not there for")
-			case <-s.done:
-				handoff.Stop()
+		case emission := <-s.inbox:
+			if !s.handOn(emission) {
 				return
 			}
-			handoff.Stop()
 		}
 	}
 }
 
 // presenceLife is how long a moment is worth publishing for. Past it the session knows
-// more than the event does: whatever came next was either published or dropped for the
-// same backlog, and a client shown the old one has no way to learn better.
+// more than the event does: whatever came next either replaced it on the board or was
+// published, and a client shown the old one has no way to learn better.
 const presenceLife = 10 * time.Second
 
 // perishableHandoff bounds how long a moment waits on a reader that is busy. Short,
@@ -1435,41 +1429,57 @@ const presenceLife = 10 * time.Second
 // sees it, and a moment is worth nothing stale.
 const perishableHandoff = time.Second
 
-// offer publishes without ever waiting for room, and drops what does not fit.
-//
-// The blocking emit is right for everything that has to arrive: the inbox filling means
-// the publisher is behind, and holding the node handler until it catches up is how a
-// message survives. A moment is the opposite -- the wait itself holds WhatsApp's node
-// handler for as long as the publisher is down, and what comes out the other side is a
-// fact about a minute that has passed.
-//
-// For a state that stays true once it is true -- somebody stopped typing, somebody went
-// away -- that is the whole of it: offered whenever there is any room at all, and never
-// stale, because nothing about it expires.
-func (s *Session) offer(eventType protocol.EventType, payload any) {
-	s.offerWithin(eventType, payload, 0)
-}
+// boardDepth bounds how many chats may have presence waiting at once. Reached only by a
+// publisher that has stopped answering while a great many chats are active, and then the
+// newest states of the chats already on it are worth more than a new chat's first one.
+const boardDepth = 512
 
-// offerFresh is the same for a state that is only true while it lasts, and it is
-// stricter in both directions: it goes in only while the publisher is keeping up, and it
-// is thrown away rather than published if it goes stale waiting.
+// handOn gives one emission to the reader, and reports whether the forwarder should
+// carry on.
 //
-// The two rules answer the sequence a single one cannot. A typing indicator queued
-// behind a backlog outlives the stop that would clear it, because the stop is dropped
-// for the same full inbox and there is no event after a stop. Requiring an empty inbox
-// means the typing was accepted only while the publisher was keeping up; the freshness
-// means that if it then stopped keeping up, the typing is discarded rather than
-// published late. For both to fail, the publisher would have to be keeping up and not.
-func (s *Session) offerFresh(eventType protocol.EventType, payload any) {
-	if len(s.inbox) > 0 {
-		s.log.Debug().Str("type", string(eventType)).
-			Msg("dropping a transient event the publisher was already behind on")
-		return
+// A moment gets two things a fact does not: it is dropped if it went stale waiting, and
+// its handoff is bounded. The second is what makes the first mean anything -- an
+// unbounded handoff would pass the freshness check and then sit on a reader that is
+// busy, and what came out would be exactly the stale event the check is for.
+func (s *Session) handOn(emission engine.Emission) bool {
+	if s.picked != nil {
+		// Taken, and about to be handed on. A test that needs the forwarder parked here
+		// rather than racing it reads this.
+		s.picked <- struct{}{}
 	}
-	s.offerWithin(eventType, payload, presenceLife)
+	if emission.Expires == nil {
+		select {
+		case s.events <- emission:
+			return true
+		case <-s.done:
+			return false
+		}
+	}
+	if emission.Expires() <= 0 {
+		s.log.Debug().Str("type", string(emission.Type)).
+			Msg("dropping a transient event that waited too long to still be true")
+		return true
+	}
+	handoff := time.NewTimer(s.handoffWait)
+	defer handoff.Stop()
+	select {
+	case s.events <- emission:
+	case <-handoff.C:
+		s.log.Debug().Str("type", string(emission.Type)).
+			Msg("dropping a transient event the reader was not there for")
+	case <-s.done:
+		return false
+	}
+	return true
 }
 
-func (s *Session) offerWithin(eventType protocol.EventType, payload any, life time.Duration) {
+// post puts a presence on the board under the chat it is about, replacing whatever that
+// chat had waiting, and wakes the forwarder.
+//
+// Never waits, which is the whole reason presence does not go through the inbox: waiting
+// would hold WhatsApp's node handler for as long as the publisher is down, and what came
+// out the other side would be a fact about a minute that has passed.
+func (s *Session) post(key string, eventType protocol.EventType, payload any, life time.Duration) {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		s.log.Error().Err(err).Str("type", string(eventType)).Msg("failed to render an event payload")
@@ -1480,12 +1490,37 @@ func (s *Session) offerWithin(eventType protocol.EventType, payload any, life ti
 		perishes := s.since() + life
 		emission.Expires = func() time.Duration { return perishes - s.since() }
 	}
-	select {
-	case s.inbox <- emission:
-	default:
+
+	s.boardMu.Lock()
+	_, waiting := s.board[key]
+	if !waiting && len(s.board) >= s.boardCap {
+		s.boardMu.Unlock()
 		s.log.Debug().Str("type", string(eventType)).
-			Msg("dropping a transient event the publisher had no room for")
+			Msg("dropping presence for a chat the board had no room for")
+		return
 	}
+	s.board[key] = emission
+	s.boardMu.Unlock()
+
+	select {
+	case s.ready <- struct{}{}:
+	default:
+		// Already awake. One signal is enough: the forwarder takes the whole board.
+	}
+}
+
+func (s *Session) takeBoard() []engine.Emission {
+	s.boardMu.Lock()
+	defer s.boardMu.Unlock()
+	if len(s.board) == 0 {
+		return nil
+	}
+	taken := make([]engine.Emission, 0, len(s.board))
+	for key, emission := range s.board {
+		taken = append(taken, emission)
+		delete(s.board, key)
+	}
+	return taken
 }
 
 func (s *Session) emit(eventType protocol.EventType, payload any) {
