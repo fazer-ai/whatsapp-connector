@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -162,9 +163,10 @@ type Session struct {
 	// `paused` dropped for want of room, and there is no event after a stop -- so the
 	// client is left showing somebody typing with nothing coming. Keyed by chat, the
 	// stop replaces the typing it stops instead of queueing behind it.
-	board    map[string]engine.Emission
+	board    map[string]posted
 	boardMu  sync.Mutex
 	boardCap int
+	boardSeq int64
 	ready    chan struct{}
 
 	// picked, when it is set, receives once for every emission the forwarder takes off
@@ -309,7 +311,7 @@ func newSession(
 		storeLimit:   bindTimeout,
 		deliverWait:  deliverTimeout,
 		handoffWait:  perishableHandoff,
-		board:        make(map[string]engine.Emission),
+		board:        make(map[string]posted),
 		boardCap:     boardDepth,
 		ready:        make(chan struct{}, 1),
 		downloadWait: downloadTimeout,
@@ -1434,6 +1436,17 @@ const perishableHandoff = time.Second
 // newest states of the chats already on it are worth more than a new chat's first one.
 const boardDepth = 512
 
+// posted is a presence waiting on the board, with when it got there.
+//
+// The order is kept because a map has none, and two entries that ought to have been one
+// -- the same person under a key that changed -- would then publish in whichever order a
+// walk happened to take, which can put the typing after the stop. Keyed right they are
+// one entry and this does not arise; kept in order, it does not arise either way.
+type posted struct {
+	seq      int64
+	emission engine.Emission
+}
+
 // handOn gives one emission to the reader, and reports whether the forwarder should
 // carry on.
 //
@@ -1502,7 +1515,8 @@ func (s *Session) post(key string, eventType protocol.EventType, payload any, li
 			Msg("dropping presence for a chat the board had no room for")
 		return
 	}
-	s.board[key] = emission
+	s.boardSeq++
+	s.board[key] = posted{seq: s.boardSeq, emission: emission}
 	s.boardMu.Unlock()
 
 	select {
@@ -1522,11 +1536,11 @@ func (s *Session) evictAMoment() bool {
 	var oldest string
 	var least time.Duration
 	found := false
-	for key, emission := range s.board {
-		if emission.Expires == nil {
+	for key, waiting := range s.board {
+		if waiting.emission.Expires == nil {
 			continue
 		}
-		if left := emission.Expires(); !found || left < least {
+		if left := waiting.emission.Expires(); !found || left < least {
 			oldest, least, found = key, left, true
 		}
 	}
@@ -1543,10 +1557,15 @@ func (s *Session) takeBoard() []engine.Emission {
 	if len(s.board) == 0 {
 		return nil
 	}
-	taken := make([]engine.Emission, 0, len(s.board))
-	for key, emission := range s.board {
-		taken = append(taken, emission)
+	waiting := make([]posted, 0, len(s.board))
+	for key, entry := range s.board {
+		waiting = append(waiting, entry)
 		delete(s.board, key)
+	}
+	slices.SortFunc(waiting, func(a, b posted) int { return cmp.Compare(a.seq, b.seq) })
+	taken := make([]engine.Emission, 0, len(waiting))
+	for _, entry := range waiting {
+		taken = append(taken, entry.emission)
 	}
 	return taken
 }

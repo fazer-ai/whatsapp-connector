@@ -450,8 +450,8 @@ func onBoard(session *Session) []engine.Emission {
 	session.boardMu.Lock()
 	defer session.boardMu.Unlock()
 	waiting := make([]engine.Emission, 0, len(session.board))
-	for _, emission := range session.board {
-		waiting = append(waiting, emission)
+	for _, entry := range session.board {
+		waiting = append(waiting, entry.emission)
 	}
 	return waiting
 }
@@ -684,5 +684,41 @@ func TestOnePersonIsOneKeyWhicheverIdentifiersArrive(t *testing.T) {
 	}
 	if state := stateOf(t, waiting[0]); state != "paused" {
 		t.Errorf("what is waiting is a %s, and the person's last state was the stop", state)
+	}
+}
+
+// A map has no order, and two entries that ought to have been one -- the same person
+// under a key that changed between events, which is what a group switching addressing
+// mode does -- would publish in whichever order a walk happened to take. Put the typing
+// after the stop and the client is showing somebody typing who is not.
+func TestTheBoardIsPublishedInTheOrderItWasWrittenIn(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.picked = make(chan struct{}, 1)
+	blockTheForwarder(t, session)
+
+	// Deliberately different keys for one person, which is the state this orders for.
+	chat := waTypes.NewJID("120363041234567890", waTypes.GroupServer)
+	session.groups = true
+	session.chatPresence(&waEvents.ChatPresence{
+		MessageSource: waTypes.MessageSource{
+			Chat: chat, Sender: waTypes.NewJID("5511999990002", waTypes.DefaultUserServer), IsGroup: true,
+		},
+		State: waTypes.ChatPresenceComposing,
+	})
+	session.chatPresence(&waEvents.ChatPresence{
+		MessageSource: waTypes.MessageSource{
+			Chat: chat, Sender: waTypes.NewJID("167392323834034", waTypes.HiddenUserServer), IsGroup: true,
+		},
+		State: waTypes.ChatPresencePaused,
+	})
+
+	taken := session.takeBoard()
+	if len(taken) != 2 {
+		t.Fatalf("%d presences came off the board, want the two that were written", len(taken))
+	}
+	if first, last := stateOf(t, taken[0]), stateOf(t, taken[1]); first != "composing" || last != "paused" {
+		t.Errorf("the board came off as %s then %s, and they were written the other way round", first, last)
 	}
 }
