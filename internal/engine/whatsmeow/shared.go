@@ -151,21 +151,49 @@ func vcardWithoutFiles(card string) string {
 	}
 	kept := strings.Builder{}
 	kept.Grow(len(card))
-	dropping := false
-	for line := range strings.SplitSeq(card, "\n") {
-		if property, names := vcardProperty(line); names {
-			_, dropping = vcardFiles[strings.ToUpper(property)]
+	// Sticky, and that is the point: a vCard 2.1 file is written as a block of base64
+	// left flush against the margin, so the lines after the property say nothing about
+	// themselves. They belong to whatever last named itself, until something else does.
+	swallowing := false
+
+	// One logical property: the physical lines it arrived on, and its text with the
+	// folding taken out, which is the only form its name can be read from.
+	emit := func(physical []string, logical string) {
+		if property, named := vcardProperty(logical); named {
+			_, swallowing = vcardFiles[strings.ToUpper(property)]
 		}
-		// A line that names no property continues the one above it, and a file's base64
-		// is written across many of them. Which way the sender's client wrapped them --
-		// folded under a space the way RFC 2426 says, or left flush the way vCard 2.1
-		// blocks are -- does not matter here: neither can be read as a property, so both
-		// belong to whatever was dropped or kept last.
-		if dropping {
+		if swallowing {
+			return
+		}
+		for _, line := range physical {
+			kept.WriteString(line)
+			kept.WriteString("\n")
+		}
+	}
+
+	var physical []string
+	logical := strings.Builder{}
+	for line := range strings.SplitSeq(card, "\n") {
+		trimmed := strings.TrimRight(line, "\r")
+		if len(physical) > 0 && trimmed != "" && (trimmed[0] == ' ' || trimmed[0] == '\t') {
+			// RFC 2426 folding. The break can land anywhere, the colon included, so the
+			// name is not readable until the lines are back together -- which is what
+			// makes classifying a physical line at a time wrong rather than merely
+			// incomplete: a PHOTO folded before its colon names nothing on either line
+			// and the file goes out.
+			logical.WriteString(trimmed[1:])
+			physical = append(physical, line)
 			continue
 		}
-		kept.WriteString(line)
-		kept.WriteString("\n")
+		if len(physical) > 0 {
+			emit(physical, logical.String())
+		}
+		physical, logical = physical[:0], strings.Builder{}
+		physical = append(physical, line)
+		logical.WriteString(trimmed)
+	}
+	if len(physical) > 0 {
+		emit(physical, logical.String())
 	}
 	return strings.TrimSuffix(kept.String(), "\n")
 }

@@ -375,6 +375,12 @@ func TestACardArrivesWithoutTheFilesItCarried(t *testing.T) {
 		{"left flush, the way a vCard 2.1 block is", "BEGIN:VCARD\nVERSION:2.1\n" +
 			"FN:Carlos Dias\nPHOTO;ENCODING=BASE64;JPEG:\n" + picture + "\n" + picture +
 			"\n\nTEL;type=CELL;waid=5541988881111:+55 41 98888-1111\nEND:VCARD\n"},
+		// The break can land on the colon itself, and then neither physical line names
+		// anything: the first has no colon and the second is a fold. A stripper reading
+		// one line at a time recognises no property and publishes the whole file.
+		{"folded before its own colon", "BEGIN:VCARD\nVERSION:3.0\n" +
+			"FN:Carlos Dias\nPHOTO;ENCODING=b;TYPE=JPEG;X-ABLabel=perfil\n :" + picture +
+			"\n " + picture + "\nTEL;type=CELL;waid=5541988881111:+55 41 98888-1111\nEND:VCARD\n"},
 		// The group is not part of the property's name, so a stripper matching on the
 		// whole token keeps the file on every card an address book exported.
 		{"written with a property group", "BEGIN:VCARD\nVERSION:3.0\n" +
