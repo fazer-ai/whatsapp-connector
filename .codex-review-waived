@@ -191,4 +191,10 @@ internal/engine/whatsmeow/acting.go: Normalize direct chats before building targ
 # would break a reaction that mostly works"). Applying strictness to one of the two and
 # not the other would leave them inconsistent with no reason for it. The failed lookup is
 # logged where it happens, which is the visibility this is worth.
+#
+# Where the line actually falls, since the same PR does refuse over a failed query one
+# function down: the account's read-receipt setting. That one fails open -- the read is
+# disclosed to somebody and cannot be taken back -- while this one fails closed, and the
+# worst of it is that nothing happened and the caller marks again. The rule is the
+# direction of the failure, not the query.
 internal/engine/whatsmeow/receipt.go: Fail group read marks when normalization fails  # PR#43

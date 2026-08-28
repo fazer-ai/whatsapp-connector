@@ -233,11 +233,42 @@ func (s *Session) markRead(ctx context.Context, command *protocol.Command) (json
 		return nil, err
 	}
 
+	// Asked for before the mark rather than during it. whatsmeow reads the account's
+	// read-receipt setting inside MarkRead and, when that query fails, carries on with an
+	// empty one -- which is not `none`, so the receipt goes out as an ordinary read. An
+	// account that turned read receipts off would have the read disclosed to the person
+	// on the other side, and a read receipt cannot be taken back.
+	//
+	// Which is the line between this and the group's addressing, where a failed query is
+	// carried on through: that one fails closed, and the worst of it is that nothing
+	// happens and the caller marks again. This one fails open, and there is no marking
+	// again.
+	//
+	// Only where it could change the answer. whatsmeow downgrades a read and not a
+	// played, and downgrades a newsletter whatever the setting says, so asking in those
+	// cases would refuse over a query whose answer was never going to be used.
+	if kind == waTypes.ReceiptTypeRead && chat.Server != waTypes.NewsletterServer {
+		known := s.privacyKnown
+		if known == nil {
+			known = s.privacyOverSocket
+		}
+		if err := known(ctx); err != nil {
+			s.log.Warn().Err(err).Msg("refusing a read mark whose privacy setting could not be read")
+			return nil, markFailure(err,
+				"this account's read-receipt setting could not be read, and marking without it could disclose the read")
+		}
+	}
+
 	if err := s.current().MarkRead(ctx, req.MessageIDs, time.Now(), chat, sender, kind); err != nil {
 		s.log.Warn().Err(err).Str("chat", chat.String()).Msg("a read mark did not go out")
-		return nil, markFailure(err)
+		return nil, markFailure(err, "WhatsApp did not take the read mark")
 	}
 	return nil, nil
+}
+
+func (s *Session) privacyOverSocket(ctx context.Context) error {
+	_, err := s.current().TryFetchPrivacySettings(ctx, false)
+	return err
 }
 
 // markFailure names what went wrong in the contract's own words.
@@ -246,7 +277,7 @@ func (s *Session) markRead(ctx context.Context, command *protocol.Command) (json
 // description of this deployment's insides to whoever does not. And the codes are what a
 // caller branches on -- told `wa_error` for a disconnect, a client retries against
 // WhatsApp instead of waiting for the session to come back.
-func markFailure(err error) error {
+func markFailure(err error, refused string) error {
 	switch {
 	case errors.Is(err, wm.ErrNotLoggedIn):
 		return protocol.NewError(protocol.ErrorNotPaired,
@@ -259,7 +290,7 @@ func markFailure(err error) error {
 		return protocol.NewError(protocol.ErrorTimeout,
 			"the read mark did not go out before the command's deadline")
 	default:
-		return protocol.NewError(protocol.ErrorWaError, "WhatsApp did not take the read mark")
+		return protocol.NewError(protocol.ErrorWaError, refused)
 	}
 }
 

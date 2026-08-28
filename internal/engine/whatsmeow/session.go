@@ -149,6 +149,10 @@ type Session struct {
 	// worth another delivery.
 	unseal func(context.Context, *waEvents.Message) (*waE2E.Message, error)
 
+	// privacyKnown reports whether this account's own privacy settings could be read.
+	// A seam for the same reason as the ones below it: nil is the real one.
+	privacyKnown func(context.Context) error
+
 	// groupMode is how a group addresses its members, which decides the namespace a
 	// message key in it names a sender by. A field because reading it is a round trip to
 	// WhatsApp, and a test cannot otherwise reach either branch of what depends on it.

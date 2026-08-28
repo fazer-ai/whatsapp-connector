@@ -329,7 +329,7 @@ func TestAReadMarkThatCouldNotGoOutIsNamedInTheContractsOwnWords(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			err := markFailure(tc.err)
+			err := markFailure(tc.err, "WhatsApp did not take the read mark")
 			assertCode(t, err, tc.want)
 			if strings.Contains(err.Error(), "file descriptor") {
 				t.Errorf("the library's own words crossed into the reply: %v", err)
@@ -516,5 +516,76 @@ func TestThePublisherWindowIsMeasuredOnAClockThatOnlyMovesForward(t *testing.T) 
 			t.Fatal("the window never ran out")
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// A read receipt cannot be taken back, and whatsmeow decides whether to send one or its
+// silent form by reading the account's own privacy setting -- swallowing the error and
+// carrying on with an empty one, which is not `none` and so reads as receipts being on.
+// An account that turned them off would have the read disclosed to the peer.
+//
+// This is the one place a failed query is answered with a refusal rather than carried on
+// through, and the reason is the direction of the failure: the group's addressing fails
+// closed, and nothing happens; this fails open, and there is no undoing it.
+func TestAReadMarkIsRefusedWhenTheAccountsOwnSettingCannotBeRead(t *testing.T) {
+	t.Parallel()
+
+	const direct = `{"chat":{"kind":"phone","id":"5511999990002"},"message_ids":["3EB0A1B2C3D4E5F60718"]`
+
+	t.Run("the setting could not be read", func(t *testing.T) {
+		t.Parallel()
+
+		session, _, _ := outboundSession(t)
+		session.privacyKnown = func(context.Context) error {
+			return errors.New("the privacy query came back with nothing in it")
+		}
+		_, err := session.markRead(t.Context(), &protocol.Command{
+			Type: protocol.CommandMessageMarkRead, Payload: json.RawMessage(direct + `}`),
+		})
+		assertCode(t, err, protocol.ErrorWaError)
+		if !strings.Contains(err.Error(), "read-receipt setting") {
+			t.Errorf("the refusal reads %q, and what went wrong is the setting", err)
+		}
+	})
+
+	// The setting is read, and what happens next is the socket's business. What is being
+	// separated here is refusing before anything goes out from failing on the way out.
+	t.Run("the setting was read", func(t *testing.T) {
+		t.Parallel()
+
+		session, _, _ := outboundSession(t)
+		asked := false
+		session.privacyKnown = func(context.Context) error { asked = true; return nil }
+		_, err := session.markRead(t.Context(), &protocol.Command{
+			Type: protocol.CommandMessageMarkRead, Payload: json.RawMessage(direct + `}`),
+		})
+		if !asked {
+			t.Fatal("a read mark went out without the account's setting being read at all")
+		}
+		assertCode(t, err, protocol.ErrorNotConnected)
+	})
+
+	// Not asked where the answer could not change what goes out: whatsmeow downgrades a
+	// read and not a played, and downgrades a newsletter whatever the setting says.
+	// Asking there would refuse over a query nothing was going to use.
+	for _, tc := range []struct{ name, payload string }{
+		{"a played mark", direct + `,"type":"played"}`},
+		{"a channel", `{"chat":{"kind":"newsletter","id":"120363041234567890@newsletter"},
+			"message_ids":["3EB0A1B2C3D4E5F60718"]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			session, _, _ := outboundSession(t)
+			session.privacyKnown = func(context.Context) error {
+				t.Error("the account's setting was read where it could not change the answer")
+				return nil
+			}
+			if _, err := session.markRead(t.Context(), &protocol.Command{
+				Type: protocol.CommandMessageMarkRead, Payload: json.RawMessage(tc.payload),
+			}); err == nil {
+				t.Fatal("a mark went out over a session with no socket")
+			}
+		})
 	}
 }
