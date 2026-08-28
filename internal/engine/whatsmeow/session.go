@@ -1128,6 +1128,8 @@ func (s *Session) Execute(ctx context.Context, command *protocol.Command) (json.
 		return s.react(ctx, command)
 	case protocol.CommandMessageDownloadMedia:
 		return s.downloadMedia(ctx, command)
+	case protocol.CommandMessageMarkRead:
+		return s.markRead(ctx, command)
 	}
 	return nil, engine.ErrNotSupported
 }
@@ -1696,6 +1698,10 @@ func (s *Session) handle(rawEvent any) bool {
 		// before. Everything this build cannot render yet is still refused, which is
 		// what keeps it on the phone for a later milestone.
 		return s.receive(event)
+	case *waEvents.Receipt:
+		// The other handler that can withhold an acknowledgement, and for the same
+		// reason: a tick nobody published never turns, and the client cannot ask again.
+		return s.receipt(event)
 	case *waEvents.Connected:
 		// whatsmeow dispatches from whichever goroutine produced the event, so a
 		// Disconnected and the Connected that follows it can be handled at the same

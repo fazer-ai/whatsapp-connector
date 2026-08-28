@@ -211,6 +211,39 @@ type MessageReaction struct {
 	Timestamp int64   `json:"timestamp"`
 }
 
+// ReceiptKind is what became of a message, as the contract names it.
+type ReceiptKind string
+
+// The four the contract has. WhatsApp reports more than this, and the engine is what
+// decides which of its own shapes each of these covers.
+const (
+	ReceiptDelivered ReceiptKind = "delivered"
+	ReceiptRead      ReceiptKind = "read"
+	ReceiptPlayed    ReceiptKind = "played"
+	ReceiptFailed    ReceiptKind = "failed"
+)
+
+// MessageReceipt is `message.receipt`: what happened to messages that already exist.
+//
+// MessageIDs is a list because WhatsApp reports a chat being opened as one receipt over
+// everything unread in it, and splitting that into one event per message would multiply
+// a burst by the size of the backlog.
+//
+// Participant is who the receipt is from, and it is set even in a direct chat where it
+// repeats the chat's own address. That repetition is the point: the same four names
+// cover a receipt about a message this account sent and one about a message it received
+// and read from another of its own devices, and the only thing separating them is whose
+// device reported it. A client comparing this against its own number can tell, and one
+// that does not care can ignore the field.
+type MessageReceipt struct {
+	Chat        Address     `json:"chat"`
+	MessageIDs  []string    `json:"message_ids"`
+	Type        ReceiptKind `json:"type"`
+	Participant *Address    `json:"participant,omitempty"`
+	Error       *Error      `json:"error,omitempty"`
+	Timestamp   int64       `json:"timestamp"`
+}
+
 // LocationContent is a pin on a map. The coordinates are the whole message: there is
 // nothing to fetch, which is what separates it from every other content that is not text.
 type LocationContent struct {
