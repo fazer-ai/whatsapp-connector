@@ -1786,3 +1786,119 @@ collect:
 	fmt.Fprintf(os.Stderr, "marked %s read. check the other phone: the message it just sent should show two blue ticks.\n",
 		arrived.Message.ID)
 }
+
+// TestLiveWatchPresence is the presence half against a real phone, and it exists for one
+// state: `recording`.
+//
+// WhatsApp has no such state. It has `composing` with a media attribute beside it, and
+// that reading came off the library's constants rather than off anything anybody sent.
+// Every other mapping in this slice is one name onto one name; this one is a guess about
+// which field carries the difference, and a guess is what a live phase is for.
+//
+// The account is marked available first, which is not decoration: whatsmeow only sends
+// real delivery receipts while it is, and WhatsApp sends presence about a party only
+// after it is subscribed to. Both halves of this phase depend on those two calls having
+// worked, so a failure in them shows up here as nothing arriving.
+func TestLiveWatchPresence(t *testing.T) {
+	to := os.Getenv("WAC_LIVE_TO")
+	if to == "" {
+		t.Skip("set WAC_LIVE_TO to the number whose presence this should watch")
+	}
+	window := liveWindow(t, 5*time.Minute)
+
+	session, _ := liveSession(t)
+	events := watch(t, session)
+
+	if err := session.Connect(t.Context(), engine.ConnectRequest{Pairing: "resume"}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	events.awaitState(t, "open", 2*time.Minute)
+
+	if _, err := session.Execute(t.Context(), &protocol.Command{
+		Type: protocol.CommandPresenceSet, Payload: json.RawMessage(`{"state":"available"}`),
+	}); err != nil {
+		t.Fatalf("presence.set: %v", err)
+	}
+	party := fmt.Sprintf(`{"party":{"kind":"phone","id":%q}}`, to)
+	if _, err := session.Execute(t.Context(), &protocol.Command{
+		Type: protocol.CommandPresenceSubscribe, Payload: json.RawMessage(party),
+	}); err != nil {
+		t.Fatalf("presence.subscribe: %v", err)
+	}
+
+	// Sent before the wait rather than after it, so whoever is holding the phone has the
+	// typing bubble in front of them while they do their half.
+	chat := fmt.Sprintf(`{"chat":{"kind":"phone","id":%q},"state":"composing"}`, to)
+	if _, err := session.Execute(t.Context(), &protocol.Command{
+		Type: protocol.CommandChatPresence, Payload: json.RawMessage(chat),
+	}); err != nil {
+		t.Fatalf("chat.presence: %v", err)
+	}
+
+	fmt.Fprintf(os.Stderr,
+		"from that phone, in this chat, and in any order:\n"+
+			"  1. type a few characters and stop -- do not send\n"+
+			"  2. hold the microphone as if recording a voice note, then let go\n"+
+			"and check whether this account shows as typing on your side.\nwaiting up to %s\n",
+		window)
+
+	seen := map[string]json.RawMessage{}
+	deadline := time.After(window)
+
+collect:
+	for {
+		select {
+		case emission, ok := <-events.seen:
+			if !ok {
+				t.Fatal("the session ended before the phase finished")
+			}
+			switch emission.Type {
+			case protocol.EventChatPresence:
+				var body struct {
+					State string `json:"state"`
+				}
+				if err := json.Unmarshal(emission.Payload, &body); err != nil {
+					t.Fatalf("unmarshal a chat presence: %v", err)
+				}
+				seen[body.State] = emission.Payload
+			case protocol.EventPresenceUpdate:
+				seen["presence"] = emission.Payload
+			default:
+				continue
+			}
+			if _, typing := seen["composing"]; typing {
+				if _, recording := seen["recording"]; recording {
+					break collect
+				}
+			}
+		case <-deadline:
+			break collect
+		}
+	}
+
+	for _, want := range []string{"composing", "recording"} {
+		if _, arrived := seen[want]; !arrived {
+			t.Errorf("no %s arrived within %s; what did: %v", want, window, rawKeysOf(seen))
+		}
+	}
+	for state, payload := range seen {
+		fmt.Fprintf(os.Stderr, "%s: %s\n", state, payload)
+	}
+	// Not a failure: it only arrives if the other phone changed state while this ran,
+	// and somebody with the chat open the whole time never does.
+	if _, arrived := seen["presence"]; !arrived {
+		fmt.Fprintln(os.Stderr, "no presence.update arrived, which is what a phone that stayed put looks like")
+	}
+	if state := session.state(); state != "open" {
+		t.Fatalf("the session did not stay up: state=%s", state)
+	}
+}
+
+func rawKeysOf(seen map[string]json.RawMessage) []string {
+	kinds := make([]string, 0, len(seen))
+	for kind := range seen {
+		kinds = append(kinds, kind)
+	}
+	sort.Strings(kinds)
+	return kinds
+}

@@ -74,15 +74,7 @@ func partyOf(info *waTypes.MessageInfo) (*protocol.Party, bool) {
 	if info.VerifiedName != nil {
 		party.VerifiedName = info.VerifiedName.Details.GetVerifiedName()
 	}
-	for _, jid := range []waTypes.JID{info.Sender, info.SenderAlt} {
-		switch address, ok := addressOf(jid); {
-		case !ok:
-		case address.Kind == protocol.AddressPhone && party.Phone == "":
-			party.Phone = address.ID
-		case address.Kind == protocol.AddressLID && party.LID == "":
-			party.LID = address.ID
-		}
-	}
+	naming(&party, info.Sender, info.SenderAlt)
 	if party.Phone != "" || party.LID != "" {
 		return &party, true
 	}
@@ -164,6 +156,21 @@ func inboundOf(event *waEvents.Message, render renderBody) (protocol.InboundMess
 		Ephemeral: said.context.GetExpiration(),
 	}
 	return message, said.failure, true
+}
+
+// naming fills in whichever of WhatsApp's two identifiers the JIDs carry, first one
+// wins per kind. Separate from partyOf because a presence names somebody with no
+// message to read a push name off, and a second copy of this would drift.
+func naming(party *protocol.Party, jids ...waTypes.JID) {
+	for _, jid := range jids {
+		switch address, ok := addressOf(jid); {
+		case !ok:
+		case address.Kind == protocol.AddressPhone && party.Phone == "":
+			party.Phone = address.ID
+		case address.Kind == protocol.AddressLID && party.LID == "":
+			party.LID = address.ID
+		}
+	}
 }
 
 // chatOf is which chat a message belongs to, and it is one function because two places

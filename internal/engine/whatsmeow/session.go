@@ -1151,6 +1151,12 @@ func (s *Session) Execute(ctx context.Context, command *protocol.Command) (json.
 		return s.downloadMedia(ctx, command)
 	case protocol.CommandMessageMarkRead:
 		return s.markRead(ctx, command)
+	case protocol.CommandPresenceSet:
+		return s.setPresence(ctx, command)
+	case protocol.CommandPresenceSubscribe:
+		return s.subscribePresence(ctx, command)
+	case protocol.CommandChatPresence:
+		return s.chatPresenceCommand(ctx, command)
 	}
 	return nil, engine.ErrNotSupported
 }
@@ -1719,6 +1725,13 @@ func (s *Session) handle(rawEvent any) bool {
 		// before. Everything this build cannot render yet is still refused, which is
 		// what keeps it on the phone for a later milestone.
 		return s.receive(event)
+	case *waEvents.ChatPresence:
+		// Published and acknowledged whatever happens, which is the one place on this
+		// path that does not withhold: a moment redelivered is a lie, and the state that
+		// corrects it was published while the stale one was being retried.
+		return s.chatPresence(event)
+	case *waEvents.Presence:
+		return s.presence(event)
 	case *waEvents.Receipt:
 		// The other handler that can withhold an acknowledgement, and for the same
 		// reason: a tick nobody published never turns, and the client cannot ask again.

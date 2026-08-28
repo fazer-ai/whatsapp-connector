@@ -286,26 +286,34 @@ func (s *Session) privacyOverSocket(ctx context.Context) error {
 }
 
 // markFailure names what went wrong in the contract's own words.
+func markFailure(err error, refused string) error {
+	if named, coded := commandFailure(err, "read mark"); named {
+		return coded
+	}
+	return protocol.NewError(protocol.ErrorWaError, refused)
+}
+
+// commandFailure maps the failures every outbound command shares onto the contract's own
+// codes, and reports whether it recognised one. What is left is each command's own.
 //
 // The library's text does not cross into a reply: it is noise to whoever reads it and a
 // description of this deployment's insides to whoever does not. And the codes are what a
 // caller branches on -- told `wa_error` for a disconnect, a client retries against
 // WhatsApp instead of waiting for the session to come back.
-func markFailure(err error, refused string) error {
+func commandFailure(err error, subject string) (bool, error) {
 	switch {
 	case errors.Is(err, wm.ErrNotLoggedIn):
-		return protocol.NewError(protocol.ErrorNotPaired,
-			"the session has no WhatsApp account to mark anything read from")
-	case errors.Is(err, wm.ErrNotConnected):
-		return protocol.NewError(protocol.ErrorNotConnected,
+		return true, protocol.NewError(protocol.ErrorNotPaired,
+			"the session has no WhatsApp account to send a "+subject+" from")
+	case errors.Is(err, wm.ErrNotConnected), errors.Is(err, wm.ErrClientIsNil):
+		return true, protocol.NewError(protocol.ErrorNotConnected,
 			"the session is not connected to WhatsApp")
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled),
 		errors.Is(err, wm.ErrIQTimedOut):
-		return protocol.NewError(protocol.ErrorTimeout,
-			"the read mark did not go out before the command's deadline")
-	default:
-		return protocol.NewError(protocol.ErrorWaError, refused)
+		return true, protocol.NewError(protocol.ErrorTimeout,
+			"the "+subject+" did not go out before the command's deadline")
 	}
+	return false, nil
 }
 
 // authored are the chats whose messages have an author the chat itself does not name, so

@@ -246,6 +246,47 @@ type MessageReceipt struct {
 	Timestamp   int64       `json:"timestamp"`
 }
 
+// TypingState is what the other side is shown above a chat.
+type TypingState string
+
+// WhatsApp has two of these and a media attribute beside them; the contract has three.
+const (
+	TypingComposing TypingState = "composing"
+	TypingRecording TypingState = "recording"
+	TypingPaused    TypingState = "paused"
+)
+
+// ChatPresence is `chat.presence`: somebody typing or recording in a chat, or stopping.
+//
+// Sender is nullable because a direct chat has nobody else to name: the chat is the
+// person. In a group it is who is typing, which is the whole information.
+type ChatPresence struct {
+	Chat   Address     `json:"chat"`
+	Sender *Party      `json:"sender,omitempty"`
+	State  TypingState `json:"state"`
+}
+
+// PresenceState is whether somebody is at their phone.
+type PresenceState string
+
+// Two, and not three: WhatsApp reports somebody going away, and how long ago they were
+// last there is a field on the event rather than a state of its own.
+const (
+	PresenceAvailable   PresenceState = "available"
+	PresenceUnavailable PresenceState = "unavailable"
+)
+
+// PresenceUpdate is `presence.update`: somebody coming online or going away. It arrives
+// only for a party this session subscribed to, one at a time.
+//
+// LastSeen is a pointer because hiding it and having been last seen at the epoch are
+// different facts, and a zero would say the second.
+type PresenceUpdate struct {
+	Party    Party         `json:"party"`
+	State    PresenceState `json:"state"`
+	LastSeen *int64        `json:"last_seen,omitempty"`
+}
+
 // LocationContent is a pin on a map. The coordinates are the whole message: there is
 // nothing to fetch, which is what separates it from every other content that is not text.
 type LocationContent struct {
