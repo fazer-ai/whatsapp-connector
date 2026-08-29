@@ -52,6 +52,7 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	waTypes "go.mau.fi/whatsmeow/types"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/engine"
 	"github.com/fazer-ai/whatsapp-connector/internal/media"
@@ -1885,6 +1886,11 @@ collect:
 		}
 	}
 
+	// Measured on 29/08/2026: all three arrive, the stop about six seconds after the
+	// typing it ends, and a direct chat's presence comes addressed by LID with no number
+	// anywhere on it -- `SenderAlt` is empty, so there is nothing for `addressedBy` to
+	// prefer. That last part is #50, and it is not this path's alone.
+	//
 	// The stop is required and not optional. Everything about how presence is queued
 	// turns on it existing: a typing indicator has nothing after it, so the board keeps
 	// the last state per chat rather than a queue of them, and a client left showing
@@ -1915,4 +1921,126 @@ func rawKeysOf(seen map[string]json.RawMessage) []string {
 	}
 	sort.Strings(kinds)
 	return kinds
+}
+
+// TestLiveShowTyping settles what a typing indicator has to have behind it before the
+// other phone renders one, which is the half no event can answer: `SendChatPresence`
+// writes the node and returns, so one nothing renders comes back successful.
+//
+// What it found, on 29/08/2026: the address was never the problem, and the wait was.
+// The very first typing of a session, sent in the same breath as the `available` before
+// it, does not show. Everything after does, by number and by LID alike -- including
+// round A, which is a number with nothing sent to that chat first and only fifteen
+// seconds of waiting behind it. So the account being marked available is what has to
+// land, and it does not land by the time the reply to `presence.set` comes back. That is
+// in the contract's conventions now, because it is a client's to know rather than
+// something this side can wait for: whatsmeow writes the node and returns.
+//
+// Round A waits and sends nothing first. Round C is the same address with a message
+// already behind it. A showing is what says it was time rather than the traffic.
+//
+// Each round ends with a real message, which is what makes the answer readable at all: a
+// typing indicator on its own leaves somebody staring at a chat with no way to say when
+// they were supposed to be looking, while a message lands in the history, names its round
+// and clears the indicator the way a real client would. So the phone is left holding the
+// answer instead of the person having to catch it.
+func TestLiveShowTyping(t *testing.T) {
+	to := os.Getenv("WAC_LIVE_TO")
+	if to == "" {
+		t.Skip("set WAC_LIVE_TO to the number to show a typing indicator to")
+	}
+	show := liveWindow(t, 12*time.Second)
+
+	session, _ := liveSession(t)
+	events := watch(t, session)
+
+	if err := session.Connect(t.Context(), engine.ConnectRequest{Pairing: "resume"}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	events.awaitState(t, "open", 2*time.Minute)
+
+	if _, err := session.Execute(t.Context(), &protocol.Command{
+		Type: protocol.CommandPresenceSet, Payload: json.RawMessage(`{"state":"available"}`),
+	}); err != nil {
+		t.Fatalf("presence.set: %v", err)
+	}
+
+	// The other namespace for the same person, out of the device store, which is where
+	// the mapping already is. A run that cannot find it says so rather than testing one
+	// address twice.
+	number := waTypes.NewJID(to, waTypes.DefaultUserServer)
+	alt, err := session.current().Store.GetAltJID(t.Context(), number)
+	if err != nil {
+		t.Fatalf("look up the other address of %s: %v", to, err)
+	}
+	if alt.IsEmpty() {
+		t.Fatalf("the store has no LID for %s, so there is nothing to compare against", to)
+	}
+	byNumber := protocol.Address{Kind: protocol.AddressPhone, ID: number.User}
+	byLID := protocol.Address{Kind: protocol.AddressLID, ID: alt.User}
+	fmt.Fprintf(os.Stderr, "the same person is %s and %s\n", number, alt)
+
+	// Nothing at all goes to that chat first, which is what makes round A mean something:
+	// it is the availability having had time to land and nothing else.
+	settle := 15 * time.Second
+	fmt.Fprintf(os.Stderr, "\nmarked available. waiting %s with nothing going out, so the first round\n"+
+		"is about the availability having landed rather than about the chat being woken up\n", settle)
+	time.Sleep(settle)
+
+	for _, round := range []struct {
+		label string
+		chat  protocol.Address
+	}{
+		{label: "A — numero, so esperei", chat: byNumber},
+		{label: "B — lid", chat: byLID},
+		{label: "C — numero, com mensagem atras", chat: byNumber},
+	} {
+		fmt.Fprintf(os.Stderr, "\n=== %s: typing to %s for %s ===\n", round.label, round.chat.ID, show)
+		showTyping(t, session, round.chat)
+		time.Sleep(show)
+		sendMarker(t, session, round.chat, round.label)
+		time.Sleep(3 * time.Second)
+	}
+
+	fmt.Fprintln(os.Stderr, "\nthree messages should be in that chat now, A B and C.\n"+
+		"for each one: was this account shown as typing in the seconds before it arrived?")
+	if state := session.state(); state != "open" {
+		t.Fatalf("the session did not stay up: state=%s", state)
+	}
+}
+
+func showTyping(t *testing.T, session *Session, chat protocol.Address) {
+	t.Helper()
+
+	payload, err := json.Marshal(map[string]any{"chat": chat, "state": "composing"})
+	if err != nil {
+		t.Fatalf("marshal a typing indicator: %v", err)
+	}
+	if _, err := session.Execute(t.Context(), &protocol.Command{
+		Type: protocol.CommandChatPresence, Payload: payload,
+	}); err != nil {
+		t.Fatalf("chat.presence for %s: %v", chat.ID, err)
+	}
+}
+
+// sendMarker sends the message that ends a round, which is what the phone is left holding
+// as the answer. No stop goes out first: a real client stops typing by sending, and
+// whether the indicator clears on its own is part of what this is looking at.
+func sendMarker(t *testing.T, session *Session, chat protocol.Address, body string) {
+	t.Helper()
+
+	payload, err := json.Marshal(map[string]any{
+		"message_id": session.current().GenerateMessageID(),
+		"to":         chat,
+		"content":    map[string]any{"type": "text", "body": body},
+	})
+	if err != nil {
+		t.Fatalf("marshal the marker: %v", err)
+	}
+	if _, err := session.Execute(t.Context(), &protocol.Command{
+		Type: protocol.CommandMessageSend, Payload: payload,
+	}); err != nil {
+		t.Fatalf("message.send to %s: %v", chat.ID, err)
+	}
+	fmt.Fprintf(os.Stderr, "=== sent %q to %s ===\n", body, chat.ID)
 }

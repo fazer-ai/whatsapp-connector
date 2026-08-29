@@ -70,13 +70,21 @@ func (s *Session) chatPresence(event *waEvents.ChatPresence) bool {
 		return true
 	}
 	if canonical, ok := addressedBy(event.Chat, event.SenderAlt); direct && ok {
-		// The chat as the person rather than as the address that arrived. WhatsApp reaches
-		// a direct peer under either of its two namespaces from one event to the next, and
-		// published as it came, a `composing` in the LID chat and the `paused` in the
-		// number chat are two chats to a client -- so the stop clears nothing, and which
-		// of the two addresses the client sees at all depends on whether the two events
-		// happened to coalesce on the board, which is not something a client should be
-		// able to tell.
+		// The chat as the person rather than as the address that arrived, so far as the
+		// event says who that is. WhatsApp reaches a direct peer under either of its two
+		// namespaces from one event to the next, and published as it came, a `composing`
+		// in the LID chat and the `paused` in the number chat are two chats to a client:
+		// the stop clears nothing, and which of the two the client sees at all would
+		// depend on whether the two happened to coalesce on the board, which is not
+		// something a client should be able to tell.
+		//
+		// This reaches as far as the event does and no further. A real `chatstate` for a
+		// direct chat carries one namespace and no alternative -- every node in the live
+		// run of 29/08/2026 arrived LID-only -- so where there is nothing to prefer, what
+		// goes out is what came in. The mapping the session would need is in the device
+		// store and nowhere near this function, and reading it here would put presence on
+		// a different address from the receipts, which is one more shape for a client to
+		// reconcile rather than one fewer. Registered as #50, across all the paths.
 		chat = canonical
 	}
 	published := protocol.ChatPresence{Chat: chat, State: state}
