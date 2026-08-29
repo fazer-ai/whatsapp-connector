@@ -1,6 +1,7 @@
 package whatsmeow
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"testing"
@@ -485,15 +486,6 @@ func TestWhatALaterBuildCouldPublishIsKeptOnThePhone(t *testing.T) {
 			}}
 			return editEvent(carrier, subject, corrected, 1755000009000)
 		}},
-		{"a reaction encrypted under a message secret", func() *waEvents.Message {
-			event := textMessage(carrier, "")
-			event.Message = &waE2E.Message{EncReactionMessage: &waE2E.EncReactionMessage{
-				TargetMessageKey: messageKey(subject),
-				EncPayload:       []byte("cifrado"),
-				EncIV:            make([]byte, 12),
-			}}
-			return event
-		}},
 		{"a reaction from somebody the contract cannot name", func() *waEvents.Message {
 			event := reactionEvent(carrier, subject, "👍", 1755000009000)
 			event.Info.Sender = waTypes.NewJID("someone", "unknown.server")
@@ -649,5 +641,200 @@ func messageKey(id string) *waCommon.MessageKey {
 		ID:        proto.String(id),
 		FromMe:    proto.Bool(false),
 		RemoteJID: proto.String("5511999990001@" + waTypes.DefaultUserServer),
+	}
+}
+
+// sealedReactionEvent is the stanza a community announcement group sends: the emoji
+// sealed under the secret of the message it is on, and the message it names carried on
+// the envelope rather than inside the ciphertext.
+func sealedReactionEvent(stanzaID, targetID string) *waEvents.Message {
+	event := textMessage(stanzaID, "")
+	event.Message = &waE2E.Message{EncReactionMessage: &waE2E.EncReactionMessage{
+		TargetMessageKey: messageKey(targetID),
+		EncPayload:       []byte("cifrado"),
+		EncIV:            make([]byte, 12),
+	}}
+	return event
+}
+
+// The reaction opens, and the message it belongs to comes off the envelope.
+//
+// This is the arm that fails silently when it is wrong. EncryptReaction takes the key
+// off the reaction before sealing it, so what comes back out of the decryption names no
+// message at all: handed on as it is, it is dropped for having no target, with the emoji
+// decrypted and in hand and nothing in the log saying it was ever readable. The stand-in
+// returns exactly that shape, which is what makes this a test of the reattachment rather
+// than of the decryption.
+func TestASealedReactionIsPublishedWithTheTargetOffItsEnvelope(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.unsealReaction = func(context.Context, *waEvents.Message) (*waE2E.ReactionMessage, error) {
+		return &waE2E.ReactionMessage{
+			Text:              proto.String("🎉"),
+			SenderTimestampMS: proto.Int64(1755000009000),
+		}, nil
+	}
+
+	emission := publishedBy(t, session, sealedReactionEvent(carrier, subject))
+	if emission.Type != protocol.EventMessageReaction {
+		t.Fatalf("a sealed reaction was published as %s, want %s", emission.Type, protocol.EventMessageReaction)
+	}
+	validateAgainstContract(t, "event_message_reaction", emission.Payload)
+
+	payload := decode(t, emission.Payload)
+	if payload["target_id"] != subject {
+		t.Errorf("the reaction annotates %v, and the envelope named %q", payload["target_id"], subject)
+	}
+	if payload["emoji"] != "🎉" {
+		t.Errorf("the reaction reads %v, and what was sealed was 🎉", payload["emoji"])
+	}
+	if payload["id"] != carrier {
+		t.Errorf("the reaction is filed under %v, and the client deduplicates on %q", payload["id"], carrier)
+	}
+}
+
+// The two ways opening one fails are opposite answers, and this milestone has already
+// got that backwards twice. A socket that is not up yet is not final: the same stanza
+// redelivered to a ready session opens. A secret this session never had is: it was
+// stored when the message being reacted to arrived, and a redelivery brings the same
+// ciphertext and no key, so keeping it buys a loop that can never end.
+func TestASealedReactionKeepsOnlyWhatARedeliveryCouldFix(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name    string
+		err     error
+		keeping bool
+	}{
+		{"a socket that is not up yet", wm.ErrNotLoggedIn, true},
+		{"a client that is gone", wm.ErrClientIsNil, true},
+		{"a store that ran out of time", context.DeadlineExceeded, true},
+		{"a session on its way out", context.Canceled, true},
+		{"a secret this session never had", errors.New("original message secret not found"), false},
+		{"a payload that will not open", errors.New("failed to decrypt reaction: cipher: message authentication failed"), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			session, _ := newTestSession(t, "5511999990001")
+			session.deliverWait = 50 * time.Millisecond
+			session.unsealReaction = func(context.Context, *waEvents.Message) (*waE2E.ReactionMessage, error) {
+				return nil, tc.err
+			}
+
+			acknowledged := publishedNothing(t, session, sealedReactionEvent(carrier, subject))
+			if tc.keeping && acknowledged {
+				t.Fatal("a reaction a ready session could have opened was acknowledged, so WhatsApp will not send it again")
+			}
+			if !tc.keeping && !acknowledged {
+				t.Fatal("a reaction nothing can ever open was kept, and WhatsApp will send it again for as long as this session is up")
+			}
+		})
+	}
+}
+
+// An envelope with no message on it is nothing a chat can show, and no redelivery
+// supplies one. Acknowledged, or it comes back for as long as the session is up.
+func TestASealedReactionThatNamesNoMessageIsDroppedAndAcknowledged(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.deliverWait = 50 * time.Millisecond
+	session.unsealReaction = func(context.Context, *waEvents.Message) (*waE2E.ReactionMessage, error) {
+		return &waE2E.ReactionMessage{Text: proto.String("🎉")}, nil
+	}
+
+	event := sealedReactionEvent(carrier, subject)
+	event.Message.EncReactionMessage.TargetMessageKey = nil
+	if !publishedNothing(t, session, event) {
+		t.Fatal("a reaction with no message to put it on was kept, and it names none on the way back either")
+	}
+}
+
+// The wiring, against whatsmeow's own crypto rather than a stand-in.
+//
+// The stand-in above pins what this build does with what comes back; this pins that
+// what comes back is what whatsmeow produces. It is the half a stand-in cannot cover:
+// that DecryptReaction is the right call for this envelope, and that the key really is
+// missing from the plaintext, which is the whole reason the reattachment exists. A
+// stand-in that returned a key would have agreed with a build that never reattached one.
+func TestASealedReactionOpensAgainstWhatsmeowsOwnCrypto(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	client := session.current()
+
+	// The account's hidden identifier. Encryption derives the key from it, and
+	// decryption from the sender of the stanza, so the reaction has to arrive as the
+	// account's own for the two to meet -- which is what a reaction of one's own in an
+	// announcement group is.
+	own, err := waTypes.ParseJID("167392323834034@lid")
+	if err != nil {
+		t.Fatalf("ParseJID: %v", err)
+	}
+	client.Store.LID = own
+
+	chat := waTypes.NewJID("120363000000000000", waTypes.GroupServer)
+	author, err := waTypes.ParseJID("167392323834035@lid")
+	if err != nil {
+		t.Fatalf("ParseJID: %v", err)
+	}
+	// The secret whatsmeow filed when the announcement itself arrived. Without it there
+	// is nothing to derive either half from.
+	secret := bytes.Repeat([]byte{7}, 32)
+	if err := client.Store.MsgSecrets.PutMessageSecret(t.Context(), chat, author, subject, secret); err != nil {
+		t.Fatalf("PutMessageSecret: %v", err)
+	}
+
+	plain := &waE2E.ReactionMessage{
+		Key: &waCommon.MessageKey{
+			RemoteJID:   proto.String(chat.String()),
+			FromMe:      proto.Bool(false),
+			ID:          proto.String(subject),
+			Participant: proto.String(author.String()),
+		},
+		Text:              proto.String("🎉"),
+		SenderTimestampMS: proto.Int64(1755000009000),
+	}
+	sealed, err := client.EncryptReaction(t.Context(), &waTypes.MessageInfo{
+		ID: subject,
+		MessageSource: waTypes.MessageSource{
+			Chat:   chat,
+			Sender: author,
+		},
+	}, plain)
+	if err != nil {
+		t.Fatalf("EncryptReaction: %v", err)
+	}
+	// What #38 warned about, asserted rather than assumed: the library takes the key off
+	// the reaction on its way in, so nothing downstream of the decryption knows what the
+	// reaction was put on.
+	if sealed.GetTargetMessageKey().GetID() != subject {
+		t.Fatalf("the envelope names %q, and the reaction was put on %q",
+			sealed.GetTargetMessageKey().GetID(), subject)
+	}
+	if plain.GetKey() != nil {
+		t.Fatal("the library left the key on the reaction, and the reattachment this tests is for its absence")
+	}
+
+	event := textMessage(carrier, "")
+	event.Info.Chat = chat
+	event.Info.Sender = own
+	event.Info.SenderAlt = waTypes.EmptyJID
+	event.Info.IsGroup = true
+	event.Message = &waE2E.Message{EncReactionMessage: sealed}
+
+	session.setGroups(true)
+	emission := publishedBy(t, session, event)
+	if emission.Type != protocol.EventMessageReaction {
+		t.Fatalf("what came out is %s", emission.Type)
+	}
+	payload := decode(t, emission.Payload)
+	if payload["target_id"] != subject {
+		t.Errorf("the reaction annotates %v, and it was put on %q", payload["target_id"], subject)
+	}
+	if payload["emoji"] != "🎉" {
+		t.Errorf("the reaction reads %v, and what was sealed was 🎉", payload["emoji"])
 	}
 }
