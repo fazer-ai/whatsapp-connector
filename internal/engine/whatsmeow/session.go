@@ -1620,6 +1620,23 @@ func (s *Session) resolve(key string, at int64) (engine.Emission, bool) {
 		// this marker and the state after it took a place of its own further along.
 		return engine.Emission{}, false
 	}
+	if entry.transitions != s.transitions.Load() {
+		// The connection this state was reported on has gone since it was posted, and
+		// the event that says so is in this same queue. Published after it, this lands
+		// on a client that clears presence when it sees a session go, and nothing comes
+		// to correct it a second time; published before it, that same event clears it
+		// anyway. There is nothing to lose by dropping it and one thing to lose by not.
+		//
+		// This is also the answer to the two handlers racing. A presence node and a
+		// disconnect reach this from different goroutines with no order between them, so
+		// no amount of care at the posting end decides which of the two queues first --
+		// but whichever way it lands, the state is not published on the far side of the
+		// connection that produced it.
+		delete(s.board, key)
+		s.log.Debug().Str("type", string(entry.emission.Type)).
+			Msg("dropping a presence whose connection went before its turn came")
+		return engine.Emission{}, false
+	}
 	if entry.emission.Settle == nil {
 		delete(s.board, key)
 		return entry.emission, true

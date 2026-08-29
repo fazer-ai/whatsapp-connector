@@ -221,3 +221,23 @@ internal/engine/whatsmeow/receipt.go: Fail group read marks when normalization f
 # unbounded by construction and deciding how to bound it is not this slice's decision.
 # Registered as #46.
 internal/protocol/types.go: Preserve idempotency for redelivered presence commands  # PR#45
+# PR#45: the claim is true and the remedy is worse than what it fixes. Cancelling a
+# context does not un-send bytes Redis has already buffered, so an XADD can be appended
+# after the moment it carries has expired. Rejecting it server-side means expressing the
+# expiry in Redis's clock, and the connector is not on that machine: it would have to
+# read TIME first and carry an offset, which is another round trip and a race of its own,
+# to put a scripted append on the path of every event for the sake of one class of them.
+#
+# And it would still not be enough, which is the part that decides this. The delay is not
+# only Redis's event loop. A consumer that is behind renders the same stale indicator
+# from a perfectly prompt append, and no rule on the write side bounds the time between
+# an event happening and somebody seeing it. Server-side rejection would close one of the
+# ways to be late and leave the others.
+#
+# So the rule belongs where the whole delay is visible, which is the reader, and the
+# frame already carries what it needs: `ts`. That is now written into the contract's
+# conventions rather than left as an assumption about clients. What the client-side
+# deadline still buys is the other half, and it is why it stays: it stops the pump
+# waiting behind a write nobody wants any more, which is the ordering cost this design is
+# built to avoid.
+internal/session/session.go: Enforce transient expiry inside the Redis append  # PR#45

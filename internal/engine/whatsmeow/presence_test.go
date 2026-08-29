@@ -1111,12 +1111,16 @@ func TestAContactOffTheOrdinaryServerIsStillOneKey(t *testing.T) {
 	}
 }
 
-// And the connection is read when the state happens, not when it reaches the publisher.
-// A drop while the marker is still waiting its turn is exactly the case the retry has to
-// refuse, and read at hand-over it would be counted as having happened before the state
-// rather than after it -- so the stop would go out behind the close, on a client that had
-// just cleared presence for it.
-func TestAPresenceRemembersTheConnectionItHappenedOn(t *testing.T) {
+// A presence is not published on the far side of the connection that produced it. The
+// event saying the connection went is in the same queue, and a client that clears
+// presence when it sees one would be left with this on top of the clearing, with nothing
+// coming to correct it a second time. Dropped before that event instead, it costs
+// nothing: that event would have cleared it anyway.
+//
+// It is also the answer to the two handlers racing. A presence node and a disconnect
+// reach the session from different goroutines with no order between them, so nothing at
+// the posting end decides which of the two queues first -- and this holds either way.
+func TestAPresenceIsNotPublishedOnceItsConnectionHasGone(t *testing.T) {
 	t.Parallel()
 
 	session, _ := newTestSession(t, "5511999990001")
@@ -1125,20 +1129,21 @@ func TestAPresenceRemembersTheConnectionItHappenedOn(t *testing.T) {
 
 	from := waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)
 	session.presence(&waEvents.Presence{From: from})
-	// Down while the availability is still waiting for its turn, so the hand-over that
-	// follows happens on the far side of the drop.
+	// Down while the availability is still waiting its turn.
 	session.handle(&waEvents.StreamReplaced{})
 
-	// The filler the forwarder is parked on, then the availability, then the drop.
+	// The filler the forwarder is parked on, and then the drop -- with nothing from
+	// before it in between.
 	next(t, session)
-	available := next(t, session)
-	if available.Type != protocol.EventPresenceUpdate {
-		t.Fatalf("what came out is %s", available.Type)
+	if published := next(t, session); published.Type != protocol.EventSessionStreamReplaced {
+		t.Fatalf("what came out is %s, and the connection it describes was already gone", published.Type)
 	}
-	next(t, session)
-	available.Settle(errors.New("redis is unreachable"))
-
+	select {
+	case emission := <-session.Events():
+		t.Fatalf("a presence from a connection that had gone was published: %s", emission.Payload)
+	case <-time.After(500 * time.Millisecond):
+	}
 	if waiting := onBoard(session); len(waiting) != 0 {
-		t.Errorf("an availability from before the connection went was put back: %s", stateOf(t, waiting[0]))
+		t.Errorf("%d presences were left on the board with no marker coming for them", len(waiting))
 	}
 }
