@@ -1292,6 +1292,12 @@ func (s *Session) Close() error {
 		return nil
 	}
 	s.closed = true
+	// Inside the same transition that publishes the close, and not after it. That flag is
+	// what an Open racing this reads to decide it may build the replacement, so a moment
+	// where the session is closed and the fence is still up is a moment where two sessions
+	// can write one device. Dropping is a single atomic store, so it costs the lock
+	// nothing to hold it for.
+	s.fence.Drop()
 	run := s.pairing
 	s.pairing = nil
 	closing := s.closing
@@ -1305,12 +1311,6 @@ func (s *Session) Close() error {
 	// Announced first, while the teardown below still has a socket to close. The engine
 	// only drops a cache entry here, and a session it can no longer hand out is the
 	// point: an Open racing this must build a new client rather than get this one back.
-	// Down before anything else. Before the context, because a write already past its own
-	// context check is one this still catches; and before the engine is told, because that
-	// is what lets an Open build the replacement, and the replacement must not be running
-	// while this one can still write.
-	s.fence.Drop()
-
 	if closing != nil {
 		closing()
 	}

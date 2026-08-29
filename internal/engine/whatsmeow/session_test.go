@@ -2442,3 +2442,26 @@ func TestASessionThatRebuiltIsStillFenced(t *testing.T) {
 		t.Fatalf("the device a rebuild adopted wrote after the session stopped: %v", err)
 	}
 }
+
+// Closed and fenced are one transition, not two. What an Open racing a Close reads to
+// decide it may build the replacement is the closed flag, so a session that reports itself
+// closed while its fence is still up is a session two clients can write through. The order
+// is held by both living in one critical section; this is the half a test can see, which is
+// that closing drops it at all.
+func TestClosingASessionDropsItsFence(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	if session.fence.Dropped() {
+		t.Fatal("a session that is running is already fenced")
+	}
+	if err := session.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if !session.Closed() {
+		t.Fatal("Close returned and the session does not report itself closed")
+	}
+	if !session.fence.Dropped() {
+		t.Error("a closed session still holds its fence up")
+	}
+}
