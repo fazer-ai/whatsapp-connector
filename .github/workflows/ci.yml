@@ -36,6 +36,25 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+
+    services:
+      # The store speaks two dialects and a deployment runs this one. A statement that
+      # is valid in SQLite and not here compiles, lints and passes the SQLite pass, so
+      # without a server in CI the first execution is in production.
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: wac
+          POSTGRES_PASSWORD: wac
+          POSTGRES_DB: wac
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U wac"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
     steps:
       - uses: actions/checkout@v7
 
@@ -46,6 +65,18 @@ jobs:
 
       - name: Run tests
         run: go test -race -coverprofile=coverage.txt -covermode=atomic ./...
+
+      # The same suite, against the other dialect. Everything rather than the one
+      # package that holds SQL today: "SQL only lives in internal/store" is a
+      # convention nothing enforces, and an unenforced convention about SQL is what
+      # left this gap in the first place.
+      #
+      # Without -race: this pass is about what the server accepts, and the race
+      # detector has already had its say on the same code a step earlier.
+      - name: Run tests against PostgreSQL
+        env:
+          WAC_TEST_DATABASE_URL: postgres://wac:wac@localhost:5432/wac?sslmode=disable
+        run: go test -count=1 ./...
 
       - name: Upload coverage
         uses: actions/upload-artifact@v7

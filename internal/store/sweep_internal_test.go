@@ -3,13 +3,14 @@ package store
 import (
 	"context"
 	"fmt"
-	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/rs/zerolog"
 	"go.mau.fi/whatsmeow/proto/waAdv"
 	"go.mau.fi/whatsmeow/types"
+
+	"github.com/fazer-ai/whatsapp-connector/internal/store/storetest"
 )
 
 // The sweep deletes a batch at a time so the rest of the store is not held behind it,
@@ -88,7 +89,7 @@ func TestASweepGivenNoTimeDropsNothing(t *testing.T) {
 func openInternal(t *testing.T) *Container {
 	t.Helper()
 
-	container, err := Open(t.Context(), "sqlite:"+filepath.Join(t.TempDir(), "wac.db"), zerolog.Nop())
+	container, err := Open(t.Context(), storetest.New(t).URL, zerolog.Nop())
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
