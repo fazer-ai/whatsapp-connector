@@ -176,6 +176,14 @@ type Session struct {
 	// something that then could not be queued only costs a marker of its own, while one
 	// counted late reads as nothing having intervened when something has.
 	queued atomic.Int64
+	// transitions counts the session states this session has published, which is what a
+	// presence that failed to publish is checked against before it is given another go.
+	// Everything presence describes belongs to the socket that reported it -- WhatsApp
+	// forgets subscriptions and availability when a connection goes, and whatsmeow
+	// replays neither -- so a state re-asserted after the session has been through one
+	// of these is a fact nothing warrants any more, put back on top of a client that
+	// cleared presence when it saw the session go.
+	transitions atomic.Int64
 
 	// picked, when it is set, receives once for every emission the forwarder takes off
 	// the inbox, before it tries to hand it on. A seam so a test can know the pump is
@@ -1469,6 +1477,10 @@ type posted struct {
 	at       int64
 	sent     bool
 	retried  bool
+	// transitions is how many session states had been published when this value was
+	// handed over, so a failure coming back after another one can tell that the socket
+	// it describes is gone.
+	transitions int64
 }
 
 // handOn gives one emission to the reader, and reports whether the forwarder should
@@ -1601,6 +1613,7 @@ func (s *Session) resolve(key string, at int64) (engine.Emission, bool) {
 		return entry.emission, true
 	}
 	entry.sent = true
+	entry.transitions = s.transitions.Load()
 	s.board[key] = entry
 	return entry.emission, true
 }
@@ -1627,6 +1640,16 @@ func (s *Session) settled(key string, seq int64) func(error) {
 			delete(s.board, key)
 			return
 		}
+		if s.transitions.Load() != entry.transitions {
+			// The session has been through a state of its own since this was handed over,
+			// and presence does not survive one: the subscription that produced it is
+			// gone, and a client that cleared presence when it saw the session go would
+			// have this put back on top with nothing coming to correct it again.
+			delete(s.board, key)
+			s.log.Debug().Str("type", string(entry.emission.Type)).
+				Msg("dropping a presence whose session changed under it before it could be tried again")
+			return
+		}
 		entry.retried, entry.sent = true, false
 		entry.at = s.queued.Add(1)
 		select {
@@ -1649,6 +1672,9 @@ func (s *Session) emit(eventType protocol.EventType, payload any) {
 		// programming error rather than something a session should carry on through.
 		s.log.Error().Err(err).Str("type", string(eventType)).Msg("failed to render an event payload")
 		return
+	}
+	if eventType == protocol.EventSessionState {
+		s.transitions.Add(1)
 	}
 	s.queued.Add(1)
 	select {

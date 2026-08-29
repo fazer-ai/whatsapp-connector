@@ -150,16 +150,23 @@ func (s *Session) presence(event *waEvents.Presence) bool {
 // by which entry happened to be published last. Where the event carries both -- and a
 // chat presence does -- one of them is always the number, so preferring it makes the two
 // events one key.
+//
+// Which JIDs are numbers is `addressOf`'s answer and not a second copy of it, because
+// there is more than one server that means "a number" -- the legacy one and the hosted
+// one alongside the ordinary one -- and a copy that knew only the ordinary one would key
+// a hosted contact by whichever address happened to arrive first. The address it returns
+// is what the key is built from for the same reason: it is the same identity the event
+// itself is published under, so two servers for one person cannot be two keys.
 func keyedBy(jids ...waTypes.JID) string {
-	chosen := waTypes.JID{}
+	var chosen protocol.Address
 	for _, jid := range jids {
-		switch {
-		case jid.IsEmpty():
-		case chosen.IsEmpty(), chosen.Server != waTypes.DefaultUserServer && jid.Server == waTypes.DefaultUserServer:
-			chosen = jid
+		switch address, ok := addressOf(jid); {
+		case !ok:
+		case chosen.ID == "", chosen.Kind != protocol.AddressPhone && address.Kind == protocol.AddressPhone:
+			chosen = address
 		}
 	}
-	return chosen.ToNonAD().String()
+	return string(chosen.Kind) + ":" + chosen.ID
 }
 
 // typingOf is the contract's three states out of whatsmeow's two.

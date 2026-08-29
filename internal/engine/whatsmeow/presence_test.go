@@ -1037,3 +1037,59 @@ func TestThisAccountsOwnTypingInAGroupIsKeptApartFromEveryoneElses(t *testing.T)
 		t.Errorf("%d presences are waiting, and two participants were typing in that group", len(waiting))
 	}
 }
+
+// A presence belongs to the socket that reported it. Once the session has been through a
+// state of its own, the subscription that produced it is gone and the fact is warranted
+// by nothing -- and a client that cleared presence when it saw the session go would have
+// this put back on top, with nothing coming to correct it a second time.
+func TestAPresenceIsNotTriedAgainOnceTheSessionHasMovedUnderIt(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.picked = make(chan struct{}, 1)
+
+	from := waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)
+	session.presence(&waEvents.Presence{From: from})
+	available := next(t, session)
+
+	session.emit(protocol.EventSessionState, map[string]any{"state": "close", "reason": "disconnected"})
+	next(t, session)
+	available.Settle(errors.New("redis is unreachable"))
+
+	if waiting := onBoard(session); len(waiting) != 0 {
+		t.Errorf("an availability from before the session went down was put back: %s", stateOf(t, waiting[0]))
+	}
+}
+
+// A number is a number on any of the servers that mean one, and `addressOf` is the only
+// place that knows which those are. A second copy of that rule inside the key knew the
+// ordinary server alone, so a hosted or legacy contact whose two addresses arrived in
+// either order was two entries.
+func TestAContactOffTheOrdinaryServerIsStillOneKey(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.groups = true
+	session.picked = make(chan struct{}, 1)
+	blockTheForwarder(t, session)
+
+	chat := waTypes.NewJID("120363041234567890", waTypes.GroupServer)
+	legacy := waTypes.NewJID("5511999990002", waTypes.LegacyUserServer)
+	lid := waTypes.NewJID("167392323834034", waTypes.HiddenUserServer)
+	session.chatPresence(&waEvents.ChatPresence{
+		MessageSource: waTypes.MessageSource{Chat: chat, Sender: lid, SenderAlt: legacy, IsGroup: true},
+		State:         waTypes.ChatPresenceComposing,
+	})
+	session.chatPresence(&waEvents.ChatPresence{
+		MessageSource: waTypes.MessageSource{Chat: chat, Sender: legacy, SenderAlt: lid, IsGroup: true},
+		State:         waTypes.ChatPresencePaused,
+	})
+
+	waiting := onBoard(session)
+	if len(waiting) != 1 {
+		t.Fatalf("%d presences are waiting for one person, and only their last state should be", len(waiting))
+	}
+	if state := stateOf(t, waiting[0]); state != "paused" {
+		t.Errorf("what is waiting is a %s, and the person's last state was the stop", state)
+	}
+}
