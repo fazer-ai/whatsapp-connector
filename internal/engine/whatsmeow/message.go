@@ -493,6 +493,15 @@ func (s *Session) receive(event *waEvents.Message) bool {
 		return false
 	}
 
+	if s.arrived(event.Info.ID) {
+		// This one was unreadable a moment ago and the recovery worked: either the sender
+		// encrypted it again or the phone forwarded it. The placeholder waiting for it is
+		// called off here rather than published and corrected, because a client that
+		// deduplicates on the id would keep the placeholder and discard this.
+		s.log.Info().Str("message_id", event.Info.ID).
+			Msg("a message that could not be read arrived after all")
+	}
+
 	message, failure, ok := inboundOf(event, s.bodyOf(s.ctx))
 	if !ok {
 		s.log.Debug().Str("message_id", event.Info.ID).
@@ -572,29 +581,37 @@ func (s *Session) deliver(eventType protocol.EventType, payload any, learned int
 	}
 }
 
-// unreadable publishes a message this device was never given, so an agent sees that
-// somebody wrote rather than seeing nothing at all.
+// rerequestTimeout is how long a message that could not be read is left to arrive before
+// the connector gives up and says so.
 //
-// WhatsApp does not hand a view-once photo to a companion device. What arrives is a
-// stanza with no ciphertext in it, and whatsmeow answers it by asking the primary phone
-// to forward the message instead. That phone may never do it -- in the run this was found
-// in it never did, over ten minutes -- and until it does there is nothing else coming.
-// Published as unsupported, the conversation at least says a message is there.
+// Both recoveries are real and both deliver the message under the id the placeholder
+// would take, so publishing one straight away is not early, it is final: the client
+// deduplicates on that id and discards the real message as a repeat. whatsmeow waits
+// `RequestFromPhoneDelay`, five seconds, before it even asks the phone, and the phone's
+// answer is a round trip after that. This is well past both, and it is a guess at the
+// only number that matters -- how long a recovery takes when it works -- which nobody
+// here has measured. What it costs when it is too long is an agent waiting to be told a
+// message exists; what it costs when it is too short is that message never arriving.
+const rerequestTimeout = 45 * time.Second
+
+// unreadable answers a message that arrived with nothing in it this device could read.
 //
-// The other half of the same event is left alone on purpose, and it is not a smaller
-// case. A ciphertext that arrived and would not open has a recovery that works: whatsmeow
-// sends a retry receipt, the sender re-encrypts, and the message arrives again under the
-// same id. Publishing a placeholder for that one would be worse than silence, because the
-// client deduplicates on the message id -- the real message that follows is discarded as
-// a repeat, and the agent is left with "could not read this" over a message that did
-// arrive. Registered as #51, with what it would take to tell a retry that failed from one
-// that has not answered yet.
+// Two different things reach here and they look almost alike. WhatsApp does not hand a
+// view-once photo to a companion device, so what arrives is a stanza with no ciphertext
+// at all and whatsmeow asks the primary phone to forward the real one. And a message
+// whose ciphertext would not open -- a Signal session that has drifted, a group message
+// with no sender key -- gets a retry receipt asking the sender to encrypt it again.
+//
+// Neither is published straight away, and that is the whole of this. Both recoveries
+// deliver the message under the same id, and a client deduplicates on that id: a
+// placeholder that goes out first is the only thing that chat will ever show, over a
+// message that did arrive. So the placeholder is scheduled instead, and the message
+// arriving is what calls it off.
+//
+// Acknowledged either way, because there is nothing to withhold: whatsmeow acknowledged
+// the node before this ran, so a refusal here buys no redelivery and the stanza carries
+// nothing to redeliver.
 func (s *Session) unreadable(event *waEvents.UndecryptableMessage) bool {
-	if !event.IsUnavailable {
-		s.log.Debug().Str("message_id", event.Info.ID).
-			Msg("leaving a message that would not decrypt to the retry whatsmeow asked for")
-		return true
-	}
 	learned := s.learned()
 
 	if event.Info.Sender.IsBot() || event.Info.Chat.IsBot() {
@@ -615,8 +632,98 @@ func (s *Session) unreadable(event *waEvents.UndecryptableMessage) bool {
 			Msg("dropping an unreadable group message the client did not subscribe to")
 		return true
 	}
-	message.Content = protocol.Unsupported(protocol.UnsupportedUnavailable)
-	s.log.Info().Str("message_id", event.Info.ID).Str("kind", string(event.UnavailableType)).
-		Msg("publishing a message this device was never given")
-	return s.deliver(protocol.EventMessageReceived, map[string]any{"message": message}, learned)
+	message.Content = protocol.Unsupported(whyUnopened(event))
+	s.awaitOrPublish(&message, learned)
+	return true
+}
+
+// whyUnopened is which of the contract's reasons a message nothing could read arrived
+// with.
+//
+// The name WhatsApp put on the stanza, and not whether whatsmeow called it unavailable.
+// Those are not the same question: a group message with no sender key is reported as
+// unavailable too, and it is an ordinary decryption failure with an ordinary retry behind
+// it. A type attribute is the server saying it withheld the message on purpose, which is
+// the only thing here that means nothing arrived to be decrypted.
+func whyUnopened(event *waEvents.UndecryptableMessage) protocol.UnsupportedReason {
+	if event.UnavailableType != "" {
+		return protocol.UnsupportedUnavailable
+	}
+	return protocol.UnsupportedUndecryptable
+}
+
+// awaitOrPublish gives the message that could not be read its window to arrive, and
+// publishes the placeholder if it does not.
+func (s *Session) awaitOrPublish(message *protocol.InboundMessage, learned int64) {
+	ctx, cancel := context.WithCancel(s.ctx)
+
+	s.awaitedMu.Lock()
+	if _, waiting := s.awaited[message.ID]; waiting {
+		// Already waiting on this one. whatsmeow repeats the event when a resend fails to
+		// decrypt as well, and a second timer would publish a second bubble for one
+		// message.
+		s.awaitedMu.Unlock()
+		cancel()
+		return
+	}
+	s.awaited[message.ID] = cancel
+	s.awaitedMu.Unlock()
+
+	go func() {
+		defer cancel()
+		timeout := time.NewTimer(s.rerequestWait)
+		defer timeout.Stop()
+		select {
+		case <-timeout.C:
+		case <-ctx.Done():
+			// The message arrived, or the session ended. Either way this is not the thing
+			// that should be in that chat.
+			return
+		}
+		if !s.forgetAwaiting(message.ID) {
+			return
+		}
+		s.log.Info().Str("message_id", message.ID).
+			Msg("publishing a message that never arrived in a form this could read")
+		if !s.deliver(protocol.EventMessageReceived, map[string]any{"message": message}, learned) {
+			// Nothing to withhold and nobody to tell: the node was acknowledged long ago.
+			s.log.Warn().Str("message_id", message.ID).
+				Msg("an unreadable message could not be published, and WhatsApp has no copy left to send")
+		}
+	}()
+}
+
+// arrived calls off the placeholder for a message that turned up after all, and reports
+// whether one was waiting.
+func (s *Session) arrived(id string) bool {
+	s.awaitedMu.Lock()
+	cancel, waiting := s.awaited[id]
+	delete(s.awaited, id)
+	s.awaitedMu.Unlock()
+	if waiting {
+		cancel()
+	}
+	return waiting
+}
+
+// forgetAwaiting takes a message off the waiting list and reports whether it was still
+// on it, which is what stops a placeholder racing the message that just arrived.
+func (s *Session) forgetAwaiting(id string) bool {
+	s.awaitedMu.Lock()
+	defer s.awaitedMu.Unlock()
+	_, waiting := s.awaited[id]
+	delete(s.awaited, id)
+	return waiting
+}
+
+// forgetAwaited gives up on every placeholder still waiting, which is what a session
+// closing owes the goroutines holding them.
+func (s *Session) forgetAwaited() {
+	s.awaitedMu.Lock()
+	waiting := s.awaited
+	s.awaited = make(map[string]context.CancelFunc)
+	s.awaitedMu.Unlock()
+	for _, cancel := range waiting {
+		cancel()
+	}
 }

@@ -20,6 +20,7 @@ func TestAMessageThisDeviceWasNeverGivenStillReachesTheInbox(t *testing.T) {
 	t.Parallel()
 
 	session, _ := newTestSession(t, "5511999990001")
+	session.rerequestWait = 10 * time.Millisecond
 	emission, acknowledged := unreadable(t, session, unavailableMessage("3EB0VIEWONCE", "view_once"))
 	if !acknowledged {
 		t.Fatal("a stanza carrying nothing was left for WhatsApp to send again, and it carries nothing again")
@@ -48,18 +49,117 @@ func TestAMessageThisDeviceWasNeverGivenStillReachesTheInbox(t *testing.T) {
 	validateInboundAgainstContract(t, &message)
 }
 
-// The other half of the same event, and the opposite answer. A ciphertext that arrived
-// and would not open has a recovery that works: whatsmeow asks the sender to send it
-// again, and it arrives under the same id. The client deduplicates on that id, so a
-// placeholder now is a placeholder for good over a message that did arrive.
-func TestAMessageThatWouldNotDecryptIsLeftToItsRetry(t *testing.T) {
+// A ciphertext that arrived and would not open is a different thing to a person reading
+// the thread, and the name WhatsApp put on the stanza is what says which it was. Whether
+// whatsmeow called it unavailable does not: a group message with no sender key is
+// reported that way too, and it is an ordinary decryption failure.
+func TestWhatWasWrongWithAMessageIsWhatWhatsAppNamed(t *testing.T) {
+	t.Parallel()
+
+	for _, unread := range []struct {
+		name  string
+		build func() *waEvents.UndecryptableMessage
+		want  protocol.UnsupportedReason
+	}{
+		{
+			name:  "withheld on purpose",
+			build: func() *waEvents.UndecryptableMessage { return unavailableMessage("3EB0VO", "view_once") },
+			want:  protocol.UnsupportedUnavailable,
+		},
+		{
+			name: "a ciphertext that would not open",
+			build: func() *waEvents.UndecryptableMessage {
+				event := unavailableMessage("3EB0BADSESSION", "")
+				event.IsUnavailable = false
+				return event
+			},
+			want: protocol.UnsupportedUndecryptable,
+		},
+		{
+			// whatsmeow reports a group message with no sender key as unavailable, and
+			// sends a retry receipt for it like any other failure to decrypt. Read off
+			// that flag, this one would say the server withheld a message it did not.
+			name: "a group message with no sender key",
+			build: func() *waEvents.UndecryptableMessage {
+				event := unavailableMessage("3EB0NOSENDERKEY", "")
+				event.Info.Chat = waTypes.NewJID("120363041234567890", waTypes.GroupServer)
+				event.Info.IsGroup = true
+				return event
+			},
+			want: protocol.UnsupportedUndecryptable,
+		},
+	} {
+		t.Run(unread.name, func(t *testing.T) {
+			t.Parallel()
+
+			session, _ := newTestSession(t, "5511999990001")
+			session.groups = true
+			session.rerequestWait = 10 * time.Millisecond
+
+			emission, acknowledged := unreadable(t, session, unread.build())
+			if !acknowledged {
+				t.Fatal("a stanza carrying nothing was left for WhatsApp to send again")
+			}
+			var content protocol.UnsupportedContent
+			if err := json.Unmarshal(mustMarshal(t, messageOf(t, emission).Content), &content); err != nil {
+				t.Fatalf("unmarshal the content: %v", err)
+			}
+			if content.Reason != unread.want {
+				t.Errorf("the bubble says %q, want %q", content.Reason, unread.want)
+			}
+		})
+	}
+}
+
+// Nothing is published while the message could still arrive. Both recoveries deliver it
+// under the id the placeholder would take, and a client deduplicates on that id: the
+// placeholder would be the only thing that chat ever shows, over a message that arrived.
+func TestNoPlaceholderGoesOutWhileTheMessageCouldStillArrive(t *testing.T) {
 	t.Parallel()
 
 	session, _ := newTestSession(t, "5511999990001")
-	event := unavailableMessage("3EB0BADSESSION", "")
-	event.IsUnavailable = false
+	session.rerequestWait = 5 * time.Second
 
-	publishedNothingUnreadable(t, session, event)
+	if !session.handle(unavailableMessage("3EB0WAITING", "view_once")) {
+		t.Fatal("an unreadable message was left for WhatsApp to send again")
+	}
+	select {
+	case emission := <-session.Events():
+		t.Fatalf("a placeholder went out over a message that may still arrive: %s", emission.Payload)
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+// And the message arriving is what calls the placeholder off, which is the whole reason
+// for waiting at all.
+func TestAMessageThatArrivesAfterAllCallsOffItsPlaceholder(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.rerequestWait = 50 * time.Millisecond
+
+	if !session.handle(unavailableMessage("3EB0RECOVERED", "view_once")) {
+		t.Fatal("an unreadable message was left for WhatsApp to send again")
+	}
+	emission := publishedBy(t, session, textMessage("3EB0RECOVERED", "bom dia"))
+
+	message := messageOf(t, emission)
+	var content struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(mustMarshal(t, message.Content), &content); err != nil {
+		t.Fatalf("unmarshal the content: %v", err)
+	}
+	if content.Type != "text" {
+		t.Fatalf("what reached the chat is %s, and the message itself arrived", content.Type)
+	}
+	// And nothing behind it: the placeholder would carry the same id and be kept over
+	// this one.
+	select {
+	case late := <-session.Events():
+		t.Fatalf("a placeholder went out after the message it was standing in for: %s", late.Payload)
+	case <-time.After(300 * time.Millisecond):
+	}
 }
 
 // The same boundary the message path draws. A client that asked for direct chats only
@@ -68,6 +168,7 @@ func TestAnUnreadableGroupMessageIsNotPublishedToADirectOnlyClient(t *testing.T)
 	t.Parallel()
 
 	session, _ := newTestSession(t, "5511999990001")
+	session.rerequestWait = 10 * time.Millisecond
 	event := unavailableMessage("3EB0GROUPGONE", "view_once")
 	event.Info.Chat = waTypes.NewJID("120363041234567890", waTypes.GroupServer)
 	event.Info.IsGroup = true
@@ -82,6 +183,7 @@ func TestAnUnreadableGroupMessageNamesWhoSentIt(t *testing.T) {
 
 	session, _ := newTestSession(t, "5511999990001")
 	session.groups = true
+	session.rerequestWait = 10 * time.Millisecond
 	event := unavailableMessage("3EB0GROUPSEEN", "view_once")
 	event.Info.Chat = waTypes.NewJID("120363041234567890", waTypes.GroupServer)
 	event.Info.IsGroup = true
