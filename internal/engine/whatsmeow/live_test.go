@@ -1927,17 +1927,19 @@ func rawKeysOf(seen map[string]json.RawMessage) []string {
 // other phone renders one, which is the half no event can answer: `SendChatPresence`
 // writes the node and returns, so one nothing renders comes back successful.
 //
-// What it found, on 29/08/2026: the address was never the problem, and the wait was.
-// The very first typing of a session, sent in the same breath as the `available` before
-// it, does not show. Everything after does, by number and by LID alike -- including
-// round A, which is a number with nothing sent to that chat first and only fifteen
-// seconds of waiting behind it. So the account being marked available is what has to
-// land, and it does not land by the time the reply to `presence.set` comes back. That is
-// in the contract's conventions now, because it is a client's to know rather than
-// something this side can wait for: whatsmeow writes the node and returns.
+// What it found, on 29/08/2026: the address is not the problem. A typing indicator shows
+// by number and by LID alike, and the only one that did not show was the very first of a
+// session, sent in the same breath as the `available` before it.
 //
-// Round A waits and sends nothing first. Round C is the same address with a message
-// already behind it. A showing is what says it was time rather than the traffic.
+// What that first one was missing is not settled, and this test cannot settle it as
+// written. Round A is meant to be the arm with nothing behind it but a wait, and it only
+// has nothing behind it *within this process*: the run before it had put four messages
+// into the same chat minutes earlier, so the peer's own subscription was still warm.
+// Separating the two would mean leaving that chat quiet for however long a subscription
+// takes to lapse, which is a length nobody here knows, and then connecting fresh and
+// sending exactly one thing. Until somebody does that, what a client can rely on is only
+// that the first typing indicator of a session may not show -- which is what the
+// contract says, and it is the same advice under either explanation.
 //
 // Each round ends with a real message, which is what makes the answer readable at all: a
 // typing indicator on its own leaves somebody staring at a chat with no way to say when
