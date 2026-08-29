@@ -1184,3 +1184,48 @@ func TestAPresenceReportedAfterTheConnectionWentIsRefused(t *testing.T) {
 	case <-time.After(500 * time.Millisecond):
 	}
 }
+
+// The board coalesces two addressings of one person only while both are still waiting.
+// Once the first has gone out, what joins them is the address on the wire -- so a
+// `composing` published in the LID chat and a `paused` published in the number chat are
+// two chats to a client, and the stop clears nothing. Which of the two a client sees at
+// all would otherwise depend on whether the events happened to coalesce, which is not
+// something a client should be able to tell.
+func TestADirectChatGoesOutUnderOneAddressWhicheverOneArrives(t *testing.T) {
+	t.Parallel()
+
+	session := newPresenceSession(t, "5511999990001")
+	phone := waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)
+	lid := waTypes.NewJID("167392323834034", waTypes.HiddenUserServer)
+
+	// Read as they are published, so the two never meet on the board.
+	session.chatPresence(&waEvents.ChatPresence{
+		MessageSource: waTypes.MessageSource{Chat: lid, Sender: lid, SenderAlt: phone},
+		State:         waTypes.ChatPresenceComposing,
+	})
+	typing := chatOfPresence(t, next(t, session))
+	session.chatPresence(&waEvents.ChatPresence{
+		MessageSource: waTypes.MessageSource{Chat: phone, Sender: phone, SenderAlt: lid},
+		State:         waTypes.ChatPresencePaused,
+	})
+	stop := chatOfPresence(t, next(t, session))
+
+	if typing != stop {
+		t.Errorf("the typing went out for %v and the stop for %v, and one of them will never be cleared", typing, stop)
+	}
+	if want := (protocol.Address{Kind: protocol.AddressPhone, ID: "5511999990002"}); stop != want {
+		t.Errorf("the chat went out as %v, and the number is the address WhatsApp offered for it", stop)
+	}
+}
+
+func chatOfPresence(t *testing.T, emission engine.Emission) protocol.Address {
+	t.Helper()
+
+	var body struct {
+		Chat protocol.Address `json:"chat"`
+	}
+	if err := json.Unmarshal(emission.Payload, &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	return body.Chat
+}

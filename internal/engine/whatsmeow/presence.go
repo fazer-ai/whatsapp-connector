@@ -69,6 +69,16 @@ func (s *Session) chatPresence(event *waEvents.ChatPresence) bool {
 			Msg("dropping a chat presence the contract does not name")
 		return true
 	}
+	if canonical, ok := addressedBy(event.Chat, event.SenderAlt); direct && ok {
+		// The chat as the person rather than as the address that arrived. WhatsApp reaches
+		// a direct peer under either of its two namespaces from one event to the next, and
+		// published as it came, a `composing` in the LID chat and the `paused` in the
+		// number chat are two chats to a client -- so the stop clears nothing, and which
+		// of the two addresses the client sees at all depends on whether the two events
+		// happened to coalesce on the board, which is not something a client should be
+		// able to tell.
+		chat = canonical
+	}
 	published := protocol.ChatPresence{Chat: chat, State: state}
 	sender := protocol.Party{}
 	naming(&sender, event.Sender, event.SenderAlt)
@@ -92,16 +102,13 @@ func (s *Session) chatPresence(event *waEvents.ChatPresence) bool {
 	// state belongs to a participant: keyed by the chat alone, Bob starting to type
 	// replaces Alice's stop and the client is left showing Alice typing for good.
 	//
-	// In a direct chat the chat is the person -- the account's own typing is gone by
-	// here, so the sender is the other party either way -- and WhatsApp addresses them by
-	// either of its two namespaces from one event to the next. Keeping the chat in the
-	// key there undoes what the canonical sender just did: a `composing` in the LID chat
-	// and the `paused` in the number chat are two entries again, and the typing under
-	// whichever address the client saw first is left showing with nothing coming.
-	who := keyedBy(event.Sender, event.SenderAlt)
-	key := string(protocol.EventChatPresence) + ":" + who
+	// In a direct chat the chat is already the person by now, canonical either way it was
+	// addressed, so it is the whole key: the account's own typing is gone from here, and
+	// nobody else types in somebody's direct chat.
+	key := string(protocol.EventChatPresence) + ":" + keyOf(chat)
 	if !direct {
-		key = string(protocol.EventChatPresence) + ":" + string(chat.Kind) + ":" + chat.ID + ":" + who
+		who, _ := addressedBy(event.Sender, event.SenderAlt)
+		key = string(protocol.EventChatPresence) + ":" + keyOf(chat) + ":" + keyOf(who)
 	}
 	s.post(key, protocol.EventChatPresence, published, life)
 	return true
@@ -135,29 +142,27 @@ func (s *Session) presence(event *waEvents.Presence) bool {
 	// them the way they were subscribed, so one contact is one key here for as long as a
 	// client asks about them the same way. There is no second address on the event to
 	// canonicalise against the way the typing above has one.
-	s.post(string(protocol.EventPresenceUpdate)+":"+keyedBy(event.From),
+	from, _ := addressedBy(event.From)
+	s.post(string(protocol.EventPresenceUpdate)+":"+keyOf(from),
 		protocol.EventPresenceUpdate, published, 0)
 	return true
 }
 
-// keyedBy is the identifier the board keys a person by, which is their number wherever
-// WhatsApp offered one.
+// addressedBy is the one address a person is known by here, which is their number
+// wherever WhatsApp offered one.
 //
 // The same person reaches this under either of WhatsApp's two namespaces, and which one
-// arrives is not the session's to choose. Keyed by whatever turned up, a `composing`
-// addressed by LID and the `paused` after it addressed by number are two entries for one
-// person: nothing coalesces, and which of the two the client is left showing is decided
-// by which entry happened to be published last. Where the event carries both -- and a
-// chat presence does -- one of them is always the number, so preferring it makes the two
-// events one key.
+// arrives is not the session's to choose. Taken as it came, a `composing` addressed by
+// LID and the `paused` after it addressed by number are two people: two board entries, so
+// nothing coalesces, and two chats on the wire, so the stop clears nothing. Where the
+// event carries both -- and a chat presence does -- one of them is always the number, so
+// preferring it makes the two events one.
 //
 // Which JIDs are numbers is `addressOf`'s answer and not a second copy of it, because
-// there is more than one server that means "a number" -- the legacy one and the hosted
-// one alongside the ordinary one -- and a copy that knew only the ordinary one would key
-// a hosted contact by whichever address happened to arrive first. The address it returns
-// is what the key is built from for the same reason: it is the same identity the event
-// itself is published under, so two servers for one person cannot be two keys.
-func keyedBy(jids ...waTypes.JID) string {
+// there is more than one server that means "a number": the legacy one and the hosted one
+// alongside the ordinary one, and a copy that knew only the ordinary one would take a
+// hosted contact as whichever address happened to arrive first.
+func addressedBy(jids ...waTypes.JID) (protocol.Address, bool) {
 	var chosen protocol.Address
 	for _, jid := range jids {
 		switch address, ok := addressOf(jid); {
@@ -166,8 +171,11 @@ func keyedBy(jids ...waTypes.JID) string {
 			chosen = address
 		}
 	}
-	return string(chosen.Kind) + ":" + chosen.ID
+	return chosen, chosen.ID != ""
 }
+
+// keyOf is an address as one string, for a board key.
+func keyOf(address protocol.Address) string { return string(address.Kind) + ":" + address.ID }
 
 // typingOf is the contract's three states out of whatsmeow's two.
 //
