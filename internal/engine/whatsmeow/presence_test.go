@@ -1038,26 +1038,43 @@ func TestThisAccountsOwnTypingInAGroupIsKeptApartFromEveryoneElses(t *testing.T)
 	}
 }
 
-// A presence belongs to the socket that reported it. Once the session has been through a
-// state of its own, the subscription that produced it is gone and the fact is warranted
-// by nothing -- and a client that cleared presence when it saw the session go would have
-// this put back on top, with nothing coming to correct it a second time.
-func TestAPresenceIsNotTriedAgainOnceTheSessionHasMovedUnderIt(t *testing.T) {
+// A presence belongs to the socket that reported it. Once the connection has gone, the
+// subscription that produced it is gone with it -- WhatsApp forgets those and whatsmeow
+// replays none of them -- and the fact is warranted by nothing. Put back then, it lands
+// on top of a client that cleared presence when it saw the session go, with nothing
+// coming to correct it a second time.
+func TestAPresenceIsNotTriedAgainOnceTheConnectionHasGone(t *testing.T) {
 	t.Parallel()
 
-	session, _ := newTestSession(t, "5511999990001")
-	session.picked = make(chan struct{}, 1)
+	for _, dropped := range []struct {
+		name  string
+		event any
+	}{
+		// An ordinary drop, which publishes a session state, and a stream replaced,
+		// which publishes an event of its own and no state at all. Counting the states
+		// would cover the first and miss the second, and the second is the one where
+		// nothing is coming back.
+		{name: "disconnected", event: &waEvents.Disconnected{}},
+		{name: "stream replaced", event: &waEvents.StreamReplaced{}},
+	} {
+		t.Run(dropped.name, func(t *testing.T) {
+			t.Parallel()
 
-	from := waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)
-	session.presence(&waEvents.Presence{From: from})
-	available := next(t, session)
+			session, _ := newTestSession(t, "5511999990001")
+			session.picked = make(chan struct{}, 1)
 
-	session.emit(protocol.EventSessionState, map[string]any{"state": "close", "reason": "disconnected"})
-	next(t, session)
-	available.Settle(errors.New("redis is unreachable"))
+			from := waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)
+			session.presence(&waEvents.Presence{From: from})
+			available := next(t, session)
 
-	if waiting := onBoard(session); len(waiting) != 0 {
-		t.Errorf("an availability from before the session went down was put back: %s", stateOf(t, waiting[0]))
+			session.handle(dropped.event)
+			next(t, session)
+			available.Settle(errors.New("redis is unreachable"))
+
+			if waiting := onBoard(session); len(waiting) != 0 {
+				t.Errorf("an availability from before the connection went was put back: %s", stateOf(t, waiting[0]))
+			}
+		})
 	}
 }
 

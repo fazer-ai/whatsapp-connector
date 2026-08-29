@@ -176,13 +176,19 @@ type Session struct {
 	// something that then could not be queued only costs a marker of its own, while one
 	// counted late reads as nothing having intervened when something has.
 	queued atomic.Int64
-	// transitions counts the session states this session has published, which is what a
-	// presence that failed to publish is checked against before it is given another go.
-	// Everything presence describes belongs to the socket that reported it -- WhatsApp
-	// forgets subscriptions and availability when a connection goes, and whatsmeow
-	// replays neither -- so a state re-asserted after the session has been through one
-	// of these is a fact nothing warrants any more, put back on top of a client that
-	// cleared presence when it saw the session go.
+	// transitions counts the writes to `connected`, which is what a presence that failed
+	// to publish is checked against before it is given another go. Everything presence
+	// describes belongs to the socket that reported it -- WhatsApp forgets subscriptions
+	// and availability when a connection goes, and whatsmeow replays neither -- so a
+	// state re-asserted across one of these is a fact nothing warrants any more, put back
+	// on top of a client that cleared presence when it saw the session go.
+	//
+	// The connection flag and not the events, because they are not the same set: an
+	// ordinary drop publishes `session.state`, while a stream replaced, a ban, an
+	// outdated client and a connect failure each publish an event of their own and no
+	// state. Counting event types would have to name all six and would miss the seventh
+	// somebody adds. `setConnected` and `offline` are the two functions that own the
+	// flag, and every one of those paths goes through one of them.
 	transitions atomic.Int64
 
 	// picked, when it is set, receives once for every emission the forwarder takes off
@@ -451,6 +457,7 @@ func (s *Session) setDialing(dialing bool) {
 }
 
 func (s *Session) setConnected(connected bool) {
+	s.transitions.Add(1)
 	s.mu.Lock()
 	s.connected = connected
 	// Either way the dial is over: whatsmeow has answered for it, with an
@@ -482,6 +489,7 @@ func (s *Session) undoHangUp() bool {
 }
 
 func (s *Session) offline() {
+	s.transitions.Add(1)
 	s.mu.Lock()
 	s.connected = false
 	s.reconnecting = false
@@ -1672,9 +1680,6 @@ func (s *Session) emit(eventType protocol.EventType, payload any) {
 		// programming error rather than something a session should carry on through.
 		s.log.Error().Err(err).Str("type", string(eventType)).Msg("failed to render an event payload")
 		return
-	}
-	if eventType == protocol.EventSessionState {
-		s.transitions.Add(1)
 	}
 	s.queued.Add(1)
 	select {
