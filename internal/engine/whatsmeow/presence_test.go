@@ -631,18 +631,14 @@ func TestPresenceLeavesNothingBehindWhenTheInboxIsFull(t *testing.T) {
 	t.Parallel()
 
 	session, _ := newTestSession(t, "5511999990001")
-	filled := 0
-	for {
-		select {
-		case session.inbox <- pending{event: engine.Emission{Type: protocol.EventSessionState, Payload: []byte(`{}`)}}:
-			filled++
-			continue
-		default:
-		}
-		break
-	}
-	if filled == 0 {
-		t.Fatal("the inbox took nothing at all")
+	filler := pending{event: engine.Emission{Type: protocol.EventSessionState, Payload: []byte(`{}`)}}
+	// The forwarder is parked on the first one before the rest go in. Filling to refusal
+	// instead would race it for the slot it frees on its way to parking, and a queue with
+	// one slot left is a queue the presence below fits into.
+	session.inbox <- filler
+	waitUntil(t, "the forwarder to be holding an emission", func() bool { return len(session.inbox) == 0 })
+	for range cap(session.inbox) {
+		session.inbox <- filler
 	}
 
 	jid := waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)
@@ -914,5 +910,72 @@ func TestAStopThatFailsTwiceIsNotTriedAThirdTime(t *testing.T) {
 
 	if waiting := onBoard(session); len(waiting) != 0 {
 		t.Errorf("%d presences went round for a third go at a publisher that is down", len(waiting))
+	}
+}
+
+// The place a marker holds belongs to the moment it was posted, and a later state may
+// take it only while nothing has queued behind it. Once something has, resolving there
+// would publish a state ahead of an event that happened before it -- and if that event is
+// a session going down, a client that clears presence on it clears this too, with nothing
+// after to put it back.
+func TestAStateDoesNotTakeThePlaceOfAMarkerSomethingHasQueuedBehind(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.picked = make(chan struct{}, 1)
+	blockTheForwarder(t, session)
+
+	jid := waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)
+	session.chatPresence(&waEvents.ChatPresence{
+		MessageSource: waTypes.MessageSource{Chat: jid, Sender: jid}, State: waTypes.ChatPresenceComposing,
+	})
+	session.emit(protocol.EventSessionState, map[string]any{"state": "close"})
+	session.chatPresence(&waEvents.ChatPresence{
+		MessageSource: waTypes.MessageSource{Chat: jid, Sender: jid}, State: waTypes.ChatPresencePaused,
+	})
+
+	// The filler the forwarder is parked on. The typing is not published at all: it was
+	// replaced on the board before its turn came, which is the board doing its job.
+	next(t, session)
+	if first := next(t, session); first.Type != protocol.EventSessionState {
+		t.Fatalf("what came out first is %s, and the session went down before the stop happened", first.Type)
+	}
+	second := next(t, session)
+	if second.Type != protocol.EventChatPresence {
+		t.Fatalf("what came out second is %s", second.Type)
+	}
+	if state := stateOf(t, second); state != "paused" {
+		t.Errorf("what came out after the session state is a %s", state)
+	}
+}
+
+// A direct chat is a person, and WhatsApp addresses them by either of its two namespaces
+// from one event to the next. Keyed by the address that arrived, the `composing` in the
+// LID chat and the `paused` in the number chat are two entries: nothing coalesces, and
+// the typing under whichever address the client saw first is left showing.
+func TestADirectChatIsKeyedByThePersonAndNotTheAddressThatArrived(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.picked = make(chan struct{}, 1)
+	blockTheForwarder(t, session)
+
+	phone := waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)
+	lid := waTypes.NewJID("167392323834034", waTypes.HiddenUserServer)
+	session.chatPresence(&waEvents.ChatPresence{
+		MessageSource: waTypes.MessageSource{Chat: lid, Sender: lid, SenderAlt: phone},
+		State:         waTypes.ChatPresenceComposing,
+	})
+	session.chatPresence(&waEvents.ChatPresence{
+		MessageSource: waTypes.MessageSource{Chat: phone, Sender: phone, SenderAlt: lid},
+		State:         waTypes.ChatPresencePaused,
+	})
+
+	waiting := onBoard(session)
+	if len(waiting) != 1 {
+		t.Fatalf("%d presences are waiting for one person, and only their last state should be", len(waiting))
+	}
+	if state := stateOf(t, waiting[0]); state != "paused" {
+		t.Errorf("what is waiting is a %s, and the person's last state was the stop", state)
 	}
 }

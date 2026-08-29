@@ -72,12 +72,21 @@ func (s *Session) chatPresence(event *waEvents.ChatPresence) bool {
 	if state == protocol.TypingPaused {
 		life = 0
 	}
-	// Keyed by who is typing and not only by where. In a group the state belongs to a
-	// participant: keyed by the chat alone, Bob starting to type replaces Alice's stop
-	// and the client is left showing Alice typing for good. In a direct chat the sender
-	// is the chat, so this is the same key either way.
-	s.post(string(protocol.EventChatPresence)+":"+string(chat.Kind)+":"+chat.ID+":"+
-		keyedBy(event.Sender, event.SenderAlt), protocol.EventChatPresence, published, life)
+	// Keyed by who is typing, and by where only where that adds anything. In a group the
+	// state belongs to a participant: keyed by the chat alone, Bob starting to type
+	// replaces Alice's stop and the client is left showing Alice typing for good.
+	//
+	// In a direct chat the chat is the person, and WhatsApp addresses them by either of
+	// its two namespaces from one event to the next. Keeping the chat in the key there
+	// undoes what the canonical sender just did: a `composing` in the LID chat and the
+	// `paused` in the number chat are two entries again, and the typing under whichever
+	// address the client saw first is left showing with nothing coming.
+	who := keyedBy(event.Sender, event.SenderAlt)
+	key := string(protocol.EventChatPresence) + ":" + who
+	if chat.Kind != protocol.AddressPhone && chat.Kind != protocol.AddressLID {
+		key = string(protocol.EventChatPresence) + ":" + string(chat.Kind) + ":" + chat.ID + ":" + who
+	}
+	s.post(key, protocol.EventChatPresence, published, life)
 	return true
 }
 

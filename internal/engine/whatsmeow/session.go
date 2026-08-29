@@ -170,6 +170,12 @@ type Session struct {
 	board    map[string]posted
 	boardMu  sync.Mutex
 	boardSeq int64
+	// queued counts everything that has taken a place in the inbox, which is how a
+	// presence knows whether the marker already waiting for its chat is still the last
+	// thing in the queue. Counted before the send rather than after: a place claimed for
+	// something that then could not be queued only costs a marker of its own, while one
+	// counted late reads as nothing having intervened when something has.
+	queued atomic.Int64
 
 	// picked, when it is set, receives once for every emission the forwarder takes off
 	// the inbox, before it tries to hand it on. A seam so a test can know the pump is
@@ -1410,7 +1416,7 @@ func (s *Session) forward() {
 				// A marker, and this is the moment it stands for. The value is read now
 				// rather than when it was posted, so what goes out is the chat's newest
 				// state and not the one that happened to be queued.
-				resolved, waiting := s.resolve(item.key)
+				resolved, waiting := s.resolve(item.key, item.at)
 				if !waiting {
 					continue
 				}
@@ -1443,18 +1449,24 @@ const perishableHandoff = time.Second
 type pending struct {
 	event engine.Emission
 	key   string
+	// at is the place this marker took in the queue, and the board entry it stands for
+	// holds the same number for as long as this is the marker that will resolve it.
+	// A marker whose entry has moved on resolves to nothing.
+	at int64
 }
 
 // posted is what the board holds for one chat: its newest state, and enough about where
 // that state has got to for a failure to be told apart from a supersession.
 //
 // `seq` names this value, so the callback of a value that has since been replaced can
-// see that it has. `sent` says the marker for this key has already been resolved, which
-// is what decides whether a new state needs a marker of its own. `retried` is what makes
-// the retry one more go rather than a loop.
+// see that it has. `at` is where in the queue the marker that will resolve this entry
+// sits, and `sent` says that marker has already been resolved, which together decide
+// whether a new state can take the place of the one waiting or needs a place of its own.
+// `retried` is what makes the retry one more go rather than a loop.
 type posted struct {
 	emission engine.Emission
 	seq      int64
+	at       int64
 	sent     bool
 	retried  bool
 }
@@ -1539,13 +1551,24 @@ func (s *Session) post(key string, eventType protocol.EventType, payload any, li
 		// which may be never.
 		entry.emission.Settle = s.settled(key, entry.seq)
 	}
-	if held, waiting := s.board[key]; waiting && !held.sent {
+	if held, waiting := s.board[key]; waiting && !held.sent && s.queued.Load() == held.at {
+		// Its marker is still the last thing in the queue, so this state and the one it
+		// replaces are neighbours in the stream and nothing can come between them.
+		// Taking that place costs nothing and is what makes a burst of typing one slot.
+		//
+		// Once something else has queued behind that marker, the place is no longer this
+		// state's to take: resolved there, this would publish ahead of an event that
+		// happened before it -- and if that event is a session going down and coming back,
+		// a client that clears presence on it clears this and there is nothing after.
+		entry.at = held.at
 		s.board[key] = entry
 		return
 	}
 
+	at := s.queued.Add(1)
+	entry.at = at
 	select {
-	case s.inbox <- pending{key: key}:
+	case s.inbox <- pending{key: key, at: at}:
 		s.board[key] = entry
 	default:
 		// The queue presence shares with the messages is full, which is a publisher that
@@ -1564,11 +1587,13 @@ func (s *Session) post(key string, eventType protocol.EventType, payload any, li
 // change. A moment leaves the board here, because nothing comes back about one; a
 // durable state stays, marked as gone, so its callback can tell a failure from having
 // been replaced.
-func (s *Session) resolve(key string) (engine.Emission, bool) {
+func (s *Session) resolve(key string, at int64) (engine.Emission, bool) {
 	s.boardMu.Lock()
 	defer s.boardMu.Unlock()
 	entry, waiting := s.board[key]
-	if !waiting {
+	if !waiting || entry.at != at {
+		// A place the chat's state has moved on from, because something queued behind
+		// this marker and the state after it took a place of its own further along.
 		return engine.Emission{}, false
 	}
 	if entry.emission.Settle == nil {
@@ -1603,8 +1628,9 @@ func (s *Session) settled(key string, seq int64) func(error) {
 			return
 		}
 		entry.retried, entry.sent = true, false
+		entry.at = s.queued.Add(1)
 		select {
-		case s.inbox <- pending{key: key}:
+		case s.inbox <- pending{key: key, at: entry.at}:
 			s.board[key] = entry
 			s.log.Debug().Str("type", string(entry.emission.Type)).
 				Msg("giving a presence another go after a publish that failed")
@@ -1624,6 +1650,7 @@ func (s *Session) emit(eventType protocol.EventType, payload any) {
 		s.log.Error().Err(err).Str("type", string(eventType)).Msg("failed to render an event payload")
 		return
 	}
+	s.queued.Add(1)
 	select {
 	case s.inbox <- pending{event: engine.Emission{Type: eventType, Payload: body}}:
 	case <-s.done:

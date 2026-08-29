@@ -524,6 +524,7 @@ func (s *Session) deliver(eventType protocol.EventType, payload any) bool {
 	// which is the state the bound exists to keep whatsmeow out of.
 	timeout := time.NewTimer(s.deliverWait)
 	defer timeout.Stop()
+	s.queued.Add(1)
 	select {
 	case s.inbox <- pending{event: emission}:
 	case <-timeout.C:
