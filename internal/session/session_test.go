@@ -37,19 +37,34 @@ type recorder struct {
 	refuse error
 	// gate holds a publish open, for the tests that need the pump busy.
 	gate chan struct{}
+	// deadlined makes that hold answer to the caller's context, for the one test that is
+	// about a write being cut short rather than about one finishing.
+	deadlined bool
 }
 
 func newRecorder() *recorder {
 	return &recorder{replies: make(map[string]protocol.Reply)}
 }
 
-func (r *recorder) Publish(_ context.Context, event *protocol.Event) error {
+func (r *recorder) Publish(ctx context.Context, event *protocol.Event) error {
 	r.mu.Lock()
-	gate := r.gate
-	r.gate = nil
+	gate, deadlined := r.gate, r.deadlined
+	r.gate, r.deadlined = nil, false
 	r.mu.Unlock()
 	if gate != nil {
-		<-gate
+		if !deadlined {
+			<-gate
+		} else {
+			// The caller's deadline is honoured while held, the way a real stream honours
+			// one mid-retry. Opt-in, because the tests that hold a publish open to watch a
+			// shutdown are asserting what happens to a write that finishes, and a fake
+			// that abandoned it would answer a different question.
+			select {
+			case <-gate:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
 	}
 
 	r.mu.Lock()
@@ -69,6 +84,16 @@ func (r *recorder) hold() func() {
 	r.gate = gate
 	r.mu.Unlock()
 	return func() { close(gate) }
+}
+
+// holdWithDeadline is hold for a publish that answers to the caller's context, which is
+// how a real stream behaves mid-retry and the only way to watch a write be cut short.
+func (r *recorder) holdWithDeadline() func() {
+	release := r.hold()
+	r.mu.Lock()
+	r.deadlined = true
+	r.mu.Unlock()
+	return release
 }
 
 func (r *recorder) failWith(err error) {
@@ -1955,5 +1980,143 @@ func TestARecordRefusedOnceIsStillWritten(t *testing.T) {
 	waitFor(t, "the redelivery to be retired", ackedAgain.Load)
 	if got := engineSession.LoggedOut(); got != 1 {
 		t.Fatalf("the account was logged out %d times, want once", got)
+	}
+}
+
+// The engine can only bound what it holds. Everything after the handoff -- a stream that
+// is retrying, a Redis that is coming back -- happens here, and it is exactly the delay
+// that makes a typing indicator wrong rather than late. So the last check is here, and a
+// moment that has passed is dropped rather than written.
+func TestATransientEventThatWentStaleIsNotWrittenToTheStream(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	if _, err := h.manager.Adopt(context.Background(), "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, ok := h.engine.Session("s1")
+	if !ok {
+		t.Fatal("the engine has no session after Adopt")
+	}
+
+	settled := make(chan error, 1)
+	engineSession.EmitPerishable(protocol.EventChatPresence, map[string]any{"state": "composing"},
+		func() time.Duration { return -time.Second }, func(err error) { settled <- err })
+
+	select {
+	case err := <-settled:
+		// Not an error: nothing failed, the event stopped being worth writing. Settled
+		// as a failure it would look like the stream refusing, which is a different
+		// thing and one an engine may act on.
+		if err != nil {
+			t.Fatalf("a moment that had passed settled as %v, and nothing failed", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a moment that had passed was never settled, so the engine waits forever")
+	}
+	if got := len(h.recorder.published()); got != 0 {
+		t.Fatalf("the stream holds %d events, and a moment that had passed is not one to write", got)
+	}
+}
+
+// And the control, because a check that drops everything would pass the test above: a
+// moment that is still true is written like anything else.
+func TestATransientEventThatIsStillTrueIsWritten(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	if _, err := h.manager.Adopt(context.Background(), "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, ok := h.engine.Session("s1")
+	if !ok {
+		t.Fatal("the engine has no session after Adopt")
+	}
+
+	settled := make(chan error, 1)
+	engineSession.EmitPerishable(protocol.EventChatPresence, map[string]any{"state": "composing"},
+		func() time.Duration { return time.Minute }, func(err error) { settled <- err })
+
+	select {
+	case err := <-settled:
+		if err != nil {
+			t.Fatalf("a moment that was still true settled as %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a moment that was still true was never settled")
+	}
+	if got := len(h.recorder.published()); got != 1 {
+		t.Fatalf("the stream holds %d events, want the one that was still true", got)
+	}
+}
+
+// The check before the write is not the write. A stream retrying through an outage can
+// take longer than the whole life of the event, so a deadline that only decided before
+// Publish started has already been answered by the time it lands -- and what lands is a
+// typing indicator about a minute that has passed.
+func TestATransientEventDoesNotOutlastItselfInsideTheWrite(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	if _, err := h.manager.Adopt(context.Background(), "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, ok := h.engine.Session("s1")
+	if !ok {
+		t.Fatal("the engine has no session after Adopt")
+	}
+	// A publish that has started and is not coming back on its own, which is what an
+	// outage looks like from here.
+	release := h.recorder.holdWithDeadline()
+	defer release()
+
+	settled := make(chan error, 1)
+	engineSession.EmitPerishable(protocol.EventChatPresence, map[string]any{"state": "composing"},
+		func() time.Duration { return 50 * time.Millisecond }, func(err error) { settled <- err })
+
+	select {
+	case err := <-settled:
+		// Settled as a success on purpose: nothing failed, the event stopped being worth
+		// making. A failure here reads as the stream refusing, which an engine may act on.
+		if err != nil {
+			t.Fatalf("a moment given up on mid-write settled as %v, and nothing failed", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a moment sat inside a write that outlasted it, which is the whole thing this bounds")
+	}
+	if got := len(h.recorder.published()); got != 0 {
+		t.Fatalf("the stream holds %d events, and one that expired mid-write is not one to write", got)
+	}
+}
+
+// A frame's `ts` is when the engine learned the thing it reports, and not when the write
+// finally went out. Stamped at publication, a typing indicator that spent nine of its ten
+// seconds in a queue goes out looking new, and the freshness rule the contract asks a
+// reader to apply has nothing left to apply it to.
+func TestAnEventCarriesTheMomentTheEngineLearnedIt(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	if _, err := h.manager.Adopt(context.Background(), "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, ok := h.engine.Session("s1")
+	if !ok {
+		t.Fatal("the engine has no session after Adopt")
+	}
+
+	happened := time.Now().Add(-9 * time.Second).UnixMilli()
+	engineSession.EmitAt(protocol.EventChatPresence, map[string]any{"state": "composing"}, happened)
+	// And one that says nothing, which is every event whose time is the moment it is
+	// written: that one still gets the clock.
+	engineSession.Emit(protocol.EventSessionState, map[string]any{"state": "open"})
+
+	waitFor(t, "both events to be published", func() bool { return len(h.recorder.published()) == 2 })
+	events := h.recorder.published()
+	if events[0].TS != happened {
+		t.Errorf("the typing went out stamped %d, and the engine learned it at %d", events[0].TS, happened)
+	}
+	if events[1].TS == happened {
+		t.Error("an event that named no moment of its own was given the previous one's")
 	}
 }

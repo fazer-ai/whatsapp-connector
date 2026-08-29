@@ -74,15 +74,7 @@ func partyOf(info *waTypes.MessageInfo) (*protocol.Party, bool) {
 	if info.VerifiedName != nil {
 		party.VerifiedName = info.VerifiedName.Details.GetVerifiedName()
 	}
-	for _, jid := range []waTypes.JID{info.Sender, info.SenderAlt} {
-		switch address, ok := addressOf(jid); {
-		case !ok:
-		case address.Kind == protocol.AddressPhone && party.Phone == "":
-			party.Phone = address.ID
-		case address.Kind == protocol.AddressLID && party.LID == "":
-			party.LID = address.ID
-		}
-	}
+	naming(&party, info.Sender, info.SenderAlt)
 	if party.Phone != "" || party.LID != "" {
 		return &party, true
 	}
@@ -164,6 +156,21 @@ func inboundOf(event *waEvents.Message, render renderBody) (protocol.InboundMess
 		Ephemeral: said.context.GetExpiration(),
 	}
 	return message, said.failure, true
+}
+
+// naming fills in whichever of WhatsApp's two identifiers the JIDs carry, first one
+// wins per kind. Separate from partyOf because a presence names somebody with no
+// message to read a push name off, and a second copy of this would drift.
+func naming(party *protocol.Party, jids ...waTypes.JID) {
+	for _, jid := range jids {
+		switch address, ok := addressOf(jid); {
+		case !ok:
+		case address.Kind == protocol.AddressPhone && party.Phone == "":
+			party.Phone = address.ID
+		case address.Kind == protocol.AddressLID && party.LID == "":
+			party.LID = address.ID
+		}
+	}
 }
 
 // chatOf is which chat a message belongs to, and it is one function because two places
@@ -431,6 +438,13 @@ func mentionsOf(info *waE2E.ContextInfo) []protocol.Address {
 // emits describes something that already happened, while this one is the reason the
 // message is allowed to leave the phone.
 func (s *Session) receive(event *waEvents.Message) bool {
+	// Once for the node, and not once per event it turns into. A message whose media
+	// failed publishes twice, and the second waits on the first: stamped when it is sent
+	// rather than when it was learned, the failure carries a time up to the whole
+	// publisher bound later than the message it is about, for something the session knew
+	// before it published either.
+	learned := s.learned()
+
 	if event.Info.Sender.IsBot() || event.Info.Chat.IsBot() {
 		// Meta's assistants, either in a chat of their own or replying inline in
 		// somebody else's. The contract has no kind for them on purpose, so no slice of
@@ -457,7 +471,7 @@ func (s *Session) receive(event *waEvents.Message) bool {
 		// It waits on the publisher exactly as a message does: WhatsApp redelivers what
 		// is not acknowledged, and a correction or a deletion nobody published is one
 		// the conversation never learns about.
-		return s.deliver(what.kind, what.payload)
+		return s.deliver(what.kind, what.payload, learned)
 	case dropChange:
 		s.log.Info().Err(what.err).Str("message_id", event.Info.ID).Msg(what.why)
 		return true
@@ -472,7 +486,7 @@ func (s *Session) receive(event *waEvents.Message) bool {
 			Msg("refusing to acknowledge an inbound message this build cannot publish")
 		return false
 	}
-	if !s.deliver(protocol.EventMessageReceived, map[string]any{"message": message}) {
+	if !s.deliver(protocol.EventMessageReceived, map[string]any{"message": message}, learned) {
 		return false
 	}
 	if failure == "" {
@@ -484,7 +498,7 @@ func (s *Session) receive(event *waEvents.Message) bool {
 	// redelivery is what gets the pair out in order.
 	return s.deliver(protocol.EventMediaDownloadFailed, protocol.MediaDownloadFailure{
 		Chat: message.Chat, MessageID: message.ID, Reason: failure,
-	})
+	}, learned)
 }
 
 // deliver emits and waits for the publisher to say what became of it.
@@ -496,7 +510,7 @@ func (s *Session) receive(event *waEvents.Message) bool {
 // succeeds after this gave up on it is delivered to the client and redelivered by
 // WhatsApp afterwards. Which is why the client deduplicates on the message id, and why
 // this way round is the right one — a duplicate is a nuisance, a lost message is not.
-func (s *Session) deliver(eventType protocol.EventType, payload any) bool {
+func (s *Session) deliver(eventType protocol.EventType, payload any, learned int64) bool {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		s.log.Error().Err(err).Str("type", string(eventType)).Msg("failed to render an event payload")
@@ -509,6 +523,7 @@ func (s *Session) deliver(eventType protocol.EventType, payload any) bool {
 	emission := engine.Emission{
 		Type:    eventType,
 		Payload: body,
+		At:      learned,
 		Settle:  func(err error) { settled <- err },
 	}
 	// Started before the emission is queued, not after: the inbox is bounded, and a
@@ -518,7 +533,7 @@ func (s *Session) deliver(eventType protocol.EventType, payload any) bool {
 	timeout := time.NewTimer(s.deliverWait)
 	defer timeout.Stop()
 	select {
-	case s.inbox <- emission:
+	case s.inbox <- pending{event: emission}:
 	case <-timeout.C:
 		s.log.Warn().Str("type", string(eventType)).Dur("waited", s.deliverWait).
 			Msg("withholding an acknowledgement for an event that could not be queued")

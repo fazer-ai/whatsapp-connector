@@ -56,7 +56,7 @@ type Session struct {
 	// only thing that closes it. Two channels rather than one because whatsmeow's
 	// handlers can still be running when Close is called, and a send on a closed
 	// channel is a panic in a library goroutine we do not own.
-	inbox  chan engine.Emission
+	inbox  chan pending
 	events chan engine.Emission
 	done   chan struct{}
 
@@ -149,9 +149,56 @@ type Session struct {
 	// worth another delivery.
 	unseal func(context.Context, *waEvents.Message) (*waE2E.Message, error)
 
+	// handoffWait bounds how long a moment waits on a reader that is busy. A field for
+	// the same reason as deliverWait, and for no other.
+	handoffWait time.Duration
+
+	// board holds the newest presence per chat that has not been published yet. The
+	// inbox holds a marker for each one, saying when its turn is.
+	//
+	// Value and order want opposite shapes, so they are kept apart. What matters about
+	// presence is the last thing somebody did: a FIFO preserves the first, so behind a
+	// backlog a queued `composing` outlives the `paused` dropped for want of room, and
+	// there is no event after a stop -- the client is left showing somebody typing with
+	// nothing coming. Keyed by chat, the stop replaces the typing it stops. But the
+	// order still has to hold against everything else the session publishes, because a
+	// `composing` that overtakes the message ending it leaves the same indicator stuck,
+	// and that is what the marker is for: it sits in the one queue with the messages,
+	// and the value it stands for is read when the forwarder reaches it. Nothing older
+	// is published after something newer, and no value waits in a queue long enough to
+	// go stale in it.
+	board    map[string]posted
+	boardMu  sync.Mutex
+	boardSeq int64
+	// transitions counts the writes to `connected`, which is what a presence that failed
+	// to publish is checked against before it is given another go. Everything presence
+	// describes belongs to the socket that reported it -- WhatsApp forgets subscriptions
+	// and availability when a connection goes, and whatsmeow replays neither -- so a
+	// state re-asserted across one of these is a fact nothing warrants any more, put back
+	// on top of a client that cleared presence when it saw the session go.
+	//
+	// The connection flag and not the events, because they are not the same set: an
+	// ordinary drop publishes `session.state`, while a stream replaced, a ban, an
+	// outdated client and a connect failure each publish an event of their own and no
+	// state. Counting event types would have to name all six and would miss the seventh
+	// somebody adds. `setConnected` and `offline` are the two functions that own the
+	// flag, and every one of those paths goes through one of them.
+	transitions atomic.Int64
+
+	// picked, when it is set, receives once for every emission the forwarder takes off
+	// the inbox, before it tries to hand it on. A seam so a test can know the pump is
+	// parked rather than sleeping until it probably is.
+	picked chan struct{}
+
 	// elapsed is the monotonic reading the publisher window is measured with, and nil is
 	// the real one. A seam so a test can hold the clock still instead of racing it.
 	elapsed func() time.Duration
+
+	// wallClock is where a published event's moment comes from, and nil is the real one.
+	// A seam for the same reason as the one above: a test that has to see two events of
+	// one node carry one moment cannot get there by racing a clock whose two readings are
+	// usually the same millisecond anyway.
+	wallClock func() time.Time
 
 	// privacyKnown reports whether this account's own privacy settings could be read.
 	// A seam for the same reason as the ones below it: nil is the real one.
@@ -265,7 +312,7 @@ func newSession(
 		store:      container,
 		log:        log.With().Str("sid", sid).Logger(),
 		waLog:      wa,
-		inbox:      make(chan engine.Emission, inboxDepth),
+		inbox:      make(chan pending, inboxDepth),
 		events:     make(chan engine.Emission),
 		done:       make(chan struct{}),
 		ctx:        ctx,
@@ -285,6 +332,8 @@ func newSession(
 
 		storeLimit:   bindTimeout,
 		deliverWait:  deliverTimeout,
+		handoffWait:  perishableHandoff,
+		board:        make(map[string]posted),
 		downloadWait: downloadTimeout,
 		uploadWait:   uploadTimeout,
 	}
@@ -409,6 +458,7 @@ func (s *Session) setDialing(dialing bool) {
 
 func (s *Session) setConnected(connected bool) {
 	s.mu.Lock()
+	s.transitions.Add(1)
 	s.connected = connected
 	// Either way the dial is over: whatsmeow has answered for it, with an
 	// authenticated session or with the socket going down again.
@@ -440,10 +490,30 @@ func (s *Session) undoHangUp() bool {
 
 func (s *Session) offline() {
 	s.mu.Lock()
+	s.transitions.Add(1)
 	s.connected = false
 	s.reconnecting = false
 	s.dialing = false
 	s.mu.Unlock()
+}
+
+// connection is the count of connection writes and whether the session is on one right
+// now, read together so the two cannot disagree about the same moment. Presence is the
+// only caller and needs both: a node from a socket that is already down describes nothing
+// current, and a node from the live one has to remember which connection that was.
+func (s *Session) connection() (int64, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.transitions.Load(), s.connected
+}
+
+// learned is the moment an event says the session found out about the thing it reports,
+// which is what the frame's `ts` carries.
+func (s *Session) learned() int64 {
+	if s.wallClock != nil {
+		return s.wallClock().UnixMilli()
+	}
+	return time.Now().UnixMilli()
 }
 
 func (s *Session) setGroups(groups bool) {
@@ -1151,6 +1221,12 @@ func (s *Session) Execute(ctx context.Context, command *protocol.Command) (json.
 		return s.downloadMedia(ctx, command)
 	case protocol.CommandMessageMarkRead:
 		return s.markRead(ctx, command)
+	case protocol.CommandPresenceSet:
+		return s.setPresence(ctx, command)
+	case protocol.CommandPresenceSubscribe:
+		return s.subscribePresence(ctx, command)
+	case protocol.CommandChatPresence:
+		return s.chatPresenceCommand(ctx, command)
 	}
 	return nil, engine.ErrNotSupported
 }
@@ -1369,12 +1445,272 @@ func (s *Session) forward() {
 		select {
 		case <-s.done:
 			return
-		case emission := <-s.inbox:
-			select {
-			case s.events <- emission:
-			case <-s.done:
+		case item := <-s.inbox:
+			emission := item.event
+			if item.key != "" {
+				// A marker, and this is the moment it stands for. The value is read now
+				// rather than when it was posted, so what goes out is the chat's newest
+				// state and not the one that happened to be queued.
+				resolved, waiting := s.resolve(item.key, item.seq)
+				if !waiting {
+					continue
+				}
+				emission = resolved
+			}
+			if !s.handOn(emission) {
 				return
 			}
+		}
+	}
+}
+
+// presenceLife is how long a moment is worth publishing for. Past it the session knows
+// more than the event does: whatever came next either replaced it on the board or was
+// published, and a client shown the old one has no way to learn better.
+const presenceLife = 10 * time.Second
+
+// perishableHandoff bounds how long a moment waits on a reader that is busy. Short,
+// because everything past it is added to how stale the event is by the time somebody
+// sees it, and a moment is worth nothing stale.
+const perishableHandoff = time.Second
+
+// pending is what the forwarder takes off the inbox: an event to hand on, or the key of
+// a board entry whose value is read when its turn comes.
+//
+// The marker is what keeps presence in step with everything else without ever waiting
+// for room. It takes its place in the queue at the moment the state happens, and carries
+// nothing, so the value it resolves to is whatever that chat's newest state is by the
+// time the forwarder gets there.
+type pending struct {
+	event engine.Emission
+	key   string
+	// seq names the value this marker stands for, and the board entry holds the same
+	// number for as long as that value is the chat's newest. A marker the chat has moved
+	// on from resolves to nothing, which is what keeps a state at the place it happened
+	// at rather than at the place an older one is waiting in.
+	seq int64
+}
+
+// posted is what the board holds for one chat: its newest state, and enough about where
+// that state has got to for a failure to be told apart from a supersession.
+//
+// `seq` names this value: the marker that will resolve it carries the same number, and
+// so does the callback the publisher owes it, so both can tell that the chat has moved on
+// since. `sent` says the marker has already been resolved. `retried` is what makes the
+// retry one more go rather than a loop.
+type posted struct {
+	emission engine.Emission
+	seq      int64
+	sent     bool
+	retried  bool
+	// transitions is what the connection counter read when this state happened, so a
+	// failure coming back later can tell that the socket it describes is gone.
+	transitions int64
+}
+
+// handOn gives one emission to the reader, and reports whether the forwarder should
+// carry on.
+//
+// A moment gets two things a fact does not: it is dropped if it went stale waiting, and
+// its handoff is bounded. The second is what makes the first mean anything -- an
+// unbounded handoff would pass the freshness check and then sit on a reader that is
+// busy, and what came out would be exactly the stale event the check is for.
+func (s *Session) handOn(emission engine.Emission) bool {
+	if s.picked != nil {
+		// Taken, and about to be handed on. A test that needs the forwarder parked here
+		// rather than racing it reads this. Never waits: a hook that can hold the
+		// forwarder is a hook that can hang the thing it was put there to watch.
+		select {
+		case s.picked <- struct{}{}:
+		default:
+		}
+	}
+	if emission.Expires == nil {
+		select {
+		case s.events <- emission:
+			return true
+		case <-s.done:
+			return false
+		}
+	}
+	if emission.Expires() <= 0 {
+		s.log.Debug().Str("type", string(emission.Type)).
+			Msg("dropping a transient event that waited too long to still be true")
+		return true
+	}
+	handoff := time.NewTimer(s.handoffWait)
+	defer handoff.Stop()
+	select {
+	case s.events <- emission:
+	case <-handoff.C:
+		s.log.Debug().Str("type", string(emission.Type)).
+			Msg("dropping a transient event the reader was not there for")
+	case <-s.done:
+		return false
+	}
+	return true
+}
+
+// post makes a presence the newest state of its chat and puts a marker for it in the
+// inbox, and never waits.
+//
+// Waiting is the whole reason presence does not go through the inbox as a value: it
+// would hold WhatsApp's node handler for as long as the publisher is down, and what came
+// out the other side would be a fact about a minute that has passed. A marker costs a
+// queue slot and is taken without one being free only when there is none, which is a
+// publisher that has already stopped answering.
+//
+// A chat whose marker has not been resolved yet needs no second one -- the one already
+// in the queue reads whatever is newest when it gets there -- so a burst of typing costs
+// one slot rather than one per event.
+func (s *Session) post(key string, eventType protocol.EventType, payload any, life time.Duration) {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		s.log.Error().Err(err).Str("type", string(eventType)).Msg("failed to render an event payload")
+		return
+	}
+	// The connection as it is now, and not as it will be when this reaches the publisher:
+	// what the rest of this has to know is which socket reported the state, and a drop
+	// while the marker waits its turn is exactly the case where that socket is gone. Read
+	// at hand-over instead, the drop would be counted as having happened before the state
+	// rather than after it, and both the publish and the retry would go out behind the
+	// close.
+	//
+	// A node from a socket that is already down is refused outright. whatsmeow runs the
+	// node handlers and the connection ones on separate goroutines, so a presence from
+	// the old socket can arrive after the disconnect has been dealt with -- and then no
+	// ordering the posting end could arrange would help, because what it describes has
+	// been over since before it got here. A message in that position is still a message;
+	// a presence is a claim about right now.
+	generation, up := s.connection()
+	if !up {
+		s.log.Debug().Str("type", string(eventType)).
+			Msg("dropping presence reported by a connection that is already down")
+		return
+	}
+	emission := engine.Emission{Type: eventType, Payload: body, At: s.learned()}
+	if life > 0 {
+		perishes := s.since() + life
+		emission.Expires = func() time.Duration { return perishes - s.since() }
+	}
+
+	s.boardMu.Lock()
+	defer s.boardMu.Unlock()
+	s.boardSeq++
+	entry := posted{emission: emission, seq: s.boardSeq, transitions: generation}
+	if life == 0 {
+		// A state that corrects something the client has already been shown, and there
+		// is nothing after it: a stop is the end of a typing burst, and somebody going
+		// away is the end of them being there. Lost to a publisher having a bad second
+		// it is not sent again by WhatsApp and not superseded by anything, so the client
+		// is left with the state before it until that person does something else --
+		// which may be never.
+		entry.emission.Settle = s.settled(key, entry.seq)
+	}
+	// A place of its own, every time, and never the one a marker for this chat is already
+	// holding. Taking that place would publish this state where the older one stood, and
+	// whether anything has queued between the two since is not a question this can answer:
+	// a reservation and a send are two steps, and another producer can land between them,
+	// so a count of what has been queued is a guess. The older marker resolves to nothing
+	// when its turn comes, which costs a slot in the queue and buys the one thing the
+	// marker exists for -- a state published where it happened, and not earlier.
+	select {
+	case s.inbox <- pending{key: key, seq: entry.seq}:
+		s.board[key] = entry
+	default:
+		// The queue presence shares with the messages is full, which is a publisher that
+		// has stopped answering while 256 messages piled up behind it. Presence waits for
+		// nothing, so this is dropped -- and whatever the chat had before is left where it
+		// is, because that one is already on its way and this one never started.
+		//
+		// A stop dropped here is a stop nothing replaces, which is the cost of sharing the
+		// queue and what buys the order. Registered as #47.
+		s.log.Debug().Str("type", string(eventType)).
+			Msg("dropping presence the inbox had no room for")
+	}
+}
+
+// resolve reads what a marker stands for, and is the last moment that value can still
+// change. A moment leaves the board here, because nothing comes back about one; a
+// durable state stays, marked as gone, so its callback can tell a failure from having
+// been replaced.
+func (s *Session) resolve(key string, seq int64) (engine.Emission, bool) {
+	s.boardMu.Lock()
+	defer s.boardMu.Unlock()
+	entry, waiting := s.board[key]
+	if !waiting || entry.seq != seq {
+		// A place the chat has moved on from: the state this marker was for was replaced,
+		// and the one that replaced it has a place of its own further along.
+		return engine.Emission{}, false
+	}
+	if entry.transitions != s.transitions.Load() {
+		// The connection this state was reported on has gone since it was posted, and
+		// the event that says so is in this same queue. Published after it, this lands
+		// on a client that clears presence when it sees a session go, and nothing comes
+		// to correct it a second time; published before it, that same event clears it
+		// anyway. There is nothing to lose by dropping it and one thing to lose by not.
+		//
+		// This is also the answer to the two handlers racing. A presence node and a
+		// disconnect reach this from different goroutines with no order between them, so
+		// no amount of care at the posting end decides which of the two queues first --
+		// but whichever way it lands, the state is not published on the far side of the
+		// connection that produced it.
+		delete(s.board, key)
+		s.log.Debug().Str("type", string(entry.emission.Type)).
+			Msg("dropping a presence whose connection went before its turn came")
+		return engine.Emission{}, false
+	}
+	if entry.emission.Settle == nil {
+		delete(s.board, key)
+		return entry.emission, true
+	}
+	entry.sent = true
+	s.board[key] = entry
+	return entry.emission, true
+}
+
+// settled returns the callback the publisher owes a durable presence, which gives it one
+// more go when the publish it was handed to failed.
+//
+// One more, and not a loop: a publisher that is down stays down for longer than any
+// number of immediate retries, and the point here is a bad second rather than an outage.
+// And only while this is still the chat's newest state -- anything posted after it is
+// what the client should end up with, and the sequence says so whether that newer state
+// is still waiting for its turn or has already gone out.
+func (s *Session) settled(key string, seq int64) func(error) {
+	return func(err error) {
+		s.boardMu.Lock()
+		defer s.boardMu.Unlock()
+		entry, waiting := s.board[key]
+		if !waiting || entry.seq != seq {
+			// Replaced by a newer state for the same chat, which is the one the client
+			// should end up with.
+			return
+		}
+		if err == nil || entry.retried {
+			delete(s.board, key)
+			return
+		}
+		if s.transitions.Load() != entry.transitions {
+			// The session has been through a state of its own since this was handed over,
+			// and presence does not survive one: the subscription that produced it is
+			// gone, and a client that cleared presence when it saw the session go would
+			// have this put back on top with nothing coming to correct it again.
+			delete(s.board, key)
+			s.log.Debug().Str("type", string(entry.emission.Type)).
+				Msg("dropping a presence whose session changed under it before it could be tried again")
+			return
+		}
+		entry.retried, entry.sent = true, false
+		select {
+		case s.inbox <- pending{key: key, seq: entry.seq}:
+			s.board[key] = entry
+			s.log.Debug().Str("type", string(entry.emission.Type)).
+				Msg("giving a presence another go after a publish that failed")
+		default:
+			delete(s.board, key)
+			s.log.Debug().Str("type", string(entry.emission.Type)).
+				Msg("dropping a presence the inbox had no room to try again for")
 		}
 	}
 }
@@ -1388,7 +1724,7 @@ func (s *Session) emit(eventType protocol.EventType, payload any) {
 		return
 	}
 	select {
-	case s.inbox <- engine.Emission{Type: eventType, Payload: body}:
+	case s.inbox <- pending{event: engine.Emission{Type: eventType, Payload: body, At: s.learned()}}:
 	case <-s.done:
 	}
 }
@@ -1719,6 +2055,13 @@ func (s *Session) handle(rawEvent any) bool {
 		// before. Everything this build cannot render yet is still refused, which is
 		// what keeps it on the phone for a later milestone.
 		return s.receive(event)
+	case *waEvents.ChatPresence:
+		// Published and acknowledged whatever happens, which is the one place on this
+		// path that does not withhold: a moment redelivered is a lie, and the state that
+		// corrects it was published while the stale one was being retried.
+		return s.chatPresence(event)
+	case *waEvents.Presence:
+		return s.presence(event)
 	case *waEvents.Receipt:
 		// The other handler that can withhold an acknowledgement, and for the same
 		// reason: a tick nobody published never turns, and the client cannot ask again.

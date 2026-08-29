@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"time"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 )
@@ -23,6 +24,18 @@ var ErrNotSupported = errors.New("engine: command not supported")
 type Emission struct {
 	Type    protocol.EventType
 	Payload json.RawMessage
+
+	// At is when the engine learned the thing this reports, in epoch milliseconds like
+	// every timestamp that crosses the wire, and it is what the frame's `ts` carries.
+	// Zero is the engine not saying, and the session stamps the moment it publishes
+	// instead -- no real reading is zero, and 1970 is not a moment WhatsApp reports.
+	//
+	// The distinction is the whole of what a reader can do about a late event. Stamped at
+	// publication, a typing indicator that spent nine of its ten seconds in a queue goes
+	// out looking new, and the freshness rule the contract asks a reader to apply has
+	// nothing to apply it to. The engine is the only layer that knows when the fact
+	// happened, so it is the one that says.
+	At int64
 	// Settle, when it is set, is called exactly once with the outcome of publishing
 	// this emission: nil once the client can be assumed to have it, an error when it
 	// never reached the stream. It is what lets an engine hold WhatsApp's own
@@ -35,6 +48,23 @@ type Emission struct {
 	// nobody is reading any more, so an engine that waits on this must have a way out
 	// of its own when its session ends.
 	Settle func(error)
+
+	// Expires, when it is set, reports how much longer this emission is worth publishing
+	// for; zero or less is not any more. Nil is forever, which is every event that states
+	// a fact: a message, a receipt, a session's state.
+	//
+	// It exists for the few that state a moment instead. A typing indicator that waited
+	// out a backlog is published as a claim about now, and now has moved; the state that
+	// would have corrected it was already dropped for the same backlog. An engine that
+	// sets this is saying the event is worth nothing late.
+	//
+	// A remaining time rather than a yes or no, because the publisher has to bound the
+	// write and not merely decide before it: a stream that is retrying through an outage
+	// can take longer than the whole life of the event, and a check that ran before it
+	// started has already been answered by the time it lands. The publisher owes the
+	// Settle callback either way, and an emission dropped for age settles as a success:
+	// nothing failed, it stopped being worth writing.
+	Expires func() time.Duration
 }
 
 // Engine opens sessions. One process has one engine; a session is one WhatsApp

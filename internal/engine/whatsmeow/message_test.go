@@ -540,9 +540,9 @@ func TestAMessageThatCannotEvenBeQueuedIsLeftUnacknowledgedWithinTheBound(t *tes
 	session, _ := newTestSession(t, "5511999990001")
 	session.deliverWait = 50 * time.Millisecond
 
-	filler := engine.Emission{
+	filler := pending{event: engine.Emission{
 		Type: protocol.EventChatPresence, Payload: json.RawMessage(`{"state":"composing"}`),
-	}
+	}}
 	// Nobody reads Events here, so the forwarder takes one emission and blocks handing
 	// it over. Waiting for it to do that before filling the rest is what makes the
 	// inbox stay full: filling first races the forwarder for the slot it frees, and a

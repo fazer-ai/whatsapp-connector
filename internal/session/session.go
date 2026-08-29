@@ -228,6 +228,31 @@ func (s *Session) publish(ctx context.Context, emission engine.Emission) {
 		return
 	}
 
+	// outlives is the caller's own context, kept when a moment's remaining life is put
+	// in front of it, so a deadline this function imposed can be told from one the caller
+	// had. Nil when nothing was imposed.
+	var outlives context.Context
+	if emission.Expires != nil {
+		// A moment, and this is the last place it can be stopped. The engine bounds what
+		// it holds; everything after that -- a stream that is retrying, a Redis that is
+		// coming back -- happens here, and it is exactly the delay that makes a typing
+		// indicator wrong rather than late.
+		//
+		// The remaining life bounds the write rather than being checked before it. A
+		// check alone would pass and then sit inside a Publish that outlasts the whole
+		// event, which is the outage this is for.
+		left := emission.Expires()
+		if left <= 0 {
+			s.log.Debug().Str("type", string(emission.Type)).
+				Msg("dropped a transient emission that is no longer true")
+			settle(emission, nil)
+			return
+		}
+		bounded, cancel := context.WithTimeout(ctx, left)
+		defer cancel()
+		outlives, ctx = ctx, bounded
+	}
+
 	s.seq++
 	event := protocol.Event{
 		V:       protocol.Version,
@@ -236,11 +261,20 @@ func (s *Session) publish(ctx context.Context, emission engine.Emission) {
 		SID:     s.sid,
 		Epoch:   s.lease.Epoch,
 		Seq:     s.seq,
-		TS:      s.now().UnixMilli(),
+		TS:      stamped(emission, s.now()),
 		Inst:    s.instance,
 		Payload: emission.Payload,
 	}
 	err := s.publisher.Publish(ctx, &event)
+	if err != nil && outlives != nil && outlives.Err() == nil && errors.Is(err, context.DeadlineExceeded) {
+		// The write was still going when the event stopped being worth making, and the
+		// deadline that ended it was this function's own rather than the caller's.
+		// Nothing failed, so nothing above should hear that anything did.
+		s.log.Debug().Str("type", string(emission.Type)).
+			Msg("gave up on a transient emission that went stale mid-write")
+		settle(emission, nil)
+		return
+	}
 	if err != nil && ctx.Err() == nil {
 		s.log.Error().Err(err).Str("type", string(emission.Type)).Msg("failed to publish an event")
 	}
@@ -248,6 +282,17 @@ func (s *Session) publish(ctx context.Context, emission engine.Emission) {
 		err = s.stillOwned()
 	}
 	settle(emission, err)
+}
+
+// stamped is when the thing an event reports happened, which is what its `ts` carries.
+// The engine's own reading where it gave one, and this moment where it did not: an event
+// that spent time in a queue is not news from now, and a reader deciding whether a moment
+// is still worth showing has only this to go on.
+func stamped(emission engine.Emission, published time.Time) int64 {
+	if emission.At == 0 {
+		return published.UnixMilli()
+	}
+	return emission.At
 }
 
 // stillOwned reports whether the epoch an event was just published under is the one
@@ -538,6 +583,12 @@ func idempotencyKey(command *protocol.Command) string {
 		// A question, and the answer is only worth having if it is current. Answering a
 		// redelivered `session.status` from a record would report the state the session
 		// was in when it was first asked.
+		return ""
+	}
+	if protocol.RepeatableCommands[command.Type] {
+		// Not a question, and still not worth remembering: what it set belongs to a
+		// socket that may be gone by the time the redelivery lands, and the record would
+		// report a success over a connection where nothing was done.
 		return ""
 	}
 	// Only where the id is the command's own creation. `message.download_media` also

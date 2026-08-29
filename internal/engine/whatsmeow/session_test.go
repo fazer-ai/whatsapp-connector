@@ -105,11 +105,12 @@ func TestExecuteAnswersTheSessionAndRefusesTheRest(t *testing.T) {
 		t.Fatalf("an unconnected session reports %q, want close", status.Connection)
 	}
 
-	// A later slice of M2 brings the rest. Until then a refusal is the honest answer:
+	// A later milestone brings these. Until then a refusal is the honest answer:
 	// acknowledging a command this build cannot carry out would lose whatever it was
 	// asked to do and report success.
 	for _, unsupported := range []protocol.CommandType{
-		protocol.CommandChatPresence,
+		protocol.CommandMessageMarkUnread, protocol.CommandHistoryRequest,
+		protocol.CommandContactCheck, protocol.CommandGroupInfo, protocol.CommandCallReject,
 	} {
 		if _, err := session.Execute(t.Context(), &protocol.Command{Type: unsupported}); !errors.Is(err, engine.ErrNotSupported) {
 			t.Fatalf("%s answered %v, want ErrNotSupported", unsupported, err)
@@ -122,7 +123,8 @@ func TestExecuteAnswersTheSessionAndRefusesTheRest(t *testing.T) {
 	// client told `unsupported` stops asking, so the two answers cannot be swapped.
 	for _, reached := range []protocol.CommandType{
 		protocol.CommandMessageEdit, protocol.CommandMessageRevoke, protocol.CommandMessageReact,
-		protocol.CommandMessageMarkRead,
+		protocol.CommandMessageMarkRead, protocol.CommandPresenceSet,
+		protocol.CommandPresenceSubscribe, protocol.CommandChatPresence,
 	} {
 		_, err := session.Execute(t.Context(), &protocol.Command{Type: reached, Payload: json.RawMessage(`{}`)})
 		if errors.Is(err, engine.ErrNotSupported) {
