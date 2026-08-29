@@ -718,7 +718,19 @@ func whyUnopened(event *waEvents.UndecryptableMessage, chat protocol.AddressKind
 func (s *Session) awaitOrPublish(message *protocol.InboundMessage, learned int64) {
 	due := learned + s.rerequestWait.Milliseconds()
 	s.hold(message, learned, due)
-	s.await(message, learned, due, s.rerequestWait)
+	// Measured from the deadline that was written down, not from here. Holding the row
+	// is a store call and can take up to the store bound, and a window started after it
+	// would have this owner publish later than the deadline a successor reads out of the
+	// same row -- so whether a bubble was on time would depend on whether a handoff
+	// happened to occur.
+	s.await(message, learned, due, s.until(due))
+}
+
+// until is what is left of a deadline, and never less than nothing. A window that has
+// already run out is a bubble that is overdue, which is a reason to publish now rather
+// than an error.
+func (s *Session) until(due int64) time.Duration {
+	return max(time.Duration(due-s.learned())*time.Millisecond, 0)
 }
 
 // hold writes the undecided bubble down, so a process that ends inside the window does
@@ -960,7 +972,6 @@ func (s *Session) rearm(ctx context.Context) {
 		return
 	}
 
-	now := s.learned()
 	for _, held := range waiting {
 		var message protocol.InboundMessage
 		if err := json.Unmarshal([]byte(held.Message), &message); err != nil {
@@ -972,7 +983,7 @@ func (s *Session) rearm(ctx context.Context) {
 			s.dropHold(held.MessageID)
 			continue
 		}
-		wait := max(time.Duration(held.DueAt-now)*time.Millisecond, 0)
+		wait := s.until(held.DueAt)
 		s.log.Info().Str("message_id", held.MessageID).Dur("wait", wait).
 			Msg("picking up a placeholder a previous owner of this session left waiting")
 		s.await(&message, held.LearnedAt, held.DueAt, wait)

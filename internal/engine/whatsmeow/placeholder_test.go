@@ -2,6 +2,7 @@ package whatsmeow
 
 import (
 	"encoding/json"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -167,21 +168,66 @@ func placeholdersOf(t *testing.T, container *store.Container, sid string) []stor
 	return held
 }
 
-// waitForNoPlaceholders polls, because the row is dropped after the publish settles and
-// on the goroutine that published it: asserting straight away would be asserting on the
-// scheduler rather than on the code.
+// waitForNoPlaceholders polls until the row is gone, on the same deadline
+// waitForBlockedInbox uses.
+//
+// Polled rather than signalled, and that is not the sleep the testing rules rule out:
+// the prohibited thing is sleeping *instead of* synchronising, where the assertion runs
+// once and a slow machine fails it. This runs the assertion until it holds or the
+// deadline does not, so a slow machine costs time and never a verdict. The alternative
+// is a completion channel on Session that only tests would read, and a hook in the
+// production type is a worse thing to carry than a loop in the test.
 func waitForNoPlaceholders(t *testing.T, container *store.Container, sid string) {
 	t.Helper()
 
-	deadline := time.Now().Add(2 * time.Second)
-	for {
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
 		if len(placeholdersOf(t, container, sid)) == 0 {
 			return
 		}
-		if time.Now().After(deadline) {
-			t.Fatal("the row for a decided placeholder is still there, and the next owner would publish it again")
-		}
-		time.Sleep(5 * time.Millisecond)
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("the row for a decided placeholder is still there, and the next owner would publish it again")
+}
+
+// Two instances, as anything touching ownership has to be tested with. The dangerous
+// version is not both of them publishing -- the client deduplicates on the id and keeps
+// one bubble -- it is the instance on its way out taking the row with it, which would
+// leave the bubble exactly where it was before any of this: gone, with WhatsApp holding
+// no copy to send again.
+func TestAnOwnerOnItsWayOutCannotTakeTheNextOwnersPlaceholder(t *testing.T) {
+	t.Parallel()
+
+	first, container := newTestSession(t, "5511999990001")
+	first.rerequestWait = time.Minute
+	first.wallClock = func() time.Time { return scheduledAt }
+	publishedNothingUnreadable(t, first, unavailableMessage("3EB0LATEDROP", "view_once"))
+
+	losing := first.store
+	if err := first.Close(); err != nil {
+		t.Fatalf("Close the first owner: %v", err)
+	}
+
+	second := nextOwner(t, container, first.sid)
+	second.wallClock = func() time.Time { return scheduledAt.Add(time.Second) }
+	second.rearm(t.Context())
+	if !waitingOn(second, "3EB0LATEDROP") {
+		t.Fatal("the second owner never picked the bubble up, so there is nothing here to take from it")
+	}
+
+	// The outgoing owner's own cleanup, landing after the session moved on. Through the
+	// handle it held and on a context that is alive, so what refuses this is the fence
+	// its close dropped rather than its own cancellation -- which is what makes this a
+	// test of who owns the session and not of teardown order.
+	if err := losing.DropPlaceholder(t.Context(), "3EB0LATEDROP"); err == nil {
+		t.Fatal("the outgoing owner took the bubble its successor was holding")
+	}
+
+	if held := placeholdersOf(t, container, first.sid); len(held) != 1 {
+		t.Fatalf("the bubble the second owner is holding is gone from the store (%d rows)", len(held))
+	}
+	if !waitingOn(second, "3EB0LATEDROP") {
+		t.Fatal("the second owner stopped waiting on a bubble nobody decided")
 	}
 }
 
@@ -202,5 +248,33 @@ func TestForgettingASessionTakesThePlaceholdersItWasHolding(t *testing.T) {
 	}
 	if held := placeholdersOf(t, container, session.sid); len(held) != 0 {
 		t.Fatalf("%d placeholder(s) outlived the pairing they were held for", len(held))
+	}
+}
+
+// The window is the one written down, and it starts when the message arrived rather
+// than when the row finished being written. Holding it is a store call and can take up
+// to the store bound, so a timer started afterwards runs past the deadline a successor
+// would read out of the same row: whether a bubble was on time would then depend on
+// whether a handoff happened to occur.
+func TestTheFirstOwnerPublishesOnTheDeadlineItWroteDown(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.rerequestWait = time.Minute
+
+	// A clock that is a further 59 seconds along at every read, standing in for a store
+	// that took its time. The deadline is fixed the moment the message arrives; what is
+	// under test is whether the timer is measured from that or from afterwards.
+	var reads atomic.Int64
+	session.wallClock = func() time.Time {
+		return scheduledAt.Add(time.Duration(reads.Add(1)-1) * 59 * time.Second)
+	}
+
+	emission, acknowledged := unreadable(t, session, unavailableMessage("3EB0ONTIME", "view_once"))
+	if !acknowledged {
+		t.Fatal("a stanza carrying nothing was left for WhatsApp to send again")
+	}
+	if message := messageOf(t, emission); message.ID != "3EB0ONTIME" {
+		t.Fatalf("the bubble names %q", message.ID)
 	}
 }
