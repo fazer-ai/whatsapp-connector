@@ -123,20 +123,9 @@ type renderBody func(*waEvents.Message) (body, bool)
 // The second return is the failure to announce once the message itself is out, empty
 // for a message with nothing missing.
 func inboundOf(event *waEvents.Message, render renderBody) (protocol.InboundMessage, string, bool) {
-	chat, ok := chatOf(event)
-	if !ok || event.Info.ID == "" {
+	message, ok := envelopeOf(&event.Info)
+	if !ok {
 		return protocol.InboundMessage{}, "", false
-	}
-	var sender *protocol.Party
-	if !event.Info.IsFromMe {
-		// An echo carries no sender, which is what the contract's own fixture for one
-		// says and what the client reads: `from_me` is the whole answer to who sent it,
-		// and naming the account itself there files the operator's own number as the
-		// party in a conversation with somebody else.
-		var named bool
-		if sender, named = partyOf(&event.Info); !named {
-			return protocol.InboundMessage{}, "", false
-		}
 	}
 	// Asked for last, once every question about the envelope has been answered.
 	said, ok := render(event)
@@ -144,18 +133,42 @@ func inboundOf(event *waEvents.Message, render renderBody) (protocol.InboundMess
 		return protocol.InboundMessage{}, "", false
 	}
 
-	message := protocol.InboundMessage{
-		ID:        event.Info.ID,
+	message.Content = said.content
+	message.QuotedID = said.context.GetStanzaID()
+	message.Mentions = mentionsOf(said.context)
+	message.Ephemeral = said.context.GetExpiration()
+	return message, said.failure, true
+}
+
+// envelopeOf is everything about an inbound message except what was said in it, which is
+// the one part a message this device was never given has none of.
+//
+// Separate from `inboundOf` for that reason and no other: a stanza that arrived with no
+// ciphertext in it still has a sender, a chat and a time, and the client needs all three
+// to put a bubble where the message was.
+func envelopeOf(info *waTypes.MessageInfo) (protocol.InboundMessage, bool) {
+	chat, ok := chatOf(info)
+	if !ok || info.ID == "" {
+		return protocol.InboundMessage{}, false
+	}
+	var sender *protocol.Party
+	if !info.IsFromMe {
+		// An echo carries no sender, which is what the contract's own fixture for one
+		// says and what the client reads: `from_me` is the whole answer to who sent it,
+		// and naming the account itself there files the operator's own number as the
+		// party in a conversation with somebody else.
+		var named bool
+		if sender, named = partyOf(info); !named {
+			return protocol.InboundMessage{}, false
+		}
+	}
+	return protocol.InboundMessage{
+		ID:        info.ID,
 		Chat:      chat,
 		Sender:    sender,
-		FromMe:    event.Info.IsFromMe,
-		Timestamp: event.Info.Timestamp.UnixMilli(),
-		Content:   said.content,
-		QuotedID:  said.context.GetStanzaID(),
-		Mentions:  mentionsOf(said.context),
-		Ephemeral: said.context.GetExpiration(),
-	}
-	return message, said.failure, true
+		FromMe:    info.IsFromMe,
+		Timestamp: info.Timestamp.UnixMilli(),
+	}, true
 }
 
 // naming fills in whichever of WhatsApp's two identifiers the JIDs carry, first one
@@ -177,16 +190,16 @@ func naming(party *protocol.Party, jids ...waTypes.JID) {
 // have to agree on the answer: the address the event is published under, and the one the
 // file kept for that message is filed under. A second copy of this rule would drift, and
 // the drift would file a message's file in a chat the message is not in.
-func chatOf(event *waEvents.Message) (protocol.Address, bool) {
-	chatJID := event.Info.Chat
-	if event.Info.IsIncomingBroadcast() {
+func chatOf(info *waTypes.MessageInfo) (protocol.Address, bool) {
+	chatJID := info.Chat
+	if info.IsIncomingBroadcast() {
 		// Somebody sent this through a broadcast list, and WhatsApp shows it to the
 		// recipient in the direct chat with whoever sent it, not under the list.
 		// whatsmeow says so on the event, and addressing the list instead sends the
 		// message to a chat the client does not open conversations for, after
 		// acknowledging it: a message the recipient can see on their own phone and
 		// nowhere else. The status feed is not a broadcast list and is not touched.
-		chatJID = event.Info.Sender
+		chatJID = info.Sender
 	}
 	return addressOf(chatJID)
 }
@@ -465,6 +478,19 @@ func (s *Session) receive(event *waEvents.Message) bool {
 		return true
 	}
 
+	if stanza := stanzaOf(event); s.arrived(stanza) {
+		// This one was unreadable a moment ago and the recovery worked: either the sender
+		// encrypted it again or the phone forwarded it. The placeholder waiting for it is
+		// called off here rather than published and corrected, because a client that
+		// deduplicates on the id would keep the placeholder and discard this.
+		//
+		// Before the switch below, and not after it: a recovered edit or reaction leaves
+		// here as a change to a message that already exists, and a placeholder still
+		// waiting behind that return would go out as a message of its own.
+		s.log.Info().Str("message_id", stanza).
+			Msg("a message that could not be read arrived after all")
+	}
+
 	switch what := s.changed(event); what.verdict {
 	case publishChange:
 		// Not a message this account received, but something done to one it already has.
@@ -501,6 +527,22 @@ func (s *Session) receive(event *waEvents.Message) bool {
 	}, learned)
 }
 
+// stanzaOf is the id of the stanza this event arrived in, which is what a placeholder for
+// it is waiting under and is not always the id on the event.
+//
+// A recovery that comes back through the phone is parsed by ParseWebMessage, and that
+// rewrites the id of an edit to the message the edit corrects, leaving the stanza's own id
+// on the web message it came in. Asked for the id on the event, the carrier's placeholder
+// would go unclaimed and go out behind the correction; asked for both, the correction would
+// call off a placeholder belonging to the message it corrects, which is a different message
+// and still missing.
+func stanzaOf(event *waEvents.Message) string {
+	if id := event.SourceWebMsg.GetKey().GetID(); id != "" {
+		return id
+	}
+	return event.Info.ID
+}
+
 // deliver emits and waits for the publisher to say what became of it.
 //
 // A failure here is reported as a failure to whatsmeow, which withholds the
@@ -511,6 +553,19 @@ func (s *Session) receive(event *waEvents.Message) bool {
 // WhatsApp afterwards. Which is why the client deduplicates on the message id, and why
 // this way round is the right one — a duplicate is a nuisance, a lost message is not.
 func (s *Session) deliver(eventType protocol.EventType, payload any, learned int64) bool {
+	return s.deliverUnless(eventType, payload, learned, "")
+}
+
+// deliverUnless is deliver for an event to be dropped if the message named here has arrived
+// by the time the publisher is about to write it.
+//
+// Which is the whole reason a placeholder goes through it. Queuing it and writing it are
+// two steps with a queue, a forwarder and a pump between them, and the message it stands in
+// for can land anywhere in there: published ahead of the real message, a client that
+// deduplicates on the id keeps the placeholder for good. Asked where a moment is asked
+// whether it is still true, the choice is made where it stops being reversible, and under
+// the lock the arrival takes.
+func (s *Session) deliverUnless(eventType protocol.EventType, payload any, learned int64, unless string) bool {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		s.log.Error().Err(err).Str("type", string(eventType)).Msg("failed to render an event payload")
@@ -525,6 +580,9 @@ func (s *Session) deliver(eventType protocol.EventType, payload any, learned int
 		Payload: body,
 		At:      learned,
 		Settle:  func(err error) { settled <- err },
+	}
+	if unless != "" {
+		emission.Claim = func() bool { return s.commit(unless) }
 	}
 	// Started before the emission is queued, not after: the inbox is bounded, and a
 	// pump stalled behind a publisher that answers neither way fills it. Timing only
@@ -556,5 +614,253 @@ func (s *Session) deliver(eventType protocol.EventType, payload any, learned int
 		return false
 	case <-s.done:
 		return false
+	}
+}
+
+// rerequestTimeout is how long a message that could not be read is left to arrive before
+// the connector gives up and says so.
+//
+// Both recoveries are real and both deliver the message under the id the placeholder
+// would take, so publishing one straight away is not early, it is final: the client
+// deduplicates on that id and discards the real message as a repeat. whatsmeow waits
+// `RequestFromPhoneDelay`, five seconds, before it even asks the phone, and the phone's
+// answer is a round trip after that. This is well past both, and it is a guess at the
+// only number that matters -- how long a recovery takes when it works -- which nobody
+// here has measured. What it costs when it is too long is an agent waiting to be told a
+// message exists; what it costs when it is too short is that message never arriving.
+const rerequestTimeout = 45 * time.Second
+
+// unreadable answers a message that arrived with nothing in it this device could read.
+//
+// Two different things reach here and they look almost alike. WhatsApp does not hand a
+// view-once photo to a companion device, so what arrives is a stanza with no ciphertext
+// at all and whatsmeow asks the primary phone to forward the real one. And a message
+// whose ciphertext would not open -- a Signal session that has drifted, a group message
+// with no sender key -- gets a retry receipt asking the sender to encrypt it again.
+//
+// Neither is published straight away, and that is the whole of this. Both recoveries
+// deliver the message under the same id, and a client deduplicates on that id: a
+// placeholder that goes out first is the only thing that chat will ever show, over a
+// message that did arrive. So the placeholder is scheduled instead, and the message
+// arriving is what calls it off.
+//
+// Acknowledged either way, because there is nothing to withhold: whatsmeow acknowledged
+// the node before this ran, so a refusal here buys no redelivery and the stanza carries
+// nothing to redeliver.
+func (s *Session) unreadable(event *waEvents.UndecryptableMessage) bool {
+	learned := s.learned()
+
+	if event.Info.Sender.IsBot() || event.Info.Chat.IsBot() {
+		s.log.Debug().Str("message_id", event.Info.ID).
+			Msg("dropping an unreadable message from one of Meta's own bots")
+		return true
+	}
+	if event.DecryptFailMode == waEvents.DecryptFailHide {
+		// The sender marked the stanza `decrypt-fail: hide`, which WhatsApp sets on a
+		// reaction, an edit, a revoke and a poll vote: things done to a message rather
+		// than messages. A bubble is the wrong shape for all four, and the sender is
+		// asking for nothing to be shown rather than something unreadable.
+		s.log.Debug().Str("message_id", event.Info.ID).
+			Msg("dropping an unreadable action the sender asked not to be shown")
+		return true
+	}
+	message, addressed := envelopeOf(&event.Info)
+	if !addressed {
+		// No chat to put it in or nobody to attribute it to. There is no bubble to be
+		// had, and the stanza carries nothing else worth an event.
+		s.log.Debug().Str("message_id", event.Info.ID).
+			Msg("dropping an unreadable message with no conversation to put it in")
+		return true
+	}
+	if message.Chat.Kind == protocol.AddressGroup && !s.wantsGroups() {
+		s.log.Debug().Str("message_id", event.Info.ID).
+			Msg("dropping an unreadable group message the client did not subscribe to")
+		return true
+	}
+	message.Content = protocol.Unsupported(whyUnopened(event, message.Chat.Kind))
+	s.awaitOrPublish(&message, learned)
+	return true
+}
+
+// whyUnopened is which of the contract's reasons a message nothing could read arrived
+// with.
+//
+// Two paths in whatsmeow arrive here and they answer different questions. A stanza that
+// carries an `<unavailable/>` node and no ciphertext at all is the server saying nothing
+// was encrypted for this device, and the `type` on that node is optional: an untyped one is
+// still a message that never arrived to be decrypted. A ciphertext that did arrive and
+// would not open is the other, and whatsmeow reports one of those as unavailable too -- a
+// group message with no sender key -- so neither field answers this on its own.
+//
+// What separates them from the event alone is the chat. The decryption path only raises the
+// flag for `skmsg`, which is how a group message is encrypted, so the flag on a direct chat
+// came from the other path. A group's own untyped unavailable is the case this gets wrong,
+// and it reads as a failure to decrypt something that was withheld.
+func whyUnopened(event *waEvents.UndecryptableMessage, chat protocol.AddressKind) protocol.UnsupportedReason {
+	if event.UnavailableType != "" {
+		return protocol.UnsupportedUnavailable
+	}
+	if event.IsUnavailable && chat != protocol.AddressGroup {
+		return protocol.UnsupportedUnavailable
+	}
+	return protocol.UnsupportedUndecryptable
+}
+
+// awaitOrPublish gives the message that could not be read its window to arrive, and
+// publishes the placeholder if it does not.
+func (s *Session) awaitOrPublish(message *protocol.InboundMessage, learned int64) {
+	ctx, cancel := context.WithCancel(s.ctx)
+
+	s.awaitedMu.Lock()
+	if _, waiting := s.awaited[message.ID]; waiting {
+		// Already waiting on this one. whatsmeow repeats the event when a resend fails to
+		// decrypt as well, and a second timer would publish a second bubble for one
+		// message.
+		s.awaitedMu.Unlock()
+		cancel()
+		return
+	}
+	s.awaited[message.ID] = &awaiting{cancel: cancel}
+	s.awaitedMu.Unlock()
+
+	go func() {
+		defer cancel()
+		timeout := time.NewTimer(s.rerequestWait)
+		defer timeout.Stop()
+		select {
+		case <-timeout.C:
+		case <-ctx.Done():
+			// The message arrived, or the session ended. Either way this is not the thing
+			// that should be in that chat.
+			return
+		}
+		s.log.Info().Str("message_id", message.ID).
+			Msg("giving up on a message arriving in a form this could read, and saying so")
+		s.insist(ctx, message, learned)
+	}()
+}
+
+// insist offers the placeholder to the publisher, and keeps offering for as long as the
+// session is up. Whether it is published or dropped for the message arriving is the
+// forwarder's to decide; both answer here as a publish that worked.
+//
+// Every other event here answers a failed publish by withholding the acknowledgement, and
+// WhatsApp redelivering is the retry. This one has no such thing: whatsmeow acknowledged
+// the stanza before it dispatched the failure, so a publisher that is down for a moment
+// would otherwise cost the message its only bubble. The retry is what puts this path back
+// on a par with the others.
+//
+// It ends with the session and needs no bound of its own. The publisher and the lease
+// share a Redis: one down long enough to matter takes the lease with it, and a session
+// that has lost its lease is cancelled.
+func (s *Session) insist(ctx context.Context, message *protocol.InboundMessage, learned int64) {
+	for {
+		if s.deliverUnless(protocol.EventMessageReceived, map[string]any{"message": message}, learned, message.ID) {
+			s.forgetAwaiting(message.ID)
+			return
+		}
+		s.log.Warn().Str("message_id", message.ID).
+			Msg("an unreadable message could not be published, and WhatsApp has no copy left to send")
+		// Back on the waiting list as one that has not been offered, so the next attempt
+		// can be chosen the way this one was. A message that arrived in the meantime took
+		// it off that list, and nothing here puts it back.
+		s.released(message.ID)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(s.rerequestRetry):
+		}
+	}
+}
+
+// awaiting is a placeholder's place on the waiting list: what stops the timer it is
+// holding, and whether it has been handed to the pump.
+//
+// The second is what keeps the two endings exclusive. A placeholder chosen by the
+// forwarder is going out and cannot be taken back, and one that has only been offered
+// still can, which is the difference between a message arriving in time and arriving too
+// late to help.
+type awaiting struct {
+	cancel    context.CancelFunc
+	committed bool
+}
+
+// commit takes the placeholder for a message off the waiting list's undecided half, and
+// reports whether it was still there to take. The forwarder's half of the choice: the
+// message arriving is the other, and they contend for one lock.
+func (s *Session) commit(id string) bool {
+	s.awaitedMu.Lock()
+	defer s.awaitedMu.Unlock()
+	entry, waiting := s.awaited[id]
+	if !waiting {
+		return false
+	}
+	entry.committed = true
+	return true
+}
+
+// released puts a placeholder the publisher would not take back among the undecided, so
+// the next attempt is chosen rather than assumed. A message that arrived meanwhile is
+// gone from the list entirely, and this leaves it that way.
+func (s *Session) released(id string) {
+	s.awaitedMu.Lock()
+	defer s.awaitedMu.Unlock()
+	if entry, waiting := s.awaited[id]; waiting {
+		entry.committed = false
+	}
+}
+
+// rerequestRetry is how long the placeholder waits before trying the publisher again.
+// Short, because the message it stands for is already late by the whole rerequest window
+// and the thing being waited on is a publisher that answered once and may answer now.
+const rerequestRetry = time.Second
+
+// arrived calls off the placeholder for a message that turned up after all, and reports
+// whether one was waiting.
+func (s *Session) arrived(id string) bool {
+	s.awaitedMu.Lock()
+	entry, waiting := s.awaited[id]
+	delete(s.awaited, id)
+	s.awaitedMu.Unlock()
+	if !waiting {
+		return false
+	}
+	entry.cancel()
+	// Committed means the forwarder has already chosen it, and a placeholder chosen is a
+	// placeholder published. Late rather than in time, and said so rather than logged as a
+	// message this saved.
+	return !entry.committed
+}
+
+// forgetAwaiting takes a message off the waiting list and reports whether it was still
+// on it, which is what stops a placeholder racing the message that just arrived.
+func (s *Session) forgetAwaiting(id string) bool {
+	s.awaitedMu.Lock()
+	defer s.awaitedMu.Unlock()
+	_, waiting := s.awaited[id]
+	delete(s.awaited, id)
+	return waiting
+}
+
+// forgetAwaited gives up on every placeholder still waiting, which is what a session
+// closing owes the goroutines holding them.
+//
+// Given up on and not published, which is the safe half of a choice with no good half.
+// A session that ends inside the window leaves the message two ways out: it arrives at
+// whoever owns the session next, and the chat is right; or it never arrives, and the chat
+// shows nothing, which is what it showed before any of this existed. Publishing on the way
+// out closes the first of those: the client deduplicates on the id, so a placeholder
+// written now outranks the message that turns up in a minute, permanently. Dropping can
+// leave a chat missing something; publishing can leave it showing the wrong thing forever.
+//
+// Carrying the placeholder across the handoff is the fix, and it needs a store write that
+// a lost lease fences, which is issue #23. Tracked as issue #53.
+func (s *Session) forgetAwaited() {
+	s.awaitedMu.Lock()
+	waiting := s.awaited
+	s.awaited = make(map[string]*awaiting)
+	s.awaitedMu.Unlock()
+	for _, entry := range waiting {
+		entry.cancel()
 	}
 }

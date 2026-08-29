@@ -239,7 +239,7 @@ func TestADownloadForADifferentChatThanTheOneOnRecordIsRefused(t *testing.T) {
 
 	// And the chat it really is filed under is served, so the check is a check and not a
 	// refusal of everything.
-	chat, ok := chatOf(imageEvent("3EB0MINE"))
+	chat, ok := chatOf(&imageEvent("3EB0MINE").Info)
 	if !ok {
 		t.Fatal("the test event has no chat")
 	}

@@ -185,6 +185,25 @@ type Session struct {
 	// flag, and every one of those paths goes through one of them.
 	transitions atomic.Int64
 
+	// awaited holds the messages that arrived unreadable and have not been given up on
+	// yet, so the one that arrives afterwards under the same id can call the placeholder
+	// off. Keyed by message id, and emptied by whichever of the two happens first.
+	//
+	// It exists because a client deduplicates on that id: a placeholder published before
+	// the real message is a placeholder for good, and both of the ways an unreadable
+	// message is recovered -- the sender re-encrypting, the phone forwarding -- deliver
+	// the real one under the id the placeholder already took.
+	awaited   map[string]*awaiting
+	awaitedMu sync.Mutex
+
+	// rerequestWait is how long a message that could not be read is left to arrive before
+	// its placeholder goes out. A field so a test does not have to wait it out.
+	rerequestWait time.Duration
+
+	// rerequestRetry is how long that placeholder waits before offering itself to the
+	// publisher again. A field for the same reason.
+	rerequestRetry time.Duration
+
 	// picked, when it is set, receives once for every emission the forwarder takes off
 	// the inbox, before it tries to hand it on. A seam so a test can know the pump is
 	// parked rather than sleeping until it probably is.
@@ -330,12 +349,16 @@ func newSession(
 		blobs:      blobs.Blobs,
 		blobBase:   blobs.BaseURL,
 
-		storeLimit:   bindTimeout,
-		deliverWait:  deliverTimeout,
-		handoffWait:  perishableHandoff,
-		board:        make(map[string]posted),
-		downloadWait: downloadTimeout,
-		uploadWait:   uploadTimeout,
+		storeLimit:  bindTimeout,
+		deliverWait: deliverTimeout,
+		handoffWait: perishableHandoff,
+		awaited:     make(map[string]*awaiting),
+
+		rerequestWait:  rerequestTimeout,
+		rerequestRetry: rerequestRetry,
+		board:          make(map[string]posted),
+		downloadWait:   downloadTimeout,
+		uploadWait:     uploadTimeout,
 	}
 	s.adopt(client)
 	go s.forward()
@@ -1268,6 +1291,11 @@ func (s *Session) Close() error {
 	closing := s.closing
 	s.mu.Unlock()
 
+	// Every placeholder still waiting is given up on here rather than left to fire into a
+	// session that is closing: the publisher is going with it, and a goroutine holding a
+	// timer past the session's own life is one nothing is left to answer for.
+	s.forgetAwaited()
+
 	// Announced first, while the teardown below still has a socket to close. The engine
 	// only drops a cache entry here, and a session it can no longer hand out is the
 	// point: an Open racing this must build a new client rather than get this one back.
@@ -2055,6 +2083,13 @@ func (s *Session) handle(rawEvent any) bool {
 		// before. Everything this build cannot render yet is still refused, which is
 		// what keeps it on the phone for a later milestone.
 		return s.receive(event)
+	case *waEvents.UndecryptableMessage:
+		// A message that arrived with nothing in it to read. Unlike everything else on
+		// this path it cannot be kept on the phone for a later build: whatsmeow has
+		// already acknowledged the node by the time this runs, so refusing here buys no
+		// redelivery and the choice is between publishing something and publishing
+		// nothing.
+		return s.unreadable(event)
 	case *waEvents.ChatPresence:
 		// Published and acknowledged whatever happens, which is the one place on this
 		// path that does not withhold: a moment redelivered is a lie, and the state that

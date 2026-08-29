@@ -822,9 +822,13 @@ func TestLiveRefetch(t *testing.T) {
 // It usually does not get that far, and finding out is what it was written for. WhatsApp
 // does not hand a view-once message to a companion device: what arrives is a stub with no
 // ciphertext (`Unavailable message ... type: "view_once"`), which whatsmeow acknowledges
-// while asking the primary phone to send the real one over. If the phone answers, this
-// phase sees the message and the assertions below hold. If it does not, nothing arrives
-// at all, which is issue #20 rather than a failure of this code.
+// while asking the primary phone to send the real one over.
+//
+// Both endings are checked, because both are correct and which one happens is not this
+// build's to decide. If the phone answers, the message arrives with its file refused and
+// its reason beside it. If it does not -- and in the run that found #20 it did not, over
+// ten minutes -- what arrives is the message with no body at all, which is what a
+// companion device is actually given and what an agent now sees instead of silence.
 func TestLiveViewOnce(t *testing.T) {
 	const token = "live-check"
 
@@ -854,16 +858,36 @@ func TestLiveViewOnce(t *testing.T) {
 
 	var body struct {
 		Message struct {
-			ID      string                `json:"id"`
-			Content protocol.MediaContent `json:"content"`
+			ID      string          `json:"id"`
+			Content json.RawMessage `json:"content"`
 		} `json:"message"`
 	}
 	if err := json.Unmarshal(received.Payload, &body); err != nil {
 		t.Fatalf("unmarshal the message: %v", err)
 	}
-	content := body.Message.Content
+	var said struct {
+		Type   string `json:"type"`
+		Reason string `json:"reason"`
+	}
+	if err := json.Unmarshal(body.Message.Content, &said); err != nil {
+		t.Fatalf("unmarshal the content: %v", err)
+	}
+	if said.Type == "unsupported" {
+		// The ordinary ending: the phone did not forward it, so what the account was
+		// given is a stanza with nothing in it. The bubble says so, which is the whole of
+		// #20 -- before it, an agent saw nothing at all.
+		if said.Reason != string(protocol.UnsupportedUnavailable) {
+			t.Fatalf("the message says %q, and what arrived was a stanza carrying nothing", said.Reason)
+		}
+		say("the phone did not forward the view-once message, and the bubble says a message is there")
+		return
+	}
+	var content protocol.MediaContent
+	if err := json.Unmarshal(body.Message.Content, &content); err != nil {
+		t.Fatalf("unmarshal the media content: %v", err)
+	}
 	if content.Type != "media" {
-		t.Fatalf("that was not a media message (%s). Send a view-once photo.", content.Type)
+		t.Fatalf("that was neither a media message nor an unreadable one (%s). Send a view-once photo.", content.Type)
 	}
 	if content.Ref != nil {
 		t.Fatalf("a view-once file was kept and handed out as %+v", content.Ref)

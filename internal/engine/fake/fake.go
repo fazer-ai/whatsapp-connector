@@ -323,6 +323,28 @@ func (s *Session) EmitDurable(eventType protocol.EventType, payload any, settle 
 	}
 }
 
+// EmitStandIn publishes an emission that stands in for another one that may yet turn up,
+// which is the shape a real engine uses for a placeholder. `claim` is asked by the
+// publisher just before it writes, and a false drops the emission as a success.
+func (s *Session) EmitStandIn(eventType protocol.EventType, payload any, claim func() bool, settle func(error)) {
+	body, err := marshal(payload)
+	if err != nil {
+		settle(err)
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		settle(errors.New("fake: session is closed"))
+		return
+	}
+	select {
+	case s.events <- engine.Emission{Type: eventType, Payload: body, Claim: claim, Settle: settle}:
+	default:
+		settle(errors.New("fake: nobody is reading the emissions"))
+	}
+}
+
 // EmitPerishable publishes an emission that stops being worth publishing, which is the
 // shape a real engine uses for a moment rather than a fact. `fresh` is consulted by the
 // publisher just before it writes.

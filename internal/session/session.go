@@ -253,6 +253,16 @@ func (s *Session) publish(ctx context.Context, emission engine.Emission) {
 		outlives, ctx = ctx, bounded
 	}
 
+	if emission.Claim != nil && !emission.Claim() {
+		// Something the engine was waiting for answered this first. Dropped before a
+		// sequence number is spent on it, and settled as a success: the emission did what
+		// it was for by not being made.
+		s.log.Debug().Str("type", string(emission.Type)).
+			Msg("dropped an emission that something else answered first")
+		settle(emission, nil)
+		return
+	}
+
 	s.seq++
 	event := protocol.Event{
 		V:       protocol.Version,
