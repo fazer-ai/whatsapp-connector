@@ -461,7 +461,10 @@ func newTestSession(t *testing.T, phone string) (*Session, *store.Container) {
 
 	container := openStore(t)
 	sid := "sid-" + t.Name()
-	device, err := container.Device(t.Context(), sid)
+	// Fenced the way Open fences it, so a test session refuses a write after it closes for
+	// the same reason a real one does.
+	fence := &store.Fence{}
+	device, err := container.Device(t.Context(), sid, fence)
 	if err != nil {
 		t.Fatalf("Device: %v", err)
 	}
@@ -478,18 +481,17 @@ func newTestSession(t *testing.T, phone string) (*Session, *store.Container) {
 			AccountSignatureKey: make([]byte, 32),
 			DeviceSignature:     make([]byte, 64),
 		}
-		if err := container.Devices().PutDevice(t.Context(), device); err != nil {
-			t.Fatalf("PutDevice: %v", err)
+		// Saved through the device rather than through the container behind it: the save
+		// is what installs whatsmeow's own stores, and only the fenced container puts the
+		// fence back over them.
+		if err := device.Save(t.Context()); err != nil {
+			t.Fatalf("Save: %v", err)
 		}
 		if err := container.Bind(t.Context(), sid, jid); err != nil {
 			t.Fatalf("Bind: %v", err)
 		}
 	}
 
-	// Fenced the way Open fences it, so a test session refuses a write after it closes
-	// for the same reason a real one does.
-	fence := &store.Fence{}
-	device = store.Fenced(device, fence)
 	session := newSession(sid, wm.NewClient(device, nil), container, fence, MediaOptions{}, zerolog.Nop(), newLibraryLogger(zerolog.Nop(), sid))
 	t.Cleanup(func() { _ = session.Close() })
 	return session, container
@@ -2413,5 +2415,30 @@ func TestASessionThatStoppedWritesNothingMore(t *testing.T) {
 	// this instance looking.
 	if _, err := device.Identities.IsTrustedIdentity(t.Context(), address, [32]byte{1}); err != nil {
 		t.Errorf("a stopped session cannot read its own keys either: %v", err)
+	}
+}
+
+// A session builds more than one device over its life: a logout and a mapping that went
+// stale both send it back for another, and the client it adopts then is the one doing the
+// writing for the rest of the session. Fenced at Open and nowhere else, that replacement
+// would run raw while Close went on dropping a fence in front of a device nobody uses.
+func TestASessionThatRebuiltIsStillFenced(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	if err := session.rebuild(t.Context()); err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	device := session.current().Store
+
+	const address = "5511999990002.0"
+	if err := device.Identities.PutIdentity(t.Context(), address, [32]byte{1}); err != nil {
+		t.Fatalf("a session that had just rebuilt could not write: %v", err)
+	}
+	if err := session.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := device.Identities.PutIdentity(t.Context(), address, [32]byte{2}); !errors.Is(err, store.ErrNotOwned) {
+		t.Fatalf("the device a rebuild adopted wrote after the session stopped: %v", err)
 	}
 }

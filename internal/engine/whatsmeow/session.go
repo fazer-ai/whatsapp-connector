@@ -1180,7 +1180,7 @@ func (s *Session) rebuild(ctx context.Context) error {
 		return nil
 	}
 
-	device, err := s.store.Device(ctx, s.sid)
+	device, err := s.store.Device(ctx, s.sid, s.fence)
 	if err != nil {
 		return fmt.Errorf("whatsmeow: rebuild %s: %w", s.sid, err)
 	}

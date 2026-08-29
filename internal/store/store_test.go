@@ -34,7 +34,7 @@ func TestDeviceIsFreshUntilSomethingIsBound(t *testing.T) {
 	t.Parallel()
 	container := open(t)
 
-	device, err := container.Device(t.Context(), "sid-1")
+	device, err := container.Device(t.Context(), "sid-1", &store.Fence{})
 	if err != nil {
 		t.Fatalf("Device: %v", err)
 	}
@@ -53,7 +53,7 @@ func TestDeviceResumesWhatWasBound(t *testing.T) {
 
 	jid := pair(t, container, "sid-1", "5511999990001")
 
-	device, err := container.Device(ctx, "sid-1")
+	device, err := container.Device(ctx, "sid-1", &store.Fence{})
 	if err != nil {
 		t.Fatalf("Device: %v", err)
 	}
@@ -62,7 +62,7 @@ func TestDeviceResumesWhatWasBound(t *testing.T) {
 	}
 
 	// A different session must not be handed the same credentials.
-	other, err := container.Device(ctx, "sid-2")
+	other, err := container.Device(ctx, "sid-2", &store.Fence{})
 	if err != nil {
 		t.Fatalf("Device: %v", err)
 	}
@@ -105,7 +105,7 @@ func TestDeviceForgetsAMappingWhoseDeviceIsGone(t *testing.T) {
 		t.Fatalf("Bind: %v", err)
 	}
 
-	device, err := container.Device(ctx, "sid-1")
+	device, err := container.Device(ctx, "sid-1", &store.Fence{})
 	if err != nil {
 		t.Fatalf("Device: %v", err)
 	}
@@ -223,7 +223,7 @@ func TestDeviceResumesACompanionDeviceJID(t *testing.T) {
 		t.Fatalf("the test paired %s, which carries no device part", jid)
 	}
 
-	device, err := container.Device(ctx, "sid-1")
+	device, err := container.Device(ctx, "sid-1", &store.Fence{})
 	if err != nil {
 		t.Fatalf("Device: %v", err)
 	}
@@ -545,7 +545,7 @@ func TestAnUpgradeKeepsTheMappingThatStillHasItsCredentials(t *testing.T) {
 	} else if stored == nil {
 		t.Fatal("the upgrade deleted the only device the account had")
 	}
-	resumed, err := upgraded.Device(t.Context(), "sid-paired")
+	resumed, err := upgraded.Device(t.Context(), "sid-paired", &store.Fence{})
 	if err != nil {
 		t.Fatalf("Device: %v", err)
 	}

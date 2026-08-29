@@ -187,14 +187,15 @@ func (e *Engine) Open(ctx context.Context, sid string) (engine.Session, error) {
 	}
 	e.mu.Unlock()
 
-	device, err := e.store.Device(ctx, sid)
+	// One fence per session, and every device that session goes on to build stands behind
+	// it. Built here rather than inside the store because a session outlives its devices:
+	// a logout or a mapping that went stale sends it back for another, and the fence has
+	// to be the same one Close will drop.
+	fence := &store.Fence{}
+	device, err := e.store.Device(ctx, sid, fence)
 	if err != nil {
 		return nil, fmt.Errorf("whatsmeow: open %s: %w", sid, err)
 	}
-	// One fence per device, and a device is built fresh per Open, so a session that is
-	// reopened after losing its lease is not fenced by the one that lost it.
-	fence := &store.Fence{}
-	device = store.Fenced(device, fence)
 
 	wa := newLibraryLogger(e.log, sid)
 	session := newSession(sid, wm.NewClient(device, wa), e.store, fence, e.media, e.log, wa)

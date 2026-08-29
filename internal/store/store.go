@@ -122,7 +122,10 @@ func (c *Container) Ping(ctx context.Context) error {
 // connector reaches for it: everything else goes through the methods above.
 func (c *Container) DB() *sql.DB { return c.db }
 
-// Devices is whatsmeow's own store, which the engine hands to a client.
+// Devices is whatsmeow's own store. Nothing in the connector reaches for it any more --
+// a session gets its device from Device, which fences it -- and what comes out of here
+// does not stand behind any fence, so a caller that saves a device through this container
+// rather than through the device itself takes the fence off it.
 func (c *Container) Devices() *sqlstore.Container { return c.devices }
 
 // Close releases the pool. There is only one, and whatsmeow's container wraps it
@@ -137,13 +140,18 @@ func (c *Container) Close() error {
 // A mapping that points at a device whatsmeow no longer holds is treated as no mapping
 // at all: the credentials are what makes a session resumable, and without them the
 // only honest answer is to pair again.
-func (c *Container) Device(ctx context.Context, sid string) (*store.Device, error) {
+//
+// The fence is taken rather than applied by the caller so that there is no way to get a
+// device from here without one. A session builds a device more than once -- a logout and
+// a stale mapping both send it back for another -- and the second of those was where an
+// unfenced one first got in.
+func (c *Container) Device(ctx context.Context, sid string, fence *Fence) (*store.Device, error) {
 	jid, bound, err := c.lookup(ctx, sid)
 	if err != nil {
 		return nil, err
 	}
 	if !bound {
-		return c.devices.NewDevice(), nil
+		return Fenced(c.devices.NewDevice(), fence), nil
 	}
 
 	device, err := c.devices.GetDevice(ctx, jid)
@@ -154,9 +162,9 @@ func (c *Container) Device(ctx context.Context, sid string) (*store.Device, erro
 		if err := c.unbind(ctx, sid); err != nil {
 			return nil, err
 		}
-		return c.devices.NewDevice(), nil
+		return Fenced(c.devices.NewDevice(), fence), nil
 	}
-	return device, nil
+	return Fenced(device, fence), nil
 }
 
 // Bind records which device a session paired.
