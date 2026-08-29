@@ -486,7 +486,11 @@ func newTestSession(t *testing.T, phone string) (*Session, *store.Container) {
 		}
 	}
 
-	session := newSession(sid, wm.NewClient(device, nil), container, MediaOptions{}, zerolog.Nop(), newLibraryLogger(zerolog.Nop(), sid))
+	// Fenced the way Open fences it, so a test session refuses a write after it closes
+	// for the same reason a real one does.
+	fence := &store.Fence{}
+	device = store.Fenced(device, fence)
+	session := newSession(sid, wm.NewClient(device, nil), container, fence, MediaOptions{}, zerolog.Nop(), newLibraryLogger(zerolog.Nop(), sid))
 	t.Cleanup(func() { _ = session.Close() })
 	return session, container
 }
@@ -2375,5 +2379,39 @@ func TestAReplacementPairingWaitsForTheOneItReplaces(t *testing.T) {
 	case <-started:
 	case <-time.After(2 * time.Second):
 		t.Fatal("the replacement never started once the attempt before it was done")
+	}
+}
+
+// A session that has stopped writes nothing more, whatever context it is handed.
+//
+// The context it was connected with is cancelled on the way out, and that already refuses
+// every write a node handler makes. This asks with a live context instead, which is what
+// the work whatsmeow detaches from the connection context arrives with -- a history sync
+// storing its secrets, a key share storing its app-state keys -- and is the half the fence
+// exists for. Written by an instance that has handed the session on, those land on top of
+// whatever the new owner has learned since.
+func TestASessionThatStoppedWritesNothingMore(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	device := session.current().Store
+
+	const address = "5511999990002.0"
+	if err := device.Identities.PutIdentity(t.Context(), address, [32]byte{1}); err != nil {
+		t.Fatalf("a session that is running could not write: %v", err)
+	}
+
+	if err := session.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	err := device.Identities.PutIdentity(t.Context(), address, [32]byte{2})
+	if !errors.Is(err, store.ErrNotOwned) {
+		t.Fatalf("a session that stopped wrote an identity anyway: %v", err)
+	}
+	// And a read still answers: what a peer cannot afford is this instance writing, not
+	// this instance looking.
+	if _, err := device.Identities.IsTrustedIdentity(t.Context(), address, [32]byte{1}); err != nil {
+		t.Errorf("a stopped session cannot read its own keys either: %v", err)
 	}
 }

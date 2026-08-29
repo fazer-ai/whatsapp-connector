@@ -196,6 +196,11 @@ type Session struct {
 	awaited   map[string]*awaiting
 	awaitedMu sync.Mutex
 
+	// fence stands in front of every write the device makes, and is dropped when this
+	// session stops. Cancelling s.ctx already refuses the writes that go through a node
+	// handler; this covers the ones whatsmeow deliberately detaches from that context.
+	fence *store.Fence
+
 	// rerequestWait is how long a message that could not be read is left to arrive before
 	// its placeholder goes out. A field so a test does not have to wait it out.
 	rerequestWait time.Duration
@@ -322,13 +327,14 @@ type pairingRun struct {
 
 //nolint:gocritic // zerolog.Logger is designed to be copied; every With() returns one by value
 func newSession(
-	sid string, client *wm.Client, container *store.Container,
+	sid string, client *wm.Client, container *store.Container, fence *store.Fence,
 	blobs MediaOptions, log zerolog.Logger, wa waLog.Logger,
 ) *Session {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Session{
 		sid:        sid,
 		store:      container,
+		fence:      fence,
 		log:        log.With().Str("sid", sid).Logger(),
 		waLog:      wa,
 		inbox:      make(chan pending, inboxDepth),
@@ -1306,6 +1312,10 @@ func (s *Session) Close() error {
 	if run != nil {
 		run.cancel()
 	}
+	// Down before anything else, and before the context: a write already past its own
+	// context check is one this still catches, and a session that is stopping owns
+	// nothing whatever the reason it stopped.
+	s.fence.Drop()
 	// Cancelled first, and that order is the whole point: whatsmeow holds its socket
 	// lock for the length of a dial, and Disconnect waits for the same lock. Cancelling
 	// afterwards would never run, and a lease handover would wait out the handshake.

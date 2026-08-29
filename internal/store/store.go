@@ -10,13 +10,19 @@
 // Ownership is arbitrated by the Redis lease, not here: one instance runs a session at
 // a time, and the layer above tears a session down within a heartbeat of losing it.
 //
-// That leaves a window, and closing it is an architecture change rather than a guard.
-// whatsmeow writes through its own SQL layer, where a statement carries no session
-// identity, so a fence would have to be per-session all the way down: one container per
-// session, or a driver wrapper that knows which session it is serving. Both are M2, and
-// M2 is when this package starts owning writes of its own, which is what makes the
-// question urgent. Until then the lease and the heartbeat are the whole of it, and this
-// is documented in the roadmap as open rather than solved.
+// What arbitration does not do on its own is stop a session that has been handed on from
+// finishing a write it had started, and those land on top of what the new owner has since
+// learned. Cancelling the session's context covers most of that for free -- whatsmeow gives
+// that context to every node handler, and a statement on a cancelled one is refused before
+// it reaches the database -- but not the work the library deliberately detaches from it.
+// Fence is the other half: it stands in front of every write a device can make and refuses
+// them all from the moment this instance stops owning the session, whichever context they
+// arrive with.
+//
+// What is left is the window between a lease running out and this instance learning it. In
+// there this instance still believes it is the owner and the fence still says yes, because
+// nothing in a write says which epoch made it. Closing that needs the database to arbitrate,
+// which is issue #55.
 package store
 
 import (
