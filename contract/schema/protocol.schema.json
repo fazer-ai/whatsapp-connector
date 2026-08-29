@@ -206,7 +206,7 @@
       "type": "object",
       "properties": {
         "type": { "const": "unsupported" },
-        "reason": { "enum": ["unknown_type", "undecryptable", "protocol", "empty"] }
+        "reason": { "enum": ["unknown_type", "undecryptable", "unavailable", "protocol", "empty"] }
       },
       "required": ["type", "reason"],
       "additionalProperties": true

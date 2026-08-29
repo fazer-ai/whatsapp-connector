@@ -338,6 +338,11 @@ const (
 	UnsupportedUnknownType UnsupportedReason = "unknown_type"
 	// UnsupportedUndecryptable is a message whose ciphertext could not be opened.
 	UnsupportedUndecryptable UnsupportedReason = "undecryptable"
+	// UnsupportedUnavailable is a message this device was never given: the stanza carried
+	// no ciphertext at all, which is not the same as one that would not open. WhatsApp
+	// answers a companion device that way on purpose for a view-once photo, and asks the
+	// primary phone to forward it instead -- which it may never do.
+	UnsupportedUnavailable UnsupportedReason = "unavailable"
 	// UnsupportedProtocol is machinery rather than a message.
 	UnsupportedProtocol UnsupportedReason = "protocol"
 	// UnsupportedEmpty is a message that arrived carrying nothing at all.

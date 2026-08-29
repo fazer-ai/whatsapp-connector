@@ -564,7 +564,7 @@ func revokeOf(event *waEvents.Message) change {
 // deletion or reaction in their mouth. An echo carries no sender at all, because
 // `from_me` is the whole answer to who did it.
 func whereAndWho(event *waEvents.Message) (protocol.Address, *protocol.Party, bool) {
-	chat, named := chatOf(event)
+	chat, named := chatOf(&event.Info)
 	if !named {
 		return protocol.Address{}, nil, false
 	}

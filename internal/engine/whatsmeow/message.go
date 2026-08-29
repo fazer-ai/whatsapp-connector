@@ -123,20 +123,9 @@ type renderBody func(*waEvents.Message) (body, bool)
 // The second return is the failure to announce once the message itself is out, empty
 // for a message with nothing missing.
 func inboundOf(event *waEvents.Message, render renderBody) (protocol.InboundMessage, string, bool) {
-	chat, ok := chatOf(event)
-	if !ok || event.Info.ID == "" {
+	message, ok := envelopeOf(&event.Info)
+	if !ok {
 		return protocol.InboundMessage{}, "", false
-	}
-	var sender *protocol.Party
-	if !event.Info.IsFromMe {
-		// An echo carries no sender, which is what the contract's own fixture for one
-		// says and what the client reads: `from_me` is the whole answer to who sent it,
-		// and naming the account itself there files the operator's own number as the
-		// party in a conversation with somebody else.
-		var named bool
-		if sender, named = partyOf(&event.Info); !named {
-			return protocol.InboundMessage{}, "", false
-		}
 	}
 	// Asked for last, once every question about the envelope has been answered.
 	said, ok := render(event)
@@ -144,18 +133,42 @@ func inboundOf(event *waEvents.Message, render renderBody) (protocol.InboundMess
 		return protocol.InboundMessage{}, "", false
 	}
 
-	message := protocol.InboundMessage{
-		ID:        event.Info.ID,
+	message.Content = said.content
+	message.QuotedID = said.context.GetStanzaID()
+	message.Mentions = mentionsOf(said.context)
+	message.Ephemeral = said.context.GetExpiration()
+	return message, said.failure, true
+}
+
+// envelopeOf is everything about an inbound message except what was said in it, which is
+// the one part a message this device was never given has none of.
+//
+// Separate from `inboundOf` for that reason and no other: a stanza that arrived with no
+// ciphertext in it still has a sender, a chat and a time, and the client needs all three
+// to put a bubble where the message was.
+func envelopeOf(info *waTypes.MessageInfo) (protocol.InboundMessage, bool) {
+	chat, ok := chatOf(info)
+	if !ok || info.ID == "" {
+		return protocol.InboundMessage{}, false
+	}
+	var sender *protocol.Party
+	if !info.IsFromMe {
+		// An echo carries no sender, which is what the contract's own fixture for one
+		// says and what the client reads: `from_me` is the whole answer to who sent it,
+		// and naming the account itself there files the operator's own number as the
+		// party in a conversation with somebody else.
+		var named bool
+		if sender, named = partyOf(info); !named {
+			return protocol.InboundMessage{}, false
+		}
+	}
+	return protocol.InboundMessage{
+		ID:        info.ID,
 		Chat:      chat,
 		Sender:    sender,
-		FromMe:    event.Info.IsFromMe,
-		Timestamp: event.Info.Timestamp.UnixMilli(),
-		Content:   said.content,
-		QuotedID:  said.context.GetStanzaID(),
-		Mentions:  mentionsOf(said.context),
-		Ephemeral: said.context.GetExpiration(),
-	}
-	return message, said.failure, true
+		FromMe:    info.IsFromMe,
+		Timestamp: info.Timestamp.UnixMilli(),
+	}, true
 }
 
 // naming fills in whichever of WhatsApp's two identifiers the JIDs carry, first one
@@ -177,16 +190,16 @@ func naming(party *protocol.Party, jids ...waTypes.JID) {
 // have to agree on the answer: the address the event is published under, and the one the
 // file kept for that message is filed under. A second copy of this rule would drift, and
 // the drift would file a message's file in a chat the message is not in.
-func chatOf(event *waEvents.Message) (protocol.Address, bool) {
-	chatJID := event.Info.Chat
-	if event.Info.IsIncomingBroadcast() {
+func chatOf(info *waTypes.MessageInfo) (protocol.Address, bool) {
+	chatJID := info.Chat
+	if info.IsIncomingBroadcast() {
 		// Somebody sent this through a broadcast list, and WhatsApp shows it to the
 		// recipient in the direct chat with whoever sent it, not under the list.
 		// whatsmeow says so on the event, and addressing the list instead sends the
 		// message to a chat the client does not open conversations for, after
 		// acknowledging it: a message the recipient can see on their own phone and
 		// nowhere else. The status feed is not a broadcast list and is not touched.
-		chatJID = event.Info.Sender
+		chatJID = info.Sender
 	}
 	return addressOf(chatJID)
 }
@@ -557,4 +570,53 @@ func (s *Session) deliver(eventType protocol.EventType, payload any, learned int
 	case <-s.done:
 		return false
 	}
+}
+
+// unreadable publishes a message this device was never given, so an agent sees that
+// somebody wrote rather than seeing nothing at all.
+//
+// WhatsApp does not hand a view-once photo to a companion device. What arrives is a
+// stanza with no ciphertext in it, and whatsmeow answers it by asking the primary phone
+// to forward the message instead. That phone may never do it -- in the run this was found
+// in it never did, over ten minutes -- and until it does there is nothing else coming.
+// Published as unsupported, the conversation at least says a message is there.
+//
+// The other half of the same event is left alone on purpose, and it is not a smaller
+// case. A ciphertext that arrived and would not open has a recovery that works: whatsmeow
+// sends a retry receipt, the sender re-encrypts, and the message arrives again under the
+// same id. Publishing a placeholder for that one would be worse than silence, because the
+// client deduplicates on the message id -- the real message that follows is discarded as
+// a repeat, and the agent is left with "could not read this" over a message that did
+// arrive. Registered as #51, with what it would take to tell a retry that failed from one
+// that has not answered yet.
+func (s *Session) unreadable(event *waEvents.UndecryptableMessage) bool {
+	if !event.IsUnavailable {
+		s.log.Debug().Str("message_id", event.Info.ID).
+			Msg("leaving a message that would not decrypt to the retry whatsmeow asked for")
+		return true
+	}
+	learned := s.learned()
+
+	if event.Info.Sender.IsBot() || event.Info.Chat.IsBot() {
+		s.log.Debug().Str("message_id", event.Info.ID).
+			Msg("dropping an unreadable message from one of Meta's own bots")
+		return true
+	}
+	message, addressed := envelopeOf(&event.Info)
+	if !addressed {
+		// No chat to put it in or nobody to attribute it to. There is no bubble to be
+		// had, and the stanza carries nothing else worth an event.
+		s.log.Debug().Str("message_id", event.Info.ID).
+			Msg("dropping an unreadable message with no conversation to put it in")
+		return true
+	}
+	if message.Chat.Kind == protocol.AddressGroup && !s.wantsGroups() {
+		s.log.Debug().Str("message_id", event.Info.ID).
+			Msg("dropping an unreadable group message the client did not subscribe to")
+		return true
+	}
+	message.Content = protocol.Unsupported(protocol.UnsupportedUnavailable)
+	s.log.Info().Str("message_id", event.Info.ID).Str("kind", string(event.UnavailableType)).
+		Msg("publishing a message this device was never given")
+	return s.deliver(protocol.EventMessageReceived, map[string]any{"message": message}, learned)
 }

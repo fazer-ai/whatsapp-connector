@@ -2055,6 +2055,13 @@ func (s *Session) handle(rawEvent any) bool {
 		// before. Everything this build cannot render yet is still refused, which is
 		// what keeps it on the phone for a later milestone.
 		return s.receive(event)
+	case *waEvents.UndecryptableMessage:
+		// A message that arrived with nothing in it to read. Unlike everything else on
+		// this path it cannot be kept on the phone for a later build: whatsmeow has
+		// already acknowledged the node by the time this runs, so refusing here buys no
+		// redelivery and the choice is between publishing something and publishing
+		// nothing.
+		return s.unreadable(event)
 	case *waEvents.ChatPresence:
 		// Published and acknowledged whatever happens, which is the one place on this
 		// path that does not withhold: a moment redelivered is a lie, and the state that
