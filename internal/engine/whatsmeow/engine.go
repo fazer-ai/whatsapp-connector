@@ -225,7 +225,12 @@ func (e *Engine) Open(ctx context.Context, sid string) (engine.Session, error) {
 	// entry it should have taken is this one.
 	if session.Closed() {
 		e.forget(sid, session)
+		return session, nil
 	}
+	// Only the session that won the entry, and only once it has. A session built and
+	// then discarded above would otherwise arm a second set of timers for bubbles the
+	// winner is already holding, and both would publish.
+	session.rearm(ctx)
 	return session, nil
 }
 

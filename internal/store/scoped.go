@@ -101,3 +101,35 @@ func (s *Scoped) PutMediaPart(ctx context.Context, part *MediaPart, now time.Tim
 func (s *Scoped) MediaPart(ctx context.Context, messageID string) (MediaPart, bool, error) {
 	return s.container.mediaPart(ctx, s.sid, messageID)
 }
+
+// PutPlaceholder holds a bubble this session has scheduled and not yet decided, so a
+// process that ends inside the window does not take the decision with it.
+//
+// Fenced: the row is read by whichever instance picks the session up next, and a write
+// from an instance that has lost the session would hand its successor a bubble for a
+// message that has already been answered somewhere else. A placeholder published for a
+// message that did arrive is permanent, because the client deduplicates on the id.
+func (s *Scoped) PutPlaceholder(ctx context.Context, held *Placeholder) error {
+	if err := s.fence.held(); err != nil {
+		return err
+	}
+	waiting := *held
+	waiting.SID = s.sid
+	return s.container.putPlaceholder(ctx, &waiting)
+}
+
+// DropPlaceholder forgets a bubble that has been decided, whichever way it went.
+//
+// Fenced like the write. Deleting somebody else's row is how a bubble goes missing on
+// the very handoff this exists to survive.
+func (s *Scoped) DropPlaceholder(ctx context.Context, messageID string) error {
+	if err := s.fence.held(); err != nil {
+		return err
+	}
+	return s.container.dropPlaceholder(ctx, s.sid, messageID)
+}
+
+// Placeholders lists the bubbles this session left undecided, oldest deadline first.
+func (s *Scoped) Placeholders(ctx context.Context) ([]Placeholder, error) {
+	return s.container.placeholders(ctx, s.sid)
+}

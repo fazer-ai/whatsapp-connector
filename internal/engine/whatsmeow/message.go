@@ -12,6 +12,7 @@ import (
 
 	"github.com/fazer-ai/whatsapp-connector/internal/engine"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
+	"github.com/fazer-ai/whatsapp-connector/internal/store"
 )
 
 // deliverTimeout is the default deliverWait: how long an inbound message waits for its
@@ -478,17 +479,23 @@ func (s *Session) receive(event *waEvents.Message) bool {
 		return true
 	}
 
-	if stanza := stanzaOf(event); s.arrived(stanza) {
-		// This one was unreadable a moment ago and the recovery worked: either the sender
-		// encrypted it again or the phone forwarded it. The placeholder waiting for it is
-		// called off here rather than published and corrected, because a client that
-		// deduplicates on the id would keep the placeholder and discard this.
-		//
-		// Before the switch below, and not after it: a recovered edit or reaction leaves
-		// here as a change to a message that already exists, and a placeholder still
-		// waiting behind that return would go out as a message of its own.
-		s.log.Info().Str("message_id", stanza).
-			Msg("a message that could not be read arrived after all")
+	// Before the switch below, and not after it: a recovered edit or reaction leaves here
+	// as a change to a message that already exists, and a placeholder still waiting behind
+	// that return would go out as a message of its own.
+	stanza := stanzaOf(event)
+	if inTime, held := s.arrived(stanza); held {
+		if inTime {
+			// This one was unreadable a moment ago and the recovery worked: either the
+			// sender encrypted it again or the phone forwarded it. The placeholder waiting
+			// for it is called off rather than published and corrected, because a client
+			// that deduplicates on the id would keep the placeholder and discard this.
+			s.log.Info().Str("message_id", stanza).
+				Msg("a message that could not be read arrived after all")
+		}
+		// Held without being in time is a bubble the forwarder already committed to, and
+		// its row is as finished as one called off: the decision has been made either way,
+		// and only an undecided row should outlive this process.
+		s.dropHold(stanza)
 	}
 
 	switch what := s.changed(event); what.verdict {
@@ -709,6 +716,66 @@ func whyUnopened(event *waEvents.UndecryptableMessage, chat protocol.AddressKind
 // awaitOrPublish gives the message that could not be read its window to arrive, and
 // publishes the placeholder if it does not.
 func (s *Session) awaitOrPublish(message *protocol.InboundMessage, learned int64) {
+	due := learned + s.rerequestWait.Milliseconds()
+	s.hold(message, learned, due)
+	// Measured from the deadline that was written down, not from here. Holding the row
+	// is a store call and can take up to the store bound, and a window started after it
+	// would have this owner publish later than the deadline a successor reads out of the
+	// same row -- so whether a bubble was on time would depend on whether a handoff
+	// happened to occur.
+	s.await(message, learned, due, s.until(due))
+}
+
+// until is what is left of a deadline, and never less than nothing. A window that has
+// already run out is a bubble that is overdue, which is a reason to publish now rather
+// than an error.
+func (s *Session) until(due int64) time.Duration {
+	return max(time.Duration(due-s.learned())*time.Millisecond, 0)
+}
+
+// hold writes the undecided bubble down, so a process that ends inside the window does
+// not take the decision with it.
+//
+// A failure here is reported and not raised. What is lost is the row, and without it
+// this path behaves exactly as it did before the row existed: the bubble lives in a
+// timer, and a timer lives as long as the process. Refusing the message over it would
+// trade a bubble that might go missing for one that certainly does.
+func (s *Session) hold(message *protocol.InboundMessage, learned, due int64) {
+	body, err := json.Marshal(message)
+	if err != nil {
+		s.log.Error().Err(err).Str("message_id", message.ID).
+			Msg("failed to render a placeholder to hold on to")
+		return
+	}
+	ctx, cancel := context.WithTimeout(s.ctx, s.storeLimit)
+	defer cancel()
+	if err := s.store.PutPlaceholder(ctx, &store.Placeholder{
+		MessageID: message.ID, Message: string(body), LearnedAt: learned, DueAt: due,
+	}); err != nil {
+		s.log.Warn().Err(err).Str("message_id", message.ID).
+			Msg("a placeholder could not be held; it will not survive this process ending")
+	}
+}
+
+// dropHold forgets a bubble that has been decided, whichever way it went. Reported and
+// not raised for the same reason as hold: a row left behind is armed again by whoever
+// opens the session next, and the two endings are both idempotent -- the message
+// arriving finds nothing waiting, and a second publish is deduplicated on the id.
+func (s *Session) dropHold(id string) {
+	ctx, cancel := context.WithTimeout(s.ctx, s.storeLimit)
+	defer cancel()
+	if err := s.store.DropPlaceholder(ctx, id); err != nil {
+		s.log.Warn().Err(err).Str("message_id", id).Msg("a decided placeholder could not be released")
+	}
+}
+
+// await puts a message on the waiting list and arms the timer that decides it.
+//
+// The wait is passed in rather than taken from the session, because the two callers
+// measure it from different places: a message that just arrived gets the whole window,
+// and one picked up from the store gets what is left of the window it was given. Both
+// publish under the same learned time and against the same deadline.
+func (s *Session) await(message *protocol.InboundMessage, learned, due int64, wait time.Duration) {
 	ctx, cancel := context.WithCancel(s.ctx)
 
 	s.awaitedMu.Lock()
@@ -720,12 +787,12 @@ func (s *Session) awaitOrPublish(message *protocol.InboundMessage, learned int64
 		cancel()
 		return
 	}
-	s.awaited[message.ID] = &awaiting{cancel: cancel}
+	s.awaited[message.ID] = &awaiting{cancel: cancel, due: due}
 	s.awaitedMu.Unlock()
 
 	go func() {
 		defer cancel()
-		timeout := time.NewTimer(s.rerequestWait)
+		timeout := time.NewTimer(wait)
 		defer timeout.Stop()
 		select {
 		case <-timeout.C:
@@ -757,6 +824,11 @@ func (s *Session) insist(ctx context.Context, message *protocol.InboundMessage, 
 	for {
 		if s.deliverUnless(protocol.EventMessageReceived, map[string]any{"message": message}, learned, message.ID) {
 			s.forgetAwaiting(message.ID)
+			// After the publish and not before it. A crash in between leaves a row that
+			// the next owner publishes a second time, which the client deduplicates on
+			// the id and discards; dropping it first would leave a crash in between with
+			// no bubble at all, which is the whole failure this row exists to close.
+			s.dropHold(message.ID)
 			return
 		}
 		s.log.Warn().Str("message_id", message.ID).
@@ -783,6 +855,9 @@ func (s *Session) insist(ctx context.Context, message *protocol.InboundMessage, 
 type awaiting struct {
 	cancel    context.CancelFunc
 	committed bool
+	// due is the deadline this placeholder was given, in milliseconds. Kept so a
+	// re-arm can tell a row it is already holding from one it has yet to see.
+	due int64
 }
 
 // commit takes the placeholder for a message off the waiting list's undecided half, and
@@ -815,21 +890,26 @@ func (s *Session) released(id string) {
 // and the thing being waited on is a publisher that answered once and may answer now.
 const rerequestRetry = time.Second
 
-// arrived calls off the placeholder for a message that turned up after all, and reports
-// whether one was waiting.
-func (s *Session) arrived(id string) bool {
+// arrived calls off the placeholder for a message that turned up after all.
+//
+// Two answers, because the caller needs both and they are not the same question. inTime
+// is whether the message beat the bubble, which is what there is to log. held is whether
+// there was anything on the list at all, which is what says there is a row to release --
+// and a placeholder the forwarder already committed is held without being in time, so
+// one answer cannot stand for the other.
+func (s *Session) arrived(id string) (inTime, held bool) {
 	s.awaitedMu.Lock()
 	entry, waiting := s.awaited[id]
 	delete(s.awaited, id)
 	s.awaitedMu.Unlock()
 	if !waiting {
-		return false
+		return false, false
 	}
 	entry.cancel()
 	// Committed means the forwarder has already chosen it, and a placeholder chosen is a
 	// placeholder published. Late rather than in time, and said so rather than logged as a
 	// message this saved.
-	return !entry.committed
+	return !entry.committed, true
 }
 
 // forgetAwaiting takes a message off the waiting list and reports whether it was still
@@ -842,19 +922,18 @@ func (s *Session) forgetAwaiting(id string) bool {
 	return waiting
 }
 
-// forgetAwaited gives up on every placeholder still waiting, which is what a session
+// forgetAwaited lets go of every placeholder still waiting, which is what a session
 // closing owes the goroutines holding them.
 //
-// Given up on and not published, which is the safe half of a choice with no good half.
-// A session that ends inside the window leaves the message two ways out: it arrives at
-// whoever owns the session next, and the chat is right; or it never arrives, and the chat
-// shows nothing, which is what it showed before any of this existed. Publishing on the way
-// out closes the first of those: the client deduplicates on the id, so a placeholder
-// written now outranks the message that turns up in a minute, permanently. Dropping can
-// leave a chat missing something; publishing can leave it showing the wrong thing forever.
+// Let go of in this process only. The row each one was written to is left exactly where
+// it is, and whoever opens the session next arms it again for the remainder of the
+// window it was given. That is the difference between this and giving up: the timer ends
+// with the process, the decision does not.
 //
-// Carrying the placeholder across the handoff is the fix, and it needs a store write that
-// a lost lease fences, which is issue #23. Tracked as issue #53.
+// Still not published on the way out, and that has not changed. The client deduplicates
+// on the id, so a placeholder written here would outrank the message that turns up a
+// minute later at the next owner, permanently. Leaving the row lets the good ending stay
+// possible; publishing would close it.
 func (s *Session) forgetAwaited() {
 	s.awaitedMu.Lock()
 	waiting := s.awaited
@@ -862,5 +941,51 @@ func (s *Session) forgetAwaited() {
 	s.awaitedMu.Unlock()
 	for _, entry := range waiting {
 		entry.cancel()
+	}
+}
+
+// rearm picks up the bubbles a previous owner of this session left undecided and puts
+// them back on the clock.
+//
+// This is the other half of holding them. A process that ends inside the window leaves
+// rows behind; without this they are only rows. Whoever opens the session next serves
+// out the deadline each one was given rather than starting a fresh window, because a
+// handoff more frequent than the window would otherwise hold a bubble back forever, and
+// because the message it stands for is already as late as it is.
+//
+// A deadline that has already passed is not an error and not a reason to drop the row:
+// the message never arrived, the chat has been missing the bubble since, and the event
+// carries the time the message reached this connector, so it lands where it belongs in
+// the history rather than at the top of it. A zero wait sends it straight to the
+// publisher, which is what an overdue bubble deserves.
+//
+// Reported and not raised. A session that cannot read these is a session that works in
+// every other respect, and refusing to open it would turn a bubble that might be missing
+// into an account that certainly is.
+func (s *Session) rearm(ctx context.Context) {
+	waiting, err := s.store.Placeholders(ctx)
+	if err != nil {
+		s.log.Warn().Err(err).Msg("could not read the placeholders this session left waiting")
+		return
+	}
+	if len(waiting) == 0 {
+		return
+	}
+
+	for _, held := range waiting {
+		var message protocol.InboundMessage
+		if err := json.Unmarshal([]byte(held.Message), &message); err != nil {
+			// A row nothing can read is a row that can never be published, and leaving it
+			// would have every future owner of this session try and fail on it. Dropped
+			// with the reason said out loud, which is the only thing left to do with it.
+			s.log.Error().Err(err).Str("message_id", held.MessageID).
+				Msg("dropping a held placeholder this build cannot read")
+			s.dropHold(held.MessageID)
+			continue
+		}
+		wait := s.until(held.DueAt)
+		s.log.Info().Str("message_id", held.MessageID).Dur("wait", wait).
+			Msg("picking up a placeholder a previous owner of this session left waiting")
+		s.await(&message, held.LearnedAt, held.DueAt, wait)
 	}
 }
