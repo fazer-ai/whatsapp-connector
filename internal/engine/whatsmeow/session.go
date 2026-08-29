@@ -200,6 +200,10 @@ type Session struct {
 	// its placeholder goes out. A field so a test does not have to wait it out.
 	rerequestWait time.Duration
 
+	// rerequestRetry is how long that placeholder waits before offering itself to the
+	// publisher again. A field for the same reason.
+	rerequestRetry time.Duration
+
 	// picked, when it is set, receives once for every emission the forwarder takes off
 	// the inbox, before it tries to hand it on. A seam so a test can know the pump is
 	// parked rather than sleeping until it probably is.
@@ -350,10 +354,11 @@ func newSession(
 		handoffWait: perishableHandoff,
 		awaited:     make(map[string]context.CancelFunc),
 
-		rerequestWait: rerequestTimeout,
-		board:         make(map[string]posted),
-		downloadWait:  downloadTimeout,
-		uploadWait:    uploadTimeout,
+		rerequestWait:  rerequestTimeout,
+		rerequestRetry: rerequestRetry,
+		board:          make(map[string]posted),
+		downloadWait:   downloadTimeout,
+		uploadWait:     uploadTimeout,
 	}
 	s.adopt(client)
 	go s.forward()

@@ -1,12 +1,16 @@
 package whatsmeow
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
+	"go.mau.fi/whatsmeow/proto/waE2E"
 	waTypes "go.mau.fi/whatsmeow/types"
 	waEvents "go.mau.fi/whatsmeow/types/events"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/engine"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
@@ -279,4 +283,87 @@ func mustMarshal(t *testing.T, value any) json.RawMessage {
 		t.Fatalf("marshal: %v", err)
 	}
 	return raw
+}
+
+// A reaction, an edit, a revoke and a poll vote are things done to a message, and WhatsApp
+// says so on the stanza: the sender sets `decrypt-fail: hide` on all four. One that will
+// not decrypt has nothing a bubble could hold -- the message it acts on is already in the
+// chat, unchanged -- and an unsupported bubble of its own would be a second entry in the
+// thread for something that was never an entry at all.
+func TestAnActionTheSenderAskedToHideIsNotGivenABubble(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.rerequestWait = 50 * time.Millisecond
+
+	event := unavailableMessage("3EB0HIDDEN", "")
+	event.IsUnavailable = false
+	event.DecryptFailMode = waEvents.DecryptFailHide
+
+	if !session.handle(event) {
+		t.Fatal("an unreadable action was left for WhatsApp to send again, and it fails to decrypt again")
+	}
+	select {
+	case published := <-session.Events():
+		t.Fatalf("something was published for an action the sender asked to hide: %s", published.Payload)
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+// The same message can come back as a change rather than a message: an edit that failed to
+// decrypt and was resent leaves as `message.edited`, under the id its placeholder is
+// waiting on. The recovery has to call the placeholder off from there too, or the chat gets
+// the correction and then an unsupported bubble claiming the same message never arrived.
+//
+// Reachable because `decrypt-fail` is the sender's to set: the clients that mark an edit
+// hidden are the ones this build knows about, and one that does not mark it lands here.
+func TestACorrectionThatArrivesAfterAllCallsOffItsPlaceholder(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.rerequestWait = 50 * time.Millisecond
+	session.unseal = func(context.Context, *waEvents.Message) (*waE2E.Message, error) {
+		return &waE2E.Message{Conversation: proto.String("bom dia, corrigido")}, nil
+	}
+
+	unread := unavailableMessage(carrier, "")
+	unread.IsUnavailable = false
+	if !session.handle(unread) {
+		t.Fatal("an unreadable message was left for WhatsApp to send again")
+	}
+
+	emission := publishedBy(t, session, sealedEditEvent(carrier, subject))
+	if emission.Type != protocol.EventMessageEdited {
+		t.Fatalf("the resent correction was published as %s, want %s", emission.Type, protocol.EventMessageEdited)
+	}
+	select {
+	case late := <-session.Events():
+		t.Fatalf("a placeholder went out behind the correction it was standing in for: %s", late.Payload)
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+// Every other event answers a publisher that would not take it by withholding the
+// acknowledgement, and WhatsApp sending it again is the retry. This one cannot: whatsmeow
+// acknowledged the stanza before it dispatched the failure. So the retry has to be here,
+// or a publisher that was down for a second costs the message its only bubble.
+func TestAPlaceholderThePublisherWouldNotTakeIsOfferedAgain(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.rerequestWait = 10 * time.Millisecond
+	session.rerequestRetry = 10 * time.Millisecond
+
+	if !session.handle(unavailableMessage("3EB0REFUSED", "view_once")) {
+		t.Fatal("an unreadable message was left for WhatsApp to send again")
+	}
+
+	refused := next(t, session)
+	refused.Settle(errors.New("the publisher is not answering"))
+
+	again := next(t, session)
+	again.Settle(nil)
+	if got := messageOf(t, again).ID; got != "3EB0REFUSED" {
+		t.Fatalf("what was offered the second time is %q, and the first was 3EB0REFUSED", got)
+	}
 }

@@ -478,6 +478,19 @@ func (s *Session) receive(event *waEvents.Message) bool {
 		return true
 	}
 
+	if s.arrived(event.Info.ID) {
+		// This one was unreadable a moment ago and the recovery worked: either the sender
+		// encrypted it again or the phone forwarded it. The placeholder waiting for it is
+		// called off here rather than published and corrected, because a client that
+		// deduplicates on the id would keep the placeholder and discard this.
+		//
+		// Before the switch below, and not after it: a recovered edit or reaction leaves
+		// here as a change to a message that already exists, and a placeholder still
+		// waiting behind that return would go out as a message of its own.
+		s.log.Info().Str("message_id", event.Info.ID).
+			Msg("a message that could not be read arrived after all")
+	}
+
 	switch what := s.changed(event); what.verdict {
 	case publishChange:
 		// Not a message this account received, but something done to one it already has.
@@ -491,15 +504,6 @@ func (s *Session) receive(event *waEvents.Message) bool {
 	case withholdChange:
 		s.log.Warn().Err(what.err).Str("message_id", event.Info.ID).Msg(what.why)
 		return false
-	}
-
-	if s.arrived(event.Info.ID) {
-		// This one was unreadable a moment ago and the recovery worked: either the sender
-		// encrypted it again or the phone forwarded it. The placeholder waiting for it is
-		// called off here rather than published and corrected, because a client that
-		// deduplicates on the id would keep the placeholder and discard this.
-		s.log.Info().Str("message_id", event.Info.ID).
-			Msg("a message that could not be read arrived after all")
 	}
 
 	message, failure, ok := inboundOf(event, s.bodyOf(s.ctx))
@@ -619,6 +623,15 @@ func (s *Session) unreadable(event *waEvents.UndecryptableMessage) bool {
 			Msg("dropping an unreadable message from one of Meta's own bots")
 		return true
 	}
+	if event.DecryptFailMode == waEvents.DecryptFailHide {
+		// The sender marked the stanza `decrypt-fail: hide`, which WhatsApp sets on a
+		// reaction, an edit, a revoke and a poll vote: things done to a message rather
+		// than messages. A bubble is the wrong shape for all four, and the sender is
+		// asking for nothing to be shown rather than something unreadable.
+		s.log.Debug().Str("message_id", event.Info.ID).
+			Msg("dropping an unreadable action the sender asked not to be shown")
+		return true
+	}
 	message, addressed := envelopeOf(&event.Info)
 	if !addressed {
 		// No chat to put it in or nobody to attribute it to. There is no bubble to be
@@ -685,13 +698,40 @@ func (s *Session) awaitOrPublish(message *protocol.InboundMessage, learned int64
 		}
 		s.log.Info().Str("message_id", message.ID).
 			Msg("publishing a message that never arrived in a form this could read")
-		if !s.deliver(protocol.EventMessageReceived, map[string]any{"message": message}, learned) {
-			// Nothing to withhold and nobody to tell: the node was acknowledged long ago.
-			s.log.Warn().Str("message_id", message.ID).
-				Msg("an unreadable message could not be published, and WhatsApp has no copy left to send")
-		}
+		s.insist(ctx, message, learned)
 	}()
 }
+
+// insist publishes the placeholder, and keeps trying for as long as the session is up.
+//
+// Every other event here answers a failed publish by withholding the acknowledgement, and
+// WhatsApp redelivering is the retry. This one has no such thing: whatsmeow acknowledged
+// the stanza before it dispatched the failure, so a publisher that is down for a moment
+// would otherwise cost the message its only bubble. The retry is what puts this path back
+// on a par with the others.
+//
+// It ends with the session and needs no bound of its own. The publisher and the lease
+// share a Redis: one down long enough to matter takes the lease with it, and a session
+// that has lost its lease is cancelled.
+func (s *Session) insist(ctx context.Context, message *protocol.InboundMessage, learned int64) {
+	for {
+		if s.deliver(protocol.EventMessageReceived, map[string]any{"message": message}, learned) {
+			return
+		}
+		s.log.Warn().Str("message_id", message.ID).
+			Msg("an unreadable message could not be published, and WhatsApp has no copy left to send")
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(s.rerequestRetry):
+		}
+	}
+}
+
+// rerequestRetry is how long the placeholder waits before trying the publisher again.
+// Short, because the message it stands for is already late by the whole rerequest window
+// and the thing being waited on is a publisher that answered once and may answer now.
+const rerequestRetry = time.Second
 
 // arrived calls off the placeholder for a message that turned up after all, and reports
 // whether one was waiting.
@@ -718,6 +758,17 @@ func (s *Session) forgetAwaiting(id string) bool {
 
 // forgetAwaited gives up on every placeholder still waiting, which is what a session
 // closing owes the goroutines holding them.
+//
+// Given up on and not published, which is the safe half of a choice with no good half.
+// A session that ends inside the window leaves the message two ways out: it arrives at
+// whoever owns the session next, and the chat is right; or it never arrives, and the chat
+// shows nothing, which is what it showed before any of this existed. Publishing on the way
+// out closes the first of those: the client deduplicates on the id, so a placeholder
+// written now outranks the message that turns up in a minute, permanently. Dropping can
+// leave a chat missing something; publishing can leave it showing the wrong thing forever.
+//
+// Carrying the placeholder across the handoff is the fix, and it needs a store write that
+// a lost lease fences, which is issue #23. Tracked as issue #53.
 func (s *Session) forgetAwaited() {
 	s.awaitedMu.Lock()
 	waiting := s.awaited
