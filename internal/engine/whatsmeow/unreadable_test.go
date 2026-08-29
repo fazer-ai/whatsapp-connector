@@ -450,3 +450,56 @@ func TestACorrectionForwardedByThePhoneCallsOffItsPlaceholder(t *testing.T) {
 		t.Fatal("the placeholder is still waiting behind the correction the phone forwarded")
 	}
 }
+
+// The placeholder is queued in one place and published in another, and the message can
+// arrive between the two. Whoever decides has to be the second of those: taken off the
+// waiting list where it was queued, a message landing a moment later finds nothing to call
+// off, and both go out -- the placeholder ahead of the message it stands for, which the
+// client keeps over the real one for good.
+func TestAMessageThatArrivesWhileItsPlaceholderIsQueuedStillWins(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.rerequestWait = 10 * time.Millisecond
+
+	// The forwarder is parked on something nobody is reading, so what follows sits in the
+	// inbox instead of being decided the moment it is queued.
+	session.inbox <- pending{event: engine.Emission{Type: protocol.EventSessionState, Payload: []byte(`{}`)}}
+	waitUntil(t, "the forwarder to be holding an emission", func() bool { return len(session.inbox) == 0 })
+
+	if !session.handle(unavailableMessage("3EB0QUEUED", "view_once")) {
+		t.Fatal("an unreadable message was left for WhatsApp to send again")
+	}
+	waitUntil(t, "the placeholder to be queued", func() bool { return len(session.inbox) == 1 })
+
+	// And now it arrives, with its placeholder already in the queue ahead of it.
+	recovered := make(chan bool, 1)
+	go func() { recovered <- session.receive(textMessage("3EB0QUEUED", "bom dia")) }()
+	// Noticed before the forwarder is let go, so what this reads is which of the two the
+	// forwarder chooses and not which goroutine got there first.
+	waitUntil(t, "the recovered message to be taken off the waiting list", func() bool {
+		return !waitingOn(session, "3EB0QUEUED")
+	})
+
+	if parked := next(t, session); parked.Type != protocol.EventSessionState {
+		t.Fatalf("what the forwarder was parked on is %s", parked.Type)
+	}
+	emission := next(t, session)
+	emission.Settle(nil)
+	select {
+	case <-recovered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the handler for the recovered message never came back")
+	}
+
+	message := messageOf(t, emission)
+	var content struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(mustMarshal(t, message.Content), &content); err != nil {
+		t.Fatalf("unmarshal the content: %v", err)
+	}
+	if content.Type != "text" {
+		t.Fatalf("what reached the chat is %s, and the message itself had arrived", content.Type)
+	}
+}

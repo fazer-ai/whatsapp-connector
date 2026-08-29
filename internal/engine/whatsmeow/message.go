@@ -553,6 +553,19 @@ func stanzaOf(event *waEvents.Message) string {
 // WhatsApp afterwards. Which is why the client deduplicates on the message id, and why
 // this way round is the right one — a duplicate is a nuisance, a lost message is not.
 func (s *Session) deliver(eventType protocol.EventType, payload any, learned int64) bool {
+	return s.deliverUnless(eventType, payload, learned, "")
+}
+
+// deliverUnless is deliver for an event the forwarder is to drop if the message named here
+// has arrived by the time it reaches it.
+//
+// Which is the whole reason a placeholder goes through it. Taking it off the waiting list
+// where it is queued and publishing it where the forwarder gets to it are two steps, and a
+// recovery landing between them publishes both: the placeholder ahead of the message it
+// stands for, and a client that deduplicates on the id keeps the placeholder. Decided in
+// the forwarder, the last moment either one can still be chosen, and under the lock the
+// arrival takes.
+func (s *Session) deliverUnless(eventType protocol.EventType, payload any, learned int64, unless string) bool {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		s.log.Error().Err(err).Str("type", string(eventType)).Msg("failed to render an event payload")
@@ -575,7 +588,7 @@ func (s *Session) deliver(eventType protocol.EventType, payload any, learned int
 	timeout := time.NewTimer(s.deliverWait)
 	defer timeout.Stop()
 	select {
-	case s.inbox <- pending{event: emission}:
+	case s.inbox <- pending{event: emission, unless: unless}:
 	case <-timeout.C:
 		s.log.Warn().Str("type", string(eventType)).Dur("waited", s.deliverWait).
 			Msg("withholding an acknowledgement for an event that could not be queued")
@@ -704,7 +717,7 @@ func (s *Session) awaitOrPublish(message *protocol.InboundMessage, learned int64
 		cancel()
 		return
 	}
-	s.awaited[message.ID] = cancel
+	s.awaited[message.ID] = &awaiting{cancel: cancel}
 	s.awaitedMu.Unlock()
 
 	go func() {
@@ -718,16 +731,15 @@ func (s *Session) awaitOrPublish(message *protocol.InboundMessage, learned int64
 			// that should be in that chat.
 			return
 		}
-		if !s.forgetAwaiting(message.ID) {
-			return
-		}
 		s.log.Info().Str("message_id", message.ID).
-			Msg("publishing a message that never arrived in a form this could read")
+			Msg("giving up on a message arriving in a form this could read, and saying so")
 		s.insist(ctx, message, learned)
 	}()
 }
 
-// insist publishes the placeholder, and keeps trying for as long as the session is up.
+// insist offers the placeholder to the publisher, and keeps offering for as long as the
+// session is up. Whether it is published or dropped for the message arriving is the
+// forwarder's to decide; both answer here as a publish that worked.
 //
 // Every other event here answers a failed publish by withholding the acknowledgement, and
 // WhatsApp redelivering is the retry. This one has no such thing: whatsmeow acknowledged
@@ -740,16 +752,58 @@ func (s *Session) awaitOrPublish(message *protocol.InboundMessage, learned int64
 // that has lost its lease is cancelled.
 func (s *Session) insist(ctx context.Context, message *protocol.InboundMessage, learned int64) {
 	for {
-		if s.deliver(protocol.EventMessageReceived, map[string]any{"message": message}, learned) {
+		if s.deliverUnless(protocol.EventMessageReceived, map[string]any{"message": message}, learned, message.ID) {
+			s.forgetAwaiting(message.ID)
 			return
 		}
 		s.log.Warn().Str("message_id", message.ID).
 			Msg("an unreadable message could not be published, and WhatsApp has no copy left to send")
+		// Back on the waiting list as one that has not been offered, so the next attempt
+		// can be chosen the way this one was. A message that arrived in the meantime took
+		// it off that list, and nothing here puts it back.
+		s.released(message.ID)
 		select {
 		case <-ctx.Done():
 			return
 		case <-time.After(s.rerequestRetry):
 		}
+	}
+}
+
+// awaiting is a placeholder's place on the waiting list: what stops the timer it is
+// holding, and whether it has been handed to the pump.
+//
+// The second is what keeps the two endings exclusive. A placeholder chosen by the
+// forwarder is going out and cannot be taken back, and one that has only been offered
+// still can, which is the difference between a message arriving in time and arriving too
+// late to help.
+type awaiting struct {
+	cancel    context.CancelFunc
+	committed bool
+}
+
+// commit takes the placeholder for a message off the waiting list's undecided half, and
+// reports whether it was still there to take. The forwarder's half of the choice: the
+// message arriving is the other, and they contend for one lock.
+func (s *Session) commit(id string) bool {
+	s.awaitedMu.Lock()
+	defer s.awaitedMu.Unlock()
+	entry, waiting := s.awaited[id]
+	if !waiting {
+		return false
+	}
+	entry.committed = true
+	return true
+}
+
+// released puts a placeholder the publisher would not take back among the undecided, so
+// the next attempt is chosen rather than assumed. A message that arrived meanwhile is
+// gone from the list entirely, and this leaves it that way.
+func (s *Session) released(id string) {
+	s.awaitedMu.Lock()
+	defer s.awaitedMu.Unlock()
+	if entry, waiting := s.awaited[id]; waiting {
+		entry.committed = false
 	}
 }
 
@@ -762,13 +816,17 @@ const rerequestRetry = time.Second
 // whether one was waiting.
 func (s *Session) arrived(id string) bool {
 	s.awaitedMu.Lock()
-	cancel, waiting := s.awaited[id]
+	entry, waiting := s.awaited[id]
 	delete(s.awaited, id)
 	s.awaitedMu.Unlock()
-	if waiting {
-		cancel()
+	if !waiting {
+		return false
 	}
-	return waiting
+	entry.cancel()
+	// Committed means the forwarder has already chosen it, and a placeholder chosen is a
+	// placeholder published. Late rather than in time, and said so rather than logged as a
+	// message this saved.
+	return !entry.committed
 }
 
 // forgetAwaiting takes a message off the waiting list and reports whether it was still
@@ -797,9 +855,9 @@ func (s *Session) forgetAwaiting(id string) bool {
 func (s *Session) forgetAwaited() {
 	s.awaitedMu.Lock()
 	waiting := s.awaited
-	s.awaited = make(map[string]context.CancelFunc)
+	s.awaited = make(map[string]*awaiting)
 	s.awaitedMu.Unlock()
-	for _, cancel := range waiting {
-		cancel()
+	for _, entry := range waiting {
+		entry.cancel()
 	}
 }

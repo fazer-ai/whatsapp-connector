@@ -193,7 +193,7 @@ type Session struct {
 	// the real message is a placeholder for good, and both of the ways an unreadable
 	// message is recovered -- the sender re-encrypting, the phone forwarding -- deliver
 	// the real one under the id the placeholder already took.
-	awaited   map[string]context.CancelFunc
+	awaited   map[string]*awaiting
 	awaitedMu sync.Mutex
 
 	// rerequestWait is how long a message that could not be read is left to arrive before
@@ -352,7 +352,7 @@ func newSession(
 		storeLimit:  bindTimeout,
 		deliverWait: deliverTimeout,
 		handoffWait: perishableHandoff,
-		awaited:     make(map[string]context.CancelFunc),
+		awaited:     make(map[string]*awaiting),
 
 		rerequestWait:  rerequestTimeout,
 		rerequestRetry: rerequestRetry,
@@ -1485,6 +1485,13 @@ func (s *Session) forward() {
 				}
 				emission = resolved
 			}
+			if item.unless != "" && !s.commit(item.unless) {
+				// The message turned up while this was waiting its turn. Answered as a
+				// publish that worked, because it did what it was for: the chat has the
+				// message, and this was only ever what would go there instead.
+				emission.Settle(nil)
+				continue
+			}
 			if !s.handOn(emission) {
 				return
 			}
@@ -1517,6 +1524,12 @@ type pending struct {
 	// on from resolves to nothing, which is what keeps a state at the place it happened
 	// at rather than at the place an older one is waiting in.
 	seq int64
+	// unless names the message this stands in for, and the forwarder drops it if that
+	// message has arrived by the time it gets here. Queuing and publishing are two steps,
+	// and the message can land between them: decided where it is decided, the placeholder
+	// would go out behind the message it was standing in for, which the client keeps over
+	// the real one for good.
+	unless string
 }
 
 // posted is what the board holds for one chat: its newest state, and enough about where
