@@ -14,7 +14,9 @@ package storetest
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"net/url"
 	"os"
@@ -171,10 +173,32 @@ func newDatabase(t *testing.T, server string) Target {
 	return Target{URL: dsn.String(), driver: "postgres", dsn: dsn.String()}
 }
 
-// databaseName builds an identifier that says which test owns it, because one left
-// behind by a crashed run is only useful if it names the test that crashed. The counter
-// is what keeps it unique: two subtests can sanitise to the same string, and truncating
-// at 40 makes that likelier rather than less.
+// run tells this process's databases apart from every other process's on the same
+// server. The counter below cannot: it is process-local, so it restarts at 1 in each
+// `go test` binary -- and `go test ./...` is several of those at once -- and it hands
+// the same name to the same test on every run, so a run interrupted before its cleanup
+// leaves behind exactly the database the next run tries to create.
+//
+// Debris is the trade. Under the counter alone a crashed run blocked the next one,
+// loudly; under this it accumulates quietly instead. A CI runner is thrown away either
+// way, and a developer's server takes
+// `DROP DATABASE` over what `SELECT datname FROM pg_database WHERE datname LIKE 'wac\_%'`
+// lists once the run that owned them is gone.
+var run = func() string {
+	var token [4]byte
+	if _, err := rand.Read(token[:]); err != nil {
+		// crypto/rand does not fail on any platform this builds for, and a helper that
+		// carried on with a constant here would reintroduce the collision it exists to
+		// avoid -- on the machine where it failed, silently.
+		panic("storetest: read random bytes for the run id: " + err.Error())
+	}
+	return hex.EncodeToString(token[:])
+}()
+
+// databaseName builds an identifier that says which run and which test own it, because
+// one left behind by a crash is only useful if it names them. The counter separates the
+// tests within a run: two subtests can sanitise to the same string, and truncating at 32
+// makes that likelier rather than less.
 func databaseName(t *testing.T) string {
 	t.Helper()
 
@@ -186,13 +210,14 @@ func databaseName(t *testing.T) string {
 		default:
 			out.WriteByte('_')
 		}
-		if out.Len() >= 40 {
+		if out.Len() >= 32 {
 			break
 		}
 	}
 	// Postgres truncates an identifier at 63 bytes, and truncation would collapse two
-	// long names into one database two parallel tests then share.
-	return fmt.Sprintf("wac_%s_%d", out.String(), nameSeq.Add(1))
+	// long names into one database two parallel tests then share. This is 4 + 8 + 1 +
+	// 32 + 1 + the counter, so it has room the test name cannot eat.
+	return fmt.Sprintf("wac_%s_%s_%d", run, out.String(), nameSeq.Add(1))
 }
 
 // quote wraps an identifier for DDL. The name is built from a test name and a counter

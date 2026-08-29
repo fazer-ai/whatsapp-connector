@@ -6,7 +6,7 @@ GOLANGCI_LINT ?= golangci-lint
 PACKAGES ?= ./...
 
 .DEFAULT_GOAL := help
-.PHONY: help setup deps hooks fmt lint test test-postgres test-cover contract tidy check clean
+.PHONY: help setup deps hooks fmt lint test test-postgres test-cover contract tidy check check-postgres clean
 
 help: ## List the available targets
 	@grep -hE '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
@@ -46,7 +46,19 @@ contract: ## Check the Go protocol binding against contract/
 tidy: ## Fail when go.mod/go.sum are not tidy
 	$(GO) mod tidy -diff
 
-check: lint test ## Everything CI enforces
+check: lint test check-postgres ## Everything CI enforces
+
+# The dialect pass, when there is a server to run it against. Not a hard dependency:
+# `check` is what the git hooks and the stop hook fall back to, so requiring a running
+# PostgreSQL would fail every commit made without one, for a reason that is not the
+# commit's. Conditional, it runs for anyone who has a server and prints its own absence
+# for everyone else, which is the part `make test` alone never says out loud.
+check-postgres:
+ifdef WAC_TEST_DATABASE_URL
+	$(GO) test -count=1 $(PACKAGES)
+else
+	@echo "skipped the PostgreSQL pass: WAC_TEST_DATABASE_URL is unset (see 'make test-postgres')"
+endif
 
 clean: ## Remove build and coverage output
 	rm -rf bin dist coverage.txt
