@@ -310,7 +310,7 @@ func TestBeingLoggedOutForgetsTheDevice(t *testing.T) {
 	t.Parallel()
 	session, container := newTestSession(t, "5511999990001")
 
-	if _, bound, err := container.JID(t.Context(), session.sid); err != nil || !bound {
+	if _, bound, err := container.For(session.sid).JID(t.Context()); err != nil || !bound {
 		t.Fatalf("the session is not bound to begin with (bound=%v, err=%v)", bound, err)
 	}
 
@@ -326,7 +326,7 @@ func TestBeingLoggedOutForgetsTheDevice(t *testing.T) {
 
 	// Credentials WhatsApp has revoked are worse than none: a session that keeps them
 	// looks resumable and fails every reconnect.
-	if _, bound, err := container.JID(t.Context(), session.sid); err != nil || bound {
+	if _, bound, err := container.For(session.sid).JID(t.Context()); err != nil || bound {
 		t.Fatalf("the device survived a logout (bound=%v, err=%v)", bound, err)
 	}
 
@@ -461,7 +461,10 @@ func newTestSession(t *testing.T, phone string) (*Session, *store.Container) {
 
 	container := openStore(t)
 	sid := "sid-" + t.Name()
-	device, err := container.Device(t.Context(), sid)
+	// One handle for the whole session, the way Open makes one: every For is a fence of
+	// its own, so a second handle here would fence a device the session is not using.
+	scoped := container.For(sid)
+	device, err := scoped.Device(t.Context())
 	if err != nil {
 		t.Fatalf("Device: %v", err)
 	}
@@ -478,15 +481,18 @@ func newTestSession(t *testing.T, phone string) (*Session, *store.Container) {
 			AccountSignatureKey: make([]byte, 32),
 			DeviceSignature:     make([]byte, 64),
 		}
-		if err := container.Devices().PutDevice(t.Context(), device); err != nil {
-			t.Fatalf("PutDevice: %v", err)
+		// Saved through the device rather than through the container behind it: the save
+		// is what installs whatsmeow's own stores, and only the fenced container puts the
+		// fence back over them.
+		if err := device.Save(t.Context()); err != nil {
+			t.Fatalf("Save: %v", err)
 		}
-		if err := container.Bind(t.Context(), sid, jid); err != nil {
+		if err := scoped.Bind(t.Context(), jid); err != nil {
 			t.Fatalf("Bind: %v", err)
 		}
 	}
 
-	session := newSession(sid, wm.NewClient(device, nil), container, MediaOptions{}, zerolog.Nop(), newLibraryLogger(zerolog.Nop(), sid))
+	session := newSession(sid, wm.NewClient(device, nil), scoped, MediaOptions{}, zerolog.Nop(), newLibraryLogger(zerolog.Nop(), sid))
 	t.Cleanup(func() { _ = session.Close() })
 	return session, container
 }
@@ -818,7 +824,7 @@ func TestALogoutThatNeverReachedWhatsappKeepsTheCredentials(t *testing.T) {
 	if session.isStale() {
 		t.Fatal("the session was marked stale, so the next connect would delete credentials that still resume")
 	}
-	if _, bound, err := container.JID(t.Context(), session.sid); err != nil || !bound {
+	if _, bound, err := container.For(session.sid).JID(t.Context()); err != nil || !bound {
 		t.Fatalf("the pairing was forgotten anyway (bound=%v, err=%v)", bound, err)
 	}
 }
@@ -2375,5 +2381,116 @@ func TestAReplacementPairingWaitsForTheOneItReplaces(t *testing.T) {
 	case <-started:
 	case <-time.After(2 * time.Second):
 		t.Fatal("the replacement never started once the attempt before it was done")
+	}
+}
+
+// A session that has stopped writes nothing more, whatever context it is handed.
+//
+// The context it was connected with is cancelled on the way out, and that already refuses
+// every write a node handler makes. This asks with a live context instead, which is what
+// the work whatsmeow detaches from the connection context arrives with -- a history sync
+// storing its secrets, a key share storing its app-state keys -- and is the half the fence
+// exists for. Written by an instance that has handed the session on, those land on top of
+// whatever the new owner has learned since.
+func TestASessionThatStoppedWritesNothingMore(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	device := session.current().Store
+
+	const address = "5511999990002.0"
+	if err := device.Identities.PutIdentity(t.Context(), address, [32]byte{1}); err != nil {
+		t.Fatalf("a session that is running could not write: %v", err)
+	}
+
+	if err := session.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	err := device.Identities.PutIdentity(t.Context(), address, [32]byte{2})
+	if !errors.Is(err, store.ErrNotOwned) {
+		t.Fatalf("a session that stopped wrote an identity anyway: %v", err)
+	}
+	// And a read still answers: what a peer cannot afford is this instance writing, not
+	// this instance looking.
+	if _, err := device.Identities.IsTrustedIdentity(t.Context(), address, [32]byte{1}); err != nil {
+		t.Errorf("a stopped session cannot read its own keys either: %v", err)
+	}
+}
+
+// A session builds more than one device over its life: a logout and a mapping that went
+// stale both send it back for another, and the client it adopts then is the one doing the
+// writing for the rest of the session. Fenced at Open and nowhere else, that replacement
+// would run raw while Close went on dropping a fence in front of a device nobody uses.
+func TestASessionThatRebuiltIsStillFenced(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	if err := session.rebuild(t.Context()); err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	device := session.current().Store
+
+	const address = "5511999990002.0"
+	if err := device.Identities.PutIdentity(t.Context(), address, [32]byte{1}); err != nil {
+		t.Fatalf("a session that had just rebuilt could not write: %v", err)
+	}
+	if err := session.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := device.Identities.PutIdentity(t.Context(), address, [32]byte{2}); !errors.Is(err, store.ErrNotOwned) {
+		t.Fatalf("the device a rebuild adopted wrote after the session stopped: %v", err)
+	}
+}
+
+// Closed and fenced are one transition, not two. What an Open racing a Close reads to
+// decide it may build the replacement is the closed flag, so a session that reports itself
+// closed while its fence is still up is a session two clients can write through. The order
+// is held by both living in one critical section; this is the half a test can see, which is
+// that closing drops it at all.
+func TestClosingASessionDropsItsFence(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	if session.store.Dropped() {
+		t.Fatal("a session that is running is already fenced")
+	}
+	if err := session.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if !session.Closed() {
+		t.Fatal("Close returned and the session does not report itself closed")
+	}
+	if !session.store.Dropped() {
+		t.Error("a closed session still holds its fence up")
+	}
+}
+
+// The device stores are not the only writes a session makes. The mapping that says which
+// device it paired is this connector's own table, and the pairing callback writes it -- late
+// enough, if a Close races the end of a pairing, to land on the mapping the replacement has
+// already written. Same for the coordinates a media message keeps.
+func TestASessionThatStoppedWritesNoMappingEither(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	jid, err := waTypes.ParseJID("5511999990009:7@" + waTypes.DefaultUserServer)
+	if err != nil {
+		t.Fatalf("ParseJID: %v", err)
+	}
+
+	if err := session.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if err := session.store.Bind(t.Context(), jid); !errors.Is(err, store.ErrNotOwned) {
+		t.Errorf("a session that stopped rebound its mapping: %v", err)
+	}
+	part := store.MediaPart{MessageID: "3EB0LATE", ChatKind: "phone", ChatID: "5511999990009", Kind: "image"}
+	if err := session.store.PutMediaPart(t.Context(), &part, time.Now()); !errors.Is(err, store.ErrNotOwned) {
+		t.Errorf("a session that stopped kept a media part: %v", err)
+	}
+	if err := session.store.Forget(t.Context()); !errors.Is(err, store.ErrNotOwned) {
+		t.Errorf("a session that stopped deleted its own device: %v", err)
 	}
 }

@@ -187,13 +187,17 @@ func (e *Engine) Open(ctx context.Context, sid string) (engine.Session, error) {
 	}
 	e.mu.Unlock()
 
-	device, err := e.store.Device(ctx, sid)
+	// The store as this session sees it, with a fence of its own. Every session-scoped
+	// write goes through it, so a device this session builds later -- after a logout, or a
+	// mapping that went stale -- stands behind the same fence as the first one.
+	scoped := e.store.For(sid)
+	device, err := scoped.Device(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("whatsmeow: open %s: %w", sid, err)
 	}
 
 	wa := newLibraryLogger(e.log, sid)
-	session := newSession(sid, wm.NewClient(device, wa), e.store, e.media, e.log, wa)
+	session := newSession(sid, wm.NewClient(device, wa), scoped, e.media, e.log, wa)
 	// Registered before the session can be handed out, so a close that happens while
 	// this function is still running is not one nobody hears about.
 	session.onClose(func() { e.forget(sid, session) })

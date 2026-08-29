@@ -213,7 +213,7 @@ restart, and reports itself healthy while doing it.
 | Milestone | Scope |
 |---|---|
 | **M0** ✅ | Skeleton, Redis Streams transport, lease/ownership port, fake engine, health and metrics, Docker image, publish pipeline |
-| **M1** ✅ | whatsmeow engine: QR and code pairing, session state, logout/ban/outdated handling, the device store. Reconnect backoff and the store-level fence are still open |
+| **M1** ✅ | whatsmeow engine: QR and code pairing, session state, logout/ban/outdated handling, the device store. A session that has been handed on writes nothing more: every write a device can make is refused from the moment this instance stops owning it, whichever context it arrives with. What is left of the fence is the window before this instance learns it lost the lease ([#55](https://github.com/fazer-ai/whatsapp-connector/issues/55)); reconnect backoff is still open |
 | **M2** ✅ | Messages in and out (text, media, location, contact, reaction, edit, revoke, quoted, mentions), receipts, read marks, chat presence, account presence, idempotent sends. All of them are in both ways, and a body this build has no arm for arrives as a placeholder rather than disappearing. What it leaves behind is in the issues rather than here: a message WhatsApp will not hand to a linked device still reaches nobody ([#20](https://github.com/fazer-ai/whatsapp-connector/issues/20)), and presence does not survive a reconnect ([#46](https://github.com/fazer-ai/whatsapp-connector/issues/46)) |
 | **M3** | Groups, contacts, calls |
 | **M4** | Multi-instance under load, quarantine, metrics/lag/DLQ, operations docs |

@@ -10,13 +10,19 @@
 // Ownership is arbitrated by the Redis lease, not here: one instance runs a session at
 // a time, and the layer above tears a session down within a heartbeat of losing it.
 //
-// That leaves a window, and closing it is an architecture change rather than a guard.
-// whatsmeow writes through its own SQL layer, where a statement carries no session
-// identity, so a fence would have to be per-session all the way down: one container per
-// session, or a driver wrapper that knows which session it is serving. Both are M2, and
-// M2 is when this package starts owning writes of its own, which is what makes the
-// question urgent. Until then the lease and the heartbeat are the whole of it, and this
-// is documented in the roadmap as open rather than solved.
+// What arbitration does not do on its own is stop a session that has been handed on from
+// finishing a write it had started, and those land on top of what the new owner has since
+// learned. Cancelling the session's context covers most of that for free -- whatsmeow gives
+// that context to every node handler, and a statement on a cancelled one is refused before
+// it reaches the database -- but not the work the library deliberately detaches from it.
+// Fence is the other half: it stands in front of every write a device can make and refuses
+// them all from the moment this instance stops owning the session, whichever context they
+// arrive with.
+//
+// What is left is the window between a lease running out and this instance learning it. In
+// there this instance still believes it is the owner and the fence still says yes, because
+// nothing in a write says which epoch made it. Closing that needs the database to arbitrate,
+// which is issue #55.
 package store
 
 import (
@@ -116,7 +122,10 @@ func (c *Container) Ping(ctx context.Context) error {
 // connector reaches for it: everything else goes through the methods above.
 func (c *Container) DB() *sql.DB { return c.db }
 
-// Devices is whatsmeow's own store, which the engine hands to a client.
+// Devices is whatsmeow's own store. Nothing in the connector reaches for it any more --
+// a session gets its device from Device, which fences it -- and what comes out of here
+// does not stand behind any fence, so a caller that saves a device through this container
+// rather than through the device itself takes the fence off it.
 func (c *Container) Devices() *sqlstore.Container { return c.devices }
 
 // Close releases the pool. There is only one, and whatsmeow's container wraps it
@@ -131,13 +140,18 @@ func (c *Container) Close() error {
 // A mapping that points at a device whatsmeow no longer holds is treated as no mapping
 // at all: the credentials are what makes a session resumable, and without them the
 // only honest answer is to pair again.
-func (c *Container) Device(ctx context.Context, sid string) (*store.Device, error) {
+//
+// The fence is taken rather than applied by the caller so that there is no way to get a
+// device from here without one. A session builds a device more than once -- a logout and
+// a stale mapping both send it back for another -- and the second of those was where an
+// unfenced one first got in.
+func (c *Container) device(ctx context.Context, sid string, fence *Fence) (*store.Device, error) {
 	jid, bound, err := c.lookup(ctx, sid)
 	if err != nil {
 		return nil, err
 	}
 	if !bound {
-		return c.devices.NewDevice(), nil
+		return Fenced(c.devices.NewDevice(), fence), nil
 	}
 
 	device, err := c.devices.GetDevice(ctx, jid)
@@ -145,12 +159,21 @@ func (c *Container) Device(ctx context.Context, sid string) (*store.Device, erro
 		return nil, fmt.Errorf("store: read the device of %s: %w", sid, err)
 	}
 	if device == nil {
+		// The mapping points at a device whatsmeow does not hold, and clearing it is a
+		// write -- the one write on a path that otherwise reads. Fenced like any other,
+		// and for a sharper reason than most: Bind runs before the device is saved, so a
+		// session that took this one over has a moment where its mapping is exactly this
+		// shape. Cleared by the instance on its way out, the new owner's device is left
+		// with nothing pointing at it.
+		if err := fence.held(); err != nil {
+			return nil, err
+		}
 		if err := c.unbind(ctx, sid); err != nil {
 			return nil, err
 		}
-		return c.devices.NewDevice(), nil
+		return Fenced(c.devices.NewDevice(), fence), nil
 	}
-	return device, nil
+	return Fenced(device, fence), nil
 }
 
 // Bind records which device a session paired.
@@ -164,7 +187,7 @@ func (c *Container) Device(ctx context.Context, sid string) (*store.Device, erro
 // is the key whatsmeow files the device under and the one `GetDevice` answers to.
 // Normalising it away would leave every restart looking up a device that is there
 // under a name we no longer hold, reading it as unpaired, and pairing again.
-func (c *Container) Bind(ctx context.Context, sid string, jid types.JID) error {
+func (c *Container) bind(ctx context.Context, sid string, jid types.JID) error {
 	if sid == "" {
 		return errors.New("store: bind needs a session id")
 	}
@@ -261,7 +284,7 @@ func (c *Container) deleteDevice(ctx context.Context, jid types.JID) {
 
 // Forget deletes a session's device and its mapping, which is what a logout means:
 // the credentials are gone and the next connect has to pair.
-func (c *Container) Forget(ctx context.Context, sid string) error {
+func (c *Container) forget(ctx context.Context, sid string) error {
 	jid, bound, err := c.lookup(ctx, sid)
 	if err != nil {
 		return err
@@ -287,7 +310,7 @@ func (c *Container) Forget(ctx context.Context, sid string) error {
 }
 
 // JID reports which device a session is bound to, and whether it is bound at all.
-func (c *Container) JID(ctx context.Context, sid string) (types.JID, bool, error) {
+func (c *Container) jid(ctx context.Context, sid string) (types.JID, bool, error) {
 	return c.lookup(ctx, sid)
 }
 

@@ -77,7 +77,7 @@ func TestLivePairWithQR(t *testing.T) {
 	events.await(t, protocol.EventPairingSuccess, liveDeadline(t, 5*time.Minute))
 	events.awaitState(t, "open", 2*time.Minute)
 
-	jid, bound, err := container.JID(t.Context(), liveSID)
+	jid, bound, err := container.For(liveSID).JID(t.Context())
 	if err != nil || !bound {
 		t.Fatalf("the pairing was announced but nothing was written down (bound=%v, err=%v)", bound, err)
 	}
@@ -106,7 +106,7 @@ func TestLivePairWithCode(t *testing.T) {
 	events.await(t, protocol.EventPairingSuccess, liveDeadline(t, 5*time.Minute))
 	events.awaitState(t, "open", 2*time.Minute)
 
-	if _, bound, err := container.JID(t.Context(), liveSID); err != nil || !bound {
+	if _, bound, err := container.For(liveSID).JID(t.Context()); err != nil || !bound {
 		t.Fatalf("the pairing was announced but nothing was written down (bound=%v, err=%v)", bound, err)
 	}
 }
@@ -116,7 +116,7 @@ func TestLivePairWithCode(t *testing.T) {
 func TestLiveResume(t *testing.T) {
 	session, container := liveSession(t)
 
-	jid, bound, err := container.JID(t.Context(), liveSID)
+	jid, bound, err := container.For(liveSID).JID(t.Context())
 	if err != nil || !bound {
 		t.Fatalf("nothing is paired yet; run TestLivePairWithQR first (err=%v)", err)
 	}
@@ -757,7 +757,7 @@ func TestLiveRefetch(t *testing.T) {
 
 	// What makes the refetch possible at all is a row, not a file. Reading it here says
 	// which of the two is missing when the command below fails.
-	kept, found, err := container.MediaPart(t.Context(), liveSID, messageID)
+	kept, found, err := container.For(liveSID).MediaPart(t.Context(), messageID)
 	if err != nil {
 		t.Fatalf("read what was filed for %s: %v", messageID, err)
 	}
@@ -1416,7 +1416,7 @@ func TestLiveLogout(t *testing.T) {
 	}
 	events.await(t, protocol.EventSessionLoggedOut, 60*time.Second)
 
-	if _, bound, err := container.JID(t.Context(), liveSID); err != nil || bound {
+	if _, bound, err := container.For(liveSID).JID(t.Context()); err != nil || bound {
 		t.Fatalf("the mapping survived a logout (bound=%v, err=%v)", bound, err)
 	}
 }

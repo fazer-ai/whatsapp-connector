@@ -34,7 +34,7 @@ func TestASweepCrossesItsBatchBoundary(t *testing.T) {
 			SID: "sid-1", MessageID: fmt.Sprintf("3EB0%04d", i), Kind: "image",
 			DirectPath: "/v/t62.7118-24/file.enc", Mime: "image/jpeg",
 		}
-		if err := container.PutMediaPart(t.Context(), &part, expired); err != nil {
+		if err := container.putMediaPart(t.Context(), &part, expired); err != nil {
 			t.Fatalf("PutMediaPart(%d): %v", i, err)
 		}
 	}
@@ -66,7 +66,7 @@ func TestASweepGivenNoTimeDropsNothing(t *testing.T) {
 	container := openInternal(t)
 	bindOne(t, container, "sid-1", "5511999990001")
 	part := MediaPart{SID: "sid-1", MessageID: "3EB0OLD", Kind: "image", DirectPath: "/v/f.enc"}
-	if err := container.PutMediaPart(t.Context(), &part, time.Now().Add(-30*24*time.Hour)); err != nil {
+	if err := container.putMediaPart(t.Context(), &part, time.Now().Add(-30*24*time.Hour)); err != nil {
 		t.Fatalf("PutMediaPart: %v", err)
 	}
 
@@ -80,7 +80,7 @@ func TestASweepGivenNoTimeDropsNothing(t *testing.T) {
 	if dropped != 0 {
 		t.Fatalf("a sweep with no time left reported dropping %d rows", dropped)
 	}
-	if _, found, err := container.MediaPart(t.Context(), "sid-1", "3EB0OLD"); err != nil || !found {
+	if _, found, err := container.mediaPart(t.Context(), "sid-1", "3EB0OLD"); err != nil || !found {
 		t.Fatalf("the row went with a sweep that never ran (found=%v err=%v)", found, err)
 	}
 }
@@ -117,7 +117,7 @@ func bindOne(t *testing.T, container *Container, sid, phone string) {
 	if err := container.Devices().PutDevice(t.Context(), device); err != nil {
 		t.Fatalf("PutDevice: %v", err)
 	}
-	if err := container.Bind(t.Context(), sid, jid); err != nil {
+	if err := container.bind(t.Context(), sid, jid); err != nil {
 		t.Fatalf("Bind: %v", err)
 	}
 }

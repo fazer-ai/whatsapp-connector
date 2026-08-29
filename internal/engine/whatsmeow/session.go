@@ -48,7 +48,7 @@ const clientDisplayName = "Chrome (Linux)"
 // Session is one WhatsApp account on a whatsmeow client.
 type Session struct {
 	sid   string
-	store *store.Container
+	store *store.Scoped
 	log   zerolog.Logger
 	waLog waLog.Logger
 
@@ -322,13 +322,13 @@ type pairingRun struct {
 
 //nolint:gocritic // zerolog.Logger is designed to be copied; every With() returns one by value
 func newSession(
-	sid string, client *wm.Client, container *store.Container,
+	sid string, client *wm.Client, scoped *store.Scoped,
 	blobs MediaOptions, log zerolog.Logger, wa waLog.Logger,
 ) *Session {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Session{
 		sid:        sid,
-		store:      container,
+		store:      scoped,
 		log:        log.With().Str("sid", sid).Logger(),
 		waLog:      wa,
 		inbox:      make(chan pending, inboxDepth),
@@ -1067,7 +1067,7 @@ func (s *Session) Logout(ctx context.Context) error {
 	// logged out minutes ago, on credentials WhatsApp threw away.
 	s.emit(protocol.EventSessionLoggedOut, map[string]any{"reason": "logout_requested"})
 
-	if err := s.store.Forget(ctx, s.sid); err != nil {
+	if err := s.store.Forget(ctx); err != nil {
 		// The client here is on a deleted device whatever happens next, and the mapping
 		// still points at it: rebuilding on top of that would hand the fresh client the
 		// very credentials WhatsApp threw away.
@@ -1174,7 +1174,7 @@ func (s *Session) rebuild(ctx context.Context) error {
 		return nil
 	}
 
-	device, err := s.store.Device(ctx, s.sid)
+	device, err := s.store.Device(ctx)
 	if err != nil {
 		return fmt.Errorf("whatsmeow: rebuild %s: %w", s.sid, err)
 	}
@@ -1198,7 +1198,7 @@ func (s *Session) rebuild(ctx context.Context) error {
 // device, and rebuilding from that hands the session the very credentials WhatsApp
 // threw away. Doing them together is what makes the retry a retry.
 func (s *Session) recover(ctx context.Context) error {
-	if err := s.store.Forget(ctx, s.sid); err != nil {
+	if err := s.store.Forget(ctx); err != nil {
 		return err
 	}
 	return s.rebuild(ctx)
@@ -1286,6 +1286,12 @@ func (s *Session) Close() error {
 		return nil
 	}
 	s.closed = true
+	// Inside the same transition that publishes the close, and not after it. That flag is
+	// what an Open racing this reads to decide it may build the replacement, so a moment
+	// where the session is closed and the fence is still up is a moment where two sessions
+	// can write one device. Dropping is a single atomic store, so it costs the lock
+	// nothing to hold it for.
+	s.store.Drop()
 	run := s.pairing
 	s.pairing = nil
 	closing := s.closing
@@ -1993,7 +1999,7 @@ func (s *Session) bind(jid waTypes.JID, _, _ string) bool {
 	ctx, cancel := context.WithTimeout(s.ctx, bindTimeout)
 	defer cancel()
 
-	if err := s.store.Bind(ctx, s.sid, jid); err != nil {
+	if err := s.store.Bind(ctx, jid); err != nil {
 		s.log.Error().Err(err).Msg("failed to record a pairing; refusing it")
 		return false
 	}
@@ -2232,7 +2238,7 @@ func (s *Session) loggedOut(event *waEvents.LoggedOut) {
 	ctx, cancel := context.WithTimeout(s.ctx, s.storeLimit)
 	defer cancel()
 	cleaned := true
-	if err := s.store.Forget(ctx, s.sid); err != nil {
+	if err := s.store.Forget(ctx); err != nil {
 		cleaned = false
 		s.log.Error().Err(err).Msg("failed to forget the device of a session that was logged out")
 	}

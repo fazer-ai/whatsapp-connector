@@ -41,7 +41,7 @@ func TestTheRefetchSweepRunsBeforeItsFirstTick(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("the sweeper made no pass at all, and its first tick is an hour away")
 	}
-	_, found, err := container.MediaPart(t.Context(), "sid-1", "3EB0OLD")
+	_, found, err := container.For("sid-1").MediaPart(t.Context(), "3EB0OLD")
 	if err != nil {
 		t.Fatalf("MediaPart: %v", err)
 	}
@@ -103,7 +103,7 @@ func seedExpiredPart(t *testing.T, container *store.Container, sid, messageID st
 	if err := container.Devices().PutDevice(t.Context(), device); err != nil {
 		t.Fatalf("PutDevice: %v", err)
 	}
-	if err := container.Bind(t.Context(), sid, jid); err != nil {
+	if err := container.For(sid).Bind(t.Context(), jid); err != nil {
 		t.Fatalf("Bind: %v", err)
 	}
 
@@ -111,7 +111,7 @@ func seedExpiredPart(t *testing.T, container *store.Container, sid, messageID st
 		SID: sid, MessageID: messageID, Kind: "image",
 		DirectPath: "/v/t62.7118-24/file.enc", Mime: "image/jpeg",
 	}
-	if err := container.PutMediaPart(t.Context(), &part, time.Now().Add(-365*24*time.Hour)); err != nil {
+	if err := container.For(part.SID).PutMediaPart(t.Context(), &part, time.Now().Add(-365*24*time.Hour)); err != nil {
 		t.Fatalf("PutMediaPart: %v", err)
 	}
 }

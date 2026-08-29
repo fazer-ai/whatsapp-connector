@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"sync"
@@ -33,7 +34,7 @@ func TestDeviceIsFreshUntilSomethingIsBound(t *testing.T) {
 	t.Parallel()
 	container := open(t)
 
-	device, err := container.Device(t.Context(), "sid-1")
+	device, err := container.For("sid-1").Device(t.Context())
 	if err != nil {
 		t.Fatalf("Device: %v", err)
 	}
@@ -52,7 +53,7 @@ func TestDeviceResumesWhatWasBound(t *testing.T) {
 
 	jid := pair(t, container, "sid-1", "5511999990001")
 
-	device, err := container.Device(ctx, "sid-1")
+	device, err := container.For("sid-1").Device(ctx)
 	if err != nil {
 		t.Fatalf("Device: %v", err)
 	}
@@ -61,7 +62,7 @@ func TestDeviceResumesWhatWasBound(t *testing.T) {
 	}
 
 	// A different session must not be handed the same credentials.
-	other, err := container.Device(ctx, "sid-2")
+	other, err := container.For("sid-2").Device(ctx)
 	if err != nil {
 		t.Fatalf("Device: %v", err)
 	}
@@ -76,14 +77,14 @@ func TestBindMovesADeviceOffItsPreviousSession(t *testing.T) {
 	ctx := t.Context()
 
 	jid := pair(t, container, "sid-old", "5511999990001")
-	if err := container.Bind(ctx, "sid-new", jid); err != nil {
+	if err := container.For("sid-new").Bind(ctx, jid); err != nil {
 		t.Fatalf("Bind: %v", err)
 	}
 
-	if _, bound, err := container.JID(ctx, "sid-old"); err != nil || bound {
+	if _, bound, err := container.For("sid-old").JID(ctx); err != nil || bound {
 		t.Fatalf("the old session is still bound (bound=%v, err=%v)", bound, err)
 	}
-	bound, ok, err := container.JID(ctx, "sid-new")
+	bound, ok, err := container.For("sid-new").JID(ctx)
 	if err != nil || !ok || bound.User != jid.User {
 		t.Fatalf("the new session holds %v (ok=%v, err=%v)", bound, ok, err)
 	}
@@ -100,18 +101,18 @@ func TestDeviceForgetsAMappingWhoseDeviceIsGone(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseJID: %v", err)
 	}
-	if err := container.Bind(ctx, "sid-1", jid); err != nil {
+	if err := container.For("sid-1").Bind(ctx, jid); err != nil {
 		t.Fatalf("Bind: %v", err)
 	}
 
-	device, err := container.Device(ctx, "sid-1")
+	device, err := container.For("sid-1").Device(ctx)
 	if err != nil {
 		t.Fatalf("Device: %v", err)
 	}
 	if device.ID != nil {
 		t.Fatalf("resumed %s from a device that is not stored", device.ID)
 	}
-	if _, bound, err := container.JID(ctx, "sid-1"); err != nil || bound {
+	if _, bound, err := container.For("sid-1").JID(ctx); err != nil || bound {
 		t.Fatalf("the dangling mapping survived (bound=%v, err=%v)", bound, err)
 	}
 }
@@ -122,11 +123,11 @@ func TestForgetRemovesTheDeviceAndTheMapping(t *testing.T) {
 	ctx := t.Context()
 
 	jid := pair(t, container, "sid-1", "5511999990001")
-	if err := container.Forget(ctx, "sid-1"); err != nil {
+	if err := container.For("sid-1").Forget(ctx); err != nil {
 		t.Fatalf("Forget: %v", err)
 	}
 
-	if _, bound, err := container.JID(ctx, "sid-1"); err != nil || bound {
+	if _, bound, err := container.For("sid-1").JID(ctx); err != nil || bound {
 		t.Fatalf("the mapping survived a logout (bound=%v, err=%v)", bound, err)
 	}
 	stored, err := container.Devices().GetDevice(ctx, jid)
@@ -139,7 +140,7 @@ func TestForgetRemovesTheDeviceAndTheMapping(t *testing.T) {
 
 	// Forgetting a session that never paired is what a delete on an unpaired inbox
 	// does, and it is not an error.
-	if err := container.Forget(ctx, "sid-never"); err != nil {
+	if err := container.For("sid-never").Forget(ctx); err != nil {
 		t.Fatalf("Forget on an unpaired session: %v", err)
 	}
 }
@@ -152,10 +153,10 @@ func TestBindRefusesAnIncompleteCall(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseJID: %v", err)
 	}
-	if err := container.Bind(t.Context(), "", jid); err == nil {
+	if err := container.For("").Bind(t.Context(), jid); err == nil {
 		t.Fatal("bound a device to no session")
 	}
-	if err := container.Bind(t.Context(), "sid-1", types.EmptyJID); err == nil {
+	if err := container.For("sid-1").Bind(t.Context(), types.EmptyJID); err == nil {
 		t.Fatal("bound a session to no device")
 	}
 }
@@ -202,7 +203,7 @@ func pair(t *testing.T, container *store.Container, sid, phone string) types.JID
 	if err := container.Devices().PutDevice(ctx, device); err != nil {
 		t.Fatalf("PutDevice: %v", err)
 	}
-	if err := container.Bind(ctx, sid, jid); err != nil {
+	if err := container.For(sid).Bind(ctx, jid); err != nil {
 		t.Fatalf("Bind: %v", err)
 	}
 	return jid
@@ -222,7 +223,7 @@ func TestDeviceResumesACompanionDeviceJID(t *testing.T) {
 		t.Fatalf("the test paired %s, which carries no device part", jid)
 	}
 
-	device, err := container.Device(ctx, "sid-1")
+	device, err := container.For("sid-1").Device(ctx)
 	if err != nil {
 		t.Fatalf("Device: %v", err)
 	}
@@ -248,7 +249,7 @@ func TestBindDeletesTheDeviceItDisplaces(t *testing.T) {
 		t.Fatal("the test paired the same device twice")
 	}
 
-	if _, bound, err := container.JID(ctx, "sid-old"); err != nil || bound {
+	if _, bound, err := container.For("sid-old").JID(ctx); err != nil || bound {
 		t.Fatalf("the displaced session is still bound (bound=%v, err=%v)", bound, err)
 	}
 	stored, err := container.Devices().GetDevice(ctx, old)
@@ -319,11 +320,11 @@ func TestConcurrentWritersDoNotCollide(t *testing.T) {
 					failures <- fmt.Errorf("PutDevice: %w", err)
 					return
 				}
-				if err := container.Bind(ctx, fmt.Sprintf("sid-%d", writer), jid); err != nil {
+				if err := container.For(fmt.Sprintf("sid-%d", writer)).Bind(ctx, jid); err != nil {
 					failures <- fmt.Errorf("Bind: %w", err)
 					return
 				}
-				if _, _, err := container.JID(ctx, fmt.Sprintf("sid-%d", writer)); err != nil {
+				if _, _, err := container.For(fmt.Sprintf("sid-%d", writer)).JID(ctx); err != nil {
 					failures <- fmt.Errorf("JID: %w", err)
 					return
 				}
@@ -365,7 +366,7 @@ func TestOneAccountKeepsOneMappingUnderConcurrentPairings(t *testing.T) {
 			}
 			// A pairing that loses the race is a pairing refused, which is a correct
 			// outcome; a pairing that wins and leaves a second mapping behind is not.
-			if err := container.Bind(ctx, fmt.Sprintf("sid-%d", i), jid); err != nil {
+			if err := container.For(fmt.Sprintf("sid-%d", i)).Bind(ctx, jid); err != nil {
 				failures <- err
 			}
 		}()
@@ -375,7 +376,7 @@ func TestOneAccountKeepsOneMappingUnderConcurrentPairings(t *testing.T) {
 
 	var bound int
 	for i := range pairings {
-		if _, ok, err := container.JID(ctx, fmt.Sprintf("sid-%d", i)); err != nil {
+		if _, ok, err := container.For(fmt.Sprintf("sid-%d", i)).JID(ctx); err != nil {
 			t.Fatalf("JID: %v", err)
 		} else if ok {
 			bound++
@@ -530,10 +531,10 @@ func TestAnUpgradeKeepsTheMappingThatStillHasItsCredentials(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = upgraded.Close() })
 
-	if _, bound, err := upgraded.JID(t.Context(), "sid-halfway"); err != nil || bound {
+	if _, bound, err := upgraded.For("sid-halfway").JID(t.Context()); err != nil || bound {
 		t.Fatalf("the mapping with no device behind it survived (bound=%v, err=%v)", bound, err)
 	}
-	if jid, bound, err := upgraded.JID(t.Context(), "sid-paired"); err != nil || !bound || jid != paired {
+	if jid, bound, err := upgraded.For("sid-paired").JID(t.Context()); err != nil || !bound || jid != paired {
 		t.Fatalf("the paired mapping is gone (jid=%v, bound=%v, err=%v)", jid, bound, err)
 	}
 
@@ -544,7 +545,7 @@ func TestAnUpgradeKeepsTheMappingThatStillHasItsCredentials(t *testing.T) {
 	} else if stored == nil {
 		t.Fatal("the upgrade deleted the only device the account had")
 	}
-	resumed, err := upgraded.Device(t.Context(), "sid-paired")
+	resumed, err := upgraded.For("sid-paired").Device(t.Context())
 	if err != nil {
 		t.Fatalf("Device: %v", err)
 	}
@@ -615,10 +616,10 @@ func TestAnOlderStoreGainsTheAccountConstraint(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = upgraded.Close() })
 
-	if _, bound, err := upgraded.JID(t.Context(), "sid-old"); err != nil || bound {
+	if _, bound, err := upgraded.For("sid-old").JID(t.Context()); err != nil || bound {
 		t.Fatalf("the older of two mappings survived (bound=%v, err=%v)", bound, err)
 	}
-	if _, bound, err := upgraded.JID(t.Context(), "sid-newer"); err != nil || !bound {
+	if _, bound, err := upgraded.For("sid-newer").JID(t.Context()); err != nil || !bound {
 		t.Fatalf("the mapping that should have been kept is gone (bound=%v, err=%v)", bound, err)
 	}
 
@@ -637,5 +638,76 @@ func TestAnOlderStoreGainsTheAccountConstraint(t *testing.T) {
 		"sid-third", "5511999990001:9@s.whatsapp.net", "5511999990001", 99)
 	if err == nil {
 		t.Fatal("a second mapping for one account was accepted after the upgrade")
+	}
+}
+
+// The save that ends a pairing is where whatsmeow installs the stores a fresh device does
+// not have yet, and it installs them over whatever was there. A fence that did not put
+// itself back would come off exactly once per account, at pairing, and stay off -- on the
+// sessions where nothing would look wrong.
+func TestPairingDoesNotTakeTheFenceOff(t *testing.T) {
+	t.Parallel()
+	container := open(t)
+
+	fence := &store.Fence{}
+	device := store.Fenced(container.Devices().NewDevice(), fence)
+	if device.Initialized {
+		t.Fatal("a device that has never been saved is already initialised, so this proves nothing")
+	}
+	jid := types.NewJID("5511999990001", types.DefaultUserServer)
+	jid.Device = 1
+	device.ID = &jid
+	// The half of pairing this test does not run: whatsmeow fills the account identity
+	// before it saves, and refuses to store a device without one.
+	device.Account = &waAdv.ADVSignedDeviceIdentity{
+		Details:             make([]byte, 32),
+		AccountSignature:    make([]byte, 64),
+		AccountSignatureKey: make([]byte, 32),
+		DeviceSignature:     make([]byte, 64),
+	}
+
+	if err := device.Save(t.Context()); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if !device.Initialized {
+		t.Fatal("the save left the device uninitialised, so whatsmeow no longer installs its stores here")
+	}
+
+	fence.Drop()
+	if err := device.Identities.PutIdentity(t.Context(), "5511999990002.0", [32]byte{}); !errors.Is(err, store.ErrNotOwned) {
+		t.Errorf("an identity was written after the fence came down: %v", err)
+	}
+	if err := device.Save(t.Context()); !errors.Is(err, store.ErrNotOwned) {
+		t.Errorf("the device itself was written after the fence came down: %v", err)
+	}
+}
+
+// Device reads, except for the one case where it writes: a mapping that points at a device
+// whatsmeow does not hold is cleared as no mapping at all. That shape is also what a session
+// taking over looks like for a moment, because Bind runs before the device is saved, so an
+// instance on its way out must not be the one to clear it.
+func TestAStoppedSessionDoesNotClearAMappingItFinds(t *testing.T) {
+	t.Parallel()
+	container := open(t)
+
+	jid, err := types.ParseJID("5511999990001:3@" + types.DefaultUserServer)
+	if err != nil {
+		t.Fatalf("ParseJID: %v", err)
+	}
+	// Bound with no device behind it, which is what pairing looks like between the mapping
+	// and the save.
+	scoped := container.For("sid-taken-over")
+	if err := scoped.Bind(t.Context(), jid); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	scoped.Drop()
+	if _, err := scoped.Device(t.Context()); !errors.Is(err, store.ErrNotOwned) {
+		t.Fatalf("a session that stopped went looking and cleaned up: %v", err)
+	}
+
+	// And the mapping is still there for whoever it belongs to now.
+	if _, bound, err := container.For("sid-taken-over").JID(t.Context()); err != nil || !bound {
+		t.Fatalf("the mapping was cleared by the session that no longer owns it (bound=%v, err=%v)", bound, err)
 	}
 }

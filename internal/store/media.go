@@ -70,7 +70,7 @@ type MediaPart struct {
 // and adding one is the architecture change the package doc calls open -- it removes the
 // harm reordering does here, which is a stale directPath installed over a fresh one and a
 // later download answered with a 404.
-func (c *Container) PutMediaPart(ctx context.Context, part *MediaPart, now time.Time) error {
+func (c *Container) putMediaPart(ctx context.Context, part *MediaPart, now time.Time) error {
 	if part.SID == "" || part.MessageID == "" {
 		return fmt.Errorf("store: a media part needs a session and a message, got %q and %q", part.SID, part.MessageID)
 	}
@@ -102,7 +102,7 @@ func (c *Container) PutMediaPart(ctx context.Context, part *MediaPart, now time.
 
 // MediaPart reads back how to fetch one message's file, and whether anything was kept
 // for it at all.
-func (c *Container) MediaPart(ctx context.Context, sid, messageID string) (MediaPart, bool, error) {
+func (c *Container) mediaPart(ctx context.Context, sid, messageID string) (MediaPart, bool, error) {
 	const query = `
 		SELECT chat_kind, chat_id, kind, direct_path, media_key, file_enc_sha256, file_sha256,
 		       file_length, mime, filename, stored_at
