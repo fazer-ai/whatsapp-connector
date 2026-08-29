@@ -44,6 +44,22 @@ func (s *Session) chatPresence(event *waEvents.ChatPresence) bool {
 	if chat.Kind == protocol.AddressGroup && !s.wantsGroups() {
 		return true
 	}
+	direct := chat.Kind == protocol.AddressPhone || chat.Kind == protocol.AddressLID
+	if direct && event.IsFromMe {
+		// This account typing on another of its own devices. In a direct chat the
+		// contract reads a `chat.presence` as being about the other party -- `sender` is
+		// documented as nullable there precisely because the chat is the person -- so a
+		// client is entitled to ignore that field, and this would reach it as the contact
+		// typing while the contact does nothing. There is no field that says otherwise,
+		// and rounding it to the nearest thing the contract does have is what this file
+		// refuses to do everywhere else. Registered as #48.
+		//
+		// A group is not the same case: there `sender` is the whole information, and this
+		// account is a participant like any other.
+		s.log.Debug().Str("chat", chat.ID).
+			Msg("dropping this account's own typing, which a direct chat has no way to say")
+		return true
+	}
 	state, named := typingOf(event.State, event.Media)
 	if !named {
 		// A state this build has no name for. Published as the nearest one it does have,
@@ -76,14 +92,15 @@ func (s *Session) chatPresence(event *waEvents.ChatPresence) bool {
 	// state belongs to a participant: keyed by the chat alone, Bob starting to type
 	// replaces Alice's stop and the client is left showing Alice typing for good.
 	//
-	// In a direct chat the chat is the person, and WhatsApp addresses them by either of
-	// its two namespaces from one event to the next. Keeping the chat in the key there
-	// undoes what the canonical sender just did: a `composing` in the LID chat and the
-	// `paused` in the number chat are two entries again, and the typing under whichever
-	// address the client saw first is left showing with nothing coming.
+	// In a direct chat the chat is the person -- the account's own typing is gone by
+	// here, so the sender is the other party either way -- and WhatsApp addresses them by
+	// either of its two namespaces from one event to the next. Keeping the chat in the
+	// key there undoes what the canonical sender just did: a `composing` in the LID chat
+	// and the `paused` in the number chat are two entries again, and the typing under
+	// whichever address the client saw first is left showing with nothing coming.
 	who := keyedBy(event.Sender, event.SenderAlt)
 	key := string(protocol.EventChatPresence) + ":" + who
-	if chat.Kind != protocol.AddressPhone && chat.Kind != protocol.AddressLID {
+	if !direct {
 		key = string(protocol.EventChatPresence) + ":" + string(chat.Kind) + ":" + chat.ID + ":" + who
 	}
 	s.post(key, protocol.EventChatPresence, published, life)

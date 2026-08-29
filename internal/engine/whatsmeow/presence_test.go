@@ -979,3 +979,61 @@ func TestADirectChatIsKeyedByThePersonAndNotTheAddressThatArrived(t *testing.T) 
 		t.Errorf("what is waiting is a %s, and the person's last state was the stop", state)
 	}
 }
+
+// WhatsApp reports this account's own typing when it is done on another linked device,
+// and in a direct chat it puts the account in the sender and the conversation in the
+// chat. The contract has no way to say that: `sender` is nullable in a direct chat
+// because the chat is the person, so a client is entitled to ignore it and would render
+// this as the contact typing while the contact does nothing.
+func TestThisAccountsOwnTypingIsNotPublishedInADirectChat(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	if !session.chatPresence(&waEvents.ChatPresence{
+		MessageSource: waTypes.MessageSource{
+			Chat:     waTypes.NewJID("5511999990002", waTypes.DefaultUserServer),
+			Sender:   waTypes.NewJID("5511999990001", waTypes.DefaultUserServer),
+			IsFromMe: true,
+		},
+		State: waTypes.ChatPresenceComposing,
+	}) {
+		t.Fatal("this account's own typing was left for WhatsApp to send again")
+	}
+	select {
+	case emission := <-session.Events():
+		t.Fatalf("a contact was published as typing, and it was this account: %s", emission.Payload)
+	case <-time.After(500 * time.Millisecond):
+	}
+}
+
+// And in a group it is published, because there `sender` is the whole information and
+// this account is a participant like any other -- keyed by that participant, so it does
+// not sit on anybody else's state.
+func TestThisAccountsOwnTypingInAGroupIsKeptApartFromEveryoneElses(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.groups = true
+	session.picked = make(chan struct{}, 1)
+	blockTheForwarder(t, session)
+
+	chat := waTypes.NewJID("120363041234567890", waTypes.GroupServer)
+	session.chatPresence(&waEvents.ChatPresence{
+		MessageSource: waTypes.MessageSource{
+			Chat: chat, Sender: waTypes.NewJID("5511999990002", waTypes.DefaultUserServer), IsGroup: true,
+		},
+		State: waTypes.ChatPresenceComposing,
+	})
+	session.chatPresence(&waEvents.ChatPresence{
+		MessageSource: waTypes.MessageSource{
+			Chat:    chat,
+			Sender:  waTypes.NewJID("5511999990001", waTypes.DefaultUserServer),
+			IsGroup: true, IsFromMe: true,
+		},
+		State: waTypes.ChatPresencePaused,
+	})
+
+	if waiting := onBoard(session); len(waiting) != 2 {
+		t.Errorf("%d presences are waiting, and two participants were typing in that group", len(waiting))
+	}
+}
