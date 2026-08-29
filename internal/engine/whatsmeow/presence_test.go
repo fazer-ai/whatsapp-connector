@@ -36,7 +36,7 @@ func TestTypingAndRecordingAreTheSameStateWithDifferentMedia(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			session, _ := newTestSession(t, "5511999990001")
+			session := newPresenceSession(t, "5511999990001")
 			event := &waEvents.ChatPresence{
 				MessageSource: waTypes.MessageSource{
 					Chat:   waTypes.NewJID("5511999990002", waTypes.DefaultUserServer),
@@ -111,7 +111,7 @@ func TestAPresenceSaysNothingAboutALastSeenThatIsHidden(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			session, _ := newTestSession(t, "5511999990001")
+			session := newPresenceSession(t, "5511999990001")
 			payload := decode(t, presencePublishedBy(t, session, protocol.EventPresenceUpdate,
 				func() bool { return session.presence(tc.event) }).Payload)
 
@@ -136,7 +136,7 @@ func TestAPresenceSaysNothingAboutALastSeenThatIsHidden(t *testing.T) {
 func TestAPresenceNobodyPublishedIsStillAcknowledged(t *testing.T) {
 	t.Parallel()
 
-	session, _ := newTestSession(t, "5511999990001")
+	session := newPresenceSession(t, "5511999990001")
 	session.deliverWait = 20 * time.Millisecond
 
 	// Nothing is reading the events, so nothing is published. The answer to WhatsApp is
@@ -221,7 +221,7 @@ func TestAPresenceCommandTakesOnlyTheStatesTheContractHas(t *testing.T) {
 func TestAGroupsTypingIsNotPublishedToADirectOnlyClient(t *testing.T) {
 	t.Parallel()
 
-	session, _ := newTestSession(t, "5511999990001")
+	session := newPresenceSession(t, "5511999990001")
 	session.deliverWait = 20 * time.Millisecond
 	event := &waEvents.ChatPresence{
 		MessageSource: waTypes.MessageSource{
@@ -275,7 +275,7 @@ func presencePublishedBy(t *testing.T, session *Session, want protocol.EventType
 func TestTypingDoesNotWaitOnAnInboxThatIsFull(t *testing.T) {
 	t.Parallel()
 
-	session, _ := newTestSession(t, "5511999990001")
+	session := newPresenceSession(t, "5511999990001")
 	// Filled until the channel itself refuses, rather than by counting to inboxDepth:
 	// the forwarder takes one out and blocks handing it on, so a count would leave a slot
 	// free and a path that waits for room would not have to wait.
@@ -320,7 +320,7 @@ func TestTypingDoesNotWaitOnAnInboxThatIsFull(t *testing.T) {
 func TestATypingStateThisBuildHasNoNameForIsNotRoundedToTheNearestOne(t *testing.T) {
 	t.Parallel()
 
-	session, _ := newTestSession(t, "5511999990001")
+	session := newPresenceSession(t, "5511999990001")
 	event := &waEvents.ChatPresence{
 		MessageSource: waTypes.MessageSource{
 			Chat:   waTypes.NewJID("5511999990002", waTypes.DefaultUserServer),
@@ -347,7 +347,7 @@ func TestATypingStateThisBuildHasNoNameForIsNotRoundedToTheNearestOne(t *testing
 func TestAStopReplacesTheTypingItStops(t *testing.T) {
 	t.Parallel()
 
-	session, _ := newTestSession(t, "5511999990001")
+	session := newPresenceSession(t, "5511999990001")
 	session.picked = make(chan struct{}, 1)
 	blockTheForwarder(t, session)
 
@@ -375,7 +375,7 @@ func TestAStopReplacesTheTypingItStops(t *testing.T) {
 func TestOneChatsTypingDoesNotDisplaceAnothers(t *testing.T) {
 	t.Parallel()
 
-	session, _ := newTestSession(t, "5511999990001")
+	session := newPresenceSession(t, "5511999990001")
 	session.picked = make(chan struct{}, 1)
 	blockTheForwarder(t, session)
 
@@ -396,7 +396,7 @@ func TestOneChatsTypingDoesNotDisplaceAnothers(t *testing.T) {
 func TestAMomentThatWentStaleIsNotPublishedLate(t *testing.T) {
 	t.Parallel()
 
-	session, _ := newTestSession(t, "5511999990001")
+	session := newPresenceSession(t, "5511999990001")
 	now := time.Duration(0)
 	session.elapsed = func() time.Duration { return now }
 	session.picked = make(chan struct{}, 1)
@@ -423,6 +423,18 @@ func TestAMomentThatWentStaleIsNotPublishedLate(t *testing.T) {
 	if typing.Expires() > 0 {
 		t.Error("a typing indicator is still worth publishing after its whole life")
 	}
+}
+
+// newPresenceSession is a session on a live connection, which is the only state presence
+// arrives in. A node reported by a socket that is already down is refused before it
+// reaches the board, so a test that does not say the session is up would be exercising
+// that refusal rather than whatever it means to.
+func newPresenceSession(t *testing.T, phone string) *Session {
+	t.Helper()
+
+	session, _ := newTestSession(t, phone)
+	session.setConnected(true)
+	return session
 }
 
 // blockTheForwarder parks the forwarding goroutine on an emission nobody is reading, so
@@ -481,7 +493,7 @@ func stateOf(t *testing.T, emission engine.Emission) string {
 func TestAMomentIsNotHeldWaitingForAReaderThatIsBusy(t *testing.T) {
 	t.Parallel()
 
-	session, _ := newTestSession(t, "5511999990001")
+	session := newPresenceSession(t, "5511999990001")
 	session.handoffWait = 50 * time.Millisecond
 	session.picked = make(chan struct{}, 1)
 
@@ -531,7 +543,7 @@ func TestAMomentIsNotHeldWaitingForAReaderThatIsBusy(t *testing.T) {
 func TestAnAvailabilityIsAFactAndTheLastOneWins(t *testing.T) {
 	t.Parallel()
 
-	session, _ := newTestSession(t, "5511999990001")
+	session := newPresenceSession(t, "5511999990001")
 	session.picked = make(chan struct{}, 1)
 	blockTheForwarder(t, session)
 
@@ -591,7 +603,7 @@ func TestATypingIndicatorIsRefusedWhereItHasNowhereToShow(t *testing.T) {
 func TestAGroupsTypingIsKeptPerPersonRatherThanPerChat(t *testing.T) {
 	t.Parallel()
 
-	session, _ := newTestSession(t, "5511999990001")
+	session := newPresenceSession(t, "5511999990001")
 	session.groups = true
 	session.picked = make(chan struct{}, 1)
 	blockTheForwarder(t, session)
@@ -630,7 +642,7 @@ func TestAGroupsTypingIsKeptPerPersonRatherThanPerChat(t *testing.T) {
 func TestPresenceLeavesNothingBehindWhenTheInboxIsFull(t *testing.T) {
 	t.Parallel()
 
-	session, _ := newTestSession(t, "5511999990001")
+	session := newPresenceSession(t, "5511999990001")
 	filler := pending{event: engine.Emission{Type: protocol.EventSessionState, Payload: []byte(`{}`)}}
 	// The forwarder is parked on the first one before the rest go in. Filling to refusal
 	// instead would race it for the slot it frees on its way to parking, and a queue with
@@ -662,7 +674,7 @@ func TestPresenceLeavesNothingBehindWhenTheInboxIsFull(t *testing.T) {
 func TestOnePersonIsOneKeyWhicheverAddressArrives(t *testing.T) {
 	t.Parallel()
 
-	session, _ := newTestSession(t, "5511999990001")
+	session := newPresenceSession(t, "5511999990001")
 	session.groups = true
 	session.picked = make(chan struct{}, 1)
 	blockTheForwarder(t, session)
@@ -695,7 +707,7 @@ func TestOnePersonIsOneKeyWhicheverAddressArrives(t *testing.T) {
 func TestAGroupsTypingWithNobodyToAttributeItToIsNotPublished(t *testing.T) {
 	t.Parallel()
 
-	session, _ := newTestSession(t, "5511999990001")
+	session := newPresenceSession(t, "5511999990001")
 	session.groups = true
 
 	if !session.chatPresence(&waEvents.ChatPresence{
@@ -721,7 +733,7 @@ func TestAGroupsTypingWithNobodyToAttributeItToIsNotPublished(t *testing.T) {
 func TestPresenceKeepsItsPlaceAmongTheMessages(t *testing.T) {
 	t.Parallel()
 
-	session, _ := newTestSession(t, "5511999990001")
+	session := newPresenceSession(t, "5511999990001")
 	session.picked = make(chan struct{}, 1)
 	// Parked, so the typing and the message are both waiting when the forwarder starts
 	// choosing. Posting them at a forwarder that is free would publish each as it
@@ -751,7 +763,7 @@ func TestPresenceKeepsItsPlaceAmongTheMessages(t *testing.T) {
 func TestAMarkerPublishesTheStateTheChatIsInWhenItsTurnComes(t *testing.T) {
 	t.Parallel()
 
-	session, _ := newTestSession(t, "5511999990001")
+	session := newPresenceSession(t, "5511999990001")
 	session.picked = make(chan struct{}, 1)
 	blockTheForwarder(t, session)
 
@@ -782,7 +794,7 @@ func TestAMarkerPublishesTheStateTheChatIsInWhenItsTurnComes(t *testing.T) {
 func TestAStopGoesBackOnTheBoardWhenItsPublishFails(t *testing.T) {
 	t.Parallel()
 
-	session, _ := newTestSession(t, "5511999990001")
+	session := newPresenceSession(t, "5511999990001")
 	session.picked = make(chan struct{}, 1)
 
 	source := waTypes.MessageSource{
@@ -812,7 +824,7 @@ func TestAStopGoesBackOnTheBoardWhenItsPublishFails(t *testing.T) {
 func TestAFailedStopDoesNotDisplaceTheStateAfterIt(t *testing.T) {
 	t.Parallel()
 
-	session, _ := newTestSession(t, "5511999990001")
+	session := newPresenceSession(t, "5511999990001")
 	session.picked = make(chan struct{}, 1)
 
 	source := waTypes.MessageSource{
@@ -846,7 +858,7 @@ func TestAFailedStopDoesNotDisplaceTheStateAfterIt(t *testing.T) {
 func TestAFailedStopDoesNotOvertakeAStateAlreadyOnItsWay(t *testing.T) {
 	t.Parallel()
 
-	session, _ := newTestSession(t, "5511999990001")
+	session := newPresenceSession(t, "5511999990001")
 	session.picked = make(chan struct{}, 1)
 
 	source := waTypes.MessageSource{
@@ -877,7 +889,7 @@ func TestAFailedStopDoesNotOvertakeAStateAlreadyOnItsWay(t *testing.T) {
 func TestAStopThatFailsTwiceIsNotTriedAThirdTime(t *testing.T) {
 	t.Parallel()
 
-	session, _ := newTestSession(t, "5511999990001")
+	session := newPresenceSession(t, "5511999990001")
 	session.picked = make(chan struct{}, 1)
 
 	source := waTypes.MessageSource{
@@ -921,7 +933,7 @@ func TestAStopThatFailsTwiceIsNotTriedAThirdTime(t *testing.T) {
 func TestAStateDoesNotTakeThePlaceOfAMarkerSomethingHasQueuedBehind(t *testing.T) {
 	t.Parallel()
 
-	session, _ := newTestSession(t, "5511999990001")
+	session := newPresenceSession(t, "5511999990001")
 	session.picked = make(chan struct{}, 1)
 	blockTheForwarder(t, session)
 
@@ -956,7 +968,7 @@ func TestAStateDoesNotTakeThePlaceOfAMarkerSomethingHasQueuedBehind(t *testing.T
 func TestADirectChatIsKeyedByThePersonAndNotTheAddressThatArrived(t *testing.T) {
 	t.Parallel()
 
-	session, _ := newTestSession(t, "5511999990001")
+	session := newPresenceSession(t, "5511999990001")
 	session.picked = make(chan struct{}, 1)
 	blockTheForwarder(t, session)
 
@@ -988,7 +1000,7 @@ func TestADirectChatIsKeyedByThePersonAndNotTheAddressThatArrived(t *testing.T) 
 func TestThisAccountsOwnTypingIsNotPublishedInADirectChat(t *testing.T) {
 	t.Parallel()
 
-	session, _ := newTestSession(t, "5511999990001")
+	session := newPresenceSession(t, "5511999990001")
 	if !session.chatPresence(&waEvents.ChatPresence{
 		MessageSource: waTypes.MessageSource{
 			Chat:     waTypes.NewJID("5511999990002", waTypes.DefaultUserServer),
@@ -1012,7 +1024,7 @@ func TestThisAccountsOwnTypingIsNotPublishedInADirectChat(t *testing.T) {
 func TestThisAccountsOwnTypingInAGroupIsKeptApartFromEveryoneElses(t *testing.T) {
 	t.Parallel()
 
-	session, _ := newTestSession(t, "5511999990001")
+	session := newPresenceSession(t, "5511999990001")
 	session.groups = true
 	session.picked = make(chan struct{}, 1)
 	blockTheForwarder(t, session)
@@ -1060,7 +1072,7 @@ func TestAPresenceIsNotTriedAgainOnceTheConnectionHasGone(t *testing.T) {
 		t.Run(dropped.name, func(t *testing.T) {
 			t.Parallel()
 
-			session, _ := newTestSession(t, "5511999990001")
+			session := newPresenceSession(t, "5511999990001")
 			session.picked = make(chan struct{}, 1)
 
 			from := waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)
@@ -1085,7 +1097,7 @@ func TestAPresenceIsNotTriedAgainOnceTheConnectionHasGone(t *testing.T) {
 func TestAContactOffTheOrdinaryServerIsStillOneKey(t *testing.T) {
 	t.Parallel()
 
-	session, _ := newTestSession(t, "5511999990001")
+	session := newPresenceSession(t, "5511999990001")
 	session.groups = true
 	session.picked = make(chan struct{}, 1)
 	blockTheForwarder(t, session)
@@ -1123,7 +1135,7 @@ func TestAContactOffTheOrdinaryServerIsStillOneKey(t *testing.T) {
 func TestAPresenceIsNotPublishedOnceItsConnectionHasGone(t *testing.T) {
 	t.Parallel()
 
-	session, _ := newTestSession(t, "5511999990001")
+	session := newPresenceSession(t, "5511999990001")
 	session.picked = make(chan struct{}, 1)
 	blockTheForwarder(t, session)
 
@@ -1145,5 +1157,28 @@ func TestAPresenceIsNotPublishedOnceItsConnectionHasGone(t *testing.T) {
 	}
 	if waiting := onBoard(session); len(waiting) != 0 {
 		t.Errorf("%d presences were left on the board with no marker coming for them", len(waiting))
+	}
+}
+
+// whatsmeow runs the node handlers and the connection ones on separate goroutines, so a
+// presence from the old socket can arrive after the disconnect has already been dealt
+// with. No ordering the posting end could arrange helps there: what it describes has been
+// over since before it got here, and published it leaves a contact typing or online with
+// nothing coming to say otherwise.
+func TestAPresenceReportedAfterTheConnectionWentIsRefused(t *testing.T) {
+	t.Parallel()
+
+	session := newPresenceSession(t, "5511999990001")
+	session.handle(&waEvents.StreamReplaced{})
+	next(t, session)
+
+	from := waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)
+	if !session.presence(&waEvents.Presence{From: from}) {
+		t.Fatal("a presence from a dead socket was left for WhatsApp to send again")
+	}
+	select {
+	case emission := <-session.Events():
+		t.Fatalf("a presence reported by a connection that was already down was published: %s", emission.Payload)
+	case <-time.After(500 * time.Millisecond):
 	}
 }

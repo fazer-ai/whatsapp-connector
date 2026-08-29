@@ -2088,3 +2088,35 @@ func TestATransientEventDoesNotOutlastItselfInsideTheWrite(t *testing.T) {
 		t.Fatalf("the stream holds %d events, and one that expired mid-write is not one to write", got)
 	}
 }
+
+// A frame's `ts` is when the engine learned the thing it reports, and not when the write
+// finally went out. Stamped at publication, a typing indicator that spent nine of its ten
+// seconds in a queue goes out looking new, and the freshness rule the contract asks a
+// reader to apply has nothing left to apply it to.
+func TestAnEventCarriesTheMomentTheEngineLearnedIt(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	if _, err := h.manager.Adopt(context.Background(), "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, ok := h.engine.Session("s1")
+	if !ok {
+		t.Fatal("the engine has no session after Adopt")
+	}
+
+	happened := time.Now().Add(-9 * time.Second).UnixMilli()
+	engineSession.EmitAt(protocol.EventChatPresence, map[string]any{"state": "composing"}, happened)
+	// And one that says nothing, which is every event whose time is the moment it is
+	// written: that one still gets the clock.
+	engineSession.Emit(protocol.EventSessionState, map[string]any{"state": "open"})
+
+	waitFor(t, "both events to be published", func() bool { return len(h.recorder.published()) == 2 })
+	events := h.recorder.published()
+	if events[0].TS != happened {
+		t.Errorf("the typing went out stamped %d, and the engine learned it at %d", events[0].TS, happened)
+	}
+	if events[1].TS == happened {
+		t.Error("an event that named no moment of its own was given the previous one's")
+	}
+}

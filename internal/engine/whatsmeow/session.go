@@ -457,8 +457,8 @@ func (s *Session) setDialing(dialing bool) {
 }
 
 func (s *Session) setConnected(connected bool) {
-	s.transitions.Add(1)
 	s.mu.Lock()
+	s.transitions.Add(1)
 	s.connected = connected
 	// Either way the dial is over: whatsmeow has answered for it, with an
 	// authenticated session or with the socket going down again.
@@ -489,12 +489,22 @@ func (s *Session) undoHangUp() bool {
 }
 
 func (s *Session) offline() {
-	s.transitions.Add(1)
 	s.mu.Lock()
+	s.transitions.Add(1)
 	s.connected = false
 	s.reconnecting = false
 	s.dialing = false
 	s.mu.Unlock()
+}
+
+// connection is the count of connection writes and whether the session is on one right
+// now, read together so the two cannot disagree about the same moment. Presence is the
+// only caller and needs both: a node from a socket that is already down describes nothing
+// current, and a node from the live one has to remember which connection that was.
+func (s *Session) connection() (int64, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.transitions.Load(), s.connected
 }
 
 func (s *Session) setGroups(groups bool) {
@@ -1551,7 +1561,26 @@ func (s *Session) post(key string, eventType protocol.EventType, payload any, li
 		s.log.Error().Err(err).Str("type", string(eventType)).Msg("failed to render an event payload")
 		return
 	}
-	emission := engine.Emission{Type: eventType, Payload: body}
+	// The connection as it is now, and not as it will be when this reaches the publisher:
+	// what the rest of this has to know is which socket reported the state, and a drop
+	// while the marker waits its turn is exactly the case where that socket is gone. Read
+	// at hand-over instead, the drop would be counted as having happened before the state
+	// rather than after it, and both the publish and the retry would go out behind the
+	// close.
+	//
+	// A node from a socket that is already down is refused outright. whatsmeow runs the
+	// node handlers and the connection ones on separate goroutines, so a presence from
+	// the old socket can arrive after the disconnect has been dealt with -- and then no
+	// ordering the posting end could arrange would help, because what it describes has
+	// been over since before it got here. A message in that position is still a message;
+	// a presence is a claim about right now.
+	generation, up := s.connection()
+	if !up {
+		s.log.Debug().Str("type", string(eventType)).
+			Msg("dropping presence reported by a connection that is already down")
+		return
+	}
+	emission := engine.Emission{Type: eventType, Payload: body, At: time.Now().UnixMilli()}
 	if life > 0 {
 		perishes := s.since() + life
 		emission.Expires = func() time.Duration { return perishes - s.since() }
@@ -1560,12 +1589,7 @@ func (s *Session) post(key string, eventType protocol.EventType, payload any, li
 	s.boardMu.Lock()
 	defer s.boardMu.Unlock()
 	s.boardSeq++
-	// The connection as it is now, and not as it will be when this reaches the publisher:
-	// what the retry has to know is whether the socket that reported this is still up,
-	// and a drop while the marker waits its turn is exactly the case where it is not.
-	// Read at hand-over instead, that drop would be counted as having happened before the
-	// state rather than after it, and the retry would go out behind the close.
-	entry := posted{emission: emission, seq: s.boardSeq, transitions: s.transitions.Load()}
+	entry := posted{emission: emission, seq: s.boardSeq, transitions: generation}
 	if life == 0 {
 		// A state that corrects something the client has already been shown, and there
 		// is nothing after it: a stop is the end of a typing burst, and somebody going
@@ -1703,7 +1727,7 @@ func (s *Session) emit(eventType protocol.EventType, payload any) {
 	}
 	s.queued.Add(1)
 	select {
-	case s.inbox <- pending{event: engine.Emission{Type: eventType, Payload: body}}:
+	case s.inbox <- pending{event: engine.Emission{Type: eventType, Payload: body, At: time.Now().UnixMilli()}}:
 	case <-s.done:
 	}
 }

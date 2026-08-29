@@ -516,6 +516,7 @@ func (s *Session) deliver(eventType protocol.EventType, payload any) bool {
 	emission := engine.Emission{
 		Type:    eventType,
 		Payload: body,
+		At:      time.Now().UnixMilli(),
 		Settle:  func(err error) { settled <- err },
 	}
 	// Started before the emission is queued, not after: the inbox is bounded, and a

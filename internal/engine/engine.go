@@ -24,6 +24,18 @@ var ErrNotSupported = errors.New("engine: command not supported")
 type Emission struct {
 	Type    protocol.EventType
 	Payload json.RawMessage
+
+	// At is when the engine learned the thing this reports, in epoch milliseconds like
+	// every timestamp that crosses the wire, and it is what the frame's `ts` carries.
+	// Zero is the engine not saying, and the session stamps the moment it publishes
+	// instead -- no real reading is zero, and 1970 is not a moment WhatsApp reports.
+	//
+	// The distinction is the whole of what a reader can do about a late event. Stamped at
+	// publication, a typing indicator that spent nine of its ten seconds in a queue goes
+	// out looking new, and the freshness rule the contract asks a reader to apply has
+	// nothing to apply it to. The engine is the only layer that knows when the fact
+	// happened, so it is the one that says.
+	At int64
 	// Settle, when it is set, is called exactly once with the outcome of publishing
 	// this emission: nil once the client can be assumed to have it, an error when it
 	// never reached the stream. It is what lets an engine hold WhatsApp's own

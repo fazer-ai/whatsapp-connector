@@ -68,7 +68,9 @@ theirs, and the connector is always upgraded first.
 - Identity is always an `address` (`kind` + bare `id`, no `@server`, no device or
   agent suffix) or a `party` (`phone` and/or `lid` plus display names). Raw JIDs
   never cross the wire.
-- Timestamps are epoch milliseconds.
+- Timestamps are epoch milliseconds. A frame's `ts` is when the connector learned the
+  thing it reports, not when it managed to write it: an event that spent time in a queue
+  is not news from now, and a reader has only this to tell the two apart.
 - `chat.presence` describes a moment rather than a state that holds, and the reader is
   what bounds how long it is worth showing: a `composing` or `recording` older than a
   few seconds by its own `ts` should not start an indicator. The connector drops one it

@@ -281,6 +281,25 @@ func (s *Session) Close() error {
 // or a disconnection that nothing above asked for.
 func (s *Session) Emit(eventType protocol.EventType, payload any) { s.emit(eventType, payload) }
 
+// EmitAt publishes an emission that says when the engine learned the thing it reports,
+// which is what a frame's `ts` carries and the only way a reader can tell an event that
+// waited from news of now.
+func (s *Session) EmitAt(eventType protocol.EventType, payload any, at int64) {
+	body, err := marshal(payload)
+	if err != nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return
+	}
+	select {
+	case s.events <- engine.Emission{Type: eventType, Payload: body, At: at}:
+	default:
+	}
+}
+
 // EmitDurable publishes an emission that wants to hear what became of it, which is the
 // shape a real engine uses for anything WhatsApp is holding an acknowledgement on. The
 // callback is what a test asserts against: it is the only place the layer above says

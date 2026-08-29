@@ -261,7 +261,7 @@ func (s *Session) publish(ctx context.Context, emission engine.Emission) {
 		SID:     s.sid,
 		Epoch:   s.lease.Epoch,
 		Seq:     s.seq,
-		TS:      s.now().UnixMilli(),
+		TS:      stamped(emission, s.now()),
 		Inst:    s.instance,
 		Payload: emission.Payload,
 	}
@@ -282,6 +282,17 @@ func (s *Session) publish(ctx context.Context, emission engine.Emission) {
 		err = s.stillOwned()
 	}
 	settle(emission, err)
+}
+
+// stamped is when the thing an event reports happened, which is what its `ts` carries.
+// The engine's own reading where it gave one, and this moment where it did not: an event
+// that spent time in a queue is not news from now, and a reader deciding whether a moment
+// is still worth showing has only this to go on.
+func stamped(emission engine.Emission, published time.Time) int64 {
+	if emission.At == 0 {
+		return published.UnixMilli()
+	}
+	return emission.At
 }
 
 // stillOwned reports whether the epoch an event was just published under is the one
