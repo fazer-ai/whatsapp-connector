@@ -525,7 +525,7 @@ func (s *Session) deliver(eventType protocol.EventType, payload any) bool {
 	timeout := time.NewTimer(s.deliverWait)
 	defer timeout.Stop()
 	select {
-	case s.inbox <- emission:
+	case s.inbox <- pending{event: emission}:
 	case <-timeout.C:
 		s.log.Warn().Str("type", string(eventType)).Dur("waited", s.deliverWait).
 			Msg("withholding an acknowledgement for an event that could not be queued")

@@ -59,6 +59,15 @@ func (s *Session) chatPresence(event *waEvents.ChatPresence) bool {
 	if sender.Phone != "" || sender.LID != "" {
 		published.Sender = &sender
 	}
+	if chat.Kind == protocol.AddressGroup && published.Sender == nil {
+		// A group's typing belongs to a participant, and there is nobody to attribute
+		// this one to. Published anyway it is a group that is typing, which no client can
+		// render and no person is doing -- and every such event would share one key, so
+		// one unnameable participant's stop would clear another's typing.
+		s.log.Debug().Str("chat", chat.ID).
+			Msg("dropping a group's typing there is nobody to attribute it to")
+		return true
+	}
 	life := presenceLife
 	if state == protocol.TypingPaused {
 		life = 0
@@ -67,14 +76,8 @@ func (s *Session) chatPresence(event *waEvents.ChatPresence) bool {
 	// participant: keyed by the chat alone, Bob starting to type replaces Alice's stop
 	// and the client is left showing Alice typing for good. In a direct chat the sender
 	// is the chat, so this is the same key either way.
-	//
-	// The JID WhatsApp put on the event, rather than the contract's party built from it.
-	// That party carries whichever of the two identifiers happened to arrive, so a
-	// `composing` naming only a number and the `paused` after it naming a number and a
-	// LID would be two keys for one person -- and then nothing coalesces and the order
-	// they come off the board in decides whether the client ends up showing the stop.
 	s.post(string(protocol.EventChatPresence)+":"+string(chat.Kind)+":"+chat.ID+":"+
-		event.Sender.ToNonAD().String(), protocol.EventChatPresence, published, life)
+		keyedBy(event.Sender, event.SenderAlt), protocol.EventChatPresence, published, life)
 	return true
 }
 
@@ -102,9 +105,35 @@ func (s *Session) presence(event *waEvents.Presence) bool {
 	// cost: an `unavailable` already queued while the newer `available` was dropped for
 	// the same backlog leaves a client showing somebody offline who is not. On the board
 	// the later one replaces the earlier, which is the same answer without the ordering.
-	s.post(string(protocol.EventPresenceUpdate)+":"+party.Phone+":"+party.LID,
+	// WhatsApp sends these only for parties this session subscribed to, and it addresses
+	// them the way they were subscribed, so one contact is one key here for as long as a
+	// client asks about them the same way. There is no second address on the event to
+	// canonicalise against the way the typing above has one.
+	s.post(string(protocol.EventPresenceUpdate)+":"+keyedBy(event.From),
 		protocol.EventPresenceUpdate, published, 0)
 	return true
+}
+
+// keyedBy is the identifier the board keys a person by, which is their number wherever
+// WhatsApp offered one.
+//
+// The same person reaches this under either of WhatsApp's two namespaces, and which one
+// arrives is not the session's to choose. Keyed by whatever turned up, a `composing`
+// addressed by LID and the `paused` after it addressed by number are two entries for one
+// person: nothing coalesces, and which of the two the client is left showing is decided
+// by which entry happened to be published last. Where the event carries both -- and a
+// chat presence does -- one of them is always the number, so preferring it makes the two
+// events one key.
+func keyedBy(jids ...waTypes.JID) string {
+	chosen := waTypes.JID{}
+	for _, jid := range jids {
+		switch {
+		case jid.IsEmpty():
+		case chosen.IsEmpty(), chosen.Server != waTypes.DefaultUserServer && jid.Server == waTypes.DefaultUserServer:
+			chosen = jid
+		}
+	}
+	return chosen.ToNonAD().String()
 }
 
 // typingOf is the contract's three states out of whatsmeow's two.

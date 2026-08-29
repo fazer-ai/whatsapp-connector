@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -57,7 +56,7 @@ type Session struct {
 	// only thing that closes it. Two channels rather than one because whatsmeow's
 	// handlers can still be running when Close is called, and a send on a closed
 	// channel is a panic in a library goroutine we do not own.
-	inbox  chan engine.Emission
+	inbox  chan pending
 	events chan engine.Emission
 	done   chan struct{}
 
@@ -154,30 +153,23 @@ type Session struct {
 	// the same reason as deliverWait, and for no other.
 	handoffWait time.Duration
 
-	// board holds the newest presence per chat that has not reached the publisher yet,
-	// and ready wakes the forwarder for it.
+	// board holds the newest presence per chat that has not been published yet. The
+	// inbox holds a marker for each one, saying when its turn is.
 	//
-	// A queue is the wrong shape for presence and every fix short of this one was a
-	// narrower version of the same bug: what matters is the last thing somebody did, and
-	// a FIFO preserves the first. Behind a backlog a queued `composing` outlives the
-	// `paused` dropped for want of room, and there is no event after a stop -- so the
-	// client is left showing somebody typing with nothing coming. Keyed by chat, the
-	// stop replaces the typing it stops instead of queueing behind it.
+	// Value and order want opposite shapes, so they are kept apart. What matters about
+	// presence is the last thing somebody did: a FIFO preserves the first, so behind a
+	// backlog a queued `composing` outlives the `paused` dropped for want of room, and
+	// there is no event after a stop -- the client is left showing somebody typing with
+	// nothing coming. Keyed by chat, the stop replaces the typing it stops. But the
+	// order still has to hold against everything else the session publishes, because a
+	// `composing` that overtakes the message ending it leaves the same indicator stuck,
+	// and that is what the marker is for: it sits in the one queue with the messages,
+	// and the value it stands for is read when the forwarder reaches it. Nothing older
+	// is published after something newer, and no value waits in a queue long enough to
+	// go stale in it.
 	board    map[string]posted
 	boardMu  sync.Mutex
-	boardCap int
 	boardSeq int64
-	// inFlight is the newest durable presence per chat that has been handed to the
-	// publisher and has not said what became of it. Board membership alone cannot answer
-	// that: a newer state can be taken off the board and be waiting on the publisher
-	// while an older one's failure comes back, and putting the older one back then
-	// publishes it last.
-	//
-	// Only the durable ones, and only until they settle, so it holds what is in flight
-	// rather than everything the session has ever seen. A moment is never put back, so
-	// there is nothing to compare it against.
-	inFlight map[string]int64
-	ready    chan struct{}
 
 	// picked, when it is set, receives once for every emission the forwarder takes off
 	// the inbox, before it tries to hand it on. A seam so a test can know the pump is
@@ -300,7 +292,7 @@ func newSession(
 		store:      container,
 		log:        log.With().Str("sid", sid).Logger(),
 		waLog:      wa,
-		inbox:      make(chan engine.Emission, inboxDepth),
+		inbox:      make(chan pending, inboxDepth),
 		events:     make(chan engine.Emission),
 		done:       make(chan struct{}),
 		ctx:        ctx,
@@ -322,9 +314,6 @@ func newSession(
 		deliverWait:  deliverTimeout,
 		handoffWait:  perishableHandoff,
 		board:        make(map[string]posted),
-		inFlight:     make(map[string]int64),
-		boardCap:     boardDepth,
-		ready:        make(chan struct{}, 1),
 		downloadWait: downloadTimeout,
 		uploadWait:   uploadTimeout,
 	}
@@ -1415,16 +1404,18 @@ func (s *Session) forward() {
 		select {
 		case <-s.done:
 			return
-		case <-s.ready:
-			// Everything the board is holding, newest per chat, in no promised order
-			// between chats. Presence is about who is doing what, so one chat's typing
-			// arriving before another's says nothing wrong.
-			for _, emission := range s.takeBoard() {
-				if !s.handOn(emission) {
-					return
+		case item := <-s.inbox:
+			emission := item.event
+			if item.key != "" {
+				// A marker, and this is the moment it stands for. The value is read now
+				// rather than when it was posted, so what goes out is the chat's newest
+				// state and not the one that happened to be queued.
+				resolved, waiting := s.resolve(item.key)
+				if !waiting {
+					continue
 				}
+				emission = resolved
 			}
-		case emission := <-s.inbox:
 			if !s.handOn(emission) {
 				return
 			}
@@ -1442,20 +1433,30 @@ const presenceLife = 10 * time.Second
 // sees it, and a moment is worth nothing stale.
 const perishableHandoff = time.Second
 
-// boardDepth bounds how many chats may have presence waiting at once. Reached only by a
-// publisher that has stopped answering while a great many chats are active, and then the
-// newest states of the chats already on it are worth more than a new chat's first one.
-const boardDepth = 512
-
-// posted is a presence waiting on the board, with when it got there.
+// pending is what the forwarder takes off the inbox: an event to hand on, or the key of
+// a board entry whose value is read when its turn comes.
 //
-// The order is kept because a map has none, and two entries that ought to have been one
-// -- the same person under a key that changed -- would then publish in whichever order a
-// walk happened to take, which can put the typing after the stop. Keyed right they are
-// one entry and this does not arise; kept in order, it does not arise either way.
+// The marker is what keeps presence in step with everything else without ever waiting
+// for room. It takes its place in the queue at the moment the state happens, and carries
+// nothing, so the value it resolves to is whatever that chat's newest state is by the
+// time the forwarder gets there.
+type pending struct {
+	event engine.Emission
+	key   string
+}
+
+// posted is what the board holds for one chat: its newest state, and enough about where
+// that state has got to for a failure to be told apart from a supersession.
+//
+// `seq` names this value, so the callback of a value that has since been replaced can
+// see that it has. `sent` says the marker for this key has already been resolved, which
+// is what decides whether a new state needs a marker of its own. `retried` is what makes
+// the retry one more go rather than a loop.
 type posted struct {
-	seq      int64
 	emission engine.Emission
+	seq      int64
+	sent     bool
+	retried  bool
 }
 
 // handOn gives one emission to the reader, and reports whether the forwarder should
@@ -1501,12 +1502,18 @@ func (s *Session) handOn(emission engine.Emission) bool {
 	return true
 }
 
-// post puts a presence on the board under the chat it is about, replacing whatever that
-// chat had waiting, and wakes the forwarder.
+// post makes a presence the newest state of its chat and puts a marker for it in the
+// inbox, and never waits.
 //
-// Never waits, which is the whole reason presence does not go through the inbox: waiting
+// Waiting is the whole reason presence does not go through the inbox as a value: it
 // would hold WhatsApp's node handler for as long as the publisher is down, and what came
-// out the other side would be a fact about a minute that has passed.
+// out the other side would be a fact about a minute that has passed. A marker costs a
+// queue slot and is taken without one being free only when there is none, which is a
+// publisher that has already stopped answering.
+//
+// A chat whose marker has not been resolved yet needs no second one -- the one already
+// in the queue reads whatever is newest when it gets there -- so a burst of typing costs
+// one slot rather than one per event.
 func (s *Session) post(key string, eventType protocol.EventType, payload any, life time.Duration) {
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -1520,18 +1527,9 @@ func (s *Session) post(key string, eventType protocol.EventType, payload any, li
 	}
 
 	s.boardMu.Lock()
-	if _, waiting := s.board[key]; !waiting && len(s.board) >= s.boardCap && !s.evictAMoment() {
-		// Full, and nothing on it worth less than this. A state that corrects something
-		// the client has already been shown is the last thing to drop, so a moment goes
-		// first: what is lost there is a typing indicator, and what would be lost here is
-		// the stop that clears one.
-		s.boardMu.Unlock()
-		s.log.Debug().Str("type", string(eventType)).
-			Msg("dropping presence for a chat the board had no room for")
-		return
-	}
+	defer s.boardMu.Unlock()
 	s.boardSeq++
-	seq := s.boardSeq
+	entry := posted{emission: emission, seq: s.boardSeq}
 	if life == 0 {
 		// A state that corrects something the client has already been shown, and there
 		// is nothing after it: a stop is the end of a typing burst, and somebody going
@@ -1539,109 +1537,83 @@ func (s *Session) post(key string, eventType protocol.EventType, payload any, li
 		// it is not sent again by WhatsApp and not superseded by anything, so the client
 		// is left with the state before it until that person does something else --
 		// which may be never.
-		s.inFlight[key] = seq
-		emission.Settle = s.settled(key, seq, eventType, body)
+		entry.emission.Settle = s.settled(key, entry.seq)
 	}
-	s.board[key] = posted{seq: seq, emission: emission}
-	s.boardMu.Unlock()
+	if held, waiting := s.board[key]; waiting && !held.sent {
+		s.board[key] = entry
+		return
+	}
 
 	select {
-	case s.ready <- struct{}{}:
+	case s.inbox <- pending{key: key}:
+		s.board[key] = entry
 	default:
-		// Already awake. One signal is enough: the forwarder takes the whole board.
+		// The queue presence shares with the messages is full, which is a publisher that
+		// has stopped answering while 256 messages piled up behind it. Presence waits for
+		// nothing, so this is dropped -- and whatever the chat had before is left where it
+		// is, because that one is already on its way and this one never started.
+		//
+		// A stop dropped here is a stop nothing replaces, which is the cost of sharing the
+		// queue and what buys the order. Registered as #47.
+		s.log.Debug().Str("type", string(eventType)).
+			Msg("dropping presence the inbox had no room for")
 	}
 }
 
-// evictAMoment makes room by dropping the perishable entry with the least life left in
-// it, and reports whether it found one. Called with boardMu held.
-//
-// The least life left rather than any of them, so the choice does not depend on which
-// order a map happens to be walked in and the one dropped is the one closest to being
-// worthless anyway.
-func (s *Session) evictAMoment() bool {
-	var oldest string
-	var least time.Duration
-	found := false
-	for key, waiting := range s.board {
-		if waiting.emission.Expires == nil {
-			continue
-		}
-		if left := waiting.emission.Expires(); !found || left < least {
-			oldest, least, found = key, left, true
-		}
+// resolve reads what a marker stands for, and is the last moment that value can still
+// change. A moment leaves the board here, because nothing comes back about one; a
+// durable state stays, marked as gone, so its callback can tell a failure from having
+// been replaced.
+func (s *Session) resolve(key string) (engine.Emission, bool) {
+	s.boardMu.Lock()
+	defer s.boardMu.Unlock()
+	entry, waiting := s.board[key]
+	if !waiting {
+		return engine.Emission{}, false
 	}
-	if !found {
-		return false
+	if entry.emission.Settle == nil {
+		delete(s.board, key)
+		return entry.emission, true
 	}
-	delete(s.board, oldest)
-	return true
+	entry.sent = true
+	s.board[key] = entry
+	return entry.emission, true
 }
 
-// settled returns the callback the publisher owes this emission, which gives a durable
-// presence one more go at the board when the publish it was handed to failed.
+// settled returns the callback the publisher owes a durable presence, which gives it one
+// more go when the publish it was handed to failed.
 //
 // One more, and not a loop: a publisher that is down stays down for longer than any
 // number of immediate retries, and the point here is a bad second rather than an outage.
-// And only while this is still the newest state for the chat -- anything issued after it
-// is what the client should end up with, whether that is waiting on the board or already
-// on its way.
-func (s *Session) settled(key string, seq int64, eventType protocol.EventType, body json.RawMessage) func(error) {
+// And only while this is still the chat's newest state -- anything posted after it is
+// what the client should end up with, and the sequence says so whether that newer state
+// is still waiting for its turn or has already gone out.
+func (s *Session) settled(key string, seq int64) func(error) {
 	return func(err error) {
 		s.boardMu.Lock()
 		defer s.boardMu.Unlock()
-		if s.inFlight[key] != seq {
-			// Something durable was issued for this chat after this one. It is what the
-			// client should end up with, whether it is waiting on the board or already
-			// on its way.
+		entry, waiting := s.board[key]
+		if !waiting || entry.seq != seq {
+			// Replaced by a newer state for the same chat, which is the one the client
+			// should end up with.
 			return
 		}
-		if err == nil {
-			delete(s.inFlight, key)
+		if err == nil || entry.retried {
+			delete(s.board, key)
 			return
 		}
-		if _, waiting := s.board[key]; waiting {
-			// And the other half, which the generation cannot see: a moment posted after
-			// this one registers nothing in flight, because a moment is never put back.
-			// What it does do is sit on the board, and it is newer than this.
-			delete(s.inFlight, key)
-			return
-		}
-		if len(s.board) >= s.boardCap && !s.evictAMoment() {
-			delete(s.inFlight, key)
-			return
-		}
-		// The one put back carries no callback of its own, which is what makes this one
-		// more rather than a loop -- and with nothing left to settle, nothing is left in
-		// flight for this chat either.
-		delete(s.inFlight, key)
-		s.boardSeq++
-		s.board[key] = posted{seq: s.boardSeq, emission: engine.Emission{Type: eventType, Payload: body}}
-		s.log.Debug().Str("type", string(eventType)).
-			Msg("putting a presence back on the board after a publish that failed")
+		entry.retried, entry.sent = true, false
 		select {
-		case s.ready <- struct{}{}:
+		case s.inbox <- pending{key: key}:
+			s.board[key] = entry
+			s.log.Debug().Str("type", string(entry.emission.Type)).
+				Msg("giving a presence another go after a publish that failed")
 		default:
+			delete(s.board, key)
+			s.log.Debug().Str("type", string(entry.emission.Type)).
+				Msg("dropping a presence the inbox had no room to try again for")
 		}
 	}
-}
-
-func (s *Session) takeBoard() []engine.Emission {
-	s.boardMu.Lock()
-	defer s.boardMu.Unlock()
-	if len(s.board) == 0 {
-		return nil
-	}
-	waiting := make([]posted, 0, len(s.board))
-	for key, entry := range s.board {
-		waiting = append(waiting, entry)
-		delete(s.board, key)
-	}
-	slices.SortFunc(waiting, func(a, b posted) int { return cmp.Compare(a.seq, b.seq) })
-	taken := make([]engine.Emission, 0, len(waiting))
-	for _, entry := range waiting {
-		taken = append(taken, entry.emission)
-	}
-	return taken
 }
 
 func (s *Session) emit(eventType protocol.EventType, payload any) {
@@ -1653,7 +1625,7 @@ func (s *Session) emit(eventType protocol.EventType, payload any) {
 		return
 	}
 	select {
-	case s.inbox <- engine.Emission{Type: eventType, Payload: body}:
+	case s.inbox <- pending{event: engine.Emission{Type: eventType, Payload: body}}:
 	case <-s.done:
 	}
 }

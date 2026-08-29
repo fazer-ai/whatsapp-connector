@@ -282,7 +282,7 @@ func TestTypingDoesNotWaitOnAnInboxThatIsFull(t *testing.T) {
 	filled := 0
 	for {
 		select {
-		case session.inbox <- engine.Emission{Type: protocol.EventSessionState, Payload: []byte(`{}`)}:
+		case session.inbox <- pending{event: engine.Emission{Type: protocol.EventSessionState, Payload: []byte(`{}`)}}:
 			filled++
 			continue
 		default:
@@ -436,7 +436,7 @@ func blockTheForwarder(t *testing.T, session *Session) {
 	t.Helper()
 
 	select {
-	case session.inbox <- engine.Emission{Type: protocol.EventSessionState, Payload: []byte(`{}`)}:
+	case session.inbox <- pending{event: engine.Emission{Type: protocol.EventSessionState, Payload: []byte(`{}`)}}:
 	case <-time.After(2 * time.Second):
 		t.Fatal("the inbox would not take a filler")
 	}
@@ -447,11 +447,17 @@ func blockTheForwarder(t *testing.T, session *Session) {
 	}
 }
 
+// onBoard is what the board is still holding for a turn that has not come, which is what
+// the tests below mean by waiting. An entry that has been handed to the publisher stays
+// on the board until it settles, and that one is not waiting for anything.
 func onBoard(session *Session) []engine.Emission {
 	session.boardMu.Lock()
 	defer session.boardMu.Unlock()
 	waiting := make([]engine.Emission, 0, len(session.board))
 	for _, entry := range session.board {
+		if entry.sent {
+			continue
+		}
 		waiting = append(waiting, entry.emission)
 	}
 	return waiting
@@ -616,67 +622,65 @@ func TestAGroupsTypingIsKeptPerPersonRatherThanPerChat(t *testing.T) {
 	}
 }
 
-// A board with no room left is where the last thing to drop is a state that corrects
-// something the client has already been shown. What is lost by dropping a moment is a
-// typing indicator; what would be lost by dropping the stop is the thing that clears one.
-func TestAFullBoardGivesUpAMomentBeforeAStop(t *testing.T) {
+// A queue with no room left is a publisher that has already stopped answering, and there
+// is nothing presence can do about that which is worth holding WhatsApp's node handler
+// for. What it must not do is leave a mark behind: an entry with no marker to resolve it
+// would sit on the board unpublished, and the next state for that chat would take it for
+// one already on its way and quietly replace it instead of queueing one of its own.
+func TestPresenceLeavesNothingBehindWhenTheInboxIsFull(t *testing.T) {
 	t.Parallel()
 
 	session, _ := newTestSession(t, "5511999990001")
-	session.boardCap = 2
-	session.picked = make(chan struct{}, 1)
-	blockTheForwarder(t, session)
-
-	typing := func(phone string, state waTypes.ChatPresence) {
-		jid := waTypes.NewJID(phone, waTypes.DefaultUserServer)
-		session.chatPresence(&waEvents.ChatPresence{
-			MessageSource: waTypes.MessageSource{Chat: jid, Sender: jid}, State: state,
-		})
-	}
-	typing("5511999990002", waTypes.ChatPresenceComposing)
-	typing("5511999990003", waTypes.ChatPresenceComposing)
-	// Full now, and this is a chat the board has nothing for.
-	typing("5511999990004", waTypes.ChatPresencePaused)
-
-	waiting := onBoard(session)
-	if len(waiting) != 2 {
-		t.Fatalf("the board is holding %d, and its cap is 2", len(waiting))
-	}
-	stops := 0
-	for _, emission := range waiting {
-		if stateOf(t, emission) == "paused" {
-			stops++
+	filled := 0
+	for {
+		select {
+		case session.inbox <- pending{event: engine.Emission{Type: protocol.EventSessionState, Payload: []byte(`{}`)}}:
+			filled++
+			continue
+		default:
 		}
+		break
 	}
-	if stops != 1 {
-		t.Error("a stop was dropped for a board full of typing, and nothing will clear what it was going to clear")
+	if filled == 0 {
+		t.Fatal("the inbox took nothing at all")
+	}
+
+	jid := waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)
+	session.chatPresence(&waEvents.ChatPresence{
+		MessageSource: waTypes.MessageSource{Chat: jid, Sender: jid}, State: waTypes.ChatPresencePaused,
+	})
+
+	session.boardMu.Lock()
+	held := len(session.board)
+	session.boardMu.Unlock()
+	if held != 0 {
+		t.Errorf("%d presences are on a board with nothing coming to publish them", held)
 	}
 }
 
-// One person is one key, whichever of WhatsApp's two identifiers happened to arrive on
-// each event. Keyed by the party built from them, a `composing` naming only a number and
-// the `paused` after it naming a number and a LID are two entries for one person --
-// nothing coalesces, and which one the client ends up showing is decided by the order
-// they come off the board in.
-func TestOnePersonIsOneKeyWhicheverIdentifiersArrive(t *testing.T) {
+// One person is one key, whichever of WhatsApp's two namespaces addressed the event. A
+// group switching addressing mode mid-burst is the ordinary way this happens: the
+// `composing` arrives by LID and the `paused` after it by number. Keyed by whatever
+// turned up they are two entries for one person -- nothing coalesces, and which state the
+// client is left showing is decided by which of the two was published last.
+func TestOnePersonIsOneKeyWhicheverAddressArrives(t *testing.T) {
 	t.Parallel()
 
 	session, _ := newTestSession(t, "5511999990001")
+	session.groups = true
 	session.picked = make(chan struct{}, 1)
 	blockTheForwarder(t, session)
 
-	chat := waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)
+	chat := waTypes.NewJID("120363041234567890", waTypes.GroupServer)
+	phone := waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)
+	lid := waTypes.NewJID("167392323834034", waTypes.HiddenUserServer)
 	session.chatPresence(&waEvents.ChatPresence{
-		MessageSource: waTypes.MessageSource{Chat: chat, Sender: chat},
+		MessageSource: waTypes.MessageSource{Chat: chat, Sender: lid, SenderAlt: phone, IsGroup: true},
 		State:         waTypes.ChatPresenceComposing,
 	})
 	session.chatPresence(&waEvents.ChatPresence{
-		MessageSource: waTypes.MessageSource{
-			Chat: chat, Sender: chat,
-			// The same person, with the other identifier alongside this time.
-			SenderAlt: waTypes.NewJID("167392323834034", waTypes.HiddenUserServer),
-		},
-		State: waTypes.ChatPresencePaused,
+		MessageSource: waTypes.MessageSource{Chat: chat, Sender: phone, SenderAlt: lid, IsGroup: true},
+		State:         waTypes.ChatPresencePaused,
 	})
 
 	waiting := onBoard(session)
@@ -688,39 +692,90 @@ func TestOnePersonIsOneKeyWhicheverIdentifiersArrive(t *testing.T) {
 	}
 }
 
-// A map has no order, and two entries that ought to have been one -- the same person
-// under a key that changed between events, which is what a group switching addressing
-// mode does -- would publish in whichever order a walk happened to take. Put the typing
-// after the stop and the client is showing somebody typing who is not.
-func TestTheBoardIsPublishedInTheOrderItWasWrittenIn(t *testing.T) {
+// A group's typing belongs to a participant. With nobody to attribute it to there is no
+// event worth publishing -- no client can render a group that is typing -- and every such
+// event would share one key, so one unnameable participant's stop would clear another's
+// typing.
+func TestAGroupsTypingWithNobodyToAttributeItToIsNotPublished(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.groups = true
+
+	if !session.chatPresence(&waEvents.ChatPresence{
+		MessageSource: waTypes.MessageSource{
+			Chat: waTypes.NewJID("120363041234567890", waTypes.GroupServer), IsGroup: true,
+		},
+		State: waTypes.ChatPresenceComposing,
+	}) {
+		t.Fatal("a typing nobody can be shown as sending was left for WhatsApp to send again")
+	}
+	select {
+	case emission := <-session.Events():
+		t.Fatalf("a group was published as typing, with nobody typing: %s", emission.Payload)
+	case <-time.After(500 * time.Millisecond):
+	}
+}
+
+// Presence keeps its place among the messages, which is the reason its order lives in the
+// same queue as theirs rather than beside it. Published out of turn, a `composing` lands
+// after the message that ended it and the client is left showing somebody typing with the
+// message already on screen -- the same stuck indicator the board exists to prevent,
+// arrived at from the other side.
+func TestPresenceKeepsItsPlaceAmongTheMessages(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.picked = make(chan struct{}, 1)
+	// Parked, so the typing and the message are both waiting when the forwarder starts
+	// choosing. Posting them at a forwarder that is free would publish each as it
+	// arrived and prove nothing about the choice.
+	blockTheForwarder(t, session)
+
+	jid := waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)
+	session.chatPresence(&waEvents.ChatPresence{
+		MessageSource: waTypes.MessageSource{Chat: jid, Sender: jid}, State: waTypes.ChatPresenceComposing,
+	})
+	session.emit(protocol.EventSessionState, map[string]any{"state": "open"})
+
+	// The filler the forwarder is parked on, and then the two in the order they happened.
+	next(t, session)
+	if first := next(t, session); first.Type != protocol.EventChatPresence {
+		t.Fatalf("what came out first is %s, and the typing was posted before the message", first.Type)
+	}
+	if second := next(t, session); second.Type != protocol.EventSessionState {
+		t.Fatalf("what came out second is %s", second.Type)
+	}
+}
+
+// The value a marker stands for is read when its turn comes and not when it was posted,
+// which is what lets one queue slot carry a whole burst of typing. A marker that carried
+// the value would publish the state the chat was in when the queue was joined, and behind
+// a backlog that is a `composing` about a minute that has passed.
+func TestAMarkerPublishesTheStateTheChatIsInWhenItsTurnComes(t *testing.T) {
 	t.Parallel()
 
 	session, _ := newTestSession(t, "5511999990001")
 	session.picked = make(chan struct{}, 1)
 	blockTheForwarder(t, session)
 
-	// Deliberately different keys for one person, which is the state this orders for.
-	chat := waTypes.NewJID("120363041234567890", waTypes.GroupServer)
-	session.groups = true
-	session.chatPresence(&waEvents.ChatPresence{
-		MessageSource: waTypes.MessageSource{
-			Chat: chat, Sender: waTypes.NewJID("5511999990002", waTypes.DefaultUserServer), IsGroup: true,
-		},
-		State: waTypes.ChatPresenceComposing,
-	})
-	session.chatPresence(&waEvents.ChatPresence{
-		MessageSource: waTypes.MessageSource{
-			Chat: chat, Sender: waTypes.NewJID("167392323834034", waTypes.HiddenUserServer), IsGroup: true,
-		},
-		State: waTypes.ChatPresencePaused,
-	})
-
-	taken := session.takeBoard()
-	if len(taken) != 2 {
-		t.Fatalf("%d presences came off the board, want the two that were written", len(taken))
+	jid := waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)
+	queued := len(session.inbox)
+	for _, state := range []waTypes.ChatPresence{
+		waTypes.ChatPresenceComposing, waTypes.ChatPresenceComposing, waTypes.ChatPresencePaused,
+	} {
+		session.chatPresence(&waEvents.ChatPresence{
+			MessageSource: waTypes.MessageSource{Chat: jid, Sender: jid}, State: state,
+		})
 	}
-	if first, last := stateOf(t, taken[0]), stateOf(t, taken[1]); first != "composing" || last != "paused" {
-		t.Errorf("the board came off as %s then %s, and they were written the other way round", first, last)
+	if took := len(session.inbox) - queued; took != 1 {
+		t.Errorf("a burst of typing in one chat took %d places in the queue, want the one", took)
+	}
+
+	next(t, session)
+	published := next(t, session)
+	if state := stateOf(t, published); state != "paused" {
+		t.Errorf("what came out is a %s, and the chat's state when its turn came was the stop", state)
 	}
 }
 
@@ -774,8 +829,12 @@ func TestAFailedStopDoesNotDisplaceTheStateAfterIt(t *testing.T) {
 	// They started typing again while the stop was still in flight.
 	blockTheForwarder(t, session)
 	session.chatPresence(&waEvents.ChatPresence{MessageSource: source, State: waTypes.ChatPresenceComposing})
+	queued := len(session.inbox)
 	emission.Settle(errors.New("redis is unreachable"))
 
+	if len(session.inbox) != queued {
+		t.Error("the failed stop took a second place in the queue for a chat that already had one")
+	}
 	waiting := onBoard(session)
 	if len(waiting) != 1 {
 		t.Fatalf("%d presences are on the board, want only the newer one", len(waiting))
@@ -812,5 +871,48 @@ func TestAFailedStopDoesNotOvertakeAStateAlreadyOnItsWay(t *testing.T) {
 
 	if waiting := onBoard(session); len(waiting) != 0 {
 		t.Errorf("the going away was put back over the coming back after it: %v", stateOf(t, waiting[0]))
+	}
+}
+
+// One more go, and not a loop. A publisher that is down stays down for longer than any
+// number of immediate retries, and a state that put itself back every time would go round
+// with the queue for as long as the outage lasted, taking a place in it from the messages
+// each time round.
+func TestAStopThatFailsTwiceIsNotTriedAThirdTime(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.picked = make(chan struct{}, 1)
+
+	source := waTypes.MessageSource{
+		Chat:   waTypes.NewJID("5511999990002", waTypes.DefaultUserServer),
+		Sender: waTypes.NewJID("5511999990002", waTypes.DefaultUserServer),
+	}
+	session.chatPresence(&waEvents.ChatPresence{MessageSource: source, State: waTypes.ChatPresencePaused})
+	first := next(t, session)
+
+	// The pick that carried the stop, cleared so the park below waits on its own rather
+	// than reading this one and returning before the forwarder is anywhere.
+	select {
+	case <-session.picked:
+	default:
+	}
+	// Parked first, so the second go is still waiting when this looks for it.
+	blockTheForwarder(t, session)
+	first.Settle(errors.New("redis is unreachable"))
+
+	// The filler the forwarder is parked on, and then the stop having its second go.
+	next(t, session)
+	second := next(t, session)
+	if state := stateOf(t, second); state != "paused" {
+		t.Fatalf("what was tried again is a %s", state)
+	}
+	if second.Settle == nil {
+		t.Fatal("the second go was published with no way to hear that it never landed either")
+	}
+	second.Settle(errors.New("redis is still unreachable"))
+
+	if waiting := onBoard(session); len(waiting) != 0 {
+		t.Errorf("%d presences went round for a third go at a publisher that is down", len(waiting))
 	}
 }
