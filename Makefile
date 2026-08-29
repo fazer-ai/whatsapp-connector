@@ -26,8 +26,13 @@ fmt: ## Format the code
 lint: ## Run the linters (formatting included)
 	$(GOLANGCI_LINT) run
 
-test: ## Run the test suite with the race detector
-	$(GO) test -race $(PACKAGES)
+# The variable is cleared rather than merely not set: it is inherited from whatever
+# shell runs this, so a developer who exported it -- or `make check`, which passes its
+# own environment to both passes -- would otherwise get PostgreSQL here and never run
+# SQLite at all. Two passes that are the same pass is the one failure this whole
+# arrangement cannot notice.
+test: ## Run the test suite with the race detector, against SQLite
+	WAC_TEST_DATABASE_URL= $(GO) test -race $(PACKAGES)
 
 test-postgres: ## Run the test suite against a PostgreSQL server (WAC_TEST_DATABASE_URL)
 ifndef WAC_TEST_DATABASE_URL
@@ -38,7 +43,7 @@ endif
 	$(GO) test -count=1 $(PACKAGES)
 
 test-cover: ## Run the test suite and write coverage.txt
-	$(GO) test -race -coverprofile=coverage.txt -covermode=atomic $(PACKAGES)
+	WAC_TEST_DATABASE_URL= $(GO) test -race -coverprofile=coverage.txt -covermode=atomic $(PACKAGES)
 
 contract: ## Check the Go protocol binding against contract/
 	$(GO) test ./internal/protocol -run 'Contract|Fixture|Type|Version|ErrorCodes'
