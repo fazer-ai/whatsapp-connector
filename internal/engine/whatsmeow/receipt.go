@@ -22,6 +22,11 @@ import (
 // Withholding the acknowledgement costs a redelivery and a duplicate the client
 // deduplicates; acknowledging one that was never published costs it for good.
 func (s *Session) receipt(event *waEvents.Receipt) bool {
+	// Read before anything that can wait, for the same reason the message path does: what
+	// a frame's `ts` says is when the session learned the thing, and the checks below can
+	// spend the whole publisher bound before this goes out.
+	learned := s.learned()
+
 	published, ok := receiptOf(event)
 	if !ok {
 		// Not a name the contract has. Dropped rather than withheld, because withholding
@@ -50,7 +55,7 @@ func (s *Session) receipt(event *waEvents.Receipt) bool {
 			Msg("withholding a receipt while the publisher is not answering")
 		return false
 	}
-	delivered := s.deliver(protocol.EventMessageReceipt, published)
+	delivered := s.deliver(protocol.EventMessageReceipt, published, learned)
 	s.publisherAnswered(delivered)
 	return delivered
 }

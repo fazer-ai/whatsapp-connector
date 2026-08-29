@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1081,5 +1082,39 @@ func assertFailure(t *testing.T, emission engine.Emission, reason string) {
 	}
 	if failure.Reason != reason {
 		t.Fatalf("the reason is %q, want %q", failure.Reason, reason)
+	}
+}
+
+// One node, one moment. A message whose media failed publishes twice, and the second
+// waits on the first for as long as the publisher bound allows: read again when it is
+// sent rather than once when the node arrived, the failure carries a time up to a minute
+// later than the message it is about, for something the session knew before it published
+// either.
+func TestBothEventsOfOneNodeCarryTheMomentItArrived(t *testing.T) {
+	t.Parallel()
+
+	session, downloads := mediaSession(t, media.Options{})
+	downloads.answer(nil, wm.ErrMediaDownloadFailedWith404)
+	// A clock that moves on every reading, so a moment taken twice is two moments. The
+	// real one usually answers the same millisecond twice, which would pass either way.
+	var readings atomic.Int64
+	session.wallClock = func() time.Time {
+		return time.UnixMilli(1755000000000).Add(time.Duration(readings.Add(1)) * time.Second)
+	}
+
+	event := mediaEvent("3EB0NODETS", &waE2E.Message{ImageMessage: &waE2E.ImageMessage{
+		Mimetype: proto.String("image/jpeg"), DirectPath: proto.String(directPath),
+		MediaKey: []byte("key"), FileEncSHA256: encSHA256(),
+	}})
+	emissions, acknowledged := deliver(t, session, event, 2)
+	if !acknowledged {
+		t.Fatal("a message whose file will never arrive was left for WhatsApp to redeliver forever")
+	}
+	if emissions[0].At != emissions[1].At {
+		t.Errorf("the message is stamped %d and its own failure %d, and one node arrived once",
+			emissions[0].At, emissions[1].At)
+	}
+	if emissions[0].At == 0 {
+		t.Error("an inbound message named no moment of its own, so its `ts` is whenever it got written")
 	}
 }

@@ -194,6 +194,12 @@ type Session struct {
 	// the real one. A seam so a test can hold the clock still instead of racing it.
 	elapsed func() time.Duration
 
+	// wallClock is where a published event's moment comes from, and nil is the real one.
+	// A seam for the same reason as the one above: a test that has to see two events of
+	// one node carry one moment cannot get there by racing a clock whose two readings are
+	// usually the same millisecond anyway.
+	wallClock func() time.Time
+
 	// privacyKnown reports whether this account's own privacy settings could be read.
 	// A seam for the same reason as the ones below it: nil is the real one.
 	privacyKnown func(context.Context) error
@@ -499,6 +505,15 @@ func (s *Session) connection() (int64, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.transitions.Load(), s.connected
+}
+
+// learned is the moment an event says the session found out about the thing it reports,
+// which is what the frame's `ts` carries.
+func (s *Session) learned() int64 {
+	if s.wallClock != nil {
+		return s.wallClock().UnixMilli()
+	}
+	return time.Now().UnixMilli()
 }
 
 func (s *Session) setGroups(groups bool) {
@@ -1573,7 +1588,7 @@ func (s *Session) post(key string, eventType protocol.EventType, payload any, li
 			Msg("dropping presence reported by a connection that is already down")
 		return
 	}
-	emission := engine.Emission{Type: eventType, Payload: body, At: time.Now().UnixMilli()}
+	emission := engine.Emission{Type: eventType, Payload: body, At: s.learned()}
 	if life > 0 {
 		perishes := s.since() + life
 		emission.Expires = func() time.Duration { return perishes - s.since() }
@@ -1709,7 +1724,7 @@ func (s *Session) emit(eventType protocol.EventType, payload any) {
 		return
 	}
 	select {
-	case s.inbox <- pending{event: engine.Emission{Type: eventType, Payload: body, At: time.Now().UnixMilli()}}:
+	case s.inbox <- pending{event: engine.Emission{Type: eventType, Payload: body, At: s.learned()}}:
 	case <-s.done:
 	}
 }
