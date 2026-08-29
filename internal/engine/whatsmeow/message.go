@@ -645,7 +645,7 @@ func (s *Session) unreadable(event *waEvents.UndecryptableMessage) bool {
 			Msg("dropping an unreadable group message the client did not subscribe to")
 		return true
 	}
-	message.Content = protocol.Unsupported(whyUnopened(event))
+	message.Content = protocol.Unsupported(whyUnopened(event, message.Chat.Kind))
 	s.awaitOrPublish(&message, learned)
 	return true
 }
@@ -653,13 +653,22 @@ func (s *Session) unreadable(event *waEvents.UndecryptableMessage) bool {
 // whyUnopened is which of the contract's reasons a message nothing could read arrived
 // with.
 //
-// The name WhatsApp put on the stanza, and not whether whatsmeow called it unavailable.
-// Those are not the same question: a group message with no sender key is reported as
-// unavailable too, and it is an ordinary decryption failure with an ordinary retry behind
-// it. A type attribute is the server saying it withheld the message on purpose, which is
-// the only thing here that means nothing arrived to be decrypted.
-func whyUnopened(event *waEvents.UndecryptableMessage) protocol.UnsupportedReason {
+// Two paths in whatsmeow arrive here and they answer different questions. A stanza that
+// carries an `<unavailable/>` node and no ciphertext at all is the server saying nothing
+// was encrypted for this device, and the `type` on that node is optional: an untyped one is
+// still a message that never arrived to be decrypted. A ciphertext that did arrive and
+// would not open is the other, and whatsmeow reports one of those as unavailable too -- a
+// group message with no sender key -- so neither field answers this on its own.
+//
+// What separates them from the event alone is the chat. The decryption path only raises the
+// flag for `skmsg`, which is how a group message is encrypted, so the flag on a direct chat
+// came from the other path. A group's own untyped unavailable is the case this gets wrong,
+// and it reads as a failure to decrypt something that was withheld.
+func whyUnopened(event *waEvents.UndecryptableMessage, chat protocol.AddressKind) protocol.UnsupportedReason {
 	if event.UnavailableType != "" {
+		return protocol.UnsupportedUnavailable
+	}
+	if event.IsUnavailable && chat != protocol.AddressGroup {
 		return protocol.UnsupportedUnavailable
 	}
 	return protocol.UnsupportedUndecryptable

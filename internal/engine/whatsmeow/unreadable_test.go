@@ -80,6 +80,16 @@ func TestWhatWasWrongWithAMessageIsWhatWhatsAppNamed(t *testing.T) {
 			want: protocol.UnsupportedUndecryptable,
 		},
 		{
+			// The `type` on an `<unavailable/>` node is optional, and whatsmeow passes
+			// the empty string straight through. Read off that attribute alone, a stanza
+			// that carried no ciphertext at all would be reported as one that did.
+			name: "withheld with no name put on it",
+			build: func() *waEvents.UndecryptableMessage {
+				return unavailableMessage("3EB0UNTYPED", "")
+			},
+			want: protocol.UnsupportedUnavailable,
+		},
+		{
 			// whatsmeow reports a group message with no sender key as unavailable, and
 			// sends a retry receipt for it like any other failure to decrypt. Read off
 			// that flag, this one would say the server withheld a message it did not.
@@ -140,10 +150,15 @@ func TestAMessageThatArrivesAfterAllCallsOffItsPlaceholder(t *testing.T) {
 	t.Parallel()
 
 	session, _ := newTestSession(t, "5511999990001")
-	session.rerequestWait = 50 * time.Millisecond
+	// Long enough that it never fires here. What is under test is the cancellation, and
+	// a window short enough to race the recovery would be testing the scheduler.
+	session.rerequestWait = time.Minute
 
 	if !session.handle(unavailableMessage("3EB0RECOVERED", "view_once")) {
 		t.Fatal("an unreadable message was left for WhatsApp to send again")
+	}
+	if !waitingOn(session, "3EB0RECOVERED") {
+		t.Fatal("no placeholder was ever waiting, so nothing here could have called one off")
 	}
 	emission := publishedBy(t, session, textMessage("3EB0RECOVERED", "bom dia"))
 
@@ -157,13 +172,20 @@ func TestAMessageThatArrivesAfterAllCallsOffItsPlaceholder(t *testing.T) {
 	if content.Type != "text" {
 		t.Fatalf("what reached the chat is %s, and the message itself arrived", content.Type)
 	}
-	// And nothing behind it: the placeholder would carry the same id and be kept over
-	// this one.
-	select {
-	case late := <-session.Events():
-		t.Fatalf("a placeholder went out after the message it was standing in for: %s", late.Payload)
-	case <-time.After(300 * time.Millisecond):
+	// And nothing left waiting to follow it: the placeholder carries the same id, and a
+	// client that deduplicates on the id would keep it over this one.
+	if waitingOn(session, "3EB0RECOVERED") {
+		t.Fatal("the placeholder is still waiting behind the message it was standing in for")
 	}
+}
+
+// waitingOn reports whether a placeholder for this message is still scheduled, which is
+// what a recovery has to leave behind it and what a wall clock cannot be asked about.
+func waitingOn(session *Session, id string) bool {
+	session.awaitedMu.Lock()
+	defer session.awaitedMu.Unlock()
+	_, waiting := session.awaited[id]
+	return waiting
 }
 
 // The same boundary the message path draws. A client that asked for direct chats only
@@ -294,7 +316,7 @@ func TestAnActionTheSenderAskedToHideIsNotGivenABubble(t *testing.T) {
 	t.Parallel()
 
 	session, _ := newTestSession(t, "5511999990001")
-	session.rerequestWait = 50 * time.Millisecond
+	session.rerequestWait = time.Minute
 
 	event := unavailableMessage("3EB0HIDDEN", "")
 	event.IsUnavailable = false
@@ -303,10 +325,15 @@ func TestAnActionTheSenderAskedToHideIsNotGivenABubble(t *testing.T) {
 	if !session.handle(event) {
 		t.Fatal("an unreadable action was left for WhatsApp to send again, and it fails to decrypt again")
 	}
+	// Neither scheduled nor published, which are the two shapes this could take. Both are
+	// settled by the time the handler returns, so neither needs waiting out.
+	if waitingOn(session, "3EB0HIDDEN") {
+		t.Error("a placeholder is waiting for an action the sender asked to hide")
+	}
 	select {
 	case published := <-session.Events():
 		t.Fatalf("something was published for an action the sender asked to hide: %s", published.Payload)
-	case <-time.After(300 * time.Millisecond):
+	default:
 	}
 }
 
@@ -321,7 +348,7 @@ func TestACorrectionThatArrivesAfterAllCallsOffItsPlaceholder(t *testing.T) {
 	t.Parallel()
 
 	session, _ := newTestSession(t, "5511999990001")
-	session.rerequestWait = 50 * time.Millisecond
+	session.rerequestWait = time.Minute
 	session.unseal = func(context.Context, *waEvents.Message) (*waE2E.Message, error) {
 		return &waE2E.Message{Conversation: proto.String("bom dia, corrigido")}, nil
 	}
@@ -331,15 +358,16 @@ func TestACorrectionThatArrivesAfterAllCallsOffItsPlaceholder(t *testing.T) {
 	if !session.handle(unread) {
 		t.Fatal("an unreadable message was left for WhatsApp to send again")
 	}
+	if !waitingOn(session, carrier) {
+		t.Fatal("no placeholder was ever waiting, so nothing here could have called one off")
+	}
 
 	emission := publishedBy(t, session, sealedEditEvent(carrier, subject))
 	if emission.Type != protocol.EventMessageEdited {
 		t.Fatalf("the resent correction was published as %s, want %s", emission.Type, protocol.EventMessageEdited)
 	}
-	select {
-	case late := <-session.Events():
-		t.Fatalf("a placeholder went out behind the correction it was standing in for: %s", late.Payload)
-	case <-time.After(300 * time.Millisecond):
+	if waitingOn(session, carrier) {
+		t.Fatal("the placeholder is still waiting behind the correction it was standing in for")
 	}
 }
 
