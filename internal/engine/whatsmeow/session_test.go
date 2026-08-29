@@ -25,6 +25,7 @@ import (
 	"github.com/fazer-ai/whatsapp-connector/internal/engine"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 	"github.com/fazer-ai/whatsapp-connector/internal/store"
+	"github.com/fazer-ai/whatsapp-connector/internal/store/storetest"
 )
 
 func TestQRDataURLIsAnImageTheContractAccepts(t *testing.T) {
@@ -500,8 +501,7 @@ func newTestSession(t *testing.T, phone string) (*Session, *store.Container) {
 func openStore(t *testing.T) *store.Container {
 	t.Helper()
 
-	address := "sqlite:" + filepath.Join(t.TempDir(), "wac.db")
-	container, err := store.Open(t.Context(), address, zerolog.Nop())
+	container, err := store.Open(t.Context(), storetest.New(t).URL, zerolog.Nop())
 	if err != nil {
 		t.Fatalf("Open the store: %v", err)
 	}

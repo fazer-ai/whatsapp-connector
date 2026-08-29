@@ -2,10 +2,11 @@ package store_test
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -15,6 +16,7 @@ import (
 	"go.mau.fi/whatsmeow/types"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/store"
+	"github.com/fazer-ai/whatsapp-connector/internal/store/storetest"
 )
 
 // deviceCounter gives every pairing its own device part, the way WhatsApp does.
@@ -161,12 +163,19 @@ func TestBindRefusesAnIncompleteCall(t *testing.T) {
 	}
 }
 
-// open returns a container on its own SQLite file, which is deleted with the test.
+// open returns a container on a database of its own, which goes with the test.
 func open(t *testing.T) *store.Container {
 	t.Helper()
+	return openAt(t, storetest.New(t))
+}
 
-	address := "sqlite:" + filepath.Join(t.TempDir(), "wac.db")
-	container, err := store.Open(t.Context(), address, zerolog.Nop())
+// openAt is the half of open the tests that keep the address use: the ones that close
+// the container and open it again, to watch a migration run over a store that is
+// already there.
+func openAt(t *testing.T, target storetest.Target) *store.Container {
+	t.Helper()
+
+	container, err := store.Open(t.Context(), target.URL, zerolog.Nop())
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -264,6 +273,10 @@ func TestBindDeletesTheDeviceItDisplaces(t *testing.T) {
 // whatsmeow refuses to bring its schema up on SQLite with foreign keys off, and the
 // driver leaves them off. An operator writing the documented url should not have to
 // know that.
+//
+// On its own address rather than the suite's, and the only test here that is: this one
+// is about what the SQLite url leaves off, so a Postgres pass of it would be a different
+// test rather than the same one twice.
 func TestSQLiteOpensWithoutSpellingOutThePragma(t *testing.T) {
 	t.Parallel()
 
@@ -397,10 +410,9 @@ func TestOneAccountKeepsOneMappingUnderConcurrentPairings(t *testing.T) {
 func TestAnUpgradeStopsRatherThanGuessAtCredentialsItCannotRead(t *testing.T) {
 	t.Parallel()
 
-	path := filepath.Join(t.TempDir(), "wac.db")
-	address := "sqlite:" + path
+	target := storetest.New(t)
 
-	old, err := store.Open(t.Context(), address, zerolog.Nop())
+	old, err := store.Open(t.Context(), target.URL, zerolog.Nop())
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -429,17 +441,24 @@ func TestAnUpgradeStopsRatherThanGuessAtCredentialsItCannotRead(t *testing.T) {
 		t.Fatalf("PutDevice: %v", err)
 	}
 	// The row is there and holds the credentials; what it will not do is come back out.
-	if _, err := db.ExecContext(t.Context(),
-		`UPDATE whatsmeow_device SET facebook_uuid = 'not-a-uuid' WHERE jid = ?`, paired.String()); err != nil {
+	//
+	// Through `lid` rather than a column with a type behind it. whatsmeow declares
+	// facebook_uuid as `uuid`, which Postgres enforces and SQLite reads as a name it
+	// does not know, so writing junk into it is refused on one dialect and accepted on
+	// the other -- the test would then be about the write rather than about the read.
+	// `lid` is TEXT in both and is scanned through types.JID, which is where this fails
+	// on either.
+	if _, err := db.ExecContext(t.Context(), target.Rebind(
+		`UPDATE whatsmeow_device SET lid = '1.x@s.whatsapp.net' WHERE jid = ?`), paired.String()); err != nil {
 		t.Fatalf("make the device unreadable: %v", err)
 	}
-	if _, err := db.ExecContext(t.Context(),
-		`INSERT INTO wac_session_device (sid, jid, account, bound_at) VALUES (?, ?, ?, ?)`,
+	if _, err := db.ExecContext(t.Context(), target.Rebind(
+		`INSERT INTO wac_session_device (sid, jid, account, bound_at) VALUES (?, ?, ?, ?)`),
 		"sid-paired", paired.String(), "5511999990001", int64(1)); err != nil {
 		t.Fatalf("write the paired mapping: %v", err)
 	}
-	if _, err := db.ExecContext(t.Context(),
-		`INSERT INTO wac_session_device (sid, jid, account, bound_at) VALUES (?, ?, ?, ?)`,
+	if _, err := db.ExecContext(t.Context(), target.Rebind(
+		`INSERT INTO wac_session_device (sid, jid, account, bound_at) VALUES (?, ?, ?, ?)`),
 		"sid-halfway", "5511999990001:2@s.whatsapp.net", "5511999990001", int64(2)); err != nil {
 		t.Fatalf("write the half-written mapping: %v", err)
 	}
@@ -447,7 +466,7 @@ func TestAnUpgradeStopsRatherThanGuessAtCredentialsItCannotRead(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	upgraded, err := store.Open(t.Context(), address, zerolog.Nop())
+	upgraded, err := store.Open(t.Context(), target.URL, zerolog.Nop())
 	if err == nil {
 		t.Cleanup(func() { _ = upgraded.Close() })
 		t.Fatal("the upgrade chose a winner while it could not tell whether the other had credentials")
@@ -455,14 +474,10 @@ func TestAnUpgradeStopsRatherThanGuessAtCredentialsItCannotRead(t *testing.T) {
 
 	// And it chose nothing on the way out: the mapping that names the device is still
 	// there, so a start once the store reads again finds the account where it left it.
-	check, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatalf("reopen the file: %v", err)
-	}
-	t.Cleanup(func() { _ = check.Close() })
+	check := target.Pool(t)
 	var mappings int
-	if err := check.QueryRowContext(t.Context(),
-		`SELECT COUNT(*) FROM wac_session_device WHERE sid = ?`, "sid-paired").Scan(&mappings); err != nil {
+	if err := check.QueryRowContext(t.Context(), target.Rebind(
+		`SELECT COUNT(*) FROM wac_session_device WHERE sid = ?`), "sid-paired").Scan(&mappings); err != nil {
 		t.Fatalf("count the mappings: %v", err)
 	}
 	if mappings != 1 {
@@ -478,10 +493,9 @@ func TestAnUpgradeStopsRatherThanGuessAtCredentialsItCannotRead(t *testing.T) {
 func TestAnUpgradeKeepsTheMappingThatStillHasItsCredentials(t *testing.T) {
 	t.Parallel()
 
-	path := filepath.Join(t.TempDir(), "wac.db")
-	address := "sqlite:" + path
+	target := storetest.New(t)
 
-	old, err := store.Open(t.Context(), address, zerolog.Nop())
+	old, err := store.Open(t.Context(), target.URL, zerolog.Nop())
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -510,14 +524,14 @@ func TestAnUpgradeKeepsTheMappingThatStillHasItsCredentials(t *testing.T) {
 	if err := old.Devices().PutDevice(t.Context(), device); err != nil {
 		t.Fatalf("PutDevice: %v", err)
 	}
-	if _, err := db.ExecContext(t.Context(),
-		`INSERT INTO wac_session_device (sid, jid, account, bound_at) VALUES (?, ?, ?, ?)`,
+	if _, err := db.ExecContext(t.Context(), target.Rebind(
+		`INSERT INTO wac_session_device (sid, jid, account, bound_at) VALUES (?, ?, ?, ?)`),
 		"sid-paired", paired.String(), "5511999990001", int64(1)); err != nil {
 		t.Fatalf("write the paired mapping: %v", err)
 	}
 	// And the one that did not: newer, and with nothing behind it.
-	if _, err := db.ExecContext(t.Context(),
-		`INSERT INTO wac_session_device (sid, jid, account, bound_at) VALUES (?, ?, ?, ?)`,
+	if _, err := db.ExecContext(t.Context(), target.Rebind(
+		`INSERT INTO wac_session_device (sid, jid, account, bound_at) VALUES (?, ?, ?, ?)`),
 		"sid-halfway", "5511999990001:2@s.whatsapp.net", "5511999990001", int64(2)); err != nil {
 		t.Fatalf("write the half-written mapping: %v", err)
 	}
@@ -525,7 +539,7 @@ func TestAnUpgradeKeepsTheMappingThatStillHasItsCredentials(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	upgraded, err := store.Open(t.Context(), address, zerolog.Nop())
+	upgraded, err := store.Open(t.Context(), target.URL, zerolog.Nop())
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
@@ -559,12 +573,11 @@ func TestAnUpgradeKeepsTheMappingThatStillHasItsCredentials(t *testing.T) {
 func TestAnOlderStoreGainsTheAccountConstraint(t *testing.T) {
 	t.Parallel()
 
-	path := filepath.Join(t.TempDir(), "wac.db")
-	address := "sqlite:" + path
+	target := storetest.New(t)
 
 	// The shape the first version left behind: a permissive index, and two mappings for
 	// one account that it allowed through.
-	old, err := store.Open(t.Context(), address, zerolog.Nop())
+	old, err := store.Open(t.Context(), target.URL, zerolog.Nop())
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -599,8 +612,8 @@ func TestAnOlderStoreGainsTheAccountConstraint(t *testing.T) {
 		if err := old.Devices().PutDevice(t.Context(), device); err != nil {
 			t.Fatalf("PutDevice: %v", err)
 		}
-		if _, err := db.ExecContext(t.Context(),
-			`INSERT INTO wac_session_device (sid, jid, account, bound_at) VALUES (?, ?, ?, ?)`,
+		if _, err := db.ExecContext(t.Context(), target.Rebind(
+			`INSERT INTO wac_session_device (sid, jid, account, bound_at) VALUES (?, ?, ?, ?)`),
 			sid, raw, "5511999990001", int64(i+1)); err != nil {
 			t.Fatalf("write the duplicate mapping: %v", err)
 		}
@@ -610,7 +623,7 @@ func TestAnOlderStoreGainsTheAccountConstraint(t *testing.T) {
 	}
 
 	// Opened again by this version, which is what an upgrade is.
-	upgraded, err := store.Open(t.Context(), address, zerolog.Nop())
+	upgraded, err := store.Open(t.Context(), target.URL, zerolog.Nop())
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
@@ -633,8 +646,8 @@ func TestAnOlderStoreGainsTheAccountConstraint(t *testing.T) {
 	}
 
 	// And the constraint is really there now, not merely named.
-	_, err = upgraded.DB().ExecContext(t.Context(),
-		`INSERT INTO wac_session_device (sid, jid, account, bound_at) VALUES (?, ?, ?, ?)`,
+	_, err = upgraded.DB().ExecContext(t.Context(), target.Rebind(
+		`INSERT INTO wac_session_device (sid, jid, account, bound_at) VALUES (?, ?, ?, ?)`),
 		"sid-third", "5511999990001:9@s.whatsapp.net", "5511999990001", 99)
 	if err == nil {
 		t.Fatal("a second mapping for one account was accepted after the upgrade")
@@ -709,5 +722,40 @@ func TestAStoppedSessionDoesNotClearAMappingItFinds(t *testing.T) {
 	// And the mapping is still there for whoever it belongs to now.
 	if _, bound, err := container.For("sid-taken-over").JID(t.Context()); err != nil || !bound {
 		t.Fatalf("the mapping was cleared by the session that no longer owns it (bound=%v, err=%v)", bound, err)
+	}
+}
+
+// The second pass is only worth its minute if it is really the other dialect. A typo in
+// the variable, a url the helper stopped reading, or a fallback that quietly handed back
+// SQLite would each leave a green run that had executed the same statements twice, and
+// nothing else in the suite would notice: every test here passes on either dialect, which
+// is the whole design.
+//
+// What it cannot catch is CI not setting the variable at all: from inside the process
+// that is indistinguishable from a developer running `make test`. That half is the
+// workflow's, and it is one line in it.
+func TestTheSecondPassRunsAgainstTheOtherDialect(t *testing.T) {
+	t.Parallel()
+
+	if os.Getenv(storetest.AddressEnv) == "" {
+		t.Skipf("the SQLite pass; %s names the server for the other one", storetest.AddressEnv)
+	}
+
+	target := storetest.New(t)
+	if !target.Postgres() {
+		t.Fatalf("%s is set and the target is still SQLite (%q)", storetest.AddressEnv, target.URL)
+	}
+
+	// Asked of the server rather than of the helper, so this fails on a url that points
+	// somewhere unexpected as well as on one the helper mishandled. `version()` is
+	// Postgres's own -- SQLite spells it `sqlite_version()` -- so a wrong server is an
+	// error here rather than a surprising string.
+	container := openAt(t, target)
+	var version string
+	if err := container.DB().QueryRowContext(t.Context(), `SELECT version()`).Scan(&version); err != nil {
+		t.Fatalf("ask the server what it is: %v", err)
+	}
+	if !strings.HasPrefix(version, "PostgreSQL ") {
+		t.Fatalf("the second pass is talking to %q", version)
 	}
 }

@@ -2,7 +2,6 @@ package app
 
 import (
 	"context"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -11,6 +10,7 @@ import (
 	waTypes "go.mau.fi/whatsmeow/types"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/store"
+	"github.com/fazer-ai/whatsapp-connector/internal/store/storetest"
 )
 
 // The cadence runs to an hour on the default retention, and every restart builds a new
@@ -73,7 +73,7 @@ func TestTheRefetchSweepStopsAtOnceWithNoStore(t *testing.T) {
 func openTestStore(t *testing.T) *store.Container {
 	t.Helper()
 
-	container, err := store.Open(t.Context(), "sqlite:"+filepath.Join(t.TempDir(), "wac.db"), zerolog.Nop())
+	container, err := store.Open(t.Context(), storetest.New(t).URL, zerolog.Nop())
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}

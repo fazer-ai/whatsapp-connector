@@ -9,6 +9,10 @@ of truth for both sides; this repository is the side that produces events.
 - **Setup a fresh clone**: `make setup` (installs the git hooks and downloads modules)
 - **Lint**: `make lint` — `make fmt` rewrites what is auto-fixable
 - **Test**: `make test` (race detector on) — a single one with `go test ./internal/protocol -run TestName`
+- **The other dialect**: `make test-postgres` runs the same suite against a PostgreSQL
+  server named by `WAC_TEST_DATABASE_URL`, which is what a deployment runs and what
+  `make test` never touches. CI runs both passes, and `make check` runs this one too
+  whenever the variable is set; the target prints how to start a server when it is not
 - **Contract only**: `make contract`
 - **Everything CI enforces**: `make check`
 - **Toolchain**: Go as declared in `go.mod`; `golangci-lint` v2
