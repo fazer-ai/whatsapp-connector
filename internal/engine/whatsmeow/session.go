@@ -1485,13 +1485,6 @@ func (s *Session) forward() {
 				}
 				emission = resolved
 			}
-			if item.unless != "" && !s.commit(item.unless) {
-				// The message turned up while this was waiting its turn. Answered as a
-				// publish that worked, because it did what it was for: the chat has the
-				// message, and this was only ever what would go there instead.
-				emission.Settle(nil)
-				continue
-			}
 			if !s.handOn(emission) {
 				return
 			}
@@ -1524,12 +1517,6 @@ type pending struct {
 	// on from resolves to nothing, which is what keeps a state at the place it happened
 	// at rather than at the place an older one is waiting in.
 	seq int64
-	// unless names the message this stands in for, and the forwarder drops it if that
-	// message has arrived by the time it gets here. Queuing and publishing are two steps,
-	// and the message can land between them: decided where it is decided, the placeholder
-	// would go out behind the message it was standing in for, which the client keeps over
-	// the real one for good.
-	unless string
 }
 
 // posted is what the board holds for one chat: its newest state, and enough about where

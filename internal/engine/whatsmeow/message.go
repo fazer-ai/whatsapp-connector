@@ -556,15 +556,15 @@ func (s *Session) deliver(eventType protocol.EventType, payload any, learned int
 	return s.deliverUnless(eventType, payload, learned, "")
 }
 
-// deliverUnless is deliver for an event the forwarder is to drop if the message named here
-// has arrived by the time it reaches it.
+// deliverUnless is deliver for an event to be dropped if the message named here has arrived
+// by the time the publisher is about to write it.
 //
-// Which is the whole reason a placeholder goes through it. Taking it off the waiting list
-// where it is queued and publishing it where the forwarder gets to it are two steps, and a
-// recovery landing between them publishes both: the placeholder ahead of the message it
-// stands for, and a client that deduplicates on the id keeps the placeholder. Decided in
-// the forwarder, the last moment either one can still be chosen, and under the lock the
-// arrival takes.
+// Which is the whole reason a placeholder goes through it. Queuing it and writing it are
+// two steps with a queue, a forwarder and a pump between them, and the message it stands in
+// for can land anywhere in there: published ahead of the real message, a client that
+// deduplicates on the id keeps the placeholder for good. Asked where a moment is asked
+// whether it is still true, the choice is made where it stops being reversible, and under
+// the lock the arrival takes.
 func (s *Session) deliverUnless(eventType protocol.EventType, payload any, learned int64, unless string) bool {
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -581,6 +581,9 @@ func (s *Session) deliverUnless(eventType protocol.EventType, payload any, learn
 		At:      learned,
 		Settle:  func(err error) { settled <- err },
 	}
+	if unless != "" {
+		emission.Claim = func() bool { return s.commit(unless) }
+	}
 	// Started before the emission is queued, not after: the inbox is bounded, and a
 	// pump stalled behind a publisher that answers neither way fills it. Timing only
 	// the publish would leave the handler waiting here with nothing to release it,
@@ -588,7 +591,7 @@ func (s *Session) deliverUnless(eventType protocol.EventType, payload any, learn
 	timeout := time.NewTimer(s.deliverWait)
 	defer timeout.Stop()
 	select {
-	case s.inbox <- pending{event: emission, unless: unless}:
+	case s.inbox <- pending{event: emission}:
 	case <-timeout.C:
 		s.log.Warn().Str("type", string(eventType)).Dur("waited", s.deliverWait).
 			Msg("withholding an acknowledgement for an event that could not be queued")

@@ -451,19 +451,20 @@ func TestACorrectionForwardedByThePhoneCallsOffItsPlaceholder(t *testing.T) {
 	}
 }
 
-// The placeholder is queued in one place and published in another, and the message can
-// arrive between the two. Whoever decides has to be the second of those: taken off the
-// waiting list where it was queued, a message landing a moment later finds nothing to call
-// off, and both go out -- the placeholder ahead of the message it stands for, which the
-// client keeps over the real one for good.
-func TestAMessageThatArrivesWhileItsPlaceholderIsQueuedStillWins(t *testing.T) {
+// The placeholder is queued in one place and written in another, with a queue, a forwarder
+// and a pump in between, and the message it stands for can land anywhere in there. So it is
+// not offered outright: it carries a claim the publisher asks at the last moment, and a
+// message that arrived first is what refuses it. Decided where it was queued, both would go
+// out -- the placeholder ahead of the message it stands for, which the client keeps over the
+// real one for good.
+func TestAMessageThatArrivesWhileItsPlaceholderIsQueuedRefusesIt(t *testing.T) {
 	t.Parallel()
 
 	session, _ := newTestSession(t, "5511999990001")
 	session.rerequestWait = 10 * time.Millisecond
 
-	// The forwarder is parked on something nobody is reading, so what follows sits in the
-	// inbox instead of being decided the moment it is queued.
+	// The forwarder is parked on something nobody is reading, so the placeholder sits in
+	// the inbox with the message still to come.
 	session.inbox <- pending{event: engine.Emission{Type: protocol.EventSessionState, Payload: []byte(`{}`)}}
 	waitUntil(t, "the forwarder to be holding an emission", func() bool { return len(session.inbox) == 0 })
 
@@ -475,8 +476,6 @@ func TestAMessageThatArrivesWhileItsPlaceholderIsQueuedStillWins(t *testing.T) {
 	// And now it arrives, with its placeholder already in the queue ahead of it.
 	recovered := make(chan bool, 1)
 	go func() { recovered <- session.receive(textMessage("3EB0QUEUED", "bom dia")) }()
-	// Noticed before the forwarder is let go, so what this reads is which of the two the
-	// forwarder chooses and not which goroutine got there first.
 	waitUntil(t, "the recovered message to be taken off the waiting list", func() bool {
 		return !waitingOn(session, "3EB0QUEUED")
 	})
@@ -484,22 +483,31 @@ func TestAMessageThatArrivesWhileItsPlaceholderIsQueuedStillWins(t *testing.T) {
 	if parked := next(t, session); parked.Type != protocol.EventSessionState {
 		t.Fatalf("what the forwarder was parked on is %s", parked.Type)
 	}
-	emission := next(t, session)
-	emission.Settle(nil)
+
+	placeholder := next(t, session)
+	if placeholder.Claim == nil {
+		t.Fatal("the placeholder was offered outright, so nothing downstream can still refuse it")
+	}
+	if placeholder.Claim() {
+		t.Error("the placeholder still claims the chat, and the message it stands for has arrived")
+	}
+	// Settled the way the publisher settles a refused claim, so the engine stops offering.
+	placeholder.Settle(nil)
+
+	message := next(t, session)
+	message.Settle(nil)
 	select {
 	case <-recovered:
 	case <-time.After(2 * time.Second):
 		t.Fatal("the handler for the recovered message never came back")
 	}
-
-	message := messageOf(t, emission)
 	var content struct {
 		Type string `json:"type"`
 	}
-	if err := json.Unmarshal(mustMarshal(t, message.Content), &content); err != nil {
+	if err := json.Unmarshal(mustMarshal(t, messageOf(t, message).Content), &content); err != nil {
 		t.Fatalf("unmarshal the content: %v", err)
 	}
 	if content.Type != "text" {
-		t.Fatalf("what reached the chat is %s, and the message itself had arrived", content.Type)
+		t.Fatalf("what followed the placeholder is %s, and the message itself had arrived", content.Type)
 	}
 }

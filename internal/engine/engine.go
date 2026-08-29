@@ -65,6 +65,16 @@ type Emission struct {
 	// Settle callback either way, and an emission dropped for age settles as a success:
 	// nothing failed, it stopped being worth writing.
 	Expires func() time.Duration
+	// Claim, when it is set, is asked at the last moment before the write whether this
+	// emission is still the one to make, and a false drops it as a success rather than a
+	// failure: nothing went wrong, something else answered the question first.
+	//
+	// It exists for an emission that stands in for another one that may yet turn up. The
+	// engine cannot decide that where it queues, because the thing it is watching for can
+	// land while the emission waits its turn, and a stand-in published ahead of the real
+	// event is kept over it by a client that deduplicates on the id. Asked here, the
+	// choice is made where it stops being reversible.
+	Claim func() bool
 }
 
 // Engine opens sessions. One process has one engine; a session is one WhatsApp

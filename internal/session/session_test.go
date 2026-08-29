@@ -2120,3 +2120,50 @@ func TestAnEventCarriesTheMomentTheEngineLearnedIt(t *testing.T) {
 		t.Error("an event that named no moment of its own was given the previous one's")
 	}
 }
+
+// A placeholder standing in for a message that may yet arrive is asked, at the last moment
+// before the write, whether it is still the one to make. The engine cannot decide that
+// where it queues: the message it stands for can land while the emission waits its turn,
+// and a placeholder written ahead of the real message is kept over it by a client that
+// deduplicates on the id. Refused, it costs no sequence number and settles as a success,
+// because nothing failed.
+func TestAnEmissionSomethingElseAnsweredFirstIsDroppedAsASuccess(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	ctx := context.Background()
+
+	if _, err := h.manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, ok := h.engine.Session("s1")
+	if !ok {
+		t.Fatal("the engine has no session after Adopt")
+	}
+
+	settled := make(chan error, 1)
+	engineSession.EmitStandIn(
+		protocol.EventMessageReceived,
+		map[string]any{"message": "the one that would have gone instead"},
+		func() bool { return false },
+		func(err error) { settled <- err },
+	)
+
+	select {
+	case err := <-settled:
+		if err != nil {
+			t.Fatalf("a refused claim settled as a failure: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a refused claim never settled, and the engine is still waiting on it")
+	}
+
+	// And nothing written, nor a sequence number spent: the next event is the first.
+	engineSession.Emit(protocol.EventChatPresence, map[string]any{"state": "composing"})
+	waitFor(t, "the event after it", func() bool { return len(h.recorder.published()) == 1 })
+	if published := h.recorder.published()[0]; published.Type != protocol.EventChatPresence {
+		t.Fatalf("what was written is %s, and the placeholder was refused", published.Type)
+	} else if published.Seq != 1 {
+		t.Errorf("the event after a refused one has seq %d, so the refused one spent one", published.Seq)
+	}
+}
