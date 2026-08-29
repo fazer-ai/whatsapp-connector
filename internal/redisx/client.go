@@ -46,6 +46,14 @@ func New(cfg Config) (*Client, error) {
 	if cfg.Password != "" {
 		options.Password = cfg.Password
 	}
+	// Without this go-redis hands the connection a background context instead of the
+	// caller's, so every deadline in this codebase stops at the point the command reaches
+	// the socket and the read and write timeouts take over from there. Everything that
+	// bounds a call by a context -- a ping, a reclaim pass, a dispatch budget, the
+	// remaining life of a transient event -- would then be a bound on getting the command
+	// sent rather than on the command, and an event published after it stopped being true
+	// is the one place where late and wrong are the same thing.
+	options.ContextTimeoutEnabled = true
 	shards := cfg.Shards
 	if shards <= 0 {
 		return nil, fmt.Errorf("redisx: shards must be positive, got %d", shards)

@@ -258,3 +258,28 @@ func TestARecordStillBeingAskedAboutIsKept(t *testing.T) {
 		t.Fatalf("a record nobody asked about outlived its own expiry (found=%v, err=%v)", found, err)
 	}
 }
+
+// Every deadline this codebase puts on a Redis call is meant to bound the call, and not
+// getting it as far as the socket. go-redis hands the connection a background context
+// unless it is told otherwise, and then a context that has run out stops mattering the
+// moment the command is on the wire: what bounds it from there is the read and write
+// timeouts, which are about a server that has gone quiet rather than about a caller that
+// has stopped caring.
+//
+// Checked here rather than trusted, because nothing else fails visibly when it is wrong.
+// A ping, a reclaim pass and a dispatch budget all still work, only late. The one that
+// does not is a transient event, which is then published after it stopped being true.
+func TestTheClientHonoursTheDeadlinesItIsGiven(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	client, err := redisx.New(redisx.Config{URL: "redis://" + server.Addr(), Shards: 1})
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+
+	if !client.Options().ContextTimeoutEnabled {
+		t.Error("a deadline on a command stops at the socket, and a moment can be published after it is over")
+	}
+}

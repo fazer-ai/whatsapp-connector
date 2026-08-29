@@ -1110,3 +1110,35 @@ func TestAContactOffTheOrdinaryServerIsStillOneKey(t *testing.T) {
 		t.Errorf("what is waiting is a %s, and the person's last state was the stop", state)
 	}
 }
+
+// And the connection is read when the state happens, not when it reaches the publisher.
+// A drop while the marker is still waiting its turn is exactly the case the retry has to
+// refuse, and read at hand-over it would be counted as having happened before the state
+// rather than after it -- so the stop would go out behind the close, on a client that had
+// just cleared presence for it.
+func TestAPresenceRemembersTheConnectionItHappenedOn(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.picked = make(chan struct{}, 1)
+	blockTheForwarder(t, session)
+
+	from := waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)
+	session.presence(&waEvents.Presence{From: from})
+	// Down while the availability is still waiting for its turn, so the hand-over that
+	// follows happens on the far side of the drop.
+	session.handle(&waEvents.StreamReplaced{})
+
+	// The filler the forwarder is parked on, then the availability, then the drop.
+	next(t, session)
+	available := next(t, session)
+	if available.Type != protocol.EventPresenceUpdate {
+		t.Fatalf("what came out is %s", available.Type)
+	}
+	next(t, session)
+	available.Settle(errors.New("redis is unreachable"))
+
+	if waiting := onBoard(session); len(waiting) != 0 {
+		t.Errorf("an availability from before the connection went was put back: %s", stateOf(t, waiting[0]))
+	}
+}

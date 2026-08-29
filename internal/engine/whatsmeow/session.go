@@ -1485,9 +1485,8 @@ type posted struct {
 	at       int64
 	sent     bool
 	retried  bool
-	// transitions is how many session states had been published when this value was
-	// handed over, so a failure coming back after another one can tell that the socket
-	// it describes is gone.
+	// transitions is what the connection counter read when this state happened, so a
+	// failure coming back later can tell that the socket it describes is gone.
 	transitions int64
 }
 
@@ -1561,7 +1560,12 @@ func (s *Session) post(key string, eventType protocol.EventType, payload any, li
 	s.boardMu.Lock()
 	defer s.boardMu.Unlock()
 	s.boardSeq++
-	entry := posted{emission: emission, seq: s.boardSeq}
+	// The connection as it is now, and not as it will be when this reaches the publisher:
+	// what the retry has to know is whether the socket that reported this is still up,
+	// and a drop while the marker waits its turn is exactly the case where it is not.
+	// Read at hand-over instead, that drop would be counted as having happened before the
+	// state rather than after it, and the retry would go out behind the close.
+	entry := posted{emission: emission, seq: s.boardSeq, transitions: s.transitions.Load()}
 	if life == 0 {
 		// A state that corrects something the client has already been shown, and there
 		// is nothing after it: a stop is the end of a typing burst, and somebody going
@@ -1621,7 +1625,6 @@ func (s *Session) resolve(key string, at int64) (engine.Emission, bool) {
 		return entry.emission, true
 	}
 	entry.sent = true
-	entry.transitions = s.transitions.Load()
 	s.board[key] = entry
 	return entry.emission, true
 }
