@@ -408,6 +408,28 @@ func (c *Container) migrate(ctx context.Context) error {
 		// The sweep reads nothing but the clock, and it runs on a table with a row per
 		// media message the deployment ever received.
 		`CREATE INDEX IF NOT EXISTS wac_media_part_stored_at ON wac_media_part (stored_at)`,
+		// A bubble that has been scheduled and not yet decided. The decision lives in a
+		// timer, which lives as long as the process; the session it belongs to does not,
+		// so without this a deploy inside the window loses the bubble and the chat is
+		// left showing nothing at all.
+		//
+		// The same foreign key as above, for the same reason and with one more: this row
+		// is published to a client on behalf of a session, so a row that outlives the
+		// pairing would put a bubble in a chat the account no longer has.
+		//
+		// No retention sweep. Every row is deleted by whichever of its two endings comes
+		// first, and one that is left is one whose session has not been picked up yet --
+		// which is precisely the row that still has work to do. The cascade is what
+		// clears the rows of a session that is never coming back.
+		`CREATE TABLE IF NOT EXISTS wac_pending_placeholder (
+			sid        TEXT   NOT NULL,
+			message_id TEXT   NOT NULL,
+			message    TEXT   NOT NULL,
+			learned_at BIGINT NOT NULL,
+			due_at     BIGINT NOT NULL,
+			PRIMARY KEY (sid, message_id),
+			FOREIGN KEY (sid) REFERENCES wac_session_device (sid) ON DELETE CASCADE
+		)`,
 	} {
 		if _, err := c.db.ExecContext(ctx, statement); err != nil {
 			return fmt.Errorf("store: bring the connector's own schema up: %w", err)
