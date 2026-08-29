@@ -159,6 +159,15 @@ func (c *Container) device(ctx context.Context, sid string, fence *Fence) (*stor
 		return nil, fmt.Errorf("store: read the device of %s: %w", sid, err)
 	}
 	if device == nil {
+		// The mapping points at a device whatsmeow does not hold, and clearing it is a
+		// write -- the one write on a path that otherwise reads. Fenced like any other,
+		// and for a sharper reason than most: Bind runs before the device is saved, so a
+		// session that took this one over has a moment where its mapping is exactly this
+		// shape. Cleared by the instance on its way out, the new owner's device is left
+		// with nothing pointing at it.
+		if err := fence.held(); err != nil {
+			return nil, err
+		}
 		if err := c.unbind(ctx, sid); err != nil {
 			return nil, err
 		}

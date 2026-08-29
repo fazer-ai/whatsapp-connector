@@ -681,3 +681,33 @@ func TestPairingDoesNotTakeTheFenceOff(t *testing.T) {
 		t.Errorf("the device itself was written after the fence came down: %v", err)
 	}
 }
+
+// Device reads, except for the one case where it writes: a mapping that points at a device
+// whatsmeow does not hold is cleared as no mapping at all. That shape is also what a session
+// taking over looks like for a moment, because Bind runs before the device is saved, so an
+// instance on its way out must not be the one to clear it.
+func TestAStoppedSessionDoesNotClearAMappingItFinds(t *testing.T) {
+	t.Parallel()
+	container := open(t)
+
+	jid, err := types.ParseJID("5511999990001:3@" + types.DefaultUserServer)
+	if err != nil {
+		t.Fatalf("ParseJID: %v", err)
+	}
+	// Bound with no device behind it, which is what pairing looks like between the mapping
+	// and the save.
+	scoped := container.For("sid-taken-over")
+	if err := scoped.Bind(t.Context(), jid); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	scoped.Drop()
+	if _, err := scoped.Device(t.Context()); !errors.Is(err, store.ErrNotOwned) {
+		t.Fatalf("a session that stopped went looking and cleaned up: %v", err)
+	}
+
+	// And the mapping is still there for whoever it belongs to now.
+	if _, bound, err := container.For("sid-taken-over").JID(t.Context()); err != nil || !bound {
+		t.Fatalf("the mapping was cleared by the session that no longer owns it (bound=%v, err=%v)", bound, err)
+	}
+}

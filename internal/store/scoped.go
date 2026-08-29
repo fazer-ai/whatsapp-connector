@@ -20,7 +20,9 @@ import (
 //
 // Reads are not fenced, here as everywhere: a session that lost its lease looking at its own
 // rows stops nothing, and refusing them would only turn a handover into a burst of errors on
-// the way out.
+// the way out. Which call is a read is a judgement and not a naming rule, and Device is the
+// one that caught it out: it clears a mapping that points at a device nothing holds, and that
+// clearing is fenced even though nothing in the name says the call writes.
 type Scoped struct {
 	container *Container
 	sid       string
@@ -50,8 +52,12 @@ func (s *Scoped) Drop() { s.fence.Drop() }
 // Dropped reports whether the fence is down.
 func (s *Scoped) Dropped() bool { return s.fence.Dropped() }
 
-// Device returns the device this session should connect with, standing behind this
-// session's fence.
+// Device returns the device this session should connect with, standing behind this session's
+// fence.
+//
+// Mostly a read, and refused outright when the fence is down and the mapping turns out to
+// point at a device that is not there: clearing that mapping is a write, and it is the new
+// owner's mapping by the time a handed-on session gets here.
 func (s *Scoped) Device(ctx context.Context) (*store.Device, error) {
 	return s.container.device(ctx, s.sid, s.fence)
 }
