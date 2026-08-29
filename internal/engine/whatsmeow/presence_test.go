@@ -784,3 +784,33 @@ func TestAFailedStopDoesNotDisplaceTheStateAfterIt(t *testing.T) {
 		t.Errorf("what is waiting is a %s, and the newer state was the typing", state)
 	}
 }
+
+// Board membership cannot answer whether something newer exists: a newer state can be
+// taken off the board and be waiting on the publisher while the older one's failure comes
+// back. Put back then, the older state is published last and the client is left on it.
+func TestAFailedStopDoesNotOvertakeAStateAlreadyOnItsWay(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.picked = make(chan struct{}, 1)
+
+	source := waTypes.MessageSource{
+		Chat:   waTypes.NewJID("5511999990002", waTypes.DefaultUserServer),
+		Sender: waTypes.NewJID("5511999990002", waTypes.DefaultUserServer),
+	}
+	session.presence(&waEvents.Presence{From: source.Chat, Unavailable: true})
+	away := next(t, session)
+
+	// The newer state goes out while the older one is still publishing, so by the time
+	// the failure comes back the board is empty and only the generation says otherwise.
+	session.presence(&waEvents.Presence{From: source.Chat})
+	back := next(t, session)
+	if state := stateOf(t, back); state != "available" {
+		t.Fatalf("what went out second is %s", state)
+	}
+	away.Settle(errors.New("redis is unreachable"))
+
+	if waiting := onBoard(session); len(waiting) != 0 {
+		t.Errorf("the going away was put back over the coming back after it: %v", stateOf(t, waiting[0]))
+	}
+}

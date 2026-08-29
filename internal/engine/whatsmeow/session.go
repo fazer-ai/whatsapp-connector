@@ -167,6 +167,16 @@ type Session struct {
 	boardMu  sync.Mutex
 	boardCap int
 	boardSeq int64
+	// inFlight is the newest durable presence per chat that has been handed to the
+	// publisher and has not said what became of it. Board membership alone cannot answer
+	// that: a newer state can be taken off the board and be waiting on the publisher
+	// while an older one's failure comes back, and putting the older one back then
+	// publishes it last.
+	//
+	// Only the durable ones, and only until they settle, so it holds what is in flight
+	// rather than everything the session has ever seen. A moment is never put back, so
+	// there is nothing to compare it against.
+	inFlight map[string]int64
 	ready    chan struct{}
 
 	// picked, when it is set, receives once for every emission the forwarder takes off
@@ -312,6 +322,7 @@ func newSession(
 		deliverWait:  deliverTimeout,
 		handoffWait:  perishableHandoff,
 		board:        make(map[string]posted),
+		inFlight:     make(map[string]int64),
 		boardCap:     boardDepth,
 		ready:        make(chan struct{}, 1),
 		downloadWait: downloadTimeout,
@@ -1506,14 +1517,6 @@ func (s *Session) post(key string, eventType protocol.EventType, payload any, li
 	if life > 0 {
 		perishes := s.since() + life
 		emission.Expires = func() time.Duration { return perishes - s.since() }
-	} else {
-		// A state that corrects something the client has already been shown, and there
-		// is nothing after it: a stop is the end of a typing burst, and somebody going
-		// away is the end of them being there. Lost to a publisher having a bad second
-		// it is not sent again by WhatsApp and not superseded by anything, so the client
-		// is left with the state before it until that person does something else --
-		// which may be never.
-		emission.Settle = s.putBack(key, eventType, body)
 	}
 
 	s.boardMu.Lock()
@@ -1528,7 +1531,18 @@ func (s *Session) post(key string, eventType protocol.EventType, payload any, li
 		return
 	}
 	s.boardSeq++
-	s.board[key] = posted{seq: s.boardSeq, emission: emission}
+	seq := s.boardSeq
+	if life == 0 {
+		// A state that corrects something the client has already been shown, and there
+		// is nothing after it: a stop is the end of a typing burst, and somebody going
+		// away is the end of them being there. Lost to a publisher having a bad second
+		// it is not sent again by WhatsApp and not superseded by anything, so the client
+		// is left with the state before it until that person does something else --
+		// which may be never.
+		s.inFlight[key] = seq
+		emission.Settle = s.settled(key, seq, eventType, body)
+	}
+	s.board[key] = posted{seq: seq, emission: emission}
 	s.boardMu.Unlock()
 
 	select {
@@ -1563,26 +1577,43 @@ func (s *Session) evictAMoment() bool {
 	return true
 }
 
-// putBack returns the callback that gives a durable presence one more go at the board
-// when the publish it was handed to failed.
+// settled returns the callback the publisher owes this emission, which gives a durable
+// presence one more go at the board when the publish it was handed to failed.
 //
 // One more, and not a loop: a publisher that is down stays down for longer than any
 // number of immediate retries, and the point here is a bad second rather than an outage.
-// Something already waiting under the same key is newer than this by construction, and
-// putting this back over it would publish the older state last.
-func (s *Session) putBack(key string, eventType protocol.EventType, body json.RawMessage) func(error) {
+// And only while this is still the newest state for the chat -- anything issued after it
+// is what the client should end up with, whether that is waiting on the board or already
+// on its way.
+func (s *Session) settled(key string, seq int64, eventType protocol.EventType, body json.RawMessage) func(error) {
 	return func(err error) {
-		if err == nil {
-			return
-		}
 		s.boardMu.Lock()
 		defer s.boardMu.Unlock()
+		if s.inFlight[key] != seq {
+			// Something durable was issued for this chat after this one. It is what the
+			// client should end up with, whether it is waiting on the board or already
+			// on its way.
+			return
+		}
+		if err == nil {
+			delete(s.inFlight, key)
+			return
+		}
 		if _, waiting := s.board[key]; waiting {
+			// And the other half, which the generation cannot see: a moment posted after
+			// this one registers nothing in flight, because a moment is never put back.
+			// What it does do is sit on the board, and it is newer than this.
+			delete(s.inFlight, key)
 			return
 		}
 		if len(s.board) >= s.boardCap && !s.evictAMoment() {
+			delete(s.inFlight, key)
 			return
 		}
+		// The one put back carries no callback of its own, which is what makes this one
+		// more rather than a loop -- and with nothing left to settle, nothing is left in
+		// flight for this chat either.
+		delete(s.inFlight, key)
 		s.boardSeq++
 		s.board[key] = posted{seq: s.boardSeq, emission: engine.Emission{Type: eventType, Payload: body}}
 		s.log.Debug().Str("type", string(eventType)).
