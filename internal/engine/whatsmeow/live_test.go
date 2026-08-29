@@ -1836,13 +1836,19 @@ func TestLiveWatchPresence(t *testing.T) {
 	}
 
 	fmt.Fprintf(os.Stderr,
-		"from that phone, in this chat, and in any order:\n"+
-			"  1. type a few characters and stop -- do not send\n"+
+		"from that phone, in this chat, and in this order:\n"+
+			"  1. type a few characters, then stop and wait a few seconds -- do not send\n"+
 			"  2. hold the microphone as if recording a voice note, then let go\n"+
-			"and check whether this account shows as typing on your side.\nwaiting up to %s\n",
+			"the stop after the typing is what this is really here for: it is the state the\n"+
+			"whole board is built around, and nothing follows it if it never comes.\n"+
+			"also check whether this account shows as typing on your side.\nwaiting up to %s\n",
 		window)
 
 	seen := map[string]json.RawMessage{}
+	// What each state said its own moment was. The frame's `ts` comes from this, and a
+	// reader is asked to decide on a typing indicator by it, so a run that never looks at
+	// it has taken the one field this milestone added on trust.
+	learnedAt := map[string]int64{}
 	deadline := time.After(window)
 
 collect:
@@ -1860,14 +1866,17 @@ collect:
 				if err := json.Unmarshal(emission.Payload, &body); err != nil {
 					t.Fatalf("unmarshal a chat presence: %v", err)
 				}
-				seen[body.State] = emission.Payload
+				seen[body.State], learnedAt[body.State] = emission.Payload, emission.At
 			case protocol.EventPresenceUpdate:
-				seen["presence"] = emission.Payload
+				seen["presence"], learnedAt["presence"] = emission.Payload, emission.At
 			default:
 				continue
 			}
-			if _, typing := seen["composing"]; typing {
-				if _, recording := seen["recording"]; recording {
+			if len(seen) >= 3 {
+				_, typing := seen["composing"]
+				_, stopped := seen["paused"]
+				_, recording := seen["recording"]
+				if typing && stopped && recording {
 					break collect
 				}
 			}
@@ -1876,13 +1885,18 @@ collect:
 		}
 	}
 
-	for _, want := range []string{"composing", "recording"} {
+	// The stop is required and not optional. Everything about how presence is queued
+	// turns on it existing: a typing indicator has nothing after it, so the board keeps
+	// the last state per chat rather than a queue of them, and a client left showing
+	// somebody typing has no second chance. A build that never receives one has been
+	// designed around a state WhatsApp does not send.
+	for _, want := range []string{"composing", "paused", "recording"} {
 		if _, arrived := seen[want]; !arrived {
 			t.Errorf("no %s arrived within %s; what did: %v", want, window, rawKeysOf(seen))
 		}
 	}
-	for state, payload := range seen {
-		fmt.Fprintf(os.Stderr, "%s: %s\n", state, payload)
+	for _, state := range rawKeysOf(seen) {
+		fmt.Fprintf(os.Stderr, "%s: at=%d %s\n", state, learnedAt[state], seen[state])
 	}
 	// Not a failure: it only arrives if the other phone changed state while this ran,
 	// and somebody with the chat open the whole time never does.
