@@ -756,11 +756,11 @@ func TestPresenceKeepsItsPlaceAmongTheMessages(t *testing.T) {
 	}
 }
 
-// The value a marker stands for is read when its turn comes and not when it was posted,
-// which is what lets one queue slot carry a whole burst of typing. A marker that carried
-// the value would publish the state the chat was in when the queue was joined, and behind
-// a backlog that is a `composing` about a minute that has passed.
-func TestAMarkerPublishesTheStateTheChatIsInWhenItsTurnComes(t *testing.T) {
+// A chat that changes its mind while its states are queued publishes the last of them and
+// none of the others. Each takes a place of its own, and every place but the newest
+// resolves to nothing when its turn comes -- so what reaches the client is one event,
+// where the state that survived actually happened, and not a replay of the burst.
+func TestAChatThatChangesItsMindPublishesOnlyWhereItLanded(t *testing.T) {
 	t.Parallel()
 
 	session := newPresenceSession(t, "5511999990001")
@@ -768,7 +768,6 @@ func TestAMarkerPublishesTheStateTheChatIsInWhenItsTurnComes(t *testing.T) {
 	blockTheForwarder(t, session)
 
 	jid := waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)
-	queued := len(session.inbox)
 	for _, state := range []waTypes.ChatPresence{
 		waTypes.ChatPresenceComposing, waTypes.ChatPresenceComposing, waTypes.ChatPresencePaused,
 	} {
@@ -776,14 +775,17 @@ func TestAMarkerPublishesTheStateTheChatIsInWhenItsTurnComes(t *testing.T) {
 			MessageSource: waTypes.MessageSource{Chat: jid, Sender: jid}, State: state,
 		})
 	}
-	if took := len(session.inbox) - queued; took != 1 {
-		t.Errorf("a burst of typing in one chat took %d places in the queue, want the one", took)
-	}
 
+	// The filler the forwarder is parked on, and then the one state the chat ended on.
 	next(t, session)
 	published := next(t, session)
 	if state := stateOf(t, published); state != "paused" {
-		t.Errorf("what came out is a %s, and the chat's state when its turn came was the stop", state)
+		t.Errorf("what came out is a %s, and the chat had already stopped by then", state)
+	}
+	select {
+	case emission := <-session.Events():
+		t.Fatalf("a state the chat had moved on from was published as well: %s", emission.Payload)
+	case <-time.After(500 * time.Millisecond):
 	}
 }
 

@@ -241,3 +241,21 @@ internal/protocol/types.go: Preserve idempotency for redelivered presence comman
 # waiting behind a write nobody wants any more, which is the ordering cost this design is
 # built to avoid.
 internal/session/session.go: Enforce transient expiry inside the Redis append  # PR#45
+# PR#45: the case is real and neither remedy exists at this layer. Tying the generation
+# to the reporting socket needs the event to name the connection it arrived on, and
+# whatsmeow does not say: `events.Presence` carries a JID and nothing else, and
+# `events.ChatPresence` carries a MessageSource, which is about the chat and the sender.
+# Draining the old handlers before activating the replacement is not available either --
+# the handler queue belongs to whatsmeow, the same client is reused across its own
+# automatic reconnect, and this code is a handler rather than the thing driving the loop.
+#
+# What the session can see, it already refuses: a node reported while the connection is
+# down, and a state whose connection went while it waited its turn. What is left is a
+# handler delayed across a whole dial, handshake and authentication, which nothing on
+# this path waits that long for on purpose. One stale event lands: a `composing` that the
+# `paused` or the message after it clears, or an `available` that the next update
+# corrects -- inside the window where a client is resyncing presence anyway, because
+# subscriptions do not survive a reconnect either.
+#
+# Registered as #49, with what upstream would have to expose to close it.
+internal/engine/whatsmeow/session.go: Tie presence to the socket that produced it  # PR#45
