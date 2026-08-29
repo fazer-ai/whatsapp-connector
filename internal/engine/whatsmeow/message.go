@@ -478,7 +478,7 @@ func (s *Session) receive(event *waEvents.Message) bool {
 		return true
 	}
 
-	if s.arrived(event.Info.ID) {
+	if stanza := stanzaOf(event); s.arrived(stanza) {
 		// This one was unreadable a moment ago and the recovery worked: either the sender
 		// encrypted it again or the phone forwarded it. The placeholder waiting for it is
 		// called off here rather than published and corrected, because a client that
@@ -487,7 +487,7 @@ func (s *Session) receive(event *waEvents.Message) bool {
 		// Before the switch below, and not after it: a recovered edit or reaction leaves
 		// here as a change to a message that already exists, and a placeholder still
 		// waiting behind that return would go out as a message of its own.
-		s.log.Info().Str("message_id", event.Info.ID).
+		s.log.Info().Str("message_id", stanza).
 			Msg("a message that could not be read arrived after all")
 	}
 
@@ -525,6 +525,22 @@ func (s *Session) receive(event *waEvents.Message) bool {
 	return s.deliver(protocol.EventMediaDownloadFailed, protocol.MediaDownloadFailure{
 		Chat: message.Chat, MessageID: message.ID, Reason: failure,
 	}, learned)
+}
+
+// stanzaOf is the id of the stanza this event arrived in, which is what a placeholder for
+// it is waiting under and is not always the id on the event.
+//
+// A recovery that comes back through the phone is parsed by ParseWebMessage, and that
+// rewrites the id of an edit to the message the edit corrects, leaving the stanza's own id
+// on the web message it came in. Asked for the id on the event, the carrier's placeholder
+// would go unclaimed and go out behind the correction; asked for both, the correction would
+// call off a placeholder belonging to the message it corrects, which is a different message
+// and still missing.
+func stanzaOf(event *waEvents.Message) string {
+	if id := event.SourceWebMsg.GetKey().GetID(); id != "" {
+		return id
+	}
+	return event.Info.ID
 }
 
 // deliver emits and waits for the publisher to say what became of it.

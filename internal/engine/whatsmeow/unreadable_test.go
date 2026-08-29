@@ -7,7 +7,9 @@ import (
 	"testing"
 	"time"
 
+	"go.mau.fi/whatsmeow/proto/waCommon"
 	"go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/proto/waWeb"
 	waTypes "go.mau.fi/whatsmeow/types"
 	waEvents "go.mau.fi/whatsmeow/types/events"
 	"google.golang.org/protobuf/proto"
@@ -393,5 +395,58 @@ func TestAPlaceholderThePublisherWouldNotTakeIsOfferedAgain(t *testing.T) {
 	again.Settle(nil)
 	if got := messageOf(t, again).ID; got != "3EB0REFUSED" {
 		t.Fatalf("what was offered the second time is %q, and the first was 3EB0REFUSED", got)
+	}
+}
+
+// The phone's answer to a message this device was never given comes back through
+// ParseWebMessage, and that door rewrites the id of an edit to the message the edit
+// corrects. The placeholder is waiting under the id of the stanza that failed, which the
+// parser leaves on the web message and nowhere else. Read off the event, the correction is
+// published and the placeholder follows it out 45 seconds later, claiming a message that
+// arrived never did.
+func TestACorrectionForwardedByThePhoneCallsOffItsPlaceholder(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.rerequestWait = time.Minute
+
+	unread := unavailableMessage(carrier, "view_once")
+	if !session.handle(unread) {
+		t.Fatal("an unreadable message was left for WhatsApp to send again")
+	}
+	if !waitingOn(session, carrier) {
+		t.Fatal("no placeholder was ever waiting, so nothing here could have called one off")
+	}
+
+	// Built by the library rather than by hand: the rewrite under test is whatsmeow's,
+	// and an imitation of it would go on passing after the library changed it.
+	chat := waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)
+	forwarded, err := session.current().ParseWebMessage(chat, &waWeb.WebMessageInfo{
+		Key: &waCommon.MessageKey{
+			RemoteJID: proto.String(chat.String()),
+			FromMe:    proto.Bool(false),
+			ID:        proto.String(carrier),
+		},
+		MessageTimestamp: proto.Uint64(1755000009),
+		PushName:         proto.String("Alice"),
+		Message: &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{
+			Key:           messageKey(subject),
+			Type:          waE2E.ProtocolMessage_MESSAGE_EDIT.Enum(),
+			EditedMessage: &waE2E.Message{Conversation: proto.String("bom dia, corrigido")},
+			TimestampMS:   proto.Int64(1755000009750),
+		}},
+	})
+	if err != nil {
+		t.Fatalf("ParseWebMessage: %v", err)
+	}
+	if forwarded.Info.ID != subject {
+		t.Fatalf("the parser left %q on the event, and this test is about it leaving the target", forwarded.Info.ID)
+	}
+
+	if publishedBy(t, session, forwarded).Type != protocol.EventMessageEdited {
+		t.Fatal("the forwarded correction was not published as a correction")
+	}
+	if waitingOn(session, carrier) {
+		t.Fatal("the placeholder is still waiting behind the correction the phone forwarded")
 	}
 }
