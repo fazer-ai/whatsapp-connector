@@ -1,7 +1,7 @@
 # The connector ships as its own image so it can be hotfixed on the WhatsApp protocol's
 # schedule rather than on Chatwoot's: whatsmeow moves every couple of weeks, and a
 # release train that had to carry a Rails app with it would be too slow to matter.
-FROM golang:1.26-alpine AS build
+FROM golang:1.27-alpine AS build
 
 WORKDIR /src
 
