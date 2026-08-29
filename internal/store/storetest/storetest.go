@@ -113,6 +113,9 @@ var (
 	adminDB   *sql.DB
 	adminErr  error
 	nameSeq   atomic.Uint64
+
+	routeOnce sync.Once
+	routeErr  error
 )
 
 // newDatabase hands the test a database of its own on the configured server.
@@ -165,12 +168,75 @@ func newDatabase(t *testing.T, server string) Target {
 		}
 	})
 
-	dsn, err := url.Parse(server)
+	dsn, err := route(server, name)
 	if err != nil {
-		t.Fatalf("parse %s: %v", AddressEnv, err)
+		t.Fatalf("point %s at the database for this test: %v", AddressEnv, err)
 	}
-	dsn.Path = "/" + name
-	return Target{URL: dsn.String(), driver: "postgres", dsn: dsn.String()}
+	// Once per run, because route does the same thing to every url: if the first test
+	// lands where it was sent, so does every other. Checked at all because the failure
+	// it guards is silent -- every test on the shared database, cleanup dropping the
+	// empty ones it made -- and a suite that passes while sharing a database is worse
+	// than no suite.
+	routeOnce.Do(func() { routeErr = confirmRoute(dsn, name) })
+	if routeErr != nil {
+		t.Fatalf("%v", routeErr)
+	}
+	return Target{URL: dsn, driver: "postgres", dsn: dsn}
+}
+
+// route points a server url at one database.
+//
+// Setting the path is not enough, and the reason is worth writing down because it is
+// not what it looks like. lib/pq turns a url into a keyword string: the path becomes
+// `dbname='...'`, every query option becomes `k='v'`, and then it *sorts the pairs*
+// before joining them (connector.go, `sort.Strings(kvs)`). The parse that follows takes
+// the last of a repeated key, so between the path's `dbname` and the query's the winner
+// is whichever value sorts later. Not the query, not the path: whichever of the two
+// database names happens to compare greater. `?dbname=zzz` takes a path of `wac_…`
+// while `?dbname=aaa` leaves it alone.
+//
+// `database` is a second way in. lib/pq does not consume it, so it travels to the
+// server as a startup parameter, and `database` is the protocol's own field for
+// choosing one.
+//
+// Both are stripped. confirmRoute is what covers the ways in that are not on this list,
+// since a rule this strange is not one to trust an enumeration of.
+func route(server, name string) (string, error) {
+	u, err := url.Parse(server)
+	if err != nil {
+		return "", err
+	}
+	query := u.Query()
+	query.Del("dbname")
+	query.Del("database")
+	u.RawQuery = query.Encode()
+	u.Path = "/" + name
+	return u.String(), nil
+}
+
+// confirmRoute asks the server which database the url reached. A key this package does
+// not know about, a PG* variable in the environment, or a driver that changes how it
+// resolves the two would each put every test back on one shared database, and nothing
+// in the suite would fail: the tests would pass, on each other's rows.
+func confirmRoute(dsn, name string) error {
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		return fmt.Errorf("storetest: open the database for this test: %w", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	var reached string
+	if err := db.QueryRowContext(ctx, `SELECT current_database()`).Scan(&reached); err != nil {
+		return fmt.Errorf("storetest: ask which database the url reached: %w", err)
+	}
+	if reached != name {
+		return fmt.Errorf(
+			"storetest: %s reaches %q, not the %q this test was given; every test would share one database",
+			AddressEnv, reached, name)
+	}
+	return nil
 }
 
 // run tells this process's databases apart from every other process's on the same
