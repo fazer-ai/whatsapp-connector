@@ -449,11 +449,28 @@ type fencedContainer struct {
 	fence *Fence
 }
 
+// PutDevice is also where the fence would take itself off, if it did not put itself back.
+//
+// A device that has never been saved carries no stores at all, and whatsmeow installs them
+// the first time it is written: `sqlstore.Container.PutDevice` calls `initializeDevice`,
+// which sets every store field, the LID map and the container itself, over whatever was
+// there. So the save that ends a pairing replaces the whole fence with the raw stores, and
+// the account that just paired spends the rest of the session unfenced -- the one kind of
+// session where losing it would be least noticed, since nothing about it looks different.
+//
+// Only when the initialisation actually happened. Every later save finds the device already
+// initialised and changes none of them, and re-wrapping there would put a fence in front of
+// a fence on every write the device ever makes.
 func (f fencedContainer) PutDevice(ctx context.Context, device *store.Device) error {
 	if err := f.fence.held(); err != nil {
 		return err
 	}
-	return f.DeviceContainer.PutDevice(ctx, device)
+	fresh := !device.Initialized
+	err := f.DeviceContainer.PutDevice(ctx, device)
+	if fresh && device.Initialized {
+		Fenced(device, f.fence)
+	}
+	return err
 }
 
 func (f fencedContainer) DeleteDevice(ctx context.Context, device *store.Device) error {

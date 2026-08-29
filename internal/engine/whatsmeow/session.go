@@ -1305,6 +1305,12 @@ func (s *Session) Close() error {
 	// Announced first, while the teardown below still has a socket to close. The engine
 	// only drops a cache entry here, and a session it can no longer hand out is the
 	// point: an Open racing this must build a new client rather than get this one back.
+	// Down before anything else. Before the context, because a write already past its own
+	// context check is one this still catches; and before the engine is told, because that
+	// is what lets an Open build the replacement, and the replacement must not be running
+	// while this one can still write.
+	s.fence.Drop()
+
 	if closing != nil {
 		closing()
 	}
@@ -1312,10 +1318,6 @@ func (s *Session) Close() error {
 	if run != nil {
 		run.cancel()
 	}
-	// Down before anything else, and before the context: a write already past its own
-	// context check is one this still catches, and a session that is stopping owns
-	// nothing whatever the reason it stopped.
-	s.fence.Drop()
 	// Cancelled first, and that order is the whole point: whatsmeow holds its socket
 	// lock for the length of a dial, and Disconnect waits for the same lock. Cancelling
 	// afterwards would never run, and a lease handover would wait out the handshake.

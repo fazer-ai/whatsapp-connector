@@ -10,7 +10,11 @@ contract/fixtures/commands/history_request.json: Require an idempotency key for 
 # uazapi adapter, which does not need it, and history is M3. The engine refusing an
 # unanchored request with a reason the operator can read is the shape to settle on then.
 contract/schema/protocol.schema.json: Require a usable anchor for native history requests  # PR#3
-internal/store/store.go: Fence device writes against lease loss  # PR#5 — real, and not a patch: whatsmeow writes through its own SQL layer where a statement carries no session identity, so a fence has to be per-session all the way down (one container per session, or a session-aware driver wrapper). That is M2, when this package starts owning writes of its own. The lease plus the heartbeat teardown bound the window meanwhile, and the roadmap says it is open.
+# PR#5's "Fence device writes against lease loss" is no longer waived: the fence landed in
+# PR#56. It also turned out not to need any of the three shapes that waiver named — the
+# stores on a device are interfaces, so the fence is a decorator per session and needs
+# neither a container per session nor a session-aware driver.
+internal/store/fence.go: Synchronize dropping with delegated writes  # PR#56 — real, and synchronising does not fix it. A write that passed the fence and is still in the database when Drop runs lands whatever this side does: making Drop wait would delay this instance, and the peer that took the session is already running, so no ordering is bought. What decides which of two writes wins has to be the database, and that is issue #55, where the epoch column and its cost are written down. Waiting would also have to come after the context is cancelled or it deadlocks on the write it is waiting for, which is the same cancel that already bounds it.
 # PR#6's logout deduplication is no longer waived: the idempotency layer it was waiting
 # for landed with `message.send` in PR#9, and `wa:idem:<sid>:<key>` now covers every
 # command that carries an `idempotency_key`. A logout that brings one is deduplicated

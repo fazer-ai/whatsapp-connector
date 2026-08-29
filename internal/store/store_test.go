@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"sync"
@@ -637,5 +638,46 @@ func TestAnOlderStoreGainsTheAccountConstraint(t *testing.T) {
 		"sid-third", "5511999990001:9@s.whatsapp.net", "5511999990001", 99)
 	if err == nil {
 		t.Fatal("a second mapping for one account was accepted after the upgrade")
+	}
+}
+
+// The save that ends a pairing is where whatsmeow installs the stores a fresh device does
+// not have yet, and it installs them over whatever was there. A fence that did not put
+// itself back would come off exactly once per account, at pairing, and stay off -- on the
+// sessions where nothing would look wrong.
+func TestPairingDoesNotTakeTheFenceOff(t *testing.T) {
+	t.Parallel()
+	container := open(t)
+
+	fence := &store.Fence{}
+	device := store.Fenced(container.Devices().NewDevice(), fence)
+	if device.Initialized {
+		t.Fatal("a device that has never been saved is already initialised, so this proves nothing")
+	}
+	jid := types.NewJID("5511999990001", types.DefaultUserServer)
+	jid.Device = 1
+	device.ID = &jid
+	// The half of pairing this test does not run: whatsmeow fills the account identity
+	// before it saves, and refuses to store a device without one.
+	device.Account = &waAdv.ADVSignedDeviceIdentity{
+		Details:             make([]byte, 32),
+		AccountSignature:    make([]byte, 64),
+		AccountSignatureKey: make([]byte, 32),
+		DeviceSignature:     make([]byte, 64),
+	}
+
+	if err := device.Save(t.Context()); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if !device.Initialized {
+		t.Fatal("the save left the device uninitialised, so whatsmeow no longer installs its stores here")
+	}
+
+	fence.Drop()
+	if err := device.Identities.PutIdentity(t.Context(), "5511999990002.0", [32]byte{}); !errors.Is(err, store.ErrNotOwned) {
+		t.Errorf("an identity was written after the fence came down: %v", err)
+	}
+	if err := device.Save(t.Context()); !errors.Is(err, store.ErrNotOwned) {
+		t.Errorf("the device itself was written after the fence came down: %v", err)
 	}
 }
