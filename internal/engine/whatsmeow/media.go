@@ -433,8 +433,8 @@ func (s *Session) remember(event *waEvents.Message, part *attachment) {
 	// message's file under a chat the message is not in.
 	chat, _ := chatOf(&event.Info)
 	kept := store.MediaPart{
-		SID: s.sid, MessageID: messageID,
-		ChatKind: string(chat.Kind), ChatID: chat.ID, Kind: string(part.content.Kind),
+		MessageID: messageID,
+		ChatKind:  string(chat.Kind), ChatID: chat.ID, Kind: string(part.content.Kind),
 		DirectPath: part.download.GetDirectPath(), MediaKey: part.download.GetMediaKey(),
 		FileEncSHA256: part.download.GetFileEncSHA256(), FileSHA256: part.download.GetFileSHA256(),
 		FileLength: part.content.Size, Mime: part.content.Mime, Filename: part.content.Filename,
@@ -470,7 +470,7 @@ func (s *Session) downloadMedia(ctx context.Context, command *protocol.Command) 
 		return nil, protocol.NewError(protocol.ErrorInternal, "this instance has nowhere to keep a file")
 	}
 
-	kept, found, err := s.store.MediaPart(ctx, s.sid, body.MessageID)
+	kept, found, err := s.store.MediaPart(ctx, body.MessageID)
 	switch {
 	case err != nil:
 		s.log.Warn().Err(err).Str("message_id", body.MessageID).Msg("could not look up how to fetch a file again")

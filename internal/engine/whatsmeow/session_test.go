@@ -310,7 +310,7 @@ func TestBeingLoggedOutForgetsTheDevice(t *testing.T) {
 	t.Parallel()
 	session, container := newTestSession(t, "5511999990001")
 
-	if _, bound, err := container.JID(t.Context(), session.sid); err != nil || !bound {
+	if _, bound, err := container.For(session.sid).JID(t.Context()); err != nil || !bound {
 		t.Fatalf("the session is not bound to begin with (bound=%v, err=%v)", bound, err)
 	}
 
@@ -326,7 +326,7 @@ func TestBeingLoggedOutForgetsTheDevice(t *testing.T) {
 
 	// Credentials WhatsApp has revoked are worse than none: a session that keeps them
 	// looks resumable and fails every reconnect.
-	if _, bound, err := container.JID(t.Context(), session.sid); err != nil || bound {
+	if _, bound, err := container.For(session.sid).JID(t.Context()); err != nil || bound {
 		t.Fatalf("the device survived a logout (bound=%v, err=%v)", bound, err)
 	}
 
@@ -461,10 +461,10 @@ func newTestSession(t *testing.T, phone string) (*Session, *store.Container) {
 
 	container := openStore(t)
 	sid := "sid-" + t.Name()
-	// Fenced the way Open fences it, so a test session refuses a write after it closes for
-	// the same reason a real one does.
-	fence := &store.Fence{}
-	device, err := container.Device(t.Context(), sid, fence)
+	// One handle for the whole session, the way Open makes one: every For is a fence of
+	// its own, so a second handle here would fence a device the session is not using.
+	scoped := container.For(sid)
+	device, err := scoped.Device(t.Context())
 	if err != nil {
 		t.Fatalf("Device: %v", err)
 	}
@@ -487,12 +487,12 @@ func newTestSession(t *testing.T, phone string) (*Session, *store.Container) {
 		if err := device.Save(t.Context()); err != nil {
 			t.Fatalf("Save: %v", err)
 		}
-		if err := container.Bind(t.Context(), sid, jid); err != nil {
+		if err := scoped.Bind(t.Context(), jid); err != nil {
 			t.Fatalf("Bind: %v", err)
 		}
 	}
 
-	session := newSession(sid, wm.NewClient(device, nil), container, fence, MediaOptions{}, zerolog.Nop(), newLibraryLogger(zerolog.Nop(), sid))
+	session := newSession(sid, wm.NewClient(device, nil), scoped, MediaOptions{}, zerolog.Nop(), newLibraryLogger(zerolog.Nop(), sid))
 	t.Cleanup(func() { _ = session.Close() })
 	return session, container
 }
@@ -824,7 +824,7 @@ func TestALogoutThatNeverReachedWhatsappKeepsTheCredentials(t *testing.T) {
 	if session.isStale() {
 		t.Fatal("the session was marked stale, so the next connect would delete credentials that still resume")
 	}
-	if _, bound, err := container.JID(t.Context(), session.sid); err != nil || !bound {
+	if _, bound, err := container.For(session.sid).JID(t.Context()); err != nil || !bound {
 		t.Fatalf("the pairing was forgotten anyway (bound=%v, err=%v)", bound, err)
 	}
 }
@@ -2452,7 +2452,7 @@ func TestClosingASessionDropsItsFence(t *testing.T) {
 	t.Parallel()
 
 	session, _ := newTestSession(t, "5511999990001")
-	if session.fence.Dropped() {
+	if session.store.Dropped() {
 		t.Fatal("a session that is running is already fenced")
 	}
 	if err := session.Close(); err != nil {
@@ -2461,7 +2461,36 @@ func TestClosingASessionDropsItsFence(t *testing.T) {
 	if !session.Closed() {
 		t.Fatal("Close returned and the session does not report itself closed")
 	}
-	if !session.fence.Dropped() {
+	if !session.store.Dropped() {
 		t.Error("a closed session still holds its fence up")
+	}
+}
+
+// The device stores are not the only writes a session makes. The mapping that says which
+// device it paired is this connector's own table, and the pairing callback writes it -- late
+// enough, if a Close races the end of a pairing, to land on the mapping the replacement has
+// already written. Same for the coordinates a media message keeps.
+func TestASessionThatStoppedWritesNoMappingEither(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	jid, err := waTypes.ParseJID("5511999990009:7@" + waTypes.DefaultUserServer)
+	if err != nil {
+		t.Fatalf("ParseJID: %v", err)
+	}
+
+	if err := session.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if err := session.store.Bind(t.Context(), jid); !errors.Is(err, store.ErrNotOwned) {
+		t.Errorf("a session that stopped rebound its mapping: %v", err)
+	}
+	part := store.MediaPart{MessageID: "3EB0LATE", ChatKind: "phone", ChatID: "5511999990009", Kind: "image"}
+	if err := session.store.PutMediaPart(t.Context(), &part, time.Now()); !errors.Is(err, store.ErrNotOwned) {
+		t.Errorf("a session that stopped kept a media part: %v", err)
+	}
+	if err := session.store.Forget(t.Context()); !errors.Is(err, store.ErrNotOwned) {
+		t.Errorf("a session that stopped deleted its own device: %v", err)
 	}
 }

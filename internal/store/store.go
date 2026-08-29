@@ -145,7 +145,7 @@ func (c *Container) Close() error {
 // device from here without one. A session builds a device more than once -- a logout and
 // a stale mapping both send it back for another -- and the second of those was where an
 // unfenced one first got in.
-func (c *Container) Device(ctx context.Context, sid string, fence *Fence) (*store.Device, error) {
+func (c *Container) device(ctx context.Context, sid string, fence *Fence) (*store.Device, error) {
 	jid, bound, err := c.lookup(ctx, sid)
 	if err != nil {
 		return nil, err
@@ -178,7 +178,7 @@ func (c *Container) Device(ctx context.Context, sid string, fence *Fence) (*stor
 // is the key whatsmeow files the device under and the one `GetDevice` answers to.
 // Normalising it away would leave every restart looking up a device that is there
 // under a name we no longer hold, reading it as unpaired, and pairing again.
-func (c *Container) Bind(ctx context.Context, sid string, jid types.JID) error {
+func (c *Container) bind(ctx context.Context, sid string, jid types.JID) error {
 	if sid == "" {
 		return errors.New("store: bind needs a session id")
 	}
@@ -275,7 +275,7 @@ func (c *Container) deleteDevice(ctx context.Context, jid types.JID) {
 
 // Forget deletes a session's device and its mapping, which is what a logout means:
 // the credentials are gone and the next connect has to pair.
-func (c *Container) Forget(ctx context.Context, sid string) error {
+func (c *Container) forget(ctx context.Context, sid string) error {
 	jid, bound, err := c.lookup(ctx, sid)
 	if err != nil {
 		return err
@@ -301,7 +301,7 @@ func (c *Container) Forget(ctx context.Context, sid string) error {
 }
 
 // JID reports which device a session is bound to, and whether it is bound at all.
-func (c *Container) JID(ctx context.Context, sid string) (types.JID, bool, error) {
+func (c *Container) jid(ctx context.Context, sid string) (types.JID, bool, error) {
 	return c.lookup(ctx, sid)
 }
 

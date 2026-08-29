@@ -34,11 +34,11 @@ func TestWhatIsKeptToFetchAFileComesBackExactly(t *testing.T) {
 	pair(t, container, "sid-1", "5511999990001")
 
 	want := samplePart("sid-1", "3EB0IMAGE")
-	if err := container.PutMediaPart(t.Context(), &want, storedAt); err != nil {
+	if err := container.For(want.SID).PutMediaPart(t.Context(), &want, storedAt); err != nil {
 		t.Fatalf("PutMediaPart: %v", err)
 	}
 
-	got, found, err := container.MediaPart(t.Context(), "sid-1", "3EB0IMAGE")
+	got, found, err := container.For("sid-1").MediaPart(t.Context(), "3EB0IMAGE")
 	if err != nil {
 		t.Fatalf("MediaPart: %v", err)
 	}
@@ -62,10 +62,10 @@ func TestWhatIsKeptForOneSessionIsNotReadByAnother(t *testing.T) {
 	pair(t, container, "sid-2", "5511999990002")
 
 	part := samplePart("sid-1", "3EB0SAME")
-	if err := container.PutMediaPart(t.Context(), &part, storedAt); err != nil {
+	if err := container.For(part.SID).PutMediaPart(t.Context(), &part, storedAt); err != nil {
 		t.Fatalf("PutMediaPart: %v", err)
 	}
-	if _, found, err := container.MediaPart(t.Context(), "sid-2", "3EB0SAME"); err != nil || found {
+	if _, found, err := container.For("sid-2").MediaPart(t.Context(), "3EB0SAME"); err != nil || found {
 		t.Fatalf("another session read the part (found=%v, err=%v)", found, err)
 	}
 }
@@ -78,17 +78,17 @@ func TestARedeliveredMessageReplacesWhatWasKeptForIt(t *testing.T) {
 	pair(t, container, "sid-1", "5511999990001")
 
 	first := samplePart("sid-1", "3EB0AGAIN")
-	if err := container.PutMediaPart(t.Context(), &first, storedAt); err != nil {
+	if err := container.For(first.SID).PutMediaPart(t.Context(), &first, storedAt); err != nil {
 		t.Fatalf("PutMediaPart: %v", err)
 	}
 	second := first
 	second.DirectPath = "/v/t62.7118-24/refreshed.enc"
 	later := storedAt.Add(time.Hour)
-	if err := container.PutMediaPart(t.Context(), &second, later); err != nil {
+	if err := container.For(second.SID).PutMediaPart(t.Context(), &second, later); err != nil {
 		t.Fatalf("PutMediaPart again: %v", err)
 	}
 
-	got, _, err := container.MediaPart(t.Context(), "sid-1", "3EB0AGAIN")
+	got, _, err := container.For("sid-1").MediaPart(t.Context(), "3EB0AGAIN")
 	if err != nil {
 		t.Fatalf("MediaPart: %v", err)
 	}
@@ -118,18 +118,18 @@ func TestAWriteThatArrivesLateDoesNotOverwriteANewerOne(t *testing.T) {
 
 	fresh := samplePart("sid-1", "3EB0RACE")
 	fresh.DirectPath = "/v/t62.7118-24/fresh.enc"
-	if err := container.PutMediaPart(t.Context(), &fresh, storedAt); err != nil {
+	if err := container.For(fresh.SID).PutMediaPart(t.Context(), &fresh, storedAt); err != nil {
 		t.Fatalf("PutMediaPart: %v", err)
 	}
 
 	// The old owner's write, made before the fresh one and landing after it.
 	stale := samplePart("sid-1", "3EB0RACE")
 	stale.DirectPath = "/v/t62.7118-24/stale.enc"
-	if err := container.PutMediaPart(t.Context(), &stale, storedAt.Add(-time.Minute)); err != nil {
+	if err := container.For(stale.SID).PutMediaPart(t.Context(), &stale, storedAt.Add(-time.Minute)); err != nil {
 		t.Fatalf("PutMediaPart: %v", err)
 	}
 
-	got, _, err := container.MediaPart(t.Context(), "sid-1", "3EB0RACE")
+	got, _, err := container.For("sid-1").MediaPart(t.Context(), "3EB0RACE")
 	if err != nil {
 		t.Fatalf("MediaPart: %v", err)
 	}
@@ -147,7 +147,7 @@ func TestAMessageNothingWasKeptForIsNotAnError(t *testing.T) {
 	t.Parallel()
 	container := open(t)
 
-	part, found, err := container.MediaPart(t.Context(), "sid-1", "3EB0NEVER")
+	part, found, err := container.For("sid-1").MediaPart(t.Context(), "3EB0NEVER")
 	if err != nil {
 		t.Fatalf("MediaPart: %v", err)
 	}
@@ -165,10 +165,10 @@ func TestWhatOutlivedItsRetentionIsSweptAndTheRestIsLeft(t *testing.T) {
 
 	old := samplePart("sid-1", "3EB0OLD")
 	fresh := samplePart("sid-1", "3EB0FRESH")
-	if err := container.PutMediaPart(t.Context(), &old, storedAt.Add(-8*24*time.Hour)); err != nil {
+	if err := container.For(old.SID).PutMediaPart(t.Context(), &old, storedAt.Add(-8*24*time.Hour)); err != nil {
 		t.Fatalf("PutMediaPart: %v", err)
 	}
-	if err := container.PutMediaPart(t.Context(), &fresh, storedAt.Add(-time.Hour)); err != nil {
+	if err := container.For(fresh.SID).PutMediaPart(t.Context(), &fresh, storedAt.Add(-time.Hour)); err != nil {
 		t.Fatalf("PutMediaPart: %v", err)
 	}
 
@@ -179,10 +179,10 @@ func TestWhatOutlivedItsRetentionIsSweptAndTheRestIsLeft(t *testing.T) {
 	if dropped != 1 {
 		t.Fatalf("the sweep dropped %d rows, want only the one past its retention", dropped)
 	}
-	if _, found, _ := container.MediaPart(t.Context(), "sid-1", "3EB0OLD"); found {
+	if _, found, _ := container.For("sid-1").MediaPart(t.Context(), "3EB0OLD"); found {
 		t.Fatal("a row past its retention survived the sweep")
 	}
-	if _, found, _ := container.MediaPart(t.Context(), "sid-1", "3EB0FRESH"); !found {
+	if _, found, _ := container.For("sid-1").MediaPart(t.Context(), "3EB0FRESH"); !found {
 		t.Fatal("the sweep took a row that was still within its retention")
 	}
 }
@@ -198,18 +198,18 @@ func TestForgettingASessionTakesWhatWasKeptToFetchItsFiles(t *testing.T) {
 	pair(t, container, "sid-2", "5511999990002")
 	for _, sid := range []string{"sid-1", "sid-2"} {
 		part := samplePart(sid, "3EB0KEEP")
-		if err := container.PutMediaPart(t.Context(), &part, storedAt); err != nil {
+		if err := container.For(part.SID).PutMediaPart(t.Context(), &part, storedAt); err != nil {
 			t.Fatalf("PutMediaPart: %v", err)
 		}
 	}
 
-	if err := container.Forget(t.Context(), "sid-1"); err != nil {
+	if err := container.For("sid-1").Forget(t.Context()); err != nil {
 		t.Fatalf("Forget: %v", err)
 	}
-	if _, found, _ := container.MediaPart(t.Context(), "sid-1", "3EB0KEEP"); found {
+	if _, found, _ := container.For("sid-1").MediaPart(t.Context(), "3EB0KEEP"); found {
 		t.Fatal("unpairing left the keys to the session's files behind")
 	}
-	if _, found, _ := container.MediaPart(t.Context(), "sid-2", "3EB0KEEP"); !found {
+	if _, found, _ := container.For("sid-2").MediaPart(t.Context(), "3EB0KEEP"); !found {
 		t.Fatal("unpairing one session took another session's keys with it")
 	}
 }
@@ -224,18 +224,18 @@ func TestAWriteThatOutlivesTheSessionItBelongsToIsRefused(t *testing.T) {
 	pair(t, container, "sid-1", "5511999990001")
 
 	part := samplePart("sid-1", "3EB0LATE")
-	if err := container.PutMediaPart(t.Context(), &part, storedAt); err != nil {
+	if err := container.For(part.SID).PutMediaPart(t.Context(), &part, storedAt); err != nil {
 		t.Fatalf("PutMediaPart: %v", err)
 	}
-	if err := container.Forget(t.Context(), "sid-1"); err != nil {
+	if err := container.For("sid-1").Forget(t.Context()); err != nil {
 		t.Fatalf("Forget: %v", err)
 	}
 
 	later := samplePart("sid-1", "3EB0LATE")
-	if err := container.PutMediaPart(t.Context(), &later, storedAt.Add(time.Minute)); err == nil {
+	if err := container.For(later.SID).PutMediaPart(t.Context(), &later, storedAt.Add(time.Minute)); err == nil {
 		t.Fatal("a write that arrived after its session was unpaired put the key to a file back")
 	}
-	if _, found, _ := container.MediaPart(t.Context(), "sid-1", "3EB0LATE"); found {
+	if _, found, _ := container.For("sid-1").MediaPart(t.Context(), "3EB0LATE"); found {
 		t.Fatal("a session that no longer exists is holding the key to a file")
 	}
 }
@@ -250,7 +250,7 @@ func TestAPartThatNamesNoMessageIsRefused(t *testing.T) {
 		{SID: "", MessageID: "3EB0X"},
 		{SID: "sid-1", MessageID: ""},
 	} {
-		if err := container.PutMediaPart(t.Context(), &part, storedAt); err == nil {
+		if err := container.For(part.SID).PutMediaPart(t.Context(), &part, storedAt); err == nil {
 			t.Fatalf("a part with sid %q and message %q was written", part.SID, part.MessageID)
 		}
 	}

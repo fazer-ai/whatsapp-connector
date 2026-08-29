@@ -117,7 +117,7 @@ func TestNothingIsKeptForAMessageWhoseFileWasNeverFetched(t *testing.T) {
 	if _, acknowledged := deliver(t, session, imageEvent("3EB0GONE"), 2); !acknowledged {
 		t.Fatal("a message whose file is gone for good was left to be redelivered forever")
 	}
-	if _, found, err := session.store.MediaPart(t.Context(), session.sid, "3EB0GONE"); err != nil || found {
+	if _, found, err := session.store.MediaPart(t.Context(), "3EB0GONE"); err != nil || found {
 		t.Fatalf("a message whose file never arrived was kept anyway (found=%v, err=%v)", found, err)
 	}
 }
@@ -177,7 +177,7 @@ func TestARefetchGoesOutWithTheCoordinatesTheMessageCarried(t *testing.T) {
 		t.Fatal("a document with a file was left unacknowledged")
 	}
 
-	kept, found, err := session.store.MediaPart(t.Context(), session.sid, "3EB0DOC")
+	kept, found, err := session.store.MediaPart(t.Context(), "3EB0DOC")
 	if err != nil || !found {
 		t.Fatalf("a document that was downloaded was not kept (found=%v, err=%v)", found, err)
 	}
@@ -208,7 +208,7 @@ func TestTheLengthKeptIsTheOneThatWasWrittenAndNotTheOneTheSenderClaimed(t *test
 		t.Fatal("an image with a file was left unacknowledged")
 	}
 
-	kept, found, err := session.store.MediaPart(t.Context(), session.sid, "3EB0LIED")
+	kept, found, err := session.store.MediaPart(t.Context(), "3EB0LIED")
 	if err != nil || !found {
 		t.Fatalf("an image that was downloaded was not kept (found=%v, err=%v)", found, err)
 	}
@@ -289,7 +289,7 @@ func TestTheChatAFileIsFiledUnderIsTheOneItsMessageWasPublishedUnder(t *testing.
 		t.Fatalf("Unmarshal: %v", err)
 	}
 
-	kept, found, err := session.store.MediaPart(t.Context(), session.sid, "3EB0FILED")
+	kept, found, err := session.store.MediaPart(t.Context(), "3EB0FILED")
 	if err != nil || !found {
 		t.Fatalf("a message that was downloaded was not kept (found=%v, err=%v)", found, err)
 	}

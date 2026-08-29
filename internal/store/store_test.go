@@ -34,7 +34,7 @@ func TestDeviceIsFreshUntilSomethingIsBound(t *testing.T) {
 	t.Parallel()
 	container := open(t)
 
-	device, err := container.Device(t.Context(), "sid-1", &store.Fence{})
+	device, err := container.For("sid-1").Device(t.Context())
 	if err != nil {
 		t.Fatalf("Device: %v", err)
 	}
@@ -53,7 +53,7 @@ func TestDeviceResumesWhatWasBound(t *testing.T) {
 
 	jid := pair(t, container, "sid-1", "5511999990001")
 
-	device, err := container.Device(ctx, "sid-1", &store.Fence{})
+	device, err := container.For("sid-1").Device(ctx)
 	if err != nil {
 		t.Fatalf("Device: %v", err)
 	}
@@ -62,7 +62,7 @@ func TestDeviceResumesWhatWasBound(t *testing.T) {
 	}
 
 	// A different session must not be handed the same credentials.
-	other, err := container.Device(ctx, "sid-2", &store.Fence{})
+	other, err := container.For("sid-2").Device(ctx)
 	if err != nil {
 		t.Fatalf("Device: %v", err)
 	}
@@ -77,14 +77,14 @@ func TestBindMovesADeviceOffItsPreviousSession(t *testing.T) {
 	ctx := t.Context()
 
 	jid := pair(t, container, "sid-old", "5511999990001")
-	if err := container.Bind(ctx, "sid-new", jid); err != nil {
+	if err := container.For("sid-new").Bind(ctx, jid); err != nil {
 		t.Fatalf("Bind: %v", err)
 	}
 
-	if _, bound, err := container.JID(ctx, "sid-old"); err != nil || bound {
+	if _, bound, err := container.For("sid-old").JID(ctx); err != nil || bound {
 		t.Fatalf("the old session is still bound (bound=%v, err=%v)", bound, err)
 	}
-	bound, ok, err := container.JID(ctx, "sid-new")
+	bound, ok, err := container.For("sid-new").JID(ctx)
 	if err != nil || !ok || bound.User != jid.User {
 		t.Fatalf("the new session holds %v (ok=%v, err=%v)", bound, ok, err)
 	}
@@ -101,18 +101,18 @@ func TestDeviceForgetsAMappingWhoseDeviceIsGone(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseJID: %v", err)
 	}
-	if err := container.Bind(ctx, "sid-1", jid); err != nil {
+	if err := container.For("sid-1").Bind(ctx, jid); err != nil {
 		t.Fatalf("Bind: %v", err)
 	}
 
-	device, err := container.Device(ctx, "sid-1", &store.Fence{})
+	device, err := container.For("sid-1").Device(ctx)
 	if err != nil {
 		t.Fatalf("Device: %v", err)
 	}
 	if device.ID != nil {
 		t.Fatalf("resumed %s from a device that is not stored", device.ID)
 	}
-	if _, bound, err := container.JID(ctx, "sid-1"); err != nil || bound {
+	if _, bound, err := container.For("sid-1").JID(ctx); err != nil || bound {
 		t.Fatalf("the dangling mapping survived (bound=%v, err=%v)", bound, err)
 	}
 }
@@ -123,11 +123,11 @@ func TestForgetRemovesTheDeviceAndTheMapping(t *testing.T) {
 	ctx := t.Context()
 
 	jid := pair(t, container, "sid-1", "5511999990001")
-	if err := container.Forget(ctx, "sid-1"); err != nil {
+	if err := container.For("sid-1").Forget(ctx); err != nil {
 		t.Fatalf("Forget: %v", err)
 	}
 
-	if _, bound, err := container.JID(ctx, "sid-1"); err != nil || bound {
+	if _, bound, err := container.For("sid-1").JID(ctx); err != nil || bound {
 		t.Fatalf("the mapping survived a logout (bound=%v, err=%v)", bound, err)
 	}
 	stored, err := container.Devices().GetDevice(ctx, jid)
@@ -140,7 +140,7 @@ func TestForgetRemovesTheDeviceAndTheMapping(t *testing.T) {
 
 	// Forgetting a session that never paired is what a delete on an unpaired inbox
 	// does, and it is not an error.
-	if err := container.Forget(ctx, "sid-never"); err != nil {
+	if err := container.For("sid-never").Forget(ctx); err != nil {
 		t.Fatalf("Forget on an unpaired session: %v", err)
 	}
 }
@@ -153,10 +153,10 @@ func TestBindRefusesAnIncompleteCall(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseJID: %v", err)
 	}
-	if err := container.Bind(t.Context(), "", jid); err == nil {
+	if err := container.For("").Bind(t.Context(), jid); err == nil {
 		t.Fatal("bound a device to no session")
 	}
-	if err := container.Bind(t.Context(), "sid-1", types.EmptyJID); err == nil {
+	if err := container.For("sid-1").Bind(t.Context(), types.EmptyJID); err == nil {
 		t.Fatal("bound a session to no device")
 	}
 }
@@ -203,7 +203,7 @@ func pair(t *testing.T, container *store.Container, sid, phone string) types.JID
 	if err := container.Devices().PutDevice(ctx, device); err != nil {
 		t.Fatalf("PutDevice: %v", err)
 	}
-	if err := container.Bind(ctx, sid, jid); err != nil {
+	if err := container.For(sid).Bind(ctx, jid); err != nil {
 		t.Fatalf("Bind: %v", err)
 	}
 	return jid
@@ -223,7 +223,7 @@ func TestDeviceResumesACompanionDeviceJID(t *testing.T) {
 		t.Fatalf("the test paired %s, which carries no device part", jid)
 	}
 
-	device, err := container.Device(ctx, "sid-1", &store.Fence{})
+	device, err := container.For("sid-1").Device(ctx)
 	if err != nil {
 		t.Fatalf("Device: %v", err)
 	}
@@ -249,7 +249,7 @@ func TestBindDeletesTheDeviceItDisplaces(t *testing.T) {
 		t.Fatal("the test paired the same device twice")
 	}
 
-	if _, bound, err := container.JID(ctx, "sid-old"); err != nil || bound {
+	if _, bound, err := container.For("sid-old").JID(ctx); err != nil || bound {
 		t.Fatalf("the displaced session is still bound (bound=%v, err=%v)", bound, err)
 	}
 	stored, err := container.Devices().GetDevice(ctx, old)
@@ -320,11 +320,11 @@ func TestConcurrentWritersDoNotCollide(t *testing.T) {
 					failures <- fmt.Errorf("PutDevice: %w", err)
 					return
 				}
-				if err := container.Bind(ctx, fmt.Sprintf("sid-%d", writer), jid); err != nil {
+				if err := container.For(fmt.Sprintf("sid-%d", writer)).Bind(ctx, jid); err != nil {
 					failures <- fmt.Errorf("Bind: %w", err)
 					return
 				}
-				if _, _, err := container.JID(ctx, fmt.Sprintf("sid-%d", writer)); err != nil {
+				if _, _, err := container.For(fmt.Sprintf("sid-%d", writer)).JID(ctx); err != nil {
 					failures <- fmt.Errorf("JID: %w", err)
 					return
 				}
@@ -366,7 +366,7 @@ func TestOneAccountKeepsOneMappingUnderConcurrentPairings(t *testing.T) {
 			}
 			// A pairing that loses the race is a pairing refused, which is a correct
 			// outcome; a pairing that wins and leaves a second mapping behind is not.
-			if err := container.Bind(ctx, fmt.Sprintf("sid-%d", i), jid); err != nil {
+			if err := container.For(fmt.Sprintf("sid-%d", i)).Bind(ctx, jid); err != nil {
 				failures <- err
 			}
 		}()
@@ -376,7 +376,7 @@ func TestOneAccountKeepsOneMappingUnderConcurrentPairings(t *testing.T) {
 
 	var bound int
 	for i := range pairings {
-		if _, ok, err := container.JID(ctx, fmt.Sprintf("sid-%d", i)); err != nil {
+		if _, ok, err := container.For(fmt.Sprintf("sid-%d", i)).JID(ctx); err != nil {
 			t.Fatalf("JID: %v", err)
 		} else if ok {
 			bound++
@@ -531,10 +531,10 @@ func TestAnUpgradeKeepsTheMappingThatStillHasItsCredentials(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = upgraded.Close() })
 
-	if _, bound, err := upgraded.JID(t.Context(), "sid-halfway"); err != nil || bound {
+	if _, bound, err := upgraded.For("sid-halfway").JID(t.Context()); err != nil || bound {
 		t.Fatalf("the mapping with no device behind it survived (bound=%v, err=%v)", bound, err)
 	}
-	if jid, bound, err := upgraded.JID(t.Context(), "sid-paired"); err != nil || !bound || jid != paired {
+	if jid, bound, err := upgraded.For("sid-paired").JID(t.Context()); err != nil || !bound || jid != paired {
 		t.Fatalf("the paired mapping is gone (jid=%v, bound=%v, err=%v)", jid, bound, err)
 	}
 
@@ -545,7 +545,7 @@ func TestAnUpgradeKeepsTheMappingThatStillHasItsCredentials(t *testing.T) {
 	} else if stored == nil {
 		t.Fatal("the upgrade deleted the only device the account had")
 	}
-	resumed, err := upgraded.Device(t.Context(), "sid-paired", &store.Fence{})
+	resumed, err := upgraded.For("sid-paired").Device(t.Context())
 	if err != nil {
 		t.Fatalf("Device: %v", err)
 	}
@@ -616,10 +616,10 @@ func TestAnOlderStoreGainsTheAccountConstraint(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = upgraded.Close() })
 
-	if _, bound, err := upgraded.JID(t.Context(), "sid-old"); err != nil || bound {
+	if _, bound, err := upgraded.For("sid-old").JID(t.Context()); err != nil || bound {
 		t.Fatalf("the older of two mappings survived (bound=%v, err=%v)", bound, err)
 	}
-	if _, bound, err := upgraded.JID(t.Context(), "sid-newer"); err != nil || !bound {
+	if _, bound, err := upgraded.For("sid-newer").JID(t.Context()); err != nil || !bound {
 		t.Fatalf("the mapping that should have been kept is gone (bound=%v, err=%v)", bound, err)
 	}
 
