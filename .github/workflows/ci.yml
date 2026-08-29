@@ -65,7 +65,7 @@ jobs:
 
       # Built, not pushed: the point is that a change cannot break the release build
       # without CI saying so on the pull request that made it.
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         with:
           context: .
           push: false
