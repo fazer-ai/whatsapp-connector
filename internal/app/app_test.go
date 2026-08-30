@@ -328,36 +328,33 @@ func TestAWakeLeftPendingIsPickedUpAgain(t *testing.T) {
 }
 
 // Fitting inside the lease is not enough on its own. Reading, dispatching and renewing
-// are one goroutine, so the renewal that follows a read comes a heartbeat, plus however
-// long that read waited on Redis, plus however long its batch took, after the one before
-// it. Longer than the lease and every session on the instance is acquired by a peer while
-// this one still holds their sockets open, which is the one thing the lease exists to
-// prevent — and a read landing just before a tick is an ordinary minute, not a corner.
-func TestAHeartbeatHasToLeaveRoomForTheReadAndBatchBeforeIt(t *testing.T) {
+// are one goroutine, but everything outside the heartbeat branch is cut when the next
+// renewal is due, so it cannot push a renewal by more than one period however many
+// steps it is made of. What sits outside that deadline is the branch's own tail: the
+// hand-backs, with their share of the lease, and a reclaim whose passes divide one
+// heartbeat. One period plus that tail past the lease and every session on the
+// instance is acquired by a peer while this one still holds their sockets open, which
+// is the one thing the lease exists to prevent.
+func TestAHeartbeatAndTheHandBackTailHaveToFitInsideTheLease(t *testing.T) {
 	t.Setenv("WAC_LEASE_TTL", "30s")
 	t.Setenv("WAC_CLAIM_MIN_IDLE", "45s")
 
-	// A 30s lease leaves 20s once a batch has had its third, and a heartbeat spends its
-	// own length plus half of it again on the read: 14s is the first that does not fit.
-	// 19s is what a check that counted the batch and forgot the read would have let
-	// through, at roughly 34s between renewals.
-	for _, heartbeat := range []string{"14s", "19s", "25s"} {
+	// A 30s lease keeps 20s beside its 10s hand-back tail, so 20s is the first
+	// heartbeat that does not fit.
+	for _, heartbeat := range []string{"20s", "25s"} {
 		t.Setenv("WAC_HEARTBEAT", heartbeat)
 		if _, err := app.LoadConfig("connector-test"); err == nil {
-			t.Fatalf("a %s heartbeat started against a 30s lease, so a read and its batch can outlive the lease",
-				heartbeat)
+			t.Fatalf("a %s heartbeat started against a 30s lease, so the tick that renews a lease "+
+				"can come after it has expired", heartbeat)
 		}
 	}
 
-	t.Setenv("WAC_HEARTBEAT", "13s")
+	// And 19s starts: the bound is one period plus the tail, not an enumeration of the
+	// loop's steps, which is exactly what a check that billed the read and the batch to
+	// the gap on top of the period used to refuse.
+	t.Setenv("WAC_HEARTBEAT", "19s")
 	if _, err := app.LoadConfig("connector-test"); err != nil {
 		t.Fatalf("LoadConfig: %v", err)
-	}
-
-	// And the read is bounded by the heartbeat rather than fixed, which is what makes the
-	// arithmetic above hold on a deployment that tunes one of them.
-	if block := app.ReadBlock(13 * time.Second); block >= 13*time.Second {
-		t.Fatalf("a read may wait %s against a 13s heartbeat", block)
 	}
 }
 
@@ -551,10 +548,10 @@ func TestASessionWithALongBacklogIsDrainedBeforeItIsRead(t *testing.T) {
 }
 
 // A non-positive lease is accepted by cluster.NewLeases, which substitutes its own
-// default, so the leases go on working while everything derived from the configured
-// value here does not: the dispatch budget is a third of it, and a zero budget is a
-// context that has already expired, so every command read is released again unrun. An
-// instance that takes work, does none of it, and reports itself healthy.
+// default, so the leases would go on working while every timing rule is checked
+// against a value the cluster never uses. Each of these has to be refused by name,
+// at startup, rather than surface as an arithmetic complaint about a duration that
+// runs backwards.
 func TestATimingThatCannotWorkIsRefusedAtStartup(t *testing.T) {
 	for name, env := range map[string]map[string]string{
 		"a lease of no length": {

@@ -15,6 +15,7 @@ import (
 
 	"github.com/fazer-ai/whatsapp-connector/internal/cluster"
 	"github.com/fazer-ai/whatsapp-connector/internal/engine/fake"
+	"github.com/fazer-ai/whatsapp-connector/internal/observability"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 	"github.com/fazer-ai/whatsapp-connector/internal/redisx"
 	"github.com/fazer-ai/whatsapp-connector/internal/session"
@@ -28,31 +29,11 @@ func (quietReplier) Reply(context.Context, string, protocol.Reply) error { retur
 
 // Reclaimed deliveries are mostly wakes, and a wake is the one command that blocks: it
 // adopts a session, which reads the store. A batch of them runs on the goroutine that
-// renews every lease this instance holds, so a batch that is not bounded delays those
-// renewals and hands the accounts to peers while this instance still holds their
-// sockets open.
-func TestAReclaimBatchStopsWhenItRunsOutOfBudget(t *testing.T) {
-	t.Parallel()
-
-	connector := &Connector{
-		cfg:     Config{LeaseTTL: time.Nanosecond},
-		log:     zerolog.Nop(),
-		manager: newTestManager(t),
-	}
-
-	acked, released := deliveryBatch(6)
-	connector.dispatchWithin(context.Background(), acked.deliveries)
-
-	if acked.count.Load() != 0 {
-		t.Fatalf("%d commands were carried out past the budget", acked.count.Load())
-	}
-	if released.Load() != 6 {
-		t.Fatalf("%d of 6 undispatched commands were released; the rest are held for good", released.Load())
-	}
-}
-
-// And with room to work, everything in the batch is carried out.
-func TestAReclaimBatchWithRoomCarriesEverythingOut(t *testing.T) {
+// renews every lease this instance holds, so a batch that outlives its window delays
+// those renewals and hands the accounts to peers while this instance still holds their
+// sockets open. The window is the caller's — the tick window, or a reclaim pass — and
+// a batch it cuts off has to let go of the rest, or the entries are held for good.
+func TestABatchStopsWhenItsWindowIsSpent(t *testing.T) {
 	t.Parallel()
 
 	connector := &Connector{
@@ -61,14 +42,39 @@ func TestAReclaimBatchWithRoomCarriesEverythingOut(t *testing.T) {
 		manager: newTestManager(t),
 	}
 
+	spent, cancel := context.WithCancel(context.Background())
+	cancel()
 	acked, released := deliveryBatch(6)
-	connector.dispatchWithin(context.Background(), acked.deliveries)
+	connector.dispatchWithin(spent, acked.deliveries)
+
+	if acked.count.Load() != 0 {
+		t.Fatalf("%d commands were carried out past the window", acked.count.Load())
+	}
+	if released.Load() != 6 {
+		t.Fatalf("%d of 6 undispatched commands were released; the rest are held for good", released.Load())
+	}
+}
+
+// And with room to work, everything in the batch is carried out.
+func TestABatchWithRoomCarriesEverythingOut(t *testing.T) {
+	t.Parallel()
+
+	connector := &Connector{
+		cfg:     Config{LeaseTTL: time.Minute},
+		log:     zerolog.Nop(),
+		manager: newTestManager(t),
+	}
+
+	window, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	acked, released := deliveryBatch(6)
+	connector.dispatchWithin(window, acked.deliveries)
 
 	if acked.count.Load() != 6 {
 		t.Fatalf("%d of 6 commands were carried out", acked.count.Load())
 	}
 	if released.Load() != 0 {
-		t.Fatalf("%d commands were released despite the budget being ample", released.Load())
+		t.Fatalf("%d commands were released despite the window being ample", released.Load())
 	}
 }
 
@@ -163,17 +169,17 @@ func deliveryBatch(n int) (*batch, *atomic.Int64) {
 	return b, released
 }
 
-// The drain claims and then dispatches, and the two share one deadline. Handing dispatch
-// the loop's context instead opens a fresh budget on top of whatever the claim spent, so a
-// drain that has already spent most of its time goes on holding the goroutine that renews
-// every lease this instance holds for a budget more, and for another on the pass after
-// that.
-func TestADrainDispatchesOnWhatIsLeftOfItsOwnDeadline(t *testing.T) {
+// The drain claims and then dispatches, and the two share the window the loop handed
+// it. Opening a budget of its own for the dispatch would stack a fresh deadline on top
+// of whatever the claim spent, so a drain that has already spent most of its window
+// would go on holding the goroutine that renews every lease this instance holds for a
+// budget more, and for another on the pass after that.
+func TestADrainDispatchesOnWhatIsLeftOfItsWindow(t *testing.T) {
 	t.Parallel()
 
-	// A short lease keeps the test quick; what it is measuring is the deadline dispatch
-	// is handed, not how long anything takes.
-	const leaseTTL = 600 * time.Millisecond
+	// A short window keeps the test quick; what it is measuring is the deadline
+	// dispatch is handed, not how long anything takes.
+	const window = 600 * time.Millisecond
 	const slowClaim = 150 * time.Millisecond
 
 	server := miniredis.RunT(t)
@@ -203,7 +209,7 @@ func TestADrainDispatchesOnWhatIsLeftOfItsOwnDeadline(t *testing.T) {
 	t.Cleanup(func() { manager.StopAll(ctx) })
 
 	connector := &Connector{
-		cfg: Config{LeaseTTL: leaseTTL}, log: zerolog.Nop(),
+		cfg: Config{LeaseTTL: 30 * time.Second}, log: zerolog.Nop(),
 		manager: manager, streams: streams,
 	}
 
@@ -220,8 +226,8 @@ func TestADrainDispatchesOnWhatIsLeftOfItsOwnDeadline(t *testing.T) {
 		t.Fatalf("Adopt: %v", err)
 	}
 
-	// The claim spends most of the drain's deadline, which is the case that tells the two
-	// contexts apart: what is left of the pass, or a whole budget over again.
+	// The claim spends most of the drain's window, which is the case that tells the two
+	// contexts apart: what is left of the window, or a fresh deadline over again.
 	var once sync.Once
 	rdb.AddHook(slowClaims{on: func(cmd redis.Cmder) bool {
 		slow := false
@@ -231,15 +237,102 @@ func TestADrainDispatchesOnWhatIsLeftOfItsOwnDeadline(t *testing.T) {
 		return slow
 	}, delay: slowClaim})
 
-	connector.drainAdopted(ctx)
+	bounded, cancel := context.WithTimeout(ctx, window)
+	defer cancel()
+	connector.drainAdopted(bounded)
 
 	left, ok := dispatched.left()
 	if !ok {
 		t.Fatal("nothing was dispatched, so there is no deadline to look at")
 	}
-	if left > leaseTTL/3-slowClaim/2 {
-		t.Fatalf("dispatch was given %s, which is a fresh budget rather than what was left of the drain's %s",
-			left, leaseTTL/3)
+	if left > window-slowClaim/2 {
+		t.Fatalf("dispatch was given %s, which is a fresh deadline rather than what was left of the drain's %s",
+			left, window)
+	}
+}
+
+// The window the loop hands its optional work is when the next renewal is due, and
+// nothing else. It used to be a budget summed from per-step constants, and the sum came
+// out wrong three times running (#7): a drain given a third of the lease, on the
+// goroutine that renews every lease this instance holds, is ten seconds of renewals not
+// happening on the default timing. The deadline the dispatch is answered under says
+// which of the two the loop granted.
+func TestTheLoopBoundsItsOptionalWorkByTheTick(t *testing.T) {
+	t.Parallel()
+
+	const heartbeat = 200 * time.Millisecond
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+
+	newStreams := func(instance string) *redisstream.Streams {
+		streams, err := redisstream.New(client, redisstream.Options{
+			Instance: instance, Block: 50 * time.Millisecond, ClaimMinIdle: time.Second,
+		})
+		if err != nil {
+			t.Fatalf("redisstream.New: %v", err)
+		}
+		return streams
+	}
+	streams := newStreams("inst-a")
+	dead := newStreams("inst-dead")
+	dispatched := &deadlineReplier{}
+	manager := session.NewManager(&session.ManagerConfig{
+		Instance: "inst-a", Engine: fake.New(),
+		Leases:    cluster.NewLeases(client, "inst-a", cluster.Options{}),
+		Publisher: quietPublisher{}, Replier: dispatched,
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	t.Cleanup(func() { manager.StopAll(context.Background()) })
+
+	connector := &Connector{
+		// A lease far longer than the heartbeat, which is what tells the two grants
+		// apart: a third of it is seconds, a tick window is milliseconds.
+		cfg:      Config{LeaseTTL: 30 * time.Second, Heartbeat: heartbeat},
+		log:      zerolog.Nop(),
+		metrics:  observability.New(),
+		registry: cluster.NewRegistry(client, 3*heartbeat),
+		manager:  manager,
+		streams:  streams,
+	}
+
+	// A command the previous owner left pending, adopted before the loop starts: the
+	// first thing the loop's first iteration does is drain it, on whatever deadline the
+	// loop grants, and the tick cannot have fired by then.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if _, err := dead.Read(ctx, []string{"s1"}); err != nil {
+		t.Fatalf("priming Read: %v", err)
+	}
+	writePing(t, client, "s1")
+	if taken, err := dead.Read(ctx, []string{"s1"}); err != nil || len(taken) != 1 {
+		t.Fatalf("the previous owner read %d commands (err=%v), want 1", len(taken), err)
+	}
+	if _, err := manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+
+	done := make(chan struct{})
+	go func() { defer close(done); _ = connector.loop(ctx, make(chan error)) }()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, ok := dispatched.left(); ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the pending command was never dispatched")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	<-done
+
+	if left, _ := dispatched.left(); left > heartbeat {
+		t.Fatalf("the drain dispatched on %s against a %s heartbeat: the loop granted more than the period",
+			left, heartbeat)
 	}
 }
 
