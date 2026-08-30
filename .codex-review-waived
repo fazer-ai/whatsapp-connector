@@ -301,7 +301,3 @@ internal/session/session.go: Backpressure reclaimed commands instead of enlargin
 # that raised it, and a waiver matches on the title it was written for.
 internal/engine/whatsmeow/session.go: Clear the file before each fallback media host  # PR#61 -> #63
 internal/engine/whatsmeow/session.go: Reset the destination before trying another media host  # PR#65 → #63
-# Inherited from main by rebase: the uninterruptible measuring scan is #68, the cap on
-# the wire format is #69, both in the streaming receive.
-internal/media/store.go: Honor cancellation while measuring the received blob  # PR#65 → #68
-internal/media/store.go: Allow encryption overhead before enforcing the blob limit  # PR#65 → #69
