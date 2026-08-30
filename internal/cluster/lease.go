@@ -173,13 +173,87 @@ func (l *Leases) Renew(ctx context.Context, sid string) error {
 	if err != nil {
 		return fmt.Errorf("cluster: renew %s: %w", sid, err)
 	}
+	return l.applyRenew(sid, ok)
+}
+
+// RenewMany renews every session named in one round trip, and answers for each of them
+// the way Renew would.
+//
+// One round trip and not one per session, because this runs on the goroutine that also
+// reads commands, and its budget is written in fixed durations: a heartbeat, a share of
+// a lease. A renewal per session puts a term proportional to how many sessions this
+// instance holds inside a bound that names none of them, so an instance carrying a few
+// hundred takes longer to renew than the arithmetic allows, and the sessions at the end
+// of the list are the ones handed to a peer while this instance still holds their
+// sockets. Pipelined, the pass costs what one renewal costs plus the bytes, whatever
+// the count.
+//
+// The per-command errors are what is read, not the one Pipelined returns: it reports
+// the first failure, and a lease lost by one session says nothing about the next.
+func (l *Leases) RenewMany(ctx context.Context, sids []string) map[string]error {
+	out := make(map[string]error, len(sids))
+	if len(sids) == 0 {
+		return out
+	}
+	renew := func(sids []string, send func(redis.Pipeliner, string) *redis.Cmd) []*redis.Cmd {
+		cmds := make([]*redis.Cmd, len(sids))
+		_, _ = l.client.Pipelined(ctx, func(pipe redis.Pipeliner) error {
+			for i, sid := range sids {
+				cmds[i] = send(pipe, sid)
+			}
+			return nil
+		})
+		return cmds
+	}
+	keys := l.client.Keys()
+	byDigest := func(pipe redis.Pipeliner, sid string) *redis.Cmd {
+		return renewScript.EvalSha(ctx, pipe, []string{keys.Lease(sid)}, l.instance, l.ttl.Milliseconds())
+	}
+	byBody := func(pipe redis.Pipeliner, sid string) *redis.Cmd {
+		return renewScript.Eval(ctx, pipe, []string{keys.Lease(sid)}, l.instance, l.ttl.Milliseconds())
+	}
+
+	// The digest first, which is what Run would send, and the body only for what comes
+	// back unloaded. Run's own fallback cannot help inside a pipeline -- it decides on
+	// an error the command does not carry until the whole batch has been sent -- and
+	// falling back one session at a time would spend, on the first pass after a restart
+	// or a SCRIPT FLUSH, exactly the round trip per session this exists to avoid.
+	cmds := renew(sids, byDigest)
+	var unloaded []string
+	for i, sid := range sids {
+		ok, err := cmds[i].Int()
+		if redis.HasErrorPrefix(err, "NOSCRIPT") {
+			unloaded = append(unloaded, sid)
+			continue
+		}
+		out[sid] = l.answerRenew(sid, ok, err)
+	}
+	if len(unloaded) > 0 {
+		retried := renew(unloaded, byBody)
+		for i, sid := range unloaded {
+			ok, err := retried[i].Int()
+			out[sid] = l.answerRenew(sid, ok, err)
+		}
+	}
+	return out
+}
+
+// answerRenew turns one command's outcome into the answer Renew gives for that session.
+func (l *Leases) answerRenew(sid string, ok int, err error) error {
+	if err != nil {
+		return fmt.Errorf("cluster: renew %s: %w", sid, err)
+	}
+	return l.applyRenew(sid, ok)
+}
+
+// applyRenew turns the script's answer into this instance's own record of the lease.
+func (l *Leases) applyRenew(sid string, ok int) error {
 	if ok != 1 {
 		l.forget(sid)
 		return ErrNotOwner
 	}
-
 	l.mu.Lock()
-	if entry, ok := l.held[sid]; ok {
+	if entry, held := l.held[sid]; held {
 		entry.renewedAt = l.clock.Now()
 		l.held[sid] = entry
 	}

@@ -206,7 +206,7 @@ func LoadConfig(hostname string) (Config, error) {
 	if cfg.Heartbeat+cfg.LeaseTTL/session.ReleaseShare >= cfg.LeaseTTL-2*cluster.DefaultRenewMargin {
 		// Fitting inside the TTL is not enough on its own. Reading, dispatching and
 		// renewing are one goroutine, so everything between two renewals delays the
-		// second — but everything outside the heartbeat branch is cut when the next
+		// second -- but everything outside the heartbeat branch is cut when the next
 		// renewal is due, so however many steps that work grows, it cannot push the
 		// renewal by more than one period. What can is the branch's own tail: the
 		// hand-backs, which get their share of the lease, and a reclaim whose passes
@@ -214,18 +214,23 @@ func LoadConfig(hostname string) (Config, error) {
 		//
 		// Against the lease's fresh lifetime, and with the margin held back over
 		// again. A lease answers "do I still own this" no from a margin before it
-		// expires, so the lifetime the bounded work may spend ends there — and the
-		// unbounded work between two renewals (the renewals' own round trips, one per
-		// session, and the announcement) needs room of its own, which is exactly what
-		// the margin was sized to be: a pause plus a round trip. A bound allowed to
-		// press against the cutoff leaves that work no room at all, and the cost is an
-		// instance whose sessions drop their own events, and whose key a peer can take
-		// on a modest Redis delay, while this one goes on holding their sockets open —
-		// the one thing the lease exists to prevent.
+		// expires, so the lifetime the bounded work may spend ends there -- and the
+		// unbounded work between two renewals (the renewal round trip and the
+		// announcement) needs room of its own, which is exactly what the margin was
+		// sized to be: a pause plus a round trip. A bound allowed to press against the
+		// cutoff leaves that work no room at all, and the cost is an instance whose
+		// sessions drop their own events, and whose key a peer can take on a modest
+		// Redis delay, while this one goes on holding their sockets open -- the one
+		// thing the lease exists to prevent.
+		//
+		// That the unbounded half is a fixed number of round trips rather than one per
+		// session is what makes a rule written in constants able to hold: the renewals
+		// go out in one pipelined batch (cluster.RenewMany), so nothing here is
+		// proportional to how many sessions the instance carries.
 		//
 		// Derived from the bounds that actually sit outside the tick, not summed from
-		// the loop's steps. The sum was wrong three times running — each rewrite
-		// remembered the parcels somebody could name and forgot one nobody did — and a
+		// the loop's steps. The sum was wrong three times running -- each rewrite
+		// remembered the parcels somebody could name and forgot one nobody did -- and a
 		// forgotten parcel here is not a failed check, it is a lease lost under load.
 		return Config{}, fmt.Errorf(
 			"app: WAC_HEARTBEAT (%s) plus the lease hand-back tail (%s) must be shorter than "+

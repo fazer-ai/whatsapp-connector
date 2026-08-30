@@ -484,9 +484,17 @@ func (m *Manager) RenewAll(ctx context.Context) {
 	// them is a session a peer takes while this instance still holds its socket open:
 	// the cost of a hand-back arriving a tick late is one session unowned for a few
 	// seconds, the cost of a renewal that never ran is every session on the instance.
+	//
+	// All of them in one round trip, so what the pass costs does not grow with how many
+	// sessions this instance carries. The tearing down that follows is per session by
+	// nature -- each one stops its own socket -- but it only touches the ones a renewal
+	// refused, which on an ordinary tick is none.
+	sids := m.SIDs()
+	renewals := m.leases.RenewMany(ctx, sids)
+
 	var released []string
-	for _, sid := range m.SIDs() {
-		err := m.leases.Renew(ctx, sid)
+	for _, sid := range sids {
+		err := renewals[sid]
 		if err == nil {
 			continue
 		}

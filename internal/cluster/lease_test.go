@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -270,4 +271,117 @@ func TestOwnedAndRenewAreSafeTogether(t *testing.T) {
 		}
 	}()
 	wg.Wait()
+}
+
+// roundTrips counts what the client actually sends: one per command run on its own, and
+// one per pipeline however many commands it carries.
+type roundTrips struct{ n atomic.Int64 }
+
+func (*roundTrips) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (r *roundTrips) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		r.n.Add(1)
+		return next(ctx, cmd)
+	}
+}
+
+func (r *roundTrips) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return func(ctx context.Context, cmds []redis.Cmder) error {
+		r.n.Add(1)
+		return next(ctx, cmds)
+	}
+}
+
+// The renew pass runs on the goroutine that also reads commands, under a budget written
+// in fixed durations. A round trip per session puts a term proportional to the number of
+// sessions inside a bound that names none of them, and the sessions at the end of the
+// list are the ones a peer takes while this instance still holds their sockets.
+func TestRenewManyRenewsEverySessionInOneRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	clock := newClock()
+	leases := cluster.NewLeases(redisx.Wrap(rdb, "wa:", 8), "inst-a", cluster.Options{Clock: clock})
+	ctx := context.Background()
+
+	sids := []string{"s1", "s2", "s3", "s4", "s5"}
+	for _, sid := range sids {
+		if _, err := leases.Acquire(ctx, sid); err != nil {
+			t.Fatalf("Acquire %s: %v", sid, err)
+		}
+	}
+
+	// Counted from here, so the acquisitions above are not part of the measurement.
+	var trips roundTrips
+	rdb.AddHook(&trips)
+
+	renew := func(when string) {
+		t.Helper()
+		clock.advance(20 * time.Second)
+		server.FastForward(20 * time.Second)
+		for sid, err := range leases.RenewMany(ctx, sids) {
+			if err != nil {
+				t.Fatalf("RenewMany %s (%s): %v", sid, when, err)
+			}
+		}
+		for _, sid := range sids {
+			if _, owned := leases.Owned(sid); !owned {
+				t.Fatalf("%s is not owned after a renewal that reported success (%s)", sid, when)
+			}
+		}
+	}
+
+	// The first pass finds the script unloaded, which costs one more batch and not one
+	// call per session: a restart or a SCRIPT FLUSH must not turn a tick into N trips.
+	renew("cold")
+	if got := trips.n.Load(); got > 2 {
+		t.Fatalf("the first renewal of %d sessions took %d round trips, want at most 2", len(sids), got)
+	}
+
+	trips.n.Store(0)
+	renew("warm")
+	if got := trips.n.Load(); got != 1 {
+		t.Fatalf("renewing %d sessions took %d round trips, want 1", len(sids), got)
+	}
+}
+
+// One lease lost says nothing about the next, so the answer has to be per session: the
+// pipeline reports the first failure and the caller stops the one session it names.
+func TestRenewManyAnswersForEachSessionOnItsOwn(t *testing.T) {
+	t.Parallel()
+
+	clock := newClock()
+	server, a, b := newFleet(t, clock)
+	ctx := context.Background()
+
+	for _, sid := range []string{"s1", "s2"} {
+		if _, err := a.Acquire(ctx, sid); err != nil {
+			t.Fatalf("a.Acquire %s: %v", sid, err)
+		}
+	}
+	// s1 alone moves: expired, then taken by the peer.
+	server.FastForward(cluster.DefaultTTL + time.Second)
+	if _, err := b.Acquire(ctx, "s1"); err != nil {
+		t.Fatalf("b.Acquire: %v", err)
+	}
+	if _, err := a.Acquire(ctx, "s2"); err != nil {
+		t.Fatalf("a.Acquire s2 again: %v", err)
+	}
+
+	answers := a.RenewMany(ctx, []string{"s1", "s2"})
+	if !errors.Is(answers["s1"], cluster.ErrNotOwner) {
+		t.Errorf("RenewMany s1 = %v, want ErrNotOwner", answers["s1"])
+	}
+	if answers["s2"] != nil {
+		t.Errorf("RenewMany s2 = %v, want nil: losing one lease is not losing the other", answers["s2"])
+	}
+	if _, owned := a.Owned("s1"); owned {
+		t.Error("a still believes it owns the session it was told it lost")
+	}
+	if _, owned := a.Owned("s2"); !owned {
+		t.Error("a dropped a session whose renewal succeeded")
+	}
 }
