@@ -394,6 +394,18 @@ func (m *Manager) wake(ctx context.Context, delivery *transport.Delivery) {
 			return
 		}
 	default:
+		if ctx.Err() != nil {
+			// The caller's window closed under the adoption, which says nothing about
+			// the wake or the session: this instance never had a whole turn to spend.
+			// Released with its age kept, so the next tick's reclaim takes it with a
+			// fresh window — forfeited, it would keep its place lost for a full claim
+			// delay, which is a session nobody runs for that long because the loop
+			// happened to read its wake late in a period.
+			m.log.Warn().Str("sid", sid).
+				Msg("the window closed before a woken session could be adopted; leaving the wake pending")
+			release(delivery)
+			return
+		}
 		// Left unacknowledged on purpose. Every instance reads this stream through one
 		// consumer group, so acknowledging a wake nobody could act on retires it: the
 		// session then stays unowned until a client happens to send another. Whatever

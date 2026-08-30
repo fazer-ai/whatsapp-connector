@@ -251,6 +251,41 @@ func TestADrainDispatchesOnWhatIsLeftOfItsWindow(t *testing.T) {
 	}
 }
 
+// A wake the window closes under is not a turn this instance spent. Forfeited, it
+// loses the age that would have the next tick's reclaim pick it up, and the session it
+// names runs nowhere for a whole claim delay because the loop happened to read the
+// wake late in a period. Released, the age is kept and the next tick retries it.
+func TestAWakeCutByTheWindowIsReleasedWithItsAgeKept(t *testing.T) {
+	t.Parallel()
+
+	manager := newTestManager(t)
+	spent, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	var released, forfeited, acked atomic.Int64
+	delivery := &transport.Delivery{
+		Command: protocol.Command{
+			V: protocol.Version, ID: "wake-late", Type: protocol.CommandSessionWake,
+			SID: "2f1c6f0e-0000-4000-8000-0000000000fe", TS: 1787000000000,
+			Payload: json.RawMessage(`{"desired":"connected"}`),
+		},
+		Ack:     func(context.Context) error { acked.Add(1); return nil },
+		Release: func() { released.Add(1) },
+		Forfeit: func() { forfeited.Add(1) },
+	}
+	manager.Dispatch(spent, delivery)
+
+	if forfeited.Load() != 0 {
+		t.Fatal("a wake cut by the window was forfeited, so its age is gone and the session waits out the claim delay")
+	}
+	if acked.Load() != 0 {
+		t.Fatal("a wake cut by the window was acknowledged, which retires the only wake there was")
+	}
+	if released.Load() != 1 {
+		t.Fatalf("the wake was released %d times, want once with its age kept", released.Load())
+	}
+}
+
 // The window the loop hands its optional work is when the next renewal is due, and
 // nothing else. It used to be a budget summed from per-step constants, and the sum came
 // out wrong three times running (#7): a drain given a third of the lease, on the

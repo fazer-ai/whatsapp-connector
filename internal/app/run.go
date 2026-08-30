@@ -263,10 +263,18 @@ func (c *Connector) loop(ctx context.Context, httpErr <-chan error) error {
 		case <-heartbeat.C:
 			due = c.tick(ctx)
 		default:
-			window, cancel := context.WithDeadline(ctx, due)
-			c.readCommands(window)
-			spent := window.Err() != nil
-			cancel()
+			// Only a read whose block fits the window is started. One cut off by the
+			// deadline mid-block is worse than one skipped: the server may have just
+			// moved a command into this consumer's pending list when the connection
+			// dies, and an entry pending here with no local record of the delivery is
+			// reclaimable by nobody until the full claim delay has passed.
+			spent := time.Until(due) < readBlock(c.cfg.Heartbeat)
+			if !spent {
+				window, cancel := context.WithDeadline(ctx, due)
+				c.readCommands(window)
+				spent = window.Err() != nil
+				cancel()
+			}
 			if !spent || ctx.Err() != nil {
 				continue
 			}
