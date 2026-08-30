@@ -245,20 +245,26 @@ func (s *Session) setPresence(ctx context.Context, command *protocol.Command) (j
 	if err := s.readyToSend(); err != nil {
 		return nil, err
 	}
-	// Held across the write, because the reapplication on the next connection takes the
-	// same lock: without it the two can interleave and leave WhatsApp holding one state
-	// while this session remembers the other.
-	s.availabilityMu.Lock()
-	defer s.availabilityMu.Unlock()
+	// Taken for the write, because the reapplication on the next connection wants the
+	// same right: without it the two can interleave and leave WhatsApp holding one state
+	// while this session remembers the other. Bounded by the command's own deadline, so
+	// a socket that will not take a node answers the client rather than parking the
+	// executor every command behind this one is waiting on.
+	release, err := s.takePresenceWrite(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 
 	if err := s.sendPresence(ctx, s.current(), state); err != nil {
 		s.log.Warn().Err(err).Msg("a presence did not go out")
 		return nil, presenceFailure(err)
 	}
-	// Remembered only once WhatsApp has taken it. A set that failed is the client's to
+	// Remembered before the right is let go, so the reapplication either reads this or
+	// wrote before it. A set that failed is not remembered at all: it is the client's to
 	// try again, and reapplying it on the next connection would put back a state nobody
 	// was ever told this session was in.
-	s.availability = &state
+	s.rememberAvailability(state)
 	return nil, nil
 }
 
@@ -284,16 +290,61 @@ func (s *Session) setPresence(ctx context.Context, command *protocol.Command) (j
 //
 // A failure is logged and left. The next connection reapplies it the same way, and
 // retrying here would be retrying onto a socket the failure says is already going.
+//
+// Bounded, and that is not a nicety. This is the one presence write with no caller
+// behind it to carry a deadline, and whatsmeow bounds a frame write by the socket's own
+// life rather than by the context it is given -- so on a connection that authenticated
+// and then stopped taking bytes, an unbounded write would hold the right to the wire for
+// as long as the process runs, and every `presence.set` after it with the same.
 func (s *Session) reapplyAvailability(ctx context.Context, client *wm.Client) {
+	ctx, cancel := context.WithTimeout(ctx, s.presenceWait)
+	defer cancel()
+
+	release, err := s.takePresenceWrite(ctx)
+	if err != nil {
+		s.log.Warn().Err(err).Msg("a new connection was not told what this account last set itself to")
+		return
+	}
+	defer release()
+
+	state, asked := s.rememberedAvailability()
+	if !asked {
+		return
+	}
+	if err := s.sendPresence(ctx, client, state); err != nil {
+		s.log.Warn().Err(err).Msg("a new connection was not told what this account last set itself to")
+	}
+}
+
+// takePresenceWrite waits for the right to put a presence on the wire, and gives up when
+// the caller's context does. The func it returns hands the right back.
+func (s *Session) takePresenceWrite(ctx context.Context) (func(), error) {
+	select {
+	case s.presenceWrite <- struct{}{}:
+		return func() { <-s.presenceWrite }, nil
+	case <-ctx.Done():
+		return nil, protocol.NewError(protocol.ErrorNotConnected,
+			"the presence before this one is still on its way to WhatsApp")
+	}
+}
+
+// rememberAvailability records what WhatsApp has taken, and rememberedAvailability reads
+// it back. Both hold the lock for the field alone: a presence node is written outside
+// it, so nothing that only wants to know or to forget waits on a socket.
+func (s *Session) rememberAvailability(state waTypes.Presence) {
+	s.availabilityMu.Lock()
+	s.availability = &state
+	s.availabilityMu.Unlock()
+}
+
+func (s *Session) rememberedAvailability() (waTypes.Presence, bool) {
 	s.availabilityMu.Lock()
 	defer s.availabilityMu.Unlock()
 
 	if s.availability == nil {
-		return
+		return "", false
 	}
-	if err := s.sendPresence(ctx, client, *s.availability); err != nil {
-		s.log.Warn().Err(err).Msg("a new connection was not told what this account last set itself to")
-	}
+	return *s.availability, true
 }
 
 // forgetAvailability drops what this session was holding, for a session whose account
