@@ -320,3 +320,11 @@ internal/app/config.go: Reject heartbeats shorter than an adoption turn  # PR#65
 # when a reclaim has drained a stream, which the drain path tracks and the reclaim path
 # does not. Registered as #77 with both candidate shapes.
 internal/app/run.go: Preserve FIFO after releasing a late read  # PR#65 r9 -> #77
+# PR#65: real, and it belongs to the ack coupling that is #62 rather than to the floor.
+# `refuse` writes the reply on the caller's context and acks on a detached timeout, so a
+# window closing mid-reply retires a command whose `rate_limited` never reached anybody.
+# The floor cannot cover it: whether a command will be refused is not knowable before the
+# offer, only the queue knows it is full, and holding session commands back before
+# dispatch is what r9 showed costs per-session order (#77). Recorded on #62, which is
+# where the ack and the answer get coupled.
+internal/app/run.go: Include inline queue-full refusals in the dispatch floor  # PR#65 r10 -> #62

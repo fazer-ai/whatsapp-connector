@@ -194,6 +194,18 @@ func LoadConfig(hostname string) (Config, error) {
 	if cfg.Heartbeat <= 0 {
 		return Config{}, fmt.Errorf("app: WAC_HEARTBEAT must be positive, got %s", cfg.Heartbeat)
 	}
+	if readBlock(cfg.Heartbeat) < time.Millisecond {
+		// A read waits a share of the heartbeat, and Redis takes that wait in whole
+		// milliseconds: under one it cannot be expressed, so every read is skipped as
+		// having no room for its own answer. The instance would tick, renew, announce
+		// and report itself alive while consuming nothing at all -- not a command, not
+		// even a wake, so no session it does not already run would ever start. Refused
+		// by name, because a heartbeat this short is a deployment mistake and not a
+		// timing to degrade under.
+		return Config{}, fmt.Errorf(
+			"app: WAC_HEARTBEAT (%s) leaves a read less than the millisecond Redis can wait for, "+
+				"so no command would ever be read", cfg.Heartbeat)
+	}
 	if cfg.Heartbeat >= cfg.LeaseTTL {
 		// Leases are renewed on the heartbeat and on nothing else, so a heartbeat that
 		// does not fit inside the TTL is one where every lease is already stale when the

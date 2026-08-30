@@ -568,6 +568,12 @@ func TestATimingThatCannotWorkIsRefusedAtStartup(t *testing.T) {
 		"a heartbeat the lease cannot outlast": {
 			"WAC_LEASE_TTL": "30s", "WAC_CLAIM_MIN_IDLE": "45s", "WAC_HEARTBEAT": "30s",
 		},
+		// A read waits a share of the heartbeat and Redis counts that wait in whole
+		// milliseconds. Under one there is nothing to wait, so every read is skipped and
+		// the instance ticks along alive without ever consuming a command or a wake.
+		"a heartbeat that leaves no room to read": {
+			"WAC_LEASE_TTL": "30s", "WAC_CLAIM_MIN_IDLE": "45s", "WAC_HEARTBEAT": "1ms",
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			for key, value := range env {
