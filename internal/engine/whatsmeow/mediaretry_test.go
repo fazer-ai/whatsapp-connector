@@ -2,6 +2,7 @@ package whatsmeow
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -30,6 +31,54 @@ func TestAFileWhatsAppDroppedIsAskedForAgainAndFetchedFromTheNewPath(t *testing.
 	phone.answersWith(reuploaded("/v/fresh-path"))
 
 	ref := refetch(t, session, "3EB0GONE", nil)
+	if ref.Kind != protocol.MediaRefConnectorBlob {
+		t.Fatalf("the refetch answered a %q reference, want the blob it wrote from the new path", ref.Kind)
+	}
+	if phone.asked() != 1 {
+		t.Fatalf("the sender's phone was asked %d times, want once", phone.asked())
+	}
+}
+
+// The case the recovery exists for, end to end. A message that sat in a backlog arrives
+// with its file already gone, so nothing is downloaded and nothing would have been kept:
+// without the coordinates written on the way past, the invitation the failure carries
+// reaches a lookup that finds nothing and answers that the file is unavailable, which is
+// final on the client. Which would make the invitation a dead end for exactly the
+// messages it is addressed to.
+func TestAFileAlreadyGoneWhenItArrivedCanStillBeAskedForAfterwards(t *testing.T) {
+	t.Parallel()
+
+	session, downloads := mediaSession(t, media.Options{})
+	downloads.answer(nil, wm.ErrMediaDownloadFailedWith404)
+	connect(session)
+
+	emissions, acknowledged := deliver(t, session, imageEvent("3EB0BACKLOG"), 2)
+	if !acknowledged {
+		t.Fatal("a message whose file was already gone was left for WhatsApp to redeliver forever")
+	}
+	var failure protocol.MediaDownloadFailure
+	if err := json.Unmarshal(emissions[1].Payload, &failure); err != nil {
+		t.Fatalf("decode the failure: %v", err)
+	}
+	if !failure.Recoverable {
+		t.Fatal("a file WhatsApp dropped was announced as one nothing brings back")
+	}
+
+	// Everything past here is the client taking the invitation up: the old path still
+	// answers 404, the phone answers with a new one, and the only way the bytes arrive is
+	// through coordinates this session kept for a file it never downloaded.
+	phone := &phoneAsked{session: session}
+	session.askReupload = phone.hand
+	session.download = func(_ context.Context, _ *wm.Client, part wm.DownloadableMessage, file media.File) error {
+		if part.GetDirectPath() == directPath {
+			return wm.ErrMediaDownloadFailedWith404
+		}
+		_, err := file.Write([]byte("os bytes que o telefone subiu de novo"))
+		return err
+	}
+	phone.answersWith(reuploaded("/v/fresh-path"))
+
+	ref := refetch(t, session, "3EB0BACKLOG", nil)
 	if ref.Kind != protocol.MediaRefConnectorBlob {
 		t.Fatalf("the refetch answered a %q reference, want the blob it wrote from the new path", ref.Kind)
 	}

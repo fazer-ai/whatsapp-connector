@@ -567,7 +567,8 @@
       "properties": {
         "chat": { "$ref": "#/definitions/address" },
         "message_id": { "$ref": "#/definitions/message_id" },
-        "reason": { "type": "string" }
+        "reason": { "type": "string" },
+        "recoverable": { "type": "boolean" }
       },
       "required": ["message_id", "reason"],
       "additionalProperties": true

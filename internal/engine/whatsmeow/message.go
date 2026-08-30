@@ -98,10 +98,29 @@ func partyOf(info *waTypes.MessageInfo) (*protocol.Party, bool) {
 type body struct {
 	content any
 	context *waE2E.ContextInfo
-	// failure is why this message's file is not coming, empty when there is nothing to
-	// say. It is announced after the message, never instead of it.
-	failure string
+	// missing is what became of this message's file, zero when nothing is wrong with
+	// it. It is announced after the message, never instead of it.
+	missing missingFile
 }
+
+// missingFile is why a message's file did not arrive with it, and whether asking again
+// could still bring it.
+//
+// The two travel together because a client reads them together: the reason explains the
+// bubble to whoever is looking at it, and the flag decides whether anybody asks a second
+// time. Kept in one value so a path that learns the reason cannot forget the flag.
+type missingFile struct {
+	reason string
+	// recoverable is WhatsApp having dropped the file off its CDN while the sender's
+	// phone may still have it. Nothing here asks: the inbound path runs on whatsmeow's
+	// node handler, and waiting on somebody's phone to wake up is not a wait it can
+	// afford. So it is published as an invitation, and `message.download_media` is where
+	// the asking happens, on a deadline the caller brought.
+	recoverable bool
+}
+
+// said reports whether there is anything to announce about the file.
+func (m missingFile) said() bool { return m.reason != "" }
 
 // renderBody turns the message WhatsApp sent into the body the contract carries, and
 // reports whether this build can carry it at all.
@@ -121,24 +140,24 @@ type renderBody func(*waEvents.Message) (body, bool)
 // milestone saying the message is somebody else's to deliver, which upstream turns
 // into a withheld acknowledgement, so WhatsApp keeps it and sends it again.
 //
-// The second return is the failure to announce once the message itself is out, empty
-// for a message with nothing missing.
-func inboundOf(event *waEvents.Message, render renderBody) (protocol.InboundMessage, string, bool) {
+// The second return is the failure to announce once the message itself is out, zero for
+// a message with nothing missing.
+func inboundOf(event *waEvents.Message, render renderBody) (protocol.InboundMessage, missingFile, bool) {
 	message, ok := envelopeOf(&event.Info)
 	if !ok {
-		return protocol.InboundMessage{}, "", false
+		return protocol.InboundMessage{}, missingFile{}, false
 	}
 	// Asked for last, once every question about the envelope has been answered.
 	said, ok := render(event)
 	if !ok {
-		return protocol.InboundMessage{}, "", false
+		return protocol.InboundMessage{}, missingFile{}, false
 	}
 
 	message.Content = said.content
 	message.QuotedID = said.context.GetStanzaID()
 	message.Mentions = mentionsOf(said.context)
 	message.Ephemeral = said.context.GetExpiration()
-	return message, said.failure, true
+	return message, said.missing, true
 }
 
 // envelopeOf is everything about an inbound message except what was said in it, which is
@@ -513,7 +532,7 @@ func (s *Session) receive(event *waEvents.Message) bool {
 		return false
 	}
 
-	message, failure, ok := inboundOf(event, s.bodyOf(s.ctx))
+	message, missing, ok := inboundOf(event, s.bodyOf(s.ctx))
 	if !ok {
 		s.log.Debug().Str("message_id", event.Info.ID).
 			Msg("refusing to acknowledge an inbound message this build cannot publish")
@@ -522,7 +541,7 @@ func (s *Session) receive(event *waEvents.Message) bool {
 	if !s.deliver(protocol.EventMessageReceived, map[string]any{"message": message}, learned) {
 		return false
 	}
-	if failure == "" {
+	if !missing.said() {
 		return true
 	}
 	// After the message and never instead of it: the client looks the message up to
@@ -530,7 +549,8 @@ func (s *Session) receive(event *waEvents.Message) bool {
 	// A failure that cannot be published leaves the acknowledgement withheld, so the
 	// redelivery is what gets the pair out in order.
 	return s.deliver(protocol.EventMediaDownloadFailed, protocol.MediaDownloadFailure{
-		Chat: message.Chat, MessageID: message.ID, Reason: failure,
+		Chat: message.Chat, MessageID: message.ID,
+		Reason: missing.reason, Recoverable: missing.recoverable,
 	}, learned)
 }
 

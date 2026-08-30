@@ -142,7 +142,7 @@ type MediaContent struct {
 func Media(kind MediaKind) MediaContent { return MediaContent{Type: "media", Kind: kind} }
 
 // MediaDownloadFailure is `media.download_failed`: the bytes of a message the client
-// already has are not coming, and asking again would not help.
+// already has did not arrive with it. Whether they ever will is what Recoverable says.
 //
 // It is published after the message it is about, never instead of it. The client looks
 // the message up to flag it, and a failure that arrives first names a message nobody
@@ -151,6 +151,16 @@ type MediaDownloadFailure struct {
 	Chat      Address `json:"chat"`
 	MessageID string  `json:"message_id"`
 	Reason    string  `json:"reason"`
+	// Recoverable is WhatsApp having dropped the file while the sender's phone may
+	// still hold it, which `message.download_media` can ask for. It is the one failure
+	// here that is not the end of the story, and it is a field of its own rather than a
+	// value of Reason because Reason is the explanation an operator reads and a client
+	// branching on it would be reading a sentence.
+	//
+	// False is what every producer said before this field existed, and it is the safe
+	// half: a client that does not know the field flags the bubble exactly as it always
+	// did, and one that does asks for the bytes instead.
+	Recoverable bool `json:"recoverable"`
 }
 
 // MessageEdited is `message.edited`: somebody corrected a message the client already

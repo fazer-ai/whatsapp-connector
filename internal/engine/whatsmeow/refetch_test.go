@@ -104,24 +104,6 @@ func TestARefetchByAnInstanceWithNowhereToPutTheFileIsRetriedRatherThanGivenUpOn
 	assertCode(t, err, protocol.ErrorInternal)
 }
 
-// Nothing is kept for a message whose file never arrived: the client was told the file
-// is not coming and will not come back for it, and a row would be the key to a file that
-// cannot be fetched.
-func TestNothingIsKeptForAMessageWhoseFileWasNeverFetched(t *testing.T) {
-	t.Parallel()
-
-	session, downloads := mediaSession(t, media.Options{})
-	downloads.answer(nil, wm.ErrMediaDownloadFailedWith404)
-	connect(session)
-
-	if _, acknowledged := deliver(t, session, imageEvent("3EB0GONE"), 2); !acknowledged {
-		t.Fatal("a message whose file is gone for good was left to be redelivered forever")
-	}
-	if _, found, err := session.store.MediaPart(t.Context(), "3EB0GONE"); err != nil || found {
-		t.Fatalf("a message whose file never arrived was kept anyway (found=%v, err=%v)", found, err)
-	}
-}
-
 // The concrete type is half the address: whatsmeow reads the media type off it and asks
 // a different endpoint for each, so a kind rebuilt as the wrong type fetches nothing.
 func TestEveryKindIsRebuiltAsTheMessageTypeItWasDownloadedFrom(t *testing.T) {

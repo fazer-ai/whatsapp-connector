@@ -41,10 +41,15 @@ const thumbnailLimit = 32 << 10
 // explanation, by way of `media.download_failed`, so each one names something that
 // happened rather than the call that returned it.
 const (
-	// reasonMediaExpired is WhatsApp's own servers refusing the file. Media is kept for
-	// a bounded time and the key that decrypts it lapses with it, which is what an old
-	// message downloaded late looks like from here.
+	// reasonMediaExpired is WhatsApp refusing to hand the file over at all. The key that
+	// decrypts it lapses with the file, and nothing on either side brings it back.
 	reasonMediaExpired = "media_key_expired"
+	// reasonMediaOffCDN is WhatsApp having dropped the file while the sender's phone may
+	// still hold it, which is what a message that sat in a backlog looks like from here.
+	// Told apart from the one above because they end differently: this is the failure a
+	// client can come back from, and saying the key expired when it did not would put a
+	// wrong sentence in front of an operator next to a flag telling them to ask again.
+	reasonMediaOffCDN = "media_off_cdn"
 	// reasonCorrupt is bytes that arrived and are not the ones the message describes.
 	reasonCorrupt = "integrity_check_failed"
 	// reasonUnreferenced is a media message that names no file to fetch.
@@ -212,6 +217,10 @@ func thumbnailOf(mime string, raw []byte) string {
 // reference and the reason travels behind it, because a bubble that says the file is
 // unavailable is worth more to an agent than a message that never arrives. A download
 // that may work next time is a refusal, and the message stays on the phone.
+//
+// Permanent here is about this attempt over this connection, not about the file: one of
+// the reasons is WhatsApp having dropped it while the sender's phone may still have it,
+// and that one is published as something the client may come back for.
 func (s *Session) mediaBody(ctx context.Context, event *waEvents.Message) (body, bool) {
 	part, ok := attachmentOf(event.Message)
 	if !ok {
@@ -234,7 +243,10 @@ func (s *Session) mediaBody(ctx context.Context, event *waEvents.Message) (body,
 		part.content.Thumbnail = ""
 		s.log.Info().Str("message_id", event.Info.ID).Str("kind", string(part.content.Kind)).
 			Msg("publishing a view-once message without keeping the file it carried")
-		return body{content: part.content, context: part.context, failure: reasonViewOnce}, true
+		return body{
+			content: part.content, context: part.context,
+			missing: missingFile{reason: reasonViewOnce},
+		}, true
 	}
 
 	download, cancel := context.WithTimeout(ctx, s.downloadWait)
@@ -244,9 +256,26 @@ func (s *Session) mediaBody(ctx context.Context, event *waEvents.Message) (body,
 	var giveUp refused
 	switch {
 	case errors.As(err, &giveUp):
-		s.log.Warn().Err(err).Str("kind", string(part.content.Kind)).
-			Msg("publishing a media message whose file is not coming")
-		return body{content: part.content, context: part.context, failure: giveUp.reason}, true
+		recoverable := agedOffTheCDN(err)
+		if recoverable {
+			// Kept even though there is no file, and only for this one reason. What the
+			// client is about to be invited to ask for is fetched from the coordinates on
+			// the original message, and this is the last place they exist -- so without
+			// this the invitation reaches a `message.download_media` that answers there
+			// is nothing kept for that message, which is final on the client and is the
+			// bubble the invitation was trying to save.
+			//
+			// The size recorded here is the sender's claim rather than a measurement,
+			// because nothing was measured. It only decides whether a refetch starts at
+			// all; a sender who understated is still caught by the cap on the way in.
+			s.remember(event, &part)
+		}
+		s.log.Warn().Err(err).Str("kind", string(part.content.Kind)).Bool("recoverable", recoverable).
+			Msg("publishing a media message whose file did not arrive with it")
+		return body{
+			content: part.content, context: part.context,
+			missing: missingFile{reason: giveUp.reason, recoverable: recoverable},
+		}, true
 	case err != nil:
 		s.log.Warn().Err(err).Str("kind", string(part.content.Kind)).
 			Msg("withholding an acknowledgement for a media message whose file may arrive next time")
@@ -382,12 +411,17 @@ func unfetchable(part wm.DownloadableMessage) error {
 // are all this instance's problem right now, and the message is worth another go.
 func downloadFailure(err error) error {
 	switch {
-	case errors.Is(err, wm.ErrMediaDownloadFailedWith403),
-		errors.Is(err, wm.ErrMediaDownloadFailedWith404),
-		errors.Is(err, wm.ErrMediaDownloadFailedWith410):
+	case errors.Is(err, wm.ErrMediaDownloadFailedWith403):
 		// WhatsApp keeps a file for a bounded time and the key that decrypts it lapses
 		// with it. Nothing about asking again brings either back.
 		return refused{reason: reasonMediaExpired, err: err}
+
+	case errors.Is(err, wm.ErrMediaDownloadFailedWith404),
+		errors.Is(err, wm.ErrMediaDownloadFailedWith410):
+		// The file is off the CDN, which the sender's phone can be asked to undo. Still a
+		// refusal: the asking is not this call's to do, and a caller that does not ask is
+		// right to treat it as final.
+		return refused{reason: reasonMediaOffCDN, err: err}
 
 	case errors.Is(err, wm.ErrInvalidMediaHMAC),
 		errors.Is(err, wm.ErrInvalidMediaSHA256),
@@ -428,9 +462,10 @@ func (s *Session) blobURL(id string) string {
 // coordinates WhatsApp wants, which are on the original message and nowhere else once
 // the event has gone out.
 //
-// A failure here is logged rather than returned. The message has its file now and the
-// client is about to be handed a reference that works; withholding it because a later
-// refetch might not be possible trades a message that arrives for one that might.
+// A failure here is logged rather than returned. The message is going out either way --
+// with a reference that works, or with an invitation to come back for the file -- and
+// withholding it because a later refetch might not be possible trades a message that
+// arrives for one that might.
 func (s *Session) remember(event *waEvents.Message, part *attachment) {
 	ctx, cancel := context.WithTimeout(s.ctx, s.storeLimit)
 	defer cancel()
@@ -623,14 +658,11 @@ func answeredNo(err error) bool {
 // 403 is not among them, and that is the whole distinction. A 403 is the key having
 // lapsed, and nothing the phone does brings it back; a 404 or a 410 is the file having
 // been dropped from the CDN, which is the case this recovery exists for and the shape a
-// message that sat in a backlog arrives in.
+// message that sat in a backlog arrives in. downloadFailure has already drawn that line,
+// and this reads its answer rather than the sentinels behind it.
 func agedOffTheCDN(err error) bool {
 	var giveUp refused
-	if !errors.As(err, &giveUp) || giveUp.reason != reasonMediaExpired {
-		return false
-	}
-	return errors.Is(giveUp.err, wm.ErrMediaDownloadFailedWith404) ||
-		errors.Is(giveUp.err, wm.ErrMediaDownloadFailedWith410)
+	return errors.As(err, &giveUp) && giveUp.reason == reasonMediaOffCDN
 }
 
 // refetchFailure turns what fetch decided into what the client should do about it.
