@@ -99,8 +99,18 @@ theirs, and the connector is always upgraded first.
   of `null` cannot tell a group with no photo from a snapshot that does not mention
   one, and the client needs the difference to clear a photo removed while its session
   was out of the group. A producer that cannot answer leaves it out.
-- Errors use the closed `error_code` enum, which maps 1:1 to
-  `Whatsapp::Session::Errors::*` on the Ruby side.
+- Errors carry an `error_code`. The enum grows the way everything else here does: a
+  consumer that meets a code it does not know treats it as `internal`, which both
+  implementations already do -- `protocol.NewError` on the Go side, `Errors.build` on
+  the Ruby one -- so a connector answering with a newer code gets exactly the behaviour
+  an older client had before that code existed. The Ruby classes are not a 1:1 mapping
+  in either direction: some of them (`event_out_of_order`, `message_already_processing`)
+  never travel, and they exist to be rescued rather than to be sent.
+- Three of the codes are about *who* failed, and the distinction is what an operator
+  reads first: `wa_error` is WhatsApp refusing, `provider_unavailable` is a dependency
+  the command itself named -- the storage a `message.send` points its `ref.url` at --
+  not answering, and `internal` is this connector. All three are worth retrying; only
+  the last one means the connector's own logs are where to look.
 
 ## RPC results
 

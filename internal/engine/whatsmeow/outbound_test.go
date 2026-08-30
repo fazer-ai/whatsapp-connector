@@ -589,9 +589,10 @@ func TestAFileThatStoppedArrivingIsNotSentAsAWholeOne(t *testing.T) {
 					"content":{"type":"media","kind":"image",
 					"ref":{"kind":"url","url":"http://rails:3000/blob.jpg"}}}`),
 			})
-			// Retryable: the same fetch may arrive whole next time, and the caller holds
-			// the only copy of what it wanted to send.
-			assertCode(t, err, protocol.ErrorInternal)
+			// Retryable, and it is the caller's own storage that stopped serving: the
+			// same fetch may arrive whole next time, and the caller holds the only copy
+			// of what it wanted to send.
+			assertCode(t, err, protocol.ErrorProviderUnavailable)
 		})
 	}
 }
@@ -702,8 +703,8 @@ func TestWhatTheCallersOwnServerAnsweredDecidesWhetherItIsWorthAnotherGo(t *test
 		{"the header no longer opens it", 403, protocol.ErrorMediaUnavailable},
 		{"the caller's own server is asking to be left alone", 429, protocol.ErrorRateLimited},
 		{"the caller's own server timed out on its own request", 408, protocol.ErrorTimeout},
-		{"the caller's own server is having a bad minute", 503, protocol.ErrorInternal},
-		{"the caller's own server broke", 500, protocol.ErrorInternal},
+		{"the caller's own server is having a bad minute", 503, protocol.ErrorProviderUnavailable},
+		{"the caller's own server broke", 500, protocol.ErrorProviderUnavailable},
 		{"the caller asked for something the server did not understand", 400, protocol.ErrorInvalidPayload},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -2347,5 +2348,24 @@ func TestAFileForABroadcastListIsRefusedBeforeItIsFetched(t *testing.T) {
 	if serving.count() != 0 || uploads.count() != 0 {
 		t.Fatalf("a message that could never go out cost %d fetch(es) and %d upload(s)",
 			serving.count(), uploads.count())
+	}
+}
+
+// An address nothing is listening on is the caller's own storage being down. The
+// operator who reads the failure has to be sent there and not to this connector's logs,
+// which will be clean while the Rails side serving the blob is the thing that is not up.
+func TestAnAddressThatIsNotAnsweringIsNamedAsTheCallersOwnAndNotAsThisConnector(t *testing.T) {
+	t.Parallel()
+
+	// Started and then stopped, so the address is well formed and refuses the
+	// connection: a service that is restarting rather than a name that never resolved.
+	gone := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	address := gone.URL + "/blob.pdf"
+	gone.Close()
+
+	_, err := retrieveOverHTTP(t.Context(), address, nil)
+	assertCode(t, err, protocol.ErrorProviderUnavailable)
+	if !strings.Contains(err.Error(), "could not fetch the file to send") {
+		t.Fatalf("the failure does not say what could not be fetched: %v", err)
 	}
 }
