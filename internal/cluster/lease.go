@@ -169,11 +169,12 @@ func (l *Leases) Acquire(ctx context.Context, sid string) (Lease, error) {
 // another round trip.
 func (l *Leases) Renew(ctx context.Context, sid string) error {
 	keys := l.client.Keys()
+	sent := l.clock.Now()
 	ok, err := renewScript.Run(ctx, l.client, []string{keys.Lease(sid)}, l.instance, l.ttl.Milliseconds()).Int()
 	if err != nil {
 		return fmt.Errorf("cluster: renew %s: %w", sid, err)
 	}
-	return l.applyRenew(sid, ok)
+	return l.applyRenew(sid, ok, sent)
 }
 
 // RenewMany renews every session named in one round trip, and answers for each of them
@@ -218,6 +219,7 @@ func (l *Leases) RenewMany(ctx context.Context, sids []string) map[string]error 
 	// an error the command does not carry until the whole batch has been sent -- and
 	// falling back one session at a time would spend, on the first pass after a restart
 	// or a SCRIPT FLUSH, exactly the round trip per session this exists to avoid.
+	sent := l.clock.Now()
 	cmds := renew(sids, byDigest)
 	var unloaded []string
 	for i, sid := range sids {
@@ -226,35 +228,43 @@ func (l *Leases) RenewMany(ctx context.Context, sids []string) map[string]error 
 			unloaded = append(unloaded, sid)
 			continue
 		}
-		out[sid] = l.answerRenew(sid, ok, err)
+		out[sid] = l.answerRenew(sid, ok, err, sent)
 	}
 	if len(unloaded) > 0 {
+		resent := l.clock.Now()
 		retried := renew(unloaded, byBody)
 		for i, sid := range unloaded {
 			ok, err := retried[i].Int()
-			out[sid] = l.answerRenew(sid, ok, err)
+			out[sid] = l.answerRenew(sid, ok, err, resent)
 		}
 	}
 	return out
 }
 
 // answerRenew turns one command's outcome into the answer Renew gives for that session.
-func (l *Leases) answerRenew(sid string, ok int, err error) error {
+func (l *Leases) answerRenew(sid string, ok int, err error, sent time.Time) error {
 	if err != nil {
 		return fmt.Errorf("cluster: renew %s: %w", sid, err)
 	}
-	return l.applyRenew(sid, ok)
+	return l.applyRenew(sid, ok, sent)
 }
 
 // applyRenew turns the script's answer into this instance's own record of the lease.
-func (l *Leases) applyRenew(sid string, ok int) error {
+//
+// Stamped with when the renewal was sent, not with when its answer came back. Redis
+// starts the new TTL when the script runs, which is before the reply is read and, in a
+// pipeline, can be a whole batch before it. Stamping on arrival would date the lease
+// later than Redis does and let Owned keep saying yes past the moment the key actually
+// expires, which is the one direction that puts two sockets on one account. Dating it
+// earlier than Redis only ever gives up the lease sooner than necessary.
+func (l *Leases) applyRenew(sid string, ok int, sent time.Time) error {
 	if ok != 1 {
 		l.forget(sid)
 		return ErrNotOwner
 	}
 	l.mu.Lock()
 	if entry, held := l.held[sid]; held {
-		entry.renewedAt = l.clock.Now()
+		entry.renewedAt = sent
 		l.held[sid] = entry
 	}
 	l.mu.Unlock()

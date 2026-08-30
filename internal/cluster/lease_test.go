@@ -3,6 +3,7 @@ package cluster_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -383,5 +384,69 @@ func TestRenewManyAnswersForEachSessionOnItsOwn(t *testing.T) {
 	}
 	if _, owned := a.Owned("s2"); !owned {
 		t.Error("a dropped a session whose renewal succeeded")
+	}
+}
+
+// advancingClock moves the test's clock while a command is in flight, which is how a
+// round trip that takes real time looks to a lease holder driven by a fake clock.
+type advancingClock struct {
+	clock *fakeClock
+	by    time.Duration
+	on    func(redis.Cmder) bool
+}
+
+func (advancingClock) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (h advancingClock) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		err := next(ctx, cmd)
+		if h.on(cmd) {
+			h.clock.advance(h.by)
+		}
+		return err
+	}
+}
+
+func (h advancingClock) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return func(ctx context.Context, cmds []redis.Cmder) error {
+		err := next(ctx, cmds)
+		h.clock.advance(h.by)
+		return err
+	}
+}
+
+// Redis starts the new TTL when the script runs, which is before the answer is read and,
+// in a pipeline, a whole batch before it. A lease stamped on arrival is dated later than
+// Redis dates it, and Owned then keeps saying yes past the moment the key expires and a
+// peer can take it -- which is two sockets on one account.
+func TestARenewalIsDatedFromWhenItWasSent(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	clock := newClock()
+	leases := cluster.NewLeases(redisx.Wrap(rdb, "wa:", 8), "inst-a", cluster.Options{Clock: clock})
+	ctx := context.Background()
+
+	if _, err := leases.Acquire(ctx, "s1"); err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+
+	// The renewal itself takes as long as the lease has to give: sent now, answered a
+	// fresh lifetime later. Whatever Redis did, it did at the start of that.
+	rdb.AddHook(advancingClock{
+		clock: clock,
+		by:    cluster.DefaultTTL - cluster.DefaultRenewMargin,
+		on:    func(cmd redis.Cmder) bool { return strings.HasPrefix(cmd.Name(), "eval") },
+	})
+
+	for sid, err := range leases.RenewMany(ctx, []string{"s1"}) {
+		if err != nil {
+			t.Fatalf("RenewMany %s: %v", sid, err)
+		}
+	}
+	if _, owned := leases.Owned("s1"); owned {
+		t.Fatal("a lease renewed by a round trip that outlasted its fresh lifetime still counts as owned")
 	}
 }

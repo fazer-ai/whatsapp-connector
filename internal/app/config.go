@@ -240,6 +240,14 @@ func LoadConfig(hostname string) (Config, error) {
 		// go out in one pipelined batch (cluster.RenewMany), so nothing here is
 		// proportional to how many sessions the instance carries.
 		//
+		// What the reserve does not cover, and cannot: an acknowledgement runs on a
+		// deadline of its own so that a command already carried out is retired even when
+		// the window it ran in is gone, and it runs on this goroutine. One started near
+		// the end of a window can hold the tick up to its own timeout past it. Pricing
+		// that worst case in would make short leases unconfigurable for a ceiling only a
+		// degraded Redis reaches, so it is left out here and carried by #79, which moves
+		// those acknowledgements off this goroutine instead.
+		//
 		// Derived from the bounds that actually sit outside the tick, not summed from
 		// the loop's steps. The sum was wrong three times running -- each rewrite
 		// remembered the parcels somebody could name and forgot one nobody did -- and a

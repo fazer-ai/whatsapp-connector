@@ -328,3 +328,12 @@ internal/app/run.go: Preserve FIFO after releasing a late read  # PR#65 r9 -> #7
 # dispatch is what r9 showed costs per-session order (#77). Recorded on #62, which is
 # where the ack and the answer get coupled.
 internal/app/run.go: Include inline queue-full refusals in the dispatch floor  # PR#65 r10 -> #62
+# PR#65: real, and the rule cannot absorb it. An ack runs on a deadline of its own so a
+# command already carried out is retired even when its window is gone, and it runs on the
+# loop's goroutine, so one started near the end of a window holds the tick up to its own
+# timeout past it -- three such places per period against a reserve of twice the margin.
+# Adding (1 + reclaimPasses) * ackTimeout to the check would refuse configurations that
+# work: a 7s lease already leaves 3s for the heartbeat and the tail, and 6s of worst-case
+# acks makes it unsatisfiable, for a ceiling only a degraded Redis reaches. Registered as
+# #79, which takes the acks off this goroutine, and named in the rule's own comment.
+internal/app/config.go: Include detached ack time in the lease bound  # PR#65 r11 -> #79
