@@ -10,7 +10,6 @@ import (
 	waTypes "go.mau.fi/whatsmeow/types"
 	waEvents "go.mau.fi/whatsmeow/types/events"
 
-	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 	"github.com/fazer-ai/whatsapp-connector/internal/store"
 )
 
@@ -36,6 +35,13 @@ func (s *Session) askForReupload(
 	if err != nil {
 		return nil, err
 	}
+
+	// A ceiling of this connector's own, on top of whatever the caller allowed. The
+	// contract makes `deadline` optional, and a command that omits one runs on the
+	// session's lifetime -- so without this, a phone that is switched off holds the
+	// session's executor, and every command behind it, until the session closes.
+	ctx, cancel := context.WithTimeout(ctx, s.reuploadWait)
+	defer cancel()
 
 	// Registered before the receipt goes out. The phone can answer faster than this
 	// goroutine gets back to the select, and an answer that arrives with nobody
@@ -90,14 +96,18 @@ var errNoReupload = errors.New("the file was not uploaded again")
 
 // sentAs rebuilds what the receipt has to be addressed with.
 //
-// The chat comes from the two columns that always had it. Whether this account sent the
-// message, and which participant did, are on the message and were kept for this alone --
-// so a row written before they were is one this cannot ask about, and says so rather than
-// sending a receipt naming nobody.
+// All three come off the row and none is derived, which is the correction a broadcast
+// forces: the chat a message was published under is not always the chat it was sent to,
+// and only the second one addresses a receipt. A row written before they were kept has
+// none of them, and says so rather than sending a receipt built out of guesses -- one
+// WhatsApp cannot match, answered by nothing, paid for with the caller's whole deadline.
 func sentAs(kept *store.MediaPart) (*waTypes.MessageInfo, error) {
-	chat, err := jidOf(protocol.Address{Kind: protocol.AddressKind(kept.ChatKind), ID: kept.ChatID})
+	if kept.ReceiptChat == "" {
+		return nil, fmt.Errorf("%w: nothing was kept about where it was sent", errNoReupload)
+	}
+	chat, err := waTypes.ParseJID(kept.ReceiptChat)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: what was kept about where it was sent is unreadable", errNoReupload)
 	}
 	info := &waTypes.MessageInfo{
 		ID: kept.MessageID,

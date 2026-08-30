@@ -255,6 +255,16 @@ type Session struct {
 	awaited   map[string]*awaiting
 	awaitedMu sync.Mutex
 
+	// reuploadWait is the longest this session waits for a sender's phone to say it has
+	// uploaded a file again. A field for the same reason as the waits above it, and for
+	// no other.
+	//
+	// A ceiling and not the wait itself: the caller's own deadline still cuts it short.
+	// It exists because the contract makes a command's `deadline` optional, and one that
+	// omits it runs on the session's lifetime -- so a phone that is switched off would
+	// hold the executor, and every command behind it, until the session closed.
+	reuploadWait time.Duration
+
 	// reuploads holds a channel per message whose file this session has asked the
 	// sender's phone to upload again, so the answer reaches the command that is waiting
 	// for it. Keyed by message id, which is what the phone answers under.
@@ -431,6 +441,7 @@ func newSession(
 		awaited:     make(map[string]*awaiting),
 
 		reuploads:      make(map[string]chan *waEvents.MediaRetry),
+		reuploadWait:   reuploadTimeout,
 		rerequestWait:  rerequestTimeout,
 		rerequestRetry: rerequestRetry,
 		presenceWrite:  make(chan struct{}, 1),
@@ -2098,6 +2109,11 @@ func (s *Session) bind(jid waTypes.JID, _, _ string) bool {
 // bindTimeout bounds the write that stands between a scanned code and a paired
 // session. It is short because WhatsApp is waiting on the other side of it.
 const bindTimeout = 5 * time.Second
+
+// reuploadTimeout is the longest a caller waits on somebody else's phone. Generous,
+// because that is what it is waiting for: a phone that is asleep takes a moment to wake
+// up and notice. Bounded all the same, because one that is switched off never will.
+const reuploadTimeout = 30 * time.Second
 
 // codeForPairPhone names the refusals the caller can fix. Left as an internal error
 // they reach the dashboard as "the connector could not carry out the command", which

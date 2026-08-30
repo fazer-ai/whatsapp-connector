@@ -383,13 +383,17 @@ func (c *Container) migrate(ctx context.Context) error {
 		// boolean is spelled differently in the two dialects and this table has held to
 		// one spelling throughout.
 		//
-		// `sender` and `from_me` are not for the download -- that needs only the path,
-		// the key and the digests. They are for asking the sender's phone to upload the
-		// file again once WhatsApp has dropped it, which is a receipt addressed by the
-		// chat, by whether the account sent the message, and in a group by which
-		// participant did. The first is derivable from the two chat columns and the
-		// other two are on the message and nowhere else, so they are kept here or the
-		// request cannot be made at all.
+		// `receipt_chat`, `sender` and `from_me` are not for the download -- that needs
+		// only the path, the key and the digests. They are the three things a request to
+		// upload the file again is addressed with, once WhatsApp has dropped it.
+		//
+		// `receipt_chat` is a column of its own and not the two beside it, and that is
+		// the point rather than duplication. `chat_kind` and `chat_id` are what the
+		// message was *published* under, and for a broadcast that is deliberately not
+		// where it was sent: WhatsApp shows such a message in the direct chat with
+		// whoever sent it, so the published chat is the sender and the list it came
+		// through is gone. A receipt addressed from that names a message WhatsApp cannot
+		// find.
 		//
 		// The foreign key is what makes a row impossible for a session that is not
 		// bound, and it is doing more than tidiness. Ownership moves between instances,
@@ -411,6 +415,7 @@ func (c *Container) migrate(ctx context.Context) error {
 			file_length     BIGINT NOT NULL,
 			mime            TEXT   NOT NULL,
 			filename        TEXT   NOT NULL,
+			receipt_chat    TEXT   NOT NULL DEFAULT '',
 			sender          TEXT   NOT NULL DEFAULT '',
 			from_me         BIGINT NOT NULL DEFAULT 0,
 			stored_at       BIGINT NOT NULL,
@@ -455,6 +460,7 @@ func (c *Container) migrate(ctx context.Context) error {
 	// are what a client's `message.download_media` reads, and dropping them would lose
 	// the file of every message received before the upgrade.
 	for _, column := range []struct{ name, definition string }{
+		{"receipt_chat", "TEXT NOT NULL DEFAULT ''"},
 		{"sender", "TEXT NOT NULL DEFAULT ''"},
 		{"from_me", "BIGINT NOT NULL DEFAULT 0"},
 	} {
@@ -472,25 +478,53 @@ func (c *Container) migrate(ctx context.Context) error {
 // a column that is already there is an error indistinguishable by type from the ones
 // that matter. Asking first is one round trip on a path that runs once per process
 // start.
+//
+// And asked again if the attempt fails, because asking first is not a lock. Two
+// instances starting together -- which is what a rolling deploy is -- can both find the
+// column missing, and the one that loses gets a duplicate-column error for work the
+// other has already done. Re-reading is what tells "somebody beat me to it" from "this
+// did not happen", and the first of those is not a reason to refuse to start.
 func (c *Container) addColumn(ctx context.Context, table, column, definition string) error {
+	present, err := c.hasColumn(ctx, table, column)
+	if err != nil || present {
+		return err
+	}
+	if _, err := c.db.ExecContext(ctx, `ALTER TABLE `+table+` ADD COLUMN `+column+` `+definition); err != nil {
+		switch present, reread := c.hasColumn(ctx, table, column); {
+		case reread != nil:
+			return reread
+		case present:
+			return nil
+		}
+		return fmt.Errorf("store: add %s.%s: %w", table, column, err)
+	}
+	return nil
+}
+
+// hasColumn reports whether a table has a column, asking about the table this
+// connection's own statements would reach and no other.
+//
+// That qualification is the whole of the Postgres branch. `information_schema.columns`
+// filtered by table name alone spans every schema the role can see, so a copy of this
+// table in another schema -- an older one, a neighbour's -- answers for the one the
+// writes actually land in, and the column is reported present on a table that has not
+// got it. `to_regclass` resolves the name through `search_path` exactly the way the DML
+// does, so what is asked about is what is written to.
+func (c *Container) hasColumn(ctx context.Context, table, column string) (bool, error) {
 	query := `SELECT 1 FROM pragma_table_info(?) WHERE name = ?`
 	if c.dialect == dialectPostgres {
-		// Filtered by table and column together, which is what makes this safe on a
-		// server where information_schema spans every schema the role can see: two
-		// tables of the same name in two schemas would both be this connector's own.
-		query = `SELECT 1 FROM information_schema.columns WHERE table_name = ? AND column_name = ?`
+		query = `SELECT 1 FROM pg_attribute
+			WHERE attrelid = to_regclass(?) AND attname = ? AND attnum > 0 AND NOT attisdropped`
 	}
 	var present int
 	switch err := c.db.QueryRowContext(ctx, c.rebind(query), table, column).Scan(&present); {
 	case err == nil:
-		return nil
-	case !errors.Is(err, sql.ErrNoRows):
-		return fmt.Errorf("store: ask whether %s.%s is there: %w", table, column, err)
+		return true, nil
+	case errors.Is(err, sql.ErrNoRows):
+		return false, nil
+	default:
+		return false, fmt.Errorf("store: ask whether %s.%s is there: %w", table, column, err)
 	}
-	if _, err := c.db.ExecContext(ctx, `ALTER TABLE `+table+` ADD COLUMN `+column+` `+definition); err != nil {
-		return fmt.Errorf("store: add %s.%s: %w", table, column, err)
-	}
-	return nil
 }
 
 // dropDuplicateMappings clears out whatever the old, permissive account index let

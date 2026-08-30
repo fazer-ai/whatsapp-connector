@@ -16,6 +16,7 @@ import (
 
 	"github.com/fazer-ai/whatsapp-connector/internal/media"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
+	"github.com/fazer-ai/whatsapp-connector/internal/store"
 )
 
 // WhatsApp keeps a file on its CDN for a bounded time and then drops it, and the sender's
@@ -158,6 +159,7 @@ type phoneAsked struct {
 	session *Session
 	answer  *reupload
 	calls   int
+	chat    string
 }
 
 // reupload is what the phone will answer: either a notification it seals under the media
@@ -171,8 +173,13 @@ func (p *phoneAsked) answersWith(answer *reupload) { p.answer = answer }
 
 func (p *phoneAsked) asked() int { return p.calls }
 
+// addressed is the chat the last receipt named, which is the whole of what a broadcast
+// gets wrong when the published chat is used instead of the one it was sent to.
+func (p *phoneAsked) addressed() string { return p.chat }
+
 func (p *phoneAsked) hand(_ context.Context, _ *wm.Client, info *waTypes.MessageInfo, key []byte) error {
 	p.calls++
+	p.chat = info.Chat.String()
 	if info.ID == "" {
 		return errors.New("a receipt was sent naming no message")
 	}
@@ -216,28 +223,32 @@ func sealReupload(
 	return ciphertext, iv, err
 }
 
-// A group receipt names the participant who sent the message, and a row written before
-// that was kept has nobody to name. Sent anyway it would ask about a message WhatsApp
-// cannot identify; the caller gets what the download said instead.
-func TestAGroupRowWithNobodyNamedIsNotAskedAbout(t *testing.T) {
+// A receipt is addressed by where the message was sent, by whether this account sent it
+// and, in a group, by which participant did. A row that has none of those -- one written
+// before they were kept -- cannot be asked about, and a group row that has the chat but
+// nobody to name cannot either. Sent anyway, either would name a message WhatsApp cannot
+// find, answered by nothing and paid for with the caller's whole deadline.
+func TestARowThatCannotAddressAReceiptIsNotAskedAbout(t *testing.T) {
 	t.Parallel()
 
 	for _, tc := range []struct {
-		name  string
-		chat  string
-		asked int
+		name   string
+		forget func(*store.MediaPart)
 	}{
-		// A direct chat has nobody else to name: the chat is the person, so the receipt
-		// can still be addressed from what the row has.
-		{"a direct chat", "phone", 1},
-		{"a group", "group", 0},
+		{"a row written before any of it was kept", func(kept *store.MediaPart) {
+			kept.ReceiptChat, kept.Sender = "", ""
+		}},
+		{"a group whose participant was not kept", func(kept *store.MediaPart) {
+			kept.ReceiptChat = "120363041234567890@g.us"
+			kept.Sender = ""
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
 			session, phone := reuploadSession(t, "3EB0NONAME")
 			phone.answersWith(nil)
-			forgetWhoSent(t, session, "3EB0NONAME", tc.chat)
+			forgetWhoSent(t, session, "3EB0NONAME", tc.forget)
 
 			deadline, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
 			defer cancel()
@@ -246,28 +257,112 @@ func TestAGroupRowWithNobodyNamedIsNotAskedAbout(t *testing.T) {
 				Payload: []byte(`{"message_id":"3EB0NONAME"}`),
 			})
 			assertCode(t, err, protocol.ErrorMediaUnavailable)
-			if phone.asked() != tc.asked {
-				t.Errorf("the sender's phone was asked %d times, want %d", phone.asked(), tc.asked)
+			if phone.asked() != 0 {
+				t.Errorf("the sender's phone was asked %d times about a row that cannot address a receipt", phone.asked())
 			}
 		})
 	}
 }
 
-// forgetWhoSent rewrites the kept row the way one written before the sender was kept
-// looks, in the chat named.
-func forgetWhoSent(t *testing.T, session *Session, messageID, chatKind string) {
+// forgetWhoSent rewrites the kept row the way the test wants it.
+func forgetWhoSent(t *testing.T, session *Session, messageID string, forget func(*store.MediaPart)) {
 	t.Helper()
 
 	kept, found, err := session.store.MediaPart(t.Context(), messageID)
 	if err != nil || !found {
 		t.Fatalf("MediaPart: %v (found %v)", err, found)
 	}
-	kept.Sender = ""
-	kept.ChatKind = chatKind
-	if chatKind == "group" {
-		kept.ChatID = "120363041234567890"
-	}
+	forget(&kept)
 	if err := session.store.PutMediaPart(t.Context(), &kept, time.Now()); err != nil {
 		t.Fatalf("PutMediaPart: %v", err)
+	}
+}
+
+// The contract makes a command's `deadline` optional, and one that omits it runs on the
+// session's own lifetime. Without a ceiling of this connector's own, a phone that is
+// switched off holds the session's executor -- and every command queued behind it --
+// until the session closes.
+func TestAPhoneIsWaitedOnEvenWhenTheCommandNamedNoDeadline(t *testing.T) {
+	t.Parallel()
+
+	session, phone := reuploadSession(t, "3EB0FOREVER")
+	phone.answersWith(nil)
+	session.reuploadWait = 50 * time.Millisecond
+
+	answered := make(chan error, 1)
+	go func() {
+		// t.Context() outlives this call, which is the shape a command with no deadline
+		// arrives in: the session's own lifetime and nothing narrower.
+		_, err := session.downloadMedia(t.Context(), &protocol.Command{
+			Type:    protocol.CommandMessageDownloadMedia,
+			Payload: []byte(`{"message_id":"3EB0FOREVER"}`),
+		})
+		answered <- err
+	}()
+
+	select {
+	case err := <-answered:
+		assertCode(t, err, protocol.ErrorMediaUnavailable)
+	case <-time.After(5 * time.Second):
+		t.Fatal("a command with no deadline waited on a phone that was never going to answer")
+	}
+}
+
+// A broadcast is published in the direct chat with whoever sent it, because that is where
+// WhatsApp shows it -- so the chat the message was published under is not the chat it was
+// sent to. A receipt addressed from the published one names a message WhatsApp cannot
+// find, and the caller pays for it with the whole wait.
+func TestABroadcastIsAskedAboutUnderTheChatItWasSentTo(t *testing.T) {
+	t.Parallel()
+
+	session, phone := reuploadSession(t, "3EB0CAST")
+	phone.answersWith(reuploaded("/v/fresh-path"))
+	kept, _, err := session.store.MediaPart(t.Context(), "3EB0CAST")
+	if err != nil {
+		t.Fatalf("MediaPart: %v", err)
+	}
+	// What remember writes for one: published under the sender, sent to the list.
+	kept.ReceiptChat = "5511999990002@broadcast"
+	if err := session.store.PutMediaPart(t.Context(), &kept, time.Now()); err != nil {
+		t.Fatalf("PutMediaPart: %v", err)
+	}
+
+	if _, err := refetchErr(session, "3EB0CAST", nil); err != nil {
+		t.Fatalf("refetch: %v", err)
+	}
+	if phone.addressed() != "5511999990002@broadcast" {
+		t.Errorf("the receipt was addressed to %q, want the chat the message was sent to",
+			phone.addressed())
+	}
+}
+
+// The blob this writes is dropped on its TTL or evicted by the quota, and the row is what
+// the request after that reads. Left pointing at the path that answered 404, that request
+// spends the failure and the whole wait on the phone again -- for a file WhatsApp is by
+// then serving perfectly well.
+func TestAFreshPathIsRememberedSoTheNextCallerDoesNotAskTwice(t *testing.T) {
+	t.Parallel()
+
+	session, phone := reuploadSession(t, "3EB0KEEP")
+	phone.answersWith(reuploaded("/v/fresh-path"))
+	if _, err := refetchErr(session, "3EB0KEEP", nil); err != nil {
+		t.Fatalf("refetch: %v", err)
+	}
+
+	kept, found, err := session.store.MediaPart(t.Context(), "3EB0KEEP")
+	if err != nil || !found {
+		t.Fatalf("MediaPart: %v (found %v)", err, found)
+	}
+	if kept.DirectPath != "/v/fresh-path" {
+		t.Errorf("the row still points at %q, want the path the phone answered with", kept.DirectPath)
+	}
+
+	// And the proof it is worth something: the next caller gets the file without the
+	// phone being asked again.
+	if _, err := refetchErr(session, "3EB0KEEP", nil); err != nil {
+		t.Fatalf("the second refetch failed: %v", err)
+	}
+	if phone.asked() != 1 {
+		t.Errorf("the sender's phone was asked %d times, want once for the two refetches", phone.asked())
 	}
 }

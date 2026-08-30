@@ -827,16 +827,17 @@ func TestAStoreThatPredatesTheReuploadColumnsGainsThemAndKeepsItsRows(t *testing
 	if kept.DirectPath != "/v/old" {
 		t.Errorf("the row came back with direct path %q, want the one it was written with", kept.DirectPath)
 	}
-	if kept.Sender != "" || kept.FromMe {
-		t.Errorf("a row written before these were kept came back as sender %q, from_me %v, want the empty ones",
-			kept.Sender, kept.FromMe)
+	if kept.ReceiptChat != "" || kept.Sender != "" || kept.FromMe {
+		t.Errorf("a row written before these were kept came back as chat %q, sender %q, from_me %v, want the empty ones",
+			kept.ReceiptChat, kept.Sender, kept.FromMe)
 	}
 
 	// And the columns take a write, which is what the old shape could not.
 	fresh := store.MediaPart{
 		MessageID: "3EB0NEW", ChatKind: "group", ChatID: "120363041234567890", Kind: "image",
 		DirectPath: "/v/new", Mime: "image/jpeg", Filename: "n.jpg", FileLength: 9,
-		Sender: "5511999990003@s.whatsapp.net", FromMe: true,
+		ReceiptChat: "120363041234567890@g.us",
+		Sender:      "5511999990003@s.whatsapp.net", FromMe: true,
 	}
 	if err := upgraded.For("sid-old").PutMediaPart(t.Context(), &fresh, time.Now()); err != nil {
 		t.Fatalf("PutMediaPart after the upgrade: %v", err)
@@ -845,7 +846,92 @@ func TestAStoreThatPredatesTheReuploadColumnsGainsThemAndKeepsItsRows(t *testing
 	if err != nil {
 		t.Fatalf("MediaPart: %v", err)
 	}
-	if read.Sender != fresh.Sender || !read.FromMe {
-		t.Errorf("read back sender %q, from_me %v, want %q and true", read.Sender, read.FromMe, fresh.Sender)
+	if read.ReceiptChat != fresh.ReceiptChat || read.Sender != fresh.Sender || !read.FromMe {
+		t.Errorf("read back chat %q, sender %q, from_me %v, want %q, %q and true",
+			read.ReceiptChat, read.Sender, read.FromMe, fresh.ReceiptChat, fresh.Sender)
+	}
+}
+
+// A rolling deploy starts the new instances alongside the old ones, so two of them can
+// find a column missing before either has added it. Asking first is not a lock: the one
+// that loses gets a duplicate-column error for work the other has already done, and
+// treated as a failure it refuses to start on a store that is perfectly fine.
+func TestTwoInstancesUpgradingAtOnceBothStart(t *testing.T) {
+	t.Parallel()
+
+	target := storetest.New(t)
+	container := openAt(t, target)
+	if _, err := container.DB().ExecContext(t.Context(),
+		`ALTER TABLE wac_media_part DROP COLUMN receipt_chat`); err != nil {
+		t.Fatalf("put the old shape back: %v", err)
+	}
+	if err := container.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Opened together, which is the whole point: one of them adds the column and the
+	// other has to find that acceptable.
+	var racing sync.WaitGroup
+	failures := make(chan error, 2)
+	for range 2 {
+		racing.Add(1)
+		go func() {
+			defer racing.Done()
+			opened, err := store.Open(context.Background(), target.URL, zerolog.Nop())
+			if err != nil {
+				failures <- err
+				return
+			}
+			if err := opened.Close(); err != nil {
+				failures <- err
+			}
+		}()
+	}
+	racing.Wait()
+	close(failures)
+	for err := range failures {
+		t.Errorf("an instance refused to start on a store another was upgrading: %v", err)
+	}
+}
+
+// `information_schema.columns` filtered by table name alone spans every schema the role
+// can see, so a copy of this table in another schema answers for the one the writes land
+// in. Reported present on a table that has not got it, the migration skips the ALTER and
+// every write afterwards fails on a column that is not there.
+func TestAColumnInAnotherSchemaIsNotMistakenForThisOne(t *testing.T) {
+	t.Parallel()
+
+	target := storetest.New(t)
+	if target.URL == "" || !strings.HasPrefix(target.URL, "postgres") {
+		t.Skip("the schema search path is a Postgres question, and this pass is on SQLite")
+	}
+	container := openAt(t, target)
+	// A neighbour that already has the column, and this connector's own table without
+	// it. Only the second is what the writes reach.
+	for _, statement := range []string{
+		`CREATE SCHEMA IF NOT EXISTS neighbour`,
+		`CREATE TABLE neighbour.wac_media_part (receipt_chat TEXT NOT NULL DEFAULT '')`,
+		`ALTER TABLE wac_media_part DROP COLUMN receipt_chat`,
+	} {
+		if _, err := container.DB().ExecContext(t.Context(), statement); err != nil {
+			t.Fatalf("set the two schemas up: %v", err)
+		}
+	}
+	if err := container.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	upgraded := openAt(t, target)
+	scoped := upgraded.For("sid-neighbour")
+	if err := scoped.Bind(t.Context(), types.NewJID("5511999990001", types.DefaultUserServer)); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	part := store.MediaPart{
+		MessageID: "3EB0NEIGHBOUR", ChatKind: "phone", ChatID: "5511999990002", Kind: "image",
+		DirectPath: "/v/p", Mime: "image/jpeg", Filename: "n.jpg", FileLength: 3,
+		ReceiptChat: "5511999990002@s.whatsapp.net",
+	}
+	if err := scoped.PutMediaPart(t.Context(), &part, time.Now()); err != nil {
+		t.Fatalf("a write landed on a table the migration thought already had the column: %v", err)
 	}
 }

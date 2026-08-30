@@ -449,7 +449,11 @@ func (s *Session) remember(event *waEvents.Message, part *attachment) {
 		// Not for the download, which needs only the path, the key and the digests.
 		// These are what a request to re-upload the file is addressed with once WhatsApp
 		// has dropped it, and the message is the only place they exist.
-		Sender: event.Info.Sender.String(), FromMe: event.Info.IsFromMe,
+		// The chat as it was *sent* to, which is not the one above: for a broadcast,
+		// chatOf publishes under the sender because that is where WhatsApp shows it, and
+		// a receipt addressed from that names a message WhatsApp cannot find.
+		ReceiptChat: event.Info.Chat.String(),
+		Sender:      event.Info.Sender.String(), FromMe: event.Info.IsFromMe,
 	}
 	if err := s.store.PutMediaPart(ctx, &kept, time.Now()); err != nil {
 		s.log.Warn().Err(err).Str("message_id", messageID).
@@ -557,6 +561,20 @@ func (s *Session) refetchReuploaded(
 		return protocol.MediaRef{}, gone
 	}
 	part.download = fresh
+
+	// Written back before the bytes are fetched, so the next caller starts from the path
+	// that works. The blob this is about to make is dropped on its TTL or evicted by the
+	// quota, and without this the request after that would spend the 404 and the wait on
+	// the phone all over again -- for a file WhatsApp is now serving perfectly well.
+	fresher := *kept
+	fresher.DirectPath = fresh.GetDirectPath()
+	if err := s.store.PutMediaPart(ctx, &fresher, time.Now()); err != nil {
+		// Logged, not returned. The file is about to be fetched either way; refusing it
+		// because the next caller may have to ask twice trades a file that arrives for
+		// one that might.
+		s.log.Warn().Err(err).Str("message_id", kept.MessageID).
+			Msg("fetched a file from a fresh path this session will not remember")
+	}
 
 	// Its own window, and not what is left of the one the first attempt spent: the wait
 	// on the phone has already taken part of the caller's deadline, and a download given
