@@ -537,7 +537,7 @@ func readBlock(heartbeat time.Duration) time.Duration { return heartbeat / readB
 // dispatched is released, so it stays pending and comes back on a later pass.
 func (c *Connector) dispatchWithin(ctx context.Context, deliveries []transport.Delivery) bool {
 	for i := range deliveries {
-		if ctx.Err() != nil || !c.roomFor(ctx) {
+		if ctx.Err() != nil || !c.roomFor(ctx, &deliveries[i]) {
 			for rest := i; rest < len(deliveries); rest++ {
 				if deliveries[rest].Release != nil {
 					deliveries[rest].Release()
@@ -552,21 +552,30 @@ func (c *Connector) dispatchWithin(ctx context.Context, deliveries []transport.D
 	return true
 }
 
-// roomFor reports whether the window can still give a delivery a real turn.
+// roomFor reports whether the window can still give this delivery a real turn.
 //
-// Every command spends at least one round trip before this goroutine is done with it: a
-// wake adopts a session, which reads the store; a ping and a refusal answer the caller
-// over Redis; and each of them is acknowledged. One dispatched with a sliver of window
-// has that trip cut, and the acknowledgement lands anyway -- it runs on a detached
-// timeout on purpose -- so the command is retired while the answer the caller is waiting
-// for never went out. The manager forfeits a wake whose turn was spent, which is right
-// for a turn that was taken, but a sliver is not a turn and the forfeit costs the
-// session a whole claim delay.
+// Only the two commands the manager carries out on this goroutine are held to a floor,
+// and they are the two that spend the window: a wake adopts a session, which reads the
+// store, and a ping answers the caller over Redis. One dispatched with a sliver has that
+// trip cut and is retired all the same -- the acknowledgement runs on a detached timeout
+// on purpose -- so a wake costs the session a whole claim delay for an attempt that never
+// was, and a ping leaves its caller waiting for an answer no redelivery will produce.
+// Below the floor they are released instead, age kept, and the next pass gives them a
+// window worth having.
 //
-// Below the floor the delivery is released instead, age kept, and the next pass gives it
-// a window worth having. What follows a released one is released with it, so nothing
-// overtakes a command that kept its place.
-func (c *Connector) roomFor(ctx context.Context) bool {
+// Everything else is an offer to a session's queue, which returns at once and is carried
+// out on that session's own goroutine, and holding one back would cost more than the
+// sliver does. A command read from a session's stream and then released stays pending
+// while the next `>` read can hand over a newer one for the same session -- the reclaim
+// walks the sessions a window at a time, so the older entry can wait several ticks for a
+// pass that looks at its stream -- which is the per-session order the single stream
+// exists to give, traded away for a round trip that was not going to block anyway.
+func (c *Connector) roomFor(ctx context.Context, delivery *transport.Delivery) bool {
+	switch delivery.Command.Type {
+	case protocol.CommandSessionWake, protocol.CommandAdminPing:
+	default:
+		return true
+	}
 	deadline, bounded := ctx.Deadline()
 	if !bounded {
 		return true

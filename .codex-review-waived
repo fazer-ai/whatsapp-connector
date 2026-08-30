@@ -312,3 +312,11 @@ internal/app/dispatch_internal_test.go: Replace wall-clock polling with a comple
 # it would refuse configurations that work whenever adoption is fast. The attempt is not
 # silent either (an error per attempt, and now a warning at boot naming the condition).
 internal/app/config.go: Reject heartbeats shorter than an adoption turn  # PR#65 r8 -> #76
+# PR#65: right about the mechanism, and the half this PR put there is fixed rather than
+# waived: the floor now stops at the two commands the loop goroutine carries out, so a
+# session's command is never held back by it. What is left is older than this PR -- a
+# batch cut off by its deadline releases the rest, and the reclaim walks the sessions a
+# window at a time while `>` covers all of them -- and closing it needs the read to know
+# when a reclaim has drained a stream, which the drain path tracks and the reclaim path
+# does not. Registered as #77 with both candidate shapes.
+internal/app/run.go: Preserve FIFO after releasing a late read  # PR#65 r9 -> #77

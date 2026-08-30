@@ -258,6 +258,47 @@ func TestADrainDispatchesOnWhatIsLeftOfItsWindow(t *testing.T) {
 // retried on the next pass with a window worth having. Forfeit stays what it was,
 // because a wake that consumed a real window and stalled must lose its place at the
 // head of the queue, or a stuck store starves every wake behind it forever.
+// The floor stops at the two commands this goroutine carries out. A command for a
+// session is offered to that session's queue and returns at once, and holding one back
+// would trade the order the single stream exists to give: released, it stays pending
+// while the next `>` read hands over a newer command for the same session, and the
+// reclaim walks the sessions a window at a time before it looks at that stream again.
+func TestASessionCommandIsNotHeldBackByTheFloor(t *testing.T) {
+	t.Parallel()
+
+	manager := newTestManager(t)
+	const sid = "2f1c6f0e-0000-4000-8000-0000000000fd"
+	if _, err := manager.Adopt(context.Background(), sid); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	connector := &Connector{
+		cfg:     Config{LeaseTTL: 30 * time.Second, Heartbeat: 600 * time.Millisecond},
+		log:     zerolog.Nop(),
+		manager: manager,
+	}
+
+	var released atomic.Int64
+	deliveries := []transport.Delivery{{
+		Command: protocol.Command{
+			V: protocol.Version, ID: "send-late", Type: protocol.CommandMessageSend,
+			SID: sid, TS: 1787000000000,
+			Payload: json.RawMessage(`{"to":{"kind":"user","id":"5511999999999"},"message_id":"m1",` +
+				`"content":{"type":"text","text":"hi"}}`),
+		},
+		Ack:     func(context.Context) error { return nil },
+		Release: func() { released.Add(1) },
+	}}
+
+	sliver, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	connector.dispatchWithin(sliver, deliveries)
+
+	if released.Load() != 0 {
+		t.Fatalf("a session command was released %d time(s) over a sliver, which leaves it pending while a newer one can be read and run first",
+			released.Load())
+	}
+}
+
 // The floor is not only the wake's. An inline answer is a round trip too, and the
 // acknowledgement that follows it runs on a detached timeout: dispatched with a sliver,
 // the reply never leaves while the command is retired all the same, and the caller
