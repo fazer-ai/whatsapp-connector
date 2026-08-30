@@ -20,6 +20,7 @@ import (
 	"github.com/fazer-ai/whatsapp-connector/internal/media"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 	"github.com/fazer-ai/whatsapp-connector/internal/redisx"
+	"github.com/fazer-ai/whatsapp-connector/internal/session"
 	"github.com/fazer-ai/whatsapp-connector/internal/transport/redisstream"
 )
 
@@ -477,6 +478,17 @@ func TestASessionWithALongBacklogIsDrainedBeforeItIsRead(t *testing.T) {
 	const sid = "2f1c6f0e-0000-4000-8000-00000000000b"
 	// More than one claim can take, so finishing the drain needs several passes.
 	const backlog = redisstream.DefaultReadCount + 5
+	// And the whole of it, plus the connect behind it, has to fit the session's queue
+	// with the executor not having run at all: the loop offers everything a drain claims
+	// before the executor is guaranteed a turn, and an offer past the bound is refused
+	// `rate_limited`. When the two constants met exactly, this test held a margin of five
+	// slots it never waited for, and lost it on a loaded runner -- a CI failure on a PR
+	// that touched nothing in here. Checked loudly, so a change to either constant fails
+	// on this line instead of narrowing the margin back into a race.
+	if backlog+1 > session.DefaultQueueDepth {
+		t.Fatalf("a backlog of %d and the connect behind it do not fit a queue of %d: "+
+			"the test would be racing the executor for the missing slots", backlog, session.DefaultQueueDepth)
+	}
 	commands := c.key.Commands(sid)
 
 	if err := c.rdb.XGroupCreateMkStream(ctx, commands, redisstream.ConsumerGroup, "0").Err(); err != nil {

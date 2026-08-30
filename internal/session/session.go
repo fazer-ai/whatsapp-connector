@@ -73,7 +73,15 @@ type Config struct {
 }
 
 // DefaultQueueDepth is the command backlog one session accepts.
-const DefaultQueueDepth = 64
+//
+// A whole claim batch with room to spare, and the headroom is the point rather than
+// generosity: adopting a session dispatches everything its previous owner left pending
+// -- up to a full batch per pass -- into this queue before the executor has had a turn,
+// and an offer the queue cannot take is refused `rate_limited` and acknowledged. With
+// the two bounds equal, a session adopted with a full batch waiting refused whatever
+// arrived behind the backlog unless the executor happened to win the race, and for a
+// redelivered fire-and-forget command that refusal retires it unrun.
+const DefaultQueueDepth = 128
 
 // New starts the session's two goroutines: the pump, which publishes what the engine
 // emits, and the executor, which runs commands in the order they arrived.
