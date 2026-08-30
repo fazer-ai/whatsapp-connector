@@ -149,6 +149,11 @@ type Session struct {
 	// worth another delivery.
 	unseal func(context.Context, *waEvents.Message) (*waE2E.Message, error)
 
+	// unsealReaction opens a reaction sealed under the secret of the message it is on,
+	// and nil is the socket's own. Replaced by the tests that stand in for the two ways
+	// it fails, which are opposite answers and neither is reachable from a stanza alone.
+	unsealReaction func(context.Context, *waEvents.Message) (*waE2E.ReactionMessage, error)
+
 	// handoffWait bounds how long a moment waits on a reader that is busy. A field for
 	// the same reason as deliverWait, and for no other.
 	handoffWait time.Duration

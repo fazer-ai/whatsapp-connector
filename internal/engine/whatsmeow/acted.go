@@ -88,6 +88,9 @@ func (s *Session) changed(event *waEvents.Message) change {
 	if sealed.GetSecretEncType() == waE2E.SecretEncryptedMessage_MESSAGE_EDIT {
 		return s.unsealedCorrection(event, sealed)
 	}
+	if reaction := event.Message.GetEncReactionMessage(); reaction != nil {
+		return s.unsealedReaction(event, reaction)
+	}
 	return changeOf(event)
 }
 
@@ -184,15 +187,6 @@ func changeOf(event *waEvents.Message) change {
 	switch {
 	case event.Message.GetReactionMessage() != nil:
 		return reactionOf(event, event.Message.GetReactionMessage())
-
-	case event.Message.GetEncReactionMessage() != nil:
-		// A community announcement group seals its reactions under the secret of the
-		// message being reacted to. Opening one takes the device store the way a sealed
-		// correction does, and the target it names is on the envelope rather than in the
-		// plaintext -- but unlike a correction it is not the ordinary shape, and every
-		// reaction in a direct chat arrives in the clear. Kept on the phone, because a
-		// build that learns to read them can still publish it. Issue #38.
-		return withholding("withholding an acknowledgement for a reaction sealed under a message secret this build does not read")
 
 	case event.IsEdit,
 		event.Info.Edit == waTypes.EditAttributeMessageEdit,
@@ -373,6 +367,54 @@ func revokes(event *waEvents.Message) bool {
 
 // reactionOf renders `message.reaction`, which is also how a reaction is taken back: an
 // empty emoji is the removal, and it is the one field here that is never omitted.
+// unsealedReaction opens a reaction a community announcement group sealed under the
+// secret of the message it is on, and renders it.
+//
+// Withheld until this build could read one, which was a redelivery loop: WhatsApp sends
+// an unacknowledged stanza again for as long as the session is up, so an account in a
+// community whose announcement group it follows paid a warn line per reaction, forever.
+// Everything about the split below is the sealed correction's, for the same reasons.
+//
+// The key is the part that is easy to get wrong and silent when you do. EncryptReaction
+// takes the key off the reaction before sealing it and puts it on the envelope, so what
+// comes back out of the decryption names no message at all. Handed to reactionOf as-is
+// it is dropped for naming no target -- with the emoji decrypted and in hand, and
+// nothing in the log saying the reaction was ever readable.
+func (s *Session) unsealedReaction(event *waEvents.Message, sealed *waE2E.EncReactionMessage) change {
+	open := s.unsealReaction
+	if open == nil {
+		open = s.unsealReactionOverStore
+	}
+	// Bounded, because this runs on whatsmeow's own node handler: a store that never
+	// answers would hold the socket's next node behind it with nothing to release it.
+	ctx, cancel := context.WithTimeout(s.ctx, s.storeLimit)
+	defer cancel()
+
+	reaction, err := open(ctx, event)
+	switch {
+	case errors.Is(err, wm.ErrNotLoggedIn), errors.Is(err, wm.ErrClientIsNil),
+		errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+		// Not final. The socket is not up yet, or the store ran out of time, and the
+		// same stanza redelivered to a session that is ready opens.
+		return withholding("withholding an acknowledgement for a reaction this session could not reach its keys for").because(err)
+	case err != nil:
+		// Final. The secret was stored when the message being reacted to arrived, and a
+		// session that never saw that message is not handed it by a redelivery: keeping
+		// this would buy the loop back for the one case that can never resolve.
+		return dropping("dropping a reaction this session has no key for").because(err)
+	}
+
+	reaction.Key = sealed.GetTargetMessageKey()
+	return reactionOf(event, reaction)
+}
+
+// unsealReactionOverStore is what opens a sealed reaction when nothing has replaced it.
+func (s *Session) unsealReactionOverStore(
+	ctx context.Context, event *waEvents.Message,
+) (*waE2E.ReactionMessage, error) {
+	return s.current().DecryptReaction(ctx, event)
+}
+
 func reactionOf(event *waEvents.Message, reaction *waE2E.ReactionMessage) change {
 	target := reaction.GetKey().GetID()
 	switch {
