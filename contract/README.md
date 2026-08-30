@@ -106,6 +106,16 @@ theirs, and the connector is always upgraded first.
   Providers that cannot accept a caller-supplied id use `client_ref` instead.
 - Media bytes never travel in a frame. Inbound media carries a `media_ref` the
   client fetches over HTTP; outbound media carries a URL the connector fetches.
+- A media message published with no `ref` is followed by `media.download_failed`, and
+  `recoverable` on it is what says whether that is the end. False is every reason the
+  file is not coming back -- the key lapsed, the bytes did not check out, the file is
+  past what the instance keeps -- and the client flags the bubble. True is WhatsApp
+  having dropped the file while the sender's phone may still hold it, and it is an
+  invitation: `message.download_media` asks the phone to upload it again and answers
+  with a fresh `media_ref`. The connector does not ask on its own, because the inbound
+  path runs on a node handler it cannot spend somebody's phone waking up. A producer
+  that predates the field leaves it out, and absent reads as false, which is the
+  behaviour every client already had.
 - An absent field and an explicit `null` mean the same thing to a client, so a field
   that has to distinguish "there is none" from "this producer does not say" carries
   its own flag. `group_info.has_picture` is the one such field today: a `picture_url`

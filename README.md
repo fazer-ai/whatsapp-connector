@@ -18,7 +18,9 @@ events and commands with its clients over Redis Streams.
 > unavailable rather than loading forever. A blob lives on the instance that downloaded it
 > and for a bounded time, and `message.download_media` fetches the file again from the
 > coordinates kept beside the message, so an attachment survives the instance being
-> replaced between the event and the client's fetch.
+> replaced between the event and the client's fetch. When WhatsApp has dropped the file
+> but the sender's phone may still hold it, that same command asks the phone to upload it
+> again, and the failure that announced it says `recoverable` so a client knows to ask.
 >
 > Outbound, a media message names a URL this connector fetches, with whatever headers open
 > it, and streams to WhatsApp without holding the file in memory; a location goes out as a

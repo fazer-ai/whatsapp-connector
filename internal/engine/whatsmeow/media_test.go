@@ -361,7 +361,7 @@ func TestAFileThatIsNotComingIsAnnouncedAfterTheMessageItBelongsTo(t *testing.T)
 	if err := json.Unmarshal(emissions[1].Payload, &failure); err != nil {
 		t.Fatalf("decode the failure: %v", err)
 	}
-	if failure.MessageID != "3EB0GONE" || failure.Reason != reasonMediaExpired {
+	if failure.MessageID != "3EB0GONE" || failure.Reason != reasonMediaOffCDN {
 		t.Fatalf("the failure is %+v, want the message it belongs to and why", failure)
 	}
 	if failure.Chat.ID != "5511999990001" {
@@ -380,12 +380,17 @@ func TestADownloadIsOnlyGivenUpOnWhenAnotherAttemptWouldFailTheSameWay(t *testin
 		name string
 		err  error
 		want string
+		// back is whether the client is invited to come back for the file. Only the
+		// CDN having dropped it is, and the table carries it so the two halves of the
+		// announcement are read together: a reason without it is half an answer.
+		back bool
 	}{
-		{"the file is past its life on WhatsApp's servers", wm.ErrMediaDownloadFailedWith410, reasonMediaExpired},
-		{"the key that decrypts it has lapsed", wm.ErrMediaDownloadFailedWith403, reasonMediaExpired},
-		{"the bytes are not the ones the message describes", wm.ErrInvalidMediaSHA256, reasonCorrupt},
-		{"the ciphertext does not authenticate", wm.ErrInvalidMediaHMAC, reasonCorrupt},
-		{"the message names no file to fetch", wm.ErrNoURLPresent, reasonUnreferenced},
+		{"the file is off WhatsApp's servers", wm.ErrMediaDownloadFailedWith410, reasonMediaOffCDN, true},
+		{"the file was never on the one asked", wm.ErrMediaDownloadFailedWith404, reasonMediaOffCDN, true},
+		{"the key that decrypts it has lapsed", wm.ErrMediaDownloadFailedWith403, reasonMediaExpired, false},
+		{"the bytes are not the ones the message describes", wm.ErrInvalidMediaSHA256, reasonCorrupt, false},
+		{"the ciphertext does not authenticate", wm.ErrInvalidMediaHMAC, reasonCorrupt, false},
+		{"the message names no file to fetch", wm.ErrNoURLPresent, reasonUnreferenced, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -404,7 +409,48 @@ func TestADownloadIsOnlyGivenUpOnWhenAnotherAttemptWouldFailTheSameWay(t *testin
 			if failure.Reason != tc.want {
 				t.Fatalf("the reason is %q, want %q", failure.Reason, tc.want)
 			}
+			if failure.Recoverable != tc.back {
+				t.Fatalf("the failure says recoverable=%v, want %v", failure.Recoverable, tc.back)
+			}
+
+			// The coordinates are kept for exactly the failure the client is invited to
+			// come back from, and for no other: a row written for a file nothing can
+			// bring back is a row the retention has to carry for nothing.
+			_, found, err := session.store.MediaPart(t.Context(), "3EB0PERM")
+			if err != nil {
+				t.Fatalf("MediaPart: %v", err)
+			}
+			if found != tc.back {
+				t.Fatalf("the coordinates were kept=%v, want %v", found, tc.back)
+			}
 		})
+	}
+}
+
+// The invitation is only as good as the coordinates behind it. A store that refused the
+// write -- a database that is not answering, a session already handed to another instance
+// -- leaves `message.download_media` with nothing to look up, and it answers that the file
+// is unavailable, which is final on the client. Announced as recoverable anyway, that is a
+// round trip whose only outcome is the bubble the client would have flagged at once.
+func TestAFileWhoseCoordinatesCouldNotBeKeptIsNotAnnouncedAsRecoverable(t *testing.T) {
+	t.Parallel()
+
+	session, downloads := mediaSession(t, media.Options{})
+	downloads.answer(nil, wm.ErrMediaDownloadFailedWith404)
+	// The session no longer owns the device, which is what a handoff leaves behind and
+	// what every fenced write answers with.
+	session.store.Drop()
+
+	emissions, acknowledged := deliver(t, session, imageEvent("3EB0NOROW"), 2)
+	if !acknowledged {
+		t.Fatal("a message whose file is not coming was left for WhatsApp to redeliver forever")
+	}
+	var failure protocol.MediaDownloadFailure
+	if err := json.Unmarshal(emissions[1].Payload, &failure); err != nil {
+		t.Fatalf("decode the failure: %v", err)
+	}
+	if failure.Recoverable {
+		t.Fatal("a file whose coordinates were not kept was announced as one to come back for")
 	}
 }
 
