@@ -224,6 +224,16 @@ internal/engine/whatsmeow/receipt.go: Fail group read marks when normalization f
 # rather than folded in here, because the subscription set it would have to keep is
 # unbounded by construction and deciding how to bound it is not this slice's decision.
 # Registered as #46.
+#
+# PR#73 built that replay, and both commands are still excluded. The reason is now a
+# different one and a narrower one. The availability is put back on every connection, so
+# within one session a redelivery answered from the ledger no longer reports success over
+# a connection where nothing was done -- but the memory is the session's and the ledger is
+# shared, so a session built by the instance that takes the account over has never heard
+# the command and has nothing to put back. Subscriptions are not replayed at all: the
+# contract now says a client re-establishes them on `session.state: open`, which is a
+# decision about who owns that set rather than a gap. Making the availability durable
+# enough to take `presence.set` out of this table is #72.
 internal/protocol/types.go: Preserve idempotency for redelivered presence commands  # PR#45
 # PR#45: the claim is true and the remedy is worse than what it fixes. Cancelling a
 # context does not un-send bytes Redis has already buffered, so an XADD can be appended

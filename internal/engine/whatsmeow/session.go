@@ -190,7 +190,7 @@ type Session struct {
 	// Its own lock rather than mu, and held for the field and nothing else -- never
 	// across the write, so the one path that must not wait on a socket does not: a
 	// rebuild clears this, and a rebuild is what a logout is waiting on.
-	availability   *waTypes.Presence
+	availability   *asked
 	availabilityMu sync.Mutex
 
 	// presenceWait bounds the presence node nobody is waiting on: the one a connection
@@ -1237,9 +1237,9 @@ func (s *Session) rebuild(ctx context.Context) error {
 	s.detach(previous, handlerID)
 	previous.Disconnect()
 
-	// Every path here has just forgotten the device, so the account this session was
-	// holding a presence for is gone. Carried over, it would mark whatever pairs next
-	// available without that client ever having asked.
+	// Dropped with the client it was filed under. Every path here has just forgotten the
+	// device, so the account that asked for it is gone, and carried over it would mark
+	// whatever pairs next available without that client ever having asked.
 	s.forgetAvailability()
 
 	// A false here is the session having closed while this ran, which adopt has already

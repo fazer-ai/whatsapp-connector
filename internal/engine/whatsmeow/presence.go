@@ -256,7 +256,13 @@ func (s *Session) setPresence(ctx context.Context, command *protocol.Command) (j
 	}
 	defer release()
 
-	if err := s.sendPresence(ctx, s.current(), state); err != nil {
+	// The client the node actually goes out on, and it is what the state is filed
+	// under. WhatsApp can log this account out while the send is in flight, and the
+	// rebuild behind that runs whether or not a presence is on its way: without the
+	// stamp this line puts the old account's state back after the rebuild dropped it,
+	// and whatever pairs next is marked available on the strength of it.
+	client := s.current()
+	if err := s.sendPresence(ctx, client, state); err != nil {
 		s.log.Warn().Err(err).Msg("a presence did not go out")
 		return nil, presenceFailure(err)
 	}
@@ -264,7 +270,7 @@ func (s *Session) setPresence(ctx context.Context, command *protocol.Command) (j
 	// wrote before it. A set that failed is not remembered at all: it is the client's to
 	// try again, and reapplying it on the next connection would put back a state nobody
 	// was ever told this session was in.
-	s.rememberAvailability(state)
+	s.rememberAvailability(state, client)
 	return nil, nil
 }
 
@@ -307,7 +313,7 @@ func (s *Session) reapplyAvailability(ctx context.Context, client *wm.Client) {
 	}
 	defer release()
 
-	state, asked := s.rememberedAvailability()
+	state, asked := s.rememberedAvailability(client)
 	if !asked {
 		return
 	}
@@ -323,28 +329,43 @@ func (s *Session) takePresenceWrite(ctx context.Context) (func(), error) {
 	case s.presenceWrite <- struct{}{}:
 		return func() { <-s.presenceWrite }, nil
 	case <-ctx.Done():
-		return nil, protocol.NewError(protocol.ErrorNotConnected,
+		// Not `not_connected`, which sends a client off to wait for a socket that is
+		// there. This ran out of its own time behind a presence the socket has not
+		// finished taking, and the answer to that is to ask again.
+		return nil, protocol.NewError(protocol.ErrorTimeout,
 			"the presence before this one is still on its way to WhatsApp")
 	}
 }
 
 // rememberAvailability records what WhatsApp has taken, and rememberedAvailability reads
-// it back. Both hold the lock for the field alone: a presence node is written outside
-// it, so nothing that only wants to know or to forget waits on a socket.
-func (s *Session) rememberAvailability(state waTypes.Presence) {
+// it back for the client asking. Both hold the lock for the field alone: a presence node
+// is written outside it, so nothing that only wants to know or to forget waits on a
+// socket.
+//
+// Filed under the client it was set on, and read back only for that one. `adopt` is the
+// only thing that assigns a client, so a different one here is a session that has been
+// rebuilt since -- which is to say the account this belonged to is gone, and its
+// availability is not the next one's to inherit.
+func (s *Session) rememberAvailability(state waTypes.Presence, on *wm.Client) {
 	s.availabilityMu.Lock()
-	s.availability = &state
+	s.availability = &asked{state: state, on: on}
 	s.availabilityMu.Unlock()
 }
 
-func (s *Session) rememberedAvailability() (waTypes.Presence, bool) {
+func (s *Session) rememberedAvailability(on *wm.Client) (waTypes.Presence, bool) {
 	s.availabilityMu.Lock()
 	defer s.availabilityMu.Unlock()
 
-	if s.availability == nil {
+	if s.availability == nil || s.availability.on != on {
 		return "", false
 	}
-	return *s.availability, true
+	return s.availability.state, true
+}
+
+// asked is a presence a client asked for, and the client it was put on the wire by.
+type asked struct {
+	state waTypes.Presence
+	on    *wm.Client
 }
 
 // forgetAvailability drops what this session was holding, for a session whose account

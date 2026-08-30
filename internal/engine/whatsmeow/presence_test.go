@@ -1368,7 +1368,7 @@ func TestASetAndAReconnectDoNotRaceOverTheAvailability(t *testing.T) {
 	}
 	running.Wait()
 
-	if session.availability == nil {
+	if _, asked := session.rememberedAvailability(session.current()); !asked {
 		t.Error("a session that was set available forgot it")
 	}
 }
@@ -1426,7 +1426,7 @@ func TestAPresenceCommandDoesNotWaitPastItsDeadlineOnAWriteThatIsStuck(t *testin
 
 	select {
 	case err := <-answered:
-		assertCode(t, err, protocol.ErrorNotConnected)
+		assertCode(t, err, protocol.ErrorTimeout)
 	case <-time.After(5 * time.Second):
 		t.Fatal("a presence command was still parked on a write that was going nowhere, and so was every command behind it")
 	}
@@ -1502,9 +1502,40 @@ func TestWhatsAppIsLeftHoldingWhatThisSessionRemembers(t *testing.T) {
 
 	written := wire.states()
 	last := written[len(written)-1]
-	remembered, asked := session.rememberedAvailability()
+	remembered, asked := session.rememberedAvailability(session.current())
 	if !asked || last != remembered {
 		t.Errorf("WhatsApp was left holding %q and this session remembers %q, out of %v", last, remembered, written)
+	}
+}
+
+// WhatsApp can log this account out while a `presence.set` is already on the wire, and
+// the rebuild behind that runs whether or not a presence is on its way -- it no longer
+// waits for one, which is the point of the right being a channel. So the command can come
+// back to a session that has moved on, and file the gone account's state under the
+// session that replaced it. The next account to pair would be marked available on the
+// strength of a command its client never sent.
+func TestAnAvailabilityFiledAfterARebuildIsNotTheNextAccountsToInherit(t *testing.T) {
+	t.Parallel()
+
+	session, wire := availableSession(t)
+	// The rebuild happens inside the send, so the command reaches the line that files
+	// the state with the session already on a different client. That is the ordering the
+	// race produces, and waiting for it to happen by itself is waiting on a scheduler.
+	hand := wire.hand
+	session.sendPresence = func(ctx context.Context, client *wm.Client, state waTypes.Presence) error {
+		if err := session.recover(t.Context()); err != nil {
+			t.Errorf("recover: %v", err)
+		}
+		return hand(ctx, client, state)
+	}
+	if _, err := session.setPresence(t.Context(), presenceCommand("available")); err != nil {
+		t.Fatalf("setPresence: %v", err)
+	}
+	wire.next(t, "the command the client sent")
+
+	session.reapplyAvailability(t.Context(), session.current())
+	if got := wire.states(); len(got) != 1 {
+		t.Errorf("the wire saw %v, and the presence of the account that was logged out is in there", got)
 	}
 }
 
