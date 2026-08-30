@@ -427,6 +427,33 @@ func TestADownloadIsOnlyGivenUpOnWhenAnotherAttemptWouldFailTheSameWay(t *testin
 	}
 }
 
+// The invitation is only as good as the coordinates behind it. A store that refused the
+// write -- a database that is not answering, a session already handed to another instance
+// -- leaves `message.download_media` with nothing to look up, and it answers that the file
+// is unavailable, which is final on the client. Announced as recoverable anyway, that is a
+// round trip whose only outcome is the bubble the client would have flagged at once.
+func TestAFileWhoseCoordinatesCouldNotBeKeptIsNotAnnouncedAsRecoverable(t *testing.T) {
+	t.Parallel()
+
+	session, downloads := mediaSession(t, media.Options{})
+	downloads.answer(nil, wm.ErrMediaDownloadFailedWith404)
+	// The session no longer owns the device, which is what a handoff leaves behind and
+	// what every fenced write answers with.
+	session.store.Drop()
+
+	emissions, acknowledged := deliver(t, session, imageEvent("3EB0NOROW"), 2)
+	if !acknowledged {
+		t.Fatal("a message whose file is not coming was left for WhatsApp to redeliver forever")
+	}
+	var failure protocol.MediaDownloadFailure
+	if err := json.Unmarshal(emissions[1].Payload, &failure); err != nil {
+		t.Fatalf("decode the failure: %v", err)
+	}
+	if failure.Recoverable {
+		t.Fatal("a file whose coordinates were not kept was announced as one to come back for")
+	}
+}
+
 // It also guards the placeholder. A body with no arm is published as unsupported rather
 // than withheld, and a file whose bytes may arrive next time is the opposite case: reached
 // through that path it would be acknowledged, spending the redelivery the retry was for.

@@ -256,20 +256,22 @@ func (s *Session) mediaBody(ctx context.Context, event *waEvents.Message) (body,
 	var giveUp refused
 	switch {
 	case errors.As(err, &giveUp):
-		recoverable := agedOffTheCDN(err)
-		if recoverable {
-			// Kept even though there is no file, and only for this one reason. What the
-			// client is about to be invited to ask for is fetched from the coordinates on
-			// the original message, and this is the last place they exist -- so without
-			// this the invitation reaches a `message.download_media` that answers there
-			// is nothing kept for that message, which is final on the client and is the
-			// bubble the invitation was trying to save.
-			//
-			// The size recorded here is the sender's claim rather than a measurement,
-			// because nothing was measured. It only decides whether a refetch starts at
-			// all; a sender who understated is still caught by the cap on the way in.
-			s.remember(event, &part)
-		}
+		// Kept even though there is no file, and only for this one reason. What the client
+		// is about to be invited to ask for is fetched from the coordinates on the original
+		// message, and this is the last place they exist -- so without this the invitation
+		// reaches a `message.download_media` that answers there is nothing kept for that
+		// message, which is final on the client and is the bubble the invitation was
+		// trying to save.
+		//
+		// Which is also why the invitation waits on the write rather than going out beside
+		// it. A store that refused -- a database that is not answering, a session already
+		// handed to another instance -- leaves the same dead end, reached one round trip
+		// later. The client is better told at once that the file is not coming.
+		//
+		// The size recorded here is the sender's claim rather than a measurement, because
+		// nothing was measured. It only decides whether a refetch starts at all; a sender
+		// who understated is still caught by the cap on the way in.
+		recoverable := agedOffTheCDN(err) && s.remember(event, &part)
 		s.log.Warn().Err(err).Str("kind", string(part.content.Kind)).Bool("recoverable", recoverable).
 			Msg("publishing a media message whose file did not arrive with it")
 		return body{
@@ -454,7 +456,7 @@ func (s *Session) blobURL(id string) string {
 
 // --- fetching the same file a second time ------------------------------------------
 
-// remember records how to fetch this message's file again.
+// remember records how to fetch this message's file again, and reports whether it did.
 //
 // The reference published with an event stops working, and on a schedule the client
 // cannot see: the blob is dropped on its TTL or evicted by the quota, and the instance
@@ -465,8 +467,9 @@ func (s *Session) blobURL(id string) string {
 // A failure here is logged rather than returned. The message is going out either way --
 // with a reference that works, or with an invitation to come back for the file -- and
 // withholding it because a later refetch might not be possible trades a message that
-// arrives for one that might.
-func (s *Session) remember(event *waEvents.Message, part *attachment) {
+// arrives for one that might. What the answer decides is whether the invitation is issued
+// at all, which is the caller's to read.
+func (s *Session) remember(event *waEvents.Message, part *attachment) bool {
 	ctx, cancel := context.WithTimeout(s.ctx, s.storeLimit)
 	defer cancel()
 
@@ -493,7 +496,9 @@ func (s *Session) remember(event *waEvents.Message, part *attachment) {
 	if err := s.store.PutMediaPart(ctx, &kept, time.Now()); err != nil {
 		s.log.Warn().Err(err).Str("message_id", messageID).
 			Msg("published a file this session will not be able to fetch a second time")
+		return false
 	}
+	return true
 }
 
 // downloadMedia is `message.download_media`: the file of a message this session already
