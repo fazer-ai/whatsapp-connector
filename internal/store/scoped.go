@@ -97,6 +97,15 @@ func (s *Scoped) PutMediaPart(ctx context.Context, part *MediaPart, now time.Tim
 	return s.container.putMediaPart(ctx, &kept, now)
 }
 
+// RefreshDirectPath replaces where a message's file is fetched from, and only while the
+// row is still the one the caller read.
+func (s *Scoped) RefreshDirectPath(ctx context.Context, messageID, path string, unchangedSince int64) error {
+	if err := s.fence.held(); err != nil {
+		return err
+	}
+	return s.container.refreshDirectPath(ctx, s.sid, messageID, path, unchangedSince)
+}
+
 // MediaPart reads back what PutMediaPart kept for one message.
 func (s *Scoped) MediaPart(ctx context.Context, messageID string) (MediaPart, bool, error) {
 	return s.container.mediaPart(ctx, s.sid, messageID)

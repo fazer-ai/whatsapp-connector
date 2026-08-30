@@ -446,6 +446,14 @@ func (s *Session) remember(event *waEvents.Message, part *attachment) {
 		DirectPath: part.download.GetDirectPath(), MediaKey: part.download.GetMediaKey(),
 		FileEncSHA256: part.download.GetFileEncSHA256(), FileSHA256: part.download.GetFileSHA256(),
 		FileLength: part.content.Size, Mime: part.content.Mime, Filename: part.content.Filename,
+		// Not for the download, which needs only the path, the key and the digests.
+		// These are what a request to re-upload the file is addressed with once WhatsApp
+		// has dropped it, and the message is the only place they exist.
+		// The chat as it was *sent* to, which is not the one above: for a broadcast,
+		// chatOf publishes under the sender because that is where WhatsApp shows it, and
+		// a receipt addressed from that names a message WhatsApp cannot find.
+		ReceiptChat: event.Info.Chat.String(),
+		Sender:      event.Info.Sender.String(), FromMe: event.Info.IsFromMe,
 	}
 	if err := s.store.PutMediaPart(ctx, &kept, time.Now()); err != nil {
 		s.log.Warn().Err(err).Str("message_id", messageID).
@@ -520,11 +528,109 @@ func (s *Session) downloadMedia(ctx context.Context, command *protocol.Command) 
 	defer cancel()
 
 	ref, err := s.fetch(download, &part)
+	if err != nil && agedOffTheCDN(err) {
+		// WhatsApp keeps a file for a bounded time and the sender's phone often still
+		// has it. Asked for here and not on the inbound path, and on the caller's
+		// deadline rather than one this invents: see askForReupload.
+		//
+		// The first failure is what is reported if this comes to nothing. The phone
+		// declining, or not answering, says nothing the caller did not already know
+		// from the 404.
+		ref, err = s.refetchReuploaded(ctx, &kept, err)
+	}
 	if err != nil {
 		s.log.Warn().Err(err).Str("message_id", body.MessageID).Msg("could not fetch a file a second time")
 		return nil, refetchFailure(err)
 	}
 	return json.Marshal(ref)
+}
+
+// refetchReuploaded asks the sender's phone to upload the file again and fetches what it
+// answers with, and hands back the download's own failure when that comes to nothing.
+func (s *Session) refetchReuploaded(
+	ctx context.Context, kept *store.MediaPart, gone error,
+) (protocol.MediaRef, error) {
+	fresh, err := s.askForReupload(ctx, kept)
+	if err != nil {
+		s.log.Info().Err(err).Str("message_id", kept.MessageID).
+			Msg("a file WhatsApp had dropped was not uploaded again")
+		if !answeredNo(err) {
+			// The phone was not reached, or did not answer in time. That says nothing
+			// about the file, so it must not come back as the 404 does: `gone` is final
+			// on the client, and this is the case where asking once more -- when the
+			// phone is back on, when the socket is up -- is exactly what recovers the
+			// attachment.
+			return protocol.MediaRef{}, err
+		}
+		// The phone was asked and answered, and the answer was no. Reported as what the
+		// download said, which is the same thing said first: the file is gone.
+		return protocol.MediaRef{}, gone
+	}
+	part, err := attachmentFrom(kept)
+	if err != nil {
+		return protocol.MediaRef{}, gone
+	}
+	part.download = fresh
+
+	// Written back before the bytes are fetched, so the next caller starts from the path
+	// that works. The blob this is about to make is dropped on its TTL or evicted by the
+	// quota, and without this the request after that would spend the 404 and the wait on
+	// the phone all over again -- for a file WhatsApp is now serving perfectly well.
+	//
+	// The path alone, and only while the row is still the one this read. Waiting on a
+	// phone takes as long as thirty seconds, and an inbound handler can write a newer row
+	// in that time; a whole row written back would put this snapshot's chat and
+	// coordinates over the fresher ones.
+	if err := s.store.RefreshDirectPath(ctx, kept.MessageID, fresh.GetDirectPath(), kept.StoredAt); err != nil {
+		// Logged, not returned. The file is about to be fetched either way; refusing it
+		// because the next caller may have to ask twice trades a file that arrives for
+		// one that might.
+		s.log.Warn().Err(err).Str("message_id", kept.MessageID).
+			Msg("fetched a file from a fresh path this session will not remember")
+	}
+
+	// Its own window, and not what is left of the one the first attempt spent: the wait
+	// on the phone has already taken part of the caller's deadline, and a download given
+	// what remains of it would be cut short by how long the phone took rather than by how
+	// big the file is. Bounded by the caller's deadline all the same, which is the
+	// context this derives from.
+	download, cancel := context.WithTimeout(ctx, s.downloadWait)
+	defer cancel()
+
+	ref, err := s.fetch(download, &part)
+	if err != nil {
+		s.log.Warn().Err(err).Str("message_id", kept.MessageID).
+			Msg("a file the sender's phone uploaded again could not be fetched")
+		return protocol.MediaRef{}, err
+	}
+	return ref, nil
+}
+
+// answeredNo is the phone having been asked and having declined, which is the only kind
+// of failure on this path that is final.
+//
+// Everything else -- a socket that was down, a phone that never woke up, an answer that
+// could not be read -- says nothing about the file. Reported as final it would tell an
+// agent the attachment is gone on the strength of the phone having been asleep, and the
+// client would never ask again; reported as this instance's problem, the client comes
+// back and the phone may be on by then.
+func answeredNo(err error) bool {
+	return errors.Is(err, errNoReupload) || errors.Is(err, wm.ErrMediaNotAvailableOnPhone)
+}
+
+// agedOffTheCDN is the failure worth asking the sender's phone about.
+//
+// 403 is not among them, and that is the whole distinction. A 403 is the key having
+// lapsed, and nothing the phone does brings it back; a 404 or a 410 is the file having
+// been dropped from the CDN, which is the case this recovery exists for and the shape a
+// message that sat in a backlog arrives in.
+func agedOffTheCDN(err error) bool {
+	var giveUp refused
+	if !errors.As(err, &giveUp) || giveUp.reason != reasonMediaExpired {
+		return false
+	}
+	return errors.Is(giveUp.err, wm.ErrMediaDownloadFailedWith404) ||
+		errors.Is(giveUp.err, wm.ErrMediaDownloadFailedWith410)
 }
 
 // refetchFailure turns what fetch decided into what the client should do about it.

@@ -44,6 +44,18 @@ type MediaPart struct {
 	Mime     string
 	Filename string
 
+	// ReceiptChat, Sender and FromMe are what a request to upload the file again is
+	// addressed with, once WhatsApp has dropped it off its CDN. None of them is needed
+	// to download it.
+	//
+	// ReceiptChat is the raw JID the message was sent to, which is not ChatKind and
+	// ChatID: those are what it was published under, and for a broadcast the two differ
+	// on purpose. All three are empty on a row written before they were kept, and such a
+	// row cannot be asked about at all.
+	ReceiptChat string
+	Sender      string
+	FromMe      bool
+
 	// StoredAt is when the part was written, in milliseconds, and it is what the sweep
 	// reads. Set by PutMediaPart.
 	StoredAt int64
@@ -81,19 +93,23 @@ func (c *Container) putMediaPart(ctx context.Context, part *MediaPart, now time.
 	const upsert = `
 		INSERT INTO wac_media_part
 			(sid, message_id, chat_kind, chat_id, kind, direct_path, media_key,
-			 file_enc_sha256, file_sha256, file_length, mime, filename, stored_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			 file_enc_sha256, file_sha256, file_length, mime, filename,
+			 receipt_chat, sender, from_me, stored_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (sid, message_id) DO UPDATE SET
 			chat_kind = excluded.chat_kind, chat_id = excluded.chat_id,
 			kind = excluded.kind, direct_path = excluded.direct_path, media_key = excluded.media_key,
 			file_enc_sha256 = excluded.file_enc_sha256, file_sha256 = excluded.file_sha256,
 			file_length = excluded.file_length, mime = excluded.mime, filename = excluded.filename,
+			receipt_chat = excluded.receipt_chat,
+			sender = excluded.sender, from_me = excluded.from_me,
 			stored_at = excluded.stored_at
 		WHERE excluded.stored_at > wac_media_part.stored_at`
 	_, err := c.db.ExecContext(ctx, c.rebind(upsert),
 		part.SID, part.MessageID, part.ChatKind, part.ChatID, part.Kind, part.DirectPath,
 		encode(part.MediaKey), encode(part.FileEncSHA256), encode(part.FileSHA256),
-		part.FileLength, part.Mime, part.Filename, stamp)
+		part.FileLength, part.Mime, part.Filename,
+		part.ReceiptChat, part.Sender, sentBy(part.FromMe), stamp)
 	if err != nil {
 		return fmt.Errorf("store: record how to fetch the file of %s: %w", part.MessageID, err)
 	}
@@ -105,21 +121,24 @@ func (c *Container) putMediaPart(ctx context.Context, part *MediaPart, now time.
 func (c *Container) mediaPart(ctx context.Context, sid, messageID string) (MediaPart, bool, error) {
 	const query = `
 		SELECT chat_kind, chat_id, kind, direct_path, media_key, file_enc_sha256, file_sha256,
-		       file_length, mime, filename, stored_at
+		       file_length, mime, filename, receipt_chat, sender, from_me, stored_at
 		FROM wac_media_part WHERE sid = ? AND message_id = ?`
 
 	part := MediaPart{SID: sid, MessageID: messageID}
 	var key, encDigest, digest string
+	var fromMe int64
 	err := c.db.QueryRowContext(ctx, c.rebind(query), sid, messageID).Scan(
 		&part.ChatKind, &part.ChatID,
 		&part.Kind, &part.DirectPath, &key, &encDigest, &digest,
-		&part.FileLength, &part.Mime, &part.Filename, &part.StoredAt)
+		&part.FileLength, &part.Mime, &part.Filename,
+		&part.ReceiptChat, &part.Sender, &fromMe, &part.StoredAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return MediaPart{}, false, nil
 	}
 	if err != nil {
 		return MediaPart{}, false, fmt.Errorf("store: read how to fetch the file of %s: %w", messageID, err)
 	}
+	part.FromMe = fromMe != 0
 
 	for _, field := range []struct {
 		raw  string
@@ -214,4 +233,38 @@ func decode(raw string) ([]byte, error) {
 		return nil, nil
 	}
 	return base64.StdEncoding.DecodeString(raw)
+}
+
+// sentBy is a boolean as this table spells one. The column is a BIGINT because the two
+// dialects disagree about how to write a boolean, and every other column here is already
+// the same type in both.
+func sentBy(fromMe bool) int64 {
+	if fromMe {
+		return 1
+	}
+	return 0
+}
+
+// refreshDirectPath replaces the path a message's file is fetched from, and only while
+// the row is still the one the caller read.
+//
+// Conditional, and that is the whole of it. The caller has been waiting on somebody
+// else's phone for as long as thirty seconds, and an inbound handler can have written a
+// newer row for the same message in that time -- a redelivery, or a sender reusing an id
+// in another chat. Written back as a whole row it would put the older snapshot's chat and
+// coordinates over the newer ones, and a later download would serve the wrong file.
+//
+// `stored_at` is left alone rather than bumped. What changed is where the file is
+// fetched from, not when the message was received, and the retention sweep goes by the
+// second: refreshing a path is not a reason for a row to live longer.
+func (c *Container) refreshDirectPath(
+	ctx context.Context, sid, messageID, path string, unchangedSince int64,
+) error {
+	const update = `
+		UPDATE wac_media_part SET direct_path = ?
+		WHERE sid = ? AND message_id = ? AND stored_at = ?`
+	if _, err := c.db.ExecContext(ctx, c.rebind(update), path, sid, messageID, unchangedSince); err != nil {
+		return fmt.Errorf("store: refresh where the file of %s is fetched from: %w", messageID, err)
+	}
+	return nil
 }
