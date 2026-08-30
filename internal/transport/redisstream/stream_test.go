@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -23,6 +24,7 @@ const shards = 8
 
 type fleet struct {
 	server *miniredis.Miniredis
+	rdb    *redis.Client
 	client *redisx.Client
 }
 
@@ -31,7 +33,29 @@ func newFleet(t *testing.T) fleet {
 	server := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
 	t.Cleanup(func() { _ = rdb.Close() })
-	return fleet{server: server, client: redisx.Wrap(rdb, "wa:", shards)}
+	return fleet{server: server, rdb: rdb, client: redisx.Wrap(rdb, "wa:", shards)}
+}
+
+// count makes the fleet's client report how many commands it actually sends, which is
+// the only way to tell a read that answered quietly from one that never went out.
+func (f fleet) count(n *atomic.Int64) { f.rdb.AddHook(&sentCommands{n: n}) }
+
+type sentCommands struct{ n *atomic.Int64 }
+
+func (*sentCommands) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (h *sentCommands) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		h.n.Add(1)
+		return next(ctx, cmd)
+	}
+}
+
+func (h *sentCommands) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return func(ctx context.Context, cmds []redis.Cmder) error {
+		h.n.Add(int64(len(cmds)))
+		return next(ctx, cmds)
+	}
 }
 
 func (f fleet) streams(t *testing.T, instance string) *redisstream.Streams {
@@ -194,6 +218,36 @@ func TestAReadShortensItsBlockToTheCallersDeadline(t *testing.T) {
 	}
 	if back.After(deadline) {
 		t.Fatalf("Read came back %s past the deadline it was given", back.Sub(deadline))
+	}
+}
+
+// A window with no room for a round trip buys a read nothing, and costs what the read
+// would have cost: a command the server moves into this consumer's pending list on a
+// call whose answer the deadline cuts off is claimable by nobody for the whole claim
+// delay, with no delivery here to release it.
+func TestAReadIsSkippedWhenNoRoundTripFitsTheWindow(t *testing.T) {
+	t.Parallel()
+
+	f := newFleet(t)
+	streams := f.streams(t, "inst-a")
+	if _, err := streams.Read(context.Background(), []string{"s1"}); err != nil {
+		t.Fatalf("priming Read: %v", err)
+	}
+
+	var sent atomic.Int64
+	f.count(&sent)
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(time.Millisecond))
+	defer cancel()
+
+	delivered, err := streams.Read(ctx, []string{"s1"})
+	if err != nil {
+		t.Fatalf("Read on a spent window = %v, want the quiet answer a read gives when it finds nothing", err)
+	}
+	if len(delivered) != 0 {
+		t.Fatalf("Read returned %d commands from a window it should not have used", len(delivered))
+	}
+	if got := sent.Load(); got != 0 {
+		t.Fatalf("%d command(s) went to Redis on a window with no room for the answer", got)
 	}
 }
 

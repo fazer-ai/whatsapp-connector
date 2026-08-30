@@ -172,18 +172,22 @@ func (s *Streams) Reply(ctx context.Context, replyTo string, reply protocol.Repl
 // nobody until the whole claim delay has passed, with newer commands for the same
 // session read and run ahead of it meanwhile.
 //
-// Redis reads BLOCK 0 as "wait forever", so a window too small to name in milliseconds
-// becomes a read that does not block at all rather than one that never comes back.
-func (s *Streams) blockWithin(ctx context.Context) time.Duration {
+// A window too thin to name a block in milliseconds is the one case with no read at
+// all: what is left cannot express the reserve, and a non-blocking read would spend a
+// whole round trip with nothing held back for the answer -- the very failure the
+// reserve is for. Skipping starves nothing, unlike a gate measured in blocks: a window
+// down to its last milliseconds is a window already over, and the loop is on its way
+// back to the ticker to start a fresh one.
+func (s *Streams) blockWithin(ctx context.Context) (time.Duration, bool) {
 	deadline, bounded := ctx.Deadline()
 	if !bounded {
-		return s.opts.Block
+		return s.opts.Block, true
 	}
 	block := min(s.opts.Block, time.Until(deadline)*2/3)
 	if block < time.Millisecond {
-		return -1
+		return 0, false
 	}
-	return block
+	return block, true
 }
 
 // Read returns the commands waiting for the sessions this instance owns, plus the
@@ -192,6 +196,12 @@ func (s *Streams) blockWithin(ctx context.Context) time.Duration {
 func (s *Streams) Read(ctx context.Context, sids []string) ([]transport.Delivery, error) {
 	streams := s.streamsFor(sids)
 	if len(streams) == 0 {
+		return nil, nil
+	}
+	// Before the group ensure, which is a round trip of its own on a stream not seen
+	// before.
+	block, room := s.blockWithin(ctx)
+	if !room {
 		return nil, nil
 	}
 	if err := s.groups.ensure(ctx, s.client, streams); err != nil {
@@ -203,7 +213,7 @@ func (s *Streams) Read(ctx context.Context, sids []string) ([]transport.Delivery
 		Consumer: s.opts.Instance,
 		Streams:  append(streams, newEntries(len(streams))...),
 		Count:    s.opts.ReadCount,
-		Block:    s.blockWithin(ctx),
+		Block:    block,
 	}
 	result, err := s.client.XReadGroup(ctx, args).Result()
 	switch {
