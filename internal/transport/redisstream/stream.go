@@ -198,14 +198,20 @@ func (s *Streams) Read(ctx context.Context, sids []string) ([]transport.Delivery
 	if len(streams) == 0 {
 		return nil, nil
 	}
-	// Before the group ensure, which is a round trip of its own on a stream not seen
-	// before.
-	block, room := s.blockWithin(ctx)
-	if !room {
+	// Before the group ensure, so a window already over does not pay for it: creating a
+	// group on a stream not seen before is a round trip of its own.
+	if _, room := s.blockWithin(ctx); !room {
 		return nil, nil
 	}
 	if err := s.groups.ensure(ctx, s.client, streams); err != nil {
 		return nil, err
+	}
+	// And again after it, because that trip spends the same window the block is measured
+	// against: a block decided before it can outlive the deadline by whatever the ensure
+	// took, which is the severed read this reserve exists to prevent.
+	block, room := s.blockWithin(ctx)
+	if !room {
+		return nil, nil
 	}
 
 	args := &redis.XReadGroupArgs{

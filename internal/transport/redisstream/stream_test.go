@@ -251,6 +251,70 @@ func TestAReadIsSkippedWhenNoRoundTripFitsTheWindow(t *testing.T) {
 	}
 }
 
+// The group ensure spends the same window the block is measured against, so the block
+// has to be measured again after it. A stream this instance has not read before costs an
+// XGROUP CREATE, and a block decided before that trip outlives the deadline by whatever
+// the trip took.
+func TestAReadMeasuresItsBlockAgainAfterCreatingGroups(t *testing.T) {
+	t.Parallel()
+
+	f := newFleet(t)
+	// A block long enough that the window, not the configured block, bounds the read.
+	streams, err := redisstream.New(f.client, redisstream.Options{
+		Instance: "inst-a", Block: 2 * time.Second, ClaimMinIdle: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("redisstream.New: %v", err)
+	}
+	// One group per stream, and a read always listens to control as well as the session,
+	// so the ensure is two trips. Sized so together they eat most of the window: what is
+	// left is well under the block a measurement taken before them would have chosen.
+	const window = 300 * time.Millisecond
+	f.rdb.AddHook(slowCommands{
+		on:    func(cmd redis.Cmder) bool { return strings.HasPrefix(cmd.Name(), "xgroup") },
+		delay: 90 * time.Millisecond,
+	})
+
+	deadline := time.Now().Add(window)
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
+
+	if _, err := streams.Read(ctx, []string{"s1"}); err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if back := time.Now(); back.After(deadline) {
+		t.Fatalf("Read came back %s past the deadline: its block was measured before the group ensure spent the window",
+			back.Sub(deadline))
+	}
+}
+
+// slowCommands makes the commands a test names take a fixed slice of the window their
+// caller is working to.
+type slowCommands struct {
+	on    func(redis.Cmder) bool
+	delay time.Duration
+}
+
+func (slowCommands) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (slowCommands) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+
+func (h slowCommands) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if h.on(cmd) {
+			select {
+			case <-time.After(h.delay):
+			case <-ctx.Done():
+				cmd.SetErr(ctx.Err())
+				return ctx.Err()
+			}
+		}
+		return next(ctx, cmd)
+	}
+}
+
 // `session.wake` arrives for sessions nobody owns yet, so an instance that only read
 // its own would never hear about a session it is supposed to pick up.
 func TestReadAlwaysListensToControl(t *testing.T) {

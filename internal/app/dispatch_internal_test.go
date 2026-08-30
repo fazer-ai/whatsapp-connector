@@ -258,6 +258,41 @@ func TestADrainDispatchesOnWhatIsLeftOfItsWindow(t *testing.T) {
 // retried on the next pass with a window worth having. Forfeit stays what it was,
 // because a wake that consumed a real window and stalled must lose its place at the
 // head of the queue, or a stuck store starves every wake behind it forever.
+// The floor is not only the wake's. An inline answer is a round trip too, and the
+// acknowledgement that follows it runs on a detached timeout: dispatched with a sliver,
+// the reply never leaves while the command is retired all the same, and the caller
+// waits out its own timeout for an answer no redelivery will produce.
+func TestAnInlineAnswerIsNotStartedOnASliverOfTheWindow(t *testing.T) {
+	t.Parallel()
+
+	connector := &Connector{
+		cfg:     Config{LeaseTTL: 30 * time.Second, Heartbeat: 600 * time.Millisecond},
+		log:     zerolog.Nop(),
+		manager: newTestManager(t),
+	}
+
+	var released, acked atomic.Int64
+	deliveries := []transport.Delivery{{
+		Command: protocol.Command{
+			V: protocol.Version, ID: "ping-late", Type: protocol.CommandAdminPing,
+			TS: 1787000000000, ReplyTo: "ping-late",
+		},
+		Ack:     func(context.Context) error { acked.Add(1); return nil },
+		Release: func() { released.Add(1) },
+	}}
+
+	sliver, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	connector.dispatchWithin(sliver, deliveries)
+
+	if acked.Load() != 0 {
+		t.Fatal("a ping was acknowledged over a sliver of window, so the caller waits for a reply that never went out")
+	}
+	if released.Load() != 1 {
+		t.Fatalf("the ping was released %d times, want once with its age kept", released.Load())
+	}
+}
+
 func TestAWakeIsNotStartedOnASliverOfTheWindow(t *testing.T) {
 	t.Parallel()
 
@@ -645,10 +680,11 @@ func TestAReclaimDispatchesOnWhatIsLeftOfItsOwnDeadline(t *testing.T) {
 	t.Parallel()
 
 	// The heartbeat is split between the control pass and the session window, so what
-	// bounds this dispatch is half of it. Sized so the slow claim spends half of that
-	// half and leaves the other half visibly short of a fresh budget.
+	// bounds this dispatch is half of it. Sized so the slow claim spends a third of that
+	// half, leaving a rest that is visibly short of a fresh budget and still above the
+	// floor roomFor holds every delivery to.
 	const heartbeat = 600 * time.Millisecond
-	const slowClaim = 150 * time.Millisecond
+	const slowClaim = 100 * time.Millisecond
 
 	server := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})

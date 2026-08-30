@@ -213,6 +213,23 @@ func (c *Connector) Run(ctx context.Context) error {
 	sweepingParts, stopPartSweep := context.WithCancel(ctx)
 	sweptParts := c.sweepMediaParts(sweepingParts)
 
+	if c.cfg.Heartbeat < session.AdoptTimeout {
+		// Said out loud rather than refused. A wake adopts inside the tick window, so a
+		// heartbeat shorter than an adoption means a session whose store or engine open
+		// runs long is cut, forfeited and tried again on a window just as short: the
+		// account never starts, and the only trace is one error per attempt. Refusing
+		// the configuration instead would price out short leases altogether -- the rule
+		// above already puts the heartbeat under two thirds of the lease, so a lease of
+		// a few seconds has no heartbeat left that would also clear an adoption -- and
+		// that is a deployment decision this check has no business making. What closes
+		// it properly is an adoption that does not run on this goroutine at all, which
+		// is #76.
+		c.log.Warn().
+			Str("heartbeat", c.cfg.Heartbeat.String()).
+			Str("adopt_timeout", session.AdoptTimeout.String()).
+			Msg("the heartbeat is shorter than an adoption; a session whose open runs long will be retried rather than started")
+	}
+
 	c.log.Info().
 		Str("addr", c.cfg.HTTPAddr).
 		Str("engine", c.cfg.Engine).
@@ -520,7 +537,7 @@ func readBlock(heartbeat time.Duration) time.Duration { return heartbeat / readB
 // dispatched is released, so it stays pending and comes back on a later pass.
 func (c *Connector) dispatchWithin(ctx context.Context, deliveries []transport.Delivery) bool {
 	for i := range deliveries {
-		if ctx.Err() != nil || !c.roomFor(ctx, &deliveries[i]) {
+		if ctx.Err() != nil || !c.roomFor(ctx) {
 			for rest := i; rest < len(deliveries); rest++ {
 				if deliveries[rest].Release != nil {
 					deliveries[rest].Release()
@@ -535,27 +552,27 @@ func (c *Connector) dispatchWithin(ctx context.Context, deliveries []transport.D
 	return true
 }
 
-// roomFor reports whether the window can still give this delivery a real turn.
+// roomFor reports whether the window can still give a delivery a real turn.
 //
-// Only a wake is held to a floor, because only a wake blocks: it adopts a session,
-// which reads the store. One dispatched with a sliver of window has its adoption cut
-// almost before it starts, and the manager forfeits a wake whose turn was spent -- the
-// forfeit is right, starvation is worse than a late retry, but a sliver is not a turn,
-// and the forfeit costs the session a whole claim delay. Below the floor the wake is
-// released instead, age kept, and the next pass gives it a window worth having.
-// Everything else is an offer to a queue or an inline answer, which spends no window
-// worth reserving; what follows a released wake is released with it, so nothing
+// Every command spends at least one round trip before this goroutine is done with it: a
+// wake adopts a session, which reads the store; a ping and a refusal answer the caller
+// over Redis; and each of them is acknowledged. One dispatched with a sliver of window
+// has that trip cut, and the acknowledgement lands anyway -- it runs on a detached
+// timeout on purpose -- so the command is retired while the answer the caller is waiting
+// for never went out. The manager forfeits a wake whose turn was spent, which is right
+// for a turn that was taken, but a sliver is not a turn and the forfeit costs the
+// session a whole claim delay.
+//
+// Below the floor the delivery is released instead, age kept, and the next pass gives it
+// a window worth having. What follows a released one is released with it, so nothing
 // overtakes a command that kept its place.
-func (c *Connector) roomFor(ctx context.Context, delivery *transport.Delivery) bool {
-	if delivery.Command.Type != protocol.CommandSessionWake {
-		return true
-	}
+func (c *Connector) roomFor(ctx context.Context) bool {
 	deadline, bounded := ctx.Deadline()
 	if !bounded {
 		return true
 	}
-	// Half a read block: an adoption given less than that is a formality, and it ends
-	// in a forfeit nothing deserved.
+	// Half a read block: a turn shorter than that is a formality, and it ends in a
+	// forfeit or an unanswerable caller that nothing deserved.
 	return time.Until(deadline) >= readBlock(c.cfg.Heartbeat)/2
 }
 
