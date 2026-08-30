@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/rs/zerolog"
 	"go.mau.fi/whatsmeow/proto/waAdv"
@@ -757,5 +758,94 @@ func TestTheSecondPassRunsAgainstTheOtherDialect(t *testing.T) {
 	}
 	if !strings.HasPrefix(version, "PostgreSQL ") {
 		t.Fatalf("the second pass is talking to %q", version)
+	}
+}
+
+// A deployment upgrading into this has the table already, so `CREATE TABLE IF NOT
+// EXISTS` does nothing to it and the columns the re-upload request needs would never
+// appear. Every write to it would then fail on a column that is not there.
+//
+// Added rather than the table recreated, because its rows are what a client's
+// `message.download_media` reads: dropping them would lose the file of every message the
+// deployment received before the upgrade.
+func TestAStoreThatPredatesTheReuploadColumnsGainsThemAndKeepsItsRows(t *testing.T) {
+	t.Parallel()
+
+	target := storetest.New(t)
+	container := openAt(t, target)
+
+	// The shape this table had before, with a row in it the upgrade must not lose.
+	for _, statement := range []string{
+		`DROP TABLE wac_media_part`,
+		`CREATE TABLE wac_media_part (
+			sid             TEXT   NOT NULL,
+			message_id      TEXT   NOT NULL,
+			chat_kind       TEXT   NOT NULL,
+			chat_id         TEXT   NOT NULL,
+			kind            TEXT   NOT NULL,
+			direct_path     TEXT   NOT NULL,
+			media_key       TEXT   NOT NULL,
+			file_enc_sha256 TEXT   NOT NULL,
+			file_sha256     TEXT   NOT NULL,
+			file_length     BIGINT NOT NULL,
+			mime            TEXT   NOT NULL,
+			filename        TEXT   NOT NULL,
+			stored_at       BIGINT NOT NULL,
+			PRIMARY KEY (sid, message_id),
+			FOREIGN KEY (sid) REFERENCES wac_session_device (sid) ON DELETE CASCADE
+		)`,
+	} {
+		if _, err := container.DB().ExecContext(t.Context(), statement); err != nil {
+			t.Fatalf("put the old shape back: %v", err)
+		}
+	}
+	scoped := container.For("sid-old")
+	if err := scoped.Bind(t.Context(), types.NewJID("5511999990001", types.DefaultUserServer)); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	// Literal rather than bound, because the placeholders differ by dialect and the
+	// translation for that is the package's own and not exported.
+	if _, err := container.DB().ExecContext(t.Context(),
+		`INSERT INTO wac_media_part (sid, message_id, chat_kind, chat_id, kind, direct_path,
+			media_key, file_enc_sha256, file_sha256, file_length, mime, filename, stored_at)
+		 VALUES ('sid-old', '3EB0OLD', 'phone', '5511999990002', 'image', '/v/old', '', '', '', 7, 'image/jpeg', 'f.jpg', 1)`,
+	); err != nil {
+		t.Fatalf("write a row in the old shape: %v", err)
+	}
+	if err := container.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	upgraded := openAt(t, target)
+	kept, found, err := upgraded.For("sid-old").MediaPart(t.Context(), "3EB0OLD")
+	if err != nil {
+		t.Fatalf("MediaPart after the upgrade: %v", err)
+	}
+	if !found {
+		t.Fatal("the upgrade lost the row of a message whose file a client can still ask for")
+	}
+	if kept.DirectPath != "/v/old" {
+		t.Errorf("the row came back with direct path %q, want the one it was written with", kept.DirectPath)
+	}
+	if kept.Sender != "" || kept.FromMe {
+		t.Errorf("a row written before these were kept came back as sender %q, from_me %v, want the empty ones",
+			kept.Sender, kept.FromMe)
+	}
+
+	// And the columns take a write, which is what the old shape could not.
+	fresh := store.MediaPart{
+		MessageID: "3EB0NEW", ChatKind: "group", ChatID: "120363041234567890", Kind: "image",
+		DirectPath: "/v/new", Mime: "image/jpeg", Filename: "n.jpg", FileLength: 9,
+		Sender: "5511999990003@s.whatsapp.net", FromMe: true,
+	}
+	if err := upgraded.For("sid-old").PutMediaPart(t.Context(), &fresh, time.Now()); err != nil {
+		t.Fatalf("PutMediaPart after the upgrade: %v", err)
+	}
+	read, _, err := upgraded.For("sid-old").MediaPart(t.Context(), "3EB0NEW")
+	if err != nil {
+		t.Fatalf("MediaPart: %v", err)
+	}
+	if read.Sender != fresh.Sender || !read.FromMe {
+		t.Errorf("read back sender %q, from_me %v, want %q and true", read.Sender, read.FromMe, fresh.Sender)
 	}
 }

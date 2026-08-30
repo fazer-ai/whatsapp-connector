@@ -446,6 +446,10 @@ func (s *Session) remember(event *waEvents.Message, part *attachment) {
 		DirectPath: part.download.GetDirectPath(), MediaKey: part.download.GetMediaKey(),
 		FileEncSHA256: part.download.GetFileEncSHA256(), FileSHA256: part.download.GetFileSHA256(),
 		FileLength: part.content.Size, Mime: part.content.Mime, Filename: part.content.Filename,
+		// Not for the download, which needs only the path, the key and the digests.
+		// These are what a request to re-upload the file is addressed with once WhatsApp
+		// has dropped it, and the message is the only place they exist.
+		Sender: event.Info.Sender.String(), FromMe: event.Info.IsFromMe,
 	}
 	if err := s.store.PutMediaPart(ctx, &kept, time.Now()); err != nil {
 		s.log.Warn().Err(err).Str("message_id", messageID).
@@ -520,11 +524,70 @@ func (s *Session) downloadMedia(ctx context.Context, command *protocol.Command) 
 	defer cancel()
 
 	ref, err := s.fetch(download, &part)
+	if err != nil && agedOffTheCDN(err) {
+		// WhatsApp keeps a file for a bounded time and the sender's phone often still
+		// has it. Asked for here and not on the inbound path, and on the caller's
+		// deadline rather than one this invents: see askForReupload.
+		//
+		// The first failure is what is reported if this comes to nothing. The phone
+		// declining, or not answering, says nothing the caller did not already know
+		// from the 404.
+		ref, err = s.refetchReuploaded(ctx, &kept, err)
+	}
 	if err != nil {
 		s.log.Warn().Err(err).Str("message_id", body.MessageID).Msg("could not fetch a file a second time")
 		return nil, refetchFailure(err)
 	}
 	return json.Marshal(ref)
+}
+
+// refetchReuploaded asks the sender's phone to upload the file again and fetches what it
+// answers with, and hands back the download's own failure when that comes to nothing.
+func (s *Session) refetchReuploaded(
+	ctx context.Context, kept *store.MediaPart, gone error,
+) (protocol.MediaRef, error) {
+	fresh, err := s.askForReupload(ctx, kept)
+	if err != nil {
+		s.log.Info().Err(err).Str("message_id", kept.MessageID).
+			Msg("a file WhatsApp had dropped was not uploaded again")
+		return protocol.MediaRef{}, gone
+	}
+	part, err := attachmentFrom(kept)
+	if err != nil {
+		return protocol.MediaRef{}, gone
+	}
+	part.download = fresh
+
+	// Its own window, and not what is left of the one the first attempt spent: the wait
+	// on the phone has already taken part of the caller's deadline, and a download given
+	// what remains of it would be cut short by how long the phone took rather than by how
+	// big the file is. Bounded by the caller's deadline all the same, which is the
+	// context this derives from.
+	download, cancel := context.WithTimeout(ctx, s.downloadWait)
+	defer cancel()
+
+	ref, err := s.fetch(download, &part)
+	if err != nil {
+		s.log.Warn().Err(err).Str("message_id", kept.MessageID).
+			Msg("a file the sender's phone uploaded again could not be fetched")
+		return protocol.MediaRef{}, err
+	}
+	return ref, nil
+}
+
+// agedOffTheCDN is the failure worth asking the sender's phone about.
+//
+// 403 is not among them, and that is the whole distinction. A 403 is the key having
+// lapsed, and nothing the phone does brings it back; a 404 or a 410 is the file having
+// been dropped from the CDN, which is the case this recovery exists for and the shape a
+// message that sat in a backlog arrives in.
+func agedOffTheCDN(err error) bool {
+	var giveUp refused
+	if !errors.As(err, &giveUp) || giveUp.reason != reasonMediaExpired {
+		return false
+	}
+	return errors.Is(giveUp.err, wm.ErrMediaDownloadFailedWith404) ||
+		errors.Is(giveUp.err, wm.ErrMediaDownloadFailedWith410)
 }
 
 // refetchFailure turns what fetch decided into what the client should do about it.

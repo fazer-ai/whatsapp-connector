@@ -154,6 +154,12 @@ type Session struct {
 	// it fails, which are opposite answers and neither is reachable from a stanza alone.
 	unsealReaction func(context.Context, *waEvents.Message) (*waE2E.ReactionMessage, error)
 
+	// askReupload asks the sender's phone to upload a file again, for one whose bytes
+	// WhatsApp has dropped. A field for the same reason as the seams around it: only a
+	// real socket answers a receipt, so a test cannot otherwise reach either side of
+	// what a phone says when it is asked.
+	askReupload func(context.Context, *wm.Client, *waTypes.MessageInfo, []byte) error
+
 	// sendPresence tells WhatsApp what the account is. A field for the same reason as
 	// the seams above it: a presence node is only answered by a real socket, so a test
 	// cannot otherwise see that the account is told again on a new connection what it
@@ -248,6 +254,17 @@ type Session struct {
 	// the real one under the id the placeholder already took.
 	awaited   map[string]*awaiting
 	awaitedMu sync.Mutex
+
+	// reuploads holds a channel per message whose file this session has asked the
+	// sender's phone to upload again, so the answer reaches the command that is waiting
+	// for it. Keyed by message id, which is what the phone answers under.
+	//
+	// It exists because the two halves are on different goroutines and neither owns the
+	// other: the request goes out from the session's executor, under a command's own
+	// deadline, and the answer arrives on whatsmeow's node handler. There is nothing to
+	// return it to except a place the asker left for it.
+	reuploads   map[string]chan *waEvents.MediaRetry
+	reuploadsMu sync.Mutex
 
 	// rerequestWait is how long a message that could not be read is left to arrive before
 	// its placeholder goes out. A field so a test does not have to wait it out.
@@ -398,6 +415,9 @@ func newSession(
 		},
 		retrieve:   retrieveOverHTTP,
 		uploadFile: uploadOverClient,
+		askReupload: func(ctx context.Context, client *wm.Client, info *waTypes.MessageInfo, key []byte) error {
+			return client.SendMediaRetryReceipt(ctx, info, key) //nolint:wrapcheck // wrapped by its caller
+		},
 		sendPresence: func(ctx context.Context, client *wm.Client, state waTypes.Presence) error {
 			return client.SendPresence(ctx, state) //nolint:wrapcheck // classified by presenceFailure, which needs the sentinels
 		},
@@ -410,6 +430,7 @@ func newSession(
 		handoffWait: perishableHandoff,
 		awaited:     make(map[string]*awaiting),
 
+		reuploads:      make(map[string]chan *waEvents.MediaRetry),
 		rerequestWait:  rerequestTimeout,
 		rerequestRetry: rerequestRetry,
 		presenceWrite:  make(chan struct{}, 1),
@@ -2171,6 +2192,11 @@ func (s *Session) handle(rawEvent any) bool {
 		return s.chatPresence(event)
 	case *waEvents.Presence:
 		return s.presence(event)
+	case *waEvents.MediaRetry:
+		// A sender's phone answering a request this connector made for a file WhatsApp
+		// had dropped. Handed to the command waiting for it, which is the only thing
+		// that ever asks.
+		return s.reupload(event)
 	case *waEvents.Receipt:
 		// The other handler that can withhold an acknowledgement, and for the same
 		// reason: a tick nobody published never turns, and the client cannot ask again.
