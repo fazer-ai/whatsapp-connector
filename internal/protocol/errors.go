@@ -23,6 +23,7 @@ const (
 	ErrorRecipientNotOnWhatsapp     ErrorCode = "recipient_not_on_whatsapp"
 	ErrorGroupParticipantNotAllowed ErrorCode = "group_participant_not_allowed"
 	ErrorWaError                    ErrorCode = "wa_error"
+	ErrorProviderUnavailable        ErrorCode = "provider_unavailable"
 	ErrorInternal                   ErrorCode = "internal"
 )
 
@@ -44,6 +45,7 @@ var AllErrorCodes = []ErrorCode{
 	ErrorRecipientNotOnWhatsapp,
 	ErrorGroupParticipantNotAllowed,
 	ErrorWaError,
+	ErrorProviderUnavailable,
 	ErrorInternal,
 }
 

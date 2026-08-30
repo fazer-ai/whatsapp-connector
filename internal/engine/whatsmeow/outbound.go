@@ -682,8 +682,9 @@ func theSameFile(want string, uploaded *wm.UploadResponse) error {
 // sourceStopped is a file that stopped arriving partway through.
 //
 // Retryable on purpose: the same fetch may well arrive whole next time, and the caller
-// still holds the only copy of what it wanted to send. `internal` for the same reason as
-// every other failure of the caller's own address, which is issue #26.
+// still holds the only copy of what it wanted to send. Named as the caller's own
+// dependency for the same reason as every other failure of its address: what stopped
+// serving is not this connector.
 func sourceStopped(err error) error {
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 		// The deadline landed while the body was being read rather than before the
@@ -693,7 +694,7 @@ func sourceStopped(err error) error {
 		return protocol.NewError(protocol.ErrorTimeout,
 			"the file to send did not arrive before this command's deadline")
 	}
-	return protocol.NewError(protocol.ErrorInternal,
+	return protocol.NewError(protocol.ErrorProviderUnavailable,
 		fmt.Sprintf("the file to send stopped arriving partway through: %s", whyUnreachable(err)))
 }
 
@@ -712,8 +713,9 @@ func allOfIt(declared int64, uploaded *wm.UploadResponse) error {
 	if sent := int64(uploaded.FileLength); sent != declared { //nolint:gosec // a length this side counted
 		// Retryable, and it is the one of the three that is: what the address said it
 		// was sending and what arrived disagree, which is a transfer that stopped, and
-		// the next one may well carry the whole file.
-		return protocol.NewError(protocol.ErrorInternal,
+		// the next one may well carry the whole file. The address that stopped serving
+		// is the caller's own, so it is named as that rather than as this connector.
+		return protocol.NewError(protocol.ErrorProviderUnavailable,
 			fmt.Sprintf("the file to send was said to be %d bytes and %d arrived", declared, sent))
 	}
 	return nil
@@ -1402,12 +1404,11 @@ func retrieveOverHTTP(ctx context.Context, address string, headers map[string]st
 			"the file to send did not arrive before this command's deadline")
 	case err != nil:
 		// Worth trying again: the address may be a service that is restarting, and the
-		// caller holds the only copy of what it wanted to send. Reported as `internal`
-		// because the contract has no code for a dependency the caller itself named
-		// being down, and of the codes it does have this is the only retryable one that
-		// is not a lie about who timed out. The message says whose fault it actually is,
-		// and the missing code is issue #26.
-		return source{}, protocol.NewError(protocol.ErrorInternal,
+		// caller holds the only copy of what it wanted to send. Named as the caller's own
+		// dependency rather than as this connector, because an operator reading
+		// `internal` goes to connector logs that are clean while what is actually down is
+		// the storage the reference points at.
+		return source{}, protocol.NewError(protocol.ErrorProviderUnavailable,
 			fmt.Sprintf("could not fetch the file to send from %s: %s", safeAddress(address), whyUnreachable(err)))
 	}
 	if answer.StatusCode != http.StatusOK {
@@ -1515,10 +1516,9 @@ func statusFailure(status int) error {
 		return protocol.NewError(protocol.ErrorTimeout,
 			"the address of the file to send timed out on its own request")
 	case status >= 500:
-		// `internal` for the same reason as the unreachable case above: retryable, and
-		// the contract has nothing that says the caller's own server is having a bad
-		// minute (#26).
-		return protocol.NewError(protocol.ErrorInternal,
+		// The caller's own server having a bad minute, which is the same answer as being
+		// unreachable above and for the same reason: retryable, and not this connector.
+		return protocol.NewError(protocol.ErrorProviderUnavailable,
 			"the address of the file to send answered "+strconv.Itoa(status))
 	default:
 		return protocol.NewError(protocol.ErrorInvalidPayload,
