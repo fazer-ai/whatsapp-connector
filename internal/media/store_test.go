@@ -1,7 +1,6 @@
 package media_test
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -32,11 +31,20 @@ func newStore(t *testing.T, opts media.Options) (store *media.Store, root string
 
 func put(t *testing.T, store *media.Store, body string, about *media.Blob) media.Blob {
 	t.Helper()
-	stored, err := store.Put(t.Context(), strings.NewReader(body), about)
+	stored, err := store.Receive(t.Context(), about, filling(body))
 	if err != nil {
-		t.Fatalf("Put: %v", err)
+		t.Fatalf("Receive: %v", err)
 	}
 	return stored
+}
+
+// filling puts a body in the file the store lends, which is the whole of what a caller
+// already holding the bytes has to do with it.
+func filling(body string) func(media.File) error {
+	return func(file media.File) error {
+		_, err := io.WriteString(file, body)
+		return err
+	}
 }
 
 func read(t *testing.T, store *media.Store, id string) (string, media.Blob) {
@@ -117,18 +125,17 @@ func TestAnIdThatIsNotOneIsRefusedRatherThanLookedUp(t *testing.T) {
 	}
 }
 
-// The cap exists because the engine downloads into memory before it gets here, so a
-// file past it is refused rather than half-kept. Refused at the byte after the cap, so a
-// file exactly at it still goes in.
+// The cap is on the file the store lends, so a caller is stopped at the byte past it
+// rather than once the whole thing has landed. A file exactly at the cap still goes in.
 func TestABlobPastTheCapIsRefusedAndLeavesNothingBehind(t *testing.T) {
 	t.Parallel()
 
 	store, root := newStore(t, media.Options{MaxBlob: 8, Quota: 1 << 20})
 
-	if _, err := store.Put(t.Context(), bytes.NewReader(bytes.Repeat([]byte("x"), 8)), &media.Blob{}); err != nil {
+	if _, err := store.Receive(t.Context(), &media.Blob{}, filling(strings.Repeat("x", 8))); err != nil {
 		t.Fatalf("a blob exactly at the cap was refused: %v", err)
 	}
-	_, err := store.Put(t.Context(), bytes.NewReader(bytes.Repeat([]byte("x"), 9)), &media.Blob{})
+	_, err := store.Receive(t.Context(), &media.Blob{}, filling(strings.Repeat("x", 9)))
 	if !errors.Is(err, media.ErrTooLarge) {
 		t.Fatalf("a blob past the cap answered with %v, want ErrTooLarge", err)
 	}
@@ -443,8 +450,10 @@ func TestABlobIsOnlyItselfInItsOwnShard(t *testing.T) {
 	}
 }
 
-// A cap at the top of the range makes a one-byte lookahead wrap: the limit goes
-// negative, the reader answers EOF straight away, and every file is stored empty.
+// A cap at the top of the range is where the arithmetic that checks a write goes wrong.
+// It has to hold without adding the offset to the length: that sum wraps, comes out
+// negative, and either refuses every write or lets every one through, depending on which
+// way the comparison is written.
 func TestAnEnormousCapDoesNotStoreEveryBlobEmpty(t *testing.T) {
 	t.Parallel()
 
@@ -672,71 +681,6 @@ func TestALargeDescriptionIsChargedForWhatItTakes(t *testing.T) {
 	}
 }
 
-// A reader may answer no bytes and no error, which means nothing happened rather than
-// there is nothing left. Taking one of those for the end of the file renames the first
-// MaxBlob bytes and reports a whole one.
-func TestASourceThatPausesIsNotMistakenForOneThatEnded(t *testing.T) {
-	t.Parallel()
-
-	store, _ := newStore(t, media.Options{MaxBlob: 4, Quota: 1 << 20})
-
-	// Four bytes, then one pause, then more: exactly the shape that reads as an exact
-	// fit to a single lookahead.
-	source := io.MultiReader(strings.NewReader("0123"), &pause{}, strings.NewReader("456"))
-	if _, err := store.Put(t.Context(), source, &media.Blob{}); !errors.Is(err, media.ErrTooLarge) {
-		t.Fatalf("a source with more bytes after a pause answered with %v, want ErrTooLarge", err)
-	}
-}
-
-// pause answers once with nothing at all, which io.Reader permits and which means
-// nothing happened.
-type pause struct{ done bool }
-
-func (p *pause) Read([]byte) (int, error) {
-	if p.done {
-		return 0, io.EOF
-	}
-	p.done = true
-	return 0, nil
-}
-
-// The source is a download off somebody else's network, so it can stall for as long as
-// that network feels like it. The session that owns the write has to be able to let go
-// of it when its lease moves or the process stops.
-func TestAStalledWriteGivesUpWithTheContext(t *testing.T) {
-	t.Parallel()
-
-	store, _ := newStore(t, media.Options{})
-	ctx, cancel := context.WithCancel(t.Context())
-
-	// Answers a little and then never again, which is a socket that has gone quiet.
-	stalled := io.MultiReader(strings.NewReader("the first bytes"), blockUntil(ctx.Done()))
-	done := make(chan error, 1)
-	go func() {
-		_, err := store.Put(ctx, stalled, &media.Blob{})
-		done <- err
-	}()
-
-	cancel()
-	select {
-	case err := <-done:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("a stalled write answered with %v, want the cancellation", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("a stalled write did not come back: the session cannot let go of it")
-	}
-}
-
-// blockUntil is a reader that answers nothing until the channel closes, then reports the
-// end of the file. It is a socket waiting on bytes that are not coming.
-type blockUntil <-chan struct{}
-
-func (b blockUntil) Read([]byte) (int, error) {
-	<-b
-	return 0, io.EOF
-}
-
 // The sweep subtracts the whole cost of an entry, and the description is part of that. A
 // description left behind after its bytes went is disk the accounting has stopped
 // counting, which is how the cache sits over quota with nothing said.
@@ -783,11 +727,10 @@ func TestAWriteInFlightIsNotCollectedForBeingSlow(t *testing.T) {
 
 	arrived := make(chan struct{})
 	release := make(chan struct{})
-	slow := io.MultiReader(strings.NewReader("the first bytes"), &announce{arrived: arrived, wait: release})
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := store.Put(t.Context(), slow, &media.Blob{})
+		_, err := store.Receive(t.Context(), &media.Blob{}, holding("the first bytes", arrived, release))
 		done <- err
 	}()
 
@@ -804,20 +747,17 @@ func TestAWriteInFlightIsNotCollectedForBeingSlow(t *testing.T) {
 	}
 }
 
-// announce says when it has been reached and then waits to be let go.
-type announce struct {
-	arrived chan struct{}
-	wait    chan struct{}
-	done    bool
-}
-
-func (a *announce) Read([]byte) (int, error) {
-	if !a.done {
-		a.done = true
-		close(a.arrived)
-		<-a.wait
+// holding writes a body, says it has got that far, and then keeps the write open until
+// it is let go. It is a download that has started and is taking its time.
+func holding(body string, arrived, release chan struct{}) func(media.File) error {
+	return func(file media.File) error {
+		if _, err := io.WriteString(file, body); err != nil {
+			return err
+		}
+		close(arrived)
+		<-release
+		return nil
 	}
-	return 0, io.EOF
 }
 
 // The age is how long since anybody wanted a blob. Left with the time its temporary file
@@ -832,13 +772,12 @@ func TestABlobIsAsOldAsItsArrivalRatherThanItsFirstByte(t *testing.T) {
 
 	arrived := make(chan struct{})
 	release := make(chan struct{})
-	slow := io.MultiReader(strings.NewReader("the first bytes"), &announce{arrived: arrived, wait: release})
 
 	stored := make(chan media.Blob, 1)
 	go func() {
-		blob, err := store.Put(t.Context(), slow, &media.Blob{})
+		blob, err := store.Receive(t.Context(), &media.Blob{}, holding("the first bytes", arrived, release))
 		if err != nil {
-			t.Errorf("Put: %v", err)
+			t.Errorf("Receive: %v", err)
 		}
 		stored <- blob
 	}()
@@ -913,7 +852,7 @@ func TestABlobIsStampedBeforeItIsNamed(t *testing.T) {
 	committed := time.Unix(1_700_000_000, 0)
 	store, root := newStore(t, media.Options{Now: func() time.Time { return committed }})
 
-	stored, err := store.Put(t.Context(), strings.NewReader("arriving"), &media.Blob{})
+	stored, err := store.Receive(t.Context(), &media.Blob{}, filling("arriving"))
 	if err != nil {
 		t.Fatalf("Put: %v", err)
 	}
@@ -960,7 +899,7 @@ func TestAWriteThatCannotBeCommittedLeavesNoDescriptionBehind(t *testing.T) {
 	store, dir := newStore(t, media.Options{Now: clock})
 	root = dir
 
-	stored, err := store.Put(t.Context(), strings.NewReader("arriving"), &media.Blob{})
+	stored, err := store.Receive(t.Context(), &media.Blob{}, filling("arriving"))
 	if err == nil {
 		t.Fatalf("a blob that could not be committed was published as %s", stored.ID)
 	}
@@ -1074,5 +1013,246 @@ func TestADescriptionIsNotCollectedFromAPutThatFinishedMeanwhile(t *testing.T) {
 	}
 	if _, _, err := store2.Open(stored.ID); err != nil {
 		t.Fatalf("the description of a blob that arrived mid-sweep was collected: %v", err)
+	}
+}
+
+// The cap has to be a bound on where the bytes end up, not on how many went past. A
+// caller rewrites what it wrote -- a transfer that retries seeks back to the start, and
+// an encrypted one is decrypted in place -- so counting bytes charges a file two and
+// three times over for a length it never had, and refuses it for a size it is not.
+func TestAFileRewrittenInPlaceIsNotChargedTwiceAgainstTheCap(t *testing.T) {
+	t.Parallel()
+
+	store, _ := newStore(t, media.Options{MaxBlob: 8, Quota: 1 << 20})
+
+	stored, err := store.Receive(t.Context(), &media.Blob{}, func(file media.File) error {
+		if _, err := io.WriteString(file, "01234567"); err != nil {
+			return err
+		}
+		// Back to the start and over it again, a thousand times: eight kibibytes have
+		// gone through the file, which is past every allowance there is, and the file is
+		// still exactly one cap long.
+		for range 1000 {
+			if _, err := file.Seek(0, io.SeekStart); err != nil {
+				return err
+			}
+			if _, err := io.WriteString(file, "89abcdef"); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("a file rewritten inside the cap was refused: %v", err)
+	}
+	if body, _ := read(t, store, stored.ID); body != "89abcdef" {
+		t.Fatalf("the blob reads back as %q, want what was left there last", body)
+	}
+}
+
+// Every way a caller can put a byte somewhere is capped, not just the sequential one.
+// Writing at an offset skips the file position entirely, and truncating grows a file as
+// readily as it shrinks one -- filling the difference with a hole that costs nothing to
+// make and a whole file to write into afterwards.
+func TestAWriteIsRefusedWhereverItWouldLandPastTheCap(t *testing.T) {
+	t.Parallel()
+
+	store, _ := newStore(t, media.Options{MaxBlob: 8, Quota: 1 << 20})
+
+	for name, fill := range map[string]func(media.File) error{
+		"at an offset": func(file media.File) error {
+			_, err := file.WriteAt([]byte("xx"), 1<<20)
+			return err
+		},
+		"by truncating": func(file media.File) error {
+			return file.Truncate(1 << 20)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if _, err := store.Receive(t.Context(), &media.Blob{}, fill); !errors.Is(err, media.ErrTooLarge) {
+				t.Fatalf("a write past the cap %s answered with %v, want ErrTooLarge", name, err)
+			}
+		})
+	}
+}
+
+// The blob is what the fill left, which is not what it wrote: an encrypted transfer
+// strips a MAC off the end and unpads in place, so a length and a digest taken as the
+// bytes went past would describe a file nobody can download.
+func TestABlobIsMeasuredFromWhatTheFillLeavesBehind(t *testing.T) {
+	t.Parallel()
+
+	store, _ := newStore(t, media.Options{MaxBlob: 64, Quota: 1 << 20})
+
+	stored, err := store.Receive(t.Context(), &media.Blob{}, func(file media.File) error {
+		if _, err := io.WriteString(file, "the file and then some padding"); err != nil {
+			return err
+		}
+		return file.Truncate(int64(len("the file")))
+	})
+	if err != nil {
+		t.Fatalf("Receive: %v", err)
+	}
+
+	if stored.Size != int64(len("the file")) {
+		t.Fatalf("the blob measures %d, want the %d bytes left behind", stored.Size, len("the file"))
+	}
+	digest := sha256.Sum256([]byte("the file"))
+	if stored.SHA256 != hex.EncodeToString(digest[:]) {
+		t.Fatalf("the blob digests as %s, want the digest of what was left behind", stored.SHA256)
+	}
+	if body, _ := read(t, store, stored.ID); body != "the file" {
+		t.Fatalf("the blob reads back as %q", body)
+	}
+}
+
+// A fill that gives up has written into the temporary file already. Left there, the
+// bytes are disk nothing will ever look up and the sweep charges the quota for.
+func TestAFillThatGivesUpLeavesNothingBehind(t *testing.T) {
+	t.Parallel()
+
+	store, root := newStore(t, media.Options{MaxBlob: 64, Quota: 1 << 20})
+
+	stopped := errors.New("the far end went quiet")
+	_, err := store.Receive(t.Context(), &media.Blob{}, func(file media.File) error {
+		if _, err := io.WriteString(file, "the first bytes"); err != nil {
+			return err
+		}
+		return stopped
+	})
+	if !errors.Is(err, stopped) {
+		t.Fatalf("a fill that gave up answered with %v, want what it returned", err)
+	}
+
+	var files int
+	_ = filepath.WalkDir(root, func(_ string, entry os.DirEntry, err error) error {
+		if err == nil && !entry.IsDir() {
+			files++
+		}
+		return nil
+	})
+	if files != 0 {
+		t.Fatalf("the root holds %d files after a fill that gave up", files)
+	}
+}
+
+// The standard library looks for a faster way to write before it writes. io.Copy takes
+// ReadFrom when the destination has it and io.WriteString takes WriteString, and an
+// os.File has both -- so a lent file that exposed either would have the bytes reach the
+// descriptor with the cap never consulted. Both shapes are checked because both are what
+// a caller reaches for: io.Copy is how a transfer off a socket lands, io.WriteString is
+// how a caller already holding the bytes puts them down.
+func TestNoFasterWayToWriteGetsPastTheCap(t *testing.T) {
+	t.Parallel()
+
+	store, _ := newStore(t, media.Options{MaxBlob: 8, Quota: 1 << 20})
+	// Well past the room the fill is lent, so what has to refuse this is the write
+	// itself. Counting what the write reported moving is the whole point: the check on
+	// what was committed refuses an oversized blob either way, and would report a clean
+	// answer for a file that reached the disk in full.
+	past := strings.Repeat("x", 1<<20)
+
+	for name, fill := range map[string]func(media.File) (int64, error){
+		"copying from a reader": func(file media.File) (int64, error) {
+			return io.Copy(file, strings.NewReader(past))
+		},
+		"writing a string": func(file media.File) (int64, error) {
+			moved, err := io.WriteString(file, past)
+			return int64(moved), err
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			var moved int64
+			_, err := store.Receive(t.Context(), &media.Blob{}, func(file media.File) error {
+				var err error
+				moved, err = fill(file)
+				return err
+			})
+			if !errors.Is(err, media.ErrTooLarge) {
+				t.Fatalf("%s past the cap answered with %v, want ErrTooLarge", name, err)
+			}
+			if moved >= int64(len(past)) {
+				t.Fatalf("%s put %d bytes on disk before anything refused it", name, moved)
+			}
+		})
+	}
+}
+
+// The cap the store means is on what a blob turns out to be, and the fill is lent a
+// little more than that so a transfer's own framing fits while it works. A file that
+// stays inside the room it was given and still commits past the cap is refused there.
+func TestAFileThatFitsTheRoomAndNotTheCapIsRefusedAtTheEnd(t *testing.T) {
+	t.Parallel()
+
+	store, root := newStore(t, media.Options{MaxBlob: 8, Quota: 1 << 20})
+
+	// One byte past the cap, which the write itself allows: the room the fill is lent
+	// reaches further than this on purpose.
+	_, err := store.Receive(t.Context(), &media.Blob{}, filling(strings.Repeat("x", 9)))
+	if !errors.Is(err, media.ErrTooLarge) {
+		t.Fatalf("a file that committed past the cap answered with %v, want ErrTooLarge", err)
+	}
+
+	var files int
+	_ = filepath.WalkDir(root, func(_ string, entry os.DirEntry, err error) error {
+		if err == nil && !entry.IsDir() {
+			files++
+		}
+		return nil
+	})
+	if files != 0 {
+		t.Fatalf("the root holds %d files after a file refused at the end", files)
+	}
+}
+
+// And the other side of the same room: a transfer that is briefly larger than the cap
+// and shrinks back inside it is a file this instance keeps. This is what an encrypted
+// download looks like -- padded to a block boundary with a MAC on the end, both of which
+// go before it is done -- and a lent file bounded at the cap exactly would refuse it for
+// a length it never has.
+func TestAFileThatShrinksBackInsideTheCapIsKept(t *testing.T) {
+	t.Parallel()
+
+	store, _ := newStore(t, media.Options{MaxBlob: 8, Quota: 1 << 20})
+
+	stored, err := store.Receive(t.Context(), &media.Blob{}, func(file media.File) error {
+		// Eight bytes of file under a block of padding and a MAC, the way it arrives.
+		if _, err := io.WriteString(file, "01234567"+strings.Repeat("p", 16)+"mmmmmmmmmm"); err != nil {
+			return err
+		}
+		return file.Truncate(8)
+	})
+	if err != nil {
+		t.Fatalf("a file that arrived larger than the cap and shrank back was refused: %v", err)
+	}
+	if body, _ := read(t, store, stored.ID); body != "01234567" {
+		t.Fatalf("the blob reads back as %q", body)
+	}
+}
+
+// Measuring the file back is the store's own read and it is not a short one. A session
+// whose lease has moved cancels its context and then waits for the handler, so a read
+// that answers to nothing holds the socket open past the point this instance is allowed
+// to own the session at all.
+func TestMeasuringAFileGivesUpWithTheContext(t *testing.T) {
+	t.Parallel()
+
+	store, _ := newStore(t, media.Options{MaxBlob: 64, Quota: 1 << 20})
+	ctx, cancel := context.WithCancel(t.Context())
+
+	// Cancelled by the time the fill is done, which is where the store's own reading
+	// starts.
+	_, err := store.Receive(ctx, &media.Blob{}, func(file media.File) error {
+		if _, err := io.WriteString(file, "the whole file"); err != nil {
+			return err
+		}
+		cancel()
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("measuring a file under a cancelled context answered with %v, want the cancellation", err)
 	}
 }

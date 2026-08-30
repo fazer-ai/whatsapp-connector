@@ -119,7 +119,7 @@ type Session struct {
 	// detach and the two below it: nothing outside whatsmeow can make a real client
 	// answer a download, so a test cannot otherwise reach either side of the split
 	// between a failure worth retrying and one that is permanent.
-	download func(context.Context, *wm.Client, wm.DownloadableMessage) ([]byte, error)
+	download func(context.Context, *wm.Client, wm.DownloadableMessage, media.File) error
 
 	// uploadWait bounds how long an outbound media message spends fetching its file and
 	// handing it to WhatsApp. A field for the same reason as the three above it.
@@ -345,8 +345,8 @@ func newSession(
 		disconnect: func(client *wm.Client) { client.Disconnect() },
 		nonce:      sessionNonce(),
 		logout:     func(ctx context.Context, client *wm.Client) error { return client.Logout(ctx) },
-		download: func(ctx context.Context, client *wm.Client, part wm.DownloadableMessage) ([]byte, error) {
-			return client.Download(ctx, part) //nolint:wrapcheck // classified by downloadFailure, which needs the sentinels
+		download: func(ctx context.Context, client *wm.Client, part wm.DownloadableMessage, file media.File) error {
+			return client.DownloadToFile(ctx, part, file) //nolint:wrapcheck // classified by downloadFailure, which needs the sentinels
 		},
 		retrieve:   retrieveOverHTTP,
 		uploadFile: uploadOverClient,

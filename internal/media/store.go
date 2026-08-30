@@ -183,23 +183,70 @@ func (s *Store) MaxBlob() int64 { return s.opts.MaxBlob }
 // somebody is still collecting outlives the expiry that was published for it.
 func (s *Store) TTL() time.Duration { return s.opts.TTL }
 
-// Put reads a blob in and returns what it stored.
+// File is a blob under construction: the temporary file the store writes into, lent to
+// a caller so the bytes go from wherever they come from straight to disk instead of
+// through memory on the way.
 //
-// The bytes land in a temporary file first and are renamed into place once they are all
-// there, so a reader never opens a partial blob and a crash mid-write leaves rubbish
+// The method set is whatsmeow's, and that is the whole reason this exists. Its
+// streaming download seeks back over what it wrote, reads it to check the MAC, decrypts
+// it in place and truncates the padding off the end, so nothing narrower than this
+// satisfies it -- and a caller handed only an io.Writer would have to hold the file in
+// memory to do any of that, which is what the file is here to avoid.
+type File interface {
+	io.Reader
+	io.Writer
+	io.Seeker
+	io.ReaderAt
+	io.WriterAt
+	Truncate(size int64) error
+	Stat() (os.FileInfo, error)
+}
+
+// workingRoom is how far past the cap the lent file reaches.
+//
+// A transfer carries framing it strips before it is done: a block cipher pads the last
+// block, and an authenticated one leaves a MAC on the end that goes once it has been
+// checked. A file that will commit at exactly the cap is therefore larger than the cap
+// while it is being fetched, and a lent file bounded at MaxBlob would refuse it for a
+// length it never has.
+//
+// It is not tuned to any one scheme's arithmetic, because it does not have to be: the
+// number that has to be exact is checked at the end, against what was actually left.
+// This one only has to be enough, and small enough that it changes nothing about what an
+// in-flight write can cost.
+const workingRoom = 1 << 10
+
+// lent is how far the file handed to a fill may reach: the cap, plus the room above.
+//
+// Saturated rather than added, because a cap at the top of the range wraps: the sum
+// comes out negative, every write is refused against it, and a store configured to keep
+// anything keeps nothing at all.
+func (s *Store) lent() int64 {
+	if s.opts.MaxBlob > math.MaxInt64-workingRoom {
+		return math.MaxInt64
+	}
+	return s.opts.MaxBlob + workingRoom
+}
+
+// Receive lends a caller a file to fill and stores whatever it left there.
+//
+// The bytes land in a temporary file first and are renamed into place once the caller
+// is done, so a reader never opens a partial blob and a crash mid-write leaves rubbish
 // the sweep collects rather than a file that lies about its length. The description is
 // written before the bytes are named, for the same reason in the other direction: a
 // blob without one is unservable, so it must not be the state a crash can leave.
 //
-// The source has to answer to ctx itself, and this is a requirement on the caller rather
-// than something the store can arrange. A read that has already entered a syscall cannot
-// be interrupted from the outside: checking the context before each read, which is what
-// happens below, returns promptly from a source that yields between reads and does
-// nothing at all for one that is blocked inside one. The two callers this has both
-// satisfy it — whatsmeow's download hands over bytes that are already in memory, and an
-// HTTP body from a request carrying ctx unblocks when ctx does — and a source that does
-// neither holds the session that owns the write for as long as its far end feels like it.
-func (s *Store) Put(ctx context.Context, source io.Reader, about *Blob) (Blob, error) {
+// The caller writes rather than the store reading because the caller is the only one
+// who can bound the transfer. A source handed to the store has to answer to a context
+// the store cannot enforce -- a read already inside a syscall cannot be interrupted from
+// the outside, by this or by any wrapper -- and getting a file's worth of bytes into a
+// reader in the first place is what puts them in memory. The transfer's own cancellation
+// therefore belongs to the fill, which holds the context that stops it; ctx here is for
+// the reading this does after, which is its own and is not short.
+//
+// The file is capped, which is what makes MaxBlob a bound on this instance's disk rather
+// than a measurement taken once the disk is already full.
+func (s *Store) Receive(ctx context.Context, about *Blob, fill func(File) error) (Blob, error) {
 	id, err := newID()
 	if err != nil {
 		return Blob{}, err
@@ -237,26 +284,29 @@ func (s *Store) Put(ctx context.Context, source io.Reader, about *Blob) (Blob, e
 		_ = s.root.Remove(tempName)
 	}()
 
-	// Read through the context, so a source that yields between reads is given up on
-	// rather than waited out. What this cannot do is interrupt a read already inside a
-	// syscall, and no wrapper can: see the note on the requirement above.
-	source = &reading{ctx: ctx, from: source}
-
-	digest := sha256.New()
-	written, err := io.Copy(io.MultiWriter(temp, digest), io.LimitReader(source, s.opts.MaxBlob))
-	if err != nil {
-		return Blob{}, fmt.Errorf("media: store %s: %w", id, err)
+	if err := fill(&capped{file: temp, max: s.lent()}); err != nil {
+		return Blob{}, fmt.Errorf("media: fill %s: %w", id, err)
 	}
-	// Asked for one more byte rather than reading one past the cap, because a cap at
-	// the top of the range makes that arithmetic wrap: the limit goes negative, the
-	// reader answers EOF straight away, and every file is stored empty. A source with
-	// nothing left is one that fitted exactly.
-	//
-	// Asked until it answers, because a reader is allowed to return no bytes and no
-	// error, which means nothing happened rather than there is nothing left. Taking one
-	// of those for EOF renames the first MaxBlob bytes and calls it a whole file.
-	if err := s.refuseIfMore(source); err != nil {
-		return Blob{}, err
+
+	// Measured and digested by reading the file back, rather than counted as it went
+	// past. Nothing passed through here: the caller wrote to disk directly, and what it
+	// leaves is not what it wrote -- an encrypted transfer strips a MAC off the end and
+	// unpads in place -- so the only length and the only digest that describe this blob
+	// are the ones taken once the caller has finished with it.
+	if _, err := temp.Seek(0, io.SeekStart); err != nil {
+		return Blob{}, fmt.Errorf("media: rewind %s: %w", id, err)
+	}
+	digest := sha256.New()
+	written, err := io.Copy(digest, &reading{ctx: ctx, from: temp})
+	if err != nil {
+		return Blob{}, fmt.Errorf("media: measure %s: %w", id, err)
+	}
+	// The exact cap, on what was actually left rather than on the room the fill was
+	// given. This is the check MaxBlob means: the lent file reaches further so a
+	// transfer's own framing fits, and what that framing was wrapped around still has to
+	// be a file this instance keeps.
+	if written > s.opts.MaxBlob {
+		return Blob{}, fmt.Errorf("%w: %d bytes", ErrTooLarge, written)
 	}
 	if err := temp.Close(); err != nil {
 		return Blob{}, fmt.Errorf("media: finish %s: %w", id, err)
@@ -301,6 +351,11 @@ func (s *Store) Put(ctx context.Context, source io.Reader, about *Blob) (Blob, e
 
 // reading is a source that gives up when the context does. io.Copy has no way to be
 // interrupted, so the check goes on the read it is already making.
+//
+// It reads the store's own file rather than a caller's socket, which is what makes it
+// worth having here: a local file yields between reads, so the check is reached. It
+// still cannot interrupt a read already inside a syscall, and on a device that has
+// stopped answering nothing can.
 type reading struct {
 	ctx  context.Context
 	from io.Reader
@@ -313,21 +368,85 @@ func (r *reading) Read(into []byte) (int, error) {
 	return r.from.Read(into) //nolint:wrapcheck // a pass-through reader; wrapping would hide io.EOF
 }
 
-// refuseIfMore reports a source that still has something in it once the cap has been
-// read, and nothing for one that fitted exactly.
-func (s *Store) refuseIfMore(source io.Reader) error {
-	one := make([]byte, 1)
-	for {
-		switch read, err := source.Read(one); {
-		case read > 0:
-			return fmt.Errorf("%w: more than %d bytes", ErrTooLarge, s.opts.MaxBlob)
-		case errors.Is(err, io.EOF):
-			return nil
-		case err != nil:
-			return fmt.Errorf("media: read past the cap: %w", err)
-		}
-		// No bytes and no error: nothing happened. Asked again.
+// capped is the file the store lends, refusing any write that would put a byte past the
+// room it was given.
+//
+// The bound is on the offset a write reaches and not on the bytes that go through it,
+// because a caller rewrites what it wrote: a transfer that retries seeks back to the
+// start, and decrypting happens in place. Counting bytes would charge such a file two
+// or three times for a length it never had, and refuse it for being too large when it
+// is not.
+//
+// A cap on the way in is the only real one available. What a message says its file is
+// worth is the sender's claim, and nothing checks it against what the far end actually
+// serves, so a message announcing four bytes and serving four hundred megabytes is
+// refused by a cap at the end only once all four hundred have landed.
+// The file is a field and not an embedded one, and that is load-bearing. Embedding
+// promotes every method os.File has, and two of the promoted ones are exactly what the
+// standard library looks for before it writes: io.Copy takes ReadFrom when the
+// destination has it and io.WriteString takes WriteString, both of which would reach the
+// descriptor with the cap never consulted. Naming the field means this type has the
+// seven methods File asks for and nothing else, so there is no faster path to find.
+type capped struct {
+	file *os.File
+	max  int64
+}
+
+func (c *capped) Write(p []byte) (int, error) {
+	// Asked of the descriptor rather than counted here, because a caller that seeks
+	// moves the position without going through Write, and a position this tracked
+	// itself would then be a number about some other part of the file.
+	at, err := c.file.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return 0, fmt.Errorf("media: find where a write would land: %w", err)
 	}
+	if err := c.room(at, int64(len(p))); err != nil {
+		return 0, err
+	}
+	return c.file.Write(p) //nolint:wrapcheck // the store's own file, wrapped by its caller
+}
+
+func (c *capped) WriteAt(p []byte, off int64) (int, error) {
+	if err := c.room(off, int64(len(p))); err != nil {
+		return 0, err
+	}
+	return c.file.WriteAt(p, off) //nolint:wrapcheck // the store's own file, wrapped by its caller
+}
+
+func (c *capped) Truncate(size int64) error {
+	// Checked although the callers this has only ever shrink a file: truncating grows
+	// one as readily, filling the difference with a hole that costs nothing to make and
+	// everything to write into afterwards.
+	if err := c.room(size, 0); err != nil {
+		return err
+	}
+	return c.file.Truncate(size) //nolint:wrapcheck // the store's own file, wrapped by its caller
+}
+
+// Reading is not capped: there is nothing past the cap to read, and a caller checking
+// what it wrote is how an encrypted transfer arrives at the file it means to keep.
+func (c *capped) Read(p []byte) (int, error) { return c.file.Read(p) } //nolint:wrapcheck // the store's own file
+
+func (c *capped) ReadAt(p []byte, off int64) (int, error) { //nolint:wrapcheck // the store's own file
+	return c.file.ReadAt(p, off)
+}
+
+func (c *capped) Seek(offset int64, whence int) (int64, error) { //nolint:wrapcheck // the store's own file
+	return c.file.Seek(offset, whence)
+}
+
+func (c *capped) Stat() (os.FileInfo, error) { return c.file.Stat() } //nolint:wrapcheck // the store's own file
+
+// room reports whether n bytes written at an offset would stay inside the cap.
+//
+// Subtracted rather than added, because a cap near the top of the range makes the
+// addition wrap: the sum comes out negative, every write looks like it fits, and the
+// bound is gone exactly where the numbers are largest.
+func (c *capped) room(at, n int64) error {
+	if at > c.max-n {
+		return fmt.Errorf("%w: more than %d bytes", ErrTooLarge, c.max)
+	}
+	return nil
 }
 
 // Open hands back a blob's bytes and what is known about it. The caller closes the

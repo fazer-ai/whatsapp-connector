@@ -1,14 +1,12 @@
 package whatsmeow
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"math"
 	"net/url"
 	"strings"
@@ -86,7 +84,7 @@ func (r refused) Unwrap() error { return r.err }
 // Blobs is the half of the media store a session writes to. An interface so a test can
 // make a store fail without needing a filesystem that will.
 type Blobs interface {
-	Put(ctx context.Context, source io.Reader, about *media.Blob) (media.Blob, error)
+	Receive(ctx context.Context, about *media.Blob, fill func(media.File) error) (media.Blob, error)
 	MaxBlob() int64
 	TTL() time.Duration
 }
@@ -305,19 +303,29 @@ func (s *Session) fetch(ctx context.Context, part *attachment) (protocol.MediaRe
 		return protocol.MediaRef{}, err
 	}
 
-	data, err := s.download(ctx, s.current(), part.download)
-	if err != nil {
-		return protocol.MediaRef{}, downloadFailure(err)
-	}
-
-	stored, err := s.blobs.Put(ctx, bytes.NewReader(data), &media.Blob{
-		Mime: part.content.Mime, Filename: part.content.Filename,
-	})
+	// The download writes into the store's own file rather than handing bytes over, so
+	// what the far end serves is bounded by the cap on the way in instead of by a check
+	// once it is all resident. Kept aside as well as returned, because the two failures
+	// that come back through here are answered differently and one of them is not the
+	// store's: what WhatsApp said about the file decides whether the message is worth
+	// redelivering, and only the sentinels carry that.
+	var reached error
+	stored, err := s.blobs.Receive(ctx,
+		&media.Blob{Mime: part.content.Mime, Filename: part.content.Filename},
+		func(file media.File) error {
+			reached = s.download(ctx, s.current(), part.download, file)
+			return reached
+		},
+	)
 	switch {
 	case errors.Is(err, media.ErrTooLarge):
 		// The sender understated the length. Permanent for this file: the same bytes
-		// arrive on every attempt and are refused by the same cap.
+		// arrive on every attempt and are refused by the same cap. Read before the
+		// download's own error, because this is how that error arrives -- the cap
+		// refuses a write, and whatsmeow hands it back as a failed download.
 		return protocol.MediaRef{}, refused{reason: reasonTooLarge, err: err}
+	case reached != nil:
+		return protocol.MediaRef{}, downloadFailure(reached)
 	case err != nil:
 		// A disk that could not take this file may take the next one, and the message is
 		// worth another go rather than a bubble that says the file is gone.
