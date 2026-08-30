@@ -484,9 +484,17 @@ func (m *Manager) RenewAll(ctx context.Context) {
 	// them is a session a peer takes while this instance still holds its socket open:
 	// the cost of a hand-back arriving a tick late is one session unowned for a few
 	// seconds, the cost of a renewal that never ran is every session on the instance.
+	//
+	// All of them in one round trip, so what the pass costs does not grow with how many
+	// sessions this instance carries. The tearing down that follows is per session by
+	// nature -- each one stops its own socket -- but it only touches the ones a renewal
+	// refused, which on an ordinary tick is none.
+	sids := m.SIDs()
+	renewals := m.leases.RenewMany(ctx, sids)
+
 	var released []string
-	for _, sid := range m.SIDs() {
-		err := m.leases.Renew(ctx, sid)
+	for _, sid := range sids {
+		err := renewals[sid]
 		if err == nil {
 			continue
 		}
@@ -529,7 +537,7 @@ func (m *Manager) RenewAll(ctx context.Context) {
 
 	// What is left of the tick goes to the hand-backs, and only what a lease can spare
 	// of it. One that does not fit is tried again on the next tick.
-	window, cancel := context.WithTimeout(ctx, m.leases.TTL()/releaseShare)
+	window, cancel := context.WithTimeout(ctx, m.leases.TTL()/ReleaseShare)
 	defer cancel()
 	for _, sid := range released {
 		m.abandon(window, sid)
@@ -537,9 +545,12 @@ func (m *Manager) RenewAll(ctx context.Context) {
 	m.releaseOrphans(window)
 }
 
-// releaseShare is the fraction of a lease one tick may spend handing leases back, which
+// ReleaseShare is the fraction of a lease one tick may spend handing leases back, which
 // leaves the rest of it for the renewals that already ran and the ones on the next tick.
-const releaseShare = 3
+// Exported because the startup timing check is built on it, and the check has to be the
+// same arithmetic as the wiring: a bound the check reads from a constant of its own is a
+// bound that drifts the day either one is tuned.
+const ReleaseShare = 3
 
 // StopAll releases every session, which is what a SIGTERM does before the process
 // exits: a released lease is one a peer can take immediately instead of waiting a full

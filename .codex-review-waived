@@ -294,7 +294,46 @@ internal/engine/whatsmeow/presence.go: Make the reconnect timeout cover the upst
 
 # The refusal-acks-a-redelivery class is real and older than the queue bump; the
 # split between fresh and redelivered work is #62, and a wider queue is not it.
-internal/session/session.go: Backpressure reclaimed commands instead of enlarging the queue  # PR#61 → #62
+internal/session/session.go: Backpressure reclaimed commands instead of enlarging the queue  # PR#61 -> #62
 
-# Inherited from main by rebase: the multi-host download overlay is #66, upstream-shaped.
-internal/engine/whatsmeow/session.go: Clear the file before each fallback media host  # PR#61 → #66
+# Inherited from main by rebase: the multi-host download overlay is #63, upstream-shaped.
+# Two titles for the one finding, because the review named it differently on the rounds
+# that raised it, and a waiver matches on the title it was written for.
+internal/engine/whatsmeow/session.go: Clear the file before each fallback media host  # PR#61 -> #63
+internal/engine/whatsmeow/session.go: Reset the destination before trying another media host  # PR#65 -> #63
+# Poll-with-deadline is the suite's sanctioned idiom (waitFor in app_test.go); what
+# AGENTS.md rules out is sleeping to synchronise, not polling a condition.
+internal/app/dispatch_internal_test.go: Replace wall-clock polling with a completion signal  # PR#65 r5
+# PR#65: real, and the remedy would price out short leases. A wake adopts inside the tick
+# window, so a heartbeat shorter than an adoption means a slow open is cut and retried
+# forever -- true, and registered as #76 with what closes it. Refusing the configuration
+# is not that: the rule above already holds the heartbeat under two thirds of the lease,
+# so a 5s floor would leave a lease of a few seconds with no valid heartbeat at all, and
+# it would refuse configurations that work whenever adoption is fast. The attempt is not
+# silent either (an error per attempt, and now a warning at boot naming the condition).
+internal/app/config.go: Reject heartbeats shorter than an adoption turn  # PR#65 r8 -> #76
+# PR#65: right about the mechanism, and the half this PR put there is fixed rather than
+# waived: the floor now stops at the two commands the loop goroutine carries out, so a
+# session's command is never held back by it. What is left is older than this PR -- a
+# batch cut off by its deadline releases the rest, and the reclaim walks the sessions a
+# window at a time while `>` covers all of them -- and closing it needs the read to know
+# when a reclaim has drained a stream, which the drain path tracks and the reclaim path
+# does not. Registered as #77 with both candidate shapes.
+internal/app/run.go: Preserve FIFO after releasing a late read  # PR#65 r9 -> #77
+# PR#65: real, and it belongs to the ack coupling that is #62 rather than to the floor.
+# `refuse` writes the reply on the caller's context and acks on a detached timeout, so a
+# window closing mid-reply retires a command whose `rate_limited` never reached anybody.
+# The floor cannot cover it: whether a command will be refused is not knowable before the
+# offer, only the queue knows it is full, and holding session commands back before
+# dispatch is what r9 showed costs per-session order (#77). Recorded on #62, which is
+# where the ack and the answer get coupled.
+internal/app/run.go: Include inline queue-full refusals in the dispatch floor  # PR#65 r10 -> #62
+# PR#65: real, and the rule cannot absorb it. An ack runs on a deadline of its own so a
+# command already carried out is retired even when its window is gone, and it runs on the
+# loop's goroutine, so one started near the end of a window holds the tick up to its own
+# timeout past it -- three such places per period against a reserve of twice the margin.
+# Adding (1 + reclaimPasses) * ackTimeout to the check would refuse configurations that
+# work: a 7s lease already leaves 3s for the heartbeat and the tail, and 6s of worst-case
+# acks makes it unsatisfiable, for a ceiling only a degraded Redis reaches. Registered as
+# #79, which takes the acks off this goroutine, and named in the rule's own comment.
+internal/app/config.go: Include detached ack time in the lease bound  # PR#65 r11 -> #79

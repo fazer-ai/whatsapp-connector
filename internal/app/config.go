@@ -11,8 +11,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/fazer-ai/whatsapp-connector/internal/cluster"
 	"github.com/fazer-ai/whatsapp-connector/internal/media"
 	"github.com/fazer-ai/whatsapp-connector/internal/redisx"
+	"github.com/fazer-ai/whatsapp-connector/internal/session"
 )
 
 // Config is the whole configuration, read from the environment.
@@ -184,14 +186,25 @@ func LoadConfig(hostname string) (Config, error) {
 	}
 	if cfg.LeaseTTL <= 0 {
 		// cluster.NewLeases substitutes its own default for a non-positive TTL, so the
-		// leases would work while everything derived from this value here would not: the
-		// dispatch budget is a third of it, and a zero budget is a context that has
-		// already expired, so every command is released the moment it is read. An
-		// instance that reads work and does none of it, reporting itself healthy.
+		// leases would go on working while every rule below is checked against a value
+		// the cluster never uses. Refused by name, so an operator reads "the lease must
+		// be positive" rather than a timing complaint about a lease of no length.
 		return Config{}, fmt.Errorf("app: WAC_LEASE_TTL must be positive, got %s", cfg.LeaseTTL)
 	}
 	if cfg.Heartbeat <= 0 {
 		return Config{}, fmt.Errorf("app: WAC_HEARTBEAT must be positive, got %s", cfg.Heartbeat)
+	}
+	if readBlock(cfg.Heartbeat) < time.Millisecond {
+		// A read waits a share of the heartbeat, and Redis takes that wait in whole
+		// milliseconds: under one it cannot be expressed, so every read is skipped as
+		// having no room for its own answer. The instance would tick, renew, announce
+		// and report itself alive while consuming nothing at all -- not a command, not
+		// even a wake, so no session it does not already run would ever start. Refused
+		// by name, because a heartbeat this short is a deployment mistake and not a
+		// timing to degrade under.
+		return Config{}, fmt.Errorf(
+			"app: WAC_HEARTBEAT (%s) leaves a read less than the millisecond Redis can wait for, "+
+				"so no command would ever be read", cfg.Heartbeat)
 	}
 	if cfg.Heartbeat >= cfg.LeaseTTL {
 		// Leases are renewed on the heartbeat and on nothing else, so a heartbeat that
@@ -202,19 +215,48 @@ func LoadConfig(hostname string) (Config, error) {
 			"app: WAC_HEARTBEAT (%s) must be shorter than WAC_LEASE_TTL (%s), or a lease expires "+
 				"before the tick that would renew it", cfg.Heartbeat, cfg.LeaseTTL)
 	}
-	if cfg.Heartbeat+ReadBlock(cfg.Heartbeat)+cfg.LeaseTTL/dispatchShare >= cfg.LeaseTTL {
+	if cfg.Heartbeat+cfg.LeaseTTL/session.ReleaseShare >= cfg.LeaseTTL-2*cluster.DefaultRenewMargin {
 		// Fitting inside the TTL is not enough on its own. Reading, dispatching and
-		// renewing are one goroutine, so the renewal that follows a read comes a
-		// heartbeat, plus however long that read waited on Redis, plus however long its
-		// batch took, after the one before it. Longer than the lease and the leases are
-		// gone by then: peers acquire the accounts while this instance goes on holding
-		// their sockets open, which is the one thing the lease exists to prevent. A read
-		// that starts just before a tick is an ordinary minute, not a corner, so this is
-		// a deployment that breaks under load rather than one that never works.
+		// renewing are one goroutine, so everything between two renewals delays the
+		// second -- but everything outside the heartbeat branch is cut when the next
+		// renewal is due, so however many steps that work grows, it cannot push the
+		// renewal by more than one period. What can is the branch's own tail: the
+		// hand-backs, which get their share of the lease, and a reclaim whose passes
+		// divide one heartbeat between them.
+		//
+		// Against the lease's fresh lifetime, and with the margin held back over
+		// again. A lease answers "do I still own this" no from a margin before it
+		// expires, so the lifetime the bounded work may spend ends there -- and the
+		// unbounded work between two renewals (the renewal round trip and the
+		// announcement) needs room of its own, which is exactly what the margin was
+		// sized to be: a pause plus a round trip. A bound allowed to press against the
+		// cutoff leaves that work no room at all, and the cost is an instance whose
+		// sessions drop their own events, and whose key a peer can take on a modest
+		// Redis delay, while this one goes on holding their sockets open -- the one
+		// thing the lease exists to prevent.
+		//
+		// That the unbounded half is a fixed number of round trips rather than one per
+		// session is what makes a rule written in constants able to hold: the renewals
+		// go out in one pipelined batch (cluster.RenewMany), so nothing here is
+		// proportional to how many sessions the instance carries.
+		//
+		// What the reserve does not cover, and cannot: an acknowledgement runs on a
+		// deadline of its own so that a command already carried out is retired even when
+		// the window it ran in is gone, and it runs on this goroutine. One started near
+		// the end of a window can hold the tick up to its own timeout past it. Pricing
+		// that worst case in would make short leases unconfigurable for a ceiling only a
+		// degraded Redis reaches, so it is left out here and carried by #79, which moves
+		// those acknowledgements off this goroutine instead.
+		//
+		// Derived from the bounds that actually sit outside the tick, not summed from
+		// the loop's steps. The sum was wrong three times running -- each rewrite
+		// remembered the parcels somebody could name and forgot one nobody did -- and a
+		// forgotten parcel here is not a failed check, it is a lease lost under load.
 		return Config{}, fmt.Errorf(
-			"app: WAC_HEARTBEAT (%s) plus a blocking read (%s) plus the dispatch budget (%s) must be "+
-				"shorter than WAC_LEASE_TTL (%s), or a batch delays the renewal past the lease it is renewing",
-			cfg.Heartbeat, ReadBlock(cfg.Heartbeat), cfg.LeaseTTL/dispatchShare, cfg.LeaseTTL)
+			"app: WAC_HEARTBEAT (%s) plus the lease hand-back tail (%s) must be shorter than "+
+				"WAC_LEASE_TTL (%s) minus twice the renew margin (%s), or a renewal can land on a "+
+				"lease that has already gone stale", cfg.Heartbeat, cfg.LeaseTTL/session.ReleaseShare,
+			cfg.LeaseTTL, cluster.DefaultRenewMargin)
 	}
 	if cfg.ClaimMinIdle <= cfg.LeaseTTL {
 		// A wake is acknowledged when adoption finds the session already owned, because

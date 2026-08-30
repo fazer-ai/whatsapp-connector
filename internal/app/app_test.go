@@ -321,43 +321,42 @@ func TestAWakeLeftPendingIsPickedUpAgain(t *testing.T) {
 	}
 
 	// A live instance now starts. A plain read will never show it this entry.
-	connector := start(t, server.Addr(), "inst-a", map[string]string{"WAC_LEASE_TTL": "1s", "WAC_CLAIM_MIN_IDLE": "1500ms"})
+	connector := start(t, server.Addr(), "inst-a", map[string]string{"WAC_LEASE_TTL": "7s", "WAC_CLAIM_MIN_IDLE": "7500ms"})
 	waitFor(t, "the pending wake to be reclaimed and acted on", func() bool {
 		return connector.Sessions() == 1
 	})
 }
 
 // Fitting inside the lease is not enough on its own. Reading, dispatching and renewing
-// are one goroutine, so the renewal that follows a read comes a heartbeat, plus however
-// long that read waited on Redis, plus however long its batch took, after the one before
-// it. Longer than the lease and every session on the instance is acquired by a peer while
-// this one still holds their sockets open, which is the one thing the lease exists to
-// prevent — and a read landing just before a tick is an ordinary minute, not a corner.
-func TestAHeartbeatHasToLeaveRoomForTheReadAndBatchBeforeIt(t *testing.T) {
+// are one goroutine, but everything outside the heartbeat branch is cut when the next
+// renewal is due, so it cannot push a renewal by more than one period however many
+// steps it is made of. What sits outside that deadline is the branch's own tail: the
+// hand-backs, with their share of the lease, and a reclaim whose passes divide one
+// heartbeat. One period plus that tail past the lease and every session on the
+// instance is acquired by a peer while this one still holds their sockets open, which
+// is the one thing the lease exists to prevent.
+func TestAHeartbeatAndTheHandBackTailHaveToFitInsideTheLease(t *testing.T) {
 	t.Setenv("WAC_LEASE_TTL", "30s")
 	t.Setenv("WAC_CLAIM_MIN_IDLE", "45s")
 
-	// A 30s lease leaves 20s once a batch has had its third, and a heartbeat spends its
-	// own length plus half of it again on the read: 14s is the first that does not fit.
-	// 19s is what a check that counted the batch and forgot the read would have let
-	// through, at roughly 34s between renewals.
-	for _, heartbeat := range []string{"14s", "19s", "25s"} {
+	// A 30s lease is fresh for 28s of its life, the margin over again is held back as
+	// the room the renewals and the announcement work in, and 10s belongs to the
+	// hand-back tail: 16s is the first heartbeat that does not fit.
+	for _, heartbeat := range []string{"16s", "25s"} {
 		t.Setenv("WAC_HEARTBEAT", heartbeat)
 		if _, err := app.LoadConfig("connector-test"); err == nil {
-			t.Fatalf("a %s heartbeat started against a 30s lease, so a read and its batch can outlive the lease",
-				heartbeat)
+			t.Fatalf("a %s heartbeat started against a 30s lease, so the tick that renews a lease "+
+				"can come after it has expired", heartbeat)
 		}
 	}
 
-	t.Setenv("WAC_HEARTBEAT", "13s")
+	// And 15s starts: the bound is one period plus the tail against the fresh
+	// lifetime less its working slack, not an enumeration of the loop's steps, which
+	// is exactly what a check that billed the read and the batch to the gap on top of
+	// the period used to refuse.
+	t.Setenv("WAC_HEARTBEAT", "15s")
 	if _, err := app.LoadConfig("connector-test"); err != nil {
 		t.Fatalf("LoadConfig: %v", err)
-	}
-
-	// And the read is bounded by the heartbeat rather than fixed, which is what makes the
-	// arithmetic above hold on a deployment that tunes one of them.
-	if block := app.ReadBlock(13 * time.Second); block >= 13*time.Second {
-		t.Fatalf("a read may wait %s against a 13s heartbeat", block)
 	}
 }
 
@@ -434,7 +433,7 @@ func TestASessionIsDrainedBeforeAnythingNewerIsReadForIt(t *testing.T) {
 	})
 
 	connector := start(t, server.Addr(), "inst-a", map[string]string{
-		"WAC_LEASE_TTL": "3s", "WAC_CLAIM_MIN_IDLE": "3500ms",
+		"WAC_LEASE_TTL": "7s", "WAC_CLAIM_MIN_IDLE": "7500ms",
 	})
 	waitFor(t, "the session to be adopted", func() bool { return connector.Sessions() == 1 })
 
@@ -444,7 +443,7 @@ func TestASessionIsDrainedBeforeAnythingNewerIsReadForIt(t *testing.T) {
 
 	// Held past the reclaim delay: without the drain, the abandoned disconnect comes
 	// back on a later heartbeat and undoes the connect that replaced it.
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(9 * time.Second)
 	for time.Now().Before(deadline) {
 		c.send(ctx, commands, &protocol.Command{
 			V: protocol.Version, ID: "status-" + strconv.FormatInt(time.Now().UnixNano(), 10),
@@ -518,7 +517,7 @@ func TestASessionWithALongBacklogIsDrainedBeforeItIsRead(t *testing.T) {
 	})
 
 	connector := start(t, server.Addr(), "inst-a", map[string]string{
-		"WAC_LEASE_TTL": "3s", "WAC_CLAIM_MIN_IDLE": "3500ms",
+		"WAC_LEASE_TTL": "7s", "WAC_CLAIM_MIN_IDLE": "7500ms",
 	})
 	waitFor(t, "the session to be adopted", func() bool { return connector.Sessions() == 1 })
 
@@ -528,7 +527,7 @@ func TestASessionWithALongBacklogIsDrainedBeforeItIsRead(t *testing.T) {
 
 	// Held past the reclaim delay: a disconnect left behind by the drain comes back on a
 	// later heartbeat and undoes the connect that replaced it.
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(9 * time.Second)
 	for time.Now().Before(deadline) {
 		c.send(ctx, commands, &protocol.Command{
 			V: protocol.Version, ID: "status-" + strconv.FormatInt(time.Now().UnixNano(), 10),
@@ -551,10 +550,10 @@ func TestASessionWithALongBacklogIsDrainedBeforeItIsRead(t *testing.T) {
 }
 
 // A non-positive lease is accepted by cluster.NewLeases, which substitutes its own
-// default, so the leases go on working while everything derived from the configured
-// value here does not: the dispatch budget is a third of it, and a zero budget is a
-// context that has already expired, so every command read is released again unrun. An
-// instance that takes work, does none of it, and reports itself healthy.
+// default, so the leases would go on working while every timing rule is checked
+// against a value the cluster never uses. Each of these has to be refused by name,
+// at startup, rather than surface as an arithmetic complaint about a duration that
+// runs backwards.
 func TestATimingThatCannotWorkIsRefusedAtStartup(t *testing.T) {
 	for name, env := range map[string]map[string]string{
 		"a lease of no length": {
@@ -568,6 +567,12 @@ func TestATimingThatCannotWorkIsRefusedAtStartup(t *testing.T) {
 		},
 		"a heartbeat the lease cannot outlast": {
 			"WAC_LEASE_TTL": "30s", "WAC_CLAIM_MIN_IDLE": "45s", "WAC_HEARTBEAT": "30s",
+		},
+		// A read waits a share of the heartbeat and Redis counts that wait in whole
+		// milliseconds. Under one there is nothing to wait, so every read is skipped and
+		// the instance ticks along alive without ever consuming a command or a wake.
+		"a heartbeat that leaves no room to read": {
+			"WAC_LEASE_TTL": "30s", "WAC_CLAIM_MIN_IDLE": "45s", "WAC_HEARTBEAT": "1ms",
 		},
 	} {
 		t.Run(name, func(t *testing.T) {

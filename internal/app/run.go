@@ -138,7 +138,7 @@ func New(cfg *Config, log zerolog.Logger) (connector *Connector, err error) {
 	}
 
 	streams, err := redisstream.New(client, redisstream.Options{
-		Instance: cfg.Instance, ClaimMinIdle: cfg.ClaimMinIdle, Block: ReadBlock(cfg.Heartbeat),
+		Instance: cfg.Instance, ClaimMinIdle: cfg.ClaimMinIdle, Block: readBlock(cfg.Heartbeat),
 	})
 	if err != nil {
 		return nil, err
@@ -213,6 +213,23 @@ func (c *Connector) Run(ctx context.Context) error {
 	sweepingParts, stopPartSweep := context.WithCancel(ctx)
 	sweptParts := c.sweepMediaParts(sweepingParts)
 
+	if c.cfg.Heartbeat < session.AdoptTimeout {
+		// Said out loud rather than refused. A wake adopts inside the tick window, so a
+		// heartbeat shorter than an adoption means a session whose store or engine open
+		// runs long is cut, forfeited and tried again on a window just as short: the
+		// account never starts, and the only trace is one error per attempt. Refusing
+		// the configuration instead would price out short leases altogether -- the rule
+		// above already puts the heartbeat under two thirds of the lease, so a lease of
+		// a few seconds has no heartbeat left that would also clear an adoption -- and
+		// that is a deployment decision this check has no business making. What closes
+		// it properly is an adoption that does not run on this goroutine at all, which
+		// is #76.
+		c.log.Warn().
+			Str("heartbeat", c.cfg.Heartbeat.String()).
+			Str("adopt_timeout", session.AdoptTimeout.String()).
+			Msg("the heartbeat is shorter than an adoption; a session whose open runs long will be retried rather than started")
+	}
+
 	c.log.Info().
 		Str("addr", c.cfg.HTTPAddr).
 		Str("engine", c.cfg.Engine).
@@ -242,32 +259,69 @@ func (c *Connector) Run(ctx context.Context) error {
 // loop is the instance's single scheduler: it reads commands, hands them to the
 // manager, and on every tick renews the leases and says it is alive.
 //
-// Reading and renewing share a goroutine because a read that blocks is bounded by the
-// transport's block interval, which is well under the lease TTL: a separate goroutine
-// would buy nothing and would need the manager's map to be safe for one more writer.
+// Reading and renewing share a goroutine, so everything that is not the tick's own
+// work runs under one deadline: when the next renewal is due. The bound used to be a
+// sum of per-step budgets, and the sum came out wrong three times running (#7 lists
+// them), because it was a list somebody had to remember in full. A deadline derived
+// from the tick cannot be wrong that way: however many steps the optional work grows,
+// together they cannot outlive the period they started in.
 func (c *Connector) loop(ctx context.Context, httpErr <-chan error) error {
 	heartbeat := time.NewTicker(c.cfg.Heartbeat)
 	defer heartbeat.Stop()
 
 	c.announce(ctx)
+	due := time.Now().Add(c.cfg.Heartbeat)
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case err := <-httpErr:
-			if err != nil {
-				return fmt.Errorf("app: http server: %w", err)
-			}
-			return nil
+			return serverEnded(err)
 		case <-heartbeat.C:
-			c.manager.RenewAll(ctx)
-			c.reclaimCommands(ctx)
-			c.announce(ctx)
-			c.metrics.SessionsRunning.Set(float64(c.manager.Count()))
+			due = c.tick(ctx)
 		default:
-			c.readCommands(ctx)
+			window, cancel := context.WithDeadline(ctx, due)
+			c.readCommands(window)
+			spent := window.Err() != nil
+			cancel()
+			if !spent || ctx.Err() != nil {
+				continue
+			}
+			// The window is gone, and the next thing this goroutine owes the fleet is
+			// a renewal. Falling back to the ticker is what keeps a spent window from
+			// becoming a hot loop: a read whose deadline has already passed comes back
+			// empty immediately, and reading again on it would hammer Redis from here
+			// to the tick.
+			select {
+			case <-ctx.Done():
+				return nil
+			case err := <-httpErr:
+				return serverEnded(err)
+			case <-heartbeat.C:
+				due = c.tick(ctx)
+			}
 		}
 	}
+}
+
+// tick is the heartbeat branch: renewals first, and nothing before them. It returns
+// when the renewal after this one is due, which is the deadline everything outside
+// this branch runs under.
+func (c *Connector) tick(ctx context.Context) time.Time {
+	due := time.Now().Add(c.cfg.Heartbeat)
+	c.manager.RenewAll(ctx)
+	c.reclaimCommands(ctx)
+	c.announce(ctx)
+	c.metrics.SessionsRunning.Set(float64(c.manager.Count()))
+	return due
+}
+
+// serverEnded turns the HTTP server's exit into the loop's own result.
+func serverEnded(err error) error {
+	if err != nil {
+		return fmt.Errorf("app: http server: %w", err)
+	}
+	return nil
 }
 
 // The bounds on how often the media cache is walked. What the cadence decides is how
@@ -453,64 +507,82 @@ func (c *Connector) reclaimPass(ctx context.Context, take func(context.Context) 
 		}
 		return
 	}
-	// The pass's own deadline, not the loop's. dispatchWithin would otherwise open a
-	// fresh budget on top of whatever the claim spent, and a heartbeat configured close
-	// to the lease makes that sum longer than the lease this goroutine is renewing. What
-	// does not fit is released, keeps its age, and comes back on the next tick.
+	// The pass's own deadline, not the loop's: the claim and the dispatch of what it
+	// took share one bound, so a claim that spent most of the pass leaves the dispatch
+	// only the rest. What does not fit is released, keeps its age, and comes back on
+	// the next tick.
 	c.dispatchWithin(pass, deliveries)
 }
 
-// dispatchShare is the fraction of the lease one batch of commands may hold the loop
-// for. The configuration is checked against it, because it is the renewal that follows
-// the batch that has to still be inside the lease.
-const dispatchShare = 3
-
-// readBlockShare is the fraction of a heartbeat a read may wait on Redis for. Derived
-// rather than fixed, because it is the same goroutine again: a read that blocks past the
-// tick delays every renewal behind it by however long it blocked, and a fixed five
-// seconds is most of a heartbeat on one deployment and none of it on another.
+// readBlockShare is the fraction of a heartbeat a read waits on Redis before answering
+// "nothing this round". What stops a read from outliving the tick is the deadline it is
+// given, which the transport shortens its block to fit; this is the ceiling on that, so
+// a quiet period costs a couple of clean round trips rather than a connection killed on
+// its deadline every time.
 const readBlockShare = 2
 
-// ReadBlock is how long the transport waits for a command before answering "nothing this
-// round". Exported because the configuration is checked against it and the check has to
-// be the same arithmetic as the wiring.
-func ReadBlock(heartbeat time.Duration) time.Duration { return heartbeat / readBlockShare }
+// readBlock is how long the transport waits for a command before answering "nothing
+// this round".
+func readBlock(heartbeat time.Duration) time.Duration { return heartbeat / readBlockShare }
 
-// budget is how long one batch of commands may hold the loop. It is a third of the
-// lease, so a batch that spends all of it still leaves two thirds for the renewal that
-// follows.
-func (c *Connector) budget() time.Duration { return c.cfg.LeaseTTL / dispatchShare }
-
-// dispatchWithin carries out what a reclaim took, and stops when it has spent as long
-// as this goroutine can afford.
+// dispatchWithin carries out a batch, and stops when the caller's deadline runs out.
 //
 // Reclaimed deliveries are mostly wakes, and a wake is the one command that blocks: it
 // adopts a session, which reads the store. A batch of them can therefore run for
 // several times the adoption bound, on the goroutine that renews every lease this
 // instance holds — and the sessions whose renewals it delays are handed to peers while
-// this instance still holds their sockets open. What is not dispatched is released, so
-// it stays pending and comes back on a later pass.
+// this instance still holds their sockets open. The deadline is the caller's own -- a
+// reclaim pass's share of the heartbeat, or the tick window -- rather than a budget
+// opened here, which would stack on whatever the caller had already spent. What is not
+// dispatched is released, so it stays pending and comes back on a later pass.
 func (c *Connector) dispatchWithin(ctx context.Context, deliveries []transport.Delivery) bool {
-	budget, cancel := context.WithTimeout(ctx, c.budget())
-	defer cancel()
-
 	for i := range deliveries {
-		if budget.Err() != nil {
+		if ctx.Err() != nil || !c.roomFor(ctx, &deliveries[i]) {
 			for rest := i; rest < len(deliveries); rest++ {
 				if deliveries[rest].Release != nil {
 					deliveries[rest].Release()
 				}
 			}
 			c.log.Warn().Int("left", len(deliveries)-i).
-				Msg("a batch of commands ran out of its budget; the rest stays pending")
+				Msg("a batch of commands ran out of its window; the rest stays pending")
 			return false
 		}
-		// The budget, not the loop's own context. A wake starting just before the
-		// deadline would otherwise run its whole adoption past it, which is most of the
-		// budget again on the goroutine that has renewals waiting behind it.
-		c.manager.Dispatch(budget, &deliveries[i])
+		c.manager.Dispatch(ctx, &deliveries[i])
 	}
 	return true
+}
+
+// roomFor reports whether the window can still give this delivery a real turn.
+//
+// Only the two commands the manager carries out on this goroutine are held to a floor,
+// and they are the two that spend the window: a wake adopts a session, which reads the
+// store, and a ping answers the caller over Redis. One dispatched with a sliver has that
+// trip cut and is retired all the same -- the acknowledgement runs on a detached timeout
+// on purpose -- so a wake costs the session a whole claim delay for an attempt that never
+// was, and a ping leaves its caller waiting for an answer no redelivery will produce.
+// Below the floor they are released instead, age kept, and the next pass gives them a
+// window worth having.
+//
+// Everything else is an offer to a session's queue, which returns at once and is carried
+// out on that session's own goroutine, and holding one back would cost more than the
+// sliver does. A command read from a session's stream and then released stays pending
+// while the next `>` read can hand over a newer one for the same session -- the reclaim
+// walks the sessions a window at a time, so the older entry can wait several ticks for a
+// pass that looks at its stream -- which is the per-session order the single stream
+// exists to give, traded away for a round trip that was not going to block anyway.
+func (c *Connector) roomFor(ctx context.Context, delivery *transport.Delivery) bool {
+	switch delivery.Command.Type {
+	case protocol.CommandSessionWake, protocol.CommandAdminPing:
+	default:
+		return true
+	}
+	deadline, bounded := ctx.Deadline()
+	if !bounded {
+		return true
+	}
+	// Half a read block: a turn shorter than that is a formality, and it ends in a
+	// forfeit or an unanswerable caller that nothing deserved.
+	return time.Until(deadline) >= readBlock(c.cfg.Heartbeat)/2
 }
 
 // reclaimPasses is how many independent passes one heartbeat's reclaim is made of: the
@@ -560,24 +632,23 @@ const maxDrainPasses = 4
 // Those must not be read from until they are drained. A pending entry is off the stream
 // until somebody claims it, so a `>` read hands over commands that arrived after it, and
 // per-session order is the one thing that stream is for.
+//
+// Bounded by the caller's window rather than a budget of its own: it walks every
+// adopted stream, up to maxDrainPasses times, on the goroutine that renews every lease
+// this instance holds, and the window ends when the next renewal is due. A drain the
+// window cuts short picks up where it stopped on the next one.
 func (c *Connector) drainAdopted(ctx context.Context) []string {
 	adopted := c.manager.TakeNewlyAdopted()
 	if len(adopted) == 0 {
 		return nil
 	}
 
-	// The same budget as a dispatch batch, for the same reason: this walks every
-	// adopted stream, up to maxDrainPasses times, on the goroutine that renews every
-	// lease this instance holds.
-	pass, cancel := context.WithTimeout(ctx, c.budget())
-	defer cancel()
-
 	for range maxDrainPasses {
-		if pass.Err() != nil {
+		if ctx.Err() != nil {
 			c.manager.ReturnAdopted(adopted)
 			return adopted
 		}
-		deliveries, err := c.streams.ClaimSessions(pass, adopted)
+		deliveries, err := c.streams.ClaimSessions(ctx, adopted)
 		if err != nil {
 			if ctx.Err() == nil {
 				c.log.Error().Err(err).Msg("failed to drain what a newly adopted session had pending")
@@ -590,12 +661,8 @@ func (c *Connector) drainAdopted(ctx context.Context) []string {
 		}
 		// One pass takes at most ReadCount per stream, so a session with a long backlog
 		// needs several before anything newer may be read for it. A pass cut short by
-		// the budget has left entries pending, so the session is not drained either.
-		// The drain's own deadline, not the loop's: dispatchWithin would otherwise open a
-		// fresh budget on every one of these passes, and a drain that already spent its
-		// claim time would go on holding the goroutine that renews every lease this
-		// instance holds for several budgets more.
-		if !c.dispatchWithin(pass, deliveries) {
+		// the window has left entries pending, so the session is not drained either.
+		if !c.dispatchWithin(ctx, deliveries) {
 			c.manager.ReturnAdopted(adopted)
 			return adopted
 		}
@@ -605,6 +672,7 @@ func (c *Connector) drainAdopted(ctx context.Context) []string {
 	return adopted
 }
 
+// readCommands drains what newly adopted sessions have pending and reads what is newer.
 func (c *Connector) readCommands(ctx context.Context) {
 	// Before the read, not after: a session adopted a moment ago may have commands its
 	// previous owner abandoned, and reading `>` for it first would hand over what
@@ -618,6 +686,10 @@ func (c *Connector) readCommands(ctx context.Context) {
 		// backlog is taken over.
 		sids = slices.DeleteFunc(sids, func(sid string) bool { return slices.Contains(undrained, sid) })
 	}
+	// Whatever is left of the window is what the read gets. The transport cuts its own
+	// block down to fit a deadline rather than refusing a window it finds too narrow,
+	// so a tick that spent most of its period still reads, and reads promptly: a gate
+	// here could only refuse, and one refusing every time is a read that never runs.
 	deliveries, err := c.streams.Read(ctx, sids)
 	if err != nil {
 		if ctx.Err() == nil {

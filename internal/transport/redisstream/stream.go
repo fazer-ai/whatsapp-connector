@@ -155,6 +155,41 @@ func (s *Streams) Reply(ctx context.Context, replyTo string, reply protocol.Repl
 	return nil
 }
 
+// blockWithin is how long the server may hold this read: the configured block, unless
+// the caller brought a deadline too near to fit one.
+//
+// Shortening it here rather than letting the caller decide whether a whole block fits.
+// A caller can only refuse, and a loop whose other work consistently leaves less than a
+// block would then stop reading `>` altogether while commands pile up unread -- the
+// read starving on a rule meant to protect it. Cutting the block instead means a narrow
+// window costs a short read, never no read.
+//
+// A third of what is left stays unspent, for the round trips the block does not cover:
+// ensuring a group on a stream not seen before, and the answer's own transit. A read
+// cut off by the deadline mid-flight is the failure worth paying that for -- the server
+// may have just moved a command into this consumer's pending list when the connection
+// dies, and an entry pending here with no local record of the delivery is claimable by
+// nobody until the whole claim delay has passed, with newer commands for the same
+// session read and run ahead of it meanwhile.
+//
+// A window too thin to name a block in milliseconds is the one case with no read at
+// all: what is left cannot express the reserve, and a non-blocking read would spend a
+// whole round trip with nothing held back for the answer -- the very failure the
+// reserve is for. Skipping starves nothing, unlike a gate measured in blocks: a window
+// down to its last milliseconds is a window already over, and the loop is on its way
+// back to the ticker to start a fresh one.
+func (s *Streams) blockWithin(ctx context.Context) (time.Duration, bool) {
+	deadline, bounded := ctx.Deadline()
+	if !bounded {
+		return s.opts.Block, true
+	}
+	block := min(s.opts.Block, time.Until(deadline)*2/3)
+	if block < time.Millisecond {
+		return 0, false
+	}
+	return block, true
+}
+
 // Read returns the commands waiting for the sessions this instance owns, plus the
 // fleet-wide ones. `>` asks for entries no consumer in the group has taken yet;
 // anything already taken and not acknowledged is Claim's business.
@@ -163,8 +198,20 @@ func (s *Streams) Read(ctx context.Context, sids []string) ([]transport.Delivery
 	if len(streams) == 0 {
 		return nil, nil
 	}
+	// Before the group ensure, so a window already over does not pay for it: creating a
+	// group on a stream not seen before is a round trip of its own.
+	if _, room := s.blockWithin(ctx); !room {
+		return nil, nil
+	}
 	if err := s.groups.ensure(ctx, s.client, streams); err != nil {
 		return nil, err
+	}
+	// And again after it, because that trip spends the same window the block is measured
+	// against: a block decided before it can outlive the deadline by whatever the ensure
+	// took, which is the severed read this reserve exists to prevent.
+	block, room := s.blockWithin(ctx)
+	if !room {
+		return nil, nil
 	}
 
 	args := &redis.XReadGroupArgs{
@@ -172,7 +219,7 @@ func (s *Streams) Read(ctx context.Context, sids []string) ([]transport.Delivery
 		Consumer: s.opts.Instance,
 		Streams:  append(streams, newEntries(len(streams))...),
 		Count:    s.opts.ReadCount,
-		Block:    s.opts.Block,
+		Block:    block,
 	}
 	result, err := s.client.XReadGroup(ctx, args).Result()
 	switch {

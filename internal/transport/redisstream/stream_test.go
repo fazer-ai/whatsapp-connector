@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -23,6 +24,7 @@ const shards = 8
 
 type fleet struct {
 	server *miniredis.Miniredis
+	rdb    *redis.Client
 	client *redisx.Client
 }
 
@@ -31,7 +33,29 @@ func newFleet(t *testing.T) fleet {
 	server := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
 	t.Cleanup(func() { _ = rdb.Close() })
-	return fleet{server: server, client: redisx.Wrap(rdb, "wa:", shards)}
+	return fleet{server: server, rdb: rdb, client: redisx.Wrap(rdb, "wa:", shards)}
+}
+
+// count makes the fleet's client report how many commands it actually sends, which is
+// the only way to tell a read that answered quietly from one that never went out.
+func (f fleet) count(n *atomic.Int64) { f.rdb.AddHook(&sentCommands{n: n}) }
+
+type sentCommands struct{ n *atomic.Int64 }
+
+func (*sentCommands) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (h *sentCommands) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		h.n.Add(1)
+		return next(ctx, cmd)
+	}
+}
+
+func (h *sentCommands) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return func(ctx context.Context, cmds []redis.Cmder) error {
+		h.n.Add(int64(len(cmds)))
+		return next(ctx, cmds)
+	}
 }
 
 func (f fleet) streams(t *testing.T, instance string) *redisstream.Streams {
@@ -148,6 +172,146 @@ func TestReadDeliversCommandsForOwnedSessions(t *testing.T) {
 	}
 	if delivered[0].Command.ID != "c1" {
 		t.Errorf("command id = %q, want c1", delivered[0].Command.ID)
+	}
+}
+
+// A read takes the caller's deadline as the bound on its own block, so a window too
+// narrow for the configured one costs a short read rather than a severed connection.
+//
+// Being cut off mid-flight is what that avoids: the server may move a command into this
+// consumer's pending list just as the connection dies, and an entry pending here that no
+// delivery was ever handed back for is claimable by nobody until the whole claim delay
+// has passed, with newer commands for the same session read and run ahead of it. The
+// caller cannot avoid it by refusing to read either -- a loop whose other work
+// consistently leaves less than a block would then never read at all.
+func TestAReadShortensItsBlockToTheCallersDeadline(t *testing.T) {
+	t.Parallel()
+
+	f := newFleet(t)
+	// The group has to exist before the read under test, and creating it from another
+	// instance keeps that first call off the long block this one is configured with.
+	if _, err := f.streams(t, "inst-prep").Read(context.Background(), []string{"s1"}); err != nil {
+		t.Fatalf("priming Read: %v", err)
+	}
+	// A block far longer than the window below, which is the shape a tick that ran long
+	// leaves behind in production.
+	streams, err := redisstream.New(f.client, redisstream.Options{
+		Instance: "inst-a", Block: 2 * time.Second, ClaimMinIdle: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("redisstream.New: %v", err)
+	}
+
+	deadline := time.Now().Add(150 * time.Millisecond)
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
+
+	// Nothing is waiting, so the call is all block: what comes back is either the server
+	// answering "nothing this round" inside the window, or the deadline cutting it off.
+	delivered, err := streams.Read(ctx, []string{"s1"})
+	back := time.Now()
+	if err != nil {
+		t.Fatalf("Read was cut off instead of shortening its block: %v", err)
+	}
+	if len(delivered) != 0 {
+		t.Fatalf("Read returned %d commands from a stream nothing was written to", len(delivered))
+	}
+	if back.After(deadline) {
+		t.Fatalf("Read came back %s past the deadline it was given", back.Sub(deadline))
+	}
+}
+
+// A window with no room for a round trip buys a read nothing, and costs what the read
+// would have cost: a command the server moves into this consumer's pending list on a
+// call whose answer the deadline cuts off is claimable by nobody for the whole claim
+// delay, with no delivery here to release it.
+func TestAReadIsSkippedWhenNoRoundTripFitsTheWindow(t *testing.T) {
+	t.Parallel()
+
+	f := newFleet(t)
+	streams := f.streams(t, "inst-a")
+	if _, err := streams.Read(context.Background(), []string{"s1"}); err != nil {
+		t.Fatalf("priming Read: %v", err)
+	}
+
+	var sent atomic.Int64
+	f.count(&sent)
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(time.Millisecond))
+	defer cancel()
+
+	delivered, err := streams.Read(ctx, []string{"s1"})
+	if err != nil {
+		t.Fatalf("Read on a spent window = %v, want the quiet answer a read gives when it finds nothing", err)
+	}
+	if len(delivered) != 0 {
+		t.Fatalf("Read returned %d commands from a window it should not have used", len(delivered))
+	}
+	if got := sent.Load(); got != 0 {
+		t.Fatalf("%d command(s) went to Redis on a window with no room for the answer", got)
+	}
+}
+
+// The group ensure spends the same window the block is measured against, so the block
+// has to be measured again after it. A stream this instance has not read before costs an
+// XGROUP CREATE, and a block decided before that trip outlives the deadline by whatever
+// the trip took.
+func TestAReadMeasuresItsBlockAgainAfterCreatingGroups(t *testing.T) {
+	t.Parallel()
+
+	f := newFleet(t)
+	// A block long enough that the window, not the configured block, bounds the read.
+	streams, err := redisstream.New(f.client, redisstream.Options{
+		Instance: "inst-a", Block: 2 * time.Second, ClaimMinIdle: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("redisstream.New: %v", err)
+	}
+	// One group per stream, and a read always listens to control as well as the session,
+	// so the ensure is two trips. Sized so together they eat most of the window: what is
+	// left is well under the block a measurement taken before them would have chosen.
+	const window = 300 * time.Millisecond
+	f.rdb.AddHook(slowCommands{
+		on:    func(cmd redis.Cmder) bool { return strings.HasPrefix(cmd.Name(), "xgroup") },
+		delay: 90 * time.Millisecond,
+	})
+
+	deadline := time.Now().Add(window)
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
+
+	if _, err := streams.Read(ctx, []string{"s1"}); err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if back := time.Now(); back.After(deadline) {
+		t.Fatalf("Read came back %s past the deadline: its block was measured before the group ensure spent the window",
+			back.Sub(deadline))
+	}
+}
+
+// slowCommands makes the commands a test names take a fixed slice of the window their
+// caller is working to.
+type slowCommands struct {
+	on    func(redis.Cmder) bool
+	delay time.Duration
+}
+
+func (slowCommands) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (slowCommands) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+
+func (h slowCommands) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if h.on(cmd) {
+			select {
+			case <-time.After(h.delay):
+			case <-ctx.Done():
+				cmd.SetErr(ctx.Err())
+				return ctx.Err()
+			}
+		}
+		return next(ctx, cmd)
 	}
 }
 

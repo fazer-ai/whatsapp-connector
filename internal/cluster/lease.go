@@ -169,18 +169,102 @@ func (l *Leases) Acquire(ctx context.Context, sid string) (Lease, error) {
 // another round trip.
 func (l *Leases) Renew(ctx context.Context, sid string) error {
 	keys := l.client.Keys()
+	sent := l.clock.Now()
 	ok, err := renewScript.Run(ctx, l.client, []string{keys.Lease(sid)}, l.instance, l.ttl.Milliseconds()).Int()
 	if err != nil {
 		return fmt.Errorf("cluster: renew %s: %w", sid, err)
 	}
+	return l.applyRenew(sid, ok, sent)
+}
+
+// RenewMany renews every session named in one round trip, and answers for each of them
+// the way Renew would.
+//
+// One round trip and not one per session, because this runs on the goroutine that also
+// reads commands, and its budget is written in fixed durations: a heartbeat, a share of
+// a lease. A renewal per session puts a term proportional to how many sessions this
+// instance holds inside a bound that names none of them, so an instance carrying a few
+// hundred takes longer to renew than the arithmetic allows, and the sessions at the end
+// of the list are the ones handed to a peer while this instance still holds their
+// sockets. Pipelined, the pass costs what one renewal costs plus the bytes, whatever
+// the count.
+//
+// The per-command errors are what is read, not the one Pipelined returns: it reports
+// the first failure, and a lease lost by one session says nothing about the next.
+func (l *Leases) RenewMany(ctx context.Context, sids []string) map[string]error {
+	out := make(map[string]error, len(sids))
+	if len(sids) == 0 {
+		return out
+	}
+	renew := func(sids []string, send func(redis.Pipeliner, string) *redis.Cmd) []*redis.Cmd {
+		cmds := make([]*redis.Cmd, len(sids))
+		_, _ = l.client.Pipelined(ctx, func(pipe redis.Pipeliner) error {
+			for i, sid := range sids {
+				cmds[i] = send(pipe, sid)
+			}
+			return nil
+		})
+		return cmds
+	}
+	keys := l.client.Keys()
+	byDigest := func(pipe redis.Pipeliner, sid string) *redis.Cmd {
+		return renewScript.EvalSha(ctx, pipe, []string{keys.Lease(sid)}, l.instance, l.ttl.Milliseconds())
+	}
+	byBody := func(pipe redis.Pipeliner, sid string) *redis.Cmd {
+		return renewScript.Eval(ctx, pipe, []string{keys.Lease(sid)}, l.instance, l.ttl.Milliseconds())
+	}
+
+	// The digest first, which is what Run would send, and the body only for what comes
+	// back unloaded. Run's own fallback cannot help inside a pipeline -- it decides on
+	// an error the command does not carry until the whole batch has been sent -- and
+	// falling back one session at a time would spend, on the first pass after a restart
+	// or a SCRIPT FLUSH, exactly the round trip per session this exists to avoid.
+	sent := l.clock.Now()
+	cmds := renew(sids, byDigest)
+	var unloaded []string
+	for i, sid := range sids {
+		ok, err := cmds[i].Int()
+		if redis.HasErrorPrefix(err, "NOSCRIPT") {
+			unloaded = append(unloaded, sid)
+			continue
+		}
+		out[sid] = l.answerRenew(sid, ok, err, sent)
+	}
+	if len(unloaded) > 0 {
+		resent := l.clock.Now()
+		retried := renew(unloaded, byBody)
+		for i, sid := range unloaded {
+			ok, err := retried[i].Int()
+			out[sid] = l.answerRenew(sid, ok, err, resent)
+		}
+	}
+	return out
+}
+
+// answerRenew turns one command's outcome into the answer Renew gives for that session.
+func (l *Leases) answerRenew(sid string, ok int, err error, sent time.Time) error {
+	if err != nil {
+		return fmt.Errorf("cluster: renew %s: %w", sid, err)
+	}
+	return l.applyRenew(sid, ok, sent)
+}
+
+// applyRenew turns the script's answer into this instance's own record of the lease.
+//
+// Stamped with when the renewal was sent, not with when its answer came back. Redis
+// starts the new TTL when the script runs, which is before the reply is read and, in a
+// pipeline, can be a whole batch before it. Stamping on arrival would date the lease
+// later than Redis does and let Owned keep saying yes past the moment the key actually
+// expires, which is the one direction that puts two sockets on one account. Dating it
+// earlier than Redis only ever gives up the lease sooner than necessary.
+func (l *Leases) applyRenew(sid string, ok int, sent time.Time) error {
 	if ok != 1 {
 		l.forget(sid)
 		return ErrNotOwner
 	}
-
 	l.mu.Lock()
-	if entry, ok := l.held[sid]; ok {
-		entry.renewedAt = l.clock.Now()
+	if entry, held := l.held[sid]; held {
+		entry.renewedAt = sent
 		l.held[sid] = entry
 	}
 	l.mu.Unlock()

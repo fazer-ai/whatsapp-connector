@@ -1040,8 +1040,32 @@ type brokenReplies struct {
 
 func (brokenReplies) DialHook(next redis.DialHook) redis.DialHook { return next }
 
-func (brokenReplies) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
-	return next
+// The renewals go out as one pipeline, so a hook that only watched commands run on
+// their own would no longer reach the call these tests exist to break.
+func (h brokenReplies) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return func(ctx context.Context, cmds []redis.Cmder) error {
+		sent := make([]redis.Cmder, 0, len(cmds))
+		for _, cmd := range cmds {
+			if h.drop != nil && h.drop(cmd) {
+				cmd.SetErr(errNoAnswer)
+				continue
+			}
+			sent = append(sent, cmd)
+		}
+		var err error
+		if len(sent) > 0 {
+			err = next(ctx, sent)
+		}
+		if err != nil || h.lose == nil {
+			return err
+		}
+		for _, cmd := range sent {
+			if cmd.Err() == nil && h.lose(cmd) {
+				cmd.SetErr(errNoAnswer)
+			}
+		}
+		return err
+	}
 }
 
 func (h brokenReplies) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
