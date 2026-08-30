@@ -321,7 +321,7 @@ func TestAWakeLeftPendingIsPickedUpAgain(t *testing.T) {
 	}
 
 	// A live instance now starts. A plain read will never show it this entry.
-	connector := start(t, server.Addr(), "inst-a", map[string]string{"WAC_LEASE_TTL": "4s", "WAC_CLAIM_MIN_IDLE": "4500ms"})
+	connector := start(t, server.Addr(), "inst-a", map[string]string{"WAC_LEASE_TTL": "7s", "WAC_CLAIM_MIN_IDLE": "7500ms"})
 	waitFor(t, "the pending wake to be reclaimed and acted on", func() bool {
 		return connector.Sessions() == 1
 	})
@@ -339,9 +339,10 @@ func TestAHeartbeatAndTheHandBackTailHaveToFitInsideTheLease(t *testing.T) {
 	t.Setenv("WAC_LEASE_TTL", "30s")
 	t.Setenv("WAC_CLAIM_MIN_IDLE", "45s")
 
-	// A 30s lease is fresh for 28s of its life, and keeps 18s of that beside its 10s
-	// hand-back tail, so 18s is the first heartbeat that does not fit.
-	for _, heartbeat := range []string{"18s", "25s"} {
+	// A 30s lease is fresh for 28s of its life, the margin over again is held back as
+	// the room the renewals and the announcement work in, and 10s belongs to the
+	// hand-back tail: 16s is the first heartbeat that does not fit.
+	for _, heartbeat := range []string{"16s", "25s"} {
 		t.Setenv("WAC_HEARTBEAT", heartbeat)
 		if _, err := app.LoadConfig("connector-test"); err == nil {
 			t.Fatalf("a %s heartbeat started against a 30s lease, so the tick that renews a lease "+
@@ -349,11 +350,11 @@ func TestAHeartbeatAndTheHandBackTailHaveToFitInsideTheLease(t *testing.T) {
 		}
 	}
 
-	// And 17s starts: the bound is one period plus the tail against the fresh
-	// lifetime, not an enumeration of the loop's steps, which is exactly what a check
-	// that billed the read and the batch to the gap on top of the period used to
-	// refuse.
-	t.Setenv("WAC_HEARTBEAT", "17s")
+	// And 15s starts: the bound is one period plus the tail against the fresh
+	// lifetime less its working slack, not an enumeration of the loop's steps, which
+	// is exactly what a check that billed the read and the batch to the gap on top of
+	// the period used to refuse.
+	t.Setenv("WAC_HEARTBEAT", "15s")
 	if _, err := app.LoadConfig("connector-test"); err != nil {
 		t.Fatalf("LoadConfig: %v", err)
 	}
@@ -432,7 +433,7 @@ func TestASessionIsDrainedBeforeAnythingNewerIsReadForIt(t *testing.T) {
 	})
 
 	connector := start(t, server.Addr(), "inst-a", map[string]string{
-		"WAC_LEASE_TTL": "4s", "WAC_CLAIM_MIN_IDLE": "4500ms",
+		"WAC_LEASE_TTL": "7s", "WAC_CLAIM_MIN_IDLE": "7500ms",
 	})
 	waitFor(t, "the session to be adopted", func() bool { return connector.Sessions() == 1 })
 
@@ -442,7 +443,7 @@ func TestASessionIsDrainedBeforeAnythingNewerIsReadForIt(t *testing.T) {
 
 	// Held past the reclaim delay: without the drain, the abandoned disconnect comes
 	// back on a later heartbeat and undoes the connect that replaced it.
-	deadline := time.Now().Add(6 * time.Second)
+	deadline := time.Now().Add(9 * time.Second)
 	for time.Now().Before(deadline) {
 		c.send(ctx, commands, &protocol.Command{
 			V: protocol.Version, ID: "status-" + strconv.FormatInt(time.Now().UnixNano(), 10),
@@ -516,7 +517,7 @@ func TestASessionWithALongBacklogIsDrainedBeforeItIsRead(t *testing.T) {
 	})
 
 	connector := start(t, server.Addr(), "inst-a", map[string]string{
-		"WAC_LEASE_TTL": "4s", "WAC_CLAIM_MIN_IDLE": "4500ms",
+		"WAC_LEASE_TTL": "7s", "WAC_CLAIM_MIN_IDLE": "7500ms",
 	})
 	waitFor(t, "the session to be adopted", func() bool { return connector.Sessions() == 1 })
 
@@ -526,7 +527,7 @@ func TestASessionWithALongBacklogIsDrainedBeforeItIsRead(t *testing.T) {
 
 	// Held past the reclaim delay: a disconnect left behind by the drain comes back on a
 	// later heartbeat and undoes the connect that replaced it.
-	deadline := time.Now().Add(6 * time.Second)
+	deadline := time.Now().Add(9 * time.Second)
 	for time.Now().Before(deadline) {
 		c.send(ctx, commands, &protocol.Command{
 			V: protocol.Version, ID: "status-" + strconv.FormatInt(time.Now().UnixNano(), 10),

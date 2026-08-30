@@ -373,15 +373,20 @@ func TestTheLoopBoundsItsOptionalWorkByTheTick(t *testing.T) {
 
 // The gate on the read sits after the drain, because the drain spends the same window:
 // checked only at the top of the iteration, a slow drain leaves the read a sliver, the
-// deadline severs the XREADGROUP mid-block, and a command the server had just moved to
+// deadline severs the XREADGROUP mid-flight, and a command the server had just moved to
 // this consumer's pending list waits out the full claim delay with no local record —
-// while newer commands for the same session are read and run ahead of it.
+// while newer commands for the same session are read and run ahead of it. And the gate
+// asks for more than the bare block: the round trips around it need room too, which is
+// what the drain here leaves the read exactly a block minus a sliver to prove.
 func TestASlowDrainDoesNotLeaveTheReadASliverOfTheWindow(t *testing.T) {
 	t.Parallel()
 
 	const heartbeat = 600 * time.Millisecond
 	const window = 600 * time.Millisecond
-	const slowClaim = 450 * time.Millisecond
+	// Sized to leave the read more than its 300ms block and less than the block and a
+	// half the gate asks for, so a gate that forgot either the drain or the round-trip
+	// room starts the read and fails here.
+	const slowClaim = 250 * time.Millisecond
 
 	server := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
@@ -448,7 +453,7 @@ func TestASlowDrainDoesNotLeaveTheReadASliverOfTheWindow(t *testing.T) {
 		t.Fatal("the drain did not dispatch the pending command, so this exercises nothing")
 	}
 	if got := reads.Load(); got != 0 {
-		t.Fatalf("a read was started %d time(s) with less than its block left of the window", got)
+		t.Fatalf("a read was started %d time(s) without room for its block and the trips around it", got)
 	}
 	if read {
 		t.Fatal("readCommands reported room for a read the window did not have")

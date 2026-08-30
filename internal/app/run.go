@@ -632,13 +632,17 @@ func (c *Connector) readCommands(ctx context.Context) bool {
 
 	// Checked here, after the drain, because the drain spends the same window: a gate
 	// at the top of the iteration passes and then the claims eat most of what is left.
-	// Only a read whose block fits what remains is started. One cut off by the deadline
-	// mid-block is worse than one skipped: the server may have just moved a command
-	// into this consumer's pending list when the connection dies, and an entry pending
-	// here with no local record of the delivery is reclaimable by nobody until the full
-	// claim delay has passed — with newer commands for the same session read and run
-	// ahead of it meanwhile, which is the ordering the single stream exists to give.
-	if deadline, bounded := ctx.Deadline(); bounded && time.Until(deadline) < readBlock(c.cfg.Heartbeat) {
+	// Only a read whose whole cost fits what remains is started — the server-side
+	// block, plus half a block again for the round trips around it (ensuring a group
+	// on a stream not seen before, the reply's own transit), derived rather than fixed
+	// for the same reason the block is. One cut off by the deadline mid-flight is
+	// worse than one skipped: the server may have just moved a command into this
+	// consumer's pending list when the connection dies, and an entry pending here with
+	// no local record of the delivery is reclaimable by nobody until the full claim
+	// delay has passed — with newer commands for the same session read and run ahead
+	// of it meanwhile, which is the ordering the single stream exists to give.
+	block := readBlock(c.cfg.Heartbeat)
+	if deadline, bounded := ctx.Deadline(); bounded && time.Until(deadline) < block+block/2 {
 		return false
 	}
 
