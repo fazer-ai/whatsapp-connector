@@ -244,6 +244,14 @@ func (c *Command) ChangesSomething() bool {
 // so a redelivery that lands on a new socket and is answered from the ledger reports a
 // success over a connection where nothing was done.
 //
+// `presence.set` is here even though the connector now puts the availability back on
+// every connection of its own accord, because that reaches only as far as the session
+// that was told: the memory is the session's, the ledger is shared, and an ownership
+// change builds a session that has never heard the command. Answering a redelivery from
+// the record would then be exactly the success over a connection where nothing was done
+// that this table exists to stop. Making it durable is a per-session record this does
+// not have, and is #72.
+//
 // `chat.presence` is deliberately not here. Skipping it costs a typing indicator nobody
 // sees, and carrying it out again long after the fact shows one that is not true -- so
 // unlike these two, repeating is not the safer of the two mistakes.

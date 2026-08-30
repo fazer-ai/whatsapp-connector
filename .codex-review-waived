@@ -224,6 +224,16 @@ internal/engine/whatsmeow/receipt.go: Fail group read marks when normalization f
 # rather than folded in here, because the subscription set it would have to keep is
 # unbounded by construction and deciding how to bound it is not this slice's decision.
 # Registered as #46.
+#
+# PR#73 built that replay, and both commands are still excluded. The reason is now a
+# different one and a narrower one. The availability is put back on every connection, so
+# within one session a redelivery answered from the ledger no longer reports success over
+# a connection where nothing was done -- but the memory is the session's and the ledger is
+# shared, so a session built by the instance that takes the account over has never heard
+# the command and has nothing to put back. Subscriptions are not replayed at all: the
+# contract now says a client re-establishes them on `session.state: open`, which is a
+# decision about who owns that set rather than a gap. Making the availability durable
+# enough to take `presence.set` out of this table is #72.
 internal/protocol/types.go: Preserve idempotency for redelivered presence commands  # PR#45
 # PR#45: the claim is true and the remedy is worse than what it fixes. Cancelling a
 # context does not un-send bytes Redis has already buffered, so an XADD can be appended
@@ -263,3 +273,21 @@ internal/session/session.go: Enforce transient expiry inside the Redis append  #
 #
 # Registered as #49, with what upstream would have to expose to close it.
 internal/engine/whatsmeow/session.go: Tie presence to the socket that produced it  # PR#45
+# PR#73: the fact is right and the harm runs the other way. `NoiseSocket.SendFrame` does
+# take its write lock before it reads the context, and a mutex cannot be given a
+# deadline, so a write already stuck behind that lock outlives `presenceWait`. Neither
+# remedy is available: the lock is private to whatsmeow, and forcing the socket closed
+# because a presence node is slow tears a session down over a background nicety, on a
+# suspicion nothing outside the library can confirm.
+#
+# What the finding reads as an amplification is the opposite. The right to the wire does
+# not cause the stall; without it a `presence.set` would block inside SendPresence on the
+# same upstream lock for the same duration and answer nothing at all, which is what every
+# other command that writes a node still does. With it the command fails promptly and the
+# session's executor stays free. The exposure belongs to every node this connector
+# writes, and the fix is upstream.
+#
+# Registered as #74, with the chain that reaches it -- including the telemetry node
+# SendPresence spawns on an unbounded BackgroundEventCtx, and the keepalive blocking on
+# the same lock so it never forces the reconnect that would clear it.
+internal/engine/whatsmeow/presence.go: Make the reconnect timeout cover the upstream write lock  # PR#73

@@ -154,6 +154,12 @@ type Session struct {
 	// it fails, which are opposite answers and neither is reachable from a stanza alone.
 	unsealReaction func(context.Context, *waEvents.Message) (*waE2E.ReactionMessage, error)
 
+	// sendPresence tells WhatsApp what the account is. A field for the same reason as
+	// the seams above it: a presence node is only answered by a real socket, so a test
+	// cannot otherwise see that the account is told again on a new connection what it
+	// last said it was.
+	sendPresence func(context.Context, *wm.Client, waTypes.Presence) error
+
 	// handoffWait bounds how long a moment waits on a reader that is busy. A field for
 	// the same reason as deliverWait, and for no other.
 	handoffWait time.Duration
@@ -175,12 +181,54 @@ type Session struct {
 	board    map[string]posted
 	boardMu  sync.Mutex
 	boardSeq int64
+
+	// availability is the last presence WhatsApp took from this account, and nil while
+	// the client has asked for none. It is kept because WhatsApp forgets it when the
+	// connection goes and whatsmeow does not send it again, so a connection that comes
+	// back has to be told.
+	//
+	// Its own lock rather than mu, and held for the field and nothing else -- never
+	// across the write, so the one path that must not wait on a socket does not: a
+	// rebuild clears this, and a rebuild is what a logout is waiting on.
+	availability   *asked
+	availabilityMu sync.Mutex
+
+	// presenceWait bounds the presence node nobody is waiting on: the one a connection
+	// that came back is told. A field for the same reason as the waits above it, and for
+	// no other.
+	//
+	// Bounded at all because it is the one presence write with no caller behind it to
+	// carry a deadline, and whatsmeow bounds a frame write by the socket's own life
+	// rather than by the context it is given -- so on a connection that authenticated
+	// and then stopped taking bytes, this would hold the right to the wire for as long
+	// as the process runs, and every `presence.set` after it with the same.
+	//
+	// It bounds the wait for that right and the write once whatsmeow has its socket
+	// lock, and not the wait for the lock itself: `NoiseSocket.SendFrame` takes it
+	// before it reads the context, and a mutex cannot be given a deadline. A write
+	// already stuck behind that lock outlives this, and nothing at this layer can reach
+	// it. That is #74, and it is the same for every node this connector writes.
+	presenceWait time.Duration
+
+	// presenceWrite is the right to have a presence node on the wire, and there is one.
+	// A channel rather than a mutex because both holders have a deadline to keep and a
+	// mutex cannot be given one: `presence.set` runs on the session's executor, so a
+	// command parked on an uncancellable lock is every command behind it parked too.
+	//
+	// What it buys is that the two writers cannot interleave. Each reads the remembered
+	// availability after taking this and writes it before letting go, so whichever goes
+	// last leaves WhatsApp holding the same state this session remembers -- where
+	// unsynchronised, a reapplication that read before a `presence.set` can land after
+	// it, and the account is left as the state its client had just replaced.
+	presenceWrite chan struct{}
 	// transitions counts the writes to `connected`, which is what a presence that failed
 	// to publish is checked against before it is given another go. Everything presence
 	// describes belongs to the socket that reported it -- WhatsApp forgets subscriptions
-	// and availability when a connection goes, and whatsmeow replays neither -- so a
-	// state re-asserted across one of these is a fact nothing warrants any more, put back
-	// on top of a client that cleared presence when it saw the session go.
+	// when a connection goes and nothing replays them -- so a state re-asserted across
+	// one of these is a fact nothing warrants any more, put back on top of a client that
+	// cleared presence when it saw the session go. This account's own availability is
+	// the one thing here that is put back, and `reapplyAvailability` is where; it is
+	// this session's own word rather than a report about somebody else.
 	//
 	// The connection flag and not the events, because they are not the same set: an
 	// ordinary drop publishes `session.state`, while a stream replaced, a ban, an
@@ -350,9 +398,12 @@ func newSession(
 		},
 		retrieve:   retrieveOverHTTP,
 		uploadFile: uploadOverClient,
-		sendLimit:  cmp.Or(blobs.SendMax, media.DefaultSendMax),
-		blobs:      blobs.Blobs,
-		blobBase:   blobs.BaseURL,
+		sendPresence: func(ctx context.Context, client *wm.Client, state waTypes.Presence) error {
+			return client.SendPresence(ctx, state) //nolint:wrapcheck // classified by presenceFailure, which needs the sentinels
+		},
+		sendLimit: cmp.Or(blobs.SendMax, media.DefaultSendMax),
+		blobs:     blobs.Blobs,
+		blobBase:  blobs.BaseURL,
 
 		storeLimit:  bindTimeout,
 		deliverWait: deliverTimeout,
@@ -361,6 +412,8 @@ func newSession(
 
 		rerequestWait:  rerequestTimeout,
 		rerequestRetry: rerequestRetry,
+		presenceWrite:  make(chan struct{}, 1),
+		presenceWait:   presenceWriteTimeout,
 		board:          make(map[string]posted),
 		downloadWait:   downloadTimeout,
 		uploadWait:     uploadTimeout,
@@ -1190,6 +1243,11 @@ func (s *Session) rebuild(ctx context.Context) error {
 	s.detach(previous, handlerID)
 	previous.Disconnect()
 
+	// Dropped with the client it was filed under. Every path here has just forgotten the
+	// device, so the account that asked for it is gone, and carried over it would mark
+	// whatever pairs next available without that client ever having asked.
+	s.forgetAvailability()
+
 	// A false here is the session having closed while this ran, which adopt has already
 	// cleaned up after. There is nothing left to do either way.
 	_ = s.adopt(wm.NewClient(device, s.waLog))
@@ -1507,6 +1565,11 @@ func (s *Session) forward() {
 // more than the event does: whatever came next either replaced it on the board or was
 // published, and a client shown the old one has no way to learn better.
 const presenceLife = 10 * time.Second
+
+// presenceWriteTimeout bounds a presence node nobody is waiting on. Short, because the
+// socket it goes out over has just finished a handshake: one that will not take forty
+// bytes in this long is not one the next node is going to reach either.
+const presenceWriteTimeout = 10 * time.Second
 
 // perishableHandoff bounds how long a moment waits on a reader that is busy. Short,
 // because everything past it is added to how stale the event is by the time somebody
@@ -2132,6 +2195,17 @@ func (s *Session) handle(rawEvent any) bool {
 			return true
 		}
 		s.setConnected(true)
+		// Off this goroutine, because this writes a node and the transition lock is
+		// held for the length of this case: a socket slow to take it would hold every
+		// state change behind it, Close included.
+		//
+		// Started before the event rather than after it, which is as far as the ordering
+		// can be taken: WhatsApp wants an account available before it will report
+		// anybody's presence to it, and the client re-subscribing is the first thing the
+		// event it is about to get asks of it. Whether the two nodes land in that order
+		// is not decidable here -- the client's subscribe has a whole round trip to make
+		// and this has none -- so what this buys is a head start, not a guarantee.
+		go s.reapplyAvailability(s.ctx, s.current())
 		s.emit(protocol.EventSessionState, s.sessionState())
 	case *waEvents.Disconnected:
 		s.transition.Lock()

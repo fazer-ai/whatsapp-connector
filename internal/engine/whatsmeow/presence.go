@@ -245,11 +245,137 @@ func (s *Session) setPresence(ctx context.Context, command *protocol.Command) (j
 	if err := s.readyToSend(); err != nil {
 		return nil, err
 	}
-	if err := s.current().SendPresence(ctx, state); err != nil {
+	// Taken for the write, because the reapplication on the next connection wants the
+	// same right: without it the two can interleave and leave WhatsApp holding one state
+	// while this session remembers the other. Bounded by the command's own deadline, so
+	// a socket that will not take a node answers the client rather than parking the
+	// executor every command behind this one is waiting on.
+	release, err := s.takePresenceWrite(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
+	// The client the node actually goes out on, and it is what the state is filed
+	// under. WhatsApp can log this account out while the send is in flight, and the
+	// rebuild behind that runs whether or not a presence is on its way: without the
+	// stamp this line puts the old account's state back after the rebuild dropped it,
+	// and whatever pairs next is marked available on the strength of it.
+	client := s.current()
+	if err := s.sendPresence(ctx, client, state); err != nil {
 		s.log.Warn().Err(err).Msg("a presence did not go out")
 		return nil, presenceFailure(err)
 	}
+	// Remembered before the right is let go, so the reapplication either reads this or
+	// wrote before it. A set that failed is not remembered at all: it is the client's to
+	// try again, and reapplying it on the next connection would put back a state nobody
+	// was ever told this session was in.
+	s.rememberAvailability(state, client)
 	return nil, nil
+}
+
+// reapplyAvailability tells a connection that has just come up what this account last
+// said it was.
+//
+// WhatsApp forgets the availability when a connection goes and whatsmeow does not send
+// it again, so without this an account that marked itself available stops being so from
+// the first reconnect on, and nothing says a word. What that costs is not the green dot.
+// whatsmeow answers an inbound message with an `inactive` receipt while the account is
+// not marked available, WhatsApp carries that to the sender, and no client renders it --
+// so everybody writing to the account is left looking at one grey tick.
+//
+// The client is told the connection opened and could set it again itself, and after an
+// ownership handoff that is the only thing that can: the session is new and has never
+// heard the command. What this closes is the window before that -- the round trip a
+// client needs to notice and answer, with every message that arrives inside it receipted
+// as if nobody were there.
+//
+// An account whose client asked for nothing is told nothing. `available` is what turns
+// the receipts on and puts this account on somebody's phone as being at the keyboard,
+// and a session that was never asked to be is not the connector's to volunteer.
+//
+// A failure is logged and left. The next connection reapplies it the same way, and
+// retrying here would be retrying onto a socket the failure says is already going.
+//
+// Bounded, and that is not a nicety. This is the one presence write with no caller
+// behind it to carry a deadline, and whatsmeow bounds a frame write by the socket's own
+// life rather than by the context it is given -- so on a connection that authenticated
+// and then stopped taking bytes, an unbounded write would hold the right to the wire for
+// as long as the process runs, and every `presence.set` after it with the same. As far
+// as the bound reaches, which is not all the way: see #74 on `presenceWait`.
+func (s *Session) reapplyAvailability(ctx context.Context, client *wm.Client) {
+	ctx, cancel := context.WithTimeout(ctx, s.presenceWait)
+	defer cancel()
+
+	release, err := s.takePresenceWrite(ctx)
+	if err != nil {
+		s.log.Warn().Err(err).Msg("a new connection was not told what this account last set itself to")
+		return
+	}
+	defer release()
+
+	state, asked := s.rememberedAvailability(client)
+	if !asked {
+		return
+	}
+	if err := s.sendPresence(ctx, client, state); err != nil {
+		s.log.Warn().Err(err).Msg("a new connection was not told what this account last set itself to")
+	}
+}
+
+// takePresenceWrite waits for the right to put a presence on the wire, and gives up when
+// the caller's context does. The func it returns hands the right back.
+func (s *Session) takePresenceWrite(ctx context.Context) (func(), error) {
+	select {
+	case s.presenceWrite <- struct{}{}:
+		return func() { <-s.presenceWrite }, nil
+	case <-ctx.Done():
+		// Not `not_connected`, which sends a client off to wait for a socket that is
+		// there. This ran out of its own time behind a presence the socket has not
+		// finished taking, and the answer to that is to ask again.
+		return nil, protocol.NewError(protocol.ErrorTimeout,
+			"the presence before this one is still on its way to WhatsApp")
+	}
+}
+
+// rememberAvailability records what WhatsApp has taken, and rememberedAvailability reads
+// it back for the client asking. Both hold the lock for the field alone: a presence node
+// is written outside it, so nothing that only wants to know or to forget waits on a
+// socket.
+//
+// Filed under the client it was set on, and read back only for that one. `adopt` is the
+// only thing that assigns a client, so a different one here is a session that has been
+// rebuilt since -- which is to say the account this belonged to is gone, and its
+// availability is not the next one's to inherit.
+func (s *Session) rememberAvailability(state waTypes.Presence, on *wm.Client) {
+	s.availabilityMu.Lock()
+	s.availability = &asked{state: state, on: on}
+	s.availabilityMu.Unlock()
+}
+
+func (s *Session) rememberedAvailability(on *wm.Client) (waTypes.Presence, bool) {
+	s.availabilityMu.Lock()
+	defer s.availabilityMu.Unlock()
+
+	if s.availability == nil || s.availability.on != on {
+		return "", false
+	}
+	return s.availability.state, true
+}
+
+// asked is a presence a client asked for, and the client it was put on the wire by.
+type asked struct {
+	state waTypes.Presence
+	on    *wm.Client
+}
+
+// forgetAvailability drops what this session was holding, for a session whose account
+// is gone. What pairs next is a different account, and is available only if its own
+// client says so.
+func (s *Session) forgetAvailability() {
+	s.availabilityMu.Lock()
+	s.availability = nil
+	s.availabilityMu.Unlock()
 }
 
 type subscribeRequest struct {
