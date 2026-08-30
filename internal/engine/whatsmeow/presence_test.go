@@ -1,11 +1,14 @@
 package whatsmeow
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
+	wm "go.mau.fi/whatsmeow"
 	waTypes "go.mau.fi/whatsmeow/types"
 	waEvents "go.mau.fi/whatsmeow/types/events"
 
@@ -1228,4 +1231,229 @@ func chatOfPresence(t *testing.T, emission engine.Emission) protocol.Address {
 		t.Fatalf("unmarshal: %v", err)
 	}
 	return body.Chat
+}
+
+// WhatsApp forgets an account's availability when the connection goes and whatsmeow does
+// not send it again, so an account that marked itself available stops being so from the
+// first reconnect on. What that costs is not the green dot: while the account is not
+// marked available whatsmeow answers every inbound message with an `inactive` receipt,
+// which WhatsApp carries to the sender and no client renders, so everybody writing to
+// this account is left looking at one grey tick.
+func TestAConnectionThatCameBackIsToldWhatTheAccountSetItselfTo(t *testing.T) {
+	t.Parallel()
+
+	session, wire := availableSession(t)
+	if _, err := session.setPresence(t.Context(), presenceCommand("available")); err != nil {
+		t.Fatalf("setPresence: %v", err)
+	}
+	wire.next(t, "the command the client sent")
+	session.handle(&waEvents.Connected{})
+
+	if state := wire.next(t, "the connection that came back"); state != waTypes.PresenceAvailable {
+		t.Errorf("the connection was told %q, and the account had set itself available", state)
+	}
+}
+
+// The newest one, not the first: an account that went away and is told it is available
+// again on the next connection is available to everybody, against its own last word.
+func TestWhatAReconnectPutsBackIsTheLastStateTheClientAskedFor(t *testing.T) {
+	t.Parallel()
+
+	session, wire := availableSession(t)
+	for _, state := range []string{"available", "unavailable"} {
+		if _, err := session.setPresence(t.Context(), presenceCommand(state)); err != nil {
+			t.Fatalf("setPresence %s: %v", state, err)
+		}
+	}
+	session.reapplyAvailability(t.Context(), session.current())
+
+	if got := wire.states(); len(got) != 3 || got[2] != waTypes.PresenceUnavailable {
+		t.Errorf("the wire saw %v, and the last thing the client asked for was unavailable", got)
+	}
+}
+
+// An availability is not the connector's to invent. `available` is what turns the real
+// delivery receipts on and puts this account on somebody's phone as being at the
+// keyboard, and a session whose client never asked for it is neither of those things.
+func TestAConnectionIsToldNothingForAnAccountThatSetNothing(t *testing.T) {
+	t.Parallel()
+
+	session, wire := availableSession(t)
+	session.reapplyAvailability(t.Context(), session.current())
+
+	if got := wire.states(); len(got) != 0 {
+		t.Errorf("a session that was never asked for a presence put %v on the wire", got)
+	}
+}
+
+// A set that failed is the client's to try again. Remembered anyway, the next connection
+// would be told a state nobody was ever told this session was in.
+func TestAnAvailabilityWhatsAppRefusedIsNotPutBackOnTheNextConnection(t *testing.T) {
+	t.Parallel()
+
+	session, wire := availableSession(t)
+	wire.refuse(errors.New("WhatsApp said no"))
+	if _, err := session.setPresence(t.Context(), presenceCommand("available")); err == nil {
+		t.Fatal("a presence WhatsApp refused was reported as set")
+	}
+	wire.refuse(nil)
+	session.reapplyAvailability(t.Context(), session.current())
+
+	if got := wire.states(); len(got) != 1 {
+		t.Errorf("the wire saw %v, and only the attempt that failed should be there", got)
+	}
+}
+
+// The account this session was holding a presence for is gone by the time it is rebuilt:
+// every path there has just forgotten the device. Carried over, the availability would
+// mark whatever pairs next available without that client ever having asked.
+func TestAnAccountThatWasUnpairedLeavesNoAvailabilityBehind(t *testing.T) {
+	t.Parallel()
+
+	session, wire := availableSession(t)
+	if _, err := session.setPresence(t.Context(), presenceCommand("available")); err != nil {
+		t.Fatalf("setPresence: %v", err)
+	}
+	if err := session.recover(t.Context()); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	session.reapplyAvailability(t.Context(), session.current())
+
+	if got := wire.states(); len(got) != 1 {
+		t.Errorf("the wire saw %v, and the presence of the account that was unpaired is in there", got)
+	}
+}
+
+// The event handler must not wait on the socket. whatsmeow dispatches a connection event
+// holding the lock every other transition takes, and the presence going back out is a
+// node written over a socket that has just come up -- so carried out inline, a peer slow
+// to take it holds every state change behind it, this session's own Close included.
+func TestPuttingTheAvailabilityBackDoesNotHoldTheConnectionEvent(t *testing.T) {
+	t.Parallel()
+
+	session, wire := availableSession(t)
+	if _, err := session.setPresence(t.Context(), presenceCommand("available")); err != nil {
+		t.Fatalf("setPresence: %v", err)
+	}
+	wire.next(t, "the command the client sent")
+	held := make(chan struct{})
+	t.Cleanup(func() { close(held) })
+	wire.hold(held)
+
+	handled := make(chan bool, 1)
+	go func() { handled <- session.handle(&waEvents.Connected{}) }()
+
+	wire.next(t, "the connection that came back")
+	select {
+	case <-handled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the connection event was still waiting on a socket that had not taken the presence")
+	}
+}
+
+// A `presence.set` and a connection coming back both write the availability and both put
+// one on the wire, and they run on different goroutines: the command on the session's
+// executor, the reapplication on a goroutine of the event handler's. Unguarded, what
+// WhatsApp saw last and what this session remembers can disagree -- and the race
+// detector says so before that argument has to be made.
+func TestASetAndAReconnectDoNotRaceOverTheAvailability(t *testing.T) {
+	t.Parallel()
+
+	session, _ := availableSession(t)
+	var running sync.WaitGroup
+	for range 8 {
+		running.Add(2)
+		go func() { defer running.Done(); _, _ = session.setPresence(t.Context(), presenceCommand("available")) }()
+		go func() { defer running.Done(); session.reapplyAvailability(t.Context(), session.current()) }()
+	}
+	running.Wait()
+
+	if session.availability == nil {
+		t.Error("a session that was set available forgot it")
+	}
+}
+
+// availableSession is a connected session whose presence nodes are counted rather than
+// written. A real socket is the only thing that answers one, and there is not one here.
+func availableSession(t *testing.T) (*Session, *presences) {
+	t.Helper()
+
+	session, _ := newTestSession(t, "5511999990001")
+	connect(session)
+	wire := &presences{taken: make(chan waTypes.Presence, 8)}
+	session.sendPresence = wire.hand
+	return session, wire
+}
+
+func presenceCommand(state string) *protocol.Command {
+	return &protocol.Command{
+		Type:    protocol.CommandPresenceSet,
+		Payload: json.RawMessage(`{"state":"` + state + `"}`),
+	}
+}
+
+// presences stands in for the socket a presence node goes out over: it records what was
+// written, in the order the writes finished, and can be made to fail or to park.
+type presences struct {
+	mu     sync.Mutex
+	sent   []waTypes.Presence
+	fail   error
+	parked chan struct{}
+	taken  chan waTypes.Presence
+}
+
+func (p *presences) hand(ctx context.Context, _ *wm.Client, state waTypes.Presence) error {
+	p.mu.Lock()
+	fail, parked := p.fail, p.parked
+	p.mu.Unlock()
+
+	select {
+	case p.taken <- state:
+	default:
+	}
+	if parked != nil {
+		select {
+		case <-parked:
+		case <-ctx.Done():
+			return ctx.Err() //nolint:wrapcheck // a stand-in for a socket, which reports the same
+		}
+	}
+	// Recorded once the write is over, because the order that matters is the order
+	// WhatsApp saw, not the order the calls started in.
+	p.mu.Lock()
+	p.sent = append(p.sent, state)
+	p.mu.Unlock()
+	return fail
+}
+
+func (p *presences) refuse(err error) {
+	p.mu.Lock()
+	p.fail = err
+	p.mu.Unlock()
+}
+
+func (p *presences) hold(on chan struct{}) {
+	p.mu.Lock()
+	p.parked = on
+	p.mu.Unlock()
+}
+
+// next waits for the socket to be handed the presence the caller is expecting, rather
+// than for a spell in which it probably was.
+func (p *presences) next(t *testing.T, what string) waTypes.Presence {
+	t.Helper()
+
+	select {
+	case state := <-p.taken:
+		return state
+	case <-time.After(5 * time.Second):
+		t.Fatalf("%s never put a presence on the wire", what)
+		return ""
+	}
+}
+
+func (p *presences) states() []waTypes.Presence {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]waTypes.Presence(nil), p.sent...)
 }

@@ -245,11 +245,64 @@ func (s *Session) setPresence(ctx context.Context, command *protocol.Command) (j
 	if err := s.readyToSend(); err != nil {
 		return nil, err
 	}
-	if err := s.current().SendPresence(ctx, state); err != nil {
+	// Held across the write, because the reapplication on the next connection takes the
+	// same lock: without it the two can interleave and leave WhatsApp holding one state
+	// while this session remembers the other.
+	s.availabilityMu.Lock()
+	defer s.availabilityMu.Unlock()
+
+	if err := s.sendPresence(ctx, s.current(), state); err != nil {
 		s.log.Warn().Err(err).Msg("a presence did not go out")
 		return nil, presenceFailure(err)
 	}
+	// Remembered only once WhatsApp has taken it. A set that failed is the client's to
+	// try again, and reapplying it on the next connection would put back a state nobody
+	// was ever told this session was in.
+	s.availability = &state
 	return nil, nil
+}
+
+// reapplyAvailability tells a connection that has just come up what this account last
+// said it was.
+//
+// WhatsApp forgets the availability when a connection goes and whatsmeow does not send
+// it again, so without this an account that marked itself available stops being so from
+// the first reconnect on, and nothing says a word. What that costs is not the green dot.
+// whatsmeow answers an inbound message with an `inactive` receipt while the account is
+// not marked available, WhatsApp carries that to the sender, and no client renders it --
+// so everybody writing to the account is left looking at one grey tick.
+//
+// The client is told the connection opened and could set it again itself, and after an
+// ownership handoff that is the only thing that can: the session is new and has never
+// heard the command. What this closes is the window before that -- the round trip a
+// client needs to notice and answer, with every message that arrives inside it receipted
+// as if nobody were there.
+//
+// An account whose client asked for nothing is told nothing. `available` is what turns
+// the receipts on and puts this account on somebody's phone as being at the keyboard,
+// and a session that was never asked to be is not the connector's to volunteer.
+//
+// A failure is logged and left. The next connection reapplies it the same way, and
+// retrying here would be retrying onto a socket the failure says is already going.
+func (s *Session) reapplyAvailability(ctx context.Context, client *wm.Client) {
+	s.availabilityMu.Lock()
+	defer s.availabilityMu.Unlock()
+
+	if s.availability == nil {
+		return
+	}
+	if err := s.sendPresence(ctx, client, *s.availability); err != nil {
+		s.log.Warn().Err(err).Msg("a new connection was not told what this account last set itself to")
+	}
+}
+
+// forgetAvailability drops what this session was holding, for a session whose account
+// is gone. What pairs next is a different account, and is available only if its own
+// client says so.
+func (s *Session) forgetAvailability() {
+	s.availabilityMu.Lock()
+	s.availability = nil
+	s.availabilityMu.Unlock()
 }
 
 type subscribeRequest struct {
