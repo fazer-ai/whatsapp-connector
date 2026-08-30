@@ -519,7 +519,7 @@ func readBlock(heartbeat time.Duration) time.Duration { return heartbeat / readB
 // dispatched is released, so it stays pending and comes back on a later pass.
 func (c *Connector) dispatchWithin(ctx context.Context, deliveries []transport.Delivery) bool {
 	for i := range deliveries {
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || !c.roomFor(ctx, &deliveries[i]) {
 			for rest := i; rest < len(deliveries); rest++ {
 				if deliveries[rest].Release != nil {
 					deliveries[rest].Release()
@@ -532,6 +532,30 @@ func (c *Connector) dispatchWithin(ctx context.Context, deliveries []transport.D
 		c.manager.Dispatch(ctx, &deliveries[i])
 	}
 	return true
+}
+
+// roomFor reports whether the window can still give this delivery a real turn.
+//
+// Only a wake is held to a floor, because only a wake blocks: it adopts a session,
+// which reads the store. One dispatched with a sliver of window has its adoption cut
+// almost before it starts, and the manager forfeits a wake whose turn was spent — the
+// forfeit is right, starvation is worse than a late retry, but a sliver is not a turn,
+// and the forfeit costs the session a whole claim delay. Below the floor the wake is
+// released instead, age kept, and the next pass gives it a window worth having.
+// Everything else is an offer to a queue or an inline answer, which spends no window
+// worth reserving; what follows a released wake is released with it, so nothing
+// overtakes a command that kept its place.
+func (c *Connector) roomFor(ctx context.Context, delivery *transport.Delivery) bool {
+	if delivery.Command.Type != protocol.CommandSessionWake {
+		return true
+	}
+	deadline, bounded := ctx.Deadline()
+	if !bounded {
+		return true
+	}
+	// Half a read block: the same unit the read gate reserves, an attempt shorter than
+	// which is a formality that ends in a forfeit nothing deserved.
+	return time.Until(deadline) >= readBlock(c.cfg.Heartbeat)/2
 }
 
 // reclaimPasses is how many independent passes one heartbeat's reclaim is made of: the

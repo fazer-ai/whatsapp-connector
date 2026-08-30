@@ -301,3 +301,10 @@ internal/session/session.go: Backpressure reclaimed commands instead of enlargin
 # that raised it, and a waiver matches on the title it was written for.
 internal/engine/whatsmeow/session.go: Clear the file before each fallback media host  # PR#61 -> #63
 internal/engine/whatsmeow/session.go: Reset the destination before trying another media host  # PR#65 → #63
+# A fixed latency reserve is the class of constants this loop just removed; the derived
+# slack holds under any Redis the rest of the timing already assumes, and a cold-stream
+# group ensure costs one round trip once per stream per process. Adjudicated on PR#65.
+internal/app/run.go: Recheck the window after creating stream groups  # PR#65 r5
+# Poll-with-deadline is the suite's sanctioned idiom (waitFor in app_test.go); what
+# AGENTS.md rules out is sleeping to synchronise, not polling a condition.
+internal/app/dispatch_internal_test.go: Replace wall-clock polling with a completion signal  # PR#65 r5

@@ -251,19 +251,24 @@ func TestADrainDispatchesOnWhatIsLeftOfItsWindow(t *testing.T) {
 	}
 }
 
-// A wake the window closes under is not a turn this instance spent. Forfeited, it
-// loses the age that would have the next tick's reclaim pick it up, and the session it
-// names runs nowhere for a whole claim delay because the loop happened to read the
-// wake late in a period. Released, the age is kept and the next tick retries it.
-func TestAWakeCutByTheWindowIsReleasedWithItsAgeKept(t *testing.T) {
+// A wake dispatched with a sliver of window has its adoption cut almost before it
+// starts, and the manager rightly forfeits a wake whose turn was spent -- so the
+// sliver costs the session a whole claim delay for an attempt that never was. The
+// dispatch refuses to start a wake below a floor and releases it instead: age kept,
+// retried on the next pass with a window worth having. Forfeit stays what it was,
+// because a wake that consumed a real window and stalled must lose its place at the
+// head of the queue, or a stuck store starves every wake behind it forever.
+func TestAWakeIsNotStartedOnASliverOfTheWindow(t *testing.T) {
 	t.Parallel()
 
-	manager := newTestManager(t)
-	spent, cancel := context.WithCancel(context.Background())
-	cancel()
+	connector := &Connector{
+		cfg:     Config{LeaseTTL: 30 * time.Second, Heartbeat: 600 * time.Millisecond},
+		log:     zerolog.Nop(),
+		manager: newTestManager(t),
+	}
 
 	var released, forfeited, acked atomic.Int64
-	delivery := &transport.Delivery{
+	deliveries := []transport.Delivery{{
 		Command: protocol.Command{
 			V: protocol.Version, ID: "wake-late", Type: protocol.CommandSessionWake,
 			SID: "2f1c6f0e-0000-4000-8000-0000000000fe", TS: 1787000000000,
@@ -272,14 +277,19 @@ func TestAWakeCutByTheWindowIsReleasedWithItsAgeKept(t *testing.T) {
 		Ack:     func(context.Context) error { acked.Add(1); return nil },
 		Release: func() { released.Add(1) },
 		Forfeit: func() { forfeited.Add(1) },
-	}
-	manager.Dispatch(spent, delivery)
+	}}
+
+	// Alive, and shorter than the floor of half a read block: the window a wake read
+	// at the tail of a period would otherwise start its adoption on.
+	sliver, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	connector.dispatchWithin(sliver, deliveries)
 
 	if forfeited.Load() != 0 {
-		t.Fatal("a wake cut by the window was forfeited, so its age is gone and the session waits out the claim delay")
+		t.Fatal("a wake was forfeited over a sliver of window, so the session waits out the claim delay for an attempt that never was")
 	}
 	if acked.Load() != 0 {
-		t.Fatal("a wake cut by the window was acknowledged, which retires the only wake there was")
+		t.Fatal("a wake was acknowledged over a sliver of window, which retires the only wake there was")
 	}
 	if released.Load() != 1 {
 		t.Fatalf("the wake was released %d times, want once with its age kept", released.Load())
