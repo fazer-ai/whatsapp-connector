@@ -31,7 +31,7 @@ func (quietReplier) Reply(context.Context, string, protocol.Reply) error { retur
 // adopts a session, which reads the store. A batch of them runs on the goroutine that
 // renews every lease this instance holds, so a batch that outlives its window delays
 // those renewals and hands the accounts to peers while this instance still holds their
-// sockets open. The window is the caller's — the tick window, or a reclaim pass — and
+// sockets open. The window is the caller's -- the tick window, or a reclaim pass -- and
 // a batch it cuts off has to let go of the rest, or the entries are held for good.
 func TestABatchStopsWhenItsWindowIsSpent(t *testing.T) {
 	t.Parallel()
@@ -381,21 +381,23 @@ func TestTheLoopBoundsItsOptionalWorkByTheTick(t *testing.T) {
 	}
 }
 
-// The gate on the read sits after the drain, because the drain spends the same window:
-// checked only at the top of the iteration, a slow drain leaves the read a sliver, the
-// deadline severs the XREADGROUP mid-flight, and a command the server had just moved to
-// this consumer's pending list waits out the full claim delay with no local record —
-// while newer commands for the same session are read and run ahead of it. And the gate
-// asks for more than the bare block: the round trips around it need room too, which is
-// what the drain here leaves the read exactly a block minus a sliver to prove.
-func TestASlowDrainDoesNotLeaveTheReadASliverOfTheWindow(t *testing.T) {
+// A drain that spends most of the window still leaves a read behind it, and one that
+// comes back inside the window.
+//
+// The read is the only way a fresh command is seen at all, so an iteration that skips
+// it when the window is narrow reads nothing for as long as the drain stays slow, and
+// nothing is what an instance whose tick consistently runs long would then read for
+// good. Shortening the block covers the hazard skipping was meant to cover: an
+// XREADGROUP severed by the deadline mid-flight leaves a command the server had just
+// moved to this consumer's pending list waiting out the whole claim delay with no local
+// record of it, while newer commands for the same session are read and run ahead.
+func TestASlowDrainStillLeavesRoomToRead(t *testing.T) {
 	t.Parallel()
 
 	const heartbeat = 600 * time.Millisecond
 	const window = 600 * time.Millisecond
-	// Sized to leave the read more than its 300ms block and less than the block and a
-	// half the gate asks for, so a gate that forgot either the drain or the round-trip
-	// room starts the read and fails here.
+	// Sized to leave the read less than its 300ms block, so a transport that only ever
+	// blocks for the configured time outlives the window here.
 	const slowClaim = 250 * time.Millisecond
 
 	server := miniredis.RunT(t)
@@ -453,20 +455,23 @@ func TestASlowDrainDoesNotLeaveTheReadASliverOfTheWindow(t *testing.T) {
 		return slow
 	}, delay: slowClaim})
 
-	bounded, cancel := context.WithDeadline(ctx, time.Now().Add(window))
+	deadline := time.Now().Add(window)
+	bounded, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
-	read := connector.readCommands(bounded)
+	connector.readCommands(bounded)
+	back := time.Now()
 
-	// The positive control: the drain itself ran and dispatched what was pending, so a
-	// zero read count below means the read was skipped, not that nothing happened.
+	// The positive control: the drain itself ran and dispatched what was pending, so
+	// the read below happened after a drain that had spent most of the window.
 	if _, ok := dispatched.left(); !ok {
 		t.Fatal("the drain did not dispatch the pending command, so this exercises nothing")
 	}
-	if got := reads.Load(); got != 0 {
-		t.Fatalf("a read was started %d time(s) without room for its block and the trips around it", got)
+	if got := reads.Load(); got == 0 {
+		t.Fatal("no read was started on what the drain left of the window")
 	}
-	if read {
-		t.Fatal("readCommands reported room for a read the window did not have")
+	if back.After(deadline) {
+		t.Fatalf("the read came back %s past the deadline: its block outlived the window it was given",
+			back.Sub(deadline))
 	}
 }
 

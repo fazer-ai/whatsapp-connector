@@ -151,6 +151,52 @@ func TestReadDeliversCommandsForOwnedSessions(t *testing.T) {
 	}
 }
 
+// A read takes the caller's deadline as the bound on its own block, so a window too
+// narrow for the configured one costs a short read rather than a severed connection.
+//
+// Being cut off mid-flight is what that avoids: the server may move a command into this
+// consumer's pending list just as the connection dies, and an entry pending here that no
+// delivery was ever handed back for is claimable by nobody until the whole claim delay
+// has passed, with newer commands for the same session read and run ahead of it. The
+// caller cannot avoid it by refusing to read either -- a loop whose other work
+// consistently leaves less than a block would then never read at all.
+func TestAReadShortensItsBlockToTheCallersDeadline(t *testing.T) {
+	t.Parallel()
+
+	f := newFleet(t)
+	// The group has to exist before the read under test, and creating it from another
+	// instance keeps that first call off the long block this one is configured with.
+	if _, err := f.streams(t, "inst-prep").Read(context.Background(), []string{"s1"}); err != nil {
+		t.Fatalf("priming Read: %v", err)
+	}
+	// A block far longer than the window below, which is the shape a tick that ran long
+	// leaves behind in production.
+	streams, err := redisstream.New(f.client, redisstream.Options{
+		Instance: "inst-a", Block: 2 * time.Second, ClaimMinIdle: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("redisstream.New: %v", err)
+	}
+
+	deadline := time.Now().Add(150 * time.Millisecond)
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
+
+	// Nothing is waiting, so the call is all block: what comes back is either the server
+	// answering "nothing this round" inside the window, or the deadline cutting it off.
+	delivered, err := streams.Read(ctx, []string{"s1"})
+	back := time.Now()
+	if err != nil {
+		t.Fatalf("Read was cut off instead of shortening its block: %v", err)
+	}
+	if len(delivered) != 0 {
+		t.Fatalf("Read returned %d commands from a stream nothing was written to", len(delivered))
+	}
+	if back.After(deadline) {
+		t.Fatalf("Read came back %s past the deadline it was given", back.Sub(deadline))
+	}
+}
+
 // `session.wake` arrives for sessions nobody owns yet, so an instance that only read
 // its own would never hear about a session it is supposed to pick up.
 func TestReadAlwaysListensToControl(t *testing.T) {

@@ -264,8 +264,8 @@ func (c *Connector) loop(ctx context.Context, httpErr <-chan error) error {
 			due = c.tick(ctx)
 		default:
 			window, cancel := context.WithDeadline(ctx, due)
-			read := c.readCommands(window)
-			spent := !read || window.Err() != nil
+			c.readCommands(window)
+			spent := window.Err() != nil
 			cancel()
 			if !spent || ctx.Err() != nil {
 				continue
@@ -498,9 +498,10 @@ func (c *Connector) reclaimPass(ctx context.Context, take func(context.Context) 
 }
 
 // readBlockShare is the fraction of a heartbeat a read waits on Redis before answering
-// "nothing this round". The tick window is what stops a read from outliving the tick;
-// this is granularity, so that a quiet period costs a couple of clean round trips
-// rather than a connection killed on its deadline every time.
+// "nothing this round". What stops a read from outliving the tick is the deadline it is
+// given, which the transport shortens its block to fit; this is the ceiling on that, so
+// a quiet period costs a couple of clean round trips rather than a connection killed on
+// its deadline every time.
 const readBlockShare = 2
 
 // readBlock is how long the transport waits for a command before answering "nothing
@@ -513,8 +514,8 @@ func readBlock(heartbeat time.Duration) time.Duration { return heartbeat / readB
 // adopts a session, which reads the store. A batch of them can therefore run for
 // several times the adoption bound, on the goroutine that renews every lease this
 // instance holds — and the sessions whose renewals it delays are handed to peers while
-// this instance still holds their sockets open. The deadline is the caller's own — a
-// reclaim pass's share of the heartbeat, or the tick window — rather than a budget
+// this instance still holds their sockets open. The deadline is the caller's own -- a
+// reclaim pass's share of the heartbeat, or the tick window -- rather than a budget
 // opened here, which would stack on whatever the caller had already spent. What is not
 // dispatched is released, so it stays pending and comes back on a later pass.
 func (c *Connector) dispatchWithin(ctx context.Context, deliveries []transport.Delivery) bool {
@@ -538,7 +539,7 @@ func (c *Connector) dispatchWithin(ctx context.Context, deliveries []transport.D
 //
 // Only a wake is held to a floor, because only a wake blocks: it adopts a session,
 // which reads the store. One dispatched with a sliver of window has its adoption cut
-// almost before it starts, and the manager forfeits a wake whose turn was spent — the
+// almost before it starts, and the manager forfeits a wake whose turn was spent -- the
 // forfeit is right, starvation is worse than a late retry, but a sliver is not a turn,
 // and the forfeit costs the session a whole claim delay. Below the floor the wake is
 // released instead, age kept, and the next pass gives it a window worth having.
@@ -553,8 +554,8 @@ func (c *Connector) roomFor(ctx context.Context, delivery *transport.Delivery) b
 	if !bounded {
 		return true
 	}
-	// Half a read block: the same unit the read gate reserves, an attempt shorter than
-	// which is a formality that ends in a forfeit nothing deserved.
+	// Half a read block: an adoption given less than that is a formality, and it ends
+	// in a forfeit nothing deserved.
 	return time.Until(deadline) >= readBlock(c.cfg.Heartbeat)/2
 }
 
@@ -646,29 +647,11 @@ func (c *Connector) drainAdopted(ctx context.Context) []string {
 }
 
 // readCommands drains what newly adopted sessions have pending and reads what is newer.
-// It reports false when the window had no room left for the read, which is the caller's
-// cue to wait on the ticker rather than ask again on a deadline already spent.
-func (c *Connector) readCommands(ctx context.Context) bool {
+func (c *Connector) readCommands(ctx context.Context) {
 	// Before the read, not after: a session adopted a moment ago may have commands its
 	// previous owner abandoned, and reading `>` for it first would hand over what
 	// arrived later and run it out of order.
 	undrained := c.drainAdopted(ctx)
-
-	// Checked here, after the drain, because the drain spends the same window: a gate
-	// at the top of the iteration passes and then the claims eat most of what is left.
-	// Only a read whose whole cost fits what remains is started — the server-side
-	// block, plus half a block again for the round trips around it (ensuring a group
-	// on a stream not seen before, the reply's own transit), derived rather than fixed
-	// for the same reason the block is. One cut off by the deadline mid-flight is
-	// worse than one skipped: the server may have just moved a command into this
-	// consumer's pending list when the connection dies, and an entry pending here with
-	// no local record of the delivery is reclaimable by nobody until the full claim
-	// delay has passed — with newer commands for the same session read and run ahead
-	// of it meanwhile, which is the ordering the single stream exists to give.
-	block := readBlock(c.cfg.Heartbeat)
-	if deadline, bounded := ctx.Deadline(); bounded && time.Until(deadline) < block+block/2 {
-		return false
-	}
 
 	sids := c.manager.SIDs()
 	if len(undrained) > 0 {
@@ -677,15 +660,18 @@ func (c *Connector) readCommands(ctx context.Context) bool {
 		// backlog is taken over.
 		sids = slices.DeleteFunc(sids, func(sid string) bool { return slices.Contains(undrained, sid) })
 	}
+	// Whatever is left of the window is what the read gets. The transport cuts its own
+	// block down to fit a deadline rather than refusing a window it finds too narrow,
+	// so a tick that spent most of its period still reads, and reads promptly: a gate
+	// here could only refuse, and one refusing every time is a read that never runs.
 	deliveries, err := c.streams.Read(ctx, sids)
 	if err != nil {
 		if ctx.Err() == nil {
 			c.log.Error().Err(err).Msg("failed to read commands")
 		}
-		return true
+		return
 	}
 	c.dispatchWithin(ctx, deliveries)
-	return true
 }
 
 func (c *Connector) announce(ctx context.Context) {
