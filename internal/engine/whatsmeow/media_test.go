@@ -492,6 +492,37 @@ func TestAFileThatRunsPastTheCapOnTheWayInIsRefusedByTheStore(t *testing.T) {
 	assertFailure(t, emissions[1], reasonTooLarge)
 }
 
+// The declared length is the sender's claim and nothing checks it against what the far
+// end serves, so a message announcing four bytes and serving far more passes the check
+// in front of the download. What stands between that and this instance's memory is the
+// cap on the file the download writes into: it refuses the write rather than the file,
+// so the transfer stops at the cap instead of being told off once it has all landed.
+func TestAFileServedFarPastWhatItClaimsIsStoppedAtTheCapRatherThanAfterwards(t *testing.T) {
+	t.Parallel()
+
+	const keeps = 16 << 10
+	session, downloads := mediaSession(t, media.Options{MaxBlob: keeps, Quota: 1 << 20})
+	// A hundred times what this instance keeps, behind a claim of four bytes.
+	downloads.answer(bytes.Repeat([]byte("x"), 100*keeps), nil)
+
+	event := mediaEvent("3EB0FLOOD", &waE2E.Message{ImageMessage: &waE2E.ImageMessage{
+		Mimetype: proto.String("image/jpeg"), FileLength: proto.Uint64(4),
+		DirectPath: proto.String(directPath), MediaKey: []byte("key"), FileEncSHA256: encSHA256(),
+	}})
+
+	emissions, acknowledged := deliver(t, session, event, 2)
+	if !acknowledged {
+		t.Fatal("a file past the cap was left to be redelivered forever")
+	}
+	// One chunk of slack, for the room the store lends a fill above its cap so a
+	// transfer's own framing fits. What matters is that this is a number near the cap
+	// rather than near what the far end decided to serve.
+	if moved, allowed := downloads.moved(), keeps+downloadChunk; moved > allowed {
+		t.Fatalf("the download moved %d bytes into an instance that keeps %d", moved, keeps)
+	}
+	assertFailure(t, emissions[1], reasonTooLarge)
+}
+
 // A store that could not take this file may take the next one, so the message is worth
 // another go rather than a bubble that says the file is gone for good.
 func TestAStoreThatFailedThisTimeLeavesTheMessageOnThePhone(t *testing.T) {
@@ -974,9 +1005,16 @@ func mediaSession(t *testing.T, opts media.Options) (*Session, *downloads) {
 type downloads struct {
 	mu    sync.Mutex
 	calls int
+	wrote int
 	bytes []byte
 	err   error
 }
+
+// downloadChunk is how much of a file the fake moves per write. A transfer arrives off a
+// socket in pieces and the cap on the file is checked per write, so a fake that handed
+// the whole file over in one call could never be stopped partway -- which is the thing
+// the cap is for.
+const downloadChunk = 4 << 10
 
 func (d *downloads) answer(file []byte, err error) {
 	d.mu.Lock()
@@ -984,11 +1022,18 @@ func (d *downloads) answer(file []byte, err error) {
 	d.bytes, d.err = file, err
 }
 
-func (d *downloads) hand(_ context.Context, _ *wm.Client, _ wm.DownloadableMessage) ([]byte, error) {
+func (d *downloads) hand(_ context.Context, _ *wm.Client, _ wm.DownloadableMessage, file media.File) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.calls++
-	return d.bytes, d.err
+	for at := 0; at < len(d.bytes); at += downloadChunk {
+		wrote, err := file.Write(d.bytes[at:min(at+downloadChunk, len(d.bytes))])
+		d.wrote += wrote
+		if err != nil {
+			return err
+		}
+	}
+	return d.err
 }
 
 func (d *downloads) count() int {
@@ -997,11 +1042,21 @@ func (d *downloads) count() int {
 	return d.calls
 }
 
+// moved is how many bytes of the file the store let through. It is the measurement the
+// memory bound is made of: what a download is allowed to move is what it can make this
+// instance hold.
+func (d *downloads) moved() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.wrote
+}
+
 // failingBlobs is a store that will not take anything, which no real filesystem can be
-// asked to be on demand.
+// asked to be on demand. It refuses before lending a file, the way a store with no room
+// left fails to open one.
 type failingBlobs struct{ err error }
 
-func (f failingBlobs) Put(context.Context, io.Reader, *media.Blob) (media.Blob, error) {
+func (f failingBlobs) Receive(context.Context, *media.Blob, func(media.File) error) (media.Blob, error) {
 	return media.Blob{}, f.err
 }
 func (f failingBlobs) MaxBlob() int64     { return media.DefaultMaxBlob }
