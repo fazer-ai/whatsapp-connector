@@ -156,10 +156,11 @@ func reuploadSession(t *testing.T, messageID string) (*Session, *phoneAsked) {
 // phoneAsked stands in for the sender's phone: it counts what it was asked and answers
 // on the session's own event path, the way a real one does.
 type phoneAsked struct {
-	session *Session
-	answer  *reupload
-	calls   int
-	chat    string
+	session     *Session
+	answer      *reupload
+	calls       int
+	chat        string
+	participant string
 }
 
 // reupload is what the phone will answer: either a notification it seals under the media
@@ -175,11 +176,17 @@ func (p *phoneAsked) asked() int { return p.calls }
 
 // addressed is the chat the last receipt named, which is the whole of what a broadcast
 // gets wrong when the published chat is used instead of the one it was sent to.
-func (p *phoneAsked) addressed() string { return p.chat }
+func (p *phoneAsked) addressed() (chat, participant string) { return p.chat, p.participant }
 
 func (p *phoneAsked) hand(_ context.Context, _ *wm.Client, info *waTypes.MessageInfo, key []byte) error {
 	p.calls++
 	p.chat = info.Chat.String()
+	// What SendMediaRetryReceipt would put on the `rmr` node, and the flag that decides
+	// whether it does.
+	p.participant = ""
+	if info.IsGroup {
+		p.participant = info.Sender.String()
+	}
 	if info.ID == "" {
 		return errors.New("a receipt was sent naming no message")
 	}
@@ -330,9 +337,14 @@ func TestABroadcastIsAskedAboutUnderTheChatItWasSentTo(t *testing.T) {
 	if _, err := refetchErr(session, "3EB0CAST", nil); err != nil {
 		t.Fatalf("refetch: %v", err)
 	}
-	if phone.addressed() != "5511999990002@broadcast" {
-		t.Errorf("the receipt was addressed to %q, want the chat the message was sent to",
-			phone.addressed())
+	chat, participant := phone.addressed()
+	if chat != "5511999990002@broadcast" {
+		t.Errorf("the receipt was addressed to %q, want the chat the message was sent to", chat)
+	}
+	// whatsmeow puts the participant on the node only for a chat it calls a group, and a
+	// broadcast list is one of those. Left off, the phone has no message to match.
+	if participant == "" {
+		t.Error("the receipt named no participant, so the phone has nothing to match it to")
 	}
 }
 

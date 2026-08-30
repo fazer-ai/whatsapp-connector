@@ -114,12 +114,12 @@ func sentAs(kept *store.MediaPart) (*waTypes.MessageInfo, error) {
 		MessageSource: waTypes.MessageSource{
 			Chat:     chat,
 			IsFromMe: kept.FromMe,
-			IsGroup:  chat.Server == waTypes.GroupServer,
+			IsGroup:  namesAParticipant(chat),
 		},
 	}
 	if kept.Sender == "" {
 		if info.IsGroup {
-			// A group receipt names the participant, and there is nobody to name.
+			// The receipt names the participant, and there is nobody to name.
 			return nil, fmt.Errorf("%w: nothing was kept about who sent it", errNoReupload)
 		}
 		// A direct chat is the person, so the chat is the sender.
@@ -175,4 +175,16 @@ func (s *Session) reupload(event *waEvents.MediaRetry) bool {
 		// waiter has the first.
 	}
 	return true
+}
+
+// namesAParticipant is whether a receipt in this chat has to say who sent the message,
+// which is what whatsmeow spells `IsGroup`.
+//
+// A broadcast list is one of them, and that is the part worth spelling out rather than
+// leaving to the field's name. whatsmeow sets the flag for a broadcast exactly as it does
+// for a group -- the field's own doc says so -- and `SendMediaRetryReceipt` puts the
+// participant on the node only when it is set. Read as the name suggests, a broadcast's
+// receipt goes out naming nobody, and the phone has no message to match it to.
+func namesAParticipant(chat waTypes.JID) bool {
+	return chat.Server == waTypes.GroupServer || chat.Server == waTypes.BroadcastServer
 }
