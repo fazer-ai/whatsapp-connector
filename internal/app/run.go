@@ -263,18 +263,10 @@ func (c *Connector) loop(ctx context.Context, httpErr <-chan error) error {
 		case <-heartbeat.C:
 			due = c.tick(ctx)
 		default:
-			// Only a read whose block fits the window is started. One cut off by the
-			// deadline mid-block is worse than one skipped: the server may have just
-			// moved a command into this consumer's pending list when the connection
-			// dies, and an entry pending here with no local record of the delivery is
-			// reclaimable by nobody until the full claim delay has passed.
-			spent := time.Until(due) < readBlock(c.cfg.Heartbeat)
-			if !spent {
-				window, cancel := context.WithDeadline(ctx, due)
-				c.readCommands(window)
-				spent = window.Err() != nil
-				cancel()
-			}
+			window, cancel := context.WithDeadline(ctx, due)
+			read := c.readCommands(window)
+			spent := !read || window.Err() != nil
+			cancel()
 			if !spent || ctx.Err() != nil {
 				continue
 			}
@@ -629,11 +621,26 @@ func (c *Connector) drainAdopted(ctx context.Context) []string {
 	return adopted
 }
 
-func (c *Connector) readCommands(ctx context.Context) {
+// readCommands drains what newly adopted sessions have pending and reads what is newer.
+// It reports false when the window had no room left for the read, which is the caller's
+// cue to wait on the ticker rather than ask again on a deadline already spent.
+func (c *Connector) readCommands(ctx context.Context) bool {
 	// Before the read, not after: a session adopted a moment ago may have commands its
 	// previous owner abandoned, and reading `>` for it first would hand over what
 	// arrived later and run it out of order.
 	undrained := c.drainAdopted(ctx)
+
+	// Checked here, after the drain, because the drain spends the same window: a gate
+	// at the top of the iteration passes and then the claims eat most of what is left.
+	// Only a read whose block fits what remains is started. One cut off by the deadline
+	// mid-block is worse than one skipped: the server may have just moved a command
+	// into this consumer's pending list when the connection dies, and an entry pending
+	// here with no local record of the delivery is reclaimable by nobody until the full
+	// claim delay has passed — with newer commands for the same session read and run
+	// ahead of it meanwhile, which is the ordering the single stream exists to give.
+	if deadline, bounded := ctx.Deadline(); bounded && time.Until(deadline) < readBlock(c.cfg.Heartbeat) {
+		return false
+	}
 
 	sids := c.manager.SIDs()
 	if len(undrained) > 0 {
@@ -647,9 +654,10 @@ func (c *Connector) readCommands(ctx context.Context) {
 		if ctx.Err() == nil {
 			c.log.Error().Err(err).Msg("failed to read commands")
 		}
-		return
+		return true
 	}
 	c.dispatchWithin(ctx, deliveries)
+	return true
 }
 
 func (c *Connector) announce(ctx context.Context) {

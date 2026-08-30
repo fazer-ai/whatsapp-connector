@@ -371,6 +371,90 @@ func TestTheLoopBoundsItsOptionalWorkByTheTick(t *testing.T) {
 	}
 }
 
+// The gate on the read sits after the drain, because the drain spends the same window:
+// checked only at the top of the iteration, a slow drain leaves the read a sliver, the
+// deadline severs the XREADGROUP mid-block, and a command the server had just moved to
+// this consumer's pending list waits out the full claim delay with no local record —
+// while newer commands for the same session are read and run ahead of it.
+func TestASlowDrainDoesNotLeaveTheReadASliverOfTheWindow(t *testing.T) {
+	t.Parallel()
+
+	const heartbeat = 600 * time.Millisecond
+	const window = 600 * time.Millisecond
+	const slowClaim = 450 * time.Millisecond
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+
+	newStreams := func(instance string) *redisstream.Streams {
+		streams, err := redisstream.New(client, redisstream.Options{
+			Instance: instance, Block: 50 * time.Millisecond, ClaimMinIdle: time.Millisecond,
+		})
+		if err != nil {
+			t.Fatalf("redisstream.New: %v", err)
+		}
+		return streams
+	}
+	streams := newStreams("inst-a")
+	dead := newStreams("inst-dead")
+	dispatched := &deadlineReplier{}
+	manager := session.NewManager(&session.ManagerConfig{
+		Instance: "inst-a", Engine: fake.New(),
+		Leases:    cluster.NewLeases(client, "inst-a", cluster.Options{}),
+		Publisher: quietPublisher{}, Replier: dispatched,
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	ctx := context.Background()
+	t.Cleanup(func() { manager.StopAll(ctx) })
+
+	connector := &Connector{
+		cfg: Config{LeaseTTL: 30 * time.Second, Heartbeat: heartbeat}, log: zerolog.Nop(),
+		manager: manager, streams: streams,
+	}
+
+	if _, err := dead.Read(ctx, []string{"s1"}); err != nil {
+		t.Fatalf("priming Read: %v", err)
+	}
+	writePing(t, client, "s1")
+	if taken, err := dead.Read(ctx, []string{"s1"}); err != nil || len(taken) != 1 {
+		t.Fatalf("the previous owner read %d commands (err=%v), want 1", len(taken), err)
+	}
+	if _, err := manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+
+	var reads atomic.Int64
+	var once sync.Once
+	rdb.AddHook(slowClaims{on: func(cmd redis.Cmder) bool {
+		if cmd.Name() == "xreadgroup" {
+			reads.Add(1)
+		}
+		slow := false
+		if cmd.Name() == "xclaim" {
+			once.Do(func() { slow = true })
+		}
+		return slow
+	}, delay: slowClaim})
+
+	bounded, cancel := context.WithDeadline(ctx, time.Now().Add(window))
+	defer cancel()
+	read := connector.readCommands(bounded)
+
+	// The positive control: the drain itself ran and dispatched what was pending, so a
+	// zero read count below means the read was skipped, not that nothing happened.
+	if _, ok := dispatched.left(); !ok {
+		t.Fatal("the drain did not dispatch the pending command, so this exercises nothing")
+	}
+	if got := reads.Load(); got != 0 {
+		t.Fatalf("a read was started %d time(s) with less than its block left of the window", got)
+	}
+	if read {
+		t.Fatal("readCommands reported room for a read the window did not have")
+	}
+}
+
 // slowClaims makes a claim take a fixed slice of the deadline its caller is working to.
 type slowClaims struct {
 	on    func(redis.Cmder) bool
