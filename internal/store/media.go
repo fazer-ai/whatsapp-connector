@@ -244,3 +244,27 @@ func sentBy(fromMe bool) int64 {
 	}
 	return 0
 }
+
+// refreshDirectPath replaces the path a message's file is fetched from, and only while
+// the row is still the one the caller read.
+//
+// Conditional, and that is the whole of it. The caller has been waiting on somebody
+// else's phone for as long as thirty seconds, and an inbound handler can have written a
+// newer row for the same message in that time -- a redelivery, or a sender reusing an id
+// in another chat. Written back as a whole row it would put the older snapshot's chat and
+// coordinates over the newer ones, and a later download would serve the wrong file.
+//
+// `stored_at` is left alone rather than bumped. What changed is where the file is
+// fetched from, not when the message was received, and the retention sweep goes by the
+// second: refreshing a path is not a reason for a row to live longer.
+func (c *Container) refreshDirectPath(
+	ctx context.Context, sid, messageID, path string, unchangedSince int64,
+) error {
+	const update = `
+		UPDATE wac_media_part SET direct_path = ?
+		WHERE sid = ? AND message_id = ? AND stored_at = ?`
+	if _, err := c.db.ExecContext(ctx, c.rebind(update), path, sid, messageID, unchangedSince); err != nil {
+		return fmt.Errorf("store: refresh where the file of %s is fetched from: %w", messageID, err)
+	}
+	return nil
+}

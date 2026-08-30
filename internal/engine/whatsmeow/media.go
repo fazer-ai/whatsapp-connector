@@ -554,6 +554,16 @@ func (s *Session) refetchReuploaded(
 	if err != nil {
 		s.log.Info().Err(err).Str("message_id", kept.MessageID).
 			Msg("a file WhatsApp had dropped was not uploaded again")
+		if !answeredNo(err) {
+			// The phone was not reached, or did not answer in time. That says nothing
+			// about the file, so it must not come back as the 404 does: `gone` is final
+			// on the client, and this is the case where asking once more -- when the
+			// phone is back on, when the socket is up -- is exactly what recovers the
+			// attachment.
+			return protocol.MediaRef{}, err
+		}
+		// The phone was asked and answered, and the answer was no. Reported as what the
+		// download said, which is the same thing said first: the file is gone.
 		return protocol.MediaRef{}, gone
 	}
 	part, err := attachmentFrom(kept)
@@ -566,9 +576,12 @@ func (s *Session) refetchReuploaded(
 	// that works. The blob this is about to make is dropped on its TTL or evicted by the
 	// quota, and without this the request after that would spend the 404 and the wait on
 	// the phone all over again -- for a file WhatsApp is now serving perfectly well.
-	fresher := *kept
-	fresher.DirectPath = fresh.GetDirectPath()
-	if err := s.store.PutMediaPart(ctx, &fresher, time.Now()); err != nil {
+	//
+	// The path alone, and only while the row is still the one this read. Waiting on a
+	// phone takes as long as thirty seconds, and an inbound handler can write a newer row
+	// in that time; a whole row written back would put this snapshot's chat and
+	// coordinates over the fresher ones.
+	if err := s.store.RefreshDirectPath(ctx, kept.MessageID, fresh.GetDirectPath(), kept.StoredAt); err != nil {
 		// Logged, not returned. The file is about to be fetched either way; refusing it
 		// because the next caller may have to ask twice trades a file that arrives for
 		// one that might.
@@ -591,6 +604,18 @@ func (s *Session) refetchReuploaded(
 		return protocol.MediaRef{}, err
 	}
 	return ref, nil
+}
+
+// answeredNo is the phone having been asked and having declined, which is the only kind
+// of failure on this path that is final.
+//
+// Everything else -- a socket that was down, a phone that never woke up, an answer that
+// could not be read -- says nothing about the file. Reported as final it would tell an
+// agent the attachment is gone on the strength of the phone having been asleep, and the
+// client would never ask again; reported as this instance's problem, the client comes
+// back and the phone may be on by then.
+func answeredNo(err error) bool {
+	return errors.Is(err, errNoReupload) || errors.Is(err, wm.ErrMediaNotAvailableOnPhone)
 }
 
 // agedOffTheCDN is the failure worth asking the sender's phone about.

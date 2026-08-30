@@ -84,9 +84,10 @@ func TestAPhoneThatWillNotUploadTheFileAgainLeavesTheDownloadsOwnAnswer(t *testi
 }
 
 // A phone that is off answers nothing, and the wait has to end on the caller's deadline
-// rather than on one this invents. The command comes back with what the download said,
-// and the caller is free to ask again later.
-func TestAPhoneThatNeverAnswersEndsOnTheCallersDeadline(t *testing.T) {
+// rather than on one this invents. What comes back must not be the 404's own answer:
+// that one is final on the client, and a phone being asleep is the case where asking
+// again is exactly what recovers the attachment.
+func TestAPhoneThatNeverAnswersIsWorthAskingAgainRatherThanFinal(t *testing.T) {
 	t.Parallel()
 
 	session, phone := reuploadSession(t, "3EB0QUIET")
@@ -98,7 +99,7 @@ func TestAPhoneThatNeverAnswersEndsOnTheCallersDeadline(t *testing.T) {
 		Type:    protocol.CommandMessageDownloadMedia,
 		Payload: []byte(`{"message_id":"3EB0QUIET"}`),
 	})
-	assertCode(t, err, protocol.ErrorMediaUnavailable)
+	assertCode(t, err, protocol.ErrorInternal)
 	if phone.asked() != 1 {
 		t.Errorf("the sender's phone was asked %d times, want once", phone.asked())
 	}
@@ -309,7 +310,7 @@ func TestAPhoneIsWaitedOnEvenWhenTheCommandNamedNoDeadline(t *testing.T) {
 
 	select {
 	case err := <-answered:
-		assertCode(t, err, protocol.ErrorMediaUnavailable)
+		assertCode(t, err, protocol.ErrorInternal)
 	case <-time.After(5 * time.Second):
 		t.Fatal("a command with no deadline waited on a phone that was never going to answer")
 	}
@@ -376,5 +377,72 @@ func TestAFreshPathIsRememberedSoTheNextCallerDoesNotAskTwice(t *testing.T) {
 	}
 	if phone.asked() != 1 {
 		t.Errorf("the sender's phone was asked %d times, want once for the two refetches", phone.asked())
+	}
+}
+
+// The receipt could not even be written, which is a socket that is down and not a file
+// that is gone. Reported as the 404's own answer it would tell an agent the attachment
+// is gone because this instance could not reach WhatsApp for a moment.
+func TestAReceiptThatCouldNotBeSentIsWorthAskingAgain(t *testing.T) {
+	t.Parallel()
+
+	session, phone := reuploadSession(t, "3EB0NOSOCKET")
+	session.askReupload = func(context.Context, *wm.Client, *waTypes.MessageInfo, []byte) error {
+		phone.calls++
+		return wm.ErrNotConnected
+	}
+
+	_, err := refetchErr(session, "3EB0NOSOCKET", nil)
+	assertCode(t, err, protocol.ErrorInternal)
+	if phone.asked() != 1 {
+		t.Errorf("the sender's phone was asked %d times, want once", phone.asked())
+	}
+}
+
+// Refreshing where a file is fetched from rewrites that and nothing else: not the row,
+// and not when it was received.
+//
+// Both halves matter. `stored_at` is what the retention sweep goes by, and a path that
+// was refreshed is not a message that arrived again, so bumping it would keep a row alive
+// past its retention on the strength of a download. And a whole row written back is the
+// snapshot this command read as much as thirty seconds ago, which an inbound handler can
+// have replaced in the meantime -- a redelivery, or a sender reusing an id in another
+// chat -- so the older chat and coordinates would land on top of the newer ones and a
+// later download would serve the wrong file.
+//
+// The row is stamped ahead so the two behaviours separate without racing a clock: the
+// conditional update matches it and leaves the stamp alone, while a whole-row write is
+// refused by the upsert's own newest-wins guard and never lands at all.
+func TestRefreshingAPathLeavesTheRowAndItsRetentionAlone(t *testing.T) {
+	t.Parallel()
+
+	session, phone := reuploadSession(t, "3EB0RACE")
+	phone.answersWith(reuploaded("/v/fresh-path"))
+
+	original, _, err := session.store.MediaPart(t.Context(), "3EB0RACE")
+	if err != nil {
+		t.Fatalf("MediaPart: %v", err)
+	}
+	stamped := time.Now().Add(time.Second)
+	if err := session.store.PutMediaPart(t.Context(), &original, stamped); err != nil {
+		t.Fatalf("PutMediaPart: %v", err)
+	}
+
+	if _, err := refetchErr(session, "3EB0RACE", nil); err != nil {
+		t.Fatalf("refetch: %v", err)
+	}
+	kept, _, err := session.store.MediaPart(t.Context(), "3EB0RACE")
+	if err != nil {
+		t.Fatalf("MediaPart: %v", err)
+	}
+	if kept.DirectPath != "/v/fresh-path" {
+		t.Errorf("the row points at %q, want the path the phone answered with", kept.DirectPath)
+	}
+	if kept.StoredAt != stamped.UnixMilli() {
+		t.Errorf("the row is now stamped %d, want the %d it was received at: refreshing a path is not a message arriving",
+			kept.StoredAt, stamped.UnixMilli())
+	}
+	if kept.ChatID != original.ChatID {
+		t.Errorf("the row came back under chat %q, want the %q it was written with", kept.ChatID, original.ChatID)
 	}
 }
