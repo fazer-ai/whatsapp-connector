@@ -295,3 +295,6 @@ internal/engine/whatsmeow/presence.go: Make the reconnect timeout cover the upst
 # The refusal-acks-a-redelivery class is real and older than the queue bump; the
 # split between fresh and redelivered work is #62, and a wider queue is not it.
 internal/session/session.go: Backpressure reclaimed commands instead of enlarging the queue  # PR#61 → #62
+
+# Inherited from main by rebase: the multi-host download overlay is #66, upstream-shaped.
+internal/engine/whatsmeow/session.go: Clear the file before each fallback media host  # PR#61 → #66
