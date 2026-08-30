@@ -301,7 +301,8 @@ func (s *Session) setPresence(ctx context.Context, command *protocol.Command) (j
 // behind it to carry a deadline, and whatsmeow bounds a frame write by the socket's own
 // life rather than by the context it is given -- so on a connection that authenticated
 // and then stopped taking bytes, an unbounded write would hold the right to the wire for
-// as long as the process runs, and every `presence.set` after it with the same.
+// as long as the process runs, and every `presence.set` after it with the same. As far
+// as the bound reaches, which is not all the way: see #74 on `presenceWait`.
 func (s *Session) reapplyAvailability(ctx context.Context, client *wm.Client) {
 	ctx, cancel := context.WithTimeout(ctx, s.presenceWait)
 	defer cancel()

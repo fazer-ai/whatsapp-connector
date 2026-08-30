@@ -202,6 +202,12 @@ type Session struct {
 	// rather than by the context it is given -- so on a connection that authenticated
 	// and then stopped taking bytes, this would hold the right to the wire for as long
 	// as the process runs, and every `presence.set` after it with the same.
+	//
+	// It bounds the wait for that right and the write once whatsmeow has its socket
+	// lock, and not the wait for the lock itself: `NoiseSocket.SendFrame` takes it
+	// before it reads the context, and a mutex cannot be given a deadline. A write
+	// already stuck behind that lock outlives this, and nothing at this layer can reach
+	// it. That is #74, and it is the same for every node this connector writes.
 	presenceWait time.Duration
 
 	// presenceWrite is the right to have a presence node on the wire, and there is one.
