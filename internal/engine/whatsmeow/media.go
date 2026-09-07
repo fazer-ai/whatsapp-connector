@@ -340,14 +340,37 @@ func (s *Session) fetch(ctx context.Context, part *attachment) (protocol.MediaRe
 	// that come back through here are answered differently and one of them is not the
 	// store's: what WhatsApp said about the file decides whether the message is worth
 	// redelivering, and only the sentinels carry that.
-	var reached error
-	stored, err := s.blobs.Receive(ctx,
-		&media.Blob{Mime: part.content.Mime, Filename: part.content.Filename},
-		func(file media.File) error {
-			reached = s.download(ctx, s.current(), part.download, file)
-			return reached
-		},
-	)
+	attempt := func() (media.Blob, error, error) {
+		var reached error
+		stored, err := s.blobs.Receive(ctx,
+			&media.Blob{Mime: part.content.Mime, Filename: part.content.Filename},
+			func(file media.File) error {
+				reached = s.download(ctx, s.current(), part.download, file)
+				return reached
+			},
+		)
+		return stored, reached, err
+	}
+
+	stored, reached, err := attempt()
+	if integrityFailure(reached) {
+		// Once more, on a file of its own. whatsmeow walks the media hosts writing into
+		// the one file it was given and rewinds between hosts no more than it truncates,
+		// so a host that fails partway leaves bytes the next one's transfer is appended
+		// to -- and every length it works out afterwards is that transfer's, measured
+		// against a file holding both. The MAC is then read from the wrong offset and the
+		// integrity check fails on a file that was never wrong.
+		//
+		// Receive opens a new temporary file for each call, so this attempt cannot see
+		// those leftovers, and a second failure is the file itself rather than the
+		// walking. Only then is the message given a verdict a client never revisits.
+		//
+		// The cost is one extra transfer, and only where the alternative is calling a
+		// good file permanently corrupt.
+		s.log.Warn().Str("kind", string(part.content.Kind)).
+			Msg("a media download failed its integrity check; trying once more on a clean file")
+		stored, reached, err = attempt()
+	}
 	switch {
 	case errors.Is(err, media.ErrTooLarge):
 		// The sender understated the length. Permanent for this file: the same bytes
@@ -406,6 +429,21 @@ func unfetchable(part wm.DownloadableMessage) error {
 	return nil
 }
 
+// integrityFailure reports the answers that mean the bytes on disk are not the ones the
+// message describes.
+//
+// Named rather than inlined into downloadFailure because fetch asks the same question
+// one step earlier, and for a reason the classification cannot see: whatsmeow measures
+// these against the file it was handed, so any of them can be an artefact of that file
+// holding an earlier attempt's bytes rather than a fact about the message.
+func integrityFailure(err error) bool {
+	return errors.Is(err, wm.ErrInvalidMediaHMAC) ||
+		errors.Is(err, wm.ErrInvalidMediaSHA256) ||
+		errors.Is(err, wm.ErrInvalidMediaEncSHA256) ||
+		errors.Is(err, wm.ErrInvalidUnencryptedMediaSHA256) ||
+		errors.Is(err, wm.ErrTooShortFile)
+}
+
 // downloadFailure classifies what whatsmeow said about a download.
 //
 // Only the answers that mean the same thing every time are permanent. A network that
@@ -425,13 +463,11 @@ func downloadFailure(err error) error {
 		// right to treat it as final.
 		return refused{reason: reasonMediaOffCDN, err: err}
 
-	case errors.Is(err, wm.ErrInvalidMediaHMAC),
-		errors.Is(err, wm.ErrInvalidMediaSHA256),
-		errors.Is(err, wm.ErrInvalidMediaEncSHA256),
-		errors.Is(err, wm.ErrInvalidUnencryptedMediaSHA256),
-		errors.Is(err, wm.ErrTooShortFile):
+	case integrityFailure(err):
 		// The bytes arrived and are not the ones the message describes. A redelivery
-		// carries the same description and downloads the same file.
+		// carries the same description and downloads the same file -- and fetch has
+		// already spent a second transfer proving the description is what is wrong,
+		// rather than the file it was written into.
 		return refused{reason: reasonCorrupt, err: err}
 
 	case errors.Is(err, wm.ErrNoURLPresent), errors.Is(err, wm.ErrUnknownMediaType):
