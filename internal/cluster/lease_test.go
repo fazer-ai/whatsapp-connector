@@ -450,3 +450,33 @@ func TestARenewalIsDatedFromWhenItWasSent(t *testing.T) {
 		t.Fatal("a lease renewed by a round trip that outlasted its fresh lifetime still counts as owned")
 	}
 }
+
+// The same for an acquisition, and with one more round trip inside it: Redis starts the
+// TTL when SETNX runs, and the epoch is read after that. A lease stamped once both have
+// answered is dated later than Redis dates it, by however long the acquisition took --
+// which is exactly the moment Redis is slow enough for it to matter. It is the store's
+// question now as well as the socket's: every fenced write asks whether this lease is
+// still good.
+func TestAnAcquisitionIsDatedFromWhenItWasSent(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	clock := newClock()
+	leases := cluster.NewLeases(redisx.Wrap(rdb, "wa:", 8), "inst-a", cluster.Options{Clock: clock})
+
+	// The acquisition takes as long as the lease has to give, spent on the way there.
+	rdb.AddHook(advancingClock{
+		clock: clock,
+		by:    cluster.DefaultTTL - cluster.DefaultRenewMargin,
+		on:    func(cmd redis.Cmder) bool { return cmd.Name() == "setnx" },
+	})
+
+	if _, err := leases.Acquire(context.Background(), "s1"); err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	if _, owned := leases.Owned("s1"); owned {
+		t.Fatal("a lease acquired by a round trip that outlasted its fresh lifetime still counts as owned")
+	}
+}
