@@ -124,7 +124,9 @@ See [`contract/README.md`](contract/README.md) for the frame shapes, the Redis k
 map and the compatibility rules. In short:
 
 - **Events** (connector → client) describe what happened: `message.received`,
-  `session.state`, `pairing.qr`, `group.updated`, ...
+  `message.receipt`, `session.state`, `pairing.qr`, ... The catalog is the contract's,
+  so it is wider than this build: the types nothing here produces yet are marked in
+  `internal/protocol/types.go`.
 - **Commands** (client → connector) ask for something: `message.send`,
   `session.connect`, `group.participants.update`, ... RPC commands get a single
   answer on `wa:reply:<command id>`; the rest are fire and forget and report failures

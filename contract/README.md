@@ -141,6 +141,12 @@ theirs, and the connector is always upgraded first.
   not implement yet, which are refused with `unsupported`. They stay in the enum because
   removing one narrows what a client may already match on, and each is marked in
   `internal/protocol/errors.go` with what arrives in its place.
+- Fourteen of the event types have no producer in this connector either, and the same
+  reasoning holds: a client may match on one and never see it. Unlike a command, nothing
+  says so at the time -- a command it does not implement comes back `unsupported`, while
+  an event that is never published is indistinguishable from one that has not happened.
+  Which fourteen is marked in `internal/protocol/types.go` and held there by a test, so
+  the marking is what the build does rather than what it did when somebody last looked.
 - Three of the codes are about *who* failed, and the distinction is what an operator
   reads first: `wa_error` is WhatsApp refusing, `provider_unavailable` is a dependency
   the command itself named -- the storage a `message.send` points its `ref.url` at --
@@ -158,7 +164,7 @@ this connector stands on every `contact.*`, `group.*` and `history.request` row 
 
 | Command | `result` |
 |---|---|
-| `session.connect`, `session.status` | `connection_state` (also carries `reachout_time_lock` and `new_chat_cap` when the account has them) |
+| `session.connect`, `session.status` | `connection_state`, which also carries `reachout_time_lock` and `new_chat_cap` where a connector reports them. This one does not fill either yet |
 | `admin.ping` | `{ "inst": string, "version": string, "sessions": integer }` |
 | `message.send`, `message.edit`, `message.react` | `{ "message_id": string, "timestamp": timestamp_ms, "client_ref": string\|null }` |
 | `message.revoke` | `null` |
