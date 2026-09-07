@@ -841,6 +841,39 @@ func TestACommandGivenBackIsCarriedOutBeforeAnythingNewerForItsSession(t *testin
 	}
 }
 
+// The site this is actually about. A batch cut off by its window gives the rest back,
+// and that is where a session's command is most often left pending: reclaimed batches
+// are dispatched under a share of the heartbeat, and what does not fit is released.
+// Driven through the dispatch rather than by handing the delivery back directly, because
+// a rule that lives only where a test calls it is a rule the production path can lose.
+func TestABatchCutOffKeepsItsSessionsTurn(t *testing.T) {
+	t.Parallel()
+
+	const sid = "2f1c6f0e-0000-4000-8000-00000000aa05"
+	connector, replies, client, streams := adoptedSession(t, sid)
+
+	writeStatus(t, client, sid, "cut")
+	taken, err := streams.Read(context.Background(), []string{sid})
+	if err != nil || len(taken) != 1 {
+		t.Fatalf("the command to cut was read %d time(s) (err=%v), want 1", len(taken), err)
+	}
+	spent, cancel := context.WithCancel(context.Background())
+	cancel()
+	connector.dispatchWithin(spent, taken)
+
+	writeStatus(t, client, sid, "newer")
+	connector.readCommands(context.Background())
+
+	waitFor(t, "the cut command and the newer one to be answered", func() bool {
+		order := replies.order()
+		return slices.Contains(order, "cut") && slices.Contains(order, "newer")
+	})
+	order := replies.order()
+	if slices.Index(order, "cut") > slices.Index(order, "newer") {
+		t.Fatalf("the commands were answered %v, want the one the batch cut off first", order)
+	}
+}
+
 // The case a mark cleared on the first acceptance gets wrong: with two entries held, the
 // reclaim brings the first, it is accepted, the mark falls, and the second is overtaken
 // by something newer. The drain lets a session back into the read when a pass finds
@@ -947,6 +980,23 @@ func heldSession(
 ) (*Connector, *orderedReplier, *redisx.Client, *redisstream.Streams) {
 	t.Helper()
 
+	connector, replies, client, streams := adoptedSession(t, sid, also...)
+	writeStatus(t, client, sid, "held-1")
+	taken, err := streams.Read(context.Background(), []string{sid})
+	if err != nil || len(taken) != 1 {
+		t.Fatalf("the command to hold was read %d time(s) (err=%v), want 1", len(taken), err)
+	}
+	connector.manager.GiveBack(&taken[0])
+	return connector, replies, client, streams
+}
+
+// adoptedSession is the same instance with the sessions running and nothing held, for the
+// tests that want the give-back to be the only thing that ever marks a session.
+func adoptedSession(
+	t *testing.T, sid string, also ...string,
+) (*Connector, *orderedReplier, *redisx.Client, *redisstream.Streams) {
+	t.Helper()
+
 	server := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
 	t.Cleanup(func() { _ = rdb.Close() })
@@ -981,12 +1031,6 @@ func heldSession(
 	// tests are about: taken here, so the only mark left is the give-back's.
 	manager.TakeNewlyAdopted()
 
-	writeStatus(t, client, sid, "held-1")
-	taken, err := streams.Read(ctx, []string{sid})
-	if err != nil || len(taken) != 1 {
-		t.Fatalf("the command to hold was read %d time(s) (err=%v), want 1", len(taken), err)
-	}
-	manager.GiveBack(&taken[0])
 	return connector, replies, client, streams
 }
 
