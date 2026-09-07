@@ -151,8 +151,10 @@ theirs, and the connector is always upgraded first.
 
 The `reply` frame carries `result` as an opaque object: the schema does not describe
 it per command type, because a result is only ever read by the caller of that one
-command. What the two sides agreed on is listed here, and both implementations are
-written against this table.
+command. What the two sides agreed on is listed here, and it is what a command answers
+when a connector carries it out at all: one that does not implement a command refuses
+it with `unsupported` rather than answering a result of the wrong shape. That is where
+this connector stands on every `contact.*`, `group.*` and `history.request` row below.
 
 | Command | `result` |
 |---|---|
