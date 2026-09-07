@@ -12,10 +12,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
+	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog"
 	"go.mau.fi/whatsmeow/proto/waAdv"
 	"go.mau.fi/whatsmeow/types"
 
+	"github.com/fazer-ai/whatsapp-connector/internal/cluster"
+	"github.com/fazer-ai/whatsapp-connector/internal/redisx"
 	"github.com/fazer-ai/whatsapp-connector/internal/store"
 	"github.com/fazer-ai/whatsapp-connector/internal/store/storetest"
 )
@@ -27,7 +31,7 @@ func TestOpenRejectsAnUnknownURL(t *testing.T) {
 	t.Parallel()
 
 	for _, url := range []string{"", "mysql://localhost/wa", "/var/lib/wa.db"} {
-		if _, err := store.Open(t.Context(), url, zerolog.Nop()); err == nil {
+		if _, err := store.Open(t.Context(), url, store.AlwaysOwned, zerolog.Nop()); err == nil {
 			t.Fatalf("opened %q, want an error", url)
 		}
 	}
@@ -176,7 +180,7 @@ func open(t *testing.T) *store.Container {
 func openAt(t *testing.T, target storetest.Target) *store.Container {
 	t.Helper()
 
-	container, err := store.Open(t.Context(), target.URL, zerolog.Nop())
+	container, err := store.Open(t.Context(), target.URL, store.AlwaysOwned, zerolog.Nop())
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -282,7 +286,7 @@ func TestSQLiteOpensWithoutSpellingOutThePragma(t *testing.T) {
 	t.Parallel()
 
 	address := "sqlite:" + filepath.Join(t.TempDir(), "wac.db")
-	container, err := store.Open(t.Context(), address, zerolog.Nop())
+	container, err := store.Open(t.Context(), address, store.AlwaysOwned, zerolog.Nop())
 	if err != nil {
 		t.Fatalf("Open %q: %v", address, err)
 	}
@@ -413,7 +417,7 @@ func TestAnUpgradeStopsRatherThanGuessAtCredentialsItCannotRead(t *testing.T) {
 
 	target := storetest.New(t)
 
-	old, err := store.Open(t.Context(), target.URL, zerolog.Nop())
+	old, err := store.Open(t.Context(), target.URL, store.AlwaysOwned, zerolog.Nop())
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -467,7 +471,7 @@ func TestAnUpgradeStopsRatherThanGuessAtCredentialsItCannotRead(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	upgraded, err := store.Open(t.Context(), target.URL, zerolog.Nop())
+	upgraded, err := store.Open(t.Context(), target.URL, store.AlwaysOwned, zerolog.Nop())
 	if err == nil {
 		t.Cleanup(func() { _ = upgraded.Close() })
 		t.Fatal("the upgrade chose a winner while it could not tell whether the other had credentials")
@@ -496,7 +500,7 @@ func TestAnUpgradeKeepsTheMappingThatStillHasItsCredentials(t *testing.T) {
 
 	target := storetest.New(t)
 
-	old, err := store.Open(t.Context(), target.URL, zerolog.Nop())
+	old, err := store.Open(t.Context(), target.URL, store.AlwaysOwned, zerolog.Nop())
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -540,7 +544,7 @@ func TestAnUpgradeKeepsTheMappingThatStillHasItsCredentials(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	upgraded, err := store.Open(t.Context(), target.URL, zerolog.Nop())
+	upgraded, err := store.Open(t.Context(), target.URL, store.AlwaysOwned, zerolog.Nop())
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
@@ -578,7 +582,7 @@ func TestAnOlderStoreGainsTheAccountConstraint(t *testing.T) {
 
 	// The shape the first version left behind: a permissive index, and two mappings for
 	// one account that it allowed through.
-	old, err := store.Open(t.Context(), target.URL, zerolog.Nop())
+	old, err := store.Open(t.Context(), target.URL, store.AlwaysOwned, zerolog.Nop())
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -624,7 +628,7 @@ func TestAnOlderStoreGainsTheAccountConstraint(t *testing.T) {
 	}
 
 	// Opened again by this version, which is what an upgrade is.
-	upgraded, err := store.Open(t.Context(), target.URL, zerolog.Nop())
+	upgraded, err := store.Open(t.Context(), target.URL, store.AlwaysOwned, zerolog.Nop())
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
@@ -663,7 +667,7 @@ func TestPairingDoesNotTakeTheFenceOff(t *testing.T) {
 	t.Parallel()
 	container := open(t)
 
-	fence := &store.Fence{}
+	fence := store.NewFence(func() bool { return true })
 	device := store.Fenced(container.Devices().NewDevice(), fence)
 	if device.Initialized {
 		t.Fatal("a device that has never been saved is already initialised, so this proves nothing")
@@ -877,7 +881,7 @@ func TestTwoInstancesUpgradingAtOnceBothStart(t *testing.T) {
 		racing.Add(1)
 		go func() {
 			defer racing.Done()
-			opened, err := store.Open(context.Background(), target.URL, zerolog.Nop())
+			opened, err := store.Open(context.Background(), target.URL, store.AlwaysOwned, zerolog.Nop())
 			if err != nil {
 				failures <- err
 				return
@@ -933,5 +937,115 @@ func TestAColumnInAnotherSchemaIsNotMistakenForThisOne(t *testing.T) {
 	}
 	if err := scoped.PutMediaPart(t.Context(), &part, time.Now()); err != nil {
 		t.Fatalf("a write landed on a table the migration thought already had the column: %v", err)
+	}
+}
+
+// leaseClock is the fleet's clock, driven by the test rather than by the wall.
+type leaseClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (c *leaseClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *leaseClock) advance(by time.Duration) {
+	c.mu.Lock()
+	c.now = c.now.Add(by)
+	c.mu.Unlock()
+}
+
+// The window this closes is the one between a lease running out and this instance
+// hearing about it. Nothing drops the fence in here: the renewal that would have said
+// `ErrNotOwner` has not run yet, so the old owner still believes the session is its own
+// while a peer has already taken it. Both write, and the loser's writes land on top of
+// what the winner has learned -- for the Signal state, on top of what the next message
+// is decrypted against.
+//
+// The lease can answer it without asking Redis, because it knows when it was last
+// renewed and for how long that is good, which is what `Owned` already gives the publish
+// path before it writes an event.
+//
+// Both halves of the store are checked, and the second is the one that matters: the
+// tables this package owns could be fenced with a column and a condition, but whatsmeow
+// builds its own statements and its tables are where the expensive writes are. Standing
+// in front of the device covers them without reaching into its SQL.
+func TestAWriteIsRefusedOnceTheLeaseHasRunOutEvenBeforeThisInstanceKnows(t *testing.T) {
+	t.Parallel()
+
+	const ttl = 30 * time.Second
+	for name, write := range map[string]func(context.Context, *store.Scoped) error{
+		"a table this package owns": func(ctx context.Context, scoped *store.Scoped) error {
+			jid := types.NewJID("5511999990002", types.DefaultUserServer)
+			jid.Device = uint16(deviceCounter.Add(1))
+			return scoped.Bind(ctx, jid)
+		},
+		"a table whatsmeow owns": func(ctx context.Context, scoped *store.Scoped) error {
+			device, err := scoped.Device(ctx)
+			if err != nil {
+				return err
+			}
+			// The write pairing itself makes, and the one a session repeats every time
+			// whatsmeow fills another field in. The rest of the device's stores are only
+			// wired up once it has been saved, so this is also the first one available.
+			jid := types.NewJID("5511999990002", types.DefaultUserServer)
+			jid.Device = uint16(deviceCounter.Add(1))
+			device.ID = &jid
+			device.Account = &waAdv.ADVSignedDeviceIdentity{
+				Details:             make([]byte, 32),
+				AccountSignature:    make([]byte, 64),
+				AccountSignatureKey: make([]byte, 32),
+				DeviceSignature:     make([]byte, 64),
+			}
+			return device.Save(ctx)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			clock := &leaseClock{now: time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC)}
+			server := miniredis.RunT(t)
+			fleet := func(instance string) *cluster.Leases {
+				rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+				t.Cleanup(func() { _ = rdb.Close() })
+				return cluster.NewLeases(redisx.Wrap(rdb, "wa:", 8), instance,
+					cluster.Options{TTL: ttl, Clock: clock})
+			}
+			losing, winning := fleet("inst-a"), fleet("inst-b")
+
+			container, err := store.Open(t.Context(), storetest.New(t).URL, losing.Owns, zerolog.Nop())
+			if err != nil {
+				t.Fatalf("store.Open: %v", err)
+			}
+			t.Cleanup(func() { _ = container.Close() })
+
+			ctx := t.Context()
+			const sid = "2f1c6f0e-0000-4000-8000-00000000005a"
+			if _, err := losing.Acquire(ctx, sid); err != nil {
+				t.Fatalf("Acquire: %v", err)
+			}
+			scoped := container.For(sid)
+			if err := write(ctx, scoped); err != nil {
+				t.Fatalf("a write under a live lease was refused, so what follows proves nothing: %v", err)
+			}
+
+			// The renewal never runs. Redis lets the key go and the peer takes the
+			// account, which is the whole of what "lost it" means.
+			clock.advance(ttl)
+			server.FastForward(ttl)
+			if _, err := winning.Acquire(ctx, sid); err != nil {
+				t.Fatalf("the peer could not take a session whose lease ran out: %v", err)
+			}
+			if scoped.Dropped() {
+				t.Fatal("the fence was dropped, so this instance had been told and the window under test never happened")
+			}
+
+			if err := write(ctx, scoped); !errors.Is(err, store.ErrNotOwned) {
+				t.Fatalf("a write from the instance that lost the session answered %v, want ErrNotOwned", err)
+			}
+		})
 	}
 }

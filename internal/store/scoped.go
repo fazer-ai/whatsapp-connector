@@ -40,7 +40,7 @@ type Scoped struct {
 // memoised: a session reopened after losing its lease must not inherit the fence that was
 // dropped under it.
 func (c *Container) For(sid string) *Scoped {
-	return &Scoped{container: c, sid: sid, fence: &Fence{}}
+	return &Scoped{container: c, sid: sid, fence: NewFence(func() bool { return c.owned(sid) })}
 }
 
 // SID is the session this handle belongs to.

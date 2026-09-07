@@ -306,6 +306,13 @@ func (l *Leases) Owned(sid string) (Lease, bool) {
 	return Lease{SID: sid, Epoch: entry.epoch}, true
 }
 
+// Owns is Owned as a plain yes or no, for a caller that needs the answer and not the
+// lease: the store fences every write on it.
+func (l *Leases) Owns(sid string) bool {
+	_, owned := l.Owned(sid)
+	return owned
+}
+
 // Held lists the sessions this instance believes it owns, fresh or not. Used by the
 // renew loop, which is what turns a stale entry into a released one.
 func (l *Leases) Held() []string {

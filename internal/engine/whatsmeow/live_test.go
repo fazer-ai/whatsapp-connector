@@ -1444,7 +1444,7 @@ func liveSessionWith(t *testing.T, blobs MediaOptions) (*Session, *store.Contain
 	log := zerolog.New(zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.TimeOnly}).
 		Level(zerolog.DebugLevel).With().Timestamp().Logger()
 
-	container, err := store.Open(t.Context(), "sqlite:"+path, log)
+	container, err := store.Open(t.Context(), "sqlite:"+path, store.AlwaysOwned, log)
 	if err != nil {
 		t.Fatalf("open the store at %s: %v", path, err)
 	}

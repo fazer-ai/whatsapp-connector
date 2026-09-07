@@ -167,7 +167,7 @@ func TestEveryWriteIsFenced(t *testing.T) {
 				t.Run(name, func(t *testing.T) {
 					t.Parallel()
 
-					fence := &Fence{}
+					fence := NewFence(held)
 					fence.Drop()
 
 					method := reflect.ValueOf(group.build(fence)).MethodByName(name)
@@ -212,13 +212,17 @@ func zeroArgs(signature reflect.Type) []reflect.Value {
 func TestAHeldFenceLetsAWriteThrough(t *testing.T) {
 	t.Parallel()
 
-	if err := (&Fence{}).held(); err != nil {
+	if err := NewFence(held).held(); err != nil {
 		t.Fatalf("a fence nobody dropped refuses a write: %v", err)
 	}
-	fence := &Fence{}
+	fence := NewFence(held)
 	fence.Drop()
 	fence.Drop()
 	if !errors.Is(fence.held(), ErrNotOwned) {
 		t.Error("a fence dropped twice stopped refusing")
 	}
 }
+
+// held is the arbiter for a test that is not about losing a lease: the session is this
+// instance's and stays that way, so what the fence refuses is what Drop refused.
+func held() bool { return true }
