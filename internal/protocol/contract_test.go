@@ -48,6 +48,11 @@ func TestFixturesValidateAgainstSchema(t *testing.T) {
 
 // Every type in the catalog must have a golden frame. Without this a type can be
 // added to the schema and to Go, and never be exercised by either side.
+// Per frame type, and only per frame type. What a fixture pins is a shape, so the enums
+// a payload can carry are not walked here and are not meant to be: they are held to the
+// schema by TestErrorCodesMatchSchema, which is the check that actually catches a
+// catalogue drifting from the contract. AGENTS.md used to read as though this test
+// covered them, and for as long as it did nobody looked (#70).
 func TestEveryTypeHasAFixture(t *testing.T) {
 	events := typesInFixtures(t, "event")
 	for _, known := range protocol.AllEventTypes {

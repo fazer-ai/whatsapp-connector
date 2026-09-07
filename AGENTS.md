@@ -38,7 +38,14 @@ internal/media/      blob store, inbound download, outbound fetch
   shows up as drift on their side.
 - Changing a frame means changing `contract/schema/protocol.schema.json`, adding or
   updating a fixture in `contract/fixtures/`, and updating `internal/protocol`. The
-  contract test fails if any of the three lags behind.
+  contract test fails when a frame **type** has no fixture, when a fixture names a type
+  this build does not know, or when a fixture does not validate against the schema.
+- Values **inside** a payload are held to the schema, not to the fixtures: an enum's
+  catalogue in `internal/protocol` and its enum in the schema must match exactly, and
+  there is no fixture per value. A fixture pins a frame's shape, and one
+  `command.failed` has the same shape whichever error code it carries -- a file per
+  value would multiply what a change to that shape costs a vendoring client without
+  multiplying what it proves.
 - **Additive changes** (a new event type, a new optional field) do not bump
   `contract/PROTOCOL_VERSION`. Clients are written to ignore what they do not know.
 - **Breaking changes** bump it, and the connector keeps serving the previous major
