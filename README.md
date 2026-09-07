@@ -34,8 +34,9 @@ events and commands with its clients over Redis Streams.
 > for as long as anybody keeps asking for it, so storing one would turn something the
 > sender expected to disappear into something the account holds indefinitely. WhatsApp
 > usually does not hand one to a linked device at all, and what it sends instead reaches
-> the inbox as nothing until
-> [#20](https://github.com/fazer-ai/whatsapp-connector/issues/20) lands. What this build
+> the inbox as a placeholder, asked of the phone first and published on its own if the
+> phone never answers -- how long to wait before giving up on it is still a guess
+> ([#51](https://github.com/fazer-ai/whatsapp-connector/issues/51)). What this build
 > cannot render is left unacknowledged on WhatsApp's side, with its plaintext buffered so
 > the redelivery can still be read: the
 > account keeps the message and delivers it again once there is somewhere to put it. A
@@ -50,10 +51,13 @@ events and commands with its clients over Redis Streams.
 > when it goes stale instead of retrying it: delivered a minute late it is somebody shown
 > typing who stopped long ago, and the state that would have corrected it went out while
 > the stale one was still on its way. The stop that ends a burst is not like that, and
-> neither is an availability -- both hold until something says otherwise. None of it
-> survives a reconnect, though: WhatsApp forgets the availability and the subscriptions
-> alike, so a client resubscribes and republishes what it wants shown
-> ([#46](https://github.com/fazer-ai/whatsapp-connector/issues/46)).
+> neither is an availability -- both hold until something says otherwise. WhatsApp forgets
+> both on a reconnect, so the session remembers the availability it was asked for and puts
+> it back as soon as a connection comes up. Subscriptions are deliberately not reapplied:
+> which parties are worth watching is the client's to know, and `session.state: open` is
+> where it re-establishes them. The memory belongs to the session, so it does not follow
+> the account to another instance
+> ([#72](https://github.com/fazer-ai/whatsapp-connector/issues/72)).
 >
 > A message is acknowledged to WhatsApp only after its event reaches the stream, so
 > losing Redis costs a redelivery and never a message. The client deduplicates on the
@@ -216,7 +220,7 @@ restart, and reports itself healthy while doing it.
 |---|---|
 | **M0** ✅ | Skeleton, Redis Streams transport, lease/ownership port, fake engine, health and metrics, Docker image, publish pipeline |
 | **M1** ✅ | whatsmeow engine: QR and code pairing, session state, logout/ban/outdated handling, the device store. A session that has been handed on writes nothing more: every write a device can make is refused from the moment this instance stops owning it, whichever context it arrives with. What is left of the fence is the window before this instance learns it lost the lease ([#55](https://github.com/fazer-ai/whatsapp-connector/issues/55)); reconnect backoff is still open |
-| **M2** ✅ | Messages in and out (text, media, location, contact, reaction, edit, revoke, quoted, mentions), receipts, read marks, chat presence, account presence, idempotent sends. All of them are in both ways, and a body this build has no arm for arrives as a placeholder rather than disappearing. What it leaves behind is in the issues rather than here: a message WhatsApp will not hand to a linked device still reaches nobody ([#20](https://github.com/fazer-ai/whatsapp-connector/issues/20)), and presence does not survive a reconnect ([#46](https://github.com/fazer-ai/whatsapp-connector/issues/46)) |
+| **M2** ✅ | Messages in and out (text, media, location, contact, reaction, edit, revoke, quoted, mentions), receipts, read marks, chat presence, account presence, idempotent sends. All of them are in both ways, and a body this build has no arm for arrives as a placeholder rather than disappearing. What it leaves behind is in the issues rather than here: an availability does not follow the account to its next owner ([#72](https://github.com/fazer-ai/whatsapp-connector/issues/72)) |
 | **M3** | Groups, contacts, calls |
 | **M4** | Multi-instance under load, quarantine, metrics/lag/DLQ, operations docs |
 | **M5** | Pairing code, passkey relay, per-session proxy, account limits |
