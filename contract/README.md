@@ -95,8 +95,11 @@ theirs, and the connector is always upgraded first.
   `presence.set` it carried out as soon as a connection comes up, which closes a window
   a client's own round trip cannot -- while the account is not marked available every
   message it receives is receipted as if nobody were there, and no sender's client
-  renders that tick -- but it reapplies only what this session was told, so a session
-  rebuilt elsewhere after an ownership change has nothing to put back. Subscriptions are
+  renders that tick. What it puts back is kept next to the account rather than in the
+  session, so an ownership change is covered too: the instance that takes the account
+  over reapplies the last `presence.set` without ever having heard the command. Sending
+  it again on `session.state: open` is harmless and stays the safe habit -- the
+  connector's copy is only as current as the last command it carried out. Subscriptions are
   not reapplied at all: which parties are worth watching is the client's to know, and a
   connector holding that set would either re-subscribe an address book nobody is looking
   at or refuse the one contact somebody has open. Until the client asks again,
