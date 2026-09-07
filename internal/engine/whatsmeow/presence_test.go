@@ -1535,7 +1535,11 @@ func TestAnAvailabilityFiledAfterARebuildIsNotTheNextAccountsToInherit(t *testin
 	// The client is told, which is right -- the state it asked for is on a connection that
 	// is gone, and the session.logged_out behind this is on its way to the same client.
 	if _, err := session.setPresence(t.Context(), presenceCommand("available")); err == nil {
-		t.Fatal("a presence filed after the account was logged out was accepted")
+		// Error and not Fatal: what this test was written to catch is the wire assertion
+		// below, and stopping here would leave that unmeasured on exactly the change that
+		// breaks it. The refusal is the newer half of the same property, not a
+		// replacement for the older one.
+		t.Error("a presence filed after the account was logged out was accepted")
 	}
 	wire.next(t, "the command the client sent")
 
@@ -1632,13 +1636,12 @@ func TestAPresenceThatCouldNotBeRecordedIsNotReportedAsSet(t *testing.T) {
 	wire := &presences{taken: make(chan waTypes.Presence, 8)}
 	session.sendPresence = wire.hand
 
-	// The device row taken out from under a session that is otherwise healthy, which is
-	// the one thing the record cannot hang off: the foreign key refuses it, and nothing
-	// else about the send is different. It is also not a contrived state -- it is what an
-	// ownership handoff leaves behind for the instance that was holding the account.
-	if _, err := container.DB().ExecContext(t.Context(),
-		`DELETE FROM wac_session_device WHERE sid = ?`, session.sid); err != nil {
-		t.Fatalf("dropping the device row: %v", err)
+	// The device unbound from under a session that is otherwise healthy, which is the one
+	// thing the record cannot hang off: the foreign key refuses it, and nothing else
+	// about the send is different. Through Forget rather than by deleting the row, so
+	// what the test arranges is a state the code actually produces.
+	if err := container.For(session.sid).Forget(t.Context()); err != nil {
+		t.Fatalf("Forget: %v", err)
 	}
 
 	if _, err := session.setPresence(t.Context(), presenceCommand("available")); err == nil {
