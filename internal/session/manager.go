@@ -39,6 +39,12 @@ type Manager struct {
 
 	// newly is the sessions adopted since the loop last asked, waiting to have what
 	// their previous owner left pending drained before anything newer is read for them.
+	//
+	// It is what triggers a drain, and not a predicate about a command in hand: a
+	// session is on it both because it was just adopted and because something was left
+	// pending for it, and those two want opposite answers for a command arriving now.
+	// Asked as "may this one be carried out", it holds back every command for a session
+	// adopted a moment ago.
 	newlyMu sync.Mutex
 	newly   []string
 
