@@ -141,6 +141,43 @@ func TestAWriteThatArrivesLateDoesNotOverwriteANewerOne(t *testing.T) {
 	}
 }
 
+// The stamp has millisecond resolution, so two writes inside one millisecond are not
+// ordered by it. Refusing the second there discards a write nothing showed to be older --
+// silently, with no error to read -- and the caller that loses most is the ordinary one:
+// a row written and then corrected, where both calls land in the same millisecond and the
+// correction is the half that disappears. The later call wins instead, which is what an
+// upsert with no guard would do and the only tie-break this stamp supports.
+func TestAWriteStampedTheSameMillisecondAsTheRowItReplacesWins(t *testing.T) {
+	t.Parallel()
+	container := open(t)
+	pair(t, container, "sid-1", "5511999990001")
+
+	first := samplePart("sid-1", "3EB0TIE")
+	first.DirectPath = "/v/t62.7118-24/first.enc"
+	if err := container.For(first.SID).PutMediaPart(t.Context(), &first, storedAt); err != nil {
+		t.Fatalf("PutMediaPart: %v", err)
+	}
+
+	// The correction, close enough behind it to share the stamp.
+	corrected := samplePart("sid-1", "3EB0TIE")
+	corrected.DirectPath = "/v/t62.7118-24/corrected.enc"
+	corrected.ReceiptChat, corrected.Sender = "", ""
+	if err := container.For(corrected.SID).PutMediaPart(t.Context(), &corrected, storedAt); err != nil {
+		t.Fatalf("PutMediaPart: %v", err)
+	}
+
+	got, _, err := container.For("sid-1").MediaPart(t.Context(), "3EB0TIE")
+	if err != nil {
+		t.Fatalf("MediaPart: %v", err)
+	}
+	if got.DirectPath != corrected.DirectPath {
+		t.Fatalf("the direct path is %q, want the correction's %q", got.DirectPath, corrected.DirectPath)
+	}
+	if got.ReceiptChat != "" || got.Sender != "" {
+		t.Fatalf("the row still names %q/%q, want the correction to have cleared both", got.ReceiptChat, got.Sender)
+	}
+}
+
 // A message nobody kept anything for is not an error: it is the ordinary answer for a
 // text message, and for one whose retention has run out.
 func TestAMessageNothingWasKeptForIsNotAnError(t *testing.T) {
