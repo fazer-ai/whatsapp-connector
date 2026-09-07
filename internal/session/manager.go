@@ -488,7 +488,11 @@ func (m *Manager) own(delivery *transport.Delivery, give func(context.Context, *
 	default:
 		m.log.Warn().Str("cmd_id", delivery.Command.ID).Str("type", string(delivery.Command.Type)).
 			Msg("no room to carry out a command this instance answers itself; leaving it pending")
-		release(delivery)
+		// Given back rather than released, and this is the site that needs it: a wake and
+		// a ping ride the control stream and carry no session's turn, but a refusal that
+		// found no room is a command for a session this instance runs and goes on reading
+		// by `>`. Released, the next command its queue accepts would overtake it.
+		m.GiveBack(delivery)
 	}
 }
 
@@ -534,7 +538,7 @@ func (m *Manager) Answer(ctx context.Context) <-chan struct{} {
 				// is the same coin toss as before -- a command dequeued after the
 				// instance began to stop, adopting a session onto one that is going away.
 				if ctx.Err() != nil {
-					release(work.delivery)
+					m.GiveBack(work.delivery)
 					m.releaseQueued()
 					return
 				}
@@ -550,7 +554,7 @@ func (m *Manager) releaseQueued() {
 	for {
 		select {
 		case work := <-m.answers:
-			release(work.delivery)
+			m.GiveBack(work.delivery)
 		default:
 			return
 		}

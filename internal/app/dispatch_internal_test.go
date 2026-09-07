@@ -202,8 +202,10 @@ func (s *timedStreams) ClaimSessions(ctx context.Context, sids []string) ([]tran
 	return s.inner.ClaimSessions(ctx, sids)
 }
 
-// waitFor blocks until cond holds, which is how a test joins the manager's own
-// goroutine: what used to be finished by the time Dispatch returned is now queued there.
+// waitFor blocks until cond holds, which is how a test joins a goroutine that is not the
+// one it is running on: the manager's, where what used to be finished by the time
+// Dispatch returned is now queued, or a session's, where a command offered to it is
+// carried out rather than by whoever dispatched it.
 func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
@@ -1089,18 +1091,4 @@ func adoptedSession(
 	manager.TakeNewlyAdopted()
 
 	return connector, replies, client, streams
-}
-
-// waitFor blocks until cond holds, which is how a test joins a session's own goroutine:
-// a command offered to a session is carried out there, not by whoever dispatched it.
-func waitFor(t *testing.T, what string, cond func() bool) {
-	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if cond() {
-			return
-		}
-		time.Sleep(time.Millisecond)
-	}
-	t.Fatalf("timed out waiting for %s", what)
 }
