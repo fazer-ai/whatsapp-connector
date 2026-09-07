@@ -342,12 +342,15 @@ func (m *Manager) forgetOrphan(sid string) {
 // GiveBack hands a delivery back without carrying it out, and remembers that the session
 // it belongs to has an older entry pending again.
 //
-// Every site that gives up a command for a session this instance runs goes through here
-// rather than calling release directly, because the remembering is the whole point and a
-// site that forgot it would bring the overtaking back in silence. What decides is the
-// delivery itself: a wake and a ping live on the control stream, so giving one back
-// leaves nothing pending on a session's, and a command for a session this instance does
-// not run is on its way to whoever does.
+// A site gives a command back through here when the command may belong to a session this
+// instance runs and the site cannot say which -- the batch a read window cut short is the
+// one that cannot, since it holds whatever the last read returned. A site that does know
+// releases directly and says why: an offer refused by a session being stopped must not be
+// marked at all, and a wake carries no session's turn to keep.
+//
+// What decides here is the delivery itself: a wake and a ping live on the control stream,
+// so giving one back leaves nothing pending on a session's, and a command for a session
+// this instance does not run is on its way to whoever does.
 //
 // The set is the one adoption uses, and reusing it is not a shortcut. Both mean the same
 // thing -- there is an older command on this stream that has not been carried out -- and
@@ -404,7 +407,11 @@ func (m *Manager) Dispatch(ctx context.Context, delivery *transport.Delivery) {
 		// the session reads the same stream, and an instance that owns nothing must not
 		// swallow a command on its way there. Released, so it does not read as work this
 		// process is still doing and become unclaimable.
-		m.GiveBack(delivery)
+		//
+		// Released rather than given back, and the distinction is the whole of it: the
+		// mark says "this instance left something pending on a stream it reads", and this
+		// instance does not read this one.
+		release(delivery)
 		return
 	}
 	switch session.Offer(delivery) {
@@ -414,7 +421,13 @@ func (m *Manager) Dispatch(ctx context.Context, delivery *transport.Delivery) {
 	case OfferStopped:
 		// This instance is letting the account go. Refusing would answer for an owner
 		// it is no longer, so the command stays pending for whoever takes it next.
-		m.GiveBack(delivery)
+		//
+		// Released rather than given back, and here it matters rather than merely reads
+		// better: marking would schedule a drain for an account this instance is giving
+		// up, and the drain claims the stream with no minimum idle time -- taking entries
+		// the new owner already holds and handing them back at age zero, below the idle
+		// floor its own reclaim watches. It stays pending for the owner instead.
+		release(delivery)
 	}
 }
 
@@ -439,7 +452,9 @@ func (m *Manager) wake(ctx context.Context, delivery *transport.Delivery) {
 			// stale key expires there is nothing left to start it at all.
 			m.log.Warn().Str("sid", sid).
 				Msg("a wake found a lease this instance is still handing back; leaving it pending")
-			m.GiveBack(delivery)
+			// A wake rides the control stream, not a session's, so there is no per-session
+			// turn to keep and nothing to mark.
+			release(delivery)
 			return
 		}
 	default:
