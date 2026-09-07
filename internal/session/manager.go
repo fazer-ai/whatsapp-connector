@@ -504,6 +504,15 @@ func (m *Manager) Answer(ctx context.Context) <-chan struct{} {
 	go func() {
 		defer close(stopped)
 		for {
+			// Asked before the select rather than inside it. A select with both arms
+			// ready picks between them at random, so a command queued behind one being
+			// carried out was sometimes carried out too and sometimes given back --
+			// which is a session adopted onto an instance that is going away, on a coin
+			// toss. Once the instance is stopping, nothing more is started.
+			if ctx.Err() != nil {
+				m.releaseQueued()
+				return
+			}
 			select {
 			case <-ctx.Done():
 				// Given back rather than dropped. These are commands nobody has carried
