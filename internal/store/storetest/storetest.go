@@ -17,6 +17,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -168,19 +169,21 @@ func newDatabase(t *testing.T, server string) Target {
 		ctx, cancel := context.WithTimeout(context.Background(), dropTimeout)
 		defer cancel()
 		if err := dropDatabase(ctx, name); err != nil {
-			if ctx.Err() != nil {
-				// Out of time rather than refused, and the test it belonged to has
-				// already passed or failed on its own merits. Failing here would report
-				// a loaded machine as a broken test -- and it does not look like one
-				// test being slow, it looks like several unrelated tests breaking at
-				// once a little past the bound, because they queue on the same four
-				// connections and time out together. That is issue #71.
+			if errors.Is(err, errQueued) {
+				// Never started, because the four connections this package allows itself
+				// were all busy, and the test it belonged to has already passed or failed
+				// on its own merits. Failing here would report congestion this package
+				// inflicts on itself as a broken test -- and not as one slow test either,
+				// but as several unrelated ones giving up together a little past the
+				// bound, which is what made issue #71 undiagnosable after the fact.
 				//
-				// The database is left behind instead, which the naming was already
-				// built to survive: every name carries a random run id, so debris
-				// collides with nothing and the next run neither trips over it nor
-				// waits for it.
-				t.Logf("left %s behind: the drop ran out of its %s "+
+				// The database is left behind instead, which the naming was already built
+				// to survive: every name carries a random run id, so debris collides with
+				// nothing and the next run neither trips over it nor waits for it.
+				//
+				// A drop that did start and then ran out of time is not this: it is a
+				// server that stopped answering, and it goes to the branch below.
+				t.Logf("left %s behind: no admin connection came free within %s "+
 					"(the server is busy, not broken; `DROP DATABASE` what "+
 					`SELECT datname FROM pg_database WHERE datname LIKE 'wac\_%%' lists)`,
 					name, dropTimeout)
@@ -230,12 +233,37 @@ func newDatabase(t *testing.T, server string) Target {
 // that ordinarily needs a machine under load to produce.
 var dropTimeout = 30 * time.Second
 
-// dropDatabase removes one test's database.
+// errQueued marks a drop that never started, because no admin connection came free
+// before the deadline. It is the congestion this package inflicts on itself, and the
+// only failure worth leaving a database behind for.
+var errQueued = errors.New("storetest: no admin connection came free")
+
+// dropDatabase removes one test's database, taking its connection and running its
+// statement as two steps so the caller can tell which of them ran out of time.
+//
+// The split is what keeps a broken server loud. Both halves end on the same context, so
+// a single check on that context would file a server that stopped answering mid-drop
+// under the same heading as a queue -- and the queue is the harmless one. Measured under
+// three concurrent suites on one server, the difference is not subtle: waiting for a
+// connection reaches 19.3s, while the statement itself never passed 7.3s, and the worst
+// cleanup of the run was 19.3s of queue in front of 1.0s of work.
 //
 // FORCE because a pool closes its idle connections and does not wait for the server to
 // notice; without it the drop loses a race it has no reason to be in.
 func dropDatabase(ctx context.Context, name string) error {
-	if _, err := adminDB.ExecContext(ctx, `DROP DATABASE `+quote(name)+` WITH (FORCE)`); err != nil {
+	conn, err := adminDB.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("%w to drop %s: %w", errQueued, name, err)
+	}
+	defer func() { _ = conn.Close() }()
+	return dropOn(ctx, conn, name)
+}
+
+// dropOn is the half that has a connection already, and every failure it reports is the
+// server's: one that stops answering mid-statement fails the test rather than being
+// filed under the queue that never touched it.
+func dropOn(ctx context.Context, conn *sql.Conn, name string) error {
+	if _, err := conn.ExecContext(ctx, `DROP DATABASE `+quote(name)+` WITH (FORCE)`); err != nil {
 		return fmt.Errorf("storetest: drop %s: %w", name, err)
 	}
 	return nil

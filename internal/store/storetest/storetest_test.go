@@ -2,6 +2,7 @@ package storetest
 
 import (
 	"context"
+	"errors"
 	"net/url"
 	"os"
 	"strings"
@@ -9,13 +10,13 @@ import (
 	"time"
 )
 
-// A cleanup that ran out of time is a busy server, not a broken test, and the test it
-// belonged to has already passed or failed on its own merits. Failing on it reports
-// several unrelated tests as breaking at once a little past the bound, because they
-// queue on the same four connections and give up together -- which is what #71 recorded
-// and what nobody could diagnose afterwards, since the failures name the harness rather
-// than anything the tests had in common.
-func TestADropThatRanOutOfTimeIsTheServerBeingBusy(t *testing.T) {
+// A drop that never got a connection is congestion this package inflicts on itself, and
+// the test it belonged to has already passed or failed on its own merits. Failing on it
+// reports several unrelated tests as breaking at once a little past the bound, because
+// they queue on the same four connections and give up together -- which is what #71
+// recorded and what nobody could diagnose afterwards, since the failures name the
+// harness rather than anything the tests had in common.
+func TestADropThatNeverGotAConnectionIsCongestion(t *testing.T) {
 	if os.Getenv(AddressEnv) == "" {
 		t.Skipf("%s is unset, so there is no server to be busy", AddressEnv)
 	}
@@ -30,14 +31,15 @@ func TestADropThatRanOutOfTimeIsTheServerBeingBusy(t *testing.T) {
 	if err == nil {
 		t.Fatal("a drop on a context with no time left reported success, so this proves nothing")
 	}
-	if spent.Err() == nil {
-		t.Fatal("the context outlived the drop, so the cleanup could not tell the two cases apart")
+	if !errors.Is(err, errQueued) {
+		t.Fatalf("a drop that never got a connection is not reported as congestion: %v", err)
 	}
 }
 
-// And the other half: a drop that fails for a reason of its own has to stay loud. A
-// name no database answers to is refused by the server rather than by the clock.
-func TestADropThatWasRefusedIsNotTheClock(t *testing.T) {
+// And the other half: a drop that reached the server and failed there has to stay loud,
+// which is the same branch a server that stops answering mid-statement lands in. A name
+// no database answers to is the reachable version of that.
+func TestADropTheServerRefusedIsNotCongestion(t *testing.T) {
 	if os.Getenv(AddressEnv) == "" {
 		t.Skipf("%s is unset, so there is no server to refuse", AddressEnv)
 	}
@@ -50,8 +52,8 @@ func TestADropThatWasRefusedIsNotTheClock(t *testing.T) {
 	if err == nil {
 		t.Fatal("dropping a database that does not exist reported success")
 	}
-	if ctx.Err() != nil {
-		t.Fatalf("the context ran out on a refusal, so the cleanup would file it as debris: %v", err)
+	if errors.Is(err, errQueued) {
+		t.Fatalf("a drop the server refused is filed as congestion, so a broken server would pass quietly: %v", err)
 	}
 }
 
@@ -95,4 +97,35 @@ func databaseIn(dsn string) (string, error) {
 		return "", err
 	}
 	return strings.TrimPrefix(parsed.Path, "/"), nil
+}
+
+// The case the split exists for: a drop that got its connection and then ran out of time
+// is a server that stopped answering, not a queue. Both halves end on the same context,
+// so a single check on that context would file the two under the same heading -- and the
+// queue is the harmless one.
+func TestADropThatStalledAfterItStartedIsNotCongestion(t *testing.T) {
+	if os.Getenv(AddressEnv) == "" {
+		t.Skipf("%s is unset, so there is no server to stall", AddressEnv)
+	}
+	New(t)
+
+	conn, err := adminDB.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("take an admin connection: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	// The connection is already in hand, so what runs out below is the statement's time
+	// and not the pool's.
+	spent, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
+	defer cancel()
+	<-spent.Done()
+
+	err = dropOn(spent, conn, databaseName(t))
+	if err == nil {
+		t.Fatal("a statement on a context with no time left reported success, so this proves nothing")
+	}
+	if errors.Is(err, errQueued) {
+		t.Fatalf("a server that stopped answering mid-drop is filed as congestion, so it would pass quietly: %v", err)
+	}
 }
