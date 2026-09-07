@@ -22,7 +22,6 @@
 package whatsmeow
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -79,12 +78,11 @@ func TestLiveGroupKeyNamespace(t *testing.T) {
 		name        string
 		participant protocol.Address
 		emoji       string
-		lying       bool
 	}{
 		// The control first. If a translated reaction does not arrive either, the
 		// experiment says nothing about namespaces and the phase says so.
 		{name: "translated", participant: liveAddressOf(t, counterpartJID), emoji: "👍"},
-		{name: "in the namespace the group does not use", participant: wrong, emoji: "❤️", lying: true},
+		{name: "in the namespace the group does not use", participant: wrong, emoji: "❤️"},
 		// The instrument check, and the phase is worth little without it. Our own client
 		// applies this one too -- `reactionOf` publishes by target id and never reads
 		// the participant -- so what is asserted here is that blindness and not the
@@ -103,16 +101,6 @@ func TestLiveGroupKeyNamespace(t *testing.T) {
 			// failure and would be read as this one.
 			mine.awaitMessage(t, sent, 2*time.Minute)
 
-			// A lie, and the only way to send the key untranslated without changing
-			// production code: `asTheGroupAddresses` rewrites a participant whose
-			// namespace does not match what this returns, so telling it the group is on
-			// the wrong namespace makes it leave the wrong one alone.
-			if probe.lying {
-				subject.groupMode = func(context.Context, waTypes.JID) (waTypes.AddressingMode, error) {
-					return liveOtherMode(mode), nil
-				}
-				t.Cleanup(func() { subject.groupMode = nil })
-			}
 			liveActOne(t, subject, protocol.CommandMessageReact, map[string]any{
 				"to":                 map[string]any{"kind": "group", "id": group.User},
 				"target_id":          sent,
@@ -197,24 +185,20 @@ func liveGroupReaches(t *testing.T, session *Session, group waTypes.JID) {
 	t.Fatalf("%s never learned it is in %s", session.sid, group)
 }
 
-// liveGroupMode reads which namespace the group addresses its members by, through the
-// same call the production path uses.
+// liveGroupMode reads which namespace the group addresses its members by.
+//
+// Asked here and nowhere in production any more: the round trip this used to be part of
+// was what these phases measured away. The phases still need it, because "the namespace
+// the group does not use" is not a thing you can name without knowing the one it does.
+
 func liveGroupMode(t *testing.T, subject *Session, group waTypes.JID) waTypes.AddressingMode {
 	t.Helper()
 
-	mode, err := subject.groupModeOverSocket(t.Context(), group)
+	info, err := subject.current().GetGroupInfo(t.Context(), group)
 	if err != nil {
 		t.Fatalf("read the group's addressing: %v", err)
 	}
-	return mode
-}
-
-// liveOtherMode is the addressing a group is not on.
-func liveOtherMode(mode waTypes.AddressingMode) waTypes.AddressingMode {
-	if mode == waTypes.AddressingModeLID {
-		return waTypes.AddressingModePN
-	}
-	return waTypes.AddressingModeLID
+	return info.AddressingMode
 }
 
 // liveOtherNamespace names the counterpart the way the group does not.
@@ -343,14 +327,13 @@ func TestLiveGroupRevokeKeyNamespace(t *testing.T) {
 	for _, probe := range []struct {
 		name        string
 		participant protocol.Address
-		lying       bool
 		// gone is what was measured, written down so the day it changes is a failing
 		// run rather than a paragraph nobody reads again. All three, which is the
 		// finding: the key's participant does not decide whether the revoke propagates.
 		gone bool
 	}{
 		{name: "translated", participant: liveAddressOf(t, counterpartJID), gone: true},
-		{name: "in the namespace the group does not use", participant: wrong, lying: true, gone: true},
+		{name: "in the namespace the group does not use", participant: wrong, gone: true},
 		// Published by us, and refused by WhatsApp: the message is still there on the
 		// phone. That divergence is its own defect and is #107; what this line pins is
 		// that we publish it, so the day the connector starts refusing it, this fails
@@ -367,12 +350,6 @@ func TestLiveGroupRevokeKeyNamespace(t *testing.T) {
 			}, said)
 			mine.awaitMessage(t, sent, 2*time.Minute)
 
-			if probe.lying {
-				subject.groupMode = func(context.Context, waTypes.JID) (waTypes.AddressingMode, error) {
-					return liveOtherMode(mode), nil
-				}
-				t.Cleanup(func() { subject.groupMode = nil })
-			}
 			liveActOne(t, subject, protocol.CommandMessageRevoke, map[string]any{
 				"to":          map[string]any{"kind": "group", "id": group.User},
 				"target_id":   sent,
@@ -431,7 +408,8 @@ func liveRevokeOf(t *testing.T, events *recorder, target string, within time.Dur
 // is what #35 exists to stop, so it is measured instead.
 //
 // What it settles is the question #35 asks, for this call site: a participant in the
-// namespace the group does not use is resolved, the same as in the other two.
+// namespace the group does not use is resolved, the same as in the other two. That is why
+// the read mark could stop paying for a metadata round trip along with them.
 func TestLiveGroupReadKeyNamespace(t *testing.T) {
 	subject, counterpart, container := liveBoth(t, MediaOptions{})
 
@@ -452,11 +430,10 @@ func TestLiveGroupReadKeyNamespace(t *testing.T) {
 	for _, probe := range []struct {
 		name        string
 		participant protocol.Address
-		lying       bool
 		read        bool
 	}{
 		{name: "translated", participant: liveAddressOf(t, counterpartJID), read: true},
-		{name: "in the namespace the group does not use", participant: wrong, lying: true, read: true},
+		{name: "in the namespace the group does not use", participant: wrong, read: true},
 		// There is no third probe here, and the absence is deliberate. Naming a member
 		// who did not send the message was tried, on the theory that a read receipt is
 		// routed to the author and so has nowhere to go when the author named is wrong.
@@ -471,12 +448,6 @@ func TestLiveGroupReadKeyNamespace(t *testing.T) {
 			}, "conector nativo, marcar lido: "+probe.name)
 			mine.awaitMessage(t, sent, 2*time.Minute)
 
-			if probe.lying {
-				subject.groupMode = func(context.Context, waTypes.JID) (waTypes.AddressingMode, error) {
-					return liveOtherMode(mode), nil
-				}
-				t.Cleanup(func() { subject.groupMode = nil })
-			}
 			liveActOne(t, subject, protocol.CommandMessageMarkRead, map[string]any{
 				"chat":        map[string]any{"kind": "group", "id": group.User},
 				"message_ids": []string{sent},

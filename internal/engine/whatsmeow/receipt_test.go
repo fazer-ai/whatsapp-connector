@@ -311,39 +311,6 @@ func TestAReadMarkThatCouldNotGoOutIsNamedInTheContractsOwnWords(t *testing.T) {
 	}
 }
 
-// The other half of the group case: a client holding an address from an older event may
-// well have the namespace the group no longer answers in. Sent as it came, the
-// participant is one WhatsApp cannot resolve, and nothing says so. What is asserted here
-// is the wiring -- that the read mark asks at all -- because the normalisation itself is
-// covered where it lives.
-func TestAReadMarkInAGroupNormalisesWhoWroteTheMessages(t *testing.T) {
-	t.Parallel()
-
-	session, _, _ := outboundSession(t)
-	asked := make(chan waTypes.JID, 1)
-	session.groupMode = func(_ context.Context, chat waTypes.JID) (waTypes.AddressingMode, error) {
-		asked <- chat
-		return waTypes.AddressingModeLID, nil
-	}
-
-	// The send itself has no socket to go out on, and that is not what is being read.
-	_, _ = session.markRead(t.Context(), &protocol.Command{
-		Type: protocol.CommandMessageMarkRead,
-		Payload: json.RawMessage(`{"chat":{"kind":"group","id":"120363041234567890"},
-			"sender":{"kind":"phone","id":"5511999990002"},
-			"message_ids":["3EB0A1B2C3D4E5F60718"]}`),
-	})
-
-	select {
-	case chat := <-asked:
-		if chat.User != "120363041234567890" {
-			t.Errorf("the read mark asked about %s", chat)
-		}
-	default:
-		t.Fatal("the read mark sent the participant in whichever namespace it came in")
-	}
-}
-
 // One receipt node is not one event. whatsmeow expands a grouped receipt into a dispatch
 // per participant and carries on through the ones that fail, so a group read by six
 // people is six calls into this handler. Six full waits is past the five minutes

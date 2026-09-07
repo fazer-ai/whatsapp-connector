@@ -251,13 +251,6 @@ func (s *Session) markRead(ctx context.Context, command *protocol.Command) (json
 	if err := s.readyToSend(); err != nil {
 		return nil, err
 	}
-	// A group answers in one namespace or the other, and a client holding the address
-	// from an older event may well have the other one. Sent as it came, the participant
-	// is one WhatsApp cannot resolve -- and, as above, nothing says so.
-	if sender, err = s.asTheGroupAddresses(ctx, chat, sender); err != nil {
-		return nil, err
-	}
-
 	// Asked for before the mark rather than during it. whatsmeow reads the account's
 	// read-receipt setting inside MarkRead and, when that query fails, carries on with an
 	// empty one -- which is not `none`, so the receipt goes out as an ordinary read. An
