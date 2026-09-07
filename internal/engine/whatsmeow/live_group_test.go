@@ -204,6 +204,20 @@ func liveGroupMode(t *testing.T, subject *Session, group waTypes.JID) waTypes.Ad
 // liveNamespaces names the counterpart both ways: as the group addresses its members, and
 // as it does not.
 //
+// Only one of the two directions has ever run, and it is worth knowing which. Every group
+// these accounts are in addresses by LID -- four of them, checked, including ones older
+// than this work -- so what has been measured is "LID group, key naming by phone". The
+// inverse, a phone-addressed group with the key naming by LID, has no execution here and
+// no way to get one: WhatsApp gives out LID groups.
+//
+// That matters because the inverse is the case the removed translation was written for.
+// Chatwoot answers with the LID whenever it has one, so a phone-addressed group is where
+// it would have sent the wrong namespace. If such a group exists anywhere, this says
+// nothing about it directly -- only that WhatsApp resolves the participant across
+// namespaces in the direction that can be reached, and that the field is consulted at all
+// (the third probe), which is what makes the reading "the identity is resolved" rather
+// than "the field is ignored".
+//
 // Both are built from `mode` rather than one of them being "the JID we happen to hold".
 // That shortcut is what this phase had after the translation was removed, and it quietly
 // emptied the experiment: `counterpartJID` is the phone JID, so in a LID group the
