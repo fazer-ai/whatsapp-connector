@@ -1,8 +1,11 @@
 // Command connector runs the WhatsApp session connector.
 //
-// Two subcommands in this build: `serve` runs the instance, `healthcheck` is what the
-// container's HEALTHCHECK calls. `migrate`, `doctor` and the session subcommands
-// arrive with the store, in M1.
+// `serve` runs the instance and `healthcheck` is what the container's HEALTHCHECK
+// calls; `version` and `help` say what they say.
+//
+// There is no `migrate`: the schema is brought up by `store.Open`, so an instance
+// migrates on the way to serving and a deployment has nothing to run first. A separate
+// command would be for migrating without starting, which nothing has needed yet.
 package main
 
 import (

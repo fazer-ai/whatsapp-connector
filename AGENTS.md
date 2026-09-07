@@ -20,7 +20,7 @@ of truth for both sides; this repository is the side that produces events.
 ## Layout
 
 ```
-cmd/connector/       binary: serve, migrate, doctor, healthcheck, session subcommands
+cmd/connector/       binary: serve, healthcheck, version, help
 contract/            protocol vN: JSON Schema + golden fixtures (language neutral, no Go here)
 internal/protocol/   Go binding for the contract: frames, type catalog, error codes
 internal/transport/  how frames travel (Redis Streams today, HTTP standalone later)
