@@ -46,8 +46,10 @@ internal/media/      blob store, inbound download, outbound fetch
   value. A fixture pins a frame's shape, and one `command.failed` has the same shape
   whichever error code it carries -- a file per value would multiply what a change to
   that shape costs a vendoring client without multiplying what it proves. A new enum
-  gets a catalogue and a row in `TestPayloadEnumsMatchSchema`; one the Go side carries
-  as a plain string is not checked, and the test names which those are.
+  gets a catalogue and a row in `TestPayloadEnumsMatchSchema`, listing every path the
+  schema spells it out at; one the Go side carries as a plain string is listed as
+  unchecked instead. `TestEverySchemaEnumIsAccountedFor` fails until it is one or the
+  other, so an enum cannot be added to the contract and quietly go uncompared.
 - **Additive changes** (a new event type, a new optional field) do not bump
   `contract/PROTOCOL_VERSION`. Clients are written to ignore what they do not know.
 - **Breaking changes** bump it, and the connector keeps serving the previous major

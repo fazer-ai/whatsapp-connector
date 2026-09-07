@@ -133,58 +133,114 @@ func TestErrorCodesMatchSchema(t *testing.T) {
 // sending what this build refuses to parse. Neither shows up in a fixture, because a
 // fixture pins a frame's shape and these are values inside one.
 //
-// The path is where the enum lives in the schema, so a definition that moves fails here
-// rather than silently checking nothing.
-//
-// What is not here is what has no catalogue to compare: the schema also enumerates a
-// ban's kind, a connection state, a group role, a member-add mode, a pairing method, a
-// wake's desired state and a mark-read type, and the Go side carries those as plain
-// strings. Giving one of them a type belongs with a catalogue and an entry below.
+// A catalogue is checked against every path the schema spells it out at, not one of
+// them. The schema repeats an enum wherever it appears rather than referencing a shared
+// definition, so a value added to the event's copy and not the command's would otherwise
+// pass here while a client validating a command rejects what this build sends.
 func TestPayloadEnumsMatchSchema(t *testing.T) {
-	for name, enum := range map[string]struct {
-		known []string
-		path  []string
-	}{
-		"address kind": {
-			known: asStrings(protocol.AllAddressKinds),
-			path:  []string{"definitions", "address", "properties", "kind"},
-		},
-		"media kind": {
-			known: asStrings(protocol.AllMediaKinds),
-			path:  []string{"definitions", "content_media", "properties", "kind"},
-		},
-		"media ref kind": {
-			known: asStrings(protocol.AllMediaRefKinds),
-			path:  []string{"definitions", "media_ref", "properties", "kind"},
-		},
-		"revoked by": {
-			known: asStrings(protocol.AllRevokedBy),
-			path:  []string{"definitions", "event_message_revoked", "properties", "by"},
-		},
-		"receipt kind": {
-			known: asStrings(protocol.AllReceiptKinds),
-			path:  []string{"definitions", "event_message_receipt", "properties", "type"},
-		},
-		"typing state": {
-			known: asStrings(protocol.AllTypingStates),
-			path:  []string{"definitions", "event_chat_presence", "properties", "state"},
-		},
-		"presence state": {
-			known: asStrings(protocol.AllPresenceStates),
-			path:  []string{"definitions", "event_presence_update", "properties", "state"},
-		},
-		"unsupported reason": {
-			known: asStrings(protocol.AllUnsupportedReasons),
-			path:  []string{"definitions", "content_unsupported", "properties", "reason"},
-		},
-	} {
+	for name, enum := range payloadEnums() {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			if published := schemaEnum(t, enum.path); !reflect.DeepEqual(enum.known, published) {
-				t.Fatalf("%s drifted:\n go:     %v\n schema: %v", name, enum.known, published)
+			for _, path := range enum.paths {
+				if published := schemaEnum(t, path); !reflect.DeepEqual(enum.known, published) {
+					t.Errorf("%s drifted at %v:\n go:     %v\n schema: %v",
+						name, path, enum.known, published)
+				}
 			}
 		})
+	}
+}
+
+// And the reverse, which is what keeps the two lists above honest. Every enum in the
+// schema is either compared against a catalogue or named here as one the Go side carries
+// as a plain string -- so an enum added to the contract fails this until somebody decides
+// which it is, rather than being quietly unchecked. Listing the exceptions by hand is
+// what let three of them go unlisted in the first version of this test.
+func TestEverySchemaEnumIsAccountedFor(t *testing.T) {
+	// Carried as plain strings, with no catalogue to compare. Giving one of these a type
+	// in `internal/protocol` means a catalogue, a row above, and a line struck from here.
+	unchecked := map[string]bool{
+		"definitions/ban/properties/kind":                                               true,
+		"definitions/connection_state/properties/connection":                            true,
+		"definitions/group_participant/properties/role":                                 true,
+		"definitions/group_info/properties/member_add_mode":                             true,
+		"definitions/event_session_state/properties/state":                              true,
+		"definitions/event_group_updated/properties/changes/properties/member_add_mode": true,
+		"definitions/command_session_connect/properties/pairing":                        true,
+		"definitions/command_session_wake/properties/desired":                           true,
+		"definitions/command_message_mark_read/properties/type":                         true,
+		"definitions/command_group_participants_update/properties/action":               true,
+		"definitions/command_group_settings_set/properties/setting":                     true,
+		"definitions/command_group_join_requests_update/properties/action":              true,
+	}
+	// error_code has a comparison of its own, in TestErrorCodesMatchSchema.
+	checked := map[string]bool{"definitions/error_code": true}
+	for _, enum := range payloadEnums() {
+		for _, path := range enum.paths {
+			checked[strings.Join(path, "/")] = true
+		}
+	}
+
+	for _, path := range schemaEnumPaths(t) {
+		if !checked[path] && !unchecked[path] {
+			t.Errorf("the schema has an enum at %q that no catalogue is compared against "+
+				"and nothing lists as unchecked", path)
+		}
+	}
+	for path := range unchecked {
+		if checked[path] {
+			t.Errorf("%q is listed as unchecked and is also compared against a catalogue", path)
+		}
+	}
+}
+
+type payloadEnum struct {
+	known []string
+	paths [][]string
+}
+
+// payloadEnums is the catalogues and where the schema spells each one out.
+func payloadEnums() map[string]payloadEnum {
+	return map[string]payloadEnum{
+		"address kind": {
+			known: asStrings(protocol.AllAddressKinds),
+			paths: [][]string{{"definitions", "address", "properties", "kind"}},
+		},
+		"media kind": {
+			known: asStrings(protocol.AllMediaKinds),
+			paths: [][]string{{"definitions", "content_media", "properties", "kind"}},
+		},
+		"media ref kind": {
+			known: asStrings(protocol.AllMediaRefKinds),
+			paths: [][]string{{"definitions", "media_ref", "properties", "kind"}},
+		},
+		"revoked by": {
+			known: asStrings(protocol.AllRevokedBy),
+			paths: [][]string{{"definitions", "event_message_revoked", "properties", "by"}},
+		},
+		"receipt kind": {
+			known: asStrings(protocol.AllReceiptKinds),
+			paths: [][]string{{"definitions", "event_message_receipt", "properties", "type"}},
+		},
+		"typing state": {
+			known: asStrings(protocol.AllTypingStates),
+			paths: [][]string{
+				{"definitions", "event_chat_presence", "properties", "state"},
+				{"definitions", "command_chat_presence", "properties", "state"},
+			},
+		},
+		"presence state": {
+			known: asStrings(protocol.AllPresenceStates),
+			paths: [][]string{
+				{"definitions", "event_presence_update", "properties", "state"},
+				{"definitions", "command_presence_set", "properties", "state"},
+			},
+		},
+		"unsupported reason": {
+			known: asStrings(protocol.AllUnsupportedReasons),
+			paths: [][]string{{"definitions", "content_unsupported", "properties", "reason"}},
+		},
 	}
 }
 
@@ -196,6 +252,34 @@ func asStrings[T ~string](catalogue []T) []string {
 		out = append(out, string(value))
 	}
 	return out
+}
+
+// schemaEnumPaths is every place the schema spells an enum out, as slash-joined paths.
+func schemaEnumPaths(t *testing.T) []string {
+	t.Helper()
+
+	var document map[string]any
+	read(t, filepath.Join(contractDir, "schema", "protocol.schema.json"), &document)
+
+	var found []string
+	var walk func(node any, path []string)
+	walk = func(node any, path []string) {
+		object, ok := node.(map[string]any)
+		if !ok {
+			return
+		}
+		if _, has := object["enum"]; has {
+			found = append(found, strings.Join(path, "/"))
+		}
+		for key, value := range object {
+			walk(value, append(append([]string{}, path...), key))
+		}
+	}
+	walk(document, nil)
+	if len(found) == 0 {
+		t.Fatal("the schema has no enums at all, so this check is comparing nothing")
+	}
+	return found
 }
 
 // schemaEnum reads one enum out of the schema by the path it lives at, and fails when
