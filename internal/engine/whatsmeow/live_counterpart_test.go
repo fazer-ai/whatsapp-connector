@@ -83,9 +83,8 @@ func TestLiveTwoAccountsTalk(t *testing.T) {
 	said := "conector nativo, contraparte falando " + time.Now().Format(time.TimeOnly)
 	sent := liveSay(t, counterpart, subjectJID.User, said)
 
-	arrived := inbox.await(t, protocol.EventMessageReceived, 2*time.Minute)
+	arrived := inbox.awaitMessage(t, sent, 2*time.Minute)
 	var message struct {
-		ID     string `json:"id"`
 		Sender *struct {
 			Phone string `json:"phone"`
 			LID   string `json:"lid"`
@@ -94,11 +93,8 @@ func TestLiveTwoAccountsTalk(t *testing.T) {
 			Body string `json:"body"`
 		} `json:"content"`
 	}
-	if err := json.Unmarshal(arrived.Payload, &message); err != nil {
+	if err := json.Unmarshal(arrived, &message); err != nil {
 		t.Fatalf("unmarshal what arrived: %v", err)
-	}
-	if message.ID != sent {
-		t.Fatalf("what arrived is %s and the counterpart sent %s", message.ID, sent)
 	}
 	if message.Content.Body != said {
 		t.Fatalf("the body is %q, want %q", message.Content.Body, said)

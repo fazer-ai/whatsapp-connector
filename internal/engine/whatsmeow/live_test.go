@@ -1689,6 +1689,53 @@ func (r *recorder) await(t *testing.T, want protocol.EventType, within time.Dura
 	}
 }
 
+// awaitMessage waits for one message.received by id, ignoring every other message that
+// arrives meanwhile, and hands back the message out of its envelope.
+//
+// Waiting for "the next message.received" is only right on an account nobody else is
+// talking to, which is not an account. A resume delivers whatever came in while the
+// session was down, and the far side answers on its own schedule -- on the demo number
+// this harness talks to, a bot answers within a second. The first event to arrive is
+// then somebody else's, and the phase reports the wrong body against the right send,
+// which reads as the connector having mangled the message.
+func (r *recorder) awaitMessage(t *testing.T, id string, within time.Duration) json.RawMessage {
+	t.Helper()
+
+	deadline := time.After(within)
+	for {
+		select {
+		case emission, ok := <-r.seen:
+			if !ok {
+				t.Fatalf("the session ended before message %s arrived", id)
+			}
+			if emission.Type == protocol.EventSessionLoggedOut {
+				t.Fatalf("the account was logged out while waiting for message %s, so it has to be paired again: %s",
+					id, emission.Payload)
+			}
+			if emission.Type != protocol.EventMessageReceived {
+				continue
+			}
+			var envelope struct {
+				Message json.RawMessage `json:"message"`
+			}
+			if err := json.Unmarshal(emission.Payload, &envelope); err != nil {
+				t.Fatalf("unmarshal a message.received: %v", err)
+			}
+			var named struct {
+				ID string `json:"id"`
+			}
+			if err := json.Unmarshal(envelope.Message, &named); err != nil {
+				t.Fatalf("unmarshal the message inside a message.received: %v", err)
+			}
+			if named.ID == id {
+				return envelope.Message
+			}
+		case <-deadline:
+			t.Fatalf("message %s did not arrive within %s", id, within)
+		}
+	}
+}
+
 // awaitState waits for one value of session.state, ignoring the ones on the way to it.
 func (r *recorder) awaitState(t *testing.T, want string, within time.Duration) {
 	t.Helper()
@@ -1699,6 +1746,19 @@ func (r *recorder) awaitState(t *testing.T, want string, within time.Duration) {
 		case emission, ok := <-r.seen:
 			if !ok {
 				t.Fatalf("the session ended before it reported %q", want)
+			}
+			// The same two dead ends `await` refuses, for the same reason: neither
+			// is a state on the way to another one, so waiting out the deadline
+			// only replaces an answer that already arrived with a timeout that
+			// says nothing. A logged-out account is the one that costs the most to
+			// misread -- it is answered by pairing again, and the generic timeout
+			// sends you looking at the network instead.
+			if emission.Type == protocol.EventSessionLoggedOut {
+				t.Fatalf("the account was logged out while waiting for %q, so it has to be paired again: %s",
+					want, emission.Payload)
+			}
+			if emission.Type == protocol.EventPairingError {
+				t.Fatalf("the pairing failed while waiting for %q: %s", want, emission.Payload)
 			}
 			if emission.Type != protocol.EventSessionState {
 				continue
