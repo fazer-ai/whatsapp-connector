@@ -298,14 +298,27 @@ func schemaEnum(t *testing.T, path []string) []string {
 	var document map[string]any
 	read(t, filepath.Join(contractDir, "schema", "protocol.schema.json"), &document)
 
+	// Through arrays as well as objects, because the walk that produces these paths goes
+	// through both: a numeric step is an index into a `oneOf` or an `allOf`. Reading a
+	// path this file can generate must not be the thing that fails.
 	var node any = document
 	for _, step := range path {
-		object, ok := node.(map[string]any)
-		if !ok {
-			t.Fatalf("%v is not an object at %q", path, step)
-		}
-		if node, ok = object[step]; !ok {
-			t.Fatalf("the schema has nothing at %v (missing %q)", path, step)
+		switch container := node.(type) {
+		case map[string]any:
+			value, ok := container[step]
+			if !ok {
+				t.Fatalf("the schema has nothing at %v (missing %q)", path, step)
+			}
+			node = value
+		case []any:
+			index, err := strconv.Atoi(step)
+			if err != nil || index < 0 || index >= len(container) {
+				t.Fatalf("the schema has nothing at %v (%q is not an index into %d alternatives)",
+					path, step, len(container))
+			}
+			node = container[index]
+		default:
+			t.Fatalf("%v is neither an object nor a list at %q", path, step)
 		}
 	}
 	object, ok := node.(map[string]any)
