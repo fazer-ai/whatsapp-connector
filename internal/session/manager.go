@@ -501,6 +501,13 @@ func (m *Manager) own(delivery *transport.Delivery, give func(context.Context, *
 // renewal's. Neither bound moved; what moved is the goroutine they are measured on.
 func (m *Manager) Answer(ctx context.Context) <-chan struct{} {
 	stopped := make(chan struct{})
+	// The work outlives the cancellation that stops the loop taking more on. Every step
+	// it runs is bounded on its own -- AdoptTimeout for an adoption, ackTimeout for a
+	// reply or a retirement -- so a command already being carried out when the instance
+	// begins to stop is finished rather than torn in half, and whoever waits on the
+	// channel below waits for exactly that. Under the caller's context instead, a
+	// shutdown would cut an adoption between the store and the lease.
+	carrying := context.WithoutCancel(ctx)
 	go func() {
 		defer close(stopped)
 		for {
@@ -522,7 +529,16 @@ func (m *Manager) Answer(ctx context.Context) <-chan struct{} {
 				m.releaseQueued()
 				return
 			case work := <-m.answers:
-				work.give(ctx, work.delivery)
+				// Asked again here, and not only above: a cancellation landing while this
+				// was blocked on the receive leaves both arms ready, and the random pick
+				// is the same coin toss as before -- a command dequeued after the
+				// instance began to stop, adopting a session onto one that is going away.
+				if ctx.Err() != nil {
+					release(work.delivery)
+					m.releaseQueued()
+					return
+				}
+				work.give(carrying, work.delivery)
 			}
 		}
 	}()

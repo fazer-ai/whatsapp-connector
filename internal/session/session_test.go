@@ -673,6 +673,82 @@ func TestACommandBeingAnsweredIsFinishedEvenAsTheInstanceStops(t *testing.T) {
 
 // gatedReplier answers only once the test lets it, and records whether the context it
 // was given was still live by then.
+// The reply and the acknowledgement bound their own work already, so a shutdown landing
+// mid-answer cannot cut either. The adoption is the one step that does not: it derives
+// its deadline from whatever context it was handed, so under the worker's own it would be
+// cancelled the moment the instance began to stop -- between reading the device store and
+// taking the lease, which is a session half-opened on an instance that is going away.
+func TestAnAdoptionBeingCarriedOutIsNotCutShortByTheInstanceStopping(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+
+	store := &gatedEngine{entered: make(chan struct{}), gate: make(chan struct{})}
+	manager := session.NewManager(&session.ManagerConfig{
+		Instance: "inst-a", Engine: store, Leases: cluster.NewLeases(client, "inst-a", cluster.Options{}),
+		Publisher: newRecorder(), Replier: &quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	answering, stop := context.WithCancel(context.Background())
+	stopped := manager.Answer(answering)
+
+	manager.Dispatch(&transport.Delivery{
+		Command: protocol.Command{
+			V: protocol.Version, ID: "c1", Type: protocol.CommandSessionWake, SID: "s1",
+		},
+		Ack:     func(context.Context) error { return nil },
+		Release: func() {},
+	})
+
+	<-store.entered
+	stop()
+	close(store.gate)
+	<-stopped
+
+	if !store.alive.Load() {
+		t.Fatal("the adoption saw its context already cancelled, want it carried out to the end")
+	}
+}
+
+// gatedEngine holds an adoption open until the test says so, and records whether the
+// context it was opened under was still alive by then.
+type gatedEngine struct {
+	entered chan struct{}
+	gate    chan struct{}
+	alive   atomic.Bool
+	once    sync.Once
+	events  chan engine.Emission
+}
+
+func (e *gatedEngine) Open(ctx context.Context, _ string) (engine.Session, error) {
+	e.once.Do(func() { close(e.entered) })
+	<-e.gate
+	e.alive.Store(ctx.Err() == nil)
+	e.events = make(chan engine.Emission)
+	return e, nil
+}
+
+func (e *gatedEngine) Events() <-chan engine.Emission                       { return e.events }
+func (e *gatedEngine) Connect(context.Context, engine.ConnectRequest) error { return nil }
+func (e *gatedEngine) Disconnect(context.Context) error                     { return nil }
+func (e *gatedEngine) Logout(context.Context) error                         { return nil }
+
+func (e *gatedEngine) Execute(context.Context, *protocol.Command) (json.RawMessage, error) {
+	return json.RawMessage(`{}`), nil
+}
+
+func (e *gatedEngine) Close() error {
+	close(e.events)
+	return nil
+}
+
+type quietReplier struct{}
+
+func (quietReplier) Reply(context.Context, string, protocol.Reply) error { return nil }
+
 type gatedReplier struct {
 	entered chan struct{}
 	gate    chan struct{}
