@@ -271,6 +271,29 @@ func (s *Session) setPresence(ctx context.Context, command *protocol.Command) (j
 	// try again, and reapplying it on the next connection would put back a state nobody
 	// was ever told this session was in.
 	s.rememberAvailability(state, client)
+
+	// And kept where the next owner can find it. The memory above is this instance's, so
+	// a handoff builds a session that has never heard this command; the record is what
+	// carries the account's availability across that.
+	//
+	// A failure here fails the command, even though WhatsApp has already taken the state
+	// and this connection is showing it. The reason is what the answer promises rather
+	// than what it did: `presence.set` is answered from the ledger on a redelivery now,
+	// which reports the state as set on the strength of this record existing. Reported
+	// without it, the client is told its account is available and no owner after this one
+	// puts it back -- the failure this issue is about, arrived at through the reporting
+	// instead of the handoff. Told the set failed, the client asks again, and the second
+	// attempt sets the same state.
+	//
+	// The name the client used, not whatsmeow's value for it, so what comes back out is
+	// put through the same table that validated it on the way in. A row nothing here
+	// wrote -- an older shape, a hand-edited database -- is then a state this connector
+	// does not recognise rather than one it puts on the wire unread.
+	if err := s.store.PutAvailability(ctx, req.State); err != nil {
+		s.log.Warn().Err(err).Msg("an availability was set but could not be kept for the next owner")
+		return nil, protocol.NewError(protocol.ErrorInternal,
+			"the availability was set but could not be recorded, so it would be lost on a handoff")
+	}
 	return nil, nil
 }
 
@@ -316,7 +339,26 @@ func (s *Session) reapplyAvailability(ctx context.Context, client *wm.Client) {
 
 	state, asked := s.rememberedAvailability(client)
 	if !asked {
-		return
+		// Nothing in this instance's memory, which is every first connection -- a fresh
+		// process, and an account just handed over. The record answers for both, and it
+		// is the handoff it exists for: a session built by a new owner has never heard
+		// the command, and without this the account stops being shown as available with
+		// nothing to say so.
+		kept, found, err := s.store.Availability(ctx)
+		if err != nil {
+			s.log.Warn().Err(err).Msg("could not read what this account was last asked to be shown as")
+			return
+		}
+		if !found {
+			return
+		}
+		named, ok := presenceStates[kept]
+		if !ok {
+			s.log.Warn().Str("state", kept).
+				Msg("a kept availability names a state this connector does not know; leaving it")
+			return
+		}
+		state = named
 	}
 	if err := s.sendPresence(ctx, client, state); err != nil {
 		s.log.Warn().Err(err).Msg("a new connection was not told what this account last set itself to")

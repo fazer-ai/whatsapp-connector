@@ -212,6 +212,17 @@ func (c *Container) bind(ctx context.Context, sid string, jid types.JID) error {
 		jid.User, sid); err != nil {
 		return fmt.Errorf("store: bind %s: %w", sid, err)
 	}
+	// Dropped before the bond is rewritten, and only when the device on it changes. The
+	// row above is updated rather than replaced when a session pairs again, so the
+	// cascade that clears this on a forget does not fire here -- and an availability the
+	// previous account's client asked for would be put back on the wire for an account
+	// that never asked, which is the one thing this record must not do.
+	if _, err := tx.ExecContext(ctx, c.rebind(`
+		DELETE FROM wac_session_presence WHERE sid = ? AND EXISTS (
+			SELECT 1 FROM wac_session_device WHERE sid = ? AND jid <> ?)`),
+		sid, sid, jid.String()); err != nil {
+		return fmt.Errorf("store: bind %s: %w", sid, err)
+	}
 	if _, err := tx.ExecContext(ctx, c.rebind(`
 		INSERT INTO wac_session_device (sid, jid, account, bound_at) VALUES (?, ?, ?, ?)
 		ON CONFLICT (sid) DO UPDATE SET
@@ -445,6 +456,20 @@ func (c *Container) migrate(ctx context.Context) error {
 			learned_at BIGINT NOT NULL,
 			due_at     BIGINT NOT NULL,
 			PRIMARY KEY (sid, message_id),
+			FOREIGN KEY (sid) REFERENCES wac_session_device (sid) ON DELETE CASCADE
+		)`,
+
+		// What a client asked this account to be shown as, so the first connection of a
+		// new owner can put it back the way a reconnect does. The session's own memory
+		// cannot: it is per instance, and a handoff builds one that has never heard the
+		// command.
+		//
+		// The cascade is the clearing rule. A forget unbinds the session and this goes
+		// with it, so what pairs next is available only if its own client says so.
+		`CREATE TABLE IF NOT EXISTS wac_session_presence (
+			sid    TEXT   PRIMARY KEY,
+			state  TEXT   NOT NULL,
+			set_at BIGINT NOT NULL,
 			FOREIGN KEY (sid) REFERENCES wac_session_device (sid) ON DELETE CASCADE
 		)`,
 	} {

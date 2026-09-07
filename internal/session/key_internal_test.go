@@ -122,10 +122,16 @@ func TestADownloadDoesNotBorrowTheIDNamespaceOfTheSendThatCreatedItsMessage(t *t
 }
 
 // A command whose effect belongs to the socket that carried it out cannot be answered
-// from a record of the first time. WhatsApp forgets an account's availability and its
-// presence subscriptions when the connection goes and whatsmeow replays neither, so a
-// redelivery that lands on a new socket and is answered from the ledger reports a
-// success over a connection where nothing was done.
+// from a record of the first time. WhatsApp forgets an account's presence subscriptions
+// when the connection goes and whatsmeow replays none of them, so a redelivery that lands
+// on a new socket and is answered from the ledger reports a success over a connection
+// where nothing was done.
+//
+// The availability is the one that stopped being like that. It is kept where the next
+// owner reads it and put back on every connection, including the first one after a
+// handoff, so the ledger's answer is backed by something an owner after this one acts on
+// -- and answering from it also stops a redelivered older set from re-asserting a state
+// the client has since changed.
 func TestAPresenceIsCarriedOutAgainRatherThanRecalled(t *testing.T) {
 	t.Parallel()
 
@@ -134,7 +140,7 @@ func TestAPresenceIsCarriedOutAgainRatherThanRecalled(t *testing.T) {
 		command    protocol.CommandType
 		remembered bool
 	}{
-		{"setting availability", protocol.CommandPresenceSet, false},
+		{"setting availability", protocol.CommandPresenceSet, true},
 		{"subscribing to somebody", protocol.CommandPresenceSubscribe, false},
 		// Skipping this one costs a typing indicator nobody sees; carrying it out again
 		// long after shows one that is not true. Repeating is not the safer mistake.

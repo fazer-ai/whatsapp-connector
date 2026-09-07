@@ -8,12 +8,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rs/zerolog"
 	wm "go.mau.fi/whatsmeow"
 	waTypes "go.mau.fi/whatsmeow/types"
 	waEvents "go.mau.fi/whatsmeow/types/events"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/engine"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
+	"github.com/fazer-ai/whatsapp-connector/internal/store"
 )
 
 // WhatsApp has no `recording`. It has `composing` with a media attribute beside it, and
@@ -1528,8 +1530,12 @@ func TestAnAvailabilityFiledAfterARebuildIsNotTheNextAccountsToInherit(t *testin
 		}
 		return hand(ctx, client, state)
 	}
-	if _, err := session.setPresence(t.Context(), presenceCommand("available")); err != nil {
-		t.Fatalf("setPresence: %v", err)
+	// Refused rather than filed, and the foreign key is what refuses it: the record hangs
+	// off the session's device row, and the recover above took that row with the account.
+	// The client is told, which is right -- the state it asked for is on a connection that
+	// is gone, and the session.logged_out behind this is on its way to the same client.
+	if _, err := session.setPresence(t.Context(), presenceCommand("available")); err == nil {
+		t.Fatal("a presence filed after the account was logged out was accepted")
 	}
 	wire.next(t, "the command the client sent")
 
@@ -1537,6 +1543,131 @@ func TestAnAvailabilityFiledAfterARebuildIsNotTheNextAccountsToInherit(t *testin
 	if got := wire.states(); len(got) != 1 {
 		t.Errorf("the wire saw %v, and the presence of the account that was logged out is in there", got)
 	}
+}
+
+// The account moves to another instance, which builds a session that has never heard the
+// command. The session's own memory cannot answer for that -- it is per instance -- so
+// without the record the account stops being marked available with nothing to say so, and
+// every message arriving before the client notices and sets it again is receipted as if
+// nobody were there.
+func TestAnAvailabilitySurvivesTheAccountChangingOwner(t *testing.T) {
+	t.Parallel()
+
+	session, container := newTestSession(t, "5511999990001")
+	connect(session)
+	session.sendPresence = (&presences{taken: make(chan waTypes.Presence, 8)}).hand
+	if _, err := session.setPresence(t.Context(), presenceCommand("available")); err != nil {
+		t.Fatalf("setPresence: %v", err)
+	}
+
+	// The instance that takes the account over: the same store and the same session id,
+	// and a session object that has never seen a command.
+	next, wire := adoptedElsewhere(t, container, session.sid)
+	next.reapplyAvailability(t.Context(), next.current())
+
+	if got := wire.states(); len(got) != 1 || got[0] != waTypes.PresenceAvailable {
+		t.Fatalf("the new owner's first connection put %v on the wire, want the availability the client had asked for", got)
+	}
+}
+
+// And the other half: an account nobody asked to be shown as available is not volunteered
+// by the owner that takes it over any more than by the one that had it.
+func TestAnAccountNobodyMarkedAvailableIsNotVolunteeredByItsNextOwner(t *testing.T) {
+	t.Parallel()
+
+	session, container := newTestSession(t, "5511999990002")
+	connect(session)
+
+	next, wire := adoptedElsewhere(t, container, session.sid)
+	next.reapplyAvailability(t.Context(), next.current())
+
+	if got := wire.states(); len(got) != 0 {
+		t.Fatalf("the new owner put %v on the wire for an account whose client never asked for one", got)
+	}
+}
+
+// A session id that pairs again against a different account starts over. The record hangs
+// off the device row, but pairing *updates* that row rather than replacing it, so the
+// cascade that clears this on a forget does not fire here -- and an availability the
+// previous account's client asked for would be put on the wire for an account that never
+// asked for one.
+func TestAnAvailabilityIsNotInheritedByTheNextAccountToPairTheSameSession(t *testing.T) {
+	t.Parallel()
+
+	session, container := newTestSession(t, "5511999990003")
+	connect(session)
+	session.sendPresence = (&presences{taken: make(chan waTypes.Presence, 8)}).hand
+	if _, err := session.setPresence(t.Context(), presenceCommand("available")); err != nil {
+		t.Fatalf("setPresence: %v", err)
+	}
+
+	other, err := waTypes.ParseJID("5511999990009:12@" + waTypes.DefaultUserServer)
+	if err != nil {
+		t.Fatalf("ParseJID: %v", err)
+	}
+	if err := container.For(session.sid).Bind(t.Context(), other); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	kept, found, err := container.For(session.sid).Availability(t.Context())
+	if err != nil {
+		t.Fatalf("Availability: %v", err)
+	}
+	if found {
+		t.Fatalf("the previous account's %q survived the session pairing another one", kept)
+	}
+}
+
+// The answer is what makes the record load-bearing: `presence.set` is answered from the
+// ledger on a redelivery now, and that answer says the state is set. Reported over a
+// record that was not written, the client is told its account is available and no owner
+// after this one puts it back -- which is the failure this whole change is about, reached
+// through the reporting instead of the handoff. So the write is part of the command
+// rather than a best effort beside it.
+func TestAPresenceThatCouldNotBeRecordedIsNotReportedAsSet(t *testing.T) {
+	t.Parallel()
+
+	session, container := newTestSession(t, "5511999990004")
+	connect(session)
+	wire := &presences{taken: make(chan waTypes.Presence, 8)}
+	session.sendPresence = wire.hand
+
+	// The device row taken out from under a session that is otherwise healthy, which is
+	// the one thing the record cannot hang off: the foreign key refuses it, and nothing
+	// else about the send is different. It is also not a contrived state -- it is what an
+	// ownership handoff leaves behind for the instance that was holding the account.
+	if _, err := container.DB().ExecContext(t.Context(),
+		`DELETE FROM wac_session_device WHERE sid = ?`, session.sid); err != nil {
+		t.Fatalf("dropping the device row: %v", err)
+	}
+
+	if _, err := session.setPresence(t.Context(), presenceCommand("available")); err == nil {
+		t.Fatal("a presence that could not be recorded was reported as set")
+	}
+	// The node did go out, which is why the answer is the interesting half: this instance
+	// is showing the state and cannot promise the next one will.
+	if got := wire.states(); len(got) != 1 {
+		t.Fatalf("the wire saw %v, want the node that did go out before the record failed", got)
+	}
+}
+
+// adoptedElsewhere is the session an instance builds when it takes an account over: the
+// same store and session id, and nothing carried across from the object that had it.
+func adoptedElsewhere(t *testing.T, container *store.Container, sid string) (*Session, *presences) {
+	t.Helper()
+
+	scoped := container.For(sid)
+	device, err := scoped.Device(t.Context())
+	if err != nil {
+		t.Fatalf("Device: %v", err)
+	}
+	next := newSession(sid, wm.NewClient(device, nil), scoped, MediaOptions{}, zerolog.Nop(),
+		newLibraryLogger(zerolog.Nop(), sid))
+	t.Cleanup(func() { _ = next.Close() })
+	connect(next)
+	wire := &presences{taken: make(chan waTypes.Presence, 8)}
+	next.sendPresence = wire.hand
+	return next, wire
 }
 
 // availableSession is a connected session whose presence nodes are counted rather than
