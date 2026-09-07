@@ -82,6 +82,15 @@ type MediaPart struct {
 // and adding one is the architecture change the package doc calls open -- it removes the
 // harm reordering does here, which is a stale directPath installed over a fresh one and a
 // later download answered with a 404.
+//
+// The comparison admits an equal stamp, and that is not a rounding of the rule. The stamp
+// has millisecond resolution, so two writes inside one millisecond are not ordered by it
+// at all: rejecting the second discards a write nothing showed to be older, silently and
+// with no error to read, and a caller that writes a row and then corrects it loses the
+// correction whenever the two land in the same millisecond. Admitting it makes the later
+// call win, which is what an upsert without a guard would do and the only tie-break the
+// stamp supports. What the guard still refuses is a stamp measurably older, which is the
+// reordering it was written for.
 func (c *Container) putMediaPart(ctx context.Context, part *MediaPart, now time.Time) error {
 	if part.SID == "" || part.MessageID == "" {
 		return fmt.Errorf("store: a media part needs a session and a message, got %q and %q", part.SID, part.MessageID)
@@ -104,7 +113,7 @@ func (c *Container) putMediaPart(ctx context.Context, part *MediaPart, now time.
 			receipt_chat = excluded.receipt_chat,
 			sender = excluded.sender, from_me = excluded.from_me,
 			stored_at = excluded.stored_at
-		WHERE excluded.stored_at > wac_media_part.stored_at`
+		WHERE excluded.stored_at >= wac_media_part.stored_at`
 	_, err := c.db.ExecContext(ctx, c.rebind(upsert),
 		part.SID, part.MessageID, part.ChatKind, part.ChatID, part.Kind, part.DirectPath,
 		encode(part.MediaKey), encode(part.FileEncSHA256), encode(part.FileSHA256),
