@@ -77,11 +77,15 @@ type MediaPart struct {
 // is no worse off than before.
 //
 // That case is not hypothetical: ownership of a session moves between instances, and the
-// old owner's handler can still be inside this call when the new one writes. This does
-// not fence the write against a lost lease -- it cannot, there is no epoch in this schema
-// and adding one is the architecture change the package doc calls open -- it removes the
-// harm reordering does here, which is a stale directPath installed over a fresh one and a
-// later download answered with a 404.
+// old owner's handler can still be inside this call when the new one writes. Fencing such
+// a write is not this guard's job: Scoped.PutMediaPart asks the fence before reaching
+// here, so one from an instance that has lost the lease is refused before a statement is
+// built. What is left for the stamp is the reordering of two writes that were both
+// entitled to be here when they started. The fence stops answering yes at
+// `renewedAt + ttl - margin`, a whole margin before the claim expires in Redis, and that
+// margin is what a write admitted just inside the cutoff has to commit in; one that takes
+// longer lands after the new owner's. The harm of that is a stale directPath installed
+// over a fresh one and a later download answered with a 404.
 //
 // The comparison admits an equal stamp, and that is not a rounding of the rule. The stamp
 // has millisecond resolution, so two writes inside one millisecond are not ordered by it
