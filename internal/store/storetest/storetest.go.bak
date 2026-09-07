@@ -141,14 +141,6 @@ func newDatabase(t *testing.T, server string) Target {
 		// a connection per parallel test on top of the ones those tests already hold,
 		// which is how a package that passes one test at a time fails as
 		// `sorry, too many clients already` when it is run whole.
-		//
-		// Four is narrow and stays narrow on purpose. Measured on this suite against one
-		// server: a run drops 539 databases, and a drop costs around 700ms on an idle
-		// server and 2.5s with three suites on it at once. Widening the cap to sixteen
-		// does make the drops quick again -- 776ms median under that same load -- and it
-		// reaches `sorry, too many clients already` instead, which fails tests outright
-		// rather than slowing their cleanup down. The queue in front of these two
-		// statements is the price of not being that.
 		adminDB.SetMaxOpenConns(4)
 	})
 	if adminErr != nil {
@@ -162,30 +154,24 @@ func newDatabase(t *testing.T, server string) Target {
 		t.Fatalf("create the database for this test: %v", err)
 	}
 	t.Cleanup(func() {
-		// A context of its own, because t.Context() is already cancelled by the time
-		// cleanup runs. Bounded rather than Background, so a server that stops answering
+		// A context of its own: t.Context() is already cancelled by the time cleanup
+		// runs, and a database left behind is one the next run collides with under the
+		// same name. Bounded rather than Background, so a server that stops answering
 		// fails the test that noticed instead of hanging the suite.
-		ctx, cancel := context.WithTimeout(context.Background(), dropTimeout)
+		//
+		// FORCE because a pool closes its idle connections and does not wait for the
+		// server to notice; without it the drop loses a race it has no reason to be in.
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		if err := dropDatabase(ctx, name); err != nil {
-			if ctx.Err() != nil {
-				// Out of time rather than refused, and the test it belonged to has
-				// already passed or failed on its own merits. Failing here would report
-				// a loaded machine as a broken test -- and it does not look like one
-				// test being slow, it looks like several unrelated tests breaking at
-				// once a little past the bound, because they queue on the same four
-				// connections and time out together. That is issue #71.
-				//
-				// The database is left behind instead, which the naming was already
-				// built to survive: every name carries a random run id, so debris
-				// collides with nothing and the next run neither trips over it nor
-				// waits for it.
-				t.Logf("left %s behind: the drop ran out of its %s "+
-					"(the server is busy, not broken; `DROP DATABASE` what "+
-					`SELECT datname FROM pg_database WHERE datname LIKE 'wac\_%%' lists)`,
-					name, dropTimeout)
-				return
-			}
+		started := time.Now()
+		_, err := adminDB.ExecContext(ctx, `DROP DATABASE `+quote(name)+` WITH (FORCE)`)
+		stats := adminDB.Stats()
+		if f, ferr := os.OpenFile("/tmp/probe.txt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); ferr == nil {
+			fmt.Fprintf(f, "drop=%s wait=%s waited=%d inuse=%d open=%d err=%v\n",
+				time.Since(started), stats.WaitDuration, stats.WaitCount, stats.InUse, stats.OpenConnections, err)
+			_ = f.Close()
+		}
+		if err != nil {
 			t.Errorf("drop the database for this test: %v", err)
 		}
 	})
@@ -223,24 +209,6 @@ func newDatabase(t *testing.T, server string) Target {
 //
 // Both are stripped. confirmRoute is what covers the ways in that are not on this list,
 // since a rule this strange is not one to trust an enumeration of.
-// dropTimeout bounds one cleanup. Long enough that only a server in real trouble
-// reaches it: the slowest drop measured under three concurrent suites was 17.5s.
-//
-// A variable rather than a constant so this package's own test can reach the branch
-// that ordinarily needs a machine under load to produce.
-var dropTimeout = 30 * time.Second
-
-// dropDatabase removes one test's database.
-//
-// FORCE because a pool closes its idle connections and does not wait for the server to
-// notice; without it the drop loses a race it has no reason to be in.
-func dropDatabase(ctx context.Context, name string) error {
-	if _, err := adminDB.ExecContext(ctx, `DROP DATABASE `+quote(name)+` WITH (FORCE)`); err != nil {
-		return fmt.Errorf("storetest: drop %s: %w", name, err)
-	}
-	return nil
-}
-
 func route(server, name string) (string, error) {
 	u, err := url.Parse(server)
 	if err != nil {
