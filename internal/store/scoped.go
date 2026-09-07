@@ -111,6 +111,24 @@ func (s *Scoped) MediaPart(ctx context.Context, messageID string) (MediaPart, bo
 	return s.container.mediaPart(ctx, s.sid, messageID)
 }
 
+// PutAvailability records what this account was last asked to be shown as, so the next
+// connection can put it back -- including the first connection of a new owner, whose
+// session has never heard the command.
+func (s *Scoped) PutAvailability(ctx context.Context, state string) error {
+	if err := s.fence.held(); err != nil {
+		return err
+	}
+	return s.container.putAvailability(ctx, s.sid, state, time.Now())
+}
+
+// Availability is what PutAvailability kept, and whether anything was kept at all.
+//
+// Not fenced, the way JID is not: it is a read, and a session about to be told what to
+// put back is one that is starting rather than one that has lost the account.
+func (s *Scoped) Availability(ctx context.Context) (state string, kept bool, err error) {
+	return s.container.availability(ctx, s.sid)
+}
+
 // PutPlaceholder holds a bubble this session has scheduled and not yet decided, so a
 // process that ends inside the window does not take the decision with it.
 //

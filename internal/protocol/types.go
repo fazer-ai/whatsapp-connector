@@ -244,19 +244,27 @@ func (c *Command) ChangesSomething() bool {
 // so a redelivery that lands on a new socket and is answered from the ledger reports a
 // success over a connection where nothing was done.
 //
-// `presence.set` is here even though the connector now puts the availability back on
-// every connection of its own accord, because that reaches only as far as the session
-// that was told: the memory is the session's, the ledger is shared, and an ownership
-// change builds a session that has never heard the command. Answering a redelivery from
-// the record would then be exactly the success over a connection where nothing was done
-// that this table exists to stop. Making it durable is a per-session record this does
-// not have, and is #72.
+// `presence.set` was here and is not any more. It was here because the reapplication on a
+// new connection reached only as far as the session that had been told, so a redelivery
+// answered from the ledger reported a success over a connection where nothing was done.
+// The availability is now kept where the next owner reads it (#72), and the command fails
+// rather than answering when that record cannot be written -- so the ledger's answer is
+// backed by something an owner after this one will act on.
 //
-// `chat.presence` is deliberately not here. Skipping it costs a typing indicator nobody
+// Taking it out fixes the other direction too. Carried out again, a redelivery of an
+// older `presence.set` re-asserts the state it named: a client that set `available` and
+// then `unavailable` could be put back to `available` by a redelivery of the first, with
+// nothing afterwards to correct it. Answered from the ledger, the old command reports
+// what it did at the time and changes nothing now.
+//
+// `presence.subscribe` stays, and the asymmetry is deliberate: subscriptions are not
+// reapplied on a new connection -- which parties are worth watching is the client's to
+// know -- so what a subscribe set really does belong to the socket that set it.
+//
+// `chat.presence` is deliberately in neither. Skipping it costs a typing indicator nobody
 // sees, and carrying it out again long after the fact shows one that is not true -- so
-// unlike these two, repeating is not the safer of the two mistakes.
+// unlike a subscribe, repeating is not the safer of the two mistakes.
 var RepeatableCommands = map[CommandType]bool{
-	CommandPresenceSet:       true,
 	CommandPresenceSubscribe: true,
 }
 
