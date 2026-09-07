@@ -52,6 +52,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1556,6 +1557,27 @@ func liveDeadline(t *testing.T, fallback time.Duration) time.Duration {
 type recorder struct {
 	seen  chan engine.Emission
 	tally map[protocol.EventType]*atomic.Int64
+}
+
+// liveWatchers is the one reader of each session's events, and the watchers it feeds.
+//
+// `Session.Events()` hands back a single channel, so two goroutines ranging over it split
+// the stream between them: each event reaches one and is lost to the other, and which one
+// is a coin flip per event. That is not hypothetical -- `liveResume` opens a watcher of
+// its own, so every phase that watched a session and then resumed it was reading about
+// half of what arrived, and passing on the runs where the half it wanted came its way.
+//
+// So the session is read once and the emissions are handed to every watcher of it. A
+// phase can watch a session it also resumes, and two phases can watch the same session
+// for different things, without either eating the other's events.
+var liveWatchers = struct {
+	sync.Mutex
+	of map[*Session]*fanout
+}{of: map[*Session]*fanout{}}
+
+type fanout struct {
+	sync.Mutex
+	to    []*recorder
 	dir   string
 	codes atomic.Int64
 }
@@ -1566,11 +1588,26 @@ func watch(t *testing.T, session *Session) *recorder {
 	r := &recorder{
 		seen:  make(chan engine.Emission, 256),
 		tally: make(map[protocol.EventType]*atomic.Int64, 24),
-		dir:   liveDir(t),
+	}
+
+	liveWatchers.Lock()
+	source, running := liveWatchers.of[session]
+	if !running {
+		source = &fanout{dir: liveDir(t)}
+		liveWatchers.of[session] = source
+	}
+	liveWatchers.Unlock()
+
+	source.Lock()
+	source.to = append(source.to, r)
+	source.Unlock()
+
+	if running {
+		return r
 	}
 	go func() {
 		for emission := range session.Events() {
-			r.record(emission)
+			source.record(emission)
 			// This harness stands in for the publisher, so it owes the same answer:
 			// an inbound message waits here for word that its event landed, and a
 			// reader that only drains the channel leaves every one of them stalled
@@ -1578,16 +1615,40 @@ func watch(t *testing.T, session *Session) *recorder {
 			if emission.Settle != nil {
 				emission.Settle(nil)
 			}
-			select {
-			case r.seen <- emission:
-			default:
-				// A phase that is not reading fast enough must not stall the
-				// session's own forwarder, which is what publishes the state.
+			source.Lock()
+			watchers := slices.Clone(source.to)
+			source.Unlock()
+			for _, watcher := range watchers {
+				watcher.tallyUp(emission.Type)
+				select {
+				case watcher.seen <- emission:
+				default:
+					// A phase that is not reading fast enough must not stall the
+					// session's own forwarder, which is what publishes the state.
+				}
 			}
 		}
-		close(r.seen)
+		source.Lock()
+		watchers := slices.Clone(source.to)
+		source.to = nil
+		source.Unlock()
+		for _, watcher := range watchers {
+			close(watcher.seen)
+		}
 	}()
 	return r
+}
+
+// tallyUp counts an event for one watcher. Counted on the way in rather than as it is
+// read, because `count` is asked about events no phase waits for -- whether a QR was ever
+// offered, when the phase is checking that resuming did not ask for one.
+func (r *recorder) tallyUp(eventType protocol.EventType) {
+	counter, ok := r.tally[eventType]
+	if !ok {
+		counter = &atomic.Int64{}
+		r.tally[eventType] = counter
+	}
+	counter.Add(1)
 }
 
 // record prints one event and, for a pairing image, writes it somewhere a camera can
@@ -1597,14 +1658,7 @@ func watch(t *testing.T, session *Session) *recorder {
 // It writes to stderr rather than through t.Logf because the testing package buffers a
 // test's log until the test ends, and a pairing code nobody sees until the deadline has
 // passed is a pairing code nobody can scan.
-func (r *recorder) record(emission engine.Emission) {
-	counter, ok := r.tally[emission.Type]
-	if !ok {
-		counter = &atomic.Int64{}
-		r.tally[emission.Type] = counter
-	}
-	counter.Add(1)
-
+func (r *fanout) record(emission engine.Emission) {
 	if emission.Type == protocol.EventPairingQR {
 		path, expires, err := r.writeCode(emission.Payload)
 		if err != nil {
@@ -1623,7 +1677,7 @@ func say(format string, args ...any) {
 }
 
 // writeCode turns the data URL the contract carries back into a file.
-func (r *recorder) writeCode(payload json.RawMessage) (string, time.Duration, error) {
+func (r *fanout) writeCode(payload json.RawMessage) (string, time.Duration, error) {
 	var body struct {
 		Image     string `json:"png_data_url"`
 		ExpiresIn int64  `json:"expires_in_ms"`
