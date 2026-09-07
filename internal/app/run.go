@@ -168,10 +168,15 @@ func New(cfg *Config, log zerolog.Logger) (connector *Connector, err error) {
 
 // commandStreams is the half of the transport the loop takes commands from.
 //
-// An interface so a test can hold a session out of the read the way a real one is held --
-// by a drain that cannot take its stream over -- and watch what happens to the sessions
-// beside it. Asserting that on what a command did afterwards would be asserting on a
-// consequence several paths reach.
+// An interface for two reasons, and the loop reaches these four calls from both. The
+// bound it grants its optional work is granted here and nowhere else, so a test that
+// reads it off anything downstream is inferring it -- it used to be inferred from the
+// deadline an `admin.ping` was answered under, which worked only while the manager
+// answered a ping on the goroutine that dispatched it, and stopped meaning anything the
+// moment that stopped being true. And a session is held out of the read the way a real
+// one is held, by a drain that cannot take its stream over, so what happens to the
+// sessions beside it is watched directly rather than through a command's fate, which is
+// a consequence several paths reach.
 type commandStreams interface {
 	Read(ctx context.Context, sids []string) ([]transport.Delivery, error)
 	Claim(ctx context.Context, sids []string) ([]transport.Delivery, error)
@@ -226,22 +231,11 @@ func (c *Connector) Run(ctx context.Context) error {
 	sweepingParts, stopPartSweep := context.WithCancel(ctx)
 	sweptParts := c.sweepMediaParts(sweepingParts)
 
-	if c.cfg.Heartbeat < session.AdoptTimeout {
-		// Said out loud rather than refused. A wake adopts inside the tick window, so a
-		// heartbeat shorter than an adoption means a session whose store or engine open
-		// runs long is cut, forfeited and tried again on a window just as short: the
-		// account never starts, and the only trace is one error per attempt. Refusing
-		// the configuration instead would price out short leases altogether -- the rule
-		// above already puts the heartbeat under two thirds of the lease, so a lease of
-		// a few seconds has no heartbeat left that would also clear an adoption -- and
-		// that is a deployment decision this check has no business making. What closes
-		// it properly is an adoption that does not run on this goroutine at all, which
-		// is #76.
-		c.log.Warn().
-			Str("heartbeat", c.cfg.Heartbeat.String()).
-			Str("adopt_timeout", session.AdoptTimeout.String()).
-			Msg("the heartbeat is shorter than an adoption; a session whose open runs long will be retried rather than started")
-	}
+	// On a context of its own, like the sweepers and for the same reason: the loop has
+	// an exit the context knows nothing about, and waiting on a goroutine nothing has
+	// cancelled would hang the process on exactly the startup failure it is reporting.
+	answering, stopAnswering := context.WithCancel(ctx)
+	answered := c.manager.Answer(answering)
 
 	c.log.Info().
 		Str("addr", c.cfg.HTTPAddr).
@@ -253,6 +247,13 @@ func (c *Connector) Run(ctx context.Context) error {
 	// Before the shutdown, which closes the pool this one is querying.
 	stopPartSweep()
 	<-sweptParts
+
+	// Before the shutdown as well, and for both of the things it closes: an adoption in
+	// flight is reading the device store, and every acknowledgement is a round trip to
+	// Redis. Stopping it here also means the hand-back below is not racing a wake that
+	// would adopt a session back onto an instance that is going away.
+	stopAnswering()
+	<-answered
 
 	c.shutdown()
 	// After the loop, so the sweep is not walking a directory the shutdown is still
@@ -540,17 +541,16 @@ func readBlock(heartbeat time.Duration) time.Duration { return heartbeat / readB
 
 // dispatchWithin carries out a batch, and stops when the caller's deadline runs out.
 //
-// Reclaimed deliveries are mostly wakes, and a wake is the one command that blocks: it
-// adopts a session, which reads the store. A batch of them can therefore run for
-// several times the adoption bound, on the goroutine that renews every lease this
-// instance holds — and the sessions whose renewals it delays are handed to peers while
-// this instance still holds their sockets open. The deadline is the caller's own -- a
-// reclaim pass's share of the heartbeat, or the tick window -- rather than a budget
-// opened here, which would stack on whatever the caller had already spent. What is not
-// dispatched is released, so it stays pending and comes back on a later pass.
+// Nothing in the batch blocks any more: a session's command is offered to that session's
+// queue and the three the manager answers itself are queued on its own goroutine, so a
+// whole batch costs a handful of channel sends. The deadline is still read, because a
+// window already spent when the batch arrives should not start work the tick is about to
+// interrupt -- but it is now a guard against a window that had already run out rather
+// than a budget the dispatch can exhaust. What is not dispatched is released, so it
+// stays pending and comes back on a later pass.
 func (c *Connector) dispatchWithin(ctx context.Context, deliveries []transport.Delivery) bool {
 	for i := range deliveries {
-		if ctx.Err() != nil || !c.roomFor(ctx, &deliveries[i]) {
+		if ctx.Err() != nil {
 			for rest := i; rest < len(deliveries); rest++ {
 				// Through the manager rather than straight to the delivery: a command
 				// for a session this instance runs, given back unrun, leaves an older
@@ -562,42 +562,9 @@ func (c *Connector) dispatchWithin(ctx context.Context, deliveries []transport.D
 				Msg("a batch of commands ran out of its window; the rest stays pending")
 			return false
 		}
-		c.manager.Dispatch(ctx, &deliveries[i])
+		c.manager.Dispatch(&deliveries[i])
 	}
 	return true
-}
-
-// roomFor reports whether the window can still give this delivery a real turn.
-//
-// Only the two commands the manager carries out on this goroutine are held to a floor,
-// and they are the two that spend the window: a wake adopts a session, which reads the
-// store, and a ping answers the caller over Redis. One dispatched with a sliver has that
-// trip cut and is retired all the same -- the acknowledgement runs on a detached timeout
-// on purpose -- so a wake costs the session a whole claim delay for an attempt that never
-// was, and a ping leaves its caller waiting for an answer no redelivery will produce.
-// Below the floor they are released instead, age kept, and the next pass gives them a
-// window worth having.
-//
-// Everything else is an offer to a session's queue, which returns at once and is carried
-// out on that session's own goroutine, and holding one back would cost more than the
-// sliver does. A command read from a session's stream and then released stays pending
-// while the next `>` read can hand over a newer one for the same session -- the reclaim
-// walks the sessions a window at a time, so the older entry can wait several ticks for a
-// pass that looks at its stream -- which is the per-session order the single stream
-// exists to give, traded away for a round trip that was not going to block anyway.
-func (c *Connector) roomFor(ctx context.Context, delivery *transport.Delivery) bool {
-	switch delivery.Command.Type {
-	case protocol.CommandSessionWake, protocol.CommandAdminPing:
-	default:
-		return true
-	}
-	deadline, bounded := ctx.Deadline()
-	if !bounded {
-		return true
-	}
-	// Half a read block: a turn shorter than that is a formality, and it ends in a
-	// forfeit or an unanswerable caller that nothing deserved.
-	return time.Until(deadline) >= readBlock(c.cfg.Heartbeat)/2
 }
 
 // reclaimPasses is how many independent passes one heartbeat's reclaim is made of: the

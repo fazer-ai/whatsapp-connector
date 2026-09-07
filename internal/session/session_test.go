@@ -228,7 +228,25 @@ func newHarness(t *testing.T) harness {
 		Logger: zerolog.Nop(),
 	})
 	t.Cleanup(func() { manager.StopAll(context.Background()) })
+	answering(t, manager)
 	return harness{leases: leases, engine: fakeEngine, recorder: rec, ledger: book, manager: manager}
+}
+
+// answering starts the goroutine a manager carries its own commands out on, and stops it
+// when the test ends.
+//
+// Every test that dispatches a wake, a ping, or a command a full session refuses needs
+// it: Dispatch queues those rather than running them, which is the whole of what #76 and
+// #79 asked for -- the goroutine that dispatches renews every lease this instance holds,
+// and none of those three may hold it up.
+func answering(t *testing.T, manager *session.Manager) {
+	t.Helper()
+	ctx, stop := context.WithCancel(context.Background())
+	stopped := manager.Answer(ctx)
+	t.Cleanup(func() {
+		stop()
+		<-stopped
+	})
 }
 
 func delivery(cmd *protocol.Command, acked *atomic.Bool) *transport.Delivery {
@@ -299,7 +317,7 @@ func TestRPCCommandIsAnsweredAndAcknowledged(t *testing.T) {
 	}
 
 	var acked atomic.Bool
-	h.manager.Dispatch(ctx, delivery(&protocol.Command{
+	h.manager.Dispatch(delivery(&protocol.Command{
 		V: protocol.Version, ID: "c1", Type: protocol.CommandSessionStatus, SID: "s1",
 		ReplyTo: "c1", Payload: json.RawMessage(`{}`),
 	}, &acked))
@@ -325,7 +343,7 @@ func TestUnsupportedCommandIsRefusedWithItsCode(t *testing.T) {
 	}
 
 	var acked atomic.Bool
-	h.manager.Dispatch(ctx, delivery(&protocol.Command{
+	h.manager.Dispatch(delivery(&protocol.Command{
 		V: protocol.Version, ID: "c2", Type: protocol.CommandGroupList, SID: "s1",
 		ReplyTo: "c2", Payload: json.RawMessage(`{}`),
 	}, &acked))
@@ -351,7 +369,7 @@ func TestExpiredCommandIsRefusedWithoutRunning(t *testing.T) {
 	engineSession, _ := h.engine.Session("s1")
 
 	var acked atomic.Bool
-	h.manager.Dispatch(ctx, delivery(&protocol.Command{
+	h.manager.Dispatch(delivery(&protocol.Command{
 		V: protocol.Version, ID: "c3", Type: protocol.CommandSessionStatus, SID: "s1",
 		ReplyTo: "c3", Deadline: time.Now().Add(-time.Minute).UnixMilli(), Payload: json.RawMessage(`{}`),
 	}, &acked))
@@ -379,7 +397,7 @@ func TestFireAndForgetFailurePublishesCommandFailed(t *testing.T) {
 	}
 
 	var acked atomic.Bool
-	h.manager.Dispatch(ctx, delivery(&protocol.Command{
+	h.manager.Dispatch(delivery(&protocol.Command{
 		V: protocol.Version, ID: "c4", Type: protocol.CommandGroupList, SID: "s1",
 		Payload: json.RawMessage(`{}`),
 	}, &acked))
@@ -402,7 +420,7 @@ func TestCommandForAnotherInstanceIsLeftPending(t *testing.T) {
 	h := newHarness(t)
 	var acked atomic.Bool
 
-	h.manager.Dispatch(context.Background(), delivery(&protocol.Command{
+	h.manager.Dispatch(delivery(&protocol.Command{
 		V: protocol.Version, ID: "c5", Type: protocol.CommandSessionStatus, SID: "not-ours",
 		ReplyTo: "c5", Payload: json.RawMessage(`{}`),
 	}, &acked))
@@ -423,14 +441,12 @@ func TestWakeAdoptsTheSession(t *testing.T) {
 	h := newHarness(t)
 	var acked atomic.Bool
 
-	h.manager.Dispatch(context.Background(), delivery(&protocol.Command{
+	h.manager.Dispatch(delivery(&protocol.Command{
 		V: protocol.Version, ID: "c6", Type: protocol.CommandSessionWake, SID: "s2",
 		Payload: json.RawMessage(`{"desired":"connected"}`),
 	}, &acked))
 
-	if !acked.Load() {
-		t.Fatal("the wake was not acknowledged")
-	}
+	waitFor(t, "the wake to be acknowledged", acked.Load)
 	if got := h.manager.SIDs(); len(got) != 1 || got[0] != "s2" {
 		t.Fatalf("running sessions = %v, want [s2]", got)
 	}
@@ -602,12 +618,12 @@ func (c *steppingClock) step(d time.Duration) {
 	c.mu.Unlock()
 }
 
-// A batch is dispatched under a budget, so a command that finishes as that budget runs
-// out would have its acknowledgement refused by the deadline rather than by Redis. That
-// is not a retry: an entry whose ack did not land stays marked as being carried out here,
-// on purpose, so a reclaim does not run it twice — and every later claim then skips it.
-// In a fleet of one that is a command nothing retires until the process restarts.
-func TestACommandThatWasCarriedOutIsRetiredEvenOutOfTime(t *testing.T) {
+// A command being answered when the instance is wound down is still answered and still
+// retired. Both run on a bound of their own, detached from the goroutine that carries
+// them: an entry whose ack did not land stays marked as being carried out here, on
+// purpose, so a reclaim does not run it twice — and every later claim then skips it. In
+// a fleet of one that is a command nothing retires until the process restarts.
+func TestACommandBeingAnsweredIsFinishedEvenAsTheInstanceStops(t *testing.T) {
 	t.Parallel()
 
 	server := miniredis.RunT(t)
@@ -615,33 +631,236 @@ func TestACommandThatWasCarriedOutIsRetiredEvenOutOfTime(t *testing.T) {
 	t.Cleanup(func() { _ = rdb.Close() })
 	client := redisx.Wrap(rdb, "wa:", 8)
 
+	// Holds the reply until the test says so, which is what lets the shutdown land in
+	// the middle of answering one command rather than between two.
+	replies := &gatedReplier{entered: make(chan struct{}), gate: make(chan struct{})}
 	manager := session.NewManager(&session.ManagerConfig{
 		Instance: "inst-a", Engine: fake.New(), Leases: cluster.NewLeases(client, "inst-a", cluster.Options{}),
-		Publisher: newRecorder(), Replier: newRecorder(),
+		Publisher: newRecorder(), Replier: replies,
 		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
 	})
+	answering, stop := context.WithCancel(context.Background())
+	stopped := manager.Answer(answering)
 
-	// Spent by the time the command is done with, which is what a batch that ran to the
-	// end of its budget hands the last command in it.
-	spent, cancel := context.WithCancel(context.Background())
-	cancel()
-
-	var acked bool
+	var acked atomic.Bool
 	delivery := &transport.Delivery{
-		Command: protocol.Command{V: protocol.Version, ID: "c1", Type: protocol.CommandAdminPing, SID: "s1"},
+		Command: protocol.Command{
+			V: protocol.Version, ID: "c1", Type: protocol.CommandAdminPing, SID: "s1", ReplyTo: "wa:reply:1",
+		},
 		Ack: func(ctx context.Context) error {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			acked = true
+			acked.Store(true)
 			return nil
 		},
 		Release: func() { t.Error("a command that was carried out was given back instead of retired") },
 	}
-	manager.Dispatch(spent, delivery)
+	manager.Dispatch(delivery)
 
-	if !acked {
-		t.Fatal("the acknowledgement was refused by the budget the command had already outlived")
+	<-replies.entered
+	stop()
+	close(replies.gate)
+	<-stopped
+
+	if !replies.alive.Load() {
+		t.Error("the answer was cut by the goroutine being stopped, leaving its caller nothing")
+	}
+	if !acked.Load() {
+		t.Fatal("the acknowledgement was refused by a context the command had already outlived")
+	}
+}
+
+// gatedReplier answers only once the test lets it, and records whether the context it
+// was given was still live by then.
+// The reply and the acknowledgement bound their own work already, so a shutdown landing
+// mid-answer cannot cut either. The adoption is the one step that does not: it derives
+// its deadline from whatever context it was handed, so under the worker's own it would be
+// cancelled the moment the instance began to stop -- between reading the device store and
+// taking the lease, which is a session half-opened on an instance that is going away.
+func TestAnAdoptionBeingCarriedOutIsNotCutShortByTheInstanceStopping(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+
+	store := &gatedEngine{entered: make(chan struct{}), gate: make(chan struct{})}
+	manager := session.NewManager(&session.ManagerConfig{
+		Instance: "inst-a", Engine: store, Leases: cluster.NewLeases(client, "inst-a", cluster.Options{}),
+		Publisher: newRecorder(), Replier: &quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	answering, stop := context.WithCancel(context.Background())
+	stopped := manager.Answer(answering)
+
+	manager.Dispatch(&transport.Delivery{
+		Command: protocol.Command{
+			V: protocol.Version, ID: "c1", Type: protocol.CommandSessionWake, SID: "s1",
+		},
+		Ack:     func(context.Context) error { return nil },
+		Release: func() {},
+	})
+
+	<-store.entered
+	stop()
+	close(store.gate)
+	<-stopped
+
+	if !store.alive.Load() {
+		t.Fatal("the adoption saw its context already cancelled, want it carried out to the end")
+	}
+}
+
+// gatedEngine holds an adoption open until the test says so, and records whether the
+// context it was opened under was still alive by then.
+type gatedEngine struct {
+	entered chan struct{}
+	gate    chan struct{}
+	alive   atomic.Bool
+	once    sync.Once
+	events  chan engine.Emission
+}
+
+func (e *gatedEngine) Open(ctx context.Context, _ string) (engine.Session, error) {
+	e.once.Do(func() { close(e.entered) })
+	<-e.gate
+	e.alive.Store(ctx.Err() == nil)
+	e.events = make(chan engine.Emission)
+	return e, nil
+}
+
+func (e *gatedEngine) Events() <-chan engine.Emission                       { return e.events }
+func (e *gatedEngine) Connect(context.Context, engine.ConnectRequest) error { return nil }
+func (e *gatedEngine) Disconnect(context.Context) error                     { return nil }
+func (e *gatedEngine) Logout(context.Context) error                         { return nil }
+
+func (e *gatedEngine) Execute(context.Context, *protocol.Command) (json.RawMessage, error) {
+	return json.RawMessage(`{}`), nil
+}
+
+func (e *gatedEngine) Close() error {
+	close(e.events)
+	return nil
+}
+
+type quietReplier struct{}
+
+func (quietReplier) Reply(context.Context, string, protocol.Reply) error { return nil }
+
+type gatedReplier struct {
+	entered chan struct{}
+	gate    chan struct{}
+	alive   atomic.Bool
+	once    sync.Once
+}
+
+func (g *gatedReplier) Reply(ctx context.Context, _ string, _ protocol.Reply) error {
+	g.once.Do(func() { close(g.entered) })
+	<-g.gate
+	g.alive.Store(ctx.Err() == nil)
+	return nil
+}
+
+// The one state this queue adds: a command the manager owns arriving with nowhere to put
+// it. Left pending, never refused and never retired.
+//
+// Which way it goes matters most for the wake. Acknowledged, it retires the only thing
+// that would have started the session, and the account stays unowned until a client
+// happens to send another command; refused, its caller is told the instance is busy,
+// which is true and is not what it asked. Released, the entry keeps its age and a later
+// pass hands it to whoever has room -- this instance once it has caught up, or a peer.
+func TestACommandTheManagerCannotQueueIsLeftPending(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+
+	// One slot and nothing running to empty it, so the second command finds it full.
+	// Deliberately without Answer: this is about what the dispatch does when the
+	// goroutine has not caught up, and starting it would race the assertion.
+	manager := session.NewManager(&session.ManagerConfig{
+		Instance: "inst-a", Engine: fake.New(), Leases: cluster.NewLeases(client, "inst-a", cluster.Options{}),
+		Publisher: newRecorder(), Replier: newRecorder(), AnswerDepth: 1,
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+
+	held := &transport.Delivery{
+		Command: protocol.Command{V: protocol.Version, ID: "c1", Type: protocol.CommandSessionWake, SID: "s1"},
+		Ack:     func(context.Context) error { t.Error("a wake nobody carried out was retired"); return nil },
+	}
+	var acked, released, forfeited atomic.Bool
+	turned := &transport.Delivery{
+		Command: protocol.Command{V: protocol.Version, ID: "c2", Type: protocol.CommandSessionWake, SID: "s2"},
+		Ack:     func(context.Context) error { acked.Store(true); return nil },
+		Release: func() { released.Store(true) },
+		Forfeit: func() { forfeited.Store(true) },
+	}
+
+	manager.Dispatch(held)
+	manager.Dispatch(turned)
+
+	if !released.Load() {
+		t.Fatal("a command with nowhere to be queued was not given back, so nothing will reclaim it")
+	}
+	if acked.Load() {
+		t.Fatal("a command nobody carried out was retired")
+	}
+	// Released and not forfeited: this instance did not take a turn at it, so it keeps
+	// the age that decides which entry a reclaim reaches first.
+	if forfeited.Load() {
+		t.Fatal("a command that was never attempted lost the age it had not spent")
+	}
+	if got := manager.Count(); got != 0 {
+		t.Fatalf("the manager adopted %d sessions without its own goroutine running", got)
+	}
+}
+
+// Everything still waiting when the instance stops is given back rather than dropped: a
+// delivery this process forgets about while still holding it is one no reclaim can take.
+func TestCommandsStillQueuedWhenTheInstanceStopsAreGivenBack(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+
+	// Held on the first command, so the second is still in the queue when the stop lands.
+	replies := &gatedReplier{entered: make(chan struct{}), gate: make(chan struct{})}
+	manager := session.NewManager(&session.ManagerConfig{
+		Instance: "inst-a", Engine: fake.New(), Leases: cluster.NewLeases(client, "inst-a", cluster.Options{}),
+		Publisher: newRecorder(), Replier: replies,
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	answering, stop := context.WithCancel(context.Background())
+	stopped := manager.Answer(answering)
+
+	ping := func(id string) *transport.Delivery {
+		return &transport.Delivery{
+			Command: protocol.Command{
+				V: protocol.Version, ID: id, Type: protocol.CommandAdminPing, SID: "s1", ReplyTo: "wa:reply:1",
+			},
+			Ack: func(context.Context) error { return nil },
+		}
+	}
+	var released atomic.Bool
+	waiting := ping("c2")
+	waiting.Release = func() { released.Store(true) }
+
+	manager.Dispatch(ping("c1"))
+	<-replies.entered
+	manager.Dispatch(waiting)
+
+	stop()
+	close(replies.gate)
+	<-stopped
+
+	if !released.Load() {
+		t.Fatal("a command still queued when the instance stopped was dropped while this process still held it")
 	}
 }
 
@@ -662,28 +881,30 @@ func TestAWakeThatCouldNotBeAdoptedStaysPending(t *testing.T) {
 		Publisher: newRecorder(), Replier: newRecorder(),
 		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
 	})
+	answering(t, manager)
 
-	acked, released, forfeited := false, false, false
+	var acked, released, forfeited atomic.Bool
 	delivery := &transport.Delivery{
 		Command: protocol.Command{V: protocol.Version, ID: "c1", Type: protocol.CommandSessionWake, SID: "s1"},
-		Ack:     func(context.Context) error { acked = true; return nil },
-		Release: func() { released = true },
-		Forfeit: func() { forfeited = true },
+		Ack:     func(context.Context) error { acked.Store(true); return nil },
+		Release: func() { released.Store(true) },
+		Forfeit: func() { forfeited.Store(true) },
 	}
-	manager.Dispatch(context.Background(), delivery)
+	manager.Dispatch(delivery)
 
-	if acked {
-		t.Fatal("a wake nobody could act on was acknowledged, so nothing will retry it")
-	}
-	if got := manager.Count(); got != 0 {
-		t.Fatalf("the manager runs %d sessions after a refused adoption", got)
-	}
 	// Given back the way an instance that took its turn gives it back. Released instead,
 	// it keeps the age that makes it the oldest entry pending, so this instance takes it
 	// first on the next pass, and again — and every wake behind it, which is every other
 	// session nobody is running, never gets a turn.
-	if released || !forfeited {
-		t.Fatalf("the wake was released=%v forfeited=%v, want forfeited", released, forfeited)
+	waitFor(t, "the wake to be given back", forfeited.Load)
+	if acked.Load() {
+		t.Fatal("a wake nobody could act on was acknowledged, so nothing will retry it")
+	}
+	if released.Load() {
+		t.Fatal("the wake was released, which keeps the age that makes it the oldest entry pending")
+	}
+	if got := manager.Count(); got != 0 {
+		t.Fatalf("the manager runs %d sessions after a refused adoption", got)
 	}
 }
 
@@ -789,7 +1010,7 @@ func TestAnAdoptedSessionOutlivesTheBoundOnItsAdoption(t *testing.T) {
 
 	// Still running, not merely still counted.
 	acked := atomic.Bool{}
-	manager.Dispatch(context.Background(), status("c-after", "s1", &acked))
+	manager.Dispatch(status("c-after", "s1", &acked))
 	waitUntil(t, "the session to answer a command after the adoption context ended", func() bool {
 		return manager.Count() == 1 && !acked.Load()
 	})
@@ -898,12 +1119,12 @@ func TestStoppingASessionLetsGoOfWhatWasStillQueued(t *testing.T) {
 	running := status("c1", "s1", &releasedFirst)
 	queued := status("c2", "s1", &releasedSecond)
 
-	manager.Dispatch(ctx, running)
+	manager.Dispatch(running)
 	// The executor has to have taken the first one, or the second is not behind it.
 	waitUntil(t, "the first command to reach the engine", func() bool {
 		return manager.Count() == 1 && held.taken()
 	})
-	manager.Dispatch(ctx, queued)
+	manager.Dispatch(queued)
 
 	manager.StopAll(ctx)
 
@@ -952,7 +1173,7 @@ func TestACommandRunningWhenItsSessionStopsIsStillRetired(t *testing.T) {
 		Release: func() { t.Error("a command that ran was given back instead of retired") },
 	}
 
-	manager.Dispatch(ctx, running)
+	manager.Dispatch(running)
 	waitUntil(t, "the command to reach the engine", func() bool {
 		return manager.Count() == 1 && held.taken()
 	})
@@ -1364,6 +1585,7 @@ func TestAWakeRefusedByThisInstancesOwnStaleLeaseStaysPending(t *testing.T) {
 		Publisher: newRecorder(), Replier: newRecorder(),
 		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
 	})
+	answering(t, manager)
 	ctx := context.Background()
 
 	if _, err := manager.Adopt(ctx, "s1"); err != nil {
@@ -1392,13 +1614,11 @@ func TestAWakeRefusedByThisInstancesOwnStaleLeaseStaysPending(t *testing.T) {
 		Ack:     func(context.Context) error { acked.Store(true); return nil },
 		Release: func() { released.Store(true) },
 	}
-	manager.Dispatch(ctx, wake)
+	manager.Dispatch(wake)
 
+	waitFor(t, "the wake to be let go of", released.Load)
 	if acked.Load() {
 		t.Fatal("the wake was retired on the word of a lease this instance is still handing back")
-	}
-	if !released.Load() {
-		t.Fatal("the wake was neither carried out nor let go of, so nothing will reclaim it")
 	}
 }
 
@@ -1670,7 +1890,7 @@ func TestARedeliveredSendIsAnsweredWithoutSendingAgain(t *testing.T) {
 			"content":{"type":"text","body":"oi"}}`),
 	}
 	var acked atomic.Bool
-	h.manager.Dispatch(ctx, delivery(send, &acked))
+	h.manager.Dispatch(delivery(send, &acked))
 	waitFor(t, "the send to be answered", func() bool { _, ok := h.recorder.reply("c1"); return ok })
 	first, _ := h.recorder.reply("c1")
 
@@ -1680,7 +1900,7 @@ func TestARedeliveredSendIsAnsweredWithoutSendingAgain(t *testing.T) {
 	redelivered.ID = "c2"
 	redelivered.ReplyTo = "c2"
 	var ackedAgain atomic.Bool
-	h.manager.Dispatch(ctx, delivery(&redelivered, &ackedAgain))
+	h.manager.Dispatch(delivery(&redelivered, &ackedAgain))
 	waitFor(t, "the redelivery to be answered", func() bool { _, ok := h.recorder.reply("c2"); return ok })
 	second, _ := h.recorder.reply("c2")
 
@@ -1714,7 +1934,7 @@ func TestACommandThatFailedIsNotRememberedAsDone(t *testing.T) {
 			"content":{"type":"text","body":"oi"}}`),
 	}
 	var acked atomic.Bool
-	h.manager.Dispatch(ctx, delivery(send, &acked))
+	h.manager.Dispatch(delivery(send, &acked))
 	waitFor(t, "the send to be refused", func() bool { _, ok := h.recorder.reply("c1"); return ok })
 	if reply, _ := h.recorder.reply("c1"); reply.OK {
 		t.Fatal("the fake accepted a send on a session that is not connected")
@@ -1728,7 +1948,7 @@ func TestACommandThatFailedIsNotRememberedAsDone(t *testing.T) {
 	retry.ID = "c2"
 	retry.ReplyTo = "c2"
 	var ackedAgain atomic.Bool
-	h.manager.Dispatch(ctx, delivery(&retry, &ackedAgain))
+	h.manager.Dispatch(delivery(&retry, &ackedAgain))
 	waitFor(t, "the retry to be answered", func() bool { _, ok := h.recorder.reply("c2"); return ok })
 
 	if reply, _ := h.recorder.reply("c2"); !reply.OK {
@@ -1758,14 +1978,14 @@ func TestACommandIsKeyedByWhateverNamesItOnlyOnce(t *testing.T) {
 		IdempotencyKey: "logout-once", Payload: json.RawMessage(`{}`),
 	}
 	var acked atomic.Bool
-	h.manager.Dispatch(ctx, delivery(logout, &acked))
+	h.manager.Dispatch(delivery(logout, &acked))
 	waitFor(t, "the logout to be answered", func() bool { _, ok := h.recorder.reply("c1"); return ok })
 
 	redelivered := *logout
 	redelivered.ID = "c2"
 	redelivered.ReplyTo = "c2"
 	var ackedAgain atomic.Bool
-	h.manager.Dispatch(ctx, delivery(&redelivered, &ackedAgain))
+	h.manager.Dispatch(delivery(&redelivered, &ackedAgain))
 	waitFor(t, "the redelivery to be answered", func() bool { _, ok := h.recorder.reply("c2"); return ok })
 
 	if reply, _ := h.recorder.reply("c2"); !reply.OK {
@@ -1800,7 +2020,7 @@ func TestASideEffectWithNoKeyOfItsOwnIsKeyedByTheCommandItArrivedAs(t *testing.T
 	}
 	for i := range 2 {
 		var acked atomic.Bool
-		h.manager.Dispatch(ctx, delivery(logout, &acked))
+		h.manager.Dispatch(delivery(logout, &acked))
 		waitFor(t, fmt.Sprintf("delivery %d to be retired", i+1), acked.Load)
 	}
 
@@ -1829,7 +2049,7 @@ func TestAQuestionIsAskedAgainRatherThanAnsweredFromARecord(t *testing.T) {
 		Payload: json.RawMessage(`{}`),
 	}
 	var acked atomic.Bool
-	h.manager.Dispatch(ctx, delivery(status, &acked))
+	h.manager.Dispatch(delivery(status, &acked))
 	waitFor(t, "the first question to be retired", acked.Load)
 	if first, _ := h.recorder.reply("c1"); !bytes.Contains(first.Result, []byte(`"close"`)) {
 		t.Fatalf("an unconnected session first reported %s", first.Result)
@@ -1840,7 +2060,7 @@ func TestAQuestionIsAskedAgainRatherThanAnsweredFromARecord(t *testing.T) {
 		t.Fatalf("Connect: %v", err)
 	}
 	var ackedAgain atomic.Bool
-	h.manager.Dispatch(ctx, delivery(status, &ackedAgain))
+	h.manager.Dispatch(delivery(status, &ackedAgain))
 	waitFor(t, "the second question to be retired", ackedAgain.Load)
 
 	second, _ := h.recorder.reply("c1")
@@ -1869,7 +2089,7 @@ func TestACommandWhoseRecordCannotBeReadIsHandedBackRatherThanRun(t *testing.T) 
 		Payload: json.RawMessage(`{}`),
 	}, &acked)
 	handed.Forfeit = func() { forfeited.Store(true) }
-	h.manager.Dispatch(ctx, handed)
+	h.manager.Dispatch(handed)
 
 	waitFor(t, "the command to be handed back", forfeited.Load)
 	if acked.Load() {
@@ -1910,7 +2130,7 @@ func TestACommandCutOffByTheSessionEndingIsHandedBack(t *testing.T) {
 		Payload: json.RawMessage(`{"message_id":"m1","to":{"kind":"phone","id":"5511999999999"},"content":{"type":"text","body":"oi"}}`),
 	}, &acked)
 	handed.Forfeit = func() { forfeited.Store(true) }
-	h.manager.Dispatch(ctx, handed)
+	h.manager.Dispatch(handed)
 
 	// In flight before the session is taken away, or the command never reaches the
 	// engine and the test proves only that a queued delivery is released.
@@ -1953,7 +2173,7 @@ func TestASendThatLandedAsTheSessionEndedIsStillAnswered(t *testing.T) {
 		Payload: json.RawMessage(`{"message_id":"m1","to":{"kind":"phone","id":"5511999999999"},"content":{"type":"text","body":"oi"}}`),
 	}, &acked)
 	handed.Forfeit = func() { forfeited.Store(true) }
-	h.manager.Dispatch(ctx, handed)
+	h.manager.Dispatch(handed)
 
 	waitFor(t, "the send to reach the engine", func() bool { return len(engineSession.Commands()) == 1 })
 	h.manager.Release(ctx, "s1")
@@ -1991,7 +2211,7 @@ func TestARecordRefusedOnceIsStillWritten(t *testing.T) {
 		Payload: json.RawMessage(`{}`),
 	}
 	var acked atomic.Bool
-	h.manager.Dispatch(ctx, delivery(logout, &acked))
+	h.manager.Dispatch(delivery(logout, &acked))
 	waitFor(t, "the logout to be retired", acked.Load)
 	if got := h.ledger.attempts(); got < 3 {
 		t.Fatalf("the record was attempted %d times, want the refusals to have been tried past", got)
@@ -2000,7 +2220,7 @@ func TestARecordRefusedOnceIsStillWritten(t *testing.T) {
 	// The same frame again, which is what the transport hands back. It is answered from
 	// the record the retry managed to write.
 	var ackedAgain atomic.Bool
-	h.manager.Dispatch(ctx, delivery(logout, &ackedAgain))
+	h.manager.Dispatch(delivery(logout, &ackedAgain))
 	waitFor(t, "the redelivery to be retired", ackedAgain.Load)
 	if got := engineSession.LoggedOut(); got != 1 {
 		t.Fatalf("the account was logged out %d times, want once", got)
