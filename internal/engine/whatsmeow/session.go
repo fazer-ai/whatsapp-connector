@@ -315,6 +315,13 @@ type Session struct {
 	// A seam for the same reason as the ones below it: nil is the real one.
 	privacyKnown func(context.Context) error
 
+	// held is told when a message is found unreadable and given a window, with the id
+	// and the instant the window starts from. A seam because that instant is the one
+	// thing about this path that reaches nothing else: the placeholder row carries it
+	// but is deleted as soon as the message turns up, so anything watching from outside
+	// is racing a row that lives for about a second. Nil is the real one.
+	held func(messageID string, learnedAt int64)
+
 	// groupMode is how a group addresses its members, which decides the namespace a
 	// message key in it names a sender by. A field because reading it is a round trip to
 	// WhatsApp, and a test cannot otherwise reach either branch of what depends on it.

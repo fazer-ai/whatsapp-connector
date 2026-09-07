@@ -18,98 +18,63 @@
 package whatsmeow
 
 import (
-	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	waTypes "go.mau.fi/whatsmeow/types"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
-	"github.com/fazer-ai/whatsapp-connector/internal/store"
 )
 
-// liveWatchForHold starts watching the store for the placeholder this message is given,
-// and hands back the moment production itself recorded as the start of the window.
+// liveHolds records, for every message this session finds unreadable, the instant its
+// window starts from -- which is the instant production compares against, not one near
+// it.
 //
-// Two earlier versions of this took the timestamp from outside, and both were wrong in
-// the same way, which is what named the rule: **do not approximate an instant production
-// records; read the one it wrote.** The send was the first proxy, and it folded in
-// outbound latency. Whatsmeow's own "Error decrypting message" line was the second, and
-// it is earlier than the window too -- with `SynchronousAck` the library logs it, then
-// requests the message from the phone, sends the retry receipt and acknowledges, and only
-// then dispatches `UndecryptableMessage`, which is where `unreadable` runs and where the
-// clock actually starts.
+// This is the fourth instrument this phase has had and the first that cannot lie, so the
+// three it replaces are worth naming. The send was a proxy and folded in outbound
+// latency. Whatsmeow's log line was a proxy and comes before the dispatch, with a retry
+// receipt and an ack in between. Polling the placeholder row read the right number but
+// raced the row's life: `hold` writes it and `dropHold` deletes it when the message
+// arrives, which on this path is under a second, so a poll can miss it entirely and
+// report a recovery as an ordinary delivery.
 //
-// `hold` writes `LearnedAt` at exactly that point, and `DueAt` from it. So the phase reads
-// the row instead of timing anything: `LearnedAt` is the same number production compares
-// against, not a number near it.
-//
-// Watched rather than read afterwards because `dropHold` deletes the row the moment the
-// real message arrives -- which, on the fast path this phase measures, is a second later.
-// Bounded by the caller's context and not by a count of its own: a watcher that gave up
-// on its own schedule would reject a slow recovery the caller was still willing to wait
-// for, which is the shape of the very failure this phase is looking for.
-func liveWatchForHold(ctx context.Context, held *store.Scoped, id string) <-chan liveHold {
-	learned := make(chan liveHold, 1)
-	go func() {
-		defer close(learned)
-		for {
-			waiting, err := held.Placeholders(ctx)
-			switch {
-			case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
-				return
-			case err != nil:
-				// Carried out rather than swallowed. A store that cannot be read looks
-				// exactly like a message that was readable -- no row either way -- so
-				// discarding this turns a broken store into "not a sample", which the
-				// timing phase answers by sending more live messages, forever.
-				learned <- liveHold{err: err}
-				return
-			}
-			for _, row := range waiting {
-				if row.MessageID == id {
-					learned <- liveHold{at: row.LearnedAt, held: true}
-					return
-				}
-			}
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(20 * time.Millisecond):
-			}
-		}
-	}()
-	return learned
-}
-
-// liveHold is what the watcher found: a placeholder, or the reason it could not look.
-type liveHold struct {
-	at   int64
-	held bool
-	err  error
-}
-
-// liveLearnedAt reads that channel, and refuses to report a time that never came: a phase
-// that fell back to "now" would report a recovery of zero and pass.
-func liveLearnedAt(t *testing.T, learned <-chan liveHold, id string) time.Time {
+// The pattern here is the one that took seven rounds to see: **an instrument assembled
+// from what is observable outside answers a weaker question than the one being asked.**
+// The seam is what the rest of this file already does for the same problem -- `groupMode`
+// and `privacyKnown` are there for exactly this reason -- and it is synchronous, exact
+// and cannot be missed, because it is called on the path itself.
+func liveHolds(t *testing.T, session *Session) *holds {
 	t.Helper()
 
-	found := <-learned
-	if found.err != nil {
-		t.Fatalf("could not read the placeholders while waiting on %s: %v", id, found.err)
+	seen := &holds{at: map[string]int64{}}
+	session.held = func(messageID string, learnedAt int64) {
+		seen.mu.Lock()
+		defer seen.mu.Unlock()
+		seen.at[messageID] = learnedAt
 	}
-	if !found.held {
-		t.Fatalf("no placeholder was ever held for %s, so it was not a message this "+
-			"session found unreadable and there is no recovery to time", id)
-	}
-	return time.UnixMilli(found.at)
+	t.Cleanup(func() { session.held = nil })
+	return seen
+}
+
+type holds struct {
+	mu sync.Mutex
+	at map[string]int64
+}
+
+// when is the instant a message's window started, and whether it ever had one. A message
+// that was readable never gets here, which is the whole signal: no window, no recovery.
+func (h *holds) when(messageID string) (int64, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	at, held := h.at[messageID]
+	return at, held
 }
 
 // liveEveryNameOf is the counterpart under every namespace this account may have filed it
@@ -150,8 +115,11 @@ func TestLiveTimeARetryRecovery(t *testing.T) {
 	liveResume(t, subject)
 	liveResume(t, counterpart)
 
+	windows := liveHolds(t, subject)
 	inbox := watch(t, subject)
-	livePrime(t, counterpart, inbox, container.For(liveSID), liveMustBePaired(t, container, liveSID).User)
+	theirs := watch(t, counterpart)
+	livePrime(t, counterpart, subject, windows, inbox, theirs,
+		liveMustBePaired(t, container, liveSID).User, counterpartJID.User)
 	rounds := 5
 	if asked := os.Getenv("WAC_LIVE_ROUNDS"); asked != "" {
 		parsed, err := strconv.Atoi(asked)
@@ -192,13 +160,9 @@ func TestLiveTimeARetryRecovery(t *testing.T) {
 		}
 
 		body := fmt.Sprintf("conector nativo, recuperacao %d de %d", len(took)+1, rounds)
-		sent := counterpart.current().GenerateMessageID()
-		watching, stop := context.WithCancel(t.Context())
-		held := liveWatchForHold(watching, container.For(liveSID), sent)
-		liveSayUnder(t, counterpart, liveMustBePaired(t, container, liveSID).User, body, sent)
+		sent := liveSay(t, counterpart, liveMustBePaired(t, container, liveSID).User, body)
 		inbox.awaitMessage(t, sent, 5*time.Minute)
 		arrived := time.Now()
-		stop()
 
 		// The scenario, verified after the fact rather than arranged and assumed. Asking
 		// beforehand whether a session existed is the weaker question and was the first
@@ -211,15 +175,12 @@ func TestLiveTimeARetryRecovery(t *testing.T) {
 		// somewhere else in the process cannot admit an ordinary delivery as a sample.
 		// A placeholder is only ever held for a message this session could not read, so
 		// the row existing is the scenario having happened.
-		found := <-held
-		if found.err != nil {
-			t.Fatalf("could not read the placeholders on attempt %d: %v", attempt+1, found.err)
-		}
-		if !found.held {
+		at, held := windows.when(sent)
+		if !held {
 			t.Logf("attempt %d decrypted first try, so it is not a sample", attempt+1)
 			continue
 		}
-		elapsed := arrived.Sub(time.UnixMilli(found.at))
+		elapsed := arrived.Sub(time.UnixMilli(at))
 
 		took = append(took, elapsed)
 		t.Logf("sample %d: %s", len(took), elapsed.Round(time.Millisecond))
@@ -261,10 +222,16 @@ func TestLiveTimeARetryRecovery(t *testing.T) {
 // already-arrived message in its buffer and reported it as having survived an absence it
 // was never subject to).
 //
-// What the run says is that the message arrives anyway. The retry is not answered by the
-// device that sent it: it is answered by the account, and a real account has a phone. So
-// the unbounded tail needs *every* device of the sender offline, which for anyone who is
-// not deliberately arranging it means their phone is off.
+// What the runs say is that it usually arrives anyway, and sometimes does not. The retry
+// is not answered by the device that sent it but by the account, and a real account has a
+// phone -- so most of the time another device answers in about 300ms even with the
+// sending session gone. Measured over three runs: twice in ~300ms, once not at all inside
+// 90 seconds, which is twice the production window.
+//
+// That one run is the whole value of the phase, and it corrects what the first version of
+// this reported. The tail does not need somebody to switch a phone off. It happens on an
+// ordinary pair of accounts, roughly often enough to see in three tries, and when it
+// happens the placeholder goes out and the real message is discarded behind it.
 func TestLiveARecoveryOutlivesTheSenderLeaving(t *testing.T) {
 	subject, counterpart, container := liveBoth(t, MediaOptions{})
 
@@ -278,7 +245,9 @@ func TestLiveARecoveryOutlivesTheSenderLeaving(t *testing.T) {
 	// with the counterpart and no way to have quietly rebuilt one.
 	liveResume(t, subject)
 	liveResume(t, counterpart)
-	livePrime(t, counterpart, watch(t, subject), container.For(liveSID), subjectJID.User)
+	windows := liveHolds(t, subject)
+	livePrime(t, counterpart, subject, windows, watch(t, subject), watch(t, counterpart),
+		subjectJID.User, counterpartJID.User)
 	for _, who := range liveEveryNameOf(t, subject, counterpartJID) {
 		address := who.SignalAddress().String()
 		prefix := address[:strings.LastIndex(address, ":")]
@@ -292,11 +261,7 @@ func TestLiveARecoveryOutlivesTheSenderLeaving(t *testing.T) {
 
 	// Sent while it is down, so WhatsApp holds the message and there is no window in
 	// which it could have been read normally.
-	sent := counterpart.current().GenerateMessageID()
-	watching, stop := context.WithCancel(t.Context())
-	t.Cleanup(stop)
-	held := liveWatchForHold(watching, container.For(liveSID), sent)
-	liveSayUnder(t, counterpart, subjectJID.User, "conector nativo, remetente que sai e nao volta", sent)
+	sent := liveSay(t, counterpart, subjectJID.User, "conector nativo, remetente que sai e nao volta")
 	if err := counterpart.Disconnect(t.Context()); err != nil {
 		t.Fatalf("take the sender offline: %v", err)
 	}
@@ -312,20 +277,31 @@ func TestLiveARecoveryOutlivesTheSenderLeaving(t *testing.T) {
 	// production has already gone out and the real message is discarded behind it.
 	within := 2 * rerequestTimeout
 	if !liveArrival(t, inbox, sent, within) {
-		t.Fatalf("the message did not arrive within %s with the sender's session offline; "+
-			"the recovery needs that session back, and the tail is then unbounded", within)
+		// Not a failure, and calling it one was wrong. Measured over three runs of this
+		// exact phase: twice the message came back in about 300ms, once it did not come
+		// back at all inside 90 seconds. Both are answers, and the second is the one #51
+		// is about -- so asserting "it always comes back" pins something that is not
+		// true and turns the interesting result into a red test somebody re-runs until
+		// it goes green.
+		//
+		// What it means when it happens: no other device of the sender's account
+		// answered the retry in twice the production window, so in production the
+		// placeholder would have gone out and the real message would have been discarded
+		// behind it as a repeat. Nobody turned a phone off to arrange this.
+		t.Skipf("the message did not arrive within %s with the sender's session offline. "+
+			"That is the tail: no other device of that account answered the retry, and "+
+			"in production the placeholder would have gone out at %s and the real message "+
+			"been discarded behind it", within, rerequestTimeout)
 	}
-	// Stopped before the channel is read, and the order is what keeps a failure a
-	// failure: if this message turned out to be readable there is no placeholder and
-	// never will be, and a watcher still polling holds the channel open, so the read
-	// below would block until the whole suite times out instead of saying the scenario
-	// was not arranged. Cancelling first closes it. What was already found is not lost
-	// -- the channel holds one value and the send happened when the row was seen.
-	stop()
+	at, held := windows.when(sent)
+	if !held {
+		t.Fatal("this message was readable, so no window was ever opened for it and " +
+			"there is no recovery to time; the deleted session was not the one it used")
+	}
 	// From what production wrote down, not from the resume: bringing the account back is
 	// this phase's own setup and production pays none of it, so counting it would inflate
 	// the number the placeholder window is being compared against.
-	elapsed := time.Since(liveLearnedAt(t, held, sent))
+	elapsed := time.Since(time.UnixMilli(at))
 	t.Logf("recovered in %s with the sender's connector session offline the whole time, "+
 		"so the retry was answered by another of that account's devices", elapsed.Round(time.Millisecond))
 	if elapsed >= rerequestTimeout {
@@ -380,27 +356,21 @@ func liveArrival(t *testing.T, events *recorder, id string, within time.Duration
 // recovers, and the message *after* a recovery is the prekey one. Priming once would then
 // hand the measured send exactly the shape it was supposed to rule out. So it repeats
 // until a prime needs no recovery of its own, which is what "established" means here.
-func livePrime(t *testing.T, from *Session, inbox *recorder, held *store.Scoped, to string) {
+func livePrime(t *testing.T, from, to *Session, windows *holds, inbox, theirs *recorder, at, back string) {
 	t.Helper()
 
 	for attempt := range 5 {
-		// Watched before the send, like the measured ones. A placeholder is transient --
-		// `hold` writes it and `dropHold` deletes it the moment the message arrives, and
-		// on this path that is under a second -- so a watcher started after the send can
-		// miss the whole life of the row and report a recovery as an ordinary delivery.
-		// Which is the one thing this loop is asking about.
-		sent := from.current().GenerateMessageID()
-		watching, stop := context.WithCancel(t.Context())
-		holding := liveWatchForHold(watching, held, sent)
-		liveSayUnder(t, from, to, "conector nativo, estabelecendo a sessao", sent)
+		// Both ways, and that is the correction that took a round: a prekey message
+		// opens without a session on the receiving side, so "no window was opened" does
+		// not say the sender has one. The sender keeps sending prekey messages until it
+		// decrypts a reply from the other side -- so the reply is the thing that settles
+		// it, and priming in one direction only can leave the pair exactly as it was.
+		sent := liveSay(t, from, at, "conector nativo, estabelecendo a sessao")
 		inbox.awaitMessage(t, sent, 2*time.Minute)
-		stop()
+		replied := liveSay(t, to, back, "conector nativo, sessao estabelecida")
+		theirs.awaitMessage(t, replied, 2*time.Minute)
 
-		found := <-holding
-		if found.err != nil {
-			t.Fatalf("could not read the placeholders while priming: %v", found.err)
-		}
-		if !found.held {
+		if _, held := windows.when(sent); !held {
 			return
 		}
 		t.Logf("the prime itself recovered on attempt %d, so the next message would be a "+

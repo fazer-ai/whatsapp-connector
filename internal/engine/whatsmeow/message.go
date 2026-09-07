@@ -763,6 +763,9 @@ func whyUnopened(event *waEvents.UndecryptableMessage, chat protocol.AddressKind
 // publishes the placeholder if it does not.
 func (s *Session) awaitOrPublish(message *protocol.InboundMessage, learned int64) {
 	due := learned + s.rerequestWait.Milliseconds()
+	if s.held != nil {
+		s.held(message.ID, learned)
+	}
 	s.hold(message, learned, due)
 	// Measured from the deadline that was written down, not from here. Holding the row
 	// is a store call and can take up to the store bound, and a window started after it
