@@ -55,9 +55,9 @@ events and commands with its clients over Redis Streams.
 > both on a reconnect, so the session remembers the availability it was asked for and puts
 > it back as soon as a connection comes up. Subscriptions are deliberately not reapplied:
 > which parties are worth watching is the client's to know, and `session.state: open` is
-> where it re-establishes them. The memory belongs to the session, so it does not follow
-> the account to another instance
-> ([#72](https://github.com/fazer-ai/whatsapp-connector/issues/72)).
+> where it re-establishes them. The availability is kept next to the account rather than
+> in the session, so an instance that takes the account over puts back the state its
+> client asked for without having heard the command.
 >
 > A message is acknowledged to WhatsApp only after its event reaches the stream, so
 > losing Redis costs a redelivery and never a message. The client deduplicates on the
@@ -220,7 +220,7 @@ restart, and reports itself healthy while doing it.
 |---|---|
 | **M0** ✅ | Skeleton, Redis Streams transport, lease/ownership port, fake engine, health and metrics, Docker image, publish pipeline |
 | **M1** ✅ | whatsmeow engine: QR and code pairing, session state, logout/ban/outdated handling, the device store. A session that has been handed on writes nothing more: every write a device can make is refused from the moment this instance stops owning it, whichever context it arrives with, and the fence asks the lease rather than this instance's own belief -- so a claim that ran out while nobody was looking stops the writes too. Reconnect backoff is still open |
-| **M2** ✅ | Messages in and out (text, media, location, contact, reaction, edit, revoke, quoted, mentions), receipts, read marks, chat presence, account presence, idempotent sends. All of them are in both ways, and a body this build has no arm for arrives as a placeholder rather than disappearing. What it leaves behind is in the issues rather than here: an availability does not follow the account to its next owner ([#72](https://github.com/fazer-ai/whatsapp-connector/issues/72)) |
+| **M2** ✅ | Messages in and out (text, media, location, contact, reaction, edit, revoke, quoted, mentions), receipts, read marks, chat presence, account presence, idempotent sends. All of them are in both ways, and a body this build has no arm for arrives as a placeholder rather than disappearing, and one WhatsApp masked from every linked device says so rather than reading as a type this build cannot render. What it leaves behind is in the issues rather than here: a presence state is dropped when the publisher has stopped answering and the queue is full ([#47](https://github.com/fazer-ai/whatsapp-connector/issues/47)), and one delayed across a reconnect is published as if it were fresh ([#49](https://github.com/fazer-ai/whatsapp-connector/issues/49)) |
 | **M3** | Groups, contacts, calls |
 | **M4** | Multi-instance under load, quarantine, metrics/lag/DLQ, operations docs |
 | **M5** | Pairing code, passkey relay, per-session proxy, account limits |
