@@ -40,12 +40,14 @@ internal/media/      blob store, inbound download, outbound fetch
   updating a fixture in `contract/fixtures/`, and updating `internal/protocol`. The
   contract test fails when a frame **type** has no fixture, when a fixture names a type
   this build does not know, or when a fixture does not validate against the schema.
-- Values **inside** a payload are held to the schema, not to the fixtures: an enum's
-  catalogue in `internal/protocol` and its enum in the schema must match exactly, and
-  there is no fixture per value. A fixture pins a frame's shape, and one
-  `command.failed` has the same shape whichever error code it carries -- a file per
-  value would multiply what a change to that shape costs a vendoring client without
-  multiplying what it proves.
+- Values **inside** a payload are held to the schema, not to the fixtures: every enum
+  with a catalogue in `internal/protocol` (`AllErrorCodes`, `AllMediaKinds`, and the
+  rest) is compared against its enum in the schema, exactly, and there is no fixture per
+  value. A fixture pins a frame's shape, and one `command.failed` has the same shape
+  whichever error code it carries -- a file per value would multiply what a change to
+  that shape costs a vendoring client without multiplying what it proves. A new enum
+  gets a catalogue and a row in `TestPayloadEnumsMatchSchema`; one the Go side carries
+  as a plain string is not checked, and the test names which those are.
 - **Additive changes** (a new event type, a new optional field) do not bump
   `contract/PROTOCOL_VERSION`. Clients are written to ignore what they do not know.
 - **Breaking changes** bump it, and the connector keeps serving the previous major

@@ -374,3 +374,38 @@ type UnsupportedContent struct {
 func Unsupported(reason UnsupportedReason) UnsupportedContent {
 	return UnsupportedContent{Type: "unsupported", Reason: reason}
 }
+
+// The catalogues below are what TestPayloadEnumsMatchSchema walks. A value added to one
+// of these types and not to its enum in `contract/schema/protocol.schema.json` -- or the
+// other way round -- is a client and a connector disagreeing about what may travel, and
+// the catalogue is what makes that difference visible to a test rather than to a
+// deployment.
+
+// AllAddressKinds lists every kind of address a canonical address can name.
+var AllAddressKinds = []AddressKind{
+	AddressPhone, AddressLID, AddressGroup, AddressNewsletter, AddressBroadcast, AddressStatus,
+}
+
+// AllMediaKinds lists every kind of media a message can carry.
+var AllMediaKinds = []MediaKind{MediaImage, MediaVideo, MediaAudio, MediaDocument, MediaSticker}
+
+// AllMediaRefKinds lists every way a media reference can say where a file is.
+var AllMediaRefKinds = []MediaRefKind{MediaRefURL, MediaRefConnectorBlob, MediaRefUazapiMessage}
+
+// AllRevokedBy lists who can have revoked a message.
+var AllRevokedBy = []RevokedBy{RevokedByContact, RevokedBySelf}
+
+// AllReceiptKinds lists every receipt a message can collect.
+var AllReceiptKinds = []ReceiptKind{ReceiptDelivered, ReceiptRead, ReceiptPlayed, ReceiptFailed}
+
+// AllTypingStates lists every state a chat presence can be in.
+var AllTypingStates = []TypingState{TypingComposing, TypingRecording, TypingPaused}
+
+// AllPresenceStates lists every availability an account can publish.
+var AllPresenceStates = []PresenceState{PresenceAvailable, PresenceUnavailable}
+
+// AllUnsupportedReasons lists every reason a message arrives without content.
+var AllUnsupportedReasons = []UnsupportedReason{
+	UnsupportedUnknownType, UnsupportedUndecryptable, UnsupportedUnavailable,
+	UnsupportedProtocol, UnsupportedEmpty,
+}

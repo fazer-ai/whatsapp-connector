@@ -127,6 +127,111 @@ func TestErrorCodesMatchSchema(t *testing.T) {
 	}
 }
 
+// Every enum a payload can carry, held to the schema the same way the error codes are.
+// A value added to the Go catalogue and not to the schema is a connector sending what
+// the client's validator rejects; added to the schema and not to Go, it is a client
+// sending what this build refuses to parse. Neither shows up in a fixture, because a
+// fixture pins a frame's shape and these are values inside one.
+//
+// The path is where the enum lives in the schema, so a definition that moves fails here
+// rather than silently checking nothing.
+//
+// What is not here is what has no catalogue to compare: the schema also enumerates a
+// ban's kind, a connection state, a group role, a member-add mode, a pairing method, a
+// wake's desired state and a mark-read type, and the Go side carries those as plain
+// strings. Giving one of them a type belongs with a catalogue and an entry below.
+func TestPayloadEnumsMatchSchema(t *testing.T) {
+	for name, enum := range map[string]struct {
+		known []string
+		path  []string
+	}{
+		"address kind": {
+			known: asStrings(protocol.AllAddressKinds),
+			path:  []string{"definitions", "address", "properties", "kind"},
+		},
+		"media kind": {
+			known: asStrings(protocol.AllMediaKinds),
+			path:  []string{"definitions", "content_media", "properties", "kind"},
+		},
+		"media ref kind": {
+			known: asStrings(protocol.AllMediaRefKinds),
+			path:  []string{"definitions", "media_ref", "properties", "kind"},
+		},
+		"revoked by": {
+			known: asStrings(protocol.AllRevokedBy),
+			path:  []string{"definitions", "event_message_revoked", "properties", "by"},
+		},
+		"receipt kind": {
+			known: asStrings(protocol.AllReceiptKinds),
+			path:  []string{"definitions", "event_message_receipt", "properties", "type"},
+		},
+		"typing state": {
+			known: asStrings(protocol.AllTypingStates),
+			path:  []string{"definitions", "event_chat_presence", "properties", "state"},
+		},
+		"presence state": {
+			known: asStrings(protocol.AllPresenceStates),
+			path:  []string{"definitions", "event_presence_update", "properties", "state"},
+		},
+		"unsupported reason": {
+			known: asStrings(protocol.AllUnsupportedReasons),
+			path:  []string{"definitions", "content_unsupported", "properties", "reason"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			if published := schemaEnum(t, enum.path); !reflect.DeepEqual(enum.known, published) {
+				t.Fatalf("%s drifted:\n go:     %v\n schema: %v", name, enum.known, published)
+			}
+		})
+	}
+}
+
+// asStrings is the catalogue as the schema spells it. The catalogues are typed, and the
+// enums they are compared against are plain strings.
+func asStrings[T ~string](catalogue []T) []string {
+	out := make([]string, 0, len(catalogue))
+	for _, value := range catalogue {
+		out = append(out, string(value))
+	}
+	return out
+}
+
+// schemaEnum reads one enum out of the schema by the path it lives at, and fails when
+// the path names nothing: a check that silently finds no enum is a check that passes on
+// an empty comparison.
+func schemaEnum(t *testing.T, path []string) []string {
+	t.Helper()
+
+	var document map[string]any
+	read(t, filepath.Join(contractDir, "schema", "protocol.schema.json"), &document)
+
+	var node any = document
+	for _, step := range path {
+		object, ok := node.(map[string]any)
+		if !ok {
+			t.Fatalf("%v is not an object at %q", path, step)
+		}
+		if node, ok = object[step]; !ok {
+			t.Fatalf("the schema has nothing at %v (missing %q)", path, step)
+		}
+	}
+	object, ok := node.(map[string]any)
+	if !ok {
+		t.Fatalf("the schema has no object at %v", path)
+	}
+	raw, ok := object["enum"].([]any)
+	if !ok {
+		t.Fatalf("the schema has no enum at %v", path)
+	}
+	published := make([]string, 0, len(raw))
+	for _, value := range raw {
+		published = append(published, value.(string))
+	}
+	return published
+}
+
 func TestNewErrorDegradesUnknownCode(t *testing.T) {
 	err := protocol.NewError("not_a_contract_code", "boom")
 	if err.Code != protocol.ErrorInternal {
