@@ -26,6 +26,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"slices"
 	"testing"
 	"time"
 
@@ -389,6 +390,104 @@ func liveRevokeOf(t *testing.T, events *recorder, target string, within time.Dur
 				t.Fatalf("unmarshal a message.revoked: %v", err)
 			}
 			if body.MessageID == target {
+				return true
+			}
+		case <-deadline:
+			return false
+		}
+	}
+}
+
+// TestLiveGroupReadKeyNamespace is the third place `asTheGroupAddresses` is called, and
+// the one the other two phases do not cover.
+//
+// It would be easy to carry the answer over from them: it is the same field, naming the
+// same person, in the same group. That is reasoning, and reasoning about this exact field
+// is what #35 exists to stop, so it is measured instead.
+//
+// It was expected to discriminate where the others do not: a reaction and a revoke are
+// stanzas that reach every member whatever the key says, while a read receipt is routed
+// to the author of the message being marked, so a participant naming the wrong person
+// looked like it would have nowhere to go. It does not discriminate -- the receipt
+// reaches the author in all three cases, the wrong member included. Written down because
+// it was a reasonable guess and the next person will have it too.
+//
+// What it does settle is the question #35 asks, for this call site: the participant in
+// the namespace the group does not use is resolved, the same as in the other two.
+func TestLiveGroupReadKeyNamespace(t *testing.T) {
+	subject, counterpart, container := liveBoth(t, MediaOptions{})
+
+	subjectJID := liveMustBePaired(t, container, liveSID)
+	counterpartJID := liveMustBePaired(t, container, liveCounterpartSID)
+
+	groups := engine.ConnectRequest{Pairing: "resume", Groups: true}
+	liveResumeAsking(t, subject, groups)
+	liveResumeAsking(t, counterpart, groups)
+
+	group := liveGroup(t, subject, counterpartJID)
+	mode := liveGroupMode(t, subject, group)
+	wrong := liveOtherNamespace(t, subject, counterpartJID, mode)
+
+	mine := watch(t, subject)
+	theirs := watch(t, counterpart)
+	for _, probe := range []struct {
+		name        string
+		participant protocol.Address
+		lying       bool
+		read        bool
+	}{
+		{name: "translated", participant: liveAddressOf(t, counterpartJID), read: true},
+		{name: "in the namespace the group does not use", participant: wrong, lying: true, read: true},
+		{name: "naming a member who did not send it", participant: liveAddressOf(t, subjectJID), read: true},
+	} {
+		t.Run(probe.name, func(t *testing.T) {
+			sent := liveSayTo(t, counterpart, protocol.Address{
+				Kind: protocol.AddressGroup, ID: group.User,
+			}, "conector nativo, marcar lido: "+probe.name)
+			mine.awaitMessage(t, sent, 2*time.Minute)
+
+			if probe.lying {
+				subject.groupMode = func(context.Context, waTypes.JID) (waTypes.AddressingMode, error) {
+					return liveOtherMode(mode), nil
+				}
+				t.Cleanup(func() { subject.groupMode = nil })
+			}
+			liveActOne(t, subject, protocol.CommandMessageMarkRead, map[string]any{
+				"chat":        map[string]any{"kind": "group", "id": group.User},
+				"message_ids": []string{sent},
+				"sender":      map[string]any{"kind": probe.participant.Kind, "id": probe.participant.ID},
+				"type":        "read",
+			})
+
+			if got := liveReceiptOn(t, theirs, sent, "read", 60*time.Second); got != probe.read {
+				t.Errorf("the author saw a read receipt: %v, want %v", got, probe.read)
+			}
+		})
+	}
+}
+
+// liveReceiptOn is whether a receipt of one type reached the message's author.
+func liveReceiptOn(t *testing.T, events *recorder, target, want string, within time.Duration) bool {
+	t.Helper()
+
+	deadline := time.After(within)
+	for {
+		select {
+		case emission, ok := <-events.seen:
+			if !ok {
+				t.Fatalf("the session ended while waiting on a receipt for %s", target)
+			}
+			if emission.Type != protocol.EventMessageReceipt {
+				continue
+			}
+			var body struct {
+				MessageIDs []string `json:"message_ids"`
+				Type       string   `json:"type"`
+			}
+			if err := json.Unmarshal(emission.Payload, &body); err != nil {
+				t.Fatalf("unmarshal a message.receipt: %v", err)
+			}
+			if body.Type == want && slices.Contains(body.MessageIDs, target) {
 				return true
 			}
 		case <-deadline:
