@@ -129,6 +129,15 @@ theirs, and the connector is always upgraded first.
   an older client had before that code existed. The Ruby classes are not a 1:1 mapping
   in either direction: some of them (`event_out_of_order`, `message_already_processing`)
   never travel, and they exist to be rescued rather than to be sent.
+- Four codes are published and never sent, so a client branching on them writes a branch
+  that never runs. `session_not_found` is not answered at all: a command for a session no
+  instance owns stays pending and its caller waits out its own deadline. `quarantined` has
+  no mechanism behind it; a session that keeps failing to connect goes on being retried.
+  `client_outdated` reaches a client as the `session.client_outdated` event instead, never
+  as a reply. `group_participant_not_allowed` waits on group commands the connector does
+  not implement yet, which are refused with `unsupported`. They stay in the enum because
+  removing one narrows what a client may already match on, and each is marked in
+  `internal/protocol/errors.go` with what arrives in its place.
 - Three of the codes are about *who* failed, and the distinction is what an operator
   reads first: `wa_error` is WhatsApp refusing, `provider_unavailable` is a dependency
   the command itself named -- the storage a `message.send` points its `ref.url` at --
