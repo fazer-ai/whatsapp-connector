@@ -149,7 +149,7 @@ func newDatabase(t *testing.T, server string) Target {
 		// reaches `sorry, too many clients already` instead, which fails tests outright
 		// rather than slowing their cleanup down. The queue in front of these two
 		// statements is the price of not being that.
-		adminDB.SetMaxOpenConns(4)
+		adminDB.SetMaxOpenConns(adminConns)
 	})
 	if adminErr != nil {
 		t.Fatalf("open %s: %v", AddressEnv, adminErr)
@@ -168,33 +168,31 @@ func newDatabase(t *testing.T, server string) Target {
 		ctx, cancel := context.WithTimeout(context.Background(), dropTimeout)
 		defer cancel()
 		if err := dropDatabase(ctx, adminDB, name); err != nil {
-			// Logged rather than failed, whatever went wrong. The test this belonged to
-			// has already passed or failed on its own merits, and the tidying up after it
-			// is not evidence about the code under test.
+			// Named as cleanup, because the failure this reaches for is not about the
+			// test it is attached to and reads exactly as if it were. #71 is a run where
+			// three tests with nothing in common failed a little past thirty seconds,
+			// and what they had in common was this line: they queue on the same four
+			// admin connections, and they give up together.
 			//
-			// What made #71 worth fixing is that the opposite reads as a bug in the
-			// suite: several unrelated tests giving up together a little past the bound,
-			// because they queue on the same four connections and time out at once.
-			// Measured on this suite, a run drops 539 databases, a drop costs around
-			// 700ms on an idle server and 2.5s with three suites on it, and two thirds of
-			// the time a cleanup spends is spent waiting for one of those connections.
+			// Measured on this suite against one server: a run drops 539 databases, a
+			// drop costs around 700ms on an idle server and 2.5s with three suites on
+			// it, the slowest under that load was 17.5s against a 30s bound, and two
+			// thirds of the time a cleanup spends is spent waiting for a connection
+			// rather than dropping anything.
 			//
-			// Telling that queue apart from a server in trouble was tried and given up
-			// on: every version of the question -- did the context expire, did the pool
-			// admit us, did the dial stall -- answers a different one, because both halves
-			// end on the same deadline and the client cannot see which side spent it. And
-			// it buys little. A server that goes away fails the tests themselves, whose
-			// `CREATE DATABASE` runs through this same pool; the only failure a silent
-			// teardown hides is one that arrives after the last test has finished, which
-			// is a failure about nothing.
-			//
-			// The database is left behind instead, which the naming was already built to
-			// survive: every name carries a random run id, so debris collides with
-			// nothing and the next run neither trips over it nor waits for it.
-			t.Logf("left %s behind: %v "+
-				"(`DROP DATABASE` what "+
-				`SELECT datname FROM pg_database WHERE datname LIKE 'wac\_%%' lists)`,
-				name, err)
+			// Left failing rather than logged, after trying the other way: `t.Logf` is
+			// kept by `go test` unless -v is passed, and neither `make test-postgres`
+			// nor CI passes it, so a quiet teardown would leave hundreds of databases
+			// behind across a run and say nothing. Between a red that explains itself
+			// and a green that hides a server filling up, the red is the one worth
+			// having.
+			t.Errorf("cleanup: could not drop %s within %s: %v\n"+
+				"\tthis is the harness tidying up, not the test above failing: %d admin "+
+				"connections are shared by every test that wants a database, and a busy "+
+				"server queues them\n"+
+				"\tleftovers: `DROP DATABASE` what "+
+				`SELECT datname FROM pg_database WHERE datname LIKE 'wac\_%%' lists`,
+				name, dropTimeout, err, adminConns)
 		}
 	})
 
@@ -231,12 +229,14 @@ func newDatabase(t *testing.T, server string) Target {
 //
 // Both are stripped. confirmRoute is what covers the ways in that are not on this list,
 // since a rule this strange is not one to trust an enumeration of.
-// dropTimeout bounds one cleanup. Long enough that only a server in real trouble
-// reaches it: the slowest drop measured under three concurrent suites was 17.5s.
-//
-// A variable rather than a constant so this package's own test can reach the branch
-// that ordinarily needs a machine under load to produce.
-var dropTimeout = 30 * time.Second
+// adminConns is how many connections the whole run may use to create and drop its
+// databases. Narrow on purpose, and it is the queue #71 is about; the comment where it is
+// set says what widening it costs.
+const adminConns = 4
+
+// dropTimeout bounds one cleanup. Long enough that only a server in real trouble reaches
+// it: the slowest drop measured under three concurrent suites was 17.5s.
+const dropTimeout = 30 * time.Second
 
 // dropDatabase removes one test's database.
 //
