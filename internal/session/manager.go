@@ -375,11 +375,14 @@ func (m *Manager) forgetOrphan(sid string) {
 // GiveBack hands a delivery back without carrying it out, and remembers that the session
 // it belongs to has an older entry pending again.
 //
-// A site gives a command back through here when the command may belong to a session this
-// instance runs and the site cannot say which -- the batch a read window cut short is the
-// one that cannot, since it holds whatever the last read returned. A site that does know
-// releases directly and says why: an offer refused by a session being stopped must not be
-// marked at all, and a wake carries no session's turn to keep.
+// What decides whether a site comes through here is not whether it knows which session
+// the command belongs to -- that question is easy and it misleads. The queue behind `own`
+// knows the sid of all three kinds it drains and only one of them may be marked. What
+// decides is whether this instance goes on reading that session's stream by `>`: if it
+// does, an older entry left pending there would be overtaken, and the mark is what stops
+// it. A site where the answer is no releases directly and says so: an offer refused by a
+// session being stopped is this instance letting the account go, and a wake rides the
+// control stream, where there is no per-session turn to keep.
 //
 // What decides here is the delivery itself: a wake and a ping live on the control stream,
 // so giving one back leaves nothing pending on a session's, and a command for a session
