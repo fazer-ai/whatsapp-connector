@@ -3,6 +3,7 @@ package cluster_test
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -410,7 +411,14 @@ func (h advancingClock) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
 func (h advancingClock) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
 	return func(ctx context.Context, cmds []redis.Cmder) error {
 		err := next(ctx, cmds)
-		h.clock.advance(h.by)
+		// Asked per command here too, and not once per batch. go-redis opens a connection
+		// with a pipeline of its own (`client` calls in a handshake), so a batch that
+		// advances the clock whatever is in it moves time for reasons the test never
+		// named -- and a test whose clock moves by itself passes without measuring what
+		// it says it measures.
+		if slices.ContainsFunc(cmds, h.on) {
+			h.clock.advance(h.by)
+		}
 		return err
 	}
 }
@@ -448,5 +456,37 @@ func TestARenewalIsDatedFromWhenItWasSent(t *testing.T) {
 	}
 	if _, owned := leases.Owned("s1"); owned {
 		t.Fatal("a lease renewed by a round trip that outlasted its fresh lifetime still counts as owned")
+	}
+}
+
+// The same for an acquisition, and with one more round trip inside it: Redis starts the
+// TTL when SETNX runs, and the epoch is read after that. A lease stamped once both have
+// answered is dated later than Redis dates it, by however long the acquisition took --
+// which is exactly the moment Redis is slow enough for it to matter. It is the store's
+// question now as well as the socket's: every fenced write asks whether this lease is
+// still good.
+func TestAnAcquisitionIsDatedFromWhenItWasSent(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	clock := newClock()
+	leases := cluster.NewLeases(redisx.Wrap(rdb, "wa:", 8), "inst-a", cluster.Options{Clock: clock})
+
+	// The acquisition takes as long as the lease has to give, spent on the way there.
+	// `set`, not `setnx`: go-redis sends SetNX with an expiration as `SET ... NX`, and
+	// the hook names the command that goes on the wire.
+	rdb.AddHook(advancingClock{
+		clock: clock,
+		by:    cluster.DefaultTTL - cluster.DefaultRenewMargin,
+		on:    func(cmd redis.Cmder) bool { return cmd.Name() == "set" },
+	})
+
+	if _, err := leases.Acquire(context.Background(), "s1"); err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	if _, owned := leases.Owned("s1"); owned {
+		t.Fatal("a lease acquired by a round trip that outlasted its fresh lifetime still counts as owned")
 	}
 }

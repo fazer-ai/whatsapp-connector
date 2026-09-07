@@ -34,12 +34,35 @@ var ErrNotOwned = errors.New("store: the session is no longer owned by this inst
 // on from is state the next message is decrypted against.
 //
 // So the fence is asked per write rather than per context, and the two overlap on
-// purpose. What it does not answer is the window between a lease running out and this
-// instance learning it: inside that, this instance still believes it owns the session and
-// this still says yes. Closing that needs the database to arbitrate, which is
-// https://github.com/fazer-ai/whatsapp-connector/issues/55.
+// purpose.
+//
+// It asks two questions, because "this instance has stopped owning the session" and
+// "this instance knows it has" are not the same moment. Drop covers the second: an
+// instance that has been told, or has decided, stops writing at once. The lease covers
+// the first, and it is the wider of the two -- a lease runs out in Redis and a peer takes
+// the account while the old owner carries on until its next renewal tells it otherwise,
+// and inside that window both instances believe they are the owner. The writes of the
+// one that is wrong land on top of what the new one has learned, which for the Signal
+// state is what the next message is decrypted against.
+//
+// The lease answers that from local state alone, without asking Redis: it was renewed at
+// a known moment, for a known TTL, so an instance can tell that its own claim has run out
+// before anybody tells it. Which is what the publish path already does before writing an
+// event (see Session.stillOwned); this is the same question asked of the store.
 type Fence struct {
 	dropped atomic.Bool
+	// owned is the lease as arbiter: still valid, or run out while nobody was looking.
+	owned func() bool
+}
+
+// NewFence returns the fence one session's writes stand behind.
+//
+// owned is not optional, and there is no zero value that works: a fence with nothing to
+// ask has only this instance's own belief to go on, which is the half of the question
+// that misses a lease already lost. Where nothing competes for the session, say so with
+// a function that answers true.
+func NewFence(owned func() bool) *Fence {
+	return &Fence{owned: owned}
 }
 
 // Drop fences every write from here on. It is idempotent: a session can be closed by its
@@ -52,7 +75,7 @@ func (f *Fence) Dropped() bool { return f.dropped.Load() }
 
 // held is what every fenced write asks first.
 func (f *Fence) held() error {
-	if f.dropped.Load() {
+	if f.dropped.Load() || !f.owned() {
 		return ErrNotOwned
 	}
 	return nil

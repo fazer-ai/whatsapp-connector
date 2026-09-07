@@ -321,3 +321,15 @@ internal/app/config.go: Reject heartbeats shorter than an adoption turn  # PR#65
 # acks makes it unsatisfiable, for a ceiling only a degraded Redis reaches. Registered as
 # #79, which takes the acks off this goroutine, and named in the rule's own comment.
 internal/app/config.go: Include detached ack time in the lease bound  # PR#65 r11 -> #79
+# PR#93: right about the residue, wrong that it makes this patch incorrect, and the
+# remedy it names is the one #55 examined and rejected. A check before a write cannot
+# cover the write's own duration, true of any fence that is not the commit itself -- and
+# the commit is where it cannot go: whatsmeow builds its own statements, so a condition
+# cannot be added from outside to the tables holding the expensive writes, and fencing
+# ours alone locks one of two doors. What covers the residue is the renew margin, which
+# exists for exactly this: Owned answers no from `renewedAt + ttl - margin` while the key
+# only expires at `renewedAt + ttl`, so a write admitted at the last possible instant has
+# DefaultRenewMargin to commit in before any peer can take the account. That budget is
+# named and configurable; closing it further is tuning, not a defect. Before this branch
+# the same window was a whole heartbeat wide.
+internal/store/fence.go: Fence writes through the database commit  # PR#93 r1

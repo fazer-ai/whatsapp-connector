@@ -132,7 +132,12 @@ func New(cfg *Config, log zerolog.Logger) (connector *Connector, err error) {
 		mediaOpts.Blobs, mediaOpts.BaseURL = blobs, cfg.AdvertiseURL
 	}
 
-	waEngine, devices, err := newEngine(startupCtx, cfg, mediaOpts, log)
+	// Before the engine, because the store the engine opens fences every write against
+	// them: a write is refused once this instance's claim has run out, and not only once
+	// it has been told so.
+	leases := cluster.NewLeases(client, cfg.Instance, cluster.Options{TTL: cfg.LeaseTTL})
+
+	waEngine, devices, err := newEngine(startupCtx, cfg, leases.Owns, mediaOpts, log)
 	if err != nil {
 		return nil, err
 	}
@@ -145,7 +150,6 @@ func New(cfg *Config, log zerolog.Logger) (connector *Connector, err error) {
 	}
 
 	metrics := observability.New()
-	leases := cluster.NewLeases(client, cfg.Instance, cluster.Options{TTL: cfg.LeaseTTL})
 	manager := session.NewManager(&session.ManagerConfig{
 		Instance: cfg.Instance, Engine: waEngine, Leases: leases,
 		Publisher: streams, Replier: streams, Ledger: redisx.NewIdempotency(client, 0),
@@ -747,13 +751,13 @@ func (c *Connector) shutdown() {
 //
 //nolint:gocritic // zerolog.Logger is designed to be copied; every With() returns one by value
 func newEngine(
-	ctx context.Context, cfg *Config, blobs meow.MediaOptions, log zerolog.Logger,
+	ctx context.Context, cfg *Config, owned store.Ownership, blobs meow.MediaOptions, log zerolog.Logger,
 ) (engine.Engine, *store.Container, error) {
 	switch cfg.Engine {
 	case EngineFake:
 		return fake.New(), nil, nil
 	case EngineWhatsmeow:
-		devices, err := store.Open(ctx, cfg.DatabaseURL, log)
+		devices, err := store.Open(ctx, cfg.DatabaseURL, owned, log)
 		if err != nil {
 			return nil, nil, err
 		}

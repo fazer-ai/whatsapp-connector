@@ -19,10 +19,10 @@
 // them all from the moment this instance stops owning the session, whichever context they
 // arrive with.
 //
-// What is left is the window between a lease running out and this instance learning it. In
-// there this instance still believes it is the owner and the fence still says yes, because
-// nothing in a write says which epoch made it. Closing that needs the database to arbitrate,
-// which is issue #55.
+// The window between a lease running out and this instance learning it is covered by the
+// same fence, which asks the lease and not only this instance's own belief: a claim that
+// was renewed at a known moment, for a known TTL, has run out at a moment this instance
+// can work out on its own, before any renewal comes back to tell it.
 package store
 
 import (
@@ -60,8 +60,25 @@ type Container struct {
 	db      *sql.DB
 	devices *sqlstore.Container
 	dialect string
+	owned   Ownership
 	log     zerolog.Logger
 }
+
+// Ownership answers whether this instance may still write for a session. Every fenced
+// write asks it, so it is asked often and on the path of every message: it must answer
+// from local state and never over the network.
+//
+// The cluster's leases are what implement it in a deployment. A false no costs a
+// disconnect and a reclaim; a false yes puts two writers on one account's Signal state,
+// which is the failure this exists to prevent, so an implementation that cannot tell
+// answers no.
+type Ownership func(sid string) bool
+
+// AlwaysOwned is the arbiter for a container nothing else is competing for: the migrate
+// and doctor commands, and tests that drive the store directly. Passing it says out loud
+// that there is no second owner to arbitrate against, rather than leaving the question
+// unasked.
+func AlwaysOwned(string) bool { return true }
 
 // Open dials the database, brings both schemas up to date, and returns the container.
 //
@@ -70,8 +87,16 @@ type Container struct {
 // typo fails here rather than silently opening a local file in a deployment that meant
 // to reach a server.
 //
+// owned is what every fenced write asks, and it is required rather than optional: a
+// container built without one would fence on this instance's own belief alone, which is
+// the half of the question that misses a lease already lost. A deployment with no second
+// owner passes AlwaysOwned and says so.
+//
 //nolint:gocritic // zerolog.Logger is designed to be copied; every With() returns one by value
-func Open(ctx context.Context, address string, log zerolog.Logger) (*Container, error) {
+func Open(ctx context.Context, address string, owned Ownership, log zerolog.Logger) (*Container, error) {
+	if owned == nil {
+		return nil, errors.New("store: open without an owner arbiter (pass AlwaysOwned where nothing competes)")
+	}
 	dialect, dsn, err := parseURL(address)
 	if err != nil {
 		return nil, err
@@ -101,7 +126,7 @@ func Open(ctx context.Context, address string, log zerolog.Logger) (*Container, 
 		return nil, fmt.Errorf("store: open the device store: %w", err)
 	}
 
-	c := &Container{db: db, devices: devices, dialect: dialect, log: log}
+	c := &Container{db: db, devices: devices, dialect: dialect, owned: owned, log: log}
 	if err := c.migrate(ctx); err != nil {
 		_ = c.Close()
 		return nil, err

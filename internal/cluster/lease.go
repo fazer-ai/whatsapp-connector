@@ -141,6 +141,13 @@ func (l *Leases) TTL() time.Duration { return l.ttl }
 // a current one.
 func (l *Leases) Acquire(ctx context.Context, sid string) (Lease, error) {
 	keys := l.client.Keys()
+	// Dated from here, for the reason applyRenew gives and with one more round trip's
+	// worth of it: Redis starts the TTL when SETNX runs, and the epoch is read after
+	// that, so a lease stamped once both have answered is dated later than Redis dates
+	// it -- by however long an acquisition takes, which is exactly the moment Redis is
+	// slow. Owned would then keep saying yes past the moment the key expires and a peer
+	// can take it. Dating it earlier only ever gives it up sooner than necessary.
+	sent := l.clock.Now()
 	won, err := l.client.SetNX(ctx, keys.Lease(sid), l.instance, l.ttl).Result()
 	if err != nil {
 		return Lease{}, fmt.Errorf("cluster: acquire %s: %w", sid, err)
@@ -158,7 +165,7 @@ func (l *Leases) Acquire(ctx context.Context, sid string) (Lease, error) {
 	}
 
 	l.mu.Lock()
-	l.held[sid] = held{epoch: uint64(epoch), renewedAt: l.clock.Now()} //nolint:gosec // INCR from 0 never returns a negative
+	l.held[sid] = held{epoch: uint64(epoch), renewedAt: sent} //nolint:gosec // INCR from 0 never returns a negative
 	l.mu.Unlock()
 
 	return Lease{SID: sid, Epoch: uint64(epoch)}, nil //nolint:gosec // same
@@ -304,6 +311,13 @@ func (l *Leases) Owned(sid string) (Lease, bool) {
 		return Lease{}, false
 	}
 	return Lease{SID: sid, Epoch: entry.epoch}, true
+}
+
+// Owns is Owned as a plain yes or no, for a caller that needs the answer and not the
+// lease: the store fences every write on it.
+func (l *Leases) Owns(sid string) bool {
+	_, owned := l.Owned(sid)
+	return owned
 }
 
 // Held lists the sessions this instance believes it owns, fresh or not. Used by the

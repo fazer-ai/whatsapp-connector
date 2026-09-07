@@ -89,7 +89,7 @@ func TestASweepGivenNoTimeDropsNothing(t *testing.T) {
 func openInternal(t *testing.T) *Container {
 	t.Helper()
 
-	container, err := Open(t.Context(), storetest.New(t).URL, zerolog.Nop())
+	container, err := Open(t.Context(), storetest.New(t).URL, AlwaysOwned, zerolog.Nop())
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
