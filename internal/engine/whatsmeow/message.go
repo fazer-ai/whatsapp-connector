@@ -365,10 +365,29 @@ func annotating(message *waE2E.Message, left int) *waE2E.ContextInfo {
 // whyUnreadable is which of the contract's reasons this message arrived with. It is what
 // separates a poll from a stanza that carried nothing at all, and a client shows the
 // difference.
+// masked reports whether this is the placeholder WhatsApp sends a linked device in
+// place of a verification code.
+//
+// The type is checked rather than the arm's presence alone. MASK_LINKED_DEVICES is the
+// only placeholder type today and it is the zero value, so a placeholder that arrives
+// without one is this; a type WhatsApp adds later is something else, and `unknown_type`
+// is the honest answer for it.
+func masked(message *waE2E.Message) bool {
+	placeholder := message.GetPlaceholderMessage()
+	return placeholder != nil && placeholder.GetType() == waE2E.PlaceholderMessage_MASK_LINKED_DEVICES
+}
+
 func whyUnreadable(event *waEvents.Message) protocol.UnsupportedReason {
 	switch {
 	case bodyless(event.Message):
 		return protocol.UnsupportedEmpty
+	case masked(event.Message):
+		// WhatsApp withholds an authentication template from every linked device and
+		// delivers this in its place, on by default and with no opt-out. The placeholder
+		// is a real arm, so bodyless is false and nothing above catches it -- it used to
+		// fall through to `unknown_type`, which tells a client this build is behind when
+		// no build will ever render it.
+		return protocol.UnsupportedMasked
 	case event.Message.GetProtocolMessage() != nil:
 		// One that is not the account's own plumbing, which changeOf already dropped.
 		// What is left is somebody acting in the conversation in a way the contract does

@@ -662,3 +662,54 @@ func TestAChannelPostWithNoEditTimestampIsStillAPost(t *testing.T) {
 		t.Fatalf("an ordinary channel post was published as %s", emission.Type)
 	}
 }
+
+// WhatsApp masks an authentication template -- a verification code -- from every linked
+// device and delivers a placeholder instead. It is on by default and there is no way
+// out of it, so this is the shape every OTP takes on a paired number.
+//
+// The reason is the whole of what a client has to draw a bubble from, and `unknown_type`
+// says the wrong thing twice: that this build is behind, and that a later one will
+// render it. Neither is true, because the content was never sent to this device. It is
+// not `unavailable` either -- that one the primary phone can still be asked for.
+func TestAMaskedVerificationCodeIsSaidToBeMaskedRatherThanUnknown(t *testing.T) {
+	t.Parallel()
+
+	for name, message := range map[string]*waE2E.Message{
+		// What arrives on the wire: the placeholder and the context that rides along
+		// with everything, and nothing else.
+		"a masked authentication template": {
+			MessageContextInfo: &waE2E.MessageContextInfo{},
+			PlaceholderMessage: &waE2E.PlaceholderMessage{
+				Type: waE2E.PlaceholderMessage_MASK_LINKED_DEVICES.Enum(),
+			},
+		},
+		// The type is the zero value, so an encoder that leaves it out means the same
+		// thing.
+		"one that left the type out": {
+			MessageContextInfo: &waE2E.MessageContextInfo{},
+			PlaceholderMessage: &waE2E.PlaceholderMessage{},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			if reason := whyUnreadable(&waEvents.Message{Message: message}); reason != protocol.UnsupportedMasked {
+				t.Fatalf("a masked verification code is published as %q, and a client cannot tell "+
+					"it from a message this build has yet to learn to render", reason)
+			}
+		})
+	}
+}
+
+// And the boundary: a placeholder of a type this build does not know is not the masking,
+// whatever it turns out to be. `unknown_type` is the honest answer for it, and saying
+// `masked` would put a bubble on screen naming a mechanism that was not involved.
+func TestAPlaceholderOfAnotherTypeIsNotCalledMasked(t *testing.T) {
+	t.Parallel()
+
+	future := waE2E.PlaceholderMessage_PlaceholderType(99)
+	message := &waE2E.Message{PlaceholderMessage: &waE2E.PlaceholderMessage{Type: future.Enum()}}
+	if reason := whyUnreadable(&waEvents.Message{Message: message}); reason != protocol.UnsupportedUnknownType {
+		t.Fatalf("a placeholder type nobody here knows is published as %q, want unknown_type", reason)
+	}
+}
