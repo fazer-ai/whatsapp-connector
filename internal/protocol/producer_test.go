@@ -5,6 +5,7 @@ import (
 	"go/parser"
 	"go/token"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -44,43 +45,102 @@ var eventTypesWithNoProducer = []protocol.EventType{
 func TestEveryEventTypeIsProducedOrMarkedAsNotProduced(t *testing.T) {
 	t.Parallel()
 
-	named := eventTypesNamedOutsideThisPackage(t)
-
-	unproduced := make(map[protocol.EventType]bool, len(eventTypesWithNoProducer))
-	for _, event := range eventTypesWithNoProducer {
-		if !event.Valid() {
-			t.Errorf("%s is marked as having no producer and is not an event type in the contract", event)
-		}
-		unproduced[event] = true
+	catalog := make([]string, len(protocol.AllEventTypes))
+	for i, event := range protocol.AllEventTypes {
+		catalog[i] = string(event)
+	}
+	marked := make([]string, len(eventTypesWithNoProducer))
+	for i, event := range eventTypesWithNoProducer {
+		marked[i] = string(event)
 	}
 
-	for _, event := range protocol.AllEventTypes {
-		where, produced := named[event]
+	assertProducers(t, "EventType", "types.go", catalog, marked)
+}
+
+// Four error codes are declared and never sent, and errors.go marks each one with what
+// reaches a client in its place. The same drift is possible there as with the events,
+// and worse to read from the outside: a client branching on a code it cannot receive
+// gets no signal at all, which is the reasoning errors.go and contract/README.md both
+// already spell out. This is what keeps that marking honest.
+var errorCodesWithNoProducer = []protocol.ErrorCode{
+	protocol.ErrorSessionNotFound,
+	protocol.ErrorQuarantined,
+	protocol.ErrorClientOutdated,
+	protocol.ErrorGroupParticipantNotAllowed,
+}
+
+func TestEveryErrorCodeIsProducedOrMarkedAsNotProduced(t *testing.T) {
+	t.Parallel()
+
+	catalog := make([]string, len(protocol.AllErrorCodes))
+	for i, code := range protocol.AllErrorCodes {
+		catalog[i] = string(code)
+	}
+	marked := make([]string, len(errorCodesWithNoProducer))
+	for i, code := range errorCodesWithNoProducer {
+		marked[i] = string(code)
+	}
+
+	assertProducers(t, "ErrorCode", "errors.go", catalog, marked)
+}
+
+// assertProducers is the check both catalogs get: every value is either produced
+// somewhere outside this package or marked as not produced, and never both.
+func assertProducers(t *testing.T, declaredType, catalogFile string, catalog, marked []string) {
+	t.Helper()
+
+	named := namedOutsideThisPackage(t, declaredType, catalog)
+
+	inCatalog := make(map[string]bool, len(catalog))
+	for _, value := range catalog {
+		inCatalog[value] = true
+	}
+	unproduced := make(map[string]bool, len(marked))
+	for _, value := range marked {
+		if !inCatalog[value] {
+			t.Errorf("%s is marked as having no producer and is not in the %s catalog", value, declaredType)
+		}
+		unproduced[value] = true
+	}
+
+	for _, value := range catalog {
+		where, produced := named[value]
 		switch {
-		case unproduced[event] && produced:
-			t.Errorf("%s is marked in types.go as having no producer, and %s names it: move it out of the marked group", event, where)
-		case !unproduced[event] && !produced:
-			t.Errorf("%s is not marked as unproduced and nothing outside internal/protocol names it: either it lost its producer or the marking in types.go is behind", event)
+		case unproduced[value] && produced:
+			t.Errorf("%s is marked in %s as having no producer, and %s names it: move it out of the marked group", value, catalogFile, where)
+		case !unproduced[value] && !produced:
+			t.Errorf("%s is not marked as unproduced and nothing outside internal/protocol names it: either it lost its producer or the marking in %s is behind", value, catalogFile)
 		}
 	}
 }
 
-// eventTypesNamedOutsideThisPackage reports which event types the production code of the
-// other packages mentions, by the constant or by its literal value.
+// namedOutsideThisPackage reports which of one catalog's values the production code of
+// the other packages mentions, and in which file.
 //
 // Reading the sources rather than importing them, because internal/protocol is what they
 // all import: a test that pulled them in would be a cycle, and one that asked each
 // package to declare what it produces would be the same comment written twice.
-func eventTypesNamedOutsideThisPackage(t *testing.T) map[protocol.EventType]string {
+//
+// A value counts as named when a package selects its constant, and -- only where the
+// value cannot be an ordinary English word -- when a package writes the value out. The
+// literal is a net for a producer that skips the constant, and it is cast no wider than
+// that on purpose: `raw` and `internal` are both catalog values, and a test that took
+// any string spelling one as a producer would report a producer for whatever a comment,
+// a log key or a struct tag happens to say.
+func namedOutsideThisPackage(t *testing.T, declaredType string, values []string) map[string]string {
 	t.Helper()
 
-	byLiteral := make(map[string]protocol.EventType, len(protocol.AllEventTypes))
-	for _, event := range protocol.AllEventTypes {
-		byLiteral[string(event)] = event
+	byLiteral := map[string]string{}
+	for _, value := range values {
+		// A dot is what makes a catalog value unmistakable: every event and command type
+		// is qualified (`group.updated`), and no error code is.
+		if strings.Contains(value, ".") {
+			byLiteral[value] = value
+		}
 	}
-	byConstant := eventConstantNames(t)
+	byConstant := constantNames(t, declaredType, values)
 
-	named := map[protocol.EventType]string{}
+	named := map[string]string{}
 	root := filepath.Join("..", "..")
 	fileSet := token.NewFileSet()
 	walk := func(path string, entry fs.DirEntry, err error) error {
@@ -110,15 +170,15 @@ func eventTypesNamedOutsideThisPackage(t *testing.T) map[protocol.EventType]stri
 			switch found := node.(type) {
 			case *ast.SelectorExpr:
 				if pkg, ok := found.X.(*ast.Ident); ok && pkg.Name == "protocol" {
-					if event, ok := byConstant[found.Sel.Name]; ok {
-						named[event] = where
+					if value, ok := byConstant[found.Sel.Name]; ok {
+						named[value] = where
 					}
 				}
 			case *ast.BasicLit:
 				if found.Kind == token.STRING {
 					if value, unquoteErr := strconv.Unquote(found.Value); unquoteErr == nil {
-						if event, ok := byLiteral[value]; ok {
-							named[event] = where
+						if spelled, ok := byLiteral[value]; ok {
+							named[spelled] = where
 						}
 					}
 				}
@@ -131,54 +191,72 @@ func eventTypesNamedOutsideThisPackage(t *testing.T) map[protocol.EventType]stri
 	// the repository keeps the contract's own fixtures, the tooling and .git out of it.
 	for _, dir := range []string{"internal", "cmd"} {
 		if err := filepath.WalkDir(filepath.Join(root, dir), walk); err != nil {
-			t.Fatalf("read the packages that produce events: %v", err)
+			t.Fatalf("read the packages that produce %s values: %v", declaredType, err)
 		}
 	}
 	if len(named) == 0 {
-		t.Fatal("no package names any event type, which means this test read nothing")
+		t.Fatalf("no package names any %s, which means this test read nothing", declaredType)
 	}
 	return named
 }
 
-// eventConstantNames maps the identifier of each event constant to its value, read from
-// the catalog itself so that the two never have to be listed side by side.
-func eventConstantNames(t *testing.T) map[string]protocol.EventType {
+// constantNames maps the identifier of each of a catalog's constants to its value, read
+// from the declarations themselves so that the two never have to be listed side by side.
+func constantNames(t *testing.T, declaredType string, values []string) map[string]string {
 	t.Helper()
 
-	fileSet := token.NewFileSet()
-	file, err := parser.ParseFile(fileSet, "types.go", nil, 0)
+	// This package's own sources, read one by one: the catalogs are spread over more than
+	// one file (types.go and errors.go), and naming them here would be one more pair that
+	// has to be kept in step.
+	entries, err := os.ReadDir(".")
 	if err != nil {
-		t.Fatalf("parse the type catalog: %v", err)
+		t.Fatalf("list this package's sources: %v", err)
 	}
-	inContract := make(map[string]bool, len(protocol.AllEventTypes))
-	for _, event := range protocol.AllEventTypes {
-		inContract[string(event)] = true
+	fileSet := token.NewFileSet()
+	var sources []*ast.File
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, parseErr := parser.ParseFile(fileSet, name, nil, 0)
+		if parseErr != nil {
+			t.Fatalf("parse %s: %v", name, parseErr)
+		}
+		sources = append(sources, file)
 	}
 
-	names := map[string]protocol.EventType{}
-	ast.Inspect(file, func(node ast.Node) bool {
-		spec, ok := node.(*ast.ValueSpec)
-		if !ok || len(spec.Names) != 1 || len(spec.Values) != 1 {
+	inContract := make(map[string]bool, len(values))
+	for _, value := range values {
+		inContract[value] = true
+	}
+
+	names := map[string]string{}
+	for _, source := range sources {
+		ast.Inspect(source, func(node ast.Node) bool {
+			spec, ok := node.(*ast.ValueSpec)
+			if !ok || len(spec.Names) != 1 || len(spec.Values) != 1 {
+				return true
+			}
+			// By the declared type, not by the value: `chat.presence` is both an event
+			// and a command, and reading it off the value alone picks up the other one.
+			if declared, ok := spec.Type.(*ast.Ident); !ok || declared.Name != declaredType {
+				return true
+			}
+			literal, ok := spec.Values[0].(*ast.BasicLit)
+			if !ok || literal.Kind != token.STRING {
+				return true
+			}
+			value, err := strconv.Unquote(literal.Value)
+			if err != nil || !inContract[value] {
+				return true
+			}
+			names[spec.Names[0].Name] = value
 			return true
-		}
-		// By the declared type, not by the value: `chat.presence` is both an event and a
-		// command, and reading it off the value alone picks up the command constant too.
-		if declared, ok := spec.Type.(*ast.Ident); !ok || declared.Name != "EventType" {
-			return true
-		}
-		literal, ok := spec.Values[0].(*ast.BasicLit)
-		if !ok || literal.Kind != token.STRING {
-			return true
-		}
-		value, err := strconv.Unquote(literal.Value)
-		if err != nil || !inContract[value] {
-			return true
-		}
-		names[spec.Names[0].Name] = protocol.EventType(value)
-		return true
-	})
-	if len(names) != len(protocol.AllEventTypes) {
-		t.Fatalf("read %d event constants out of the catalog, want %d", len(names), len(protocol.AllEventTypes))
+		})
+	}
+	if len(names) != len(values) {
+		t.Fatalf("read %d %s constants out of the catalog, want %d", len(names), declaredType, len(values))
 	}
 	return names
 }
