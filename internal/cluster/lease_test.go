@@ -3,6 +3,7 @@ package cluster_test
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -410,7 +411,14 @@ func (h advancingClock) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
 func (h advancingClock) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
 	return func(ctx context.Context, cmds []redis.Cmder) error {
 		err := next(ctx, cmds)
-		h.clock.advance(h.by)
+		// Asked per command here too, and not once per batch. go-redis opens a connection
+		// with a pipeline of its own (`client` calls in a handshake), so a batch that
+		// advances the clock whatever is in it moves time for reasons the test never
+		// named -- and a test whose clock moves by itself passes without measuring what
+		// it says it measures.
+		if slices.ContainsFunc(cmds, h.on) {
+			h.clock.advance(h.by)
+		}
 		return err
 	}
 }
@@ -467,10 +475,12 @@ func TestAnAcquisitionIsDatedFromWhenItWasSent(t *testing.T) {
 	leases := cluster.NewLeases(redisx.Wrap(rdb, "wa:", 8), "inst-a", cluster.Options{Clock: clock})
 
 	// The acquisition takes as long as the lease has to give, spent on the way there.
+	// `set`, not `setnx`: go-redis sends SetNX with an expiration as `SET ... NX`, and
+	// the hook names the command that goes on the wire.
 	rdb.AddHook(advancingClock{
 		clock: clock,
 		by:    cluster.DefaultTTL - cluster.DefaultRenewMargin,
-		on:    func(cmd redis.Cmder) bool { return cmd.Name() == "setnx" },
+		on:    func(cmd redis.Cmder) bool { return cmd.Name() == "set" },
 	})
 
 	if _, err := leases.Acquire(context.Background(), "s1"); err != nil {
