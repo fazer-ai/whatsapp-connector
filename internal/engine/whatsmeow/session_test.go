@@ -137,8 +137,6 @@ var (
 		protocol.CommandSessionUpdate,
 		protocol.CommandMessageMarkUnread,
 		protocol.CommandHistoryRequest,
-		protocol.CommandContactCheck,
-		protocol.CommandContactProfilePicture,
 		protocol.CommandContactInfo,
 		protocol.CommandContactResolve,
 		protocol.CommandGroupCreate,
@@ -180,6 +178,8 @@ var (
 		{protocol.CommandPresenceSet, protocol.ErrorInvalidPayload},
 		{protocol.CommandPresenceSubscribe, protocol.ErrorInvalidPayload},
 		{protocol.CommandChatPresence, protocol.ErrorInvalidPayload},
+		{protocol.CommandContactCheck, protocol.ErrorInvalidPayload},
+		{protocol.CommandContactProfilePicture, protocol.ErrorInvalidPayload},
 	}
 )
 
