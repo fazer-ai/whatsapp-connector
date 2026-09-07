@@ -84,17 +84,9 @@ internal/transport/redisstream/stream.go: Age pending commands from first delive
 # bytes already in memory, and an HTTP body from a request carrying the context unblocks
 # when the context does. The check before each read is what covers a source that yields.
 internal/media/store.go: Interrupt the underlying read on cancellation  # PR#15
-# PR#16: real, and filed as #17 rather than patched here. whatsmeow's Download is
-# io.ReadAll over the response body and holds ciphertext and plaintext at once, so the
-# peak is the file itself and not WAC_MEDIA_MAX_BLOB; the declared FileLength is checked
-# before a byte moves, which covers an honest sender and not a lying one, and the store's
-# cap then refuses on the way in, by which point the memory is already spent. Closing it
-# means streaming into the store instead of through memory: whatsmeow has
-# DownloadToFile, and os.Root.OpenFile returns something that satisfies its File, but the
-# store has to grow a second way in that commits (digest, description, rename, stamp) as
-# the same code Put does, or the two accountings drift. That is its own change, which is
-# what #17 describes. It takes a sender deliberately lying about the length to reach.
-internal/engine/whatsmeow/media.go: Enforce the blob limit while downloading  # PR#16
+# PR#16's "Enforce the blob limit while downloading" is no longer waived: #17 closed, and
+# an inbound file goes through DownloadToFile into the store's own handle rather than
+# through io.ReadAll. The waiver deferred to that issue.
 # PR#16: wrong for this client, and the client says so in its own code. The premise is
 # that a redelivered message is deduplicated and the replacement reference thrown away.
 # Chatwoot's MessageReceived answers a stored message with `duplicate_of(stored)`, which
@@ -107,36 +99,15 @@ internal/engine/whatsmeow/media.go: Enforce the blob limit while downloading  # 
 # `connector_blob` kind exists because a file lives on the disk of whoever downloaded it,
 # and the client's MediaRef.PROVIDER_KINDS says the same from the other side.
 internal/engine/whatsmeow/media.go: Keep media references usable across redelivery  # PR#16
-# PR#16: real for 404 and 410, wrong for 403, and filed as #18. The recovery is
-# SendMediaRetryReceipt plus the MediaRetry answer, and it cannot be bolted onto this
-# path: the client's answer to `media.download_failed` is `is_unsupported` and a refusal
-# to fetch again, so the retry has to happen before the failure is published, and the
-# inbound path is on whatsmeow's node handler with five minutes before a session loses
-# its ordering — of which the download already spends 90s. Waiting on the sender's phone
-# to answer is unbounded and it may never answer. `message.download_media` is where the
-# caller asked, is waiting, and brought a deadline, which is what #18 describes.
-internal/engine/whatsmeow/media.go: Retry 404 and 410 media through the phone  # PR#16
-# PR#16: real, correctly described, and it is M2.2c rather than a hole in M2.2b. Filed as
-# #19 with the window that makes it matter named: a deploy landing in the seconds between
-# publishing the event and the client fetching the blob leaves a URL for an instance that
-# is gone, the refresh answers `unsupported`, and Chatwoot flags the message for good. The
-# fix is not a guard here — the connector cannot rebuild a blob from the ref, because
-# re-downloading needs the directPath, mediaKey and hashes off the original proto and
-# nothing keeps a message once its event is out. So it is a table in internal/store, a
-# command handler, and a retention policy: the slice #19 describes, which #18 also wants.
-# Folding it in here would double a PR whose subject is the inbound half.
-internal/engine/whatsmeow/media.go: Implement stale blob refresh before issuing local refs  # PR#16
-# PR#16: real, narrow, and folded into #19 with the reasoning in a comment there. A blob
-# can be dropped by the sweep's quota pass between Put returning and the event naming it
-# being published; the age pass cannot, because this PR refuses a cache whose TTL does
-# not outlast the delivery bound. The two local fixes are both worse than waiting for
-# #19: pinning until the event settles is a store API change whose forgotten release
-# leaves a blob nothing ever evicts and a quota that lies, and a grace window on the LRU
-# pass trades a silent lost attachment for a quota that overshoots by whatever arrives in
-# one window. Once `message.download_media` exists, a blob that is gone costs a round
-# trip instead of the attachment, which is what makes the window ordinary rather than
-# fatal.
-internal/engine/whatsmeow/media.go: Keep blobs pinned until publication settles  # PR#16
+# PR#16's "Retry 404 and 410 media through the phone" is no longer waived: #18 closed in
+# PR#75 and PR#78, and a file WhatsApp dropped is asked of the sender's phone
+# (mediaretry.go, SendMediaRetryReceipt) with the client invited back for it. The waiver
+# deferred to that issue.
+# PR#16's two blob-lifetime titles are no longer waived: #19 closed, and what it asked
+# for exists -- the coordinates of a message's media are kept in wac_media_part and
+# `message.download_media` rebuilds a blob that is gone. Both waivers deferred to that
+# issue, and the second said so in as many words: a blob that has been dropped now costs
+# a round trip instead of the attachment.
 # PR#22: the cost is real and it is the one that was chosen. A download recalled from
 # the ledger is a `connector_blob` URL naming one instance and good until a TTL, and the
 # whole point of the command is that both of those lapse: the recalled answer is an
@@ -150,17 +121,12 @@ internal/engine/whatsmeow/media.go: Keep blobs pinned until publication settles 
 # Registered as #24 rather than only waived, because the cost is worth revisiting once
 # there is a way to validate a ref that another instance issued.
 internal/protocol/types.go: Preserve idempotency for media downloads  # PR#22
-# PR#22: the finding is right that the monotonic stamp is not a fence, and #22 does not
-# claim it is — the comment on the write says so, and #23 carries the gap with the three
-# candidate designs and what each costs. What #22 does close is the half a fence would
-# not have covered anyway: a write arriving after the session was unpaired now fails on
-# the foreign key rather than inserting a parentless row that holds the key to a file.
-# Building the epoch fence here means either a column on every table this package owns
-# with the epoch read from the lease, or a session-aware driver wrapper that whatsmeow's
-# sqlstore would have to accept. Both are the architecture change internal/store's own
-# package doc has called open since M1, and neither belongs in the PR that made the
-# first write.
-internal/store/media.go: Fence media writes with the ownership epoch  # PR#22
+# PR#22's "Fence media writes with the ownership epoch" is no longer waived: #23 closed in
+# PR#56 and PR#93, and Scoped.PutMediaPart asks the fence like every other write from that
+# handle. It took none of the three designs this waiver weighed -- no epoch column, no
+# session-aware driver -- because the stores on a device are interfaces, so the fence is a
+# decorator per session. The comment on the write said the same thing the waiver did and
+# has been corrected with it.
 # PR#33: the mechanism is right and the consequence is not, and the consequence was
 # checked on a phone rather than argued about. whatsmeow does replace the destination of
 # every direct message to a phone JID with the contact's LID (send.go, the
@@ -225,16 +191,30 @@ internal/engine/whatsmeow/receipt.go: Fail group read marks when normalization f
 # unbounded by construction and deciding how to bound it is not this slice's decision.
 # Registered as #46.
 #
-# PR#73 built that replay, and both commands are still excluded. The reason is now a
-# different one and a narrower one. The availability is put back on every connection, so
-# within one session a redelivery answered from the ledger no longer reports success over
-# a connection where nothing was done -- but the memory is the session's and the ledger is
-# shared, so a session built by the instance that takes the account over has never heard
-# the command and has nothing to put back. Subscriptions are not replayed at all: the
-# contract now says a client re-establishes them on `session.state: open`, which is a
-# decision about who owns that set rather than a gap. Making the availability durable
-# enough to take `presence.set` out of this table is #72.
+# PR#73 built that replay, and both commands stayed excluded: the availability was put
+# back on every connection, but the memory was the session's and the ledger is shared, so
+# a session built by the instance that took the account over had never heard the command
+# and had nothing to put back. Closing that was #72.
+#
+# #72 closed in PR#92, and `presence.set` left the table with it: the availability is now
+# kept where the next owner reads it, and the command fails rather than answering when
+# that record cannot be written, so the ledger's answer is backed by something a later
+# owner will act on. The waiver stands for `presence.subscribe` alone, and for the reason
+# the first paragraph gives -- subscriptions are replayed by nobody, because which parties
+# are worth watching is the client's to know, so what a subscribe sets really does belong
+# to the socket that set it. The asymmetry and both halves of it are spelled out in
+# types.go, above RepeatableCommands.
 internal/protocol/types.go: Preserve idempotency for redelivered presence commands  # PR#45
+# PR#114 r2: right that the surviving title is wider than what it now covers, and the
+# remedy disarms it. A waiver matches on the finding's title normalised and compared for
+# equality (`w["title"] == key` in post-findings.py), so renaming this one to say
+# "subscriptions" stops it matching the finding it exists for, which then blocks the PR
+# every round -- the exact failure the file was written to end. The risk it names is also
+# the wrong way round: `presence.set` left RepeatableCommands because it *is* remembered
+# now, so a future finding under this title asking for idempotency on it would be asking
+# for something the code already does. What the title could still hide is a finding about
+# some third presence command, and there is no third one.
+.codex-review-waived: Narrow the surviving waiver to presence.subscribe  # PR#114 r2
 # PR#45: the claim is true and the remedy is worse than what it fixes. Cancelling a
 # context does not un-send bytes Redis has already buffered, so an XADD can be appended
 # after the moment it carries has expired. Rejecting it server-side means expressing the
