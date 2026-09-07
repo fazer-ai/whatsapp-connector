@@ -83,10 +83,12 @@ func TestLiveGroupKeyNamespace(t *testing.T) {
 		// experiment says nothing about namespaces and the phase says so.
 		{name: "translated", participant: liveAddressOf(t, counterpartJID), emoji: "👍"},
 		{name: "in the namespace the group does not use", participant: wrong, emoji: "❤️", lying: true},
-		// The instrument check, and the phase is worth little without it. If a key
-		// naming a member who did not send the message is applied too, then the
-		// participant is not consulted at all and the probe above proved nothing about
-		// namespaces -- it would have passed whatever was in that field.
+		// The instrument check, and the phase is worth little without it. Our own client
+		// applies this one too -- `reactionOf` publishes by target id and never reads
+		// the participant -- so what is asserted here is that blindness and not the
+		// outcome. On the phone this reaction does **not** appear: measured 07/09/2026,
+		// and it is what says the field is consulted by somebody, which is what makes
+		// the probe above mean anything.
 		{name: "naming a member who did not send it", participant: liveAddressOf(t, subjectJID), emoji: "😀"},
 	} {
 		t.Run(probe.name, func(t *testing.T) {
@@ -135,6 +137,10 @@ func TestLiveGroupKeyNamespace(t *testing.T) {
 	t.Logf("subject %s, counterpart %s", subjectJID, counterpartJID)
 	// The half no harness reaches. Printed rather than left in a comment: the person who
 	// runs this is the person who has to look, and they are looking at this output.
+	//
+	// Read once, on 07/09/2026: the translated one and the one in the namespace the group
+	// does not use both carry their reaction; the one naming a member who did not send
+	// the message does not. So the namespace does not matter and the member does.
 	fmt.Fprintf(os.Stderr, "\nnow open %s on a phone: each of the three messages says "+
 		"which probe it is, and the question is which of them carries its reaction\n", group)
 }
@@ -319,6 +325,10 @@ func TestLiveGroupRevokeKeyNamespace(t *testing.T) {
 	}{
 		{name: "translated", participant: liveAddressOf(t, counterpartJID), gone: true},
 		{name: "in the namespace the group does not use", participant: wrong, lying: true, gone: true},
+		// Published by us, and refused by WhatsApp: the message is still there on the
+		// phone. That divergence is its own defect and is #107; what this line pins is
+		// that we publish it, so the day the connector starts refusing it, this fails
+		// and points at the issue rather than at the harness.
 		{name: "naming a member who did not send it", participant: liveAddressOf(t, subjectJID), gone: true},
 	} {
 		t.Run(probe.name, func(t *testing.T) {
@@ -352,6 +362,8 @@ func TestLiveGroupRevokeKeyNamespace(t *testing.T) {
 			}
 		})
 	}
+	// Read once, on 07/09/2026: the first two are gone, the third is still there. Same
+	// answer as the reaction phase, and the third is #107.
 	fmt.Fprintf(os.Stderr, "\nnow open %s on a phone: three messages were sent and a "+
 		"revoke went out for each, and the question is which of them are actually gone\n", group)
 }
