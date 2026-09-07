@@ -58,7 +58,11 @@ func TestLivePairCounterpart(t *testing.T) {
 		t.Fatalf("could not read which account is under test, so there is no way to tell "+
 			"it apart from the counterpart: %v", err)
 	}
-	if subjectBound && subject.User == phone {
+	// Compared through the same normalisation the pairing itself applies. `pairWithCode`
+	// strips everything that is not a digit, so "+55 11 93619-9421" and "5511936199421"
+	// pair the same account and only one of them would have been caught here -- and the
+	// one that slipped through is the one that destroys the subject.
+	if subjectBound && subject.User == digitsOf(phone) {
 		t.Fatalf("WAC_LIVE_COUNTERPART_PHONE is %s, which is the account under test; "+
 			"pairing it would unpair the subject and leave every phase after this "+
 			"checking a conversation with itself", phone)

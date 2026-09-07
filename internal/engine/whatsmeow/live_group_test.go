@@ -182,19 +182,30 @@ func liveGroup(t *testing.T, subject *Session, counterpart waTypes.JID) waTypes.
 func liveGroupReaches(t *testing.T, session *Session, group waTypes.JID) {
 	t.Helper()
 
-	for attempt := range 120 {
-		if _, err := session.current().GetGroupInfo(t.Context(), group); err == nil {
+	// One deadline over the whole wait, and not a count of attempts. Counting looks like
+	// a bound and is not: each `GetGroupInfo` is an IQ, whatsmeow gives an IQ 75 seconds,
+	// and a query handed the test's own context inherits that -- so "120 tries, half a
+	// second apart" can run for hours and end at the suite timeout with no diagnosis,
+	// which is the shape AGENTS.md rules out.
+	waiting, give := context.WithTimeout(t.Context(), time.Minute)
+	defer give()
+	for attempt := 0; ; attempt++ {
+		asking, stop := context.WithTimeout(waiting, 5*time.Second)
+		_, err := session.current().GetGroupInfo(asking, group)
+		stop()
+		if err == nil {
 			return
-		} else if attempt == 0 {
+		}
+		if attempt == 0 {
 			t.Logf("waiting for %s to reach %s: %v", group, session.sid, err)
 		}
 		select {
-		case <-t.Context().Done():
-			t.Fatalf("gave up waiting for %s to reach %s: %v", group, session.sid, t.Context().Err())
+		case <-waiting.Done():
+			t.Fatalf("%s never learned it is in %s within the minute it was given: %v",
+				session.sid, group, err)
 		case <-time.After(500 * time.Millisecond):
 		}
 	}
-	t.Fatalf("%s never learned it is in %s", session.sid, group)
 }
 
 // liveGroupMode reads which namespace the group addresses its members by, through the
@@ -447,6 +458,13 @@ func TestLiveGroupReadKeyNamespace(t *testing.T) {
 	mode := liveGroupMode(t, subject, group)
 	wrong := liveOtherNamespace(t, subject, counterpartJID, mode)
 
+	// A read mark from an account with read receipts turned off is converted to
+	// `read-self` and never reaches the author, so every probe below would fail with the
+	// namespace handling perfectly correct. Asked rather than assumed, and skipped rather
+	// than worked around: turning somebody's privacy setting on from a test is not this
+	// phase's business.
+	liveMustSendReadReceipts(t, subject)
+
 	mine := watch(t, subject)
 	theirs := watch(t, counterpart)
 	for _, probe := range []struct {
@@ -518,5 +536,25 @@ func liveReceiptOn(t *testing.T, events *recorder, target, want string, within t
 		case <-deadline:
 			return false
 		}
+	}
+}
+
+// liveMustSendReadReceipts stops the read phase when this account does not send read
+// receipts at all.
+//
+// whatsmeow turns a read mark from such an account into `read-self`, which is not sent to
+// the author, so the phase would measure the privacy setting and report it as the
+// namespace being wrong.
+func liveMustSendReadReceipts(t *testing.T, session *Session) {
+	t.Helper()
+
+	settings, err := session.current().TryFetchPrivacySettings(t.Context(), false)
+	if err != nil {
+		t.Skipf("could not read this account's privacy settings, and a read mark means "+
+			"nothing without knowing whether receipts are sent at all: %v", err)
+	}
+	if settings.ReadReceipts == waTypes.PrivacySettingNone {
+		t.Skip("this account does not send read receipts, so a read mark never reaches " +
+			"the author and this phase would measure the privacy setting")
 	}
 }
