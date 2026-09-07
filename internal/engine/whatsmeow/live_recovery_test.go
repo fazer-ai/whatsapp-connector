@@ -151,7 +151,7 @@ func TestLiveTimeARetryRecovery(t *testing.T) {
 	liveResume(t, counterpart)
 
 	inbox := watch(t, subject)
-	livePrime(t, counterpart, inbox, liveMustBePaired(t, container, liveSID).User)
+	livePrime(t, counterpart, inbox, container.For(liveSID), liveMustBePaired(t, container, liveSID).User)
 	rounds := 5
 	if asked := os.Getenv("WAC_LIVE_ROUNDS"); asked != "" {
 		parsed, err := strconv.Atoi(asked)
@@ -278,7 +278,7 @@ func TestLiveARecoveryOutlivesTheSenderLeaving(t *testing.T) {
 	// with the counterpart and no way to have quietly rebuilt one.
 	liveResume(t, subject)
 	liveResume(t, counterpart)
-	livePrime(t, counterpart, watch(t, subject), subjectJID.User)
+	livePrime(t, counterpart, watch(t, subject), container.For(liveSID), subjectJID.User)
 	for _, who := range liveEveryNameOf(t, subject, counterpartJID) {
 		address := who.SignalAddress().String()
 		prefix := address[:strings.LastIndex(address, ":")]
@@ -365,17 +365,41 @@ func liveArrival(t *testing.T, events *recorder, id string, within time.Duration
 	}
 }
 
-// livePrime puts an ordinary message through, so the sender is talking over an
-// established Signal session by the time one is deliberately broken.
+// livePrime puts ordinary messages through until one of them arrives without needing a
+// recovery, so the sender is talking over an established Signal session by the time one
+// is deliberately broken.
 //
 // Without it the phase depends on these two accounts having a history. On a pair paired
 // this morning the counterpart's first message is a prekey message, which carries what it
 // takes to open it and needs no session on the receiving side at all -- so deleting that
 // side's session changes nothing, the message decrypts, no placeholder is held, and a
 // phase that has one shot at the scenario reports a failure over correct behaviour.
-func livePrime(t *testing.T, from *Session, inbox *recorder, to string) {
+//
+// One message is not enough, and the reason is the same fact one layer along: a durable
+// store can begin the run with a session that has already drifted, so the prime itself
+// recovers, and the message *after* a recovery is the prekey one. Priming once would then
+// hand the measured send exactly the shape it was supposed to rule out. So it repeats
+// until a prime needs no recovery of its own, which is what "established" means here.
+func livePrime(t *testing.T, from *Session, inbox *recorder, held *store.Scoped, to string) {
 	t.Helper()
 
-	sent := liveSay(t, from, to, "conector nativo, estabelecendo a sessao")
-	inbox.awaitMessage(t, sent, 2*time.Minute)
+	for attempt := range 5 {
+		sent := liveSay(t, from, to, "conector nativo, estabelecendo a sessao")
+		watching, stop := context.WithCancel(t.Context())
+		holding := liveWatchForHold(watching, held, sent)
+		inbox.awaitMessage(t, sent, 2*time.Minute)
+		stop()
+
+		found := <-holding
+		if found.err != nil {
+			t.Fatalf("could not read the placeholders while priming: %v", found.err)
+		}
+		if !found.held {
+			return
+		}
+		t.Logf("the prime itself recovered on attempt %d, so the next message would be a "+
+			"prekey; priming again", attempt+1)
+	}
+	t.Fatal("every prime needed a recovery of its own, so this pair never settled into an " +
+		"established session and the scenario below cannot be arranged")
 }
