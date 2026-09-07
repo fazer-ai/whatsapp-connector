@@ -247,6 +247,64 @@ func unavailableMessage(id, kind string) *waEvents.UndecryptableMessage {
 	}
 }
 
+// The `groups` flag guards four paths, and this is the one it was missing a test for.
+// The other three -- an ordinary message, a chat presence and a receipt -- each have one
+// naming the same boundary, and an unreadable message reaches the group check by a route
+// of its own: it is published from unreadable rather than from the message path, so a
+// change there could take the check with it and leave the other three green.
+//
+// Landing it as a placeholder would be the worse of the two failures. A client that asked
+// for direct chats only never got the group's messages, so a bubble saying one of them
+// cannot be read is about a conversation it does not have.
+//
+// What is asserted is the waiting list rather than the event stream, and the difference
+// is what makes this test able to fail. A placeholder is not published when the handler
+// runs: `await` writes it down and a timer publishes it later, so the handler answers
+// WhatsApp with nothing on the stream either way. Watching the stream for a while and
+// calling it clean proves only that the timer had not fired yet -- the first version of
+// this test did exactly that, and passed with the group check commented out. The entry in
+// `awaited` is written before `handle` returns, so asking whether one is there is the
+// same question with no clock in it.
+func TestAnUnreadableGroupMessageIsDroppedWhenTheClientAskedForDirectChatsOnly(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	// Left at its default, which is what an ordinary inbox sends: `groups` is opt-in on
+	// the client and this session was never told otherwise.
+	//
+	// The wait is long rather than short on purpose: it is what a scheduled placeholder
+	// would still be sitting under when the assertion runs, so a build that schedules one
+	// is caught holding it rather than racing to publish it.
+	session.rerequestWait = time.Hour
+
+	event := unavailableMessage("3EB0GROUPNOSENDERKEY", "")
+	event.Info.Chat = waTypes.NewJID("120363041234567890", waTypes.GroupServer)
+	event.Info.IsGroup = true
+
+	acknowledged := make(chan bool, 1)
+	go func() { acknowledged <- session.handle(event) }()
+	select {
+	case got := <-acknowledged:
+		if !got {
+			t.Fatal("the message was left for WhatsApp to send again, and it carries nothing again")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the handler never came back")
+	}
+
+	session.awaitedMu.Lock()
+	waiting := len(session.awaited)
+	session.awaitedMu.Unlock()
+	if waiting != 0 {
+		t.Errorf("a placeholder is waiting to go out for a group the client did not subscribe to")
+	}
+	select {
+	case emission := <-session.Events():
+		t.Errorf("something was published for a group the client did not subscribe to: %s", emission.Payload)
+	default:
+	}
+}
+
 // publishedNothingUnreadable runs the handler and fails if anything was published or if
 // the handler did not answer WhatsApp.
 //
