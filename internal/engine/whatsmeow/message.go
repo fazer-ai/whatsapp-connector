@@ -540,6 +540,7 @@ func (s *Session) receive(event *waEvents.Message) bool {
 		// Held without being in time is a bubble the forwarder already committed to, and
 		// its row is as finished as one called off: the decision has been made either way,
 		// and only an undecided row should outlive this process.
+		s.reportWindow(stanza, 0, false)
 		s.dropHold(stanza)
 	}
 
@@ -763,9 +764,7 @@ func whyUnopened(event *waEvents.UndecryptableMessage, chat protocol.AddressKind
 // publishes the placeholder if it does not.
 func (s *Session) awaitOrPublish(message *protocol.InboundMessage, learned int64) {
 	due := learned + s.rerequestWait.Milliseconds()
-	if s.held != nil {
-		s.held(message.ID, learned)
-	}
+	s.reportWindow(message.ID, learned, true)
 	s.hold(message, learned, due)
 	// Measured from the deadline that was written down, not from here. Holding the row
 	// is a store call and can take up to the store bound, and a window started after it

@@ -315,12 +315,16 @@ type Session struct {
 	// A seam for the same reason as the ones below it: nil is the real one.
 	privacyKnown func(context.Context) error
 
-	// held is told when a message is found unreadable and given a window, with the id
-	// and the instant the window starts from. A seam because that instant is the one
-	// thing about this path that reaches nothing else: the placeholder row carries it
-	// but is deleted as soon as the message turns up, so anything watching from outside
-	// is racing a row that lives for about a second. Nil is the real one.
-	held func(messageID string, learnedAt int64)
+	// window is told when a message is found unreadable and given one, and again when
+	// that window is decided, so both ends of a recovery are reported from the path that
+	// performs it. A seam because neither instant reaches anything else: the placeholder
+	// row carries the first and is deleted at the second, so anything watching from
+	// outside is racing a row that lives about a second.
+	//
+	// Read under the mutex like every other field here, because it is called from
+	// whatsmeow's event goroutine while a test may still be setting it. Nil is the real
+	// one.
+	window func(messageID string, learnedAt int64, opened bool)
 
 	// groupMode is how a group addresses its members, which decides the namespace a
 	// message key in it names a sender by. A field because reading it is a round trip to
@@ -667,6 +671,16 @@ func (s *Session) wantsGroups() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.groups
+}
+
+// reportWindow tells the seam, if there is one, under the lock that guards it.
+func (s *Session) reportWindow(messageID string, learnedAt int64, opened bool) {
+	s.mu.Lock()
+	report := s.window
+	s.mu.Unlock()
+	if report != nil {
+		report(messageID, learnedAt, opened)
+	}
 }
 
 func (s *Session) setIdentity(phone, lid string) {

@@ -53,28 +53,74 @@ import (
 func liveHolds(t *testing.T, session *Session) *holds {
 	t.Helper()
 
-	seen := &holds{at: map[string]int64{}}
-	session.held = func(messageID string, learnedAt int64) {
-		seen.mu.Lock()
-		defer seen.mu.Unlock()
-		seen.at[messageID] = learnedAt
-	}
-	t.Cleanup(func() { session.held = nil })
+	seen := &holds{opened: map[string]int64{}, closed: map[string]time.Time{}}
+	// Set and cleared through the session's own lock, which is what `reportWindow` reads
+	// it under: whatsmeow calls it from the event goroutine, and a plain assignment here
+	// races that.
+	session.mu.Lock()
+	session.window = seen.record
+	session.mu.Unlock()
+	t.Cleanup(func() {
+		session.mu.Lock()
+		session.window = nil
+		session.mu.Unlock()
+	})
 	return seen
 }
 
 type holds struct {
 	mu sync.Mutex
-	at map[string]int64
+	// opened is the first window each message was given. Only the first: a resend that
+	// is also unreadable opens the question again, and `await` deliberately keeps the
+	// original timer, so overwriting would report the last failure instead of the wait
+	// production is actually serving -- a recovery 50s after the first failure with a
+	// second failure at 40s would read as 10s and pass, while the real placeholder had
+	// already won.
+	opened map[string]int64
+	// closed is when the window was decided, which is where a recovery ends. Taking the
+	// time at `awaitMessage` instead measures the publish behind it -- the store write,
+	// the forwarder, the settle -- none of which production counts against the window.
+	closed map[string]time.Time
 }
 
-// when is the instant a message's window started, and whether it ever had one. A message
-// that was readable never gets here, which is the whole signal: no window, no recovery.
+func (h *holds) record(messageID string, learnedAt int64, opened bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	switch {
+	case !opened:
+		if _, already := h.closed[messageID]; !already {
+			h.closed[messageID] = time.Now()
+		}
+	default:
+		if _, already := h.opened[messageID]; !already {
+			h.opened[messageID] = learnedAt
+		}
+	}
+}
+
+// took is how long a message's window stood before it was decided, and whether there was
+// one at all. A message that was readable never opens one, which is the whole signal.
+func (h *holds) took(messageID string) (time.Duration, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	at, opened := h.opened[messageID]
+	if !opened {
+		return 0, false
+	}
+	done, closed := h.closed[messageID]
+	if !closed {
+		return 0, false
+	}
+	return done.Sub(time.UnixMilli(at)), true
+}
+
+// when is the instant a message's window started, for a phase that measures from it
+// rather than over it.
 func (h *holds) when(messageID string) (int64, bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	at, held := h.at[messageID]
-	return at, held
+	at, opened := h.opened[messageID]
+	return at, opened
 }
 
 // liveEveryNameOf is the counterpart under every namespace this account may have filed it
@@ -162,7 +208,6 @@ func TestLiveTimeARetryRecovery(t *testing.T) {
 		body := fmt.Sprintf("conector nativo, recuperacao %d de %d", len(took)+1, rounds)
 		sent := liveSay(t, counterpart, liveMustBePaired(t, container, liveSID).User, body)
 		inbox.awaitMessage(t, sent, 5*time.Minute)
-		arrived := time.Now()
 
 		// The scenario, verified after the fact rather than arranged and assumed. Asking
 		// beforehand whether a session existed is the weaker question and was the first
@@ -175,12 +220,11 @@ func TestLiveTimeARetryRecovery(t *testing.T) {
 		// somewhere else in the process cannot admit an ordinary delivery as a sample.
 		// A placeholder is only ever held for a message this session could not read, so
 		// the row existing is the scenario having happened.
-		at, held := windows.when(sent)
+		elapsed, held := windows.took(sent)
 		if !held {
 			t.Logf("attempt %d decrypted first try, so it is not a sample", attempt+1)
 			continue
 		}
-		elapsed := arrived.Sub(time.UnixMilli(at))
 
 		took = append(took, elapsed)
 		t.Logf("sample %d: %s", len(took), elapsed.Round(time.Millisecond))
@@ -293,15 +337,11 @@ func TestLiveARecoveryOutlivesTheSenderLeaving(t *testing.T) {
 			"in production the placeholder would have gone out at %s and the real message "+
 			"been discarded behind it", within, rerequestTimeout)
 	}
-	at, held := windows.when(sent)
+	elapsed, held := windows.took(sent)
 	if !held {
 		t.Fatal("this message was readable, so no window was ever opened for it and " +
 			"there is no recovery to time; the deleted session was not the one it used")
 	}
-	// From what production wrote down, not from the resume: bringing the account back is
-	// this phase's own setup and production pays none of it, so counting it would inflate
-	// the number the placeholder window is being compared against.
-	elapsed := time.Since(time.UnixMilli(at))
 	t.Logf("recovered in %s with the sender's connector session offline the whole time, "+
 		"so the retry was answered by another of that account's devices", elapsed.Round(time.Millisecond))
 	if elapsed >= rerequestTimeout {
