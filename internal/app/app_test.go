@@ -1,6 +1,7 @@
 package app_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -109,7 +111,20 @@ func start(t *testing.T, addr, instance string, env map[string]string) *app.Conn
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
 	}
-	connector, err := app.New(&cfg, zerolog.New(os.Stderr).Level(zerolog.ErrorLevel))
+
+	// Kept rather than printed, and printed only when the test fails. These tests run a
+	// whole connector against a real Redis, and what it says about a lease it lost or a
+	// stream it could not claim is the difference between a diagnosis and a rerun -- but
+	// at ERROR on stderr, a warning never appears at all, and at anything louder every
+	// passing test buries the run. Registered before the shutdown below so it runs after
+	// it, with everything the connector had to say already in the buffer.
+	logged := &syncBuffer{}
+	t.Cleanup(func() {
+		if t.Failed() {
+			t.Logf("what the connector logged:\n%s", logged.String())
+		}
+	})
+	connector, err := app.New(&cfg, zerolog.New(logged).Level(zerolog.DebugLevel))
 	if err != nil {
 		t.Fatalf("app.New: %v", err)
 	}
@@ -459,7 +474,16 @@ func TestASessionIsDrainedBeforeAnythingNewerIsReadForIt(t *testing.T) {
 			t.Fatalf("unmarshal the status: %v", err)
 		}
 		if status["connection"] != "open" {
-			t.Fatalf("connection=%v after the abandoned disconnect came back, want open", status["connection"])
+			// Two things close a connection here and they need different fixes, so the
+			// assertion says which: the abandoned disconnect being carried out late,
+			// which is the defect this test is for, or the session having been let go
+			// because its lease went stale, which at a 7s TTL is a stalled heartbeat and
+			// not an ordering bug at all. A session this instance no longer runs is the
+			// second.
+			t.Fatalf("connection=%v after %s of the window, with %d session(s) still adopted "+
+				"(0 means the lease went stale and this is not the disconnect coming back), want open",
+				status["connection"], time.Since(deadline.Add(-9*time.Second)).Round(time.Millisecond),
+				connector.Sessions())
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
@@ -1062,4 +1086,23 @@ func TestANonPositiveSendCapIsRefused(t *testing.T) {
 			t.Fatalf("WAC_MEDIA_SEND_MAX=%q was accepted", bad)
 		}
 	}
+}
+
+// syncBuffer is a log a test can read while the connector is still writing it. zerolog
+// does no locking of its own, and the connector writes from every goroutine it runs.
+type syncBuffer struct {
+	mu      sync.Mutex
+	written bytes.Buffer
+}
+
+func (b *syncBuffer) Write(line []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.written.Write(line)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.written.String()
 }
