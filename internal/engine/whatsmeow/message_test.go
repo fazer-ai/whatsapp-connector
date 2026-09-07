@@ -95,7 +95,7 @@ func TestASenderCarriesBothIdentifiersWhenWhatsAppSendsBoth(t *testing.T) {
 		PushName: "Alice",
 	}
 
-	party, named := partyOf(info)
+	party, named := plain(t).partyOf(t.Context(), info)
 	if !named || party == nil {
 		t.Fatal("a sender WhatsApp named twice was left off the message")
 	}
@@ -119,7 +119,7 @@ func TestASenderTheContractCannotNameStopsTheMessageRatherThanGoingOutEmpty(t *t
 		PushName:      "Somebody",
 	}
 
-	party, named := partyOf(info)
+	party, named := plain(t).partyOf(t.Context(), info)
 	if named {
 		t.Fatalf("a sender the contract cannot name was accepted as %+v", party)
 	}
@@ -146,7 +146,7 @@ func TestANewsletterPostIsPublishedWithNoSenderToAttributeItTo(t *testing.T) {
 		Message: &waE2E.Message{Conversation: proto.String("edição de hoje")},
 	}
 
-	message, _, ok := inboundOf(event, plainBody)
+	message, _, ok := plain(t).inboundOf(event, plainBody)
 	if !ok {
 		t.Fatal("a newsletter post was withheld, so the channel would redeliver it for good")
 	}
@@ -176,7 +176,7 @@ func TestAPlainTextMessageIsRenderedTheWayTheContractCarriesIt(t *testing.T) {
 		Message: &waE2E.Message{Conversation: proto.String("bom dia")},
 	}
 
-	message, _, ok := inboundOf(event, plainBody)
+	message, _, ok := plain(t).inboundOf(event, plainBody)
 	if !ok {
 		t.Fatal("a plain text message is the one thing this build can carry, and it was refused")
 	}
@@ -221,7 +221,7 @@ func TestAnExtendedTextMessageCarriesTheQuoteTheMentionsAndTheTimer(t *testing.T
 		}},
 	}
 
-	message, _, ok := inboundOf(event, plainBody)
+	message, _, ok := plain(t).inboundOf(event, plainBody)
 	if !ok {
 		t.Fatal("an extended text message was refused")
 	}
@@ -496,7 +496,7 @@ func TestAnIncomingBroadcastIsAddressedToTheChatTheRecipientSeesItIn(t *testing.
 	event.Info.Sender = sender
 	event.Info.IsGroup = true
 
-	message, _, ok := inboundOf(event, plainBody)
+	message, _, ok := plain(t).inboundOf(event, plainBody)
 	if !ok {
 		t.Fatal("a broadcast a recipient can read was withheld")
 	}
@@ -521,7 +521,7 @@ func TestAStatusPostStaysOnTheStatusFeed(t *testing.T) {
 	event.Info.Sender = waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)
 	event.Info.IsGroup = true
 
-	message, _, ok := inboundOf(event, plainBody)
+	message, _, ok := plain(t).inboundOf(event, plainBody)
 	if !ok {
 		t.Fatal("a status post was withheld")
 	}
@@ -629,7 +629,7 @@ func TestAnEchoFromAnotherDeviceCarriesNoSender(t *testing.T) {
 	event.Info.Sender = account
 	event.Info.IsFromMe = true
 
-	message, _, ok := inboundOf(event, plainBody)
+	message, _, ok := plain(t).inboundOf(event, plainBody)
 	if !ok {
 		t.Fatal("an echo of the account's own send was withheld")
 	}

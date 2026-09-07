@@ -1912,8 +1912,10 @@ collect:
 
 	// Measured on 29/08/2026: all three arrive, the stop about six seconds after the
 	// typing it ends, and a direct chat's presence comes addressed by LID with no number
-	// anywhere on it -- `SenderAlt` is empty, so there is nothing for `addressedBy` to
-	// prefer. That last part is #50, and it is not this path's alone.
+	// anywhere on it -- `SenderAlt` is empty, so the event answers nothing about the
+	// other namespace. That is what the resolution in addressing.go is for, and this run
+	// is the measurement it was written from: the mapping comes from the device store,
+	// because there is nothing on the event to prefer.
 	//
 	// The stop is required and not optional. Everything about how presence is queued
 	// turns on it existing: a typing indicator has nothing after it, so the board keeps

@@ -513,7 +513,7 @@ func (s *Session) remember(event *waEvents.Message, part *attachment) bool {
 	// Through chatOf, which is what the event was published under. Recomputing it here
 	// would be a second copy of the broadcast rule, and a copy that drifted would file a
 	// message's file under a chat the message is not in.
-	chat, _ := chatOf(&event.Info)
+	chat, _ := s.chatOf(ctx, &event.Info)
 	kept := store.MediaPart{
 		MessageID: messageID,
 		ChatKind:  string(chat.Kind), ChatID: chat.ID, Kind: string(part.content.Kind),

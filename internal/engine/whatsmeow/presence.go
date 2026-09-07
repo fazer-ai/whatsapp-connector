@@ -37,7 +37,10 @@ import (
 // because they describe a moment; the `paused` does not, and neither does an
 // availability, because both stay true until something says otherwise.
 func (s *Session) chatPresence(event *waEvents.ChatPresence) bool {
-	chat, addressable := addressOf(event.Chat)
+	looking, done := s.looking()
+	defer done()
+
+	chat, addressable := s.address(looking, event.Chat)
 	if !addressable {
 		return true
 	}
@@ -45,6 +48,13 @@ func (s *Session) chatPresence(event *waEvents.ChatPresence) bool {
 		return true
 	}
 	direct := chat.Kind == protocol.AddressPhone || chat.Kind == protocol.AddressLID
+	if direct {
+		// In a direct chat the chat is the person, so the alternative the event carries
+		// for the sender names the same conversation and is worth preferring. In a group
+		// it names the participant, and reading it as the chat would publish somebody's
+		// typing under their own address instead of under the group.
+		chat, _ = s.address(looking, event.Chat, event.SenderAlt)
+	}
 	if direct && event.IsFromMe {
 		// This account typing on another of its own devices. In a direct chat the
 		// contract reads a `chat.presence` as being about the other party -- `sender` is
@@ -69,27 +79,8 @@ func (s *Session) chatPresence(event *waEvents.ChatPresence) bool {
 			Msg("dropping a chat presence the contract does not name")
 		return true
 	}
-	if canonical, ok := addressedBy(event.Chat, event.SenderAlt); direct && ok {
-		// The chat as the person rather than as the address that arrived, so far as the
-		// event says who that is. WhatsApp reaches a direct peer under either of its two
-		// namespaces from one event to the next, and published as it came, a `composing`
-		// in the LID chat and the `paused` in the number chat are two chats to a client:
-		// the stop clears nothing, and which of the two the client sees at all would
-		// depend on whether the two happened to coalesce on the board, which is not
-		// something a client should be able to tell.
-		//
-		// This reaches as far as the event does and no further. A real `chatstate` for a
-		// direct chat carries one namespace and no alternative -- every node in the live
-		// run of 29/08/2026 arrived LID-only -- so where there is nothing to prefer, what
-		// goes out is what came in. The mapping the session would need is in the device
-		// store and nowhere near this function, and reading it here would put presence on
-		// a different address from the receipts, which is one more shape for a client to
-		// reconcile rather than one fewer. Registered as #50, across all the paths.
-		chat = canonical
-	}
 	published := protocol.ChatPresence{Chat: chat, State: state}
-	sender := protocol.Party{}
-	naming(&sender, event.Sender, event.SenderAlt)
+	sender := s.party(looking, event.Sender, event.SenderAlt)
 	if sender.Phone != "" || sender.LID != "" {
 		published.Sender = &sender
 	}
@@ -115,7 +106,7 @@ func (s *Session) chatPresence(event *waEvents.ChatPresence) bool {
 	// nobody else types in somebody's direct chat.
 	key := string(protocol.EventChatPresence) + ":" + keyOf(chat)
 	if !direct {
-		who, _ := addressedBy(event.Sender, event.SenderAlt)
+		who, _ := s.address(looking, event.Sender, event.SenderAlt)
 		key = string(protocol.EventChatPresence) + ":" + keyOf(chat) + ":" + keyOf(who)
 	}
 	s.post(key, protocol.EventChatPresence, published, life)
@@ -126,8 +117,11 @@ func (s *Session) chatPresence(event *waEvents.ChatPresence) bool {
 // session subscribed to. Published on the same terms as the typing above, and for the
 // same reason.
 func (s *Session) presence(event *waEvents.Presence) bool {
-	party := &protocol.Party{}
-	naming(party, event.From)
+	looking, done := s.looking()
+	defer done()
+
+	named := s.party(looking, event.From)
+	party := &named
 	if party.Phone == "" && party.LID == "" {
 		return true
 	}
@@ -150,36 +144,10 @@ func (s *Session) presence(event *waEvents.Presence) bool {
 	// them the way they were subscribed, so one contact is one key here for as long as a
 	// client asks about them the same way. There is no second address on the event to
 	// canonicalise against the way the typing above has one.
-	from, _ := addressedBy(event.From)
+	from, _ := s.address(looking, event.From)
 	s.post(string(protocol.EventPresenceUpdate)+":"+keyOf(from),
 		protocol.EventPresenceUpdate, published, 0)
 	return true
-}
-
-// addressedBy is the one address a person is known by here, which is their number
-// wherever WhatsApp offered one.
-//
-// The same person reaches this under either of WhatsApp's two namespaces, and which one
-// arrives is not the session's to choose. Taken as it came, a `composing` addressed by
-// LID and the `paused` after it addressed by number are two people: two board entries, so
-// nothing coalesces, and two chats on the wire, so the stop clears nothing. Where the
-// event carries both -- and a chat presence does -- one of them is always the number, so
-// preferring it makes the two events one.
-//
-// Which JIDs are numbers is `addressOf`'s answer and not a second copy of it, because
-// there is more than one server that means "a number": the legacy one and the hosted one
-// alongside the ordinary one, and a copy that knew only the ordinary one would take a
-// hosted contact as whichever address happened to arrive first.
-func addressedBy(jids ...waTypes.JID) (protocol.Address, bool) {
-	var chosen protocol.Address
-	for _, jid := range jids {
-		switch address, ok := addressOf(jid); {
-		case !ok:
-		case chosen.ID == "", chosen.Kind != protocol.AddressPhone && address.Kind == protocol.AddressPhone:
-			chosen = address
-		}
-	}
-	return chosen, chosen.ID != ""
 }
 
 // keyOf is an address as one string, for a board key.

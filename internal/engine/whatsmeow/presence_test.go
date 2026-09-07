@@ -1223,8 +1223,14 @@ func TestADirectChatGoesOutUnderOneAddressWhicheverOneArrives(t *testing.T) {
 	if typing != stop {
 		t.Errorf("the typing went out for %v and the stop for %v, and one of them will never be cleared", typing, stop)
 	}
-	if want := (protocol.Address{Kind: protocol.AddressPhone, ID: "5511999990002"}); stop != want {
-		t.Errorf("the chat went out as %v, and the number is the address WhatsApp offered for it", stop)
+	// The LID, and which of the two is not a coin toss. The client's own contact key is
+	// its LID when it has one and its number otherwise, and its consolidation merges a
+	// phone-keyed contact into the LID when it learns both -- so canonicalising the other
+	// way would publish under the address the client is migrating away from. WhatsApp is
+	// moving the same direction, and the number is the half that can go missing on a
+	// privacy setting while the LID cannot.
+	if want := (protocol.Address{Kind: protocol.AddressLID, ID: "167392323834034"}); stop != want {
+		t.Errorf("the chat went out as %v, want the LID both paths agree on", stop)
 	}
 }
 
