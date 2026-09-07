@@ -16,6 +16,7 @@ import (
 	"context"
 	"crypto/rand"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -168,7 +169,7 @@ func newDatabase(t *testing.T, server string) Target {
 		// fails the test that noticed instead of hanging the suite.
 		ctx, cancel := context.WithTimeout(context.Background(), dropTimeout)
 		defer cancel()
-		if err := dropDatabase(ctx, name); err != nil {
+		if err := dropDatabase(ctx, adminDB, name); err != nil {
 			if errors.Is(err, errQueued) {
 				// Never started, because the four connections this package allows itself
 				// were all busy, and the test it belonged to has already passed or failed
@@ -238,30 +239,57 @@ var dropTimeout = 30 * time.Second
 // only failure worth leaving a database behind for.
 var errQueued = errors.New("storetest: no admin connection came free")
 
-// dropDatabase removes one test's database, taking its connection and running its
-// statement as two steps so the caller can tell which of them ran out of time.
+// dropDatabase removes one test's database.
 //
-// The split is what keeps a broken server loud. Both halves end on the same context, so
-// a single check on that context would file a server that stopped answering mid-drop
-// under the same heading as a queue -- and the queue is the harmless one. Measured under
-// three concurrent suites on one server, the difference is not subtle: waiting for a
-// connection reaches 19.3s, while the statement itself never passed 7.3s, and the worst
-// cleanup of the run was 19.3s of queue in front of 1.0s of work.
+// Three things are separated here that a single `db.ExecContext` runs together, and each
+// of them was getting the wrong answer from the one before.
 //
-// FORCE because a pool closes its idle connections and does not wait for the server to
-// notice; without it the drop loses a race it has no reason to be in.
-func dropDatabase(ctx context.Context, name string) error {
-	conn, err := adminDB.Conn(ctx)
-	if err != nil {
-		return fmt.Errorf("%w to drop %s: %w", errQueued, name, err)
+// Waiting for a connection is bounded by the caller's context, and only a deadline while
+// waiting is congestion: a pool that has capacity and still cannot hand one over is a
+// server that went away, which has to stay loud. Measured under three concurrent suites
+// on one server, the wait is where the time goes -- it reaches 19.3s while the statement
+// itself never passed 7.3s, and two thirds of all the time these cleanups spend is spent
+// queueing.
+//
+// The statement then gets a bound of its own, counted from when it actually starts. On
+// the caller's remainder, a connection that came free a moment before the deadline would
+// leave the drop to fail as a stalled server -- the exact reading this split exists to
+// avoid, produced by the congestion it exists to forgive.
+//
+// And the retry is what `database/sql` does when the connection is its own: a pooled
+// connection the server closed while idle is only discovered on the first write, and
+// lib/pq reports `driver.ErrBadConn` for it. Taking the connection by hand opts out of
+// that, so the second attempt is put back by hand.
+func dropDatabase(ctx context.Context, db *sql.DB, name string) error {
+	var err error
+	for range 2 {
+		var conn *sql.Conn
+		conn, err = db.Conn(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return fmt.Errorf("%w to drop %s: %w", errQueued, name, err)
+			}
+			return fmt.Errorf("storetest: take a connection to drop %s: %w", name, err)
+		}
+
+		run, cancel := context.WithTimeout(context.WithoutCancel(ctx), dropTimeout)
+		err = dropOn(run, conn, name)
+		cancel()
+		_ = conn.Close()
+
+		if !errors.Is(err, driver.ErrBadConn) {
+			return err
+		}
 	}
-	defer func() { _ = conn.Close() }()
-	return dropOn(ctx, conn, name)
+	return err
 }
 
 // dropOn is the half that has a connection already, and every failure it reports is the
 // server's: one that stops answering mid-statement fails the test rather than being
 // filed under the queue that never touched it.
+//
+// FORCE because a pool closes its idle connections and does not wait for the server to
+// notice; without it the drop loses a race it has no reason to be in.
 func dropOn(ctx context.Context, conn *sql.Conn, name string) error {
 	if _, err := conn.ExecContext(ctx, `DROP DATABASE `+quote(name)+` WITH (FORCE)`); err != nil {
 		return fmt.Errorf("storetest: drop %s: %w", name, err)

@@ -2,6 +2,7 @@ package storetest
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"net/url"
 	"os"
@@ -27,7 +28,7 @@ func TestADropThatNeverGotAConnectionIsCongestion(t *testing.T) {
 	defer cancel()
 	<-spent.Done()
 
-	err := dropDatabase(spent, databaseName(t))
+	err := dropDatabase(spent, adminDB, databaseName(t))
 	if err == nil {
 		t.Fatal("a drop on a context with no time left reported success, so this proves nothing")
 	}
@@ -48,7 +49,7 @@ func TestADropTheServerRefusedIsNotCongestion(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), dropTimeout)
 	defer cancel()
 
-	err := dropDatabase(ctx, "wac_no_such_database_for_"+databaseName(t))
+	err := dropDatabase(ctx, adminDB, "wac_no_such_database_for_"+databaseName(t))
 	if err == nil {
 		t.Fatal("dropping a database that does not exist reported success")
 	}
@@ -79,7 +80,7 @@ func TestACleanupThatRanOutOfTimeDoesNotFailItsTest(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), dropTimeout)
 		defer cancel()
 		if name, err := databaseIn(left.dsn); err == nil {
-			_ = dropDatabase(ctx, name)
+			_ = dropDatabase(ctx, adminDB, name)
 		}
 	})
 
@@ -127,5 +128,62 @@ func TestADropThatStalledAfterItStartedIsNotCongestion(t *testing.T) {
 	}
 	if errors.Is(err, errQueued) {
 		t.Fatalf("a server that stopped answering mid-drop is filed as congestion, so it would pass quietly: %v", err)
+	}
+}
+
+// A pool with room that still cannot hand over a connection is a server that went away,
+// not a queue. Filing it under congestion would let the suite pass quietly on a
+// PostgreSQL that died after the tests themselves had finished.
+func TestAConnectionThatCouldNotBeMadeIsNotCongestion(t *testing.T) {
+	if os.Getenv(AddressEnv) == "" {
+		t.Skipf("%s is unset, so there is no server to compare against", AddressEnv)
+	}
+	// A pool of its own, pointed at nothing: no waiting is involved, the dial simply
+	// fails.
+	gone, err := sql.Open("postgres", "postgres://wac:wac@127.0.0.1:1/wac?sslmode=disable")
+	if err != nil {
+		t.Fatalf("open a pool pointing nowhere: %v", err)
+	}
+	defer func() { _ = gone.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err = dropDatabase(ctx, gone, "wac_whatever")
+	if err == nil {
+		t.Fatal("a drop against a server that is not there reported success")
+	}
+	if errors.Is(err, errQueued) {
+		t.Fatalf("a server that could not be reached is filed as congestion, so it would pass quietly: %v", err)
+	}
+	if ctx.Err() != nil {
+		t.Fatal("the context ran out, so this measured a deadline rather than a refused connection")
+	}
+}
+
+// The statement is bounded from when it starts, not from what the queue left over. A
+// connection that comes free a moment before the caller's deadline would otherwise leave
+// the drop to fail as a stalled server -- the loud reading, produced by the very
+// congestion this is meant to forgive.
+func TestAQueuedDropStillGetsAFullTimeoutToRunIn(t *testing.T) {
+	if os.Getenv(AddressEnv) == "" {
+		t.Skipf("%s is unset, so there is nothing to drop", AddressEnv)
+	}
+	// One through New to open the admin pool, and a second one by hand for this test to
+	// drop: a database New handed out is dropped again by its own cleanup, which would
+	// then fail on the one this test already removed.
+	New(t)
+	name := databaseName(t)
+	if _, err := adminDB.ExecContext(context.Background(), `CREATE DATABASE `+quote(name)); err != nil {
+		t.Fatalf("create a database to drop: %v", err)
+	}
+
+	// Long enough to take a connection from an idle pool, far short of a drop: the
+	// fastest drop measured on this suite was 42ms.
+	nearlySpent, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	if err := dropDatabase(nearlySpent, adminDB, name); err != nil {
+		t.Fatalf("a drop that got its connection in time still failed on the caller's leftovers: %v", err)
 	}
 }
