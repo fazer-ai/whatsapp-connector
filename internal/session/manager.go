@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -182,11 +183,16 @@ func (m *Manager) Adopt(ctx context.Context, sid string) (*Session, error) {
 		return winner, nil
 	}
 	m.sessions[sid] = session
-	m.mu.Unlock()
-
+	// Under the same lock as the insert, and this is the ordering the whole file turns
+	// on: between the two there used to be a moment where the session was running and
+	// not yet waiting to be drained. Nothing could observe it while adoption ran on the
+	// reader's own goroutine; the moment it does not, a reader looking into that gap
+	// would find the session in SIDs, miss it among the newly adopted, and read `>` for
+	// it ahead of everything its previous owner left pending.
 	m.newlyMu.Lock()
 	m.newly = append(m.newly, sid)
 	m.newlyMu.Unlock()
+	m.mu.Unlock()
 
 	m.log.Info().Str("sid", sid).Uint64("epoch", lease.Epoch).Msg("adopted a session")
 	return session, nil
@@ -333,6 +339,49 @@ func (m *Manager) forgetOrphan(sid string) {
 	m.orphanMu.Unlock()
 }
 
+// GiveBack hands a delivery back without carrying it out, and remembers that the session
+// it belongs to has an older entry pending again.
+//
+// Every site that gives up a command for a session this instance runs goes through here
+// rather than calling release directly, because the remembering is the whole point and a
+// site that forgot it would bring the overtaking back in silence. What decides is the
+// delivery itself: a wake and a ping live on the control stream, so giving one back
+// leaves nothing pending on a session's, and a command for a session this instance does
+// not run is on its way to whoever does.
+//
+// The set is the one adoption uses, and reusing it is not a shortcut. Both mean the same
+// thing -- there is an older command on this stream that has not been carried out -- and
+// the drain already lets a session back into the `>` read only when a pass finds nothing
+// left for it. A mark cleared on the first command accepted instead would let a second
+// held one be overtaken by something newer.
+func (m *Manager) GiveBack(delivery *transport.Delivery) {
+	release(delivery)
+
+	sid := delivery.Command.SID
+	switch {
+	case sid == "":
+	case delivery.Command.Type == protocol.CommandSessionWake,
+		delivery.Command.Type == protocol.CommandAdminPing:
+	default:
+		m.mu.RLock()
+		_, running := m.sessions[sid]
+		m.mu.RUnlock()
+		if running {
+			m.undrained(sid)
+		}
+	}
+}
+
+// undrained puts a session back among those whose stream has to be taken over before
+// anything newer is read for it.
+func (m *Manager) undrained(sid string) {
+	m.newlyMu.Lock()
+	if !slices.Contains(m.newly, sid) {
+		m.newly = append(m.newly, sid)
+	}
+	m.newlyMu.Unlock()
+}
+
 // Dispatch routes one command. It answers by itself for the two it can answer without
 // a session (`session.wake` and `admin.ping`) and hands the rest to the session.
 func (m *Manager) Dispatch(ctx context.Context, delivery *transport.Delivery) {
@@ -355,7 +404,7 @@ func (m *Manager) Dispatch(ctx context.Context, delivery *transport.Delivery) {
 		// the session reads the same stream, and an instance that owns nothing must not
 		// swallow a command on its way there. Released, so it does not read as work this
 		// process is still doing and become unclaimable.
-		release(delivery)
+		m.GiveBack(delivery)
 		return
 	}
 	switch session.Offer(delivery) {
@@ -365,7 +414,7 @@ func (m *Manager) Dispatch(ctx context.Context, delivery *transport.Delivery) {
 	case OfferStopped:
 		// This instance is letting the account go. Refusing would answer for an owner
 		// it is no longer, so the command stays pending for whoever takes it next.
-		release(delivery)
+		m.GiveBack(delivery)
 	}
 }
 
@@ -390,7 +439,7 @@ func (m *Manager) wake(ctx context.Context, delivery *transport.Delivery) {
 			// stale key expires there is nothing left to start it at all.
 			m.log.Warn().Str("sid", sid).
 				Msg("a wake found a lease this instance is still handing back; leaving it pending")
-			release(delivery)
+			m.GiveBack(delivery)
 			return
 		}
 	default:

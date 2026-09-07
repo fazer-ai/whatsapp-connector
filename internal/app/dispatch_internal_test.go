@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -796,4 +797,175 @@ func TestAReclaimDispatchesOnWhatIsLeftOfItsOwnDeadline(t *testing.T) {
 		t.Fatalf("dispatch was given %s, which is a fresh budget rather than what was left of the pass's %s",
 			left, budget)
 	}
+}
+
+// orderedReplier records which commands were answered, in the order they were.
+type orderedReplier struct {
+	mu       sync.Mutex
+	answered []string
+}
+
+func (r *orderedReplier) Reply(_ context.Context, replyTo string, _ protocol.Reply) error {
+	r.mu.Lock()
+	r.answered = append(r.answered, replyTo)
+	r.mu.Unlock()
+	return nil
+}
+
+func (r *orderedReplier) order() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return slices.Clone(r.answered)
+}
+
+// A command given back unrun stays pending under this instance's name, and `>` returns
+// only what nobody has taken. Read for that session before the held entry is taken over
+// and WhatsApp's order is gone: the newer command runs first, which for a
+// `session.disconnect` followed by a `session.connect` leaves the session in the state
+// the client asked it not to be in. Losing a command is a command missing; this is a
+// command that ran and left the wrong state behind, which is worse.
+func TestACommandGivenBackIsCarriedOutBeforeAnythingNewerForItsSession(t *testing.T) {
+	t.Parallel()
+
+	const sid = "2f1c6f0e-0000-4000-8000-00000000aa01"
+	connector, replies, client, _ := heldSession(t, sid)
+
+	// Held first, newer second, and only the newer one is still unread -- which is
+	// exactly the pair `>` would hand over in the wrong order.
+	writeStatus(t, client, sid, "newer")
+	connector.readCommands(context.Background())
+
+	waitFor(t, "both commands to be answered", func() bool { return len(replies.order()) == 2 })
+	if got := replies.order(); got[0] != "held-1" {
+		t.Fatalf("the commands were answered %v, want the held one first", got)
+	}
+}
+
+// The case a mark cleared on the first acceptance gets wrong: with two entries held, the
+// reclaim brings the first, it is accepted, the mark falls, and the second is overtaken
+// by something newer. The drain lets a session back into the read when a pass finds
+// nothing left for it, never when one command was taken.
+func TestTwoCommandsGivenBackAreBothCarriedOutBeforeAnythingNewer(t *testing.T) {
+	t.Parallel()
+
+	const sid = "2f1c6f0e-0000-4000-8000-00000000aa02"
+	connector, replies, client, streams := heldSession(t, sid)
+
+	writeStatus(t, client, sid, "held-2")
+	second, err := streams.Read(context.Background(), []string{sid})
+	if err != nil || len(second) != 1 {
+		t.Fatalf("the second command to hold was read %d time(s) (err=%v), want 1", len(second), err)
+	}
+	connector.manager.GiveBack(&second[0])
+
+	writeStatus(t, client, sid, "newer")
+	connector.readCommands(context.Background())
+
+	waitFor(t, "all three commands to be answered", func() bool { return len(replies.order()) == 3 })
+	got := replies.order()
+	if slices.Index(got, "newer") != 2 {
+		t.Fatalf("the commands were answered %v, want the newer one last", got)
+	}
+}
+
+// The brake is per session. A held session must not stop the reads for every other one,
+// which is the failure mode next door to this fix and the one nothing would report: no
+// error, no crash, just commands that quietly stop arriving.
+func TestOnlyTheHeldSessionIsLeftOutOfTheRead(t *testing.T) {
+	t.Parallel()
+
+	const stuck = "2f1c6f0e-0000-4000-8000-00000000aa03"
+	const other = "2f1c6f0e-0000-4000-8000-00000000aa04"
+	connector, replies, client, _ := heldSession(t, stuck)
+	if _, err := connector.manager.Adopt(context.Background(), other); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	connector.manager.TakeNewlyAdopted()
+
+	writeStatus(t, client, other, "elsewhere")
+	connector.readCommands(context.Background())
+
+	waitFor(t, "the other session's command to be answered", func() bool {
+		return slices.Contains(replies.order(), "elsewhere")
+	})
+}
+
+// writeStatus puts a session command on that session's own stream. Not a ping: a ping is
+// answered by the manager itself and belongs to the control stream, so giving one back
+// leaves nothing pending where the order this is about is decided.
+func writeStatus(t *testing.T, client *redisx.Client, sid, id string) {
+	t.Helper()
+	command := &protocol.Command{
+		V: protocol.Version, ID: id, Type: protocol.CommandSessionStatus,
+		SID: sid, TS: time.Now().UnixMilli(), ReplyTo: id, Payload: json.RawMessage(`{}`),
+	}
+	fields, err := command.Fields()
+	if err != nil {
+		t.Fatalf("Fields: %v", err)
+	}
+	if err := client.XAdd(t.Context(), &redis.XAddArgs{
+		Stream: client.Keys().Commands(sid), Values: fields,
+	}).Err(); err != nil {
+		t.Fatalf("XAdd: %v", err)
+	}
+}
+
+// heldSession builds a connector running `sid` with one command of its own given back
+// unrun, which is the state this file is about.
+func heldSession(t *testing.T, sid string) (*Connector, *orderedReplier, *redisx.Client, *redisstream.Streams) {
+	t.Helper()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+
+	streams, err := redisstream.New(client, redisstream.Options{
+		Instance: "inst-a", Block: 20 * time.Millisecond, ClaimMinIdle: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("redisstream.New: %v", err)
+	}
+	replies := &orderedReplier{}
+	manager := session.NewManager(&session.ManagerConfig{
+		Instance: "inst-a", Engine: fake.New(),
+		Leases:    cluster.NewLeases(client, "inst-a", cluster.Options{}),
+		Publisher: quietPublisher{}, Replier: replies,
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	t.Cleanup(func() { manager.StopAll(context.Background()) })
+
+	connector := &Connector{
+		cfg: Config{LeaseTTL: time.Minute, Heartbeat: time.Second}, log: zerolog.Nop(),
+		manager: manager, streams: streams,
+	}
+	ctx := context.Background()
+	if _, err := manager.Adopt(ctx, sid); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	// Adoption marks the session for draining on its own, and that is not what these
+	// tests are about: taken here, so the only mark left is the give-back's.
+	manager.TakeNewlyAdopted()
+
+	writeStatus(t, client, sid, "held-1")
+	taken, err := streams.Read(ctx, []string{sid})
+	if err != nil || len(taken) != 1 {
+		t.Fatalf("the command to hold was read %d time(s) (err=%v), want 1", len(taken), err)
+	}
+	manager.GiveBack(&taken[0])
+	return connector, replies, client, streams
+}
+
+// waitFor blocks until cond holds, which is how a test joins a session's own goroutine:
+// a command offered to a session is carried out there, not by whoever dispatched it.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
 }
