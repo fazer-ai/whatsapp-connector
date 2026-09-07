@@ -353,6 +353,17 @@ const (
 	// answers a companion device that way on purpose for a view-once photo, and asks the
 	// primary phone to forward it instead -- which it may never do.
 	UnsupportedUnavailable UnsupportedReason = "unavailable"
+	// UnsupportedMasked is a message WhatsApp withheld from every linked device on
+	// purpose. An authentication template -- a verification code -- is delivered to the
+	// primary phone and replaced here by a placeholder, with no way to opt out.
+	//
+	// Its own reason and not `unknown_type`, which is the difference a client draws a
+	// bubble from: `unknown_type` says this build has no arm for what arrived and a
+	// later one may, while nothing will ever render this, because it was never sent
+	// here. Nor `unavailable`, which is content this device was not given but the
+	// primary phone can still be asked for; this one is on the phone and nowhere else,
+	// and that is the whole of what there is to tell the reader.
+	UnsupportedMasked UnsupportedReason = "masked"
 	// UnsupportedProtocol is machinery rather than a message.
 	UnsupportedProtocol UnsupportedReason = "protocol"
 	// UnsupportedEmpty is a message that arrived carrying nothing at all.
@@ -407,5 +418,5 @@ var AllPresenceStates = []PresenceState{PresenceAvailable, PresenceUnavailable}
 // AllUnsupportedReasons lists every reason a message arrives without content.
 var AllUnsupportedReasons = []UnsupportedReason{
 	UnsupportedUnknownType, UnsupportedUndecryptable, UnsupportedUnavailable,
-	UnsupportedProtocol, UnsupportedEmpty,
+	UnsupportedMasked, UnsupportedProtocol, UnsupportedEmpty,
 }
