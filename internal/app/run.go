@@ -549,6 +549,13 @@ func readBlock(heartbeat time.Duration) time.Duration { return heartbeat / readB
 // than a budget the dispatch can exhaust. What is not dispatched is released, so it
 // stays pending and comes back on a later pass.
 func (c *Connector) dispatchWithin(ctx context.Context, deliveries []transport.Delivery) bool {
+	// The sessions something in this batch was left pending for. A batch is one stream's
+	// worth of commands in order, so a session that gave one back may not have a later
+	// one carried out behind it: the queue that had no room for the first can free a slot
+	// between two entries, and then the newer one runs and the older waits for a drain.
+	// The undrained mark only keeps the next read away, and the rest of a batch already
+	// in hand is this side of it.
+	var held []string
 	for i := range deliveries {
 		if ctx.Err() != nil {
 			for rest := i; rest < len(deliveries); rest++ {
@@ -562,7 +569,14 @@ func (c *Connector) dispatchWithin(ctx context.Context, deliveries []transport.D
 				Msg("a batch of commands ran out of its window; the rest stays pending")
 			return false
 		}
-		c.manager.Dispatch(&deliveries[i])
+		sid := deliveries[i].Command.SID
+		if sid != "" && slices.Contains(held, sid) {
+			c.manager.GiveBack(&deliveries[i])
+			continue
+		}
+		if c.manager.Dispatch(&deliveries[i]) && sid != "" {
+			held = append(held, sid)
+		}
 	}
 	return true
 }

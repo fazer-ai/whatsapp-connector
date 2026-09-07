@@ -52,6 +52,17 @@ type Delivery struct {
 	//
 	// Nil where the delivery has no age to give up, and then Release is the whole story.
 	Forfeit func()
+	// Redelivered says this command was taken over rather than read for the first time:
+	// its previous holder was killed, or lost the session, or its acknowledgement never
+	// landed. A transport that cannot tell the two apart leaves it false.
+	//
+	// It exists because an answer that ends a command is only an answer while somebody
+	// is still listening for it. A caller that sent a command a moment ago is waiting on
+	// its reply; a caller whose command has been round the pending list since another
+	// instance died is not, and its reply list may not even exist any more. Refusing the
+	// first is backpressure the caller acts on. Refusing the second retires the only copy
+	// of a command nobody ever ran and nobody hears about.
+	Redelivered bool
 }
 
 // CommandReader delivers the commands addressed to the sessions this instance owns,

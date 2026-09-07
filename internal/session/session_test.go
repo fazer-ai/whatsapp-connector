@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -2409,5 +2410,409 @@ func TestAnEmissionSomethingElseAnsweredFirstIsDroppedAsASuccess(t *testing.T) {
 		t.Fatalf("what was written is %s, and the placeholder was refused", published.Type)
 	} else if published.Seq != 1 {
 		t.Errorf("the event after a refused one has seq %d, so the refused one spent one", published.Seq)
+	}
+}
+
+// fillQueue puts a session's executor on hold and fills the queue behind it, which is
+// the state every backpressure test below starts from.
+//
+// The wait in the middle is what makes it deterministic rather than a race the test
+// usually wins. The executor takes one command off the queue and blocks on it; offered
+// before it has done so, the last of the fill finds the queue full, is handed back, and
+// leaves behind a slot the executor empties a moment later -- a queue that reads as full
+// and has room in it, which is a test that passes for the wrong reason or fails for no
+// reason at all, depending on how loaded the runner is.
+func fillQueue(t *testing.T, manager *session.Manager, held *heldEngine, sid string) {
+	t.Helper()
+
+	var occupied atomic.Bool
+	manager.Dispatch(status("fill-head", sid, &occupied))
+	waitUntil(t, "the executor to take the first command", held.entered.Load)
+
+	var handedBack atomic.Int64
+	for i := range session.DefaultQueueDepth {
+		var ignored atomic.Bool
+		filler := status("fill-"+strconv.Itoa(i), sid, &ignored)
+		filler.Release = func() { handedBack.Add(1) }
+		filler.Ack = func(context.Context) error { handedBack.Add(1); return nil }
+		manager.Dispatch(filler)
+	}
+	// Checked loudly, so a change to the queue depth or to what the executor takes fails
+	// on this line instead of quietly leaving the tests below exercising nothing.
+	if n := handedBack.Load(); n != 0 {
+		t.Fatalf("%d of the %d commands meant to fill the queue were handed back, so it is not full",
+			n, session.DefaultQueueDepth)
+	}
+}
+
+// Backpressure is an answer, and it can only end a command while somebody is still
+// listening for it. A redelivered command has been round the pending list since another
+// instance died or an acknowledgement was lost, and whoever sent it has long since timed
+// out: acknowledging retires the only copy of a command nobody ran, with no reply and no
+// `command.failed` to say so.
+func TestAFullQueueLeavesARedeliveredCommandPending(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	held := newHeldEngine()
+	replies := newRecorder()
+	manager := session.NewManager(&session.ManagerConfig{
+		Instance: "inst-a", Engine: held,
+		Leases:    cluster.NewLeases(redisx.Wrap(rdb, "wa:", 8), "inst-a", cluster.Options{}),
+		Publisher: newRecorder(), Replier: replies,
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	ctx := context.Background()
+	t.Cleanup(func() { manager.StopAll(ctx) })
+	if _, err := manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	fillQueue(t, manager, held, "s1")
+
+	var released, acked atomic.Bool
+	redelivered := status("taken-over", "s1", &released)
+	redelivered.Redelivered = true
+	redelivered.Command.ReplyTo = "taken-over"
+	redelivered.Ack = func(context.Context) error { acked.Store(true); return nil }
+
+	manager.Dispatch(redelivered)
+
+	if acked.Load() {
+		t.Fatal("a redelivered command was acknowledged by backpressure, which retires the only copy there was")
+	}
+	if !released.Load() {
+		t.Fatal("the redelivered command was neither run nor left pending")
+	}
+	if reply, sent := replies.reply("taken-over"); sent {
+		t.Errorf("a refusal was sent to a caller that stopped waiting for it: %+v", reply)
+	}
+}
+
+// The same for a command nobody asked to hear about. Without a reply address there is
+// nowhere for `rate_limited` to go, so acknowledging drops it in silence -- the caller
+// never learns its command did not run, and there is nothing left to run later.
+func TestAFullQueueLeavesACommandWithNoCallerPending(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	held := newHeldEngine()
+	manager := session.NewManager(&session.ManagerConfig{
+		Instance: "inst-a", Engine: held,
+		Leases:    cluster.NewLeases(redisx.Wrap(rdb, "wa:", 8), "inst-a", cluster.Options{}),
+		Publisher: newRecorder(), Replier: newRecorder(),
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	ctx := context.Background()
+	t.Cleanup(func() { manager.StopAll(ctx) })
+	if _, err := manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	fillQueue(t, manager, held, "s1")
+
+	var released, acked atomic.Bool
+	fresh := status("fire-and-forget", "s1", &released)
+	fresh.Ack = func(context.Context) error { acked.Store(true); return nil }
+
+	manager.Dispatch(fresh)
+
+	if acked.Load() {
+		t.Fatal("a command with no reply address was acknowledged by backpressure, so it was dropped in silence")
+	}
+	if !released.Load() {
+		t.Fatal("the command was neither run nor left pending")
+	}
+}
+
+// And the case backpressure is for, unchanged: a caller that sent this a moment ago and
+// is waiting on the reply hears `rate_limited` and decides what to do about it.
+func TestAFullQueueStillRefusesAFreshCommandItsCallerIsWaitingFor(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	held := newHeldEngine()
+	replies := newRecorder()
+	manager := session.NewManager(&session.ManagerConfig{
+		Instance: "inst-a", Engine: held,
+		Leases:    cluster.NewLeases(redisx.Wrap(rdb, "wa:", 8), "inst-a", cluster.Options{}),
+		Publisher: newRecorder(), Replier: replies,
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	ctx := context.Background()
+	t.Cleanup(func() { manager.StopAll(ctx) })
+	// The refusal is carried out on the goroutine this manager answers from, so the test
+	// needs that goroutine running to see one at all.
+	answering, stopAnswering := context.WithCancel(ctx)
+	stopped := manager.Answer(answering)
+	t.Cleanup(func() { stopAnswering(); <-stopped })
+	if _, err := manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	fillQueue(t, manager, held, "s1")
+
+	var released, acked atomic.Bool
+	fresh := status("waiting-caller", "s1", &released)
+	fresh.Command.ReplyTo = "waiting-caller"
+	fresh.Ack = func(context.Context) error { acked.Store(true); return nil }
+
+	manager.Dispatch(fresh)
+
+	// The refusal is carried out by the goroutine this manager answers from, so it lands
+	// after the dispatch returns rather than inside it. The acknowledgement is the last
+	// step of it, which makes it the one to wait on.
+	waitUntil(t, "the refused command to be retired", acked.Load)
+
+	sent, ok := replies.reply("waiting-caller")
+	if !ok {
+		t.Fatal("the caller heard nothing about a command that was refused on its behalf")
+	}
+	if sent.OK || sent.Error == nil || sent.Error.Code != protocol.ErrorRateLimited {
+		t.Fatalf("the caller was answered %+v, want a rate_limited refusal", sent)
+	}
+	if released.Load() {
+		t.Error("the command was both refused and left pending")
+	}
+}
+
+// Once that rule has said somebody is listening, an error writing the refusal does not
+// reopen the question. Redis can apply the push and lose the answer on its way back, so
+// putting the command back leaves a caller holding a `rate_limited` for a command
+// somebody then runs -- and a caller that retried on the refusal has the effect twice,
+// which only a send's message id makes harmless.
+func TestARefusalWhoseWriteFailedStillRetiresTheCommand(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	held := newHeldEngine()
+	manager := session.NewManager(&session.ManagerConfig{
+		Instance: "inst-a", Engine: held,
+		Leases:    cluster.NewLeases(redisx.Wrap(rdb, "wa:", 8), "inst-a", cluster.Options{}),
+		Publisher: newRecorder(), Replier: refusingReplier{err: errors.New("answer lost on the way back")},
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	ctx := context.Background()
+	t.Cleanup(func() { manager.StopAll(ctx) })
+	// The refusal is carried out on the goroutine this manager answers from, so the test
+	// needs that goroutine running to see one at all.
+	answering, stopAnswering := context.WithCancel(ctx)
+	stopped := manager.Answer(answering)
+	t.Cleanup(func() { stopAnswering(); <-stopped })
+	if _, err := manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	fillQueue(t, manager, held, "s1")
+
+	var released, acked atomic.Bool
+	fresh := status("ambiguous-refusal", "s1", &released)
+	fresh.Command.ReplyTo = "ambiguous-refusal"
+	fresh.Ack = func(context.Context) error { acked.Store(true); return nil }
+
+	manager.Dispatch(fresh)
+
+	waitUntil(t, "the refused command to be retired", acked.Load)
+	if released.Load() {
+		t.Fatal("a command was put back on a refusal that may well have arrived, so its caller can be told no and have it run anyway")
+	}
+}
+
+// A handoff claims with no minimum idle at all, so a redelivered command can be one its
+// caller is still blocked on. What the caller said about how long it would wait outranks
+// where the command came from.
+func TestAFullQueueRefusesARedeliveredCommandWhoseDeadlineIsStillLive(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	held := newHeldEngine()
+	replies := newRecorder()
+	manager := session.NewManager(&session.ManagerConfig{
+		Instance: "inst-a", Engine: held,
+		Leases:    cluster.NewLeases(redisx.Wrap(rdb, "wa:", 8), "inst-a", cluster.Options{}),
+		Publisher: newRecorder(), Replier: replies,
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	ctx := context.Background()
+	t.Cleanup(func() { manager.StopAll(ctx) })
+	// The refusal is carried out on the goroutine this manager answers from, so the test
+	// needs that goroutine running to see one at all.
+	answering, stopAnswering := context.WithCancel(ctx)
+	stopped := manager.Answer(answering)
+	t.Cleanup(func() { stopAnswering(); <-stopped })
+	if _, err := manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	fillQueue(t, manager, held, "s1")
+
+	var released atomic.Bool
+	waiting := status("handed-over", "s1", &released)
+	waiting.Redelivered = true
+	waiting.Command.ReplyTo = "handed-over"
+	waiting.Command.Deadline = time.Now().Add(time.Minute).UnixMilli()
+
+	manager.Dispatch(waiting)
+
+	waitUntil(t, "a caller still inside its own deadline to be refused", func() bool {
+		_, sent := replies.reply("handed-over")
+		return sent
+	})
+
+	sent, ok := replies.reply("handed-over")
+	if !ok {
+		t.Fatal("a caller still inside its own deadline heard nothing, and waits out a timeout instead")
+	}
+	if sent.OK || sent.Error == nil || sent.Error.Code != protocol.ErrorRateLimited {
+		t.Fatalf("the caller was answered %+v, want a rate_limited refusal", sent)
+	}
+	if released.Load() {
+		t.Error("the command was both refused and left pending")
+	}
+}
+
+// And the other half of the same rule: a deadline that has passed says the caller has
+// stopped waiting, whatever its reply address still says.
+func TestAFullQueueLeavesACommandWhoseDeadlineHasPassedPending(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	held := newHeldEngine()
+	replies := newRecorder()
+	manager := session.NewManager(&session.ManagerConfig{
+		Instance: "inst-a", Engine: held,
+		Leases:    cluster.NewLeases(redisx.Wrap(rdb, "wa:", 8), "inst-a", cluster.Options{}),
+		Publisher: newRecorder(), Replier: replies,
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	ctx := context.Background()
+	t.Cleanup(func() { manager.StopAll(ctx) })
+	if _, err := manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	fillQueue(t, manager, held, "s1")
+
+	var released, acked atomic.Bool
+	gone := status("gave-up", "s1", &released)
+	gone.Command.ReplyTo = "gave-up"
+	gone.Command.Deadline = time.Now().Add(-time.Minute).UnixMilli()
+	gone.Ack = func(context.Context) error { acked.Store(true); return nil }
+
+	manager.Dispatch(gone)
+
+	if acked.Load() {
+		t.Fatal("a command was retired to answer a caller whose own deadline had passed")
+	}
+	if !released.Load() {
+		t.Fatal("the command was neither run nor left pending")
+	}
+	if reply, sent := replies.reply("gave-up"); sent {
+		t.Errorf("a refusal was written for a caller that had already given up: %+v", reply)
+	}
+}
+
+// refusingReplier answers every reply with the same error, which is what a Redis that
+// took the write and lost the answer looks like from here.
+type refusingReplier struct{ err error }
+
+func (r refusingReplier) Reply(context.Context, string, protocol.Reply) error { return r.err }
+
+// A command held for a full queue stays pending on its session's stream, and this
+// instance goes on reading that stream. Without the session being marked undrained, the
+// first command the queue accepts once it drains is handed over ahead of the one held
+// here -- newer before older on one session, which is the order the single stream per
+// session exists to give (#77).
+func TestACommandHeldForAFullQueueKeepsItsSessionsTurn(t *testing.T) {
+	t.Parallel()
+
+	for name, arrange := range map[string]func(*transport.Delivery){
+		"a redelivery nobody is waiting for": func(d *transport.Delivery) {
+			d.Redelivered = true
+			d.Command.ReplyTo = "held"
+		},
+		"a command sent without a reply address": func(*transport.Delivery) {},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			server := miniredis.RunT(t)
+			rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+			t.Cleanup(func() { _ = rdb.Close() })
+			held := newHeldEngine()
+			manager := session.NewManager(&session.ManagerConfig{
+				Instance: "inst-a", Engine: held,
+				Leases:    cluster.NewLeases(redisx.Wrap(rdb, "wa:", 8), "inst-a", cluster.Options{}),
+				Publisher: newRecorder(), Replier: newRecorder(),
+				NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+			})
+			ctx := context.Background()
+			t.Cleanup(func() { manager.StopAll(ctx) })
+			const sid = "s1"
+			if _, err := manager.Adopt(ctx, sid); err != nil {
+				t.Fatalf("Adopt: %v", err)
+			}
+			fillQueue(t, manager, held, sid)
+			// Cleared, so what is left below is this dispatch's doing and not the
+			// adoption's.
+			manager.TakeNewlyAdopted()
+
+			var released atomic.Bool
+			delivery := status("held", sid, &released)
+			arrange(delivery)
+
+			manager.Dispatch(delivery)
+
+			if !released.Load() {
+				t.Fatal("the command was not held at all, so there is no turn to keep")
+			}
+			if left := manager.TakeNewlyAdopted(); !slices.Contains(left, sid) {
+				t.Fatalf("the session was not marked undrained (%v), so a newer command "+
+					"can be read and run ahead of the one held here", left)
+			}
+		})
+	}
+}
+
+// A drain takes its sessions off the list before it runs and puts back the ones it could
+// not finish. In between, a command given back puts its session on the list again -- and
+// the two used to leave two copies of one sid, the next failed drain a third, growing for
+// as long as the backpressure lasts. Every copy is another pending-list query a claim
+// makes for a stream already in the list, on the goroutine that renews every lease.
+func TestASessionReturnedByADrainIsNotListedTwice(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	manager := session.NewManager(&session.ManagerConfig{
+		Instance: "inst-a", Engine: fake.New(),
+		Leases:    cluster.NewLeases(redisx.Wrap(rdb, "wa:", 8), "inst-a", cluster.Options{}),
+		Publisher: newRecorder(), Replier: newRecorder(),
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	ctx := context.Background()
+	t.Cleanup(func() { manager.StopAll(ctx) })
+	const sid = "s1"
+	if _, err := manager.Adopt(ctx, sid); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+
+	// What a drain does: take the sessions, give a command back while it runs, put back
+	// what it could not finish.
+	adopted := manager.TakeNewlyAdopted()
+	var released atomic.Bool
+	manager.GiveBack(status("given-back", sid, &released))
+	manager.ReturnAdopted(adopted)
+
+	left := manager.TakeNewlyAdopted()
+	if len(left) != 1 || left[0] != sid {
+		t.Fatalf("the sessions left to drain are %v, and one drain of one session should leave one entry", left)
 	}
 }

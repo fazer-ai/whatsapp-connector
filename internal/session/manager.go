@@ -39,6 +39,12 @@ type Manager struct {
 
 	// newly is the sessions adopted since the loop last asked, waiting to have what
 	// their previous owner left pending drained before anything newer is read for them.
+	//
+	// It is what triggers a drain, and not a predicate about a command in hand: a
+	// session is on it both because it was just adopted and because something was left
+	// pending for it, and those two want opposite answers for a command arriving now.
+	// Asked as "may this one be carried out", it holds back every command for a session
+	// adopted a moment ago.
 	newlyMu sync.Mutex
 	newly   []string
 
@@ -289,6 +295,14 @@ func (m *Manager) ReturnAdopted(sids []string) {
 		return
 	}
 	m.newlyMu.Lock()
+	// Deduplicated, and what is coming back still goes first: it is the older backlog.
+	// A drain that gave a command back has already put that session among the newly
+	// adopted while it ran, so appending blind leaves two copies of one sid -- and the
+	// next failed drain a third. Each copy is another pending-list query every claim
+	// makes, on the goroutine that renews the leases, for a stream already in the list.
+	m.newly = slices.DeleteFunc(m.newly, func(sid string) bool {
+		return slices.Contains(sids, sid)
+	})
 	m.newly = append(sids, m.newly...)
 	m.newlyMu.Unlock()
 }
@@ -428,15 +442,17 @@ func (m *Manager) undrained(sid string) {
 // the goroutine that dispatches is the one that renews every lease this instance holds,
 // and nothing routed here may hold it up. A session's command is offered to that
 // session's queue, and the three this manager owns are queued on its own goroutine.
-func (m *Manager) Dispatch(delivery *transport.Delivery) {
+//
+// It reports whether the command was left pending for somebody to run later, which is
+// what a caller holding the rest of a batch needs: nothing newer for that session may be
+// dispatched behind one that stayed pending.
+func (m *Manager) Dispatch(delivery *transport.Delivery) (pending bool) {
 	command := delivery.Command
 	switch command.Type {
 	case protocol.CommandSessionWake:
-		m.own(delivery, m.wake)
-		return
+		return m.own(delivery, m.wake)
 	case protocol.CommandAdminPing:
-		m.own(delivery, m.pong)
-		return
+		return m.own(delivery, m.pong)
 	}
 
 	m.mu.RLock()
@@ -453,12 +469,26 @@ func (m *Manager) Dispatch(delivery *transport.Delivery) {
 		// mark says "this instance left something pending on a stream it reads", and this
 		// instance does not read this one.
 		release(delivery)
-		return
+		return true
 	}
 	switch session.Offer(delivery) {
 	case OfferAccepted:
 	case OfferBusy:
-		m.own(delivery, func(ctx context.Context, busy *transport.Delivery) {
+		if !m.stillHeard(&command, delivery.Redelivered) {
+			// Backpressure is an answer, and an answer only ends a command while somebody
+			// is listening for it. Refusing into nowhere is not backpressure: it retires
+			// the only copy of a command nobody ran, with no reply and no `command.failed`
+			// to say so.
+			//
+			// Left pending instead, with its age, so the queue that is full now can take
+			// it when it drains. Given back rather than released, unlike the stopping
+			// session below: this instance still runs this one and goes on reading its
+			// stream, so without the mark the first command the queue accepts after it
+			// drains would overtake the one held here.
+			m.GiveBack(delivery)
+			return true
+		}
+		return m.own(delivery, func(ctx context.Context, busy *transport.Delivery) {
 			m.refuse(ctx, busy, protocol.NewError(protocol.ErrorRateLimited, "the session has too many commands waiting"))
 		})
 	case OfferStopped:
@@ -471,11 +501,13 @@ func (m *Manager) Dispatch(delivery *transport.Delivery) {
 		// the new owner already holds and handing them back at age zero, below the idle
 		// floor its own reclaim watches. It stays pending for the owner instead.
 		release(delivery)
+		return true
 	}
+	return false
 }
 
 // own queues a command for the goroutine that carries out what this manager answers
-// itself, and never blocks doing it.
+// itself, and never blocks doing it. It reports whether the command was left pending.
 //
 // A queue with no room leaves the delivery pending rather than refusing it: released,
 // age kept, so a later pass brings it back -- to this instance once it has caught up, or
@@ -485,9 +517,10 @@ func (m *Manager) Dispatch(delivery *transport.Delivery) {
 // instance is busy, which is true but is not what it asked. And the queue-full refusal
 // is itself the answer to a session that is behind -- dropping it on a manager that is
 // also behind would retire, unrun, a command the client never heard about.
-func (m *Manager) own(delivery *transport.Delivery, give func(context.Context, *transport.Delivery)) {
+func (m *Manager) own(delivery *transport.Delivery, give func(context.Context, *transport.Delivery)) bool {
 	select {
 	case m.answers <- answer{delivery: delivery, give: give}:
+		return false
 	default:
 		m.log.Warn().Str("cmd_id", delivery.Command.ID).Str("type", string(delivery.Command.Type)).
 			Msg("no room to carry out a command this instance answers itself; leaving it pending")
@@ -496,6 +529,7 @@ func (m *Manager) own(delivery *transport.Delivery, give func(context.Context, *
 		// found no room is a command for a session this instance runs and goes on reading
 		// by `>`. Released, the next command its queue accepts would overtake it.
 		m.GiveBack(delivery)
+		return true
 	}
 }
 
@@ -641,6 +675,29 @@ func (m *Manager) refuse(ctx context.Context, delivery *transport.Delivery, fail
 		cancel()
 	}
 	m.ack(ctx, delivery)
+}
+
+// stillHeard reports whether a refusal for this command would reach anybody.
+//
+// The caller's own deadline is the best evidence there is, and it outranks where the
+// command came from: a handoff hands a command back within milliseconds (ClaimSessions
+// claims with no minimum idle at all), and the caller that sent it is still blocked on
+// its reply. Refusing that one is backpressure the caller acts on; leaving it pending
+// would hold it until its queue drains or its own timeout runs out, having told it
+// nothing.
+//
+// Where no deadline was declared, provenance is the only evidence left. A command read
+// with `>` has just arrived, so somebody is waiting on the other end of it. A redelivered
+// one has been round the pending list since its holder died or lost the session, and its
+// reply list may not even exist any more.
+func (m *Manager) stillHeard(command *protocol.Command, redelivered bool) bool {
+	if command.ReplyTo == "" {
+		return false
+	}
+	if command.Deadline > 0 {
+		return !expired(command, m.now())
+	}
+	return !redelivered
 }
 
 // release says this instance is done with a delivery it did not carry out. A transport

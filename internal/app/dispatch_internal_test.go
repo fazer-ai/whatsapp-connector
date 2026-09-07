@@ -1100,3 +1100,75 @@ func adoptedSession(
 
 	return connector, replies, client, streams
 }
+
+// A batch is one stream's worth of commands in order, so a session that left one behind
+// may not have a later one carried out in the same batch. The queue that had no room for
+// the first can free a slot between two entries, and then the newer command runs while
+// the older waits for a drain -- newer before older on the one stream that exists to
+// keep them in order (#77). The undrained mark cannot help here: it keeps the next read
+// away, and the rest of the batch is already in hand.
+func TestALaterCommandDoesNotOvertakeOneLeftPendingInTheSameBatch(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	// One place on the manager's own goroutine and nothing running to empty it, which is
+	// how the first command of this batch is left pending without a queue to fill.
+	manager := session.NewManager(&session.ManagerConfig{
+		Instance: "inst-a", Engine: fake.New(),
+		Leases:    cluster.NewLeases(redisx.Wrap(rdb, "wa:", 8), "inst-a", cluster.Options{}),
+		Publisher: quietPublisher{}, Replier: quietReplier{},
+		AnswerDepth: 1,
+		NewID:       func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	t.Cleanup(func() { manager.StopAll(context.Background()) })
+	const sid = "2f1c6f0e-0000-4000-8000-0000000000fe"
+	if _, err := manager.Adopt(context.Background(), sid); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	connector := &Connector{
+		cfg:     Config{LeaseTTL: 30 * time.Second, Heartbeat: 600 * time.Millisecond},
+		log:     zerolog.Nop(),
+		manager: manager,
+	}
+
+	var wakeReleased, laterReleased, laterAcked atomic.Bool
+	deliveries := []transport.Delivery{{
+		// Takes the one place, so the wake behind it finds none.
+		Command: protocol.Command{
+			V: protocol.Version, ID: "ping", Type: protocol.CommandAdminPing, TS: 1787000000000,
+		},
+		Ack:     func(context.Context) error { return nil },
+		Release: func() {},
+	}, {
+		Command: protocol.Command{
+			V: protocol.Version, ID: "wake", Type: protocol.CommandSessionWake,
+			SID: sid, TS: 1787000000001,
+		},
+		Ack:     func(context.Context) error { return nil },
+		Release: func() { wakeReleased.Store(true) },
+	}, {
+		// Its session is running and its queue is empty, so nothing but the command
+		// ahead of it stands between this one and the executor.
+		Command: protocol.Command{
+			V: protocol.Version, ID: "status", Type: protocol.CommandSessionStatus,
+			SID: sid, TS: 1787000000002, Payload: json.RawMessage(`{}`),
+		},
+		Ack:     func(context.Context) error { laterAcked.Store(true); return nil },
+		Release: func() { laterReleased.Store(true) },
+	}}
+
+	connector.dispatchWithin(context.Background(), deliveries)
+
+	if !wakeReleased.Load() {
+		t.Fatal("the wake was carried out after all, so there is nothing left pending for the command behind it to overtake")
+	}
+	if laterReleased.Load() {
+		return
+	}
+	// Only reached when the command was not held: it went to the session, and whether it
+	// has run yet is a matter of scheduling rather than of what was decided here.
+	waitFor(t, "the command that overtook one left pending to finish", laterAcked.Load)
+	t.Fatal("a command was carried out for a session that had an older one left pending in the same batch, which runs them out of order")
+}
