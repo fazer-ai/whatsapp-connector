@@ -129,9 +129,10 @@ type ConnectRequest struct {
 	// Proxy is an object in the contract, not a string: decoding it as one made every
 	// connect carrying a proxy fail to parse before it reached an engine.
 	Proxy *ProxyRequest `json:"proxy,omitempty"`
-	// Groups asks for group chats alongside direct ones. Nothing selects on it yet
-	// because nothing is delivered yet: M2 is what brings conversation traffic, and
-	// until then this chooses between nothing and nothing.
+	// Groups asks for group chats alongside direct ones. A session that did not ask is
+	// not merely unsubscribed: a group message reaching it is acknowledged and published
+	// nowhere, because withholding the acknowledgement would have WhatsApp redeliver
+	// every group message the account receives for as long as the session is up.
 	Groups bool `json:"groups,omitempty"`
 	// HistorySync asks for the backlog the phone holds. Honouring it is M6.
 	HistorySync bool `json:"history_sync,omitempty"`

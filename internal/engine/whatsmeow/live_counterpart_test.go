@@ -149,8 +149,20 @@ func liveSay(t *testing.T, from *Session, to, body string) string {
 func liveResume(t *testing.T, session *Session) {
 	t.Helper()
 
+	liveResumeAsking(t, session, engine.ConnectRequest{Pairing: "resume"})
+}
+
+// liveResumeAsking is liveResume with the subscriptions the phase needs.
+//
+// Groups are the one that matters, and getting it wrong looks like the feature being
+// broken rather than unasked for: a session that did not subscribe has its group messages
+// acknowledged and published nowhere, so a group phase resuming the ordinary way sits and
+// watches a silence it arranged itself.
+func liveResumeAsking(t *testing.T, session *Session, req engine.ConnectRequest) {
+	t.Helper()
+
 	events := watch(t, session)
-	if err := session.Connect(t.Context(), engine.ConnectRequest{Pairing: "resume"}); err != nil {
+	if err := session.Connect(t.Context(), req); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
 	events.awaitState(t, "open", 2*time.Minute)
