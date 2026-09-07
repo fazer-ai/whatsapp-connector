@@ -69,35 +69,6 @@ import (
 // liveSID is the account under test.
 const liveSID = "live-1"
 
-// liveTranscript is every log line this process has written, kept so a phase can ask
-// what happened underneath the events. Reset when the engine opens, so a phase reads its
-// own run and not the one before it in the same binary.
-var liveTranscript transcript
-
-type transcript struct {
-	mu   sync.Mutex
-	says strings.Builder
-}
-
-func (t *transcript) Write(line []byte) (int, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.says.Write(line)
-}
-
-func (t *transcript) Reset() {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.says.Reset()
-}
-
-// saying is how many lines so far contain a phrase.
-func (t *transcript) saying(phrase string) int {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return strings.Count(t.says.String(), phrase)
-}
-
 // liveCounterpartSID is the second account: the one on the other side of the
 // conversation, paired as a linked device like the first and driven from here.
 //
@@ -1525,15 +1496,8 @@ func liveEngine(t *testing.T, blobs MediaOptions) (engine.Engine, *store.Contain
 		t.Fatalf("prepare %s: %v", filepath.Dir(path), err)
 	}
 
-	// Teed into a buffer as well as onto the screen. Some of what a live phase has to
-	// establish is not an event and not a store row: whether whatsmeow failed to decrypt
-	// a stanza is only ever said in a log line, and a phase that arranges a broken Signal
-	// session has no other way to know its scenario actually happened. Without it a
-	// stopwatch on an ordinary delivery reads exactly like a stopwatch on a recovery.
-	liveTranscript.Reset()
-	log := zerolog.New(zerolog.MultiLevelWriter(
-		zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.TimeOnly}, &liveTranscript,
-	)).Level(zerolog.DebugLevel).With().Timestamp().Logger()
+	log := zerolog.New(zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.TimeOnly}).
+		Level(zerolog.DebugLevel).With().Timestamp().Logger()
 
 	container, err := store.Open(t.Context(), "sqlite:"+path, store.AlwaysOwned, log)
 	if err != nil {

@@ -18,6 +18,7 @@
 package whatsmeow
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -30,60 +31,65 @@ import (
 	waTypes "go.mau.fi/whatsmeow/types"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
+	"github.com/fazer-ai/whatsapp-connector/internal/store"
 )
 
-// liveCouldNotDecrypt is whatsmeow's own words for a stanza that would not open. Matched
-// on the library's phrasing because there is nothing else to match on: this is the one
-// fact in the phase that reaches neither an event nor a store row.
+// liveWatchForHold starts watching the store for the placeholder this message is given,
+// and hands back the moment production itself recorded as the start of the window.
 //
-// The line names the stanza, so the match can too, and it has to: the transcript is the
-// whole process, both accounts in it, and any unrelated undecryptable stanza arriving
-// while a send is in flight would move a count. A round that decrypted normally would
-// then be admitted as a sample on somebody else's failure.
-const liveCouldNotDecrypt = "Error decrypting message"
-
-func liveCouldNotDecryptThis(id string) string { return liveCouldNotDecrypt + " " + id }
-
-// liveWatchForFailure starts watching for whatsmeow saying this message would not open,
-// and hands back a channel carrying the moment it said so.
+// Two earlier versions of this took the timestamp from outside, and both were wrong in
+// the same way, which is what named the rule: **do not approximate an instant production
+// records; read the one it wrote.** The send was the first proxy, and it folded in
+// outbound latency. Whatsmeow's own "Error decrypting message" line was the second, and
+// it is earlier than the window too -- with `SynchronousAck` the library logs it, then
+// requests the message from the phone, sends the retry receipt and acknowledges, and only
+// then dispatches `UndecryptableMessage`, which is where `unreadable` runs and where the
+// clock actually starts.
 //
-// Started before the send and read after, because the failure is the moment the recovery
-// clock starts and nothing records it: the transcript keeps the line, not the time it
-// arrived, so noticing it afterwards would time the noticing. Production's own window
-// starts in `unreadable`, at the failure, and measuring from the send instead folds in
-// ordinary outbound latency -- and, in the second phase, a whole reconnect. The
-// comparison against `rerequestTimeout` is what the phase is for, so inflating one side
-// of it is not a detail.
+// `hold` writes `LearnedAt` at exactly that point, and `DueAt` from it. So the phase reads
+// the row instead of timing anything: `LearnedAt` is the same number production compares
+// against, not a number near it.
 //
-// The resolution is the poll interval, which is a fiftieth of the fastest sample ever
-// measured here.
-func liveWatchForFailure(id string) <-chan time.Time {
-	when := make(chan time.Time, 1)
+// Watched rather than read afterwards because `dropHold` deletes the row the moment the
+// real message arrives -- which, on the fast path this phase measures, is a second later.
+// Bounded by the caller's context and not by a count of its own: a watcher that gave up
+// on its own schedule would reject a slow recovery the caller was still willing to wait
+// for, which is the shape of the very failure this phase is looking for.
+func liveWatchForHold(ctx context.Context, held *store.Scoped, id string) <-chan int64 {
+	learned := make(chan int64, 1)
 	go func() {
-		needle := liveCouldNotDecryptThis(id)
-		for range 60 * 50 {
-			if liveTranscript.saying(needle) > 0 {
-				when <- time.Now()
-				return
+		defer close(learned)
+		for {
+			waiting, err := held.Placeholders(ctx)
+			if err == nil {
+				for _, row := range waiting {
+					if row.MessageID == id {
+						learned <- row.LearnedAt
+						return
+					}
+				}
 			}
-			time.Sleep(20 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(20 * time.Millisecond):
+			}
 		}
-		close(when)
 	}()
-	return when
+	return learned
 }
 
-// liveFailedAt reads that channel, and refuses to report a time that never came: a phase
+// liveLearnedAt reads that channel, and refuses to report a time that never came: a phase
 // that fell back to "now" would report a recovery of zero and pass.
-func liveFailedAt(t *testing.T, when <-chan time.Time, id string) time.Time {
+func liveLearnedAt(t *testing.T, learned <-chan int64, id string) time.Time {
 	t.Helper()
 
-	failed, saw := <-when
+	at, saw := <-learned
 	if !saw {
-		t.Fatalf("nothing ever said %q, so %s was not the message whose session was "+
-			"broken and there is no recovery to time", liveCouldNotDecryptThis(id), id)
+		t.Fatalf("no placeholder was ever held for %s, so it was not a message this "+
+			"session found unreadable and there is no recovery to time", id)
 	}
-	return failed
+	return time.UnixMilli(at)
 }
 
 // liveEveryNameOf is the counterpart under every namespace this account may have filed it
@@ -166,10 +172,12 @@ func TestLiveTimeARetryRecovery(t *testing.T) {
 
 		body := fmt.Sprintf("conector nativo, recuperacao %d de %d", len(took)+1, rounds)
 		sent := counterpart.current().GenerateMessageID()
-		failing := liveWatchForFailure(sent)
+		watching, stop := context.WithCancel(t.Context())
+		held := liveWatchForHold(watching, container.For(liveSID), sent)
 		liveSayUnder(t, counterpart, liveMustBePaired(t, container, liveSID).User, body, sent)
 		inbox.awaitMessage(t, sent, 5*time.Minute)
 		arrived := time.Now()
+		stop()
 
 		// The scenario, verified after the fact rather than arranged and assumed. Asking
 		// beforehand whether a session existed is the weaker question and was the first
@@ -180,11 +188,14 @@ func TestLiveTimeARetryRecovery(t *testing.T) {
 		//
 		// Asked about this message and not about a count, so an unrelated stanza failing
 		// somewhere else in the process cannot admit an ordinary delivery as a sample.
-		if liveTranscript.saying(liveCouldNotDecryptThis(sent)) == 0 {
+		// A placeholder is only ever held for a message this session could not read, so
+		// the row existing is the scenario having happened.
+		at, saw := <-held
+		if !saw {
 			t.Logf("attempt %d decrypted first try, so it is not a sample", attempt+1)
 			continue
 		}
-		elapsed := arrived.Sub(liveFailedAt(t, failing, sent))
+		elapsed := arrived.Sub(time.UnixMilli(at))
 
 		took = append(took, elapsed)
 		t.Logf("sample %d: %s", len(took), elapsed.Round(time.Millisecond))
@@ -257,12 +268,18 @@ func TestLiveARecoveryOutlivesTheSenderLeaving(t *testing.T) {
 	// which it could have been read normally.
 	liveResume(t, counterpart)
 	sent := counterpart.current().GenerateMessageID()
-	failing := liveWatchForFailure(sent)
+	watching, stop := context.WithCancel(t.Context())
+	t.Cleanup(stop)
+	held := liveWatchForHold(watching, container.For(liveSID), sent)
 	liveSayUnder(t, counterpart, subjectJID.User, "conector nativo, remetente que sai e nao volta", sent)
 	if err := counterpart.Disconnect(t.Context()); err != nil {
 		t.Fatalf("take the sender offline: %v", err)
 	}
 
+	// Watched after the resume for the same reason as everywhere else: a watcher's
+	// buffer drops what does not fit, and a resume is exactly when a backlog lands.
+	// The message this phase waits for is in that backlog, though, so the buffer has to
+	// exist before it arrives -- and it is one message, not a backlog worth 256.
 	inbox := watch(t, subject)
 	liveResume(t, subject)
 
@@ -273,10 +290,11 @@ func TestLiveARecoveryOutlivesTheSenderLeaving(t *testing.T) {
 		t.Fatalf("the message did not arrive within %s with the sender's session offline; "+
 			"the recovery needs that session back, and the tail is then unbounded", within)
 	}
-	// From the failure, not from the resume: bringing the account back is this phase's
-	// own setup and production pays none of it, so counting it would inflate the number
-	// the placeholder window is being compared against.
-	elapsed := time.Since(liveFailedAt(t, failing, sent))
+	// From what production wrote down, not from the resume: bringing the account back is
+	// this phase's own setup and production pays none of it, so counting it would inflate
+	// the number the placeholder window is being compared against.
+	elapsed := time.Since(liveLearnedAt(t, held, sent))
+	stop()
 	t.Logf("recovered in %s with the sender's connector session offline the whole time, "+
 		"so the retry was answered by another of that account's devices", elapsed.Round(time.Millisecond))
 	if elapsed >= rerequestTimeout {
