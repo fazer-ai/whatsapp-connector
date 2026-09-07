@@ -94,7 +94,12 @@ const (
 	CommandCallReject              CommandType = "call.reject"
 )
 
-// AllEventTypes lists every event type this build knows how to produce.
+// AllEventTypes lists every event type in the contract. Fourteen of them have no
+// producer in this build, and they are marked below: a client may match on one and
+// never see it, the way it may branch on a reserved error code in errors.go. They stay
+// in the catalog because removing one narrows what a client may already match on, and
+// because Valid and the fixture test are about the contract rather than about this
+// build's reach.
 var AllEventTypes = []EventType{
 	EventSessionState,
 	EventSessionLoggedOut,
@@ -102,6 +107,9 @@ var AllEventTypes = []EventType{
 	EventSessionTemporaryBan,
 	EventSessionClientOutdated,
 	EventSessionConnectFailure,
+	// No producer. whatsmeow already emits both (events.OfflineSyncPreview and
+	// events.OfflineSyncCompleted); nothing here translates them, and no milestone is
+	// waiting on it.
 	EventSessionOfflineSyncPreview,
 	EventSessionOfflineSyncCompleted,
 	EventPairingQR,
@@ -119,6 +127,9 @@ var AllEventTypes = []EventType{
 	EventCommandFailed,
 	EventChatPresence,
 	EventPresenceUpdate,
+	// No producer, all of them, and each waits on the milestone its family belongs to:
+	// contacts, groups and calls are M3, the two account limits are M5, and the history
+	// replay is M6.
 	EventContactPictureChanged,
 	EventContactIdentityChanged,
 	EventGroupJoined,
@@ -130,6 +141,10 @@ var AllEventTypes = []EventType{
 	EventCallOffer,
 	EventCallTerminate,
 	EventHistorySync,
+	// No producer either, and this one waits on nothing: `raw` is the escape hatch for a
+	// provider node the catalog has no shape for, and this connector publishes what it
+	// understands or an `unsupported` placeholder instead. It is in the contract for a
+	// provider that needs it.
 	EventRaw,
 }
 
