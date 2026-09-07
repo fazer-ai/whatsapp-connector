@@ -30,6 +30,11 @@
 // The store is deliberately not a t.TempDir: resuming is the thing being checked, and
 // a pairing that does not outlive the process proves nothing. Point WAC_LIVE_DB
 // somewhere durable, or accept the default under the user's state directory.
+//
+// A second account, paired the same way and driven from here, lives in
+// live_counterpart_test.go. The phases above still want a person for what only the phone
+// answers -- pairing, the passkey wall, whether a view-once is forwarded at all -- but
+// anything needing somebody on the other side of the conversation no longer does.
 package whatsmeow
 
 import (
@@ -60,9 +65,21 @@ import (
 	"github.com/fazer-ai/whatsapp-connector/internal/store"
 )
 
-// liveSID is the account under test. One is enough: what is being exercised is a
-// device's own lifecycle, not the fleet's.
+// liveSID is the account under test.
 const liveSID = "live-1"
+
+// liveCounterpartSID is the second account: the one on the other side of the
+// conversation, paired as a linked device like the first and driven from here.
+//
+// Every phase up to now had a person there, sending the message to react to and reading
+// the typing indicator. That was affordable while a phase asked for one or two actions.
+// Groups are not: creating one, adding and removing participants, promoting an admin,
+// changing the subject, an invite link -- each needs somebody on the other side, and each
+// review round runs the phase again.
+//
+// Two sids on one store and one engine, which is also what an instance running two
+// sessions looks like. A second store would be a shape production never has.
+const liveCounterpartSID = "live-2"
 
 // TestLivePairWithQR pairs by scanning. It is the first phase and the only one that
 // needs the phone in hand.
@@ -1433,6 +1450,43 @@ func liveSession(t *testing.T) (*Session, *store.Container) {
 func liveSessionWith(t *testing.T, blobs MediaOptions) (*Session, *store.Container) {
 	t.Helper()
 
+	waEngine, container := liveEngine(t, blobs)
+	return liveSessionOn(t, waEngine, container, liveSID), container
+}
+
+// liveBoth opens the account under test and the counterpart on one engine, which is what
+// a phase needing two sides of a conversation runs on.
+func liveBoth(t *testing.T, blobs MediaOptions) (subject, counterpart *Session, container *store.Container) {
+	t.Helper()
+
+	waEngine, container := liveEngine(t, blobs)
+	return liveSessionOn(t, waEngine, container, liveSID),
+		liveSessionOn(t, waEngine, container, liveCounterpartSID), container
+}
+
+// liveSessionOn opens one session on an engine that is already up, and says which account
+// it turned out to be -- the log line is what tells the two apart in a phase driving both.
+func liveSessionOn(t *testing.T, waEngine engine.Engine, container *store.Container, sid string) *Session {
+	t.Helper()
+
+	opened, err := waEngine.Open(t.Context(), sid)
+	if err != nil {
+		t.Fatalf("Open %s: %v", sid, err)
+	}
+	session, ok := opened.(*Session)
+	if !ok {
+		t.Fatalf("the engine handed back a %T for %s", opened, sid)
+	}
+	if jid, bound, err := container.For(sid).JID(t.Context()); err == nil && bound {
+		t.Logf("%s is %s", sid, jid)
+	}
+	return session
+}
+
+// liveEngine opens the store and the engine the sessions above run on.
+func liveEngine(t *testing.T, blobs MediaOptions) (engine.Engine, *store.Container) {
+	t.Helper()
+
 	path := os.Getenv("WAC_LIVE_DB")
 	if path == "" {
 		path = filepath.Join(liveDir(t), "live.db")
@@ -1462,15 +1516,7 @@ func liveSessionWith(t *testing.T, blobs MediaOptions) (*Session, *store.Contain
 		}
 	})
 
-	opened, err := waEngine.Open(t.Context(), liveSID)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	session, ok := opened.(*Session)
-	if !ok {
-		t.Fatalf("the engine handed back a %T", opened)
-	}
-	return session, container
+	return waEngine, container
 }
 
 // liveDir is where the store and the rendered codes go. Outside the repo, because a
@@ -1643,6 +1689,53 @@ func (r *recorder) await(t *testing.T, want protocol.EventType, within time.Dura
 	}
 }
 
+// awaitMessage waits for one message.received by id, ignoring every other message that
+// arrives meanwhile, and hands back the message out of its envelope.
+//
+// Waiting for "the next message.received" is only right on an account nobody else is
+// talking to, which is not an account. A resume delivers whatever came in while the
+// session was down, and the far side answers on its own schedule -- on the demo number
+// this harness talks to, a bot answers within a second. The first event to arrive is
+// then somebody else's, and the phase reports the wrong body against the right send,
+// which reads as the connector having mangled the message.
+func (r *recorder) awaitMessage(t *testing.T, id string, within time.Duration) json.RawMessage {
+	t.Helper()
+
+	deadline := time.After(within)
+	for {
+		select {
+		case emission, ok := <-r.seen:
+			if !ok {
+				t.Fatalf("the session ended before message %s arrived", id)
+			}
+			if emission.Type == protocol.EventSessionLoggedOut {
+				t.Fatalf("the account was logged out while waiting for message %s, so it has to be paired again: %s",
+					id, emission.Payload)
+			}
+			if emission.Type != protocol.EventMessageReceived {
+				continue
+			}
+			var envelope struct {
+				Message json.RawMessage `json:"message"`
+			}
+			if err := json.Unmarshal(emission.Payload, &envelope); err != nil {
+				t.Fatalf("unmarshal a message.received: %v", err)
+			}
+			var named struct {
+				ID string `json:"id"`
+			}
+			if err := json.Unmarshal(envelope.Message, &named); err != nil {
+				t.Fatalf("unmarshal the message inside a message.received: %v", err)
+			}
+			if named.ID == id {
+				return envelope.Message
+			}
+		case <-deadline:
+			t.Fatalf("message %s did not arrive within %s", id, within)
+		}
+	}
+}
+
 // awaitState waits for one value of session.state, ignoring the ones on the way to it.
 func (r *recorder) awaitState(t *testing.T, want string, within time.Duration) {
 	t.Helper()
@@ -1653,6 +1746,19 @@ func (r *recorder) awaitState(t *testing.T, want string, within time.Duration) {
 		case emission, ok := <-r.seen:
 			if !ok {
 				t.Fatalf("the session ended before it reported %q", want)
+			}
+			// The same two dead ends `await` refuses, for the same reason: neither
+			// is a state on the way to another one, so waiting out the deadline
+			// only replaces an answer that already arrived with a timeout that
+			// says nothing. A logged-out account is the one that costs the most to
+			// misread -- it is answered by pairing again, and the generic timeout
+			// sends you looking at the network instead.
+			if emission.Type == protocol.EventSessionLoggedOut {
+				t.Fatalf("the account was logged out while waiting for %q, so it has to be paired again: %s",
+					want, emission.Payload)
+			}
+			if emission.Type == protocol.EventPairingError {
+				t.Fatalf("the pairing failed while waiting for %q: %s", want, emission.Payload)
 			}
 			if emission.Type != protocol.EventSessionState {
 				continue
