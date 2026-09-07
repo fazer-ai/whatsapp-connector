@@ -35,7 +35,56 @@ import (
 // liveCouldNotDecrypt is whatsmeow's own words for a stanza that would not open. Matched
 // on the library's phrasing because there is nothing else to match on: this is the one
 // fact in the phase that reaches neither an event nor a store row.
+//
+// The line names the stanza, so the match can too, and it has to: the transcript is the
+// whole process, both accounts in it, and any unrelated undecryptable stanza arriving
+// while a send is in flight would move a count. A round that decrypted normally would
+// then be admitted as a sample on somebody else's failure.
 const liveCouldNotDecrypt = "Error decrypting message"
+
+func liveCouldNotDecryptThis(id string) string { return liveCouldNotDecrypt + " " + id }
+
+// liveWatchForFailure starts watching for whatsmeow saying this message would not open,
+// and hands back a channel carrying the moment it said so.
+//
+// Started before the send and read after, because the failure is the moment the recovery
+// clock starts and nothing records it: the transcript keeps the line, not the time it
+// arrived, so noticing it afterwards would time the noticing. Production's own window
+// starts in `unreadable`, at the failure, and measuring from the send instead folds in
+// ordinary outbound latency -- and, in the second phase, a whole reconnect. The
+// comparison against `rerequestTimeout` is what the phase is for, so inflating one side
+// of it is not a detail.
+//
+// The resolution is the poll interval, which is a fiftieth of the fastest sample ever
+// measured here.
+func liveWatchForFailure(id string) <-chan time.Time {
+	when := make(chan time.Time, 1)
+	go func() {
+		needle := liveCouldNotDecryptThis(id)
+		for range 60 * 50 {
+			if liveTranscript.saying(needle) > 0 {
+				when <- time.Now()
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		close(when)
+	}()
+	return when
+}
+
+// liveFailedAt reads that channel, and refuses to report a time that never came: a phase
+// that fell back to "now" would report a recovery of zero and pass.
+func liveFailedAt(t *testing.T, when <-chan time.Time, id string) time.Time {
+	t.Helper()
+
+	failed, saw := <-when
+	if !saw {
+		t.Fatalf("nothing ever said %q, so %s was not the message whose session was "+
+			"broken and there is no recovery to time", liveCouldNotDecryptThis(id), id)
+	}
+	return failed
+}
 
 // liveEveryNameOf is the counterpart under every namespace this account may have filed it
 // under: the number, and the LID when there is one.
@@ -115,15 +164,12 @@ func TestLiveTimeARetryRecovery(t *testing.T) {
 			}
 		}
 
-		// What whatsmeow says when a stanza will not open. Counted before and after, so
-		// the round can tell its own failure from one left over from the round before.
-		failedBefore := liveTranscript.saying(liveCouldNotDecrypt)
-
 		body := fmt.Sprintf("conector nativo, recuperacao %d de %d", len(took)+1, rounds)
-		started := time.Now()
-		sent := liveSay(t, counterpart, liveMustBePaired(t, container, liveSID).User, body)
+		sent := counterpart.current().GenerateMessageID()
+		failing := liveWatchForFailure(sent)
+		liveSayUnder(t, counterpart, liveMustBePaired(t, container, liveSID).User, body, sent)
 		inbox.awaitMessage(t, sent, 5*time.Minute)
-		elapsed := time.Since(started)
+		arrived := time.Now()
 
 		// The scenario, verified after the fact rather than arranged and assumed. Asking
 		// beforehand whether a session existed is the weaker question and was the first
@@ -131,10 +177,14 @@ func TestLiveTimeARetryRecovery(t *testing.T) {
 		// first three attempts here deleted rows that were real and were not the ones the
 		// message would use -- reporting 195ms as a recovery time, which is what an
 		// ordinary delivery costs.
-		if liveTranscript.saying(liveCouldNotDecrypt) == failedBefore {
+		//
+		// Asked about this message and not about a count, so an unrelated stanza failing
+		// somewhere else in the process cannot admit an ordinary delivery as a sample.
+		if liveTranscript.saying(liveCouldNotDecryptThis(sent)) == 0 {
 			t.Logf("attempt %d decrypted first try, so it is not a sample", attempt+1)
 			continue
 		}
+		elapsed := arrived.Sub(liveFailedAt(t, failing, sent))
 
 		took = append(took, elapsed)
 		t.Logf("sample %d: %s", len(took), elapsed.Round(time.Millisecond))
@@ -206,14 +256,14 @@ func TestLiveARecoveryOutlivesTheSenderLeaving(t *testing.T) {
 	// Sent while it is down, so WhatsApp holds the message and there is no window in
 	// which it could have been read normally.
 	liveResume(t, counterpart)
-	sent := liveSay(t, counterpart, subjectJID.User, "conector nativo, remetente que sai e nao volta")
+	sent := counterpart.current().GenerateMessageID()
+	failing := liveWatchForFailure(sent)
+	liveSayUnder(t, counterpart, subjectJID.User, "conector nativo, remetente que sai e nao volta", sent)
 	if err := counterpart.Disconnect(t.Context()); err != nil {
 		t.Fatalf("take the sender offline: %v", err)
 	}
 
 	inbox := watch(t, subject)
-	failedBefore := liveTranscript.saying(liveCouldNotDecrypt)
-	started := time.Now()
 	liveResume(t, subject)
 
 	// Past the window on purpose: if it takes longer than this, the placeholder in
@@ -223,12 +273,10 @@ func TestLiveARecoveryOutlivesTheSenderLeaving(t *testing.T) {
 		t.Fatalf("the message did not arrive within %s with the sender's session offline; "+
 			"the recovery needs that session back, and the tail is then unbounded", within)
 	}
-	elapsed := time.Since(started)
-
-	if liveTranscript.saying(liveCouldNotDecrypt) == failedBefore {
-		t.Fatal("nothing failed to decrypt, so the deleted session was not the one this " +
-			"message used and the run measured an ordinary delivery")
-	}
+	// From the failure, not from the resume: bringing the account back is this phase's
+	// own setup and production pays none of it, so counting it would inflate the number
+	// the placeholder window is being compared against.
+	elapsed := time.Since(liveFailedAt(t, failing, sent))
 	t.Logf("recovered in %s with the sender's connector session offline the whole time, "+
 		"so the retry was answered by another of that account's devices", elapsed.Round(time.Millisecond))
 	if elapsed >= rerequestTimeout {
