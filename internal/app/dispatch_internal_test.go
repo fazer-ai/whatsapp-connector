@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -873,33 +872,18 @@ func TestTwoCommandsGivenBackAreBothCarriedOutBeforeAnythingNewer(t *testing.T) 
 // brakes is one that never reads, and nothing would report it -- no error, no crash, just
 // commands that quietly stop arriving for every session on the instance.
 //
-// Held here by a backlog longer than one drain can empty, which is the shape that keeps a
-// session out of the read across ticks rather than for the rest of a single call. That is
-// backpressure working: what cannot enter is exactly what would not have fitted. What must
-// not happen is the session next to it paying for that.
-func TestASessionHeldAcrossTicksDoesNotStopTheReadsForAnother(t *testing.T) {
+// Held by a drain that cannot take the stream over, which is the state that outlives a
+// single call: a session stays out of the read for as long as its backlog is not taken,
+// and that is backpressure working rather than starvation. What must not happen is the
+// session beside it paying for the wait.
+func TestASessionThatStaysUndrainedDoesNotStopTheReadsForAnother(t *testing.T) {
 	t.Parallel()
 
 	const stuck = "2f1c6f0e-0000-4000-8000-00000000aa03"
 	const other = "2f1c6f0e-0000-4000-8000-00000000aa04"
+	connector, replies, client, _ := heldSession(t, stuck, other)
+	connector.streams = &undrainableStreams{inner: connector.streams}
 
-	// One entry per pass, so a backlog of more than maxDrainPasses cannot be emptied in
-	// the call that starts it and the session is still undrained when the read happens.
-	connector, replies, client, streams := heldSession(t, stuck, withReadCount(1))
-	for i := range maxDrainPasses + 1 {
-		id := fmt.Sprintf("stuck-%d", i)
-		writeStatus(t, client, stuck, id)
-		taken, err := streams.Read(context.Background(), []string{stuck})
-		if err != nil || len(taken) != 1 {
-			t.Fatalf("%s was read %d time(s) (err=%v), want 1", id, len(taken), err)
-		}
-		connector.manager.GiveBack(&taken[0])
-	}
-
-	if _, err := connector.manager.Adopt(context.Background(), other); err != nil {
-		t.Fatalf("Adopt: %v", err)
-	}
-	connector.manager.TakeNewlyAdopted()
 	writeStatus(t, client, other, "elsewhere")
 
 	connector.readCommands(context.Background())
@@ -907,6 +891,31 @@ func TestASessionHeldAcrossTicksDoesNotStopTheReadsForAnother(t *testing.T) {
 	waitFor(t, "the other session's command to be answered", func() bool {
 		return slices.Contains(replies.order(), "elsewhere")
 	})
+	if slices.Contains(replies.order(), "held-1") {
+		t.Fatal("the held command was carried out even though its stream was never taken over")
+	}
+}
+
+// undrainableStreams is a transport whose drain never succeeds, which is what leaves a
+// session out of the read across ticks instead of for the rest of one call.
+type undrainableStreams struct {
+	inner commandStreams
+}
+
+func (s *undrainableStreams) Read(ctx context.Context, sids []string) ([]transport.Delivery, error) {
+	return s.inner.Read(ctx, sids)
+}
+
+func (s *undrainableStreams) Claim(ctx context.Context, sids []string) ([]transport.Delivery, error) {
+	return s.inner.Claim(ctx, sids)
+}
+
+func (s *undrainableStreams) ClaimControl(ctx context.Context) ([]transport.Delivery, error) {
+	return s.inner.ClaimControl(ctx)
+}
+
+func (s *undrainableStreams) ClaimSessions(context.Context, []string) ([]transport.Delivery, error) {
+	return nil, errors.New("the drain cannot reach redis")
 }
 
 // writeStatus puts a session command on that session's own stream. Not a ping: a ping is
@@ -929,16 +938,12 @@ func writeStatus(t *testing.T, client *redisx.Client, sid, id string) {
 	}
 }
 
-// withReadCount caps how many entries one claim or read takes per stream, which is what
-// lets a test build a backlog the drain cannot empty in one call.
-func withReadCount(n int64) func(*redisstream.Options) {
-	return func(o *redisstream.Options) { o.ReadCount = n }
-}
-
 // heldSession builds a connector running `sid` with one command of its own given back
 // unrun, which is the state this file is about.
+// `also` are sessions adopted alongside it and drained before anything is held, so the
+// only session waiting on a drain is the one the test is about.
 func heldSession(
-	t *testing.T, sid string, opts ...func(*redisstream.Options),
+	t *testing.T, sid string, also ...string,
 ) (*Connector, *orderedReplier, *redisx.Client, *redisstream.Streams) {
 	t.Helper()
 
@@ -947,13 +952,9 @@ func heldSession(
 	t.Cleanup(func() { _ = rdb.Close() })
 	client := redisx.Wrap(rdb, "wa:", 8)
 
-	options := redisstream.Options{
+	streams, err := redisstream.New(client, redisstream.Options{
 		Instance: "inst-a", Block: 20 * time.Millisecond, ClaimMinIdle: time.Millisecond,
-	}
-	for _, apply := range opts {
-		apply(&options)
-	}
-	streams, err := redisstream.New(client, options)
+	})
 	if err != nil {
 		t.Fatalf("redisstream.New: %v", err)
 	}
@@ -971,8 +972,10 @@ func heldSession(
 		manager: manager, streams: streams,
 	}
 	ctx := context.Background()
-	if _, err := manager.Adopt(ctx, sid); err != nil {
-		t.Fatalf("Adopt: %v", err)
+	for _, adopt := range append([]string{sid}, also...) {
+		if _, err := manager.Adopt(ctx, adopt); err != nil {
+			t.Fatalf("Adopt(%s): %v", adopt, err)
+		}
 	}
 	// Adoption marks the session for draining on its own, and that is not what these
 	// tests are about: taken here, so the only mark left is the give-back's.
