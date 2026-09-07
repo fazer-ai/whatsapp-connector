@@ -179,6 +179,7 @@ internal/store/media.go: Fence media writes with the ownership epoch  # PR#22
 # wrong twice in the slice before it. What would reopen it: a client that does not
 # resolve it, or WhatsApp tightening the key match -- both of which show up as an action
 # reported successful and not visible, which is what the live phase exists to catch.
+internal/engine/whatsmeow/acting.go: Normalize direct chats before building target keys  # PR#33
 # PR#43: the finding is right about the mechanism and wrong about the remedy, and the
 # remedy would put this path out of step with the one it was copied from. A read mark in
 # a group whose addressing could not be read is sent with the participant as it came, and
