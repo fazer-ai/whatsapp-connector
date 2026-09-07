@@ -24,7 +24,7 @@ cmd/connector/       binary: serve, migrate, doctor, healthcheck, session subcom
 contract/            protocol vN: JSON Schema + golden fixtures (language neutral, no Go here)
 internal/protocol/   Go binding for the contract: frames, type catalog, error codes
 internal/transport/  how frames travel (Redis Streams today, HTTP standalone later)
-internal/cluster/    leases, epochs, quarantine, rebalance — who owns a session
+internal/cluster/    leases, epochs, the instance registry -- who owns a session
 internal/session/    session lifecycle, state machine, per-session FIFO executor
 internal/engine/     the WhatsApp side behind an interface (whatsmeow, plus a fake for tests)
 internal/store/      Postgres/SQLite persistence, fenced against a lost lease
