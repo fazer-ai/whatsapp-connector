@@ -129,9 +129,17 @@ type ConnectRequest struct {
 	// Proxy is an object in the contract, not a string: decoding it as one made every
 	// connect carrying a proxy fail to parse before it reached an engine.
 	Proxy *ProxyRequest `json:"proxy,omitempty"`
-	// Groups asks for group chats alongside direct ones. Nothing selects on it yet
-	// because nothing is delivered yet: M2 is what brings conversation traffic, and
-	// until then this chooses between nothing and nothing.
+	// Groups asks for group chats alongside direct ones, and four paths select on it:
+	// a message, an unreadable message, a chat presence and a receipt whose chat is a
+	// group are acknowledged and published nowhere when the last connect asked for
+	// direct chats only. So this is the client's switch for whether group traffic
+	// reaches it at all, and a client that stops setting it stops receiving groups
+	// rather than losing a feature it was not using.
+	//
+	// It says nothing about the group *commands*, which are a different question and
+	// are not served: `group.info` and the eleven beside it answer `unsupported`.
+	// Wanting group conversation and being able to administer a group are separate, and
+	// only the first of them is honoured here.
 	Groups bool `json:"groups,omitempty"`
 	// HistorySync asks for the backlog the phone holds. Honouring it is M6.
 	HistorySync bool `json:"history_sync,omitempty"`
