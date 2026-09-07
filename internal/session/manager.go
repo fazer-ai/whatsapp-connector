@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -182,11 +183,16 @@ func (m *Manager) Adopt(ctx context.Context, sid string) (*Session, error) {
 		return winner, nil
 	}
 	m.sessions[sid] = session
-	m.mu.Unlock()
-
+	// Under the same lock as the insert, and this is the ordering the whole file turns
+	// on: between the two there used to be a moment where the session was running and
+	// not yet waiting to be drained. Nothing could observe it while adoption ran on the
+	// reader's own goroutine; the moment it does not, a reader looking into that gap
+	// would find the session in SIDs, miss it among the newly adopted, and read `>` for
+	// it ahead of everything its previous owner left pending.
 	m.newlyMu.Lock()
 	m.newly = append(m.newly, sid)
 	m.newlyMu.Unlock()
+	m.mu.Unlock()
 
 	m.log.Info().Str("sid", sid).Uint64("epoch", lease.Epoch).Msg("adopted a session")
 	return session, nil
@@ -333,6 +339,52 @@ func (m *Manager) forgetOrphan(sid string) {
 	m.orphanMu.Unlock()
 }
 
+// GiveBack hands a delivery back without carrying it out, and remembers that the session
+// it belongs to has an older entry pending again.
+//
+// A site gives a command back through here when the command may belong to a session this
+// instance runs and the site cannot say which -- the batch a read window cut short is the
+// one that cannot, since it holds whatever the last read returned. A site that does know
+// releases directly and says why: an offer refused by a session being stopped must not be
+// marked at all, and a wake carries no session's turn to keep.
+//
+// What decides here is the delivery itself: a wake and a ping live on the control stream,
+// so giving one back leaves nothing pending on a session's, and a command for a session
+// this instance does not run is on its way to whoever does.
+//
+// The set is the one adoption uses, and reusing it is not a shortcut. Both mean the same
+// thing -- there is an older command on this stream that has not been carried out -- and
+// the drain already lets a session back into the `>` read only when a pass finds nothing
+// left for it. A mark cleared on the first command accepted instead would let a second
+// held one be overtaken by something newer.
+func (m *Manager) GiveBack(delivery *transport.Delivery) {
+	release(delivery)
+
+	sid := delivery.Command.SID
+	switch {
+	case sid == "":
+	case delivery.Command.Type == protocol.CommandSessionWake,
+		delivery.Command.Type == protocol.CommandAdminPing:
+	default:
+		m.mu.RLock()
+		_, running := m.sessions[sid]
+		m.mu.RUnlock()
+		if running {
+			m.undrained(sid)
+		}
+	}
+}
+
+// undrained puts a session back among those whose stream has to be taken over before
+// anything newer is read for it.
+func (m *Manager) undrained(sid string) {
+	m.newlyMu.Lock()
+	if !slices.Contains(m.newly, sid) {
+		m.newly = append(m.newly, sid)
+	}
+	m.newlyMu.Unlock()
+}
+
 // Dispatch routes one command. It answers by itself for the two it can answer without
 // a session (`session.wake` and `admin.ping`) and hands the rest to the session.
 func (m *Manager) Dispatch(ctx context.Context, delivery *transport.Delivery) {
@@ -355,6 +407,10 @@ func (m *Manager) Dispatch(ctx context.Context, delivery *transport.Delivery) {
 		// the session reads the same stream, and an instance that owns nothing must not
 		// swallow a command on its way there. Released, so it does not read as work this
 		// process is still doing and become unclaimable.
+		//
+		// Released rather than given back, and the distinction is the whole of it: the
+		// mark says "this instance left something pending on a stream it reads", and this
+		// instance does not read this one.
 		release(delivery)
 		return
 	}
@@ -365,6 +421,12 @@ func (m *Manager) Dispatch(ctx context.Context, delivery *transport.Delivery) {
 	case OfferStopped:
 		// This instance is letting the account go. Refusing would answer for an owner
 		// it is no longer, so the command stays pending for whoever takes it next.
+		//
+		// Released rather than given back, and here it matters rather than merely reads
+		// better: marking would schedule a drain for an account this instance is giving
+		// up, and the drain claims the stream with no minimum idle time -- taking entries
+		// the new owner already holds and handing them back at age zero, below the idle
+		// floor its own reclaim watches. It stays pending for the owner instead.
 		release(delivery)
 	}
 }
@@ -390,6 +452,8 @@ func (m *Manager) wake(ctx context.Context, delivery *transport.Delivery) {
 			// stale key expires there is nothing left to start it at all.
 			m.log.Warn().Str("sid", sid).
 				Msg("a wake found a lease this instance is still handing back; leaving it pending")
+			// A wake rides the control stream, not a session's, so there is no per-session
+			// turn to keep and nothing to mark.
 			release(delivery)
 			return
 		}

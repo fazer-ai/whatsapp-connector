@@ -53,7 +53,7 @@ type Connector struct {
 	manager  *session.Manager
 	engine   engine.Engine
 	store    *store.Container
-	streams  *redisstream.Streams
+	streams  commandStreams
 	http     *httpserver.Server
 	blobs    *media.Store
 
@@ -164,6 +164,19 @@ func New(cfg *Config, log zerolog.Logger) (connector *Connector, err error) {
 	})
 	c.streams = streams
 	return c, nil
+}
+
+// commandStreams is the half of the transport the loop takes commands from.
+//
+// An interface so a test can hold a session out of the read the way a real one is held --
+// by a drain that cannot take its stream over -- and watch what happens to the sessions
+// beside it. Asserting that on what a command did afterwards would be asserting on a
+// consequence several paths reach.
+type commandStreams interface {
+	Read(ctx context.Context, sids []string) ([]transport.Delivery, error)
+	Claim(ctx context.Context, sids []string) ([]transport.Delivery, error)
+	ClaimControl(ctx context.Context) ([]transport.Delivery, error)
+	ClaimSessions(ctx context.Context, sids []string) ([]transport.Delivery, error)
 }
 
 // Ready reports whether this instance can serve: Redis, without which it can neither
@@ -539,9 +552,11 @@ func (c *Connector) dispatchWithin(ctx context.Context, deliveries []transport.D
 	for i := range deliveries {
 		if ctx.Err() != nil || !c.roomFor(ctx, &deliveries[i]) {
 			for rest := i; rest < len(deliveries); rest++ {
-				if deliveries[rest].Release != nil {
-					deliveries[rest].Release()
-				}
+				// Through the manager rather than straight to the delivery: a command
+				// for a session this instance runs, given back unrun, leaves an older
+				// entry pending on that session's stream, and nothing newer may be read
+				// for it until a claim has taken that stream over.
+				c.manager.GiveBack(&deliveries[rest])
 			}
 			c.log.Warn().Int("left", len(deliveries)-i).
 				Msg("a batch of commands ran out of its window; the rest stays pending")
@@ -674,12 +689,19 @@ func (c *Connector) drainAdopted(ctx context.Context) []string {
 
 // readCommands drains what newly adopted sessions have pending and reads what is newer.
 func (c *Connector) readCommands(ctx context.Context) {
+	// Taken before the drain, and the order is the point rather than tidiness. A session
+	// adopted between the two calls would otherwise be absent from the set the drain
+	// takes and present in this list, and `>` would hand over something newer for it
+	// ahead of everything its previous owner left pending. Read first, it is simply not
+	// in this list at all: the drain takes it, and it joins the read a tick later with
+	// its backlog already taken over.
+	sids := c.manager.SIDs()
+
 	// Before the read, not after: a session adopted a moment ago may have commands its
 	// previous owner abandoned, and reading `>` for it first would hand over what
 	// arrived later and run it out of order.
 	undrained := c.drainAdopted(ctx)
 
-	sids := c.manager.SIDs()
 	if len(undrained) > 0 {
 		// Left out of this read rather than skipping the read altogether: the control
 		// stream and every other session carry on, and these come back as soon as their
