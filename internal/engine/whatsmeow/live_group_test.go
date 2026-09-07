@@ -67,7 +67,7 @@ func TestLiveGroupKeyNamespace(t *testing.T) {
 	// The namespace the group does not use, which is the whole point of the phase, and
 	// the one namespace this account cannot be named in is a reason to stop rather than
 	// to report a result: without it there is nothing to send wrongly.
-	wrong := liveOtherNamespace(t, subject, counterpartJID, mode)
+	right, wrong := liveNamespaces(t, subject, counterpartJID, mode)
 
 	// Both sides watched at once, which the fan-out in `watch` is what makes possible:
 	// the subject has to see the message before it can react to it, and the counterpart
@@ -81,7 +81,7 @@ func TestLiveGroupKeyNamespace(t *testing.T) {
 	}{
 		// The control first. If a translated reaction does not arrive either, the
 		// experiment says nothing about namespaces and the phase says so.
-		{name: "translated", participant: liveAddressOf(t, counterpartJID), emoji: "👍"},
+		{name: "as the group addresses its members", participant: right, emoji: "👍"},
 		{name: "in the namespace the group does not use", participant: wrong, emoji: "❤️"},
 		// The instrument check, and the phase is worth little without it. Our own client
 		// applies this one too -- `reactionOf` publishes by target id and never reads
@@ -201,22 +201,31 @@ func liveGroupMode(t *testing.T, subject *Session, group waTypes.JID) waTypes.Ad
 	return info.AddressingMode
 }
 
-// liveOtherNamespace names the counterpart the way the group does not.
-func liveOtherNamespace(
+// liveNamespaces names the counterpart both ways: as the group addresses its members, and
+// as it does not.
+//
+// Both are built from `mode` rather than one of them being "the JID we happen to hold".
+// That shortcut is what this phase had after the translation was removed, and it quietly
+// emptied the experiment: `counterpartJID` is the phone JID, so in a LID group the
+// control and the wrong-namespace probe were the same phone key sent twice. Two probes
+// passing then said nothing about a LID participant, because neither was one.
+func liveNamespaces(
 	t *testing.T, subject *Session, counterpart waTypes.JID, mode waTypes.AddressingMode,
-) protocol.Address {
+) (asTheGroupDoes, asItDoesNot protocol.Address) {
 	t.Helper()
 
-	if mode != waTypes.AddressingModeLID {
-		alt, err := subject.current().Store.GetAltJID(t.Context(), counterpart)
-		if err != nil || alt.IsEmpty() {
-			t.Skipf("the counterpart has no LID on this account (err=%v), so there is no wrong namespace to send", err)
-		}
-		return protocol.Address{Kind: protocol.AddressLID, ID: alt.User}
+	phone := protocol.Address{Kind: protocol.AddressPhone, ID: counterpart.User}
+	alt, err := subject.current().Store.GetAltJID(t.Context(), counterpart)
+	if err != nil || alt.IsEmpty() {
+		t.Skipf("the counterpart has no LID on this account (err=%v), so only one of the "+
+			"two namespaces can be named and there is nothing to compare", err)
 	}
-	// The group is on LID, so the wrong namespace is the phone number, which is the one
-	// thing about the counterpart this harness always knows.
-	return protocol.Address{Kind: protocol.AddressPhone, ID: counterpart.User}
+	lid := protocol.Address{Kind: protocol.AddressLID, ID: alt.User}
+
+	if mode == waTypes.AddressingModeLID {
+		return lid, phone
+	}
+	return phone, lid
 }
 
 // liveAddressOf names a JID the way the contract does, through the production mapping
@@ -320,7 +329,7 @@ func TestLiveGroupRevokeKeyNamespace(t *testing.T) {
 	liveGroupReaches(t, counterpart, group)
 	mode := liveGroupMode(t, subject, group)
 	t.Logf("group %s addresses its members by %q", group, mode)
-	wrong := liveOtherNamespace(t, subject, counterpartJID, mode)
+	right, wrong := liveNamespaces(t, subject, counterpartJID, mode)
 
 	mine := watch(t, subject)
 	theirs := watch(t, counterpart)
@@ -332,7 +341,7 @@ func TestLiveGroupRevokeKeyNamespace(t *testing.T) {
 		// finding: the key's participant does not decide whether the revoke propagates.
 		gone bool
 	}{
-		{name: "translated", participant: liveAddressOf(t, counterpartJID), gone: true},
+		{name: "as the group addresses its members", participant: right, gone: true},
 		{name: "in the namespace the group does not use", participant: wrong, gone: true},
 		// Published by us, and refused by WhatsApp: the message is still there on the
 		// phone. That divergence is its own defect and is #107; what this line pins is
@@ -423,7 +432,7 @@ func TestLiveGroupReadKeyNamespace(t *testing.T) {
 	group := liveGroup(t, subject, counterpartJID)
 	liveGroupReaches(t, counterpart, group)
 	mode := liveGroupMode(t, subject, group)
-	wrong := liveOtherNamespace(t, subject, counterpartJID, mode)
+	right, wrong := liveNamespaces(t, subject, counterpartJID, mode)
 
 	mine := watch(t, subject)
 	theirs := watch(t, counterpart)
@@ -432,7 +441,7 @@ func TestLiveGroupReadKeyNamespace(t *testing.T) {
 		participant protocol.Address
 		read        bool
 	}{
-		{name: "translated", participant: liveAddressOf(t, counterpartJID), read: true},
+		{name: "as the group addresses its members", participant: right, read: true},
 		{name: "in the namespace the group does not use", participant: wrong, read: true},
 		// There is no third probe here, and the absence is deliberate. Naming a member
 		// who did not send the message was tried, on the theory that a read receipt is
