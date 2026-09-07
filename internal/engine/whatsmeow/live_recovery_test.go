@@ -384,9 +384,15 @@ func livePrime(t *testing.T, from *Session, inbox *recorder, held *store.Scoped,
 	t.Helper()
 
 	for attempt := range 5 {
-		sent := liveSay(t, from, to, "conector nativo, estabelecendo a sessao")
+		// Watched before the send, like the measured ones. A placeholder is transient --
+		// `hold` writes it and `dropHold` deletes it the moment the message arrives, and
+		// on this path that is under a second -- so a watcher started after the send can
+		// miss the whole life of the row and report a recovery as an ordinary delivery.
+		// Which is the one thing this loop is asking about.
+		sent := from.current().GenerateMessageID()
 		watching, stop := context.WithCancel(t.Context())
 		holding := liveWatchForHold(watching, held, sent)
+		liveSayUnder(t, from, to, "conector nativo, estabelecendo a sessao", sent)
 		inbox.awaitMessage(t, sent, 2*time.Minute)
 		stop()
 
