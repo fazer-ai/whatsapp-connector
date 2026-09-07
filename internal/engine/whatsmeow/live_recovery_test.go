@@ -290,11 +290,17 @@ func TestLiveARecoveryOutlivesTheSenderLeaving(t *testing.T) {
 		t.Fatalf("the message did not arrive within %s with the sender's session offline; "+
 			"the recovery needs that session back, and the tail is then unbounded", within)
 	}
+	// Stopped before the channel is read, and the order is what keeps a failure a
+	// failure: if this message turned out to be readable there is no placeholder and
+	// never will be, and a watcher still polling holds the channel open, so the read
+	// below would block until the whole suite times out instead of saying the scenario
+	// was not arranged. Cancelling first closes it. What was already found is not lost
+	// -- the channel holds one value and the send happened when the row was seen.
+	stop()
 	// From what production wrote down, not from the resume: bringing the account back is
 	// this phase's own setup and production pays none of it, so counting it would inflate
 	// the number the placeholder window is being compared against.
 	elapsed := time.Since(liveLearnedAt(t, held, sent))
-	stop()
 	t.Logf("recovered in %s with the sender's connector session offline the whole time, "+
 		"so the retry was answered by another of that account's devices", elapsed.Round(time.Millisecond))
 	if elapsed >= rerequestTimeout {
