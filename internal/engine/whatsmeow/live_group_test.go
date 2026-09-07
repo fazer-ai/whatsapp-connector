@@ -61,6 +61,7 @@ func TestLiveGroupKeyNamespace(t *testing.T) {
 	liveResumeAsking(t, counterpart, groups)
 
 	group := liveGroup(t, subject, counterpartJID)
+	liveGroupReaches(t, counterpart, group)
 	mode := liveGroupMode(t, subject, group)
 	t.Logf("group %s addresses its members by %q", group, mode)
 
@@ -167,10 +168,33 @@ func liveGroup(t *testing.T, subject *Session, counterpart waTypes.JID) waTypes.
 		t.Fatalf("create the group: %v", err)
 	}
 	t.Logf("created %s -- pass WAC_LIVE_GROUP=%s to reuse it", info.JID, info.JID)
-	// The counterpart learns about the group over its own connection, and reacting
-	// before it has is a message sent to a group it does not know it is in.
-	time.Sleep(5 * time.Second)
 	return info.JID
+}
+
+// liveGroupReaches waits until a session knows it is in the group.
+//
+// The creating side is told at once; the other learns over its own connection, and a
+// message sent before it has is a message to a group it does not know it is in -- which
+// fails every probe after it and reads as the connector being wrong. Waited on rather
+// than slept through: a fixed delay is right until the day WhatsApp is slower than the
+// number somebody guessed, and then it is wrong in a way that looks like a real failure.
+// AGENTS.md rules out the sleep for exactly this reason.
+func liveGroupReaches(t *testing.T, session *Session, group waTypes.JID) {
+	t.Helper()
+
+	for attempt := range 120 {
+		if _, err := session.current().GetGroupInfo(t.Context(), group); err == nil {
+			return
+		} else if attempt == 0 {
+			t.Logf("waiting for %s to reach %s: %v", group, session.sid, err)
+		}
+		select {
+		case <-t.Context().Done():
+			t.Fatalf("gave up waiting for %s to reach %s: %v", group, session.sid, t.Context().Err())
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+	t.Fatalf("%s never learned it is in %s", session.sid, group)
 }
 
 // liveGroupMode reads which namespace the group addresses its members by, through the
@@ -309,6 +333,7 @@ func TestLiveGroupRevokeKeyNamespace(t *testing.T) {
 	liveResumeAsking(t, counterpart, groups)
 
 	group := liveGroup(t, subject, counterpartJID)
+	liveGroupReaches(t, counterpart, group)
 	mode := liveGroupMode(t, subject, group)
 	t.Logf("group %s addresses its members by %q", group, mode)
 	wrong := liveOtherNamespace(t, subject, counterpartJID, mode)
@@ -405,19 +430,12 @@ func liveRevokeOf(t *testing.T, events *recorder, target string, within time.Dur
 // same person, in the same group. That is reasoning, and reasoning about this exact field
 // is what #35 exists to stop, so it is measured instead.
 //
-// It was expected to discriminate where the others do not: a reaction and a revoke are
-// stanzas that reach every member whatever the key says, while a read receipt is routed
-// to the author of the message being marked, so a participant naming the wrong person
-// looked like it would have nowhere to go. It does not discriminate -- the receipt
-// reaches the author in all three cases, the wrong member included. Written down because
-// it was a reasonable guess and the next person will have it too.
-//
-// What it does settle is the question #35 asks, for this call site: the participant in
-// the namespace the group does not use is resolved, the same as in the other two.
+// What it settles is the question #35 asks, for this call site: a participant in the
+// namespace the group does not use is resolved, the same as in the other two.
 func TestLiveGroupReadKeyNamespace(t *testing.T) {
 	subject, counterpart, container := liveBoth(t, MediaOptions{})
 
-	subjectJID := liveMustBePaired(t, container, liveSID)
+	liveMustBePaired(t, container, liveSID)
 	counterpartJID := liveMustBePaired(t, container, liveCounterpartSID)
 
 	groups := engine.ConnectRequest{Pairing: "resume", Groups: true}
@@ -425,6 +443,7 @@ func TestLiveGroupReadKeyNamespace(t *testing.T) {
 	liveResumeAsking(t, counterpart, groups)
 
 	group := liveGroup(t, subject, counterpartJID)
+	liveGroupReaches(t, counterpart, group)
 	mode := liveGroupMode(t, subject, group)
 	wrong := liveOtherNamespace(t, subject, counterpartJID, mode)
 
@@ -438,7 +457,13 @@ func TestLiveGroupReadKeyNamespace(t *testing.T) {
 	}{
 		{name: "translated", participant: liveAddressOf(t, counterpartJID), read: true},
 		{name: "in the namespace the group does not use", participant: wrong, lying: true, read: true},
-		{name: "naming a member who did not send it", participant: liveAddressOf(t, subjectJID), read: true},
+		// There is no third probe here, and the absence is deliberate. Naming a member
+		// who did not send the message was tried, on the theory that a read receipt is
+		// routed to the author and so has nowhere to go when the author named is wrong.
+		// It produced a receipt on one run and none on the next, which makes it a coin
+		// flip rather than an instrument -- WhatsApp coalesces reads over a chat, so
+		// whether one turns up depends on what else the author has read. Pinning either
+		// answer would be pinning the flip.
 	} {
 		t.Run(probe.name, func(t *testing.T) {
 			sent := liveSayTo(t, counterpart, protocol.Address{
