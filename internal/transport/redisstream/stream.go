@@ -238,7 +238,7 @@ func (s *Streams) Read(ctx context.Context, sids []string) ([]transport.Delivery
 	}
 	var out []transport.Delivery
 	for _, stream := range result {
-		taken, ids := s.deliveriesWithIDs([]redis.XStream{stream})
+		taken, ids := s.deliveriesWithIDs([]redis.XStream{stream}, false)
 		// A read entry starts at zero idle and stays there until somebody touches it, so
 		// one this instance gives back unrun is claimable by nobody — not by `>`, which
 		// returns only what no consumer has taken, and not by a claim, which will not
@@ -408,7 +408,7 @@ func (s *Streams) claim(ctx context.Context, streams []string, minIdle time.Dura
 		case err != nil && !errors.Is(err, redis.Nil):
 			return fail(fmt.Errorf("redisstream: claim %s: %w", stream, err))
 		}
-		taken, ids := s.deliveriesWithIDs([]redis.XStream{{Stream: stream, Messages: messages}})
+		taken, ids := s.deliveriesWithIDs([]redis.XStream{{Stream: stream, Messages: messages}}, true)
 		if minIdle > 0 {
 			s.rememberAge(stream, minIdle, taken, ids)
 		}
@@ -529,7 +529,7 @@ func (s *Streams) sessionStreams(sids []string) []string {
 // deliveriesWithIDs is the deliveries plus the stream entry each one came from, which
 // both callers need to say what they took: the ids line up with the deliveries, and a
 // frame that could not be read is in neither.
-func (s *Streams) deliveriesWithIDs(result []redis.XStream) (out []transport.Delivery, ids []string) {
+func (s *Streams) deliveriesWithIDs(result []redis.XStream, redelivered bool) (out []transport.Delivery, ids []string) {
 	for _, stream := range result {
 		for _, message := range stream.Messages {
 			command, err := protocol.ParseCommand(toFields(message.Values))
@@ -543,9 +543,10 @@ func (s *Streams) deliveriesWithIDs(result []redis.XStream) (out []transport.Del
 			}
 			held := s.hold(stream.Stream, message.ID)
 			out = append(out, transport.Delivery{
-				Command: command,
-				Ack:     s.acker(stream.Stream, message.ID, held),
-				Release: held,
+				Command:     command,
+				Ack:         s.acker(stream.Stream, message.ID, held),
+				Release:     held,
+				Redelivered: redelivered,
 			})
 			ids = append(ids, message.ID)
 		}

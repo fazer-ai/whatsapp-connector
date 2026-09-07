@@ -139,7 +139,10 @@ type Offer int
 const (
 	// OfferAccepted means the command is queued and this session owns answering it.
 	OfferAccepted Offer = iota
-	// OfferBusy means the queue is full. The client is told so.
+	// OfferBusy means the queue is full. What the caller does about it depends on
+	// whether anybody is still listening: a client waiting on a reply is told so, and a
+	// command whose sender has gone (a redelivery, or one sent without a reply address)
+	// is left pending instead of being answered into nowhere.
 	OfferBusy
 	// OfferStopped means this session is going away. The command is not this
 	// instance's to answer or to refuse.

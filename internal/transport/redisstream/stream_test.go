@@ -1157,3 +1157,51 @@ func (brokenAcks) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
 		return next(ctx, cmd)
 	}
 }
+
+// The split backpressure makes between a command whose sender is still waiting and one
+// whose sender has gone is only as good as this flag: a claim is a command taken over
+// from a holder that died or lost the session, a `>` read is one nobody has touched.
+func TestADeliverySaysWhetherItWasTakenOverOrReadFresh(t *testing.T) {
+	t.Parallel()
+
+	f := newFleet(t)
+	owner := f.streams(t, "inst-a")
+	ctx := context.Background()
+
+	if _, err := owner.Read(ctx, []string{"s1"}); err != nil {
+		t.Fatalf("priming Read: %v", err)
+	}
+	writeCommand(t, f, f.client.Keys().Commands("s1"), command("c1", "s1", "c1"))
+
+	fresh, err := owner.Read(ctx, []string{"s1"})
+	if err != nil || len(fresh) != 1 {
+		t.Fatalf("Read returned %d commands (err=%v), want 1", len(fresh), err)
+	}
+	if fresh[0].Redelivered {
+		t.Error("a command read with `>` is marked as taken over, so backpressure would leave a caller waiting")
+	}
+
+	// Left pending by that reader, which is what a killed instance leaves behind.
+	peer := f.streams(t, "inst-b")
+	taken := claimEventually(t, peer, []string{"s1"})
+	if len(taken) != 1 {
+		t.Fatalf("the peer claimed %d commands, want 1", len(taken))
+	}
+	if !taken[0].Redelivered {
+		t.Error("a claimed command is not marked as taken over, so backpressure could retire the only copy of it")
+	}
+
+	// The drain's claim takes without waiting out the delay, and says the same thing.
+	writeCommand(t, f, f.client.Keys().Commands("s2"), command("c2", "s2", "c2"))
+	if _, err := owner.Read(ctx, []string{"s2"}); err != nil {
+		t.Fatalf("Read s2: %v", err)
+	}
+	adopted, err := peer.ClaimSessions(ctx, []string{"s2"})
+	if err != nil {
+		t.Fatalf("ClaimSessions: %v", err)
+	}
+	if len(adopted) != 1 || !adopted[0].Redelivered {
+		t.Fatalf("the drain claimed %d commands, redelivered=%v; want 1 marked as taken over",
+			len(adopted), len(adopted) == 1 && adopted[0].Redelivered)
+	}
+}

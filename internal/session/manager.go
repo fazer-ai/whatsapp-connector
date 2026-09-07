@@ -458,6 +458,20 @@ func (m *Manager) Dispatch(delivery *transport.Delivery) {
 	switch session.Offer(delivery) {
 	case OfferAccepted:
 	case OfferBusy:
+		if !m.stillHeard(&command, delivery.Redelivered) {
+			// Backpressure is an answer, and an answer only ends a command while somebody
+			// is listening for it. Refusing into nowhere is not backpressure: it retires
+			// the only copy of a command nobody ran, with no reply and no `command.failed`
+			// to say so.
+			//
+			// Left pending instead, with its age, so the queue that is full now can take
+			// it when it drains. Given back rather than released, unlike the stopping
+			// session below: this instance still runs this one and goes on reading its
+			// stream, so without the mark the first command the queue accepts after it
+			// drains would overtake the one held here.
+			m.GiveBack(delivery)
+			return
+		}
 		m.own(delivery, func(ctx context.Context, busy *transport.Delivery) {
 			m.refuse(ctx, busy, protocol.NewError(protocol.ErrorRateLimited, "the session has too many commands waiting"))
 		})
@@ -641,6 +655,29 @@ func (m *Manager) refuse(ctx context.Context, delivery *transport.Delivery, fail
 		cancel()
 	}
 	m.ack(ctx, delivery)
+}
+
+// stillHeard reports whether a refusal for this command would reach anybody.
+//
+// The caller's own deadline is the best evidence there is, and it outranks where the
+// command came from: a handoff hands a command back within milliseconds (ClaimSessions
+// claims with no minimum idle at all), and the caller that sent it is still blocked on
+// its reply. Refusing that one is backpressure the caller acts on; leaving it pending
+// would hold it until its queue drains or its own timeout runs out, having told it
+// nothing.
+//
+// Where no deadline was declared, provenance is the only evidence left. A command read
+// with `>` has just arrived, so somebody is waiting on the other end of it. A redelivered
+// one has been round the pending list since its holder died or lost the session, and its
+// reply list may not even exist any more.
+func (m *Manager) stillHeard(command *protocol.Command, redelivered bool) bool {
+	if command.ReplyTo == "" {
+		return false
+	}
+	if command.Deadline > 0 {
+		return !expired(command, m.now())
+	}
+	return !redelivered
 }
 
 // release says this instance is done with a delivery it did not carry out. A transport
