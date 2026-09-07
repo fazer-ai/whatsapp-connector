@@ -263,16 +263,23 @@ func schemaEnumPaths(t *testing.T) []string {
 
 	var found []string
 	var walk func(node any, path []string)
+	// Down arrays as well as objects. A frame is a union, so `oneOf`, `anyOf` and
+	// `allOf` decode as slices, and a walk that only descends into maps stops at the
+	// edge of every one of them -- reporting that every enum is accounted for while not
+	// having looked at the places JSON Schema puts alternatives.
 	walk = func(node any, path []string) {
-		object, ok := node.(map[string]any)
-		if !ok {
-			return
-		}
-		if _, has := object["enum"]; has {
-			found = append(found, strings.Join(path, "/"))
-		}
-		for key, value := range object {
-			walk(value, append(append([]string{}, path...), key))
+		switch node := node.(type) {
+		case map[string]any:
+			if _, has := node["enum"]; has {
+				found = append(found, strings.Join(path, "/"))
+			}
+			for key, value := range node {
+				walk(value, append(append([]string{}, path...), key))
+			}
+		case []any:
+			for i, value := range node {
+				walk(value, append(append([]string{}, path...), strconv.Itoa(i)))
+			}
 		}
 	}
 	walk(document, nil)
