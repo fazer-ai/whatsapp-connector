@@ -48,7 +48,33 @@ type Manager struct {
 	// expires. Kept here so the next tick tries the release again.
 	orphanMu sync.Mutex
 	orphans  map[string]struct{}
+
+	// answers is the commands this manager carries out itself, waiting on the goroutine
+	// that carries them out.
+	//
+	// A session's commands are queued on that session and run on its own goroutine, and
+	// have been all along. These three -- a wake, a ping, and the refusal of a session
+	// whose queue is full -- were the ones the manager answered inline, on whichever
+	// goroutine dispatched. That goroutine is the one that renews every lease this
+	// instance holds, and all three block on I/O: a wake reads the store and opens the
+	// engine, and every one of them ends in a round trip to Redis to retire the command.
+	answers chan answer
 }
+
+// answer is one command this manager owns, and the work that finishes it.
+type answer struct {
+	delivery *transport.Delivery
+	give     func(context.Context, *transport.Delivery)
+}
+
+// DefaultAnswerDepth is how many commands may wait on the manager's own goroutine.
+//
+// A whole claim batch with room to spare, for the same reason DefaultQueueDepth is: a
+// reclaim pass hands over what it took in one go, and the goroutine has had no turn
+// while it did. Smaller than a session's queue because only three kinds of command
+// reach here and a wake is the only slow one, and because what does not fit is not
+// refused but left pending, which costs a claim delay rather than an answer.
+const DefaultAnswerDepth = 64
 
 // ManagerConfig is what a manager needs.
 type ManagerConfig struct {
@@ -63,12 +89,18 @@ type ManagerConfig struct {
 	NewID  IDFunc
 	Now    func() time.Time
 	Logger zerolog.Logger
+	// AnswerDepth bounds how many commands wait on the manager's own goroutine. The
+	// zero value asks for DefaultAnswerDepth.
+	AnswerDepth int
 }
 
 // NewManager returns a manager owning no sessions yet.
 func NewManager(cfg *ManagerConfig) *Manager {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
+	}
+	if cfg.AnswerDepth <= 0 {
+		cfg.AnswerDepth = DefaultAnswerDepth
 	}
 	return &Manager{
 		instance:  cfg.Instance,
@@ -82,6 +114,7 @@ func NewManager(cfg *ManagerConfig) *Manager {
 		log:       cfg.Logger,
 		sessions:  make(map[string]*Session),
 		orphans:   make(map[string]struct{}),
+		answers:   make(chan answer, cfg.AnswerDepth),
 	}
 }
 
@@ -387,14 +420,19 @@ func (m *Manager) undrained(sid string) {
 
 // Dispatch routes one command. It answers by itself for the two it can answer without
 // a session (`session.wake` and `admin.ping`) and hands the rest to the session.
-func (m *Manager) Dispatch(ctx context.Context, delivery *transport.Delivery) {
+//
+// It takes no context and does no I/O, which is the whole of its contract to the caller:
+// the goroutine that dispatches is the one that renews every lease this instance holds,
+// and nothing routed here may hold it up. A session's command is offered to that
+// session's queue, and the three this manager owns are queued on its own goroutine.
+func (m *Manager) Dispatch(delivery *transport.Delivery) {
 	command := delivery.Command
 	switch command.Type {
 	case protocol.CommandSessionWake:
-		m.wake(ctx, delivery)
+		m.own(delivery, m.wake)
 		return
 	case protocol.CommandAdminPing:
-		m.pong(ctx, delivery)
+		m.own(delivery, m.pong)
 		return
 	}
 
@@ -417,7 +455,9 @@ func (m *Manager) Dispatch(ctx context.Context, delivery *transport.Delivery) {
 	switch session.Offer(delivery) {
 	case OfferAccepted:
 	case OfferBusy:
-		m.refuse(ctx, delivery, protocol.NewError(protocol.ErrorRateLimited, "the session has too many commands waiting"))
+		m.own(delivery, func(ctx context.Context, busy *transport.Delivery) {
+			m.refuse(ctx, busy, protocol.NewError(protocol.ErrorRateLimited, "the session has too many commands waiting"))
+		})
 	case OfferStopped:
 		// This instance is letting the account go. Refusing would answer for an owner
 		// it is no longer, so the command stays pending for whoever takes it next.
@@ -428,6 +468,67 @@ func (m *Manager) Dispatch(ctx context.Context, delivery *transport.Delivery) {
 		// the new owner already holds and handing them back at age zero, below the idle
 		// floor its own reclaim watches. It stays pending for the owner instead.
 		release(delivery)
+	}
+}
+
+// own queues a command for the goroutine that carries out what this manager answers
+// itself, and never blocks doing it.
+//
+// A queue with no room leaves the delivery pending rather than refusing it: released,
+// age kept, so a later pass brings it back -- to this instance once it has caught up, or
+// to a peer. That is the right trade for all three. A wake left pending is a session
+// started a claim delay later; refused, it would be a session nobody starts at all. A
+// ping left pending is answered on the redelivery; refused, its caller is told this
+// instance is busy, which is true but is not what it asked. And the queue-full refusal
+// is itself the answer to a session that is behind -- dropping it on a manager that is
+// also behind would retire, unrun, a command the client never heard about.
+func (m *Manager) own(delivery *transport.Delivery, give func(context.Context, *transport.Delivery)) {
+	select {
+	case m.answers <- answer{delivery: delivery, give: give}:
+	default:
+		m.log.Warn().Str("cmd_id", delivery.Command.ID).Str("type", string(delivery.Command.Type)).
+			Msg("no room to carry out a command this instance answers itself; leaving it pending")
+		release(delivery)
+	}
+}
+
+// Answer carries out the commands this manager owns, on a goroutine of its own. The
+// returned channel closes once it has stopped.
+//
+// The context is the instance's lifetime, which is what gives the work back the bounds
+// it is written against: an adoption gets AdoptTimeout rather than whatever was left of
+// a tick window, and an acknowledgement gets its own two seconds without spending a
+// renewal's. Neither bound moved; what moved is the goroutine they are measured on.
+func (m *Manager) Answer(ctx context.Context) <-chan struct{} {
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		for {
+			select {
+			case <-ctx.Done():
+				// Given back rather than dropped. These are commands nobody has carried
+				// out, and a delivery this process forgets about while still holding it
+				// is one no reclaim can take: the instance is going away, so the sooner
+				// they read as untouched the sooner a peer runs them.
+				m.releaseQueued()
+				return
+			case work := <-m.answers:
+				work.give(ctx, work.delivery)
+			}
+		}
+	}()
+	return stopped
+}
+
+// releaseQueued hands back everything still waiting, without carrying any of it out.
+func (m *Manager) releaseQueued() {
+	for {
+		select {
+		case work := <-m.answers:
+			release(work.delivery)
+		default:
+			return
+		}
 	}
 }
 
@@ -480,9 +581,17 @@ func (m *Manager) pong(ctx context.Context, delivery *transport.Delivery) {
 		result, _ := json.Marshal(map[string]any{
 			"inst": m.instance, "version": protocol.Version, "sessions": m.Count(),
 		})
-		if err := m.replier.Reply(ctx, command.ReplyTo, protocol.Reply{
+		// Bounded here, the way a session bounds its own reply, and for a reason this
+		// used to get for free: the caller's context was a tick window, so a Redis that
+		// hung could not hold this past one. It is the manager's own goroutine now, and
+		// its context is the instance's lifetime -- long enough that an unbounded reply
+		// would stop every wake behind it, for as long as Redis stayed away.
+		answered, cancel := context.WithTimeout(context.WithoutCancel(ctx), ackTimeout)
+		err := m.replier.Reply(answered, command.ReplyTo, protocol.Reply{
 			V: protocol.Version, ID: command.ID, OK: true, Result: result,
-		}); err != nil {
+		})
+		cancel()
+		if err != nil {
 			m.log.Error().Err(err).Msg("failed to answer admin.ping")
 		}
 	}
@@ -492,9 +601,12 @@ func (m *Manager) pong(ctx context.Context, delivery *transport.Delivery) {
 func (m *Manager) refuse(ctx context.Context, delivery *transport.Delivery, failure *protocol.Error) {
 	command := delivery.Command
 	if command.ReplyTo != "" {
-		_ = m.replier.Reply(ctx, command.ReplyTo, protocol.Reply{
+		// Bounded for the same reason pong's is: see there.
+		answered, cancel := context.WithTimeout(context.WithoutCancel(ctx), ackTimeout)
+		_ = m.replier.Reply(answered, command.ReplyTo, protocol.Reply{
 			V: protocol.Version, ID: command.ID, OK: false, Error: failure,
 		})
+		cancel()
 	}
 	m.ack(ctx, delivery)
 }

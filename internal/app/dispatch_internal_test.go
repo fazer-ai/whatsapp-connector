@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -71,9 +72,7 @@ func TestABatchWithRoomCarriesEverythingOut(t *testing.T) {
 	acked, released := deliveryBatch(6)
 	connector.dispatchWithin(window, acked.deliveries)
 
-	if acked.count.Load() != 6 {
-		t.Fatalf("%d of 6 commands were carried out", acked.count.Load())
-	}
+	waitFor(t, "the whole batch to be carried out", func() bool { return acked.count.Load() == 6 })
 	if released.Load() != 0 {
 		t.Fatalf("%d commands were released despite the window being ample", released.Load())
 	}
@@ -101,6 +100,7 @@ func TestADrainThatFailsGivesTheSessionsBack(t *testing.T) {
 		Publisher: quietPublisher{}, Replier: quietReplier{},
 		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
 	})
+	answering(t, manager)
 	t.Cleanup(func() { manager.StopAll(context.Background()) })
 
 	connector := &Connector{cfg: Config{LeaseTTL: time.Minute}, log: zerolog.Nop(), manager: manager, streams: streams}
@@ -143,7 +143,91 @@ func newTestManager(t *testing.T) *session.Manager {
 		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
 	})
 	t.Cleanup(func() { manager.StopAll(context.Background()) })
+	answering(t, manager)
 	return manager
+}
+
+// timedStreams records the deadline the loop granted each of its own calls.
+//
+// This is where the bound #7 is about is actually granted, so this is where it is read.
+// It used to be inferred from the deadline an `admin.ping` was answered under, which
+// held only while the manager answered a ping on the goroutine that dispatched it.
+type timedStreams struct {
+	inner commandStreams
+	mu    sync.Mutex
+	given []time.Duration
+}
+
+func (s *timedStreams) record(ctx context.Context) {
+	deadline, bounded := ctx.Deadline()
+	if !bounded {
+		s.mu.Lock()
+		s.given = append(s.given, time.Duration(math.MaxInt64))
+		s.mu.Unlock()
+		return
+	}
+	s.mu.Lock()
+	s.given = append(s.given, time.Until(deadline))
+	s.mu.Unlock()
+}
+
+// longest is the most any one call was given, which is what a ceiling is asserted
+// against: one call under the bound proves nothing if another was over it.
+func (s *timedStreams) longest() (time.Duration, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.given) == 0 {
+		return 0, false
+	}
+	return slices.Max(s.given), true
+}
+
+func (s *timedStreams) Read(ctx context.Context, sids []string) ([]transport.Delivery, error) {
+	s.record(ctx)
+	return s.inner.Read(ctx, sids)
+}
+
+func (s *timedStreams) Claim(ctx context.Context, sids []string) ([]transport.Delivery, error) {
+	s.record(ctx)
+	return s.inner.Claim(ctx, sids)
+}
+
+func (s *timedStreams) ClaimControl(ctx context.Context) ([]transport.Delivery, error) {
+	s.record(ctx)
+	return s.inner.ClaimControl(ctx)
+}
+
+func (s *timedStreams) ClaimSessions(ctx context.Context, sids []string) ([]transport.Delivery, error) {
+	s.record(ctx)
+	return s.inner.ClaimSessions(ctx, sids)
+}
+
+// waitFor blocks until cond holds, which is how a test joins the manager's own
+// goroutine: what used to be finished by the time Dispatch returned is now queued there.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
+// answering starts the goroutine a manager carries its own commands out on, and stops it
+// when the test ends. A wake, a ping and the refusal of a full session are queued there
+// rather than run by whoever dispatched, so a test that asserts on one has to let that
+// goroutine run.
+func answering(t *testing.T, manager *session.Manager) {
+	t.Helper()
+	ctx, stop := context.WithCancel(context.Background())
+	stopped := manager.Answer(ctx)
+	t.Cleanup(func() {
+		stop()
+		<-stopped
+	})
 }
 
 type batch struct {
@@ -170,18 +254,23 @@ func deliveryBatch(n int) (*batch, *atomic.Int64) {
 	return b, released
 }
 
-// The drain claims and then dispatches, and the two share the window the loop handed
-// it. Opening a budget of its own for the dispatch would stack a fresh deadline on top
-// of whatever the claim spent, so a drain that has already spent most of its window
-// would go on holding the goroutine that renews every lease this instance holds for a
-// budget more, and for another on the pass after that.
-func TestADrainDispatchesOnWhatIsLeftOfItsWindow(t *testing.T) {
+// The drain claims under the window the loop handed it, and never under one of its own.
+// A budget opened here would stack a fresh deadline on top of whatever the loop had
+// already spent, so a drain reached late in a period would go on holding the goroutine
+// that renews every lease this instance holds for a budget more, and for another on the
+// pass after that.
+//
+// Read off the claim itself. The dispatch that follows it no longer does any I/O -- a
+// session's command is offered to that session's queue and the manager's own three are
+// queued on its goroutine -- so the deadline the dispatch is handed decides nothing, and
+// asserting on it would be asserting on a value nothing reads. What is left to protect
+// is the claim, which is the whole of what the drain spends.
+func TestADrainClaimsOnWhatIsLeftOfItsWindow(t *testing.T) {
 	t.Parallel()
 
 	// A short window keeps the test quick; what it is measuring is the deadline
 	// dispatch is handed, not how long anything takes.
 	const window = 600 * time.Millisecond
-	const slowClaim = 150 * time.Millisecond
 
 	server := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
@@ -199,6 +288,7 @@ func TestADrainDispatchesOnWhatIsLeftOfItsWindow(t *testing.T) {
 	}
 	streams := newStreams("inst-a")
 	dead := newStreams("inst-dead")
+	timed := &timedStreams{inner: streams}
 	dispatched := &deadlineReplier{}
 	manager := session.NewManager(&session.ManagerConfig{
 		Instance: "inst-a", Engine: fake.New(),
@@ -206,12 +296,13 @@ func TestADrainDispatchesOnWhatIsLeftOfItsWindow(t *testing.T) {
 		Publisher: quietPublisher{}, Replier: dispatched,
 		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
 	})
+	answering(t, manager)
 	ctx := context.Background()
 	t.Cleanup(func() { manager.StopAll(ctx) })
 
 	connector := &Connector{
 		cfg: Config{LeaseTTL: 30 * time.Second}, log: zerolog.Nop(),
-		manager: manager, streams: streams,
+		manager: manager, streams: timed,
 	}
 
 	// An admin.ping, because the manager answers that one on the dispatch goroutine: the
@@ -227,28 +318,17 @@ func TestADrainDispatchesOnWhatIsLeftOfItsWindow(t *testing.T) {
 		t.Fatalf("Adopt: %v", err)
 	}
 
-	// The claim spends most of the drain's window, which is the case that tells the two
-	// contexts apart: what is left of the window, or a fresh deadline over again.
-	var once sync.Once
-	rdb.AddHook(slowClaims{on: func(cmd redis.Cmder) bool {
-		slow := false
-		if cmd.Name() == "xclaim" {
-			once.Do(func() { slow = true })
-		}
-		return slow
-	}, delay: slowClaim})
-
 	bounded, cancel := context.WithTimeout(ctx, window)
 	defer cancel()
 	connector.drainAdopted(bounded)
 
-	left, ok := dispatched.left()
-	if !ok {
-		t.Fatal("nothing was dispatched, so there is no deadline to look at")
+	given, claimed := timed.longest()
+	if !claimed {
+		t.Fatal("the drain made no claim, so there is no grant to look at")
 	}
-	if left > window-slowClaim/2 {
-		t.Fatalf("dispatch was given %s, which is a fresh deadline rather than what was left of the drain's %s",
-			left, window)
+	if given > window {
+		t.Fatalf("the drain claimed on %s, which is a fresh deadline rather than the %s window it was handed",
+			given, window)
 	}
 }
 
@@ -300,11 +380,17 @@ func TestASessionCommandIsNotHeldBackByTheFloor(t *testing.T) {
 	}
 }
 
-// The floor is not only the wake's. An inline answer is a round trip too, and the
-// acknowledgement that follows it runs on a detached timeout: dispatched with a sliver,
-// the reply never leaves while the command is retired all the same, and the caller
-// waits out its own timeout for an answer no redelivery will produce.
-func TestAnInlineAnswerIsNotStartedOnASliverOfTheWindow(t *testing.T) {
+// What the floor used to buy, bought structurally instead. A wake and a ping used to be
+// carried out by whoever dispatched them, so one dispatched with a sliver of window left
+// had its round trip cut and was retired all the same: the session waited out a claim
+// delay for an attempt that never was, and the ping's caller waited out its own timeout
+// for an answer no redelivery would produce. They were held to a floor for that reason.
+//
+// Neither is carried out here any more. The dispatch queues them on the manager's own
+// goroutine, where the adoption gets AdoptTimeout and the answer gets its own, so how
+// much window was left when they arrived decides nothing -- which is what let the floor,
+// and the guessing about what a turn is worth, be deleted rather than tuned.
+func TestAnAnswerIsNotMeasuredAgainstTheWindowItWasDispatchedIn(t *testing.T) {
 	t.Parallel()
 
 	connector := &Connector{
@@ -323,53 +409,14 @@ func TestAnInlineAnswerIsNotStartedOnASliverOfTheWindow(t *testing.T) {
 		Release: func() { released.Add(1) },
 	}}
 
+	// Alive, and far shorter than the floor the old code would have refused it on.
 	sliver, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	connector.dispatchWithin(sliver, deliveries)
 
-	if acked.Load() != 0 {
-		t.Fatal("a ping was acknowledged over a sliver of window, so the caller waits for a reply that never went out")
-	}
-	if released.Load() != 1 {
-		t.Fatalf("the ping was released %d times, want once with its age kept", released.Load())
-	}
-}
-
-func TestAWakeIsNotStartedOnASliverOfTheWindow(t *testing.T) {
-	t.Parallel()
-
-	connector := &Connector{
-		cfg:     Config{LeaseTTL: 30 * time.Second, Heartbeat: 600 * time.Millisecond},
-		log:     zerolog.Nop(),
-		manager: newTestManager(t),
-	}
-
-	var released, forfeited, acked atomic.Int64
-	deliveries := []transport.Delivery{{
-		Command: protocol.Command{
-			V: protocol.Version, ID: "wake-late", Type: protocol.CommandSessionWake,
-			SID: "2f1c6f0e-0000-4000-8000-0000000000fe", TS: 1787000000000,
-			Payload: json.RawMessage(`{"desired":"connected"}`),
-		},
-		Ack:     func(context.Context) error { acked.Add(1); return nil },
-		Release: func() { released.Add(1) },
-		Forfeit: func() { forfeited.Add(1) },
-	}}
-
-	// Alive, and shorter than the floor of half a read block: the window a wake read
-	// at the tail of a period would otherwise start its adoption on.
-	sliver, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel()
-	connector.dispatchWithin(sliver, deliveries)
-
-	if forfeited.Load() != 0 {
-		t.Fatal("a wake was forfeited over a sliver of window, so the session waits out the claim delay for an attempt that never was")
-	}
-	if acked.Load() != 0 {
-		t.Fatal("a wake was acknowledged over a sliver of window, which retires the only wake there was")
-	}
-	if released.Load() != 1 {
-		t.Fatalf("the wake was released %d times, want once with its age kept", released.Load())
+	waitFor(t, "the ping to be answered", func() bool { return acked.Load() == 1 })
+	if released.Load() != 0 {
+		t.Fatalf("the ping was released %d time(s) over a window that no longer bounds it", released.Load())
 	}
 }
 
@@ -407,17 +454,19 @@ func TestTheLoopBoundsItsOptionalWorkByTheTick(t *testing.T) {
 		Publisher: quietPublisher{}, Replier: dispatched,
 		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
 	})
+	answering(t, manager)
 	t.Cleanup(func() { manager.StopAll(context.Background()) })
 
+	// A lease far longer than the heartbeat, which is what tells the two grants apart: a
+	// third of it is seconds, a tick window is milliseconds.
+	timed := &timedStreams{inner: streams}
 	connector := &Connector{
-		// A lease far longer than the heartbeat, which is what tells the two grants
-		// apart: a third of it is seconds, a tick window is milliseconds.
 		cfg:      Config{LeaseTTL: 30 * time.Second, Heartbeat: heartbeat},
 		log:      zerolog.Nop(),
 		metrics:  observability.New(),
 		registry: cluster.NewRegistry(client, 3*heartbeat),
 		manager:  manager,
-		streams:  streams,
+		streams:  timed,
 	}
 
 	// A command the previous owner left pending, adopted before the loop starts: the
@@ -439,22 +488,24 @@ func TestTheLoopBoundsItsOptionalWorkByTheTick(t *testing.T) {
 	done := make(chan struct{})
 	go func() { defer close(done); _ = connector.loop(ctx, make(chan error)) }()
 
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		if _, ok := dispatched.left(); ok {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("the pending command was never dispatched")
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
+	waitFor(t, "the pending command to be dispatched", func() bool {
+		_, dispatchedIt := dispatched.left()
+		return dispatchedIt
+	})
 	cancel()
 	<-done
 
-	if left, _ := dispatched.left(); left > heartbeat {
-		t.Fatalf("the drain dispatched on %s against a %s heartbeat: the loop granted more than the period",
-			left, heartbeat)
+	// Read where it is granted rather than off what a command was answered under. Every
+	// call the loop makes outside the tick's own work shares one deadline -- when the
+	// next renewal is due -- so the longest any of them was given is the whole of what
+	// the period lends, and it may not exceed it.
+	longest, taken := timed.longest()
+	if !taken {
+		t.Fatal("the loop made no read or claim, so there is no grant to look at")
+	}
+	if longest > heartbeat {
+		t.Fatalf("the loop granted %s against a %s heartbeat: more than the period it started in",
+			longest, heartbeat)
 	}
 }
 
@@ -500,6 +551,7 @@ func TestASlowDrainStillLeavesRoomToRead(t *testing.T) {
 		Publisher: quietPublisher{}, Replier: dispatched,
 		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
 	})
+	answering(t, manager)
 	ctx := context.Background()
 	t.Cleanup(func() { manager.StopAll(ctx) })
 
@@ -677,6 +729,7 @@ func TestAFailingSessionClaimDoesNotTakeTheControlStreamWithIt(t *testing.T) {
 		Publisher: quietPublisher{}, Replier: dispatched,
 		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
 	})
+	answering(t, manager)
 	ctx := context.Background()
 	t.Cleanup(func() { manager.StopAll(ctx) })
 
@@ -744,21 +797,22 @@ func TestAReclaimDispatchesOnWhatIsLeftOfItsOwnDeadline(t *testing.T) {
 	}
 	streams := newStreams("inst-a")
 	dead := newStreams("inst-dead")
-	dispatched := &deadlineReplier{}
 	manager := session.NewManager(&session.ManagerConfig{
 		Instance: "inst-a", Engine: fake.New(),
 		Leases:    cluster.NewLeases(client, "inst-a", cluster.Options{}),
-		Publisher: quietPublisher{}, Replier: dispatched,
+		Publisher: quietPublisher{}, Replier: quietReplier{},
 		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
 	})
+	answering(t, manager)
 	ctx := context.Background()
 	t.Cleanup(func() { manager.StopAll(ctx) })
 
+	// A lease far longer than the heartbeat, which is what makes a budget of the pass's
+	// own tell itself apart from a share of the period.
+	timed := &timedStreams{inner: streams}
 	connector := &Connector{
-		// A lease far longer than the heartbeat, which is what makes a fresh dispatch
-		// budget tell itself apart from what is left of the pass.
 		cfg: Config{LeaseTTL: 30 * time.Second, Heartbeat: heartbeat}, log: zerolog.Nop(),
-		manager: manager, streams: streams,
+		manager: manager, streams: timed,
 	}
 
 	if _, err := dead.Read(ctx, []string{"s1"}); err != nil {
@@ -789,13 +843,16 @@ func TestAReclaimDispatchesOnWhatIsLeftOfItsOwnDeadline(t *testing.T) {
 
 	connector.reclaimCommands(ctx)
 
-	left, ok := dispatched.left()
-	if !ok {
-		t.Fatal("nothing was dispatched, so there is no deadline to look at")
+	// Each pass gets its share of the heartbeat and no more, so the two together stay
+	// inside one period. Read off the claims themselves: what the dispatch after them is
+	// handed decides nothing any more, because it does no I/O.
+	given, claimed := timed.longest()
+	if !claimed {
+		t.Fatal("the reclaim made no claim, so there is no grant to look at")
 	}
-	if budget := heartbeat / reclaimPasses; left > budget-slowClaim/2 {
-		t.Fatalf("dispatch was given %s, which is a fresh budget rather than what was left of the pass's %s",
-			left, budget)
+	if budget := heartbeat / reclaimPasses; given > budget {
+		t.Fatalf("a reclaim pass claimed on %s, which is more than the %s share it is allowed",
+			given, budget)
 	}
 }
 
