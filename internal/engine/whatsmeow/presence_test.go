@@ -814,6 +814,11 @@ func TestAStopGoesBackOnTheBoardWhenItsPublishFails(t *testing.T) {
 	if emission.Settle == nil {
 		t.Fatal("a stop was published with no way to hear that it never landed")
 	}
+	// Before the settle, which is what puts it back: the retry goes through the inbox,
+	// and a forwarder still running takes it from there and marks it sent -- so what this
+	// looks at next is empty, and the test reads "the stop was dropped" from a stop that
+	// was picked up. The sibling below already parks it for the same reason.
+	blockTheForwarder(t, session)
 	emission.Settle(errors.New("redis is unreachable"))
 
 	waiting := onBoard(session)
