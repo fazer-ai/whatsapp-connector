@@ -1555,8 +1555,9 @@ func liveDeadline(t *testing.T, fallback time.Duration) time.Duration {
 // there can only be one: Events is a channel, so a second reader would steal frames
 // from the first.
 type recorder struct {
-	seen  chan engine.Emission
-	tally map[protocol.EventType]*atomic.Int64
+	seen    chan engine.Emission
+	tally   map[protocol.EventType]*atomic.Int64
+	dropped atomic.Int64
 }
 
 // liveWatchers is the one reader of each session's events, and the watchers it feeds.
@@ -1625,6 +1626,14 @@ func watch(t *testing.T, session *Session) *recorder {
 				default:
 					// A phase that is not reading fast enough must not stall the
 					// session's own forwarder, which is what publishes the state.
+					//
+					// Counted, because dropping in silence is what makes the wait
+					// that follows unreadable: a phase whose event was thrown away
+					// waits out its whole deadline and then reports the event as
+					// never having arrived, which is a description of the connector
+					// and not of this buffer. Every wait below says so when it gives
+					// up.
+					watcher.dropped.Add(1)
 				}
 			}
 		}
@@ -1709,6 +1718,17 @@ func (r *fanout) writeCode(payload json.RawMessage) (string, time.Duration, erro
 	return current, time.Duration(body.ExpiresIn) * time.Millisecond, nil
 }
 
+// overflowed is what to add to a deadline's complaint: whether this watcher's buffer
+// filled up while it was not being read, which is the difference between "the connector
+// never sent it" and "this phase was not listening when it did".
+func (r *recorder) overflowed() string {
+	if dropped := r.dropped.Load(); dropped > 0 {
+		return fmt.Sprintf(" (%d emissions were dropped: this watcher's buffer filled "+
+			"before anything drained it, so what was waited for may well have arrived)", dropped)
+	}
+	return ""
+}
+
 func (r *recorder) count(eventType protocol.EventType) int64 {
 	if counter, ok := r.tally[eventType]; ok {
 		return counter.Load()
@@ -1738,7 +1758,7 @@ func (r *recorder) await(t *testing.T, want protocol.EventType, within time.Dura
 				t.Fatalf("the account was logged out while waiting for %s: %s", want, emission.Payload)
 			}
 		case <-deadline:
-			t.Fatalf("%s did not arrive within %s", want, within)
+			t.Fatalf("%s did not arrive within %s%s", want, within, r.overflowed())
 		}
 	}
 }
@@ -1785,7 +1805,7 @@ func (r *recorder) awaitMessage(t *testing.T, id string, within time.Duration) j
 				return envelope.Message
 			}
 		case <-deadline:
-			t.Fatalf("message %s did not arrive within %s", id, within)
+			t.Fatalf("message %s did not arrive within %s%s", id, within, r.overflowed())
 		}
 	}
 }
@@ -1827,7 +1847,7 @@ func (r *recorder) awaitState(t *testing.T, want string, within time.Duration) {
 				return
 			}
 		case <-deadline:
-			t.Fatalf("the session did not report %q within %s", want, within)
+			t.Fatalf("the session did not report %q within %s%s", want, within, r.overflowed())
 		}
 	}
 }

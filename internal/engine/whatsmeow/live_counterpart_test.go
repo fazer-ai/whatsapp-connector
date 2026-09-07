@@ -76,9 +76,14 @@ func TestLiveTwoAccountsTalk(t *testing.T) {
 	subjectJID := liveMustBePaired(t, container, liveSID)
 	counterpartJID := liveMustBePaired(t, container, liveCounterpartSID)
 
-	inbox := watch(t, subject)
 	liveResume(t, subject)
 	liveResume(t, counterpart)
+	// Watched after the resumes, not before. A watcher's buffer holds 256 emissions and
+	// drops what does not fit, and a resume delivers whatever came in while the session
+	// was down: on an account with a real backlog the probe below would be dropped on
+	// arrival, and the phase would wait out its deadline reporting a message that had in
+	// fact been delivered. Nothing here needs the resume's own events.
+	inbox := watch(t, subject)
 
 	said := "conector nativo, contraparte falando " + time.Now().Format(time.TimeOnly)
 	sent := liveSay(t, counterpart, subjectJID.User, said)
