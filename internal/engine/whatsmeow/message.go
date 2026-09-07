@@ -70,12 +70,12 @@ func addressOf(jid waTypes.JID) (protocol.Address, bool) {
 // depends on the chat's addressing mode, so neither is the one to build on: a client
 // that only ever stored the phone number still has to recognise the LID as the same
 // person the first time a chat switches.
-func partyOf(info *waTypes.MessageInfo) (*protocol.Party, bool) {
-	party := protocol.Party{PushName: info.PushName}
+func (s *Session) partyOf(ctx context.Context, info *waTypes.MessageInfo) (*protocol.Party, bool) {
+	party := s.party(ctx, info.Sender, info.SenderAlt)
+	party.PushName = info.PushName
 	if info.VerifiedName != nil {
 		party.VerifiedName = info.VerifiedName.Details.GetVerifiedName()
 	}
-	naming(&party, info.Sender, info.SenderAlt)
 	if party.Phone != "" || party.LID != "" {
 		return &party, true
 	}
@@ -142,8 +142,8 @@ type renderBody func(*waEvents.Message) (body, bool)
 //
 // The second return is the failure to announce once the message itself is out, zero for
 // a message with nothing missing.
-func inboundOf(event *waEvents.Message, render renderBody) (protocol.InboundMessage, missingFile, bool) {
-	message, ok := envelopeOf(&event.Info)
+func (s *Session) inboundOf(event *waEvents.Message, render renderBody) (protocol.InboundMessage, missingFile, bool) {
+	message, ok := s.envelopeOf(&event.Info)
 	if !ok {
 		return protocol.InboundMessage{}, missingFile{}, false
 	}
@@ -166,8 +166,11 @@ func inboundOf(event *waEvents.Message, render renderBody) (protocol.InboundMess
 // Separate from `inboundOf` for that reason and no other: a stanza that arrived with no
 // ciphertext in it still has a sender, a chat and a time, and the client needs all three
 // to put a bubble where the message was.
-func envelopeOf(info *waTypes.MessageInfo) (protocol.InboundMessage, bool) {
-	chat, ok := chatOf(info)
+func (s *Session) envelopeOf(info *waTypes.MessageInfo) (protocol.InboundMessage, bool) {
+	looking, done := s.looking()
+	defer done()
+
+	chat, ok := s.chatOf(looking, info)
 	if !ok || info.ID == "" {
 		return protocol.InboundMessage{}, false
 	}
@@ -178,7 +181,7 @@ func envelopeOf(info *waTypes.MessageInfo) (protocol.InboundMessage, bool) {
 		// and naming the account itself there files the operator's own number as the
 		// party in a conversation with somebody else.
 		var named bool
-		if sender, named = partyOf(info); !named {
+		if sender, named = s.partyOf(looking, info); !named {
 			return protocol.InboundMessage{}, false
 		}
 	}
@@ -210,7 +213,7 @@ func naming(party *protocol.Party, jids ...waTypes.JID) {
 // have to agree on the answer: the address the event is published under, and the one the
 // file kept for that message is filed under. A second copy of this rule would drift, and
 // the drift would file a message's file in a chat the message is not in.
-func chatOf(info *waTypes.MessageInfo) (protocol.Address, bool) {
+func (s *Session) chatOf(ctx context.Context, info *waTypes.MessageInfo) (protocol.Address, bool) {
 	chatJID := info.Chat
 	if info.IsIncomingBroadcast() {
 		// Somebody sent this through a broadcast list, and WhatsApp shows it to the
@@ -221,7 +224,11 @@ func chatOf(info *waTypes.MessageInfo) (protocol.Address, bool) {
 		// nowhere else. The status feed is not a broadcast list and is not touched.
 		chatJID = info.Sender
 	}
-	return addressOf(chatJID)
+	if info.IsGroup || chatJID.Server == waTypes.GroupServer {
+		// SenderAlt names the participant here, not the chat.
+		return s.address(ctx, chatJID)
+	}
+	return s.address(ctx, chatJID, info.SenderAlt)
 }
 
 // newsletterEdit reports whether a newsletter post is a correction of an earlier one.
@@ -532,7 +539,7 @@ func (s *Session) receive(event *waEvents.Message) bool {
 		return false
 	}
 
-	message, missing, ok := inboundOf(event, s.bodyOf(s.ctx))
+	message, missing, ok := s.inboundOf(event, s.bodyOf(s.ctx))
 	if !ok {
 		s.log.Debug().Str("message_id", event.Info.ID).
 			Msg("refusing to acknowledge an inbound message this build cannot publish")
@@ -691,7 +698,7 @@ func (s *Session) unreadable(event *waEvents.UndecryptableMessage) bool {
 			Msg("dropping an unreadable action the sender asked not to be shown")
 		return true
 	}
-	message, addressed := envelopeOf(&event.Info)
+	message, addressed := s.envelopeOf(&event.Info)
 	if !addressed {
 		// No chat to put it in or nobody to attribute it to. There is no bubble to be
 		// had, and the stanza carries nothing else worth an event.

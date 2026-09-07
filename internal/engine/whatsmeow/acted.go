@@ -91,7 +91,7 @@ func (s *Session) changed(event *waEvents.Message) change {
 	if reaction := event.Message.GetEncReactionMessage(); reaction != nil {
 		return s.unsealedReaction(event, reaction)
 	}
-	return changeOf(event)
+	return s.changeOf(event)
 }
 
 // unsealedCorrection opens a sealed correction and renders it, or says why it could not.
@@ -112,7 +112,7 @@ func (s *Session) unsealedCorrection(event *waEvents.Message, sealed *waE2E.Secr
 	if target == "" {
 		return dropping("dropping a sealed correction that names no message to correct")
 	}
-	chat, sender, addressed := whereAndWho(event)
+	chat, sender, addressed := s.whereAndWho(event)
 	if !addressed {
 		return withholding("withholding an acknowledgement for a sealed correction this build cannot address")
 	}
@@ -183,20 +183,20 @@ func theSealedBody(plain *waE2E.Message, event *waEvents.Message) (corrected *wa
 // checked exhaustively rather than by exclusion, so an attribute a future WhatsApp
 // introduces is refused with a name rather than published as whatever it happens to
 // resemble.
-func changeOf(event *waEvents.Message) change {
+func (s *Session) changeOf(event *waEvents.Message) change {
 	switch {
 	case event.Message.GetReactionMessage() != nil:
-		return reactionOf(event, event.Message.GetReactionMessage())
+		return s.reactionOf(event, event.Message.GetReactionMessage())
 
 	case event.IsEdit,
 		event.Info.Edit == waTypes.EditAttributeMessageEdit,
 		event.Info.Edit == waTypes.EditAttributeAdminEdit,
 		newsletterEdit(event),
 		resentEdit(event):
-		return editOf(event)
+		return s.editOf(event)
 
 	case revokes(event):
-		return revokeOf(event)
+		return s.revokeOf(event)
 
 	case event.Info.Edit == waTypes.EditAttributePinInChat:
 		// Pinning is not a change to the message, it is a change to where the chat shows
@@ -405,7 +405,7 @@ func (s *Session) unsealedReaction(event *waEvents.Message, sealed *waE2E.EncRea
 	}
 
 	reaction.Key = sealed.GetTargetMessageKey()
-	return reactionOf(event, reaction)
+	return s.reactionOf(event, reaction)
 }
 
 // unsealReactionOverStore is what opens a sealed reaction when nothing has replaced it.
@@ -415,7 +415,7 @@ func (s *Session) unsealReactionOverStore(
 	return s.current().DecryptReaction(ctx, event)
 }
 
-func reactionOf(event *waEvents.Message, reaction *waE2E.ReactionMessage) change {
+func (s *Session) reactionOf(event *waEvents.Message, reaction *waE2E.ReactionMessage) change {
 	target := reaction.GetKey().GetID()
 	switch {
 	case target == "":
@@ -425,7 +425,7 @@ func reactionOf(event *waEvents.Message, reaction *waE2E.ReactionMessage) change
 		// later that supplies one, so a redelivery would be the same stanza again.
 		return dropping("dropping a reaction with no id of its own")
 	}
-	chat, sender, addressed := whereAndWho(event)
+	chat, sender, addressed := s.whereAndWho(event)
 	if !addressed {
 		return withholding("withholding an acknowledgement for a reaction this build cannot address")
 	}
@@ -441,12 +441,12 @@ func reactionOf(event *waEvents.Message, reaction *waE2E.ReactionMessage) change
 }
 
 // editOf renders `message.edited`.
-func editOf(event *waEvents.Message) change {
+func (s *Session) editOf(event *waEvents.Message) change {
 	target, corrected, at := theCorrection(event)
 	if target == "" {
 		return dropping("dropping an edit that names no message to correct")
 	}
-	chat, sender, addressed := whereAndWho(event)
+	chat, sender, addressed := s.whereAndWho(event)
 	if !addressed {
 		return withholding("withholding an acknowledgement for an edit this build cannot address")
 	}
@@ -558,8 +558,8 @@ func correctedContent(corrected *waE2E.Message) (any, bool) {
 }
 
 // revokeOf renders `message.revoked`.
-func revokeOf(event *waEvents.Message) change {
-	chat, sender, addressed := whereAndWho(event)
+func (s *Session) revokeOf(event *waEvents.Message) change {
+	chat, sender, addressed := s.whereAndWho(event)
 	if !addressed {
 		return withholding("withholding an acknowledgement for a deletion this build cannot address")
 	}
@@ -605,15 +605,22 @@ func revokeOf(event *waEvents.Message) change {
 // reads as the person on the other side of it, which puts somebody else's correction,
 // deletion or reaction in their mouth. An echo carries no sender at all, because
 // `from_me` is the whole answer to who did it.
-func whereAndWho(event *waEvents.Message) (protocol.Address, *protocol.Party, bool) {
-	chat, named := chatOf(&event.Info)
+func (s *Session) whereAndWho(event *waEvents.Message) (protocol.Address, *protocol.Party, bool) {
+	// Its own budget rather than the caller's, and the caller is why: these run on the
+	// event path, where the handlers above have no context to hand down. Resolving an
+	// address is a local read, so what it needs is a bound and not a deadline inherited
+	// from somewhere.
+	looking, done := s.looking()
+	defer done()
+
+	chat, named := s.chatOf(looking, &event.Info)
 	if !named {
 		return protocol.Address{}, nil, false
 	}
 	if event.Info.IsFromMe {
 		return chat, nil, true
 	}
-	sender, attributed := partyOf(&event.Info)
+	sender, attributed := s.partyOf(looking, &event.Info)
 	if !attributed {
 		return protocol.Address{}, nil, false
 	}

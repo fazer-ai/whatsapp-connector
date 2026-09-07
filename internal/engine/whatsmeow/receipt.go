@@ -27,7 +27,7 @@ func (s *Session) receipt(event *waEvents.Receipt) bool {
 	// spend the whole publisher bound before this goes out.
 	learned := s.learned()
 
-	published, ok := receiptOf(event)
+	published, ok := s.receiptOf(event)
 	if !ok {
 		// Not a name the contract has. Dropped rather than withheld, because withholding
 		// buys a redelivery of a receipt no build will ever publish, and the node would
@@ -129,12 +129,18 @@ var sinceStart = time.Now()
 // `retry` is not `failed`. It says the recipient's device could not decrypt the message
 // and is asking for it again, which whatsmeow answers on its own; a client told the
 // message failed would show an error for something that is about to arrive.
-func receiptOf(event *waEvents.Receipt) (protocol.MessageReceipt, bool) {
+func (s *Session) receiptOf(event *waEvents.Receipt) (protocol.MessageReceipt, bool) {
 	kind, named := receiptKinds[event.Type]
 	if !named || len(event.MessageIDs) == 0 {
 		return protocol.MessageReceipt{}, false
 	}
-	chat, addressable := addressOf(receiptChatJID(event))
+	// The same resolution the message and the typing indicator go through, so a client
+	// that sent by number gets the tick back under the conversation it sent to rather
+	// than under a second one it has to recognise as the same person.
+	looking, done := s.looking()
+	defer done()
+
+	chat, addressable := s.address(looking, receiptChatJID(event))
 	if !addressable {
 		return protocol.MessageReceipt{}, false
 	}
@@ -145,7 +151,7 @@ func receiptOf(event *waEvents.Receipt) (protocol.MessageReceipt, bool) {
 		Type:       kind,
 		Timestamp:  event.Timestamp.UnixMilli(),
 	}
-	if participant, addressable := addressOf(event.Sender); addressable {
+	if participant, addressable := s.address(looking, event.Sender); addressable {
 		published.Participant = &participant
 	}
 	if kind == protocol.ReceiptFailed {

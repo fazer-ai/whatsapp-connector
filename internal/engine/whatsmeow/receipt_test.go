@@ -178,7 +178,7 @@ func TestAReceiptOverNoMessageIsNotPublished(t *testing.T) {
 	t.Parallel()
 
 	event := receiptEvent(waTypes.ReceiptTypeRead)
-	if published, ok := receiptOf(event); ok {
+	if published, ok := plain(t).receiptOf(event); ok {
 		t.Errorf("a receipt over nothing was rendered as %v", published)
 	}
 }

@@ -199,6 +199,10 @@ type Session struct {
 	availability   *asked
 	availabilityMu sync.Mutex
 
+	// aliases is the one place that turns a JID into the address the wire carries, so
+	// every path publishes a conversation under the same one. See addressing.go.
+	aliases *alias
+
 	// presenceWait bounds the presence node nobody is waiting on: the one a connection
 	// that came back is told. A field for the same reason as the waits above it, and for
 	// no other.
@@ -408,6 +412,7 @@ func newSession(
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Session{
 		sid:        sid,
+		aliases:    newAlias(),
 		store:      scoped,
 		log:        log.With().Str("sid", sid).Logger(),
 		waLog:      wa,
