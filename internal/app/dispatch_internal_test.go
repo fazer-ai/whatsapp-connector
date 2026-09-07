@@ -593,10 +593,14 @@ func TestASlowDrainStillLeavesRoomToRead(t *testing.T) {
 	back := time.Now()
 
 	// The positive control: the drain itself ran and dispatched what was pending, so
-	// the read below happened after a drain that had spent most of the window.
-	if _, ok := dispatched.left(); !ok {
-		t.Fatal("the drain did not dispatch the pending command, so this exercises nothing")
-	}
+	// the read below happened after a drain that had spent most of the window. Joined
+	// rather than read straight after, for the same reason as everywhere else here --
+	// the manager answers on a goroutine of its own, so a control read too early passes
+	// or fails on timing, which is the one thing a control must not do.
+	waitFor(t, "the drain's command to be answered", func() bool {
+		_, ok := dispatched.left()
+		return ok
+	})
 	if got := reads.Load(); got == 0 {
 		t.Fatal("no read was started on what the drain left of the window")
 	}
@@ -764,9 +768,13 @@ func TestAFailingSessionClaimDoesNotTakeTheControlStreamWithIt(t *testing.T) {
 
 	connector.reclaimCommands(ctx)
 
-	if _, ok := dispatched.left(); !ok {
-		t.Fatal("the control stream's pending command went unreclaimed because a session stream failed")
-	}
+	// Joined rather than read straight after the call: the reclaim hands the command to
+	// the manager, which answers it on a goroutine of its own, so what the reclaim
+	// returns says nothing about whether the answer has been given yet.
+	waitFor(t, "the reclaimed command to be answered", func() bool {
+		_, ok := dispatched.left()
+		return ok
+	})
 }
 
 // The same rule on the heartbeat's own reclaim. A heartbeat configured close to the lease
