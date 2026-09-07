@@ -20,6 +20,7 @@ package whatsmeow
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"slices"
@@ -55,18 +56,27 @@ import (
 // Bounded by the caller's context and not by a count of its own: a watcher that gave up
 // on its own schedule would reject a slow recovery the caller was still willing to wait
 // for, which is the shape of the very failure this phase is looking for.
-func liveWatchForHold(ctx context.Context, held *store.Scoped, id string) <-chan int64 {
-	learned := make(chan int64, 1)
+func liveWatchForHold(ctx context.Context, held *store.Scoped, id string) <-chan liveHold {
+	learned := make(chan liveHold, 1)
 	go func() {
 		defer close(learned)
 		for {
 			waiting, err := held.Placeholders(ctx)
-			if err == nil {
-				for _, row := range waiting {
-					if row.MessageID == id {
-						learned <- row.LearnedAt
-						return
-					}
+			switch {
+			case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+				return
+			case err != nil:
+				// Carried out rather than swallowed. A store that cannot be read looks
+				// exactly like a message that was readable -- no row either way -- so
+				// discarding this turns a broken store into "not a sample", which the
+				// timing phase answers by sending more live messages, forever.
+				learned <- liveHold{err: err}
+				return
+			}
+			for _, row := range waiting {
+				if row.MessageID == id {
+					learned <- liveHold{at: row.LearnedAt, held: true}
+					return
 				}
 			}
 			select {
@@ -79,17 +89,27 @@ func liveWatchForHold(ctx context.Context, held *store.Scoped, id string) <-chan
 	return learned
 }
 
+// liveHold is what the watcher found: a placeholder, or the reason it could not look.
+type liveHold struct {
+	at   int64
+	held bool
+	err  error
+}
+
 // liveLearnedAt reads that channel, and refuses to report a time that never came: a phase
 // that fell back to "now" would report a recovery of zero and pass.
-func liveLearnedAt(t *testing.T, learned <-chan int64, id string) time.Time {
+func liveLearnedAt(t *testing.T, learned <-chan liveHold, id string) time.Time {
 	t.Helper()
 
-	at, saw := <-learned
-	if !saw {
+	found := <-learned
+	if found.err != nil {
+		t.Fatalf("could not read the placeholders while waiting on %s: %v", id, found.err)
+	}
+	if !found.held {
 		t.Fatalf("no placeholder was ever held for %s, so it was not a message this "+
 			"session found unreadable and there is no recovery to time", id)
 	}
-	return time.UnixMilli(at)
+	return time.UnixMilli(found.at)
 }
 
 // liveEveryNameOf is the counterpart under every namespace this account may have filed it
@@ -131,6 +151,7 @@ func TestLiveTimeARetryRecovery(t *testing.T) {
 	liveResume(t, counterpart)
 
 	inbox := watch(t, subject)
+	livePrime(t, counterpart, inbox, liveMustBePaired(t, container, liveSID).User)
 	rounds := 5
 	if asked := os.Getenv("WAC_LIVE_ROUNDS"); asked != "" {
 		parsed, err := strconv.Atoi(asked)
@@ -190,12 +211,15 @@ func TestLiveTimeARetryRecovery(t *testing.T) {
 		// somewhere else in the process cannot admit an ordinary delivery as a sample.
 		// A placeholder is only ever held for a message this session could not read, so
 		// the row existing is the scenario having happened.
-		at, saw := <-held
-		if !saw {
+		found := <-held
+		if found.err != nil {
+			t.Fatalf("could not read the placeholders on attempt %d: %v", attempt+1, found.err)
+		}
+		if !found.held {
 			t.Logf("attempt %d decrypted first try, so it is not a sample", attempt+1)
 			continue
 		}
-		elapsed := arrived.Sub(time.UnixMilli(at))
+		elapsed := arrived.Sub(time.UnixMilli(found.at))
 
 		took = append(took, elapsed)
 		t.Logf("sample %d: %s", len(took), elapsed.Round(time.Millisecond))
@@ -253,6 +277,8 @@ func TestLiveARecoveryOutlivesTheSenderLeaving(t *testing.T) {
 	// then taken down: the store keeps the deletion, so what comes back has no session
 	// with the counterpart and no way to have quietly rebuilt one.
 	liveResume(t, subject)
+	liveResume(t, counterpart)
+	livePrime(t, counterpart, watch(t, subject), subjectJID.User)
 	for _, who := range liveEveryNameOf(t, subject, counterpartJID) {
 		address := who.SignalAddress().String()
 		prefix := address[:strings.LastIndex(address, ":")]
@@ -266,7 +292,6 @@ func TestLiveARecoveryOutlivesTheSenderLeaving(t *testing.T) {
 
 	// Sent while it is down, so WhatsApp holds the message and there is no window in
 	// which it could have been read normally.
-	liveResume(t, counterpart)
 	sent := counterpart.current().GenerateMessageID()
 	watching, stop := context.WithCancel(t.Context())
 	t.Cleanup(stop)
@@ -338,4 +363,19 @@ func liveArrival(t *testing.T, events *recorder, id string, within time.Duration
 			return false
 		}
 	}
+}
+
+// livePrime puts an ordinary message through, so the sender is talking over an
+// established Signal session by the time one is deliberately broken.
+//
+// Without it the phase depends on these two accounts having a history. On a pair paired
+// this morning the counterpart's first message is a prekey message, which carries what it
+// takes to open it and needs no session on the receiving side at all -- so deleting that
+// side's session changes nothing, the message decrypts, no placeholder is held, and a
+// phase that has one shot at the scenario reports a failure over correct behaviour.
+func livePrime(t *testing.T, from *Session, inbox *recorder, to string) {
+	t.Helper()
+
+	sent := liveSay(t, from, to, "conector nativo, estabelecendo a sessao")
+	inbox.awaitMessage(t, sent, 2*time.Minute)
 }
