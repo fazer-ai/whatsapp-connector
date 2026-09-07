@@ -289,6 +289,14 @@ func (m *Manager) ReturnAdopted(sids []string) {
 		return
 	}
 	m.newlyMu.Lock()
+	// Deduplicated, and what is coming back still goes first: it is the older backlog.
+	// A drain that gave a command back has already put that session among the newly
+	// adopted while it ran, so appending blind leaves two copies of one sid -- and the
+	// next failed drain a third. Each copy is another pending-list query every claim
+	// makes, on the goroutine that renews the leases, for a stream already in the list.
+	m.newly = slices.DeleteFunc(m.newly, func(sid string) bool {
+		return slices.Contains(sids, sid)
+	})
 	m.newly = append(sids, m.newly...)
 	m.newlyMu.Unlock()
 }
@@ -428,15 +436,17 @@ func (m *Manager) undrained(sid string) {
 // the goroutine that dispatches is the one that renews every lease this instance holds,
 // and nothing routed here may hold it up. A session's command is offered to that
 // session's queue, and the three this manager owns are queued on its own goroutine.
-func (m *Manager) Dispatch(delivery *transport.Delivery) {
+//
+// It reports whether the command was left pending for somebody to run later, which is
+// what a caller holding the rest of a batch needs: nothing newer for that session may be
+// dispatched behind one that stayed pending.
+func (m *Manager) Dispatch(delivery *transport.Delivery) (pending bool) {
 	command := delivery.Command
 	switch command.Type {
 	case protocol.CommandSessionWake:
-		m.own(delivery, m.wake)
-		return
+		return m.own(delivery, m.wake)
 	case protocol.CommandAdminPing:
-		m.own(delivery, m.pong)
-		return
+		return m.own(delivery, m.pong)
 	}
 
 	m.mu.RLock()
@@ -453,7 +463,7 @@ func (m *Manager) Dispatch(delivery *transport.Delivery) {
 		// mark says "this instance left something pending on a stream it reads", and this
 		// instance does not read this one.
 		release(delivery)
-		return
+		return true
 	}
 	switch session.Offer(delivery) {
 	case OfferAccepted:
@@ -470,9 +480,9 @@ func (m *Manager) Dispatch(delivery *transport.Delivery) {
 			// stream, so without the mark the first command the queue accepts after it
 			// drains would overtake the one held here.
 			m.GiveBack(delivery)
-			return
+			return true
 		}
-		m.own(delivery, func(ctx context.Context, busy *transport.Delivery) {
+		return m.own(delivery, func(ctx context.Context, busy *transport.Delivery) {
 			m.refuse(ctx, busy, protocol.NewError(protocol.ErrorRateLimited, "the session has too many commands waiting"))
 		})
 	case OfferStopped:
@@ -485,11 +495,13 @@ func (m *Manager) Dispatch(delivery *transport.Delivery) {
 		// the new owner already holds and handing them back at age zero, below the idle
 		// floor its own reclaim watches. It stays pending for the owner instead.
 		release(delivery)
+		return true
 	}
+	return false
 }
 
 // own queues a command for the goroutine that carries out what this manager answers
-// itself, and never blocks doing it.
+// itself, and never blocks doing it. It reports whether the command was left pending.
 //
 // A queue with no room leaves the delivery pending rather than refusing it: released,
 // age kept, so a later pass brings it back -- to this instance once it has caught up, or
@@ -499,9 +511,10 @@ func (m *Manager) Dispatch(delivery *transport.Delivery) {
 // instance is busy, which is true but is not what it asked. And the queue-full refusal
 // is itself the answer to a session that is behind -- dropping it on a manager that is
 // also behind would retire, unrun, a command the client never heard about.
-func (m *Manager) own(delivery *transport.Delivery, give func(context.Context, *transport.Delivery)) {
+func (m *Manager) own(delivery *transport.Delivery, give func(context.Context, *transport.Delivery)) bool {
 	select {
 	case m.answers <- answer{delivery: delivery, give: give}:
+		return false
 	default:
 		m.log.Warn().Str("cmd_id", delivery.Command.ID).Str("type", string(delivery.Command.Type)).
 			Msg("no room to carry out a command this instance answers itself; leaving it pending")
@@ -510,6 +523,7 @@ func (m *Manager) own(delivery *transport.Delivery, give func(context.Context, *
 		// found no room is a command for a session this instance runs and goes on reading
 		// by `>`. Released, the next command its queue accepts would overtake it.
 		m.GiveBack(delivery)
+		return true
 	}
 }
 

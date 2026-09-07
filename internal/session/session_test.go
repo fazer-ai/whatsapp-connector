@@ -2779,3 +2779,40 @@ func TestACommandHeldForAFullQueueKeepsItsSessionsTurn(t *testing.T) {
 		})
 	}
 }
+
+// A drain takes its sessions off the list before it runs and puts back the ones it could
+// not finish. In between, a command given back puts its session on the list again -- and
+// the two used to leave two copies of one sid, the next failed drain a third, growing for
+// as long as the backpressure lasts. Every copy is another pending-list query a claim
+// makes for a stream already in the list, on the goroutine that renews every lease.
+func TestASessionReturnedByADrainIsNotListedTwice(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	manager := session.NewManager(&session.ManagerConfig{
+		Instance: "inst-a", Engine: fake.New(),
+		Leases:    cluster.NewLeases(redisx.Wrap(rdb, "wa:", 8), "inst-a", cluster.Options{}),
+		Publisher: newRecorder(), Replier: newRecorder(),
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	ctx := context.Background()
+	t.Cleanup(func() { manager.StopAll(ctx) })
+	const sid = "s1"
+	if _, err := manager.Adopt(ctx, sid); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+
+	// What a drain does: take the sessions, give a command back while it runs, put back
+	// what it could not finish.
+	adopted := manager.TakeNewlyAdopted()
+	var released atomic.Bool
+	manager.GiveBack(status("given-back", sid, &released))
+	manager.ReturnAdopted(adopted)
+
+	left := manager.TakeNewlyAdopted()
+	if len(left) != 1 || left[0] != sid {
+		t.Fatalf("the sessions left to drain are %v, and one drain of one session should leave one entry", left)
+	}
+}
