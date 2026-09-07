@@ -85,7 +85,7 @@ func TestConnectRefusesWhatItCannotDo(t *testing.T) {
 	}
 }
 
-func TestExecuteAnswersTheSessionAndRefusesTheRest(t *testing.T) {
+func TestExecuteAnswersTheSessionStatus(t *testing.T) {
 	t.Parallel()
 	session, _ := newTestSession(t, "")
 
@@ -105,33 +105,149 @@ func TestExecuteAnswersTheSessionAndRefusesTheRest(t *testing.T) {
 	if status.Connection != "close" {
 		t.Fatalf("an unconnected session reports %q, want close", status.Connection)
 	}
+}
 
-	// A later milestone brings these. Until then a refusal is the honest answer:
-	// acknowledging a command this build cannot carry out would lose whatever it was
-	// asked to do and report success.
-	for _, unsupported := range []protocol.CommandType{
-		protocol.CommandMessageMarkUnread, protocol.CommandHistoryRequest,
-		protocol.CommandContactCheck, protocol.CommandGroupInfo, protocol.CommandCallReject,
-	} {
-		if _, err := session.Execute(t.Context(), &protocol.Command{Type: unsupported}); !errors.Is(err, engine.ErrNotSupported) {
-			t.Fatalf("%s answered %v, want ErrNotSupported", unsupported, err)
+// Every command type in the contract belongs to exactly one of the three lists below,
+// and the test that reads them walks protocol.AllCommandTypes rather than a sample of
+// it. The sample this replaced named five refusals and seven arrivals, and said nothing
+// about the twenty-seven it left out: a command added to the contract could sit there
+// unclassified, and a handler could be wired up, without either one reaching a test.
+var (
+	// Answered before a command ever reaches the engine, so Execute refuses them the
+	// same way it refuses a command nobody implemented at all. That refusal is not what
+	// a client sees. The session's own lifecycle takes the first three and the manager
+	// takes the last two off the control stream, and both are covered where they live,
+	// in internal/session and internal/app.
+	commandsHandledAboveTheEngine = []protocol.CommandType{
+		protocol.CommandSessionConnect,
+		protocol.CommandSessionDisconnect,
+		protocol.CommandSessionLogout,
+		protocol.CommandSessionWake,
+		protocol.CommandAdminPing,
+	}
+
+	// In the contract and implemented nowhere, so this is the refusal a client does see.
+	// A refusal is the honest answer: acknowledging a command this build cannot carry
+	// out would lose whatever it was asked to do and report success. A later milestone
+	// moves a name from here to the list below, and having to move it by hand is the
+	// point -- it is what makes the connector's reach something someone decided rather
+	// than something that drifted.
+	commandsNoHandlerCarriesOut = []protocol.CommandType{
+		protocol.CommandSessionDelete,
+		protocol.CommandSessionUpdate,
+		protocol.CommandMessageMarkUnread,
+		protocol.CommandHistoryRequest,
+		protocol.CommandContactCheck,
+		protocol.CommandContactProfilePicture,
+		protocol.CommandContactInfo,
+		protocol.CommandContactResolve,
+		protocol.CommandGroupCreate,
+		protocol.CommandGroupInfo,
+		protocol.CommandGroupList,
+		protocol.CommandGroupLeave,
+		protocol.CommandGroupParticipantsUpdate,
+		protocol.CommandGroupNameSet,
+		protocol.CommandGroupDescriptionSet,
+		protocol.CommandGroupPhotoSet,
+		protocol.CommandGroupSettingsSet,
+		protocol.CommandGroupInviteGet,
+		protocol.CommandGroupJoinRequestsList,
+		protocol.CommandGroupJoinRequestsUpdate,
+		protocol.CommandCallReject,
+	}
+
+	// Reached now, which is a different thing from being carried out: an empty payload
+	// names no message, so what comes back says the payload is wrong rather than that
+	// the command is unknown. A client told `unsupported` stops asking, so the two
+	// answers cannot be swapped, and the code each one answers with is spelled out here
+	// so that a handler which stops being reached fails as loudly as one that is not
+	// wired up at all. `session.status` is the one command an empty payload is complete
+	// for, so it answers nothing.
+	commandsExecuteCarriesOut = []struct {
+		command     protocol.CommandType
+		onNoPayload protocol.ErrorCode
+	}{
+		{protocol.CommandSessionStatus, ""},
+		{protocol.CommandPairingRequestCode, protocol.ErrorInvalidPayload},
+		{protocol.CommandPairingPasskeyResponse, protocol.ErrorInvalidPayload},
+		{protocol.CommandPairingPasskeyConfirm, protocol.ErrorInvalidPayload},
+		{protocol.CommandMessageSend, protocol.ErrorInvalidPayload},
+		{protocol.CommandMessageEdit, protocol.ErrorInvalidPayload},
+		{protocol.CommandMessageRevoke, protocol.ErrorInvalidPayload},
+		{protocol.CommandMessageReact, protocol.ErrorInvalidPayload},
+		{protocol.CommandMessageMarkRead, protocol.ErrorInvalidPayload},
+		{protocol.CommandMessageDownloadMedia, protocol.ErrorInvalidPayload},
+		{protocol.CommandPresenceSet, protocol.ErrorInvalidPayload},
+		{protocol.CommandPresenceSubscribe, protocol.ErrorInvalidPayload},
+		{protocol.CommandChatPresence, protocol.ErrorInvalidPayload},
+	}
+)
+
+func TestEveryCommandInTheContractIsClassified(t *testing.T) {
+	t.Parallel()
+
+	// The lists first, before any of them is used to assert anything. A list that has
+	// drifted from the contract would otherwise still pass its own half of the test
+	// while quietly covering less than it reads as covering.
+	classified := make(map[protocol.CommandType]string, len(protocol.AllCommandTypes))
+	place := func(command protocol.CommandType, list string) {
+		if where, already := classified[command]; already {
+			t.Errorf("%s is on both %s and %s", command, where, list)
+			return
+		}
+		classified[command] = list
+	}
+	for _, command := range commandsHandledAboveTheEngine {
+		place(command, "commandsHandledAboveTheEngine")
+	}
+	for _, command := range commandsNoHandlerCarriesOut {
+		place(command, "commandsNoHandlerCarriesOut")
+	}
+	for _, reached := range commandsExecuteCarriesOut {
+		place(reached.command, "commandsExecuteCarriesOut")
+	}
+	for _, command := range protocol.AllCommandTypes {
+		if _, ok := classified[command]; !ok {
+			t.Errorf("%s is in the contract and on none of the lists: say whether this build carries it out", command)
+		}
+		delete(classified, command)
+	}
+	for command, list := range classified {
+		t.Errorf("%s is on %s and is not a command type in the contract", command, list)
+	}
+
+	session, _ := newTestSession(t, "")
+	refused := func(t *testing.T, command protocol.CommandType) {
+		t.Helper()
+		if _, err := session.Execute(t.Context(), &protocol.Command{Type: command}); !errors.Is(err, engine.ErrNotSupported) {
+			t.Fatalf("answered %v, want ErrNotSupported", err)
 		}
 	}
 
-	// And the three that act on an existing message are reached now, which is a
-	// different thing from being carried out: an empty payload names no message, so what
-	// comes back says the payload is wrong rather than that the command is unknown. A
-	// client told `unsupported` stops asking, so the two answers cannot be swapped.
-	for _, reached := range []protocol.CommandType{
-		protocol.CommandMessageEdit, protocol.CommandMessageRevoke, protocol.CommandMessageReact,
-		protocol.CommandMessageMarkRead, protocol.CommandPresenceSet,
-		protocol.CommandPresenceSubscribe, protocol.CommandChatPresence,
-	} {
-		_, err := session.Execute(t.Context(), &protocol.Command{Type: reached, Payload: json.RawMessage(`{}`)})
-		if errors.Is(err, engine.ErrNotSupported) {
-			t.Fatalf("%s is wired up and still answers ErrNotSupported", reached)
-		}
-		assertCode(t, err, protocol.ErrorInvalidPayload)
+	// A subtest each, rather than one loop: a command that answers the wrong thing
+	// should not stop the thirty-eight after it from being asked at all, and a run that
+	// stops at the first name says nothing about how far the drift goes.
+	for _, command := range commandsHandledAboveTheEngine {
+		t.Run(string(command), func(t *testing.T) { refused(t, command) })
+	}
+	for _, command := range commandsNoHandlerCarriesOut {
+		t.Run(string(command), func(t *testing.T) { refused(t, command) })
+	}
+
+	for _, reached := range commandsExecuteCarriesOut {
+		t.Run(string(reached.command), func(t *testing.T) {
+			_, err := session.Execute(t.Context(), &protocol.Command{Type: reached.command, Payload: json.RawMessage(`{}`)})
+			if errors.Is(err, engine.ErrNotSupported) {
+				t.Fatalf("wired up and still answers ErrNotSupported")
+			}
+			if reached.onNoPayload == "" {
+				if err != nil {
+					t.Fatalf("takes an empty payload and answered %v", err)
+				}
+				return
+			}
+			assertCode(t, err, reached.onNoPayload)
+		})
 	}
 }
 
