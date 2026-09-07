@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -868,21 +869,39 @@ func TestTwoCommandsGivenBackAreBothCarriedOutBeforeAnythingNewer(t *testing.T) 
 	}
 }
 
-// The brake is per session. A held session must not stop the reads for every other one,
-// which is the failure mode next door to this fix and the one nothing would report: no
-// error, no crash, just commands that quietly stop arriving.
-func TestOnlyTheHeldSessionIsLeftOutOfTheRead(t *testing.T) {
+// The brake is per session, and this is the failure mode next door: one that always
+// brakes is one that never reads, and nothing would report it -- no error, no crash, just
+// commands that quietly stop arriving for every session on the instance.
+//
+// Held here by a backlog longer than one drain can empty, which is the shape that keeps a
+// session out of the read across ticks rather than for the rest of a single call. That is
+// backpressure working: what cannot enter is exactly what would not have fitted. What must
+// not happen is the session next to it paying for that.
+func TestASessionHeldAcrossTicksDoesNotStopTheReadsForAnother(t *testing.T) {
 	t.Parallel()
 
 	const stuck = "2f1c6f0e-0000-4000-8000-00000000aa03"
 	const other = "2f1c6f0e-0000-4000-8000-00000000aa04"
-	connector, replies, client, _ := heldSession(t, stuck)
+
+	// One entry per pass, so a backlog of more than maxDrainPasses cannot be emptied in
+	// the call that starts it and the session is still undrained when the read happens.
+	connector, replies, client, streams := heldSession(t, stuck, withReadCount(1))
+	for i := range maxDrainPasses + 1 {
+		id := fmt.Sprintf("stuck-%d", i)
+		writeStatus(t, client, stuck, id)
+		taken, err := streams.Read(context.Background(), []string{stuck})
+		if err != nil || len(taken) != 1 {
+			t.Fatalf("%s was read %d time(s) (err=%v), want 1", id, len(taken), err)
+		}
+		connector.manager.GiveBack(&taken[0])
+	}
+
 	if _, err := connector.manager.Adopt(context.Background(), other); err != nil {
 		t.Fatalf("Adopt: %v", err)
 	}
 	connector.manager.TakeNewlyAdopted()
-
 	writeStatus(t, client, other, "elsewhere")
+
 	connector.readCommands(context.Background())
 
 	waitFor(t, "the other session's command to be answered", func() bool {
@@ -910,9 +929,17 @@ func writeStatus(t *testing.T, client *redisx.Client, sid, id string) {
 	}
 }
 
+// withReadCount caps how many entries one claim or read takes per stream, which is what
+// lets a test build a backlog the drain cannot empty in one call.
+func withReadCount(n int64) func(*redisstream.Options) {
+	return func(o *redisstream.Options) { o.ReadCount = n }
+}
+
 // heldSession builds a connector running `sid` with one command of its own given back
 // unrun, which is the state this file is about.
-func heldSession(t *testing.T, sid string) (*Connector, *orderedReplier, *redisx.Client, *redisstream.Streams) {
+func heldSession(
+	t *testing.T, sid string, opts ...func(*redisstream.Options),
+) (*Connector, *orderedReplier, *redisx.Client, *redisstream.Streams) {
 	t.Helper()
 
 	server := miniredis.RunT(t)
@@ -920,9 +947,13 @@ func heldSession(t *testing.T, sid string) (*Connector, *orderedReplier, *redisx
 	t.Cleanup(func() { _ = rdb.Close() })
 	client := redisx.Wrap(rdb, "wa:", 8)
 
-	streams, err := redisstream.New(client, redisstream.Options{
+	options := redisstream.Options{
 		Instance: "inst-a", Block: 20 * time.Millisecond, ClaimMinIdle: time.Millisecond,
-	})
+	}
+	for _, apply := range opts {
+		apply(&options)
+	}
+	streams, err := redisstream.New(client, options)
 	if err != nil {
 		t.Fatalf("redisstream.New: %v", err)
 	}
