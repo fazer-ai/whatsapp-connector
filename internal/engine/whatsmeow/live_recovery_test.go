@@ -162,9 +162,10 @@ func TestLiveTimeARetryRecovery(t *testing.T) {
 	liveResume(t, counterpart)
 
 	windows := liveHolds(t, subject)
+	mirrored := liveHolds(t, counterpart)
 	inbox := watch(t, subject)
 	theirs := watch(t, counterpart)
-	livePrime(t, counterpart, subject, windows, inbox, theirs,
+	livePrime(t, counterpart, subject, windows, mirrored, inbox, theirs,
 		liveMustBePaired(t, container, liveSID).User, counterpartJID.User)
 	rounds := 5
 	if asked := os.Getenv("WAC_LIVE_ROUNDS"); asked != "" {
@@ -290,7 +291,8 @@ func TestLiveARecoveryOutlivesTheSenderLeaving(t *testing.T) {
 	liveResume(t, subject)
 	liveResume(t, counterpart)
 	windows := liveHolds(t, subject)
-	livePrime(t, counterpart, subject, windows, watch(t, subject), watch(t, counterpart),
+	mirrored := liveHolds(t, counterpart)
+	livePrime(t, counterpart, subject, windows, mirrored, watch(t, subject), watch(t, counterpart),
 		subjectJID.User, counterpartJID.User)
 	for _, who := range liveEveryNameOf(t, subject, counterpartJID) {
 		address := who.SignalAddress().String()
@@ -396,7 +398,7 @@ func liveArrival(t *testing.T, events *recorder, id string, within time.Duration
 // recovers, and the message *after* a recovery is the prekey one. Priming once would then
 // hand the measured send exactly the shape it was supposed to rule out. So it repeats
 // until a prime needs no recovery of its own, which is what "established" means here.
-func livePrime(t *testing.T, from, to *Session, windows *holds, inbox, theirs *recorder, at, back string) {
+func livePrime(t *testing.T, from, to *Session, theirWindows, ourWindows *holds, inbox, theirs *recorder, at, back string) {
 	t.Helper()
 
 	for attempt := range 5 {
@@ -410,11 +412,18 @@ func livePrime(t *testing.T, from, to *Session, windows *holds, inbox, theirs *r
 		replied := liveSay(t, to, back, "conector nativo, sessao estabelecida")
 		theirs.awaitMessage(t, replied, 2*time.Minute)
 
-		if _, held := windows.when(sent); !held {
+		// Both directions, and checking only one was the bug this replaced. A reply that
+		// itself needed a recovery leaves *its* sender emitting prekey messages next,
+		// which is the same hole one step over: the pair is established when neither
+		// direction needed a window, not when the one being watched did not.
+		_, theirsRecovered := theirWindows.when(sent)
+		_, oursRecovered := ourWindows.when(replied)
+		if !theirsRecovered && !oursRecovered {
 			return
 		}
-		t.Logf("the prime itself recovered on attempt %d, so the next message would be a "+
-			"prekey; priming again", attempt+1)
+		t.Logf("a prime recovered on attempt %d (inbound=%v, reply=%v), so the next "+
+			"message that way would be a prekey; priming again",
+			attempt+1, theirsRecovered, oursRecovered)
 	}
 	t.Fatal("every prime needed a recovery of its own, so this pair never settled into an " +
 		"established session and the scenario below cannot be arranged")
