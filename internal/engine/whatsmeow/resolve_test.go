@@ -274,6 +274,10 @@ func TestAResolveAnswersTheAccountOutOfItsOwnIdentity(t *testing.T) {
 	session, _ := newTestSession(t, "5511999990001")
 	client := session.current()
 	client.Store.LID = waTypes.NewJID(lid, waTypes.HiddenUserServer)
+	// The account's own names, which whatsmeow keeps on the device rather than in the
+	// contact table: the table is the people this account has met.
+	client.Store.PushName = "Atendimento"
+	client.Store.BusinessName = "Loja do Bruno"
 	// Adopted again so the session copies the identity back out of the device, which is
 	// the only thing that reads it. Nothing in this test publishes an event, so the
 	// second handler the re-adoption registers has nothing to double up on.
@@ -293,6 +297,9 @@ func TestAResolveAnswersTheAccountOutOfItsOwnIdentity(t *testing.T) {
 		party := resolved(t, result)
 		if party["phone"] != "5511999990001" || party["lid"] != lid {
 			t.Errorf("resolving the account itself answered %v, want both names the session holds", party)
+		}
+		if party["push_name"] != "Atendimento" || party["verified_name"] != "Loja do Bruno" {
+			t.Errorf("resolving the account itself answered %v, want the names on its own device", party)
 		}
 	}
 }

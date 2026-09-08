@@ -295,6 +295,13 @@ func (s *Session) resolveContact(ctx context.Context, command *protocol.Command)
 		// than fails on -- so the account can be the one party the table cannot answer
 		// for, which would be an absurd thing for this command to be unable to resolve.
 		named.Phone, named.LID = phone, lid
+		// Its own names live on the device record. The contact table holds the people this
+		// account has met, and it is not one of them, so resolving itself through the
+		// table alone answers with no name at all.
+		if client := s.current(); client != nil && client.Store != nil {
+			named.PushName = client.Store.PushName
+			named.VerifiedName = client.Store.BusinessName
+		}
 		s.nameFromStore(ctx, &named)
 		return json.Marshal(named)
 	}
