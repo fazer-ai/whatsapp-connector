@@ -633,7 +633,13 @@ type account struct {
 	businessName string
 }
 
-func identityOf(client *wm.Client) account {
+// addressesOf is the pair of names WhatsApp addresses an account by.
+//
+// Its own reader, because the display names next to them on the device record are written
+// by whatsmeow's app-state goroutine: reading a field and discarding it is the same race
+// as reading it and using it, so a path that only wants the addresses must not go past
+// them.
+func addressesOf(client *wm.Client) account {
 	var named account
 	if id := client.Store.ID; id != nil {
 		named.phone = id.User
@@ -641,6 +647,13 @@ func identityOf(client *wm.Client) account {
 	if stored := client.Store.LID; !stored.IsEmpty() {
 		named.lid = stored.User
 	}
+	return named
+}
+
+// identityOf is addressesOf plus the display names, and it is only safe where nothing
+// else holds the client yet.
+func identityOf(client *wm.Client) account {
+	named := addressesOf(client)
 	named.pushName = client.Store.PushName
 	named.businessName = client.Store.BusinessName
 	return named
@@ -681,15 +694,6 @@ func (s *Session) adopt(client *wm.Client) bool {
 	// instead of being prevented. The buffer keeps the plaintext, keyed by the
 	// ciphertext, until a handler accepts it.
 	client.EnableDecryptedEventBuffer = true
-	// The first app-state sync of a device is a full one, and whatsmeow suppresses the
-	// events it produces by default: it would update the account's own push name and tell
-	// nobody, so a freshly paired session would answer with no name until the account
-	// renamed itself. `setting_pushName` is the only app-state event this build consumes
-	// -- everything else a full sync emits falls through the handler untouched -- so
-	// turning them on costs one pass over events nothing reads, once per full sync. A
-	// build that starts consuming another one has to weigh this again: a full sync
-	// replays the whole state, so an event that means "this just happened" would not.
-	client.EmitAppStateEventsOnFullSync = true
 
 	// Read here and not later: this client was built for this session and nothing else
 	// holds it yet, so whatsmeow's own goroutines are not writing to it.
@@ -848,9 +852,6 @@ func (s *Session) setIdentity(phone, lid string) {
 
 // setVerifiedName records the name a business account is verified under.
 func (s *Session) setVerifiedName(businessName string) {
-	if businessName == "" {
-		return
-	}
 	s.mu.Lock()
 	s.businessName = businessName
 	s.mu.Unlock()
@@ -893,7 +894,7 @@ func (s *Session) relearn(client *wm.Client) {
 	if client == nil || client.Store == nil {
 		return
 	}
-	named := identityOf(client)
+	named := addressesOf(client)
 	s.mu.Lock()
 	s.phone = named.phone
 	s.lid = named.lid
@@ -2650,6 +2651,15 @@ func (s *Session) handle(rawEvent any) bool {
 		// rather than off `client.Store`, which whatsmeow writes on this same path: the
 		// event carries the new name, so there is nothing to go and read.
 		s.rename(event.Action.GetName())
+	case *waEvents.BusinessName:
+		// A verified name change, for whoever it is about. whatsmeow puts it in the
+		// contact table and does not touch the device record, so the account's own is the
+		// one nothing else here would ever hear about: the copy taken at pairing would
+		// stand for the life of the session, and it is the copy `contact.resolve`
+		// answers with.
+		if phone, lid := s.identity(); event.JID.User == phone || (lid != "" && event.JID.User == lid) {
+			s.setVerifiedName(event.NewBusinessName)
+		}
 	case *waEvents.PairError:
 		// Whatever the QR channel does with this, the client is on a device whatsmeow
 		// may have half-written: an id with no credentials, or one it marked deleted.

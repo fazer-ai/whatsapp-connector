@@ -1,6 +1,7 @@
 package whatsmeow
 
 import (
+	"fmt"
 	"testing"
 
 	waSyncAction "go.mau.fi/whatsmeow/proto/waSyncAction"
@@ -102,15 +103,72 @@ func TestAConnectionDoesNotTakeTheNamesBackOffTheDevice(t *testing.T) {
 	}
 }
 
-// The first app-state sync of a device is a full one, and whatsmeow suppresses its events
-// by default: the account's own push name would be updated with nobody told, and a freshly
-// paired session would answer with no name until the account renamed itself.
-func TestASessionAsksForTheEventsOfAFullSync(t *testing.T) {
+// Asking for the events of a full sync looks like the way to hear the push name it learns,
+// and it is not worth what it costs: whatsmeow's mass insert of the contact snapshot is
+// conditional on those events being suppressed, so turning them on turns a few batch
+// inserts into a round trip per contact, for an address book of any size. What it would
+// buy is one display name on the account itself, which arrives anyway the next time the
+// session is built or the account renames itself.
+func TestASessionLeavesTheEventsOfAFullSyncSuppressed(t *testing.T) {
 	t.Parallel()
 
 	session, _ := newTestSession(t, "5511999990001")
-	if !session.current().EmitAppStateEventsOnFullSync {
-		t.Error("the client suppresses the events of a full sync, so the push name it learns there is never published")
+	if session.current().EmitAppStateEventsOnFullSync {
+		t.Error("a full sync emits its events, which costs the contact snapshot its mass insert")
+	}
+}
+
+// Reading a field and throwing the value away is the same race as reading it and using it.
+// A probe rather than a proof -- the detector reports what it happens to observe -- on the
+// one arrangement that matters: a connection landing while an app-state sync writes.
+func TestConnectingDoesNotReadWhatAnAppStateSyncIsWriting(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	client := session.current()
+
+	writing := make(chan struct{})
+	go func() {
+		defer close(writing)
+		for i := range 200 {
+			client.Store.PushName = fmt.Sprintf("nome %d", i)
+		}
+	}()
+	for range 200 {
+		session.relearn(client)
+	}
+	<-writing
+}
+
+// A verified name change reaches the contact table and never the device record, so the
+// account's own is the one nothing else here would hear about: the copy taken at pairing
+// would stand for the life of the session, and it is the copy a resolve answers with.
+func TestASessionTakesItsOwnVerifiedNameChange(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.handle(&waEvents.PairSuccess{
+		ID:           waTypes.NewJID("5511999990001", waTypes.DefaultUserServer),
+		BusinessName: "Loja do Bruno",
+	})
+	drain(t, session)
+
+	session.handle(&waEvents.BusinessName{
+		JID:             waTypes.NewJID("5511999990001", waTypes.DefaultUserServer),
+		OldBusinessName: "Loja do Bruno",
+		NewBusinessName: "Loja do Bruno LTDA",
+	})
+	if _, verified := session.names(); verified != "Loja do Bruno LTDA" {
+		t.Errorf("the session is verified as %q, want the name the account changed to", verified)
+	}
+
+	// Somebody else renaming their business says nothing about this account.
+	session.handle(&waEvents.BusinessName{
+		JID:             waTypes.NewJID("5541988887777", waTypes.DefaultUserServer),
+		NewBusinessName: "Outra Loja",
+	})
+	if _, verified := session.names(); verified != "Loja do Bruno LTDA" {
+		t.Errorf("the session is verified as %q after somebody else was renamed", verified)
 	}
 }
 
