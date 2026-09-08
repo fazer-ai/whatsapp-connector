@@ -468,6 +468,35 @@ func TestADeletionCarriesTheAuthorItsKeyClaims(t *testing.T) {
 	}
 }
 
+// Which of WhatsApp's two identifiers arrives as the sender and which as the alternative
+// depends on the chat's addressing mode. A claim carrying only one of them is one the
+// client may not be able to match -- its copy of the message is keyed by whichever half it
+// learned first -- and a claim it cannot match reads as somebody else having written the
+// message, which drops a deletion that was real.
+func TestADeletionOfTheSendersOwnClaimsBothNamespaces(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setGroups(true)
+	event := revokeEvent(carrier, subject)
+	event.Info.Chat = waTypes.NewJID("120363000000000000", waTypes.GroupServer)
+	event.Info.IsGroup = true
+	event.Info.Sender = waTypes.NewJID("5541988887777", waTypes.DefaultUserServer)
+	event.Info.SenderAlt = waTypes.NewJID("998877665544332", waTypes.HiddenUserServer)
+	event.Message.GetProtocolMessage().GetKey().FromMe = proto.Bool(true)
+
+	emission := publishedBy(t, session, event)
+	validateAgainstContract(t, "event_message_revoked", emission.Payload)
+
+	claimed, named := decode(t, emission.Payload)["message_author"].(map[string]any)
+	if !named {
+		t.Fatal("the deletion claims nobody wrote the message")
+	}
+	if claimed["phone"] != "5541988887777" || claimed["lid"] != "998877665544332" {
+		t.Errorf("the claim names %v, want both namespaces the event carried", claimed)
+	}
+}
+
 // A channel deletes a post by sending the deletion under the post's own id, with no body
 // at all to name a key in.
 func TestAChannelDeletionNamesThePostItself(t *testing.T) {

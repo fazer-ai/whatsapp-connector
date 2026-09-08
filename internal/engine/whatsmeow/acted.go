@@ -617,9 +617,15 @@ func (s *Session) revokeOf(event *waEvents.Message) change {
 // existed, rather than losing the deletion over the annotation on it.
 func (s *Session) claimedAuthor(event *waEvents.Message) *protocol.Party {
 	key := event.Message.GetProtocolMessage().GetKey()
-	var jid waTypes.JID
+	var claiming []waTypes.JID
 	if key.GetFromMe() {
-		jid = event.Info.Sender
+		// Both namespaces, the way every other sender on this path is named. Which of the
+		// two arrives as the sender and which as the alternative depends on the chat's
+		// addressing mode, and a claim named in one namespace is one the client may not
+		// be able to match: its copy of the message is keyed by whichever half it learned
+		// first, and a claim it cannot match reads as a mismatch and drops a deletion
+		// that was real.
+		claiming = []waTypes.JID{event.Info.Sender, event.Info.SenderAlt}
 	} else {
 		named := key.GetParticipant()
 		if named == "" {
@@ -629,7 +635,7 @@ func (s *Session) claimedAuthor(event *waEvents.Message) *protocol.Party {
 		if err != nil {
 			return nil
 		}
-		jid = parsed
+		claiming = []waTypes.JID{parsed}
 	}
 
 	// Its own budget, and only spent when a key named somebody: whereAndWho's is closed
@@ -643,7 +649,7 @@ func (s *Session) claimedAuthor(event *waEvents.Message) *protocol.Party {
 	// fills in, and `ParseJID` takes any user part at all -- while the contract says a
 	// party is digits. A `phone` of "not-a-number" is a frame a strict client rejects
 	// whole, and it would take the deletion down with it.
-	author := s.party(looking, jid)
+	author := s.party(looking, claiming...)
 	if !onlyDigits(author.Phone) {
 		author.Phone = ""
 	}
