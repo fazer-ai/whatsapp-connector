@@ -604,18 +604,32 @@ func (s *Session) revokeOf(event *waEvents.Message) change {
 // for why this connector cannot establish it, and why passing the claim on is what makes
 // the client able to.
 //
-// Nil where the key names nobody, which is the ordinary shape of a direct chat and of a
-// sender deleting their own message. An unreadable participant is nil for the same
-// reason a mention that will not parse is dropped: the client keeps the behaviour it had
-// before the field existed, rather than losing the deletion over the annotation on it.
+// `from_me` on the key wins over the participant, and a key can carry both. It says the
+// message being deleted is the sender's own, and that is how WhatsApp resolves the key:
+// whatsmeow's own getOrigSenderFromKey returns the stanza's sender and never reads the
+// participant when the flag is set. Publishing the participant there would hand a client
+// a claim WhatsApp does not make -- and it is the claim that makes the client's
+// comparison pass, for a deletion no phone applied, which is the whole exploit again.
+//
+// Nil where the key names nobody: a direct chat, where the key names the chat and the two
+// parties are all there is. An unreadable participant is nil for the same reason a mention
+// that will not parse is dropped -- the client keeps the behaviour it had before the field
+// existed, rather than losing the deletion over the annotation on it.
 func (s *Session) claimedAuthor(event *waEvents.Message) *protocol.Party {
-	named := event.Message.GetProtocolMessage().GetKey().GetParticipant()
-	if named == "" {
-		return nil
-	}
-	jid, err := waTypes.ParseJID(named)
-	if err != nil {
-		return nil
+	key := event.Message.GetProtocolMessage().GetKey()
+	var jid waTypes.JID
+	if key.GetFromMe() {
+		jid = event.Info.Sender
+	} else {
+		named := key.GetParticipant()
+		if named == "" {
+			return nil
+		}
+		parsed, err := waTypes.ParseJID(named)
+		if err != nil {
+			return nil
+		}
+		jid = parsed
 	}
 
 	// Its own budget, and only spent when a key named somebody: whereAndWho's is closed

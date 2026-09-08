@@ -203,9 +203,12 @@ const (
 // it names no message at all and every phone applies nothing. This connector cannot
 // check the claim -- it keeps no record of who wrote what, and asking the group who its
 // admins are is a round trip per deletion -- so it hands the claim to the client, which
-// resolved the message by id and knows its author. Absent means the key named nobody,
-// which is what a deletion of the sender's own message looks like and what every direct
-// chat looks like; there, who the sender is already answers it.
+// resolved the message by id and knows its author.
+//
+// A key that says the message is the deleter's own names the deleter, whatever else the
+// key carries: that is how WhatsApp resolves it, so it is the claim being made. Absent
+// means the key named nobody at all, which is a direct chat, where the key names the chat
+// and there are only two parties to be.
 type MessageRevoked struct {
 	Chat      Address   `json:"chat"`
 	Sender    *Party    `json:"sender,omitempty"`

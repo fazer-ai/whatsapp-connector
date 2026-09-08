@@ -417,12 +417,20 @@ func TestADeletionCarriesTheAuthorItsKeyClaims(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
 		participant string
+		fromMe      bool
 		want        string
 	}{
-		{"the key names who wrote it", author + "@" + waTypes.DefaultUserServer, author},
-		{"the key names nobody, as a sender deleting their own does", "", ""},
-		{"the key names something that is not an address", "quem escreveu", ""},
-		{"the key names an address whose number is not one", "not-a-number@" + waTypes.DefaultUserServer, ""},
+		{name: "the key names who wrote it", participant: author + "@" + waTypes.DefaultUserServer, want: author},
+		{name: "the key names nobody", want: ""},
+		{name: "the key names something that is not an address", participant: "quem escreveu", want: ""},
+		{name: "the key names an address whose number is not one", participant: "not-a-number@" + waTypes.DefaultUserServer, want: ""},
+		// `from_me` on the key says the message is the sender's own, and WhatsApp
+		// resolves it that way whatever the participant says. Reading the participant
+		// here would publish a claim WhatsApp does not make, and it is the claim that
+		// makes the client's comparison pass for a deletion no phone applied.
+		{name: "the key claims the sender's own message and names somebody else too",
+			participant: author + "@" + waTypes.DefaultUserServer, fromMe: true, want: "5511999990001"},
+		{name: "the key claims the sender's own message and names nobody", fromMe: true, want: "5511999990001"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -435,6 +443,9 @@ func TestADeletionCarriesTheAuthorItsKeyClaims(t *testing.T) {
 			if tc.participant != "" {
 				event.Message.GetProtocolMessage().GetKey().Participant = proto.String(tc.participant)
 			}
+			if tc.fromMe {
+				event.Message.GetProtocolMessage().GetKey().FromMe = proto.Bool(true)
+			}
 
 			emission := publishedBy(t, session, event)
 			if emission.Type != protocol.EventMessageRevoked {
@@ -446,12 +457,12 @@ func TestADeletionCarriesTheAuthorItsKeyClaims(t *testing.T) {
 			claimed, named := payload["message_author"].(map[string]any)
 			switch {
 			case tc.want == "" && named:
-				t.Fatalf("a deletion whose key names %q says %v wrote the message, want no claim at all", tc.participant, claimed)
+				t.Fatalf("the deletion says %v wrote the message, want no claim at all", claimed)
 			case tc.want == "":
 			case !named:
-				t.Fatalf("a deletion whose key names %q claims nobody wrote the message, want %q", tc.participant, tc.want)
+				t.Fatalf("the deletion claims nobody wrote the message, want the author its key names, %q", tc.want)
 			case claimed["phone"] != tc.want:
-				t.Fatalf("the deletion says %v wrote the message, want the participant its key names, %q", claimed["phone"], tc.want)
+				t.Fatalf("the deletion says %v wrote the message, want the author its key names, %q", claimed["phone"], tc.want)
 			}
 		})
 	}

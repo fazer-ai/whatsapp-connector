@@ -128,9 +128,10 @@ theirs, and the connector is always upgraded first.
   check is necessary and not sufficient -- WhatsApp also requires the sender to be that
   author or an admin of the group, and a connector answers neither without keeping every
   message's author or spending a round trip per deletion -- so it closes the case a
-  member can exploit rather than the whole rule. Absent means the key named nobody,
-  which is every direct chat and a sender deleting their own message; there `sender` and
-  `by` already say who claimed what.
+  member can exploit rather than the whole rule. A key that says the message is the
+  deleter's own names the deleter, whatever participant it also carries, because that is
+  how WhatsApp resolves it. Absent means the key named nobody at all, which is a direct
+  chat: there `sender` and `by` already say who claimed what.
 - An absent field and an explicit `null` mean the same thing to a client, so a field
   that has to distinguish "there is none" from "this producer does not say" carries
   its own flag. `group_info.has_picture` is the one such field today: a `picture_url`
