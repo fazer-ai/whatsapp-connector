@@ -164,6 +164,13 @@ func TestAResolveNeedsAnAccountButNotAConnection(t *testing.T) {
 	if _, err := paired.Execute(t.Context(), resolveCommand(t, `{"party":{"kind":"phone","id":"5541988887777"}}`)); err != nil {
 		t.Fatalf("a resolve on a disconnected session: %v", err)
 	}
+
+	// An account WhatsApp has revoked, on credentials this session is still holding. The
+	// identity is copied at pairing and nothing clears it, so the number is in hand and
+	// means nothing.
+	paired.markStale()
+	_, err = paired.Execute(t.Context(), resolveCommand(t, `{"party":{"kind":"phone","id":"5511999990001"}}`))
+	assertCode(t, err, protocol.ErrorNotPaired)
 }
 
 // A mapping that could not be read is not a mapping that does not exist. Answering the
