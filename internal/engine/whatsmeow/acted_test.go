@@ -377,6 +377,10 @@ func TestADeletionSaysWhoPerformedIt(t *testing.T) {
 			event.Info.Edit = waTypes.EditAttributeAdminRevoke
 			event.Info.Chat = waTypes.NewJID("120363000000000000", waTypes.GroupServer)
 			event.Info.IsGroup = true
+			// The participant a real one carries: in a group it is half of what names
+			// the message, and a key without it names none.
+			event.Message.GetProtocolMessage().GetKey().Participant =
+				proto.String("5541988887777@" + waTypes.DefaultUserServer)
 		}, "contact"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -416,21 +420,22 @@ func TestADeletionCarriesTheAuthorItsKeyClaims(t *testing.T) {
 
 	for _, tc := range []struct {
 		name        string
+		group       bool
 		participant string
 		fromMe      bool
 		want        string
 	}{
-		{name: "the key names who wrote it", participant: author + "@" + waTypes.DefaultUserServer, want: author},
-		{name: "the key names nobody", want: ""},
-		{name: "the key names something that is not an address", participant: "quem escreveu", want: ""},
-		{name: "the key names an address whose number is not one", participant: "not-a-number@" + waTypes.DefaultUserServer, want: ""},
+		{name: "the key names who wrote it", group: true, participant: author + "@" + waTypes.DefaultUserServer, want: author},
 		// `from_me` on the key says the message is the sender's own, and WhatsApp
 		// resolves it that way whatever the participant says. Reading the participant
 		// here would publish a claim WhatsApp does not make, and it is the claim that
 		// makes the client's comparison pass for a deletion no phone applied.
-		{name: "the key claims the sender's own message and names somebody else too",
+		{name: "the key claims the sender's own message and names somebody else too", group: true,
 			participant: author + "@" + waTypes.DefaultUserServer, fromMe: true, want: "5511999990001"},
-		{name: "the key claims the sender's own message and names nobody", fromMe: true, want: "5511999990001"},
+		{name: "the key claims the sender's own message and names nobody", group: true, fromMe: true, want: "5511999990001"},
+		// A direct chat's key names the chat, and there are two parties to be: `sender`
+		// and `by` are the whole answer, and no claim is the honest shape for it.
+		{name: "a direct chat, where the key names nobody", want: ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -438,8 +443,10 @@ func TestADeletionCarriesTheAuthorItsKeyClaims(t *testing.T) {
 			session, _ := newTestSession(t, "5511999990001")
 			session.setGroups(true)
 			event := revokeEvent(carrier, subject)
-			event.Info.Chat = waTypes.NewJID("120363000000000000", waTypes.GroupServer)
-			event.Info.IsGroup = true
+			if tc.group {
+				event.Info.Chat = waTypes.NewJID("120363000000000000", waTypes.GroupServer)
+				event.Info.IsGroup = true
+			}
 			if tc.participant != "" {
 				event.Message.GetProtocolMessage().GetKey().Participant = proto.String(tc.participant)
 			}
@@ -463,6 +470,44 @@ func TestADeletionCarriesTheAuthorItsKeyClaims(t *testing.T) {
 				t.Fatalf("the deletion claims nobody wrote the message, want the author its key names, %q", tc.want)
 			case claimed["phone"] != tc.want:
 				t.Fatalf("the deletion says %v wrote the message, want the author its key names, %q", claimed["phone"], tc.want)
+			}
+		})
+	}
+}
+
+// In a group a key identifies a message by its participant, or by `from_me` where it is
+// the sender's own. One that carries neither names no message: WhatsApp applies nothing
+// and every phone goes on showing it. Publishing without the claim would not do -- absent
+// is what a direct chat sends, and a client cannot tell the two apart -- so an agent would
+// lose a bubble on the strength of a key nobody else honoured.
+func TestAGroupDeletionWhoseKeyNamesNoAuthorIsDropped(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name        string
+		participant string
+	}{
+		{"the key names nobody", ""},
+		{"the key names something that is not an address", "quem escreveu"},
+		{"the key names an address whose number is not one", "not-a-number@" + waTypes.DefaultUserServer},
+		{"the key names a group rather than a person", "120363000000000009@" + waTypes.GroupServer},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			session, _ := newTestSession(t, "5511999990001")
+			session.setGroups(true)
+			event := revokeEvent(carrier, subject)
+			event.Info.Chat = waTypes.NewJID("120363000000000000", waTypes.GroupServer)
+			event.Info.IsGroup = true
+			if tc.participant != "" {
+				event.Message.GetProtocolMessage().GetKey().Participant = proto.String(tc.participant)
+			}
+
+			// Acknowledged all the same: WhatsApp resending it would only produce the
+			// same key, and holding it back keeps the phone trying forever.
+			if !publishedNothing(t, session, event) {
+				t.Fatal("a deletion that names no message was left unacknowledged, so WhatsApp will send it again")
 			}
 		})
 	}

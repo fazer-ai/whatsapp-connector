@@ -589,11 +589,24 @@ func (s *Session) revokeOf(event *waEvents.Message) change {
 	if event.Info.IsFromMe {
 		by = protocol.RevokedBySelf
 	}
+	author := s.claimedAuthor(event)
+	if author == nil && chat.Kind == protocol.AddressGroup {
+		// In a group a key identifies a message by its participant, or by `from_me` where
+		// it is the sender's own. A key carrying neither -- or naming something that is
+		// not a person -- names no message at all, so WhatsApp applies nothing and every
+		// phone in the group goes on showing the message. Publishing it would take the
+		// bubble off an agent's screen on the strength of a key nobody else honoured, and
+		// omitting only the claim would not help: absent is what a direct chat sends, and
+		// a client cannot tell the two apart. whatsmeow refuses the same key on its own
+		// path, for the same reason.
+		return dropping("dropping a group deletion whose key names no message")
+	}
+
 	return publishing(protocol.EventMessageRevoked, protocol.MessageRevoked{
 		Chat:      chat,
 		Sender:    sender,
 		MessageID: target,
-		Author:    s.claimedAuthor(event),
+		Author:    author,
 		By:        by,
 		Timestamp: event.Info.Timestamp.UnixMilli(),
 	})

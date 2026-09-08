@@ -209,6 +209,10 @@ const (
 // key carries: that is how WhatsApp resolves it, so it is the claim being made. Absent
 // means the key named nobody at all, which is a direct chat, where the key names the chat
 // and there are only two parties to be.
+//
+// A group deletion always carries one. A key there identifies a message by its participant
+// or by `from_me`, so one with neither names no message at all, and the connector drops it
+// rather than publishing a deletion no phone applied.
 type MessageRevoked struct {
 	Chat      Address   `json:"chat"`
 	Sender    *Party    `json:"sender,omitempty"`
