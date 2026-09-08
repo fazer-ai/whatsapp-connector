@@ -422,6 +422,7 @@ func TestADeletionCarriesTheAuthorItsKeyClaims(t *testing.T) {
 		{"the key names who wrote it", author + "@" + waTypes.DefaultUserServer, author},
 		{"the key names nobody, as a sender deleting their own does", "", ""},
 		{"the key names something that is not an address", "quem escreveu", ""},
+		{"the key names an address whose number is not one", "not-a-number@" + waTypes.DefaultUserServer, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()

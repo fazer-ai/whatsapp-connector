@@ -624,10 +624,22 @@ func (s *Session) claimedAuthor(event *waEvents.Message) *protocol.Party {
 	looking, done := s.looking()
 	defer done()
 
-	if author := s.party(looking, jid); author.Phone != "" || author.LID != "" {
-		return &author
+	// Checked, not trusted. The participant is the one field on this event a stranger
+	// writes -- it rides inside the message body rather than on the envelope WhatsApp
+	// fills in, and `ParseJID` takes any user part at all -- while the contract says a
+	// party is digits. A `phone` of "not-a-number" is a frame a strict client rejects
+	// whole, and it would take the deletion down with it.
+	author := s.party(looking, jid)
+	if !onlyDigits(author.Phone) {
+		author.Phone = ""
 	}
-	return nil
+	if !onlyDigits(author.LID) {
+		author.LID = ""
+	}
+	if author.Phone == "" && author.LID == "" {
+		return nil
+	}
+	return &author
 }
 
 // whereAndWho is the half of these three events that does not depend on which one it is.
