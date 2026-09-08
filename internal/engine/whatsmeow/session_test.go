@@ -139,7 +139,6 @@ var (
 		protocol.CommandContactInfo,
 		protocol.CommandContactResolve,
 		protocol.CommandGroupCreate,
-		protocol.CommandGroupInfo,
 		protocol.CommandGroupList,
 		protocol.CommandGroupLeave,
 		protocol.CommandGroupParticipantsUpdate,
@@ -180,6 +179,7 @@ var (
 		{protocol.CommandContactCheck, protocol.ErrorInvalidPayload},
 		{protocol.CommandContactProfilePicture, protocol.ErrorInvalidPayload},
 		{protocol.CommandMessageMarkUnread, protocol.ErrorInvalidPayload},
+		{protocol.CommandGroupInfo, protocol.ErrorInvalidPayload},
 	}
 )
 
