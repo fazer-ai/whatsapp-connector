@@ -1,3 +1,17 @@
+# PR#133: `hosted` is not another person. It is a device domain -- whatsmeow's own
+# ActualAgent maps `s.whatsapp.net`, `lid`, `hosted` and `hosted.lid` to four domains over
+# the same user -- so `5541988887777@hosted` and `5541988887777@s.whatsapp.net` are the
+# same account, and `addressOf` canonicalises them to one phone everywhere in this
+# connector, on purpose. The claim it produces is therefore true, not spoofed.
+# What the finding describes as the exploit needs no `hosted` at all: a member sending
+# `participant: <the author's own number>@s.whatsapp.net` produces exactly the same
+# accepted claim. That is the gap this PR documents as necessary-and-not-sufficient --
+# WhatsApp also requires the sender to be the author or an admin, which costs a metadata
+# round trip per deletion -- and restricting the server closes none of it.
+# Against a gain of nothing sits a real loss: a participant arriving on a server the
+# addressing layer reads as a phone (`c.us`, the legacy spelling, or `hosted`) would have
+# its deletion dropped. The keys that name nobody are already refused, digits included.
+internal/engine/whatsmeow/acted.go: Reject non-user participant domains before canonicalizing  # PR#133
 # PR#3: both still stand, and both are the same answer as the logout below. The
 # connector has no idempotency layer at all yet, for any command; invariant 5 lands with
 # `message.send` in M2 and covers every command at once, so a key on this one command
