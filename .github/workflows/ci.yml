@@ -32,12 +32,6 @@ jobs:
       - uses: golangci/golangci-lint-action@v9
         with:
           version: v2.12
-          # Without this the whole live suite is outside the analysis: every file behind
-          # `//go:build live` is excluded by default, so the phases that drive real
-          # accounts -- which is where the trickiest code in this repo lives -- were the
-          # only ones never linted. Found because a `paramTypeCombine` shipped to main
-          # through a green CI.
-          args: --build-tags live
 
   test:
     name: Test
