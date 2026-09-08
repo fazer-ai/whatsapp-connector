@@ -220,3 +220,28 @@ func addMode(raw json.RawMessage) (waTypes.GroupMemberAddMode, error) {
 	return "", protocol.NewError(protocol.ErrorInvalidPayload,
 		fmt.Sprintf("%q is not a way this connector knows of deciding who adds members", named))
 }
+
+// leaveGroup carries out `group.leave`.
+//
+// The one command in this file that cannot be undone from this side: leaving a group needs
+// an invite to reverse, and an invite needs somebody still in it. There is no confirmation
+// step here because the confirmation belongs where a person is -- the dashboard asks, and
+// this is what it asks for.
+func (s *Session) leaveGroup(ctx context.Context, command *protocol.Command) (json.RawMessage, error) {
+	var req groupTarget
+	if err := json.Unmarshal(command.Payload, &req); err != nil {
+		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
+			"leaving has to name the group to leave")
+	}
+	group, err := groupToChange(req.Group, "members to leave")
+	if err != nil {
+		return nil, err
+	}
+	if err := s.readyToSend(); err != nil {
+		return nil, err
+	}
+	if err := s.leave(ctx, s.current(), group); err != nil {
+		return nil, contactFailure(err, "group departure")
+	}
+	return nil, nil
+}

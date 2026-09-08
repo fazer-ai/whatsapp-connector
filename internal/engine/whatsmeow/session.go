@@ -144,6 +144,7 @@ type Session struct {
 	joinRequests       func(context.Context, *wm.Client, waTypes.JID) ([]waTypes.GroupParticipantRequest, error)
 	//nolint:lll // one line per seam reads better than a wrapped signature
 	decideJoinRequests func(context.Context, *wm.Client, waTypes.JID, []waTypes.JID, wm.ParticipantRequestChange) ([]waTypes.GroupParticipant, error)
+	leave              func(context.Context, *wm.Client, waTypes.JID) error
 	setName            func(context.Context, *wm.Client, waTypes.JID, string) error
 	setDescription     func(context.Context, *wm.Client, waTypes.JID, string) error
 	setAnnounce        func(context.Context, *wm.Client, waTypes.JID, bool) error
@@ -507,6 +508,9 @@ func newSession(
 			participants []waTypes.JID, action wm.ParticipantRequestChange,
 		) ([]waTypes.GroupParticipant, error) {
 			return client.UpdateGroupRequestParticipants(ctx, group, participants, action) //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
+		},
+		leave: func(ctx context.Context, client *wm.Client, group waTypes.JID) error {
+			return client.LeaveGroup(ctx, group) //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
 		},
 		setName: func(ctx context.Context, client *wm.Client, group waTypes.JID, subject string) error {
 			return client.SetGroupName(ctx, group, subject) //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
@@ -1480,6 +1484,8 @@ func (s *Session) Execute(ctx context.Context, command *protocol.Command) (json.
 		return s.contactPicture(ctx, command)
 	case protocol.CommandMessageMarkUnread:
 		return s.markUnread(ctx, command)
+	case protocol.CommandGroupLeave:
+		return s.leaveGroup(ctx, command)
 	case protocol.CommandGroupNameSet:
 		return s.setGroupName(ctx, command)
 	case protocol.CommandGroupDescriptionSet:
