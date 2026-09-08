@@ -196,10 +196,21 @@ const (
 // account performed is applied the way its own deletion is, files included, while one
 // somebody else performed only flags the bubble and leaves the text an agent can still
 // read.
+//
+// Author is who the deletion's own key names as having written the message it deletes,
+// which is the half of a message's identity a bare id does not carry: WhatsApp addresses
+// a message in a group by (id, participant), so a key naming somebody who did not write
+// it names no message at all and every phone applies nothing. This connector cannot
+// check the claim -- it keeps no record of who wrote what, and asking the group who its
+// admins are is a round trip per deletion -- so it hands the claim to the client, which
+// resolved the message by id and knows its author. Absent means the key named nobody,
+// which is what a deletion of the sender's own message looks like and what every direct
+// chat looks like; there, who the sender is already answers it.
 type MessageRevoked struct {
 	Chat      Address   `json:"chat"`
 	Sender    *Party    `json:"sender,omitempty"`
 	MessageID string    `json:"message_id"`
+	Author    *Party    `json:"message_author,omitempty"`
 	By        RevokedBy `json:"by"`
 	Timestamp int64     `json:"timestamp"`
 }

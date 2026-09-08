@@ -404,6 +404,58 @@ func TestADeletionSaysWhoPerformedIt(t *testing.T) {
 	}
 }
 
+// A deletion's key names the message it deletes by (id, participant), and any member of
+// a group can put anybody in that second field. WhatsApp applies nothing when the name
+// is wrong, and the client is the only side that can tell -- it has the message and
+// knows who wrote it. Publishing the id alone is what left an agent looking at a bubble
+// marked deleted while every phone in the group still showed the message.
+func TestADeletionCarriesTheAuthorItsKeyClaims(t *testing.T) {
+	t.Parallel()
+
+	const author = "5541988887777"
+
+	for _, tc := range []struct {
+		name        string
+		participant string
+		want        string
+	}{
+		{"the key names who wrote it", author + "@" + waTypes.DefaultUserServer, author},
+		{"the key names nobody, as a sender deleting their own does", "", ""},
+		{"the key names something that is not an address", "quem escreveu", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			session, _ := newTestSession(t, "5511999990001")
+			session.setGroups(true)
+			event := revokeEvent(carrier, subject)
+			event.Info.Chat = waTypes.NewJID("120363000000000000", waTypes.GroupServer)
+			event.Info.IsGroup = true
+			if tc.participant != "" {
+				event.Message.GetProtocolMessage().GetKey().Participant = proto.String(tc.participant)
+			}
+
+			emission := publishedBy(t, session, event)
+			if emission.Type != protocol.EventMessageRevoked {
+				t.Fatalf("a deletion was published as %s, want %s", emission.Type, protocol.EventMessageRevoked)
+			}
+			validateAgainstContract(t, "event_message_revoked", emission.Payload)
+
+			payload := decode(t, emission.Payload)
+			claimed, named := payload["message_author"].(map[string]any)
+			switch {
+			case tc.want == "" && named:
+				t.Fatalf("a deletion whose key names %q says %v wrote the message, want no claim at all", tc.participant, claimed)
+			case tc.want == "":
+			case !named:
+				t.Fatalf("a deletion whose key names %q claims nobody wrote the message, want %q", tc.participant, tc.want)
+			case claimed["phone"] != tc.want:
+				t.Fatalf("the deletion says %v wrote the message, want the participant its key names, %q", claimed["phone"], tc.want)
+			}
+		})
+	}
+}
+
 // A channel deletes a post by sending the deletion under the post's own id, with no body
 // at all to name a key in.
 func TestAChannelDeletionNamesThePostItself(t *testing.T) {

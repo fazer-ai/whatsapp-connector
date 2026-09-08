@@ -542,6 +542,7 @@
         "chat": { "$ref": "#/definitions/address" },
         "sender": { "oneOf": [{ "$ref": "#/definitions/party" }, { "type": "null" }] },
         "message_id": { "$ref": "#/definitions/message_id" },
+        "message_author": { "oneOf": [{ "$ref": "#/definitions/party" }, { "type": "null" }] },
         "by": { "enum": ["contact", "self"] },
         "timestamp": { "$ref": "#/definitions/timestamp_ms" }
       },

@@ -593,9 +593,41 @@ func (s *Session) revokeOf(event *waEvents.Message) change {
 		Chat:      chat,
 		Sender:    sender,
 		MessageID: target,
+		Author:    s.claimedAuthor(event),
 		By:        by,
 		Timestamp: event.Info.Timestamp.UnixMilli(),
 	})
+}
+
+// claimedAuthor reads the participant off a deletion's key: who the key says wrote the
+// message it deletes. It is claimed and not established -- see protocol.MessageRevoked
+// for why this connector cannot establish it, and why passing the claim on is what makes
+// the client able to.
+//
+// Nil where the key names nobody, which is the ordinary shape of a direct chat and of a
+// sender deleting their own message. An unreadable participant is nil for the same
+// reason a mention that will not parse is dropped: the client keeps the behaviour it had
+// before the field existed, rather than losing the deletion over the annotation on it.
+func (s *Session) claimedAuthor(event *waEvents.Message) *protocol.Party {
+	named := event.Message.GetProtocolMessage().GetKey().GetParticipant()
+	if named == "" {
+		return nil
+	}
+	jid, err := waTypes.ParseJID(named)
+	if err != nil {
+		return nil
+	}
+
+	// Its own budget, and only spent when a key named somebody: whereAndWho's is closed
+	// by the time this runs, and a deletion that names nobody must not pay for a lookup
+	// there is nothing to look up.
+	looking, done := s.looking()
+	defer done()
+
+	if author := s.party(looking, jid); author.Phone != "" || author.LID != "" {
+		return &author
+	}
+	return nil
 }
 
 // whereAndWho is the half of these three events that does not depend on which one it is.
