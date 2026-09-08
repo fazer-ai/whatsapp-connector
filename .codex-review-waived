@@ -328,5 +328,5 @@ internal/engine/whatsmeow/unread.go: Separate patch acceptance from the follow-u
 # this result shape, the refusal is per participant on WhatsApp's side, and failing a
 # partly-successful request whole would report the participants that *were* added as not
 # added, with no second source for a caller to check against. The rest belongs on the
-# client, and is filed there.
+# client, and is filed as fazer-ai/chatwoot#483.
 internal/engine/whatsmeow/participants.go: Make callers handle failed participant rows  # PR#122
