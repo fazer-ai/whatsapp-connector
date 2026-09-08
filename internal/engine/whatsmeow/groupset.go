@@ -106,6 +106,9 @@ func (s *Session) setGroupSetting(ctx context.Context, command *protocol.Command
 		return nil, err
 	}
 
+	if err := valueGiven(req.Value); err != nil {
+		return nil, err
+	}
 	if req.Setting == "member_add_mode" {
 		mode, err := addMode(req.Value)
 		if err != nil {
@@ -157,6 +160,21 @@ func groupToChange(address protocol.Address, what string) (waTypes.JID, error) {
 			fmt.Sprintf("%q is not a group: only a group has %s to change", address.Kind, what))
 	}
 	return jidOf(address)
+}
+
+// valueGiven refuses a settings change that carries no value.
+//
+// Go's json leaves a `null` alone rather than failing on it: unmarshalling null into a
+// bool writes nothing and answers no error, so `"value": null` would read as `false` and
+// turn a setting off that nobody asked to turn off -- and as `admin_add` on the one
+// setting that is not a switch. The contract allows a boolean or a string and nothing
+// else, and an absent value is the same nothing spelled differently.
+func valueGiven(raw json.RawMessage) error {
+	if len(raw) == 0 || string(raw) == "null" {
+		return protocol.NewError(protocol.ErrorInvalidPayload,
+			"a settings change has to say what to set the setting to")
+	}
+	return nil
 }
 
 // switchedOn reads a switch's value. Only a boolean, because that is what a switch is: a

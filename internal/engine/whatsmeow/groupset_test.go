@@ -303,3 +303,37 @@ func TestAGroupChangeAnswersWhatsAppsRefusal(t *testing.T) {
 		`{"group":{"kind":"group","id":"1"},"subject":"x"}`))
 	assertCode(t, err, protocol.ErrorWaError)
 }
+
+// Go's json leaves a `null` alone rather than failing on it -- unmarshalling null into a
+// bool writes nothing and answers no error -- so a payload carrying no value would read as
+// `false` and turn a setting off that nobody asked to turn off. On `member_add_mode`, the
+// setting that is not a switch, it would read as `admin_add` and take away every member's
+// ability to add people. The contract allows a boolean or a string and nothing else.
+func TestAGroupSettingsChangeRefusesAValueThatSaysNothing(t *testing.T) {
+	t.Parallel()
+
+	for _, setting := range []string{"announce", "locked", "join_approval", "member_add_mode"} {
+		for _, given := range []struct {
+			name    string
+			payload string
+		}{
+			{name: "null", payload: `{"group":{"kind":"group","id":"1"},"setting":%q,"value":null}`},
+			{name: "no value at all", payload: `{"group":{"kind":"group","id":"1"},"setting":%q}`},
+		} {
+			t.Run(setting+"/"+given.name, func(t *testing.T) {
+				t.Parallel()
+				session := settableSession(t)
+				session.setAddMode = func(
+					context.Context, *wm.Client, waTypes.JID, waTypes.GroupMemberAddMode,
+				) error {
+					t.Error("a payload that set nothing changed who may add members")
+					return nil
+				}
+
+				_, err := session.Execute(t.Context(), setCommand(t, protocol.CommandGroupSettingsSet,
+					fmt.Sprintf(given.payload, setting)))
+				assertCode(t, err, protocol.ErrorInvalidPayload)
+			})
+		}
+	}
+}
