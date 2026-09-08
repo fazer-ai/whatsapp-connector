@@ -121,6 +121,14 @@ type Session struct {
 	// between a failure worth retrying and one that is permanent.
 	download func(context.Context, *wm.Client, wm.DownloadableMessage, media.File) error
 
+	// onWhatsApp and profilePicture are the two contact queries. Fields for the same
+	// reason as download: both are a single IQ to WhatsApp's own servers, so without
+	// them a test can reach the payload this connector refuses and nothing past it --
+	// not the ordering a check has to answer in, and neither of the two refusals a
+	// picture query answers with, which are the parts that decide what a client shows.
+	onWhatsApp     func(context.Context, *wm.Client, []string) ([]waTypes.IsOnWhatsAppResponse, error)
+	profilePicture func(context.Context, *wm.Client, waTypes.JID, *wm.GetProfilePictureParams) (*waTypes.ProfilePictureInfo, error)
+
 	// uploadWait bounds how long an outbound media message spends fetching its file and
 	// handing it to WhatsApp. A field for the same reason as the three above it.
 	uploadWait time.Duration
@@ -430,6 +438,14 @@ func newSession(
 		},
 		retrieve:   retrieveOverHTTP,
 		uploadFile: uploadOverClient,
+		onWhatsApp: func(ctx context.Context, client *wm.Client, phones []string) ([]waTypes.IsOnWhatsAppResponse, error) {
+			return client.IsOnWhatsApp(ctx, phones) //nolint:wrapcheck // wrapped by its caller
+		},
+		profilePicture: func(
+			ctx context.Context, client *wm.Client, party waTypes.JID, params *wm.GetProfilePictureParams,
+		) (*waTypes.ProfilePictureInfo, error) {
+			return client.GetProfilePictureInfo(ctx, party, params) //nolint:wrapcheck // the sentinels are read by its caller
+		},
 		askReupload: func(ctx context.Context, client *wm.Client, info *waTypes.MessageInfo, key []byte) error {
 			return client.SendMediaRetryReceipt(ctx, info, key) //nolint:wrapcheck // wrapped by its caller
 		},
@@ -1350,6 +1366,10 @@ func (s *Session) Execute(ctx context.Context, command *protocol.Command) (json.
 		return s.subscribePresence(ctx, command)
 	case protocol.CommandChatPresence:
 		return s.chatPresenceCommand(ctx, command)
+	case protocol.CommandContactCheck:
+		return s.checkContacts(ctx, command)
+	case protocol.CommandContactProfilePicture:
+		return s.contactPicture(ctx, command)
 	}
 	return nil, engine.ErrNotSupported
 }
