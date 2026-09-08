@@ -102,27 +102,8 @@ func (s *Session) groupInfoOf(ctx context.Context, command *protocol.Command) (j
 
 // describeGroup turns whatsmeow's own view of a group into the contract's.
 func (s *Session) describeGroup(ctx context.Context, info *waTypes.GroupInfo) groupInfo {
-	described := groupInfo{
-		Subject:      info.Name,
-		Description:  info.Topic,
-		Announce:     info.IsAnnounce,
-		Locked:       info.IsLocked,
-		JoinApproval: info.IsJoinApprovalRequired,
-		Size:         info.ParticipantCount,
-		Participants: make([]groupParticipant, 0, len(info.Participants)),
-	}
-	if address, named := addressOf(info.JID); named {
-		described.Group = address
-	}
-	if !info.GroupCreated.IsZero() {
-		described.CreatedAt = info.GroupCreated.UnixMilli()
-	}
-	if owner := s.party(ctx, info.OwnerJID, info.OwnerPN); owner.Phone != "" || owner.LID != "" {
-		described.Owner = &owner
-	}
-	if mode := memberAddModes[info.MemberAddMode]; mode != "" {
-		described.MemberAddMode = mode
-	}
+	described := s.describeGroupItself(ctx, info)
+	described.Participants = make([]groupParticipant, 0, len(info.Participants))
 	for i := range info.Participants {
 		member := &info.Participants[i]
 		// Both namespaces off the participant itself where it has them, and the mapping
@@ -192,6 +173,44 @@ func groupInfoOverClient(ctx context.Context, client *wm.Client, group waTypes.J
 	return client.GetGroupInfo(ctx, group) //nolint:wrapcheck // classified by its caller
 }
 
+// describeGroupItself is everything about a group except who is in it.
+//
+// Split out because naming the members is what a listing must not pay for: `party` reads
+// the LID mapping out of the device store for every namespace a participant row does not
+// carry, so describing the roster of every group an account is in is thousands of
+// sequential store reads -- on the one goroutine that owns the session, with every other
+// command for it waiting behind. `group.list` needs none of them and answers `size`, which
+// WhatsApp already counted.
+func (s *Session) describeGroupItself(ctx context.Context, info *waTypes.GroupInfo) groupInfo {
+	described := groupInfo{
+		Subject:      info.Name,
+		Description:  info.Topic,
+		Announce:     info.IsAnnounce,
+		Locked:       info.IsLocked,
+		JoinApproval: info.IsJoinApprovalRequired,
+		Size:         info.ParticipantCount,
+	}
+	if address, named := addressOf(info.JID); named {
+		described.Group = address
+	}
+	if !info.GroupCreated.IsZero() {
+		described.CreatedAt = info.GroupCreated.UnixMilli()
+	}
+	// The owner is one party, not a roster, so it is worth the lookup it may cost.
+	if owner := s.party(ctx, info.OwnerJID, info.OwnerPN); owner.Phone != "" || owner.LID != "" {
+		described.Owner = &owner
+	}
+	if mode := memberAddModes[info.MemberAddMode]; mode != "" {
+		described.MemberAddMode = mode
+	}
+	if described.Size == 0 {
+		// The list WhatsApp sent, which is a count and not a translation: the fallback
+		// holds for a listing as much as for one group.
+		described.Size = len(info.Participants)
+	}
+	return described
+}
+
 // listGroups carries out `group.list`: every group this account is in.
 //
 // Without the rosters, and that is the whole difference between this and asking about each
@@ -217,10 +236,22 @@ func (s *Session) listGroups(ctx context.Context, _ *protocol.Command) (json.Raw
 	listed := make([]groupInfo, 0, len(joined))
 	for _, info := range joined {
 		if info == nil {
+			// whatsmeow skips a group it could not parse by logging rather than by
+			// failing, so a nil in the middle is a shape this has to survive.
 			continue
 		}
-		described := s.describeGroup(ctx, info)
-		described.Participants = nil
+		described := s.describeGroupItself(ctx, info)
+		if described.Group.ID == "" {
+			// A group WhatsApp named with something this connector cannot turn into an
+			// address -- a partially parsed node keeps its place in the slice with an
+			// empty JID. Publishing it would put `{"kind":"","id":""}` on the wire, which
+			// is not an address any client can hold and not a shape the contract allows,
+			// and one of those invalidates the whole listing for a client that validates
+			// what it receives. Nothing is lost that a caller could act on: a group it
+			// cannot address is a group it cannot open.
+			s.log.Warn().Msg("left a group out of the listing: WhatsApp named it with no address")
+			continue
+		}
 		listed = append(listed, described)
 	}
 	return json.Marshal(listed)

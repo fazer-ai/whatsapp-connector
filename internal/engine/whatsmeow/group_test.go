@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
@@ -431,6 +432,10 @@ func TestAGroupListingSurvivesAGroupItWasHandedAsNothing(t *testing.T) {
 	session.joinedGroups = func(context.Context, *wm.Client) ([]*waTypes.GroupInfo, error) {
 		return []*waTypes.GroupInfo{
 			nil,
+			// Parsed far enough to be a struct and not far enough to have a JID, which is
+			// what whatsmeow leaves behind when a group node is malformed: it logs and
+			// appends anyway.
+			{GroupName: waTypes.GroupName{Name: "Sem endereço"}},
 			{JID: waTypes.NewJID("120363041234567890", waTypes.GroupServer)},
 		}, nil
 	}
@@ -439,8 +444,49 @@ func TestAGroupListingSurvivesAGroupItWasHandedAsNothing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("group.list: %v", err)
 	}
-	if listed := listedGroups(t, result); len(listed) != 1 {
+	listed := listedGroups(t, result)
+	if len(listed) != 1 {
 		t.Fatalf("the answer has %d groups, want the one that could be described", len(listed))
+	}
+	// Not on the wire at all: `{"kind":"","id":""}` is not an address any client can hold,
+	// and one of those invalidates the whole listing for a client that validates what it
+	// receives.
+	if bytes.Contains(result, []byte(`"id":""`)) {
+		t.Errorf("a group with no address went out anyway: %s", result)
+	}
+}
+
+// The listing must not pay for naming members it is about to throw away. `party` reads the
+// device store for every namespace a participant row does not carry, so describing the
+// roster of every group an account is in is thousands of sequential reads on the one
+// goroutine that owns the session, with every other command for it waiting behind.
+//
+// What holds that is structural rather than measured: `describeGroupItself` has no loop
+// over the participants at all, so a listing built on it cannot walk them. This pins the
+// half a test can see -- it describes a group of fifty and names none of them, while still
+// answering how many there are.
+func TestDescribingAGroupItselfNamesNobodyInIt(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	roster := make([]waTypes.GroupParticipant, 0, 50)
+	for i := range 50 {
+		roster = append(roster, waTypes.GroupParticipant{
+			JID: waTypes.NewJID(fmt.Sprintf("55119999%05d", i), waTypes.DefaultUserServer),
+		})
+	}
+
+	described := session.describeGroupItself(t.Context(), &waTypes.GroupInfo{
+		JID:          waTypes.NewJID("120363041234567890", waTypes.GroupServer),
+		Participants: roster,
+	})
+	if described.Participants != nil {
+		t.Errorf("describing the group itself named %d participants, want none", len(described.Participants))
+	}
+	// The count still comes from the list WhatsApp sent, which is a length and not a
+	// translation: the fallback holds for a listing as much as for one group.
+	if described.Size != len(roster) {
+		t.Errorf("the group is %d big, want %d", described.Size, len(roster))
 	}
 }
 
