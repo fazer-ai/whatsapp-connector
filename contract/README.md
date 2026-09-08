@@ -176,7 +176,7 @@ this connector stands on every `contact.*`, `group.*` and `history.request` row 
 | `group.list` | array of `group_info` |
 | `group.invite.get` | `{ "code": string, "url": string\|null }` |
 | `group.participants.update`, `group.join_requests.update` | array of `{ "address": address, "status": "success"\|"failed", "code": error_code\|null }` |
-| `group.join_requests.list` | array of `{ "party": party, "requested_at": timestamp_ms }` |
+| `group.join_requests.list` | array of `{ "party": party, "requested_at": timestamp_ms }`, empty when nobody is waiting. `requested_at` is absent when the provider did not date the request: a request with no date is still one somebody is waiting on, and a zero reads as January 1970 and sorts as one |
 | `group.leave`, `group.name.set`, `group.description.set`, `group.photo.set`, `group.settings.set` | `null` |
 
 A command whose result is `null` still answers `{"ok": true}`: the caller is waiting
