@@ -140,6 +140,11 @@ type Session struct {
 	// joinedGroups reads every group this account is in. One IQ, like groupInfo above it.
 	joinedGroups func(context.Context, *wm.Client) ([]*waTypes.GroupInfo, error)
 
+	// createTheGroup makes one. A seam like the queries above it: one IQ, and a test can
+	// otherwise reach the payload this connector refuses and nothing of what it makes of
+	// an answer.
+	createTheGroup func(context.Context, *wm.Client, wm.ReqCreateGroup) (*waTypes.GroupInfo, error)
+
 	onWhatsApp func(context.Context, *wm.Client, []string) ([]waTypes.IsOnWhatsAppResponse, error)
 	//nolint:lll // one line per seam reads better than a wrapped signature
 	updateParticipants func(context.Context, *wm.Client, waTypes.JID, []waTypes.JID, wm.ParticipantChange) ([]waTypes.GroupParticipant, error)
@@ -490,6 +495,11 @@ func newSession(
 		sendAppState: sendAppStateOverClient,
 		groupInfo:    groupInfoOverClient,
 		joinedGroups: joinedGroupsOverClient,
+		createTheGroup: func(
+			ctx context.Context, client *wm.Client, req wm.ReqCreateGroup,
+		) (*waTypes.GroupInfo, error) {
+			return client.CreateGroup(ctx, req) //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
+		},
 		onWhatsApp: func(ctx context.Context, client *wm.Client, phones []string) ([]waTypes.IsOnWhatsAppResponse, error) {
 			return client.IsOnWhatsApp(ctx, phones) //nolint:wrapcheck // wrapped by its caller
 		},
@@ -1502,6 +1512,8 @@ func (s *Session) Execute(ctx context.Context, command *protocol.Command) (json.
 		return s.listJoinRequests(ctx, command)
 	case protocol.CommandGroupJoinRequestsUpdate:
 		return s.updateJoinRequests(ctx, command)
+	case protocol.CommandGroupCreate:
+		return s.createGroup(ctx, command)
 	case protocol.CommandGroupList:
 		return s.listGroups(ctx, command)
 	case protocol.CommandGroupInfo:
