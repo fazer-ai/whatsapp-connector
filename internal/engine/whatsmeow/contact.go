@@ -282,6 +282,13 @@ func (s *Session) resolveContact(ctx context.Context, command *protocol.Command)
 			"this session has no WhatsApp account to resolve against")
 	}
 
+	// Bounded, and not by the caller's deadline alone. A command may carry none at all,
+	// and this runs on the session's executor: a database call that wedges with the
+	// session's own context behind it holds every later command for this session for as
+	// long as it lasts. The same bound every event handler reads the store under.
+	reading, done := context.WithTimeout(ctx, s.storeLimit)
+	defer done()
+
 	// The mapping read directly rather than through `party`, because a command whose
 	// whole answer is the mapping has to tell a store that did not answer from a pairing
 	// nobody has learned. `party` reports both as an absence, which is right where losing
@@ -303,10 +310,10 @@ func (s *Session) resolveContact(ctx context.Context, command *protocol.Command)
 			named.LID = lid
 		}
 		named.Phone = phone
-		s.nameFromStore(ctx, &named)
+		s.nameFromStore(reading, &named)
 		return json.Marshal(named)
 	}
-	alt, found, err := s.aliases.lookup(ctx, s, jid)
+	alt, found, err := s.aliases.lookup(reading, s, jid)
 	if err != nil {
 		return nil, storeFailure(err, "the address mapping")
 	}
@@ -321,7 +328,7 @@ func (s *Session) resolveContact(ctx context.Context, command *protocol.Command)
 		// The contact table is keyed by `our_jid`, so it is the one thing here that
 		// answers "has this account met them". A party it has not is answered with the
 		// half the caller already had. Issue #137 is the mapping table itself.
-		met, err := s.hasMet(ctx, jid, alt)
+		met, err := s.hasMet(reading, jid, alt)
 		switch {
 		case err != nil:
 			return nil, storeFailure(err, "the contact record")
@@ -338,7 +345,7 @@ func (s *Session) resolveContact(ctx context.Context, command *protocol.Command)
 		// the two namespaces it is built on.
 		return nil, protocol.NewError(protocol.ErrorInternal, "the party resolved to no address at all")
 	}
-	s.nameFromStore(ctx, &named)
+	s.nameFromStore(reading, &named)
 	return json.Marshal(named)
 }
 

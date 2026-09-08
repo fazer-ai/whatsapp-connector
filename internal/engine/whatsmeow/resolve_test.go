@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"testing"
+	"time"
 
 	waTypes "go.mau.fi/whatsmeow/types"
 
@@ -366,4 +367,25 @@ func TestAResolveSaysWhenTheContactRecordCouldNotBeRead(t *testing.T) {
 
 	_, err := session.Execute(t.Context(), resolveCommand(t, `{"party":{"kind":"lid","id":"`+lid+`"}}`))
 	assertCode(t, err, protocol.ErrorInternal)
+}
+
+// A command need not carry a deadline, and this one runs on the session's executor: a
+// database call left with the session's own context behind it holds every later command
+// for that session for as long as it lasts. The bound is the store's, the same one every
+// event handler reads under.
+func TestAResolveBoundsItsReadsWithoutACallerDeadline(t *testing.T) {
+	t.Parallel()
+
+	const (
+		phone = "5541988887777"
+		lid   = "998877665544332"
+	)
+
+	session, _ := newTestSession(t, "5511999990001")
+	learn(t, session, phone, lid)
+	session.storeLimit = time.Nanosecond
+
+	// No deadline on the command, so the bound has to come from here.
+	_, err := session.Execute(t.Context(), resolveCommand(t, `{"party":{"kind":"lid","id":"`+lid+`"}}`))
+	assertCode(t, err, protocol.ErrorTimeout)
 }
