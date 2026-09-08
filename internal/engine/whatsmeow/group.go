@@ -125,7 +125,10 @@ func (s *Session) describeGroup(ctx context.Context, info *waTypes.GroupInfo) gr
 		})
 	}
 	if described.Size == 0 {
-		described.Size = len(described.Participants)
+		// The list WhatsApp sent, not the rows that survived naming. Somebody this
+		// connector cannot name is still somebody in the group, and counting only the
+		// nameable ones would report an announcement group as smaller than it is.
+		described.Size = len(info.Participants)
 	}
 	return described
 }

@@ -194,6 +194,12 @@ func TestGroupInfoLeavesOutAParticipantItCannotName(t *testing.T) {
 	if len(described.Participants) != 1 {
 		t.Fatalf("the answer has %d participants, want only the one that can be named", len(described.Participants))
 	}
+	// Left out of the rows and still counted: somebody this connector cannot name is
+	// still somebody in the group, and a size taken from the filtered list reports an
+	// announcement group as smaller than it is.
+	if described.Size != 2 {
+		t.Errorf("size is %d, want 2: the participant that could not be named is still in the group", described.Size)
+	}
 	for _, member := range described.Participants {
 		if member.Party.Phone == "" && member.Party.LID == "" {
 			t.Error("a participant came back with neither a phone nor a lid, which no client can address")
