@@ -116,6 +116,7 @@ func (s *Session) updateGroupParticipants(ctx context.Context, command *protocol
 	}
 
 	rows := make([]participantOutcome, len(req.Participants))
+	refused := 0
 	for i, party := range req.Participants {
 		rows[i] = participantOutcome{Address: party, Status: "failed"}
 		verdict, mentioned := verdicts[party]
@@ -136,8 +137,39 @@ func (s *Session) updateGroupParticipants(ctx context.Context, command *protocol
 		default:
 			rows[i].Status = "success"
 		}
+		if rows[i].Status == "failed" {
+			refused++
+		}
+	}
+
+	if refused == len(rows) {
+		// Nothing was carried out, and that is the command failing rather than a command
+		// reporting failures. Three of the four actions reach this connector one
+		// participant at a time -- the dashboard promotes, demotes and removes a single
+		// member -- and a client updates its own roster on the reply: told `ok` with a
+		// row it does not read, it shows somebody as demoted whom WhatsApp refused to
+		// demote. The generation before this one raised on exactly this, so answering
+		// `ok` here is a regression against what is running today, not a new strictness.
+		//
+		// A request where some went through still answers `ok` with the rows. Failing it
+		// whole would report the participants that were added as not added, and there is
+		// no second source for a caller to check that against.
+		return nil, protocol.NewError(refusalAcross(rows),
+			fmt.Sprintf("WhatsApp carried out none of the %d participant changes", len(rows)))
 	}
 	return json.Marshal(rows)
+}
+
+// refusalAcross is the one code that answers for a request nothing was carried out of.
+// The named refusal wins over the opaque one: a caller that hears `wa_error` because one
+// of its rows carried it learns less than the row that said why.
+func refusalAcross(rows []participantOutcome) protocol.ErrorCode {
+	for _, row := range rows {
+		if row.Code != nil && *row.Code != protocol.ErrorWaError {
+			return *row.Code
+		}
+	}
+	return protocol.ErrorWaError
 }
 
 // refusalOf is the address of a code, which is what the row carries so that a successful
@@ -146,16 +178,16 @@ func refusalOf(code protocol.ErrorCode) *protocol.ErrorCode { return &code }
 
 // participantRefusal names why WhatsApp refused one participant.
 //
-// Only an add refused with 403 is translated, and only because it is the one this
-// connector can account for: it is `not-authorized`, and WhatsApp attaches an invite to
+// Two pairs are translated, and both because they were confirmed for that action and no
+// other. An add refused with 403 is `not-authorized`, and WhatsApp attaches an invite to
 // it -- an add it refuses on the other person's privacy setting, answered with a code to
-// send them instead. That is exactly what `group_participant_not_allowed` is for, and it
-// is what a client acts on by sending the invite instead of retrying the add.
+// send them instead. A remove or a demote refused with 406 is the group's creator, who
+// cannot be taken out of their own group. Both are what `group_participant_not_allowed`
+// is for, and both are what a client acts on rather than just reports.
 //
-// The same 403 on a remove, a promote or a demote is a different sentence with the same
-// number, and this connector has confirmed neither what it means nor that an invite would
-// help. Sending the privacy code there would have a client offer to invite somebody it
-// was trying to demote.
+// The same numbers on the other actions are different sentences, and this connector has
+// confirmed neither what they mean nor what would help. Sending the privacy code for a
+// 403 on a demote would have a client offer to invite somebody it was trying to demote.
 //
 // Everything else stays `wa_error` on purpose. The other codes WhatsApp uses here (409,
 // 408 and the rest) have no meaning this connector has confirmed per action, and a guess
@@ -163,7 +195,16 @@ func refusalOf(code protocol.ErrorCode) *protocol.ErrorCode { return &code }
 // the code, so a wrong one sends it down a road nobody checked. The numeric code is
 // logged, which is where it can be confirmed without a client having been told a story.
 func participantRefusal(action wm.ParticipantChange, code int) protocol.ErrorCode {
-	if action == wm.ParticipantChangeAdd && code == 403 {
+	switch {
+	case action == wm.ParticipantChangeAdd && code == 403:
+		return protocol.ErrorGroupParticipantNotAllowed
+	case code == 406 && (action == wm.ParticipantChangeRemove || action == wm.ParticipantChangeDemote):
+		// The group's creator, who cannot be removed from their own group or stripped of
+		// it. Confirmed by the generation this connector replaces, which has been mapping
+		// this exact pair in production and whose dashboard has a message for it
+		// (`group_creator_not_modifiable`). Leaving it opaque here would take that
+		// message away from an operator who has been reading it for as long as the
+		// feature has existed.
 		return protocol.ErrorGroupParticipantNotAllowed
 	}
 	return protocol.ErrorWaError

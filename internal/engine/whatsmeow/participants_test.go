@@ -218,6 +218,14 @@ func TestAParticipantsUpdateNamesOnlyTheRefusalItCanAccountFor(t *testing.T) {
 		{name: "a remove WhatsApp would not authorize", action: "remove", code: 403, want: protocol.ErrorWaError},
 		{name: "a promote WhatsApp would not authorize", action: "promote", code: 403, want: protocol.ErrorWaError},
 		{name: "a demote WhatsApp would not authorize", action: "demote", code: 403, want: protocol.ErrorWaError},
+		// The group's creator, who cannot be taken out of their own group. Confirmed by
+		// the generation this connector replaces, which maps this exact pair in
+		// production and whose dashboard has a message for it.
+		{name: "a remove of the group's creator", action: "remove", code: 406, want: protocol.ErrorGroupParticipantNotAllowed},
+		{name: "a demote of the group's creator", action: "demote", code: 406, want: protocol.ErrorGroupParticipantNotAllowed},
+		// The same number on the actions it was not confirmed for.
+		{name: "an add answered with 406", action: "add", code: 406, want: protocol.ErrorWaError},
+		{name: "a promote answered with 406", action: "promote", code: 406, want: protocol.ErrorWaError},
 		{name: "already in the group", action: "add", code: 409, want: protocol.ErrorWaError},
 		{name: "left recently", action: "add", code: 408, want: protocol.ErrorWaError},
 		{name: "something this build has never seen", action: "add", code: 500, want: protocol.ErrorWaError},
@@ -226,26 +234,33 @@ func TestAParticipantsUpdateNamesOnlyTheRefusalItCanAccountFor(t *testing.T) {
 			t.Parallel()
 			session, _ := newTestSession(t, "5511999990001")
 			session.setConnected(true)
+			// Somebody who goes through alongside the refusal, because a request nothing
+			// was carried out of fails as a whole and would answer no rows to read.
 			session.updateParticipants = func(
 				context.Context, *wm.Client, waTypes.JID, []waTypes.JID, wm.ParticipantChange,
 			) ([]waTypes.GroupParticipant, error) {
 				return []waTypes.GroupParticipant{
 					{JID: waTypes.NewJID("5511999990002", waTypes.DefaultUserServer), Error: refusal.code},
+					{JID: waTypes.NewJID("5511999990003", waTypes.DefaultUserServer)},
 				}, nil
 			}
 
 			result, err := session.Execute(t.Context(), participantsCommand(t,
 				`{"group":{"kind":"group","id":"120363000000000001"},`+
-					`"participants":[{"kind":"phone","id":"5511999990002"}],"action":"`+refusal.action+`"}`))
+					`"participants":[{"kind":"phone","id":"5511999990002"},`+
+					`{"kind":"phone","id":"5511999990003"}],"action":"`+refusal.action+`"}`))
 			if err != nil {
 				t.Fatalf("group.participants.update: %v", err)
 			}
 			rows := updated(t, result)
-			if len(rows) != 1 {
-				t.Fatalf("the answer has %d rows, want one", len(rows))
+			if len(rows) != 2 {
+				t.Fatalf("the answer has %d rows, want one per participant asked", len(rows))
 			}
 			if rows[0].Status != "failed" {
 				t.Errorf("a participant WhatsApp refused came back as %q", rows[0].Status)
+			}
+			if rows[1].Status != "success" {
+				t.Errorf("the participant WhatsApp did carry out came back as %q", rows[1].Status)
 			}
 			if rows[0].Code == nil || *rows[0].Code != refusal.want {
 				t.Errorf("WhatsApp's %d on a %s came back as %s, want %q",
@@ -345,5 +360,100 @@ func TestAParticipantsUpdateKeepsTwoNamespacesWithTheSameDigitsApart(t *testing.
 	if rows[1].Address.Kind != protocol.AddressLID || rows[1].Status != "failed" {
 		t.Errorf("a LID WhatsApp never answered for came back as %+v/%s, want failed",
 			rows[1].Address, rows[1].Status)
+	}
+}
+
+// A request nothing was carried out of is the command failing, not a command reporting
+// failures. Three of the four actions reach here one participant at a time -- the
+// dashboard promotes, demotes and removes a single member -- and a client updates its own
+// roster on the reply, so an `ok` carrying a row it does not read shows somebody as
+// demoted whom WhatsApp refused to demote. The generation this replaces raised on exactly
+// this, and it is running in production today.
+func TestAParticipantsUpdateFailsWhenNothingWasCarriedOut(t *testing.T) {
+	t.Parallel()
+
+	for _, nothing := range []struct {
+		name     string
+		answered []waTypes.GroupParticipant
+		want     protocol.ErrorCode
+	}{
+		{
+			name: "the one participant it was asked about",
+			answered: []waTypes.GroupParticipant{
+				{JID: waTypes.NewJID("5511999990002", waTypes.DefaultUserServer), Error: 403},
+			},
+			want: protocol.ErrorGroupParticipantNotAllowed,
+		},
+		{
+			// The named refusal wins over the opaque one: a caller that hears `wa_error`
+			// because one of its rows carried it learns less than the row that said why.
+			name: "everybody, for reasons only one of which has a name",
+			answered: []waTypes.GroupParticipant{
+				{JID: waTypes.NewJID("5511999990002", waTypes.DefaultUserServer), Error: 409},
+				{JID: waTypes.NewJID("5511999990003", waTypes.DefaultUserServer), Error: 403},
+			},
+			want: protocol.ErrorGroupParticipantNotAllowed,
+		},
+		{
+			name: "everybody, for reasons none of which has one",
+			answered: []waTypes.GroupParticipant{
+				{JID: waTypes.NewJID("5511999990002", waTypes.DefaultUserServer), Error: 409},
+				{JID: waTypes.NewJID("5511999990003", waTypes.DefaultUserServer), Error: 500},
+			},
+			want: protocol.ErrorWaError,
+		},
+		{
+			// Answered for nobody at all, which leaves every row unaccounted for.
+			name:     "nobody, because WhatsApp answered for nobody",
+			answered: nil,
+			want:     protocol.ErrorWaError,
+		},
+	} {
+		t.Run(nothing.name, func(t *testing.T) {
+			t.Parallel()
+			session, _ := newTestSession(t, "5511999990001")
+			session.setConnected(true)
+			session.updateParticipants = func(
+				context.Context, *wm.Client, waTypes.JID, []waTypes.JID, wm.ParticipantChange,
+			) ([]waTypes.GroupParticipant, error) {
+				return nothing.answered, nil
+			}
+
+			_, err := session.Execute(t.Context(), participantsCommand(t,
+				`{"group":{"kind":"group","id":"120363000000000001"},`+
+					`"participants":[{"kind":"phone","id":"5511999990002"},`+
+					`{"kind":"phone","id":"5511999990003"}],"action":"add"}`))
+			assertCode(t, err, nothing.want)
+		})
+	}
+}
+
+// A request some of which went through still answers `ok` with its rows. Failing it whole
+// would report the participants that were added as not added, and a caller has no second
+// source to check that against.
+func TestAParticipantsUpdateAnswersRowsWhenSomebodyWentThrough(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setConnected(true)
+	session.updateParticipants = func(
+		context.Context, *wm.Client, waTypes.JID, []waTypes.JID, wm.ParticipantChange,
+	) ([]waTypes.GroupParticipant, error) {
+		return []waTypes.GroupParticipant{
+			{JID: waTypes.NewJID("5511999990002", waTypes.DefaultUserServer), Error: 403},
+			{JID: waTypes.NewJID("5511999990003", waTypes.DefaultUserServer)},
+		}, nil
+	}
+
+	result, err := session.Execute(t.Context(), participantsCommand(t,
+		`{"group":{"kind":"group","id":"120363000000000001"},`+
+			`"participants":[{"kind":"phone","id":"5511999990002"},`+
+			`{"kind":"phone","id":"5511999990003"}],"action":"add"}`))
+	if err != nil {
+		t.Fatalf("a request one participant of which went through failed as a whole: %v", err)
+	}
+	rows := updated(t, result)
+	if len(rows) != 2 || rows[0].Status != "failed" || rows[1].Status != "success" {
+		t.Fatalf("the answer is %+v, want the refusal and the one that went through", rows)
 	}
 }
