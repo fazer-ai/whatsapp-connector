@@ -79,3 +79,56 @@ func TestAResolveAnswersTheAccountsOwnNames(t *testing.T) {
 		t.Errorf("resolving the account itself answered %v, want both of its names", party)
 	}
 }
+
+// Connected orders the LID write and orders nothing about the display names: an app-state
+// sync writes those from its own goroutine and may be writing one now. Reading them there
+// would be a data race, and it would also lose a name the account had just changed to.
+func TestAConnectionDoesNotTakeTheNamesBackOffTheDevice(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.handle(&waEvents.PushNameSetting{
+		Action: &waSyncAction.PushNameSetting{Name: proto.String("Atendimento")},
+	})
+	// What the device record said before the rename, which is what a read here would
+	// find.
+	session.current().Store.PushName = "Antigo"
+
+	session.handle(&waEvents.Connected{})
+	drain(t, session)
+
+	if named, _ := session.names(); named != "Atendimento" {
+		t.Errorf("after connecting the session calls itself %q, want the name it was told", named)
+	}
+}
+
+// The first app-state sync of a device is a full one, and whatsmeow suppresses its events
+// by default: the account's own push name would be updated with nobody told, and a freshly
+// paired session would answer with no name until the account renamed itself.
+func TestASessionAsksForTheEventsOfAFullSync(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	if !session.current().EmitAppStateEventsOnFullSync {
+		t.Error("the client suppresses the events of a full sync, so the push name it learns there is never published")
+	}
+}
+
+// The verified name arrives with the pairing and nowhere else until a reconnect: the
+// client the session was built with had no account on it, so there was nothing to copy.
+func TestAPairingCarriesTheVerifiedName(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "")
+	session.handle(&waEvents.PairSuccess{
+		ID:           waTypes.NewJID("5511999990001", waTypes.DefaultUserServer),
+		LID:          waTypes.NewJID("111222333444555", waTypes.HiddenUserServer),
+		BusinessName: "Loja do Bruno",
+		Platform:     "android",
+	})
+	drain(t, session)
+
+	if _, verified := session.names(); verified != "Loja do Bruno" {
+		t.Errorf("after pairing the session is verified as %q, want the name the pairing carried", verified)
+	}
+}

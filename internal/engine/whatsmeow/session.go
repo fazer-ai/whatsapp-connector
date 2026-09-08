@@ -681,6 +681,15 @@ func (s *Session) adopt(client *wm.Client) bool {
 	// instead of being prevented. The buffer keeps the plaintext, keyed by the
 	// ciphertext, until a handler accepts it.
 	client.EnableDecryptedEventBuffer = true
+	// The first app-state sync of a device is a full one, and whatsmeow suppresses the
+	// events it produces by default: it would update the account's own push name and tell
+	// nobody, so a freshly paired session would answer with no name until the account
+	// renamed itself. `setting_pushName` is the only app-state event this build consumes
+	// -- everything else a full sync emits falls through the handler untouched -- so
+	// turning them on costs one pass over events nothing reads, once per full sync. A
+	// build that starts consuming another one has to weigh this again: a full sync
+	// replays the whole state, so an event that means "this just happened" would not.
+	client.EmitAppStateEventsOnFullSync = true
 
 	// Read here and not later: this client was built for this session and nothing else
 	// holds it yet, so whatsmeow's own goroutines are not writing to it.
@@ -837,6 +846,16 @@ func (s *Session) setIdentity(phone, lid string) {
 	s.mu.Unlock()
 }
 
+// setVerifiedName records the name a business account is verified under.
+func (s *Session) setVerifiedName(businessName string) {
+	if businessName == "" {
+		return
+	}
+	s.mu.Lock()
+	s.businessName = businessName
+	s.mu.Unlock()
+}
+
 // rename records a push name the account changed while the session was up.
 func (s *Session) rename(pushName string) {
 	if pushName == "" {
@@ -865,6 +884,11 @@ func (s *Session) names() (pushName, businessName string) {
 // Called from the Connected handler, which is where the ordering is: whatsmeow writes the
 // LID and then starts the goroutine that dispatches the event, so what this reads is what
 // that write left.
+//
+// The addresses and nothing else, for the same reason. That ordering covers the LID write
+// and covers nothing about the display names, which an app-state sync writes from its own
+// goroutine and may be writing right now -- reading them here would be the data race this
+// whole arrangement exists to avoid. They arrive on their own events instead.
 func (s *Session) relearn(client *wm.Client) {
 	if client == nil || client.Store == nil {
 		return
@@ -873,8 +897,6 @@ func (s *Session) relearn(client *wm.Client) {
 	s.mu.Lock()
 	s.phone = named.phone
 	s.lid = named.lid
-	s.pushName = named.pushName
-	s.businessName = named.businessName
 	s.mu.Unlock()
 }
 
@@ -2694,6 +2716,11 @@ func (s *Session) paired(event *waEvents.PairSuccess) {
 		lid = event.LID.User
 	}
 	s.setIdentity(event.ID.User, lid)
+	// The verified name arrives here and nowhere else until a reconnect: the client this
+	// session was built with had no account on it, so what `adopt` copied was empty. A
+	// business account resolving itself before its first reconnect would answer without
+	// one, and a reconnect that keeps failing never comes.
+	s.setVerifiedName(event.BusinessName)
 
 	payload := map[string]any{"phone": event.ID.User, "platform": event.Platform}
 	if lid != "" {
