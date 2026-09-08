@@ -145,7 +145,6 @@ var (
 		protocol.CommandGroupDescriptionSet,
 		protocol.CommandGroupPhotoSet,
 		protocol.CommandGroupSettingsSet,
-		protocol.CommandGroupInviteGet,
 		protocol.CommandGroupJoinRequestsList,
 		protocol.CommandGroupJoinRequestsUpdate,
 		protocol.CommandCallReject,
@@ -180,6 +179,7 @@ var (
 		{protocol.CommandMessageMarkUnread, protocol.ErrorInvalidPayload},
 		{protocol.CommandGroupInfo, protocol.ErrorInvalidPayload},
 		{protocol.CommandGroupParticipantsUpdate, protocol.ErrorInvalidPayload},
+		{protocol.CommandGroupInviteGet, protocol.ErrorInvalidPayload},
 	}
 )
 
