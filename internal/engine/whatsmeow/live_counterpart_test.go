@@ -160,6 +160,15 @@ func liveSay(t *testing.T, from *Session, to, body string) string {
 	t.Helper()
 
 	messageID := from.current().GenerateMessageID()
+	liveSayUnder(t, from, to, body, messageID)
+	return messageID
+}
+
+// liveSayUnder is liveSay with the id decided by the caller, for a phase that has to
+// arrange something around this message before it goes out.
+func liveSayUnder(t *testing.T, from *Session, to, body, messageID string) {
+	t.Helper()
+
 	payload, err := json.Marshal(map[string]any{
 		"message_id": messageID,
 		"to":         map[string]any{"kind": "phone", "id": to},
@@ -173,7 +182,6 @@ func liveSay(t *testing.T, from *Session, to, body string) string {
 	}); err != nil {
 		t.Fatalf("message.send: %v", err)
 	}
-	return messageID
 }
 
 // liveResume brings a paired session back up, the way a connector restart does.
