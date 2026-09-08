@@ -190,3 +190,31 @@ func TestAPairingCarriesTheVerifiedName(t *testing.T) {
 		t.Errorf("after pairing the session is verified as %q, want the name the pairing carried", verified)
 	}
 }
+
+// A verified name change is written to the contact table and not to the device record, so
+// after a restart the record is the stale copy of the two: the session takes its own names
+// from the device, and answering out of that would report a name the account left behind.
+func TestAResolvePrefersTheNewerVerifiedName(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	client := session.current()
+	// The device record as a restart finds it: what the pairing wrote.
+	client.Store.BusinessName = "Loja do Bruno"
+	if !session.adopt(client) {
+		t.Fatal("the session would not take its own client back")
+	}
+	// The table as the rename left it.
+	if _, _, err := client.Store.Contacts.PutBusinessName(t.Context(),
+		waTypes.NewJID("5511999990001", waTypes.DefaultUserServer), "Loja do Bruno LTDA"); err != nil {
+		t.Fatalf("PutBusinessName: %v", err)
+	}
+
+	result, err := session.Execute(t.Context(), resolveCommand(t, `{"party":{"kind":"phone","id":"5511999990001"}}`))
+	if err != nil {
+		t.Fatalf("contact.resolve: %v", err)
+	}
+	if party := resolved(t, result); party["verified_name"] != "Loja do Bruno LTDA" {
+		t.Errorf("the account is verified as %v, want the name the table was left with", party)
+	}
+}

@@ -315,12 +315,22 @@ func (s *Session) resolveContact(ctx context.Context, command *protocol.Command)
 			named.LID = lid
 		}
 		named.Phone = phone
-		// Its own names come off the session, which took them from the device where an
-		// ordering exists. The contact table holds the people this account has met and it
-		// is not one of them, so resolving itself through the table alone answers with no
-		// name at all.
-		named.PushName, named.VerifiedName = s.names()
+		// The table first, and the session for what it does not hold. Its own names are
+		// not in there to begin with -- the table is the people this account has met, and
+		// it is not one of them -- so the session, which took them off the device where an
+		// ordering exists, is what usually answers.
+		//
+		// The exception is why the order is this way round: an account that renames its
+		// business has the new name written to the table and not to the device record, so
+		// after a restart the device is the stale copy of the two.
 		s.nameFromStore(reading, &named)
+		pushName, verifiedName := s.names()
+		if named.PushName == "" {
+			named.PushName = pushName
+		}
+		if named.VerifiedName == "" {
+			named.VerifiedName = verifiedName
+		}
 		return json.Marshal(named)
 	}
 	alt, found, err := s.aliases.lookup(reading, s, jid)
