@@ -71,6 +71,12 @@ func (s *Session) groupInfoOf(ctx context.Context, command *protocol.Command) (j
 		return nil, err
 	}
 
+	// Read before the query, compared after it, the same as `groupModeCached` does and
+	// for the same reason: a reconnection empties what is remembered so the first group
+	// action on the new socket goes back to WhatsApp, and an answer already in flight
+	// when that happened must not be written in behind it.
+	on, _ := s.connection()
+
 	info, err := s.groupInfo(ctx, s.current(), group)
 	if err != nil {
 		return nil, contactFailure(err, "group info request")
@@ -82,6 +88,15 @@ func (s *Session) groupInfoOf(ctx context.Context, command *protocol.Command) (j
 		return nil, protocol.NewError(protocol.ErrorInternal,
 			"the group info query came back empty without saying why")
 	}
+	// This query went to the wire, so its answer is the freshest reading of the group
+	// there is. Filed for the paths that translate a participant into the group's own
+	// namespace, which otherwise keep whatever the last one of them read -- a client
+	// asking about a group is the one moment a migration becomes visible without anybody
+	// paying a round trip for it. Deliberately not the other way round: `group.info` is a
+	// client asking what the group *is*, and answering that out of a cache would report a
+	// membership and a subject this session has not checked.
+	s.rememberGroupMode(group, info.AddressingMode, on)
+
 	return json.Marshal(s.describeGroup(ctx, info))
 }
 

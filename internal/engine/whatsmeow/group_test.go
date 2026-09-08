@@ -279,3 +279,50 @@ func TestGroupInfoThatComesBackEmptyWithoutAReasonIsAFailureRatherThanAPanic(t *
 	_, err := session.Execute(t.Context(), groupCommand(t, aGroup))
 	assertCode(t, err, protocol.ErrorInternal)
 }
+
+// A `group.info` query goes to the wire, so its answer is the freshest reading of the
+// group there is. The paths that translate a participant into the group's own namespace
+// otherwise keep whatever the last one of them read, and a client asking about a group is
+// the one moment a migration becomes visible without anybody paying a round trip for it.
+func TestGroupInfoFilesTheAddressingItJustRead(t *testing.T) {
+	t.Parallel()
+
+	group := waTypes.NewJID("120363041234567890", waTypes.GroupServer)
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setConnected(true)
+	// A stale reading of the same group, which is what this is meant to correct.
+	session.rememberGroupMode(group, waTypes.AddressingModePN, mustConnection(t, session))
+	session.groupInfo = func(context.Context, *wm.Client, waTypes.JID) (*waTypes.GroupInfo, error) {
+		return &waTypes.GroupInfo{
+			JID:            group,
+			OwnerJID:       waTypes.NewJID("5511999990002", waTypes.DefaultUserServer),
+			GroupName:      waTypes.GroupName{Name: "Equipe"},
+			AddressingMode: waTypes.AddressingModeLID,
+		}, nil
+	}
+
+	if _, err := session.groupInfoOf(t.Context(), &protocol.Command{
+		Type:    protocol.CommandGroupInfo,
+		Payload: json.RawMessage(`{"group":{"kind":"group","id":"120363041234567890"}}`),
+	}); err != nil {
+		t.Fatalf("group.info: %v", err)
+	}
+
+	session.mu.Lock()
+	filed := session.groupModes[group]
+	session.mu.Unlock()
+	if filed != waTypes.AddressingModeLID {
+		t.Fatalf("the group answered %q and %q is still what a reaction would be built on",
+			waTypes.AddressingModeLID, filed)
+	}
+}
+
+// mustConnection is the counter a reading is filed against, read the way the production
+// path reads it.
+func mustConnection(t *testing.T, session *Session) int64 {
+	t.Helper()
+
+	on, _ := session.connection()
+	return on
+}
