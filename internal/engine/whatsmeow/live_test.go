@@ -1775,6 +1775,20 @@ func (r *recorder) await(t *testing.T, want protocol.EventType, within time.Dura
 func (r *recorder) awaitMessage(t *testing.T, id string, within time.Duration) json.RawMessage {
 	t.Helper()
 
+	body, arrived := r.sawMessage(t, id, within)
+	if !arrived {
+		t.Fatalf("message %s did not arrive within %s%s", id, within, r.overflowed())
+	}
+	return body
+}
+
+// sawMessage is awaitMessage without the verdict: whether the message turned up, for a
+// caller that has something to do about it not having. Everything except the deadline is
+// still fatal -- a logged-out session or an unreadable emission is not an answer to the
+// question, it is the harness having lost the ability to answer it.
+func (r *recorder) sawMessage(t *testing.T, id string, within time.Duration) (json.RawMessage, bool) {
+	t.Helper()
+
 	deadline := time.After(within)
 	for {
 		select {
@@ -1802,10 +1816,10 @@ func (r *recorder) awaitMessage(t *testing.T, id string, within time.Duration) j
 				t.Fatalf("unmarshal the message inside a message.received: %v", err)
 			}
 			if named.ID == id {
-				return envelope.Message
+				return envelope.Message, true
 			}
 		case <-deadline:
-			t.Fatalf("message %s did not arrive within %s%s", id, within, r.overflowed())
+			return nil, false
 		}
 	}
 }
