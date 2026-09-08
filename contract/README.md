@@ -187,7 +187,8 @@ this connector stands on every `contact.*`, `group.*` and `history.request` row 
 | `message.download_media` | `media_ref`, fetchable from `url` until `expires_at`. The connector answers with a `connector_blob`, the same shape its events carry: what it hands back is a blob it just wrote, instance-local and time-bounded like any other |
 | `contact.check` | array of `{ "phone": digits, "exists": boolean, "address": address\|null }` |
 | `contact.profile_picture` | `{ "url": string\|null }` |
-| `contact.info`, `contact.resolve` | `party` |
+| `contact.resolve` | `party`. Both of WhatsApp's namespaces for one person, out of what the connector already holds, plus the display names it has learned. Local: no round trip, and a session that is paired but not connected still answers it. A party this account has no record of having met is answered with the half the caller already had, rather than with a mapping another account on the same connector learned |
+| `contact.info` | `party` |
 | `group.create`, `group.info` | `group_info`. `participants` is absent when the connector cannot account for every one of them -- an anonymous participant it has no address for, or a list shorter than `size` -- because a roster reads as the whole of the group and half of one takes people out of it. Absent means *not answered*, never *empty*: `size` is what says how many there are |
 | `group.list` | array of `group_info`, empty when the account is in no groups, and **without `participants`**: an account can be in hundreds of groups of hundreds of people, and a listing that carried every membership would answer with the whole address book of every conversation to say which conversations exist. `size` still says how big each one is, and `group.info` answers the roster for the group a caller opens |
 | `group.invite.get` | `{ "code": string, "url": string\|null }` |

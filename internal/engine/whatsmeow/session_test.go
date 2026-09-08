@@ -137,7 +137,6 @@ var (
 		protocol.CommandSessionUpdate,
 		protocol.CommandHistoryRequest,
 		protocol.CommandContactInfo,
-		protocol.CommandContactResolve,
 		protocol.CommandCallReject,
 	}
 
@@ -170,6 +169,7 @@ var (
 		{protocol.CommandChatPresence, protocol.ErrorInvalidPayload},
 		{protocol.CommandContactCheck, protocol.ErrorInvalidPayload},
 		{protocol.CommandContactProfilePicture, protocol.ErrorInvalidPayload},
+		{protocol.CommandContactResolve, protocol.ErrorInvalidPayload},
 		{protocol.CommandMessageMarkUnread, protocol.ErrorInvalidPayload},
 		{protocol.CommandGroupCreate, protocol.ErrorInvalidPayload},
 		{protocol.CommandGroupList, protocol.ErrorNotPaired},

@@ -1,3 +1,28 @@
+# PR#136: this is a fix an earlier round of this same review asked for, that a later round
+# of it then reported as a bug -- and the later round is right. `client.Store.PushName` is
+# written by whatsmeow from its app-state goroutine (appstate.go, on a push-name setting
+# mutation) while this would read it from the session executor, which is a data race the
+# race detector will find as soon as the two land together. `BusinessName` sits next to it.
+# The names are real and the device does hold them; what is missing is a way to read them
+# that is not a race. The place for that is the handler that already runs on whatsmeow's
+# own goroutine, copying them into the session the way `PairSuccess` copies the identity --
+# which is issue #138, together with the LID a resumed session never learns for the same
+# reason. Reading them here would trade a missing field for a race.
+internal/engine/whatsmeow/contact.go: Return device metadata when resolving the account itself  # PR#136
+# PR#136: right that the contact table is a proxy and not a record of provenance, and the
+# alternative it names -- a per-account mapping this connector writes itself -- is issue
+# #137's third option, which is a table, a migration and a fill path rather than a guard on
+# one command.
+# What the proxy costs is a false negative: a mapping this account did learn, for somebody
+# it has no contact row for, is answered with the half the caller already had. That is
+# narrow in practice, because a row lands from a push name on almost any inbound message,
+# from an address-book sync, and from the redacted phone whatsmeow files for LID members of
+# a group. The case the finding names, `contact.check`, is one where the caller asked by
+# number and already holds it.
+# The direction of the error is the point. A false negative loses half an answer; a false
+# positive hands one operator's client a number another operator's account was shown, which
+# is what #137 is about and what this command must not add a lookup for.
+internal/engine/whatsmeow/contact.go: Track encounters independently of contact names  # PR#136
 # PR#133: `hosted` is not another person. It is a device domain -- whatsmeow's own
 # ActualAgent maps `s.whatsapp.net`, `lid`, `hosted` and `hosted.lid` to four domains over
 # the same user -- so `5541988887777@hosted` and `5541988887777@s.whatsapp.net` are the

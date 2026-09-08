@@ -244,3 +244,243 @@ func (s *Session) contactPicture(ctx context.Context, command *protocol.Command)
 	}
 	return json.Marshal(map[string]any{"url": picture.URL})
 }
+
+// targetRequest is the payload `contact.resolve` names a person with.
+type targetRequest struct {
+	Party protocol.Address `json:"party"`
+}
+
+// resolveContact carries out `contact.resolve`: both of WhatsApp's names for one person,
+// plus whatever display names this session has already learned for them.
+//
+// A phone number and a LID are the same person under two namespaces, and which one an
+// event carries depends on the path it arrived on. A client that stored a contact by
+// number and then meets a LID-only party has no way to see they are the same, and this is
+// the command that answers it.
+//
+// Local by construction: whatsmeow keeps the mapping in the device store, so this costs a
+// read rather than a round trip. `contact.info` is the one that asks WhatsApp, and the
+// division is the whole reason the contract has two commands with one payload.
+//
+// Paired is all it asks for. Every other command here wants a connection because it puts
+// something on the wire; this one reads a table that is there whether the socket is up or
+// not, and refusing a client reconciling its contacts during a reconnect would be a
+// refusal this connector does not need to make.
+func (s *Session) resolveContact(ctx context.Context, command *protocol.Command) (json.RawMessage, error) {
+	var req targetRequest
+	if err := json.Unmarshal(command.Payload, &req); err != nil {
+		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
+			"a resolve has to name the party to resolve")
+	}
+	jid, err := personOf(req.Party, "resolve")
+	if err != nil {
+		return nil, err
+	}
+	phone, lid := s.identity()
+	if phone == "" || s.isRevoked() {
+		// Revoked is an account WhatsApp has taken away, on credentials this session is
+		// still holding: the identity is copied out at pairing, and the cleanup that
+		// clears it is a store round trip behind the unlink. Every other command here is
+		// kept out by needing a connection; this one asks for no connection on purpose, so
+		// it has to ask the question the connection was answering.
+		return nil, protocol.NewError(protocol.ErrorNotPaired,
+			"this session has no WhatsApp account to resolve against")
+	}
+
+	// Bounded, and not by the caller's deadline alone. A command may carry none at all,
+	// and this runs on the session's executor: a database call that wedges with the
+	// session's own context behind it holds every later command for this session for as
+	// long as it lasts. The same bound every event handler reads the store under.
+	reading, done := context.WithTimeout(ctx, s.storeLimit)
+	defer done()
+
+	// The mapping read directly rather than through `party`, because a command whose
+	// whole answer is the mapping has to tell a store that did not answer from a pairing
+	// nobody has learned. `party` reports both as an absence, which is right where losing
+	// the mapping costs less than losing the event, and wrong here: a client told the
+	// other namespace does not exist stops asking, and the one told to retry retries.
+	var named protocol.Party
+	naming(&named, jid)
+	if named.Phone == phone || (lid != "" && named.LID == lid) {
+		// The account asking about itself. Both of its names were copied out of the device
+		// at pairing, and the mapping table is a separate write that whatsmeow logs rather
+		// than fails on -- so the account can be the one party the table cannot answer
+		// for, which would be an absurd thing for this command to be unable to resolve.
+		//
+		// The LID half is only as good as what the session was told: a resumed device
+		// learns its LID on the connection rather than through a `PairSuccess`, and
+		// nothing copies it out afterwards, so this can answer with the number alone.
+		// That is issue #138, and it is a missing half rather than a wrong one.
+		if lid != "" {
+			named.LID = lid
+		}
+		named.Phone = phone
+		s.nameFromStore(reading, &named)
+		return json.Marshal(named)
+	}
+	alt, found, err := s.aliases.lookup(reading, s, jid)
+	if err != nil {
+		return nil, s.storeFailure(err, "the address mapping")
+	}
+	if found {
+		// `whatsmeow_lid_map` is keyed by `(lid, pn)` and by nothing else: every account
+		// on this deployment writes into one table, so a mapping in it may have been
+		// learned by a different one. Enriching an event with it is one thing -- the event
+		// is about somebody this account is already talking to -- and answering a question
+		// about an arbitrary address is another, which is a client asking this connector
+		// for a number another operator's account was shown.
+		//
+		// The contact table is keyed by `our_jid`, so it is the one thing here that
+		// answers "has this account met them". A party it has not is answered with the
+		// half the caller already had. Issue #137 is the mapping table itself.
+		met, err := s.hasMet(reading, jid, alt)
+		switch {
+		case err != nil:
+			return nil, s.storeFailure(err, "the contact record")
+		case met:
+			naming(&named, alt)
+		default:
+			s.log.Debug().Str("kind", string(req.Party.Kind)).
+				Msg("withholding a mapping this account has no record of having learned")
+		}
+	}
+	if named.Phone == "" && named.LID == "" {
+		// jidOf built this JID out of an address kind personOf just accepted, so the
+		// party cannot come back empty unless the addressing layer stopped naming one of
+		// the two namespaces it is built on.
+		return nil, protocol.NewError(protocol.ErrorInternal, "the party resolved to no address at all")
+	}
+	s.nameFromStore(reading, &named)
+	return json.Marshal(named)
+}
+
+// personOf is jidOf for the commands that act on somebody rather than on a conversation.
+//
+// A group, a channel or the status feed parses as an address and is not a person: asked
+// to resolve one, this would hand back a party naming a group as though it were somebody,
+// and a client would file a conversation under a contact that does not exist.
+func personOf(address protocol.Address, subject string) (waTypes.JID, error) {
+	switch address.Kind {
+	case protocol.AddressPhone, protocol.AddressLID:
+		if !onlyDigits(address.ID) {
+			// The contract lets an `address` carry any non-empty id -- a group's is not a
+			// number -- while a `party` is digits in both namespaces. A person whose id is
+			// not one would answer with a party the contract refuses, and a client
+			// validating what it reads drops the reply rather than the id inside it.
+			return waTypes.EmptyJID, protocol.NewError(protocol.ErrorInvalidPayload,
+				"a person is named by digits, and this address carries something else")
+		}
+		jid, err := jidOf(address)
+		if err != nil {
+			return waTypes.EmptyJID, err
+		}
+		if jid.IsBot() {
+			// Meta's own assistants answer on the ordinary phone server under a reserved
+			// range. The addressing layer refuses to name one as a party -- a client
+			// handed the number would open a conversation with something that is not a
+			// person -- so this is the caller's payload rather than a failure here.
+			return waTypes.EmptyJID, protocol.NewError(protocol.ErrorInvalidPayload,
+				"that number belongs to a bot, and a bot is not somebody this contract names")
+		}
+		return jid, nil
+	default:
+		return waTypes.EmptyJID, protocol.NewError(protocol.ErrorInvalidPayload,
+			fmt.Sprintf("only a person can be the subject of a %s, and %q is not one", subject, address.Kind))
+	}
+}
+
+// nameFromStore fills in the display names the device already holds for a party.
+//
+// Both namespaces are asked, in the order the party names them, because a push name is
+// learned from whichever address the message carrying it arrived under -- so a party
+// resolved from a LID may have its name filed under the phone, and the other way round.
+//
+// Names are an annotation. A store that will not answer leaves the party as it is rather
+// than failing the command: the addresses are what the caller asked for, and they are
+// already in hand.
+func (s *Session) nameFromStore(ctx context.Context, named *protocol.Party) {
+	client := s.current()
+	if client == nil || client.Store == nil || client.Store.Contacts == nil {
+		return
+	}
+	for _, address := range []protocol.Address{
+		{Kind: protocol.AddressPhone, ID: named.Phone},
+		{Kind: protocol.AddressLID, ID: named.LID},
+	} {
+		if named.PushName != "" && named.VerifiedName != "" {
+			return
+		}
+		if address.ID == "" {
+			continue
+		}
+		jid, err := jidOf(address)
+		if err != nil {
+			continue
+		}
+		contact, err := client.Store.Contacts.GetContact(ctx, jid)
+		if err != nil {
+			s.log.Debug().Err(err).Str("kind", string(address.Kind)).
+				Msg("could not read the stored names for a party")
+			continue
+		}
+		// Field by field, and a row that was found is not the end of the search: the two
+		// namespaces are written by different paths -- an app-state contact sync files one,
+		// a message's push name the other -- so the row for the address that was asked
+		// about can exist and hold neither name.
+		if named.PushName == "" {
+			named.PushName = contact.PushName
+		}
+		if named.VerifiedName == "" {
+			named.VerifiedName = contact.BusinessName
+		}
+	}
+}
+
+// hasMet reports whether this account has a record of either of a party's two addresses.
+//
+// The contact table is keyed by `our_jid`, which makes it the only per-account record in
+// the device store: a row exists once a message, a group listing or an address-book sync
+// has put one there. `whatsmeow_lid_map` has no such key -- it is `(lid, pn)` and nothing
+// else -- so it is shared by every account on the deployment, and a mapping read out of it
+// may be one another operator's account was shown.
+//
+// Either address counts, because the row can be filed under the namespace the caller did
+// not ask about, which is the same asymmetry the name lookup handles.
+// A read that fails is not a party this account has not met: withholding on it would
+// answer the same one-sided party an unknown mapping answers, and a client told the other
+// namespace is unknown stops asking. The error goes back for the same reason the mapping's
+// does.
+func (s *Session) hasMet(ctx context.Context, addresses ...waTypes.JID) (bool, error) {
+	client := s.current()
+	if client == nil || client.Store == nil || client.Store.Contacts == nil {
+		return false, nil
+	}
+	for _, jid := range addresses {
+		if jid.IsEmpty() {
+			continue
+		}
+		contact, err := client.Store.Contacts.GetContact(ctx, jid)
+		if err != nil {
+			return false, err
+		}
+		if contact.Found {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// storeFailure is what a device store that would not answer comes back as. A cancelled or
+// expired context is the caller's deadline rather than a fault here, and the two send a
+// client down different roads: one waits and asks again, the other is a line in this
+// connector's log.
+func (s *Session) storeFailure(err error, subject string) error {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return protocol.NewError(protocol.ErrorTimeout, subject+" did not answer in time")
+	}
+	// Logged before it is degraded. `internal` is documented as meaning this connector's
+	// own logs are where to look, and the wire carries a closed vocabulary rather than a
+	// database's text -- so if the error does not reach the log here, it reaches nothing.
+	s.log.Error().Err(err).Msg("the device store refused a read " + subject + " needed")
+	return protocol.NewError(protocol.ErrorInternal, subject+" could not be read")
+}

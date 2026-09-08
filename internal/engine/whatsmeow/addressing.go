@@ -34,47 +34,104 @@ import (
 // wrong answer for as long as the session ran. A pair nobody has learned yet is looked up
 // again each time, which is the price of never being stale.
 type alias struct {
-	mu   sync.RWMutex
-	seen map[string]waTypes.JID
+	mu sync.RWMutex
+	// seen is what has been learned, and generation is which account learned it. A
+	// lookup that started before the account changed must not write its answer into the
+	// map that replaced it: the store read is not under the lock, so a rebuild can land
+	// in the middle of one.
+	seen       map[string]waTypes.JID
+	generation uint64
 }
 
 func newAlias() *alias { return &alias{seen: make(map[string]waTypes.JID)} }
 
 // of answers the other namespace's JID for one, and whether there is one to have.
+//
+// A store that will not answer is logged and left. The address still goes out with the
+// half the event carried, which is what happened before this existed at all, and the next
+// event for the same party asks again -- on the event path, losing the mapping is worth
+// less than losing the event. A caller that is asking for the mapping itself wants the
+// difference, and lookup is where it is kept.
 func (a *alias) of(ctx context.Context, s *Session, jid waTypes.JID) (waTypes.JID, bool) {
-	if !pairable(jid) {
+	alt, found, err := a.lookup(ctx, s, jid)
+	if err != nil {
+		s.log.Debug().Err(err).Str("jid", jid.String()).
+			Msg("could not read the other namespace for a party")
 		return waTypes.EmptyJID, false
+	}
+	return alt, found
+}
+
+// lookup is of, with the failure kept apart from the absence.
+//
+// The two are not the same answer and a command whose whole result is the mapping cannot
+// treat them as one: "nobody has learned this pairing yet" is a result, and "the store did
+// not answer" is a refusal the caller can retry.
+func (a *alias) lookup(ctx context.Context, s *Session, jid waTypes.JID) (waTypes.JID, bool, error) {
+	if !pairable(jid) {
+		return waTypes.EmptyJID, false, nil
 	}
 	key := jid.ToNonAD().String()
 
 	a.mu.RLock()
 	known, remembered := a.seen[key]
+	learning := a.generation
 	a.mu.RUnlock()
 	if remembered {
-		return known, true
+		return known, true, nil
 	}
 
 	client := s.current()
 	if client == nil || client.Store == nil {
-		return waTypes.EmptyJID, false
+		return waTypes.EmptyJID, false, nil
 	}
 	alt, err := client.Store.GetAltJID(ctx, jid)
 	switch {
 	case err != nil:
-		// Logged and left. The address still goes out with the half the event carried,
-		// which is what happened before this existed at all, and the next event for the
-		// same party asks again.
-		s.log.Debug().Err(err).Str("jid", jid.String()).
-			Msg("could not read the other namespace for a party")
-		return waTypes.EmptyJID, false
+		return waTypes.EmptyJID, false, err
 	case alt.IsEmpty():
-		return waTypes.EmptyJID, false
+		return waTypes.EmptyJID, false, nil
 	}
 
+	a.remember(key, alt, learning)
+	return alt, true, nil
+}
+
+// learning is which account's mapping is being learned right now.
+func (a *alias) learning() uint64 {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.generation
+}
+
+// remember keeps what a lookup found, unless the account changed while it was being read.
+//
+// The store read is not under the lock -- it is a database round trip, and holding the map
+// across one would serialise every path that names a party -- so a rebuild can land in the
+// middle of one. The answer still goes back to the caller that asked for it, because the
+// command was accepted under the account that could see it; what must not happen is the
+// previous account's mapping being written back into a map that was emptied precisely to
+// lose it.
+func (a *alias) remember(key string, alt waTypes.JID, learning uint64) {
 	a.mu.Lock()
-	a.seen[key] = alt
+	if a.generation == learning {
+		a.seen[key] = alt
+	}
 	a.mu.Unlock()
-	return alt, true
+}
+
+// forget empties the mapping this session has learned.
+//
+// The cache mirrors a table in the device store, so it lives as long as that device and
+// not as long as the session: a logout deletes the device, and the account paired after it
+// may be a different one. A pairing between a LID and a number is what one account was
+// shown, not a fact about the world, so answering the next account out of it would hand
+// over a number nobody gave it.
+func (a *alias) forget() {
+	a.mu.Lock()
+	a.seen = make(map[string]waTypes.JID)
+	a.generation++
+	a.mu.Unlock()
 }
 
 // pairable reports whether a JID is one of the two namespaces that name a person. A
