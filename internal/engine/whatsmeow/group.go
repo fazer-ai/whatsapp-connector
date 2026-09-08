@@ -313,6 +313,14 @@ func (s *Session) createGroup(ctx context.Context, command *protocol.Command) (j
 		Name: req.Subject, Participants: asked,
 	})
 	if err != nil {
+		// The context first, because this one call can lose it. `CreateGroup` reads the
+		// LID mapping and a privacy token per participant before it sends anything, and
+		// it wraps a failure there with `%v` rather than `%w` -- so a deadline that
+		// expires mid-lookup arrives as text, `errors.Is` cannot see it, and a command
+		// that ran out of time would be reported as a fault in this connector.
+		if expired := ctx.Err(); expired != nil {
+			return nil, contactFailure(expired, "group creation")
+		}
 		return nil, contactFailure(err, "group creation")
 	}
 	if made == nil {

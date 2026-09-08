@@ -723,3 +723,28 @@ func TestCreatingAGroupTellsAMissingGuestListFromAnEmptyOne(t *testing.T) {
 		})
 	}
 }
+
+// whatsmeow's `CreateGroup` reads a LID mapping and a privacy token per participant before
+// it sends anything, and wraps a failure there with `%v` rather than `%w`. A deadline that
+// expires mid-lookup therefore arrives as text: `errors.Is` cannot see it, and a command
+// that ran out of time would be answered as a fault in this connector.
+func TestCreatingAGroupAnswersTimeoutWhenItRanOutOfTime(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setConnected(true)
+	session.createTheGroup = func(
+		ctx context.Context, _ *wm.Client, _ wm.ReqCreateGroup,
+	) (*waTypes.GroupInfo, error) {
+		<-ctx.Done()
+		// Exactly what whatsmeow answers: the sentinel flattened into a string.
+		return nil, fmt.Errorf("failed to get phone number for participant: %v", ctx.Err()) //nolint:errorlint // the point is the lost sentinel
+	}
+
+	ran, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	_, err := session.Execute(ran, createCommand(t,
+		`{"subject":"Obras","participants":[{"kind":"lid","id":"77777777777777"}]}`))
+	assertCode(t, err, protocol.ErrorTimeout)
+}
