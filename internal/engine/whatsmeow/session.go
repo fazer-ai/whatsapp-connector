@@ -132,6 +132,11 @@ type Session struct {
 	// a test cannot otherwise reach what a failed patch is reported as.
 	sendAppState func(context.Context, *wm.Client, appstate.PatchInfo) error
 
+	// groupInfo reads a group's metadata. A field for the same reason as the queries
+	// below it: it is one IQ, so a test can otherwise reach the payload this connector
+	// refuses and nothing of what it makes of an answer.
+	groupInfo func(context.Context, *wm.Client, waTypes.JID) (*waTypes.GroupInfo, error)
+
 	onWhatsApp     func(context.Context, *wm.Client, []string) ([]waTypes.IsOnWhatsAppResponse, error)
 	profilePicture func(context.Context, *wm.Client, waTypes.JID, *wm.GetProfilePictureParams) (*waTypes.ProfilePictureInfo, error)
 
@@ -456,6 +461,7 @@ func newSession(
 		retrieve:     retrieveOverHTTP,
 		uploadFile:   uploadOverClient,
 		sendAppState: sendAppStateOverClient,
+		groupInfo:    groupInfoOverClient,
 		onWhatsApp: func(ctx context.Context, client *wm.Client, phones []string) ([]waTypes.IsOnWhatsAppResponse, error) {
 			return client.IsOnWhatsApp(ctx, phones) //nolint:wrapcheck // wrapped by its caller
 		},
@@ -1400,6 +1406,8 @@ func (s *Session) Execute(ctx context.Context, command *protocol.Command) (json.
 		return s.contactPicture(ctx, command)
 	case protocol.CommandMessageMarkUnread:
 		return s.markUnread(ctx, command)
+	case protocol.CommandGroupInfo:
+		return s.groupInfoOf(ctx, command)
 	}
 	return nil, engine.ErrNotSupported
 }
