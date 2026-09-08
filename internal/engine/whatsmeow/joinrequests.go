@@ -17,12 +17,14 @@ type joinRequestsRequest struct {
 
 // joinRequest is one row of the answer, `{party, requested_at}`.
 //
-// `requested_at` is left off when WhatsApp did not say when. A request with no date is
-// still a request somebody is waiting on, and a zero timestamp reaches a dashboard as
-// January 1970 -- a date that reads as real and orders wrong against every other row.
+// `requested_at` is null when WhatsApp did not say when. A request with no date is still a
+// request somebody is waiting on, and a zero timestamp reaches a dashboard as January 1970
+// -- a date that reads as real and orders wrong against every other row. Null rather than
+// absent because that is how the rest of this contract writes "there is none": `address`
+// on a contact check, `url` on a profile picture, `code` on a participant row.
 type joinRequest struct {
 	Party       protocol.Party `json:"party"`
-	RequestedAt int64          `json:"requested_at,omitempty"`
+	RequestedAt *int64         `json:"requested_at"`
 }
 
 // listJoinRequests answers who is waiting to join a group.
@@ -67,12 +69,13 @@ func (s *Session) listJoinRequests(ctx context.Context, command *protocol.Comman
 	return json.Marshal(rows)
 }
 
-// askedAt is a request's date in epoch milliseconds, and zero when WhatsApp gave none.
+// askedAt is a request's date in epoch milliseconds, and nil when WhatsApp gave none.
 // `time.Time`'s zero value is year 1, whose UnixMilli is a large negative number that a
 // client would read as a date rather than as an absence.
-func askedAt(when time.Time) int64 {
+func askedAt(when time.Time) *int64 {
 	if when.IsZero() {
-		return 0
+		return nil
 	}
-	return when.UnixMilli()
+	millis := when.UnixMilli()
+	return &millis
 }

@@ -90,8 +90,8 @@ func TestAJoinRequestListingAnswersWhoIsWaiting(t *testing.T) {
 	}
 	// Milliseconds, which is what the contract carries. Seconds reach a dashboard as
 	// January 1970 and order wrong against every other row on the screen.
-	if rows[0].RequestedAt != asked.UnixMilli() {
-		t.Errorf("the request is dated %d, want %d", rows[0].RequestedAt, asked.UnixMilli())
+	if rows[0].RequestedAt == nil || *rows[0].RequestedAt != asked.UnixMilli() {
+		t.Errorf("the request is dated %v, want %d", rows[0].RequestedAt, asked.UnixMilli())
 	}
 }
 
@@ -118,9 +118,9 @@ func TestAJoinRequestListingAnswersAnEmptyListRatherThanNull(t *testing.T) {
 	}
 }
 
-// A request WhatsApp dated as nothing carries no date rather than a made-up one. The zero
-// `time.Time` is year 1, whose UnixMilli is a large negative number a client reads as a
-// date and sorts by.
+// A request WhatsApp dated as nothing carries a null date rather than a made-up one. The
+// zero `time.Time` is year 1, whose UnixMilli is a large negative number a client reads as
+// a date and sorts by.
 func TestAJoinRequestWithNoDateCarriesNone(t *testing.T) {
 	t.Parallel()
 
@@ -142,11 +142,14 @@ func TestAJoinRequestWithNoDateCarriesNone(t *testing.T) {
 	if len(rows) != 1 {
 		t.Fatalf("the answer has %d rows, want the one request that is waiting", len(rows))
 	}
-	if rows[0].RequestedAt != 0 {
-		t.Errorf("a request WhatsApp gave no date for is dated %d, want no date at all", rows[0].RequestedAt)
+	if rows[0].RequestedAt != nil {
+		t.Errorf("a request WhatsApp gave no date for is dated %d, want no date at all", *rows[0].RequestedAt)
 	}
-	if bytes.Contains(result, []byte(`"requested_at"`)) {
-		t.Errorf("a request with no date carried the field anyway: %s", result)
+	// Present and null, not absent: that is how the rest of this contract writes "there
+	// is none", and a client reading the key without checking for it finds nothing rather
+	// than a date from year 1.
+	if !bytes.Contains(result, []byte(`"requested_at":null`)) {
+		t.Errorf("a request with no date answered %s, want a null date", result)
 	}
 }
 
