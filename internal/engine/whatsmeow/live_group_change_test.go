@@ -73,19 +73,28 @@ func TestLiveGroupMessageChange(t *testing.T) {
 	// Leg 2: the counterpart corrects it. The correction is a stanza with an id of its
 	// own, and publishing that one instead of the target leaves a client looking for a
 	// message nobody stored -- which is the failure the direct-chat phase found first.
-	liveEdit(t, counterpart, to, target, "wac group change: corrected")
+	const corrected = "wac group change: corrected"
+	liveEdit(t, counterpart, to, target, corrected)
 	edited := liveAwaitAbout(t, watchingSubject, protocol.EventMessageEdited,
 		"message_id", target, liveGroupChangeWindow)
 	liveCheckTheCorrection(t, edited, target)
+	// `liveCheckTheCorrection` only asks that the new body is not empty, which republishing
+	// the original text also satisfies. The correction is the thing being corrected to, so
+	// it is compared against what the command actually sent.
+	liveCheckTheBody(t, "the correction", string(edited.Payload), corrected)
 	liveCheckAGroupSender(t, "the correction", edited.Payload, to, theCounterpart, mode)
 
 	// Leg 3: the reaction and taking it back, in that order, each awaited before the
 	// next is sent. Waiting for both at once would let one leg's absence be covered by
 	// the other's arrival.
-	putID := liveReact(t, counterpart, to, target, "👍")
+	const reacted = "👍"
+	putID := liveReact(t, counterpart, to, target, reacted)
 	put := liveAwaitAbout(t, watchingSubject, protocol.EventMessageReaction,
 		"target_id", target, liveGroupChangeWindow)
 	liveCheckReactionID(t, "the reaction", put.Payload, putID)
+	// And which emoji, not merely that there was one: `liveCheckTheReactions` tells the
+	// two legs apart by empty versus non-empty, so any wrong emoji reads as the reaction.
+	liveCheckTheEmoji(t, "the reaction", put.Payload, reacted)
 	liveCheckAGroupSender(t, "the reaction", put.Payload, to, theCounterpart, mode)
 
 	takenID := liveReact(t, counterpart, to, target, "")
@@ -97,6 +106,7 @@ func TestLiveGroupMessageChange(t *testing.T) {
 	// nobody, or named the wrong member, would take a reaction off somebody else's
 	// bubble, and asserting only on `put` would let that through.
 	liveCheckAGroupSender(t, "the reaction being taken back", taken.Payload, to, theCounterpart, mode)
+	liveCheckTheEmoji(t, "the reaction being taken back", taken.Payload, "")
 	liveCheckTheReactions(t, []engine.Emission{put, taken}, target)
 
 	// Leg 4: the subject is the group's creator and therefore its admin, and deletes the
@@ -227,6 +237,40 @@ func liveCheckReactionID(t *testing.T, what string, payload json.RawMessage, sen
 	}
 	if body.ID != sent {
 		t.Fatalf("%s arrived under id %q and went out under %q", what, body.ID, sent)
+	}
+}
+
+// liveCheckTheBody compares what a message now reads against what was actually sent.
+func liveCheckTheBody(t *testing.T, what, payload string, want string) {
+	t.Helper()
+
+	var body struct {
+		Content struct {
+			Body string `json:"body"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal([]byte(payload), &body); err != nil {
+		t.Fatalf("unmarshal %s: %v", what, err)
+	}
+	if body.Content.Body != want {
+		t.Fatalf("%s reads %q, and %q was sent", what, body.Content.Body, want)
+	}
+}
+
+// liveCheckTheEmoji compares the emoji on a reaction against the one that went out. The
+// empty string is a real value here and is how a removal is spelled, which is why this
+// takes what it wants rather than asking whether there is one.
+func liveCheckTheEmoji(t *testing.T, what string, payload json.RawMessage, want string) {
+	t.Helper()
+
+	var body struct {
+		Emoji string `json:"emoji"`
+	}
+	if err := json.Unmarshal(payload, &body); err != nil {
+		t.Fatalf("unmarshal %s: %v", what, err)
+	}
+	if body.Emoji != want {
+		t.Fatalf("%s carries emoji %q, and %q went out", what, body.Emoji, want)
 	}
 }
 
