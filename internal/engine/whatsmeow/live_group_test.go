@@ -208,16 +208,19 @@ func liveGroupReaches(t *testing.T, session *Session, group waTypes.JID) {
 	}
 }
 
-// liveGroupMode reads which namespace the group addresses its members by, through the
-// same call the production path uses.
+// liveGroupMode reads which namespace the group addresses its members by, over the socket
+// and deliberately not through `groupModeCached`, which is what the production path uses.
+// Every probe below is built out of this answer, so it has to come from somewhere the code
+// under test cannot also be wrong about: sharing whatsmeow's cache with the production
+// path would have a stale entry decide both sides of the comparison and agree with itself.
 func liveGroupMode(t *testing.T, subject *Session, group waTypes.JID) waTypes.AddressingMode {
 	t.Helper()
 
-	mode, err := subject.groupModeOverSocket(t.Context(), group)
+	info, err := subject.current().GetGroupInfo(t.Context(), group)
 	if err != nil {
 		t.Fatalf("read the group's addressing: %v", err)
 	}
-	return mode
+	return info.AddressingMode
 }
 
 // liveOtherMode is the addressing a group is not on.
@@ -557,4 +560,47 @@ func liveMustSendReadReceipts(t *testing.T, session *Session) {
 		t.Skip("this account does not send read receipts, so a read mark never reaches " +
 			"the author and this phase would measure the privacy setting")
 	}
+}
+
+// TestLiveGroupModeIsAnsweredFromMemory pins the one thing the switch to whatsmeow's
+// cache bought, and it is only observable here: nothing in the connector counts IQs, and
+// the seam a unit test would use replaces the reader being measured.
+//
+// The instrument is time, and it is load-bearing rather than decorative. A metadata IQ is
+// a request to WhatsApp and back, which no network completes in single-digit
+// milliseconds; a map read under a mutex is sub-microsecond. The threshold sits two
+// orders of magnitude below the thing it has to exclude, so a slow machine moves the
+// measurement without moving the verdict, and going back to `GetGroupInfo` fails this by
+// a factor of ten or more rather than by a hair.
+//
+// The first call is not timed. It may be the one that fills the cache, and how long a
+// cold read takes is not what this is about.
+func TestLiveGroupModeIsAnsweredFromMemory(t *testing.T) {
+	subject, counterpart, container := liveBoth(t, MediaOptions{})
+	counterpartJID := liveMustBePaired(t, container, liveCounterpartSID)
+
+	groups := engine.ConnectRequest{Pairing: "resume", Groups: true}
+	liveResumeAsking(t, subject, groups)
+	liveResumeAsking(t, counterpart, groups)
+
+	group := liveGroup(t, subject, counterpartJID)
+
+	if _, err := subject.groupModeCached(t.Context(), group); err != nil {
+		t.Fatalf("first read of the group's addressing: %v", err)
+	}
+
+	started := time.Now()
+	mode, err := subject.groupModeCached(t.Context(), group)
+	took := time.Since(started)
+	if err != nil {
+		t.Fatalf("second read of the group's addressing: %v", err)
+	}
+	if mode == "" {
+		t.Fatalf("the group answered with no addressing at all, so this measured nothing")
+	}
+	if took > 5*time.Millisecond {
+		t.Fatalf("reading %s's addressing a second time took %s, which is a round trip and "+
+			"not a cache read: the mode is being asked for over the socket again", group, took)
+	}
+	t.Logf("the group's addressing came back as %s in %s", mode, took)
 }

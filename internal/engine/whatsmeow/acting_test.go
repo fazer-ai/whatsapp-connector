@@ -508,6 +508,27 @@ func TestAParticipantIsPutInTheGroupsOwnNamespace(t *testing.T) {
 		})
 	}
 
+	// The round trip is paid once per group and not once per action, which is the whole
+	// reason `groupModeCached` exists. Reached with no client at all: an entry already in
+	// the map has to be answered out of the map, and a read that falls through to the
+	// socket dereferences a nil client and fails loudly rather than quietly costing a
+	// round trip nobody measures.
+	t.Run("a group already read is not asked about again", func(t *testing.T) {
+		t.Parallel()
+
+		session := &Session{groupModes: map[waTypes.JID]waTypes.AddressingMode{
+			mustJID(t, group): waTypes.AddressingModeLID,
+		}}
+
+		mode, err := session.groupModeCached(t.Context(), mustJID(t, group))
+		if err != nil {
+			t.Fatalf("groupModeCached: %v", err)
+		}
+		if mode != waTypes.AddressingModeLID {
+			t.Fatalf("the group came back as %q, want %q", mode, waTypes.AddressingModeLID)
+		}
+	})
+
 	// A direct chat's key carries no participant at all, so there is nothing to place and
 	// nothing to look up: a round trip here would be spent on every reaction in every
 	// one-to-one chat.

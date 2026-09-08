@@ -345,6 +345,14 @@ type Session struct {
 	// WhatsApp, and a test cannot otherwise reach either branch of what depends on it.
 	groupMode func(context.Context, waTypes.JID) (waTypes.AddressingMode, error)
 
+	// groupModes remembers what the round trip above answered, per group, for as long as
+	// the session is up. Written under the mutex; never held across the round trip that
+	// fills it, so two callers can ask about the same group at once and the second
+	// overwrites the first with the same answer.
+	//
+	// Bounded by the groups the account is in, which is a number a phone also holds.
+	groupModes map[waTypes.JID]waTypes.AddressingMode
+
 	// sendLimit is the largest file this session will send. Not the blob cap: an
 	// instance with nowhere to keep an inbound file still sends one.
 	sendLimit int64

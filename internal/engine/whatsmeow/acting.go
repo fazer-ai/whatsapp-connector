@@ -288,7 +288,7 @@ func (s *Session) asTheGroupAddresses(
 	}
 	read := s.groupMode
 	if read == nil {
-		read = s.groupModeOverSocket
+		read = s.groupModeCached
 	}
 	info, err := read(ctx, chat)
 	if err != nil {
@@ -341,12 +341,45 @@ func (s *Session) asTheGroupAddresses(
 	return alt, nil
 }
 
-// groupModeOverSocket asks WhatsApp how a group addresses its members.
-func (s *Session) groupModeOverSocket(ctx context.Context, chat waTypes.JID) (waTypes.AddressingMode, error) {
+// groupModeCached asks how a group addresses its members, and asks WhatsApp only the
+// first time it is asked about a group.
+//
+// The cost this saves is one metadata round trip per reaction, per admin revoke and per
+// group read mark, for as long as the session is up. What it costs instead is one per
+// group, on the first of those.
+//
+// Nothing invalidates an entry when a group's addressing changes, and that is a decision
+// rather than an omission. The migration only runs one way, phone numbers to LIDs, so a
+// stale entry names a participant by phone in a group that has moved to LIDs, and a key
+// naming the right member in the other namespace is the case `TestLiveGroupKeyNamespace`
+// measured as harmless. The inverse, which is the one this whole translation exists for,
+// a stale entry cannot produce: it would need a group to move from LIDs to phone numbers.
+//
+// whatsmeow keeps the same value in a cache of its own and accepts the same staleness for
+// the send itself -- `sendGroup` picks the stanza's addressing out of it, and asks once
+// per group too. That cache is not read here: it is reachable only through
+// `DangerousInternals`, whose name is its contract, and its reader answers a miss it
+// cannot file with a nil and no error. This one is ours, and invalidating it later is a
+// line in this file rather than an upstream question.
+func (s *Session) groupModeCached(ctx context.Context, chat waTypes.JID) (waTypes.AddressingMode, error) {
+	s.mu.Lock()
+	mode, known := s.groupModes[chat]
+	s.mu.Unlock()
+	if known {
+		return mode, nil
+	}
+
 	info, err := s.current().GetGroupInfo(ctx, chat)
 	if err != nil {
 		return "", err
 	}
+
+	s.mu.Lock()
+	if s.groupModes == nil {
+		s.groupModes = map[waTypes.JID]waTypes.AddressingMode{}
+	}
+	s.groupModes[chat] = info.AddressingMode
+	s.mu.Unlock()
 	return info.AddressingMode, nil
 }
 
