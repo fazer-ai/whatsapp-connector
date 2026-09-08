@@ -137,6 +137,9 @@ type Session struct {
 	// refuses and nothing of what it makes of an answer.
 	groupInfo func(context.Context, *wm.Client, waTypes.JID) (*waTypes.GroupInfo, error)
 
+	// joinedGroups reads every group this account is in. One IQ, like groupInfo above it.
+	joinedGroups func(context.Context, *wm.Client) ([]*waTypes.GroupInfo, error)
+
 	onWhatsApp func(context.Context, *wm.Client, []string) ([]waTypes.IsOnWhatsAppResponse, error)
 	//nolint:lll // one line per seam reads better than a wrapped signature
 	updateParticipants func(context.Context, *wm.Client, waTypes.JID, []waTypes.JID, wm.ParticipantChange) ([]waTypes.GroupParticipant, error)
@@ -486,6 +489,7 @@ func newSession(
 		uploadFile:   uploadOverClient,
 		sendAppState: sendAppStateOverClient,
 		groupInfo:    groupInfoOverClient,
+		joinedGroups: joinedGroupsOverClient,
 		onWhatsApp: func(ctx context.Context, client *wm.Client, phones []string) ([]waTypes.IsOnWhatsAppResponse, error) {
 			return client.IsOnWhatsApp(ctx, phones) //nolint:wrapcheck // wrapped by its caller
 		},
@@ -1498,6 +1502,8 @@ func (s *Session) Execute(ctx context.Context, command *protocol.Command) (json.
 		return s.listJoinRequests(ctx, command)
 	case protocol.CommandGroupJoinRequestsUpdate:
 		return s.updateJoinRequests(ctx, command)
+	case protocol.CommandGroupList:
+		return s.listGroups(ctx, command)
 	case protocol.CommandGroupInfo:
 		return s.groupInfoOf(ctx, command)
 	case protocol.CommandGroupParticipantsUpdate:

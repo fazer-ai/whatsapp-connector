@@ -102,27 +102,8 @@ func (s *Session) groupInfoOf(ctx context.Context, command *protocol.Command) (j
 
 // describeGroup turns whatsmeow's own view of a group into the contract's.
 func (s *Session) describeGroup(ctx context.Context, info *waTypes.GroupInfo) groupInfo {
-	described := groupInfo{
-		Subject:      info.Name,
-		Description:  info.Topic,
-		Announce:     info.IsAnnounce,
-		Locked:       info.IsLocked,
-		JoinApproval: info.IsJoinApprovalRequired,
-		Size:         info.ParticipantCount,
-		Participants: make([]groupParticipant, 0, len(info.Participants)),
-	}
-	if address, named := addressOf(info.JID); named {
-		described.Group = address
-	}
-	if !info.GroupCreated.IsZero() {
-		described.CreatedAt = info.GroupCreated.UnixMilli()
-	}
-	if owner := s.party(ctx, info.OwnerJID, info.OwnerPN); owner.Phone != "" || owner.LID != "" {
-		described.Owner = &owner
-	}
-	if mode := memberAddModes[info.MemberAddMode]; mode != "" {
-		described.MemberAddMode = mode
-	}
+	described := s.describeGroupItself(ctx, info)
+	described.Participants = make([]groupParticipant, 0, len(info.Participants))
 	for i := range info.Participants {
 		member := &info.Participants[i]
 		// Both namespaces off the participant itself where it has them, and the mapping
@@ -182,7 +163,96 @@ var memberAddModes = map[waTypes.GroupMemberAddMode]string{
 	waTypes.GroupMemberAddModeAllMember: "all_member_add",
 }
 
+// joinedGroupsOverClient is the default for the seam.
+func joinedGroupsOverClient(ctx context.Context, client *wm.Client) ([]*waTypes.GroupInfo, error) {
+	return client.GetJoinedGroups(ctx) //nolint:wrapcheck // classified by its caller
+}
+
 // groupInfoOverClient is the default for the seam.
 func groupInfoOverClient(ctx context.Context, client *wm.Client, group waTypes.JID) (*waTypes.GroupInfo, error) {
 	return client.GetGroupInfo(ctx, group) //nolint:wrapcheck // classified by its caller
+}
+
+// describeGroupItself is everything about a group except who is in it.
+//
+// Split out because naming the members is what a listing must not pay for: `party` reads
+// the LID mapping out of the device store for every namespace a participant row does not
+// carry, so describing the roster of every group an account is in is thousands of
+// sequential store reads -- on the one goroutine that owns the session, with every other
+// command for it waiting behind. `group.list` needs none of them and answers `size`, which
+// WhatsApp already counted.
+func (s *Session) describeGroupItself(ctx context.Context, info *waTypes.GroupInfo) groupInfo {
+	described := groupInfo{
+		Subject:      info.Name,
+		Description:  info.Topic,
+		Announce:     info.IsAnnounce,
+		Locked:       info.IsLocked,
+		JoinApproval: info.IsJoinApprovalRequired,
+		Size:         info.ParticipantCount,
+	}
+	if address, named := addressOf(info.JID); named {
+		described.Group = address
+	}
+	if !info.GroupCreated.IsZero() {
+		described.CreatedAt = info.GroupCreated.UnixMilli()
+	}
+	// The owner is one party, not a roster, so it is worth the lookup it may cost.
+	if owner := s.party(ctx, info.OwnerJID, info.OwnerPN); owner.Phone != "" || owner.LID != "" {
+		described.Owner = &owner
+	}
+	if mode := memberAddModes[info.MemberAddMode]; mode != "" {
+		described.MemberAddMode = mode
+	}
+	if described.Size == 0 {
+		// The list WhatsApp sent, which is a count and not a translation: the fallback
+		// holds for a listing as much as for one group.
+		described.Size = len(info.Participants)
+	}
+	return described
+}
+
+// listGroups carries out `group.list`: every group this account is in.
+//
+// Without the rosters, and that is the whole difference between this and asking about each
+// group in turn. An account can be in hundreds of groups of hundreds of people, and a
+// listing that carried every membership would answer with the entire address book of every
+// conversation to say which conversations exist. `size` still says how big each one is,
+// and `group.info` answers the roster for the group a caller actually opens.
+//
+// Absent, not empty: the contract's `participants` is optional and this is the same
+// "not answered" that a partial roster is, which is what keeps a client from reading a
+// listing as the whole of any group's membership and deactivating everybody missing.
+func (s *Session) listGroups(ctx context.Context, _ *protocol.Command) (json.RawMessage, error) {
+	if err := s.readyToSend(); err != nil {
+		return nil, err
+	}
+	joined, err := s.joinedGroups(ctx, s.current())
+	if err != nil {
+		return nil, contactFailure(err, "group listing")
+	}
+
+	// Never nil: an empty list is the answer "this account is in no groups", and a client
+	// reading `null` has to decide which of the two that is.
+	listed := make([]groupInfo, 0, len(joined))
+	for _, info := range joined {
+		described := s.describeGroupItself(ctx, info)
+		if described.Group.ID == "" {
+			// A group WhatsApp named with something this connector cannot turn into an
+			// address. whatsmeow keeps it: `parseGroupNode` answers a struct even when the
+			// node was malformed, and `GetJoinedGroups` logs the parse error and appends
+			// it anyway, so an entry with an empty JID reaches here.
+			//
+			// The whole listing fails rather than losing that one entry. A listing is a
+			// statement about a set -- these are the groups -- and one silently short is
+			// a statement that is false in a way no client can see: an answer of `[]` for
+			// an account in one unreadable group says it is in none, and a client
+			// reconciling against that removes a group it already knows about. The same
+			// reasoning already keeps a partial roster off the wire.
+			s.log.Error().Str("subject", described.Subject).
+				Msg("WhatsApp listed a group with no address this build can read")
+			return nil, protocol.NewError(protocol.ErrorInternal, "the group listing could not be read")
+		}
+		listed = append(listed, described)
+	}
+	return json.Marshal(listed)
 }

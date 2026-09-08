@@ -139,7 +139,6 @@ var (
 		protocol.CommandContactInfo,
 		protocol.CommandContactResolve,
 		protocol.CommandGroupCreate,
-		protocol.CommandGroupList,
 		protocol.CommandGroupPhotoSet,
 		protocol.CommandCallReject,
 	}
@@ -150,7 +149,10 @@ var (
 	// answers cannot be swapped, and the code each one answers with is spelled out here
 	// so that a handler which stops being reached fails as loudly as one that is not
 	// wired up at all. `session.status` is the one command an empty payload is complete
-	// for, so it answers nothing.
+	// for, so it answers nothing. `group.list` takes no payload either, and what it
+	// answers here is what any command that has to reach WhatsApp answers on a session
+	// with no account -- which is the point: the payload was fine, the account is not
+	// there.
 	commandsExecuteCarriesOut = []struct {
 		command     protocol.CommandType
 		onNoPayload protocol.ErrorCode
@@ -171,6 +173,7 @@ var (
 		{protocol.CommandContactCheck, protocol.ErrorInvalidPayload},
 		{protocol.CommandContactProfilePicture, protocol.ErrorInvalidPayload},
 		{protocol.CommandMessageMarkUnread, protocol.ErrorInvalidPayload},
+		{protocol.CommandGroupList, protocol.ErrorNotPaired},
 		{protocol.CommandGroupInfo, protocol.ErrorInvalidPayload},
 		{protocol.CommandGroupParticipantsUpdate, protocol.ErrorInvalidPayload},
 		{protocol.CommandGroupInviteGet, protocol.ErrorInvalidPayload},

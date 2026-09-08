@@ -173,7 +173,7 @@ this connector stands on every `contact.*`, `group.*` and `history.request` row 
 | `contact.profile_picture` | `{ "url": string\|null }` |
 | `contact.info`, `contact.resolve` | `party` |
 | `group.create`, `group.info` | `group_info`. `participants` is absent when the connector cannot account for every one of them -- an anonymous participant it has no address for, or a list shorter than `size` -- because a roster reads as the whole of the group and half of one takes people out of it. Absent means *not answered*, never *empty*: `size` is what says how many there are |
-| `group.list` | array of `group_info` |
+| `group.list` | array of `group_info`, empty when the account is in no groups, and **without `participants`**: an account can be in hundreds of groups of hundreds of people, and a listing that carried every membership would answer with the whole address book of every conversation to say which conversations exist. `size` still says how big each one is, and `group.info` answers the roster for the group a caller opens |
 | `group.invite.get` | `{ "code": string, "url": string\|null }` |
 | `group.participants.update`, `group.join_requests.update` | array of `{ "address": address, "status": "success"\|"failed", "code": error_code\|null }` |
 | `group.join_requests.list` | array of `{ "party": party, "requested_at": timestamp_ms }`, empty when nobody is waiting. `requested_at` is `timestamp_ms\|null`, null when the provider did not date the request: a request with no date is still one somebody is waiting on, and a zero reads as January 1970 and sorts as one |

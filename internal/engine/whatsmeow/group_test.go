@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
@@ -325,4 +326,180 @@ func mustConnection(t *testing.T, session *Session) int64 {
 
 	on, _ := session.connection()
 	return on
+}
+
+func listCommand(t *testing.T) *protocol.Command {
+	t.Helper()
+	return &protocol.Command{
+		V: protocol.Version, ID: "c1", Type: protocol.CommandGroupList,
+		SID: "s1", Payload: json.RawMessage(`{}`),
+	}
+}
+
+func listedGroups(t *testing.T, result json.RawMessage) []groupInfo {
+	t.Helper()
+	var listed []groupInfo
+	if err := json.Unmarshal(result, &listed); err != nil {
+		t.Fatalf("unmarshal the answer: %v", err)
+	}
+	return listed
+}
+
+// The listing says which groups exist and how big each one is, and leaves the rosters to
+// `group.info`. An account can be in hundreds of groups of hundreds of people, and a
+// listing that carried every membership would answer with the whole address book of every
+// conversation to say which conversations exist.
+func TestAGroupListingAnswersTheGroupsWithoutTheirRosters(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setConnected(true)
+	session.joinedGroups = func(context.Context, *wm.Client) ([]*waTypes.GroupInfo, error) {
+		return []*waTypes.GroupInfo{
+			{
+				JID:              waTypes.NewJID("120363041234567890", waTypes.GroupServer),
+				GroupName:        waTypes.GroupName{Name: "Turma da tarde"},
+				ParticipantCount: 2,
+				Participants: []waTypes.GroupParticipant{
+					{JID: waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)},
+					{JID: waTypes.NewJID("5511999990003", waTypes.DefaultUserServer)},
+				},
+			},
+			{
+				JID:       waTypes.NewJID("120363041234567891", waTypes.GroupServer),
+				GroupName: waTypes.GroupName{Name: "Obras"},
+			},
+		}, nil
+	}
+
+	result, err := session.Execute(t.Context(), listCommand(t))
+	if err != nil {
+		t.Fatalf("group.list: %v", err)
+	}
+	listed := listedGroups(t, result)
+	if len(listed) != 2 {
+		t.Fatalf("the answer has %d groups, want the two this account is in", len(listed))
+	}
+	if listed[0].Group.Kind != protocol.AddressGroup || listed[0].Group.ID != "120363041234567890" {
+		t.Errorf("the first group came back as %+v, want the one WhatsApp named", listed[0].Group)
+	}
+	if listed[0].Subject != "Turma da tarde" {
+		t.Errorf("the first group is called %q, want its subject", listed[0].Subject)
+	}
+	// The count survives; the membership does not.
+	if listed[0].Size != 2 {
+		t.Errorf("the first group has size %d, want 2", listed[0].Size)
+	}
+	if len(listed[0].Participants) != 0 {
+		t.Errorf("the listing carries %d participants, want the roster left to group.info",
+			len(listed[0].Participants))
+	}
+	// Absent rather than empty: an empty roster is still a roster to whoever reads one,
+	// and a client that deactivates every membership missing from it would empty the group.
+	if bytes.Contains(result, []byte(`"participants"`)) {
+		t.Errorf("the listing carries a participants field: %s", result)
+	}
+}
+
+// An empty list is the answer "this account is in no groups". `null` would leave a client
+// deciding whether that means the same thing.
+func TestAGroupListingAnswersAnEmptyListRatherThanNull(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setConnected(true)
+	session.joinedGroups = func(context.Context, *wm.Client) ([]*waTypes.GroupInfo, error) {
+		return nil, nil
+	}
+
+	result, err := session.Execute(t.Context(), listCommand(t))
+	if err != nil {
+		t.Fatalf("group.list: %v", err)
+	}
+	if string(result) != "[]" {
+		t.Errorf("an account in no groups answered %s, want an empty list", result)
+	}
+}
+
+// A listing is a statement about a set -- these are the groups -- so one silently short is
+// false in a way no client can see. whatsmeow keeps a malformed group node rather than
+// dropping it: `parseGroupNode` answers a struct even on a parse error and
+// `GetJoinedGroups` appends it anyway, so an entry with no JID does reach this code, and an
+// answer of `[]` for an account in one unreadable group would say it is in none.
+func TestAGroupListingFailsRatherThanAnswerAGroupShort(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setConnected(true)
+	session.joinedGroups = func(context.Context, *wm.Client) ([]*waTypes.GroupInfo, error) {
+		return []*waTypes.GroupInfo{
+			{JID: waTypes.NewJID("120363041234567890", waTypes.GroupServer)},
+			// Parsed far enough to be a struct and not far enough to have an id, which is
+			// what a malformed group node leaves behind.
+			{GroupName: waTypes.GroupName{Name: "Sem endereço"}},
+		}, nil
+	}
+
+	_, err := session.Execute(t.Context(), listCommand(t))
+	assertCode(t, err, protocol.ErrorInternal)
+}
+
+// The listing must not pay for naming members it is about to throw away. `party` reads the
+// device store for every namespace a participant row does not carry, so describing the
+// roster of every group an account is in is thousands of sequential reads on the one
+// goroutine that owns the session, with every other command for it waiting behind.
+//
+// What holds that is structural rather than measured: `describeGroupItself` has no loop
+// over the participants at all, so a listing built on it cannot walk them. This pins the
+// half a test can see -- it describes a group of fifty and names none of them, while still
+// answering how many there are.
+func TestDescribingAGroupItselfNamesNobodyInIt(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	roster := make([]waTypes.GroupParticipant, 0, 50)
+	for i := range 50 {
+		roster = append(roster, waTypes.GroupParticipant{
+			JID: waTypes.NewJID(fmt.Sprintf("55119999%05d", i), waTypes.DefaultUserServer),
+		})
+	}
+
+	described := session.describeGroupItself(t.Context(), &waTypes.GroupInfo{
+		JID:          waTypes.NewJID("120363041234567890", waTypes.GroupServer),
+		Participants: roster,
+	})
+	if described.Participants != nil {
+		t.Errorf("describing the group itself named %d participants, want none", len(described.Participants))
+	}
+	// The count still comes from the list WhatsApp sent, which is a length and not a
+	// translation: the fallback holds for a listing as much as for one group.
+	if described.Size != len(roster) {
+		t.Errorf("the group is %d big, want %d", described.Size, len(roster))
+	}
+}
+
+func TestAGroupListingNeedsAConnection(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.joinedGroups = func(context.Context, *wm.Client) ([]*waTypes.GroupInfo, error) {
+		t.Error("a disconnected session asked WhatsApp for its groups anyway")
+		return nil, nil
+	}
+
+	_, err := session.Execute(t.Context(), listCommand(t))
+	assertCode(t, err, protocol.ErrorNotConnected)
+}
+
+func TestAGroupListingAnswersWhatsAppsRefusal(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setConnected(true)
+	session.joinedGroups = func(context.Context, *wm.Client) ([]*waTypes.GroupInfo, error) {
+		return nil, &wm.IQError{Code: 429}
+	}
+
+	_, err := session.Execute(t.Context(), listCommand(t))
+	assertCode(t, err, protocol.ErrorRateLimited)
 }
