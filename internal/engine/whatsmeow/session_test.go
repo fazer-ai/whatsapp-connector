@@ -141,10 +141,7 @@ var (
 		protocol.CommandGroupCreate,
 		protocol.CommandGroupList,
 		protocol.CommandGroupLeave,
-		protocol.CommandGroupNameSet,
-		protocol.CommandGroupDescriptionSet,
 		protocol.CommandGroupPhotoSet,
-		protocol.CommandGroupSettingsSet,
 		protocol.CommandCallReject,
 	}
 
@@ -180,6 +177,9 @@ var (
 		{protocol.CommandGroupInviteGet, protocol.ErrorInvalidPayload},
 		{protocol.CommandGroupJoinRequestsList, protocol.ErrorInvalidPayload},
 		{protocol.CommandGroupJoinRequestsUpdate, protocol.ErrorInvalidPayload},
+		{protocol.CommandGroupNameSet, protocol.ErrorInvalidPayload},
+		{protocol.CommandGroupDescriptionSet, protocol.ErrorInvalidPayload},
+		{protocol.CommandGroupSettingsSet, protocol.ErrorInvalidPayload},
 	}
 )
 
