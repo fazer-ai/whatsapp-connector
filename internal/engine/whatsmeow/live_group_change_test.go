@@ -241,7 +241,7 @@ func liveCheckReactionID(t *testing.T, what string, payload json.RawMessage, sen
 }
 
 // liveCheckTheBody compares what a message now reads against what was actually sent.
-func liveCheckTheBody(t *testing.T, what, payload string, want string) {
+func liveCheckTheBody(t *testing.T, what, payload, want string) {
 	t.Helper()
 
 	var body struct {
