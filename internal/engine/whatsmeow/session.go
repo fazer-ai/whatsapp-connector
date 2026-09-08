@@ -850,6 +850,28 @@ func (s *Session) setIdentity(phone, lid string) {
 	s.mu.Unlock()
 }
 
+// isSelf reports whether a JID names the account this session is paired with.
+//
+// Namespace and digits both, because the digits alone are not an identity: a LID and a
+// phone number are two numbers drawn from two spaces, and nothing stops one account's LID
+// reading like another account's number. Matching on digits would then take a stranger's
+// name for this account's own.
+func (s *Session) isSelf(jid waTypes.JID) bool {
+	address, named := addressOf(jid)
+	if !named {
+		return false
+	}
+	phone, lid := s.identity()
+	switch address.Kind {
+	case protocol.AddressPhone:
+		return phone != "" && address.ID == phone
+	case protocol.AddressLID:
+		return lid != "" && address.ID == lid
+	default:
+		return false
+	}
+}
+
 // setVerifiedName records the name a business account is verified under.
 func (s *Session) setVerifiedName(businessName string) {
 	s.mu.Lock()
@@ -2657,7 +2679,7 @@ func (s *Session) handle(rawEvent any) bool {
 		// one nothing else here would ever hear about: the copy taken at pairing would
 		// stand for the life of the session, and it is the copy `contact.resolve`
 		// answers with.
-		if phone, lid := s.identity(); event.JID.User == phone || (lid != "" && event.JID.User == lid) {
+		if s.isSelf(event.JID) {
 			s.setVerifiedName(event.NewBusinessName)
 		}
 	case *waEvents.PairError:

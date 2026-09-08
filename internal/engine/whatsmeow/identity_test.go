@@ -170,6 +170,16 @@ func TestASessionTakesItsOwnVerifiedNameChange(t *testing.T) {
 	if _, verified := session.names(); verified != "Loja do Bruno LTDA" {
 		t.Errorf("the session is verified as %q after somebody else was renamed", verified)
 	}
+
+	// The same digits in the other namespace are somebody else: a LID and a phone number
+	// are drawn from two spaces, and nothing stops one reading like the other.
+	session.handle(&waEvents.BusinessName{
+		JID:             waTypes.NewJID("5511999990001", waTypes.HiddenUserServer),
+		NewBusinessName: "Loja Homonima",
+	})
+	if _, verified := session.names(); verified != "Loja do Bruno LTDA" {
+		t.Errorf("the session is verified as %q after a LID that only looks like its number", verified)
+	}
 }
 
 // The verified name arrives with the pairing and nowhere else until a reconnect: the
