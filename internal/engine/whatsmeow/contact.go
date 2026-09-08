@@ -320,7 +320,7 @@ func (s *Session) resolveContact(ctx context.Context, command *protocol.Command)
 	}
 	alt, found, err := s.aliases.lookup(reading, s, jid)
 	if err != nil {
-		return nil, storeFailure(err, "the address mapping")
+		return nil, s.storeFailure(err, "the address mapping")
 	}
 	if found {
 		// `whatsmeow_lid_map` is keyed by `(lid, pn)` and by nothing else: every account
@@ -336,7 +336,7 @@ func (s *Session) resolveContact(ctx context.Context, command *protocol.Command)
 		met, err := s.hasMet(reading, jid, alt)
 		switch {
 		case err != nil:
-			return nil, storeFailure(err, "the contact record")
+			return nil, s.storeFailure(err, "the contact record")
 		case met:
 			naming(&named, alt)
 		default:
@@ -474,9 +474,13 @@ func (s *Session) hasMet(ctx context.Context, addresses ...waTypes.JID) (bool, e
 // expired context is the caller's deadline rather than a fault here, and the two send a
 // client down different roads: one waits and asks again, the other is a line in this
 // connector's log.
-func storeFailure(err error, subject string) error {
+func (s *Session) storeFailure(err error, subject string) error {
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 		return protocol.NewError(protocol.ErrorTimeout, subject+" did not answer in time")
 	}
+	// Logged before it is degraded. `internal` is documented as meaning this connector's
+	// own logs are where to look, and the wire carries a closed vocabulary rather than a
+	// database's text -- so if the error does not reach the log here, it reaches nothing.
+	s.log.Error().Err(err).Msg("the device store refused a read " + subject + " needed")
 	return protocol.NewError(protocol.ErrorInternal, subject+" could not be read")
 }

@@ -677,12 +677,14 @@ func (s *Session) adopt(client *wm.Client) bool {
 	s.lid = lid
 	s.stale = false
 	s.connected = false
-	s.mu.Unlock()
-
-	// A new client is a new device store, and the alias cache mirrors a table in the one
-	// it replaces. Rebuilding happens on a logout, and what is paired after it may be
-	// another account entirely.
+	// Under the same lock as the swap. A new client is a new device store, and the alias
+	// cache mirrors a table in the one it replaces -- rebuilding happens on a logout, and
+	// what is paired after it may be another account entirely. Cleared after the swap was
+	// published, there is an instant where a reader sees the new account and the old
+	// cache. The order is safe: nothing takes the session lock while holding the alias
+	// one, so the two are only ever acquired this way round.
 	s.aliases.forget()
+	s.mu.Unlock()
 	return true
 }
 
@@ -1344,6 +1346,13 @@ func (s *Session) settleLogout() {
 
 	s.refuseLateConnect()
 	s.offline()
+	// Revoked from here, not from the end of the cleanup after it. Forgetting the device
+	// and rebuilding take a store round trip each, and until one of them lands the session
+	// still holds the identity it was paired with: a command that reads local state rather
+	// than the socket -- `contact.resolve` is the one -- would answer for an account
+	// WhatsApp has already taken away. `adopt` clears this again when a fresh client
+	// arrives, which is the only thing that makes the session paired once more.
+	s.markStale()
 }
 
 // dropHangUp takes the guard down and answers with the state as it stood at that moment.

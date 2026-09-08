@@ -167,8 +167,14 @@ func TestAResolveNeedsAnAccountButNotAConnection(t *testing.T) {
 
 	// An account WhatsApp has revoked, on credentials this session is still holding. The
 	// identity is copied at pairing and nothing clears it, so the number is in hand and
-	// means nothing.
-	paired.markStale()
+	// means nothing. Settling the unlink is what says so, and it says it before the
+	// cleanup behind it: forgetting the device and rebuilding are a store round trip
+	// each, and this command reads local state rather than the socket, so it would answer
+	// all the way through them.
+	paired.settleLogout()
+	if !paired.isStale() {
+		t.Fatal("a session whose account was unlinked did not say so until its cleanup finished")
+	}
 	_, err = paired.Execute(t.Context(), resolveCommand(t, `{"party":{"kind":"phone","id":"5511999990001"}}`))
 	assertCode(t, err, protocol.ErrorNotPaired)
 }
