@@ -315,14 +315,25 @@ func (s *Session) asTheGroupAddresses(
 	// outright, against one per action if the entry were dropped on a timer.
 	s.forgetGroupMode(chat)
 	placed, _, err = s.placeInTheGroup(ctx, chat, participant)
+	var unread unreadableGroup
 	switch {
-	case errors.As(err, &unreadableGroup{}):
+	case errors.As(err, &unread):
 		// The re-read did not happen, so there is nothing fresher than the reading that
 		// already said this participant cannot be named -- and that reading is the only
-		// evidence there is. Answered with its refusal rather than sending the
-		// participant as it came: a key naming a member the group has no name for is
-		// accepted by WhatsApp, answered with a timestamp and shown to nobody, and a
-		// silent no-op is worse to a client than a refusal it can see.
+		// evidence there is.
+		//
+		// Why it did not happen decides what the client hears. A connection that is down
+		// or a deadline that has run out is the client's to act on and says nothing about
+		// its payload: told `invalid_payload`, it retires an address that may well be
+		// correct, and the whole reason this re-read exists is that the reading behind
+		// the refusal might be wrong.
+		if operational := operational(unread.cause); operational != nil {
+			return waTypes.EmptyJID, operational
+		}
+		// Anything else, and the stale reading stands. Refused rather than sent as it
+		// came: a key naming a member the group has no name for is accepted by WhatsApp,
+		// answered with a timestamp and shown to nobody, and a client can act on a
+		// refusal and cannot see a silent no-op.
 		return waTypes.EmptyJID, unnamed.refusal()
 	case !errors.As(err, &unnamed):
 		return placed, err
@@ -333,9 +344,29 @@ func (s *Session) asTheGroupAddresses(
 // unreadableGroup is `placeInTheGroup` saying the group itself could not be read, so it
 // learned nothing and is claiming nothing. What the caller does with that depends on
 // whether anything else is known about the participant.
-type unreadableGroup struct{}
+type unreadableGroup struct{ cause error }
 
-func (unreadableGroup) Error() string { return "the group's addressing could not be read" }
+func (e unreadableGroup) Error() string {
+	return fmt.Sprintf("the group's addressing could not be read: %v", e.cause)
+}
+
+func (e unreadableGroup) Unwrap() error { return e.cause }
+
+// operational is the connection or the deadline having gone, told apart from every other
+// reason a read fails because those two are the client's to act on: a send that comes back
+// `not_connected` is retried when the session is up, and one that comes back
+// `invalid_payload` is a payload the client stops sending. Answering the second when the
+// truth is the first retires an address that was correct.
+func operational(err error) error {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+		return protocol.NewError(protocol.ErrorTimeout,
+			"the group's addressing did not arrive before the command's deadline")
+	case errors.Is(err, wm.ErrNotConnected), errors.Is(err, wm.ErrClientIsNil):
+		return protocol.NewError(protocol.ErrorNotConnected, "the session is not connected to WhatsApp")
+	}
+	return nil
+}
 
 // noSuchNaming is `placeInTheGroup` telling its caller that this reading of the group
 // needed the participant translated and the translation did not arrive. Both ways that
@@ -400,7 +431,7 @@ func (s *Session) placeInTheGroup(
 	if err != nil {
 		s.log.Warn().Err(err).Str("chat", chat.String()).
 			Msg("could not read the group's addressing")
-		return participant, remembered, unreadableGroup{}
+		return participant, remembered, unreadableGroup{cause: err}
 	}
 	// Kept as the contract's own kind rather than the server behind it, because it ends
 	// up in a message that crosses the wire, where an address is `{kind, id}` and never a

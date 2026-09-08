@@ -646,6 +646,17 @@ func (s *Session) setConnected(connected bool) {
 	s.dialing = false
 	if connected {
 		s.reconnecting = false
+		// A new socket is a new answer about every group. What was remembered outlives a
+		// disconnection, and so does whatsmeow's own cache of the same groups -- which
+		// nothing clears on connect and which `sendGroup` encrypts to, member list and
+		// all. Membership that changed while the account was offline reaches neither, and
+		// whatsmeow only notices after the server disagrees with the participant hash it
+		// sent under, by which point that message has already gone out to the old list.
+		//
+		// Forgetting here puts the first group action after a reconnect back on
+		// `GetGroupInfo`, which refills both caches. One round trip per group per
+		// connection, and the ones after it still cost nothing.
+		clear(s.groupModes)
 	}
 	s.mu.Unlock()
 }

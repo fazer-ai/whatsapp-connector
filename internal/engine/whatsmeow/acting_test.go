@@ -618,6 +618,31 @@ func TestAParticipantIsPutInTheGroupsOwnNamespace(t *testing.T) {
 		}
 	})
 
+	// A new socket is a new answer about every group. What was remembered outlives a
+	// disconnection, and so does whatsmeow's own cache of the same groups, which nothing
+	// clears on connect and which `sendGroup` encrypts to -- member list included. A
+	// member who joined while the account was offline reaches neither cache, and
+	// whatsmeow only notices after the server disagrees with the participant hash, by
+	// which point the message has gone out to the old list.
+	t.Run("a reconnection forgets what was remembered about every group", func(t *testing.T) {
+		t.Parallel()
+
+		session, _, _ := outboundSession(t)
+		session.groupModes = map[waTypes.JID]waTypes.AddressingMode{
+			mustJID(t, group): waTypes.AddressingModeLID,
+		}
+
+		session.setConnected(true)
+
+		session.mu.Lock()
+		left := len(session.groupModes)
+		session.mu.Unlock()
+		if left != 0 {
+			t.Fatalf("%d group addressings survived a reconnection, so the first action in "+
+				"each goes out to whatever membership the last connection saw", left)
+		}
+	})
+
 	// A direct chat's key carries no participant at all, so there is nothing to place and
 	// nothing to look up: a round trip here would be spent on every reaction in every
 	// one-to-one chat.
@@ -777,6 +802,38 @@ func TestAParticipantIsPutInTheGroupsOwnNamespace(t *testing.T) {
 			t.Fatalf("the group was read %d times, want exactly 2", reads)
 		}
 	})
+
+	// Why the re-read did not happen decides what the client hears. A connection that is
+	// down says nothing about the payload, and the reading behind the refusal is the one
+	// this re-read exists to doubt: `invalid_payload` there retires an address that may
+	// well be correct.
+	for _, tc := range []struct {
+		name  string
+		cause error
+		want  protocol.ErrorCode
+	}{
+		{name: "the socket went down", cause: wm.ErrNotConnected, want: protocol.ErrorNotConnected},
+		{name: "the command ran out of time", cause: context.DeadlineExceeded, want: protocol.ErrorTimeout},
+		{name: "WhatsApp refused the query", cause: errors.New("406 not acceptable"),
+			want: protocol.ErrorInvalidPayload},
+	} {
+		t.Run("a re-read stopped by "+tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			session, _, _ := outboundSession(t)
+			reads := 0
+			session.groupMode = func(context.Context, waTypes.JID) (waTypes.AddressingMode, bool, error) {
+				reads++
+				if reads == 1 {
+					return waTypes.AddressingModePN, true, nil
+				}
+				return "", false, tc.cause
+			}
+
+			_, err := session.asTheGroupAddresses(t.Context(), mustJID(t, group), mustJID(t, lid))
+			assertCode(t, err, tc.want)
+		})
+	}
 
 	// The other half of it: the group really is phone-addressed, the store really is
 	// down, and re-reading changes nothing. Answered as this connector breaking and not
