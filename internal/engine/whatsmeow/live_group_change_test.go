@@ -26,9 +26,10 @@ import (
 	"testing"
 	"time"
 
+	waTypes "go.mau.fi/whatsmeow/types"
+
 	"github.com/fazer-ai/whatsapp-connector/internal/engine"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
-	waTypes "go.mau.fi/whatsmeow/types"
 )
 
 // liveGroupChangeWindow is how long each leg gets. Generous next to the seconds a group
@@ -89,6 +90,11 @@ func TestLiveGroupMessageChange(t *testing.T) {
 	liveReact(t, counterpart, to, target, "")
 	taken := liveAwaitAbout(t, watchingSubject, protocol.EventMessageReaction,
 		"target_id", target, liveGroupChangeWindow)
+	// Checked on the removal as much as on the reaction. They are two events on the wire
+	// and nothing makes the second inherit the first's sender: a removal that named
+	// nobody, or named the wrong member, would take a reaction off somebody else's
+	// bubble, and asserting only on `put` would let that through.
+	liveCheckAGroupSender(t, "the reaction being taken back", taken.Payload, theCounterpart, mode)
 	liveCheckTheReactions(t, []engine.Emission{put, taken}, target)
 
 	// Leg 4: the subject is the group's creator and therefore its admin, and deletes the
