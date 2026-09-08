@@ -503,3 +503,193 @@ func TestAGroupListingAnswersWhatsAppsRefusal(t *testing.T) {
 	_, err := session.Execute(t.Context(), listCommand(t))
 	assertCode(t, err, protocol.ErrorRateLimited)
 }
+
+func createCommand(t *testing.T, payload string) *protocol.Command {
+	t.Helper()
+	return &protocol.Command{
+		V: protocol.Version, ID: "c1", Type: protocol.CommandGroupCreate,
+		SID: "s1", Payload: json.RawMessage(payload),
+	}
+}
+
+func TestCreatingAGroupRefusesAPayloadItCannotCarryOut(t *testing.T) {
+	t.Parallel()
+
+	for _, refused := range []struct {
+		name    string
+		payload string
+	}{
+		{name: "no payload at all", payload: `{}`},
+		{name: "no subject", payload: `{"participants":[{"kind":"phone","id":"5511999990002"}]}`},
+		// WhatsApp has no nameless group and answers the empty string by refusing the IQ.
+		{name: "a name of nothing", payload: `{"subject":"","participants":[]}`},
+		// A group cannot hold a group, and sending one anyway has WhatsApp refuse the
+		// whole request, which loses the participants that were named correctly.
+		{
+			name:    "a group as a participant",
+			payload: `{"subject":"Obras","participants":[{"kind":"group","id":"120363000000000002"}]}`,
+		},
+		{
+			name:    "a participant with no id",
+			payload: `{"subject":"Obras","participants":[{"kind":"phone","id":""}]}`,
+		},
+	} {
+		t.Run(refused.name, func(t *testing.T) {
+			t.Parallel()
+			session, _ := newTestSession(t, "5511999990001")
+			session.setConnected(true)
+			session.createTheGroup = func(
+				context.Context, *wm.Client, wm.ReqCreateGroup,
+			) (*waTypes.GroupInfo, error) {
+				t.Error("a payload that names no group to create made one anyway")
+				return nil, nil
+			}
+
+			_, err := session.Execute(t.Context(), createCommand(t, refused.payload))
+			assertCode(t, err, protocol.ErrorInvalidPayload)
+		})
+	}
+}
+
+func TestCreatingAGroupSendsTheSubjectAndTheParticipants(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setConnected(true)
+	session.createTheGroup = func(
+		_ context.Context, _ *wm.Client, req wm.ReqCreateGroup,
+	) (*waTypes.GroupInfo, error) {
+		if req.Name != "Obras" {
+			t.Errorf("the group was called %q, want the subject that was asked", req.Name)
+		}
+		if len(req.Participants) != 2 ||
+			req.Participants[0].User != "5511999990002" || req.Participants[1].User != "77777777777777" {
+			t.Errorf("whatsmeow was given %v, want the two participants that were asked", req.Participants)
+		}
+		if req.Participants[1].Server != waTypes.HiddenUserServer {
+			t.Errorf("the LID was sent as %s, want it on the LID server", req.Participants[1])
+		}
+		return &waTypes.GroupInfo{
+			JID:       waTypes.NewJID("120363041234567890", waTypes.GroupServer),
+			GroupName: waTypes.GroupName{Name: "Obras"},
+		}, nil
+	}
+
+	result, err := session.Execute(t.Context(), createCommand(t,
+		`{"subject":"Obras","participants":[{"kind":"phone","id":"5511999990002"},{"kind":"lid","id":"77777777777777"}]}`))
+	if err != nil {
+		t.Fatalf("group.create: %v", err)
+	}
+	var described groupInfo
+	if err := json.Unmarshal(result, &described); err != nil {
+		t.Fatalf("unmarshal the answer: %v", err)
+	}
+	if described.Group.ID != "120363041234567890" || described.Subject != "Obras" {
+		t.Errorf("the answer describes %+v, want the group that was made", described)
+	}
+}
+
+// A group with nobody else in it is a group: WhatsApp adds this account itself, and an
+// operator opening a group to fill in later is a real thing to do.
+func TestCreatingAGroupTakesAnEmptyGuestList(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setConnected(true)
+	asked := false
+	session.createTheGroup = func(
+		_ context.Context, _ *wm.Client, req wm.ReqCreateGroup,
+	) (*waTypes.GroupInfo, error) {
+		asked = true
+		if len(req.Participants) != 0 {
+			t.Errorf("whatsmeow was given %v, want nobody", req.Participants)
+		}
+		return &waTypes.GroupInfo{JID: waTypes.NewJID("120363041234567890", waTypes.GroupServer)}, nil
+	}
+
+	if _, err := session.Execute(t.Context(),
+		createCommand(t, `{"subject":"Obras","participants":[]}`)); err != nil {
+		t.Fatalf("group.create: %v", err)
+	}
+	if !asked {
+		t.Error("a group with nobody in it was refused rather than created")
+	}
+}
+
+// The one thing only a new group's roster has: WhatsApp reports per participant whether it
+// could add them, and somebody it refused is not in the group. A caller reading those rows
+// as members would show people a conversation they were never added to.
+func TestCreatingAGroupLeavesOutTheParticipantsWhatsAppRefused(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setConnected(true)
+	session.createTheGroup = func(
+		context.Context, *wm.Client, wm.ReqCreateGroup,
+	) (*waTypes.GroupInfo, error) {
+		return &waTypes.GroupInfo{
+			JID:              waTypes.NewJID("120363041234567890", waTypes.GroupServer),
+			ParticipantCount: 3,
+			Participants: []waTypes.GroupParticipant{
+				{JID: waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)},
+				{JID: waTypes.NewJID("5511999990003", waTypes.DefaultUserServer), Error: 403},
+				{JID: waTypes.NewJID("5511999990004", waTypes.DefaultUserServer)},
+			},
+		}, nil
+	}
+
+	result, err := session.Execute(t.Context(), createCommand(t,
+		`{"subject":"Obras","participants":[{"kind":"phone","id":"5511999990002"},`+
+			`{"kind":"phone","id":"5511999990003"},{"kind":"phone","id":"5511999990004"}]}`))
+	if err != nil {
+		t.Fatalf("group.create: %v", err)
+	}
+	var described groupInfo
+	if err := json.Unmarshal(result, &described); err != nil {
+		t.Fatalf("unmarshal the answer: %v", err)
+	}
+	if len(described.Participants) != 2 {
+		t.Fatalf("the answer has %d participants, want the two WhatsApp added", len(described.Participants))
+	}
+	for _, member := range described.Participants {
+		if member.Party.Phone == "5511999990003" {
+			t.Error("somebody WhatsApp refused to add came back as a member of the group")
+		}
+	}
+	// The count goes with them: a size of three over a roster of two reads as a roster
+	// that could not be accounted for, and the roster would be dropped entirely.
+	if described.Size != 2 {
+		t.Errorf("the group has size %d, want the two who are in it", described.Size)
+	}
+}
+
+func TestCreatingAGroupNeedsAConnection(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.createTheGroup = func(
+		context.Context, *wm.Client, wm.ReqCreateGroup,
+	) (*waTypes.GroupInfo, error) {
+		t.Error("a disconnected session created a group anyway")
+		return nil, nil
+	}
+
+	_, err := session.Execute(t.Context(), createCommand(t, `{"subject":"Obras","participants":[]}`))
+	assertCode(t, err, protocol.ErrorNotConnected)
+}
+
+func TestCreatingAGroupAnswersWhatsAppsRefusal(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setConnected(true)
+	session.createTheGroup = func(
+		context.Context, *wm.Client, wm.ReqCreateGroup,
+	) (*waTypes.GroupInfo, error) {
+		// The name is longer than WhatsApp allows, which it answers with 406.
+		return nil, &wm.IQError{Code: 406, Text: "not-acceptable"}
+	}
+
+	_, err := session.Execute(t.Context(), createCommand(t, `{"subject":"Obras","participants":[]}`))
+	assertCode(t, err, protocol.ErrorWaError)
+}

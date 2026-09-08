@@ -3,6 +3,7 @@ package whatsmeow
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 
 	wm "go.mau.fi/whatsmeow"
 	waTypes "go.mau.fi/whatsmeow/types"
@@ -255,4 +256,86 @@ func (s *Session) listGroups(ctx context.Context, _ *protocol.Command) (json.Raw
 		listed = append(listed, described)
 	}
 	return json.Marshal(listed)
+}
+
+// createRequest is `group.create`.
+type createRequest struct {
+	Subject      string             `json:"subject"`
+	Participants []protocol.Address `json:"participants"`
+}
+
+// createGroup carries out `group.create` and answers the group it made.
+//
+// The answer is a `group_info` like any other, with one difference that only a new group
+// has: WhatsApp reports per participant whether it could add them, and somebody it refused
+// is not in the group. Those rows are left out of the roster and out of `size`, because a
+// caller reading them as members would show people a conversation they were never added
+// to -- and the refusal is the ordinary case here, not the exception: a privacy setting
+// that forbids being added to groups is exactly what a fresh group runs into.
+func (s *Session) createGroup(ctx context.Context, command *protocol.Command) (json.RawMessage, error) {
+	var req createRequest
+	if err := json.Unmarshal(command.Payload, &req); err != nil {
+		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
+			"creating a group has to say what to call it and who to put in it")
+	}
+	if req.Subject == "" {
+		return nil, protocol.NewError(protocol.ErrorInvalidPayload, "a group cannot be called nothing")
+	}
+	asked := make([]waTypes.JID, len(req.Participants))
+	for i, party := range req.Participants {
+		switch party.Kind {
+		case protocol.AddressPhone, protocol.AddressLID:
+		default:
+			return nil, protocol.NewError(protocol.ErrorInvalidPayload,
+				fmt.Sprintf("%q is not somebody who can be in a group", party.Kind))
+		}
+		var err error
+		if asked[i], err = jidOf(party); err != nil {
+			return nil, err
+		}
+	}
+	if err := s.readyToSend(); err != nil {
+		return nil, err
+	}
+
+	made, err := s.createTheGroup(ctx, s.current(), wm.ReqCreateGroup{
+		Name: req.Subject, Participants: asked,
+	})
+	if err != nil {
+		return nil, contactFailure(err, "group creation")
+	}
+	if made == nil {
+		// whatsmeow answers an error for a group it could not make, so nothing should
+		// reach here with neither. Reading the fields off it would take the session's
+		// executor down along with every command queued behind it.
+		return nil, protocol.NewError(protocol.ErrorInternal,
+			"the group was created and WhatsApp said nothing about it")
+	}
+	return json.Marshal(s.describeGroup(ctx, withoutRefused(made)))
+}
+
+// withoutRefused drops the participants WhatsApp would not add, and the count with them.
+//
+// `GroupParticipant.Error` is filled in only here: an existing group's roster has nobody
+// in it who is not in it, but a group just created reports the people whose privacy
+// setting, block list or recent departure kept them out. They are on the list WhatsApp
+// answered with, and they are not members.
+func withoutRefused(made *waTypes.GroupInfo) *waTypes.GroupInfo {
+	joined := make([]waTypes.GroupParticipant, 0, len(made.Participants))
+	for i := range made.Participants {
+		if member := &made.Participants[i]; member.Error == 0 {
+			joined = append(joined, *member)
+		}
+	}
+	if len(joined) == len(made.Participants) {
+		return made
+	}
+	// A copy, because the caller's own struct is whatsmeow's and this is the connector's
+	// reading of it.
+	trimmed := *made
+	trimmed.Participants = joined
+	if trimmed.ParticipantCount > len(joined) {
+		trimmed.ParticipantCount = len(joined)
+	}
+	return &trimmed
 }
