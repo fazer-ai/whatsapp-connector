@@ -371,6 +371,14 @@ func operational(err error, subject string) error {
 		return protocol.NewError(protocol.ErrorNotConnected,
 			"the connection went while the "+subject+" was in flight")
 	}
+	// And WhatsApp saying to come back later, which is the client's to act on for the
+	// same reason the two above are: a rate limit passes and a payload a client was told
+	// is wrong never gets sent again.
+	var refused *wm.IQError
+	if errors.As(err, &refused) && (refused.Code == 419 || refused.Code == 429) {
+		return protocol.NewError(protocol.ErrorRateLimited,
+			"WhatsApp is rate limiting this account's "+subject+"s")
+	}
 	return nil
 }
 
@@ -521,18 +529,40 @@ func (s *Session) groupModeCached(
 		return mode, true, nil
 	}
 
+	// Read before the query, compared after it. A reconnection empties this map so the
+	// first group action on the new socket goes back to WhatsApp, and an answer that was
+	// already in flight when that happened would otherwise be written in afterwards --
+	// putting a reading of the old connection back exactly where the emptying had just
+	// taken it from, and taking whatsmeow's stale member list with it.
+	on, _ := s.connection()
+
 	info, err := s.current().GetGroupInfo(ctx, chat)
 	if err != nil {
 		return "", false, err
 	}
 
+	s.rememberGroupMode(chat, info.AddressingMode, on)
+	// Answered either way. The reading is what this connection was told and is the best
+	// there is for the command in hand; only keeping it is conditional.
+	return info.AddressingMode, false, nil
+}
+
+// rememberGroupMode files a reading of a group, unless the connection it was read on is
+// no longer the one the session is on.
+//
+// Its own function so the discarding half can be reached from a test. Everything above it
+// needs a socket, and the race it exists for -- an answer still in flight when a
+// reconnection empties the map -- cannot be arranged against one.
+func (s *Session) rememberGroupMode(chat waTypes.JID, mode waTypes.AddressingMode, on int64) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.transitions.Load() != on {
+		return
+	}
 	if s.groupModes == nil {
 		s.groupModes = map[waTypes.JID]waTypes.AddressingMode{}
 	}
-	s.groupModes[chat] = info.AddressingMode
-	s.mu.Unlock()
-	return info.AddressingMode, false, nil
+	s.groupModes[chat] = mode
 }
 
 // jidOfMaybe is jidOf for a field the contract makes optional, where absent and an

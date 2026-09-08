@@ -643,6 +643,47 @@ func TestAParticipantIsPutInTheGroupsOwnNamespace(t *testing.T) {
 		}
 	})
 
+	// An answer that was already in flight when a reconnection emptied the map is not
+	// written in afterwards. Doing so would put a reading of the old connection back
+	// exactly where the emptying had just taken it from, and take whatsmeow's stale
+	// member list with it -- so the first action on the new socket would go out to the
+	// membership the previous one saw, which is the whole thing the emptying prevents.
+	t.Run("a reading that outlived its connection is not filed", func(t *testing.T) {
+		t.Parallel()
+
+		session, _, _ := outboundSession(t)
+		on, _ := session.connection()
+
+		// The reconnection lands while the read is in flight.
+		session.setConnected(true)
+		session.rememberGroupMode(mustJID(t, group), waTypes.AddressingModeLID, on)
+
+		session.mu.Lock()
+		_, filed := session.groupModes[mustJID(t, group)]
+		session.mu.Unlock()
+		if filed {
+			t.Fatalf("a reading taken on an earlier connection was filed after the reconnection " +
+				"that emptied the map, so the first action on the new socket skips its refresh")
+		}
+	})
+
+	// And the ordinary case still files, or the cache would be one that never holds
+	// anything and every test above it would pass for the wrong reason.
+	t.Run("a reading taken on the current connection is filed", func(t *testing.T) {
+		t.Parallel()
+
+		session, _, _ := outboundSession(t)
+		on, _ := session.connection()
+		session.rememberGroupMode(mustJID(t, group), waTypes.AddressingModeLID, on)
+
+		session.mu.Lock()
+		filed := session.groupModes[mustJID(t, group)]
+		session.mu.Unlock()
+		if filed != waTypes.AddressingModeLID {
+			t.Fatalf("the reading was filed as %q, want %q", filed, waTypes.AddressingModeLID)
+		}
+	})
+
 	// A direct chat's key carries no participant at all, so there is nothing to place and
 	// nothing to look up: a round trip here would be spent on every reaction in every
 	// one-to-one chat.
@@ -820,6 +861,11 @@ func TestAParticipantIsPutInTheGroupsOwnNamespace(t *testing.T) {
 		{name: "WhatsApp never answered the query", cause: wm.ErrIQTimedOut, want: protocol.ErrorTimeout},
 		{name: "the account was logged out", cause: wm.ErrNotLoggedIn, want: protocol.ErrorNotPaired},
 		{name: "the command ran out of time", cause: context.DeadlineExceeded, want: protocol.ErrorTimeout},
+		// A rate limit passes; a payload a client is told is wrong never gets sent again.
+		{name: "WhatsApp is rate limiting the account", cause: wm.ErrIQRateOverLimit,
+			want: protocol.ErrorRateLimited},
+		{name: "the account ran into a resource limit", cause: wm.ErrIQResourceLimit,
+			want: protocol.ErrorRateLimited},
 		{name: "WhatsApp refused the query", cause: errors.New("406 not acceptable"),
 			want: protocol.ErrorInvalidPayload},
 	} {
