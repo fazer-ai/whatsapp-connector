@@ -119,6 +119,22 @@ theirs, and the connector is always upgraded first.
   path runs on a node handler it cannot spend somebody's phone waking up. A producer
   that predates the field leaves it out, and absent reads as false, which is the
   behaviour every client already had.
+- `message.revoked` carries `message_author` where the deletion's key named one, and it
+  is a claim rather than a fact. WhatsApp addresses a message by (id, participant), so
+  any member of a group can send a deletion naming somebody who did not write the
+  message: the phones apply nothing, and a client matching on the id alone marks the
+  bubble deleted while every other member still sees it. Compare the claim against the
+  author of the message you resolved, and drop the deletion when the two disagree. The
+  check is necessary and not sufficient -- WhatsApp also requires the sender to be that
+  author or an admin of the group, and a connector answers neither without keeping every
+  message's author or spending a round trip per deletion -- so it closes the case a
+  member can exploit rather than the whole rule. A key that says the message is the
+  deleter's own names the deleter, whatever participant it also carries, because that is
+  how WhatsApp resolves it. Absent means the key named nobody at all, which is a direct
+  chat: there `sender` and `by` already say who claimed what. A `message.revoked` for a
+  group always carries the field -- a key with neither a participant nor `from_me` names
+  no message, and this connector drops that deletion rather than publishing one no phone
+  applied -- so a client can require it there.
 - An absent field and an explicit `null` mean the same thing to a client, so a field
   that has to distinguish "there is none" from "this producer does not say" carries
   its own flag. `group_info.has_picture` is the one such field today: a `picture_url`

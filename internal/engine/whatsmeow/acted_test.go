@@ -377,6 +377,10 @@ func TestADeletionSaysWhoPerformedIt(t *testing.T) {
 			event.Info.Edit = waTypes.EditAttributeAdminRevoke
 			event.Info.Chat = waTypes.NewJID("120363000000000000", waTypes.GroupServer)
 			event.Info.IsGroup = true
+			// The participant a real one carries: in a group it is half of what names
+			// the message, and a key without it names none.
+			event.Message.GetProtocolMessage().GetKey().Participant =
+				proto.String("5541988887777@" + waTypes.DefaultUserServer)
 		}, "contact"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -401,6 +405,150 @@ func TestADeletionSaysWhoPerformedIt(t *testing.T) {
 				t.Fatalf("the deletion names %v, want the message it deletes, %q", payload["message_id"], subject)
 			}
 		})
+	}
+}
+
+// A deletion's key names the message it deletes by (id, participant), and any member of
+// a group can put anybody in that second field. WhatsApp applies nothing when the name
+// is wrong, and the client is the only side that can tell -- it has the message and
+// knows who wrote it. Publishing the id alone is what left an agent looking at a bubble
+// marked deleted while every phone in the group still showed the message.
+func TestADeletionCarriesTheAuthorItsKeyClaims(t *testing.T) {
+	t.Parallel()
+
+	const author = "5541988887777"
+
+	for _, tc := range []struct {
+		name        string
+		group       bool
+		participant string
+		fromMe      bool
+		want        string
+	}{
+		{name: "the key names who wrote it", group: true, participant: author + "@" + waTypes.DefaultUserServer, want: author},
+		// The legacy spelling, agent and device and all. It is the same person, and
+		// nothing about a formatting difference makes the claim less true -- which is why
+		// the check below counts what ParseJID discards instead of demanding that a JID
+		// come back out spelled the way it went in.
+		{name: "the key names who wrote it, with a device on the address", group: true,
+			participant: author + ".0:12@" + waTypes.DefaultUserServer, want: author},
+		// `from_me` on the key says the message is the sender's own, and WhatsApp
+		// resolves it that way whatever the participant says. Reading the participant
+		// here would publish a claim WhatsApp does not make, and it is the claim that
+		// makes the client's comparison pass for a deletion no phone applied.
+		{name: "the key claims the sender's own message and names somebody else too", group: true,
+			participant: author + "@" + waTypes.DefaultUserServer, fromMe: true, want: "5511999990001"},
+		{name: "the key claims the sender's own message and names nobody", group: true, fromMe: true, want: "5511999990001"},
+		// A direct chat's key names the chat, and there are two parties to be: `sender`
+		// and `by` are the whole answer, and no claim is the honest shape for it.
+		{name: "a direct chat, where the key names nobody", want: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			session, _ := newTestSession(t, "5511999990001")
+			session.setGroups(true)
+			event := revokeEvent(carrier, subject)
+			if tc.group {
+				event.Info.Chat = waTypes.NewJID("120363000000000000", waTypes.GroupServer)
+				event.Info.IsGroup = true
+			}
+			if tc.participant != "" {
+				event.Message.GetProtocolMessage().GetKey().Participant = proto.String(tc.participant)
+			}
+			if tc.fromMe {
+				event.Message.GetProtocolMessage().GetKey().FromMe = proto.Bool(true)
+			}
+
+			emission := publishedBy(t, session, event)
+			if emission.Type != protocol.EventMessageRevoked {
+				t.Fatalf("a deletion was published as %s, want %s", emission.Type, protocol.EventMessageRevoked)
+			}
+			validateAgainstContract(t, "event_message_revoked", emission.Payload)
+
+			payload := decode(t, emission.Payload)
+			claimed, named := payload["message_author"].(map[string]any)
+			switch {
+			case tc.want == "" && named:
+				t.Fatalf("the deletion says %v wrote the message, want no claim at all", claimed)
+			case tc.want == "":
+			case !named:
+				t.Fatalf("the deletion claims nobody wrote the message, want the author its key names, %q", tc.want)
+			case claimed["phone"] != tc.want:
+				t.Fatalf("the deletion says %v wrote the message, want the author its key names, %q", claimed["phone"], tc.want)
+			}
+		})
+	}
+}
+
+// In a group a key identifies a message by its participant, or by `from_me` where it is
+// the sender's own. One that carries neither names no message: WhatsApp applies nothing
+// and every phone goes on showing it. Publishing without the claim would not do -- absent
+// is what a direct chat sends, and a client cannot tell the two apart -- so an agent would
+// lose a bubble on the strength of a key nobody else honoured.
+func TestAGroupDeletionWhoseKeyNamesNoAuthorIsDropped(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name        string
+		participant string
+	}{
+		{"the key names nobody", ""},
+		{"the key names something that is not an address", "quem escreveu"},
+		{"the key names an address whose number is not one", "not-a-number@" + waTypes.DefaultUserServer},
+		{"the key names a group rather than a person", "120363000000000009@" + waTypes.GroupServer},
+		// ParseJID splits on `@` and keeps the first two pieces, so this reads as the real
+		// participant with the rest thrown away. The key is not one any WhatsApp client
+		// writes, and the claim it would produce names somebody it does not name.
+		{"the key names an address with something after it", "5541988887777@" + waTypes.DefaultUserServer + "@junk"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			session, _ := newTestSession(t, "5511999990001")
+			session.setGroups(true)
+			event := revokeEvent(carrier, subject)
+			event.Info.Chat = waTypes.NewJID("120363000000000000", waTypes.GroupServer)
+			event.Info.IsGroup = true
+			if tc.participant != "" {
+				event.Message.GetProtocolMessage().GetKey().Participant = proto.String(tc.participant)
+			}
+
+			// Acknowledged all the same: WhatsApp resending it would only produce the
+			// same key, and holding it back keeps the phone trying forever.
+			if !publishedNothing(t, session, event) {
+				t.Fatal("a deletion that names no message was left unacknowledged, so WhatsApp will send it again")
+			}
+		})
+	}
+}
+
+// Which of WhatsApp's two identifiers arrives as the sender and which as the alternative
+// depends on the chat's addressing mode. A claim carrying only one of them is one the
+// client may not be able to match -- its copy of the message is keyed by whichever half it
+// learned first -- and a claim it cannot match reads as somebody else having written the
+// message, which drops a deletion that was real.
+func TestADeletionOfTheSendersOwnClaimsBothNamespaces(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setGroups(true)
+	event := revokeEvent(carrier, subject)
+	event.Info.Chat = waTypes.NewJID("120363000000000000", waTypes.GroupServer)
+	event.Info.IsGroup = true
+	event.Info.Sender = waTypes.NewJID("5541988887777", waTypes.DefaultUserServer)
+	event.Info.SenderAlt = waTypes.NewJID("998877665544332", waTypes.HiddenUserServer)
+	event.Message.GetProtocolMessage().GetKey().FromMe = proto.Bool(true)
+
+	emission := publishedBy(t, session, event)
+	validateAgainstContract(t, "event_message_revoked", emission.Payload)
+
+	claimed, named := decode(t, emission.Payload)["message_author"].(map[string]any)
+	if !named {
+		t.Fatal("the deletion claims nobody wrote the message")
+	}
+	if claimed["phone"] != "5541988887777" || claimed["lid"] != "998877665544332" {
+		t.Errorf("the claim names %v, want both namespaces the event carried", claimed)
 	}
 }
 

@@ -3,6 +3,7 @@ package whatsmeow
 import (
 	"context"
 	"errors"
+	"strings"
 
 	wm "go.mau.fi/whatsmeow"
 
@@ -589,13 +590,97 @@ func (s *Session) revokeOf(event *waEvents.Message) change {
 	if event.Info.IsFromMe {
 		by = protocol.RevokedBySelf
 	}
+	author := s.claimedAuthor(event)
+	if author == nil && chat.Kind == protocol.AddressGroup {
+		// In a group a key identifies a message by its participant, or by `from_me` where
+		// it is the sender's own. A key carrying neither -- or naming something that is
+		// not a person -- names no message at all, so WhatsApp applies nothing and every
+		// phone in the group goes on showing the message. Publishing it would take the
+		// bubble off an agent's screen on the strength of a key nobody else honoured, and
+		// omitting only the claim would not help: absent is what a direct chat sends, and
+		// a client cannot tell the two apart. whatsmeow refuses the same key on its own
+		// path, for the same reason.
+		return dropping("dropping a group deletion whose key names no message")
+	}
+
 	return publishing(protocol.EventMessageRevoked, protocol.MessageRevoked{
 		Chat:      chat,
 		Sender:    sender,
 		MessageID: target,
+		Author:    author,
 		By:        by,
 		Timestamp: event.Info.Timestamp.UnixMilli(),
 	})
+}
+
+// claimedAuthor reads the participant off a deletion's key: who the key says wrote the
+// message it deletes. It is claimed and not established -- see protocol.MessageRevoked
+// for why this connector cannot establish it, and why passing the claim on is what makes
+// the client able to.
+//
+// `from_me` on the key wins over the participant, and a key can carry both. It says the
+// message being deleted is the sender's own, and that is how WhatsApp resolves the key:
+// whatsmeow's own getOrigSenderFromKey returns the stanza's sender and never reads the
+// participant when the flag is set. Publishing the participant there would hand a client
+// a claim WhatsApp does not make -- and it is the claim that makes the client's
+// comparison pass, for a deletion no phone applied, which is the whole exploit again.
+//
+// Nil where the key names nobody: a direct chat, where the key names the chat and the two
+// parties are all there is. An unreadable participant is nil for the same reason a mention
+// that will not parse is dropped -- the client keeps the behaviour it had before the field
+// existed, rather than losing the deletion over the annotation on it.
+func (s *Session) claimedAuthor(event *waEvents.Message) *protocol.Party {
+	key := event.Message.GetProtocolMessage().GetKey()
+	var claiming []waTypes.JID
+	if key.GetFromMe() {
+		// Both namespaces, the way every other sender on this path is named. Which of the
+		// two arrives as the sender and which as the alternative depends on the chat's
+		// addressing mode, and a claim named in one namespace is one the client may not
+		// be able to match: its copy of the message is keyed by whichever half it learned
+		// first, and a claim it cannot match reads as a mismatch and drops a deletion
+		// that was real.
+		claiming = []waTypes.JID{event.Info.Sender, event.Info.SenderAlt}
+	} else {
+		named := key.GetParticipant()
+		// Exactly one `@`, because ParseJID splits on it and keeps the first two pieces:
+		// `5541988887777@s.whatsapp.net@junk` parses happily into the real participant's
+		// number, and the claim would then name the person the key was written to point
+		// past. A round trip through String() would catch that as well, and it would also
+		// reject the legacy `5541988887777.0:12@s.whatsapp.net`, which normalises to a
+		// different spelling of the same person -- a deletion dropped over a formatting
+		// difference.
+		if strings.Count(named, "@") != 1 {
+			return nil
+		}
+		parsed, err := waTypes.ParseJID(named)
+		if err != nil {
+			return nil
+		}
+		claiming = []waTypes.JID{parsed}
+	}
+
+	// Its own budget, and only spent when a key named somebody: whereAndWho's is closed
+	// by the time this runs, and a deletion that names nobody must not pay for a lookup
+	// there is nothing to look up.
+	looking, done := s.looking()
+	defer done()
+
+	// Checked, not trusted. The participant is the one field on this event a stranger
+	// writes -- it rides inside the message body rather than on the envelope WhatsApp
+	// fills in, and `ParseJID` takes any user part at all -- while the contract says a
+	// party is digits. A `phone` of "not-a-number" is a frame a strict client rejects
+	// whole, and it would take the deletion down with it.
+	author := s.party(looking, claiming...)
+	if !onlyDigits(author.Phone) {
+		author.Phone = ""
+	}
+	if !onlyDigits(author.LID) {
+		author.LID = ""
+	}
+	if author.Phone == "" && author.LID == "" {
+		return nil
+	}
+	return &author
 }
 
 // whereAndWho is the half of these three events that does not depend on which one it is.
