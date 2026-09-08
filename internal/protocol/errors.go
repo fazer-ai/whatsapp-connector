@@ -51,13 +51,11 @@ const (
 	ErrorMediaTooLarge          ErrorCode = "media_too_large"
 	ErrorMediaUnavailable       ErrorCode = "media_unavailable"
 	ErrorRecipientNotOnWhatsapp ErrorCode = "recipient_not_on_whatsapp"
-	// ErrorGroupParticipantNotAllowed is reserved: the commands that would send it are
-	// not implemented.
-	//
-	// `group.participants.update` is in the catalogue and the engine has no arm for it,
-	// so it is refused with ErrorUnsupported by way of `engine.ErrNotSupported`. When it
-	// is implemented, WhatsApp's refusal will arrive as ErrorWaError unless the reason
-	// is mapped to this on purpose, which is the whole of what this code is for.
+	// ErrorGroupParticipantNotAllowed is one participant of a `group.participants.update`
+	// that WhatsApp would not carry out because of who they are: an add refused on their
+	// privacy setting, answered with an invite to send them instead. It is a row of that
+	// command's answer and never the command's own failure, because the same request
+	// carries the participants it did go through.
 	ErrorGroupParticipantNotAllowed ErrorCode = "group_participant_not_allowed"
 	ErrorWaError                    ErrorCode = "wa_error"
 	ErrorProviderUnavailable        ErrorCode = "provider_unavailable"
