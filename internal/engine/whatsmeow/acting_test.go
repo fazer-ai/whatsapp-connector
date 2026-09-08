@@ -750,6 +750,34 @@ func TestAParticipantIsPutInTheGroupsOwnNamespace(t *testing.T) {
 		}
 	})
 
+	// A re-read that does not happen leaves the stale reading as the only evidence there
+	// is, and that reading said this participant cannot be named. Refused rather than
+	// sent as it came: a key naming a member the group has no name for is accepted by
+	// WhatsApp, answered with a timestamp and shown to nobody, and a client can see a
+	// refusal but not a silent no-op.
+	t.Run("a re-read that fails keeps the refusal it was trying to lift", func(t *testing.T) {
+		t.Parallel()
+
+		session, _, _ := outboundSession(t)
+		reads := 0
+		session.groupMode = func(context.Context, waTypes.JID) (waTypes.AddressingMode, bool, error) {
+			reads++
+			if reads == 1 {
+				return waTypes.AddressingModePN, true, nil
+			}
+			return "", false, errors.New("no route to WhatsApp")
+		}
+
+		_, err := session.asTheGroupAddresses(t.Context(), mustJID(t, group), mustJID(t, lid))
+		if err == nil {
+			t.Fatalf("a participant the only reading of the group could not name was accepted")
+		}
+		assertCode(t, err, protocol.ErrorInvalidPayload)
+		if reads != 2 {
+			t.Fatalf("the group was read %d times, want exactly 2", reads)
+		}
+	})
+
 	// The other half of it: the group really is phone-addressed, the store really is
 	// down, and re-reading changes nothing. Answered as this connector breaking and not
 	// as the client's payload being wrong, because a client told its address is wrong

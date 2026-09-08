@@ -288,7 +288,14 @@ func (s *Session) asTheGroupAddresses(
 	}
 	placed, remembered, err := s.placeInTheGroup(ctx, chat, participant)
 	var unnamed noSuchNaming
-	if !errors.As(err, &unnamed) {
+	switch {
+	case errors.As(err, &unreadableGroup{}):
+		// Nothing was learned about the group, so nothing is claimed about the
+		// participant: it goes as it came, which is what this did before the translation
+		// existed and is no worse. Refusing a reaction because a metadata query had a bad
+		// second would break one that mostly works.
+		return participant, nil
+	case !errors.As(err, &unnamed):
 		return placed, err
 	}
 	// The group was read and its addressing has no name for this participant. Whether
@@ -307,11 +314,28 @@ func (s *Session) asTheGroupAddresses(
 	// re-read, and only the refusal: one round trip on a path that was about to fail
 	// outright, against one per action if the entry were dropped on a timer.
 	s.forgetGroupMode(chat)
-	if placed, _, err = s.placeInTheGroup(ctx, chat, participant); !errors.As(err, &unnamed) {
+	placed, _, err = s.placeInTheGroup(ctx, chat, participant)
+	switch {
+	case errors.As(err, &unreadableGroup{}):
+		// The re-read did not happen, so there is nothing fresher than the reading that
+		// already said this participant cannot be named -- and that reading is the only
+		// evidence there is. Answered with its refusal rather than sending the
+		// participant as it came: a key naming a member the group has no name for is
+		// accepted by WhatsApp, answered with a timestamp and shown to nobody, and a
+		// silent no-op is worse to a client than a refusal it can see.
+		return waTypes.EmptyJID, unnamed.refusal()
+	case !errors.As(err, &unnamed):
 		return placed, err
 	}
 	return waTypes.EmptyJID, unnamed.refusal()
 }
+
+// unreadableGroup is `placeInTheGroup` saying the group itself could not be read, so it
+// learned nothing and is claiming nothing. What the caller does with that depends on
+// whether anything else is known about the participant.
+type unreadableGroup struct{}
+
+func (unreadableGroup) Error() string { return "the group's addressing could not be read" }
 
 // noSuchNaming is `placeInTheGroup` telling its caller that this reading of the group
 // needed the participant translated and the translation did not arrive. Both ways that
@@ -375,8 +399,8 @@ func (s *Session) placeInTheGroup(
 	info, remembered, err := read(ctx, chat)
 	if err != nil {
 		s.log.Warn().Err(err).Str("chat", chat.String()).
-			Msg("could not read the group's addressing, sending the participant as it came")
-		return participant, remembered, nil
+			Msg("could not read the group's addressing")
+		return participant, remembered, unreadableGroup{}
 	}
 	// Kept as the contract's own kind rather than the server behind it, because it ends
 	// up in a message that crosses the wire, where an address is `{kind, id}` and never a
