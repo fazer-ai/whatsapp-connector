@@ -2,6 +2,7 @@ package whatsmeow
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 
@@ -242,6 +243,74 @@ func (s *Session) leaveGroup(ctx context.Context, command *protocol.Command) (js
 	}
 	if err := s.leave(ctx, s.current(), group); err != nil {
 		return nil, contactFailure(err, "group departure")
+	}
+	return nil, nil
+}
+
+// photoRequest is `group.photo.set`.
+//
+// `image` is raw JSON rather than a string or a pointer to one, because the three cases
+// have to be told apart and only raw JSON keeps them: a pointer is nil for an absent field
+// *and* for an explicit null, which are the two this command must not confuse. Null is
+// documented as removing the picture; absent says nothing at all, and carrying that out as
+// a removal deletes a group's photo because a caller forgot a field.
+type photoRequest struct {
+	Group protocol.Address `json:"group"`
+	Image json.RawMessage  `json:"image"`
+}
+
+// setGroupPhoto carries out `group.photo.set`.
+//
+// The bytes travel inside the frame, base64, which is the one place this contract puts
+// media on the wire: `contract/README.md` says media never does, and the picture of a
+// group is the exception the schema spells out. It is a profile picture -- WhatsApp keeps
+// these small -- rather than a message attachment, and there is no `media_ref` for
+// something that was never a message.
+func (s *Session) setGroupPhoto(ctx context.Context, command *protocol.Command) (json.RawMessage, error) {
+	var req photoRequest
+	if err := json.Unmarshal(command.Payload, &req); err != nil {
+		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
+			"a photo change has to name a group and say what to put on it")
+	}
+	group, err := groupToChange(req.Group, "a photo")
+	if err != nil {
+		return nil, err
+	}
+
+	if len(req.Image) == 0 {
+		// Absent is not null. Null is "take the picture off", which is a change somebody
+		// asked for; absent is a payload that never said, and carrying it out as a
+		// removal deletes a group's photo because a caller forgot a field.
+		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
+			"a photo change has to carry an image, or null to remove the one there is")
+	}
+
+	var picture []byte
+	if string(req.Image) != "null" {
+		var encoded string
+		if err := json.Unmarshal(req.Image, &encoded); err != nil {
+			return nil, protocol.NewError(protocol.ErrorInvalidPayload,
+				"an image is base64 text: this is neither that nor a null")
+		}
+		if picture, err = base64.StdEncoding.DecodeString(encoded); err != nil {
+			return nil, protocol.NewError(protocol.ErrorInvalidPayload,
+				"the image is not base64 this connector can read")
+		}
+		if len(picture) == 0 {
+			// An empty string, or base64 that decodes to nothing. Sent on, WhatsApp would
+			// be handed a picture element with no picture in it, which is neither setting
+			// a photo nor removing one.
+			return nil, protocol.NewError(protocol.ErrorInvalidPayload,
+				"the image decodes to nothing: send null to remove the picture")
+		}
+	}
+	if err := s.readyToSend(); err != nil {
+		return nil, err
+	}
+	// nil is what removes it, and an empty string means the same thing here: the caller
+	// said "no image", and there is one way to say that to WhatsApp.
+	if err := s.setPhoto(ctx, s.current(), group, picture); err != nil {
+		return nil, contactFailure(err, "photo change")
 	}
 	return nil, nil
 }

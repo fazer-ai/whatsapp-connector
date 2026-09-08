@@ -138,7 +138,6 @@ var (
 		protocol.CommandHistoryRequest,
 		protocol.CommandContactInfo,
 		protocol.CommandContactResolve,
-		protocol.CommandGroupPhotoSet,
 		protocol.CommandCallReject,
 	}
 
@@ -180,6 +179,7 @@ var (
 		{protocol.CommandGroupJoinRequestsList, protocol.ErrorInvalidPayload},
 		{protocol.CommandGroupJoinRequestsUpdate, protocol.ErrorInvalidPayload},
 		{protocol.CommandGroupLeave, protocol.ErrorInvalidPayload},
+		{protocol.CommandGroupPhotoSet, protocol.ErrorInvalidPayload},
 		{protocol.CommandGroupNameSet, protocol.ErrorInvalidPayload},
 		{protocol.CommandGroupDescriptionSet, protocol.ErrorInvalidPayload},
 		{protocol.CommandGroupSettingsSet, protocol.ErrorInvalidPayload},
