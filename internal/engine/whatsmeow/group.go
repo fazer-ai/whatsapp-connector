@@ -32,10 +32,10 @@ type groupParticipant struct {
 type groupInfo struct {
 	Group         protocol.Address   `json:"group"`
 	Subject       string             `json:"subject,omitempty"`
-	Description   string             `json:"description,omitempty"`
+	Description   string             `json:"description"`
 	Owner         *protocol.Party    `json:"owner,omitempty"`
 	CreatedAt     int64              `json:"created_at,omitempty"`
-	Participants  []groupParticipant `json:"participants"`
+	Participants  []groupParticipant `json:"participants,omitempty"`
 	Size          int                `json:"size"`
 	Announce      bool               `json:"announce"`
 	Locked        bool               `json:"locked"`
@@ -129,6 +129,18 @@ func (s *Session) describeGroup(ctx context.Context, info *waTypes.GroupInfo) gr
 		// connector cannot name is still somebody in the group, and counting only the
 		// nameable ones would report an announcement group as smaller than it is.
 		described.Size = len(info.Participants)
+	}
+	if len(described.Participants) < described.Size {
+		// A roster short of the group is left out rather than sent short. The client
+		// reads any roster it is given as the whole of the group and deactivates every
+		// membership missing from it, so an announcement group with one anonymous
+		// participant would have every member it could not name removed from the
+		// dashboard -- a sync that takes people out of a group they are still in. The
+		// size still says how many there are, and a client that gets no roster leaves
+		// the one it has alone.
+		s.log.Info().Int("named", len(described.Participants)).Int("size", described.Size).
+			Msg("left the roster out of a group description that could not account for every participant")
+		described.Participants = nil
 	}
 	return described
 }

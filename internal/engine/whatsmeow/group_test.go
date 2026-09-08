@@ -1,6 +1,7 @@
 package whatsmeow
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"testing"
@@ -168,18 +169,92 @@ func TestGroupInfoPrefersWhatsAppsOwnCountToTheListItSent(t *testing.T) {
 // A participant nobody can be named by is a row the contract does not allow -- `party`
 // requires one of the two identifiers. An anonymous member of an announcement group is
 // how one arrives.
-func TestGroupInfoLeavesOutAParticipantItCannotName(t *testing.T) {
+// A roster that cannot account for every participant is left out rather than sent short.
+// The client reads any roster it is given as the whole of the group -- `sync_members`
+// deactivates every membership missing from it -- so half a roster takes people out of a
+// group they are still in, and the half it takes out are the ones nothing here could name
+// and nothing there can put back.
+func TestGroupInfoLeavesOutARosterItCannotAccountFor(t *testing.T) {
+	t.Parallel()
+
+	for _, partial := range []struct {
+		name string
+		info *waTypes.GroupInfo
+		size int
+	}{
+		{
+			// An anonymous participant in an announcement group: WhatsApp names them by
+			// an obfuscated display name, which is not an address any client can hold.
+			name: "somebody this connector cannot name",
+			info: &waTypes.GroupInfo{
+				JID: waTypes.NewJID("120363041234567890", waTypes.GroupServer),
+				Participants: []waTypes.GroupParticipant{
+					{JID: waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)},
+					{DisplayName: "somebody"},
+				},
+			},
+			size: 2,
+		},
+		{
+			// WhatsApp's own count is larger than the list it sent, which says the list
+			// is not the whole group whatever this connector does with it.
+			name: "a list shorter than the count WhatsApp reported",
+			info: &waTypes.GroupInfo{
+				JID:              waTypes.NewJID("120363041234567890", waTypes.GroupServer),
+				ParticipantCount: 40,
+				Participants: []waTypes.GroupParticipant{
+					{JID: waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)},
+				},
+			},
+			size: 40,
+		},
+	} {
+		t.Run(partial.name, func(t *testing.T) {
+			t.Parallel()
+			session, _ := newTestSession(t, "5511999990001")
+			session.setConnected(true)
+			session.groupInfo = func(context.Context, *wm.Client, waTypes.JID) (*waTypes.GroupInfo, error) {
+				return partial.info, nil
+			}
+
+			result, err := session.Execute(t.Context(), groupCommand(t, aGroup))
+			if err != nil {
+				t.Fatalf("group.info: %v", err)
+			}
+			var described groupInfo
+			if err := json.Unmarshal(result, &described); err != nil {
+				t.Fatalf("unmarshal the answer: %v", err)
+			}
+			if len(described.Participants) != 0 {
+				t.Errorf("the answer carries %d of %d participants, want no roster at all",
+					len(described.Participants), partial.size)
+			}
+			// The field is absent, not an empty array: an empty roster is still a roster
+			// to whoever reads one, and the count is what says the group is not empty.
+			if bytes.Contains(result, []byte(`"participants"`)) {
+				t.Errorf("a roster that could not be accounted for went out anyway: %s", result)
+			}
+			if described.Size != partial.size {
+				t.Errorf("size is %d, want %d: a participant that could not be named is still in the group",
+					described.Size, partial.size)
+			}
+		})
+	}
+}
+
+// A group that removed its description says so with an empty one. The client leaves an
+// absent field alone on purpose -- `invite_code` and `owner` are not always readable, and
+// treating either absence as a removal would throw away what it legitimately has -- so a
+// description dropped from the reply keeps the deleted text on a dashboard forever.
+func TestGroupInfoAnswersAnEmptyDescriptionRatherThanNone(t *testing.T) {
 	t.Parallel()
 
 	session, _ := newTestSession(t, "5511999990001")
 	session.setConnected(true)
 	session.groupInfo = func(context.Context, *wm.Client, waTypes.JID) (*waTypes.GroupInfo, error) {
 		return &waTypes.GroupInfo{
-			JID: waTypes.NewJID("120363041234567890", waTypes.GroupServer),
-			Participants: []waTypes.GroupParticipant{
-				{JID: waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)},
-				{DisplayName: "somebody"},
-			},
+			JID:        waTypes.NewJID("120363041234567890", waTypes.GroupServer),
+			GroupTopic: waTypes.GroupTopic{TopicDeleted: true},
 		}, nil
 	}
 
@@ -187,23 +262,8 @@ func TestGroupInfoLeavesOutAParticipantItCannotName(t *testing.T) {
 	if err != nil {
 		t.Fatalf("group.info: %v", err)
 	}
-	var described groupInfo
-	if err := json.Unmarshal(result, &described); err != nil {
-		t.Fatalf("unmarshal the answer: %v", err)
-	}
-	if len(described.Participants) != 1 {
-		t.Fatalf("the answer has %d participants, want only the one that can be named", len(described.Participants))
-	}
-	// Left out of the rows and still counted: somebody this connector cannot name is
-	// still somebody in the group, and a size taken from the filtered list reports an
-	// announcement group as smaller than it is.
-	if described.Size != 2 {
-		t.Errorf("size is %d, want 2: the participant that could not be named is still in the group", described.Size)
-	}
-	for _, member := range described.Participants {
-		if member.Party.Phone == "" && member.Party.LID == "" {
-			t.Error("a participant came back with neither a phone nor a lid, which no client can address")
-		}
+	if !bytes.Contains(result, []byte(`"description":""`)) {
+		t.Errorf("a group with no description answered %s, want an empty description", result)
 	}
 }
 

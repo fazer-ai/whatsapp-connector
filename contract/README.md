@@ -173,7 +173,7 @@ this connector stands on every `contact.*`, `group.*` and `history.request` row 
 | `contact.check` | array of `{ "phone": digits, "exists": boolean, "address": address\|null }` |
 | `contact.profile_picture` | `{ "url": string\|null }` |
 | `contact.info`, `contact.resolve` | `party` |
-| `group.create`, `group.info` | `group_info` |
+| `group.create`, `group.info` | `group_info`. `participants` is absent when the connector cannot account for every one of them -- an anonymous participant it has no address for, or a list shorter than `size` -- because a roster reads as the whole of the group and half of one takes people out of it. Absent means *not answered*, never *empty*: `size` is what says how many there are |
 | `group.list` | array of `group_info` |
 | `group.invite.get` | `{ "code": string, "url": string\|null }` |
 | `group.participants.update`, `group.join_requests.update` | array of `{ "address": address, "status": "success"\|"failed", "code": error_code\|null }` |
