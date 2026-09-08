@@ -426,6 +426,12 @@ func TestADeletionCarriesTheAuthorItsKeyClaims(t *testing.T) {
 		want        string
 	}{
 		{name: "the key names who wrote it", group: true, participant: author + "@" + waTypes.DefaultUserServer, want: author},
+		// The legacy spelling, agent and device and all. It is the same person, and
+		// nothing about a formatting difference makes the claim less true -- which is why
+		// the check below counts what ParseJID discards instead of demanding that a JID
+		// come back out spelled the way it went in.
+		{name: "the key names who wrote it, with a device on the address", group: true,
+			participant: author + ".0:12@" + waTypes.DefaultUserServer, want: author},
 		// `from_me` on the key says the message is the sender's own, and WhatsApp
 		// resolves it that way whatever the participant says. Reading the participant
 		// here would publish a claim WhatsApp does not make, and it is the claim that
@@ -491,6 +497,10 @@ func TestAGroupDeletionWhoseKeyNamesNoAuthorIsDropped(t *testing.T) {
 		{"the key names something that is not an address", "quem escreveu"},
 		{"the key names an address whose number is not one", "not-a-number@" + waTypes.DefaultUserServer},
 		{"the key names a group rather than a person", "120363000000000009@" + waTypes.GroupServer},
+		// ParseJID splits on `@` and keeps the first two pieces, so this reads as the real
+		// participant with the rest thrown away. The key is not one any WhatsApp client
+		// writes, and the claim it would produce names somebody it does not name.
+		{"the key names an address with something after it", "5541988887777@" + waTypes.DefaultUserServer + "@junk"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()

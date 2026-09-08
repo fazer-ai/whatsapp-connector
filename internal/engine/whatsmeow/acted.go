@@ -3,6 +3,7 @@ package whatsmeow
 import (
 	"context"
 	"errors"
+	"strings"
 
 	wm "go.mau.fi/whatsmeow"
 
@@ -641,7 +642,14 @@ func (s *Session) claimedAuthor(event *waEvents.Message) *protocol.Party {
 		claiming = []waTypes.JID{event.Info.Sender, event.Info.SenderAlt}
 	} else {
 		named := key.GetParticipant()
-		if named == "" {
+		// Exactly one `@`, because ParseJID splits on it and keeps the first two pieces:
+		// `5541988887777@s.whatsapp.net@junk` parses happily into the real participant's
+		// number, and the claim would then name the person the key was written to point
+		// past. A round trip through String() would catch that as well, and it would also
+		// reject the legacy `5541988887777.0:12@s.whatsapp.net`, which normalises to a
+		// different spelling of the same person -- a deletion dropped over a formatting
+		// difference.
+		if strings.Count(named, "@") != 1 {
 			return nil
 		}
 		parsed, err := waTypes.ParseJID(named)
