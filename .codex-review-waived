@@ -330,3 +330,25 @@ internal/engine/whatsmeow/unread.go: Separate patch acceptance from the follow-u
 # added, with no second source for a caller to check against. The rest belongs on the
 # client, and is filed as fazer-ai/chatwoot#483.
 internal/engine/whatsmeow/participants.go: Make callers handle failed participant rows  # PR#122
+# PR#119: the mechanism is real and the consequence is not. A group that migrates from
+# phone numbers to LIDs while the socket stays up is not noticed until the next
+# reconnection, because nothing in whatsmeow emits an addressing-mode change --
+# `AddressingMode` is on `types.GroupInfo` and on no event type, and whatsmeow's own
+# `updateGroupParticipantCache` carries a TODO asking the same question.
+#
+# What that costs is naming a member by phone in a group already on LIDs, which is the
+# case `TestLiveGroupKeyNamespace` measured against real accounts and found harmless: the
+# key names the right member in the other spelling and the receiving client resolves
+# either, and every group event publishes `phone` and `lid` together, measured
+# independently in #120. The direction the translation exists for a stale entry cannot
+# produce, since it would need a migration from LIDs back to phone numbers.
+#
+# The finding also has the member list going stale with it, and that half does not hold
+# while connected: `parseGroupNotification` calls `updateGroupParticipantCache` on every
+# group-change notification (group.go:1047), so joins and leaves keep `Members` fresh. The
+# stale-membership window is the offline one, which `setConnected` already closes.
+#
+# The only fix available is a TTL, there being no event to listen for, and it would pay a
+# metadata round trip per group per window to bound a staleness whose only measured effect
+# is harmless. Reasoning, cost and correction path in #125.
+internal/engine/whatsmeow/acting.go: Refresh both caches when a group migrates  # PR#119
