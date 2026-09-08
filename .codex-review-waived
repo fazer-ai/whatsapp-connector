@@ -352,3 +352,17 @@ internal/engine/whatsmeow/participants.go: Make callers handle failed participan
 # metadata round trip per group per window to bound a staleness whose only measured effect
 # is harmless. Reasoning, cost and correction path in #125.
 internal/engine/whatsmeow/acting.go: Refresh both caches when a group migrates  # PR#119
+# PR#124: not taken, and the reasoning is that the premise inverts. The rule it cites
+# protects clients that already receive a frame; it cannot protect a client of a command no
+# connector has ever answered. `group.join_requests.list` was refused with `unsupported`
+# until this PR, so nothing has ever decoded a `requested_at` from a native connector and
+# nothing can reject one now -- and the only client there is already treats the date as
+# optional (`join_request_payload` builds the hash with `.compact`). Read the way the
+# finding reads it, *any* implementation of this command would be a breaking change,
+# because v1 promised a shape no build ever produced; a rule that forbids implementing the
+# contract is not the rule. What the finding is right about is that the contract and the
+# build must agree, and they do: `contract/README.md` says `timestamp_ms|null` in this same
+# PR, which is the same "present and null" the rest of the contract already uses for
+# `address`, `url` and `code`. The alternative it proposes -- an integer always -- means
+# inventing a date when there is none, and year 1 renders as a real date and sorts as one.
+internal/engine/whatsmeow/joinrequests.go: Keep nullable timestamps out of protocol v1  # PR#124

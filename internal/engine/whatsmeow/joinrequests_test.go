@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
@@ -195,5 +196,182 @@ func TestAJoinRequestListingNeedsAConnection(t *testing.T) {
 	}
 
 	_, err := session.Execute(t.Context(), joinsCommand(t, aGatedGroup))
+	assertCode(t, err, protocol.ErrorNotConnected)
+}
+
+func decideCommand(t *testing.T, payload string) *protocol.Command {
+	t.Helper()
+	return &protocol.Command{
+		V: protocol.Version, ID: "c1", Type: protocol.CommandGroupJoinRequestsUpdate,
+		SID: "s1", Payload: json.RawMessage(payload),
+	}
+}
+
+const twoWaiting = `{"group":{"kind":"group","id":"120363000000000001"},"participants":[` +
+	`{"kind":"phone","id":"5511999990002"},{"kind":"phone","id":"5511999990003"}],"action":"approve"}`
+
+func TestAJoinRequestUpdateRefusesAPayloadItCannotCarryOut(t *testing.T) {
+	t.Parallel()
+
+	for _, refused := range []struct {
+		name    string
+		payload string
+	}{
+		{name: "no payload at all", payload: `{}`},
+		{name: "nobody to decide about", payload: `{"group":{"kind":"group","id":"120363000000000001"},"participants":[],"action":"approve"}`},
+		{
+			name:    "an action this build does not know",
+			payload: `{"group":{"kind":"group","id":"120363000000000001"},"participants":[{"kind":"phone","id":"5511999990002"}],"action":"maybe"}`,
+		},
+		{
+			name:    "a chat that is not a group",
+			payload: `{"group":{"kind":"phone","id":"5511999990002"},"participants":[{"kind":"phone","id":"5511999990003"}],"action":"approve"}`,
+		},
+		{
+			name:    "a group as somebody waiting",
+			payload: `{"group":{"kind":"group","id":"120363000000000001"},"participants":[{"kind":"group","id":"120363000000000002"}],"action":"approve"}`,
+		},
+	} {
+		t.Run(refused.name, func(t *testing.T) {
+			t.Parallel()
+			session, _ := newTestSession(t, "5511999990001")
+			session.setConnected(true)
+			session.decideJoinRequests = func(
+				context.Context, *wm.Client, waTypes.JID, []waTypes.JID, wm.ParticipantRequestChange,
+			) ([]waTypes.GroupParticipant, error) {
+				t.Error("a payload that decides nothing was sent to WhatsApp anyway")
+				return nil, nil
+			}
+
+			_, err := session.Execute(t.Context(), decideCommand(t, refused.payload))
+			assertCode(t, err, protocol.ErrorInvalidPayload)
+		})
+	}
+}
+
+// An approval carried out as a rejection is the failure this covers: both are accepted,
+// both answer success, and somebody is turned away who was meant to be let in.
+func TestAJoinRequestUpdateCarriesOutTheActionItWasAsked(t *testing.T) {
+	t.Parallel()
+
+	for _, action := range []struct {
+		asked string
+		want  wm.ParticipantRequestChange
+	}{
+		{asked: "approve", want: wm.ParticipantChangeApprove},
+		{asked: "reject", want: wm.ParticipantChangeReject},
+	} {
+		t.Run(action.asked, func(t *testing.T) {
+			t.Parallel()
+			session, _ := newTestSession(t, "5511999990001")
+			session.setConnected(true)
+			session.decideJoinRequests = func(
+				_ context.Context, _ *wm.Client, group waTypes.JID,
+				participants []waTypes.JID, decided wm.ParticipantRequestChange,
+			) ([]waTypes.GroupParticipant, error) {
+				if decided != action.want {
+					t.Errorf("whatsmeow was asked to %q, want %q", decided, action.want)
+				}
+				if group.Server != waTypes.GroupServer || group.User != "120363000000000001" {
+					t.Errorf("the decision was addressed to %s, want the group that was asked", group)
+				}
+				if len(participants) != 1 || participants[0].User != "5511999990002" {
+					t.Errorf("whatsmeow was given %v, want the one request that was decided", participants)
+				}
+				return []waTypes.GroupParticipant{
+					{JID: waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)},
+				}, nil
+			}
+
+			result, err := session.Execute(t.Context(), decideCommand(t,
+				`{"group":{"kind":"group","id":"120363000000000001"},`+
+					`"participants":[{"kind":"phone","id":"5511999990002"}],"action":"`+action.asked+`"}`))
+			if err != nil {
+				t.Fatalf("group.join_requests.update: %v", err)
+			}
+			var rows []participantOutcome
+			if err := json.Unmarshal(result, &rows); err != nil {
+				t.Fatalf("unmarshal the answer: %v", err)
+			}
+			if len(rows) != 1 || rows[0].Status != "success" {
+				t.Fatalf("the answer is %+v, want one successful row", rows)
+			}
+		})
+	}
+}
+
+// Every refusal stays `wa_error`: WhatsApp answers with a number, and none of them has
+// been confirmed to mean anything in particular here. A client branches on the code, so a
+// guess spelled as a contract code sends it somewhere nobody checked.
+func TestAJoinRequestUpdateLeavesEveryRefusalOpaque(t *testing.T) {
+	t.Parallel()
+
+	for _, code := range []int{403, 406, 409, 500} {
+		t.Run(fmt.Sprint(code), func(t *testing.T) {
+			t.Parallel()
+			session, _ := newTestSession(t, "5511999990001")
+			session.setConnected(true)
+			session.decideJoinRequests = func(
+				context.Context, *wm.Client, waTypes.JID, []waTypes.JID, wm.ParticipantRequestChange,
+			) ([]waTypes.GroupParticipant, error) {
+				return []waTypes.GroupParticipant{
+					{JID: waTypes.NewJID("5511999990002", waTypes.DefaultUserServer), Error: code},
+					{JID: waTypes.NewJID("5511999990003", waTypes.DefaultUserServer)},
+				}, nil
+			}
+
+			result, err := session.Execute(t.Context(), decideCommand(t, twoWaiting))
+			if err != nil {
+				t.Fatalf("group.join_requests.update: %v", err)
+			}
+			var rows []participantOutcome
+			if err := json.Unmarshal(result, &rows); err != nil {
+				t.Fatalf("unmarshal the answer: %v", err)
+			}
+			if len(rows) != 2 {
+				t.Fatalf("the answer has %d rows, want one per request decided", len(rows))
+			}
+			if rows[0].Status != "failed" || rows[0].Code == nil || *rows[0].Code != protocol.ErrorWaError {
+				t.Errorf("WhatsApp's %d came back as %+v, want a failed row with wa_error", code, rows[0])
+			}
+			if rows[1].Status != "success" {
+				t.Errorf("the request WhatsApp did decide came back as %q", rows[1].Status)
+			}
+		})
+	}
+}
+
+// A request nothing was carried out of is the command failing. The client drops the
+// request from its own list right after the call and only a raised error stops it, so an
+// `ok` carrying a refusal it does not read loses somebody who is still waiting.
+func TestAJoinRequestUpdateFailsWhenNothingWasDecided(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setConnected(true)
+	session.decideJoinRequests = func(
+		context.Context, *wm.Client, waTypes.JID, []waTypes.JID, wm.ParticipantRequestChange,
+	) ([]waTypes.GroupParticipant, error) {
+		return []waTypes.GroupParticipant{
+			{JID: waTypes.NewJID("5511999990002", waTypes.DefaultUserServer), Error: 403},
+		}, nil
+	}
+
+	_, err := session.Execute(t.Context(), decideCommand(t, twoWaiting))
+	assertCode(t, err, protocol.ErrorWaError)
+}
+
+func TestAJoinRequestUpdateNeedsAConnection(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.decideJoinRequests = func(
+		context.Context, *wm.Client, waTypes.JID, []waTypes.JID, wm.ParticipantRequestChange,
+	) ([]waTypes.GroupParticipant, error) {
+		t.Error("a disconnected session asked WhatsApp to decide a join request anyway")
+		return nil, nil
+	}
+
+	_, err := session.Execute(t.Context(), decideCommand(t, twoWaiting))
 	assertCode(t, err, protocol.ErrorNotConnected)
 }

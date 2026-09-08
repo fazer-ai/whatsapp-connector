@@ -142,6 +142,8 @@ type Session struct {
 	updateParticipants func(context.Context, *wm.Client, waTypes.JID, []waTypes.JID, wm.ParticipantChange) ([]waTypes.GroupParticipant, error)
 	inviteLink         func(context.Context, *wm.Client, waTypes.JID, bool) (string, error)
 	joinRequests       func(context.Context, *wm.Client, waTypes.JID) ([]waTypes.GroupParticipantRequest, error)
+	//nolint:lll // one line per seam reads better than a wrapped signature
+	decideJoinRequests func(context.Context, *wm.Client, waTypes.JID, []waTypes.JID, wm.ParticipantRequestChange) ([]waTypes.GroupParticipant, error)
 	profilePicture     func(context.Context, *wm.Client, waTypes.JID, *wm.GetProfilePictureParams) (*waTypes.ProfilePictureInfo, error)
 
 	// uploadWait bounds how long an outbound media message spends fetching its file and
@@ -493,6 +495,12 @@ func newSession(
 			ctx context.Context, client *wm.Client, group waTypes.JID,
 		) ([]waTypes.GroupParticipantRequest, error) {
 			return client.GetGroupRequestParticipants(ctx, group) //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
+		},
+		decideJoinRequests: func(
+			ctx context.Context, client *wm.Client, group waTypes.JID,
+			participants []waTypes.JID, action wm.ParticipantRequestChange,
+		) ([]waTypes.GroupParticipant, error) {
+			return client.UpdateGroupRequestParticipants(ctx, group, participants, action) //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
 		},
 		profilePicture: func(
 			ctx context.Context, client *wm.Client, party waTypes.JID, params *wm.GetProfilePictureParams,
@@ -1450,6 +1458,8 @@ func (s *Session) Execute(ctx context.Context, command *protocol.Command) (json.
 		return s.groupInviteOf(ctx, command)
 	case protocol.CommandGroupJoinRequestsList:
 		return s.listJoinRequests(ctx, command)
+	case protocol.CommandGroupJoinRequestsUpdate:
+		return s.updateJoinRequests(ctx, command)
 	case protocol.CommandGroupInfo:
 		return s.groupInfoOf(ctx, command)
 	case protocol.CommandGroupParticipantsUpdate:

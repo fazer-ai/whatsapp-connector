@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"time"
 
+	wm "go.mau.fi/whatsmeow"
+	waTypes "go.mau.fi/whatsmeow/types"
+
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 )
 
@@ -78,4 +81,86 @@ func askedAt(when time.Time) *int64 {
 	}
 	millis := when.UnixMilli()
 	return &millis
+}
+
+// joinRequestsUpdate is `group.join_requests.update`: let somebody in, or turn them away.
+type joinRequestsUpdate struct {
+	Group        protocol.Address   `json:"group"`
+	Participants []protocol.Address `json:"participants"`
+	Action       string             `json:"action"`
+}
+
+// joinRequestActions is the contract's enum, mapped onto whatsmeow's. Listing it rather
+// than casting the string keeps a payload from naming an action this build has not seen.
+var joinRequestActions = map[string]wm.ParticipantRequestChange{
+	"approve": wm.ParticipantChangeApprove,
+	"reject":  wm.ParticipantChangeReject,
+}
+
+// updateJoinRequests answers approve or reject for the people waiting on a group.
+//
+// The same rows as `group.participants.update`, built by the same code: WhatsApp answers
+// one IQ with a verdict per person here too, so the command succeeds whenever the request
+// was answered and a caller reads its own participant's fate off the row. A request
+// nothing was carried out of fails as a whole, which is what keeps a client from marking
+// a request handled that WhatsApp refused -- `group_join_requests_controller#handle`
+// drops the request from its own list right after the call, and only a raised error stops
+// it.
+func (s *Session) updateJoinRequests(ctx context.Context, command *protocol.Command) (json.RawMessage, error) {
+	var req joinRequestsUpdate
+	if err := json.Unmarshal(command.Payload, &req); err != nil {
+		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
+			"a join request update has to name a group, who is waiting on it and what to do")
+	}
+	if req.Group.Kind != protocol.AddressGroup {
+		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
+			fmt.Sprintf("%q is not a group: only a group has people waiting to join it", req.Group.Kind))
+	}
+	group, err := jidOf(req.Group)
+	if err != nil {
+		return nil, err
+	}
+	action, known := joinRequestActions[req.Action]
+	if !known {
+		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
+			fmt.Sprintf("%q is not something this connector does to a join request", req.Action))
+	}
+	if len(req.Participants) == 0 {
+		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
+			"a join request update with nobody in it decides nothing")
+	}
+	asked := make([]waTypes.JID, len(req.Participants))
+	for i, party := range req.Participants {
+		switch party.Kind {
+		case protocol.AddressPhone, protocol.AddressLID:
+		default:
+			return nil, protocol.NewError(protocol.ErrorInvalidPayload,
+				fmt.Sprintf("%q is not somebody who can ask to join a group", party.Kind))
+		}
+		if asked[i], err = jidOf(party); err != nil {
+			return nil, err
+		}
+	}
+	if err := s.readyToSend(); err != nil {
+		return nil, err
+	}
+
+	answered, err := s.decideJoinRequests(ctx, s.current(), group, asked, action)
+	if err != nil {
+		return nil, contactFailure(err, "join request update")
+	}
+
+	// Every refusal stays `wa_error`. WhatsApp answers a refused approval with a number
+	// and none of them has been confirmed to mean anything in particular here, unlike the
+	// two pairs `group.participants.update` translates. A client branches on the code, so
+	// a guess spelled as a contract code sends it somewhere nobody checked; the number is
+	// logged, which is where it can be confirmed first.
+	rows, refused := s.verdicts(req.Participants, answered, req.Action, func(int) protocol.ErrorCode {
+		return protocol.ErrorWaError
+	})
+	if refused == len(rows) {
+		return nil, protocol.NewError(refusalAcross(rows),
+			fmt.Sprintf("WhatsApp decided none of the %d join requests", len(rows)))
+	}
+	return json.Marshal(rows)
 }
