@@ -248,16 +248,20 @@ func (s *Session) leaveGroup(ctx context.Context, command *protocol.Command) (js
 	return nil, nil
 }
 
-// photoRequest is `group.photo.set`.
+// photoRequest is `group.photo.set`. A nil image removes the picture, and an absent field
+// is a nil.
 //
-// `image` is raw JSON rather than a string or a pointer to one, because the three cases
-// have to be told apart and only raw JSON keeps them: a pointer is nil for an absent field
-// *and* for an explicit null, which are the two this command must not confuse. Null is
-// documented as removing the picture; absent says nothing at all, and carrying that out as
-// a removal deletes a group's photo because a caller forgot a field.
+// Telling absent from null looks like the careful reading -- a caller who forgot the field
+// would then not lose a group's photo to it -- and the contract closes that door on
+// purpose: an absent field and an explicit null mean the same thing to a reader, and a
+// field that has to distinguish them carries its own flag (`group_info.has_picture` is the
+// one that does). The client that speaks this contract is built on the same rule and drops
+// nils on the way out, so `image: null` is not a payload it can send at all: a connector
+// that insisted on it would answer the only removal a client can express with
+// `invalid_payload`.
 type photoRequest struct {
 	Group protocol.Address `json:"group"`
-	Image json.RawMessage  `json:"image"`
+	Image *string          `json:"image"`
 }
 
 // setGroupPhoto carries out `group.photo.set`.
@@ -278,38 +282,26 @@ func (s *Session) setGroupPhoto(ctx context.Context, command *protocol.Command) 
 		return nil, err
 	}
 
-	if len(req.Image) == 0 {
-		// Absent is not null. Null is "take the picture off", which is a change somebody
-		// asked for; absent is a payload that never said, and carrying it out as a
-		// removal deletes a group's photo because a caller forgot a field.
-		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
-			"a photo change has to carry an image, or null to remove the one there is")
-	}
-
 	var picture []byte
-	if string(req.Image) != "null" {
-		var encoded string
-		if err := json.Unmarshal(req.Image, &encoded); err != nil {
-			return nil, protocol.NewError(protocol.ErrorInvalidPayload,
-				"an image is base64 text: this is neither that nor a null")
-		}
-		if picture, err = base64.StdEncoding.DecodeString(encoded); err != nil {
+	if req.Image != nil {
+		if picture, err = base64.StdEncoding.DecodeString(*req.Image); err != nil {
 			return nil, protocol.NewError(protocol.ErrorInvalidPayload,
 				"the image is not base64 this connector can read")
 		}
 		if len(picture) == 0 {
 			// An empty string, or base64 that decodes to nothing. Sent on, WhatsApp would
 			// be handed a picture element with no picture in it, which is neither setting
-			// a photo nor removing one.
+			// a photo nor removing one. Refused rather than read as a removal, because a
+			// caller that meant to remove had a way to say so and did not use it.
 			return nil, protocol.NewError(protocol.ErrorInvalidPayload,
-				"the image decodes to nothing: send null to remove the picture")
+				"the image decodes to nothing: leave the field out to remove the picture")
 		}
 	}
 	if err := s.readyToSend(); err != nil {
 		return nil, err
 	}
-	// nil is what removes it, and an empty string means the same thing here: the caller
-	// said "no image", and there is one way to say that to WhatsApp.
+	// nil is what removes it: whatsmeow reads a nil avatar as the removal, and that is
+	// the one way to say it to WhatsApp.
 	if err := s.setPhoto(ctx, s.current(), group, picture); err != nil {
 		if errors.Is(err, wm.ErrInvalidImageFormat) {
 			// WhatsApp refusing the bytes themselves. It answers `not-acceptable`, which

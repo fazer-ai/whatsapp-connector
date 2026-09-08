@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 	"testing"
 
 	wm "go.mau.fi/whatsmeow"
@@ -521,10 +520,6 @@ func TestAPhotoChangeRefusesAPayloadItCannotCarryOut(t *testing.T) {
 	}{
 		{name: "no payload at all", payload: `{}`},
 		{name: "a chat that is not a group", payload: `{"group":{"kind":"phone","id":"5511999990002"},"image":null}`},
-		// Absent is not null. Null is "take the picture off", which somebody asked for;
-		// absent is a payload that never said, and removing on it deletes a group's photo
-		// because a caller forgot a field.
-
 		{name: "an image that is not base64", payload: `{"group":{"kind":"group","id":"1"},"image":"not base64!!"}`},
 		{name: "base64 that decodes to nothing", payload: `{"group":{"kind":"group","id":"1"},"image":""}`},
 		{name: "an image that is not text at all", payload: `{"group":{"kind":"group","id":"1"},"image":42}`},
@@ -543,23 +538,29 @@ func TestAPhotoChangeRefusesAPayloadItCannotCarryOut(t *testing.T) {
 	}
 }
 
-// Absent is not null, and the two are one keystroke apart in a client. Null is "take the
-// picture off"; absent is a payload that never said, and carrying that out as a removal
-// deletes a group's photo because a caller forgot a field. The refusal has to say which of
-// the two it is, or the client cannot tell a bug in its payload from a rejected image.
-func TestAPhotoChangeSaysAMissingImageIsNotARemoval(t *testing.T) {
+// Refusing a payload with no `image` reads as the careful thing to do, and it would make
+// the removal unreachable: the contract's own rule is that an absent field and a null are
+// the same to a reader, and the client that speaks it drops nils before it writes a frame,
+// so `{"group": ...}` is the only removal it can send.
+func TestAPhotoChangeWithNoImageAtAllRemovesThePicture(t *testing.T) {
 	t.Parallel()
 
 	session := settableSession(t)
-	session.setPhoto = func(context.Context, *wm.Client, waTypes.JID, []byte) error {
-		t.Error("a payload with no image field removed the group's photo")
+	removed := false
+	session.setPhoto = func(_ context.Context, _ *wm.Client, _ waTypes.JID, picture []byte) error {
+		removed = true
+		if picture != nil {
+			t.Errorf("WhatsApp was given %d bytes, want nothing at all", len(picture))
+		}
 		return nil
 	}
 
-	_, err := session.Execute(t.Context(), photoCommand(t, `{"group":{"kind":"group","id":"1"}}`))
-	assertCode(t, err, protocol.ErrorInvalidPayload)
-	if !strings.Contains(err.Error(), "or null to remove") {
-		t.Errorf("the refusal reads %q, want it to point at null as the way to remove", err)
+	if _, err := session.Execute(t.Context(),
+		photoCommand(t, `{"group":{"kind":"group","id":"1"}}`)); err != nil {
+		t.Fatalf("group.photo.set: %v", err)
+	}
+	if !removed {
+		t.Error("a photo change with no image did not reach WhatsApp at all")
 	}
 }
 
@@ -591,10 +592,9 @@ func TestAPhotoChangeSendsTheBytesItWasGiven(t *testing.T) {
 	}
 }
 
-// Null is how a group's picture comes off, and whatsmeow reads a nil avatar as the
-// removal. An empty string says the same thing and must not reach WhatsApp as a picture
-// element with no picture in it.
-func TestAPhotoChangeRemovesTheePictureWithNothingInIt(t *testing.T) {
+// Null is how a group's picture comes off where a client can write one, and whatsmeow
+// reads a nil avatar as the removal.
+func TestAPhotoChangeRemovesThePictureOnANullImage(t *testing.T) {
 	t.Parallel()
 
 	session := settableSession(t)

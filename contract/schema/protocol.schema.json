@@ -1012,7 +1012,7 @@
       "type": "object",
       "properties": {
         "group": { "$ref": "#/definitions/address" },
-        "image": { "type": ["string", "null"], "description": "base64 JPEG; null removes the picture" }
+        "image": { "type": ["string", "null"], "description": "base64 JPEG; null or absent removes the picture" }
       },
       "required": ["group"],
       "additionalProperties": true
