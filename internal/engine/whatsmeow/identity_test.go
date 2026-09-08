@@ -297,3 +297,33 @@ func TestAResolveKeepsTheVerifiedNameAnEventBrought(t *testing.T) {
 		t.Errorf("the account is verified as %v, want the name the event brought", party)
 	}
 }
+
+// A rename can reach this connector as the notify on a message the account sent from
+// another device, which whatsmeow reports as a contact's push name changing. For this
+// account it is the same rename, and it may be the only notice there is.
+func TestASessionTakesItsOwnNameOffAMessageItSent(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.handle(&waEvents.PushNameSetting{
+		Action: &waSyncAction.PushNameSetting{Name: proto.String("Antigo")},
+	})
+
+	session.handle(&waEvents.PushName{
+		JID:         waTypes.NewJID("5511999990001", waTypes.DefaultUserServer),
+		OldPushName: "Antigo",
+		NewPushName: "Atendimento",
+	})
+	if named, _, _ := session.names(); named != "Atendimento" {
+		t.Errorf("the session calls itself %q, want the name its own message carried", named)
+	}
+
+	// Somebody else's push name is not this account's.
+	session.handle(&waEvents.PushName{
+		JID:         waTypes.NewJID("5541988887777", waTypes.DefaultUserServer),
+		NewPushName: "Bruno",
+	})
+	if named, _, _ := session.names(); named != "Atendimento" {
+		t.Errorf("the session calls itself %q after somebody else was renamed", named)
+	}
+}

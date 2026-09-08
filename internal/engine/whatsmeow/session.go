@@ -2683,6 +2683,14 @@ func (s *Session) handle(rawEvent any) bool {
 		// rather than off `client.Store`, which whatsmeow writes on this same path: the
 		// event carries the new name, so there is nothing to go and read.
 		s.rename(event.Action.GetName())
+	case *waEvents.PushName:
+		// The account's own name, learned from a message it sent from another device
+		// rather than from an app-state sync. whatsmeow writes it to the contact table and
+		// dispatches this, which may be the only notice there is: a rename seen this way
+		// need not be followed by a `PushNameSetting`.
+		if s.isSelf(event.JID) || s.isSelf(event.JIDAlt) {
+			s.rename(event.NewPushName)
+		}
 	case *waEvents.BusinessName:
 		// A verified name change, for whoever it is about. whatsmeow puts it in the
 		// contact table and does not touch the device record, so the account's own is the
