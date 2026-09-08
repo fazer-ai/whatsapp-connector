@@ -340,3 +340,30 @@ func TestAResolveWithholdsAMappingThisAccountNeverLearned(t *testing.T) {
 		t.Errorf("the resolve answered %v, want the half the caller already had", party)
 	}
 }
+
+// The mapping can come out of the cache while the contact record still has to be read, so
+// the check that authorises it has a failure of its own. Reported as "not met", it answers
+// the same one-sided party an unknown mapping answers, and a client told the other
+// namespace is unknown stops asking.
+func TestAResolveSaysWhenTheContactRecordCouldNotBeRead(t *testing.T) {
+	t.Parallel()
+
+	const (
+		phone = "5541988887777"
+		lid   = "998877665544332"
+	)
+
+	session, container := newTestSession(t, "5511999990001")
+	// The mapping put straight into the session's cache, so the lookup answers without a
+	// read and the contact record is the first thing that touches the database.
+	session.aliases.remember(
+		waTypes.NewJID(lid, waTypes.HiddenUserServer).String(),
+		waTypes.NewJID(phone, waTypes.DefaultUserServer),
+		session.aliases.learning())
+	if err := container.Close(); err != nil {
+		t.Fatalf("Close the store: %v", err)
+	}
+
+	_, err := session.Execute(t.Context(), resolveCommand(t, `{"party":{"kind":"lid","id":"`+lid+`"}}`))
+	assertCode(t, err, protocol.ErrorInternal)
+}

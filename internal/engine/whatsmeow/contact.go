@@ -307,26 +307,30 @@ func (s *Session) resolveContact(ctx context.Context, command *protocol.Command)
 		return json.Marshal(named)
 	}
 	alt, found, err := s.aliases.lookup(ctx, s, jid)
-	switch {
-	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
-		return nil, protocol.NewError(protocol.ErrorTimeout, "the address mapping did not answer in time")
-	case err != nil:
-		return nil, protocol.NewError(protocol.ErrorInternal, "the address mapping could not be read")
-	case found && s.hasMet(ctx, jid, alt):
-		naming(&named, alt)
-	case found:
-		// Found and withheld. `whatsmeow_lid_map` is keyed by `(lid, pn)` and by nothing
-		// else: every account on this deployment writes into one table, so a mapping in it
-		// may have been learned by a different one. Enriching an event with it is one
-		// thing -- the event is about somebody this account is already talking to -- and
-		// answering a question about an arbitrary address is another, which is a client
-		// asking this connector for a number another operator's account was shown.
+	if err != nil {
+		return nil, storeFailure(err, "the address mapping")
+	}
+	if found {
+		// `whatsmeow_lid_map` is keyed by `(lid, pn)` and by nothing else: every account
+		// on this deployment writes into one table, so a mapping in it may have been
+		// learned by a different one. Enriching an event with it is one thing -- the event
+		// is about somebody this account is already talking to -- and answering a question
+		// about an arbitrary address is another, which is a client asking this connector
+		// for a number another operator's account was shown.
 		//
 		// The contact table is keyed by `our_jid`, so it is the one thing here that
 		// answers "has this account met them". A party it has not is answered with the
 		// half the caller already had. Issue #137 is the mapping table itself.
-		s.log.Debug().Str("kind", string(req.Party.Kind)).
-			Msg("withholding a mapping this account has no record of having learned")
+		met, err := s.hasMet(ctx, jid, alt)
+		switch {
+		case err != nil:
+			return nil, storeFailure(err, "the contact record")
+		case met:
+			naming(&named, alt)
+		default:
+			s.log.Debug().Str("kind", string(req.Party.Kind)).
+				Msg("withholding a mapping this account has no record of having learned")
+		}
 	}
 	if named.Phone == "" && named.LID == "" {
 		// jidOf built this JID out of an address kind personOf just accepted, so the
@@ -430,10 +434,14 @@ func (s *Session) nameFromStore(ctx context.Context, named *protocol.Party) {
 //
 // Either address counts, because the row can be filed under the namespace the caller did
 // not ask about, which is the same asymmetry the name lookup handles.
-func (s *Session) hasMet(ctx context.Context, addresses ...waTypes.JID) bool {
+// A read that fails is not a party this account has not met: withholding on it would
+// answer the same one-sided party an unknown mapping answers, and a client told the other
+// namespace is unknown stops asking. The error goes back for the same reason the mapping's
+// does.
+func (s *Session) hasMet(ctx context.Context, addresses ...waTypes.JID) (bool, error) {
 	client := s.current()
 	if client == nil || client.Store == nil || client.Store.Contacts == nil {
-		return false
+		return false, nil
 	}
 	for _, jid := range addresses {
 		if jid.IsEmpty() {
@@ -441,12 +449,22 @@ func (s *Session) hasMet(ctx context.Context, addresses ...waTypes.JID) bool {
 		}
 		contact, err := client.Store.Contacts.GetContact(ctx, jid)
 		if err != nil {
-			s.log.Debug().Err(err).Msg("could not read whether this account has met a party")
-			continue
+			return false, err
 		}
 		if contact.Found {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
+}
+
+// storeFailure is what a device store that would not answer comes back as. A cancelled or
+// expired context is the caller's deadline rather than a fault here, and the two send a
+// client down different roads: one waits and asks again, the other is a line in this
+// connector's log.
+func storeFailure(err error, subject string) error {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return protocol.NewError(protocol.ErrorTimeout, subject+" did not answer in time")
+	}
+	return protocol.NewError(protocol.ErrorInternal, subject+" could not be read")
 }
