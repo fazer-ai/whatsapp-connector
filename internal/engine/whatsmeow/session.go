@@ -19,6 +19,7 @@ import (
 	"github.com/rs/zerolog"
 	qrcode "github.com/skip2/go-qrcode"
 	wm "go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/appstate"
 	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
 	waTypes "go.mau.fi/whatsmeow/types"
 	waEvents "go.mau.fi/whatsmeow/types/events"
@@ -126,6 +127,11 @@ type Session struct {
 	// them a test can reach the payload this connector refuses and nothing past it --
 	// not the ordering a check has to answer in, and neither of the two refusals a
 	// picture query answers with, which are the parts that decide what a client shows.
+	// sendAppState hands WhatsApp a patch to this account's own state. A field for the
+	// same reason as the two below it: nothing outside a real socket can answer one, so
+	// a test cannot otherwise reach what a failed patch is reported as.
+	sendAppState func(context.Context, *wm.Client, appstate.PatchInfo) error
+
 	onWhatsApp     func(context.Context, *wm.Client, []string) ([]waTypes.IsOnWhatsAppResponse, error)
 	profilePicture func(context.Context, *wm.Client, waTypes.JID, *wm.GetProfilePictureParams) (*waTypes.ProfilePictureInfo, error)
 
@@ -447,8 +453,9 @@ func newSession(
 		download: func(ctx context.Context, client *wm.Client, part wm.DownloadableMessage, file media.File) error {
 			return client.DownloadToFile(ctx, part, file) //nolint:wrapcheck // classified by downloadFailure, which needs the sentinels
 		},
-		retrieve:   retrieveOverHTTP,
-		uploadFile: uploadOverClient,
+		retrieve:     retrieveOverHTTP,
+		uploadFile:   uploadOverClient,
+		sendAppState: sendAppStateOverClient,
 		onWhatsApp: func(ctx context.Context, client *wm.Client, phones []string) ([]waTypes.IsOnWhatsAppResponse, error) {
 			return client.IsOnWhatsApp(ctx, phones) //nolint:wrapcheck // wrapped by its caller
 		},
@@ -1391,6 +1398,8 @@ func (s *Session) Execute(ctx context.Context, command *protocol.Command) (json.
 		return s.checkContacts(ctx, command)
 	case protocol.CommandContactProfilePicture:
 		return s.contactPicture(ctx, command)
+	case protocol.CommandMessageMarkUnread:
+		return s.markUnread(ctx, command)
 	}
 	return nil, engine.ErrNotSupported
 }

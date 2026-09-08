@@ -303,3 +303,19 @@ internal/app/dispatch_internal_test.go: Replace wall-clock polling with a comple
 # named and configurable; closing it further is tuning, not a defect. Before this branch
 # the same window was a whole heartbeat wide.
 internal/store/fence.go: Fence writes through the database commit  # PR#93 r1
+
+# PR#118 r2: real, and the remedy does not exist in the pinned library. `SendAppState` is
+# the only exported way in; the `sendAppState` that could tell the two apart is private,
+# and the fetch it does after the patch is accepted (`failed to fetch app state after
+# sending update`) is returned as the call's own error. Splitting the two would mean
+# reading the error's text, which changes without notice and would go quiet exactly when
+# it broke.
+#
+# What it costs is bounded by what the command does. A mark that was applied and reported
+# failed is retried, and the retry sets the same chat to the same state -- unread is
+# unread, and the range is rebuilt from the moment the retry runs rather than replayed
+# from the first attempt, so nothing stale is reapplied. The ledger not recording it is
+# the same shape: what a redelivery repeats is an operation whose second application is
+# indistinguishable from its first.
+internal/engine/whatsmeow/unread.go: Separate patch acceptance from the follow-up resync  # PR#118 r2
+

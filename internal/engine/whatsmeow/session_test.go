@@ -135,7 +135,6 @@ var (
 	commandsNoHandlerCarriesOut = []protocol.CommandType{
 		protocol.CommandSessionDelete,
 		protocol.CommandSessionUpdate,
-		protocol.CommandMessageMarkUnread,
 		protocol.CommandHistoryRequest,
 		protocol.CommandContactInfo,
 		protocol.CommandContactResolve,
@@ -180,6 +179,7 @@ var (
 		{protocol.CommandChatPresence, protocol.ErrorInvalidPayload},
 		{protocol.CommandContactCheck, protocol.ErrorInvalidPayload},
 		{protocol.CommandContactProfilePicture, protocol.ErrorInvalidPayload},
+		{protocol.CommandMessageMarkUnread, protocol.ErrorInvalidPayload},
 	}
 )
 
