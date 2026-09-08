@@ -3,6 +3,7 @@ package whatsmeow
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"testing"
 
@@ -382,6 +383,120 @@ func TestAGroupChangeSaysWhatIsWrongWithAPayloadEvenWhileDisconnected(t *testing
 
 			_, err := session.Execute(t.Context(), setCommand(t, refused.kind, refused.payload))
 			assertCode(t, err, protocol.ErrorInvalidPayload)
+		})
+	}
+}
+
+func leaveCommand(t *testing.T, payload string) *protocol.Command {
+	t.Helper()
+	return setCommand(t, protocol.CommandGroupLeave, payload)
+}
+
+func TestLeavingRefusesAPayloadThatNamesNoGroup(t *testing.T) {
+	t.Parallel()
+
+	for _, refused := range []struct {
+		name    string
+		payload string
+	}{
+		{name: "no payload at all", payload: `{}`},
+		{name: "a group with no id", payload: `{"group":{"kind":"group","id":""}}`},
+		// Leaving a direct chat is not a thing, and the address is how a caller says
+		// which group it means. Sending this on would have WhatsApp refuse a group IQ
+		// addressed to a person, which reaches the client as an opaque `wa_error`.
+		{name: "a chat that is not a group", payload: `{"group":{"kind":"phone","id":"5511999990002"}}`},
+		{name: "a newsletter", payload: `{"group":{"kind":"newsletter","id":"120363000000000001"}}`},
+	} {
+		t.Run(refused.name, func(t *testing.T) {
+			t.Parallel()
+			session, _ := newTestSession(t, "5511999990001")
+			session.setConnected(true)
+			session.leave = func(context.Context, *wm.Client, waTypes.JID) error {
+				t.Error("a payload that names no group left one anyway")
+				return nil
+			}
+
+			_, err := session.Execute(t.Context(), leaveCommand(t, refused.payload))
+			assertCode(t, err, protocol.ErrorInvalidPayload)
+		})
+	}
+}
+
+func TestLeavingLeavesTheGroupItWasGiven(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setConnected(true)
+	left := waTypes.EmptyJID
+	session.leave = func(_ context.Context, _ *wm.Client, group waTypes.JID) error {
+		left = group
+		return nil
+	}
+
+	result, err := session.Execute(t.Context(), leaveCommand(t,
+		`{"group":{"kind":"group","id":"120363000000000001"}}`))
+	if err != nil {
+		t.Fatalf("group.leave: %v", err)
+	}
+	if left.Server != waTypes.GroupServer || left.User != "120363000000000001" {
+		t.Errorf("the session left %s, want the group that was named", left)
+	}
+	// The contract's table says this command answers null: the caller is waiting for the
+	// confirmation, not for data.
+	if result != nil {
+		t.Errorf("the answer carries %s, want nothing", result)
+	}
+}
+
+// Leaving cannot be undone from this side, so a session with no socket must not report
+// that it left. A client told `ok` takes the group out of its own list, and the account is
+// still in it.
+func TestLeavingNeedsAConnection(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.leave = func(context.Context, *wm.Client, waTypes.JID) error {
+		t.Error("a disconnected session left a group anyway")
+		return nil
+	}
+
+	_, err := session.Execute(t.Context(), leaveCommand(t, `{"group":{"kind":"group","id":"1"}}`))
+	assertCode(t, err, protocol.ErrorNotConnected)
+}
+
+// WhatsApp's own refusal reaches the client as a code from the contract, never as
+// whatsmeow's own error.
+//
+// The refusals are IQ errors and not whatsmeow's named sentinels, which is what `LeaveGroup`
+// actually answers with: it hands back what `sendGroupIQ` returned, and the two sentinels
+// that mean "not in that group" are attached by two getters this command is not one of.
+// Writing the test against those would be testing a case the API cannot produce.
+func TestLeavingAnswersWhatsAppsRefusal(t *testing.T) {
+	t.Parallel()
+
+	for _, refused := range []struct {
+		name string
+		err  error
+		want protocol.ErrorCode
+	}{
+		{name: "not in the group", err: &wm.IQError{Code: 403, Text: "forbidden"}, want: protocol.ErrorWaError},
+		{name: "no such group", err: &wm.IQError{Code: 404, Text: "item-not-found"}, want: protocol.ErrorWaError},
+		{name: "the connection went", err: wm.ErrIQDisconnected, want: protocol.ErrorNotConnected},
+		{name: "rate limited", err: &wm.IQError{Code: 429}, want: protocol.ErrorRateLimited},
+	} {
+		t.Run(refused.name, func(t *testing.T) {
+			t.Parallel()
+			session, _ := newTestSession(t, "5511999990001")
+			session.setConnected(true)
+			session.leave = func(context.Context, *wm.Client, waTypes.JID) error {
+				return refused.err
+			}
+
+			_, err := session.Execute(t.Context(), leaveCommand(t, `{"group":{"kind":"group","id":"1"}}`))
+			assertCode(t, err, refused.want)
+			if errors.Is(err, refused.err) {
+				t.Error("whatsmeow's own error reached the client instead of a code from the contract")
+			}
 		})
 	}
 }
