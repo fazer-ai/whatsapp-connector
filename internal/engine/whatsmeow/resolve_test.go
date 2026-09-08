@@ -49,11 +49,7 @@ func TestAResolveAnswersBothNamespacesFromEitherOne(t *testing.T) {
 			t.Parallel()
 
 			session, _ := newTestSession(t, "5511999990001")
-			if err := session.current().Store.LIDs.PutLIDMapping(t.Context(),
-				waTypes.NewJID(lid, waTypes.HiddenUserServer),
-				waTypes.NewJID(phone, waTypes.DefaultUserServer)); err != nil {
-				t.Fatalf("PutLIDMapping: %v", err)
-			}
+			learn(t, session, phone, lid)
 
 			result, err := session.Execute(t.Context(), resolveCommand(t, tc.payload))
 			if err != nil {
@@ -106,7 +102,8 @@ func TestAResolveCarriesTheNameTheDeviceLearned(t *testing.T) {
 		waTypes.NewJID(phone, waTypes.DefaultUserServer)); err != nil {
 		t.Fatalf("PutLIDMapping: %v", err)
 	}
-	// Filed under the LID, asked for by number.
+	// Filed under the LID, asked for by number. The row is also what says this account
+	// has met them, which is what lets the mapping out.
 	if _, _, err := client.Store.Contacts.PutPushName(t.Context(),
 		waTypes.NewJID(lid, waTypes.HiddenUserServer), "Bruno Lima"); err != nil {
 		t.Fatalf("PutPushName: %v", err)
@@ -233,11 +230,7 @@ func TestAResolveForgetsWhatThePreviousAccountLearned(t *testing.T) {
 	)
 
 	session, _ := newTestSession(t, "5511999990001")
-	if err := session.current().Store.LIDs.PutLIDMapping(t.Context(),
-		waTypes.NewJID(lid, waTypes.HiddenUserServer),
-		waTypes.NewJID(phone, waTypes.DefaultUserServer)); err != nil {
-		t.Fatalf("PutLIDMapping: %v", err)
-	}
+	learn(t, session, phone, lid)
 	asked := resolveCommand(t, `{"party":{"kind":"lid","id":"`+lid+`"}}`)
 	result, err := session.Execute(t.Context(), asked)
 	if err != nil {
@@ -274,10 +267,6 @@ func TestAResolveAnswersTheAccountOutOfItsOwnIdentity(t *testing.T) {
 	session, _ := newTestSession(t, "5511999990001")
 	client := session.current()
 	client.Store.LID = waTypes.NewJID(lid, waTypes.HiddenUserServer)
-	// The account's own names, which whatsmeow keeps on the device rather than in the
-	// contact table: the table is the people this account has met.
-	client.Store.PushName = "Atendimento"
-	client.Store.BusinessName = "Loja do Bruno"
 	// Adopted again so the session copies the identity back out of the device, which is
 	// the only thing that reads it. Nothing in this test publishes an event, so the
 	// second handler the re-adoption registers has nothing to double up on.
@@ -298,8 +287,56 @@ func TestAResolveAnswersTheAccountOutOfItsOwnIdentity(t *testing.T) {
 		if party["phone"] != "5511999990001" || party["lid"] != lid {
 			t.Errorf("resolving the account itself answered %v, want both names the session holds", party)
 		}
-		if party["push_name"] != "Atendimento" || party["verified_name"] != "Loja do Bruno" {
-			t.Errorf("resolving the account itself answered %v, want the names on its own device", party)
-		}
+	}
+}
+
+// learn records a pairing and the contact row that says this account met them.
+func learn(t *testing.T, session *Session, phone, lid string) {
+	t.Helper()
+
+	client := session.current()
+	if err := client.Store.LIDs.PutLIDMapping(t.Context(),
+		waTypes.NewJID(lid, waTypes.HiddenUserServer),
+		waTypes.NewJID(phone, waTypes.DefaultUserServer)); err != nil {
+		t.Fatalf("PutLIDMapping: %v", err)
+	}
+	if _, _, err := client.Store.Contacts.PutPushName(t.Context(),
+		waTypes.NewJID(phone, waTypes.DefaultUserServer), "Bruno Lima"); err != nil {
+		t.Fatalf("PutPushName: %v", err)
+	}
+}
+
+// The mapping table has no `our_jid`: every account on a deployment writes into one, so a
+// row in it may be one another operator's account was shown. Enriching an event with it is
+// one thing -- the event is about somebody this account is already talking to -- and
+// answering a question about an address nobody here has met is handing a client a number
+// another operator was given.
+func TestAResolveWithholdsAMappingThisAccountNeverLearned(t *testing.T) {
+	t.Parallel()
+
+	const (
+		phone = "5541988887777"
+		lid   = "998877665544332"
+	)
+
+	session, _ := newTestSession(t, "5511999990001")
+	// The pairing alone, with no contact row: what another account on the same
+	// deployment leaves behind.
+	if err := session.current().Store.LIDs.PutLIDMapping(t.Context(),
+		waTypes.NewJID(lid, waTypes.HiddenUserServer),
+		waTypes.NewJID(phone, waTypes.DefaultUserServer)); err != nil {
+		t.Fatalf("PutLIDMapping: %v", err)
+	}
+
+	result, err := session.Execute(t.Context(), resolveCommand(t, `{"party":{"kind":"lid","id":"`+lid+`"}}`))
+	if err != nil {
+		t.Fatalf("contact.resolve: %v", err)
+	}
+	party := resolved(t, result)
+	if _, disclosed := party["phone"]; disclosed {
+		t.Errorf("the resolve answered %v for a party this account has no record of meeting", party)
+	}
+	if party["lid"] != lid {
+		t.Errorf("the resolve answered %v, want the half the caller already had", party)
 	}
 }

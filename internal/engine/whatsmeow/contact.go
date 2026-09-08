@@ -289,19 +289,20 @@ func (s *Session) resolveContact(ctx context.Context, command *protocol.Command)
 	// other namespace does not exist stops asking, and the one told to retry retries.
 	var named protocol.Party
 	naming(&named, jid)
-	if lid != "" && (named.Phone == phone || named.LID == lid) {
+	if named.Phone == phone || (lid != "" && named.LID == lid) {
 		// The account asking about itself. Both of its names were copied out of the device
 		// at pairing, and the mapping table is a separate write that whatsmeow logs rather
 		// than fails on -- so the account can be the one party the table cannot answer
 		// for, which would be an absurd thing for this command to be unable to resolve.
-		named.Phone, named.LID = phone, lid
-		// Its own names live on the device record. The contact table holds the people this
-		// account has met, and it is not one of them, so resolving itself through the
-		// table alone answers with no name at all.
-		if client := s.current(); client != nil && client.Store != nil {
-			named.PushName = client.Store.PushName
-			named.VerifiedName = client.Store.BusinessName
+		//
+		// The LID half is only as good as what the session was told: a resumed device
+		// learns its LID on the connection rather than through a `PairSuccess`, and
+		// nothing copies it out afterwards, so this can answer with the number alone.
+		// That is issue #138, and it is a missing half rather than a wrong one.
+		if lid != "" {
+			named.LID = lid
 		}
+		named.Phone = phone
 		s.nameFromStore(ctx, &named)
 		return json.Marshal(named)
 	}
@@ -311,8 +312,21 @@ func (s *Session) resolveContact(ctx context.Context, command *protocol.Command)
 		return nil, protocol.NewError(protocol.ErrorTimeout, "the address mapping did not answer in time")
 	case err != nil:
 		return nil, protocol.NewError(protocol.ErrorInternal, "the address mapping could not be read")
-	case found:
+	case found && s.hasMet(ctx, jid, alt):
 		naming(&named, alt)
+	case found:
+		// Found and withheld. `whatsmeow_lid_map` is keyed by `(lid, pn)` and by nothing
+		// else: every account on this deployment writes into one table, so a mapping in it
+		// may have been learned by a different one. Enriching an event with it is one
+		// thing -- the event is about somebody this account is already talking to -- and
+		// answering a question about an arbitrary address is another, which is a client
+		// asking this connector for a number another operator's account was shown.
+		//
+		// The contact table is keyed by `our_jid`, so it is the one thing here that
+		// answers "has this account met them". A party it has not is answered with the
+		// half the caller already had. Issue #137 is the mapping table itself.
+		s.log.Debug().Str("kind", string(req.Party.Kind)).
+			Msg("withholding a mapping this account has no record of having learned")
 	}
 	if named.Phone == "" && named.LID == "" {
 		// jidOf built this JID out of an address kind personOf just accepted, so the
@@ -404,4 +418,35 @@ func (s *Session) nameFromStore(ctx context.Context, named *protocol.Party) {
 			named.VerifiedName = contact.BusinessName
 		}
 	}
+}
+
+// hasMet reports whether this account has a record of either of a party's two addresses.
+//
+// The contact table is keyed by `our_jid`, which makes it the only per-account record in
+// the device store: a row exists once a message, a group listing or an address-book sync
+// has put one there. `whatsmeow_lid_map` has no such key -- it is `(lid, pn)` and nothing
+// else -- so it is shared by every account on the deployment, and a mapping read out of it
+// may be one another operator's account was shown.
+//
+// Either address counts, because the row can be filed under the namespace the caller did
+// not ask about, which is the same asymmetry the name lookup handles.
+func (s *Session) hasMet(ctx context.Context, addresses ...waTypes.JID) bool {
+	client := s.current()
+	if client == nil || client.Store == nil || client.Store.Contacts == nil {
+		return false
+	}
+	for _, jid := range addresses {
+		if jid.IsEmpty() {
+			continue
+		}
+		contact, err := client.Store.Contacts.GetContact(ctx, jid)
+		if err != nil {
+			s.log.Debug().Err(err).Msg("could not read whether this account has met a party")
+			continue
+		}
+		if contact.Found {
+			return true
+		}
+	}
+	return false
 }
