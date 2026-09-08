@@ -137,8 +137,10 @@ type Session struct {
 	// refuses and nothing of what it makes of an answer.
 	groupInfo func(context.Context, *wm.Client, waTypes.JID) (*waTypes.GroupInfo, error)
 
-	onWhatsApp     func(context.Context, *wm.Client, []string) ([]waTypes.IsOnWhatsAppResponse, error)
-	profilePicture func(context.Context, *wm.Client, waTypes.JID, *wm.GetProfilePictureParams) (*waTypes.ProfilePictureInfo, error)
+	onWhatsApp func(context.Context, *wm.Client, []string) ([]waTypes.IsOnWhatsAppResponse, error)
+	//nolint:lll // one line per seam reads better than a wrapped signature
+	updateParticipants func(context.Context, *wm.Client, waTypes.JID, []waTypes.JID, wm.ParticipantChange) ([]waTypes.GroupParticipant, error)
+	profilePicture     func(context.Context, *wm.Client, waTypes.JID, *wm.GetProfilePictureParams) (*waTypes.ProfilePictureInfo, error)
 
 	// uploadWait bounds how long an outbound media message spends fetching its file and
 	// handing it to WhatsApp. A field for the same reason as the three above it.
@@ -464,6 +466,12 @@ func newSession(
 		groupInfo:    groupInfoOverClient,
 		onWhatsApp: func(ctx context.Context, client *wm.Client, phones []string) ([]waTypes.IsOnWhatsAppResponse, error) {
 			return client.IsOnWhatsApp(ctx, phones) //nolint:wrapcheck // wrapped by its caller
+		},
+		updateParticipants: func(
+			ctx context.Context, client *wm.Client, group waTypes.JID,
+			participants []waTypes.JID, action wm.ParticipantChange,
+		) ([]waTypes.GroupParticipant, error) {
+			return client.UpdateGroupParticipants(ctx, group, participants, action) //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
 		},
 		profilePicture: func(
 			ctx context.Context, client *wm.Client, party waTypes.JID, params *wm.GetProfilePictureParams,
@@ -1408,6 +1416,8 @@ func (s *Session) Execute(ctx context.Context, command *protocol.Command) (json.
 		return s.markUnread(ctx, command)
 	case protocol.CommandGroupInfo:
 		return s.groupInfoOf(ctx, command)
+	case protocol.CommandGroupParticipantsUpdate:
+		return s.updateGroupParticipants(ctx, command)
 	}
 	return nil, engine.ErrNotSupported
 }

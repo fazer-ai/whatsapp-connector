@@ -53,6 +53,35 @@ func TestFixturesValidateAgainstSchema(t *testing.T) {
 // schema by TestErrorCodesMatchSchema, which is the check that actually catches a
 // catalogue drifting from the contract. AGENTS.md used to read as though this test
 // covered them, and for as long as it did nobody looked (#70).
+// Four of the commands in contract/README.md answer with an array -- `contact.check`,
+// `group.list`, `group.participants.update` and both `group.join_requests.*` -- and the
+// reply schema admitted only an object or null, so every one of those replies was a frame
+// this connector sends and its own contract rejects. A client that validates what it
+// receives drops the answer; one that does not carries on, which is why nothing here
+// noticed. Replies have no fixtures, so this is what holds the two together.
+func TestAReplyMayCarryTheArrayResultTheContractDocuments(t *testing.T) {
+	schema := compile(t, "#/definitions/reply")
+
+	for _, reply := range []struct {
+		name string
+		raw  string
+	}{
+		{name: "an array, as four commands answer with", raw: `{"v":1,"id":"c1","ok":true,"result":[{"address":{"kind":"phone","id":"5511999990002"},"status":"success","code":null}]}`},
+		{name: "an object", raw: `{"v":1,"id":"c1","ok":true,"result":{"url":null}}`},
+		{name: "nothing at all", raw: `{"v":1,"id":"c1","ok":true,"result":null}`},
+	} {
+		t.Run(reply.name, func(t *testing.T) {
+			var frame any
+			if err := json.Unmarshal([]byte(reply.raw), &frame); err != nil {
+				t.Fatalf("parse the reply: %v", err)
+			}
+			if err := schema.Validate(frame); err != nil {
+				t.Fatalf("a reply this connector sends does not validate: %v", err)
+			}
+		})
+	}
+}
+
 func TestEveryTypeHasAFixture(t *testing.T) {
 	events := typesInFixtures(t, "event")
 	for _, known := range protocol.AllEventTypes {

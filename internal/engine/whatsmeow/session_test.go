@@ -141,7 +141,6 @@ var (
 		protocol.CommandGroupCreate,
 		protocol.CommandGroupList,
 		protocol.CommandGroupLeave,
-		protocol.CommandGroupParticipantsUpdate,
 		protocol.CommandGroupNameSet,
 		protocol.CommandGroupDescriptionSet,
 		protocol.CommandGroupPhotoSet,
@@ -180,6 +179,7 @@ var (
 		{protocol.CommandContactProfilePicture, protocol.ErrorInvalidPayload},
 		{protocol.CommandMessageMarkUnread, protocol.ErrorInvalidPayload},
 		{protocol.CommandGroupInfo, protocol.ErrorInvalidPayload},
+		{protocol.CommandGroupParticipantsUpdate, protocol.ErrorInvalidPayload},
 	}
 )
 

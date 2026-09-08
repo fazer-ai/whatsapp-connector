@@ -57,7 +57,7 @@ func TestEveryEventTypeIsProducedOrMarkedAsNotProduced(t *testing.T) {
 	assertProducers(t, "EventType", "types.go", catalog, marked)
 }
 
-// Four error codes are declared and never sent, and errors.go marks each one with what
+// Three error codes are declared and never sent, and errors.go marks each one with what
 // reaches a client in its place. The same drift is possible there as with the events,
 // and worse to read from the outside: a client branching on a code it cannot receive
 // gets no signal at all, which is the reasoning errors.go and contract/README.md both
@@ -66,7 +66,6 @@ var errorCodesWithNoProducer = []protocol.ErrorCode{
 	protocol.ErrorSessionNotFound,
 	protocol.ErrorQuarantined,
 	protocol.ErrorClientOutdated,
-	protocol.ErrorGroupParticipantNotAllowed,
 }
 
 func TestEveryErrorCodeIsProducedOrMarkedAsNotProduced(t *testing.T) {

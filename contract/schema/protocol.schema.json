@@ -340,7 +340,7 @@
         "v": { "$ref": "#/definitions/protocol_version" },
         "id": { "type": "string", "minLength": 1 },
         "ok": { "type": "boolean" },
-        "result": { "type": ["object", "null"] },
+        "result": { "type": ["object", "array", "null"] },
         "error": { "oneOf": [{ "$ref": "#/definitions/error" }, { "type": "null" }] }
       },
       "required": ["v", "id", "ok"],

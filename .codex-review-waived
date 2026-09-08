@@ -319,3 +319,14 @@ internal/store/fence.go: Fence writes through the database commit  # PR#93 r1
 # indistinguishable from its first.
 internal/engine/whatsmeow/unread.go: Separate patch acceptance from the follow-up resync  # PR#118 r2
 
+# PR#122: half taken, half not. The reading is right -- the Chatwoot controllers update
+# their own roster after the call and only a raised error stops them, so a participant
+# WhatsApp refused would show as promoted -- and the connector now fails the whole command
+# when *nothing* was carried out, which is the shape three of the four actions arrive in
+# and restores what the Baileys generation did by raising. What is not taken is the
+# remedy: holding the command back until the client changes. The contract already names
+# this result shape, the refusal is per participant on WhatsApp's side, and failing a
+# partly-successful request whole would report the participants that *were* added as not
+# added, with no second source for a caller to check against. The rest belongs on the
+# client, and is filed as fazer-ai/chatwoot#483.
+internal/engine/whatsmeow/participants.go: Make callers handle failed participant rows  # PR#122
