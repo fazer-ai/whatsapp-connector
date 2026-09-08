@@ -693,3 +693,33 @@ func TestCreatingAGroupAnswersWhatsAppsRefusal(t *testing.T) {
 	_, err := session.Execute(t.Context(), createCommand(t, `{"subject":"Obras","participants":[]}`))
 	assertCode(t, err, protocol.ErrorWaError)
 }
+
+// A payload that leaves `participants` out is not the same as one that sends an empty
+// list. The contract requires the field, and a group created from a request that never
+// said who was supposed to be in it is a group nobody asked for in that shape.
+func TestCreatingAGroupTellsAMissingGuestListFromAnEmptyOne(t *testing.T) {
+	t.Parallel()
+
+	for _, refused := range []struct {
+		name    string
+		payload string
+	}{
+		{name: "no participants field", payload: `{"subject":"Obras"}`},
+		{name: "a null participants field", payload: `{"subject":"Obras","participants":null}`},
+	} {
+		t.Run(refused.name, func(t *testing.T) {
+			t.Parallel()
+			session, _ := newTestSession(t, "5511999990001")
+			session.setConnected(true)
+			session.createTheGroup = func(
+				context.Context, *wm.Client, wm.ReqCreateGroup,
+			) (*waTypes.GroupInfo, error) {
+				t.Error("a payload that never said who to add created a group anyway")
+				return nil, nil
+			}
+
+			_, err := session.Execute(t.Context(), createCommand(t, refused.payload))
+			assertCode(t, err, protocol.ErrorInvalidPayload)
+		})
+	}
+}

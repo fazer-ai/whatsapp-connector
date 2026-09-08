@@ -380,3 +380,15 @@ internal/engine/whatsmeow/joinrequests.go: Keep nullable timestamps out of proto
 # one and surprised by the other is a worse contract than either rule alone. Nothing is
 # carried out at all still fails, which is the case the dashboard actually sends.
 internal/engine/whatsmeow/joinrequests.go: Handle partial join-request refusals before returning success  # PR#124
+# PR#130: real, and not this handler's to fix. The window is `Session.carryOut`'s -- the
+# ledger record is written after the effect, deliberately, and the comment there says why a
+# reservation was rejected for the layer as a whole: an entry saying an attempt was made
+# says nothing about whether it landed. What that comment names as the cover is the caller
+# naming the message, which works for `message.send` and has no equivalent for a group that
+# does not exist yet. So the finding is right that creation is the first effect this
+# connector serves which duplicates rather than converging on a retry -- every other command
+# is repeatable or answers "already done" -- and wrong only about where the fix goes.
+# Building a reservation for this one command would be a second idempotency mechanism to
+# retire, which is the same reason PR#3's own waiver gives for not building one there.
+# Written up with the three candidate fixes in fazer-ai/whatsapp-connector#131.
+internal/engine/whatsmeow/group.go: Make group creation survive command redelivery  # PR#130

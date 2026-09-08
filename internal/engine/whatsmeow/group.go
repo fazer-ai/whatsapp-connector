@@ -259,9 +259,15 @@ func (s *Session) listGroups(ctx context.Context, _ *protocol.Command) (json.Raw
 }
 
 // createRequest is `group.create`.
+//
+// `participants` is a pointer so that a payload which leaves it out can be told apart from
+// one that sends an empty list. The two mean different things: an empty list is a group
+// this account opens alone and fills in later, and a missing one is a payload the contract
+// does not allow -- accepting it would create a group from a request that never said who
+// was supposed to be in it.
 type createRequest struct {
-	Subject      string             `json:"subject"`
-	Participants []protocol.Address `json:"participants"`
+	Subject      string              `json:"subject"`
+	Participants *[]protocol.Address `json:"participants"`
 }
 
 // createGroup carries out `group.create` and answers the group it made.
@@ -281,8 +287,13 @@ func (s *Session) createGroup(ctx context.Context, command *protocol.Command) (j
 	if req.Subject == "" {
 		return nil, protocol.NewError(protocol.ErrorInvalidPayload, "a group cannot be called nothing")
 	}
-	asked := make([]waTypes.JID, len(req.Participants))
-	for i, party := range req.Participants {
+	if req.Participants == nil {
+		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
+			"creating a group has to say who to put in it, even if that is nobody")
+	}
+	wanted := *req.Participants
+	asked := make([]waTypes.JID, len(wanted))
+	for i, party := range wanted {
 		switch party.Kind {
 		case protocol.AddressPhone, protocol.AddressLID:
 		default:
