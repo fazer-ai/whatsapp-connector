@@ -318,26 +318,24 @@ func (s *Session) asTheGroupAddresses(
 	var unread unreadableGroup
 	switch {
 	case errors.As(err, &unread):
-		// The re-read did not happen, so there is nothing fresher than the reading that
-		// already said this participant cannot be named -- and that reading is the only
-		// evidence there is.
+		// The re-read did not happen, so nothing confirmed or denied the reading behind
+		// the refusal -- and that reading is the one this re-read exists to doubt.
 		//
-		// Why it did not happen decides what the client hears. A connection that is down
-		// or a deadline that has run out is the client's to act on and says nothing about
-		// its payload: told `invalid_payload`, it retires an address that may well be
-		// correct, and the whole reason this re-read exists is that the reading behind
-		// the refusal might be wrong.
-		if coded := operational(unread.cause, "reading of the group"); coded != nil {
-			return waTypes.EmptyJID, coded
-		}
-		// Anything else, and the stale reading stands. Refused rather than sent as it
-		// came: a key naming a member the group has no name for is accepted by WhatsApp,
-		// answered with a timestamp and shown to nobody, and a client can act on a
-		// refusal and cannot see a silent no-op.
-		return waTypes.EmptyJID, unnamed.refusal()
+		// Answered as the re-read failing, never as the stale refusal. `invalid_payload`
+		// tells a client its address is wrong and a client that hears it stops sending
+		// that address; not knowing is not that. Every way a read can fail is somebody
+		// else's to act on -- wait out a rate limit, reconnect, look at the logs -- and
+		// none of them is the payload's fault.
+		//
+		// Sending the participant as it came is equally out. A key naming a member the
+		// group has no name for is accepted by WhatsApp, answered with a timestamp and
+		// shown to nobody, and a client can act on an error and cannot see a no-op.
+		return waTypes.EmptyJID, contactFailure(unread.cause, "reading of the group")
 	case !errors.As(err, &unnamed):
 		return placed, err
 	}
+	// Read as freshly as it can be and still no name for this participant. Now it is the
+	// address, and the client is told so.
 	return waTypes.EmptyJID, unnamed.refusal()
 }
 
@@ -351,36 +349,6 @@ func (e unreadableGroup) Error() string {
 }
 
 func (e unreadableGroup) Unwrap() error { return e.cause }
-
-// operational is the connection or the deadline having gone, told apart from every other
-// reason a read fails because those two are the client's to act on: a command that comes
-// back `not_connected` is retried when the session is up, and one that comes back
-// `invalid_payload` is a payload the client stops sending. Answering the second when the
-// truth is the first retires an address that was correct.
-//
-// `commandFailure` is where the same question is answered for every other path, and the
-// list is longer than it looks: reading a group is an IQ, and an IQ has sentinels of its
-// own for both halves of this -- `ErrIQTimedOut` rather than a context deadline, and
-// `ErrIQDisconnected` rather than `ErrNotConnected`. The first is already in there; the
-// second is the arm `contactFailure` adds, and is added here for the same reason.
-func operational(err error, subject string) error {
-	if named, coded := commandFailure(err, subject); named {
-		return coded
-	}
-	if errors.Is(err, wm.ErrIQDisconnected) {
-		return protocol.NewError(protocol.ErrorNotConnected,
-			"the connection went while the "+subject+" was in flight")
-	}
-	// And WhatsApp saying to come back later, which is the client's to act on for the
-	// same reason the two above are: a rate limit passes and a payload a client was told
-	// is wrong never gets sent again.
-	var refused *wm.IQError
-	if errors.As(err, &refused) && (refused.Code == 419 || refused.Code == 429) {
-		return protocol.NewError(protocol.ErrorRateLimited,
-			"WhatsApp is rate limiting this account's "+subject+"s")
-	}
-	return nil
-}
 
 // noSuchNaming is `placeInTheGroup` telling its caller that this reading of the group
 // needed the participant translated and the translation did not arrive. Both ways that

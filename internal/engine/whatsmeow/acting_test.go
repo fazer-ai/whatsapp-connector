@@ -816,12 +816,16 @@ func TestAParticipantIsPutInTheGroupsOwnNamespace(t *testing.T) {
 		}
 	})
 
-	// A re-read that does not happen leaves the stale reading as the only evidence there
-	// is, and that reading said this participant cannot be named. Refused rather than
-	// sent as it came: a key naming a member the group has no name for is accepted by
-	// WhatsApp, answered with a timestamp and shown to nobody, and a client can see a
-	// refusal but not a silent no-op.
-	t.Run("a re-read that fails keeps the refusal it was trying to lift", func(t *testing.T) {
+	// A re-read that does not happen confirms nothing and denies nothing, and the reading
+	// behind the refusal is the one it exists to doubt. So it is answered as the re-read
+	// failing and never as that refusal: `invalid_payload` tells a client its address is
+	// wrong, a client that hears it stops sending that address, and not knowing is not
+	// that.
+	//
+	// Sending the participant as it came is equally out. A key naming a member the group
+	// has no name for is accepted by WhatsApp, answered with a timestamp and shown to
+	// nobody, and a client can act on an error and cannot see a no-op.
+	t.Run("a re-read that fails is not answered as the refusal it was trying to lift", func(t *testing.T) {
 		t.Parallel()
 
 		session, _, _ := outboundSession(t)
@@ -836,9 +840,9 @@ func TestAParticipantIsPutInTheGroupsOwnNamespace(t *testing.T) {
 
 		_, err := session.asTheGroupAddresses(t.Context(), mustJID(t, group), mustJID(t, lid))
 		if err == nil {
-			t.Fatalf("a participant the only reading of the group could not name was accepted")
+			t.Fatalf("a participant no reading of the group could name was accepted")
 		}
-		assertCode(t, err, protocol.ErrorInvalidPayload)
+		assertCode(t, err, protocol.ErrorInternal)
 		if reads != 2 {
 			t.Fatalf("the group was read %d times, want exactly 2", reads)
 		}
@@ -866,8 +870,14 @@ func TestAParticipantIsPutInTheGroupsOwnNamespace(t *testing.T) {
 			want: protocol.ErrorRateLimited},
 		{name: "the account ran into a resource limit", cause: wm.ErrIQResourceLimit,
 			want: protocol.ErrorRateLimited},
-		{name: "WhatsApp refused the query", cause: errors.New("406 not acceptable"),
-			want: protocol.ErrorInvalidPayload},
+		// WhatsApp answering with a refusal of its own, and the local store having a bad
+		// second. Neither is the payload: told `invalid_payload` a client retires an
+		// address that a later re-read could well confirm, and the whole reason this
+		// re-read exists is that the reading behind the refusal might be wrong.
+		{name: "WhatsApp refused the query", cause: &wm.IQError{Code: 500, Text: "internal-server-error"},
+			want: protocol.ErrorWaError},
+		{name: "something else went wrong", cause: errors.New("the response made no sense"),
+			want: protocol.ErrorInternal},
 	} {
 		t.Run("a re-read stopped by "+tc.name, func(t *testing.T) {
 			t.Parallel()
