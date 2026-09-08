@@ -432,6 +432,11 @@ type Session struct {
 	// each change -- and read from here under the lock like every other session field.
 	pushName     string
 	businessName string
+	// verifiedLive says the verified name came from an event this session handled rather
+	// than from the device record it was built on. The two rank differently against the
+	// contact table: a change is written to the table and not to the record, so a copy
+	// from the record is the older of the two and a copy from an event is the newer.
+	verifiedLive bool
 	// phone and lid are this session's copy of what it paired. whatsmeow assigns the
 	// same fields on its pairing goroutine, so reading them off the client from a
 	// command is a race; this is written from the event handler and read under the
@@ -717,6 +722,7 @@ func (s *Session) adopt(client *wm.Client) bool {
 	s.lid = named.lid
 	s.pushName = named.pushName
 	s.businessName = named.businessName
+	s.verifiedLive = false
 	s.stale = false
 	s.revoked = false
 	s.connected = false
@@ -876,6 +882,8 @@ func (s *Session) isSelf(jid waTypes.JID) bool {
 func (s *Session) setVerifiedName(businessName string) {
 	s.mu.Lock()
 	s.businessName = businessName
+	// From an event, which is what makes it outrank the contact table.
+	s.verifiedLive = true
 	s.mu.Unlock()
 }
 
@@ -890,11 +898,12 @@ func (s *Session) rename(pushName string) {
 }
 
 // names is what this account calls itself: the push name every recipient sees, and the
-// verified name a business account carries.
-func (s *Session) names() (pushName, businessName string) {
+// verified name a business account carries. `live` says the verified name came from an
+// event rather than from the device record.
+func (s *Session) names() (pushName, businessName string, live bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.pushName, s.businessName
+	return s.pushName, s.businessName, s.verifiedLive
 }
 
 // relearn takes the account's own details off the client again.
@@ -2562,6 +2571,11 @@ func (s *Session) handle(rawEvent any) bool {
 		s.transition.Lock()
 		defer s.transition.Unlock()
 
+		// Before the socket is judged, because the addresses do not depend on whether this
+		// connection is one this session still wants: whatsmeow has already written and
+		// saved the LID by the time this event exists, and a socket that is about to be
+		// closed produces no second Connected to learn it from.
+		s.relearn(s.current())
 		if s.undoHangUp() {
 			// A reconnect that was already past its wait when the disconnect landed. The
 			// command has answered `close`, so this socket is one nobody asked for.
@@ -2569,10 +2583,6 @@ func (s *Session) handle(rawEvent any) bool {
 			go s.current().Disconnect()
 			return true
 		}
-		// The connection is where a resumed device learns its LID, so this is the one
-		// moment the session's copy of the account can become more complete than the
-		// record it was built from.
-		s.relearn(s.current())
 		s.setConnected(true)
 		// Off this goroutine, because this writes a node and the transition lock is
 		// held for the length of this case: a socket slow to take it would hold every

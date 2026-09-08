@@ -45,7 +45,7 @@ func TestASessionTakesTheNameTheAccountChangedTo(t *testing.T) {
 		Action: &waSyncAction.PushNameSetting{Name: proto.String("Atendimento")},
 	})
 
-	if named, _ := session.names(); named != "Atendimento" {
+	if named, _, _ := session.names(); named != "Atendimento" {
 		t.Errorf("the session calls itself %q, want the name the account changed to", named)
 	}
 }
@@ -98,7 +98,7 @@ func TestAConnectionDoesNotTakeTheNamesBackOffTheDevice(t *testing.T) {
 	session.handle(&waEvents.Connected{})
 	drain(t, session)
 
-	if named, _ := session.names(); named != "Atendimento" {
+	if named, _, _ := session.names(); named != "Atendimento" {
 		t.Errorf("after connecting the session calls itself %q, want the name it was told", named)
 	}
 }
@@ -158,7 +158,7 @@ func TestASessionTakesItsOwnVerifiedNameChange(t *testing.T) {
 		OldBusinessName: "Loja do Bruno",
 		NewBusinessName: "Loja do Bruno LTDA",
 	})
-	if _, verified := session.names(); verified != "Loja do Bruno LTDA" {
+	if _, verified, _ := session.names(); verified != "Loja do Bruno LTDA" {
 		t.Errorf("the session is verified as %q, want the name the account changed to", verified)
 	}
 
@@ -167,7 +167,7 @@ func TestASessionTakesItsOwnVerifiedNameChange(t *testing.T) {
 		JID:             waTypes.NewJID("5541988887777", waTypes.DefaultUserServer),
 		NewBusinessName: "Outra Loja",
 	})
-	if _, verified := session.names(); verified != "Loja do Bruno LTDA" {
+	if _, verified, _ := session.names(); verified != "Loja do Bruno LTDA" {
 		t.Errorf("the session is verified as %q after somebody else was renamed", verified)
 	}
 
@@ -177,7 +177,7 @@ func TestASessionTakesItsOwnVerifiedNameChange(t *testing.T) {
 		JID:             waTypes.NewJID("5511999990001", waTypes.HiddenUserServer),
 		NewBusinessName: "Loja Homonima",
 	})
-	if _, verified := session.names(); verified != "Loja do Bruno LTDA" {
+	if _, verified, _ := session.names(); verified != "Loja do Bruno LTDA" {
 		t.Errorf("the session is verified as %q after a LID that only looks like its number", verified)
 	}
 }
@@ -196,7 +196,7 @@ func TestAPairingCarriesTheVerifiedName(t *testing.T) {
 	})
 	drain(t, session)
 
-	if _, verified := session.names(); verified != "Loja do Bruno" {
+	if _, verified, _ := session.names(); verified != "Loja do Bruno" {
 		t.Errorf("after pairing the session is verified as %q, want the name the pairing carried", verified)
 	}
 }
@@ -251,5 +251,49 @@ func TestAResolvePrefersTheNewerPushName(t *testing.T) {
 	}
 	if party := resolved(t, result); party["push_name"] != "Atendimento" {
 		t.Errorf("the account is called %v, want the name it renamed itself to", party)
+	}
+}
+
+// A connection that arrives while an explicit disconnect still stands is closed, and it
+// still authenticated: whatsmeow wrote and saved the LID before the event existed, and no
+// second connection comes to learn it from.
+func TestASessionTakesTheLIDOffASocketItIsAboutToClose(t *testing.T) {
+	t.Parallel()
+
+	const lid = "111222333444555"
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.current().Store.LID = waTypes.NewJID(lid, waTypes.HiddenUserServer)
+	// An explicit disconnect still standing, which is what makes this socket uninvited.
+	session.mu.Lock()
+	session.hungUp = true
+	session.mu.Unlock()
+
+	session.handle(&waEvents.Connected{})
+
+	if _, learned := session.identity(); learned != lid {
+		t.Errorf("the session says its LID is %q, want the one the refused connection brought", learned)
+	}
+}
+
+// A verified name from an event is the newest copy there is. The contact rows for the two
+// namespaces can disagree -- whatsmeow writes the LID row first and logs a failure on the
+// phone one -- and reading the stale row would undo a change this session was told about.
+func TestAResolveKeepsTheVerifiedNameAnEventBrought(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	own := waTypes.NewJID("5511999990001", waTypes.DefaultUserServer)
+	if _, _, err := session.current().Store.Contacts.PutBusinessName(t.Context(), own, "Loja do Bruno"); err != nil {
+		t.Fatalf("PutBusinessName: %v", err)
+	}
+	session.handle(&waEvents.BusinessName{JID: own, NewBusinessName: "Loja do Bruno LTDA"})
+
+	result, err := session.Execute(t.Context(), resolveCommand(t, `{"party":{"kind":"phone","id":"5511999990001"}}`))
+	if err != nil {
+		t.Fatalf("contact.resolve: %v", err)
+	}
+	if party := resolved(t, result); party["verified_name"] != "Loja do Bruno LTDA" {
+		t.Errorf("the account is verified as %v, want the name the event brought", party)
 	}
 }

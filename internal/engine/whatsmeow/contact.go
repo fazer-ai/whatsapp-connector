@@ -326,11 +326,11 @@ func (s *Session) resolveContact(ctx context.Context, command *protocol.Command)
 		//     device record, so after a restart the session holds the older of the two and
 		//     the table wins.
 		s.nameFromStore(reading, &named)
-		pushName, verifiedName := s.names()
+		pushName, verifiedName, live := s.names()
 		if pushName != "" {
 			named.PushName = pushName
 		}
-		if named.VerifiedName == "" {
+		if live || named.VerifiedName == "" {
 			named.VerifiedName = verifiedName
 		}
 		return json.Marshal(named)
