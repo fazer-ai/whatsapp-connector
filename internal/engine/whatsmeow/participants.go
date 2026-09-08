@@ -96,52 +96,9 @@ func (s *Session) updateGroupParticipants(ctx context.Context, command *protocol
 		return nil, contactFailure(err, "participants update")
 	}
 
-	// Indexed by every name WhatsApp answered under, because which one comes back is not
-	// the caller's choice: a participant asked for by phone is answered under a LID on an
-	// account that has one, and matching by position instead would line the rows up
-	// wrong the moment WhatsApp leaves somebody out of its answer.
-	//
-	// Keyed by the canonical address and not by its digits alone. A LID and a phone
-	// number are separate namespaces that happen to be written the same way, so a request
-	// naming both `{phone, 5511999990002}` and `{lid, 5511999990002}` -- two different
-	// people -- would collapse onto one key and report one's verdict for both.
-	verdicts := make(map[protocol.Address]*waTypes.GroupParticipant, len(answered)*2)
-	for i := range answered {
-		one := &answered[i]
-		for _, named := range []waTypes.JID{one.JID, one.PhoneNumber, one.LID} {
-			if canonical, addressable := addressOf(named); addressable {
-				verdicts[canonical] = one
-			}
-		}
-	}
-
-	rows := make([]participantOutcome, len(req.Participants))
-	refused := 0
-	for i, party := range req.Participants {
-		rows[i] = participantOutcome{Address: party, Status: "failed"}
-		verdict, mentioned := verdicts[party]
-		switch {
-		case !mentioned:
-			// WhatsApp answered the request and said nothing about this person. Silence
-			// is not consent: reporting success here would tell a caller somebody was
-			// removed from a group they are still in.
-			s.log.Warn().Str("action", req.Action).
-				Msg("WhatsApp left a participant out of its answer to a participants update")
-			rows[i].Code = refusalOf(protocol.ErrorWaError)
-		case verdict.Error != 0:
-			// The number, because the vocabulary the row answers in is deliberately
-			// narrower than WhatsApp's and this is where the rest of it is kept.
-			s.log.Info().Str("action", req.Action).Int("wa_code", verdict.Error).
-				Msg("WhatsApp refused one participant of a participants update")
-			rows[i].Code = refusalOf(participantRefusal(action, verdict.Error))
-		default:
-			rows[i].Status = "success"
-		}
-		if rows[i].Status == "failed" {
-			refused++
-		}
-	}
-
+	rows, refused := s.verdicts(req.Participants, answered, req.Action, func(code int) protocol.ErrorCode {
+		return participantRefusal(action, code)
+	})
 	if refused == len(rows) {
 		// Nothing was carried out, and that is the command failing rather than a command
 		// reporting failures. Three of the four actions reach this connector one
@@ -158,6 +115,65 @@ func (s *Session) updateGroupParticipants(ctx context.Context, command *protocol
 			fmt.Sprintf("WhatsApp carried out none of the %d participant changes", len(rows)))
 	}
 	return json.Marshal(rows)
+}
+
+// verdicts lines WhatsApp's answer up against what was asked: one row per participant, in
+// the order asked, under the address that was asked. It also counts the refusals, because
+// a request nothing was carried out of is the command failing rather than a command
+// reporting failures, and that is the caller's decision to make.
+//
+// `named` is what turns WhatsApp's number into a code the contract carries, and it differs
+// per command: an add refused with 403 has a name, and no code WhatsApp answers a join
+// request with has been confirmed to mean anything in particular.
+func (s *Session) verdicts(
+	asked []protocol.Address, answered []waTypes.GroupParticipant,
+	action string, named func(int) protocol.ErrorCode,
+) (rows []participantOutcome, refused int) {
+	// Indexed by every name WhatsApp answered under, because which one comes back is not
+	// the caller's choice: a participant asked for by phone is answered under a LID on an
+	// account that has one, and matching by position instead would line the rows up
+	// wrong the moment WhatsApp leaves somebody out of its answer.
+	//
+	// Keyed by the canonical address and not by its digits alone. A LID and a phone
+	// number are separate namespaces that happen to be written the same way, so a request
+	// naming both `{phone, 5511999990002}` and `{lid, 5511999990002}` -- two different
+	// people -- would collapse onto one key and report one's verdict for both.
+	verdicts := make(map[protocol.Address]*waTypes.GroupParticipant, len(answered)*2)
+	for i := range answered {
+		one := &answered[i]
+		for _, spelled := range []waTypes.JID{one.JID, one.PhoneNumber, one.LID} {
+			if canonical, addressable := addressOf(spelled); addressable {
+				verdicts[canonical] = one
+			}
+		}
+	}
+
+	rows = make([]participantOutcome, len(asked))
+	for i, party := range asked {
+		rows[i] = participantOutcome{Address: party, Status: "failed"}
+		verdict, mentioned := verdicts[party]
+		switch {
+		case !mentioned:
+			// WhatsApp answered the request and said nothing about this person. Silence
+			// is not consent: reporting success here would tell a caller somebody was
+			// removed from a group they are still in.
+			s.log.Warn().Str("action", action).
+				Msg("WhatsApp left a participant out of its answer")
+			rows[i].Code = refusalOf(protocol.ErrorWaError)
+		case verdict.Error != 0:
+			// The number, because the vocabulary the row answers in is deliberately
+			// narrower than WhatsApp's and this is where the rest of it is kept.
+			s.log.Info().Str("action", action).Int("wa_code", verdict.Error).
+				Msg("WhatsApp refused one participant")
+			rows[i].Code = refusalOf(named(verdict.Error))
+		default:
+			rows[i].Status = "success"
+		}
+		if rows[i].Status == "failed" {
+			refused++
+		}
+	}
+	return rows, refused
 }
 
 // refusalAcross is the one code that answers for a request nothing was carried out of.
