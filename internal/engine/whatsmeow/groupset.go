@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	wm "go.mau.fi/whatsmeow"
@@ -310,6 +311,15 @@ func (s *Session) setGroupPhoto(ctx context.Context, command *protocol.Command) 
 	// nil is what removes it, and an empty string means the same thing here: the caller
 	// said "no image", and there is one way to say that to WhatsApp.
 	if err := s.setPhoto(ctx, s.current(), group, picture); err != nil {
+		if errors.Is(err, wm.ErrInvalidImageFormat) {
+			// WhatsApp refusing the bytes themselves. It answers `not-acceptable`, which
+			// every other command here reports as `wa_error` -- and `wa_error` is
+			// documented as worth retrying, while these bytes are refused every time.
+			// The payload is what is wrong, and the caller has to send a different image
+			// rather than the same one again.
+			return nil, protocol.NewError(protocol.ErrorInvalidPayload,
+				"WhatsApp will not take this image: a group photo has to be a JPEG")
+		}
 		return nil, contactFailure(err, "photo change")
 	}
 	return nil, nil

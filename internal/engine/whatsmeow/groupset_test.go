@@ -630,6 +630,27 @@ func TestAPhotoChangeNeedsAConnection(t *testing.T) {
 	assertCode(t, err, protocol.ErrorNotConnected)
 }
 
+// An image WhatsApp will not take is the caller's payload, not a condition that passes.
+// Reported as `wa_error` it reads as worth retrying, and the same bytes are refused every
+// time: the loop costs a round trip per attempt and never ends with a photo on the group.
+func TestAPhotoWhatsAppWillNotTakeIsThePayloadsFault(t *testing.T) {
+	t.Parallel()
+
+	session := settableSession(t)
+	session.setPhoto = func(context.Context, *wm.Client, waTypes.JID, []byte) error {
+		// What whatsmeow answers when WhatsApp says `not-acceptable`: the sentinel with
+		// the IQ error still reachable through it. Both halves matter -- the IQ error is
+		// what every other refusal here matches on, so a sentinel that did not carry one
+		// would be told apart by accident rather than on purpose.
+		return fmt.Errorf("%w: %w", wm.ErrInvalidImageFormat, &wm.IQError{Code: 406, Text: "not-acceptable"})
+	}
+
+	_, err := session.Execute(t.Context(), photoCommand(t,
+		// Base64 this connector reads happily, of bytes that are not an image at all.
+		`{"group":{"kind":"group","id":"1"},"image":"bmFvIGUgdW0ganBlZw=="}`))
+	assertCode(t, err, protocol.ErrorInvalidPayload)
+}
+
 func TestAPhotoChangeAnswersWhatsAppsRefusal(t *testing.T) {
 	t.Parallel()
 
