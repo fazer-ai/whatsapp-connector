@@ -140,6 +140,7 @@ type Session struct {
 	onWhatsApp func(context.Context, *wm.Client, []string) ([]waTypes.IsOnWhatsAppResponse, error)
 	//nolint:lll // one line per seam reads better than a wrapped signature
 	updateParticipants func(context.Context, *wm.Client, waTypes.JID, []waTypes.JID, wm.ParticipantChange) ([]waTypes.GroupParticipant, error)
+	inviteLink         func(context.Context, *wm.Client, waTypes.JID, bool) (string, error)
 	profilePicture     func(context.Context, *wm.Client, waTypes.JID, *wm.GetProfilePictureParams) (*waTypes.ProfilePictureInfo, error)
 
 	// uploadWait bounds how long an outbound media message spends fetching its file and
@@ -472,6 +473,9 @@ func newSession(
 			participants []waTypes.JID, action wm.ParticipantChange,
 		) ([]waTypes.GroupParticipant, error) {
 			return client.UpdateGroupParticipants(ctx, group, participants, action) //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
+		},
+		inviteLink: func(ctx context.Context, client *wm.Client, group waTypes.JID, revoke bool) (string, error) {
+			return client.GetGroupInviteLink(ctx, group, revoke) //nolint:wrapcheck // the sentinels are read by inviteFailure
 		},
 		profilePicture: func(
 			ctx context.Context, client *wm.Client, party waTypes.JID, params *wm.GetProfilePictureParams,
@@ -1414,6 +1418,8 @@ func (s *Session) Execute(ctx context.Context, command *protocol.Command) (json.
 		return s.contactPicture(ctx, command)
 	case protocol.CommandMessageMarkUnread:
 		return s.markUnread(ctx, command)
+	case protocol.CommandGroupInviteGet:
+		return s.groupInviteOf(ctx, command)
 	case protocol.CommandGroupInfo:
 		return s.groupInfoOf(ctx, command)
 	case protocol.CommandGroupParticipantsUpdate:
