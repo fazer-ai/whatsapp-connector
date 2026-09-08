@@ -235,22 +235,22 @@ func (s *Session) listGroups(ctx context.Context, _ *protocol.Command) (json.Raw
 	// reading `null` has to decide which of the two that is.
 	listed := make([]groupInfo, 0, len(joined))
 	for _, info := range joined {
-		if info == nil {
-			// whatsmeow skips a group it could not parse by logging rather than by
-			// failing, so a nil in the middle is a shape this has to survive.
-			continue
-		}
 		described := s.describeGroupItself(ctx, info)
 		if described.Group.ID == "" {
 			// A group WhatsApp named with something this connector cannot turn into an
-			// address -- a partially parsed node keeps its place in the slice with an
-			// empty JID. Publishing it would put `{"kind":"","id":""}` on the wire, which
-			// is not an address any client can hold and not a shape the contract allows,
-			// and one of those invalidates the whole listing for a client that validates
-			// what it receives. Nothing is lost that a caller could act on: a group it
-			// cannot address is a group it cannot open.
-			s.log.Warn().Msg("left a group out of the listing: WhatsApp named it with no address")
-			continue
+			// address. whatsmeow keeps it: `parseGroupNode` answers a struct even when the
+			// node was malformed, and `GetJoinedGroups` logs the parse error and appends
+			// it anyway, so an entry with an empty JID reaches here.
+			//
+			// The whole listing fails rather than losing that one entry. A listing is a
+			// statement about a set -- these are the groups -- and one silently short is
+			// a statement that is false in a way no client can see: an answer of `[]` for
+			// an account in one unreadable group says it is in none, and a client
+			// reconciling against that removes a group it already knows about. The same
+			// reasoning already keeps a partial roster off the wire.
+			s.log.Error().Str("subject", described.Subject).
+				Msg("WhatsApp listed a group with no address this build can read")
+			return nil, protocol.NewError(protocol.ErrorInternal, "the group listing could not be read")
 		}
 		listed = append(listed, described)
 	}

@@ -421,39 +421,27 @@ func TestAGroupListingAnswersAnEmptyListRatherThanNull(t *testing.T) {
 	}
 }
 
-// whatsmeow answers a slice of pointers, and it skips a group it could not parse by
-// logging rather than by failing -- so a nil in the middle is a shape this has to survive
-// without taking the whole listing down.
-func TestAGroupListingSurvivesAGroupItWasHandedAsNothing(t *testing.T) {
+// A listing is a statement about a set -- these are the groups -- so one silently short is
+// false in a way no client can see. whatsmeow keeps a malformed group node rather than
+// dropping it: `parseGroupNode` answers a struct even on a parse error and
+// `GetJoinedGroups` appends it anyway, so an entry with no JID does reach this code, and an
+// answer of `[]` for an account in one unreadable group would say it is in none.
+func TestAGroupListingFailsRatherThanAnswerAGroupShort(t *testing.T) {
 	t.Parallel()
 
 	session, _ := newTestSession(t, "5511999990001")
 	session.setConnected(true)
 	session.joinedGroups = func(context.Context, *wm.Client) ([]*waTypes.GroupInfo, error) {
 		return []*waTypes.GroupInfo{
-			nil,
-			// Parsed far enough to be a struct and not far enough to have a JID, which is
-			// what whatsmeow leaves behind when a group node is malformed: it logs and
-			// appends anyway.
-			{GroupName: waTypes.GroupName{Name: "Sem endereço"}},
 			{JID: waTypes.NewJID("120363041234567890", waTypes.GroupServer)},
+			// Parsed far enough to be a struct and not far enough to have an id, which is
+			// what a malformed group node leaves behind.
+			{GroupName: waTypes.GroupName{Name: "Sem endereço"}},
 		}, nil
 	}
 
-	result, err := session.Execute(t.Context(), listCommand(t))
-	if err != nil {
-		t.Fatalf("group.list: %v", err)
-	}
-	listed := listedGroups(t, result)
-	if len(listed) != 1 {
-		t.Fatalf("the answer has %d groups, want the one that could be described", len(listed))
-	}
-	// Not on the wire at all: `{"kind":"","id":""}` is not an address any client can hold,
-	// and one of those invalidates the whole listing for a client that validates what it
-	// receives.
-	if bytes.Contains(result, []byte(`"id":""`)) {
-		t.Errorf("a group with no address went out anyway: %s", result)
-	}
+	_, err := session.Execute(t.Context(), listCommand(t))
+	assertCode(t, err, protocol.ErrorInternal)
 }
 
 // The listing must not pay for naming members it is about to throw away. `party` reads the
