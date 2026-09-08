@@ -22,7 +22,6 @@
 package whatsmeow
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -48,15 +47,12 @@ func TestLiveChannelMessageChange(t *testing.T) {
 	liveResume(t, counterpart)
 
 	channel := liveChannel(t, subject)
-	live := liveFollowChannel(t, counterpart, channel)
-	liveChannelReaches(t, counterpart, channel)
-	t.Logf("the counterpart follows %s, live updates for %s", channel, live)
-
-	// Opened before the post, on the follower: it is where a channel's events land, and
-	// the owner's own copy is not what #40 is asking about.
-	watching := watch(t, counterpart)
-
 	to := protocol.Address{Kind: protocol.AddressNewsletter, ID: channel.User}
+
+	// Opened before anything is sent, on the follower: it is where a channel's events
+	// land, and the owner's own copy is not what #40 is asking about.
+	watching := watch(t, counterpart)
+	liveChannelDelivers(t, subject, counterpart, channel, to, watching)
 
 	post := liveSayTo(t, subject, to, "wac channel: the original")
 	received := watching.awaitMessage(t, post, liveChannelWindow)
@@ -84,7 +80,18 @@ func TestLiveChannelMessageChange(t *testing.T) {
 	// that believes the post is gone is the client that asked. Recorded as #134.
 	liveRevokeOwn(t, subject, to, post)
 
-	if arrived := liveNothingAbout(t, watching, protocol.EventMessageRevoked, post, 30*time.Second); arrived {
+	// Nothing arriving is what is being recorded, and nothing is also what a session that
+	// stopped delivering looks like. So a post sent after the deletion is what closes it:
+	// arriving, it proves the subscription was live across the moment the deletion
+	// crossed, which turns the silence in between into evidence rather than an absence.
+	// Same shape `TestLiveWatchAShare` uses for a vote.
+	closing := liveSayTo(t, subject, to, "wac channel: after the deletion")
+	arrived := liveNothingAbout(t, watching, protocol.EventMessageRevoked, post, closing, liveChannelWindow)
+	if dropped := watching.dropped.Load(); dropped > 0 {
+		t.Fatalf("%d emissions were dropped, so the absence of a deletion for %s proves "+
+			"nothing: this watcher's buffer filled before anything drained it", dropped, post)
+	}
+	if arrived {
 		t.Fatalf("a deletion of %s reached the follower, which #134 says does not happen: "+
 			"if this is fixed, assert the deletion here and close it", post)
 	}
@@ -142,26 +149,6 @@ func liveChannel(t *testing.T, owner *Session) waTypes.JID {
 	return info.ID
 }
 
-// liveFollowChannel puts the counterpart on the channel and asks for live updates.
-//
-// The subscription is the part worth noticing: nothing in this connector calls
-// `NewsletterSubscribeLiveUpdates`, so a follower's session gets a channel's posts only
-// for as long as something else asked for them. This phase asks, because otherwise it
-// would be measuring the absence of a subscription rather than what the connector does
-// with a post that arrives.
-func liveFollowChannel(t *testing.T, follower *Session, channel waTypes.JID) time.Duration {
-	t.Helper()
-
-	if err := follower.current().FollowNewsletter(t.Context(), channel); err != nil {
-		t.Fatalf("follow %s: %v", channel, err)
-	}
-	live, err := follower.current().NewsletterSubscribeLiveUpdates(t.Context(), channel)
-	if err != nil {
-		t.Fatalf("subscribe to live updates on %s: %v", channel, err)
-	}
-	return live
-}
-
 // liveRevokeOwn deletes the account's own message, which is the only deletion a channel
 // has: a post's author is the channel, so there is no participant to name.
 func liveRevokeOwn(t *testing.T, from *Session, to protocol.Address, target string) {
@@ -173,69 +160,96 @@ func liveRevokeOwn(t *testing.T, from *Session, to protocol.Address, target stri
 	})
 }
 
-// liveChannelReaches waits until the follower's own session knows it follows the channel.
-//
-// The follow and the subscription are answered before either has propagated, and a post
-// sent in that gap reaches nobody -- which the first run of this phase spent ninety
-// seconds proving, on a channel created moments earlier. Waited on rather than slept
-// through, for the reason AGENTS.md gives: a fixed delay is right until the day WhatsApp
-// is slower than the number somebody guessed.
-func liveChannelReaches(t *testing.T, follower *Session, channel waTypes.JID) {
-	t.Helper()
-
-	// One deadline over the whole wait, not a count of attempts. Each query is an IQ and
-	// whatsmeow gives an IQ 75 seconds, so "N tries, half a second apart" is not the bound
-	// it looks like.
-	waiting, give := context.WithTimeout(t.Context(), time.Minute)
-	defer give()
-	for attempt := 0; ; attempt++ {
-		asking, stop := context.WithTimeout(waiting, 5*time.Second)
-		following, err := follower.current().GetSubscribedNewsletters(asking)
-		stop()
-		if err == nil && slices.ContainsFunc(following, func(one *waTypes.NewsletterMetadata) bool {
-			return one.ID == channel
-		}) {
-			return
-		}
-
-		select {
-		case <-waiting.Done():
-			t.Fatalf("the follower still did not know it follows %s after %d attempts: %v",
-				channel, attempt+1, err)
-		case <-time.After(500 * time.Millisecond):
-		}
-	}
-}
-
 // liveNothingAbout is the negative of liveAwaitAbout: whether an event of that type naming
-// this message turned up at all. Not a Fatal either way -- the caller is what decides
-// which answer is the failure, and here the absence is what is being recorded.
+// `id` turned up before `closing` did.
+//
+// The clock is a message and not a timer, which is the whole point. A deadline expiring
+// says the event did not arrive in that long; a later message arriving says the session
+// was delivering across the window, and only then is the silence about the event rather
+// than about the connection. The timeout stays as a bound on the wait itself, and reaching
+// it is a failure: without the closing message there is nothing to conclude from.
 func liveNothingAbout(
-	t *testing.T, events *recorder, want protocol.EventType, id string, within time.Duration,
+	t *testing.T, events *recorder, want protocol.EventType, id, closing string, within time.Duration,
 ) bool {
 	t.Helper()
 
+	found := false
 	deadline := time.After(within)
 	for {
 		select {
 		case emission, ok := <-events.seen:
 			if !ok {
-				return false
+				t.Fatalf("the session ended before %s closed the window", closing)
 			}
-			if emission.Type != want {
-				continue
-			}
-			var named struct {
-				MessageID string `json:"message_id"`
-			}
-			if err := json.Unmarshal(emission.Payload, &named); err != nil {
-				t.Fatalf("unmarshal a %s: %v", want, err)
-			}
-			if named.MessageID == id {
-				return true
+			switch emission.Type {
+			case want:
+				var named struct {
+					MessageID string `json:"message_id"`
+				}
+				if err := json.Unmarshal(emission.Payload, &named); err != nil {
+					t.Fatalf("unmarshal a %s: %v", want, err)
+				}
+				if named.MessageID == id {
+					found = true
+				}
+			case protocol.EventMessageReceived:
+				var body struct {
+					Message struct {
+						ID string `json:"id"`
+					} `json:"message"`
+				}
+				if err := json.Unmarshal(emission.Payload, &body); err != nil {
+					t.Fatalf("unmarshal a message: %v", err)
+				}
+				if body.Message.ID == closing {
+					return found
+				}
 			}
 		case <-deadline:
-			return false
+			t.Fatalf("%s never arrived within %s%s, so nothing can be concluded about %s: "+
+				"the session may simply have stopped delivering", closing, within,
+				events.overflowed(), id)
+		}
+	}
+}
+
+// liveChannelDelivers gets the follower to a state where a post actually reaches it, and
+// proves it rather than assuming it.
+//
+// Two things have to have happened, and neither is done when its call returns. The follow
+// propagates on its own schedule, and the live-updates subscription is temporary -- it is
+// asked for per run and it is what a channel's posts are delivered under, so a channel
+// reused through WAC_LIVE_CHANNEL is already in `GetSubscribedNewsletters` from a previous
+// run while this run's subscription has not taken effect.
+//
+// So the check is a post that arrives. That is the precondition every leg below needs,
+// stated as itself instead of through a proxy, and the first run of this phase spent
+// ninety seconds discovering what a proxy is worth here.
+func liveChannelDelivers(
+	t *testing.T, owner, follower *Session, channel waTypes.JID, to protocol.Address, events *recorder,
+) {
+	t.Helper()
+
+	if err := follower.current().FollowNewsletter(t.Context(), channel); err != nil {
+		t.Fatalf("follow %s: %v", channel, err)
+	}
+
+	const attempts = 4
+	for attempt := 1; ; attempt++ {
+		live, err := follower.current().NewsletterSubscribeLiveUpdates(t.Context(), channel)
+		if err != nil {
+			t.Fatalf("subscribe to live updates on %s: %v", channel, err)
+		}
+
+		priming := liveSayTo(t, owner, to, fmt.Sprintf("wac channel: priming %d", attempt))
+		if _, arrived := events.sawMessage(t, priming, 20*time.Second); arrived {
+			t.Logf("%s is delivering to the follower, live updates for %s", channel, live)
+			return
+		}
+		if attempt == attempts {
+			t.Fatalf("%d posts to %s never reached the follower, so this phase cannot tell "+
+				"a connector problem from a subscription that never took effect%s",
+				attempts, channel, events.overflowed())
 		}
 	}
 }
