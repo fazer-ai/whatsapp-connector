@@ -1,5 +1,14 @@
 version: "2"
 
+# The live suite is behind `//go:build live`, so without this every file that drives a
+# real account -- where the trickiest code in this repo lives -- is outside the analysis.
+# Set here rather than on the CI step so it holds for `make lint`, the git hooks, and
+# anyone running the binary by hand: a lint that only the remote enforces is one that
+# finds things after they are pushed, which is how a `paramTypeCombine` reached main.
+run:
+  build-tags:
+    - live
+
 linters:
   default: standard
   enable:
