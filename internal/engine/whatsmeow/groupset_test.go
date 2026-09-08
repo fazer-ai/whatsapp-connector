@@ -500,3 +500,166 @@ func TestLeavingAnswersWhatsAppsRefusal(t *testing.T) {
 		})
 	}
 }
+
+func photoCommand(t *testing.T, payload string) *protocol.Command {
+	t.Helper()
+	return setCommand(t, protocol.CommandGroupPhotoSet, payload)
+}
+
+// A one-pixel JPEG, which is what a real payload carries: base64 of actual bytes.
+const aTinyJPEG = "/9j/4AAQSkZJRgABAQEAYABgAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0a" +
+	"HBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/wAALCAABAAEBAREA/8QAFAABAAAAAAAA" +
+	"AAAAAAAAAAAACf/EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAD8AKp//2Q=="
+
+func TestAPhotoChangeRefusesAPayloadItCannotCarryOut(t *testing.T) {
+	t.Parallel()
+
+	for _, refused := range []struct {
+		name    string
+		payload string
+	}{
+		{name: "no payload at all", payload: `{}`},
+		{name: "a chat that is not a group", payload: `{"group":{"kind":"phone","id":"5511999990002"},"image":null}`},
+		{name: "an image that is not base64", payload: `{"group":{"kind":"group","id":"1"},"image":"not base64!!"}`},
+		{name: "base64 that decodes to nothing", payload: `{"group":{"kind":"group","id":"1"},"image":""}`},
+		{name: "an image that is not text at all", payload: `{"group":{"kind":"group","id":"1"},"image":42}`},
+	} {
+		t.Run(refused.name, func(t *testing.T) {
+			t.Parallel()
+			session := settableSession(t)
+			session.setPhoto = func(context.Context, *wm.Client, waTypes.JID, []byte) error {
+				t.Error("a payload that says nothing about a picture changed one anyway")
+				return nil
+			}
+
+			_, err := session.Execute(t.Context(), photoCommand(t, refused.payload))
+			assertCode(t, err, protocol.ErrorInvalidPayload)
+		})
+	}
+}
+
+// Refusing a payload with no `image` reads as the careful thing to do, and it would make
+// the removal unreachable: the contract's own rule is that an absent field and a null are
+// the same to a reader, and the client that speaks it drops nils before it writes a frame,
+// so `{"group": ...}` is the only removal it can send.
+func TestAPhotoChangeWithNoImageAtAllRemovesThePicture(t *testing.T) {
+	t.Parallel()
+
+	session := settableSession(t)
+	removed := false
+	session.setPhoto = func(_ context.Context, _ *wm.Client, _ waTypes.JID, picture []byte) error {
+		removed = true
+		if picture != nil {
+			t.Errorf("WhatsApp was given %d bytes, want nothing at all", len(picture))
+		}
+		return nil
+	}
+
+	if _, err := session.Execute(t.Context(),
+		photoCommand(t, `{"group":{"kind":"group","id":"1"}}`)); err != nil {
+		t.Fatalf("group.photo.set: %v", err)
+	}
+	if !removed {
+		t.Error("a photo change with no image did not reach WhatsApp at all")
+	}
+}
+
+func TestAPhotoChangeSendsTheBytesItWasGiven(t *testing.T) {
+	t.Parallel()
+
+	session := settableSession(t)
+	var sent []byte
+	session.setPhoto = func(_ context.Context, _ *wm.Client, group waTypes.JID, picture []byte) error {
+		if group.Server != waTypes.GroupServer || group.User != "120363000000000001" {
+			t.Errorf("the photo was set on %s, want the group that was named", group)
+		}
+		sent = picture
+		return nil
+	}
+
+	result, err := session.Execute(t.Context(), photoCommand(t,
+		`{"group":{"kind":"group","id":"120363000000000001"},"image":"`+aTinyJPEG+`"}`))
+	if err != nil {
+		t.Fatalf("group.photo.set: %v", err)
+	}
+	// Decoded, not passed through as text: WhatsApp is handed the picture, not its
+	// spelling.
+	if len(sent) < 100 || sent[0] != 0xFF || sent[1] != 0xD8 {
+		t.Errorf("WhatsApp was given %d bytes starting %x, want the decoded JPEG", len(sent), sent[:min(2, len(sent))])
+	}
+	if result != nil {
+		t.Errorf("the answer carries %s, want nothing", result)
+	}
+}
+
+// Null is how a group's picture comes off where a client can write one, and whatsmeow
+// reads a nil avatar as the removal.
+func TestAPhotoChangeRemovesThePictureOnANullImage(t *testing.T) {
+	t.Parallel()
+
+	session := settableSession(t)
+	removed := false
+	session.setPhoto = func(_ context.Context, _ *wm.Client, _ waTypes.JID, picture []byte) error {
+		removed = true
+		if picture != nil {
+			t.Errorf("WhatsApp was given %d bytes, want nothing at all", len(picture))
+		}
+		return nil
+	}
+
+	if _, err := session.Execute(t.Context(),
+		photoCommand(t, `{"group":{"kind":"group","id":"1"},"image":null}`)); err != nil {
+		t.Fatalf("group.photo.set: %v", err)
+	}
+	if !removed {
+		t.Error("a null image did not reach WhatsApp at all")
+	}
+}
+
+func TestAPhotoChangeNeedsAConnection(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setPhoto = func(context.Context, *wm.Client, waTypes.JID, []byte) error {
+		t.Error("a disconnected session changed a group's photo anyway")
+		return nil
+	}
+
+	_, err := session.Execute(t.Context(), photoCommand(t,
+		`{"group":{"kind":"group","id":"1"},"image":null}`))
+	assertCode(t, err, protocol.ErrorNotConnected)
+}
+
+// An image WhatsApp will not take is the caller's payload, not a condition that passes.
+// Reported as `wa_error` it reads as worth retrying, and the same bytes are refused every
+// time: the loop costs a round trip per attempt and never ends with a photo on the group.
+func TestAPhotoWhatsAppWillNotTakeIsThePayloadsFault(t *testing.T) {
+	t.Parallel()
+
+	session := settableSession(t)
+	session.setPhoto = func(context.Context, *wm.Client, waTypes.JID, []byte) error {
+		// What whatsmeow answers when WhatsApp says `not-acceptable`: the sentinel with
+		// the IQ error still reachable through it. Both halves matter -- the IQ error is
+		// what every other refusal here matches on, so a sentinel that did not carry one
+		// would be told apart by accident rather than on purpose.
+		return fmt.Errorf("%w: %w", wm.ErrInvalidImageFormat, &wm.IQError{Code: 406, Text: "not-acceptable"})
+	}
+
+	_, err := session.Execute(t.Context(), photoCommand(t,
+		// Base64 this connector reads happily, of bytes that are not an image at all.
+		`{"group":{"kind":"group","id":"1"},"image":"bmFvIGUgdW0ganBlZw=="}`))
+	assertCode(t, err, protocol.ErrorInvalidPayload)
+}
+
+func TestAPhotoChangeAnswersWhatsAppsRefusal(t *testing.T) {
+	t.Parallel()
+
+	session := settableSession(t)
+	session.setPhoto = func(context.Context, *wm.Client, waTypes.JID, []byte) error {
+		return &wm.IQError{Code: 403, Text: "forbidden"}
+	}
+
+	_, err := session.Execute(t.Context(), photoCommand(t,
+		`{"group":{"kind":"group","id":"1"},"image":null}`))
+	assertCode(t, err, protocol.ErrorWaError)
+}

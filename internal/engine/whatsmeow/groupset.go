@@ -2,7 +2,9 @@ package whatsmeow
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	wm "go.mau.fi/whatsmeow"
@@ -242,6 +244,75 @@ func (s *Session) leaveGroup(ctx context.Context, command *protocol.Command) (js
 	}
 	if err := s.leave(ctx, s.current(), group); err != nil {
 		return nil, contactFailure(err, "group departure")
+	}
+	return nil, nil
+}
+
+// photoRequest is `group.photo.set`. A nil image removes the picture, and an absent field
+// is a nil.
+//
+// Telling absent from null looks like the careful reading -- a caller who forgot the field
+// would then not lose a group's photo to it -- and the contract closes that door on
+// purpose: an absent field and an explicit null mean the same thing to a reader, and a
+// field that has to distinguish them carries its own flag (`group_info.has_picture` is the
+// one that does). The client that speaks this contract is built on the same rule and drops
+// nils on the way out, so `image: null` is not a payload it can send at all: a connector
+// that insisted on it would answer the only removal a client can express with
+// `invalid_payload`.
+type photoRequest struct {
+	Group protocol.Address `json:"group"`
+	Image *string          `json:"image"`
+}
+
+// setGroupPhoto carries out `group.photo.set`.
+//
+// The bytes travel inside the frame, base64, which is the one place this contract puts
+// media on the wire: `contract/README.md` says media never does, and the picture of a
+// group is the exception the schema spells out. It is a profile picture -- WhatsApp keeps
+// these small -- rather than a message attachment, and there is no `media_ref` for
+// something that was never a message.
+func (s *Session) setGroupPhoto(ctx context.Context, command *protocol.Command) (json.RawMessage, error) {
+	var req photoRequest
+	if err := json.Unmarshal(command.Payload, &req); err != nil {
+		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
+			"a photo change has to name a group and say what to put on it")
+	}
+	group, err := groupToChange(req.Group, "a photo")
+	if err != nil {
+		return nil, err
+	}
+
+	var picture []byte
+	if req.Image != nil {
+		if picture, err = base64.StdEncoding.DecodeString(*req.Image); err != nil {
+			return nil, protocol.NewError(protocol.ErrorInvalidPayload,
+				"the image is not base64 this connector can read")
+		}
+		if len(picture) == 0 {
+			// An empty string, or base64 that decodes to nothing. Sent on, WhatsApp would
+			// be handed a picture element with no picture in it, which is neither setting
+			// a photo nor removing one. Refused rather than read as a removal, because a
+			// caller that meant to remove had a way to say so and did not use it.
+			return nil, protocol.NewError(protocol.ErrorInvalidPayload,
+				"the image decodes to nothing: leave the field out to remove the picture")
+		}
+	}
+	if err := s.readyToSend(); err != nil {
+		return nil, err
+	}
+	// nil is what removes it: whatsmeow reads a nil avatar as the removal, and that is
+	// the one way to say it to WhatsApp.
+	if err := s.setPhoto(ctx, s.current(), group, picture); err != nil {
+		if errors.Is(err, wm.ErrInvalidImageFormat) {
+			// WhatsApp refusing the bytes themselves. It answers `not-acceptable`, which
+			// every other command here reports as `wa_error` -- and `wa_error` is
+			// documented as worth retrying, while these bytes are refused every time.
+			// The payload is what is wrong, and the caller has to send a different image
+			// rather than the same one again.
+			return nil, protocol.NewError(protocol.ErrorInvalidPayload,
+				"WhatsApp will not take this image: a group photo has to be a JPEG")
+		}
+		return nil, contactFailure(err, "photo change")
 	}
 	return nil, nil
 }
