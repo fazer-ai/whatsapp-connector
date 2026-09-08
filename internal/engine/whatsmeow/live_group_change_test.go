@@ -68,7 +68,7 @@ func TestLiveGroupMessageChange(t *testing.T) {
 	// somebody else's, sent by the counterpart.
 	target := liveSayTo(t, counterpart, to, "wac group change: the original")
 	received := watchingSubject.awaitMessage(t, target, liveGroupChangeWindow)
-	liveCheckAGroupSender(t, "the message", received, theCounterpart, mode)
+	liveCheckAGroupSender(t, "the message", received, to, theCounterpart, mode)
 
 	// Leg 2: the counterpart corrects it. The correction is a stanza with an id of its
 	// own, and publishing that one instead of the target leaves a client looking for a
@@ -77,24 +77,26 @@ func TestLiveGroupMessageChange(t *testing.T) {
 	edited := liveAwaitAbout(t, watchingSubject, protocol.EventMessageEdited,
 		"message_id", target, liveGroupChangeWindow)
 	liveCheckTheCorrection(t, edited, target)
-	liveCheckAGroupSender(t, "the correction", edited.Payload, theCounterpart, mode)
+	liveCheckAGroupSender(t, "the correction", edited.Payload, to, theCounterpart, mode)
 
 	// Leg 3: the reaction and taking it back, in that order, each awaited before the
 	// next is sent. Waiting for both at once would let one leg's absence be covered by
 	// the other's arrival.
-	liveReact(t, counterpart, to, target, "👍")
+	putID := liveReact(t, counterpart, to, target, "👍")
 	put := liveAwaitAbout(t, watchingSubject, protocol.EventMessageReaction,
 		"target_id", target, liveGroupChangeWindow)
-	liveCheckAGroupSender(t, "the reaction", put.Payload, theCounterpart, mode)
+	liveCheckReactionID(t, "the reaction", put.Payload, putID)
+	liveCheckAGroupSender(t, "the reaction", put.Payload, to, theCounterpart, mode)
 
-	liveReact(t, counterpart, to, target, "")
+	takenID := liveReact(t, counterpart, to, target, "")
 	taken := liveAwaitAbout(t, watchingSubject, protocol.EventMessageReaction,
 		"target_id", target, liveGroupChangeWindow)
+	liveCheckReactionID(t, "the reaction being taken back", taken.Payload, takenID)
 	// Checked on the removal as much as on the reaction. They are two events on the wire
 	// and nothing makes the second inherit the first's sender: a removal that named
 	// nobody, or named the wrong member, would take a reaction off somebody else's
 	// bubble, and asserting only on `put` would let that through.
-	liveCheckAGroupSender(t, "the reaction being taken back", taken.Payload, theCounterpart, mode)
+	liveCheckAGroupSender(t, "the reaction being taken back", taken.Payload, to, theCounterpart, mode)
 	liveCheckTheReactions(t, []engine.Emission{put, taken}, target)
 
 	// Leg 4: the subject is the group's creator and therefore its admin, and deletes the
@@ -103,7 +105,7 @@ func TestLiveGroupMessageChange(t *testing.T) {
 	liveRevokeAsAdmin(t, subject, to, target, liveAddressOf(t, counterpartJID))
 	revoked := liveAwaitAbout(t, watchingCounterpart, protocol.EventMessageRevoked,
 		"message_id", target, liveGroupChangeWindow)
-	liveCheckAnAdminDeletion(t, revoked, target, theSubject, mode)
+	liveCheckAnAdminDeletion(t, revoked, target, to, theSubject, mode)
 
 	for name, session := range map[string]*Session{"subject": subject, "counterpart": counterpart} {
 		if state := session.state(); state != "open" {
@@ -115,7 +117,8 @@ func TestLiveGroupMessageChange(t *testing.T) {
 // liveCheckAnAdminDeletion reads a deletion the account did not perform on a message it
 // did send. The two fields it exists for are the ones a direct chat cannot produce.
 func liveCheckAnAdminDeletion(
-	t *testing.T, emission engine.Emission, target string, admin protocol.Party, mode waTypes.AddressingMode,
+	t *testing.T, emission engine.Emission, target string,
+	in protocol.Address, admin protocol.Party, mode waTypes.AddressingMode,
 ) {
 	t.Helper()
 
@@ -137,7 +140,7 @@ func liveCheckAnAdminDeletion(
 		t.Fatalf("an admin's deletion of this account's message was published as %q, want %q: %s",
 			body.By, protocol.RevokedByContact, emission.Payload)
 	}
-	liveCheckAGroupSender(t, "the deletion", emission.Payload, admin, mode)
+	liveCheckAGroupSender(t, "the deletion", emission.Payload, in, admin, mode)
 	if body.Sender == nil {
 		t.Fatalf("the deletion says somebody else performed it and does not say who: %s", emission.Payload)
 	}
@@ -154,16 +157,26 @@ func liveCheckAnAdminDeletion(
 // resolve a second contact for one person, and one carrying a wrong second spelling would
 // merge two people into one.
 func liveCheckAGroupSender(
-	t *testing.T, what string, payload json.RawMessage, who protocol.Party, mode waTypes.AddressingMode,
+	t *testing.T, what string, payload json.RawMessage,
+	in protocol.Address, who protocol.Party, mode waTypes.AddressingMode,
 ) {
 	t.Helper()
 
 	var body struct {
-		FromMe bool            `json:"from_me"`
-		Sender *protocol.Party `json:"sender"`
+		Chat   protocol.Address `json:"chat"`
+		FromMe bool             `json:"from_me"`
+		Sender *protocol.Party  `json:"sender"`
 	}
 	if err := json.Unmarshal(payload, &body); err != nil {
 		t.Fatalf("unmarshal %s: %v", what, err)
+	}
+	// Every wait below selects on a message id alone, so an event published under the
+	// wrong chat would satisfy all of them. A client routes on this field: the same
+	// correction filed under a direct chat lands in a one-to-one conversation that never
+	// had the message, and under another group it lands in somebody else's.
+	if body.Chat != in {
+		t.Fatalf("%s was published under chat %+v, and it happened in %+v: %s",
+			what, body.Chat, in, payload)
 	}
 	if body.FromMe {
 		t.Fatalf("%s came from another member and was published as the account's own: %s", what, payload)
@@ -196,6 +209,25 @@ func liveCheckAGroupSender(
 	}
 	fmt.Fprintf(os.Stderr, "%s: from %s %s (phone %q, lid %q)\n",
 		what, namespace, required, body.Sender.Phone, body.Sender.LID)
+}
+
+// liveCheckReactionID compares a reaction's own id against the one the sending side put
+// it out under. `liveCheckTheReactions` only asks that the id is not empty and not the
+// target's, which two reactions published under one wrong id both satisfy -- and a client
+// that deduplicates on it would then drop the removal and leave the emoji on the bubble
+// forever.
+func liveCheckReactionID(t *testing.T, what string, payload json.RawMessage, sent string) {
+	t.Helper()
+
+	var body struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(payload, &body); err != nil {
+		t.Fatalf("unmarshal %s: %v", what, err)
+	}
+	if body.ID != sent {
+		t.Fatalf("%s arrived under id %q and went out under %q", what, body.ID, sent)
+	}
 }
 
 // liveWhoIs is both spellings of the account a session is signed in as, read out of that
@@ -275,17 +307,22 @@ func liveEdit(t *testing.T, from *Session, to protocol.Address, target, body str
 	})
 }
 
-// liveReact puts an emoji on a message, or takes it off when the emoji is empty.
-func liveReact(t *testing.T, from *Session, to protocol.Address, target, emoji string) {
+// liveReact puts an emoji on a message, or takes it off when the emoji is empty, and says
+// which id it went out under. A client deduplicates reactions on that id and matches its
+// own sends by it, so the id is as load-bearing as the emoji and has to be checked
+// against something the receiving side did not invent.
+func liveReact(t *testing.T, from *Session, to protocol.Address, target, emoji string) string {
 	t.Helper()
 
+	reactionID := from.current().GenerateMessageID()
 	liveCommand(t, from, protocol.CommandMessageReact, map[string]any{
-		"message_id":     from.current().GenerateMessageID(),
+		"message_id":     reactionID,
 		"to":             map[string]any{"kind": to.Kind, "id": to.ID},
 		"target_id":      target,
 		"target_from_me": true,
 		"emoji":          emoji,
 	})
+	return reactionID
 }
 
 // liveRevokeAsAdmin deletes somebody else's message, which only a group admin can do and
