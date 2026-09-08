@@ -307,14 +307,19 @@ func (s *Session) resolveContact(ctx context.Context, command *protocol.Command)
 		// than fails on -- so the account can be the one party the table cannot answer
 		// for, which would be an absurd thing for this command to be unable to resolve.
 		//
-		// The LID half is only as good as what the session was told: a resumed device
-		// learns its LID on the connection rather than through a `PairSuccess`, and
-		// nothing copies it out afterwards, so this can answer with the number alone.
-		// That is issue #138, and it is a missing half rather than a wrong one.
+		// The LID half is as good as what the session has been told, which is the device
+		// it was built on plus what the connection brought: a resumed device learns its
+		// LID there rather than through a `PairSuccess`. A session that has never
+		// connected can still answer with the number alone.
 		if lid != "" {
 			named.LID = lid
 		}
 		named.Phone = phone
+		// Its own names come off the session, which took them from the device where an
+		// ordering exists. The contact table holds the people this account has met and it
+		// is not one of them, so resolving itself through the table alone answers with no
+		// name at all.
+		named.PushName, named.VerifiedName = s.names()
 		s.nameFromStore(reading, &named)
 		return json.Marshal(named)
 	}

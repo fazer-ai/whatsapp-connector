@@ -424,6 +424,14 @@ type Session struct {
 	// and rebuilding. Fusing the two would have a connect arriving during a logout run
 	// that cleanup a second time, alongside the one the logout is already running.
 	revoked bool
+
+	// pushName and businessName are this account's own display names. They live here
+	// rather than being read off `client.Store` where they are wanted, because whatsmeow
+	// writes those fields from its own goroutines: the copy is taken where an ordering
+	// exists -- building a client nothing else holds yet, and the events that announce
+	// each change -- and read from here under the lock like every other session field.
+	pushName     string
+	businessName string
 	// phone and lid are this session's copy of what it paired. whatsmeow assigns the
 	// same fields on its pairing goroutine, so reading them off the client from a
 	// command is a race; this is written from the event handler and read under the
@@ -617,14 +625,25 @@ func sessionNonce() string {
 // identityOf reads what a client was built knowing. Safe before the client is running,
 // which is the only time this is called: once it is, whatsmeow assigns the same fields
 // from its pairing goroutine.
-func identityOf(client *wm.Client) (phone, lid string) {
+// account is what a device record says about the account on it.
+type account struct {
+	phone        string
+	lid          string
+	pushName     string
+	businessName string
+}
+
+func identityOf(client *wm.Client) account {
+	var named account
 	if id := client.Store.ID; id != nil {
-		phone = id.User
+		named.phone = id.User
 	}
 	if stored := client.Store.LID; !stored.IsEmpty() {
-		lid = stored.User
+		named.lid = stored.User
 	}
-	return phone, lid
+	named.pushName = client.Store.PushName
+	named.businessName = client.Store.BusinessName
+	return named
 }
 
 // adopt takes a client over: it wires the callbacks, subscribes to its events, and
@@ -663,7 +682,9 @@ func (s *Session) adopt(client *wm.Client) bool {
 	// ciphertext, until a handler accepts it.
 	client.EnableDecryptedEventBuffer = true
 
-	phone, lid := identityOf(client)
+	// Read here and not later: this client was built for this session and nothing else
+	// holds it yet, so whatsmeow's own goroutines are not writing to it.
+	named := identityOf(client)
 
 	// Subscribed before the swap, so the client is never live with nobody listening,
 	// and both halves are one lifecycle step: a Close that lands between them would
@@ -679,8 +700,10 @@ func (s *Session) adopt(client *wm.Client) bool {
 	}
 	s.client = client
 	s.handlerID = handlerID
-	s.phone = phone
-	s.lid = lid
+	s.phone = named.phone
+	s.lid = named.lid
+	s.pushName = named.pushName
+	s.businessName = named.businessName
 	s.stale = false
 	s.revoked = false
 	s.connected = false
@@ -811,6 +834,47 @@ func (s *Session) setIdentity(phone, lid string) {
 	s.mu.Lock()
 	s.phone = phone
 	s.lid = lid
+	s.mu.Unlock()
+}
+
+// rename records a push name the account changed while the session was up.
+func (s *Session) rename(pushName string) {
+	if pushName == "" {
+		return
+	}
+	s.mu.Lock()
+	s.pushName = pushName
+	s.mu.Unlock()
+}
+
+// names is what this account calls itself: the push name every recipient sees, and the
+// verified name a business account carries.
+func (s *Session) names() (pushName, businessName string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.pushName, s.businessName
+}
+
+// relearn takes the account's own details off the client again.
+//
+// The LID is why. whatsmeow learns it from the connection rather than from the device it
+// resumed -- `handleConnectSuccess` writes `Store.LID` and saves -- so a device stored
+// before the account had one runs with none until this. Nothing else puts it back: the
+// only other writer is pairing, and a resumed session never pairs.
+//
+// Called from the Connected handler, which is where the ordering is: whatsmeow writes the
+// LID and then starts the goroutine that dispatches the event, so what this reads is what
+// that write left.
+func (s *Session) relearn(client *wm.Client) {
+	if client == nil || client.Store == nil {
+		return
+	}
+	named := identityOf(client)
+	s.mu.Lock()
+	s.phone = named.phone
+	s.lid = named.lid
+	s.pushName = named.pushName
+	s.businessName = named.businessName
 	s.mu.Unlock()
 }
 
@@ -2460,6 +2524,10 @@ func (s *Session) handle(rawEvent any) bool {
 			go s.current().Disconnect()
 			return true
 		}
+		// The connection is where a resumed device learns its LID, so this is the one
+		// moment the session's copy of the account can become more complete than the
+		// record it was built from.
+		s.relearn(s.current())
 		s.setConnected(true)
 		// Off this goroutine, because this writes a node and the transition lock is
 		// held for the length of this case: a socket slow to take it would hold every
@@ -2555,6 +2623,11 @@ func (s *Session) handle(rawEvent any) bool {
 		})
 	case *waEvents.PairSuccess:
 		s.paired(event)
+	case *waEvents.PushNameSetting:
+		// The account renamed itself, from this phone or another one. Taken off the event
+		// rather than off `client.Store`, which whatsmeow writes on this same path: the
+		// event carries the new name, so there is nothing to go and read.
+		s.rename(event.Action.GetName())
 	case *waEvents.PairError:
 		// Whatever the QR channel does with this, the client is on a device whatsmeow
 		// may have half-written: an id with no credentials, or one it marked deleted.
