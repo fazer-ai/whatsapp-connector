@@ -136,6 +136,10 @@ type ConnectRequest struct {
 	// reaches it at all, and a client that stops setting it stops receiving groups
 	// rather than losing a feature it was not using.
 	//
+	// Acknowledged and dropped rather than refused, because withholding the
+	// acknowledgement would have WhatsApp redeliver every group message the account
+	// receives for as long as the session is up.
+	//
 	// It says nothing about the group *commands*, which are a different question and
 	// are not served: `group.info` and the eleven beside it answer `unsupported`.
 	// Wanting group conversation and being able to administer a group are separate, and

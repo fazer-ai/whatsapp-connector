@@ -43,6 +43,31 @@ func TestLivePairCounterpart(t *testing.T) {
 	counterpart := liveSessionOn(t, waEngine, container, liveCounterpartSID)
 	events := watch(t, counterpart)
 
+	// Refused before pairing, not after, and this ordering is the whole of it. Checking
+	// afterwards reads as equivalent and is destructive: `bind` deletes the competing
+	// mapping and credentials for the other sid, so pairing the number already under test
+	// unpairs the account under test -- and then the check cannot see it, because the row
+	// it would have compared against is the row the pairing just deleted. The phase
+	// reports success over a subject it destroyed, and the next run has to pair again.
+	//
+	// A lookup that fails is not a pass either. There is one thing this refuses and no
+	// way to know whether to refuse without reading the subject, so an unreadable subject
+	// is a reason to stop rather than to carry on unguarded.
+	subject, subjectBound, err := container.For(liveSID).JID(t.Context())
+	if err != nil {
+		t.Fatalf("could not read which account is under test, so there is no way to tell "+
+			"it apart from the counterpart: %v", err)
+	}
+	// Compared through the same normalisation the pairing itself applies. `pairWithCode`
+	// strips everything that is not a digit, so "+55 11 93619-9421" and "5511936199421"
+	// pair the same account and only one of them would have been caught here -- and the
+	// one that slipped through is the one that destroys the subject.
+	if subjectBound && subject.User == digitsOf(phone) {
+		t.Fatalf("WAC_LIVE_COUNTERPART_PHONE is %s, which is the account under test; "+
+			"pairing it would unpair the subject and leave every phase after this "+
+			"checking a conversation with itself", phone)
+	}
+
 	if err := counterpart.Connect(t.Context(), engine.ConnectRequest{Pairing: "code", Phone: phone}); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
@@ -54,12 +79,13 @@ func TestLivePairCounterpart(t *testing.T) {
 	if err != nil || !bound {
 		t.Fatalf("the counterpart paired but nothing was written down (bound=%v, err=%v)", bound, err)
 	}
-	// The two must not be the same account. Pairing the number already under test would
-	// leave every phase after this checking a conversation with itself, which passes and
-	// proves nothing.
-	subject, subjectBound, err := container.For(liveSID).JID(t.Context())
-	if err == nil && subjectBound && subject.User == jid.User {
-		t.Fatalf("the counterpart paired as %s, which is the account under test", jid)
+	// Asked again, because the number that was typed is not necessarily the account that
+	// answered: WhatsApp pairs whichever account the person confirms on, and the guard
+	// above can only refuse the number it was given. This one is not destructive -- by
+	// here the damage, if any, is done -- but it is what says so out loud.
+	if subjectBound && subject.User == jid.User {
+		t.Fatalf("the counterpart paired as %s, which is the account under test; the "+
+			"subject's pairing is gone and both sids have to be paired again", jid)
 	}
 	t.Logf("counterpart paired as %s", jid)
 }
@@ -76,9 +102,14 @@ func TestLiveTwoAccountsTalk(t *testing.T) {
 	subjectJID := liveMustBePaired(t, container, liveSID)
 	counterpartJID := liveMustBePaired(t, container, liveCounterpartSID)
 
-	inbox := watch(t, subject)
 	liveResume(t, subject)
 	liveResume(t, counterpart)
+	// Watched after the resumes, not before. A watcher's buffer holds 256 emissions and
+	// drops what does not fit, and a resume delivers whatever came in while the session
+	// was down: on an account with a real backlog the probe below would be dropped on
+	// arrival, and the phase would wait out its deadline reporting a message that had in
+	// fact been delivered. Nothing here needs the resume's own events.
+	inbox := watch(t, subject)
 
 	said := "conector nativo, contraparte falando " + time.Now().Format(time.TimeOnly)
 	sent := liveSay(t, counterpart, subjectJID.User, said)
@@ -149,8 +180,20 @@ func liveSay(t *testing.T, from *Session, to, body string) string {
 func liveResume(t *testing.T, session *Session) {
 	t.Helper()
 
+	liveResumeAsking(t, session, engine.ConnectRequest{Pairing: "resume"})
+}
+
+// liveResumeAsking is liveResume with the subscriptions the phase needs.
+//
+// Groups are the one that matters, and getting it wrong looks like the feature being
+// broken rather than unasked for: a session that did not subscribe has its group messages
+// acknowledged and published nowhere, so a group phase resuming the ordinary way sits and
+// watches a silence it arranged itself.
+func liveResumeAsking(t *testing.T, session *Session, req engine.ConnectRequest) {
+	t.Helper()
+
 	events := watch(t, session)
-	if err := session.Connect(t.Context(), engine.ConnectRequest{Pairing: "resume"}); err != nil {
+	if err := session.Connect(t.Context(), req); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
 	events.awaitState(t, "open", 2*time.Minute)
