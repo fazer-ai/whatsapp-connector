@@ -1501,6 +1501,8 @@ func (s *Session) Execute(ctx context.Context, command *protocol.Command) (json.
 		return s.checkContacts(ctx, command)
 	case protocol.CommandContactProfilePicture:
 		return s.contactPicture(ctx, command)
+	case protocol.CommandContactResolve:
+		return s.resolveContact(ctx, command)
 	case protocol.CommandMessageMarkUnread:
 		return s.markUnread(ctx, command)
 	case protocol.CommandGroupLeave:

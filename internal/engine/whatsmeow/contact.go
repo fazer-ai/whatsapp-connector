@@ -244,3 +244,104 @@ func (s *Session) contactPicture(ctx context.Context, command *protocol.Command)
 	}
 	return json.Marshal(map[string]any{"url": picture.URL})
 }
+
+// targetRequest is the payload `contact.resolve` names a person with.
+type targetRequest struct {
+	Party protocol.Address `json:"party"`
+}
+
+// resolveContact carries out `contact.resolve`: both of WhatsApp's names for one person,
+// plus whatever display names this session has already learned for them.
+//
+// A phone number and a LID are the same person under two namespaces, and which one an
+// event carries depends on the path it arrived on. A client that stored a contact by
+// number and then meets a LID-only party has no way to see they are the same, and this is
+// the command that answers it.
+//
+// Local by construction: whatsmeow keeps the mapping in the device store, so this costs a
+// read rather than a round trip. `contact.info` is the one that asks WhatsApp, and the
+// division is the whole reason the contract has two commands with one payload.
+//
+// Paired is all it asks for. Every other command here wants a connection because it puts
+// something on the wire; this one reads a table that is there whether the socket is up or
+// not, and refusing a client reconciling its contacts during a reconnect would be a
+// refusal this connector does not need to make.
+func (s *Session) resolveContact(ctx context.Context, command *protocol.Command) (json.RawMessage, error) {
+	var req targetRequest
+	if err := json.Unmarshal(command.Payload, &req); err != nil {
+		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
+			"a resolve has to name the party to resolve")
+	}
+	jid, err := personOf(req.Party, "resolve")
+	if err != nil {
+		return nil, err
+	}
+	if phone, _ := s.identity(); phone == "" {
+		return nil, protocol.NewError(protocol.ErrorNotPaired,
+			"this session has no WhatsApp account to resolve against")
+	}
+
+	named := s.party(ctx, jid)
+	if named.Phone == "" && named.LID == "" {
+		// jidOf built this JID out of an address kind personOf just accepted, so the
+		// party cannot come back empty unless the addressing layer stopped naming one of
+		// the two namespaces it is built on.
+		return nil, protocol.NewError(protocol.ErrorInternal, "the party resolved to no address at all")
+	}
+	s.nameFromStore(ctx, &named)
+	return json.Marshal(named)
+}
+
+// personOf is jidOf for the commands that act on somebody rather than on a conversation.
+//
+// A group, a channel or the status feed parses as an address and is not a person: asked
+// to resolve one, this would hand back a party naming a group as though it were somebody,
+// and a client would file a conversation under a contact that does not exist.
+func personOf(address protocol.Address, subject string) (waTypes.JID, error) {
+	switch address.Kind {
+	case protocol.AddressPhone, protocol.AddressLID:
+		return jidOf(address)
+	default:
+		return waTypes.EmptyJID, protocol.NewError(protocol.ErrorInvalidPayload,
+			fmt.Sprintf("only a person can be the subject of a %s, and %q is not one", subject, address.Kind))
+	}
+}
+
+// nameFromStore fills in the display names the device already holds for a party.
+//
+// Both namespaces are asked, in the order the party names them, because a push name is
+// learned from whichever address the message carrying it arrived under -- so a party
+// resolved from a LID may have its name filed under the phone, and the other way round.
+//
+// Names are an annotation. A store that will not answer leaves the party as it is rather
+// than failing the command: the addresses are what the caller asked for, and they are
+// already in hand.
+func (s *Session) nameFromStore(ctx context.Context, named *protocol.Party) {
+	client := s.current()
+	if client == nil || client.Store == nil || client.Store.Contacts == nil {
+		return
+	}
+	for _, address := range []protocol.Address{
+		{Kind: protocol.AddressPhone, ID: named.Phone},
+		{Kind: protocol.AddressLID, ID: named.LID},
+	} {
+		if address.ID == "" {
+			continue
+		}
+		jid, err := jidOf(address)
+		if err != nil {
+			continue
+		}
+		contact, err := client.Store.Contacts.GetContact(ctx, jid)
+		switch {
+		case err != nil:
+			s.log.Debug().Err(err).Str("kind", string(address.Kind)).
+				Msg("could not read the stored names for a party")
+		case !contact.Found:
+		default:
+			named.PushName = contact.PushName
+			named.VerifiedName = contact.BusinessName
+			return
+		}
+	}
+}
