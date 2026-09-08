@@ -182,7 +182,46 @@ var memberAddModes = map[waTypes.GroupMemberAddMode]string{
 	waTypes.GroupMemberAddModeAllMember: "all_member_add",
 }
 
+// joinedGroupsOverClient is the default for the seam.
+func joinedGroupsOverClient(ctx context.Context, client *wm.Client) ([]*waTypes.GroupInfo, error) {
+	return client.GetJoinedGroups(ctx) //nolint:wrapcheck // classified by its caller
+}
+
 // groupInfoOverClient is the default for the seam.
 func groupInfoOverClient(ctx context.Context, client *wm.Client, group waTypes.JID) (*waTypes.GroupInfo, error) {
 	return client.GetGroupInfo(ctx, group) //nolint:wrapcheck // classified by its caller
+}
+
+// listGroups carries out `group.list`: every group this account is in.
+//
+// Without the rosters, and that is the whole difference between this and asking about each
+// group in turn. An account can be in hundreds of groups of hundreds of people, and a
+// listing that carried every membership would answer with the entire address book of every
+// conversation to say which conversations exist. `size` still says how big each one is,
+// and `group.info` answers the roster for the group a caller actually opens.
+//
+// Absent, not empty: the contract's `participants` is optional and this is the same
+// "not answered" that a partial roster is, which is what keeps a client from reading a
+// listing as the whole of any group's membership and deactivating everybody missing.
+func (s *Session) listGroups(ctx context.Context, _ *protocol.Command) (json.RawMessage, error) {
+	if err := s.readyToSend(); err != nil {
+		return nil, err
+	}
+	joined, err := s.joinedGroups(ctx, s.current())
+	if err != nil {
+		return nil, contactFailure(err, "group listing")
+	}
+
+	// Never nil: an empty list is the answer "this account is in no groups", and a client
+	// reading `null` has to decide which of the two that is.
+	listed := make([]groupInfo, 0, len(joined))
+	for _, info := range joined {
+		if info == nil {
+			continue
+		}
+		described := s.describeGroup(ctx, info)
+		described.Participants = nil
+		listed = append(listed, described)
+	}
+	return json.Marshal(listed)
 }

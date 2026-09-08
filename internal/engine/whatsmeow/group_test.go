@@ -326,3 +326,146 @@ func mustConnection(t *testing.T, session *Session) int64 {
 	on, _ := session.connection()
 	return on
 }
+
+func listCommand(t *testing.T) *protocol.Command {
+	t.Helper()
+	return &protocol.Command{
+		V: protocol.Version, ID: "c1", Type: protocol.CommandGroupList,
+		SID: "s1", Payload: json.RawMessage(`{}`),
+	}
+}
+
+func listedGroups(t *testing.T, result json.RawMessage) []groupInfo {
+	t.Helper()
+	var listed []groupInfo
+	if err := json.Unmarshal(result, &listed); err != nil {
+		t.Fatalf("unmarshal the answer: %v", err)
+	}
+	return listed
+}
+
+// The listing says which groups exist and how big each one is, and leaves the rosters to
+// `group.info`. An account can be in hundreds of groups of hundreds of people, and a
+// listing that carried every membership would answer with the whole address book of every
+// conversation to say which conversations exist.
+func TestAGroupListingAnswersTheGroupsWithoutTheirRosters(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setConnected(true)
+	session.joinedGroups = func(context.Context, *wm.Client) ([]*waTypes.GroupInfo, error) {
+		return []*waTypes.GroupInfo{
+			{
+				JID:              waTypes.NewJID("120363041234567890", waTypes.GroupServer),
+				GroupName:        waTypes.GroupName{Name: "Turma da tarde"},
+				ParticipantCount: 2,
+				Participants: []waTypes.GroupParticipant{
+					{JID: waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)},
+					{JID: waTypes.NewJID("5511999990003", waTypes.DefaultUserServer)},
+				},
+			},
+			{
+				JID:       waTypes.NewJID("120363041234567891", waTypes.GroupServer),
+				GroupName: waTypes.GroupName{Name: "Obras"},
+			},
+		}, nil
+	}
+
+	result, err := session.Execute(t.Context(), listCommand(t))
+	if err != nil {
+		t.Fatalf("group.list: %v", err)
+	}
+	listed := listedGroups(t, result)
+	if len(listed) != 2 {
+		t.Fatalf("the answer has %d groups, want the two this account is in", len(listed))
+	}
+	if listed[0].Group.Kind != protocol.AddressGroup || listed[0].Group.ID != "120363041234567890" {
+		t.Errorf("the first group came back as %+v, want the one WhatsApp named", listed[0].Group)
+	}
+	if listed[0].Subject != "Turma da tarde" {
+		t.Errorf("the first group is called %q, want its subject", listed[0].Subject)
+	}
+	// The count survives; the membership does not.
+	if listed[0].Size != 2 {
+		t.Errorf("the first group has size %d, want 2", listed[0].Size)
+	}
+	if len(listed[0].Participants) != 0 {
+		t.Errorf("the listing carries %d participants, want the roster left to group.info",
+			len(listed[0].Participants))
+	}
+	// Absent rather than empty: an empty roster is still a roster to whoever reads one,
+	// and a client that deactivates every membership missing from it would empty the group.
+	if bytes.Contains(result, []byte(`"participants"`)) {
+		t.Errorf("the listing carries a participants field: %s", result)
+	}
+}
+
+// An empty list is the answer "this account is in no groups". `null` would leave a client
+// deciding whether that means the same thing.
+func TestAGroupListingAnswersAnEmptyListRatherThanNull(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setConnected(true)
+	session.joinedGroups = func(context.Context, *wm.Client) ([]*waTypes.GroupInfo, error) {
+		return nil, nil
+	}
+
+	result, err := session.Execute(t.Context(), listCommand(t))
+	if err != nil {
+		t.Fatalf("group.list: %v", err)
+	}
+	if string(result) != "[]" {
+		t.Errorf("an account in no groups answered %s, want an empty list", result)
+	}
+}
+
+// whatsmeow answers a slice of pointers, and it skips a group it could not parse by
+// logging rather than by failing -- so a nil in the middle is a shape this has to survive
+// without taking the whole listing down.
+func TestAGroupListingSurvivesAGroupItWasHandedAsNothing(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setConnected(true)
+	session.joinedGroups = func(context.Context, *wm.Client) ([]*waTypes.GroupInfo, error) {
+		return []*waTypes.GroupInfo{
+			nil,
+			{JID: waTypes.NewJID("120363041234567890", waTypes.GroupServer)},
+		}, nil
+	}
+
+	result, err := session.Execute(t.Context(), listCommand(t))
+	if err != nil {
+		t.Fatalf("group.list: %v", err)
+	}
+	if listed := listedGroups(t, result); len(listed) != 1 {
+		t.Fatalf("the answer has %d groups, want the one that could be described", len(listed))
+	}
+}
+
+func TestAGroupListingNeedsAConnection(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.joinedGroups = func(context.Context, *wm.Client) ([]*waTypes.GroupInfo, error) {
+		t.Error("a disconnected session asked WhatsApp for its groups anyway")
+		return nil, nil
+	}
+
+	_, err := session.Execute(t.Context(), listCommand(t))
+	assertCode(t, err, protocol.ErrorNotConnected)
+}
+
+func TestAGroupListingAnswersWhatsAppsRefusal(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setConnected(true)
+	session.joinedGroups = func(context.Context, *wm.Client) ([]*waTypes.GroupInfo, error) {
+		return nil, &wm.IQError{Code: 429}
+	}
+
+	_, err := session.Execute(t.Context(), listCommand(t))
+	assertCode(t, err, protocol.ErrorRateLimited)
+}
