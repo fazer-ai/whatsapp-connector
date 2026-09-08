@@ -721,6 +721,56 @@ func TestAParticipantIsPutInTheGroupsOwnNamespace(t *testing.T) {
 			t.Fatalf("the driver's own words went to the client: %v", err)
 		}
 	})
+
+	// The store failing and the group having moved are the same failure to the caller,
+	// and a fresher reading makes this one go away without the store ever answering: a
+	// LID group needs no translation, so the lookup that was failing is not performed.
+	// Refusing here would report the store's bad second on a payload that is correct.
+	t.Run("a stale addressing is not what a broken mapping store is reported as", func(t *testing.T) {
+		t.Parallel()
+
+		session, _, _ := outboundSession(t)
+		reads := 0
+		session.groupMode = func(context.Context, waTypes.JID) (waTypes.AddressingMode, bool, error) {
+			reads++
+			if reads == 1 {
+				return waTypes.AddressingModePN, true, nil
+			}
+			return waTypes.AddressingModeLID, false, nil
+		}
+		session.current().Store.LIDs = brokenLIDs{err: errors.New("the store is down")}
+
+		got, err := session.asTheGroupAddresses(t.Context(), mustJID(t, group), mustJID(t, lid))
+		if err != nil {
+			t.Fatalf("a LID that needed no translation was refused over a lookup that "+
+				"only a stale reading of the group asked for: %v", err)
+		}
+		if got.String() != lid {
+			t.Fatalf("the key names %s, want %s", got, lid)
+		}
+	})
+
+	// The other half of it: the group really is phone-addressed, the store really is
+	// down, and re-reading changes nothing. Answered as this connector breaking and not
+	// as the client's payload being wrong, because a client told its address is wrong
+	// stops sending it.
+	t.Run("a store that stays down is still reported as this connector breaking", func(t *testing.T) {
+		t.Parallel()
+
+		session, _, _ := outboundSession(t)
+		reads := 0
+		session.groupMode = func(context.Context, waTypes.JID) (waTypes.AddressingMode, bool, error) {
+			reads++
+			return waTypes.AddressingModePN, true, nil
+		}
+		session.current().Store.LIDs = brokenLIDs{err: errors.New("the store is down")}
+
+		_, err := session.asTheGroupAddresses(t.Context(), mustJID(t, group), mustJID(t, lid))
+		assertCode(t, err, protocol.ErrorInternal)
+		if reads != 2 {
+			t.Fatalf("the group was read %d times, want exactly 2", reads)
+		}
+	})
 }
 
 // brokenLIDs is a mapping store that only ever fails, which is the one way the real one

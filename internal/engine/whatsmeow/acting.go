@@ -313,27 +313,51 @@ func (s *Session) asTheGroupAddresses(
 	return waTypes.EmptyJID, unnamed.refusal()
 }
 
-// noSuchNaming is `placeInTheGroup` telling its caller that the group was read and had no
-// name for this participant. The one failure a fresher reading of the group can fix, and
-// the only one that comes back unwrapped: whether it is final depends on how fresh that
-// reading was, which the caller knows and the placement does not.
+// noSuchNaming is `placeInTheGroup` telling its caller that this reading of the group
+// needed the participant translated and the translation did not arrive. Both ways that
+// happens are the same thing to the caller, and the reason they are one sentinel is that
+// a fresher reading can make either go away without the store's answer changing at all:
+// a group that has moved to LIDs does not need the participant translated, so the lookup
+// that failed is not performed.
+//
+// The timeout is deliberately not in here. That is the caller's own budget running out,
+// and spending what is left of it on a second reading is how a deadline turns into two.
 type noSuchNaming struct {
 	wanted      protocol.AddressKind
 	participant waTypes.JID
+	// cause is the store's failure, or nil when the store answered and had nothing.
+	// They are one sentinel on the way up and two different answers at the end of it.
+	cause error
 }
 
 func (e noSuchNaming) Error() string {
+	if e.cause != nil {
+		return fmt.Sprintf("looking up how %s is addressed in the group: %v", e.participant, e.cause)
+	}
 	return fmt.Sprintf("the group names its senders by %s and there is no %s for %s",
 		e.wanted, e.wanted, e.participant)
 }
 
+func (e noSuchNaming) Unwrap() error { return e.cause }
+
 // refusal is what a client is told once the group has been read as freshly as it can be
-// and still has no name for the participant.
+// and the translation still did not arrive.
 //
-// Named the way the caller named it, which is also the only way an address is allowed to
-// cross: a JID in here would put `@s.whatsapp.net` in a client's UI and its own server
-// names in this connector's replies.
+// The store having a bad second is not the caller's payload and must not be answered as
+// one: told its address is wrong, a client stops sending it. What went wrong was logged
+// and is not sent -- a reply crosses into a client's UI, and a driver's own words there
+// are noise to whoever reads them and a description of this deployment's insides to
+// whoever does not, the same reason the fetch answers out of a closed vocabulary rather
+// than repeating net/http.
+//
+// The other arm names the participant the way the caller named it, which is also the only
+// way an address is allowed to cross: a JID in here would put `@s.whatsapp.net` in a
+// client's UI and its own server names in this connector's replies.
 func (e noSuchNaming) refusal() error {
+	if e.cause != nil {
+		return protocol.NewError(protocol.ErrorInternal,
+			"could not look up how that participant is addressed in the group")
+	}
 	named, _ := addressOf(e.participant)
 	return protocol.NewError(protocol.ErrorInvalidPayload,
 		fmt.Sprintf("that group names its senders by %s, and this session has no %s for the %s %s",
@@ -372,18 +396,13 @@ func (s *Session) placeInTheGroup(
 		return waTypes.EmptyJID, remembered, protocol.NewError(protocol.ErrorTimeout,
 			"the mapping this group's addressing needs did not arrive before the command's deadline")
 	case err != nil:
-		// The store having a bad second, which the next attempt may well not have. It is
-		// not the caller's payload and must not be answered as one: told its address is
-		// wrong, a client stops sending it.
-		//
-		// What went wrong is logged and not sent. A reply crosses into a client's UI, and
-		// a driver's own words there are noise to whoever reads them and a description of
-		// this deployment's insides to whoever does not -- the same reason the fetch
-		// answers out of a closed vocabulary rather than repeating net/http.
+		// The store having a bad second, which the next attempt may well not have -- and
+		// which a fresher reading of the group can skip past entirely, if the group has
+		// moved to the namespace the participant is already in.
 		s.log.Warn().Err(err).Str("chat", chat.String()).Str("participant", participant.String()).
 			Msg("could not look up how a participant is addressed in a group")
-		return waTypes.EmptyJID, remembered, protocol.NewError(protocol.ErrorInternal,
-			"could not look up how that participant is addressed in the group")
+		return waTypes.EmptyJID, remembered,
+			noSuchNaming{wanted: wanted, participant: participant, cause: err}
 	case alt.IsEmpty():
 		// Asked and answered against this reading of the group: there is no mapping, so
 		// there is no key naming this participant that the group would resolve.
