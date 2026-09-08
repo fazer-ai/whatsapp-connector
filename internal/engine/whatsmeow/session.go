@@ -343,7 +343,18 @@ type Session struct {
 	// groupMode is how a group addresses its members, which decides the namespace a
 	// message key in it names a sender by. A field because reading it is a round trip to
 	// WhatsApp, and a test cannot otherwise reach either branch of what depends on it.
-	groupMode func(context.Context, waTypes.JID) (waTypes.AddressingMode, error)
+	//
+	// The second return says the answer came out of what was remembered rather than off
+	// the wire, which is what makes it stale-able and is the only reason to ask twice.
+	groupMode func(context.Context, waTypes.JID) (mode waTypes.AddressingMode, remembered bool, err error)
+
+	// groupModes remembers what the round trip above answered, per group, for as long as
+	// the session is up. Written under the mutex; never held across the round trip that
+	// fills it, so two callers can ask about the same group at once and the second
+	// overwrites the first with the same answer.
+	//
+	// Bounded by the groups the account is in, which is a number a phone also holds.
+	groupModes map[waTypes.JID]waTypes.AddressingMode
 
 	// sendLimit is the largest file this session will send. Not the blob cap: an
 	// instance with nowhere to keep an inbound file still sends one.
@@ -635,6 +646,17 @@ func (s *Session) setConnected(connected bool) {
 	s.dialing = false
 	if connected {
 		s.reconnecting = false
+		// A new socket is a new answer about every group. What was remembered outlives a
+		// disconnection, and so does whatsmeow's own cache of the same groups -- which
+		// nothing clears on connect and which `sendGroup` encrypts to, member list and
+		// all. Membership that changed while the account was offline reaches neither, and
+		// whatsmeow only notices after the server disagrees with the participant hash it
+		// sent under, by which point that message has already gone out to the old list.
+		//
+		// Forgetting here puts the first group action after a reconnect back on
+		// `GetGroupInfo`, which refills both caches. One round trip per group per
+		// connection, and the ones after it still cost nothing.
+		clear(s.groupModes)
 	}
 	s.mu.Unlock()
 }

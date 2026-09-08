@@ -108,8 +108,8 @@ func TestLiveGroupKeyNamespace(t *testing.T) {
 			// namespace does not match what this returns, so telling it the group is on
 			// the wrong namespace makes it leave the wrong one alone.
 			if probe.lying {
-				subject.groupMode = func(context.Context, waTypes.JID) (waTypes.AddressingMode, error) {
-					return liveOtherMode(mode), nil
+				subject.groupMode = func(context.Context, waTypes.JID) (waTypes.AddressingMode, bool, error) {
+					return liveOtherMode(mode), false, nil
 				}
 				t.Cleanup(func() { subject.groupMode = nil })
 			}
@@ -208,16 +208,19 @@ func liveGroupReaches(t *testing.T, session *Session, group waTypes.JID) {
 	}
 }
 
-// liveGroupMode reads which namespace the group addresses its members by, through the
-// same call the production path uses.
+// liveGroupMode reads which namespace the group addresses its members by, over the socket
+// and deliberately not through `groupModeCached`, which is what the production path uses.
+// Every probe below is built out of this answer, so it has to come from somewhere the code
+// under test cannot also be wrong about: sharing whatsmeow's cache with the production
+// path would have a stale entry decide both sides of the comparison and agree with itself.
 func liveGroupMode(t *testing.T, subject *Session, group waTypes.JID) waTypes.AddressingMode {
 	t.Helper()
 
-	mode, err := subject.groupModeOverSocket(t.Context(), group)
+	info, err := subject.current().GetGroupInfo(t.Context(), group)
 	if err != nil {
 		t.Fatalf("read the group's addressing: %v", err)
 	}
-	return mode
+	return info.AddressingMode
 }
 
 // liveOtherMode is the addressing a group is not on.
@@ -379,8 +382,8 @@ func TestLiveGroupRevokeKeyNamespace(t *testing.T) {
 			mine.awaitMessage(t, sent, 2*time.Minute)
 
 			if probe.lying {
-				subject.groupMode = func(context.Context, waTypes.JID) (waTypes.AddressingMode, error) {
-					return liveOtherMode(mode), nil
+				subject.groupMode = func(context.Context, waTypes.JID) (waTypes.AddressingMode, bool, error) {
+					return liveOtherMode(mode), false, nil
 				}
 				t.Cleanup(func() { subject.groupMode = nil })
 			}
@@ -490,8 +493,8 @@ func TestLiveGroupReadKeyNamespace(t *testing.T) {
 			mine.awaitMessage(t, sent, 2*time.Minute)
 
 			if probe.lying {
-				subject.groupMode = func(context.Context, waTypes.JID) (waTypes.AddressingMode, error) {
-					return liveOtherMode(mode), nil
+				subject.groupMode = func(context.Context, waTypes.JID) (waTypes.AddressingMode, bool, error) {
+					return liveOtherMode(mode), false, nil
 				}
 				t.Cleanup(func() { subject.groupMode = nil })
 			}
@@ -557,4 +560,64 @@ func liveMustSendReadReceipts(t *testing.T, session *Session) {
 		t.Skip("this account does not send read receipts, so a read mark never reaches " +
 			"the author and this phase would measure the privacy setting")
 	}
+}
+
+// TestLiveGroupModeIsAnsweredFromMemory pins the one thing reading the mode out of the
+// session bought, against a real group whose addressing this suite does not decide.
+//
+// Asserted on state and not on how long the second read took. A stopwatch here would be
+// measuring the machine: a descheduled test process or a moment's contention on the
+// session mutex makes a genuine map hit take longer than any threshold worth writing, and
+// the phase would then report a round trip that never happened. What is actually being
+// claimed is that the group was remembered, and the map is where that is true or false.
+//
+// The socket read that fills it is not what this checks -- `liveGroupMode` already reads
+// the group over the wire, and the two answers agreeing is the other half of the claim.
+func TestLiveGroupModeIsAnsweredFromMemory(t *testing.T) {
+	subject, counterpart, container := liveBoth(t, MediaOptions{})
+	counterpartJID := liveMustBePaired(t, container, liveCounterpartSID)
+
+	groups := engine.ConnectRequest{Pairing: "resume", Groups: true}
+	liveResumeAsking(t, subject, groups)
+	liveResumeAsking(t, counterpart, groups)
+
+	group := liveGroup(t, subject, counterpartJID)
+
+	// Nothing remembered yet, so this is the read that goes to WhatsApp. Forgotten first
+	// rather than assumed cold: another phase in the same process may have asked already,
+	// and a test that only passes when it runs alone is not a test.
+	subject.forgetGroupMode(group)
+	mode, remembered, err := subject.groupModeCached(t.Context(), group)
+	if err != nil {
+		t.Fatalf("read the group's addressing: %v", err)
+	}
+	if remembered {
+		t.Fatalf("the group was forgotten and answered out of memory anyway")
+	}
+	if mode == "" {
+		t.Fatalf("the group answered with no addressing at all, so this measured nothing")
+	}
+
+	subject.mu.Lock()
+	kept, known := subject.groupModes[group]
+	subject.mu.Unlock()
+	if !known {
+		t.Fatalf("%s was read over the socket and not remembered, so every reaction, admin "+
+			"revoke and read mark in it pays that round trip again", group)
+	}
+	if kept != mode {
+		t.Fatalf("the group answered %q and %q was remembered", mode, kept)
+	}
+
+	// And the second reading says so, which is what `asTheGroupAddresses` acts on when it
+	// decides whether a refusal is worth asking about again.
+	if _, again, err := subject.groupModeCached(t.Context(), group); err != nil || !again {
+		t.Fatalf("the second read reported remembered=%v err=%v, want true and no error", again, err)
+	}
+
+	// And the group really is addressed that way, read independently over the wire.
+	if overSocket := liveGroupMode(t, subject, group); overSocket != mode {
+		t.Fatalf("what was remembered says %q and the group itself says %q", mode, overSocket)
+	}
+	t.Logf("the group's addressing came back as %s and was remembered", mode)
 }

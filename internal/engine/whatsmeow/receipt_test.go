@@ -321,9 +321,9 @@ func TestAReadMarkInAGroupNormalisesWhoWroteTheMessages(t *testing.T) {
 
 	session, _, _ := outboundSession(t)
 	asked := make(chan waTypes.JID, 1)
-	session.groupMode = func(_ context.Context, chat waTypes.JID) (waTypes.AddressingMode, error) {
+	session.groupMode = func(_ context.Context, chat waTypes.JID) (waTypes.AddressingMode, bool, error) {
 		asked <- chat
-		return waTypes.AddressingModeLID, nil
+		return waTypes.AddressingModeLID, false, nil
 	}
 
 	// The send itself has no socket to go out on, and that is not what is being read.
