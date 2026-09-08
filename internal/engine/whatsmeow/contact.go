@@ -323,7 +323,19 @@ func personOf(address protocol.Address, subject string) (waTypes.JID, error) {
 			return waTypes.EmptyJID, protocol.NewError(protocol.ErrorInvalidPayload,
 				"a person is named by digits, and this address carries something else")
 		}
-		return jidOf(address)
+		jid, err := jidOf(address)
+		if err != nil {
+			return waTypes.EmptyJID, err
+		}
+		if jid.IsBot() {
+			// Meta's own assistants answer on the ordinary phone server under a reserved
+			// range. The addressing layer refuses to name one as a party -- a client
+			// handed the number would open a conversation with something that is not a
+			// person -- so this is the caller's payload rather than a failure here.
+			return waTypes.EmptyJID, protocol.NewError(protocol.ErrorInvalidPayload,
+				"that number belongs to a bot, and a bot is not somebody this contract names")
+		}
+		return jid, nil
 	default:
 		return waTypes.EmptyJID, protocol.NewError(protocol.ErrorInvalidPayload,
 			fmt.Sprintf("only a person can be the subject of a %s, and %q is not one", subject, address.Kind))

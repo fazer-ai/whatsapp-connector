@@ -678,6 +678,11 @@ func (s *Session) adopt(client *wm.Client) bool {
 	s.stale = false
 	s.connected = false
 	s.mu.Unlock()
+
+	// A new client is a new device store, and the alias cache mirrors a table in the one
+	// it replaces. Rebuilding happens on a logout, and what is paired after it may be
+	// another account entirely.
+	s.aliases.forget()
 	return true
 }
 

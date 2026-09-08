@@ -93,6 +93,19 @@ func (a *alias) lookup(ctx context.Context, s *Session, jid waTypes.JID) (waType
 	return alt, true, nil
 }
 
+// forget empties the mapping this session has learned.
+//
+// The cache mirrors a table in the device store, so it lives as long as that device and
+// not as long as the session: a logout deletes the device, and the account paired after it
+// may be a different one. A pairing between a LID and a number is what one account was
+// shown, not a fact about the world, so answering the next account out of it would hand
+// over a number nobody gave it.
+func (a *alias) forget() {
+	a.mu.Lock()
+	a.seen = make(map[string]waTypes.JID)
+	a.mu.Unlock()
+}
+
 // pairable reports whether a JID is one of the two namespaces that name a person. A
 // group, a newsletter and a broadcast list have no counterpart to look up.
 func pairable(jid waTypes.JID) bool {

@@ -138,6 +138,9 @@ func TestAResolveRefusesAPayloadItCannotCarryOut(t *testing.T) {
 		// digits, so this is a payload the schema accepts whose answer the schema would
 		// refuse.
 		{name: "a person whose id is not a number", payload: `{"party":{"kind":"phone","id":"abc"}}`},
+		// Meta's own assistants answer on the phone server under a reserved range, and
+		// the addressing layer refuses to name one as a party at all.
+		{name: "a number that belongs to a bot", payload: `{"party":{"kind":"phone","id":"13135550002"}}`},
 	} {
 		t.Run(refused.name, func(t *testing.T) {
 			t.Parallel()
@@ -214,5 +217,48 @@ func TestAResolveKeepsLookingWhenTheFirstRowHasNoName(t *testing.T) {
 	}
 	if party := resolved(t, result); party["push_name"] != "Bruninho" {
 		t.Errorf("the resolve answered %v, want the push name filed under the other namespace", party)
+	}
+}
+
+// The cache mirrors a table in the device store, and a logout deletes that device. What
+// is paired next may be another account, and a pairing between a LID and a number is what
+// one account was shown rather than a fact about the world: answered out of the cache, the
+// new account is handed a number nobody gave it.
+func TestAResolveForgetsWhatThePreviousAccountLearned(t *testing.T) {
+	t.Parallel()
+
+	const (
+		phone = "5541988887777"
+		lid   = "998877665544332"
+	)
+
+	session, _ := newTestSession(t, "5511999990001")
+	if err := session.current().Store.LIDs.PutLIDMapping(t.Context(),
+		waTypes.NewJID(lid, waTypes.HiddenUserServer),
+		waTypes.NewJID(phone, waTypes.DefaultUserServer)); err != nil {
+		t.Fatalf("PutLIDMapping: %v", err)
+	}
+	asked := resolveCommand(t, `{"party":{"kind":"lid","id":"`+lid+`"}}`)
+	result, err := session.Execute(t.Context(), asked)
+	if err != nil {
+		t.Fatalf("contact.resolve: %v", err)
+	}
+	if party := resolved(t, result); party["phone"] != phone {
+		t.Fatalf("the first resolve answered %v, want the mapping the account was shown", party)
+	}
+
+	// The device the next pairing produces, with none of what the last one learned.
+	fresh, _ := newTestSession(t, "5511999990002")
+	if !session.adopt(fresh.current()) {
+		t.Fatal("the session would not take the new client")
+	}
+
+	result, err = session.Execute(t.Context(), asked)
+	if err != nil {
+		t.Fatalf("contact.resolve after the account changed: %v", err)
+	}
+	party := resolved(t, result)
+	if _, remembered := party["phone"]; remembered {
+		t.Errorf("the resolve answered %v after the account changed, want nothing the previous one learned", party)
 	}
 }
