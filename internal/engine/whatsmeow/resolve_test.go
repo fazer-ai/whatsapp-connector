@@ -1,6 +1,7 @@
 package whatsmeow
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
 
@@ -133,6 +134,10 @@ func TestAResolveRefusesAPayloadItCannotCarryOut(t *testing.T) {
 		// party naming a group as though it were a person.
 		{name: "a group", payload: `{"party":{"kind":"group","id":"120363000000000000"}}`},
 		{name: "a channel", payload: `{"party":{"kind":"newsletter","id":"120363111111111111"}}`},
+		// The contract lets an address carry any non-empty id and a party carry only
+		// digits, so this is a payload the schema accepts whose answer the schema would
+		// refuse.
+		{name: "a person whose id is not a number", payload: `{"party":{"kind":"phone","id":"abc"}}`},
 	} {
 		t.Run(refused.name, func(t *testing.T) {
 			t.Parallel()
@@ -157,5 +162,57 @@ func TestAResolveNeedsAnAccountButNotAConnection(t *testing.T) {
 	paired, _ := newTestSession(t, "5511999990001")
 	if _, err := paired.Execute(t.Context(), resolveCommand(t, `{"party":{"kind":"phone","id":"5541988887777"}}`)); err != nil {
 		t.Fatalf("a resolve on a disconnected session: %v", err)
+	}
+}
+
+// A mapping that could not be read is not a mapping that does not exist. Answering the
+// input address for both would tell a client the other namespace is unknown, and a client
+// told that stops asking; told the read failed, it asks again.
+func TestAResolveSaysWhenTheMappingCouldNotBeRead(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	stopped, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	_, err := session.resolveContact(stopped, resolveCommand(t, `{"party":{"kind":"phone","id":"5541988887777"}}`))
+	assertCode(t, err, protocol.ErrorTimeout)
+}
+
+// The two namespaces are written by different paths: an app-state contact sync files one,
+// a message's push name the other. A row for the address that was asked about can exist
+// and hold neither name, so finding it is not the end of the search.
+func TestAResolveKeepsLookingWhenTheFirstRowHasNoName(t *testing.T) {
+	t.Parallel()
+
+	const (
+		phone = "5541988887777"
+		lid   = "998877665544332"
+	)
+
+	session, _ := newTestSession(t, "5511999990001")
+	client := session.current()
+	if err := client.Store.LIDs.PutLIDMapping(t.Context(),
+		waTypes.NewJID(lid, waTypes.HiddenUserServer),
+		waTypes.NewJID(phone, waTypes.DefaultUserServer)); err != nil {
+		t.Fatalf("PutLIDMapping: %v", err)
+	}
+	// A row under the number with a contact name and no push name, which is what an
+	// address-book sync leaves behind.
+	if err := client.Store.Contacts.PutContactName(t.Context(),
+		waTypes.NewJID(phone, waTypes.DefaultUserServer), "Bruno Lima", "Bruno"); err != nil {
+		t.Fatalf("PutContactName: %v", err)
+	}
+	if _, _, err := client.Store.Contacts.PutPushName(t.Context(),
+		waTypes.NewJID(lid, waTypes.HiddenUserServer), "Bruninho"); err != nil {
+		t.Fatalf("PutPushName: %v", err)
+	}
+
+	result, err := session.Execute(t.Context(), resolveCommand(t, `{"party":{"kind":"phone","id":"`+phone+`"}}`))
+	if err != nil {
+		t.Fatalf("contact.resolve: %v", err)
+	}
+	if party := resolved(t, result); party["push_name"] != "Bruninho" {
+		t.Errorf("the resolve answered %v, want the push name filed under the other namespace", party)
 	}
 }

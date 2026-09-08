@@ -41,9 +41,30 @@ type alias struct {
 func newAlias() *alias { return &alias{seen: make(map[string]waTypes.JID)} }
 
 // of answers the other namespace's JID for one, and whether there is one to have.
+//
+// A store that will not answer is logged and left. The address still goes out with the
+// half the event carried, which is what happened before this existed at all, and the next
+// event for the same party asks again -- on the event path, losing the mapping is worth
+// less than losing the event. A caller that is asking for the mapping itself wants the
+// difference, and lookup is where it is kept.
 func (a *alias) of(ctx context.Context, s *Session, jid waTypes.JID) (waTypes.JID, bool) {
-	if !pairable(jid) {
+	alt, found, err := a.lookup(ctx, s, jid)
+	if err != nil {
+		s.log.Debug().Err(err).Str("jid", jid.String()).
+			Msg("could not read the other namespace for a party")
 		return waTypes.EmptyJID, false
+	}
+	return alt, found
+}
+
+// lookup is of, with the failure kept apart from the absence.
+//
+// The two are not the same answer and a command whose whole result is the mapping cannot
+// treat them as one: "nobody has learned this pairing yet" is a result, and "the store did
+// not answer" is a refusal the caller can retry.
+func (a *alias) lookup(ctx context.Context, s *Session, jid waTypes.JID) (waTypes.JID, bool, error) {
+	if !pairable(jid) {
+		return waTypes.EmptyJID, false, nil
 	}
 	key := jid.ToNonAD().String()
 
@@ -51,30 +72,25 @@ func (a *alias) of(ctx context.Context, s *Session, jid waTypes.JID) (waTypes.JI
 	known, remembered := a.seen[key]
 	a.mu.RUnlock()
 	if remembered {
-		return known, true
+		return known, true, nil
 	}
 
 	client := s.current()
 	if client == nil || client.Store == nil {
-		return waTypes.EmptyJID, false
+		return waTypes.EmptyJID, false, nil
 	}
 	alt, err := client.Store.GetAltJID(ctx, jid)
 	switch {
 	case err != nil:
-		// Logged and left. The address still goes out with the half the event carried,
-		// which is what happened before this existed at all, and the next event for the
-		// same party asks again.
-		s.log.Debug().Err(err).Str("jid", jid.String()).
-			Msg("could not read the other namespace for a party")
-		return waTypes.EmptyJID, false
+		return waTypes.EmptyJID, false, err
 	case alt.IsEmpty():
-		return waTypes.EmptyJID, false
+		return waTypes.EmptyJID, false, nil
 	}
 
 	a.mu.Lock()
 	a.seen[key] = alt
 	a.mu.Unlock()
-	return alt, true
+	return alt, true, nil
 }
 
 // pairable reports whether a JID is one of the two namespaces that name a person. A

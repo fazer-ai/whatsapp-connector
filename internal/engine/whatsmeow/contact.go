@@ -281,7 +281,22 @@ func (s *Session) resolveContact(ctx context.Context, command *protocol.Command)
 			"this session has no WhatsApp account to resolve against")
 	}
 
-	named := s.party(ctx, jid)
+	// The mapping read directly rather than through `party`, because a command whose
+	// whole answer is the mapping has to tell a store that did not answer from a pairing
+	// nobody has learned. `party` reports both as an absence, which is right where losing
+	// the mapping costs less than losing the event, and wrong here: a client told the
+	// other namespace does not exist stops asking, and the one told to retry retries.
+	var named protocol.Party
+	naming(&named, jid)
+	alt, found, err := s.aliases.lookup(ctx, s, jid)
+	switch {
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+		return nil, protocol.NewError(protocol.ErrorTimeout, "the address mapping did not answer in time")
+	case err != nil:
+		return nil, protocol.NewError(protocol.ErrorInternal, "the address mapping could not be read")
+	case found:
+		naming(&named, alt)
+	}
 	if named.Phone == "" && named.LID == "" {
 		// jidOf built this JID out of an address kind personOf just accepted, so the
 		// party cannot come back empty unless the addressing layer stopped naming one of
@@ -300,6 +315,14 @@ func (s *Session) resolveContact(ctx context.Context, command *protocol.Command)
 func personOf(address protocol.Address, subject string) (waTypes.JID, error) {
 	switch address.Kind {
 	case protocol.AddressPhone, protocol.AddressLID:
+		if !onlyDigits(address.ID) {
+			// The contract lets an `address` carry any non-empty id -- a group's is not a
+			// number -- while a `party` is digits in both namespaces. A person whose id is
+			// not one would answer with a party the contract refuses, and a client
+			// validating what it reads drops the reply rather than the id inside it.
+			return waTypes.EmptyJID, protocol.NewError(protocol.ErrorInvalidPayload,
+				"a person is named by digits, and this address carries something else")
+		}
 		return jidOf(address)
 	default:
 		return waTypes.EmptyJID, protocol.NewError(protocol.ErrorInvalidPayload,
@@ -325,6 +348,9 @@ func (s *Session) nameFromStore(ctx context.Context, named *protocol.Party) {
 		{Kind: protocol.AddressPhone, ID: named.Phone},
 		{Kind: protocol.AddressLID, ID: named.LID},
 	} {
+		if named.PushName != "" && named.VerifiedName != "" {
+			return
+		}
 		if address.ID == "" {
 			continue
 		}
@@ -333,15 +359,20 @@ func (s *Session) nameFromStore(ctx context.Context, named *protocol.Party) {
 			continue
 		}
 		contact, err := client.Store.Contacts.GetContact(ctx, jid)
-		switch {
-		case err != nil:
+		if err != nil {
 			s.log.Debug().Err(err).Str("kind", string(address.Kind)).
 				Msg("could not read the stored names for a party")
-		case !contact.Found:
-		default:
+			continue
+		}
+		// Field by field, and a row that was found is not the end of the search: the two
+		// namespaces are written by different paths -- an app-state contact sync files one,
+		// a message's push name the other -- so the row for the address that was asked
+		// about can exist and hold neither name.
+		if named.PushName == "" {
 			named.PushName = contact.PushName
+		}
+		if named.VerifiedName == "" {
 			named.VerifiedName = contact.BusinessName
-			return
 		}
 	}
 }
