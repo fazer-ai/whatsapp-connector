@@ -286,15 +286,73 @@ func (s *Session) asTheGroupAddresses(
 	if participant.IsEmpty() || chat.Server != waTypes.GroupServer {
 		return participant, nil
 	}
+	placed, remembered, err := s.placeInTheGroup(ctx, chat, participant)
+	var unnamed noSuchNaming
+	if !errors.As(err, &unnamed) {
+		return placed, err
+	}
+	// The group was read and its addressing has no name for this participant. Whether
+	// that is the answer depends on where the reading came from.
+	//
+	// A reading that came off the wire has nothing fresher behind it, so asking again
+	// would spend a second round trip to be told the same thing.
+	if !remembered {
+		return waTypes.EmptyJID, unnamed.refusal()
+	}
+	// A remembered one goes stale in exactly one direction, phone numbers to LIDs, and
+	// this is what that costs: the group has moved, the participant is known by LID alone
+	// -- a privacy setting is enough, and `addressing.go` says why the number is the half
+	// that goes missing -- and translating a correct LID into a phone that does not exist
+	// refuses a reaction that would have worked. So the refusal is what pays for a
+	// re-read, and only the refusal: one round trip on a path that was about to fail
+	// outright, against one per action if the entry were dropped on a timer.
+	s.forgetGroupMode(chat)
+	if placed, _, err = s.placeInTheGroup(ctx, chat, participant); !errors.As(err, &unnamed) {
+		return placed, err
+	}
+	return waTypes.EmptyJID, unnamed.refusal()
+}
+
+// noSuchNaming is `placeInTheGroup` telling its caller that the group was read and had no
+// name for this participant. The one failure a fresher reading of the group can fix, and
+// the only one that comes back unwrapped: whether it is final depends on how fresh that
+// reading was, which the caller knows and the placement does not.
+type noSuchNaming struct {
+	wanted      protocol.AddressKind
+	participant waTypes.JID
+}
+
+func (e noSuchNaming) Error() string {
+	return fmt.Sprintf("the group names its senders by %s and there is no %s for %s",
+		e.wanted, e.wanted, e.participant)
+}
+
+// refusal is what a client is told once the group has been read as freshly as it can be
+// and still has no name for the participant.
+//
+// Named the way the caller named it, which is also the only way an address is allowed to
+// cross: a JID in here would put `@s.whatsapp.net` in a client's UI and its own server
+// names in this connector's replies.
+func (e noSuchNaming) refusal() error {
+	named, _ := addressOf(e.participant)
+	return protocol.NewError(protocol.ErrorInvalidPayload,
+		fmt.Sprintf("that group names its senders by %s, and this session has no %s for the %s %s",
+			e.wanted, e.wanted, named.Kind, named.ID))
+}
+
+// placeInTheGroup is asTheGroupAddresses over one reading of the group.
+func (s *Session) placeInTheGroup(
+	ctx context.Context, chat, participant waTypes.JID,
+) (placed waTypes.JID, remembered bool, err error) {
 	read := s.groupMode
 	if read == nil {
 		read = s.groupModeCached
 	}
-	info, err := read(ctx, chat)
+	info, remembered, err := read(ctx, chat)
 	if err != nil {
 		s.log.Warn().Err(err).Str("chat", chat.String()).
 			Msg("could not read the group's addressing, sending the participant as it came")
-		return participant, nil
+		return participant, remembered, nil
 	}
 	// Kept as the contract's own kind rather than the server behind it, because it ends
 	// up in a message that crosses the wire, where an address is `{kind, id}` and never a
@@ -304,14 +362,14 @@ func (s *Session) asTheGroupAddresses(
 		wanted, wantedServer = protocol.AddressLID, waTypes.HiddenUserServer
 	}
 	if participant.Server == wantedServer {
-		return participant, nil
+		return participant, remembered, nil
 	}
 	alt, err := s.current().Store.GetAltJID(ctx, participant)
 	switch {
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
 		// The caller's own budget, and it has run out. Reported as anything else the
 		// send reads as this connector breaking.
-		return waTypes.EmptyJID, protocol.NewError(protocol.ErrorTimeout,
+		return waTypes.EmptyJID, remembered, protocol.NewError(protocol.ErrorTimeout,
 			"the mapping this group's addressing needs did not arrive before the command's deadline")
 	case err != nil:
 		// The store having a bad second, which the next attempt may well not have. It is
@@ -324,21 +382,18 @@ func (s *Session) asTheGroupAddresses(
 		// answers out of a closed vocabulary rather than repeating net/http.
 		s.log.Warn().Err(err).Str("chat", chat.String()).Str("participant", participant.String()).
 			Msg("could not look up how a participant is addressed in a group")
-		return waTypes.EmptyJID, protocol.NewError(protocol.ErrorInternal,
+		return waTypes.EmptyJID, remembered, protocol.NewError(protocol.ErrorInternal,
 			"could not look up how that participant is addressed in the group")
 	case alt.IsEmpty():
-		// Asked and answered: there is no mapping, so there is no key naming this
-		// participant that the group would resolve, and the next attempt says the same.
+		// Asked and answered against this reading of the group: there is no mapping, so
+		// there is no key naming this participant that the group would resolve.
 		//
-		// Named the way the caller named it, which is also the only way an address is
-		// allowed to cross: a JID in here would put `@s.whatsapp.net` in a client's UI
-		// and its own server names in this connector's replies.
-		named, _ := addressOf(participant)
-		return waTypes.EmptyJID, protocol.NewError(protocol.ErrorInvalidPayload,
-			fmt.Sprintf("that group names its senders by %s, and this session has no %s for the %s %s",
-				wanted, wanted, named.Kind, named.ID))
+		// Whether that is final depends on how fresh the reading was, which is the
+		// caller's to know and not this function's, so it comes back as the sentinel and
+		// the caller decides between asking again and refusing.
+		return waTypes.EmptyJID, remembered, noSuchNaming{wanted: wanted, participant: participant}
 	}
-	return alt, nil
+	return alt, remembered, nil
 }
 
 // groupModeCached asks how a group addresses its members, and asks WhatsApp only the
@@ -348,12 +403,19 @@ func (s *Session) asTheGroupAddresses(
 // group read mark, for as long as the session is up. What it costs instead is one per
 // group, on the first of those.
 //
-// Nothing invalidates an entry when a group's addressing changes, and that is a decision
-// rather than an omission. The migration only runs one way, phone numbers to LIDs, so a
-// stale entry names a participant by phone in a group that has moved to LIDs, and a key
-// naming the right member in the other namespace is the case `TestLiveGroupKeyNamespace`
-// measured as harmless. The inverse, which is the one this whole translation exists for,
-// a stale entry cannot produce: it would need a group to move from LIDs to phone numbers.
+// Nothing drops an entry on a timer, and nothing needs to. The migration only runs one
+// way, phone numbers to LIDs, so a stale entry says phone about a group that has moved,
+// and that has exactly two outcomes. A member with both spellings is named by phone in a
+// LID group, which `TestLiveGroupKeyNamespace` measured as harmless. A member known by
+// LID alone -- a privacy setting is enough, and `addressing.go` says why the number is
+// the half that goes missing -- has no phone to be named by, and translating into one
+// that does not exist would refuse a reaction that was correct as it came.
+//
+// That second outcome is what invalidates an entry: `asTheGroupAddresses` forgets the
+// group and asks again rather than refusing, so the round trip is paid on the path that
+// was about to fail and on no other. The inverse staleness, which is the one this whole
+// translation exists for, a cache cannot produce: it would need a group to move from LIDs
+// back to phone numbers.
 //
 // whatsmeow keeps the same value in a cache of its own and accepts the same staleness for
 // the send itself -- `sendGroup` picks the stanza's addressing out of it, and asks once
@@ -361,17 +423,27 @@ func (s *Session) asTheGroupAddresses(
 // `DangerousInternals`, whose name is its contract, and its reader answers a miss it
 // cannot file with a nil and no error. This one is ours, and invalidating it later is a
 // line in this file rather than an upstream question.
-func (s *Session) groupModeCached(ctx context.Context, chat waTypes.JID) (waTypes.AddressingMode, error) {
+// forgetGroupMode drops what was remembered about one group, so the next read asks
+// WhatsApp again.
+func (s *Session) forgetGroupMode(chat waTypes.JID) {
+	s.mu.Lock()
+	delete(s.groupModes, chat)
+	s.mu.Unlock()
+}
+
+func (s *Session) groupModeCached(
+	ctx context.Context, chat waTypes.JID,
+) (waTypes.AddressingMode, bool, error) {
 	s.mu.Lock()
 	mode, known := s.groupModes[chat]
 	s.mu.Unlock()
 	if known {
-		return mode, nil
+		return mode, true, nil
 	}
 
 	info, err := s.current().GetGroupInfo(ctx, chat)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 
 	s.mu.Lock()
@@ -380,7 +452,7 @@ func (s *Session) groupModeCached(ctx context.Context, chat waTypes.JID) (waType
 	}
 	s.groupModes[chat] = info.AddressingMode
 	s.mu.Unlock()
-	return info.AddressingMode, nil
+	return info.AddressingMode, false, nil
 }
 
 // jidOfMaybe is jidOf for a field the contract makes optional, where absent and an

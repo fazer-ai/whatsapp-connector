@@ -343,7 +343,10 @@ type Session struct {
 	// groupMode is how a group addresses its members, which decides the namespace a
 	// message key in it names a sender by. A field because reading it is a round trip to
 	// WhatsApp, and a test cannot otherwise reach either branch of what depends on it.
-	groupMode func(context.Context, waTypes.JID) (waTypes.AddressingMode, error)
+	//
+	// The second return says the answer came out of what was remembered rather than off
+	// the wire, which is what makes it stale-able and is the only reason to ask twice.
+	groupMode func(context.Context, waTypes.JID) (mode waTypes.AddressingMode, remembered bool, err error)
 
 	// groupModes remembers what the round trip above answered, per group, for as long as
 	// the session is up. Written under the mutex; never held across the round trip that

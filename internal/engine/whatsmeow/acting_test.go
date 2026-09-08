@@ -490,11 +490,11 @@ func TestAParticipantIsPutInTheGroupsOwnNamespace(t *testing.T) {
 			t.Parallel()
 
 			session, _, _ := outboundSession(t)
-			session.groupMode = func(context.Context, waTypes.JID) (waTypes.AddressingMode, error) {
+			session.groupMode = func(context.Context, waTypes.JID) (waTypes.AddressingMode, bool, error) {
 				if tc.modeErr {
-					return "", errors.New("no route to WhatsApp")
+					return "", false, errors.New("no route to WhatsApp")
 				}
-				return tc.mode, nil
+				return tc.mode, false, nil
 			}
 			mustMap(t, session, pn, lid)
 
@@ -520,12 +520,101 @@ func TestAParticipantIsPutInTheGroupsOwnNamespace(t *testing.T) {
 			mustJID(t, group): waTypes.AddressingModeLID,
 		}}
 
-		mode, err := session.groupModeCached(t.Context(), mustJID(t, group))
+		mode, remembered, err := session.groupModeCached(t.Context(), mustJID(t, group))
 		if err != nil {
 			t.Fatalf("groupModeCached: %v", err)
 		}
 		if mode != waTypes.AddressingModeLID {
 			t.Fatalf("the group came back as %q, want %q", mode, waTypes.AddressingModeLID)
+		}
+		// What the caller acts on: an answer off the wire is as fresh as it gets and a
+		// remembered one may not be, and only the second is worth asking twice about.
+		if !remembered {
+			t.Fatalf("an answer that came out of the map reported itself as freshly read")
+		}
+	})
+
+	// The one case a remembered addressing gets wrong, and what it costs. A group read as
+	// phone-addressed has since moved to LIDs, and the member is known by LID alone --
+	// which a privacy setting is enough to cause. Translating the correct LID into a
+	// phone that does not exist would refuse a reaction that was right as it came, so the
+	// group is forgotten and read again instead.
+	t.Run("a group whose remembered addressing has gone stale is read again", func(t *testing.T) {
+		t.Parallel()
+
+		session, _, _ := outboundSession(t)
+		reads := 0
+		session.groupMode = func(context.Context, waTypes.JID) (waTypes.AddressingMode, bool, error) {
+			reads++
+			if reads == 1 {
+				return waTypes.AddressingModePN, true, nil
+			}
+			return waTypes.AddressingModeLID, false, nil
+		}
+		// Deliberately no mapping: this member has no phone number to be named by, which
+		// is what makes the stale reading refuse instead of merely misnaming.
+
+		got, err := session.asTheGroupAddresses(t.Context(), mustJID(t, group), mustJID(t, lid))
+		if err != nil {
+			t.Fatalf("a correct LID was refused because the group had been read as phone-addressed: %v", err)
+		}
+		if got.String() != lid {
+			t.Fatalf("the key names %s, want %s", got, lid)
+		}
+		if reads != 2 {
+			t.Fatalf("the group was read %d times, want 2: once from what was remembered "+
+				"and once after forgetting it", reads)
+		}
+	})
+
+	// The re-read is one attempt and not a loop, and it does not turn a real refusal into
+	// a retry that hides it: a group that answers the same way twice is answered.
+	t.Run("a group that has not moved still refuses what it cannot name", func(t *testing.T) {
+		t.Parallel()
+
+		session, _, _ := outboundSession(t)
+		reads := 0
+		session.groupMode = func(context.Context, waTypes.JID) (waTypes.AddressingMode, bool, error) {
+			reads++
+			return waTypes.AddressingModePN, true, nil
+		}
+
+		_, err := session.asTheGroupAddresses(t.Context(), mustJID(t, group), mustJID(t, lid))
+		if err == nil {
+			t.Fatalf("a participant the group cannot name was accepted")
+		}
+		if reads != 2 {
+			t.Fatalf("the group was read %d times, want exactly 2", reads)
+		}
+		var refused *protocol.Error
+		if !errors.As(err, &refused) || refused.Code != protocol.ErrorInvalidPayload {
+			t.Fatalf("the refusal reached the client as %v, and a client has to be able to "+
+				"tell its own payload apart from this connector breaking", err)
+		}
+	})
+
+	// A reading that came off the wire is not asked about again. Nothing fresher exists
+	// behind it, so a second round trip would be spent to be told the same thing -- and
+	// every caller that stands in for the read itself, the read-mark path included, would
+	// pay for a retry that cannot change the answer.
+	t.Run("a group read off the wire is not asked about twice", func(t *testing.T) {
+		t.Parallel()
+
+		session, _, _ := outboundSession(t)
+		reads := 0
+		session.groupMode = func(context.Context, waTypes.JID) (waTypes.AddressingMode, bool, error) {
+			reads++
+			return waTypes.AddressingModePN, false, nil
+		}
+
+		if _, err := session.asTheGroupAddresses(
+			t.Context(), mustJID(t, group), mustJID(t, lid),
+		); err == nil {
+			t.Fatalf("a participant the group cannot name was accepted")
+		}
+		if reads != 1 {
+			t.Fatalf("the group was read %d times, want 1: the first reading was already "+
+				"as fresh as one can be", reads)
 		}
 	})
 
@@ -536,9 +625,9 @@ func TestAParticipantIsPutInTheGroupsOwnNamespace(t *testing.T) {
 		t.Parallel()
 
 		session, _, _ := outboundSession(t)
-		session.groupMode = func(context.Context, waTypes.JID) (waTypes.AddressingMode, error) {
+		session.groupMode = func(context.Context, waTypes.JID) (waTypes.AddressingMode, bool, error) {
 			t.Error("a direct chat asked WhatsApp how its group addresses members")
-			return "", nil
+			return "", false, nil
 		}
 		direct := mustJID(t, "5511999990002@s.whatsapp.net")
 		got, err := session.asTheGroupAddresses(t.Context(), direct, direct)
@@ -577,8 +666,8 @@ func TestAParticipantIsPutInTheGroupsOwnNamespace(t *testing.T) {
 				t.Parallel()
 
 				session, _, _ := outboundSession(t)
-				session.groupMode = func(context.Context, waTypes.JID) (waTypes.AddressingMode, error) {
-					return waTypes.AddressingModePN, nil
+				session.groupMode = func(context.Context, waTypes.JID) (waTypes.AddressingMode, bool, error) {
+					return waTypes.AddressingModePN, false, nil
 				}
 				_, err := session.asTheGroupAddresses(tc.ctx(t), mustJID(t, group), mustJID(t, tc.participant))
 				assertCode(t, err, tc.want)
@@ -595,8 +684,8 @@ func TestAParticipantIsPutInTheGroupsOwnNamespace(t *testing.T) {
 		t.Parallel()
 
 		session, _, _ := outboundSession(t)
-		session.groupMode = func(context.Context, waTypes.JID) (waTypes.AddressingMode, error) {
-			return waTypes.AddressingModePN, nil
+		session.groupMode = func(context.Context, waTypes.JID) (waTypes.AddressingMode, bool, error) {
+			return waTypes.AddressingModePN, false, nil
 		}
 		_, err := session.asTheGroupAddresses(t.Context(),
 			mustJID(t, group), mustJID(t, "999999999999999@lid"))
@@ -621,8 +710,8 @@ func TestAParticipantIsPutInTheGroupsOwnNamespace(t *testing.T) {
 
 		const secret = "pq: relation \"whatsmeow_lid_map\" does not exist"
 		session, _, _ := outboundSession(t)
-		session.groupMode = func(context.Context, waTypes.JID) (waTypes.AddressingMode, error) {
-			return waTypes.AddressingModePN, nil
+		session.groupMode = func(context.Context, waTypes.JID) (waTypes.AddressingMode, bool, error) {
+			return waTypes.AddressingModePN, false, nil
 		}
 		session.current().Store.LIDs = brokenLIDs{err: errors.New(secret)}
 
@@ -710,8 +799,8 @@ func TestBothCommandsPutTheParticipantOnTheWireResolved(t *testing.T) {
 			session, sent := actingSession(t)
 			// A group still on phone numbers, which is where the LID the client sends
 			// names nobody.
-			session.groupMode = func(context.Context, waTypes.JID) (waTypes.AddressingMode, error) {
-				return waTypes.AddressingModePN, nil
+			session.groupMode = func(context.Context, waTypes.JID) (waTypes.AddressingMode, bool, error) {
+				return waTypes.AddressingModePN, false, nil
 			}
 			mustMap(t, session, pn, lid)
 
