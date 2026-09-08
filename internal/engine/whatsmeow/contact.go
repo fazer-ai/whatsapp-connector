@@ -276,7 +276,8 @@ func (s *Session) resolveContact(ctx context.Context, command *protocol.Command)
 	if err != nil {
 		return nil, err
 	}
-	if phone, _ := s.identity(); phone == "" {
+	phone, lid := s.identity()
+	if phone == "" {
 		return nil, protocol.NewError(protocol.ErrorNotPaired,
 			"this session has no WhatsApp account to resolve against")
 	}
@@ -288,6 +289,15 @@ func (s *Session) resolveContact(ctx context.Context, command *protocol.Command)
 	// other namespace does not exist stops asking, and the one told to retry retries.
 	var named protocol.Party
 	naming(&named, jid)
+	if lid != "" && (named.Phone == phone || named.LID == lid) {
+		// The account asking about itself. Both of its names were copied out of the device
+		// at pairing, and the mapping table is a separate write that whatsmeow logs rather
+		// than fails on -- so the account can be the one party the table cannot answer
+		// for, which would be an absurd thing for this command to be unable to resolve.
+		named.Phone, named.LID = phone, lid
+		s.nameFromStore(ctx, &named)
+		return json.Marshal(named)
+	}
 	alt, found, err := s.aliases.lookup(ctx, s, jid)
 	switch {
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):

@@ -95,3 +95,28 @@ func TestOnlyAMappingThatWasFoundIsRemembered(t *testing.T) {
 		t.Fatalf("the party is %+v, want the pair this session had already learned", named)
 	}
 }
+
+// A lookup that started under one account must not write its answer into the map that
+// replaced it. The store read is a round trip taken outside the lock, so a logout and the
+// pairing after it can land in the middle of one, and what comes back is the previous
+// account's -- a pairing between a LID and a number is what one account was shown.
+func TestAnAliasLearnedBeforeTheAccountChangedIsNotKept(t *testing.T) {
+	t.Parallel()
+
+	const key = "998877665544332@lid"
+	learned := waTypes.NewJID("5541988887777", waTypes.DefaultUserServer)
+
+	kept := newAlias()
+	kept.remember(key, learned, kept.learning())
+	if _, held := kept.seen[key]; !held {
+		t.Fatal("an alias learned under the current account was dropped")
+	}
+
+	dropped := newAlias()
+	learning := dropped.learning()
+	dropped.forget()
+	dropped.remember(key, learned, learning)
+	if _, held := dropped.seen[key]; held {
+		t.Error("an alias learned under the previous account was written back after the change")
+	}
+}

@@ -34,8 +34,13 @@ import (
 // wrong answer for as long as the session ran. A pair nobody has learned yet is looked up
 // again each time, which is the price of never being stale.
 type alias struct {
-	mu   sync.RWMutex
-	seen map[string]waTypes.JID
+	mu sync.RWMutex
+	// seen is what has been learned, and generation is which account learned it. A
+	// lookup that started before the account changed must not write its answer into the
+	// map that replaced it: the store read is not under the lock, so a rebuild can land
+	// in the middle of one.
+	seen       map[string]waTypes.JID
+	generation uint64
 }
 
 func newAlias() *alias { return &alias{seen: make(map[string]waTypes.JID)} }
@@ -70,6 +75,7 @@ func (a *alias) lookup(ctx context.Context, s *Session, jid waTypes.JID) (waType
 
 	a.mu.RLock()
 	known, remembered := a.seen[key]
+	learning := a.generation
 	a.mu.RUnlock()
 	if remembered {
 		return known, true, nil
@@ -87,10 +93,31 @@ func (a *alias) lookup(ctx context.Context, s *Session, jid waTypes.JID) (waType
 		return waTypes.EmptyJID, false, nil
 	}
 
-	a.mu.Lock()
-	a.seen[key] = alt
-	a.mu.Unlock()
+	a.remember(key, alt, learning)
 	return alt, true, nil
+}
+
+// learning is which account's mapping is being learned right now.
+func (a *alias) learning() uint64 {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.generation
+}
+
+// remember keeps what a lookup found, unless the account changed while it was being read.
+//
+// The store read is not under the lock -- it is a database round trip, and holding the map
+// across one would serialise every path that names a party -- so a rebuild can land in the
+// middle of one. The answer still goes back to the caller that asked for it, because the
+// command was accepted under the account that could see it; what must not happen is the
+// previous account's mapping being written back into a map that was emptied precisely to
+// lose it.
+func (a *alias) remember(key string, alt waTypes.JID, learning uint64) {
+	a.mu.Lock()
+	if a.generation == learning {
+		a.seen[key] = alt
+	}
+	a.mu.Unlock()
 }
 
 // forget empties the mapping this session has learned.
@@ -103,6 +130,7 @@ func (a *alias) lookup(ctx context.Context, s *Session, jid waTypes.JID) (waType
 func (a *alias) forget() {
 	a.mu.Lock()
 	a.seen = make(map[string]waTypes.JID)
+	a.generation++
 	a.mu.Unlock()
 }
 

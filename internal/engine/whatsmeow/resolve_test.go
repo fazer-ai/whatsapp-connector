@@ -262,3 +262,37 @@ func TestAResolveForgetsWhatThePreviousAccountLearned(t *testing.T) {
 		t.Errorf("the resolve answered %v after the account changed, want nothing the previous one learned", party)
 	}
 }
+
+// The account's own two names were copied out of the device at pairing, and the mapping
+// table is a separate write that whatsmeow logs rather than fails on. Resolved through the
+// table alone, the account can be the one party this command cannot answer for.
+func TestAResolveAnswersTheAccountOutOfItsOwnIdentity(t *testing.T) {
+	t.Parallel()
+
+	const lid = "111222333444555"
+
+	session, _ := newTestSession(t, "5511999990001")
+	client := session.current()
+	client.Store.LID = waTypes.NewJID(lid, waTypes.HiddenUserServer)
+	// Adopted again so the session copies the identity back out of the device, which is
+	// the only thing that reads it. Nothing in this test publishes an event, so the
+	// second handler the re-adoption registers has nothing to double up on.
+	if !session.adopt(client) {
+		t.Fatal("the session would not take its own client back")
+	}
+
+	// Nothing in the mapping table, which is the case this is about.
+	for _, payload := range []string{
+		`{"party":{"kind":"phone","id":"5511999990001"}}`,
+		`{"party":{"kind":"lid","id":"` + lid + `"}}`,
+	} {
+		result, err := session.Execute(t.Context(), resolveCommand(t, payload))
+		if err != nil {
+			t.Fatalf("contact.resolve: %v", err)
+		}
+		party := resolved(t, result)
+		if party["phone"] != "5511999990001" || party["lid"] != lid {
+			t.Errorf("resolving the account itself answered %v, want both names the session holds", party)
+		}
+	}
+}
