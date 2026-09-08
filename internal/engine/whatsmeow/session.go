@@ -418,6 +418,12 @@ type Session struct {
 	// be built. Nothing works on it, so the next connect tries the rebuild again rather
 	// than talking to it.
 	stale bool
+
+	// revoked is the account being gone, which is not the same as stale: stale is a
+	// client nothing works on, and the next connect repairs it by forgetting the device
+	// and rebuilding. Fusing the two would have a connect arriving during a logout run
+	// that cleanup a second time, alongside the one the logout is already running.
+	revoked bool
 	// phone and lid are this session's copy of what it paired. whatsmeow assigns the
 	// same fields on its pairing goroutine, so reading them off the client from a
 	// command is a race; this is written from the event handler and read under the
@@ -676,6 +682,7 @@ func (s *Session) adopt(client *wm.Client) bool {
 	s.phone = phone
 	s.lid = lid
 	s.stale = false
+	s.revoked = false
 	s.connected = false
 	// Under the same lock as the swap. A new client is a new device store, and the alias
 	// cache mirrors a table in the one it replaces -- rebuilding happens on a logout, and
@@ -1350,9 +1357,14 @@ func (s *Session) settleLogout() {
 	// and rebuilding take a store round trip each, and until one of them lands the session
 	// still holds the identity it was paired with: a command that reads local state rather
 	// than the socket -- `contact.resolve` is the one -- would answer for an account
-	// WhatsApp has already taken away. `adopt` clears this again when a fresh client
+	// WhatsApp has already taken away. `adopt` clears it again when a fresh client
 	// arrives, which is the only thing that makes the session paired once more.
-	s.markStale()
+	//
+	// Its own flag rather than `stale`, which reads as "this client needs repairing" and
+	// is what a connect acts on: a connect arriving here would then run the forget and
+	// the rebuild a second time, next to the ones the logout is already running, and the
+	// two would take each other's client out from under a pairing.
+	s.setRevoked()
 }
 
 // dropHangUp takes the guard down and answers with the state as it stood at that moment.
@@ -1471,6 +1483,20 @@ func (s *Session) markStale() {
 	s.mu.Lock()
 	s.stale = true
 	s.mu.Unlock()
+}
+
+// setRevoked records that WhatsApp has taken the account away. Cleared only by adopting
+// the client of a session that has one again.
+func (s *Session) setRevoked() {
+	s.mu.Lock()
+	s.revoked = true
+	s.mu.Unlock()
+}
+
+func (s *Session) isRevoked() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.revoked
 }
 
 func (s *Session) isStale() bool {

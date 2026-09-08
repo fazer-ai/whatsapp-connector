@@ -277,12 +277,12 @@ func (s *Session) resolveContact(ctx context.Context, command *protocol.Command)
 		return nil, err
 	}
 	phone, lid := s.identity()
-	if phone == "" || s.isStale() {
-		// Stale is an account WhatsApp has revoked, on credentials this session is still
-		// holding: the identity is copied out at pairing and nothing clears it, so a
-		// logout whose rebuild failed leaves the number in hand. Every other command here
-		// is kept out by needing a connection; this one asks for no connection on purpose,
-		// so it has to ask the question the connection was answering.
+	if phone == "" || s.isRevoked() {
+		// Revoked is an account WhatsApp has taken away, on credentials this session is
+		// still holding: the identity is copied out at pairing, and the cleanup that
+		// clears it is a store round trip behind the unlink. Every other command here is
+		// kept out by needing a connection; this one asks for no connection on purpose, so
+		// it has to ask the question the connection was answering.
 		return nil, protocol.NewError(protocol.ErrorNotPaired,
 			"this session has no WhatsApp account to resolve against")
 	}

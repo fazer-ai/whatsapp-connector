@@ -172,8 +172,13 @@ func TestAResolveNeedsAnAccountButNotAConnection(t *testing.T) {
 	// each, and this command reads local state rather than the socket, so it would answer
 	// all the way through them.
 	paired.settleLogout()
-	if !paired.isStale() {
+	if !paired.isRevoked() {
 		t.Fatal("a session whose account was unlinked did not say so until its cleanup finished")
+	}
+	if paired.isStale() {
+		// Stale is what a connect repairs, and repairing while the logout is already
+		// forgetting and rebuilding runs both at once.
+		t.Fatal("an unlinked session asked the next connect to repair a cleanup already running")
 	}
 	_, err = paired.Execute(t.Context(), resolveCommand(t, `{"party":{"kind":"phone","id":"5511999990001"}}`))
 	assertCode(t, err, protocol.ErrorNotPaired)
