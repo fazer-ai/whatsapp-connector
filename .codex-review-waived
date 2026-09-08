@@ -392,3 +392,13 @@ internal/engine/whatsmeow/joinrequests.go: Handle partial join-request refusals 
 # retire, which is the same reason PR#3's own waiver gives for not building one there.
 # Written up with the three candidate fixes in fazer-ai/whatsapp-connector#131.
 internal/engine/whatsmeow/group.go: Make group creation survive command redelivery  # PR#130
+# PR#130: the same finding as the line above, returned under a different title, and the
+# answer is unchanged. Recorded twice because the waiver matches on the title and the
+# review renamed it; the substance -- ledger written after the effect, no caller-chosen
+# name for a group that does not exist yet -- is identical, and #131 holds the three
+# candidate fixes. On the recommendation it adds, to hold the command back until creation
+# is reconciled: the same rule would have held `message.send` until `message_id` existed,
+# and it weighs a crash inside a millisecond-wide window against a feature nobody can use.
+# The damage it risks is also the visible kind -- two real groups, one of which the
+# operator deletes -- not the silent kind this connector goes out of its way to avoid.
+internal/engine/whatsmeow/group.go: Prevent redelivery from creating a second group  # PR#130
