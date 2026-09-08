@@ -102,16 +102,21 @@ func (s *Session) setGroupSetting(ctx context.Context, command *protocol.Command
 	if err != nil {
 		return nil, err
 	}
-	if err := s.readyToSend(); err != nil {
-		return nil, err
-	}
-
 	if err := valueGiven(req.Value); err != nil {
 		return nil, err
 	}
+
+	// The whole payload before the socket, which is the order every other handler here
+	// uses and the reason is the caller's: a payload that can never be carried out is
+	// wrong whether or not this session happens to be connected, and answering
+	// `not_connected` to it invites a client to wait and try the same broken command
+	// again. `readyToSend` comes after everything that could refuse it outright.
 	if req.Setting == "member_add_mode" {
 		mode, err := addMode(req.Value)
 		if err != nil {
+			return nil, err
+		}
+		if err := s.readyToSend(); err != nil {
 			return nil, err
 		}
 		if err := s.setAddMode(ctx, s.current(), group, mode); err != nil {
@@ -126,6 +131,9 @@ func (s *Session) setGroupSetting(ctx context.Context, command *protocol.Command
 	}
 	on, err := switchedOn(req.Value, req.Setting)
 	if err != nil {
+		return nil, err
+	}
+	if err := s.readyToSend(); err != nil {
 		return nil, err
 	}
 	if err := flip(ctx, s.current(), group, on); err != nil {

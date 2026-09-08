@@ -337,3 +337,51 @@ func TestAGroupSettingsChangeRefusesAValueThatSaysNothing(t *testing.T) {
 		}
 	}
 }
+
+// A payload that can never be carried out is wrong whether or not the session happens to
+// be connected. Answering `not_connected` to it invites a client to wait for a connection
+// and then send the same broken command again, and the connection was never the problem.
+func TestAGroupChangeSaysWhatIsWrongWithAPayloadEvenWhileDisconnected(t *testing.T) {
+	t.Parallel()
+
+	for _, refused := range []struct {
+		name    string
+		kind    protocol.CommandType
+		payload string
+	}{
+		{
+			name: "a setting this build does not know", kind: protocol.CommandGroupSettingsSet,
+			payload: `{"group":{"kind":"group","id":"1"},"setting":"ephemeral","value":true}`,
+		},
+		{
+			name: "a switch given a mode", kind: protocol.CommandGroupSettingsSet,
+			payload: `{"group":{"kind":"group","id":"1"},"setting":"announce","value":"all_member_add"}`,
+		},
+		{
+			name: "no value at all", kind: protocol.CommandGroupSettingsSet,
+			payload: `{"group":{"kind":"group","id":"1"},"setting":"announce"}`,
+		},
+		{
+			name: "a mode nobody knows", kind: protocol.CommandGroupSettingsSet,
+			payload: `{"group":{"kind":"group","id":"1"},"setting":"member_add_mode","value":"whoever"}`,
+		},
+		{
+			name: "a group with no name to give it", kind: protocol.CommandGroupNameSet,
+			payload: `{"group":{"kind":"group","id":"1"},"subject":""}`,
+		},
+		{
+			name: "a chat that is not a group", kind: protocol.CommandGroupDescriptionSet,
+			payload: `{"group":{"kind":"phone","id":"5511999990002"},"description":"x"}`,
+		},
+	} {
+		t.Run(refused.name, func(t *testing.T) {
+			t.Parallel()
+			// Never connected: the session has an account and no socket, which is the
+			// state a client retries out of.
+			session, _ := newTestSession(t, "5511999990001")
+
+			_, err := session.Execute(t.Context(), setCommand(t, refused.kind, refused.payload))
+			assertCode(t, err, protocol.ErrorInvalidPayload)
+		})
+	}
+}
