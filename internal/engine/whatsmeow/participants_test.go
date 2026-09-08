@@ -206,14 +206,21 @@ func TestAParticipantsUpdateNamesOnlyTheRefusalItCanAccountFor(t *testing.T) {
 	t.Parallel()
 
 	for _, refusal := range []struct {
-		name string
-		code int
-		want protocol.ErrorCode
+		name   string
+		action string
+		code   int
+		want   protocol.ErrorCode
 	}{
-		{name: "not authorized", code: 403, want: protocol.ErrorGroupParticipantNotAllowed},
-		{name: "already in the group", code: 409, want: protocol.ErrorWaError},
-		{name: "left recently", code: 408, want: protocol.ErrorWaError},
-		{name: "something this build has never seen", code: 500, want: protocol.ErrorWaError},
+		{name: "an add WhatsApp would not authorize", action: "add", code: 403, want: protocol.ErrorGroupParticipantNotAllowed},
+		// The same number on another action is a different sentence. Nothing here has
+		// confirmed what it means, and a client acting on the privacy code would offer to
+		// invite somebody it was trying to demote.
+		{name: "a remove WhatsApp would not authorize", action: "remove", code: 403, want: protocol.ErrorWaError},
+		{name: "a promote WhatsApp would not authorize", action: "promote", code: 403, want: protocol.ErrorWaError},
+		{name: "a demote WhatsApp would not authorize", action: "demote", code: 403, want: protocol.ErrorWaError},
+		{name: "already in the group", action: "add", code: 409, want: protocol.ErrorWaError},
+		{name: "left recently", action: "add", code: 408, want: protocol.ErrorWaError},
+		{name: "something this build has never seen", action: "add", code: 500, want: protocol.ErrorWaError},
 	} {
 		t.Run(refusal.name, func(t *testing.T) {
 			t.Parallel()
@@ -229,7 +236,7 @@ func TestAParticipantsUpdateNamesOnlyTheRefusalItCanAccountFor(t *testing.T) {
 
 			result, err := session.Execute(t.Context(), participantsCommand(t,
 				`{"group":{"kind":"group","id":"120363000000000001"},`+
-					`"participants":[{"kind":"phone","id":"5511999990002"}],"action":"add"}`))
+					`"participants":[{"kind":"phone","id":"5511999990002"}],"action":"`+refusal.action+`"}`))
 			if err != nil {
 				t.Fatalf("group.participants.update: %v", err)
 			}
@@ -241,7 +248,8 @@ func TestAParticipantsUpdateNamesOnlyTheRefusalItCanAccountFor(t *testing.T) {
 				t.Errorf("a participant WhatsApp refused came back as %q", rows[0].Status)
 			}
 			if rows[0].Code == nil || *rows[0].Code != refusal.want {
-				t.Errorf("WhatsApp's %d came back as %s, want %q", refusal.code, spelled(rows[0].Code), refusal.want)
+				t.Errorf("WhatsApp's %d on a %s came back as %s, want %q",
+					refusal.code, refusal.action, spelled(rows[0].Code), refusal.want)
 			}
 		})
 	}
@@ -299,4 +307,43 @@ func TestAParticipantsUpdateNeedsAConnection(t *testing.T) {
 		`{"group":{"kind":"group","id":"120363000000000001"},`+
 			`"participants":[{"kind":"phone","id":"5511999990002"}],"action":"add"}`))
 	assertCode(t, err, protocol.ErrorNotConnected)
+}
+
+// A LID and a phone number are separate namespaces written the same way, so the same
+// digits under both kinds name two different people. Matching a verdict by the digits
+// alone hands one person's answer to the other, and the caller reads two rows that agree
+// about a group only one of them is in.
+func TestAParticipantsUpdateKeepsTwoNamespacesWithTheSameDigitsApart(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setConnected(true)
+	session.updateParticipants = func(
+		context.Context, *wm.Client, waTypes.JID, []waTypes.JID, wm.ParticipantChange,
+	) ([]waTypes.GroupParticipant, error) {
+		// Only the phone was added. WhatsApp says nothing about the LID of the same
+		// digits, which belongs to somebody else entirely.
+		return []waTypes.GroupParticipant{
+			{JID: waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)},
+		}, nil
+	}
+
+	result, err := session.Execute(t.Context(), participantsCommand(t,
+		`{"group":{"kind":"group","id":"120363000000000001"},"participants":[`+
+			`{"kind":"phone","id":"5511999990002"},`+
+			`{"kind":"lid","id":"5511999990002"}],"action":"add"}`))
+	if err != nil {
+		t.Fatalf("group.participants.update: %v", err)
+	}
+	rows := updated(t, result)
+	if len(rows) != 2 {
+		t.Fatalf("the answer has %d rows, want one per participant asked", len(rows))
+	}
+	if rows[0].Address.Kind != protocol.AddressPhone || rows[0].Status != "success" {
+		t.Errorf("the phone that was added came back as %+v/%s, want success", rows[0].Address, rows[0].Status)
+	}
+	if rows[1].Address.Kind != protocol.AddressLID || rows[1].Status != "failed" {
+		t.Errorf("a LID WhatsApp never answered for came back as %+v/%s, want failed",
+			rows[1].Address, rows[1].Status)
+	}
 }

@@ -100,12 +100,17 @@ func (s *Session) updateGroupParticipants(ctx context.Context, command *protocol
 	// the caller's choice: a participant asked for by phone is answered under a LID on an
 	// account that has one, and matching by position instead would line the rows up
 	// wrong the moment WhatsApp leaves somebody out of its answer.
-	verdicts := make(map[string]*waTypes.GroupParticipant, len(answered)*2)
+	//
+	// Keyed by the canonical address and not by its digits alone. A LID and a phone
+	// number are separate namespaces that happen to be written the same way, so a request
+	// naming both `{phone, 5511999990002}` and `{lid, 5511999990002}` -- two different
+	// people -- would collapse onto one key and report one's verdict for both.
+	verdicts := make(map[protocol.Address]*waTypes.GroupParticipant, len(answered)*2)
 	for i := range answered {
 		one := &answered[i]
 		for _, named := range []waTypes.JID{one.JID, one.PhoneNumber, one.LID} {
-			if named.User != "" {
-				verdicts[named.User] = one
+			if canonical, addressable := addressOf(named); addressable {
+				verdicts[canonical] = one
 			}
 		}
 	}
@@ -113,7 +118,7 @@ func (s *Session) updateGroupParticipants(ctx context.Context, command *protocol
 	rows := make([]participantOutcome, len(req.Participants))
 	for i, party := range req.Participants {
 		rows[i] = participantOutcome{Address: party, Status: "failed"}
-		verdict, mentioned := verdicts[party.ID]
+		verdict, mentioned := verdicts[party]
 		switch {
 		case !mentioned:
 			// WhatsApp answered the request and said nothing about this person. Silence
@@ -127,7 +132,7 @@ func (s *Session) updateGroupParticipants(ctx context.Context, command *protocol
 			// narrower than WhatsApp's and this is where the rest of it is kept.
 			s.log.Info().Str("action", req.Action).Int("wa_code", verdict.Error).
 				Msg("WhatsApp refused one participant of a participants update")
-			rows[i].Code = refusalOf(participantRefusal(verdict.Error))
+			rows[i].Code = refusalOf(participantRefusal(action, verdict.Error))
 		default:
 			rows[i].Status = "success"
 		}
@@ -141,18 +146,24 @@ func refusalOf(code protocol.ErrorCode) *protocol.ErrorCode { return &code }
 
 // participantRefusal names why WhatsApp refused one participant.
 //
-// Only 403 is translated, and only because it is the one this connector can account for:
-// it is `not-authorized`, and WhatsApp attaches an invite to it -- an add it refuses on
-// the other person's privacy setting, answered with a code to send them instead. That is
-// exactly what `group_participant_not_allowed` is for.
+// Only an add refused with 403 is translated, and only because it is the one this
+// connector can account for: it is `not-authorized`, and WhatsApp attaches an invite to
+// it -- an add it refuses on the other person's privacy setting, answered with a code to
+// send them instead. That is exactly what `group_participant_not_allowed` is for, and it
+// is what a client acts on by sending the invite instead of retrying the add.
+//
+// The same 403 on a remove, a promote or a demote is a different sentence with the same
+// number, and this connector has confirmed neither what it means nor that an invite would
+// help. Sending the privacy code there would have a client offer to invite somebody it
+// was trying to demote.
 //
 // Everything else stays `wa_error` on purpose. The other codes WhatsApp uses here (409,
 // 408 and the rest) have no meaning this connector has confirmed per action, and a guess
 // spelled as a contract code is worse than the honest `wa_error`: a client branches on
 // the code, so a wrong one sends it down a road nobody checked. The numeric code is
 // logged, which is where it can be confirmed without a client having been told a story.
-func participantRefusal(code int) protocol.ErrorCode {
-	if code == 403 {
+func participantRefusal(action wm.ParticipantChange, code int) protocol.ErrorCode {
+	if action == wm.ParticipantChangeAdd && code == 403 {
 		return protocol.ErrorGroupParticipantNotAllowed
 	}
 	return protocol.ErrorWaError
