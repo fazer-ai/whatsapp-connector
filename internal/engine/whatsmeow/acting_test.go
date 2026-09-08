@@ -813,6 +813,12 @@ func TestAParticipantIsPutInTheGroupsOwnNamespace(t *testing.T) {
 		want  protocol.ErrorCode
 	}{
 		{name: "the socket went down", cause: wm.ErrNotConnected, want: protocol.ErrorNotConnected},
+		// Reading a group is an IQ, and an IQ names both halves of this itself. Neither
+		// sentinel is the one every other path is written against, and answering a
+		// payload error to either retires an address that may well be correct.
+		{name: "the socket went mid-query", cause: wm.ErrIQDisconnected, want: protocol.ErrorNotConnected},
+		{name: "WhatsApp never answered the query", cause: wm.ErrIQTimedOut, want: protocol.ErrorTimeout},
+		{name: "the account was logged out", cause: wm.ErrNotLoggedIn, want: protocol.ErrorNotPaired},
 		{name: "the command ran out of time", cause: context.DeadlineExceeded, want: protocol.ErrorTimeout},
 		{name: "WhatsApp refused the query", cause: errors.New("406 not acceptable"),
 			want: protocol.ErrorInvalidPayload},

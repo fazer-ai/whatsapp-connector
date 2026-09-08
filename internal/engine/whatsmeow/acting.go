@@ -327,8 +327,8 @@ func (s *Session) asTheGroupAddresses(
 		// its payload: told `invalid_payload`, it retires an address that may well be
 		// correct, and the whole reason this re-read exists is that the reading behind
 		// the refusal might be wrong.
-		if operational := operational(unread.cause); operational != nil {
-			return waTypes.EmptyJID, operational
+		if coded := operational(unread.cause, "reading of the group"); coded != nil {
+			return waTypes.EmptyJID, coded
 		}
 		// Anything else, and the stale reading stands. Refused rather than sent as it
 		// came: a key naming a member the group has no name for is accepted by WhatsApp,
@@ -353,17 +353,23 @@ func (e unreadableGroup) Error() string {
 func (e unreadableGroup) Unwrap() error { return e.cause }
 
 // operational is the connection or the deadline having gone, told apart from every other
-// reason a read fails because those two are the client's to act on: a send that comes back
-// `not_connected` is retried when the session is up, and one that comes back
+// reason a read fails because those two are the client's to act on: a command that comes
+// back `not_connected` is retried when the session is up, and one that comes back
 // `invalid_payload` is a payload the client stops sending. Answering the second when the
 // truth is the first retires an address that was correct.
-func operational(err error) error {
-	switch {
-	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
-		return protocol.NewError(protocol.ErrorTimeout,
-			"the group's addressing did not arrive before the command's deadline")
-	case errors.Is(err, wm.ErrNotConnected), errors.Is(err, wm.ErrClientIsNil):
-		return protocol.NewError(protocol.ErrorNotConnected, "the session is not connected to WhatsApp")
+//
+// `commandFailure` is where the same question is answered for every other path, and the
+// list is longer than it looks: reading a group is an IQ, and an IQ has sentinels of its
+// own for both halves of this -- `ErrIQTimedOut` rather than a context deadline, and
+// `ErrIQDisconnected` rather than `ErrNotConnected`. The first is already in there; the
+// second is the arm `contactFailure` adds, and is added here for the same reason.
+func operational(err error, subject string) error {
+	if named, coded := commandFailure(err, subject); named {
+		return coded
+	}
+	if errors.Is(err, wm.ErrIQDisconnected) {
+		return protocol.NewError(protocol.ErrorNotConnected,
+			"the connection went while the "+subject+" was in flight")
 	}
 	return nil
 }
