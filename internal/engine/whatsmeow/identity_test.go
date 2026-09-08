@@ -228,3 +228,28 @@ func TestAResolvePrefersTheNewerVerifiedName(t *testing.T) {
 		t.Errorf("the account is verified as %v, want the name the table was left with", party)
 	}
 }
+
+// Which copy of a name is the fresher one differs per field, and it differs because of
+// where each change is written: a rename updates the device record and the session and
+// leaves any contact row the account has for itself alone.
+func TestAResolvePrefersTheNewerPushName(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	own := waTypes.NewJID("5511999990001", waTypes.DefaultUserServer)
+	// A row for the account itself, as a from-me message leaves one.
+	if _, _, err := session.current().Store.Contacts.PutPushName(t.Context(), own, "Antigo"); err != nil {
+		t.Fatalf("PutPushName: %v", err)
+	}
+	session.handle(&waEvents.PushNameSetting{
+		Action: &waSyncAction.PushNameSetting{Name: proto.String("Atendimento")},
+	})
+
+	result, err := session.Execute(t.Context(), resolveCommand(t, `{"party":{"kind":"phone","id":"5511999990001"}}`))
+	if err != nil {
+		t.Fatalf("contact.resolve: %v", err)
+	}
+	if party := resolved(t, result); party["push_name"] != "Atendimento" {
+		t.Errorf("the account is called %v, want the name it renamed itself to", party)
+	}
+}

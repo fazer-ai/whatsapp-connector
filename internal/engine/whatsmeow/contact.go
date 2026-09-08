@@ -315,17 +315,19 @@ func (s *Session) resolveContact(ctx context.Context, command *protocol.Command)
 			named.LID = lid
 		}
 		named.Phone = phone
-		// The table first, and the session for what it does not hold. Its own names are
-		// not in there to begin with -- the table is the people this account has met, and
-		// it is not one of them -- so the session, which took them off the device where an
-		// ordering exists, is what usually answers.
+		// The account's own names are usually in neither place -- the contact table is the
+		// people it has met, and it is not one of them -- so most of the time the session
+		// answers both. Where a row does exist, which of the two is the fresher one
+		// differs per field, and it differs because of where each change is written:
 		//
-		// The exception is why the order is this way round: an account that renames its
-		// business has the new name written to the table and not to the device record, so
-		// after a restart the device is the stale copy of the two.
+		//   - a push name change updates the device record and this session, and does not
+		//     touch a row the account may have for itself, so the session wins;
+		//   - a verified name change is written to the contact table and *not* to the
+		//     device record, so after a restart the session holds the older of the two and
+		//     the table wins.
 		s.nameFromStore(reading, &named)
 		pushName, verifiedName := s.names()
-		if named.PushName == "" {
+		if pushName != "" {
 			named.PushName = pushName
 		}
 		if named.VerifiedName == "" {
