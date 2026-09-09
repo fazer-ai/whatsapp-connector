@@ -2071,6 +2071,14 @@ func (s *Session) startPairing(ctx context.Context, cancel context.CancelFunc) *
 	s.mu.Lock()
 	previous := s.pairing
 	s.pairing = run
+	// A pairing is starting, which is the answer to "is there anything left to try", and
+	// it is given here as well as where the guard comes down. Between those two the
+	// attempt this one replaces can report a build WhatsApp will not talk to -- it holds
+	// this lock to do it, so it either gets there first and is undone here, or finds this
+	// run current and stands aside. Left standing, the giving-up belongs to the attempt
+	// that was replaced and the account is handed over on the strength of it, however the
+	// one that is running now ends.
+	s.terminal = false
 	s.mu.Unlock()
 	if previous != nil {
 		previous.cancel()

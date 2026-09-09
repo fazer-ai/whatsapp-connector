@@ -2901,3 +2901,37 @@ func TestTheGuardComesDownWithWhateverGivingUpItFinds(t *testing.T) {
 		t.Fatalf("the guard came down reporting giving-up %d on a session that had none", gaveUp)
 	}
 }
+
+// A connect takes the session's giving-up down on its way in and then waits for the lock a
+// pairing starts under. The attempt it replaces can report a build WhatsApp will not talk
+// to in that gap: it takes the same lock, finds its own run still current because the
+// replacement has not started yet, and gives up on the session again. Nothing would then
+// take that down -- the connect is already past the place where it does -- so the account
+// is handed over on an answer about the attempt that was replaced, however the one that is
+// running now ends.
+func TestAPairingStartingUndoesTheGivingUpOfTheAttemptItReplaces(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "")
+	leftCtx, cancelLeft := context.WithCancel(t.Context())
+	t.Cleanup(cancelLeft)
+	left := session.startPairing(leftCtx, cancelLeft)
+
+	// The attempt on its way out, reporting the build while it is still the current one.
+	session.outdatedPairing(left)
+	if session.Finished() == 0 {
+		t.Fatal("the attempt on its way out did not give up on the session, so there is nothing to undo")
+	}
+	if outdated := next(t, session); outdated.Type != protocol.EventSessionClientOutdated {
+		t.Fatalf("the attempt published %s, want %s", outdated.Type, protocol.EventSessionClientOutdated)
+	}
+
+	// The operator's corrected attempt, starting into it.
+	nextCtx, cancelNext := context.WithCancel(t.Context())
+	t.Cleanup(cancelNext)
+	session.startPairing(nextCtx, cancelNext)
+
+	if session.Finished() != 0 {
+		t.Fatal("a pairing started with the giving-up of the attempt it replaced still standing")
+	}
+}
