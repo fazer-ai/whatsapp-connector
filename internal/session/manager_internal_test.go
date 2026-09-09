@@ -2,6 +2,8 @@ package session
 
 import (
 	"context"
+	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -224,4 +226,194 @@ func waitFor(t *testing.T, done func() bool, complaint string) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatal(complaint)
+}
+
+// A client retrying between the terminal event and the next heartbeat must not be served
+// by the session that is on its way out: a connect answered there would put the account
+// back up on an instance whose next tick stops it and hands it away regardless. The
+// adoption hands it back instead, and what serves the retry is the session built after.
+func TestAnAdoptionDoesNotHandBackASessionOnItsWayOut(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+
+	engines := fake.New()
+	manager := NewManager(&ManagerConfig{
+		Instance: "inst-a", Engine: engines,
+		Leases:    cluster.NewLeases(client, "inst-a", cluster.Options{}),
+		Publisher: quietPublisher{}, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	t.Cleanup(func() { manager.StopAll(context.Background()) })
+
+	const sid = "9c2b7d1e-0000-4000-8000-0000000000a3"
+	ctx := context.Background()
+	first, err := manager.Adopt(ctx, sid)
+	if err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+
+	engineSession, running := engines.Session(sid)
+	if !running {
+		t.Fatal("the engine has no session for the account that was just adopted")
+	}
+	engineSession.EmitLast(protocol.EventSessionConnectFailure, map[string]any{"reason": "unavailable"})
+	waitFor(t, func() bool { return first.Retired() }, "the session was never finished with")
+
+	// The retry, before any heartbeat has swept.
+	second, err := manager.Adopt(ctx, sid)
+	if err != nil {
+		t.Fatalf("the retry could not be adopted: %v", err)
+	}
+	if second == first {
+		t.Fatal("the retry was answered with the session that is on its way out")
+	}
+	if second.Retired() {
+		t.Fatal("the session built for the retry came back already finished with")
+	}
+}
+
+// stalledRedis is a hop in front of a real server that can be told to stop carrying
+// anything, which is what a Redis under load looks like from the caller: the connection
+// is up, the request went out, and the answer never comes. Closing the server instead
+// would prove nothing -- a refused connection fails at once, and it is the round trip
+// that does not fail that a heartbeat has to be protected from.
+type stalledRedis struct {
+	listener net.Listener
+	stalled  atomic.Bool
+	held     chan struct{}
+}
+
+func stallable(t *testing.T, backend string) *stalledRedis {
+	t.Helper()
+	var listen net.ListenConfig
+	listener, err := listen.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	hop := &stalledRedis{listener: listener, held: make(chan struct{})}
+	t.Cleanup(func() {
+		close(hop.held)
+		_ = listener.Close()
+	})
+	go func() {
+		for {
+			near, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			var dial net.Dialer
+			far, err := dial.DialContext(context.Background(), "tcp", backend)
+			if err != nil {
+				_ = near.Close()
+				return
+			}
+			go hop.carry(far, near)
+			go hop.carry(near, far)
+		}
+	}()
+	return hop
+}
+
+func (s *stalledRedis) addr() string { return s.listener.Addr().String() }
+
+func (s *stalledRedis) stall() { s.stalled.Store(true) }
+
+func (s *stalledRedis) carry(dst, src net.Conn) {
+	defer func() { _, _ = dst.Close(), src.Close() }()
+	buf := make([]byte, 4096)
+	for {
+		n, err := src.Read(buf)
+		if n > 0 {
+			if s.stalled.Load() {
+				<-s.held
+				return
+			}
+			if _, err := dst.Write(buf[:n]); err != nil {
+				return
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+// Every hand-back is a Redis round trip that can hang, and the goroutine that sweeps is
+// the goroutine that renews every lease this instance holds. A sweep that spends longer
+// than a lease is every other session left unrenewed while its socket is still open, so
+// peers take those accounts from under a live connection. Retiring an account a tick
+// later is the cheaper outcome by a wide margin.
+func TestASweepGivesUpOnARedisThatStoppedAnswering(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	hop := stallable(t, server.Addr())
+	// The same option production dials with, and the only one that matters here: without
+	// it go-redis hands the connection a background context and its own read timeout, so
+	// the window this measures would stop at the point the command reaches the socket.
+	rdb := redis.NewClient(&redis.Options{Addr: hop.addr(), ContextTimeoutEnabled: true})
+	t.Cleanup(func() { _ = rdb.Close() })
+
+	// Short enough that the budget is unmistakable next to the read timeout a hand-back
+	// that is not bounded waits out, which is what the reversion of this measures, and
+	// long enough that the events retiring the sessions are still published under a
+	// lease this holder counts as its own.
+	const ttl = 1500 * time.Millisecond
+	engines := fake.New()
+	leases := cluster.NewLeases(redisx.Wrap(rdb, "wa:", 8), "inst-a", cluster.Options{
+		TTL: ttl, Margin: 100 * time.Millisecond,
+	})
+	manager := NewManager(&ManagerConfig{
+		Instance: "inst-a", Engine: engines, Leases: leases,
+		Publisher: quietPublisher{}, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	// Bounded because this runs with the server still stalled, and a hand-back that
+	// cannot reach it is not what is being measured here.
+	t.Cleanup(func() {
+		quick, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		defer cancel()
+		manager.StopAll(quick)
+	})
+
+	sids := []string{"s1", "s2", "s3"}
+	sessions := make([]*Session, 0, len(sids))
+	for _, sid := range sids {
+		session, err := manager.Adopt(context.Background(), sid)
+		if err != nil {
+			t.Fatalf("Adopt %s: %v", sid, err)
+		}
+		sessions = append(sessions, session)
+		engineSession, running := engines.Session(sid)
+		if !running {
+			t.Fatalf("the engine has no session for %s, just adopted", sid)
+		}
+		engineSession.EmitLast(protocol.EventSessionState, map[string]any{
+			"state": "close", "reason": "pairing_client_outdated",
+		})
+	}
+	waitFor(t, func() bool {
+		for _, session := range sessions {
+			if !session.Retired() {
+				return false
+			}
+		}
+		return true
+	}, "the sessions were never finished with")
+
+	hop.stall()
+	swept := make(chan struct{})
+	go func() {
+		defer close(swept)
+		manager.SweepRetired(context.Background())
+	}()
+	select {
+	case <-swept:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("the sweep is still handing leases back after 2s, on a lease worth %s", ttl)
+	}
 }

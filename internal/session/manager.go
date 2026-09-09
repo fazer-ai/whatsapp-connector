@@ -161,8 +161,21 @@ func (m *Manager) Adopt(ctx context.Context, sid string) (*Session, error) {
 	m.mu.RLock()
 	existing, running := m.sessions[sid]
 	m.mu.RUnlock()
-	if running {
+	if running && !existing.Retired() {
 		return existing, nil
+	}
+	if running {
+		// Finished with, and the sweep has not come round yet. Handing it back here
+		// rather than answering with it is what keeps the window between the two from
+		// being one where a command runs: a connect served by this session would
+		// reconnect an account the next heartbeat then stops and hands away anyway.
+		//
+		// Bounded and detached for the same reason `abandon` is on the failure path
+		// below: the caller's deadline is for adopting, and a cleanup that spent it
+		// would leave nothing for the adoption that follows.
+		release, cancelRelease := context.WithTimeout(context.WithoutCancel(ctx), releaseTimeout)
+		m.Release(release, sid)
+		cancelRelease()
 	}
 
 	// Bounded, and bounded around the I/O only. Commands are dispatched on the same
@@ -848,9 +861,21 @@ func (m *Manager) SweepRetired(ctx context.Context) {
 	}
 	m.mu.RUnlock()
 
+	// The same share of a lease `RenewAll`'s hand-backs get, and for the same reason: each
+	// release is a Redis round trip that can hang, and a heartbeat that spends longer than
+	// a lease here is every other session on this instance left unrenewed -- peers take
+	// them while the sockets are still open. One that does not fit is swept on the next
+	// tick, which costs an account a few more seconds of belonging to nobody.
+	window, cancel := context.WithTimeout(ctx, m.leases.TTL()/ReleaseShare)
+	defer cancel()
 	for _, sid := range retired {
+		if window.Err() != nil {
+			m.log.Warn().Str("sid", sid).
+				Msg("ran out of tick before handing back a retired session; will try again")
+			return
+		}
 		m.log.Info().Str("sid", sid).
 			Msg("handing back a session the engine will not bring back on its own")
-		m.Release(ctx, sid)
+		m.Release(window, sid)
 	}
 }

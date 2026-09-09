@@ -300,6 +300,26 @@ func (s *Session) EmitLast(eventType protocol.EventType, payload any) {
 	}
 }
 
+// EmitLastDurable is EmitLast with the callback EmitDurable takes, which is how a test
+// waits for the publish itself rather than for something after it.
+func (s *Session) EmitLastDurable(eventType protocol.EventType, payload any, settle func(error)) {
+	body, err := marshal(payload)
+	if err != nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		settle(errors.New("fake: nobody is reading the emissions"))
+		return
+	}
+	select {
+	case s.events <- engine.Emission{Type: eventType, Payload: body, Retires: true, Settle: settle}:
+	default:
+		settle(errors.New("fake: nobody is reading the emissions"))
+	}
+}
+
 // EmitAt publishes an emission that says when the engine learned the thing it reports,
 // which is what a frame's `ts` carries and the only way a reader can tell an event that
 // waited from news of now.

@@ -236,19 +236,26 @@ func (s *Session) pump(ctx context.Context) {
 			if !ok {
 				return
 			}
-			s.publish(ctx, &emission)
-			if emission.Retires {
-				// After the publish and not before it: the event says why the session is
-				// finished, and handing the lease back first would let another instance
-				// adopt the account and publish under a newer epoch, which is a client
-				// dropping the explanation as stale.
+			// After the publish and only on one that landed. The event says why the
+			// session is finished: handing the lease back before it is out lets another
+			// instance adopt the account and publish under a newer epoch, which is a
+			// client dropping the explanation as stale, and handing it back after one
+			// that never reached the stream retires the account with nobody told at all.
+			if s.publish(ctx, &emission) && emission.Retires {
 				s.retired.Store(true)
 			}
 		}
 	}
 }
 
-func (s *Session) publish(ctx context.Context, emission *engine.Emission) {
+// publish writes one emission and says whether the client can be assumed to have it.
+//
+// False for every road that ends without a write on the stream -- a lease that moved, a
+// moment that went stale, something the engine was waiting for answered first -- and for
+// a write that failed. The one caller that reads it is the pump deciding whether the
+// session is finished, and a session retired on an event nobody received is an account
+// handed over with nothing saying why.
+func (s *Session) publish(ctx context.Context, emission *engine.Emission) bool {
 	if _, owned := s.leases.Owned(s.sid); !owned {
 		// Publishing under a lease this instance no longer holds writes a lower epoch
 		// after a higher one has already been seen, which is the one thing a client
@@ -256,7 +263,7 @@ func (s *Session) publish(ctx context.Context, emission *engine.Emission) {
 		// the state it finds.
 		s.log.Warn().Str("type", string(emission.Type)).Msg("dropped an emission from a session owned elsewhere")
 		settle(emission, errLostOwnership)
-		return
+		return false
 	}
 
 	// outlives is the caller's own context, kept when a moment's remaining life is put
@@ -277,7 +284,7 @@ func (s *Session) publish(ctx context.Context, emission *engine.Emission) {
 			s.log.Debug().Str("type", string(emission.Type)).
 				Msg("dropped a transient emission that is no longer true")
 			settle(emission, nil)
-			return
+			return false
 		}
 		bounded, cancel := context.WithTimeout(ctx, left)
 		defer cancel()
@@ -291,7 +298,7 @@ func (s *Session) publish(ctx context.Context, emission *engine.Emission) {
 		s.log.Debug().Str("type", string(emission.Type)).
 			Msg("dropped an emission that something else answered first")
 		settle(emission, nil)
-		return
+		return false
 	}
 
 	s.seq++
@@ -314,7 +321,7 @@ func (s *Session) publish(ctx context.Context, emission *engine.Emission) {
 		s.log.Debug().Str("type", string(emission.Type)).
 			Msg("gave up on a transient emission that went stale mid-write")
 		settle(emission, nil)
-		return
+		return false
 	}
 	if err != nil && ctx.Err() == nil {
 		s.log.Error().Err(err).Str("type", string(emission.Type)).Msg("failed to publish an event")
@@ -323,6 +330,7 @@ func (s *Session) publish(ctx context.Context, emission *engine.Emission) {
 		err = s.stillOwned()
 	}
 	settle(emission, err)
+	return err == nil
 }
 
 // stamped is when the thing an event reports happened, which is what its `ts` carries.
@@ -702,7 +710,7 @@ func (s *Session) answer(ctx context.Context, command *protocol.Command, result 
 		return
 	}
 	failure := asProtocolError(err)
-	s.publish(ctx, &engine.Emission{
+	_ = s.publish(ctx, &engine.Emission{
 		Type:    protocol.EventCommandFailed,
 		Payload: mustMarshal(map[string]any{"command_id": command.ID, "type": command.Type, "error": failure}),
 	})

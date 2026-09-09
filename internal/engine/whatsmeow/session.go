@@ -488,6 +488,12 @@ type pairingRun struct {
 	// operator has already replaced would be sent to WhatsApp as if it were this one's.
 	id     string
 	cancel context.CancelFunc
+	// outdated says WhatsApp refused this build during the run. The reader publishes that
+	// on its own -- whatsmeow delivers it to the QR channel as well as to the handler, and
+	// the handler stands aside -- and it is the run's last event that has to say the
+	// session is finished, not this one: stopping the reader here would take the pairing's
+	// own outcome down with it.
+	outdated atomic.Bool
 	// done is closed when this conversation is cancelled. whatsmeow only watches the
 	// pairing context from the goroutine that emits codes, and that goroutine is started
 	// by the first QR event: a conversation whose dial failed before one arrived leaves
@@ -1431,7 +1437,7 @@ func (s *Session) abandonPairing(run *pairingRun, client *wm.Client, reason stri
 	// the same one for the outcomes WhatsApp reports. Outside it, an attempt that ends
 	// here while its reader is reporting a timeout publishes both.
 	if reason != "" {
-		s.publishPairingFailure(reason, err)
+		s.publishPairingFailure(reason, err, false)
 	}
 	s.tearDownPairing(run, client)
 }
@@ -2464,6 +2470,7 @@ func (s *Session) publishPairing(run *pairingRun, item wm.QRChannelItem, publish
 			"request_id": run.id, "code": item.PasskeyConfirmation.Code,
 		})
 	case "err-client-outdated":
+		run.outdated.Store(true)
 		s.emit(protocol.EventSessionClientOutdated, map[string]any{})
 	case "timeout":
 		s.finishPairing(run, "timeout", nil)
@@ -2584,7 +2591,7 @@ func (s *Session) finishPairing(run *pairingRun, reason string, err error) {
 	if !s.endPairing(run) {
 		return
 	}
-	s.publishPairingFailure(reason, err)
+	s.publishPairingFailure(reason, err, run.outdated.Load())
 	// The socket does not always go with the outcome. A code scanned on a phone without
 	// multidevice leaves the client connected with its pairing channel live, and
 	// whatsmeow will not open a second one on a live socket: the operator's corrected
@@ -2646,7 +2653,7 @@ func qrDataURL(code string) (string, error) {
 // on the wire. A `PairDatabaseError` or a protobuf failure carries SQL and internals
 // that mean nothing to an operator and should not reach a client's UI; the detail stays
 // in the log, where whoever is debugging it can find it.
-func (s *Session) publishPairingFailure(reason string, err error) {
+func (s *Session) publishPairingFailure(reason string, err error, retires bool) {
 	if err != nil {
 		s.log.Warn().Err(err).Str("reason", reason).Msg("a pairing failed")
 	}
@@ -2663,7 +2670,16 @@ func (s *Session) publishPairingFailure(reason string, err error) {
 
 	s.refuseLateConnect()
 	s.offline()
-	s.emit(protocol.EventSessionState, map[string]any{"state": "close", "reason": "pairing_" + reason})
+	closing := map[string]any{"state": "close", "reason": "pairing_" + reason}
+	if retires {
+		// The run is over and WhatsApp refused this build, so nothing here is going to
+		// connect: the account goes back rather than being held by an instance whose
+		// image is the reason it cannot pair. On the run's last event, so the pairing's
+		// own outcome is out first.
+		s.emitLast(protocol.EventSessionState, closing)
+		return
+	}
+	s.emit(protocol.EventSessionState, closing)
 }
 
 // pairingFailureMessage is the stable sentence a client shows for each reason.
@@ -2874,7 +2890,7 @@ func (s *Session) handle(rawEvent any) bool {
 		if s.pairingActive() {
 			return true
 		}
-		s.publishPairingFailure("pair_error", event.Error)
+		s.publishPairingFailure("pair_error", event.Error, false)
 	}
 	return true
 }

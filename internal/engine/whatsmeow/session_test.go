@@ -1270,7 +1270,7 @@ func TestAPairingThatEndedTakesTheConnectionWithIt(t *testing.T) {
 		t.Fatalf("state = %q while pairing, want connecting", state)
 	}
 
-	session.publishPairingFailure("timeout", nil)
+	session.publishPairingFailure("timeout", nil, false)
 
 	if emission := next(t, session); emission.Type != protocol.EventPairingError {
 		t.Fatalf("published %q first, want the pairing error", emission.Type)
@@ -1722,7 +1722,7 @@ func TestATerminalTransitionRefusesTheConnectQueuedBehindIt(t *testing.T) {
 			session.handle(&waEvents.StreamReplaced{})
 		},
 		"a pairing that failed": func(session *Session) {
-			session.publishPairingFailure("timeout", nil)
+			session.publishPairingFailure("timeout", nil, false)
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -2653,5 +2653,51 @@ func TestTheStatesWhatsmeowDoesNotComeBackFromRetireTheSession(t *testing.T) {
 				t.Errorf("the emission retires the session: %v, want %v", emission.Retires, tc.retires)
 			}
 		})
+	}
+}
+
+// A pairing that WhatsApp refuses for the build's version leaves a session nothing can
+// bring back, and the handler stands aside there: whatsmeow delivers the outdated event to
+// the pairing channel as well, and two canonical events for one outcome is worse than
+// either. So it is the run's own last event that finishes the session -- after the pairing
+// has said how it ended, not instead of it.
+func TestAPairingRefusedForTheBuildFinishesTheSession(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "")
+	pairCtx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	run := session.startPairing(pairCtx, cancel)
+
+	// Driven through the reader rather than by setting the flag, because the wiring is
+	// what this is about: whatsmeow reports the refusal as an item of its own, and the
+	// outcome that carries it arrives afterwards as a separate one.
+	codes := make(chan wm.QRChannelItem, 2)
+	codes <- wm.QRChannelItem{Event: "err-client-outdated"}
+	codes <- wm.QRChannelItem{Event: "timeout"}
+	go session.readPairingWith(run, codes, nil, false)
+
+	outdated := next(t, session)
+	if outdated.Type != protocol.EventSessionClientOutdated {
+		t.Fatalf("the pairing published %s first, want %s", outdated.Type, protocol.EventSessionClientOutdated)
+	}
+	if outdated.Retires {
+		t.Error("the refusal finished the session on its own, leaving nothing to publish the outcome")
+	}
+
+	failed := next(t, session)
+	if failed.Type != protocol.EventPairingError {
+		t.Fatalf("the pairing published %s, want %s", failed.Type, protocol.EventPairingError)
+	}
+	if failed.Retires {
+		t.Error("the pairing's own outcome finished the session, leaving nothing to publish the state")
+	}
+
+	closed := next(t, session)
+	if closed.Type != protocol.EventSessionState {
+		t.Fatalf("the pairing published %s last, want %s", closed.Type, protocol.EventSessionState)
+	}
+	if !closed.Retires {
+		t.Error("a pairing WhatsApp refused for this build left the session holding its lease")
 	}
 }

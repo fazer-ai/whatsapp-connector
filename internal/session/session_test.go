@@ -2885,3 +2885,43 @@ func TestASessionIsNotFinishedWithUntilTheEventSayingSoIsOut(t *testing.T) {
 		t.Fatalf("the events published are %v, want the one that says why", published)
 	}
 }
+
+// A publish that never reached the stream is not an event the client has, and retiring on
+// one hands the account over with nothing saying why. The lease stays where it is until
+// something gets through.
+func TestASessionIsNotFinishedWithOnAnEventThatNeverLanded(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	ctx := context.Background()
+
+	adopted, err := h.manager.Adopt(ctx, "s1")
+	if err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, ok := h.engine.Session("s1")
+	if !ok {
+		t.Fatal("the engine has no session after Adopt")
+	}
+
+	h.recorder.failWith(errors.New("the stream is not taking writes"))
+	published := make(chan error, 1)
+	engineSession.EmitLastDurable(protocol.EventSessionTemporaryBan, map[string]any{
+		"ban": map[string]any{"kind": "temporary", "reason": "spam"},
+	}, func(err error) { published <- err })
+
+	// The publish itself is what has to be waited for, and the callback is the only thing
+	// that reports it: waiting for a later event instead races the pump.
+	select {
+	case err := <-published:
+		if err == nil {
+			t.Fatal("the publish this test needs to fail succeeded")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the pump never came back from the publish")
+	}
+
+	if adopted.Retired() {
+		t.Fatal("the session was finished with on an event that never reached the stream")
+	}
+}
