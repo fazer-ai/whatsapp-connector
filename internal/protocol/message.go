@@ -131,6 +131,18 @@ type MediaContent struct {
 	Size      int64     `json:"size,omitempty"`
 	// Duration is how long an audio or a video runs, in seconds.
 	Duration uint32 `json:"duration,omitempty"`
+	// Width and Height are the picture's size in pixels, for an image, a video or a
+	// sticker. A recipient's client lays the bubble out from these before a byte of the
+	// file has arrived, so with them the conversation does not jump when the media lands.
+	// WhatsApp's own clients always send them. The connector does not decode media, so
+	// they come from the caller, which already has the file.
+	Width  uint32 `json:"width,omitempty"`
+	Height uint32 `json:"height,omitempty"`
+	// Waveform is the shape a voice note's bubble draws: exactly 64 samples of amplitude,
+	// each 0-100. Absent is a flat bar, which is how a note sent from here reads without
+	// it. Computing one means decoding the audio, which this connector does not do and
+	// the caller, holding the file and an ffmpeg, already can.
+	Waveform []int `json:"waveform,omitempty"`
 	// Thumbnail is a data: URI small enough to travel inside the frame, which is the
 	// one exception to media never doing so.
 	Thumbnail string    `json:"thumbnail,omitempty"`

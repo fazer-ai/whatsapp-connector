@@ -9,6 +9,7 @@ import (
 	"errors"
 	"io"
 	"net/url"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -124,7 +125,7 @@ func TestEachMediaKindIsRenderedTheWayTheContractCarriesIt(t *testing.T) {
 			if !ok {
 				t.Fatal("a media message this build carries was not recognised as one")
 			}
-			if part.content != tc.want {
+			if !reflect.DeepEqual(part.content, tc.want) {
 				t.Fatalf("the content is %+v, want %+v", part.content, tc.want)
 			}
 			if part.download == nil {
