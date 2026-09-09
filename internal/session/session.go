@@ -64,10 +64,14 @@ type Session struct {
 	// when the engine says its last word; the lease goes back only once that word is out,
 	// so an emission that never landed puts the door back rather than handing an account
 	// away with nothing published to say why.
-	finishing atomic.Bool
+	// Guarded by queueMu, with `stopping` and the queue itself: refusing a command and
+	// reopening the door are each [read one, write the other], and interleaved they lose
+	// the mark -- the door opens between the read and the write, and the command that was
+	// turned away is left pending with no drain to take its stream back.
+	finishing bool
 	// refused says a command was turned away while the door was shut, which is what the
 	// drain the reopening schedules is for.
-	refused atomic.Bool
+	refused bool
 	// undrained marks this session as having something pending on its stream that was
 	// not read by the loop's own `>`. Nil outside the manager.
 	undrained func()
@@ -186,14 +190,14 @@ func (s *Session) Offer(delivery *transport.Delivery) Offer {
 	if s.stopping {
 		return OfferStopped
 	}
-	if s.finishing.Load() {
+	if s.finishing {
 		// Finishing is stopping that has not happened yet: the engine has said its last
 		// word and the heartbeat hands the lease back once it is out. A connect served in
 		// that window dials an account this instance gives away moments later, and answers
 		// the client that it worked -- the socket is then stopped with nothing published
 		// to say so. Left pending for the owner that comes next, which is what
 		// OfferStopped already means.
-		s.refused.Store(true)
+		s.refused = true
 		return OfferStopped
 	}
 	select {
@@ -274,16 +278,18 @@ func (s *Session) pump(ctx context.Context) {
 			// otherwise be carried out in that gap, on a session the engine has already
 			// said its last word about.
 			if emission.Retires {
-				s.finishing.Store(true)
+				s.shut()
 			}
 			landed := s.publish(ctx, &emission)
 			if !emission.Retires {
 				continue
 			}
-			if !s.engine.Finished() {
-				// A connect ran between the engine queueing this and the pump taking it,
-				// and put a socket back up. The mark is about the attempt before that one,
-				// and handing the account over on it would tear down a retry that worked.
+			if s.engine.Finished() != emission.Attempt {
+				// The session has moved on from the giving-up this is about: a connect ran
+				// between the engine queueing it and the pump taking it, and either put a
+				// socket back up or ran into a giving-up of its own. Handing the account
+				// over on this one would tear down a retry that worked, or stop the session
+				// with the newer outcome and everything before it still queued.
 				s.log.Info().Str("type", string(emission.Type)).
 					Msg("a connect answered an outcome the engine had already given up on; keeping the session")
 				s.reopen()
@@ -316,10 +322,35 @@ func (s *Session) reopen() {
 	if s.retired.Load() {
 		return
 	}
-	s.finishing.Store(false)
-	if s.refused.Swap(false) && s.undrained != nil {
+	s.queueMu.Lock()
+	s.finishing = false
+	refused := s.refused
+	s.refused = false
+	s.queueMu.Unlock()
+
+	if refused && s.undrained != nil {
 		s.undrained()
 	}
+}
+
+// shut closes the door: the engine has said its last word and this session is not to
+// carry out anything else while it goes out.
+func (s *Session) shut() {
+	s.queueMu.Lock()
+	s.finishing = true
+	s.queueMu.Unlock()
+}
+
+// finished reports whether the door is shut, marking the refusal in the same step so a
+// reopening cannot come between the two and lose it.
+func (s *Session) finished() bool {
+	s.queueMu.Lock()
+	defer s.queueMu.Unlock()
+	if !s.finishing {
+		return false
+	}
+	s.refused = true
+	return true
 }
 
 // publish writes one emission and says whether the client can be assumed to have it.
@@ -503,13 +534,12 @@ func (s *Session) execute(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case delivery := <-s.commands:
-			if s.finishing.Load() {
+			if s.finished() {
 				// Queued before the engine finished with the session, which `Offer` can
 				// no longer refuse because it was already taken. Carried out, a connect
 				// waiting here dials an account the next tick hands away and answers the
 				// client that it worked. Left pending for whoever takes the account, the
 				// same answer an offer refused now gets.
-				s.refused.Store(true)
 				release(delivery)
 				continue
 			}

@@ -87,6 +87,7 @@ type Session struct {
 	closed    bool
 	connected bool
 	finished  bool
+	givenUp   uint64
 	loggedOut int
 	commands  []protocol.Command
 	held      chan struct{}
@@ -269,10 +270,22 @@ func (s *Session) Events() <-chan engine.Emission { return s.events }
 
 // Finished is what the fake was last told to say: EmitLast and EmitLastDurable put it
 // up, and a Connect that succeeds takes it down, the way whatsmeow's own does.
-func (s *Session) Finished() bool {
+func (s *Session) Finished() uint64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.finished
+	if !s.finished {
+		return 0
+	}
+	return s.givenUp
+}
+
+// giveUp records another giving-up. The caller holds the lock.
+func (s *Session) giveUp() uint64 {
+	if !s.finished {
+		s.finished = true
+		s.givenUp++
+	}
+	return s.givenUp
 }
 
 // Close ends the session. Safe to call twice, because both an operator command and
@@ -306,9 +319,8 @@ func (s *Session) EmitLast(eventType protocol.EventType, payload any) {
 	if s.closed {
 		return
 	}
-	s.finished = true
 	select {
-	case s.events <- engine.Emission{Type: eventType, Payload: body, Retires: true}:
+	case s.events <- engine.Emission{Type: eventType, Payload: body, Retires: true, Attempt: s.giveUp()}:
 	default:
 	}
 }
@@ -326,9 +338,8 @@ func (s *Session) EmitLastDurable(eventType protocol.EventType, payload any, set
 		settle(errors.New("fake: nobody is reading the emissions"))
 		return
 	}
-	s.finished = true
 	select {
-	case s.events <- engine.Emission{Type: eventType, Payload: body, Retires: true, Settle: settle}:
+	case s.events <- engine.Emission{Type: eventType, Payload: body, Retires: true, Settle: settle, Attempt: s.giveUp()}:
 	default:
 		settle(errors.New("fake: nobody is reading the emissions"))
 	}

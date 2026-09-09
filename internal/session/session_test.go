@@ -754,7 +754,7 @@ func (e *gatedEngine) Open(ctx context.Context, _ string) (engine.Session, error
 }
 
 func (e *gatedEngine) Events() <-chan engine.Emission                       { return e.events }
-func (e *gatedEngine) Finished() bool                                       { return false }
+func (e *gatedEngine) Finished() uint64                                     { return 0 }
 func (e *gatedEngine) Connect(context.Context, engine.ConnectRequest) error { return nil }
 func (e *gatedEngine) Disconnect(context.Context) error                     { return nil }
 func (e *gatedEngine) Logout(context.Context) error                         { return nil }
@@ -1097,7 +1097,7 @@ func newHeldEngine() *heldEngine {
 
 func (e *heldEngine) Open(context.Context, string) (engine.Session, error) { return e, nil }
 func (e *heldEngine) Events() <-chan engine.Emission                       { return e.events }
-func (e *heldEngine) Finished() bool                                       { return false }
+func (e *heldEngine) Finished() uint64                                     { return 0 }
 func (e *heldEngine) Connect(context.Context, engine.ConnectRequest) error { return nil }
 func (e *heldEngine) Disconnect(context.Context) error                     { return nil }
 func (e *heldEngine) Logout(context.Context) error                         { return nil }

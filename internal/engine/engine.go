@@ -50,6 +50,11 @@ type Emission struct {
 	// nobody until a command adopts it again, which is what lets another instance be the
 	// one that tries -- and on an outdated client, one running a newer build.
 	Retires bool
+	// Attempt names the giving-up this emission belongs to, as `Finished` reported it
+	// when the emission was made, and zero on everything that does not retire. The reader
+	// compares the two: an emission about a giving-up the session has moved on from is
+	// one a retry has already answered.
+	Attempt uint64
 
 	// Settle, when it is set, is called exactly once with the outcome of publishing
 	// this emission: nil once the client can be assumed to have it, an error when it
@@ -126,17 +131,18 @@ type Session interface {
 	// Events is closed when the session is done. Reading it is the only way to learn
 	// what the engine has to say.
 	Events() <-chan Emission
-	// Finished reports that there is nothing left for this session to try: WhatsApp
-	// refused the build, banned the number or refused the connection, and the library
-	// publishes those from the branch that keeps the socket down.
+	// Finished names the giving-up this session is on, or zero while there is still
+	// something to try: WhatsApp refused the build, banned the number or refused the
+	// connection, and the library publishes those from the branch that keeps the socket
+	// down.
 	//
-	// Asked when an emission marked as the last one is about to be published, because
-	// between the engine queueing that emission and the reader taking it a connect can
-	// have run and put a socket back up. The mark travels with the emission and cannot
-	// be taken off it; this is how the emission is checked against what has happened
-	// since, so a retry that worked is not torn down by an answer about the attempt
-	// before it.
-	Finished() bool
+	// Asked when an emission marked as the last one is about to be published, and
+	// compared against that emission's `Attempt`. The mark travels with the emission and
+	// cannot be taken off it, so between the engine queueing one and the reader taking it
+	// a connect can have run and put a socket back up -- and run into a second outcome of
+	// its own. A count rather than a flag, because both of those have to be told apart
+	// from the outcome the emission in hand is about.
+	Finished() uint64
 	// Close releases the session. Events is closed before Close returns, so a reader
 	// draining it always terminates.
 	Close() error

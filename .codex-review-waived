@@ -491,3 +491,15 @@ internal/engine/whatsmeow/session.go: Preserve failed name writes across session
 # fazer-ai/whatsapp-connector#145, with the note that `cooldown:<sid>` is already written on
 # every release and read by nobody, so the marker may well belong there.
 internal/session/manager.go: Make in-flight hand-backs visible to peer consumers  # PR#144
+# PR#144: `waitFor` polls with a 5ms sleep and a 5s deadline, and that is not the pattern
+# the rule names. What it forbids is a sleep standing in for synchronisation -- sleep 100ms,
+# then assert -- which passes when the scheduler is kind and fails when it is not. This
+# waits for a condition and fails loudly if it never holds, so its outcome does not depend
+# on how long anything took; the sleep is only how often it looks. Where a signal exists,
+# the tests in this PR take it: `hop.swallowed` for a round trip in flight, `entered` and
+# `let` for a publish held mid-write, `handed` for a hand-back that finished. What is left
+# is a flag another goroutine sets after a callback has already returned -- `Retired`, set
+# by the pump after `publish` settles -- and there is nothing to wait on for those without
+# putting a channel in production code for the tests to read. The same shape is used
+# throughout the repository's own suites (internal/app, transport/redisstream).
+internal/session/manager_internal_test.go: Replace polling sleeps with deterministic synchronization  # PR#144

@@ -413,6 +413,10 @@ type Session struct {
 	// the handler and once through the QR channel, and only the second of the two knows
 	// it is last. Cleared with the guard beside it, on the next connect.
 	terminal bool
+	// givenUp counts the times this session has been given up on, and never goes back:
+	// the connector compares the count an emission was made under with the one standing
+	// when it is read, and two givings-up either side of a retry have to be told apart.
+	givenUp uint64
 	// reconnecting is whatsmeow retrying a paired socket on its own, which runs outside
 	// this session's dial. Without it a status would report `close` while the event
 	// stream says reconnecting, and a resume would start a second dial alongside it.
@@ -1687,22 +1691,28 @@ func (s *Session) refuseLateConnect() {
 // markTerminal records that whatsmeow will not bring this connection back on its own.
 func (s *Session) markTerminal() {
 	s.mu.Lock()
-	s.terminal = true
+	if !s.terminal {
+		s.terminal = true
+		s.givenUp++
+	}
 	s.mu.Unlock()
 }
 
-// Finished is isTerminal under the name the engine interface asks for. Read by the
-// connector when it is about to publish an emission marked as the last: a connect that
-// ran in between clears the mark, and an account whose socket is back up is not one to
-// hand over.
-func (s *Session) Finished() bool { return s.isTerminal() }
-
-// isTerminal reports whether there is anything left for this session to try.
-func (s *Session) isTerminal() bool {
+// Finished names the giving-up this session is on, for the connector to compare against
+// the one an emission was made under. Zero while there is still something to try: a
+// connect that ran after the emission was queued clears it, and an account whose socket
+// is back up is not one to hand over.
+func (s *Session) Finished() uint64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.terminal
+	if !s.terminal {
+		return 0
+	}
+	return s.givenUp
 }
+
+// isTerminal reports whether there is anything left for this session to try.
+func (s *Session) isTerminal() bool { return s.Finished() != 0 }
 
 // finishing publishes an outcome the session does not come back from, and marks it as
 // the session's last unless a pairing is still running.
@@ -2411,7 +2421,7 @@ func (s *Session) emit(eventType protocol.EventType, payload any) {
 // emission, so the connector hands the lease back once the event is out and the account
 // stops belonging to an instance with nothing left to try.
 func (s *Session) emitLast(eventType protocol.EventType, payload any) {
-	s.emitting(&engine.Emission{Type: eventType, Retires: true}, payload)
+	s.emitting(&engine.Emission{Type: eventType, Retires: true, Attempt: s.Finished()}, payload)
 }
 
 func (s *Session) emitting(emission *engine.Emission, payload any) {

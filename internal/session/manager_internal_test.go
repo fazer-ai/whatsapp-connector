@@ -949,7 +949,7 @@ func TestASessionTakesNoCommandWhileItsLastWordIsGoingOut(t *testing.T) {
 	engines := fake.New()
 	publisher := &heldPublisher{
 		holds:   protocol.EventSessionConnectFailure,
-		entered: make(chan struct{}),
+		entered: make(chan protocol.EventType, 8),
 		let:     make(chan struct{}),
 	}
 	manager := NewManager(&ManagerConfig{
@@ -958,8 +958,10 @@ func TestASessionTakesNoCommandWhileItsLastWordIsGoingOut(t *testing.T) {
 		Publisher: publisher, Replier: quietReplier{},
 		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
 	})
-	t.Cleanup(publisher.release)
+	// Registered after the stop and so run before it: cleanups run last-first, and a
+	// publish still being held is a pump that never stops.
 	t.Cleanup(func() { manager.StopAll(context.Background()) })
+	t.Cleanup(publisher.release)
 
 	const sid = "9c2b7d1e-0000-4000-8000-0000000000b3"
 	session, err := manager.Adopt(context.Background(), sid)
@@ -995,9 +997,11 @@ func TestASessionTakesNoCommandWhileItsLastWordIsGoingOut(t *testing.T) {
 // heldPublisher keeps one event type inside Publish until it is let go, which is what a
 // Redis that is slow rather than away looks like from the pump.
 type heldPublisher struct {
-	holds   protocol.EventType
-	entered chan struct{}
-	once    sync.Once
+	holds protocol.EventType
+	// entered takes one value per publish that is held, and let hands out one turn per
+	// receive: a test that wants the pump stopped at a particular event asks for exactly
+	// as many turns as the events before it.
+	entered chan protocol.EventType
 	let     chan struct{}
 	letting sync.Once
 
@@ -1011,7 +1015,7 @@ type heldPublisher struct {
 
 func (p *heldPublisher) Publish(_ context.Context, event *protocol.Event) error {
 	if event.Type == p.holds {
-		p.once.Do(func() { close(p.entered) })
+		p.entered <- event.Type
 		<-p.let
 		if p.fails != nil {
 			return p.fails
@@ -1048,7 +1052,7 @@ func TestAConnectThatWorkedCancelsAnOutcomeQueuedBeforeIt(t *testing.T) {
 	engines := fake.New()
 	publisher := &heldPublisher{
 		holds:   protocol.EventSessionState,
-		entered: make(chan struct{}),
+		entered: make(chan protocol.EventType, 8),
 		let:     make(chan struct{}),
 	}
 	manager := NewManager(&ManagerConfig{
@@ -1057,8 +1061,10 @@ func TestAConnectThatWorkedCancelsAnOutcomeQueuedBeforeIt(t *testing.T) {
 		Publisher: publisher, Replier: quietReplier{},
 		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
 	})
-	t.Cleanup(publisher.release)
+	// Registered after the stop and so run before it: cleanups run last-first, and a
+	// publish still being held is a pump that never stops.
 	t.Cleanup(func() { manager.StopAll(context.Background()) })
+	t.Cleanup(publisher.release)
 
 	const sid = "9c2b7d1e-0000-4000-8000-0000000000b5"
 	session, err := manager.Adopt(context.Background(), sid)
@@ -1111,7 +1117,7 @@ func TestADoorThatOpensAgainSchedulesADrainForWhatItTurnedAway(t *testing.T) {
 	engines := fake.New()
 	publisher := &heldPublisher{
 		holds:   protocol.EventSessionConnectFailure,
-		entered: make(chan struct{}),
+		entered: make(chan protocol.EventType, 8),
 		let:     make(chan struct{}),
 		fails:   errors.New("redis is away"),
 	}
@@ -1121,12 +1127,13 @@ func TestADoorThatOpensAgainSchedulesADrainForWhatItTurnedAway(t *testing.T) {
 		Publisher: publisher, Replier: quietReplier{},
 		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
 	})
-	t.Cleanup(publisher.release)
+	// Registered after the stop and so run before it: cleanups run last-first, and a
+	// publish still being held is a pump that never stops.
 	t.Cleanup(func() { manager.StopAll(context.Background()) })
+	t.Cleanup(publisher.release)
 
 	const sid = "9c2b7d1e-0000-4000-8000-0000000000b6"
-	session, err := manager.Adopt(context.Background(), sid)
-	if err != nil {
+	if _, err := manager.Adopt(context.Background(), sid); err != nil {
 		t.Fatalf("Adopt: %v", err)
 	}
 	engineSession, running := engines.Session(sid)
@@ -1153,9 +1160,79 @@ func TestADoorThatOpensAgainSchedulesADrainForWhatItTurnedAway(t *testing.T) {
 
 	// The word never lands, so the session is not finished with after all.
 	publisher.release()
-	waitFor(t, func() bool { return !session.finishing.Load() }, "the door never opened again")
+	// Taken rather than read, so a mark that arrives late is still seen: what is asserted
+	// is that the drain is scheduled at all, not which poll finds it.
+	waitFor(t, func() bool { return slices.Contains(manager.TakeNewlyAdopted(), sid) },
+		"the door opened again with no drain scheduled, leaving a command pending and no claim to take its stream back")
+}
 
-	if marked := manager.TakeNewlyAdopted(); !slices.Contains(marked, sid) {
-		t.Fatalf("the door opened again on %v, leaving a command pending with no drain to take its stream back", marked)
+// A retry can run into a giving-up of its own before the one it answered has even been
+// published. Both emissions are marked, and the account is finished with -- but only the
+// second of them is what the client is owed: retiring on the first stops the session with
+// the retry's own state and its outcome still queued, and the client is left looking at a
+// session that says it is connecting.
+func TestASecondGivingUpIsNotAnsweredByTheFirstOnesEmission(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+
+	engines := fake.New()
+	publisher := &heldPublisher{
+		holds:   protocol.EventSessionState,
+		entered: make(chan protocol.EventType, 8),
+		let:     make(chan struct{}),
+	}
+	manager := NewManager(&ManagerConfig{
+		Instance: "inst-a", Engine: engines,
+		Leases:    cluster.NewLeases(client, "inst-a", cluster.Options{}),
+		Publisher: publisher, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	// Registered after the stop and so run before it: cleanups run last-first, and a
+	// publish still being held is a pump that never stops.
+	t.Cleanup(func() { manager.StopAll(context.Background()) })
+	t.Cleanup(publisher.release)
+
+	const sid = "9c2b7d1e-0000-4000-8000-0000000000b7"
+	session, err := manager.Adopt(context.Background(), sid)
+	if err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, running := engines.Session(sid)
+	if !running {
+		t.Fatal("the engine has no session for the account that was just adopted")
+	}
+
+	// The pump is stopped on the first state, and everything else is queued behind it:
+	// the connect WhatsApp refused, the retry that put a socket back up, and the build
+	// WhatsApp would not talk to once it was up.
+	engineSession.Emit(protocol.EventSessionState, map[string]any{"state": "connecting"})
+	<-publisher.entered
+	engineSession.EmitLast(protocol.EventSessionConnectFailure, map[string]any{"reason": "unavailable"})
+	if err := engineSession.Connect(context.Background(), engine.ConnectRequest{Pairing: "resume"}); err != nil {
+		t.Fatalf("the retry could not connect: %v", err)
+	}
+	engineSession.EmitLast(protocol.EventSessionClientOutdated, map[string]any{})
+
+	// One turn, which carries the pump through the first state and the refused connect
+	// behind it, and stops it on the state the retry published.
+	publisher.let <- struct{}{}
+	<-publisher.entered
+
+	if session.Retired() {
+		t.Fatal("the session was handed over on a giving-up it had already moved on from, with the retry's own outcome still queued")
+	}
+	published := publisher.published()
+	if len(published) != 2 || published[1] != protocol.EventSessionConnectFailure {
+		t.Fatalf("the pump published %v, want the state and then the refused connect", published)
+	}
+
+	publisher.release()
+	waitFor(t, session.Retired, "the session was never finished with")
+	if last := publisher.published(); last[len(last)-1] != protocol.EventSessionClientOutdated {
+		t.Fatalf("the pump published %v last, want %s", last[len(last)-1], protocol.EventSessionClientOutdated)
 	}
 }
