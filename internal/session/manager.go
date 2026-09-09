@@ -1108,6 +1108,13 @@ func (m *Manager) StopAll(ctx context.Context) {
 		}
 		for _, sid := range ending {
 			m.stopSession(sid)
+		}
+		// Every socket in the group down before any of their leases goes back, for the
+		// reason the batch below exists at all: a hand-back is a round trip that can
+		// hang, and one interleaved with these stops is an account still talking to
+		// WhatsApp because the account before it is waiting on a Redis that does not
+		// answer.
+		for _, sid := range ending {
 			m.abandon(ctx, sid)
 		}
 		if len(sids) == 0 {
@@ -1132,6 +1139,17 @@ func (m *Manager) StopAll(ctx context.Context) {
 //
 // Local, and deliberately so: it decides the order everything below runs in, and a split
 // that had to ask Redis would be one more thing in front of the sockets it is protecting.
+//
+// In practice one side of this split is almost always empty, and it is worth knowing why
+// before hardening it further. Leases are renewed in one pipelined batch and stamped with
+// one reading of the clock, so an instance's leases age together and the spread between
+// them is whatever a single tick takes. A session adopted between ticks is stamped when
+// it is acquired, which makes it newer than the rest and never older; and one whose
+// renewal fails on its own is stopped by the sweep rather than kept with a stale lease.
+// What that leaves is the two ends: every lease with room, which is the ordinary tick, or
+// every lease without it, which is an instance that stopped renewing for about a whole
+// TTL -- a frozen process, a long pause, a suspended machine. A single lease near its end
+// among fresh ones would need a per-session failure inside a batch that fails as one.
 func (m *Manager) roomToMark(sids []string) (ahead, ending []string) {
 	room := m.marking()
 	for _, sid := range sids {

@@ -3077,3 +3077,65 @@ func TestTheShutdownSplitIsTakenAgainAsTimePasses(t *testing.T) {
 		t.Fatal("a lease that ran out while the shutdown was working stayed in the batch, on a split taken before its room was spent")
 	}
 }
+
+// The leases taken down early are handed back one after another, and a hand-back is a
+// round trip that can hang. Interleaved with their stops, the second account is still
+// talking to WhatsApp because the first one is waiting on a Redis that does not answer,
+// and its own lease expires meanwhile.
+func TestEveryExpiringSocketComesDownBeforeAnyOfTheirLeasesGoBack(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	hop := stallable(t, server.Addr())
+	rdb := redis.NewClient(&redis.Options{Addr: hop.addr(), ContextTimeoutEnabled: true})
+	t.Cleanup(func() { _ = rdb.Close() })
+
+	const ttl = 3 * time.Second
+	clock := &steppingClock{now: time.Now()}
+	engines := fake.New()
+	manager := NewManager(&ManagerConfig{
+		Instance: "inst-a", Engine: engines,
+		Leases: cluster.NewLeases(redisx.Wrap(rdb, "wa:", 8), "inst-a", cluster.Options{
+			TTL: ttl, Margin: ttl / 10, Clock: clock,
+		}),
+		Publisher: quietPublisher{}, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+
+	ctx := context.Background()
+	sessions := make([]*fake.Session, 0, 3)
+	for i := range 3 {
+		sid := fmt.Sprintf("9c2b7d1e-0000-4000-8000-00000000d3%02d", i)
+		if _, err := manager.Adopt(ctx, sid); err != nil {
+			t.Fatalf("Adopt %s: %v", sid, err)
+		}
+		engineSession, running := engines.Session(sid)
+		if !running {
+			t.Fatalf("the engine has no session for %s", sid)
+		}
+		sessions = append(sessions, engineSession)
+	}
+	// Every lease past the room a mark needs, which is the group this is about.
+	clock.step(ttl)
+
+	hop.stall()
+	stopped := make(chan struct{})
+	t.Cleanup(func() { <-stopped })
+	t.Cleanup(hop.resume)
+	go func() {
+		defer close(stopped)
+		manager.StopAll(ctx)
+	}()
+
+	// Closing the engine session is what closes these, so a receive on every one means
+	// every socket is down. Nothing here is a round trip, so the only thing that could
+	// take this long is a hand-back in front of a stop.
+	deadline := time.After(400 * time.Millisecond)
+	for i, engineSession := range sessions {
+		select {
+		case <-engineSession.Events():
+		case <-deadline:
+			t.Fatalf("a shutdown was still holding sockets open at session %d of %d, waiting out a hand-back for the account before it", i, len(sessions))
+		}
+	}
+}
