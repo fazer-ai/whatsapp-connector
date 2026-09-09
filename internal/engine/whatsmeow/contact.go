@@ -325,12 +325,12 @@ func (s *Session) resolveContact(ctx context.Context, command *protocol.Command)
 		// to answer over it.
 		s.nameFromStore(reading, &named)
 		own := s.names()
-		if own.push != "" && (own.unfiled || named.PushName == "") {
+		if own.push != "" && (own.pushUnfiled || named.PushName == "") {
 			// Unfiled is the one case the table is behind: the write that keeps it level
 			// failed, and the row still holds the name before this one.
 			named.PushName = own.push
 		}
-		if named.VerifiedName == "" {
+		if own.verified != "" && (own.verifiedUnfiled || named.VerifiedName == "") {
 			named.VerifiedName = own.verified
 		}
 		return json.Marshal(named)

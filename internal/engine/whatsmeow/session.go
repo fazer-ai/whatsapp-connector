@@ -437,6 +437,10 @@ type Session struct {
 	// write that failed is exactly the case where that would answer with a name the
 	// account has already left behind.
 	pushUnfiled bool
+	// verifiedUnfiled says the same about the verified name. whatsmeow files that one
+	// itself and files it first, so the row the change arrived on is written by the time
+	// the event exists; the other row is best effort and is the one a read goes to first.
+	verifiedUnfiled bool
 	// naming serialises the filing of the push name, which is the one session field whose
 	// write reaches further than this struct. It is not `mu`: the write is a store round
 	// trip, and holding the session lock across one would stall every other reader for as
@@ -725,9 +729,14 @@ func (s *Session) adopt(client *wm.Client) bool {
 	s.handlerID = handlerID
 	s.phone = named.phone
 	s.lid = named.lid
+	// A rebuilt client brings the device record's copy of these names back, and the marker
+	// that a row would not take one survives only where it still describes that row: the
+	// name coming back has to be the one the row refused, or nothing here knows anything
+	// about what the table is holding.
+	s.pushUnfiled = s.pushUnfiled && s.pushName == named.pushName
+	s.verifiedUnfiled = s.verifiedUnfiled && s.businessName == named.businessName
 	s.pushName = named.pushName
 	s.businessName = named.businessName
-	s.pushUnfiled = false
 	s.stale = false
 	s.revoked = false
 	s.connected = false
@@ -890,6 +899,26 @@ func (s *Session) setVerifiedName(businessName string) {
 	s.mu.Unlock()
 }
 
+// reverify records a verified name the account changed while the session was up.
+//
+// whatsmeow files this one itself, and the event is proof that it filed it: the row under
+// the address the change arrived on took the write, or `updateBusinessName` would have
+// returned before dispatching. The other row is where that stops being true -- it resolves
+// the alternate address afterwards and logs a failure there rather than reporting it --
+// and when the change arrives on the LID, the row left behind is the one a read goes to
+// first.
+func (s *Session) reverify(businessName string) {
+	if businessName == "" {
+		return
+	}
+	s.mu.Lock()
+	s.businessName = businessName
+	s.verifiedUnfiled = true
+	s.mu.Unlock()
+
+	s.recordOwnVerifiedName(businessName)
+}
+
 // rename records a push name the account changed while the session was up.
 func (s *Session) rename(pushName string) {
 	if pushName == "" {
@@ -929,6 +958,49 @@ func (s *Session) recordOwnName(pushName string) {
 	if s.names().push != pushName {
 		return
 	}
+	if !s.fileOwnName(client.Store.Contacts.PutPushName, pushName, "push name") {
+		return
+	}
+	s.mu.Lock()
+	// Only while the name is still the one that was written: a rename that landed during
+	// this has a write of its own behind it.
+	if s.pushName == pushName {
+		s.pushUnfiled = false
+	}
+	s.mu.Unlock()
+}
+
+// recordOwnVerifiedName files the account's own verified name under the address whatsmeow
+// may have left without it.
+func (s *Session) recordOwnVerifiedName(businessName string) {
+	client := s.current()
+	if client == nil || client.Store == nil || client.Store.Contacts == nil {
+		return
+	}
+	s.naming.Lock()
+	defer s.naming.Unlock()
+	if s.names().verified != businessName {
+		return
+	}
+	if !s.fileOwnName(client.Store.Contacts.PutBusinessName, businessName, "verified name") {
+		return
+	}
+	s.mu.Lock()
+	if s.businessName == businessName {
+		s.verifiedUnfiled = false
+	}
+	s.mu.Unlock()
+}
+
+// fileOwnName writes one of the account's own display names under every address the
+// account answers under, and says whether every one of them took it.
+//
+// All of them, because a read takes the first row that holds a name and the phone row is
+// read first: one row left behind is enough to answer with a name the account has left.
+func (s *Session) fileOwnName(
+	put func(context.Context, waTypes.JID, string) (bool, string, error),
+	name, what string,
+) bool {
 	phone, lid := s.identity()
 	writing, done := context.WithTimeout(s.ctx, s.storeLimit)
 	defer done()
@@ -945,43 +1017,37 @@ func (s *Session) recordOwnName(pushName string) {
 			missed = true
 			continue
 		}
-		if _, _, err := client.Store.Contacts.PutPushName(writing, jid, pushName); err != nil {
-			s.log.Debug().Err(err).Str("kind", string(address.Kind)).
-				Msg("could not file the account's own push name")
+		if _, _, err := put(writing, jid, name); err != nil {
+			s.log.Debug().Err(err).Str("kind", string(address.Kind)).Str("name", what).
+				Msg("could not file one of the account's own names")
 			missed = true
 			continue
 		}
 		filed = true
 	}
-	// Every address the account answers under, or the name is still unfiled. A read takes
-	// the first row that holds a name and the phone row is read first, so one row left
-	// behind is enough to answer with the name the account has left.
-	if !filed || missed {
-		return
-	}
-	s.mu.Lock()
-	// Only while the name is still the one that was written: a rename that landed during
-	// this has a write of its own behind it.
-	if s.pushName == pushName {
-		s.pushUnfiled = false
-	}
-	s.mu.Unlock()
+	return filed && !missed
 }
 
 // selfNames is what this account calls itself: the push name every recipient sees, and the
 // verified name a business account carries.
 type selfNames struct {
 	push string
-	// unfiled says the push name has not reached the contact table, which is otherwise
-	// the copy that answers.
-	unfiled  bool
-	verified string
+	// pushUnfiled and verifiedUnfiled say the name beside them has not reached the contact
+	// table, which is otherwise the copy that answers.
+	pushUnfiled     bool
+	verified        string
+	verifiedUnfiled bool
 }
 
 func (s *Session) names() selfNames {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return selfNames{push: s.pushName, unfiled: s.pushUnfiled, verified: s.businessName}
+	return selfNames{
+		push:            s.pushName,
+		pushUnfiled:     s.pushUnfiled,
+		verified:        s.businessName,
+		verifiedUnfiled: s.verifiedUnfiled,
+	}
 }
 
 // relearn takes the account's own details off the client again.
@@ -2776,7 +2842,7 @@ func (s *Session) handle(rawEvent any) bool {
 		// stand for the life of the session, and it is the copy `contact.resolve`
 		// answers with.
 		if s.isSelf(event.JID) {
-			s.setVerifiedName(event.NewBusinessName)
+			s.reverify(event.NewBusinessName)
 		}
 	case *waEvents.PairError:
 		// Whatever the QR channel does with this, the client is on a device whatsmeow

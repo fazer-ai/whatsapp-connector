@@ -442,7 +442,7 @@ func TestARenameDoesNotFileANameTheSessionHasLeft(t *testing.T) {
 	if contact.PushName != "Atendimento" {
 		t.Errorf("the table has the account down as %q, want the name it renamed itself to last", contact.PushName)
 	}
-	if names := session.names(); names.unfiled {
+	if names := session.names(); names.pushUnfiled {
 		t.Error("the session says its name is unfiled after the write that took it")
 	}
 }
@@ -471,7 +471,7 @@ func TestARenameStaysUnfiledWhenARowDidNotTake(t *testing.T) {
 	session.handle(&waEvents.PushNameSetting{
 		Action: &waSyncAction.PushNameSetting{Name: proto.String("Atendimento")},
 	})
-	if names := session.names(); !names.unfiled {
+	if names := session.names(); !names.pushUnfiled {
 		t.Error("the session says its name is filed after the row a read prefers refused it")
 	}
 
@@ -496,4 +496,81 @@ func (r *refusingContacts) PutPushName(ctx context.Context, user waTypes.JID, pu
 		return false, "", errors.New("this row is not taking writes")
 	}
 	return r.ContactStore.PutPushName(ctx, user, pushName)
+}
+
+func (r *refusingContacts) PutBusinessName(ctx context.Context, user waTypes.JID, businessName string) (changed bool, previous string, err error) {
+	if user.User == r.refuse.User && user.Server == r.refuse.Server {
+		return false, "", errors.New("this row is not taking writes")
+	}
+	return r.ContactStore.PutBusinessName(ctx, user, businessName)
+}
+
+// whatsmeow files a verified name change before it dispatches the event, so the row under
+// the address it arrived on is written. The other row is best effort:
+// `updateBusinessName` resolves the alternate address afterwards and logs a failure there
+// rather than reporting it. A change that arrived on the LID therefore leaves the phone
+// row behind, and that is the row a read goes to first.
+func TestAResolveKeepsAVerifiedNameARowDidNotTake(t *testing.T) {
+	t.Parallel()
+
+	const lid = "111222333444555"
+
+	session, _ := newTestSession(t, "5511999990001")
+	client := session.current()
+	own := waTypes.NewJID("5511999990001", waTypes.DefaultUserServer)
+	client.Store.LID = waTypes.NewJID(lid, waTypes.HiddenUserServer)
+	session.handle(&waEvents.Connected{})
+	drain(t, session)
+	if _, _, err := client.Store.Contacts.PutBusinessName(t.Context(), own, "Loja do Bruno"); err != nil {
+		t.Fatalf("PutBusinessName: %v", err)
+	}
+
+	client.Store.Contacts = &refusingContacts{ContactStore: client.Store.Contacts, refuse: own}
+	session.handle(&waEvents.BusinessName{
+		JID:             waTypes.NewJID(lid, waTypes.HiddenUserServer),
+		OldBusinessName: "Loja do Bruno",
+		NewBusinessName: "Loja do Bruno LTDA",
+	})
+
+	result, err := session.Execute(t.Context(), resolveCommand(t, `{"party":{"kind":"phone","id":"5511999990001"}}`))
+	if err != nil {
+		t.Fatalf("contact.resolve: %v", err)
+	}
+	if party := resolved(t, result); party["verified_name"] != "Loja do Bruno LTDA" {
+		t.Errorf("the account is verified as %v, want the name the row would not take", party)
+	}
+}
+
+// A reconnect rebuilds the client and the session takes the device record's names off it
+// again. The record is written by the app-state sync that carried the rename, so the name
+// coming back is the same one the contact table refused -- and the row is still behind it.
+// Clearing the marker there would hand the answer back to that row for good.
+func TestAReconnectKeepsARenameTheTableDidNotTake(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	client := session.current()
+	own := waTypes.NewJID("5511999990001", waTypes.DefaultUserServer)
+	if _, _, err := client.Store.Contacts.PutPushName(t.Context(), own, "Antigo"); err != nil {
+		t.Fatalf("PutPushName: %v", err)
+	}
+
+	client.Store.Contacts = &refusingContacts{ContactStore: client.Store.Contacts, refuse: own}
+	// The sync writes the record and this connector hears the event; only the table is
+	// left behind.
+	client.Store.PushName = "Atendimento"
+	session.handle(&waEvents.PushNameSetting{
+		Action: &waSyncAction.PushNameSetting{Name: proto.String("Atendimento")},
+	})
+	if !session.adopt(client) {
+		t.Fatal("the session would not take its own client back")
+	}
+
+	result, err := session.Execute(t.Context(), resolveCommand(t, `{"party":{"kind":"phone","id":"5511999990001"}}`))
+	if err != nil {
+		t.Fatalf("contact.resolve: %v", err)
+	}
+	if party := resolved(t, result); party["push_name"] != "Atendimento" {
+		t.Errorf("the account is called %v, want the name the reconnect brought back", party)
+	}
 }

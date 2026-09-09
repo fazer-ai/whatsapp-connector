@@ -452,3 +452,17 @@ internal/engine/whatsmeow/group.go: Make group creation survive command redelive
 # The damage it risks is also the visible kind -- two real groups, one of which the
 # operator deletes -- not the silent kind this connector goes out of its way to avoid.
 internal/engine/whatsmeow/group.go: Prevent redelivery from creating a second group  # PR#130
+# PR#139: the invariant this asks for is the one the code already holds, and the one it
+# names is not recoverable here. Every write to the table happens inside `naming` and
+# re-reads the session's current name first, so a row is only ever written with the name
+# the session was holding at that moment, and the marker is only cleared by the writer of
+# a name that is still current. Walk the interleavings of two renames A and B and the two
+# copies agree at the end of all of them: whichever handler assigns last is the one whose
+# check passes, and the other returns without writing. What is left over is which of two
+# simultaneous renames is the newer, and that is not decidable from here -- whatsmeow
+# dispatches these from two paths with no shared clock, `events.PushName` carries no
+# timestamp of its own, and the app-state sync that carries the authoritative value is
+# redelivered anyway. Holding the session lock across the store write instead would order
+# them, at the price of stalling every other reader of the session for as long as the
+# database takes, to decide a race between two names the account set seconds apart.
+internal/engine/whatsmeow/session.go: Order concurrent renames before replacing the session name  # PR#139
