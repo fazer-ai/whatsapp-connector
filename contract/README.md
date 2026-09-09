@@ -130,11 +130,15 @@ theirs, and the connector is always upgraded first.
   message's author or spending a round trip per deletion -- so it closes the case a
   member can exploit rather than the whole rule. A key that says the message is the
   deleter's own names the deleter, whatever participant it also carries, because that is
-  how WhatsApp resolves it. Absent means the key named nobody at all, which is a direct
-  chat: there `sender` and `by` already say who claimed what. A `message.revoked` for a
-  group always carries the field -- a key with neither a participant nor `from_me` names
-  no message, and this connector drops that deletion rather than publishing one no phone
-  applied -- so a client can require it there.
+  how WhatsApp resolves it. A direct chat carries the field as well, worked out rather
+  than read: the key names no participant there and does not need to, because there are
+  two parties and `from_me` says which of them, and only the author can delete for
+  everyone in a chat. So the same comparison applies in both kinds. A `message.revoked`
+  for a group always carries the field -- a key with neither a participant nor `from_me`
+  names no message, and this connector drops that deletion rather than publishing one no
+  phone applied -- so a client can require it there. Absent is left for what the
+  connector could not read: a participant that will not parse, and a channel, where the
+  deletion arrives under the post's own id with no key at all.
 - An absent field and an explicit `null` mean the same thing to a client, so a field
   that has to distinguish "there is none" from "this producer does not say" carries
   its own flag. `group_info.has_picture` is the one such field today: a `picture_url`

@@ -590,7 +590,7 @@ func (s *Session) revokeOf(event *waEvents.Message) change {
 	if event.Info.IsFromMe {
 		by = protocol.RevokedBySelf
 	}
-	author := s.claimedAuthor(event)
+	author := s.claimedAuthor(event, chat)
 	if author == nil && chat.Kind == protocol.AddressGroup {
 		// In a group a key identifies a message by its participant, or by `from_me` where
 		// it is the sender's own. A key carrying neither -- or naming something that is
@@ -629,7 +629,7 @@ func (s *Session) revokeOf(event *waEvents.Message) change {
 // parties are all there is. An unreadable participant is nil for the same reason a mention
 // that will not parse is dropped -- the client keeps the behaviour it had before the field
 // existed, rather than losing the deletion over the annotation on it.
-func (s *Session) claimedAuthor(event *waEvents.Message) *protocol.Party {
+func (s *Session) claimedAuthor(event *waEvents.Message, chat protocol.Address) *protocol.Party {
 	key := event.Message.GetProtocolMessage().GetKey()
 	var claiming []waTypes.JID
 	if key.GetFromMe() {
@@ -645,8 +645,18 @@ func (s *Session) claimedAuthor(event *waEvents.Message) *protocol.Party {
 		// account on the deployment shares, and naming the author by it would put another
 		// operator's pairing on this event and into what this session learns from it.
 		claiming = []waTypes.JID{event.Info.Sender, wireAlt(&event.Info)}
+	} else if named := key.GetParticipant(); named == "" && directChat(chat) {
+		// A direct chat names no participant and does not have to: there are two parties,
+		// and the flag says the message is not the deleter's own, so it is the other
+		// one's. That is how WhatsApp resolves it too -- `getOrigSenderFromKey` reads the
+		// key's own remote JID in a chat rather than a participant.
+		//
+		// Derived rather than left out, because the claim is what a client checks and the
+		// check is worth as much here as it is in a group: only the author can delete for
+		// everyone in a chat, so a key saying otherwise names a message no phone deleted,
+		// and this is the chat kind an installation is actually using today.
+		claiming = s.theOtherParty(event, chat)
 	} else {
-		named := key.GetParticipant()
 		// Exactly one `@`, because ParseJID splits on it and keeps the first two pieces:
 		// `5541988887777@s.whatsapp.net@junk` parses happily into the real participant's
 		// number, and the claim would then name the person the key was written to point
@@ -686,6 +696,41 @@ func (s *Session) claimedAuthor(event *waEvents.Message) *protocol.Party {
 		return nil
 	}
 	return &author
+}
+
+// directChat reports whether a conversation is one person talking to another, which is the
+// only kind with exactly two parties for a key to be about.
+func directChat(chat protocol.Address) bool {
+	return chat.Kind == protocol.AddressPhone || chat.Kind == protocol.AddressLID
+}
+
+// theOtherParty names whichever of a direct chat's two parties did not delete the message.
+//
+// Both are known without asking anybody: one end is this account, whose own addresses the
+// session holds, and the other is the chat itself. Which of them the key means follows from
+// who sent the deletion, and that is on the envelope rather than in the body.
+func (s *Session) theOtherParty(event *waEvents.Message, chat protocol.Address) []waTypes.JID {
+	if event.Info.IsFromMe {
+		named, err := jidOf(chat)
+		if err != nil {
+			return nil
+		}
+		return []waTypes.JID{named}
+	}
+	phone, lid := s.identity()
+	claiming := make([]waTypes.JID, 0, 2)
+	for _, address := range []protocol.Address{
+		{Kind: protocol.AddressPhone, ID: phone},
+		{Kind: protocol.AddressLID, ID: lid},
+	} {
+		if address.ID == "" {
+			continue
+		}
+		if named, err := jidOf(address); err == nil {
+			claiming = append(claiming, named)
+		}
+	}
+	return claiming
 }
 
 // whereAndWho is the half of these three events that does not depend on which one it is.
