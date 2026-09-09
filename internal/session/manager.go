@@ -1089,8 +1089,16 @@ func (m *Manager) StopAll(ctx context.Context) {
 	// What a mark per session would have spent is then not spent at all: the stops below
 	// go straight through, and the hand-backs behind them carry whatever retry the batch
 	// still deserves.
-	m.givingUpAllAhead(ctx, sids)
-	for _, sid := range sids {
+	ahead, ending := m.roomToMark(sids)
+	// The leases with nothing left to give come down before anything blocks on Redis at
+	// all. No mark could outlive them, so waiting for one -- even a batch they are not in
+	// -- buys nothing and spends the last of a lease a peer is about to be free to take,
+	// with this instance still talking to WhatsApp on the account.
+	for _, sid := range ending {
+		m.stopSession(sid)
+	}
+	m.givingUpAll(ctx, ahead)
+	for _, sid := range ahead {
 		m.stopSession(sid)
 	}
 	// Only now, with every socket already down. A hand-back is a round trip that can
@@ -1101,9 +1109,27 @@ func (m *Manager) StopAll(ctx context.Context) {
 	}
 }
 
-// givingUpAllAhead marks a whole batch of hand-backs in front of their stops, under one
-// bound and one round trip.
-func (m *Manager) givingUpAllAhead(ctx context.Context, sids []string) {
+// roomToMark splits a shutdown's list into the leases worth marking before their stops
+// and the ones that have to be stopped first.
+//
+// Local, and deliberately so: it decides the order everything below runs in, and a split
+// that had to ask Redis would be one more thing in front of the sockets it is protecting.
+func (m *Manager) roomToMark(sids []string) (ahead, ending []string) {
+	room := m.marking()
+	for _, sid := range sids {
+		if m.leases.Freshness(sid) < room {
+			ending = append(ending, sid)
+			continue
+		}
+		ahead = append(ahead, sid)
+	}
+	return ahead, ending
+}
+
+// givingUpAll marks a whole batch of hand-backs in front of their stops, under one bound
+// and one round trip. Every session in it has a whole bound of lease to spend, which is
+// what roomToMark decided.
+func (m *Manager) givingUpAll(ctx context.Context, sids []string) {
 	unmarked := make([]string, 0, len(sids))
 	m.orphanMu.Lock()
 	for _, sid := range sids {
@@ -1117,37 +1143,20 @@ func (m *Manager) givingUpAllAhead(ctx context.Context, sids []string) {
 		return
 	}
 
-	// Only the leases with a whole bound of their own to spend, and the bound is not
-	// shrunk to fit the tightest of them. A batch sized by its most nearly expired member
-	// is one that can run out before the request is even sent, and then nothing in it is
-	// marked: one lease near its end would cost every other account in the shutdown the
-	// mark that keeps it from being left unowned.
-	//
-	// What is left out loses nothing it could have had. A lease with less than a bound of
-	// life is one no mark can outlive anyway, so its socket comes down first and its mark
-	// goes out behind the stop, where nothing is waiting on it.
-	room := m.marking()
-	ahead := make([]string, 0, len(unmarked))
-	for _, sid := range unmarked {
-		if m.leases.Freshness(sid) < room {
-			continue
-		}
-		ahead = append(ahead, sid)
-	}
-	if len(ahead) == 0 {
-		return
-	}
-
-	marking, done := context.WithTimeout(ctx, room)
-	err := m.leases.MarkManyHandingBack(marking, ahead)
+	// The whole bound, not one shrunk to fit the tightest lease in the batch: a deadline
+	// sized by its most nearly expired member is one that can run out before the request
+	// is even sent, and then nothing in it is marked. Which leases belong here is
+	// roomToMark's answer, and every one of them has a bound of its own to spend.
+	marking, done := context.WithTimeout(ctx, m.marking())
+	err := m.leases.MarkManyHandingBack(marking, unmarked)
 	done()
 	if err != nil {
-		m.log.Warn().Err(err).Int("sessions", len(ahead)).
+		m.log.Warn().Err(err).Int("sessions", len(unmarked)).
 			Msg("could not mark hand-backs for peers to see; handing back anyway")
 		return
 	}
 	m.orphanMu.Lock()
-	for _, sid := range ahead {
+	for _, sid := range unmarked {
 		// Only where the session is still one this instance is giving up, for the reason
 		// givingUp gives: an adoption that won the account back must not be left carrying
 		// a mark that says it is on its way out.

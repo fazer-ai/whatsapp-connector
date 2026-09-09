@@ -2864,3 +2864,63 @@ func TestANearlyExpiredLeaseIsLeftOutOfTheShutdownBatch(t *testing.T) {
 		t.Fatal("a lease with less life than a mark needs went into the shared batch, where its deadline is every other account's too")
 	}
 }
+
+// Being left out of the batch is not enough for a lease near its end: its socket has to
+// come down before anything blocks on Redis at all. Waiting out a batch it is not even
+// in spends the last of a lease a peer is about to be free to take, with this instance
+// still talking to WhatsApp on the account.
+func TestANearlyExpiredSocketComesDownBeforeTheBatchBlocks(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	hop := stallable(t, server.Addr())
+	rdb := redis.NewClient(&redis.Options{Addr: hop.addr(), ContextTimeoutEnabled: true})
+	t.Cleanup(func() { _ = rdb.Close() })
+
+	// A third of this is the bound the batch waits out, which is what the reversion of
+	// this holds the near-expiry socket open for.
+	const ttl = 3 * time.Second
+	clock := &steppingClock{now: time.Now()}
+	engines := fake.New()
+	manager := NewManager(&ManagerConfig{
+		Instance: "inst-a", Engine: engines,
+		Leases: cluster.NewLeases(redisx.Wrap(rdb, "wa:", 8), "inst-a", cluster.Options{
+			TTL: ttl, Margin: ttl / 10, Clock: clock,
+		}),
+		Publisher: quietPublisher{}, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+
+	const ending = "9c2b7d1e-0000-4000-8000-0000000000cd"
+	const fresh = "9c2b7d1e-0000-4000-8000-0000000000ce"
+	ctx := context.Background()
+	if _, err := manager.Adopt(ctx, ending); err != nil {
+		t.Fatalf("Adopt %s: %v", ending, err)
+	}
+	endingSession, running := engines.Session(ending)
+	if !running {
+		t.Fatalf("the engine has no session for %s", ending)
+	}
+	clock.step(ttl - ttl/10 - 10*time.Millisecond)
+	if _, err := manager.Adopt(ctx, fresh); err != nil {
+		t.Fatalf("Adopt %s: %v", fresh, err)
+	}
+
+	// From here the batch reaches nobody and waits out its whole bound.
+	hop.stall()
+	stopped := make(chan struct{})
+	t.Cleanup(func() { <-stopped })
+	t.Cleanup(hop.resume)
+	go func() {
+		defer close(stopped)
+		manager.StopAll(ctx)
+	}()
+
+	// Closing the engine session is what closes this, so a receive means the socket is
+	// down. Well inside the bound the batch is spending meanwhile.
+	select {
+	case <-endingSession.Events():
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("a socket whose lease was nearly out waited on a batch of marks it was not even in, past the moment a peer may take the account")
+	}
+}
