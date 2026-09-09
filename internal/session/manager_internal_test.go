@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"net"
+	"slices"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -415,5 +416,117 @@ func TestASweepGivesUpOnARedisThatStoppedAnswering(t *testing.T) {
 	case <-swept:
 	case <-time.After(2 * time.Second):
 		t.Fatalf("the sweep is still handing leases back after 2s, on a lease worth %s", ttl)
+	}
+}
+
+// Retirement is a stop the heartbeat has not performed yet, and until it does the
+// session is still in the map and still answers. A connect carried out in that window
+// dials an account this instance hands away moments later and tells the client it
+// worked: the socket is then stopped by the sweep with nothing published to say so, and
+// the inbox reads as connected until somebody tries to send on it.
+func TestACommandForARetiredSessionIsLeftForItsNextOwner(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+
+	engines := fake.New()
+	manager := NewManager(&ManagerConfig{
+		Instance: "inst-a", Engine: engines,
+		Leases:    cluster.NewLeases(client, "inst-a", cluster.Options{}),
+		Publisher: quietPublisher{}, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	t.Cleanup(func() { manager.StopAll(context.Background()) })
+
+	const sid = "9c2b7d1e-0000-4000-8000-0000000000a5"
+	ctx := context.Background()
+	session, err := manager.Adopt(ctx, sid)
+	if err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	manager.TakeNewlyAdopted()
+
+	engineSession, running := engines.Session(sid)
+	if !running {
+		t.Fatal("the engine has no session for the account that was just adopted")
+	}
+	engineSession.EmitLast(protocol.EventSessionConnectFailure, map[string]any{"reason": "unavailable"})
+	waitFor(t, func() bool { return session.Retired() }, "the session was never finished with")
+
+	var given bool
+	manager.Dispatch(&transport.Delivery{
+		Command: protocol.Command{
+			V: protocol.Version, ID: "c1", Type: protocol.CommandSessionConnect, SID: sid,
+		},
+		Ack:     func(context.Context) error { t.Error("a command nobody carried out was retired"); return nil },
+		Release: func() { given = true },
+	})
+
+	if !given {
+		t.Fatal("a connect was taken by a session on its way out, want it left pending for whoever takes the account")
+	}
+	if marked := manager.TakeNewlyAdopted(); len(marked) != 0 {
+		t.Fatalf("the retired session was marked for a drain (%v), want no mark", marked)
+	}
+}
+
+// The sweep runs on the heartbeat and adoptions run on the answer goroutine, so between
+// finding a retired session and handing it back a wake can have replaced it -- Adopt
+// does exactly that. Released by sid alone, the sweep then stops a session that is
+// running and deletes the lease it is running under, and the cooldown that release arms
+// keeps this instance from taking the account back.
+func TestASweepDoesNotHandBackASessionAdoptedAgainSinceItLooked(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+
+	engines := fake.New()
+	leases := cluster.NewLeases(client, "inst-a", cluster.Options{})
+	manager := NewManager(&ManagerConfig{
+		Instance: "inst-a", Engine: engines, Leases: leases,
+		Publisher: quietPublisher{}, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	t.Cleanup(func() { manager.StopAll(context.Background()) })
+
+	const sid = "9c2b7d1e-0000-4000-8000-0000000000a6"
+	ctx := context.Background()
+	first, err := manager.Adopt(ctx, sid)
+	if err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, running := engines.Session(sid)
+	if !running {
+		t.Fatal("the engine has no session for the account that was just adopted")
+	}
+	engineSession.EmitLast(protocol.EventSessionConnectFailure, map[string]any{"reason": "unavailable"})
+	waitFor(t, func() bool { return first.Retired() }, "the session was never finished with")
+
+	// The interleaving, written out: the sweep has looked and has not released yet, and
+	// the wake that replaces the session lands in between.
+	retired := map[string]*Session{sid: first}
+	second, err := manager.Adopt(ctx, sid)
+	if err != nil {
+		t.Fatalf("the retry could not be adopted: %v", err)
+	}
+	for swept, session := range retired {
+		manager.releaseThis(ctx, swept, session)
+	}
+
+	if second.Retired() {
+		t.Fatal("the session built for the retry came back already finished with")
+	}
+	if _, held := leases.Owned(sid); !held {
+		t.Fatal("the sweep deleted the lease of the session that replaced the one it found")
+	}
+	// Forgotten and stopped are the same step, so the map answers for both.
+	if !slices.Contains(manager.SIDs(), sid) {
+		t.Fatal("the sweep stopped the session that replaced the one it found")
 	}
 }

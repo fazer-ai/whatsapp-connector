@@ -160,7 +160,13 @@ const (
 func (s *Session) Offer(delivery *transport.Delivery) Offer {
 	s.queueMu.Lock()
 	defer s.queueMu.Unlock()
-	if s.stopping {
+	if s.stopping || s.retired.Load() {
+		// Retired is stopping that has not happened yet: the heartbeat hands the lease
+		// back on its next tick, and until it does this session is still in the map and
+		// still answers. A connect served in that window dials an account this instance
+		// gives away moments later, and answers the client that it worked -- the socket
+		// is then stopped with nothing published to say so. Left pending for the owner
+		// that comes next, which is what OfferStopped already means.
 		return OfferStopped
 	}
 	select {

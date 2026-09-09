@@ -853,10 +853,10 @@ func (m *Manager) StopAll(ctx context.Context) {
 // is the client's to make, and it may land on any instance.
 func (m *Manager) SweepRetired(ctx context.Context) {
 	m.mu.RLock()
-	retired := make([]string, 0, len(m.sessions))
+	retired := make(map[string]*Session, len(m.sessions))
 	for sid, session := range m.sessions {
 		if session.Retired() {
-			retired = append(retired, sid)
+			retired[sid] = session
 		}
 	}
 	m.mu.RUnlock()
@@ -868,7 +868,7 @@ func (m *Manager) SweepRetired(ctx context.Context) {
 	// tick, which costs an account a few more seconds of belonging to nobody.
 	window, cancel := context.WithTimeout(ctx, m.leases.TTL()/ReleaseShare)
 	defer cancel()
-	for _, sid := range retired {
+	for sid, session := range retired {
 		if window.Err() != nil {
 			m.log.Warn().Str("sid", sid).
 				Msg("ran out of tick before handing back a retired session; will try again")
@@ -876,6 +876,33 @@ func (m *Manager) SweepRetired(ctx context.Context) {
 		}
 		m.log.Info().Str("sid", sid).
 			Msg("handing back a session the engine will not bring back on its own")
-		m.Release(window, sid)
+		m.releaseThis(window, sid, session)
 	}
+}
+
+// releaseThis hands a session back only while it is still the one that was found.
+//
+// Adoptions run on the answer goroutine and this runs on the heartbeat, so between the
+// two lines above a wake can release this very session, win the lease again and put a
+// fresh one in its place -- Adopt does exactly that for a retired session. Released by
+// sid alone, this would then stop the session that just started and delete the lease it
+// is running under, and arm the cooldown that keeps this instance from taking it back.
+//
+// What is left is the gap between forgetting the session and the release reaching Redis,
+// which `releaseOrphans` names as well and for the same reason: the release matches on
+// the instance and nothing else, so one that overtakes an adoption deletes a live lease.
+// Closing it needs the lease itself to carry the epoch, which is a change to what every
+// instance in a fleet reads, not to this loop.
+func (m *Manager) releaseThis(ctx context.Context, sid string, want *Session) {
+	m.mu.Lock()
+	session, ok := m.sessions[sid]
+	if !ok || session != want {
+		m.mu.Unlock()
+		return
+	}
+	delete(m.sessions, sid)
+	m.mu.Unlock()
+
+	session.Stop()
+	m.abandon(ctx, sid)
 }

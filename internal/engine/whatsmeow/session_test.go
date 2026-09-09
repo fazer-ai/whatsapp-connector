@@ -2669,21 +2669,63 @@ func TestAPairingRefusedForTheBuildFinishesTheSession(t *testing.T) {
 	t.Cleanup(cancel)
 	run := session.startPairing(pairCtx, cancel)
 
-	// Driven through the reader rather than by setting the flag, because the wiring is
-	// what this is about: whatsmeow reports the refusal as an item of its own, and the
-	// outcome that carries it arrives afterwards as a separate one.
-	codes := make(chan wm.QRChannelItem, 2)
+	// Exactly what whatsmeow does with a build WhatsApp will not talk to: the refusal is
+	// the last item on the channel and the channel closes on the same step, so the reader
+	// returns with no outcome of its own. Driven through the reader rather than by hand
+	// because that shape is the whole reason the mark belongs on this event.
+	codes := make(chan wm.QRChannelItem, 1)
 	codes <- wm.QRChannelItem{Event: "err-client-outdated"}
-	codes <- wm.QRChannelItem{Event: "timeout"}
+	close(codes)
 	go session.readPairingWith(run, codes, nil, false)
 
 	outdated := next(t, session)
 	if outdated.Type != protocol.EventSessionClientOutdated {
-		t.Fatalf("the pairing published %s first, want %s", outdated.Type, protocol.EventSessionClientOutdated)
+		t.Fatalf("the pairing published %s, want %s", outdated.Type, protocol.EventSessionClientOutdated)
 	}
-	if outdated.Retires {
-		t.Error("the refusal finished the session on its own, leaving nothing to publish the outcome")
+	if !outdated.Retires {
+		t.Error("a pairing WhatsApp refused for this build left the session holding its lease")
 	}
+
+	select {
+	case emission, open := <-session.Events():
+		if open {
+			t.Fatalf("the pairing published %s after the refusal, which the mark said was its last",
+				emission.Type)
+		}
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// A ban and a refused connect reach this session twice while a pairing is running: once
+// through the handler and once through the QR channel, which turns them into the
+// pairing's own ending. The lease has to go back on the second of the two -- handed back
+// on the first, the pairing error and the state that closes it are published by a session
+// whose account already belongs to nobody, and the client is left watching a pairing that
+// never resolves.
+func TestAConnectRefusedMidPairingRetiresOnThePairingsOwnEnding(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "")
+	pairCtx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	run := session.startPairing(pairCtx, cancel)
+
+	codes := make(chan wm.QRChannelItem, 1)
+	go session.readPairingWith(run, codes, nil, false)
+
+	session.handle(&waEvents.ConnectFailure{Reason: waEvents.ConnectFailureServiceUnavailable})
+	refused := next(t, session)
+	if refused.Type != protocol.EventSessionConnectFailure {
+		t.Fatalf("the session published %s, want %s", refused.Type, protocol.EventSessionConnectFailure)
+	}
+	if refused.Retires {
+		t.Error("the refused connect finished the session while its pairing still had two events to publish")
+	}
+
+	// whatsmeow's own answer to a connect it refused mid-pairing: the channel calls it an
+	// unexpected event and closes on it.
+	codes <- wm.QRChannelItem{Event: "err-unexpected-state"}
+	close(codes)
 
 	failed := next(t, session)
 	if failed.Type != protocol.EventPairingError {
@@ -2698,6 +2740,6 @@ func TestAPairingRefusedForTheBuildFinishesTheSession(t *testing.T) {
 		t.Fatalf("the pairing published %s last, want %s", closed.Type, protocol.EventSessionState)
 	}
 	if !closed.Retires {
-		t.Error("a pairing WhatsApp refused for this build left the session holding its lease")
+		t.Error("a pairing that ended on a connect WhatsApp refused left the session holding its lease")
 	}
 }
