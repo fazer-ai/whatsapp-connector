@@ -528,6 +528,11 @@ func TestAGroupDeletionWhoseKeyNamesNoAuthorIsDropped(t *testing.T) {
 // client may not be able to match -- its copy of the message is keyed by whichever half it
 // learned first -- and a claim it cannot match reads as somebody else having written the
 // message, which drops a deletion that was real.
+//
+// Addressed by the LID, which is the direction that carries both: the alternative there is
+// the number off `participant_pn`, read from the stanza and nowhere else. The other way
+// round the alternative may have been filled in from the mapping the deployment shares,
+// and `TestADeletionsAuthorIsNamedByWhatTheStanzaCarried` is that case.
 func TestADeletionOfTheSendersOwnClaimsBothNamespaces(t *testing.T) {
 	t.Parallel()
 
@@ -536,8 +541,8 @@ func TestADeletionOfTheSendersOwnClaimsBothNamespaces(t *testing.T) {
 	event := revokeEvent(carrier, subject)
 	event.Info.Chat = waTypes.NewJID("120363000000000000", waTypes.GroupServer)
 	event.Info.IsGroup = true
-	event.Info.Sender = waTypes.NewJID("5541988887777", waTypes.DefaultUserServer)
-	event.Info.SenderAlt = waTypes.NewJID("998877665544332", waTypes.HiddenUserServer)
+	event.Info.Sender = waTypes.NewJID("998877665544332", waTypes.HiddenUserServer)
+	event.Info.SenderAlt = waTypes.NewJID("5541988887777", waTypes.DefaultUserServer)
 	event.Message.GetProtocolMessage().GetKey().FromMe = proto.Bool(true)
 
 	emission := publishedBy(t, session, event)
@@ -984,5 +989,42 @@ func TestASealedReactionOpensAgainstWhatsmeowsOwnCrypto(t *testing.T) {
 	}
 	if payload["emoji"] != "🎉" {
 		t.Errorf("the reaction reads %v, and what was sealed was 🎉", payload["emoji"])
+	}
+}
+
+// The author a deletion claims is named off the same event a message is, so it is held to
+// the same rule: a phone-addressed stanza that arrived without `sender_lid` has one filled
+// in from the mapping every account on the deployment shares, and naming the author by it
+// would put another operator's pairing on this event and into what the session learns.
+func TestADeletionsAuthorIsNamedByWhatTheStanzaCarried(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setConnected(true)
+
+	author := session.claimedAuthor(&waEvents.Message{
+		Info: waTypes.MessageInfo{
+			MessageSource: waTypes.MessageSource{
+				IsGroup:   true,
+				Chat:      waTypes.NewJID("120363000000000001", waTypes.GroupServer),
+				Sender:    waTypes.NewJID("5511999990012", waTypes.DefaultUserServer),
+				SenderAlt: waTypes.NewJID("167392323834045", waTypes.HiddenUserServer),
+			},
+		},
+		Message: &waE2E.Message{
+			ProtocolMessage: &waE2E.ProtocolMessage{
+				Type: waE2E.ProtocolMessage_REVOKE.Enum(),
+				Key:  &waCommon.MessageKey{FromMe: proto.Bool(true), ID: proto.String("3EB0")},
+			},
+		},
+	})
+	if author == nil {
+		t.Fatal("the deletion named no author at all")
+	}
+	if author.LID != "" {
+		t.Errorf("the author is %+v, want the address the stanza carried and nothing filled in", author)
+	}
+	if author.Phone != "5511999990012" {
+		t.Errorf("the author is %+v, want the number the stanza was addressed by", author)
 	}
 }
