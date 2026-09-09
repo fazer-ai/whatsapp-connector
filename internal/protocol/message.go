@@ -207,8 +207,11 @@ const (
 //
 // A key that says the message is the deleter's own names the deleter, whatever else the
 // key carries: that is how WhatsApp resolves it, so it is the claim being made. Absent
-// means the key named nobody at all, which is a direct chat, where the key names the chat
-// and there are only two parties to be.
+// means the key named nobody WhatsApp reads, which is a one-to-one chat: a key there
+// addresses the message by the conversation, so a participant in one is a field nothing
+// else honours and this connector does not pass it on either. A broadcast is not that
+// chat, whichever conversation the message shows up in: its key names a participant like
+// any other, and the field carries it.
 //
 // A group deletion always carries one. A key there identifies a message by its participant
 // or by `from_me`, so one with neither names no message at all, and the connector drops it

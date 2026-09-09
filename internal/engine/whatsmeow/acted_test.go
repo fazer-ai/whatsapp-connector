@@ -421,6 +421,7 @@ func TestADeletionCarriesTheAuthorItsKeyClaims(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
 		group       bool
+		broadcast   bool
 		participant string
 		fromMe      bool
 		want        string
@@ -442,6 +443,19 @@ func TestADeletionCarriesTheAuthorItsKeyClaims(t *testing.T) {
 		// A direct chat's key names the chat, and there are two parties to be: `sender`
 		// and `by` are the whole answer, and no claim is the honest shape for it.
 		{name: "a direct chat, where the key names nobody", want: ""},
+		// And a participant there is a field WhatsApp does not read: `BuildMessageKey`
+		// writes one only outside a chat, and `getOrigSenderFromKey` takes the key's own
+		// remote JID instead. Publishing it would hand a client a claim nothing else
+		// honours, and the claim is what makes its comparison pass.
+		{name: "a direct chat, where the key names a participant anyway",
+			participant: "5511999990001@" + waTypes.DefaultUserServer, want: ""},
+		// A broadcast is published in the direct conversation with whoever sent it,
+		// because that is where WhatsApp shows it, and its key is a list's all the same:
+		// `BuildMessageKey` writes a participant everywhere but a one-to-one chat. Read
+		// off the published address, this would take the claim off the one event whose
+		// two chats disagree.
+		{name: "a broadcast, published as the direct chat it shows up in", broadcast: true,
+			participant: author + "@" + waTypes.DefaultUserServer, want: author},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -452,6 +466,10 @@ func TestADeletionCarriesTheAuthorItsKeyClaims(t *testing.T) {
 			if tc.group {
 				event.Info.Chat = waTypes.NewJID("120363000000000000", waTypes.GroupServer)
 				event.Info.IsGroup = true
+			}
+			if tc.broadcast {
+				event.Info.Chat = waTypes.NewJID("5511999990001", waTypes.BroadcastServer)
+				event.Info.Sender = waTypes.NewJID(author, waTypes.DefaultUserServer)
 			}
 			if tc.participant != "" {
 				event.Message.GetProtocolMessage().GetKey().Participant = proto.String(tc.participant)

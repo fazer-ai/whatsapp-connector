@@ -645,6 +645,15 @@ func (s *Session) claimedAuthor(event *waEvents.Message) *protocol.Party {
 		// account on the deployment shares, and naming the author by it would put another
 		// operator's pairing on this event and into what this session learns from it.
 		claiming = []waTypes.JID{event.Info.Sender, wireAlt(&event.Info)}
+	} else if directChat(event.Info.Chat) {
+		// A chat's key carries no participant and is not read for one. WhatsApp addresses
+		// a message there by the conversation, which is why `BuildMessageKey` writes a
+		// participant only outside a chat and `getOrigSenderFromKey` reads the key's own
+		// remote JID rather than the participant. Reading one anyway would take a field
+		// nothing else honours and publish it as the claim -- and the claim is what makes
+		// a client's comparison pass, for a deletion no phone applied, which is the whole
+		// reason the field is checked rather than trusted.
+		return nil
 	} else {
 		named := key.GetParticipant()
 		// Exactly one `@`, because ParseJID splits on it and keeps the first two pieces:
@@ -686,6 +695,23 @@ func (s *Session) claimedAuthor(event *waEvents.Message) *protocol.Party {
 		return nil
 	}
 	return &author
+}
+
+// directChat reports whether a conversation's key names no participant, which is what
+// WhatsApp does in a one-to-one chat and nowhere else. The servers are whatsmeow's own
+// list, from the `BuildMessageKey` that decides where to write one.
+//
+// Off the stanza's own chat rather than the address this connector publishes, and a
+// broadcast is why the two differ: a message sent through a list shows up in the direct
+// conversation with whoever sent it, so that is where this publishes it, while the key
+// stays a list's -- participant and all.
+func directChat(chat waTypes.JID) bool {
+	switch chat.Server {
+	case waTypes.DefaultUserServer, waTypes.HiddenUserServer, waTypes.MessengerServer:
+		return true
+	default:
+		return false
+	}
 }
 
 // whereAndWho is the half of these three events that does not depend on which one it is.
