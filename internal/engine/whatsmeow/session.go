@@ -432,10 +432,13 @@ type Session struct {
 	// each change -- and read from here under the lock like every other session field.
 	pushName     string
 	businessName string
-	// verifiedLive says the verified name came from an event this session handled rather
-	// than from the device record it was built on. The two rank differently against the
-	// contact table: a change is written to the table and not to the record, so a copy
-	// from the record is the older of the two and a copy from an event is the newer.
+	// pushLive and verifiedLive say the name beside them came from an event this session
+	// handled rather than from the device record it was built on, which is what decides
+	// how it ranks against the contact table. A rename is written to the table and, for
+	// the paths that do not go through an app-state sync, not to the record -- so a copy
+	// taken from the record is the older of the two, and one an event brought is the
+	// newer.
+	pushLive     bool
 	verifiedLive bool
 	// phone and lid are this session's copy of what it paired. whatsmeow assigns the
 	// same fields on its pairing goroutine, so reading them off the client from a
@@ -722,6 +725,7 @@ func (s *Session) adopt(client *wm.Client) bool {
 	s.lid = named.lid
 	s.pushName = named.pushName
 	s.businessName = named.businessName
+	s.pushLive = false
 	s.verifiedLive = false
 	s.stale = false
 	s.revoked = false
@@ -894,16 +898,29 @@ func (s *Session) rename(pushName string) {
 	}
 	s.mu.Lock()
 	s.pushName = pushName
+	// From an event, which is what makes it outrank the contact table.
+	s.pushLive = true
 	s.mu.Unlock()
 }
 
-// names is what this account calls itself: the push name every recipient sees, and the
-// verified name a business account carries. `live` says the verified name came from an
-// event rather than from the device record.
-func (s *Session) names() (pushName, businessName string, live bool) {
+// selfNames is what this account calls itself: the push name every recipient sees, and the
+// verified name a business account carries, each with where this session got it from.
+type selfNames struct {
+	push         string
+	verified     string
+	pushLive     bool
+	verifiedLive bool
+}
+
+func (s *Session) names() selfNames {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.pushName, s.businessName, s.verifiedLive
+	return selfNames{
+		push:         s.pushName,
+		verified:     s.businessName,
+		pushLive:     s.pushLive,
+		verifiedLive: s.verifiedLive,
+	}
 }
 
 // relearn takes the account's own details off the client again.

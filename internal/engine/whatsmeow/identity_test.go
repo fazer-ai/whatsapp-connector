@@ -45,7 +45,7 @@ func TestASessionTakesTheNameTheAccountChangedTo(t *testing.T) {
 		Action: &waSyncAction.PushNameSetting{Name: proto.String("Atendimento")},
 	})
 
-	if named, _, _ := session.names(); named != "Atendimento" {
+	if named := session.names().push; named != "Atendimento" {
 		t.Errorf("the session calls itself %q, want the name the account changed to", named)
 	}
 }
@@ -98,7 +98,7 @@ func TestAConnectionDoesNotTakeTheNamesBackOffTheDevice(t *testing.T) {
 	session.handle(&waEvents.Connected{})
 	drain(t, session)
 
-	if named, _, _ := session.names(); named != "Atendimento" {
+	if named := session.names().push; named != "Atendimento" {
 		t.Errorf("after connecting the session calls itself %q, want the name it was told", named)
 	}
 }
@@ -158,7 +158,7 @@ func TestASessionTakesItsOwnVerifiedNameChange(t *testing.T) {
 		OldBusinessName: "Loja do Bruno",
 		NewBusinessName: "Loja do Bruno LTDA",
 	})
-	if _, verified, _ := session.names(); verified != "Loja do Bruno LTDA" {
+	if verified := session.names().verified; verified != "Loja do Bruno LTDA" {
 		t.Errorf("the session is verified as %q, want the name the account changed to", verified)
 	}
 
@@ -167,7 +167,7 @@ func TestASessionTakesItsOwnVerifiedNameChange(t *testing.T) {
 		JID:             waTypes.NewJID("5541988887777", waTypes.DefaultUserServer),
 		NewBusinessName: "Outra Loja",
 	})
-	if _, verified, _ := session.names(); verified != "Loja do Bruno LTDA" {
+	if verified := session.names().verified; verified != "Loja do Bruno LTDA" {
 		t.Errorf("the session is verified as %q after somebody else was renamed", verified)
 	}
 
@@ -177,7 +177,7 @@ func TestASessionTakesItsOwnVerifiedNameChange(t *testing.T) {
 		JID:             waTypes.NewJID("5511999990001", waTypes.HiddenUserServer),
 		NewBusinessName: "Loja Homonima",
 	})
-	if _, verified, _ := session.names(); verified != "Loja do Bruno LTDA" {
+	if verified := session.names().verified; verified != "Loja do Bruno LTDA" {
 		t.Errorf("the session is verified as %q after a LID that only looks like its number", verified)
 	}
 }
@@ -196,7 +196,7 @@ func TestAPairingCarriesTheVerifiedName(t *testing.T) {
 	})
 	drain(t, session)
 
-	if _, verified, _ := session.names(); verified != "Loja do Bruno" {
+	if verified := session.names().verified; verified != "Loja do Bruno" {
 		t.Errorf("after pairing the session is verified as %q, want the name the pairing carried", verified)
 	}
 }
@@ -314,7 +314,7 @@ func TestASessionTakesItsOwnNameOffAMessageItSent(t *testing.T) {
 		OldPushName: "Antigo",
 		NewPushName: "Atendimento",
 	})
-	if named, _, _ := session.names(); named != "Atendimento" {
+	if named := session.names().push; named != "Atendimento" {
 		t.Errorf("the session calls itself %q, want the name its own message carried", named)
 	}
 
@@ -323,7 +323,36 @@ func TestASessionTakesItsOwnNameOffAMessageItSent(t *testing.T) {
 		JID:         waTypes.NewJID("5541988887777", waTypes.DefaultUserServer),
 		NewPushName: "Bruno",
 	})
-	if named, _, _ := session.names(); named != "Atendimento" {
+	if named := session.names().push; named != "Atendimento" {
 		t.Errorf("the session calls itself %q after somebody else was renamed", named)
+	}
+}
+
+// A rename learned from a message the account sent is written to the contact table and not
+// to the device record, so a restart brings the session back holding the older of the two.
+// Preferring the session's copy unconditionally would then answer with a name the account
+// had already left behind.
+func TestAResolveTakesTheTableWhenTheSessionOnlyHasTheRecord(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	client := session.current()
+	own := waTypes.NewJID("5511999990001", waTypes.DefaultUserServer)
+	// The record as the pairing wrote it, and the table as the rename left it.
+	client.Store.PushName = "Antigo"
+	if _, _, err := client.Store.Contacts.PutPushName(t.Context(), own, "Atendimento"); err != nil {
+		t.Fatalf("PutPushName: %v", err)
+	}
+	// A restart: the session copies the record and has heard no event.
+	if !session.adopt(client) {
+		t.Fatal("the session would not take its own client back")
+	}
+
+	result, err := session.Execute(t.Context(), resolveCommand(t, `{"party":{"kind":"phone","id":"5511999990001"}}`))
+	if err != nil {
+		t.Fatalf("contact.resolve: %v", err)
+	}
+	if party := resolved(t, result); party["push_name"] != "Atendimento" {
+		t.Errorf("the account is called %v, want the name the table was left with", party)
 	}
 }

@@ -317,21 +317,18 @@ func (s *Session) resolveContact(ctx context.Context, command *protocol.Command)
 		named.Phone = phone
 		// The account's own names are usually in neither place -- the contact table is the
 		// people it has met, and it is not one of them -- so most of the time the session
-		// answers both. Where a row does exist, which of the two is the fresher one
-		// differs per field, and it differs because of where each change is written:
-		//
-		//   - a push name change updates the device record and this session, and does not
-		//     touch a row the account may have for itself, so the session wins;
-		//   - a verified name change is written to the contact table and *not* to the
-		//     device record, so after a restart the session holds the older of the two and
-		//     the table wins.
+		// answers both. Where a row does exist as well, the rule is recency, and what
+		// says which is newer is where the session got its copy: a name an event brought
+		// in is at least as new as the table, because the same change wrote both, while
+		// one taken off the device record can be older than the table, because several of
+		// the paths that rename an account write the table and leave the record alone.
 		s.nameFromStore(reading, &named)
-		pushName, verifiedName, live := s.names()
-		if pushName != "" {
-			named.PushName = pushName
+		own := s.names()
+		if own.push != "" && (own.pushLive || named.PushName == "") {
+			named.PushName = own.push
 		}
-		if live || named.VerifiedName == "" {
-			named.VerifiedName = verifiedName
+		if own.verified != "" && (own.verifiedLive || named.VerifiedName == "") {
+			named.VerifiedName = own.verified
 		}
 		return json.Marshal(named)
 	}
