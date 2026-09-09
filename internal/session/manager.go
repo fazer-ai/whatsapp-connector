@@ -958,8 +958,13 @@ func (m *Manager) RenewAll(ctx context.Context, by time.Time) {
 		// Not knowing is the reason to hand it back explicitly rather than to wait the
 		// key out. Done below, with everything else that is not a renewal.
 		//
-		// Said before the stop, for the reason Release gives: the stop is the window.
-		m.givingUp(ctx, sid)
+		// Stopped first, and this is the one place the mark does not go before the stop.
+		// Everything that gets here failed to renew, so either the lease is gone or it is
+		// past being fresh, and Redis is often the reason: a mark asked for here waits
+		// out a network that is not answering, once per session, while the sockets those
+		// leases were covering are still open and peers are free to take the accounts.
+		// Not knowing is the reason to let go, not a reason to hold on, and the window
+		// the mark covers is at most the margin's worth of lease that is left.
 		session.Stop()
 		released = append(released, sid)
 	}

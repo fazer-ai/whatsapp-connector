@@ -83,8 +83,16 @@ return 1
 // The mark is compared against the holder rather than merely being present. One left by
 // an instance that no longer holds the lease says nothing about the one that does, and a
 // wake left pending on the strength of it would bounce until the mark expired.
+//
+// Winning clears it, for the case the comparison cannot see through: a hand-back that
+// never landed leaves a mark outliving the lease it was about, and the instance that
+// wrote it can win the account back under its own name. The mark would then equal the
+// holder while that holder runs the session, and every wake for it would be left pending
+// until the mark expired. A lease taken afresh is the moment nothing about the one
+// before it is true any more.
 var acquireScript = redis.NewScript(`
 if redis.call("SET", KEYS[1], ARGV[1], "NX", "PX", ARGV[2]) then
+  redis.call("DEL", KEYS[2])
   return 1
 end
 local holder = redis.call("GET", KEYS[1])
