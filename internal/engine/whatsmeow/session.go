@@ -1772,6 +1772,10 @@ func (s *Session) isStale() bool {
 // What is not here is refused rather than answered with a plausible shape: a connector
 // that acknowledged a send it cannot make would lose the message and report success.
 func (s *Session) Execute(ctx context.Context, command *protocol.Command) (json.RawMessage, error) {
+	// Stamped here, before the command spends a round trip at WhatsApp: a pairing that
+	// comes back belongs to the account that asked for it, and a logout landing in that
+	// window has already rebuilt the session on another one.
+	ctx = s.aliases.stamp(ctx)
 	switch command.Type {
 	case protocol.CommandSessionStatus:
 		return json.Marshal(s.status())

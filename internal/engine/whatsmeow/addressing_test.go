@@ -148,17 +148,47 @@ func TestAPairingTheEventCarriedIsLearnedFirstHand(t *testing.T) {
 	lid := waTypes.NewJID("167392323834036", waTypes.HiddenUserServer)
 	phone := waTypes.NewJID("5511999990004", waTypes.DefaultUserServer)
 
+	// The context an event handler runs under, which is where the account a pairing is
+	// being learned for is stamped.
+	looking, done := session.looking()
+	defer done()
+
 	// Nothing in the shared table and no contact row: the event is the only source.
-	if named := session.party(t.Context(), phone, lid); named.Phone != "5511999990004" || named.LID != "167392323834036" {
+	if named := session.party(looking, phone, lid); named.Phone != "5511999990004" || named.LID != "167392323834036" {
 		t.Fatalf("the party is %+v, want both halves the event named", named)
 	}
 
 	// The half a receipt would carry, answered whole.
-	if named := session.party(t.Context(), lid); named.Phone != "5511999990004" {
+	if named := session.party(looking, lid); named.Phone != "5511999990004" {
 		t.Errorf("the party is %+v, want the number the message had already named", named)
 	}
-	if chat, ok := session.address(t.Context(), phone); !ok || chat.ID != "167392323834036" {
+	if chat, ok := session.address(looking, phone); !ok || chat.ID != "167392323834036" {
 		t.Errorf("the chat went out as %+v (ok=%v), want the LID the message had already named", chat, ok)
+	}
+}
+
+// A command spends a round trip at WhatsApp between being asked and naming anybody, and a
+// logout landing in that window rebuilds the session on another account. What comes back
+// belongs to the account that asked, so it is dropped rather than written into the map
+// that replaced it -- which is what the next account would otherwise be answered from.
+func TestAPairingLearnedUnderOneAccountIsNotKeptForTheNext(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setConnected(true)
+
+	lid := waTypes.NewJID("167392323834038", waTypes.HiddenUserServer)
+	phone := waTypes.NewJID("5511999990006", waTypes.DefaultUserServer)
+
+	// The account that asked, stamped before the round trip.
+	asking := session.aliases.stamp(t.Context())
+	// The logout, and the account that took its place.
+	session.aliases.forget()
+	// And the answer, arriving late.
+	session.aliases.observe(asking, phone, lid)
+
+	if named := session.party(t.Context(), lid); named.Phone != "" {
+		t.Errorf("the party is %+v, carrying a number the previous account was shown", named)
 	}
 }
 

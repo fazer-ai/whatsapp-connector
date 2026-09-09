@@ -62,6 +62,20 @@ func (a *alias) of(ctx context.Context, s *Session, jid waTypes.JID) (waTypes.JI
 	return alt, found
 }
 
+// generationKey is how the account an operation started under travels with it.
+type generationKey struct{}
+
+// stamp marks a context with the account whose mapping is being learned right now.
+//
+// Where the data enters, not where it is written down. A command spends a round trip at
+// WhatsApp between the two, and a logout landing in that window rebuilds the session on a
+// different account: the pairing that comes back belongs to the account that asked, and
+// writing it into the map that replaced it would hand the next account a number nobody
+// gave it. This is `remember`'s check moved to the only place that can tell.
+func (a *alias) stamp(ctx context.Context) context.Context {
+	return context.WithValue(ctx, generationKey{}, a.learning())
+}
+
 // observe records a pairing the event itself carried.
 //
 // First hand, and that is the whole difference. WhatsApp addressed this account with both
@@ -73,7 +87,14 @@ func (a *alias) of(ctx context.Context, s *Session, jid waTypes.JID) (waTypes.JI
 // Only a pair one caller passed together, which is what makes this safe to sit on the path
 // every event takes. The one field a stranger writes -- the participant inside a deletion
 // key -- reaches `party` on its own, and a single JID names no pairing.
-func (a *alias) observe(jids ...waTypes.JID) {
+func (a *alias) observe(ctx context.Context, jids ...waTypes.JID) {
+	// A context nobody stamped is one this cannot place, and an unplaceable pairing is
+	// dropped rather than guessed at: the cost is a lookup the next event pays, and the
+	// alternative is the previous account's mapping in this one's map.
+	learning, placed := ctx.Value(generationKey{}).(uint64)
+	if !placed {
+		return
+	}
 	var phone, lid waTypes.JID
 	for _, jid := range jids {
 		if !pairable(jid) {
@@ -92,8 +113,10 @@ func (a *alias) observe(jids ...waTypes.JID) {
 		return
 	}
 	a.mu.Lock()
-	a.seen[phone.String()] = lid
-	a.seen[lid.String()] = phone
+	if a.generation == learning {
+		a.seen[phone.String()] = lid
+		a.seen[lid.String()] = phone
+	}
 	a.mu.Unlock()
 }
 
@@ -219,13 +242,13 @@ func pairable(jid waTypes.JID) bool {
 // device store, which shares its one connection with everything the session writes, so a
 // handler that waits on it indefinitely waits on whatever else is mid-write.
 func (s *Session) looking() (context.Context, context.CancelFunc) {
-	return context.WithTimeout(s.ctx, s.storeLimit)
+	return context.WithTimeout(s.aliases.stamp(s.ctx), s.storeLimit)
 }
 
 // party names somebody by both of the addresses WhatsApp knows them by, filling in from
 // the mapping whatever the event did not carry.
 func (s *Session) party(ctx context.Context, jids ...waTypes.JID) protocol.Party {
-	s.aliases.observe(jids...)
+	s.aliases.observe(ctx, jids...)
 	var named protocol.Party
 	naming(&named, jids...)
 	if named.Phone != "" && named.LID != "" {
@@ -251,7 +274,7 @@ func (s *Session) party(ctx context.Context, jids ...waTypes.JID) protocol.Party
 // LID when it has one -- names the same conversation whether it arrived through a
 // message, a receipt or a typing indicator.
 func (s *Session) address(ctx context.Context, jids ...waTypes.JID) (protocol.Address, bool) {
-	s.aliases.observe(jids...)
+	s.aliases.observe(ctx, jids...)
 
 	// What the event carried first, and the mapping only for what it did not. An event
 	// that names both namespaces has already answered the question, and asking the store
