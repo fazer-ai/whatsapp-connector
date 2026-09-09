@@ -808,23 +808,27 @@ func TestAHandBackAndAnAdoptionOfTheSameAccountDoNotOverlap(t *testing.T) {
 	// the hand-back and not a server that stopped answering.
 	hop.resume()
 
-	// On this goroutine, so the answer is an ordering rather than a wait: the adoption
-	// returns after the hand-back finished, or it ran through it.
+	// On this goroutine, and answered rather than waited out: an adoption that waited here
+	// would hold every other wake and ping behind an account this instance is giving up.
 	_, err = manager.Adopt(ctx, sid)
 	select {
 	case <-handed:
+		t.Fatal("the hand-back finished before the adoption was asked, so nothing was in the way of it")
 	default:
-		t.Fatal("an adoption ran while a hand-back for the same account was still under way")
+	}
+	if !errors.Is(err, errLeaving) {
+		t.Fatalf("an adoption alongside a hand-back for the same account answered %v, want %v", err, errLeaving)
 	}
 
-	// The release never reached Redis, so the key still names this instance and the
-	// adoption is told as much. `handingBack` is what keeps the wake behind it pending
-	// rather than acknowledged as somebody else's.
-	if !errors.Is(err, cluster.ErrNotOwner) {
-		t.Fatalf("the adoption after a hand-back that never landed answered %v, want %v", err, cluster.ErrNotOwner)
-	}
+	// The release never reached Redis, so the key still names this instance and the wake
+	// stays pending on those grounds too: `handingBack` is what keeps it from being
+	// acknowledged as somebody else's.
+	<-handed
 	if !manager.handingBack(sid) {
 		t.Fatal("a hand-back that did not reach Redis was forgotten, so the wake that would restart the account is acknowledged as somebody else's")
+	}
+	if _, err := manager.Adopt(ctx, sid); !errors.Is(err, cluster.ErrNotOwner) {
+		t.Fatalf("the adoption after a hand-back that never landed answered %v, want %v", err, cluster.ErrNotOwner)
 	}
 }
 
@@ -864,7 +868,9 @@ func TestASweepDoesNotTakeASessionAnAdoptionIsWorkingOn(t *testing.T) {
 
 	// An adoption in flight, which is all the answer goroutine holding this looks like
 	// from the heartbeat.
-	manager.holdHanding(sid)
+	if !manager.tryHoldHanding(sid) {
+		t.Fatal("the account's turn was already taken")
+	}
 	defer manager.dropHanding(sid)
 
 	manager.releaseThis(ctx, sid, first)
@@ -1360,7 +1366,9 @@ func TestASweepIsNotHeldUpByAnAdoptionOfAnotherAccount(t *testing.T) {
 	waitFor(t, session.Retired, "the session was never finished with")
 
 	// Another account being adopted, which is what a wake looks like from the heartbeat.
-	manager.holdHanding(other)
+	if !manager.tryHoldHanding(other) {
+		t.Fatal("the other account's turn was already taken")
+	}
 	defer manager.dropHanding(other)
 
 	manager.SweepRetired(ctx, manager.HandBackBy())
@@ -1682,7 +1690,9 @@ func TestAnOrphanIsNotRetriedWhileTheAccountIsBeingWorkedOn(t *testing.T) {
 
 	// An adoption of the same account under way, which is the release that must not have
 	// a second one sent alongside it.
-	manager.holdHanding(sid)
+	if !manager.tryHoldHanding(sid) {
+		t.Fatal("the account's turn was already taken")
+	}
 	defer manager.dropHanding(sid)
 
 	manager.releaseOrphans(ctx)

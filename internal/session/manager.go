@@ -59,7 +59,6 @@ type Manager struct {
 	// on the next tick.
 	handingMu   sync.Mutex
 	handingBusy map[string]struct{}
-	handingFree *sync.Cond
 
 	// newly is the sessions adopted since the loop last asked, waiting to have what
 	// their previous owner left pending drained before anything newer is read for them.
@@ -151,7 +150,6 @@ func NewManager(cfg *ManagerConfig) *Manager {
 		handingBusy: make(map[string]struct{}),
 		answers:     make(chan answer, cfg.AnswerDepth),
 	}
-	manager.handingFree = sync.NewCond(&manager.handingMu)
 	return manager
 }
 
@@ -200,7 +198,15 @@ const releaseTimeout = 2 * time.Second
 // It returns cluster.ErrNotOwner when another instance holds it, which is the ordinary
 // answer in a fleet and not a failure.
 func (m *Manager) Adopt(ctx context.Context, sid string) (*Session, error) {
-	m.holdHanding(sid)
+	if !m.tryHoldHanding(sid) {
+		// The heartbeat is handing this very account back. Waiting for it would hold every
+		// wake and ping behind it on this goroutine, and what is being waited for is an
+		// account this instance is giving up: the wake is left pending, and whoever reads
+		// it next finds an account nobody owns.
+		m.log.Info().Str("sid", sid).
+			Msg("a wake found an account this instance is handing back; leaving it pending")
+		return nil, errLeaving
+	}
 	defer m.dropHanding(sid)
 
 	m.mu.RLock()
@@ -996,21 +1002,13 @@ func (m *Manager) SweepRetired(ctx context.Context, by time.Time) {
 // The pointer answers for a replacement that has already landed; `handing` answers for
 // one that is still being built, because the release that overtakes an adoption deletes
 // a live lease -- `cluster.Release` matches on the instance and nothing else.
-// holdHanding takes the turn for one account, waiting for whoever has it.
-func (m *Manager) holdHanding(sid string) {
-	m.handingMu.Lock()
-	defer m.handingMu.Unlock()
-	for {
-		if _, busy := m.handingBusy[sid]; !busy {
-			m.handingBusy[sid] = struct{}{}
-			return
-		}
-		m.handingFree.Wait()
-	}
-}
-
-// tryHoldHanding takes the turn for one account, or says it is taken. For the heartbeat,
-// which has other sessions to renew and cannot wait on a store read.
+// tryHoldHanding takes the turn for one account, or says it is taken.
+//
+// Nobody waits on it. The heartbeat has other sessions to renew and cannot spend a tick
+// on one; an adoption runs on the goroutine that answers every wake and ping, and one
+// waiting here would hold all of them behind an account it has been told is on its way
+// out -- which is a wake to leave pending, not one to wait for. Two adoptions of the same
+// account cannot contend, being the same goroutine.
 func (m *Manager) tryHoldHanding(sid string) bool {
 	m.handingMu.Lock()
 	defer m.handingMu.Unlock()
@@ -1025,9 +1023,6 @@ func (m *Manager) dropHanding(sid string) {
 	m.handingMu.Lock()
 	delete(m.handingBusy, sid)
 	m.handingMu.Unlock()
-	// Everyone, because the wait is per account and one broadcast is cheaper than keeping
-	// a queue per account for a wait that is almost never contended.
-	m.handingFree.Broadcast()
 }
 
 // forget takes a session out of the map and stops it, unless the map no longer holds the
