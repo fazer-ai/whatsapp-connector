@@ -1089,16 +1089,34 @@ func (m *Manager) StopAll(ctx context.Context) {
 	// What a mark per session would have spent is then not spent at all: the stops below
 	// go straight through, and the hand-backs behind them carry whatever retry the batch
 	// still deserves.
-	ahead, ending := m.roomToMark(sids)
-	// The leases with nothing left to give come down before anything blocks on Redis at
-	// all. No mark could outlive them, so waiting for one -- even a batch they are not in
-	// -- buys nothing and spends the last of a lease a peer is about to be free to take,
-	// with this instance still talking to WhatsApp on the account.
-	for _, sid := range ending {
-		m.stopSession(sid)
+	// The leases with nothing left to give come down, and go back, before anything blocks
+	// on Redis for anybody else. No mark could outlive them, so waiting for one -- even a
+	// batch they are not in -- buys nothing and spends the last of a lease a peer is
+	// about to be free to take, with this instance still talking to WhatsApp on the
+	// account. Their own mark goes out with their release, one round trip behind a socket
+	// that is already down, which is the shortest window a hand-back can have.
+	//
+	// Asked again after every pass, because passing time is what puts a lease in this
+	// group: the stops and releases here spend exactly the room the rest were just
+	// measured to have. A split taken once and acted on for a whole shutdown is a split
+	// that was true when it was taken.
+	for {
+		ahead, ending := m.roomToMark(sids)
+		sids = ahead
+		if len(ending) == 0 {
+			break
+		}
+		for _, sid := range ending {
+			m.stopSession(sid)
+			m.abandon(ctx, sid)
+		}
+		if len(sids) == 0 {
+			return
+		}
 	}
-	m.givingUpAll(ctx, ahead)
-	for _, sid := range ahead {
+
+	m.givingUpAll(ctx, sids)
+	for _, sid := range sids {
 		m.stopSession(sid)
 	}
 	// Only now, with every socket already down. A hand-back is a round trip that can

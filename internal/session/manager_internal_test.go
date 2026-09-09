@@ -2281,7 +2281,14 @@ func TestAStaleHandBackDoesNotOverwriteTheMarkOfTheInstanceThatHoldsTheLease(t *
 
 // watching runs after a command has been answered, which is where a test learns that a
 // key is in Redis rather than merely on its way.
-type watching struct{ after func(redis.Cmder) }
+//
+// `batch` sees a pipeline whole, which is the only way to ask what went out together: a
+// shutdown's marks are one batch under one deadline, and which sessions are in it is a
+// different question from which sessions were marked at all.
+type watching struct {
+	after func(redis.Cmder)
+	batch func([]redis.Cmder)
+}
 
 func (watching) DialHook(next redis.DialHook) redis.DialHook { return next }
 
@@ -2290,8 +2297,13 @@ func (watching) DialHook(next redis.DialHook) redis.DialHook { return next }
 func (h watching) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
 	return func(ctx context.Context, cmds []redis.Cmder) error {
 		err := next(ctx, cmds)
-		for _, cmd := range cmds {
-			h.after(cmd)
+		if h.batch != nil {
+			h.batch(cmds)
+		}
+		if h.after != nil {
+			for _, cmd := range cmds {
+				h.after(cmd)
+			}
 		}
 		return err
 	}
@@ -2300,7 +2312,9 @@ func (h watching) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.Proc
 func (h watching) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
 	return func(ctx context.Context, cmd redis.Cmder) error {
 		err := next(ctx, cmd)
-		h.after(cmd)
+		if h.after != nil {
+			h.after(cmd)
+		}
 		return err
 	}
 }
@@ -2839,13 +2853,17 @@ func TestANearlyExpiredLeaseIsLeftOutOfTheShutdownBatch(t *testing.T) {
 	if !running {
 		t.Fatalf("the engine has no session for %s", fresh)
 	}
-	var markedFresh, markedEnding atomic.Bool
-	rdb.AddHook(watching{after: func(cmd redis.Cmder) {
-		if names(cmd, keys.HandBack(fresh)) {
-			markedFresh.Store(true)
-		}
-		if names(cmd, keys.HandBack(ending)) {
-			markedEnding.Store(true)
+	// The batch whole, not the marks one by one: the lease near its end is marked too,
+	// with its own release, and what must not happen is it sharing the batch's deadline.
+	var markedFresh, batchedEnding atomic.Bool
+	rdb.AddHook(watching{batch: func(cmds []redis.Cmder) {
+		for _, cmd := range cmds {
+			if names(cmd, keys.HandBack(fresh)) {
+				markedFresh.Store(true)
+			}
+			if names(cmd, keys.HandBack(ending)) {
+				batchedEnding.Store(true)
+			}
 		}
 	}})
 	freshSession.Emit(protocol.EventSessionState, map[string]any{"state": "connected"})
@@ -2860,7 +2878,7 @@ func TestANearlyExpiredLeaseIsLeftOutOfTheShutdownBatch(t *testing.T) {
 	}()
 
 	waitFor(t, markedFresh.Load, "the shutdown never marked the lease that had room for it, so a peer wake for it is acknowledged as somebody else's")
-	if markedEnding.Load() {
+	if batchedEnding.Load() {
 		t.Fatal("a lease with less life than a mark needs went into the shared batch, where its deadline is every other account's too")
 	}
 }
@@ -2922,5 +2940,140 @@ func TestANearlyExpiredSocketComesDownBeforeTheBatchBlocks(t *testing.T) {
 	case <-endingSession.Events():
 	case <-time.After(300 * time.Millisecond):
 		t.Fatal("a socket whose lease was nearly out waited on a batch of marks it was not even in, past the moment a peer may take the account")
+	}
+}
+
+// A socket taken down early still leaves a lease naming this instance, and a shutdown
+// that defers its release until after the batch and every other stop leaves it live and
+// unmarked for that whole stretch: a peer's wake in there is acknowledged into nothing,
+// which is the bug this branch exists to close. The release goes out behind the stop,
+// where the window is one round trip.
+func TestALeaseTakenDownEarlyGoesBackBeforeTheBatch(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+	keys := client.Keys()
+
+	const ttl = 3 * time.Second
+	clock := &steppingClock{now: time.Now()}
+	engines := fake.New()
+	manager := NewManager(&ManagerConfig{
+		Instance: "inst-a", Engine: engines,
+		Leases: cluster.NewLeases(client, "inst-a", cluster.Options{
+			TTL: ttl, Margin: ttl / 10, Clock: clock,
+		}),
+		Publisher: quietPublisher{}, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+
+	const ending = "9c2b7d1e-0000-4000-8000-0000000000cf"
+	const fresh = "9c2b7d1e-0000-4000-8000-0000000000d0"
+	ctx := context.Background()
+	if _, err := manager.Adopt(ctx, ending); err != nil {
+		t.Fatalf("Adopt %s: %v", ending, err)
+	}
+	clock.step(ttl - ttl/10 - 10*time.Millisecond)
+	if _, err := manager.Adopt(ctx, fresh); err != nil {
+		t.Fatalf("Adopt %s: %v", fresh, err)
+	}
+
+	// The order the lease near its end is treated in, against the batch that follows it.
+	var order []string
+	var recorded sync.Mutex
+	note := func(what string) {
+		recorded.Lock()
+		defer recorded.Unlock()
+		if len(order) == 0 || order[len(order)-1] != what {
+			order = append(order, what)
+		}
+	}
+	rdb.AddHook(watching{
+		after: func(cmd redis.Cmder) {
+			if handsBack(cmd, keys.HandBack(ending)) {
+				note("the lease taken down early went back")
+			}
+		},
+		batch: func(cmds []redis.Cmder) {
+			for _, cmd := range cmds {
+				if names(cmd, keys.HandBack(fresh)) {
+					note("the batch went out")
+				}
+			}
+		},
+	})
+
+	manager.StopAll(ctx)
+
+	recorded.Lock()
+	defer recorded.Unlock()
+	if len(order) == 0 || order[0] != "the lease taken down early went back" {
+		t.Fatalf("a lease taken down early was left live and unmarked while the rest of the shutdown ran; order was %v", order)
+	}
+}
+
+// The split between the leases worth marking and the ones that have to come down first
+// is true when it is taken, and taking it once for a whole shutdown makes it a claim
+// about the past: the stops and releases that follow spend exactly the room the rest were
+// just measured to have. A lease that ran out meanwhile must not still be in the batch,
+// under a deadline it no longer has the life to sit through.
+func TestTheShutdownSplitIsTakenAgainAsTimePasses(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+	keys := client.Keys()
+
+	const ttl = 3 * time.Second
+	clock := &steppingClock{now: time.Now()}
+	engines := fake.New()
+	manager := NewManager(&ManagerConfig{
+		Instance: "inst-a", Engine: engines,
+		Leases: cluster.NewLeases(client, "inst-a", cluster.Options{
+			TTL: ttl, Margin: ttl / 10, Clock: clock,
+		}),
+		Publisher: quietPublisher{}, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+
+	const ending = "9c2b7d1e-0000-4000-8000-0000000000d1"
+	const borderline = "9c2b7d1e-0000-4000-8000-0000000000d2"
+	ctx := context.Background()
+	if _, err := manager.Adopt(ctx, ending); err != nil {
+		t.Fatalf("Adopt %s: %v", ending, err)
+	}
+	// Far enough in that the first lease has less than a mark's worth left, and the
+	// second, taken now, has more.
+	clock.step(ttl - ttl/10 - 900*time.Millisecond)
+	if _, err := manager.Adopt(ctx, borderline); err != nil {
+		t.Fatalf("Adopt %s: %v", borderline, err)
+	}
+
+	// Handing the first one back is what spends the second one's room, which is the whole
+	// point: the shutdown's own work is what makes the split it took go stale.
+	var batched atomic.Bool
+	rdb.AddHook(watching{
+		after: func(cmd redis.Cmder) {
+			if handsBack(cmd, keys.HandBack(ending)) {
+				clock.step(900 * time.Millisecond)
+			}
+		},
+		batch: func(cmds []redis.Cmder) {
+			for _, cmd := range cmds {
+				if names(cmd, keys.HandBack(borderline)) {
+					batched.Store(true)
+				}
+			}
+		},
+	})
+
+	manager.StopAll(ctx)
+
+	if batched.Load() {
+		t.Fatal("a lease that ran out while the shutdown was working stayed in the batch, on a split taken before its room was spent")
 	}
 }
