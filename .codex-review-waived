@@ -511,10 +511,10 @@ internal/cluster/lease.go: Stage the hand-back marker for mixed-version fleets  
 # Leases are renewed in one pipelined batch under one reading of the clock, so an
 # instance's leases age together; a session adopted between ticks is stamped when it is
 # acquired, which makes it newer and never older; and one whose renewal fails on its own
-# is stopped by the sweep. Measured from outside on a running fleet: with twelve sessions,
-# a five second heartbeat and a thirty second lease, the spread between the newest and the
-# oldest lease stayed between 490 and 838 ms across forty PTTL samples, the smallest TTL
-# seen was 25.0 s of 30, and six seconds of Redis being away left the spread at 584 ms.
+# is stopped by the sweep. Measured from outside on a running fleet, reading every PTTL in
+# one EVAL rather than one call per key: across forty samples of thirty-three leases and
+# forty of twenty-seven, the spread between the newest and the oldest was 0 ms in thirty of
+# them and 1 ms in the rest, never more, with the smallest TTL seen 25.0 s of 30.
 # So `ending` is empty, which is every ordinary shutdown, or it is everything, which is an
 # instance that stopped renewing for about a whole TTL: a frozen process, a long pause, a
 # suspended machine.
@@ -533,11 +533,11 @@ internal/session/manager.go: Mark each expiring hand-back before another stop ca
 # TTL without a renewal, which means the instance was not reaching Redis or was not
 # running at all; a lease is only in the other group if it was renewed or acquired
 # recently, which means it was. For the harm named here the releases in front also have to
-# block, so Redis has to be away again by then. Measured on a running fleet, an instance's
-# leases sit within one tick of each other (490 to 838 ms of spread across forty PTTL
-# samples, twelve sessions, five second heartbeat, thirty second lease, and 584 ms still
-# after six seconds of Redis being away), because they are renewed in one pipelined batch
-# under one reading of the clock; a session adopted between ticks is stamped when it is
+# block, so Redis has to be away again by then. Measured on a running fleet, reading every
+# PTTL in one EVAL rather than one call per key, an instance's leases carry the same expiry
+# to the millisecond: across forty samples of thirty-three leases and forty of twenty-seven,
+# the spread was 0 ms in thirty of them and 1 ms in the rest, never more. They are renewed
+# in one pipelined batch under one reading of the clock; a session adopted between ticks is stamped when it is
 # acquired, so it is newer than the rest and never older, and one whose renewal fails on
 # its own is stopped by the sweep rather than kept.
 #
