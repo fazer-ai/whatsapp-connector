@@ -1157,8 +1157,8 @@ func (m *Manager) StopAll(ctx context.Context) {
 //
 // In practice one side of this split is almost always empty, and it is worth knowing why
 // before hardening it further. Leases are renewed in one pipelined batch and stamped with
-// one reading of the clock, so an instance's leases age together and the spread between
-// them is whatever a single tick takes. A session adopted between ticks is stamped when
+// one reading of the clock, so an instance's leases do not merely age together: Redis
+// gives them the same expiry, to the millisecond. A session adopted between ticks is stamped when
 // it is acquired, which makes it newer than the rest and never older; and one whose
 // renewal fails on its own is stopped by the sweep rather than kept with a stale lease.
 // What that leaves is the two ends: every lease with room, which is the ordinary tick, or
