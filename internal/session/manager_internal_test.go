@@ -2452,3 +2452,64 @@ func keysOf(cmd redis.Cmder) int {
 	}
 	return count
 }
+
+// The mark goes in front of the stop, and the stop is what takes the socket down. A
+// Redis that answers nothing would otherwise hold it there: the lease it names goes on
+// expiring meanwhile, a peer with a working Redis takes the account, and this instance is
+// still talking to WhatsApp on it. Two live sockets on one account is the one thing the
+// lease exists to prevent, and it outweighs by a wide margin the wake the mark was for.
+func TestAMarkThatCannotBeWrittenDoesNotHoldTheSocketOpen(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	hop := stallable(t, server.Addr())
+	rdb := redis.NewClient(&redis.Options{Addr: hop.addr(), ContextTimeoutEnabled: true})
+	t.Cleanup(func() { _ = rdb.Close() })
+
+	// Short, because the bound is a fraction of it: the whole point is that the mark
+	// cannot outlast the lease it is about, however the lease is configured.
+	const ttl = 300 * time.Millisecond
+	engines := fake.New()
+	manager := NewManager(&ManagerConfig{
+		Instance: "inst-a", Engine: engines,
+		Leases: cluster.NewLeases(redisx.Wrap(rdb, "wa:", 8), "inst-a", cluster.Options{
+			TTL: ttl, Margin: ttl / 10,
+		}),
+		Publisher: quietPublisher{}, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+
+	const sid = "9c2b7d1e-0000-4000-8000-0000000000c6"
+	ctx := context.Background()
+	if _, err := manager.Adopt(ctx, sid); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, running := engines.Session(sid)
+	if !running {
+		t.Fatal("the engine has no session for an account that was adopted")
+	}
+
+	hop.stall()
+	released := make(chan struct{})
+	// Registered before the resume, so the resume runs first: cleanups run last in, first
+	// out, and the hand-back behind the stop is on the caller's own unbounded context. It
+	// is not what this measures, and waiting it out against a stalled hop would put the
+	// wait back into the test by the other door.
+	t.Cleanup(func() { <-released })
+	t.Cleanup(hop.resume)
+	go func() {
+		defer close(released)
+		// The caller's own context has all the time in the world, which is what a
+		// shutdown grace looks like next to a lease this short. The bound has to come
+		// from the lease.
+		manager.Release(ctx, sid)
+	}()
+
+	// Closing the engine session is what closes this, so a receive means the socket is
+	// down. Nothing is emitted, so there is nothing else a receive could be.
+	select {
+	case <-engineSession.Events():
+	case <-time.After(2 * time.Second):
+		t.Fatal("a session held its socket open on a mark that was waiting out a Redis that does not answer, for longer than the lease a peer can take the account on")
+	}
+}

@@ -194,8 +194,9 @@ func (m *Manager) Count() int {
 // retried, because the wake it came from is left unacknowledged and reclaimed.
 const AdoptTimeout = 5 * time.Second
 
-// releaseTimeout bounds handing a lease back after an adoption that could not finish.
-// Short, because nothing waits on it and the lease expires on its own anyway.
+// releaseTimeout bounds one round trip of hand-back work: the release after an adoption
+// that could not finish, and the mark that goes in front of a stop. Short, because
+// nothing waits on either and the lease expires on its own anyway.
 const releaseTimeout = 2 * time.Second
 
 // Adopt takes a session over: wins the lease, opens it on the engine, and starts it.
@@ -451,7 +452,19 @@ func (m *Manager) givingUp(ctx context.Context, sid string) {
 		return
 	}
 
-	err := m.leases.MarkHandingBack(ctx, sid)
+	// Bounded, and this is what lets the mark go in front of a stop at all. The stop is
+	// what takes the socket down, and a socket still open on an account whose lease a
+	// peer is free to take is the one thing the lease exists to prevent. Against the
+	// lease and not only against a constant, because the TTL is configurable and the
+	// point is a fraction of it: a mark that cannot be written in a fraction of a lease
+	// is one the account is better off without, and the worst it costs is one wake
+	// retired -- a session started late, against two live sockets on one account.
+	//
+	// Derived from the caller's context rather than detached from it, so a shutdown with
+	// less than this left still gets the socket down inside its own grace.
+	marking, done := context.WithTimeout(ctx, min(releaseTimeout, m.leases.TTL()/ReleaseShare))
+	err := m.leases.MarkHandingBack(marking, sid)
+	done()
 	if err != nil {
 		// Not fatal to the hand-back, which is the part that matters and is attempted
 		// anyway: an unmarked hand-back is the behaviour this instance had before the
