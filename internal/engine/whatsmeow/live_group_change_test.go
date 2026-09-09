@@ -107,7 +107,7 @@ func TestLiveGroupMessageChange(t *testing.T) {
 	// bubble, and asserting only on `put` would let that through.
 	liveCheckAGroupSender(t, "the reaction being taken back", taken.Payload, to, theCounterpart, mode)
 	liveCheckTheEmoji(t, "the reaction being taken back", taken.Payload, "")
-	liveCheckTheReactions(t, []engine.Emission{put, taken}, target)
+	liveCheckTheReactions(t, []*engine.Emission{put, taken}, target)
 
 	// Leg 4: the subject is the group's creator and therefore its admin, and deletes the
 	// counterpart's message. Read on the counterpart, which is the side that has to be
@@ -127,7 +127,7 @@ func TestLiveGroupMessageChange(t *testing.T) {
 // liveCheckAnAdminDeletion reads a deletion the account did not perform on a message it
 // did send. The two fields it exists for are the ones a direct chat cannot produce.
 func liveCheckAnAdminDeletion(
-	t *testing.T, emission engine.Emission, target string,
+	t *testing.T, emission *engine.Emission, target string,
 	in protocol.Address, admin protocol.Party, mode waTypes.AddressingMode,
 ) {
 	t.Helper()
@@ -301,7 +301,7 @@ func liveWhoIs(t *testing.T, session *Session) protocol.Party {
 // is only the answer on an account nobody else is using.
 func liveAwaitAbout(
 	t *testing.T, events *recorder, want protocol.EventType, field, id string, within time.Duration,
-) engine.Emission {
+) *engine.Emission {
 	t.Helper()
 
 	deadline := time.After(within)
@@ -328,7 +328,7 @@ func liveAwaitAbout(
 				}
 			}
 			if got == id {
-				return emission
+				return &emission
 			}
 			fmt.Fprintf(os.Stderr, "ignoring a %s whose %s is %q\n", want, field, got)
 		case <-deadline:

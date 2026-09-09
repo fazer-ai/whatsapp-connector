@@ -2076,7 +2076,7 @@ func (s *Session) forward() {
 				}
 				emission = resolved
 			}
-			if !s.handOn(emission) {
+			if !s.handOn(&emission) {
 				return
 			}
 		}
@@ -2139,7 +2139,7 @@ type posted struct {
 // its handoff is bounded. The second is what makes the first mean anything -- an
 // unbounded handoff would pass the freshness check and then sit on a reader that is
 // busy, and what came out would be exactly the stale event the check is for.
-func (s *Session) handOn(emission engine.Emission) bool {
+func (s *Session) handOn(emission *engine.Emission) bool {
 	if s.picked != nil {
 		// Taken, and about to be handed on. A test that needs the forwarder parked here
 		// rather than racing it reads this. Never waits: a hook that can hold the
@@ -2151,7 +2151,7 @@ func (s *Session) handOn(emission engine.Emission) bool {
 	}
 	if emission.Expires == nil {
 		select {
-		case s.events <- emission:
+		case s.events <- *emission:
 			return true
 		case <-s.done:
 			return false
@@ -2165,7 +2165,7 @@ func (s *Session) handOn(emission engine.Emission) bool {
 	handoff := time.NewTimer(s.handoffWait)
 	defer handoff.Stop()
 	select {
-	case s.events <- emission:
+	case s.events <- *emission:
 	case <-handoff.C:
 		s.log.Debug().Str("type", string(emission.Type)).
 			Msg("dropping a transient event the reader was not there for")
@@ -2340,6 +2340,18 @@ func (s *Session) settled(key string, seq int64) func(error) {
 }
 
 func (s *Session) emit(eventType protocol.EventType, payload any) {
+	s.emitting(&engine.Emission{Type: eventType}, payload)
+}
+
+// emitLast is emit for a state whatsmeow does not come back from. It says so on the
+// emission, so the connector hands the lease back once the event is out and the account
+// stops belonging to an instance with nothing left to try.
+func (s *Session) emitLast(eventType protocol.EventType, payload any) {
+	s.emitting(&engine.Emission{Type: eventType, Retires: true}, payload)
+}
+
+func (s *Session) emitting(emission *engine.Emission, payload any) {
+	eventType := emission.Type
 	body, err := json.Marshal(payload)
 	if err != nil {
 		// Everything reaching this is built a few lines above, so a failure is a
@@ -2347,8 +2359,10 @@ func (s *Session) emit(eventType protocol.EventType, payload any) {
 		s.log.Error().Err(err).Str("type", string(eventType)).Msg("failed to render an event payload")
 		return
 	}
+	emission.Payload = body
+	emission.At = s.learned()
 	select {
-	case s.inbox <- pending{event: engine.Emission{Type: eventType, Payload: body, At: s.learned()}}:
+	case s.inbox <- pending{event: *emission}:
 	case <-s.done:
 	}
 }
@@ -2801,7 +2815,7 @@ func (s *Session) handle(rawEvent any) bool {
 			// Publishing now+0 would read as one that already has.
 			ban["expires_at"] = time.Now().Add(event.Expire).UnixMilli()
 		}
-		s.emit(protocol.EventSessionTemporaryBan, map[string]any{"ban": ban})
+		s.emitLast(protocol.EventSessionTemporaryBan, map[string]any{"ban": ban})
 	case *waEvents.ClientOutdated:
 		s.transition.Lock()
 		defer s.transition.Unlock()
@@ -2812,16 +2826,20 @@ func (s *Session) handle(rawEvent any) bool {
 			// The pairing reader publishes this one: whatsmeow delivers it here and to
 			// the QR channel both, and two canonical events for one outcome is worse
 			// than either.
+			//
+			// Which is also why the pairing reader's copy does not retire the session:
+			// its run is still reading the channel, and a lease handed back from under it
+			// would stop the reader before it published how the pairing ended.
 			return true
 		}
-		s.emit(protocol.EventSessionClientOutdated, map[string]any{})
+		s.emitLast(protocol.EventSessionClientOutdated, map[string]any{})
 	case *waEvents.ConnectFailure:
 		s.transition.Lock()
 		defer s.transition.Unlock()
 
 		s.refuseLateConnect()
 		s.offline()
-		s.emit(protocol.EventSessionConnectFailure, map[string]any{
+		s.emitLast(protocol.EventSessionConnectFailure, map[string]any{
 			"reason": event.Reason.String(), "code": int(event.Reason),
 		})
 	case *waEvents.PairSuccess:

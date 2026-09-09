@@ -281,6 +281,25 @@ func (s *Session) Close() error {
 // or a disconnection that nothing above asked for.
 func (s *Session) Emit(eventType protocol.EventType, payload any) { s.emit(eventType, payload) }
 
+// EmitLast publishes an emission after which the engine has nothing more to do for this
+// session on its own, which is how a test drives a temporary ban or a connect WhatsApp
+// refused without a socket to be banned from.
+func (s *Session) EmitLast(eventType protocol.EventType, payload any) {
+	body, err := marshal(payload)
+	if err != nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return
+	}
+	select {
+	case s.events <- engine.Emission{Type: eventType, Payload: body, Retires: true}:
+	default:
+	}
+}
+
 // EmitAt publishes an emission that says when the engine learned the thing it reports,
 // which is what a frame's `ts` carries and the only way a reader can tell an event that
 // waited from news of now.

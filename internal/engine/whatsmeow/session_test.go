@@ -633,7 +633,7 @@ func openStore(t *testing.T) *store.Container {
 }
 
 // next reads the emission the session just published, or fails rather than hanging.
-func next(t *testing.T, session *Session) engine.Emission {
+func next(t *testing.T, session *Session) *engine.Emission {
 	t.Helper()
 
 	select {
@@ -641,10 +641,10 @@ func next(t *testing.T, session *Session) engine.Emission {
 		if !ok {
 			t.Fatal("the session published nothing and closed")
 		}
-		return emission
+		return &emission
 	case <-time.After(2 * time.Second):
 		t.Fatal("the session published nothing")
-		return engine.Emission{}
+		return nil
 	}
 }
 
@@ -2611,5 +2611,47 @@ func TestASessionThatStoppedWritesNoMappingEither(t *testing.T) {
 	}
 	if err := session.store.Forget(t.Context()); !errors.Is(err, store.ErrNotOwned) {
 		t.Errorf("a session that stopped deleted its own device: %v", err)
+	}
+}
+
+// whatsmeow publishes these three from the branch that told the socket to stay down, so
+// nothing is going to reconnect: the session is finished until somebody asks it to try
+// again. Saying so on the emission is what lets the connector hand the lease back --
+// otherwise the account belongs to an instance with nothing left to try, and no peer
+// touches it. The two that are not here are the ones something does come back from.
+func TestTheStatesWhatsmeowDoesNotComeBackFromRetireTheSession(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name    string
+		event   any
+		want    protocol.EventType
+		retires bool
+	}{
+		{name: "a temporary ban", want: protocol.EventSessionTemporaryBan, retires: true,
+			event: &waEvents.TemporaryBan{Code: waEvents.TempBanReason(101)}},
+		{name: "a client WhatsApp will not talk to", want: protocol.EventSessionClientOutdated,
+			retires: true, event: &waEvents.ClientOutdated{}},
+		{name: "a connect it refused", want: protocol.EventSessionConnectFailure, retires: true,
+			event: &waEvents.ConnectFailure{Reason: waEvents.ConnectFailureServiceUnavailable}},
+		// A disconnect is whatsmeow's own to reconnect from, and a logout leaves a session
+		// that can pair again. Neither is finished with.
+		{name: "a disconnect", want: protocol.EventSessionState, event: &waEvents.Disconnected{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			session, _ := newTestSession(t, "5511999990001")
+			session.setConnected(true)
+			session.handle(tc.event)
+
+			emission := next(t, session)
+			if emission.Type != tc.want {
+				t.Fatalf("the session published %s, want %s", emission.Type, tc.want)
+			}
+			if emission.Retires != tc.retires {
+				t.Errorf("the emission retires the session: %v, want %v", emission.Retires, tc.retires)
+			}
+		})
 	}
 }

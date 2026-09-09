@@ -33,10 +33,16 @@ const (
 	ErrorOwnedElsewhere  ErrorCode = "owned_elsewhere"
 	// ErrorQuarantined is reserved: nothing sends it, because nothing quarantines.
 	//
-	// `redisx.Keys.Quarantine` names a key and no code writes or reads it, so a session
-	// that fails to connect over and over goes on being retried. A client sees the
-	// connect failures themselves and nothing that says the fleet has given up on the
-	// account for a while.
+	// `redisx.Keys.Quarantine` names a key and no code writes or reads it. What used to
+	// go with that is gone: a session the engine has finished with -- a temporary ban, a
+	// build WhatsApp will not talk to, a connect it refused -- now hands its lease back
+	// instead of being held by an instance with nothing left to try, so the account is
+	// there for whichever instance a client's next connect lands on.
+	//
+	// What is left for a quarantine is the part that needs a policy: a session that keeps
+	// connecting and dropping is nobody's to give up on yet, and there is no rule saying
+	// how many failures over what window make it one. Until there is, nothing refuses a
+	// command with this and a client sees the connect failures themselves.
 	ErrorQuarantined ErrorCode = "quarantined"
 	// ErrorClientOutdated is reserved: the condition is an event, not a reply.
 	//

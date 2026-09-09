@@ -328,6 +328,7 @@ func (c *Connector) loop(ctx context.Context, httpErr <-chan error) error {
 func (c *Connector) tick(ctx context.Context) time.Time {
 	due := time.Now().Add(c.cfg.Heartbeat)
 	c.manager.RenewAll(ctx)
+	c.manager.SweepRetired(ctx)
 	c.reclaimCommands(ctx)
 	c.announce(ctx)
 	c.metrics.SessionsRunning.Set(float64(c.manager.Count()))

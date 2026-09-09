@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -46,6 +47,12 @@ type Session struct {
 	stop     context.CancelFunc
 	done     chan struct{}
 	stopOnce sync.Once
+
+	// retired is set by the pump once it has published an emission the engine marked as
+	// its last. Read by the instance's heartbeat, which is what hands the lease back, so
+	// it is atomic rather than guarded: the two goroutines never touch anything else of
+	// each other's.
+	retired atomic.Bool
 
 	// queueMu guards the door to commands rather than the channel itself: the executor
 	// has to be able to say "nothing more comes in" and then empty what is left,
@@ -197,6 +204,12 @@ func (s *Session) Stop() {
 	<-s.done
 }
 
+// Retired reports whether the engine has said this session will not come back on its own.
+//
+// The lease goes back on the strength of it: an instance holding a session it has stopped
+// working on is an account no peer will try, which is worse than an account nobody owns.
+func (s *Session) Retired() bool { return s.retired.Load() }
+
 // Done is closed once both goroutines have returned.
 func (s *Session) Done() <-chan struct{} { return s.done }
 
@@ -223,12 +236,19 @@ func (s *Session) pump(ctx context.Context) {
 			if !ok {
 				return
 			}
-			s.publish(ctx, emission)
+			s.publish(ctx, &emission)
+			if emission.Retires {
+				// After the publish and not before it: the event says why the session is
+				// finished, and handing the lease back first would let another instance
+				// adopt the account and publish under a newer epoch, which is a client
+				// dropping the explanation as stale.
+				s.retired.Store(true)
+			}
 		}
 	}
 }
 
-func (s *Session) publish(ctx context.Context, emission engine.Emission) {
+func (s *Session) publish(ctx context.Context, emission *engine.Emission) {
 	if _, owned := s.leases.Owned(s.sid); !owned {
 		// Publishing under a lease this instance no longer holds writes a lower epoch
 		// after a higher one has already been seen, which is the one thing a client
@@ -309,7 +329,7 @@ func (s *Session) publish(ctx context.Context, emission engine.Emission) {
 // The engine's own reading where it gave one, and this moment where it did not: an event
 // that spent time in a queue is not news from now, and a reader deciding whether a moment
 // is still worth showing has only this to go on.
-func stamped(emission engine.Emission, published time.Time) int64 {
+func stamped(emission *engine.Emission, published time.Time) int64 {
 	if emission.At == 0 {
 		return published.UnixMilli()
 	}
@@ -349,7 +369,7 @@ func (s *Session) abandonPending(events <-chan engine.Emission) {
 			if !ok {
 				return
 			}
-			settle(emission, errStopped)
+			settle(&emission, errStopped)
 		default:
 			return
 		}
@@ -378,7 +398,7 @@ var errLostOwnership = errors.New("session: dropped an emission from a session o
 
 // settle reports a publish outcome to an engine that asked for one. Most emissions do
 // not: they are things the client is told about, not things WhatsApp is waiting on.
-func settle(emission engine.Emission, err error) {
+func settle(emission *engine.Emission, err error) {
 	if emission.Settle != nil {
 		emission.Settle(err)
 	}
@@ -682,7 +702,7 @@ func (s *Session) answer(ctx context.Context, command *protocol.Command, result 
 		return
 	}
 	failure := asProtocolError(err)
-	s.publish(ctx, engine.Emission{
+	s.publish(ctx, &engine.Emission{
 		Type:    protocol.EventCommandFailed,
 		Payload: mustMarshal(map[string]any{"command_id": command.ID, "type": command.Type, "error": failure}),
 	})

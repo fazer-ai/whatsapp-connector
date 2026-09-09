@@ -1202,13 +1202,13 @@ func mediaEvent(id string, content *waE2E.Message) *waEvents.Message {
 // Asking for a count is what makes it discriminating in both directions: an event that
 // does not come times out, and one that comes and was not expected leaves the handler
 // waiting on a settle nobody gives it.
-func deliver(t *testing.T, session *Session, event *waEvents.Message, count int) ([]engine.Emission, bool) {
+func deliver(t *testing.T, session *Session, event *waEvents.Message, count int) ([]*engine.Emission, bool) {
 	t.Helper()
 
 	acknowledged := make(chan bool, 1)
 	go func() { acknowledged <- session.receive(event) }()
 
-	emissions := make([]engine.Emission, 0, count)
+	emissions := make([]*engine.Emission, 0, count)
 	for range count {
 		emission := next(t, session)
 		emission.Settle(nil)
@@ -1225,7 +1225,7 @@ func deliver(t *testing.T, session *Session, event *waEvents.Message, count int)
 
 // mediaContentOf reads the media content back off a published message, the way a client
 // decoding the event does.
-func mediaContentOf(t *testing.T, emission engine.Emission) protocol.MediaContent {
+func mediaContentOf(t *testing.T, emission *engine.Emission) protocol.MediaContent {
 	t.Helper()
 
 	var payload struct {
@@ -1242,7 +1242,7 @@ func mediaContentOf(t *testing.T, emission engine.Emission) protocol.MediaConten
 	return payload.Message.Content
 }
 
-func assertFailure(t *testing.T, emission engine.Emission, reason string) {
+func assertFailure(t *testing.T, emission *engine.Emission, reason string) {
 	t.Helper()
 
 	if emission.Type != protocol.EventMediaDownloadFailed {

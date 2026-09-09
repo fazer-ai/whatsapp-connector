@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
@@ -149,3 +150,78 @@ func (quietPublisher) Publish(context.Context, *protocol.Event) error { return n
 type quietReplier struct{}
 
 func (quietReplier) Reply(context.Context, string, protocol.Reply) error { return nil }
+
+// A session the engine has finished with keeps its lease otherwise, and while it does no
+// peer tries the account: a fleet of three does not get three attempts at an account
+// WhatsApp will not talk to, it gets one instance holding it and two that never see it.
+//
+// Two instances, because the whole point is the second one being able to take it. The
+// account is owned by nobody in between, which is what a client's next connect adopts.
+func TestASessionTheEngineFinishedWithHandsItsLeaseBack(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+
+	engines := fake.New()
+	holder := NewManager(&ManagerConfig{
+		Instance: "inst-a", Engine: engines,
+		Leases:    cluster.NewLeases(client, "inst-a", cluster.Options{}),
+		Publisher: quietPublisher{}, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	t.Cleanup(func() { holder.StopAll(context.Background()) })
+	peer := NewManager(&ManagerConfig{
+		Instance: "inst-b", Engine: fake.New(),
+		Leases:    cluster.NewLeases(client, "inst-b", cluster.Options{}),
+		Publisher: quietPublisher{}, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	t.Cleanup(func() { peer.StopAll(context.Background()) })
+
+	const sid = "9c2b7d1e-0000-4000-8000-0000000000a2"
+	ctx := context.Background()
+	if _, err := holder.Adopt(ctx, sid); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	if _, err := peer.Adopt(ctx, sid); err == nil {
+		t.Fatal("a peer adopted a session another instance holds the lease for")
+	}
+
+	engineSession, running := engines.Session(sid)
+	if !running {
+		t.Fatal("the engine has no session for the account that was just adopted")
+	}
+	// The shape of a temporary ban: the event says why, and the engine says it has
+	// nothing left to try.
+	engineSession.EmitLast(protocol.EventSessionTemporaryBan, map[string]any{
+		"ban": map[string]any{"kind": "temporary", "reason": "spam"},
+	})
+
+	waitFor(t, func() bool {
+		holder.SweepRetired(ctx)
+		_, held := holder.leases.Owned(sid)
+		return !held
+	}, "the lease of a session the engine finished with was never handed back")
+
+	if _, err := peer.Adopt(ctx, sid); err != nil {
+		t.Fatalf("the peer could not take an account nobody owns: %v", err)
+	}
+}
+
+// waitFor polls a condition rather than sleeping to a deadline: the pump publishes on its
+// own goroutine, so what is being waited for is a hand-off and not a duration.
+func waitFor(t *testing.T, done func() bool, complaint string) {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if done() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal(complaint)
+}

@@ -329,7 +329,7 @@ func publishedNothingUnreadable(t *testing.T, session *Session, event *waEvents.
 	}
 }
 
-func unreadable(t *testing.T, session *Session, event *waEvents.UndecryptableMessage) (engine.Emission, bool) {
+func unreadable(t *testing.T, session *Session, event *waEvents.UndecryptableMessage) (*engine.Emission, bool) {
 	t.Helper()
 
 	acknowledged := make(chan bool, 1)
@@ -341,11 +341,11 @@ func unreadable(t *testing.T, session *Session, event *waEvents.UndecryptableMes
 		return emission, got
 	case <-time.After(2 * time.Second):
 		t.Fatal("the handler never came back")
-		return engine.Emission{}, false
+		return nil, false
 	}
 }
 
-func messageOf(t *testing.T, emission engine.Emission) protocol.InboundMessage {
+func messageOf(t *testing.T, emission *engine.Emission) protocol.InboundMessage {
 	t.Helper()
 
 	var body struct {

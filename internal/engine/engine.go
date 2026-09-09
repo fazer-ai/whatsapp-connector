@@ -36,6 +36,21 @@ type Emission struct {
 	// nothing to apply it to. The engine is the only layer that knows when the fact
 	// happened, so it is the one that says.
 	At int64
+	// Retires says this session has nothing left to do on its own once this emission is
+	// out: the engine is reporting a state it will not come back from without being told
+	// to try again. A temporary ban, a client WhatsApp will not talk to and a connect it
+	// refused are the three -- whatsmeow publishes each of them from the branch that told
+	// the socket to stay down, so no reconnection is coming.
+	//
+	// It travels on the emission rather than beside it because the order is the point.
+	// The event says what happened and this says the session is finished; a client that
+	// got the second first would see the account handed over with nothing saying why.
+	//
+	// What the connector does with it is hand the lease back. The account then belongs to
+	// nobody until a command adopts it again, which is what lets another instance be the
+	// one that tries -- and on an outdated client, one running a newer build.
+	Retires bool
+
 	// Settle, when it is set, is called exactly once with the outcome of publishing
 	// this emission: nil once the client can be assumed to have it, an error when it
 	// never reached the stream. It is what lets an engine hold WhatsApp's own

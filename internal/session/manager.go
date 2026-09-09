@@ -825,3 +825,32 @@ func (m *Manager) StopAll(ctx context.Context) {
 		m.Release(ctx, sid)
 	}
 }
+
+// SweepRetired hands back the lease of every session the engine has finished with.
+//
+// On the heartbeat, beside the renewals, because it is the same bookkeeping: a session
+// this instance has stopped working on is renewed forever otherwise, and while the lease
+// stands no peer tries the account. `RenewAll` deliberately renews without looking at
+// whether a session is connected -- a renewal skipped mid-reconnect hands an account to a
+// peer while this instance still holds a socket -- and this is not that check. The engine
+// has said the socket is down and staying down.
+//
+// Releasing stops the session and hands the lease back, so the account is owned by nobody
+// until a command adopts it again. Nothing here reconnects on its own, so the next attempt
+// is the client's to make, and it may land on any instance.
+func (m *Manager) SweepRetired(ctx context.Context) {
+	m.mu.RLock()
+	retired := make([]string, 0, len(m.sessions))
+	for sid, session := range m.sessions {
+		if session.Retired() {
+			retired = append(retired, sid)
+		}
+	}
+	m.mu.RUnlock()
+
+	for _, sid := range retired {
+		m.log.Info().Str("sid", sid).
+			Msg("handing back a session the engine will not bring back on its own")
+		m.Release(ctx, sid)
+	}
+}

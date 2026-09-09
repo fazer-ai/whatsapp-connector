@@ -195,7 +195,7 @@ func receiptEvent(kind waTypes.ReceiptType, ids ...string) *waEvents.Receipt {
 	}
 }
 
-func receiptPublishedBy(t *testing.T, session *Session, event *waEvents.Receipt) engine.Emission {
+func receiptPublishedBy(t *testing.T, session *Session, event *waEvents.Receipt) *engine.Emission {
 	t.Helper()
 
 	acknowledged := make(chan bool, 1)
