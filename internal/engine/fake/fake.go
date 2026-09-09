@@ -46,9 +46,13 @@ func (e *Engine) Open(_ context.Context, sid string) (engine.Session, error) {
 	if e.closed {
 		return nil, errors.New("fake: engine is closed")
 	}
-	if existing, ok := e.sessions[sid]; ok {
+	if existing, ok := e.sessions[sid]; ok && !existing.done() {
 		return existing, nil
 	}
+	// A session that has been closed is not one to hand out again: its emission channel
+	// is closed, so the reader on the other side has already stopped and everything the
+	// new owner publishes would go nowhere. An account released and adopted again is an
+	// ordinary sequence now, and the real engine opens a new session for it.
 	session := newSession(sid)
 	e.sessions[sid] = session
 	return session, nil
@@ -286,6 +290,14 @@ func (s *Session) giveUp() uint64 {
 		s.givenUp++
 	}
 	return s.givenUp
+}
+
+// done reports that this session has been closed, which is the end of it: nothing it is
+// asked afterwards reaches anybody.
+func (s *Session) done() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closed
 }
 
 // Close ends the session. Safe to call twice, because both an operator command and

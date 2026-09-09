@@ -849,8 +849,8 @@ func TestASweepDoesNotTakeASessionAnAdoptionIsWorkingOn(t *testing.T) {
 
 	// An adoption in flight, which is all the answer goroutine holding this looks like
 	// from the heartbeat.
-	manager.handing.Lock()
-	defer manager.handing.Unlock()
+	manager.holdHanding(sid)
+	defer manager.dropHanding(sid)
 
 	manager.releaseThis(ctx, sid, first)
 	if !slices.Contains(manager.SIDs(), sid) {
@@ -1234,5 +1234,115 @@ func TestASecondGivingUpIsNotAnsweredByTheFirstOnesEmission(t *testing.T) {
 	waitFor(t, session.Retired, "the session was never finished with")
 	if last := publisher.published(); last[len(last)-1] != protocol.EventSessionClientOutdated {
 		t.Fatalf("the pump published %v last, want %s", last[len(last)-1], protocol.EventSessionClientOutdated)
+	}
+}
+
+// A command taken off the queue before the door shut is one no door can call back, and a
+// connect among them can put a socket up after the pump has already decided the session
+// is finished with. The answer is asked of the engine again where it is acted on: an
+// account whose socket is back is not one to hand over, and the heartbeat closing that
+// socket would answer the client's connect with silence.
+func TestAConnectTakenBeforeTheDoorShutUndoesTheRetirement(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+
+	engines := fake.New()
+	leases := cluster.NewLeases(client, "inst-a", cluster.Options{})
+	manager := NewManager(&ManagerConfig{
+		Instance: "inst-a", Engine: engines, Leases: leases,
+		Publisher: quietPublisher{}, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	t.Cleanup(func() { manager.StopAll(context.Background()) })
+
+	const sid = "9c2b7d1e-0000-4000-8000-0000000000b8"
+	session, err := manager.Adopt(context.Background(), sid)
+	if err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, running := engines.Session(sid)
+	if !running {
+		t.Fatal("the engine has no session for the account that was just adopted")
+	}
+
+	engineSession.EmitLast(protocol.EventSessionConnectFailure, map[string]any{"reason": "unavailable"})
+	waitFor(t, func() bool { return session.retired.Load() }, "the session was never finished with")
+
+	// The connect that was already past the door, landing after the pump had decided.
+	if err := engineSession.Connect(context.Background(), engine.ConnectRequest{Pairing: "resume"}); err != nil {
+		t.Fatalf("the connect that was already past the door failed: %v", err)
+	}
+
+	if session.Retired() {
+		t.Fatal("a session whose socket is back up was still handed over")
+	}
+	manager.SweepRetired(context.Background(), manager.HandBackBy())
+	if _, held := leases.Owned(sid); !held {
+		t.Fatal("the sweep handed back the lease of an account whose socket is up")
+	}
+	if !engineSession.Connected() {
+		t.Fatal("the sweep closed a socket the client had just been told was open")
+	}
+
+	// And the door is open again, or the account is one this instance owns and refuses to
+	// carry anything out for.
+	if offered := session.Offer(&transport.Delivery{
+		Command: protocol.Command{
+			V: protocol.Version, ID: "c1", Type: protocol.CommandMessageSend, SID: sid,
+		},
+		Ack: func(context.Context) error { return nil }, Release: func() {},
+	}); offered != OfferAccepted {
+		t.Fatalf("the session answered %v after the retirement was undone, want %v", offered, OfferAccepted)
+	}
+}
+
+// The sweep runs on the goroutine that renews every lease this instance holds, and
+// adoptions run on the answer loop with a store read inside them. Shared by the manager
+// rather than by account, one wake in flight is every retired session left where it is --
+// and a fleet coming up has a wake for every account it owns, so the backlog would keep
+// the sweep from ever taking a turn and the accounts would be renewed for as long as it
+// lasted.
+func TestASweepIsNotHeldUpByAnAdoptionOfAnotherAccount(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+
+	engines := fake.New()
+	leases := cluster.NewLeases(client, "inst-a", cluster.Options{})
+	manager := NewManager(&ManagerConfig{
+		Instance: "inst-a", Engine: engines, Leases: leases,
+		Publisher: quietPublisher{}, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	t.Cleanup(func() { manager.StopAll(context.Background()) })
+
+	const retiring = "9c2b7d1e-0000-4000-8000-0000000000b9"
+	const other = "9c2b7d1e-0000-4000-8000-0000000000ba"
+	ctx := context.Background()
+	session, err := manager.Adopt(ctx, retiring)
+	if err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, running := engines.Session(retiring)
+	if !running {
+		t.Fatal("the engine has no session for the account that was just adopted")
+	}
+	engineSession.EmitLast(protocol.EventSessionConnectFailure, map[string]any{"reason": "unavailable"})
+	waitFor(t, session.Retired, "the session was never finished with")
+
+	// Another account being adopted, which is what a wake looks like from the heartbeat.
+	manager.holdHanding(other)
+	defer manager.dropHanding(other)
+
+	manager.SweepRetired(ctx, manager.HandBackBy())
+	if _, held := leases.Owned(retiring); held {
+		t.Fatal("an adoption of another account kept the sweep from handing a retired session back")
 	}
 }

@@ -53,6 +53,9 @@ type Session struct {
 	// it is atomic rather than guarded: the two goroutines never touch anything else of
 	// each other's.
 	retired atomic.Bool
+	// retiredOn is the giving-up the session was retired on, kept so the answer can be
+	// asked of the engine again when it is acted on.
+	retiredOn atomic.Uint64
 	// finishing is the same news half a step earlier: the pump has the engine's last
 	// emission in hand and has not published it yet. Publishing is a write to Redis and
 	// can take a while, and the executor runs alongside the pump -- a connect waiting in
@@ -245,7 +248,23 @@ func (s *Session) Stop() {
 //
 // The lease goes back on the strength of it: an instance holding a session it has stopped
 // working on is an account no peer will try, which is worse than an account nobody owns.
-func (s *Session) Retired() bool { return s.retired.Load() }
+//
+// The engine is asked again here rather than taken at the pump's word, because the pump's
+// word is about the moment it published. A connect taken off the queue before the door
+// shut is one no door can call back, and it can put a socket up after that moment: an
+// account whose socket is back is not one to hand over. Asked at the point the answer is
+// acted on, and the door opens again when the answer has changed.
+func (s *Session) Retired() bool {
+	if !s.retired.Load() {
+		return false
+	}
+	if s.engine.Finished() == s.retiredOn.Load() {
+		return true
+	}
+	s.retired.Store(false)
+	s.reopen()
+	return false
+}
 
 // Done is closed once both goroutines have returned.
 func (s *Session) Done() <-chan struct{} { return s.done }
@@ -306,6 +325,7 @@ func (s *Session) pump(ctx context.Context) {
 			// handing it back before the event is out lets another instance adopt the
 			// account and publish under a newer epoch, which is a client dropping the
 			// explanation as stale.
+			s.retiredOn.Store(emission.Attempt)
 			s.retired.Store(true)
 		}
 	}

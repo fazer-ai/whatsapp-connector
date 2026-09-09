@@ -37,19 +37,26 @@ type Manager struct {
 	mu       sync.RWMutex
 	sessions map[string]*Session
 
-	// handing keeps an adoption and a hand-back of the same instance's own lease from
-	// running through each other. Both go [look at the map, talk to Redis, change the
-	// map], on different goroutines -- adoptions on the answer loop, the sweep on the
-	// heartbeat -- and interleaved the release lands after the acquisition and deletes
-	// the lease the session that just started is running under: `cluster.Release` matches
-	// on the instance and nothing else, so it cannot tell one of this instance's leases
-	// from the next one. A peer can then take an account whose socket is still open here,
-	// which is the one thing the lease exists to prevent.
+	// handing names the accounts an adoption or a hand-back is working on, and keeps the
+	// two off each other. Both go [look at the map, talk to Redis, change the map], on
+	// different goroutines -- adoptions on the answer loop, the sweep on the heartbeat --
+	// and interleaved the release lands after the acquisition and deletes the lease the
+	// session that just started is running under: `cluster.Release` matches on the
+	// instance and nothing else, so it cannot tell one of this instance's leases from the
+	// next one. A peer can then take an account whose socket is still open here, which is
+	// the one thing the lease exists to prevent.
 	//
-	// The heartbeat never waits on it. An adoption holds it for as long as a store read
-	// takes, and a tick spent waiting that out is every other lease on this instance left
-	// unrenewed; a session the sweep skips is swept on the next tick instead.
-	handing sync.Mutex
+	// By account and not one lock for the manager: an adoption holds its account for as
+	// long as a store read takes, and a fleet coming up has a wake for every account it
+	// owns. One lock, and a queue of wakes would keep the sweep from ever taking a turn --
+	// retired sessions renewed for as long as the backlog lasts, which is this feature
+	// not happening at all.
+	//
+	// The heartbeat never waits on it either way: a session the sweep finds busy is swept
+	// on the next tick.
+	handingMu   sync.Mutex
+	handingBusy map[string]struct{}
+	handingFree *sync.Cond
 
 	// newly is the sessions adopted since the loop last asked, waiting to have what
 	// their previous owner left pending drained before anything newer is read for them.
@@ -122,20 +129,23 @@ func NewManager(cfg *ManagerConfig) *Manager {
 	if cfg.AnswerDepth <= 0 {
 		cfg.AnswerDepth = DefaultAnswerDepth
 	}
-	return &Manager{
-		instance:  cfg.Instance,
-		engine:    cfg.Engine,
-		leases:    cfg.Leases,
-		publisher: cfg.Publisher,
-		replier:   cfg.Replier,
-		ledger:    cfg.Ledger,
-		newID:     cfg.NewID,
-		now:       cfg.Now,
-		log:       cfg.Logger,
-		sessions:  make(map[string]*Session),
-		orphans:   make(map[string]struct{}),
-		answers:   make(chan answer, cfg.AnswerDepth),
+	manager := &Manager{
+		instance:    cfg.Instance,
+		engine:      cfg.Engine,
+		leases:      cfg.Leases,
+		publisher:   cfg.Publisher,
+		replier:     cfg.Replier,
+		ledger:      cfg.Ledger,
+		newID:       cfg.NewID,
+		now:         cfg.Now,
+		log:         cfg.Logger,
+		sessions:    make(map[string]*Session),
+		orphans:     make(map[string]struct{}),
+		handingBusy: make(map[string]struct{}),
+		answers:     make(chan answer, cfg.AnswerDepth),
 	}
+	manager.handingFree = sync.NewCond(&manager.handingMu)
+	return manager
 }
 
 // running is every session this instance holds, by sid, as it stands now.
@@ -183,8 +193,8 @@ const releaseTimeout = 2 * time.Second
 // It returns cluster.ErrNotOwner when another instance holds it, which is the ordinary
 // answer in a fleet and not a failure.
 func (m *Manager) Adopt(ctx context.Context, sid string) (*Session, error) {
-	m.handing.Lock()
-	defer m.handing.Unlock()
+	m.holdHanding(sid)
+	defer m.dropHanding(sid)
 
 	m.mu.RLock()
 	existing, running := m.sessions[sid]
@@ -947,6 +957,40 @@ func (m *Manager) SweepRetired(ctx context.Context, by time.Time) {
 // The pointer answers for a replacement that has already landed; `handing` answers for
 // one that is still being built, because the release that overtakes an adoption deletes
 // a live lease -- `cluster.Release` matches on the instance and nothing else.
+// holdHanding takes the turn for one account, waiting for whoever has it.
+func (m *Manager) holdHanding(sid string) {
+	m.handingMu.Lock()
+	defer m.handingMu.Unlock()
+	for {
+		if _, busy := m.handingBusy[sid]; !busy {
+			m.handingBusy[sid] = struct{}{}
+			return
+		}
+		m.handingFree.Wait()
+	}
+}
+
+// tryHoldHanding takes the turn for one account, or says it is taken. For the heartbeat,
+// which has other sessions to renew and cannot wait on a store read.
+func (m *Manager) tryHoldHanding(sid string) bool {
+	m.handingMu.Lock()
+	defer m.handingMu.Unlock()
+	if _, busy := m.handingBusy[sid]; busy {
+		return false
+	}
+	m.handingBusy[sid] = struct{}{}
+	return true
+}
+
+func (m *Manager) dropHanding(sid string) {
+	m.handingMu.Lock()
+	delete(m.handingBusy, sid)
+	m.handingMu.Unlock()
+	// Everyone, because the wait is per account and one broadcast is cheaper than keeping
+	// a queue per account for a wait that is almost never contended.
+	m.handingFree.Broadcast()
+}
+
 // forget takes a session out of the map and stops it, unless the map no longer holds the
 // one the caller was looking at.
 //
@@ -969,14 +1013,14 @@ func (m *Manager) forget(sid string, want *Session) bool {
 }
 
 func (m *Manager) releaseThis(ctx context.Context, sid string, want *Session) {
-	if !m.handing.TryLock() {
-		// An adoption of one of these accounts is under way. Tried and not taken: this
-		// runs on the heartbeat, and an adoption reads a store.
+	if !m.tryHoldHanding(sid) {
+		// An adoption of this account is under way. Tried and not taken: this runs on the
+		// heartbeat, and an adoption reads a store.
 		m.log.Debug().Str("sid", sid).
 			Msg("an adoption is under way; leaving a retired session for the next tick")
 		return
 	}
-	defer m.handing.Unlock()
+	defer m.dropHanding(sid)
 
 	if !m.forget(sid, want) {
 		return
