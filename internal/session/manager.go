@@ -485,7 +485,7 @@ func (m *Manager) mark(ctx context.Context, sid string, room time.Duration) {
 		// waiting on it.
 		return
 	}
-	marking, done := context.WithTimeout(ctx, room)
+	marking, done := context.WithTimeout(ctx, m.sharing(ctx, room))
 	err := m.leases.MarkHandingBack(marking, sid)
 	done()
 	if err != nil {
@@ -509,6 +509,21 @@ func (m *Manager) mark(ctx context.Context, sid string, room time.Duration) {
 // marking is how long a mark may take when nothing is waiting behind it.
 func (m *Manager) marking() time.Duration {
 	return min(releaseTimeout, m.leases.TTL()/ReleaseShare)
+}
+
+// sharing cuts a mark's bound down to what leaves the release behind it a turn.
+//
+// A caller that hands the whole hand-back a budget of its own -- an adoption that could
+// not open the session gets releaseTimeout for both halves -- would otherwise see the
+// mark spend all of it against a slow Redis, and the release run on a context that is
+// already over. What that costs is the opposite of what the mark is for: a lease left
+// naming an instance running nothing, until a later tick or the TTL takes it away.
+func (m *Manager) sharing(ctx context.Context, room time.Duration) time.Duration {
+	deadline, bounded := ctx.Deadline()
+	if !bounded {
+		return room
+	}
+	return min(room, time.Until(deadline)/2)
 }
 
 // markingAhead is the same for a mark that runs in front of a stop, and zero when the
@@ -1183,7 +1198,7 @@ func (m *Manager) givingUpAll(ctx context.Context, sids []string) {
 	// sized by its most nearly expired member is one that can run out before the request
 	// is even sent, and then nothing in it is marked. Which leases belong here is
 	// roomToMark's answer, and every one of them has a bound of its own to spend.
-	marking, done := context.WithTimeout(ctx, m.marking())
+	marking, done := context.WithTimeout(ctx, m.sharing(ctx, m.marking()))
 	err := m.leases.MarkManyHandingBack(marking, unmarked)
 	done()
 	if err != nil {

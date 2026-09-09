@@ -3139,3 +3139,74 @@ func TestEveryExpiringSocketComesDownBeforeAnyOfTheirLeasesGoBack(t *testing.T) 
 		}
 	}
 }
+
+// The mark and the release behind it share one budget wherever a caller hands the
+// hand-back a bound of its own. A mark that spends all of it against a slow Redis leaves
+// the release running on a context that is already over, and the lease goes on naming an
+// instance that is running nothing until a later tick or the TTL takes it away -- the
+// opposite of what the mark is for.
+func TestAMarkLeavesTheReleaseBehindItATurn(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr(), ContextTimeoutEnabled: true})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+	keys := client.Keys()
+
+	manager := NewManager(&ManagerConfig{
+		Instance: "inst-a", Engine: fake.New(),
+		Leases:    cluster.NewLeases(client, "inst-a", cluster.Options{}),
+		Publisher: quietPublisher{}, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	ctx := context.Background()
+	t.Cleanup(func() { manager.StopAll(ctx) })
+
+	const sid = "9c2b7d1e-0000-4000-8000-0000000000d4"
+	if _, err := manager.Adopt(ctx, sid); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	manager.stopSession(sid)
+
+	// A Redis that takes every lease script to the end of whatever context it is given,
+	// which is what a hand-back looks like when the network is the thing that is broken.
+	var attempts atomic.Int64
+	rdb.AddHook(waiting{on: func(cmd redis.Cmder) bool {
+		return strings.HasPrefix(cmd.Name(), "eval") && names(cmd, keys.HandBack(sid))
+	}, count: &attempts})
+
+	// The budget an adoption that could not open its session hands the whole hand-back.
+	handing, cancel := context.WithTimeout(ctx, releaseTimeout)
+	defer cancel()
+	manager.abandon(handing, sid)
+
+	if got := attempts.Load(); got != 2 {
+		t.Fatalf("the hand-back reached Redis %d time(s), want 2: the mark and the release that has to follow it", got)
+	}
+}
+
+// waiting holds a command until its own context is over, which is a Redis that answers
+// nothing rather than one that refuses, and counts the ones it held.
+type waiting struct {
+	on    func(redis.Cmder) bool
+	count *atomic.Int64
+}
+
+func (waiting) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (waiting) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+
+func (h waiting) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if !h.on(cmd) {
+			return next(ctx, cmd)
+		}
+		h.count.Add(1)
+		<-ctx.Done()
+		cmd.SetErr(ctx.Err())
+		return ctx.Err()
+	}
+}
