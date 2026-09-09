@@ -319,55 +319,60 @@ func TestOnlyAReactionIsRefusedOnAStatus(t *testing.T) {
 	}
 }
 
-// A channel names the post a reaction is on with a server id, not with a message key, and
-// carries it on a node of its own. Sent the ordinary way it goes out naming a key the
-// channel cannot resolve, WhatsApp accepts it, and nobody sees a reaction. See #34.
+// A channel names a post by a server id rather than by a message key, and the contract
+// carries no field one could arrive in. A reaction sent the ordinary way goes out naming a
+// key the channel cannot resolve, WhatsApp accepts it, and nobody sees a reaction (#34); a
+// deletion does the same and leaves the post in the channel, with nothing published to
+// anybody, so the only side that believes it is gone is the client that asked (#134).
+// Refusing is the honest answer to both until the id has somewhere to travel.
 //
-// An edit and a revoke are not in the same position: whatsmeow recognises both on the
-// newsletter path and rewrites the stanza id to the target's, so they are not refused and
-// a test that refused all three would pin the wrong rule.
-func TestOnlyAReactionIsRefusedOnAChannel(t *testing.T) {
+// An edit is not in the same position: whatsmeow rewrites the stanza id to the target's on
+// the newsletter path and the correction lands, measured on a real channel beside the
+// deletion that did not. A test that refused all three would pin the wrong rule.
+func TestOnlyTheChangeThatLandsIsCarriedOutOnAChannel(t *testing.T) {
 	t.Parallel()
 
 	session, _, _ := outboundSession(t)
 	const channel = `"to":{"kind":"newsletter","id":"120363000000000000"}`
 
-	_, err := session.react(t.Context(), &protocol.Command{
-		Type:    protocol.CommandMessageReact,
-		Payload: json.RawMessage(`{` + channel + `,"target_id":"3EB0A1B2C3D4E5F60718","emoji":"👍"}`),
-	})
-	assertCode(t, err, protocol.ErrorUnsupported)
-
-	// The other two reach the wire, where an unconnected session is what stops them --
-	// which is a different answer from `unsupported`, and the point.
 	for _, tc := range []struct {
 		name string
 		run  func() error
 	}{
-		{"an edit of a channel post", func() error {
-			_, err := session.edit(t.Context(), &protocol.Command{
-				Type: protocol.CommandMessageEdit,
-				Payload: json.RawMessage(`{` + channel + `,"target_id":"3EB0A1B2C3D4E5F60718",
-					"content":{"type":"text","body":"corrigido"}}`)})
+		{"a reaction to a channel post", func() error {
+			_, err := session.react(t.Context(), &protocol.Command{
+				Type:    protocol.CommandMessageReact,
+				Payload: json.RawMessage(`{` + channel + `,"target_id":"3EB0A1B2C3D4E5F60718","emoji":"👍"}`)})
 			return err
 		}},
-		{"a revoke of one", func() error {
+		{"a deletion of one", func() error {
 			_, err := session.revoke(t.Context(), &protocol.Command{
 				Type:    protocol.CommandMessageRevoke,
 				Payload: json.RawMessage(`{` + channel + `,"target_id":"3EB0A1B2C3D4E5F60718"}`)})
 			return err
 		}},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
+		t.Run("refused: "+tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			err := tc.run()
-			var coded *protocol.Error
-			if errors.As(err, &coded) && coded.Code == protocol.ErrorUnsupported {
-				t.Fatalf("%s was refused as unsupported, and whatsmeow carries it: %v", tc.name, err)
-			}
+			assertCode(t, tc.run(), protocol.ErrorUnsupported)
 		})
 	}
+
+	// The edit reaches the wire, where an unconnected session is what stops it -- which is
+	// a different answer from `unsupported`, and the point.
+	t.Run("carried out: an edit of a channel post", func(t *testing.T) {
+		t.Parallel()
+
+		_, err := session.edit(t.Context(), &protocol.Command{
+			Type: protocol.CommandMessageEdit,
+			Payload: json.RawMessage(`{` + channel + `,"target_id":"3EB0A1B2C3D4E5F60718",
+				"content":{"type":"text","body":"corrigido"}}`)})
+		var coded *protocol.Error
+		if errors.As(err, &coded) && coded.Code == protocol.ErrorUnsupported {
+			t.Fatalf("an edit of a channel post was refused as unsupported, and whatsmeow carries it: %v", err)
+		}
+	})
 }
 
 // wire records what a command actually handed to WhatsApp, which is the only place the
