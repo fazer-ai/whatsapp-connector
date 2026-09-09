@@ -131,9 +131,11 @@ theirs, and the connector is always upgraded first.
   member can exploit rather than the whole rule. A key that says the message is the
   deleter's own names the deleter, whatever participant it also carries, because that is
   how WhatsApp resolves it. Absent means the key named nobody WhatsApp reads, which is a
-  direct chat: a key there addresses the message by the conversation rather than by a
+  one-to-one chat: a key there addresses the message by the conversation rather than by a
   participant, so `sender` and `by` are the whole answer and a participant that turns up
-  in one is dropped rather than passed on. A `message.revoked` for a
+  in one is dropped rather than passed on. A message sent through a broadcast list is
+  shown in the direct conversation with whoever sent it and is published there, but its
+  key is a list's and carries the field. A `message.revoked` for a
   group always carries the field -- a key with neither a participant nor `from_me` names
   no message, and this connector drops that deletion rather than publishing one no phone
   applied -- so a client can require it there.

@@ -590,7 +590,7 @@ func (s *Session) revokeOf(event *waEvents.Message) change {
 	if event.Info.IsFromMe {
 		by = protocol.RevokedBySelf
 	}
-	author := s.claimedAuthor(event, chat)
+	author := s.claimedAuthor(event)
 	if author == nil && chat.Kind == protocol.AddressGroup {
 		// In a group a key identifies a message by its participant, or by `from_me` where
 		// it is the sender's own. A key carrying neither -- or naming something that is
@@ -629,7 +629,7 @@ func (s *Session) revokeOf(event *waEvents.Message) change {
 // parties are all there is. An unreadable participant is nil for the same reason a mention
 // that will not parse is dropped -- the client keeps the behaviour it had before the field
 // existed, rather than losing the deletion over the annotation on it.
-func (s *Session) claimedAuthor(event *waEvents.Message, chat protocol.Address) *protocol.Party {
+func (s *Session) claimedAuthor(event *waEvents.Message) *protocol.Party {
 	key := event.Message.GetProtocolMessage().GetKey()
 	var claiming []waTypes.JID
 	if key.GetFromMe() {
@@ -645,7 +645,7 @@ func (s *Session) claimedAuthor(event *waEvents.Message, chat protocol.Address) 
 		// account on the deployment shares, and naming the author by it would put another
 		// operator's pairing on this event and into what this session learns from it.
 		claiming = []waTypes.JID{event.Info.Sender, wireAlt(&event.Info)}
-	} else if directChat(chat) {
+	} else if directChat(event.Info.Chat) {
 		// A chat's key carries no participant and is not read for one. WhatsApp addresses
 		// a message there by the conversation, which is why `BuildMessageKey` writes a
 		// participant only outside a chat and `getOrigSenderFromKey` reads the key's own
@@ -697,10 +697,21 @@ func (s *Session) claimedAuthor(event *waEvents.Message, chat protocol.Address) 
 	return &author
 }
 
-// directChat reports whether a conversation is one person talking to another, which is the
-// only kind whose key names no participant.
-func directChat(chat protocol.Address) bool {
-	return chat.Kind == protocol.AddressPhone || chat.Kind == protocol.AddressLID
+// directChat reports whether a conversation's key names no participant, which is what
+// WhatsApp does in a one-to-one chat and nowhere else. The servers are whatsmeow's own
+// list, from the `BuildMessageKey` that decides where to write one.
+//
+// Off the stanza's own chat rather than the address this connector publishes, and a
+// broadcast is why the two differ: a message sent through a list shows up in the direct
+// conversation with whoever sent it, so that is where this publishes it, while the key
+// stays a list's -- participant and all.
+func directChat(chat waTypes.JID) bool {
+	switch chat.Server {
+	case waTypes.DefaultUserServer, waTypes.HiddenUserServer, waTypes.MessengerServer:
+		return true
+	default:
+		return false
+	}
 }
 
 // whereAndWho is the half of these three events that does not depend on which one it is.

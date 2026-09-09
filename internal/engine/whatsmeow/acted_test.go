@@ -421,6 +421,7 @@ func TestADeletionCarriesTheAuthorItsKeyClaims(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
 		group       bool
+		broadcast   bool
 		participant string
 		fromMe      bool
 		want        string
@@ -448,6 +449,13 @@ func TestADeletionCarriesTheAuthorItsKeyClaims(t *testing.T) {
 		// honours, and the claim is what makes its comparison pass.
 		{name: "a direct chat, where the key names a participant anyway",
 			participant: "5511999990001@" + waTypes.DefaultUserServer, want: ""},
+		// A broadcast is published in the direct conversation with whoever sent it,
+		// because that is where WhatsApp shows it, and its key is a list's all the same:
+		// `BuildMessageKey` writes a participant everywhere but a one-to-one chat. Read
+		// off the published address, this would take the claim off the one event whose
+		// two chats disagree.
+		{name: "a broadcast, published as the direct chat it shows up in", broadcast: true,
+			participant: author + "@" + waTypes.DefaultUserServer, want: author},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -458,6 +466,10 @@ func TestADeletionCarriesTheAuthorItsKeyClaims(t *testing.T) {
 			if tc.group {
 				event.Info.Chat = waTypes.NewJID("120363000000000000", waTypes.GroupServer)
 				event.Info.IsGroup = true
+			}
+			if tc.broadcast {
+				event.Info.Chat = waTypes.NewJID("5511999990001", waTypes.BroadcastServer)
+				event.Info.Sender = waTypes.NewJID(author, waTypes.DefaultUserServer)
 			}
 			if tc.participant != "" {
 				event.Message.GetProtocolMessage().GetKey().Participant = proto.String(tc.participant)
@@ -1023,7 +1035,7 @@ func TestADeletionsAuthorIsNamedByWhatTheStanzaCarried(t *testing.T) {
 				Key:  &waCommon.MessageKey{FromMe: proto.Bool(true), ID: proto.String("3EB0")},
 			},
 		},
-	}, protocol.Address{Kind: protocol.AddressGroup, ID: "120363000000000001"})
+	})
 	if author == nil {
 		t.Fatal("the deletion named no author at all")
 	}
