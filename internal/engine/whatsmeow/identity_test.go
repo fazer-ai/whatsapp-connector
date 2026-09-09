@@ -1,8 +1,12 @@
 package whatsmeow
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"testing"
+
+	waStore "go.mau.fi/whatsmeow/store"
 
 	waSyncAction "go.mau.fi/whatsmeow/proto/waSyncAction"
 	waTypes "go.mau.fi/whatsmeow/types"
@@ -412,4 +416,84 @@ func TestAResolveKeepsARenameTheTableDidNotTake(t *testing.T) {
 	if party := resolved(t, result); party["push_name"] != "Atendimento" {
 		t.Errorf("the account is called %v, want the name the table never took", party)
 	}
+}
+
+// A rename that is already stale must not be filed. Two of them can be in flight at once:
+// whatsmeow dispatches an app-state sync from a goroutine of its own and the notify on a
+// message the account sent from the one that read it, so the older handler can resume
+// after the newer has filed its name and put the older name back over it. The session
+// would then be holding one name, the table another, and nothing left saying so.
+func TestARenameDoesNotFileANameTheSessionHasLeft(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	own := waTypes.NewJID("5511999990001", waTypes.DefaultUserServer)
+	session.handle(&waEvents.PushNameSetting{
+		Action: &waSyncAction.PushNameSetting{Name: proto.String("Atendimento")},
+	})
+
+	// The older handler, resuming with the name the account has already left.
+	session.recordOwnName("Antigo")
+
+	contact, err := session.current().Store.Contacts.GetContact(t.Context(), own)
+	if err != nil {
+		t.Fatalf("GetContact: %v", err)
+	}
+	if contact.PushName != "Atendimento" {
+		t.Errorf("the table has the account down as %q, want the name it renamed itself to last", contact.PushName)
+	}
+	if names := session.names(); names.unfiled {
+		t.Error("the session says its name is unfiled after the write that took it")
+	}
+}
+
+// The name is filed under both of the account's addresses, and a read takes the first row
+// that holds one. The phone row is read first, so a rename that reached only the LID row
+// is still a rename the answer would miss.
+func TestARenameStaysUnfiledWhenARowDidNotTake(t *testing.T) {
+	t.Parallel()
+
+	const lid = "111222333444555"
+
+	session, _ := newTestSession(t, "5511999990001")
+	client := session.current()
+	own := waTypes.NewJID("5511999990001", waTypes.DefaultUserServer)
+	client.Store.LID = waTypes.NewJID(lid, waTypes.HiddenUserServer)
+	session.handle(&waEvents.Connected{})
+	drain(t, session)
+	if _, _, err := client.Store.Contacts.PutPushName(t.Context(), own, "Antigo"); err != nil {
+		t.Fatalf("PutPushName: %v", err)
+	}
+
+	// Only the phone row refuses the write, which is the row a read goes to first.
+	client.Store.Contacts = &refusingContacts{ContactStore: client.Store.Contacts, refuse: own}
+
+	session.handle(&waEvents.PushNameSetting{
+		Action: &waSyncAction.PushNameSetting{Name: proto.String("Atendimento")},
+	})
+	if names := session.names(); !names.unfiled {
+		t.Error("the session says its name is filed after the row a read prefers refused it")
+	}
+
+	result, err := session.Execute(t.Context(), resolveCommand(t, `{"party":{"kind":"phone","id":"5511999990001"}}`))
+	if err != nil {
+		t.Fatalf("contact.resolve: %v", err)
+	}
+	if party := resolved(t, result); party["push_name"] != "Atendimento" {
+		t.Errorf("the account is called %v, want the name the row would not take", party)
+	}
+}
+
+// refusingContacts is a contact store that will not file a push name for one address, and
+// is otherwise the store it wraps.
+type refusingContacts struct {
+	waStore.ContactStore
+	refuse waTypes.JID
+}
+
+func (r *refusingContacts) PutPushName(ctx context.Context, user waTypes.JID, pushName string) (changed bool, previous string, err error) {
+	if user.User == r.refuse.User && user.Server == r.refuse.Server {
+		return false, "", errors.New("this row is not taking writes")
+	}
+	return r.ContactStore.PutPushName(ctx, user, pushName)
 }

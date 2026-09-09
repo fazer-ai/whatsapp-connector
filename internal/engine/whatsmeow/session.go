@@ -437,6 +437,11 @@ type Session struct {
 	// write that failed is exactly the case where that would answer with a name the
 	// account has already left behind.
 	pushUnfiled bool
+	// naming serialises the filing of the push name, which is the one session field whose
+	// write reaches further than this struct. It is not `mu`: the write is a store round
+	// trip, and holding the session lock across one would stall every other reader for as
+	// long as the database takes.
+	naming sync.Mutex
 	// phone and lid are this session's copy of what it paired. whatsmeow assigns the
 	// same fields on its pairing goroutine, so reading them off the client from a
 	// command is a race; this is written from the event handler and read under the
@@ -914,10 +919,20 @@ func (s *Session) recordOwnName(pushName string) {
 	if client == nil || client.Store == nil || client.Store.Contacts == nil {
 		return
 	}
+	// One filing at a time, and only for the name the session is still holding. Two
+	// renames can be in flight on different goroutines -- an app-state sync dispatches on
+	// one of its own, the notify on a message the account sent on the one that read it --
+	// and without this the older write can land after the newer one and leave the table
+	// holding a name the session has already stopped saying is unfiled.
+	s.naming.Lock()
+	defer s.naming.Unlock()
+	if s.names().push != pushName {
+		return
+	}
 	phone, lid := s.identity()
 	writing, done := context.WithTimeout(s.ctx, s.storeLimit)
 	defer done()
-	filed := false
+	filed, missed := false, false
 	for _, address := range []protocol.Address{
 		{Kind: protocol.AddressPhone, ID: phone},
 		{Kind: protocol.AddressLID, ID: lid},
@@ -927,16 +942,21 @@ func (s *Session) recordOwnName(pushName string) {
 		}
 		jid, err := jidOf(address)
 		if err != nil {
+			missed = true
 			continue
 		}
 		if _, _, err := client.Store.Contacts.PutPushName(writing, jid, pushName); err != nil {
 			s.log.Debug().Err(err).Str("kind", string(address.Kind)).
 				Msg("could not file the account's own push name")
+			missed = true
 			continue
 		}
 		filed = true
 	}
-	if !filed {
+	// Every address the account answers under, or the name is still unfiled. A read takes
+	// the first row that holds a name and the phone row is read first, so one row left
+	// behind is enough to answer with the name the account has left.
+	if !filed || missed {
 		return
 	}
 	s.mu.Lock()
