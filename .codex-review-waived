@@ -480,3 +480,14 @@ internal/engine/whatsmeow/session.go: Order concurrent renames before replacing 
 # marker with the name it describes, which is a durable outbox for a display annotation that
 # the next rename repairs on its own. Recorded in fazer-ai/whatsapp-connector#140.
 internal/engine/whatsmeow/session.go: Preserve failed name writes across session recreation  # PR#139
+# PR#144: real, and not this PR's to close. `handingBack` reads a map in this process, so a
+# wake consumed by a peer while this instance is handing a lease back is acknowledged as
+# somebody else's and the account is left with nothing to start it. That is main's behaviour
+# for every hand-back -- `StopAll` runs one per session on every SIGTERM, which is every
+# rolling deploy -- and not something the retirement path introduces; it only adds another
+# caller of the same `abandon`. Closing it needs state a peer can read, which means a key
+# every instance in a fleet writes and reads, with a mixed-version story of its own during
+# the deploy that is exactly when `StopAll` is handing everything back. Recorded in
+# fazer-ai/whatsapp-connector#145, with the note that `cooldown:<sid>` is already written on
+# every release and read by nobody, so the marker may well belong there.
+internal/session/manager.go: Make in-flight hand-backs visible to peer consumers  # PR#144

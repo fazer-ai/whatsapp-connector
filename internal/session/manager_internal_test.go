@@ -714,3 +714,66 @@ func TestACommandAlreadyQueuedWhenTheSessionRetiresIsLeftForItsNextOwner(t *test
 		t.Fatal("a connect queued before the engine finished with the session dialled anyway")
 	}
 }
+
+// A hand-back and an adoption of the same account are both [look at the map, talk to
+// Redis, change the map], on two goroutines. Run through each other, the release lands
+// after the acquisition and deletes the lease the session that just started is running
+// under -- the release matches on the instance and nothing else -- and a peer takes an
+// account whose socket is open here. Neither half may step into the other.
+func TestAHandBackAndAnAdoptionOfTheSameAccountDoNotOverlap(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+
+	engines := fake.New()
+	leases := cluster.NewLeases(client, "inst-a", cluster.Options{})
+	manager := NewManager(&ManagerConfig{
+		Instance: "inst-a", Engine: engines, Leases: leases,
+		Publisher: quietPublisher{}, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	t.Cleanup(func() { manager.StopAll(context.Background()) })
+
+	const sid = "9c2b7d1e-0000-4000-8000-0000000000b1"
+	ctx := context.Background()
+	first, err := manager.Adopt(ctx, sid)
+	if err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, running := engines.Session(sid)
+	if !running {
+		t.Fatal("the engine has no session for the account that was just adopted")
+	}
+	engineSession.EmitLast(protocol.EventSessionConnectFailure, map[string]any{"reason": "unavailable"})
+	waitFor(t, func() bool { return first.Retired() }, "the session was never finished with")
+
+	// An adoption in flight, which is all the answer goroutine holding this looks like
+	// from the heartbeat.
+	manager.handing.Lock()
+	manager.releaseThis(ctx, sid, first)
+	if !slices.Contains(manager.SIDs(), sid) {
+		t.Fatal("the sweep handed a session back from under an adoption of the same account")
+	}
+	if _, held := leases.Owned(sid); !held {
+		t.Fatal("the sweep released a lease an adoption of the same account was working on")
+	}
+
+	// And the other way round: a hand-back in flight is one an adoption waits out, or it
+	// wins the lease in time for the release to delete it.
+	adopted := make(chan struct{})
+	go func() {
+		defer close(adopted)
+		_, _ = manager.Adopt(ctx, sid)
+	}()
+	select {
+	case <-adopted:
+		t.Fatal("an adoption ran while a hand-back for the same account was under way")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	manager.handing.Unlock()
+	<-adopted
+}

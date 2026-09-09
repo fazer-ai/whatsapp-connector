@@ -37,6 +37,20 @@ type Manager struct {
 	mu       sync.RWMutex
 	sessions map[string]*Session
 
+	// handing keeps an adoption and a hand-back of the same instance's own lease from
+	// running through each other. Both go [look at the map, talk to Redis, change the
+	// map], on different goroutines -- adoptions on the answer loop, the sweep on the
+	// heartbeat -- and interleaved the release lands after the acquisition and deletes
+	// the lease the session that just started is running under: `cluster.Release` matches
+	// on the instance and nothing else, so it cannot tell one of this instance's leases
+	// from the next one. A peer can then take an account whose socket is still open here,
+	// which is the one thing the lease exists to prevent.
+	//
+	// The heartbeat never waits on it. An adoption holds it for as long as a store read
+	// takes, and a tick spent waiting that out is every other lease on this instance left
+	// unrenewed; a session the sweep skips is swept on the next tick instead.
+	handing sync.Mutex
+
 	// newly is the sessions adopted since the loop last asked, waiting to have what
 	// their previous owner left pending drained before anything newer is read for them.
 	//
@@ -158,6 +172,9 @@ const releaseTimeout = 2 * time.Second
 // It returns cluster.ErrNotOwner when another instance holds it, which is the ordinary
 // answer in a fleet and not a failure.
 func (m *Manager) Adopt(ctx context.Context, sid string) (*Session, error) {
+	m.handing.Lock()
+	defer m.handing.Unlock()
+
 	m.mu.RLock()
 	existing, running := m.sessions[sid]
 	m.mu.RUnlock()
@@ -907,12 +924,19 @@ func (m *Manager) SweepRetired(ctx context.Context, by time.Time) {
 // sid alone, this would then stop the session that just started and delete the lease it
 // is running under, and arm the cooldown that keeps this instance from taking it back.
 //
-// What is left is the gap between forgetting the session and the release reaching Redis,
-// which `releaseOrphans` names as well and for the same reason: the release matches on
-// the instance and nothing else, so one that overtakes an adoption deletes a live lease.
-// Closing it needs the lease itself to carry the epoch, which is a change to what every
-// instance in a fleet reads, not to this loop.
+// The pointer answers for a replacement that has already landed; `handing` answers for
+// one that is still being built, because the release that overtakes an adoption deletes
+// a live lease -- `cluster.Release` matches on the instance and nothing else.
 func (m *Manager) releaseThis(ctx context.Context, sid string, want *Session) {
+	if !m.handing.TryLock() {
+		// An adoption of one of these accounts is under way. Tried and not taken: this
+		// runs on the heartbeat, and an adoption reads a store.
+		m.log.Debug().Str("sid", sid).
+			Msg("an adoption is under way; leaving a retired session for the next tick")
+		return
+	}
+	defer m.handing.Unlock()
+
 	m.mu.Lock()
 	session, ok := m.sessions[sid]
 	if !ok || session != want {
