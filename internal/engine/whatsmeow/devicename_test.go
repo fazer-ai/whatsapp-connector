@@ -4,8 +4,8 @@ import (
 	"testing"
 
 	"github.com/rs/zerolog"
+	"go.mau.fi/whatsmeow/proto/waCompanionReg"
 	waStore "go.mau.fi/whatsmeow/store"
-	"google.golang.org/protobuf/proto"
 )
 
 // The device name is a package-level value in whatsmeow, and its pairing handshake reads
@@ -22,7 +22,7 @@ import (
 // everything the binary goes on to do, and New finds the Once spent and never writes
 // again: one side of the racing pair stops existing rather than being scheduled around.
 func init() {
-	deviceNameOnce.Do(func() { waStore.DeviceProps.Os = proto.String("fazer.ai test") })
+	deviceNameOnce.Do(func() { applyDeviceIdentity(waStore.DeviceProps, "fazer.ai test") })
 }
 
 // And the fix is only worth as much as that claim: if New could still write, init would
@@ -35,5 +35,23 @@ func TestBuildingAnEngineNoLongerWritesTheDeviceName(t *testing.T) {
 	if after := waStore.DeviceProps.GetOs(); after != before {
 		t.Fatalf("building an engine wrote the device name (%q -> %q), which is the write "+
 			"a pairing handshake races", before, after)
+	}
+}
+
+// What the account's own screen shows about this companion, and the one part of the
+// handshake a person reads. Both halves are asserted because either one alone is what
+// makes the row stand out: a browser name on an UNKNOWN platform, or a platform with a
+// product's name on it.
+func TestTheDeviceIdentityReadsAsABrowser(t *testing.T) {
+	t.Parallel()
+
+	props := &waCompanionReg.DeviceProps{}
+	applyDeviceIdentity(props, "Chrome")
+
+	if os := props.GetOs(); os != "Chrome" {
+		t.Errorf("Os = %q, want the name it was given", os)
+	}
+	if platform := props.GetPlatformType(); platform != waCompanionReg.DeviceProps_CHROME {
+		t.Errorf("PlatformType = %v, want CHROME so the entry matches the name beside it", platform)
 	}
 }
