@@ -83,13 +83,13 @@ func (a *alias) observe(ctx context.Context, jids ...waTypes.JID) {
 		if !pairable(jid) {
 			continue
 		}
-		address, addressable := addressOf(jid)
+		canonical, addressable := canonicalJID(jid)
 		switch {
 		case !addressable:
-		case address.Kind == protocol.AddressPhone && phone.IsEmpty():
-			phone = jid.ToNonAD()
-		case address.Kind == protocol.AddressLID && lid.IsEmpty():
-			lid = jid.ToNonAD()
+		case canonical.Server == waTypes.DefaultUserServer && phone.IsEmpty():
+			phone = canonical
+		case canonical.Server == waTypes.HiddenUserServer && lid.IsEmpty():
+			lid = canonical
 		}
 	}
 	if phone.IsEmpty() || lid.IsEmpty() {
@@ -97,10 +97,39 @@ func (a *alias) observe(ctx context.Context, jids ...waTypes.JID) {
 	}
 	a.mu.Lock()
 	if a.generation == learning {
+		// Whatever each half was paired with before goes with it. A number can be handed
+		// to somebody else, who has a LID of their own, and leaving the reverse entry
+		// behind would leave two handles claiming one number -- and the answer would
+		// depend on which of the two a caller happened to ask about.
+		if stale, paired := a.seen[phone.String()]; paired && stale != lid {
+			delete(a.seen, stale.String())
+		}
+		if stale, paired := a.seen[lid.String()]; paired && stale != phone {
+			delete(a.seen, stale.String())
+		}
 		a.seen[phone.String()] = lid
 		a.seen[lid.String()] = phone
 	}
 	a.mu.Unlock()
+}
+
+// canonicalJID is the one spelling of a JID that every path here agrees on.
+//
+// WhatsApp names one person over four domains -- `s.whatsapp.net` and `c.us` for a number,
+// `lid` and `hosted.lid` for a handle, plus `hosted` -- and the contract collapses them
+// into two kinds. A map keyed by what arrived would answer for the spelling it was taught
+// and miss the same person under another, which is the canonical-address rule holding
+// inside this connector as well as on the wire.
+func canonicalJID(jid waTypes.JID) (waTypes.JID, bool) {
+	address, addressable := addressOf(jid)
+	if !addressable {
+		return waTypes.EmptyJID, false
+	}
+	canonical, err := jidOf(address)
+	if err != nil {
+		return waTypes.EmptyJID, false
+	}
+	return canonical, true
 }
 
 // lookup answers the other namespace's JID for one, and whether there is one to have.
@@ -112,7 +141,11 @@ func (a *alias) lookup(s *Session, jid waTypes.JID) (waTypes.JID, bool) {
 	if !pairable(jid) {
 		return waTypes.EmptyJID, false
 	}
-	key := jid.ToNonAD().String()
+	canonical, addressable := canonicalJID(jid)
+	if !addressable {
+		return waTypes.EmptyJID, false
+	}
+	key := canonical.String()
 
 	a.mu.RLock()
 	known, remembered := a.seen[key]

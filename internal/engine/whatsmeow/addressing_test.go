@@ -241,3 +241,57 @@ func TestTheAccountsOwnPairingNeedsNothingToHaveShownIt(t *testing.T) {
 		t.Errorf("the account's own chat went out as %+v (ok=%v), want its LID", chat, ok)
 	}
 }
+
+// WhatsApp names one person over four domains and the contract collapses them into two
+// kinds, so a pairing learned under one spelling has to answer under the other. A map
+// keyed by what arrived would answer for `c.us` and miss the same person on
+// `s.whatsapp.net`, which is where every address this connector builds for itself lands.
+func TestAPairingIsFoundUnderEverySpellingOfTheAddress(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setConnected(true)
+
+	looking, done := session.looking()
+	defer done()
+
+	// The pairing as an older stanza spells it.
+	session.aliases.observe(looking,
+		waTypes.NewJID("5511999990010", waTypes.LegacyUserServer),
+		waTypes.NewJID("167392323834042", waTypes.HostedLIDServer))
+
+	if named := session.party(looking, waTypes.NewJID("5511999990010", waTypes.DefaultUserServer)); named.LID != "167392323834042" {
+		t.Errorf("the party is %+v, want the pairing learned under the other spelling", named)
+	}
+	if named := session.party(looking, waTypes.NewJID("167392323834042", waTypes.HiddenUserServer)); named.Phone != "5511999990010" {
+		t.Errorf("the party is %+v, want the pairing learned under the other spelling", named)
+	}
+}
+
+// A number can be handed to somebody else, and that person has a handle of their own. The
+// pairing that arrives replaces the one that was there, and the entry pointing back from
+// the handle it replaced goes with it: left behind, two handles would claim one number and
+// the answer would depend on which of them a caller happened to ask about.
+func TestANumberPairedAgainLeavesNoHandleBehind(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setConnected(true)
+
+	looking, done := session.looking()
+	defer done()
+
+	phone := waTypes.NewJID("5511999990011", waTypes.DefaultUserServer)
+	before := waTypes.NewJID("167392323834043", waTypes.HiddenUserServer)
+	after := waTypes.NewJID("167392323834044", waTypes.HiddenUserServer)
+
+	session.aliases.observe(looking, phone, before)
+	session.aliases.observe(looking, phone, after)
+
+	if named := session.party(looking, phone); named.LID != "167392323834044" {
+		t.Errorf("the party is %+v, want the handle the number is paired with now", named)
+	}
+	if named := session.party(looking, before); named.Phone != "" {
+		t.Errorf("the party is %+v, still claiming a number that is paired elsewhere", named)
+	}
+}
