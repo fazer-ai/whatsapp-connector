@@ -188,13 +188,22 @@ func receiptChatJID(event *waEvents.Receipt) waTypes.JID {
 }
 
 // receiptChatAlt is the chat's other address, where the chat is somebody rather than a
-// group: `RecipientAlt` names whoever is on the other end of the conversation, and a group
-// has no second namespace to name.
+// group.
+//
+// Which field holds it depends on which way the receipt goes, because both name the far
+// end of the conversation and only one is filled in at a time. A receipt for a message
+// this account sent from another of its devices names the peer as the recipient, and
+// `parseMessageSource` reads `peer_recipient_pn` or `peer_recipient_lid` only on that
+// branch; a receipt somebody else sent names them as the sender. A group has no second
+// namespace to name, and neither does a broadcast list.
 func receiptChatAlt(event *waEvents.Receipt) waTypes.JID {
 	if event.IsGroup || !event.BroadcastListOwner.IsEmpty() {
 		return waTypes.EmptyJID
 	}
-	return event.RecipientAlt
+	if event.IsFromMe {
+		return event.RecipientAlt
+	}
+	return event.SenderAlt
 }
 
 var receiptKinds = map[waTypes.ReceiptType]protocol.ReceiptKind{
