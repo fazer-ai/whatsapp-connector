@@ -190,7 +190,7 @@ restart, and reports itself healthy while doing it.
 | `WAC_EVENT_SHARDS` | `8` | How many event streams the fleet publishes to. Fleet-wide and effectively permanent: an instance that disagrees with what is recorded refuses to start |
 | `WAC_ENGINE` | `fake` | `whatsmeow` for a real account, `fake` for a fleet with nothing behind it |
 | `WAC_DATABASE_URL` | none | Where pairings live. `postgres://…`, `sqlite:…` or `file:…`. Required by the `whatsmeow` engine |
-| `WAC_DEVICE_NAME` | `fazer.ai` | What the account's linked-devices list shows. Fleet-wide, not per session: whatsmeow keeps device properties process-wide |
+| `WAC_DEVICE_NAME` | `Chrome` | What the account's linked-devices list shows, paired with a CHROME platform so the entry reads like the web session it behaves as. A browser's name because that is what the list is full of, and a row naming a product nobody recognises is the one part of the handshake that says out loud this is not a browser. Fleet-wide, not per session: whatsmeow keeps device properties process-wide |
 | `WAC_HTTP_ADDR` | `:8080` | Where `/healthz`, `/readyz` and `/metrics` listen |
 | `WAC_ADVERTISE_URL` | derived | How clients reach this instance for media |
 | `WAC_MEDIA_ROOT` | unset | Where inbound media is cached. Unset turns the store and the endpoint off, and every media message is then published with `media.download_failed` behind it |

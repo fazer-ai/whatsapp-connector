@@ -81,7 +81,16 @@ const (
 // DefaultDeviceName is what the account's linked-devices list shows for a session this
 // connector paired. It is fleet-wide rather than per session, because whatsmeow keeps
 // device properties process-wide.
-const DefaultDeviceName = "fazer.ai"
+//
+// A browser's name, because that is what the list is full of: every other companion in
+// it is WhatsApp Web on some machine, and a row naming a product nobody recognises is
+// the one thing in the whole handshake that says out loud this is not a browser. The
+// generation before this connector reached the same place from the other side, sending
+// Baileys' `Browsers.windows("Chrome")`.
+//
+// An operator who wants their own name here sets WAC_DEVICE_NAME, and should know what
+// it costs: the account's own screen is not the only place this is read.
+const DefaultDeviceName = "Chrome"
 
 // DefaultEventShards is how many event streams a fleet publishes to. It is fleet-wide
 // and effectively permanent: changing it re-hashes every session onto a different

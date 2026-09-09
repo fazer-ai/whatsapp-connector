@@ -18,12 +18,27 @@ import (
 
 	"github.com/rs/zerolog"
 	wm "go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/proto/waCompanionReg"
 	waStore "go.mau.fi/whatsmeow/store"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/engine"
 	"github.com/fazer-ai/whatsapp-connector/internal/store"
 )
+
+// applyDeviceIdentity writes both halves of what the account's linked-devices list shows.
+//
+// The name alone is half an answer: whatsmeow leaves the platform UNKNOWN, and a
+// companion naming an OS no browser has, on a platform nothing sets, stands out in a
+// list whose every other row is a browser on somebody's machine. Written together so the
+// entry reads as the web session this behaves as.
+//
+// Takes the properties to write rather than reaching for the package-level ones, so the
+// claim can be tested without touching a value a pairing handshake elsewhere is reading.
+func applyDeviceIdentity(props *waCompanionReg.DeviceProps, name string) {
+	props.Os = proto.String(name)
+	props.PlatformType = waCompanionReg.DeviceProps_CHROME.Enum()
+}
 
 // deviceNameOnce guards the one write to whatsmeow's process-wide device properties.
 var deviceNameOnce sync.Once
@@ -92,7 +107,7 @@ func New(container *store.Container, opts Options, log zerolog.Logger) (*Engine,
 		// socket. A process that built a second engine while the first was pairing would
 		// have the Once find nothing to do, so there is still only ever the one write --
 		// and it is already long done.
-		deviceNameOnce.Do(func() { waStore.DeviceProps.Os = proto.String(deviceName) })
+		deviceNameOnce.Do(func() { applyDeviceIdentity(waStore.DeviceProps, deviceName) })
 	}
 	return &Engine{
 		store:    container,
