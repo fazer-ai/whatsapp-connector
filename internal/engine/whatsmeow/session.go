@@ -1438,7 +1438,7 @@ func (s *Session) abandonPairing(run *pairingRun, client *wm.Client, reason stri
 	// the same one for the outcomes WhatsApp reports. Outside it, an attempt that ends
 	// here while its reader is reporting a timeout publishes both.
 	if reason != "" {
-		s.publishPairingFailure(reason, err, false)
+		s.publishPairingFailure(reason, err)
 	}
 	s.tearDownPairing(run, client)
 }
@@ -2648,7 +2648,7 @@ func (s *Session) finishPairing(run *pairingRun, reason string, err error) {
 	if !s.endPairing(run) {
 		return
 	}
-	s.publishPairingFailure(reason, err, s.isTerminal())
+	s.publishPairingFailure(reason, err)
 	// The socket does not always go with the outcome. A code scanned on a phone without
 	// multidevice leaves the client connected with its pairing channel live, and
 	// whatsmeow will not open a second one on a live socket: the operator's corrected
@@ -2710,7 +2710,7 @@ func qrDataURL(code string) (string, error) {
 // on the wire. A `PairDatabaseError` or a protobuf failure carries SQL and internals
 // that mean nothing to an operator and should not reach a client's UI; the detail stays
 // in the log, where whoever is debugging it can find it.
-func (s *Session) publishPairingFailure(reason string, err error, retires bool) {
+func (s *Session) publishPairingFailure(reason string, err error) {
 	if err != nil {
 		s.log.Warn().Err(err).Str("reason", reason).Msg("a pairing failed")
 	}
@@ -2728,7 +2728,13 @@ func (s *Session) publishPairingFailure(reason string, err error, retires bool) 
 	s.refuseLateConnect()
 	s.offline()
 	closing := map[string]any{"state": "close", "reason": "pairing_" + reason}
-	if retires {
+	// Asked here and not taken from the caller. Every way a pairing ends publishes this
+	// same closing state, and each of them can be the one that ends a session whatsmeow
+	// will not bring back: a dial that failed, a channel that reported an outcome, an
+	// error WhatsApp named. A caller that answers for itself is a caller that can be
+	// added without the question being asked at all, and then the account is held by an
+	// instance with nothing left to try.
+	if s.isTerminal() {
 		// The run is over and WhatsApp refused this build, so nothing here is going to
 		// connect: the account goes back rather than being held by an instance whose
 		// image is the reason it cannot pair. On the run's last event, so the pairing's
@@ -2948,7 +2954,7 @@ func (s *Session) handle(rawEvent any) bool {
 		if s.pairingActive() {
 			return true
 		}
-		s.publishPairingFailure("pair_error", event.Error, false)
+		s.publishPairingFailure("pair_error", event.Error)
 	}
 	return true
 }

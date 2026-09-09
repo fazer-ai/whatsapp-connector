@@ -53,6 +53,18 @@ type Session struct {
 	// it is atomic rather than guarded: the two goroutines never touch anything else of
 	// each other's.
 	retired atomic.Bool
+	// finishing is the same news half a step earlier: the pump has the engine's last
+	// emission in hand and has not published it yet. Publishing is a write to Redis and
+	// can take a while, and the executor runs alongside the pump -- a connect waiting in
+	// the queue would be carried out in that gap, dial an account this session is
+	// finished with, and answer the client that it worked, moments before the heartbeat
+	// stops the socket it opened.
+	//
+	// Kept apart from `retired` because they answer different questions. The door shuts
+	// when the engine says its last word; the lease goes back only once that word is out,
+	// so an emission that never landed puts the door back rather than handing an account
+	// away with nothing published to say why.
+	finishing atomic.Bool
 
 	// queueMu guards the door to commands rather than the channel itself: the executor
 	// has to be able to say "nothing more comes in" and then empty what is left,
@@ -160,7 +172,7 @@ const (
 func (s *Session) Offer(delivery *transport.Delivery) Offer {
 	s.queueMu.Lock()
 	defer s.queueMu.Unlock()
-	if s.stopping || s.retired.Load() {
+	if s.stopping || s.finishing.Load() {
 		// Retired is stopping that has not happened yet: the heartbeat hands the lease
 		// back on its next tick, and until it does this session is still in the map and
 		// still answers. A connect served in that window dials an account this instance
@@ -242,14 +254,30 @@ func (s *Session) pump(ctx context.Context) {
 			if !ok {
 				return
 			}
-			// After the publish and only on one that landed. The event says why the
-			// session is finished: handing the lease back before it is out lets another
-			// instance adopt the account and publish under a newer epoch, which is a
-			// client dropping the explanation as stale, and handing it back after one
-			// that never reached the stream retires the account with nobody told at all.
-			if s.publish(ctx, &emission) && emission.Retires {
-				s.retired.Store(true)
+			// Before the publish, because publishing is a write to Redis and the
+			// executor runs alongside this: a connect waiting in the queue would
+			// otherwise be carried out in that gap, on a session the engine has already
+			// said its last word about.
+			if emission.Retires {
+				s.finishing.Store(true)
 			}
+			landed := s.publish(ctx, &emission)
+			if !emission.Retires {
+				continue
+			}
+			if !landed {
+				// Nobody heard it, so nothing is finished with. Handing the lease back on
+				// an event that never reached the stream retires the account with the
+				// client never told why, and a command refused while this was in flight
+				// was left pending and comes back.
+				s.finishing.Store(s.retired.Load())
+				continue
+			}
+			// The lease goes back only now. The event says why the session is finished:
+			// handing it back before the event is out lets another instance adopt the
+			// account and publish under a newer epoch, which is a client dropping the
+			// explanation as stale.
+			s.retired.Store(true)
 		}
 	}
 }
@@ -435,7 +463,7 @@ func (s *Session) execute(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case delivery := <-s.commands:
-			if s.retired.Load() {
+			if s.finishing.Load() {
 				// Queued before the engine finished with the session, which `Offer` can
 				// no longer refuse because it was already taken. Carried out, a connect
 				// waiting here dials an account the next tick hands away and answers the

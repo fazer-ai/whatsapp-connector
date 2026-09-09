@@ -138,6 +138,17 @@ func NewManager(cfg *ManagerConfig) *Manager {
 	}
 }
 
+// running is every session this instance holds, by sid, as it stands now.
+func (m *Manager) running() map[string]*Session {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	sessions := make(map[string]*Session, len(m.sessions))
+	for sid, session := range m.sessions {
+		sessions[sid] = session
+	}
+	return sessions
+}
+
 // SIDs lists the sessions this instance is running, which is what the command reader
 // subscribes to.
 func (m *Manager) SIDs() []string {
@@ -789,7 +800,14 @@ func (m *Manager) RenewAll(ctx context.Context, by time.Time) {
 	// sessions this instance carries. The tearing down that follows is per session by
 	// nature -- each one stops its own socket -- but it only touches the ones a renewal
 	// refused, which on an ordinary tick is none.
-	sids := m.SIDs()
+	// By session and not by sid alone: an adoption replaces a retired session with a
+	// fresh one under the same sid, on another goroutine, and an answer about the session
+	// before it must not be carried out on the one that replaced it.
+	running := m.running()
+	sids := make([]string, 0, len(running))
+	for sid := range running {
+		sids = append(sids, sid)
+	}
 	renewals := m.leases.RenewMany(ctx, sids)
 
 	var released []string
@@ -815,12 +833,13 @@ func (m *Manager) RenewAll(ctx context.Context, by time.Time) {
 		} else {
 			m.log.Warn().Str("sid", sid).Msg("lost a lease; stopping the session")
 		}
-		m.mu.Lock()
-		session, ok := m.sessions[sid]
-		delete(m.sessions, sid)
-		m.mu.Unlock()
-		if ok {
-			session.Stop()
+		if !m.forget(sid, running[sid]) {
+			// Adopted again since the renewal went out, which means a lease won after
+			// this answer was already stale. Stopping that session would leave an account
+			// nobody runs, and handing its lease back would delete a live one.
+			m.log.Warn().Str("sid", sid).
+				Msg("a session was adopted again while its renewal was in flight; leaving the new one alone")
+			continue
 		}
 		if errors.Is(err, cluster.ErrNotOwner) {
 			// Somebody else's now, and Renew has already forgotten it locally. Nothing
@@ -927,6 +946,27 @@ func (m *Manager) SweepRetired(ctx context.Context, by time.Time) {
 // The pointer answers for a replacement that has already landed; `handing` answers for
 // one that is still being built, because the release that overtakes an adoption deletes
 // a live lease -- `cluster.Release` matches on the instance and nothing else.
+// forget takes a session out of the map and stops it, unless the map no longer holds the
+// one the caller was looking at.
+//
+// Adoptions run on the answer goroutine, and one of them replaces a retired session with
+// a fresh one under the same sid. A caller acting on an answer about the session before
+// it -- a renewal that was refused, a sweep that found it finished with -- would then
+// stop a session that is running and leave the lease it won behind.
+func (m *Manager) forget(sid string, want *Session) bool {
+	m.mu.Lock()
+	session, ok := m.sessions[sid]
+	if !ok || session != want {
+		m.mu.Unlock()
+		return false
+	}
+	delete(m.sessions, sid)
+	m.mu.Unlock()
+
+	session.Stop()
+	return true
+}
+
 func (m *Manager) releaseThis(ctx context.Context, sid string, want *Session) {
 	if !m.handing.TryLock() {
 		// An adoption of one of these accounts is under way. Tried and not taken: this
@@ -937,15 +977,8 @@ func (m *Manager) releaseThis(ctx context.Context, sid string, want *Session) {
 	}
 	defer m.handing.Unlock()
 
-	m.mu.Lock()
-	session, ok := m.sessions[sid]
-	if !ok || session != want {
-		m.mu.Unlock()
+	if !m.forget(sid, want) {
 		return
 	}
-	delete(m.sessions, sid)
-	m.mu.Unlock()
-
-	session.Stop()
 	m.abandon(ctx, sid)
 }

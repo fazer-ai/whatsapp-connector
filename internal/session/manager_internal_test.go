@@ -291,6 +291,15 @@ type stalledRedis struct {
 	// what lets a test say "the round trip is in flight" without waiting on a clock.
 	swallowed chan struct{}
 	once      sync.Once
+
+	// holdReply keeps the next answer coming back from the server, and `reached` says it
+	// is being kept. One answer and not the connection, so everything the test does
+	// meanwhile still reaches Redis: it is how a caller is held between asking and
+	// hearing, which is where the interesting interleavings live.
+	holdReply atomic.Bool
+	reached   chan struct{}
+	let       chan struct{}
+	reachedOn sync.Once
 }
 
 func stallable(t *testing.T, backend string) *stalledRedis {
@@ -302,6 +311,7 @@ func stallable(t *testing.T, backend string) *stalledRedis {
 	}
 	hop := &stalledRedis{
 		listener: listener, held: make(chan struct{}), swallowed: make(chan struct{}),
+		reached: make(chan struct{}), let: make(chan struct{}),
 	}
 	t.Cleanup(func() {
 		close(hop.held)
@@ -319,8 +329,8 @@ func stallable(t *testing.T, backend string) *stalledRedis {
 				_ = near.Close()
 				return
 			}
-			go hop.carry(far, near)
-			go hop.carry(near, far)
+			go hop.carry(far, near, false)
+			go hop.carry(near, far, true)
 		}
 	}()
 	return hop
@@ -330,7 +340,10 @@ func (s *stalledRedis) addr() string { return s.listener.Addr().String() }
 
 func (s *stalledRedis) stall() { s.stalled.Store(true) }
 
-func (s *stalledRedis) carry(dst, src net.Conn) {
+// holdNextAnswer keeps the next answer the server sends until `let` is closed.
+func (s *stalledRedis) holdNextAnswer() { s.holdReply.Store(true) }
+
+func (s *stalledRedis) carry(dst, src net.Conn, answers bool) {
 	defer func() { _, _ = dst.Close(), src.Close() }()
 	buf := make([]byte, 4096)
 	for {
@@ -340,6 +353,10 @@ func (s *stalledRedis) carry(dst, src net.Conn) {
 				s.once.Do(func() { close(s.swallowed) })
 				<-s.held
 				return
+			}
+			if answers && s.holdReply.CompareAndSwap(true, false) {
+				s.reachedOn.Do(func() { close(s.reached) })
+				<-s.let
 			}
 			if _, err := dst.Write(buf[:n]); err != nil {
 				return
@@ -776,4 +793,151 @@ func TestAHandBackAndAnAdoptionOfTheSameAccountDoNotOverlap(t *testing.T) {
 
 	manager.handing.Unlock()
 	<-adopted
+}
+
+// A renewal is a round trip, and the answer describes the session as it was when the
+// question went out. An adoption on the answer goroutine can replace a retired session
+// while it is in flight, winning a lease of its own, and a teardown that acts on the sid
+// alone then stops the session that is running and leaves its lease where it is: Redis
+// names this instance for an account it does not run, and the wakes that would restart it
+// are acknowledged as somebody else's.
+func TestARenewalThatWasRefusedDoesNotStopTheSessionThatReplacedIt(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	hop := stallable(t, server.Addr())
+	rdb := redis.NewClient(&redis.Options{Addr: hop.addr(), ContextTimeoutEnabled: true})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+
+	engines := fake.New()
+	leases := cluster.NewLeases(client, "inst-a", cluster.Options{})
+	manager := NewManager(&ManagerConfig{
+		Instance: "inst-a", Engine: engines, Leases: leases,
+		Publisher: quietPublisher{}, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	t.Cleanup(func() { manager.StopAll(context.Background()) })
+
+	const sid = "9c2b7d1e-0000-4000-8000-0000000000b2"
+	ctx := context.Background()
+	first, err := manager.Adopt(ctx, sid)
+	if err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, running := engines.Session(sid)
+	if !running {
+		t.Fatal("the engine has no session for the account that was just adopted")
+	}
+	engineSession.EmitLast(protocol.EventSessionConnectFailure, map[string]any{"reason": "unavailable"})
+	waitFor(t, func() bool { return first.Retired() }, "the session was never finished with")
+
+	// One renewal that changes nothing, so the script is cached: the first EVALSHA of a
+	// run answers NOSCRIPT and is retried as an EVAL, and holding that first answer would
+	// hold the retry rather than the renewal.
+	manager.RenewAll(ctx, manager.HandBackBy())
+
+	// The lease is gone by the time the renewal runs, which is what makes the answer a
+	// refusal and the account free for the retry to take.
+	server.Del(client.Keys().Lease(sid))
+
+	hop.holdNextAnswer()
+	renewed := make(chan struct{})
+	go func() {
+		defer close(renewed)
+		manager.RenewAll(ctx, manager.HandBackBy())
+	}()
+	<-hop.reached
+
+	// The retry, while the renewal is between asking and hearing.
+	second, err := manager.Adopt(ctx, sid)
+	if err != nil {
+		t.Fatalf("the retry could not be adopted: %v", err)
+	}
+	if second == first {
+		t.Fatal("the retry was answered with the session that is on its way out")
+	}
+	close(hop.let)
+	<-renewed
+
+	if !slices.Contains(manager.SIDs(), sid) {
+		t.Fatal("a refused renewal stopped the session that replaced the one it asked about")
+	}
+	if _, held := leases.Owned(sid); !held {
+		t.Fatal("a refused renewal took the lease of the session that replaced the one it asked about")
+	}
+}
+
+// Publishing is a write to Redis, and the executor runs alongside the pump. A connect
+// waiting in the queue while the engine's last word is being written would dial an
+// account this session is finished with and answer the client that it worked, moments
+// before the heartbeat stops the socket it opened.
+func TestASessionTakesNoCommandWhileItsLastWordIsGoingOut(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+
+	engines := fake.New()
+	publisher := &heldPublisher{
+		holds:   protocol.EventSessionConnectFailure,
+		entered: make(chan struct{}),
+		let:     make(chan struct{}),
+	}
+	manager := NewManager(&ManagerConfig{
+		Instance: "inst-a", Engine: engines,
+		Leases:    cluster.NewLeases(client, "inst-a", cluster.Options{}),
+		Publisher: publisher, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	t.Cleanup(func() { manager.StopAll(context.Background()) })
+
+	const sid = "9c2b7d1e-0000-4000-8000-0000000000b3"
+	session, err := manager.Adopt(context.Background(), sid)
+	if err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, running := engines.Session(sid)
+	if !running {
+		t.Fatal("the engine has no session for the account that was just adopted")
+	}
+
+	engineSession.EmitLast(protocol.EventSessionConnectFailure, map[string]any{"reason": "unavailable"})
+	<-publisher.entered
+
+	offered := session.Offer(&transport.Delivery{
+		Command: protocol.Command{
+			V: protocol.Version, ID: "c1", Type: protocol.CommandSessionConnect, SID: sid,
+		},
+		Ack:     func(context.Context) error { return nil },
+		Release: func() {},
+	})
+	close(publisher.let)
+	if offered != OfferStopped {
+		t.Fatalf("the session answered %v to a connect while its last word was going out, want %v",
+			offered, OfferStopped)
+	}
+	waitFor(t, session.Retired, "the session was never finished with")
+	if engineSession.Connected() {
+		t.Fatal("a connect taken while the last word was going out dialled anyway")
+	}
+}
+
+// heldPublisher keeps one event type inside Publish until it is let go, which is what a
+// Redis that is slow rather than away looks like from the pump.
+type heldPublisher struct {
+	holds   protocol.EventType
+	entered chan struct{}
+	once    sync.Once
+	let     chan struct{}
+}
+
+func (p *heldPublisher) Publish(_ context.Context, event *protocol.Event) error {
+	if event.Type == p.holds {
+		p.once.Do(func() { close(p.entered) })
+		<-p.let
+	}
+	return nil
 }

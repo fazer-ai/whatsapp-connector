@@ -1270,7 +1270,7 @@ func TestAPairingThatEndedTakesTheConnectionWithIt(t *testing.T) {
 		t.Fatalf("state = %q while pairing, want connecting", state)
 	}
 
-	session.publishPairingFailure("timeout", nil, false)
+	session.publishPairingFailure("timeout", nil)
 
 	if emission := next(t, session); emission.Type != protocol.EventPairingError {
 		t.Fatalf("published %q first, want the pairing error", emission.Type)
@@ -1722,7 +1722,7 @@ func TestATerminalTransitionRefusesTheConnectQueuedBehindIt(t *testing.T) {
 			session.handle(&waEvents.StreamReplaced{})
 		},
 		"a pairing that failed": func(session *Session) {
-			session.publishPairingFailure("timeout", nil, false)
+			session.publishPairingFailure("timeout", nil)
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -2768,5 +2768,43 @@ func TestAnOutcomeRacingAPairingsEndingLetsThePairingCarryTheMark(t *testing.T) 
 	}
 	if refused.Retires {
 		t.Error("a refused connect took the mark from a pairing that was already publishing its own ending")
+	}
+}
+
+// A dial that failed ends the pairing from a path of its own, detached from the command
+// that started it, and publishes the same closing state every other ending publishes. The
+// event that says WhatsApp refused the connection reaches the handler at the same time,
+// and with a pairing running it is not the one that can carry the mark: if this ending
+// does not carry it either, nothing does, and the account is held by an instance with
+// nothing left to try.
+func TestAPairingGivenUpOnAfterARefusedConnectFinishesTheSession(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "")
+	pairCtx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	run := session.startPairing(pairCtx, cancel)
+
+	session.handle(&waEvents.ConnectFailure{Reason: waEvents.ConnectFailureServiceUnavailable})
+	refused := next(t, session)
+	if refused.Type != protocol.EventSessionConnectFailure {
+		t.Fatalf("the session published %s, want %s", refused.Type, protocol.EventSessionConnectFailure)
+	}
+	if refused.Retires {
+		t.Error("the refused connect finished the session while its pairing had still to end")
+	}
+
+	session.abandonPairing(run, session.current(), "connect_failed", errors.New("dial refused"))
+
+	failed := next(t, session)
+	if failed.Type != protocol.EventPairingError {
+		t.Fatalf("the pairing published %s, want %s", failed.Type, protocol.EventPairingError)
+	}
+	closed := next(t, session)
+	if closed.Type != protocol.EventSessionState {
+		t.Fatalf("the pairing published %s last, want %s", closed.Type, protocol.EventSessionState)
+	}
+	if !closed.Retires {
+		t.Error("a pairing given up on after a connect WhatsApp refused left the session holding its lease")
 	}
 }
