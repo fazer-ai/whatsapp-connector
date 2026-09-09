@@ -1117,19 +1117,22 @@ func (m *Manager) givingUpAllAhead(ctx context.Context, sids []string) {
 		return
 	}
 
-	// Only the leases with room to spend, and bounded by the tightest of those. One
-	// session whose lease has run out must not stand between every other socket and the
-	// mark that keeps its account from being left unowned; its own mark comes after its
-	// stop, where nothing is waiting.
+	// Only the leases with a whole bound of their own to spend, and the bound is not
+	// shrunk to fit the tightest of them. A batch sized by its most nearly expired member
+	// is one that can run out before the request is even sent, and then nothing in it is
+	// marked: one lease near its end would cost every other account in the shutdown the
+	// mark that keeps it from being left unowned.
+	//
+	// What is left out loses nothing it could have had. A lease with less than a bound of
+	// life is one no mark can outlive anyway, so its socket comes down first and its mark
+	// goes out behind the stop, where nothing is waiting on it.
 	room := m.marking()
 	ahead := make([]string, 0, len(unmarked))
 	for _, sid := range unmarked {
-		left := m.leases.Freshness(sid)
-		if left <= 0 {
+		if m.leases.Freshness(sid) < room {
 			continue
 		}
 		ahead = append(ahead, sid)
-		room = min(room, left)
 	}
 	if len(ahead) == 0 {
 		return

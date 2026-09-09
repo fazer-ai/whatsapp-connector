@@ -2789,3 +2789,78 @@ func TestOneStaleLeaseDoesNotSuppressTheMarksOfTheRest(t *testing.T) {
 		t.Fatal("one lease that had run out kept every other session in the shutdown from being marked, so a peer's wake for a live account is acknowledged as somebody else's")
 	}
 }
+
+// A batch sized by its most nearly expired member is one that can run out before the
+// request is even sent, and then nothing in it is marked: one lease near its end would
+// cost every other account in the shutdown the mark that keeps it from being left
+// unowned. Being near the end is not being over it, so the check cannot be for zero.
+func TestANearlyExpiredLeaseIsLeftOutOfTheShutdownBatch(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+	keys := client.Keys()
+
+	const ttl = 3 * time.Second
+	clock := &steppingClock{now: time.Now()}
+	held := &heldPublisher{
+		holds:   protocol.EventSessionState,
+		entered: make(chan protocol.EventType),
+		let:     make(chan struct{}),
+	}
+	engines := fake.New()
+	manager := NewManager(&ManagerConfig{
+		Instance: "inst-a", Engine: engines,
+		Leases: cluster.NewLeases(client, "inst-a", cluster.Options{
+			TTL: ttl, Margin: ttl / 10, Clock: clock,
+		}),
+		Publisher: held, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+
+	const ending = "9c2b7d1e-0000-4000-8000-0000000000cb"
+	const fresh = "9c2b7d1e-0000-4000-8000-0000000000cc"
+	ctx := context.Background()
+	if _, err := manager.Adopt(ctx, ending); err != nil {
+		t.Fatalf("Adopt %s: %v", ending, err)
+	}
+	// Ten milliseconds of lease left: more than none, and less than the round trip a mark
+	// would need, which is exactly the case a check for zero lets through.
+	clock.step(ttl - ttl/10 - 10*time.Millisecond)
+	if _, err := manager.Adopt(ctx, fresh); err != nil {
+		t.Fatalf("Adopt %s: %v", fresh, err)
+	}
+
+	// The fresh session's stop is parked in the pump, so everything Redis has been asked
+	// by then is the batch in front of the stops and nothing else.
+	freshSession, running := engines.Session(fresh)
+	if !running {
+		t.Fatalf("the engine has no session for %s", fresh)
+	}
+	var markedFresh, markedEnding atomic.Bool
+	rdb.AddHook(watching{after: func(cmd redis.Cmder) {
+		if names(cmd, keys.HandBack(fresh)) {
+			markedFresh.Store(true)
+		}
+		if names(cmd, keys.HandBack(ending)) {
+			markedEnding.Store(true)
+		}
+	}})
+	freshSession.Emit(protocol.EventSessionState, map[string]any{"state": "connected"})
+	<-held.entered
+
+	stopped := make(chan struct{})
+	t.Cleanup(func() { <-stopped })
+	t.Cleanup(held.release)
+	go func() {
+		defer close(stopped)
+		manager.StopAll(ctx)
+	}()
+
+	waitFor(t, markedFresh.Load, "the shutdown never marked the lease that had room for it, so a peer wake for it is acknowledged as somebody else's")
+	if markedEnding.Load() {
+		t.Fatal("a lease with less life than a mark needs went into the shared batch, where its deadline is every other account's too")
+	}
+}
