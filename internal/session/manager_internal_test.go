@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"slices"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -204,7 +205,7 @@ func TestASessionTheEngineFinishedWithHandsItsLeaseBack(t *testing.T) {
 	})
 
 	waitFor(t, func() bool {
-		holder.SweepRetired(ctx)
+		holder.SweepRetired(ctx, holder.HandBackBy())
 		_, held := holder.leases.Owned(sid)
 		return !held
 	}, "the lease of a session the engine finished with was never handed back")
@@ -286,6 +287,10 @@ type stalledRedis struct {
 	listener net.Listener
 	stalled  atomic.Bool
 	held     chan struct{}
+	// swallowed closes on the first request the hop takes and never answers, which is
+	// what lets a test say "the round trip is in flight" without waiting on a clock.
+	swallowed chan struct{}
+	once      sync.Once
 }
 
 func stallable(t *testing.T, backend string) *stalledRedis {
@@ -295,7 +300,9 @@ func stallable(t *testing.T, backend string) *stalledRedis {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	hop := &stalledRedis{listener: listener, held: make(chan struct{})}
+	hop := &stalledRedis{
+		listener: listener, held: make(chan struct{}), swallowed: make(chan struct{}),
+	}
 	t.Cleanup(func() {
 		close(hop.held)
 		_ = listener.Close()
@@ -330,6 +337,7 @@ func (s *stalledRedis) carry(dst, src net.Conn) {
 		n, err := src.Read(buf)
 		if n > 0 {
 			if s.stalled.Load() {
+				s.once.Do(func() { close(s.swallowed) })
 				<-s.held
 				return
 			}
@@ -410,7 +418,7 @@ func TestASweepGivesUpOnARedisThatStoppedAnswering(t *testing.T) {
 	swept := make(chan struct{})
 	go func() {
 		defer close(swept)
-		manager.SweepRetired(context.Background())
+		manager.SweepRetired(context.Background(), manager.HandBackBy())
 	}()
 	select {
 	case <-swept:
@@ -528,5 +536,181 @@ func TestASweepDoesNotHandBackASessionAdoptedAgainSinceItLooked(t *testing.T) {
 	// Forgotten and stopped are the same step, so the map answers for both.
 	if !slices.Contains(manager.SIDs(), sid) {
 		t.Fatal("the sweep stopped the session that replaced the one it found")
+	}
+}
+
+// The tick hands leases back twice: the renewals give up what they lost, and the sweep
+// gives up what the engine finished with. The budget is the tick's, not each pass's --
+// the startup check that decides whether a lease TTL is configurable at all prices one
+// hand-back tail into it (`app.Config`), and a second one nobody priced is a renewal that
+// lands on a lease a peer has already taken while this instance holds the socket open.
+func TestASweepTakesOnlyWhatTheRenewalsLeftOfTheTick(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	hop := stallable(t, server.Addr())
+	rdb := redis.NewClient(&redis.Options{Addr: hop.addr(), ContextTimeoutEnabled: true})
+	t.Cleanup(func() { _ = rdb.Close() })
+
+	// A lease worth six seconds, so a pass that makes its own window would take two.
+	const ttl = 6 * time.Second
+	engines := fake.New()
+	leases := cluster.NewLeases(redisx.Wrap(rdb, "wa:", 8), "inst-a", cluster.Options{TTL: ttl})
+	manager := NewManager(&ManagerConfig{
+		Instance: "inst-a", Engine: engines, Leases: leases,
+		Publisher: quietPublisher{}, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	t.Cleanup(func() {
+		quick, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		defer cancel()
+		manager.StopAll(quick)
+	})
+
+	const sid = "9c2b7d1e-0000-4000-8000-0000000000a7"
+	session, err := manager.Adopt(context.Background(), sid)
+	if err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, running := engines.Session(sid)
+	if !running {
+		t.Fatal("the engine has no session for the account that was just adopted")
+	}
+	engineSession.EmitLast(protocol.EventSessionConnectFailure, map[string]any{"reason": "unavailable"})
+	waitFor(t, func() bool { return session.Retired() }, "the session was never finished with")
+
+	hop.stall()
+	// The renewals ran first and spent all but a moment of the tick's budget, which is
+	// the deadline the sweep is handed rather than a fresh window of its own.
+	nearlySpent := time.Now().Add(150 * time.Millisecond)
+	swept := make(chan struct{})
+	go func() {
+		defer close(swept)
+		manager.SweepRetired(context.Background(), nearlySpent)
+	}()
+	select {
+	case <-swept:
+	case <-time.After(time.Second):
+		t.Fatal("the sweep made a window of its own instead of taking what was left of the tick")
+	}
+}
+
+// A hand-back is a round trip, and until it answers the lease still names this instance
+// while nothing here runs the session. A wake that lands in that gap finds the lease
+// taken; acknowledged on those grounds it retires the only thing that would have started
+// the account, and the release lands a moment later on an account with nothing left to
+// pick it up.
+func TestALeaseOnItsWayBackIsOneAWakeWaitsFor(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	hop := stallable(t, server.Addr())
+	rdb := redis.NewClient(&redis.Options{Addr: hop.addr(), ContextTimeoutEnabled: true})
+	t.Cleanup(func() { _ = rdb.Close() })
+
+	engines := fake.New()
+	leases := cluster.NewLeases(redisx.Wrap(rdb, "wa:", 8), "inst-a", cluster.Options{})
+	manager := NewManager(&ManagerConfig{
+		Instance: "inst-a", Engine: engines, Leases: leases,
+		Publisher: quietPublisher{}, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	t.Cleanup(func() {
+		quick, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		defer cancel()
+		manager.StopAll(quick)
+	})
+
+	const sid = "9c2b7d1e-0000-4000-8000-0000000000a8"
+	if _, err := manager.Adopt(context.Background(), sid); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+
+	hop.stall()
+	handing, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		manager.Release(handing, sid)
+	}()
+
+	// The release has reached the hop and will never be answered, which is exactly the
+	// moment a wake has to be able to see.
+	select {
+	case <-hop.swallowed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the release never reached Redis")
+	}
+	if !manager.handingBack(sid) {
+		t.Fatal("a lease in flight back to Redis reads as nobody's, and the wake that would have restarted the account is acknowledged as somebody else's")
+	}
+	cancel()
+	<-done
+}
+
+// Offer closes the door on new commands, and the ones already through it are the point:
+// a connect taken from the queue after the engine has finished with the session dials an
+// account the next tick hands away, and answers the client that it worked.
+func TestACommandAlreadyQueuedWhenTheSessionRetiresIsLeftForItsNextOwner(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+
+	engines := fake.New()
+	manager := NewManager(&ManagerConfig{
+		Instance: "inst-a", Engine: engines,
+		Leases:    cluster.NewLeases(client, "inst-a", cluster.Options{}),
+		Publisher: quietPublisher{}, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	t.Cleanup(func() { manager.StopAll(context.Background()) })
+
+	const sid = "9c2b7d1e-0000-4000-8000-0000000000a9"
+	session, err := manager.Adopt(context.Background(), sid)
+	if err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, running := engines.Session(sid)
+	if !running {
+		t.Fatal("the engine has no session for the account that was just adopted")
+	}
+
+	// One command in flight, so the queue behind it is a queue.
+	release := engineSession.Hold()
+	defer release()
+	if offered := session.Offer(&transport.Delivery{
+		Command: protocol.Command{
+			V: protocol.Version, ID: "c1", Type: protocol.CommandMessageSend, SID: sid,
+		},
+		Ack:     func(context.Context) error { return nil },
+		Release: func() {},
+	}); offered != OfferAccepted {
+		t.Fatalf("the session refused the first command: %v", offered)
+	}
+	waitFor(t, func() bool { return len(engineSession.Commands()) == 1 }, "the first command never reached the engine")
+
+	// Written by the executor and read here, so not a plain bool.
+	var given atomic.Bool
+	if offered := session.Offer(&transport.Delivery{
+		Command: protocol.Command{
+			V: protocol.Version, ID: "c2", Type: protocol.CommandSessionConnect, SID: sid,
+		},
+		Ack:     func(context.Context) error { t.Error("a command nobody carried out was retired"); return nil },
+		Release: func() { given.Store(true) },
+	}); offered != OfferAccepted {
+		t.Fatalf("the session refused the queued command: %v", offered)
+	}
+
+	engineSession.EmitLast(protocol.EventSessionConnectFailure, map[string]any{"reason": "unavailable"})
+	waitFor(t, func() bool { return session.Retired() }, "the session was never finished with")
+
+	release()
+	waitFor(t, given.Load, "the queued connect was never handed back")
+	if engineSession.Connected() {
+		t.Fatal("a connect queued before the engine finished with the session dialled anyway")
 	}
 }

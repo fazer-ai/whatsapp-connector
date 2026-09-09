@@ -339,11 +339,16 @@ func (m *Manager) Release(ctx context.Context, sid string) {
 // session finds the lease taken, is acknowledged, and retires: the session is then left
 // unowned with nothing scheduled to pick it up.
 func (m *Manager) abandon(ctx context.Context, sid string) {
+	// Marked before the round trip and not after it fails. A wake that lands while this
+	// is in flight finds the lease taken and this instance running nothing, and
+	// `handingBack` is the only thing that stops it from being acknowledged as somebody
+	// else's: the release then lands, and the account is left owned by nobody with the
+	// one wake that would have started it already retired.
+	m.orphanMu.Lock()
+	m.orphans[sid] = struct{}{}
+	m.orphanMu.Unlock()
 	if _, err := m.leases.Release(ctx, sid); err != nil {
 		m.log.Warn().Err(err).Str("sid", sid).Msg("could not hand a lease back; will try again")
-		m.orphanMu.Lock()
-		m.orphans[sid] = struct{}{}
-		m.orphanMu.Unlock()
 		return
 	}
 	m.forgetOrphan(sid)
@@ -756,7 +761,7 @@ func (m *Manager) ack(ctx context.Context, delivery *transport.Delivery) {
 // RenewAll keeps the leases of running sessions alive and tears down whatever this
 // instance has lost. It is the loop that turns "the lease expired" into "the socket is
 // closed", which is what keeps two instances off one account.
-func (m *Manager) RenewAll(ctx context.Context) {
+func (m *Manager) RenewAll(ctx context.Context, by time.Time) {
 	// Renewals first, and nothing before them. Every hand-back is a Redis round trip
 	// that can hang, and a lease left unrenewed because this goroutine was busy with
 	// them is a session a peer takes while this instance still holds its socket open:
@@ -815,12 +820,26 @@ func (m *Manager) RenewAll(ctx context.Context) {
 
 	// What is left of the tick goes to the hand-backs, and only what a lease can spare
 	// of it. One that does not fit is tried again on the next tick.
-	window, cancel := context.WithTimeout(ctx, m.leases.TTL()/ReleaseShare)
+	window, cancel := context.WithDeadline(ctx, by)
 	defer cancel()
 	for _, sid := range released {
 		m.abandon(window, sid)
 	}
 	m.releaseOrphans(window)
+}
+
+// HandBackBy is the moment every hand-back in one tick has to be done by, counted from
+// the call rather than per pass.
+//
+// One deadline and not one per pass, because the tick has two: the renewals hand back
+// what they lost, and the sweep hands back what the engine finished with. Two windows of
+// a third of a lease each, back to back, is a renewal that can be two thirds of a lease
+// late -- and the startup check that decides whether a lease TTL is configurable at all
+// prices in exactly one of them (app.Config, "the lease hand-back tail"). A second one
+// nobody priced is a lease lost under load, which is a peer running an account whose
+// socket this instance still holds open.
+func (m *Manager) HandBackBy() time.Time {
+	return m.now().Add(m.leases.TTL() / ReleaseShare)
 }
 
 // ReleaseShare is the fraction of a lease one tick may spend handing leases back, which
@@ -851,7 +870,7 @@ func (m *Manager) StopAll(ctx context.Context) {
 // Releasing stops the session and hands the lease back, so the account is owned by nobody
 // until a command adopts it again. Nothing here reconnects on its own, so the next attempt
 // is the client's to make, and it may land on any instance.
-func (m *Manager) SweepRetired(ctx context.Context) {
+func (m *Manager) SweepRetired(ctx context.Context, by time.Time) {
 	m.mu.RLock()
 	retired := make(map[string]*Session, len(m.sessions))
 	for sid, session := range m.sessions {
@@ -861,12 +880,12 @@ func (m *Manager) SweepRetired(ctx context.Context) {
 	}
 	m.mu.RUnlock()
 
-	// The same share of a lease `RenewAll`'s hand-backs get, and for the same reason: each
-	// release is a Redis round trip that can hang, and a heartbeat that spends longer than
-	// a lease here is every other session on this instance left unrenewed -- peers take
-	// them while the sockets are still open. One that does not fit is swept on the next
-	// tick, which costs an account a few more seconds of belonging to nobody.
-	window, cancel := context.WithTimeout(ctx, m.leases.TTL()/ReleaseShare)
+	// The same deadline `RenewAll`'s own hand-backs ran under, and what they left of it:
+	// each release is a Redis round trip that can hang, and a heartbeat that spends longer
+	// than a lease here is every other session on this instance left unrenewed -- peers
+	// take them while the sockets are still open. One that does not fit is swept on the
+	// next tick, which costs an account a few more seconds of belonging to nobody.
+	window, cancel := context.WithDeadline(ctx, by)
 	defer cancel()
 	for sid, session := range retired {
 		if window.Err() != nil {

@@ -537,7 +537,7 @@ func TestRenewAllDropsASessionWhoseLeaseMoved(t *testing.T) {
 		t.Fatalf("inst-b Acquire: %v", err)
 	}
 
-	manager.RenewAll(ctx)
+	manager.RenewAll(ctx, manager.HandBackBy())
 
 	if got := manager.Count(); got != 0 {
 		t.Fatalf("the manager still runs %d sessions after losing the lease", got)
@@ -580,7 +580,7 @@ func TestRenewAllDropsASessionWhoseLeaseWentStaleWhileRedisWasUnreachable(t *tes
 	clock.step(cluster.DefaultTTL + time.Second)
 	server.Close()
 
-	manager.RenewAll(ctx)
+	manager.RenewAll(ctx, manager.HandBackBy())
 
 	if got := manager.Count(); got != 0 {
 		t.Fatalf("the manager still runs %d sessions on a lease that ran out", got)
@@ -615,7 +615,7 @@ func TestRenewAllKeepsASessionWhoseLeaseIsStillFresh(t *testing.T) {
 	}
 	server.Close()
 
-	manager.RenewAll(ctx)
+	manager.RenewAll(ctx, manager.HandBackBy())
 
 	if got := manager.Count(); got != 1 {
 		t.Fatalf("the manager dropped a session on one failed round trip (running %d)", got)
@@ -1376,7 +1376,7 @@ func TestRenewAllHandsBackTheLeaseOfASessionItStopped(t *testing.T) {
 
 	rdb.AddHook(losesRenewals(keys.Cooldown("s1")))
 	clock.step(cluster.DefaultTTL + time.Second)
-	manager.RenewAll(ctx)
+	manager.RenewAll(ctx, manager.HandBackBy())
 
 	if got := manager.Count(); got != 0 {
 		t.Fatalf("the manager still runs %d sessions on a lease that ran out", got)
@@ -1421,7 +1421,7 @@ func TestAHandBackThatDidNotLandIsTriedAgain(t *testing.T) {
 	rdb.AddHook(hook)
 
 	clock.step(cluster.DefaultTTL + time.Second)
-	manager.RenewAll(ctx)
+	manager.RenewAll(ctx, manager.HandBackBy())
 
 	if got, err := rdb.Get(ctx, keys.Lease("s1")).Result(); err != nil || got != "inst-a" {
 		t.Fatalf("the lease should still be there for the retry to find (got %q, %v)", got, err)
@@ -1430,7 +1430,7 @@ func TestAHandBackThatDidNotLandIsTriedAgain(t *testing.T) {
 	// Redis answers again. Nothing renews this session any more, so the only thing left
 	// that can hand its lease back is the tick itself.
 	away.Store(false)
-	manager.RenewAll(ctx)
+	manager.RenewAll(ctx, manager.HandBackBy())
 
 	peer := cluster.NewLeases(client, "inst-b", cluster.Options{Clock: clock})
 	if _, err := peer.Acquire(ctx, "s1"); err != nil {
@@ -1472,7 +1472,7 @@ func TestAQueuedHandBackDoesNotTouchALeaseTakenAgain(t *testing.T) {
 	rdb.AddHook(hook)
 
 	clock.step(cluster.DefaultTTL + time.Second)
-	manager.RenewAll(ctx)
+	manager.RenewAll(ctx, manager.HandBackBy())
 	away.Store(false)
 
 	// The orphaned key runs out on its own, and a wake arrives before the next tick:
@@ -1483,7 +1483,7 @@ func TestAQueuedHandBackDoesNotTouchALeaseTakenAgain(t *testing.T) {
 		t.Fatalf("re-adopting: %v", err)
 	}
 
-	manager.RenewAll(ctx)
+	manager.RenewAll(ctx, manager.HandBackBy())
 
 	if got := manager.Count(); got != 1 {
 		t.Fatalf("the retry stopped a session this instance had taken again (running %d)", got)
@@ -1536,7 +1536,7 @@ func TestRenewalsComeBeforeHandBacks(t *testing.T) {
 	rdb.AddHook(hook)
 	away.Store(true)
 	clock.step(ttl + time.Millisecond)
-	manager.RenewAll(ctx)
+	manager.RenewAll(ctx, manager.HandBackBy())
 	away.Store(false)
 
 	// s1's hand-back is queued. From here every hand-back hangs for longer than a lease,
@@ -1549,7 +1549,7 @@ func TestRenewalsComeBeforeHandBacks(t *testing.T) {
 		t.Fatalf("re-adopting s2: %v", err)
 	}
 	before := time.Now()
-	manager.RenewAll(ctx)
+	manager.RenewAll(ctx, manager.HandBackBy())
 
 	if got := manager.Count(); got != 1 {
 		t.Fatalf("the live session was dropped while a hand-back was hanging (running %d)", got)
@@ -1624,7 +1624,7 @@ func TestAWakeRefusedByThisInstancesOwnStaleLeaseStaysPending(t *testing.T) {
 	}
 	rdb.AddHook(hook)
 	clock.step(cluster.DefaultTTL + time.Second)
-	manager.RenewAll(ctx)
+	manager.RenewAll(ctx, manager.HandBackBy())
 
 	acked := &atomic.Bool{}
 	released := &atomic.Bool{}

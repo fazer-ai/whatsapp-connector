@@ -2743,3 +2743,30 @@ func TestAConnectRefusedMidPairingRetiresOnThePairingsOwnEnding(t *testing.T) {
 		t.Error("a pairing that ended on a connect WhatsApp refused left the session holding its lease")
 	}
 }
+
+// The handler and the pairing reader are two goroutines publishing into the same queue,
+// and only one of them can carry the mark that says the session is finished with. A
+// pairing that ends between the handler's question and the handler's own event would
+// publish its closing state -- marked, because the session is already terminal -- ahead
+// of an event that is then last and unmarked, and the account can go back before the
+// reason it went back is out.
+func TestAnOutcomeRacingAPairingsEndingLetsThePairingCarryTheMark(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "")
+
+	// A pairing in the middle of ending, which is what holds this lock and nothing else
+	// does: the run is already cleared and the events that close it are not out yet.
+	session.pairingMu.Lock()
+	defer session.pairingMu.Unlock()
+
+	session.handle(&waEvents.ConnectFailure{Reason: waEvents.ConnectFailureServiceUnavailable})
+
+	refused := next(t, session)
+	if refused.Type != protocol.EventSessionConnectFailure {
+		t.Fatalf("the session published %s, want %s", refused.Type, protocol.EventSessionConnectFailure)
+	}
+	if refused.Retires {
+		t.Error("a refused connect took the mark from a pairing that was already publishing its own ending")
+	}
+}

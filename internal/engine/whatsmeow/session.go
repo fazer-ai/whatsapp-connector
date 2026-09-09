@@ -1708,6 +1708,22 @@ func (s *Session) isTerminal() bool {
 // pairing's closing state carries the mark instead, and reads `terminal` to know it has
 // to. Whichever of the two runs second is the one that finds the other's mark.
 func (s *Session) finishing(eventType protocol.EventType, payload any) {
+	// Held across the question and the answer, or the pairing can end between the two and
+	// publish its own closing state -- marked, because the mark above is already set --
+	// ahead of the event this call has not enqueued yet. The supposedly last event would
+	// then not be last, and the account can go back before the reason it went back is out.
+	//
+	// TryLock and not Lock: the caller holds transition, and a pairing ending takes
+	// transition from under this very lock, so waiting here would be waiting on the
+	// goroutine that is waiting on us. Failing to take it answers the question anyway --
+	// only a pairing that is ending holds it, and it is blocked behind this transition, so
+	// it publishes after this does and the mark is its to carry.
+	if !s.pairingMu.TryLock() {
+		s.emit(eventType, payload)
+		return
+	}
+	defer s.pairingMu.Unlock()
+
 	if s.pairingActive() {
 		s.emit(eventType, payload)
 		return

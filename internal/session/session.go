@@ -435,6 +435,15 @@ func (s *Session) execute(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case delivery := <-s.commands:
+			if s.retired.Load() {
+				// Queued before the engine finished with the session, which `Offer` can
+				// no longer refuse because it was already taken. Carried out, a connect
+				// waiting here dials an account the next tick hands away and answers the
+				// client that it worked. Left pending for whoever takes the account, the
+				// same answer an offer refused now gets.
+				release(delivery)
+				continue
+			}
 			s.run(ctx, delivery)
 		}
 	}
