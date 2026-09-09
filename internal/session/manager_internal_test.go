@@ -795,6 +795,15 @@ func TestAHandBackAndAnAdoptionOfTheSameAccountDoNotOverlap(t *testing.T) {
 	engineSession.EmitLast(protocol.EventSessionConnectFailure, map[string]any{"reason": "unavailable"})
 	waitFor(t, first.Retired, "the session was never finished with")
 
+	// The release itself never lands, whatever the hop is doing. It used to be enough
+	// that the stall swallowed the first round trip and the mark spent the whole budget
+	// on it; now the mark keeps only half, so the release would reach a server that has
+	// been let go again. What the tail of this test is about is a hand-back that did not
+	// land, so it is made not to land.
+	rdb.AddHook(dropped{when: func(cmd redis.Cmder) bool {
+		return handsBack(cmd, client.Keys().HandBack(sid))
+	}})
+
 	// The hand-back reaches Redis and is never answered, so it is still under way for as
 	// long as the test needs it to be -- no clock decides that.
 	hop.stall()
@@ -822,8 +831,8 @@ func TestAHandBackAndAnAdoptionOfTheSameAccountDoNotOverlap(t *testing.T) {
 		t.Fatalf("an adoption alongside a hand-back for the same account answered %v, want %v", err, errLeaving)
 	}
 
-	// The release never reached Redis, so the key still names this instance and the wake
-	// stays pending on those grounds too: `handingBack` is what keeps it from being
+	// The release never landed, so the key still names this instance and the wake stays
+	// pending on those grounds too: `handingBack` is what keeps it from being
 	// acknowledged as somebody else's.
 	<-handed
 	if !manager.handingBack(sid) {
