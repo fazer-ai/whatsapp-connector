@@ -639,7 +639,12 @@ func (s *Session) claimedAuthor(event *waEvents.Message) *protocol.Party {
 		// be able to match: its copy of the message is keyed by whichever half it learned
 		// first, and a claim it cannot match reads as a mismatch and drops a deletion
 		// that was real.
-		claiming = []waTypes.JID{event.Info.Sender, event.Info.SenderAlt}
+		//
+		// The alternative only where the stanza carried it. A phone-addressed message
+		// that arrived without `sender_lid` has one filled in from the mapping every
+		// account on the deployment shares, and naming the author by it would put another
+		// operator's pairing on this event and into what this session learns from it.
+		claiming = []waTypes.JID{event.Info.Sender, wireAlt(&event.Info)}
 	} else {
 		named := key.GetParticipant()
 		// Exactly one `@`, because ParseJID splits on it and keeps the first two pieces:

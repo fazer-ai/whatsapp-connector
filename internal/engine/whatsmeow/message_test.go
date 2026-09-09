@@ -713,3 +713,67 @@ func TestAPlaceholderOfAnotherTypeIsNotCalledMasked(t *testing.T) {
 		t.Fatalf("a placeholder type nobody here knows is published as %q, want unknown_type", reason)
 	}
 }
+
+// whatsmeow fills in the LID a phone-addressed message arrived without, and it fills it
+// in out of `whatsmeow_lid_map` -- one table for every account on the deployment. Nothing
+// on the event separates that from the `sender_lid` WhatsApp actually sent, so a
+// phone-addressed message names one namespace here. The other direction cannot be
+// backfilled, because the backfill only ever produces a LID, and it is where the pairing
+// is learned.
+func TestAPhoneAddressedMessageDoesNotTakeTheAlternateOnTrust(t *testing.T) {
+	t.Parallel()
+
+	session := plain(t)
+	backfilled := &waTypes.MessageInfo{
+		MessageSource: waTypes.MessageSource{
+			Sender:    waTypes.NewJID("5511999990007", waTypes.DefaultUserServer),
+			SenderAlt: waTypes.NewJID("167392323834039", waTypes.HiddenUserServer),
+		},
+	}
+	party, named := session.partyOf(t.Context(), backfilled)
+	if !named || party.LID != "" {
+		t.Fatalf("the party is %+v, want the number the stanza was addressed by and nothing taken on trust", party)
+	}
+
+	// And the same person, addressed the other way round: the alternate is the number,
+	// which is read off the stanza and nowhere else.
+	looking, done := session.looking()
+	defer done()
+	shown := &waTypes.MessageInfo{
+		MessageSource: waTypes.MessageSource{
+			Sender:    waTypes.NewJID("167392323834039", waTypes.HiddenUserServer),
+			SenderAlt: waTypes.NewJID("5511999990007", waTypes.DefaultUserServer),
+		},
+	}
+	if party, _ = session.partyOf(looking, shown); party.Phone != "5511999990007" || party.LID != "167392323834039" {
+		t.Fatalf("the party is %+v, want both halves the stanza carried", party)
+	}
+	// Learned, so the phone-addressed message is whole from here on.
+	if party, _ = session.partyOf(looking, backfilled); party.LID != "167392323834039" {
+		t.Errorf("the party is %+v, want the pairing the other message had already shown", party)
+	}
+}
+
+// A message this account sent from another of its devices names the person on the other
+// end as the chat, and their other address as the recipient's alternate. Reading the
+// sender's alternate instead would be reading this account's own.
+func TestADirectChatTakesThePeersOwnAlternate(t *testing.T) {
+	t.Parallel()
+
+	session := plain(t)
+	looking, done := session.looking()
+	defer done()
+
+	sent := &waTypes.MessageInfo{
+		MessageSource: waTypes.MessageSource{
+			IsFromMe:     true,
+			Chat:         waTypes.NewJID("5511999990008", waTypes.DefaultUserServer),
+			Sender:       waTypes.NewJID("5511999990001", waTypes.DefaultUserServer),
+			RecipientAlt: waTypes.NewJID("167392323834040", waTypes.HiddenUserServer),
+		},
+	}
+	chat, addressable := session.chatOf(looking, sent)
+	if !addressable || chat.Kind != protocol.AddressLID || chat.ID != "167392323834040" {
+		t.Fatalf("the chat went out as %+v (ok=%v), want the LID the stanza named the peer by", chat, addressable)
+	}
+}

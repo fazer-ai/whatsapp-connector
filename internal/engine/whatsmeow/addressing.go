@@ -45,56 +45,154 @@ type alias struct {
 
 func newAlias() *alias { return &alias{seen: make(map[string]waTypes.JID)} }
 
-// of answers the other namespace's JID for one, and whether there is one to have.
+// generationKey is how the account an operation started under travels with it.
+type generationKey struct{}
+
+// stamp marks a context with the account whose mapping is being learned right now.
 //
-// A store that will not answer is logged and left. The address still goes out with the
-// half the event carried, which is what happened before this existed at all, and the next
-// event for the same party asks again -- on the event path, losing the mapping is worth
-// less than losing the event. A caller that is asking for the mapping itself wants the
-// difference, and lookup is where it is kept.
-func (a *alias) of(ctx context.Context, s *Session, jid waTypes.JID) (waTypes.JID, bool) {
-	alt, found, err := a.lookup(ctx, s, jid)
-	if err != nil {
-		s.log.Debug().Err(err).Str("jid", jid.String()).
-			Msg("could not read the other namespace for a party")
-		return waTypes.EmptyJID, false
-	}
-	return alt, found
+// Where the data enters, not where it is written down. A command spends a round trip at
+// WhatsApp between the two, and a logout landing in that window rebuilds the session on a
+// different account: the pairing that comes back belongs to the account that asked, and
+// writing it into the map that replaced it would hand the next account a number nobody
+// gave it. This is `remember`'s check moved to the only place that can tell.
+func (a *alias) stamp(ctx context.Context) context.Context {
+	return context.WithValue(ctx, generationKey{}, a.learning())
 }
 
-// lookup is of, with the failure kept apart from the absence.
+// observe records a pairing the event itself carried.
 //
-// The two are not the same answer and a command whose whole result is the mapping cannot
-// treat them as one: "nobody has learned this pairing yet" is a result, and "the store did
-// not answer" is a refusal the caller can retry.
-func (a *alias) lookup(ctx context.Context, s *Session, jid waTypes.JID) (waTypes.JID, bool, error) {
-	if !pairable(jid) {
-		return waTypes.EmptyJID, false, nil
+// First hand, and that is the whole difference. WhatsApp addressed this account with both
+// halves, so the pairing is one this account was shown, and publishing it back discloses
+// nothing it was not already told. `whatsmeow_lid_map` is not that: it is `(lid, pn)` with
+// no `our_jid` column, one table for every session on the deployment, so a row in it may
+// be what another operator's account was shown.
+//
+// Only a pair one caller passed together, which is what makes this safe to sit on the path
+// every event takes. The one field a stranger writes -- the participant inside a deletion
+// key -- reaches `party` on its own, and a single JID names no pairing.
+func (a *alias) observe(ctx context.Context, jids ...waTypes.JID) {
+	// A context nobody stamped is one this cannot place, and an unplaceable pairing is
+	// dropped rather than guessed at: the cost is a lookup the next event pays, and the
+	// alternative is the previous account's mapping in this one's map.
+	learning, placed := ctx.Value(generationKey{}).(uint64)
+	if !placed {
+		return
 	}
-	key := jid.ToNonAD().String()
+	var phone, lid waTypes.JID
+	for _, jid := range jids {
+		if !pairable(jid) {
+			continue
+		}
+		canonical, addressable := canonicalJID(jid)
+		switch {
+		case !addressable:
+		case canonical.Server == waTypes.DefaultUserServer && phone.IsEmpty():
+			phone = canonical
+		case canonical.Server == waTypes.HiddenUserServer && lid.IsEmpty():
+			lid = canonical
+		}
+	}
+	if phone.IsEmpty() || lid.IsEmpty() {
+		return
+	}
+	a.mu.Lock()
+	if a.generation == learning {
+		// Whatever each half was paired with before goes with it. A number can be handed
+		// to somebody else, who has a LID of their own, and leaving the reverse entry
+		// behind would leave two handles claiming one number -- and the answer would
+		// depend on which of the two a caller happened to ask about.
+		if stale, paired := a.seen[phone.String()]; paired && stale != lid {
+			delete(a.seen, stale.String())
+		}
+		if stale, paired := a.seen[lid.String()]; paired && stale != phone {
+			delete(a.seen, stale.String())
+		}
+		a.seen[phone.String()] = lid
+		a.seen[lid.String()] = phone
+	}
+	a.mu.Unlock()
+}
+
+// canonicalJID is the one spelling of a JID that every path here agrees on.
+//
+// WhatsApp names one person over four domains -- `s.whatsapp.net` and `c.us` for a number,
+// `lid` and `hosted.lid` for a handle, plus `hosted` -- and the contract collapses them
+// into two kinds. A map keyed by what arrived would answer for the spelling it was taught
+// and miss the same person under another, which is the canonical-address rule holding
+// inside this connector as well as on the wire.
+func canonicalJID(jid waTypes.JID) (waTypes.JID, bool) {
+	address, addressable := addressOf(jid)
+	if !addressable {
+		return waTypes.EmptyJID, false
+	}
+	canonical, err := jidOf(address)
+	if err != nil {
+		return waTypes.EmptyJID, false
+	}
+	return canonical, true
+}
+
+// lookup answers the other namespace's JID for one, and whether there is one to have.
+//
+// Out of what this account was shown and nothing else, so there is no store behind it and
+// no failure to report: an absence here is "nobody has shown this account that pairing
+// yet", which the next message from the same person usually settles.
+func (a *alias) lookup(s *Session, jid waTypes.JID) (waTypes.JID, bool) {
+	if !pairable(jid) {
+		return waTypes.EmptyJID, false
+	}
+	canonical, addressable := canonicalJID(jid)
+	if !addressable {
+		return waTypes.EmptyJID, false
+	}
+	key := canonical.String()
 
 	a.mu.RLock()
 	known, remembered := a.seen[key]
 	learning := a.generation
 	a.mu.RUnlock()
 	if remembered {
-		return known, true, nil
+		return known, true
 	}
 
-	client := s.current()
-	if client == nil || client.Store == nil {
-		return waTypes.EmptyJID, false, nil
+	// The account's own pairing is the one this never had to be told: the session holds
+	// both halves, off the device it paired and the connection it made. It is also the one
+	// the shared table may not answer for -- whatsmeow logs that write rather than failing
+	// on it -- and a receipt for the account's own send would then go out under the number
+	// while every other path names the conversation by LID.
+	if own, mine := s.ownAlias(jid); mine {
+		a.remember(key, own, learning)
+		return own, true
 	}
-	alt, err := client.Store.GetAltJID(ctx, jid)
+
+	// And nothing else. `whatsmeow_lid_map` is `(lid, pn)` with no `our_jid`, so a row in
+	// it may be one another operator's account was shown, and there is nothing here that
+	// can tell which. The contact table looked like the answer -- it is keyed by `our_jid`
+	// -- and it is not: `updatePushName` fills in the address the event did not carry out
+	// of that same shared table and files a row under it, so a row for a number can be
+	// this account's own record of the very mapping it is being asked to authorise.
+	//
+	// What is left is what this account was shown, which `observe` records as it goes by.
+	// A pairing nobody has shown it yet is not published, and the next message from the
+	// same person carries both halves.
+	return waTypes.EmptyJID, false
+}
+
+// ownAlias answers the other half of the account's own pair.
+func (s *Session) ownAlias(jid waTypes.JID) (waTypes.JID, bool) {
+	phone, lid := s.identity()
+	if phone == "" || lid == "" {
+		return waTypes.EmptyJID, false
+	}
+	address, addressable := addressOf(jid)
 	switch {
-	case err != nil:
-		return waTypes.EmptyJID, false, err
-	case alt.IsEmpty():
-		return waTypes.EmptyJID, false, nil
+	case !addressable:
+	case address.Kind == protocol.AddressPhone && address.ID == phone:
+		return waTypes.NewJID(lid, waTypes.HiddenUserServer), true
+	case address.Kind == protocol.AddressLID && address.ID == lid:
+		return waTypes.NewJID(phone, waTypes.DefaultUserServer), true
 	}
-
-	a.remember(key, alt, learning)
-	return alt, true, nil
+	return waTypes.EmptyJID, false
 }
 
 // learning is which account's mapping is being learned right now.
@@ -150,19 +248,20 @@ func pairable(jid waTypes.JID) bool {
 // device store, which shares its one connection with everything the session writes, so a
 // handler that waits on it indefinitely waits on whatever else is mid-write.
 func (s *Session) looking() (context.Context, context.CancelFunc) {
-	return context.WithTimeout(s.ctx, s.storeLimit)
+	return context.WithTimeout(s.aliases.stamp(s.ctx), s.storeLimit)
 }
 
 // party names somebody by both of the addresses WhatsApp knows them by, filling in from
 // the mapping whatever the event did not carry.
 func (s *Session) party(ctx context.Context, jids ...waTypes.JID) protocol.Party {
+	s.aliases.observe(ctx, jids...)
 	var named protocol.Party
 	naming(&named, jids...)
 	if named.Phone != "" && named.LID != "" {
 		return named
 	}
 	for _, jid := range jids {
-		alt, ok := s.aliases.of(ctx, s, jid)
+		alt, ok := s.aliases.lookup(s, jid)
 		if !ok {
 			continue
 		}
@@ -181,6 +280,8 @@ func (s *Session) party(ctx context.Context, jids ...waTypes.JID) protocol.Party
 // LID when it has one -- names the same conversation whether it arrived through a
 // message, a receipt or a typing indicator.
 func (s *Session) address(ctx context.Context, jids ...waTypes.JID) (protocol.Address, bool) {
+	s.aliases.observe(ctx, jids...)
+
 	// What the event carried first, and the mapping only for what it did not. An event
 	// that names both namespaces has already answered the question, and asking the store
 	// anyway would be a read per event for an answer in hand.
@@ -203,7 +304,7 @@ func (s *Session) address(ctx context.Context, jids ...waTypes.JID) (protocol.Ad
 		return named, true
 	}
 	for _, jid := range jids {
-		alt, found := s.aliases.of(ctx, s, jid)
+		alt, found := s.aliases.lookup(s, jid)
 		if !found {
 			continue
 		}

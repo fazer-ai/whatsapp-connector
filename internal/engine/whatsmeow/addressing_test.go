@@ -7,6 +7,7 @@ import (
 
 	"github.com/rs/zerolog"
 	waTypes "go.mau.fi/whatsmeow/types"
+	waEvents "go.mau.fi/whatsmeow/types/events"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 )
@@ -29,69 +30,67 @@ func plain(t *testing.T) *Session {
 // what went out was what came in -- so the typing indicator for a person the client knew
 // only by number named a conversation it could not find, and never showed.
 //
-// The mapping was there the whole time, in the device store, and this is the one place
-// that asks for it.
-func TestAnAddressIsResolvedFromTheStoreWhenTheEventNamesOnlyOne(t *testing.T) {
+// The pairing was on the message that came before it, and this is the one place that
+// remembers.
+func TestAnAddressIsResolvedFromWhatTheAccountWasShown(t *testing.T) {
 	t.Parallel()
 
 	session, _ := newTestSession(t, "5511999990001")
 	session.setConnected(true)
 
+	looking, done := session.looking()
+	defer done()
+
 	lid := waTypes.NewJID("167392323834034", waTypes.HiddenUserServer)
 	phone := waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)
-	if err := session.current().Store.LIDs.PutLIDMapping(t.Context(), lid, phone); err != nil {
-		t.Fatalf("PutLIDMapping: %v", err)
-	}
+	// The message that named both, which is how this account came to know the two are one
+	// person.
+	session.party(looking, phone, lid)
 
 	// Only the number on the event, which is the shape that used to publish a chat no
 	// LID-keyed contact matched.
-	named := session.party(t.Context(), phone)
+	named := session.party(looking, phone)
 	if named.LID != "167392323834034" || named.Phone != "5511999990002" {
-		t.Fatalf("the party is %+v, want both halves filled in from the mapping", named)
+		t.Fatalf("the party is %+v, want both halves of the pairing it was shown", named)
 	}
 
 	// And the conversation goes out under the address every other path uses.
-	chat, ok := session.address(t.Context(), phone)
+	chat, ok := session.address(looking, phone)
 	if !ok || chat.Kind != protocol.AddressLID || chat.ID != "167392323834034" {
-		t.Fatalf("the chat went out as %+v (ok=%v), want the LID the mapping named", chat, ok)
+		t.Fatalf("the chat went out as %+v (ok=%v), want the LID the pairing named", chat, ok)
 	}
 }
 
-// A pair, once known, names the same two people for good, so the answer is remembered and
-// the store is asked once. What is deliberately not remembered is the absence: the
-// mapping is learned later, from a message or an app-state sync, and a miss kept in
-// memory would pin "this person has no LID" for as long as the session ran.
+// A pair, once known, names the same two people for good, so the answer is remembered.
+// What is deliberately not remembered is the absence: the pairing arrives later, on a
+// message or a group listing, and a miss kept in memory would pin "this person has no
+// LID" for as long as the session ran.
 func TestOnlyAMappingThatWasFoundIsRemembered(t *testing.T) {
 	t.Parallel()
 
 	session, _ := newTestSession(t, "5511999990001")
 	session.setConnected(true)
 
+	looking, done := session.looking()
+	defer done()
+
 	lid := waTypes.NewJID("167392323834035", waTypes.HiddenUserServer)
 	phone := waTypes.NewJID("5511999990003", waTypes.DefaultUserServer)
 
-	// Asked before the mapping exists, which must not settle the question.
-	if named := session.party(t.Context(), phone); named.LID != "" {
-		t.Fatalf("a party was given a LID nothing had mapped yet: %+v", named)
+	// Asked before anything showed this account the pairing, which must not settle the
+	// question.
+	if named := session.party(looking, phone); named.LID != "" {
+		t.Fatalf("a party was given a LID nothing had paired yet: %+v", named)
 	}
-	if err := session.current().Store.LIDs.PutLIDMapping(t.Context(), lid, phone); err != nil {
-		t.Fatalf("PutLIDMapping: %v", err)
-	}
-	if named := session.party(t.Context(), phone); named.LID != "167392323834035" {
-		t.Fatalf("the party is %+v, want the mapping learned after the first miss", named)
+	session.party(looking, phone, lid)
+	if named := session.party(looking, phone); named.LID != "167392323834035" {
+		t.Fatalf("the party is %+v, want the pairing learned after the first miss", named)
 	}
 
-	// And now it is remembered, which the store no longer having it is what proves: a
-	// pair that has been learned names the same two people for good, so asking again is a
-	// round trip to the device store -- the one connection everything the session writes
-	// shares -- for an answer that cannot have changed.
-	// Repointed at somebody else rather than deleted, because the store has no delete:
-	// either way the answer this session already has is no longer the store's.
-	other := waTypes.NewJID("5511999990099", waTypes.DefaultUserServer)
-	if err := session.current().Store.LIDs.PutLIDMapping(t.Context(), lid, other); err != nil {
-		t.Fatalf("repointing the mapping: %v", err)
-	}
-	if named := session.party(t.Context(), phone); named.LID != "167392323834035" {
+	// And it stays what it was shown. A pair names the same two people for good, so a
+	// later event naming this number beside a different handle is a spelling of somebody
+	// else, not a correction.
+	if named := session.party(looking, phone); named.LID != "167392323834035" {
 		t.Fatalf("the party is %+v, want the pair this session had already learned", named)
 	}
 }
@@ -118,5 +117,181 @@ func TestAnAliasLearnedBeforeTheAccountChangedIsNotKept(t *testing.T) {
 	dropped.remember(key, learned, learning)
 	if _, held := dropped.seen[key]; held {
 		t.Error("an alias learned under the previous account was written back after the change")
+	}
+}
+
+// The pairing an event carried is one this account was shown, so it needs no table and no
+// permission: WhatsApp addressed this account with both halves. Remembering it is what
+// keeps the later events for the same person whole, because the wire carries both halves
+// on a message and one half on a receipt or a typing indicator.
+func TestAPairingTheEventCarriedIsLearnedFirstHand(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setConnected(true)
+
+	lid := waTypes.NewJID("167392323834036", waTypes.HiddenUserServer)
+	phone := waTypes.NewJID("5511999990004", waTypes.DefaultUserServer)
+
+	// The context an event handler runs under, which is where the account a pairing is
+	// being learned for is stamped.
+	looking, done := session.looking()
+	defer done()
+
+	// Nothing in the shared table and no contact row: the event is the only source.
+	if named := session.party(looking, phone, lid); named.Phone != "5511999990004" || named.LID != "167392323834036" {
+		t.Fatalf("the party is %+v, want both halves the event named", named)
+	}
+
+	// The half a receipt would carry, answered whole.
+	if named := session.party(looking, lid); named.Phone != "5511999990004" {
+		t.Errorf("the party is %+v, want the number the message had already named", named)
+	}
+	if chat, ok := session.address(looking, phone); !ok || chat.ID != "167392323834036" {
+		t.Errorf("the chat went out as %+v (ok=%v), want the LID the message had already named", chat, ok)
+	}
+}
+
+// A command spends a round trip at WhatsApp between being asked and naming anybody, and a
+// logout landing in that window rebuilds the session on another account. What comes back
+// belongs to the account that asked, so it is dropped rather than written into the map
+// that replaced it -- which is what the next account would otherwise be answered from.
+func TestAPairingLearnedUnderOneAccountIsNotKeptForTheNext(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setConnected(true)
+
+	lid := waTypes.NewJID("167392323834038", waTypes.HiddenUserServer)
+	phone := waTypes.NewJID("5511999990006", waTypes.DefaultUserServer)
+
+	// The account that asked, stamped before the round trip.
+	asking := session.aliases.stamp(t.Context())
+	// The logout, and the account that took its place.
+	session.aliases.forget()
+	// And the answer, arriving late.
+	session.aliases.observe(asking, phone, lid)
+
+	if named := session.party(t.Context(), lid); named.Phone != "" {
+		t.Errorf("the party is %+v, carrying a number the previous account was shown", named)
+	}
+}
+
+// `whatsmeow_lid_map` is `(lid, pn)` with no `our_jid`, so one table serves every session
+// on a deployment: a pairing operator A's account learned is readable by operator B's. A
+// LID exists so somebody can take part without handing over their number, and which
+// accounts get to see the number behind one is granted per account. B is not one of them.
+func TestAPairingAnotherAccountLearnedIsNotPublished(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setConnected(true)
+
+	lid := waTypes.NewJID("167392323834037", waTypes.HiddenUserServer)
+	phone := waTypes.NewJID("5511999990005", waTypes.DefaultUserServer)
+	// The row as the other account's session left it, with nothing saying this one was
+	// ever shown the pairing.
+	if err := session.current().Store.LIDs.PutLIDMapping(t.Context(), lid, phone); err != nil {
+		t.Fatalf("PutLIDMapping: %v", err)
+	}
+
+	// And a contact row under the number, which is what a row proves nothing: whatsmeow
+	// fills in the address a LID-only message did not carry out of that same shared table
+	// and files a row under it, so this account's record of the number can be a copy of
+	// the mapping it would be authorising.
+	if _, _, err := session.current().Store.Contacts.PutPushName(t.Context(), phone, "Bruno"); err != nil {
+		t.Fatalf("PutPushName: %v", err)
+	}
+
+	if named := session.party(t.Context(), lid); named.Phone != "" {
+		t.Errorf("the party is %+v, carrying a number this account was never given", named)
+	}
+	if chat, ok := session.address(t.Context(), lid); !ok || chat.Kind != protocol.AddressLID {
+		t.Errorf("the chat went out as %+v (ok=%v), want the half the event carried", chat, ok)
+	}
+
+	// The other direction links the same two people, and links it for an account that
+	// holds neither side by having met them.
+	if named := session.party(t.Context(), phone); named.LID != "" {
+		t.Errorf("the party is %+v, linking a number to a handle this account never met", named)
+	}
+}
+
+// The account's own pairing is the one nothing had to show it: the session holds both
+// halves, off the device it paired and off the connection that brought the LID. It is also
+// the one the shared table can be missing, because whatsmeow logs that write rather than
+// failing on it -- and a receipt for the account's own send would then go out under the
+// number while every other path names the conversation by LID.
+func TestTheAccountsOwnPairingNeedsNothingToHaveShownIt(t *testing.T) {
+	t.Parallel()
+
+	const lid = "111222333444555"
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.current().Store.LID = waTypes.NewJID(lid, waTypes.HiddenUserServer)
+	session.handle(&waEvents.Connected{})
+	drain(t, session)
+	session.setConnected(true)
+
+	own := waTypes.NewJID("5511999990001", waTypes.DefaultUserServer)
+	if named := session.party(t.Context(), own); named.LID != lid {
+		t.Errorf("the account is named %+v, want the LID the connection brought", named)
+	}
+	if chat, ok := session.address(t.Context(), own); !ok || chat.Kind != protocol.AddressLID || chat.ID != lid {
+		t.Errorf("the account's own chat went out as %+v (ok=%v), want its LID", chat, ok)
+	}
+}
+
+// WhatsApp names one person over four domains and the contract collapses them into two
+// kinds, so a pairing learned under one spelling has to answer under the other. A map
+// keyed by what arrived would answer for `c.us` and miss the same person on
+// `s.whatsapp.net`, which is where every address this connector builds for itself lands.
+func TestAPairingIsFoundUnderEverySpellingOfTheAddress(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setConnected(true)
+
+	looking, done := session.looking()
+	defer done()
+
+	// The pairing as an older stanza spells it.
+	session.aliases.observe(looking,
+		waTypes.NewJID("5511999990010", waTypes.LegacyUserServer),
+		waTypes.NewJID("167392323834042", waTypes.HostedLIDServer))
+
+	if named := session.party(looking, waTypes.NewJID("5511999990010", waTypes.DefaultUserServer)); named.LID != "167392323834042" {
+		t.Errorf("the party is %+v, want the pairing learned under the other spelling", named)
+	}
+	if named := session.party(looking, waTypes.NewJID("167392323834042", waTypes.HiddenUserServer)); named.Phone != "5511999990010" {
+		t.Errorf("the party is %+v, want the pairing learned under the other spelling", named)
+	}
+}
+
+// A number can be handed to somebody else, and that person has a handle of their own. The
+// pairing that arrives replaces the one that was there, and the entry pointing back from
+// the handle it replaced goes with it: left behind, two handles would claim one number and
+// the answer would depend on which of them a caller happened to ask about.
+func TestANumberPairedAgainLeavesNoHandleBehind(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setConnected(true)
+
+	looking, done := session.looking()
+	defer done()
+
+	phone := waTypes.NewJID("5511999990011", waTypes.DefaultUserServer)
+	before := waTypes.NewJID("167392323834043", waTypes.HiddenUserServer)
+	after := waTypes.NewJID("167392323834044", waTypes.HiddenUserServer)
+
+	session.aliases.observe(looking, phone, before)
+	session.aliases.observe(looking, phone, after)
+
+	if named := session.party(looking, phone); named.LID != "167392323834044" {
+		t.Errorf("the party is %+v, want the handle the number is paired with now", named)
+	}
+	if named := session.party(looking, before); named.Phone != "" {
+		t.Errorf("the party is %+v, still claiming a number that is paired elsewhere", named)
 	}
 }

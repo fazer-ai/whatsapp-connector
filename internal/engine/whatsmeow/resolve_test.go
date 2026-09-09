@@ -1,10 +1,8 @@
 package whatsmeow
 
 import (
-	"context"
 	"encoding/json"
 	"testing"
-	"time"
 
 	waTypes "go.mau.fi/whatsmeow/types"
 
@@ -98,13 +96,8 @@ func TestAResolveCarriesTheNameTheDeviceLearned(t *testing.T) {
 
 	session, _ := newTestSession(t, "5511999990001")
 	client := session.current()
-	if err := client.Store.LIDs.PutLIDMapping(t.Context(),
-		waTypes.NewJID(lid, waTypes.HiddenUserServer),
-		waTypes.NewJID(phone, waTypes.DefaultUserServer)); err != nil {
-		t.Fatalf("PutLIDMapping: %v", err)
-	}
-	// Filed under the LID, asked for by number. The row is also what says this account
-	// has met them, which is what lets the mapping out.
+	pair(t, session, phone, lid)
+	// Filed under the LID, asked for by number.
 	if _, _, err := client.Store.Contacts.PutPushName(t.Context(),
 		waTypes.NewJID(lid, waTypes.HiddenUserServer), "Bruno Lima"); err != nil {
 		t.Fatalf("PutPushName: %v", err)
@@ -184,20 +177,6 @@ func TestAResolveNeedsAnAccountButNotAConnection(t *testing.T) {
 	assertCode(t, err, protocol.ErrorNotPaired)
 }
 
-// A mapping that could not be read is not a mapping that does not exist. Answering the
-// input address for both would tell a client the other namespace is unknown, and a client
-// told that stops asking; told the read failed, it asks again.
-func TestAResolveSaysWhenTheMappingCouldNotBeRead(t *testing.T) {
-	t.Parallel()
-
-	session, _ := newTestSession(t, "5511999990001")
-	stopped, cancel := context.WithCancel(t.Context())
-	cancel()
-
-	_, err := session.resolveContact(stopped, resolveCommand(t, `{"party":{"kind":"phone","id":"5541988887777"}}`))
-	assertCode(t, err, protocol.ErrorTimeout)
-}
-
 // The two namespaces are written by different paths: an app-state contact sync files one,
 // a message's push name the other. A row for the address that was asked about can exist
 // and hold neither name, so finding it is not the end of the search.
@@ -211,11 +190,7 @@ func TestAResolveKeepsLookingWhenTheFirstRowHasNoName(t *testing.T) {
 
 	session, _ := newTestSession(t, "5511999990001")
 	client := session.current()
-	if err := client.Store.LIDs.PutLIDMapping(t.Context(),
-		waTypes.NewJID(lid, waTypes.HiddenUserServer),
-		waTypes.NewJID(phone, waTypes.DefaultUserServer)); err != nil {
-		t.Fatalf("PutLIDMapping: %v", err)
-	}
+	pair(t, session, phone, lid)
 	// A row under the number with a contact name and no push name, which is what an
 	// address-book sync leaves behind.
 	if err := client.Store.Contacts.PutContactName(t.Context(),
@@ -313,16 +288,21 @@ func TestAResolveAnswersTheAccountOutOfItsOwnIdentity(t *testing.T) {
 func learn(t *testing.T, session *Session, phone, lid string) {
 	t.Helper()
 
-	client := session.current()
-	if err := client.Store.LIDs.PutLIDMapping(t.Context(),
-		waTypes.NewJID(lid, waTypes.HiddenUserServer),
-		waTypes.NewJID(phone, waTypes.DefaultUserServer)); err != nil {
-		t.Fatalf("PutLIDMapping: %v", err)
-	}
-	if _, _, err := client.Store.Contacts.PutPushName(t.Context(),
+	// The pairing as a message brings it: both halves, addressed to this account.
+	pair(t, session, phone, lid)
+	if _, _, err := session.current().Store.Contacts.PutPushName(t.Context(),
 		waTypes.NewJID(phone, waTypes.DefaultUserServer), "Bruno Lima"); err != nil {
 		t.Fatalf("PutPushName: %v", err)
 	}
+}
+
+// pair records a pairing the way an event carrying both halves does.
+func pair(t *testing.T, session *Session, phone, lid string) {
+	t.Helper()
+
+	session.aliases.observe(session.aliases.stamp(t.Context()),
+		waTypes.NewJID(phone, waTypes.DefaultUserServer),
+		waTypes.NewJID(lid, waTypes.HiddenUserServer))
 }
 
 // The mapping table has no `our_jid`: every account on a deployment writes into one, so a
@@ -358,52 +338,4 @@ func TestAResolveWithholdsAMappingThisAccountNeverLearned(t *testing.T) {
 	if party["lid"] != lid {
 		t.Errorf("the resolve answered %v, want the half the caller already had", party)
 	}
-}
-
-// The mapping can come out of the cache while the contact record still has to be read, so
-// the check that authorises it has a failure of its own. Reported as "not met", it answers
-// the same one-sided party an unknown mapping answers, and a client told the other
-// namespace is unknown stops asking.
-func TestAResolveSaysWhenTheContactRecordCouldNotBeRead(t *testing.T) {
-	t.Parallel()
-
-	const (
-		phone = "5541988887777"
-		lid   = "998877665544332"
-	)
-
-	session, container := newTestSession(t, "5511999990001")
-	// The mapping put straight into the session's cache, so the lookup answers without a
-	// read and the contact record is the first thing that touches the database.
-	session.aliases.remember(
-		waTypes.NewJID(lid, waTypes.HiddenUserServer).String(),
-		waTypes.NewJID(phone, waTypes.DefaultUserServer),
-		session.aliases.learning())
-	if err := container.Close(); err != nil {
-		t.Fatalf("Close the store: %v", err)
-	}
-
-	_, err := session.Execute(t.Context(), resolveCommand(t, `{"party":{"kind":"lid","id":"`+lid+`"}}`))
-	assertCode(t, err, protocol.ErrorInternal)
-}
-
-// A command need not carry a deadline, and this one runs on the session's executor: a
-// database call left with the session's own context behind it holds every later command
-// for that session for as long as it lasts. The bound is the store's, the same one every
-// event handler reads under.
-func TestAResolveBoundsItsReadsWithoutACallerDeadline(t *testing.T) {
-	t.Parallel()
-
-	const (
-		phone = "5541988887777"
-		lid   = "998877665544332"
-	)
-
-	session, _ := newTestSession(t, "5511999990001")
-	learn(t, session, phone, lid)
-	session.storeLimit = time.Nanosecond
-
-	// No deadline on the command, so the bound has to come from here.
-	_, err := session.Execute(t.Context(), resolveCommand(t, `{"party":{"kind":"lid","id":"`+lid+`"}}`))
-	assertCode(t, err, protocol.ErrorTimeout)
 }

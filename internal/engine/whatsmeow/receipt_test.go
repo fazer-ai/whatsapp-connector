@@ -609,3 +609,60 @@ func TestAReadMarkWhereMessagesHaveAnAuthorHasToNameThem(t *testing.T) {
 		})
 	}
 }
+
+// A receipt names the far end of the conversation in one of two fields depending on which
+// way it goes, and only one of them is ever filled in: `parseMessageSource` reads the
+// recipient's alternate on the from-me branch alone. Reading only that one leaves an
+// inbound receipt with no pairing to go on, and the tick lands on a conversation keyed by
+// the number while the messages are filed under the LID.
+func TestAReceiptTakesThePeerAlternateWhicheverWayItGoes(t *testing.T) {
+	t.Parallel()
+
+	const (
+		phone = "5511999990009"
+		lid   = "167392323834041"
+	)
+
+	for _, tc := range []struct {
+		name   string
+		source waTypes.MessageSource
+	}{
+		{
+			name: "somebody read what this account sent",
+			source: waTypes.MessageSource{
+				Chat:      waTypes.NewJID(phone, waTypes.DefaultUserServer),
+				Sender:    waTypes.NewJID(phone, waTypes.DefaultUserServer),
+				SenderAlt: waTypes.NewJID(lid, waTypes.HiddenUserServer),
+			},
+		},
+		{
+			name: "this account read from another of its devices",
+			source: waTypes.MessageSource{
+				IsFromMe:     true,
+				Chat:         waTypes.NewJID(phone, waTypes.DefaultUserServer),
+				Sender:       waTypes.NewJID("5511999990001", waTypes.DefaultUserServer),
+				RecipientAlt: waTypes.NewJID(lid, waTypes.HiddenUserServer),
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			session, _ := newTestSession(t, "5511999990001")
+			session.setConnected(true)
+
+			published, ok := session.receiptOf(&waEvents.Receipt{
+				MessageSource: tc.source,
+				MessageIDs:    []string{"3EB0"},
+				Type:          waTypes.ReceiptTypeRead,
+				Timestamp:     time.UnixMilli(1700000000000),
+			})
+			if !ok {
+				t.Fatal("the receipt was not published at all")
+			}
+			if published.Chat.Kind != protocol.AddressLID || published.Chat.ID != lid {
+				t.Errorf("the receipt went out under %+v, want the LID the stanza named the peer by", published.Chat)
+			}
+		})
+	}
+}
