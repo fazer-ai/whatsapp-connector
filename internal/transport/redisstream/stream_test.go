@@ -406,11 +406,14 @@ func TestReplyPushesOneElementWithATTL(t *testing.T) {
 	ctx := context.Background()
 	reply := protocol.Reply{V: protocol.Version, ID: "c1", OK: true, Result: json.RawMessage(`{"state":"open"}`)}
 
-	if err := f.streams(t, "inst-a").Reply(ctx, "c1", reply); err != nil {
+	// The key as a client spells it in `reply_to`, which is where it is blocked: the
+	// contract's own command frames carry it fully spelled, and this is what stops the
+	// prefix from being applied a second time on the way out.
+	key := f.client.Keys().Reply("c1")
+	if err := f.streams(t, "inst-a").Reply(ctx, key, reply); err != nil {
 		t.Fatalf("Reply: %v", err)
 	}
 
-	key := f.client.Keys().Reply("c1")
 	// Read the expiry before taking the element: popping the only element deletes the
 	// key, and a deleted key reports no TTL.
 	if ttl := f.server.TTL(key); ttl <= 0 {
@@ -427,6 +430,32 @@ func TestReplyPushesOneElementWithATTL(t *testing.T) {
 	}
 	if !got.OK || got.ID != "c1" {
 		t.Errorf("reply = %+v, want ok for c1", got)
+	}
+}
+
+// The destination comes off the wire, so it is checked rather than trusted: everything
+// else under the prefix is fleet state, and one transaction would leave a TTL on it even
+// where the push fails on the type.
+func TestReplyRefusesADestinationOutsideTheReplyNamespace(t *testing.T) {
+	t.Parallel()
+
+	f := newFleet(t)
+	ctx := context.Background()
+	reply := protocol.Reply{V: protocol.Version, ID: "c1", OK: true}
+
+	for _, key := range []string{
+		f.client.Keys().Sessions(),
+		f.client.Keys().Commands("2f1c6f0e-0000-4000-8000-000000000001"),
+		f.client.Keys().Prefix() + "reply:",
+		"reply:c1",
+		"wa:other:c1",
+	} {
+		if err := f.streams(t, "inst-a").Reply(ctx, key, reply); err == nil {
+			t.Errorf("Reply to %q returned no error, want a refusal", key)
+		}
+		if ttl := f.server.TTL(key); ttl > 0 {
+			t.Errorf("Reply to %q left a TTL of %v behind", key, ttl)
+		}
 	}
 }
 

@@ -135,18 +135,27 @@ func (s *Streams) Publish(ctx context.Context, event *protocol.Event) error {
 
 // Reply pushes the single element the caller is blocked on, and puts a TTL on it so a
 // caller that gave up does not leave the answer behind forever.
+//
+// `reply_to` is the key itself, not a command id to build one from: the contract's own
+// command frames carry it fully spelled (`wa:reply:cmd_000035`), because the client is
+// the one blocked on it and it is the client that chose where to wait. Prefixing it
+// again here answered at `wa:reply:wa:reply:<id>`, which nobody reads, so every RPC in
+// the fleet timed out while the command it carried had already been carried out.
 func (s *Streams) Reply(ctx context.Context, replyTo string, reply protocol.Reply) error {
-	if replyTo == "" {
-		return errors.New("redisstream: reply without a destination")
+	// The destination is the client's to choose and this connector's to check. Everything
+	// else under the prefix is fleet state -- the session set, the leases, the streams --
+	// and an answer written at one of those names would leave a TTL on it even where the
+	// push itself fails on the type, since both run in one transaction.
+	if !s.client.Keys().IsReply(replyTo) {
+		return fmt.Errorf("redisstream: %q is not a reply destination", replyTo)
 	}
 	body, err := marshalReply(reply)
 	if err != nil {
 		return err
 	}
-	key := s.client.Keys().Reply(replyTo)
 	_, err = s.client.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
-		pipe.LPush(ctx, key, body)
-		pipe.PExpire(ctx, key, s.opts.ReplyTTL)
+		pipe.LPush(ctx, replyTo, body)
+		pipe.PExpire(ctx, replyTo, s.opts.ReplyTTL)
 		return nil
 	})
 	if err != nil {

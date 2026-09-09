@@ -9,6 +9,7 @@ package redisx
 import (
 	"hash/fnv"
 	"strconv"
+	"strings"
 )
 
 // DefaultPrefix is what both sides use unless the deployment overrides it. The
@@ -72,6 +73,17 @@ func (k Keys) Control() string { return k.prefix + "control" }
 
 // Reply is the list one RPC reply is pushed to.
 func (k Keys) Reply(commandID string) string { return k.prefix + "reply:" + commandID }
+
+// IsReply reports whether a key names a reply list of this fleet, and nothing else.
+//
+// A command carries the key it wants its answer on, so the value is a client's to
+// choose and this connector's to check: everything else under the prefix is fleet
+// state -- the session set, the leases, the streams -- and an answer written at one of
+// those names would put a TTL on it. Naming an id is required too, since the bare
+// namespace is not a destination.
+func (k Keys) IsReply(key string) bool {
+	return strings.HasPrefix(key, k.prefix+"reply:") && len(key) > len(k.prefix)+len("reply:")
+}
 
 // Sessions is the set of every session the fleet knows about.
 func (k Keys) Sessions() string { return k.prefix + "sessions" }
