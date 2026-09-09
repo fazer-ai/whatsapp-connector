@@ -386,26 +386,32 @@ func (m *Manager) ReturnAdopted(sids []string) {
 
 // Release stops a session and gives up its lease.
 func (m *Manager) Release(ctx context.Context, sid string) {
-	m.mu.Lock()
-	session, ok := m.sessions[sid]
-	delete(m.sessions, sid)
-	m.mu.Unlock()
 	// Before the session stops rather than with the release, and that ordering is the
 	// whole of what the mark buys. Stopping is not instant -- it closes a socket and
 	// drains what the session was holding -- and throughout it the lease still names this
 	// instance while nothing here runs the account. A wake landing in that gap finds an
 	// owner, is acknowledged as an account already running, and the release that follows
 	// leaves the account owned by nobody.
-	//
-	// After the map and not before it, because the mark cannot be written under `mu`: it
-	// is a round trip, and everything that looks a session up on this instance would wait
-	// behind it. What is left between the two is a handful of instructions with no I/O in
-	// them, against a stop that closes a socket.
 	m.givingUp(ctx, sid)
+	m.stopSession(sid)
+	m.abandon(ctx, sid)
+}
+
+// stopSession takes a session out of the map and stops it, and talks to nobody.
+//
+// Separate from the hand-back that follows because their costs are not alike: this one
+// closes a socket and is local, and the hand-back is a round trip that can hang. A
+// shutdown does all of these first, so no account's socket waits on another account's
+// Redis. The mark that says the lease is on its way back is the caller's for the same
+// reason: one for the whole list rather than one per socket.
+func (m *Manager) stopSession(sid string) {
+	m.mu.Lock()
+	session, ok := m.sessions[sid]
+	delete(m.sessions, sid)
+	m.mu.Unlock()
 	if ok {
 		session.Stop()
 	}
-	m.abandon(ctx, sid)
 }
 
 // abandon hands back the lease of a session this instance is no longer running.
@@ -462,7 +468,7 @@ func (m *Manager) givingUp(ctx context.Context, sid string) {
 	//
 	// Derived from the caller's context rather than detached from it, so a shutdown with
 	// less than this left still gets the socket down inside its own grace.
-	marking, done := context.WithTimeout(ctx, min(releaseTimeout, m.leases.TTL()/ReleaseShare))
+	marking, done := context.WithTimeout(ctx, m.markingFor())
 	err := m.leases.MarkHandingBack(marking, sid)
 	done()
 	if err != nil {
@@ -481,6 +487,11 @@ func (m *Manager) givingUp(ctx context.Context, sid string) {
 		m.orphans[sid] = err == nil
 	}
 	m.orphanMu.Unlock()
+}
+
+// markingFor is how long a mark that goes in front of a stop may take.
+func (m *Manager) markingFor() time.Duration {
+	return min(releaseTimeout, m.leases.TTL()/ReleaseShare)
 }
 
 // releaseOrphans retries the hand-backs that did not reach Redis.
@@ -1031,9 +1042,61 @@ const ReleaseShare = 3
 // exits: a released lease is one a peer can take immediately instead of waiting a full
 // TTL for it to expire.
 func (m *Manager) StopAll(ctx context.Context) {
-	for _, sid := range m.SIDs() {
-		m.Release(ctx, sid)
+	sids := m.SIDs()
+	// All of them in one round trip, ahead of every stop, and this is the shape rather
+	// than a mark per Release because the releases are serial: a Redis that answers
+	// nothing would otherwise be waited out once per session, in front of each socket in
+	// turn, and the last one on the list would still be talking to WhatsApp long after
+	// the lease a peer can take its account on had expired.
+	//
+	// What a mark per session would have spent is then not spent at all: the stops below
+	// go straight through, and the hand-backs behind them carry whatever retry the batch
+	// still deserves.
+	m.givingUpAll(ctx, sids)
+	for _, sid := range sids {
+		m.stopSession(sid)
 	}
+	// Only now, with every socket already down. A hand-back is a round trip that can
+	// hang, and one interleaved with the stops is an account still talking to WhatsApp
+	// because the account before it is waiting on a Redis that does not answer.
+	for _, sid := range sids {
+		m.abandon(ctx, sid)
+	}
+}
+
+// givingUpAll marks a whole batch of hand-backs, under one bound and one round trip.
+func (m *Manager) givingUpAll(ctx context.Context, sids []string) {
+	unmarked := make([]string, 0, len(sids))
+	m.orphanMu.Lock()
+	for _, sid := range sids {
+		if marked := m.orphans[sid]; !marked {
+			unmarked = append(unmarked, sid)
+			m.orphans[sid] = false
+		}
+	}
+	m.orphanMu.Unlock()
+	if len(unmarked) == 0 {
+		return
+	}
+
+	marking, done := context.WithTimeout(ctx, m.markingFor())
+	err := m.leases.MarkManyHandingBack(marking, unmarked)
+	done()
+	if err != nil {
+		m.log.Warn().Err(err).Int("sessions", len(unmarked)).
+			Msg("could not mark hand-backs for peers to see; handing back anyway")
+		return
+	}
+	m.orphanMu.Lock()
+	for _, sid := range unmarked {
+		// Only where the session is still one this instance is giving up, for the reason
+		// givingUp gives: an adoption that won the account back must not be left carrying
+		// a mark that says it is on its way out.
+		if _, still := m.orphans[sid]; still {
+			m.orphans[sid] = true
+		}
+	}
+	m.orphanMu.Unlock()
 }
 
 // SweepRetired hands back the lease of every session the engine has finished with.

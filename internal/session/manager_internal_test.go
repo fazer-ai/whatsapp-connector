@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"slices"
 	"strings"
@@ -2511,5 +2512,69 @@ func TestAMarkThatCannotBeWrittenDoesNotHoldTheSocketOpen(t *testing.T) {
 	case <-engineSession.Events():
 	case <-time.After(2 * time.Second):
 		t.Fatal("a session held its socket open on a mark that was waiting out a Redis that does not answer, for longer than the lease a peer can take the account on")
+	}
+}
+
+// A shutdown stops its sessions one after another, and the mark goes in front of each
+// stop. Asked once per session against a Redis that answers nothing, the waits stack: the
+// last account on the list is still talking to WhatsApp long after the lease a peer can
+// take it on has expired, which is the one thing the lease exists to prevent. One batch,
+// under one bound, is what keeps the shutdown's cost off the number of sessions.
+func TestAShutdownDoesNotWaitOncePerSessionBeforeStoppingThem(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	hop := stallable(t, server.Addr())
+	rdb := redis.NewClient(&redis.Options{Addr: hop.addr(), ContextTimeoutEnabled: true})
+	t.Cleanup(func() { _ = rdb.Close() })
+
+	// The bound on one mark is a third of this, so six sessions marked one at a time
+	// spend six of them and the batch spends one.
+	const ttl = 900 * time.Millisecond
+	engines := fake.New()
+	manager := NewManager(&ManagerConfig{
+		Instance: "inst-a", Engine: engines,
+		Leases: cluster.NewLeases(redisx.Wrap(rdb, "wa:", 8), "inst-a", cluster.Options{
+			TTL: ttl, Margin: ttl / 10,
+		}),
+		Publisher: quietPublisher{}, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+
+	ctx := context.Background()
+	sessions := make([]*fake.Session, 0, 6)
+	for i := range 6 {
+		sid := fmt.Sprintf("9c2b7d1e-0000-4000-8000-00000000d0%02d", i)
+		if _, err := manager.Adopt(ctx, sid); err != nil {
+			t.Fatalf("Adopt %s: %v", sid, err)
+		}
+		engineSession, running := engines.Session(sid)
+		if !running {
+			t.Fatalf("the engine has no session for %s", sid)
+		}
+		sessions = append(sessions, engineSession)
+	}
+
+	hop.stall()
+	stopped := make(chan struct{})
+	// Before the resume, so the resume runs first: the hand-backs behind the stops are on
+	// the caller's own context and are not what this measures.
+	t.Cleanup(func() { <-stopped })
+	t.Cleanup(hop.resume)
+	go func() {
+		defer close(stopped)
+		manager.StopAll(ctx)
+	}()
+
+	// Closing the engine session is what closes these, so a receive on every one means
+	// every socket is down. Three marks' worth of room, against the six a mark per
+	// session would spend.
+	deadline := time.After(ttl)
+	for i, engineSession := range sessions {
+		select {
+		case <-engineSession.Events():
+		case <-deadline:
+			t.Fatalf("a shutdown was still holding sockets open at session %d of %d, waiting out a Redis that does not answer once per session", i, len(sessions))
+		}
 	}
 }

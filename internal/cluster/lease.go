@@ -378,6 +378,53 @@ redis.call("SET", KEYS[2], ARGV[1], "PX", ARGV[2])
 return 1
 `)
 
+// MarkManyHandingBack marks a whole batch in one round trip.
+//
+// One and not one per session, for the reason RenewMany exists: what a shutdown spends
+// here is spent in front of the stops that take the sockets down, and a wait that grows
+// with how many sessions the instance carries is one where the last socket outlives the
+// lease a peer can already take the account on.
+//
+// Answers are not read back one by one. The caller learns whether the batch reached
+// Redis, which is the only thing it can act on: a mark refused because the lease moved
+// on is an answer, not a failure, exactly as in MarkHandingBack.
+func (l *Leases) MarkManyHandingBack(ctx context.Context, sids []string) error {
+	if len(sids) == 0 {
+		return nil
+	}
+	keys := l.client.Keys()
+	_, err := l.client.Pipelined(ctx, func(pipe redis.Pipeliner) error {
+		for _, sid := range sids {
+			markHandingBackScript.EvalSha(
+				ctx, pipe, []string{keys.Lease(sid), keys.HandBack(sid)}, l.instance, l.ttl.Milliseconds(),
+			)
+		}
+		return nil
+	})
+	if err == nil {
+		return nil
+	}
+	// The digest is not loaded on the first pass after a restart or a SCRIPT FLUSH, and
+	// inside a pipeline Run's own fallback cannot help: it decides on an error the command
+	// does not carry until the whole batch has been sent. Resent whole rather than per
+	// session, which is the round trip this exists to avoid spending N times.
+	if !redis.HasErrorPrefix(err, "NOSCRIPT") {
+		return fmt.Errorf("cluster: mark handing back %d sessions: %w", len(sids), err)
+	}
+	_, err = l.client.Pipelined(ctx, func(pipe redis.Pipeliner) error {
+		for _, sid := range sids {
+			markHandingBackScript.Eval(
+				ctx, pipe, []string{keys.Lease(sid), keys.HandBack(sid)}, l.instance, l.ttl.Milliseconds(),
+			)
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("cluster: mark handing back %d sessions: %w", len(sids), err)
+	}
+	return nil
+}
+
 // MarkHandingBack says that this instance holds a lease it has stopped running and is
 // about to give up. Release clears it, and it expires on its own after one TTL, which
 // outlasts the lease it is about.
