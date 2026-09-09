@@ -307,15 +307,32 @@ func (s *Session) resolveContact(ctx context.Context, command *protocol.Command)
 		// than fails on -- so the account can be the one party the table cannot answer
 		// for, which would be an absurd thing for this command to be unable to resolve.
 		//
-		// The LID half is only as good as what the session was told: a resumed device
-		// learns its LID on the connection rather than through a `PairSuccess`, and
-		// nothing copies it out afterwards, so this can answer with the number alone.
-		// That is issue #138, and it is a missing half rather than a wrong one.
+		// The LID half is as good as what the session has been told, which is the device
+		// it was built on plus what the connection brought: a resumed device learns its
+		// LID there rather than through a `PairSuccess`. A session that has never
+		// connected can still answer with the number alone.
 		if lid != "" {
 			named.LID = lid
 		}
 		named.Phone = phone
+		// The table first, then the session for what it does not hold. Its own names are
+		// usually in neither -- the table is the people this account has met, and it is
+		// not one of them -- so the session answers most of the time.
+		//
+		// Where a row does exist, the table is the copy that is never behind: every change
+		// to either name is written there, by whatsmeow for a verified name and by this
+		// session for a push name. The device record is not, which is why it does not get
+		// to answer over it.
 		s.nameFromStore(reading, &named)
+		own := s.names()
+		if own.push != "" && (own.pushUnfiled || named.PushName == "") {
+			// Unfiled is the one case the table is behind: the write that keeps it level
+			// failed, and the row still holds the name before this one.
+			named.PushName = own.push
+		}
+		if own.verified != "" && (own.verifiedUnfiled || named.VerifiedName == "") {
+			named.VerifiedName = own.verified
+		}
 		return json.Marshal(named)
 	}
 	alt, found, err := s.aliases.lookup(reading, s, jid)

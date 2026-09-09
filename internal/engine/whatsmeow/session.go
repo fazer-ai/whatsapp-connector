@@ -424,6 +424,28 @@ type Session struct {
 	// and rebuilding. Fusing the two would have a connect arriving during a logout run
 	// that cleanup a second time, alongside the one the logout is already running.
 	revoked bool
+
+	// pushName and businessName are this account's own display names. They live here
+	// rather than being read off `client.Store` where they are wanted, because whatsmeow
+	// writes those fields from its own goroutines: the copy is taken where an ordering
+	// exists -- building a client nothing else holds yet, and the events that announce
+	// each change -- and read from here under the lock like every other session field.
+	pushName     string
+	businessName string
+	// pushUnfiled says the push name in hand has not made it into the contact table, so
+	// the row is behind it. The table answers over the session everywhere else, and a
+	// write that failed is exactly the case where that would answer with a name the
+	// account has already left behind.
+	pushUnfiled bool
+	// verifiedUnfiled says the same about the verified name. whatsmeow files that one
+	// itself and files it first, so the row the change arrived on is written by the time
+	// the event exists; the other row is best effort and is the one a read goes to first.
+	verifiedUnfiled bool
+	// naming serialises the filing of the push name, which is the one session field whose
+	// write reaches further than this struct. It is not `mu`: the write is a store round
+	// trip, and holding the session lock across one would stall every other reader for as
+	// long as the database takes.
+	naming sync.Mutex
 	// phone and lid are this session's copy of what it paired. whatsmeow assigns the
 	// same fields on its pairing goroutine, so reading them off the client from a
 	// command is a race; this is written from the event handler and read under the
@@ -617,14 +639,38 @@ func sessionNonce() string {
 // identityOf reads what a client was built knowing. Safe before the client is running,
 // which is the only time this is called: once it is, whatsmeow assigns the same fields
 // from its pairing goroutine.
-func identityOf(client *wm.Client) (phone, lid string) {
+// account is what a device record says about the account on it.
+type account struct {
+	phone        string
+	lid          string
+	pushName     string
+	businessName string
+}
+
+// addressesOf is the pair of names WhatsApp addresses an account by.
+//
+// Its own reader, because the display names next to them on the device record are written
+// by whatsmeow's app-state goroutine: reading a field and discarding it is the same race
+// as reading it and using it, so a path that only wants the addresses must not go past
+// them.
+func addressesOf(client *wm.Client) account {
+	var named account
 	if id := client.Store.ID; id != nil {
-		phone = id.User
+		named.phone = id.User
 	}
 	if stored := client.Store.LID; !stored.IsEmpty() {
-		lid = stored.User
+		named.lid = stored.User
 	}
-	return phone, lid
+	return named
+}
+
+// identityOf is addressesOf plus the display names, and it is only safe where nothing
+// else holds the client yet.
+func identityOf(client *wm.Client) account {
+	named := addressesOf(client)
+	named.pushName = client.Store.PushName
+	named.businessName = client.Store.BusinessName
+	return named
 }
 
 // adopt takes a client over: it wires the callbacks, subscribes to its events, and
@@ -663,7 +709,9 @@ func (s *Session) adopt(client *wm.Client) bool {
 	// ciphertext, until a handler accepts it.
 	client.EnableDecryptedEventBuffer = true
 
-	phone, lid := identityOf(client)
+	// Read here and not later: this client was built for this session and nothing else
+	// holds it yet, so whatsmeow's own goroutines are not writing to it.
+	named := identityOf(client)
 
 	// Subscribed before the swap, so the client is never live with nobody listening,
 	// and both halves are one lifecycle step: a Close that lands between them would
@@ -679,8 +727,16 @@ func (s *Session) adopt(client *wm.Client) bool {
 	}
 	s.client = client
 	s.handlerID = handlerID
-	s.phone = phone
-	s.lid = lid
+	s.phone = named.phone
+	s.lid = named.lid
+	// A rebuilt client brings the device record's copy of these names back, and the marker
+	// that a row would not take one survives only where it still describes that row: the
+	// name coming back has to be the one the row refused, or nothing here knows anything
+	// about what the table is holding.
+	s.pushUnfiled = s.pushUnfiled && s.pushName == named.pushName
+	s.verifiedUnfiled = s.verifiedUnfiled && s.businessName == named.businessName
+	s.pushName = named.pushName
+	s.businessName = named.businessName
 	s.stale = false
 	s.revoked = false
 	s.connected = false
@@ -811,6 +867,212 @@ func (s *Session) setIdentity(phone, lid string) {
 	s.mu.Lock()
 	s.phone = phone
 	s.lid = lid
+	s.mu.Unlock()
+}
+
+// isSelf reports whether a JID names the account this session is paired with.
+//
+// Namespace and digits both, because the digits alone are not an identity: a LID and a
+// phone number are two numbers drawn from two spaces, and nothing stops one account's LID
+// reading like another account's number. Matching on digits would then take a stranger's
+// name for this account's own.
+func (s *Session) isSelf(jid waTypes.JID) bool {
+	address, named := addressOf(jid)
+	if !named {
+		return false
+	}
+	phone, lid := s.identity()
+	switch address.Kind {
+	case protocol.AddressPhone:
+		return phone != "" && address.ID == phone
+	case protocol.AddressLID:
+		return lid != "" && address.ID == lid
+	default:
+		return false
+	}
+}
+
+// setVerifiedName records the name a business account is verified under.
+func (s *Session) setVerifiedName(businessName string) {
+	s.mu.Lock()
+	s.businessName = businessName
+	s.mu.Unlock()
+}
+
+// reverify records a verified name the account changed while the session was up.
+//
+// whatsmeow files this one itself, and the event is proof that it filed it: the row under
+// the address the change arrived on took the write, or `updateBusinessName` would have
+// returned before dispatching. The other row is where that stops being true -- it resolves
+// the alternate address afterwards and logs a failure there rather than reporting it --
+// and when the change arrives on the LID, the row left behind is the one a read goes to
+// first.
+func (s *Session) reverify(businessName string) {
+	if businessName == "" {
+		return
+	}
+	s.mu.Lock()
+	s.businessName = businessName
+	s.verifiedUnfiled = true
+	s.mu.Unlock()
+
+	s.recordOwnVerifiedName(businessName)
+}
+
+// rename records a push name the account changed while the session was up.
+func (s *Session) rename(pushName string) {
+	if pushName == "" {
+		return
+	}
+	s.mu.Lock()
+	s.pushName = pushName
+	s.pushUnfiled = true
+	s.mu.Unlock()
+
+	// Written to the contact table as well, which is the only thing that keeps the two
+	// copies of this name from disagreeing after a restart. A rename arrives two ways and
+	// each writes one of them: an app-state sync writes the device record, and the notify
+	// on a message the account sent writes the table. Neither writes the other, so a
+	// session rebuilt from the record has no way to tell which of the two it is holding.
+	// Writing here makes the table the one that is never behind.
+	s.recordOwnName(pushName)
+}
+
+// recordOwnName files the account's own push name where the people it has met are filed.
+//
+// A failure is logged rather than retried: the name is an annotation and the session's own
+// copy is already current. What it costs is that the row is behind until the next rename,
+// which is why the session remembers that it is.
+func (s *Session) recordOwnName(pushName string) {
+	client := s.current()
+	if client == nil || client.Store == nil || client.Store.Contacts == nil {
+		return
+	}
+	// One filing at a time, and only for the name the session is still holding. Two
+	// renames can be in flight on different goroutines -- an app-state sync dispatches on
+	// one of its own, the notify on a message the account sent on the one that read it --
+	// and without this the older write can land after the newer one and leave the table
+	// holding a name the session has already stopped saying is unfiled.
+	s.naming.Lock()
+	defer s.naming.Unlock()
+	if s.names().push != pushName {
+		return
+	}
+	if !s.fileOwnName(client.Store.Contacts.PutPushName, pushName, "push name") {
+		return
+	}
+	s.mu.Lock()
+	// Only while the name is still the one that was written: a rename that landed during
+	// this has a write of its own behind it.
+	if s.pushName == pushName {
+		s.pushUnfiled = false
+	}
+	s.mu.Unlock()
+}
+
+// recordOwnVerifiedName files the account's own verified name under the address whatsmeow
+// may have left without it.
+func (s *Session) recordOwnVerifiedName(businessName string) {
+	client := s.current()
+	if client == nil || client.Store == nil || client.Store.Contacts == nil {
+		return
+	}
+	s.naming.Lock()
+	defer s.naming.Unlock()
+	if s.names().verified != businessName {
+		return
+	}
+	if !s.fileOwnName(client.Store.Contacts.PutBusinessName, businessName, "verified name") {
+		return
+	}
+	s.mu.Lock()
+	if s.businessName == businessName {
+		s.verifiedUnfiled = false
+	}
+	s.mu.Unlock()
+}
+
+// fileOwnName writes one of the account's own display names under every address the
+// account answers under, and says whether every one of them took it.
+//
+// All of them, because a read takes the first row that holds a name and the phone row is
+// read first: one row left behind is enough to answer with a name the account has left.
+func (s *Session) fileOwnName(
+	put func(context.Context, waTypes.JID, string) (bool, string, error),
+	name, what string,
+) bool {
+	phone, lid := s.identity()
+	writing, done := context.WithTimeout(s.ctx, s.storeLimit)
+	defer done()
+	filed, missed := false, false
+	for _, address := range []protocol.Address{
+		{Kind: protocol.AddressPhone, ID: phone},
+		{Kind: protocol.AddressLID, ID: lid},
+	} {
+		if address.ID == "" {
+			continue
+		}
+		jid, err := jidOf(address)
+		if err != nil {
+			missed = true
+			continue
+		}
+		if _, _, err := put(writing, jid, name); err != nil {
+			s.log.Debug().Err(err).Str("kind", string(address.Kind)).Str("name", what).
+				Msg("could not file one of the account's own names")
+			missed = true
+			continue
+		}
+		filed = true
+	}
+	return filed && !missed
+}
+
+// selfNames is what this account calls itself: the push name every recipient sees, and the
+// verified name a business account carries.
+type selfNames struct {
+	push string
+	// pushUnfiled and verifiedUnfiled say the name beside them has not reached the contact
+	// table, which is otherwise the copy that answers.
+	pushUnfiled     bool
+	verified        string
+	verifiedUnfiled bool
+}
+
+func (s *Session) names() selfNames {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return selfNames{
+		push:            s.pushName,
+		pushUnfiled:     s.pushUnfiled,
+		verified:        s.businessName,
+		verifiedUnfiled: s.verifiedUnfiled,
+	}
+}
+
+// relearn takes the account's own details off the client again.
+//
+// The LID is why. whatsmeow learns it from the connection rather than from the device it
+// resumed -- `handleConnectSuccess` writes `Store.LID` and saves -- so a device stored
+// before the account had one runs with none until this. Nothing else puts it back: the
+// only other writer is pairing, and a resumed session never pairs.
+//
+// Called from the Connected handler, which is where the ordering is: whatsmeow writes the
+// LID and then starts the goroutine that dispatches the event, so what this reads is what
+// that write left.
+//
+// The addresses and nothing else, for the same reason. That ordering covers the LID write
+// and covers nothing about the display names, which an app-state sync writes from its own
+// goroutine and may be writing right now -- reading them here would be the data race this
+// whole arrangement exists to avoid. They arrive on their own events instead.
+func (s *Session) relearn(client *wm.Client) {
+	if client == nil || client.Store == nil {
+		return
+	}
+	named := addressesOf(client)
+	s.mu.Lock()
+	s.phone = named.phone
+	s.lid = named.lid
 	s.mu.Unlock()
 }
 
@@ -2453,6 +2715,11 @@ func (s *Session) handle(rawEvent any) bool {
 		s.transition.Lock()
 		defer s.transition.Unlock()
 
+		// Before the socket is judged, because the addresses do not depend on whether this
+		// connection is one this session still wants: whatsmeow has already written and
+		// saved the LID by the time this event exists, and a socket that is about to be
+		// closed produces no second Connected to learn it from.
+		s.relearn(s.current())
 		if s.undoHangUp() {
 			// A reconnect that was already past its wait when the disconnect landed. The
 			// command has answered `close`, so this socket is one nobody asked for.
@@ -2555,6 +2822,28 @@ func (s *Session) handle(rawEvent any) bool {
 		})
 	case *waEvents.PairSuccess:
 		s.paired(event)
+	case *waEvents.PushNameSetting:
+		// The account renamed itself, from this phone or another one. Taken off the event
+		// rather than off `client.Store`, which whatsmeow writes on this same path: the
+		// event carries the new name, so there is nothing to go and read.
+		s.rename(event.Action.GetName())
+	case *waEvents.PushName:
+		// The account's own name, learned from a message it sent from another device
+		// rather than from an app-state sync. whatsmeow writes it to the contact table and
+		// dispatches this, which may be the only notice there is: a rename seen this way
+		// need not be followed by a `PushNameSetting`.
+		if s.isSelf(event.JID) || s.isSelf(event.JIDAlt) {
+			s.rename(event.NewPushName)
+		}
+	case *waEvents.BusinessName:
+		// A verified name change, for whoever it is about. whatsmeow puts it in the
+		// contact table and does not touch the device record, so the account's own is the
+		// one nothing else here would ever hear about: the copy taken at pairing would
+		// stand for the life of the session, and it is the copy `contact.resolve`
+		// answers with.
+		if s.isSelf(event.JID) {
+			s.reverify(event.NewBusinessName)
+		}
 	case *waEvents.PairError:
 		// Whatever the QR channel does with this, the client is on a device whatsmeow
 		// may have half-written: an id with no credentials, or one it marked deleted.
@@ -2621,6 +2910,11 @@ func (s *Session) paired(event *waEvents.PairSuccess) {
 		lid = event.LID.User
 	}
 	s.setIdentity(event.ID.User, lid)
+	// The verified name arrives here and nowhere else until a reconnect: the client this
+	// session was built with had no account on it, so what `adopt` copied was empty. A
+	// business account resolving itself before its first reconnect would answer without
+	// one, and a reconnect that keeps failing never comes.
+	s.setVerifiedName(event.BusinessName)
 
 	payload := map[string]any{"phone": event.ID.User, "platform": event.Platform}
 	if lid != "" {
