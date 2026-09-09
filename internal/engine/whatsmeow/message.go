@@ -71,7 +71,7 @@ func addressOf(jid waTypes.JID) (protocol.Address, bool) {
 // that only ever stored the phone number still has to recognise the LID as the same
 // person the first time a chat switches.
 func (s *Session) partyOf(ctx context.Context, info *waTypes.MessageInfo) (*protocol.Party, bool) {
-	party := s.party(ctx, info.Sender, info.SenderAlt)
+	party := s.party(ctx, info.Sender, wireAlt(info))
 	party.PushName = info.PushName
 	if info.VerifiedName != nil {
 		party.VerifiedName = info.VerifiedName.Details.GetVerifiedName()
@@ -228,7 +228,30 @@ func (s *Session) chatOf(ctx context.Context, info *waTypes.MessageInfo) (protoc
 		// SenderAlt names the participant here, not the chat.
 		return s.address(ctx, chatJID)
 	}
-	return s.address(ctx, chatJID, info.SenderAlt)
+	// RecipientAlt is the chat's other address whichever direction the message went --
+	// `peer_recipient_pn` and `peer_recipient_lid`, both read off the stanza -- and it is
+	// the only one that names the person on the other end of a message this account sent
+	// from another of its devices.
+	return s.address(ctx, chatJID, info.RecipientAlt, wireAlt(info))
+}
+
+// wireAlt is a sender's other address, and only where the event is proof WhatsApp sent it.
+//
+// whatsmeow backfills one. A phone-addressed message that arrives without `sender_lid`
+// has its LID looked up in the shared mapping by `decryptMessages` and assigned to
+// `SenderAlt` before the event is dispatched, and nothing on the event tells that apart
+// from the attribute WhatsApp put there -- so on a deployment serving more than one
+// operator, taking it would be taking a pairing another account was shown.
+//
+// The backfill only ever produces a LID, which is what leaves a case that cannot be one:
+// a message the LID addressed, whose alternate is the number off `sender_pn` or
+// `participant_pn`. A phone-addressed message names one namespace here, and its pairing
+// arrives on the next message addressed the other way.
+func wireAlt(info *waTypes.MessageInfo) waTypes.JID {
+	if address, addressable := addressOf(info.Sender); addressable && address.Kind == protocol.AddressLID {
+		return info.SenderAlt
+	}
+	return waTypes.EmptyJID
 }
 
 // newsletterEdit reports whether a newsletter post is a correction of an earlier one.

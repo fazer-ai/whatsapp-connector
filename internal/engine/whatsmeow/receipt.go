@@ -140,7 +140,10 @@ func (s *Session) receiptOf(event *waEvents.Receipt) (protocol.MessageReceipt, b
 	looking, done := s.looking()
 	defer done()
 
-	chat, addressable := s.address(looking, receiptChatJID(event))
+	// A receipt's alternates are read off the stanza and nowhere else -- nothing backfills
+	// them the way a message's sender alternate can be -- so both halves are what this
+	// account was addressed with.
+	chat, addressable := s.address(looking, receiptChatJID(event), receiptChatAlt(event))
 	if !addressable {
 		return protocol.MessageReceipt{}, false
 	}
@@ -151,7 +154,7 @@ func (s *Session) receiptOf(event *waEvents.Receipt) (protocol.MessageReceipt, b
 		Type:       kind,
 		Timestamp:  event.Timestamp.UnixMilli(),
 	}
-	if participant, addressable := s.address(looking, event.Sender); addressable {
+	if participant, addressable := s.address(looking, event.Sender, event.SenderAlt); addressable {
 		published.Participant = &participant
 	}
 	if kind == protocol.ReceiptFailed {
@@ -182,6 +185,16 @@ func receiptChatJID(event *waEvents.Receipt) waTypes.JID {
 		return event.BroadcastListOwner
 	}
 	return event.Chat
+}
+
+// receiptChatAlt is the chat's other address, where the chat is somebody rather than a
+// group: `RecipientAlt` names whoever is on the other end of the conversation, and a group
+// has no second namespace to name.
+func receiptChatAlt(event *waEvents.Receipt) waTypes.JID {
+	if event.IsGroup || !event.BroadcastListOwner.IsEmpty() {
+		return waTypes.EmptyJID
+	}
+	return event.RecipientAlt
 }
 
 var receiptKinds = map[waTypes.ReceiptType]protocol.ReceiptKind{
