@@ -323,9 +323,21 @@ func (s *Session) pump(ctx context.Context) {
 		case <-again.C:
 			owed := s.owed
 			s.owed = nil
-			if owed != nil {
-				s.carry(ctx, owed, again)
+			if owed == nil {
+				continue
 			}
+			if s.engine.Finished() != owed.Attempt {
+				// Asked before it is said again, and not after: a connect that succeeded
+				// while this was waiting has already published `open`, and a giving-up
+				// after that one has published its own. Said now, this would arrive after
+				// both and describe neither -- and the door it shuts is a door the newer
+				// one is holding.
+				s.log.Info().Str("type", string(owed.Type)).
+					Msg("the session moved on from the outcome that did not reach the stream; dropping it")
+				s.reopen(owed.Attempt)
+				continue
+			}
+			s.carry(ctx, owed, again)
 		case emission, ok := <-events:
 			if !ok {
 				return

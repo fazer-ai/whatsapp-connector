@@ -1514,16 +1514,25 @@ func TestTheEventFinishingASessionIsSaidAgainWhenItDoesNotLand(t *testing.T) {
 // flakyPublisher fails the first few writes, which is a Redis that is away and comes back.
 type flakyPublisher struct {
 	fails int
+	// failed closes on the first write that is refused, which is a test's signal that the
+	// pump is now holding an event it could not say.
+	failed  chan struct{}
+	failing sync.Once
 
-	mu   sync.Mutex
-	seen int
+	mu    sync.Mutex
+	seen  int
+	types []protocol.EventType
 }
 
-func (p *flakyPublisher) Publish(context.Context, *protocol.Event) error {
+func (p *flakyPublisher) Publish(_ context.Context, event *protocol.Event) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.seen++
+	p.types = append(p.types, event.Type)
 	if p.seen <= p.fails {
+		if p.failed != nil {
+			p.failing.Do(func() { close(p.failed) })
+		}
 		return errors.New("redis is away")
 	}
 	return nil
@@ -1533,6 +1542,20 @@ func (p *flakyPublisher) attempts() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.seen
+}
+
+// timesSaid is how often one event type was written, which is what tells a retry that
+// went out from one that was dropped.
+func (p *flakyPublisher) timesSaid(want protocol.EventType) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	said := 0
+	for _, seen := range p.types {
+		if seen == want {
+			said++
+		}
+	}
+	return said
 }
 
 // A connect taken off the queue before the door shut is one no door can call back, and it
@@ -1795,5 +1818,66 @@ func TestAWakeDoesNotHandBackASessionWithACommandInFlight(t *testing.T) {
 	}
 	if len(engineSession.Commands()) != 1 {
 		t.Fatal("the session the wake found was stopped from under the command it was carrying out")
+	}
+}
+
+// An outcome kept for another try describes the session as it was. A connect that
+// succeeded while it waited has already published `open`, and a giving-up after that one
+// has published its own: said now, it arrives after both and describes neither, and the
+// door it shuts is a door the newer one is holding.
+func TestAnOutcomeTheSessionMovedOnFromIsNotSaidAgain(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+
+	engines := fake.New()
+	publisher := &flakyPublisher{fails: 1, failed: make(chan struct{})}
+	manager := NewManager(&ManagerConfig{
+		Instance: "inst-a", Engine: engines,
+		Leases:    cluster.NewLeases(client, "inst-a", cluster.Options{}),
+		Publisher: publisher, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+		RetireRetry: 200 * time.Millisecond,
+	})
+	t.Cleanup(func() { manager.StopAll(context.Background()) })
+
+	const sid = "9c2b7d1e-0000-4000-8000-0000000000c3"
+	ctx := context.Background()
+	session, err := manager.Adopt(ctx, sid)
+	if err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, running := engines.Session(sid)
+	if !running {
+		t.Fatal("the engine has no session for the account that was just adopted")
+	}
+
+	engineSession.EmitLast(protocol.EventSessionConnectFailure, map[string]any{"reason": "unavailable"})
+	<-publisher.failed
+
+	// The retry that answered it, well inside the wait before the outcome would be said
+	// again.
+	if err := engineSession.Connect(ctx, engine.ConnectRequest{Pairing: "resume"}); err != nil {
+		t.Fatalf("the retry could not connect: %v", err)
+	}
+
+	// The door opening is the pump having reached the outcome it was keeping.
+	waitFor(t, func() bool {
+		return session.Offer(&transport.Delivery{
+			Command: protocol.Command{
+				V: protocol.Version, ID: "c1", Type: protocol.CommandMessageSend, SID: sid,
+			},
+			Ack: func(context.Context) error { return nil }, Release: func() {},
+		}) == OfferAccepted
+	}, "the door never opened again, so the outcome the session moved on from was never looked at")
+
+	if session.Retired() {
+		t.Fatal("an outcome the session had moved on from handed the account over")
+	}
+	if said := publisher.timesSaid(protocol.EventSessionConnectFailure); said != 1 {
+		t.Fatalf("the outcome was published %d times, want the one attempt that failed and no more: said again, it lands after the open the retry published", said)
 	}
 }
