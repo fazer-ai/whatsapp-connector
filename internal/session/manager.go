@@ -206,32 +206,28 @@ func (m *Manager) Adopt(ctx context.Context, sid string) (*Session, error) {
 	m.mu.RLock()
 	existing, running := m.sessions[sid]
 	m.mu.RUnlock()
-	claimed := running && existing.claim()
-	if running && !claimed {
+	if running {
 		if existing.leaving() {
-			// On its way out, and which way is not settled: the event saying the engine
-			// finished with it may still be going out, or a command it took before the
-			// door shut may not have answered. Answering the wake with this session
-			// acknowledges it, and the commands behind it are then refused by a door this
-			// instance is about to stop being the owner of.
+			// On its way out, whether or not that is settled yet: the event saying the
+			// engine finished with it may still be going out, a command it took before
+			// the door shut may not have answered, or the heartbeat may simply not have
+			// come round.
+			//
+			// Left pending rather than answered, and rather than handed back here to make
+			// room for a fresh session. Answering with it acknowledges the wake, and the
+			// commands behind it are then refused by a door this instance is about to
+			// stop being the owner of. Handing it back and taking it again in one step is
+			// worse: releasing arms a cooldown so the instance that let go does not
+			// immediately win the account back, and for a build WhatsApp will not talk to
+			// that is the whole point -- the retry has to be free to land on a peer whose
+			// image can succeed, and it cannot if the instance that cannot has already
+			// taken it. The sweep hands the account back on the next tick, and the wake is
+			// then a wake for an account nobody owns.
 			m.log.Info().Str("sid", sid).
 				Msg("a wake found an account this instance is finishing with; leaving it pending")
 			return nil, errLeaving
 		}
 		return existing, nil
-	}
-	if claimed {
-		// Finished with, and the sweep has not come round yet. Handing it back here
-		// rather than answering with it is what keeps the window between the two from
-		// being one where a command runs: a connect served by this session would
-		// reconnect an account the next heartbeat then stops and hands away anyway.
-		//
-		// Bounded and detached for the same reason `abandon` is on the failure path
-		// below: the caller's deadline is for adopting, and a cleanup that spent it
-		// would leave nothing for the adoption that follows.
-		release, cancelRelease := context.WithTimeout(context.WithoutCancel(ctx), releaseTimeout)
-		m.Release(release, sid)
-		cancelRelease()
 	}
 
 	// Bounded, and bounded around the I/O only. Commands are dispatched on the same

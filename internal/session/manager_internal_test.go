@@ -234,8 +234,11 @@ func waitFor(t *testing.T, done func() bool, complaint string) {
 
 // A client retrying between the terminal event and the next heartbeat must not be served
 // by the session that is on its way out: a connect answered there would put the account
-// back up on an instance whose next tick stops it and hands it away regardless. The
-// adoption hands it back instead, and what serves the retry is the session built after.
+// back up on an instance that hands it away moments later. Nor is the account taken back
+// in the same step, which is what handing it back here and acquiring again would be: the
+// release arms a cooldown so that the instance letting go does not immediately win the
+// account, and for a build WhatsApp will not talk to that is the whole point -- the retry
+// has to be free to land on a peer whose image can succeed.
 func TestAnAdoptionDoesNotHandBackASessionOnItsWayOut(t *testing.T) {
 	t.Parallel()
 
@@ -245,9 +248,9 @@ func TestAnAdoptionDoesNotHandBackASessionOnItsWayOut(t *testing.T) {
 	client := redisx.Wrap(rdb, "wa:", 8)
 
 	engines := fake.New()
+	leases := cluster.NewLeases(client, "inst-a", cluster.Options{})
 	manager := NewManager(&ManagerConfig{
-		Instance: "inst-a", Engine: engines,
-		Leases:    cluster.NewLeases(client, "inst-a", cluster.Options{}),
+		Instance: "inst-a", Engine: engines, Leases: leases,
 		Publisher: quietPublisher{}, Replier: quietReplier{},
 		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
 	})
@@ -265,18 +268,27 @@ func TestAnAdoptionDoesNotHandBackASessionOnItsWayOut(t *testing.T) {
 		t.Fatal("the engine has no session for the account that was just adopted")
 	}
 	engineSession.EmitLast(protocol.EventSessionConnectFailure, map[string]any{"reason": "unavailable"})
-	waitFor(t, func() bool { return first.Retired() }, "the session was never finished with")
+	waitFor(t, first.Retired, "the session was never finished with")
 
 	// The retry, before any heartbeat has swept.
 	second, err := manager.Adopt(ctx, sid)
-	if err != nil {
-		t.Fatalf("the retry could not be adopted: %v", err)
+	if !errors.Is(err, errLeaving) {
+		t.Fatalf("the retry was answered with %v, want %v", err, errLeaving)
 	}
-	if second == first {
-		t.Fatal("the retry was answered with the session that is on its way out")
+	if second != nil {
+		t.Fatal("the retry was answered with a session for an account this instance is finishing with")
 	}
-	if second.Retired() {
-		t.Fatal("the session built for the retry came back already finished with")
+	if _, held := leases.Owned(sid); !held {
+		t.Fatal("the retry handed the account back and took it again, which is the instance that cannot pair keeping it")
+	}
+
+	// And once the heartbeat has swept, the account is there for whoever wakes it next.
+	manager.SweepRetired(ctx, manager.HandBackBy())
+	if _, held := leases.Owned(sid); held {
+		t.Fatal("the sweep never handed the account back")
+	}
+	if _, err := manager.Adopt(ctx, sid); err != nil {
+		t.Fatalf("the account could not be adopted once it had been handed back: %v", err)
 	}
 }
 
@@ -504,12 +516,17 @@ func TestACommandForARetiredSessionIsLeftForItsNextOwner(t *testing.T) {
 	}
 }
 
-// The sweep runs on the heartbeat and adoptions run on the answer goroutine, so between
-// finding a retired session and handing it back a wake can have replaced it -- Adopt
-// does exactly that. Released by sid alone, the sweep then stops a session that is
-// running and deletes the lease it is running under, and the cooldown that release arms
-// keeps this instance from taking the account back.
-func TestASweepDoesNotHandBackASessionAdoptedAgainSinceItLooked(t *testing.T) {
+// A hand-back acts on the session it was asked about and not on whatever the map holds
+// when it gets there. The account can have been handed back and adopted again since --
+// the sweep names one session, the wake that follows it names another -- and stopping the
+// one that is running would take an account nobody asked to give up, with the lease it is
+// running under deleted behind it.
+//
+// Written against the map rather than through a schedule that produces it, which is the
+// point of it being here: what has to hold is that the answer names its session, and a
+// rule that holds only because nothing currently interleaves is a rule that goes the day
+// something does.
+func TestAHandBackActsOnTheSessionItWasAskedAbout(t *testing.T) {
 	t.Parallel()
 
 	server := miniredis.RunT(t)
@@ -526,7 +543,7 @@ func TestASweepDoesNotHandBackASessionAdoptedAgainSinceItLooked(t *testing.T) {
 	})
 	t.Cleanup(func() { manager.StopAll(context.Background()) })
 
-	const sid = "9c2b7d1e-0000-4000-8000-0000000000a6"
+	const sid = "9c2b7d1e-0000-4000-8000-0000000000a4"
 	ctx := context.Background()
 	first, err := manager.Adopt(ctx, sid)
 	if err != nil {
@@ -537,28 +554,26 @@ func TestASweepDoesNotHandBackASessionAdoptedAgainSinceItLooked(t *testing.T) {
 		t.Fatal("the engine has no session for the account that was just adopted")
 	}
 	engineSession.EmitLast(protocol.EventSessionConnectFailure, map[string]any{"reason": "unavailable"})
-	waitFor(t, func() bool { return first.Retired() }, "the session was never finished with")
+	waitFor(t, first.Retired, "the session was never finished with")
 
-	// The interleaving, written out: the sweep has looked and has not released yet, and
-	// the wake that replaces the session lands in between.
-	retired := map[string]*Session{sid: first}
+	// Handed back, and woken again: the account is running under a session of its own.
+	manager.SweepRetired(ctx, manager.HandBackBy())
 	second, err := manager.Adopt(ctx, sid)
 	if err != nil {
-		t.Fatalf("the retry could not be adopted: %v", err)
+		t.Fatalf("the account could not be adopted again: %v", err)
 	}
-	for swept, session := range retired {
-		manager.releaseThis(ctx, swept, session)
+	if second == first {
+		t.Fatal("the account was adopted onto the session that had been handed back")
 	}
 
-	if second.Retired() {
-		t.Fatal("the session built for the retry came back already finished with")
+	// And the sweep, coming to the one it found a moment ago.
+	manager.releaseThis(ctx, sid, first)
+
+	if !slices.Contains(manager.SIDs(), sid) {
+		t.Fatal("a hand-back stopped the session that replaced the one it was asked about")
 	}
 	if _, held := leases.Owned(sid); !held {
-		t.Fatal("the sweep deleted the lease of the session that replaced the one it found")
-	}
-	// Forgotten and stopped are the same step, so the map answers for both.
-	if !slices.Contains(manager.SIDs(), sid) {
-		t.Fatal("the sweep stopped the session that replaced the one it found")
+		t.Fatal("a hand-back deleted the lease of the session that replaced the one it was asked about")
 	}
 }
 
@@ -915,7 +930,9 @@ func TestARenewalThatWasRefusedDoesNotStopTheSessionThatReplacedIt(t *testing.T)
 	}()
 	<-hop.reached
 
-	// The retry, while the renewal is between asking and hearing.
+	// The account handed back and woken again, while the renewal is between asking and
+	// hearing.
+	manager.releaseThis(ctx, sid, first)
 	second, err := manager.Adopt(ctx, sid)
 	if err != nil {
 		t.Fatalf("the retry could not be adopted: %v", err)

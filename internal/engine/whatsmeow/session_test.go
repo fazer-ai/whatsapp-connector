@@ -2840,3 +2840,33 @@ func TestARefusalForAnAttemptTheOperatorReplacedFinishesNothing(t *testing.T) {
 	case <-time.After(200 * time.Millisecond):
 	}
 }
+
+// A connect refused before it dialled anything -- a resume on a session that never
+// paired, a code pairing with no number -- takes the guard down on its way in and puts it
+// back on its way out. The session's own giving-up goes with it: without that, a command
+// that changed nothing leaves a session that looks as though it has something to try, so
+// the account is never handed back and the instance renews a socket that is down for good.
+func TestAConnectRefusedBeforeItDialledLeavesTheGivingUpStanding(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "")
+
+	session.transition.Lock()
+	session.refuseLateConnect()
+	session.markTerminal()
+	session.transition.Unlock()
+	gaveUp := session.Finished()
+	if gaveUp == 0 {
+		t.Fatal("the session did not record the giving-up the test set up")
+	}
+
+	// A resume on a session that never paired, which is refused before anything is dialled.
+	if err := session.Connect(t.Context(), engine.ConnectRequest{Pairing: "resume"}); err == nil {
+		t.Fatal("a resume on a session that never paired was accepted")
+	}
+
+	if session.Finished() != gaveUp {
+		t.Errorf("the session reports giving-up %d after a connect that changed nothing, want %d",
+			session.Finished(), gaveUp)
+	}
+}

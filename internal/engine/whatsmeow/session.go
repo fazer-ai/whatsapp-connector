@@ -1163,6 +1163,10 @@ func (s *Session) Connect(ctx context.Context, req engine.ConnectRequest) error 
 	// the queued Connected lands in between: the guard is down, so it is announced rather
 	// than refused, and the resume below is then told the session is already open — over
 	// a socket that is down for good, and with nothing arriving later to say so.
+	// Read before the guard comes down, because coming down takes the session's own
+	// giving-up with it: a request refused below never dialled anything, and a session
+	// left looking as though it had something to try is one nothing hands back.
+	gaveUp := s.Finished()
 	standing := s.dropHangUp()
 
 	var err error
@@ -1185,6 +1189,7 @@ func (s *Session) Connect(ctx context.Context, req engine.ConnectRequest) error 
 		// own failure raises the guard where it belongs.
 		s.transition.Lock()
 		s.refuseLateConnect()
+		s.restoreTerminal(gaveUp)
 		s.transition.Unlock()
 	}
 	return err
@@ -1709,6 +1714,24 @@ func (s *Session) Finished() uint64 {
 		return 0
 	}
 	return s.givenUp
+}
+
+// restoreTerminal puts back a giving-up that a connect took down and then did not act on.
+//
+// The same one, not another: the emission reporting it is on its way with that number on
+// it, and a fresh giving-up here would be a different one, which the connector reads as an
+// answer about an attempt the session has moved on from. Skipped when something has moved
+// on since, which has its own number and its own emission.
+func (s *Session) restoreTerminal(was uint64) {
+	if was == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.terminal || s.givenUp != was {
+		return
+	}
+	s.terminal = true
 }
 
 // isTerminal reports whether there is anything left for this session to try.
