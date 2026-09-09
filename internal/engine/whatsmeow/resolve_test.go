@@ -3,9 +3,11 @@ package whatsmeow
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
+	waStore "go.mau.fi/whatsmeow/store"
 	waTypes "go.mau.fi/whatsmeow/types"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
@@ -103,11 +105,17 @@ func TestAResolveCarriesTheNameTheDeviceLearned(t *testing.T) {
 		waTypes.NewJID(phone, waTypes.DefaultUserServer)); err != nil {
 		t.Fatalf("PutLIDMapping: %v", err)
 	}
-	// Filed under the LID, asked for by number. The row is also what says this account
-	// has met them, which is what lets the mapping out.
+	// Filed under the LID, asked for by number.
 	if _, _, err := client.Store.Contacts.PutPushName(t.Context(),
 		waTypes.NewJID(lid, waTypes.HiddenUserServer), "Bruno Lima"); err != nil {
 		t.Fatalf("PutPushName: %v", err)
+	}
+	// And a row under the number, which is what says this account holds it and what lets
+	// the pairing out. A row a group listing left, carrying no push name of its own, so
+	// the name still has to come off the LID row.
+	if err := client.Store.Contacts.PutContactName(t.Context(),
+		waTypes.NewJID(phone, waTypes.DefaultUserServer), "Bruno Lima Silva", "Bruno"); err != nil {
+		t.Fatalf("PutContactName: %v", err)
 	}
 
 	result, err := session.Execute(t.Context(), resolveCommand(t, `{"party":{"kind":"phone","id":"`+phone+`"}}`))
@@ -372,19 +380,29 @@ func TestAResolveSaysWhenTheContactRecordCouldNotBeRead(t *testing.T) {
 		lid   = "998877665544332"
 	)
 
-	session, container := newTestSession(t, "5511999990001")
-	// The mapping put straight into the session's cache, so the lookup answers without a
-	// read and the contact record is the first thing that touches the database.
-	session.aliases.remember(
-		waTypes.NewJID(lid, waTypes.HiddenUserServer).String(),
-		waTypes.NewJID(phone, waTypes.DefaultUserServer),
-		session.aliases.learning())
-	if err := container.Close(); err != nil {
-		t.Fatalf("Close the store: %v", err)
+	session, _ := newTestSession(t, "5511999990001")
+	client := session.current()
+	if err := client.Store.LIDs.PutLIDMapping(t.Context(),
+		waTypes.NewJID(lid, waTypes.HiddenUserServer),
+		waTypes.NewJID(phone, waTypes.DefaultUserServer)); err != nil {
+		t.Fatalf("PutLIDMapping: %v", err)
 	}
+	// The mapping answers and the record that would authorise it does not, which is the
+	// only way round: the two are read one after the other by the same lookup.
+	client.Store.Contacts = unreadableContacts{ContactStore: client.Store.Contacts}
 
 	_, err := session.Execute(t.Context(), resolveCommand(t, `{"party":{"kind":"lid","id":"`+lid+`"}}`))
 	assertCode(t, err, protocol.ErrorInternal)
+}
+
+// unreadableContacts is a contact store that will not answer a read, and is otherwise the
+// store it wraps.
+type unreadableContacts struct {
+	waStore.ContactStore
+}
+
+func (unreadableContacts) GetContact(context.Context, waTypes.JID) (waTypes.ContactInfo, error) {
+	return waTypes.ContactInfo{}, errors.New("this store is not answering reads")
 }
 
 // A command need not carry a deadline, and this one runs on the session's executor: a
@@ -400,7 +418,8 @@ func TestAResolveBoundsItsReadsWithoutACallerDeadline(t *testing.T) {
 	)
 
 	session, _ := newTestSession(t, "5511999990001")
-	learn(t, session, phone, lid)
+	// Nothing learned, so the mapping read is one whatsmeow cannot answer out of its own
+	// cache and the bound is what stops it.
 	session.storeLimit = time.Nanosecond
 
 	// No deadline on the command, so the bound has to come from here.

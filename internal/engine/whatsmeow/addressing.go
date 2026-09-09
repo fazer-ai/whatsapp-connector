@@ -62,6 +62,41 @@ func (a *alias) of(ctx context.Context, s *Session, jid waTypes.JID) (waTypes.JI
 	return alt, found
 }
 
+// observe records a pairing the event itself carried.
+//
+// First hand, and that is the whole difference. WhatsApp addressed this account with both
+// halves, so the pairing is one this account was shown, and publishing it back discloses
+// nothing it was not already told. `whatsmeow_lid_map` is not that: it is `(lid, pn)` with
+// no `our_jid` column, one table for every session on the deployment, so a row in it may
+// be what another operator's account was shown.
+//
+// Only a pair one caller passed together, which is what makes this safe to sit on the path
+// every event takes. The one field a stranger writes -- the participant inside a deletion
+// key -- reaches `party` on its own, and a single JID names no pairing.
+func (a *alias) observe(jids ...waTypes.JID) {
+	var phone, lid waTypes.JID
+	for _, jid := range jids {
+		if !pairable(jid) {
+			continue
+		}
+		address, addressable := addressOf(jid)
+		switch {
+		case !addressable:
+		case address.Kind == protocol.AddressPhone && phone.IsEmpty():
+			phone = jid.ToNonAD()
+		case address.Kind == protocol.AddressLID && lid.IsEmpty():
+			lid = jid.ToNonAD()
+		}
+	}
+	if phone.IsEmpty() || lid.IsEmpty() {
+		return
+	}
+	a.mu.Lock()
+	a.seen[phone.String()] = lid
+	a.seen[lid.String()] = phone
+	a.mu.Unlock()
+}
+
 // lookup is of, with the failure kept apart from the absence.
 //
 // The two are not the same answer and a command whose whole result is the mapping cannot
@@ -93,8 +128,42 @@ func (a *alias) lookup(ctx context.Context, s *Session, jid waTypes.JID) (waType
 		return waTypes.EmptyJID, false, nil
 	}
 
+	// Nothing this account was shown, so it is answered only where it discloses nothing:
+	// the number has to be one this account already holds. `whatsmeow_contacts` is keyed
+	// by `our_jid` and is the only per-account record in the device store, so a row under
+	// the phone half is this account's own record of having been given that number -- by a
+	// message, a group listing or an address-book sync. Pairing it with a LID then tells
+	// this account which of the people it can already call is the one behind the handle,
+	// and never hands it a number nobody gave it.
+	//
+	// The phone half specifically. A row under the LID would pass a test on either
+	// address while proving the opposite: an account that has only ever seen the handle is
+	// exactly the one the number is being withheld from.
+	allowed, err := s.hasMet(ctx, phoneHalf(jid, alt))
+	switch {
+	case err != nil:
+		return waTypes.EmptyJID, false, err
+	case !allowed:
+		s.log.Debug().Str("jid", jid.String()).
+			Msg("withholding a pairing this account was not the one shown")
+		return waTypes.EmptyJID, false, nil
+	}
+
 	a.remember(key, alt, learning)
 	return alt, true, nil
+}
+
+// phoneHalf is whichever of a pairing's two addresses is the number.
+//
+// Empty when neither is, which `hasMet` reads as an account that has met nobody: a pairing
+// with no phone half discloses no number, and there is nothing to authorise.
+func phoneHalf(jids ...waTypes.JID) waTypes.JID {
+	for _, jid := range jids {
+		if address, addressable := addressOf(jid); addressable && address.Kind == protocol.AddressPhone {
+			return jid.ToNonAD()
+		}
+	}
+	return waTypes.EmptyJID
 }
 
 // learning is which account's mapping is being learned right now.
@@ -156,6 +225,7 @@ func (s *Session) looking() (context.Context, context.CancelFunc) {
 // party names somebody by both of the addresses WhatsApp knows them by, filling in from
 // the mapping whatever the event did not carry.
 func (s *Session) party(ctx context.Context, jids ...waTypes.JID) protocol.Party {
+	s.aliases.observe(jids...)
 	var named protocol.Party
 	naming(&named, jids...)
 	if named.Phone != "" && named.LID != "" {
@@ -181,6 +251,8 @@ func (s *Session) party(ctx context.Context, jids ...waTypes.JID) protocol.Party
 // LID when it has one -- names the same conversation whether it arrived through a
 // message, a receipt or a typing indicator.
 func (s *Session) address(ctx context.Context, jids ...waTypes.JID) (protocol.Address, bool) {
+	s.aliases.observe(jids...)
+
 	// What the event carried first, and the mapping only for what it did not. An event
 	// that names both namespaces has already answered the question, and asking the store
 	// anyway would be a read per event for an answer in hand.

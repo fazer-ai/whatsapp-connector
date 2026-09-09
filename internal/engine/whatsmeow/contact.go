@@ -340,26 +340,13 @@ func (s *Session) resolveContact(ctx context.Context, command *protocol.Command)
 		return nil, s.storeFailure(err, "the address mapping")
 	}
 	if found {
-		// `whatsmeow_lid_map` is keyed by `(lid, pn)` and by nothing else: every account
-		// on this deployment writes into one table, so a mapping in it may have been
-		// learned by a different one. Enriching an event with it is one thing -- the event
-		// is about somebody this account is already talking to -- and answering a question
-		// about an arbitrary address is another, which is a client asking this connector
-		// for a number another operator's account was shown.
-		//
-		// The contact table is keyed by `our_jid`, so it is the one thing here that
-		// answers "has this account met them". A party it has not is answered with the
-		// half the caller already had. Issue #137 is the mapping table itself.
-		met, err := s.hasMet(reading, jid, alt)
-		switch {
-		case err != nil:
-			return nil, s.storeFailure(err, "the contact record")
-		case met:
-			naming(&named, alt)
-		default:
-			s.log.Debug().Str("kind", string(req.Party.Kind)).
-				Msg("withholding a mapping this account has no record of having learned")
-		}
+		// Withholding is the lookup's own, and it is the same rule on every path that
+		// names a party: a pairing this account was not the one shown is not answered
+		// with. Nothing is left for this command to decide, which is the point -- the
+		// guard that used to live here tested either address, and a row under the LID is
+		// the case where the number is being withheld rather than the case where it is
+		// already known.
+		naming(&named, alt)
 	}
 	if named.Phone == "" && named.LID == "" {
 		// jidOf built this JID out of an address kind personOf just accepted, so the
