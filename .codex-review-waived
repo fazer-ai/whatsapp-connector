@@ -466,3 +466,17 @@ internal/engine/whatsmeow/group.go: Prevent redelivery from creating a second gr
 # them, at the price of stalling every other reader of the session for as long as the
 # database takes, to decide a race between two names the account set seconds apart.
 internal/engine/whatsmeow/session.go: Order concurrent renames before replacing the session name  # PR#139
+# PR#139: real and not decidable here. The marker is knowledge an event produced -- "the
+# name I am holding is newer than the row" -- and a process that did not see the event has
+# no way to reproduce it. The record and the contact table have no ordering between them:
+# an app-state sync writes the record, the notify on a message the account sent writes the
+# table, and neither writes the other, so a session rebuilt from the record cannot tell
+# which of the two copies is the newer one. Preferring the record, which is what this asks
+# for, is wrong in the commoner case -- a rename that only ever reached the table -- and
+# `TestAResolveTakesTheTableWhenTheSessionOnlyHasTheRecord` pins that. Reconciling at
+# construction has the same hole: writing the record's name over the rows would overwrite a
+# newer table name with an older record one, and a disagreement between the two rows proves
+# a partial write without saying which side of it is current. What is left is persisting the
+# marker with the name it describes, which is a durable outbox for a display annotation that
+# the next rename repairs on its own. Recorded in fazer-ai/whatsapp-connector#140.
+internal/engine/whatsmeow/session.go: Preserve failed name writes across session recreation  # PR#139
