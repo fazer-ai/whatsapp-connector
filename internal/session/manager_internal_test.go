@@ -3178,29 +3178,30 @@ func TestAMarkLeavesTheReleaseBehindItATurn(t *testing.T) {
 	}
 	manager.stopSession(sid)
 
-	// A Redis that takes every lease script to the end of whatever context it is given,
-	// which is what a hand-back looks like when the network is the thing that is broken.
-	var attempts atomic.Int64
+	// A Redis that never answers the mark, and answers everything else at once. The mark
+	// is the script that names the key and is not the hand-back: handing back needs only
+	// the instance's name, and marking also carries a lifetime.
 	rdb.AddHook(waiting{on: func(cmd redis.Cmder) bool {
-		return strings.HasPrefix(cmd.Name(), "eval") && names(cmd, keys.HandBack(sid))
-	}, count: &attempts})
+		return strings.HasPrefix(cmd.Name(), "eval") && names(cmd, keys.HandBack(sid)) &&
+			!handsBack(cmd, keys.HandBack(sid))
+	}})
 
 	// The budget an adoption that could not open its session hands the whole hand-back.
 	handing, cancel := context.WithTimeout(ctx, releaseTimeout)
 	defer cancel()
 	manager.abandon(handing, sid)
 
-	if got := attempts.Load(); got != 2 {
-		t.Fatalf("the hand-back reached Redis %d time(s), want 2: the mark and the release that has to follow it", got)
+	// The release is what the budget was for. A mark that spends all of it leaves the
+	// lease naming an instance that is running nothing, which is what the mark exists to
+	// keep from happening.
+	if server.Exists(keys.Lease(sid)) {
+		t.Fatal("the lease was still held after the hand-back: the mark spent the whole budget and the release ran on a context already over")
 	}
 }
 
 // waiting holds a command until its own context is over, which is a Redis that answers
-// nothing rather than one that refuses, and counts the ones it held.
-type waiting struct {
-	on    func(redis.Cmder) bool
-	count *atomic.Int64
-}
+// nothing rather than one that refuses.
+type waiting struct{ on func(redis.Cmder) bool }
 
 func (waiting) DialHook(next redis.DialHook) redis.DialHook { return next }
 
@@ -3213,7 +3214,6 @@ func (h waiting) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
 		if !h.on(cmd) {
 			return next(ctx, cmd)
 		}
-		h.count.Add(1)
 		<-ctx.Done()
 		cmd.SetErr(ctx.Err())
 		return ctx.Err()
