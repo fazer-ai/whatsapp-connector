@@ -439,15 +439,15 @@ func TestADeletionCarriesTheAuthorItsKeyClaims(t *testing.T) {
 		{name: "the key claims the sender's own message and names somebody else too", group: true,
 			participant: author + "@" + waTypes.DefaultUserServer, fromMe: true, want: "5511999990001"},
 		{name: "the key claims the sender's own message and names nobody", group: true, fromMe: true, want: "5511999990001"},
-		// A direct chat's key names no participant and does not have to: there are two
-		// parties, and the flag says which. Not the deleter's own means the other one's,
-		// and here the deleter is the contact, so the key is claiming this account wrote
-		// the message -- which only the author can delete for everyone, so it is the claim
-		// a client is meant to catch.
-		{name: "a direct chat, where the key claims the account's own message", want: "5511999990001"},
-		// The deleter's own, which is the ordinary deletion and the one that is real.
-		{name: "a direct chat, where the key claims the deleter's own message",
-			fromMe: true, want: author},
+		// A direct chat's key names the chat, and there are two parties to be: `sender`
+		// and `by` are the whole answer, and no claim is the honest shape for it.
+		{name: "a direct chat, where the key names nobody", want: ""},
+		// And a participant there is a field WhatsApp does not read: `BuildMessageKey`
+		// writes one only outside a chat, and `getOrigSenderFromKey` takes the key's own
+		// remote JID instead. Publishing it would hand a client a claim nothing else
+		// honours, and the claim is what makes its comparison pass.
+		{name: "a direct chat, where the key names a participant anyway",
+			participant: "5511999990001@" + waTypes.DefaultUserServer, want: ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -458,11 +458,6 @@ func TestADeletionCarriesTheAuthorItsKeyClaims(t *testing.T) {
 			if tc.group {
 				event.Info.Chat = waTypes.NewJID("120363000000000000", waTypes.GroupServer)
 				event.Info.IsGroup = true
-			} else {
-				// Somebody other than this account on the other end, so a claim naming the
-				// contact and one naming the account are told apart.
-				event.Info.Chat = waTypes.NewJID(author, waTypes.DefaultUserServer)
-				event.Info.Sender = waTypes.NewJID(author, waTypes.DefaultUserServer)
 			}
 			if tc.participant != "" {
 				event.Message.GetProtocolMessage().GetKey().Participant = proto.String(tc.participant)

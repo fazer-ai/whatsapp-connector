@@ -206,20 +206,14 @@ const (
 // resolved the message by id and knows its author.
 //
 // A key that says the message is the deleter's own names the deleter, whatever else the
-// key carries: that is how WhatsApp resolves it, so it is the claim being made.
-//
-// A direct chat carries one too, worked out rather than read: a key there names no
-// participant and does not need to, because there are two parties and `from_me` says which
-// of them. Not the deleter's own means the other one's, which is how WhatsApp resolves it
-// as well. The claim is worth as much here as in a group -- only the author can delete for
-// everyone in a chat -- and this is the chat kind an installation is using today.
+// key carries: that is how WhatsApp resolves it, so it is the claim being made. Absent
+// means the key named nobody WhatsApp reads, which is a direct chat: a key there addresses
+// the message by the conversation, so a participant in one is a field nothing else honours
+// and this connector does not pass it on either.
 //
 // A group deletion always carries one. A key there identifies a message by its participant
 // or by `from_me`, so one with neither names no message at all, and the connector drops it
 // rather than publishing a deletion no phone applied.
-//
-// Absent is left for what the connector could not read: a participant that will not parse,
-// and a channel, where the deletion arrives under the post's own id with no key at all.
 type MessageRevoked struct {
 	Chat      Address   `json:"chat"`
 	Sender    *Party    `json:"sender,omitempty"`
