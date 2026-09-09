@@ -2074,3 +2074,195 @@ func names(cmd redis.Cmder, key string) bool {
 	}
 	return false
 }
+
+// The mark has to be in Redis before the session stops, not merely before the release.
+// Stopping is not instant -- it closes a socket and drains what the session was holding
+// -- and for all of it the lease still names this instance while nothing here runs the
+// account. A wake landing in that window finds an owner and is acknowledged as an
+// account already running, and the release that follows leaves the account owned by
+// nobody. The window between the release going out and landing is the one the mark
+// obviously covers; this is the wider one in front of it.
+func TestAHandBackIsMarkedBeforeTheSessionStops(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	giving := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	taking := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = giving.Close(); _ = taking.Close() })
+	givingClient := redisx.Wrap(giving, "wa:", 8)
+	takingClient := redisx.Wrap(taking, "wa:", 8)
+	keys := givingClient.Keys()
+
+	// One event held parks the stop: Session.Stop closes the engine and then waits for
+	// the pump, and the pump is in the publisher.
+	held := &heldPublisher{
+		holds:   protocol.EventSessionState,
+		entered: make(chan protocol.EventType),
+		let:     make(chan struct{}),
+	}
+	engines := fake.New()
+	holder := NewManager(&ManagerConfig{
+		Instance: "inst-a", Engine: engines,
+		Leases:    cluster.NewLeases(givingClient, "inst-a", cluster.Options{}),
+		Publisher: held, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	peer := NewManager(&ManagerConfig{
+		Instance: "inst-b", Engine: fake.New(),
+		Leases:    cluster.NewLeases(takingClient, "inst-b", cluster.Options{}),
+		Publisher: quietPublisher{}, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	ctx := context.Background()
+
+	const sid = "9c2b7d1e-0000-4000-8000-0000000000c2"
+	if _, err := holder.Adopt(ctx, sid); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, running := engines.Session(sid)
+	if !running {
+		t.Fatal("the engine has no session for an account that was adopted")
+	}
+
+	// Armed only now, so the acquisition above -- which reads the mark and so carries the
+	// same two keys -- is not mistaken for the writing of one.
+	var handing atomic.Bool
+	marked := make(chan struct{})
+	var announce sync.Once
+	giving.AddHook(watching{after: func(cmd redis.Cmder) {
+		if handing.Load() && names(cmd, keys.HandBack(sid)) {
+			announce.Do(func() { close(marked) })
+		}
+	}})
+
+	engineSession.Emit(protocol.EventSessionState, map[string]any{"state": "connected"})
+	<-held.entered
+
+	handing.Store(true)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		holder.Release(ctx, sid)
+	}()
+	defer func() {
+		held.release()
+		<-done
+	}()
+
+	select {
+	case <-marked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the hand-back was not marked while the session was still stopping, so every wake in that window is acknowledged as an account somebody else runs")
+	}
+
+	var acked, left bool
+	peer.wake(ctx, &transport.Delivery{
+		Command: protocol.Command{V: protocol.Version, ID: "wake", Type: protocol.CommandSessionWake, SID: sid},
+		Ack:     func(context.Context) error { acked = true; return nil },
+		Release: func() { left = true },
+	})
+	if acked {
+		t.Fatal("a peer retired the wake for an account that was still stopping here; the release that follows leaves it owned by nobody")
+	}
+	if !left {
+		t.Fatal("the wake was neither acknowledged nor left pending, so nothing will read it again")
+	}
+}
+
+// A hand-back that did not land is tried again on a later tick, and by then the account
+// may have moved on: the lease expired, a peer took it, and that peer is now handing it
+// back itself. An unfenced mark would put this instance's name over the peer's, and the
+// comparison every reader makes -- mark against holder -- then says nobody is handing
+// anything back, on an account that is.
+func TestAStaleHandBackDoesNotOverwriteTheMarkOfTheInstanceThatHoldsTheLease(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	first := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	second := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = first.Close(); _ = second.Close() })
+	firstClient := redisx.Wrap(first, "wa:", 8)
+	secondClient := redisx.Wrap(second, "wa:", 8)
+	keys := firstClient.Keys()
+
+	const sid = "9c2b7d1e-0000-4000-8000-0000000000c3"
+	// The second instance's hand-back reaches Redis to leave its mark and never gets to
+	// delete the lease, which is the state a stale retry can land in the middle of.
+	second.AddHook(dropped{when: func(cmd redis.Cmder) bool { return names(cmd, keys.Cooldown(sid)) }})
+
+	stale := NewManager(&ManagerConfig{
+		Instance: "inst-a", Engine: fake.New(),
+		Leases:    cluster.NewLeases(firstClient, "inst-a", cluster.Options{}),
+		Publisher: quietPublisher{}, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	holder := NewManager(&ManagerConfig{
+		Instance: "inst-b", Engine: fake.New(),
+		Leases:    cluster.NewLeases(secondClient, "inst-b", cluster.Options{}),
+		Publisher: quietPublisher{}, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	ctx := context.Background()
+	t.Cleanup(func() { stale.StopAll(ctx); holder.StopAll(ctx) })
+
+	if _, err := stale.Adopt(ctx, sid); err != nil {
+		t.Fatalf("Adopt on the first instance: %v", err)
+	}
+
+	// A hand-back that reached Redis with neither half: no mark, and a lease left naming
+	// this instance. Through a context that is already over, which is what a Redis nobody
+	// can reach looks like from here without a hop to stall.
+	over, giveUp := context.WithCancel(ctx)
+	giveUp()
+	stale.Release(over, sid)
+	if !stale.handingBack(sid) {
+		t.Fatal("a hand-back that reached nothing was forgotten, so nothing would try it again")
+	}
+
+	// The lease runs out and the account moves. The second instance stops it in turn, and
+	// its own hand-back gets as far as the mark.
+	server.FastForward(cluster.DefaultTTL + time.Second)
+	if _, err := holder.Adopt(ctx, sid); err != nil {
+		t.Fatalf("Adopt on the second instance: %v", err)
+	}
+	holder.Release(ctx, sid)
+	if got, _ := server.Get(keys.HandBack(sid)); got != "inst-b" {
+		t.Fatalf("the instance holding the lease marked its hand-back as %q, want inst-b", got)
+	}
+
+	stale.releaseOrphans(ctx)
+	if got, _ := server.Get(keys.HandBack(sid)); got != "inst-b" {
+		t.Fatalf("a stale retry left the hand-back mark naming %q, want the instance that holds the lease", got)
+	}
+
+	var acked, left bool
+	stale.wake(ctx, &transport.Delivery{
+		Command: protocol.Command{V: protocol.Version, ID: "wake", Type: protocol.CommandSessionWake, SID: sid},
+		Ack:     func(context.Context) error { acked = true; return nil },
+		Release: func() { left = true },
+	})
+	if acked {
+		t.Fatal("a wake was retired for an account whose owner is handing it back, because a stale retry had overwritten the mark")
+	}
+	if !left {
+		t.Fatal("the wake was neither acknowledged nor left pending, so nothing will read it again")
+	}
+}
+
+// watching runs after a command has been answered, which is where a test learns that a
+// key is in Redis rather than merely on its way.
+type watching struct{ after func(redis.Cmder) }
+
+func (watching) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (watching) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+
+func (h watching) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		err := next(ctx, cmd)
+		h.after(cmd)
+		return err
+	}
+}

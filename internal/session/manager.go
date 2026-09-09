@@ -75,8 +75,12 @@ type Manager struct {
 	// The Redis key still names this instance, and every wake for such a session is
 	// answered "owned elsewhere" and acknowledged, so nobody runs it until the key
 	// expires. Kept here so the next tick tries the release again.
+	//
+	// The value says the hand-back has been marked in Redis for peers to read, which is
+	// what keeps the mark at one round trip per hand-back rather than one per attempt --
+	// and what makes a mark that did not land be tried again rather than assumed.
 	orphanMu sync.Mutex
-	orphans  map[string]struct{}
+	orphans  map[string]bool
 
 	// answers is the commands this manager carries out itself, waiting on the goroutine
 	// that carries them out.
@@ -146,7 +150,7 @@ func NewManager(cfg *ManagerConfig) *Manager {
 		retireRetry: cfg.RetireRetry,
 		log:         cfg.Logger,
 		sessions:    make(map[string]*Session),
-		orphans:     make(map[string]struct{}),
+		orphans:     make(map[string]bool),
 		handingBusy: make(map[string]struct{}),
 		answers:     make(chan answer, cfg.AnswerDepth),
 	}
@@ -385,6 +389,18 @@ func (m *Manager) Release(ctx context.Context, sid string) {
 	session, ok := m.sessions[sid]
 	delete(m.sessions, sid)
 	m.mu.Unlock()
+	// Before the session stops rather than with the release, and that ordering is the
+	// whole of what the mark buys. Stopping is not instant -- it closes a socket and
+	// drains what the session was holding -- and throughout it the lease still names this
+	// instance while nothing here runs the account. A wake landing in that gap finds an
+	// owner, is acknowledged as an account already running, and the release that follows
+	// leaves the account owned by nobody.
+	//
+	// After the map and not before it, because the mark cannot be written under `mu`: it
+	// is a round trip, and everything that looks a session up on this instance would wait
+	// behind it. What is left between the two is a handful of instructions with no I/O in
+	// them, against a stop that closes a socket.
+	m.givingUp(ctx, sid)
 	if ok {
 		session.Stop()
 	}
@@ -404,25 +420,54 @@ func (m *Manager) abandon(ctx context.Context, sid string) {
 	// release then lands, and the account is left owned by nobody with the one wake that
 	// would have started it already retired.
 	//
-	// Twice, because the two readers are in different places. The local set answers for
-	// wakes this instance reads, without a round trip and even when Redis is the thing
-	// that is away; the key in Redis answers for the peers, which is most of them -- the
-	// wake goes to every instance and any one of them may be the one to take it.
+	// Asked again here even where the caller has already marked it, because the callers
+	// that stop a session are not the only ones that reach this: an adoption that took a
+	// lease and could not open the session comes through with nothing marked.
+	m.givingUp(ctx, sid)
+	if _, err := m.leases.Release(ctx, sid); err != nil {
+		m.log.Warn().Err(err).Str("sid", sid).Msg("could not hand a lease back; will try again")
+		return
+	}
+	m.forgetOrphan(sid)
+}
+
+// givingUp says this instance is letting a session's lease go, in the two places a wake
+// is answered from.
+//
+// Twice, because the two readers are in different places. The local set answers for
+// wakes this instance reads, without a round trip and even when Redis is the thing that
+// is away; the key in Redis answers for the peers, which is most of them -- the wake goes
+// to every instance and any one of them may be the one to take it.
+//
+// The round trip is spent once per hand-back and not once per attempt, which is what the
+// value in the map records. A mark that did not land is not remembered as landed, so the
+// next attempt at the release pays for it again.
+func (m *Manager) givingUp(ctx context.Context, sid string) {
 	m.orphanMu.Lock()
-	m.orphans[sid] = struct{}{}
+	marked := m.orphans[sid]
+	m.orphans[sid] = marked
 	m.orphanMu.Unlock()
-	if err := m.leases.MarkHandingBack(ctx, sid); err != nil {
+	if marked {
+		return
+	}
+
+	err := m.leases.MarkHandingBack(ctx, sid)
+	if err != nil {
 		// Not fatal to the hand-back, which is the part that matters and is attempted
 		// anyway: an unmarked hand-back is the behaviour this instance had before the
 		// mark existed, and a peer's wake can still be lost to it.
 		m.log.Warn().Err(err).Str("sid", sid).
 			Msg("could not mark a hand-back for peers to see; handing back anyway")
 	}
-	if _, err := m.leases.Release(ctx, sid); err != nil {
-		m.log.Warn().Err(err).Str("sid", sid).Msg("could not hand a lease back; will try again")
-		return
+	m.orphanMu.Lock()
+	// Only where the session is still one this instance is giving up. A hand-back that
+	// landed while this was in flight has already forgotten it, and an adoption that won
+	// the account back has too: writing here would leave a live session carrying a mark
+	// that says it is on its way out.
+	if _, still := m.orphans[sid]; still {
+		m.orphans[sid] = err == nil
 	}
-	m.forgetOrphan(sid)
+	m.orphanMu.Unlock()
 }
 
 // releaseOrphans retries the hand-backs that did not reach Redis.
@@ -892,7 +937,8 @@ func (m *Manager) RenewAll(ctx context.Context, by time.Time) {
 		} else {
 			m.log.Warn().Str("sid", sid).Msg("lost a lease; stopping the session")
 		}
-		if !m.forget(sid, running[sid]) {
+		session, still := m.drop(sid, running[sid])
+		if !still {
 			// Adopted again since the renewal went out, which means a lease won after
 			// this answer was already stale. Stopping that session would leave an account
 			// nobody runs, and handing its lease back would delete a live one.
@@ -902,14 +948,19 @@ func (m *Manager) RenewAll(ctx context.Context, by time.Time) {
 		}
 		if errors.Is(err, cluster.ErrNotOwner) {
 			// Somebody else's now, and Renew has already forgotten it locally. Nothing
-			// to hand back, and the release only ever deletes a key naming this
-			// instance, so asking would cost a round trip to be told no.
+			// to hand back and nothing to mark: both keys only ever answer to this
+			// instance's own name, so either would cost a round trip to be told no.
+			session.Stop()
 			continue
 		}
 		// The renewal may well have been applied and only the answer lost, which leaves
 		// a key naming this instance for a full TTL after the session it named stopped.
 		// Not knowing is the reason to hand it back explicitly rather than to wait the
 		// key out. Done below, with everything else that is not a renewal.
+		//
+		// Said before the stop, for the reason Release gives: the stop is the window.
+		m.givingUp(ctx, sid)
+		session.Stop()
 		released = append(released, sid)
 	}
 
@@ -922,8 +973,12 @@ func (m *Manager) RenewAll(ctx context.Context, by time.Time) {
 			// An adoption of this account is under way. Handing back alongside it deletes
 			// the lease it wins; the mark `abandon` leaves is what brings this back on a
 			// later tick.
+			//
+			// Put back rather than left alone, because the adoption in the way may be the
+			// thing that cleared it. Marked as unwritten: what the adoption did to the key
+			// in Redis is not knowable from here.
 			m.orphanMu.Lock()
-			m.orphans[sid] = struct{}{}
+			m.orphans[sid] = false
 			m.orphanMu.Unlock()
 			continue
 		}
@@ -1045,18 +1100,36 @@ func (m *Manager) dropHanding(sid string) {
 // a fresh one under the same sid. A caller acting on an answer about the session before
 // it -- a renewal that was refused, a sweep that found it finished with -- would then
 // stop a session that is running and leave the lease it won behind.
-func (m *Manager) forget(sid string, want *Session) bool {
-	m.mu.Lock()
-	session, ok := m.sessions[sid]
-	if !ok || session != want {
-		m.mu.Unlock()
+func (m *Manager) forget(ctx context.Context, sid string, want *Session) bool {
+	session, ok := m.drop(sid, want)
+	if !ok {
 		return false
 	}
-	delete(m.sessions, sid)
-	m.mu.Unlock()
-
+	// Here rather than at the callers, and here rather than before the lookup, for the
+	// two reasons Release gives: the stop is what opens the window, and the session this
+	// is about is only settled once the lookup has agreed it is the one asked for. A mark
+	// written ahead of that names a session the instance turns out to be running.
+	m.givingUp(ctx, sid)
 	session.Stop()
 	return true
+}
+
+// drop takes a session out of the map, if it is still the one the caller means, and
+// hands it back to be stopped.
+//
+// Taking it out and stopping it are separate because what belongs between them is not
+// the same everywhere: an instance giving a lease up has to say so before the stop, and
+// one whose lease is already somebody else's has nothing to say and no key that would
+// answer to its name.
+func (m *Manager) drop(sid string, want *Session) (*Session, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	session, ok := m.sessions[sid]
+	if !ok || session != want {
+		return nil, false
+	}
+	delete(m.sessions, sid)
+	return session, true
 }
 
 func (m *Manager) releaseThis(ctx context.Context, sid string, want *Session) {
@@ -1079,7 +1152,7 @@ func (m *Manager) releaseThis(ctx context.Context, sid string, want *Session) {
 			Msg("a session finished with was not free to be handed over; leaving it for the next tick")
 		return
 	}
-	if !m.forget(sid, want) {
+	if !m.forget(ctx, sid, want) {
 		return
 	}
 	m.abandon(ctx, sid)

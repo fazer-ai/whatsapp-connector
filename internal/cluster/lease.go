@@ -354,6 +354,22 @@ func (l *Leases) epochOf(sid string) uint64 {
 	return l.held[sid].epoch
 }
 
+// markHandingBackScript writes the mark only while this instance still holds the lease.
+//
+// Fenced, and not a plain SET, because a hand-back that failed is retried on a later
+// tick and the account may have moved on by then: the lease expired, a peer took it, and
+// that peer is now handing it back itself. An unfenced write would replace its mark with
+// this instance's name, and the comparison every reader makes -- mark against holder --
+// would then say nobody is handing anything back, on an account being handed back. The
+// wake that follows is acknowledged into nothing, which is the bug the mark exists for.
+var markHandingBackScript = redis.NewScript(`
+if redis.call("GET", KEYS[1]) ~= ARGV[1] then
+  return 0
+end
+redis.call("SET", KEYS[2], ARGV[1], "PX", ARGV[2])
+return 1
+`)
+
 // MarkHandingBack says that this instance holds a lease it has stopped running and is
 // about to give up. Release clears it, and it expires on its own after one TTL, which
 // outlasts the lease it is about.
@@ -363,7 +379,12 @@ func (l *Leases) epochOf(sid string) uint64 {
 // having been written.
 func (l *Leases) MarkHandingBack(ctx context.Context, sid string) error {
 	keys := l.client.Keys()
-	if err := l.client.Set(ctx, keys.HandBack(sid), l.instance, l.ttl).Err(); err != nil {
+	// The answer says whether the mark was written, and there is nothing for a caller to
+	// do with it: a lease this instance no longer holds is a hand-back nobody is waiting
+	// to hear about, which is an answer rather than a failure.
+	if _, err := markHandingBackScript.Run(
+		ctx, l.client, []string{keys.Lease(sid), keys.HandBack(sid)}, l.instance, l.ttl.Milliseconds(),
+	).Int(); err != nil {
 		return fmt.Errorf("cluster: mark handing back %s: %w", sid, err)
 	}
 	return nil
