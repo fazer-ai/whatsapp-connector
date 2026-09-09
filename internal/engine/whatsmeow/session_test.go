@@ -1941,7 +1941,10 @@ func TestDroppingTheHangUpGuardAndReadingTheStateIsOneStep(t *testing.T) {
 	// holding it here is the queued event caught mid-flight.
 	session.transition.Lock()
 	standing := make(chan string, 1)
-	go func() { standing <- session.dropHangUp() }()
+	go func() {
+		state, _ := session.dropHangUp()
+		standing <- state
+	}()
 
 	select {
 	case state := <-standing:
@@ -1967,7 +1970,7 @@ func TestAConnectQueuedBehindADisconnectIsStillRefused(t *testing.T) {
 	drain(t, session)
 
 	session.handle(&waEvents.Connected{})
-	if state := session.dropHangUp(); state != "close" {
+	if state, _ := session.dropHangUp(); state != "close" {
 		t.Fatalf("the connect was handed %q over a socket that is down", state)
 	}
 	select {
@@ -2868,5 +2871,33 @@ func TestAConnectRefusedBeforeItDialledLeavesTheGivingUpStanding(t *testing.T) {
 	if session.Finished() != gaveUp {
 		t.Errorf("the session reports giving-up %d after a connect that changed nothing, want %d",
 			session.Finished(), gaveUp)
+	}
+}
+
+// The guard and the session's own giving-up come down together, in the step that takes
+// them down. Read separately by the caller, a giving-up landing in between is taken down
+// by this and reported to nobody: the connect that took it down is then refused before it
+// dials anything, has nothing to put back, and the account is held by an instance with a
+// socket that is down for good.
+func TestTheGuardComesDownWithWhateverGivingUpItFinds(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "")
+
+	session.transition.Lock()
+	session.markTerminal()
+	session.transition.Unlock()
+
+	_, gaveUp := session.dropHangUp()
+	if gaveUp != session.givenUp {
+		t.Fatalf("the guard came down reporting giving-up %d, want %d", gaveUp, session.givenUp)
+	}
+	if session.Finished() != 0 {
+		t.Fatal("the guard came down and left the giving-up standing")
+	}
+
+	// And nothing to report when there was nothing to take down.
+	if _, gaveUp := session.dropHangUp(); gaveUp != 0 {
+		t.Fatalf("the guard came down reporting giving-up %d on a session that had none", gaveUp)
 	}
 }

@@ -1898,3 +1898,52 @@ func TestAnOutcomeTheSessionMovedOnFromIsNotSaidAgain(t *testing.T) {
 		t.Fatalf("the outcome was published %d times, want the one attempt that failed and no more: said again, it lands after the open the retry published", said)
 	}
 }
+
+// Taking a command in and counting it as running are one step. A session that has taken
+// one and not counted it reads as having nothing running, and a hand-back takes it there:
+// the command then runs on a session being stopped, which for a connect is the client
+// told that it worked over a socket closed a moment later.
+func TestASessionThatTookACommandIsNotFreeToBeHandedOver(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+
+	engines := fake.New()
+	manager := NewManager(&ManagerConfig{
+		Instance: "inst-a", Engine: engines,
+		Leases:    cluster.NewLeases(client, "inst-a", cluster.Options{}),
+		Publisher: quietPublisher{}, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	t.Cleanup(func() { manager.StopAll(context.Background()) })
+
+	const sid = "9c2b7d1e-0000-4000-8000-0000000000c4"
+	session, err := manager.Adopt(context.Background(), sid)
+	if err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, running := engines.Session(sid)
+	if !running {
+		t.Fatal("the engine has no session for the account that was just adopted")
+	}
+	engineSession.EmitLast(protocol.EventSessionConnectFailure, map[string]any{"reason": "unavailable"})
+	waitFor(t, session.Retired, "the session was never finished with")
+
+	// Written against the two rather than through the executor, because what has to hold
+	// is that no moment exists between them: a command is in or it is not, and a session
+	// that has one is not free.
+	if session.admit() {
+		t.Fatal("a session whose door is shut took a command in")
+	}
+	session.reopen(session.retiredOn.Load())
+	if !session.admit() {
+		t.Fatal("a session with an open door refused a command")
+	}
+	if session.claim() {
+		t.Fatal("a session that had just taken a command in was handed over as free")
+	}
+	session.doneWith()
+}

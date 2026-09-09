@@ -1163,11 +1163,10 @@ func (s *Session) Connect(ctx context.Context, req engine.ConnectRequest) error 
 	// the queued Connected lands in between: the guard is down, so it is announced rather
 	// than refused, and the resume below is then told the session is already open — over
 	// a socket that is down for good, and with nothing arriving later to say so.
-	// Read before the guard comes down, because coming down takes the session's own
-	// giving-up with it: a request refused below never dialled anything, and a session
-	// left looking as though it had something to try is one nothing hands back.
-	gaveUp := s.Finished()
-	standing := s.dropHangUp()
+	// The guard comes down with the session's own giving-up, and that is what is handed
+	// back here: a request refused below never dialled anything, and a session left
+	// looking as though it had something to try is one nothing hands back.
+	standing, gaveUp := s.dropHangUp()
 
 	var err error
 	switch req.Pairing {
@@ -1653,7 +1652,7 @@ func (s *Session) settleLogout() {
 // entirely before — refused, and the socket it came from closed — or entirely after,
 // by which point this request has already decided to dial and the worst it costs is a
 // second `open` behind the first.
-func (s *Session) dropHangUp() string {
+func (s *Session) dropHangUp() (state string, gaveUp uint64) {
 	s.transition.Lock()
 	defer s.transition.Unlock()
 
@@ -1662,9 +1661,18 @@ func (s *Session) dropHangUp() string {
 	// The operator is asking for a connection, which is the answer to "is there anything
 	// left to try". Left standing, it would retire the session on the next pairing that
 	// merely ran out of codes.
-	s.terminal = false
+	//
+	// Handed back rather than read separately by the caller: the branch that gives up
+	// takes the same lock, so a giving-up that lands either side of this is either taken
+	// down here and reported, or not taken down at all. Read before, one landing in
+	// between is cleared by this and reported to nobody -- and a connect refused before it
+	// dialled would then have nothing to put back.
+	if s.terminal {
+		gaveUp = s.givenUp
+		s.terminal = false
+	}
 	s.mu.Unlock()
-	return s.state()
+	return s.state(), gaveUp
 }
 
 // hangUpStanding reports whether the guard is up, without taking it down. The Connected

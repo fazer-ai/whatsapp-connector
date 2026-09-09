@@ -443,26 +443,29 @@ func (s *Session) shut(attempt uint64) {
 	s.queueMu.Unlock()
 }
 
-// finished reports whether the door is shut, marking the refusal in the same step so a
-// reopening cannot come between the two and lose it.
-func (s *Session) finished() bool {
+// admit takes a command in and counts it as running, or refuses it and marks the refusal.
+//
+// One step for all of it. A check that passed and a count that has not happened yet is a
+// session that reads as having nothing running: a hand-back takes it there, and the
+// command runs on a session being stopped -- a connect answering the client that it
+// worked, over a socket that is closed a moment later. The refusal is marked in the same
+// step for the same reason, so a door reopening cannot come between the two and lose it.
+func (s *Session) admit() bool {
 	s.queueMu.Lock()
 	defer s.queueMu.Unlock()
-	if s.shutFor == 0 {
+	if s.stopping {
 		return false
 	}
-	s.refused = true
+	if s.shutFor != 0 {
+		s.refused = true
+		return false
+	}
+	s.running++
 	return true
 }
 
-// takingUp and done bracket a command the executor is carrying out, which is what lets
-// `claim` tell "nothing is running" from "a connect is dialling right now".
-func (s *Session) takingUp() {
-	s.queueMu.Lock()
-	s.running++
-	s.queueMu.Unlock()
-}
-
+// doneWith is the other end of `admit`: the command has been answered, and the session is
+// free to be handed over.
 func (s *Session) doneWith() {
 	s.queueMu.Lock()
 	s.running--
@@ -687,8 +690,7 @@ func (s *Session) execute(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case delivery := <-s.commands:
-			if s.finished() {
-				// Left pending for whoever takes the account.
+			if !s.admit() {
 				// Queued before the engine finished with the session, which `Offer` can
 				// no longer refuse because it was already taken. Carried out, a connect
 				// waiting here dials an account the next tick hands away and answers the
@@ -697,7 +699,6 @@ func (s *Session) execute(ctx context.Context) {
 				release(delivery)
 				continue
 			}
-			s.takingUp()
 			s.run(ctx, delivery)
 			s.doneWith()
 		}
