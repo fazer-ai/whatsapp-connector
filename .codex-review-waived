@@ -492,3 +492,17 @@ internal/engine/whatsmeow/session.go: Preserve failed name writes across session
 # putting a channel in production code for the tests to read. The same shape is used
 # throughout the repository's own suites (internal/app, transport/redisstream).
 internal/session/manager_internal_test.go: Replace polling sleeps with deterministic synchronization  # PR#144
+# PR#149: a two-release rollout is what you need when new behaviour breaks old
+# participants, and nothing here does. Every pairing during a rolling deploy is either
+# fixed or exactly main's behaviour today: new reader with new writer is the fix; new
+# reader with old writer finds no mark and acknowledges the wake, which is what main
+# does; old reader ignores the mark and acknowledges the wake, which is also what main
+# does. At no point is any instance worse off than before the change, so there is no
+# window to stage. The mark is a key nothing else reads, with a TTL of one lease, and
+# an old instance that wins a lease without clearing a mark is covered by the fence:
+# readers compare mark against holder, and a mark naming somebody who no longer holds
+# the lease reads as nobody handing anything back. The one case an old binary leaves
+# behind -- winning a lease under an instance id a mark still names -- costs wakes left
+# pending for at most one TTL, with nothing lost. Staging it over two releases would
+# add a flag and a second deploy to buy a property the additive shape already has.
+internal/cluster/lease.go: Stage the hand-back marker for mixed-version fleets  # PR#149
