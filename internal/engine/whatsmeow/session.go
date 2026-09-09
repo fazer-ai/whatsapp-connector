@@ -432,6 +432,11 @@ type Session struct {
 	// each change -- and read from here under the lock like every other session field.
 	pushName     string
 	businessName string
+	// pushUnfiled says the push name in hand has not made it into the contact table, so
+	// the row is behind it. The table answers over the session everywhere else, and a
+	// write that failed is exactly the case where that would answer with a name the
+	// account has already left behind.
+	pushUnfiled bool
 	// phone and lid are this session's copy of what it paired. whatsmeow assigns the
 	// same fields on its pairing goroutine, so reading them off the client from a
 	// command is a race; this is written from the event handler and read under the
@@ -717,6 +722,7 @@ func (s *Session) adopt(client *wm.Client) bool {
 	s.lid = named.lid
 	s.pushName = named.pushName
 	s.businessName = named.businessName
+	s.pushUnfiled = false
 	s.stale = false
 	s.revoked = false
 	s.connected = false
@@ -886,6 +892,7 @@ func (s *Session) rename(pushName string) {
 	}
 	s.mu.Lock()
 	s.pushName = pushName
+	s.pushUnfiled = true
 	s.mu.Unlock()
 
 	// Written to the contact table as well, which is the only thing that keeps the two
@@ -899,9 +906,9 @@ func (s *Session) rename(pushName string) {
 
 // recordOwnName files the account's own push name where the people it has met are filed.
 //
-// A failure is logged and left: the name is an annotation, the session's own copy is
-// already current, and what this buys is only that a session built after a restart agrees
-// with it.
+// A failure is logged rather than retried: the name is an annotation and the session's own
+// copy is already current. What it costs is that the row is behind until the next rename,
+// which is why the session remembers that it is.
 func (s *Session) recordOwnName(pushName string) {
 	client := s.current()
 	if client == nil || client.Store == nil || client.Store.Contacts == nil {
@@ -910,6 +917,7 @@ func (s *Session) recordOwnName(pushName string) {
 	phone, lid := s.identity()
 	writing, done := context.WithTimeout(s.ctx, s.storeLimit)
 	defer done()
+	filed := false
 	for _, address := range []protocol.Address{
 		{Kind: protocol.AddressPhone, ID: phone},
 		{Kind: protocol.AddressLID, ID: lid},
@@ -924,21 +932,36 @@ func (s *Session) recordOwnName(pushName string) {
 		if _, _, err := client.Store.Contacts.PutPushName(writing, jid, pushName); err != nil {
 			s.log.Debug().Err(err).Str("kind", string(address.Kind)).
 				Msg("could not file the account's own push name")
+			continue
 		}
+		filed = true
 	}
+	if !filed {
+		return
+	}
+	s.mu.Lock()
+	// Only while the name is still the one that was written: a rename that landed during
+	// this has a write of its own behind it.
+	if s.pushName == pushName {
+		s.pushUnfiled = false
+	}
+	s.mu.Unlock()
 }
 
 // selfNames is what this account calls itself: the push name every recipient sees, and the
 // verified name a business account carries.
 type selfNames struct {
-	push     string
+	push string
+	// unfiled says the push name has not reached the contact table, which is otherwise
+	// the copy that answers.
+	unfiled  bool
 	verified string
 }
 
 func (s *Session) names() selfNames {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return selfNames{push: s.pushName, verified: s.businessName}
+	return selfNames{push: s.pushName, unfiled: s.pushUnfiled, verified: s.businessName}
 }
 
 // relearn takes the account's own details off the client again.

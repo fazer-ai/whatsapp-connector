@@ -1,3 +1,14 @@
+# PR#139: right that a self account reported under `hosted`, `hosted.lid` or `c.us` has its
+# verified name filed by whatsmeow under that raw JID, while the read here rebuilds the two
+# canonical ones. What makes it narrow is the write next to it: `updateBusinessName` files
+# the name under the JID it was given and then resolves the other namespace and files it
+# there too, so the canonical row is written unless that resolution also fails.
+# Filing under a non-canonical JID from this side is the part not worth doing. Addresses on
+# this connector's own paths are canonical by rule, and a row under `hosted` would be one
+# nothing else here can look up -- the session would be writing a key only it knows about,
+# to cover a case that needs two failures at once. The account's own push name is filed
+# under the canonical pair for exactly that reason.
+internal/engine/whatsmeow/session.go: Persist verified names under canonical self JIDs  # PR#139
 # PR#136: this is a fix an earlier round of this same review asked for, that a later round
 # of it then reported as a bug -- and the later round is right. `client.Store.PushName` is
 # written by whatsmeow from its app-state goroutine (appstate.go, on a push-name setting

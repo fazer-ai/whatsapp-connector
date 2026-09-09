@@ -379,3 +379,37 @@ func TestARenameIsFiledWhereTheContactsAre(t *testing.T) {
 		t.Errorf("the table has the account down as %q, want the name it renamed itself to", contact.PushName)
 	}
 }
+
+// The table answers over the session because every change reaches it. A write that failed
+// is the case where that is not true, and answering from the row would then report a name
+// the account has already left behind.
+func TestAResolveKeepsARenameTheTableDidNotTake(t *testing.T) {
+	t.Parallel()
+
+	session, container := newTestSession(t, "5511999990001")
+	own := waTypes.NewJID("5511999990001", waTypes.DefaultUserServer)
+	if _, _, err := session.current().Store.Contacts.PutPushName(t.Context(), own, "Antigo"); err != nil {
+		t.Fatalf("PutPushName: %v", err)
+	}
+	// Read once so the row is in whatsmeow's own cache, which is what answers the resolve
+	// after the database is gone.
+	if _, err := session.current().Store.Contacts.GetContact(t.Context(), own); err != nil {
+		t.Fatalf("GetContact: %v", err)
+	}
+	if err := container.Close(); err != nil {
+		t.Fatalf("Close the store: %v", err)
+	}
+
+	// The rename lands in the session and fails to reach the table.
+	session.handle(&waEvents.PushNameSetting{
+		Action: &waSyncAction.PushNameSetting{Name: proto.String("Atendimento")},
+	})
+
+	result, err := session.Execute(t.Context(), resolveCommand(t, `{"party":{"kind":"phone","id":"5511999990001"}}`))
+	if err != nil {
+		t.Fatalf("contact.resolve: %v", err)
+	}
+	if party := resolved(t, result); party["push_name"] != "Atendimento" {
+		t.Errorf("the account is called %v, want the name the table never took", party)
+	}
+}
