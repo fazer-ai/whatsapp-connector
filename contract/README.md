@@ -182,8 +182,8 @@ this connector stands on every `contact.*`, `group.*` and `history.request` row 
 |---|---|
 | `session.connect`, `session.status` | `connection_state`, which also carries `reachout_time_lock` and `new_chat_cap` where a connector reports them. This one does not fill either yet |
 | `admin.ping` | `{ "inst": string, "version": string, "sessions": integer }` |
-| `message.send`, `message.edit`, `message.react` | `{ "message_id": string, "timestamp": timestamp_ms, "client_ref": string\|null }` |
-| `message.revoke` | `null` |
+| `message.send`, `message.edit`, `message.react` | `{ "message_id": string, "timestamp": timestamp_ms, "client_ref": string\|null }`. `message.react` is refused with `unsupported` on a channel, which names a post by a server id the contract has no field for |
+| `message.revoke` | `null`. Refused with `unsupported` on a channel: WhatsApp answers the deletion without an error and leaves the post up, so reporting success would tell the client a post is gone while every follower still sees it |
 | `history.request` | `null`. The phone answers later, as `history.sync` events, and may never answer at all: the reply says the request went out, not that history is coming |
 | `message.download_media` | `media_ref`, fetchable from `url` until `expires_at`. The connector answers with a `connector_blob`, the same shape its events carry: what it hands back is a blob it just wrote, instance-local and time-bounded like any other |
 | `contact.check` | array of `{ "phone": digits, "exists": boolean, "address": address\|null }` |

@@ -15,6 +15,11 @@
 // when the body carries no key. Both came from reading whatsmeow's *send* path and
 // assuming the receive side is symmetric.
 //
+// The deletion turned out not to work at all, which this phase now pins from the other
+// side: the command is refused, and the two checks after it are what says the refusal is
+// the honest answer rather than a missing feature -- the post is still in the channel and
+// nothing was published about it. #134.
+//
 //	WAC_LIVE_CHANNEL=<jid> go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveChannelMessageChange
 //
 // The channel is created on the first run and its JID printed; pass it back afterwards.
@@ -23,6 +28,7 @@ package whatsmeow
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"slices"
@@ -69,16 +75,18 @@ func TestLiveChannelMessageChange(t *testing.T) {
 	// leaves a client looking for a message nobody stored.
 	liveCheckTheCorrection(t, edited, post)
 
-	// The deletion, and it does not work. Pinned to what was measured rather than to what
-	// `revokeOf` was written for, so that whoever fixes it is told by a failing test
-	// instead of finding this phase asserting something that has not been true.
+	// The deletion, which this connector refuses. Sent, it is answered without an error
+	// and does nothing: the post stays in the channel and nothing is published to the
+	// follower or to the owner, so the only side that believed the post was gone was the
+	// client that asked. Measured that way for #134, and refused since.
 	//
-	// What happens: `message.revoke` is accepted, whatsmeow builds the newsletter stanza
-	// the way its own send path says to -- `edit=admin_revoke`, no body, the stanza id
-	// rewritten to the post's -- WhatsApp answers without an error, and the post stays in
-	// the channel. Nothing is published to the follower or to the owner, so the only side
-	// that believes the post is gone is the client that asked. Recorded as #134.
-	liveRevokeOwn(t, subject, to, post)
+	// The refusal is asserted here rather than in a unit test alone because what makes it
+	// right is the two checks below it, which are what a unit test cannot make: that the
+	// post is still there and that nothing arrived.
+	liveRefused(t, subject, protocol.CommandMessageRevoke, map[string]any{
+		"to":        map[string]any{"kind": to.Kind, "id": to.ID},
+		"target_id": post,
+	}, protocol.ErrorUnsupported)
 
 	// Nothing arriving is what is being recorded, and nothing is also what a session that
 	// stopped delivering looks like. So a post sent after the deletion is what closes it:
@@ -92,14 +100,14 @@ func TestLiveChannelMessageChange(t *testing.T) {
 			"nothing: this watcher's buffer filled before anything drained it", dropped, post)
 	}
 	if arrived {
-		t.Fatalf("a deletion of %s reached the follower, which #134 says does not happen: "+
-			"if this is fixed, assert the deletion here and close it", post)
+		t.Fatalf("a deletion of %s reached the follower, and this connector refused to send "+
+			"one: something else deleted the post, or the refusal is not being applied", post)
 	}
 	if !liveChannelStillHas(t, subject, channel, post) {
-		t.Fatalf("%s is gone from the channel, so the deletion worked after all: "+
-			"#134 is fixed on WhatsApp's side and this phase has to assert it now", post)
+		t.Fatalf("%s is gone from the channel and no deletion was sent for it: "+
+			"if a path here can delete a channel post after all, #134 has to be reopened", post)
 	}
-	t.Logf("the deletion left %s in the channel and published nothing, which is #134", post)
+	t.Logf("the deletion was refused, %s is still in the channel and nothing was published", post)
 
 	for name, session := range map[string]*Session{"subject": subject, "counterpart": counterpart} {
 		if state := session.state(); state != "open" {
@@ -151,13 +159,27 @@ func liveChannel(t *testing.T, owner *Session) waTypes.JID {
 
 // liveRevokeOwn deletes the account's own message, which is the only deletion a channel
 // has: a post's author is the channel, so there is no participant to name.
-func liveRevokeOwn(t *testing.T, from *Session, to protocol.Address, target string) {
+// liveRefused is liveCommand for a command this connector is expected to turn down, and it
+// checks the code rather than only the refusal: a client branches on it, and one refusal
+// standing in for another is what sends it down the wrong road.
+func liveRefused(
+	t *testing.T, from *Session, kind protocol.CommandType, payload map[string]any, want protocol.ErrorCode,
+) {
 	t.Helper()
 
-	liveCommand(t, from, protocol.CommandMessageRevoke, map[string]any{
-		"to":        map[string]any{"kind": to.Kind, "id": to.ID},
-		"target_id": target,
-	})
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("build a %s: %v", kind, err)
+	}
+	_, err = from.Execute(t.Context(), &protocol.Command{Type: kind, Payload: body})
+	if err == nil {
+		t.Fatalf("%s was carried out, and it is meant to be refused with %s", kind, want)
+	}
+	var refusal *protocol.Error
+	if !errors.As(err, &refusal) || refusal.Code != want {
+		t.Fatalf("%s was refused with %v, want %s", kind, err, want)
+	}
+	fmt.Fprintf(os.Stderr, "the %s was refused with %s\n", kind, refusal.Code)
 }
 
 // liveNothingAbout is the negative of liveAwaitAbout: whether an event of that type naming

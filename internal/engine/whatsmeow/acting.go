@@ -112,6 +112,26 @@ func (s *Session) revoke(ctx context.Context, command *protocol.Command) (json.R
 		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
 			"a revoke has to name the message it deletes")
 	}
+	if req.To.Kind == protocol.AddressNewsletter {
+		// Measured on a real channel: the stanza whatsmeow builds for this --
+		// `edit=admin_revoke`, no body, the stanza id rewritten to the post's -- is
+		// answered without an error, the post stays in the channel, and nothing is
+		// published to the followers or to the owner. The only side that believes the
+		// post is gone is the client that asked, which is worse than a refusal: a refusal
+		// sends somebody to delete it from the phone.
+		//
+		// A channel names a post by its `server_id`, the way a reaction does, and the
+		// contract carries no field it could arrive in. whatsmeow has no primitive for
+		// this either -- `NewsletterSendReaction` and `NewsletterMarkViewed` take a server
+		// id, and there is no deletion beside them -- so there is nothing to call even
+		// once the id is in hand. Refused until #134 has both.
+		//
+		// An edit is not in the same position and is not refused: whatsmeow rewrites the
+		// stanza id to the target's there too, and the correction lands, which was
+		// measured in the same session.
+		return nil, protocol.NewError(protocol.ErrorUnsupported,
+			"this connector cannot delete a channel post yet")
+	}
 	to, err := jidOf(req.To)
 	if err != nil {
 		return nil, err
@@ -142,9 +162,6 @@ func (s *Session) revoke(ctx context.Context, command *protocol.Command) (json.R
 	// first. What it does with one whose target is already gone is its business, and
 	// not something to find out per outage.
 	//
-	// Ignored on a channel, where whatsmeow rewrites the stanza id to the target's,
-	// which is how a channel names what is being deleted. That is already idempotent by
-	// construction: the id is the target's, so the retry carries the same one.
 	if _, err := s.putOnTheWire(ctx, to, s.orDerived(command, ""),
 		client.BuildRevoke(to, sender, req.TargetID)); err != nil {
 		return nil, err
@@ -192,9 +209,10 @@ func (s *Session) react(ctx context.Context, command *protocol.Command) (json.Ra
 		// the ordinary way it goes out as a message naming a key the channel cannot
 		// resolve, and the send reports success. Refused until #34 does it properly.
 		//
-		// An edit and a revoke are not in the same position and are not refused:
-		// whatsmeow recognises both on the newsletter path and rewrites the stanza id to
-		// the target's, which is how a channel names what is being changed.
+		// An edit is not in the same position and is not refused: whatsmeow rewrites the
+		// stanza id to the target's, which is how a channel names what is being changed,
+		// and the correction lands. A deletion is refused beside this one, for the same
+		// reason and separately measured -- #134.
 		return nil, protocol.NewError(protocol.ErrorUnsupported,
 			"this connector cannot react to a channel post yet")
 	}
