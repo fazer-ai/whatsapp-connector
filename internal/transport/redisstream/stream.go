@@ -142,8 +142,12 @@ func (s *Streams) Publish(ctx context.Context, event *protocol.Event) error {
 // again here answered at `wa:reply:wa:reply:<id>`, which nobody reads, so every RPC in
 // the fleet timed out while the command it carried had already been carried out.
 func (s *Streams) Reply(ctx context.Context, replyTo string, reply protocol.Reply) error {
-	if replyTo == "" {
-		return errors.New("redisstream: reply without a destination")
+	// The destination is the client's to choose and this connector's to check. Everything
+	// else under the prefix is fleet state -- the session set, the leases, the streams --
+	// and an answer written at one of those names would leave a TTL on it even where the
+	// push itself fails on the type, since both run in one transaction.
+	if !s.client.Keys().IsReply(replyTo) {
+		return fmt.Errorf("redisstream: %q is not a reply destination", replyTo)
 	}
 	body, err := marshalReply(reply)
 	if err != nil {
