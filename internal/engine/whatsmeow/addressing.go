@@ -45,23 +45,6 @@ type alias struct {
 
 func newAlias() *alias { return &alias{seen: make(map[string]waTypes.JID)} }
 
-// of answers the other namespace's JID for one, and whether there is one to have.
-//
-// A store that will not answer is logged and left. The address still goes out with the
-// half the event carried, which is what happened before this existed at all, and the next
-// event for the same party asks again -- on the event path, losing the mapping is worth
-// less than losing the event. A caller that is asking for the mapping itself wants the
-// difference, and lookup is where it is kept.
-func (a *alias) of(ctx context.Context, s *Session, jid waTypes.JID) (waTypes.JID, bool) {
-	alt, found, err := a.lookup(ctx, s, jid)
-	if err != nil {
-		s.log.Debug().Err(err).Str("jid", jid.String()).
-			Msg("could not read the other namespace for a party")
-		return waTypes.EmptyJID, false
-	}
-	return alt, found
-}
-
 // generationKey is how the account an operation started under travels with it.
 type generationKey struct{}
 
@@ -120,14 +103,14 @@ func (a *alias) observe(ctx context.Context, jids ...waTypes.JID) {
 	a.mu.Unlock()
 }
 
-// lookup is of, with the failure kept apart from the absence.
+// lookup answers the other namespace's JID for one, and whether there is one to have.
 //
-// The two are not the same answer and a command whose whole result is the mapping cannot
-// treat them as one: "nobody has learned this pairing yet" is a result, and "the store did
-// not answer" is a refusal the caller can retry.
-func (a *alias) lookup(ctx context.Context, s *Session, jid waTypes.JID) (waTypes.JID, bool, error) {
+// Out of what this account was shown and nothing else, so there is no store behind it and
+// no failure to report: an absence here is "nobody has shown this account that pairing
+// yet", which the next message from the same person usually settles.
+func (a *alias) lookup(s *Session, jid waTypes.JID) (waTypes.JID, bool) {
 	if !pairable(jid) {
-		return waTypes.EmptyJID, false, nil
+		return waTypes.EmptyJID, false
 	}
 	key := jid.ToNonAD().String()
 
@@ -136,57 +119,47 @@ func (a *alias) lookup(ctx context.Context, s *Session, jid waTypes.JID) (waType
 	learning := a.generation
 	a.mu.RUnlock()
 	if remembered {
-		return known, true, nil
+		return known, true
 	}
 
-	client := s.current()
-	if client == nil || client.Store == nil {
-		return waTypes.EmptyJID, false, nil
-	}
-	alt, err := client.Store.GetAltJID(ctx, jid)
-	switch {
-	case err != nil:
-		return waTypes.EmptyJID, false, err
-	case alt.IsEmpty():
-		return waTypes.EmptyJID, false, nil
+	// The account's own pairing is the one this never had to be told: the session holds
+	// both halves, off the device it paired and the connection it made. It is also the one
+	// the shared table may not answer for -- whatsmeow logs that write rather than failing
+	// on it -- and a receipt for the account's own send would then go out under the number
+	// while every other path names the conversation by LID.
+	if own, mine := s.ownAlias(jid); mine {
+		a.remember(key, own, learning)
+		return own, true
 	}
 
-	// Nothing this account was shown, so it is answered only where it discloses nothing:
-	// the number has to be one this account already holds. `whatsmeow_contacts` is keyed
-	// by `our_jid` and is the only per-account record in the device store, so a row under
-	// the phone half is this account's own record of having been given that number -- by a
-	// message, a group listing or an address-book sync. Pairing it with a LID then tells
-	// this account which of the people it can already call is the one behind the handle,
-	// and never hands it a number nobody gave it.
+	// And nothing else. `whatsmeow_lid_map` is `(lid, pn)` with no `our_jid`, so a row in
+	// it may be one another operator's account was shown, and there is nothing here that
+	// can tell which. The contact table looked like the answer -- it is keyed by `our_jid`
+	// -- and it is not: `updatePushName` fills in the address the event did not carry out
+	// of that same shared table and files a row under it, so a row for a number can be
+	// this account's own record of the very mapping it is being asked to authorise.
 	//
-	// The phone half specifically. A row under the LID would pass a test on either
-	// address while proving the opposite: an account that has only ever seen the handle is
-	// exactly the one the number is being withheld from.
-	allowed, err := s.hasMet(ctx, phoneHalf(jid, alt))
-	switch {
-	case err != nil:
-		return waTypes.EmptyJID, false, err
-	case !allowed:
-		s.log.Debug().Str("jid", jid.String()).
-			Msg("withholding a pairing this account was not the one shown")
-		return waTypes.EmptyJID, false, nil
-	}
-
-	a.remember(key, alt, learning)
-	return alt, true, nil
+	// What is left is what this account was shown, which `observe` records as it goes by.
+	// A pairing nobody has shown it yet is not published, and the next message from the
+	// same person carries both halves.
+	return waTypes.EmptyJID, false
 }
 
-// phoneHalf is whichever of a pairing's two addresses is the number.
-//
-// Empty when neither is, which `hasMet` reads as an account that has met nobody: a pairing
-// with no phone half discloses no number, and there is nothing to authorise.
-func phoneHalf(jids ...waTypes.JID) waTypes.JID {
-	for _, jid := range jids {
-		if address, addressable := addressOf(jid); addressable && address.Kind == protocol.AddressPhone {
-			return jid.ToNonAD()
-		}
+// ownAlias answers the other half of the account's own pair.
+func (s *Session) ownAlias(jid waTypes.JID) (waTypes.JID, bool) {
+	phone, lid := s.identity()
+	if phone == "" || lid == "" {
+		return waTypes.EmptyJID, false
 	}
-	return waTypes.EmptyJID
+	address, addressable := addressOf(jid)
+	switch {
+	case !addressable:
+	case address.Kind == protocol.AddressPhone && address.ID == phone:
+		return waTypes.NewJID(lid, waTypes.HiddenUserServer), true
+	case address.Kind == protocol.AddressLID && address.ID == lid:
+		return waTypes.NewJID(phone, waTypes.DefaultUserServer), true
+	}
+	return waTypes.EmptyJID, false
 }
 
 // learning is which account's mapping is being learned right now.
@@ -255,7 +228,7 @@ func (s *Session) party(ctx context.Context, jids ...waTypes.JID) protocol.Party
 		return named
 	}
 	for _, jid := range jids {
-		alt, ok := s.aliases.of(ctx, s, jid)
+		alt, ok := s.aliases.lookup(s, jid)
 		if !ok {
 			continue
 		}
@@ -298,7 +271,7 @@ func (s *Session) address(ctx context.Context, jids ...waTypes.JID) (protocol.Ad
 		return named, true
 	}
 	for _, jid := range jids {
-		alt, found := s.aliases.of(ctx, s, jid)
+		alt, found := s.aliases.lookup(s, jid)
 		if !found {
 			continue
 		}

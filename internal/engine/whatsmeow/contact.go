@@ -335,10 +335,7 @@ func (s *Session) resolveContact(ctx context.Context, command *protocol.Command)
 		}
 		return json.Marshal(named)
 	}
-	alt, found, err := s.aliases.lookup(reading, s, jid)
-	if err != nil {
-		return nil, s.storeFailure(err, "the address mapping")
-	}
+	alt, found := s.aliases.lookup(s, jid)
 	if found {
 		// Withholding is the lookup's own, and it is the same rule on every path that
 		// names a party: a pairing this account was not the one shown is not answered
@@ -438,53 +435,4 @@ func (s *Session) nameFromStore(ctx context.Context, named *protocol.Party) {
 			named.VerifiedName = contact.BusinessName
 		}
 	}
-}
-
-// hasMet reports whether this account has a record of either of a party's two addresses.
-//
-// The contact table is keyed by `our_jid`, which makes it the only per-account record in
-// the device store: a row exists once a message, a group listing or an address-book sync
-// has put one there. `whatsmeow_lid_map` has no such key -- it is `(lid, pn)` and nothing
-// else -- so it is shared by every account on the deployment, and a mapping read out of it
-// may be one another operator's account was shown.
-//
-// Either address counts, because the row can be filed under the namespace the caller did
-// not ask about, which is the same asymmetry the name lookup handles.
-// A read that fails is not a party this account has not met: withholding on it would
-// answer the same one-sided party an unknown mapping answers, and a client told the other
-// namespace is unknown stops asking. The error goes back for the same reason the mapping's
-// does.
-func (s *Session) hasMet(ctx context.Context, addresses ...waTypes.JID) (bool, error) {
-	client := s.current()
-	if client == nil || client.Store == nil || client.Store.Contacts == nil {
-		return false, nil
-	}
-	for _, jid := range addresses {
-		if jid.IsEmpty() {
-			continue
-		}
-		contact, err := client.Store.Contacts.GetContact(ctx, jid)
-		if err != nil {
-			return false, err
-		}
-		if contact.Found {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-// storeFailure is what a device store that would not answer comes back as. A cancelled or
-// expired context is the caller's deadline rather than a fault here, and the two send a
-// client down different roads: one waits and asks again, the other is a line in this
-// connector's log.
-func (s *Session) storeFailure(err error, subject string) error {
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-		return protocol.NewError(protocol.ErrorTimeout, subject+" did not answer in time")
-	}
-	// Logged before it is degraded. `internal` is documented as meaning this connector's
-	// own logs are where to look, and the wire carries a closed vocabulary rather than a
-	// database's text -- so if the error does not reach the log here, it reaches nothing.
-	s.log.Error().Err(err).Msg("the device store refused a read " + subject + " needed")
-	return protocol.NewError(protocol.ErrorInternal, subject+" could not be read")
 }
