@@ -457,6 +457,20 @@ func (s *Session) doneWith() {
 	s.queueMu.Unlock()
 }
 
+// leaving reports that this session's door is shut: the engine has said its last word and
+// what happens next is not decided yet -- the event saying so may still be going out, or a
+// command taken off the queue before the door shut may not have answered.
+//
+// Neither is a session to answer a wake with. Answering with it acknowledges the wake, and
+// the commands behind it are then refused by the shut door and left pending for an owner
+// that the heartbeat is about to stop being, with the one wake that would have started the
+// account somewhere else already retired.
+func (s *Session) leaving() bool {
+	s.queueMu.Lock()
+	defer s.queueMu.Unlock()
+	return s.shutFor != 0
+}
+
 // claim takes a retired session for the hand-back that is about to stop it, and says
 // whether it may.
 //
@@ -836,6 +850,11 @@ const ledgerTimeout = 3 * time.Second
 // never reaches a caller: the delivery is handed back instead, so whoever claims it next
 // can ask again once Redis is answering.
 var errUnknownWhetherItRan = errors.New("session: cannot tell whether the command has already run")
+
+// errLeaving is what an adoption answers with when this instance is in the middle of
+// finishing with the account. Not a failure: the wake it came from is left pending, and
+// whoever reads it next finds an account nobody owns and starts it.
+var errLeaving = errors.New("session: this instance is finishing with the account")
 
 // alreadyDid answers a command this session has already carried out.
 //

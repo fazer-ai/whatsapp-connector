@@ -2808,3 +2808,35 @@ func TestAPairingGivenUpOnAfterARefusedConnectFinishesTheSession(t *testing.T) {
 		t.Error("a pairing given up on after a connect WhatsApp refused left the session holding its lease")
 	}
 }
+
+// The operator can replace a pairing while the one before is still reading its channel,
+// and a refusal that arrives then belongs to the attempt they left. Marking the session
+// finished with on it marks the attempt that is running now, and nothing clears that: the
+// replacement's own connect came before the mark, so a pairing that goes on to succeed
+// would be handed over on the strength of an answer about the attempt it replaced.
+func TestARefusalForAnAttemptTheOperatorReplacedFinishesNothing(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "")
+	leftCtx, cancelLeft := context.WithCancel(t.Context())
+	t.Cleanup(cancelLeft)
+	left := session.startPairing(leftCtx, cancelLeft)
+
+	// The operator's corrected attempt, which is now the one the session is on.
+	nextCtx, cancelNext := context.WithCancel(t.Context())
+	t.Cleanup(cancelNext)
+	session.startPairing(nextCtx, cancelNext)
+
+	session.outdatedPairing(left)
+
+	if session.Finished() != 0 {
+		t.Error("a refusal for the attempt the operator left finished the one that replaced it")
+	}
+	select {
+	case emission, open := <-session.Events():
+		if open {
+			t.Fatalf("the session published %s for an attempt the operator had already replaced", emission.Type)
+		}
+	case <-time.After(200 * time.Millisecond):
+	}
+}

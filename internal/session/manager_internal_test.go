@@ -1695,3 +1695,105 @@ func TestADoorIsOnlyOpenedByAnAnswerAboutWhatShutIt(t *testing.T) {
 			offered, OfferStopped)
 	}
 }
+
+// A wake for an account this instance is finishing with must not be acknowledged. The
+// event saying the engine gave up may still be going out, so the session is not retired
+// yet and reads as ordinary: answered with it, the wake is retired, the commands behind it
+// are refused by the shut door, and the heartbeat then hands the account back -- unowned,
+// with the one wake that would have started it somewhere else already consumed.
+func TestAWakeForAnAccountOnItsWayOutIsLeftPending(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+
+	engines := fake.New()
+	publisher := &heldPublisher{
+		holds:   protocol.EventSessionConnectFailure,
+		entered: make(chan protocol.EventType, 8),
+		let:     make(chan struct{}),
+	}
+	manager := NewManager(&ManagerConfig{
+		Instance: "inst-a", Engine: engines,
+		Leases:    cluster.NewLeases(client, "inst-a", cluster.Options{}),
+		Publisher: publisher, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	t.Cleanup(func() { manager.StopAll(context.Background()) })
+	t.Cleanup(publisher.release)
+
+	const sid = "9c2b7d1e-0000-4000-8000-0000000000c1"
+	ctx := context.Background()
+	if _, err := manager.Adopt(ctx, sid); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, running := engines.Session(sid)
+	if !running {
+		t.Fatal("the engine has no session for the account that was just adopted")
+	}
+
+	// The last word is going out: the door is shut and the session is not retired yet.
+	engineSession.EmitLast(protocol.EventSessionConnectFailure, map[string]any{"reason": "unavailable"})
+	<-publisher.entered
+
+	if _, err := manager.Adopt(ctx, sid); !errors.Is(err, errLeaving) {
+		t.Fatalf("a wake for an account on its way out was answered with %v, want %v", err, errLeaving)
+	}
+}
+
+// The sweep waits for a command in flight; a wake reaching the same session has to wait
+// for it too, or the hand-back it triggers cancels the command from under the client
+// waiting for its answer -- and a redelivery of one whose side effect landed without its
+// record is a side effect carried out twice.
+func TestAWakeDoesNotHandBackASessionWithACommandInFlight(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+
+	engines := fake.New()
+	leases := cluster.NewLeases(client, "inst-a", cluster.Options{})
+	manager := NewManager(&ManagerConfig{
+		Instance: "inst-a", Engine: engines, Leases: leases,
+		Publisher: quietPublisher{}, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	t.Cleanup(func() { manager.StopAll(context.Background()) })
+
+	const sid = "9c2b7d1e-0000-4000-8000-0000000000c2"
+	ctx := context.Background()
+	session, err := manager.Adopt(ctx, sid)
+	if err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, running := engines.Session(sid)
+	if !running {
+		t.Fatal("the engine has no session for the account that was just adopted")
+	}
+
+	release := engineSession.Hold()
+	defer release()
+	if offered := session.Offer(&transport.Delivery{
+		Command: protocol.Command{
+			V: protocol.Version, ID: "c1", Type: protocol.CommandMessageSend, SID: sid,
+		},
+		Ack: func(context.Context) error { return nil }, Release: func() {},
+	}); offered != OfferAccepted {
+		t.Fatalf("the session refused a command with the door open: %v", offered)
+	}
+	waitFor(t, func() bool { return len(engineSession.Commands()) == 1 }, "the command never reached the engine")
+
+	engineSession.EmitLast(protocol.EventSessionConnectFailure, map[string]any{"reason": "unavailable"})
+	waitFor(t, session.Retired, "the session was never finished with")
+
+	if _, err := manager.Adopt(ctx, sid); !errors.Is(err, errLeaving) {
+		t.Fatalf("a wake took a session with a command still running, answering %v, want %v", err, errLeaving)
+	}
+	if len(engineSession.Commands()) != 1 {
+		t.Fatal("the session the wake found was stopped from under the command it was carrying out")
+	}
+}

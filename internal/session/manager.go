@@ -206,10 +206,21 @@ func (m *Manager) Adopt(ctx context.Context, sid string) (*Session, error) {
 	m.mu.RLock()
 	existing, running := m.sessions[sid]
 	m.mu.RUnlock()
-	if running && !existing.Retired() {
+	claimed := running && existing.claim()
+	if running && !claimed {
+		if existing.leaving() {
+			// On its way out, and which way is not settled: the event saying the engine
+			// finished with it may still be going out, or a command it took before the
+			// door shut may not have answered. Answering the wake with this session
+			// acknowledges it, and the commands behind it are then refused by a door this
+			// instance is about to stop being the owner of.
+			m.log.Info().Str("sid", sid).
+				Msg("a wake found an account this instance is finishing with; leaving it pending")
+			return nil, errLeaving
+		}
 		return existing, nil
 	}
-	if running {
+	if claimed {
 		// Finished with, and the sweep has not come round yet. Handing it back here
 		// rather than answering with it is what keeps the window between the two from
 		// being one where a command runs: a connect served by this session would
@@ -684,6 +695,12 @@ func (m *Manager) wake(ctx context.Context, delivery *transport.Delivery) {
 	_, err := m.Adopt(ctx, sid)
 	switch {
 	case err == nil:
+	case errors.Is(err, errLeaving):
+		// Not this instance's turn to answer: it is giving the account up, and the wake is
+		// what starts it again once nobody owns it. Released rather than forfeited, so it
+		// keeps its age -- the account has been unowned since it was sent.
+		release(delivery)
+		return
 	case errors.Is(err, cluster.ErrNotOwner):
 		if m.handingBack(sid) {
 			// Owned by this instance, which is running nothing and is still trying to

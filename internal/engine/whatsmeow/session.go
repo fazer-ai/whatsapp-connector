@@ -2538,13 +2538,7 @@ func (s *Session) publishPairing(run *pairingRun, item wm.QRChannelItem, publish
 			"request_id": run.id, "code": item.PasskeyConfirmation.Code,
 		})
 	case "err-client-outdated":
-		// The last thing this channel carries. whatsmeow sends it from the branch that
-		// closes the channel, so the reader's next turn finds it shut and returns without
-		// an outcome of its own: there is no `pairing.error` after this and no state to
-		// close, which makes this event the pairing's end as much as the session's.
-		// Nothing follows it that could carry the mark instead.
-		s.markTerminal()
-		s.emitLast(protocol.EventSessionClientOutdated, map[string]any{})
+		s.outdatedPairing(run)
 	case "timeout":
 		s.finishPairing(run, "timeout", nil)
 	case "error":
@@ -2552,6 +2546,32 @@ func (s *Session) publishPairing(run *pairingRun, item wm.QRChannelItem, publish
 	default:
 		s.finishPairing(run, item.Event, item.Error)
 	}
+}
+
+// outdatedPairing reports a build WhatsApp will not talk to, and finishes the session on
+// it.
+//
+// The last thing this channel carries: whatsmeow sends it from the branch that closes the
+// channel, so the reader's next turn finds it shut and returns without an outcome of its
+// own. There is no `pairing.error` after this and no state to close, which makes this
+// event the pairing's end as much as the session's -- nothing follows it that could carry
+// the mark instead.
+//
+// Only while this is still the attempt the session is on, and under the lock a replacement
+// takes to start: the operator can have replaced it already, and marking the session
+// finished with then is marking the attempt that is running now. Nothing clears that --
+// the replacement's own connect came before the mark -- so a pairing that goes on to
+// succeed is handed over on the strength of an answer about the attempt it replaced.
+func (s *Session) outdatedPairing(run *pairingRun) {
+	s.pairingMu.Lock()
+	defer s.pairingMu.Unlock()
+
+	if !s.endPairing(run) {
+		s.log.Warn().Msg("WhatsApp refused a pairing for this build after the attempt was replaced")
+		return
+	}
+	s.markTerminal()
+	s.emitLast(protocol.EventSessionClientOutdated, map[string]any{})
 }
 
 // publishPasskeyRequest hands the operator's client the challenge WhatsApp wants signed.
