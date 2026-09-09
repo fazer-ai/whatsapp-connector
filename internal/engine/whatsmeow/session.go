@@ -432,14 +432,6 @@ type Session struct {
 	// each change -- and read from here under the lock like every other session field.
 	pushName     string
 	businessName string
-	// pushLive and verifiedLive say the name beside them came from an event this session
-	// handled rather than from the device record it was built on, which is what decides
-	// how it ranks against the contact table. A rename is written to the table and, for
-	// the paths that do not go through an app-state sync, not to the record -- so a copy
-	// taken from the record is the older of the two, and one an event brought is the
-	// newer.
-	pushLive     bool
-	verifiedLive bool
 	// phone and lid are this session's copy of what it paired. whatsmeow assigns the
 	// same fields on its pairing goroutine, so reading them off the client from a
 	// command is a race; this is written from the event handler and read under the
@@ -725,8 +717,6 @@ func (s *Session) adopt(client *wm.Client) bool {
 	s.lid = named.lid
 	s.pushName = named.pushName
 	s.businessName = named.businessName
-	s.pushLive = false
-	s.verifiedLive = false
 	s.stale = false
 	s.revoked = false
 	s.connected = false
@@ -886,8 +876,6 @@ func (s *Session) isSelf(jid waTypes.JID) bool {
 func (s *Session) setVerifiedName(businessName string) {
 	s.mu.Lock()
 	s.businessName = businessName
-	// From an event, which is what makes it outrank the contact table.
-	s.verifiedLive = true
 	s.mu.Unlock()
 }
 
@@ -898,29 +886,59 @@ func (s *Session) rename(pushName string) {
 	}
 	s.mu.Lock()
 	s.pushName = pushName
-	// From an event, which is what makes it outrank the contact table.
-	s.pushLive = true
 	s.mu.Unlock()
+
+	// Written to the contact table as well, which is the only thing that keeps the two
+	// copies of this name from disagreeing after a restart. A rename arrives two ways and
+	// each writes one of them: an app-state sync writes the device record, and the notify
+	// on a message the account sent writes the table. Neither writes the other, so a
+	// session rebuilt from the record has no way to tell which of the two it is holding.
+	// Writing here makes the table the one that is never behind.
+	s.recordOwnName(pushName)
+}
+
+// recordOwnName files the account's own push name where the people it has met are filed.
+//
+// A failure is logged and left: the name is an annotation, the session's own copy is
+// already current, and what this buys is only that a session built after a restart agrees
+// with it.
+func (s *Session) recordOwnName(pushName string) {
+	client := s.current()
+	if client == nil || client.Store == nil || client.Store.Contacts == nil {
+		return
+	}
+	phone, lid := s.identity()
+	writing, done := context.WithTimeout(s.ctx, s.storeLimit)
+	defer done()
+	for _, address := range []protocol.Address{
+		{Kind: protocol.AddressPhone, ID: phone},
+		{Kind: protocol.AddressLID, ID: lid},
+	} {
+		if address.ID == "" {
+			continue
+		}
+		jid, err := jidOf(address)
+		if err != nil {
+			continue
+		}
+		if _, _, err := client.Store.Contacts.PutPushName(writing, jid, pushName); err != nil {
+			s.log.Debug().Err(err).Str("kind", string(address.Kind)).
+				Msg("could not file the account's own push name")
+		}
+	}
 }
 
 // selfNames is what this account calls itself: the push name every recipient sees, and the
-// verified name a business account carries, each with where this session got it from.
+// verified name a business account carries.
 type selfNames struct {
-	push         string
-	verified     string
-	pushLive     bool
-	verifiedLive bool
+	push     string
+	verified string
 }
 
 func (s *Session) names() selfNames {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return selfNames{
-		push:         s.pushName,
-		verified:     s.businessName,
-		pushLive:     s.pushLive,
-		verifiedLive: s.verifiedLive,
-	}
+	return selfNames{push: s.pushName, verified: s.businessName}
 }
 
 // relearn takes the account's own details off the client again.

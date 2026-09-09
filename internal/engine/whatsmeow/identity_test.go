@@ -276,15 +276,15 @@ func TestASessionTakesTheLIDOffASocketItIsAboutToClose(t *testing.T) {
 	}
 }
 
-// A verified name from an event is the newest copy there is. The contact rows for the two
-// namespaces can disagree -- whatsmeow writes the LID row first and logs a failure on the
-// phone one -- and reading the stale row would undo a change this session was told about.
-func TestAResolveKeepsTheVerifiedNameAnEventBrought(t *testing.T) {
+// The table is where a verified name change lands: whatsmeow writes it there before it
+// dispatches the event, so the row and the session agree from that moment on. What this
+// pins is that the answer follows the table, which is the copy nothing leaves behind.
+func TestAResolveAnswersTheVerifiedNameFromTheTable(t *testing.T) {
 	t.Parallel()
 
 	session, _ := newTestSession(t, "5511999990001")
 	own := waTypes.NewJID("5511999990001", waTypes.DefaultUserServer)
-	if _, _, err := session.current().Store.Contacts.PutBusinessName(t.Context(), own, "Loja do Bruno"); err != nil {
+	if _, _, err := session.current().Store.Contacts.PutBusinessName(t.Context(), own, "Loja do Bruno LTDA"); err != nil {
 		t.Fatalf("PutBusinessName: %v", err)
 	}
 	session.handle(&waEvents.BusinessName{JID: own, NewBusinessName: "Loja do Bruno LTDA"})
@@ -294,7 +294,7 @@ func TestAResolveKeepsTheVerifiedNameAnEventBrought(t *testing.T) {
 		t.Fatalf("contact.resolve: %v", err)
 	}
 	if party := resolved(t, result); party["verified_name"] != "Loja do Bruno LTDA" {
-		t.Errorf("the account is verified as %v, want the name the event brought", party)
+		t.Errorf("the account is verified as %v, want the name the change left", party)
 	}
 }
 
@@ -354,5 +354,28 @@ func TestAResolveTakesTheTableWhenTheSessionOnlyHasTheRecord(t *testing.T) {
 	}
 	if party := resolved(t, result); party["push_name"] != "Atendimento" {
 		t.Errorf("the account is called %v, want the name the table was left with", party)
+	}
+}
+
+// A rename reaches the device record and the contact table by different paths, and neither
+// writes the other: an app-state sync writes the record, the notify on a message the
+// account sent writes the table. A session rebuilt from the record cannot tell which of
+// the two it is holding, so the session files its own name in the table as well and the
+// table is the copy that is never behind.
+func TestARenameIsFiledWhereTheContactsAre(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.handle(&waEvents.PushNameSetting{
+		Action: &waSyncAction.PushNameSetting{Name: proto.String("Atendimento")},
+	})
+
+	contact, err := session.current().Store.Contacts.GetContact(t.Context(),
+		waTypes.NewJID("5511999990001", waTypes.DefaultUserServer))
+	if err != nil {
+		t.Fatalf("GetContact: %v", err)
+	}
+	if contact.PushName != "Atendimento" {
+		t.Errorf("the table has the account down as %q, want the name it renamed itself to", contact.PushName)
 	}
 }

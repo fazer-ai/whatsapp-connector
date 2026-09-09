@@ -315,19 +315,20 @@ func (s *Session) resolveContact(ctx context.Context, command *protocol.Command)
 			named.LID = lid
 		}
 		named.Phone = phone
-		// The account's own names are usually in neither place -- the contact table is the
-		// people it has met, and it is not one of them -- so most of the time the session
-		// answers both. Where a row does exist as well, the rule is recency, and what
-		// says which is newer is where the session got its copy: a name an event brought
-		// in is at least as new as the table, because the same change wrote both, while
-		// one taken off the device record can be older than the table, because several of
-		// the paths that rename an account write the table and leave the record alone.
+		// The table first, then the session for what it does not hold. Its own names are
+		// usually in neither -- the table is the people this account has met, and it is
+		// not one of them -- so the session answers most of the time.
+		//
+		// Where a row does exist, the table is the copy that is never behind: every change
+		// to either name is written there, by whatsmeow for a verified name and by this
+		// session for a push name. The device record is not, which is why it does not get
+		// to answer over it.
 		s.nameFromStore(reading, &named)
 		own := s.names()
-		if own.push != "" && (own.pushLive || named.PushName == "") {
+		if named.PushName == "" {
 			named.PushName = own.push
 		}
-		if own.verified != "" && (own.verifiedLive || named.VerifiedName == "") {
+		if named.VerifiedName == "" {
 			named.VerifiedName = own.verified
 		}
 		return json.Marshal(named)
