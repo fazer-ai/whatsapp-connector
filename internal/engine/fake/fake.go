@@ -86,6 +86,7 @@ type Session struct {
 	events    chan engine.Emission
 	closed    bool
 	connected bool
+	finished  bool
 	loggedOut int
 	commands  []protocol.Command
 	held      chan struct{}
@@ -127,6 +128,9 @@ func (s *Session) Connect(_ context.Context, req engine.ConnectRequest) error {
 
 	s.mu.Lock()
 	s.connected = true
+	// A socket that is up is a session with something left to try, which is what a
+	// connect landing between a terminal emission and its publish leaves behind.
+	s.finished = false
 	s.mu.Unlock()
 	s.emit(protocol.EventSessionState, map[string]any{"state": "open"})
 	return nil
@@ -263,6 +267,14 @@ func (s *Session) holdSucceeds() bool {
 // Events is the emission channel. It is closed by Close.
 func (s *Session) Events() <-chan engine.Emission { return s.events }
 
+// Finished is what the fake was last told to say: EmitLast and EmitLastDurable put it
+// up, and a Connect that succeeds takes it down, the way whatsmeow's own does.
+func (s *Session) Finished() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.finished
+}
+
 // Close ends the session. Safe to call twice, because both an operator command and
 // the shutdown path reach it.
 func (s *Session) Close() error {
@@ -294,6 +306,7 @@ func (s *Session) EmitLast(eventType protocol.EventType, payload any) {
 	if s.closed {
 		return
 	}
+	s.finished = true
 	select {
 	case s.events <- engine.Emission{Type: eventType, Payload: body, Retires: true}:
 	default:
@@ -313,6 +326,7 @@ func (s *Session) EmitLastDurable(eventType protocol.EventType, payload any, set
 		settle(errors.New("fake: nobody is reading the emissions"))
 		return
 	}
+	s.finished = true
 	select {
 	case s.events <- engine.Emission{Type: eventType, Payload: body, Retires: true, Settle: settle}:
 	default:

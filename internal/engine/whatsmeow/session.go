@@ -1691,6 +1691,12 @@ func (s *Session) markTerminal() {
 	s.mu.Unlock()
 }
 
+// Finished is isTerminal under the name the engine interface asks for. Read by the
+// connector when it is about to publish an emission marked as the last: a connect that
+// ran in between clears the mark, and an account whose socket is back up is not one to
+// hand over.
+func (s *Session) Finished() bool { return s.isTerminal() }
+
 // isTerminal reports whether there is anything left for this session to try.
 func (s *Session) isTerminal() bool {
 	s.mu.Lock()

@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"errors"
 	"net"
 	"slices"
 	"sync"
@@ -14,6 +15,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/cluster"
+	"github.com/fazer-ai/whatsapp-connector/internal/engine"
 	"github.com/fazer-ai/whatsapp-connector/internal/engine/fake"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 	"github.com/fazer-ai/whatsapp-connector/internal/redisx"
@@ -339,6 +341,10 @@ func stallable(t *testing.T, backend string) *stalledRedis {
 func (s *stalledRedis) addr() string { return s.listener.Addr().String() }
 
 func (s *stalledRedis) stall() { s.stalled.Store(true) }
+
+// resume lets connections opened from here on through again. The one already swallowed
+// stays swallowed: its request is lost, which is what the caller waiting on it is for.
+func (s *stalledRedis) resume() { s.stalled.Store(false) }
 
 // holdNextAnswer keeps the next answer the server sends until `let` is closed.
 func (s *stalledRedis) holdNextAnswer() { s.holdReply.Store(true) }
@@ -741,6 +747,80 @@ func TestAHandBackAndAnAdoptionOfTheSameAccountDoNotOverlap(t *testing.T) {
 	t.Parallel()
 
 	server := miniredis.RunT(t)
+	hop := stallable(t, server.Addr())
+	rdb := redis.NewClient(&redis.Options{Addr: hop.addr(), ContextTimeoutEnabled: true})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+
+	engines := fake.New()
+	leases := cluster.NewLeases(client, "inst-a", cluster.Options{})
+	manager := NewManager(&ManagerConfig{
+		Instance: "inst-a", Engine: engines, Leases: leases,
+		Publisher: quietPublisher{}, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	t.Cleanup(func() {
+		quick, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		defer cancel()
+		manager.StopAll(quick)
+	})
+
+	const sid = "9c2b7d1e-0000-4000-8000-0000000000b1"
+	ctx := context.Background()
+	first, err := manager.Adopt(ctx, sid)
+	if err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, running := engines.Session(sid)
+	if !running {
+		t.Fatal("the engine has no session for the account that was just adopted")
+	}
+	engineSession.EmitLast(protocol.EventSessionConnectFailure, map[string]any{"reason": "unavailable"})
+	waitFor(t, first.Retired, "the session was never finished with")
+
+	// The hand-back reaches Redis and is never answered, so it is still under way for as
+	// long as the test needs it to be -- no clock decides that.
+	hop.stall()
+	handing, cancelHanding := context.WithTimeout(ctx, 300*time.Millisecond)
+	defer cancelHanding()
+	handed := make(chan struct{})
+	go func() {
+		defer close(handed)
+		manager.releaseThis(handing, sid, first)
+	}()
+	<-hop.swallowed
+	// Everything after the swallowed one gets through, so what the adoption waits for is
+	// the hand-back and not a server that stopped answering.
+	hop.resume()
+
+	// On this goroutine, so the answer is an ordering rather than a wait: the adoption
+	// returns after the hand-back finished, or it ran through it.
+	_, err = manager.Adopt(ctx, sid)
+	select {
+	case <-handed:
+	default:
+		t.Fatal("an adoption ran while a hand-back for the same account was still under way")
+	}
+
+	// The release never reached Redis, so the key still names this instance and the
+	// adoption is told as much. `handingBack` is what keeps the wake behind it pending
+	// rather than acknowledged as somebody else's.
+	if !errors.Is(err, cluster.ErrNotOwner) {
+		t.Fatalf("the adoption after a hand-back that never landed answered %v, want %v", err, cluster.ErrNotOwner)
+	}
+	if !manager.handingBack(sid) {
+		t.Fatal("a hand-back that did not reach Redis was forgotten, so the wake that would restart the account is acknowledged as somebody else's")
+	}
+}
+
+// And the other way round: a sweep does not take a session an adoption is working on. The
+// adoption releases the retired session, wins a lease of its own and opens a socket on
+// it; the sweep, acting on what it saw before any of that, would stop the session that
+// just started and delete the lease it is running under.
+func TestASweepDoesNotTakeASessionAnAdoptionIsWorkingOn(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
 	t.Cleanup(func() { _ = rdb.Close() })
 	client := redisx.Wrap(rdb, "wa:", 8)
@@ -754,7 +834,7 @@ func TestAHandBackAndAnAdoptionOfTheSameAccountDoNotOverlap(t *testing.T) {
 	})
 	t.Cleanup(func() { manager.StopAll(context.Background()) })
 
-	const sid = "9c2b7d1e-0000-4000-8000-0000000000b1"
+	const sid = "9c2b7d1e-0000-4000-8000-0000000000b4"
 	ctx := context.Background()
 	first, err := manager.Adopt(ctx, sid)
 	if err != nil {
@@ -765,11 +845,13 @@ func TestAHandBackAndAnAdoptionOfTheSameAccountDoNotOverlap(t *testing.T) {
 		t.Fatal("the engine has no session for the account that was just adopted")
 	}
 	engineSession.EmitLast(protocol.EventSessionConnectFailure, map[string]any{"reason": "unavailable"})
-	waitFor(t, func() bool { return first.Retired() }, "the session was never finished with")
+	waitFor(t, first.Retired, "the session was never finished with")
 
 	// An adoption in flight, which is all the answer goroutine holding this looks like
 	// from the heartbeat.
 	manager.handing.Lock()
+	defer manager.handing.Unlock()
+
 	manager.releaseThis(ctx, sid, first)
 	if !slices.Contains(manager.SIDs(), sid) {
 		t.Fatal("the sweep handed a session back from under an adoption of the same account")
@@ -777,22 +859,6 @@ func TestAHandBackAndAnAdoptionOfTheSameAccountDoNotOverlap(t *testing.T) {
 	if _, held := leases.Owned(sid); !held {
 		t.Fatal("the sweep released a lease an adoption of the same account was working on")
 	}
-
-	// And the other way round: a hand-back in flight is one an adoption waits out, or it
-	// wins the lease in time for the release to delete it.
-	adopted := make(chan struct{})
-	go func() {
-		defer close(adopted)
-		_, _ = manager.Adopt(ctx, sid)
-	}()
-	select {
-	case <-adopted:
-		t.Fatal("an adoption ran while a hand-back for the same account was under way")
-	case <-time.After(100 * time.Millisecond):
-	}
-
-	manager.handing.Unlock()
-	<-adopted
 }
 
 // A renewal is a round trip, and the answer describes the session as it was when the
@@ -892,6 +958,7 @@ func TestASessionTakesNoCommandWhileItsLastWordIsGoingOut(t *testing.T) {
 		Publisher: publisher, Replier: quietReplier{},
 		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
 	})
+	t.Cleanup(publisher.release)
 	t.Cleanup(func() { manager.StopAll(context.Background()) })
 
 	const sid = "9c2b7d1e-0000-4000-8000-0000000000b3"
@@ -914,7 +981,7 @@ func TestASessionTakesNoCommandWhileItsLastWordIsGoingOut(t *testing.T) {
 		Ack:     func(context.Context) error { return nil },
 		Release: func() {},
 	})
-	close(publisher.let)
+	publisher.release()
 	if offered != OfferStopped {
 		t.Fatalf("the session answered %v to a connect while its last word was going out, want %v",
 			offered, OfferStopped)
@@ -932,12 +999,163 @@ type heldPublisher struct {
 	entered chan struct{}
 	once    sync.Once
 	let     chan struct{}
+	letting sync.Once
+
+	// fails is what the held publish answers, which is a Redis that took the write and
+	// could not complete it.
+	fails error
+
+	mu     sync.Mutex
+	events []protocol.EventType
 }
 
 func (p *heldPublisher) Publish(_ context.Context, event *protocol.Event) error {
 	if event.Type == p.holds {
 		p.once.Do(func() { close(p.entered) })
 		<-p.let
+		if p.fails != nil {
+			return p.fails
+		}
 	}
+	p.mu.Lock()
+	p.events = append(p.events, event.Type)
+	p.mu.Unlock()
 	return nil
+}
+
+// release lets the held publish finish, once, however the test ends: a publish left
+// waiting is a pump that never stops and a cleanup that never returns.
+func (p *heldPublisher) release() { p.letting.Do(func() { close(p.let) }) }
+
+func (p *heldPublisher) published() []protocol.EventType {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return slices.Clone(p.events)
+}
+
+// The mark travels with the emission and cannot be taken off it. Between the engine
+// queueing its last word and the pump taking it -- a gap as long as whatever the pump is
+// publishing -- a connect can run and put the socket back up, and handing the account
+// over on an answer about the attempt before that one tears down a retry that worked.
+func TestAConnectThatWorkedCancelsAnOutcomeQueuedBeforeIt(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+
+	engines := fake.New()
+	publisher := &heldPublisher{
+		holds:   protocol.EventSessionState,
+		entered: make(chan struct{}),
+		let:     make(chan struct{}),
+	}
+	manager := NewManager(&ManagerConfig{
+		Instance: "inst-a", Engine: engines,
+		Leases:    cluster.NewLeases(client, "inst-a", cluster.Options{}),
+		Publisher: publisher, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	t.Cleanup(publisher.release)
+	t.Cleanup(func() { manager.StopAll(context.Background()) })
+
+	const sid = "9c2b7d1e-0000-4000-8000-0000000000b5"
+	session, err := manager.Adopt(context.Background(), sid)
+	if err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, running := engines.Session(sid)
+	if !running {
+		t.Fatal("the engine has no session for the account that was just adopted")
+	}
+
+	// One event the pump is stuck publishing, and the engine's last word queued behind it.
+	engineSession.Emit(protocol.EventSessionState, map[string]any{"state": "connecting"})
+	<-publisher.entered
+	engineSession.EmitLast(protocol.EventSessionConnectFailure, map[string]any{"reason": "unavailable"})
+
+	// The retry, which the door cannot refuse: the pump has not reached the last word yet.
+	if err := engineSession.Connect(context.Background(), engine.ConnectRequest{Pairing: "resume"}); err != nil {
+		t.Fatalf("the retry could not connect: %v", err)
+	}
+	publisher.release()
+
+	waitFor(t, func() bool { return len(publisher.published()) >= 2 }, "the queued outcome was never published")
+	if session.Retired() {
+		t.Fatal("a connect that worked was undone by an outcome the engine had already given up on")
+	}
+	if offered := session.Offer(&transport.Delivery{
+		Command: protocol.Command{
+			V: protocol.Version, ID: "c1", Type: protocol.CommandMessageSend, SID: sid,
+		},
+		Ack: func(context.Context) error { return nil }, Release: func() {},
+	}); offered != OfferAccepted {
+		t.Fatalf("the session answered %v after a retry that worked, want %v", offered, OfferAccepted)
+	}
+}
+
+// A door that opens again has to put back what it turned away. A command refused while it
+// was shut was released rather than given back -- a session on its way out must not
+// schedule a drain, which would claim its stream from under the owner taking it over --
+// and a released command keeps no turn: the newest command for the session would be read
+// and run ahead of one that has been pending since before it.
+func TestADoorThatOpensAgainSchedulesADrainForWhatItTurnedAway(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+
+	engines := fake.New()
+	publisher := &heldPublisher{
+		holds:   protocol.EventSessionConnectFailure,
+		entered: make(chan struct{}),
+		let:     make(chan struct{}),
+		fails:   errors.New("redis is away"),
+	}
+	manager := NewManager(&ManagerConfig{
+		Instance: "inst-a", Engine: engines,
+		Leases:    cluster.NewLeases(client, "inst-a", cluster.Options{}),
+		Publisher: publisher, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	t.Cleanup(publisher.release)
+	t.Cleanup(func() { manager.StopAll(context.Background()) })
+
+	const sid = "9c2b7d1e-0000-4000-8000-0000000000b6"
+	session, err := manager.Adopt(context.Background(), sid)
+	if err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, running := engines.Session(sid)
+	if !running {
+		t.Fatal("the engine has no session for the account that was just adopted")
+	}
+	// The mark adoption leaves is not what this is about.
+	manager.TakeNewlyAdopted()
+
+	engineSession.EmitLast(protocol.EventSessionConnectFailure, map[string]any{"reason": "unavailable"})
+	<-publisher.entered
+
+	var given atomic.Bool
+	manager.Dispatch(&transport.Delivery{
+		Command: protocol.Command{
+			V: protocol.Version, ID: "c1", Type: protocol.CommandSessionConnect, SID: sid,
+		},
+		Ack:     func(context.Context) error { t.Error("a command nobody carried out was retired"); return nil },
+		Release: func() { given.Store(true) },
+	})
+	if !given.Load() {
+		t.Fatal("a connect was taken while the session's last word was going out")
+	}
+
+	// The word never lands, so the session is not finished with after all.
+	publisher.release()
+	waitFor(t, func() bool { return !session.finishing.Load() }, "the door never opened again")
+
+	if marked := manager.TakeNewlyAdopted(); !slices.Contains(marked, sid) {
+		t.Fatalf("the door opened again on %v, leaving a command pending with no drain to take its stream back", marked)
+	}
 }

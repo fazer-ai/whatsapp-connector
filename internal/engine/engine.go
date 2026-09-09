@@ -126,6 +126,17 @@ type Session interface {
 	// Events is closed when the session is done. Reading it is the only way to learn
 	// what the engine has to say.
 	Events() <-chan Emission
+	// Finished reports that there is nothing left for this session to try: WhatsApp
+	// refused the build, banned the number or refused the connection, and the library
+	// publishes those from the branch that keeps the socket down.
+	//
+	// Asked when an emission marked as the last one is about to be published, because
+	// between the engine queueing that emission and the reader taking it a connect can
+	// have run and put a socket back up. The mark travels with the emission and cannot
+	// be taken off it; this is how the emission is checked against what has happened
+	// since, so a retry that worked is not torn down by an answer about the attempt
+	// before it.
+	Finished() bool
 	// Close releases the session. Events is closed before Close returns, so a reader
 	// draining it always terminates.
 	Close() error

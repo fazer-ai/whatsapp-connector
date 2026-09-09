@@ -65,6 +65,12 @@ type Session struct {
 	// so an emission that never landed puts the door back rather than handing an account
 	// away with nothing published to say why.
 	finishing atomic.Bool
+	// refused says a command was turned away while the door was shut, which is what the
+	// drain the reopening schedules is for.
+	refused atomic.Bool
+	// undrained marks this session as having something pending on its stream that was
+	// not read by the loop's own `>`. Nil outside the manager.
+	undrained func()
 
 	// queueMu guards the door to commands rather than the channel itself: the executor
 	// has to be able to say "nothing more comes in" and then empty what is left,
@@ -85,6 +91,10 @@ type Config struct {
 	NewID     IDFunc
 	Now       func() time.Time
 	Logger    zerolog.Logger
+	// Undrained marks this session as having a command pending on its stream that the
+	// loop's own read did not take. Called when a door that turned away commands opens
+	// again, so the drain that keeps the session's turn is scheduled.
+	Undrained func()
 	// QueueDepth bounds how many commands wait for this session. Beyond it a client
 	// is told the session is busy rather than being queued behind a backlog whose
 	// deadlines have all passed by the time it is reached.
@@ -122,6 +132,7 @@ func New(ctx context.Context, cfg *Config) *Session {
 		ledger:    cfg.Ledger,
 		replier:   cfg.Replier,
 		newID:     cfg.NewID,
+		undrained: cfg.Undrained,
 		now:       cfg.Now,
 		log:       cfg.Logger.With().Str("sid", cfg.Lease.SID).Uint64("epoch", cfg.Lease.Epoch).Logger(),
 		commands:  make(chan *transport.Delivery, cfg.QueueDepth),
@@ -172,13 +183,17 @@ const (
 func (s *Session) Offer(delivery *transport.Delivery) Offer {
 	s.queueMu.Lock()
 	defer s.queueMu.Unlock()
-	if s.stopping || s.finishing.Load() {
-		// Retired is stopping that has not happened yet: the heartbeat hands the lease
-		// back on its next tick, and until it does this session is still in the map and
-		// still answers. A connect served in that window dials an account this instance
-		// gives away moments later, and answers the client that it worked -- the socket
-		// is then stopped with nothing published to say so. Left pending for the owner
-		// that comes next, which is what OfferStopped already means.
+	if s.stopping {
+		return OfferStopped
+	}
+	if s.finishing.Load() {
+		// Finishing is stopping that has not happened yet: the engine has said its last
+		// word and the heartbeat hands the lease back once it is out. A connect served in
+		// that window dials an account this instance gives away moments later, and answers
+		// the client that it worked -- the socket is then stopped with nothing published
+		// to say so. Left pending for the owner that comes next, which is what
+		// OfferStopped already means.
+		s.refused.Store(true)
 		return OfferStopped
 	}
 	select {
@@ -265,12 +280,20 @@ func (s *Session) pump(ctx context.Context) {
 			if !emission.Retires {
 				continue
 			}
+			if !s.engine.Finished() {
+				// A connect ran between the engine queueing this and the pump taking it,
+				// and put a socket back up. The mark is about the attempt before that one,
+				// and handing the account over on it would tear down a retry that worked.
+				s.log.Info().Str("type", string(emission.Type)).
+					Msg("a connect answered an outcome the engine had already given up on; keeping the session")
+				s.reopen()
+				continue
+			}
 			if !landed {
 				// Nobody heard it, so nothing is finished with. Handing the lease back on
 				// an event that never reached the stream retires the account with the
-				// client never told why, and a command refused while this was in flight
-				// was left pending and comes back.
-				s.finishing.Store(s.retired.Load())
+				// client never told why.
+				s.reopen()
 				continue
 			}
 			// The lease goes back only now. The event says why the session is finished:
@@ -279,6 +302,23 @@ func (s *Session) pump(ctx context.Context) {
 			// explanation as stale.
 			s.retired.Store(true)
 		}
+	}
+}
+
+// reopen takes the door off a session that turned out not to be finished with.
+//
+// A command refused while it was shut was released rather than given back -- a session on
+// its way out must not schedule a drain, which would claim its stream from under the owner
+// taking it over. Released, it keeps no turn, so the newest command for this session can
+// be read and run ahead of it. That is only true of a door that opens again, which is why
+// the mark is put back here and nowhere else.
+func (s *Session) reopen() {
+	if s.retired.Load() {
+		return
+	}
+	s.finishing.Store(false)
+	if s.refused.Swap(false) && s.undrained != nil {
+		s.undrained()
 	}
 }
 
@@ -469,6 +509,7 @@ func (s *Session) execute(ctx context.Context) {
 				// waiting here dials an account the next tick hands away and answers the
 				// client that it worked. Left pending for whoever takes the account, the
 				// same answer an offer refused now gets.
+				s.refused.Store(true)
 				release(delivery)
 				continue
 			}

@@ -251,6 +251,7 @@ func (m *Manager) Adopt(ctx context.Context, sid string) (*Session, error) {
 		Instance: m.instance, Lease: lease, Leases: m.leases, Engine: engineSession,
 		Publisher: m.publisher, Replier: m.replier, Ledger: m.ledger,
 		NewID: m.newID, Now: m.now, Logger: m.log,
+		Undrained: func() { m.undrained(sid) },
 	})
 
 	m.mu.Lock()
