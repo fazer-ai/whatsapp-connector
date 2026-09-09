@@ -1022,6 +1022,15 @@ func (m *Manager) releaseThis(ctx context.Context, sid string, want *Session) {
 	}
 	defer m.dropHanding(sid)
 
+	// Asked again with the turn in hand, because the sweep found this session a step
+	// earlier and a connect taken off its queue before the door shut can have finished in
+	// between. Stopping it then would close a socket the client has just been told is
+	// open, and hand back the lease it is running under.
+	if !want.Retired() {
+		m.log.Info().Str("sid", sid).
+			Msg("a session finished with came back before it could be handed over; keeping it")
+		return
+	}
 	if !m.forget(sid, want) {
 		return
 	}

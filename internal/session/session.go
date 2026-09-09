@@ -48,13 +48,16 @@ type Session struct {
 	done     chan struct{}
 	stopOnce sync.Once
 
-	// retired is set by the pump once it has published an emission the engine marked as
-	// its last. Read by the instance's heartbeat, which is what hands the lease back, so
-	// it is atomic rather than guarded: the two goroutines never touch anything else of
-	// each other's.
-	retired atomic.Bool
-	// retiredOn is the giving-up the session was retired on, kept so the answer can be
-	// asked of the engine again when it is acted on.
+	// retiredOn is the giving-up this session was retired on, set by the pump once it has
+	// published the emission that named it, and zero while the session is not retired at
+	// all. Read by the instance's heartbeat, which is what hands the lease back, so it is
+	// atomic rather than guarded: the two goroutines never touch anything else of each
+	// other's.
+	//
+	// One word for both facts, because undoing a retirement has to be conditional on the
+	// retirement it looked at. A retry can be given up on again while an undoing is in
+	// flight, and a plain "not retired any more" written over that would leave a session
+	// nothing will hand back and a door nothing will shut.
 	retiredOn atomic.Uint64
 	// finishing is the same news half a step earlier: the pump has the engine's last
 	// emission in hand and has not published it yet. Publishing is a write to Redis and
@@ -255,14 +258,19 @@ func (s *Session) Stop() {
 // account whose socket is back is not one to hand over. Asked at the point the answer is
 // acted on, and the door opens again when the answer has changed.
 func (s *Session) Retired() bool {
-	if !s.retired.Load() {
+	on := s.retiredOn.Load()
+	if on == 0 {
 		return false
 	}
-	if s.engine.Finished() == s.retiredOn.Load() {
+	if s.engine.Finished() == on {
 		return true
 	}
-	s.retired.Store(false)
-	s.reopen()
+	// Only the retirement this call looked at, or a newer one written meanwhile is
+	// undone by an answer about the one before it. Losing the race here costs a tick:
+	// the session reads as retired until the next one asks again.
+	if s.retiredOn.CompareAndSwap(on, 0) {
+		s.reopen()
+	}
 	return false
 }
 
@@ -303,12 +311,16 @@ func (s *Session) pump(ctx context.Context) {
 			if !emission.Retires {
 				continue
 			}
-			if s.engine.Finished() != emission.Attempt {
+			if emission.Attempt == 0 || s.engine.Finished() != emission.Attempt {
 				// The session has moved on from the giving-up this is about: a connect ran
 				// between the engine queueing it and the pump taking it, and either put a
 				// socket back up or ran into a giving-up of its own. Handing the account
 				// over on this one would tear down a retry that worked, or stop the session
 				// with the newer outcome and everything before it still queued.
+				//
+				// A mark carrying no giving-up at all is the same answer for the same
+				// reason: the engine had already been taken back by a connect when the
+				// emission was made, and nothing about an active session is finished.
 				s.log.Info().Str("type", string(emission.Type)).
 					Msg("a connect answered an outcome the engine had already given up on; keeping the session")
 				s.reopen()
@@ -326,7 +338,6 @@ func (s *Session) pump(ctx context.Context) {
 			// account and publish under a newer epoch, which is a client dropping the
 			// explanation as stale.
 			s.retiredOn.Store(emission.Attempt)
-			s.retired.Store(true)
 		}
 	}
 }
@@ -339,7 +350,7 @@ func (s *Session) pump(ctx context.Context) {
 // be read and run ahead of it. That is only true of a door that opens again, which is why
 // the mark is put back here and nowhere else.
 func (s *Session) reopen() {
-	if s.retired.Load() {
+	if s.retiredOn.Load() != 0 {
 		return
 	}
 	s.queueMu.Lock()

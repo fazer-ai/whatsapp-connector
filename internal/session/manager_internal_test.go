@@ -1270,7 +1270,7 @@ func TestAConnectTakenBeforeTheDoorShutUndoesTheRetirement(t *testing.T) {
 	}
 
 	engineSession.EmitLast(protocol.EventSessionConnectFailure, map[string]any{"reason": "unavailable"})
-	waitFor(t, func() bool { return session.retired.Load() }, "the session was never finished with")
+	waitFor(t, func() bool { return session.retiredOn.Load() != 0 }, "the session was never finished with")
 
 	// The connect that was already past the door, landing after the pump had decided.
 	if err := engineSession.Connect(context.Background(), engine.ConnectRequest{Pairing: "resume"}); err != nil {
@@ -1344,5 +1344,123 @@ func TestASweepIsNotHeldUpByAnAdoptionOfAnotherAccount(t *testing.T) {
 	manager.SweepRetired(ctx, manager.HandBackBy())
 	if _, held := leases.Owned(retiring); held {
 		t.Fatal("an adoption of another account kept the sweep from handing a retired session back")
+	}
+}
+
+// A mark can be made in the instant a connect has already taken the session back: the
+// branch that gives up sets it, the connect clears it, and the emission that reports the
+// giving-up is made after both. It names no giving-up at all, and an active session names
+// none either -- so the two agree, and the session that is working is handed over.
+func TestAMarkThatNamesNoGivingUpDoesNotHandTheAccountOver(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+
+	engines := fake.New()
+	leases := cluster.NewLeases(client, "inst-a", cluster.Options{})
+	published := make(chan protocol.EventType, 8)
+	manager := NewManager(&ManagerConfig{
+		Instance: "inst-a", Engine: engines, Leases: leases,
+		Publisher: recordingPublisher{published}, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	t.Cleanup(func() { manager.StopAll(context.Background()) })
+
+	const sid = "9c2b7d1e-0000-4000-8000-0000000000bb"
+	session, err := manager.Adopt(context.Background(), sid)
+	if err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, running := engines.Session(sid)
+	if !running {
+		t.Fatal("the engine has no session for the account that was just adopted")
+	}
+
+	engineSession.EmitLastRaced(protocol.EventSessionConnectFailure, map[string]any{"reason": "unavailable"})
+	if got := <-published; got != protocol.EventSessionConnectFailure {
+		t.Fatalf("the pump published %s, want %s", got, protocol.EventSessionConnectFailure)
+	}
+
+	if session.Retired() {
+		t.Fatal("a mark naming no giving-up handed over a session with nothing wrong with it")
+	}
+	manager.SweepRetired(context.Background(), manager.HandBackBy())
+	if _, held := leases.Owned(sid); !held {
+		t.Fatal("the sweep handed back the lease of an account the engine had not given up on")
+	}
+
+	// And the door the mark shut is open again, or the account is one this instance owns,
+	// never hands back, and refuses to carry anything out for.
+	if offered := session.Offer(&transport.Delivery{
+		Command: protocol.Command{
+			V: protocol.Version, ID: "c1", Type: protocol.CommandMessageSend, SID: sid,
+		},
+		Ack: func(context.Context) error { return nil }, Release: func() {},
+	}); offered != OfferAccepted {
+		t.Fatalf("the session answered %v after a mark that named no giving-up, want %v", offered, OfferAccepted)
+	}
+}
+
+// recordingPublisher says when a publish landed, which is what a test that wants the pump
+// past one event and not the next waits on.
+type recordingPublisher struct{ published chan protocol.EventType }
+
+func (p recordingPublisher) Publish(_ context.Context, event *protocol.Event) error {
+	p.published <- event.Type
+	return nil
+}
+
+// The sweep finds a session a step before it hands it back, and a connect taken off the
+// queue before the door shut can finish in between. Stopping it then closes a socket the
+// client has just been told is open and hands back the lease it is running under, so the
+// question is asked again with the account's turn in hand.
+func TestAHandBackAsksAgainForTheSessionItWasAboutToTake(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+
+	engines := fake.New()
+	leases := cluster.NewLeases(client, "inst-a", cluster.Options{})
+	manager := NewManager(&ManagerConfig{
+		Instance: "inst-a", Engine: engines, Leases: leases,
+		Publisher: quietPublisher{}, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	t.Cleanup(func() { manager.StopAll(context.Background()) })
+
+	const sid = "9c2b7d1e-0000-4000-8000-0000000000bc"
+	ctx := context.Background()
+	session, err := manager.Adopt(ctx, sid)
+	if err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, running := engines.Session(sid)
+	if !running {
+		t.Fatal("the engine has no session for the account that was just adopted")
+	}
+	engineSession.EmitLast(protocol.EventSessionConnectFailure, map[string]any{"reason": "unavailable"})
+	waitFor(t, session.Retired, "the session was never finished with")
+
+	// What the sweep is holding when it comes to hand this one back, and the connect that
+	// was already past the door landing in between.
+	found := map[string]*Session{sid: session}
+	if err := engineSession.Connect(ctx, engine.ConnectRequest{Pairing: "resume"}); err != nil {
+		t.Fatalf("the connect that was already past the door failed: %v", err)
+	}
+	for swept, about := range found {
+		manager.releaseThis(ctx, swept, about)
+	}
+
+	if _, held := leases.Owned(sid); !held {
+		t.Fatal("the sweep handed back the lease of a session that came back before it got there")
+	}
+	if !engineSession.Connected() {
+		t.Fatal("the sweep closed a socket the client had just been told was open")
 	}
 }

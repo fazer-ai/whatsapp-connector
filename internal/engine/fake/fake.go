@@ -337,6 +337,26 @@ func (s *Session) EmitLast(eventType protocol.EventType, payload any) {
 	}
 }
 
+// EmitLastRaced is EmitLast made in the instant a connect had already taken the session
+// back: the mark is on the emission and the giving-up it named is gone, which is what
+// whatsmeow produces when a connect clears the terminal state between the branch that
+// marks it and the emission that reports it.
+func (s *Session) EmitLastRaced(eventType protocol.EventType, payload any) {
+	body, err := marshal(payload)
+	if err != nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return
+	}
+	select {
+	case s.events <- engine.Emission{Type: eventType, Payload: body, Retires: true}:
+	default:
+	}
+}
+
 // EmitLastDurable is EmitLast with the callback EmitDurable takes, which is how a test
 // waits for the publish itself rather than for something after it.
 func (s *Session) EmitLastDurable(eventType protocol.EventType, payload any, settle func(error)) {
