@@ -406,11 +406,14 @@ func TestReplyPushesOneElementWithATTL(t *testing.T) {
 	ctx := context.Background()
 	reply := protocol.Reply{V: protocol.Version, ID: "c1", OK: true, Result: json.RawMessage(`{"state":"open"}`)}
 
-	if err := f.streams(t, "inst-a").Reply(ctx, "c1", reply); err != nil {
+	// The key as a client spells it in `reply_to`, which is where it is blocked: the
+	// contract's own command frames carry it fully spelled, and this is what stops the
+	// prefix from being applied a second time on the way out.
+	key := f.client.Keys().Reply("c1")
+	if err := f.streams(t, "inst-a").Reply(ctx, key, reply); err != nil {
 		t.Fatalf("Reply: %v", err)
 	}
 
-	key := f.client.Keys().Reply("c1")
 	// Read the expiry before taking the element: popping the only element deletes the
 	// key, and a deleted key reports no TTL.
 	if ttl := f.server.TTL(key); ttl <= 0 {

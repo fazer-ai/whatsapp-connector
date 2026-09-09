@@ -56,7 +56,9 @@ func (c *client) send(ctx context.Context, stream string, command *protocol.Comm
 	}
 }
 
-// await blocks on the reply list the same way the Ruby side does.
+// await blocks on the reply list the same way a client does: on the key the command's
+// own `reply_to` named, fully spelled, which is how the contract's command frames carry
+// it.
 func (c *client) await(ctx context.Context, commandID string, timeout time.Duration) protocol.Reply {
 	c.t.Helper()
 	answer, err := c.rdb.BLPop(ctx, timeout, c.key.Reply(commandID)).Result()
@@ -172,7 +174,7 @@ func TestFleetAdoptsASessionAndAnswersACommand(t *testing.T) {
 
 	c.send(ctx, c.key.Commands(sid), &protocol.Command{
 		V: protocol.Version, ID: "status-1", Type: protocol.CommandSessionStatus, SID: sid,
-		TS: time.Now().UnixMilli(), ReplyTo: "status-1", Payload: json.RawMessage(`{}`),
+		TS: time.Now().UnixMilli(), ReplyTo: c.key.Reply("status-1"), Payload: json.RawMessage(`{}`),
 	})
 
 	reply := c.await(ctx, "status-1", 10*time.Second)
@@ -220,7 +222,7 @@ func TestCommandForAnUnownedSessionIsNotAnswered(t *testing.T) {
 	const sid = "2f1c6f0e-0000-4000-8000-000000000003"
 	c.send(ctx, c.key.Commands(sid), &protocol.Command{
 		V: protocol.Version, ID: "orphan-1", Type: protocol.CommandSessionStatus, SID: sid,
-		TS: time.Now().UnixMilli(), ReplyTo: "orphan-1", Payload: json.RawMessage(`{}`),
+		TS: time.Now().UnixMilli(), ReplyTo: c.key.Reply("orphan-1"), Payload: json.RawMessage(`{}`),
 	})
 
 	// BLPop returning nothing within the window is the assertion: the command was left
@@ -245,7 +247,7 @@ func TestPublishedEventsCarryTheOwnersEpochInOrder(t *testing.T) {
 
 	c.send(ctx, c.key.Commands(sid), &protocol.Command{
 		V: protocol.Version, ID: "logout-1", Type: protocol.CommandSessionLogout, SID: sid,
-		TS: time.Now().UnixMilli(), ReplyTo: "logout-1", Payload: json.RawMessage(`{}`),
+		TS: time.Now().UnixMilli(), ReplyTo: c.key.Reply("logout-1"), Payload: json.RawMessage(`{}`),
 	})
 	c.await(ctx, "logout-1", 10*time.Second)
 
@@ -440,7 +442,7 @@ func TestASessionIsDrainedBeforeAnythingNewerIsReadForIt(t *testing.T) {
 	// And then the operator reconnected, which is the command that must win.
 	c.send(ctx, commands, &protocol.Command{
 		V: protocol.Version, ID: "connect-new", Type: protocol.CommandSessionConnect, SID: sid,
-		TS: time.Now().UnixMilli(), ReplyTo: "connect-new", Payload: json.RawMessage(`{"pairing":"resume"}`),
+		TS: time.Now().UnixMilli(), ReplyTo: c.key.Reply("connect-new"), Payload: json.RawMessage(`{"pairing":"resume"}`),
 	})
 	c.send(ctx, c.key.Control(), &protocol.Command{
 		V: protocol.Version, ID: "wake-order", Type: protocol.CommandSessionWake, SID: sid,
@@ -463,7 +465,7 @@ func TestASessionIsDrainedBeforeAnythingNewerIsReadForIt(t *testing.T) {
 		c.send(ctx, commands, &protocol.Command{
 			V: protocol.Version, ID: "status-" + strconv.FormatInt(time.Now().UnixNano(), 10),
 			Type: protocol.CommandSessionStatus, SID: sid, TS: time.Now().UnixMilli(),
-			ReplyTo: "status-check", Payload: json.RawMessage(`{}`),
+			ReplyTo: c.key.Reply("status-check"), Payload: json.RawMessage(`{}`),
 		})
 		reply := c.await(ctx, "status-check", 5*time.Second)
 		if !reply.OK {
@@ -533,7 +535,7 @@ func TestASessionWithALongBacklogIsDrainedBeforeItIsRead(t *testing.T) {
 	// The operator's reconnect, which arrived after every one of them.
 	c.send(ctx, commands, &protocol.Command{
 		V: protocol.Version, ID: "connect-after", Type: protocol.CommandSessionConnect, SID: sid,
-		TS: time.Now().UnixMilli(), ReplyTo: "connect-after", Payload: json.RawMessage(`{"pairing":"resume"}`),
+		TS: time.Now().UnixMilli(), ReplyTo: c.key.Reply("connect-after"), Payload: json.RawMessage(`{"pairing":"resume"}`),
 	})
 	c.send(ctx, c.key.Control(), &protocol.Command{
 		V: protocol.Version, ID: "wake-backlog", Type: protocol.CommandSessionWake, SID: sid,
@@ -556,7 +558,7 @@ func TestASessionWithALongBacklogIsDrainedBeforeItIsRead(t *testing.T) {
 		c.send(ctx, commands, &protocol.Command{
 			V: protocol.Version, ID: "status-" + strconv.FormatInt(time.Now().UnixNano(), 10),
 			Type: protocol.CommandSessionStatus, SID: sid, TS: time.Now().UnixMilli(),
-			ReplyTo: "backlog-check", Payload: json.RawMessage(`{}`),
+			ReplyTo: c.key.Reply("backlog-check"), Payload: json.RawMessage(`{}`),
 		})
 		reply := c.await(ctx, "backlog-check", 5*time.Second)
 		if !reply.OK {
