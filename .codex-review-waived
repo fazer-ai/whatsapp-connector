@@ -528,3 +528,23 @@ internal/cluster/lease.go: Stage the hand-back marker for mixed-version fleets  
 # cannot both be true, and this side is the one where the residue is bounded by the margin
 # rather than by how long a Redis outage lasts.
 internal/session/manager.go: Mark each expiring hand-back before another stop can block  # PR#149
+# PR#149: this one needs both groups to exist at once, and the two things it needs pull
+# against each other. A lease only reaches the group with no room by going about a whole
+# TTL without a renewal, which means the instance was not reaching Redis or was not
+# running at all; a lease is only in the other group if it was renewed or acquired
+# recently, which means it was. For the harm named here the releases in front also have to
+# block, so Redis has to be away again by then. Measured on a running fleet, an instance's
+# leases sit within one tick of each other (490 to 838 ms of spread across forty PTTL
+# samples, twelve sessions, five second heartbeat, thirty second lease, and 584 ms still
+# after six seconds of Redis being away), because they are renewed in one pipelined batch
+# under one reading of the clock; a session adopted between ticks is stamped when it is
+# acquired, so it is newer than the rest and never older, and one whose renewal fails on
+# its own is stopped by the sweep rather than kept.
+#
+# What is left is a sequence -- frozen for a TTL, resumed, an account adopted, Redis away
+# again, SIGTERM -- against a fix that would put the releases behind every socket, which
+# is the finding four rounds ago, or bound them so tightly they stop landing, which is
+# what the mark exists to avoid. Marking before the stops and stopping before the marks
+# cannot both be true; this is the ninth round on that one trade, and the residue on this
+# side is one margin of lease rather than the length of an outage.
+internal/session/manager.go: Stop fresh sockets before blocking on stale releases  # PR#149
