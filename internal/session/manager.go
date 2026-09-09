@@ -32,7 +32,10 @@ type Manager struct {
 	ledger    Ledger
 	newID     IDFunc
 	now       func() time.Time
-	log       zerolog.Logger
+	// retireRetry is how long a session waits before saying again that it is finished
+	// with. A field so the tests that drive that path do not wait on the real one.
+	retireRetry time.Duration
+	log         zerolog.Logger
 
 	mu       sync.RWMutex
 	sessions map[string]*Session
@@ -119,6 +122,9 @@ type ManagerConfig struct {
 	// AnswerDepth bounds how many commands wait on the manager's own goroutine. The
 	// zero value asks for DefaultAnswerDepth.
 	AnswerDepth int
+	// RetireRetry is how long a session waits before saying again that it is finished
+	// with, when the first attempt did not reach the stream. Zero asks for the default.
+	RetireRetry time.Duration
 }
 
 // NewManager returns a manager owning no sessions yet.
@@ -138,6 +144,7 @@ func NewManager(cfg *ManagerConfig) *Manager {
 		ledger:      cfg.Ledger,
 		newID:       cfg.NewID,
 		now:         cfg.Now,
+		retireRetry: cfg.RetireRetry,
 		log:         cfg.Logger,
 		sessions:    make(map[string]*Session),
 		orphans:     make(map[string]struct{}),
@@ -261,7 +268,7 @@ func (m *Manager) Adopt(ctx context.Context, sid string) (*Session, error) {
 		Instance: m.instance, Lease: lease, Leases: m.leases, Engine: engineSession,
 		Publisher: m.publisher, Replier: m.replier, Ledger: m.ledger,
 		NewID: m.newID, Now: m.now, Logger: m.log,
-		Undrained: func() { m.undrained(sid) },
+		Undrained: func() { m.undrained(sid) }, RetireRetry: m.retireRetry,
 	})
 
 	m.mu.Lock()
@@ -417,14 +424,23 @@ func (m *Manager) releaseOrphans(ctx context.Context) {
 			// tick starts where this one stopped.
 			return
 		}
+		if !m.tryHoldHanding(sid) {
+			// An adoption or a hand-back of this account is under way, and the mark is
+			// what a hand-back sets before its round trip: retrying alongside it is a
+			// second release, which lands after the first one and after whatever lease
+			// was won in between and deletes that one. Tried again on the next tick.
+			continue
+		}
 		m.mu.RLock()
 		_, running := m.sessions[sid]
 		m.mu.RUnlock()
 		if running {
 			m.forgetOrphan(sid)
+			m.dropHanding(sid)
 			continue
 		}
 		m.abandon(ctx, sid)
+		m.dropHanding(sid)
 	}
 }
 
@@ -870,7 +886,17 @@ func (m *Manager) RenewAll(ctx context.Context, by time.Time) {
 	window, cancel := context.WithDeadline(ctx, by)
 	defer cancel()
 	for _, sid := range released {
+		if !m.tryHoldHanding(sid) {
+			// An adoption of this account is under way. Handing back alongside it deletes
+			// the lease it wins; the mark `abandon` leaves is what brings this back on a
+			// later tick.
+			m.orphanMu.Lock()
+			m.orphans[sid] = struct{}{}
+			m.orphanMu.Unlock()
+			continue
+		}
 		m.abandon(window, sid)
+		m.dropHanding(sid)
 	}
 	m.releaseOrphans(window)
 }
@@ -1022,13 +1048,14 @@ func (m *Manager) releaseThis(ctx context.Context, sid string, want *Session) {
 	}
 	defer m.dropHanding(sid)
 
-	// Asked again with the turn in hand, because the sweep found this session a step
-	// earlier and a connect taken off its queue before the door shut can have finished in
-	// between. Stopping it then would close a socket the client has just been told is
+	// Asked again with the turn in hand, and the session locked shut in the same step,
+	// because the sweep found it a step earlier: a command taken off its queue before the
+	// door shut is one no door can call back, and a connect among them can put a socket up
+	// in between. Stopping it then would close a socket the client has just been told is
 	// open, and hand back the lease it is running under.
-	if !want.Retired() {
+	if !want.claim() {
 		m.log.Info().Str("sid", sid).
-			Msg("a session finished with came back before it could be handed over; keeping it")
+			Msg("a session finished with was not free to be handed over; leaving it for the next tick")
 		return
 	}
 	if !m.forget(sid, want) {

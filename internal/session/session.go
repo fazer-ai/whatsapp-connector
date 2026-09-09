@@ -74,10 +74,23 @@ type Session struct {
 	// reopening the door are each [read one, write the other], and interleaved they lose
 	// the mark -- the door opens between the read and the write, and the command that was
 	// turned away is left pending with no drain to take its stream back.
-	finishing bool
+	//
+	// It holds the giving-up the door was shut for rather than a flag, and zero when it
+	// is open. Only an answer about that same giving-up opens it again: the engine can be
+	// given up on afresh while an answer about the one before is on its way, and a door
+	// opened by that older answer is a session marked retired and taking commands.
+	shutFor uint64
 	// refused says a command was turned away while the door was shut, which is what the
 	// drain the reopening schedules is for.
 	refused bool
+	// running counts the commands the executor has taken off the queue and not answered
+	// yet. A hand-back does not take a session with one in flight: its answer is not in,
+	// and a connect among them may be about to tell the client that it worked.
+	running int
+	// owed is the emission finishing this session that did not reach the stream, kept for
+	// another try. The pump's own, touched by nothing else.
+	owed    *engine.Emission
+	retryIn time.Duration
 	// undrained marks this session as having something pending on its stream that was
 	// not read by the loop's own `>`. Nil outside the manager.
 	undrained func()
@@ -101,6 +114,9 @@ type Config struct {
 	NewID     IDFunc
 	Now       func() time.Time
 	Logger    zerolog.Logger
+	// RetireRetry is how long to wait before saying again that this session is finished
+	// with, when the first attempt did not reach the stream. Zero asks for the default.
+	RetireRetry time.Duration
 	// Undrained marks this session as having a command pending on its stream that the
 	// loop's own read did not take. Called when a door that turned away commands opens
 	// again, so the drain that keeps the session's turn is scheduled.
@@ -131,6 +147,9 @@ func New(ctx context.Context, cfg *Config) *Session {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
+	if cfg.RetireRetry <= 0 {
+		cfg.RetireRetry = retireRetry
+	}
 	runCtx, cancel := context.WithCancel(ctx)
 	s := &Session{
 		sid:       cfg.Lease.SID,
@@ -143,6 +162,7 @@ func New(ctx context.Context, cfg *Config) *Session {
 		replier:   cfg.Replier,
 		newID:     cfg.NewID,
 		undrained: cfg.Undrained,
+		retryIn:   cfg.RetireRetry,
 		now:       cfg.Now,
 		log:       cfg.Logger.With().Str("sid", cfg.Lease.SID).Uint64("epoch", cfg.Lease.Epoch).Logger(),
 		commands:  make(chan *transport.Delivery, cfg.QueueDepth),
@@ -196,7 +216,7 @@ func (s *Session) Offer(delivery *transport.Delivery) Offer {
 	if s.stopping {
 		return OfferStopped
 	}
-	if s.finishing {
+	if s.shutFor != 0 {
 		// Finishing is stopping that has not happened yet: the engine has said its last
 		// word and the heartbeat hands the lease back once it is out. A connect served in
 		// that window dials an account this instance gives away moments later, and answers
@@ -269,7 +289,7 @@ func (s *Session) Retired() bool {
 	// undone by an answer about the one before it. Losing the race here costs a tick:
 	// the session reads as retired until the next one asks again.
 	if s.retiredOn.CompareAndSwap(on, 0) {
-		s.reopen()
+		s.reopen(on)
 	}
 	return false
 }
@@ -283,6 +303,10 @@ func (s *Session) Done() <-chan struct{} { return s.done }
 // what makes the client's ordering hold: one shard, one consumer, one writer.
 func (s *Session) pump(ctx context.Context) {
 	events := s.engine.Events()
+	// Stopped until something is owed, which on nearly every session is never.
+	again := time.NewTimer(s.retryIn)
+	again.Stop()
+	defer again.Stop()
 	for {
 		if ctx.Err() != nil {
 			// Checked ahead of the select rather than inside it, because a select whose
@@ -296,50 +320,83 @@ func (s *Session) pump(ctx context.Context) {
 		case <-ctx.Done():
 			s.abandonPending(events)
 			return
+		case <-again.C:
+			owed := s.owed
+			s.owed = nil
+			if owed != nil {
+				s.carry(ctx, owed, again)
+			}
 		case emission, ok := <-events:
 			if !ok {
 				return
 			}
-			// Before the publish, because publishing is a write to Redis and the
-			// executor runs alongside this: a connect waiting in the queue would
-			// otherwise be carried out in that gap, on a session the engine has already
-			// said its last word about.
-			if emission.Retires {
-				s.shut()
-			}
-			landed := s.publish(ctx, &emission)
-			if !emission.Retires {
-				continue
-			}
-			if emission.Attempt == 0 || s.engine.Finished() != emission.Attempt {
-				// The session has moved on from the giving-up this is about: a connect ran
-				// between the engine queueing it and the pump taking it, and either put a
-				// socket back up or ran into a giving-up of its own. Handing the account
-				// over on this one would tear down a retry that worked, or stop the session
-				// with the newer outcome and everything before it still queued.
-				//
-				// A mark carrying no giving-up at all is the same answer for the same
-				// reason: the engine had already been taken back by a connect when the
-				// emission was made, and nothing about an active session is finished.
-				s.log.Info().Str("type", string(emission.Type)).
-					Msg("a connect answered an outcome the engine had already given up on; keeping the session")
-				s.reopen()
-				continue
-			}
-			if !landed {
-				// Nobody heard it, so nothing is finished with. Handing the lease back on
-				// an event that never reached the stream retires the account with the
-				// client never told why.
-				s.reopen()
-				continue
-			}
-			// The lease goes back only now. The event says why the session is finished:
-			// handing it back before the event is out lets another instance adopt the
-			// account and publish under a newer epoch, which is a client dropping the
-			// explanation as stale.
-			s.retiredOn.Store(emission.Attempt)
+			s.carry(ctx, &emission, again)
 		}
 	}
+}
+
+// retireRetry is how long the pump waits before saying again that a session is finished
+// with, when the first attempt did not reach the stream.
+//
+// Nothing is waiting on it: the client hears when Redis comes back, and the account is
+// handed over on the heartbeat after that. Short enough that an outage of a few seconds
+// costs an account a few seconds of belonging to an instance that will not use it, long
+// enough that a Redis that is away is not written to on every tick of a timer.
+const retireRetry = 2 * time.Second
+
+// carry publishes one emission and decides what it leaves behind.
+func (s *Session) carry(ctx context.Context, emission *engine.Emission, again *time.Timer) {
+	// Before the publish, because publishing is a write to Redis and the executor runs
+	// alongside this: a connect waiting in the queue would otherwise be carried out in
+	// that gap, on a session the engine has already said its last word about.
+	if emission.Retires && emission.Attempt != 0 {
+		s.shut(emission.Attempt)
+	}
+	landed := s.publish(ctx, emission)
+	if !emission.Retires {
+		return
+	}
+	if emission.Attempt == 0 || s.engine.Finished() != emission.Attempt {
+		// The session has moved on from the giving-up this is about: a connect ran between
+		// the engine queueing it and the pump taking it, and either put a socket back up or
+		// ran into a giving-up of its own. Handing the account over on this one would tear
+		// down a retry that worked, or stop the session with the newer outcome and
+		// everything before it still queued.
+		//
+		// A mark carrying no giving-up at all is the same answer for the same reason: the
+		// engine had already been taken back by a connect when the emission was made, and
+		// nothing about an active session is finished.
+		s.log.Info().Str("type", string(emission.Type)).
+			Msg("a connect answered an outcome the engine had already given up on; keeping the session")
+		s.reopen(emission.Attempt)
+		return
+	}
+	if !landed {
+		// Nobody heard it, and the engine has nothing more to say: whatsmeow publishes
+		// these from the branch that keeps the socket down, so this emission is the only
+		// trigger there will ever be. Dropped, the account stays owned by an instance that
+		// will not use it and the client is never told why, which is the whole of what
+		// this feature exists to stop.
+		//
+		// Kept and tried again instead, with the door still shut: nothing is carried out
+		// for a session the engine has finished with, and a Redis that is away is a Redis
+		// no command reaches this session through either.
+		//
+		// Without the callback, which has already been answered with the failure. Whoever
+		// was waiting on this emission was waiting for one attempt, and telling them twice
+		// is worse than not telling them again.
+		kept := *emission
+		kept.Settle = nil
+		s.owed = &kept
+		again.Reset(s.retryIn)
+		s.log.Warn().Str("type", string(emission.Type)).
+			Msg("the event finishing this session did not reach the stream; will say it again")
+		return
+	}
+	// The lease goes back only now. The event says why the session is finished: handing it
+	// back before the event is out lets another instance adopt the account and publish
+	// under a newer epoch, which is a client dropping the explanation as stale.
+	s.retiredOn.Store(emission.Attempt)
 }
 
 // reopen takes the door off a session that turned out not to be finished with.
@@ -349,12 +406,14 @@ func (s *Session) pump(ctx context.Context) {
 // taking it over. Released, it keeps no turn, so the newest command for this session can
 // be read and run ahead of it. That is only true of a door that opens again, which is why
 // the mark is put back here and nowhere else.
-func (s *Session) reopen() {
-	if s.retiredOn.Load() != 0 {
+func (s *Session) reopen(undoing uint64) {
+	s.queueMu.Lock()
+	if s.shutFor != undoing {
+		// Shut again since, for a giving-up this answer is not about.
+		s.queueMu.Unlock()
 		return
 	}
-	s.queueMu.Lock()
-	s.finishing = false
+	s.shutFor = 0
 	refused := s.refused
 	s.refused = false
 	s.queueMu.Unlock()
@@ -364,11 +423,11 @@ func (s *Session) reopen() {
 	}
 }
 
-// shut closes the door: the engine has said its last word and this session is not to
-// carry out anything else while it goes out.
-func (s *Session) shut() {
+// shut closes the door for one giving-up: the engine has said its last word and this
+// session is not to carry out anything else while it goes out.
+func (s *Session) shut(attempt uint64) {
 	s.queueMu.Lock()
-	s.finishing = true
+	s.shutFor = attempt
 	s.queueMu.Unlock()
 }
 
@@ -377,10 +436,47 @@ func (s *Session) shut() {
 func (s *Session) finished() bool {
 	s.queueMu.Lock()
 	defer s.queueMu.Unlock()
-	if !s.finishing {
+	if s.shutFor == 0 {
 		return false
 	}
 	s.refused = true
+	return true
+}
+
+// takingUp and done bracket a command the executor is carrying out, which is what lets
+// `claim` tell "nothing is running" from "a connect is dialling right now".
+func (s *Session) takingUp() {
+	s.queueMu.Lock()
+	s.running++
+	s.queueMu.Unlock()
+}
+
+func (s *Session) doneWith() {
+	s.queueMu.Lock()
+	s.running--
+	s.queueMu.Unlock()
+}
+
+// claim takes a retired session for the hand-back that is about to stop it, and says
+// whether it may.
+//
+// The question the sweep asked a step earlier is asked once more here, with the door
+// locked shut in the same step: a command taken off the queue before the door shut is one
+// no door can call back, and a connect among them can put a socket up in between.
+// Refused while one is still running, because its answer is not in yet and the client may
+// be about to be told that it worked -- the account is swept on the next tick instead.
+func (s *Session) claim() bool {
+	s.queueMu.Lock()
+	defer s.queueMu.Unlock()
+
+	if s.stopping || s.running > 0 {
+		return false
+	}
+	on := s.retiredOn.Load()
+	if on == 0 || s.engine.Finished() != on {
+		return false
+	}
+	s.stopping = true
 	return true
 }
 
@@ -566,6 +662,7 @@ func (s *Session) execute(ctx context.Context) {
 			return
 		case delivery := <-s.commands:
 			if s.finished() {
+				// Left pending for whoever takes the account.
 				// Queued before the engine finished with the session, which `Offer` can
 				// no longer refuse because it was already taken. Carried out, a connect
 				// waiting here dials an account the next tick hands away and answers the
@@ -574,7 +671,9 @@ func (s *Session) execute(ctx context.Context) {
 				release(delivery)
 				continue
 			}
+			s.takingUp()
 			s.run(ctx, delivery)
+			s.doneWith()
 		}
 	}
 }

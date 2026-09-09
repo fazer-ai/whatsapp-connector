@@ -1119,7 +1119,6 @@ func TestADoorThatOpensAgainSchedulesADrainForWhatItTurnedAway(t *testing.T) {
 		holds:   protocol.EventSessionConnectFailure,
 		entered: make(chan protocol.EventType, 8),
 		let:     make(chan struct{}),
-		fails:   errors.New("redis is away"),
 	}
 	manager := NewManager(&ManagerConfig{
 		Instance: "inst-a", Engine: engines,
@@ -1143,6 +1142,7 @@ func TestADoorThatOpensAgainSchedulesADrainForWhatItTurnedAway(t *testing.T) {
 	// The mark adoption leaves is not what this is about.
 	manager.TakeNewlyAdopted()
 
+	// The door shuts when the pump takes the last word, and the pump is stopped there.
 	engineSession.EmitLast(protocol.EventSessionConnectFailure, map[string]any{"reason": "unavailable"})
 	<-publisher.entered
 
@@ -1158,8 +1158,13 @@ func TestADoorThatOpensAgainSchedulesADrainForWhatItTurnedAway(t *testing.T) {
 		t.Fatal("a connect was taken while the session's last word was going out")
 	}
 
-	// The word never lands, so the session is not finished with after all.
+	// And the session turns out not to be finished with after all: a connect that was
+	// already past the door put the socket back up while the word was going out.
+	if err := engineSession.Connect(context.Background(), engine.ConnectRequest{Pairing: "resume"}); err != nil {
+		t.Fatalf("the connect that was already past the door failed: %v", err)
+	}
 	publisher.release()
+
 	// Taken rather than read, so a mark that arrives late is still seen: what is asserted
 	// is that the drain is scheduled at all, not which poll finds it.
 	waitFor(t, func() bool { return slices.Contains(manager.TakeNewlyAdopted(), sid) },
@@ -1462,5 +1467,231 @@ func TestAHandBackAsksAgainForTheSessionItWasAboutToTake(t *testing.T) {
 	}
 	if !engineSession.Connected() {
 		t.Fatal("the sweep closed a socket the client had just been told was open")
+	}
+}
+
+// whatsmeow publishes a terminal outcome from the branch that keeps the socket down, so
+// the emission that carries it is the only trigger there will ever be: nothing reconnects
+// and nothing says it again. Dropped on a Redis that was away, the account stays owned by
+// an instance that will not use it and the client is never told why, which is the whole
+// of what this feature exists to stop.
+func TestTheEventFinishingASessionIsSaidAgainWhenItDoesNotLand(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+
+	engines := fake.New()
+	publisher := &flakyPublisher{fails: 1}
+	manager := NewManager(&ManagerConfig{
+		Instance: "inst-a", Engine: engines,
+		Leases:    cluster.NewLeases(client, "inst-a", cluster.Options{}),
+		Publisher: publisher, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+		RetireRetry: 20 * time.Millisecond,
+	})
+	t.Cleanup(func() { manager.StopAll(context.Background()) })
+
+	const sid = "9c2b7d1e-0000-4000-8000-0000000000bd"
+	session, err := manager.Adopt(context.Background(), sid)
+	if err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, running := engines.Session(sid)
+	if !running {
+		t.Fatal("the engine has no session for the account that was just adopted")
+	}
+
+	engineSession.EmitLast(protocol.EventSessionConnectFailure, map[string]any{"reason": "unavailable"})
+	waitFor(t, session.Retired, "the event finishing the session was never said again, so the account is held by an instance with nothing left to try")
+	if attempts := publisher.attempts(); attempts < 2 {
+		t.Fatalf("the pump published %d times, want the failed one and at least one more", attempts)
+	}
+}
+
+// flakyPublisher fails the first few writes, which is a Redis that is away and comes back.
+type flakyPublisher struct {
+	fails int
+
+	mu   sync.Mutex
+	seen int
+}
+
+func (p *flakyPublisher) Publish(context.Context, *protocol.Event) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.seen++
+	if p.seen <= p.fails {
+		return errors.New("redis is away")
+	}
+	return nil
+}
+
+func (p *flakyPublisher) attempts() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.seen
+}
+
+// A connect taken off the queue before the door shut is one no door can call back, and it
+// can be dialling while the sweep comes round. Its answer is not in: the client may be
+// about to be told that it worked, so the account is left for the next tick rather than
+// stopped from under it.
+func TestAHandBackWaitsForACommandThatIsStillRunning(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+
+	engines := fake.New()
+	leases := cluster.NewLeases(client, "inst-a", cluster.Options{})
+	manager := NewManager(&ManagerConfig{
+		Instance: "inst-a", Engine: engines, Leases: leases,
+		Publisher: quietPublisher{}, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	t.Cleanup(func() { manager.StopAll(context.Background()) })
+
+	const sid = "9c2b7d1e-0000-4000-8000-0000000000be"
+	ctx := context.Background()
+	session, err := manager.Adopt(ctx, sid)
+	if err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, running := engines.Session(sid)
+	if !running {
+		t.Fatal("the engine has no session for the account that was just adopted")
+	}
+
+	// One command in flight, taken off the queue while the door was still open.
+	release := engineSession.Hold()
+	defer release()
+	if offered := session.Offer(&transport.Delivery{
+		Command: protocol.Command{
+			V: protocol.Version, ID: "c1", Type: protocol.CommandMessageSend, SID: sid,
+		},
+		Ack: func(context.Context) error { return nil }, Release: func() {},
+	}); offered != OfferAccepted {
+		t.Fatalf("the session refused a command with the door open: %v", offered)
+	}
+	waitFor(t, func() bool { return len(engineSession.Commands()) == 1 }, "the command never reached the engine")
+
+	engineSession.EmitLast(protocol.EventSessionConnectFailure, map[string]any{"reason": "unavailable"})
+	waitFor(t, session.Retired, "the session was never finished with")
+
+	manager.SweepRetired(ctx, manager.HandBackBy())
+	if _, held := leases.Owned(sid); !held {
+		t.Fatal("the sweep took a session with a command still running, whose answer the client is waiting for")
+	}
+
+	// And once the answer is in, the account goes back.
+	release()
+	waitFor(t, func() bool {
+		manager.SweepRetired(ctx, manager.HandBackBy())
+		_, held := leases.Owned(sid)
+		return !held
+	}, "the account was never handed back once the command it was waiting on answered")
+}
+
+// The mark a hand-back leaves before its round trip is what keeps a wake from being
+// acknowledged as somebody else's, and it is also what brings a release that failed back
+// on a later tick. The two readings are the same map, so a retry can go out alongside a
+// release that is still in flight: it lands after that one and after whatever lease was
+// won in between, and deletes the lease of a session this instance is running.
+func TestAnOrphanIsNotRetriedWhileTheAccountIsBeingWorkedOn(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	hop := stallable(t, server.Addr())
+	rdb := redis.NewClient(&redis.Options{Addr: hop.addr(), ContextTimeoutEnabled: true})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+
+	engines := fake.New()
+	manager := NewManager(&ManagerConfig{
+		Instance: "inst-a", Engine: engines,
+		Leases:    cluster.NewLeases(client, "inst-a", cluster.Options{}),
+		Publisher: quietPublisher{}, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	t.Cleanup(func() {
+		quick, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		defer cancel()
+		manager.StopAll(quick)
+	})
+
+	const sid = "9c2b7d1e-0000-4000-8000-0000000000bf"
+	ctx := context.Background()
+	if _, err := manager.Adopt(ctx, sid); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+
+	// A hand-back that did not reach Redis, which is what leaves the mark.
+	hop.stall()
+	handing, cancelHanding := context.WithTimeout(ctx, 300*time.Millisecond)
+	manager.Release(handing, sid)
+	cancelHanding()
+	hop.resume()
+	if !manager.handingBack(sid) {
+		t.Fatal("a release that did not reach Redis left no mark, so nothing would try it again")
+	}
+
+	// An adoption of the same account under way, which is the release that must not have
+	// a second one sent alongside it.
+	manager.holdHanding(sid)
+	defer manager.dropHanding(sid)
+
+	manager.releaseOrphans(ctx)
+	if !manager.handingBack(sid) {
+		t.Fatal("an orphan was retried alongside work on the same account, and that release deletes whatever lease it wins")
+	}
+}
+
+// The door holds the giving-up it was shut for, because a session can be given up on
+// afresh while an answer about the one before is on its way. Opened by that older answer,
+// it is a session marked retired and taking commands until the next sweep gets to it.
+func TestADoorIsOnlyOpenedByAnAnswerAboutWhatShutIt(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+
+	engines := fake.New()
+	manager := NewManager(&ManagerConfig{
+		Instance: "inst-a", Engine: engines,
+		Leases:    cluster.NewLeases(client, "inst-a", cluster.Options{}),
+		Publisher: quietPublisher{}, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	t.Cleanup(func() { manager.StopAll(context.Background()) })
+
+	const sid = "9c2b7d1e-0000-4000-8000-0000000000c0"
+	session, err := manager.Adopt(context.Background(), sid)
+	if err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+
+	// Written against the door rather than through the pump, and that is the point of it
+	// being here: the two shuttings are a retry given up on again while the answer about
+	// the first is still on its way, which no ordering the pump can be driven through
+	// reproduces on purpose.
+	session.shut(1)
+	session.shut(2)
+	session.reopen(1)
+
+	if offered := session.Offer(&transport.Delivery{
+		Command: protocol.Command{
+			V: protocol.Version, ID: "c1", Type: protocol.CommandSessionConnect, SID: sid,
+		},
+		Ack: func(context.Context) error { return nil }, Release: func() {},
+	}); offered != OfferStopped {
+		t.Fatalf("the session answered %v after an answer about a giving-up it had moved on from, want %v",
+			offered, OfferStopped)
 	}
 }
