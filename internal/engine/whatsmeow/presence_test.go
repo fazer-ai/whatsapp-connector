@@ -250,7 +250,7 @@ func TestAGroupsTypingIsNotPublishedToADirectOnlyClient(t *testing.T) {
 	}
 }
 
-func presencePublishedBy(t *testing.T, session *Session, want protocol.EventType, handle func() bool) engine.Emission {
+func presencePublishedBy(t *testing.T, session *Session, want protocol.EventType, handle func() bool) *engine.Emission {
 	t.Helper()
 
 	acknowledged := make(chan bool, 1)
@@ -367,7 +367,7 @@ func TestAStopReplacesTheTypingItStops(t *testing.T) {
 	if len(waiting) != 1 {
 		t.Fatalf("%d presences are waiting for one chat, and only its last state should be", len(waiting))
 	}
-	if state := stateOf(t, waiting[0]); state != "paused" {
+	if state := stateOf(t, &waiting[0]); state != "paused" {
 		t.Errorf("what is waiting is a %s, and the chat's last state was the stop", state)
 	}
 	if waiting[0].Expires != nil {
@@ -480,7 +480,7 @@ func onBoard(session *Session) []engine.Emission {
 	return waiting
 }
 
-func stateOf(t *testing.T, emission engine.Emission) string {
+func stateOf(t *testing.T, emission *engine.Emission) string {
 	t.Helper()
 
 	var body struct {
@@ -563,7 +563,7 @@ func TestAnAvailabilityIsAFactAndTheLastOneWins(t *testing.T) {
 	if waiting[0].Expires != nil {
 		t.Error("an availability was posted as something that expires")
 	}
-	if state := stateOf(t, waiting[0]); state != "available" {
+	if state := stateOf(t, &waiting[0]); state != "available" {
 		t.Errorf("what is waiting says %s, and the party's last state was the coming back", state)
 	}
 }
@@ -632,7 +632,7 @@ func TestAGroupsTypingIsKeptPerPersonRatherThanPerChat(t *testing.T) {
 	}
 	states := map[string]bool{}
 	for _, emission := range waiting {
-		states[stateOf(t, emission)] = true
+		states[stateOf(t, &emission)] = true
 	}
 	if !states["paused"] || !states["composing"] {
 		t.Errorf("what is waiting is %v, want one person's stop and the other's typing", states)
@@ -700,7 +700,7 @@ func TestOnePersonIsOneKeyWhicheverAddressArrives(t *testing.T) {
 	if len(waiting) != 1 {
 		t.Fatalf("%d presences are waiting for one person, and only their last state should be", len(waiting))
 	}
-	if state := stateOf(t, waiting[0]); state != "paused" {
+	if state := stateOf(t, &waiting[0]); state != "paused" {
 		t.Errorf("what is waiting is a %s, and the person's last state was the stop", state)
 	}
 }
@@ -825,7 +825,7 @@ func TestAStopGoesBackOnTheBoardWhenItsPublishFails(t *testing.T) {
 	if len(waiting) != 1 {
 		t.Fatalf("%d presences are on the board, and the stop that never landed should be", len(waiting))
 	}
-	if state := stateOf(t, waiting[0]); state != "paused" {
+	if state := stateOf(t, &waiting[0]); state != "paused" {
 		t.Errorf("what went back is a %s", state)
 	}
 }
@@ -859,7 +859,7 @@ func TestAFailedStopDoesNotDisplaceTheStateAfterIt(t *testing.T) {
 	if len(waiting) != 1 {
 		t.Fatalf("%d presences are on the board, want only the newer one", len(waiting))
 	}
-	if state := stateOf(t, waiting[0]); state != "composing" {
+	if state := stateOf(t, &waiting[0]); state != "composing" {
 		t.Errorf("what is waiting is a %s, and the newer state was the typing", state)
 	}
 }
@@ -890,7 +890,7 @@ func TestAFailedStopDoesNotOvertakeAStateAlreadyOnItsWay(t *testing.T) {
 	away.Settle(errors.New("redis is unreachable"))
 
 	if waiting := onBoard(session); len(waiting) != 0 {
-		t.Errorf("the going away was put back over the coming back after it: %v", stateOf(t, waiting[0]))
+		t.Errorf("the going away was put back over the coming back after it: %v", stateOf(t, &waiting[0]))
 	}
 }
 
@@ -999,7 +999,7 @@ func TestADirectChatIsKeyedByThePersonAndNotTheAddressThatArrived(t *testing.T) 
 	if len(waiting) != 1 {
 		t.Fatalf("%d presences are waiting for one person, and only their last state should be", len(waiting))
 	}
-	if state := stateOf(t, waiting[0]); state != "paused" {
+	if state := stateOf(t, &waiting[0]); state != "paused" {
 		t.Errorf("what is waiting is a %s, and the person's last state was the stop", state)
 	}
 }
@@ -1096,7 +1096,7 @@ func TestAPresenceIsNotTriedAgainOnceTheConnectionHasGone(t *testing.T) {
 			available.Settle(errors.New("redis is unreachable"))
 
 			if waiting := onBoard(session); len(waiting) != 0 {
-				t.Errorf("an availability from before the connection went was put back: %s", stateOf(t, waiting[0]))
+				t.Errorf("an availability from before the connection went was put back: %s", stateOf(t, &waiting[0]))
 			}
 		})
 	}
@@ -1130,7 +1130,7 @@ func TestAContactOffTheOrdinaryServerIsStillOneKey(t *testing.T) {
 	if len(waiting) != 1 {
 		t.Fatalf("%d presences are waiting for one person, and only their last state should be", len(waiting))
 	}
-	if state := stateOf(t, waiting[0]); state != "paused" {
+	if state := stateOf(t, &waiting[0]); state != "paused" {
 		t.Errorf("what is waiting is a %s, and the person's last state was the stop", state)
 	}
 }
@@ -1234,7 +1234,7 @@ func TestADirectChatGoesOutUnderOneAddressWhicheverOneArrives(t *testing.T) {
 	}
 }
 
-func chatOfPresence(t *testing.T, emission engine.Emission) protocol.Address {
+func chatOfPresence(t *testing.T, emission *engine.Emission) protocol.Address {
 	t.Helper()
 
 	var body struct {

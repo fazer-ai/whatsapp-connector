@@ -327,7 +327,11 @@ func (c *Connector) loop(ctx context.Context, httpErr <-chan error) error {
 // this branch runs under.
 func (c *Connector) tick(ctx context.Context) time.Time {
 	due := time.Now().Add(c.cfg.Heartbeat)
-	c.manager.RenewAll(ctx)
+	// One deadline for both, because both hand leases back and the tail the startup check
+	// prices is one tail.
+	handBackBy := c.manager.HandBackBy()
+	c.manager.RenewAll(ctx, handBackBy)
+	c.manager.SweepRetired(ctx, handBackBy)
 	c.reclaimCommands(ctx)
 	c.announce(ctx)
 	c.metrics.SessionsRunning.Set(float64(c.manager.Count()))

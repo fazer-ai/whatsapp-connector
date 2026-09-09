@@ -131,3 +131,36 @@ func validateAgainst(t *testing.T, definition string, payload json.RawMessage) {
 		t.Fatalf("the payload does not match %s: %v", definition, err)
 	}
 }
+
+// An account released and adopted again is an ordinary sequence now that a session the
+// engine has finished with is handed back. The real engine opens a new session for it,
+// and a double that hands out the closed one instead makes every test built on that
+// sequence prove nothing: the emission channel is closed, so the reader on the other
+// side has already stopped and everything the new owner publishes goes nowhere.
+func TestOpeningAnAccountAgainAfterItWasClosedGivesANewSession(t *testing.T) {
+	t.Parallel()
+
+	engines := fake.New()
+	first, err := engines.Open(t.Context(), "s1")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	second, err := engines.Open(t.Context(), "s1")
+	if err != nil {
+		t.Fatalf("Open again: %v", err)
+	}
+	if second == first {
+		t.Fatal("the engine handed out the session it had already closed")
+	}
+	select {
+	case _, open := <-second.Events():
+		if !open {
+			t.Fatal("the session opened for the account again came with a closed emission channel")
+		}
+	default:
+	}
+}

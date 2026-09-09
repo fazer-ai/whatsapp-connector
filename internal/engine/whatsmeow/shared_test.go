@@ -679,7 +679,7 @@ func TestAMessageCarryingAGroupsKeyIsStillTheMessage(t *testing.T) {
 }
 
 // inboundContentOf is the content of the message an emission published.
-func inboundContentOf(t *testing.T, emission engine.Emission) map[string]any {
+func inboundContentOf(t *testing.T, emission *engine.Emission) map[string]any {
 	t.Helper()
 
 	if emission.Type != protocol.EventMessageReceived {

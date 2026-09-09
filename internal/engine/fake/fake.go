@@ -46,9 +46,13 @@ func (e *Engine) Open(_ context.Context, sid string) (engine.Session, error) {
 	if e.closed {
 		return nil, errors.New("fake: engine is closed")
 	}
-	if existing, ok := e.sessions[sid]; ok {
+	if existing, ok := e.sessions[sid]; ok && !existing.done() {
 		return existing, nil
 	}
+	// A session that has been closed is not one to hand out again: its emission channel
+	// is closed, so the reader on the other side has already stopped and everything the
+	// new owner publishes would go nowhere. An account released and adopted again is an
+	// ordinary sequence now, and the real engine opens a new session for it.
 	session := newSession(sid)
 	e.sessions[sid] = session
 	return session, nil
@@ -86,6 +90,8 @@ type Session struct {
 	events    chan engine.Emission
 	closed    bool
 	connected bool
+	finished  bool
+	givenUp   uint64
 	loggedOut int
 	commands  []protocol.Command
 	held      chan struct{}
@@ -127,6 +133,9 @@ func (s *Session) Connect(_ context.Context, req engine.ConnectRequest) error {
 
 	s.mu.Lock()
 	s.connected = true
+	// A socket that is up is a session with something left to try, which is what a
+	// connect landing between a terminal emission and its publish leaves behind.
+	s.finished = false
 	s.mu.Unlock()
 	s.emit(protocol.EventSessionState, map[string]any{"state": "open"})
 	return nil
@@ -263,6 +272,34 @@ func (s *Session) holdSucceeds() bool {
 // Events is the emission channel. It is closed by Close.
 func (s *Session) Events() <-chan engine.Emission { return s.events }
 
+// Finished is what the fake was last told to say: EmitLast and EmitLastDurable put it
+// up, and a Connect that succeeds takes it down, the way whatsmeow's own does.
+func (s *Session) Finished() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.finished {
+		return 0
+	}
+	return s.givenUp
+}
+
+// giveUp records another giving-up. The caller holds the lock.
+func (s *Session) giveUp() uint64 {
+	if !s.finished {
+		s.finished = true
+		s.givenUp++
+	}
+	return s.givenUp
+}
+
+// done reports that this session has been closed, which is the end of it: nothing it is
+// asked afterwards reaches anybody.
+func (s *Session) done() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closed
+}
+
 // Close ends the session. Safe to call twice, because both an operator command and
 // the shutdown path reach it.
 func (s *Session) Close() error {
@@ -280,6 +317,65 @@ func (s *Session) Close() error {
 // Emit publishes an arbitrary emission, which is how a test drives an inbound message
 // or a disconnection that nothing above asked for.
 func (s *Session) Emit(eventType protocol.EventType, payload any) { s.emit(eventType, payload) }
+
+// EmitLast publishes an emission after which the engine has nothing more to do for this
+// session on its own, which is how a test drives a temporary ban or a connect WhatsApp
+// refused without a socket to be banned from.
+func (s *Session) EmitLast(eventType protocol.EventType, payload any) {
+	body, err := marshal(payload)
+	if err != nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return
+	}
+	select {
+	case s.events <- engine.Emission{Type: eventType, Payload: body, Retires: true, Attempt: s.giveUp()}:
+	default:
+	}
+}
+
+// EmitLastRaced is EmitLast made in the instant a connect had already taken the session
+// back: the mark is on the emission and the giving-up it named is gone, which is what
+// whatsmeow produces when a connect clears the terminal state between the branch that
+// marks it and the emission that reports it.
+func (s *Session) EmitLastRaced(eventType protocol.EventType, payload any) {
+	body, err := marshal(payload)
+	if err != nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return
+	}
+	select {
+	case s.events <- engine.Emission{Type: eventType, Payload: body, Retires: true}:
+	default:
+	}
+}
+
+// EmitLastDurable is EmitLast with the callback EmitDurable takes, which is how a test
+// waits for the publish itself rather than for something after it.
+func (s *Session) EmitLastDurable(eventType protocol.EventType, payload any, settle func(error)) {
+	body, err := marshal(payload)
+	if err != nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		settle(errors.New("fake: nobody is reading the emissions"))
+		return
+	}
+	select {
+	case s.events <- engine.Emission{Type: eventType, Payload: body, Retires: true, Settle: settle, Attempt: s.giveUp()}:
+	default:
+		settle(errors.New("fake: nobody is reading the emissions"))
+	}
+}
 
 // EmitAt publishes an emission that says when the engine learned the thing it reports,
 // which is what a frame's `ts` carries and the only way a reader can tell an event that

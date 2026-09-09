@@ -32,10 +32,33 @@ type Manager struct {
 	ledger    Ledger
 	newID     IDFunc
 	now       func() time.Time
-	log       zerolog.Logger
+	// retireRetry is how long a session waits before saying again that it is finished
+	// with. A field so the tests that drive that path do not wait on the real one.
+	retireRetry time.Duration
+	log         zerolog.Logger
 
 	mu       sync.RWMutex
 	sessions map[string]*Session
+
+	// handing names the accounts an adoption or a hand-back is working on, and keeps the
+	// two off each other. Both go [look at the map, talk to Redis, change the map], on
+	// different goroutines -- adoptions on the answer loop, the sweep on the heartbeat --
+	// and interleaved the release lands after the acquisition and deletes the lease the
+	// session that just started is running under: `cluster.Release` matches on the
+	// instance and nothing else, so it cannot tell one of this instance's leases from the
+	// next one. A peer can then take an account whose socket is still open here, which is
+	// the one thing the lease exists to prevent.
+	//
+	// By account and not one lock for the manager: an adoption holds its account for as
+	// long as a store read takes, and a fleet coming up has a wake for every account it
+	// owns. One lock, and a queue of wakes would keep the sweep from ever taking a turn --
+	// retired sessions renewed for as long as the backlog lasts, which is this feature
+	// not happening at all.
+	//
+	// The heartbeat never waits on it either way: a session the sweep finds busy is swept
+	// on the next tick.
+	handingMu   sync.Mutex
+	handingBusy map[string]struct{}
 
 	// newly is the sessions adopted since the loop last asked, waiting to have what
 	// their previous owner left pending drained before anything newer is read for them.
@@ -98,6 +121,9 @@ type ManagerConfig struct {
 	// AnswerDepth bounds how many commands wait on the manager's own goroutine. The
 	// zero value asks for DefaultAnswerDepth.
 	AnswerDepth int
+	// RetireRetry is how long a session waits before saying again that it is finished
+	// with, when the first attempt did not reach the stream. Zero asks for the default.
+	RetireRetry time.Duration
 }
 
 // NewManager returns a manager owning no sessions yet.
@@ -108,20 +134,34 @@ func NewManager(cfg *ManagerConfig) *Manager {
 	if cfg.AnswerDepth <= 0 {
 		cfg.AnswerDepth = DefaultAnswerDepth
 	}
-	return &Manager{
-		instance:  cfg.Instance,
-		engine:    cfg.Engine,
-		leases:    cfg.Leases,
-		publisher: cfg.Publisher,
-		replier:   cfg.Replier,
-		ledger:    cfg.Ledger,
-		newID:     cfg.NewID,
-		now:       cfg.Now,
-		log:       cfg.Logger,
-		sessions:  make(map[string]*Session),
-		orphans:   make(map[string]struct{}),
-		answers:   make(chan answer, cfg.AnswerDepth),
+	manager := &Manager{
+		instance:    cfg.Instance,
+		engine:      cfg.Engine,
+		leases:      cfg.Leases,
+		publisher:   cfg.Publisher,
+		replier:     cfg.Replier,
+		ledger:      cfg.Ledger,
+		newID:       cfg.NewID,
+		now:         cfg.Now,
+		retireRetry: cfg.RetireRetry,
+		log:         cfg.Logger,
+		sessions:    make(map[string]*Session),
+		orphans:     make(map[string]struct{}),
+		handingBusy: make(map[string]struct{}),
+		answers:     make(chan answer, cfg.AnswerDepth),
 	}
+	return manager
+}
+
+// running is every session this instance holds, by sid, as it stands now.
+func (m *Manager) running() map[string]*Session {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	sessions := make(map[string]*Session, len(m.sessions))
+	for sid, session := range m.sessions {
+		sessions[sid] = session
+	}
+	return sessions
 }
 
 // SIDs lists the sessions this instance is running, which is what the command reader
@@ -158,10 +198,41 @@ const releaseTimeout = 2 * time.Second
 // It returns cluster.ErrNotOwner when another instance holds it, which is the ordinary
 // answer in a fleet and not a failure.
 func (m *Manager) Adopt(ctx context.Context, sid string) (*Session, error) {
+	if !m.tryHoldHanding(sid) {
+		// The heartbeat is handing this very account back. Waiting for it would hold every
+		// wake and ping behind it on this goroutine, and what is being waited for is an
+		// account this instance is giving up: the wake is left pending, and whoever reads
+		// it next finds an account nobody owns.
+		m.log.Info().Str("sid", sid).
+			Msg("a wake found an account this instance is handing back; leaving it pending")
+		return nil, errLeaving
+	}
+	defer m.dropHanding(sid)
+
 	m.mu.RLock()
 	existing, running := m.sessions[sid]
 	m.mu.RUnlock()
 	if running {
+		if existing.leaving() {
+			// On its way out, whether or not that is settled yet: the event saying the
+			// engine finished with it may still be going out, a command it took before
+			// the door shut may not have answered, or the heartbeat may simply not have
+			// come round.
+			//
+			// Left pending rather than answered, and rather than handed back here to make
+			// room for a fresh session. Answering with it acknowledges the wake, and the
+			// commands behind it are then refused by a door this instance is about to
+			// stop being the owner of. Handing it back and taking it again in one step is
+			// worse: releasing arms a cooldown so the instance that let go does not
+			// immediately win the account back, and for a build WhatsApp will not talk to
+			// that is the whole point -- the retry has to be free to land on a peer whose
+			// image can succeed, and it cannot if the instance that cannot has already
+			// taken it. The sweep hands the account back on the next tick, and the wake is
+			// then a wake for an account nobody owns.
+			m.log.Info().Str("sid", sid).
+				Msg("a wake found an account this instance is finishing with; leaving it pending")
+			return nil, errLeaving
+		}
 		return existing, nil
 	}
 
@@ -210,6 +281,7 @@ func (m *Manager) Adopt(ctx context.Context, sid string) (*Session, error) {
 		Instance: m.instance, Lease: lease, Leases: m.leases, Engine: engineSession,
 		Publisher: m.publisher, Replier: m.replier, Ledger: m.ledger,
 		NewID: m.newID, Now: m.now, Logger: m.log,
+		Undrained: func() { m.undrained(sid) }, RetireRetry: m.retireRetry,
 	})
 
 	m.mu.Lock()
@@ -326,11 +398,16 @@ func (m *Manager) Release(ctx context.Context, sid string) {
 // session finds the lease taken, is acknowledged, and retires: the session is then left
 // unowned with nothing scheduled to pick it up.
 func (m *Manager) abandon(ctx context.Context, sid string) {
+	// Marked before the round trip and not after it fails. A wake that lands while this
+	// is in flight finds the lease taken and this instance running nothing, and
+	// `handingBack` is the only thing that stops it from being acknowledged as somebody
+	// else's: the release then lands, and the account is left owned by nobody with the
+	// one wake that would have started it already retired.
+	m.orphanMu.Lock()
+	m.orphans[sid] = struct{}{}
+	m.orphanMu.Unlock()
 	if _, err := m.leases.Release(ctx, sid); err != nil {
 		m.log.Warn().Err(err).Str("sid", sid).Msg("could not hand a lease back; will try again")
-		m.orphanMu.Lock()
-		m.orphans[sid] = struct{}{}
-		m.orphanMu.Unlock()
 		return
 	}
 	m.forgetOrphan(sid)
@@ -360,14 +437,23 @@ func (m *Manager) releaseOrphans(ctx context.Context) {
 			// tick starts where this one stopped.
 			return
 		}
+		if !m.tryHoldHanding(sid) {
+			// An adoption or a hand-back of this account is under way, and the mark is
+			// what a hand-back sets before its round trip: retrying alongside it is a
+			// second release, which lands after the first one and after whatever lease
+			// was won in between and deletes that one. Tried again on the next tick.
+			continue
+		}
 		m.mu.RLock()
 		_, running := m.sessions[sid]
 		m.mu.RUnlock()
 		if running {
 			m.forgetOrphan(sid)
+			m.dropHanding(sid)
 			continue
 		}
 		m.abandon(ctx, sid)
+		m.dropHanding(sid)
 	}
 }
 
@@ -611,6 +697,12 @@ func (m *Manager) wake(ctx context.Context, delivery *transport.Delivery) {
 	_, err := m.Adopt(ctx, sid)
 	switch {
 	case err == nil:
+	case errors.Is(err, errLeaving):
+		// Not this instance's turn to answer: it is giving the account up, and the wake is
+		// what starts it again once nobody owns it. Released rather than forfeited, so it
+		// keeps its age -- the account has been unowned since it was sent.
+		release(delivery)
+		return
 	case errors.Is(err, cluster.ErrNotOwner):
 		if m.handingBack(sid) {
 			// Owned by this instance, which is running nothing and is still trying to
@@ -743,7 +835,7 @@ func (m *Manager) ack(ctx context.Context, delivery *transport.Delivery) {
 // RenewAll keeps the leases of running sessions alive and tears down whatever this
 // instance has lost. It is the loop that turns "the lease expired" into "the socket is
 // closed", which is what keeps two instances off one account.
-func (m *Manager) RenewAll(ctx context.Context) {
+func (m *Manager) RenewAll(ctx context.Context, by time.Time) {
 	// Renewals first, and nothing before them. Every hand-back is a Redis round trip
 	// that can hang, and a lease left unrenewed because this goroutine was busy with
 	// them is a session a peer takes while this instance still holds its socket open:
@@ -754,7 +846,14 @@ func (m *Manager) RenewAll(ctx context.Context) {
 	// sessions this instance carries. The tearing down that follows is per session by
 	// nature -- each one stops its own socket -- but it only touches the ones a renewal
 	// refused, which on an ordinary tick is none.
-	sids := m.SIDs()
+	// By session and not by sid alone: an adoption replaces a retired session with a
+	// fresh one under the same sid, on another goroutine, and an answer about the session
+	// before it must not be carried out on the one that replaced it.
+	running := m.running()
+	sids := make([]string, 0, len(running))
+	for sid := range running {
+		sids = append(sids, sid)
+	}
 	renewals := m.leases.RenewMany(ctx, sids)
 
 	var released []string
@@ -780,12 +879,13 @@ func (m *Manager) RenewAll(ctx context.Context) {
 		} else {
 			m.log.Warn().Str("sid", sid).Msg("lost a lease; stopping the session")
 		}
-		m.mu.Lock()
-		session, ok := m.sessions[sid]
-		delete(m.sessions, sid)
-		m.mu.Unlock()
-		if ok {
-			session.Stop()
+		if !m.forget(sid, running[sid]) {
+			// Adopted again since the renewal went out, which means a lease won after
+			// this answer was already stale. Stopping that session would leave an account
+			// nobody runs, and handing its lease back would delete a live one.
+			m.log.Warn().Str("sid", sid).
+				Msg("a session was adopted again while its renewal was in flight; leaving the new one alone")
+			continue
 		}
 		if errors.Is(err, cluster.ErrNotOwner) {
 			// Somebody else's now, and Renew has already forgotten it locally. Nothing
@@ -802,12 +902,36 @@ func (m *Manager) RenewAll(ctx context.Context) {
 
 	// What is left of the tick goes to the hand-backs, and only what a lease can spare
 	// of it. One that does not fit is tried again on the next tick.
-	window, cancel := context.WithTimeout(ctx, m.leases.TTL()/ReleaseShare)
+	window, cancel := context.WithDeadline(ctx, by)
 	defer cancel()
 	for _, sid := range released {
+		if !m.tryHoldHanding(sid) {
+			// An adoption of this account is under way. Handing back alongside it deletes
+			// the lease it wins; the mark `abandon` leaves is what brings this back on a
+			// later tick.
+			m.orphanMu.Lock()
+			m.orphans[sid] = struct{}{}
+			m.orphanMu.Unlock()
+			continue
+		}
 		m.abandon(window, sid)
+		m.dropHanding(sid)
 	}
 	m.releaseOrphans(window)
+}
+
+// HandBackBy is the moment every hand-back in one tick has to be done by, counted from
+// the call rather than per pass.
+//
+// One deadline and not one per pass, because the tick has two: the renewals hand back
+// what they lost, and the sweep hands back what the engine finished with. Two windows of
+// a third of a lease each, back to back, is a renewal that can be two thirds of a lease
+// late -- and the startup check that decides whether a lease TTL is configurable at all
+// prices in exactly one of them (app.Config, "the lease hand-back tail"). A second one
+// nobody priced is a lease lost under load, which is a peer running an account whose
+// socket this instance still holds open.
+func (m *Manager) HandBackBy() time.Time {
+	return m.now().Add(m.leases.TTL() / ReleaseShare)
 }
 
 // ReleaseShare is the fraction of a lease one tick may spend handing leases back, which
@@ -824,4 +948,126 @@ func (m *Manager) StopAll(ctx context.Context) {
 	for _, sid := range m.SIDs() {
 		m.Release(ctx, sid)
 	}
+}
+
+// SweepRetired hands back the lease of every session the engine has finished with.
+//
+// On the heartbeat, beside the renewals, because it is the same bookkeeping: a session
+// this instance has stopped working on is renewed forever otherwise, and while the lease
+// stands no peer tries the account. `RenewAll` deliberately renews without looking at
+// whether a session is connected -- a renewal skipped mid-reconnect hands an account to a
+// peer while this instance still holds a socket -- and this is not that check. The engine
+// has said the socket is down and staying down.
+//
+// Releasing stops the session and hands the lease back, so the account is owned by nobody
+// until a command adopts it again. Nothing here reconnects on its own, so the next attempt
+// is the client's to make, and it may land on any instance.
+func (m *Manager) SweepRetired(ctx context.Context, by time.Time) {
+	m.mu.RLock()
+	retired := make(map[string]*Session, len(m.sessions))
+	for sid, session := range m.sessions {
+		if session.Retired() {
+			retired[sid] = session
+		}
+	}
+	m.mu.RUnlock()
+
+	// The same deadline `RenewAll`'s own hand-backs ran under, and what they left of it:
+	// each release is a Redis round trip that can hang, and a heartbeat that spends longer
+	// than a lease here is every other session on this instance left unrenewed -- peers
+	// take them while the sockets are still open. One that does not fit is swept on the
+	// next tick, which costs an account a few more seconds of belonging to nobody.
+	window, cancel := context.WithDeadline(ctx, by)
+	defer cancel()
+	for sid, session := range retired {
+		if window.Err() != nil {
+			m.log.Warn().Str("sid", sid).
+				Msg("ran out of tick before handing back a retired session; will try again")
+			return
+		}
+		m.log.Info().Str("sid", sid).
+			Msg("handing back a session the engine will not bring back on its own")
+		m.releaseThis(window, sid, session)
+	}
+}
+
+// releaseThis hands a session back only while it is still the one that was found.
+//
+// Adoptions run on the answer goroutine and this runs on the heartbeat, so between the
+// two lines above a wake can release this very session, win the lease again and put a
+// fresh one in its place -- Adopt does exactly that for a retired session. Released by
+// sid alone, this would then stop the session that just started and delete the lease it
+// is running under, and arm the cooldown that keeps this instance from taking it back.
+//
+// The pointer answers for a replacement that has already landed; `handing` answers for
+// one that is still being built, because the release that overtakes an adoption deletes
+// a live lease -- `cluster.Release` matches on the instance and nothing else.
+// tryHoldHanding takes the turn for one account, or says it is taken.
+//
+// Nobody waits on it. The heartbeat has other sessions to renew and cannot spend a tick
+// on one; an adoption runs on the goroutine that answers every wake and ping, and one
+// waiting here would hold all of them behind an account it has been told is on its way
+// out -- which is a wake to leave pending, not one to wait for. Two adoptions of the same
+// account cannot contend, being the same goroutine.
+func (m *Manager) tryHoldHanding(sid string) bool {
+	m.handingMu.Lock()
+	defer m.handingMu.Unlock()
+	if _, busy := m.handingBusy[sid]; busy {
+		return false
+	}
+	m.handingBusy[sid] = struct{}{}
+	return true
+}
+
+func (m *Manager) dropHanding(sid string) {
+	m.handingMu.Lock()
+	delete(m.handingBusy, sid)
+	m.handingMu.Unlock()
+}
+
+// forget takes a session out of the map and stops it, unless the map no longer holds the
+// one the caller was looking at.
+//
+// Adoptions run on the answer goroutine, and one of them replaces a retired session with
+// a fresh one under the same sid. A caller acting on an answer about the session before
+// it -- a renewal that was refused, a sweep that found it finished with -- would then
+// stop a session that is running and leave the lease it won behind.
+func (m *Manager) forget(sid string, want *Session) bool {
+	m.mu.Lock()
+	session, ok := m.sessions[sid]
+	if !ok || session != want {
+		m.mu.Unlock()
+		return false
+	}
+	delete(m.sessions, sid)
+	m.mu.Unlock()
+
+	session.Stop()
+	return true
+}
+
+func (m *Manager) releaseThis(ctx context.Context, sid string, want *Session) {
+	if !m.tryHoldHanding(sid) {
+		// An adoption of this account is under way. Tried and not taken: this runs on the
+		// heartbeat, and an adoption reads a store.
+		m.log.Debug().Str("sid", sid).
+			Msg("an adoption is under way; leaving a retired session for the next tick")
+		return
+	}
+	defer m.dropHanding(sid)
+
+	// Asked again with the turn in hand, and the session locked shut in the same step,
+	// because the sweep found it a step earlier: a command taken off its queue before the
+	// door shut is one no door can call back, and a connect among them can put a socket up
+	// in between. Stopping it then would close a socket the client has just been told is
+	// open, and hand back the lease it is running under.
+	if !want.claim() {
+		m.log.Info().Str("sid", sid).
+			Msg("a session finished with was not free to be handed over; leaving it for the next tick")
+		return
+	}
+	if !m.forget(sid, want) {
+		return
+	}
+	m.abandon(ctx, sid)
 }

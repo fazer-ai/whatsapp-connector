@@ -272,7 +272,7 @@ func TestLiveWatchAMessageChange(t *testing.T) {
 		window)
 
 	var edited, revoked engine.Emission
-	var reactions []engine.Emission
+	var reactions []*engine.Emission
 	deadline := time.After(window)
 
 collect:
@@ -290,7 +290,7 @@ collect:
 			case protocol.EventMessageReaction:
 				// Kept whole rather than counted: a reaction on some other message in
 				// the account would otherwise be read as the answer to one of these.
-				reactions = append(reactions, emission)
+				reactions = append(reactions, &emission)
 			}
 			if edited.Type != "" && revoked.Type != "" && len(reactions) >= 2 {
 				break collect
@@ -316,16 +316,16 @@ collect:
 		t.Fatalf("%s never arrived within %s", strings.Join(missing, " and "), window)
 	}
 
-	liveCheckTheCorrection(t, edited, target)
+	liveCheckTheCorrection(t, &edited, target)
 	liveCheckTheReactions(t, reactions, target)
-	liveCheckTheDeletion(t, revoked, target)
+	liveCheckTheDeletion(t, &revoked, target)
 
 	if state := session.state(); state != "open" {
 		t.Fatalf("the session did not stay up: state=%s", state)
 	}
 }
 
-func liveCheckTheCorrection(t *testing.T, emission engine.Emission, target string) {
+func liveCheckTheCorrection(t *testing.T, emission *engine.Emission, target string) {
 	t.Helper()
 
 	var correction struct {
@@ -355,7 +355,7 @@ func liveCheckTheCorrection(t *testing.T, emission engine.Emission, target strin
 // liveCheckTheReactions reads the two halves of putting a reaction on and taking it off.
 // Which arrives first is not assumed: they are told apart by the emoji, because that is
 // what tells them apart on the wire.
-func liveCheckTheReactions(t *testing.T, emissions []engine.Emission, target string) {
+func liveCheckTheReactions(t *testing.T, emissions []*engine.Emission, target string) {
 	t.Helper()
 
 	var put, taken []byte
@@ -395,7 +395,7 @@ func liveCheckTheReactions(t *testing.T, emissions []engine.Emission, target str
 	}
 }
 
-func liveCheckTheDeletion(t *testing.T, emission engine.Emission, target string) {
+func liveCheckTheDeletion(t *testing.T, emission *engine.Emission, target string) {
 	t.Helper()
 
 	var deletion struct {
@@ -1608,7 +1608,7 @@ func watch(t *testing.T, session *Session) *recorder {
 	}
 	go func() {
 		for emission := range session.Events() {
-			source.record(emission)
+			source.record(&emission)
 			// This harness stands in for the publisher, so it owes the same answer:
 			// an inbound message waits here for word that its event landed, and a
 			// reader that only drains the channel leaves every one of them stalled
@@ -1667,7 +1667,7 @@ func (r *recorder) tallyUp(eventType protocol.EventType) {
 // It writes to stderr rather than through t.Logf because the testing package buffers a
 // test's log until the test ends, and a pairing code nobody sees until the deadline has
 // passed is a pairing code nobody can scan.
-func (r *fanout) record(emission engine.Emission) {
+func (r *fanout) record(emission *engine.Emission) {
 	if emission.Type == protocol.EventPairingQR {
 		path, expires, err := r.writeCode(emission.Payload)
 		if err != nil {

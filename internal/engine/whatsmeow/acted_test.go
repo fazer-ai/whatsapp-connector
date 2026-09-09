@@ -714,7 +714,7 @@ func TestTheEchoOfTheAccountsOwnReactionCarriesNoSender(t *testing.T) {
 
 // publishedBy runs the handler the way whatsmeow does and returns the one event it put
 // out, settled the way a working publisher settles it.
-func publishedBy(t *testing.T, session *Session, event *waEvents.Message) engine.Emission {
+func publishedBy(t *testing.T, session *Session, event *waEvents.Message) *engine.Emission {
 	t.Helper()
 
 	acknowledged := make(chan bool, 1)

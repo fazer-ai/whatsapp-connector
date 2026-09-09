@@ -406,6 +406,17 @@ type Session struct {
 	// undo. whatsmeow's own reconnect can already be past its wait when that lands, and
 	// it then opens a socket nobody asked for, after the command has answered `close`.
 	hungUp bool
+	// terminal is whatsmeow having put this socket down for good: a temporary ban, a
+	// build WhatsApp will not talk to, a connect it refused. Read by whatever publishes
+	// the session's last event, because that is the one that has to hand the lease back
+	// -- an outcome reaches this session twice when a pairing is running, once through
+	// the handler and once through the QR channel, and only the second of the two knows
+	// it is last. Cleared with the guard beside it, on the next connect.
+	terminal bool
+	// givenUp counts the times this session has been given up on, and never goes back:
+	// the connector compares the count an emission was made under with the one standing
+	// when it is read, and two givings-up either side of a retry have to be told apart.
+	givenUp uint64
 	// reconnecting is whatsmeow retrying a paired socket on its own, which runs outside
 	// this session's dial. Without it a status would report `close` while the event
 	// stream says reconnecting, and a resume would start a second dial alongside it.
@@ -1152,7 +1163,10 @@ func (s *Session) Connect(ctx context.Context, req engine.ConnectRequest) error 
 	// the queued Connected lands in between: the guard is down, so it is announced rather
 	// than refused, and the resume below is then told the session is already open — over
 	// a socket that is down for good, and with nothing arriving later to say so.
-	standing := s.dropHangUp()
+	// The guard comes down with the session's own giving-up, and that is what is handed
+	// back here: a request refused below never dialled anything, and a session left
+	// looking as though it had something to try is one nothing hands back.
+	standing, gaveUp := s.dropHangUp()
 
 	var err error
 	switch req.Pairing {
@@ -1174,6 +1188,7 @@ func (s *Session) Connect(ctx context.Context, req engine.ConnectRequest) error 
 		// own failure raises the guard where it belongs.
 		s.transition.Lock()
 		s.refuseLateConnect()
+		s.restoreTerminal(gaveUp)
 		s.transition.Unlock()
 	}
 	return err
@@ -1637,14 +1652,27 @@ func (s *Session) settleLogout() {
 // entirely before — refused, and the socket it came from closed — or entirely after,
 // by which point this request has already decided to dial and the worst it costs is a
 // second `open` behind the first.
-func (s *Session) dropHangUp() string {
+func (s *Session) dropHangUp() (state string, gaveUp uint64) {
 	s.transition.Lock()
 	defer s.transition.Unlock()
 
 	s.mu.Lock()
 	s.hungUp = false
+	// The operator is asking for a connection, which is the answer to "is there anything
+	// left to try". Left standing, it would retire the session on the next pairing that
+	// merely ran out of codes.
+	//
+	// Handed back rather than read separately by the caller: the branch that gives up
+	// takes the same lock, so a giving-up that lands either side of this is either taken
+	// down here and reported, or not taken down at all. Read before, one landing in
+	// between is cleared by this and reported to nobody -- and a connect refused before it
+	// dialled would then have nothing to put back.
+	if s.terminal {
+		gaveUp = s.givenUp
+		s.terminal = false
+	}
 	s.mu.Unlock()
-	return s.state()
+	return s.state(), gaveUp
 }
 
 // hangUpStanding reports whether the guard is up, without taking it down. The Connected
@@ -1671,6 +1699,83 @@ func (s *Session) refuseLateConnect() {
 	s.mu.Lock()
 	s.hungUp = true
 	s.mu.Unlock()
+}
+
+// markTerminal records that whatsmeow will not bring this connection back on its own.
+func (s *Session) markTerminal() {
+	s.mu.Lock()
+	if !s.terminal {
+		s.terminal = true
+		s.givenUp++
+	}
+	s.mu.Unlock()
+}
+
+// Finished names the giving-up this session is on, for the connector to compare against
+// the one an emission was made under. Zero while there is still something to try: a
+// connect that ran after the emission was queued clears it, and an account whose socket
+// is back up is not one to hand over.
+func (s *Session) Finished() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.terminal {
+		return 0
+	}
+	return s.givenUp
+}
+
+// restoreTerminal puts back a giving-up that a connect took down and then did not act on.
+//
+// The same one, not another: the emission reporting it is on its way with that number on
+// it, and a fresh giving-up here would be a different one, which the connector reads as an
+// answer about an attempt the session has moved on from. Skipped when something has moved
+// on since, which has its own number and its own emission.
+func (s *Session) restoreTerminal(was uint64) {
+	if was == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.terminal || s.givenUp != was {
+		return
+	}
+	s.terminal = true
+}
+
+// isTerminal reports whether there is anything left for this session to try.
+func (s *Session) isTerminal() bool { return s.Finished() != 0 }
+
+// finishing publishes an outcome the session does not come back from, and marks it as
+// the session's last unless a pairing is still running.
+//
+// whatsmeow hands a ban and a refused connect to the QR channel as well as to the
+// handler, so a pairing publishes its own end after this one -- the error and the state
+// that closes it. Retiring here would hand the lease back with those still behind it in
+// the queue, and a client would be left watching a pairing that never resolves. The
+// pairing's closing state carries the mark instead, and reads `terminal` to know it has
+// to. Whichever of the two runs second is the one that finds the other's mark.
+func (s *Session) finishing(eventType protocol.EventType, payload any) {
+	// Held across the question and the answer, or the pairing can end between the two and
+	// publish its own closing state -- marked, because the mark above is already set --
+	// ahead of the event this call has not enqueued yet. The supposedly last event would
+	// then not be last, and the account can go back before the reason it went back is out.
+	//
+	// TryLock and not Lock: the caller holds transition, and a pairing ending takes
+	// transition from under this very lock, so waiting here would be waiting on the
+	// goroutine that is waiting on us. Failing to take it answers the question anyway --
+	// only a pairing that is ending holds it, and it is blocked behind this transition, so
+	// it publishes after this does and the mark is its to carry.
+	if !s.pairingMu.TryLock() {
+		s.emit(eventType, payload)
+		return
+	}
+	defer s.pairingMu.Unlock()
+
+	if s.pairingActive() {
+		s.emit(eventType, payload)
+		return
+	}
+	s.emitLast(eventType, payload)
 }
 
 // sentNothing reports whether a logout failed before it reached WhatsApp, which is the
@@ -1966,6 +2071,14 @@ func (s *Session) startPairing(ctx context.Context, cancel context.CancelFunc) *
 	s.mu.Lock()
 	previous := s.pairing
 	s.pairing = run
+	// A pairing is starting, which is the answer to "is there anything left to try", and
+	// it is given here as well as where the guard comes down. Between those two the
+	// attempt this one replaces can report a build WhatsApp will not talk to -- it holds
+	// this lock to do it, so it either gets there first and is undone here, or finds this
+	// run current and stands aside. Left standing, the giving-up belongs to the attempt
+	// that was replaced and the account is handed over on the strength of it, however the
+	// one that is running now ends.
+	s.terminal = false
 	s.mu.Unlock()
 	if previous != nil {
 		previous.cancel()
@@ -2076,7 +2189,7 @@ func (s *Session) forward() {
 				}
 				emission = resolved
 			}
-			if !s.handOn(emission) {
+			if !s.handOn(&emission) {
 				return
 			}
 		}
@@ -2139,7 +2252,7 @@ type posted struct {
 // its handoff is bounded. The second is what makes the first mean anything -- an
 // unbounded handoff would pass the freshness check and then sit on a reader that is
 // busy, and what came out would be exactly the stale event the check is for.
-func (s *Session) handOn(emission engine.Emission) bool {
+func (s *Session) handOn(emission *engine.Emission) bool {
 	if s.picked != nil {
 		// Taken, and about to be handed on. A test that needs the forwarder parked here
 		// rather than racing it reads this. Never waits: a hook that can hold the
@@ -2151,7 +2264,7 @@ func (s *Session) handOn(emission engine.Emission) bool {
 	}
 	if emission.Expires == nil {
 		select {
-		case s.events <- emission:
+		case s.events <- *emission:
 			return true
 		case <-s.done:
 			return false
@@ -2165,7 +2278,7 @@ func (s *Session) handOn(emission engine.Emission) bool {
 	handoff := time.NewTimer(s.handoffWait)
 	defer handoff.Stop()
 	select {
-	case s.events <- emission:
+	case s.events <- *emission:
 	case <-handoff.C:
 		s.log.Debug().Str("type", string(emission.Type)).
 			Msg("dropping a transient event the reader was not there for")
@@ -2340,6 +2453,18 @@ func (s *Session) settled(key string, seq int64) func(error) {
 }
 
 func (s *Session) emit(eventType protocol.EventType, payload any) {
+	s.emitting(&engine.Emission{Type: eventType}, payload)
+}
+
+// emitLast is emit for a state whatsmeow does not come back from. It says so on the
+// emission, so the connector hands the lease back once the event is out and the account
+// stops belonging to an instance with nothing left to try.
+func (s *Session) emitLast(eventType protocol.EventType, payload any) {
+	s.emitting(&engine.Emission{Type: eventType, Retires: true, Attempt: s.Finished()}, payload)
+}
+
+func (s *Session) emitting(emission *engine.Emission, payload any) {
+	eventType := emission.Type
 	body, err := json.Marshal(payload)
 	if err != nil {
 		// Everything reaching this is built a few lines above, so a failure is a
@@ -2347,8 +2472,10 @@ func (s *Session) emit(eventType protocol.EventType, payload any) {
 		s.log.Error().Err(err).Str("type", string(eventType)).Msg("failed to render an event payload")
 		return
 	}
+	emission.Payload = body
+	emission.At = s.learned()
 	select {
-	case s.inbox <- pending{event: engine.Emission{Type: eventType, Payload: body, At: s.learned()}}:
+	case s.inbox <- pending{event: *emission}:
 	case <-s.done:
 	}
 }
@@ -2450,7 +2577,7 @@ func (s *Session) publishPairing(run *pairingRun, item wm.QRChannelItem, publish
 			"request_id": run.id, "code": item.PasskeyConfirmation.Code,
 		})
 	case "err-client-outdated":
-		s.emit(protocol.EventSessionClientOutdated, map[string]any{})
+		s.outdatedPairing(run)
 	case "timeout":
 		s.finishPairing(run, "timeout", nil)
 	case "error":
@@ -2458,6 +2585,32 @@ func (s *Session) publishPairing(run *pairingRun, item wm.QRChannelItem, publish
 	default:
 		s.finishPairing(run, item.Event, item.Error)
 	}
+}
+
+// outdatedPairing reports a build WhatsApp will not talk to, and finishes the session on
+// it.
+//
+// The last thing this channel carries: whatsmeow sends it from the branch that closes the
+// channel, so the reader's next turn finds it shut and returns without an outcome of its
+// own. There is no `pairing.error` after this and no state to close, which makes this
+// event the pairing's end as much as the session's -- nothing follows it that could carry
+// the mark instead.
+//
+// Only while this is still the attempt the session is on, and under the lock a replacement
+// takes to start: the operator can have replaced it already, and marking the session
+// finished with then is marking the attempt that is running now. Nothing clears that --
+// the replacement's own connect came before the mark -- so a pairing that goes on to
+// succeed is handed over on the strength of an answer about the attempt it replaced.
+func (s *Session) outdatedPairing(run *pairingRun) {
+	s.pairingMu.Lock()
+	defer s.pairingMu.Unlock()
+
+	if !s.endPairing(run) {
+		s.log.Warn().Msg("WhatsApp refused a pairing for this build after the attempt was replaced")
+		return
+	}
+	s.markTerminal()
+	s.emitLast(protocol.EventSessionClientOutdated, map[string]any{})
 }
 
 // publishPasskeyRequest hands the operator's client the challenge WhatsApp wants signed.
@@ -2649,7 +2802,22 @@ func (s *Session) publishPairingFailure(reason string, err error) {
 
 	s.refuseLateConnect()
 	s.offline()
-	s.emit(protocol.EventSessionState, map[string]any{"state": "close", "reason": "pairing_" + reason})
+	closing := map[string]any{"state": "close", "reason": "pairing_" + reason}
+	// Asked here and not taken from the caller. Every way a pairing ends publishes this
+	// same closing state, and each of them can be the one that ends a session whatsmeow
+	// will not bring back: a dial that failed, a channel that reported an outcome, an
+	// error WhatsApp named. A caller that answers for itself is a caller that can be
+	// added without the question being asked at all, and then the account is held by an
+	// instance with nothing left to try.
+	if s.isTerminal() {
+		// The run is over and WhatsApp refused this build, so nothing here is going to
+		// connect: the account goes back rather than being held by an instance whose
+		// image is the reason it cannot pair. On the run's last event, so the pairing's
+		// own outcome is out first.
+		s.emitLast(protocol.EventSessionState, closing)
+		return
+	}
+	s.emit(protocol.EventSessionState, closing)
 }
 
 // pairingFailureMessage is the stable sentence a client shows for each reason.
@@ -2794,6 +2962,7 @@ func (s *Session) handle(rawEvent any) bool {
 		defer s.transition.Unlock()
 
 		s.refuseLateConnect()
+		s.markTerminal()
 		s.offline()
 		ban := map[string]any{"kind": "temporary", "reason": event.Code.String()}
 		if event.Expire > 0 {
@@ -2801,27 +2970,31 @@ func (s *Session) handle(rawEvent any) bool {
 			// Publishing now+0 would read as one that already has.
 			ban["expires_at"] = time.Now().Add(event.Expire).UnixMilli()
 		}
-		s.emit(protocol.EventSessionTemporaryBan, map[string]any{"ban": ban})
+		s.finishing(protocol.EventSessionTemporaryBan, map[string]any{"ban": ban})
 	case *waEvents.ClientOutdated:
 		s.transition.Lock()
 		defer s.transition.Unlock()
 
 		s.refuseLateConnect()
+		s.markTerminal()
 		s.offline()
 		if s.pairingActive() {
 			// The pairing reader publishes this one: whatsmeow delivers it here and to
 			// the QR channel both, and two canonical events for one outcome is worse
-			// than either.
+			// than either. It is the reader's copy that retires the session, because for
+			// this outcome the reader's copy is the last thing the pairing publishes:
+			// whatsmeow closes the channel on the same item.
 			return true
 		}
-		s.emit(protocol.EventSessionClientOutdated, map[string]any{})
+		s.emitLast(protocol.EventSessionClientOutdated, map[string]any{})
 	case *waEvents.ConnectFailure:
 		s.transition.Lock()
 		defer s.transition.Unlock()
 
 		s.refuseLateConnect()
+		s.markTerminal()
 		s.offline()
-		s.emit(protocol.EventSessionConnectFailure, map[string]any{
+		s.finishing(protocol.EventSessionConnectFailure, map[string]any{
 			"reason": event.Reason.String(), "code": int(event.Reason),
 		})
 	case *waEvents.PairSuccess:

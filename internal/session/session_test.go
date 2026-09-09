@@ -41,6 +41,9 @@ type recorder struct {
 	// deadlined makes that hold answer to the caller's context, for the one test that is
 	// about a write being cut short rather than about one finishing.
 	deadlined bool
+	// entered is closed when a held publish is reached, for the tests that have to know
+	// the pump is inside the write rather than on its way to it.
+	entered chan struct{}
 }
 
 func newRecorder() *recorder {
@@ -49,9 +52,12 @@ func newRecorder() *recorder {
 
 func (r *recorder) Publish(ctx context.Context, event *protocol.Event) error {
 	r.mu.Lock()
-	gate, deadlined := r.gate, r.deadlined
-	r.gate, r.deadlined = nil, false
+	gate, deadlined, entered := r.gate, r.deadlined, r.entered
+	r.gate, r.deadlined, r.entered = nil, false, nil
 	r.mu.Unlock()
+	if entered != nil {
+		close(entered)
+	}
 	if gate != nil {
 		if !deadlined {
 			<-gate
@@ -85,6 +91,21 @@ func (r *recorder) hold() func() {
 	r.gate = gate
 	r.mu.Unlock()
 	return func() { close(gate) }
+}
+
+// holdOnceInside is hold that also says when the publish was reached, which is what an
+// assertion about something happening after a write needs: waiting for the write to
+// finish proves nothing about the order, and not waiting at all catches a pump that has
+// not started.
+func (r *recorder) holdOnceInside() (release func(), inside <-chan struct{}) {
+	gate, entered := make(chan struct{}), make(chan struct{})
+	r.mu.Lock()
+	r.gate, r.entered = gate, entered
+	r.mu.Unlock()
+	// Releasable twice, because the caller both releases it deliberately and defers a
+	// release in case it fails before getting there.
+	var once sync.Once
+	return func() { once.Do(func() { close(gate) }) }, entered
 }
 
 // holdWithDeadline is hold for a publish that answers to the caller's context, which is
@@ -516,7 +537,7 @@ func TestRenewAllDropsASessionWhoseLeaseMoved(t *testing.T) {
 		t.Fatalf("inst-b Acquire: %v", err)
 	}
 
-	manager.RenewAll(ctx)
+	manager.RenewAll(ctx, manager.HandBackBy())
 
 	if got := manager.Count(); got != 0 {
 		t.Fatalf("the manager still runs %d sessions after losing the lease", got)
@@ -559,7 +580,7 @@ func TestRenewAllDropsASessionWhoseLeaseWentStaleWhileRedisWasUnreachable(t *tes
 	clock.step(cluster.DefaultTTL + time.Second)
 	server.Close()
 
-	manager.RenewAll(ctx)
+	manager.RenewAll(ctx, manager.HandBackBy())
 
 	if got := manager.Count(); got != 0 {
 		t.Fatalf("the manager still runs %d sessions on a lease that ran out", got)
@@ -594,7 +615,7 @@ func TestRenewAllKeepsASessionWhoseLeaseIsStillFresh(t *testing.T) {
 	}
 	server.Close()
 
-	manager.RenewAll(ctx)
+	manager.RenewAll(ctx, manager.HandBackBy())
 
 	if got := manager.Count(); got != 1 {
 		t.Fatalf("the manager dropped a session on one failed round trip (running %d)", got)
@@ -733,6 +754,7 @@ func (e *gatedEngine) Open(ctx context.Context, _ string) (engine.Session, error
 }
 
 func (e *gatedEngine) Events() <-chan engine.Emission                       { return e.events }
+func (e *gatedEngine) Finished() uint64                                     { return 0 }
 func (e *gatedEngine) Connect(context.Context, engine.ConnectRequest) error { return nil }
 func (e *gatedEngine) Disconnect(context.Context) error                     { return nil }
 func (e *gatedEngine) Logout(context.Context) error                         { return nil }
@@ -1075,6 +1097,7 @@ func newHeldEngine() *heldEngine {
 
 func (e *heldEngine) Open(context.Context, string) (engine.Session, error) { return e, nil }
 func (e *heldEngine) Events() <-chan engine.Emission                       { return e.events }
+func (e *heldEngine) Finished() uint64                                     { return 0 }
 func (e *heldEngine) Connect(context.Context, engine.ConnectRequest) error { return nil }
 func (e *heldEngine) Disconnect(context.Context) error                     { return nil }
 func (e *heldEngine) Logout(context.Context) error                         { return nil }
@@ -1355,7 +1378,7 @@ func TestRenewAllHandsBackTheLeaseOfASessionItStopped(t *testing.T) {
 
 	rdb.AddHook(losesRenewals(keys.Cooldown("s1")))
 	clock.step(cluster.DefaultTTL + time.Second)
-	manager.RenewAll(ctx)
+	manager.RenewAll(ctx, manager.HandBackBy())
 
 	if got := manager.Count(); got != 0 {
 		t.Fatalf("the manager still runs %d sessions on a lease that ran out", got)
@@ -1400,7 +1423,7 @@ func TestAHandBackThatDidNotLandIsTriedAgain(t *testing.T) {
 	rdb.AddHook(hook)
 
 	clock.step(cluster.DefaultTTL + time.Second)
-	manager.RenewAll(ctx)
+	manager.RenewAll(ctx, manager.HandBackBy())
 
 	if got, err := rdb.Get(ctx, keys.Lease("s1")).Result(); err != nil || got != "inst-a" {
 		t.Fatalf("the lease should still be there for the retry to find (got %q, %v)", got, err)
@@ -1409,7 +1432,7 @@ func TestAHandBackThatDidNotLandIsTriedAgain(t *testing.T) {
 	// Redis answers again. Nothing renews this session any more, so the only thing left
 	// that can hand its lease back is the tick itself.
 	away.Store(false)
-	manager.RenewAll(ctx)
+	manager.RenewAll(ctx, manager.HandBackBy())
 
 	peer := cluster.NewLeases(client, "inst-b", cluster.Options{Clock: clock})
 	if _, err := peer.Acquire(ctx, "s1"); err != nil {
@@ -1451,7 +1474,7 @@ func TestAQueuedHandBackDoesNotTouchALeaseTakenAgain(t *testing.T) {
 	rdb.AddHook(hook)
 
 	clock.step(cluster.DefaultTTL + time.Second)
-	manager.RenewAll(ctx)
+	manager.RenewAll(ctx, manager.HandBackBy())
 	away.Store(false)
 
 	// The orphaned key runs out on its own, and a wake arrives before the next tick:
@@ -1462,7 +1485,7 @@ func TestAQueuedHandBackDoesNotTouchALeaseTakenAgain(t *testing.T) {
 		t.Fatalf("re-adopting: %v", err)
 	}
 
-	manager.RenewAll(ctx)
+	manager.RenewAll(ctx, manager.HandBackBy())
 
 	if got := manager.Count(); got != 1 {
 		t.Fatalf("the retry stopped a session this instance had taken again (running %d)", got)
@@ -1515,7 +1538,7 @@ func TestRenewalsComeBeforeHandBacks(t *testing.T) {
 	rdb.AddHook(hook)
 	away.Store(true)
 	clock.step(ttl + time.Millisecond)
-	manager.RenewAll(ctx)
+	manager.RenewAll(ctx, manager.HandBackBy())
 	away.Store(false)
 
 	// s1's hand-back is queued. From here every hand-back hangs for longer than a lease,
@@ -1528,7 +1551,7 @@ func TestRenewalsComeBeforeHandBacks(t *testing.T) {
 		t.Fatalf("re-adopting s2: %v", err)
 	}
 	before := time.Now()
-	manager.RenewAll(ctx)
+	manager.RenewAll(ctx, manager.HandBackBy())
 
 	if got := manager.Count(); got != 1 {
 		t.Fatalf("the live session was dropped while a hand-back was hanging (running %d)", got)
@@ -1603,7 +1626,7 @@ func TestAWakeRefusedByThisInstancesOwnStaleLeaseStaysPending(t *testing.T) {
 	}
 	rdb.AddHook(hook)
 	clock.step(cluster.DefaultTTL + time.Second)
-	manager.RenewAll(ctx)
+	manager.RenewAll(ctx, manager.HandBackBy())
 
 	acked := &atomic.Bool{}
 	released := &atomic.Bool{}
@@ -2814,5 +2837,93 @@ func TestASessionReturnedByADrainIsNotListedTwice(t *testing.T) {
 	left := manager.TakeNewlyAdopted()
 	if len(left) != 1 || left[0] != sid {
 		t.Fatalf("the sessions left to drain are %v, and one drain of one session should leave one entry", left)
+	}
+}
+
+// The event goes out before the session is finished with, and the order is not a detail:
+// handing the lease back first lets another instance adopt the account and publish under
+// a newer epoch, and a client drops the event that said why as stale. So the mark is set
+// after the publish returns, which a publish held open is the only way to catch.
+func TestASessionIsNotFinishedWithUntilTheEventSayingSoIsOut(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	ctx := context.Background()
+
+	adopted, err := h.manager.Adopt(ctx, "s1")
+	if err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, ok := h.engine.Session("s1")
+	if !ok {
+		t.Fatal("the engine has no session after Adopt")
+	}
+
+	release, inside := h.recorder.holdOnceInside()
+	// Released whatever happens: the pump is inside the publish, and the harness stops the
+	// session on cleanup, which waits for the pump. A failure that left the gate shut
+	// would hang the run instead of reporting itself.
+	defer release()
+	engineSession.EmitLast(protocol.EventSessionTemporaryBan, map[string]any{
+		"ban": map[string]any{"kind": "temporary", "reason": "spam"},
+	})
+
+	// Inside the write that has to land first, which is the only moment the order is
+	// observable: before it the pump has not started, after it there is nothing left to
+	// be out of order with.
+	select {
+	case <-inside:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the pump never reached the publish")
+	}
+	if adopted.Retired() {
+		t.Fatal("the session was finished with while the event saying so was still being published")
+	}
+
+	release()
+	waitFor(t, "the session to be finished with", func() bool { return adopted.Retired() })
+	if published := h.recorder.published(); len(published) != 1 ||
+		published[0].Type != protocol.EventSessionTemporaryBan {
+		t.Fatalf("the events published are %v, want the one that says why", published)
+	}
+}
+
+// A publish that never reached the stream is not an event the client has, and retiring on
+// one hands the account over with nothing saying why. The lease stays where it is until
+// something gets through.
+func TestASessionIsNotFinishedWithOnAnEventThatNeverLanded(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	ctx := context.Background()
+
+	adopted, err := h.manager.Adopt(ctx, "s1")
+	if err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, ok := h.engine.Session("s1")
+	if !ok {
+		t.Fatal("the engine has no session after Adopt")
+	}
+
+	h.recorder.failWith(errors.New("the stream is not taking writes"))
+	published := make(chan error, 1)
+	engineSession.EmitLastDurable(protocol.EventSessionTemporaryBan, map[string]any{
+		"ban": map[string]any{"kind": "temporary", "reason": "spam"},
+	}, func(err error) { published <- err })
+
+	// The publish itself is what has to be waited for, and the callback is the only thing
+	// that reports it: waiting for a later event instead races the pump.
+	select {
+	case err := <-published:
+		if err == nil {
+			t.Fatal("the publish this test needs to fail succeeded")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the pump never came back from the publish")
+	}
+
+	if adopted.Retired() {
+		t.Fatal("the session was finished with on an event that never reached the stream")
 	}
 }

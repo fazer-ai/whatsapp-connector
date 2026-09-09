@@ -633,7 +633,7 @@ func openStore(t *testing.T) *store.Container {
 }
 
 // next reads the emission the session just published, or fails rather than hanging.
-func next(t *testing.T, session *Session) engine.Emission {
+func next(t *testing.T, session *Session) *engine.Emission {
 	t.Helper()
 
 	select {
@@ -641,10 +641,10 @@ func next(t *testing.T, session *Session) engine.Emission {
 		if !ok {
 			t.Fatal("the session published nothing and closed")
 		}
-		return emission
+		return &emission
 	case <-time.After(2 * time.Second):
 		t.Fatal("the session published nothing")
-		return engine.Emission{}
+		return nil
 	}
 }
 
@@ -1941,7 +1941,10 @@ func TestDroppingTheHangUpGuardAndReadingTheStateIsOneStep(t *testing.T) {
 	// holding it here is the queued event caught mid-flight.
 	session.transition.Lock()
 	standing := make(chan string, 1)
-	go func() { standing <- session.dropHangUp() }()
+	go func() {
+		state, _ := session.dropHangUp()
+		standing <- state
+	}()
 
 	select {
 	case state := <-standing:
@@ -1967,7 +1970,7 @@ func TestAConnectQueuedBehindADisconnectIsStillRefused(t *testing.T) {
 	drain(t, session)
 
 	session.handle(&waEvents.Connected{})
-	if state := session.dropHangUp(); state != "close" {
+	if state, _ := session.dropHangUp(); state != "close" {
 		t.Fatalf("the connect was handed %q over a socket that is down", state)
 	}
 	select {
@@ -2611,5 +2614,324 @@ func TestASessionThatStoppedWritesNoMappingEither(t *testing.T) {
 	}
 	if err := session.store.Forget(t.Context()); !errors.Is(err, store.ErrNotOwned) {
 		t.Errorf("a session that stopped deleted its own device: %v", err)
+	}
+}
+
+// whatsmeow publishes these three from the branch that told the socket to stay down, so
+// nothing is going to reconnect: the session is finished until somebody asks it to try
+// again. Saying so on the emission is what lets the connector hand the lease back --
+// otherwise the account belongs to an instance with nothing left to try, and no peer
+// touches it. The two that are not here are the ones something does come back from.
+func TestTheStatesWhatsmeowDoesNotComeBackFromRetireTheSession(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name    string
+		event   any
+		want    protocol.EventType
+		retires bool
+	}{
+		{name: "a temporary ban", want: protocol.EventSessionTemporaryBan, retires: true,
+			event: &waEvents.TemporaryBan{Code: waEvents.TempBanReason(101)}},
+		{name: "a client WhatsApp will not talk to", want: protocol.EventSessionClientOutdated,
+			retires: true, event: &waEvents.ClientOutdated{}},
+		{name: "a connect it refused", want: protocol.EventSessionConnectFailure, retires: true,
+			event: &waEvents.ConnectFailure{Reason: waEvents.ConnectFailureServiceUnavailable}},
+		// A disconnect is whatsmeow's own to reconnect from, and a logout leaves a session
+		// that can pair again. Neither is finished with.
+		{name: "a disconnect", want: protocol.EventSessionState, event: &waEvents.Disconnected{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			session, _ := newTestSession(t, "5511999990001")
+			session.setConnected(true)
+			session.handle(tc.event)
+
+			emission := next(t, session)
+			if emission.Type != tc.want {
+				t.Fatalf("the session published %s, want %s", emission.Type, tc.want)
+			}
+			if emission.Retires != tc.retires {
+				t.Errorf("the emission retires the session: %v, want %v", emission.Retires, tc.retires)
+			}
+		})
+	}
+}
+
+// A pairing that WhatsApp refuses for the build's version leaves a session nothing can
+// bring back, and the handler stands aside there: whatsmeow delivers the outdated event to
+// the pairing channel as well, and two canonical events for one outcome is worse than
+// either. So it is the run's own last event that finishes the session -- after the pairing
+// has said how it ended, not instead of it.
+func TestAPairingRefusedForTheBuildFinishesTheSession(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "")
+	pairCtx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	run := session.startPairing(pairCtx, cancel)
+
+	// Exactly what whatsmeow does with a build WhatsApp will not talk to: the refusal is
+	// the last item on the channel and the channel closes on the same step, so the reader
+	// returns with no outcome of its own. Driven through the reader rather than by hand
+	// because that shape is the whole reason the mark belongs on this event.
+	codes := make(chan wm.QRChannelItem, 1)
+	codes <- wm.QRChannelItem{Event: "err-client-outdated"}
+	close(codes)
+	go session.readPairingWith(run, codes, nil, false)
+
+	outdated := next(t, session)
+	if outdated.Type != protocol.EventSessionClientOutdated {
+		t.Fatalf("the pairing published %s, want %s", outdated.Type, protocol.EventSessionClientOutdated)
+	}
+	if !outdated.Retires {
+		t.Error("a pairing WhatsApp refused for this build left the session holding its lease")
+	}
+
+	select {
+	case emission, open := <-session.Events():
+		if open {
+			t.Fatalf("the pairing published %s after the refusal, which the mark said was its last",
+				emission.Type)
+		}
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// A ban and a refused connect reach this session twice while a pairing is running: once
+// through the handler and once through the QR channel, which turns them into the
+// pairing's own ending. The lease has to go back on the second of the two -- handed back
+// on the first, the pairing error and the state that closes it are published by a session
+// whose account already belongs to nobody, and the client is left watching a pairing that
+// never resolves.
+func TestAConnectRefusedMidPairingRetiresOnThePairingsOwnEnding(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "")
+	pairCtx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	run := session.startPairing(pairCtx, cancel)
+
+	codes := make(chan wm.QRChannelItem, 1)
+	go session.readPairingWith(run, codes, nil, false)
+
+	session.handle(&waEvents.ConnectFailure{Reason: waEvents.ConnectFailureServiceUnavailable})
+	refused := next(t, session)
+	if refused.Type != protocol.EventSessionConnectFailure {
+		t.Fatalf("the session published %s, want %s", refused.Type, protocol.EventSessionConnectFailure)
+	}
+	if refused.Retires {
+		t.Error("the refused connect finished the session while its pairing still had two events to publish")
+	}
+
+	// whatsmeow's own answer to a connect it refused mid-pairing: the channel calls it an
+	// unexpected event and closes on it.
+	codes <- wm.QRChannelItem{Event: "err-unexpected-state"}
+	close(codes)
+
+	failed := next(t, session)
+	if failed.Type != protocol.EventPairingError {
+		t.Fatalf("the pairing published %s, want %s", failed.Type, protocol.EventPairingError)
+	}
+	if failed.Retires {
+		t.Error("the pairing's own outcome finished the session, leaving nothing to publish the state")
+	}
+
+	closed := next(t, session)
+	if closed.Type != protocol.EventSessionState {
+		t.Fatalf("the pairing published %s last, want %s", closed.Type, protocol.EventSessionState)
+	}
+	if !closed.Retires {
+		t.Error("a pairing that ended on a connect WhatsApp refused left the session holding its lease")
+	}
+}
+
+// The handler and the pairing reader are two goroutines publishing into the same queue,
+// and only one of them can carry the mark that says the session is finished with. A
+// pairing that ends between the handler's question and the handler's own event would
+// publish its closing state -- marked, because the session is already terminal -- ahead
+// of an event that is then last and unmarked, and the account can go back before the
+// reason it went back is out.
+func TestAnOutcomeRacingAPairingsEndingLetsThePairingCarryTheMark(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "")
+
+	// A pairing in the middle of ending, which is what holds this lock and nothing else
+	// does: the run is already cleared and the events that close it are not out yet.
+	session.pairingMu.Lock()
+	defer session.pairingMu.Unlock()
+
+	session.handle(&waEvents.ConnectFailure{Reason: waEvents.ConnectFailureServiceUnavailable})
+
+	refused := next(t, session)
+	if refused.Type != protocol.EventSessionConnectFailure {
+		t.Fatalf("the session published %s, want %s", refused.Type, protocol.EventSessionConnectFailure)
+	}
+	if refused.Retires {
+		t.Error("a refused connect took the mark from a pairing that was already publishing its own ending")
+	}
+}
+
+// A dial that failed ends the pairing from a path of its own, detached from the command
+// that started it, and publishes the same closing state every other ending publishes. The
+// event that says WhatsApp refused the connection reaches the handler at the same time,
+// and with a pairing running it is not the one that can carry the mark: if this ending
+// does not carry it either, nothing does, and the account is held by an instance with
+// nothing left to try.
+func TestAPairingGivenUpOnAfterARefusedConnectFinishesTheSession(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "")
+	pairCtx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	run := session.startPairing(pairCtx, cancel)
+
+	session.handle(&waEvents.ConnectFailure{Reason: waEvents.ConnectFailureServiceUnavailable})
+	refused := next(t, session)
+	if refused.Type != protocol.EventSessionConnectFailure {
+		t.Fatalf("the session published %s, want %s", refused.Type, protocol.EventSessionConnectFailure)
+	}
+	if refused.Retires {
+		t.Error("the refused connect finished the session while its pairing had still to end")
+	}
+
+	session.abandonPairing(run, session.current(), "connect_failed", errors.New("dial refused"))
+
+	failed := next(t, session)
+	if failed.Type != protocol.EventPairingError {
+		t.Fatalf("the pairing published %s, want %s", failed.Type, protocol.EventPairingError)
+	}
+	closed := next(t, session)
+	if closed.Type != protocol.EventSessionState {
+		t.Fatalf("the pairing published %s last, want %s", closed.Type, protocol.EventSessionState)
+	}
+	if !closed.Retires {
+		t.Error("a pairing given up on after a connect WhatsApp refused left the session holding its lease")
+	}
+}
+
+// The operator can replace a pairing while the one before is still reading its channel,
+// and a refusal that arrives then belongs to the attempt they left. Marking the session
+// finished with on it marks the attempt that is running now, and nothing clears that: the
+// replacement's own connect came before the mark, so a pairing that goes on to succeed
+// would be handed over on the strength of an answer about the attempt it replaced.
+func TestARefusalForAnAttemptTheOperatorReplacedFinishesNothing(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "")
+	leftCtx, cancelLeft := context.WithCancel(t.Context())
+	t.Cleanup(cancelLeft)
+	left := session.startPairing(leftCtx, cancelLeft)
+
+	// The operator's corrected attempt, which is now the one the session is on.
+	nextCtx, cancelNext := context.WithCancel(t.Context())
+	t.Cleanup(cancelNext)
+	session.startPairing(nextCtx, cancelNext)
+
+	session.outdatedPairing(left)
+
+	if session.Finished() != 0 {
+		t.Error("a refusal for the attempt the operator left finished the one that replaced it")
+	}
+	select {
+	case emission, open := <-session.Events():
+		if open {
+			t.Fatalf("the session published %s for an attempt the operator had already replaced", emission.Type)
+		}
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// A connect refused before it dialled anything -- a resume on a session that never
+// paired, a code pairing with no number -- takes the guard down on its way in and puts it
+// back on its way out. The session's own giving-up goes with it: without that, a command
+// that changed nothing leaves a session that looks as though it has something to try, so
+// the account is never handed back and the instance renews a socket that is down for good.
+func TestAConnectRefusedBeforeItDialledLeavesTheGivingUpStanding(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "")
+
+	session.transition.Lock()
+	session.refuseLateConnect()
+	session.markTerminal()
+	session.transition.Unlock()
+	gaveUp := session.Finished()
+	if gaveUp == 0 {
+		t.Fatal("the session did not record the giving-up the test set up")
+	}
+
+	// A resume on a session that never paired, which is refused before anything is dialled.
+	if err := session.Connect(t.Context(), engine.ConnectRequest{Pairing: "resume"}); err == nil {
+		t.Fatal("a resume on a session that never paired was accepted")
+	}
+
+	if session.Finished() != gaveUp {
+		t.Errorf("the session reports giving-up %d after a connect that changed nothing, want %d",
+			session.Finished(), gaveUp)
+	}
+}
+
+// The guard and the session's own giving-up come down together, in the step that takes
+// them down. Read separately by the caller, a giving-up landing in between is taken down
+// by this and reported to nobody: the connect that took it down is then refused before it
+// dials anything, has nothing to put back, and the account is held by an instance with a
+// socket that is down for good.
+func TestTheGuardComesDownWithWhateverGivingUpItFinds(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "")
+
+	session.transition.Lock()
+	session.markTerminal()
+	session.transition.Unlock()
+
+	_, gaveUp := session.dropHangUp()
+	if gaveUp != session.givenUp {
+		t.Fatalf("the guard came down reporting giving-up %d, want %d", gaveUp, session.givenUp)
+	}
+	if session.Finished() != 0 {
+		t.Fatal("the guard came down and left the giving-up standing")
+	}
+
+	// And nothing to report when there was nothing to take down.
+	if _, gaveUp := session.dropHangUp(); gaveUp != 0 {
+		t.Fatalf("the guard came down reporting giving-up %d on a session that had none", gaveUp)
+	}
+}
+
+// A connect takes the session's giving-up down on its way in and then waits for the lock a
+// pairing starts under. The attempt it replaces can report a build WhatsApp will not talk
+// to in that gap: it takes the same lock, finds its own run still current because the
+// replacement has not started yet, and gives up on the session again. Nothing would then
+// take that down -- the connect is already past the place where it does -- so the account
+// is handed over on an answer about the attempt that was replaced, however the one that is
+// running now ends.
+func TestAPairingStartingUndoesTheGivingUpOfTheAttemptItReplaces(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "")
+	leftCtx, cancelLeft := context.WithCancel(t.Context())
+	t.Cleanup(cancelLeft)
+	left := session.startPairing(leftCtx, cancelLeft)
+
+	// The attempt on its way out, reporting the build while it is still the current one.
+	session.outdatedPairing(left)
+	if session.Finished() == 0 {
+		t.Fatal("the attempt on its way out did not give up on the session, so there is nothing to undo")
+	}
+	if outdated := next(t, session); outdated.Type != protocol.EventSessionClientOutdated {
+		t.Fatalf("the attempt published %s, want %s", outdated.Type, protocol.EventSessionClientOutdated)
+	}
+
+	// The operator's corrected attempt, starting into it.
+	nextCtx, cancelNext := context.WithCancel(t.Context())
+	t.Cleanup(cancelNext)
+	session.startPairing(nextCtx, cancelNext)
+
+	if session.Finished() != 0 {
+		t.Fatal("a pairing started with the giving-up of the attempt it replaced still standing")
 	}
 }
