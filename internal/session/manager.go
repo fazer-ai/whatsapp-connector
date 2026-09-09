@@ -392,7 +392,7 @@ func (m *Manager) Release(ctx context.Context, sid string) {
 	// instance while nothing here runs the account. A wake landing in that gap finds an
 	// owner, is acknowledged as an account already running, and the release that follows
 	// leaves the account owned by nobody.
-	m.givingUp(ctx, sid)
+	m.givingUpAhead(ctx, sid)
 	m.stopSession(sid)
 	m.abandon(ctx, sid)
 }
@@ -450,6 +450,16 @@ func (m *Manager) abandon(ctx context.Context, sid string) {
 // value in the map records. A mark that did not land is not remembered as landed, so the
 // next attempt at the release pays for it again.
 func (m *Manager) givingUp(ctx context.Context, sid string) {
+	m.mark(ctx, sid, m.marking())
+}
+
+// givingUpAhead is givingUp in front of the stop that takes the socket down, where what
+// is left of the lease is the bound and not the TTL.
+func (m *Manager) givingUpAhead(ctx context.Context, sid string) {
+	m.mark(ctx, sid, m.markingAhead(sid))
+}
+
+func (m *Manager) mark(ctx context.Context, sid string, room time.Duration) {
 	m.orphanMu.Lock()
 	marked := m.orphans[sid]
 	m.orphans[sid] = marked
@@ -468,11 +478,11 @@ func (m *Manager) givingUp(ctx context.Context, sid string) {
 	//
 	// Derived from the caller's context rather than detached from it, so a shutdown with
 	// less than this left still gets the socket down inside its own grace.
-	room := m.markingFor(sid)
 	if room <= 0 {
-		// The lease has nothing left to spend. A peer may take the account from this
-		// moment, so the socket has to come down now; a mark written after that would be
-		// about a lease this instance no longer has, and the fence would refuse it.
+		// Only reachable from ahead of a stop, and there the lease has nothing left to
+		// spend: a peer may take the account from this moment, so the socket comes down
+		// instead. The hand-back behind it marks again, on the bound that has nobody
+		// waiting on it.
 		return
 	}
 	marking, done := context.WithTimeout(ctx, room)
@@ -496,21 +506,29 @@ func (m *Manager) givingUp(ctx context.Context, sid string) {
 	m.orphanMu.Unlock()
 }
 
-// markingFor is how long a mark that goes in front of a stop may take, and zero when
-// there is no room for one at all.
+// marking is how long a mark may take when nothing is waiting behind it.
+func (m *Manager) marking() time.Duration {
+	return min(releaseTimeout, m.leases.TTL()/ReleaseShare)
+}
+
+// markingAhead is the same for a mark that runs in front of a stop, and zero when the
+// lease has no room for one at all.
 //
 // Against what is left of the lease and not only against its configured length. The stop
 // behind the mark is what takes the socket down, and a lease near its end has less than a
 // share of a TTL to give: a bound written from the TTL alone would run past the moment a
 // peer may take the account, with this instance still talking to WhatsApp on it. Zero is
-// the honest answer for a lease that has nothing left, and the caller skips the mark
-// rather than shortening it into a round trip that cannot land.
-func (m *Manager) markingFor(sids ...string) time.Duration {
-	room := min(releaseTimeout, m.leases.TTL()/ReleaseShare)
-	for _, sid := range sids {
-		room = min(room, m.leases.Freshness(sid))
-	}
-	return room
+// the honest answer for a lease that has nothing left, and the caller stops the socket
+// instead of shortening the mark into a round trip that cannot land.
+//
+// Only ahead of a stop. A mark that runs after the socket is already down has nobody
+// waiting on it and is the only thing standing between a peer's wake and an account left
+// unowned, so it is bounded by the constant and never skipped: local freshness reaching
+// zero says this instance may not act on the lease, not that Redis has stopped naming it
+// -- a renewal whose answer was lost leaves exactly that, and Release forgets the lease
+// locally before its first attempt, so every retry would find zero.
+func (m *Manager) markingAhead(sid string) time.Duration {
+	return min(m.marking(), m.leases.Freshness(sid))
 }
 
 // releaseOrphans retries the hand-backs that did not reach Redis.
@@ -1071,7 +1089,7 @@ func (m *Manager) StopAll(ctx context.Context) {
 	// What a mark per session would have spent is then not spent at all: the stops below
 	// go straight through, and the hand-backs behind them carry whatever retry the batch
 	// still deserves.
-	m.givingUpAll(ctx, sids)
+	m.givingUpAllAhead(ctx, sids)
 	for _, sid := range sids {
 		m.stopSession(sid)
 	}
@@ -1083,8 +1101,9 @@ func (m *Manager) StopAll(ctx context.Context) {
 	}
 }
 
-// givingUpAll marks a whole batch of hand-backs, under one bound and one round trip.
-func (m *Manager) givingUpAll(ctx context.Context, sids []string) {
+// givingUpAllAhead marks a whole batch of hand-backs in front of their stops, under one
+// bound and one round trip.
+func (m *Manager) givingUpAllAhead(ctx context.Context, sids []string) {
 	unmarked := make([]string, 0, len(sids))
 	m.orphanMu.Lock()
 	for _, sid := range sids {
@@ -1098,20 +1117,34 @@ func (m *Manager) givingUpAll(ctx context.Context, sids []string) {
 		return
 	}
 
-	room := m.markingFor(unmarked...)
-	if room <= 0 {
+	// Only the leases with room to spend, and bounded by the tightest of those. One
+	// session whose lease has run out must not stand between every other socket and the
+	// mark that keeps its account from being left unowned; its own mark comes after its
+	// stop, where nothing is waiting.
+	room := m.marking()
+	ahead := make([]string, 0, len(unmarked))
+	for _, sid := range unmarked {
+		left := m.leases.Freshness(sid)
+		if left <= 0 {
+			continue
+		}
+		ahead = append(ahead, sid)
+		room = min(room, left)
+	}
+	if len(ahead) == 0 {
 		return
 	}
+
 	marking, done := context.WithTimeout(ctx, room)
-	err := m.leases.MarkManyHandingBack(marking, unmarked)
+	err := m.leases.MarkManyHandingBack(marking, ahead)
 	done()
 	if err != nil {
-		m.log.Warn().Err(err).Int("sessions", len(unmarked)).
+		m.log.Warn().Err(err).Int("sessions", len(ahead)).
 			Msg("could not mark hand-backs for peers to see; handing back anyway")
 		return
 	}
 	m.orphanMu.Lock()
-	for _, sid := range unmarked {
+	for _, sid := range ahead {
 		// Only where the session is still one this instance is giving up, for the reason
 		// givingUp gives: an adoption that won the account back must not be left carrying
 		// a mark that says it is on its way out.
@@ -1213,7 +1246,7 @@ func (m *Manager) forget(ctx context.Context, sid string, want *Session) bool {
 	// two reasons Release gives: the stop is what opens the window, and the session this
 	// is about is only settled once the lookup has agreed it is the one asked for. A mark
 	// written ahead of that names a session the instance turns out to be running.
-	m.givingUp(ctx, sid)
+	m.givingUpAhead(ctx, sid)
 	session.Stop()
 	return true
 }

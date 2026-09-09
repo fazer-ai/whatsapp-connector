@@ -2285,8 +2285,16 @@ type watching struct{ after func(redis.Cmder) }
 
 func (watching) DialHook(next redis.DialHook) redis.DialHook { return next }
 
-func (watching) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
-	return next
+// Pipelines too, because a shutdown marks its whole list in one batch: a hook that only
+// covers the commands sent on their own would miss exactly what it is watching for.
+func (h watching) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return func(ctx context.Context, cmds []redis.Cmder) error {
+		err := next(ctx, cmds)
+		for _, cmd := range cmds {
+			h.after(cmd)
+		}
+		return err
+	}
 }
 
 func (h watching) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
@@ -2644,5 +2652,140 @@ func TestAMarkIsSkippedWhenTheLeaseHasNothingLeftToSpend(t *testing.T) {
 	case <-engineSession.Events():
 	case <-time.After(400 * time.Millisecond):
 		t.Fatal("a session with no lease left to spend still held its socket open on a mark, past the moment a peer may take the account")
+	}
+}
+
+// A mark that runs after the socket is already down has nobody waiting on it, and it is
+// the only thing between a peer's wake and an account left unowned. Bounding it by what
+// is left of the lease locally reads the wrong clock: freshness at zero says this
+// instance may not act on the lease, not that Redis has stopped naming it -- and Release
+// forgets the lease locally before its first attempt, so every retry finds zero.
+func TestAHandBackRetriedAfterTheStopIsStillMarked(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+	keys := client.Keys()
+
+	manager := NewManager(&ManagerConfig{
+		Instance: "inst-a", Engine: fake.New(),
+		Leases:    cluster.NewLeases(client, "inst-a", cluster.Options{}),
+		Publisher: quietPublisher{}, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	ctx := context.Background()
+	t.Cleanup(func() { manager.StopAll(ctx) })
+
+	const sid = "9c2b7d1e-0000-4000-8000-0000000000c8"
+	if _, err := manager.Adopt(ctx, sid); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+
+	// A hand-back that reached Redis with neither half: no mark, and a lease left naming
+	// this instance. It also forgets the lease locally, which is what leaves every retry
+	// reading zero freshness for a lease Redis still holds.
+	over, giveUp := context.WithCancel(ctx)
+	giveUp()
+	manager.Release(over, sid)
+	if server.Exists(keys.HandBack(sid)) {
+		t.Fatal("a hand-back that reached nothing left a mark, so this proves nothing about the retry")
+	}
+	if !manager.handingBack(sid) {
+		t.Fatal("a hand-back that reached nothing was forgotten, so nothing would try it again")
+	}
+
+	// Watched rather than looked up afterwards: the retry marks and then releases, and a
+	// release that lands takes the mark with it. What has to have happened is the mark
+	// going out at all.
+	//
+	// The mark is the script that names the key and is not the hand-back: handing back
+	// needs only the instance's name, and marking also carries a lifetime. Nothing
+	// acquires during a retry, so nothing else answers to that.
+	var marked atomic.Bool
+	rdb.AddHook(watching{after: func(cmd redis.Cmder) {
+		if strings.HasPrefix(cmd.Name(), "eval") && names(cmd, keys.HandBack(sid)) &&
+			!handsBack(cmd, keys.HandBack(sid)) {
+			marked.Store(true)
+		}
+	}})
+
+	manager.releaseOrphans(ctx)
+	if !marked.Load() {
+		t.Fatal("a hand-back retried after the stop never marked, so a peer's wake for the account is acknowledged as somebody else's while the release is in flight")
+	}
+}
+
+// A shutdown marks its whole list in one round trip, and one lease that has run out must
+// not stand between every other socket and the mark its account needs: skipping the batch
+// leaves fresh sessions stopped under live leases with nothing a peer can read, for the
+// whole length of the loop that stops them.
+func TestOneStaleLeaseDoesNotSuppressTheMarksOfTheRest(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+	keys := client.Keys()
+
+	const ttl = 3 * time.Second
+	clock := &steppingClock{now: time.Now()}
+	held := &heldPublisher{
+		holds:   protocol.EventSessionState,
+		entered: make(chan protocol.EventType),
+		let:     make(chan struct{}),
+	}
+	engines := fake.New()
+	manager := NewManager(&ManagerConfig{
+		Instance: "inst-a", Engine: engines,
+		Leases: cluster.NewLeases(client, "inst-a", cluster.Options{
+			TTL: ttl, Margin: ttl / 10, Clock: clock,
+		}),
+		Publisher: held, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+
+	const stale = "9c2b7d1e-0000-4000-8000-0000000000c9"
+	const fresh = "9c2b7d1e-0000-4000-8000-0000000000ca"
+	ctx := context.Background()
+	if _, err := manager.Adopt(ctx, stale); err != nil {
+		t.Fatalf("Adopt %s: %v", stale, err)
+	}
+	// Everything the older lease had to give is spent, and the newer one is taken now.
+	clock.step(ttl)
+	if _, err := manager.Adopt(ctx, fresh); err != nil {
+		t.Fatalf("Adopt %s: %v", fresh, err)
+	}
+
+	// The fresh session's stop is parked in the pump, so nothing that happens after it
+	// can be what wrote the mark: only the batch in front of the stops can.
+	freshSession, running := engines.Session(fresh)
+	if !running {
+		t.Fatalf("the engine has no session for %s", fresh)
+	}
+	marked := make(chan struct{})
+	var announce sync.Once
+	rdb.AddHook(watching{after: func(cmd redis.Cmder) {
+		if names(cmd, keys.HandBack(fresh)) {
+			announce.Do(func() { close(marked) })
+		}
+	}})
+	freshSession.Emit(protocol.EventSessionState, map[string]any{"state": "connected"})
+	<-held.entered
+
+	stopped := make(chan struct{})
+	t.Cleanup(func() { <-stopped })
+	t.Cleanup(held.release)
+	go func() {
+		defer close(stopped)
+		manager.StopAll(ctx)
+	}()
+
+	select {
+	case <-marked:
+	case <-time.After(2 * time.Second):
+		t.Fatal("one lease that had run out kept every other session in the shutdown from being marked, so a peer's wake for a live account is acknowledged as somebody else's")
 	}
 }
