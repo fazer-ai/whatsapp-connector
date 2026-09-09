@@ -100,6 +100,14 @@ func (k Keys) LeaseEpoch(sid string) string { return k.prefix + "lease-epoch:" +
 // Handoff asks the current owner to release a session.
 func (k Keys) Handoff(sid string) string { return k.prefix + "handoff:" + sid }
 
+// HandBack names the instance that holds a session's lease and is giving it up.
+//
+// The lease says who owns an account; this says that whoever owns it has stopped running
+// it and is on the way to letting go. A wake landing in between finds the lease taken and
+// would otherwise be acknowledged as somebody else's -- and once the release lands, the
+// account is owned by nobody with the one wake that would have started it retired.
+func (k Keys) HandBack(sid string) string { return k.prefix + "handback:" + sid }
+
 // Cooldown keeps a session from being reclaimed the instant it was released.
 func (k Keys) Cooldown(sid string) string { return k.prefix + "cooldown:" + sid }
 

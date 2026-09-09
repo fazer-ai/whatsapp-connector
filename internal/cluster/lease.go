@@ -23,6 +23,15 @@ import (
 // does not hold it any more.
 var ErrNotOwner = errors.New("cluster: session is owned elsewhere")
 
+// ErrHandingBack is ErrNotOwner from a holder that has already said it is giving the
+// session up, so the answer is "not yet" rather than "somebody else is running it".
+//
+// It wraps ErrNotOwner because every caller that branches on ownership wants the same
+// thing here: the lease is not this instance's. Only the caller that has to decide
+// whether an account will still be running a moment from now -- the one holding a wake
+// it would otherwise retire -- looks past that.
+var ErrHandingBack = fmt.Errorf("%w: the owner is handing it back", ErrNotOwner)
+
 // DefaultTTL is how long a lease survives without a renewal. It has to outlast a
 // stop-the-world pause plus a renewal round trip, and be short enough that a session
 // on a killed instance moves within the DoD's 45 seconds.
@@ -47,13 +56,42 @@ return 0
 // releaseScript drops the lease only while this instance holds it, and arms the
 // cooldown in the same step so the instance that just let go does not immediately win
 // the race to take it back.
+//
+// The hand-back mark goes in the same step, for the same reason: it says an owner is on
+// its way to letting go, and the moment it has, the account is free and a peer asking
+// should be told so rather than told to wait for a hand-back that already happened.
 var releaseScript = redis.NewScript(`
 if redis.call("GET", KEYS[1]) ~= ARGV[1] then
   return 0
 end
 redis.call("DEL", KEYS[1])
+redis.call("DEL", KEYS[3])
 redis.call("SET", KEYS[2], ARGV[1], "PX", ARGV[2])
 return 1
+`)
+
+// acquireScript takes the lease if it is free, and otherwise says whether the instance
+// holding it has marked itself as handing it back.
+//
+// Both in one step, because the interesting case is exactly the race between them: a
+// peer reading the mark after its own acquisition failed can be beaten to it by the
+// release, find nothing, and conclude the account is somebody else's -- which is the bug
+// the mark exists to close, only narrower. Inside the script the two cannot interleave:
+// a release that lands first makes the SET succeed, and one that lands after leaves the
+// mark for this read.
+//
+// The mark is compared against the holder rather than merely being present. One left by
+// an instance that no longer holds the lease says nothing about the one that does, and a
+// wake left pending on the strength of it would bounce until the mark expired.
+var acquireScript = redis.NewScript(`
+if redis.call("SET", KEYS[1], ARGV[1], "NX", "PX", ARGV[2]) then
+  return 1
+end
+local holder = redis.call("GET", KEYS[1])
+if holder and redis.call("GET", KEYS[2]) == holder then
+  return 2
+end
+return 0
 `)
 
 // Lease is one session's ownership, as held by this instance.
@@ -148,11 +186,19 @@ func (l *Leases) Acquire(ctx context.Context, sid string) (Lease, error) {
 	// slow. Owned would then keep saying yes past the moment the key expires and a peer
 	// can take it. Dating it earlier only ever gives it up sooner than necessary.
 	sent := l.clock.Now()
-	won, err := l.client.SetNX(ctx, keys.Lease(sid), l.instance, l.ttl).Result()
+	won, err := acquireScript.Run(
+		ctx, l.client,
+		[]string{keys.Lease(sid), keys.HandBack(sid)},
+		l.instance, l.ttl.Milliseconds(),
+	).Int()
 	if err != nil {
 		return Lease{}, fmt.Errorf("cluster: acquire %s: %w", sid, err)
 	}
-	if !won {
+	switch won {
+	case 1:
+	case 2:
+		return Lease{}, ErrHandingBack
+	default:
 		return Lease{}, ErrNotOwner
 	}
 
@@ -308,13 +354,30 @@ func (l *Leases) epochOf(sid string) uint64 {
 	return l.held[sid].epoch
 }
 
-// Release gives up a lease and arms the cooldown. It reports whether this instance
-// was the one holding it.
+// MarkHandingBack says that this instance holds a lease it has stopped running and is
+// about to give up. Release clears it, and it expires on its own after one TTL, which
+// outlasts the lease it is about.
+//
+// It is a separate round trip on purpose: the mark is only worth anything before the
+// release, and there is no arrangement in which one call both writes it and acts on it
+// having been written.
+func (l *Leases) MarkHandingBack(ctx context.Context, sid string) error {
+	keys := l.client.Keys()
+	if err := l.client.Set(ctx, keys.HandBack(sid), l.instance, l.ttl).Err(); err != nil {
+		return fmt.Errorf("cluster: mark handing back %s: %w", sid, err)
+	}
+	return nil
+}
+
+// Release gives up a lease, arms the cooldown, and clears the hand-back mark. It reports
+// whether this instance was the one holding it.
 func (l *Leases) Release(ctx context.Context, sid string) (bool, error) {
 	l.forget(sid)
 	keys := l.client.Keys()
 	released, err := releaseScript.Run(
-		ctx, l.client, []string{keys.Lease(sid), keys.Cooldown(sid)}, l.instance, l.cooldown.Milliseconds(),
+		ctx, l.client,
+		[]string{keys.Lease(sid), keys.Cooldown(sid), keys.HandBack(sid)},
+		l.instance, l.cooldown.Milliseconds(),
 	).Int()
 	if err != nil {
 		return false, fmt.Errorf("cluster: release %s: %w", sid, err)

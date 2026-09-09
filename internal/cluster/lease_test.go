@@ -460,7 +460,7 @@ func TestARenewalIsDatedFromWhenItWasSent(t *testing.T) {
 }
 
 // The same for an acquisition, and with one more round trip inside it: Redis starts the
-// TTL when SETNX runs, and the epoch is read after that. A lease stamped once both have
+// TTL when the acquiring script runs, and the epoch is read after that. A lease stamped once both have
 // answered is dated later than Redis dates it, by however long the acquisition took --
 // which is exactly the moment Redis is slow enough for it to matter. It is the store's
 // question now as well as the socket's: every fenced write asks whether this lease is
@@ -475,12 +475,13 @@ func TestAnAcquisitionIsDatedFromWhenItWasSent(t *testing.T) {
 	leases := cluster.NewLeases(redisx.Wrap(rdb, "wa:", 8), "inst-a", cluster.Options{Clock: clock})
 
 	// The acquisition takes as long as the lease has to give, spent on the way there.
-	// `set`, not `setnx`: go-redis sends SetNX with an expiration as `SET ... NX`, and
-	// the hook names the command that goes on the wire.
+	// It is a script rather than a bare SET because taking the lease and reading whether
+	// its holder is handing it back have to be one step, so the hook names an eval; this
+	// test acquires once and renews never, so nothing else answers to that.
 	rdb.AddHook(advancingClock{
 		clock: clock,
 		by:    cluster.DefaultTTL - cluster.DefaultRenewMargin,
-		on:    func(cmd redis.Cmder) bool { return cmd.Name() == "set" },
+		on:    func(cmd redis.Cmder) bool { return strings.HasPrefix(cmd.Name(), "eval") },
 	})
 
 	if _, err := leases.Acquire(context.Background(), "s1"); err != nil {

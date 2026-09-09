@@ -1957,3 +1957,120 @@ func TestASessionThatTookACommandIsNotFreeToBeHandedOver(t *testing.T) {
 	}
 	session.doneWith()
 }
+
+// A hand-back is one instance's own business until it lands, and the wake that would put
+// the account back to work is read by every instance in the fleet. The one giving the
+// account up knows to leave that wake pending; a peer reading the same entry finds a
+// lease naming somebody else and, with nothing else to go on, acknowledges it as an
+// account already running. The release then lands, and the account is owned by nobody
+// with the one wake that would have started it retired.
+//
+// Two instances, because that is the whole of it: the state the first one acts on is
+// state the second one cannot see.
+func TestAPeerLeavesAWakeForAnAccountBeingHandedBackPending(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	giving := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	taking := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = giving.Close(); _ = taking.Close() })
+	givingClient := redisx.Wrap(giving, "wa:", 8)
+	takingClient := redisx.Wrap(taking, "wa:", 8)
+	keys := givingClient.Keys()
+
+	const sid = "9c2b7d1e-0000-4000-8000-0000000000c1"
+	// Dropped rather than answered with an error: the hand-back must not reach the
+	// server, or there would be no lease left to find and nothing to be misread.
+	var losing atomic.Bool
+	giving.AddHook(dropped{when: func(cmd redis.Cmder) bool {
+		return losing.Load() && names(cmd, keys.Cooldown(sid))
+	}})
+
+	holder := NewManager(&ManagerConfig{
+		Instance: "inst-a", Engine: fake.New(),
+		Leases:    cluster.NewLeases(givingClient, "inst-a", cluster.Options{}),
+		Publisher: quietPublisher{}, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	peer := NewManager(&ManagerConfig{
+		Instance: "inst-b", Engine: fake.New(),
+		Leases:    cluster.NewLeases(takingClient, "inst-b", cluster.Options{}),
+		Publisher: quietPublisher{}, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	ctx := context.Background()
+	t.Cleanup(func() { holder.StopAll(ctx); peer.StopAll(ctx) })
+
+	if _, err := holder.Adopt(ctx, sid); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+
+	losing.Store(true)
+	holder.Release(ctx, sid)
+	if !holder.handingBack(sid) {
+		t.Fatal("a hand-back that never reached Redis was forgotten, so nothing would try it again")
+	}
+	if !server.Exists(keys.HandBack(sid)) {
+		t.Fatal("a hand-back left no mark for peers to read, so a wake for the account reads to them as somebody else's")
+	}
+
+	var acked, left bool
+	peer.wake(ctx, &transport.Delivery{
+		Command: protocol.Command{V: protocol.Version, ID: "wake", Type: protocol.CommandSessionWake, SID: sid},
+		Ack:     func(context.Context) error { acked = true; return nil },
+		Release: func() { left = true },
+		Forfeit: func() {
+			t.Error("a peer gave up its place in the pending list over a hand-back it only had to wait out")
+		},
+	})
+	if acked {
+		t.Fatal("a peer retired the wake for an account being handed back; once the release lands nothing is left to start it")
+	}
+	if !left {
+		t.Fatal("the wake was neither acknowledged nor left pending, so nothing will read it again")
+	}
+
+	// And the mark goes when the lease does, or a wake for an account nobody owns is
+	// left pending for as long as the mark outlives the lease it was about.
+	losing.Store(false)
+	holder.releaseOrphans(ctx)
+	if server.Exists(keys.HandBack(sid)) {
+		t.Fatal("a hand-back landed and left its mark behind, so wakes for a free account go on being left pending")
+	}
+	if _, err := peer.Adopt(ctx, sid); err != nil {
+		t.Fatalf("adopting an account whose hand-back landed: %v", err)
+	}
+}
+
+// dropped answers a command without sending it, which is what a round trip that never
+// reaches Redis looks like from the instance that asked for it. Unlike a stalled hop it
+// picks one command out of the traffic, so the rest of what a test does still lands.
+type dropped struct{ when func(redis.Cmder) bool }
+
+func (dropped) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (dropped) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+
+func (h dropped) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if !h.when(cmd) {
+			return next(ctx, cmd)
+		}
+		err := errors.New("the answer never came back")
+		cmd.SetErr(err)
+		return err
+	}
+}
+
+// names reports whether a command carries a key, which is how a test picks one of the
+// lease scripts out: only handing back reaches for the cooldown.
+func names(cmd redis.Cmder, key string) bool {
+	for _, arg := range cmd.Args() {
+		if text, ok := arg.(string); ok && text == key {
+			return true
+		}
+	}
+	return false
+}

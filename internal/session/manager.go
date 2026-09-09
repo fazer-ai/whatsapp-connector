@@ -399,13 +399,25 @@ func (m *Manager) Release(ctx context.Context, sid string) {
 // unowned with nothing scheduled to pick it up.
 func (m *Manager) abandon(ctx context.Context, sid string) {
 	// Marked before the round trip and not after it fails. A wake that lands while this
-	// is in flight finds the lease taken and this instance running nothing, and
-	// `handingBack` is the only thing that stops it from being acknowledged as somebody
-	// else's: the release then lands, and the account is left owned by nobody with the
-	// one wake that would have started it already retired.
+	// is in flight finds the lease taken and this instance running nothing, and the mark
+	// is the only thing that stops it from being acknowledged as somebody else's: the
+	// release then lands, and the account is left owned by nobody with the one wake that
+	// would have started it already retired.
+	//
+	// Twice, because the two readers are in different places. The local set answers for
+	// wakes this instance reads, without a round trip and even when Redis is the thing
+	// that is away; the key in Redis answers for the peers, which is most of them -- the
+	// wake goes to every instance and any one of them may be the one to take it.
 	m.orphanMu.Lock()
 	m.orphans[sid] = struct{}{}
 	m.orphanMu.Unlock()
+	if err := m.leases.MarkHandingBack(ctx, sid); err != nil {
+		// Not fatal to the hand-back, which is the part that matters and is attempted
+		// anyway: an unmarked hand-back is the behaviour this instance had before the
+		// mark existed, and a peer's wake can still be lost to it.
+		m.log.Warn().Err(err).Str("sid", sid).
+			Msg("could not mark a hand-back for peers to see; handing back anyway")
+	}
 	if _, err := m.leases.Release(ctx, sid); err != nil {
 		m.log.Warn().Err(err).Str("sid", sid).Msg("could not hand a lease back; will try again")
 		return
@@ -704,13 +716,14 @@ func (m *Manager) wake(ctx context.Context, delivery *transport.Delivery) {
 		release(delivery)
 		return
 	case errors.Is(err, cluster.ErrNotOwner):
-		if m.handingBack(sid) {
-			// Owned by this instance, which is running nothing and is still trying to
-			// give the lease up. Acknowledging here on the grounds that somebody else has
-			// it retires the only thing that would have started the session, and once the
-			// stale key expires there is nothing left to start it at all.
+		if errors.Is(err, cluster.ErrHandingBack) || m.handingBack(sid) {
+			// Owned by an instance that is running nothing and is still trying to give
+			// the lease up, whether that is this one or a peer. Acknowledging here on the
+			// grounds that somebody has it retires the only thing that would have started
+			// the session, and once the stale key expires there is nothing left to start
+			// it at all.
 			m.log.Warn().Str("sid", sid).
-				Msg("a wake found a lease this instance is still handing back; leaving it pending")
+				Msg("a wake found a lease that is still being handed back; leaving it pending")
 			// A wake rides the control stream, not a session's, so there is no per-session
 			// turn to keep and nothing to mark.
 			release(delivery)
