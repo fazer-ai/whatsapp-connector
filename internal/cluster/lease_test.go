@@ -216,30 +216,6 @@ func TestHeldListsWhatWasAcquired(t *testing.T) {
 	}
 }
 
-func TestReleaseArmsTheCooldown(t *testing.T) {
-	t.Parallel()
-
-	server, a, _ := newFleet(t, newClock())
-	ctx := context.Background()
-
-	if _, err := a.Acquire(ctx, "s1"); err != nil {
-		t.Fatalf("a.Acquire: %v", err)
-	}
-	released, err := a.Release(ctx, "s1")
-	if err != nil {
-		t.Fatalf("a.Release: %v", err)
-	}
-	if !released {
-		t.Fatal("a.Release reported it held nothing")
-	}
-	if !server.Exists("wa:cooldown:s1") {
-		t.Fatal("release left no cooldown, so the same instance can win the reclaim immediately")
-	}
-	if server.Exists("wa:lease:s1") {
-		t.Fatal("release left the lease in place")
-	}
-}
-
 // Owned answers from local state on every write, and the renew loop rewrites that state
 // on its own goroutine. The two have to be safe together, and an entry that escaped the
 // lock as a pointer was not: the reader saw a renewal timestamp mid-write.

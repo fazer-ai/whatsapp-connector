@@ -53,20 +53,16 @@ end
 return 0
 `)
 
-// releaseScript drops the lease only while this instance holds it, and arms the
-// cooldown in the same step so the instance that just let go does not immediately win
-// the race to take it back.
-//
-// The hand-back mark goes in the same step, for the same reason: it says an owner is on
-// its way to letting go, and the moment it has, the account is free and a peer asking
-// should be told so rather than told to wait for a hand-back that already happened.
+// releaseScript drops the lease only while this instance holds it, and takes the
+// hand-back mark with it in the same step: the mark says an owner is on its way to
+// letting go, and the moment it has, the account is free and a peer asking should be
+// told so rather than told to wait for a hand-back that already happened.
 var releaseScript = redis.NewScript(`
 if redis.call("GET", KEYS[1]) ~= ARGV[1] then
   return 0
 end
 redis.call("DEL", KEYS[1])
-redis.call("DEL", KEYS[3])
-redis.call("SET", KEYS[2], ARGV[1], "PX", ARGV[2])
+redis.call("DEL", KEYS[2])
 return 1
 `)
 
@@ -114,7 +110,6 @@ type Leases struct {
 	instance string
 	ttl      time.Duration
 	margin   time.Duration
-	cooldown time.Duration
 
 	mu sync.RWMutex
 	// held by value, not by pointer: Owned answers from local state on every write, and
@@ -141,10 +136,9 @@ type held struct {
 
 // Options configures Leases. The zero value asks for the defaults.
 type Options struct {
-	TTL      time.Duration
-	Margin   time.Duration
-	Cooldown time.Duration
-	Clock    Clock
+	TTL    time.Duration
+	Margin time.Duration
+	Clock  Clock
 }
 
 // NewLeases returns the lease holder for one instance id.
@@ -155,9 +149,6 @@ func NewLeases(client *redisx.Client, instance string, opts Options) *Leases {
 	if opts.Margin <= 0 {
 		opts.Margin = DefaultRenewMargin
 	}
-	if opts.Cooldown <= 0 {
-		opts.Cooldown = opts.TTL / 3
-	}
 	if opts.Clock == nil {
 		opts.Clock = systemClock{}
 	}
@@ -166,7 +157,6 @@ func NewLeases(client *redisx.Client, instance string, opts Options) *Leases {
 		instance: instance,
 		ttl:      opts.TTL,
 		margin:   opts.Margin,
-		cooldown: opts.Cooldown,
 		held:     make(map[string]held),
 		clock:    opts.Clock,
 	}
@@ -445,20 +435,36 @@ func (l *Leases) MarkHandingBack(ctx context.Context, sid string) error {
 	return nil
 }
 
-// Release gives up a lease, arms the cooldown, and clears the hand-back mark. It reports
-// whether this instance was the one holding it.
+// Release gives up a lease and clears the hand-back mark. It reports whether this
+// instance was the one holding it.
 func (l *Leases) Release(ctx context.Context, sid string) (bool, error) {
 	l.forget(sid)
 	keys := l.client.Keys()
 	released, err := releaseScript.Run(
-		ctx, l.client,
-		[]string{keys.Lease(sid), keys.Cooldown(sid), keys.HandBack(sid)},
-		l.instance, l.cooldown.Milliseconds(),
+		ctx, l.client, []string{keys.Lease(sid), keys.HandBack(sid)}, l.instance,
 	).Int()
 	if err != nil {
 		return false, fmt.Errorf("cluster: release %s: %w", sid, err)
 	}
 	return released == 1, nil
+}
+
+// Freshness is how much of a lease this instance may still act on, which is the same
+// clock Owned answers from: the lifetime left before the margin, and zero once that is
+// gone or the lease was never held.
+//
+// It exists for the work that has to happen before a socket comes down. A bound written
+// against the configured TTL is the right size for a lease just renewed and the wrong
+// one for a lease near its end: the work would run past the moment a peer can take the
+// account, with this instance still talking to WhatsApp on it.
+func (l *Leases) Freshness(sid string) time.Duration {
+	l.mu.RLock()
+	entry, ok := l.held[sid]
+	l.mu.RUnlock()
+	if !ok {
+		return 0
+	}
+	return max(l.ttl-l.margin-l.clock.Now().Sub(entry.renewedAt), 0)
 }
 
 // Owned answers whether this instance may still act on a session, from local state

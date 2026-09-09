@@ -228,12 +228,12 @@ func (m *Manager) Adopt(ctx context.Context, sid string) (*Session, error) {
 			// room for a fresh session. Answering with it acknowledges the wake, and the
 			// commands behind it are then refused by a door this instance is about to
 			// stop being the owner of. Handing it back and taking it again in one step is
-			// worse: releasing arms a cooldown so the instance that let go does not
-			// immediately win the account back, and for a build WhatsApp will not talk to
-			// that is the whole point -- the retry has to be free to land on a peer whose
-			// image can succeed, and it cannot if the instance that cannot has already
-			// taken it. The sweep hands the account back on the next tick, and the wake is
-			// then a wake for an account nobody owns.
+			// worse: nothing keeps the instance that just let go from winning the account
+			// straight back, and for a build WhatsApp will not talk to that is the whole
+			// point -- the retry has to be free to land on a peer whose image can succeed,
+			// and it cannot if the instance that cannot has already taken it. The sweep
+			// hands the account back on the next tick, and the wake is then a wake for an
+			// account nobody owns.
 			m.log.Info().Str("sid", sid).
 				Msg("a wake found an account this instance is finishing with; leaving it pending")
 			return nil, errLeaving
@@ -468,7 +468,14 @@ func (m *Manager) givingUp(ctx context.Context, sid string) {
 	//
 	// Derived from the caller's context rather than detached from it, so a shutdown with
 	// less than this left still gets the socket down inside its own grace.
-	marking, done := context.WithTimeout(ctx, m.markingFor())
+	room := m.markingFor(sid)
+	if room <= 0 {
+		// The lease has nothing left to spend. A peer may take the account from this
+		// moment, so the socket has to come down now; a mark written after that would be
+		// about a lease this instance no longer has, and the fence would refuse it.
+		return
+	}
+	marking, done := context.WithTimeout(ctx, room)
 	err := m.leases.MarkHandingBack(marking, sid)
 	done()
 	if err != nil {
@@ -489,9 +496,21 @@ func (m *Manager) givingUp(ctx context.Context, sid string) {
 	m.orphanMu.Unlock()
 }
 
-// markingFor is how long a mark that goes in front of a stop may take.
-func (m *Manager) markingFor() time.Duration {
-	return min(releaseTimeout, m.leases.TTL()/ReleaseShare)
+// markingFor is how long a mark that goes in front of a stop may take, and zero when
+// there is no room for one at all.
+//
+// Against what is left of the lease and not only against its configured length. The stop
+// behind the mark is what takes the socket down, and a lease near its end has less than a
+// share of a TTL to give: a bound written from the TTL alone would run past the moment a
+// peer may take the account, with this instance still talking to WhatsApp on it. Zero is
+// the honest answer for a lease that has nothing left, and the caller skips the mark
+// rather than shortening it into a round trip that cannot land.
+func (m *Manager) markingFor(sids ...string) time.Duration {
+	room := min(releaseTimeout, m.leases.TTL()/ReleaseShare)
+	for _, sid := range sids {
+		room = min(room, m.leases.Freshness(sid))
+	}
+	return room
 }
 
 // releaseOrphans retries the hand-backs that did not reach Redis.
@@ -1079,7 +1098,11 @@ func (m *Manager) givingUpAll(ctx context.Context, sids []string) {
 		return
 	}
 
-	marking, done := context.WithTimeout(ctx, m.markingFor())
+	room := m.markingFor(unmarked...)
+	if room <= 0 {
+		return
+	}
+	marking, done := context.WithTimeout(ctx, room)
 	err := m.leases.MarkManyHandingBack(marking, unmarked)
 	done()
 	if err != nil {
@@ -1146,7 +1169,7 @@ func (m *Manager) SweepRetired(ctx context.Context, by time.Time) {
 // two lines above a wake can release this very session, win the lease again and put a
 // fresh one in its place -- Adopt does exactly that for a retired session. Released by
 // sid alone, this would then stop the session that just started and delete the lease it
-// is running under, and arm the cooldown that keeps this instance from taking it back.
+// is running under.
 //
 // The pointer answers for a replacement that has already landed; `handing` answers for
 // one that is still being built, because the release that overtakes an adoption deletes

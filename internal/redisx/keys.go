@@ -108,9 +108,6 @@ func (k Keys) Handoff(sid string) string { return k.prefix + "handoff:" + sid }
 // account is owned by nobody with the one wake that would have started it retired.
 func (k Keys) HandBack(sid string) string { return k.prefix + "handback:" + sid }
 
-// Cooldown keeps a session from being reclaimed the instant it was released.
-func (k Keys) Cooldown(sid string) string { return k.prefix + "cooldown:" + sid }
-
 // Quarantine holds a session that keeps failing to connect.
 func (k Keys) Quarantine(sid string) string { return k.prefix + "quarantine:" + sid }
 
