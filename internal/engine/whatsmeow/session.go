@@ -3903,6 +3903,10 @@ func (s *Session) handle(rawEvent any) bool {
 		if s.isSelf(event.JID) {
 			s.reverify(event.NewBusinessName)
 		}
+	case *waEvents.JoinedGroup:
+		s.joinedAGroup(event)
+	case *waEvents.GroupInfo:
+		s.groupChanged(event)
 	case *waEvents.PairError:
 		// Whatever the QR channel does with this, the client is on a device whatsmeow
 		// may have half-written: an id with no credentials, or one it marked deleted.

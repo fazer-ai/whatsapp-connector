@@ -14,13 +14,15 @@ import (
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 )
 
-// Fourteen event types in the contract have nothing in this build that produces them,
+// Eleven event types in the contract have nothing in this build that produces them,
 // and types.go marks each one. A comment is all that can be written there, and a comment
 // is what goes stale: the day somebody wires up `group.updated`, nothing makes them come
 // back here and say so, and the catalog then tells a client the opposite of the truth
 // about what it can expect to receive. So the marking is checked rather than trusted --
 // the test reads the packages that would do the producing and asks which types they
-// name.
+// name. Which is what happened: `group.joined`, `group.updated` and `group.activity`
+// left this list because the session's event handler started publishing them, and the
+// test is what said so.
 //
 // The value of getting this right is the same one the reserved error codes in errors.go
 // have: a client that matches on an event it will never receive writes a branch that
@@ -30,10 +32,7 @@ var eventTypesWithNoProducer = []protocol.EventType{
 	protocol.EventSessionOfflineSyncCompleted,
 	protocol.EventContactPictureChanged,
 	protocol.EventContactIdentityChanged,
-	protocol.EventGroupJoined,
-	protocol.EventGroupUpdated,
 	protocol.EventGroupPictureChanged,
-	protocol.EventGroupActivity,
 	protocol.EventAccountReachoutTimelock,
 	protocol.EventAccountNewChatCap,
 	protocol.EventCallOffer,
