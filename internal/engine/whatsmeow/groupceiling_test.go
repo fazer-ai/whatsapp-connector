@@ -859,3 +859,42 @@ func TestARedeliveryWhoseRevisionMovedOnStillWritesItsText(t *testing.T) {
 		t.Errorf("the write named %q, and naming anything else is a 409 for a command that can succeed", named)
 	}
 }
+
+// The reads have one budget between them, and the write that follows the second one has no
+// ceiling of its own. So a second look that answers only after the budget is spent must not
+// be followed by a write: the command has already held the session's only goroutine for its
+// whole ceiling, and an unbounded write behind that is the wait the ceiling took away,
+// handed back.
+func TestNoWriteFollowsASecondLookThatOutlastedTheBudget(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setConnected(true)
+	ran, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	reads := 0
+	session.groupInfo = func(context.Context, *wm.Client, waTypes.JID) (*waTypes.GroupInfo, error) {
+		reads++
+		if reads == 1 {
+			return &waTypes.GroupInfo{GroupTopic: waTypes.GroupTopic{TopicID: "OLD"}}, nil
+		}
+		// It answers, and the budget is gone by the time it does.
+		cancel()
+		return &waTypes.GroupInfo{GroupTopic: waTypes.GroupTopic{TopicID: "THEIRS"}}, nil
+	}
+	writes := 0
+	session.setTopic = func(context.Context, *wm.Client, waTypes.JID, string, string, string) error {
+		writes++
+		return &wm.IQError{Code: 409}
+	}
+
+	_, err := session.Execute(ran, &protocol.Command{
+		Type:    protocol.CommandGroupDescriptionSet,
+		Payload: []byte(`{"group":{"kind":"group","id":"` + theGroup + `"},"description":"x"}`),
+	})
+	assertCode(t, err, protocol.ErrorTimeout)
+	if writes != 1 {
+		t.Errorf("the description was written %d times, and the second went out with the budget already spent", writes)
+	}
+}

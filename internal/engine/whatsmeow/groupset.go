@@ -423,6 +423,13 @@ func (s *Session) writeTheDescription(
 	if fresh.TopicID == info.TopicID {
 		return err //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
 	}
+	if err := budget.Err(); err != nil {
+		// The second look answered, but only after the reads had spent everything they
+		// were given. Going on would put an unbounded write behind a command that has
+		// already held the session's only goroutine for its whole ceiling, which is the
+		// same reason the first look is checked before the first write.
+		return err //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
+	}
 	// Once, and under the same revision. Once because a caller waiting on a description is
 	// better served by an answer than by this session's only goroutine racing whoever else
 	// is editing; the same revision because a redelivery of this command has to write the
