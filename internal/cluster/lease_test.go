@@ -467,3 +467,41 @@ func TestAnAcquisitionIsDatedFromWhenItWasSent(t *testing.T) {
 		t.Fatal("a lease acquired by a round trip that outlasted its fresh lifetime still counts as owned")
 	}
 }
+
+// And dated from the request that actually started the TTL, which on the first
+// acquisition after a restart or a SCRIPT FLUSH is not the first one sent. The digest is
+// not loaded, the EVALSHA comes back NOSCRIPT having started nothing, and Redis begins
+// the lifetime at the EVAL behind it. A lease dated from before both is short by a whole
+// failed round trip, and the local answer to "do I still own this" -- which every fenced
+// write asks -- expires that much before the key does.
+func TestAnAcquisitionIsDatedFromTheRequestThatStartedTheLease(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	clock := newClock()
+	leases := cluster.NewLeases(redisx.Wrap(rdb, "wa:", 8), "inst-a", cluster.Options{Clock: clock})
+	ctx := context.Background()
+
+	// Nothing is loaded, so the acquisition below pays for the digest that is not there.
+	if err := rdb.ScriptFlush(ctx).Err(); err != nil {
+		t.Fatalf("ScriptFlush: %v", err)
+	}
+
+	// Half of what the lease has to give, per round trip. One of them is what Redis
+	// starts the TTL after, and the lease survives it; two is what dating from before
+	// the failed one charges, and that is the whole lifetime.
+	rdb.AddHook(advancingClock{
+		clock: clock,
+		by:    (cluster.DefaultTTL - cluster.DefaultRenewMargin) / 2,
+		on:    func(cmd redis.Cmder) bool { return strings.HasPrefix(cmd.Name(), "eval") },
+	})
+
+	if _, err := leases.Acquire(ctx, "s1"); err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	if _, owned := leases.Owned("s1"); !owned {
+		t.Fatal("a lease was dated from an EVALSHA that came back unloaded and started no TTL, so it reads as expired a whole failed round trip before the key does")
+	}
+}

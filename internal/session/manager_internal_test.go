@@ -237,10 +237,10 @@ func waitFor(t *testing.T, done func() bool, complaint string) {
 // A client retrying between the terminal event and the next heartbeat must not be served
 // by the session that is on its way out: a connect answered there would put the account
 // back up on an instance that hands it away moments later. Nor is the account taken back
-// in the same step, which is what handing it back here and acquiring again would be: the
-// release arms a cooldown so that the instance letting go does not immediately win the
-// account, and for a build WhatsApp will not talk to that is the whole point -- the retry
-// has to be free to land on a peer whose image can succeed.
+// in the same step, which is what handing it back here and acquiring again would be:
+// nothing keeps the instance that just let go from winning the account straight back, and
+// for a build WhatsApp will not talk to that is the whole point -- the retry has to be
+// free to land on a peer whose image can succeed.
 func TestAnAdoptionDoesNotHandBackASessionOnItsWayOut(t *testing.T) {
 	t.Parallel()
 
@@ -2478,10 +2478,10 @@ func (c *steppingClock) step(d time.Duration) {
 }
 
 // keysOf reports how many keys a script command carries, counted where go-redis puts it:
-// after the command and the script, ahead of the keys themselves. It is what tells the
-// lease scripts apart regardless of which session they are about -- renewing takes the
-// lease alone, acquiring takes the lease and the mark, handing back takes those and the
-// cooldown.
+// after the command and the script, ahead of the keys themselves. It separates a renewal
+// from everything else regardless of which session the script is about: renewing takes
+// the lease alone, and acquiring, marking and handing back all take the lease and the
+// mark.
 func keysOf(cmd redis.Cmder) int {
 	args := cmd.Args()
 	if len(args) < 3 {

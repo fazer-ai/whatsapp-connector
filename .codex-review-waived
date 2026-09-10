@@ -534,12 +534,13 @@ internal/session/manager.go: Mark each expiring hand-back before another stop ca
 # running at all; a lease is only in the other group if it was renewed or acquired
 # recently, which means it was. For the harm named here the releases in front also have to
 # block, so Redis has to be away again by then. Measured on a running fleet, reading every
-# PTTL in one EVAL rather than one call per key, an instance's leases carry the same expiry
-# to the millisecond: across forty samples of thirty-three leases and forty of twenty-seven,
-# the spread was 0 ms in thirty of them and 1 ms in the rest, never more. They are renewed
-# in one pipelined batch under one reading of the clock; a session adopted between ticks is stamped when it is
-# acquired, so it is newer than the rest and never older, and one whose renewal fails on
-# its own is stopped by the sweep rather than kept.
+# PTTL in one EVAL rather than one call per key, an instance's leases carry the same
+# expiry to the millisecond: across forty samples of thirty-three leases and forty of
+# twenty-seven, the spread was 0 ms in thirty of them and 1 ms in the rest, never more.
+# They are renewed in one pipelined batch under one reading of the clock; a session
+# adopted between ticks is stamped when it is acquired, so it is newer than the rest and
+# never older, and one whose renewal fails on its own is stopped by the sweep rather than
+# kept.
 #
 # What is left is a sequence -- frozen for a TTL, resumed, an account adopted, Redis away
 # again, SIGTERM -- against a fix that would put the releases behind every socket, which

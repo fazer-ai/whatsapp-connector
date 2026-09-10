@@ -183,12 +183,18 @@ func (l *Leases) Acquire(ctx context.Context, sid string) (Lease, error) {
 	// it -- by however long an acquisition takes, which is exactly the moment Redis is
 	// slow. Owned would then keep saying yes past the moment the key expires and a peer
 	// can take it. Dating it earlier only ever gives it up sooner than necessary.
+	on := []string{keys.Lease(sid), keys.HandBack(sid)}
 	sent := l.clock.Now()
-	won, err := acquireScript.Run(
-		ctx, l.client,
-		[]string{keys.Lease(sid), keys.HandBack(sid)},
-		l.instance, l.ttl.Milliseconds(),
-	).Int()
+	won, err := acquireScript.EvalSha(ctx, l.client, on, l.instance, l.ttl.Milliseconds()).Int()
+	if redis.HasErrorPrefix(err, "NOSCRIPT") {
+		// Sent by hand rather than left to Run, which would send it too but date the
+		// lease from before the request that came back unloaded. The digest is not
+		// there on the first acquisition after a restart or a SCRIPT FLUSH, and an
+		// EVALSHA answered NOSCRIPT started no TTL: Redis starts it here. Dated from
+		// here for the same reason RenewMany re-dates the batch it has to resend.
+		sent = l.clock.Now()
+		won, err = acquireScript.Eval(ctx, l.client, on, l.instance, l.ttl.Milliseconds()).Int()
+	}
 	if err != nil {
 		return Lease{}, fmt.Errorf("cluster: acquire %s: %w", sid, err)
 	}

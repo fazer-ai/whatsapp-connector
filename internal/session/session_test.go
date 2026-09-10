@@ -1345,9 +1345,9 @@ func mentions(cmd redis.Cmder, key string) bool {
 // keysOf reports how many keys a script command carries, counted where go-redis puts it:
 // after the command and the script, ahead of the keys themselves.
 //
-// It is what tells the lease scripts apart regardless of which session they are about.
-// Renewing takes the lease alone, acquiring takes the lease and the hand-back mark, and
-// handing back takes both of those and the cooldown.
+// It separates a renewal from everything else, regardless of which session the script is
+// about: renewing takes the lease alone, and acquiring, marking and handing back all take
+// the lease and the hand-back mark. Telling those three apart is handsBack's job.
 func keysOf(cmd redis.Cmder) int {
 	args := cmd.Args()
 	if len(args) < 3 {
