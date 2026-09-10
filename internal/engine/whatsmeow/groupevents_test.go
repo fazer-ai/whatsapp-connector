@@ -21,6 +21,10 @@ func groupSession(t *testing.T) *Session {
 
 	session, _ := newTestSession(t, "5511999990001")
 	session.setConnected(true)
+	// The subscription the client asks for on `session.connect`. Every case below is
+	// about what a session that wanted groups publishes; the one below that is about
+	// what a session that did not want them must not.
+	session.setGroups(true)
 	return session
 }
 
@@ -84,6 +88,39 @@ func changesIn(t *testing.T, payload map[string]any) map[string]any {
 		t.Fatalf("the payload carries no changes object: %v", payload)
 	}
 	return changes
+}
+
+// `session.connect` decides whether group traffic reaches a client at all, and these
+// three events are group traffic like the messages, the receipts and the typing
+// indicators that already select on it. A client that asked for direct chats only and is
+// handed a `group.joined` opens a conversation for a chat no message will ever arrive
+// in, because the very next group message is acknowledged and dropped by the path beside
+// this one.
+func TestAGroupIsNotPublishedToASessionThatDidNotAskForGroups(t *testing.T) {
+	t.Parallel()
+
+	for name, event := range map[string]any{
+		"being added to one": &waEvents.JoinedGroup{
+			GroupInfo: waTypes.GroupInfo{JID: groupJID(), GroupName: waTypes.GroupName{Name: "Equipe fazer.ai"}},
+		},
+		"one changing": &waEvents.GroupInfo{
+			JID: groupJID(), Name: &waTypes.GroupName{Name: "Equipe fazer.ai"},
+		},
+		"one changing in a way the contract cannot carry": &waEvents.GroupInfo{
+			JID: groupJID(), Ephemeral: &waTypes.GroupEphemeral{IsEphemeral: true},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			session, _ := newTestSession(t, "5511999990001")
+			session.setConnected(true)
+			// Deliberately not `setGroups`: false is the default a client gets by not
+			// asking, which is the case this is about.
+
+			session.handle(event)
+			nothingPublished(t, session)
+		})
+	}
 }
 
 // The whole point of the issue: a group changing produces an event at all. whatsmeow

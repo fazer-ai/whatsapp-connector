@@ -62,6 +62,13 @@ type joinedGroup struct {
 // `group.info` costs, which is a mapping read per participant this notification did not
 // name both namespaces for -- bounded by one group, and paid once.
 func (s *Session) joinedAGroup(event *waEvents.JoinedGroup) {
+	if !s.wantsGroups() {
+		// The client asked for direct chats only, and this is group traffic like any
+		// other: `session.connect` decides whether groups reach it at all, and a session
+		// that publishes a group it was not asked about has the client opening a
+		// conversation for a chat it will never receive a message in.
+		return
+	}
 	ctx, cancel := s.looking()
 	defer cancel()
 
@@ -89,6 +96,9 @@ func (s *Session) joinedAGroup(event *waEvents.JoinedGroup) {
 // -- an ephemeral timer changed in the same breath as a rename -- is a gap in the
 // contract rather than something this handler can carry.
 func (s *Session) groupChanged(event *waEvents.GroupInfo) {
+	if !s.wantsGroups() {
+		return
+	}
 	ctx, cancel := s.looking()
 	defer cancel()
 
