@@ -1970,29 +1970,38 @@ const groupIQWait = 15 * time.Second
 
 // boundedGroupCommand reports whether the ceiling is safe for this command.
 //
-// It is safe wherever giving up costs an answer and nothing else: asked again, the command
-// leaves the group in the state the first attempt was for. Three do not qualify.
-// `group.create` makes another group every time it runs, `group.invite.get` rotates the
-// link when it is asked to revoke, which invalidates the one people are already holding,
-// and `group.photo.set` has WhatsApp assign a new picture id and announce another change,
-// with no id this side can hand it to make the second write the first one over again --
-// which is what the description does instead of being left out.
-// WhatsApp does not undo either because this side stopped waiting, and the ledger records
-// only successes, so one of those answered `timeout` here and retried under the same
-// idempotency key is invariant 5 broken by the fix. They keep whatsmeow's own bound, which
-// is longer and is the price of not repeating what cannot be taken back.
+// Giving up on a wait does not undo what WhatsApp did with the request, and `carryOut`
+// writes the ledger only on success, so a command answered `timeout` here and redelivered
+// under the same idempotency key runs a second time. That is fine where running twice
+// changes nothing and costs nothing, and it is not fine anywhere else -- invariant 5, and
+// the thing a ceiling would otherwise be trading a stalled queue for. So the ceiling is
+// allowed in exactly two places:
 //
-// The invite is asked rather than assumed, through the same reading `ChangesSomething`
-// already does: a lookup that does not revoke is a read, and a read has nothing to
-// duplicate.
+//   - **Reads.** `group.info`, `group.list`, `group.join_requests.list`, and a
+//     `group.invite.get` that is not revoking. Asked again they answer again; the only
+//     thing a truncated wait costs is the answer, which is what the caller is told.
+//   - **A write that names itself on the wire.** Only `group.description.set` does:
+//     whatsmeow lets a topic carry the revision id this connector derives, so a redelivery
+//     writes the same revision rather than a second one.
+//
+// Everything else keeps whatsmeow's own bound, which is longer, and the account can still
+// be held by one of them. That is not an oversight -- it is what is left after refusing to
+// truncate a mutation nothing can reconcile, and the general answer to it is #165 rather
+// than a shorter number here. `group.create` makes another group, `group.photo.set` has a
+// new picture id assigned and another change announced, a revoking `group.invite.get`
+// rotates the link again; `group.leave`, `group.participants.update` and
+// `group.join_requests.update` answer a retry with "not in the group" or "no such request"
+// for work the first attempt did; and `group.name.set` and `group.settings.set` have no id
+// to write twice under, so a retry publishes a second `group.updated` for one command.
 func boundedGroupCommand(command *protocol.Command) bool {
 	switch command.Type {
-	case protocol.CommandGroupCreate, protocol.CommandGroupPhotoSet:
-		return false
+	case protocol.CommandGroupInfo, protocol.CommandGroupList,
+		protocol.CommandGroupJoinRequestsList, protocol.CommandGroupDescriptionSet:
+		return true
 	case protocol.CommandGroupInviteGet:
 		return !command.ChangesSomething()
 	}
-	return true
+	return false
 }
 
 // aboutAGroup carries out the group commands, under a ceiling none of the others need.

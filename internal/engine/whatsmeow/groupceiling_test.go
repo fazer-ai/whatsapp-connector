@@ -22,12 +22,9 @@ func TestAGroupCommandDoesNotWaitOutAnInfoQuery(t *testing.T) {
 	t.Parallel()
 
 	for name, command := range map[string]*protocol.Command{
-		"a name change":      {Type: protocol.CommandGroupNameSet, Payload: []byte(`{"group":{"kind":"group","id":"` + theGroup + `"},"subject":"x"}`)},
-		"a description":      {Type: protocol.CommandGroupDescriptionSet, Payload: []byte(`{"group":{"kind":"group","id":"` + theGroup + `"},"description":"x"}`)},
-		"a settings change":  {Type: protocol.CommandGroupSettingsSet, Payload: []byte(`{"group":{"kind":"group","id":"` + theGroup + `"},"setting":"announce","value":true}`)},
-		"asking about one":   {Type: protocol.CommandGroupInfo, Payload: []byte(`{"group":{"kind":"group","id":"` + theGroup + `"}}`)},
-		"leaving one":        {Type: protocol.CommandGroupLeave, Payload: []byte(`{"group":{"kind":"group","id":"` + theGroup + `"}}`)},
-		"changing who is in": {Type: protocol.CommandGroupParticipantsUpdate, Payload: []byte(`{"group":{"kind":"group","id":"` + theGroup + `"},"action":"add","participants":[{"kind":"phone","id":"5511999990002"}]}`)},
+		"a description":    {Type: protocol.CommandGroupDescriptionSet, Payload: []byte(`{"group":{"kind":"group","id":"` + theGroup + `"},"description":"x"}`)},
+		"asking about one": {Type: protocol.CommandGroupInfo, Payload: []byte(`{"group":{"kind":"group","id":"` + theGroup + `"}}`)},
+		"listing them":     {Type: protocol.CommandGroupList, Payload: []byte(`{}`)},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -101,8 +98,8 @@ func seamDeadline(t *testing.T, session *Session) func() (time.Duration, bool) {
 	session.setAnnounce = func(ctx context.Context, _ *wm.Client, _ waTypes.JID, _ bool) error {
 		return record(ctx)
 	}
-	session.leave = func(ctx context.Context, _ *wm.Client, _ waTypes.JID) error {
-		return record(ctx)
+	session.joinedGroups = func(ctx context.Context, _ *wm.Client) ([]*waTypes.GroupInfo, error) {
+		return nil, record(ctx)
 	}
 	session.groupInfo = func(ctx context.Context, _ *wm.Client, _ waTypes.JID) (*waTypes.GroupInfo, error) {
 		return nil, record(ctx)
@@ -159,6 +156,17 @@ func TestACommandThatCannotBeRepeatedKeepsItsFullWait(t *testing.T) {
 		bounded bool
 	}{
 		"creating a group": {&protocol.Command{Type: protocol.CommandGroupCreate}, false},
+		// Answered a second time with "not in the group" or "no such request", for work
+		// the first attempt did.
+		"leaving one":              {&protocol.Command{Type: protocol.CommandGroupLeave}, false},
+		"changing who is in":       {&protocol.Command{Type: protocol.CommandGroupParticipantsUpdate}, false},
+		"answering a join request": {&protocol.Command{Type: protocol.CommandGroupJoinRequestsUpdate}, false},
+		// No id to write twice under, so a retry publishes a second group.updated.
+		"a name change":     {&protocol.Command{Type: protocol.CommandGroupNameSet}, false},
+		"a settings change": {&protocol.Command{Type: protocol.CommandGroupSettingsSet}, false},
+		// Reads: asked again they answer again.
+		"listing groups":        {&protocol.Command{Type: protocol.CommandGroupList}, true},
+		"listing join requests": {&protocol.Command{Type: protocol.CommandGroupJoinRequestsList}, true},
 		// WhatsApp assigns a new picture id and announces another change, and there is no
 		// id this side can hand it to make a second write the first one over again.
 		"setting a photo": {&protocol.Command{Type: protocol.CommandGroupPhotoSet}, false},
@@ -231,6 +239,10 @@ func TestTheTwoThatCannotBeRepeatedArriveWithNoCeiling(t *testing.T) {
 		"creating a group":   {Type: protocol.CommandGroupCreate, Payload: []byte(`{"subject":"x","participants":[{"kind":"phone","id":"5511999990002"}]}`)},
 		"rotating an invite": {Type: protocol.CommandGroupInviteGet, Payload: []byte(`{"group":{"kind":"group","id":"` + theGroup + `"},"revoke":true}`)},
 		"setting a photo":    {Type: protocol.CommandGroupPhotoSet, Payload: []byte(`{"group":{"kind":"group","id":"` + theGroup + `"},"image":"` + aTinyJPEG + `"}`)},
+		"leaving one":        {Type: protocol.CommandGroupLeave, Payload: []byte(`{"group":{"kind":"group","id":"` + theGroup + `"}}`)},
+		"a name change":      {Type: protocol.CommandGroupNameSet, Payload: []byte(`{"group":{"kind":"group","id":"` + theGroup + `"},"subject":"x"}`)},
+		"a settings change":  {Type: protocol.CommandGroupSettingsSet, Payload: []byte(`{"group":{"kind":"group","id":"` + theGroup + `"},"setting":"announce","value":true}`)},
+		"changing who is in": {Type: protocol.CommandGroupParticipantsUpdate, Payload: []byte(`{"group":{"kind":"group","id":"` + theGroup + `"},"action":"add","participants":[{"kind":"phone","id":"5511999990002"}]}`)},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -256,6 +268,32 @@ func TestTheTwoThatCannotBeRepeatedArriveWithNoCeiling(t *testing.T) {
 					left, set = time.Until(until), true
 				}
 				return errors.New("recorded")
+			}
+			session.leave = func(ctx context.Context, _ *wm.Client, _ waTypes.JID) error {
+				if until, ok := ctx.Deadline(); ok {
+					left, set = time.Until(until), true
+				}
+				return errors.New("recorded")
+			}
+			session.setName = func(ctx context.Context, _ *wm.Client, _ waTypes.JID, _ string) error {
+				if until, ok := ctx.Deadline(); ok {
+					left, set = time.Until(until), true
+				}
+				return errors.New("recorded")
+			}
+			session.setAnnounce = func(ctx context.Context, _ *wm.Client, _ waTypes.JID, _ bool) error {
+				if until, ok := ctx.Deadline(); ok {
+					left, set = time.Until(until), true
+				}
+				return errors.New("recorded")
+			}
+			session.updateParticipants = func(
+				ctx context.Context, _ *wm.Client, _ waTypes.JID, _ []waTypes.JID, _ wm.ParticipantChange,
+			) ([]waTypes.GroupParticipant, error) {
+				if until, ok := ctx.Deadline(); ok {
+					left, set = time.Until(until), true
+				}
+				return nil, errors.New("recorded")
 			}
 
 			_, _ = session.Execute(t.Context(), command)
