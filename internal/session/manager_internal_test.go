@@ -3242,8 +3242,6 @@ func TestAMarkLeavesTheReleaseBehindItATurn(t *testing.T) {
 	}
 }
 
-// waiting holds a command until its own context is over, which is a Redis that answers
-// nothing rather than one that refuses.
 // heldCommand holds one command on its way to Redis until it is let go, and says when it
 // has one. Unlike waiting, which never lets go, this one is for separating a command from
 // its effect: what is held has not happened yet, and that is a fact rather than a race.
@@ -3273,6 +3271,8 @@ func (h *heldCommand) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
 
 func (h *heldCommand) release() { h.freed.Do(func() { close(h.let) }) }
 
+// waiting holds a command until its own context is over, which is a Redis that answers
+// nothing rather than one that refuses.
 type waiting struct{ on func(redis.Cmder) bool }
 
 func (waiting) DialHook(next redis.DialHook) redis.DialHook { return next }
