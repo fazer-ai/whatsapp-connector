@@ -159,7 +159,6 @@ type Session struct {
 	// The two calls writeTheDescription picks between. Seams of their own because which
 	// one a write takes is the whole of what it decides, and only one of them is bounded.
 	setTopic        func(context.Context, *wm.Client, waTypes.JID, string, string, string) error
-	setLegacyTopic  func(context.Context, *wm.Client, waTypes.JID, string) error
 	setAnnounce     func(context.Context, *wm.Client, waTypes.JID, bool) error
 	setLocked       func(context.Context, *wm.Client, waTypes.JID, bool) error
 	setJoinApproval func(context.Context, *wm.Client, waTypes.JID, bool) error
@@ -625,9 +624,6 @@ func newSession(
 		ctx context.Context, client *wm.Client, group waTypes.JID, previous, revision, description string,
 	) error {
 		return client.SetGroupTopic(ctx, group, previous, revision, description) //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
-	}
-	s.setLegacyTopic = func(ctx context.Context, client *wm.Client, group waTypes.JID, description string) error {
-		return client.SetGroupDescription(ctx, group, description) //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
 	}
 	// Assigned after the literal, not in it: this one reads the group before it writes,
 	// and it reads it through the seam beside it rather than off the client, so a test

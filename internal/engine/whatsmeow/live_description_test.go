@@ -16,9 +16,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"strconv"
 	"testing"
 	"time"
+
+	waTypes "go.mau.fi/whatsmeow/types"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/engine"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
@@ -151,6 +154,53 @@ func TestLiveDescriptionIsRemovable(t *testing.T) {
 		// own and stored something other than what the operator asked for.
 		reads(t, "anything but empty", func(got string) bool { return got != "" })
 	})
+}
+
+// TestLiveAFrozenDescriptionIsRefusedQuickly is the half of #163 this change cannot fix,
+// measured rather than argued. A description this connector wrote before it gave one an id
+// is frozen: WhatsApp answers 409 to every later change, whichever call or stanza carries
+// it. What changes here is the cost of being told so -- a third of a second instead of the
+// minute and a quarter the old removal spent before answering `timeout`.
+//
+// Needs a group in that state, which the suite will not make for itself: freezing one is
+// permanent, and a test that leaves permanent damage behind on every run is a test that
+// runs out of groups. Pass WAC_LIVE_FROZEN_GROUP=<jid>@g.us. 120363410605594371@g.us was
+// frozen on 10/09/2026 by the probe that established the mechanism.
+func TestLiveAFrozenDescriptionIsRefusedQuickly(t *testing.T) {
+	frozen := os.Getenv("WAC_LIVE_FROZEN_GROUP")
+	if frozen == "" {
+		t.Skip("set WAC_LIVE_FROZEN_GROUP to a group whose description was written the old way")
+	}
+	jid, err := waTypes.ParseJID(frozen)
+	if err != nil {
+		t.Fatalf("WAC_LIVE_FROZEN_GROUP is not a JID: %v", err)
+	}
+
+	subject, _, _ := liveBoth(t, MediaOptions{})
+	liveResumeAsking(t, subject, engine.ConnectRequest{Pairing: "resume", Groups: true})
+	target := map[string]any{"kind": "group", "id": jid.User}
+
+	for name, description := range map[string]any{
+		"rewriting it": "wac-163 outra coisa",
+		"removing it":  nil,
+	} {
+		t.Run(name, func(t *testing.T) {
+			started := time.Now()
+			err := liveTry(t, subject, protocol.CommandGroupDescriptionSet, map[string]any{
+				"group": target, "description": description,
+			})
+			took := time.Since(started)
+			t.Logf("%s a frozen description answered %v after %s", name, err, took.Round(time.Millisecond))
+			if err == nil {
+				t.Fatal("a frozen description was changed, which every measurement says cannot happen")
+			}
+			// The point is the wait, not the refusal. Ten seconds is what the acceptance
+			// scenario gives a group command, and the defect took seventy-five.
+			if took > 10*time.Second {
+				t.Errorf("being refused took %s", took.Round(time.Millisecond))
+			}
+		})
+	}
 }
 
 // TestLiveTheQueueMovesBehindAGroupCommand is the half of #163 the title calls the worse

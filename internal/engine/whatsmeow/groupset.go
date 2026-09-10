@@ -324,52 +324,44 @@ func (s *Session) setGroupPhoto(ctx context.Context, command *protocol.Command) 
 	return nil, nil
 }
 
-// unaddressableTopicID is what WhatsApp reports as a description's id when the description
-// was written without one. Not a sentinel this connector invented: it is the literal
-// string that comes back on the wire, and it reads like a JavaScript `undefined` that got
-// as far as the server.
-const unaddressableTopicID = "undefined"
-
 // writeTheDescription writes a group's description through the one whatsmeow call that
-// gives it an id, and uses the one that does not only where WhatsApp leaves no choice.
+// gives it an id.
 //
-// The two calls do not send the same stanza. `SetGroupDescription` sends
-// `<description><body>…</body></description>` with no attributes at all; `SetGroupTopic`
-// always puts an `id` on it, names the description it replaces with `prev`, and for an
-// empty text drops the body and sets `delete="true"` instead. A description written
-// without an id is one nothing can address afterwards: WhatsApp reports its id as
-// `"undefined"`, and a removal, which has to name what it replaces, is refused with a 409.
+// #163 was a removal that could not be carried out. `SetGroupDescription` sends a
+// `description` node with no attributes at all -- no `id`, no `prev` -- and a description
+// written that way is one nothing can address afterwards: WhatsApp reports its id as the
+// literal string `"undefined"`, and every later change to it is refused.
 //
-// Measured live on 10/09/2026, on groups between the two paired test accounts:
+// Measured on real groups between the two paired test accounts, 10/09/2026, on a group
+// made for the purpose and driven in this order:
 //
-//	write with SetGroupDescription -> topic_id "undefined"
-//	  then remove with SetGroupDescription("") -> 1m15.001s, info query timed out
-//	  then remove with SetGroupTopic("")       ->    409 ms, 409 conflict
-//	  then rewrite with SetGroupTopic          ->    370 ms, 409 conflict
-//	write with SetGroupTopic       -> topic_id "3EB0C2A14F4FBC421B2E8C"
-//	  then remove with SetGroupTopic("")       ->    959 ms, removed
-//	a group that never had one     -> topic_id ""
-//	  remove with SetGroupTopic("")            ->    536 ms, removed
-//	  remove with SetGroupDescription("")      -> 1m15.001s, info query timed out
+//	as found                              -> topic_id ""
+//	SetGroupDescription("travada")           494 ms, applied -> topic_id "undefined"
+//	SetGroupDescription("segunda")           326 ms, 409 conflict
+//	SetGroupTopic(rewrite)                   704 ms, 409 conflict
+//	SetGroupTopic("")                        716 ms, 409 conflict
+//	<description id=...>          by hand    324 ms, 409 conflict
+//	<description id=... delete=true>         327 ms, 409 conflict
+//
+// The last two go through `DangerousInternals().SendGroupIQ`, which is the only way to
+// send the stanza this connector would want: an id, naming no predecessor. It is refused
+// too. So a description written the old way is frozen -- no call and no stanza shape
+// changes it, and there is nothing left here to try. What this can do is stop making new
+// ones, and answer the frozen ones in a third of a second rather than in the
+// seventy-five #163 measured four times over.
 //
 // The id is read here rather than left to `SetGroupTopic`, which fetches it itself when
-// handed an empty one, and that is not duplicated work: it is the same round trip made
-// where its outcome can be told apart. Two things depend on seeing it. A 409 means "you
-// may not replace the description named by this prev", and there are two ways to get one
-// -- a description with no id, and a description somebody else changed between the read
-// and the write -- so deciding on the error alone would answer a concurrent edit by
-// writing over it, and by leaving another description nothing can ever remove. And
-// `SetGroupTopic` flattens a failure of its own lookup with `%v`, so a disconnection or a
-// rate limit during it would reach the caller as `internal` instead of as itself.
+// handed an empty one and flattens a failure of that fetch with `%v`: a disconnection or
+// a rate limit during it would reach the caller as `internal` instead of as itself.
 //
 // What that does not buy, and the limit is worth stating rather than implying: a group
 // with no description when it was read has no id to name, so `SetGroupTopic` reads it
-// again and takes whatever is there. A description added by another admin in that window
-// is written over instead of answering 409. That is last write wins, which is what
-// `group.description.set` means and what this connector has always done -- the id is here
-// so a refusal is not mistaken for a legacy description, not to turn the command into a
-// compare-and-set it never promised. Naming the absence would take a stanza with an id and
-// no `prev`, which whatsmeow does not expose.
+// again anyway, and that second read is the one whose failure arrives without a cause --
+// which is why an unclassifiable answer is asked about again below instead of being
+// passed on as `internal`. And a description another admin wrote between the read and the
+// write is written over rather than refused, because `SetGroupTopic` names the id it was
+// given. That is last write wins, which is what `group.description.set` means and what
+// this connector has always done.
 func (s *Session) writeTheDescription(
 	ctx context.Context, client *wm.Client, group waTypes.JID, description, revision string,
 ) error {
@@ -393,41 +385,40 @@ func (s *Session) writeTheDescription(
 	if err := budget.Err(); err != nil {
 		return err //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
 	}
-	if legacyDescription(info.TopicID, description) {
-		// A description this connector wrote before it knew to give one an id. The call
-		// below is the only one that still changes it, and it leaves the replacement
-		// unaddressable in the same way -- taken anyway, because the alternative is
-		// answering 409 for a write that works today.
-		//
-		// On `ctx` and not on the budget, deliberately. It carries no id, so WhatsApp
-		// committing it after this side gave up on the wait is a second description
-		// written by the redelivery invariant 5 entitles the caller to send. The ledger
-		// records only successes, so there would be nothing to stop it.
-		return s.setLegacyTopic(ctx, client, group, description)
-	}
-	// What is left of the budget, which is the whole point of there being one: this write
-	// goes out under a revision this side chose, so WhatsApp committing it after the wait
-	// was given up on and the caller redelivering writes that same revision again rather
-	// than a second one.
+
 	err = s.setTopic(budget, client, group, info.TopicID, revision, description)
-	if err != nil && budget.Err() != nil {
-		// A group with no description at all sends `SetGroupTopic` to read one for itself,
-		// and it flattens a failure of that read with `%v`. The budget above is the most
-		// likely thing to end it, and a deadline reported as `internal` tells the caller
-		// this connector broke rather than that it stopped waiting.
-		return budget.Err() //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
+	if err == nil {
+		return nil
+	}
+	if ended := budget.Err(); ended != nil {
+		// The ceiling, and not something WhatsApp said. Reported as itself, because a
+		// deadline reaching the caller as `internal` says this connector broke rather than
+		// that it stopped waiting.
+		return ended //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
+	}
+	if info.TopicID == "" && lostItsCause(err) {
+		// The group had no description, so `SetGroupTopic` went to read one for itself and
+		// what came back is its own `%v` with nothing left in it to classify. Asked again
+		// here, through a call that keeps its sentinels: a disconnection and a rate limit
+		// both outlive one round trip, so whichever ended that read ends this one too and
+		// the caller is told which it was instead of `internal`.
+		if _, again := s.groupInfo(budget, client, group); again != nil {
+			return again //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
+		}
 	}
 	return err //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
 }
 
-// legacyDescription reports whether a write has to go through the call that leaves a
-// description without an id.
-//
-// Narrow on purpose, and each condition rules out a different way of being wrong. Only the
-// id WhatsApp reports for a description written without one qualifies: a real id, or none
-// at all on a group that never had a description, both address fine. And only a write --
-// a removal on such a group is answered as the refusal it is, in a third of a second,
-// because sending it the other way is the seventy-five second wait this exists to remove.
-func legacyDescription(topicID, description string) bool {
-	return topicID == unaddressableTopicID && description != ""
+// lostItsCause reports whether an error carries nothing `contactFailure` can name, which is
+// what whatsmeow's `%v` leaves behind. The three checks are that function's own, in its
+// order: anything it recognises is passed on as it stands.
+func lostItsCause(err error) bool {
+	if named, _ := commandFailure(err, "description change"); named {
+		return false
+	}
+	if errors.Is(err, wm.ErrIQDisconnected) {
+		return false
+	}
+	var refused *wm.IQError
+	return !errors.As(err, &refused)
 }

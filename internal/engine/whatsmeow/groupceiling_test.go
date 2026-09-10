@@ -113,36 +113,6 @@ func seamDeadline(t *testing.T, session *Session) func() (time.Duration, bool) {
 	return func() (time.Duration, bool) { return left, set }
 }
 
-// Which description has to be written the old way. Split out from the call itself because
-// the call takes a live client: what is decidable without a socket is the decision, and it
-// is the decision that has to be narrow.
-func TestOnlyADescriptionWithNoIDIsWrittenTheOldWay(t *testing.T) {
-	t.Parallel()
-
-	for name, test := range map[string]struct {
-		topicID     string
-		description string
-		want        bool
-	}{
-		"a write over a description with no id": {unaddressableTopicID, "novo texto", true},
-		// The one that matters most: going the other way on a removal is the 75-second
-		// wait. A group stuck like this is told 409 in a third of a second instead.
-		"a removal over a description with no id":     {unaddressableTopicID, "", false},
-		"a write over a description with a real id":   {"3EB0C2A14F4FBC421B2E8C", "novo texto", false},
-		"a removal over a description with a real id": {"3EB0C2A14F4FBC421B2E8C", "", false},
-		// A group that never had a description: nothing to name, and nothing refuses it.
-		"a write over no description":   {"", "novo texto", false},
-		"a removal over no description": {"", "", false},
-	} {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-			if got := legacyDescription(test.topicID, test.description); got != test.want {
-				t.Errorf("writing the old way = %v, want %v", got, test.want)
-			}
-		})
-	}
-}
-
 // The ceiling protects the account's queue by giving up on a command, and that trade is
 // only available where giving up costs an answer. `group.create` makes another group every
 // time it runs, and a revoking `group.invite.get` rotates the link again; WhatsApp does not
@@ -369,22 +339,21 @@ func TestARedeliveredDescriptionIsWrittenUnderTheSameRevision(t *testing.T) {
 	}
 }
 
-// The description's ceiling is decided inside the write rather than by command type,
-// because which call it needs is known only after the group is read. The read and the
-// revision-bearing write are bounded; the legacy write, which carries no revision and
-// would be repeated by a redelivery, is not.
-func TestOnlyTheHalfOfADescriptionThatNamesItselfIsBounded(t *testing.T) {
+// Both halves of a description change are under the ceiling, and under one budget between
+// them. The read is bounded because asked again it answers again; the write is bounded
+// because it goes out under a revision this side chose, so WhatsApp committing it after
+// the wait was given up on and the caller redelivering writes that same revision again
+// rather than a second one.
+func TestBothHalvesOfADescriptionAreBounded(t *testing.T) {
 	t.Parallel()
 
-	for name, test := range map[string]struct {
-		topicID string
-		bounded bool
-	}{
-		"a description that can carry a revision": {"3EB0C2A14F4FBC421B2E8C", true},
-		"a group that never had one":              {"", true},
-		// The legacy write: no revision goes out with it, so a wait given up on and
-		// redelivered writes a second one.
-		"a description with no id": {unaddressableTopicID, false},
+	for name, topicID := range map[string]string{
+		"a description that can carry a revision": "3EB0C2A14F4FBC421B2E8C",
+		"a group that never had one":              "",
+		// Frozen: written before this connector gave a description an id. WhatsApp
+		// refuses every change to it, and the ceiling is what makes that refusal cost a
+		// third of a second instead of seventy-five.
+		"a description with no id": "undefined",
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -397,7 +366,7 @@ func TestOnlyTheHalfOfADescriptionThatNamesItselfIsBounded(t *testing.T) {
 				if until, ok := ctx.Deadline(); ok {
 					lookedUnder, lookBounded = time.Until(until), true
 				}
-				return &waTypes.GroupInfo{GroupTopic: waTypes.GroupTopic{TopicID: test.topicID}}, nil
+				return &waTypes.GroupInfo{GroupTopic: waTypes.GroupTopic{TopicID: topicID}}, nil
 			}
 			var left time.Duration
 			var set bool
@@ -405,13 +374,7 @@ func TestOnlyTheHalfOfADescriptionThatNamesItselfIsBounded(t *testing.T) {
 				if until, ok := ctx.Deadline(); ok {
 					left, set = time.Until(until), true
 				}
-				return errors.New("recorded")
-			}
-			session.setLegacyTopic = func(ctx context.Context, _ *wm.Client, _ waTypes.JID, _ string) error {
-				if until, ok := ctx.Deadline(); ok {
-					left, set = time.Until(until), true
-				}
-				return errors.New("recorded")
+				return &wm.IQError{Code: 409}
 			}
 
 			_, _ = session.Execute(t.Context(), &protocol.Command{
@@ -419,14 +382,11 @@ func TestOnlyTheHalfOfADescriptionThatNamesItselfIsBounded(t *testing.T) {
 				Payload: []byte(`{"group":{"kind":"group","id":"` + theGroup + `"},"description":"x"}`),
 			})
 
-			// The read is bounded whichever write follows it: asked again it answers
-			// again, so giving up on it costs an answer and nothing else.
 			if !lookBounded || lookedUnder > 20*time.Second {
 				t.Errorf("the group was read with no ceiling (set=%v, left=%s)", lookBounded, lookedUnder)
 			}
-			bounded := set && left <= 20*time.Second
-			if bounded != test.bounded {
-				t.Errorf("bounded = %v (deadline set=%v, left=%s), want %v", bounded, set, left, test.bounded)
+			if !set || left > 20*time.Second {
+				t.Errorf("the description was written with no ceiling (set=%v, left=%s)", set, left)
 			}
 		})
 	}
@@ -542,18 +502,6 @@ func TestAWriteEndedByTheCeilingIsReportedAsTheCeiling(t *testing.T) {
 	assertCode(t, err, protocol.ErrorTimeout)
 }
 
-// The id itself, spelled out. `TestOnlyADescriptionWithNoIDIsWrittenTheOldWay` asks the
-// question through the constant, so it moves with the constant and a build that got the
-// value wrong would still pass it -- with every stuck group sent down the path that
-// answers 409 and nothing saying so. This value was measured, not chosen.
-func TestTheIDOfADescriptionWrittenWithoutOneIsWhatWhatsAppReports(t *testing.T) {
-	t.Parallel()
-
-	if !legacyDescription("undefined", "novo texto") {
-		t.Error(`a description whose id WhatsApp reports as "undefined" was not written the old way`)
-	}
-}
-
 // whatsmeow answers an error for a group it cannot read, so a group and no error should
 // not reach the write at all. Should is why the guard is there: reading a field off it
 // takes the session's goroutine down, and with it every command queued behind this one.
@@ -600,5 +548,109 @@ func TestADescriptionOfSpacesIsWrittenAndNotTakenForARemoval(t *testing.T) {
 	}
 	if written != "   " {
 		t.Errorf("three spaces reached WhatsApp as %q", written)
+	}
+}
+
+// A group with no description has no id to name, so `SetGroupTopic` goes and reads one for
+// itself -- and flattens a failure of that read with `%v`, which leaves nothing for
+// `contactFailure` to classify. Passed on as it comes, a rate limit or a disconnection
+// reaches the caller as `internal`: this connector broke, rather than WhatsApp is
+// throttling you. Asked again through a call that keeps its sentinels, it is told apart.
+func TestAFailureWhatsmeowFlattenedIsAskedAboutAgain(t *testing.T) {
+	t.Parallel()
+
+	for name, test := range map[string]struct {
+		topicID string
+		again   error
+		want    protocol.ErrorCode
+	}{
+		"throttled while it read the id for itself": {
+			"", &wm.IQError{Code: 429}, protocol.ErrorRateLimited,
+		},
+		"disconnected while it read the id for itself": {
+			"", wm.ErrIQDisconnected, protocol.ErrorNotConnected,
+		},
+		// The read answers, so what failed was the write itself and there is nothing to
+		// recover: `internal` is the honest answer to an error nobody can name.
+		"the write failed for a reason of its own": {"", nil, protocol.ErrorInternal},
+		// Nothing was flattened: the id went out with the write, so whatsmeow never read
+		// anything and a second read would only be a round trip spent on a guess.
+		"a group whose description already has an id": {
+			"3EB0C2A14F4FBC421B2E8C", &wm.IQError{Code: 429}, protocol.ErrorInternal,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			session, _ := newTestSession(t, "5511999990001")
+			session.setConnected(true)
+			reads := 0
+			session.groupInfo = func(context.Context, *wm.Client, waTypes.JID) (*waTypes.GroupInfo, error) {
+				reads++
+				if reads == 1 {
+					return &waTypes.GroupInfo{
+						GroupTopic: waTypes.GroupTopic{TopicID: test.topicID},
+					}, nil
+				}
+				return &waTypes.GroupInfo{}, test.again
+			}
+			session.setTopic = func(context.Context, *wm.Client, waTypes.JID, string, string, string) error {
+				// whatsmeow's own line, and the point of it is the sentinel it drops.
+				//nolint:errorlint // the point is the sentinel whatsmeow drops
+				return fmt.Errorf("failed to get old group info to update topic: %v", test.again)
+			}
+
+			_, err := session.Execute(t.Context(), &protocol.Command{
+				Type:    protocol.CommandGroupDescriptionSet,
+				Payload: []byte(`{"group":{"kind":"group","id":"` + theGroup + `"},"description":"x"}`),
+			})
+			assertCode(t, err, test.want)
+		})
+	}
+}
+
+// And an answer that already carries its own cause is passed on as it stands. Asking again
+// would spend another of the session's serial round trips to be told the same thing, which
+// is the cost this whole change exists to stop paying.
+func TestAnAnswerThatNamesItselfIsNotAskedAboutAgain(t *testing.T) {
+	t.Parallel()
+
+	for name, test := range map[string]struct {
+		refusal error
+		want    protocol.ErrorCode
+	}{
+		// A 409 on a frozen description is the answer, not a symptom.
+		"WhatsApp refused it":          {&wm.IQError{Code: 409}, protocol.ErrorWaError},
+		"WhatsApp is throttling":       {&wm.IQError{Code: 429}, protocol.ErrorRateLimited},
+		"the connection went":          {wm.ErrIQDisconnected, protocol.ErrorNotConnected},
+		"WhatsApp never answered":      {wm.ErrIQTimedOut, protocol.ErrorTimeout},
+		"the session has no account":   {wm.ErrNotLoggedIn, protocol.ErrorNotPaired},
+		"the command ran out of time":  {context.DeadlineExceeded, protocol.ErrorTimeout},
+		"the session is not connected": {wm.ErrNotConnected, protocol.ErrorNotConnected},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			session, _ := newTestSession(t, "5511999990001")
+			session.setConnected(true)
+			reads := 0
+			session.groupInfo = func(context.Context, *wm.Client, waTypes.JID) (*waTypes.GroupInfo, error) {
+				reads++
+				// No id, which is the case that would otherwise be asked about again.
+				return &waTypes.GroupInfo{GroupTopic: waTypes.GroupTopic{TopicID: ""}}, nil
+			}
+			session.setTopic = func(context.Context, *wm.Client, waTypes.JID, string, string, string) error {
+				return test.refusal
+			}
+
+			_, err := session.Execute(t.Context(), &protocol.Command{
+				Type:    protocol.CommandGroupDescriptionSet,
+				Payload: []byte(`{"group":{"kind":"group","id":"` + theGroup + `"},"description":"x"}`),
+			})
+			assertCode(t, err, test.want)
+			if reads != 1 {
+				t.Errorf("the group was read %d times for an answer that already said what happened", reads)
+			}
+		})
 	}
 }
