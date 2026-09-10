@@ -2369,3 +2369,129 @@ func TestAnAddressThatIsNotAnsweringIsNamedAsTheCallersOwnAndNotAsThisConnector(
 		t.Fatalf("the failure does not say what could not be fetched: %v", err)
 	}
 }
+
+// A recipient's client lays a media bubble out before the file arrives, and what it lays
+// it out from is these. Sent without them the bubble is a guess that the conversation
+// then jumps to correct; sent as a zero it is a measurement, and a measurement of nothing
+// is worse than the absence a client already knows how to handle.
+func TestAPicturesSizeTravelsWithItAndAZeroIsNotASize(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name, kind, mime, fields string
+		width, height            uint32
+	}{
+		{"an image", "image", "image/jpeg", `"width":800,"height":600`, 800, 600},
+		{"a video", "video", "video/mp4", `"width":1920,"height":1080`, 1920, 1080},
+		{"a sticker", "sticker", "image/webp", `"width":512,"height":512`, 512, 512},
+		{"an image the caller did not measure", "image", "image/jpeg", `"caption":"sem medida"`, 0, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			session, serving, _ := outboundSession(t)
+			serving.answer([]byte("bytes"), tc.mime)
+			message := mustSendBody(t, session, `{"message_id":"3EB0",
+				"to":{"kind":"phone","id":"5511999990001"},
+				"content":{"type":"media","kind":"`+tc.kind+`","mime":"`+tc.mime+`",`+tc.fields+`,
+				"ref":{"kind":"url","url":"http://rails:3000/blob"}}}`)
+
+			var width, height *uint32
+			switch tc.kind {
+			case "image":
+				width, height = message.GetImageMessage().Width, message.GetImageMessage().Height
+			case "video":
+				width, height = message.GetVideoMessage().Width, message.GetVideoMessage().Height
+			case "sticker":
+				width, height = message.GetStickerMessage().Width, message.GetStickerMessage().Height
+			}
+			if tc.width == 0 {
+				if width != nil || height != nil {
+					t.Fatalf("a size nobody gave went out as %v x %v", width, height)
+				}
+				return
+			}
+			if width == nil || height == nil || *width != tc.width || *height != tc.height {
+				t.Fatalf("the picture went out as %v x %v, want %d x %d",
+					width, height, tc.width, tc.height)
+			}
+		})
+	}
+}
+
+// The bars a voice note's bubble draws. Absent, the bubble is flat, which is at least
+// honestly empty; wrong, it draws a shape that is not the audio, and the caller is never
+// told, because renderMedia has nowhere to put it and the send still reports success.
+func TestAVoiceNotesWaveformIsSixtyFourAmplitudesOrNothing(t *testing.T) {
+	t.Parallel()
+
+	sixtyFour := make([]int, 64)
+	for i := range sixtyFour {
+		sixtyFour[i] = i + 20
+	}
+
+	session, serving, _ := outboundSession(t)
+	serving.answer([]byte("opus"), "audio/ogg")
+	message := mustSendBody(t, session, `{"message_id":"3EB0","to":{"kind":"phone","id":"5511999990001"},
+		"content":{"type":"media","kind":"audio","mime":"audio/ogg","voice_note":true,
+		"waveform":`+asJSON(t, sixtyFour)+`,
+		"ref":{"kind":"url","url":"http://rails:3000/blob.ogg"}}}`)
+
+	drawn := message.GetAudioMessage().GetWaveform()
+	if len(drawn) != 64 {
+		t.Fatalf("the waveform went out with %d samples", len(drawn))
+	}
+	for i, sample := range drawn {
+		if int(sample) != sixtyFour[i] {
+			t.Fatalf("sample %d went out as %d, want %d", i, sample, sixtyFour[i])
+		}
+	}
+
+	for _, tc := range []struct{ name, content string }{
+		{"a waveform shorter than the row of bars", `"kind":"audio","waveform":[1,2,3]`},
+		{"a waveform longer than the row of bars",
+			`"kind":"audio","waveform":` + asJSON(t, make([]int, 65))},
+		{"an amplitude above the range", `"kind":"audio","waveform":` + asJSON(t, overTheTop(101))},
+		{"an amplitude below the range", `"kind":"audio","waveform":` + asJSON(t, overTheTop(-1))},
+		// Every kind below has no Waveform field at all, so this is a caller computing a
+		// shape that renderMedia then drops on the floor.
+		{"a waveform on a video", `"kind":"video","waveform":` + asJSON(t, sixtyFour)},
+		{"a waveform on a document", `"kind":"document","waveform":` + asJSON(t, sixtyFour)},
+		// And the same silent loss from the other side: neither an audio nor a document
+		// has a width and a height to carry.
+		{"a size on an audio", `"kind":"audio","width":800,"height":600`},
+		{"a size on a document", `"kind":"document","width":800,"height":600`},
+		{"only the width", `"kind":"image","width":800`},
+		{"only the height", `"kind":"image","height":600`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			req := requestOf(t, `{"message_id":"3EB0","to":{"kind":"phone","id":"5511999990001"},
+				"content":{"type":"media",`+tc.content+`,
+				"ref":{"kind":"url","url":"http://rails:3000/blob"}}}`)
+			_, _, err := planBody(req, nil, 1<<20)
+			assertCode(t, err, protocol.ErrorInvalidPayload)
+		})
+	}
+}
+
+// overTheTop is a full row of bars with one sample outside what a byte of amplitude
+// means, so what the check answers is the sample and not the length.
+func overTheTop(sample int) []int {
+	waveform := make([]int, 64)
+	waveform[7] = sample
+	return waveform
+}
+
+// asJSON writes a list of amplitudes into the body being built, so a case reads as the
+// waveform it is testing rather than as a row of digits typed out by hand.
+func asJSON(t *testing.T, waveform []int) string {
+	t.Helper()
+
+	encoded, err := json.Marshal(waveform)
+	if err != nil {
+		t.Fatalf("that waveform does not encode: %v", err)
+	}
+	return string(encoded)
+}

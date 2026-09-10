@@ -79,6 +79,9 @@ type (
 		VoiceNote bool               `json:"voice_note"`
 		Size      int64              `json:"size"`
 		Duration  uint32             `json:"duration"`
+		Width     uint32             `json:"width"`
+		Height    uint32             `json:"height"`
+		Waveform  []int              `json:"waveform"`
 		Thumbnail string             `json:"thumbnail"`
 		Ref       *protocol.MediaRef `json:"ref"`
 	}
@@ -512,7 +515,7 @@ func planMedia(content *mediaContent, limit int64) (*mediaPlan, error) {
 		// reports success. WhatsApp has nowhere to put one on either of these: neither
 		// StickerMessage nor AudioMessage has the field at all.
 		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
-			fmt.Sprintf("a %s carries no caption: send the text as its own message", content.Kind))
+			fmt.Sprintf("no caption travels with %s: send the text as its own message", content.Kind))
 	}
 	address, err := fetchable(content.Ref)
 	if err != nil {
@@ -550,11 +553,71 @@ func planMedia(content *mediaContent, limit int64) (*mediaPlan, error) {
 	if err := matchable(content.Ref.SHA256); err != nil {
 		return nil, err
 	}
+	if err := drawable(content); err != nil {
+		return nil, err
+	}
 	thumbnail, err := thumbnailBytes(content.Thumbnail, content.Kind)
 	if err != nil {
 		return nil, err
 	}
 	return &mediaPlan{content: *content, address: address, thumbnail: thumbnail}, nil
+}
+
+// waveformSamples is how many amplitudes a voice note's bubble is drawn from. It is not a
+// resolution the sender picks: the field is read as a fixed-length row of bars, and a row
+// of another length is not a shorter waveform, it is a misread one.
+const waveformSamples = 64
+
+// maxAmplitude is the loudest a sample says. The field is a byte, so the range is a
+// convention between clients rather than something the wire enforces.
+const maxAmplitude = 100
+
+// drawable judges what the caller says the media looks like, before anything is fetched.
+//
+// Both of these describe a leaf field that only some kinds have, so on the wrong kind
+// they are dropped in renderMedia and the send still reports success -- the same silent
+// loss a caption on an audio would be, and refused here for the same reason.
+func drawable(content *mediaContent) error {
+	if (content.Width != 0 || content.Height != 0) && !sized[content.Kind] {
+		return protocol.NewError(protocol.ErrorInvalidPayload,
+			fmt.Sprintf("a size describes a picture, and %s carries none", content.Kind))
+	}
+	if content.Width != 0 && content.Height == 0 || content.Height != 0 && content.Width == 0 {
+		// One side alone is not a size, and a client laying the bubble out from it either
+		// ignores the pair or draws with an aspect ratio nothing supplied.
+		return protocol.NewError(protocol.ErrorInvalidPayload,
+			"a picture's size is both sides or neither")
+	}
+	if len(content.Waveform) == 0 {
+		return nil
+	}
+	if content.Kind != protocol.MediaAudio {
+		return protocol.NewError(protocol.ErrorInvalidPayload,
+			fmt.Sprintf("only an audio's bubble draws a waveform, and this one is %s", content.Kind))
+	}
+	if len(content.Waveform) != waveformSamples {
+		return protocol.NewError(protocol.ErrorInvalidPayload,
+			fmt.Sprintf("a waveform is %d samples and that one is %d",
+				waveformSamples, len(content.Waveform)))
+	}
+	for _, sample := range content.Waveform {
+		if sample < 0 || sample > maxAmplitude {
+			// The field is a byte per sample on the wire. A number outside the range does
+			// not clip, it wraps: 101 narrows to 101 of 100 on a client that trusts the
+			// range, and a negative becomes a tall bar where the audio was silent.
+			return protocol.NewError(protocol.ErrorInvalidPayload,
+				fmt.Sprintf("%d is not an amplitude between 0 and %d", sample, maxAmplitude))
+		}
+	}
+	return nil
+}
+
+// sized are the kinds whose leaf message has somewhere to put a width and a height. An
+// audio has no picture and a document is described by its name, not its shape.
+var sized = map[protocol.MediaKind]bool{
+	protocol.MediaImage:   true,
+	protocol.MediaVideo:   true,
+	protocol.MediaSticker: true,
 }
 
 // captions are the kinds WhatsApp gives somewhere to put one. An audio and a sticker have
@@ -1118,6 +1181,7 @@ func renderMedia(
 			FileLength: proto.Uint64(uploaded.FileLength),
 			Mimetype:   proto.String(mimetype),
 			Caption:    optional(content.Caption), JPEGThumbnail: thumbnail,
+			Width: optionalPixels(content.Width), Height: optionalPixels(content.Height),
 			ContextInfo: alongside,
 		}}
 	case protocol.MediaVideo:
@@ -1127,6 +1191,7 @@ func renderMedia(
 			FileLength: proto.Uint64(uploaded.FileLength),
 			Mimetype:   proto.String(mimetype),
 			Caption:    optional(content.Caption), Seconds: optionalSeconds(content.Duration),
+			Width: optionalPixels(content.Width), Height: optionalPixels(content.Height),
 			JPEGThumbnail: thumbnail,
 			ContextInfo:   alongside,
 		}}
@@ -1141,6 +1206,7 @@ func renderMedia(
 			// and every voice note this connector publishes on the way in was recognised
 			// by this field being there at all.
 			PTT:         optionalTrue(content.VoiceNote),
+			Waveform:    samples(content.Waveform),
 			ContextInfo: alongside,
 		}}
 	case protocol.MediaDocument:
@@ -1170,6 +1236,7 @@ func renderMedia(
 			FileEncSHA256: uploaded.FileEncSHA256, FileSHA256: uploaded.FileSHA256,
 			FileLength: proto.Uint64(uploaded.FileLength),
 			Mimetype:   proto.String(mimetype),
+			Width:      optionalPixels(content.Width), Height: optionalPixels(content.Height),
 			// The one leaf type whose preview field is a PNG, which is also the format
 			// this connector publishes a sticker's preview in.
 			PngThumbnail: thumbnail,
@@ -1195,6 +1262,34 @@ func optionalSeconds(seconds uint32) *uint32 {
 		return nil
 	}
 	return proto.Uint32(seconds)
+}
+
+// optionalPixels is the same for a side the caller may not know. A picture with no size
+// is not a picture 0 wide: it is a caller that did not say, and a zero on the wire is a
+// measurement, which is worse than the absence a client already knows how to handle.
+func optionalPixels(pixels uint32) *uint32 {
+	if pixels == 0 {
+		return nil
+	}
+	return proto.Uint32(pixels)
+}
+
+// samples narrows a waveform to the bytes the field is: the contract carries it as
+// integers, because 64 numbers between 0 and 100 are something a schema can check and a
+// base64 blob is not.
+//
+// planMedia has already refused anything outside the range, and the clamp here is for the
+// call that arrives without having gone through it: narrowed unchecked, an amplitude of
+// 300 does not clip, it wraps to 44, and the bubble draws a bar where the audio was quiet.
+func samples(waveform []int) []byte {
+	if len(waveform) == 0 {
+		return nil
+	}
+	drawn := make([]byte, len(waveform))
+	for i, sample := range waveform {
+		drawn[i] = byte(min(max(sample, 0), maxAmplitude)) //nolint:gosec // clamped on the line itself
+	}
+	return drawn
 }
 
 // optionalTrue is the same for a flag whose false is not a value.
