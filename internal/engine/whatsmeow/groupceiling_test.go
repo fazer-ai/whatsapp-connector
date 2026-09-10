@@ -3,6 +3,8 @@ package whatsmeow
 import (
 	"context"
 	"errors"
+	"fmt"
+	"runtime"
 	"testing"
 	"time"
 
@@ -427,5 +429,176 @@ func TestOnlyTheHalfOfADescriptionThatNamesItselfIsBounded(t *testing.T) {
 				t.Errorf("bounded = %v (deadline set=%v, left=%s), want %v", bounded, set, left, test.bounded)
 			}
 		})
+	}
+}
+
+// One ceiling for the command, not one per query. `group.description.set` is a read and
+// then a write, and giving each of them fifteen seconds holds the session's serial
+// executor for thirty -- the thing the ceiling exists to prevent, reached by applying the
+// prevention twice. What separates one budget from two is the instant they expire at: from
+// one budget both queries expire together, and from two the second expires later by
+// whatever the first one spent.
+func TestADescriptionGetsOneCeilingAndNotOnePerQuery(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setConnected(true)
+
+	var readUntil, writeUntil time.Time
+	session.groupInfo = func(ctx context.Context, _ *wm.Client, _ waTypes.JID) (*waTypes.GroupInfo, error) {
+		readUntil, _ = ctx.Deadline()
+		// The read costs time, and the test has to make that cost real: two budgets
+		// created a nanosecond apart are two budgets, but not ones an assertion can tell
+		// from one. Spent here rather than slept, because nothing is being waited for --
+		// this is the elapsed time the second budget would silently hand back.
+		for spent := time.Now(); time.Since(spent) < 5*time.Millisecond; {
+			runtime.Gosched()
+		}
+		return &waTypes.GroupInfo{
+			GroupTopic: waTypes.GroupTopic{TopicID: "3EB0C2A14F4FBC421B2E8C"},
+		}, nil
+	}
+	session.setTopic = func(ctx context.Context, _ *wm.Client, _ waTypes.JID, _, _, _ string) error {
+		writeUntil, _ = ctx.Deadline()
+		return errors.New("recorded")
+	}
+
+	_, _ = session.Execute(t.Context(), &protocol.Command{
+		Type:    protocol.CommandGroupDescriptionSet,
+		Payload: []byte(`{"group":{"kind":"group","id":"` + theGroup + `"},"description":"x"}`),
+	})
+
+	if readUntil.IsZero() || writeUntil.IsZero() {
+		t.Fatalf("a query went out with no deadline (read set=%v, write set=%v)",
+			!readUntil.IsZero(), !writeUntil.IsZero())
+	}
+	if writeUntil.After(readUntil) {
+		t.Errorf("the write was given until %s and the read until %s: %s more than the command's whole ceiling",
+			writeUntil, readUntil, writeUntil.Sub(readUntil))
+	}
+}
+
+// The budget can run out while the read is in flight and the read still answer. Going on
+// to the write then spends a second command's worth of the executor on a command that has
+// already given up, and the caller is told `internal` for it rather than that this side
+// stopped waiting.
+func TestADescriptionIsNotWrittenAfterItsBudgetRanOut(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setConnected(true)
+	session.groupInfo = func(context.Context, *wm.Client, waTypes.JID) (*waTypes.GroupInfo, error) {
+		return &waTypes.GroupInfo{
+			GroupTopic: waTypes.GroupTopic{TopicID: "3EB0C2A14F4FBC421B2E8C"},
+		}, nil
+	}
+	written := false
+	session.setTopic = func(context.Context, *wm.Client, waTypes.JID, string, string, string) error {
+		written = true
+		return nil
+	}
+
+	ran, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	_, err := session.Execute(ran, &protocol.Command{
+		Type:    protocol.CommandGroupDescriptionSet,
+		Payload: []byte(`{"group":{"kind":"group","id":"` + theGroup + `"},"description":"x"}`),
+	})
+	if written {
+		t.Error("the description was written under a budget that had already run out")
+	}
+	assertCode(t, err, protocol.ErrorTimeout)
+}
+
+// `SetGroupTopic` reads the current description for itself when this side has no id to
+// hand it, and it flattens a failure of that read with `%v`. So the ceiling ending the
+// write arrives as a string with no sentinel left in it, and reported as it comes it tells
+// the caller this connector broke rather than that it stopped waiting.
+func TestAWriteEndedByTheCeilingIsReportedAsTheCeiling(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setConnected(true)
+	session.groupInfo = func(context.Context, *wm.Client, waTypes.JID) (*waTypes.GroupInfo, error) {
+		return &waTypes.GroupInfo{GroupTopic: waTypes.GroupTopic{TopicID: ""}}, nil
+	}
+
+	ran, cancel := context.WithCancel(t.Context())
+	session.setTopic = func(ctx context.Context, _ *wm.Client, _ waTypes.JID, _, _, _ string) error {
+		// The budget runs out with the write already in flight, which is the case the
+		// guard is for: before it, the read's own check would have caught it.
+		cancel()
+		<-ctx.Done()
+		// Exactly what whatsmeow answers: the sentinel flattened into a string.
+		return fmt.Errorf("failed to get group info: %v", ctx.Err()) //nolint:errorlint // the point is the lost sentinel
+	}
+	defer cancel()
+
+	_, err := session.Execute(ran, &protocol.Command{
+		Type:    protocol.CommandGroupDescriptionSet,
+		Payload: []byte(`{"group":{"kind":"group","id":"` + theGroup + `"},"description":"x"}`),
+	})
+	assertCode(t, err, protocol.ErrorTimeout)
+}
+
+// The id itself, spelled out. `TestOnlyADescriptionWithNoIDIsWrittenTheOldWay` asks the
+// question through the constant, so it moves with the constant and a build that got the
+// value wrong would still pass it -- with every stuck group sent down the path that
+// answers 409 and nothing saying so. This value was measured, not chosen.
+func TestTheIDOfADescriptionWrittenWithoutOneIsWhatWhatsAppReports(t *testing.T) {
+	t.Parallel()
+
+	if !legacyDescription("undefined", "novo texto") {
+		t.Error(`a description whose id WhatsApp reports as "undefined" was not written the old way`)
+	}
+}
+
+// whatsmeow answers an error for a group it cannot read, so a group and no error should
+// not reach the write at all. Should is why the guard is there: reading a field off it
+// takes the session's goroutine down, and with it every command queued behind this one.
+func TestAGroupThatComesBackEmptyIsAnErrorAndNotAPanic(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setConnected(true)
+	session.groupInfo = func(context.Context, *wm.Client, waTypes.JID) (*waTypes.GroupInfo, error) {
+		return nil, nil
+	}
+
+	_, err := session.Execute(t.Context(), &protocol.Command{
+		Type:    protocol.CommandGroupDescriptionSet,
+		Payload: []byte(`{"group":{"kind":"group","id":"` + theGroup + `"},"description":"x"}`),
+	})
+	if err == nil {
+		t.Fatal("a description was reported written over a group that came back empty")
+	}
+	assertCode(t, err, protocol.ErrorInternal)
+}
+
+// A description of nothing but spaces is a description of nothing but spaces. Collapsing
+// it into a removal decides for the operator that what they typed was a mistake, and it
+// stores something other than what the command carried while reporting success. Only an
+// absent or empty description removes one, which is what the contract says and what the
+// holdout scenario for #163 marks the other way round as a failure.
+func TestADescriptionOfSpacesIsWrittenAndNotTakenForARemoval(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setConnected(true)
+	var written string
+	session.setDescription = func(_ context.Context, _ *wm.Client, _ waTypes.JID, description, _ string) error {
+		written = description
+		return nil
+	}
+
+	if _, err := session.Execute(t.Context(), &protocol.Command{
+		Type:    protocol.CommandGroupDescriptionSet,
+		Payload: []byte(`{"group":{"kind":"group","id":"` + theGroup + `"},"description":"   "}`),
+	}); err != nil {
+		t.Fatalf("group.description.set: %v", err)
+	}
+	if written != "   " {
+		t.Errorf("three spaces reached WhatsApp as %q", written)
 	}
 }

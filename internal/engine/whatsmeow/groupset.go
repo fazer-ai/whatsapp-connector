@@ -373,11 +373,13 @@ const unaddressableTopicID = "undefined"
 func (s *Session) writeTheDescription(
 	ctx context.Context, client *wm.Client, group waTypes.JID, description, revision string,
 ) error {
-	// The read is bounded whatever comes next: asked again it answers again, so giving up
-	// on it costs an answer and nothing else.
-	looking, stopLooking := context.WithTimeout(ctx, groupIQWait)
-	defer stopLooking()
-	info, err := s.groupInfo(looking, client, group)
+	// One budget for the command, not one per query. The ceiling exists to bound how long
+	// a single command may hold the session's serial executor, and a read and a write
+	// given fifteen seconds each hold it for thirty -- which is the thing being prevented,
+	// arrived at by applying the prevention twice.
+	budget, giveUp := context.WithTimeout(ctx, groupIQWait)
+	defer giveUp()
+	info, err := s.groupInfo(budget, client, group)
 	if err != nil {
 		return err //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
 	}
@@ -388,7 +390,7 @@ func (s *Session) writeTheDescription(
 		return protocol.NewError(protocol.ErrorInternal,
 			"the group came back empty while writing its description")
 	}
-	if err := looking.Err(); err != nil {
+	if err := budget.Err(); err != nil {
 		return err //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
 	}
 	if legacyDescription(info.TopicID, description) {
@@ -396,21 +398,24 @@ func (s *Session) writeTheDescription(
 		// below is the only one that still changes it, and it leaves the replacement
 		// unaddressable in the same way -- taken anyway, because the alternative is
 		// answering 409 for a write that works today.
+		//
+		// On `ctx` and not on the budget, deliberately. It carries no id, so WhatsApp
+		// committing it after this side gave up on the wait is a second description
+		// written by the redelivery invariant 5 entitles the caller to send. The ledger
+		// records only successes, so there would be nothing to stop it.
 		return s.setLegacyTopic(ctx, client, group, description)
 	}
-	// Bounded, and only here: this is the write that goes out under a revision this side
-	// chose, so WhatsApp committing it after the wait was given up on and the caller
-	// redelivering the command writes that same revision again rather than a second one.
-	// The legacy call above carries no id and gets no ceiling for exactly that reason.
-	writing, stopWriting := context.WithTimeout(ctx, groupIQWait)
-	defer stopWriting()
-	err = s.setTopic(writing, client, group, info.TopicID, revision, description)
-	if err != nil && writing.Err() != nil {
+	// What is left of the budget, which is the whole point of there being one: this write
+	// goes out under a revision this side chose, so WhatsApp committing it after the wait
+	// was given up on and the caller redelivering writes that same revision again rather
+	// than a second one.
+	err = s.setTopic(budget, client, group, info.TopicID, revision, description)
+	if err != nil && budget.Err() != nil {
 		// A group with no description at all sends `SetGroupTopic` to read one for itself,
-		// and it flattens a failure of that read with `%v`. The ceiling above is the most
+		// and it flattens a failure of that read with `%v`. The budget above is the most
 		// likely thing to end it, and a deadline reported as `internal` tells the caller
 		// this connector broke rather than that it stopped waiting.
-		return writing.Err() //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
+		return budget.Err() //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
 	}
 	return err //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
 }
