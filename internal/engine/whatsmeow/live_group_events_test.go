@@ -192,11 +192,11 @@ func TestLiveGroupChangesArePublished(t *testing.T) {
 
 // liveGroupChange waits for the next group.updated and hands back its changes object and
 // the whole payload.
-func liveGroupChange(t *testing.T, watching *recorder) (map[string]any, map[string]any) {
+func liveGroupChange(t *testing.T, watching *recorder) (changes, payload map[string]any) {
 	t.Helper()
 
 	updated := watching.await(t, protocol.EventGroupUpdated, 90*time.Second)
-	payload := decode(t, updated.Payload)
+	payload = decode(t, updated.Payload)
 	changes, ok := payload["changes"].(map[string]any)
 	if !ok {
 		t.Fatalf("group.updated carried no changes object: %s", updated.Payload)
