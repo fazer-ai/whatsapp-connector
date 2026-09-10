@@ -475,31 +475,58 @@ func TestADescriptionIsNotWrittenAfterItsBudgetRanOut(t *testing.T) {
 // hand it, and it flattens a failure of that read with `%v`. So the ceiling ending the
 // write arrives as a string with no sentinel left in it, and reported as it comes it tells
 // the caller this connector broke rather than that it stopped waiting.
+//
+// Both writes, because there are two: the first, and the one that follows a 409 from
+// somebody else's edit. A check the second forgot would be invisible from the first.
 func TestAWriteEndedByTheCeilingIsReportedAsTheCeiling(t *testing.T) {
 	t.Parallel()
 
-	session, _ := newTestSession(t, "5511999990001")
-	session.setConnected(true)
-	session.groupInfo = func(context.Context, *wm.Client, waTypes.JID) (*waTypes.GroupInfo, error) {
-		return &waTypes.GroupInfo{GroupTopic: waTypes.GroupTopic{TopicID: ""}}, nil
-	}
+	for name, endsOn := range map[string]int{
+		"the first write":            1,
+		"the write after a conflict": 2,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
 
-	ran, cancel := context.WithCancel(t.Context())
-	session.setTopic = func(ctx context.Context, _ *wm.Client, _ waTypes.JID, _, _, _ string) error {
-		// The budget runs out with the write already in flight, which is the case the
-		// guard is for: before it, the read's own check would have caught it.
-		cancel()
-		<-ctx.Done()
-		// Exactly what whatsmeow answers: the sentinel flattened into a string.
-		return fmt.Errorf("failed to get group info: %v", ctx.Err()) //nolint:errorlint // the point is the lost sentinel
-	}
-	defer cancel()
+			session, _ := newTestSession(t, "5511999990001")
+			session.setConnected(true)
+			reads := 0
+			session.groupInfo = func(context.Context, *wm.Client, waTypes.JID) (*waTypes.GroupInfo, error) {
+				reads++
+				if reads == 1 {
+					return &waTypes.GroupInfo{GroupTopic: waTypes.GroupTopic{TopicID: "OLD"}}, nil
+				}
+				// Somebody removed the description, so the retry has no id to hand over
+				// and whatsmeow goes looking for one itself.
+				return &waTypes.GroupInfo{GroupTopic: waTypes.GroupTopic{TopicID: ""}}, nil
+			}
 
-	_, err := session.Execute(ran, &protocol.Command{
-		Type:    protocol.CommandGroupDescriptionSet,
-		Payload: []byte(`{"group":{"kind":"group","id":"` + theGroup + `"},"description":"x"}`),
-	})
-	assertCode(t, err, protocol.ErrorTimeout)
+			ran, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			writes := 0
+			session.setTopic = func(ctx context.Context, _ *wm.Client, _ waTypes.JID, _, _, _ string) error {
+				writes++
+				if writes < endsOn {
+					return &wm.IQError{Code: 409}
+				}
+				// The budget runs out with the write already in flight, which is the case
+				// the check is for: before it, the read's own would have caught it.
+				cancel()
+				<-ctx.Done()
+				//nolint:errorlint // the point is the sentinel whatsmeow drops
+				return fmt.Errorf("failed to get old group info to update topic: %v", ctx.Err())
+			}
+
+			_, err := session.Execute(ran, &protocol.Command{
+				Type:    protocol.CommandGroupDescriptionSet,
+				Payload: []byte(`{"group":{"kind":"group","id":"` + theGroup + `"},"description":"x"}`),
+			})
+			assertCode(t, err, protocol.ErrorTimeout)
+			if writes != endsOn {
+				t.Errorf("the description was written %d times, want %d", writes, endsOn)
+			}
+		})
+	}
 }
 
 // whatsmeow answers an error for a group it cannot read, so a group and no error should

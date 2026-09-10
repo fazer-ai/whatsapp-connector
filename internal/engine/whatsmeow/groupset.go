@@ -390,15 +390,9 @@ func (s *Session) writeTheDescription(
 		return err //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
 	}
 
-	err = s.setTopic(budget, client, group, info.TopicID, revision, description)
+	err = s.writeUnder(budget, client, group, info.TopicID, revision, description)
 	if err == nil {
 		return nil
-	}
-	if ended := budget.Err(); ended != nil {
-		// The ceiling, and not something WhatsApp said. Reported as itself, because a
-		// deadline reaching the caller as `internal` says this connector broke rather than
-		// that it stopped waiting.
-		return ended //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
 	}
 	if !refusedAsAConflict(err) {
 		return err //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
@@ -420,7 +414,27 @@ func (s *Session) writeTheDescription(
 	// better served by an answer than by this session's only goroutine racing whoever else
 	// is editing; the same revision because a redelivery of this command has to write the
 	// revision it wrote the first time rather than a second one.
-	return s.setTopic(budget, client, group, fresh.TopicID, revision, description) //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
+	return s.writeUnder(budget, client, group, fresh.TopicID, revision, description)
+}
+
+// writeUnder writes the description and reports the ceiling as itself when the ceiling is
+// what ended the write.
+//
+// `SetGroupTopic` reads the current id for itself when handed an empty one and flattens a
+// failure of that read with `%v`, and a budget running out there is the likeliest thing to
+// end it. A deadline reported as `internal` tells the caller this connector broke rather
+// than that it stopped waiting -- so both writes go through here rather than one of them
+// remembering to check.
+func (s *Session) writeUnder(
+	budget context.Context, client *wm.Client, group waTypes.JID, previous, revision, description string,
+) error {
+	err := s.setTopic(budget, client, group, previous, revision, description)
+	if err != nil {
+		if ended := budget.Err(); ended != nil {
+			return ended //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
+		}
+	}
+	return err //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
 }
 
 // refusedAsAConflict reports whether WhatsApp answered 409, which for a `description`
