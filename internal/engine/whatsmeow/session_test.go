@@ -2935,3 +2935,48 @@ func TestAPairingStartingUndoesTheGivingUpOfTheAttemptItReplaces(t *testing.T) {
 		t.Fatal("a pairing started with the giving-up of the attempt it replaced still standing")
 	}
 }
+
+// The operator changing their mind, which is not an error: they switched from the QR to
+// a code, or hit connect again on a screen whose code had visibly run out. The attempt in
+// flight holds a live socket, and whatsmeow will not open a second pairing channel on one
+// -- `GetQRChannel must be called before connecting` -- so the request came back as "the
+// connector could not carry out the command" for as long as the old codes had left.
+func TestAPairingInFlightIsReplacedRatherThanRefused(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name, pairing string
+		replaced      bool
+	}{
+		{"asking for a QR", "qr", true},
+		// A resume carries on with credentials that already exist. Tearing a live pairing
+		// down for one would have a client's periodic reconnect cancel an operator's scan.
+		{"asking to resume", "resume", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			session, _ := newTestSession(t, "")
+			cancelled := false
+			run := session.startPairing(t.Context(), func() { cancelled = true })
+
+			if tc.pairing != "resume" {
+				session.replacePairing()
+			}
+
+			if session.pairingActive() == tc.replaced {
+				t.Fatalf("a pairing is active=%v after asking for %q", session.pairingActive(), tc.pairing)
+			}
+			if cancelled != tc.replaced {
+				t.Fatalf("the attempt in flight was cancelled=%v, want %v", cancelled, tc.replaced)
+			}
+			if tc.replaced && !session.isStale() {
+				// tearDownPairing marks it, and the next connect is what rebuilds the
+				// client. Without the mark the fresh pairing opens on the socket that was
+				// just torn down.
+				t.Fatal("the session was not marked for a fresh client")
+			}
+			_ = run
+		})
+	}
+}

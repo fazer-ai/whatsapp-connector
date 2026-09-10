@@ -1116,15 +1116,6 @@ func (s *Session) Connect(ctx context.Context, req engine.ConnectRequest) error 
 		return protocol.NewError(protocol.ErrorUnsupported,
 			"this connector does not import the phone's history yet")
 	}
-	if s.isStale() {
-		// The device behind this client was deleted and its replacement could not be
-		// built at the time. Nothing on it works, so the connect that would have failed
-		// is the connect that repairs it.
-		if err := s.recover(ctx); err != nil {
-			return fmt.Errorf("whatsmeow: %s is still without a usable device: %w", s.sid, err)
-		}
-	}
-
 	if req.Pairing != "resume" && req.Pairing != "qr" && req.Pairing != "code" {
 		return protocol.NewError(protocol.ErrorInvalidPayload,
 			fmt.Sprintf("%q is not a pairing mode this connector knows", req.Pairing))
@@ -1134,6 +1125,30 @@ func (s *Session) Connect(ctx context.Context, req engine.ConnectRequest) error 
 		// point changes the session, and a refusal that has already changed it is a
 		// command that failed and took effect.
 		return protocol.NewError(protocol.ErrorInvalidPayload, "code pairing needs the phone number to pair")
+	}
+
+	// A pairing already in flight is the operator changing their mind, not an error: they
+	// switched from the QR to a code, or hit connect again on a screen whose code had
+	// visibly run out. Left standing, its socket is live and whatsmeow refuses to open a
+	// second pairing channel on one -- `GetQRChannel must be called before connecting` --
+	// which the caller receives as "the connector could not carry out the command", about
+	// a request that was perfectly reasonable.
+	//
+	// Only for the two modes that need a channel of their own. A resume asks to carry on
+	// with credentials that already exist, and tearing a live pairing down for one would
+	// have a client's periodic reconnect cancel the operator's scan.
+	if req.Pairing != "resume" {
+		s.replacePairing()
+	}
+
+	if s.isStale() {
+		// The device behind this client was deleted and its replacement could not be
+		// built at the time -- or the pairing just replaced above took its client with
+		// it. Nothing on it works, so the connect that would have failed is the connect
+		// that repairs it.
+		if err := s.recover(ctx); err != nil {
+			return fmt.Errorf("whatsmeow: %s is still without a usable device: %w", s.sid, err)
+		}
 	}
 
 	// Recorded once the request is one the session is going to act on, because the
@@ -2096,6 +2111,26 @@ func (s *Session) endPairing(run *pairingRun) bool {
 	}
 	s.pairing = nil
 	return true
+}
+
+// replacePairing ends the pairing conversation this session is in, so that the one about
+// to start gets a socket of its own.
+//
+// Quietly: no `pairing.error`, because nothing failed. The attempt is being replaced by
+// its own operator, and reporting it would put a red sentence on the screen underneath
+// the fresh code they are waiting for.
+func (s *Session) replacePairing() {
+	s.pairingMu.Lock()
+	defer s.pairingMu.Unlock()
+
+	s.mu.Lock()
+	run := s.pairing
+	s.pairing = nil
+	s.mu.Unlock()
+	if run == nil {
+		return
+	}
+	s.tearDownPairing(run, s.current())
 }
 
 // cancelPairing ends whatever conversation is open.
