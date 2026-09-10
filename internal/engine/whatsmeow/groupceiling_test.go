@@ -751,3 +751,62 @@ func TestTheSecondLookAtAGroupIsAnsweredLikeTheFirst(t *testing.T) {
 		})
 	}
 }
+
+// Invariant 5 from the far end: a redelivery must not duplicate a side effect, and it must
+// not be told the command failed because it already happened. The revision is derived from
+// the session and the idempotency key, and WhatsApp stores it as the description's id, so a
+// command whose answer was lost can recognise its own work by looking.
+func TestARedeliveryRecognisesTheDescriptionItAlreadyWrote(t *testing.T) {
+	t.Parallel()
+
+	// "!" stands for the revision this command derives, which is known only once the
+	// session exists: the seed is the session's own id, so two sessions writing the same
+	// command derive two revisions and one built out here would belong to neither.
+	for name, test := range map[string]struct {
+		topicIDs []string
+		writes   int
+	}{
+		// WhatsApp committed it and the answer was lost, so the ledger never recorded it.
+		// The first look is enough.
+		"the first look already shows it": {[]string{"!"}, 0},
+		// The group named something else when it was read, so the write goes out and
+		// WhatsApp refuses the replay -- and the second look is what tells a replay apart
+		// from a refusal there is nothing to be done about.
+		"the second look shows it": {[]string{"OLD", "!"}, 1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			here, _ := newTestSession(t, "5511999990001")
+			here.setConnected(true)
+			command := &protocol.Command{
+				Type: protocol.CommandGroupDescriptionSet, ID: "c1", IdempotencyKey: "desc-99",
+				Payload: []byte(`{"group":{"kind":"group","id":"` + theGroup + `"},"description":"x"}`),
+			}
+			revision := here.orDerived(command, "")
+
+			reads := 0
+			here.groupInfo = func(context.Context, *wm.Client, waTypes.JID) (*waTypes.GroupInfo, error) {
+				at := min(reads, len(test.topicIDs)-1)
+				reads++
+				topicID := test.topicIDs[at]
+				if topicID == "!" {
+					topicID = revision
+				}
+				return &waTypes.GroupInfo{GroupTopic: waTypes.GroupTopic{TopicID: topicID}}, nil
+			}
+			writes := 0
+			here.setTopic = func(context.Context, *wm.Client, waTypes.JID, string, string, string) error {
+				writes++
+				return &wm.IQError{Code: 409}
+			}
+
+			if _, err := here.Execute(t.Context(), command); err != nil {
+				t.Fatalf("a redelivery of a command that worked was answered %v", err)
+			}
+			if writes != test.writes {
+				t.Errorf("the description was written %d times, want %d", writes, test.writes)
+			}
+		})
+	}
+}

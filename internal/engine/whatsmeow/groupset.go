@@ -389,6 +389,9 @@ func (s *Session) writeTheDescription(
 	if err := budget.Err(); err != nil {
 		return err //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
 	}
+	if alreadyApplied(info.TopicID, revision) {
+		return nil
+	}
 
 	err = s.writeUnder(budget, client, group, info.TopicID, revision, description)
 	if err == nil {
@@ -407,7 +410,13 @@ func (s *Session) writeTheDescription(
 	if again != nil {
 		return again //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
 	}
-	if fresh == nil || fresh.TopicID == info.TopicID {
+	if fresh == nil {
+		return err //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
+	}
+	if alreadyApplied(fresh.TopicID, revision) {
+		return nil
+	}
+	if fresh.TopicID == info.TopicID {
 		return err //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
 	}
 	// Once, and under the same revision. Once because a caller waiting on a description is
@@ -435,6 +444,22 @@ func (s *Session) writeUnder(
 		}
 	}
 	return err //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
+}
+
+// alreadyApplied reports whether the description the group carries is the one this command
+// wrote, which is a question that can be asked at all only because the revision is derived
+// rather than generated: `orDerived` hashes the session and the command's idempotency key,
+// `SetGroupTopic` sends it as the description's `id`, and WhatsApp stores it as the topic
+// id. So a redelivery of a command whose answer was lost -- WhatsApp committed it and the
+// ledger never learned -- recognises its own work and reports the success it already had.
+//
+// Writing again instead is not harmless, which is why this is a check and not an
+// optimisation: replaying a revision over itself is refused with 409, the second look sees
+// the same id, and the caller is told `wa_error` for a command that worked. Invariant 5
+// says a redelivered command must not duplicate a side effect; being told it failed
+// because it already happened is the same promise broken from the other end.
+func alreadyApplied(topicID, revision string) bool {
+	return topicID == revision
 }
 
 // refusedAsAConflict reports whether WhatsApp answered 409, which for a `description`
