@@ -2215,7 +2215,15 @@ func TestAHandBackIsMarkedBeforeTheSessionStops(t *testing.T) {
 	// command went out rather than the mark being there, and the wake below then lands in a
 	// window the mark does not cover -- which is a peer adopting the account legitimately,
 	// read by the assertion at the end as the bug this test is about.
-	<-writing.entered
+	// Under a ceiling, and not a bare receive: a product that never writes the mark leaves
+	// nothing to hold, and a test waiting on that with no bound turns the failure it is
+	// here to report into a package that hangs to its own -timeout, with a goroutine dump
+	// where the assertion should be.
+	select {
+	case <-writing.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the hand-back was not marked while the session was still stopping, so every wake in that window is acknowledged as an account somebody else runs")
+	}
 	select {
 	case <-marked:
 		t.Fatal("the mark was announced while the write that leaves it was still held, so every wake this test sends lands before the mark it is meant to be covered by")
