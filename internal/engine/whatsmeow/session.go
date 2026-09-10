@@ -1971,9 +1971,12 @@ const groupIQWait = 15 * time.Second
 // boundedGroupCommand reports whether the ceiling is safe for this command.
 //
 // It is safe wherever giving up costs an answer and nothing else: asked again, the command
-// leaves the group in the state the first attempt was for. Two do not qualify.
-// `group.create` makes another group every time it runs, and `group.invite.get` rotates the
-// link when it is asked to revoke, which invalidates the one people are already holding.
+// leaves the group in the state the first attempt was for. Three do not qualify.
+// `group.create` makes another group every time it runs, `group.invite.get` rotates the
+// link when it is asked to revoke, which invalidates the one people are already holding,
+// and `group.photo.set` has WhatsApp assign a new picture id and announce another change,
+// with no id this side can hand it to make the second write the first one over again --
+// which is what the description does instead of being left out.
 // WhatsApp does not undo either because this side stopped waiting, and the ledger records
 // only successes, so one of those answered `timeout` here and retried under the same
 // idempotency key is invariant 5 broken by the fix. They keep whatsmeow's own bound, which
@@ -1984,7 +1987,7 @@ const groupIQWait = 15 * time.Second
 // duplicate.
 func boundedGroupCommand(command *protocol.Command) bool {
 	switch command.Type {
-	case protocol.CommandGroupCreate:
+	case protocol.CommandGroupCreate, protocol.CommandGroupPhotoSet:
 		return false
 	case protocol.CommandGroupInviteGet:
 		return !command.ChangesSomething()

@@ -159,6 +159,9 @@ func TestACommandThatCannotBeRepeatedKeepsItsFullWait(t *testing.T) {
 		bounded bool
 	}{
 		"creating a group": {&protocol.Command{Type: protocol.CommandGroupCreate}, false},
+		// WhatsApp assigns a new picture id and announces another change, and there is no
+		// id this side can hand it to make a second write the first one over again.
+		"setting a photo": {&protocol.Command{Type: protocol.CommandGroupPhotoSet}, false},
 		"rotating an invite": {&protocol.Command{
 			Type: protocol.CommandGroupInviteGet, Payload: []byte(`{"revoke":true}`),
 		}, false},
@@ -227,6 +230,7 @@ func TestTheTwoThatCannotBeRepeatedArriveWithNoCeiling(t *testing.T) {
 	for name, command := range map[string]*protocol.Command{
 		"creating a group":   {Type: protocol.CommandGroupCreate, Payload: []byte(`{"subject":"x","participants":[{"kind":"phone","id":"5511999990002"}]}`)},
 		"rotating an invite": {Type: protocol.CommandGroupInviteGet, Payload: []byte(`{"group":{"kind":"group","id":"` + theGroup + `"},"revoke":true}`)},
+		"setting a photo":    {Type: protocol.CommandGroupPhotoSet, Payload: []byte(`{"group":{"kind":"group","id":"` + theGroup + `"},"image":"` + aTinyJPEG + `"}`)},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -247,6 +251,12 @@ func TestTheTwoThatCannotBeRepeatedArriveWithNoCeiling(t *testing.T) {
 				}
 				return "", errors.New("recorded")
 			}
+			session.setPhoto = func(ctx context.Context, _ *wm.Client, _ waTypes.JID, _ []byte) error {
+				if until, ok := ctx.Deadline(); ok {
+					left, set = time.Until(until), true
+				}
+				return errors.New("recorded")
+			}
 
 			_, _ = session.Execute(t.Context(), command)
 
@@ -260,24 +270,59 @@ func TestTheTwoThatCannotBeRepeatedArriveWithNoCeiling(t *testing.T) {
 // The revision a description is written under. A redelivery has to write the same one:
 // whatsmeow generates a fresh id when handed an empty one, so two attempts at one command
 // would be two revisions of the group's description, and the second publishes a
-// `group.updated` nobody asked for.
+// `group.updated` nobody asked for. Two instances editing the same group under the same
+// caller-supplied key are two commands, though, and must not collide.
 func TestARedeliveredDescriptionIsWrittenUnderTheSameRevision(t *testing.T) {
 	t.Parallel()
 
-	first := revisionOf(&protocol.Command{ID: "c1", IdempotencyKey: "desc-42"})
-	again := revisionOf(&protocol.Command{ID: "c2", IdempotencyKey: "desc-42"})
-	if first == "" {
-		t.Fatal("a command that named itself was written under a generated revision")
-	}
+	here, _ := newTestSession(t, "5511999990001")
+	command := &protocol.Command{Type: protocol.CommandGroupDescriptionSet, ID: "c1", IdempotencyKey: "desc-42"}
+
+	first := here.orDerived(command, "")
+	again := here.orDerived(&protocol.Command{
+		Type: protocol.CommandGroupDescriptionSet, ID: "c2", IdempotencyKey: "desc-42",
+	}, "")
 	if first != again {
 		t.Errorf("the same command written twice got %q and then %q", first, again)
 	}
-	if other := revisionOf(&protocol.Command{ID: "c3", IdempotencyKey: "desc-43"}); other == first {
+	if other := here.orDerived(&protocol.Command{
+		Type: protocol.CommandGroupDescriptionSet, ID: "c3", IdempotencyKey: "desc-43",
+	}, ""); other == first {
 		t.Errorf("two different commands share the revision %q", other)
 	}
-	// No key is the caller declining to name the command, and there is nothing to be
-	// stable about. whatsmeow generates one, and the duplicate event goes with it.
-	if none := revisionOf(&protocol.Command{ID: "c4"}); none != "" {
-		t.Errorf("a command with no idempotency key was given the revision %q", none)
+
+	// The ledger is keyed by session, so the same key on another instance is another
+	// command. Handing WhatsApp one revision for both would have it read the second
+	// instance's edit as a replay of the first's.
+	// And the command actually reaches WhatsApp under it. Asserting `orDerived` alone is
+	// an assertion about `orDerived`: the mutation that stops passing it survives that.
+	written := make([]string, 0, 2)
+	here.setConnected(true)
+	here.setDescription = func(_ context.Context, _ *wm.Client, _ waTypes.JID, _, revision string) error {
+		written = append(written, revision)
+		return nil
+	}
+	payload := []byte(`{"group":{"kind":"group","id":"` + theGroup + `"},"description":"x"}`)
+	for _, id := range []string{"c1", "c2"} {
+		if _, err := here.Execute(t.Context(), &protocol.Command{
+			Type: protocol.CommandGroupDescriptionSet, ID: id,
+			IdempotencyKey: "desc-42", Payload: payload,
+		}); err != nil {
+			t.Fatalf("group.description.set: %v", err)
+		}
+	}
+	if written[0] == "" {
+		t.Error("the description went out under no revision at all")
+	}
+	if written[0] != written[1] {
+		t.Errorf("a redelivery went out under %q where the first went out under %q", written[1], written[0])
+	}
+
+	elsewhere, _ := newTestSession(t, "5511999990002")
+	// Two test sessions built in one test share a sid, which is what they are keyed by:
+	// named apart here so what is compared is two instances rather than one twice.
+	elsewhere.sid = "sid-another-instance"
+	if theirs := elsewhere.orDerived(command, ""); theirs == first {
+		t.Errorf("two sessions editing one group share the revision %q", theirs)
 	}
 }
