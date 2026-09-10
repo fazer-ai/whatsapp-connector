@@ -258,6 +258,27 @@ func TestAChangeWithNobodyBehindItNamesNoActor(t *testing.T) {
 	}
 }
 
+// A notification that names somebody this connector cannot put an address on. The
+// contract has no party without one -- `anyOf` requires phone or lid -- so an actor built
+// out of it would be an empty object the client's own validator rejects, taking the whole
+// frame down with it. Saying nothing about who made the change is what the optional field
+// is for.
+func TestAnActorWithNoAddressIsLeftOutRatherThanSentHollow(t *testing.T) {
+	t.Parallel()
+
+	session := groupSession(t)
+	nobody := waTypes.JID{Server: waTypes.DefaultUserServer}
+	session.handle(&waEvents.GroupInfo{
+		JID: groupJID(), Sender: &nobody,
+		Name: &waTypes.GroupName{Name: "Equipe fazer.ai"},
+	})
+
+	payload := published(t, session, protocol.EventGroupUpdated, "event_group_updated")
+	if actor, named := payload["actor"]; named && actor != nil {
+		t.Errorf("named %v as the actor of a change nobody nameable was reported for", actor)
+	}
+}
+
 // The changes the contract has no field for. Publishing nothing for them is silence a
 // client cannot tell from nothing having happened, so they go out as `group.activity`,
 // which is the contract's way of saying a group moved without saying how.
