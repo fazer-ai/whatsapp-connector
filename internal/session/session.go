@@ -986,6 +986,7 @@ func (s *Session) answer(ctx context.Context, command *protocol.Command, result 
 		return
 	}
 	failure := asProtocolError(err)
+	s.logFailure(command, failure, err)
 	_ = s.publish(ctx, &engine.Emission{
 		Type:    protocol.EventCommandFailed,
 		Payload: mustMarshal(map[string]any{"command_id": command.ID, "type": command.Type, "error": failure}),
@@ -996,6 +997,7 @@ func (s *Session) reply(ctx context.Context, command *protocol.Command, result j
 	reply := protocol.Reply{V: protocol.Version, ID: command.ID, OK: err == nil, Result: result}
 	if err != nil {
 		reply.Error = asProtocolError(err)
+		s.logFailure(command, reply.Error, err)
 	}
 	if replyErr := s.replier.Reply(ctx, command.ReplyTo, reply); replyErr != nil && ctx.Err() == nil {
 		s.log.Error().Err(replyErr).Str("cmd_id", command.ID).Msg("failed to answer a command")
@@ -1004,6 +1006,30 @@ func (s *Session) reply(ctx context.Context, command *protocol.Command, result j
 
 func expired(command *protocol.Command, now time.Time) bool {
 	return command.Deadline > 0 && now.UnixMilli() > command.Deadline
+}
+
+// logFailure is the only place a command's real error is written down.
+//
+// What the caller gets is the closed set the contract names, and for anything without a
+// code of its own that is one sentence: "the connector could not carry out the command".
+// It is deliberately uninformative -- an internal error's text is not something to put in
+// somebody's dashboard -- which leaves this the one record of what actually happened. An
+// operator who could not connect after a logout was told exactly that sentence, and this
+// log had nothing at all in it, so there was nowhere left to look.
+//
+// `internal` is the error, and everything else is the caller being told no: a payload the
+// contract refuses, a command this build does not implement, a session that moved. Those
+// are answers, not faults, and logging them at error would bury the one that is.
+func (s *Session) logFailure(command *protocol.Command, failure *protocol.Error, err error) {
+	event := s.log.Warn()
+	if failure.Code == protocol.ErrorInternal {
+		event = s.log.Error()
+	}
+	event.Err(err).
+		Str("cmd_id", command.ID).
+		Str("cmd_type", string(command.Type)).
+		Str("code", string(failure.Code)).
+		Msg("a command failed")
 }
 
 // asProtocolError maps whatever went wrong onto the closed set the client branches on.

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"slices"
 	"strconv"
 	"strings"
@@ -230,6 +231,13 @@ func (l *ledger) Remember(ctx context.Context, sid, key string, result json.RawM
 
 func newHarness(t *testing.T) harness {
 	t.Helper()
+	return newHarnessLogging(t, io.Discard)
+}
+
+// newHarnessLogging is the same harness with somewhere to read the log, for the tests
+// whose subject is what the connector wrote down rather than what it answered.
+func newHarnessLogging(t *testing.T, written io.Writer) harness {
+	t.Helper()
 	server := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
 	t.Cleanup(func() { _ = rdb.Close() })
@@ -247,7 +255,7 @@ func newHarness(t *testing.T) harness {
 		Instance: "inst-a", Engine: fakeEngine, Leases: leases, Publisher: rec, Replier: rec,
 		Ledger: book,
 		NewID:  func() string { return "evt-" + strconv.FormatInt(ids.Add(1), 10) },
-		Logger: zerolog.Nop(),
+		Logger: zerolog.New(written),
 	})
 	t.Cleanup(func() { manager.StopAll(context.Background()) })
 	answering(t, manager)
@@ -2926,4 +2934,79 @@ func TestASessionIsNotFinishedWithOnAnEventThatNeverLanded(t *testing.T) {
 	if adopted.Retired() {
 		t.Fatal("the session was finished with on an event that never reached the stream")
 	}
+}
+
+// What a caller is told about an internal error is one sentence that says nothing on
+// purpose -- the text of a Go error has no business in somebody's dashboard -- so this
+// log is the only record of what actually went wrong. An operator who could not connect
+// after a logout was answered with exactly that sentence, and this log had nothing in it
+// at all, which left nowhere to look.
+func TestACommandThatFailedSaysWhyInTheLog(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name, code, level string
+		command           protocol.CommandType
+		payload           string
+	}{
+		// Answered over a reply key, which is the path that used to write nothing: only
+		// the fire-and-forget one published anything a person could read.
+		{
+			name: "an internal error on an answered command", code: "internal", level: "error",
+			command: protocol.CommandSessionConnect, payload: `{"pairing":"neither"}`,
+		},
+		// The caller being told no, not a fault of this connector's.
+		{
+			name: "a command this build does not carry out", code: "unsupported", level: "warn",
+			command: protocol.CommandGroupList, payload: `{}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			written := &syncBuffer{}
+			h := newHarnessLogging(t, written)
+			if _, err := h.manager.Adopt(context.Background(), "s1"); err != nil {
+				t.Fatalf("Adopt: %v", err)
+			}
+
+			var acked atomic.Bool
+			h.manager.Dispatch(delivery(&protocol.Command{
+				V: protocol.Version, ID: "c9", Type: tc.command, SID: "s1",
+				Payload: json.RawMessage(tc.payload), ReplyTo: "wa:reply:c9",
+			}, &acked))
+
+			waitFor(t, "the failure in the log", func() bool {
+				return strings.Contains(written.String(), `"cmd_id":"c9"`)
+			})
+			logged := written.String()
+			for _, want := range []string{
+				`"cmd_type":"` + string(tc.command) + `"`,
+				`"code":"` + tc.code + `"`,
+				`"level":"` + tc.level + `"`,
+			} {
+				if !strings.Contains(logged, want) {
+					t.Fatalf("the log line is %s, want it to carry %s", logged, want)
+				}
+			}
+		})
+	}
+}
+
+// syncBuffer is a log sink a test can read while the pump goroutine writes to it.
+type syncBuffer struct {
+	mu      sync.Mutex
+	written bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.written.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.written.String()
 }
