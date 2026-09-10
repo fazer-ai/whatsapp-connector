@@ -1058,9 +1058,6 @@ func TestAWriteIsRefusedOnceTheLeaseHasRunOutEvenBeforeThisInstanceKnows(t *test
 func TestThePostgresPoolHasACeiling(t *testing.T) {
 	t.Parallel()
 
-	target := storetest.New(t)
-	postgres := strings.HasPrefix(target.URL, "postgres")
-
 	for _, tc := range []struct {
 		name        string
 		asked, want int
@@ -1070,7 +1067,12 @@ func TestThePostgresPoolHasACeiling(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			if !postgres {
+
+			// A database of its own. Two of these upgrading one schema at the same time
+			// race on creating it, which is a failure about this test and not about the
+			// pool it is looking at.
+			target := storetest.New(t)
+			if !strings.HasPrefix(target.URL, "postgres") {
 				t.Skip("no Postgres to open a pool against")
 			}
 
