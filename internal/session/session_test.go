@@ -442,10 +442,15 @@ func TestAnExpiredCommandWithNoReplyToIsAlsoRefusedWithoutRunning(t *testing.T) 
 	}
 }
 
-// And the other half of what a deadline says: do not let it run past that instant. Read
-// with nobody to answer, because it is this side that reads it -- the command is in
-// flight at the engine, nothing releases it, and what ends it is the deadline the caller
-// declared and no reply list to declare it for.
+// And the other half of what a deadline says: do not let it run past that instant. Also
+// read with nobody to answer, because it is this side that reads it -- the command runs
+// under a context that ends when the caller said, and no reply list is involved in
+// deciding that.
+//
+// Asked of the context the engine was handed, and not by waiting for an expiry: a
+// deadline near enough to observe passing is a wall clock deciding the order of a test,
+// and one far enough not to flake is one nothing waits for. The hour below is never
+// reached and never needs to be.
 func TestADeadlineWithNoReplyToStillBoundsTheRun(t *testing.T) {
 	t.Parallel()
 
@@ -456,20 +461,25 @@ func TestADeadlineWithNoReplyToStillBoundsTheRun(t *testing.T) {
 		t.Fatalf("Adopt: %v", err)
 	}
 	engineSession, _ := h.engine.Session("s1")
-	// Never released: if the deadline is not applied to the command's context, nothing
-	// here ever ends and the wait below is what says so.
-	t.Cleanup(engineSession.Hold())
 
 	var acked atomic.Bool
+	due := time.Now().Add(time.Hour).UnixMilli()
 	h.manager.Dispatch(delivery(&protocol.Command{
 		V: protocol.Version, ID: "c5", Type: protocol.CommandMessageMarkRead, SID: "s1",
-		Deadline: time.Now().Add(100 * time.Millisecond).UnixMilli(),
+		Deadline: due,
 		Payload:  json.RawMessage(`{"chat":{"kind":"phone","id":"5541999990000"},"message_ids":["A"],"type":"read"}`),
 	}, &acked))
 
-	waitFor(t, "the command to be cut off by its own deadline", acked.Load)
-	if got := len(engineSession.Commands()); got != 1 {
-		t.Fatalf("the engine saw %d commands, want the one that was cut off", got)
+	waitFor(t, "the command to be carried out", acked.Load)
+	bounds := engineSession.Bounds()
+	if len(bounds) != 1 {
+		t.Fatalf("the engine saw %d commands, want the one that was dispatched", len(bounds))
+	}
+	if bounds[0].IsZero() {
+		t.Fatal("the command ran under a context with no deadline, so nothing would stop it at the instant the caller named")
+	}
+	if got := bounds[0].UnixMilli(); got != due {
+		t.Fatalf("the command ran under a deadline of %d, want the %d it declared", got, due)
 	}
 }
 
