@@ -203,6 +203,92 @@ func TestLiveAFrozenDescriptionIsRefusedQuickly(t *testing.T) {
 	}
 }
 
+// TestLiveARedeliveredRemovalIsNotRefused pins what a redelivery of a successful removal
+// costs, because the fix reads a group's topic id to recognise its own work and a removal
+// leaves no topic id to recognise: whatsmeow fills `TopicID` from a description body, and
+// a removed description has none.
+//
+// The question that raises is whether WhatsApp refuses a delete stanza whose `id` it has
+// already seen. Measured on 10/09/2026 it does not -- the same command sent twice under
+// one idempotency key, so one derived revision and one `id`, is answered twice:
+//
+//	write one to remove                       744 ms   applied -> topic_id "3EB0597422..."
+//	remove it                                 798 ms   applied -> topic_id ""
+//	remove it again under the same key        991 ms   applied
+//	remove it again under another key         903 ms   applied
+//
+// So a removal needs no recognising: the redelivery succeeds on its own. This is here so
+// that stays measured rather than assumed, since the code depends on it by omission.
+func TestLiveARedeliveredRemovalIsNotRefused(t *testing.T) {
+	subject, counterpart, container := liveBoth(t, MediaOptions{})
+	counterpartJID := liveMustBePaired(t, container, liveCounterpartSID)
+	liveResumeAsking(t, subject, engine.ConnectRequest{Pairing: "resume", Groups: true})
+	liveResumeAsking(t, counterpart, engine.ConnectRequest{Pairing: "resume", Groups: true})
+
+	group := liveGroup(t, subject, counterpartJID)
+	target := map[string]any{"kind": "group", "id": group.User}
+	client := subject.current()
+
+	read := func(what, wantTopic string) {
+		t.Helper()
+		info, err := client.GetGroupInfo(t.Context(), group)
+		if err != nil {
+			t.Fatalf("%s: read the group: %v", what, err)
+		}
+		t.Logf("%s: topic=%q topic_id=%q", what, info.Topic, info.TopicID)
+		if info.Topic != wantTopic {
+			t.Errorf("%s: the group says %q, want %q", what, info.Topic, wantTopic)
+		}
+	}
+
+	send := func(what string, key string, description any) {
+		t.Helper()
+		payload := map[string]any{"group": target, "description": description}
+		started := time.Now()
+		err := liveTryKeyed(t, subject, protocol.CommandGroupDescriptionSet, key, payload)
+		took := time.Since(started)
+		t.Logf("%s took %s and answered %v", what, took.Round(time.Millisecond), err)
+		if err != nil {
+			t.Fatalf("%s was refused: %v", what, err)
+		}
+		// The wait matters as much as the answer: this is #163, and the defect was a
+		// removal that answered at all only after a minute and a quarter.
+		if took > 10*time.Second {
+			t.Errorf("%s took %s", what, took.Round(time.Millisecond))
+		}
+	}
+
+	send("write one to remove", "probe-write", "para apagar")
+	read("after writing", "para apagar")
+	send("remove it", "probe-remove", nil)
+	read("after removing", "")
+	// The same command again: same idempotency key, so the same derived revision, so the
+	// same `id` on the delete stanza. This is what a redelivery actually sends.
+	send("remove it again under the same key", "probe-remove", nil)
+	read("after the redelivery", "")
+	// And for the comparison the live phase already makes: a different command, so a
+	// different revision.
+	send("remove it again under another key", "probe-remove-2", nil)
+	read("after the second removal", "")
+}
+
+// liveTryKeyed is liveTry with an idempotency key, which is what makes two sends the same
+// command rather than two of them.
+func liveTryKeyed(
+	t *testing.T, from *Session, kind protocol.CommandType, key string, payload map[string]any,
+) error {
+	t.Helper()
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("build a %s: %v", kind, err)
+	}
+	_, err = from.Execute(t.Context(), &protocol.Command{
+		Type: kind, Payload: body, ID: key, IdempotencyKey: key,
+	})
+	return err
+}
+
 // TestLiveTheQueueMovesBehindAGroupCommand is the half of #163 the title calls the worse
 // one: the session executor is serial, so a group command WhatsApp does not answer costs
 // the account rather than the command. The probe asks about a group the account is not in,
