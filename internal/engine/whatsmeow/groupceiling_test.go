@@ -810,3 +810,44 @@ func TestARedeliveryRecognisesTheDescriptionItAlreadyWrote(t *testing.T) {
 		})
 	}
 }
+
+// The other end of `alreadyApplied`, and it is a decision rather than a leftover: a
+// redelivery whose revision is no longer what the group carries writes its text anyway.
+//
+// The case is a write WhatsApp committed after this side gave up on the answer, with
+// another admin writing over it before the caller sent the command again. There is nothing
+// left to recognise then, and the two available readings are opposite. Refusing would make
+// `group.description.set` a compare-and-set, which it has never been and which
+// `TestAConcurrentEditIsWrittenOverAndNotRefused` rules out from the first delivery's side;
+// writing means a caller asking twice for its text gets its text. What closes the gap is
+// the ledger recording an attempt rather than only a success, which is #165.
+func TestARedeliveryWhoseRevisionMovedOnStillWritesItsText(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setConnected(true)
+	session.groupInfo = func(context.Context, *wm.Client, waTypes.JID) (*waTypes.GroupInfo, error) {
+		// Somebody else's description, written while this command had no answer.
+		return &waTypes.GroupInfo{GroupTopic: waTypes.GroupTopic{TopicID: "THEIRS"}}, nil
+	}
+	var wrote, named string
+	session.setTopic = func(
+		_ context.Context, _ *wm.Client, _ waTypes.JID, previous, _, description string,
+	) error {
+		named, wrote = previous, description
+		return nil
+	}
+
+	if _, err := session.Execute(t.Context(), &protocol.Command{
+		Type: protocol.CommandGroupDescriptionSet, ID: "c1", IdempotencyKey: "desc-77",
+		Payload: []byte(`{"group":{"kind":"group","id":"` + theGroup + `"},"description":"o meu texto"}`),
+	}); err != nil {
+		t.Fatalf("a redelivery was answered %v instead of writing its text", err)
+	}
+	if wrote != "o meu texto" {
+		t.Errorf("the group was written %q", wrote)
+	}
+	if named != "THEIRS" {
+		t.Errorf("the write named %q, and naming anything else is a 409 for a command that can succeed", named)
+	}
+}

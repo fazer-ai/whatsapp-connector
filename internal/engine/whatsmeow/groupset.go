@@ -458,6 +458,20 @@ func (s *Session) writeUnder(
 // the same id, and the caller is told `wa_error` for a command that worked. Invariant 5
 // says a redelivered command must not duplicate a side effect; being told it failed
 // because it already happened is the same promise broken from the other end.
+//
+// What it does not do, and the limit is the point: it recognises the revision only while
+// the revision is still what the group carries. WhatsApp committing a write whose answer
+// this side gave up on, and another admin writing over it before the caller redelivers,
+// leaves nothing here to recognise -- the redelivery reads somebody else's id and writes
+// its own text over it.
+//
+// That is the command's own meaning rather than a hole in it. `group.description.set` is
+// last write wins: a caller that sends it again is asking for its text to be what the
+// group says, and the alternative -- refusing because somebody else got there first -- is
+// the compare-and-set this command has never been and that the review rejected when an
+// earlier revision of it did exactly that. What would close the gap properly is the ledger
+// recording an attempt rather than only a success, which is #165 and is a change to how
+// invariant 5 is kept rather than to what it promises.
 func alreadyApplied(topicID, revision string) bool {
 	return topicID == revision
 }
