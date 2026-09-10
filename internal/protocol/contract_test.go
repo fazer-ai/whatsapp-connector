@@ -116,6 +116,20 @@ func TestEveryFixtureTypeIsKnown(t *testing.T) {
 // of saying "this command answers" have to agree. Without this, a fixture can promise a
 // reply for a command no implementation ever replies to, and the caller hangs until its
 // deadline. That is exactly how pairing.request_code shipped wrong.
+//
+// The deadline is not part of that agreement, and the rule that said it was came along
+// for the ride: that same fixture lost both fields in one commit, and the check written
+// next to this one read the pair as the point. It is not. Nothing here reads an expiry
+// through reply_to -- `expired` refuses a command whose deadline passed before it was
+// reached, and `carryOut` runs what it does start under a `context.WithDeadline`, and
+// neither looks at where a reply would go. `stillHeard` is the only place that reads
+// both, and what it decides is whether spending a refusal would reach anybody.
+//
+// So a deadline with no reply_to is a coherent frame: "do not start this after that
+// instant, and do not let it run past it", from a caller with nowhere to be answered.
+// The pairing.request_code fixture is that frame, and it is the one the Chatwoot side
+// sends: 300 seconds, and no reply list, because the code arrives as a pairing.code
+// event.
 func TestReplyToMatchesRPCClassification(t *testing.T) {
 	for name, fixture := range fixtures(t, "command") {
 		frame, ok := fixture.(map[string]any)
@@ -124,14 +138,10 @@ func TestReplyToMatchesRPCClassification(t *testing.T) {
 		}
 		commandType := protocol.CommandType(frame["type"].(string))
 		_, hasReplyTo := frame["reply_to"]
-		_, hasDeadline := frame["deadline"]
 
 		t.Run(name, func(t *testing.T) {
 			if isRPC := protocol.IsRPC(commandType); hasReplyTo != isRPC {
 				t.Fatalf("fixture has reply_to=%v but IsRPC(%s)=%v", hasReplyTo, commandType, isRPC)
-			}
-			if hasDeadline && !hasReplyTo {
-				t.Fatalf("fixture carries a deadline without a reply_to: nobody would read the expiry")
 			}
 		})
 	}
