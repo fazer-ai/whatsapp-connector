@@ -551,33 +551,148 @@ func TestADescriptionOfSpacesIsWrittenAndNotTakenForARemoval(t *testing.T) {
 	}
 }
 
-// A group with no description has no id to name, so `SetGroupTopic` goes and reads one for
-// itself -- and flattens a failure of that read with `%v`, which leaves nothing for
-// `contactFailure` to classify. Passed on as it comes, a rate limit or a disconnection
-// reaches the caller as `internal`: this connector broke, rather than WhatsApp is
-// throttling you. Asked again through a call that keeps its sentinels, it is told apart.
-func TestAFailureWhatsmeowFlattenedIsAskedAboutAgain(t *testing.T) {
+// `group.description.set` is last write wins, and naming an id would quietly make it a
+// compare-and-set: a description another admin changed between the read and the write
+// answers 409 for naming the wrong predecessor. Before this change the call in use sent no
+// `prev` at all and could not be refused that way, so refusing now would be a semantics
+// change smuggled in as a bugfix.
+func TestAConcurrentEditIsWrittenOverAndNotRefused(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setConnected(true)
+	reads, ids := 0, []string{}
+	// Every query of the second round trip, under the same budget as the first: a retry
+	// that leaves the ceiling behind hands the account back the wait the ceiling took away.
+	var under []time.Duration
+	bounded := func(ctx context.Context) {
+		if until, ok := ctx.Deadline(); ok {
+			under = append(under, time.Until(until))
+			return
+		}
+		under = append(under, time.Hour)
+	}
+	session.groupInfo = func(ctx context.Context, _ *wm.Client, _ waTypes.JID) (*waTypes.GroupInfo, error) {
+		reads++
+		bounded(ctx)
+		if reads == 1 {
+			return &waTypes.GroupInfo{GroupTopic: waTypes.GroupTopic{TopicID: "OLD"}}, nil
+		}
+		// Somebody else's write landed in between, so the group names a different one now.
+		return &waTypes.GroupInfo{GroupTopic: waTypes.GroupTopic{TopicID: "THEIRS"}}, nil
+	}
+	revisions := []string{}
+	session.setTopic = func(
+		ctx context.Context, _ *wm.Client, _ waTypes.JID, previous, revision, _ string,
+	) error {
+		ids, revisions = append(ids, previous), append(revisions, revision)
+		bounded(ctx)
+		if previous == "OLD" {
+			return &wm.IQError{Code: 409}
+		}
+		return nil
+	}
+
+	if _, err := session.Execute(t.Context(), &protocol.Command{
+		Type:    protocol.CommandGroupDescriptionSet,
+		Payload: []byte(`{"group":{"kind":"group","id":"` + theGroup + `"},"description":"x"}`),
+	}); err != nil {
+		t.Fatalf("a concurrent edit was answered %v instead of written over", err)
+	}
+	if len(ids) != 2 || ids[1] != "THEIRS" {
+		t.Errorf("the description was written naming %v, want the second to name THEIRS", ids)
+	}
+	// A redelivery of one command has to write one revision, not one per attempt.
+	if revisions[0] != revisions[1] {
+		t.Errorf("the retry went out under %q where the first went out under %q",
+			revisions[1], revisions[0])
+	}
+	for i, left := range under {
+		if left > 20*time.Second {
+			t.Errorf("query %d of the command was given %s", i+1, left)
+		}
+	}
+}
+
+// And a 409 that is not a concurrent edit is answered, not retried. A frozen description
+// gives the same id back however many times it is read, and racing it would spend the
+// session's only goroutine on a write WhatsApp has already refused.
+func TestARefusalThatIsNotAConcurrentEditIsAnswered(t *testing.T) {
 	t.Parallel()
 
 	for name, test := range map[string]struct {
-		topicID string
-		again   error
+		refusal error
 		want    protocol.ErrorCode
+		reads   int
 	}{
-		"throttled while it read the id for itself": {
-			"", &wm.IQError{Code: 429}, protocol.ErrorRateLimited,
+		// Frozen: read again, same id, so there was no concurrent edit to write over.
+		"a frozen description": {&wm.IQError{Code: 409}, protocol.ErrorWaError, 2},
+		// Not a conflict at all, so there is nothing to look at a second time.
+		"not an admin":            {&wm.IQError{Code: 403}, protocol.ErrorWaError, 1},
+		"WhatsApp is throttling":  {&wm.IQError{Code: 429}, protocol.ErrorRateLimited, 1},
+		"the connection went":     {wm.ErrIQDisconnected, protocol.ErrorNotConnected, 1},
+		"WhatsApp never answered": {wm.ErrIQTimedOut, protocol.ErrorTimeout, 1},
+		// whatsmeow's own `%v` around a failure of the lookup it does for itself. Nothing
+		// here can put the sentinel back, and this repository answers a cause it cannot
+		// name with `internal` rather than with a guess.
+		"a cause whatsmeow flattened": {
+			errors.New("failed to get old group info to update topic: some error"),
+			protocol.ErrorInternal, 1,
 		},
-		"disconnected while it read the id for itself": {
-			"", wm.ErrIQDisconnected, protocol.ErrorNotConnected,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			session, _ := newTestSession(t, "5511999990001")
+			session.setConnected(true)
+			reads := 0
+			session.groupInfo = func(context.Context, *wm.Client, waTypes.JID) (*waTypes.GroupInfo, error) {
+				reads++
+				return &waTypes.GroupInfo{GroupTopic: waTypes.GroupTopic{TopicID: "undefined"}}, nil
+			}
+			writes := 0
+			session.setTopic = func(context.Context, *wm.Client, waTypes.JID, string, string, string) error {
+				writes++
+				return test.refusal
+			}
+
+			_, err := session.Execute(t.Context(), &protocol.Command{
+				Type:    protocol.CommandGroupDescriptionSet,
+				Payload: []byte(`{"group":{"kind":"group","id":"` + theGroup + `"},"description":"x"}`),
+			})
+			assertCode(t, err, test.want)
+			if reads != test.reads {
+				t.Errorf("the group was read %d times, want %d", reads, test.reads)
+			}
+			if writes != 1 {
+				t.Errorf("the description was written %d times for a refusal nobody could act on", writes)
+			}
+		})
+	}
+}
+
+// What the second look answers is the command's answer. Swallowing a failure of it reports
+// the first refusal, which is the one thing that read exists to find out is out of date;
+// and a group that comes back with neither a group nor an error takes the session's
+// goroutine down on the field read next.
+func TestTheSecondLookAtAGroupIsAnsweredLikeTheFirst(t *testing.T) {
+	t.Parallel()
+
+	for name, test := range map[string]struct {
+		info    *waTypes.GroupInfo
+		err     error
+		want    protocol.ErrorCode
+		written int
+	}{
+		"the connection went while it looked again": {
+			nil, wm.ErrIQDisconnected, protocol.ErrorNotConnected, 1,
 		},
-		// The read answers, so what failed was the write itself and there is nothing to
-		// recover: `internal` is the honest answer to an error nobody can name.
-		"the write failed for a reason of its own": {"", nil, protocol.ErrorInternal},
-		// Nothing was flattened: the id went out with the write, so whatsmeow never read
-		// anything and a second read would only be a round trip spent on a guess.
-		"a group whose description already has an id": {
-			"3EB0C2A14F4FBC421B2E8C", &wm.IQError{Code: 429}, protocol.ErrorInternal,
+		"WhatsApp throttled the second look": {
+			nil, &wm.IQError{Code: 429}, protocol.ErrorRateLimited, 1,
 		},
+		// Nothing to compare and nothing to name: the first refusal stands, and reading a
+		// field off the nil would take every command queued behind this one down with it.
+		"the group came back empty": {nil, nil, protocol.ErrorWaError, 1},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -588,16 +703,14 @@ func TestAFailureWhatsmeowFlattenedIsAskedAboutAgain(t *testing.T) {
 			session.groupInfo = func(context.Context, *wm.Client, waTypes.JID) (*waTypes.GroupInfo, error) {
 				reads++
 				if reads == 1 {
-					return &waTypes.GroupInfo{
-						GroupTopic: waTypes.GroupTopic{TopicID: test.topicID},
-					}, nil
+					return &waTypes.GroupInfo{GroupTopic: waTypes.GroupTopic{TopicID: "OLD"}}, nil
 				}
-				return &waTypes.GroupInfo{}, test.again
+				return test.info, test.err
 			}
+			writes := 0
 			session.setTopic = func(context.Context, *wm.Client, waTypes.JID, string, string, string) error {
-				// whatsmeow's own line, and the point of it is the sentinel it drops.
-				//nolint:errorlint // the point is the sentinel whatsmeow drops
-				return fmt.Errorf("failed to get old group info to update topic: %v", test.again)
+				writes++
+				return &wm.IQError{Code: 409}
 			}
 
 			_, err := session.Execute(t.Context(), &protocol.Command{
@@ -605,51 +718,8 @@ func TestAFailureWhatsmeowFlattenedIsAskedAboutAgain(t *testing.T) {
 				Payload: []byte(`{"group":{"kind":"group","id":"` + theGroup + `"},"description":"x"}`),
 			})
 			assertCode(t, err, test.want)
-		})
-	}
-}
-
-// And an answer that already carries its own cause is passed on as it stands. Asking again
-// would spend another of the session's serial round trips to be told the same thing, which
-// is the cost this whole change exists to stop paying.
-func TestAnAnswerThatNamesItselfIsNotAskedAboutAgain(t *testing.T) {
-	t.Parallel()
-
-	for name, test := range map[string]struct {
-		refusal error
-		want    protocol.ErrorCode
-	}{
-		// A 409 on a frozen description is the answer, not a symptom.
-		"WhatsApp refused it":          {&wm.IQError{Code: 409}, protocol.ErrorWaError},
-		"WhatsApp is throttling":       {&wm.IQError{Code: 429}, protocol.ErrorRateLimited},
-		"the connection went":          {wm.ErrIQDisconnected, protocol.ErrorNotConnected},
-		"WhatsApp never answered":      {wm.ErrIQTimedOut, protocol.ErrorTimeout},
-		"the session has no account":   {wm.ErrNotLoggedIn, protocol.ErrorNotPaired},
-		"the command ran out of time":  {context.DeadlineExceeded, protocol.ErrorTimeout},
-		"the session is not connected": {wm.ErrNotConnected, protocol.ErrorNotConnected},
-	} {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-
-			session, _ := newTestSession(t, "5511999990001")
-			session.setConnected(true)
-			reads := 0
-			session.groupInfo = func(context.Context, *wm.Client, waTypes.JID) (*waTypes.GroupInfo, error) {
-				reads++
-				// No id, which is the case that would otherwise be asked about again.
-				return &waTypes.GroupInfo{GroupTopic: waTypes.GroupTopic{TopicID: ""}}, nil
-			}
-			session.setTopic = func(context.Context, *wm.Client, waTypes.JID, string, string, string) error {
-				return test.refusal
-			}
-
-			_, err := session.Execute(t.Context(), &protocol.Command{
-				Type:    protocol.CommandGroupDescriptionSet,
-				Payload: []byte(`{"group":{"kind":"group","id":"` + theGroup + `"},"description":"x"}`),
-			})
-			assertCode(t, err, test.want)
-			if reads != 1 {
-				t.Errorf("the group was read %d times for an answer that already said what happened", reads)
+			if writes != test.written {
+				t.Errorf("the description was written %d times, want %d", writes, test.written)
 			}
 		})
 	}

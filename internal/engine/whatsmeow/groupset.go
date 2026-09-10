@@ -347,21 +347,25 @@ func (s *Session) setGroupPhoto(ctx context.Context, command *protocol.Command) 
 // send the stanza this connector would want: an id, naming no predecessor. It is refused
 // too. So a description written the old way is frozen -- no call and no stanza shape
 // changes it, and there is nothing left here to try. What this can do is stop making new
-// ones, and answer the frozen ones in a third of a second rather than in the
-// seventy-five #163 measured four times over.
+// ones, and answer the frozen ones in a third of a second rather than in the seventy-five
+// #163 measured four times over.
 //
 // The id is read here rather than left to `SetGroupTopic`, which fetches it itself when
-// handed an empty one and flattens a failure of that fetch with `%v`: a disconnection or
-// a rate limit during it would reach the caller as `internal` instead of as itself.
+// handed an empty one and flattens a failure of that fetch with `%v`. Two consequences,
+// and the second is a limit worth stating rather than implying:
 //
-// What that does not buy, and the limit is worth stating rather than implying: a group
-// with no description when it was read has no id to name, so `SetGroupTopic` reads it
-// again anyway, and that second read is the one whose failure arrives without a cause --
-// which is why an unclassifiable answer is asked about again below instead of being
-// passed on as `internal`. And a description another admin wrote between the read and the
-// write is written over rather than refused, because `SetGroupTopic` names the id it was
-// given. That is last write wins, which is what `group.description.set` means and what
-// this connector has always done.
+// Naming an id makes the write a compare-and-set, and `group.description.set` is not one:
+// it is last write wins, and it was before this change too, because the call it used sent
+// no `prev` and could not be refused for naming the wrong one. So the one 409 that means
+// "somebody else changed it since you looked" is answered by looking again and writing
+// over what is there now, under the same revision, once.
+//
+// And a group with no description has no id to name, so `SetGroupTopic` reads it again
+// anyway. That read is whatsmeow's, its failure arrives with the sentinel flattened out of
+// it, and there is nothing here that can put it back: a second request answers about
+// itself, not about the one that failed. Such an answer reaches the caller as `internal`,
+// which is what this repository does with a cause it cannot name. Fixing it properly is a
+// `%w` upstream.
 func (s *Session) writeTheDescription(
 	ctx context.Context, client *wm.Client, group waTypes.JID, description, revision string,
 ) error {
@@ -396,29 +400,32 @@ func (s *Session) writeTheDescription(
 		// that it stopped waiting.
 		return ended //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
 	}
-	if info.TopicID == "" && lostItsCause(err) {
-		// The group had no description, so `SetGroupTopic` went to read one for itself and
-		// what came back is its own `%v` with nothing left in it to classify. Asked again
-		// here, through a call that keeps its sentinels: a disconnection and a rate limit
-		// both outlive one round trip, so whichever ended that read ends this one too and
-		// the caller is told which it was instead of `internal`.
-		if _, again := s.groupInfo(budget, client, group); again != nil {
-			return again //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
-		}
+	if !refusedAsAConflict(err) {
+		return err //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
 	}
-	return err //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
+
+	// A 409 says the description this write claimed to replace is not the one that is
+	// there. Either somebody changed it in the moment between the read and the write, or
+	// the group is frozen -- and the two are told apart by looking, not by guessing: a
+	// changed id is a concurrent edit, and the same id back is a group where nothing this
+	// connector sends will ever be accepted.
+	fresh, again := s.groupInfo(budget, client, group)
+	if again != nil {
+		return again //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
+	}
+	if fresh == nil || fresh.TopicID == info.TopicID {
+		return err //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
+	}
+	// Once, and under the same revision. Once because a caller waiting on a description is
+	// better served by an answer than by this session's only goroutine racing whoever else
+	// is editing; the same revision because a redelivery of this command has to write the
+	// revision it wrote the first time rather than a second one.
+	return s.setTopic(budget, client, group, fresh.TopicID, revision, description) //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
 }
 
-// lostItsCause reports whether an error carries nothing `contactFailure` can name, which is
-// what whatsmeow's `%v` leaves behind. The three checks are that function's own, in its
-// order: anything it recognises is passed on as it stands.
-func lostItsCause(err error) bool {
-	if named, _ := commandFailure(err, "description change"); named {
-		return false
-	}
-	if errors.Is(err, wm.ErrIQDisconnected) {
-		return false
-	}
+// refusedAsAConflict reports whether WhatsApp answered 409, which for a `description`
+// stanza means the `prev` it carried is not what the group has.
+func refusedAsAConflict(err error) bool {
 	var refused *wm.IQError
-	return !errors.As(err, &refused)
+	return errors.As(err, &refused) && refused.Code == 409
 }
