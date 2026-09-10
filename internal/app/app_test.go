@@ -274,7 +274,9 @@ func TestAnInstanceWithADifferentShardCountRefusesToStart(t *testing.T) {
 	server := miniredis.RunT(t)
 	start(t, server.Addr(), "inst-a", nil)
 
-	t.Setenv("WAC_EVENT_SHARDS", "16")
+	// Derived from the default rather than written out, so raising the default does not
+	// turn this into a test of two instances that agree.
+	t.Setenv("WAC_EVENT_SHARDS", strconv.Itoa(app.DefaultEventShards*2))
 	cfg, err := app.LoadConfig("test-host")
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)

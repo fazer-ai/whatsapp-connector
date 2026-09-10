@@ -187,7 +187,7 @@ restart, and reports itself healthy while doing it.
 | `REDIS_PASSWORD` | — | Overrides the password in the URL, for deployments that pass the two separately |
 | `WAC_INSTANCE` | the hostname | This instance's id. In a container the hostname is the container id, which is unique per replica |
 | `WAC_REDIS_PREFIX` | `wa:` | Namespaces every key, so one Redis can host two independent fleets |
-| `WAC_EVENT_SHARDS` | `8` | How many event streams the fleet publishes to. Fleet-wide and effectively permanent: an instance that disagrees with what is recorded refuses to start |
+| `WAC_EVENT_SHARDS` | `16` | How many event streams the fleet publishes to. Fleet-wide and effectively permanent: an instance that disagrees with what is recorded refuses to start |
 | `WAC_ENGINE` | `fake` | `whatsmeow` for a real account, `fake` for a fleet with nothing behind it |
 | `WAC_DATABASE_URL` | none | Where pairings live. `postgres://…`, `sqlite:…` or `file:…`. Required by the `whatsmeow` engine |
 | `WAC_DATABASE_MAX_CONNS` | `20` | Ceiling on the Postgres pool. There is one pool per process, shared by every session on it, and a connection is taken per query rather than held per account, so this bounds concurrent queries and not paired numbers. Left uncapped, `database/sql` opens one per concurrent query and a burst can reach Postgres's own `max_connections`, which refuses connections to every other application on that server. Ignored for SQLite, where a file holds one writer whatever the pool says |

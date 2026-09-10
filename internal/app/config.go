@@ -98,7 +98,14 @@ const DefaultDeviceName = "Chrome"
 // DefaultEventShards is how many event streams a fleet publishes to. It is fleet-wide
 // and effectively permanent: changing it re-hashes every session onto a different
 // stream, so an instance that disagrees with what is recorded refuses to start.
-const DefaultEventShards = 8
+//
+// Sixteen and not eight because of that permanence. A session always lands on the same
+// stream and a stream is read by one consumer thread, so the count is the ceiling on how
+// much of an installation's traffic can be worked on at once. Raising it later is not a
+// setting change, it is a re-shard, which is the reason to start with room rather than
+// with the smallest number that works today. What sixteen costs over eight is eight more
+// mostly-empty Redis keys and eight more leases to renew.
+const DefaultEventShards = 16
 
 // DefaultMediaRefetch is how long a message can still be asked for its file again.
 //
