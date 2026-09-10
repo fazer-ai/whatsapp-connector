@@ -351,8 +351,11 @@ func (s *Session) setGroupPhoto(ctx context.Context, command *protocol.Command) 
 // #163 measured four times over.
 //
 // The id is read here rather than left to `SetGroupTopic`, which fetches it itself when
-// handed an empty one and flattens a failure of that fetch with `%v`. Two consequences,
-// and the second is a limit worth stating rather than implying:
+// handed an empty one and flattens a failure of that fetch with `%v`. The reads are under
+// a ceiling and the writes are not, which is the connector's rule rather than this
+// command's: giving up on a read costs its answer, and giving up on a write turns
+// "WhatsApp applied it" into a `timeout` the ledger never records. Two consequences, and
+// the second is a limit worth stating rather than implying:
 //
 // Naming an id makes the write a compare-and-set, and `group.description.set` is not one:
 // it is last write wins, and it was before this change too, because the call it used sent
@@ -369,10 +372,11 @@ func (s *Session) setGroupPhoto(ctx context.Context, command *protocol.Command) 
 func (s *Session) writeTheDescription(
 	ctx context.Context, client *wm.Client, group waTypes.JID, description, revision string,
 ) error {
-	// One budget for the command, not one per query. The ceiling exists to bound how long
-	// a single command may hold the session's serial executor, and a read and a write
-	// given fifteen seconds each hold it for thirty -- which is the thing being prevented,
-	// arrived at by applying the prevention twice.
+	// One budget for the two reads, not one each. The ceiling exists to bound how long a
+	// single command may hold the session's serial executor, and two lookups given fifteen
+	// seconds each hold it for thirty -- which is the thing being prevented, arrived at by
+	// applying the prevention twice. The writes are outside it, for the reason spelled out
+	// at `writeUnder`.
 	budget, giveUp := context.WithTimeout(ctx, groupIQWait)
 	defer giveUp()
 	info, err := s.groupInfo(budget, client, group)
@@ -393,7 +397,7 @@ func (s *Session) writeTheDescription(
 		return nil
 	}
 
-	err = s.writeUnder(budget, client, group, info.TopicID, revision, description)
+	err = s.writeUnder(ctx, client, group, info.TopicID, revision, description)
 	if err == nil {
 		return nil
 	}
@@ -423,23 +427,29 @@ func (s *Session) writeTheDescription(
 	// better served by an answer than by this session's only goroutine racing whoever else
 	// is editing; the same revision because a redelivery of this command has to write the
 	// revision it wrote the first time rather than a second one.
-	return s.writeUnder(budget, client, group, fresh.TopicID, revision, description)
+	return s.writeUnder(ctx, client, group, fresh.TopicID, revision, description)
 }
 
-// writeUnder writes the description and reports the ceiling as itself when the ceiling is
-// what ended the write.
+// writeUnder writes the description under the caller's own context, and reports a deadline
+// as itself when a deadline is what ended the write.
 //
-// `SetGroupTopic` reads the current id for itself when handed an empty one and flattens a
-// failure of that read with `%v`, and a budget running out there is the likeliest thing to
-// end it. A deadline reported as `internal` tells the caller this connector broke rather
-// than that it stopped waiting -- so both writes go through here rather than one of them
-// remembering to check.
+// No ceiling of this connector's, and that is the whole point of the function's existence
+// being separate from the reads above it: the ledger records only successes, so a ceiling
+// that turns "WhatsApp applied it" into `timeout` leaves nothing recorded and the
+// redelivery writes again. Every other group write is unbounded for that reason, and this
+// one is no exception -- the derived revision recognises a redelivery only while the group
+// still carries it, which a third party's edit ends.
+//
+// The check that remains is about naming what happened: `SetGroupTopic` reads the current
+// id for itself when handed an empty one and flattens a failure of that read with `%v`, so
+// a caller's own deadline ending the write would otherwise reach it as `internal` -- this
+// connector broke, rather than you did not wait long enough.
 func (s *Session) writeUnder(
-	budget context.Context, client *wm.Client, group waTypes.JID, previous, revision, description string,
+	ctx context.Context, client *wm.Client, group waTypes.JID, previous, revision, description string,
 ) error {
-	err := s.setTopic(budget, client, group, previous, revision, description)
+	err := s.setTopic(ctx, client, group, previous, revision, description)
 	if err != nil {
-		if ended := budget.Err(); ended != nil {
+		if ended := ctx.Err(); ended != nil {
 			return ended //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
 		}
 	}

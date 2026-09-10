@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"strconv"
 	"testing"
 	"time"
 
@@ -339,20 +340,18 @@ func TestARedeliveredDescriptionIsWrittenUnderTheSameRevision(t *testing.T) {
 	}
 }
 
-// Both halves of a description change are under the ceiling, and under one budget between
-// them. The read is bounded because asked again it answers again; the write is bounded
-// because it goes out under a revision this side chose, so WhatsApp committing it after
-// the wait was given up on and the caller redelivering writes that same revision again
-// rather than a second one.
-func TestBothHalvesOfADescriptionAreBounded(t *testing.T) {
+// The reads of a description change are under the ceiling and the writes are not, which is
+// the connector's rule rather than this command's: giving up on a read costs its answer,
+// and giving up on a write turns "WhatsApp applied it" into a `timeout` the ledger never
+// records, so the redelivery the caller is entitled to send writes it again.
+func TestOnlyTheReadsOfADescriptionAreBounded(t *testing.T) {
 	t.Parallel()
 
 	for name, topicID := range map[string]string{
 		"a description that can carry a revision": "3EB0C2A14F4FBC421B2E8C",
 		"a group that never had one":              "",
 		// Frozen: written before this connector gave a description an id. WhatsApp
-		// refuses every change to it, and the ceiling is what makes that refusal cost a
-		// third of a second instead of seventy-five.
+		// refuses every change to it, and it answers that refusal in a third of a second.
 		"a description with no id": "undefined",
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -385,28 +384,34 @@ func TestBothHalvesOfADescriptionAreBounded(t *testing.T) {
 			if !lookBounded || lookedUnder > 20*time.Second {
 				t.Errorf("the group was read with no ceiling (set=%v, left=%s)", lookBounded, lookedUnder)
 			}
-			if !set || left > 20*time.Second {
-				t.Errorf("the description was written with no ceiling (set=%v, left=%s)", set, left)
+			if set && left <= 20*time.Second {
+				t.Errorf("the description was written under a %s ceiling, and WhatsApp applying it after that is a side effect a retry repeats", left)
 			}
 		})
 	}
 }
 
-// One ceiling for the command, not one per query. `group.description.set` is a read and
-// then a write, and giving each of them fifteen seconds holds the session's serial
-// executor for thirty -- the thing the ceiling exists to prevent, reached by applying the
-// prevention twice. What separates one budget from two is the instant they expire at: from
-// one budget both queries expire together, and from two the second expires later by
-// whatever the first one spent.
-func TestADescriptionGetsOneCeilingAndNotOnePerQuery(t *testing.T) {
+// One ceiling for the command's reads, not one per read. `group.description.set` reads the
+// group, and reads it again when WhatsApp answers 409, and giving each fifteen seconds
+// holds the session's serial executor for thirty -- the thing the ceiling exists to
+// prevent, reached by applying the prevention twice. What separates one budget from two is
+// the instant they expire at: from one budget both reads expire together, and from two the
+// second expires later by whatever the first one spent.
+func TestTheReadsOfADescriptionShareOneCeiling(t *testing.T) {
 	t.Parallel()
 
 	session, _ := newTestSession(t, "5511999990001")
 	session.setConnected(true)
 
-	var readUntil, writeUntil time.Time
+	var deadlines []time.Time
+	reads := 0
 	session.groupInfo = func(ctx context.Context, _ *wm.Client, _ waTypes.JID) (*waTypes.GroupInfo, error) {
-		readUntil, _ = ctx.Deadline()
+		until, ok := ctx.Deadline()
+		if !ok {
+			t.Error("the group was read with no ceiling at all")
+		}
+		deadlines = append(deadlines, until)
+		reads++
 		// The read costs time, and the test has to make that cost real: two budgets
 		// created a nanosecond apart are two budgets, but not ones an assertion can tell
 		// from one. Spent here rather than slept, because nothing is being waited for --
@@ -414,13 +419,19 @@ func TestADescriptionGetsOneCeilingAndNotOnePerQuery(t *testing.T) {
 		for spent := time.Now(); time.Since(spent) < 5*time.Millisecond; {
 			runtime.Gosched()
 		}
+		// A different id each time, so the 409 below reads as a concurrent edit and the
+		// second read happens at all.
 		return &waTypes.GroupInfo{
-			GroupTopic: waTypes.GroupTopic{TopicID: "3EB0C2A14F4FBC421B2E8C"},
+			GroupTopic: waTypes.GroupTopic{TopicID: "id-" + strconv.Itoa(reads)},
 		}, nil
 	}
-	session.setTopic = func(ctx context.Context, _ *wm.Client, _ waTypes.JID, _, _, _ string) error {
-		writeUntil, _ = ctx.Deadline()
-		return errors.New("recorded")
+	writes := 0
+	session.setTopic = func(context.Context, *wm.Client, waTypes.JID, string, string, string) error {
+		writes++
+		if writes == 1 {
+			return &wm.IQError{Code: 409}
+		}
+		return nil
 	}
 
 	_, _ = session.Execute(t.Context(), &protocol.Command{
@@ -428,13 +439,12 @@ func TestADescriptionGetsOneCeilingAndNotOnePerQuery(t *testing.T) {
 		Payload: []byte(`{"group":{"kind":"group","id":"` + theGroup + `"},"description":"x"}`),
 	})
 
-	if readUntil.IsZero() || writeUntil.IsZero() {
-		t.Fatalf("a query went out with no deadline (read set=%v, write set=%v)",
-			!readUntil.IsZero(), !writeUntil.IsZero())
+	if len(deadlines) != 2 {
+		t.Fatalf("the group was read %d times, want the two the conflict path takes", len(deadlines))
 	}
-	if writeUntil.After(readUntil) {
-		t.Errorf("the write was given until %s and the read until %s: %s more than the command's whole ceiling",
-			writeUntil, readUntil, writeUntil.Sub(readUntil))
+	if deadlines[1].After(deadlines[0]) {
+		t.Errorf("the second read was given until %s and the first until %s: %s more than the command's whole ceiling",
+			deadlines[1], deadlines[0], deadlines[1].Sub(deadlines[0]))
 	}
 }
 
@@ -472,13 +482,15 @@ func TestADescriptionIsNotWrittenAfterItsBudgetRanOut(t *testing.T) {
 }
 
 // `SetGroupTopic` reads the current description for itself when this side has no id to
-// hand it, and it flattens a failure of that read with `%v`. So the ceiling ending the
+// hand it, and it flattens a failure of that read with `%v`. So a deadline ending the
 // write arrives as a string with no sentinel left in it, and reported as it comes it tells
 // the caller this connector broke rather than that it stopped waiting.
 //
-// Both writes, because there are two: the first, and the one that follows a 409 from
-// somebody else's edit. A check the second forgot would be invisible from the first.
-func TestAWriteEndedByTheCeilingIsReportedAsTheCeiling(t *testing.T) {
+// The deadline here is the caller's own -- the writes carry no ceiling of this
+// connector's. Both of them, because there are two: the first, and the one that follows a
+// 409 from somebody else's edit. A check the second forgot would be invisible from the
+// first.
+func TestAWriteEndedByADeadlineIsReportedAsOne(t *testing.T) {
 	t.Parallel()
 
 	for name, endsOn := range map[string]int{
@@ -509,8 +521,8 @@ func TestAWriteEndedByTheCeilingIsReportedAsTheCeiling(t *testing.T) {
 				if writes < endsOn {
 					return &wm.IQError{Code: 409}
 				}
-				// The budget runs out with the write already in flight, which is the case
-				// the check is for: before it, the read's own would have caught it.
+				// The caller's deadline runs out with the write already in flight, which
+				// is the case the check is for.
 				cancel()
 				<-ctx.Done()
 				//nolint:errorlint // the point is the sentinel whatsmeow drops
@@ -589,19 +601,16 @@ func TestAConcurrentEditIsWrittenOverAndNotRefused(t *testing.T) {
 	session, _ := newTestSession(t, "5511999990001")
 	session.setConnected(true)
 	reads, ids := 0, []string{}
-	// Every query of the second round trip, under the same budget as the first: a retry
-	// that leaves the ceiling behind hands the account back the wait the ceiling took away.
+	// The reads of the second round trip under the same budget as the first: a retry that
+	// leaves the ceiling behind hands the account back the wait the ceiling took away.
 	var under []time.Duration
-	bounded := func(ctx context.Context) {
-		if until, ok := ctx.Deadline(); ok {
-			under = append(under, time.Until(until))
-			return
-		}
-		under = append(under, time.Hour)
-	}
 	session.groupInfo = func(ctx context.Context, _ *wm.Client, _ waTypes.JID) (*waTypes.GroupInfo, error) {
 		reads++
-		bounded(ctx)
+		if until, ok := ctx.Deadline(); ok {
+			under = append(under, time.Until(until))
+		} else {
+			under = append(under, time.Hour)
+		}
 		if reads == 1 {
 			return &waTypes.GroupInfo{GroupTopic: waTypes.GroupTopic{TopicID: "OLD"}}, nil
 		}
@@ -610,10 +619,9 @@ func TestAConcurrentEditIsWrittenOverAndNotRefused(t *testing.T) {
 	}
 	revisions := []string{}
 	session.setTopic = func(
-		ctx context.Context, _ *wm.Client, _ waTypes.JID, previous, revision, _ string,
+		_ context.Context, _ *wm.Client, _ waTypes.JID, previous, revision, _ string,
 	) error {
 		ids, revisions = append(ids, previous), append(revisions, revision)
-		bounded(ctx)
 		if previous == "OLD" {
 			return &wm.IQError{Code: 409}
 		}
@@ -636,7 +644,7 @@ func TestAConcurrentEditIsWrittenOverAndNotRefused(t *testing.T) {
 	}
 	for i, left := range under {
 		if left > 20*time.Second {
-			t.Errorf("query %d of the command was given %s", i+1, left)
+			t.Errorf("read %d of the command was given %s", i+1, left)
 		}
 	}
 }
