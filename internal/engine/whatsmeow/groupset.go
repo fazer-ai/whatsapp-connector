@@ -354,10 +354,19 @@ const unaddressableTopicID = "undefined"
 // overwriting it, and by writing another description nothing can ever remove. And
 // `SetGroupTopic` flattens a failure of its own lookup with `%v`, so a disconnection or a
 // rate limit during it would reach the caller as `internal` instead of as itself.
-func writeTheDescription(ctx context.Context, client *wm.Client, group waTypes.JID, description string) error {
-	info, err := client.GetGroupInfo(ctx, group)
+func (s *Session) writeTheDescription(
+	ctx context.Context, client *wm.Client, group waTypes.JID, description string,
+) error {
+	info, err := s.groupInfo(ctx, client, group)
 	if err != nil {
 		return err //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
+	}
+	if info == nil {
+		// whatsmeow answers an error for a group it cannot read, so nothing reaches here
+		// with neither. Reading a field off it would take the session's executor down and
+		// every command queued behind it with it.
+		return protocol.NewError(protocol.ErrorInternal,
+			"the group came back empty while writing its description")
 	}
 	if legacyDescription(info.TopicID, description) {
 		// A description this connector wrote before it knew to give one an id. The call

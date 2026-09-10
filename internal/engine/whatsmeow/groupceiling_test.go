@@ -176,3 +176,73 @@ func TestACommandThatCannotBeRepeatedKeepsItsFullWait(t *testing.T) {
 		}
 	}
 }
+
+// The read that comes before the write, and what happens when it fails. Swallowing it
+// answers the caller that the description was written over a group nobody could even read,
+// and the operator then sees the old text on the next refresh with nothing having said no.
+func TestADescriptionIsNotReportedWrittenWhenTheGroupCouldNotBeRead(t *testing.T) {
+	t.Parallel()
+
+	for name, refusal := range map[string]error{
+		"the connection went":     wm.ErrIQDisconnected,
+		"whatsapp never answered": wm.ErrIQTimedOut,
+		"whatsapp refused":        &wm.IQError{Code: 403},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			session, _ := newTestSession(t, "5511999990001")
+			session.setConnected(true)
+			session.groupInfo = func(context.Context, *wm.Client, waTypes.JID) (*waTypes.GroupInfo, error) {
+				return nil, refusal
+			}
+
+			_, err := session.Execute(t.Context(), &protocol.Command{
+				Type:    protocol.CommandGroupDescriptionSet,
+				Payload: []byte(`{"group":{"kind":"group","id":"` + theGroup + `"},"description":"x"}`),
+			})
+			if err == nil {
+				t.Fatal("a description was reported written over a group that could not be read")
+			}
+		})
+	}
+}
+
+// The ceiling is applied by command and not to the block, so the two that cannot be
+// repeated have to be watched arriving without one rather than only listed as absent from
+// a map. A map is a claim about a map.
+func TestTheTwoThatCannotBeRepeatedArriveWithNoCeiling(t *testing.T) {
+	t.Parallel()
+
+	for name, command := range map[string]*protocol.Command{
+		"creating a group":   {Type: protocol.CommandGroupCreate, Payload: []byte(`{"subject":"x","participants":[{"kind":"phone","id":"5511999990002"}]}`)},
+		"rotating an invite": {Type: protocol.CommandGroupInviteGet, Payload: []byte(`{"group":{"kind":"group","id":"` + theGroup + `"},"revoke":true}`)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			session, _ := newTestSession(t, "5511999990001")
+			session.setConnected(true)
+			var left time.Duration
+			var set bool
+			session.createTheGroup = func(ctx context.Context, _ *wm.Client, _ wm.ReqCreateGroup) (*waTypes.GroupInfo, error) {
+				if until, ok := ctx.Deadline(); ok {
+					left, set = time.Until(until), true
+				}
+				return nil, errors.New("recorded")
+			}
+			session.inviteLink = func(ctx context.Context, _ *wm.Client, _ waTypes.JID, _ bool) (string, error) {
+				if until, ok := ctx.Deadline(); ok {
+					left, set = time.Until(until), true
+				}
+				return "", errors.New("recorded")
+			}
+
+			_, _ = session.Execute(t.Context(), command)
+
+			if set && left <= 20*time.Second {
+				t.Errorf("it was given %s, and WhatsApp applying it after that is a side effect a retry repeats", left)
+			}
+		})
+	}
+}

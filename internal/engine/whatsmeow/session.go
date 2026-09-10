@@ -573,7 +573,6 @@ func newSession(
 		setName: func(ctx context.Context, client *wm.Client, group waTypes.JID, subject string) error {
 			return client.SetGroupName(ctx, group, subject) //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
 		},
-		setDescription: writeTheDescription,
 		setAnnounce: func(ctx context.Context, client *wm.Client, group waTypes.JID, on bool) error {
 			return client.SetGroupAnnounce(ctx, group, on) //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
 		},
@@ -617,6 +616,12 @@ func newSession(
 		board:          make(map[string]posted),
 		downloadWait:   downloadTimeout,
 		uploadWait:     uploadTimeout,
+	}
+	// Assigned after the literal, not in it: this one reads the group before it writes,
+	// and it reads it through the seam beside it rather than off the client, so a test
+	// can make the lookup fail the way a disconnection does.
+	s.setDescription = func(ctx context.Context, client *wm.Client, group waTypes.JID, description string) error {
+		return s.writeTheDescription(ctx, client, group, description)
 	}
 	s.adopt(client)
 	go s.forward()
