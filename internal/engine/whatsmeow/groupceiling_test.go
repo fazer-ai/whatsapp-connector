@@ -22,7 +22,6 @@ func TestAGroupCommandDoesNotWaitOutAnInfoQuery(t *testing.T) {
 	t.Parallel()
 
 	for name, command := range map[string]*protocol.Command{
-		"a description":    {Type: protocol.CommandGroupDescriptionSet, Payload: []byte(`{"group":{"kind":"group","id":"` + theGroup + `"},"description":"x"}`)},
 		"asking about one": {Type: protocol.CommandGroupInfo, Payload: []byte(`{"group":{"kind":"group","id":"` + theGroup + `"}}`)},
 		"listing them":     {Type: protocol.CommandGroupList, Payload: []byte(`{}`)},
 	} {
@@ -186,7 +185,10 @@ func TestACommandThatCannotBeRepeatedKeepsItsFullWait(t *testing.T) {
 		"an invite whose payload will not parse": {&protocol.Command{
 			Type: protocol.CommandGroupInviteGet, Payload: []byte(`{`),
 		}, false},
-		"changing a description": {&protocol.Command{Type: protocol.CommandGroupDescriptionSet}, true},
+		// Not decided here: which call it needs is known only after the group is read, so
+		// `writeTheDescription` bounds the half that carries a revision and leaves the
+		// legacy half alone.
+		"changing a description": {&protocol.Command{Type: protocol.CommandGroupDescriptionSet}, false},
 		"asking about a group":   {&protocol.Command{Type: protocol.CommandGroupInfo}, true},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -362,5 +364,68 @@ func TestARedeliveredDescriptionIsWrittenUnderTheSameRevision(t *testing.T) {
 	elsewhere.sid = "sid-another-instance"
 	if theirs := elsewhere.orDerived(command, ""); theirs == first {
 		t.Errorf("two sessions editing one group share the revision %q", theirs)
+	}
+}
+
+// The description's ceiling is decided inside the write rather than by command type,
+// because which call it needs is known only after the group is read. The read and the
+// revision-bearing write are bounded; the legacy write, which carries no revision and
+// would be repeated by a redelivery, is not.
+func TestOnlyTheHalfOfADescriptionThatNamesItselfIsBounded(t *testing.T) {
+	t.Parallel()
+
+	for name, test := range map[string]struct {
+		topicID string
+		bounded bool
+	}{
+		"a description that can carry a revision": {"3EB0C2A14F4FBC421B2E8C", true},
+		"a group that never had one":              {"", true},
+		// The legacy write: no revision goes out with it, so a wait given up on and
+		// redelivered writes a second one.
+		"a description with no id": {unaddressableTopicID, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			session, _ := newTestSession(t, "5511999990001")
+			session.setConnected(true)
+			var lookedUnder time.Duration
+			var lookBounded bool
+			session.groupInfo = func(ctx context.Context, _ *wm.Client, _ waTypes.JID) (*waTypes.GroupInfo, error) {
+				if until, ok := ctx.Deadline(); ok {
+					lookedUnder, lookBounded = time.Until(until), true
+				}
+				return &waTypes.GroupInfo{GroupTopic: waTypes.GroupTopic{TopicID: test.topicID}}, nil
+			}
+			var left time.Duration
+			var set bool
+			session.setTopic = func(ctx context.Context, _ *wm.Client, _ waTypes.JID, _, _, _ string) error {
+				if until, ok := ctx.Deadline(); ok {
+					left, set = time.Until(until), true
+				}
+				return errors.New("recorded")
+			}
+			session.setLegacyTopic = func(ctx context.Context, _ *wm.Client, _ waTypes.JID, _ string) error {
+				if until, ok := ctx.Deadline(); ok {
+					left, set = time.Until(until), true
+				}
+				return errors.New("recorded")
+			}
+
+			_, _ = session.Execute(t.Context(), &protocol.Command{
+				Type:    protocol.CommandGroupDescriptionSet,
+				Payload: []byte(`{"group":{"kind":"group","id":"` + theGroup + `"},"description":"x"}`),
+			})
+
+			// The read is bounded whichever write follows it: asked again it answers
+			// again, so giving up on it costs an answer and nothing else.
+			if !lookBounded || lookedUnder > 20*time.Second {
+				t.Errorf("the group was read with no ceiling (set=%v, left=%s)", lookBounded, lookedUnder)
+			}
+			bounded := set && left <= 20*time.Second
+			if bounded != test.bounded {
+				t.Errorf("bounded = %v (deadline set=%v, left=%s), want %v", bounded, set, left, test.bounded)
+			}
+		})
 	}
 }

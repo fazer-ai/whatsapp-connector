@@ -373,7 +373,11 @@ const unaddressableTopicID = "undefined"
 func (s *Session) writeTheDescription(
 	ctx context.Context, client *wm.Client, group waTypes.JID, description, revision string,
 ) error {
-	info, err := s.groupInfo(ctx, client, group)
+	// The read is bounded whatever comes next: asked again it answers again, so giving up
+	// on it costs an answer and nothing else.
+	looking, stopLooking := context.WithTimeout(ctx, groupIQWait)
+	defer stopLooking()
+	info, err := s.groupInfo(looking, client, group)
 	if err != nil {
 		return err //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
 	}
@@ -384,20 +388,29 @@ func (s *Session) writeTheDescription(
 		return protocol.NewError(protocol.ErrorInternal,
 			"the group came back empty while writing its description")
 	}
+	if err := looking.Err(); err != nil {
+		return err //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
+	}
 	if legacyDescription(info.TopicID, description) {
 		// A description this connector wrote before it knew to give one an id. The call
 		// below is the only one that still changes it, and it leaves the replacement
 		// unaddressable in the same way -- taken anyway, because the alternative is
 		// answering 409 for a write that works today.
-		return client.SetGroupDescription(ctx, group, description) //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
+		return s.setLegacyTopic(ctx, client, group, description)
 	}
-	err = client.SetGroupTopic(ctx, group, info.TopicID, revision, description)
-	if err != nil && ctx.Err() != nil {
+	// Bounded, and only here: this is the write that goes out under a revision this side
+	// chose, so WhatsApp committing it after the wait was given up on and the caller
+	// redelivering the command writes that same revision again rather than a second one.
+	// The legacy call above carries no id and gets no ceiling for exactly that reason.
+	writing, stopWriting := context.WithTimeout(ctx, groupIQWait)
+	defer stopWriting()
+	err = s.setTopic(writing, client, group, info.TopicID, revision, description)
+	if err != nil && writing.Err() != nil {
 		// A group with no description at all sends `SetGroupTopic` to read one for itself,
 		// and it flattens a failure of that read with `%v`. The ceiling above is the most
 		// likely thing to end it, and a deadline reported as `internal` tells the caller
 		// this connector broke rather than that it stopped waiting.
-		return ctx.Err() //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
+		return writing.Err() //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
 	}
 	return err //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
 }

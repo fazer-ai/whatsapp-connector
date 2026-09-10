@@ -156,11 +156,15 @@ type Session struct {
 	setName            func(context.Context, *wm.Client, waTypes.JID, string) error
 	setPhoto           func(context.Context, *wm.Client, waTypes.JID, []byte) error
 	setDescription     func(context.Context, *wm.Client, waTypes.JID, string, string) error
-	setAnnounce        func(context.Context, *wm.Client, waTypes.JID, bool) error
-	setLocked          func(context.Context, *wm.Client, waTypes.JID, bool) error
-	setJoinApproval    func(context.Context, *wm.Client, waTypes.JID, bool) error
-	setAddMode         func(context.Context, *wm.Client, waTypes.JID, waTypes.GroupMemberAddMode) error
-	profilePicture     func(context.Context, *wm.Client, waTypes.JID, *wm.GetProfilePictureParams) (*waTypes.ProfilePictureInfo, error)
+	// The two calls writeTheDescription picks between. Seams of their own because which
+	// one a write takes is the whole of what it decides, and only one of them is bounded.
+	setTopic        func(context.Context, *wm.Client, waTypes.JID, string, string, string) error
+	setLegacyTopic  func(context.Context, *wm.Client, waTypes.JID, string) error
+	setAnnounce     func(context.Context, *wm.Client, waTypes.JID, bool) error
+	setLocked       func(context.Context, *wm.Client, waTypes.JID, bool) error
+	setJoinApproval func(context.Context, *wm.Client, waTypes.JID, bool) error
+	setAddMode      func(context.Context, *wm.Client, waTypes.JID, waTypes.GroupMemberAddMode) error
+	profilePicture  func(context.Context, *wm.Client, waTypes.JID, *wm.GetProfilePictureParams) (*waTypes.ProfilePictureInfo, error)
 
 	// uploadWait bounds how long an outbound media message spends fetching its file and
 	// handing it to WhatsApp. A field for the same reason as the three above it.
@@ -616,6 +620,14 @@ func newSession(
 		board:          make(map[string]posted),
 		downloadWait:   downloadTimeout,
 		uploadWait:     uploadTimeout,
+	}
+	s.setTopic = func(
+		ctx context.Context, client *wm.Client, group waTypes.JID, previous, revision, description string,
+	) error {
+		return client.SetGroupTopic(ctx, group, previous, revision, description) //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
+	}
+	s.setLegacyTopic = func(ctx context.Context, client *wm.Client, group waTypes.JID, description string) error {
+		return client.SetGroupDescription(ctx, group, description) //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
 	}
 	// Assigned after the literal, not in it: this one reads the group before it writes,
 	// and it reads it through the seam beside it rather than off the client, so a test
@@ -1980,9 +1992,11 @@ const groupIQWait = 15 * time.Second
 //   - **Reads.** `group.info`, `group.list`, `group.join_requests.list`, and a
 //     `group.invite.get` that is not revoking. Asked again they answer again; the only
 //     thing a truncated wait costs is the answer, which is what the caller is told.
-//   - **A write that names itself on the wire.** Only `group.description.set` does:
-//     whatsmeow lets a topic carry the revision id this connector derives, so a redelivery
-//     writes the same revision rather than a second one.
+//
+// `group.description.set` is not decided here at all, and that is the one asymmetry worth
+// spelling out: whether it can be bounded depends on which call it turns out to need,
+// which is known only after the group has been read. `writeTheDescription` bounds the half
+// that carries a revision id and leaves the legacy half alone.
 //
 // Everything else keeps whatsmeow's own bound, which is longer, and the account can still
 // be held by one of them. That is not an oversight -- it is what is left after refusing to
@@ -1995,8 +2009,7 @@ const groupIQWait = 15 * time.Second
 // to write twice under, so a retry publishes a second `group.updated` for one command.
 func boundedGroupCommand(command *protocol.Command) bool {
 	switch command.Type {
-	case protocol.CommandGroupInfo, protocol.CommandGroupList,
-		protocol.CommandGroupJoinRequestsList, protocol.CommandGroupDescriptionSet:
+	case protocol.CommandGroupInfo, protocol.CommandGroupList, protocol.CommandGroupJoinRequestsList:
 		return true
 	case protocol.CommandGroupInviteGet:
 		return !command.ChangesSomething()
