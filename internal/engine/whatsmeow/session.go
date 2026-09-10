@@ -1961,10 +1961,37 @@ func (s *Session) Execute(ctx context.Context, command *protocol.Command) (json.
 // does not extend one.
 const groupIQWait = 15 * time.Second
 
+// repeatableGroupCommands are the ones the ceiling is safe for: asked again, they leave the
+// group in the state the first attempt was for.
+//
+// The two left out are the two that do not. `group.create` makes a new group every time it
+// is carried out, and `group.invite.get` rotates the link when it is asked to revoke, which
+// invalidates the one people are holding. Cutting a wait short does not undo what WhatsApp
+// already did with it, and the ledger records only successes, so a command answered
+// `timeout` here and retried under the same idempotency key would make a second group or
+// rotate the link a second time -- invariant 5, and the thing the ceiling would otherwise
+// be trading a stalled queue for. They keep whatsmeow's own bound, which is longer and is
+// the price of not duplicating what cannot be taken back.
+var repeatableGroupCommands = map[protocol.CommandType]bool{
+	protocol.CommandGroupLeave:              true,
+	protocol.CommandGroupPhotoSet:           true,
+	protocol.CommandGroupNameSet:            true,
+	protocol.CommandGroupDescriptionSet:     true,
+	protocol.CommandGroupSettingsSet:        true,
+	protocol.CommandGroupJoinRequestsList:   true,
+	protocol.CommandGroupJoinRequestsUpdate: true,
+	protocol.CommandGroupList:               true,
+	protocol.CommandGroupInfo:               true,
+	protocol.CommandGroupParticipantsUpdate: true,
+}
+
 // aboutAGroup carries out the group commands, under a ceiling none of the others need.
 func (s *Session) aboutAGroup(ctx context.Context, command *protocol.Command) (json.RawMessage, error) {
-	ctx, cancel := context.WithTimeout(ctx, groupIQWait)
-	defer cancel()
+	if repeatableGroupCommands[command.Type] {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, groupIQWait)
+		defer cancel()
+	}
 
 	switch command.Type {
 	case protocol.CommandGroupLeave:

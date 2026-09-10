@@ -3,7 +3,7 @@ package whatsmeow
 import (
 	"context"
 	"errors"
-	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -116,32 +116,63 @@ func seamDeadline(t *testing.T, session *Session) func() (time.Duration, bool) {
 	return func() (time.Duration, bool) { return left, set }
 }
 
-// The write that falls back, and the three ways of not being it. Split out from the call
-// itself because the call takes a live client: what is decidable without a socket is the
-// decision, and it is the decision that has to be narrow.
-func TestOnlyADescriptionWhatsAppWillNotLetUsReplaceFallsBack(t *testing.T) {
+// Which description has to be written the old way. Split out from the call itself because
+// the call takes a live client: what is decidable without a socket is the decision, and it
+// is the decision that has to be narrow.
+func TestOnlyADescriptionWithNoIDIsWrittenTheOldWay(t *testing.T) {
 	t.Parallel()
 
-	conflict := &wm.IQError{Code: http.StatusConflict}
 	for name, test := range map[string]struct {
-		err         error
+		topicID     string
 		description string
 		want        bool
 	}{
-		"a conflict over a description that has no id": {conflict, "novo texto", true},
-		"a write that worked":                          {nil, "novo texto", false},
-		// The one that matters most: falling back on a removal is the 75-second wait.
-		"a conflict over a removal":   {conflict, "", false},
-		"rate limited":                {&wm.IQError{Code: http.StatusTooManyRequests}, "novo texto", false},
-		"the connection went":         {wm.ErrIQDisconnected, "novo texto", false},
-		"whatsapp never answered":     {wm.ErrIQTimedOut, "novo texto", false},
-		"something that is not an IQ": {errors.New("nothing to do with WhatsApp"), "novo texto", false},
+		"a write over a description with no id": {unaddressableTopicID, "novo texto", true},
+		// The one that matters most: going the other way on a removal is the 75-second
+		// wait. A group stuck like this is told 409 in a third of a second instead.
+		"a removal over a description with no id":     {unaddressableTopicID, "", false},
+		"a write over a description with a real id":   {"3EB0C2A14F4FBC421B2E8C", "novo texto", false},
+		"a removal over a description with a real id": {"3EB0C2A14F4FBC421B2E8C", "", false},
+		// A group that never had a description: nothing to name, and nothing refuses it.
+		"a write over no description":   {"", "novo texto", false},
+		"a removal over no description": {"", "", false},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			if got := unaddressableDescription(test.err, test.description); got != test.want {
-				t.Errorf("falling back = %v, want %v", got, test.want)
+			if got := legacyDescription(test.topicID, test.description); got != test.want {
+				t.Errorf("writing the old way = %v, want %v", got, test.want)
 			}
 		})
+	}
+}
+
+// The ceiling protects the account's queue by giving up on a command, and that trade is
+// only available where giving up costs an answer. `group.create` makes another group every
+// time it runs, and a revoking `group.invite.get` rotates the link again; WhatsApp does not
+// undo either because this side stopped waiting, and the ledger records only successes. So
+// one of those answered `timeout` here and retried under the same idempotency key is
+// invariant 5 broken by the fix for #163.
+func TestACommandThatCannotBeRepeatedKeepsItsFullWait(t *testing.T) {
+	t.Parallel()
+
+	cannotRepeat := map[protocol.CommandType]bool{
+		protocol.CommandGroupCreate:    true,
+		protocol.CommandGroupInviteGet: true,
+	}
+	for command := range cannotRepeat {
+		if repeatableGroupCommands[command] {
+			t.Errorf("%s is under the ceiling, and a retry of it duplicates what it did", command)
+		}
+	}
+	// The fence, in the shape internal/protocol already uses for the event catalogue: a
+	// group command added later is under the ceiling or is named as one that cannot be,
+	// and never neither because nobody came back here.
+	for _, command := range protocol.AllCommandTypes {
+		if !strings.HasPrefix(string(command), "group.") {
+			continue
+		}
+		if !repeatableGroupCommands[command] && !cannotRepeat[command] {
+			t.Errorf("%s is neither under the ceiling nor named as one that cannot be", command)
+		}
 	}
 }

@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
 
 	wm "go.mau.fi/whatsmeow"
 	waTypes "go.mau.fi/whatsmeow/types"
@@ -318,17 +317,21 @@ func (s *Session) setGroupPhoto(ctx context.Context, command *protocol.Command) 
 	return nil, nil
 }
 
+// unaddressableTopicID is what WhatsApp reports as a description's id when the description
+// was written without one. Not a sentinel this connector invented: it is the literal
+// string that comes back on the wire, and it reads like a JavaScript `undefined` that got
+// as far as the server.
+const unaddressableTopicID = "undefined"
+
 // writeTheDescription writes a group's description through the one whatsmeow call that
-// gives it an id, and falls back to the one that does not only where WhatsApp leaves no
-// choice.
+// gives it an id, and uses the one that does not only where WhatsApp leaves no choice.
 //
 // The two calls do not send the same stanza. `SetGroupDescription` sends
 // `<description><body>…</body></description>` with no attributes at all; `SetGroupTopic`
 // always puts an `id` on it, names the description it replaces with `prev`, and for an
 // empty text drops the body and sets `delete="true"` instead. A description written
-// without an id is one nothing can address afterwards, and WhatsApp reports its id as the
-// literal string `"undefined"` -- which is what a removal would then have to name, and
-// what WhatsApp refuses with a 409.
+// without an id is one nothing can address afterwards: WhatsApp reports its id as
+// `"undefined"`, and a removal, which has to name what it replaces, is refused with a 409.
 //
 // Measured live on 10/09/2026, on groups between the two paired test accounts:
 //
@@ -342,41 +345,38 @@ func (s *Session) setGroupPhoto(ctx context.Context, command *protocol.Command) 
 //	  remove with SetGroupTopic("")            ->    536 ms, removed
 //	  remove with SetGroupDescription("")      -> 1m15.001s, info query timed out
 //
-// So the removal is written the right way round here, and every description this connector
-// writes from now on is one it can also take back. What it cannot do is rescue a group
-// whose description this connector already wrote: that one has no id on WhatsApp's side,
-// `SetGroupTopic` is refused for it in both directions, and the only call that still
-// changes it is the one that leaves it unaddressable again. Rather than answer such a
-// group with a 409 for a write that works today, the write falls back -- the removal does
-// not, because falling back there is the 75-second wait this whole change is about.
-//
-// Getting out of that state needs a removal stanza with no `prev` at all, which whatsmeow
-// does not expose: `sendGroupIQ` and `infoQueryType` are both unexported. That is an
-// upstream report, not something this connector can reach.
+// The id is read here rather than left to `SetGroupTopic`, which fetches it itself when
+// handed an empty one, and that is not duplicated work: it is the same round trip made
+// where its outcome can be told apart. Two things depend on seeing it. A 409 means "you
+// may not replace the description named by this prev", and there are two ways to get one
+// -- a description with no id, and a description somebody else changed between the read
+// and the write -- so deciding on the error alone would answer a concurrent edit by
+// overwriting it, and by writing another description nothing can ever remove. And
+// `SetGroupTopic` flattens a failure of its own lookup with `%v`, so a disconnection or a
+// rate limit during it would reach the caller as `internal` instead of as itself.
 func writeTheDescription(ctx context.Context, client *wm.Client, group waTypes.JID, description string) error {
-	err := client.SetGroupTopic(ctx, group, "", "", description)
-	if !unaddressableDescription(err, description) {
+	info, err := client.GetGroupInfo(ctx, group)
+	if err != nil {
 		return err //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
 	}
-	// A description already on the group that this account cannot replace by name. The
-	// call below is what has always written them, and it still works.
-	return client.SetGroupDescription(ctx, group, description) //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
+	if legacyDescription(info.TopicID, description) {
+		// A description this connector wrote before it knew to give one an id. The call
+		// below is the only one that still changes it, and it leaves the replacement
+		// unaddressable in the same way -- taken anyway, because the alternative is
+		// answering 409 for a write that works today.
+		return client.SetGroupDescription(ctx, group, description) //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
+	}
+	return client.SetGroupTopic(ctx, group, info.TopicID, "", description) //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
 }
 
-// unaddressableDescription reports whether a failed write is the one case that has to be
-// retried through the call that leaves a description without an id.
+// legacyDescription reports whether a write has to go through the call that leaves a
+// description without an id.
 //
-// Narrow on purpose, and each of the three conditions rules out a different way of being
-// wrong. A write that worked has nothing to retry. An empty text is a removal, and
-// retrying a removal through the other call is the seventy-five second wait this change
-// exists to remove -- so a removal WhatsApp refuses is answered as a refusal, which is
-// what it is. And only a 409 means "you may not replace the description that is there":
-// a rate limit, a disconnection or a group this account is not in would all be reported
-// to the caller as though the description had been written.
-func unaddressableDescription(err error, description string) bool {
-	if err == nil || description == "" {
-		return false
-	}
-	var refused *wm.IQError
-	return errors.As(err, &refused) && refused.Code == http.StatusConflict
+// Narrow on purpose, and each condition rules out a different way of being wrong. Only the
+// id WhatsApp reports for a description written without one qualifies: a real id, or none
+// at all on a group that never had a description, both address fine. And only a write --
+// a removal on such a group is answered as the refusal it is, in a third of a second,
+// because sending it the other way is the seventy-five second wait this exists to remove.
+func legacyDescription(topicID, description string) bool {
+	return topicID == unaddressableTopicID && description != ""
 }
