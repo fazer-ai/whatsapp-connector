@@ -147,6 +147,24 @@ func TestReplyToMatchesRPCClassification(t *testing.T) {
 	}
 }
 
+// And one golden frame has to be that shape, or the paragraph above is the only record
+// of it and the rule comes back the next time somebody reads the fixtures instead. This
+// is what keeps a deadline with no reply_to in the contract clients vendor, so the frame
+// the Chatwoot side sends has an example here rather than a comment about one.
+func TestACommandFixtureCarriesADeadlineWithNoReplyTo(t *testing.T) {
+	for name, fixture := range fixtures(t, "command") {
+		frame, ok := fixture.(map[string]any)
+		if !ok {
+			t.Fatalf("command fixture %s is not an object", name)
+		}
+		_, hasReplyTo := frame["reply_to"]
+		if _, hasDeadline := frame["deadline"]; hasDeadline && !hasReplyTo {
+			return
+		}
+	}
+	t.Fatal("no command fixture carries a deadline without a reply_to, so the contract has no example of a caller that bounds a command it is not waiting on")
+}
+
 // The Makefile's contract target has to run this whole package. A -run filter there is
 // a list somebody has to remember to extend, and the one that shipped forgot exactly the
 // tests that decide what a fixture may look like: the RPC classification and both enum
