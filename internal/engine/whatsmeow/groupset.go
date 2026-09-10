@@ -358,9 +358,18 @@ const unaddressableTopicID = "undefined"
 // may not replace the description named by this prev", and there are two ways to get one
 // -- a description with no id, and a description somebody else changed between the read
 // and the write -- so deciding on the error alone would answer a concurrent edit by
-// overwriting it, and by writing another description nothing can ever remove. And
+// writing over it, and by leaving another description nothing can ever remove. And
 // `SetGroupTopic` flattens a failure of its own lookup with `%v`, so a disconnection or a
 // rate limit during it would reach the caller as `internal` instead of as itself.
+//
+// What that does not buy, and the limit is worth stating rather than implying: a group
+// with no description when it was read has no id to name, so `SetGroupTopic` reads it
+// again and takes whatever is there. A description added by another admin in that window
+// is written over instead of answering 409. That is last write wins, which is what
+// `group.description.set` means and what this connector has always done -- the id is here
+// so a refusal is not mistaken for a legacy description, not to turn the command into a
+// compare-and-set it never promised. Naming the absence would take a stanza with an id and
+// no `prev`, which whatsmeow does not expose.
 func (s *Session) writeTheDescription(
 	ctx context.Context, client *wm.Client, group waTypes.JID, description, revision string,
 ) error {
