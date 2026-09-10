@@ -5,6 +5,11 @@
 // with every command for that account queued behind it.
 //
 //	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveDescription
+//
+// It makes a group, so running it over and over runs into WhatsApp's own limit rather than
+// into anything here: measured, an account that has made about ten groups within the hour
+// answers `429 rate-overlimit` to the next `CreateGroup`. Pass WAC_LIVE_GROUP=<jid>@g.us to
+// reuse one instead, which is what repeat runs want anyway.
 package whatsmeow
 
 import (
