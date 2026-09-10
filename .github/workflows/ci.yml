@@ -100,5 +100,35 @@ jobs:
         with:
           context: .
           push: false
+          load: true
+          tags: connector:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # And that it comes up. An image that builds is not an image that runs: Docker
+      # creates the path a VOLUME names, owns it as root, and this image runs as nonroot,
+      # so the first write to the cache or to the SQLite store is what decides whether an
+      # operator gets a connector or a container that exits on boot. Nothing short of
+      # starting it with the volume attached sees that.
+      - name: It comes up with its own volume attached
+        run: |
+          docker network create smoke-net
+          docker run -d --name smoke-redis --network smoke-net redis:8-alpine
+          docker run -d --name smoke --network smoke-net -v smoke-data:/data \
+            -e REDIS_URL=redis://smoke-redis:6379/0 \
+            -e WAC_ENGINE=whatsmeow \
+            -e WAC_DATABASE_URL=sqlite:/data/wa.db \
+            -e WAC_MEDIA_ROOT=/data/media \
+            -e WAC_MEDIA_TOKEN=smoke \
+            -e WAC_INSTANCE=smoke \
+            connector:ci
+          for _ in $(seq 30); do
+            if docker exec smoke /connector healthcheck >/dev/null 2>&1; then
+              echo "the connector answers its own healthcheck"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "it never came up:"
+          docker logs smoke
+          exit 1

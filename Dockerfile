@@ -11,6 +11,13 @@ RUN go mod download
 
 COPY . .
 
+# The volume's mount point, made here because the runtime image has no shell to make it
+# with. Docker creates a missing VOLUME path as root, and this image runs as nonroot, so
+# without this the first write to the cache or to the SQLite store fails on permission and
+# the container exits on boot -- with the volume attached, which is the arrangement the
+# VOLUME line below invites an operator into.
+RUN mkdir -p /out/data
+
 ARG VERSION=dev
 # Static, because the runtime image has no libc to link against. -trimpath keeps the
 # build reproducible and keeps the builder's paths out of stack traces.
@@ -22,6 +29,7 @@ RUN CGO_ENABLED=0 go build \
 FROM gcr.io/distroless/static:nonroot
 
 COPY --from=build /out/connector /connector
+COPY --from=build --chown=nonroot:nonroot /out/data /data
 
 # Media blobs and, from M1, the SQLite store when Postgres is not configured.
 VOLUME ["/data"]
