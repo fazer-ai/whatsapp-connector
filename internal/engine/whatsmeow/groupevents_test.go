@@ -14,8 +14,6 @@ import (
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 )
 
-const theGroup = "120363041234567890"
-
 func groupSession(t *testing.T) *Session {
 	t.Helper()
 
@@ -67,16 +65,34 @@ func published(t *testing.T, session *Session, want protocol.EventType, definiti
 	return decode(t, emission.Payload)
 }
 
-// nothingPublished fails when anything comes out, which is what half the cases here are
+// silentSession is a session whose forwarder is parked, for the cases that assert nothing
+// comes out.
+//
+// Parked rather than timed, and the difference is the whole reliability of a negative
+// assertion: `handle` enqueues on the session's inbox and returns, so waiting a fixed
+// spell on the far end of the forwarder passes on a loaded machine whether the event was
+// enqueued or not, and the case it is supposed to catch is exactly the one where it was.
+// With the forwarder holding a filler, the inbox is where an emission stops, and looking
+// at it is a question about this build rather than about how busy the machine is.
+func silentSession(t *testing.T, groups bool) *Session {
+	t.Helper()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setConnected(true)
+	session.setGroups(groups)
+	session.picked = make(chan struct{}, 1)
+	blockTheForwarder(t, session)
+	return session
+}
+
+// nothingPublished fails when anything was queued, which is what half the cases here are
 // about: a notification carrying nothing the contract can say must not turn into an event
 // saying nothing.
 func nothingPublished(t *testing.T, session *Session) {
 	t.Helper()
 
-	select {
-	case emission := <-session.Events():
-		t.Fatalf("published %q for a notification with nothing in it", emission.Type)
-	case <-time.After(200 * time.Millisecond):
+	if queued := len(session.inbox); queued != 0 {
+		t.Fatalf("queued %d emissions for a notification with nothing in it", queued)
 	}
 }
 
@@ -112,10 +128,9 @@ func TestAGroupIsNotPublishedToASessionThatDidNotAskForGroups(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			session, _ := newTestSession(t, "5511999990001")
-			session.setConnected(true)
-			// Deliberately not `setGroups`: false is the default a client gets by not
+			// Deliberately not subscribed: false is the default a client gets by not
 			// asking, which is the case this is about.
+			session := silentSession(t, false)
 
 			session.handle(event)
 			nothingPublished(t, session)
@@ -362,7 +377,7 @@ func TestAChangeTheContractCannotCarryIsPublishedAsActivity(t *testing.T) {
 func TestAVersionBumpOnItsOwnPublishesNothing(t *testing.T) {
 	t.Parallel()
 
-	session := groupSession(t)
+	session := silentSession(t, true)
 	session.handle(&waEvents.GroupInfo{
 		JID:                      groupJID(),
 		PrevParticipantVersionID: "17",
@@ -378,7 +393,7 @@ func TestAVersionBumpOnItsOwnPublishesNothing(t *testing.T) {
 func TestAChangeWithNoGroupPublishesNothing(t *testing.T) {
 	t.Parallel()
 
-	session := groupSession(t)
+	session := silentSession(t, true)
 	session.handle(&waEvents.GroupInfo{Name: &waTypes.GroupName{Name: "Equipe fazer.ai"}})
 
 	nothingPublished(t, session)
@@ -470,7 +485,7 @@ func TestAMemberWhatsAppRefusedIsNotPublishedAsOneWhoJoined(t *testing.T) {
 func TestJoiningAGroupWithNoAddressPublishesNothing(t *testing.T) {
 	t.Parallel()
 
-	session := groupSession(t)
+	session := silentSession(t, true)
 	session.handle(&waEvents.JoinedGroup{
 		GroupInfo: waTypes.GroupInfo{GroupName: waTypes.GroupName{Name: "Equipe fazer.ai"}},
 	})

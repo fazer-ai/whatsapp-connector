@@ -203,19 +203,6 @@ func TestLiveGroupChangesArePublished(t *testing.T) {
 	}
 }
 
-// liveTry is liveCommand for a command whose failure is the phase's business rather than
-// the harness's: it hands the error back instead of ending the run.
-func liveTry(t *testing.T, from *Session, kind protocol.CommandType, payload map[string]any) error {
-	t.Helper()
-
-	body, err := json.Marshal(payload)
-	if err != nil {
-		t.Fatalf("build a %s: %v", kind, err)
-	}
-	_, err = from.Execute(t.Context(), &protocol.Command{Type: kind, Payload: body})
-	return err
-}
-
 // liveGroupChange waits for the next group.updated and hands back its changes object and
 // the whole payload.
 func liveGroupChange(t *testing.T, watching *recorder) (changes, payload map[string]any) {
