@@ -573,9 +573,7 @@ func newSession(
 		setName: func(ctx context.Context, client *wm.Client, group waTypes.JID, subject string) error {
 			return client.SetGroupName(ctx, group, subject) //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
 		},
-		setDescription: func(ctx context.Context, client *wm.Client, group waTypes.JID, description string) error {
-			return client.SetGroupDescription(ctx, group, description) //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
-		},
+		setDescription: writeTheDescription,
 		setAnnounce: func(ctx context.Context, client *wm.Client, group waTypes.JID, on bool) error {
 			return client.SetGroupAnnounce(ctx, group, on) //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
 		},
@@ -1931,6 +1929,44 @@ func (s *Session) Execute(ctx context.Context, command *protocol.Command) (json.
 		return s.resolveContact(ctx, command)
 	case protocol.CommandMessageMarkUnread:
 		return s.markUnread(ctx, command)
+	case protocol.CommandGroupLeave, protocol.CommandGroupPhotoSet, protocol.CommandGroupNameSet,
+		protocol.CommandGroupDescriptionSet, protocol.CommandGroupSettingsSet,
+		protocol.CommandGroupInviteGet, protocol.CommandGroupJoinRequestsList,
+		protocol.CommandGroupJoinRequestsUpdate, protocol.CommandGroupCreate,
+		protocol.CommandGroupList, protocol.CommandGroupInfo,
+		protocol.CommandGroupParticipantsUpdate:
+		return s.aboutAGroup(ctx, command)
+	}
+	return nil, engine.ErrNotSupported
+}
+
+// groupIQWait is how long a group command may spend at WhatsApp before this connector
+// stops waiting for it.
+//
+// Every one of them is an info query, and whatsmeow gives an info query 75 seconds. The
+// session executor is serial -- one goroutine takes one command off the queue and does not
+// take the next until that one has answered -- so an info query WhatsApp decides not to
+// answer does not cost the command that made it, it costs the account: every message,
+// receipt and read marker queued behind it waits out the whole minute and a quarter. That
+// is what #163 measured, four times, on a description that could not be removed.
+//
+// Fifteen seconds is far above what these actually take. Measured live on 10/09/2026: a
+// group created, renamed, its settings changed, its description written and removed, all
+// between 370 ms and 1.3 s, and a refusal -- a 409 over a description WhatsApp will not
+// let this account replace -- in 364 ms. A query still running at fifteen seconds is not
+// slow, it is one that is not coming back, and answering `timeout` then costs the caller
+// one command instead of costing the account a minute of its queue.
+//
+// A caller that sends a shorter deadline of its own still wins: this bounds the wait, it
+// does not extend one.
+const groupIQWait = 15 * time.Second
+
+// aboutAGroup carries out the group commands, under a ceiling none of the others need.
+func (s *Session) aboutAGroup(ctx context.Context, command *protocol.Command) (json.RawMessage, error) {
+	ctx, cancel := context.WithTimeout(ctx, groupIQWait)
+	defer cancel()
+
+	switch command.Type {
 	case protocol.CommandGroupLeave:
 		return s.leaveGroup(ctx, command)
 	case protocol.CommandGroupPhotoSet:
