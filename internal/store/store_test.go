@@ -1049,3 +1049,61 @@ func TestAWriteIsRefusedOnceTheLeaseHasRunOutEvenBeforeThisInstanceKnows(t *test
 		})
 	}
 }
+
+// database/sql opens a connection per concurrent query and, left alone, stops at no
+// number: Postgres ships with `max_connections = 100` for the whole server, and reaching
+// it does not slow this connector down, it refuses connections to every other application
+// on that database. One pool per process is what makes a cap sufficient -- sessions do not
+// hold one each.
+func TestThePostgresPoolHasACeiling(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name        string
+		asked, want int
+	}{
+		{"a number the deployment asked for", 7, 7},
+		{"nothing asked for", 0, store.DefaultMaxConns},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			// A database of its own. Two of these upgrading one schema at the same time
+			// race on creating it, which is a failure about this test and not about the
+			// pool it is looking at.
+			target := storetest.New(t)
+			if !strings.HasPrefix(target.URL, "postgres") {
+				t.Skip("no Postgres to open a pool against")
+			}
+
+			container, err := store.OpenWith(t.Context(), target.URL, store.AlwaysOwned, zerolog.Nop(),
+				store.Options{MaxConns: tc.asked})
+			if err != nil {
+				t.Fatalf("OpenWith: %v", err)
+			}
+			t.Cleanup(func() { _ = container.Close() })
+
+			if got := container.DB().Stats().MaxOpenConnections; got != tc.want {
+				t.Fatalf("the pool tops out at %d, want %d", got, tc.want)
+			}
+		})
+	}
+
+	// A file holds one writer whatever the pool says, and handing out more connections
+	// than that converts waiting into `database is locked`. The cap above must not raise
+	// it back up.
+	t.Run("sqlite is still serialised whatever was asked for", func(t *testing.T) {
+		t.Parallel()
+
+		container, err := store.OpenWith(t.Context(), "sqlite:"+filepath.Join(t.TempDir(), "wa.db"),
+			store.AlwaysOwned, zerolog.Nop(), store.Options{MaxConns: 32})
+		if err != nil {
+			t.Fatalf("OpenWith: %v", err)
+		}
+		t.Cleanup(func() { _ = container.Close() })
+
+		if got := container.DB().Stats().MaxOpenConnections; got != 1 {
+			t.Fatalf("the file's pool tops out at %d, want 1", got)
+		}
+	})
+}

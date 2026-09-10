@@ -190,6 +190,7 @@ restart, and reports itself healthy while doing it.
 | `WAC_EVENT_SHARDS` | `8` | How many event streams the fleet publishes to. Fleet-wide and effectively permanent: an instance that disagrees with what is recorded refuses to start |
 | `WAC_ENGINE` | `fake` | `whatsmeow` for a real account, `fake` for a fleet with nothing behind it |
 | `WAC_DATABASE_URL` | none | Where pairings live. `postgres://…`, `sqlite:…` or `file:…`. Required by the `whatsmeow` engine |
+| `WAC_DATABASE_MAX_CONNS` | `20` | Ceiling on the Postgres pool. There is one pool per process, shared by every session on it, and a connection is taken per query rather than held per account, so this bounds concurrent queries and not paired numbers. Left uncapped, `database/sql` opens one per concurrent query and a burst can reach Postgres's own `max_connections`, which refuses connections to every other application on that server. Ignored for SQLite, where a file holds one writer whatever the pool says |
 | `WAC_DEVICE_NAME` | `Chrome` | What the account's linked-devices list shows, paired with a CHROME platform so the entry reads like the web session it behaves as. A browser's name because that is what the list is full of, and a row naming a product nobody recognises is the one part of the handshake that says out loud this is not a browser. Fleet-wide, not per session: whatsmeow keeps device properties process-wide |
 | `WAC_HTTP_ADDR` | `:8080` | Where `/healthz`, `/readyz` and `/metrics` listen |
 | `WAC_ADVERTISE_URL` | derived | How clients reach this instance for media |
