@@ -30,7 +30,7 @@ func settableSession(t *testing.T) *Session {
 		t.Error("a command that is not a name change renamed the group")
 		return nil
 	}
-	session.setDescription = func(context.Context, *wm.Client, waTypes.JID, string) error {
+	session.setDescription = func(context.Context, *wm.Client, waTypes.JID, string, string) error {
 		t.Error("a command that is not a description change rewrote the description")
 		return nil
 	}
@@ -148,7 +148,7 @@ func TestAGroupDescriptionChangeSendsAnEmptyBodyForBothWaysOfClearingIt(t *testi
 			t.Parallel()
 			session := settableSession(t)
 			sent := "unset"
-			session.setDescription = func(_ context.Context, _ *wm.Client, _ waTypes.JID, description string) error {
+			session.setDescription = func(_ context.Context, _ *wm.Client, _ waTypes.JID, description, _ string) error {
 				sent = description
 				return nil
 			}
@@ -278,7 +278,11 @@ func TestAGroupChangeNeedsAConnection(t *testing.T) {
 				t.Error("a disconnected session changed the group anyway")
 				return nil
 			}
-			session.setDescription = session.setName
+			session.setDescription = func(
+				ctx context.Context, client *wm.Client, group waTypes.JID, description, _ string,
+			) error {
+				return session.setName(ctx, client, group, description)
+			}
 			session.setAnnounce = func(context.Context, *wm.Client, waTypes.JID, bool) error {
 				t.Error("a disconnected session changed the group anyway")
 				return nil

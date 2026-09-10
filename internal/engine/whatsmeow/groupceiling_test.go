@@ -3,7 +3,6 @@ package whatsmeow
 import (
 	"context"
 	"errors"
-	"strings"
 	"testing"
 	"time"
 
@@ -96,7 +95,7 @@ func seamDeadline(t *testing.T, session *Session) func() (time.Duration, bool) {
 	session.setName = func(ctx context.Context, _ *wm.Client, _ waTypes.JID, _ string) error {
 		return record(ctx)
 	}
-	session.setDescription = func(ctx context.Context, _ *wm.Client, _ waTypes.JID, _ string) error {
+	session.setDescription = func(ctx context.Context, _ *wm.Client, _ waTypes.JID, _, _ string) error {
 		return record(ctx)
 	}
 	session.setAnnounce = func(ctx context.Context, _ *wm.Client, _ waTypes.JID, _ bool) error {
@@ -155,25 +154,36 @@ func TestOnlyADescriptionWithNoIDIsWrittenTheOldWay(t *testing.T) {
 func TestACommandThatCannotBeRepeatedKeepsItsFullWait(t *testing.T) {
 	t.Parallel()
 
-	cannotRepeat := map[protocol.CommandType]bool{
-		protocol.CommandGroupCreate:    true,
-		protocol.CommandGroupInviteGet: true,
-	}
-	for command := range cannotRepeat {
-		if repeatableGroupCommands[command] {
-			t.Errorf("%s is under the ceiling, and a retry of it duplicates what it did", command)
-		}
-	}
-	// The fence, in the shape internal/protocol already uses for the event catalogue: a
-	// group command added later is under the ceiling or is named as one that cannot be,
-	// and never neither because nobody came back here.
-	for _, command := range protocol.AllCommandTypes {
-		if !strings.HasPrefix(string(command), "group.") {
-			continue
-		}
-		if !repeatableGroupCommands[command] && !cannotRepeat[command] {
-			t.Errorf("%s is neither under the ceiling nor named as one that cannot be", command)
-		}
+	for name, test := range map[string]struct {
+		command *protocol.Command
+		bounded bool
+	}{
+		"creating a group": {&protocol.Command{Type: protocol.CommandGroupCreate}, false},
+		"rotating an invite": {&protocol.Command{
+			Type: protocol.CommandGroupInviteGet, Payload: []byte(`{"revoke":true}`),
+		}, false},
+		// Reading the link changes nothing, so there is nothing a retry could repeat and
+		// no reason for it to hold the account's queue for seventy-five seconds.
+		"reading an invite": {&protocol.Command{
+			Type: protocol.CommandGroupInviteGet, Payload: []byte(`{"revoke":false}`),
+		}, true},
+		"reading an invite without saying so": {&protocol.Command{
+			Type: protocol.CommandGroupInviteGet, Payload: []byte(`{}`),
+		}, true},
+		// An unreadable payload is not a question, and the safe reading is the one that
+		// costs nothing when it is wrong.
+		"an invite whose payload will not parse": {&protocol.Command{
+			Type: protocol.CommandGroupInviteGet, Payload: []byte(`{`),
+		}, false},
+		"changing a description": {&protocol.Command{Type: protocol.CommandGroupDescriptionSet}, true},
+		"asking about a group":   {&protocol.Command{Type: protocol.CommandGroupInfo}, true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if got := boundedGroupCommand(test.command); got != test.bounded {
+				t.Errorf("under the ceiling = %v, want %v", got, test.bounded)
+			}
+		})
 	}
 }
 
@@ -244,5 +254,30 @@ func TestTheTwoThatCannotBeRepeatedArriveWithNoCeiling(t *testing.T) {
 				t.Errorf("it was given %s, and WhatsApp applying it after that is a side effect a retry repeats", left)
 			}
 		})
+	}
+}
+
+// The revision a description is written under. A redelivery has to write the same one:
+// whatsmeow generates a fresh id when handed an empty one, so two attempts at one command
+// would be two revisions of the group's description, and the second publishes a
+// `group.updated` nobody asked for.
+func TestARedeliveredDescriptionIsWrittenUnderTheSameRevision(t *testing.T) {
+	t.Parallel()
+
+	first := revisionOf(&protocol.Command{ID: "c1", IdempotencyKey: "desc-42"})
+	again := revisionOf(&protocol.Command{ID: "c2", IdempotencyKey: "desc-42"})
+	if first == "" {
+		t.Fatal("a command that named itself was written under a generated revision")
+	}
+	if first != again {
+		t.Errorf("the same command written twice got %q and then %q", first, again)
+	}
+	if other := revisionOf(&protocol.Command{ID: "c3", IdempotencyKey: "desc-43"}); other == first {
+		t.Errorf("two different commands share the revision %q", other)
+	}
+	// No key is the caller declining to name the command, and there is nothing to be
+	// stable about. whatsmeow generates one, and the duplicate event goes with it.
+	if none := revisionOf(&protocol.Command{ID: "c4"}); none != "" {
+		t.Errorf("a command with no idempotency key was given the revision %q", none)
 	}
 }

@@ -2,10 +2,13 @@ package whatsmeow
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	wm "go.mau.fi/whatsmeow"
 	waTypes "go.mau.fi/whatsmeow/types"
@@ -82,7 +85,14 @@ func (s *Session) setGroupDescription(ctx context.Context, command *protocol.Com
 	if req.Description != nil {
 		description = *req.Description
 	}
-	if err := s.setDescription(ctx, s.current(), group, description); err != nil {
+	// The revision the write goes out under, taken from the caller's idempotency key so a
+	// redelivery writes the same one. whatsmeow generates a fresh id when handed an empty
+	// one, and a description written twice under two ids is two revisions of the group's
+	// description for one command -- the text ends up the same either way, but the second
+	// one publishes a `group.updated` nobody asked for. A caller that sent no key gets the
+	// generated id and the duplicate event with it, which is the trade it already made by
+	// not naming the command.
+	if err := s.setDescription(ctx, s.current(), group, description, revisionOf(command)); err != nil {
 		return nil, contactFailure(err, "description change")
 	}
 	return nil, nil
@@ -355,7 +365,7 @@ const unaddressableTopicID = "undefined"
 // `SetGroupTopic` flattens a failure of its own lookup with `%v`, so a disconnection or a
 // rate limit during it would reach the caller as `internal` instead of as itself.
 func (s *Session) writeTheDescription(
-	ctx context.Context, client *wm.Client, group waTypes.JID, description string,
+	ctx context.Context, client *wm.Client, group waTypes.JID, description, revision string,
 ) error {
 	info, err := s.groupInfo(ctx, client, group)
 	if err != nil {
@@ -375,7 +385,15 @@ func (s *Session) writeTheDescription(
 		// answering 409 for a write that works today.
 		return client.SetGroupDescription(ctx, group, description) //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
 	}
-	return client.SetGroupTopic(ctx, group, info.TopicID, "", description) //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
+	err = client.SetGroupTopic(ctx, group, info.TopicID, revision, description)
+	if err != nil && ctx.Err() != nil {
+		// A group with no description at all sends `SetGroupTopic` to read one for itself,
+		// and it flattens a failure of that read with `%v`. The ceiling above is the most
+		// likely thing to end it, and a deadline reported as `internal` tells the caller
+		// this connector broke rather than that it stopped waiting.
+		return ctx.Err() //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
+	}
+	return err //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
 }
 
 // legacyDescription reports whether a write has to go through the call that leaves a
@@ -388,4 +406,18 @@ func (s *Session) writeTheDescription(
 // because sending it the other way is the seventy-five second wait this exists to remove.
 func legacyDescription(topicID, description string) bool {
 	return topicID == unaddressableTopicID && description != ""
+}
+
+// revisionOf is the id a description is written under.
+//
+// The caller's idempotency key when there is one, so a redelivered command writes the same
+// revision instead of a second one. Hashed rather than passed through: the key is the
+// caller's string and this goes on the wire as a stanza id, where WhatsApp expects the
+// shape its own clients send.
+func revisionOf(command *protocol.Command) string {
+	if command.IdempotencyKey == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(command.IdempotencyKey))
+	return strings.ToUpper(hex.EncodeToString(sum[:11]))
 }

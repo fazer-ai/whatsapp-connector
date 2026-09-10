@@ -155,7 +155,7 @@ type Session struct {
 	leave              func(context.Context, *wm.Client, waTypes.JID) error
 	setName            func(context.Context, *wm.Client, waTypes.JID, string) error
 	setPhoto           func(context.Context, *wm.Client, waTypes.JID, []byte) error
-	setDescription     func(context.Context, *wm.Client, waTypes.JID, string) error
+	setDescription     func(context.Context, *wm.Client, waTypes.JID, string, string) error
 	setAnnounce        func(context.Context, *wm.Client, waTypes.JID, bool) error
 	setLocked          func(context.Context, *wm.Client, waTypes.JID, bool) error
 	setJoinApproval    func(context.Context, *wm.Client, waTypes.JID, bool) error
@@ -620,8 +620,10 @@ func newSession(
 	// Assigned after the literal, not in it: this one reads the group before it writes,
 	// and it reads it through the seam beside it rather than off the client, so a test
 	// can make the lookup fail the way a disconnection does.
-	s.setDescription = func(ctx context.Context, client *wm.Client, group waTypes.JID, description string) error {
-		return s.writeTheDescription(ctx, client, group, description)
+	s.setDescription = func(
+		ctx context.Context, client *wm.Client, group waTypes.JID, description, revision string,
+	) error {
+		return s.writeTheDescription(ctx, client, group, description, revision)
 	}
 	s.adopt(client)
 	go s.forward()
@@ -1966,33 +1968,33 @@ func (s *Session) Execute(ctx context.Context, command *protocol.Command) (json.
 // does not extend one.
 const groupIQWait = 15 * time.Second
 
-// repeatableGroupCommands are the ones the ceiling is safe for: asked again, they leave the
-// group in the state the first attempt was for.
+// boundedGroupCommand reports whether the ceiling is safe for this command.
 //
-// The two left out are the two that do not. `group.create` makes a new group every time it
-// is carried out, and `group.invite.get` rotates the link when it is asked to revoke, which
-// invalidates the one people are holding. Cutting a wait short does not undo what WhatsApp
-// already did with it, and the ledger records only successes, so a command answered
-// `timeout` here and retried under the same idempotency key would make a second group or
-// rotate the link a second time -- invariant 5, and the thing the ceiling would otherwise
-// be trading a stalled queue for. They keep whatsmeow's own bound, which is longer and is
-// the price of not duplicating what cannot be taken back.
-var repeatableGroupCommands = map[protocol.CommandType]bool{
-	protocol.CommandGroupLeave:              true,
-	protocol.CommandGroupPhotoSet:           true,
-	protocol.CommandGroupNameSet:            true,
-	protocol.CommandGroupDescriptionSet:     true,
-	protocol.CommandGroupSettingsSet:        true,
-	protocol.CommandGroupJoinRequestsList:   true,
-	protocol.CommandGroupJoinRequestsUpdate: true,
-	protocol.CommandGroupList:               true,
-	protocol.CommandGroupInfo:               true,
-	protocol.CommandGroupParticipantsUpdate: true,
+// It is safe wherever giving up costs an answer and nothing else: asked again, the command
+// leaves the group in the state the first attempt was for. Two do not qualify.
+// `group.create` makes another group every time it runs, and `group.invite.get` rotates the
+// link when it is asked to revoke, which invalidates the one people are already holding.
+// WhatsApp does not undo either because this side stopped waiting, and the ledger records
+// only successes, so one of those answered `timeout` here and retried under the same
+// idempotency key is invariant 5 broken by the fix. They keep whatsmeow's own bound, which
+// is longer and is the price of not repeating what cannot be taken back.
+//
+// The invite is asked rather than assumed, through the same reading `ChangesSomething`
+// already does: a lookup that does not revoke is a read, and a read has nothing to
+// duplicate.
+func boundedGroupCommand(command *protocol.Command) bool {
+	switch command.Type {
+	case protocol.CommandGroupCreate:
+		return false
+	case protocol.CommandGroupInviteGet:
+		return !command.ChangesSomething()
+	}
+	return true
 }
 
 // aboutAGroup carries out the group commands, under a ceiling none of the others need.
 func (s *Session) aboutAGroup(ctx context.Context, command *protocol.Command) (json.RawMessage, error) {
-	if repeatableGroupCommands[command.Type] {
+	if boundedGroupCommand(command) {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, groupIQWait)
 		defer cancel()

@@ -8,7 +8,10 @@
 package whatsmeow
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"strconv"
 	"testing"
 	"time"
 
@@ -34,41 +37,83 @@ func TestLiveDescriptionIsRemovable(t *testing.T) {
 	// second or so they take, and well below the seventy-five the defect took.
 	const promptly = 10 * time.Second
 
+	// Asked again while WhatsApp is throttling, and timed only from the attempt that got
+	// through. Five description changes in as many seconds is more than this account is
+	// allowed -- measured: the fifth comes back `rate_limited` -- and that is WhatsApp
+	// pacing a real account, not the connector being slow. Retried rather than paced with
+	// a sleep, so what the phase waits on is the answer and not a number somebody guessed.
 	describe := func(t *testing.T, description any) time.Duration {
 		t.Helper()
-		started := time.Now()
-		liveCommand(t, subject, protocol.CommandGroupDescriptionSet, map[string]any{
-			"group": target, "description": description,
-		})
-		return time.Since(started)
+
+		waiting, give := context.WithTimeout(t.Context(), time.Minute)
+		defer give()
+		for attempt := 0; ; attempt++ {
+			started := time.Now()
+			err := liveTry(t, subject, protocol.CommandGroupDescriptionSet, map[string]any{
+				"group": target, "description": description,
+			})
+			took := time.Since(started)
+			if err == nil {
+				return took
+			}
+			var coded *protocol.Error
+			if !errors.As(err, &coded) || coded.Code != protocol.ErrorRateLimited {
+				t.Fatalf("group.description.set: %v", err)
+			}
+			if attempt == 0 {
+				t.Logf("WhatsApp is throttling this account's description changes; asking again")
+			}
+			select {
+			case <-waiting.Done():
+				t.Fatalf("WhatsApp throttled every attempt within the minute it was given")
+			case <-time.After(2 * time.Second):
+			}
+		}
 	}
 	// Read from the far side, so what is checked is what the group is rather than what
 	// this session remembers about it.
-	reads := func(t *testing.T) string {
+	//
+	// Waited on rather than read once: the write is acknowledged by WhatsApp to the
+	// session that made it, and the other account learns over its own connection, so a
+	// single read races the propagation and fails on a description that is on its way.
+	// A fixed pause would be the same race with a number on it.
+	reads := func(t *testing.T, wanted string, agrees func(string) bool) {
 		t.Helper()
-		info, err := counterpart.current().GetGroupInfo(t.Context(), group)
-		if err != nil {
-			t.Fatalf("read the group back: %v", err)
+
+		waiting, give := context.WithTimeout(t.Context(), 30*time.Second)
+		defer give()
+		var last string
+		for {
+			info, err := counterpart.current().GetGroupInfo(waiting, group)
+			if err == nil {
+				if last = info.Topic; agrees(last) {
+					return
+				}
+			}
+			select {
+			case <-waiting.Done():
+				t.Fatalf("the group reads %q on the other account, want %s", last, wanted)
+			case <-time.After(500 * time.Millisecond):
+			}
 		}
-		return info.Topic
+	}
+	is := func(t *testing.T, want string) {
+		t.Helper()
+		reads(t, strconv.Quote(want), func(got string) bool { return got == want })
 	}
 
 	t.Run("a description is written and reads back", func(t *testing.T) {
 		if took := describe(t, "para a 163"); took > promptly {
 			t.Errorf("writing a description took %s", took.Round(time.Millisecond))
 		}
-		if got := reads(t); got != "para a 163" {
-			t.Errorf("the group reads back %q", got)
-		}
+		is(t, "para a 163")
 	})
 
 	t.Run("a description is rewritten", func(t *testing.T) {
 		if took := describe(t, "para a 163, de novo"); took > promptly {
 			t.Errorf("rewriting a description took %s", took.Round(time.Millisecond))
 		}
-		if got := reads(t); got != "para a 163, de novo" {
-			t.Errorf("the group reads back %q", got)
-		}
+		is(t, "para a 163, de novo")
 	})
 
 	// The defect. Before this change the same call answered `timeout` after 1m15s, four
@@ -77,9 +122,7 @@ func TestLiveDescriptionIsRemovable(t *testing.T) {
 		if took := describe(t, nil); took > promptly {
 			t.Errorf("removing a description took %s", took.Round(time.Millisecond))
 		}
-		if got := reads(t); got != "" {
-			t.Errorf("the description is still %q after being removed", got)
-		}
+		is(t, "")
 	})
 
 	// The state a removal that leans on the previous description's id would hang in:
@@ -88,9 +131,7 @@ func TestLiveDescriptionIsRemovable(t *testing.T) {
 		if took := describe(t, nil); took > promptly {
 			t.Errorf("removing an absent description took %s", took.Round(time.Millisecond))
 		}
-		if got := reads(t); got != "" {
-			t.Errorf("the description came back as %q", got)
-		}
+		is(t, "")
 	})
 
 	// Whitespace is text, not a request for nothing. Storing a space where the operator
@@ -99,9 +140,11 @@ func TestLiveDescriptionIsRemovable(t *testing.T) {
 		if took := describe(t, "   "); took > promptly {
 			t.Errorf("writing spaces took %s", took.Round(time.Millisecond))
 		}
-		if got := reads(t); got == "" {
-			t.Error("three spaces were collapsed into a removal")
-		}
+		// Whatever WhatsApp keeps for three spaces is its business -- it may trim them,
+		// and the acceptance scenario says so. What it must not be is nothing, because
+		// nothing would mean this connector collapsed whitespace into a removal on its
+		// own and stored something other than what the operator asked for.
+		reads(t, "anything but empty", func(got string) bool { return got != "" })
 	})
 }
 
