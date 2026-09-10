@@ -761,7 +761,8 @@ func newEngine(
 	case EngineFake:
 		return fake.New(), nil, nil
 	case EngineWhatsmeow:
-		devices, err := store.Open(ctx, cfg.DatabaseURL, owned, log)
+		devices, err := store.OpenWith(ctx, cfg.DatabaseURL, owned, log,
+			store.Options{MaxConns: cfg.DatabaseConns})
 		if err != nil {
 			return nil, nil, err
 		}

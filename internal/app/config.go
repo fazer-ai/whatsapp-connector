@@ -15,6 +15,8 @@ import (
 	"github.com/fazer-ai/whatsapp-connector/internal/media"
 	"github.com/fazer-ai/whatsapp-connector/internal/redisx"
 	"github.com/fazer-ai/whatsapp-connector/internal/session"
+
+	"github.com/fazer-ai/whatsapp-connector/internal/store"
 )
 
 // Config is the whole configuration, read from the environment.
@@ -24,17 +26,18 @@ import (
 // variable the client's compose file already sets, so the two cannot be pointed at
 // different servers by an operator setting only one of them.
 type Config struct {
-	Instance     string
-	RedisURL     string
-	RedisPass    string
-	RedisPrefix  string
-	EventShards  int
-	Engine       string
-	DatabaseURL  string
-	DeviceName   string
-	HTTPAddr     string
-	AdvertiseURL string
-	MediaToken   string
+	Instance      string
+	RedisURL      string
+	RedisPass     string
+	RedisPrefix   string
+	EventShards   int
+	Engine        string
+	DatabaseURL   string
+	DatabaseConns int
+	DeviceName    string
+	HTTPAddr      string
+	AdvertiseURL  string
+	MediaToken    string
 	// MediaRoot is where this instance keeps the bytes of inbound media. Empty turns
 	// the blob store off, and with it the media endpoint: an instance with nowhere to
 	// put a file publishes messages without a blob to fetch rather than filling a
@@ -117,6 +120,10 @@ const DefaultMediaRefetch = 7 * 24 * time.Hour
 // falling back to a default, because a misspelled number in a deployment is a bug to
 // see at startup, not a setting silently ignored.
 func LoadConfig(hostname string) (Config, error) {
+	databaseConns, err := envInt("WAC_DATABASE_MAX_CONNS", store.DefaultMaxConns)
+	if err != nil {
+		return Config{}, err
+	}
 	shards, err := envInt("WAC_EVENT_SHARDS", DefaultEventShards)
 	if err != nil {
 		return Config{}, err
@@ -174,6 +181,7 @@ func LoadConfig(hostname string) (Config, error) {
 		EventShards:    shards,
 		Engine:         envString("WAC_ENGINE", "fake"),
 		DatabaseURL:    envString("WAC_DATABASE_URL", ""),
+		DatabaseConns:  databaseConns,
 		DeviceName:     envString("WAC_DEVICE_NAME", DefaultDeviceName),
 		HTTPAddr:       envString("WAC_HTTP_ADDR", ":8080"),
 		AdvertiseURL:   envString("WAC_ADVERTISE_URL", ""),

@@ -94,6 +94,35 @@ func AlwaysOwned(string) bool { return true }
 //
 //nolint:gocritic // zerolog.Logger is designed to be copied; every With() returns one by value
 func Open(ctx context.Context, address string, owned Ownership, log zerolog.Logger) (*Container, error) {
+	return OpenWith(ctx, address, owned, log, Options{})
+}
+
+// Options are the knobs a deployment sets and a test does not care about.
+type Options struct {
+	// MaxConns caps the Postgres pool. Zero takes DefaultMaxConns, which exists because
+	// database/sql's own default is no cap at all: a burst of concurrent queries opens a
+	// connection per query, and Postgres ships with `max_connections = 100` for the whole
+	// server. Reaching it does not slow this connector down, it refuses connections to
+	// every other application on that database.
+	//
+	// Sessions do not hold one each. There is a single pool per process, shared by
+	// whatsmeow's device store and this package's tables, and a connection is taken per
+	// query and given back -- which is why the number that matters is how many queries
+	// run at once, not how many accounts are paired.
+	//
+	// SQLite ignores it: a file holds one writer whatever the pool says.
+	MaxConns int
+}
+
+// DefaultMaxConns leaves room for several connectors and everything else on a Postgres
+// that was never reconfigured. An instance that needs more says so.
+const DefaultMaxConns = 20
+
+// OpenWith is Open with the knobs a deployment sets. Open is the same call with none of
+// them, which is what every test and every caller that does not run a fleet wants.
+//
+//nolint:gocritic // zerolog.Logger is designed to be copied; every With() returns one by value
+func OpenWith(ctx context.Context, address string, owned Ownership, log zerolog.Logger, opts Options) (*Container, error) {
 	if owned == nil {
 		return nil, errors.New("store: open without an owner arbiter (pass AlwaysOwned where nothing competes)")
 	}
@@ -118,6 +147,17 @@ func Open(ctx context.Context, address string, owned Ownership, log zerolog.Logg
 		// `database is locked`. Serialising here is what makes busy_timeout the
 		// backstop rather than the mechanism.
 		db.SetMaxOpenConns(1)
+	} else {
+		maxConns := opts.MaxConns
+		if maxConns <= 0 {
+			maxConns = DefaultMaxConns
+		}
+		db.SetMaxOpenConns(maxConns)
+		// Held open between queries, so a busy instance is not paying a TLS handshake per
+		// message. Left at the library's default of two, every burst past the second
+		// concurrent query dials, works, and closes.
+		db.SetMaxIdleConns(maxConns)
+		db.SetConnMaxIdleTime(idleConnLifetime)
 	}
 
 	devices := sqlstore.NewWithDB(db, dialect, nil)
@@ -133,6 +173,11 @@ func Open(ctx context.Context, address string, owned Ownership, log zerolog.Logg
 	}
 	return c, nil
 }
+
+// idleConnLifetime is how long an unused connection is kept. Long enough that a quiet
+// minute does not cost a reconnect, short enough that an instance that went idle gives
+// its share of the server's connections back.
+const idleConnLifetime = 5 * time.Minute
 
 // Ping reports whether the database is answering. Readiness asks, because a session
 // cannot be opened or paired without it.
