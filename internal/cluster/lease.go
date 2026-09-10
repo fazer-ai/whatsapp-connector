@@ -23,6 +23,15 @@ import (
 // does not hold it any more.
 var ErrNotOwner = errors.New("cluster: session is owned elsewhere")
 
+// ErrHandingBack is ErrNotOwner from a holder that has already said it is giving the
+// session up, so the answer is "not yet" rather than "somebody else is running it".
+//
+// It wraps ErrNotOwner because every caller that branches on ownership wants the same
+// thing here: the lease is not this instance's. Only the caller that has to decide
+// whether an account will still be running a moment from now -- the one holding a wake
+// it would otherwise retire -- looks past that.
+var ErrHandingBack = fmt.Errorf("%w: the owner is handing it back", ErrNotOwner)
+
 // DefaultTTL is how long a lease survives without a renewal. It has to outlast a
 // stop-the-world pause plus a renewal round trip, and be short enough that a session
 // on a killed instance moves within the DoD's 45 seconds.
@@ -44,16 +53,49 @@ end
 return 0
 `)
 
-// releaseScript drops the lease only while this instance holds it, and arms the
-// cooldown in the same step so the instance that just let go does not immediately win
-// the race to take it back.
+// releaseScript drops the lease only while this instance holds it, and takes the
+// hand-back mark with it in the same step: the mark says an owner is on its way to
+// letting go, and the moment it has, the account is free and a peer asking should be
+// told so rather than told to wait for a hand-back that already happened.
 var releaseScript = redis.NewScript(`
 if redis.call("GET", KEYS[1]) ~= ARGV[1] then
   return 0
 end
 redis.call("DEL", KEYS[1])
-redis.call("SET", KEYS[2], ARGV[1], "PX", ARGV[2])
+redis.call("DEL", KEYS[2])
 return 1
+`)
+
+// acquireScript takes the lease if it is free, and otherwise says whether the instance
+// holding it has marked itself as handing it back.
+//
+// Both in one step, because the interesting case is exactly the race between them: a
+// peer reading the mark after its own acquisition failed can be beaten to it by the
+// release, find nothing, and conclude the account is somebody else's -- which is the bug
+// the mark exists to close, only narrower. Inside the script the two cannot interleave:
+// a release that lands first makes the SET succeed, and one that lands after leaves the
+// mark for this read.
+//
+// The mark is compared against the holder rather than merely being present. One left by
+// an instance that no longer holds the lease says nothing about the one that does, and a
+// wake left pending on the strength of it would bounce until the mark expired.
+//
+// Winning clears it, for the case the comparison cannot see through: a hand-back that
+// never landed leaves a mark outliving the lease it was about, and the instance that
+// wrote it can win the account back under its own name. The mark would then equal the
+// holder while that holder runs the session, and every wake for it would be left pending
+// until the mark expired. A lease taken afresh is the moment nothing about the one
+// before it is true any more.
+var acquireScript = redis.NewScript(`
+if redis.call("SET", KEYS[1], ARGV[1], "NX", "PX", ARGV[2]) then
+  redis.call("DEL", KEYS[2])
+  return 1
+end
+local holder = redis.call("GET", KEYS[1])
+if holder and redis.call("GET", KEYS[2]) == holder then
+  return 2
+end
+return 0
 `)
 
 // Lease is one session's ownership, as held by this instance.
@@ -68,7 +110,6 @@ type Leases struct {
 	instance string
 	ttl      time.Duration
 	margin   time.Duration
-	cooldown time.Duration
 
 	mu sync.RWMutex
 	// held by value, not by pointer: Owned answers from local state on every write, and
@@ -95,10 +136,9 @@ type held struct {
 
 // Options configures Leases. The zero value asks for the defaults.
 type Options struct {
-	TTL      time.Duration
-	Margin   time.Duration
-	Cooldown time.Duration
-	Clock    Clock
+	TTL    time.Duration
+	Margin time.Duration
+	Clock  Clock
 }
 
 // NewLeases returns the lease holder for one instance id.
@@ -109,9 +149,6 @@ func NewLeases(client *redisx.Client, instance string, opts Options) *Leases {
 	if opts.Margin <= 0 {
 		opts.Margin = DefaultRenewMargin
 	}
-	if opts.Cooldown <= 0 {
-		opts.Cooldown = opts.TTL / 3
-	}
 	if opts.Clock == nil {
 		opts.Clock = systemClock{}
 	}
@@ -120,7 +157,6 @@ func NewLeases(client *redisx.Client, instance string, opts Options) *Leases {
 		instance: instance,
 		ttl:      opts.TTL,
 		margin:   opts.Margin,
-		cooldown: opts.Cooldown,
 		held:     make(map[string]held),
 		clock:    opts.Clock,
 	}
@@ -147,12 +183,26 @@ func (l *Leases) Acquire(ctx context.Context, sid string) (Lease, error) {
 	// it -- by however long an acquisition takes, which is exactly the moment Redis is
 	// slow. Owned would then keep saying yes past the moment the key expires and a peer
 	// can take it. Dating it earlier only ever gives it up sooner than necessary.
+	on := []string{keys.Lease(sid), keys.HandBack(sid)}
 	sent := l.clock.Now()
-	won, err := l.client.SetNX(ctx, keys.Lease(sid), l.instance, l.ttl).Result()
+	won, err := acquireScript.EvalSha(ctx, l.client, on, l.instance, l.ttl.Milliseconds()).Int()
+	if redis.HasErrorPrefix(err, "NOSCRIPT") {
+		// Sent by hand rather than left to Run, which would send it too but date the
+		// lease from before the request that came back unloaded. The digest is not
+		// there on the first acquisition after a restart or a SCRIPT FLUSH, and an
+		// EVALSHA answered NOSCRIPT started no TTL: Redis starts it here. Dated from
+		// here for the same reason RenewMany re-dates the batch it has to resend.
+		sent = l.clock.Now()
+		won, err = acquireScript.Eval(ctx, l.client, on, l.instance, l.ttl.Milliseconds()).Int()
+	}
 	if err != nil {
 		return Lease{}, fmt.Errorf("cluster: acquire %s: %w", sid, err)
 	}
-	if !won {
+	switch won {
+	case 1:
+	case 2:
+		return Lease{}, ErrHandingBack
+	default:
 		return Lease{}, ErrNotOwner
 	}
 
@@ -308,18 +358,119 @@ func (l *Leases) epochOf(sid string) uint64 {
 	return l.held[sid].epoch
 }
 
-// Release gives up a lease and arms the cooldown. It reports whether this instance
-// was the one holding it.
+// markHandingBackScript writes the mark only while this instance still holds the lease.
+//
+// Fenced, and not a plain SET, because a hand-back that failed is retried on a later
+// tick and the account may have moved on by then: the lease expired, a peer took it, and
+// that peer is now handing it back itself. An unfenced write would replace its mark with
+// this instance's name, and the comparison every reader makes -- mark against holder --
+// would then say nobody is handing anything back, on an account being handed back. The
+// wake that follows is acknowledged into nothing, which is the bug the mark exists for.
+var markHandingBackScript = redis.NewScript(`
+if redis.call("GET", KEYS[1]) ~= ARGV[1] then
+  return 0
+end
+redis.call("SET", KEYS[2], ARGV[1], "PX", ARGV[2])
+return 1
+`)
+
+// MarkManyHandingBack marks a whole batch in one round trip.
+//
+// One and not one per session, for the reason RenewMany exists: what a shutdown spends
+// here is spent in front of the stops that take the sockets down, and a wait that grows
+// with how many sessions the instance carries is one where the last socket outlives the
+// lease a peer can already take the account on.
+//
+// Answers are not read back one by one. The caller learns whether the batch reached
+// Redis, which is the only thing it can act on: a mark refused because the lease moved
+// on is an answer, not a failure, exactly as in MarkHandingBack.
+func (l *Leases) MarkManyHandingBack(ctx context.Context, sids []string) error {
+	if len(sids) == 0 {
+		return nil
+	}
+	keys := l.client.Keys()
+	_, err := l.client.Pipelined(ctx, func(pipe redis.Pipeliner) error {
+		for _, sid := range sids {
+			markHandingBackScript.EvalSha(
+				ctx, pipe, []string{keys.Lease(sid), keys.HandBack(sid)}, l.instance, l.ttl.Milliseconds(),
+			)
+		}
+		return nil
+	})
+	if err == nil {
+		return nil
+	}
+	// The digest is not loaded on the first pass after a restart or a SCRIPT FLUSH, and
+	// inside a pipeline Run's own fallback cannot help: it decides on an error the command
+	// does not carry until the whole batch has been sent. Resent whole rather than per
+	// session, which is the round trip this exists to avoid spending N times.
+	if !redis.HasErrorPrefix(err, "NOSCRIPT") {
+		return fmt.Errorf("cluster: mark handing back %d sessions: %w", len(sids), err)
+	}
+	_, err = l.client.Pipelined(ctx, func(pipe redis.Pipeliner) error {
+		for _, sid := range sids {
+			markHandingBackScript.Eval(
+				ctx, pipe, []string{keys.Lease(sid), keys.HandBack(sid)}, l.instance, l.ttl.Milliseconds(),
+			)
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("cluster: mark handing back %d sessions: %w", len(sids), err)
+	}
+	return nil
+}
+
+// MarkHandingBack says that this instance holds a lease it has stopped running and is
+// about to give up. Release clears it, and it expires on its own after one TTL, which
+// outlasts the lease it is about.
+//
+// It is a separate round trip on purpose: the mark is only worth anything before the
+// release, and there is no arrangement in which one call both writes it and acts on it
+// having been written.
+func (l *Leases) MarkHandingBack(ctx context.Context, sid string) error {
+	keys := l.client.Keys()
+	// The answer says whether the mark was written, and there is nothing for a caller to
+	// do with it: a lease this instance no longer holds is a hand-back nobody is waiting
+	// to hear about, which is an answer rather than a failure.
+	if _, err := markHandingBackScript.Run(
+		ctx, l.client, []string{keys.Lease(sid), keys.HandBack(sid)}, l.instance, l.ttl.Milliseconds(),
+	).Int(); err != nil {
+		return fmt.Errorf("cluster: mark handing back %s: %w", sid, err)
+	}
+	return nil
+}
+
+// Release gives up a lease and clears the hand-back mark. It reports whether this
+// instance was the one holding it.
 func (l *Leases) Release(ctx context.Context, sid string) (bool, error) {
 	l.forget(sid)
 	keys := l.client.Keys()
 	released, err := releaseScript.Run(
-		ctx, l.client, []string{keys.Lease(sid), keys.Cooldown(sid)}, l.instance, l.cooldown.Milliseconds(),
+		ctx, l.client, []string{keys.Lease(sid), keys.HandBack(sid)}, l.instance,
 	).Int()
 	if err != nil {
 		return false, fmt.Errorf("cluster: release %s: %w", sid, err)
 	}
 	return released == 1, nil
+}
+
+// Freshness is how much of a lease this instance may still act on, which is the same
+// clock Owned answers from: the lifetime left before the margin, and zero once that is
+// gone or the lease was never held.
+//
+// It exists for the work that has to happen before a socket comes down. A bound written
+// against the configured TTL is the right size for a lease just renewed and the wrong
+// one for a lease near its end: the work would run past the moment a peer can take the
+// account, with this instance still talking to WhatsApp on it.
+func (l *Leases) Freshness(sid string) time.Duration {
+	l.mu.RLock()
+	entry, ok := l.held[sid]
+	l.mu.RUnlock()
+	if !ok {
+		return 0
+	}
+	return max(l.ttl-l.margin-l.clock.Now().Sub(entry.renewedAt), 0)
 }
 
 // Owned answers whether this instance may still act on a session, from local state

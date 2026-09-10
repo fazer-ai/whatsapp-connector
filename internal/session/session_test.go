@@ -1328,12 +1328,11 @@ func (h brokenReplies) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
 	}
 }
 
-// isScript keeps a hook off the plain commands a test reads state with, and off the
-// SETNX an instance acquires a lease with.
+// isScript keeps a hook off the plain commands a test reads state with. All three lease
+// operations are scripts, so it does not tell them apart on its own.
 func isScript(cmd redis.Cmder) bool { return strings.HasPrefix(cmd.Name(), "eval") }
 
-// mentions reports whether a command carries a key, which is how a test tells the two
-// lease scripts apart: only the hand-back names the cooldown.
+// mentions reports whether a command carries a key.
 func mentions(cmd redis.Cmder, key string) bool {
 	for _, arg := range cmd.Args() {
 		if text, ok := arg.(string); ok && text == key {
@@ -1343,11 +1342,39 @@ func mentions(cmd redis.Cmder, key string) bool {
 	return false
 }
 
-// losesRenewals fails every renewal after it has been applied, and leaves the hand-back
-// alone.
-func losesRenewals(cooldownKey string) brokenReplies {
+// keysOf reports how many keys a script command carries, counted where go-redis puts it:
+// after the command and the script, ahead of the keys themselves.
+//
+// It separates a renewal from everything else, regardless of which session the script is
+// about: renewing takes the lease alone, and acquiring, marking and handing back all take
+// the lease and the hand-back mark. Telling those three apart is handsBack's job.
+func keysOf(cmd redis.Cmder) int {
+	args := cmd.Args()
+	if len(args) < 3 {
+		return 0
+	}
+	count, ok := args[2].(int)
+	if !ok {
+		return 0
+	}
+	return count
+}
+
+// handsBack names the hand-back of one session among the lease scripts.
+//
+// By what the script is told and not by the keys it takes, because the keys no longer
+// separate them: renewing takes the lease alone, and acquiring, marking and handing back
+// all take the lease and the mark. What is left is the arguments -- the hand-back needs
+// only the instance's name, and the other two also carry a lifetime.
+func handsBack(cmd redis.Cmder, handBackKey string) bool {
+	return isScript(cmd) && mentions(cmd, handBackKey) && len(cmd.Args()) == 3+keysOf(cmd)+1
+}
+
+// losesRenewals fails every renewal after it has been applied, and leaves the hand-backs
+// and the acquisitions alone.
+func losesRenewals() brokenReplies {
 	return brokenReplies{lose: func(cmd redis.Cmder) bool {
-		return isScript(cmd) && !mentions(cmd, cooldownKey)
+		return isScript(cmd) && keysOf(cmd) == 1
 	}}
 }
 
@@ -1361,7 +1388,6 @@ func TestRenewAllHandsBackTheLeaseOfASessionItStopped(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
 	t.Cleanup(func() { _ = rdb.Close() })
 	client := redisx.Wrap(rdb, "wa:", 8)
-	keys := client.Keys()
 
 	clock := &steppingClock{now: time.Now()}
 	leases := cluster.NewLeases(client, "inst-a", cluster.Options{Clock: clock})
@@ -1376,7 +1402,7 @@ func TestRenewAllHandsBackTheLeaseOfASessionItStopped(t *testing.T) {
 		t.Fatalf("Adopt: %v", err)
 	}
 
-	rdb.AddHook(losesRenewals(keys.Cooldown("s1")))
+	rdb.AddHook(losesRenewals())
 	clock.step(cluster.DefaultTTL + time.Second)
 	manager.RenewAll(ctx, manager.HandBackBy())
 
@@ -1416,9 +1442,9 @@ func TestAHandBackThatDidNotLandIsTriedAgain(t *testing.T) {
 
 	var away atomic.Bool
 	away.Store(true)
-	hook := losesRenewals(keys.Cooldown("s1"))
+	hook := losesRenewals()
 	hook.drop = func(cmd redis.Cmder) bool {
-		return away.Load() && isScript(cmd) && mentions(cmd, keys.Cooldown("s1"))
+		return away.Load() && handsBack(cmd, keys.HandBack("s1"))
 	}
 	rdb.AddHook(hook)
 
@@ -1467,9 +1493,9 @@ func TestAQueuedHandBackDoesNotTouchALeaseTakenAgain(t *testing.T) {
 
 	var away atomic.Bool
 	away.Store(true)
-	hook := losesRenewals(keys.Cooldown("s1"))
+	hook := losesRenewals()
 	hook.drop = func(cmd redis.Cmder) bool {
-		return away.Load() && isScript(cmd) && mentions(cmd, keys.Cooldown("s1"))
+		return away.Load() && handsBack(cmd, keys.HandBack("s1"))
 	}
 	rdb.AddHook(hook)
 
@@ -1531,9 +1557,9 @@ func TestRenewalsComeBeforeHandBacks(t *testing.T) {
 		}
 	}
 	var away atomic.Bool
-	hook := losesRenewals(keys.Cooldown("s1"))
+	hook := losesRenewals()
 	hook.drop = func(cmd redis.Cmder) bool {
-		return away.Load() && isScript(cmd) && mentions(cmd, keys.Cooldown("s1"))
+		return away.Load() && handsBack(cmd, keys.HandBack("s1"))
 	}
 	rdb.AddHook(hook)
 	away.Store(true)
@@ -1544,7 +1570,7 @@ func TestRenewalsComeBeforeHandBacks(t *testing.T) {
 	// s1's hand-back is queued. From here every hand-back hangs for longer than a lease,
 	// and the renewal of the live session must not be waiting behind it.
 	rdb.AddHook(slowCommands{slow: func(cmd redis.Cmder) bool {
-		return isScript(cmd) && mentions(cmd, keys.Cooldown("s1"))
+		return handsBack(cmd, keys.HandBack("s1"))
 	}, delay: hang})
 
 	if _, err := manager.Adopt(ctx, "s2"); err != nil {
@@ -1620,9 +1646,9 @@ func TestAWakeRefusedByThisInstancesOwnStaleLeaseStaysPending(t *testing.T) {
 	// the key still names this instance, which is running nothing.
 	var away atomic.Bool
 	away.Store(true)
-	hook := losesRenewals(keys.Cooldown("s1"))
+	hook := losesRenewals()
 	hook.drop = func(cmd redis.Cmder) bool {
-		return away.Load() && isScript(cmd) && mentions(cmd, keys.Cooldown("s1"))
+		return away.Load() && handsBack(cmd, keys.HandBack("s1"))
 	}
 	rdb.AddHook(hook)
 	clock.step(cluster.DefaultTTL + time.Second)

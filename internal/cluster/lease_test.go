@@ -216,30 +216,6 @@ func TestHeldListsWhatWasAcquired(t *testing.T) {
 	}
 }
 
-func TestReleaseArmsTheCooldown(t *testing.T) {
-	t.Parallel()
-
-	server, a, _ := newFleet(t, newClock())
-	ctx := context.Background()
-
-	if _, err := a.Acquire(ctx, "s1"); err != nil {
-		t.Fatalf("a.Acquire: %v", err)
-	}
-	released, err := a.Release(ctx, "s1")
-	if err != nil {
-		t.Fatalf("a.Release: %v", err)
-	}
-	if !released {
-		t.Fatal("a.Release reported it held nothing")
-	}
-	if !server.Exists("wa:cooldown:s1") {
-		t.Fatal("release left no cooldown, so the same instance can win the reclaim immediately")
-	}
-	if server.Exists("wa:lease:s1") {
-		t.Fatal("release left the lease in place")
-	}
-}
-
 // Owned answers from local state on every write, and the renew loop rewrites that state
 // on its own goroutine. The two have to be safe together, and an entry that escaped the
 // lock as a pointer was not: the reader saw a renewal timestamp mid-write.
@@ -460,7 +436,7 @@ func TestARenewalIsDatedFromWhenItWasSent(t *testing.T) {
 }
 
 // The same for an acquisition, and with one more round trip inside it: Redis starts the
-// TTL when SETNX runs, and the epoch is read after that. A lease stamped once both have
+// TTL when the acquiring script runs, and the epoch is read after that. A lease stamped once both have
 // answered is dated later than Redis dates it, by however long the acquisition took --
 // which is exactly the moment Redis is slow enough for it to matter. It is the store's
 // question now as well as the socket's: every fenced write asks whether this lease is
@@ -475,12 +451,13 @@ func TestAnAcquisitionIsDatedFromWhenItWasSent(t *testing.T) {
 	leases := cluster.NewLeases(redisx.Wrap(rdb, "wa:", 8), "inst-a", cluster.Options{Clock: clock})
 
 	// The acquisition takes as long as the lease has to give, spent on the way there.
-	// `set`, not `setnx`: go-redis sends SetNX with an expiration as `SET ... NX`, and
-	// the hook names the command that goes on the wire.
+	// It is a script rather than a bare SET because taking the lease and reading whether
+	// its holder is handing it back have to be one step, so the hook names an eval; this
+	// test acquires once and renews never, so nothing else answers to that.
 	rdb.AddHook(advancingClock{
 		clock: clock,
 		by:    cluster.DefaultTTL - cluster.DefaultRenewMargin,
-		on:    func(cmd redis.Cmder) bool { return cmd.Name() == "set" },
+		on:    func(cmd redis.Cmder) bool { return strings.HasPrefix(cmd.Name(), "eval") },
 	})
 
 	if _, err := leases.Acquire(context.Background(), "s1"); err != nil {
@@ -488,5 +465,43 @@ func TestAnAcquisitionIsDatedFromWhenItWasSent(t *testing.T) {
 	}
 	if _, owned := leases.Owned("s1"); owned {
 		t.Fatal("a lease acquired by a round trip that outlasted its fresh lifetime still counts as owned")
+	}
+}
+
+// And dated from the request that actually started the TTL, which on the first
+// acquisition after a restart or a SCRIPT FLUSH is not the first one sent. The digest is
+// not loaded, the EVALSHA comes back NOSCRIPT having started nothing, and Redis begins
+// the lifetime at the EVAL behind it. A lease dated from before both is short by a whole
+// failed round trip, and the local answer to "do I still own this" -- which every fenced
+// write asks -- expires that much before the key does.
+func TestAnAcquisitionIsDatedFromTheRequestThatStartedTheLease(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	clock := newClock()
+	leases := cluster.NewLeases(redisx.Wrap(rdb, "wa:", 8), "inst-a", cluster.Options{Clock: clock})
+	ctx := context.Background()
+
+	// Nothing is loaded, so the acquisition below pays for the digest that is not there.
+	if err := rdb.ScriptFlush(ctx).Err(); err != nil {
+		t.Fatalf("ScriptFlush: %v", err)
+	}
+
+	// Half of what the lease has to give, per round trip. One of them is what Redis
+	// starts the TTL after, and the lease survives it; two is what dating from before
+	// the failed one charges, and that is the whole lifetime.
+	rdb.AddHook(advancingClock{
+		clock: clock,
+		by:    (cluster.DefaultTTL - cluster.DefaultRenewMargin) / 2,
+		on:    func(cmd redis.Cmder) bool { return strings.HasPrefix(cmd.Name(), "eval") },
+	})
+
+	if _, err := leases.Acquire(ctx, "s1"); err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	if _, owned := leases.Owned("s1"); !owned {
+		t.Fatal("a lease was dated from an EVALSHA that came back unloaded and started no TTL, so it reads as expired a whole failed round trip before the key does")
 	}
 }

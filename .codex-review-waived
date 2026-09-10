@@ -480,17 +480,6 @@ internal/engine/whatsmeow/session.go: Order concurrent renames before replacing 
 # marker with the name it describes, which is a durable outbox for a display annotation that
 # the next rename repairs on its own. Recorded in fazer-ai/whatsapp-connector#140.
 internal/engine/whatsmeow/session.go: Preserve failed name writes across session recreation  # PR#139
-# PR#144: real, and not this PR's to close. `handingBack` reads a map in this process, so a
-# wake consumed by a peer while this instance is handing a lease back is acknowledged as
-# somebody else's and the account is left with nothing to start it. That is main's behaviour
-# for every hand-back -- `StopAll` runs one per session on every SIGTERM, which is every
-# rolling deploy -- and not something the retirement path introduces; it only adds another
-# caller of the same `abandon`. Closing it needs state a peer can read, which means a key
-# every instance in a fleet writes and reads, with a mixed-version story of its own during
-# the deploy that is exactly when `StopAll` is handing everything back. Recorded in
-# fazer-ai/whatsapp-connector#145, with the note that `cooldown:<sid>` is already written on
-# every release and read by nobody, so the marker may well belong there.
-internal/session/manager.go: Make in-flight hand-backs visible to peer consumers  # PR#144
 # PR#144: `waitFor` polls with a 5ms sleep and a 5s deadline, and that is not the pattern
 # the rule names. What it forbids is a sleep standing in for synchronisation -- sleep 100ms,
 # then assert -- which passes when the scheduler is kind and fails when it is not. This
@@ -503,3 +492,60 @@ internal/session/manager.go: Make in-flight hand-backs visible to peer consumers
 # putting a channel in production code for the tests to read. The same shape is used
 # throughout the repository's own suites (internal/app, transport/redisstream).
 internal/session/manager_internal_test.go: Replace polling sleeps with deterministic synchronization  # PR#144
+# PR#149: a two-release rollout is what you need when new behaviour breaks old
+# participants, and nothing here does. Every pairing during a rolling deploy is either
+# fixed or exactly main's behaviour today: new reader with new writer is the fix; new
+# reader with old writer finds no mark and acknowledges the wake, which is what main
+# does; old reader ignores the mark and acknowledges the wake, which is also what main
+# does. At no point is any instance worse off than before the change, so there is no
+# window to stage. The mark is a key nothing else reads, with a TTL of one lease, and
+# an old instance that wins a lease without clearing a mark is covered by the fence:
+# readers compare mark against holder, and a mark naming somebody who no longer holds
+# the lease reads as nobody handing anything back. The one case an old binary leaves
+# behind -- winning a lease under an instance id a mark still names -- costs wakes left
+# pending for at most one TTL, with nothing lost. Staging it over two releases would
+# add a flag and a second deploy to buy a property the additive shape already has.
+internal/cluster/lease.go: Stage the hand-back marker for mixed-version fleets  # PR#149
+# PR#149: the group this is about is the one that only exists when every lease on the
+# instance is already past its usable life, and there is no ordering that closes it.
+# Leases are renewed in one pipelined batch under one reading of the clock, so an
+# instance's leases age together; a session adopted between ticks is stamped when it is
+# acquired, which makes it newer and never older; and one whose renewal fails on its own
+# is stopped by the sweep. Measured from outside on a running fleet, reading every PTTL in
+# one EVAL rather than one call per key: across forty samples of thirty-three leases and
+# forty of twenty-seven, the spread between the newest and the oldest was 0 ms in thirty of
+# them and 1 ms in the rest, never more, with the smallest TTL seen 25.0 s of 30.
+# So `ending` is empty, which is every ordinary shutdown, or it is everything, which is an
+# instance that stopped renewing for about a whole TTL: a frozen process, a long pause, a
+# suspended machine.
+#
+# In that state the exposure this names is one margin long. Local freshness at zero means
+# the key in Redis has at most the margin left before it expires on its own, and after
+# that a wake adopts the account normally; the loss needs a wake inside that window. What
+# closing it would cost is a round trip in front of every socket, which is the finding two
+# rounds ago -- and an instance that has not reached Redis for a whole TTL is not one
+# whose mark would land anyway. Marking before the stops and stopping before the marks
+# cannot both be true, and this side is the one where the residue is bounded by the margin
+# rather than by how long a Redis outage lasts.
+internal/session/manager.go: Mark each expiring hand-back before another stop can block  # PR#149
+# PR#149: this one needs both groups to exist at once, and the two things it needs pull
+# against each other. A lease only reaches the group with no room by going about a whole
+# TTL without a renewal, which means the instance was not reaching Redis or was not
+# running at all; a lease is only in the other group if it was renewed or acquired
+# recently, which means it was. For the harm named here the releases in front also have to
+# block, so Redis has to be away again by then. Measured on a running fleet, reading every
+# PTTL in one EVAL rather than one call per key, an instance's leases carry the same
+# expiry to the millisecond: across forty samples of thirty-three leases and forty of
+# twenty-seven, the spread was 0 ms in thirty of them and 1 ms in the rest, never more.
+# They are renewed in one pipelined batch under one reading of the clock; a session
+# adopted between ticks is stamped when it is acquired, so it is newer than the rest and
+# never older, and one whose renewal fails on its own is stopped by the sweep rather than
+# kept.
+#
+# What is left is a sequence -- frozen for a TTL, resumed, an account adopted, Redis away
+# again, SIGTERM -- against a fix that would put the releases behind every socket, which
+# is the finding four rounds ago, or bound them so tightly they stop landing, which is
+# what the mark exists to avoid. Marking before the stops and stopping before the marks
+# cannot both be true; this is the ninth round on that one trade, and the residue on this
+# side is one margin of lease rather than the length of an outage.
+internal/session/manager.go: Stop fresh sockets before blocking on stale releases  # PR#149
