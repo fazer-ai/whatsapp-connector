@@ -155,12 +155,15 @@ type Session struct {
 	leave              func(context.Context, *wm.Client, waTypes.JID) error
 	setName            func(context.Context, *wm.Client, waTypes.JID, string) error
 	setPhoto           func(context.Context, *wm.Client, waTypes.JID, []byte) error
-	setDescription     func(context.Context, *wm.Client, waTypes.JID, string) error
-	setAnnounce        func(context.Context, *wm.Client, waTypes.JID, bool) error
-	setLocked          func(context.Context, *wm.Client, waTypes.JID, bool) error
-	setJoinApproval    func(context.Context, *wm.Client, waTypes.JID, bool) error
-	setAddMode         func(context.Context, *wm.Client, waTypes.JID, waTypes.GroupMemberAddMode) error
-	profilePicture     func(context.Context, *wm.Client, waTypes.JID, *wm.GetProfilePictureParams) (*waTypes.ProfilePictureInfo, error)
+	setDescription     func(context.Context, *wm.Client, waTypes.JID, string, string) error
+	// The two calls writeTheDescription picks between. Seams of their own because which
+	// one a write takes is the whole of what it decides, and only one of them is bounded.
+	setTopic        func(context.Context, *wm.Client, waTypes.JID, string, string, string) error
+	setAnnounce     func(context.Context, *wm.Client, waTypes.JID, bool) error
+	setLocked       func(context.Context, *wm.Client, waTypes.JID, bool) error
+	setJoinApproval func(context.Context, *wm.Client, waTypes.JID, bool) error
+	setAddMode      func(context.Context, *wm.Client, waTypes.JID, waTypes.GroupMemberAddMode) error
+	profilePicture  func(context.Context, *wm.Client, waTypes.JID, *wm.GetProfilePictureParams) (*waTypes.ProfilePictureInfo, error)
 
 	// uploadWait bounds how long an outbound media message spends fetching its file and
 	// handing it to WhatsApp. A field for the same reason as the three above it.
@@ -573,9 +576,6 @@ func newSession(
 		setName: func(ctx context.Context, client *wm.Client, group waTypes.JID, subject string) error {
 			return client.SetGroupName(ctx, group, subject) //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
 		},
-		setDescription: func(ctx context.Context, client *wm.Client, group waTypes.JID, description string) error {
-			return client.SetGroupDescription(ctx, group, description) //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
-		},
 		setAnnounce: func(ctx context.Context, client *wm.Client, group waTypes.JID, on bool) error {
 			return client.SetGroupAnnounce(ctx, group, on) //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
 		},
@@ -619,6 +619,19 @@ func newSession(
 		board:          make(map[string]posted),
 		downloadWait:   downloadTimeout,
 		uploadWait:     uploadTimeout,
+	}
+	s.setTopic = func(
+		ctx context.Context, client *wm.Client, group waTypes.JID, previous, revision, description string,
+	) error {
+		return client.SetGroupTopic(ctx, group, previous, revision, description) //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
+	}
+	// Assigned after the literal, not in it: this one reads the group before it writes,
+	// and it reads it through the seam beside it rather than off the client, so a test
+	// can make the lookup fail the way a disconnection does.
+	s.setDescription = func(
+		ctx context.Context, client *wm.Client, group waTypes.JID, description, revision string,
+	) error {
+		return s.writeTheDescription(ctx, client, group, description, revision)
 	}
 	s.adopt(client)
 	go s.forward()
@@ -1931,6 +1944,84 @@ func (s *Session) Execute(ctx context.Context, command *protocol.Command) (json.
 		return s.resolveContact(ctx, command)
 	case protocol.CommandMessageMarkUnread:
 		return s.markUnread(ctx, command)
+	case protocol.CommandGroupLeave, protocol.CommandGroupPhotoSet, protocol.CommandGroupNameSet,
+		protocol.CommandGroupDescriptionSet, protocol.CommandGroupSettingsSet,
+		protocol.CommandGroupInviteGet, protocol.CommandGroupJoinRequestsList,
+		protocol.CommandGroupJoinRequestsUpdate, protocol.CommandGroupCreate,
+		protocol.CommandGroupList, protocol.CommandGroupInfo,
+		protocol.CommandGroupParticipantsUpdate:
+		return s.aboutAGroup(ctx, command)
+	}
+	return nil, engine.ErrNotSupported
+}
+
+// groupIQWait is how long a group command may spend at WhatsApp before this connector
+// stops waiting for it.
+//
+// Every one of them is an info query, and whatsmeow gives an info query 75 seconds. The
+// session executor is serial -- one goroutine takes one command off the queue and does not
+// take the next until that one has answered -- so an info query WhatsApp decides not to
+// answer does not cost the command that made it, it costs the account: every message,
+// receipt and read marker queued behind it waits out the whole minute and a quarter. That
+// is what #163 measured, four times, on a description that could not be removed.
+//
+// Fifteen seconds is far above what these actually take. Measured live on 10/09/2026: a
+// group created, renamed, its settings changed, its description written and removed, all
+// between 370 ms and 1.3 s, and a refusal -- a 409 over a description WhatsApp will not
+// let this account replace -- in 364 ms. A query still running at fifteen seconds is not
+// slow, it is one that is not coming back, and answering `timeout` then costs the caller
+// one command instead of costing the account a minute of its queue.
+//
+// A caller that sends a shorter deadline of its own still wins: this bounds the wait, it
+// does not extend one.
+const groupIQWait = 15 * time.Second
+
+// boundedGroupCommand reports whether the ceiling is safe for this command.
+//
+// Giving up on a wait does not undo what WhatsApp did with the request, and `carryOut`
+// writes the ledger only on success, so a command answered `timeout` here and redelivered
+// under the same idempotency key runs a second time. That is fine where running twice
+// changes nothing and costs nothing, and it is not fine anywhere else -- invariant 5, and
+// the thing a ceiling would otherwise be trading a stalled queue for. So the ceiling is
+// allowed in exactly two places:
+//
+//   - **Reads.** `group.info`, `group.list`, `group.join_requests.list`, and a
+//     `group.invite.get` that is not revoking. Asked again they answer again; the only
+//     thing a truncated wait costs is the answer, which is what the caller is told.
+//
+// `group.description.set` is not decided here at all, and that is the one asymmetry worth
+// spelling out: whether it can be bounded depends on which call it turns out to need,
+// which is known only after the group has been read. `writeTheDescription` bounds the half
+// that carries a revision id and leaves the legacy half alone.
+//
+// Everything else keeps whatsmeow's own bound, which is longer, and the account can still
+// be held by one of them. That is not an oversight -- it is what is left after refusing to
+// truncate a mutation nothing can reconcile, and the general answer to it is #165 rather
+// than a shorter number here. `group.create` makes another group, `group.photo.set` has a
+// new picture id assigned and another change announced, a revoking `group.invite.get`
+// rotates the link again; `group.leave`, `group.participants.update` and
+// `group.join_requests.update` answer a retry with "not in the group" or "no such request"
+// for work the first attempt did; and `group.name.set` and `group.settings.set` have no id
+// to write twice under, so a retry publishes a second `group.updated` for one command.
+func boundedGroupCommand(command *protocol.Command) bool {
+	switch command.Type {
+	case protocol.CommandGroupInfo, protocol.CommandGroupList, protocol.CommandGroupJoinRequestsList:
+		return true
+	case protocol.CommandGroupInviteGet:
+		return !command.ChangesSomething()
+	}
+	return false
+}
+
+// aboutAGroup carries out the group commands, under a ceiling none of the others need.
+func (s *Session) aboutAGroup(ctx context.Context, command *protocol.Command) (json.RawMessage, error) {
+	if boundedGroupCommand(command) {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, groupIQWait)
+		defer cancel()
+	}
+
+	switch command.Type {
 	case protocol.CommandGroupLeave:
 		return s.leaveGroup(ctx, command)
 	case protocol.CommandGroupPhotoSet:

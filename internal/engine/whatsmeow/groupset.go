@@ -82,7 +82,14 @@ func (s *Session) setGroupDescription(ctx context.Context, command *protocol.Com
 	if req.Description != nil {
 		description = *req.Description
 	}
-	if err := s.setDescription(ctx, s.current(), group, description); err != nil {
+	// The revision the write goes out under, derived the way a message id is: whatsmeow
+	// generates a fresh one when handed an empty id, and a description written twice under
+	// two ids is two revisions of the group's description for one command -- the text ends
+	// up the same either way, but the second publishes a `group.updated` nobody asked for.
+	// Seeded with the session as well as the key, because two instances editing one group
+	// under the same caller-supplied key are two commands, and handing WhatsApp the same
+	// revision for both would have it read the second as a replay of the first.
+	if err := s.setDescription(ctx, s.current(), group, description, s.orDerived(command, "")); err != nil {
 		return nil, contactFailure(err, "description change")
 	}
 	return nil, nil
@@ -315,4 +322,180 @@ func (s *Session) setGroupPhoto(ctx context.Context, command *protocol.Command) 
 		return nil, contactFailure(err, "photo change")
 	}
 	return nil, nil
+}
+
+// writeTheDescription writes a group's description through the one whatsmeow call that
+// gives it an id.
+//
+// #163 was a removal that could not be carried out. `SetGroupDescription` sends a
+// `description` node with no attributes at all -- no `id`, no `prev` -- and a description
+// written that way is one nothing can address afterwards: WhatsApp reports its id as the
+// literal string `"undefined"`, and every later change to it is refused.
+//
+// Measured on real groups between the two paired test accounts, 10/09/2026, on a group
+// made for the purpose and driven in this order:
+//
+//	as found                              -> topic_id ""
+//	SetGroupDescription("travada")           494 ms, applied -> topic_id "undefined"
+//	SetGroupDescription("segunda")           326 ms, 409 conflict
+//	SetGroupTopic(rewrite)                   704 ms, 409 conflict
+//	SetGroupTopic("")                        716 ms, 409 conflict
+//	<description id=...>          by hand    324 ms, 409 conflict
+//	<description id=... delete=true>         327 ms, 409 conflict
+//
+// The last two go through `DangerousInternals().SendGroupIQ`, which is the only way to
+// send the stanza this connector would want: an id, naming no predecessor. It is refused
+// too. So a description written the old way is frozen -- no call and no stanza shape
+// changes it, and there is nothing left here to try. What this can do is stop making new
+// ones, and answer the frozen ones in a third of a second rather than in the seventy-five
+// #163 measured four times over.
+//
+// The id is read here rather than left to `SetGroupTopic`, which fetches it itself when
+// handed an empty one and flattens a failure of that fetch with `%v`. The reads are under
+// a ceiling and the writes are not, which is the connector's rule rather than this
+// command's: giving up on a read costs its answer, and giving up on a write turns
+// "WhatsApp applied it" into a `timeout` the ledger never records. Two consequences, and
+// the second is a limit worth stating rather than implying:
+//
+// Naming an id makes the write a compare-and-set, and `group.description.set` is not one:
+// it is last write wins, and it was before this change too, because the call it used sent
+// no `prev` and could not be refused for naming the wrong one. So the one 409 that means
+// "somebody else changed it since you looked" is answered by looking again and writing
+// over what is there now, under the same revision, once.
+//
+// And a group with no description has no id to name, so `SetGroupTopic` reads it again
+// anyway. That read is whatsmeow's, its failure arrives with the sentinel flattened out of
+// it, and there is nothing here that can put it back: a second request answers about
+// itself, not about the one that failed. Such an answer reaches the caller as `internal`,
+// which is what this repository does with a cause it cannot name. Fixing it properly is a
+// `%w` upstream.
+func (s *Session) writeTheDescription(
+	ctx context.Context, client *wm.Client, group waTypes.JID, description, revision string,
+) error {
+	// One budget for the two reads, not one each. The ceiling exists to bound how long a
+	// single command may hold the session's serial executor, and two lookups given fifteen
+	// seconds each hold it for thirty -- which is the thing being prevented, arrived at by
+	// applying the prevention twice. The writes are outside it, for the reason spelled out
+	// at `writeUnder`.
+	budget, giveUp := context.WithTimeout(ctx, groupIQWait)
+	defer giveUp()
+	info, err := s.groupInfo(budget, client, group)
+	if err != nil {
+		return err //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
+	}
+	if info == nil {
+		// whatsmeow answers an error for a group it cannot read, so nothing reaches here
+		// with neither. Reading a field off it would take the session's executor down and
+		// every command queued behind it with it.
+		return protocol.NewError(protocol.ErrorInternal,
+			"the group came back empty while writing its description")
+	}
+	if err := budget.Err(); err != nil {
+		return err //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
+	}
+	if alreadyApplied(info.TopicID, revision) {
+		return nil
+	}
+
+	err = s.writeUnder(ctx, client, group, info.TopicID, revision, description)
+	if err == nil {
+		return nil
+	}
+	if !refusedAsAConflict(err) {
+		return err //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
+	}
+
+	// A 409 says the description this write claimed to replace is not the one that is
+	// there. Either somebody changed it in the moment between the read and the write, or
+	// the group is frozen -- and the two are told apart by looking, not by guessing: a
+	// changed id is a concurrent edit, and the same id back is a group where nothing this
+	// connector sends will ever be accepted.
+	fresh, again := s.groupInfo(budget, client, group)
+	if again != nil {
+		return again //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
+	}
+	if fresh == nil {
+		return err //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
+	}
+	if alreadyApplied(fresh.TopicID, revision) {
+		return nil
+	}
+	if fresh.TopicID == info.TopicID {
+		return err //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
+	}
+	if err := budget.Err(); err != nil {
+		// The second look answered, but only after the reads had spent everything they
+		// were given. Going on would put an unbounded write behind a command that has
+		// already held the session's only goroutine for its whole ceiling, which is the
+		// same reason the first look is checked before the first write.
+		return err //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
+	}
+	// Once, and under the same revision. Once because a caller waiting on a description is
+	// better served by an answer than by this session's only goroutine racing whoever else
+	// is editing; the same revision because a redelivery of this command has to write the
+	// revision it wrote the first time rather than a second one.
+	return s.writeUnder(ctx, client, group, fresh.TopicID, revision, description)
+}
+
+// writeUnder writes the description under the caller's own context, and reports a deadline
+// as itself when a deadline is what ended the write.
+//
+// No ceiling of this connector's, and that is the whole point of the function's existence
+// being separate from the reads above it: the ledger records only successes, so a ceiling
+// that turns "WhatsApp applied it" into `timeout` leaves nothing recorded and the
+// redelivery writes again. Every other group write is unbounded for that reason, and this
+// one is no exception -- the derived revision recognises a redelivery only while the group
+// still carries it, which a third party's edit ends.
+//
+// The check that remains is about naming what happened: `SetGroupTopic` reads the current
+// id for itself when handed an empty one and flattens a failure of that read with `%v`, so
+// a caller's own deadline ending the write would otherwise reach it as `internal` -- this
+// connector broke, rather than you did not wait long enough.
+func (s *Session) writeUnder(
+	ctx context.Context, client *wm.Client, group waTypes.JID, previous, revision, description string,
+) error {
+	err := s.setTopic(ctx, client, group, previous, revision, description)
+	if err != nil {
+		if ended := ctx.Err(); ended != nil {
+			return ended //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
+		}
+	}
+	return err //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
+}
+
+// alreadyApplied reports whether the description the group carries is the one this command
+// wrote, which is a question that can be asked at all only because the revision is derived
+// rather than generated: `orDerived` hashes the session and the command's idempotency key,
+// `SetGroupTopic` sends it as the description's `id`, and WhatsApp stores it as the topic
+// id. So a redelivery of a command whose answer was lost -- WhatsApp committed it and the
+// ledger never learned -- recognises its own work and reports the success it already had.
+//
+// Writing again instead is not harmless, which is why this is a check and not an
+// optimisation: replaying a revision over itself is refused with 409, the second look sees
+// the same id, and the caller is told `wa_error` for a command that worked. Invariant 5
+// says a redelivered command must not duplicate a side effect; being told it failed
+// because it already happened is the same promise broken from the other end.
+//
+// What it does not do, and the limit is the point: it recognises the revision only while
+// the revision is still what the group carries. WhatsApp committing a write whose answer
+// this side gave up on, and another admin writing over it before the caller redelivers,
+// leaves nothing here to recognise -- the redelivery reads somebody else's id and writes
+// its own text over it.
+//
+// That is the command's own meaning rather than a hole in it. `group.description.set` is
+// last write wins: a caller that sends it again is asking for its text to be what the
+// group says, and the alternative -- refusing because somebody else got there first -- is
+// the compare-and-set this command has never been and that the review rejected when an
+// earlier revision of it did exactly that. What would close the gap properly is the ledger
+// recording an attempt rather than only a success, which is #165 and is a change to how
+// invariant 5 is kept rather than to what it promises.
+func alreadyApplied(topicID, revision string) bool {
+	return topicID == revision
+}
+
+// refusedAsAConflict reports whether WhatsApp answered 409, which for a `description`
+// stanza means the `prev` it carried is not what the group has.
+func refusedAsAConflict(err error) bool {
+	var refused *wm.IQError
+	return errors.As(err, &refused) && refused.Code == 409
 }
