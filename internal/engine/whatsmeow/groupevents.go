@@ -76,7 +76,15 @@ func (s *Session) joinedAGroup(event *waEvents.JoinedGroup) {
 		s.log.Warn().Msg("dropping a group the account joined that has no address to publish it under")
 		return
 	}
-	s.emit(protocol.EventGroupJoined, joinedGroup{Info: s.describeGroup(ctx, &event.GroupInfo)})
+	// Through the same filter the create command answers through, and for the same
+	// reason: a group just created reports the people WhatsApp would not add -- a privacy
+	// setting, a block list, a recent departure -- as rows on its own participant list,
+	// with `Error` filled in. They are on the list WhatsApp sent and they are not members,
+	// and this roster is the one a client builds the group's membership out of, so
+	// publishing them adds people to a group they were kept out of.
+	s.emit(protocol.EventGroupJoined, joinedGroup{
+		Info: s.describeGroup(ctx, withoutRefused(&event.GroupInfo)),
+	})
 }
 
 // groupChanged publishes what WhatsApp says changed about a group.

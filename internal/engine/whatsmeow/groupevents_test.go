@@ -422,6 +422,51 @@ func TestJoiningAGroupIsPublished(t *testing.T) {
 	}
 }
 
+// A group just created reports the people WhatsApp would not add -- a privacy setting, a
+// block list, a recent departure -- as rows on its own participant list with `Error`
+// filled in. They are on the list WhatsApp sent and they are not members, and this roster
+// is what a client builds the group's membership out of: published, they are added to a
+// group they were kept out of, and nothing later takes them back out.
+func TestAMemberWhatsAppRefusedIsNotPublishedAsOneWhoJoined(t *testing.T) {
+	t.Parallel()
+
+	session := groupSession(t)
+	session.handle(&waEvents.JoinedGroup{
+		Type: "new",
+		GroupInfo: waTypes.GroupInfo{
+			JID:              groupJID(),
+			GroupName:        waTypes.GroupName{Name: "Equipe fazer.ai"},
+			ParticipantCount: 3,
+			Participants: []waTypes.GroupParticipant{
+				{JID: someone("5511999990001")},
+				{JID: someone("5511999990002")},
+				// The one WhatsApp answered with and did not add.
+				{JID: someone("5511999990003"), Error: 403},
+			},
+		},
+	})
+
+	payload := published(t, session, protocol.EventGroupJoined, "event_group_joined")
+	info, _ := payload["info"].(map[string]any)
+	roster, _ := info["participants"].([]any)
+	if len(roster) != 2 {
+		t.Fatalf("published %d participants for a group WhatsApp put two people in: %v",
+			len(roster), info["participants"])
+	}
+	for _, member := range roster {
+		party, _ := member.(map[string]any)["party"].(map[string]any)
+		if party["phone"] == "5511999990003" {
+			t.Errorf("published a member WhatsApp refused: %v", member)
+		}
+	}
+	// The count goes with them. A size of three over a roster of two has the client
+	// reading the roster as short of the group and leaving its own membership alone,
+	// which is the opposite of what a group.joined is for.
+	if size, _ := info["size"].(float64); int(size) != 2 {
+		t.Errorf("published a size of %v for a group of two", info["size"])
+	}
+}
+
 func TestJoiningAGroupWithNoAddressPublishesNothing(t *testing.T) {
 	t.Parallel()
 
