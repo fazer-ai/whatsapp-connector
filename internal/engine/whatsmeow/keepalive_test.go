@@ -1549,3 +1549,299 @@ func dialedAndConnected(session *Session) {
 	session.setDialing(true)
 	session.setConnected(true)
 }
+
+// The instant a drop is dated from has to be the one the event was dispatched at, and the
+// arm that publishes `reconnecting` is the one where that is hardest to see: it takes the
+// transition lock, and whatever held that lock before it may have been waiting on a publish
+// into a full inbox. A stamp read after that wait is later than the socket it describes,
+// and once it is more than `keepAliveStaleAfter` later every real timeout on the socket
+// that follows reads as stale.
+func TestTheKeepAliveDropIsDatedFromTheDispatchAndNotTheHandling(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newLoggedTestSession(t, "5511999990001")
+	dialedAndConnected(session)
+
+	// Driven rather than measured: the gap this is about is one the real thing can take
+	// minutes over while two `time.Now()` calls in a row cannot produce it at all. The
+	// first reading is the dispatch, and everything after it is the handling.
+	dispatched := time.Now()
+	var readings int
+	session.wallClock = func() time.Time {
+		readings++
+		if readings == 1 {
+			return dispatched
+		}
+		return dispatched.Add(time.Minute)
+	}
+
+	session.handle(&waEvents.KeepAliveTimeout{ErrorCount: 2, LastSuccess: dispatched})
+
+	session.mu.Lock()
+	stamped := session.connectedAt
+	session.mu.Unlock()
+	if !stamped.Equal(dispatched) {
+		t.Fatalf("the reconnect is dated %s, when the handler got round to it, rather than %s, "+
+			"when the event was dispatched, so a timeout on the socket that follows reads as stale",
+			stamped.Format(time.TimeOnly), dispatched.Format(time.TimeOnly))
+	}
+}
+
+// Same question on the other side of the same decision. A recovery is compared against the
+// connection stamp to decide which of the two is later, so one dated from its handling can
+// win that comparison over a socket that replaced it -- and then the timeouts of a dead
+// keepalive loop read as current and the healthy replacement is taken down for them.
+func TestARecoveryIsDatedFromTheDispatchAndNotTheHandling(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newLoggedTestSession(t, "5511999990001")
+	dialedAndConnected(session)
+
+	dispatched := time.Now()
+	var readings int
+	session.wallClock = func() time.Time {
+		readings++
+		if readings == 1 {
+			return dispatched
+		}
+		return dispatched.Add(time.Minute)
+	}
+
+	session.handle(&waEvents.KeepAliveRestored{})
+
+	session.mu.Lock()
+	answered := session.keepAliveAnsweredAt
+	session.mu.Unlock()
+	if !answered.Equal(dispatched) {
+		t.Fatalf("the ping is recorded as answered at %s, when the handler got round to it, "+
+			"rather than %s, when whatsmeow dispatched it, so a recovery about a socket that "+
+			"has since been replaced outlives the replacement's own stamp",
+			answered.Format(time.TimeOnly), dispatched.Format(time.TimeOnly))
+	}
+}
+
+// A session that is not on a socket has no evidence of life, and the stamp of the socket it
+// used to be on is not evidence about the one it is not on. Left standing, it answers the
+// staleness question for a connection that does not exist.
+func TestASessionWithNoSocketHasNoEvidenceOfLife(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	dialedAndConnected(session)
+	session.setConnected(false)
+
+	if alive := session.lastKnownAlive(); !alive.IsZero() {
+		t.Fatalf("a session with no socket says it was alive at %s, the socket it no longer "+
+			"has, so a timeout about that dead socket reads as one about the present",
+			alive.Format(time.TimeOnly))
+	}
+}
+
+// The debt carries the connection it was judged on, not the count at the moment it is
+// written down. Those differ by exactly the thing the judgement is for: a drop landing in
+// between moves the count, and a debt that took the new one would be paid over whatever
+// socket the client has by the time the command answers.
+func TestTheDebtKeepsTheGenerationItWasJudgedOn(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newLoggedTestSession(t, "5511999990001")
+	dialedAndConnected(session)
+	judged := session.setConnected(false)
+	// The drop of the socket this takedown is about, landing before the debt is recorded.
+	session.dropped()
+	session.countCommand()
+	defer session.endCommand()
+
+	session.takeDownSoon(session.current(), judged)
+
+	session.mu.Lock()
+	owed := session.owed
+	session.mu.Unlock()
+	if owed == nil {
+		t.Fatal("the takedown did not wait for the command in flight")
+	}
+	if owed.judged != judged {
+		t.Fatalf("the debt was written down against connection %d, the one current when it was "+
+			"recorded, rather than %d, the one it was judged on, so it is paid over a socket "+
+			"nobody judged", owed.judged, judged)
+	}
+}
+
+// `Connect` and `Disconnect` do not wait on a takedown, and the reason they still count is
+// this one: a takedown must not fire in the middle of one. Counting is the whole of what
+// they do here, so a count that does not happen is invisible everywhere else.
+func TestAConnectInFlightHoldsOffTheTakedown(t *testing.T) {
+	t.Parallel()
+
+	session, written := newLoggedTestSession(t, "5511999990001")
+	dialedAndConnected(session)
+	session.countCommand()
+	defer session.endCommand()
+
+	session.handle(&waEvents.KeepAliveTimeout{ErrorCount: 2, LastSuccess: time.Now()})
+
+	if !strings.Contains(written.String(), "comes down with its answer") {
+		t.Fatalf("the socket was taken down under a lifecycle command that counts but does not "+
+			"wait, so whatsmeow resends whatever it was carrying: %q", written.String())
+	}
+}
+
+// The mark answers for one drop, and the drop it answers for is the next one handled. Left
+// standing it swallows the one after that as well, and then the session reports `open` over
+// a socket on the floor until whatsmeow announces a reconnect of its own.
+func TestTheMarkIsConsumedByTheDropItSuppresses(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.relearn(session.current())
+	dialedAndConnected(session)
+	session.announceDrop()
+
+	// The drop the mark was raised for.
+	session.handle(&waEvents.Disconnected{})
+	// whatsmeow's own reconnect, and then a second drop that nobody announced.
+	dialedAndConnected(session)
+	session.handle(&waEvents.Disconnected{})
+
+	if got := session.state(); got == "open" {
+		t.Fatal("the second drop was swallowed by a mark raised for the first, so the session " +
+			"reports open with no socket under it")
+	}
+}
+
+// Going offline is the session saying the connection is over and nothing is coming back on
+// its own. A debt left behind it is a takedown owed to a socket that no longer exists, and
+// the command it waits for can answer at any time.
+func TestGoingOfflineDropsTheDebtWithTheConnection(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newLoggedTestSession(t, "5511999990001")
+	dialedAndConnected(session)
+	judged := session.setConnected(false)
+	session.countCommand()
+	session.takeDownSoon(session.current(), judged)
+
+	session.offline()
+
+	session.mu.Lock()
+	owed := session.owed
+	session.mu.Unlock()
+	session.endCommand()
+	if owed != nil {
+		t.Fatal("a takedown is still owed to a socket the session has declared gone, and the " +
+			"command in flight will pay it against whatever the client holds by then")
+	}
+}
+
+// The socket coming back is a transition like any other, and it has to count as one: what
+// reads the count is the takedown that was judged before it, and the whole of standing that
+// takedown down is the count having moved.
+func TestTheSocketComingBackCountsAsATransition(t *testing.T) {
+	t.Parallel()
+
+	session, written := newLoggedTestSession(t, "5511999990001")
+	dialedAndConnected(session)
+	judged := session.setConnected(false)
+
+	session.recovered()
+	session.resetUnlessReplaced(session.current(), judged)
+
+	if !strings.Contains(written.String(), "leaving it alone") {
+		t.Fatalf("the socket answered again and the takedown judged before it went ahead "+
+			"anyway, closing a connection that works: %q", written.String())
+	}
+}
+
+// The teardowns are the two commands `readyToSend` does not refuse, so nothing else stops
+// one from starting on a socket that is being closed underneath it -- and a removal IQ cut
+// off mid-flight is resent by whatsmeow and applied twice by WhatsApp. They wait, and a
+// caller whose deadline runs out inside that wait is answered rather than let through.
+func TestATeardownDoesNotBeginWhileATakedownIsClosingTheSocket(t *testing.T) {
+	t.Parallel()
+
+	for _, teardown := range []struct {
+		name string
+		call func(*Session, context.Context) error
+	}{
+		{name: "Logout", call: func(s *Session, ctx context.Context) error { return s.Logout(ctx) }},
+		{name: "Delete", call: func(s *Session, ctx context.Context) error { return s.Delete(ctx) }},
+	} {
+		t.Run(teardown.name, func(t *testing.T) {
+			t.Parallel()
+
+			session, _ := newLoggedTestSession(t, "5511999990001")
+			dialedAndConnected(session)
+			session.logout = func(context.Context, *wm.Client) error {
+				t.Error("the teardown reached WhatsApp over a socket that is being closed")
+				return nil
+			}
+
+			// The takedown has claimed the socket and is in the close handshake.
+			closing := make(chan struct{})
+			session.mu.Lock()
+			session.resetting = closing
+			session.mu.Unlock()
+			defer func() {
+				session.mu.Lock()
+				session.resetting = nil
+				session.mu.Unlock()
+				close(closing)
+			}()
+
+			ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+			defer cancel()
+			err := teardown.call(session, ctx)
+
+			if err == nil || !strings.Contains(err.Error(), "waiting for the socket to be taken down") {
+				t.Fatalf("%s began while the socket was being closed under it, so its removal IQ "+
+					"is resent on the connection that follows and applied twice: %v", teardown.name, err)
+			}
+		})
+	}
+}
+
+// Three windows nothing deterministic can stand inside, so the fence reads the source. Each
+// is a place where the correct code and the wrong code differ only in what another goroutine
+// can do between two statements, which is exactly what a test cannot hold still.
+func TestTheWindowsNoTestCanStandInsideAreFencedOff(t *testing.T) {
+	t.Parallel()
+
+	// The judgement is the value the transition wrote, not one read back after it: `dropped`
+	// is deliberately outside the transition lock, so a drop landing between the write and a
+	// read-back is counted into the snapshot instead of invalidating it.
+	dating := theBodyOf(t, "func (s *Session) setConnectedAt(")
+	if !strings.Contains(dating, "generation := s.transitions.Add(1)") {
+		t.Fatalf("the transition does not take its own generation from the write:\n%s", dating)
+	}
+	if strings.Contains(dating, "s.transitions.Load()") {
+		t.Fatalf("the transition reads the count back after writing it:\n%s", dating)
+	}
+
+	// A command woken by one takedown must go back and look again, because a second takedown
+	// can have claimed the socket while it was waking.
+	waiting := theBodyOf(t, "func (s *Session) startCommand(")
+	if !strings.Contains(waiting, "case <-closing:\n\t\tcase <-ctx.Done():") {
+		t.Fatalf("the wait for a takedown does something other than look again when it wakes, "+
+			"so a command can start under the takedown that claimed the socket next:\n%s", waiting)
+	}
+
+	// And the claim is released before the waiters are woken, so one that wakes finds the
+	// claim already gone rather than queueing behind a takedown that is finished.
+	taking := theBodyOf(t, "func (s *Session) resetUnlessReplaced(")
+	released := strings.Index(taking, "s.resetting = nil")
+	woken := strings.Index(taking, "close(closing)")
+	if released < 0 || woken < 0 {
+		t.Fatalf("the takedown neither claims the socket nor releases the claim:\n%s", taking)
+	}
+	if released > woken {
+		t.Fatalf("the takedown wakes the commands waiting on it before it releases the claim, "+
+			"so one that wakes sees a claim that is already over:\n%s", taking)
+	}
+
+	// The debt is paid against the socket it was judged on. `s.current()` at that point is
+	// whatever the client holds after however long the command took.
+	paying := theBodyOf(t, "func (s *Session) endCommand(")
+	if !strings.Contains(paying, "owed.client") {
+		t.Fatalf("the debt is paid against a socket other than the one it names:\n%s", paying)
+	}
+}
