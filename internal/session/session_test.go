@@ -155,11 +155,12 @@ func (r *recorder) reply(replyTo string) (protocol.Reply, bool) {
 }
 
 type harness struct {
-	leases   *cluster.Leases
-	engine   *fake.Engine
-	recorder *recorder
-	ledger   *ledger
-	manager  *session.Manager
+	leases     *cluster.Leases
+	quarantine *cluster.Quarantine
+	engine     *fake.Engine
+	recorder   *recorder
+	ledger     *ledger
+	manager    *session.Manager
 }
 
 // ledger is the harness's idempotency store, with a switch for the tests that need one
@@ -251,15 +252,20 @@ func newHarnessLogging(t *testing.T, written io.Writer) harness {
 	// counter is atomic like every other cross-goroutine value here.
 	book := &ledger{inner: redisx.NewIdempotency(client, 0)}
 	var ids atomic.Int64
+	quarantine := cluster.NewQuarantine(client, nil)
 	manager := session.NewManager(&session.ManagerConfig{
 		Instance: "inst-a", Engine: fakeEngine, Leases: leases, Publisher: rec, Replier: rec,
-		Ledger: book,
-		NewID:  func() string { return "evt-" + strconv.FormatInt(ids.Add(1), 10) },
-		Logger: zerolog.New(written),
+		Ledger:     book,
+		Quarantine: quarantine,
+		NewID:      func() string { return "evt-" + strconv.FormatInt(ids.Add(1), 10) },
+		Logger:     zerolog.New(written),
 	})
 	t.Cleanup(func() { manager.StopAll(context.Background()) })
 	answering(t, manager)
-	return harness{leases: leases, engine: fakeEngine, recorder: rec, ledger: book, manager: manager}
+	return harness{
+		leases: leases, quarantine: quarantine, engine: fakeEngine,
+		recorder: rec, ledger: book, manager: manager,
+	}
 }
 
 // answering starts the goroutine a manager carries its own commands out on, and stops it
@@ -2196,6 +2202,97 @@ func TestAResumeThatFailedIsNotReportedAsACommandNobodySent(t *testing.T) {
 	}
 	if len(failures) != 1 || failures[0] != "c1" {
 		t.Fatalf("command.failed was published for %v, want only the client's own c1: a resume the connector sent itself has no sender to tell", failures)
+	}
+}
+
+// An account the connector cannot bring back has to cost less and less. The sweep that
+// resumes it runs on a clock, so without a record of the failures it makes the same
+// attempt at the same broken account at the same rate forever, on every instance.
+func TestAResumeThatFailedIsLeftAloneForAWhile(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	ctx := context.Background()
+	if _, err := h.engine.Open(ctx, "s1"); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	engineSession, _ := h.engine.Session("s1")
+	engineSession.FailConnect(errors.New("whatsapp refused the build"))
+
+	if !h.manager.Resume("s1") {
+		t.Fatal("the resume was not queued")
+	}
+	waitFor(t, "the failure to be counted", func() bool {
+		waiting, err := h.quarantine.Waiting(ctx, []string{"s1"})
+		if err != nil {
+			t.Errorf("Waiting: %v", err)
+			return true
+		}
+		return len(waiting) == 1
+	})
+}
+
+// And what ends it is the account working. A backoff nothing clears is one that grows
+// past every session that ever had a bad minute: the next failure months later would be
+// answered with the wait the last one earned.
+func TestAConnectionThatComesUpEndsTheWait(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	ctx := context.Background()
+	if _, err := h.quarantine.Strike(ctx, "s1"); err != nil {
+		t.Fatalf("Strike: %v", err)
+	}
+	if _, err := h.manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+
+	connect := &protocol.Command{
+		V: protocol.Version, ID: "c1", Type: protocol.CommandSessionConnect, SID: "s1", ReplyTo: "c1",
+		Payload: json.RawMessage(`{"pairing":"resume"}`),
+	}
+	var acked atomic.Bool
+	h.manager.Dispatch(delivery(connect, &acked))
+	waitFor(t, "the connect to be answered", func() bool { _, ok := h.recorder.reply("c1"); return ok })
+
+	waitFor(t, "the failures to be forgotten", func() bool {
+		waiting, err := h.quarantine.Waiting(ctx, []string{"s1"})
+		if err != nil {
+			t.Errorf("Waiting: %v", err)
+			return true
+		}
+		return len(waiting) == 0
+	})
+}
+
+// The other way an account turns out to be one nobody can keep in the air: it connects,
+// and then the engine gives up on it -- a ban, a build WhatsApp will not talk to, a
+// number that was unlinked from the phone. The lease goes back, which is right, and
+// without this the sweep would find the account free and start the same attempt a minute
+// later.
+func TestASessionTheEngineGaveUpOnIsLeftAloneToo(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	ctx := context.Background()
+	adopted, err := h.manager.Adopt(ctx, "s1")
+	if err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, _ := h.engine.Session("s1")
+
+	engineSession.EmitLast(protocol.EventSessionTemporaryBan, map[string]any{
+		"ban": map[string]any{"kind": "temporary", "reason": "spam"},
+	})
+	waitFor(t, "the session to be finished with", adopted.Retired)
+	h.manager.SweepRetired(ctx, time.Now().Add(time.Second))
+
+	waiting, err := h.quarantine.Waiting(ctx, []string{"s1"})
+	if err != nil {
+		t.Fatalf("Waiting: %v", err)
+	}
+	if len(waiting) != 1 {
+		t.Fatal("an account the engine gave up on is not being left alone; the sweep would try it again within the minute")
 	}
 }
 

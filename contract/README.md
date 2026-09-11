@@ -72,6 +72,7 @@ frames, but both sides have to agree on them, so they are part of the contract:
 | `wa:lease:<sid>`, `wa:lease-epoch:<sid>` | STRING | connector | which instance owns a session, and the epoch it owns it under |
 | `wa:idem:<sid>:<key>` | STRING | connector | command idempotency (`msg:<message_id>` for sends) |
 | `wa:resume:<sid>` | STRING (EX 60s) | connector | a turn taken to bring an unowned session back, so the fleet asks about one account once per window |
+| `wa:quarantine:<sid>` | HASH (EX wait + 1h) | connector | `strikes` and `until`: how many times a session failed to come back, and how long the fleet leaves it alone |
 | `wa:events:<shard>:lease` | STRING (EX 30s) | client | which consumer reads a shard; exactly one at a time, which is what preserves order |
 | `wa:consumer:<cid>` | STRING (EX 15s) | client | consumer heartbeat and the shards it holds |
 | `wa:cursor:<sid>` | STRING | client | last `epoch:seq` the client processed for a session |
@@ -84,10 +85,12 @@ absent row -- a client vendoring this directory reads that the connector keeps t
 known state of every session and can write code against it. It cost a holdout agent a
 set of acceptance criteria built on that premise while #151 was being verified.
 
-The same is true of `wa:quarantine:<sid>`, which has a constructor and no producer;
-that one is tracked as fazer-ai/whatsapp-connector#102, which is about building the
-mechanism rather than about the key. Whether a session registry should exist at all is
-a separate question from this table telling clients that one does.
+`wa:quarantine:<sid>` was in the same state and is not any more: it counts the failures
+of a session the connector could not bring back and says how long the fleet leaves it
+alone, from a minute up to an hour, doubling. It gates the connector's own resume sweep
+and nothing else -- a client that asks for a connection gets one, quarantine or not, which
+is why no command is ever answered `quarantined`. Whether a session registry should exist
+at all is a separate question from this table telling clients that one does.
 
 **The one thing that registry was for does exist, and not here.** A connector keeps what
 a client asked each session to be -- connected or disconnected -- in its own database,

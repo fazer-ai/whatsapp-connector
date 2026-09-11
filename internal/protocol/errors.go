@@ -31,18 +31,19 @@ const (
 	ErrorNotConnected    ErrorCode = "not_connected"
 	ErrorNotPaired       ErrorCode = "not_paired"
 	ErrorOwnedElsewhere  ErrorCode = "owned_elsewhere"
-	// ErrorQuarantined is reserved: nothing sends it, because nothing quarantines.
+	// ErrorQuarantined is reserved, and now deliberately so rather than for want of a
+	// mechanism.
 	//
-	// `redisx.Keys.Quarantine` names a key and no code writes or reads it. What used to
-	// go with that is gone: a session the engine has finished with -- a temporary ban, a
-	// build WhatsApp will not talk to, a connect it refused -- now hands its lease back
-	// instead of being held by an instance with nothing left to try, so the account is
-	// there for whichever instance a client's next connect lands on.
+	// There is a quarantine: `wa:quarantine:<sid>` counts the failures of a session the
+	// connector could not bring back and says how long the fleet leaves it alone, from a
+	// minute up to an hour. What it gates is what the connector does on its own -- the
+	// sweep that resumes an account nobody is running -- and nothing else.
 	//
-	// What is left for a quarantine is the part that needs a policy: a session that keeps
-	// connecting and dropping is nobody's to give up on yet, and there is no rule saying
-	// how many failures over what window make it one. Until there is, nothing refuses a
-	// command with this and a client sees the connect failures themselves.
+	// A client that asks for a connection gets one, during a quarantine like at any other
+	// time, which is why no command is answered with this. The operator is the one part
+	// of the system that may know why the last attempt failed, and a backoff that refused
+	// them would be a wall in front of the person fixing it. What a client sees is what it
+	// saw before: the connect failures themselves.
 	ErrorQuarantined ErrorCode = "quarantined"
 	// ErrorClientOutdated is reserved: the condition is an event, not a reply.
 	//

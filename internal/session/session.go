@@ -94,6 +94,17 @@ type Session struct {
 	// undrained marks this session as having something pending on its stream that was
 	// not read by the loop's own `>`. Nil outside the manager.
 	undrained func()
+	// connected says the account is in the air, once per time it comes up, and resumeBad
+	// says an attempt the connector made on its own did not work. Both are how the
+	// backoff on a session that keeps failing is counted and cleared. Nil outside the
+	// manager.
+	//
+	// wasOpen is the pump's own, and is what makes the first of them a transition rather
+	// than an event: a session publishes its state on every reconnect whatsmeow makes,
+	// and a Redis round trip per one of those is a cost with nothing behind it.
+	connected func()
+	resumeBad func()
+	wasOpen   bool
 
 	// queueMu guards the door to commands rather than the channel itself: the executor
 	// has to be able to say "nothing more comes in" and then empty what is left,
@@ -121,6 +132,14 @@ type Config struct {
 	// loop's own read did not take. Called when a door that turned away commands opens
 	// again, so the drain that keeps the session's turn is scheduled.
 	Undrained func()
+	// Connected is called when this session publishes a connection that is open, once
+	// per time it comes up rather than once per event. It is what says the account is
+	// working, which is the only thing that ends a quarantine.
+	Connected func()
+	// ResumeFailed is called when a command the connector sent itself failed. The only
+	// one it sends is the connect that brings an account back, so this is "the attempt
+	// to resume this session did not work", which is what the backoff counts.
+	ResumeFailed func()
 	// QueueDepth bounds how many commands wait for this session. Beyond it a client
 	// is told the session is busy rather than being queued behind a backlog whose
 	// deadlines have all passed by the time it is reached.
@@ -162,6 +181,8 @@ func New(ctx context.Context, cfg *Config) *Session {
 		replier:   cfg.Replier,
 		newID:     cfg.NewID,
 		undrained: cfg.Undrained,
+		connected: cfg.Connected,
+		resumeBad: cfg.ResumeFailed,
 		retryIn:   cfg.RetireRetry,
 		now:       cfg.Now,
 		log:       cfg.Logger.With().Str("sid", cfg.Lease.SID).Uint64("epoch", cfg.Lease.Epoch).Logger(),
@@ -365,6 +386,9 @@ func (s *Session) carry(ctx context.Context, emission *engine.Emission, again *t
 		s.shut(emission.Attempt)
 	}
 	landed := s.publish(ctx, emission)
+	if landed {
+		s.noticeState(emission)
+	}
 	if !emission.Retires {
 		return
 	}
@@ -409,6 +433,38 @@ func (s *Session) carry(ctx context.Context, emission *engine.Emission, again *t
 	// back before the event is out lets another instance adopt the account and publish
 	// under a newer epoch, which is a client dropping the explanation as stale.
 	s.retiredOn.Store(emission.Attempt)
+}
+
+// noticeState says the account is working, on the transition into an open connection and
+// not on every event that reports one.
+//
+// Read from what was published rather than asked of the engine, because what matters is
+// the moment a client can act on: an account that came up and was announced. Only a state
+// that reached the stream counts, which is why the caller asks after the publish.
+//
+// Runs on the pump, so the callback is not allowed to block on anything slow. What is
+// behind it is one Redis round trip, and only on the transition.
+func (s *Session) noticeState(emission *engine.Emission) {
+	if emission.Type != protocol.EventSessionState {
+		return
+	}
+	var body struct {
+		State string `json:"state"`
+	}
+	if err := json.Unmarshal(emission.Payload, &body); err != nil {
+		return
+	}
+	if body.State != "open" {
+		s.wasOpen = false
+		return
+	}
+	if s.wasOpen {
+		return
+	}
+	s.wasOpen = true
+	if s.connected != nil {
+		s.connected()
+	}
 }
 
 // reopen takes the door off a session that turned out not to be finished with.
@@ -746,6 +802,12 @@ func (s *Session) run(ctx context.Context, delivery *transport.Delivery) {
 	// here, on purpose, so a reclaim does not run it twice: every later claim then skips
 	// it, and if this same instance adopts the session again the marker is still
 	// standing. The command is neither retired nor retried until the process restarts.
+	if err != nil && delivery.Internal && s.resumeBad != nil {
+		// Nobody sent it and nobody is waiting for it, so this is the only place its
+		// failure is counted. What counts it is the backoff: an account the connector
+		// cannot bring back must not be tried again at the same rate forever.
+		s.resumeBad()
+	}
 	retire, cancel := context.WithTimeout(context.WithoutCancel(ctx), ackTimeout)
 	defer cancel()
 	s.answer(retire, &command, delivery.Internal, result, err)

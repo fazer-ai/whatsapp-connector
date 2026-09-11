@@ -44,18 +44,19 @@ const ShutdownGrace = 20 * time.Second
 
 // Connector is a running instance.
 type Connector struct {
-	cfg      Config
-	log      zerolog.Logger
-	metrics  *observability.Metrics
-	client   *redisx.Client
-	leases   *cluster.Leases
-	registry *cluster.Registry
-	manager  *session.Manager
-	engine   engine.Engine
-	store    *store.Container
-	streams  commandStreams
-	http     *httpserver.Server
-	blobs    *media.Store
+	cfg        Config
+	log        zerolog.Logger
+	metrics    *observability.Metrics
+	client     *redisx.Client
+	leases     *cluster.Leases
+	quarantine *cluster.Quarantine
+	registry   *cluster.Registry
+	manager    *session.Manager
+	engine     engine.Engine
+	store      *store.Container
+	streams    commandStreams
+	http       *httpserver.Server
+	blobs      *media.Store
 
 	// reclaimCursor is where the next reclaim pass starts. Read and written only by the
 	// loop goroutine, which is also the only one that reclaims.
@@ -150,14 +151,16 @@ func New(cfg *Config, log zerolog.Logger) (connector *Connector, err error) {
 	}
 
 	metrics := observability.New()
+	quarantine := cluster.NewQuarantine(client, nil)
 	manager := session.NewManager(&session.ManagerConfig{
 		Instance: cfg.Instance, Engine: waEngine, Leases: leases,
 		Publisher: streams, Replier: streams, Ledger: redisx.NewIdempotency(client, 0),
-		NewID: newFrameID, Logger: log,
+		Quarantine: quarantine,
+		NewID:      newFrameID, Logger: log,
 	})
 
 	c := &Connector{
-		cfg: *cfg, log: log, metrics: metrics, client: client, leases: leases,
+		cfg: *cfg, log: log, metrics: metrics, client: client, leases: leases, quarantine: quarantine,
 		registry: cluster.NewRegistry(client, 3*cfg.Heartbeat), manager: manager, engine: waEngine,
 		store: devices, blobs: blobs,
 	}
@@ -562,9 +565,26 @@ func (c *Connector) resumeOnce(ctx context.Context) {
 		c.log.Warn().Err(err).Msg("could not tell which sessions are running somewhere")
 		return
 	}
+	// The accounts the fleet has agreed to leave alone for now, because the last
+	// attempts at them failed. Read for the whole list in one batch, like the leases: it
+	// is the same question asked of every candidate.
+	//
+	// A read that fails is not a reason to skip the pass. What it costs is attempts at
+	// accounts that were going to be left alone, which is the behaviour this had before
+	// there was a backoff at all; what skipping costs is every healthy account staying
+	// down because one read did not answer.
+	waiting, err := c.waitingOut(pass, free)
+	if err != nil {
+		c.log.Warn().Err(err).Msg("could not read which sessions the fleet is leaving alone; trying them all")
+	}
 
 	asked := 0
 	for _, sid := range free {
+		if until, held := waiting[sid]; held {
+			c.log.Debug().Str("sid", sid).Time("until", until).
+				Msg("leaving a session that keeps failing alone")
+			continue
+		}
 		if asked >= resumeBatch {
 			return
 		}
@@ -584,6 +604,14 @@ func (c *Connector) resumeOnce(ctx context.Context) {
 			c.log.Info().Str("sid", sid).Msg("bringing back a session that should be connected and that nobody is running")
 		}
 	}
+}
+
+// waitingOut is the quarantine read, with the instance that has none answering "none".
+func (c *Connector) waitingOut(ctx context.Context, sids []string) (map[string]time.Time, error) {
+	if c.quarantine == nil {
+		return nil, nil
+	}
+	return c.quarantine.Waiting(ctx, sids)
 }
 
 // sweepPartsOnce makes one pass and reports whether the sweeper should stop.
