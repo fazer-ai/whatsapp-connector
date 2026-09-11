@@ -96,6 +96,48 @@ func TestAKeepAliveTimeoutWithNoConnectionIsIgnored(t *testing.T) {
 	}
 }
 
+// whatsmeow redials on its own after a drop, and that retry never passes through `dial`:
+// it goes straight into its own `connect`. A session that dated the connection only from
+// the dials it asks for would carry the dropped socket's stamp into the socket that
+// replaced it, and the pings that went unanswered before the drop -- dispatched from
+// goroutines that outlive the loop they came from -- would read as current and take the
+// replacement down.
+func TestAKeepAliveTimeoutFromBeforeAReconnectIsIgnored(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	var written bytes.Buffer
+	session.log = zerolog.New(&written)
+
+	dialled := time.Now()
+	clock := dialled
+	session.wallClock = func() time.Time { return clock }
+	// So the drop reads as one whatsmeow will redial, which is what it is: the session is
+	// paired, and the arm answers an unpaired one with `close` instead.
+	session.relearn(session.current())
+	dialedAndConnected(session)
+
+	// A minute in the socket drops and whatsmeow starts its own retry. Nothing in this
+	// path dials, so nothing else can re-date the connection.
+	clock = dialled.Add(time.Minute)
+	session.handle(&waEvents.Disconnected{})
+	if state := decode(t, next(t, session).Payload)["state"]; state != "reconnecting" {
+		t.Fatalf("the drop published state=%v, so this is not the path whatsmeow redials", state)
+	}
+	clock = dialled.Add(70 * time.Second)
+	session.setConnected(true)
+
+	// The run of pings the old socket stopped answering, arriving after the new one is up.
+	session.handle(&waEvents.KeepAliveTimeout{ErrorCount: 2, LastSuccess: dialled.Add(5 * time.Second)})
+
+	if got := session.state(); got != "open" {
+		t.Fatalf("a timeout from before the reconnect left the session %q", got)
+	}
+	if written.Len() != 0 {
+		t.Fatalf("a timeout from before the reconnect was acted on: %s", written.String())
+	}
+}
+
 // And the second one is acted on rather than waited out. What the log line stands for is
 // the reset beside it; the reset itself is not observable from here, because a client with
 // no socket has nothing to take down, and the phase that measures it is the live one.
