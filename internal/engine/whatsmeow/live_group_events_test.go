@@ -9,11 +9,15 @@
 //	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveGroupChanges
 //
 // It creates a group between the two paired accounts and changes it, so it leaves a real
-// group on both phones. Pass WAC_LIVE_GROUP to reuse one instead.
+// group on both phones. Pass WAC_LIVE_GROUP to reuse one instead, which costs the
+// `group.joined` case: nobody joins anything in a run that reuses a group, and that
+// subtest skips naming what it did not cover rather than waiting for a notification
+// WhatsApp has no reason to send.
 package whatsmeow
 
 import (
 	"encoding/json"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -48,6 +52,17 @@ func TestLiveGroupChangesArePublished(t *testing.T) {
 	target := map[string]any{"kind": "group", "id": group.User}
 
 	t.Run("being added to a group is published with the group in it", func(t *testing.T) {
+		// Only a group created in this run produces the notification this asserts on. With
+		// WAC_LIVE_GROUP the account was added to that group at some point in the past, and
+		// nothing announces it again -- the wait below would spend its ninety seconds and
+		// fail on a build where the handler works. Skipped rather than quietly passed,
+		// because what is not exercised here is `group.joined` in its entirety, and a run
+		// that reuses a group has to say so instead of reporting a green it did not earn.
+		if reused := os.Getenv("WAC_LIVE_GROUP"); reused != "" {
+			t.Skipf("reusing %s, so nobody joins anything in this run: group.joined is not "+
+				"exercised. Unset WAC_LIVE_GROUP to cover it, at the cost of one CreateGroup "+
+				"against WhatsApp's rate limit.", reused)
+		}
 		joined := watching.await(t, protocol.EventGroupJoined, 90*time.Second)
 		payload := decode(t, joined.Payload)
 		info, ok := payload["info"].(map[string]any)
