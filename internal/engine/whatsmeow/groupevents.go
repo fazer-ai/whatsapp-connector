@@ -143,9 +143,6 @@ func (s *Session) groupChanged(event *waEvents.GroupInfo) {
 // link with no participant on the node, and the contract has `actor` optional precisely
 // so a producer can say it does not know rather than guess.
 func (s *Session) actorOf(ctx context.Context, event *waEvents.GroupInfo) *protocol.Party {
-	if event.Sender == nil && event.SenderPN == nil {
-		return nil
-	}
 	jids := make([]waTypes.JID, 0, 2)
 	if event.Sender != nil {
 		jids = append(jids, *event.Sender)
@@ -153,6 +150,9 @@ func (s *Session) actorOf(ctx context.Context, event *waEvents.GroupInfo) *proto
 	if event.SenderPN != nil {
 		jids = append(jids, *event.SenderPN)
 	}
+	// One guard for both ways of having no actor: a notification that named nobody, and one
+	// that named somebody this connector cannot address. `party` with nothing to go on
+	// returns an empty one, so the two arrive here the same way and leave it the same way.
 	actor := s.party(ctx, jids...)
 	if actor.Phone == "" && actor.LID == "" {
 		return nil
@@ -228,9 +228,6 @@ func (s *Session) parties(ctx context.Context, jids []waTypes.JID) []protocol.Pa
 			continue
 		}
 		named = append(named, party)
-	}
-	if len(named) == 0 {
-		return nil
 	}
 	return named
 }

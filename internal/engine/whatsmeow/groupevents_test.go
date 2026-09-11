@@ -331,6 +331,31 @@ func TestAnActorWithNoAddressIsLeftOutRatherThanSentHollow(t *testing.T) {
 	}
 }
 
+// The notification names whoever made the change on one of two fields, and which one it
+// uses is WhatsApp's choice, not this connector's: a group whose participants are addressed
+// by LID carries the number on `SenderPN` and leaves `Sender` empty. Reading only one of
+// them loses the actor on every change that came in the other shape, and the frame goes out
+// saying nobody did it.
+func TestAnActorNamedOnlyByNumberIsStillNamed(t *testing.T) {
+	t.Parallel()
+
+	session := groupSession(t)
+	number := someone("5511999990002")
+	session.handle(&waEvents.GroupInfo{
+		JID: groupJID(), SenderPN: &number,
+		Name: &waTypes.GroupName{Name: "Equipe fazer.ai"},
+	})
+
+	payload := published(t, session, protocol.EventGroupUpdated, "event_group_updated")
+	who, named := payload["actor"].(map[string]any)
+	if !named {
+		t.Fatalf("published no actor for a change WhatsApp named on SenderPN: %v", payload["actor"])
+	}
+	if who["phone"] != "5511999990002" {
+		t.Errorf("named %v as who made the change", payload["actor"])
+	}
+}
+
 // The changes the contract has no field for. Publishing nothing for them is silence a
 // client cannot tell from nothing having happened, so they go out as `group.activity`,
 // which is the contract's way of saying a group moved without saying how.
