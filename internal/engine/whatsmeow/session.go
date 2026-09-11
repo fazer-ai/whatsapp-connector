@@ -894,14 +894,19 @@ func (s *Session) setConnectedAt(connected bool, at time.Time) {
 			// loop dispatches read as current, and the healthy replacement would be taken
 			// down for them.
 			//
-			// Later than the socket it dates, by the handshake between whatsmeow's `connect`
-			// and this event, and that is the wrong direction to be wrong in: a stamp more
-			// than `keepAliveStaleAfter` past the new loop's first tick makes real timeouts
-			// on this socket read as stale and leaves it to whatsmeow's own three minutes,
-			// which is where main already is. What is left of that gap is the handshake
-			// itself, which is bounded by what whatsmeow will wait for an authentication;
-			// the unbounded part, the wait for the transition lock, is why the instant is
-			// handed in rather than read here.
+			// Later than the socket it dates, and that is the wrong direction to be wrong in:
+			// a stamp more than `keepAliveStaleAfter` past the new loop's first tick makes
+			// real timeouts on this socket read as stale and leaves it to whatsmeow's own
+			// three minutes, which is where main already is.
+			//
+			// Two things make up that gap. The wait for the transition lock has no bound at
+			// all, which is why the instant is handed in rather than read here. The rest is
+			// whatsmeow's, and it is bigger than a handshake: the prekey count, the prekey
+			// upload and the passive IQ all run before `Connected` is dispatched, up to four
+			// round trips at `defaultRequestTimeout` each. `Client.LastSuccessfulConnect` is
+			// set before those and would cut it to one, but it is an unsynchronised field
+			// and the next connection writes it on this very path, so reading it would trade
+			// the window for a race. That residue is issue #181.
 			s.connectedAt = at
 		}
 		s.reconnecting = false

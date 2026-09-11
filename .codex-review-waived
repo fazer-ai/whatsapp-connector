@@ -1,3 +1,18 @@
+# PR#177: right, and right about the size of it too -- the gap is not the handshake, it is
+# the prekey count, the prekey upload and the passive IQ that whatsmeow runs in a goroutine
+# before it dispatches `Connected` (connectionevents.go:164 onwards), up to four IQ round
+# trips at 75s each, while the keepalive loop has been running since the noise handshake.
+# The remedy it names exists: `Client.LastSuccessfulConnect` is exported and is set before
+# that goroutine starts. It is also a plain `time.Time` with no mutex, written in one place
+# and read nowhere in the library, and the read would sit in the `Connected` arm for one
+# connection while the next connection's `handleConnectSuccess` writes it -- on exactly the
+# path this is about, since the arm being slow is the premise. A torn `time.Time` fails in
+# both directions at once: never taking a mute socket down, or resetting a healthy one.
+# Trading a narrow window for a data race on the same path is not an improvement. The
+# residue is issue #181, with the two ways out (an upstream accessor, or a clamped read),
+# and what it costs when it bites is main's behaviour for one socket, not a regression.
+internal/engine/whatsmeow/session.go: Date replacement sockets before the delayed Connected event  # PR#177
+
 # PR#139: right that a self account reported under `hosted`, `hosted.lid` or `c.us` has its
 # verified name filed by whatsmeow under that raw JID, while the read here rebuilds the two
 # canonical ones. What makes it narrow is the write next to it: `updateBusinessName` files
