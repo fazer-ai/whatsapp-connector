@@ -40,9 +40,12 @@ func TestOneMissedKeepAliveLeavesTheSocketAlone(t *testing.T) {
 	session, _ := newTestSession(t, "5511999990001")
 	var written bytes.Buffer
 	session.log = zerolog.New(&written)
-	onAConnectionOlderThanThePings(session)
+	session.setConnected(true)
 
-	session.handle(&waEvents.KeepAliveTimeout{ErrorCount: 1, LastSuccess: time.Now().Add(-40 * time.Second)})
+	// The last answered ping is dated inside this connection, which is what a timeout
+	// about it looks like. The stamp it is compared against is the one `setConnected`
+	// writes, so nothing here fills in for the production path.
+	session.handle(&waEvents.KeepAliveTimeout{ErrorCount: 1, LastSuccess: time.Now()})
 
 	if got := session.state(); got != "open" {
 		t.Fatalf("the session left itself %q over one missed keepalive", got)
@@ -98,9 +101,9 @@ func TestTheSecondMissedKeepAliveIsActedOn(t *testing.T) {
 	session, _ := newTestSession(t, "5511999990001")
 	var written bytes.Buffer
 	session.log = zerolog.New(&written)
-	onAConnectionOlderThanThePings(session)
+	session.setConnected(true)
 
-	session.handle(&waEvents.KeepAliveTimeout{ErrorCount: 2, LastSuccess: time.Now().Add(-70 * time.Second)})
+	session.handle(&waEvents.KeepAliveTimeout{ErrorCount: 2, LastSuccess: time.Now()})
 
 	// Before the reset and not after it: ResetConnection blocks on the close handshake
 	// holding whatsmeow's socket lock, and a session still reporting `open` in that window
@@ -161,13 +164,22 @@ func theCaseFor(t *testing.T, event string) string {
 	return ""
 }
 
-// onAConnectionOlderThanThePings is the ordinary state a keepalive timeout describes: a
-// socket that has been up a while, and a last answered ping somewhere inside that. A
-// session connected this instant cannot be the one that missed a ping a minute ago, and
-// the handler reads it as a timeout left over from a socket already replaced.
-func onAConnectionOlderThanThePings(session *Session) {
-	session.setConnected(true)
-	session.mu.Lock()
-	session.connectedAt = time.Now().Add(-5 * time.Minute)
-	session.mu.Unlock()
+// The order inside the arm is load-bearing and invisible to every test that can run here:
+// with no socket under it, ResetConnection returns at once, so a session that published
+// after it looks the same from outside as one that published before. What it costs live is
+// the seconds the close handshake holds the socket lock while the session still says
+// `open`, which is the window this change exists to close.
+func TestTheKeepAliveHandlerPublishesBeforeItCloses(t *testing.T) {
+	t.Parallel()
+
+	handler := theCaseFor(t, "*waEvents.KeepAliveTimeout")
+	published := strings.Index(handler, "setReconnecting(true)")
+	closed := strings.Index(handler, "ResetConnection()")
+	if published < 0 || closed < 0 {
+		t.Fatalf("the keepalive handler neither publishes nor closes:\n%s", handler)
+	}
+	if published > closed {
+		t.Fatalf("the keepalive handler closes the socket before saying so, so `readyToSend` accepts "+
+			"commands into the lock the close is holding:\n%s", handler)
+	}
 }
