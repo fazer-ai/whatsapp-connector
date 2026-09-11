@@ -138,6 +138,42 @@ func TestAKeepAliveTimeoutFromBeforeAReconnectIsIgnored(t *testing.T) {
 	}
 }
 
+// And the socket whatsmeow swaps under a session that never hears about it. Its 515 path
+// ("restart required") disconnects and reconnects inside itself, and the disconnect it
+// marks as expected publishes nothing, so the first thing this session learns is a
+// `Connected` while it still believes it is connected. Nothing before that instant is
+// observable from here, and the stamp left behind describes the socket that is gone.
+func TestAKeepAliveTimeoutFromASocketSwappedUnderTheSessionIsIgnored(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	var written bytes.Buffer
+	session.log = zerolog.New(&written)
+
+	dialled := time.Now()
+	clock := dialled
+	session.wallClock = func() time.Time { return clock }
+	dialedAndConnected(session)
+
+	// A minute in, whatsmeow answers a 515 by replacing the socket on its own. No drop,
+	// no `Disconnected`, no dial: this event is the whole of what the session sees.
+	clock = dialled.Add(time.Minute)
+	session.handle(&waEvents.Connected{})
+	if emission := next(t, session); emission.Type != protocol.EventSessionState {
+		t.Fatalf("the replacement published %s", emission.Type)
+	}
+
+	// The run of pings the socket it replaced stopped answering, arriving late.
+	session.handle(&waEvents.KeepAliveTimeout{ErrorCount: 2, LastSuccess: dialled.Add(5 * time.Second)})
+
+	if got := session.state(); got != "open" {
+		t.Fatalf("a timeout about the socket that was swapped out left the session %q", got)
+	}
+	if written.Len() != 0 {
+		t.Fatalf("a timeout about the socket that was swapped out was acted on: %s", written.String())
+	}
+}
+
 // And the second one is acted on rather than waited out. What the log line stands for is
 // the reset beside it; the reset itself is not observable from here, because a client with
 // no socket has nothing to take down, and the phase that measures it is the live one.
