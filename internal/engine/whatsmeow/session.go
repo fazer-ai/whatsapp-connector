@@ -297,6 +297,11 @@ type Session struct {
 	// every path that can tell the socket is a new one: the dials this process asks for,
 	// the reconnects it watches whatsmeow start, and a connection that announces itself
 	// while the session still believes it is on the previous one.
+	//
+	// Those three are all of them. whatsmeow dispatches `events.Connected` from exactly
+	// one place, once per authenticated socket, so a socket that reaches this session at
+	// all reaches it through the third even when the first two miss it -- which is what
+	// keeps this from being a list of library paths to keep up with.
 	connectedAt time.Time
 
 	// awaited holds the messages that arrived unreadable and have not been given up on
