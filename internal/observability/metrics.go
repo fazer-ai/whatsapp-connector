@@ -20,6 +20,17 @@ type Metrics struct {
 	// LeasesLost counts ownership taken away, which is the shape a flapping instance
 	// or a partitioned Redis makes.
 	LeasesLost prometheus.Counter
+	// CommandReadsFailed counts command reads that came back with an error.
+	CommandReadsFailed prometheus.Counter
+	// CommandReadLastSuccess is when this instance last read commands without an error.
+	//
+	// The counter alone cannot say what an operator needs to know, because a read that
+	// fails is ordinary and a run of them is not: while the run lasts this instance
+	// carries out nothing for any session it owns, answers nobody, and goes on reporting
+	// itself ready and holding every lease. What separates the two is elapsed time with
+	// no success, which is `time() - this`, and it is the only signal an instance that is
+	// silently not serving gives off at all.
+	CommandReadLastSuccess prometheus.Gauge
 }
 
 // New builds the metric set and registers it.
@@ -44,7 +55,18 @@ func New() *Metrics {
 			Name: "wac_leases_lost_total",
 			Help: "Sessions whose lease was taken away from this instance.",
 		}),
+		CommandReadsFailed: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "wac_command_reads_failed_total",
+			Help: "Command reads that came back with an error.",
+		}),
+		CommandReadLastSuccess: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "wac_command_read_last_success_timestamp_seconds",
+			Help: "When this instance last read commands without an error.",
+		}),
 	}
-	registry.MustRegister(m.SessionsRunning, m.EventsPublished, m.CommandDuration, m.LeasesLost)
+	registry.MustRegister(
+		m.SessionsRunning, m.EventsPublished, m.CommandDuration, m.LeasesLost,
+		m.CommandReadsFailed, m.CommandReadLastSuccess,
+	)
 	return m
 }
