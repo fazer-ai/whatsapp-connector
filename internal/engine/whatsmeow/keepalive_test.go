@@ -205,6 +205,86 @@ func TestTheSecondMissedKeepAliveIsActedOn(t *testing.T) {
 	}
 }
 
+// A timeout whose run of failures is already over. whatsmeow dispatches the recovery from
+// a goroutine of its own too, so it can be handled before a timeout that preceded it, and
+// acting on that one resets a socket that is answering again.
+func TestAKeepAliveTimeoutTheSocketRecoveredFromIsIgnored(t *testing.T) {
+	t.Parallel()
+
+	session, written := newLoggedTestSession(t, "5511999990001")
+
+	started := time.Now()
+	clock := started
+	session.wallClock = func() time.Time { return clock }
+	dialedAndConnected(session)
+
+	// The socket went quiet and then answered again, on the same connection.
+	clock = started.Add(time.Minute)
+	session.handle(&waEvents.KeepAliveRestored{})
+
+	// The second timeout of the run that just ended, arriving after it.
+	session.handle(&waEvents.KeepAliveTimeout{ErrorCount: 2, LastSuccess: started.Add(5 * time.Second)})
+
+	if got := session.state(); got != "open" {
+		t.Fatalf("a timeout the socket already recovered from left the session %q", got)
+	}
+	if written.Len() != 0 {
+		t.Fatalf("a timeout the socket already recovered from was acted on: %s", written.String())
+	}
+}
+
+// And the run that begins from the very ping that ended the last one. A recovery is
+// recorded when this session handles it, which is later than whatsmeow saw it, so a rule
+// with no slack in it would read the next run of failures as the previous one arriving late
+// and leave a genuinely dead socket up.
+func TestARunOfFailuresThatBeganRightAfterARecoveryIsStillActedOn(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	started := time.Now()
+	clock := started
+	session.wallClock = func() time.Time { return clock }
+	dialedAndConnected(session)
+
+	clock = started.Add(time.Minute)
+	session.handle(&waEvents.KeepAliveRestored{})
+
+	// The pings stopped again, counted from one answered just before this session got
+	// round to the recovery.
+	session.handle(&waEvents.KeepAliveTimeout{ErrorCount: 2, LastSuccess: started.Add(55 * time.Second)})
+
+	if got := session.state(); got != "reconnecting" {
+		t.Fatalf("a run of failures dated from the ping that ended the last one left the session %q", got)
+	}
+	if state := decode(t, next(t, session).Payload)["state"]; state != "reconnecting" {
+		t.Fatalf("the session published state=%v", state)
+	}
+}
+
+// The two ways to take a socket down differ in one thing and it is the thing this change is
+// about: `Disconnect` marks the disconnect as expected, and `onDisconnect` publishes
+// `events.Disconnected` only when it was not -- so a session that used it would take its
+// socket down and go on reporting `open`, which is the state this exists to leave. Read off
+// the source because nothing else here can see the difference: a client with no socket does
+// the same nothing under either call.
+func TestTheKeepAliveHandlerResetsTheConnectionRatherThanDisconnecting(t *testing.T) {
+	t.Parallel()
+
+	taking := theBodyOf(t, "func (s *Session) resetUnlessReplaced(")
+	if !strings.Contains(taking, "ResetConnection()") {
+		t.Fatalf("the socket is not taken down with a reset:\n%s", taking)
+	}
+	if strings.Contains(taking, "client.Disconnect()") {
+		t.Fatalf("the socket is taken down with a disconnect, which publishes nothing and leaves "+
+			"the session reporting open:\n%s", taking)
+	}
+	handler := theCaseFor(t, "*waEvents.KeepAliveTimeout")
+	if strings.Contains(handler, "Disconnect()") {
+		t.Fatalf("the keepalive handler disconnects, which publishes nothing and leaves the "+
+			"session reporting open:\n%s", handler)
+	}
+}
+
 // The drop the session causes is published by the handler that causes it, and whatsmeow
 // starts the reconnect from the same instant it dispatches the event. Handled after the
 // replacement announced itself, the drop would describe a socket that is up, and nothing
