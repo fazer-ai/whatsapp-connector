@@ -928,13 +928,17 @@ func (s *Session) connection() (int64, bool) {
 	return s.transitions.Load(), s.connected
 }
 
-// connectedSince is when the attempt behind the current socket started, and the zero time
-// when the session is not on one.
-func (s *Session) connectedSince() time.Time {
+// lastKnownAlive is the latest moment this session has evidence the socket it is on was
+// alive, and the zero time when it is not on one. Two things say so and the later of them
+// wins: the connection being dated, and the socket answering a ping after having stopped.
+func (s *Session) lastKnownAlive() time.Time {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.connected {
 		return time.Time{}
+	}
+	if s.keepAliveAnsweredAt.After(s.connectedAt) {
+		return s.keepAliveAnsweredAt
 	}
 	return s.connectedAt
 }
@@ -1905,14 +1909,6 @@ func (s *Session) answeredKeepAlive() {
 	s.mu.Lock()
 	s.keepAliveAnsweredAt = at
 	s.mu.Unlock()
-}
-
-// keepAliveAnswered is when the socket was last seen answering, and the zero time when
-// nothing has said so on this process.
-func (s *Session) keepAliveAnswered() time.Time {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.keepAliveAnsweredAt
 }
 
 // hangUpStanding reports whether the guard is up, without taking it down. The Connected
@@ -3297,17 +3293,12 @@ func (s *Session) handle(rawEvent any) bool {
 		s.transition.Lock()
 		defer s.transition.Unlock()
 
-		if keepAliveWasAnswered(s.keepAliveAnswered(), event) {
-			// The run of failures this belongs to is over: the socket answered again, and
-			// whatsmeow said so in an event of its own. That one is dispatched from its own
-			// goroutine too, so it can arrive first and leave this one describing a
-			// connection that recovered while it waited to be handled.
-			return true
-		}
-		if keepAliveIsStale(s.connectedSince(), event) {
-			// A timeout about a connection that is already gone, dispatched from a
-			// goroutine of its own and arriving after the socket it is about was
-			// replaced. Acting on it would take down the healthy one that took its place.
+		if keepAliveIsStale(s.lastKnownAlive(), event) {
+			// Either a timeout about a connection that is already gone, arriving after the
+			// socket it is about was replaced, or one whose run of failures the socket
+			// recovered from. whatsmeow dispatches each timeout, each recovery and each drop
+			// from a goroutine of its own, so any of them can be handled after the thing it
+			// describes stopped being true. Acting on one would take down a healthy socket.
 			return true
 		}
 		s.log.Warn().Int("missed", event.ErrorCount).

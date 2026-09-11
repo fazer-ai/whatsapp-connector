@@ -24,32 +24,35 @@ func keepAliveIsLost(event *waEvents.KeepAliveTimeout) bool {
 	return event.ErrorCount >= keepAlivesBeforeReset
 }
 
-// keepAliveStaleAfter is how far a connection may have started after the last answered
-// ping before a timeout about it is read as belonging to an earlier socket.
+// keepAliveStaleAfter is how much later than the last answered ping a moment of known
+// liveness may be before the timeout that counts from that ping is read as describing
+// something already over.
 //
 // On the connection a timeout is really about, the last answered ping is *later* than the
 // connection came up, so the difference is negative -- except in the one case where no ping
 // was ever answered, and there whatsmeow dates it from the moment the loop started, which
-// is the same connection a hair earlier. A timeout left over from a socket that has already
-// been replaced is the other shape: the replacement came up after that socket spent its two
-// failed pings, so it is a minute or more later. Anything between the two separates them,
-// and this is the low end of it.
+// is the same connection a hair earlier. The two shapes this has to separate from that are
+// both a minute or more out: a socket that was replaced spent two failed pings first, and a
+// run of failures the socket recovered from took at least that long to recover. Anything
+// between the two separates them, and this is the low end of it.
+//
+// The slack is not padding. The moments this session can compare against are dated by when
+// it handled an event, and the ping they are compared to is dated by whatsmeow's own clock
+// inside the keepalive loop, so a session that was slow to handle something would otherwise
+// read a fresh timeout as an old one.
 const keepAliveStaleAfter = 20 * time.Second
 
-// keepAliveIsStale reports whether a keepalive timeout is about a connection this session
-// is no longer on. A session with no connection at all has nothing to take down, which
-// reads the same way here.
-func keepAliveIsStale(connectedSince time.Time, event *waEvents.KeepAliveTimeout) bool {
-	if connectedSince.IsZero() {
+// keepAliveIsStale reports whether a keepalive timeout describes something already over:
+// a socket this session is no longer on, or a run of failures the socket recovered from.
+//
+// Both are the same question, which is why they are one comparison. Every timeout in a run
+// is dated from the same last answered ping; a connection that started well after that date
+// is a different connection, and a recovery seen well after it ended the run that timeout
+// belongs to. A session with no connection at all has nothing to take down, which reads the
+// same way here.
+func keepAliveIsStale(aliveAt time.Time, event *waEvents.KeepAliveTimeout) bool {
+	if aliveAt.IsZero() {
 		return true
 	}
-	return connectedSince.After(event.LastSuccess.Add(keepAliveStaleAfter))
-}
-
-// keepAliveWasAnswered reports whether the socket answered a ping after the run of failures
-// this timeout belongs to began. Every timeout in a run is dated from the same last
-// answered ping, and the recovery that ends the run moves that date forward, so a timeout
-// whose date is older than the last recovery this session saw describes a run that is over.
-func keepAliveWasAnswered(answeredAt time.Time, event *waEvents.KeepAliveTimeout) bool {
-	return !answeredAt.IsZero() && answeredAt.After(event.LastSuccess)
+	return aliveAt.After(event.LastSuccess.Add(keepAliveStaleAfter))
 }

@@ -298,6 +298,34 @@ func TestAKeepAliveTimeoutTheSocketRecoveredFromIsIgnored(t *testing.T) {
 	}
 }
 
+// And the run that begins from the very ping that ended the last one. A recovery is
+// recorded when this session handles it, which is later than whatsmeow saw it, so a rule
+// with no slack in it would read the next run of failures as the previous one arriving late
+// and leave a genuinely dead socket up.
+func TestARunOfFailuresThatBeganRightAfterARecoveryIsStillActedOn(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	started := time.Now()
+	clock := started
+	session.wallClock = func() time.Time { return clock }
+	dialedAndConnected(session)
+
+	clock = started.Add(time.Minute)
+	session.handle(&waEvents.KeepAliveRestored{})
+
+	// The pings stopped again, counted from one answered just before this session got
+	// round to the recovery.
+	session.handle(&waEvents.KeepAliveTimeout{ErrorCount: 2, LastSuccess: started.Add(55 * time.Second)})
+
+	if got := session.state(); got != "reconnecting" {
+		t.Fatalf("a run of failures dated from the ping that ended the last one left the session %q", got)
+	}
+	if state := decode(t, next(t, session).Payload)["state"]; state != "reconnecting" {
+		t.Fatalf("the session published state=%v", state)
+	}
+}
+
 // The two ways to take a socket down differ in one thing and it is the thing this change
 // is about: `Disconnect` marks the disconnect as expected, and `onDisconnect` publishes
 // `events.Disconnected` only when it was not -- so a session that used it would take its
@@ -377,7 +405,7 @@ func TestTheConnectionIsStampedWhenItIsDialledAndNotWhenItIsAnnounced(t *testing
 	afterTheDialStarted := time.Now()
 	session.setConnected(true)
 
-	if !session.connectedSince().Before(afterTheDialStarted) {
+	if !session.lastKnownAlive().Before(afterTheDialStarted) {
 		t.Fatal("the connection is stamped when it is announced rather than when it is dialled, " +
 			"so every keepalive timeout on a socket slow to answer reads as stale and the socket stays up")
 	}
