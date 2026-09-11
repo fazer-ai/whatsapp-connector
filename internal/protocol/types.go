@@ -148,12 +148,19 @@ var AllEventTypes = []EventType{
 	EventRaw,
 }
 
-// AllCommandTypes lists every command type this build knows how to execute.
+// AllCommandTypes lists every command type in the contract. Four of them have no handler
+// in this build and are marked below: a client that sends one is answered `unsupported`,
+// which is the difference between these and the unproduced events -- a command says so at
+// the time, an event that never arrives says nothing.
 var AllCommandTypes = []CommandType{
 	CommandSessionConnect,
 	CommandSessionDisconnect,
 	CommandSessionLogout,
 	CommandSessionDelete,
+	// No handler, and nothing to handle: the payload is an open `config` object whose
+	// only named settings live in the fixture (`mark_as_read`, `presence_subscribe`) and
+	// nowhere else on either side. What a session is actually configured with arrives on
+	// `session.connect`.
 	CommandSessionUpdate,
 	CommandSessionStatus,
 	CommandSessionWake,
@@ -168,12 +175,16 @@ var AllCommandTypes = []CommandType{
 	CommandMessageMarkRead,
 	CommandMessageMarkUnread,
 	CommandMessageDownloadMedia,
+	// No handler, and it is M6's: the contract answers it with `history.sync` events,
+	// which have no producer either.
 	CommandHistoryRequest,
 	CommandPresenceSet,
 	CommandPresenceSubscribe,
 	CommandChatPresence,
 	CommandContactCheck,
 	CommandContactProfilePicture,
+	// No handler. `contact.resolve` answers the same `party` out of what this account was
+	// already shown, without a round trip, and it is what the client calls.
 	CommandContactInfo,
 	CommandContactResolve,
 	CommandGroupCreate,
@@ -188,6 +199,8 @@ var AllCommandTypes = []CommandType{
 	CommandGroupInviteGet,
 	CommandGroupJoinRequestsList,
 	CommandGroupJoinRequestsUpdate,
+	// No handler, and neither have the two call events that would make it worth one.
+	// Calls are M3's remainder.
 	CommandCallReject,
 }
 

@@ -462,7 +462,7 @@ func TestReplyRefusesADestinationOutsideTheReplyNamespace(t *testing.T) {
 	reply := protocol.Reply{V: protocol.Version, ID: "c1", OK: true}
 
 	for _, key := range []string{
-		f.client.Keys().Sessions(),
+		f.client.Keys().Instances(),
 		f.client.Keys().Commands("2f1c6f0e-0000-4000-8000-000000000001"),
 		f.client.Keys().Prefix() + "reply:",
 		"reply:c1",

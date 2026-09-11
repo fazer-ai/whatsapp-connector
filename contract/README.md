@@ -79,8 +79,8 @@ possibly by the same one. For `session.delete` that means: an account **nobody**
 torn down by whoever reads the entry, which is the case this route exists for and is
 deterministic; an account a connector is **running** is torn down when the entry reaches
 that connector, which happens but is not bounded. Nothing in the protocol asks an owner
-to give a session up on demand -- that is what `wa:handoff:<sid>` in the table above was
-meant for, and it has never been built.
+to give a session up on demand: a `wa:handoff:<sid>` key was declared for it once and
+removed here, having never had anything behind it.
 
 Around those four keys sit the ones that decide who reads and who writes. They are not
 frames, but both sides have to agree on them, so they are part of the contract:
@@ -89,7 +89,6 @@ frames, but both sides have to agree on them, so they are part of the contract:
 |---|---|---|---|
 | `wa:meta` | HASH | connector | `protocol_min`, `protocol_max`, `event_shards`; a connector whose `event_shards` disagrees refuses to start |
 | `wa:instances`, `wa:instance:<inst>` | SET, HASH (PX 15s) | connector | live instances and what they advertise: `version`, `protocol_min`, `protocol_max`, `advertise_url`, `media_token` |
-| `wa:sessions`, `wa:session:<sid>` | SET, HASH | **nobody** | described here as the connector's registry of session state, and no connector writes or reads either key. See the note below before relying on them |
 | `wa:lease:<sid>`, `wa:lease-epoch:<sid>` | STRING | connector | which instance owns a session, and the epoch it owns it under |
 | `wa:idem:<sid>:<key>` | STRING | connector | command idempotency (`msg:<message_id>` for sends) |
 | `wa:resume:<sid>` | STRING (EX 60s) | connector | a turn taken to bring an unowned session back, so the fleet asks about one account once per window |
@@ -97,14 +96,19 @@ frames, but both sides have to agree on them, so they are part of the contract:
 | `wa:events:<shard>:lease` | STRING (EX 30s) | client | which consumer reads a shard; exactly one at a time, which is what preserves order |
 | `wa:consumer:<cid>` | STRING (EX 15s) | client | consumer heartbeat and the shards it holds |
 | `wa:cursor:<sid>` | STRING | client | last `epoch:seq` the client processed for a session |
-| `wa:dlq:events`, `wa:dlq:commands` | LIST | either | entries that failed after retries, kept for an operator to inspect |
 
-**`wa:sessions` and `wa:session:<sid>` are not maintained.** They have a key
-constructor and nothing else: no connector writes them, and none reads them. The row
-stayed in this table describing a registry that was never built, which is worse than an
-absent row -- a client vendoring this directory reads that the connector keeps the last
-known state of every session and can write code against it. It cost a holdout agent a
-set of acceptance criteria built on that premise while #151 was being verified.
+**Four keys left this table rather than being explained in it.** `wa:sessions` and
+`wa:session:<sid>` described a registry of session state that was never built, and
+`wa:dlq:events` and `wa:dlq:commands` a dead letter queue neither side has ever written;
+all four had a key constructor and nothing else. A row for a key nobody writes is worse
+than an absent row -- a client vendoring this directory reads that the connector keeps
+the last known state of every session, or that an operator can go and look at what
+failed, and writes code against either. The registry cost a holdout agent a set of
+acceptance criteria built on that premise while #151 was being verified, and the DLQ
+would send an operator to a key that is empty whether or not anything failed. A client
+that still reads those names in an older copy of this file should stop: they are not
+written, and they were not written then either. Wanting a DLQ is an issue to open, not a
+constructor to leave lying around.
 
 `wa:quarantine:<sid>` was in the same state and is not any more: it counts the failures
 of a session the connector could not bring back and says how long the fleet leaves it
@@ -236,6 +240,12 @@ theirs, and the connector is always upgraded first.
   as a reply. They stay in the enum because
   removing one narrows what a client may already match on, and each is marked in
   `internal/protocol/errors.go` with what arrives in its place.
+- Four command types have no handler here -- `session.update`, `history.request`,
+  `contact.info` and `call.reject` -- and a client that sends one is answered
+  `unsupported`. That answer only reaches a client whose session some instance owns: a
+  command for a session nobody is running is delivered to nobody, so the caller waits out
+  its own deadline instead. Which four is marked in `internal/protocol/types.go` and held
+  there by a test, so wiring one up without saying so fails the build.
 - Fourteen of the event types have no producer in this connector either, and the same
   reasoning holds: a client may match on one and never see it. Unlike a command, nothing
   says so at the time -- a command it does not implement comes back `unsupported`, while
@@ -255,8 +265,9 @@ The `reply` frame carries `result` as an opaque object: the schema does not desc
 it per command type, because a result is only ever read by the caller of that one
 command. What the two sides agreed on is listed here, and it is what a command answers
 when a connector carries it out at all: one that does not implement a command refuses
-it with `unsupported` rather than answering a result of the wrong shape. That is where
-this connector stands on every `contact.*`, `group.*` and `history.request` row below.
+it with `unsupported` rather than answering a result of the wrong shape. In this
+connector that is `contact.info` and `history.request` below, plus `session.update` and
+`call.reject`, which have no result of their own to list.
 
 | Command | `result` |
 |---|---|

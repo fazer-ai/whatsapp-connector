@@ -54,7 +54,35 @@ func TestEveryEventTypeIsProducedOrMarkedAsNotProduced(t *testing.T) {
 		marked[i] = string(event)
 	}
 
-	assertProducers(t, "EventType", "types.go", catalog, marked)
+	assertProducers(t, "EventType", "types.go", "producer", catalog, marked)
+}
+
+// Four command types are in the contract with nothing in this build that carries them
+// out, and types.go marks each one. A client that sends one is answered `unsupported`,
+// so unlike an unproduced event this is told at the time -- but only to a client that
+// already sent it, and only for a session some instance owns. A command for a session
+// nobody is running is answered by nobody at all (#151), so the caller waits out its own
+// deadline and learns nothing about why.
+var commandTypesWithNoHandler = []protocol.CommandType{
+	protocol.CommandSessionUpdate,
+	protocol.CommandHistoryRequest,
+	protocol.CommandContactInfo,
+	protocol.CommandCallReject,
+}
+
+func TestEveryCommandTypeIsHandledOrMarkedAsNotHandled(t *testing.T) {
+	t.Parallel()
+
+	catalog := make([]string, len(protocol.AllCommandTypes))
+	for i, command := range protocol.AllCommandTypes {
+		catalog[i] = string(command)
+	}
+	marked := make([]string, len(commandTypesWithNoHandler))
+	for i, command := range commandTypesWithNoHandler {
+		marked[i] = string(command)
+	}
+
+	assertProducers(t, "CommandType", "types.go", "handler", catalog, marked)
 }
 
 // Three error codes are declared and never sent, and errors.go marks each one with what
@@ -80,12 +108,14 @@ func TestEveryErrorCodeIsProducedOrMarkedAsNotProduced(t *testing.T) {
 		marked[i] = string(code)
 	}
 
-	assertProducers(t, "ErrorCode", "errors.go", catalog, marked)
+	assertProducers(t, "ErrorCode", "errors.go", "producer", catalog, marked)
 }
 
-// assertProducers is the check both catalogs get: every value is either produced
-// somewhere outside this package or marked as not produced, and never both.
-func assertProducers(t *testing.T, declaredType, catalogFile string, catalog, marked []string) {
+// assertProducers is the check all three catalogs get: every value is either named
+// somewhere outside this package or marked as having nothing behind it, and never both.
+// `role` is what the naming would have been -- a producer for the events and the error
+// codes, a handler for the commands -- and only shapes the failures.
+func assertProducers(t *testing.T, declaredType, catalogFile, role string, catalog, marked []string) {
 	t.Helper()
 
 	named := namedOutsideThisPackage(t, declaredType, catalog)
@@ -97,7 +127,7 @@ func assertProducers(t *testing.T, declaredType, catalogFile string, catalog, ma
 	unproduced := make(map[string]bool, len(marked))
 	for _, value := range marked {
 		if !inCatalog[value] {
-			t.Errorf("%s is marked as having no producer and is not in the %s catalog", value, declaredType)
+			t.Errorf("%s is marked as having no %s and is not in the %s catalog", value, role, declaredType)
 		}
 		unproduced[value] = true
 	}
@@ -106,9 +136,9 @@ func assertProducers(t *testing.T, declaredType, catalogFile string, catalog, ma
 		where, produced := named[value]
 		switch {
 		case unproduced[value] && produced:
-			t.Errorf("%s is marked in %s as having no producer, and %s names it: move it out of the marked group", value, catalogFile, where)
+			t.Errorf("%s is marked in %s as having no %s, and %s names it: move it out of the marked group", value, catalogFile, role, where)
 		case !unproduced[value] && !produced:
-			t.Errorf("%s is not marked as unproduced and nothing outside internal/protocol names it: either it lost its producer or the marking in %s is behind", value, catalogFile)
+			t.Errorf("%s is not marked and nothing outside internal/protocol names it: either it lost its %s or the marking in %s is behind", value, role, catalogFile)
 		}
 	}
 }
