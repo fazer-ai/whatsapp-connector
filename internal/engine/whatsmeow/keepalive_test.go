@@ -890,6 +890,42 @@ func TestAJudgedConnectionEndsWithoutWaitingForTheLock(t *testing.T) {
 			"reads its socket as current and takes down the replacement")
 }
 
+// And the generation a takedown is judged by is the one its own transition wrote, not one
+// read back afterwards. `dropped` is deliberately outside the transition lock, so a drop can
+// land between the write and a read: counted into the snapshot instead of invalidating it,
+// it leaves the takedown agreeing with a socket that is already gone.
+func TestTheGenerationASocketIsGivenUpOnIsInvalidatedByALaterDrop(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	dialedAndConnected(session)
+
+	judged := session.setConnected(false)
+	if judged != session.transitions.Load() {
+		t.Fatalf("giving up on the socket returned generation %d for a connection the session "+
+			"counts as %d, so every takedown reads as superseded and none of them runs",
+			judged, session.transitions.Load())
+	}
+	session.dropped()
+	if session.transitions.Load() == judged {
+		t.Fatal("a drop after the socket was given up on left the generation it was judged by " +
+			"unchanged, so the takedown compares equal and resets whatever socket is under the " +
+			"client by then")
+	}
+}
+
+// Read off the source, because the window the snapshot has to survive is another goroutine's.
+func TestTheTakedownIsJudgedByTheGenerationItsOwnTransitionWrote(t *testing.T) {
+	t.Parallel()
+
+	handler := theCaseFor(t, "*waEvents.KeepAliveTimeout")
+	if !strings.Contains(handler, "judged := s.setConnected(false)") {
+		t.Fatalf("the takedown reads the generation back after writing it instead of taking the "+
+			"one its own transition returned, so a drop landing in between is counted into the "+
+			"snapshot rather than invalidating it:\n%s", handler)
+	}
+}
+
 // The unlink a `session.delete` sends is the sharpest case of all: it is a lifecycle
 // command, so it never passes through `Execute`, and cutting it off would have whatsmeow
 // resend the removal to WhatsApp. Driven rather than fenced, because this one cannot be

@@ -865,8 +865,8 @@ func (s *Session) setDialing(dialing bool) {
 
 // setConnected dates the connection from the moment this session found out about it,
 // which for everything that is not an event is now.
-func (s *Session) setConnected(connected bool) {
-	s.setConnectedAt(connected, s.now())
+func (s *Session) setConnected(connected bool) int64 {
+	return s.setConnectedAt(connected, s.now())
 }
 
 // setConnectedAt is setConnected with that moment handed in, for the one caller that
@@ -875,10 +875,16 @@ func (s *Session) setConnected(connected bool) {
 // an instant read here would date the socket from whenever the lock came free rather than
 // from when the session heard about it, and a stamp more than `keepAliveStaleAfter` past
 // the new keepalive loop makes every real timeout on that socket read as stale.
-func (s *Session) setConnectedAt(connected bool, at time.Time) {
+func (s *Session) setConnectedAt(connected bool, at time.Time) int64 {
 	s.mu.Lock()
 	replaced := connected && s.connected
-	s.transitions.Add(1)
+	// Returned, and that is the whole reason this has a result. A caller that wrote a
+	// transition and then read the count back would be reading across a window another
+	// goroutine can write in: `dropped` is deliberately outside the transition lock, so a
+	// drop landing there is counted into the snapshot instead of invalidating it, and a
+	// takedown judged by that snapshot goes ahead over whatever socket is under the client
+	// by the time it gets an answer.
+	generation := s.transitions.Add(1)
 	s.connected = connected
 	// Either way the dial is over: whatsmeow has answered for it, with an
 	// authenticated session or with the socket going down again.
@@ -923,6 +929,7 @@ func (s *Session) setConnectedAt(connected bool, at time.Time) {
 		clear(s.groupModes)
 	}
 	s.mu.Unlock()
+	return generation
 }
 
 // setReconnecting also re-dates the connection, because this is the other way a session
@@ -3563,14 +3570,13 @@ func (s *Session) handle(rawEvent any) bool {
 		// leads to is dispatched only after the close handshake returns, so a session that
 		// waited for the event would spend those seconds still reporting `open`, accepting
 		// commands into the very lock the close is holding.
-		s.setConnected(false)
+		judged := s.setConnected(false)
 		s.setReconnecting(true, dispatched)
 		// The `Disconnected` this is about to cause is already published, and saying so is
 		// what keeps it from being applied late: whatsmeow starts the reconnect from the
 		// same instant it dispatches that event, and a `Connected` handled first would
 		// leave the drop writing `reconnecting` over the socket that replaced it.
 		s.announceDrop()
-		judged := s.transitions.Load()
 		// Ordered before the publish and started off this goroutine, and both halves of
 		// that matter.
 		//
