@@ -1822,6 +1822,9 @@ func (s *Session) Logout(ctx context.Context) error {
 // answered here is a command the client republishes forever over a teardown that
 // already happened. What the second one leaves is named in the log instead.
 func (s *Session) Delete(ctx context.Context) error {
+	s.startCommand()
+	defer s.endCommand()
+
 	s.cancelPairing()
 	_, paired, pairedErr := s.store.JID(ctx)
 	unlink := s.logout(ctx, s.current())
@@ -2311,8 +2314,8 @@ func (s *Session) Execute(ctx context.Context, command *protocol.Command) (json.
 	// Counted for the whole of it, so a socket this session decides to take down waits for
 	// whatever is already out at WhatsApp. What it must not interrupt is an answer that has
 	// not arrived: whatsmeow resends the frame it was cut off from, and WhatsApp applies it
-	// again. Connect, Disconnect and Logout count themselves, because the session layer
-	// routes those three to their own engine methods rather than through here.
+	// again. The lifecycle commands count themselves, because the session layer routes
+	// those to their own engine methods rather than through here.
 	s.startCommand()
 	defer s.endCommand()
 

@@ -712,15 +712,17 @@ func TestTheOwedTakeDownWaitsForTheLastCommandOut(t *testing.T) {
 func TestEveryCommandBoundaryCountsWhatItIsCarryingOut(t *testing.T) {
 	t.Parallel()
 
-	// Execute is not the only one: the session layer routes `session.connect`,
-	// `session.disconnect` and `session.logout` to these three directly
-	// (`internal/session/session.go`, lifecycle), so a pairing code or a logout would have
-	// a mutating IQ out at WhatsApp with nothing counting it.
+	// Execute is not the only one: the session layer routes the lifecycle commands to
+	// these directly (`internal/session/session.go`, lifecycle), so a pairing code, a
+	// logout or a delete would have a mutating IQ out at WhatsApp with nothing counting it.
+	// The list is the one that file routes; a sixth added there and not here is a hole,
+	// which is how `Delete` arrived.
 	for _, boundary := range []string{
 		"func (s *Session) Execute(",
 		"func (s *Session) Connect(",
 		"func (s *Session) Disconnect(",
 		"func (s *Session) Logout(",
+		"func (s *Session) Delete(",
 	} {
 		carrying := theBodyOf(t, boundary)
 		started := strings.Index(carrying, "s.startCommand()")
