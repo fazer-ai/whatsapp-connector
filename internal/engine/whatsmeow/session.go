@@ -863,8 +863,19 @@ func (s *Session) setDialing(dialing bool) {
 	s.mu.Unlock()
 }
 
+// setConnected dates the connection from the moment this session found out about it,
+// which for everything that is not an event is now.
 func (s *Session) setConnected(connected bool) {
-	at := s.now()
+	s.setConnectedAt(connected, s.now())
+}
+
+// setConnectedAt is setConnected with that moment handed in, for the one caller that
+// learns it well before it can write it down. `Connected` is handled under the transition
+// lock, and whichever arm holds that lock may be waiting on a publish into a full inbox:
+// an instant read here would date the socket from whenever the lock came free rather than
+// from when the session heard about it, and a stamp more than `keepAliveStaleAfter` past
+// the new keepalive loop makes every real timeout on that socket read as stale.
+func (s *Session) setConnectedAt(connected bool, at time.Time) {
 	s.mu.Lock()
 	replaced := connected && s.connected
 	s.transitions.Add(1)
@@ -887,8 +898,10 @@ func (s *Session) setConnected(connected bool) {
 			// and this event, and that is the wrong direction to be wrong in: a stamp more
 			// than `keepAliveStaleAfter` past the new loop's first tick makes real timeouts
 			// on this socket read as stale and leaves it to whatsmeow's own three minutes,
-			// which is where main already is. It is the only instant this path offers, and
-			// erring into main's behaviour for one socket beats resetting a healthy one.
+			// which is where main already is. What is left of that gap is the handshake
+			// itself, which is bounded by what whatsmeow will wait for an authentication;
+			// the unbounded part, the wait for the transition lock, is why the instant is
+			// handed in rather than read here.
 			s.connectedAt = at
 		}
 		s.reconnecting = false
@@ -3446,7 +3459,7 @@ func (s *Session) handle(rawEvent any) bool {
 			go s.current().Disconnect()
 			return true
 		}
-		s.setConnected(true)
+		s.setConnectedAt(true, dispatched)
 		// Off this goroutine, because this writes a node and the transition lock is
 		// held for the length of this case: a socket slow to take it would hold every
 		// state change behind it, Close included.

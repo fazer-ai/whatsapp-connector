@@ -168,6 +168,53 @@ func TestAKeepAliveTimeoutFromASocketSwappedUnderTheSessionIsIgnored(t *testing.
 	}
 }
 
+// And the socket that replaced it is dated from when the session heard about it, not from
+// when it got the lock to write it down. Whichever arm holds the transition lock may be
+// waiting on a publish into an inbox nobody is draining, and a replacement stamped from
+// the far side of that wait is one whose own timeouts all read as stale: the session would
+// leave a mute socket up for whatsmeow's three minutes, which is where main already is.
+func TestASwappedSocketIsDatedFromWhenTheSessionHeardAboutIt(t *testing.T) {
+	t.Parallel()
+
+	session, written := newLoggedTestSession(t, "5511999990001")
+	dialedAndConnected(session)
+
+	// The clock the handler reads: the event's arrival for the instant it takes on entry,
+	// and a lock that came free a good deal later for every read after that. Scripted
+	// rather than slept, because what stands between the two in production is a publish
+	// that blocks for as long as the inbox stays full.
+	heard := time.Now()
+	late := heard.Add(keepAliveStaleAfter + time.Second)
+	reads := 0
+	session.wallClock = func() time.Time {
+		reads++
+		if reads == 1 {
+			return heard
+		}
+		return late
+	}
+
+	// whatsmeow's 515 path again: the socket is replaced and this event is the whole of
+	// what the session sees.
+	session.handle(&waEvents.Connected{})
+	if emission := next(t, session); emission.Type != protocol.EventSessionState {
+		t.Fatalf("the replacement published %s", emission.Type)
+	}
+
+	// A run of pings the replacement itself stopped answering, dated from the socket it
+	// came up on.
+	session.handle(&waEvents.KeepAliveTimeout{ErrorCount: 2, LastSuccess: heard})
+
+	if got := session.state(); got != "reconnecting" {
+		t.Fatalf("the replacement was dated %s, when the lock came free, rather than %s, when the "+
+			"session heard about it, so its own timeouts read as stale and the session stayed %q over "+
+			"a mute socket", late.Format(time.TimeOnly), heard.Format(time.TimeOnly), got)
+	}
+	if written.Len() == 0 {
+		t.Fatalf("the mute replacement was not taken down")
+	}
+}
+
 // And the second one is acted on rather than waited out. What the log line stands for is
 // the reset beside it; the reset itself is not observable from here, because a client with
 // no socket has nothing to take down, and the phase that measures it is the live one.
