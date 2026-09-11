@@ -482,6 +482,16 @@ func TestTheKeepAliveHandlerDoesNotWaitForTheCloseHandshake(t *testing.T) {
 		t.Fatalf("the keepalive handler resets whatever socket the session has when the "+
 			"goroutine runs, rather than the one it judged:\n%s", handler)
 	}
+	// The count guards the socket being replaced under the same client, which is what
+	// whatsmeow does on its own. It does not guard the session swapping the client itself:
+	// `adopt` rebuilds one after a logout and writes no connection, so the count does not
+	// move and only the pinned pointer separates the two. Read off the source because a
+	// client with no socket is reset invisibly, whichever one it is.
+	taking := theBodyOf(t, "func (s *Session) resetUnlessReplaced(")
+	if strings.Contains(taking, "s.current()") {
+		t.Fatalf("the reset reads the session's client when it runs instead of the one it was "+
+			"handed, so a session that adopted a new client in between takes that one down:\n%s", taking)
+	}
 }
 
 func TestTheConnectionIsStampedWhenItIsDialledAndNotWhenItIsAnnounced(t *testing.T) {
