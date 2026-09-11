@@ -291,9 +291,9 @@ type Session struct {
 	// somebody adds. `setConnected` and `offline` are the two functions that own the
 	// flag, and every one of those paths goes through one of them.
 	transitions atomic.Int64
-	// connectedAt is when the socket this session is on came up, which is what tells a
-	// keepalive timeout about the current connection from one about a connection that is
-	// already gone. Written under mu beside `connected`, by the same two functions.
+	// connectedAt is the earliest moment the socket this session is on could have come
+	// up, which is what tells a keepalive timeout about the current connection from one
+	// about a connection that is already gone. Written under mu beside `connected`.
 	connectedAt time.Time
 
 	// awaited holds the messages that arrived unreadable and have not been given up on
@@ -793,6 +793,7 @@ func (s *Session) identity() (phone, lid string) {
 }
 
 func (s *Session) setDialing(dialing bool) {
+	at := s.now()
 	s.mu.Lock()
 	s.dialing = dialing
 	if dialing {
@@ -803,7 +804,7 @@ func (s *Session) setDialing(dialing bool) {
 		// after it. A stamp taken there can be seconds or tens of seconds later than the
 		// clock it is compared against, and every timeout on that socket would then read
 		// as one about an older connection.
-		s.connectedAt = time.Now()
+		s.connectedAt = at
 	}
 	s.mu.Unlock()
 }
@@ -832,9 +833,21 @@ func (s *Session) setConnected(connected bool) {
 	s.mu.Unlock()
 }
 
+// setReconnecting also re-dates the connection, because this is the other way a session
+// gets a new socket: `dial` is only the ones this process asks for, and whatsmeow redials
+// on its own after a drop, straight into its own `connect` without passing through here.
+// A stamp left behind from the socket that dropped describes a connection that is gone, so
+// every timeout dispatched by its keepalive loop -- and those come from goroutines of their
+// own, outliving the socket they are about -- would read as current and take down the
+// replacement. The moment the retry starts is the latest instant that is still earlier than
+// any socket it can produce, which is what this comparison needs it to be.
 func (s *Session) setReconnecting(reconnecting bool) {
+	at := s.now()
 	s.mu.Lock()
 	s.reconnecting = reconnecting
+	if reconnecting {
+		s.connectedAt = at
+	}
 	s.mu.Unlock()
 }
 
@@ -881,13 +894,18 @@ func (s *Session) connectedSince() time.Time {
 	return s.connectedAt
 }
 
+// now is this session's clock: the real one, or the one a test drives.
+func (s *Session) now() time.Time {
+	if s.wallClock != nil {
+		return s.wallClock()
+	}
+	return time.Now()
+}
+
 // learned is the moment an event says the session found out about the thing it reports,
 // which is what the frame's `ts` carries.
 func (s *Session) learned() int64 {
-	if s.wallClock != nil {
-		return s.wallClock().UnixMilli()
-	}
-	return time.Now().UnixMilli()
+	return s.now().UnixMilli()
 }
 
 func (s *Session) setGroups(groups bool) {
