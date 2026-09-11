@@ -381,6 +381,13 @@ func (c *Container) forget(ctx context.Context, sid string) error {
 			}
 		}
 	}
+	// The desired state goes by hand, because it has no foreign key to hang a cascade
+	// on: it is written before a session has a device, so it cannot reference one. Left
+	// behind, it would have the resume sweep trying to bring back an account whose
+	// credentials this call is deleting.
+	if err := c.dropDesired(ctx, sid); err != nil {
+		return err
+	}
 	// The media parts go with the mapping, by the cascade on wac_media_part rather than
 	// by a delete here. An explicit one would only cover the case the constraint already
 	// covers -- foreign keys are on in both dialects, and whatsmeow refuses to bring its
@@ -536,6 +543,26 @@ func (c *Container) migrate(ctx context.Context) error {
 		//
 		// The cascade is the clearing rule. A forget unbinds the session and this goes
 		// with it, so what pairs next is available only if its own client says so.
+		// What a client asked for, which is the one thing nothing else in this schema
+		// records. `wac_session_device` says a session is paired; it does not say anybody
+		// wants it in the air, and adopting on the strength of a pairing would be the
+		// connector deciding to connect what no client asked for.
+		//
+		// It is what makes a session survive the instance that was running it. A lease is
+		// held by an instance and dies with it, a `session.wake` is a frame on a stream
+		// that is read once, and neither is a record of intent: after a restart the
+		// account is paired, unowned, and there is nothing anywhere that says it should be
+		// running -- which is exactly what fazer-ai/chatwoot#577 measured in production.
+		//
+		// No foreign key to the device, on purpose. A client connects a session before it
+		// has paired, so the row has to be writable while there is no device yet; what
+		// reads it joins the two, so a session that never paired is never resumed. A
+		// forget deletes it explicitly instead.
+		`CREATE TABLE IF NOT EXISTS wac_session_desired (
+			sid      TEXT   PRIMARY KEY,
+			desired  TEXT   NOT NULL,
+			asked_at BIGINT NOT NULL
+		)`,
 		`CREATE TABLE IF NOT EXISTS wac_session_presence (
 			sid    TEXT   PRIMARY KEY,
 			state  TEXT   NOT NULL,

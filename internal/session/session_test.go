@@ -2125,6 +2125,80 @@ func TestACommandIsKeyedByWhateverNamesItOnlyOnce(t *testing.T) {
 	}
 }
 
+// A restart leaves every paired account unowned, and nothing in the fleet notices: the
+// lease died with the instance that held it, the client polls nothing, and the inbox goes
+// on showing `open` while nothing arrives. What brings it back is this: the account is
+// taken and connected without anybody asking again.
+func TestAResumeTakesASessionNobodyIsRunningAndConnectsIt(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	if !h.manager.Resume("s1") {
+		t.Fatal("the resume was not even queued, so nothing will bring the account back")
+	}
+
+	waitFor(t, "the session to be taken and connected", func() bool {
+		engineSession, ok := h.engine.Session("s1")
+		return ok && engineSession.Connected()
+	})
+	if _, owned := h.leases.Owned("s1"); !owned {
+		t.Fatal("the account was connected without this instance holding its lease")
+	}
+}
+
+// The connect the sweep sends is the connector's own, and a client that reads
+// `command.failed` for it is told that a command it never sent has failed, naming an id
+// nothing on its side can match. What reports a resume either way is what reports every
+// connect: the engine's own events, which are addressed to the session.
+func TestAResumeThatFailedIsNotReportedAsACommandNobodySent(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	ctx := context.Background()
+	// Opened here so the engine session exists before the resume reaches it: what this
+	// test needs is a connect that fails, and the sweep's own adoption opens it too late
+	// to say so.
+	if _, err := h.engine.Open(ctx, "s1"); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	engineSession, _ := h.engine.Session("s1")
+	engineSession.FailConnect(errors.New("whatsapp refused the build"))
+
+	if !h.manager.Resume("s1") {
+		t.Fatal("the resume was not queued")
+	}
+	waitFor(t, "the resume to be attempted", func() bool { return engineSession.Connects() > 0 })
+
+	// A command of the client's own, behind the resume on the same queue, and one the
+	// fake refuses. The session runs one command at a time, so by the time this one is
+	// answered the resume has been: if a `command.failed` for the resume were coming, it
+	// would already be on the stream.
+	refused := &protocol.Command{
+		V: protocol.Version, ID: "c1", Type: protocol.CommandHistoryRequest, SID: "s1",
+		Payload: json.RawMessage(`{}`),
+	}
+	var acked atomic.Bool
+	h.manager.Dispatch(delivery(refused, &acked))
+	waitFor(t, "the client's own command to be answered", acked.Load)
+
+	var failures []string
+	for _, event := range h.recorder.published() {
+		if event.Type != protocol.EventCommandFailed {
+			continue
+		}
+		var body struct {
+			CommandID string `json:"command_id"`
+		}
+		if err := json.Unmarshal(event.Payload, &body); err != nil {
+			t.Fatalf("unmarshal a failure: %v", err)
+		}
+		failures = append(failures, body.CommandID)
+	}
+	if len(failures) != 1 || failures[0] != "c1" {
+		t.Fatalf("command.failed was published for %v, want only the client's own c1: a resume the connector sent itself has no sender to tell", failures)
+	}
+}
+
 // A teardown is carried out by the session that holds the account, like every other
 // command, and what it leaves behind is a session with nothing left to try: the lease
 // goes back on the next sweep rather than being held by an instance running an account

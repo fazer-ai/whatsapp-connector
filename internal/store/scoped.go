@@ -129,6 +129,20 @@ func (s *Scoped) Availability(ctx context.Context) (state string, kept bool, err
 	return s.container.availability(ctx, s.sid)
 }
 
+// PutDesired records what the client last asked this session to be, so that an instance
+// which comes up later can put it back.
+//
+// Fenced like every other write from here: an instance that has lost the account must not
+// be the one saying what should happen to it. The two writers are the two commands that
+// say it -- a connect and a disconnect -- and the deletion is the forget, which is what a
+// logout and a teardown both end in.
+func (s *Scoped) PutDesired(ctx context.Context, desired string) error {
+	if err := s.fence.held(); err != nil {
+		return err
+	}
+	return s.container.putDesired(ctx, s.sid, desired, time.Now())
+}
+
 // PutPlaceholder holds a bubble this session has scheduled and not yet decided, so a
 // process that ends inside the window does not take the decision with it.
 //

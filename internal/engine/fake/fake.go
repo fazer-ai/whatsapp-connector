@@ -94,8 +94,10 @@ type Session struct {
 	givenUp      uint64
 	loggedOut    int
 	deleted      int
+	connects     int
 	refuseUnlink error
 	failDelete   error
+	failConnect  error
 	onDelete     func()
 	commands     []protocol.Command
 	bounds       []time.Time
@@ -111,8 +113,32 @@ func newSession(sid string) *Session {
 	return &Session{sid: sid, events: make(chan engine.Emission, 32)}
 }
 
+// FailConnect makes every connect fail, which is how a test drives a session that cannot
+// come back: an account WhatsApp refuses, a store that is away, credentials that no longer
+// resume.
+func (s *Session) FailConnect(err error) {
+	s.mu.Lock()
+	s.failConnect = err
+	s.mu.Unlock()
+}
+
+// Connects counts the connect attempts, failed ones included. It is what a test waits on
+// when what it is about is an attempt rather than its outcome.
+func (s *Session) Connects() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.connects
+}
+
 // Connect walks the pairing conversation the type asks for and ends `open`.
 func (s *Session) Connect(_ context.Context, req engine.ConnectRequest) error {
+	s.mu.Lock()
+	s.connects++
+	failWith := s.failConnect
+	s.mu.Unlock()
+	if failWith != nil {
+		return failWith
+	}
 	switch req.Pairing {
 	case "qr":
 		s.emit(protocol.EventPairingQR, map[string]any{"png_data_url": QRData, "expires_in_ms": 20000})

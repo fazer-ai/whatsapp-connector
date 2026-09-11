@@ -71,6 +71,7 @@ frames, but both sides have to agree on them, so they are part of the contract:
 | `wa:sessions`, `wa:session:<sid>` | SET, HASH | **nobody** | described here as the connector's registry of session state, and no connector writes or reads either key. See the note below before relying on them |
 | `wa:lease:<sid>`, `wa:lease-epoch:<sid>` | STRING | connector | which instance owns a session, and the epoch it owns it under |
 | `wa:idem:<sid>:<key>` | STRING | connector | command idempotency (`msg:<message_id>` for sends) |
+| `wa:resume:<sid>` | STRING (EX 60s) | connector | a turn taken to bring an unowned session back, so the fleet asks about one account once per window |
 | `wa:events:<shard>:lease` | STRING (EX 30s) | client | which consumer reads a shard; exactly one at a time, which is what preserves order |
 | `wa:consumer:<cid>` | STRING (EX 15s) | client | consumer heartbeat and the shards it holds |
 | `wa:cursor:<sid>` | STRING | client | last `epoch:seq` the client processed for a session |
@@ -87,6 +88,19 @@ The same is true of `wa:quarantine:<sid>`, which has a constructor and no produc
 that one is tracked as fazer-ai/whatsapp-connector#102, which is about building the
 mechanism rather than about the key. Whether a session registry should exist at all is
 a separate question from this table telling clients that one does.
+
+**The one thing that registry was for does exist, and not here.** A connector keeps what
+a client asked each session to be -- connected or disconnected -- in its own database,
+written by `session.connect` and `session.disconnect` and deleted by `session.logout` and
+`session.delete`. It is what makes a paired account survive the instance that was running
+it: a lease dies with its holder and a `session.wake` is a frame read once, so without a
+record of intent a restarted fleet leaves every account unowned and silent. A sweep reads
+it and brings back what nobody is running, taking `wa:resume:<sid>` first so the fleet
+spends one attempt per account per window rather than one per instance per pass.
+
+It is deliberately not in Redis and not in this table. Desired state that a client could
+write is a client deciding when the connector dials WhatsApp; what the client says is a
+command, and this is the connector's record of having been told.
 
 The client reads events with a consumer group named `chatwoot`, created at `0` so that
 whatever the connector published while no client was running is still delivered.

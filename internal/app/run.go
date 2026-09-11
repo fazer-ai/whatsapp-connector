@@ -235,6 +235,13 @@ func (c *Connector) Run(ctx context.Context) error {
 	sweepingParts, stopPartSweep := context.WithCancel(ctx)
 	sweptParts := c.sweepMediaParts(sweepingParts)
 
+	// On a context of its own like the two above, and stopped before the answering
+	// goroutine below for the reason that one is stopped before the shutdown: it queues
+	// adoptions there, and an adoption queued while the instance is going away is an
+	// account taken by one that is about to hand everything back.
+	resuming, stopResuming := context.WithCancel(ctx)
+	resumed := c.resumeWanted(resuming)
+
 	// On a context of its own, like the sweepers and for the same reason: the loop has
 	// an exit the context knows nothing about, and waiting on a goroutine nothing has
 	// cancelled would hang the process on exactly the startup failure it is reporting.
@@ -251,6 +258,11 @@ func (c *Connector) Run(ctx context.Context) error {
 	// Before the shutdown, which closes the pool this one is querying.
 	stopPartSweep()
 	<-sweptParts
+
+	// Before the answering goroutine, because what it does is queue work onto it, and
+	// before the shutdown, because its own pass reads the database the shutdown closes.
+	stopResuming()
+	<-resumed
 
 	// Before the shutdown as well, and for both of the things it closes: an adoption in
 	// flight is reading the device store, and every acknowledgement is a round trip to
@@ -463,6 +475,115 @@ func (c *Connector) sweepMediaParts(ctx context.Context) <-chan struct{} {
 		}
 	}()
 	return done
+}
+
+// The shape of the resume sweep. Together they say how fast a fleet comes back: one pass
+// every interval, at most this many accounts asked for per pass per instance, so a
+// hundred sessions are all asked for inside a minute and a half on a single instance and
+// proportionally faster on more.
+//
+// The batch is what keeps a restart from being a stampede. Every session brought back
+// dials WhatsApp, and an instance that adopted every account it found at once would open
+// hundreds of sockets in the same second, on a process that has just started.
+//
+// The cool-off is fleet-wide and is what makes an account that cannot connect cost one
+// attempt per window instead of one per instance per pass: a session that fails to come
+// back is retired by its engine, the lease goes back, and without the mark the next pass
+// would find it free and try again immediately, forever. It is not quarantine -- a
+// session that is permanently unable to connect still costs an attempt a minute, which is
+// fazer-ai/whatsapp-connector#102 -- it is the floor under the retry.
+const (
+	resumeInterval = 30 * time.Second
+	resumeBatch    = 8
+	resumeCooloff  = time.Minute
+)
+
+// resumeWanted brings back the sessions a client asked to have connected and that no
+// instance is running, on a goroutine of its own. The returned channel closes once it has
+// stopped.
+//
+// Not on the heartbeat, and for the reason the two sweeps above are not: that goroutine
+// renews every lease this instance holds, and this pass reads a database and talks to
+// Redis. A pass that took longer than a lease would have peers adopt accounts whose
+// sockets are open here.
+//
+// What it exists for is the state nothing else notices. A lease dies with the instance
+// that held it, a `session.wake` is a frame read once, and the client polls nothing:
+// after a connector restart every paired account is unowned, the inbox still shows
+// `open`, and nothing arrives until somebody opens it and presses connect. Measured on a
+// production deployment (fazer-ai/chatwoot#577).
+func (c *Connector) resumeWanted(ctx context.Context) <-chan struct{} {
+	done := make(chan struct{})
+	if c.store == nil {
+		close(done)
+		return done
+	}
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(resumeInterval)
+		defer ticker.Stop()
+		for {
+			// Before the first tick rather than after it, because the case this is for is
+			// the instance that has just started: waiting out an interval first would add
+			// it to the time an account spends unowned after every deploy.
+			c.resumeOnce(ctx)
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+	return done
+}
+
+// resumeOnce makes one pass over the accounts that should be in the air.
+func (c *Connector) resumeOnce(ctx context.Context) {
+	// Bounded, and on a context of its own: the pass has nothing waiting on it, and a
+	// database or a Redis that hangs would otherwise hold this goroutine for as long as
+	// it takes rather than for as long as a pass is worth.
+	pass, cancel := context.WithTimeout(ctx, resumeInterval)
+	defer cancel()
+
+	wanted, err := c.store.Wanted(pass)
+	if err != nil {
+		c.log.Warn().Err(err).Msg("could not read which sessions should be connected")
+		return
+	}
+	running := c.manager.SIDs()
+	candidates := make([]string, 0, len(wanted))
+	for _, sid := range wanted {
+		if !slices.Contains(running, sid) {
+			candidates = append(candidates, sid)
+		}
+	}
+	free, err := c.leases.Unleased(pass, candidates)
+	if err != nil {
+		c.log.Warn().Err(err).Msg("could not tell which sessions are running somewhere")
+		return
+	}
+
+	asked := 0
+	for _, sid := range free {
+		if asked >= resumeBatch {
+			return
+		}
+		// The mark is taken before the attempt, and taking it is what wins the turn: two
+		// instances reading the same free account in the same second would otherwise both
+		// adopt, and the loser's adoption is an account handed straight back.
+		won, err := c.client.SetNX(pass, c.client.Keys().Resume(sid), c.cfg.Instance, resumeCooloff).Result()
+		if err != nil {
+			c.log.Warn().Err(err).Str("sid", sid).Msg("could not take the turn to bring a session back")
+			return
+		}
+		if !won {
+			continue
+		}
+		if c.manager.Resume(sid) {
+			asked++
+			c.log.Info().Str("sid", sid).Msg("bringing back a session that should be connected and that nobody is running")
+		}
+	}
 }
 
 // sweepPartsOnce makes one pass and reports whether the sweeper should stop.
