@@ -291,6 +291,18 @@ type Session struct {
 	// somebody adds. `setConnected` and `offline` are the two functions that own the
 	// flag, and every one of those paths goes through one of them.
 	transitions atomic.Int64
+	// connectedAt is the earliest moment the socket this session is on could have come
+	// up, which is what tells a keepalive timeout about the current connection from one
+	// about a connection that is already gone. Written under mu beside `connected`, by
+	// every path that can tell the socket is a new one: the dials this process asks for,
+	// the reconnects it watches whatsmeow start, and a connection that announces itself
+	// while the session still believes it is on the previous one.
+	//
+	// Those three are all of them. whatsmeow dispatches `events.Connected` from exactly
+	// one place, once per authenticated socket, so a socket that reaches this session at
+	// all reaches it through the third even when the first two miss it -- which is what
+	// keeps this from being a list of library paths to keep up with.
+	connectedAt time.Time
 
 	// awaited holds the messages that arrived unreadable and have not been given up on
 	// yet, so the one that arrives afterwards under the same id can call the placeholder
@@ -405,6 +417,49 @@ type Session struct {
 	// socket nobody is waiting for. This is the answer to "is it connecting" that costs
 	// no lock.
 	dialing bool
+	// running is how many commands are inside Execute. The keepalive handler reads it
+	// before taking a mute socket down, because `ResetConnection` clears whatsmeow's
+	// response waiters and `sendIQ` answers a disconnect node by resending the identical
+	// frame, same stanza id (`request.go:166`). WhatsApp does not deduplicate an IQ across
+	// connections: measured, a `group.create` caught by that resend leaves the account with
+	// two groups, and the caller is told about the second one only.
+	running int
+	// owed is a socket takedown the keepalive handler decided on and could not perform,
+	// because of the above. It runs when the command in flight is answered.
+	owed *owedReset
+	// Open while a takedown is closing the socket, and nil otherwise. `startCommand` waits
+	// on it so that no command begins under a socket that is going down.
+	resetting chan struct{}
+	// dropAnnounced is a drop this session brought on itself and has already published. Put
+	// up by the handler that causes the reset, taken down by the next `Disconnected` or by
+	// the reset itself when it finds nothing to take down.
+	//
+	// It names no connection, which bounds what it can do: it suppresses the next
+	// `Disconnected` handled, whichever that turns out to be. Telling two drops apart would
+	// need a connection identity the event does not carry and whatsmeow does not expose,
+	// which is #179.
+	//
+	// Nothing retires it early, and that is a decision rather than an omission. Every rule
+	// for retiring it is a guess about whether a drop is still coming, and the two guesses
+	// fail in opposite directions. Guess wrong towards keeping it and one future drop is
+	// swallowed: the session reports `open` over a socket on the floor until whatsmeow's own
+	// reconnect announces itself, which it always starts on the same branch that dispatched
+	// the drop. Guess wrong towards dropping it and a late `Disconnected` writes
+	// `reconnecting` over a healthy replacement, and nothing after it says otherwise --
+	// commands refused until an operator reconnects the session by hand. One self-corrects
+	// and the other does not, so this keeps the mark.
+	// The reset the keepalive handler performs leads to a `Disconnected` dispatched from a
+	// goroutine of its own, and whatsmeow starts the reconnect from the same instant, so
+	// the two race: a `Connected` handled first leaves the late `Disconnected` writing
+	// `reconnecting` over a socket that is up and healthy, and nothing after it corrects
+	// that -- the replacement is fine, so it produces no further event, and every command
+	// is refused from then on. Consumed by the next `Disconnected`, and dropped on a fresh
+	// dial so a reset that produced no event at all cannot leave it standing.
+	dropAnnounced bool
+	// keepAliveAnsweredAt is when the socket was last seen answering a ping, which is what
+	// tells a timeout that still describes the present from one whose run of failures is
+	// already over. Written under mu beside `connected`.
+	keepAliveAnsweredAt time.Time
 	// hungUp is an explicit disconnect this session performed and has not been asked to
 	// undo. whatsmeow's own reconnect can already be past its wait when that lands, and
 	// it then opens a socket nobody asked for, after the command has answered `close`.
@@ -750,6 +805,12 @@ func (s *Session) adopt(client *wm.Client) bool {
 		return false
 	}
 	s.client = client
+	// A mark about the client being replaced describes a drop from a socket this session no
+	// longer holds, and the argument for keeping one otherwise does not survive here: it
+	// rests on whatsmeow announcing its own reconnect, and a client adopted after a logout
+	// has no device to reconnect with. A drop swallowed during the pairing that follows is
+	// swallowed for good.
+	s.dropAnnounced = false
 	s.handlerID = handlerID
 	s.phone = named.phone
 	s.lid = named.lid
@@ -789,19 +850,74 @@ func (s *Session) identity() (phone, lid string) {
 }
 
 func (s *Session) setDialing(dialing bool) {
+	at := s.now()
 	s.mu.Lock()
 	s.dialing = dialing
+	if dialing {
+		// Dated from the attempt and not from the authentication that follows it. What
+		// this stamp is compared against is whatsmeow's keepalive clock, and that starts
+		// with the socket: its loop dates its first "last answered" from the moment the
+		// connection is up, while `Connected` waits for prekeys and the passive switch
+		// after it. A stamp taken there can be seconds or tens of seconds later than the
+		// clock it is compared against, and every timeout on that socket would then read
+		// as one about an older connection.
+		s.connectedAt = at
+	}
 	s.mu.Unlock()
 }
 
-func (s *Session) setConnected(connected bool) {
+// setConnected dates the connection from the moment this session found out about it,
+// which for everything that is not an event is now.
+func (s *Session) setConnected(connected bool) int64 {
+	return s.setConnectedAt(connected, s.now())
+}
+
+// setConnectedAt is setConnected with that moment handed in, for the one caller that
+// learns it well before it can write it down. `Connected` is handled under the transition
+// lock, and whichever arm holds that lock may be waiting on a publish into a full inbox:
+// an instant read here would date the socket from whenever the lock came free rather than
+// from when the session heard about it, and a stamp more than `keepAliveStaleAfter` past
+// the new keepalive loop makes every real timeout on that socket read as stale.
+func (s *Session) setConnectedAt(connected bool, at time.Time) int64 {
 	s.mu.Lock()
-	s.transitions.Add(1)
+	replaced := connected && s.connected
+	// Returned, and that is the whole reason this has a result. A caller that wrote a
+	// transition and then read the count back would be reading across a window another
+	// goroutine can write in: `dropped` is deliberately outside the transition lock, so a
+	// drop landing there is counted into the snapshot instead of invalidating it, and a
+	// takedown judged by that snapshot goes ahead over whatever socket is under the client
+	// by the time it gets an answer.
+	generation := s.transitions.Add(1)
 	s.connected = connected
 	// Either way the dial is over: whatsmeow has answered for it, with an
 	// authenticated session or with the socket going down again.
 	s.dialing = false
 	if connected {
+		if replaced {
+			// A socket announcing itself while the session still believes it is on one can
+			// only be a socket that replaced the previous one without anything telling this
+			// session so. whatsmeow's 515 path does exactly that: it disconnects and
+			// reconnects inside itself, and the disconnect it marks as expected publishes no
+			// event, so nothing before this moment is observable from here. Keeping the
+			// stamp of the socket that is gone would make every timeout its dead keepalive
+			// loop dispatches read as current, and the healthy replacement would be taken
+			// down for them.
+			//
+			// Later than the socket it dates, and that is the wrong direction to be wrong in:
+			// a stamp more than `keepAliveStaleAfter` past the new loop's first tick makes
+			// real timeouts on this socket read as stale and leaves it to whatsmeow's own
+			// three minutes, which is where main already is.
+			//
+			// Two things make up that gap. The wait for the transition lock has no bound at
+			// all, which is why the instant is handed in rather than read here. The rest is
+			// whatsmeow's, and it is bigger than a handshake: the prekey count, the prekey
+			// upload and the passive IQ all run before `Connected` is dispatched, up to four
+			// round trips at `defaultRequestTimeout` each. `Client.LastSuccessfulConnect` is
+			// set before those and would cut it to one, but it is an unsynchronised field
+			// and the next connection writes it on this very path, so reading it would trade
+			// the window for a race. That residue is issue #181.
+			s.connectedAt = at
+		}
 		s.reconnecting = false
 		// A new socket is a new answer about every group. What was remembered outlives a
 		// disconnection, and so does whatsmeow's own cache of the same groups -- which
@@ -816,11 +932,23 @@ func (s *Session) setConnected(connected bool) {
 		clear(s.groupModes)
 	}
 	s.mu.Unlock()
+	return generation
 }
 
-func (s *Session) setReconnecting(reconnecting bool) {
+// setReconnecting also re-dates the connection, because this is the other way a session
+// gets a new socket: `dial` is only the ones this process asks for, and whatsmeow redials
+// on its own after a drop, straight into its own `connect` without passing through here.
+// A stamp left behind from the socket that dropped describes a connection that is gone, so
+// every timeout dispatched by its keepalive loop -- and those come from goroutines of their
+// own, outliving the socket they are about -- would read as current and take down the
+// replacement. The moment the retry starts is the latest instant that is still earlier than
+// any socket it can produce, which is what this comparison needs it to be.
+func (s *Session) setReconnecting(reconnecting bool, at time.Time) {
 	s.mu.Lock()
 	s.reconnecting = reconnecting
+	if reconnecting {
+		s.connectedAt = at
+	}
 	s.mu.Unlock()
 }
 
@@ -839,6 +967,12 @@ func (s *Session) undoHangUp() bool {
 
 func (s *Session) offline() {
 	s.mu.Lock()
+	s.owed = nil
+	// And the mark that went with it. This is the session saying the connection is over and
+	// nothing is coming back on its own, so no `Disconnected` is owed to it -- an explicit
+	// disconnect is marked expected inside whatsmeow and publishes none, and a remote drop
+	// that raced the hang-up is answered by the guard the hang-up itself raises.
+	s.dropAnnounced = false
 	s.transitions.Add(1)
 	s.connected = false
 	s.reconnecting = false
@@ -856,13 +990,33 @@ func (s *Session) connection() (int64, bool) {
 	return s.transitions.Load(), s.connected
 }
 
+// lastKnownAlive is the latest moment this session has evidence the socket it is on was
+// alive, and the zero time when it is not on one. Two things say so and the later of them
+// wins: the connection being dated, and the socket answering a ping after having stopped.
+func (s *Session) lastKnownAlive() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.connected {
+		return time.Time{}
+	}
+	if s.keepAliveAnsweredAt.After(s.connectedAt) {
+		return s.keepAliveAnsweredAt
+	}
+	return s.connectedAt
+}
+
+// now is this session's clock: the real one, or the one a test drives.
+func (s *Session) now() time.Time {
+	if s.wallClock != nil {
+		return s.wallClock()
+	}
+	return time.Now()
+}
+
 // learned is the moment an event says the session found out about the thing it reports,
 // which is what the frame's `ts` carries.
 func (s *Session) learned() int64 {
-	if s.wallClock != nil {
-		return s.wallClock().UnixMilli()
-	}
-	return time.Now().UnixMilli()
+	return s.now().UnixMilli()
 }
 
 func (s *Session) setGroups(groups bool) {
@@ -1105,6 +1259,9 @@ func (s *Session) Events() <-chan engine.Emission { return s.events }
 
 // Connect starts pairing or resumes a stored session.
 func (s *Session) Connect(ctx context.Context, req engine.ConnectRequest) error {
+	s.countCommand()
+	defer s.endCommand()
+
 	if s.isClosed() {
 		return errors.New("whatsmeow: the session is closed")
 	}
@@ -1601,6 +1758,9 @@ func (s *Session) pairWithCode(ctx context.Context, rawPhone, standing string) e
 
 // Disconnect drops the socket and keeps the credentials.
 func (s *Session) Disconnect(ctx context.Context) error {
+	s.countCommand()
+	defer s.endCommand()
+
 	s.cancelPairing()
 	// Before the socket goes down, because what this records is the answer to "should
 	// anything bring it back": written after, an instance that died in between would
@@ -1619,6 +1779,11 @@ func (s *Session) Disconnect(ctx context.Context) error {
 // Logout ends the session on WhatsApp's side and forgets the credentials here, so the
 // next connect has to pair again.
 func (s *Session) Logout(ctx context.Context) error {
+	if err := s.startCommand(ctx); err != nil {
+		return err
+	}
+	defer s.endCommand()
+
 	s.cancelPairing()
 	if err := s.logout(ctx, s.current()); err != nil {
 		if sentNothing(err) {
@@ -1687,6 +1852,11 @@ func (s *Session) Logout(ctx context.Context) error {
 // answered here is a command the client republishes forever over a teardown that
 // already happened. What the second one leaves is named in the log instead.
 func (s *Session) Delete(ctx context.Context) error {
+	if err := s.startCommand(ctx); err != nil {
+		return err
+	}
+	defer s.endCommand()
+
 	s.cancelPairing()
 	_, paired, pairedErr := s.store.JID(ctx)
 	unlink := s.logout(ctx, s.current())
@@ -1790,6 +1960,281 @@ func (s *Session) dropHangUp() (state string, gaveUp uint64) {
 	}
 	s.mu.Unlock()
 	return s.state(), gaveUp
+}
+
+// owedReset is a takedown waiting for the command in flight to be answered.
+type owedReset struct {
+	client *wm.Client
+	judged int64
+}
+
+// countCommand is startCommand for the two boundaries that must not wait on a takedown.
+//
+// Waiting is for a command that could have a mutating IQ cut off mid-flight and resent.
+// Neither of these can: a disconnect sends nothing that WhatsApp applies, and a connect
+// dials a socket of its own rather than writing on the one being closed. What they would
+// get from waiting is the harm instead of the guard -- a disconnect refused there never
+// records that the account was asked to stay down, and `ResetConnection` puts the socket
+// back up, so the operator's disconnect is undone by the takedown it queued behind.
+//
+// They still count, because a takedown must not fire in the middle of one of them.
+func (s *Session) countCommand() {
+	s.mu.Lock()
+	s.running++
+	s.mu.Unlock()
+}
+
+// startCommand counts a command as being in flight, and waits for a takedown that has
+// already claimed the socket rather than joining it.
+//
+// The wait is what closes the other half of the guard. A takedown only claims when nothing
+// is running, and it holds the claim for the close handshake alone; what would arrive in
+// that window is a lifecycle command, the one kind that does not pass `readyToSend`, and
+// letting it start would put a removal IQ on a socket that is being closed underneath it.
+// Whatsmeow resends that frame once the connection is back and WhatsApp applies it twice.
+//
+// So a command that lands there pays the close handshake and is then refused by the state
+// the takedown published before it began. Every command that does not land in that window
+// is still refused in microseconds, which is the whole point of publishing first.
+func (s *Session) startCommand(ctx context.Context) error {
+	for {
+		s.mu.Lock()
+		closing := s.resetting
+		if closing == nil {
+			s.running++
+			s.mu.Unlock()
+			return nil
+		}
+		s.mu.Unlock()
+		select {
+		case <-closing:
+		case <-ctx.Done():
+			// The caller's deadline, which is the only thing here that knows how long the
+			// answer is still worth having. A command let through after it expired is one
+			// the session layer has stopped waiting for, and for a lifecycle command that
+			// means a socket effect launched for nobody.
+			return fmt.Errorf("whatsmeow: %s: waiting for the socket to be taken down: %w", s.sid, ctx.Err())
+		case <-s.ctx.Done():
+			// And the session going away, which the caller's context does not have to know
+			// about: a command with no deadline of its own would otherwise wait here for a
+			// takedown nobody is left to finish.
+			return fmt.Errorf("whatsmeow: %s: the session is closing", s.sid)
+		}
+	}
+}
+
+// endCommand releases the takedown the keepalive handler left waiting, if this was the
+// command it was waiting for.
+func (s *Session) endCommand() {
+	s.mu.Lock()
+	s.running--
+	owed := s.owed
+	if s.running > 0 {
+		owed = nil
+	} else {
+		s.owed = nil
+	}
+	s.mu.Unlock()
+	if owed != nil {
+		go s.resetUnlessReplaced(owed.client, owed.judged)
+	}
+}
+
+// takeDownSoon takes the socket down, or writes down that it has to come down as soon as
+// whatever is waiting on WhatsApp has been answered.
+//
+// Taking it down under an in-flight command is what turns one write into two. The state is
+// already `reconnecting` and the client already told, so nothing new is accepted while this
+// waits, and what it waits for is bounded: `sendIQ` answers within its own 75s ceiling, the
+// one main reaches first and this design otherwise gets in front of.
+func (s *Session) takeDownSoon(client *wm.Client, judged int64) {
+	s.mu.Lock()
+	waiting := s.running > 0
+	if waiting {
+		s.owed = &owedReset{client: client, judged: judged}
+	}
+	s.mu.Unlock()
+	if waiting {
+		s.log.Info().Msg("a command is still waiting on WhatsApp; the mute socket comes down with its answer")
+		return
+	}
+	go s.resetUnlessReplaced(client, judged)
+}
+
+// resetUnlessReplaced takes the socket down unless a connection landed while this was
+// waiting to be scheduled.
+//
+// `ResetConnection` reads the client's socket at the moment it runs, so a goroutine that
+// sat while whatsmeow replaced the socket on its own would close the replacement. A
+// connection write since the judgement is what says that happened, and it is also what put
+// the state back to `open`, so standing down here leaves nothing to repair.
+//
+// Neither question is asked under the same lock as the reset itself, which leaves the width
+// of those statements as a window: a connection or a command that lands inside it is not
+// seen. Holding a lock across the reset would close that and reopen worse -- `ResetConnection`
+// blocks on the close handshake holding whatsmeow's socket lock, and the session's own mutex
+// is taken by every read of its state.
+func (s *Session) resetUnlessReplaced(client *wm.Client, judged int64) {
+	s.mu.Lock()
+	replaced := s.transitions.Load() != judged
+	// A command that started between the decision and this goroutine being scheduled. Only
+	// the lifecycle three can: everything else is refused at the gate by then. `logout`
+	// sends its removal IQ over the socket that is still up, and cutting that off is the
+	// resend this whole guard exists to avoid, so the takedown goes back to waiting.
+	started := !replaced && s.running > 0
+	if started {
+		s.owed = &owedReset{client: client, judged: judged}
+	}
+	s.mu.Unlock()
+	if started {
+		s.log.Info().Msg("a command started before the mute socket could be taken down; waiting for its answer")
+		return
+	}
+	if replaced {
+		s.log.Info().Msg("a connection landed before the mute socket could be taken down; leaving it alone")
+		return
+	}
+	// Asked here and not in the handler, because reading it takes whatsmeow's socket lock
+	// and a redial holds that for the length of an attempt: off the handler's goroutine
+	// that is a wait, on it that would be the session's whole state machine behind a
+	// redial. It is the precondition for the reset producing anything at all -- with no
+	// socket under it, `ResetConnection` returns having done nothing.
+	if !client.IsConnected() {
+		s.log.Info().Msg("the mute socket was already gone before it could be taken down")
+		return
+	}
+	// Judged again, and this time the going-ahead is claimed in the same breath. Both
+	// readings above are stale by now: getting an answer out of `IsConnected` waits on
+	// whatsmeow's socket lock, which a redial holds for a whole attempt, so a `true`
+	// returned at the end of one describes the socket that replaced the mute one. And the
+	// count of commands is read on one goroutine while the executor starts them on
+	// another: between reading nought and closing the socket, a `Logout` or a `Delete` can
+	// put its removal IQ on the wire. Those two do not pass `readyToSend` -- they are how
+	// a session is ended, not a request about a live one -- so nothing else refuses them
+	// here, and an IQ cut off mid-flight is resent by whatsmeow and applied twice, which is
+	// the invariant this whole guard exists for.
+	s.mu.Lock()
+	if s.transitions.Load() != judged {
+		s.mu.Unlock()
+		s.log.Info().Msg("a connection landed while the mute socket was being checked; leaving it alone")
+		return
+	}
+	if s.running > 0 {
+		s.owed = &owedReset{client: client, judged: judged}
+		s.mu.Unlock()
+		s.log.Info().Msg("a command started while the mute socket was being checked; waiting for its answer")
+		return
+	}
+	// Claimed, not just checked: `startCommand` waits on this, so no command can begin
+	// between here and the socket being closed. Released before the channel is closed, so
+	// a waiter that wakes finds the claim already gone.
+	closing := make(chan struct{})
+	s.resetting = closing
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.resetting = nil
+		s.mu.Unlock()
+		close(closing)
+	}()
+
+	client.ResetConnection()
+}
+
+// forgetOwedReset drops a takedown whose socket is already gone, without any of what
+// cancelling one means: nothing recovered, so nothing is published and the mark stands for
+// the drop that is being handled.
+func (s *Session) forgetOwedReset() {
+	s.mu.Lock()
+	s.owed = nil
+	s.mu.Unlock()
+}
+
+// dropped records that the connection this session was on is over, before anything here can
+// wait on a lock.
+//
+// What reads it is the takedown running on its own goroutine. That one judged a socket by
+// the count, and asking whatsmeow whether the socket is still under the client costs a wait
+// on a lock a redial holds for the length of an attempt -- so the answer it eventually gets
+// describes whatever socket the client has by then, which may be the one that replaced the
+// mute socket rather than the mute socket. The session cannot see that replacement arrive:
+// whatsmeow dispatches `Connected` only after its prekey and passive IQs, which is issue
+// #181. It can see this, and this is enough -- a takedown whose socket has been reported
+// gone has nothing left to take down, whatever is under the client now.
+//
+// Counted rather than flagged, because the count is what the takedown already judges by, and
+// counting twice for one drop costs nothing: every reader compares it against a snapshot.
+func (s *Session) dropped() {
+	s.transitions.Add(1)
+}
+
+// cancelOwedReset drops a takedown that was still waiting for a command to be answered, and
+// reports whether the connection it was judged on is the one that recovered.
+//
+// Only that one cancels it, and the mark is why. A recovery about a socket that has since
+// been replaced -- the replacement's `Connected` handled first, which moves the count -- has
+// nothing to bring back, and the `Disconnected` of the socket it describes is still on its
+// way: that drop is what the mark was raised for and what it has to swallow. Taking the mark
+// down on a recovery that arrived too late is how the drop of the old socket gets written
+// over the healthy new one, with nothing after it to put that right.
+//
+// The takedown goes either way. Its socket is gone, and `resetUnlessReplaced` would find the
+// count moved and leave it alone in any case.
+func (s *Session) cancelOwedReset() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.owed == nil {
+		return false
+	}
+	superseded := s.owed.judged != s.transitions.Load()
+	s.owed = nil
+	if superseded {
+		return false
+	}
+	s.dropAnnounced = false
+	return true
+}
+
+// recovered puts the session back on the socket it had given up on. Not `setConnected`,
+// because this is the same connection and not a new one: what was remembered about it,
+// group modes included, still describes it.
+func (s *Session) recovered() {
+	s.mu.Lock()
+	s.transitions.Add(1)
+	s.connected = true
+	s.reconnecting = false
+	s.mu.Unlock()
+}
+
+// announceDrop marks the `Disconnected` this session's own reset is about to produce as
+// one that has already been published. The caller holds transition: this is one half of a
+// socket transition, not one of its own.
+func (s *Session) announceDrop() {
+	s.mu.Lock()
+	s.dropAnnounced = true
+	s.mu.Unlock()
+}
+
+// dropWasAnnounced reports whether the drop being handled is the one this session brought
+// on itself, clearing the mark either way: one reset is answered once.
+func (s *Session) dropWasAnnounced() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	announced := s.dropAnnounced
+	s.dropAnnounced = false
+	return announced
+}
+
+// answeredKeepAlive records that the socket answered a ping again.
+//
+// Unconditional, and the date is what makes that safe: `at` is when whatsmeow dispatched the
+// recovery, not when this session got round to it, so a recovery about a socket that has
+// since been replaced carries an instant from before the replacement was dated. The rule
+// that reads this takes the later of the two, so the superseded one loses.
+func (s *Session) answeredKeepAlive(at time.Time) {
+	s.mu.Lock()
+	s.keepAliveAnsweredAt = at
+	s.mu.Unlock()
 }
 
 // hangUpStanding reports whether the guard is up, without taking it down. The Connected
@@ -2013,6 +2458,29 @@ func (s *Session) isStale() bool {
 // What is not here is refused rather than answered with a plausible shape: a connector
 // that acknowledged a send it cannot make would lose the message and report success.
 func (s *Session) Execute(ctx context.Context, command *protocol.Command) (json.RawMessage, error) {
+	// Answered before any of the counting below, because it is the one command that puts
+	// nothing on the socket: it reads this session's own memory and returns. There is
+	// nothing for a takedown to cut off, nothing to wait for, and nothing to count.
+	//
+	// Made explicit rather than left to fall through, because the session layer answers
+	// every `session.connect` with one of these (`internal/session/session.go`, the connect
+	// arm): a status that waited on a takedown would put the wait straight back into the
+	// connect that deliberately does not wait, and could time it out after the account was
+	// already recorded as one that should be connected.
+	if command != nil && command.Type == protocol.CommandSessionStatus {
+		return json.Marshal(s.status())
+	}
+
+	// Counted for the whole of it, so a socket this session decides to take down waits for
+	// whatever is already out at WhatsApp. What it must not interrupt is an answer that has
+	// not arrived: whatsmeow resends the frame it was cut off from, and WhatsApp applies it
+	// again. The lifecycle commands count themselves, because the session layer routes
+	// those to their own engine methods rather than through here.
+	if err := s.startCommand(ctx); err != nil {
+		return nil, err
+	}
+	defer s.endCommand()
+
 	// Stamped here, before the command spends a round trip at WhatsApp: a pairing that
 	// comes back belongs to the account that asked for it, and a logout landing in that
 	// window has already rebuilt the session on another one.
@@ -3079,6 +3547,13 @@ func pairingFailureMessage(reason string) string {
 // it again, which is the only honest answer while this build has nowhere to put it: an
 // acknowledged message nobody published is a message that is simply gone.
 func (s *Session) handle(rawEvent any) bool {
+	// Taken before anything here can wait. An arm that moves the connection dates it, and
+	// every one of them takes the transition lock first: a handler already holding it
+	// across a publish that waits on a full inbox delays this one by as long as that takes,
+	// and a connection dated from then reads as later than the socket it describes.
+	// whatsmeow calls this from the goroutine that dispatched the event, so this is as
+	// early as this session can know anything.
+	dispatched := s.now()
 	switch event := rawEvent.(type) {
 	case *waEvents.Message:
 		// The one handler that blocks, and the only place the ack invariant is decided:
@@ -3133,7 +3608,7 @@ func (s *Session) handle(rawEvent any) bool {
 			go s.current().Disconnect()
 			return true
 		}
-		s.setConnected(true)
+		s.setConnectedAt(true, dispatched)
 		// Off this goroutine, because this writes a node and the transition lock is
 		// held for the length of this case: a socket slow to take it would hold every
 		// state change behind it, Close included.
@@ -3146,10 +3621,142 @@ func (s *Session) handle(rawEvent any) bool {
 		// and this has none -- so what this buys is a head start, not a guarantee.
 		go s.reapplyAvailability(s.ctx, s.current())
 		s.emit(protocol.EventSessionState, s.sessionState())
-	case *waEvents.Disconnected:
+	case *waEvents.KeepAliveTimeout:
+		// The socket is open and the server stopped answering on it. Nobody else is going
+		// to say so for a while: whatsmeow's own patience here is KeepAliveMaxFailTime,
+		// three minutes, and the disconnect it forces at the end of it is one it marks as
+		// expected -- so `onDisconnect` publishes nothing and this session goes on
+		// reporting `open` over a socket on the floor. Everything the client sends in that
+		// window is accepted by `readyToSend`, queued behind the dead socket, and pays its
+		// own ceiling there, one command at a time.
+		//
+		// Reset rather than Disconnect, and that is the whole of it: ResetConnection is
+		// the one that dispatches the event, so the session below turns `reconnecting`,
+		// the client is told, and `readyToSend` starts refusing in microseconds instead of
+		// accepting work for a socket that cannot carry it.
+		//
+		// What it does not do is give up on the command already in flight: the pending
+		// query is answered with a disconnect node and whatsmeow resends the same frame
+		// under the same id once the socket is back. Deciding a write failed is what
+		// invariant 5 forbids, and nothing here decides that.
+		if !keepAliveIsLost(event) {
+			return true
+		}
+		// Taken for the same reason every other arm here takes it: what follows reads the
+		// connection and then acts on it, and a hand-back or a reconnect settling in
+		// between would leave this publishing `reconnecting` over a session that is
+		// closing, or resetting a socket that replaced the one these pings were about.
 		s.transition.Lock()
 		defer s.transition.Unlock()
 
+		if keepAliveIsStale(s.lastKnownAlive(), event) {
+			// Either a timeout about a connection that is already gone, arriving after the
+			// socket it is about was replaced, or one whose run of failures the socket
+			// recovered from. whatsmeow dispatches each timeout, each recovery and each drop
+			// from a goroutine of its own, so any of them can be handled after the thing it
+			// describes stopped being true. Acting on one would take down a healthy socket.
+			return true
+		}
+		s.log.Warn().Int("missed", event.ErrorCount).
+			Time("last_answered", event.LastSuccess).
+			Msg("no keepalive answered on an open socket; taking it down rather than waiting")
+		// Read here, so what goes down is the socket this session just judged and not
+		// whatever it is on by the time the reset below runs.
+		client := s.current()
+		// The state goes first, and the order is the point. The `Disconnected` a reset
+		// leads to is dispatched only after the close handshake returns, so a session that
+		// waited for the event would spend those seconds still reporting `open`, accepting
+		// commands into the very lock the close is holding.
+		judged := s.setConnected(false)
+		s.setReconnecting(true, dispatched)
+		// The `Disconnected` this is about to cause is already published, and saying so is
+		// what keeps it from being applied late: whatsmeow starts the reconnect from the
+		// same instant it dispatches that event, and a `Connected` handled first would
+		// leave the drop writing `reconnecting` over the socket that replaced it.
+		s.announceDrop()
+		// Ordered before the publish and started off this goroutine, and both halves of
+		// that matter.
+		//
+		// Before, because the publish can wait: `emit` blocks for as long as the inbox is
+		// full, and a reset left behind it would run whenever that cleared, against
+		// whatever socket the client had by then -- the one that answered again, or the one
+		// whatsmeow put in its place while this handler sat holding the transition lock and
+		// could not be told. What it would take down is a healthy socket.
+		//
+		// Off this goroutine, because `ResetConnection` blocks on the close handshake
+		// holding whatsmeow's socket lock: waiting for it here would spend those seconds
+		// with the session already refusing commands and its last published state still
+		// saying `open`, which is a session the client has no way to make sense of.
+		//
+		// A goroutine that is ready still has to be scheduled, though, and `ResetConnection`
+		// reads the client's socket when it runs rather than when it is asked for, so the
+		// count above is carried along and checked on the other side.
+		s.takeDownSoon(client, judged)
+		s.emit(protocol.EventSessionState, map[string]any{"state": "reconnecting", "reason": "keepalive"})
+	case *waEvents.KeepAliveRestored:
+		// Nothing to announce: the socket never went down, so no state changed. What this
+		// is for is the timeouts that came before it and have not been handled yet.
+		//
+		// Taken for the same reason the timeout arm takes it, and it is the other half of
+		// the same decision: that one reads this stamp and then acts on what it read, so a
+		// recovery landing in between would be recorded too late to stop a reset of the
+		// socket it says is answering again. With the lock this one is either wholly before
+		// that read or wholly after the action.
+		s.transition.Lock()
+		defer s.transition.Unlock()
+
+		s.answeredKeepAlive(dispatched)
+		if !s.cancelOwedReset() {
+			return true
+		}
+		// The socket this session had given up on is answering again, and the takedown it
+		// was owed never ran: it was waiting for a command that is still out at WhatsApp.
+		// Nothing was closed, so there is nothing to bring back -- what is left is a session
+		// reporting `reconnecting` and refusing commands over a connection that works, for
+		// as long as that command takes.
+		//
+		// The narrow half of this is not covered: once the command is answered the takedown
+		// is already on its way, and a recovery landing after that resets a socket that is
+		// answering again. One reconnect, against the minutes this window can run to.
+		s.log.Info().Msg("the mute socket answered again before it could be taken down")
+		s.recovered()
+		s.emit(protocol.EventSessionState, s.sessionState())
+	case *waEvents.Disconnected:
+		// The socket is gone, so a takedown still owed for it has nothing left to do, and
+		// leaving it owed is worse than useless: a recovery dispatched just before the drop
+		// and handled just after it would cancel that debt and put the session back on a
+		// connection that no longer exists.
+		//
+		// Before the lock, because the value of forgetting it is in forgetting it promptly.
+		// The command the takedown waits on can be answered at any moment, and the reset
+		// that fires then judges by a connection count this handler has not been able to
+		// move yet. Behind a publish waiting on a full inbox that is minutes, and minutes
+		// is long enough for whatsmeow to have redialled -- so the reset finds a socket
+		// under the client, and the socket it finds is the replacement. Nothing here needs
+		// the transition lock: the count is atomic and the debt is its own field.
+		//
+		// The count goes first, and that order is the whole of what forgetting the debt is
+		// worth. Forgetting it only stops a takedown that has not been launched yet, and
+		// `endCommand` can be taking `s.mu` at this very moment, lifting the debt and
+		// launching it. That goroutine judges by the count, so a count this handler has not
+		// moved yet reads as the connection still being the one it was judged on -- and
+		// then the only thing between it and closing a healthy replacement is whether
+		// whatsmeow has finished redialling. Moving the count first makes every reset
+		// launched from here on stand down, whether the debt was forgotten or claimed.
+		s.dropped()
+		s.forgetOwedReset()
+
+		s.transition.Lock()
+		defer s.transition.Unlock()
+
+		if s.dropWasAnnounced() {
+			// The drop this session brought on itself, published by the handler that caused
+			// it. Applying it here as well would be harmless in the order it usually
+			// arrives and would wedge the session in the order it sometimes does: handled
+			// after the replacement announced itself, it writes `reconnecting` over a
+			// healthy socket, and nothing comes after it to put that right.
+			return true
+		}
 		s.setConnected(false)
 		if s.hangUpStanding() {
 			// A drop from a socket this session is already done with. whatsmeow
@@ -3170,7 +3777,7 @@ func (s *Session) handle(rawEvent any) bool {
 		if phone, _ := s.identity(); phone == "" {
 			state = "close"
 		}
-		s.setReconnecting(state == "reconnecting")
+		s.setReconnecting(state == "reconnecting", dispatched)
 		s.emit(protocol.EventSessionState, map[string]any{"state": state, "reason": "disconnected"})
 	case *waEvents.LoggedOut:
 		s.loggedOut(event)

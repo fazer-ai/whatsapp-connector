@@ -1,3 +1,49 @@
+# PR#177: the mechanism is right -- a `select` with two ready cases picks between them at
+# random, so waking because the takedown finished says nothing about whether the caller is
+# still there -- and the remedy is wrong for this connector. Refusing a command whose
+# context has expired contradicts a decision this repository already made and tested:
+# `TestADisconnectThatOutlivesItsDeadlineIsStillRecorded` drives a `Disconnect` with an
+# already-cancelled context and requires the teardown to happen anyway, reporting the
+# failure to the caller while the socket closes and the state is published. Two more tests
+# pin the same shape for the error a late command answers with. A lifecycle command that
+# reached the executor runs its effect; what expires is the caller's patience, not the
+# account's state.
+# What the finding names as the harm -- "Disconnect can launch its socket teardown after the
+# caller timed out" -- is therefore the intended behaviour rather than the defect. The real
+# hazard in the neighbourhood is the opposite one, and it is fixed instead: a disconnect made
+# to wait can be refused before it records that the account should stay down, and the
+# takedown it queued behind reconnects the socket, so the operator's disconnect is undone.
+# `Connect` and `Disconnect` now count without waiting, because neither can have a mutating
+# IQ cut off mid-flight, which is the only thing the wait is for.
+internal/engine/whatsmeow/session.go: Recheck cancellation before starting the command  # PR#177
+
+# PR#177: wrong on its premise. `dispatched` is not the handling time: it is the first
+# statement of `handle`, taken before the arm can reach `s.transition.Lock()`, which is what
+# `TestTheConnectionIsDatedFromTheDispatchAndNotTheHandling` fences off the source. And
+# whatsmeow gives each recovery a goroutine of its own (`go cli.dispatchEvent`, keepalive.go)
+# and calls handlers directly, with no queue in between, so that instant is the recovery's.
+# The consequence the finding builds on therefore does not follow. A replacement's socket can
+# only exist after the recovery happened, so its `connectedAt` is the later of the two, and
+# `lastKnownAlive` takes the later -- the superseded recovery loses the comparison it would
+# have had to win. That is what the comment on `answeredKeepAlive` says and why it can be
+# unconditional.
+internal/engine/whatsmeow/session.go: Do not date stale keepalive recoveries as current  # PR#177
+
+# PR#177: right, and right about the size of it too -- the gap is not the handshake, it is
+# the prekey count, the prekey upload and the passive IQ that whatsmeow runs in a goroutine
+# before it dispatches `Connected` (connectionevents.go:164 onwards), up to four IQ round
+# trips at 75s each, while the keepalive loop has been running since the noise handshake.
+# The remedy it names exists: `Client.LastSuccessfulConnect` is exported and is set before
+# that goroutine starts. It is also a plain `time.Time` with no mutex, written in one place
+# and read nowhere in the library, and the read would sit in the `Connected` arm for one
+# connection while the next connection's `handleConnectSuccess` writes it -- on exactly the
+# path this is about, since the arm being slow is the premise. A torn `time.Time` fails in
+# both directions at once: never taking a mute socket down, or resetting a healthy one.
+# Trading a narrow window for a data race on the same path is not an improvement. The
+# residue is issue #181, with the two ways out (an upstream accessor, or a clamped read),
+# and what it costs when it bites is main's behaviour for one socket, not a regression.
+internal/engine/whatsmeow/session.go: Date replacement sockets before the delayed Connected event  # PR#177
+
 # PR#139: right that a self account reported under `hosted`, `hosted.lid` or `c.us` has its
 # verified name filed by whatsmeow under that raw JID, while the read here rebuilds the two
 # canonical ones. What makes it narrow is the write next to it: `updateBusinessName` files
