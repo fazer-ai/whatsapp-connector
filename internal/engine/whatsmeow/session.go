@@ -1259,7 +1259,9 @@ func (s *Session) Events() <-chan engine.Emission { return s.events }
 
 // Connect starts pairing or resumes a stored session.
 func (s *Session) Connect(ctx context.Context, req engine.ConnectRequest) error {
-	s.startCommand()
+	if err := s.startCommand(ctx); err != nil {
+		return err
+	}
 	defer s.endCommand()
 
 	if s.isClosed() {
@@ -1758,7 +1760,9 @@ func (s *Session) pairWithCode(ctx context.Context, rawPhone, standing string) e
 
 // Disconnect drops the socket and keeps the credentials.
 func (s *Session) Disconnect(ctx context.Context) error {
-	s.startCommand()
+	if err := s.startCommand(ctx); err != nil {
+		return err
+	}
 	defer s.endCommand()
 
 	s.cancelPairing()
@@ -1779,7 +1783,9 @@ func (s *Session) Disconnect(ctx context.Context) error {
 // Logout ends the session on WhatsApp's side and forgets the credentials here, so the
 // next connect has to pair again.
 func (s *Session) Logout(ctx context.Context) error {
-	s.startCommand()
+	if err := s.startCommand(ctx); err != nil {
+		return err
+	}
 	defer s.endCommand()
 
 	s.cancelPairing()
@@ -1850,7 +1856,9 @@ func (s *Session) Logout(ctx context.Context) error {
 // answered here is a command the client republishes forever over a teardown that
 // already happened. What the second one leaves is named in the log instead.
 func (s *Session) Delete(ctx context.Context) error {
-	s.startCommand()
+	if err := s.startCommand(ctx); err != nil {
+		return err
+	}
 	defer s.endCommand()
 
 	s.cancelPairing()
@@ -1976,17 +1984,30 @@ type owedReset struct {
 // So a command that lands there pays the close handshake and is then refused by the state
 // the takedown published before it began. Every command that does not land in that window
 // is still refused in microseconds, which is the whole point of publishing first.
-func (s *Session) startCommand() {
+func (s *Session) startCommand(ctx context.Context) error {
 	for {
 		s.mu.Lock()
 		closing := s.resetting
 		if closing == nil {
 			s.running++
 			s.mu.Unlock()
-			return
+			return nil
 		}
 		s.mu.Unlock()
-		<-closing
+		select {
+		case <-closing:
+		case <-ctx.Done():
+			// The caller's deadline, which is the only thing here that knows how long the
+			// answer is still worth having. A command let through after it expired is one
+			// the session layer has stopped waiting for, and for a lifecycle command that
+			// means a socket effect launched for nobody.
+			return fmt.Errorf("whatsmeow: %s: waiting for the socket to be taken down: %w", s.sid, ctx.Err())
+		case <-s.ctx.Done():
+			// And the session going away, which the caller's context does not have to know
+			// about: a command with no deadline of its own would otherwise wait here for a
+			// takedown nobody is left to finish.
+			return fmt.Errorf("whatsmeow: %s: the session is closing", s.sid)
+		}
 	}
 }
 
@@ -2430,7 +2451,9 @@ func (s *Session) Execute(ctx context.Context, command *protocol.Command) (json.
 	// not arrived: whatsmeow resends the frame it was cut off from, and WhatsApp applies it
 	// again. The lifecycle commands count themselves, because the session layer routes
 	// those to their own engine methods rather than through here.
-	s.startCommand()
+	if err := s.startCommand(ctx); err != nil {
+		return nil, err
+	}
 	defer s.endCommand()
 
 	// Stamped here, before the command spends a round trip at WhatsApp: a pairing that

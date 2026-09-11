@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -436,7 +437,7 @@ func TestTheResetGoesBackToWaitingWhenACommandStartedFirst(t *testing.T) {
 
 	judged := session.transitions.Load()
 	// A logout started while the takedown was still waiting for a turn.
-	session.startCommand()
+	mustStartCommand(t, session)
 
 	session.resetUnlessReplaced(session.current(), judged)
 
@@ -564,7 +565,7 @@ func TestADropStillOnItsWayIsSuppressedAfterTheResetStandsDown(t *testing.T) {
 	session.relearn(session.current())
 	dialedAndConnected(session)
 
-	session.startCommand()
+	mustStartCommand(t, session)
 	session.handle(&waEvents.KeepAliveTimeout{ErrorCount: 2, LastSuccess: time.Now()})
 	next(t, session)
 
@@ -600,7 +601,7 @@ func TestAMuteSocketIsNotTakenDownUnderACommandStillWaiting(t *testing.T) {
 	dialedAndConnected(session)
 
 	// A command is out at WhatsApp, the way `Execute` counts one.
-	session.startCommand()
+	mustStartCommand(t, session)
 	session.handle(&waEvents.KeepAliveTimeout{ErrorCount: 2, LastSuccess: time.Now()})
 
 	if !strings.Contains(written.String(), "comes down with its answer") {
@@ -624,7 +625,7 @@ func TestTheOwedTakeDownRunsWhenTheCommandIsAnswered(t *testing.T) {
 	session.relearn(session.current())
 	dialedAndConnected(session)
 
-	session.startCommand()
+	mustStartCommand(t, session)
 	session.handle(&waEvents.KeepAliveTimeout{ErrorCount: 2, LastSuccess: time.Now()})
 	next(t, session)
 
@@ -634,6 +635,17 @@ func TestTheOwedTakeDownRunsWhenTheCommandIsAnswered(t *testing.T) {
 	// only thing it leaves behind is the line saying so.
 	waitFor(t, func() bool { return strings.Contains(written.String(), "already gone") },
 		"the takedown owed to the answered command never ran")
+}
+
+// mustStartCommand counts a command in flight for a test that is not about the wait, and
+// fails loudly if the wait is what it got: a test that silently ran without its command
+// counted would be asserting about a different session than it thinks.
+func mustStartCommand(t *testing.T, session *Session) {
+	t.Helper()
+
+	if err := session.startCommand(context.Background()); err != nil {
+		t.Fatalf("the command could not be counted in flight: %v", err)
+	}
 }
 
 // waitFor polls a condition the production code reaches from a goroutine of its own.
@@ -661,7 +673,7 @@ func TestASocketThatAnswersAgainBeforeTheTakeDownKeepsItsConnection(t *testing.T
 	session.relearn(session.current())
 	dialedAndConnected(session)
 
-	session.startCommand()
+	mustStartCommand(t, session)
 	session.handle(&waEvents.KeepAliveTimeout{ErrorCount: 2, LastSuccess: time.Now()})
 	if state := decode(t, next(t, session).Payload)["state"]; state != "reconnecting" {
 		t.Fatalf("the session published state=%v while giving up on the socket", state)
@@ -714,7 +726,7 @@ func TestARecoveryHandledAfterTheDropDoesNotReviveTheSocket(t *testing.T) {
 	session.relearn(session.current())
 	dialedAndConnected(session)
 
-	session.startCommand()
+	mustStartCommand(t, session)
 	session.handle(&waEvents.KeepAliveTimeout{ErrorCount: 2, LastSuccess: time.Now()})
 	next(t, session)
 
@@ -745,7 +757,7 @@ func TestARecoveryAboutAReplacedSocketLeavesTheDropMarkStanding(t *testing.T) {
 
 	// A mute socket judged lost with a command still out at WhatsApp, so the takedown is
 	// owed rather than run, and the mark stands for a drop that has not happened yet.
-	session.startCommand()
+	mustStartCommand(t, session)
 	session.handle(&waEvents.KeepAliveTimeout{ErrorCount: 2, LastSuccess: time.Now()})
 	if state := decode(t, next(t, session).Payload)["state"]; state != "reconnecting" {
 		t.Fatalf("the session published state=%v while giving up on the socket", state)
@@ -789,7 +801,7 @@ func TestTheDebtOfAMuteSocketIsDroppedWithoutWaitingForTheLock(t *testing.T) {
 	session.relearn(session.current())
 	dialedAndConnected(session)
 
-	session.startCommand()
+	mustStartCommand(t, session)
 	session.handle(&waEvents.KeepAliveTimeout{ErrorCount: 2, LastSuccess: time.Now()})
 	next(t, session)
 	session.mu.Lock()
@@ -940,11 +952,10 @@ func TestNoCommandBeginsWhileATakedownIsClosingTheSocket(t *testing.T) {
 	session.resetting = closing
 	session.mu.Unlock()
 
-	reached, started := make(chan struct{}), make(chan struct{})
+	reached, started := make(chan struct{}), make(chan error, 1)
 	go func() {
 		close(reached)
-		session.startCommand()
-		close(started)
+		started <- session.startCommand(context.Background())
 	}()
 
 	// The goroutine is running before anything is concluded from its silence, so what the
@@ -965,15 +976,62 @@ func TestNoCommandBeginsWhileATakedownIsClosingTheSocket(t *testing.T) {
 	session.mu.Unlock()
 	close(closing)
 
-	waitFor(t, func() bool {
-		select {
-		case <-started:
-			return true
-		default:
-			return false
+	select {
+	case err := <-started:
+		if err != nil {
+			t.Fatalf("the command was refused after the takedown let the socket go: %v", err)
 		}
-	}, "the command never began after the takedown let the socket go")
+	case <-time.After(2 * time.Second):
+		t.Fatal("the command never began after the takedown let the socket go")
+	}
 	session.endCommand()
+}
+
+// And a command whose caller has stopped waiting does not begin at all. The wait here is
+// for a close handshake, which is seconds; a command let through after its deadline is one
+// the session layer has already answered, and for a lifecycle command that is a socket
+// effect launched for nobody.
+func TestACommandWhoseDeadlineExpiredDoesNotBeginAfterTheWait(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	closing := make(chan struct{})
+	defer close(closing)
+	session.mu.Lock()
+	session.resetting = closing
+	session.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	refused := make(chan error, 1)
+	reached := make(chan struct{})
+	go func() {
+		close(reached)
+		refused <- session.startCommand(ctx)
+	}()
+	<-reached
+	cancel()
+
+	select {
+	case err := <-refused:
+		if err == nil {
+			t.Fatal("a command whose caller stopped waiting began anyway, after the only expiry " +
+				"check the session layer makes")
+		}
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("the refusal does not carry the caller's own reason, so it cannot be told "+
+				"from a connector failure: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the wait did not honour the caller's context at all")
+	}
+
+	session.mu.Lock()
+	running := session.running
+	session.mu.Unlock()
+	if running != 0 {
+		t.Fatalf("a command refused at the wait was still counted in flight (%d), so the takedown "+
+			"waits for an answer nobody is coming back with", running)
+	}
 }
 
 // And the takedown claims that only after asking whatsmeow whether the socket is still
@@ -1042,8 +1100,8 @@ func TestTheOwedTakeDownWaitsForTheLastCommandOut(t *testing.T) {
 	session.relearn(session.current())
 	dialedAndConnected(session)
 
-	session.startCommand()
-	session.startCommand()
+	mustStartCommand(t, session)
+	mustStartCommand(t, session)
 	session.handle(&waEvents.KeepAliveTimeout{ErrorCount: 2, LastSuccess: time.Now()})
 	next(t, session)
 
@@ -1076,7 +1134,7 @@ func TestEveryCommandBoundaryCountsWhatItIsCarryingOut(t *testing.T) {
 	for _, method := range theEngineMethodsTheSessionLayerRoutesTo(t) {
 		boundary := "func (s *Session) " + method + "("
 		carrying := theBodyOf(t, boundary)
-		started := strings.Index(carrying, "s.startCommand()")
+		started := strings.Index(carrying, "s.startCommand(ctx)")
 		ended := strings.Index(carrying, "defer s.endCommand()")
 		if started < 0 || ended < 0 {
 			t.Fatalf("%s does not count the command in flight, so the keepalive handler takes "+
