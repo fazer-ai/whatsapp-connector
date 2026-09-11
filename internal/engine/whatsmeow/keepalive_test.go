@@ -2,6 +2,7 @@ package whatsmeow
 
 import (
 	"bytes"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -66,4 +67,48 @@ func TestTheSecondMissedKeepAliveIsActedOn(t *testing.T) {
 	if !strings.Contains(out, `"missed":2`) {
 		t.Fatalf("the log does not say how many went unanswered: %q", out)
 	}
+}
+
+// The two ways to take a socket down differ in one thing and it is the thing this change
+// is about: `Disconnect` marks the disconnect as expected, and `onDisconnect` publishes
+// `events.Disconnected` only when it was not -- so a session that used it would take its
+// socket down and go on reporting `open`, which is the state this exists to leave. Read
+// off the source because nothing else here can see the difference: a client with no socket
+// does the same nothing under either call, and the phase that can tell them apart is the
+// live one.
+func TestTheKeepAliveHandlerResetsTheConnectionRatherThanDisconnecting(t *testing.T) {
+	t.Parallel()
+
+	handler := theCaseFor(t, "*waEvents.KeepAliveTimeout")
+	if !strings.Contains(handler, "ResetConnection()") {
+		t.Fatalf("the keepalive handler does not reset the connection:\n%s", handler)
+	}
+	if strings.Contains(handler, "Disconnect()") {
+		t.Fatalf("the keepalive handler disconnects, which publishes nothing and leaves the session reporting open:\n%s", handler)
+	}
+}
+
+// theCaseFor returns one arm of the event switch, from its case line to the next one.
+func theCaseFor(t *testing.T, event string) string {
+	t.Helper()
+
+	raw, err := os.ReadFile("session.go")
+	if err != nil {
+		t.Fatalf("read the session: %v", err)
+	}
+	lines := strings.Split(string(raw), "\n")
+	opens := "\tcase " + event + ":"
+	for i, line := range lines {
+		if line != opens {
+			continue
+		}
+		for end := i + 1; end < len(lines); end++ {
+			if strings.HasPrefix(lines[end], "\tcase ") || strings.HasPrefix(lines[end], "\tdefault:") {
+				return strings.Join(lines[i:end], "\n")
+			}
+		}
+		t.Fatalf("the arm for %s does not end", event)
+	}
+	t.Fatalf("the event switch has no arm for %s", event)
+	return ""
 }
