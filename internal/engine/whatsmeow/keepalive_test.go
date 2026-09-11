@@ -1055,6 +1055,40 @@ func TestTheTakedownJudgesAgainAfterAskingWhetherTheSocketIsThere(t *testing.T) 
 	}
 }
 
+// And a command with no deadline of its own is let go when the session is. Nothing above
+// bounds that wait: the command carries no expiry, and what it is waiting for is a close
+// handshake that whatever went wrong may never finish. Without this the goroutine holds a
+// session that is already gone.
+func TestACommandWithNoDeadlineIsLetGoWhenTheSessionCloses(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	closing := make(chan struct{})
+	defer close(closing)
+	session.mu.Lock()
+	session.resetting = closing
+	session.mu.Unlock()
+
+	refused := make(chan error, 1)
+	reached := make(chan struct{})
+	go func() {
+		close(reached)
+		refused <- session.startCommand(context.Background())
+	}()
+	<-reached
+	session.cancel()
+
+	select {
+	case err := <-refused:
+		if err == nil {
+			t.Fatal("a command began on a session that is closing, under a takedown nobody is " +
+				"left to finish")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a command with no deadline of its own waited on a session that had already closed")
+	}
+}
+
 // The unlink a `session.delete` sends is the sharpest case of all: it is a lifecycle
 // command, so it never passes through `Execute`, and cutting it off would have whatsmeow
 // resend the removal to WhatsApp. Driven rather than fenced, because this one cannot be
