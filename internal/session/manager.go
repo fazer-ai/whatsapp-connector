@@ -943,6 +943,66 @@ func (m *Manager) takeForDelete(ctx context.Context, delivery *transport.Deliver
 	}
 }
 
+// Resume asks this instance to take a session that should be running and put it back in
+// the air. It reports whether the request was queued, and does no I/O of its own: the
+// caller is a sweep, and the goroutine that carries this out is the one that answers
+// every wake.
+//
+// This is the connector starting a session nobody asked it to start in this moment, and
+// the licence for it is the record the client wrote when it asked for the connection.
+// Without it the account is paired, unowned and silent: a lease dies with the instance
+// that held it, a `session.wake` is a frame read once, and neither is a record of intent.
+// Measured in production as an inbox showing `open` and delivering nothing until somebody
+// opened it and pressed connect (fazer-ai/chatwoot#577).
+//
+// The connect is a real command on the session's own queue, synthesised here. Everything
+// a connect needs is then what it has always had -- the executor, the order, the engine's
+// own events -- and the one thing that differs is that nobody is waiting for it, which is
+// what `Internal` says.
+func (m *Manager) Resume(sid string) bool {
+	if sid == "" {
+		return false
+	}
+	m.mu.RLock()
+	_, running := m.sessions[sid]
+	m.mu.RUnlock()
+	if running {
+		// Already this instance's, and a connect offered to a session that is up would
+		// dial a socket that is already there. The sweep asks about accounts nobody runs.
+		return false
+	}
+	return !m.own(&transport.Delivery{
+		Command: protocol.Command{
+			V: protocol.Version, ID: m.newID(), Type: protocol.CommandSessionConnect, SID: sid,
+			Payload: json.RawMessage(`{"pairing":"resume"}`),
+		},
+		// Nothing to acknowledge and nothing to leave pending: this command is not an
+		// entry on a stream, so the only thing a refusal costs is a pass, and the next
+		// sweep asks again.
+		Ack:      func(context.Context) error { return nil },
+		Release:  func() {},
+		Internal: true,
+	}, m.reconnect)
+}
+
+// reconnect adopts an account that should be running and hands the synthesised connect to
+// it, on the goroutine that answers every wake.
+func (m *Manager) reconnect(ctx context.Context, delivery *transport.Delivery) {
+	sid := delivery.Command.SID
+	session, err := m.Adopt(ctx, sid)
+	if err != nil {
+		// Every reason to fail here is one a later pass may find gone: a peer that won
+		// the lease (the commonest, and the right outcome -- somebody is running it), an
+		// account this instance is handing back, a store that was away. Logged at debug
+		// because the ordinary case is a race the fleet is supposed to have.
+		m.log.Debug().Err(err).Str("sid", sid).Msg("could not take a session that should be running")
+		return
+	}
+	if session.Offer(delivery) != OfferAccepted {
+		m.log.Info().Str("sid", sid).Msg("a session that should be running had no room for the connect that would resume it")
+	}
+}
+
 func (m *Manager) pong(ctx context.Context, delivery *transport.Delivery) {
 	command := delivery.Command
 	if command.ReplyTo != "" {

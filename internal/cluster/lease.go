@@ -455,6 +455,46 @@ func (l *Leases) Release(ctx context.Context, sid string) (bool, error) {
 	return released == 1, nil
 }
 
+// Unleased keeps the sessions no instance holds a lease for, in the order they came in.
+//
+// One pipelined batch rather than a call per session, because the caller is a sweep over
+// everything a store says should be running: in a fleet of several instances most of that
+// list is somebody else's at any moment, and an acquisition per entry to find that out is
+// a Lua call per session per pass, on every instance.
+//
+// It is a filter and not a decision. A lease can be taken between this answer and the
+// acquisition that follows it, and the acquisition is what settles ownership; what this
+// removes is the traffic of asking for accounts that are plainly already running.
+func (l *Leases) Unleased(ctx context.Context, sids []string) ([]string, error) {
+	if len(sids) == 0 {
+		return nil, nil
+	}
+	keys := l.client.Keys()
+	pipeline := l.client.Pipeline()
+	held := make([]*redis.IntCmd, len(sids))
+	for i, sid := range sids {
+		held[i] = pipeline.Exists(ctx, keys.Lease(sid))
+	}
+	if _, err := pipeline.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+		return nil, fmt.Errorf("cluster: read the leases of %d sessions: %w", len(sids), err)
+	}
+
+	free := make([]string, 0, len(sids))
+	for i, sid := range sids {
+		count, err := held[i].Result()
+		if err != nil {
+			// One unreadable answer is not a reason to drop the whole pass, and it is not
+			// a reason to treat the account as free either: a session whose lease could
+			// not be read is one this sweep says nothing about.
+			continue
+		}
+		if count == 0 {
+			free = append(free, sid)
+		}
+	}
+	return free, nil
+}
+
 // Compared against the lease in one step, and that is the whole of why it is a script.
 // A local lease can have expired in Redis without this instance knowing -- that is what
 // the renew margin exists for -- and a bare DEL sent then deletes the counter of the

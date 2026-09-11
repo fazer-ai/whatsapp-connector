@@ -63,6 +63,17 @@ type Delivery struct {
 	// first is backpressure the caller acts on. Refusing the second retires the only copy
 	// of a command nobody ever ran and nobody hears about.
 	Redelivered bool
+	// Internal says this command came from the connector rather than from a client: the
+	// resume sweep synthesises a `session.connect` for an account whose owner went away,
+	// and nothing else does.
+	//
+	// What it changes is who is told when it fails. A command a client sent and is not
+	// waiting on is answered with `command.failed`, which is the only way its sender ever
+	// hears about it; one nobody sent has no sender, and publishing the event anyway
+	// would put a command id no client has ever seen on the stream. The engine's own
+	// events -- the connection state, the connect failure -- are what report a resume
+	// either way, and those are addressed to the session rather than to a command.
+	Internal bool
 }
 
 // CommandReader delivers the commands addressed to the sessions this instance owns,

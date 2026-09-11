@@ -899,6 +899,42 @@ func TestASocketThatComesBackAfterADisconnectIsClosedAgain(t *testing.T) {
 	}
 }
 
+// What the connector knows about an account after the instance running it is gone. A
+// lease dies with its holder and a wake is a frame read once, so without this a paired
+// account comes up unowned and stays down: the inbox shows `open` and nothing arrives,
+// which is what fazer-ai/chatwoot#577 measured on a live deployment.
+//
+// Written by the two commands that say it, in both directions, because the second one is
+// what keeps the recovery from undoing an operator: a session turned off has to stay off
+// across a restart, and a record that only ever says "connected" would dial it again.
+func TestTheConnectorRemembersWhichSessionsShouldBeConnected(t *testing.T) {
+	t.Parallel()
+
+	session, container := newTestSession(t, "5511999990001")
+
+	if err := session.Connect(t.Context(), engine.ConnectRequest{Pairing: "resume"}); err != nil {
+		t.Fatalf("resuming a paired session: %v", err)
+	}
+	wanted, err := container.Wanted(t.Context())
+	if err != nil {
+		t.Fatalf("Wanted: %v", err)
+	}
+	if len(wanted) != 1 || wanted[0] != session.sid {
+		t.Fatalf("after a connect the store wants %v, want just %s: nothing would bring this account back", wanted, session.sid)
+	}
+
+	if err := session.Disconnect(t.Context()); err != nil {
+		t.Fatalf("Disconnect: %v", err)
+	}
+	wanted, err = container.Wanted(t.Context())
+	if err != nil {
+		t.Fatalf("Wanted: %v", err)
+	}
+	if len(wanted) != 0 {
+		t.Fatalf("after a disconnect the store still wants %v; a sweep would dial the socket the operator just closed", wanted)
+	}
+}
+
 // A reconnect already under way is not a reason to start a second one: dialling
 // alongside whatsmeow's retry loses the race about half the time and answers the caller
 // with ErrAlreadyConnected for a socket that was recovering perfectly well.

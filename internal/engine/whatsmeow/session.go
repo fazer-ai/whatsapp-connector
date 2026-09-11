@@ -1172,6 +1172,21 @@ func (s *Session) Connect(ctx context.Context, req engine.ConnectRequest) error 
 	// next connect that happened to succeed.
 	s.setGroups(req.Groups)
 
+	// Recorded at the same point and for the same reason: this is where the request stops
+	// being one the session might refuse. It is what makes the account survive the
+	// instance running it -- a lease dies with its holder and a wake is a frame read once,
+	// so without this there is nothing anywhere that says a paired, unowned account should
+	// be in the air, and it stays down until somebody opens the inbox and asks again.
+	//
+	// Logged rather than returned. The connection is what the client asked for and it is
+	// happening; a memory that could not be written is a session that will not be brought
+	// back by itself later, which is worse than it was but not a reason to refuse what is
+	// working now. The next connect writes it again.
+	if err := s.store.PutDesired(ctx, store.DesiredConnected); err != nil {
+		s.log.Warn().Err(err).Str("sid", s.sid).
+			Msg("could not record that this session should be connected; it will not be resumed on its own")
+	}
+
 	// Waited for before the guard comes down, and before anything is dialled. A
 	// disconnect that outlived its command is still going to close the socket, and a
 	// connect answered `open` in between is one the older command then closes underneath:
@@ -1587,6 +1602,17 @@ func (s *Session) pairWithCode(ctx context.Context, rawPhone, standing string) e
 // Disconnect drops the socket and keeps the credentials.
 func (s *Session) Disconnect(ctx context.Context) error {
 	s.cancelPairing()
+	// Before the socket goes down, because what this records is the answer to "should
+	// anything bring it back": written after, an instance that died in between would
+	// leave an account the operator turned off looking like one that should be resumed.
+	//
+	// Logged rather than returned, like the one in Connect: the disconnect is what was
+	// asked for and it is going to happen either way. What a failure here costs is a
+	// session the resume sweep may bring back, which the next disconnect corrects.
+	if err := s.store.PutDesired(ctx, store.DesiredDisconnected); err != nil {
+		s.log.Warn().Err(err).Str("sid", s.sid).
+			Msg("could not record that this session was asked to stay down; a sweep may bring it back")
+	}
 	return s.hangUp(ctx, s.current())
 }
 

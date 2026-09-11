@@ -748,7 +748,7 @@ func (s *Session) run(ctx context.Context, delivery *transport.Delivery) {
 	// standing. The command is neither retired nor retried until the process restarts.
 	retire, cancel := context.WithTimeout(context.WithoutCancel(ctx), ackTimeout)
 	defer cancel()
-	s.answer(retire, &command, result, err)
+	s.answer(retire, &command, delivery.Internal, result, err)
 	if ackErr := delivery.Ack(retire); ackErr != nil {
 		log.Error().Err(ackErr).Msg("failed to acknowledge a command")
 	}
@@ -1001,7 +1001,7 @@ func (s *Session) tearDown(ctx context.Context) error {
 // answer replies to an RPC command, and publishes a `command.failed` event for a
 // fire-and-forget one that failed: nobody is blocked on it, so a failure with no event
 // would be a command that silently did nothing.
-func (s *Session) answer(ctx context.Context, command *protocol.Command, result json.RawMessage, err error) {
+func (s *Session) answer(ctx context.Context, command *protocol.Command, internal bool, result json.RawMessage, err error) {
 	if command.ReplyTo != "" {
 		s.reply(ctx, command, result, err)
 		return
@@ -1011,6 +1011,13 @@ func (s *Session) answer(ctx context.Context, command *protocol.Command, result 
 	}
 	failure := asProtocolError(err)
 	s.logFailure(command, failure, err)
+	if internal {
+		// Nobody sent it, so there is nobody to tell. The event names the command it is
+		// about, and a client reading one for an id it never wrote learns that something
+		// it does not know about failed. What a resume that failed publishes instead is
+		// what the engine publishes for any connect that failed, addressed to the session.
+		return
+	}
 	_ = s.publish(ctx, &engine.Emission{
 		Type: protocol.EventCommandFailed,
 		// `command_type`, which is what the schema requires and the fixture carries. It

@@ -108,6 +108,10 @@ func (k Keys) Handoff(sid string) string { return k.prefix + "handoff:" + sid }
 // account is owned by nobody with the one wake that would have started it retired.
 func (k Keys) HandBack(sid string) string { return k.prefix + "handback:" + sid }
 
+// Resume is the cool-off that follows an attempt to bring a session back, so the fleet
+// asks about one account at most once per window rather than once per instance per pass.
+func (k Keys) Resume(sid string) string { return k.prefix + "resume:" + sid }
+
 // Quarantine holds a session that keeps failing to connect.
 func (k Keys) Quarantine(sid string) string { return k.prefix + "quarantine:" + sid }
 
