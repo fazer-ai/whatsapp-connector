@@ -30,6 +30,19 @@ type Event struct {
 
 // Command is one entry of wa:cmd:<sid> (or of wa:control for the session-agnostic
 // ones): something a client asks the session owner to do.
+//
+// Deadline and MaxRuntimeMs are two different requests, and the reason both exist is that
+// one field answering both questions could not express what a teardown needs. Deadline is
+// an instant and says "do not start this after that moment": a command reaching its owner
+// late is dropped, unrun, with `expired`. MaxRuntimeMs is a duration and says "do not let
+// this run longer than that once it has started", and says nothing about arriving late.
+//
+// A `session.logout` that is dropped for being late is a device left linked on somebody's
+// phone with nothing saying so, so a client cannot set the first; one that parks on a
+// socket write holds every command for that account behind it, so it badly wants the
+// second. With one field it had to choose, and chose neither.
+//
+// A command carrying both gets whichever runs out first.
 type Command struct {
 	V              int             `json:"v"`
 	ID             string          `json:"id"`
@@ -38,6 +51,7 @@ type Command struct {
 	TS             int64           `json:"ts"`
 	ReplyTo        string          `json:"reply_to,omitempty"`
 	Deadline       int64           `json:"deadline,omitempty"`
+	MaxRuntimeMs   int64           `json:"max_runtime_ms,omitempty"`
 	IdempotencyKey string          `json:"idempotency_key,omitempty"`
 	Payload        json.RawMessage `json:"payload"`
 }
@@ -157,6 +171,9 @@ func (c *Command) Fields() (map[string]string, error) {
 	if c.Deadline != 0 {
 		fields["deadline"] = strconv.FormatInt(c.Deadline, 10)
 	}
+	if c.MaxRuntimeMs != 0 {
+		fields["max_runtime_ms"] = strconv.FormatInt(c.MaxRuntimeMs, 10)
+	}
 	if c.IdempotencyKey != "" {
 		fields["idempotency_key"] = c.IdempotencyKey
 	}
@@ -178,6 +195,11 @@ func ParseCommand(fields map[string]string) (Command, error) {
 	}
 	if raw, ok := fields["deadline"]; ok && raw != "" {
 		if c.Deadline, err = int64Field(fields, "deadline"); err != nil {
+			return Command{}, err
+		}
+	}
+	if raw, ok := fields["max_runtime_ms"]; ok && raw != "" {
+		if c.MaxRuntimeMs, err = int64Field(fields, "max_runtime_ms"); err != nil {
 			return Command{}, err
 		}
 	}

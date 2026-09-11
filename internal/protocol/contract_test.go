@@ -165,6 +165,25 @@ func TestACommandFixtureCarriesADeadlineWithNoReplyTo(t *testing.T) {
 	t.Fatal("no command fixture carries a deadline without a reply_to, so the contract has no example of a caller that bounds a command it is not waiting on")
 }
 
+// The other ceiling has to have an example too, and it is the one a reader is most
+// likely to get wrong: `max_runtime_ms` without a `deadline` is a caller saying "stop this
+// if it hangs" without saying "throw it away if it arrives late", which is exactly what a
+// teardown needs and what one field could not express. Without a fixture carrying it, the
+// distinction is a paragraph nobody has to keep true.
+func TestACommandFixtureCarriesARuntimeCeilingWithNoDeadline(t *testing.T) {
+	for name, fixture := range fixtures(t, "command") {
+		frame, ok := fixture.(map[string]any)
+		if !ok {
+			t.Fatalf("command fixture %s is not an object", name)
+		}
+		_, hasDeadline := frame["deadline"]
+		if _, hasCeiling := frame["max_runtime_ms"]; hasCeiling && !hasDeadline {
+			return
+		}
+	}
+	t.Fatal("no command fixture bounds how long it may run without also allowing itself to be dropped for arriving late")
+}
+
 // The Makefile's contract target has to run this whole package. A -run filter there is
 // a list somebody has to remember to extend, and the one that shipped forgot exactly the
 // tests that decide what a fixture may look like: the RPC classification and both enum

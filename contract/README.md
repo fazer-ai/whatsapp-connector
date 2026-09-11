@@ -22,8 +22,21 @@ pinned by `CONTRACT_REF`. CI on both sides fails when the copies drift.
 ## Transport
 
 Frames travel as Redis stream entries. Every stream field is a string on the wire;
-the schema describes the **decoded** frame, where `v`, `epoch`, `seq`, `ts` and
-`deadline` are integers and `payload` is an object (transported JSON-encoded).
+the schema describes the **decoded** frame, where `v`, `epoch`, `seq`, `ts`,
+`deadline` and `max_runtime_ms` are integers and `payload` is an object (transported
+JSON-encoded).
+
+**A command carries two different ceilings, and they answer different questions.**
+`deadline` is an instant and says *do not start this after that moment*: a command that
+reaches its owner late is dropped unrun, answered `expired`. `max_runtime_ms` is a
+duration, measured from the moment the work begins, and says *do not let this run longer
+than that*; it says nothing about arriving late. A command carrying both gets whichever
+runs out first, and one carrying neither has no ceiling at all.
+
+The distinction exists because a teardown needs one without the other: a `session.logout`
+dropped for arriving late is a device left linked on somebody's phone with nothing saying
+so, while the same command parked on a socket write holds every other command for that
+account behind it. With one field a client had to choose, and chose neither.
 
 | Stream / key | Direction | Frame |
 |---|---|---|
