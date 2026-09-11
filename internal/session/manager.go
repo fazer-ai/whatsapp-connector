@@ -923,12 +923,23 @@ func (m *Manager) takeForDelete(ctx context.Context, delivery *transport.Deliver
 		return
 	}
 
-	if session.Offer(delivery) != OfferAccepted {
-		// Busy or stopping, and neither is this command's to answer: the session that
-		// refused it is the one that would have carried it out. Released, so whoever runs
-		// the account next -- this instance once the queue drains, or a peer -- finds a
-		// teardown that has never been acknowledged.
+	switch session.Offer(delivery) {
+	case OfferAccepted:
+	case OfferStopped:
+		// The session is on its way out, so this instance is about to stop being the
+		// owner: the teardown stays pending for whoever takes the account next. Released
+		// rather than given back, because marking would schedule a drain of a stream this
+		// instance is giving up and take it from under the owner taking it over.
 		release(delivery)
+	default:
+		// The queue is full, which for a session adopted a moment ago means a client that
+		// had already filled it. Given back rather than released, so that nothing newer
+		// for this account overtakes the teardown: a delete published to `wa:cmd:<sid>`
+		// is on a stream this instance reads, and the mark is what keeps the next command
+		// it accepts from being read ahead of this one. It costs a drain of that stream
+		// for a delete that arrived on the control stream, which is a pass over entries
+		// this instance owns either way.
+		m.GiveBack(delivery)
 	}
 }
 

@@ -3419,3 +3419,52 @@ func TestADeleteForAnAccountAPeerRunsIsLeftForTheOwner(t *testing.T) {
 		t.Fatal("the account was torn down from an instance that does not hold its lease, under a live socket")
 	}
 }
+
+// A teardown offered to a session that is stopping is left pending, and left without a
+// mark. The mark schedules a drain, and the drain claims the session's stream with no
+// minimum idle time -- so an account this instance is giving up would have its stream
+// taken from under the owner taking it over, with the entries handed back at age zero.
+//
+// It is the same rule Dispatch keeps for every other command, and the delete has its own
+// route to the session, so nothing else holds it on this path.
+func TestATeardownRefusedByAStoppingSessionIsLeftWithoutAMark(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+
+	manager := NewManager(&ManagerConfig{
+		Instance: "inst-a", Engine: fake.New(),
+		Leases:    cluster.NewLeases(client, "inst-a", cluster.Options{}),
+		Publisher: quietPublisher{}, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	ctx := context.Background()
+	t.Cleanup(func() { manager.StopAll(ctx) })
+
+	const sid = "9c2b7d1e-0000-4000-8000-0000000000d3"
+	session, err := manager.Adopt(ctx, sid)
+	if err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	// The mark adoption leaves is not what this is about.
+	manager.TakeNewlyAdopted()
+	session.Stop()
+
+	var given bool
+	manager.takeForDelete(ctx, &transport.Delivery{
+		Command: protocol.Command{V: protocol.Version, ID: "c1", Type: protocol.CommandSessionDelete, SID: sid},
+		Ack:     func(context.Context) error { t.Error("a teardown nobody carried out was retired"); return nil },
+		Release: func() { given = true },
+		Forfeit: func() { given = true },
+	})
+
+	if !given {
+		t.Fatal("the teardown was neither carried out nor left pending, so the account is never torn down at all")
+	}
+	if marked := manager.TakeNewlyAdopted(); len(marked) != 0 {
+		t.Fatalf("a session on its way out was marked for a drain (%v); the drain claims its stream from under the instance taking the account over", marked)
+	}
+}
