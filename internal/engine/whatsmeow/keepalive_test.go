@@ -455,6 +455,34 @@ func waitFor(t *testing.T, done func() bool, complaint string) {
 	t.Fatal(complaint)
 }
 
+// And it waits for the last of them, not the first. The session runs its commands one at a
+// time, but the count is what says the socket is clear, and releasing it early is the same
+// resend under a different command.
+func TestTheOwedTakeDownWaitsForTheLastCommandOut(t *testing.T) {
+	t.Parallel()
+
+	session, written := newLoggedTestSession(t, "5511999990001")
+	session.relearn(session.current())
+	dialedAndConnected(session)
+
+	session.startCommand()
+	session.startCommand()
+	session.handle(&waEvents.KeepAliveTimeout{ErrorCount: 2, LastSuccess: time.Now()})
+	next(t, session)
+
+	session.endCommand()
+	session.mu.Lock()
+	owed := session.owed
+	session.mu.Unlock()
+	if owed == nil {
+		t.Fatalf("the takedown was released with a command still waiting on WhatsApp: %q", written.String())
+	}
+
+	session.endCommand()
+	waitFor(t, func() bool { return strings.Contains(written.String(), "already gone") },
+		"the takedown owed to the answered commands never ran")
+}
+
 // And what counts a command as being in flight is `Execute` itself, for the whole of it.
 // Read off the source because every command a test can run here answers from memory, so the
 // count is back to zero before anything could look at it.
