@@ -38,6 +38,14 @@ dropped for arriving late is a device left linked on somebody's phone with nothi
 so, while the same command parked on a socket write holds every other command for that
 account behind it. With one field a client had to choose, and chose neither.
 
+**Both ceilings bound the wait on WhatsApp, not the bookkeeping that follows it.** Once a
+teardown's unlink has been answered, the connector finishes deleting the credentials, the
+device mapping and the session's epoch counter on a bound of its own, and a ceiling that
+ran out during the unlink does not cancel any of it: an account whose remote half is gone
+and whose local half survived is one the connector would go on adopting and resuming over
+credentials WhatsApp has already revoked. So a client may set the ceiling to how long it
+is willing to wait for an answer, not to how long the teardown is allowed to take in all.
+
 | Stream / key | Direction | Frame |
 |---|---|---|
 | `wa:events:<shard>` | connector → client | `event` |

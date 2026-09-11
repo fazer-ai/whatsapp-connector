@@ -2427,6 +2427,48 @@ func TestADeleteTearsTheAccountDownAndHandsTheLeaseBack(t *testing.T) {
 	})
 }
 
+// The last write of a teardown is the epoch counter, and by then the command's ceiling is
+// usually gone: the unlink is what spends it, since the socket is normally already down
+// by the time a client destroys the inbox. Left on the command's own context, the drop
+// would be skipped on exactly the sessions that took longest to delete -- and the counter
+// is a fencing token, so what stays behind out-ranks the account paired next on the same
+// number and has a client drop its events.
+func TestATeardownDropsTheEpochEvenWhenTheCeilingRanOut(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	ctx := context.Background()
+	if _, err := h.manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, _ := h.engine.Session("s1")
+	// Longer than the ceiling below, so the context is over by the time the teardown
+	// reaches anything the connector still owes itself.
+	engineSession.OnDelete(func() { time.Sleep(50 * time.Millisecond) })
+
+	del := &protocol.Command{
+		V: protocol.Version, ID: "c1", Type: protocol.CommandSessionDelete, SID: "s1",
+		Payload: json.RawMessage(`{}`), MaxRuntimeMs: 1,
+	}
+	var acked atomic.Bool
+	h.manager.Dispatch(delivery(del, &acked))
+	waitFor(t, "the delete to be retired", acked.Load)
+	waitFor(t, "the lease of a deleted account to go back", func() bool {
+		h.manager.SweepRetired(ctx, time.Now().Add(time.Second))
+		_, owned := h.leases.Owned("s1")
+		return !owned
+	})
+
+	if _, err := h.manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt after the teardown: %v", err)
+	}
+	lease, owned := h.leases.Owned("s1")
+	if !owned || lease.Epoch != 1 {
+		t.Fatalf("the number paired next starts at epoch %d (owned=%v), want 1; the counter of the account that was deleted outlived it",
+			lease.Epoch, owned)
+	}
+}
+
 // A teardown that failed deleted nothing: the account is still addressable and the
 // client has to hear about it. `session.delete` is fire-and-forget, so nobody is
 // blocked on a reply and the only way to say so is the event -- and the event has to
