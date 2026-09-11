@@ -291,6 +291,10 @@ type Session struct {
 	// somebody adds. `setConnected` and `offline` are the two functions that own the
 	// flag, and every one of those paths goes through one of them.
 	transitions atomic.Int64
+	// connectedAt is when the socket this session is on came up, which is what tells a
+	// keepalive timeout about the current connection from one about a connection that is
+	// already gone. Written under mu beside `connected`, by the same two functions.
+	connectedAt time.Time
 
 	// awaited holds the messages that arrived unreadable and have not been given up on
 	// yet, so the one that arrives afterwards under the same id can call the placeholder
@@ -803,6 +807,7 @@ func (s *Session) setConnected(connected bool) {
 	s.dialing = false
 	if connected {
 		s.reconnecting = false
+		s.connectedAt = time.Now()
 		// A new socket is a new answer about every group. What was remembered outlives a
 		// disconnection, and so does whatsmeow's own cache of the same groups -- which
 		// nothing clears on connect and which `sendGroup` encrypts to, member list and
@@ -854,6 +859,16 @@ func (s *Session) connection() (int64, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.transitions.Load(), s.connected
+}
+
+// connectedSince is when the current socket came up, and the zero time when none is.
+func (s *Session) connectedSince() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.connected {
+		return time.Time{}
+	}
+	return s.connectedAt
 }
 
 // learned is the moment an event says the session found out about the thing it reports,
@@ -3164,12 +3179,26 @@ func (s *Session) handle(rawEvent any) bool {
 		// query is answered with a disconnect node and whatsmeow resends the same frame
 		// under the same id once the socket is back. Deciding a write failed is what
 		// invariant 5 forbids, and nothing here decides that.
-		if keepAliveIsLost(event) {
-			s.log.Warn().Int("missed", event.ErrorCount).
-				Time("last_answered", event.LastSuccess).
-				Msg("no keepalive answered on an open socket; taking it down rather than waiting")
-			s.current().ResetConnection()
+		if !keepAliveIsLost(event) {
+			return true
 		}
+		if keepAliveIsStale(s.connectedSince(), event) {
+			// A timeout about a connection that is already gone, dispatched from a
+			// goroutine of its own and arriving after the socket it is about was
+			// replaced. Acting on it would take down the healthy one that took its place.
+			return true
+		}
+		s.log.Warn().Int("missed", event.ErrorCount).
+			Time("last_answered", event.LastSuccess).
+			Msg("no keepalive answered on an open socket; taking it down rather than waiting")
+		// The state goes first, and the order is the point. ResetConnection blocks on the
+		// close handshake while holding whatsmeow's socket lock, and the Disconnected it
+		// leads to is dispatched only after that returns -- so a session that waited for
+		// the event would spend those seconds still reporting `open`, accepting commands
+		// into the very lock the close is holding.
+		s.setConnected(false)
+		s.setReconnecting(true)
+		s.current().ResetConnection()
 	case *waEvents.Disconnected:
 		s.transition.Lock()
 		defer s.transition.Unlock()
