@@ -137,6 +137,58 @@ func TestReplyToMatchesRPCClassification(t *testing.T) {
 	}
 }
 
+// The Makefile's contract target has to run this whole package. A -run filter there is
+// a list somebody has to remember to extend, and the one that shipped forgot exactly the
+// tests that decide what a fixture may look like: the RPC classification and both enum
+// checks were outside it, so a fixture that broke them left `make contract` green. The
+// CLAUDE.md presents that target as "Contract only", which is where the confidence comes
+// from.
+func TestTheContractTargetRunsThisWholePackage(t *testing.T) {
+	recipe := makefileRecipe(t, "contract")
+	if strings.Contains(recipe, "-run") {
+		t.Fatalf("the contract target filters which tests it runs (%q), so a contract test outside the filter answers green when it is red", recipe)
+	}
+	if !strings.Contains(recipe, "./internal/protocol") {
+		t.Fatalf("the contract target does not run this package (%q)", recipe)
+	}
+}
+
+// makefileRecipe returns the command lines of one target, without the leading tabs.
+func makefileRecipe(t *testing.T, target string) string {
+	t.Helper()
+
+	raw, err := os.ReadFile(filepath.Join("..", "..", "Makefile"))
+	if err != nil {
+		t.Fatalf("read the Makefile: %v", err)
+	}
+	var recipe []string
+	inside := false
+	for _, line := range strings.Split(string(raw), "\n") {
+		if strings.HasPrefix(line, target+":") {
+			inside = true
+			continue
+		}
+		if !inside {
+			continue
+		}
+		if strings.HasPrefix(line, "\t") {
+			recipe = append(recipe, strings.TrimPrefix(line, "\t"))
+			continue
+		}
+		// A conditional inside the recipe is still part of it; anything else at column
+		// zero has ended the target.
+		if trimmed := strings.TrimSpace(line); trimmed == "" || strings.HasPrefix(trimmed, "ifndef") ||
+			strings.HasPrefix(trimmed, "endif") || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		break
+	}
+	if len(recipe) == 0 {
+		t.Fatalf("the Makefile has no recipe for %s", target)
+	}
+	return strings.Join(recipe, "\n")
+}
+
 func TestErrorCodesMatchSchema(t *testing.T) {
 	var document struct {
 		Definitions struct {
