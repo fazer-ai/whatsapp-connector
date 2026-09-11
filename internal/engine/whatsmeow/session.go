@@ -795,6 +795,16 @@ func (s *Session) identity() (phone, lid string) {
 func (s *Session) setDialing(dialing bool) {
 	s.mu.Lock()
 	s.dialing = dialing
+	if dialing {
+		// Dated from the attempt and not from the authentication that follows it. What
+		// this stamp is compared against is whatsmeow's keepalive clock, and that starts
+		// with the socket: its loop dates its first "last answered" from the moment the
+		// connection is up, while `Connected` waits for prekeys and the passive switch
+		// after it. A stamp taken there can be seconds or tens of seconds later than the
+		// clock it is compared against, and every timeout on that socket would then read
+		// as one about an older connection.
+		s.connectedAt = time.Now()
+	}
 	s.mu.Unlock()
 }
 
@@ -807,7 +817,6 @@ func (s *Session) setConnected(connected bool) {
 	s.dialing = false
 	if connected {
 		s.reconnecting = false
-		s.connectedAt = time.Now()
 		// A new socket is a new answer about every group. What was remembered outlives a
 		// disconnection, and so does whatsmeow's own cache of the same groups -- which
 		// nothing clears on connect and which `sendGroup` encrypts to, member list and
@@ -861,7 +870,8 @@ func (s *Session) connection() (int64, bool) {
 	return s.transitions.Load(), s.connected
 }
 
-// connectedSince is when the current socket came up, and the zero time when none is.
+// connectedSince is when the attempt behind the current socket started, and the zero time
+// when the session is not on one.
 func (s *Session) connectedSince() time.Time {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -3182,6 +3192,13 @@ func (s *Session) handle(rawEvent any) bool {
 		if !keepAliveIsLost(event) {
 			return true
 		}
+		// Taken for the same reason every other arm here takes it: what follows reads the
+		// connection and then acts on it, and a hand-back or a reconnect settling in
+		// between would leave this publishing `reconnecting` over a session that is
+		// closing, or resetting a socket that replaced the one these pings were about.
+		s.transition.Lock()
+		defer s.transition.Unlock()
+
 		if keepAliveIsStale(s.connectedSince(), event) {
 			// A timeout about a connection that is already gone, dispatched from a
 			// goroutine of its own and arriving after the socket it is about was
@@ -3198,6 +3215,11 @@ func (s *Session) handle(rawEvent any) bool {
 		// into the very lock the close is holding.
 		s.setConnected(false)
 		s.setReconnecting(true)
+		// Published here, and not left to the `Disconnected` this leads to: the setters
+		// above move only what this process reads, and the client reads the event stream.
+		// A session whose commands are already being refused while its last published
+		// state says `open` is one the client has no way to make sense of.
+		s.emit(protocol.EventSessionState, map[string]any{"state": "reconnecting", "reason": "keepalive"})
 		s.current().ResetConnection()
 	case *waEvents.Disconnected:
 		s.transition.Lock()

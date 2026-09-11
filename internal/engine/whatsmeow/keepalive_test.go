@@ -40,7 +40,7 @@ func TestOneMissedKeepAliveLeavesTheSocketAlone(t *testing.T) {
 	session, _ := newTestSession(t, "5511999990001")
 	var written bytes.Buffer
 	session.log = zerolog.New(&written)
-	session.setConnected(true)
+	dialedAndConnected(session)
 
 	// The last answered ping is dated inside this connection, which is what a timeout
 	// about it looks like. The stamp it is compared against is the one `setConnected`
@@ -64,7 +64,7 @@ func TestAKeepAliveTimeoutFromAReplacedSocketIsIgnored(t *testing.T) {
 	session, _ := newTestSession(t, "5511999990001")
 	var written bytes.Buffer
 	session.log = zerolog.New(&written)
-	session.setConnected(true)
+	dialedAndConnected(session)
 
 	// The run of failed pings belongs to a connection that ended before this one began.
 	session.handle(&waEvents.KeepAliveTimeout{ErrorCount: 2, LastSuccess: time.Now().Add(-5 * time.Minute)})
@@ -101,7 +101,7 @@ func TestTheSecondMissedKeepAliveIsActedOn(t *testing.T) {
 	session, _ := newTestSession(t, "5511999990001")
 	var written bytes.Buffer
 	session.log = zerolog.New(&written)
-	session.setConnected(true)
+	dialedAndConnected(session)
 
 	session.handle(&waEvents.KeepAliveTimeout{ErrorCount: 2, LastSuccess: time.Now()})
 
@@ -182,4 +182,33 @@ func TestTheKeepAliveHandlerPublishesBeforeItCloses(t *testing.T) {
 		t.Fatalf("the keepalive handler closes the socket before saying so, so `readyToSend` accepts "+
 			"commands into the lock the close is holding:\n%s", handler)
 	}
+}
+
+// The stamp the staleness check reads has to start with the socket, not with the
+// authentication that follows it: whatsmeow's keepalive clock starts its first "last
+// answered" when the connection is up, while `Connected` waits for prekeys and the passive
+// switch. A stamp taken there is later than the clock it is compared against, and on a
+// socket that took its time answering every timeout would read as one about an older
+// connection -- which is the quiet socket this change exists to take down, left up.
+func TestTheConnectionIsStampedWhenItIsDialledAndNotWhenItIsAnnounced(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+
+	session.setDialing(true)
+	afterTheDialStarted := time.Now()
+	session.setConnected(true)
+
+	if !session.connectedSince().Before(afterTheDialStarted) {
+		t.Fatal("the connection is stamped when it is announced rather than when it is dialled, " +
+			"so every keepalive timeout on a socket slow to answer reads as stale and the socket stays up")
+	}
+}
+
+// dialedAndConnected puts a session on a socket the way a real one gets there: the attempt
+// first, which is what whatsmeow's keepalive clock starts with, and the authentication
+// after it.
+func dialedAndConnected(session *Session) {
+	session.setDialing(true)
+	session.setConnected(true)
 }
