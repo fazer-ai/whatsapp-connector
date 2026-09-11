@@ -2,13 +2,17 @@ package whatsmeow
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/rs/zerolog"
+
 	waEvents "go.mau.fi/whatsmeow/types/events"
+
+	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 )
 
 // The count is what the rule is about, so it is asked directly rather than through a
@@ -111,6 +115,20 @@ func TestTheSecondMissedKeepAliveIsActedOn(t *testing.T) {
 	if got := session.state(); got != "reconnecting" {
 		t.Fatalf("the session reports %q while taking its own socket down, so readyToSend still accepts", got)
 	}
+	// The client reads the event stream and nothing else: an in-memory flag it cannot see
+	// is a session that refuses its commands while its last published state says `open`.
+	emission := next(t, session)
+	if emission.Type != protocol.EventSessionState {
+		t.Fatalf("the session published %s while taking its socket down", emission.Type)
+	}
+	var published map[string]any
+	if err := json.Unmarshal(emission.Payload, &published); err != nil {
+		t.Fatalf("the session published something unreadable: %v", err)
+	}
+	if state := published["state"]; state != "reconnecting" {
+		t.Fatalf("the session published state=%v while taking its socket down", state)
+	}
+
 	out := written.String()
 	if !strings.Contains(out, "taking it down") {
 		t.Fatalf("the second missed keepalive was waited out instead: %q", out)
@@ -202,6 +220,20 @@ func TestTheConnectionIsStampedWhenItIsDialledAndNotWhenItIsAnnounced(t *testing
 	if !session.connectedSince().Before(afterTheDialStarted) {
 		t.Fatal("the connection is stamped when it is announced rather than when it is dialled, " +
 			"so every keepalive timeout on a socket slow to answer reads as stale and the socket stays up")
+	}
+}
+
+// Every other arm of the event switch that moves the connection takes this, and this one
+// reads the connection and then acts on it: a hand-back or a reconnect settling in between
+// leaves it publishing `reconnecting` over a session that is closing, or resetting a socket
+// that replaced the one these pings were about. Read off the source because a lock held
+// correctly and a lock not taken at all look the same from a single goroutine.
+func TestTheKeepAliveHandlerSerialisesWithTheOtherTransitions(t *testing.T) {
+	t.Parallel()
+
+	handler := theCaseFor(t, "*waEvents.KeepAliveTimeout")
+	if !strings.Contains(handler, "s.transition.Lock()") {
+		t.Fatalf("the keepalive handler does not serialise with the other connection transitions:\n%s", handler)
 	}
 }
 
