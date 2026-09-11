@@ -427,6 +427,9 @@ type Session struct {
 	// owed is a socket takedown the keepalive handler decided on and could not perform,
 	// because of the above. It runs when the command in flight is answered.
 	owed *owedReset
+	// Open while a takedown is closing the socket, and nil otherwise. `startCommand` waits
+	// on it so that no command begins under a socket that is going down.
+	resetting chan struct{}
 	// dropAnnounced is a drop this session brought on itself and has already published. Put
 	// up by the handler that causes the reset, taken down by the next `Disconnected` or by
 	// the reset itself when it finds nothing to take down.
@@ -1961,10 +1964,30 @@ type owedReset struct {
 	judged int64
 }
 
+// startCommand counts a command as being in flight, and waits for a takedown that has
+// already claimed the socket rather than joining it.
+//
+// The wait is what closes the other half of the guard. A takedown only claims when nothing
+// is running, and it holds the claim for the close handshake alone; what would arrive in
+// that window is a lifecycle command, the one kind that does not pass `readyToSend`, and
+// letting it start would put a removal IQ on a socket that is being closed underneath it.
+// Whatsmeow resends that frame once the connection is back and WhatsApp applies it twice.
+//
+// So a command that lands there pays the close handshake and is then refused by the state
+// the takedown published before it began. Every command that does not land in that window
+// is still refused in microseconds, which is the whole point of publishing first.
 func (s *Session) startCommand() {
-	s.mu.Lock()
-	s.running++
-	s.mu.Unlock()
+	for {
+		s.mu.Lock()
+		closing := s.resetting
+		if closing == nil {
+			s.running++
+			s.mu.Unlock()
+			return
+		}
+		s.mu.Unlock()
+		<-closing
+	}
 }
 
 // endCommand releases the takedown the keepalive handler left waiting, if this was the
@@ -2047,15 +2070,41 @@ func (s *Session) resetUnlessReplaced(client *wm.Client, judged int64) {
 		s.log.Info().Msg("the mute socket was already gone before it could be taken down")
 		return
 	}
-	// Asked again, because of what the answer above cost to get. That read waits on
-	// whatsmeow's socket lock and a redial holds it for the length of an attempt, so a
-	// `true` returned at the end of one is about the socket that replaced the mute one,
-	// not about the mute one. A connection that landed during the wait is one this session
-	// has counted by now, and this is the cheapest place to notice.
+	// Judged again, and this time the going-ahead is claimed in the same breath. Both
+	// readings above are stale by now: getting an answer out of `IsConnected` waits on
+	// whatsmeow's socket lock, which a redial holds for a whole attempt, so a `true`
+	// returned at the end of one describes the socket that replaced the mute one. And the
+	// count of commands is read on one goroutine while the executor starts them on
+	// another: between reading nought and closing the socket, a `Logout` or a `Delete` can
+	// put its removal IQ on the wire. Those two do not pass `readyToSend` -- they are how
+	// a session is ended, not a request about a live one -- so nothing else refuses them
+	// here, and an IQ cut off mid-flight is resent by whatsmeow and applied twice, which is
+	// the invariant this whole guard exists for.
+	s.mu.Lock()
 	if s.transitions.Load() != judged {
+		s.mu.Unlock()
 		s.log.Info().Msg("a connection landed while the mute socket was being checked; leaving it alone")
 		return
 	}
+	if s.running > 0 {
+		s.owed = &owedReset{client: client, judged: judged}
+		s.mu.Unlock()
+		s.log.Info().Msg("a command started while the mute socket was being checked; waiting for its answer")
+		return
+	}
+	// Claimed, not just checked: `startCommand` waits on this, so no command can begin
+	// between here and the socket being closed. Released before the channel is closed, so
+	// a waiter that wakes finds the claim already gone.
+	closing := make(chan struct{})
+	s.resetting = closing
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.resetting = nil
+		s.mu.Unlock()
+		close(closing)
+	}()
+
 	client.ResetConnection()
 }
 

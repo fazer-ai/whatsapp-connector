@@ -926,6 +926,77 @@ func TestTheTakedownIsJudgedByTheGenerationItsOwnTransitionWrote(t *testing.T) {
 	}
 }
 
+// And no command begins while a takedown is closing the socket. The takedown only claims
+// when nothing is running, and what would arrive in that window is a lifecycle command --
+// the one kind that does not pass `readyToSend` -- putting a removal IQ on a socket that is
+// going down underneath it, which whatsmeow resends once the connection is back and
+// WhatsApp applies twice.
+func TestNoCommandBeginsWhileATakedownIsClosingTheSocket(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	closing := make(chan struct{})
+	session.mu.Lock()
+	session.resetting = closing
+	session.mu.Unlock()
+
+	reached, started := make(chan struct{}), make(chan struct{})
+	go func() {
+		close(reached)
+		session.startCommand()
+		close(started)
+	}()
+
+	// The goroutine is running before anything is concluded from its silence, so what the
+	// window below measures is a command held back and not a goroutine never scheduled.
+	<-reached
+	for range 1000 {
+		runtime.Gosched()
+	}
+	select {
+	case <-started:
+		t.Fatal("a command began while a takedown was closing the socket, so its removal IQ can " +
+			"be cut off mid-flight and resent once the connection is back")
+	default:
+	}
+
+	session.mu.Lock()
+	session.resetting = nil
+	session.mu.Unlock()
+	close(closing)
+
+	waitFor(t, func() bool {
+		select {
+		case <-started:
+			return true
+		default:
+			return false
+		}
+	}, "the command never began after the takedown let the socket go")
+	session.endCommand()
+}
+
+// And the takedown claims that only after asking whatsmeow whether the socket is still
+// there, because asking is what takes the time: both readings taken before it are stale by
+// the time it answers. Read off the source, because reaching the claim needs a real socket.
+func TestTheTakedownJudgesAgainAfterAskingWhetherTheSocketIsThere(t *testing.T) {
+	t.Parallel()
+
+	taking := theBodyOf(t, "func (s *Session) resetUnlessReplaced(")
+	asked := strings.Index(taking, "client.IsConnected()")
+	running := strings.LastIndex(taking, "s.running > 0")
+	claim := strings.Index(taking, "s.resetting = closing")
+	reset := strings.Index(taking, "client.ResetConnection()")
+	if asked < 0 || running < 0 || claim < 0 || reset < 0 {
+		t.Fatalf("the takedown no longer reads as ask, judge again, claim, reset:\n%s", taking)
+	}
+	if asked > running || running > claim || claim > reset {
+		t.Fatalf("the takedown does not judge the command count again and claim the socket "+
+			"between asking whether it is there and closing it, so a lifecycle command starting "+
+			"in that window has its removal IQ cut off and resent:\n%s", taking)
+	}
+}
+
 // The unlink a `session.delete` sends is the sharpest case of all: it is a lifecycle
 // command, so it never passes through `Execute`, and cutting it off would have whatsmeow
 // resend the removal to WhatsApp. Driven rather than fenced, because this one cannot be
