@@ -1076,7 +1076,15 @@ func (s *Session) tearDown(ctx context.Context) error {
 	if err := s.engine.Delete(ctx); err != nil {
 		return err
 	}
-	if err := s.leases.ForgetEpoch(ctx, s.sid); err != nil {
+	// On a context of its own, for the same reason the answer at the end of `run` is: the
+	// ceiling the client put on this command is about how long to wait on WhatsApp, and by
+	// here the account is already deleted. Left on the command's context, the last write of
+	// a teardown would be skipped every time the unlink was slow rather than now and then,
+	// which is the difference between a counter that leaks occasionally and one that leaks
+	// on exactly the sessions hardest to delete.
+	drop, cancel := context.WithTimeout(context.WithoutCancel(ctx), ackTimeout)
+	defer cancel()
+	if err := s.leases.ForgetEpoch(drop, s.sid); err != nil {
 		// Logged rather than returned, for the same reason the refused unlink is: the
 		// account is deleted by now, and answering a failure asks the client to send the
 		// teardown again over an account that no longer exists. What is left behind is a

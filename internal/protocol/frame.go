@@ -43,6 +43,13 @@ type Event struct {
 // second. With one field it had to choose, and chose neither.
 //
 // A command carrying both gets whichever runs out first.
+//
+// What either one bounds is the wait on WhatsApp, not the bookkeeping a command still
+// owes this process afterwards. A teardown whose unlink spent the budget goes on to
+// delete the credentials, the device mapping and the epoch counter on a bound of its
+// own: the alternative is an account whose remote half is gone and whose local half
+// survived, which this connector would go on adopting and resuming over credentials
+// WhatsApp has already revoked.
 type Command struct {
 	V              int             `json:"v"`
 	ID             string          `json:"id"`

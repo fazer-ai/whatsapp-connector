@@ -1654,14 +1654,11 @@ func (s *Session) Logout(ctx context.Context) error {
 	// logged out minutes ago, on credentials WhatsApp threw away.
 	s.emit(protocol.EventSessionLoggedOut, map[string]any{"reason": "logout_requested"})
 
-	if err := s.store.Forget(ctx); err != nil {
-		// The client here is on a deleted device whatever happens next, and the mapping
-		// still points at it: rebuilding on top of that would hand the fresh client the
-		// very credentials WhatsApp threw away.
-		s.markStale()
-		return err
-	}
-	if err := s.rebuild(ctx); err != nil {
+	if err := s.recoverWithin(); err != nil {
+		// The client here is on a deleted device whatever happens next, and a cleanup that
+		// stopped halfway leaves the mapping still pointing at it: rebuilding on top of
+		// that would hand the fresh client the very credentials WhatsApp threw away, so
+		// the next connect has to try the cleanup again rather than talk to this client.
 		s.markStale()
 		return err
 	}
@@ -1713,14 +1710,12 @@ func (s *Session) Delete(ctx context.Context) error {
 			Msg("the device could not be unlinked before the session was deleted; it may still be listed on the phone")
 	}
 
-	if err := s.store.Forget(ctx); err != nil {
-		// This one is a real failure: nothing was deleted, so the account is still
-		// addressable and a retry can still fix it. Answering success here is what would
-		// turn a failed teardown into the silence this exists to end.
-		s.markStale()
-		return fmt.Errorf("whatsmeow: delete %s: %w", s.sid, err)
-	}
-	if err := s.rebuild(ctx); err != nil {
+	if err := s.recoverWithin(); err != nil {
+		// Answered as a failure, unlike the refused unlink above, because here the retry
+		// has something to do: whichever half did not land is the half the next delete
+		// finishes, the credentials still sitting in the store or the client still being
+		// the deleted one. Answering success is what would turn a teardown that stopped
+		// halfway into the silence this exists to end.
 		s.markStale()
 		return fmt.Errorf("whatsmeow: delete %s: %w", s.sid, err)
 	}
@@ -1951,6 +1946,25 @@ func (s *Session) rebuild(ctx context.Context) error {
 	// cleaned up after. There is nothing left to do either way.
 	_ = s.adopt(wm.NewClient(device, s.waLog))
 	return nil
+}
+
+// recoverWithin is recover on a bound of its own, for the teardowns a command asked for.
+//
+// On the session's own lifetime rather than the command's, and that is the whole reason
+// it exists. The command carries the client's ceiling, and the ceiling is about how long
+// to wait on WhatsApp, not about what this process still owes its own database once the
+// answer is in. An unlink that spends the budget -- the ordinary shape of a logout on a
+// socket that is down -- would leave every store call after it running on a context that
+// is already dead, and then nothing is cleaned up at all: the account keeps credentials
+// WhatsApp has revoked, goes on being adopted and resumed on them, and the client is told
+// to retry a teardown whose remote half can never succeed again.
+//
+// Still a short bound, and still one the session's own close ends, because a database
+// that stopped answering must not be able to hold a teardown open either.
+func (s *Session) recoverWithin() error {
+	ctx, cancel := context.WithTimeout(s.ctx, s.storeLimit)
+	defer cancel()
+	return s.recover(ctx)
 }
 
 // recover puts a session that was logged out back where a fresh pairing can start:

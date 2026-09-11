@@ -1023,6 +1023,75 @@ func TestADeleteThatNeverReachedWhatsappForgetsTheCredentialsAnyway(t *testing.T
 	}
 }
 
+// A client that puts a runtime ceiling on a teardown is saying how long to wait on
+// WhatsApp, and the ordinary shape of a teardown is an unlink that spends the whole of
+// it: the socket is usually already down by the time a client gives up on an account.
+// What is left after the unlink is local bookkeeping, and on the same budget it does not
+// run at all -- the credentials stay in the store over a device WhatsApp has revoked, the
+// session goes on being adopted and resumed on them, and the client is answered with a
+// failure whose remote half can never succeed again however many times it retries.
+func TestTheLocalHalfOfATeardownOutlivesTheCeilingTheUnlinkSpent(t *testing.T) {
+	t.Parallel()
+
+	for name, tearDown := range map[string]func(*Session, context.Context) error{
+		"logout": (*Session).Logout,
+		"delete": (*Session).Delete,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			session, container := newTestSession(t, "5511999990001")
+			spent, spend := context.WithCancel(t.Context())
+			session.logout = func(context.Context, *wm.Client) error {
+				// WhatsApp accepted it, and waiting for that answer is what used the
+				// budget up. Every line after this one is on a context that is over.
+				spend()
+				return nil
+			}
+
+			if err := tearDown(session, spent); err != nil {
+				t.Fatalf("a teardown whose ceiling ran out during the unlink answered failure: %v", err)
+			}
+			if _, bound, err := container.For(session.sid).JID(t.Context()); err != nil || bound {
+				t.Fatalf("the credentials survived the teardown (bound=%v, err=%v); the account WhatsApp revoked goes on being resumed on them", bound, err)
+			}
+			if session.isStale() {
+				t.Fatal("the session was marked stale, so the cleanup did not run and the next connect has to repeat it")
+			}
+		})
+	}
+}
+
+// And the bound on that cleanup is what keeps the cure from being worse than the disease.
+// The command's ceiling no longer ends it, so a store that stopped answering would hold a
+// teardown open for as long as the process runs, with the lease held and the client
+// waiting on a reply that never comes.
+func TestATeardownGivesUpOnAStoreThatStoppedAnswering(t *testing.T) {
+	t.Parallel()
+
+	session, container := newTestSession(t, "5511999990001")
+	session.storeLimit = 100 * time.Millisecond
+	session.logout = func(context.Context, *wm.Client) error { return nil }
+
+	// The store keeps one connection, so holding it is what makes every query after it
+	// wait: a database that stalls rather than one that answers with an error.
+	held, err := container.DB().Conn(t.Context())
+	if err != nil {
+		t.Fatalf("take the store's connection: %v", err)
+	}
+	t.Cleanup(func() { _ = held.Close() })
+
+	before := time.Now()
+	// What the teardown answered is not the subject, and it cannot be: holding the one
+	// connection stalls SQLite, while a pool hands the cleanup another one and the logout
+	// simply goes through. Either answer is fine. What is pinned here is that the call
+	// comes back at all, which on the stalling store only the bound can deliver.
+	_ = session.Logout(t.Context())
+	if spent := time.Since(before); spent > 20*session.storeLimit {
+		t.Fatalf("the teardown took %s to give up, on a store bound of %s", spent, session.storeLimit)
+	}
+}
+
 // The other half of the same rule: a failure the server answered with means the unlink
 // may well have been carried out, and a session that kept its credentials would report
 // itself open over a device WhatsApp has already thrown away.
