@@ -3734,8 +3734,17 @@ func (s *Session) handle(rawEvent any) bool {
 		// is long enough for whatsmeow to have redialled -- so the reset finds a socket
 		// under the client, and the socket it finds is the replacement. Nothing here needs
 		// the transition lock: the count is atomic and the debt is its own field.
-		s.forgetOwedReset()
+		//
+		// The count goes first, and that order is the whole of what forgetting the debt is
+		// worth. Forgetting it only stops a takedown that has not been launched yet, and
+		// `endCommand` can be taking `s.mu` at this very moment, lifting the debt and
+		// launching it. That goroutine judges by the count, so a count this handler has not
+		// moved yet reads as the connection still being the one it was judged on -- and
+		// then the only thing between it and closing a healthy replacement is whether
+		// whatsmeow has finished redialling. Moving the count first makes every reset
+		// launched from here on stand down, whether the debt was forgotten or claimed.
 		s.dropped()
+		s.forgetOwedReset()
 
 		s.transition.Lock()
 		defer s.transition.Unlock()

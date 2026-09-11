@@ -1850,6 +1850,23 @@ func TestTheWindowsNoTestCanStandInsideAreFencedOff(t *testing.T) {
 	// it would be whatever the client holds by then -- which on the 515 path is a healthy
 	// replacement the session has not been told about, because `Connected` comes only after
 	// whatsmeow's prekey and passive IQs (#181).
+	// And the drop counts the connection over before it goes looking for the debt. Only a
+	// takedown that has not been launched yet can be stopped by forgetting the debt, and
+	// `endCommand` can be lifting it at this very moment: that goroutine judges by the
+	// count, so a count this arm has not moved yet reads as the connection it was judged on
+	// still being current.
+	dropping := theCaseFor(t, "*waEvents.Disconnected")
+	counted := strings.Index(dropping, "s.dropped()")
+	forgotten := strings.Index(dropping, "s.forgetOwedReset()")
+	if counted < 0 || forgotten < 0 {
+		t.Fatalf("the drop neither counts the connection over nor drops the debt owed to it:\n%s", dropping)
+	}
+	if counted > forgotten {
+		t.Fatalf("the drop forgets the debt before it counts the connection over, so a takedown "+
+			"lifted by `endCommand` in between is judged against a connection this arm has not "+
+			"yet invalidated and can close the socket that replaced it:\n%s", dropping)
+	}
+
 	judging := theCaseFor(t, "*waEvents.KeepAliveTimeout")
 	if !strings.Contains(judging, "client := s.current()") {
 		t.Fatalf("the timeout does not read the socket it is judging:\n%s", judging)
