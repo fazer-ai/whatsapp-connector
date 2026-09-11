@@ -3146,6 +3146,30 @@ func (s *Session) handle(rawEvent any) bool {
 		// and this has none -- so what this buys is a head start, not a guarantee.
 		go s.reapplyAvailability(s.ctx, s.current())
 		s.emit(protocol.EventSessionState, s.sessionState())
+	case *waEvents.KeepAliveTimeout:
+		// The socket is open and the server stopped answering on it. Nobody else is going
+		// to say so for a while: whatsmeow's own patience here is KeepAliveMaxFailTime,
+		// three minutes, and the disconnect it forces at the end of it is one it marks as
+		// expected -- so `onDisconnect` publishes nothing and this session goes on
+		// reporting `open` over a socket on the floor. Everything the client sends in that
+		// window is accepted by `readyToSend`, queued behind the dead socket, and pays its
+		// own ceiling there, one command at a time.
+		//
+		// Reset rather than Disconnect, and that is the whole of it: ResetConnection is
+		// the one that dispatches the event, so the session below turns `reconnecting`,
+		// the client is told, and `readyToSend` starts refusing in microseconds instead of
+		// accepting work for a socket that cannot carry it.
+		//
+		// What it does not do is give up on the command already in flight: the pending
+		// query is answered with a disconnect node and whatsmeow resends the same frame
+		// under the same id once the socket is back. Deciding a write failed is what
+		// invariant 5 forbids, and nothing here decides that.
+		if keepAliveIsLost(event) {
+			s.log.Warn().Int("missed", event.ErrorCount).
+				Time("last_answered", event.LastSuccess).
+				Msg("no keepalive answered on an open socket; taking it down rather than waiting")
+			s.current().ResetConnection()
+		}
 	case *waEvents.Disconnected:
 		s.transition.Lock()
 		defer s.transition.Unlock()

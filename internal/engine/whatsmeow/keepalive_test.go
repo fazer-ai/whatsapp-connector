@@ -1,50 +1,69 @@
 package whatsmeow
 
 import (
+	"bytes"
+	"strings"
 	"testing"
 	"time"
 
-	wm "go.mau.fi/whatsmeow"
+	"github.com/rs/zerolog"
+	waEvents "go.mau.fi/whatsmeow/types/events"
 )
 
-// The value is a count of failed pings dressed as a duration, and this is the arithmetic
-// that turns one into the other. Written against whatsmeow's own constants rather than
-// against 40s and 60s: the library sets the ping interval and the response deadline, and
-// a release that changes either moves the window this has to sit in.
-func TestTheSocketIsGivenUpOnTheSecondFailedPingAndNotTheFirst(t *testing.T) {
-	// The latest the first failed ping can be seen: a full interval, then the whole
-	// deadline spent waiting for an answer that does not come.
-	first := wm.KeepAliveIntervalMax + wm.KeepAliveResponseDeadline
-	// The earliest the second can, which is the same wait twice at its shortest.
-	second := 2 * (wm.KeepAliveIntervalMin + wm.KeepAliveResponseDeadline)
+// The count is what the rule is about, so it is asked directly rather than through a
+// session: whatsmeow resets it on the first answered ping, so "two" means two in a row
+// and not two since the process started.
+func TestOnlyAKeepAliveMissedTwiceInARowIsALostSocket(t *testing.T) {
+	t.Parallel()
 
-	if wm.KeepAliveMaxFailTime <= first {
-		t.Fatalf("a socket is given up after %s, which one failed ping can reach by %s, "+
-			"so a single lost ping takes a healthy session down",
-			wm.KeepAliveMaxFailTime, first)
-	}
-	if wm.KeepAliveMaxFailTime >= second {
-		t.Fatalf("a socket is given up after %s, which the second failed ping reaches by %s, "+
-			"so the account waits for a third and spends half again as long behind a dead transport",
-			wm.KeepAliveMaxFailTime, second)
+	for _, missed := range []struct {
+		count int
+		lost  bool
+	}{
+		{count: 0, lost: false},
+		{count: 1, lost: false},
+		{count: 2, lost: true},
+		{count: 7, lost: true},
+	} {
+		if got := keepAliveIsLost(&waEvents.KeepAliveTimeout{ErrorCount: missed.count}); got != missed.lost {
+			t.Errorf("%d missed keepalive(s) read as lost=%v, want %v", missed.count, got, missed.lost)
+		}
 	}
 }
 
-// And the init is what puts it there. Asserted apart from the arithmetic above so a
-// removed init is not reported as a badly chosen number.
-func TestTheKeepAliveSettingIsInstalled(t *testing.T) {
-	if wm.KeepAliveMaxFailTime != keepAliveGiveUp {
-		t.Fatalf("whatsmeow gives up after %s, and this package means to set %s",
-			wm.KeepAliveMaxFailTime, keepAliveGiveUp)
+// A single stalled ping is a blip, and a session that took its socket down for one would
+// reconnect through every bad minute a mobile network has.
+func TestOneMissedKeepAliveLeavesTheSocketAlone(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	var written bytes.Buffer
+	session.log = zerolog.New(&written)
+
+	session.handle(&waEvents.KeepAliveTimeout{ErrorCount: 1, LastSuccess: time.Now().Add(-40 * time.Second)})
+
+	if written.Len() != 0 {
+		t.Fatalf("a single missed keepalive was acted on: %s", written.String())
 	}
 }
 
-// The default this replaces, named so the test says what changed rather than only that
-// something did. Three minutes is what an account spends behind a quiet socket without
-// the init above.
-func TestTheLibraryDefaultIsTheOneThisReplaces(t *testing.T) {
-	if was := 3 * time.Minute; keepAliveGiveUp >= was {
-		t.Fatalf("this package sets %s, which is no sooner than the %s it exists to shorten",
-			keepAliveGiveUp, was)
+// And the second one is acted on rather than waited out. What the log line stands for is
+// the reset beside it; the reset itself is not observable from here, because a client with
+// no socket has nothing to take down, and the phase that measures it is the live one.
+func TestTheSecondMissedKeepAliveIsActedOn(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	var written bytes.Buffer
+	session.log = zerolog.New(&written)
+
+	session.handle(&waEvents.KeepAliveTimeout{ErrorCount: 2, LastSuccess: time.Now().Add(-70 * time.Second)})
+
+	out := written.String()
+	if !strings.Contains(out, "taking it down") {
+		t.Fatalf("the second missed keepalive was waited out instead: %q", out)
+	}
+	if !strings.Contains(out, `"missed":2`) {
+		t.Fatalf("the log does not say how many went unanswered: %q", out)
 	}
 }
