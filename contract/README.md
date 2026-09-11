@@ -29,11 +29,37 @@ the schema describes the **decoded** frame, where `v`, `epoch`, `seq`, `ts` and
 |---|---|---|
 | `wa:events:<shard>` | connector → client | `event` |
 | `wa:cmd:<sid>` | client → connector | `command` |
-| `wa:control` | client → any connector | `command` (`session.wake`, `admin.ping`) |
+| `wa:control` | client → any connector | `command` (`session.wake`, `admin.ping`, `session.delete`) |
 | `wa:reply:<command_id>` (LIST) | connector → client | `reply` |
 
 `seq` is monotonic per `(sid, epoch)` and, together with the per-session shard
 assignment, is what lets the consumer drop out-of-order redeliveries.
+
+**Which stream a command goes on is part of the contract, not a detail.** A connector
+reads `wa:cmd:<sid>` only for the sessions it is running, so a command addressed to a
+session nobody has adopted is delivered to no connector at all and is lost when the
+stream is trimmed. `wa:control` is read by every connector, which is why the commands
+that have to reach an account nobody owns ride it:
+
+- `session.wake` starts a session nobody is running, which is the whole point of it.
+- `session.delete` tears one down, and the account it matters most for is exactly the
+  one that is down: an inbox destroyed while its session was not connected, or
+  destroyed while the fleet was restarting.
+
+Both are accepted on `wa:cmd:<sid>` as well, and a connector running the session
+carries them out from there. A client that publishes `session.delete` only to the
+session's own stream therefore gets the teardown whenever the session happens to be
+up, and silence otherwise.
+
+What `wa:control` guarantees is delivery to *some* connector, not to a particular one.
+Every connector reads the stream under one consumer group, so an entry naming a session
+another connector is running is given up by the one that read it and reclaimed later,
+possibly by the same one. For `session.delete` that means: an account **nobody** owns is
+torn down by whoever reads the entry, which is the case this route exists for and is
+deterministic; an account a connector is **running** is torn down when the entry reaches
+that connector, which happens but is not bounded. Nothing in the protocol asks an owner
+to give a session up on demand -- that is what `wa:handoff:<sid>` in the table above was
+meant for, and it has never been built.
 
 Around those four keys sit the ones that decide who reads and who writes. They are not
 frames, but both sides have to agree on them, so they are part of the contract:
@@ -42,13 +68,25 @@ frames, but both sides have to agree on them, so they are part of the contract:
 |---|---|---|---|
 | `wa:meta` | HASH | connector | `protocol_min`, `protocol_max`, `event_shards`; a connector whose `event_shards` disagrees refuses to start |
 | `wa:instances`, `wa:instance:<inst>` | SET, HASH (PX 15s) | connector | live instances and what they advertise: `version`, `protocol_min`, `protocol_max`, `advertise_url`, `media_token` |
-| `wa:sessions`, `wa:session:<sid>` | SET, HASH | connector | last known state of a session: `state`, `owner`, `epoch`, `phone`, `desired`, `quarantine` |
+| `wa:sessions`, `wa:session:<sid>` | SET, HASH | **nobody** | described here as the connector's registry of session state, and no connector writes or reads either key. See the note below before relying on them |
 | `wa:lease:<sid>`, `wa:lease-epoch:<sid>` | STRING | connector | which instance owns a session, and the epoch it owns it under |
 | `wa:idem:<sid>:<key>` | STRING | connector | command idempotency (`msg:<message_id>` for sends) |
 | `wa:events:<shard>:lease` | STRING (EX 30s) | client | which consumer reads a shard; exactly one at a time, which is what preserves order |
 | `wa:consumer:<cid>` | STRING (EX 15s) | client | consumer heartbeat and the shards it holds |
 | `wa:cursor:<sid>` | STRING | client | last `epoch:seq` the client processed for a session |
 | `wa:dlq:events`, `wa:dlq:commands` | LIST | either | entries that failed after retries, kept for an operator to inspect |
+
+**`wa:sessions` and `wa:session:<sid>` are not maintained.** They have a key
+constructor and nothing else: no connector writes them, and none reads them. The row
+stayed in this table describing a registry that was never built, which is worse than an
+absent row -- a client vendoring this directory reads that the connector keeps the last
+known state of every session and can write code against it. It cost a holdout agent a
+set of acceptance criteria built on that premise while #151 was being verified.
+
+The same is true of `wa:quarantine:<sid>`, which has a constructor and no producer;
+that one is tracked as fazer-ai/whatsapp-connector#102, which is about building the
+mechanism rather than about the key. Whether a session registry should exist at all is
+a separate question from this table telling clients that one does.
 
 The client reads events with a consumer group named `chatwoot`, created at `0` so that
 whatever the connector published while no client was running is still delivered.

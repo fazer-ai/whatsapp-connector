@@ -835,6 +835,7 @@ func (e *gatedEngine) Finished() uint64                                     { re
 func (e *gatedEngine) Connect(context.Context, engine.ConnectRequest) error { return nil }
 func (e *gatedEngine) Disconnect(context.Context) error                     { return nil }
 func (e *gatedEngine) Logout(context.Context) error                         { return nil }
+func (e *gatedEngine) Delete(context.Context) error                         { return nil }
 
 func (e *gatedEngine) Execute(context.Context, *protocol.Command) (json.RawMessage, error) {
 	return json.RawMessage(`{}`), nil
@@ -1178,6 +1179,7 @@ func (e *heldEngine) Finished() uint64                                     { ret
 func (e *heldEngine) Connect(context.Context, engine.ConnectRequest) error { return nil }
 func (e *heldEngine) Disconnect(context.Context) error                     { return nil }
 func (e *heldEngine) Logout(context.Context) error                         { return nil }
+func (e *heldEngine) Delete(context.Context) error                         { return nil }
 
 func (e *heldEngine) Execute(ctx context.Context, _ *protocol.Command) (json.RawMessage, error) {
 	e.entered.Store(true)
@@ -2120,6 +2122,102 @@ func TestACommandIsKeyedByWhateverNamesItOnlyOnce(t *testing.T) {
 	}
 	if got := engineSession.LoggedOut(); got != 1 {
 		t.Fatalf("the account was logged out %d times, want once", got)
+	}
+}
+
+// A teardown is carried out by the session that holds the account, like every other
+// command, and what it leaves behind is a session with nothing left to try: the lease
+// goes back on the next sweep rather than being held by an instance running an account
+// that no longer exists, and the number can be paired again without waiting for the
+// lease to expire.
+func TestADeleteTearsTheAccountDownAndHandsTheLeaseBack(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	ctx := context.Background()
+	if _, err := h.manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, _ := h.engine.Session("s1")
+
+	del := &protocol.Command{
+		V: protocol.Version, ID: "c1", Type: protocol.CommandSessionDelete, SID: "s1",
+		Payload: json.RawMessage(`{}`),
+	}
+	var acked atomic.Bool
+	h.manager.Dispatch(delivery(del, &acked))
+	waitFor(t, "the delete to be retired", acked.Load)
+
+	if got := engineSession.Deleted(); got != 1 {
+		t.Fatalf("the account was torn down %d times, want once", got)
+	}
+	// Swept inside the wait, because the sweep is what hands the lease back and it runs
+	// on the heartbeat: asking once, before the pump has carried the event that retires
+	// the session, would time the test against a goroutine rather than assert anything.
+	waitFor(t, "the lease of a deleted account to go back", func() bool {
+		h.manager.SweepRetired(ctx, time.Now().Add(time.Second))
+		_, owned := h.leases.Owned("s1")
+		return !owned
+	})
+}
+
+// A teardown that failed deleted nothing: the account is still addressable and the
+// client has to hear about it. `session.delete` is fire-and-forget, so nobody is
+// blocked on a reply and the only way to say so is the event -- and the event has to
+// name the command, or a client reading it learns that something failed without
+// learning what.
+func TestAFailedTeardownIsNamedOnTheEventStream(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	ctx := context.Background()
+	if _, err := h.manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, _ := h.engine.Session("s1")
+	engineSession.FailDelete(errors.New("the store is away"))
+
+	del := &protocol.Command{
+		V: protocol.Version, ID: "c1", Type: protocol.CommandSessionDelete, SID: "s1",
+		Payload: json.RawMessage(`{}`),
+	}
+	var acked atomic.Bool
+	h.manager.Dispatch(delivery(del, &acked))
+	waitFor(t, "the delete to be answered", acked.Load)
+
+	var failure *protocol.Event
+	waitFor(t, "the failure to reach the event stream", func() bool {
+		for _, event := range h.recorder.published() {
+			if event.Type == protocol.EventCommandFailed {
+				failure = &event
+				return true
+			}
+		}
+		return false
+	})
+
+	var body struct {
+		CommandID   string `json:"command_id"`
+		CommandType string `json:"command_type"`
+	}
+	if err := json.Unmarshal(failure.Payload, &body); err != nil {
+		t.Fatalf("unmarshal the failure: %v", err)
+	}
+	if body.CommandID != "c1" {
+		t.Fatalf("command.failed named command %q, want c1", body.CommandID)
+	}
+	// The field the schema requires and the client destructures. It was published as
+	// `type`, so every command.failed this connector has ever sent arrived with nothing
+	// where the command should be, and no fixture test could see it: the contract test
+	// compares fixtures against the schema and never a payload built at runtime.
+	if body.CommandType != string(protocol.CommandSessionDelete) {
+		t.Fatalf("command.failed named the type %q, want %q", body.CommandType, protocol.CommandSessionDelete)
+	}
+
+	// And the account is still this instance's, because it still exists: a teardown that
+	// deleted nothing must not hand the lease back as if it had.
+	if _, owned := h.leases.Owned("s1"); !owned {
+		t.Fatal("a failed teardown handed the lease back; the account is still addressable and nothing is running it")
 	}
 }
 

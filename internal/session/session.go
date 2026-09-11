@@ -944,7 +944,7 @@ func idempotencyKey(command *protocol.Command) string {
 	return "cmd:" + command.ID
 }
 
-// The three lifecycle commands go to the engine's own methods rather than through
+// The four lifecycle commands go to the engine's own methods rather than through
 // Execute: they are not requests about a live session, they are what makes one live or
 // ends it, and an engine that had to recognise them inside Execute would be answering
 // two different kinds of question through one door.
@@ -969,9 +969,33 @@ func (s *Session) lifecycle(ctx context.Context, command *protocol.Command) (jso
 		return nil, s.engine.Disconnect(ctx)
 	case protocol.CommandSessionLogout:
 		return nil, s.engine.Logout(ctx)
+	case protocol.CommandSessionDelete:
+		return nil, s.tearDown(ctx)
 	default:
 		return s.engine.Execute(ctx, command)
 	}
+}
+
+// tearDown deletes the account and the fleet state that exists only to address it.
+//
+// It runs here, on the session's own executor, and that is the whole of the ordering it
+// needs: the lease that fences every store write is held, the engine is open, and the
+// commands before and after this one are the ones the client sent before and after it.
+// Nothing above has to stop the session first -- stopping closes the engine, and the
+// whatsmeow one drops the store's fence when it does, so a teardown after that deletes
+// nothing at all.
+func (s *Session) tearDown(ctx context.Context) error {
+	if err := s.engine.Delete(ctx); err != nil {
+		return err
+	}
+	if err := s.leases.ForgetEpoch(ctx, s.sid); err != nil {
+		// Logged rather than returned, for the same reason the refused unlink is: the
+		// account is deleted by now, and answering a failure asks the client to send the
+		// teardown again over an account that no longer exists. What is left behind is a
+		// counter of a few bytes, which is what #159 is about.
+		s.log.Warn().Err(err).Msg("could not delete the epoch counter of a session that was torn down")
+	}
+	return nil
 }
 
 // answer replies to an RPC command, and publishes a `command.failed` event for a
@@ -988,8 +1012,16 @@ func (s *Session) answer(ctx context.Context, command *protocol.Command, result 
 	failure := asProtocolError(err)
 	s.logFailure(command, failure, err)
 	_ = s.publish(ctx, &engine.Emission{
-		Type:    protocol.EventCommandFailed,
-		Payload: mustMarshal(map[string]any{"command_id": command.ID, "type": command.Type, "error": failure}),
+		Type: protocol.EventCommandFailed,
+		// `command_type`, which is what the schema requires and the fixture carries. It
+		// was `type` here, so every `command.failed` this connector has ever published
+		// named its command under a key nobody reads: the client's own handler destructures
+		// `command_type` and has always been handed nil. The contract test compares
+		// fixtures against the schema and never sees a payload built at runtime, which is
+		// why nothing caught it.
+		Payload: mustMarshal(map[string]any{
+			"command_id": command.ID, "command_type": command.Type, "error": failure,
+		}),
 	})
 }
 

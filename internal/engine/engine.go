@@ -125,6 +125,23 @@ type Session interface {
 	// Logout ends the session on WhatsApp's side too, so resuming is impossible and
 	// the next connect has to pair again.
 	Logout(ctx context.Context) error
+	// Delete is Logout for an account nobody is coming back to, and the difference is
+	// what it does when WhatsApp will not answer.
+	//
+	// Logout keeps credentials that still resume when the request never left, because
+	// the operator asked to unlink a device and is still running the account: throwing
+	// the credentials away would cost them a fresh pairing for a logout that visibly
+	// failed. Delete is asked by a client that has already destroyed the inbox on its
+	// side, so there is nobody left to pair again and the account this connector holds
+	// is one nothing addresses. Credentials kept there are a device linked on somebody's
+	// phone with nothing on this side that corresponds to it.
+	//
+	// So the unlink is attempted and its refusal is reported without stopping the rest:
+	// what WhatsApp was told is best effort, what this connector holds is not. What is
+	// left when it ends is a session with nothing to try, which it says the way every
+	// other giving-up says it -- the emission that reports the teardown is marked, so the
+	// lease goes back rather than being held for an account that no longer exists.
+	Delete(ctx context.Context) error
 	// Execute carries out one command and returns the `result` half of the reply.
 	// A nil result with a nil error is a command whose reply carries no data.
 	Execute(ctx context.Context, command *protocol.Command) (json.RawMessage, error)

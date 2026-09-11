@@ -86,16 +86,20 @@ func (e *Engine) Close() error {
 type Session struct {
 	sid string
 
-	mu        sync.Mutex
-	events    chan engine.Emission
-	closed    bool
-	connected bool
-	finished  bool
-	givenUp   uint64
-	loggedOut int
-	commands  []protocol.Command
-	bounds    []time.Time
-	held      chan struct{}
+	mu           sync.Mutex
+	events       chan engine.Emission
+	closed       bool
+	connected    bool
+	finished     bool
+	givenUp      uint64
+	loggedOut    int
+	deleted      int
+	refuseUnlink error
+	failDelete   error
+	onDelete     func()
+	commands     []protocol.Command
+	bounds       []time.Time
+	held         chan struct{}
 
 	heldSucceeds bool
 }
@@ -159,6 +163,83 @@ func (s *Session) Logout(_ context.Context) error {
 	s.mu.Unlock()
 	s.emit(protocol.EventSessionLoggedOut, map[string]any{"reason": "logout_requested"})
 	return nil
+}
+
+// Delete unlinks and forgets, and counts the two separately so a test can tell a
+// teardown that gave up from one that carried on: the whole point of the real one is
+// that a refused unlink does not stop the deletion.
+func (s *Session) Delete(_ context.Context) error {
+	s.mu.Lock()
+	// The real engine drops the store's fence in Close, and every fenced write after
+	// that is refused. Modelled here because a fake that deletes happily after its
+	// session was closed hides the one ordering this teardown has to get right: the
+	// engine is emptied while it is still open, and stopped afterwards.
+	if s.closed {
+		s.mu.Unlock()
+		return errFenced
+	}
+	watch := s.onDelete
+	failWith := s.failDelete
+	refuse := s.refuseUnlink
+	s.connected = false
+	if refuse == nil {
+		s.loggedOut++
+	}
+	s.deleted++
+	s.mu.Unlock()
+	if watch != nil {
+		watch()
+	}
+	if failWith != nil {
+		return failWith
+	}
+	// Marked, the way the real one marks it: the account is gone, so the session has
+	// nothing left to try and the connector hands the lease back once this is out. A
+	// refused unlink says it too -- what WhatsApp was told does not change the fact that
+	// this connector is holding an account nothing addresses any more.
+	s.EmitLast(protocol.EventSessionLoggedOut, map[string]any{"reason": "session_deleted"})
+	// Nil even when WhatsApp refused the unlink, which is the real engine's answer and
+	// the one thing a fake here must not soften: the teardown happened, and a failure
+	// reported for it is a client republishing a delete over an account that is already
+	// gone. What the refusal cost is a device still listed on somebody's phone, which
+	// the real one names in its log and neither one can undo.
+	return nil
+}
+
+// FailDelete makes the teardown itself fail, which is the case where nothing was
+// deleted and the account is still addressable.
+func (s *Session) FailDelete(err error) {
+	s.mu.Lock()
+	s.failDelete = err
+	s.mu.Unlock()
+}
+
+// OnDelete runs at the moment the teardown does, for assertions about what else was
+// still true then.
+func (s *Session) OnDelete(watch func()) {
+	s.mu.Lock()
+	s.onDelete = watch
+	s.mu.Unlock()
+}
+
+// errFenced is what a write refused by a dropped fence answers, which is what the real
+// store does once the engine has been closed.
+var errFenced = errors.New("fake: the store fence is down")
+
+// Deleted counts the teardowns that ran to the end.
+func (s *Session) Deleted() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.deleted
+}
+
+// RefuseUnlink makes WhatsApp turn the unlink down, which is the case Delete exists to
+// answer: the credentials go anyway and the caller is told the device may still be
+// listed on the phone.
+func (s *Session) RefuseUnlink(err error) {
+	s.mu.Lock()
+	s.refuseUnlink = err
+	s.mu.Unlock()
 }
 
 // LoggedOut counts how many times the account was unlinked, which is what a test
