@@ -370,6 +370,55 @@ func TestTheResetStandsDownWhenAConnectionLandedFirst(t *testing.T) {
 	assertTheMarkStillStands(t, session)
 }
 
+// And it goes back to waiting when a command started between the decision and this
+// goroutine getting a turn. Only the lifecycle three can start there, everything else being
+// refused at the gate by then, and `logout` sends its removal IQ over the socket that is
+// still up: cutting that off is the resend the whole guard exists to avoid.
+func TestTheResetGoesBackToWaitingWhenACommandStartedFirst(t *testing.T) {
+	t.Parallel()
+
+	session, written := newLoggedTestSession(t, "5511999990001")
+	session.relearn(session.current())
+	dialedAndConnected(session)
+	session.announceDrop()
+
+	judged := session.transitions.Load()
+	// A logout started while the takedown was still waiting for a turn.
+	session.startCommand()
+
+	session.resetUnlessReplaced(session.current(), judged)
+
+	if !strings.Contains(written.String(), "waiting for its answer") {
+		t.Fatalf("the socket was taken down under a command that started first: %q", written.String())
+	}
+	session.mu.Lock()
+	owed := session.owed
+	session.mu.Unlock()
+	if owed == nil {
+		t.Fatal("the takedown was dropped instead of going back to waiting, so the mute socket stays up")
+	}
+}
+
+// And a dial of this session's own does not retire the mark either. A drop from the socket
+// the dial replaces can still be on its way, and applying it after the new connection
+// announces itself is the same wedge by another door.
+func TestAFreshDialKeepsTheMark(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.relearn(session.current())
+	dialedAndConnected(session)
+	session.announceDrop()
+
+	dialedAndConnected(session)
+	session.handle(&waEvents.Disconnected{})
+
+	if got := session.state(); got != "open" {
+		t.Fatalf("a dial retired the mark, so a drop still on its way from the socket it "+
+			"replaced left the session %q with nothing to correct it", got)
+	}
+}
+
 // And a reset that finds no socket does nothing, quietly.
 func TestTheResetDoesNothingWhenThereIsNoSocketToTakeDown(t *testing.T) {
 	t.Parallel()
