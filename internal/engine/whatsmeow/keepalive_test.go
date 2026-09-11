@@ -865,6 +865,31 @@ func TestADropSwallowedByTheMarkStillEndsTheConnectionItWasJudgedOn(t *testing.T
 	}
 }
 
+// And it records that without waiting for the transition lock either, which is the whole
+// point of recording it: the takedown is already awake on its own goroutine, and the arm
+// holding the lock may be the one blocked publishing into an inbox nobody drains.
+func TestAJudgedConnectionEndsWithoutWaitingForTheLock(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.relearn(session.current())
+	dialedAndConnected(session)
+
+	session.handle(&waEvents.KeepAliveTimeout{ErrorCount: 2, LastSuccess: time.Now()})
+	next(t, session)
+	judged := session.transitions.Load()
+
+	session.transition.Lock()
+	defer session.transition.Unlock()
+
+	go session.handle(&waEvents.Disconnected{})
+
+	waitFor(t, func() bool { return session.transitions.Load() != judged },
+		"the drop handler waited for the transition lock before recording that the judged "+
+			"connection is over, so a takedown waking from its question at the end of a redial "+
+			"reads its socket as current and takes down the replacement")
+}
+
 // The unlink a `session.delete` sends is the sharpest case of all: it is a lifecycle
 // command, so it never passes through `Execute`, and cutting it off would have whatsmeow
 // resend the removal to WhatsApp. Driven rather than fenced, because this one cannot be
