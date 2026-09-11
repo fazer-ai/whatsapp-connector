@@ -1092,6 +1092,71 @@ func TestATeardownGivesUpOnAStoreThatStoppedAnswering(t *testing.T) {
 	}
 }
 
+// whatsmeow hands `Disconnected` to a goroutine of its own and dispatches the `Connected`
+// its reconnect produces synchronously, on the handler's own path, so a reconnect that
+// authenticates before the drop is handled applies the two arms in the wrong order: the
+// drop writes `reconnecting` over a socket that is up. Nothing arrives afterwards to put
+// that right -- the replacement is healthy and produces nothing further -- so the session
+// stays wedged and `readyToSend` refuses every command until somebody reconnects it by
+// hand.
+//
+// Driven at the seam, because nothing outside the process can force the inversion: the
+// starvation it needs is the scheduler's to decide, and repeating a drop until it fails to
+// happen proves nothing. What is handed in is the drop dated from before the connection
+// that overtook it, which is what whatsmeow's own dispatch produced.
+func TestADropIsNotAppliedOverTheSocketThatOvertookIt(t *testing.T) {
+	t.Parallel()
+
+	connected := time.Now()
+	for name, test := range map[string]struct {
+		dispatched time.Time
+		want       string
+		published  bool
+	}{
+		// The socket that is up is the one that dropped, which is every ordinary drop.
+		"the drop is about the connection the session is on": {
+			dispatched: connected.Add(time.Minute), want: "reconnecting", published: true,
+		},
+		// Dispatched before the connection announced itself, so what it describes is the
+		// socket that one replaced.
+		"the reconnect got in front of the drop": {
+			dispatched: connected.Add(-time.Minute), want: "open",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			session, _ := newTestSession(t, "5511999990001")
+			clock := connected
+			session.wallClock = func() time.Time { return clock }
+			// So the drop reads as one whatsmeow will redial. The same arm answers an
+			// unpaired session with `close`, for a reason that is not this one.
+			session.relearn(session.current())
+			dialedAndConnected(session)
+
+			clock = test.dispatched
+			session.handle(&waEvents.Disconnected{})
+
+			if state := session.state(); state != test.want {
+				t.Fatalf("the session reports %q after the drop, want %q", state, test.want)
+			}
+			// And the stream has to agree with the state, or the client acts on one while
+			// `session.status` answers the other.
+			if test.published {
+				if emission := next(t, session); emission.Type != protocol.EventSessionState {
+					t.Fatalf("the drop published %q, want the session state", emission.Type)
+				}
+				return
+			}
+			select {
+			case emission := <-session.Events():
+				t.Fatalf("a drop about a socket that was already replaced published %q", emission.Type)
+			case <-time.After(200 * time.Millisecond):
+			}
+		})
+	}
+}
+
 // The other half of the same rule: a failure the server answered with means the unlink
 // may well have been carried out, and a session that kept its credentials would report
 // itself open over a device WhatsApp has already thrown away.
@@ -1355,16 +1420,26 @@ func TestConcurrentSocketEventsLeaveStateAndStreamAgreeing(t *testing.T) {
 	}
 	wg.Wait()
 
-	// Every handler published exactly one state, and all of them have to be read: the
-	// forwarder is still delivering when the last handler returns, and a test that
-	// stopped at whatever had arrived would be comparing against the wrong event.
+	// Everything published has to be read before the comparison: the forwarder is still
+	// delivering when the last handler returns, and a test that stopped at whatever had
+	// arrived would be comparing against the wrong event.
+	//
+	// Drained until it goes quiet rather than counted out. Not every handler publishes:
+	// a drop dispatched before the connection that overtook it is now ignored without a
+	// word, which is what keeps `reconnecting` off a socket that is up, so the number of
+	// events this produces depends on how the scheduler interleaved the pairs.
 	var reported string
-	for range pairs * 2 {
+	seen := 0
+	for draining := true; draining; {
 		select {
 		case reported = <-last:
-		case <-time.After(5 * time.Second):
-			t.Fatal("the states published were never all delivered")
+			seen++
+		case <-time.After(time.Second):
+			draining = false
 		}
+	}
+	if seen == 0 {
+		t.Fatal("none of the handlers published a state at all")
 	}
 	if state := session.state(); state != reported {
 		t.Fatalf("session.status says %q while the last event said %q", state, reported)
