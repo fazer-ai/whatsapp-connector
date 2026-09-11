@@ -2225,6 +2225,38 @@ func (s *Session) dropWasAnnounced() bool {
 	return announced
 }
 
+// dropWasOvertaken reports whether a drop dispatched at `at` is about a connection this
+// session has already moved past.
+//
+// whatsmeow hands `Disconnected` to a goroutine of its own and starts the reconnect from
+// another, and nothing orders the two against each other or against the `Connected` the
+// reconnect produces -- which is dispatched synchronously, on the handler's own path. So a
+// reconnect that authenticates before the drop is handled has the two arms applied in the
+// wrong order: `open` is written and published, and the drop then writes `reconnecting`
+// over a socket that is up. Nothing arrives after it to put that right, because the
+// replacement is healthy and produces nothing further, and `readyToSend` refuses every
+// command until somebody reconnects the session by hand.
+//
+// The event names no connection and whatsmeow exposes none, so the two sockets are told
+// apart by when this session heard about each: `at` is taken at the top of `handle`,
+// before anything there can wait, and a connection dated later than that is one that came
+// up after the socket this drop describes went down. It is the rule `answeredKeepAlive`
+// already reads by, in the other direction.
+//
+// The stamp alone decides it, and the state around it deliberately does not. Three writes
+// move `connectedAt` forward -- a socket announcing itself, a dial starting, and a drop
+// being applied -- and each of them means this session learned of something after the
+// instant it records. So a drop older than that stamp is about a connection that is over
+// however the session is currently reporting itself, and adding `connected` or `!dialing`
+// here would only narrow the rule to the one case it was first noticed in: a second drop
+// starved behind the first would then re-date the connection backwards, and the keepalive
+// staleness rule reads that stamp.
+func (s *Session) dropWasOvertaken(at time.Time) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.connectedAt.After(at)
+}
+
 // answeredKeepAlive records that the socket answered a ping again.
 //
 // Unconditional, and the date is what makes that safe: `at` is when whatsmeow dispatched the
@@ -3755,6 +3787,15 @@ func (s *Session) handle(rawEvent any) bool {
 			// arrives and would wedge the session in the order it sometimes does: handled
 			// after the replacement announced itself, it writes `reconnecting` over a
 			// healthy socket, and nothing comes after it to put that right.
+			return true
+		}
+		if s.dropWasOvertaken(dispatched) {
+			// A drop about a socket the reconnect has already replaced. The mark above
+			// covers only the drop this session brought on itself; this is the general
+			// case, and it is the same inversion seen from the other end -- so it also
+			// takes the residue that mark leaves, where the reset's own event is overtaken
+			// by a later drop and the later one consumes it.
+			s.log.Info().Msg("ignoring a drop that the socket replacing it announced itself in front of")
 			return true
 		}
 		s.setConnected(false)
