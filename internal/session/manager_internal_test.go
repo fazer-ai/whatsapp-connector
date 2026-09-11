@@ -2165,14 +2165,33 @@ func TestAHandBackIsMarkedBeforeTheSessionStops(t *testing.T) {
 
 	// Armed only now, so the acquisition above -- which reads the mark and so carries the
 	// same two keys -- is not mistaken for the writing of one.
+	//
+	// What is watched for is the mark being in Redis, and the traffic is only when to look:
+	// a command naming the key is not a command that wrote it. The mark script's first
+	// EVALSHA is answered NOSCRIPT and writes nothing, and a wait satisfied by it sends the
+	// wake below into a window the mark does not cover, where a peer adopting the account
+	// legitimately is read here as the bug this test is about.
 	var handing atomic.Bool
 	marked := make(chan struct{})
 	var announce sync.Once
 	giving.AddHook(watching{after: func(cmd redis.Cmder) {
-		if handing.Load() && names(cmd, keys.HandBack(sid)) {
+		if handing.Load() && names(cmd, keys.HandBack(sid)) && server.Exists(keys.HandBack(sid)) {
 			announce.Do(func() { close(marked) })
 		}
 	}})
+
+	// The mark goes out twice and only the second one writes: the script is not loaded in
+	// a miniredis this test just started, so the first EVALSHA is answered NOSCRIPT and the
+	// EVAL that follows is the write. Held here so the gap between them is one this test
+	// decides the width of, rather than one it hopes to lose the race to.
+	writing := &heldCommand{
+		on: func(cmd redis.Cmder) bool {
+			return handing.Load() && cmd.Name() == "eval" && names(cmd, keys.HandBack(sid))
+		},
+		entered: make(chan struct{}),
+		let:     make(chan struct{}),
+	}
+	giving.AddHook(writing)
 
 	engineSession.Emit(protocol.EventSessionState, map[string]any{"state": "connected"})
 	<-held.entered
@@ -2187,6 +2206,30 @@ func TestAHandBackIsMarkedBeforeTheSessionStops(t *testing.T) {
 		held.release()
 		<-done
 	}()
+	// Registered after the stop's own cleanup so it runs before it: a failure below leaves
+	// Release parked on the write held here, and the wait for it would never come back.
+	defer writing.release()
+
+	// The write is held, so the mark is provably still absent: what has been answered by
+	// now is the attempt that wrote nothing. A wait satisfied here is a wait that means the
+	// command went out rather than the mark being there, and the wake below then lands in a
+	// window the mark does not cover -- which is a peer adopting the account legitimately,
+	// read by the assertion at the end as the bug this test is about.
+	// Under a ceiling, and not a bare receive: a product that never writes the mark leaves
+	// nothing to hold, and a test waiting on that with no bound turns the failure it is
+	// here to report into a package that hangs to its own -timeout, with a goroutine dump
+	// where the assertion should be.
+	select {
+	case <-writing.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the hand-back was not marked while the session was still stopping, so every wake in that window is acknowledged as an account somebody else runs")
+	}
+	select {
+	case <-marked:
+		t.Fatal("the mark was announced while the write that leaves it was still held, so every wake this test sends lands before the mark it is meant to be covered by")
+	default:
+	}
+	writing.release()
 
 	select {
 	case <-marked:
@@ -3198,6 +3241,35 @@ func TestAMarkLeavesTheReleaseBehindItATurn(t *testing.T) {
 		t.Fatal("the lease was still held after the hand-back: the mark spent the whole budget and the release ran on a context already over")
 	}
 }
+
+// heldCommand holds one command on its way to Redis until it is let go, and says when it
+// has one. Unlike waiting, which never lets go, this one is for separating a command from
+// its effect: what is held has not happened yet, and that is a fact rather than a race.
+type heldCommand struct {
+	on      func(redis.Cmder) bool
+	entered chan struct{}
+	let     chan struct{}
+	once    sync.Once
+	freed   sync.Once
+}
+
+func (*heldCommand) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (*heldCommand) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+
+func (h *heldCommand) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if h.on(cmd) {
+			h.once.Do(func() { close(h.entered) })
+			<-h.let
+		}
+		return next(ctx, cmd)
+	}
+}
+
+func (h *heldCommand) release() { h.freed.Do(func() { close(h.let) }) }
 
 // waiting holds a command until its own context is over, which is a Redis that answers
 // nothing rather than one that refuses.
