@@ -1844,4 +1844,18 @@ func TestTheWindowsNoTestCanStandInsideAreFencedOff(t *testing.T) {
 	if !strings.Contains(paying, "owed.client") {
 		t.Fatalf("the debt is paid against a socket other than the one it names:\n%s", paying)
 	}
+
+	// And the takedown is aimed at the socket the timeout was judged against, read while the
+	// handler still holds the transition lock. Read again where the takedown is asked for,
+	// it would be whatever the client holds by then -- which on the 515 path is a healthy
+	// replacement the session has not been told about, because `Connected` comes only after
+	// whatsmeow's prekey and passive IQs (#181).
+	judging := theCaseFor(t, "*waEvents.KeepAliveTimeout")
+	if !strings.Contains(judging, "client := s.current()") {
+		t.Fatalf("the timeout does not read the socket it is judging:\n%s", judging)
+	}
+	if !strings.Contains(judging, "s.takeDownSoon(client,") {
+		t.Fatalf("the takedown is aimed at whatever socket the client holds when it is asked "+
+			"for, rather than the one this timeout was judged against:\n%s", judging)
+	}
 }
