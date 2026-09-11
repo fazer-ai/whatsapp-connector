@@ -293,7 +293,10 @@ type Session struct {
 	transitions atomic.Int64
 	// connectedAt is the earliest moment the socket this session is on could have come
 	// up, which is what tells a keepalive timeout about the current connection from one
-	// about a connection that is already gone. Written under mu beside `connected`.
+	// about a connection that is already gone. Written under mu beside `connected`, by
+	// every path that can tell the socket is a new one: the dials this process asks for,
+	// the reconnects it watches whatsmeow start, and a connection that announces itself
+	// while the session still believes it is on the previous one.
 	connectedAt time.Time
 
 	// awaited holds the messages that arrived unreadable and have not been given up on
@@ -810,13 +813,33 @@ func (s *Session) setDialing(dialing bool) {
 }
 
 func (s *Session) setConnected(connected bool) {
+	at := s.now()
 	s.mu.Lock()
+	replaced := connected && s.connected
 	s.transitions.Add(1)
 	s.connected = connected
 	// Either way the dial is over: whatsmeow has answered for it, with an
 	// authenticated session or with the socket going down again.
 	s.dialing = false
 	if connected {
+		if replaced {
+			// A socket announcing itself while the session still believes it is on one can
+			// only be a socket that replaced the previous one without anything telling this
+			// session so. whatsmeow's 515 path does exactly that: it disconnects and
+			// reconnects inside itself, and the disconnect it marks as expected publishes no
+			// event, so nothing before this moment is observable from here. Keeping the
+			// stamp of the socket that is gone would make every timeout its dead keepalive
+			// loop dispatches read as current, and the healthy replacement would be taken
+			// down for them.
+			//
+			// Later than the socket it dates, by the handshake between whatsmeow's `connect`
+			// and this event, and that is the wrong direction to be wrong in: a stamp more
+			// than `keepAliveStaleAfter` past the new loop's first tick makes real timeouts
+			// on this socket read as stale and leaves it to whatsmeow's own three minutes,
+			// which is where main already is. It is the only instant this path offers, and
+			// erring into main's behaviour for one socket beats resetting a healthy one.
+			s.connectedAt = at
+		}
 		s.reconnecting = false
 		// A new socket is a new answer about every group. What was remembered outlives a
 		// disconnection, and so does whatsmeow's own cache of the same groups -- which
