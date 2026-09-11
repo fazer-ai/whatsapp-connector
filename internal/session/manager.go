@@ -24,14 +24,15 @@ import (
 // is held, and losing the lease tears it down rather than letting it publish under an
 // epoch that has moved on.
 type Manager struct {
-	instance  string
-	engine    engine.Engine
-	leases    *cluster.Leases
-	publisher transport.Publisher
-	replier   transport.Replier
-	ledger    Ledger
-	newID     IDFunc
-	now       func() time.Time
+	instance   string
+	engine     engine.Engine
+	leases     *cluster.Leases
+	quarantine *cluster.Quarantine
+	publisher  transport.Publisher
+	replier    transport.Replier
+	ledger     Ledger
+	newID      IDFunc
+	now        func() time.Time
 	// retireRetry is how long a session waits before saying again that it is finished
 	// with. A field so the tests that drive that path do not wait on the real one.
 	retireRetry time.Duration
@@ -119,9 +120,14 @@ type ManagerConfig struct {
 	// Ledger is where a command's outcome is remembered. Leaving it out turns the
 	// idempotency invariant off, which only a test that is not exercising it should do.
 	Ledger Ledger
-	NewID  IDFunc
-	Now    func() time.Time
-	Logger zerolog.Logger
+	// Quarantine is the fleet's record of the sessions that keep failing to come back.
+	// Leaving it out turns the backoff off, which only a test that is not exercising it
+	// should do: without it an account that cannot connect is asked for again at the
+	// sweep's own rate, forever.
+	Quarantine *cluster.Quarantine
+	NewID      IDFunc
+	Now        func() time.Time
+	Logger     zerolog.Logger
 	// AnswerDepth bounds how many commands wait on the manager's own goroutine. The
 	// zero value asks for DefaultAnswerDepth.
 	AnswerDepth int
@@ -142,6 +148,7 @@ func NewManager(cfg *ManagerConfig) *Manager {
 		instance:    cfg.Instance,
 		engine:      cfg.Engine,
 		leases:      cfg.Leases,
+		quarantine:  cfg.Quarantine,
 		publisher:   cfg.Publisher,
 		replier:     cfg.Replier,
 		ledger:      cfg.Ledger,
@@ -282,11 +289,15 @@ func (m *Manager) Adopt(ctx context.Context, sid string) (*Session, error) {
 	// slow store off the goroutine that renews leases. A session built on that context
 	// would be torn down along with it, which is a connector that pairs an account and
 	// drops it. Sessions end when StopAll or a lost lease ends them, and nothing else.
-	session := New(context.WithoutCancel(ctx), &Config{
+	// The lifetime the callbacks below run under, for the same reason the session gets
+	// it: they fire from the pump and the executor long after this call has returned.
+	living := context.WithoutCancel(ctx)
+	session := New(living, &Config{
 		Instance: m.instance, Lease: lease, Leases: m.leases, Engine: engineSession,
 		Publisher: m.publisher, Replier: m.replier, Ledger: m.ledger,
 		NewID: m.newID, Now: m.now, Logger: m.log,
 		Undrained: func() { m.undrained(sid) }, RetireRetry: m.retireRetry,
+		Connected: func() { m.working(living, sid) }, ResumeFailed: func() { m.failing(living, sid) },
 	})
 
 	m.mu.Lock()
@@ -1392,8 +1403,55 @@ func (m *Manager) SweepRetired(ctx context.Context, by time.Time) {
 		}
 		m.log.Info().Str("sid", sid).
 			Msg("handing back a session the engine will not bring back on its own")
+		// Counted as a failure before the account goes back, because that is what it is:
+		// the engine has nothing left to try -- a build WhatsApp refuses, a ban, an
+		// account that was unlinked -- and the resume sweep would otherwise find the
+		// account free a minute later and start the same attempt again.
+		//
+		// A teardown ends here too, and striking that one is wrong and harmless: the
+		// account is gone, nothing will ask about it again, and the record expires on its
+		// own. Telling the two apart at this point would mean the sweep reading a reason
+		// off a session that has already stopped.
+		m.failing(window, sid)
 		m.releaseThis(window, sid, session)
 	}
+}
+
+// working forgets a session's failures, which is what a connection that came up means.
+//
+// Bounded and detached, because it is called from the pump: the goroutine that publishes
+// what the engine says must not wait on Redis for longer than it would wait to publish.
+// A clear that does not land costs the account a wait it has already outgrown, and the
+// next connection clears it again.
+func (m *Manager) working(ctx context.Context, sid string) {
+	if m.quarantine == nil {
+		return
+	}
+	forget, cancel := context.WithTimeout(ctx, ackTimeout)
+	defer cancel()
+	if err := m.quarantine.Clear(forget, sid); err != nil {
+		m.log.Warn().Err(err).Str("sid", sid).Msg("could not clear the failures of a session that is connected")
+	}
+}
+
+// failing records one more failure for a session the connector could not bring back, and
+// says how long the fleet will now leave it alone.
+//
+// Bounded and detached for the reason working is: it is called from the executor, where
+// what waits behind it is every command for this account.
+func (m *Manager) failing(ctx context.Context, sid string) {
+	if m.quarantine == nil {
+		return
+	}
+	count, cancel := context.WithTimeout(ctx, ackTimeout)
+	defer cancel()
+	until, err := m.quarantine.Strike(count, sid)
+	if err != nil {
+		m.log.Warn().Err(err).Str("sid", sid).Msg("could not record that a session failed to come back")
+		return
+	}
+	m.log.Info().Str("sid", sid).Time("until", until).
+		Msg("a session the connector could not keep in the air; leaving it alone until then")
 }
 
 // releaseThis hands a session back only while it is still the one that was found.

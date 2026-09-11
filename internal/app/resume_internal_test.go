@@ -148,6 +148,34 @@ func TestTheResumeSweepAsksForOneBatchAtATime(t *testing.T) {
 	}
 }
 
+// An account the fleet has agreed to leave alone is not asked for, and the backoff is
+// the only thing that says so: the turn mark expires in a minute, so without this an
+// account that can never connect costs the fleet an attempt a minute for the life of the
+// deployment.
+func TestTheResumeSweepLeavesAQuarantinedAccountAlone(t *testing.T) {
+	t.Parallel()
+
+	connector, container, engine, _ := newResumeConnector(t)
+	// Two accounts again, the quarantined one first, so that the second coming back is
+	// proof that the first was considered and skipped rather than proof that nothing has
+	// happened yet.
+	wantConnected(t, container, "sid-a-broken", "5511999990001")
+	wantConnected(t, container, "sid-b-fine", "5511999990002")
+	if _, err := connector.quarantine.Strike(t.Context(), "sid-a-broken"); err != nil {
+		t.Fatalf("Strike: %v", err)
+	}
+
+	connector.resumeOnce(t.Context())
+
+	waitFor(t, "the healthy account to come back", func() bool {
+		account, ok := engine.Session("sid-b-fine")
+		return ok && account.Connected()
+	})
+	if _, ok := engine.Session("sid-a-broken"); ok {
+		t.Fatal("an account the fleet is waiting out was tried anyway; the backoff buys nothing")
+	}
+}
+
 // newResumeConnector builds the instance the sweep runs on: a real store, a real lease
 // set, and the fake engine, all over one Redis.
 func newResumeConnector(t *testing.T) (*Connector, *store.Container, *fake.Engine, *miniredis.Miniredis) {
@@ -160,10 +188,12 @@ func newResumeConnector(t *testing.T) (*Connector, *store.Container, *fake.Engin
 	leases := cluster.NewLeases(client, "inst-a", cluster.Options{})
 	engine := fake.New()
 
+	quarantine := cluster.NewQuarantine(client, nil)
 	manager := session.NewManager(&session.ManagerConfig{
 		Instance: "inst-a", Engine: engine, Leases: leases,
 		Publisher: quietPublisher{}, Replier: quietReplier{},
-		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+		Quarantine: quarantine,
+		NewID:      func() string { return "evt" }, Logger: zerolog.Nop(),
 	})
 	t.Cleanup(func() { manager.StopAll(context.Background()) })
 	answering(t, manager)
@@ -171,7 +201,7 @@ func newResumeConnector(t *testing.T) (*Connector, *store.Container, *fake.Engin
 	container := openTestStore(t)
 	connector := &Connector{
 		cfg: Config{Instance: "inst-a"}, log: zerolog.Nop(),
-		client: client, leases: leases, manager: manager, store: container,
+		client: client, leases: leases, quarantine: quarantine, manager: manager, store: container,
 	}
 	return connector, container, engine, server
 }
