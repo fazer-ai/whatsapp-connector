@@ -432,11 +432,19 @@ type Session struct {
 	// the reset itself when it finds nothing to take down.
 	//
 	// It names no connection, which bounds what it can do: it suppresses the next
-	// `Disconnected` handled, and if the reset's own event were overtaken by a later one the
-	// later one would consume it. Overtaking means one dispatch goroutine starved across a
-	// whole reconnect and a second drop, because `transition` hands off in arrival order once
-	// a waiter has waited a millisecond. Telling two drops apart would need a connection
-	// identity the event does not carry and whatsmeow does not expose, which is #179.
+	// `Disconnected` handled, whichever that turns out to be. Telling two drops apart would
+	// need a connection identity the event does not carry and whatsmeow does not expose,
+	// which is #179.
+	//
+	// Nothing retires it early, and that is a decision rather than an omission. Every rule
+	// for retiring it is a guess about whether a drop is still coming, and the two guesses
+	// fail in opposite directions. Guess wrong towards keeping it and one future drop is
+	// swallowed: the session reports `open` over a socket on the floor until whatsmeow's own
+	// reconnect announces itself, which it always starts on the same branch that dispatched
+	// the drop. Guess wrong towards dropping it and a late `Disconnected` writes
+	// `reconnecting` over a healthy replacement, and nothing after it says otherwise --
+	// commands refused until an operator reconnects the session by hand. One self-corrects
+	// and the other does not, so this keeps the mark.
 	// The reset the keepalive handler performs leads to a `Disconnected` dispatched from a
 	// goroutine of its own, and whatsmeow starts the reconnect from the same instant, so
 	// the two race: a `Connected` handled first leaves the late `Disconnected` writing
@@ -837,11 +845,6 @@ func (s *Session) setDialing(dialing bool) {
 	s.mu.Lock()
 	s.dialing = dialing
 	if dialing {
-		// Whatever a previous reset left marked is about a socket two lifecycles back: a
-		// hang-up or a re-pair between asking whether there was a socket and resetting it
-		// suppresses the `Disconnected` that mark was waiting for, and one left standing
-		// swallows the next genuine drop instead.
-		s.dropAnnounced = false
 		// Dated from the attempt and not from the authentication that follows it. What
 		// this stamp is compared against is whatsmeow's keepalive clock, and that starts
 		// with the socket: its loop dates its first "last answered" from the moment the
@@ -1993,7 +1996,6 @@ func (s *Session) resetUnlessReplaced(client *wm.Client, judged int64) {
 		return
 	}
 	if replaced {
-		s.retireDrop()
 		s.log.Info().Msg("a connection landed before the mute socket could be taken down; leaving it alone")
 		return
 	}
@@ -2003,7 +2005,6 @@ func (s *Session) resetUnlessReplaced(client *wm.Client, judged int64) {
 	// redial. It is the precondition for the reset producing anything at all -- with no
 	// socket under it, `ResetConnection` returns having done nothing.
 	if !client.IsConnected() {
-		s.retireDrop()
 		s.log.Info().Msg("the mute socket was already gone before it could be taken down")
 		return
 	}
@@ -2041,19 +2042,6 @@ func (s *Session) recovered() {
 	s.transitions.Add(1)
 	s.connected = true
 	s.reconnecting = false
-	s.mu.Unlock()
-}
-
-// retireDrop takes down the mark left for a `Disconnected` that is not going to come.
-//
-// A mark left standing is the mirror of what it exists to prevent: it swallows the next
-// genuine drop instead, and the session reports `open` over a socket on the floor. The
-// window between asking whether there is a socket and resetting it is not covered -- one
-// that dies in between produces no event either -- and that one closes itself, because
-// whatsmeow reconnects a remote drop on its own and the `Connected` puts the state back.
-func (s *Session) retireDrop() {
-	s.mu.Lock()
-	s.dropAnnounced = false
 	s.mu.Unlock()
 }
 

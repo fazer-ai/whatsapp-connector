@@ -367,43 +367,11 @@ func TestTheResetStandsDownWhenAConnectionLandedFirst(t *testing.T) {
 	if !strings.Contains(written.String(), "leaving it alone") {
 		t.Fatalf("the reset went ahead over a connection that landed after the judgement: %q", written.String())
 	}
-	assertTheNextDropIsApplied(t, session)
+	assertTheMarkStillStands(t, session)
 }
 
-// And it goes back to waiting when a command started between the decision and this
-// goroutine getting a turn. Only the lifecycle three can start there, everything else being
-// refused at the gate by then, and `logout` sends its removal IQ over the socket that is
-// still up: cutting that off is the resend the whole guard exists to avoid.
-func TestTheResetGoesBackToWaitingWhenACommandStartedFirst(t *testing.T) {
-	t.Parallel()
-
-	session, written := newLoggedTestSession(t, "5511999990001")
-	session.relearn(session.current())
-	dialedAndConnected(session)
-	session.announceDrop()
-
-	judged := session.transitions.Load()
-	// A logout started while the takedown was still waiting for a turn.
-	session.startCommand()
-
-	session.resetUnlessReplaced(session.current(), judged)
-
-	if !strings.Contains(written.String(), "waiting for its answer") {
-		t.Fatalf("the socket was taken down under a command that started first: %q", written.String())
-	}
-	session.mu.Lock()
-	owed := session.owed
-	session.mu.Unlock()
-	if owed == nil {
-		t.Fatal("the takedown was dropped instead of going back to waiting, so the mute socket stays up")
-	}
-}
-
-// And a reset that finds no socket takes the mark down too. Nothing is going to produce the
-// `Disconnected` it was left for -- whatsmeow's own 515 swap marks its disconnect expected,
-// so it publishes nothing -- and a mark left standing is the mirror of what it prevents: the
-// next genuine drop is swallowed and the session reports `open` over a socket on the floor.
-func TestTheResetRetiresTheMarkWhenThereIsNoSocketToTakeDown(t *testing.T) {
+// And a reset that finds no socket does nothing, quietly.
+func TestTheResetDoesNothingWhenThereIsNoSocketToTakeDown(t *testing.T) {
 	t.Parallel()
 
 	session, written := newLoggedTestSession(t, "5511999990001")
@@ -417,23 +385,56 @@ func TestTheResetRetiresTheMarkWhenThereIsNoSocketToTakeDown(t *testing.T) {
 	if !strings.Contains(written.String(), "already gone") {
 		t.Fatalf("the reset claimed to take down a socket that was not there: %q", written.String())
 	}
-	assertTheNextDropIsApplied(t, session)
+	assertTheMarkStillStands(t, session)
 }
 
-// assertTheNextDropIsApplied puts the session back on a socket and drops it, which a mark
-// left standing would swallow.
-func assertTheNextDropIsApplied(t *testing.T, session *Session) {
+// Neither of those retires the mark, and that is the decision the field comment records.
+// Whether a drop is still on its way is not knowable from here: the socket may have died
+// with its `Disconnected` dispatched and not yet handled, and a mark retired on the guess
+// that none is coming lets that one write `reconnecting` over the replacement, with nothing
+// after it to say otherwise. Keeping it costs one future drop swallowed, and that one the
+// reconnect announces its way out of.
+func assertTheMarkStillStands(t *testing.T, session *Session) {
 	t.Helper()
 
-	// Back on a socket the way whatsmeow's own reconnect puts it there, with no dial of this
-	// session's own. A dial retires the mark as well, and going through one here would hide
-	// whether the reset did -- and whatsmeow's reconnect after a keepalive reset never
-	// passes through a dial, which is the case this is about.
 	session.setConnected(true)
 	session.handle(&waEvents.Disconnected{})
-	if got := session.state(); got != "reconnecting" {
-		t.Fatalf("a genuine drop was swallowed by a mark nothing was ever going to claim, "+
-			"leaving the session %q over a socket on the floor", got)
+	if got := session.state(); got != "open" {
+		t.Fatalf("the mark was retired on a guess that no drop was coming, so a late one left "+
+			"the session %q over a socket that is up, with nothing to correct it", got)
+	}
+}
+
+// The drop that was still on its way when the reset stood down. The socket dies on its own
+// with the takedown still owed, whatsmeow reconnects, the command is answered, and only then
+// the drop is handled: it describes the socket that is gone, and applying it leaves the
+// session refusing commands over the replacement with nothing after it to say otherwise.
+func TestADropStillOnItsWayIsSuppressedAfterTheResetStandsDown(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.relearn(session.current())
+	dialedAndConnected(session)
+
+	session.startCommand()
+	session.handle(&waEvents.KeepAliveTimeout{ErrorCount: 2, LastSuccess: time.Now()})
+	next(t, session)
+
+	// The socket dies, its drop is dispatched and not handled yet, and whatsmeow's own
+	// reconnect authenticates the replacement.
+	session.handle(&waEvents.Connected{})
+	next(t, session)
+
+	// The command is answered, so the takedown finally gets its turn and stands down.
+	session.endCommand()
+	waitFor(t, func() bool { return session.state() == "open" }, "the session never settled")
+
+	// And only now the drop from the socket that is gone.
+	session.handle(&waEvents.Disconnected{})
+
+	if got := session.state(); got != "open" {
+		t.Fatalf("a drop from the socket that was replaced left the session %q over a healthy "+
+			"one, with nothing after it to correct the state", got)
 	}
 }
 
@@ -635,28 +636,6 @@ func TestEveryCommandBoundaryCountsWhatItIsCarryingOut(t *testing.T) {
 		if started > ended {
 			t.Fatalf("%s releases the count before it takes it:\n%s", boundary, carrying)
 		}
-	}
-}
-
-// A mark nothing is ever going to claim does not survive into the next connection. The
-// reset retires it when it finds no socket, but a hang-up or a re-pair landing between that
-// question and the reset suppresses the `Disconnected` it was left for, and a mark left
-// standing swallows the next genuine drop instead.
-func TestAFreshDialRetiresAMarkNoDisconnectEverClaimed(t *testing.T) {
-	t.Parallel()
-
-	session, _ := newTestSession(t, "5511999990001")
-	session.relearn(session.current())
-	dialedAndConnected(session)
-	session.announceDrop()
-
-	// The session dials again without that drop ever having arrived.
-	dialedAndConnected(session)
-	session.handle(&waEvents.Disconnected{})
-
-	if got := session.state(); got != "reconnecting" {
-		t.Fatalf("a genuine drop was swallowed by a mark left over from an older socket, "+
-			"leaving the session %q over a socket on the floor", got)
 	}
 }
 
