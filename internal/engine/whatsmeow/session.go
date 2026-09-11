@@ -2458,6 +2458,19 @@ func (s *Session) isStale() bool {
 // What is not here is refused rather than answered with a plausible shape: a connector
 // that acknowledged a send it cannot make would lose the message and report success.
 func (s *Session) Execute(ctx context.Context, command *protocol.Command) (json.RawMessage, error) {
+	// Answered before any of the counting below, because it is the one command that puts
+	// nothing on the socket: it reads this session's own memory and returns. There is
+	// nothing for a takedown to cut off, nothing to wait for, and nothing to count.
+	//
+	// Made explicit rather than left to fall through, because the session layer answers
+	// every `session.connect` with one of these (`internal/session/session.go`, the connect
+	// arm): a status that waited on a takedown would put the wait straight back into the
+	// connect that deliberately does not wait, and could time it out after the account was
+	// already recorded as one that should be connected.
+	if command != nil && command.Type == protocol.CommandSessionStatus {
+		return json.Marshal(s.status())
+	}
+
 	// Counted for the whole of it, so a socket this session decides to take down waits for
 	// whatever is already out at WhatsApp. What it must not interrupt is an answer that has
 	// not arrived: whatsmeow resends the frame it was cut off from, and WhatsApp applies it

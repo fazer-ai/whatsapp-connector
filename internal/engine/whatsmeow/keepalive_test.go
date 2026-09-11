@@ -1110,6 +1110,33 @@ func TestTheBoundariesThatMustNotWaitOnATakedownDoNot(t *testing.T) {
 	}
 }
 
+// And the status read is the only command answered before the counting. It is the one that
+// puts nothing on the socket, so there is nothing for a takedown to cut off -- and it has to
+// stay out of the wait for a second reason: the session layer answers every `session.connect`
+// with one, and that connect deliberately does not wait, so a status that waited would put
+// the wait straight back where it was taken out.
+//
+// Read off the source, and by counting rather than by naming: an exemption added later is
+// caught here whatever it is called.
+func TestOnlyTheStatusReadIsAnsweredBeforeTheCounting(t *testing.T) {
+	t.Parallel()
+
+	carrying := theBodyOf(t, "func (s *Session) Execute(")
+	counted := strings.Index(carrying, "s.startCommand(ctx)")
+	if counted < 0 {
+		t.Fatalf("Execute no longer counts the command in flight:\n%s", carrying)
+	}
+	exempt := map[string]bool{}
+	for _, name := range regexp.MustCompile(`protocol\.Command[A-Za-z]+`).FindAllString(carrying[:counted], -1) {
+		exempt[name] = true
+	}
+	if len(exempt) != 1 || !exempt["protocol.CommandSessionStatus"] {
+		t.Fatalf("the commands answered before the counting are %v, and the only one that may be "+
+			"is the status read: anything else can put a frame on a socket a takedown is about "+
+			"to close, and whatsmeow resends what it was cut off from:\n%s", exempt, carrying[:counted])
+	}
+}
+
 // The unlink a `session.delete` sends is the sharpest case of all: it is a lifecycle
 // command, so it never passes through `Execute`, and cutting it off would have whatsmeow
 // resend the removal to WhatsApp. Driven rather than fenced, because this one cannot be
