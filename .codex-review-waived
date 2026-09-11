@@ -1,3 +1,15 @@
+# PR#177: wrong on its premise. `dispatched` is not the handling time: it is the first
+# statement of `handle`, taken before the arm can reach `s.transition.Lock()`, which is what
+# `TestTheConnectionIsDatedFromTheDispatchAndNotTheHandling` fences off the source. And
+# whatsmeow gives each recovery a goroutine of its own (`go cli.dispatchEvent`, keepalive.go)
+# and calls handlers directly, with no queue in between, so that instant is the recovery's.
+# The consequence the finding builds on therefore does not follow. A replacement's socket can
+# only exist after the recovery happened, so its `connectedAt` is the later of the two, and
+# `lastKnownAlive` takes the later -- the superseded recovery loses the comparison it would
+# have had to win. That is what the comment on `answeredKeepAlive` says and why it can be
+# unconditional.
+internal/engine/whatsmeow/session.go: Do not date stale keepalive recoveries as current  # PR#177
+
 # PR#177: right, and right about the size of it too -- the gap is not the handshake, it is
 # the prekey count, the prekey upload and the passive IQ that whatsmeow runs in a goroutine
 # before it dispatches `Connected` (connectionevents.go:164 onwards), up to four IQ round

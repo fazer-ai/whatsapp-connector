@@ -776,6 +776,65 @@ func TestARecoveryAboutAReplacedSocketLeavesTheDropMarkStanding(t *testing.T) {
 	}
 }
 
+// And the debt of a mute socket is dropped without waiting for the transition lock. The
+// command a takedown waits on can be answered at any moment, and the reset that fires then
+// judges by a connection count the drop handler has not been able to move yet: behind a
+// publish waiting on a full inbox that is minutes, and minutes is enough for whatsmeow to
+// have redialled, so the reset finds a socket under the client and the socket it finds is
+// the replacement.
+func TestTheDebtOfAMuteSocketIsDroppedWithoutWaitingForTheLock(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.relearn(session.current())
+	dialedAndConnected(session)
+
+	session.startCommand()
+	session.handle(&waEvents.KeepAliveTimeout{ErrorCount: 2, LastSuccess: time.Now()})
+	next(t, session)
+	session.mu.Lock()
+	owed := session.owed
+	session.mu.Unlock()
+	if owed == nil {
+		t.Fatal("no takedown was owed, so this test is about nothing")
+	}
+
+	// Another arm holding the lock across a publish nobody is draining.
+	session.transition.Lock()
+	defer session.transition.Unlock()
+
+	go session.handle(&waEvents.Disconnected{})
+
+	waitFor(t, func() bool {
+		session.mu.Lock()
+		defer session.mu.Unlock()
+		return session.owed == nil
+	}, "the drop handler waited for the transition lock before dropping the debt, so a command "+
+		"answered while it waits takes down whatever socket the client has by then")
+}
+
+// And the connection is checked once more after a socket is found, because finding one is
+// what takes the time: that read waits on whatsmeow's socket lock, a redial holds it for the
+// length of an attempt, and a `true` returned at the end of one describes the socket that
+// replaced the mute one. Read off the source, because reaching it needs a real socket and a
+// real redial.
+func TestTheConnectionIsCheckedAgainAfterASocketIsFound(t *testing.T) {
+	t.Parallel()
+
+	taking := theBodyOf(t, "func (s *Session) resetUnlessReplaced(")
+	found := strings.Index(taking, "client.IsConnected()")
+	recheck := strings.LastIndex(taking, "s.transitions.Load() != judged")
+	reset := strings.Index(taking, "client.ResetConnection()")
+	if found < 0 || recheck < 0 || reset < 0 {
+		t.Fatalf("the takedown no longer reads as a check, a re-check and a reset:\n%s", taking)
+	}
+	if found > recheck || recheck > reset {
+		t.Fatalf("the takedown does not re-read the connection count between finding a socket and "+
+			"resetting it, so a socket found at the end of a redial is taken down even though it is "+
+			"the one that replaced the mute socket:\n%s", taking)
+	}
+}
+
 // The unlink a `session.delete` sends is the sharpest case of all: it is a lifecycle
 // command, so it never passes through `Execute`, and cutting it off would have whatsmeow
 // resend the removal to WhatsApp. Driven rather than fenced, because this one cannot be

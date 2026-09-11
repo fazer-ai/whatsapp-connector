@@ -2040,6 +2040,15 @@ func (s *Session) resetUnlessReplaced(client *wm.Client, judged int64) {
 		s.log.Info().Msg("the mute socket was already gone before it could be taken down")
 		return
 	}
+	// Asked again, because of what the answer above cost to get. That read waits on
+	// whatsmeow's socket lock and a redial holds it for the length of an attempt, so a
+	// `true` returned at the end of one is about the socket that replaced the mute one,
+	// not about the mute one. A connection that landed during the wait is one this session
+	// has counted by now, and this is the cheapest place to notice.
+	if s.transitions.Load() != judged {
+		s.log.Info().Msg("a connection landed while the mute socket was being checked; leaving it alone")
+		return
+	}
 	client.ResetConnection()
 }
 
@@ -3592,15 +3601,23 @@ func (s *Session) handle(rawEvent any) bool {
 		s.recovered()
 		s.emit(protocol.EventSessionState, s.sessionState())
 	case *waEvents.Disconnected:
-		s.transition.Lock()
-		defer s.transition.Unlock()
-
 		// The socket is gone, so a takedown still owed for it has nothing left to do, and
 		// leaving it owed is worse than useless: a recovery dispatched just before the drop
 		// and handled just after it would cancel that debt and put the session back on a
-		// connection that no longer exists. Dropped before the mark is read, because the
-		// branch that consumes the mark returns without touching anything else.
+		// connection that no longer exists.
+		//
+		// Before the lock, because the value of forgetting it is in forgetting it promptly.
+		// The command the takedown waits on can be answered at any moment, and the reset
+		// that fires then judges by a connection count this handler has not been able to
+		// move yet. Behind a publish waiting on a full inbox that is minutes, and minutes
+		// is long enough for whatsmeow to have redialled -- so the reset finds a socket
+		// under the client, and the socket it finds is the replacement. Nothing here needs
+		// the transition lock: the count is atomic and the debt is its own field.
 		s.forgetOwedReset()
+
+		s.transition.Lock()
+		defer s.transition.Unlock()
+
 		if s.dropWasAnnounced() {
 			// The drop this session brought on itself, published by the handler that caused
 			// it. Applying it here as well would be harmless in the order it usually
