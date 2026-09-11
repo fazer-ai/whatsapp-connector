@@ -31,9 +31,25 @@ type groupParticipant struct {
 // what the contract asks of a producer that does not answer them -- a `null` would claim
 // this group has no photo and no invite, which is a different and untrue thing.
 type groupInfo struct {
-	Group         protocol.Address   `json:"group"`
-	Subject       string             `json:"subject,omitempty"`
-	Description   string             `json:"description"`
+	Group       protocol.Address `json:"group"`
+	Subject     string           `json:"subject,omitempty"`
+	Description string           `json:"description"`
+	// TopicID is WhatsApp's own id for the description, passed on exactly as it arrives
+	// and never interpreted here.
+	//
+	// It is what says a group's description can no longer be changed. A group whose
+	// description was written by certain clients comes back with the literal string
+	// `undefined` here, and from then on every edit is refused with a conflict, whatever
+	// the stanza looks like -- measured on a group made for it, including a hand-built
+	// stanza through DangerousInternals. Without the field a client can only offer "try
+	// again", which in that group is false.
+	//
+	// Deliberately not an error code of its own. A conflict is genuinely ambiguous
+	// between a frozen description and another admin writing between the read and the
+	// write, and answering "refused permanently" would sell an inference as a fact. The
+	// raw reading lets the client decide what to say, which is a product choice and not
+	// this connector's to make.
+	TopicID       string             `json:"topic_id,omitempty"`
 	Owner         *protocol.Party    `json:"owner,omitempty"`
 	CreatedAt     int64              `json:"created_at,omitempty"`
 	Participants  []groupParticipant `json:"participants,omitempty"`
@@ -186,6 +202,7 @@ func (s *Session) describeGroupItself(ctx context.Context, info *waTypes.GroupIn
 	described := groupInfo{
 		Subject:      info.Name,
 		Description:  info.Topic,
+		TopicID:      info.TopicID,
 		Announce:     info.IsAnnounce,
 		Locked:       info.IsLocked,
 		JoinApproval: info.IsJoinApprovalRequired,
