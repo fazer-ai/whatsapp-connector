@@ -2174,7 +2174,7 @@ func TestALogoutThatNeverLeftLeavesTheStateAsItWas(t *testing.T) {
 	session, _ := newTestSession(t, "5511999990001")
 	session.logout = func(context.Context, *wm.Client) error { return wm.ErrNotConnected }
 	session.setConnected(false)
-	session.setReconnecting(true)
+	session.setReconnecting(true, time.Now())
 
 	if err := session.Logout(t.Context()); err == nil {
 		t.Fatal("a logout that never left was reported as one that went through")

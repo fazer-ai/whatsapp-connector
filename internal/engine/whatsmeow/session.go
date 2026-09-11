@@ -837,6 +837,11 @@ func (s *Session) setDialing(dialing bool) {
 	s.mu.Lock()
 	s.dialing = dialing
 	if dialing {
+		// Whatever a previous reset left marked is about a socket two lifecycles back: a
+		// hang-up or a re-pair between asking whether there was a socket and resetting it
+		// suppresses the `Disconnected` that mark was waiting for, and one left standing
+		// swallows the next genuine drop instead.
+		s.dropAnnounced = false
 		// Dated from the attempt and not from the authentication that follows it. What
 		// this stamp is compared against is whatsmeow's keepalive clock, and that starts
 		// with the socket: its loop dates its first "last answered" from the moment the
@@ -901,8 +906,7 @@ func (s *Session) setConnected(connected bool) {
 // own, outliving the socket they are about -- would read as current and take down the
 // replacement. The moment the retry starts is the latest instant that is still earlier than
 // any socket it can produce, which is what this comparison needs it to be.
-func (s *Session) setReconnecting(reconnecting bool) {
-	at := s.now()
+func (s *Session) setReconnecting(reconnecting bool, at time.Time) {
 	s.mu.Lock()
 	s.reconnecting = reconnecting
 	if reconnecting {
@@ -1212,6 +1216,9 @@ func (s *Session) Events() <-chan engine.Emission { return s.events }
 
 // Connect starts pairing or resumes a stored session.
 func (s *Session) Connect(ctx context.Context, req engine.ConnectRequest) error {
+	s.startCommand()
+	defer s.endCommand()
+
 	if s.isClosed() {
 		return errors.New("whatsmeow: the session is closed")
 	}
@@ -1708,6 +1715,9 @@ func (s *Session) pairWithCode(ctx context.Context, rawPhone, standing string) e
 
 // Disconnect drops the socket and keeps the credentials.
 func (s *Session) Disconnect(ctx context.Context) error {
+	s.startCommand()
+	defer s.endCommand()
+
 	s.cancelPairing()
 	// Before the socket goes down, because what this records is the answer to "should
 	// anything bring it back": written after, an instance that died in between would
@@ -1726,6 +1736,9 @@ func (s *Session) Disconnect(ctx context.Context) error {
 // Logout ends the session on WhatsApp's side and forgets the credentials here, so the
 // next connect has to pair again.
 func (s *Session) Logout(ctx context.Context) error {
+	s.startCommand()
+	defer s.endCommand()
+
 	s.cancelPairing()
 	if err := s.logout(ctx, s.current()); err != nil {
 		if sentNothing(err) {
@@ -2244,7 +2257,8 @@ func (s *Session) Execute(ctx context.Context, command *protocol.Command) (json.
 	// Counted for the whole of it, so a socket this session decides to take down waits for
 	// whatever is already out at WhatsApp. What it must not interrupt is an answer that has
 	// not arrived: whatsmeow resends the frame it was cut off from, and WhatsApp applies it
-	// again.
+	// again. Connect, Disconnect and Logout count themselves, because the session layer
+	// routes those three to their own engine methods rather than through here.
 	s.startCommand()
 	defer s.endCommand()
 
@@ -3314,6 +3328,13 @@ func pairingFailureMessage(reason string) string {
 // it again, which is the only honest answer while this build has nowhere to put it: an
 // acknowledged message nobody published is a message that is simply gone.
 func (s *Session) handle(rawEvent any) bool {
+	// Taken before anything here can wait. An arm that moves the connection dates it, and
+	// every one of them takes the transition lock first: a handler already holding it
+	// across a publish that waits on a full inbox delays this one by as long as that takes,
+	// and a connection dated from then reads as later than the socket it describes.
+	// whatsmeow calls this from the goroutine that dispatched the event, so this is as
+	// early as this session can know anything.
+	dispatched := s.now()
 	switch event := rawEvent.(type) {
 	case *waEvents.Message:
 		// The one handler that blocks, and the only place the ack invariant is decided:
@@ -3428,7 +3449,7 @@ func (s *Session) handle(rawEvent any) bool {
 		// waited for the event would spend those seconds still reporting `open`, accepting
 		// commands into the very lock the close is holding.
 		s.setConnected(false)
-		s.setReconnecting(true)
+		s.setReconnecting(true, dispatched)
 		// The `Disconnected` this is about to cause is already published, and saying so is
 		// what keeps it from being applied late: whatsmeow starts the reconnect from the
 		// same instant it dispatches that event, and a `Connected` handled first would
@@ -3490,7 +3511,7 @@ func (s *Session) handle(rawEvent any) bool {
 		if phone, _ := s.identity(); phone == "" {
 			state = "close"
 		}
-		s.setReconnecting(state == "reconnecting")
+		s.setReconnecting(state == "reconnecting", dispatched)
 		s.emit(protocol.EventSessionState, map[string]any{"state": state, "reason": "disconnected"})
 	case *waEvents.LoggedOut:
 		s.loggedOut(event)

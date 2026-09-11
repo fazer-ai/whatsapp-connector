@@ -486,18 +486,76 @@ func TestTheOwedTakeDownWaitsForTheLastCommandOut(t *testing.T) {
 // And what counts a command as being in flight is `Execute` itself, for the whole of it.
 // Read off the source because every command a test can run here answers from memory, so the
 // count is back to zero before anything could look at it.
-func TestExecuteCountsTheCommandItIsCarryingOut(t *testing.T) {
+func TestEveryCommandBoundaryCountsWhatItIsCarryingOut(t *testing.T) {
 	t.Parallel()
 
-	carrying := theBodyOf(t, "func (s *Session) Execute(")
-	started := strings.Index(carrying, "s.startCommand()")
-	ended := strings.Index(carrying, "defer s.endCommand()")
-	if started < 0 || ended < 0 {
-		t.Fatalf("Execute does not count the command in flight, so the keepalive handler takes "+
-			"the socket down under it and WhatsApp applies the resent frame twice:\n%s", carrying)
+	// Execute is not the only one: the session layer routes `session.connect`,
+	// `session.disconnect` and `session.logout` to these three directly
+	// (`internal/session/session.go`, lifecycle), so a pairing code or a logout would have
+	// a mutating IQ out at WhatsApp with nothing counting it.
+	for _, boundary := range []string{
+		"func (s *Session) Execute(",
+		"func (s *Session) Connect(",
+		"func (s *Session) Disconnect(",
+		"func (s *Session) Logout(",
+	} {
+		carrying := theBodyOf(t, boundary)
+		started := strings.Index(carrying, "s.startCommand()")
+		ended := strings.Index(carrying, "defer s.endCommand()")
+		if started < 0 || ended < 0 {
+			t.Fatalf("%s does not count the command in flight, so the keepalive handler takes "+
+				"the socket down under it and WhatsApp applies the resent frame twice:\n%s",
+				boundary, carrying)
+		}
+		if started > ended {
+			t.Fatalf("%s releases the count before it takes it:\n%s", boundary, carrying)
+		}
 	}
-	if started > ended {
-		t.Fatalf("Execute releases the count before it takes it:\n%s", carrying)
+}
+
+// A mark nothing is ever going to claim does not survive into the next connection. The
+// reset retires it when it finds no socket, but a hang-up or a re-pair landing between that
+// question and the reset suppresses the `Disconnected` it was left for, and a mark left
+// standing swallows the next genuine drop instead.
+func TestAFreshDialRetiresAMarkNoDisconnectEverClaimed(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.relearn(session.current())
+	dialedAndConnected(session)
+	session.announceDrop()
+
+	// The session dials again without that drop ever having arrived.
+	dialedAndConnected(session)
+	session.handle(&waEvents.Disconnected{})
+
+	if got := session.state(); got != "reconnecting" {
+		t.Fatalf("a genuine drop was swallowed by a mark left over from an older socket, "+
+			"leaving the session %q over a socket on the floor", got)
+	}
+}
+
+// And a connection is dated from when whatsmeow dispatched the event that announced it,
+// not from when this session got round to handling it. Every arm that moves the connection
+// takes the transition lock first, and one already held across a publish waiting on a full
+// inbox delays the next by as long as that takes: a connection dated from then reads as
+// later than the socket it describes, and genuine timeouts on that socket read as stale.
+// Read off the source because the delay it is about is another goroutine's.
+func TestTheConnectionIsDatedFromTheDispatchAndNotTheHandling(t *testing.T) {
+	t.Parallel()
+
+	handling := theBodyOf(t, "func (s *Session) handle(")
+	dated := strings.Index(handling, "dispatched := s.now()")
+	waits := strings.Index(handling, "s.transition.Lock()")
+	if dated < 0 || waits < 0 {
+		t.Fatalf("the event handler neither dates the event nor serialises:\n%s", handling[:400])
+	}
+	if dated > waits {
+		t.Fatalf("the event is dated after the first thing in the handler that can wait")
+	}
+	drop := theCaseFor(t, "*waEvents.Disconnected")
+	if !strings.Contains(drop, "dispatched)") {
+		t.Fatalf("the drop dates the reconnect from its own handling:\n%s", drop)
 	}
 }
 
@@ -511,7 +569,7 @@ func TestTheKeepAliveHandlerTakesTheSocketDownBeforeItWaitsOnThePublish(t *testi
 	t.Parallel()
 
 	handler := theCaseFor(t, "*waEvents.KeepAliveTimeout")
-	refused := strings.Index(handler, "setReconnecting(true)")
+	refused := strings.Index(handler, "setReconnecting(true")
 	closed := strings.Index(handler, "takeDownSoon(")
 	published := strings.Index(handler, "s.emit(")
 	if refused < 0 || closed < 0 || published < 0 {
