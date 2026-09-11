@@ -2,6 +2,7 @@ package whatsmeow
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"os"
 	"runtime"
@@ -675,6 +676,41 @@ func TestARecoveryHandledAfterTheDropDoesNotReviveTheSocket(t *testing.T) {
 	if got := session.state(); got != "reconnecting" {
 		t.Fatalf("a recovery handled after the drop put the session back to %q over a socket "+
 			"that is gone, so every command is accepted for a connection that does not exist", got)
+	}
+}
+
+// The unlink a `session.delete` sends is the sharpest case of all: it is a lifecycle
+// command, so it never passes through `Execute`, and cutting it off would have whatsmeow
+// resend the removal to WhatsApp. Driven rather than fenced, because this one cannot be
+// exercised against the real service without unpairing the account it would run on.
+func TestAMuteSocketIsNotTakenDownUnderATeardownStillWaiting(t *testing.T) {
+	t.Parallel()
+
+	session, written := newLoggedTestSession(t, "5511999990001")
+	session.relearn(session.current())
+	dialedAndConnected(session)
+
+	// The unlink is out at WhatsApp and has not been answered.
+	unlinking := make(chan struct{})
+	release := make(chan struct{})
+	session.logout = func(context.Context, *wm.Client) error {
+		close(unlinking)
+		<-release
+		return nil
+	}
+	deleted := make(chan error, 1)
+	go func() { deleted <- session.Delete(t.Context()) }()
+	<-unlinking
+
+	session.handle(&waEvents.KeepAliveTimeout{ErrorCount: 2, LastSuccess: time.Now()})
+
+	if !strings.Contains(written.String(), "comes down with its answer") {
+		t.Fatalf("the socket was taken down under the unlink, so whatsmeow resends the removal: %q",
+			written.String())
+	}
+	close(release)
+	if err := <-deleted; err != nil {
+		t.Fatalf("Delete: %v", err)
 	}
 }
 
