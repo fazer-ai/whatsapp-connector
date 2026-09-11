@@ -13,6 +13,7 @@ import (
 
 	"github.com/fazer-ai/whatsapp-connector/internal/cluster"
 	"github.com/fazer-ai/whatsapp-connector/internal/engine/fake"
+	"github.com/fazer-ai/whatsapp-connector/internal/observability"
 	"github.com/fazer-ai/whatsapp-connector/internal/redisx"
 	"github.com/fazer-ai/whatsapp-connector/internal/session"
 	"github.com/fazer-ai/whatsapp-connector/internal/store"
@@ -200,6 +201,8 @@ func newResumeConnector(t *testing.T) (*Connector, *store.Container, *fake.Engin
 
 	container := openTestStore(t)
 	connector := &Connector{
+		metrics: observability.New(),
+
 		cfg: Config{Instance: "inst-a"}, log: zerolog.Nop(),
 		client: client, leases: leases, quarantine: quarantine, manager: manager, store: container,
 	}

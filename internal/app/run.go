@@ -62,6 +62,13 @@ type Connector struct {
 	// loop goroutine, which is also the only one that reclaims.
 	reclaimCursor int
 
+	// silentReads is how many command reads have failed in a row, and silentSince is when
+	// that run began. Read and written only by the loop goroutine, which is the only one
+	// that reads commands.
+	silentReads  int
+	silentSince  time.Time
+	saidItIsMute bool
+
 	// partSwept is signalled after every completed pass of the refetch sweep, and only
 	// the tests set it. What they have to know is that the loop made its pass, and the
 	// two ways of learning that without a signal are both wrong: polling the table on a
@@ -853,12 +860,80 @@ func (c *Connector) readCommands(ctx context.Context) {
 	// here could only refuse, and one refusing every time is a read that never runs.
 	deliveries, err := c.streams.Read(ctx, sids)
 	if err != nil {
-		if ctx.Err() == nil {
-			c.log.Error().Err(err).Msg("failed to read commands")
-		}
+		c.commandReadFailed(ctx, err)
 		return
 	}
+	c.commandReadSucceeded()
 	c.dispatchWithin(ctx, deliveries)
+}
+
+// silentReadsBeforeAlarm is how many command reads have to fail in a row before the
+// instance says it is not serving, instead of reporting one more error.
+//
+// One failure is ordinary: a window spent, a connection the server closed, a blip. A run
+// of them is not, and nothing above this could tell the two apart -- while it lasts, this
+// instance carries out nothing for any session it owns, answers nobody, and goes on
+// reporting itself ready and holding every lease. On CI it lasted long enough to take a
+// test down and the only trace was four identical error lines (#178).
+const silentReadsBeforeAlarm = 3
+
+// commandReadFailed records a failed read and decides whether this is one more error or
+// an instance that has stopped serving.
+//
+// It also waits before letting the loop try again, and that is the point rather than
+// politeness: a read that fails at once -- Redis refusing the connection, a broken pipe --
+// returns immediately, the window it ran under is still open, and the loop goes straight
+// back in. That is a spin against a dependency already in trouble, for as long as the
+// window lasts. Backing off by a quarter of the heartbeat leaves a few attempts per
+// window and cannot outlive it, since the wait ends with the window it was given.
+func (c *Connector) commandReadFailed(ctx context.Context, err error) {
+	// A window that ran out is the deadline working, not the read failing: the tick
+	// hands out what is left of its period, and a read that spends all of it comes back
+	// with the context's error and nothing to report.
+	if ctx.Err() != nil {
+		return
+	}
+
+	c.metrics.CommandReadsFailed.Inc()
+	c.silentReads++
+	if c.silentReads == 1 {
+		c.silentSince = time.Now()
+	}
+	switch {
+	case c.silentReads < silentReadsBeforeAlarm:
+		c.log.Error().Err(err).Msg("failed to read commands")
+	case !c.saidItIsMute:
+		c.saidItIsMute = true
+		c.log.Error().Err(err).Int("failures", c.silentReads).
+			Dur("silent_for", time.Since(c.silentSince)).Int("sessions", c.manager.Count()).
+			Msg("this instance has stopped reading commands: every session it owns is unserved until reads come back")
+	default:
+		// Said once. Repeating it per read would bury the recovery line in the same log
+		// it is read from, and the metric is what carries how long this has gone on.
+		c.log.Debug().Err(err).Int("failures", c.silentReads).Msg("still not reading commands")
+	}
+
+	backoff := c.cfg.Heartbeat / 4
+	timer := time.NewTimer(backoff)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+	case <-ctx.Done():
+	}
+}
+
+// commandReadSucceeded closes a run of failures, and says so when there was one to close.
+func (c *Connector) commandReadSucceeded() {
+	c.metrics.CommandReadLastSuccess.SetToCurrentTime()
+	if c.silentReads == 0 {
+		return
+	}
+	if c.saidItIsMute {
+		c.log.Warn().Int("failures", c.silentReads).Dur("silent_for", time.Since(c.silentSince)).
+			Msg("reading commands again")
+	}
+	c.silentReads = 0
+	c.saidItIsMute = false
 }
 
 func (c *Connector) announce(ctx context.Context) {

@@ -39,6 +39,8 @@ func TestABatchStopsWhenItsWindowIsSpent(t *testing.T) {
 	t.Parallel()
 
 	connector := &Connector{
+		metrics: observability.New(),
+
 		cfg:     Config{LeaseTTL: time.Minute},
 		log:     zerolog.Nop(),
 		manager: newTestManager(t),
@@ -62,6 +64,8 @@ func TestABatchWithRoomCarriesEverythingOut(t *testing.T) {
 	t.Parallel()
 
 	connector := &Connector{
+		metrics: observability.New(),
+
 		cfg:     Config{LeaseTTL: time.Minute},
 		log:     zerolog.Nop(),
 		manager: newTestManager(t),
@@ -103,7 +107,9 @@ func TestADrainThatFailsGivesTheSessionsBack(t *testing.T) {
 	answering(t, manager)
 	t.Cleanup(func() { manager.StopAll(context.Background()) })
 
-	connector := &Connector{cfg: Config{LeaseTTL: time.Minute}, log: zerolog.Nop(), manager: manager, streams: streams}
+	connector := &Connector{
+		metrics: observability.New(),
+		cfg:     Config{LeaseTTL: time.Minute}, log: zerolog.Nop(), manager: manager, streams: streams}
 	ctx := context.Background()
 	if _, err := manager.Adopt(ctx, "s1"); err != nil {
 		t.Fatalf("Adopt: %v", err)
@@ -303,6 +309,8 @@ func TestADrainClaimsOnWhatIsLeftOfItsWindow(t *testing.T) {
 	t.Cleanup(func() { manager.StopAll(ctx) })
 
 	connector := &Connector{
+		metrics: observability.New(),
+
 		cfg: Config{LeaseTTL: 30 * time.Second}, log: zerolog.Nop(),
 		manager: manager, streams: timed,
 	}
@@ -355,6 +363,8 @@ func TestASessionCommandIsNotHeldBackByTheFloor(t *testing.T) {
 		t.Fatalf("Adopt: %v", err)
 	}
 	connector := &Connector{
+		metrics: observability.New(),
+
 		cfg:     Config{LeaseTTL: 30 * time.Second, Heartbeat: 600 * time.Millisecond},
 		log:     zerolog.Nop(),
 		manager: manager,
@@ -396,6 +406,8 @@ func TestAnAnswerIsNotMeasuredAgainstTheWindowItWasDispatchedIn(t *testing.T) {
 	t.Parallel()
 
 	connector := &Connector{
+		metrics: observability.New(),
+
 		cfg:     Config{LeaseTTL: 30 * time.Second, Heartbeat: 600 * time.Millisecond},
 		log:     zerolog.Nop(),
 		manager: newTestManager(t),
@@ -558,6 +570,8 @@ func TestASlowDrainStillLeavesRoomToRead(t *testing.T) {
 	t.Cleanup(func() { manager.StopAll(ctx) })
 
 	connector := &Connector{
+		metrics: observability.New(),
+
 		cfg: Config{LeaseTTL: 30 * time.Second, Heartbeat: heartbeat}, log: zerolog.Nop(),
 		manager: manager, streams: streams,
 	}
@@ -740,6 +754,8 @@ func TestAFailingSessionClaimDoesNotTakeTheControlStreamWithIt(t *testing.T) {
 	t.Cleanup(func() { manager.StopAll(ctx) })
 
 	connector := &Connector{
+		metrics: observability.New(),
+
 		cfg: Config{LeaseTTL: 30 * time.Second, Heartbeat: time.Second}, log: zerolog.Nop(),
 		manager: manager, streams: streams,
 	}
@@ -821,6 +837,8 @@ func TestAReclaimDispatchesOnWhatIsLeftOfItsOwnDeadline(t *testing.T) {
 	// own tell itself apart from a share of the period.
 	timed := &timedStreams{inner: streams}
 	connector := &Connector{
+		metrics: observability.New(),
+
 		cfg: Config{LeaseTTL: 30 * time.Second, Heartbeat: heartbeat}, log: zerolog.Nop(),
 		manager: manager, streams: timed,
 	}
@@ -1085,6 +1103,8 @@ func adoptedSession(
 	t.Cleanup(func() { manager.StopAll(context.Background()) })
 
 	connector := &Connector{
+		metrics: observability.New(),
+
 		cfg: Config{LeaseTTL: time.Minute, Heartbeat: time.Second}, log: zerolog.Nop(),
 		manager: manager, streams: streams,
 	}
@@ -1128,6 +1148,8 @@ func TestALaterCommandDoesNotOvertakeOneLeftPendingInTheSameBatch(t *testing.T) 
 		t.Fatalf("Adopt: %v", err)
 	}
 	connector := &Connector{
+		metrics: observability.New(),
+
 		cfg:     Config{LeaseTTL: 30 * time.Second, Heartbeat: 600 * time.Millisecond},
 		log:     zerolog.Nop(),
 		manager: manager,

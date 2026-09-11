@@ -460,36 +460,61 @@ func TestASessionIsDrainedBeforeAnythingNewerIsReadForIt(t *testing.T) {
 		t.Fatalf("the connect was refused: %+v", reply)
 	}
 
+	// The abandoned disconnect has to have been taken over, not merely not have come
+	// back yet: a window in which the connector did nothing at all would pass this test
+	// for the wrong reason. Nothing pending on the session's stream is what says the
+	// drain claimed that entry and acknowledged it, and it is read rather than asked, so
+	// a busy instance cannot fail it.
+	waitFor(t, "the abandoned disconnect to be taken over", func() bool {
+		pending, err := c.rdb.XPending(ctx, commands, redisstream.ConsumerGroup).Result()
+		return err == nil && pending.Count == 0
+	})
+
 	// Held past the reclaim delay: without the drain, the abandoned disconnect comes
 	// back on a later heartbeat and undoes the connect that replaced it.
-	deadline := time.Now().Add(9 * time.Second)
-	for time.Now().Before(deadline) {
-		c.send(ctx, commands, &protocol.Command{
-			V: protocol.Version, ID: "status-" + strconv.FormatInt(time.Now().UnixNano(), 10),
-			Type: protocol.CommandSessionStatus, SID: sid, TS: time.Now().UnixMilli(),
-			ReplyTo: c.key.Reply("status-check"), Payload: json.RawMessage(`{}`),
-		})
-		reply := c.await(ctx, "status-check", 5*time.Second)
-		if !reply.OK {
-			t.Fatalf("session.status was refused: %+v", reply)
+	//
+	// What says it came back is the session's own event stream, read once at the end,
+	// rather than a `session.status` round trip every 200ms. The round trip made the
+	// test assert two things at once -- that the connection stayed open, and that a
+	// command was answered within five seconds -- and on CI it failed on the second
+	// while the first held: the connector's command reads had timed out at the socket
+	// level, so nothing was answered and the invariant was never in question (#178).
+	// An event this connector published is a fact it recorded, and reading it needs
+	// nothing of the instance at the time of reading.
+	time.Sleep(9 * time.Second)
+
+	// A session this instance no longer runs would have gone quiet for a reason that is
+	// not an ordering bug: at a 7s TTL a stalled heartbeat loses the lease, and the
+	// session is let go. Checked first so the failure below cannot be read as the
+	// disconnect coming back when it is that instead.
+	if running := connector.Sessions(); running != 1 {
+		t.Fatalf("%d session(s) adopted at the end of the window, want 1: the lease went stale "+
+			"and this is not the disconnect coming back", running)
+	}
+
+	var opened bool
+	for _, event := range c.events(ctx, sid) {
+		if event.Type != protocol.EventSessionState {
+			continue
 		}
-		var status map[string]any
-		if err := json.Unmarshal(reply.Result, &status); err != nil {
-			t.Fatalf("unmarshal the status: %v", err)
+		var state struct {
+			State  string `json:"state"`
+			Reason string `json:"reason"`
 		}
-		if status["connection"] != "open" {
-			// Two things close a connection here and they need different fixes, so the
-			// assertion says which: the abandoned disconnect being carried out late,
-			// which is the defect this test is for, or the session having been let go
-			// because its lease went stale, which at a 7s TTL is a stalled heartbeat and
-			// not an ordering bug at all. A session this instance no longer runs is the
-			// second.
-			t.Fatalf("connection=%v after %s of the window, with %d session(s) still adopted "+
-				"(0 means the lease went stale and this is not the disconnect coming back), want open",
-				status["connection"], time.Since(deadline.Add(-9*time.Second)).Round(time.Millisecond),
-				connector.Sessions())
+		if err := json.Unmarshal(event.Payload, &state); err != nil {
+			t.Fatalf("unmarshal a session.state payload: %v", err)
 		}
-		time.Sleep(200 * time.Millisecond)
+		if state.State == "open" {
+			opened = true
+			continue
+		}
+		if opened {
+			t.Fatalf("session.state went to %q (reason %q) after the connect that replaced the "+
+				"abandoned disconnect, want the connection left open", state.State, state.Reason)
+		}
+	}
+	if !opened {
+		t.Fatal("no session.state reported the connection open, so this window proves nothing about what came after it")
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"go.mau.fi/whatsmeow/proto/waAdv"
 	waTypes "go.mau.fi/whatsmeow/types"
 
+	"github.com/fazer-ai/whatsapp-connector/internal/observability"
 	"github.com/fazer-ai/whatsapp-connector/internal/store"
 	"github.com/fazer-ai/whatsapp-connector/internal/store/storetest"
 )
@@ -25,6 +26,8 @@ func TestTheRefetchSweepRunsBeforeItsFirstTick(t *testing.T) {
 
 	passes := make(chan struct{}, 1)
 	connector := &Connector{
+		metrics: observability.New(),
+
 		cfg:       Config{MediaRefetch: DefaultMediaRefetch},
 		log:       zerolog.Nop(),
 		store:     container,
@@ -62,7 +65,9 @@ func TestTheRefetchSweepRunsBeforeItsFirstTick(t *testing.T) {
 func TestTheRefetchSweepStopsAtOnceWithNoStore(t *testing.T) {
 	t.Parallel()
 
-	connector := &Connector{cfg: Config{MediaRefetch: DefaultMediaRefetch}, log: zerolog.Nop()}
+	connector := &Connector{
+		metrics: observability.New(),
+		cfg:     Config{MediaRefetch: DefaultMediaRefetch}, log: zerolog.Nop()}
 	select {
 	case <-connector.sweepMediaParts(t.Context()):
 	case <-time.After(5 * time.Second):

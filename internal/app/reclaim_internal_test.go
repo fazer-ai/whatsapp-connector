@@ -4,6 +4,8 @@ import (
 	"slices"
 	"strconv"
 	"testing"
+
+	"github.com/fazer-ai/whatsapp-connector/internal/observability"
 )
 
 // Reclaiming runs on the goroutine that renews every lease this instance holds, and
@@ -18,7 +20,9 @@ func TestTheReclaimWindowReachesEverySessionInTurn(t *testing.T) {
 		sids = append(sids, "s"+strconv.Itoa(i))
 	}
 
-	connector := &Connector{}
+	connector := &Connector{
+		metrics: observability.New(),
+	}
 	seen := make(map[string]int, len(sids))
 	// Enough passes to cover the list, and no more: if it takes longer than this, the
 	// rotation is resampling rather than advancing.
@@ -44,7 +48,9 @@ func TestTheReclaimWindowReachesEverySessionInTurn(t *testing.T) {
 func TestASmallInstanceReclaimsEverythingEveryPass(t *testing.T) {
 	t.Parallel()
 
-	connector := &Connector{}
+	connector := &Connector{
+		metrics: observability.New(),
+	}
 	sids := []string{"s1", "s2", "s3"}
 	for range 3 {
 		window := connector.windowOver(slices.Clone(sids))
