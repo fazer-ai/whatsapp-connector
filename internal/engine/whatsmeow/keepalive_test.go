@@ -400,14 +400,22 @@ func TestTheConnectionIsStampedWhenItIsDialledAndNotWhenItIsAnnounced(t *testing
 	t.Parallel()
 
 	session, _ := newTestSession(t, "5511999990001")
+	dialled := time.Now()
+	clock := dialled
+	session.wallClock = func() time.Time { return clock }
 
 	session.setDialing(true)
-	afterTheDialStarted := time.Now()
+	// The authentication a dial waits for is not instant: prekeys and the passive switch
+	// come first, and whatsmeow's keepalive clock has been running since the socket came
+	// up. Driven rather than measured, because the gap this is about is the one the real
+	// thing can take seconds over and two `time.Now()` calls in a row cannot produce.
+	clock = dialled.Add(30 * time.Second)
 	session.setConnected(true)
 
-	if !session.lastKnownAlive().Before(afterTheDialStarted) {
-		t.Fatal("the connection is stamped when it is announced rather than when it is dialled, " +
-			"so every keepalive timeout on a socket slow to answer reads as stale and the socket stays up")
+	if stamped := session.lastKnownAlive(); !stamped.Equal(dialled) {
+		t.Fatalf("the connection is dated %s, the announcement, rather than %s, the dial, "+
+			"so every keepalive timeout on a socket slow to answer reads as stale and the socket stays up",
+			stamped.Format(time.TimeOnly), dialled.Format(time.TimeOnly))
 	}
 }
 
