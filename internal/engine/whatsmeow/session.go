@@ -930,6 +930,7 @@ func (s *Session) undoHangUp() bool {
 
 func (s *Session) offline() {
 	s.mu.Lock()
+	s.owed = nil
 	s.transitions.Add(1)
 	s.connected = false
 	s.reconnecting = false
@@ -2007,6 +2008,15 @@ func (s *Session) resetUnlessReplaced(client *wm.Client, judged int64) {
 		return
 	}
 	client.ResetConnection()
+}
+
+// forgetOwedReset drops a takedown whose socket is already gone, without any of what
+// cancelling one means: nothing recovered, so nothing is published and the mark stands for
+// the drop that is being handled.
+func (s *Session) forgetOwedReset() {
+	s.mu.Lock()
+	s.owed = nil
+	s.mu.Unlock()
 }
 
 // cancelOwedReset drops a takedown that was still waiting for a command to be answered, and
@@ -3552,6 +3562,12 @@ func (s *Session) handle(rawEvent any) bool {
 		s.transition.Lock()
 		defer s.transition.Unlock()
 
+		// The socket is gone, so a takedown still owed for it has nothing left to do, and
+		// leaving it owed is worse than useless: a recovery dispatched just before the drop
+		// and handled just after it would cancel that debt and put the session back on a
+		// connection that no longer exists. Dropped before the mark is read, because the
+		// branch that consumes the mark returns without touching anything else.
+		s.forgetOwedReset()
 		if s.dropWasAnnounced() {
 			// The drop this session brought on itself, published by the handler that caused
 			// it. Applying it here as well would be harmless in the order it usually

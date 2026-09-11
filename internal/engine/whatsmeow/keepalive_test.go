@@ -554,6 +554,32 @@ func TestASocketThatAnswersAgainBeforeTheTakeDownKeepsItsConnection(t *testing.T
 	}
 }
 
+// A recovery dispatched just before the socket dropped, and handled just after. whatsmeow
+// sends both from goroutines of their own, so the drop can take the transition lock first;
+// the recovery then arrives to a session that is already off that socket, and reviving it
+// there leaves the session accepting commands for a connection that does not exist.
+func TestARecoveryHandledAfterTheDropDoesNotReviveTheSocket(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.relearn(session.current())
+	dialedAndConnected(session)
+
+	session.startCommand()
+	session.handle(&waEvents.KeepAliveTimeout{ErrorCount: 2, LastSuccess: time.Now()})
+	next(t, session)
+
+	// The socket drops for real, and this is the event the takedown had marked.
+	session.handle(&waEvents.Disconnected{})
+	// And only now the recovery that was dispatched before it.
+	session.handle(&waEvents.KeepAliveRestored{})
+
+	if got := session.state(); got != "reconnecting" {
+		t.Fatalf("a recovery handled after the drop put the session back to %q over a socket "+
+			"that is gone, so every command is accepted for a connection that does not exist", got)
+	}
+}
+
 // And it waits for the last of them, not the first. The session runs its commands one at a
 // time, but the count is what says the socket is clear, and releasing it early is the same
 // resend under a different command.
