@@ -4,6 +4,13 @@
 // The key names live here rather than being written inline where they are used
 // because they are shared with the Chatwoot side: a name spelled from memory at one
 // call site is a stream nobody reads.
+//
+// A constructor here is also a claim in contract/README.md that the key exists, and a
+// client vendoring that file builds against it. So every constructor is either reached
+// from this build's production code or marked below as one only the client writes, and a
+// test holds the marking to what the build actually does -- a key nobody on either side
+// touches is a row telling a client to read a name that is never written, which is how
+// #160 collected four of them.
 package redisx
 
 import (
@@ -63,6 +70,11 @@ func (k Keys) Events(shard int) string { return k.prefix + "events:" + strconv.I
 func (k Keys) EventsOf(sid string) string { return k.Events(k.ShardOf(sid)) }
 
 // EventsLease is the key a client holds to be the single reader of a shard.
+//
+// Client-owned: this connector never reads or writes it, and the constructor is here so
+// both sides spell the name from the same place. Same for Consumer and Cursor below, and
+// for Reply above, which the connector writes into and never names: the destination
+// arrives as a command's reply_to and is checked with IsReply.
 func (k Keys) EventsLease(shard int) string { return k.Events(shard) + ":lease" }
 
 // Commands is the stream a client writes commands for one session to.
@@ -85,20 +97,11 @@ func (k Keys) IsReply(key string) bool {
 	return strings.HasPrefix(key, k.prefix+"reply:") && len(key) > len(k.prefix)+len("reply:")
 }
 
-// Sessions is the set of every session the fleet knows about.
-func (k Keys) Sessions() string { return k.prefix + "sessions" }
-
-// Session is the snapshot hash of one session.
-func (k Keys) Session(sid string) string { return k.prefix + "session:" + sid }
-
 // Lease is the key naming the instance that owns a session.
 func (k Keys) Lease(sid string) string { return k.prefix + "lease:" + sid }
 
 // LeaseEpoch is the counter incremented on every ownership change.
 func (k Keys) LeaseEpoch(sid string) string { return k.prefix + "lease-epoch:" + sid }
-
-// Handoff asks the current owner to release a session.
-func (k Keys) Handoff(sid string) string { return k.prefix + "handoff:" + sid }
 
 // HandBack names the instance that holds a session's lease and is giving it up.
 //
@@ -129,9 +132,3 @@ func (k Keys) Cursor(sid string) string { return k.prefix + "cursor:" + sid }
 
 // Idempotency is the record of a command that has already been carried out.
 func (k Keys) Idempotency(sid, key string) string { return k.prefix + "idem:" + sid + ":" + key }
-
-// DLQEvents holds events a client could not process.
-func (k Keys) DLQEvents() string { return k.prefix + "dlq:events" }
-
-// DLQCommands holds commands the connector could not carry out.
-func (k Keys) DLQCommands() string { return k.prefix + "dlq:commands" }
