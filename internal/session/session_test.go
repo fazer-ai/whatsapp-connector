@@ -414,6 +414,75 @@ func TestExpiredCommandIsRefusedWithoutRunning(t *testing.T) {
 	}
 }
 
+// The same refusal for a command with nobody to tell. A deadline is not a promise to
+// the caller that it will hear about the expiry -- it is an instruction to this side:
+// do not start this after that instant. What answers a fire and forget command is the
+// side effect it did not have.
+func TestAnExpiredCommandWithNoReplyToIsAlsoRefusedWithoutRunning(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	ctx := context.Background()
+
+	if _, err := h.manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, _ := h.engine.Session("s1")
+
+	var acked atomic.Bool
+	h.manager.Dispatch(delivery(&protocol.Command{
+		V: protocol.Version, ID: "c4", Type: protocol.CommandMessageMarkRead, SID: "s1",
+		Deadline: time.Now().Add(-time.Minute).UnixMilli(),
+		Payload:  json.RawMessage(`{"chat":{"kind":"phone","id":"5541999990000"},"message_ids":["A"],"type":"read"}`),
+	}, &acked))
+
+	waitFor(t, "the command to be retired", acked.Load)
+	if got := len(engineSession.Commands()); got != 0 {
+		t.Fatalf("the engine ran %d commands, want none", got)
+	}
+}
+
+// And the other half of what a deadline says: do not let it run past that instant. Also
+// read with nobody to answer, because it is this side that reads it -- the command runs
+// under a context that ends when the caller said, and no reply list is involved in
+// deciding that.
+//
+// Asked of the context the engine was handed, and not by waiting for an expiry: a
+// deadline near enough to observe passing is a wall clock deciding the order of a test,
+// and one far enough not to flake is one nothing waits for. The hour below is never
+// reached and never needs to be.
+func TestADeadlineWithNoReplyToStillBoundsTheRun(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	ctx := context.Background()
+
+	if _, err := h.manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, _ := h.engine.Session("s1")
+
+	var acked atomic.Bool
+	due := time.Now().Add(time.Hour).UnixMilli()
+	h.manager.Dispatch(delivery(&protocol.Command{
+		V: protocol.Version, ID: "c5", Type: protocol.CommandMessageMarkRead, SID: "s1",
+		Deadline: due,
+		Payload:  json.RawMessage(`{"chat":{"kind":"phone","id":"5541999990000"},"message_ids":["A"],"type":"read"}`),
+	}, &acked))
+
+	waitFor(t, "the command to be carried out", acked.Load)
+	bounds := engineSession.Bounds()
+	if len(bounds) != 1 {
+		t.Fatalf("the engine saw %d commands, want the one that was dispatched", len(bounds))
+	}
+	if bounds[0].IsZero() {
+		t.Fatal("the command ran under a context with no deadline, so nothing would stop it at the instant the caller named")
+	}
+	if got := bounds[0].UnixMilli(); got != due {
+		t.Fatalf("the command ran under a deadline of %d, want the %d it declared", got, due)
+	}
+}
+
 // A fire-and-forget command has nobody blocked on it, so a failure that published
 // nothing would be a command that silently did nothing.
 func TestFireAndForgetFailurePublishesCommandFailed(t *testing.T) {

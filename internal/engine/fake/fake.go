@@ -94,6 +94,7 @@ type Session struct {
 	givenUp   uint64
 	loggedOut int
 	commands  []protocol.Command
+	bounds    []time.Time
 	held      chan struct{}
 
 	heldSucceeds bool
@@ -182,13 +183,25 @@ func (s *Session) Commands() []protocol.Command {
 	return append([]protocol.Command(nil), s.commands...)
 }
 
+// Bounds returns, per command in Commands, the deadline its context carried, zero when
+// it carried none. It is how a test asks whether a command's own deadline reached the
+// engine without waiting for one to pass: a wait long enough to observe an expiry is a
+// wall clock deciding the order, which is what AGENTS.md rules out.
+func (s *Session) Bounds() []time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]time.Time(nil), s.bounds...)
+}
+
 // Execute records the command and answers the shapes the contract's result table
 // names. Anything it does not know is refused rather than answered with a guess: a
 // fake that invents a result shape is a test that passes against a contract nobody
 // implements.
 func (s *Session) Execute(ctx context.Context, command *protocol.Command) (json.RawMessage, error) {
+	bound, _ := ctx.Deadline()
 	s.mu.Lock()
 	s.commands = append(s.commands, *command)
+	s.bounds = append(s.bounds, bound)
 	connected := s.connected
 	held := s.held
 	s.mu.Unlock()
