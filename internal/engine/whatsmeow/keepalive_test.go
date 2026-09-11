@@ -729,6 +729,53 @@ func TestARecoveryHandledAfterTheDropDoesNotReviveTheSocket(t *testing.T) {
 	}
 }
 
+// And a recovery about a socket that has already been replaced does not take the drop mark
+// down with it. Three events from three goroutines, in an order whatsmeow allows and this
+// session cannot prevent: the replacement announces itself first, the recovery of the socket
+// it replaced lands after that, and the drop of that same socket lands last. The mark exists
+// for exactly that drop. A recovery that clears it leaves nothing to swallow it, and
+// `reconnecting` is written over a healthy socket with nothing after it to put that right --
+// the replacement is fine, so it produces no further event.
+func TestARecoveryAboutAReplacedSocketLeavesTheDropMarkStanding(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.relearn(session.current())
+	dialedAndConnected(session)
+
+	// A mute socket judged lost with a command still out at WhatsApp, so the takedown is
+	// owed rather than run, and the mark stands for a drop that has not happened yet.
+	session.startCommand()
+	session.handle(&waEvents.KeepAliveTimeout{ErrorCount: 2, LastSuccess: time.Now()})
+	if state := decode(t, next(t, session).Payload)["state"]; state != "reconnecting" {
+		t.Fatalf("the session published state=%v while giving up on the socket", state)
+	}
+
+	// whatsmeow puts the session on another socket, and this session hears the replacement
+	// before it hears anything about the one that went.
+	session.handle(&waEvents.Connected{})
+	if state := decode(t, next(t, session).Payload)["state"]; state != "open" {
+		t.Fatalf("the replacement published state=%v", state)
+	}
+
+	// The recovery of the socket that is gone, dispatched before the replacement was and
+	// handled after it, then the drop of that same socket, last of the three.
+	session.handle(&waEvents.KeepAliveRestored{})
+	session.handle(&waEvents.Disconnected{})
+
+	if got := session.state(); got != "open" {
+		t.Fatalf("the drop of the replaced socket was applied over the healthy replacement, "+
+			"leaving the session %q and refusing every command for a connection that works", got)
+	}
+
+	// And nothing is owed to a socket that is gone, so answering the command does not take
+	// the replacement down either.
+	session.endCommand()
+	if got := session.state(); got != "open" {
+		t.Fatalf("answering the command took down the replacement: %q", got)
+	}
+}
+
 // The unlink a `session.delete` sends is the sharpest case of all: it is a lifecycle
 // command, so it never passes through `Execute`, and cutting it off would have whatsmeow
 // resend the removal to WhatsApp. Driven rather than fenced, because this one cannot be

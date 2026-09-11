@@ -2053,15 +2053,28 @@ func (s *Session) forgetOwedReset() {
 }
 
 // cancelOwedReset drops a takedown that was still waiting for a command to be answered, and
-// reports whether there was one. The mark that went up with it comes down too: the
-// `Disconnected` it was left for is not going to happen now.
+// reports whether the connection it was judged on is the one that recovered.
+//
+// Only that one cancels it, and the mark is why. A recovery about a socket that has since
+// been replaced -- the replacement's `Connected` handled first, which moves the count -- has
+// nothing to bring back, and the `Disconnected` of the socket it describes is still on its
+// way: that drop is what the mark was raised for and what it has to swallow. Taking the mark
+// down on a recovery that arrived too late is how the drop of the old socket gets written
+// over the healthy new one, with nothing after it to put that right.
+//
+// The takedown goes either way. Its socket is gone, and `resetUnlessReplaced` would find the
+// count moved and leave it alone in any case.
 func (s *Session) cancelOwedReset() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.owed == nil {
 		return false
 	}
+	superseded := s.owed.judged != s.transitions.Load()
 	s.owed = nil
+	if superseded {
+		return false
+	}
 	s.dropAnnounced = false
 	return true
 }
