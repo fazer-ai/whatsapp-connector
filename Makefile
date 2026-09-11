@@ -42,6 +42,14 @@ ifndef WAC_TEST_DATABASE_URL
 endif
 	$(GO) test -count=1 $(PACKAGES)
 
+test-redis: ## Run the pass that needs a real Redis (WAC_TEST_REDIS_URL)
+ifndef WAC_TEST_REDIS_URL
+	$(error WAC_TEST_REDIS_URL is unset. It names the server this pass runs against, e.g. \
+	  docker run -d --rm -p 6379:6379 redis:8-alpine \
+	  then WAC_TEST_REDIS_URL=redis://localhost:6379/0 make test-redis)
+endif
+	$(GO) test -count=1 ./internal/transport/redisstream
+
 test-cover: ## Run the test suite and write coverage.txt
 	WAC_TEST_DATABASE_URL= $(GO) test -race -coverprofile=coverage.txt -covermode=atomic $(PACKAGES)
 
@@ -55,7 +63,7 @@ contract: ## Check the Go protocol binding against contract/
 tidy: ## Fail when go.mod/go.sum are not tidy
 	$(GO) mod tidy -diff
 
-check: lint test check-postgres ## Everything CI enforces
+check: lint test check-postgres check-redis ## Everything CI enforces
 
 # The dialect pass, when there is a server to run it against. Not a hard dependency:
 # `check` is what the git hooks and the stop hook fall back to, so requiring a running
@@ -67,6 +75,18 @@ ifdef WAC_TEST_DATABASE_URL
 	$(GO) test -count=1 $(PACKAGES)
 else
 	@echo "skipped the PostgreSQL pass: WAC_TEST_DATABASE_URL is unset (see 'make test-postgres')"
+endif
+
+# The same shape as check-postgres, for the same reason. miniredis answers zero for
+# `entries-added` and `entries-read`, so the trim report -- whose whole job is to notice
+# commands Redis dropped before anybody was handed them -- is correctly silent against it
+# and proves nothing. Conditional rather than required: a commit made without a server
+# running must not fail for a reason that is not the commit's.
+check-redis:
+ifdef WAC_TEST_REDIS_URL
+	$(GO) test -count=1 ./internal/transport/redisstream
+else
+	@echo "skipped the real-Redis pass: WAC_TEST_REDIS_URL is unset (see 'make test-redis')"
 endif
 
 clean: ## Remove build and coverage output

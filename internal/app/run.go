@@ -145,6 +145,7 @@ func New(cfg *Config, log zerolog.Logger) (connector *Connector, err error) {
 
 	streams, err := redisstream.New(client, redisstream.Options{
 		Instance: cfg.Instance, ClaimMinIdle: cfg.ClaimMinIdle, Block: readBlock(cfg.Heartbeat),
+		Logger: log,
 	})
 	if err != nil {
 		return nil, err

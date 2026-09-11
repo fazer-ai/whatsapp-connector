@@ -55,6 +55,20 @@ jobs:
           --health-timeout 5s
           --health-retries 10
 
+      # miniredis stands in for Redis everywhere else and cannot stand in here: it
+      # answers zero for `entries-added` and `entries-read`, the two counters that say
+      # whether a MAXLEN trim took commands the consumer group was never handed. Against
+      # the double that diagnosis is correctly silent, which means it is never exercised.
+      redis:
+        image: redis:8-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
     steps:
       - uses: actions/checkout@v7
 
@@ -77,6 +91,13 @@ jobs:
         env:
           WAC_TEST_DATABASE_URL: postgres://wac:wac@localhost:5432/wac?sslmode=disable
         run: go test -count=1 ./...
+
+      # The transport against a real server, for the counters miniredis does not keep.
+      # Its own database index, so nothing here shares state with the smoke job.
+      - name: Run the transport against Redis
+        env:
+          WAC_TEST_REDIS_URL: redis://localhost:6379/15
+        run: go test -count=1 ./internal/transport/redisstream
 
       - name: Upload coverage
         uses: actions/upload-artifact@v7
