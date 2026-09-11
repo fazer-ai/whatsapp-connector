@@ -2009,6 +2009,31 @@ func (s *Session) resetUnlessReplaced(client *wm.Client, judged int64) {
 	client.ResetConnection()
 }
 
+// cancelOwedReset drops a takedown that was still waiting for a command to be answered, and
+// reports whether there was one. The mark that went up with it comes down too: the
+// `Disconnected` it was left for is not going to happen now.
+func (s *Session) cancelOwedReset() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.owed == nil {
+		return false
+	}
+	s.owed = nil
+	s.dropAnnounced = false
+	return true
+}
+
+// recovered puts the session back on the socket it had given up on. Not `setConnected`,
+// because this is the same connection and not a new one: what was remembered about it,
+// group modes included, still describes it.
+func (s *Session) recovered() {
+	s.mu.Lock()
+	s.transitions.Add(1)
+	s.connected = true
+	s.reconnecting = false
+	s.mu.Unlock()
+}
+
 // retireDrop takes down the mark left for a `Disconnected` that is not going to come.
 //
 // A mark left standing is the mirror of what it exists to prevent: it swallows the next
@@ -2042,6 +2067,11 @@ func (s *Session) dropWasAnnounced() bool {
 }
 
 // answeredKeepAlive records that the socket answered a ping again.
+//
+// Unconditional, and the date is what makes that safe: `at` is when whatsmeow dispatched the
+// recovery, not when this session got round to it, so a recovery about a socket that has
+// since been replaced carries an instant from before the replacement was dated. The rule
+// that reads this takes the later of the two, so the superseded one loses.
 func (s *Session) answeredKeepAlive(at time.Time) {
 	s.mu.Lock()
 	s.keepAliveAnsweredAt = at
@@ -3503,6 +3533,21 @@ func (s *Session) handle(rawEvent any) bool {
 		defer s.transition.Unlock()
 
 		s.answeredKeepAlive(dispatched)
+		if !s.cancelOwedReset() {
+			return true
+		}
+		// The socket this session had given up on is answering again, and the takedown it
+		// was owed never ran: it was waiting for a command that is still out at WhatsApp.
+		// Nothing was closed, so there is nothing to bring back -- what is left is a session
+		// reporting `reconnecting` and refusing commands over a connection that works, for
+		// as long as that command takes.
+		//
+		// The narrow half of this is not covered: once the command is answered the takedown
+		// is already on its way, and a recovery landing after that resets a socket that is
+		// answering again. One reconnect, against the minutes this window can run to.
+		s.log.Info().Msg("the mute socket answered again before it could be taken down")
+		s.recovered()
+		s.emit(protocol.EventSessionState, s.sessionState())
 	case *waEvents.Disconnected:
 		s.transition.Lock()
 		defer s.transition.Unlock()

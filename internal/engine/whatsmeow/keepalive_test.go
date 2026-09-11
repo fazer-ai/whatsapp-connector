@@ -501,6 +501,59 @@ func waitFor(t *testing.T, done func() bool, complaint string) {
 	t.Fatal(complaint)
 }
 
+// A socket that answers again while the takedown is still waiting for a command gets to
+// keep its connection, and the session says so. Without this the session spends the whole
+// wait reporting `reconnecting` and refusing commands over a connection that works, and
+// then takes it down anyway when the command is answered.
+func TestASocketThatAnswersAgainBeforeTheTakeDownKeepsItsConnection(t *testing.T) {
+	t.Parallel()
+
+	session, written := newLoggedTestSession(t, "5511999990001")
+	session.relearn(session.current())
+	dialedAndConnected(session)
+
+	session.startCommand()
+	session.handle(&waEvents.KeepAliveTimeout{ErrorCount: 2, LastSuccess: time.Now()})
+	if state := decode(t, next(t, session).Payload)["state"]; state != "reconnecting" {
+		t.Fatalf("the session published state=%v while giving up on the socket", state)
+	}
+
+	// The socket answers again while that command is still out at WhatsApp.
+	session.handle(&waEvents.KeepAliveRestored{})
+
+	if got := session.state(); got != "open" {
+		t.Fatalf("a socket that answered again left the session %q, refusing commands over a "+
+			"connection that works", got)
+	}
+	if state := decode(t, next(t, session).Payload)["state"]; state != "open" {
+		t.Fatalf("the session published state=%v for a socket that answered again", state)
+	}
+	if !strings.Contains(written.String(), "answered again") {
+		t.Fatalf("the recovery went unsaid: %q", written.String())
+	}
+
+	// And the takedown it was owed is gone, so the command being answered does not take a
+	// healthy socket down after all.
+	session.endCommand()
+	session.mu.Lock()
+	owed := session.owed
+	session.mu.Unlock()
+	if owed != nil {
+		t.Fatal("the takedown survived the recovery")
+	}
+	if got := session.state(); got != "open" {
+		t.Fatalf("answering the command took down a socket that had recovered: %q", got)
+	}
+
+	// And the mark that went up with the takedown came down with it: no drop is coming from
+	// a reset that never ran, so a mark left standing would swallow the next genuine one.
+	session.handle(&waEvents.Disconnected{})
+	if got := session.state(); got != "reconnecting" {
+		t.Fatalf("a genuine drop was swallowed by the mark of a takedown that was cancelled, "+
+			"leaving the session %q over a socket on the floor", got)
+	}
+}
+
 // And it waits for the last of them, not the first. The session runs its commands one at a
 // time, but the count is what says the socket is clear, and releasing it early is the same
 // resend under a different command.
