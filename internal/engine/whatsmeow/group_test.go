@@ -478,6 +478,80 @@ func TestDescribingAGroupItselfNamesNobodyInIt(t *testing.T) {
 	}
 }
 
+// A group whose description was written by certain clients comes back with the literal
+// string `undefined` as its topic id, and from then on WhatsApp refuses every edit to that
+// description with a conflict -- measured on a group made for it, against every stanza
+// shape including one built by hand through DangerousInternals. Nothing else in the answer
+// says so, and without the reading a client can only offer "try again", which in that
+// group is false.
+//
+// Passed on exactly as it arrives, and that is the point of the field rather than an
+// oversight. A conflict is genuinely ambiguous between a frozen description and another
+// admin writing between the read and the write, so what this connector can honestly send
+// is the reading, not a verdict built on it.
+func TestAGroupDescriptionCarriesTheIDThatSaysItIsFrozen(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+
+	for name, topicID := range map[string]string{
+		// What WhatsApp answers for a description nothing can change any more.
+		"a description nothing can change": "undefined",
+		// And an ordinary one, so the field is not a constant that happens to match.
+		"an ordinary description": "3EB0C767D26B8CA1E0A0A1",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			described := session.describeGroupItself(t.Context(), &waTypes.GroupInfo{
+				JID:        waTypes.NewJID("120363041234567890", waTypes.GroupServer),
+				GroupTopic: waTypes.GroupTopic{Topic: "the description", TopicID: topicID},
+			})
+			if described.TopicID != topicID {
+				t.Fatalf("the group was described with topic_id %q, want %q", described.TopicID, topicID)
+			}
+
+			// And it has to survive the rendering, which is where the client reads it.
+			body, err := json.Marshal(described)
+			if err != nil {
+				t.Fatalf("render the group: %v", err)
+			}
+			var rendered map[string]any
+			if err := json.Unmarshal(body, &rendered); err != nil {
+				t.Fatalf("read the rendered group back: %v", err)
+			}
+			if rendered["topic_id"] != topicID {
+				t.Fatalf("the rendered group carries topic_id %v, want %q", rendered["topic_id"], topicID)
+			}
+		})
+	}
+}
+
+// A group WhatsApp said nothing about the topic of leaves the field out rather than
+// sending an empty string. Absent is what the contract asks of a producer that did not
+// answer, and an empty string here would read as an id, which is what a client compares
+// against `undefined`.
+func TestAGroupWithNoTopicIDLeavesTheFieldOut(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	described := session.describeGroupItself(t.Context(), &waTypes.GroupInfo{
+		JID: waTypes.NewJID("120363041234567890", waTypes.GroupServer),
+	})
+
+	body, err := json.Marshal(described)
+	if err != nil {
+		t.Fatalf("render the group: %v", err)
+	}
+	var rendered map[string]any
+	if err := json.Unmarshal(body, &rendered); err != nil {
+		t.Fatalf("read the rendered group back: %v", err)
+	}
+	if _, there := rendered["topic_id"]; there {
+		t.Fatalf("a group with no topic id rendered one anyway: %v", rendered["topic_id"])
+	}
+}
+
 func TestAGroupListingNeedsAConnection(t *testing.T) {
 	t.Parallel()
 
