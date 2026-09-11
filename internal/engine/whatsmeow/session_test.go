@@ -115,13 +115,14 @@ func TestExecuteAnswersTheSessionStatus(t *testing.T) {
 var (
 	// Answered before a command ever reaches the engine, so Execute refuses them the
 	// same way it refuses a command nobody implemented at all. That refusal is not what
-	// a client sees. The session's own lifecycle takes the first three and the manager
+	// a client sees. The session's own lifecycle takes the first four and the manager
 	// takes the last two off the control stream, and both are covered where they live,
 	// in internal/session and internal/app.
 	commandsHandledAboveTheEngine = []protocol.CommandType{
 		protocol.CommandSessionConnect,
 		protocol.CommandSessionDisconnect,
 		protocol.CommandSessionLogout,
+		protocol.CommandSessionDelete,
 		protocol.CommandSessionWake,
 		protocol.CommandAdminPing,
 	}
@@ -133,7 +134,6 @@ var (
 	// point -- it is what makes the connector's reach something someone decided rather
 	// than something that drifted.
 	commandsNoHandlerCarriesOut = []protocol.CommandType{
-		protocol.CommandSessionDelete,
 		protocol.CommandSessionUpdate,
 		protocol.CommandHistoryRequest,
 		protocol.CommandContactInfo,
@@ -945,6 +945,45 @@ func TestALogoutThatNeverReachedWhatsappKeepsTheCredentials(t *testing.T) {
 	}
 	if _, bound, err := container.For(session.sid).JID(t.Context()); err != nil || !bound {
 		t.Fatalf("the pairing was forgotten anyway (bound=%v, err=%v)", bound, err)
+	}
+}
+
+// The same situation as the logout above, against the real store, with the opposite
+// answer -- which is the whole of why Delete exists as its own call.
+//
+// A logout that never reached WhatsApp keeps credentials that still resume, because the
+// operator is still running the account and a failed unlink must not cost them a fresh
+// pairing. A delete is sent by a client that has already destroyed the inbox, so there
+// is nobody left to pair again: credentials kept there are a device linked on somebody's
+// phone with nothing on this side that answers for it, and no later command can remove
+// it, because the credentials that would sign the unlink are these.
+func TestADeleteThatNeverReachedWhatsappForgetsTheCredentialsAnyway(t *testing.T) {
+	t.Parallel()
+
+	session, container := newTestSession(t, "5511999990002")
+
+	// Paired, and the socket is down -- exactly where the logout above keeps everything.
+	if _, bound, err := container.For(session.sid).JID(t.Context()); err != nil || !bound {
+		t.Fatalf("the account under test was not paired to begin with (bound=%v, err=%v)", bound, err)
+	}
+
+	if err := session.Delete(t.Context()); err != nil {
+		t.Fatalf("a delete whose unlink was refused answered failure (%v); the teardown finished, and a client that republishes on failure would retry an unlink that can never succeed again", err)
+	}
+
+	if _, bound, err := container.For(session.sid).JID(t.Context()); err != nil || bound {
+		t.Fatalf("a delete kept the pairing after the unlink was refused (bound=%v, err=%v); the session goes on being adopted for an inbox that no longer exists", bound, err)
+	}
+
+	// And it says so the way every other giving-up does, or the account stays owned by an
+	// instance with nothing left to try: the lease goes back on the strength of this mark.
+	emission := next(t, session)
+	if emission.Type != protocol.EventSessionLoggedOut {
+		t.Fatalf("a delete published %q, want %q", emission.Type, protocol.EventSessionLoggedOut)
+	}
+	if !emission.Retires || emission.Attempt == 0 || emission.Attempt != session.Finished() {
+		t.Fatalf("the event ending a deleted session was not marked as its last (retires=%v, attempt=%d, finished=%d); the lease would be held for an account that no longer exists",
+			emission.Retires, emission.Attempt, session.Finished())
 	}
 }
 

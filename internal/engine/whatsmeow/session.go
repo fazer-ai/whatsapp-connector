@@ -1642,6 +1642,74 @@ func (s *Session) Logout(ctx context.Context) error {
 	return nil
 }
 
+// Delete tears the account down for a client that has already stopped addressing it.
+//
+// The unlink is attempted first, because a device this connector forgets while WhatsApp
+// still lists it is a row on somebody's phone that nothing can ever remove: the
+// credentials that would authorise the unlink are exactly what is about to be deleted.
+// Trying first is the only order in which the unlink is possible at all.
+//
+// What is different from Logout is what happens next. Logout leaves credentials that
+// still resume when the request never left; here they are deleted anyway. The caller
+// destroyed the inbox before sending this, so there is no operator left to spare a
+// fresh pairing, and what keeping them buys is a session this connector goes on
+// adopting, reconnecting and publishing events for, addressed to nobody.
+//
+// A refused unlink is not a failed delete, and answering that it was is the mistake
+// this comment exists to prevent. The two ways to get here are an account that was
+// never paired, where there is nothing on WhatsApp's side to remove and nothing is
+// left behind, and a paired account whose socket is down, where the device stays
+// listed on the phone. Neither improves on a retry -- the second cannot, because the
+// credentials a later attempt would sign with are gone by then -- so a failure
+// answered here is a command the client republishes forever over a teardown that
+// already happened. What the second one leaves is named in the log instead.
+func (s *Session) Delete(ctx context.Context) error {
+	s.cancelPairing()
+	_, paired, pairedErr := s.store.JID(ctx)
+	unlink := s.logout(ctx, s.current())
+	// Whatever WhatsApp answered, this session is not coming back. settleLogout is what
+	// keeps a reconnect from dialling on credentials that are about to be gone.
+	s.settleLogout()
+	switch {
+	case unlink == nil:
+	case pairedErr == nil && !paired:
+		// Nothing was linked, so there is nothing WhatsApp has to be told about and no
+		// residue to name. The commonest way here is the redelivery of a delete that
+		// already ran.
+		s.log.Debug().Str("sid", s.sid).
+			Msg("nothing was linked for this session, so the teardown had no device to unlink")
+	default:
+		// The one case that leaves something behind, and the operator is the only one who
+		// can act on it: the device goes on being listed on the phone until they remove
+		// it there. Logged rather than returned, because returning it asks the client to
+		// retry a teardown that is finished and an unlink that can never succeed again.
+		s.log.Warn().Err(unlink).Str("sid", s.sid).
+			Msg("the device could not be unlinked before the session was deleted; it may still be listed on the phone")
+	}
+
+	if err := s.store.Forget(ctx); err != nil {
+		// This one is a real failure: nothing was deleted, so the account is still
+		// addressable and a retry can still fix it. Answering success here is what would
+		// turn a failed teardown into the silence this exists to end.
+		s.markStale()
+		return fmt.Errorf("whatsmeow: delete %s: %w", s.sid, err)
+	}
+	if err := s.rebuild(ctx); err != nil {
+		s.markStale()
+		return fmt.Errorf("whatsmeow: delete %s: %w", s.sid, err)
+	}
+
+	// Said the way every other giving-up is said, and for the same reason: there is
+	// nothing left for this session to try, so the connector hands the lease back once
+	// the event is out and the account stops belonging to an instance that will not use
+	// it. The number can be paired again straight away rather than after the lease
+	// expires -- and a connect arriving anyway takes the mark down, which is right:
+	// there are no credentials left, so what it gets is a fresh pairing.
+	s.markTerminal()
+	s.emitLast(protocol.EventSessionLoggedOut, map[string]any{"reason": "session_deleted"})
+	return nil
+}
+
 // settleLogout records a socket the account no longer has, and refuses the connection
 // whatsmeow may still have queued behind the unlink.
 //

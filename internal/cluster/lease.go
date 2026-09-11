@@ -455,6 +455,51 @@ func (l *Leases) Release(ctx context.Context, sid string) (bool, error) {
 	return released == 1, nil
 }
 
+// Compared against the lease in one step, and that is the whole of why it is a script.
+// A local lease can have expired in Redis without this instance knowing -- that is what
+// the renew margin exists for -- and a bare DEL sent then deletes the counter of the
+// peer that has since taken the account and started counting from its own epoch. The
+// next handover would restart at one, under a client cursor that is already higher.
+var forgetEpochScript = redis.NewScript(`
+if redis.call("GET", KEYS[1]) ~= ARGV[1] then
+  return 0
+end
+redis.call("DEL", KEYS[2])
+return 1
+`)
+
+// ForgetEpoch deletes a session's epoch counter, and it is for a session being deleted
+// rather than handed over.
+//
+// The epoch is a fencing token, not a statistic: a client drops events carrying a lower
+// epoch than the one it has seen, which is what keeps a late event from a previous owner
+// off a session another instance is running. So the counter must never go backwards
+// while an account exists, and giving the key a TTL would do exactly that -- it would
+// expire while nobody held the session, the next acquisition would count from one again,
+// and a stale owner still holding eight would out-rank the live one and overwrite its
+// state. Kilobytes of leak against silent corruption is not a trade.
+//
+// Deleting it here is safe for the one reason that does not generalise: the account
+// itself is gone. The credentials are deleted, the mapping with them, and there is no
+// inbox on the other side left for anybody's late event to corrupt. An account paired
+// again is a new one, and a count starting over is the truth about it.
+func (l *Leases) ForgetEpoch(ctx context.Context, sid string) error {
+	keys := l.client.Keys()
+	held, err := forgetEpochScript.Run(
+		ctx, l.client, []string{keys.Lease(sid), keys.LeaseEpoch(sid)}, l.instance,
+	).Int()
+	if err != nil {
+		return fmt.Errorf("cluster: forget the epoch of %s: %w", sid, err)
+	}
+	if held == 0 {
+		// The lease moved on while this was in flight. Somebody else owns the account and
+		// the counter is theirs now, so leaving it is the right answer rather than a
+		// failure: this instance no longer has anything to say about the session.
+		return ErrNotOwner
+	}
+	return nil
+}
+
 // Freshness is how much of a lease this instance may still act on, which is the same
 // clock Owned answers from: the lifetime left before the margin, and zero once that is
 // gone or the lease was never held.

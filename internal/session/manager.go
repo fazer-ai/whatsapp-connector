@@ -679,6 +679,15 @@ func (m *Manager) Dispatch(delivery *transport.Delivery) (pending bool) {
 	m.mu.RUnlock()
 
 	if !running {
+		if command.Type == protocol.CommandSessionDelete && command.SID != "" {
+			// The one command worth adopting an account for, and the one state it is
+			// most often sent in: an inbox destroyed while its session was down, or
+			// while the fleet was restarting. Left for an owner that does not exist, a
+			// teardown waits for a session nobody is going to start -- the account goes
+			// on being adopted later, reconnecting and publishing for an inbox that is
+			// gone.
+			return m.own(delivery, m.takeForDelete)
+		}
 		// Not ours. Leaving it un-acknowledged is the point: the instance that does own
 		// the session reads the same stream, and an instance that owns nothing must not
 		// swallow a command on its way there. Released, so it does not read as work this
@@ -865,6 +874,62 @@ func (m *Manager) wake(ctx context.Context, delivery *transport.Delivery) {
 		return
 	}
 	m.ack(ctx, delivery)
+}
+
+// takeForDelete adopts an account nobody is running so that its own executor can tear it
+// down, and hands the command to it.
+//
+// This is the only thing the manager does for a teardown, and it is what `wake` already
+// does for a different reason: a command is carried out by the session it names, and an
+// account nobody has adopted has no session to carry anything out. Adoption gives it
+// one, under the lease that fences every store write and with the engine open on the
+// credentials the unlink has to be signed with. The teardown is an ordinary command from
+// there -- same queue, same order, same deadline, same record of having run.
+//
+// An account this instance adopts here never connects. The socket the unlink would have
+// gone out over is one a session that was down does not have, and dialling for it would
+// be a connection made for an inbox that no longer exists; what that costs is a device
+// left listed on the operator's phone, which the engine names in its log.
+func (m *Manager) takeForDelete(ctx context.Context, delivery *transport.Delivery) {
+	sid := delivery.Command.SID
+	session, err := m.Adopt(ctx, sid)
+	switch {
+	case err == nil:
+	case errors.Is(err, errLeaving):
+		// This instance is in the middle of giving the account up. Released, so it keeps
+		// the age it has had since it was sent: the account is about to belong to nobody,
+		// and the next pass finds it that way.
+		release(delivery)
+		return
+	case errors.Is(err, cluster.ErrNotOwner):
+		// A peer is running it, and nothing here can make it stop: `handoff:<sid>` is in
+		// the key set and is written and read by nobody. Tearing down from here would
+		// pull the credentials out from under a live socket that still holds the lease.
+		//
+		// Left pending for the owner, which reads the control stream too, and forfeited
+		// rather than released: an entry that keeps its age is the oldest one on every
+		// pass, so this instance would claim it first again, and again, while the owner
+		// never got a turn. Measured at 126 claims in two minutes on a fleet of two.
+		m.log.Info().Str("sid", sid).
+			Msg("a delete named a session another instance is running; leaving it pending for the owner")
+		forfeit(delivery)
+		return
+	default:
+		// Whatever stopped the adoption -- a database that was away, a store that could
+		// not be read -- may well be over by the time this is reclaimed. Forfeited for the
+		// same reason a wake is: this instance took its turn at it.
+		m.log.Error().Err(err).Str("sid", sid).Msg("failed to adopt a session to tear it down; leaving the delete pending")
+		forfeit(delivery)
+		return
+	}
+
+	if session.Offer(delivery) != OfferAccepted {
+		// Busy or stopping, and neither is this command's to answer: the session that
+		// refused it is the one that would have carried it out. Released, so whoever runs
+		// the account next -- this instance once the queue drains, or a peer -- finds a
+		// teardown that has never been acknowledged.
+		release(delivery)
+	}
 }
 
 func (m *Manager) pong(ctx context.Context, delivery *transport.Delivery) {

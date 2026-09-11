@@ -3291,3 +3291,131 @@ func (h waiting) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
 		return ctx.Err()
 	}
 }
+
+// A teardown for an account nobody is running is the state the command exists for: an
+// inbox destroyed while its session was down, or while the fleet was restarting. There
+// is no executor for it, so the manager makes one -- adoption, which takes the lease
+// that fences every store write and opens the engine on the credentials the unlink has
+// to be signed with -- and the delete is an ordinary command from there.
+//
+// Left to the ordinary route, the command reaches nobody at all: an instance reads
+// `wa:cmd:<sid>` only for the sessions it runs, so a stream for an account nobody has
+// adopted is in no read set and the entry dies when MAXLEN cuts it.
+func TestADeleteForAnAccountNobodyRunsAdoptsItAndTearsItDown(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+	keys := client.Keys()
+
+	const sid = "9c2b7d1e-0000-4000-8000-0000000000d1"
+	fakeEngine := fake.New()
+	manager := NewManager(&ManagerConfig{
+		Instance: "inst-a", Engine: fakeEngine,
+		Leases:    cluster.NewLeases(client, "inst-a", cluster.Options{}),
+		Publisher: quietPublisher{}, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	ctx := context.Background()
+	t.Cleanup(func() { manager.StopAll(ctx) })
+	answering, stopAnswering := context.WithCancel(ctx)
+	stopped := manager.Answer(answering)
+	t.Cleanup(func() { stopAnswering(); <-stopped })
+
+	var acked, left atomic.Bool
+	pending := manager.Dispatch(&transport.Delivery{
+		Command: protocol.Command{V: protocol.Version, ID: "c1", Type: protocol.CommandSessionDelete, SID: sid},
+		Ack:     func(context.Context) error { acked.Store(true); return nil },
+		Release: func() { left.Store(true) },
+		Forfeit: func() { left.Store(true) },
+	})
+	if pending {
+		t.Fatal("a delete queued for the manager to answer was reported as left pending")
+	}
+	waitFor(t, acked.Load, "the teardown was never carried out: a delete for an account nobody runs reached no session at all")
+	if left.Load() {
+		t.Fatal("the delete was left pending as well as carried out")
+	}
+
+	engineSession, ok := fakeEngine.Session(sid)
+	if !ok {
+		t.Fatal("no session was ever opened for the account, so nothing was torn down")
+	}
+	if got := engineSession.Deleted(); got != 1 {
+		t.Fatalf("the account was torn down %d times, want once", got)
+	}
+
+	// And what the fleet kept to address the account goes with it. The lease first,
+	// which is what lets the number be paired again without waiting out its TTL, and the
+	// epoch counter behind it -- deleted only here, where the account itself is gone and
+	// there is no inbox left for a late event of a previous owner to corrupt.
+	waitFor(t, func() bool {
+		manager.SweepRetired(ctx, time.Now().Add(time.Second))
+		return !server.Exists(keys.Lease(sid))
+	}, "the lease of a deleted account was never handed back; the number cannot be paired again until it expires")
+	if server.Exists(keys.LeaseEpoch(sid)) {
+		t.Fatal("the epoch counter of a deleted account was left behind, and nothing else in the fleet ever deletes one")
+	}
+}
+
+// An account another instance is running is left alone. Nothing here can ask that
+// instance to stop -- `handoff:<sid>` has a key constructor and no producer -- so tearing
+// it down from here would pull the credentials out from under a live socket that still
+// holds the lease and is still publishing.
+//
+// Left pending instead, for the owner, which reads the control stream too. Forfeited
+// rather than released, and that is not cosmetic: an entry that keeps its age is the
+// oldest one on every pass, so the instance that cannot act on it claims it first again,
+// and again, while the owner never gets a turn.
+func TestADeleteForAnAccountAPeerRunsIsLeftForTheOwner(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	mine := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	theirs := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = mine.Close(); _ = theirs.Close() })
+
+	const sid = "9c2b7d1e-0000-4000-8000-0000000000d2"
+	ownerEngine, peerEngine := fake.New(), fake.New()
+	owner := NewManager(&ManagerConfig{
+		Instance: "inst-b", Engine: ownerEngine,
+		Leases:    cluster.NewLeases(redisx.Wrap(theirs, "wa:", 8), "inst-b", cluster.Options{}),
+		Publisher: quietPublisher{}, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	peer := NewManager(&ManagerConfig{
+		Instance: "inst-a", Engine: peerEngine,
+		Leases:    cluster.NewLeases(redisx.Wrap(mine, "wa:", 8), "inst-a", cluster.Options{}),
+		Publisher: quietPublisher{}, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	ctx := context.Background()
+	t.Cleanup(func() { owner.StopAll(ctx); peer.StopAll(ctx) })
+
+	if _, err := owner.Adopt(ctx, sid); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+
+	var acked, released, forfeited bool
+	peer.takeForDelete(ctx, &transport.Delivery{
+		Command: protocol.Command{V: protocol.Version, ID: "c1", Type: protocol.CommandSessionDelete, SID: sid},
+		Ack:     func(context.Context) error { acked = true; return nil },
+		Release: func() { released = true },
+		Forfeit: func() { forfeited = true },
+	})
+
+	if acked {
+		t.Fatal("an instance that does not own the account retired the teardown; the owner never sees it and the inbox stays up here")
+	}
+	if !forfeited {
+		t.Fatalf("the delete was not forfeited (released=%v); keeping its age has this instance claim it first on every pass and the owner never gets a turn", released)
+	}
+	if session, ok := peerEngine.Session(sid); ok {
+		t.Fatalf("the peer opened a session for an account somebody else is running (torn down %d times)", session.Deleted())
+	}
+	if session, ok := ownerEngine.Session(sid); ok && session.Deleted() != 0 {
+		t.Fatal("the account was torn down from an instance that does not hold its lease, under a live socket")
+	}
+}

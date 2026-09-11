@@ -505,3 +505,41 @@ func TestAnAcquisitionIsDatedFromTheRequestThatStartedTheLease(t *testing.T) {
 		t.Fatal("a lease was dated from an EVALSHA that came back unloaded and started no TTL, so it reads as expired a whole failed round trip before the key does")
 	}
 }
+
+// The epoch counter is a fencing token: a client drops events carrying a lower epoch
+// than the highest it has seen, which is what keeps a late event from a previous owner
+// off a session somebody else is running. Deleting one that belongs to a live owner
+// restarts their count at one, under a cursor that is already higher, so every event
+// they publish next reads as stale.
+//
+// It matters here because an instance can believe it holds a lease that expired in
+// Redis -- that is what the renew margin exists for -- so the deletion has to be
+// compared against the lease in the same step rather than sent as a bare DEL.
+func TestForgetEpochOnlyDropsTheCounterOfALeaseYouStillHold(t *testing.T) {
+	t.Parallel()
+
+	server, a, b := newFleet(t, newClock())
+	ctx := context.Background()
+	keys := redisx.NewKeys("wa:", 8)
+
+	if _, err := a.Acquire(ctx, "s1"); err != nil {
+		t.Fatalf("a.Acquire: %v", err)
+	}
+	if !server.Exists(keys.LeaseEpoch("s1")) {
+		t.Fatal("acquiring a lease wrote no epoch counter, so this test proves nothing")
+	}
+
+	if err := b.ForgetEpoch(ctx, "s1"); !errors.Is(err, cluster.ErrNotOwner) {
+		t.Fatalf("an instance that holds nothing deleted the epoch of a live owner (err=%v)", err)
+	}
+	if !server.Exists(keys.LeaseEpoch("s1")) {
+		t.Fatal("the counter of a session another instance owns was deleted; its next epoch counts from one again, under a client cursor that is already higher")
+	}
+
+	if err := a.ForgetEpoch(ctx, "s1"); err != nil {
+		t.Fatalf("the owner could not delete the counter of the account it holds: %v", err)
+	}
+	if server.Exists(keys.LeaseEpoch("s1")) {
+		t.Fatal("the counter outlived the account it belonged to, which is the leak this exists to close")
+	}
+}
