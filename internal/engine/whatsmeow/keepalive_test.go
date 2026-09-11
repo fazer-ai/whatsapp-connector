@@ -1089,6 +1089,27 @@ func TestACommandWithNoDeadlineIsLetGoWhenTheSessionCloses(t *testing.T) {
 	}
 }
 
+// And the two boundaries that must not wait do not. A disconnect refused at the wait never
+// records that the account was asked to stay down, and the takedown it queued behind puts
+// the socket back up -- so the operator's disconnect is undone by the guard meant to protect
+// it. Neither of them can have a mutating IQ cut off mid-flight, which is all the wait is
+// for: one sends nothing WhatsApp applies, the other dials a socket of its own.
+func TestTheBoundariesThatMustNotWaitOnATakedownDoNot(t *testing.T) {
+	t.Parallel()
+
+	for _, boundary := range []string{"func (s *Session) Connect(", "func (s *Session) Disconnect("} {
+		carrying := theBodyOf(t, boundary)
+		if strings.Contains(carrying, "s.startCommand(") {
+			t.Fatalf("%s waits on a takedown, so a caller that gives up leaves the account "+
+				"recorded as one that should be connected and the reset brings it back:\n%s",
+				boundary, carrying)
+		}
+		if !strings.Contains(carrying, "s.countCommand()") {
+			t.Fatalf("%s does not count the command in flight at all:\n%s", boundary, carrying)
+		}
+	}
+}
+
 // The unlink a `session.delete` sends is the sharpest case of all: it is a lifecycle
 // command, so it never passes through `Execute`, and cutting it off would have whatsmeow
 // resend the removal to WhatsApp. Driven rather than fenced, because this one cannot be
@@ -1169,6 +1190,10 @@ func TestEveryCommandBoundaryCountsWhatItIsCarryingOut(t *testing.T) {
 		boundary := "func (s *Session) " + method + "("
 		carrying := theBodyOf(t, boundary)
 		started := strings.Index(carrying, "s.startCommand(ctx)")
+		if started < 0 {
+			// The two that must not wait on a takedown count through their own door.
+			started = strings.Index(carrying, "s.countCommand()")
+		}
 		ended := strings.Index(carrying, "defer s.endCommand()")
 		if started < 0 || ended < 0 {
 			t.Fatalf("%s does not count the command in flight, so the keepalive handler takes "+

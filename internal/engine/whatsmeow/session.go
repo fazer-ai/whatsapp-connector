@@ -1259,9 +1259,7 @@ func (s *Session) Events() <-chan engine.Emission { return s.events }
 
 // Connect starts pairing or resumes a stored session.
 func (s *Session) Connect(ctx context.Context, req engine.ConnectRequest) error {
-	if err := s.startCommand(ctx); err != nil {
-		return err
-	}
+	s.countCommand()
 	defer s.endCommand()
 
 	if s.isClosed() {
@@ -1760,9 +1758,7 @@ func (s *Session) pairWithCode(ctx context.Context, rawPhone, standing string) e
 
 // Disconnect drops the socket and keeps the credentials.
 func (s *Session) Disconnect(ctx context.Context) error {
-	if err := s.startCommand(ctx); err != nil {
-		return err
-	}
+	s.countCommand()
 	defer s.endCommand()
 
 	s.cancelPairing()
@@ -1970,6 +1966,22 @@ func (s *Session) dropHangUp() (state string, gaveUp uint64) {
 type owedReset struct {
 	client *wm.Client
 	judged int64
+}
+
+// countCommand is startCommand for the two boundaries that must not wait on a takedown.
+//
+// Waiting is for a command that could have a mutating IQ cut off mid-flight and resent.
+// Neither of these can: a disconnect sends nothing that WhatsApp applies, and a connect
+// dials a socket of its own rather than writing on the one being closed. What they would
+// get from waiting is the harm instead of the guard -- a disconnect refused there never
+// records that the account was asked to stay down, and `ResetConnection` puts the socket
+// back up, so the operator's disconnect is undone by the takedown it queued behind.
+//
+// They still count, because a takedown must not fire in the middle of one of them.
+func (s *Session) countCommand() {
+	s.mu.Lock()
+	s.running++
+	s.mu.Unlock()
 }
 
 // startCommand counts a command as being in flight, and waits for a takedown that has
