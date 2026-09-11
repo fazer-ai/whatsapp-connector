@@ -371,31 +371,52 @@ func theCaseFor(t *testing.T, event string) string {
 }
 
 // The order inside the arm is load-bearing and invisible to every test that can run here:
-// with no socket under it, ResetConnection returns at once, so a session that published
-// after it looks the same from outside as one that published before. What it costs live is
-// the seconds the close handshake holds the socket lock while the session still says
-// `open`, which is the window this change exists to close.
-func TestTheKeepAliveHandlerPublishesBeforeItCloses(t *testing.T) {
+// with no socket under it, a reset returns at once and an inbox nobody filled never makes
+// `emit` wait, so every arrangement of these three lines looks the same from outside. What
+// they cost live is the window in which the session refuses commands while its last
+// published state still says `open`, and the socket the reset lands on when the publish in
+// front of it waited on a full inbox.
+func TestTheKeepAliveHandlerTakesTheSocketDownBeforeItWaitsOnThePublish(t *testing.T) {
 	t.Parallel()
 
 	handler := theCaseFor(t, "*waEvents.KeepAliveTimeout")
-	published := strings.Index(handler, "setReconnecting(true)")
+	refused := strings.Index(handler, "setReconnecting(true)")
 	closed := strings.Index(handler, "ResetConnection()")
-	if published < 0 || closed < 0 {
-		t.Fatalf("the keepalive handler neither publishes nor closes:\n%s", handler)
+	published := strings.Index(handler, "s.emit(")
+	if refused < 0 || closed < 0 || published < 0 {
+		t.Fatalf("the keepalive handler does not refuse, close and publish:\n%s", handler)
 	}
-	if published > closed {
-		t.Fatalf("the keepalive handler closes the socket before saying so, so `readyToSend` accepts "+
-			"commands into the lock the close is holding:\n%s", handler)
+	if refused > closed {
+		t.Fatalf("the keepalive handler closes the socket before it stops accepting for it, so "+
+			"`readyToSend` hands commands into the lock the close is holding:\n%s", handler)
+	}
+	if closed > published {
+		t.Fatalf("the keepalive handler publishes before it closes, and `emit` waits on a full "+
+			"inbox: the reset would then land on whatever socket the client had by the time it "+
+			"cleared, which is a healthy one:\n%s", handler)
 	}
 }
 
-// The stamp the staleness check reads has to start with the socket, not with the
-// authentication that follows it: whatsmeow's keepalive clock starts its first "last
-// answered" when the connection is up, while `Connected` waits for prekeys and the passive
-// switch. A stamp taken there is later than the clock it is compared against, and on a
-// socket that took its time answering every timeout would read as one about an older
-// connection -- which is the quiet socket this change exists to take down, left up.
+// And the close does not hold the publish. `ResetConnection` blocks on the close handshake
+// holding whatsmeow's socket lock, seconds of it on a quiet path, and a session that waited
+// for that before saying anything would spend them refusing commands with `open` as its last
+// published state. Read off the source because a client with no socket returns from the
+// reset at once, so here the two are indistinguishable.
+func TestTheKeepAliveHandlerDoesNotWaitForTheCloseHandshake(t *testing.T) {
+	t.Parallel()
+
+	handler := theCaseFor(t, "*waEvents.KeepAliveTimeout")
+	if !strings.Contains(handler, "go client.ResetConnection()") {
+		t.Fatalf("the keepalive handler waits for the close handshake before publishing:\n%s", handler)
+	}
+	// And on the client it judged, not on whatever the session is holding once that
+	// goroutine is scheduled.
+	if !strings.Contains(handler, "client := s.current()") {
+		t.Fatalf("the keepalive handler resets whatever socket the session has when the "+
+			"goroutine runs, rather than the one it judged:\n%s", handler)
+	}
+}
+
 func TestTheConnectionIsStampedWhenItIsDialledAndNotWhenItIsAnnounced(t *testing.T) {
 	t.Parallel()
 

@@ -3304,24 +3304,40 @@ func (s *Session) handle(rawEvent any) bool {
 		s.log.Warn().Int("missed", event.ErrorCount).
 			Time("last_answered", event.LastSuccess).
 			Msg("no keepalive answered on an open socket; taking it down rather than waiting")
-		// The state goes first, and the order is the point. ResetConnection blocks on the
-		// close handshake while holding whatsmeow's socket lock, and the Disconnected it
-		// leads to is dispatched only after that returns -- so a session that waited for
-		// the event would spend those seconds still reporting `open`, accepting commands
-		// into the very lock the close is holding.
+		// Read here, so what goes down is the socket this session just judged and not
+		// whatever it is on by the time the reset below runs.
+		client := s.current()
+		// The state goes first, and the order is the point. The `Disconnected` a reset
+		// leads to is dispatched only after the close handshake returns, so a session that
+		// waited for the event would spend those seconds still reporting `open`, accepting
+		// commands into the very lock the close is holding.
 		s.setConnected(false)
 		s.setReconnecting(true)
-		// Published here, and not left to the `Disconnected` this leads to: the setters
-		// above move only what this process reads, and the client reads the event stream.
-		// A session whose commands are already being refused while its last published
-		// state says `open` is one the client has no way to make sense of.
-		s.emit(protocol.EventSessionState, map[string]any{"state": "reconnecting", "reason": "keepalive"})
 		// The `Disconnected` this is about to cause is already published, and saying so is
 		// what keeps it from being applied late: whatsmeow starts the reconnect from the
 		// same instant it dispatches that event, and a `Connected` handled first would
 		// leave the drop writing `reconnecting` over the socket that replaced it.
 		s.announceDrop()
-		s.current().ResetConnection()
+		// Ordered before the publish and started off this goroutine, and both halves of
+		// that matter.
+		//
+		// Before, because the publish can wait: `emit` blocks for as long as the inbox is
+		// full, and a reset left behind it would run whenever that cleared, against
+		// whatever socket the client had by then -- the one that answered again, or the one
+		// whatsmeow put in its place while this handler sat holding the transition lock and
+		// could not be told. What it would take down is a healthy socket.
+		//
+		// Off this goroutine, because `ResetConnection` blocks on the close handshake
+		// holding whatsmeow's socket lock: waiting for it here would spend those seconds
+		// with the session already refusing commands and its last published state still
+		// saying `open`, which is a session the client has no way to make sense of.
+		//
+		// What this does not buy is a guarantee. A goroutine that is ready still has to be
+		// scheduled, and one starved for long enough resets whatever socket the client has
+		// by then. That window is the scheduler's, measured against the minutes a full
+		// inbox can hold.
+		go client.ResetConnection()
+		s.emit(protocol.EventSessionState, map[string]any{"state": "reconnecting", "reason": "keepalive"})
 	case *waEvents.KeepAliveRestored:
 		// Nothing to announce: the socket never went down, so no state changed. What this
 		// is for is the timeouts that came before it and have not been handled yet.
