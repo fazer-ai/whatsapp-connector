@@ -1970,12 +1970,28 @@ func (s *Session) takeDownSoon(client *wm.Client, judged int64) {
 // connection write since the judgement is what says that happened, and it is also what put
 // the state back to `open`, so standing down here leaves nothing to repair.
 //
-// The count is read and acted on without the transition lock, which leaves the width of
-// those two statements as a window. Taking the lock would close it and reopen the one this
-// exists for: the handler holds it across a publish that waits on a full inbox, and a reset
-// queued behind that runs whenever the inbox clears.
+// Neither question is asked under the same lock as the reset itself, which leaves the width
+// of those statements as a window: a connection or a command that lands inside it is not
+// seen. Holding a lock across the reset would close that and reopen worse -- `ResetConnection`
+// blocks on the close handshake holding whatsmeow's socket lock, and the session's own mutex
+// is taken by every read of its state.
 func (s *Session) resetUnlessReplaced(client *wm.Client, judged int64) {
-	if s.transitions.Load() != judged {
+	s.mu.Lock()
+	replaced := s.transitions.Load() != judged
+	// A command that started between the decision and this goroutine being scheduled. Only
+	// the lifecycle three can: everything else is refused at the gate by then. `logout`
+	// sends its removal IQ over the socket that is still up, and cutting that off is the
+	// resend this whole guard exists to avoid, so the takedown goes back to waiting.
+	started := !replaced && s.running > 0
+	if started {
+		s.owed = &owedReset{client: client, judged: judged}
+	}
+	s.mu.Unlock()
+	if started {
+		s.log.Info().Msg("a command started before the mute socket could be taken down; waiting for its answer")
+		return
+	}
+	if replaced {
 		s.retireDrop()
 		s.log.Info().Msg("a connection landed before the mute socket could be taken down; leaving it alone")
 		return
@@ -2026,8 +2042,7 @@ func (s *Session) dropWasAnnounced() bool {
 }
 
 // answeredKeepAlive records that the socket answered a ping again.
-func (s *Session) answeredKeepAlive() {
-	at := s.now()
+func (s *Session) answeredKeepAlive(at time.Time) {
 	s.mu.Lock()
 	s.keepAliveAnsweredAt = at
 	s.mu.Unlock()
@@ -3478,7 +3493,16 @@ func (s *Session) handle(rawEvent any) bool {
 	case *waEvents.KeepAliveRestored:
 		// Nothing to announce: the socket never went down, so no state changed. What this
 		// is for is the timeouts that came before it and have not been handled yet.
-		s.answeredKeepAlive()
+		//
+		// Taken for the same reason the timeout arm takes it, and it is the other half of
+		// the same decision: that one reads this stamp and then acts on what it read, so a
+		// recovery landing in between would be recorded too late to stop a reset of the
+		// socket it says is answering again. With the lock this one is either wholly before
+		// that read or wholly after the action.
+		s.transition.Lock()
+		defer s.transition.Unlock()
+
+		s.answeredKeepAlive(dispatched)
 	case *waEvents.Disconnected:
 		s.transition.Lock()
 		defer s.transition.Unlock()

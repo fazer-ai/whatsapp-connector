@@ -234,6 +234,19 @@ func TestAKeepAliveTimeoutTheSocketRecoveredFromIsIgnored(t *testing.T) {
 	}
 }
 
+// The recovery is serialised with the timeout decision, which is the other half of it: the
+// timeout arm reads the stamp and then acts on what it read, so a recovery recorded in
+// between would come too late to stop a reset of the socket it says is answering. Read off
+// the source because both arms are driven from one goroutine here.
+func TestTheKeepAliveRecoverySerialisesWithTheTimeoutDecision(t *testing.T) {
+	t.Parallel()
+
+	recovered := theCaseFor(t, "*waEvents.KeepAliveRestored")
+	if !strings.Contains(recovered, "s.transition.Lock()") {
+		t.Fatalf("the recovery does not serialise with the decision that reads it:\n%s", recovered)
+	}
+}
+
 // And the run that begins from the very ping that ended the last one. A recovery is
 // recorded when this session handles it, which is later than whatsmeow saw it, so a rule
 // with no slack in it would read the next run of failures as the previous one arriving late
@@ -355,6 +368,35 @@ func TestTheResetStandsDownWhenAConnectionLandedFirst(t *testing.T) {
 		t.Fatalf("the reset went ahead over a connection that landed after the judgement: %q", written.String())
 	}
 	assertTheNextDropIsApplied(t, session)
+}
+
+// And it goes back to waiting when a command started between the decision and this
+// goroutine getting a turn. Only the lifecycle three can start there, everything else being
+// refused at the gate by then, and `logout` sends its removal IQ over the socket that is
+// still up: cutting that off is the resend the whole guard exists to avoid.
+func TestTheResetGoesBackToWaitingWhenACommandStartedFirst(t *testing.T) {
+	t.Parallel()
+
+	session, written := newLoggedTestSession(t, "5511999990001")
+	session.relearn(session.current())
+	dialedAndConnected(session)
+	session.announceDrop()
+
+	judged := session.transitions.Load()
+	// A logout started while the takedown was still waiting for a turn.
+	session.startCommand()
+
+	session.resetUnlessReplaced(session.current(), judged)
+
+	if !strings.Contains(written.String(), "waiting for its answer") {
+		t.Fatalf("the socket was taken down under a command that started first: %q", written.String())
+	}
+	session.mu.Lock()
+	owed := session.owed
+	session.mu.Unlock()
+	if owed == nil {
+		t.Fatal("the takedown was dropped instead of going back to waiting, so the mute socket stays up")
+	}
 }
 
 // And a reset that finds no socket takes the mark down too. Nothing is going to produce the
