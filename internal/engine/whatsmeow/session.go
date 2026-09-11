@@ -802,6 +802,12 @@ func (s *Session) adopt(client *wm.Client) bool {
 		return false
 	}
 	s.client = client
+	// A mark about the client being replaced describes a drop from a socket this session no
+	// longer holds, and the argument for keeping one otherwise does not survive here: it
+	// rests on whatsmeow announcing its own reconnect, and a client adopted after a logout
+	// has no device to reconnect with. A drop swallowed during the pairing that follows is
+	// swallowed for good.
+	s.dropAnnounced = false
 	s.handlerID = handlerID
 	s.phone = named.phone
 	s.lid = named.lid

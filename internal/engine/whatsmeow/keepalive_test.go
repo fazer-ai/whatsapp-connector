@@ -12,6 +12,7 @@ import (
 
 	"github.com/rs/zerolog"
 
+	wm "go.mau.fi/whatsmeow"
 	waEvents "go.mau.fi/whatsmeow/types/events"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
@@ -396,6 +397,30 @@ func TestTheResetGoesBackToWaitingWhenACommandStartedFirst(t *testing.T) {
 	session.mu.Unlock()
 	if owed == nil {
 		t.Fatal("the takedown was dropped instead of going back to waiting, so the mute socket stays up")
+	}
+}
+
+// But a client this session no longer holds takes its mark with it. The argument for
+// keeping one rests on whatsmeow announcing its own reconnect, and a client adopted after a
+// logout has no device to reconnect with: a drop swallowed during the pairing that follows
+// is swallowed for good, and the session sits with no socket and nothing to say so.
+func TestAdoptingAClientRetiresTheMarkOfTheOneItReplaces(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.relearn(session.current())
+	dialedAndConnected(session)
+	session.announceDrop()
+
+	if !session.adopt(wm.NewClient(session.current().Store, nil)) {
+		t.Fatal("the session refused to adopt a client")
+	}
+	dialedAndConnected(session)
+	session.handle(&waEvents.Disconnected{})
+
+	if got := session.state(); got != "reconnecting" && got != "close" {
+		t.Fatalf("a drop on the adopted client was swallowed by the mark of the one it "+
+			"replaced, leaving the session %q with no socket under it", got)
 	}
 }
 
