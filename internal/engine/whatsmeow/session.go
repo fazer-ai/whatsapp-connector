@@ -417,13 +417,16 @@ type Session struct {
 	// socket nobody is waiting for. This is the answer to "is it connecting" that costs
 	// no lock.
 	dialing bool
-	// dropAnnounced is a drop this session brought on itself and has already published. It
-	// names no connection, which bounds what it can do: it suppresses the next `Disconnected`
-	// handled, and if the reset's own event were overtaken by a later one the later one would
-	// consume it. Overtaking means one dispatch goroutine starved across a whole reconnect
-	// and a second drop, because `transition` hands off in arrival order once a waiter has
-	// waited a millisecond. Telling two drops apart would need a connection identity the
-	// event does not carry and whatsmeow does not expose, which is #179.
+	// dropAnnounced is a drop this session brought on itself and has already published. Put
+	// up by the handler that causes the reset, taken down by the next `Disconnected` or by
+	// the reset itself when it finds nothing to take down.
+	//
+	// It names no connection, which bounds what it can do: it suppresses the next
+	// `Disconnected` handled, and if the reset's own event were overtaken by a later one the
+	// later one would consume it. Overtaking means one dispatch goroutine starved across a
+	// whole reconnect and a second drop, because `transition` hands off in arrival order once
+	// a waiter has waited a millisecond. Telling two drops apart would need a connection
+	// identity the event does not carry and whatsmeow does not expose, which is #179.
 	// The reset the keepalive handler performs leads to a `Disconnected` dispatched from a
 	// goroutine of its own, and whatsmeow starts the reconnect from the same instant, so
 	// the two race: a `Connected` handled first leaves the late `Disconnected` writing
@@ -824,10 +827,6 @@ func (s *Session) setDialing(dialing bool) {
 	s.mu.Lock()
 	s.dialing = dialing
 	if dialing {
-		// A socket this process is asking for is at least one generation past anything a
-		// previous reset may have left marked, so the mark stops standing here rather than
-		// waiting for a `Disconnected` that is never going to come.
-		s.dropAnnounced = false
 		// Dated from the attempt and not from the authentication that follows it. What
 		// this stamp is compared against is whatsmeow's keepalive clock, and that starts
 		// with the socket: its loop dates its first "last answered" from the moment the
@@ -1904,10 +1903,34 @@ func (s *Session) dropHangUp() (state string, gaveUp uint64) {
 // queued behind that runs whenever the inbox clears.
 func (s *Session) resetUnlessReplaced(client *wm.Client, judged int64) {
 	if s.transitions.Load() != judged {
+		s.retireDrop()
 		s.log.Info().Msg("a connection landed before the mute socket could be taken down; leaving it alone")
 		return
 	}
+	// Asked here and not in the handler, because reading it takes whatsmeow's socket lock
+	// and a redial holds that for the length of an attempt: off the handler's goroutine
+	// that is a wait, on it that would be the session's whole state machine behind a
+	// redial. It is the precondition for the reset producing anything at all -- with no
+	// socket under it, `ResetConnection` returns having done nothing.
+	if !client.IsConnected() {
+		s.retireDrop()
+		s.log.Info().Msg("the mute socket was already gone before it could be taken down")
+		return
+	}
 	client.ResetConnection()
+}
+
+// retireDrop takes down the mark left for a `Disconnected` that is not going to come.
+//
+// A mark left standing is the mirror of what it exists to prevent: it swallows the next
+// genuine drop instead, and the session reports `open` over a socket on the floor. The
+// window between asking whether there is a socket and resetting it is not covered -- one
+// that dies in between produces no event either -- and that one closes itself, because
+// whatsmeow reconnects a remote drop on its own and the `Connected` puts the state back.
+func (s *Session) retireDrop() {
+	s.mu.Lock()
+	s.dropAnnounced = false
+	s.mu.Unlock()
 }
 
 // announceDrop marks the `Disconnected` this session's own reset is about to produce as

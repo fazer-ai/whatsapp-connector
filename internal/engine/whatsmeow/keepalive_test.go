@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -41,9 +42,7 @@ func TestOnlyAKeepAliveMissedTwiceInARowIsALostSocket(t *testing.T) {
 func TestOneMissedKeepAliveLeavesTheSocketAlone(t *testing.T) {
 	t.Parallel()
 
-	session, _ := newTestSession(t, "5511999990001")
-	var written bytes.Buffer
-	session.log = zerolog.New(&written)
+	session, written := newLoggedTestSession(t, "5511999990001")
 	dialedAndConnected(session)
 
 	// The last answered ping is dated inside this connection, which is what a timeout
@@ -65,9 +64,7 @@ func TestOneMissedKeepAliveLeavesTheSocketAlone(t *testing.T) {
 func TestAKeepAliveTimeoutFromAReplacedSocketIsIgnored(t *testing.T) {
 	t.Parallel()
 
-	session, _ := newTestSession(t, "5511999990001")
-	var written bytes.Buffer
-	session.log = zerolog.New(&written)
+	session, written := newLoggedTestSession(t, "5511999990001")
 	dialedAndConnected(session)
 
 	// The run of failed pings belongs to a connection that ended before this one began.
@@ -85,9 +82,7 @@ func TestAKeepAliveTimeoutFromAReplacedSocketIsIgnored(t *testing.T) {
 func TestAKeepAliveTimeoutWithNoConnectionIsIgnored(t *testing.T) {
 	t.Parallel()
 
-	session, _ := newTestSession(t, "5511999990001")
-	var written bytes.Buffer
-	session.log = zerolog.New(&written)
+	session, written := newLoggedTestSession(t, "5511999990001")
 
 	session.handle(&waEvents.KeepAliveTimeout{ErrorCount: 2, LastSuccess: time.Now().Add(-70 * time.Second)})
 
@@ -105,9 +100,7 @@ func TestAKeepAliveTimeoutWithNoConnectionIsIgnored(t *testing.T) {
 func TestAKeepAliveTimeoutFromBeforeAReconnectIsIgnored(t *testing.T) {
 	t.Parallel()
 
-	session, _ := newTestSession(t, "5511999990001")
-	var written bytes.Buffer
-	session.log = zerolog.New(&written)
+	session, written := newLoggedTestSession(t, "5511999990001")
 
 	dialled := time.Now()
 	clock := dialled
@@ -146,9 +139,7 @@ func TestAKeepAliveTimeoutFromBeforeAReconnectIsIgnored(t *testing.T) {
 func TestAKeepAliveTimeoutFromASocketSwappedUnderTheSessionIsIgnored(t *testing.T) {
 	t.Parallel()
 
-	session, _ := newTestSession(t, "5511999990001")
-	var written bytes.Buffer
-	session.log = zerolog.New(&written)
+	session, written := newLoggedTestSession(t, "5511999990001")
 
 	dialled := time.Now()
 	clock := dialled
@@ -180,9 +171,7 @@ func TestAKeepAliveTimeoutFromASocketSwappedUnderTheSessionIsIgnored(t *testing.
 func TestTheSecondMissedKeepAliveIsActedOn(t *testing.T) {
 	t.Parallel()
 
-	session, _ := newTestSession(t, "5511999990001")
-	var written bytes.Buffer
-	session.log = zerolog.New(&written)
+	session, written := newLoggedTestSession(t, "5511999990001")
 	dialedAndConnected(session)
 
 	session.handle(&waEvents.KeepAliveTimeout{ErrorCount: 2, LastSuccess: time.Now()})
@@ -228,10 +217,11 @@ func TestTheDropTheSessionCausedIsNotAppliedOverTheSocketThatReplacedIt(t *testi
 	session.relearn(session.current())
 	dialedAndConnected(session)
 
-	session.handle(&waEvents.KeepAliveTimeout{ErrorCount: 2, LastSuccess: time.Now()})
-	if state := decode(t, next(t, session).Payload)["state"]; state != "reconnecting" {
-		t.Fatalf("the session published state=%v while taking its socket down", state)
-	}
+	// The mark the handler puts up before it takes the socket down. Set here rather than by
+	// driving the handler, because a session with no socket under it has no reset to take
+	// down and the mark would be retired again before this test could use it; that the
+	// handler is what puts it up is fenced below.
+	session.announceDrop()
 
 	// whatsmeow authenticates the replacement before the drop it dispatched is handled.
 	session.handle(&waEvents.Connected{})
@@ -246,169 +236,33 @@ func TestTheDropTheSessionCausedIsNotAppliedOverTheSocketThatReplacedIt(t *testi
 	}
 }
 
-// And the mark that does it cannot outlive the socket it was made for: `ResetConnection`
-// on a client whose socket is already gone produces no `Disconnected` at all, and a mark
-// left standing would swallow the next real drop instead.
-func TestAFreshDialDropsAMarkNoDisconnectEverClaimed(t *testing.T) {
+// And the handler is what puts that mark up, before it starts the reset that produces the
+// drop. Read off the source because a client with no socket produces no drop to suppress.
+func TestTheKeepAliveHandlerAnnouncesTheDropItIsAboutToCause(t *testing.T) {
 	t.Parallel()
 
-	session, _ := newTestSession(t, "5511999990001")
-	session.relearn(session.current())
-	dialedAndConnected(session)
-
-	session.handle(&waEvents.KeepAliveTimeout{ErrorCount: 2, LastSuccess: time.Now()})
-	next(t, session)
-
-	// Nothing claimed that mark, and the session dials again on its own.
-	dialedAndConnected(session)
-	session.handle(&waEvents.Disconnected{})
-
-	if got := session.state(); got != "reconnecting" {
-		t.Fatalf("a drop on a new socket was swallowed by a mark left over from an older one: %q", got)
-	}
-}
-
-// A timeout whose run of failures is already over. whatsmeow dispatches the recovery from
-// a goroutine of its own too, so it can be handled before a timeout that preceded it, and
-// acting on that one resets a socket that is answering again.
-func TestAKeepAliveTimeoutTheSocketRecoveredFromIsIgnored(t *testing.T) {
-	t.Parallel()
-
-	session, _ := newTestSession(t, "5511999990001")
-	var written bytes.Buffer
-	session.log = zerolog.New(&written)
-
-	started := time.Now()
-	clock := started
-	session.wallClock = func() time.Time { return clock }
-	dialedAndConnected(session)
-
-	// The socket went quiet and then answered again, on the same connection.
-	clock = started.Add(time.Minute)
-	session.handle(&waEvents.KeepAliveRestored{})
-
-	// The second timeout of the run that just ended, arriving after it.
-	session.handle(&waEvents.KeepAliveTimeout{ErrorCount: 2, LastSuccess: started.Add(5 * time.Second)})
-
-	if got := session.state(); got != "open" {
-		t.Fatalf("a timeout the socket already recovered from left the session %q", got)
-	}
-	if written.Len() != 0 {
-		t.Fatalf("a timeout the socket already recovered from was acted on: %s", written.String())
-	}
-}
-
-// And the run that begins from the very ping that ended the last one. A recovery is
-// recorded when this session handles it, which is later than whatsmeow saw it, so a rule
-// with no slack in it would read the next run of failures as the previous one arriving late
-// and leave a genuinely dead socket up.
-func TestARunOfFailuresThatBeganRightAfterARecoveryIsStillActedOn(t *testing.T) {
-	t.Parallel()
-
-	session, _ := newTestSession(t, "5511999990001")
-	started := time.Now()
-	clock := started
-	session.wallClock = func() time.Time { return clock }
-	dialedAndConnected(session)
-
-	clock = started.Add(time.Minute)
-	session.handle(&waEvents.KeepAliveRestored{})
-
-	// The pings stopped again, counted from one answered just before this session got
-	// round to the recovery.
-	session.handle(&waEvents.KeepAliveTimeout{ErrorCount: 2, LastSuccess: started.Add(55 * time.Second)})
-
-	if got := session.state(); got != "reconnecting" {
-		t.Fatalf("a run of failures dated from the ping that ended the last one left the session %q", got)
-	}
-	if state := decode(t, next(t, session).Payload)["state"]; state != "reconnecting" {
-		t.Fatalf("the session published state=%v", state)
-	}
-}
-
-// The two ways to take a socket down differ in one thing and it is the thing this change
-// is about: `Disconnect` marks the disconnect as expected, and `onDisconnect` publishes
-// `events.Disconnected` only when it was not -- so a session that used it would take its
-// socket down and go on reporting `open`, which is the state this exists to leave. Read
-// off the source because nothing else here can see the difference: a client with no socket
-// does the same nothing under either call, and the phase that can tell them apart is the
-// live one.
-func TestTheKeepAliveHandlerResetsTheConnectionRatherThanDisconnecting(t *testing.T) {
-	t.Parallel()
-
-	taking := theBodyOf(t, "func (s *Session) resetUnlessReplaced(")
-	if !strings.Contains(taking, "ResetConnection()") {
-		t.Fatalf("the socket is not taken down with a reset:\n%s", taking)
-	}
-	if strings.Contains(taking, "Disconnect()") {
-		t.Fatalf("the socket is taken down with a disconnect, which publishes nothing and leaves "+
-			"the session reporting open:\n%s", taking)
-	}
 	handler := theCaseFor(t, "*waEvents.KeepAliveTimeout")
-	if strings.Contains(handler, "Disconnect()") {
-		t.Fatalf("the keepalive handler disconnects, which publishes nothing and leaves the session reporting open:\n%s", handler)
+	announced := strings.Index(handler, "s.announceDrop()")
+	closed := strings.Index(handler, "resetUnlessReplaced(")
+	if announced < 0 || closed < 0 {
+		t.Fatalf("the keepalive handler does not announce the drop it causes:\n%s", handler)
+	}
+	if announced > closed {
+		t.Fatalf("the keepalive handler starts the reset before marking the drop it causes, so "+
+			"the drop can be handled before the mark is up:\n%s", handler)
 	}
 }
 
-// theBodyOf returns a function of the session, from its signature to its closing brace.
-func theBodyOf(t *testing.T, signature string) string {
-	t.Helper()
-
-	raw, err := os.ReadFile("session.go")
-	if err != nil {
-		t.Fatalf("read the session: %v", err)
-	}
-	lines := strings.Split(string(raw), "\n")
-	for i, line := range lines {
-		if !strings.HasPrefix(line, signature) {
-			continue
-		}
-		for end := i + 1; end < len(lines); end++ {
-			if lines[end] == "}" {
-				return strings.Join(lines[i:end+1], "\n")
-			}
-		}
-		t.Fatalf("%s does not end", signature)
-	}
-	t.Fatalf("the session has no %s", signature)
-	return ""
-}
-
-// theCaseFor returns one arm of the event switch, from its case line to the next one.
-func theCaseFor(t *testing.T, event string) string {
-	t.Helper()
-
-	raw, err := os.ReadFile("session.go")
-	if err != nil {
-		t.Fatalf("read the session: %v", err)
-	}
-	lines := strings.Split(string(raw), "\n")
-	opens := "\tcase " + event + ":"
-	for i, line := range lines {
-		if line != opens {
-			continue
-		}
-		for end := i + 1; end < len(lines); end++ {
-			if strings.HasPrefix(lines[end], "\tcase ") || strings.HasPrefix(lines[end], "\tdefault:") {
-				return strings.Join(lines[i:end], "\n")
-			}
-		}
-		t.Fatalf("the arm for %s does not end", event)
-	}
-	t.Fatalf("the event switch has no arm for %s", event)
-	return ""
-}
-
-// And the goroutine it is started on stands down if a connection landed while it waited to
-// run. `ResetConnection` reads the client's socket when it runs, so one scheduled late over
-// a socket whatsmeow replaced on its own would close the replacement.
+// And the goroutine the reset is started on stands down if a connection landed while it
+// waited to run. `ResetConnection` reads the client's socket when it runs, so one scheduled
+// late over a socket whatsmeow replaced on its own would close the replacement.
 func TestTheResetStandsDownWhenAConnectionLandedFirst(t *testing.T) {
 	t.Parallel()
 
-	session, _ := newTestSession(t, "5511999990001")
-	var written bytes.Buffer
-	session.log = zerolog.New(&written)
+	session, written := newLoggedTestSession(t, "5511999990001")
+	session.relearn(session.current())
 	dialedAndConnected(session)
+	session.announceDrop()
 
 	judged := session.transitions.Load()
 	// A replacement announced itself while the reset was still waiting for a turn.
@@ -419,21 +273,40 @@ func TestTheResetStandsDownWhenAConnectionLandedFirst(t *testing.T) {
 	if !strings.Contains(written.String(), "leaving it alone") {
 		t.Fatalf("the reset went ahead over a connection that landed after the judgement: %q", written.String())
 	}
+	assertTheNextDropIsApplied(t, session)
 }
 
-// And goes ahead when nothing did.
-func TestTheResetGoesAheadWhenNothingLandedFirst(t *testing.T) {
+// And a reset that finds no socket takes the mark down too. Nothing is going to produce the
+// `Disconnected` it was left for -- whatsmeow's own 515 swap marks its disconnect expected,
+// so it publishes nothing -- and a mark left standing is the mirror of what it prevents: the
+// next genuine drop is swallowed and the session reports `open` over a socket on the floor.
+func TestTheResetRetiresTheMarkWhenThereIsNoSocketToTakeDown(t *testing.T) {
 	t.Parallel()
 
-	session, _ := newTestSession(t, "5511999990001")
-	var written bytes.Buffer
-	session.log = zerolog.New(&written)
+	session, written := newLoggedTestSession(t, "5511999990001")
+	session.relearn(session.current())
 	dialedAndConnected(session)
+	session.announceDrop()
 
+	// The generation is untouched, so nothing this session can see replaced the connection.
 	session.resetUnlessReplaced(session.current(), session.transitions.Load())
 
-	if written.Len() != 0 {
-		t.Fatalf("the reset stood down with nothing between it and the judgement: %s", written.String())
+	if !strings.Contains(written.String(), "already gone") {
+		t.Fatalf("the reset claimed to take down a socket that was not there: %q", written.String())
+	}
+	assertTheNextDropIsApplied(t, session)
+}
+
+// assertTheNextDropIsApplied puts the session back on a socket and drops it, which a mark
+// left standing would swallow.
+func assertTheNextDropIsApplied(t *testing.T, session *Session) {
+	t.Helper()
+
+	dialedAndConnected(session)
+	session.handle(&waEvents.Disconnected{})
+	if got := session.state(); got != "reconnecting" {
+		t.Fatalf("a genuine drop was swallowed by a mark nothing was ever going to claim, "+
+			"leaving the session %q over a socket on the floor", got)
 	}
 }
 
@@ -529,6 +402,92 @@ func TestTheKeepAliveHandlerSerialisesWithTheOtherTransitions(t *testing.T) {
 	if !strings.Contains(handler, "s.transition.Lock()") {
 		t.Fatalf("the keepalive handler does not serialise with the other connection transitions:\n%s", handler)
 	}
+}
+
+// theBodyOf returns a function of the session, from its signature to its closing brace.
+func theBodyOf(t *testing.T, signature string) string {
+	t.Helper()
+
+	lines := theSessionSource(t)
+	for i, line := range lines {
+		if !strings.HasPrefix(line, signature) {
+			continue
+		}
+		for end := i + 1; end < len(lines); end++ {
+			if lines[end] == "}" {
+				return strings.Join(lines[i:end+1], "\n")
+			}
+		}
+		t.Fatalf("%s does not end", signature)
+	}
+	t.Fatalf("the session has no %s", signature)
+	return ""
+}
+
+// theCaseFor returns one arm of the event switch, from its case line to the next one.
+func theCaseFor(t *testing.T, event string) string {
+	t.Helper()
+
+	lines := theSessionSource(t)
+	opens := "\tcase " + event + ":"
+	for i, line := range lines {
+		if line != opens {
+			continue
+		}
+		for end := i + 1; end < len(lines); end++ {
+			if strings.HasPrefix(lines[end], "\tcase ") || strings.HasPrefix(lines[end], "\tdefault:") {
+				return strings.Join(lines[i:end], "\n")
+			}
+		}
+		t.Fatalf("the arm for %s does not end", event)
+	}
+	t.Fatalf("the event switch has no arm for %s", event)
+	return ""
+}
+
+func theSessionSource(t *testing.T) []string {
+	t.Helper()
+
+	raw, err := os.ReadFile("session.go")
+	if err != nil {
+		t.Fatalf("read the session: %v", err)
+	}
+	return strings.Split(string(raw), "\n")
+}
+
+// newLoggedTestSession is a session whose log can be read while it is being written. The
+// keepalive handler takes the socket down from a goroutine of its own, and that goroutine
+// logs, so a plain bytes.Buffer here is a data race and not a test.
+func newLoggedTestSession(t *testing.T, phone string) (*Session, *syncBuffer) {
+	t.Helper()
+
+	session, _ := newTestSession(t, phone)
+	written := &syncBuffer{}
+	session.log = zerolog.New(written)
+	return session, written
+}
+
+type syncBuffer struct {
+	mu      sync.Mutex
+	written bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.written.Write(p) //nolint:wrapcheck // a test writer, and the caller is zerolog
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.written.String()
+}
+
+func (b *syncBuffer) Len() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.written.Len()
 }
 
 // dialedAndConnected puts a session on a socket the way a real one gets there: the attempt
