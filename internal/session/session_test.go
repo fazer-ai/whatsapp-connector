@@ -489,6 +489,101 @@ func TestADeadlineWithNoReplyToStillBoundsTheRun(t *testing.T) {
 	}
 }
 
+// The other ceiling, and the reason it exists: a teardown must not be dropped for
+// arriving late, and it badly wants a limit on how long it may park on a socket write.
+// With `deadline` alone a client had to choose between the two, and chose neither, so the
+// four commands that most need a limit ran without one.
+//
+// Read from the context the engine was handed rather than by waiting for it to pass: a
+// bound near enough to observe is a wall clock deciding the order of a test.
+func TestAMaxRuntimeBoundsTheRunWithoutRefusingACommandThatArrivedLate(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	ctx := context.Background()
+	if _, err := h.manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, _ := h.engine.Session("s1")
+
+	// Sent an hour ago and carrying no deadline, which is a teardown that waited for an
+	// owner. It has to run.
+	var acked atomic.Bool
+	before := time.Now()
+	h.manager.Dispatch(delivery(&protocol.Command{
+		V: protocol.Version, ID: "c1", Type: protocol.CommandMessageMarkRead, SID: "s1",
+		TS: before.Add(-time.Hour).UnixMilli(), MaxRuntimeMs: (30 * time.Second).Milliseconds(),
+		Payload: json.RawMessage(`{"chat":{"kind":"phone","id":"5541999990000"},"message_ids":["A"],"type":"read"}`),
+	}, &acked))
+	waitFor(t, "the command to be carried out", acked.Load)
+
+	if got := len(engineSession.Commands()); got != 1 {
+		t.Fatalf("the engine ran %d commands, want the one that was dispatched: a ceiling on duration must not read as a licence to drop it", got)
+	}
+	bounds := engineSession.Bounds()
+	if bounds[0].IsZero() {
+		t.Fatal("the command ran with no ceiling at all, so a socket write that parks holds every command for this account behind it")
+	}
+	// Measured from when the work starts rather than from when the frame was written,
+	// which is the whole difference between a duration and an instant: this one was
+	// written an hour ago.
+	if window := bounds[0].Sub(before); window < 29*time.Second || window > 31*time.Second {
+		t.Fatalf("the command ran under a window of %s, want the 30s it asked for measured from now", window)
+	}
+}
+
+// A command carrying both gets whichever runs out first, because each of them asked for
+// exactly that on its own.
+func TestACommandCarryingBothCeilingsGetsTheNearerOne(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	ctx := context.Background()
+	if _, err := h.manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, _ := h.engine.Session("s1")
+
+	var acked atomic.Bool
+	due := time.Now().Add(time.Minute)
+	h.manager.Dispatch(delivery(&protocol.Command{
+		V: protocol.Version, ID: "c1", Type: protocol.CommandMessageMarkRead, SID: "s1",
+		Deadline: due.UnixMilli(), MaxRuntimeMs: time.Hour.Milliseconds(),
+		Payload: json.RawMessage(`{"chat":{"kind":"phone","id":"5541999990000"},"message_ids":["A"],"type":"read"}`),
+	}, &acked))
+	waitFor(t, "the command to be carried out", acked.Load)
+
+	bounds := engineSession.Bounds()
+	if got := bounds[0].UnixMilli(); got != due.UnixMilli() {
+		t.Fatalf("the command ran until %s, want the nearer of the two ceilings at %s", bounds[0], due)
+	}
+}
+
+// And the deadline keeps the half that is only its own: a command that arrived after it
+// is not started at all. A runtime ceiling alongside it says nothing about that.
+func TestADeadlineThatPassedStillRefusesTheCommandThatCarriesARuntimeCeiling(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	ctx := context.Background()
+	if _, err := h.manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, _ := h.engine.Session("s1")
+
+	var acked atomic.Bool
+	h.manager.Dispatch(delivery(&protocol.Command{
+		V: protocol.Version, ID: "c1", Type: protocol.CommandMessageMarkRead, SID: "s1",
+		Deadline: time.Now().Add(-time.Minute).UnixMilli(), MaxRuntimeMs: time.Hour.Milliseconds(),
+		Payload: json.RawMessage(`{"chat":{"kind":"phone","id":"5541999990000"},"message_ids":["A"],"type":"read"}`),
+	}, &acked))
+	waitFor(t, "the command to be retired", acked.Load)
+
+	if got := len(engineSession.Commands()); got != 0 {
+		t.Fatalf("the engine ran %d commands, want none: the deadline had passed before it was reached", got)
+	}
+}
+
 // A fire-and-forget command has nobody blocked on it, so a failure that published
 // nothing would be a command that silently did nothing.
 func TestFireAndForgetFailurePublishesCommandFailed(t *testing.T) {

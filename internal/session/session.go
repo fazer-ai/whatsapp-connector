@@ -836,12 +836,8 @@ func (s *Session) carryOut(ctx context.Context, command *protocol.Command) (json
 		return result, nil
 	}
 
-	execCtx := ctx
-	if command.Deadline > 0 {
-		var cancel context.CancelFunc
-		execCtx, cancel = context.WithDeadline(ctx, time.UnixMilli(command.Deadline))
-		defer cancel()
-	}
+	execCtx, releaseBound := bound(ctx, command)
+	defer releaseBound()
 
 	result, err = s.lifecycle(execCtx, command)
 	if err == nil && key != "" && s.ledger != nil {
@@ -872,6 +868,36 @@ func (s *Session) carryOut(ctx context.Context, command *protocol.Command) (json
 		s.remember(ctx, command, key, result)
 	}
 	return result, err
+}
+
+// bound gives the work the ceiling its caller asked for, out of the two the contract has.
+//
+// They are different requests and a command may carry either, both or neither.
+// `deadline` is an instant, and the reading that matters here is the second half of it:
+// having refused to start a command that arrived after it, this stops one that is still
+// running when it passes. `max_runtime_ms` is a duration, measured from now, which is the
+// moment the work begins -- the ledger lookup above it is not the caller's to pay for.
+//
+// A command carrying both gets whichever runs out first, which is what each of them
+// separately asked for. The zero value of both is no ceiling at all, and that is a real
+// answer rather than an oversight: a teardown is published precisely so it can sit
+// pending, and a group write has no ceiling because the ledger only remembers successes,
+// so a write cut off mid-flight would be reported as failed and redone.
+func bound(ctx context.Context, command *protocol.Command) (context.Context, context.CancelFunc) {
+	deadline := time.Time{}
+	if command.Deadline > 0 {
+		deadline = time.UnixMilli(command.Deadline)
+	}
+	if command.MaxRuntimeMs > 0 {
+		ends := time.Now().Add(time.Duration(command.MaxRuntimeMs) * time.Millisecond)
+		if deadline.IsZero() || ends.Before(deadline) {
+			deadline = ends
+		}
+	}
+	if deadline.IsZero() {
+		return ctx, func() {}
+	}
+	return context.WithDeadline(ctx, deadline)
 }
 
 // remember writes the record of a command that ran, and keeps trying inside a bounded
