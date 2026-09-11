@@ -5,7 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"path/filepath"
+	"regexp"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -792,21 +795,18 @@ func TestTheOwedTakeDownWaitsForTheLastCommandOut(t *testing.T) {
 // And what counts a command as being in flight is `Execute` itself, for the whole of it.
 // Read off the source because every command a test can run here answers from memory, so the
 // count is back to zero before anything could look at it.
+//
+// Execute is not the only one: the session layer routes the lifecycle commands straight to
+// the engine's own methods, so a pairing code, a logout or a teardown would otherwise have
+// a mutating IQ out at WhatsApp with nothing counting it. Which methods those are is read
+// out of that file rather than written down here, and the difference is not tidiness: a
+// hand-kept list is exactly what let `Delete` arrive uncounted when #157 landed under this
+// branch. A sixth routed there is caught by this without anybody remembering to come back.
 func TestEveryCommandBoundaryCountsWhatItIsCarryingOut(t *testing.T) {
 	t.Parallel()
 
-	// Execute is not the only one: the session layer routes the lifecycle commands to
-	// these directly (`internal/session/session.go`, lifecycle), so a pairing code, a
-	// logout or a delete would have a mutating IQ out at WhatsApp with nothing counting it.
-	// The list is the one that file routes; a sixth added there and not here is a hole,
-	// which is how `Delete` arrived.
-	for _, boundary := range []string{
-		"func (s *Session) Execute(",
-		"func (s *Session) Connect(",
-		"func (s *Session) Disconnect(",
-		"func (s *Session) Logout(",
-		"func (s *Session) Delete(",
-	} {
+	for _, method := range theEngineMethodsTheSessionLayerRoutesTo(t) {
+		boundary := "func (s *Session) " + method + "("
 		carrying := theBodyOf(t, boundary)
 		started := strings.Index(carrying, "s.startCommand()")
 		ended := strings.Index(carrying, "defer s.endCommand()")
@@ -819,6 +819,104 @@ func TestEveryCommandBoundaryCountsWhatItIsCarryingOut(t *testing.T) {
 			t.Fatalf("%s releases the count before it takes it:\n%s", boundary, carrying)
 		}
 	}
+}
+
+// theEngineMethodsTheSessionLayerRoutesTo reads `lifecycle` in `internal/session` and
+// returns every engine method a command can reach through it.
+//
+// Every arm of that switch is required to reach one, and helpers are followed as far as
+// they go rather than a fixed number of hops: `session.delete` reaches the engine through
+// `tearDown` instead of calling it in the arm, so a fence that read only the arms would
+// have missed the exact boundary that went missing. An arm that reaches nothing is the
+// failure this is for -- whatever it routes to is then not being checked at all.
+func theEngineMethodsTheSessionLayerRoutesTo(t *testing.T) []string {
+	t.Helper()
+
+	raw, err := os.ReadFile(filepath.Join("..", "..", "session", "session.go"))
+	if err != nil {
+		t.Fatalf("read the session layer: %v", err)
+	}
+	source := strings.Split(string(raw), "\n")
+
+	onEngine := regexp.MustCompile(`s\.engine\.([A-Z]\w*)\(`)
+	ownHelper := regexp.MustCompile(`\bs\.([a-z]\w*)\(ctx`)
+
+	var reach func(body string, followed map[string]bool) []string
+	reach = func(body string, followed map[string]bool) []string {
+		found := []string{}
+		for _, call := range onEngine.FindAllStringSubmatch(body, -1) {
+			found = append(found, call[1])
+		}
+		for _, call := range ownHelper.FindAllStringSubmatch(body, -1) {
+			if followed[call[1]] {
+				continue
+			}
+			followed[call[1]] = true
+			helper := theBodyOfIn(t, source, "func (s *Session) "+call[1]+"(", "the session layer")
+			found = append(found, reach(helper, followed)...)
+		}
+		return found
+	}
+
+	counted := map[string]bool{}
+	for _, arm := range theArmsOfTheLifecycleSwitch(t, source) {
+		reached := reach(arm.body, map[string]bool{"lifecycle": true})
+		if len(reached) == 0 {
+			t.Fatalf("the %s arm of the session layer's lifecycle switch reaches no engine method "+
+				"by any route this fence can follow, so whatever carries that command out is not "+
+				"being held to counting it:\n%s", arm.name, arm.body)
+		}
+		for _, method := range reached {
+			counted[method] = true
+		}
+	}
+
+	methods := []string{}
+	for method := range counted {
+		methods = append(methods, method)
+	}
+	sort.Strings(methods)
+	return methods
+}
+
+// lifecycleArm is one arm of that switch: the command it answers, and what it does.
+type lifecycleArm struct{ name, body string }
+
+// theArmsOfTheLifecycleSwitch splits the routing into its arms, so each can be held to
+// reaching the engine on its own. A lifecycle this cannot read as a switch fails here
+// rather than quietly reading as no arms at all.
+func theArmsOfTheLifecycleSwitch(t *testing.T, source []string) []lifecycleArm {
+	t.Helper()
+
+	routing := strings.Split(
+		theBodyOfIn(t, source, "func (s *Session) lifecycle(", "the session layer"), "\n",
+	)
+	opens := func(line string) bool {
+		return strings.HasPrefix(line, "\tcase ") || line == "\tdefault:"
+	}
+
+	arms := []lifecycleArm{}
+	for i, line := range routing {
+		if !opens(line) {
+			continue
+		}
+		end := len(routing)
+		for j := i + 1; j < len(routing); j++ {
+			if opens(routing[j]) {
+				end = j
+				break
+			}
+		}
+		arms = append(arms, lifecycleArm{
+			name: strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(line), "case "), ":"),
+			body: strings.Join(routing[i:end], "\n"),
+		})
+	}
+	if len(arms) == 0 {
+		t.Fatalf("the session layer's lifecycle is not a switch this fence can read:\n%s",
+			strings.Join(routing, "\n"))
+	}
+	return arms
 }
 
 // And a connection is dated from when whatsmeow dispatched the event that announced it,
@@ -943,7 +1041,14 @@ func TestTheKeepAliveHandlerSerialisesWithTheOtherTransitions(t *testing.T) {
 func theBodyOf(t *testing.T, signature string) string {
 	t.Helper()
 
-	lines := theSessionSource(t)
+	return theBodyOfIn(t, theSessionSource(t), signature, "the session")
+}
+
+// theBodyOfIn is theBodyOf over source read from somewhere else, which the boundary fence
+// needs: what it has to read is the session layer, a package away.
+func theBodyOfIn(t *testing.T, lines []string, signature, what string) string {
+	t.Helper()
+
 	for i, line := range lines {
 		if !strings.HasPrefix(line, signature) {
 			continue
@@ -955,7 +1060,7 @@ func theBodyOf(t *testing.T, signature string) string {
 		}
 		t.Fatalf("%s does not end", signature)
 	}
-	t.Fatalf("the session has no %s", signature)
+	t.Fatalf("%s has no %s", what, signature)
 	return ""
 }
 
