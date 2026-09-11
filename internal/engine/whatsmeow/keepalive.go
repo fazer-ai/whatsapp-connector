@@ -45,3 +45,11 @@ func keepAliveIsStale(connectedSince time.Time, event *waEvents.KeepAliveTimeout
 	}
 	return connectedSince.After(event.LastSuccess.Add(keepAliveStaleAfter))
 }
+
+// keepAliveWasAnswered reports whether the socket answered a ping after the run of failures
+// this timeout belongs to began. Every timeout in a run is dated from the same last
+// answered ping, and the recovery that ends the run moves that date forward, so a timeout
+// whose date is older than the last recovery this session saw describes a run that is over.
+func keepAliveWasAnswered(answeredAt time.Time, event *waEvents.KeepAliveTimeout) bool {
+	return !answeredAt.IsZero() && answeredAt.After(event.LastSuccess)
+}

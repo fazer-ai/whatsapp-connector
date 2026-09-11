@@ -417,6 +417,19 @@ type Session struct {
 	// socket nobody is waiting for. This is the answer to "is it connecting" that costs
 	// no lock.
 	dialing bool
+	// dropAnnounced is a drop this session brought on itself and has already published.
+	// The reset the keepalive handler performs leads to a `Disconnected` dispatched from a
+	// goroutine of its own, and whatsmeow starts the reconnect from the same instant, so
+	// the two race: a `Connected` handled first leaves the late `Disconnected` writing
+	// `reconnecting` over a socket that is up and healthy, and nothing after it corrects
+	// that -- the replacement is fine, so it produces no further event, and every command
+	// is refused from then on. Consumed by the next `Disconnected`, and dropped on a fresh
+	// dial so a reset that produced no event at all cannot leave it standing.
+	dropAnnounced bool
+	// keepAliveAnsweredAt is when the socket was last seen answering a ping, which is what
+	// tells a timeout that still describes the present from one whose run of failures is
+	// already over. Written under mu beside `connected`.
+	keepAliveAnsweredAt time.Time
 	// hungUp is an explicit disconnect this session performed and has not been asked to
 	// undo. whatsmeow's own reconnect can already be past its wait when that lands, and
 	// it then opens a socket nobody asked for, after the command has answered `close`.
@@ -805,6 +818,10 @@ func (s *Session) setDialing(dialing bool) {
 	s.mu.Lock()
 	s.dialing = dialing
 	if dialing {
+		// A socket this process is asking for is at least one generation past anything a
+		// previous reset may have left marked, so the mark stops standing here rather than
+		// waiting for a `Disconnected` that is never going to come.
+		s.dropAnnounced = false
 		// Dated from the attempt and not from the authentication that follows it. What
 		// this stamp is compared against is whatsmeow's keepalive clock, and that starts
 		// with the socket: its loop dates its first "last answered" from the moment the
@@ -1861,6 +1878,41 @@ func (s *Session) dropHangUp() (state string, gaveUp uint64) {
 	}
 	s.mu.Unlock()
 	return s.state(), gaveUp
+}
+
+// announceDrop marks the `Disconnected` this session's own reset is about to produce as
+// one that has already been published. The caller holds transition: this is one half of a
+// socket transition, not one of its own.
+func (s *Session) announceDrop() {
+	s.mu.Lock()
+	s.dropAnnounced = true
+	s.mu.Unlock()
+}
+
+// dropWasAnnounced reports whether the drop being handled is the one this session brought
+// on itself, clearing the mark either way: one reset is answered once.
+func (s *Session) dropWasAnnounced() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	announced := s.dropAnnounced
+	s.dropAnnounced = false
+	return announced
+}
+
+// answeredKeepAlive records that the socket answered a ping again.
+func (s *Session) answeredKeepAlive() {
+	at := s.now()
+	s.mu.Lock()
+	s.keepAliveAnsweredAt = at
+	s.mu.Unlock()
+}
+
+// keepAliveAnswered is when the socket was last seen answering, and the zero time when
+// nothing has said so on this process.
+func (s *Session) keepAliveAnswered() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.keepAliveAnsweredAt
 }
 
 // hangUpStanding reports whether the guard is up, without taking it down. The Connected
@@ -3245,6 +3297,13 @@ func (s *Session) handle(rawEvent any) bool {
 		s.transition.Lock()
 		defer s.transition.Unlock()
 
+		if keepAliveWasAnswered(s.keepAliveAnswered(), event) {
+			// The run of failures this belongs to is over: the socket answered again, and
+			// whatsmeow said so in an event of its own. That one is dispatched from its own
+			// goroutine too, so it can arrive first and leave this one describing a
+			// connection that recovered while it waited to be handled.
+			return true
+		}
 		if keepAliveIsStale(s.connectedSince(), event) {
 			// A timeout about a connection that is already gone, dispatched from a
 			// goroutine of its own and arriving after the socket it is about was
@@ -3266,11 +3325,28 @@ func (s *Session) handle(rawEvent any) bool {
 		// A session whose commands are already being refused while its last published
 		// state says `open` is one the client has no way to make sense of.
 		s.emit(protocol.EventSessionState, map[string]any{"state": "reconnecting", "reason": "keepalive"})
+		// The `Disconnected` this is about to cause is already published, and saying so is
+		// what keeps it from being applied late: whatsmeow starts the reconnect from the
+		// same instant it dispatches that event, and a `Connected` handled first would
+		// leave the drop writing `reconnecting` over the socket that replaced it.
+		s.announceDrop()
 		s.current().ResetConnection()
+	case *waEvents.KeepAliveRestored:
+		// Nothing to announce: the socket never went down, so no state changed. What this
+		// is for is the timeouts that came before it and have not been handled yet.
+		s.answeredKeepAlive()
 	case *waEvents.Disconnected:
 		s.transition.Lock()
 		defer s.transition.Unlock()
 
+		if s.dropWasAnnounced() {
+			// The drop this session brought on itself, published by the handler that caused
+			// it. Applying it here as well would be harmless in the order it usually
+			// arrives and would wedge the session in the order it sometimes does: handled
+			// after the replacement announced itself, it writes `reconnecting` over a
+			// healthy socket, and nothing comes after it to put that right.
+			return true
+		}
 		s.setConnected(false)
 		if s.hangUpStanding() {
 			// A drop from a socket this session is already done with. whatsmeow
