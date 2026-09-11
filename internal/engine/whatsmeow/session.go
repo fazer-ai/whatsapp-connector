@@ -417,7 +417,13 @@ type Session struct {
 	// socket nobody is waiting for. This is the answer to "is it connecting" that costs
 	// no lock.
 	dialing bool
-	// dropAnnounced is a drop this session brought on itself and has already published.
+	// dropAnnounced is a drop this session brought on itself and has already published. It
+	// names no connection, which bounds what it can do: it suppresses the next `Disconnected`
+	// handled, and if the reset's own event were overtaken by a later one the later one would
+	// consume it. Overtaking means one dispatch goroutine starved across a whole reconnect
+	// and a second drop, because `transition` hands off in arrival order once a waiter has
+	// waited a millisecond. Telling two drops apart would need a connection identity the
+	// event does not carry and whatsmeow does not expose, which is #179.
 	// The reset the keepalive handler performs leads to a `Disconnected` dispatched from a
 	// goroutine of its own, and whatsmeow starts the reconnect from the same instant, so
 	// the two race: a `Connected` handled first leaves the late `Disconnected` writing
@@ -1884,6 +1890,26 @@ func (s *Session) dropHangUp() (state string, gaveUp uint64) {
 	return s.state(), gaveUp
 }
 
+// resetUnlessReplaced takes the socket down unless a connection landed while this was
+// waiting to be scheduled.
+//
+// `ResetConnection` reads the client's socket at the moment it runs, so a goroutine that
+// sat while whatsmeow replaced the socket on its own would close the replacement. A
+// connection write since the judgement is what says that happened, and it is also what put
+// the state back to `open`, so standing down here leaves nothing to repair.
+//
+// The count is read and acted on without the transition lock, which leaves the width of
+// those two statements as a window. Taking the lock would close it and reopen the one this
+// exists for: the handler holds it across a publish that waits on a full inbox, and a reset
+// queued behind that runs whenever the inbox clears.
+func (s *Session) resetUnlessReplaced(client *wm.Client, judged int64) {
+	if s.transitions.Load() != judged {
+		s.log.Info().Msg("a connection landed before the mute socket could be taken down; leaving it alone")
+		return
+	}
+	client.ResetConnection()
+}
+
 // announceDrop marks the `Disconnected` this session's own reset is about to produce as
 // one that has already been published. The caller holds transition: this is one half of a
 // socket transition, not one of its own.
@@ -3318,6 +3344,7 @@ func (s *Session) handle(rawEvent any) bool {
 		// same instant it dispatches that event, and a `Connected` handled first would
 		// leave the drop writing `reconnecting` over the socket that replaced it.
 		s.announceDrop()
+		judged := s.transitions.Load()
 		// Ordered before the publish and started off this goroutine, and both halves of
 		// that matter.
 		//
@@ -3332,11 +3359,10 @@ func (s *Session) handle(rawEvent any) bool {
 		// with the session already refusing commands and its last published state still
 		// saying `open`, which is a session the client has no way to make sense of.
 		//
-		// What this does not buy is a guarantee. A goroutine that is ready still has to be
-		// scheduled, and one starved for long enough resets whatever socket the client has
-		// by then. That window is the scheduler's, measured against the minutes a full
-		// inbox can hold.
-		go client.ResetConnection()
+		// A goroutine that is ready still has to be scheduled, though, and `ResetConnection`
+		// reads the client's socket when it runs rather than when it is asked for, so the
+		// count above is carried along and checked on the other side.
+		go s.resetUnlessReplaced(client, judged)
 		s.emit(protocol.EventSessionState, map[string]any{"state": "reconnecting", "reason": "keepalive"})
 	case *waEvents.KeepAliveRestored:
 		// Nothing to announce: the socket never went down, so no state changed. What this

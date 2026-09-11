@@ -336,13 +336,42 @@ func TestARunOfFailuresThatBeganRightAfterARecoveryIsStillActedOn(t *testing.T) 
 func TestTheKeepAliveHandlerResetsTheConnectionRatherThanDisconnecting(t *testing.T) {
 	t.Parallel()
 
-	handler := theCaseFor(t, "*waEvents.KeepAliveTimeout")
-	if !strings.Contains(handler, "ResetConnection()") {
-		t.Fatalf("the keepalive handler does not reset the connection:\n%s", handler)
+	taking := theBodyOf(t, "func (s *Session) resetUnlessReplaced(")
+	if !strings.Contains(taking, "ResetConnection()") {
+		t.Fatalf("the socket is not taken down with a reset:\n%s", taking)
 	}
+	if strings.Contains(taking, "Disconnect()") {
+		t.Fatalf("the socket is taken down with a disconnect, which publishes nothing and leaves "+
+			"the session reporting open:\n%s", taking)
+	}
+	handler := theCaseFor(t, "*waEvents.KeepAliveTimeout")
 	if strings.Contains(handler, "Disconnect()") {
 		t.Fatalf("the keepalive handler disconnects, which publishes nothing and leaves the session reporting open:\n%s", handler)
 	}
+}
+
+// theBodyOf returns a function of the session, from its signature to its closing brace.
+func theBodyOf(t *testing.T, signature string) string {
+	t.Helper()
+
+	raw, err := os.ReadFile("session.go")
+	if err != nil {
+		t.Fatalf("read the session: %v", err)
+	}
+	lines := strings.Split(string(raw), "\n")
+	for i, line := range lines {
+		if !strings.HasPrefix(line, signature) {
+			continue
+		}
+		for end := i + 1; end < len(lines); end++ {
+			if lines[end] == "}" {
+				return strings.Join(lines[i:end+1], "\n")
+			}
+		}
+		t.Fatalf("%s does not end", signature)
+	}
+	t.Fatalf("the session has no %s", signature)
+	return ""
 }
 
 // theCaseFor returns one arm of the event switch, from its case line to the next one.
@@ -370,6 +399,44 @@ func theCaseFor(t *testing.T, event string) string {
 	return ""
 }
 
+// And the goroutine it is started on stands down if a connection landed while it waited to
+// run. `ResetConnection` reads the client's socket when it runs, so one scheduled late over
+// a socket whatsmeow replaced on its own would close the replacement.
+func TestTheResetStandsDownWhenAConnectionLandedFirst(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	var written bytes.Buffer
+	session.log = zerolog.New(&written)
+	dialedAndConnected(session)
+
+	judged := session.transitions.Load()
+	// A replacement announced itself while the reset was still waiting for a turn.
+	session.setConnected(true)
+
+	session.resetUnlessReplaced(session.current(), judged)
+
+	if !strings.Contains(written.String(), "leaving it alone") {
+		t.Fatalf("the reset went ahead over a connection that landed after the judgement: %q", written.String())
+	}
+}
+
+// And goes ahead when nothing did.
+func TestTheResetGoesAheadWhenNothingLandedFirst(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	var written bytes.Buffer
+	session.log = zerolog.New(&written)
+	dialedAndConnected(session)
+
+	session.resetUnlessReplaced(session.current(), session.transitions.Load())
+
+	if written.Len() != 0 {
+		t.Fatalf("the reset stood down with nothing between it and the judgement: %s", written.String())
+	}
+}
+
 // The order inside the arm is load-bearing and invisible to every test that can run here:
 // with no socket under it, a reset returns at once and an inbox nobody filled never makes
 // `emit` wait, so every arrangement of these three lines looks the same from outside. What
@@ -381,7 +448,7 @@ func TestTheKeepAliveHandlerTakesTheSocketDownBeforeItWaitsOnThePublish(t *testi
 
 	handler := theCaseFor(t, "*waEvents.KeepAliveTimeout")
 	refused := strings.Index(handler, "setReconnecting(true)")
-	closed := strings.Index(handler, "ResetConnection()")
+	closed := strings.Index(handler, "resetUnlessReplaced(")
 	published := strings.Index(handler, "s.emit(")
 	if refused < 0 || closed < 0 || published < 0 {
 		t.Fatalf("the keepalive handler does not refuse, close and publish:\n%s", handler)
@@ -406,7 +473,7 @@ func TestTheKeepAliveHandlerDoesNotWaitForTheCloseHandshake(t *testing.T) {
 	t.Parallel()
 
 	handler := theCaseFor(t, "*waEvents.KeepAliveTimeout")
-	if !strings.Contains(handler, "go client.ResetConnection()") {
+	if !strings.Contains(handler, "go s.resetUnlessReplaced(client, judged)") {
 		t.Fatalf("the keepalive handler waits for the close handshake before publishing:\n%s", handler)
 	}
 	// And on the client it judged, not on whatever the session is holding once that
