@@ -45,8 +45,12 @@ endif
 test-cover: ## Run the test suite and write coverage.txt
 	WAC_TEST_DATABASE_URL= $(GO) test -race -coverprofile=coverage.txt -covermode=atomic $(PACKAGES)
 
+# The whole package, and not a -run of the tests whose names sounded like the contract:
+# the filter that used to be here missed the RPC classification and both enum checks, so
+# a fixture that broke one of them left this target green. A list of name fragments is a
+# list somebody has to remember to extend, and the package is already under a second.
 contract: ## Check the Go protocol binding against contract/
-	$(GO) test ./internal/protocol -run 'Contract|Fixture|Type|Version|ErrorCodes'
+	$(GO) test ./internal/protocol
 
 tidy: ## Fail when go.mod/go.sum are not tidy
 	$(GO) mod tidy -diff
