@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"github.com/rs/zerolog"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 	"github.com/fazer-ai/whatsapp-connector/internal/redisx"
@@ -41,7 +42,12 @@ type Options struct {
 	// Instance is this connector's id. It is the consumer name inside the group, so
 	// it has to be stable for the life of the process and unique in the fleet:
 	// commands left pending are claimed back by name.
-	Instance      string
+	Instance string
+	// Logger is where a diagnosis this layer can only make once goes. The transport is
+	// otherwise silent by design -- it answers its callers and they decide what is worth
+	// saying -- but a trim that cut undelivered commands leaves a reading the next read
+	// destroys, so there is nobody left to tell afterwards.
+	Logger        zerolog.Logger
 	EventMaxLen   int64
 	CommandMaxLen int64
 	Block         time.Duration
@@ -82,6 +88,8 @@ type unrunEntry struct {
 // New returns the transport. It creates no keys: a stream and its group are created on
 // first use, which is what lets a connector start before any client exists and the
 // other way round.
+//
+//nolint:gocritic // Options is heavy because it now carries a zerolog.Logger, which is designed to be copied
 func New(client *redisx.Client, opts Options) (*Streams, error) {
 	if opts.Instance == "" {
 		return nil, errors.New("redisstream: instance id is required")
@@ -212,9 +220,12 @@ func (s *Streams) Read(ctx context.Context, sids []string) ([]transport.Delivery
 	if _, room := s.blockWithin(ctx); !room {
 		return nil, nil
 	}
-	if err := s.groups.ensure(ctx, s.client, streams); err != nil {
+	fresh, err := s.groups.ensure(ctx, s.client, streams)
+	if err != nil {
 		return nil, err
 	}
+	// Before the read, because the read is what destroys the reading this is taken from.
+	s.reportTrimmed(ctx, fresh)
 	// And again after it, because that trip spends the same window the block is measured
 	// against: a block decided before it can outlive the deadline by whatever the ensure
 	// took, which is the severed read this reserve exists to prevent.
@@ -375,9 +386,13 @@ func (s *Streams) claim(ctx context.Context, streams []string, minIdle time.Dura
 	if len(streams) == 0 {
 		return nil, nil
 	}
-	if err := s.groups.ensure(ctx, s.client, streams); err != nil {
+	fresh, err := s.groups.ensure(ctx, s.client, streams)
+	if err != nil {
 		return nil, err
 	}
+	// The other door onto a stream this process has not touched yet, and it moves the
+	// group just the same, so the reading has to be taken here too.
+	s.reportTrimmed(ctx, fresh)
 
 	var claimed []transport.Delivery
 	// Every early return past this point has to let go of what it already took: a

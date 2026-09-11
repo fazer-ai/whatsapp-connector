@@ -50,7 +50,7 @@ func TestAFailedClaimLetsGoOfWhatItAlreadyTook(t *testing.T) {
 	// The second stream is primed so its group is cached, and then replaced by a value
 	// that is not a stream at all. That is what a Redis answering wrongly partway
 	// through a pass looks like from in here, without a sleep or a race to arrange it.
-	if err := streams.groups.ensure(ctx, client, []string{first, second}); err != nil {
+	if _, err := streams.groups.ensure(ctx, client, []string{first, second}); err != nil {
 		t.Fatalf("ensure: %v", err)
 	}
 	if err := client.Del(ctx, second).Err(); err != nil {

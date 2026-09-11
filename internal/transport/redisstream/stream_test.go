@@ -1,9 +1,12 @@
 package redisstream_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -13,6 +16,7 @@ import (
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
+	"github.com/rs/zerolog"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 	"github.com/fazer-ai/whatsapp-connector/internal/redisx"
@@ -56,6 +60,20 @@ func (h *sentCommands) ProcessPipelineHook(next redis.ProcessPipelineHook) redis
 		h.n.Add(int64(len(cmds)))
 		return next(ctx, cmds)
 	}
+}
+
+// streamsLogging is `streams` with somewhere to read the log, for the one diagnosis this
+// layer makes on its own instead of answering its caller with it.
+func (f fleet) streamsLogging(t *testing.T, instance string, written io.Writer) *redisstream.Streams {
+	t.Helper()
+	streams, err := redisstream.New(f.client, redisstream.Options{
+		Instance: instance, Block: 50 * time.Millisecond, ClaimMinIdle: time.Millisecond,
+		Logger: zerolog.New(written),
+	})
+	if err != nil {
+		t.Fatalf("redisstream.New: %v", err)
+	}
+	return streams
 }
 
 func (f fleet) streams(t *testing.T, instance string) *redisstream.Streams {
@@ -1232,5 +1250,152 @@ func TestADeliverySaysWhetherItWasTakenOverOrReadFresh(t *testing.T) {
 	if len(adopted) != 1 || !adopted[0].Redelivered {
 		t.Fatalf("the drain claimed %d commands, redelivered=%v; want 1 marked as taken over",
 			len(adopted), len(adopted) == 1 && adopted[0].Redelivered)
+	}
+}
+
+// RedisEnv names a real Redis for the one pass miniredis cannot stand in for. The double
+// answers zero for `entries-added` and `entries-read`, which are the counters the trim
+// report is built on, so against it the report is correctly silent and proves nothing
+// about the case it exists for.
+const RedisEnv = "WAC_TEST_REDIS_URL"
+
+// realFleet is the fleet against the server RedisEnv names, under a prefix of its own so
+// a run leaves nothing behind for the next one.
+func realFleet(t *testing.T) fleet {
+	t.Helper()
+	url := os.Getenv(RedisEnv)
+	if url == "" {
+		t.Skipf("set %s to run this against a real Redis (see 'make test-redis')", RedisEnv)
+	}
+	opts, err := redis.ParseURL(url)
+	if err != nil {
+		t.Fatalf("parse %s: %v", RedisEnv, err)
+	}
+	rdb := redis.NewClient(opts)
+	t.Cleanup(func() { _ = rdb.Close() })
+	prefix := "wactest:" + strconv.FormatInt(time.Now().UnixNano(), 36) + ":"
+	t.Cleanup(func() {
+		keys, err := rdb.Keys(context.Background(), prefix+"*").Result()
+		if err == nil && len(keys) > 0 {
+			_ = rdb.Del(context.Background(), keys...).Err()
+		}
+	})
+	return fleet{rdb: rdb, client: redisx.Wrap(rdb, prefix, shards)}
+}
+
+// A client writes commands with `MAXLEN ~`, so Redis drops the oldest entries on its own
+// and the consumer group is never consulted: the publisher got an id back, the group goes
+// on from its last-delivered-id, and the next read simply returns what survived. Nothing
+// on either side reports the commands cut in between, and `lag` even falls as if the work
+// had been done.
+//
+// The numbers are the ones measured in #176: ten commands, three delivered, trimmed to
+// two, five lost. Against a real server, because the counters that answer this are
+// `entries-added` and `entries-read` and miniredis reports neither.
+func TestATrimThatCutUndeliveredCommandsIsSaidOutLoud(t *testing.T) {
+	t.Parallel()
+
+	f := realFleet(t)
+	ctx := context.Background()
+	stream := f.client.Keys().Commands("s1")
+	// An earlier owner read what there was and stopped there, which is where the group's
+	// last-delivered-id stays.
+	for i := range 3 {
+		writeCommand(t, f, stream, command("c"+strconv.Itoa(i), "s1", ""))
+	}
+	if _, err := f.streams(t, "inst-a").Read(ctx, []string{"s1"}); err != nil {
+		t.Fatalf("the first read: %v", err)
+	}
+	// The client went on writing while nobody was reading, and the cap took the ones
+	// nobody had been handed.
+	for i := 3; i < 10; i++ {
+		writeCommand(t, f, stream, command("c"+strconv.Itoa(i), "s1", ""))
+	}
+	if err := f.rdb.XTrimMaxLen(ctx, stream, 2).Err(); err != nil {
+		t.Fatalf("XTrimMaxLen: %v", err)
+	}
+
+	// A different instance adopts the session, which is the moment this is asked.
+	written := &bytes.Buffer{}
+	if _, err := f.streamsLogging(t, "inst-b", written).Read(ctx, []string{"s1"}); err != nil {
+		t.Fatalf("the read after the trim: %v", err)
+	}
+
+	logged := written.String()
+	if !strings.Contains(logged, "trimmed out of this stream before they were delivered") {
+		t.Fatalf("the cut was not reported anywhere; the log was:\n%s", logged)
+	}
+	// The count and the stream, because an operator reading this has to know how much was
+	// lost and which account lost it.
+	if !strings.Contains(logged, `"commands_lost":5`) {
+		t.Fatalf("the report does not say five commands were lost; the log was:\n%s", logged)
+	}
+	if !strings.Contains(logged, stream) {
+		t.Fatalf("the report does not name the stream; the log was:\n%s", logged)
+	}
+}
+
+// And the ordinary trim, the one that takes only what the group already read, says
+// nothing. This is the case the obvious heuristic gets wrong: the oldest surviving entry
+// is later than the last delivered one here too, exactly as in a real cut.
+func TestATrimThatTookOnlyWhatWasDeliveredIsNotReported(t *testing.T) {
+	t.Parallel()
+
+	f := realFleet(t)
+	ctx := context.Background()
+	stream := f.client.Keys().Commands("s1")
+	for i := range 3 {
+		writeCommand(t, f, stream, command("c"+strconv.Itoa(i), "s1", ""))
+	}
+	if _, err := f.streams(t, "inst-a").Read(ctx, []string{"s1"}); err != nil {
+		t.Fatalf("the first read: %v", err)
+	}
+	for i := 3; i < 10; i++ {
+		writeCommand(t, f, stream, command("c"+strconv.Itoa(i), "s1", ""))
+	}
+	// Seven left, which is everything the group has not been handed.
+	if err := f.rdb.XTrimMaxLen(ctx, stream, 7).Err(); err != nil {
+		t.Fatalf("XTrimMaxLen: %v", err)
+	}
+
+	written := &bytes.Buffer{}
+	if _, err := f.streamsLogging(t, "inst-b", written).Read(ctx, []string{"s1"}); err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if logged := written.String(); strings.Contains(logged, "trimmed out") {
+		t.Fatalf("an ordinary trim was reported as a loss:\n%s", logged)
+	}
+}
+
+// A server that cannot answer the counters must produce silence and not a clean bill.
+// miniredis is exactly that server -- it reports zero for both -- which makes it the
+// fixture for this and useless for the two above.
+func TestAServerThatCannotAnswerTheCountersIsNotCalledClean(t *testing.T) {
+	t.Parallel()
+
+	f := newFleet(t)
+	ctx := context.Background()
+	stream := f.client.Keys().Commands("s1")
+	for i := range 3 {
+		writeCommand(t, f, stream, command("c"+strconv.Itoa(i), "s1", ""))
+	}
+	if _, err := f.streams(t, "inst-a").Read(ctx, []string{"s1"}); err != nil {
+		t.Fatalf("the first read: %v", err)
+	}
+	for i := 3; i < 10; i++ {
+		writeCommand(t, f, stream, command("c"+strconv.Itoa(i), "s1", ""))
+	}
+	if err := f.rdb.XTrimMaxLen(ctx, stream, 2).Err(); err != nil {
+		t.Fatalf("XTrimMaxLen: %v", err)
+	}
+
+	written := &bytes.Buffer{}
+	if _, err := f.streamsLogging(t, "inst-b", written).Read(ctx, []string{"s1"}); err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	// Silence, and the read still works: the diagnosis is never allowed to fail the read
+	// it runs in front of.
+	if logged := written.String(); strings.Contains(logged, "trimmed out") {
+		t.Fatalf("a server that cannot count reported a loss it cannot know about:\n%s", logged)
 	}
 }

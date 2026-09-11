@@ -27,7 +27,15 @@ func newGroupCache() *groupCache {
 	return &groupCache{ensured: make(map[string]struct{})}
 }
 
-func (c *groupCache) ensure(ctx context.Context, client *redisx.Client, streams []string) error {
+// ensure creates the group where it is missing and answers with the streams this process
+// had not touched before and whose group was already standing.
+//
+// That list is what `reportTrimmed` is asked about, and both halves of it matter. Not
+// touched before, because the reading it takes survives only until the first read of that
+// stream. Already standing, because a group this call created has been handed nothing, so
+// there is no delivery for a cut to have overtaken.
+func (c *groupCache) ensure(ctx context.Context, client *redisx.Client, streams []string) ([]string, error) {
+	var standing []string
 	for _, stream := range streams {
 		c.mu.Lock()
 		_, done := c.ensured[stream]
@@ -41,14 +49,17 @@ func (c *groupCache) ensure(ctx context.Context, client *redisx.Client, streams 
 		// started is still delivered rather than skipped.
 		err := client.XGroupCreateMkStream(ctx, stream, ConsumerGroup, "0").Err()
 		if err != nil && !isBusyGroup(err) {
-			return fmt.Errorf("redisstream: create group on %s: %w", stream, err)
+			return nil, fmt.Errorf("redisstream: create group on %s: %w", stream, err)
+		}
+		if isBusyGroup(err) {
+			standing = append(standing, stream)
 		}
 
 		c.mu.Lock()
 		c.ensured[stream] = struct{}{}
 		c.mu.Unlock()
 	}
-	return nil
+	return standing, nil
 }
 
 // forget drops a stream from the cache so the next ensure recreates its group. Called
