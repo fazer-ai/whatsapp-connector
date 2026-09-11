@@ -835,6 +835,36 @@ func TestTheConnectionIsCheckedAgainAfterASocketIsFound(t *testing.T) {
 	}
 }
 
+// And a drop swallowed by the mark still tells the takedown that its socket is gone. The
+// takedown runs on its own goroutine and judges by the connection count; the question it
+// asks whatsmeow -- is there still a socket -- costs a wait on a lock a redial holds for a
+// whole attempt, so the answer that comes back at the end of one describes the socket that
+// replaced the mute one. The replacement itself is invisible until whatsmeow finishes its
+// prekey and passive IQs (#181), but the drop of the judged socket is not, and it is enough.
+func TestADropSwallowedByTheMarkStillEndsTheConnectionItWasJudgedOn(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.relearn(session.current())
+	dialedAndConnected(session)
+
+	session.handle(&waEvents.KeepAliveTimeout{ErrorCount: 2, LastSuccess: time.Now()})
+	if state := decode(t, next(t, session).Payload)["state"]; state != "reconnecting" {
+		t.Fatalf("the session published state=%v while giving up on the socket", state)
+	}
+	judged := session.transitions.Load()
+
+	// The drop the takedown caused, or the one that beat it there: either way the mark
+	// swallows it, and the arm returns without touching the state the handler already wrote.
+	session.handle(&waEvents.Disconnected{})
+
+	if session.transitions.Load() == judged {
+		t.Fatal("the drop was swallowed without recording that the judged connection is over, so " +
+			"a takedown waking from its question at the end of a redial still reads its socket as " +
+			"current and takes down the one that replaced it")
+	}
+}
+
 // The unlink a `session.delete` sends is the sharpest case of all: it is a lifecycle
 // command, so it never passes through `Execute`, and cutting it off would have whatsmeow
 // resend the removal to WhatsApp. Driven rather than fenced, because this one cannot be

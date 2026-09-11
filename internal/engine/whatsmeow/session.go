@@ -2061,6 +2061,24 @@ func (s *Session) forgetOwedReset() {
 	s.mu.Unlock()
 }
 
+// dropped records that the connection this session was on is over, before anything here can
+// wait on a lock.
+//
+// What reads it is the takedown running on its own goroutine. That one judged a socket by
+// the count, and asking whatsmeow whether the socket is still under the client costs a wait
+// on a lock a redial holds for the length of an attempt -- so the answer it eventually gets
+// describes whatever socket the client has by then, which may be the one that replaced the
+// mute socket rather than the mute socket. The session cannot see that replacement arrive:
+// whatsmeow dispatches `Connected` only after its prekey and passive IQs, which is issue
+// #181. It can see this, and this is enough -- a takedown whose socket has been reported
+// gone has nothing left to take down, whatever is under the client now.
+//
+// Counted rather than flagged, because the count is what the takedown already judges by, and
+// counting twice for one drop costs nothing: every reader compares it against a snapshot.
+func (s *Session) dropped() {
+	s.transitions.Add(1)
+}
+
 // cancelOwedReset drops a takedown that was still waiting for a command to be answered, and
 // reports whether the connection it was judged on is the one that recovered.
 //
@@ -3614,6 +3632,7 @@ func (s *Session) handle(rawEvent any) bool {
 		// under the client, and the socket it finds is the replacement. Nothing here needs
 		// the transition lock: the count is atomic and the debt is its own field.
 		s.forgetOwedReset()
+		s.dropped()
 
 		s.transition.Lock()
 		defer s.transition.Unlock()
