@@ -383,7 +383,11 @@ func TestTheResetRetiresTheMarkWhenThereIsNoSocketToTakeDown(t *testing.T) {
 func assertTheNextDropIsApplied(t *testing.T, session *Session) {
 	t.Helper()
 
-	dialedAndConnected(session)
+	// Back on a socket the way whatsmeow's own reconnect puts it there, with no dial of this
+	// session's own. A dial retires the mark as well, and going through one here would hide
+	// whether the reset did -- and whatsmeow's reconnect after a keepalive reset never
+	// passes through a dial, which is the case this is about.
+	session.setConnected(true)
 	session.handle(&waEvents.Disconnected{})
 	if got := session.state(); got != "reconnecting" {
 		t.Fatalf("a genuine drop was swallowed by a mark nothing was ever going to claim, "+
