@@ -400,6 +400,29 @@ func TestTheResetGoesBackToWaitingWhenACommandStartedFirst(t *testing.T) {
 	}
 }
 
+// A connection this session declared over takes its mark with it, for the same reason. An
+// explicit disconnect is marked expected inside whatsmeow and publishes no `Disconnected`,
+// so nothing is ever going to claim that mark, and after the operator reconnects it would
+// swallow the next genuine drop instead.
+func TestAConnectionDeclaredOverRetiresItsMark(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.relearn(session.current())
+	dialedAndConnected(session)
+	session.announceDrop()
+
+	session.offline()
+
+	dialedAndConnected(session)
+	session.handle(&waEvents.Disconnected{})
+
+	if got := session.state(); got != "reconnecting" {
+		t.Fatalf("a drop after the operator reconnected was swallowed by the mark of a "+
+			"connection declared over, leaving the session %q with no socket under it", got)
+	}
+}
+
 // But a client this session no longer holds takes its mark with it. The argument for
 // keeping one rests on whatsmeow announcing its own reconnect, and a client adopted after a
 // logout has no device to reconnect with: a drop swallowed during the pairing that follows

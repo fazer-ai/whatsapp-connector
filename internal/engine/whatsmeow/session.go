@@ -940,6 +940,11 @@ func (s *Session) undoHangUp() bool {
 func (s *Session) offline() {
 	s.mu.Lock()
 	s.owed = nil
+	// And the mark that went with it. This is the session saying the connection is over and
+	// nothing is coming back on its own, so no `Disconnected` is owed to it -- an explicit
+	// disconnect is marked expected inside whatsmeow and publishes none, and a remote drop
+	// that raced the hang-up is answered by the guard the hang-up itself raises.
+	s.dropAnnounced = false
 	s.transitions.Add(1)
 	s.connected = false
 	s.reconnecting = false
