@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -323,7 +324,7 @@ func TestTheKeepAliveHandlerAnnouncesTheDropItIsAboutToCause(t *testing.T) {
 
 	handler := theCaseFor(t, "*waEvents.KeepAliveTimeout")
 	announced := strings.Index(handler, "s.announceDrop()")
-	closed := strings.Index(handler, "resetUnlessReplaced(")
+	closed := strings.Index(handler, "takeDownSoon(")
 	if announced < 0 || closed < 0 {
 		t.Fatalf("the keepalive handler does not announce the drop it causes:\n%s", handler)
 	}
@@ -390,6 +391,88 @@ func assertTheNextDropIsApplied(t *testing.T, session *Session) {
 	}
 }
 
+// A socket taken down under a command that is still waiting on WhatsApp is what turns one
+// write into two: `ResetConnection` clears whatsmeow's response waiters, `sendIQ` answers
+// the disconnect node by resending the identical frame under the same stanza id, and
+// WhatsApp does not deduplicate an IQ across connections. Measured on the real service, a
+// `group.create` caught by that resend left the account with two groups and the caller was
+// told about the second one only.
+func TestAMuteSocketIsNotTakenDownUnderACommandStillWaiting(t *testing.T) {
+	t.Parallel()
+
+	session, written := newLoggedTestSession(t, "5511999990001")
+	session.relearn(session.current())
+	dialedAndConnected(session)
+
+	// A command is out at WhatsApp, the way `Execute` counts one.
+	session.startCommand()
+	session.handle(&waEvents.KeepAliveTimeout{ErrorCount: 2, LastSuccess: time.Now()})
+
+	if !strings.Contains(written.String(), "comes down with its answer") {
+		t.Fatalf("the socket was taken down under a command still waiting: %q", written.String())
+	}
+	// The half that does not wait: the client is told and the gate closes at once, because
+	// neither needs the socket to be down.
+	if got := session.state(); got != "reconnecting" {
+		t.Fatalf("the session reports %q, so readyToSend still accepts while the socket is mute", got)
+	}
+	if state := decode(t, next(t, session).Payload)["state"]; state != "reconnecting" {
+		t.Fatalf("the session published state=%v", state)
+	}
+}
+
+// And it comes down as soon as that command is answered.
+func TestTheOwedTakeDownRunsWhenTheCommandIsAnswered(t *testing.T) {
+	t.Parallel()
+
+	session, written := newLoggedTestSession(t, "5511999990001")
+	session.relearn(session.current())
+	dialedAndConnected(session)
+
+	session.startCommand()
+	session.handle(&waEvents.KeepAliveTimeout{ErrorCount: 2, LastSuccess: time.Now()})
+	next(t, session)
+
+	session.endCommand()
+
+	// The reset owed for that socket runs off a goroutine, and with no socket under it the
+	// only thing it leaves behind is the line saying so.
+	waitFor(t, func() bool { return strings.Contains(written.String(), "already gone") },
+		"the takedown owed to the answered command never ran")
+}
+
+// waitFor polls a condition the production code reaches from a goroutine of its own.
+func waitFor(t *testing.T, done func() bool, complaint string) {
+	t.Helper()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if done() {
+			return
+		}
+		runtime.Gosched()
+	}
+	t.Fatal(complaint)
+}
+
+// And what counts a command as being in flight is `Execute` itself, for the whole of it.
+// Read off the source because every command a test can run here answers from memory, so the
+// count is back to zero before anything could look at it.
+func TestExecuteCountsTheCommandItIsCarryingOut(t *testing.T) {
+	t.Parallel()
+
+	carrying := theBodyOf(t, "func (s *Session) Execute(")
+	started := strings.Index(carrying, "s.startCommand()")
+	ended := strings.Index(carrying, "defer s.endCommand()")
+	if started < 0 || ended < 0 {
+		t.Fatalf("Execute does not count the command in flight, so the keepalive handler takes "+
+			"the socket down under it and WhatsApp applies the resent frame twice:\n%s", carrying)
+	}
+	if started > ended {
+		t.Fatalf("Execute releases the count before it takes it:\n%s", carrying)
+	}
+}
+
 // The order inside the arm is load-bearing and invisible to every test that can run here:
 // with no socket under it, a reset returns at once and an inbox nobody filled never makes
 // `emit` wait, so every arrangement of these three lines looks the same from outside. What
@@ -401,7 +484,7 @@ func TestTheKeepAliveHandlerTakesTheSocketDownBeforeItWaitsOnThePublish(t *testi
 
 	handler := theCaseFor(t, "*waEvents.KeepAliveTimeout")
 	refused := strings.Index(handler, "setReconnecting(true)")
-	closed := strings.Index(handler, "resetUnlessReplaced(")
+	closed := strings.Index(handler, "takeDownSoon(")
 	published := strings.Index(handler, "s.emit(")
 	if refused < 0 || closed < 0 || published < 0 {
 		t.Fatalf("the keepalive handler does not refuse, close and publish:\n%s", handler)
@@ -426,7 +509,7 @@ func TestTheKeepAliveHandlerDoesNotWaitForTheCloseHandshake(t *testing.T) {
 	t.Parallel()
 
 	handler := theCaseFor(t, "*waEvents.KeepAliveTimeout")
-	if !strings.Contains(handler, "go s.resetUnlessReplaced(client, judged)") {
+	if !strings.Contains(theBodyOf(t, "func (s *Session) takeDownSoon("), "go s.resetUnlessReplaced(") {
 		t.Fatalf("the keepalive handler waits for the close handshake before publishing:\n%s", handler)
 	}
 	// And on the client it judged, not on whatever the session is holding once that

@@ -417,6 +417,16 @@ type Session struct {
 	// socket nobody is waiting for. This is the answer to "is it connecting" that costs
 	// no lock.
 	dialing bool
+	// running is how many commands are inside Execute. The keepalive handler reads it
+	// before taking a mute socket down, because `ResetConnection` clears whatsmeow's
+	// response waiters and `sendIQ` answers a disconnect node by resending the identical
+	// frame, same stanza id (`request.go:166`). WhatsApp does not deduplicate an IQ across
+	// connections: measured, a `group.create` caught by that resend leaves the account with
+	// two groups, and the caller is told about the second one only.
+	running int
+	// owed is a socket takedown the keepalive handler decided on and could not perform,
+	// because of the above. It runs when the command in flight is answered.
+	owed *owedReset
 	// dropAnnounced is a drop this session brought on itself and has already published. Put
 	// up by the handler that causes the reset, taken down by the next `Disconnected` or by
 	// the reset itself when it finds nothing to take down.
@@ -1889,6 +1899,56 @@ func (s *Session) dropHangUp() (state string, gaveUp uint64) {
 	return s.state(), gaveUp
 }
 
+// owedReset is a takedown waiting for the command in flight to be answered.
+type owedReset struct {
+	client *wm.Client
+	judged int64
+}
+
+func (s *Session) startCommand() {
+	s.mu.Lock()
+	s.running++
+	s.mu.Unlock()
+}
+
+// endCommand releases the takedown the keepalive handler left waiting, if this was the
+// command it was waiting for.
+func (s *Session) endCommand() {
+	s.mu.Lock()
+	s.running--
+	owed := s.owed
+	if s.running > 0 {
+		owed = nil
+	} else {
+		s.owed = nil
+	}
+	s.mu.Unlock()
+	if owed != nil {
+		go s.resetUnlessReplaced(owed.client, owed.judged)
+	}
+}
+
+// takeDownSoon takes the socket down, or writes down that it has to come down as soon as
+// whatever is waiting on WhatsApp has been answered.
+//
+// Taking it down under an in-flight command is what turns one write into two. The state is
+// already `reconnecting` and the client already told, so nothing new is accepted while this
+// waits, and what it waits for is bounded: `sendIQ` answers within its own 75s ceiling, the
+// one main reaches first and this design otherwise gets in front of.
+func (s *Session) takeDownSoon(client *wm.Client, judged int64) {
+	s.mu.Lock()
+	waiting := s.running > 0
+	if waiting {
+		s.owed = &owedReset{client: client, judged: judged}
+	}
+	s.mu.Unlock()
+	if waiting {
+		s.log.Info().Msg("a command is still waiting on WhatsApp; the mute socket comes down with its answer")
+		return
+	}
+	go s.resetUnlessReplaced(client, judged)
+}
+
 // resetUnlessReplaced takes the socket down unless a connection landed while this was
 // waiting to be scheduled.
 //
@@ -2181,6 +2241,13 @@ func (s *Session) isStale() bool {
 // What is not here is refused rather than answered with a plausible shape: a connector
 // that acknowledged a send it cannot make would lose the message and report success.
 func (s *Session) Execute(ctx context.Context, command *protocol.Command) (json.RawMessage, error) {
+	// Counted for the whole of it, so a socket this session decides to take down waits for
+	// whatever is already out at WhatsApp. What it must not interrupt is an answer that has
+	// not arrived: whatsmeow resends the frame it was cut off from, and WhatsApp applies it
+	// again.
+	s.startCommand()
+	defer s.endCommand()
+
 	// Stamped here, before the command spends a round trip at WhatsApp: a pairing that
 	// comes back belongs to the account that asked for it, and a logout landing in that
 	// window has already rebuilt the session on another one.
@@ -3385,7 +3452,7 @@ func (s *Session) handle(rawEvent any) bool {
 		// A goroutine that is ready still has to be scheduled, though, and `ResetConnection`
 		// reads the client's socket when it runs rather than when it is asked for, so the
 		// count above is carried along and checked on the other side.
-		go s.resetUnlessReplaced(client, judged)
+		s.takeDownSoon(client, judged)
 		s.emit(protocol.EventSessionState, map[string]any{"state": "reconnecting", "reason": "keepalive"})
 	case *waEvents.KeepAliveRestored:
 		// Nothing to announce: the socket never went down, so no state changed. What this
