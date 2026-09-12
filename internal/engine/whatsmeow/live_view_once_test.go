@@ -221,7 +221,26 @@ func reportWhatArrived(
 
 	switch {
 	case said.Type == "unsupported":
-		say("MEASURED %-52s -> nothing reached the companion but a stub: %s/%s", probe, said.Type, said.Reason)
+		// Which unsupported, because they answer #21's question in opposite directions.
+		// Only `unavailable` means the stanza carried no ciphertext at all -- the thing
+		// #20 saw. `undecryptable` is the reverse: the ciphertext DID reach this device
+		// and would not open, which is a Signal session problem and not WhatsApp
+		// withholding anything. Reporting the second as the first would hand this phase
+		// the opposite conclusion after an ordinary decryption failure.
+		switch protocol.UnsupportedReason(said.Reason) {
+		case protocol.UnsupportedUnavailable:
+			say("MEASURED %-52s -> nothing reached the companion: the stanza carried no ciphertext (%s)",
+				probe, said.Reason)
+		case protocol.UnsupportedUndecryptable:
+			say("MEASURED %-52s -> the ciphertext DID reach the companion and would not open (%s): a session problem, not a withheld message; re-run before reading anything into it",
+				probe, said.Reason)
+		case protocol.UnsupportedMasked:
+			say("MEASURED %-52s -> WhatsApp withheld it from every linked device (%s), which is not the view-once path",
+				probe, said.Reason)
+		default:
+			say("MEASURED %-52s -> it arrived and could not be rendered (%s), which says nothing either way about the bytes",
+				probe, said.Reason)
+		}
 	case said.Type != "media":
 		say("MEASURED %-52s -> something else arrived: %s", probe, message.Content)
 	default:
