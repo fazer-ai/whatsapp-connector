@@ -563,9 +563,14 @@ func (c *Connector) resumeOnce(ctx context.Context) {
 	}
 	running := c.manager.SIDs()
 	candidates := make([]string, 0, len(wanted))
-	for _, sid := range wanted {
-		if !slices.Contains(running, sid) {
-			candidates = append(candidates, sid)
+	// What each client asked to receive, kept beside the list because everything between
+	// here and the resume speaks in session ids alone: the leases and the backoff are
+	// asked about a set of accounts, not about what any of them subscribed to.
+	subscription := make(map[string]bool, len(wanted))
+	for _, session := range wanted {
+		subscription[session.SID] = session.Groups
+		if !slices.Contains(running, session.SID) {
+			candidates = append(candidates, session.SID)
 		}
 	}
 	free, err := c.leases.Unleased(pass, candidates)
@@ -607,7 +612,7 @@ func (c *Connector) resumeOnce(ctx context.Context) {
 		if !won {
 			continue
 		}
-		if c.manager.Resume(sid) {
+		if c.manager.Resume(sid, subscription[sid]) {
 			asked++
 			c.log.Info().Str("sid", sid).Msg("bringing back a session that should be connected and that nobody is running")
 		}

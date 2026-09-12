@@ -129,18 +129,35 @@ func (s *Scoped) Availability(ctx context.Context) (state string, kept bool, err
 	return s.container.availability(ctx, s.sid)
 }
 
-// PutDesired records what the client last asked this session to be, so that an instance
-// which comes up later can put it back.
+// PutDesiredConnected records that the client asked this session to be connected, and
+// which traffic it asked for while it is, so that an instance which comes up later can
+// put back the session that was asked for rather than half of it.
 //
 // Fenced like every other write from here: an instance that has lost the account must not
 // be the one saying what should happen to it. The two writers are the two commands that
-// say it -- a connect and a disconnect -- and the deletion is the forget, which is what a
-// logout and a teardown both end in.
-func (s *Scoped) PutDesired(ctx context.Context, desired string) error {
+// say it, this one and PutDesiredDisconnected, and the deletion is the forget, which is
+// what a logout and a teardown both end in.
+//
+// A door per command rather than one that takes the state as a string: only one of the
+// two carries a subscription, and a single door would let a caller record a connection
+// without one -- which is the state this issue was, a session brought back deaf to the
+// groups its client asked for.
+func (s *Scoped) PutDesiredConnected(ctx context.Context, groups bool) error {
 	if err := s.fence.held(); err != nil {
 		return err
 	}
-	return s.container.putDesired(ctx, s.sid, desired, time.Now())
+	return s.container.putDesiredConnected(ctx, s.sid, groups, time.Now())
+}
+
+// PutDesiredDisconnected records that the client asked this session to stay down.
+//
+// Fenced for the same reason as the one above, and carrying no subscription because the
+// command it serves does not: see putDesiredDisconnected.
+func (s *Scoped) PutDesiredDisconnected(ctx context.Context) error {
+	if err := s.fence.held(); err != nil {
+		return err
+	}
+	return s.container.putDesiredDisconnected(ctx, s.sid, time.Now())
 }
 
 // PutPlaceholder holds a bubble this session has scheduled and not yet decided, so a

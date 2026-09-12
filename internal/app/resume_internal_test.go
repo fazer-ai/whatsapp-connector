@@ -28,7 +28,7 @@ func TestTheResumeSweepBringsBackAnAccountNobodyIsRunning(t *testing.T) {
 	t.Parallel()
 
 	connector, container, engine, server := newResumeConnector(t)
-	wantConnected(t, container, "sid-1", "5511999990001")
+	wantConnected(t, container, "sid-1", "5511999990001", false)
 
 	connector.resumeOnce(t.Context())
 
@@ -42,7 +42,7 @@ func TestTheResumeSweepBringsBackAnAccountNobodyIsRunning(t *testing.T) {
 	// And an account this instance is already running is not asked for again: the sweep
 	// is about accounts nobody has, and a connect offered to a live session would dial a
 	// socket that is already up.
-	if connector.manager.Resume("sid-1") {
+	if connector.manager.Resume("sid-1", false) {
 		t.Fatal("an account this instance is running was queued for a resume")
 	}
 }
@@ -54,7 +54,7 @@ func TestTheResumeSweepMakesItsFirstPassOnTheWayIn(t *testing.T) {
 	t.Parallel()
 
 	connector, container, engine, _ := newResumeConnector(t)
-	wantConnected(t, container, "sid-1", "5511999990001")
+	wantConnected(t, container, "sid-1", "5511999990001", false)
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -79,7 +79,7 @@ func TestTheResumeSweepLeavesAnAccountAPeerIsRunning(t *testing.T) {
 	t.Parallel()
 
 	connector, container, engine, server := newResumeConnector(t)
-	wantConnected(t, container, "sid-1", "5511999990001")
+	wantConnected(t, container, "sid-1", "5511999990001", false)
 
 	peer := cluster.NewLeases(redisx.Wrap(redis.NewClient(&redis.Options{Addr: server.Addr()}), "wa:", 8),
 		"inst-b", cluster.Options{})
@@ -108,8 +108,8 @@ func TestTheResumeSweepWaitsOutTheMarkAnotherAttemptLeft(t *testing.T) {
 	// defined order and the adoptions are carried out in the order they were queued. So
 	// the second one being back is proof that the first one was considered and skipped,
 	// rather than proof that nothing has happened yet.
-	wantConnected(t, container, "sid-a-cold", "5511999990001")
-	wantConnected(t, container, "sid-b-warm", "5511999990002")
+	wantConnected(t, container, "sid-a-cold", "5511999990001", false)
+	wantConnected(t, container, "sid-b-warm", "5511999990002", false)
 	server.Set(redisx.NewKeys("wa:", 8).Resume("sid-a-cold"), "inst-b")
 
 	connector.resumeOnce(t.Context())
@@ -131,7 +131,7 @@ func TestTheResumeSweepAsksForOneBatchAtATime(t *testing.T) {
 
 	connector, container, _, server := newResumeConnector(t)
 	for i := range resumeBatch + 3 {
-		wantConnected(t, container, fmt.Sprintf("sid-%02d", i), fmt.Sprintf("55119999900%02d", i))
+		wantConnected(t, container, fmt.Sprintf("sid-%02d", i), fmt.Sprintf("55119999900%02d", i), false)
 	}
 
 	connector.resumeOnce(t.Context())
@@ -160,8 +160,8 @@ func TestTheResumeSweepLeavesAQuarantinedAccountAlone(t *testing.T) {
 	// Two accounts again, the quarantined one first, so that the second coming back is
 	// proof that the first was considered and skipped rather than proof that nothing has
 	// happened yet.
-	wantConnected(t, container, "sid-a-broken", "5511999990001")
-	wantConnected(t, container, "sid-b-fine", "5511999990002")
+	wantConnected(t, container, "sid-a-broken", "5511999990001", false)
+	wantConnected(t, container, "sid-b-fine", "5511999990002", false)
 	if _, err := connector.quarantine.Strike(t.Context(), "sid-a-broken"); err != nil {
 		t.Fatalf("Strike: %v", err)
 	}
@@ -210,8 +210,8 @@ func newResumeConnector(t *testing.T) (*Connector, *store.Container, *fake.Engin
 }
 
 // wantConnected pairs a session and records that a client asked for it to be connected,
-// which is the state the sweep reads.
-func wantConnected(t *testing.T, container *store.Container, sid, phone string) {
+// with the subscription it asked for, which is the state the sweep reads.
+func wantConnected(t *testing.T, container *store.Container, sid, phone string, groups bool) {
 	t.Helper()
 
 	jid, err := waTypes.ParseJID(phone + ":12@" + waTypes.DefaultUserServer)
@@ -230,7 +230,40 @@ func wantConnected(t *testing.T, container *store.Container, sid, phone string) 
 	if err := container.For(sid).Bind(t.Context(), jid); err != nil {
 		t.Fatalf("Bind: %v", err)
 	}
-	if err := container.For(sid).PutDesired(t.Context(), store.DesiredConnected); err != nil {
-		t.Fatalf("PutDesired: %v", err)
+	if err := container.For(sid).PutDesiredConnected(t.Context(), groups); err != nil {
+		t.Fatalf("PutDesiredConnected: %v", err)
+	}
+}
+
+// The whole path of #190, end to end: a client asks for a connection with group traffic,
+// the instance running it goes away, and the sweep brings the account back. What the
+// engine is handed has to be what the client asked for, not the pairing mode alone -- an
+// account resumed without the subscription is open, acknowledges every group message
+// WhatsApp has for it, and publishes none of them.
+func TestTheResumeSweepBringsBackTheSubscriptionItsClientAskedFor(t *testing.T) {
+	t.Parallel()
+
+	for _, wanted := range []bool{true, false} {
+		t.Run(fmt.Sprintf("groups=%v", wanted), func(t *testing.T) {
+			t.Parallel()
+
+			connector, container, engine, _ := newResumeConnector(t)
+			wantConnected(t, container, "sid-1", "5511999990001", wanted)
+
+			connector.resumeOnce(t.Context())
+
+			waitFor(t, "the account to be taken and connected", func() bool {
+				account, ok := engine.Session("sid-1")
+				return ok && account.Connected()
+			})
+			account, _ := engine.Session("sid-1")
+			asked, connected := account.Asked()
+			if !connected {
+				t.Fatal("the engine was never handed a connect at all")
+			}
+			if asked.Groups != wanted {
+				t.Fatalf("the sweep brought the account back with groups=%v, want %v", asked.Groups, wanted)
+			}
+		})
 	}
 }

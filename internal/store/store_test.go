@@ -1107,3 +1107,59 @@ func TestThePostgresPoolHasACeiling(t *testing.T) {
 		}
 	})
 }
+
+// A store written by a build that had nowhere to record the subscription. Its rows are
+// the whole roster of a deployment upgrading into this, so losing them would leave every
+// paired account on the floor until somebody opened each inbox and pressed connect.
+//
+// They come back with groups off, and that is the choice rather than an accident of the
+// column default. Off is what the deployment already does -- a resumed session has never
+// carried the subscription -- and on would have an upgrade start publishing group
+// conversation into inboxes that never asked for it, which is the one outcome a client
+// cannot undo after the fact.
+func TestAnOlderStoreResumesItsSessionsWithoutGroups(t *testing.T) {
+	t.Parallel()
+
+	target := storetest.New(t)
+	old, err := store.Open(t.Context(), target.URL, store.AlwaysOwned, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	pair(t, old, "sid-old", "5511999990001")
+
+	// The shape the first version created: no column for what the connect asked to
+	// receive. Recreated rather than altered, because that is what the old build left.
+	db := old.DB()
+	if _, err := db.ExecContext(t.Context(), `DROP TABLE IF EXISTS wac_session_desired`); err != nil {
+		t.Fatalf("drop the new table: %v", err)
+	}
+	if _, err := db.ExecContext(t.Context(), `CREATE TABLE wac_session_desired (
+		sid      TEXT   PRIMARY KEY,
+		desired  TEXT   NOT NULL,
+		asked_at BIGINT NOT NULL
+	)`); err != nil {
+		t.Fatalf("recreate the old table: %v", err)
+	}
+	if _, err := db.ExecContext(t.Context(), target.Rebind(
+		`INSERT INTO wac_session_desired (sid, desired, asked_at) VALUES (?, ?, ?)`),
+		"sid-old", "connected", 1); err != nil {
+		t.Fatalf("write the row the old build would have: %v", err)
+	}
+
+	if err := old.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Opened again by this version, which is what an upgrade is.
+	upgraded := openAt(t, target)
+	wanted, err := upgraded.Wanted(t.Context())
+	if err != nil {
+		t.Fatalf("Wanted: %v", err)
+	}
+	if len(wanted) != 1 || wanted[0].SID != "sid-old" {
+		t.Fatalf("the upgrade lost the roster: the sweep would bring back %v", wanted)
+	}
+	if wanted[0].Groups {
+		t.Fatal("an upgrade turned group conversation on for a session whose client never asked for it")
+	}
+}

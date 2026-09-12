@@ -955,9 +955,9 @@ func (m *Manager) takeForDelete(ctx context.Context, delivery *transport.Deliver
 }
 
 // Resume asks this instance to take a session that should be running and put it back in
-// the air. It reports whether the request was queued, and does no I/O of its own: the
-// caller is a sweep, and the goroutine that carries this out is the one that answers
-// every wake.
+// the air, with the subscription its client asked for. It reports whether the request was
+// queued, and does no I/O of its own: the caller is a sweep, and the goroutine that
+// carries this out is the one that answers every wake.
 //
 // This is the connector starting a session nobody asked it to start in this moment, and
 // the licence for it is the record the client wrote when it asked for the connection.
@@ -970,7 +970,12 @@ func (m *Manager) takeForDelete(ctx context.Context, delivery *transport.Deliver
 // a connect needs is then what it has always had -- the executor, the order, the engine's
 // own events -- and the one thing that differs is that nobody is waiting for it, which is
 // what `Internal` says.
-func (m *Manager) Resume(sid string) bool {
+//
+// `groups` comes from the same record as the licence, and it is the only thing of the
+// client's request that is put back. The rest of a connect is not remembered on purpose:
+// a stored payload replayed here could be a request this build refuses, and a resume that
+// synthesised a refused command would leave the account down and in the sweep's backoff.
+func (m *Manager) Resume(sid string, groups bool) bool {
 	if sid == "" {
 		return false
 	}
@@ -982,10 +987,20 @@ func (m *Manager) Resume(sid string) bool {
 		// dial a socket that is already there. The sweep asks about accounts nobody runs.
 		return false
 	}
+	// Built from the type the session decodes rather than spelled out as a literal, so
+	// what this writes and what reads it cannot drift: they are the same struct, and a
+	// field renamed on one side stops compiling instead of quietly setting nothing.
+	payload, err := json.Marshal(engine.ConnectRequest{Pairing: "resume", Groups: groups})
+	if err != nil {
+		// A string and a bool with no marshaller of their own: unreachable. Refused
+		// rather than sent half-built, and the next sweep asks for this account again.
+		m.log.Warn().Err(err).Str("sid", sid).Msg("could not build the connect to bring a session back")
+		return false
+	}
 	return !m.own(&transport.Delivery{
 		Command: protocol.Command{
 			V: protocol.Version, ID: m.newID(), Type: protocol.CommandSessionConnect, SID: sid,
-			Payload: json.RawMessage(`{"pairing":"resume"}`),
+			Payload: payload,
 		},
 		// Nothing to acknowledge and nothing to leave pending: this command is not an
 		// entry on a stream, so the only thing a refusal costs is a pass, and the next

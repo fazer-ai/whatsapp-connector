@@ -2234,7 +2234,7 @@ func TestAResumeTakesASessionNobodyIsRunningAndConnectsIt(t *testing.T) {
 	t.Parallel()
 
 	h := newHarness(t)
-	if !h.manager.Resume("s1") {
+	if !h.manager.Resume("s1", false) {
 		t.Fatal("the resume was not even queued, so nothing will bring the account back")
 	}
 
@@ -2265,7 +2265,7 @@ func TestAResumeThatFailedIsNotReportedAsACommandNobodySent(t *testing.T) {
 	engineSession, _ := h.engine.Session("s1")
 	engineSession.FailConnect(errors.New("whatsapp refused the build"))
 
-	if !h.manager.Resume("s1") {
+	if !h.manager.Resume("s1", false) {
 		t.Fatal("the resume was not queued")
 	}
 	waitFor(t, "the resume to be attempted", func() bool { return engineSession.Connects() > 0 })
@@ -2314,7 +2314,7 @@ func TestAResumeThatFailedIsLeftAloneForAWhile(t *testing.T) {
 	engineSession, _ := h.engine.Session("s1")
 	engineSession.FailConnect(errors.New("whatsapp refused the build"))
 
-	if !h.manager.Resume("s1") {
+	if !h.manager.Resume("s1", false) {
 		t.Fatal("the resume was not queued")
 	}
 	waitFor(t, "the failure to be counted", func() bool {
@@ -3510,4 +3510,43 @@ func (b *syncBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.written.String()
+}
+
+// The connect a sweep synthesises is not a frame a client sent, so what it does not carry
+// is absent rather than defaulted. The subscription is the one thing of the original
+// request that has to travel with it: the engine reads it on every message, receipt,
+// presence and group notification, and a resume that dropped it brings the account back
+// acknowledging group traffic and publishing none of it (#190).
+func TestAResumeConnectsWithTheSubscriptionItsClientAskedFor(t *testing.T) {
+	t.Parallel()
+
+	for _, wanted := range []bool{true, false} {
+		t.Run(fmt.Sprintf("groups=%v", wanted), func(t *testing.T) {
+			t.Parallel()
+
+			h := newHarness(t)
+			if !h.manager.Resume("s1", wanted) {
+				t.Fatal("the resume was not even queued, so nothing will bring the account back")
+			}
+			waitFor(t, "the session to be taken and connected", func() bool {
+				engineSession, ok := h.engine.Session("s1")
+				return ok && engineSession.Connected()
+			})
+
+			engineSession, _ := h.engine.Session("s1")
+			asked, connected := engineSession.Asked()
+			if !connected {
+				t.Fatal("the engine was never handed a connect at all")
+			}
+			// The whole request and not the two fields, which is the fence: a resume
+			// carries the mode and the subscription and nothing else on purpose. A
+			// connect refuses `history_sync`, `calls.auto_reject` and a proxy with a URL
+			// outright, so a resume that learned to replay more of a client's request
+			// could synthesise a command the session rejects -- and an account left on
+			// the floor in the sweep's backoff is worse off than the silence this fixes.
+			if want := (engine.ConnectRequest{Pairing: "resume", Groups: wanted}); asked != want {
+				t.Fatalf("the sweep synthesised %+v, want %+v", asked, want)
+			}
+		})
+	}
 }

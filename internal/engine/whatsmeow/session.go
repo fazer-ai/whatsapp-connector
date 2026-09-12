@@ -1335,11 +1335,16 @@ func (s *Session) Connect(ctx context.Context, req engine.ConnectRequest) error 
 	// so without this there is nothing anywhere that says a paired, unowned account should
 	// be in the air, and it stays down until somebody opens the inbox and asks again.
 	//
+	// The subscription goes with it, because a resume has no other way of learning it.
+	// The connect a sweep synthesises is not a frame a client sent, so what it does not
+	// carry is not defaulted, it is absent: the session came back open and acknowledged
+	// every group message WhatsApp had for it without publishing one.
+	//
 	// Logged rather than returned. The connection is what the client asked for and it is
 	// happening; a memory that could not be written is a session that will not be brought
 	// back by itself later, which is worse than it was but not a reason to refuse what is
 	// working now. The next connect writes it again.
-	if err := s.store.PutDesired(ctx, store.DesiredConnected); err != nil {
+	if err := s.store.PutDesiredConnected(ctx, req.Groups); err != nil {
 		s.log.Warn().Err(err).Str("sid", s.sid).
 			Msg("could not record that this session should be connected; it will not be resumed on its own")
 	}
@@ -1769,7 +1774,7 @@ func (s *Session) Disconnect(ctx context.Context) error {
 	// Logged rather than returned, like the one in Connect: the disconnect is what was
 	// asked for and it is going to happen either way. What a failure here costs is a
 	// session the resume sweep may bring back, which the next disconnect corrects.
-	if err := s.store.PutDesired(ctx, store.DesiredDisconnected); err != nil {
+	if err := s.store.PutDesiredDisconnected(ctx); err != nil {
 		s.log.Warn().Err(err).Str("sid", s.sid).
 			Msg("could not record that this session was asked to stay down; a sweep may bring it back")
 	}

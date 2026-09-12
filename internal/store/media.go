@@ -122,7 +122,7 @@ func (c *Container) putMediaPart(ctx context.Context, part *MediaPart, now time.
 		part.SID, part.MessageID, part.ChatKind, part.ChatID, part.Kind, part.DirectPath,
 		encode(part.MediaKey), encode(part.FileEncSHA256), encode(part.FileSHA256),
 		part.FileLength, part.Mime, part.Filename,
-		part.ReceiptChat, part.Sender, sentBy(part.FromMe), stamp)
+		part.ReceiptChat, part.Sender, asFlag(part.FromMe), stamp)
 	if err != nil {
 		return fmt.Errorf("store: record how to fetch the file of %s: %w", part.MessageID, err)
 	}
@@ -251,8 +251,8 @@ func decode(raw string) ([]byte, error) {
 // sentBy is a boolean as this table spells one. The column is a BIGINT because the two
 // dialects disagree about how to write a boolean, and every other column here is already
 // the same type in both.
-func sentBy(fromMe bool) int64 {
-	if fromMe {
+func asFlag(set bool) int64 {
+	if set {
 		return 1
 	}
 	return 0
