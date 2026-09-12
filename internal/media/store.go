@@ -483,6 +483,53 @@ func (s *Store) Open(id string) (io.ReadSeekCloser, Blob, error) {
 	return file, about, nil
 }
 
+// Touch reports what is known about a blob without handing its bytes over, and puts it
+// at the back of the eviction queue the way collecting it would.
+//
+// It answers the question a caller that already has a reference to a file asks: is it
+// still here, and how long does this instance still promise it for. Both halves are why
+// it returns a time of its own rather than leaving the caller to read `StoredAt`: the
+// sweep drops on the modification time, which this renews, while `StoredAt` is when the
+// blob was written and is never renewed. A caller publishing an expiry off `StoredAt`
+// for a blob that has been handed out is publishing one that has already passed on a
+// file this instance will go on serving for another whole TTL.
+//
+// Without the bytes, deliberately. A caller that wants to know whether a file is there
+// has no use for a descriptor, and one handed a descriptor it did not ask for is one
+// that can forget to close it.
+func (s *Store) Touch(id string) (Blob, time.Time, error) {
+	if !validID(id) {
+		return Blob{}, time.Time{}, ErrNotFound
+	}
+	// Held for the same reason Open holds it: an eviction landing between the read and
+	// the touch unlinks the blob, and this would answer that a file is here and promise
+	// it for a day after the sweep has already taken it.
+	s.collecting.RLock()
+	defer s.collecting.RUnlock()
+
+	about, err := s.readAbout(id)
+	if err != nil {
+		return Blob{}, time.Time{}, err
+	}
+	if _, err := s.root.Stat(s.pathOf(id)); errors.Is(err, os.ErrNotExist) {
+		// The description without the bytes is what a crash mid-write leaves, and what a
+		// blob whose file was removed under the store looks like. Neither is a blob.
+		return Blob{}, time.Time{}, ErrNotFound
+	} else if err != nil {
+		return Blob{}, time.Time{}, fmt.Errorf("media: look at %s: %w", id, err)
+	}
+
+	now := s.opts.Now()
+	if err := s.root.Chtimes(s.pathOf(id), now, now); err != nil {
+		// Not best effort, unlike Open's. Open has already decided to hand the bytes
+		// over and a missed touch only costs the blob some of its life; here the touch
+		// is half the answer, and reporting a renewal that did not happen is how a
+		// caller publishes an expiry for a file the sweep drops first.
+		return Blob{}, time.Time{}, fmt.Errorf("media: keep %s: %w", id, err)
+	}
+	return about, now, nil
+}
+
 // Sweep drops what has aged out and then, if the rest is still over quota, the blobs
 // nobody has asked for in longest. It returns how many went and how many bytes came
 // back.

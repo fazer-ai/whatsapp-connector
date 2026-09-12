@@ -56,6 +56,16 @@ type MediaPart struct {
 	Sender      string
 	FromMe      bool
 
+	// BlobID is the file this instance already has for this message, and it is empty
+	// when there is none: a row written before the column existed, a message whose file
+	// never arrived, or one whose blob has since been swept.
+	//
+	// It is a hint and never an answer. The blob it names lives on the disk of whichever
+	// instance wrote it and is dropped on its own schedule, so a reader has to ask its
+	// own store whether the file is there rather than believe the row -- see
+	// RememberBlob for what keeps the two from drifting apart in the first place.
+	BlobID string
+
 	// StoredAt is when the part was written, in milliseconds, and it is what the sweep
 	// reads. Set by PutMediaPart.
 	StoredAt int64
@@ -107,8 +117,8 @@ func (c *Container) putMediaPart(ctx context.Context, part *MediaPart, now time.
 		INSERT INTO wac_media_part
 			(sid, message_id, chat_kind, chat_id, kind, direct_path, media_key,
 			 file_enc_sha256, file_sha256, file_length, mime, filename,
-			 receipt_chat, sender, from_me, stored_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			 receipt_chat, sender, from_me, blob_id, stored_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (sid, message_id) DO UPDATE SET
 			chat_kind = excluded.chat_kind, chat_id = excluded.chat_id,
 			kind = excluded.kind, direct_path = excluded.direct_path, media_key = excluded.media_key,
@@ -116,13 +126,13 @@ func (c *Container) putMediaPart(ctx context.Context, part *MediaPart, now time.
 			file_length = excluded.file_length, mime = excluded.mime, filename = excluded.filename,
 			receipt_chat = excluded.receipt_chat,
 			sender = excluded.sender, from_me = excluded.from_me,
-			stored_at = excluded.stored_at
+			blob_id = excluded.blob_id, stored_at = excluded.stored_at
 		WHERE excluded.stored_at >= wac_media_part.stored_at`
 	_, err := c.db.ExecContext(ctx, c.rebind(upsert),
 		part.SID, part.MessageID, part.ChatKind, part.ChatID, part.Kind, part.DirectPath,
 		encode(part.MediaKey), encode(part.FileEncSHA256), encode(part.FileSHA256),
 		part.FileLength, part.Mime, part.Filename,
-		part.ReceiptChat, part.Sender, asFlag(part.FromMe), stamp)
+		part.ReceiptChat, part.Sender, asFlag(part.FromMe), part.BlobID, stamp)
 	if err != nil {
 		return fmt.Errorf("store: record how to fetch the file of %s: %w", part.MessageID, err)
 	}
@@ -134,7 +144,7 @@ func (c *Container) putMediaPart(ctx context.Context, part *MediaPart, now time.
 func (c *Container) mediaPart(ctx context.Context, sid, messageID string) (MediaPart, bool, error) {
 	const query = `
 		SELECT chat_kind, chat_id, kind, direct_path, media_key, file_enc_sha256, file_sha256,
-		       file_length, mime, filename, receipt_chat, sender, from_me, stored_at
+		       file_length, mime, filename, receipt_chat, sender, from_me, blob_id, stored_at
 		FROM wac_media_part WHERE sid = ? AND message_id = ?`
 
 	part := MediaPart{SID: sid, MessageID: messageID}
@@ -144,7 +154,7 @@ func (c *Container) mediaPart(ctx context.Context, sid, messageID string) (Media
 		&part.ChatKind, &part.ChatID,
 		&part.Kind, &part.DirectPath, &key, &encDigest, &digest,
 		&part.FileLength, &part.Mime, &part.Filename,
-		&part.ReceiptChat, &part.Sender, &fromMe, &part.StoredAt)
+		&part.ReceiptChat, &part.Sender, &fromMe, &part.BlobID, &part.StoredAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return MediaPart{}, false, nil
 	}
@@ -270,6 +280,32 @@ func asFlag(set bool) int64 {
 // `stored_at` is left alone rather than bumped. What changed is where the file is
 // fetched from, not when the message was received, and the retention sweep goes by the
 // second: refreshing a path is not a reason for a row to live longer.
+// rememberBlob records the file this instance now has for a message, and only while the
+// row is still the one the caller read.
+//
+// Conditional for the same reason refreshDirectPath is, and it is the more dangerous of
+// the two. The caller has been inside a download for as long as the media timeout allows,
+// and an inbound handler can have replaced the row in that time -- a redelivery, or a
+// sender reusing a message id in another chat, which puts a different chat's file under
+// the same key. Written back on the key alone, this instance's copy of chat A's file
+// would be filed as chat B's, and the chat guard in front of a later download would let
+// it through: the row it checks is chat B's row, and it is the blob on it that is wrong.
+//
+// `stored_at` is left alone rather than bumped, again like refreshDirectPath: what
+// changed is which file is on the disk, not when the message was received, and the
+// retention sweep goes by the second.
+func (c *Container) rememberBlob(
+	ctx context.Context, sid, messageID, blobID string, unchangedSince int64,
+) error {
+	const update = `
+		UPDATE wac_media_part SET blob_id = ?
+		WHERE sid = ? AND message_id = ? AND stored_at = ?`
+	if _, err := c.db.ExecContext(ctx, c.rebind(update), blobID, sid, messageID, unchangedSince); err != nil {
+		return fmt.Errorf("store: record the file kept for %s: %w", messageID, err)
+	}
+	return nil
+}
+
 func (c *Container) refreshDirectPath(
 	ctx context.Context, sid, messageID, path string, unchangedSince int64,
 ) error {

@@ -106,6 +106,15 @@ func (s *Scoped) RefreshDirectPath(ctx context.Context, messageID, path string, 
 	return s.container.refreshDirectPath(ctx, s.sid, messageID, path, unchangedSince)
 }
 
+// RememberBlob records which blob on this instance's disk holds a message's file, and
+// only while the row is still the one the caller read.
+func (s *Scoped) RememberBlob(ctx context.Context, messageID, blobID string, unchangedSince int64) error {
+	if err := s.fence.held(); err != nil {
+		return err
+	}
+	return s.container.rememberBlob(ctx, s.sid, messageID, blobID, unchangedSince)
+}
+
 // MediaPart reads back what PutMediaPart kept for one message.
 func (s *Scoped) MediaPart(ctx context.Context, messageID string) (MediaPart, bool, error) {
 	return s.container.mediaPart(ctx, s.sid, messageID)
