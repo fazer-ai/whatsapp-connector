@@ -410,21 +410,32 @@ func TestAChangeTheContractCannotCarryIsPublishedAsActivity(t *testing.T) {
 func TestAMembershipChangeNobodyCouldReadIsPublishedAsActivity(t *testing.T) {
 	t.Parallel()
 
-	session := groupSession(t)
-	session.handle(&waEvents.GroupInfo{
-		JID:                      groupJID(),
-		PrevParticipantVersionID: "17",
-		ParticipantVersionID:     "18",
-	})
+	// Either id on its own is proof enough, and the two are read separately rather than
+	// as a pair because the parser reads them separately: `parseGroupChange` fills each
+	// with `OptionalString`, so a child carrying one and not the other leaves the other
+	// empty. Asking only about the newer id would publish nothing for the shape that
+	// names only the older one.
+	for name, event := range map[string]*waEvents.GroupInfo{
+		"both ids":     {PrevParticipantVersionID: "17", ParticipantVersionID: "18"},
+		"only the new": {ParticipantVersionID: "18"},
+		"only the old": {PrevParticipantVersionID: "17"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			session := groupSession(t)
+			event.JID = groupJID()
+			session.handle(event)
 
-	payload := published(t, session, protocol.EventGroupActivity, "event_group_activity")
-	groups, _ := payload["groups"].([]any)
-	if len(groups) != 1 {
-		t.Fatalf("named %v as the groups that moved", payload["groups"])
-	}
-	named, _ := groups[0].(map[string]any)
-	if named["id"] != theGroup {
-		t.Errorf("named %v as the group that moved", groups[0])
+			payload := published(t, session, protocol.EventGroupActivity, "event_group_activity")
+			groups, _ := payload["groups"].([]any)
+			if len(groups) != 1 {
+				t.Fatalf("named %v as the groups that moved", payload["groups"])
+			}
+			named, _ := groups[0].(map[string]any)
+			if named["id"] != theGroup {
+				t.Errorf("named %v as the group that moved", groups[0])
+			}
+		})
 	}
 }
 
