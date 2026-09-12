@@ -301,31 +301,43 @@ func asFlag(set bool) int64 {
 // would be filed as chat B's, and the chat guard in front of a later download would let
 // it through: the row it checks is chat B's row, and it is the blob on it that is wrong.
 //
-// The condition is `rev`, and it is the only thing here that is a row identity. Every
-// column that describes the message can be the same on two rows that are not the same
-// row: a sender chooses its own message ids, so one id can carry two different files in
-// one chat, and media that is not encrypted carries neither digest, so the comparison
-// that would tell those two apart compares an empty string with an empty string.
-// `stored_at` does not close it either -- it has millisecond resolution and putMediaPart
-// deliberately admits a write stamped inside the same millisecond as the one it replaces,
-// because at that resolution the two are not ordered at all. A counter of writes is
-// exactly what is left: it changes whenever the row does, and it changes for no other
-// reason, which is what refreshDirectPath's refresh needs of it -- that one rewrites a
-// path without the row becoming another row, and a write-back that followed it must still
-// land.
-//
 // The window is the whole media timeout wide. The caller read this row, went off to
 // download a file on its coordinates, and an inbound handler can have replaced it in the
 // meantime. Landing this on the replacement files one message's file under another's, and
 // the chat guard in front of a later download cannot catch it, because the row it checks
 // is the replacement's and it is the blob on it that is wrong.
 //
-// `stored_at` is left alone rather than bumped, like refreshDirectPath: what changed is
-// which file is on the disk, not when the message was received, and the retention sweep
-// goes by the second.
+// Nothing that describes the message identifies the row it is on. A sender chooses its
+// own message ids, so one id carries two different files in one chat; media that is not
+// encrypted carries neither digest, so the comparison that would tell those two apart
+// compares an empty string with an empty string. What is left is the pair below, and each
+// closes what the other cannot:
+//
+//   - `rev` counts writes to this row. It separates a row from itself after somebody else
+//     has written it, which is the whole of the common case, and it separates it at the
+//     one resolution that matters rather than at the clock's. It changes when the row does
+//     and for no other reason, which is what refreshDirectPath needs of it: that one
+//     rewrites a path without the row becoming another row, so a write-back that follows
+//     it still lands.
+//   - `stored_at` separates a row from a different row that took its place. `rev` cannot:
+//     it starts at nought, so a row the retention sweep dropped and a row an inbound
+//     message wrote in its place are both nought, and a download in flight across that
+//     gap would file its file on a message it knows nothing about. A reincarnation is a
+//     fresh write with a fresh stamp, and it is separated by the whole retention window,
+//     because being older than that window is why the first one was swept.
+//
+// The pair cannot collide. Two stamps agree only inside one millisecond, two revs only
+// when both are fresh inserts, and a row cannot be inserted, swept and inserted again
+// inside one millisecond when what makes it sweepable is being days old.
+//
+// `stored_at` is read and not written, like refreshDirectPath: what changed is which file
+// is on the disk, not when the message was received, and the retention sweep goes by it.
 func (c *Container) rememberBlob(ctx context.Context, sid, blobID string, read *MediaPart) error {
-	const update = `UPDATE wac_media_part SET blob_id = ? WHERE sid = ? AND message_id = ? AND rev = ?`
-	if _, err := c.db.ExecContext(ctx, c.rebind(update), blobID, sid, read.MessageID, read.Rev); err != nil {
+	const update = `
+		UPDATE wac_media_part SET blob_id = ?
+		WHERE sid = ? AND message_id = ? AND rev = ? AND stored_at = ?`
+	if _, err := c.db.ExecContext(ctx, c.rebind(update),
+		blobID, sid, read.MessageID, read.Rev, read.StoredAt); err != nil {
 		return fmt.Errorf("store: record the file kept for %s: %w", read.MessageID, err)
 	}
 	return nil
