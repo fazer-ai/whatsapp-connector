@@ -553,11 +553,7 @@ func TestALoweredCapStopsAFileWhoseRowHoldsTheSendersClaim(t *testing.T) {
 	// The file does not arrive with the message, so the row is written with what the
 	// sender said, which here is four bytes for a file of eight thousand.
 	downloads.answer(nil, wm.ErrMediaDownloadFailedWith404)
-	understated := mediaEvent("3EB0UNDERSTATED", &waE2E.Message{ImageMessage: &waE2E.ImageMessage{
-		Mimetype: proto.String("image/jpeg"), FileLength: proto.Uint64(4),
-		DirectPath: proto.String(directPath), MediaKey: []byte("key"), FileEncSHA256: encSHA256(),
-	}})
-	if _, acknowledged := deliver(t, session, understated, 2); !acknowledged {
+	if _, acknowledged := deliver(t, session, understating("3EB0UNDERSTATED", 4), 2); !acknowledged {
 		t.Fatal("a media message whose file was refused was left unacknowledged")
 	}
 
@@ -588,6 +584,51 @@ func TestALoweredCapStopsAFileWhoseRowHoldsTheSendersClaim(t *testing.T) {
 		t.Fatalf("a file of %d bytes was served from the disk under a cap of %d", len(file), len(file)/2)
 	} else {
 		assertCode(t, err, protocol.ErrorMediaTooLarge)
+	}
+}
+
+// What a reused reference describes is the blob it names, and not the row that named it.
+// The two are not the same statement: `size` and `sha256` are what a client checks the
+// bytes it fetched against, and the row's copies of them are the sender's claim about a
+// file rather than a measurement of one -- understated where the file never arrived with
+// the message, and empty on media that carries no plaintext digest at all. Published off
+// the row, a reference announces four bytes and no digest for a file of eight thousand
+// that this instance is serving perfectly well, and the client rejects it.
+func TestAReusedReferenceDescribesTheBlobItNamesAndNotTheRow(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	file := bytes.Repeat([]byte("u"), 8192)
+	session, downloads, _ := reuseSession(t, root, media.Options{})
+	connect(session)
+
+	// The file does not arrive with the message, so the row keeps what the sender said.
+	downloads.answer(nil, wm.ErrMediaDownloadFailedWith404)
+	if _, acknowledged := deliver(t, session, understating("3EB0DESCRIBES", 4), 2); !acknowledged {
+		t.Fatal("a media message whose file was refused was left unacknowledged")
+	}
+	downloads.answer(file, nil)
+	written := refetch(t, session, "3EB0DESCRIBES", nil)
+
+	spent := downloads.count()
+	reused := refetch(t, session, "3EB0DESCRIBES", nil)
+	if downloads.count() != spent || reused.ID != written.ID {
+		t.Fatalf("the second download answered %s at a cost of %d downloads, want %s and none",
+			reused.ID, downloads.count()-spent, written.ID)
+	}
+
+	if reused.Size != int64(len(file)) {
+		t.Errorf("the reused reference says %d bytes and the blob it names holds %d", reused.Size, len(file))
+	}
+	if want := hex.EncodeToString(sha256Of(file)); reused.SHA256 != want {
+		t.Errorf("the reused reference says %q and the blob it names hashes to %q", reused.SHA256, want)
+	}
+	if reused.Size != written.Size || reused.SHA256 != written.SHA256 {
+		t.Errorf("reusing described the file as %d bytes (%s) and writing it described it as %d (%s)",
+			reused.Size, reused.SHA256, written.Size, written.SHA256)
+	}
+	if got := servedBytes(t, session, &reused); !bytes.Equal(got, file) {
+		t.Errorf("the reused reference serves %d bytes, want the %d it describes", len(got), len(file))
 	}
 }
 
@@ -711,6 +752,24 @@ func TestReusingABlobDoesNotLeaveADescriptorBehind(t *testing.T) {
 }
 
 // --- helpers ------------------------------------------------------------------------
+
+// understating is a message whose sender announced a length, for the tests about a row
+// that holds a claim rather than a measurement. That is what a message whose file did not
+// arrive with it is filed with, because nothing was measured, and a download that works
+// later leaves the claim where it is.
+func understating(id string, length uint64) *waEvents.Message {
+	return mediaEvent(id, &waE2E.Message{ImageMessage: &waE2E.ImageMessage{
+		Mimetype: proto.String("image/jpeg"), FileLength: proto.Uint64(length),
+		DirectPath: proto.String(directPath), MediaKey: []byte("key"), FileEncSHA256: encSHA256(),
+	}})
+}
+
+// sha256Of is the digest the blob store takes over what was written, which for an honest
+// message is the digest WhatsApp puts on the message itself.
+func sha256Of(file []byte) []byte {
+	digest := sha256.Sum256(file)
+	return digest[:]
+}
 
 // otherChat is the second chat a reused message id arrives in. It is a different party
 // from the one `textMessage` builds, which is what makes the row change hands.
