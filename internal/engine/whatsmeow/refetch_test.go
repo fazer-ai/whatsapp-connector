@@ -73,15 +73,22 @@ func TestAMessageNothingWasKeptForIsGivenUpOnRatherThanRetried(t *testing.T) {
 
 // The download goes out over this session's own socket. A session that is down fetches
 // nothing, and that is worth waiting for rather than giving up on.
+//
+// The blob goes first, which is what leaves a download as the only way to answer. A file
+// still on this instance's disk is served whether the socket is up or not, and that is
+// deliberate: see TestAFileOnThisDiskIsServedWhileTheSessionIsDown.
 func TestAFileIsNotFetchedAgainWhileTheSessionIsDown(t *testing.T) {
 	t.Parallel()
 
-	session, downloads := mediaSession(t, media.Options{})
+	root := t.TempDir()
+	session, downloads := mediaSession(t, media.Options{Root: root})
 	downloads.answer([]byte("os mesmos bytes"), nil)
 	connect(session)
-	if _, acknowledged := deliver(t, session, imageEvent("3EB0DOWN"), 1); !acknowledged {
+	emissions, acknowledged := deliver(t, session, imageEvent("3EB0DOWN"), 1)
+	if !acknowledged {
 		t.Fatal("a media message with a file was left unacknowledged")
 	}
+	removeBlob(t, root, mediaContentOf(t, emissions[0]).Ref.ID)
 
 	disconnect(session)
 	_, err := refetchErr(session, "3EB0DOWN", nil)

@@ -22,6 +22,7 @@ func samplePart(sid, messageID string) store.MediaPart {
 		FileEncSHA256: bytes.Repeat([]byte{2}, 32),
 		FileSHA256:    bytes.Repeat([]byte{3}, 32),
 		FileLength:    111743, Mime: "image/jpeg", Filename: "recibo.pdf",
+		BlobID: "blob_0123456789abcdef01234567",
 	}
 }
 
@@ -290,5 +291,105 @@ func TestAPartThatNamesNoMessageIsRefused(t *testing.T) {
 		if err := container.For(part.SID).PutMediaPart(t.Context(), &part, storedAt); err == nil {
 			t.Fatalf("a part with sid %q and message %q was written", part.SID, part.MessageID)
 		}
+	}
+}
+
+// RememberBlob is what points a row at the file this instance downloaded, and the
+// condition on it is the whole of it. The caller has been inside a download for as long
+// as the media timeout allows, and an inbound handler can have replaced the row in that
+// time -- a redelivery, or a sender reusing a message id in another chat, which puts a
+// different file under the same key. Written on the key alone, one chat's file would be
+// filed as another's, where the chat guard in front of a later download cannot catch it.
+//
+// The row is stamped ahead so the two behaviours separate without racing a clock.
+func TestABlobIsOnlyRememberedOnTheRowTheCallerRead(t *testing.T) {
+	t.Parallel()
+	container := open(t)
+	pair(t, container, "sid-1", "5511999990001")
+	scoped := container.For("sid-1")
+
+	read := samplePart("sid-1", "3EB0RACE")
+	if err := scoped.PutMediaPart(t.Context(), &read, storedAt); err != nil {
+		t.Fatalf("PutMediaPart: %v", err)
+	}
+	// And then the row changes hands while the download the caller started is still out.
+	replaced := samplePart("sid-1", "3EB0RACE")
+	replaced.ChatID = "5511888880002"
+	replaced.BlobID = "blob_ffffffffffffffffffffffff"
+	if err := scoped.PutMediaPart(t.Context(), &replaced, storedAt.Add(time.Second)); err != nil {
+		t.Fatalf("PutMediaPart: %v", err)
+	}
+
+	if err := scoped.RememberBlob(t.Context(), "3EB0RACE", "blob_aaaaaaaaaaaaaaaaaaaaaaaa",
+		storedAt.UnixMilli()); err != nil {
+		t.Fatalf("RememberBlob: %v", err)
+	}
+
+	got, found, err := container.For("sid-1").MediaPart(t.Context(), "3EB0RACE")
+	if err != nil || !found {
+		t.Fatalf("MediaPart: %v (found %v)", err, found)
+	}
+	if got.BlobID != replaced.BlobID {
+		t.Errorf("the row points at %q, want the file of the row that replaced it, %q", got.BlobID, replaced.BlobID)
+	}
+	if got.ChatID != replaced.ChatID {
+		t.Errorf("the row is under chat %q, want %q", got.ChatID, replaced.ChatID)
+	}
+}
+
+// The other half: on the row the caller did read, it writes -- and it writes that and
+// nothing else. `stored_at` is what the retention sweep goes by, and which file is on
+// this instance's disk is not a message arriving again.
+func TestRememberingABlobLeavesTheRowAndItsRetentionAlone(t *testing.T) {
+	t.Parallel()
+	container := open(t)
+	pair(t, container, "sid-1", "5511999990001")
+	scoped := container.For("sid-1")
+
+	want := samplePart("sid-1", "3EB0KEPT")
+	if err := scoped.PutMediaPart(t.Context(), &want, storedAt); err != nil {
+		t.Fatalf("PutMediaPart: %v", err)
+	}
+	if err := scoped.RememberBlob(t.Context(), "3EB0KEPT", "blob_aaaaaaaaaaaaaaaaaaaaaaaa",
+		storedAt.UnixMilli()); err != nil {
+		t.Fatalf("RememberBlob: %v", err)
+	}
+
+	got, found, err := container.For("sid-1").MediaPart(t.Context(), "3EB0KEPT")
+	if err != nil || !found {
+		t.Fatalf("MediaPart: %v (found %v)", err, found)
+	}
+	want.BlobID = "blob_aaaaaaaaaaaaaaaaaaaaaaaa"
+	want.StoredAt = storedAt.UnixMilli()
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("what came back is\n %+v\nwant\n %+v", got, want)
+	}
+}
+
+// An instance that has lost the account must not be writing to its rows, and a write-back
+// arriving from one is the same hazard as any other: it lands after the new owner's.
+func TestABlobRememberedByASessionThatWasHandedOnIsRefused(t *testing.T) {
+	t.Parallel()
+	container := open(t)
+	pair(t, container, "sid-1", "5511999990001")
+	scoped := container.For("sid-1")
+
+	part := samplePart("sid-1", "3EB0LOST")
+	if err := scoped.PutMediaPart(t.Context(), &part, storedAt); err != nil {
+		t.Fatalf("PutMediaPart: %v", err)
+	}
+
+	scoped.Drop()
+	if err := scoped.RememberBlob(t.Context(), "3EB0LOST", "blob_aaaaaaaaaaaaaaaaaaaaaaaa",
+		storedAt.UnixMilli()); err == nil {
+		t.Fatal("a session that no longer owns the account recorded a file against it")
+	}
+
+	got, _, err := container.For("sid-1").MediaPart(t.Context(), "3EB0LOST")
+	if err != nil {
+		t.Fatalf("MediaPart: %v", err)
+	}
+	if got.BlobID != part.BlobID {
+		t.Errorf("the row points at %q, want the file it was written with, %q", got.BlobID, part.BlobID)
 	}
 }

@@ -815,19 +815,37 @@ func TestLiveRefetch(t *testing.T) {
 	}
 	say("fetched %d bytes from %s, digest matches", len(fetched.body), again.URL)
 
-	// Asking twice is what a redelivered command does, and it is answered by paying for
-	// the file a second time rather than by handing back the first answer. That cost is
-	// issue #24; what is checked here is that the answer is at least a working one.
+	// Asking twice is what a redelivered command does, and issue #24 is that it used to
+	// be answered by paying for the file a second time. Both halves are checked, because
+	// either alone is satisfiable by something that is not the fix: the same id would
+	// come back from an answer that reads the row without asking this instance's own
+	// store, which is a reference to a file on somebody else's disk, and a download that
+	// is not spent proves nothing about what is being served.
+	blobsBefore, bytesBefore := countBlobs(t, root)
 	twice := refetch(t, session, messageID, nil)
-	if twice.ID == again.ID {
-		t.Fatalf("two refetches named the same blob %s, which the ledger is not supposed to be keeping", twice.ID)
+	if twice.ID != again.ID {
+		t.Fatalf("two refetches named %s and %s, and the file was already on this disk", again.ID, twice.ID)
 	}
 	if twice.SHA256 != again.SHA256 {
 		t.Fatalf("the second refetch served %s and the first served %s", twice.SHA256, again.SHA256)
 	}
-	if repeat := fetchBlob(t, twice.URL, token); repeat.status != http.StatusOK {
+	if blobsAfter, bytesAfter := countBlobs(t, root); blobsAfter != blobsBefore || bytesAfter != bytesBefore {
+		t.Fatalf("the second refetch took the store from %d blobs and %d bytes to %d and %d, "+
+			"so it downloaded the file again", blobsBefore, bytesBefore, blobsAfter, bytesAfter)
+	}
+	repeat := fetchBlob(t, twice.URL, token)
+	if repeat.status != http.StatusOK {
 		t.Fatalf("fetching the second refetch answered %d: %s", repeat.status, repeat.body)
 	}
+	if digest := fmt.Sprintf("%x", sha256.Sum256(repeat.body)); digest != twice.SHA256 {
+		t.Fatalf("the reused blob serves bytes hashing to %s and the reference says %s", digest, twice.SHA256)
+	}
+	if twice.ExpiresAt <= time.Now().UnixMilli() {
+		t.Fatalf("the second refetch answered a reference that lapsed at %d, and it is %d",
+			twice.ExpiresAt, time.Now().UnixMilli())
+	}
+	say("the second refetch reused %s: no download, %d bytes served, expires at %d",
+		twice.ID, len(repeat.body), twice.ExpiresAt)
 
 	if state := session.state(); state != "open" {
 		t.Fatalf("the session did not stay up: state=%s", state)

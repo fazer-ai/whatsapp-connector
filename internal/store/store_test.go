@@ -772,7 +772,7 @@ func TestTheSecondPassRunsAgainstTheOtherDialect(t *testing.T) {
 // Added rather than the table recreated, because its rows are what a client's
 // `message.download_media` reads: dropping them would lose the file of every message the
 // deployment received before the upgrade.
-func TestAStoreThatPredatesTheReuploadColumnsGainsThemAndKeepsItsRows(t *testing.T) {
+func TestAStoreThatPredatesTheAddedMediaColumnsGainsThemAndKeepsItsRows(t *testing.T) {
 	t.Parallel()
 
 	target := storetest.New(t)
@@ -831,9 +831,9 @@ func TestAStoreThatPredatesTheReuploadColumnsGainsThemAndKeepsItsRows(t *testing
 	if kept.DirectPath != "/v/old" {
 		t.Errorf("the row came back with direct path %q, want the one it was written with", kept.DirectPath)
 	}
-	if kept.ReceiptChat != "" || kept.Sender != "" || kept.FromMe {
-		t.Errorf("a row written before these were kept came back as chat %q, sender %q, from_me %v, want the empty ones",
-			kept.ReceiptChat, kept.Sender, kept.FromMe)
+	if kept.ReceiptChat != "" || kept.Sender != "" || kept.FromMe || kept.BlobID != "" {
+		t.Errorf("a row written before these were kept came back as chat %q, sender %q, from_me %v, blob %q, "+
+			"want the empty ones", kept.ReceiptChat, kept.Sender, kept.FromMe, kept.BlobID)
 	}
 
 	// And the columns take a write, which is what the old shape could not.
@@ -842,6 +842,7 @@ func TestAStoreThatPredatesTheReuploadColumnsGainsThemAndKeepsItsRows(t *testing
 		DirectPath: "/v/new", Mime: "image/jpeg", Filename: "n.jpg", FileLength: 9,
 		ReceiptChat: "120363041234567890@g.us",
 		Sender:      "5511999990003@s.whatsapp.net", FromMe: true,
+		BlobID: "blob_0123456789abcdef01234567",
 	}
 	if err := upgraded.For("sid-old").PutMediaPart(t.Context(), &fresh, time.Now()); err != nil {
 		t.Fatalf("PutMediaPart after the upgrade: %v", err)
@@ -850,9 +851,26 @@ func TestAStoreThatPredatesTheReuploadColumnsGainsThemAndKeepsItsRows(t *testing
 	if err != nil {
 		t.Fatalf("MediaPart: %v", err)
 	}
-	if read.ReceiptChat != fresh.ReceiptChat || read.Sender != fresh.Sender || !read.FromMe {
-		t.Errorf("read back chat %q, sender %q, from_me %v, want %q, %q and true",
-			read.ReceiptChat, read.Sender, read.FromMe, fresh.ReceiptChat, fresh.Sender)
+	if read.ReceiptChat != fresh.ReceiptChat || read.Sender != fresh.Sender || !read.FromMe ||
+		read.BlobID != fresh.BlobID {
+		t.Errorf("read back chat %q, sender %q, from_me %v, blob %q, want %q, %q, true and %q",
+			read.ReceiptChat, read.Sender, read.FromMe, read.BlobID,
+			fresh.ReceiptChat, fresh.Sender, fresh.BlobID)
+	}
+
+	// And the column the upgrade added takes the write that is made against a row that
+	// came from before it, which is how a deployment's cost falls off: each message that
+	// is asked for pays once more and then never again.
+	if err := upgraded.For("sid-old").RememberBlob(t.Context(), "3EB0OLD",
+		"blob_aaaaaaaaaaaaaaaaaaaaaaaa", 1); err != nil {
+		t.Fatalf("RememberBlob against a row from the old shape: %v", err)
+	}
+	remembered, _, err := upgraded.For("sid-old").MediaPart(t.Context(), "3EB0OLD")
+	if err != nil {
+		t.Fatalf("MediaPart: %v", err)
+	}
+	if remembered.BlobID != "blob_aaaaaaaaaaaaaaaaaaaaaaaa" {
+		t.Errorf("the upgraded row points at %q, want the file the download wrote", remembered.BlobID)
 	}
 }
 

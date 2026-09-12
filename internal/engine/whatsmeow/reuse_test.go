@@ -92,7 +92,7 @@ func TestAMessageIdReusedInAnotherChatNeverServesTheFirstChatsFile(t *testing.T)
 	}
 
 	served := refetch(t, session, "3EB0TWOCHATS", &protocol.Address{Kind: protocol.AddressPhone, ID: otherChat})
-	if got := servedBytes(t, session, served); !bytes.Equal(got, inChatB) {
+	if got := servedBytes(t, session, &served); !bytes.Equal(got, inChatB) {
 		t.Errorf("the download served %q, want the file of the chat that asked for it, %q", got, inChatB)
 	}
 	if served.Size != int64(len(inChatB)) {
@@ -114,7 +114,7 @@ func TestAMessageIdReusedInAnotherChatNeverServesTheFirstChatsFile(t *testing.T)
 	// is served with the chat the row is under. Answering the older chat's file here
 	// would be the same leak, reached by omission.
 	blind := refetch(t, session, "3EB0TWOCHATS", nil)
-	if got := servedBytes(t, session, blind); !bytes.Equal(got, inChatB) {
+	if got := servedBytes(t, session, &blind); !bytes.Equal(got, inChatB) {
 		t.Errorf("a download with no chat served %q, want what naming the chat serves, %q", got, inChatB)
 	}
 	if blind.ID != served.ID || blind.SHA256 != served.SHA256 {
@@ -203,7 +203,7 @@ func TestABlobIsRememberedOnlyWhileTheRowIsTheOneTheDownloadRead(t *testing.T) {
 	}
 	// And the observable the guard is there for: the next caller still gets its own file.
 	next := refetch(t, session, "3EB0HELD", &protocol.Address{Kind: protocol.AddressPhone, ID: otherChat})
-	if got := servedBytes(t, session, next); !bytes.Equal(got, inChatB) {
+	if got := servedBytes(t, session, &next); !bytes.Equal(got, inChatB) {
 		t.Errorf("the download after the race served %q, want %q", got, inChatB)
 	}
 }
@@ -246,7 +246,7 @@ func TestARowAndABlobThatDisagreeAboutTheFileAreNotReused(t *testing.T) {
 		t.Errorf("the download answered %s, want the digest the message describes, %s",
 			ref.SHA256, hex.EncodeToString(digest[:]))
 	}
-	if got := servedBytes(t, session, ref); !bytes.Equal(got, theirs) {
+	if got := servedBytes(t, session, &ref); !bytes.Equal(got, theirs) {
 		t.Errorf("the download served %q, want %q", got, theirs)
 	}
 }
@@ -310,7 +310,7 @@ func TestABlobThatIsNoLongerThereCostsADownloadAndNeverABrokenAnswer(t *testing.
 				t.Errorf("the download published under %q, want the address of the instance answering, %q",
 					again.URL, session.blobBase)
 			}
-			if got := servedBytes(t, session, again); !bytes.Equal(got, file) {
+			if got := servedBytes(t, session, &again); !bytes.Equal(got, file) {
 				t.Errorf("the download served %q, want %q", got, file)
 			}
 			if downloads.count() != 2 {
@@ -369,7 +369,7 @@ func TestAReusedReferenceNeverLapsesBeforeItIsAnswered(t *testing.T) {
 	if ref.ExpiresAt <= now {
 		t.Errorf("the download answered a reference that lapsed at %d, and it is %d", ref.ExpiresAt, now)
 	}
-	if got := servedBytes(t, session, ref); !bytes.Equal(got, []byte("os mesmos bytes")) {
+	if got := servedBytes(t, session, &ref); !bytes.Equal(got, []byte("os mesmos bytes")) {
 		t.Errorf("the download served %q, want the file that is on the disk", got)
 	}
 }
@@ -400,7 +400,7 @@ func TestAFileOnThisDiskIsServedWhileTheSessionIsDown(t *testing.T) {
 	if downloads.count() != 1 {
 		t.Errorf("a session that is down spent %d downloads", downloads.count()-1)
 	}
-	if got := servedBytes(t, session, ref); !bytes.Equal(got, file) {
+	if got := servedBytes(t, session, &ref); !bytes.Equal(got, file) {
 		t.Errorf("the download served %q, want %q", got, file)
 	}
 }
@@ -628,7 +628,11 @@ func TestARowFromBeforeTheBlobWasRememberedStillDownloadsAndThenRemembers(t *tes
 // A reuse that only wants to know whether the blob is there is exactly the shape that
 // forgets to close what it opened, and a connector holds its sessions for weeks.
 func TestReusingABlobDoesNotLeaveADescriptorBehind(t *testing.T) {
-	t.Parallel()
+	// Not parallel, and that is the measurement rather than a preference: what is counted
+	// is the whole process's open descriptors, and a test running beside this one with a
+	// file open is indistinguishable from the leak being looked for. Go holds every
+	// parallel test until the sequential ones are done, so running sequentially is what
+	// makes the count this test's own.
 
 	root := t.TempDir()
 	session, downloads, _ := reuseSession(t, root, media.Options{})
@@ -661,20 +665,10 @@ const otherChat = "5511888880002"
 func reuseSession(t *testing.T, root string, opts media.Options) (*Session, *downloads, *movable) {
 	t.Helper()
 
-	session, _ := newTestSession(t, "5511999990001")
 	clock := &movable{at: storedAt}
 	opts.Root = root
 	opts.Now = clock.now
-	blobs, err := media.New(opts)
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	t.Cleanup(func() { _ = blobs.Close() })
-
-	handing := &downloads{}
-	session.blobs = blobs
-	session.blobBase = "http://connector-a1b2c3:8080"
-	session.download = handing.hand
+	session, handing := mediaSession(t, opts)
 	return session, handing, clock
 }
 
@@ -709,7 +703,7 @@ func inAnotherChat(event *waEvents.Message) *waEvents.Message {
 // servedBytes fetches a reference the way a client does, over the handler and against
 // the token, rather than reading the file off the disk. What a client gets is the
 // question, and the id and the URL are only half of it.
-func servedBytes(t *testing.T, session *Session, ref protocol.MediaRef) []byte {
+func servedBytes(t *testing.T, session *Session, ref *protocol.MediaRef) []byte {
 	t.Helper()
 
 	blobs, ok := session.blobs.(*media.Store)
@@ -722,7 +716,7 @@ func servedBytes(t *testing.T, session *Session, ref protocol.MediaRef) []byte {
 	endpoint := httptest.NewServer(mux)
 	defer endpoint.Close()
 
-	request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, endpoint.URL+"/media/"+ref.ID, nil)
+	request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, endpoint.URL+"/media/"+ref.ID, http.NoBody)
 	if err != nil {
 		t.Fatalf("build the request: %v", err)
 	}
@@ -799,9 +793,17 @@ func removeBlob(t *testing.T, root, id string) {
 func openDescriptors(t *testing.T) int {
 	t.Helper()
 
-	entries, err := os.ReadDir("/dev/fd")
+	fds, err := os.Open("/dev/fd")
 	if err != nil {
 		t.Skipf("this platform does not count descriptors at /dev/fd: %v", err)
 	}
-	return len(entries)
+	defer func() { _ = fds.Close() }()
+	// Named rather than read as entries: on darwin every name under here is a descriptor
+	// of the process doing the reading, and stat-ing them fails on the one the read is
+	// using. The names are the answer and nothing else is needed.
+	open, err := fds.Readdirnames(-1)
+	if err != nil {
+		t.Skipf("this platform does not list descriptors at /dev/fd: %v", err)
+	}
+	return len(open)
 }
