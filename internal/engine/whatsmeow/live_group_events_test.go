@@ -92,13 +92,19 @@ func TestLiveGroupChangesArePublished(t *testing.T) {
 	})
 
 	t.Run("a rename carries the subject, the actor and nothing else", func(t *testing.T) {
+		// Stamped rather than constant, and on a reused group that is the difference
+		// between a probe and a no-op: WhatsApp sends no notification for a subject that
+		// is already the group's, so a fixed name passes on the first run and then spends
+		// the whole ninety seconds waiting for a rename that never happened, on a build
+		// where renaming works. Measured here, on the second run over the same group.
+		renamed := "wac 161 " + time.Now().Format("0102-150405")
 		liveCommand(t, subject, protocol.CommandGroupNameSet, map[string]any{
-			"group": target, "subject": "wac 161 renamed",
+			"group": target, "subject": renamed,
 		})
 
 		changes, payload := liveGroupChange(t, watching)
-		if changes["subject"] != "wac 161 renamed" {
-			t.Errorf("published %v as the new subject", changes["subject"])
+		if changes["subject"] != renamed {
+			t.Errorf("published %v as the new subject, want %q", changes["subject"], renamed)
 		}
 		// The tri-state, measured rather than reasoned about: the client reads a key that
 		// is present as a change that was reported, so a rename carrying `announce: false`
