@@ -666,14 +666,6 @@ func (s *Session) reusable(kept *store.MediaPart) (protocol.MediaRef, bool) {
 		// this build did for every call before there was a column at all.
 		return protocol.MediaRef{}, false
 	}
-	if kept.FileLength > s.blobs.MaxBlob() {
-		// The length on the row is the one that was measured rather than the one the
-		// sender announced, precisely so a cap lowered afterwards stops the file before
-		// a transfer rather than after it. Read here as well as on the download path so
-		// that lowering the cap stops the same file whichever path put it on the disk.
-		return protocol.MediaRef{}, false
-	}
-
 	about, touched, err := s.blobs.Touch(kept.BlobID)
 	switch {
 	case errors.Is(err, media.ErrNotFound):
@@ -683,6 +675,22 @@ func (s *Session) reusable(kept *store.MediaPart) (protocol.MediaRef, bool) {
 	case err != nil:
 		s.log.Warn().Err(err).Str("message_id", kept.MessageID).
 			Msg("could not tell whether the file of a message is still on this instance")
+		return protocol.MediaRef{}, false
+	}
+
+	if about.Size > s.blobs.MaxBlob() {
+		// A cap lowered under a file that is already here stops it, the same as it stops
+		// one arriving. That intention is written down in mediaBody, which records the
+		// length it measured rather than the one the sender announced so that a lowered
+		// cap refuses the file before a transfer rather than after it -- and reuse in
+		// front of the cap would quietly undo it for every file on the disk.
+		//
+		// Measured against the store's own length rather than the row's, which is not
+		// always a measurement: a message whose file WhatsApp had already dropped is
+		// filed with the sender's claim, because nothing was measured, and a download
+		// that succeeded later leaves that claim in place. Read off the row, a sender who
+		// understated would be served from the disk while the same file arriving is
+		// stopped by the cap on the way in, and the two paths would disagree.
 		return protocol.MediaRef{}, false
 	}
 
@@ -728,7 +736,7 @@ func (s *Session) reusable(kept *store.MediaPart) (protocol.MediaRef, bool) {
 // one; what is lost is only that the next caller pays for the download again, which is
 // what every caller paid before this existed.
 func (s *Session) rememberBlob(ctx context.Context, kept *store.MediaPart, blobID string) {
-	if err := s.store.RememberBlob(ctx, kept.MessageID, blobID, kept.StoredAt); err != nil {
+	if err := s.store.RememberBlob(ctx, blobID, kept); err != nil {
 		s.log.Warn().Err(err).Str("message_id", kept.MessageID).
 			Msg("could not record which file was kept for a message, so the next caller will fetch it again")
 	}

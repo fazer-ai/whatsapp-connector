@@ -291,17 +291,27 @@ func asFlag(set bool) int64 {
 // would be filed as chat B's, and the chat guard in front of a later download would let
 // it through: the row it checks is chat B's row, and it is the blob on it that is wrong.
 //
+// The condition is on what the row says and not only on when it was written, and that
+// is not belt and braces. putMediaPart admits a write stamped the same millisecond as
+// the row it replaces -- deliberately, because a stamp of that resolution does not order
+// two writes inside one millisecond at all -- so `stored_at` alone is not a row identity.
+// Three events inside one millisecond is a narrow window and this is the one write where
+// losing it hands one conversation's attachment to another, so the chat and the file the
+// caller downloaded are compared as well. `direct_path` deliberately is not: a caller
+// coming through refetchReuploaded refreshes it a line earlier, and conditioning on it
+// would have this refuse its own caller's write.
+//
 // `stored_at` is left alone rather than bumped, again like refreshDirectPath: what
 // changed is which file is on the disk, not when the message was received, and the
 // retention sweep goes by the second.
-func (c *Container) rememberBlob(
-	ctx context.Context, sid, messageID, blobID string, unchangedSince int64,
-) error {
+func (c *Container) rememberBlob(ctx context.Context, sid, blobID string, read *MediaPart) error {
 	const update = `
 		UPDATE wac_media_part SET blob_id = ?
-		WHERE sid = ? AND message_id = ? AND stored_at = ?`
-	if _, err := c.db.ExecContext(ctx, c.rebind(update), blobID, sid, messageID, unchangedSince); err != nil {
-		return fmt.Errorf("store: record the file kept for %s: %w", messageID, err)
+		WHERE sid = ? AND message_id = ? AND stored_at = ?
+		  AND chat_kind = ? AND chat_id = ? AND file_enc_sha256 = ?`
+	if _, err := c.db.ExecContext(ctx, c.rebind(update), blobID, sid, read.MessageID,
+		read.StoredAt, read.ChatKind, read.ChatID, encode(read.FileEncSHA256)); err != nil {
+		return fmt.Errorf("store: record the file kept for %s: %w", read.MessageID, err)
 	}
 	return nil
 }

@@ -320,8 +320,8 @@ func TestABlobIsOnlyRememberedOnTheRowTheCallerRead(t *testing.T) {
 		t.Fatalf("PutMediaPart: %v", err)
 	}
 
-	if err := scoped.RememberBlob(t.Context(), "3EB0RACE", "blob_aaaaaaaaaaaaaaaaaaaaaaaa",
-		storedAt.UnixMilli()); err != nil {
+	read.StoredAt = storedAt.UnixMilli()
+	if err := scoped.RememberBlob(t.Context(), "blob_aaaaaaaaaaaaaaaaaaaaaaaa", &read); err != nil {
 		t.Fatalf("RememberBlob: %v", err)
 	}
 
@@ -350,8 +350,9 @@ func TestRememberingABlobLeavesTheRowAndItsRetentionAlone(t *testing.T) {
 	if err := scoped.PutMediaPart(t.Context(), &want, storedAt); err != nil {
 		t.Fatalf("PutMediaPart: %v", err)
 	}
-	if err := scoped.RememberBlob(t.Context(), "3EB0KEPT", "blob_aaaaaaaaaaaaaaaaaaaaaaaa",
-		storedAt.UnixMilli()); err != nil {
+	read := want
+	read.StoredAt = storedAt.UnixMilli()
+	if err := scoped.RememberBlob(t.Context(), "blob_aaaaaaaaaaaaaaaaaaaaaaaa", &read); err != nil {
 		t.Fatalf("RememberBlob: %v", err)
 	}
 
@@ -379,9 +380,10 @@ func TestABlobRememberedByASessionThatWasHandedOnIsRefused(t *testing.T) {
 		t.Fatalf("PutMediaPart: %v", err)
 	}
 
+	read := part
+	read.StoredAt = storedAt.UnixMilli()
 	scoped.Drop()
-	if err := scoped.RememberBlob(t.Context(), "3EB0LOST", "blob_aaaaaaaaaaaaaaaaaaaaaaaa",
-		storedAt.UnixMilli()); err == nil {
+	if err := scoped.RememberBlob(t.Context(), "blob_aaaaaaaaaaaaaaaaaaaaaaaa", &read); err == nil {
 		t.Fatal("a session that no longer owns the account recorded a file against it")
 	}
 
@@ -391,5 +393,79 @@ func TestABlobRememberedByASessionThatWasHandedOnIsRefused(t *testing.T) {
 	}
 	if got.BlobID != part.BlobID {
 		t.Errorf("the row points at %q, want the file it was written with, %q", got.BlobID, part.BlobID)
+	}
+}
+
+// `stored_at` is not a row identity, and treating it as one is how this write lands on
+// somebody else's row. putMediaPart admits a write stamped the same millisecond as the
+// one it replaces -- on purpose, because a stamp of that resolution does not order two
+// writes inside one millisecond at all -- so a replacement that arrives inside the
+// millisecond the caller read is invisible to the stamp alone. What is left to tell them
+// apart is what the row says, and the chat is the half that matters: a blob id landing on
+// another chat's row puts one conversation's attachment where the chat guard in front of
+// a later download cannot see it, because the row it checks is the other chat's row.
+func TestABlobIsNotRememberedOnARowThatChangedChatsInTheSameMillisecond(t *testing.T) {
+	t.Parallel()
+	container := open(t)
+	pair(t, container, "sid-1", "5511999990001")
+	scoped := container.For("sid-1")
+
+	read := samplePart("sid-1", "3EB0TIEBREAK")
+	if err := scoped.PutMediaPart(t.Context(), &read, storedAt); err != nil {
+		t.Fatalf("PutMediaPart: %v", err)
+	}
+	// The same millisecond, another chat, another file: the stamp cannot separate them.
+	replaced := samplePart("sid-1", "3EB0TIEBREAK")
+	replaced.ChatID = "5511888880002"
+	replaced.BlobID = "blob_ffffffffffffffffffffffff"
+	if err := scoped.PutMediaPart(t.Context(), &replaced, storedAt); err != nil {
+		t.Fatalf("PutMediaPart: %v", err)
+	}
+
+	read.StoredAt = storedAt.UnixMilli()
+	if err := scoped.RememberBlob(t.Context(), "blob_aaaaaaaaaaaaaaaaaaaaaaaa", &read); err != nil {
+		t.Fatalf("RememberBlob: %v", err)
+	}
+
+	got, _, err := container.For("sid-1").MediaPart(t.Context(), "3EB0TIEBREAK")
+	if err != nil {
+		t.Fatalf("MediaPart: %v", err)
+	}
+	if got.BlobID != replaced.BlobID {
+		t.Errorf("the row of chat %s points at %q, want %q", got.ChatID, got.BlobID, replaced.BlobID)
+	}
+}
+
+// And the same for the file itself: a row whose coordinates were replaced describes a
+// different file, whatever chat it is under, and the blob the caller downloaded is not
+// that file.
+func TestABlobIsNotRememberedOnARowThatNowDescribesAnotherFile(t *testing.T) {
+	t.Parallel()
+	container := open(t)
+	pair(t, container, "sid-1", "5511999990001")
+	scoped := container.For("sid-1")
+
+	read := samplePart("sid-1", "3EB0OTHERFILE")
+	if err := scoped.PutMediaPart(t.Context(), &read, storedAt); err != nil {
+		t.Fatalf("PutMediaPart: %v", err)
+	}
+	replaced := samplePart("sid-1", "3EB0OTHERFILE")
+	replaced.FileEncSHA256 = bytes.Repeat([]byte{9}, 32)
+	replaced.BlobID = "blob_ffffffffffffffffffffffff"
+	if err := scoped.PutMediaPart(t.Context(), &replaced, storedAt); err != nil {
+		t.Fatalf("PutMediaPart: %v", err)
+	}
+
+	read.StoredAt = storedAt.UnixMilli()
+	if err := scoped.RememberBlob(t.Context(), "blob_aaaaaaaaaaaaaaaaaaaaaaaa", &read); err != nil {
+		t.Fatalf("RememberBlob: %v", err)
+	}
+
+	got, _, err := container.For("sid-1").MediaPart(t.Context(), "3EB0OTHERFILE")
+	if err != nil {
+		t.Fatalf("MediaPart: %v", err)
+	}
+	if got.BlobID != replaced.BlobID {
+		t.Errorf("the row points at %q, want the file it now describes, %q", got.BlobID, replaced.BlobID)
 	}
 }

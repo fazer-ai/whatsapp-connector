@@ -17,8 +17,10 @@ import (
 	"time"
 
 	wm "go.mau.fi/whatsmeow"
+	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
 	waTypes "go.mau.fi/whatsmeow/types"
 	waEvents "go.mau.fi/whatsmeow/types/events"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/media"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
@@ -532,6 +534,60 @@ func TestALoweredCapStopsAFileWhicheverPathPutItOnTheDisk(t *testing.T) {
 					downloads.count()-spent)
 			}
 		})
+	}
+}
+
+// The length on a row is not always a measurement. A message whose file WhatsApp had
+// already dropped is filed with the sender's claim, because nothing was measured, and a
+// download that succeeded later leaves that claim in place. Read off the row, a sender
+// who understated is served from the disk under a cap that stops the same file arriving,
+// and the two paths disagree about one file, which is what C9 forbids.
+func TestALoweredCapStopsAFileWhoseRowHoldsTheSendersClaim(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	file := bytes.Repeat([]byte("v"), 8192)
+	session, downloads, _ := reuseSession(t, root, media.Options{MaxBlob: int64(len(file)) * 2})
+	connect(session)
+
+	// The file does not arrive with the message, so the row is written with what the
+	// sender said, which here is four bytes for a file of eight thousand.
+	downloads.answer(nil, wm.ErrMediaDownloadFailedWith404)
+	understated := mediaEvent("3EB0UNDERSTATED", &waE2E.Message{ImageMessage: &waE2E.ImageMessage{
+		Mimetype: proto.String("image/jpeg"), FileLength: proto.Uint64(4),
+		DirectPath: proto.String(directPath), MediaKey: []byte("key"), FileEncSHA256: encSHA256(),
+	}})
+	if _, acknowledged := deliver(t, session, understated, 2); !acknowledged {
+		t.Fatal("a media message whose file was refused was left unacknowledged")
+	}
+
+	// A later download works, and the row comes out of it pointing at the whole file
+	// while still claiming four bytes.
+	downloads.answer(file, nil)
+	stored := refetch(t, session, "3EB0UNDERSTATED", nil)
+	kept, found, err := session.store.MediaPart(t.Context(), "3EB0UNDERSTATED")
+	if err != nil || !found {
+		t.Fatalf("MediaPart: %v (found %v)", err, found)
+	}
+	if kept.BlobID != stored.ID || kept.FileLength >= int64(len(file)) {
+		t.Fatalf("the row is %d bytes pointing at %q, want the sender's claim pointing at %q",
+			kept.FileLength, kept.BlobID, stored.ID)
+	}
+
+	// The operator lowers the cap under it.
+	lowered, err := media.New(media.Options{
+		Root: root, MaxBlob: int64(len(file)) / 2, Now: func() time.Time { return storedAt },
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = lowered.Close() })
+	session.blobs = lowered
+
+	if _, err := refetchErr(session, "3EB0UNDERSTATED", nil); err == nil {
+		t.Fatalf("a file of %d bytes was served from the disk under a cap of %d", len(file), len(file)/2)
+	} else {
+		assertCode(t, err, protocol.ErrorMediaTooLarge)
 	}
 }
 

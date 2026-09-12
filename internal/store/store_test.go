@@ -861,13 +861,17 @@ func TestAStoreThatPredatesTheAddedMediaColumnsGainsThemAndKeepsItsRows(t *testi
 	// And the column the upgrade added takes the write that is made against a row that
 	// came from before it, which is how a deployment's cost falls off: each message that
 	// is asked for pays once more and then never again.
-	if err := upgraded.For("sid-old").RememberBlob(t.Context(), "3EB0OLD",
-		"blob_aaaaaaaaaaaaaaaaaaaaaaaa", 1); err != nil {
+	old, _, err := upgraded.For("sid-old").MediaPart(t.Context(), "3EB0OLD")
+	if err != nil {
+		t.Fatalf("MediaPart: %v", err)
+	}
+	if err := upgraded.For("sid-old").RememberBlob(t.Context(),
+		"blob_aaaaaaaaaaaaaaaaaaaaaaaa", &old); err != nil {
 		t.Fatalf("RememberBlob against a row from the old shape: %v", err)
 	}
 	remembered, _, err := upgraded.For("sid-old").MediaPart(t.Context(), "3EB0OLD")
 	if err != nil {
-		t.Fatalf("MediaPart: %v", err)
+		t.Fatalf("MediaPart after the write-back: %v", err)
 	}
 	if remembered.BlobID != "blob_aaaaaaaaaaaaaaaaaaaaaaaa" {
 		t.Errorf("the upgraded row points at %q, want the file the download wrote", remembered.BlobID)

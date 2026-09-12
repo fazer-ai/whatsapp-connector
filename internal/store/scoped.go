@@ -108,11 +108,15 @@ func (s *Scoped) RefreshDirectPath(ctx context.Context, messageID, path string, 
 
 // RememberBlob records which blob on this instance's disk holds a message's file, and
 // only while the row is still the one the caller read.
-func (s *Scoped) RememberBlob(ctx context.Context, messageID, blobID string, unchangedSince int64) error {
+//
+// `read` is the row as MediaPart handed it back, which is what the condition is built
+// from: a write-back is only ever valid for the row whose coordinates the download
+// actually used.
+func (s *Scoped) RememberBlob(ctx context.Context, blobID string, read *MediaPart) error {
 	if err := s.fence.held(); err != nil {
 		return err
 	}
-	return s.container.rememberBlob(ctx, s.sid, messageID, blobID, unchangedSince)
+	return s.container.rememberBlob(ctx, s.sid, blobID, read)
 }
 
 // MediaPart reads back what PutMediaPart kept for one message.
