@@ -558,6 +558,11 @@ func (c *Container) migrate(ctx context.Context) error {
 		// has paired, so the row has to be writable while there is no device yet; what
 		// reads it joins the two, so a session that never paired is never resumed. A
 		// forget deletes it explicitly instead.
+		//
+		// `wants_groups` is not here, and that is deliberate: it is added below, by the
+		// same path that gives it to a store which predates it. Declared in both places
+		// it would have two defaults for one column -- a fresh store reading this one and
+		// an upgraded store reading the other -- and nothing would ever compare them.
 		`CREATE TABLE IF NOT EXISTS wac_session_desired (
 			sid      TEXT   PRIMARY KEY,
 			desired  TEXT   NOT NULL,
@@ -578,15 +583,28 @@ func (c *Container) migrate(ctx context.Context) error {
 	// above does nothing to a table that is already there, so a deployment upgrading into
 	// this would keep the old shape and every write would fail on the missing column.
 	//
-	// Added rather than the table recreated, because a deployment has rows in it: they
-	// are what a client's `message.download_media` reads, and dropping them would lose
-	// the file of every message received before the upgrade.
-	for _, column := range []struct{ name, definition string }{
-		{"receipt_chat", "TEXT NOT NULL DEFAULT ''"},
-		{"sender", "TEXT NOT NULL DEFAULT ''"},
-		{"from_me", "BIGINT NOT NULL DEFAULT 0"},
+	// Added rather than the table recreated, because a deployment has rows in both: the
+	// media ones are what a client's `message.download_media` reads, and dropping them
+	// would lose the file of every message received before the upgrade; the desired ones
+	// are what brings a paired account back by itself, and dropping them would leave a
+	// fleet's whole roster on the floor until somebody pressed connect on each inbox.
+	//
+	// `wants_groups` defaults to 0, so a row written before this column existed resumes
+	// with group traffic off. That is the state the deployment is already in -- a resumed
+	// session has never carried the subscription -- and the other default would have an
+	// upgrade start publishing group conversation into inboxes on the strength of a
+	// request nobody recorded.
+	//
+	// It is the one column here that a fresh store does not have either, on purpose: the
+	// default belongs in one place, and this is the place that has to have it right for
+	// the store that already has rows.
+	for _, column := range []struct{ table, name, definition string }{
+		{"wac_media_part", "receipt_chat", "TEXT NOT NULL DEFAULT ''"},
+		{"wac_media_part", "sender", "TEXT NOT NULL DEFAULT ''"},
+		{"wac_media_part", "from_me", "BIGINT NOT NULL DEFAULT 0"},
+		{"wac_session_desired", "wants_groups", "BIGINT NOT NULL DEFAULT 0"},
 	} {
-		if err := c.addColumn(ctx, "wac_media_part", column.name, column.definition); err != nil {
+		if err := c.addColumn(ctx, column.table, column.name, column.definition); err != nil {
 			return err
 		}
 	}

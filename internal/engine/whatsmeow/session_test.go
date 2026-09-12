@@ -919,7 +919,7 @@ func TestTheConnectorRemembersWhichSessionsShouldBeConnected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Wanted: %v", err)
 	}
-	if len(wanted) != 1 || wanted[0] != session.sid {
+	if len(wanted) != 1 || wanted[0].SID != session.sid {
 		t.Fatalf("after a connect the store wants %v, want just %s: nothing would bring this account back", wanted, session.sid)
 	}
 
@@ -3196,6 +3196,119 @@ func TestAPairingInFlightIsReplacedRatherThanRefused(t *testing.T) {
 				t.Fatal("the session was not marked for a fresh client")
 			}
 			_ = run
+		})
+	}
+}
+
+// The seam #190 is about, at the layer the engine owns. A client asked for group traffic,
+// the instance running the account went away, and the instance that comes after has one
+// place to learn what was asked for: the record this connect leaves. Without the
+// subscription in it, the account comes back open and every group notification WhatsApp
+// sends is acknowledged and published nowhere -- an inbox that looks connected and is
+// deaf to half its conversation.
+func TestAResumedSessionStillHasTheGroupsItAskedFor(t *testing.T) {
+	t.Parallel()
+
+	session, container := newTestSession(t, "5511999990001")
+	if err := session.Connect(t.Context(), engine.ConnectRequest{Pairing: "resume", Groups: true}); err != nil {
+		t.Fatalf("the connect that asks for groups: %v", err)
+	}
+	sid := session.sid
+	if err := session.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// The instance that comes after, on the same store and the same account, opening the
+	// session the way the manager does.
+	scoped := container.For(sid)
+	device, err := scoped.Device(t.Context())
+	if err != nil {
+		t.Fatalf("Device: %v", err)
+	}
+	resumed := newSession(sid, wm.NewClient(device, nil), scoped, MediaOptions{},
+		zerolog.Nop(), newLibraryLogger(zerolog.Nop(), sid))
+	t.Cleanup(func() { _ = resumed.Close() })
+
+	// What the sweep reads and what it synthesises from it, spelled out here because the
+	// two halves live in internal/app and internal/session and this is the third.
+	wanted, err := container.Wanted(t.Context())
+	if err != nil {
+		t.Fatalf("Wanted: %v", err)
+	}
+	if len(wanted) != 1 {
+		t.Fatalf("the sweep would bring back %v, so there is nothing to resume with", wanted)
+	}
+	if err := resumed.Connect(t.Context(), engine.ConnectRequest{
+		Pairing: "resume", Groups: wanted[0].Groups,
+	}); err != nil {
+		t.Fatalf("the connect the sweep synthesises: %v", err)
+	}
+	resumed.setConnected(true)
+
+	resumed.handle(&waEvents.GroupInfo{
+		JID:  waTypes.NewJID(theGroup, waTypes.GroupServer),
+		Name: &waTypes.GroupName{Name: "Equipe fazer.ai"},
+	})
+
+	if queued := len(resumed.inbox); queued == 0 {
+		t.Fatal("the resumed session published nothing for a group change: it came back deaf to the subscription its client had asked for")
+	}
+}
+
+// And the other half of it: a client that connects without groups is not given them back
+// by a resume. Recording the request is only half a fix if what is recorded is a constant.
+func TestAResumedSessionDoesNotGainGroupsNobodyAskedFor(t *testing.T) {
+	t.Parallel()
+
+	session, container := newTestSession(t, "5511999990001")
+	if err := session.Connect(t.Context(), engine.ConnectRequest{Pairing: "resume"}); err != nil {
+		t.Fatalf("the connect that asks for direct chats only: %v", err)
+	}
+
+	wanted, err := container.Wanted(t.Context())
+	if err != nil {
+		t.Fatalf("Wanted: %v", err)
+	}
+	if len(wanted) != 1 {
+		t.Fatalf("the sweep would bring back %v", wanted)
+	}
+	if wanted[0].Groups {
+		t.Fatal("a session would be resumed with group conversation its client never asked for")
+	}
+}
+
+// A connect this build refuses records nothing, which is what keeps a refusal from
+// becoming a permanent one. The sweep synthesises its own connect from this record, so a
+// record left behind by a request the session rejected would be replayed on every pass:
+// the account would be taken, refused, and dropped into the backoff, over and over, with
+// the client seeing an inbox that never comes up.
+//
+// It holds because every refusal above is taken before the session changes anything, and
+// this is the test that says so out loud: what protects the sweep is an ordering, and an
+// ordering is a thing a later edit moves without noticing.
+func TestAConnectThisBuildRefusesIsNotSomethingToResume(t *testing.T) {
+	t.Parallel()
+
+	for name, request := range map[string]engine.ConnectRequest{
+		"history_sync":      {Pairing: "resume", Groups: true, HistorySync: true},
+		"calls.auto_reject": {Pairing: "resume", Groups: true, Calls: &engine.CallsRequest{AutoReject: true}},
+		"proxy":             {Pairing: "resume", Groups: true, Proxy: &engine.ProxyRequest{URL: "socks5://127.0.0.1:1080"}},
+		"pairing":           {Pairing: "telepathy", Groups: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			session, container := newTestSession(t, "5511999990001")
+			if err := session.Connect(t.Context(), request); err == nil {
+				t.Fatalf("the connect carrying %s was accepted", name)
+			}
+			wanted, err := container.Wanted(t.Context())
+			if err != nil {
+				t.Fatalf("Wanted: %v", err)
+			}
+			if len(wanted) != 0 {
+				t.Fatalf("a refused connect left %v for the sweep to bring back and be refused again", wanted)
+			}
 		})
 	}
 }
