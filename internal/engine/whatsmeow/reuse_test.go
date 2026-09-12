@@ -210,6 +210,86 @@ func TestABlobIsRememberedOnlyWhileTheRowIsTheOneTheDownloadRead(t *testing.T) {
 	}
 }
 
+// The same race, on the one shape where nothing downstream can catch it.
+//
+// Media that is not encrypted carries neither digest: whatsmeow draws the line at a nil
+// ciphertext digest, and the column keeps it as the empty string. So two messages sharing
+// an id in one chat agree on the chat and agree on the empty digest, and the check on the
+// way back out has nothing to compare either. Whether the second caller is served its own
+// file rests entirely on the write-back having refused to file the first caller's blob,
+// which is what this follows through to the bytes.
+func TestAFileWithNoDigestIsNotServedForTheMessageThatReplacedIt(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	session, _, _ := reuseSession(t, root, media.Options{})
+	first := []byte("o primeiro arquivo")
+	second := []byte("o segundo arquivo")
+
+	var mu sync.Mutex
+	var calls int
+	release := make(chan struct{})
+	inside := make(chan struct{}, 4)
+	session.download = func(_ context.Context, _ *wm.Client, _ wm.DownloadableMessage, file media.File) error {
+		mu.Lock()
+		calls++
+		nth := calls
+		mu.Unlock()
+		inside <- struct{}{}
+		if nth == 2 {
+			<-release
+		}
+		body := first
+		if nth >= 3 {
+			body = second
+		}
+		_, err := file.Write(body)
+		return err
+	}
+	connect(session)
+
+	emissions, acknowledged := deliver(t, session, unencrypted("3EB0NODIGEST", "/v/first"), 1)
+	if !acknowledged {
+		t.Fatal("the first delivery was left unacknowledged")
+	}
+	<-inside
+	removeBlob(t, root, mediaContentOf(t, emissions[0]).Ref.ID)
+	kept, _, err := session.store.MediaPart(t.Context(), "3EB0NODIGEST")
+	if err != nil {
+		t.Fatalf("MediaPart: %v", err)
+	}
+	if len(kept.FileEncSHA256) != 0 || len(kept.FileSHA256) != 0 {
+		t.Fatalf("the row kept digests (%q, %q), so this is not the shape it is meant to be",
+			kept.FileEncSHA256, kept.FileSHA256)
+	}
+
+	answered := make(chan struct{})
+	go func() {
+		defer close(answered)
+		if _, err := refetchErr(session, "3EB0NODIGEST", nil); err != nil {
+			t.Errorf("the held download failed: %v", err)
+		}
+	}()
+	<-inside
+
+	// The same id, the same chat, a different file, and nothing to tell them apart but
+	// when each row was written. A second later, because that is a redelivery rather than
+	// the same node arriving twice, which the session settles before any of this.
+	replacing := unencrypted("3EB0NODIGEST", "/v/second")
+	replacing.Info.Timestamp = replacing.Info.Timestamp.Add(time.Second)
+	if _, acknowledged := deliver(t, session, replacing, 1); !acknowledged {
+		t.Fatal("the delivery that replaces the row was left unacknowledged")
+	}
+	<-inside
+	close(release)
+	<-answered
+
+	served := refetch(t, session, "3EB0NODIGEST", nil)
+	if got := servedBytes(t, session, &served); !bytes.Equal(got, second) {
+		t.Errorf("the download served %q, want the file of the message that is on record, %q", got, second)
+	}
+}
+
 // The row carries the digest WhatsApp put on the message and the store carries the digest
 // of the bytes it wrote, and for an honest message those are one value. Comparing them
 // costs nothing and closes the whole family of "the id on this row is not this row's
@@ -752,6 +832,16 @@ func TestReusingABlobDoesNotLeaveADescriptorBehind(t *testing.T) {
 }
 
 // --- helpers ------------------------------------------------------------------------
+
+// unencrypted is a message with no digests at all, which is what whatsmeow calls media
+// that was not encrypted: it draws the line at a nil ciphertext digest and drops the key
+// to match. Both columns are then empty on the row, and every comparison that would tell
+// two of these apart compares nothing.
+func unencrypted(id, path string) *waEvents.Message {
+	return mediaEvent(id, &waE2E.Message{ImageMessage: &waE2E.ImageMessage{
+		Mimetype: proto.String("image/jpeg"), DirectPath: proto.String(path),
+	}})
+}
 
 // understating is a message whose sender announced a length, for the tests about a row
 // that holds a claim rather than a measurement. That is what a message whose file did not
