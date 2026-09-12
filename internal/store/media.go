@@ -56,6 +56,13 @@ type MediaPart struct {
 	Sender      string
 	FromMe      bool
 
+	// Rev counts how many times this row has been written, and it is what a caller that
+	// read the row and went away for a while checks it against. Nothing else here is an
+	// identity: the chat and the coordinates can be the same for two different files
+	// under one id, media that is not encrypted carries no digests at all, and StoredAt
+	// has millisecond resolution and admits a tie on purpose. Set by PutMediaPart.
+	Rev int64
+
 	// BlobID is the file this instance already has for this message, and it is empty
 	// when there is none: a row written before the column existed, a message whose file
 	// never arrived, or one whose blob has since been swept.
@@ -119,6 +126,8 @@ func (c *Container) putMediaPart(ctx context.Context, part *MediaPart, now time.
 			 file_enc_sha256, file_sha256, file_length, mime, filename,
 			 receipt_chat, sender, from_me, blob_id, stored_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		-- rev is left to its default on the way in and bumped on the way through, so it
+		-- counts writes rather than being something a caller can hand in wrong.
 		ON CONFLICT (sid, message_id) DO UPDATE SET
 			chat_kind = excluded.chat_kind, chat_id = excluded.chat_id,
 			kind = excluded.kind, direct_path = excluded.direct_path, media_key = excluded.media_key,
@@ -126,7 +135,8 @@ func (c *Container) putMediaPart(ctx context.Context, part *MediaPart, now time.
 			file_length = excluded.file_length, mime = excluded.mime, filename = excluded.filename,
 			receipt_chat = excluded.receipt_chat,
 			sender = excluded.sender, from_me = excluded.from_me,
-			blob_id = excluded.blob_id, stored_at = excluded.stored_at
+			blob_id = excluded.blob_id, stored_at = excluded.stored_at,
+			rev = wac_media_part.rev + 1
 		WHERE excluded.stored_at >= wac_media_part.stored_at`
 	_, err := c.db.ExecContext(ctx, c.rebind(upsert),
 		part.SID, part.MessageID, part.ChatKind, part.ChatID, part.Kind, part.DirectPath,
@@ -144,7 +154,7 @@ func (c *Container) putMediaPart(ctx context.Context, part *MediaPart, now time.
 func (c *Container) mediaPart(ctx context.Context, sid, messageID string) (MediaPart, bool, error) {
 	const query = `
 		SELECT chat_kind, chat_id, kind, direct_path, media_key, file_enc_sha256, file_sha256,
-		       file_length, mime, filename, receipt_chat, sender, from_me, blob_id, stored_at
+		       file_length, mime, filename, receipt_chat, sender, from_me, blob_id, rev, stored_at
 		FROM wac_media_part WHERE sid = ? AND message_id = ?`
 
 	part := MediaPart{SID: sid, MessageID: messageID}
@@ -154,7 +164,7 @@ func (c *Container) mediaPart(ctx context.Context, sid, messageID string) (Media
 		&part.ChatKind, &part.ChatID,
 		&part.Kind, &part.DirectPath, &key, &encDigest, &digest,
 		&part.FileLength, &part.Mime, &part.Filename,
-		&part.ReceiptChat, &part.Sender, &fromMe, &part.BlobID, &part.StoredAt)
+		&part.ReceiptChat, &part.Sender, &fromMe, &part.BlobID, &part.Rev, &part.StoredAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return MediaPart{}, false, nil
 	}
@@ -291,26 +301,31 @@ func asFlag(set bool) int64 {
 // would be filed as chat B's, and the chat guard in front of a later download would let
 // it through: the row it checks is chat B's row, and it is the blob on it that is wrong.
 //
-// The condition is on what the row says and not only on when it was written, and that
-// is not belt and braces. putMediaPart admits a write stamped the same millisecond as
-// the row it replaces -- deliberately, because a stamp of that resolution does not order
-// two writes inside one millisecond at all -- so `stored_at` alone is not a row identity.
-// Three events inside one millisecond is a narrow window and this is the one write where
-// losing it hands one conversation's attachment to another, so the chat and the file the
-// caller downloaded are compared as well. `direct_path` deliberately is not: a caller
-// coming through refetchReuploaded refreshes it a line earlier, and conditioning on it
-// would have this refuse its own caller's write.
+// The condition is `rev`, and it is the only thing here that is a row identity. Every
+// column that describes the message can be the same on two rows that are not the same
+// row: a sender chooses its own message ids, so one id can carry two different files in
+// one chat, and media that is not encrypted carries neither digest, so the comparison
+// that would tell those two apart compares an empty string with an empty string.
+// `stored_at` does not close it either -- it has millisecond resolution and putMediaPart
+// deliberately admits a write stamped inside the same millisecond as the one it replaces,
+// because at that resolution the two are not ordered at all. A counter of writes is
+// exactly what is left: it changes whenever the row does, and it changes for no other
+// reason, which is what refreshDirectPath's refresh needs of it -- that one rewrites a
+// path without the row becoming another row, and a write-back that followed it must still
+// land.
 //
-// `stored_at` is left alone rather than bumped, again like refreshDirectPath: what
-// changed is which file is on the disk, not when the message was received, and the
-// retention sweep goes by the second.
+// The window is the whole media timeout wide. The caller read this row, went off to
+// download a file on its coordinates, and an inbound handler can have replaced it in the
+// meantime. Landing this on the replacement files one message's file under another's, and
+// the chat guard in front of a later download cannot catch it, because the row it checks
+// is the replacement's and it is the blob on it that is wrong.
+//
+// `stored_at` is left alone rather than bumped, like refreshDirectPath: what changed is
+// which file is on the disk, not when the message was received, and the retention sweep
+// goes by the second.
 func (c *Container) rememberBlob(ctx context.Context, sid, blobID string, read *MediaPart) error {
-	const update = `
-		UPDATE wac_media_part SET blob_id = ?
-		WHERE sid = ? AND message_id = ? AND stored_at = ?
-		  AND chat_kind = ? AND chat_id = ? AND file_enc_sha256 = ?`
-	if _, err := c.db.ExecContext(ctx, c.rebind(update), blobID, sid, read.MessageID,
-		read.StoredAt, read.ChatKind, read.ChatID, encode(read.FileEncSHA256)); err != nil {
+	const update = `UPDATE wac_media_part SET blob_id = ? WHERE sid = ? AND message_id = ? AND rev = ?`
+	if _, err := c.db.ExecContext(ctx, c.rebind(update), blobID, sid, read.MessageID, read.Rev); err != nil {
 		return fmt.Errorf("store: record the file kept for %s: %w", read.MessageID, err)
 	}
 	return nil

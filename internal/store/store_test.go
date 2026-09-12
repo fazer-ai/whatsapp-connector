@@ -831,9 +831,10 @@ func TestAStoreThatPredatesTheAddedMediaColumnsGainsThemAndKeepsItsRows(t *testi
 	if kept.DirectPath != "/v/old" {
 		t.Errorf("the row came back with direct path %q, want the one it was written with", kept.DirectPath)
 	}
-	if kept.ReceiptChat != "" || kept.Sender != "" || kept.FromMe || kept.BlobID != "" {
+	if kept.ReceiptChat != "" || kept.Sender != "" || kept.FromMe || kept.BlobID != "" || kept.Rev != 0 {
 		t.Errorf("a row written before these were kept came back as chat %q, sender %q, from_me %v, blob %q, "+
-			"want the empty ones", kept.ReceiptChat, kept.Sender, kept.FromMe, kept.BlobID)
+			"rev %d, want the empty ones and nought",
+			kept.ReceiptChat, kept.Sender, kept.FromMe, kept.BlobID, kept.Rev)
 	}
 
 	// And the columns take a write, which is what the old shape could not.
@@ -864,6 +865,9 @@ func TestAStoreThatPredatesTheAddedMediaColumnsGainsThemAndKeepsItsRows(t *testi
 	old, _, err := upgraded.For("sid-old").MediaPart(t.Context(), "3EB0OLD")
 	if err != nil {
 		t.Fatalf("MediaPart: %v", err)
+	}
+	if old.Rev != 0 {
+		t.Errorf("a row from the old shape came back at rev %d, want the nought it has never been written past", old.Rev)
 	}
 	if err := upgraded.For("sid-old").RememberBlob(t.Context(),
 		"blob_aaaaaaaaaaaaaaaaaaaaaaaa", &old); err != nil {
