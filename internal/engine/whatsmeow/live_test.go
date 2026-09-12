@@ -17,7 +17,7 @@
 //	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveListen
 //	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveMedia
 //	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveRefetch
-//	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveViewOnce
+//	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveViewOnce$
 //	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveWatchAMessageChange
 //	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveWatchAShare
 //	WAC_LIVE_TO=<number> go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveSend$
@@ -844,11 +844,14 @@ func TestLiveRefetch(t *testing.T) {
 //
 // Which is about the sender rather than about companions, and this comment used to say
 // otherwise. `TestLiveViewOnceReachesACompanion` sends the same three shapes from the
-// second paired account and the bytes arrive every time, decrypted and whole, so nothing
-// between here and WhatsApp's servers strips a view-once from a companion device. What is
-// still unmeasured is the arm this phase covers: whether an official client fans a
-// view-once out to the recipient's companions at all, or only to their phone. That one
-// needs hardware, which is why this phase still asks for a person.
+// second paired account, downloads what arrives and compares it with what was sent, and
+// the bytes are there every time -- so nothing between here and WhatsApp's servers strips
+// a view-once from a companion device. What is still unmeasured is the arm this phase
+// covers: whether an official client fans a view-once out to the recipient's companions at
+// all, or only to their phone. That one needs hardware, which is why this phase still asks
+// for a person. (Its name is why the command above anchors with `$`: `-run` is an
+// unanchored regex, and without the anchor asking for this phase also starts that one,
+// which wants the second account paired.)
 //
 // Both endings are checked, because both are correct and which one happens is not this
 // build's to decide. If the message arrives, its file is refused and the reason is beside
