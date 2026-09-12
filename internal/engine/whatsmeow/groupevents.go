@@ -115,6 +115,12 @@ func (s *Session) groupChanged(event *waEvents.GroupInfo) {
 	if !s.wantsGroups() {
 		return
 	}
+	// One reading of the clock for whatever this notification produces, taken here rather
+	// than inside each emission. `handle` calls this on the goroutine that dispatched the
+	// event, so this is when the session learned of it, and a notification that comes out
+	// as two events has the two carrying the same moment instead of one dated by however
+	// long the first spent waiting on a full inbox.
+	learned := s.learned()
 	ctx, cancel := s.looking()
 	defer cancel()
 
@@ -127,11 +133,9 @@ func (s *Session) groupChanged(event *waEvents.GroupInfo) {
 	changes := s.describeChanges(ctx, event)
 	if changes.empty() {
 		if reportsNothing(event) {
-			// A participant version bump on its own, which says the roster has a new
-			// version and not what it is. Nothing to publish and nothing to go and read.
 			return
 		}
-		s.emit(protocol.EventGroupActivity, groupActivity{Groups: []protocol.Address{group}})
+		s.emitAt(learned, protocol.EventGroupActivity, groupActivity{Groups: []protocol.Address{group}})
 		return
 	}
 
@@ -142,14 +146,14 @@ func (s *Session) groupChanged(event *waEvents.GroupInfo) {
 	if actor := s.actorOf(ctx, event); actor != nil {
 		update.Actor = actor
 	}
-	s.emit(protocol.EventGroupUpdated, update)
+	s.emitAt(learned, protocol.EventGroupUpdated, update)
 
 	if reportsResidue(event) {
 		// The update goes first and the sync second, because the two say different things
 		// about the same instant: one is the line an operator reads, the other is a
 		// prompt to go and read state. Reversed, a client that syncs on the prompt can
 		// land its query before the update it already had the answer to.
-		s.emit(protocol.EventGroupActivity, groupActivity{Groups: []protocol.Address{group}})
+		s.emitAt(learned, protocol.EventGroupActivity, groupActivity{Groups: []protocol.Address{group}})
 	}
 }
 
@@ -264,7 +268,36 @@ func reportsResidue(event *waEvents.GroupInfo) bool {
 	return event.Ephemeral != nil || event.MembershipApprovalMode != nil ||
 		event.Delete != nil || event.Link != nil || event.Unlink != nil ||
 		event.NewInviteLink != nil || event.Suspended || event.Unsuspended ||
-		len(event.UnknownChanges) > 0
+		len(event.UnknownChanges) > 0 ||
+		reportsMembershipNobodyCouldRead(event)
+}
+
+// reportsMembershipNobodyCouldRead is a membership notification that arrived with nobody
+// in it.
+//
+// The roster version ids are the tell, and they say more than they look like they say:
+// `parseGroupChange` fills them from an `add`, `remove`, `promote` or `demote` child and
+// from nowhere else, so an id is proof one of those four arrived. Reading them as a bare
+// version bump -- a roster that has a new number and no news -- is the mistake this
+// function exists to name, because there is no bump without a membership child, and a
+// membership child that left all four lists empty is one whose participants
+// `parseParticipantList` skipped: a `participant` it could not read a JID off, or a child
+// under some tag this build has never seen.
+//
+// Which makes it residue rather than nothing. The roster moved, this connector cannot say
+// how, and a client that is told nothing keeps showing the old membership with nothing to
+// contradict it -- the same silence `group.activity` exists to break everywhere else in
+// this handler.
+//
+// A membership change that WAS read carries its ids too, and this is false for it: the
+// lists are full, `group.updated` says what happened, and a sync alongside it would be a
+// query for what the client has just been handed.
+func reportsMembershipNobodyCouldRead(event *waEvents.GroupInfo) bool {
+	if event.ParticipantVersionID == "" && event.PrevParticipantVersionID == "" {
+		return false
+	}
+	return len(event.Join) == 0 && len(event.Leave) == 0 &&
+		len(event.Promote) == 0 && len(event.Demote) == 0
 }
 
 // reportsNothing is a notification that changed nothing anybody can act on: no setting,

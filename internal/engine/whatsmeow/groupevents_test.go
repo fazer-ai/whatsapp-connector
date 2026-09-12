@@ -397,18 +397,44 @@ func TestAChangeTheContractCannotCarryIsPublishedAsActivity(t *testing.T) {
 	}
 }
 
-// A notification that says the roster has a new version and not what it is. There is
-// nothing to publish and nothing for a client to go and read: the version bump rides
-// along with the change it belongs to, and on its own it is bookkeeping.
-func TestAVersionBumpOnItsOwnPublishesNothing(t *testing.T) {
+// A roster version id with nobody beside it is not bookkeeping, which is what it looks
+// like and what this case asserted until whatsmeow's parser was read line by line.
+//
+// `parseGroupChange` fills the two ids from an `add`, `remove`, `promote` or `demote`
+// child and from nowhere else, so there is no such thing as a bare version bump: an id is
+// proof one of those four arrived. All four lists empty beside it means
+// `parseParticipantList` skipped every child -- a `participant` with no readable JID, or
+// a tag this build has never seen -- so the roster moved and this connector cannot say
+// how. Published as `group.activity`, because the alternative is a client that goes on
+// showing the old membership with nothing to contradict it.
+func TestAMembershipChangeNobodyCouldReadIsPublishedAsActivity(t *testing.T) {
 	t.Parallel()
 
-	session := silentSession(t, true)
+	session := groupSession(t)
 	session.handle(&waEvents.GroupInfo{
 		JID:                      groupJID(),
 		PrevParticipantVersionID: "17",
 		ParticipantVersionID:     "18",
 	})
+
+	payload := published(t, session, protocol.EventGroupActivity, "event_group_activity")
+	groups, _ := payload["groups"].([]any)
+	if len(groups) != 1 {
+		t.Fatalf("named %v as the groups that moved", payload["groups"])
+	}
+	named, _ := groups[0].(map[string]any)
+	if named["id"] != theGroup {
+		t.Errorf("named %v as the group that moved", groups[0])
+	}
+}
+
+// What is left over once the ids are read as evidence: a notification that spoke about
+// nothing at all. Nothing to publish and nothing for a client to go and read.
+func TestANotificationThatReportedNothingPublishesNothing(t *testing.T) {
+	t.Parallel()
+
+	session := silentSession(t, true)
+	session.handle(&waEvents.GroupInfo{JID: groupJID(), Notify: "w:gp2"})
 
 	nothingPublished(t, session)
 }
@@ -596,11 +622,18 @@ func TestAChangeTheContractCarriesWholeAsksForNoSync(t *testing.T) {
 	t.Parallel()
 
 	for name, event := range map[string]*waEvents.GroupInfo{
-		"a rename":       {Name: &waTypes.GroupName{Name: "Equipe fazer.ai"}},
-		"a description":  {Topic: &waTypes.GroupTopic{Topic: "o que combinamos"}},
-		"announce on":    {Announce: &waTypes.GroupAnnounce{IsAnnounce: true}},
-		"locked off":     {Locked: &waTypes.GroupLocked{IsLocked: false}},
-		"somebody added": {Join: []waTypes.JID{someone("5511999990002")}},
+		"a rename":      {Name: &waTypes.GroupName{Name: "Equipe fazer.ai"}},
+		"a description": {Topic: &waTypes.GroupTopic{Topic: "o que combinamos"}},
+		"announce on":   {Announce: &waTypes.GroupAnnounce{IsAnnounce: true}},
+		"locked off":    {Locked: &waTypes.GroupLocked{IsLocked: false}},
+		// With the version ids the notification really carries, because they are what
+		// says a membership child arrived, and reading them as residue on their own
+		// would put a sync beside every add and remove in the system.
+		"somebody added": {
+			Join:                     []waTypes.JID{someone("5511999990002")},
+			PrevParticipantVersionID: "17",
+			ParticipantVersionID:     "18",
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -641,12 +674,16 @@ func TestEveryFieldOfAGroupNotificationIsMappedOrResidue(t *testing.T) {
 		"Ephemeral": true, "MembershipApprovalMode": true, "Delete": true,
 		"Link": true, "Unlink": true, "NewInviteLink": true,
 		"Suspended": true, "Unsuspended": true, "UnknownChanges": true,
+		// Residue only when the four lists came back empty, which is the one thing they
+		// can say that `changes` cannot: a membership child arrived and nobody in it could
+		// be read. Beside a membership change that WAS read they say nothing new, and
+		// `reportsMembershipNobodyCouldRead` is where that distinction lives.
+		"PrevParticipantVersionID": true, "ParticipantVersionID": true,
 	}
-	// Not a change at all: who sent the notification, when, about which group, and the
-	// roster version ids that ride along with a membership change.
+	// Not a change at all: who sent the notification, when, and about which group.
 	metadata := map[string]bool{
 		"JID": true, "Notify": true, "Sender": true, "SenderPN": true, "Timestamp": true,
-		"PrevParticipantVersionID": true, "ParticipantVersionID": true, "JoinReason": true,
+		"JoinReason": true,
 	}
 
 	shape := reflect.TypeOf(waEvents.GroupInfo{})
@@ -668,5 +705,52 @@ func TestEveryFieldOfAGroupNotificationIsMappedOrResidue(t *testing.T) {
 				t.Errorf("GroupInfo has no field %s: whatsmeow dropped it and this split is behind", field)
 			}
 		}
+	}
+}
+
+// `Emission.At` is when the session learned the thing an event reports, and two events
+// out of one notification learned it at the same moment.
+//
+// Taken inside each emission instead, the two readings are a queue apart: `emitting`
+// stamps and then blocks on the inbox, so a publisher that stalls between the pair dates
+// the `group.activity` an outage after the `group.updated` it accompanies. The clock here
+// answers once and then jumps a minute, so a second reading cannot hide.
+func TestBothEventsOutOfOneNotificationCarryTheSameMoment(t *testing.T) {
+	t.Parallel()
+
+	session := groupSession(t)
+	// A minute per reading, so two readings cannot come out equal by accident and the
+	// failure names the size of the gap rather than a race. Which reading of the handler's
+	// whole run belongs to this notification is not asserted: it would pin the number of
+	// clock reads `handle` happens to make today, and the invariant is that the pair share
+	// one, not which one.
+	start := time.Now()
+	var readings int
+	session.wallClock = func() time.Time {
+		readings++
+		return start.Add(time.Duration(readings) * time.Minute)
+	}
+
+	session.handle(&waEvents.GroupInfo{
+		JID:       groupJID(),
+		Name:      &waTypes.GroupName{Name: "Equipe fazer.ai"},
+		Ephemeral: &waTypes.GroupEphemeral{IsEphemeral: true, DisappearingTimer: 86400},
+	})
+
+	update := next(t, session)
+	if update.Type != protocol.EventGroupUpdated {
+		t.Fatalf("published %q first, want %q", update.Type, protocol.EventGroupUpdated)
+	}
+	activity := next(t, session)
+	if activity.Type != protocol.EventGroupActivity {
+		t.Fatalf("published %q second, want %q", activity.Type, protocol.EventGroupActivity)
+	}
+	if update.At == 0 {
+		t.Fatalf("the update carried no moment at all")
+	}
+	if activity.At != update.At {
+		t.Errorf("dated the sync %d and the update %d, %s apart, out of one notification",
+			activity.At, update.At,
+			time.Duration(activity.At-update.At)*time.Millisecond)
 	}
 }
