@@ -767,3 +767,64 @@ func TestBothEventsOutOfOneNotificationCarryTheSameMoment(t *testing.T) {
 			time.Duration(activity.At-update.At)*time.Millisecond)
 	}
 }
+
+// A rename in a group addressed by LID puts the number on `participant_pn` and leaves
+// `participant` out, and names who set the subject separately, in both namespaces. The
+// missing half of the actor is therefore in the frame, and taking it is what keeps a cold
+// alias cache from costing the client the LID it keys on.
+func TestAnActorNamedOnlyByNumberIsCompletedFromTheSubjectItSet(t *testing.T) {
+	t.Parallel()
+
+	number := someone("5511999990002")
+	lid := waTypes.NewJID("10089566068807", waTypes.HiddenUserServer)
+	session := groupSession(t)
+	session.handle(&waEvents.GroupInfo{
+		JID:      groupJID(),
+		SenderPN: &number,
+		Name: &waTypes.GroupName{
+			Name: "Equipe fazer.ai", NameSetBy: lid, NameSetByPN: number,
+		},
+	})
+
+	payload := published(t, session, protocol.EventGroupUpdated, "event_group_updated")
+	actor, _ := payload["actor"].(map[string]any)
+	if actor["phone"] != number.User {
+		t.Errorf("published %v as the actor's number", actor["phone"])
+	}
+	if actor["lid"] != lid.User {
+		t.Errorf("published %v as the actor's LID, want the one the subject named", actor["lid"])
+	}
+}
+
+// The guard under the case above, and the reason the comparison is inside one namespace.
+//
+// `party` merges every JID it is handed into a single identity and `aliases.observe`
+// writes the pairing down, so a `subject` set by somebody other than whoever sent the
+// notification must not be read as the sender's other address: the frame would carry one
+// member's number beside another member's LID, and the store would learn it as a mapping.
+// Here the numbers disagree, which is a question the frame can answer, and the answer is
+// to leave the actor with what the notification itself named.
+func TestASubjectSetBySomebodyElseDoesNotNameTheActor(t *testing.T) {
+	t.Parallel()
+
+	number := someone("5511999990002")
+	stranger := someone("5511999990003")
+	strangerLID := waTypes.NewJID("10089566068807", waTypes.HiddenUserServer)
+	session := groupSession(t)
+	session.handle(&waEvents.GroupInfo{
+		JID:      groupJID(),
+		SenderPN: &number,
+		Name: &waTypes.GroupName{
+			Name: "Equipe fazer.ai", NameSetBy: strangerLID, NameSetByPN: stranger,
+		},
+	})
+
+	payload := published(t, session, protocol.EventGroupUpdated, "event_group_updated")
+	actor, _ := payload["actor"].(map[string]any)
+	if actor["phone"] != number.User {
+		t.Errorf("published %v as the actor's number", actor["phone"])
+	}
+	if actor["lid"] != nil {
+		t.Errorf("published %v as the actor's LID, which belongs to somebody else", actor["lid"])
+	}
+}

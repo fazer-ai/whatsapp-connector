@@ -163,12 +163,15 @@ func (s *Session) groupChanged(event *waEvents.GroupInfo) {
 // link with no participant on the node, and the contract has `actor` optional precisely
 // so a producer can say it does not know rather than guess.
 func (s *Session) actorOf(ctx context.Context, event *waEvents.GroupInfo) *protocol.Party {
-	jids := make([]waTypes.JID, 0, 2)
+	jids := make([]waTypes.JID, 0, 3)
 	if event.Sender != nil {
 		jids = append(jids, *event.Sender)
 	}
 	if event.SenderPN != nil {
 		jids = append(jids, *event.SenderPN)
+	}
+	if other, ok := theSenderInTheOtherNamespace(event); ok {
+		jids = append(jids, other)
 	}
 	// One guard for both ways of having no actor: a notification that named nobody, and one
 	// that named somebody this connector cannot address. `party` with nothing to go on
@@ -178,6 +181,42 @@ func (s *Session) actorOf(ctx context.Context, event *waEvents.GroupInfo) *proto
 		return nil
 	}
 	return &actor
+}
+
+// theSenderInTheOtherNamespace is the renaming member's other address, when the
+// notification carried it and can be shown to be the same person.
+//
+// A `subject` child names who set it in both namespaces, `s_o` and `s_o_pn`, separately
+// from the `participant` and `participant_pn` on the notification itself. When the sender
+// arrived in one namespace only -- which is what a group addressed by LID does, putting
+// the number on `participant_pn` and leaving `participant` out -- the missing half is
+// already in the frame. Reading it there is what `address` does for a conversation and for
+// the same reason: an event that names both namespaces has answered the question, and
+// going to the store instead is a lookup for something in hand, which on a cold alias
+// cache is not a slower answer but a missing one.
+//
+// The equality is inside ONE namespace, never across, and that is the whole of what makes
+// this safe. Setter and sender are the same person in a rename somebody just made, but
+// that is a belief about WhatsApp rather than something the frame proves, and both `party`
+// and `aliases.observe` take what they are handed as one identity -- so handing them two
+// people would publish one member's number beside another's LID and write the pair into
+// the store as a mapping. Comparing the phone to the phone, or the LID to the LID, asks a
+// question this frame can actually answer, and only the half the comparison vouches for is
+// taken.
+func theSenderInTheOtherNamespace(event *waEvents.GroupInfo) (waTypes.JID, bool) {
+	if event.Name == nil {
+		return waTypes.JID{}, false
+	}
+	setBy, setByPN := event.Name.NameSetBy.ToNonAD(), event.Name.NameSetByPN.ToNonAD()
+	switch {
+	case event.Sender == nil && event.SenderPN != nil &&
+		!setBy.IsEmpty() && setByPN == event.SenderPN.ToNonAD():
+		return setBy, true
+	case event.SenderPN == nil && event.Sender != nil &&
+		!setByPN.IsEmpty() && setBy == event.Sender.ToNonAD():
+		return setByPN, true
+	}
+	return waTypes.JID{}, false
 }
 
 // describeChanges maps the notification onto the contract, field by field, and carries
