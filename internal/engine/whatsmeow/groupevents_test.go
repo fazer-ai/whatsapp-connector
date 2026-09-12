@@ -3,6 +3,7 @@ package whatsmeow
 import (
 	"encoding/json"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -537,3 +538,135 @@ func TestGroupChangesKeepTheOrderTheyArrivedIn(t *testing.T) {
 }
 
 func ptr[T any](v T) *T { return &v }
+
+// One `w:gp2` notification can speak about both sides at once. whatsmeow's parser walks
+// every child of the node into a single `GroupInfo`, so a rename that arrives in the same
+// breath as a disappearing-message timer is one event with `Name` and `Ephemeral` both
+// set, and publishing only the `group.updated` would carry the rename and swallow the
+// timer with nothing afterwards telling the client to go and look. A `group.updated` is a
+// statement about what changed, so a client that got one has no reason to suspect there
+// was more.
+func TestAChangeCarryingResidueAsksForASyncBesidesTheUpdate(t *testing.T) {
+	t.Parallel()
+
+	for name, residue := range map[string]waEvents.GroupInfo{
+		"disappearing messages": {Ephemeral: &waTypes.GroupEphemeral{IsEphemeral: true, DisappearingTimer: 86400}},
+		"the group deleted":     {Delete: &waTypes.GroupDelete{Deleted: true, DeleteReason: "admin"}},
+		"a new invite link":     {NewInviteLink: ptr("ABCDEF")},
+		"suspended":             {Suspended: true},
+		"unsuspended":           {Unsuspended: true},
+		"linked to a community": {Link: &waTypes.GroupLinkChange{Type: waTypes.GroupLinkChangeTypeSub}},
+		"unlinked":              {Unlink: &waTypes.GroupLinkChange{Type: waTypes.GroupLinkChangeTypeSub}},
+		"something unparsed":    {UnknownChanges: []*waBinary.Node{{Tag: "whatever"}}},
+		"membership approval":   {MembershipApprovalMode: &waTypes.GroupMembershipApprovalMode{IsJoinApprovalRequired: true}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			session := groupSession(t)
+
+			event := residue
+			event.JID = groupJID()
+			event.Name = &waTypes.GroupName{Name: "Equipe fazer.ai"}
+			session.handle(&event)
+
+			// The update first and the sync second: one is the line an operator reads,
+			// the other a prompt to go and read state, and reversed a client that syncs
+			// on the prompt can land its query before the update it already had.
+			update := published(t, session, protocol.EventGroupUpdated, "event_group_updated")
+			if subject := changesIn(t, update)["subject"]; subject != "Equipe fazer.ai" {
+				t.Errorf("published %v as the subject", subject)
+			}
+			activity := published(t, session, protocol.EventGroupActivity, "event_group_activity")
+			groups, _ := activity["groups"].([]any)
+			if len(groups) != 1 {
+				t.Fatalf("named %v as the groups that moved", activity["groups"])
+			}
+			named, _ := groups[0].(map[string]any)
+			if named["id"] != theGroup {
+				t.Errorf("named %v as the group that moved", groups[0])
+			}
+		})
+	}
+}
+
+// The other half of the rule above, and the reason the sync is conditioned on residue
+// rather than on an update having gone out at all: a soft sync alongside a change the
+// client has just been handed is a metadata query for what it already has.
+func TestAChangeTheContractCarriesWholeAsksForNoSync(t *testing.T) {
+	t.Parallel()
+
+	for name, event := range map[string]*waEvents.GroupInfo{
+		"a rename":       {Name: &waTypes.GroupName{Name: "Equipe fazer.ai"}},
+		"a description":  {Topic: &waTypes.GroupTopic{Topic: "o que combinamos"}},
+		"announce on":    {Announce: &waTypes.GroupAnnounce{IsAnnounce: true}},
+		"locked off":     {Locked: &waTypes.GroupLocked{IsLocked: false}},
+		"somebody added": {Join: []waTypes.JID{someone("5511999990002")}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			session := silentSession(t, true)
+			event.JID = groupJID()
+			session.handle(event)
+
+			if queued := len(session.inbox); queued != 1 {
+				t.Fatalf("queued %d emissions for a change the contract says whole, want 1", queued)
+			}
+		})
+	}
+}
+
+// The fence under the two functions above.
+//
+// `describeChanges` maps some of a notification's fields onto the contract and
+// `reportsResidue` names the rest, and what makes the pair correct is that every field is
+// on exactly one of the two sides. whatsmeow is a moving dependency: the day it learns to
+// parse a new `w:gp2` child, `GroupInfo` grows a field, and nothing in a compiler or in a
+// green suite says that this handler now drops it silently -- the new change would arrive,
+// fit no `changes` field, count as no residue, and be published as nothing at all.
+//
+// So the split is read off the struct rather than trusted. A field that is neither mapped
+// nor residue nor plain metadata about the notification fails here, and whoever added it
+// has to say which it is.
+func TestEveryFieldOfAGroupNotificationIsMappedOrResidue(t *testing.T) {
+	t.Parallel()
+
+	// Carried into `groupChanges` field by field, by `describeChanges`.
+	mapped := map[string]bool{
+		"Name": true, "Topic": true, "Locked": true, "Announce": true,
+		"Join": true, "Leave": true, "Promote": true, "Demote": true,
+	}
+	// No field in the contract says these, so they go out as `group.activity` and the
+	// client reads them back with a metadata query.
+	residue := map[string]bool{
+		"Ephemeral": true, "MembershipApprovalMode": true, "Delete": true,
+		"Link": true, "Unlink": true, "NewInviteLink": true,
+		"Suspended": true, "Unsuspended": true, "UnknownChanges": true,
+	}
+	// Not a change at all: who sent the notification, when, about which group, and the
+	// roster version ids that ride along with a membership change.
+	metadata := map[string]bool{
+		"JID": true, "Notify": true, "Sender": true, "SenderPN": true, "Timestamp": true,
+		"PrevParticipantVersionID": true, "ParticipantVersionID": true, "JoinReason": true,
+	}
+
+	shape := reflect.TypeOf(waEvents.GroupInfo{})
+	for i := range shape.NumField() {
+		field := shape.Field(i).Name
+		sides := 0
+		for _, side := range []map[string]bool{mapped, residue, metadata} {
+			if side[field] {
+				sides++
+			}
+		}
+		if sides != 1 {
+			t.Errorf("GroupInfo.%s is on %d of the three sides, want exactly 1: map it in describeChanges, name it in reportsResidue, or list it as metadata", field, sides)
+		}
+	}
+	for _, side := range []map[string]bool{mapped, residue, metadata} {
+		for field := range side {
+			if _, ok := shape.FieldByName(field); !ok {
+				t.Errorf("GroupInfo has no field %s: whatsmeow dropped it and this split is behind", field)
+			}
+		}
+	}
+}

@@ -99,10 +99,18 @@ func (s *Session) joinedAGroup(event *waEvents.JoinedGroup) {
 // all, and without it every one of them is silence indistinguishable from nothing having
 // happened.
 //
-// Only one of the two, never both. A soft sync alongside a change the client has just
-// been given is a metadata query for what it already has, and the residue it would cover
-// -- an ephemeral timer changed in the same breath as a rename -- is a gap in the
-// contract rather than something this handler can carry.
+// One notification can produce both, and only when it reported something on each side.
+// whatsmeow's parser walks every child of the `w:gp2` node into one `GroupInfo`, so a
+// rename and a disappearing-message timer arriving in the same breath are one event with
+// `Name` and `Ephemeral` both set. Publishing only `group.updated` there would carry the
+// rename and swallow the timer, and nothing afterwards would tell the client to go and
+// look: a `group.updated` is a statement about what changed, so a client that got one has
+// no reason to suspect the rest.
+//
+// What is not done is emitting the pair whenever `group.updated` goes out. A soft sync
+// alongside a change the client has just been handed is a metadata query for what it
+// already has, and that is the whole of why the second event is conditioned on residue
+// rather than on there having been an update at all.
 func (s *Session) groupChanged(event *waEvents.GroupInfo) {
 	if !s.wantsGroups() {
 		return
@@ -135,6 +143,14 @@ func (s *Session) groupChanged(event *waEvents.GroupInfo) {
 		update.Actor = actor
 	}
 	s.emit(protocol.EventGroupUpdated, update)
+
+	if reportsResidue(event) {
+		// The update goes first and the sync second, because the two say different things
+		// about the same instant: one is the line an operator reads, the other is a
+		// prompt to go and read state. Reversed, a client that syncs on the prompt can
+		// land its query before the update it already had the answer to.
+		s.emit(protocol.EventGroupActivity, groupActivity{Groups: []protocol.Address{group}})
+	}
 }
 
 // actorOf names whoever made the change, when the notification says who.
@@ -232,14 +248,31 @@ func (s *Session) parties(ctx context.Context, jids []waTypes.JID) []protocol.Pa
 	return named
 }
 
+// reportsResidue is a notification carrying something `groupChanges` has no field for.
+//
+// These are the changes WhatsApp reports and this contract does not spell out --
+// disappearing messages, join approval, community links and unlinks, an invite link
+// reset, deletion, suspension -- plus whatever whatsmeow could not parse at all. None of
+// them can be said in a `group.updated`, so the only way to say a group moved is
+// `group.activity` and a metadata query on the client's side.
+//
+// It is deliberately the complement of what `describeChanges` maps rather than a list
+// that happens to sit next to it: every field of `waEvents.GroupInfo` is on exactly one
+// of the two sides, and `TestEveryFieldOfAGroupNotificationIsMappedOrResidue` is what
+// keeps it that way when whatsmeow grows a field.
+func reportsResidue(event *waEvents.GroupInfo) bool {
+	return event.Ephemeral != nil || event.MembershipApprovalMode != nil ||
+		event.Delete != nil || event.Link != nil || event.Unlink != nil ||
+		event.NewInviteLink != nil || event.Suspended || event.Unsuspended ||
+		len(event.UnknownChanges) > 0
+}
+
 // reportsNothing is a notification that changed nothing anybody can act on: no setting,
 // no membership, and nothing whatsmeow failed to parse either.
 func reportsNothing(event *waEvents.GroupInfo) bool {
 	return event.Name == nil && event.Topic == nil && event.Locked == nil &&
-		event.Announce == nil && event.Ephemeral == nil && event.MembershipApprovalMode == nil &&
-		event.Delete == nil && event.Link == nil && event.Unlink == nil &&
-		event.NewInviteLink == nil && !event.Suspended && !event.Unsuspended &&
+		event.Announce == nil &&
 		len(event.Join) == 0 && len(event.Leave) == 0 &&
 		len(event.Promote) == 0 && len(event.Demote) == 0 &&
-		len(event.UnknownChanges) == 0
+		!reportsResidue(event)
 }
