@@ -410,15 +410,17 @@ func TestAChangeTheContractCannotCarryIsPublishedAsActivity(t *testing.T) {
 func TestAMembershipChangeNobodyCouldReadIsPublishedAsActivity(t *testing.T) {
 	t.Parallel()
 
-	// Either id on its own is proof enough, and the two are read separately rather than
-	// as a pair because the parser reads them separately: `parseGroupChange` fills each
-	// with `OptionalString`, so a child carrying one and not the other leaves the other
-	// empty. Asking only about the newer id would publish nothing for the shape that
-	// names only the older one.
+	// Any one of the three on its own is proof enough, and they are read separately
+	// because the parser writes them separately, each with `OptionalString` off its own
+	// attribute. A child carrying one and not the others leaves the others empty, so
+	// asking about only one of them publishes nothing for the shapes that name another:
+	// `<add reason="invite">` with no version id at all is the case that is not
+	// hypothetical, since that is how WhatsApp reports somebody joining by link.
 	for name, event := range map[string]*waEvents.GroupInfo{
-		"both ids":     {PrevParticipantVersionID: "17", ParticipantVersionID: "18"},
-		"only the new": {ParticipantVersionID: "18"},
-		"only the old": {PrevParticipantVersionID: "17"},
+		"both ids":        {PrevParticipantVersionID: "17", ParticipantVersionID: "18"},
+		"only the new":    {ParticipantVersionID: "18"},
+		"only the old":    {PrevParticipantVersionID: "17"},
+		"only the reason": {JoinReason: "invite"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -685,16 +687,16 @@ func TestEveryFieldOfAGroupNotificationIsMappedOrResidue(t *testing.T) {
 		"Ephemeral": true, "MembershipApprovalMode": true, "Delete": true,
 		"Link": true, "Unlink": true, "NewInviteLink": true,
 		"Suspended": true, "Unsuspended": true, "UnknownChanges": true,
-		// Residue only when the four lists came back empty, which is the one thing they
-		// can say that `changes` cannot: a membership child arrived and nobody in it could
-		// be read. Beside a membership change that WAS read they say nothing new, and
+		// The three a membership child writes and nothing else does. Residue only when the
+		// four lists came back empty, which is the one thing they can say that `changes`
+		// cannot: a membership child arrived and nobody in it could be read. Beside a
+		// membership change that WAS read they say nothing new, and
 		// `reportsMembershipNobodyCouldRead` is where that distinction lives.
-		"PrevParticipantVersionID": true, "ParticipantVersionID": true,
+		"PrevParticipantVersionID": true, "ParticipantVersionID": true, "JoinReason": true,
 	}
 	// Not a change at all: who sent the notification, when, and about which group.
 	metadata := map[string]bool{
 		"JID": true, "Notify": true, "Sender": true, "SenderPN": true, "Timestamp": true,
-		"JoinReason": true,
 	}
 
 	shape := reflect.TypeOf(waEvents.GroupInfo{})

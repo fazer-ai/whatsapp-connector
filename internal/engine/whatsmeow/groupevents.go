@@ -275,25 +275,33 @@ func reportsResidue(event *waEvents.GroupInfo) bool {
 // reportsMembershipNobodyCouldRead is a membership notification that arrived with nobody
 // in it.
 //
-// The roster version ids are the tell, and they say more than they look like they say:
-// `parseGroupChange` fills them from an `add`, `remove`, `promote` or `demote` child and
-// from nowhere else, so an id is proof one of those four arrived. Reading them as a bare
-// version bump -- a roster that has a new number and no news -- is the mistake this
-// function exists to name, because there is no bump without a membership child, and a
-// membership child that left all four lists empty is one whose participants
+// Three fields are the tell, and they say more than they look like they say. Reading down
+// `parseGroupChange`'s loop over the node's children, exactly three things are written
+// from an `add`, `remove`, `promote` or `demote` case and from nowhere else: the two
+// roster version ids, and the join reason that only `add` carries. Any one of them present
+// is proof one of those four children arrived.
+//
+// Which is why a bare version bump -- a roster that has a new number and no news -- is not
+// a thing that happens, and reading the ids that way was the mistake this function exists
+// to name. A membership child that left all four lists empty is one whose participants
 // `parseParticipantList` skipped: a `participant` it could not read a JID off, or a child
 // under some tag this build has never seen.
 //
-// Which makes it residue rather than nothing. The roster moved, this connector cannot say
-// how, and a client that is told nothing keeps showing the old membership with nothing to
+// That makes it residue rather than nothing. The roster moved, this connector cannot say
+// how, and a client told nothing keeps showing the old membership with nothing to
 // contradict it -- the same silence `group.activity` exists to break everywhere else in
 // this handler.
 //
-// A membership change that WAS read carries its ids too, and this is false for it: the
+// All three are optional attributes on their own child, so they arrive in any combination
+// and none of them can stand for the others: an `<add reason="invite">` with neither
+// version id says as much as a `v_id` with no reason.
+//
+// A membership change that WAS read carries the same three, and this is false for it: the
 // lists are full, `group.updated` says what happened, and a sync alongside it would be a
 // query for what the client has just been handed.
 func reportsMembershipNobodyCouldRead(event *waEvents.GroupInfo) bool {
-	if event.ParticipantVersionID == "" && event.PrevParticipantVersionID == "" {
+	if event.ParticipantVersionID == "" && event.PrevParticipantVersionID == "" &&
+		event.JoinReason == "" {
 		return false
 	}
 	return len(event.Join) == 0 && len(event.Leave) == 0 &&
