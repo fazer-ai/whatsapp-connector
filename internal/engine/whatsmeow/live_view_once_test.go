@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -227,8 +228,21 @@ func reportWhatArrived(
 		// The published frame says the envelope decrypted. Only this download says the
 		// bytes it describes are really there and really the ones that were sent, which is
 		// the question #21 asks and the one a `type=media` alone does not answer.
-		why := whyNoFile(t, sent, watching)
 		got := liveDownload(t, subject, arrived(t, sent))
+
+		// A kept file is a third answer, and asking why no file was kept would be asking
+		// about something that did not happen: this build publishes no failure when it
+		// keeps one, so the wait would spend its deadline and fail the arm on an outcome
+		// worth reporting. It is not hypothetical -- it is what a WhatsApp that stopped
+		// preserving the view-once marker would look like from here, and that is precisely
+		// the change this phase exists to notice.
+		if said.Ref != nil {
+			say("MEASURED %-52s -> the marker did not survive: this build treated it as ordinary media and KEPT the file (kind=%s, %s)",
+				probe, said.Kind, matched(got))
+			return
+		}
+
+		why := whyNoFile(t, sent, watching)
 		switch {
 		case got == nil:
 			say("MEASURED %-52s -> the envelope decrypted but the bytes could not be fetched (kind=%s, reason=%s)",
@@ -240,6 +254,19 @@ func reportWhatArrived(
 			say("MEASURED %-52s -> the BYTES reached the companion (%d downloaded, identical to what was sent); this build kept nothing, reason=%s (kind=%s, thumbnail=%d bytes)",
 				probe, len(got), why, said.Kind, len(said.Thumb))
 		}
+	}
+}
+
+// matched says whether a download came back as the file that was sent, in one phrase, for
+// the reports that carry it as an aside rather than as their subject.
+func matched(got []byte) string {
+	switch {
+	case got == nil:
+		return "and its bytes could not be fetched"
+	case bytes.Equal(got, onePixelPNG):
+		return fmt.Sprintf("and its %d bytes are the ones that were sent", len(got))
+	default:
+		return fmt.Sprintf("and its %d bytes are not the %d that were sent", len(got), len(onePixelPNG))
 	}
 }
 
