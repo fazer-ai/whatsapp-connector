@@ -382,9 +382,13 @@ const (
 	// UnsupportedUndecryptable is a message whose ciphertext could not be opened.
 	UnsupportedUndecryptable UnsupportedReason = "undecryptable"
 	// UnsupportedUnavailable is a message this device was never given: the stanza carried
-	// no ciphertext at all, which is not the same as one that would not open. WhatsApp
-	// answers a companion device that way on purpose for a view-once photo, and asks the
-	// primary phone to forward it instead -- which it may never do.
+	// no ciphertext at all, which is not the same as one that would not open. WhatsApp has
+	// answered a companion device that way for a view-once photo sent from a phone, asking
+	// the primary phone to forward it instead -- which it may never do.
+	//
+	// A property of the sender rather than of view-once itself, as far as anything here has
+	// measured: `TestLiveViewOnceReachesACompanion` sends the same shapes from a second
+	// linked device and the bytes arrive every time.
 	UnsupportedUnavailable UnsupportedReason = "unavailable"
 	// UnsupportedMasked is a message WhatsApp withheld from every linked device on
 	// purpose. An authentication template -- a verification code -- is delivered to the
