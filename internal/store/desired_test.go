@@ -152,6 +152,36 @@ func TestTurningGroupsOffIsRemembered(t *testing.T) {
 	}
 }
 
+// The two doors are fenced, because what they record is what brings an account back. An
+// instance that has lost the session must not be the one saying it should be running --
+// it would be telling its successor to put back what the successor has already been
+// asked to leave down, or to leave down what a client has asked for since.
+func TestTheDesiredStateIsNotWrittenByASessionThatWasHandedOn(t *testing.T) {
+	t.Parallel()
+	container := open(t)
+	ctx := t.Context()
+	pair(t, container, "sid-1", "5511999990001")
+
+	losing := container.For("sid-1")
+	losing.Drop()
+
+	if err := losing.PutDesiredConnected(ctx, true); err == nil {
+		t.Fatal("a session that no longer owns this one asked for it to be brought back")
+	}
+	if err := losing.PutDesiredDisconnected(ctx); err == nil {
+		t.Fatal("a session that no longer owns this one asked for it to stay down")
+	}
+	// And nothing reached the table: a fence that answered the error after writing would
+	// pass the two checks above and still hand the successor the wrong instruction.
+	wanted, err := container.Wanted(ctx)
+	if err != nil {
+		t.Fatalf("Wanted: %v", err)
+	}
+	if len(wanted) != 0 {
+		t.Fatalf("the refused write landed anyway: the sweep would bring back %v", wanted)
+	}
+}
+
 // A disconnect does not carry a subscription, so it must not write one. The value it
 // would write is not read while the session is down -- Wanted selects on the state --
 // which is exactly why writing it is the kind of falsehood that survives until somebody

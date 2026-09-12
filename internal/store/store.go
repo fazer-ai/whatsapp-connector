@@ -559,18 +559,14 @@ func (c *Container) migrate(ctx context.Context) error {
 		// reads it joins the two, so a session that never paired is never resumed. A
 		// forget deletes it explicitly instead.
 		//
-		// `wants_groups` is the one thing the connect carried that the row has to keep,
-		// and it is one column rather than the request it came in: a stored request
-		// replayed by a resume can be a request this build refuses -- `history_sync`,
-		// `calls.auto_reject`, a proxy with a URL -- and an account brought back by a
-		// command that fails is worse off than one that was never brought back at all.
-		// Spelled `wants_groups` and not `groups` because both dialects have made
-		// `GROUPS` a keyword for window frames.
+		// `wants_groups` is not here, and that is deliberate: it is added below, by the
+		// same path that gives it to a store which predates it. Declared in both places
+		// it would have two defaults for one column -- a fresh store reading this one and
+		// an upgraded store reading the other -- and nothing would ever compare them.
 		`CREATE TABLE IF NOT EXISTS wac_session_desired (
-			sid          TEXT   PRIMARY KEY,
-			desired      TEXT   NOT NULL,
-			wants_groups BIGINT NOT NULL DEFAULT 0,
-			asked_at     BIGINT NOT NULL
+			sid      TEXT   PRIMARY KEY,
+			desired  TEXT   NOT NULL,
+			asked_at BIGINT NOT NULL
 		)`,
 		`CREATE TABLE IF NOT EXISTS wac_session_presence (
 			sid    TEXT   PRIMARY KEY,
@@ -598,6 +594,10 @@ func (c *Container) migrate(ctx context.Context) error {
 	// session has never carried the subscription -- and the other default would have an
 	// upgrade start publishing group conversation into inboxes on the strength of a
 	// request nobody recorded.
+	//
+	// It is the one column here that a fresh store does not have either, on purpose: the
+	// default belongs in one place, and this is the place that has to have it right for
+	// the store that already has rows.
 	for _, column := range []struct{ table, name, definition string }{
 		{"wac_media_part", "receipt_chat", "TEXT NOT NULL DEFAULT ''"},
 		{"wac_media_part", "sender", "TEXT NOT NULL DEFAULT ''"},
