@@ -178,21 +178,22 @@ type ConnectRequest struct {
 	// Proxy is an object in the contract, not a string: decoding it as one made every
 	// connect carrying a proxy fail to parse before it reached an engine.
 	Proxy *ProxyRequest `json:"proxy,omitempty"`
-	// Groups asks for group chats alongside direct ones, and four paths select on it:
-	// a message, an unreadable message, a chat presence and a receipt whose chat is a
-	// group are acknowledged and published nowhere when the last connect asked for
-	// direct chats only. So this is the client's switch for whether group traffic
-	// reaches it at all, and a client that stops setting it stops receiving groups
-	// rather than losing a feature it was not using.
+	// Groups asks for group chats alongside direct ones, and six paths select on it: a
+	// message, an unreadable message, a chat presence, a receipt whose chat is a group,
+	// and the two notifications WhatsApp sends about a group itself -- being added to
+	// one, and one changing -- are acknowledged and published nowhere when the last
+	// connect asked for direct chats only. So this is the client's switch for whether
+	// group traffic reaches it at all, and a client that stops setting it stops
+	// receiving groups rather than losing a feature it was not using.
 	//
 	// Acknowledged and dropped rather than refused, because withholding the
 	// acknowledgement would have WhatsApp redeliver every group message the account
 	// receives for as long as the session is up.
 	//
 	// It says nothing about the group *commands*, which are a different question and
-	// are not served: `group.info` and the eleven beside it answer `unsupported`.
-	// Wanting group conversation and being able to administer a group are separate, and
-	// only the first of them is honoured here.
+	// are served whether or not this is set: `group.info` and the eleven beside it
+	// answer. Wanting group conversation to arrive and being able to ask about or
+	// administer a group are separate, and this switch is only about the first.
 	Groups bool `json:"groups,omitempty"`
 	// HistorySync asks for the backlog the phone holds. Honouring it is M6.
 	HistorySync bool `json:"history_sync,omitempty"`

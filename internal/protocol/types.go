@@ -94,7 +94,7 @@ const (
 	CommandCallReject              CommandType = "call.reject"
 )
 
-// AllEventTypes lists every event type in the contract. Fourteen of them have no
+// AllEventTypes lists every event type in the contract. Eleven of them have no
 // producer in this build, and they are marked below: a client may match on one and
 // never see it, the way it may branch on a reserved error code in errors.go. They stay
 // in the catalog because removing one narrows what a client may already match on, and
@@ -127,15 +127,16 @@ var AllEventTypes = []EventType{
 	EventCommandFailed,
 	EventChatPresence,
 	EventPresenceUpdate,
-	// No producer, all of them, and each waits on the milestone its family belongs to:
-	// contacts, groups and calls are M3, the two account limits are M5, and the history
-	// replay is M6.
+	// No producer, and each waits on the milestone its family belongs to: contacts,
+	// groups and calls are M3, the two account limits are M5, and the history replay is
+	// M6. The three group events interleaved here are the exception and are marked one by
+	// one, because the session's event handler publishes them now.
 	EventContactPictureChanged,
 	EventContactIdentityChanged,
-	EventGroupJoined,
-	EventGroupUpdated,
+	EventGroupJoined,  // produced
+	EventGroupUpdated, // produced
 	EventGroupPictureChanged,
-	EventGroupActivity,
+	EventGroupActivity, // produced
 	EventAccountReachoutTimelock,
 	EventAccountNewChatCap,
 	EventCallOffer,

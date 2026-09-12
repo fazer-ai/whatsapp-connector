@@ -3190,6 +3190,17 @@ func (s *Session) emit(eventType protocol.EventType, payload any) {
 	s.emitting(&engine.Emission{Type: eventType}, payload)
 }
 
+// emitAt is emit for a reading of the clock taken somewhere else.
+//
+// Two events that report one notification have one learned time, and taking it inside
+// each `emitting` gives them two: the first call blocks on a full inbox until the
+// publisher recovers, and the second is then stamped an outage after the thing it
+// reports, which is the opposite of what `Emission.At` promises a reader. So whoever
+// knows the two belong together reads the clock once and hands the reading down.
+func (s *Session) emitAt(at int64, eventType protocol.EventType, payload any) {
+	s.emitting(&engine.Emission{Type: eventType, At: at}, payload)
+}
+
 // emitLast is emit for a state whatsmeow does not come back from. It says so on the
 // emission, so the connector hands the lease back once the event is out and the account
 // stops belonging to an instance with nothing left to try.
@@ -3207,7 +3218,9 @@ func (s *Session) emitting(emission *engine.Emission, payload any) {
 		return
 	}
 	emission.Payload = body
-	emission.At = s.learned()
+	if emission.At == 0 {
+		emission.At = s.learned()
+	}
 	select {
 	case s.inbox <- pending{event: *emission}:
 	case <-s.done:
@@ -3903,6 +3916,10 @@ func (s *Session) handle(rawEvent any) bool {
 		if s.isSelf(event.JID) {
 			s.reverify(event.NewBusinessName)
 		}
+	case *waEvents.JoinedGroup:
+		s.joinedAGroup(event)
+	case *waEvents.GroupInfo:
+		s.groupChanged(event)
 	case *waEvents.PairError:
 		// Whatever the QR channel does with this, the client is on a device whatsmeow
 		// may have half-written: an id with no credentials, or one it marked deleted.
