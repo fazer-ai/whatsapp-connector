@@ -661,16 +661,17 @@ func (s *Session) downloadMedia(ctx context.Context, command *protocol.Command) 
 // instance's address is a reference that answers 404 forever. So the store is asked, and
 // a no is not a failure -- it is the ordinary case the download below exists for.
 func (s *Session) reusable(kept *store.MediaPart) (protocol.MediaRef, bool) {
-	if kept.BlobID == "" {
-		// Nothing was kept, or the row predates the column. Both download, which is what
-		// this build did for every call before there was a column at all.
-		return protocol.MediaRef{}, false
-	}
+	// Asked without checking the id first, because an empty one is already an id this
+	// store has no blob for: a row that kept nothing, or one written before the column
+	// existed, comes back ErrNotFound like any other and downloads, which is what this
+	// build did for every call before there was a column at all. A guard in front of it
+	// would be a second answer to a question that already has one.
 	about, touched, err := s.blobs.Touch(kept.BlobID)
 	switch {
 	case errors.Is(err, media.ErrNotFound):
-		// Swept, evicted, or on an instance this session no longer runs on. The ordinary
-		// case, and it is not worth a line in the log: it is what the download is for.
+		// Swept, evicted, on an instance this session no longer runs on, or never there
+		// at all. The ordinary case, and it is not worth a line in the log: it is what
+		// the download below is for.
 		return protocol.MediaRef{}, false
 	case err != nil:
 		s.log.Warn().Err(err).Str("message_id", kept.MessageID).
