@@ -469,3 +469,51 @@ func TestABlobIsNotRememberedOnARowThatNowDescribesAnotherFile(t *testing.T) {
 		t.Errorf("the row points at %q, want the file it now describes, %q", got.BlobID, replaced.BlobID)
 	}
 }
+
+// The stamp is the last thing separating two rows when nothing else can. Media that is
+// not encrypted carries no ciphertext digest -- whatsmeow draws the line at nil, and the
+// column keeps it as the empty string -- so two messages sharing an id in one chat, with
+// different files and neither carrying a digest, agree on the chat and agree on the empty
+// digest. What is left is when each was written, and without it the blob of the first
+// would be filed as the second's, in the one case the digest check on the way back out
+// cannot see either: it has no digest to compare.
+func TestABlobIsNotRememberedOnARowWithNoDigestThatWasWrittenAgain(t *testing.T) {
+	t.Parallel()
+	container := open(t)
+	pair(t, container, "sid-1", "5511999990001")
+	scoped := container.For("sid-1")
+
+	unencrypted := func(path string) store.MediaPart {
+		part := samplePart("sid-1", "3EB0NODIGEST")
+		part.DirectPath = path
+		part.FileEncSHA256, part.FileSHA256 = nil, nil
+		return part
+	}
+
+	read := unencrypted("/v/first")
+	if err := scoped.PutMediaPart(t.Context(), &read, storedAt); err != nil {
+		t.Fatalf("PutMediaPart: %v", err)
+	}
+	// The same chat and the same absent digest, and a different file behind them.
+	replaced := unencrypted("/v/second")
+	replaced.BlobID = "blob_ffffffffffffffffffffffff"
+	if err := scoped.PutMediaPart(t.Context(), &replaced, storedAt.Add(time.Second)); err != nil {
+		t.Fatalf("PutMediaPart: %v", err)
+	}
+
+	read.StoredAt = storedAt.UnixMilli()
+	if err := scoped.RememberBlob(t.Context(), "blob_aaaaaaaaaaaaaaaaaaaaaaaa", &read); err != nil {
+		t.Fatalf("RememberBlob: %v", err)
+	}
+
+	got, _, err := container.For("sid-1").MediaPart(t.Context(), "3EB0NODIGEST")
+	if err != nil {
+		t.Fatalf("MediaPart: %v", err)
+	}
+	if got.BlobID != replaced.BlobID {
+		t.Errorf("the row points at %q, want the file of the row that replaced it, %q", got.BlobID, replaced.BlobID)
+	}
+	if got.DirectPath != replaced.DirectPath {
+		t.Errorf("the row describes %q, want %q", got.DirectPath, replaced.DirectPath)
+	}
+}

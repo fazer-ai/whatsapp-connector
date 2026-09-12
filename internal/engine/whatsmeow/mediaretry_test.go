@@ -448,6 +448,53 @@ func TestAFreshPathIsRememberedSoTheNextCallerDoesNotAskTwice(t *testing.T) {
 	}
 }
 
+// The file the sender's phone uploaded again is filed on the row like any other, so the
+// next caller is answered off the disk instead of going back to the phone.
+//
+// Which is the half of this path that costs the most when it is missed. A download that
+// came through the phone spent a 404 and then as long as the phone took to answer, which
+// can be tens of seconds and can be never; paying that again for a file already on this
+// disk is the worst case issue #24 has.
+//
+// It is also what holds the write-back's condition to the columns it has. The path this
+// runs refreshes `direct_path` a line before recording the blob, so a condition that
+// included `direct_path` would have the write-back refuse its own caller, silently: every
+// file that came from a phone would go unfiled, and every later download would ask the
+// phone again. That reads as a tightening and is a regression, and without this nothing
+// would go red.
+func TestTheFileAPhoneUploadedAgainIsFiledOnTheRow(t *testing.T) {
+	t.Parallel()
+
+	session, phone, _ := reuploadSession(t, "3EB0FILED")
+	phone.answersWith(reuploaded("/v/fresh-path"))
+	fresh, err := refetchErr(session, "3EB0FILED", nil)
+	if err != nil {
+		t.Fatalf("refetch: %v", err)
+	}
+
+	kept, found, err := session.store.MediaPart(t.Context(), "3EB0FILED")
+	if err != nil || !found {
+		t.Fatalf("MediaPart: %v (found %v)", err, found)
+	}
+	if kept.BlobID != fresh.ID {
+		t.Fatalf("the row points at %q, want the file the phone's upload was written to, %q",
+			kept.BlobID, fresh.ID)
+	}
+
+	// And that is worth something: the next caller is answered from the disk, without the
+	// 404 and without the phone.
+	again, err := refetchErr(session, "3EB0FILED", nil)
+	if err != nil {
+		t.Fatalf("the second refetch failed: %v", err)
+	}
+	if again.ID != fresh.ID {
+		t.Errorf("the second refetch answered %s, want the file already on this disk, %s", again.ID, fresh.ID)
+	}
+	if phone.asked() != 1 {
+		t.Errorf("the sender's phone was asked %d times, want once", phone.asked())
+	}
+}
+
 // The receipt could not even be written, which is a socket that is down and not a file
 // that is gone. Reported as the 404's own answer it would tell an agent the attachment
 // is gone because this instance could not reach WhatsApp for a moment.
