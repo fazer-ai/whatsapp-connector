@@ -13,6 +13,12 @@
 // `group.joined` case: nobody joins anything in a run that reuses a group, and that
 // subtest skips naming what it did not cover rather than waiting for a notification
 // WhatsApp has no reason to send.
+//
+// WAC_LIVE_GROUP takes the whole JID, `<id>@g.us`, and the server half is not optional.
+// `types.ParseJID` reads a bare id as a user, so `WAC_LIVE_GROUP=1203...` asks WhatsApp
+// about a person with that number: every `GetGroupInfo` times out, the run dies after a
+// minute on "never learned it is in", and nothing in that message says the JID was the
+// problem. Measured here twice before the id was the suspect.
 package whatsmeow
 
 import (
