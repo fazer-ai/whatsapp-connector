@@ -95,6 +95,7 @@ type Session struct {
 	loggedOut    int
 	deleted      int
 	connects     int
+	asked        engine.ConnectRequest
 	refuseUnlink error
 	failDelete   error
 	failConnect  error
@@ -130,10 +131,25 @@ func (s *Session) Connects() int {
 	return s.connects
 }
 
+// Asked is the last connect this session was handed, and whether it has been handed one.
+//
+// Recorded because the pairing mode is not the whole of a connect: the subscription
+// travels in the same request, and a caller that synthesises one -- the resume sweep does
+// -- can carry the mode and drop the rest, which reaches the client as an account that is
+// open and publishes no group conversation at all.
+func (s *Session) Asked() (engine.ConnectRequest, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.asked, s.connects > 0
+}
+
 // Connect walks the pairing conversation the type asks for and ends `open`.
 func (s *Session) Connect(_ context.Context, req engine.ConnectRequest) error {
 	s.mu.Lock()
 	s.connects++
+	// Before the refusal rather than after it: what was asked for is what was asked for,
+	// and a test about an attempt reads this to find out what was attempted.
+	s.asked = req
 	failWith := s.failConnect
 	s.mu.Unlock()
 	if failWith != nil {
