@@ -85,11 +85,13 @@ type Streams struct {
 	unrunMu sync.Mutex
 	unrun   map[string][]unrunEntry
 
-	// marks is, per stream, how far Read has read this consumer's pending history, and
-	// claimedPast what a claim handed out beyond that point. See Read.
+	// marks is, per stream, how far Read has read this consumer's pending history,
+	// claimedPast what a claim handed out beyond that point, and received the payloads `>`
+	// answered with beyond it. See Read.
 	marksMu     sync.Mutex
 	marks       map[string]string
 	claimedPast map[string]map[string]struct{}
+	received    map[string]map[string]map[string]any
 }
 
 // unrunEntry is one entry given back without being carried out, and the idle time it
@@ -142,6 +144,7 @@ func New(client *redisx.Client, opts Options) (*Streams, error) {
 		unrun:       make(map[string][]unrunEntry),
 		marks:       make(map[string]string),
 		claimedPast: make(map[string]map[string]struct{}),
+		received:    make(map[string]map[string]map[string]any),
 	}, nil
 }
 
@@ -282,6 +285,10 @@ func (s *Streams) blockWithin(ctx context.Context) (time.Duration, bool) {
 // ago. The streams of sessions have no such limit, since a peer claims them only once it
 // holds their lease, and order is what they are for.
 //
+// The history reads an entry's payload back from the stream, and a producer trimming it can
+// remove the entry in between. What `>` answered with is kept until a page passes it and
+// stands in for an entry no longer there.
+//
 // A history read that fails leaves what `>` moved in pending above the mark, for the
 // history of the next read to hand out. Anything already taken and not acknowledged below
 // the mark is Claim's business.
@@ -337,12 +344,33 @@ func (s *Streams) Read(ctx context.Context, sids []string) ([]transport.Delivery
 	control := s.client.Keys().Control()
 	answered := make(map[string]struct{})
 	s.marksMu.Lock()
+	// Only a stream still read will have a page carry what it received. A page empties a
+	// stream's share as it passes it, so this is almost always nothing to look at.
+	if len(s.received) > 0 {
+		reading := make(map[string]struct{}, len(streams))
+		for _, stream := range streams {
+			reading[stream] = struct{}{}
+		}
+		for stream := range s.received {
+			if _, still := reading[stream]; !still {
+				delete(s.received, stream)
+			}
+		}
+	}
 	for _, stream := range answer {
 		// `>` returns only what is past the group's cursor, which is never behind a mark this
 		// group's pages set. An entry at or below the mark means the group was recreated,
 		// starting over at the beginning of the stream, and the mark was the old group's.
 		if len(stream.Messages) > 0 && !entryAfter(stream.Messages[0].ID, s.marks[stream.Stream]) {
 			delete(s.marks, stream.Stream)
+		}
+		// Kept until a page passes it: a producer trimming the stream can remove an entry
+		// before the history reads it back, and the payload is here already.
+		if len(stream.Messages) > 0 && s.received[stream.Stream] == nil {
+			s.received[stream.Stream] = make(map[string]map[string]any)
+		}
+		for _, message := range stream.Messages {
+			s.received[stream.Stream][message.ID] = message.Values
 		}
 		if stream.Stream != control {
 			continue
@@ -399,6 +427,9 @@ func (s *Streams) readHistory(ctx context.Context, streams []string, answered ma
 			if _, fresh := answered[entry.ID]; page.stream == control && !fresh && entry.idle+trip > s.opts.ReadBackMaxAge {
 				continue
 			}
+			if values, ok := s.received[page.stream][entry.ID]; ok && len(entry.Values) == 0 {
+				entry.Values = values
+			}
 			handing = append(handing, entry.XMessage)
 		}
 		// Past everything on the page, what was handed out and what was skipped alike: a
@@ -410,6 +441,14 @@ func (s *Streams) readHistory(ctx context.Context, streams []string, answered ma
 				if !entryAfter(id, s.marks[page.stream]) {
 					delete(s.claimedPast[page.stream], id)
 				}
+			}
+			for id := range s.received[page.stream] {
+				if !entryAfter(id, s.marks[page.stream]) {
+					delete(s.received[page.stream], id)
+				}
+			}
+			if len(s.received[page.stream]) == 0 {
+				delete(s.received, page.stream)
 			}
 		}
 		s.marksMu.Unlock()

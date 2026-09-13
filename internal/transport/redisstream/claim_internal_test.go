@@ -189,3 +189,58 @@ func TestEntryIDsCompareAsNumbers(t *testing.T) {
 		}
 	}
 }
+
+// What `>` answered with is kept only as a fallback for an entry trimmed before a page reads
+// it back. A page that passes it, or a read that no longer reads its stream, lets it go, or
+// an instance holds every command it ever read.
+func TestAReceivedPayloadIsForgottenOncePassedOrNoLongerRead(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+	ctx := context.Background()
+
+	a, err := New(client, Options{Instance: "inst-a", Block: 50 * time.Millisecond, ReadCount: 1})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	for _, sid := range []string{"s1", "s2"} {
+		if _, err := a.Read(ctx, []string{sid}); err != nil {
+			t.Fatalf("priming Read: %v", err)
+		}
+	}
+	first, second := client.Keys().Commands("s1"), client.Keys().Commands("s2")
+
+	writeOne(t, client, first, "s1")
+	if read, err := a.Read(ctx, []string{"s1"}); err != nil || len(read) != 1 {
+		t.Fatalf("read %d commands (err=%v), want 1", len(read), err)
+	}
+	if kept := len(a.received[first]); kept != 0 {
+		t.Fatalf("%d payloads kept after the page that read them back, want none", kept)
+	}
+
+	// A read whose answer never arrived, as far as this process knows: the command is pending
+	// here past the mark. The next read's page is that one, while its `>` carries a newer
+	// command, whose payload stays kept.
+	writeOne(t, client, second, "s2")
+	if err := client.XReadGroup(ctx, &redis.XReadGroupArgs{
+		Group: ConsumerGroup, Consumer: "inst-a", Streams: []string{second, ">"}, Count: 1, Block: -1,
+	}).Err(); err != nil {
+		t.Fatalf("XREADGROUP: %v", err)
+	}
+	writeOne(t, client, second, "s2")
+	if read, err := a.Read(ctx, []string{"s2"}); err != nil || len(read) != 1 {
+		t.Fatalf("read %d commands (err=%v), want the older one", len(read), err)
+	}
+	if kept := len(a.received[second]); kept != 1 {
+		t.Fatalf("%d payloads kept, want the one no page has passed yet", kept)
+	}
+	if _, err := a.Read(ctx, []string{"s1"}); err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if _, kept := a.received[second]; kept {
+		t.Fatal("payloads still kept for a stream the read no longer reads")
+	}
+}

@@ -767,6 +767,78 @@ func TestAGroupRecreatedUnderTheReadStartsItsHistoryOver(t *testing.T) {
 	})
 }
 
+// A read hands out what it read back, and a producer trimming the stream can take an entry
+// away between `>` answering with it and the history reading it back. The answer carried
+// the payload; losing the entry from the stream must not lose the command with it, whether
+// the history reads it back in the same read or, with a page already full of older entries,
+// in a later one.
+func TestACommandTrimmedAfterItsReadAnsweredIsStillHandedOut(t *testing.T) {
+	cutBackends(t, func(t *testing.T, f cutFleet) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		trim := func(stream string) {
+			t.Helper()
+			if err := f.client.XTrimMaxLen(ctx, stream, 0).Err(); err != nil {
+				t.Fatalf("XTRIM: %v", err)
+			}
+		}
+
+		t.Run("read back by the same read", func(t *testing.T) {
+			streams := f.streams(t, "inst-a")
+			stream := f.client.Keys().Commands("s1")
+			if _, err := read(t, streams, "s1"); err != nil {
+				t.Fatalf("priming read: %v", err)
+			}
+			writeCommand(t, f.fleet, stream, command("trimmed-at-once", "s1", ""))
+
+			// The answer is held, so the stream is trimmed after `>` ran and before the
+			// history does.
+			release := make(chan struct{})
+			caught := f.proxy.Hold("trimmed-at-once", release)
+			type result struct {
+				delivered []transport.Delivery
+				err       error
+			}
+			done := make(chan result, 1)
+			go func() {
+				delivered, err := streams.Read(ctx, []string{"s1"})
+				done <- result{delivered, err}
+			}()
+			<-caught
+			trim(stream)
+			close(release)
+			got := <-done
+			if got.err != nil || !slices.Equal(ids(got.delivered), []string{"trimmed-at-once"}) {
+				t.Fatalf("handed out %v (err=%v), want the command the answer carried", ids(got.delivered), got.err)
+			}
+		})
+
+		t.Run("read back by a later read", func(t *testing.T) {
+			streams := f.streamsReading(t, "inst-b", 1)
+			stream := f.client.Keys().Commands("s2")
+			if _, err := read(t, streams, "s2"); err != nil {
+				t.Fatalf("priming read: %v", err)
+			}
+			writeCommand(t, f.fleet, stream, command("lost-first", "s2", ""))
+			f.loseTheAnswer(t, "held past the window", streams, "inst-b", "lost-first", "s2")
+			writeCommand(t, f.fleet, stream, command("trimmed-later", "s2", ""))
+
+			// One entry a page: this read's `>` carries the newer command, and its page is the
+			// older one.
+			delivered, err := read(t, streams, "s2")
+			if err != nil || !slices.Equal(ids(delivered), []string{"lost-first"}) {
+				t.Fatalf("handed out %v (err=%v), want the older command first", ids(delivered), err)
+			}
+			ackAll(t, delivered)
+			trim(stream)
+			delivered, err = read(t, streams, "s2")
+			if err != nil || !slices.Equal(ids(delivered), []string{"trimmed-later"}) {
+				t.Fatalf("handed out %v (err=%v), want the command an earlier answer carried", ids(delivered), err)
+			}
+		})
+	})
+}
+
 // A max age as long as the claim delay would hand a recovered wake out already claimable.
 func TestAReadBackMaxAgeNotShorterThanTheClaimDelayIsRefused(t *testing.T) {
 	f := newFleet(t)
