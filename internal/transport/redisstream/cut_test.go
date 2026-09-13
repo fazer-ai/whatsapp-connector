@@ -989,6 +989,50 @@ func TestACommandRecoveredPastTheClaimDelayIsARedelivery(t *testing.T) {
 	})
 }
 
+// A process restarted under the same instance name reads the same pending list, and what its
+// predecessor was handed and never acknowledged is on it. That is not a lost answer of this
+// process: a wake among it may name a session whose lease the predecessor still holds, and
+// handed out now it would find that lease live and be retired. The claim delay outlasts a
+// lease, which is why such entries are a claim's.
+func TestWhatAPredecessorUnderTheSameNameLeftPendingIsLeftToAClaim(t *testing.T) {
+	cutBackends(t, func(t *testing.T, f cutFleet) {
+		const claimDelay = 2 * cutWindow
+
+		predecessor := f.streamsWith(t, &redisstream.Options{Instance: "inst-x", Block: 50 * time.Millisecond, ClaimMinIdle: claimDelay})
+		if _, err := read(t, predecessor, "s1"); err != nil {
+			t.Fatalf("priming read: %v", err)
+		}
+		writeCommand(t, f.fleet, f.client.Keys().Control(), &protocol.Command{
+			V: protocol.Version, ID: "inherited-wake", Type: protocol.CommandSessionWake, SID: "s9",
+			TS: 1787000000000, Payload: []byte(`{"desired":"connected"}`),
+		})
+		writeCommand(t, f.fleet, f.client.Keys().Commands("s1"), command("inherited-status", "s1", ""))
+		if taken, err := read(t, predecessor, "s1"); err != nil || len(taken) != 2 {
+			t.Fatalf("the predecessor read %v (err=%v), want both commands", ids(taken), err)
+		}
+
+		// The predecessor dies holding both. Idle times are whole milliseconds, so the restart
+		// is a few of them later.
+		time.Sleep(5 * time.Millisecond)
+		restarted := f.streamsWith(t, &redisstream.Options{Instance: "inst-x", Block: 50 * time.Millisecond, ClaimMinIdle: claimDelay})
+		if delivered, err := read(t, restarted, "s1"); err != nil || len(delivered) != 0 {
+			t.Fatalf("the restarted process handed out %v (err=%v), want what its predecessor held left to a claim", ids(delivered), err)
+		}
+
+		// And a claim does take them, once the delay has passed.
+		time.Sleep(claimDelay)
+		ctx := context.Background()
+		wakes, err := restarted.ClaimControl(ctx)
+		if err != nil || !slices.Equal(ids(wakes), []string{"inherited-wake"}) {
+			t.Fatalf("the claim took %v (err=%v), want the wake", ids(wakes), err)
+		}
+		sessions, err := restarted.Claim(ctx, []string{"s1"})
+		if err != nil || !slices.Equal(ids(sessions), []string{"inherited-status"}) {
+			t.Fatalf("the claim took %v (err=%v), want the session command", ids(sessions), err)
+		}
+	})
+}
+
 // A max age as long as the claim delay would hand a recovered wake out already claimable.
 func TestAReadBackMaxAgeNotShorterThanTheClaimDelayIsRefused(t *testing.T) {
 	f := newFleet(t)

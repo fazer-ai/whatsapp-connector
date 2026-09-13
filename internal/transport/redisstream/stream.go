@@ -96,6 +96,10 @@ type Streams struct {
 	pagesOut  int
 	lettingGo map[string][]string
 
+	// started is when this process began reading, and anything pending here that was
+	// delivered before it is a predecessor's. See Read.
+	started time.Time
+
 	// afterPage runs once a page has been looked at and before what it hands out is, and is
 	// nil outside tests: it is where a claim running alongside a read would interleave.
 	afterPage func()
@@ -146,7 +150,8 @@ func New(client *redisx.Client, opts Options) (*Streams, error) {
 			opts.ReadBackMaxAge, opts.ClaimMinIdle)
 	}
 	return &Streams{
-		client: client, opts: opts, groups: newGroupCache(),
+		started: time.Now(),
+		client:  client, opts: opts, groups: newGroupCache(),
 		inFlight:    make(map[string]struct{}),
 		unrun:       make(map[string][]unrunEntry),
 		marks:       make(map[string]string),
@@ -277,8 +282,10 @@ func (s *Streams) blockWithin(ctx context.Context) (time.Duration, bool) {
 // lost, or sent again and come back empty -- stays apart too, for a later claim to hand out
 // as the redelivery it is. And the history is this consumer's alone, so what is pending
 // under a peer, which may be running there right now, is never read. On a stream no read has been
-// through yet, the mark is the start, and what an earlier process under this name left
-// pending comes back the same way. A group recreated under the read, which starts over at
+// through yet, the mark is the start. What an earlier process under this name left pending
+// is not this process's lost answer, though: it was delivered before this one started, it
+// may be a wake for a session whose lease that process still holds, and the claim delay,
+// which outlasts a lease, is what it waits for. The history skips it, for a claim. A group recreated under the read, which starts over at
 // the beginning of the stream, starts the mark over too: `>` handing out an entry at or
 // below it is how that shows.
 //
@@ -417,6 +424,10 @@ func (s *Streams) readHistory(ctx context.Context, streams []string, answered ma
 	}()
 
 	sent := time.Now()
+	// Anything idle for longer than this was delivered before this process started. Taken
+	// as the page is sent, the script runs later still, so an entry this process was handed
+	// right at its start may count as a predecessor's, and waits for a claim.
+	uptime := sent.Sub(s.started)
 	raw, err := pendingPastScript.Run(ctx, s.client, streams, args...).Result()
 	if err != nil {
 		return nil, fmt.Errorf("redisstream: read commands back: %w", err)
@@ -447,6 +458,9 @@ func (s *Streams) readHistory(ctx context.Context, streams []string, answered ma
 				entry.Values = values
 			}
 			_, entry.fresh = answered[page.stream][entry.ID]
+			if !entry.fresh && !trimmed && entry.idle > uptime {
+				continue
+			}
 			if page.stream == control && !entry.fresh && !trimmed && entry.idle+trip > s.opts.ReadBackMaxAge {
 				continue
 			}
