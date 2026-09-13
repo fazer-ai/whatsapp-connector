@@ -419,3 +419,49 @@ func TestAReceivedPayloadIsForgottenOnceItsEntryIsAcknowledged(t *testing.T) {
 		t.Fatal("the payload is still kept after its entry was acknowledged")
 	}
 }
+
+// A read hands out what a page carried after it has looked at the page, and a claim on the
+// heartbeat can run in between. The entry is below the mark by then, so the claim does not
+// keep it apart, and unless the read has already marked it as running, the claim takes it
+// too and the command runs twice.
+func TestAClaimBetweenAPageAndItsHandOutTakesNothingTheReadHandsOut(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+	ctx := context.Background()
+	stream := client.Keys().Commands("s1")
+
+	a, err := New(client, Options{Instance: "inst-a", Block: 50 * time.Millisecond, ClaimMinIdle: time.Millisecond, ReadCount: 8})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, err := a.Read(ctx, []string{"s1"}); err != nil {
+		t.Fatalf("priming Read: %v", err)
+	}
+	// A read whose answer never arrived: the command is pending here, unseen, and old
+	// enough for the heartbeat's claim.
+	writeOne(t, client, stream, "s1")
+	if err := client.XReadGroup(ctx, &redis.XReadGroupArgs{
+		Group: ConsumerGroup, Consumer: "inst-a", Streams: []string{stream, ">"}, Block: -1,
+	}).Err(); err != nil {
+		t.Fatalf("XREADGROUP: %v", err)
+	}
+	time.Sleep(5 * time.Millisecond)
+
+	var claimed []transport.Delivery
+	var claimErr error
+	a.afterPage = func() {
+		a.afterPage = nil
+		claimed, claimErr = a.Claim(ctx, []string{"s1"})
+	}
+	read, err := a.Read(ctx, []string{"s1"})
+	if err != nil || len(read) != 1 {
+		t.Fatalf("read %d commands (err=%v), want the one the lost answer left", len(read), err)
+	}
+	if claimErr != nil || len(claimed) != 0 {
+		t.Fatalf("the claim took %d (err=%v) of what the read was handing out, want nothing", len(claimed), claimErr)
+	}
+}

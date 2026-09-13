@@ -95,6 +95,10 @@ type Streams struct {
 	// was acknowledged meanwhile, let go once none is left.
 	pagesOut  int
 	lettingGo map[string][]string
+
+	// afterPage runs once a page has been looked at and before what it hands out is, and is
+	// nil outside tests: it is where a claim running alongside a read would interleave.
+	afterPage func()
 }
 
 // unrunEntry is one entry given back without being carried out, and the idle time it
@@ -467,7 +471,17 @@ func (s *Streams) readHistory(ctx context.Context, streams []string, answered ma
 				delete(s.received, page.stream)
 			}
 		}
+		// Marked as running before the lock is let go, which is what a claim checks under
+		// it: past the mark the entry is no longer kept apart, and a claim in the gap would
+		// take it too.
+		held := make([]func(), len(handing))
+		for i, entry := range handing {
+			held[i] = s.hold(page.stream, entry.ID)
+		}
 		s.marksMu.Unlock()
+		if s.afterPage != nil {
+			s.afterPage()
+		}
 
 		// Handed out as read for the first time, whichever answer it first arrived in: nobody
 		// has run it, and whoever sent it is still waiting. Unless an answer lost left it
@@ -475,10 +489,11 @@ func (s *Streams) readHistory(ctx context.Context, streams []string, answered ma
 		// redelivery whose sender may have stopped listening.
 		var taken []transport.Delivery
 		var ids []string
-		for _, entry := range handing {
+		for i, entry := range handing {
 			aged := !entry.fresh && entry.idle+trip >= s.opts.ClaimMinIdle
-			one, id := s.deliveriesWithIDs([]redis.XStream{{Stream: page.stream, Messages: []redis.XMessage{entry.XMessage}}}, aged)
-			taken, ids = append(taken, one...), append(ids, id...)
+			if delivery, ok := s.deliver(page.stream, entry.XMessage, held[i], aged); ok {
+				taken, ids = append(taken, delivery), append(ids, entry.ID)
+			}
 		}
 		// A read entry starts at zero idle and stays there until somebody touches it, so
 		// one this instance gives back unrun is claimable by nobody — not by `>`, which
@@ -492,10 +507,14 @@ func (s *Streams) readHistory(ctx context.Context, streams []string, answered ma
 	return out, nil
 }
 
-// keepApart keeps apart what a claim is about to take past a stream's mark. See Read.
-func (s *Streams) keepApart(stream string, ids []string) {
+// keepApart keeps apart what a claim is about to take past a stream's mark, and returns what
+// is still to take. A read marks what it hands out as running under the same lock, so an
+// entry a read has just handed out, which the list the claim works from may predate, is
+// dropped here. See Read.
+func (s *Streams) keepApart(stream string, ids []string) []string {
 	s.marksMu.Lock()
 	defer s.marksMu.Unlock()
+	ids = slices.DeleteFunc(ids, func(id string) bool { return s.running(stream, id) })
 	for _, id := range ids {
 		if !entryAfter(id, s.marks[stream]) {
 			continue
@@ -505,6 +524,7 @@ func (s *Streams) keepApart(stream string, ids []string) {
 		}
 		s.claimedPast[stream][id] = struct{}{}
 	}
+	return ids
 }
 
 // letGo stops keeping anything for acknowledged entries: they are off the pending list, and
@@ -815,7 +835,9 @@ func (s *Streams) claim(ctx context.Context, streams []string, minIdle time.Dura
 		// goroutine can page an entry this claim has already moved here. And kept apart
 		// whatever the answer, since one lost, or one sent again and come back empty, leaves
 		// entries moved here all the same; they are a later claim's. See Read.
-		s.keepApart(stream, ids)
+		if ids = s.keepApart(stream, ids); len(ids) == 0 {
+			continue
+		}
 		messages, err := s.client.XClaim(ctx, &redis.XClaimArgs{
 			Stream:   stream,
 			Group:    ConsumerGroup,
@@ -963,26 +985,33 @@ func (s *Streams) sessionStreams(sids []string) []string {
 func (s *Streams) deliveriesWithIDs(result []redis.XStream, redelivered bool) (out []transport.Delivery, ids []string) {
 	for _, stream := range result {
 		for _, message := range stream.Messages {
-			command, err := protocol.ParseCommand(toFields(message.Values))
-			if err != nil {
-				// A frame this instance cannot read is not a frame a retry will fix,
-				// and leaving it pending blocks nothing but fills the PEL forever. It
-				// is acknowledged and dropped; the sender hears about it through the
-				// reply it is waiting for timing out.
-				s.ackUnreadable(stream.Stream, message.ID)
-				continue
+			if delivery, ok := s.deliver(stream.Stream, message, s.hold(stream.Stream, message.ID), redelivered); ok {
+				out = append(out, delivery)
+				ids = append(ids, message.ID)
 			}
-			held := s.hold(stream.Stream, message.ID)
-			out = append(out, transport.Delivery{
-				Command:     command,
-				Ack:         s.acker(stream.Stream, message.ID, held),
-				Release:     held,
-				Redelivered: redelivered,
-			})
-			ids = append(ids, message.ID)
 		}
 	}
 	return out, ids
+}
+
+// deliver makes a delivery of an entry already marked as running, and reports false for one
+// it cannot read.
+func (s *Streams) deliver(stream string, message redis.XMessage, held func(), redelivered bool) (transport.Delivery, bool) {
+	command, err := protocol.ParseCommand(toFields(message.Values))
+	if err != nil {
+		// A frame this instance cannot read is not a frame a retry will fix, and leaving
+		// it pending blocks nothing but fills the PEL forever. It is acknowledged and
+		// dropped; the sender hears about it through the reply it is waiting for timing out.
+		held()
+		s.ackUnreadable(stream, message.ID)
+		return transport.Delivery{}, false
+	}
+	return transport.Delivery{
+		Command:     command,
+		Ack:         s.acker(stream, message.ID, held),
+		Release:     held,
+		Redelivered: redelivered,
+	}, true
 }
 
 // entryAfter reports whether stream entry id a comes after b. Everything comes after an
