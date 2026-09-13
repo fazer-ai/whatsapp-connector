@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -258,7 +259,10 @@ func (s *Streams) blockWithin(ctx context.Context) (time.Duration, bool) {
 // seen. Only a read moves it. A claim hands out entries past it too -- a peer's, or one a
 // peer gave back -- but a claim says nothing about the entries before the one it took, and
 // one of those may be a lost answer's; those claimed entries are kept apart instead, and a
-// page skips them. And the history is this consumer's alone, so what is pending under a
+// page skips them. Claims run on another goroutine, and so do the acknowledgements of what
+// they hand out, so both have to be visible to a page already on its way: a claim keeps its
+// entries apart before it sends XCLAIM, and a page skips what was kept apart when it was
+// sent as well as what is now. And the history is this consumer's alone, so what is pending under a
 // peer, which may be running there right now, is never read. On a stream no read has been
 // through yet, the mark is the start, and what an earlier process under this name left
 // pending comes back the same way.
@@ -326,8 +330,14 @@ func (s *Streams) Read(ctx context.Context, sids []string) ([]transport.Delivery
 		}
 		return nil, fmt.Errorf("redisstream: read commands: %w", err)
 	}
+	// Entry ids are unique within a stream, not across streams, and only the control
+	// stream's ids are asked about.
+	control := s.client.Keys().Control()
 	answered := make(map[string]struct{})
 	for _, stream := range answer {
+		if stream.Stream != control {
+			continue
+		}
 		for _, message := range stream.Messages {
 			answered[message.ID] = struct{}{}
 		}
@@ -337,13 +347,19 @@ func (s *Streams) Read(ctx context.Context, sids []string) ([]transport.Delivery
 
 // readHistory hands out what is pending under this consumer past the mark on each stream.
 // It never waits, and it only looks: an answer it loses leaves everything as it found it,
-// for the next one. answered is what the `>` of the same read carried.
+// for the next one. answered is what the `>` of the same read carried on the control stream.
 func (s *Streams) readHistory(ctx context.Context, streams []string, answered map[string]struct{}) ([]transport.Delivery, error) {
 	args := make([]any, 0, len(streams)+3)
 	args = append(args, ConsumerGroup, s.opts.Instance, s.opts.ReadCount)
+	// What is kept apart as the page is sent: an entry acknowledged after this is still on
+	// the page, and forgotten by the time the page is looked at.
+	keptApart := make(map[string]map[string]struct{})
 	s.marksMu.Lock()
 	for _, stream := range streams {
 		args = append(args, s.marks[stream])
+		if kept := s.claimedPast[stream]; len(kept) > 0 {
+			keptApart[stream] = maps.Clone(kept)
+		}
 	}
 	s.marksMu.Unlock()
 
@@ -362,7 +378,8 @@ func (s *Streams) readHistory(ctx context.Context, streams []string, answered ma
 		handing := make([]redis.XMessage, 0, len(page.entries))
 		s.marksMu.Lock()
 		for _, entry := range page.entries {
-			if _, claimed := s.claimedPast[page.stream][entry.ID]; claimed {
+			_, keptThen := keptApart[page.stream][entry.ID]
+			if _, keptNow := s.claimedPast[page.stream][entry.ID]; keptThen || keptNow {
 				continue
 			}
 			if _, fresh := answered[entry.ID]; page.stream == control && !fresh && entry.idle > s.opts.ReadBackMaxAge {
@@ -398,8 +415,9 @@ func (s *Streams) readHistory(ctx context.Context, streams []string, answered ma
 	return out, nil
 }
 
-// noteClaimed keeps apart what a claim handed out past a stream's mark. See Read.
-func (s *Streams) noteClaimed(stream string, ids []string) {
+// keepApart keeps apart what a claim is about to take past a stream's mark, and returns
+// what was not kept apart already. See Read.
+func (s *Streams) keepApart(stream string, ids []string) (added []string) {
 	s.marksMu.Lock()
 	defer s.marksMu.Unlock()
 	for _, id := range ids {
@@ -409,16 +427,23 @@ func (s *Streams) noteClaimed(stream string, ids []string) {
 		if s.claimedPast[stream] == nil {
 			s.claimedPast[stream] = make(map[string]struct{})
 		}
-		s.claimedPast[stream][id] = struct{}{}
+		if _, kept := s.claimedPast[stream][id]; !kept {
+			s.claimedPast[stream][id] = struct{}{}
+			added = append(added, id)
+		}
 	}
+	return added
 }
 
-// forgetClaimed drops an acknowledged entry from what claims handed out: it is off the
-// pending list, and no page will ever carry it to be passed.
-func (s *Streams) forgetClaimed(stream, id string) {
+// letGo stops keeping entries apart: acknowledged, they are off the pending list and no
+// page will ever carry them to be passed; not handed out by the claim that kept them apart,
+// they are not a claim's to run.
+func (s *Streams) letGo(stream string, ids ...string) {
 	s.marksMu.Lock()
 	defer s.marksMu.Unlock()
-	delete(s.claimedPast[stream], id)
+	for _, id := range ids {
+		delete(s.claimedPast[stream], id)
+	}
 }
 
 // pendingPastScript returns, for each stream, up to a count of the entries pending under
@@ -665,6 +690,11 @@ func (s *Streams) claim(ctx context.Context, streams []string, minIdle time.Dura
 			continue
 		}
 
+		// Kept apart before the claim is sent, not once it answers: a read on another
+		// goroutine can page an entry this claim has already moved here. Only what this
+		// claim kept apart is its to let go of again; the rest was kept apart by an earlier
+		// claim that handed it out, and given back, it is still a claim's.
+		added := s.keepApart(stream, ids)
 		messages, err := s.client.XClaim(ctx, &redis.XClaimArgs{
 			Stream:   stream,
 			Group:    ConsumerGroup,
@@ -674,15 +704,19 @@ func (s *Streams) claim(ctx context.Context, streams []string, minIdle time.Dura
 		}).Result()
 		switch {
 		case isNoGroup(err):
+			s.letGo(stream, added...)
 			s.groups.forget(stream)
 			continue
 		case err != nil && !errors.Is(err, redis.Nil):
+			// Whatever it moved here with its answer lost, nobody runs: the history
+			// hands it out.
+			s.letGo(stream, added...)
 			return fail(fmt.Errorf("redisstream: claim %s: %w", stream, err))
 		}
-		taken, ids := s.deliveriesWithIDs([]redis.XStream{{Stream: stream, Messages: messages}}, true)
-		s.noteClaimed(stream, ids)
+		taken, handed := s.deliveriesWithIDs([]redis.XStream{{Stream: stream, Messages: messages}}, true)
+		s.letGo(stream, slices.DeleteFunc(added, func(id string) bool { return slices.Contains(handed, id) })...)
 		if minIdle > 0 {
-			s.rememberAge(stream, minIdle, taken, ids)
+			s.rememberAge(stream, minIdle, taken, handed)
 		}
 		claimed = append(claimed, taken...)
 	}
@@ -854,7 +888,7 @@ func (s *Streams) acker(stream, id string, release func()) func(context.Context)
 			return fmt.Errorf("redisstream: ack %s on %s: %w", id, stream, err)
 		}
 		release()
-		s.forgetClaimed(stream, id)
+		s.letGo(stream, id)
 		return nil
 	}
 }

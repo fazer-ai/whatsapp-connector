@@ -145,6 +145,22 @@ func (f cutFleet) loseTheAnswer(t *testing.T, how string, streams *redisstream.S
 	return delivered
 }
 
+// writeCommandAt is writeCommand at an entry id of the test's choosing.
+func writeCommandAt(t *testing.T, f fleet, stream, id string, cmd *protocol.Command) {
+	t.Helper()
+	fields, err := cmd.Fields()
+	if err != nil {
+		t.Fatalf("render command: %v", err)
+	}
+	values := make(map[string]any, len(fields))
+	for key, value := range fields {
+		values[key] = value
+	}
+	if err := f.client.XAdd(context.Background(), &redis.XAddArgs{Stream: stream, ID: id, Values: values}).Err(); err != nil {
+		t.Fatalf("XAdd %s: %v", id, err)
+	}
+}
+
 // pendingUnder names the consumer a command is pending under, or "" when it is not pending.
 func (f cutFleet) pendingUnder(t *testing.T, commandID string, sids ...string) string {
 	t.Helper()
@@ -351,7 +367,9 @@ func TestARecoveryThatLosesItsOwnAnswerIsTriedAgain(t *testing.T) {
 // lost or not, and the peer's claim would never find it old enough.
 func TestReadingBackAWakeWhoseAnswersKeepGettingLostLeavesItForAPeer(t *testing.T) {
 	cutBackends(t, func(t *testing.T, f cutFleet) {
-		const claimDelay = 300 * time.Millisecond
+		// Longer than the held answer each lost read leaves behind, so a read that set the
+		// wake's idle time back to zero would leave it too young for the peer.
+		const claimDelay = 3 * cutWindow
 
 		sick := f.streams(t, "inst-sick")
 		if _, err := read(t, sick, "s1"); err != nil {
@@ -362,16 +380,17 @@ func TestReadingBackAWakeWhoseAnswersKeepGettingLostLeavesItForAPeer(t *testing.
 			TS: 1787000000000, Payload: []byte(`{"desired":"connected"}`),
 		}
 		writeCommand(t, f.fleet, f.client.Keys().Control(), wake)
+		delivered := time.Now()
 		f.loseTheAnswer(t, "held past the window", sick, "inst-sick", "starved-wake", "s1")
 
-		// Every read after it loses its answer too, for well past the claim delay, and each
-		// one did reach the server: the history it read carried the wake.
-		lost := 0
-		for start := time.Now(); time.Since(start) < 3*claimDelay; lost++ {
+		// Every read after it loses its answer too, and each one did reach the server: the
+		// history it read carried the wake.
+		for range 3 {
 			f.loseTheAnswer(t, "held past the window", sick, "inst-sick", "starved-wake", "s1")
 		}
-		if lost < 3 {
-			t.Fatalf("only %d reads lost their answer inside three claim delays; the test proves nothing", lost)
+		// The age is the subject: the wake has sat for the claim delay since `>` delivered it.
+		if left := claimDelay - time.Since(delivered); left > 0 {
+			time.Sleep(left)
 		}
 
 		peer, err := redisstream.New(f.client, redisstream.Options{Instance: "inst-peer", ClaimMinIdle: claimDelay})
@@ -487,6 +506,181 @@ func TestASessionCommandReadBackLateIsStillHandedOutInOrder(t *testing.T) {
 		if want := []string{"aged-connect", "aged-disconnect"}; !slices.Equal(order, want) {
 			t.Fatalf("handed out %v, want %v", order, want)
 		}
+	})
+}
+
+// Entry ids are unique within a stream, not across streams, and two written in the same
+// millisecond on different streams share one. What the `>` carried on a session stream says
+// nothing about the control stream's entry with the same id, which is still the wake a read
+// lost long ago.
+func TestAWakeSharingAnIDWithWhatTheReadCarriedIsStillLeftToAClaim(t *testing.T) {
+	cutBackends(t, func(t *testing.T, f cutFleet) {
+		streams := f.streamsWith(t, &redisstream.Options{
+			Instance: "inst-a", Block: 50 * time.Millisecond, ClaimMinIdle: cutClaimMinIdle, ReadBackMaxAge: cutWindow / 2,
+		})
+		if _, err := read(t, streams, "s1"); err != nil {
+			t.Fatalf("priming read: %v", err)
+		}
+		const shared = "5-1"
+		writeCommandAt(t, f.fleet, f.client.Keys().Control(), shared, &protocol.Command{
+			V: protocol.Version, ID: "twin-wake", Type: protocol.CommandSessionWake, SID: "s9",
+			TS: 1787000000000, Payload: []byte(`{"desired":"connected"}`),
+		})
+		f.loseTheAnswer(t, "held past the window", streams, "inst-a", "twin-wake", "s1")
+		writeCommandAt(t, f.fleet, f.client.Keys().Commands("s1"), shared, command("twin-status", "s1", ""))
+
+		delivered, err := read(t, streams, "s1")
+		if err != nil || !slices.Equal(ids(delivered), []string{"twin-status"}) {
+			t.Fatalf("handed out %v (err=%v), want only the session command the read carried", ids(delivered), err)
+		}
+	})
+}
+
+// Claims run on another goroutine than reads, and so do the acknowledgements of what they
+// hand out. A read pages this consumer's history in one trip and decides what to skip after
+// it answers, so whatever a claim does in between has to be visible to that decision.
+func TestAReadRacingAClaimHandsOutNothingTheClaimDoes(t *testing.T) {
+	cutBackends(t, func(t *testing.T, f cutFleet) {
+		adopter, dead := f.streams(t, "inst-a"), f.streams(t, "inst-dead")
+		for _, streams := range []*redisstream.Streams{adopter, dead} {
+			if _, err := read(t, streams, "s1"); err != nil {
+				t.Fatalf("priming read: %v", err)
+			}
+		}
+		stream := f.client.Keys().Commands("s1")
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		t.Run("acknowledged while the page is on its way", func(t *testing.T) {
+			writeCommand(t, f.fleet, stream, command("acked-claim", "s1", ""))
+			if taken, err := read(t, dead, "s1"); err != nil || len(taken) != 1 {
+				t.Fatalf("the peer read %v (err=%v), want the command", ids(taken), err)
+			}
+			claimed, err := adopter.ClaimSessions(ctx, []string{"s1"})
+			if err != nil || !slices.Equal(ids(claimed), []string{"acked-claim"}) {
+				t.Fatalf("claimed %v (err=%v), want the peer's command", ids(claimed), err)
+			}
+
+			release := make(chan struct{})
+			caught := f.proxy.Hold("acked-claim", release)
+			var delivered []transport.Delivery
+			done := make(chan error, 1)
+			go func() {
+				var err error
+				delivered, err = adopter.Read(ctx, []string{"s1"})
+				done <- err
+			}()
+			<-caught
+			if err := claimed[0].Ack(ctx); err != nil {
+				t.Fatalf("Ack: %v", err)
+			}
+			close(release)
+			if err := <-done; err != nil || len(delivered) != 0 {
+				t.Fatalf("the read handed out %v (err=%v), want nothing: the claim ran it", ids(delivered), err)
+			}
+		})
+
+		t.Run("claimed while the page is on its way", func(t *testing.T) {
+			writeCommand(t, f.fleet, stream, command("racing-claim", "s1", ""))
+			if taken, err := read(t, dead, "s1"); err != nil || len(taken) != 1 {
+				t.Fatalf("the peer read %v (err=%v), want the command", ids(taken), err)
+			}
+
+			// The claim's answer is held, so the claim has moved the command here and not yet
+			// heard that it did.
+			release := make(chan struct{})
+			caught := f.proxy.Hold("racing-claim", release)
+			var claimed []transport.Delivery
+			done := make(chan error, 1)
+			go func() {
+				var err error
+				claimed, err = adopter.ClaimSessions(ctx, []string{"s1"})
+				done <- err
+			}()
+			<-caught
+			delivered, err := adopter.Read(ctx, []string{"s1"})
+			close(release)
+			if claimErr := <-done; claimErr != nil || !slices.Equal(ids(claimed), []string{"racing-claim"}) {
+				t.Fatalf("claimed %v (err=%v), want the peer's command", ids(claimed), claimErr)
+			}
+			if err != nil || len(delivered) != 0 {
+				t.Fatalf("the read handed out %v (err=%v), want nothing: the claim hands it out", ids(delivered), err)
+			}
+			ackAll(t, claimed)
+		})
+	})
+}
+
+// A claim whose answer is lost has still moved what it took here, where nobody runs it, and
+// the next read hands out what that claim kept apart. What was kept apart before it, by a
+// claim that handed it out and had it given back, is still a claim's: a read handing it out
+// would run a command given back on every read after.
+func TestAClaimThatLostItsAnswerLetsGoOnlyOfWhatItKeptApart(t *testing.T) {
+	cutBackends(t, func(t *testing.T, f cutFleet) {
+		adopter, dead := f.streams(t, "inst-a"), f.streams(t, "inst-dead")
+		for _, streams := range []*redisstream.Streams{adopter, dead} {
+			if _, err := read(t, streams, "s1"); err != nil {
+				t.Fatalf("priming read: %v", err)
+			}
+		}
+		stream := f.client.Keys().Commands("s1")
+		abandon := func(commandID string) {
+			t.Helper()
+			writeCommand(t, f.fleet, stream, command(commandID, "s1", ""))
+			if taken, err := read(t, dead, "s1"); err != nil || len(taken) != 1 {
+				t.Fatalf("the peer read %v (err=%v), want the command", ids(taken), err)
+			}
+		}
+		claimLosingItsAnswer := func(commandID string) {
+			t.Helper()
+			release := make(chan struct{})
+			caught := f.proxy.Hold(commandID, release)
+			ctx, cancel := context.WithTimeout(context.Background(), cutWindow)
+			defer cancel()
+			claimed, err := adopter.ClaimSessions(ctx, []string{"s1"})
+			close(release)
+			select {
+			case <-caught:
+			default:
+				t.Fatalf("the claim's answer carrying %s was never held (claimed %v, err=%v)", commandID, ids(claimed), err)
+			}
+			if err == nil || len(claimed) != 0 {
+				t.Fatalf("the claim whose answer was lost handed out %v (err=%v)", ids(claimed), err)
+			}
+			if holder := f.pendingUnder(t, commandID, "s1"); holder != "inst-a" {
+				t.Fatalf("%s is pending under %q after the claim, want inst-a", commandID, holder)
+			}
+		}
+
+		t.Run("a peer's command", func(t *testing.T) {
+			abandon("lost-claim")
+			claimLosingItsAnswer("lost-claim")
+			delivered, err := read(t, adopter, "s1")
+			if err != nil || !slices.Equal(ids(delivered), []string{"lost-claim"}) {
+				t.Fatalf("the next read handed out %v (err=%v), want the command the claim moved here", ids(delivered), err)
+			}
+			ackAll(t, delivered)
+		})
+
+		t.Run("a command already claimed and given back", func(t *testing.T) {
+			abandon("given-back")
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			claimed, err := adopter.ClaimSessions(ctx, []string{"s1"})
+			if err != nil || !slices.Equal(ids(claimed), []string{"given-back"}) {
+				t.Fatalf("claimed %v (err=%v), want the peer's command", ids(claimed), err)
+			}
+			claimed[0].Release()
+			claimLosingItsAnswer("given-back")
+			if delivered, err := read(t, adopter, "s1"); err != nil || len(delivered) != 0 {
+				t.Fatalf("the next read handed out %v (err=%v), want nothing: it was given back to a claim", ids(delivered), err)
+			}
+			again, err := adopter.ClaimSessions(ctx, []string{"s1"})
+			if err != nil || !slices.Equal(ids(again), []string{"given-back"}) {
+				t.Fatalf("claimed %v (err=%v), want the command given back", ids(again), err)
+			}
+			ackAll(t, again)
+		})
 	})
 }
 

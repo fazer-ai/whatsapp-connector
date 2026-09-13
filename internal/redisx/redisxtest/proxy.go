@@ -110,12 +110,15 @@ func (p *Proxy) arm(marker string, release <-chan struct{}) <-chan struct{} {
 
 // spring takes the first trap what the server just wrote matches, if any. seen is the
 // chunk that just arrived with the end of what came before it on the same connection in
-// front, so a marker TCP delivered in two pieces is still recognised.
-func (p *Proxy) spring(seen []byte) *trap {
+// front, the first relayed bytes of it, so a marker TCP delivered in two pieces is still
+// recognised. A marker has to end in the new chunk: one wholly inside what was already
+// relayed belongs to an answer the client has, and matching it would catch whatever
+// unrelated answer the connection carries next.
+func (p *Proxy) spring(seen []byte, relayed int) *trap {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for i, candidate := range p.traps {
-		if bytes.Contains(seen, candidate.marker) {
+		if bytes.Contains(seen[max(0, relayed-len(candidate.marker)+1):], candidate.marker) {
 			p.traps = append(p.traps[:i], p.traps[i+1:]...)
 			return candidate
 		}
@@ -168,10 +171,11 @@ func (p *Proxy) relay(client net.Conn, target string) {
 		n, err := server.Read(buf)
 		if n > 0 {
 			seen := slices.Concat(tail, buf[:n])
+			relayed := len(tail)
 			// Longer than any marker a test names, so the piece of one that ended the last
 			// chunk is always still here when the rest arrives.
 			tail = append([]byte(nil), seen[max(0, len(seen)-markerReach):]...)
-			if sprung := p.spring(seen); sprung != nil {
+			if sprung := p.spring(seen, relayed); sprung != nil {
 				close(sprung.caught)
 				if sprung.release == nil {
 					return

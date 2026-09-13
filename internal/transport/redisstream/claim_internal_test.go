@@ -166,3 +166,26 @@ func TestAClaimedEntryIsForgottenOnceAckedOrPassed(t *testing.T) {
 		t.Fatalf("%d claimed entries still kept after a page was read past them, want none", kept)
 	}
 }
+
+// Which claimed entries a page skips and which it has passed both turn on this comparison,
+// and an id is two numbers: compared as text, 1-10 comes before 1-9, and a claim of 1-10
+// past a mark at 1-9 would not be kept apart from the page that reads it.
+func TestEntryIDsCompareAsNumbers(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		a, b  string
+		after bool
+	}{
+		{"1-10", "1-9", true},
+		{"1-9", "1-10", false},
+		{"10-0", "9-5", true},
+		{"9-5", "10-0", false},
+		{"1-0", "1-0", false},
+		{"1-0", "", true},
+	} {
+		if got := entryAfter(tc.a, tc.b); got != tc.after {
+			t.Errorf("entryAfter(%q, %q) = %v, want %v", tc.a, tc.b, got, tc.after)
+		}
+	}
+}
