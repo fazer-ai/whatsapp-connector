@@ -1256,3 +1256,83 @@ func TestMeasuringAFileGivesUpWithTheContext(t *testing.T) {
 		t.Fatalf("measuring a file under a cancelled context answered with %v, want the cancellation", err)
 	}
 }
+
+// Touch is the question a caller with a reference to a file asks: is it still here, and
+// how long is it still promised for. It hands back no bytes, because a caller that only
+// wants to know has no use for a descriptor and one it did not ask for is one it can
+// forget to close.
+func TestTouchDescribesABlobWithoutHandingTheBytesOver(t *testing.T) {
+	t.Parallel()
+
+	store, _ := newStore(t, media.Options{})
+	stored := put(t, store, "os bytes do arquivo", &media.Blob{Mime: "image/jpeg", Filename: "f.jpg"})
+
+	about, touched, err := store.Touch(stored.ID)
+	if err != nil {
+		t.Fatalf("Touch: %v", err)
+	}
+	if about != stored {
+		t.Errorf("Touch describes\n %+v\nand the store wrote\n %+v", about, stored)
+	}
+	if touched.IsZero() {
+		t.Error("Touch answered with no instant, so a caller has nothing to work an expiry out from")
+	}
+}
+
+// The two clocks a blob's life is measured by. The sweep drops on the modification time,
+// which being asked for renews; `StoredAt` is when the write finished and nothing renews
+// it. A caller publishing `StoredAt + TTL` for a blob that has been handed out publishes
+// an expiry that has already passed on a file this instance goes on serving, which is
+// why Touch answers with the instant of the touch instead.
+func TestTouchRenewsABlobsLifeAndSaysWhenFrom(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	store, _ := newStore(t, media.Options{TTL: time.Hour, Now: func() time.Time { return now }})
+	stored := put(t, store, "os bytes do arquivo", &media.Blob{})
+
+	// Most of a TTL later, somebody asks about it.
+	now = now.Add(50 * time.Minute)
+	about, touched, err := store.Touch(stored.ID)
+	if err != nil {
+		t.Fatalf("Touch: %v", err)
+	}
+	if !touched.Equal(now) {
+		t.Errorf("Touch answered %s and it is %s", touched, now)
+	}
+	if about.StoredAt != stored.StoredAt {
+		t.Errorf("Touch reported it stored at %d and it was written at %d", about.StoredAt, stored.StoredAt)
+	}
+
+	// And the renewal is real: past the expiry it was written under, the sweep leaves it.
+	now = now.Add(20 * time.Minute)
+	if _, _, err := store.Sweep(t.Context()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if _, _, err := store.Touch(stored.ID); err != nil {
+		t.Errorf("a blob asked about ten minutes ago was swept on a TTL of an hour: %v", err)
+	}
+}
+
+// A blob that is not here answers the way Open does, and for the same reason: it is the
+// ordinary case, not an exceptional one. The description without the bytes is one of the
+// ways -- a write that was interrupted, a file removed under the store -- and it is not a
+// blob either.
+func TestTouchSaysNotFoundForEveryWayABlobIsNotThere(t *testing.T) {
+	t.Parallel()
+
+	store, root := newStore(t, media.Options{})
+	stored := put(t, store, "os bytes do arquivo", &media.Blob{})
+	if err := os.Remove(filepath.Join(root, stored.ID[5:7], stored.ID)); err != nil {
+		t.Fatalf("take the bytes out from under the store: %v", err)
+	}
+
+	for _, id := range []string{
+		stored.ID, "blob_000102030405060708090a0b",
+		"../secret", "blob_../../secret", "", "blob_", "blob_zzzz", "secret",
+	} {
+		if _, _, err := store.Touch(id); !errors.Is(err, media.ErrNotFound) {
+			t.Errorf("Touch(%q) answered with %v, want ErrNotFound", id, err)
+		}
+	}
+}

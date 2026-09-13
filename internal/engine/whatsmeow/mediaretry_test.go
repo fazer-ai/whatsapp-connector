@@ -27,7 +27,7 @@ import (
 func TestAFileWhatsAppDroppedIsAskedForAgainAndFetchedFromTheNewPath(t *testing.T) {
 	t.Parallel()
 
-	session, phone := reuploadSession(t, "3EB0GONE")
+	session, phone, _ := reuploadSession(t, "3EB0GONE")
 	phone.answersWith(reuploaded("/v/fresh-path"))
 
 	ref := refetch(t, session, "3EB0GONE", nil)
@@ -92,7 +92,7 @@ func TestAFileAlreadyGoneWhenItArrivedCanStillBeAskedForAfterwards(t *testing.T)
 func TestAKeyThatLapsedIsNotAskedAboutAtAll(t *testing.T) {
 	t.Parallel()
 
-	session, phone := reuploadSession(t, "3EB0403")
+	session, phone, _ := reuploadSession(t, "3EB0403")
 	session.download = func(context.Context, *wm.Client, wm.DownloadableMessage, media.File) error {
 		return wm.ErrMediaDownloadFailedWith403
 	}
@@ -120,7 +120,7 @@ func TestAPhoneThatWillNotUploadTheFileAgainLeavesTheDownloadsOwnAnswer(t *testi
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			session, phone := reuploadSession(t, "3EB0NOPE")
+			session, phone, _ := reuploadSession(t, "3EB0NOPE")
 			phone.answersWith(tc.answer)
 
 			_, err := refetchErr(session, "3EB0NOPE", nil)
@@ -139,7 +139,7 @@ func TestAPhoneThatWillNotUploadTheFileAgainLeavesTheDownloadsOwnAnswer(t *testi
 func TestAPhoneThatNeverAnswersIsWorthAskingAgainRatherThanFinal(t *testing.T) {
 	t.Parallel()
 
-	session, phone := reuploadSession(t, "3EB0QUIET")
+	session, phone, _ := reuploadSession(t, "3EB0QUIET")
 	phone.answersWith(nil)
 
 	deadline, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
@@ -175,15 +175,27 @@ func TestAnAnswerNobodyIsWaitingForIsDropped(t *testing.T) {
 // reuploadSession is a session holding the coordinates of one message whose file
 // WhatsApp has dropped: the first download answers 404, and what happens next is what
 // each test is about.
-func reuploadSession(t *testing.T, messageID string) (*Session, *phoneAsked) {
+//
+// The blob the message was published with goes, and that is not scene setting. A file
+// still on this instance's disk is handed straight back, so a session that kept it never
+// reaches the 404, never asks the phone, and every test below would pass without any of
+// the path it was written for having run. What these describe is a file WhatsApp has
+// dropped *and* this instance no longer holds, which is the only state the sender's phone
+// is worth asking in.
+//
+// The root is returned for the one test that has to take a blob away a second time.
+func reuploadSession(t *testing.T, messageID string) (*Session, *phoneAsked, string) {
 	t.Helper()
 
-	session, downloads := mediaSession(t, media.Options{})
+	root := t.TempDir()
+	session, downloads := mediaSession(t, media.Options{Root: root})
 	downloads.answer([]byte("os bytes originais"), nil)
 	connect(session)
-	if _, acknowledged := deliver(t, session, imageEvent(messageID), 1); !acknowledged {
+	emissions, acknowledged := deliver(t, session, imageEvent(messageID), 1)
+	if !acknowledged {
 		t.Fatal("a media message with a file was left unacknowledged")
 	}
+	removeBlob(t, root, mediaContentOf(t, emissions[0]).Ref.ID)
 
 	kept, found, err := session.store.MediaPart(t.Context(), messageID)
 	if err != nil || !found {
@@ -200,7 +212,7 @@ func reuploadSession(t *testing.T, messageID string) (*Session, *phoneAsked) {
 		_, err := file.Write([]byte("os bytes que o telefone subiu de novo"))
 		return err
 	}
-	return session, phone
+	return session, phone, root
 }
 
 // phoneAsked stands in for the sender's phone: it counts what it was asked and answers
@@ -303,7 +315,7 @@ func TestARowThatCannotAddressAReceiptIsNotAskedAbout(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			session, phone := reuploadSession(t, "3EB0NONAME")
+			session, phone, _ := reuploadSession(t, "3EB0NONAME")
 			phone.answersWith(nil)
 			forgetWhoSent(t, session, "3EB0NONAME", tc.forget)
 
@@ -342,7 +354,7 @@ func forgetWhoSent(t *testing.T, session *Session, messageID string, forget func
 func TestAPhoneIsWaitedOnEvenWhenTheCommandNamedNoDeadline(t *testing.T) {
 	t.Parallel()
 
-	session, phone := reuploadSession(t, "3EB0FOREVER")
+	session, phone, _ := reuploadSession(t, "3EB0FOREVER")
 	phone.answersWith(nil)
 	session.reuploadWait = 50 * time.Millisecond
 
@@ -372,7 +384,7 @@ func TestAPhoneIsWaitedOnEvenWhenTheCommandNamedNoDeadline(t *testing.T) {
 func TestABroadcastIsAskedAboutUnderTheChatItWasSentTo(t *testing.T) {
 	t.Parallel()
 
-	session, phone := reuploadSession(t, "3EB0CAST")
+	session, phone, _ := reuploadSession(t, "3EB0CAST")
 	phone.answersWith(reuploaded("/v/fresh-path"))
 	kept, _, err := session.store.MediaPart(t.Context(), "3EB0CAST")
 	if err != nil {
@@ -405,9 +417,10 @@ func TestABroadcastIsAskedAboutUnderTheChatItWasSentTo(t *testing.T) {
 func TestAFreshPathIsRememberedSoTheNextCallerDoesNotAskTwice(t *testing.T) {
 	t.Parallel()
 
-	session, phone := reuploadSession(t, "3EB0KEEP")
+	session, phone, root := reuploadSession(t, "3EB0KEEP")
 	phone.answersWith(reuploaded("/v/fresh-path"))
-	if _, err := refetchErr(session, "3EB0KEEP", nil); err != nil {
+	fresh, err := refetchErr(session, "3EB0KEEP", nil)
+	if err != nil {
 		t.Fatalf("refetch: %v", err)
 	}
 
@@ -421,11 +434,64 @@ func TestAFreshPathIsRememberedSoTheNextCallerDoesNotAskTwice(t *testing.T) {
 
 	// And the proof it is worth something: the next caller gets the file without the
 	// phone being asked again.
+	//
+	// The blob that refetch just wrote goes first, and that is what keeps this test
+	// about the path it is named for. Left on the disk it is handed straight back, and
+	// the phone is then unasked because nothing was fetched at all -- which the stored
+	// path being wrong, or never written, would satisfy just as well.
+	removeBlob(t, root, fresh.ID)
 	if _, err := refetchErr(session, "3EB0KEEP", nil); err != nil {
 		t.Fatalf("the second refetch failed: %v", err)
 	}
 	if phone.asked() != 1 {
 		t.Errorf("the sender's phone was asked %d times, want once for the two refetches", phone.asked())
+	}
+}
+
+// The file the sender's phone uploaded again is filed on the row like any other, so the
+// next caller is answered off the disk instead of going back to the phone.
+//
+// Which is the half of this path that costs the most when it is missed. A download that
+// came through the phone spent a 404 and then as long as the phone took to answer, which
+// can be tens of seconds and can be never; paying that again for a file already on this
+// disk is the worst case issue #24 has.
+//
+// It is also what holds the write-back's condition to the columns it has. The path this
+// runs refreshes `direct_path` a line before recording the blob, so a condition that
+// included `direct_path` would have the write-back refuse its own caller, silently: every
+// file that came from a phone would go unfiled, and every later download would ask the
+// phone again. That reads as a tightening and is a regression, and without this nothing
+// would go red.
+func TestTheFileAPhoneUploadedAgainIsFiledOnTheRow(t *testing.T) {
+	t.Parallel()
+
+	session, phone, _ := reuploadSession(t, "3EB0FILED")
+	phone.answersWith(reuploaded("/v/fresh-path"))
+	fresh, err := refetchErr(session, "3EB0FILED", nil)
+	if err != nil {
+		t.Fatalf("refetch: %v", err)
+	}
+
+	kept, found, err := session.store.MediaPart(t.Context(), "3EB0FILED")
+	if err != nil || !found {
+		t.Fatalf("MediaPart: %v (found %v)", err, found)
+	}
+	if kept.BlobID != fresh.ID {
+		t.Fatalf("the row points at %q, want the file the phone's upload was written to, %q",
+			kept.BlobID, fresh.ID)
+	}
+
+	// And that is worth something: the next caller is answered from the disk, without the
+	// 404 and without the phone.
+	again, err := refetchErr(session, "3EB0FILED", nil)
+	if err != nil {
+		t.Fatalf("the second refetch failed: %v", err)
+	}
+	if again.ID != fresh.ID {
+		t.Errorf("the second refetch answered %s, want the file already on this disk, %s", again.ID, fresh.ID)
+	}
+	if phone.asked() != 1 {
+		t.Errorf("the sender's phone was asked %d times, want once", phone.asked())
 	}
 }
 
@@ -435,7 +501,7 @@ func TestAFreshPathIsRememberedSoTheNextCallerDoesNotAskTwice(t *testing.T) {
 func TestAReceiptThatCouldNotBeSentIsWorthAskingAgain(t *testing.T) {
 	t.Parallel()
 
-	session, phone := reuploadSession(t, "3EB0NOSOCKET")
+	session, phone, _ := reuploadSession(t, "3EB0NOSOCKET")
 	session.askReupload = func(context.Context, *wm.Client, *waTypes.MessageInfo, []byte) error {
 		phone.calls++
 		return wm.ErrNotConnected
@@ -465,7 +531,7 @@ func TestAReceiptThatCouldNotBeSentIsWorthAskingAgain(t *testing.T) {
 func TestRefreshingAPathLeavesTheRowAndItsRetentionAlone(t *testing.T) {
 	t.Parallel()
 
-	session, phone := reuploadSession(t, "3EB0RACE")
+	session, phone, _ := reuploadSession(t, "3EB0RACE")
 	phone.answersWith(reuploaded("/v/fresh-path"))
 
 	original, _, err := session.store.MediaPart(t.Context(), "3EB0RACE")

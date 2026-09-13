@@ -1103,8 +1103,12 @@ func mediaSession(t *testing.T, opts media.Options) (*Session, *downloads) {
 	t.Helper()
 
 	session, _ := newTestSession(t, "5511999990001")
-	opts.Root = t.TempDir()
-	opts.Now = func() time.Time { return storedAt }
+	if opts.Root == "" {
+		opts.Root = t.TempDir()
+	}
+	if opts.Now == nil {
+		opts.Now = func() time.Time { return storedAt }
+	}
 	blobs, err := media.New(opts)
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -1176,6 +1180,9 @@ type failingBlobs struct{ err error }
 
 func (f failingBlobs) Receive(context.Context, *media.Blob, func(media.File) error) (media.Blob, error) {
 	return media.Blob{}, f.err
+}
+func (f failingBlobs) Touch(string) (media.Blob, time.Time, error) {
+	return media.Blob{}, time.Time{}, media.ErrNotFound
 }
 func (f failingBlobs) MaxBlob() int64     { return media.DefaultMaxBlob }
 func (f failingBlobs) TTL() time.Duration { return media.DefaultTTL }

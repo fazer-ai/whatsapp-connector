@@ -106,6 +106,19 @@ func (s *Scoped) RefreshDirectPath(ctx context.Context, messageID, path string, 
 	return s.container.refreshDirectPath(ctx, s.sid, messageID, path, unchangedSince)
 }
 
+// RememberBlob records which blob on this instance's disk holds a message's file, and
+// only while the row is still the one the caller read.
+//
+// `read` is the row as MediaPart handed it back, which is what the condition is built
+// from: a write-back is only ever valid for the row whose coordinates the download
+// actually used.
+func (s *Scoped) RememberBlob(ctx context.Context, blobID string, read *MediaPart) error {
+	if err := s.fence.held(); err != nil {
+		return err
+	}
+	return s.container.rememberBlob(ctx, s.sid, blobID, read)
+}
+
 // MediaPart reads back what PutMediaPart kept for one message.
 func (s *Scoped) MediaPart(ctx context.Context, messageID string) (MediaPart, bool, error) {
 	return s.container.mediaPart(ctx, s.sid, messageID)

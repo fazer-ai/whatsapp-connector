@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -86,10 +87,15 @@ func (r refused) Error() string {
 
 func (r refused) Unwrap() error { return r.err }
 
-// Blobs is the half of the media store a session writes to. An interface so a test can
-// make a store fail without needing a filesystem that will.
+// Blobs is the half of the media store a session uses. An interface so a test can make a
+// store fail without needing a filesystem that will.
+//
+// Touch is the read half and it hands back no bytes: what a session asks the store is
+// whether a file it already downloaded is still here and how long it is still promised
+// for, and a session with a descriptor in its hand is a session that can drop one.
 type Blobs interface {
 	Receive(ctx context.Context, about *media.Blob, fill func(media.File) error) (media.Blob, error)
+	Touch(id string) (media.Blob, time.Time, error)
 	MaxBlob() int64
 	TTL() time.Duration
 }
@@ -529,6 +535,13 @@ func (s *Session) remember(event *waEvents.Message, part *attachment) bool {
 		ReceiptChat: event.Info.Chat.String(),
 		Sender:      event.Info.Sender.String(), FromMe: event.Info.IsFromMe,
 	}
+	if part.content.Ref != nil {
+		// The file is on this instance's disk, so the next caller asking for it can be
+		// answered from there instead of downloading it again. Empty for the other way
+		// into here, which is a message whose file never arrived: there is nothing to
+		// point at, and the invitation to come back for it is the whole point of the row.
+		kept.BlobID = part.content.Ref.ID
+	}
 	if err := s.store.PutMediaPart(ctx, &kept, time.Now()); err != nil {
 		s.log.Warn().Err(err).Str("message_id", messageID).
 			Msg("published a file this session will not be able to fetch a second time")
@@ -588,11 +601,23 @@ func (s *Session) downloadMedia(ctx context.Context, command *protocol.Command) 
 			"what is kept for that message belongs to a different chat")
 	}
 
+	// Asked here and not earlier, which is the whole of C17 and is load bearing. Looking
+	// at a blob puts it at the back of the eviction queue, so a consultation in front of
+	// the guards above would let a caller naming the wrong chat -- one this is about to
+	// refuse -- keep alive indefinitely a file it has no right to fetch.
+	if ref, found := s.reusable(&kept); found {
+		return json.Marshal(ref)
+	}
+
 	if s.state() != "open" {
 		// The download goes out over this session's own connection: whatsmeow refreshes
 		// the media credentials on the socket, so a session that is not up fetches
 		// nothing however good the coordinates are. Retried by the client rather than
 		// given up on, which is what a connection coming back deserves.
+		//
+		// Below the reuse above on purpose: reading a file this instance already has goes
+		// out over no socket at all, and refusing it would make a reconnection cost an
+		// attachment that was never in question.
 		return nil, protocol.NewError(protocol.ErrorNotConnected, "the session is not connected to WhatsApp")
 	}
 
@@ -618,7 +643,104 @@ func (s *Session) downloadMedia(ctx context.Context, command *protocol.Command) 
 		s.log.Warn().Err(err).Str("message_id", body.MessageID).Msg("could not fetch a file a second time")
 		return nil, refetchFailure(err)
 	}
+	s.rememberBlob(ctx, &kept, ref.ID)
 	return json.Marshal(ref)
+}
+
+// reusable is the file this instance already has for a message, described as a client
+// fetches it, and whether there is one to hand back at all.
+//
+// It is what issue #24 is about: the same command arriving twice used to pay for the
+// file twice and leave two copies of it on the disk, and a second copy of a file is not
+// worth anything to anybody -- the client keys by message id, the store hands out either
+// one, and the quota pays for both.
+//
+// Nothing here is trusted without being checked against the disk. The row is shared
+// across the deployment and the blob is not: a session that has moved reads an id
+// naming a file on the instance that downloaded it, and publishing that id under this
+// instance's address is a reference that answers 404 forever. So the store is asked, and
+// a no is not a failure -- it is the ordinary case the download below exists for.
+func (s *Session) reusable(kept *store.MediaPart) (protocol.MediaRef, bool) {
+	// Asked without checking the id first, because an empty one is already an id this
+	// store has no blob for: a row that kept nothing, or one written before the column
+	// existed, comes back ErrNotFound like any other and downloads, which is what this
+	// build did for every call before there was a column at all. A guard in front of it
+	// would be a second answer to a question that already has one.
+	about, touched, err := s.blobs.Touch(kept.BlobID)
+	switch {
+	case errors.Is(err, media.ErrNotFound):
+		// Swept, evicted, on an instance this session no longer runs on, or never there
+		// at all. The ordinary case, and it is not worth a line in the log: it is what
+		// the download below is for.
+		return protocol.MediaRef{}, false
+	case err != nil:
+		s.log.Warn().Err(err).Str("message_id", kept.MessageID).
+			Msg("could not tell whether the file of a message is still on this instance")
+		return protocol.MediaRef{}, false
+	}
+
+	if about.Size > s.blobs.MaxBlob() {
+		// A cap lowered under a file that is already here stops it, the same as it stops
+		// one arriving. That intention is written down in mediaBody, which records the
+		// length it measured rather than the one the sender announced so that a lowered
+		// cap refuses the file before a transfer rather than after it -- and reuse in
+		// front of the cap would quietly undo it for every file on the disk.
+		//
+		// Measured against the store's own length rather than the row's, which is not
+		// always a measurement: a message whose file WhatsApp had already dropped is
+		// filed with the sender's claim, because nothing was measured, and a download
+		// that succeeded later leaves that claim in place. Read off the row, a sender who
+		// understated would be served from the disk while the same file arriving is
+		// stopped by the cap on the way in, and the two paths would disagree.
+		return protocol.MediaRef{}, false
+	}
+
+	if digest := hex.EncodeToString(kept.FileSHA256); len(kept.FileSHA256) > 0 &&
+		about.SHA256 != "" && digest != about.SHA256 {
+		// The row says one file and the blob holds another. For an honest message the
+		// two digests are one value -- WhatsApp puts the plaintext digest on the message
+		// and the store takes its own over the bytes it wrote -- so a disagreement means
+		// the id on this row is not this row's file, and handing it over would put one
+		// conversation's attachment in another's thread past a chat guard that cannot see
+		// it. Downloaded instead, and the write-back below then points the row at the
+		// file that does belong to it.
+		s.log.Warn().Str("message_id", kept.MessageID).
+			Msg("refusing to reuse a file whose digest is not the one the message describes")
+		return protocol.MediaRef{}, false
+	}
+
+	return protocol.MediaRef{
+		Kind: protocol.MediaRefConnectorBlob, ID: about.ID, URL: s.blobURL(about.ID),
+		Size: about.Size, Mime: about.Mime, SHA256: about.SHA256,
+		// From the touch and not from `about.StoredAt`, which is the two clocks a blob is
+		// measured by: the sweep drops on the modification time, which being asked for
+		// renews, while `StoredAt` is when the write finished and nothing renews it. A
+		// blob written a day ago and collected an hour ago is served for another day, and
+		// publishing `StoredAt + TTL` for it hands back a reference that lapsed hours ago
+		// -- to a client whose answer to a lapsed reference is to ask for the file again,
+		// which is this very command.
+		ExpiresAt: touched.Add(s.blobs.TTL()).UnixMilli(),
+	}, true
+}
+
+// rememberBlob points a message's row at the file this instance just downloaded, so the
+// next caller is answered off the disk.
+//
+// Conditional on the row being the one this command read, and that is not a formality:
+// the download it follows can have been in flight for the whole media timeout, and the
+// inbound pump runs beside the executor that serialises commands. A message id is the
+// sender's to choose, so the same one arriving in another chat replaces the row inside
+// that window -- and this write landing on the key alone would file chat A's file as
+// chat B's, where the chat guard cannot catch it because the row it checks is chat B's.
+//
+// A failure is logged rather than returned. The file was fetched and the answer is a good
+// one; what is lost is only that the next caller pays for the download again, which is
+// what every caller paid before this existed.
+func (s *Session) rememberBlob(ctx context.Context, kept *store.MediaPart, blobID string) {
+	if err := s.store.RememberBlob(ctx, blobID, kept); err != nil {
+		s.log.Warn().Err(err).Str("message_id", kept.MessageID).
+			Msg("could not record which file was kept for a message, so the next caller will fetch it again")
+	}
 }
 
 // refetchReuploaded asks the sender's phone to upload the file again and fetches what it

@@ -595,13 +595,24 @@ func (c *Container) migrate(ctx context.Context) error {
 	// upgrade start publishing group conversation into inboxes on the strength of a
 	// request nobody recorded.
 	//
-	// It is the one column here that a fresh store does not have either, on purpose: the
+	// `rev` defaults to 0 and counts writes from there, so a row that predates it is a
+	// row nobody has written since -- which is true, and is the only thing a caller
+	// comparing against it needs.
+	//
+	// `blob_id` defaults to empty, which is a row with no file kept for it on this
+	// instance's disk. That is what every row in an upgrading deployment is, because the
+	// blobs predate the column that would have named them, and it is also what a row
+	// whose blob has been swept comes back to.
+	//
+	// Those two are the columns a fresh store does not have either, on purpose: the
 	// default belongs in one place, and this is the place that has to have it right for
 	// the store that already has rows.
 	for _, column := range []struct{ table, name, definition string }{
 		{"wac_media_part", "receipt_chat", "TEXT NOT NULL DEFAULT ''"},
 		{"wac_media_part", "sender", "TEXT NOT NULL DEFAULT ''"},
 		{"wac_media_part", "from_me", "BIGINT NOT NULL DEFAULT 0"},
+		{"wac_media_part", "blob_id", "TEXT NOT NULL DEFAULT ''"},
+		{"wac_media_part", "rev", "BIGINT NOT NULL DEFAULT 0"},
 		{"wac_session_desired", "wants_groups", "BIGINT NOT NULL DEFAULT 0"},
 	} {
 		if err := c.addColumn(ctx, column.table, column.name, column.definition); err != nil {
