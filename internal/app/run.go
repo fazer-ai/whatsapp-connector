@@ -906,7 +906,12 @@ func (c *Connector) commandReadFailed(ctx context.Context, err error) {
 	// A window that ran out is the deadline working, not the read failing: the tick
 	// hands out what is left of its period, and a read that spends all of it comes back
 	// with the context's error and nothing to report.
-	if ctx.Err() != nil {
+	//
+	// The error is asked before the context, because the context is the half that can be
+	// wrong here. The socket carries the window's own deadline, so the two fire together
+	// and `ctx.Err()` is set by whichever timer ran first; the transport decides by the
+	// clock instead and says so in the error (#209).
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) || ctx.Err() != nil {
 		return
 	}
 

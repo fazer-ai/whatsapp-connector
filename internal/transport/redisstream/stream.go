@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"slices"
 	"strconv"
 	"strings"
@@ -313,6 +314,13 @@ func (s *Streams) blockWithin(ctx context.Context) (time.Duration, bool) {
 // history of the next read to hand out. Anything already taken and not acknowledged below
 // the mark is Claim's business.
 func (s *Streams) Read(ctx context.Context, sids []string) ([]transport.Delivery, error) {
+	deliveries, err := s.read(ctx, sids)
+	// Every trip of the read is measured against the same window, so the question of
+	// which one ran out of it is one the caller cannot use and the operator cannot see.
+	return deliveries, spentWindow(ctx, err)
+}
+
+func (s *Streams) read(ctx context.Context, sids []string) ([]transport.Delivery, error) {
 	streams := s.streamsFor(sids)
 	if len(streams) == 0 {
 		return nil, nil
@@ -354,9 +362,6 @@ func (s *Streams) Read(ctx context.Context, sids []string) ([]transport.Delivery
 		s.groups.forgetAll(streams)
 		return nil, nil
 	case err != nil:
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
 		return nil, fmt.Errorf("redisstream: read commands: %w", err)
 	}
 	// Per stream, because entry ids are unique within a stream, not across streams.
@@ -1124,4 +1129,32 @@ func toFields(values map[string]any) map[string]string {
 		}
 	}
 	return fields
+}
+
+// spentWindow tells a window that ran out from a read that failed inside one, and does it
+// by the clock rather than by asking the context.
+//
+// go-redis takes the earliest of the caller's deadline and its own read timeout, and for a
+// blocking read its own is the block plus ten seconds, so the deadline on the socket is
+// the window's own. The two then fire together, from two different timers, and whichever
+// the scheduler runs first decides whether `ctx.Err()` is set by the time the error is
+// looked at. A loaded box loses that race often: production logged sixteen of these in the
+// first forty-two minutes of an instance whose reads never stopped landing (#209).
+//
+// The clock cannot be raced: past the deadline the window is over, whatever the context
+// has got around to saying. A timeout on any other deadline is left alone -- it is a read
+// that failed with time to spare, which is the failure this instance should report.
+func spentWindow(ctx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	deadline, bounded := ctx.Deadline()
+	if !bounded || time.Now().Before(deadline) {
+		return err
+	}
+	var timeout net.Error
+	if !errors.As(err, &timeout) || !timeout.Timeout() {
+		return err
+	}
+	return fmt.Errorf("%w: the window ran out with the answer still on its way: %w", context.DeadlineExceeded, err)
 }
