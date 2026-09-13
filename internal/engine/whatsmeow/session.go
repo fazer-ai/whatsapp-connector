@@ -1316,7 +1316,7 @@ func (s *Session) Connect(ctx context.Context, req engine.ConnectRequest) error 
 		// built at the time -- or the pairing just replaced above took its client with
 		// it. Nothing on it works, so the connect that would have failed is the connect
 		// that repairs it.
-		if err := s.recover(ctx); err != nil {
+		if err := s.recover(ctx, ctx); err != nil {
 			return fmt.Errorf("whatsmeow: %s is still without a usable device: %w", s.sid, err)
 		}
 	}
@@ -1828,7 +1828,7 @@ func (s *Session) Logout(ctx context.Context) error {
 	// logged out minutes ago, on credentials WhatsApp threw away.
 	s.emit(protocol.EventSessionLoggedOut, map[string]any{"reason": "logout_requested"})
 
-	if err := s.recoverWithin(); err != nil {
+	if err := s.recoverWithin(ctx); err != nil {
 		// The client here is on a deleted device whatever happens next, and a cleanup that
 		// stopped halfway leaves the mapping still pointing at it: rebuilding on top of
 		// that would hand the fresh client the very credentials WhatsApp threw away, so
@@ -1889,7 +1889,7 @@ func (s *Session) Delete(ctx context.Context) error {
 			Msg("the device could not be unlinked before the session was deleted; it may still be listed on the phone")
 	}
 
-	if err := s.recoverWithin(); err != nil {
+	if err := s.recoverWithin(ctx); err != nil {
 		// Answered as a failure, unlike the refused unlink above, because here the retry
 		// has something to do: whichever half did not land is the half the next delete
 		// finishes, the credentials still sitting in the store or the client still being
@@ -2464,10 +2464,12 @@ func unanswered(err error) bool {
 func (s *Session) rebuildWithin() error {
 	ctx, cancel := context.WithTimeout(s.ctx, s.storeLimit)
 	defer cancel()
-	return s.rebuild(ctx)
+	return s.rebuild(ctx, ctx)
 }
 
-func (s *Session) rebuild(ctx context.Context) error {
+// rebuild's caller is whoever is waiting for it, and it bounds only the wait for the old
+// client to close; ctx bounds everything else.
+func (s *Session) rebuild(ctx, caller context.Context) error {
 	if s.isClosed() {
 		// Nothing left to pair with. A session that closed while this was on its way is
 		// one the layer above has already given up.
@@ -2483,11 +2485,13 @@ func (s *Session) rebuild(ctx context.Context) error {
 	previous, handlerID := s.client, s.handlerID
 	s.mu.Unlock()
 	s.detach(previous, handlerID)
-	// Waited for no longer than the bound. Disconnect takes the socket lock, which a dial
-	// holds for as long as the dial lasts with no context to end it, and a delete reaches
-	// this while a reconnect is dialling exactly when its unlink was given up on for that
-	// reason (#187). The client is detached already, so nothing it does from here is heard,
-	// and the disconnect still lands the moment the dial lets go.
+	// Waited for no longer than somebody is waiting. Disconnect takes the socket lock, which
+	// a dial holds for as long as the dial lasts with no context to end it, and a delete
+	// reaches this while a reconnect is dialling exactly when its unlink was given up on for
+	// that reason (#187). Not on the store's bound alone: closing a client nothing listens to
+	// is not store work, and spending that bound on it answers a caller whose time is already
+	// up a whole bound later. The client is detached already, so nothing it does from here is
+	// heard, and the disconnect still lands the moment the dial lets go.
 	closed := make(chan struct{})
 	go func() {
 		defer close(closed)
@@ -2496,6 +2500,7 @@ func (s *Session) rebuild(ctx context.Context) error {
 	select {
 	case <-closed:
 	case <-ctx.Done():
+	case <-caller.Done():
 	}
 
 	// Dropped with the client it was filed under. Every path here has just forgotten the
@@ -2521,11 +2526,12 @@ func (s *Session) rebuild(ctx context.Context) error {
 // to retry a teardown whose remote half can never succeed again.
 //
 // Still a short bound, and still one the session's own close ends, because a database
-// that stopped answering must not be able to hold a teardown open either.
-func (s *Session) recoverWithin() error {
+// that stopped answering must not be able to hold a teardown open either. The command's
+// context comes along for the one wait that is not store work: see rebuild.
+func (s *Session) recoverWithin(caller context.Context) error {
 	ctx, cancel := context.WithTimeout(s.ctx, s.storeLimit)
 	defer cancel()
-	return s.recover(ctx)
+	return s.recover(ctx, caller)
 }
 
 // recover puts a session that was logged out back where a fresh pairing can start:
@@ -2534,11 +2540,11 @@ func (s *Session) recoverWithin() error {
 // Both halves, because a cleanup that failed leaves the mapping pointing at the revoked
 // device, and rebuilding from that hands the session the very credentials WhatsApp
 // threw away. Doing them together is what makes the retry a retry.
-func (s *Session) recover(ctx context.Context) error {
+func (s *Session) recover(ctx, caller context.Context) error {
 	if err := s.store.Forget(ctx); err != nil {
 		return err
 	}
-	return s.rebuild(ctx)
+	return s.rebuild(ctx, caller)
 }
 
 // markStale records that this session is on a client nothing works on. The next connect

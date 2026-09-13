@@ -1327,7 +1327,7 @@ func TestAnAccountThatWasUnpairedLeavesNoAvailabilityBehind(t *testing.T) {
 	if _, err := session.setPresence(t.Context(), presenceCommand("available")); err != nil {
 		t.Fatalf("setPresence: %v", err)
 	}
-	if err := session.recover(t.Context()); err != nil {
+	if err := session.recover(t.Context(), t.Context()); err != nil {
 		t.Fatalf("recover: %v", err)
 	}
 	session.reapplyAvailability(t.Context(), session.current())
@@ -1536,7 +1536,7 @@ func TestAnAvailabilityFiledAfterARebuildIsNotTheNextAccountsToInherit(t *testin
 	// race produces, and waiting for it to happen by itself is waiting on a scheduler.
 	hand := wire.hand
 	session.sendPresence = func(ctx context.Context, client *wm.Client, state waTypes.Presence) error {
-		if err := session.recover(t.Context()); err != nil {
+		if err := session.recover(t.Context(), t.Context()); err != nil {
 			t.Errorf("recover: %v", err)
 		}
 		return hand(ctx, client, state)

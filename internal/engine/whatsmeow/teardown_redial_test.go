@@ -68,8 +68,8 @@ func holdTheDial(t *testing.T, session *Session) {
 
 // answeredWithin runs a teardown on a caller's deadline and fails if it is still waiting
 // long after that deadline. The bound is generous on purpose: what it separates is an
-// answer that honours the caller from one that waits on the dial for as long as the dial
-// lasts, which here is the whole test.
+// answer that honours the caller from one that waits on something else -- the dial, which
+// here lasts the whole test, or a bound of the session's own set far above this one.
 func answeredWithin(t *testing.T, tearDown func(context.Context) error) error {
 	t.Helper()
 
@@ -127,12 +127,16 @@ func TestALogoutWaitingOnARedialAnswersWithinTheCallersTime(t *testing.T) {
 //
 // Two waits stand in its way, not one. The unlink waits on the lock to send, and the
 // rebuild after it waits on the same lock to close the client being thrown away; answering
-// the first and then sitting in the second is the same hang one step later.
+// the first and then sitting in the second is the same hang one step later. Nor may the
+// second end on the bound the local cleanup has for the store: closing a client nothing
+// listens to any more is not store work, and spending that bound on it answers the caller
+// a whole bound after its time. Set far above the test's own bound, so it cannot be what
+// ends the wait here.
 func TestADeleteWaitingOnARedialAnswersWithinTheCallersTime(t *testing.T) {
 	t.Parallel()
 
 	session, container := newTestSession(t, "5511999990002")
-	session.storeLimit = 500 * time.Millisecond
+	session.storeLimit = time.Minute
 	session.setConnected(false)
 	session.setReconnecting(true, time.Now())
 	holdTheDial(t, session)
