@@ -80,10 +80,11 @@ type Streams struct {
 	unrunMu sync.Mutex
 	unrun   map[string][]unrunEntry
 
-	// received is, per stream, the newest entry this process has been handed, by a read or
-	// by a claim: the mark Read reads this consumer's history past. See Read.
-	receivedMu sync.Mutex
-	received   map[string]string
+	// marks is, per stream, how far Read has read this consumer's pending history, and
+	// claimedPast what a claim handed out beyond that point. See Read.
+	marksMu     sync.Mutex
+	marks       map[string]string
+	claimedPast map[string]map[string]struct{}
 }
 
 // unrunEntry is one entry given back without being carried out, and the idle time it
@@ -122,9 +123,10 @@ func New(client *redisx.Client, opts Options) (*Streams, error) {
 	}
 	return &Streams{
 		client: client, opts: opts, groups: newGroupCache(),
-		inFlight: make(map[string]struct{}),
-		unrun:    make(map[string][]unrunEntry),
-		received: make(map[string]string),
+		inFlight:    make(map[string]struct{}),
+		unrun:       make(map[string][]unrunEntry),
+		marks:       make(map[string]string),
+		claimedPast: make(map[string]map[string]struct{}),
 	}, nil
 }
 
@@ -221,8 +223,7 @@ func (s *Streams) blockWithin(ctx context.Context) (time.Duration, bool) {
 // It takes two trips, and neither hands out what the other returned. `>` asks for entries
 // no consumer in the group has taken yet, which moves them into this consumer's pending
 // list, and waits for some if there are none. What is handed out is then read back from
-// that list: this consumer's own history, past the newest entry this process has already
-// been handed on each stream.
+// that list: this consumer's own history, past the mark on each stream.
 //
 // The answer to `>` cannot be what is handed out, because it can go missing with its
 // entries already moved (#202). Held past the window, the read returns the deadline's
@@ -234,15 +235,19 @@ func (s *Streams) blockWithin(ctx context.Context) (time.Duration, bool) {
 // session are read and run ahead of them. The history has them either way, and in stream
 // order, ahead of anything newer.
 //
-// The mark is what keeps the history to what nobody here has seen. Everything this process
-// was handed -- still running, given back, forfeited -- is at or below it, and none of that
-// may come back through a read: a running command would run twice, and one given back is a
-// claim's to hand out and would otherwise jump the queue on every read. Anything moved in by
-// `>` is above it, since `>` only returns what is newer than all of it. And the history is
-// this consumer's alone, so what is pending under a peer, which may be running there right
-// now, is never read. On a stream this process has been handed nothing from, the mark is
-// the start, and what an earlier process under this name left pending comes back the same
-// way.
+// The mark is how far that history has been read: the newest entry of the last page read
+// back. Every entry pending under this consumer up to it was on a page, and so was handed
+// out, or had been handed out already -- still running, given back, forfeited -- and none of
+// that may come back through a read: a running command would run twice, and one given back
+// is a claim's to hand out and would otherwise jump the queue on every read. Anything `>`
+// moves in is past it, since `>` only returns what is newer than every entry any read has
+// seen. Only a read moves it. A claim hands out entries past it too -- a peer's, or one a
+// peer gave back -- but a claim says nothing about the entries before the one it took, and
+// one of those may be a lost answer's; those claimed entries are kept apart instead, and a
+// page skips them. And the history is this consumer's alone, so what is pending under a
+// peer, which may be running there right now, is never read. On a stream no read has been
+// through yet, the mark is the start, and what an earlier process under this name left
+// pending comes back the same way.
 //
 // A history read that fails leaves what `>` moved in pending above the mark, for the
 // history of the next read to hand out. Anything already taken and not acknowledged below
@@ -298,16 +303,16 @@ func (s *Streams) Read(ctx context.Context, sids []string) ([]transport.Delivery
 }
 
 // readHistory hands out what is pending under this consumer past the mark on each stream.
-// It never waits, and it only looks: an answer it loses leaves everything as it found it,
-// for the next one.
+// It never waits, and reading only looks: an answer it loses leaves everything as it found
+// it, for the next one.
 func (s *Streams) readHistory(ctx context.Context, streams []string) ([]transport.Delivery, error) {
 	args := make([]any, 0, len(streams)+3)
 	args = append(args, ConsumerGroup, s.opts.Instance, s.opts.ReadCount)
-	s.receivedMu.Lock()
+	s.marksMu.Lock()
 	for _, stream := range streams {
-		args = append(args, s.received[stream])
+		args = append(args, s.marks[stream])
 	}
-	s.receivedMu.Unlock()
+	s.marksMu.Unlock()
 
 	raw, err := pendingPastScript.Run(ctx, s.client, streams, args...).Result()
 	if err != nil {
@@ -316,12 +321,26 @@ func (s *Streams) readHistory(ctx context.Context, streams []string) ([]transpor
 		}
 		return nil, fmt.Errorf("redisstream: read commands back: %w", err)
 	}
-	result, err := parsePendingPast(raw)
+	pages, err := parsePendingPast(raw)
 	if err != nil {
 		return nil, err
 	}
+
+	// Every page is settled before anything is handed out, so a stream that fails leaves
+	// nothing half given: the next read finds the same pages.
+	kept := make([][]redis.XMessage, len(pages))
+	for i, page := range pages {
+		if kept[i], err = s.takeFresh(ctx, page.Stream, s.skipClaimed(page)); err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			return nil, fmt.Errorf("redisstream: read commands back from %s: %w", page.Stream, err)
+		}
+	}
+
 	var out []transport.Delivery
-	for _, stream := range result {
+	for i, page := range pages {
+		stream := redis.XStream{Stream: page.Stream, Messages: kept[i]}
 		// Handed out as read for the first time, not as redelivered, whichever answer it
 		// first arrived in: nobody has run it, and whoever sent it is still waiting.
 		taken, ids := s.deliveriesWithIDs([]redis.XStream{stream}, false)
@@ -333,9 +352,112 @@ func (s *Streams) readHistory(ctx context.Context, streams []string) ([]transpor
 		// difference between running late and expiring unrun.
 		s.rememberAge(stream.Stream, s.opts.ClaimMinIdle, taken, ids)
 		out = append(out, taken...)
+		s.advanceMark(page.Stream, page.Messages)
 	}
 	return out, nil
 }
+
+// skipClaimed drops from a page what a claim already handed out, which is still pending
+// here and must not be handed out a second time.
+func (s *Streams) skipClaimed(page redis.XStream) []redis.XMessage {
+	s.marksMu.Lock()
+	defer s.marksMu.Unlock()
+	claimed := s.claimedPast[page.Stream]
+	fresh := make([]redis.XMessage, 0, len(page.Messages))
+	for _, message := range page.Messages {
+		if _, taken := claimed[message.ID]; !taken {
+			fresh = append(fresh, message)
+		}
+	}
+	return fresh
+}
+
+// advanceMark moves a stream's mark to the newest entry of a page read back, and forgets
+// the claimed entries it has now passed.
+func (s *Streams) advanceMark(stream string, page []redis.XMessage) {
+	s.marksMu.Lock()
+	defer s.marksMu.Unlock()
+	for _, message := range page {
+		if entryAfter(message.ID, s.marks[stream]) {
+			s.marks[stream] = message.ID
+		}
+	}
+	for id := range s.claimedPast[stream] {
+		if !entryAfter(id, s.marks[stream]) {
+			delete(s.claimedPast[stream], id)
+		}
+	}
+}
+
+// noteClaimed keeps apart what a claim handed out past a stream's mark. See Read.
+func (s *Streams) noteClaimed(stream string, ids []string) {
+	s.marksMu.Lock()
+	defer s.marksMu.Unlock()
+	for _, id := range ids {
+		if !entryAfter(id, s.marks[stream]) {
+			continue
+		}
+		if s.claimedPast[stream] == nil {
+			s.claimedPast[stream] = make(map[string]struct{})
+		}
+		s.claimedPast[stream][id] = struct{}{}
+	}
+}
+
+// takeFresh sets the idle time of entries about to be handed out back to zero, and returns
+// those still pending under this consumer to hand out.
+//
+// A read hands out an entry that may have sat pending since the answer carrying it was
+// lost, and a claim goes by idle time. Left alone, a wake recovered twenty seconds late
+// would be claimable by a peer twenty seconds early, while this instance is still adopting
+// the session it names -- and the peer, finding a live lease, would retire the only wake
+// there was. Reset here, it waits the whole claim delay from now, as a wake read the moment
+// it arrived does. It is done after the page reached this process, never by reading it: an
+// instance whose answers stop arriving never gets this far, and keeps nothing looking fresh
+// for a peer's claim to wait on.
+//
+// An entry a peer took in between is not this process's to hand out any more, and is left
+// out rather than taken back.
+func (s *Streams) takeFresh(ctx context.Context, stream string, messages []redis.XMessage) ([]redis.XMessage, error) {
+	if len(messages) == 0 {
+		return nil, nil
+	}
+	args := make([]any, 0, len(messages)+2)
+	args = append(args, ConsumerGroup, s.opts.Instance)
+	for _, message := range messages {
+		args = append(args, message.ID)
+	}
+	stillOurs, err := freshenScript.Run(ctx, s.client, []string{stream}, args...).StringSlice()
+	if err != nil {
+		return nil, err
+	}
+	kept := make([]redis.XMessage, 0, len(stillOurs))
+	for _, message := range messages {
+		if slices.Contains(stillOurs, message.ID) {
+			kept = append(kept, message)
+		}
+	}
+	return kept, nil
+}
+
+// freshenScript sets each entry's idle time to zero while it is still pending under the
+// consumer, and names the ones it did. One operation for the reason restoreAgeScript is
+// one: XCLAIM transfers an entry without asking who holds it, so a check and a claim apart
+// would take back an entry a peer had just claimed and is carrying out. JUSTID keeps the
+// delivery counter still, since nothing was delivered again.
+var freshenScript = redis.NewScript(`
+local group, consumer = ARGV[1], ARGV[2]
+local kept = {}
+for i = 3, #ARGV do
+  local id = ARGV[i]
+  local pending = redis.call("XPENDING", KEYS[1], group, id, id, 1)
+  if pending[1] and pending[1][2] == consumer then
+    redis.call("XCLAIM", KEYS[1], group, consumer, 0, id, "JUSTID")
+    kept[#kept + 1] = id
+  end
+end
+return kept
+`)
 
 // pendingPastScript returns, for each stream, up to a count of the entries pending under
 // one consumer past a mark, oldest first. An empty mark is the start of the stream.
@@ -582,6 +704,7 @@ func (s *Streams) claim(ctx context.Context, streams []string, minIdle time.Dura
 			return fail(fmt.Errorf("redisstream: claim %s: %w", stream, err))
 		}
 		taken, ids := s.deliveriesWithIDs([]redis.XStream{{Stream: stream, Messages: messages}}, true)
+		s.noteClaimed(stream, ids)
 		if minIdle > 0 {
 			s.rememberAge(stream, minIdle, taken, ids)
 		}
@@ -715,7 +838,6 @@ func (s *Streams) deliveriesWithIDs(result []redis.XStream, redelivered bool) (o
 				continue
 			}
 			held := s.hold(stream.Stream, message.ID)
-			s.markReceived(stream.Stream, message.ID)
 			out = append(out, transport.Delivery{
 				Command:     command,
 				Ack:         s.acker(stream.Stream, message.ID, held),
@@ -726,15 +848,6 @@ func (s *Streams) deliveriesWithIDs(result []redis.XStream, redelivered bool) (o
 		}
 	}
 	return out, ids
-}
-
-// markReceived moves a stream's mark up to an entry this process has been handed.
-func (s *Streams) markReceived(stream, id string) {
-	s.receivedMu.Lock()
-	defer s.receivedMu.Unlock()
-	if entryAfter(id, s.received[stream]) {
-		s.received[stream] = id
-	}
 }
 
 // entryAfter reports whether stream entry id a comes after b. Everything comes after an

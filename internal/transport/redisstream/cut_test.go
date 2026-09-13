@@ -382,6 +382,106 @@ func TestReadingBackAWakeWhoseAnswersKeepGettingLostLeavesItForAPeer(t *testing.
 	})
 }
 
+// A wake read back late is handed out late, and a claim goes by idle time. The claim delay
+// is longer than a lease precisely so a peer never takes a wake while the instance that read
+// it may still be adopting its session: handed out with the age it gathered while its answer
+// was lost, the wake would be claimable that much early, and a peer finding the new owner's
+// lease would retire the only wake there was. It has to wait the whole delay from when it is
+// handed out, as a wake read the moment it arrived does.
+func TestAWakeReadBackLateWaitsTheWholeClaimDelayFromWhenItIsHandedOut(t *testing.T) {
+	cutBackends(t, func(t *testing.T, f cutFleet) {
+		const claimDelay = 400 * time.Millisecond
+
+		adopter := f.streams(t, "inst-a")
+		if _, err := read(t, adopter, "s1"); err != nil {
+			t.Fatalf("priming read: %v", err)
+		}
+		writeCommand(t, f.fleet, f.client.Keys().Control(), &protocol.Command{
+			V: protocol.Version, ID: "late-wake", Type: protocol.CommandSessionWake, SID: "s9",
+			TS: 1787000000000, Payload: []byte(`{"desired":"connected"}`),
+		})
+		f.loseTheAnswer(t, "held past the window", adopter, "inst-a", "late-wake", "s1")
+		// The age is the subject: the wake sits unseen here for longer than a peer's delay.
+		time.Sleep(claimDelay + claimDelay/2)
+
+		delivered, err := read(t, adopter, "s1")
+		if err != nil || !slices.Equal(ids(delivered), []string{"late-wake"}) {
+			t.Fatalf("the read back handed out %v (err=%v), want [late-wake]", ids(delivered), err)
+		}
+
+		peer, err := redisstream.New(f.client, redisstream.Options{Instance: "inst-peer", ClaimMinIdle: claimDelay})
+		if err != nil {
+			t.Fatalf("redisstream.New: %v", err)
+		}
+		claimed, err := peer.ClaimControl(context.Background())
+		if err != nil {
+			t.Fatalf("ClaimControl: %v", err)
+		}
+		if len(claimed) != 0 {
+			t.Fatalf("a peer claimed %v the moment inst-a handed it out, want it left to inst-a for the whole delay", ids(claimed))
+		}
+	})
+}
+
+// A claim hands out entries past the mark: a peer's, or one a peer gave back with its age
+// put back, which is claimable at once. Taking one says nothing about the entries before it,
+// and one of those may be what a lost answer left here. Moving the mark to the claimed entry
+// would hide that one from every read back, and leave it to wait the claim delay again.
+func TestAClaimPastALostAnswerDoesNotHideItFromTheNextRead(t *testing.T) {
+	cutBackends(t, func(t *testing.T, f cutFleet) {
+		a := f.streams(t, "inst-a")
+		b, err := redisstream.New(f.client, redisstream.Options{
+			Instance: "inst-b", Block: 50 * time.Millisecond, ClaimMinIdle: cutClaimMinIdle,
+		})
+		if err != nil {
+			t.Fatalf("redisstream.New: %v", err)
+		}
+		for _, streams := range []*redisstream.Streams{a, b} {
+			if _, err := read(t, streams, "s1"); err != nil {
+				t.Fatalf("priming read: %v", err)
+			}
+		}
+		control := f.client.Keys().Control()
+		wake := func(id string) *protocol.Command {
+			return &protocol.Command{
+				V: protocol.Version, ID: id, Type: protocol.CommandSessionWake, SID: "s9",
+				TS: 1787000000000, Payload: []byte(`{"desired":"connected"}`),
+			}
+		}
+
+		writeCommand(t, f.fleet, control, wake("gap-first"))
+		f.loseTheAnswer(t, "held past the window", a, "inst-a", "gap-first", "s1")
+
+		writeCommand(t, f.fleet, control, wake("gap-second"))
+		given, err := read(t, b, "s1")
+		if err != nil || !slices.Equal(ids(given), []string{"gap-second"}) {
+			t.Fatalf("inst-b read %v (err=%v), want [gap-second]", ids(given), err)
+		}
+		given[0].Release()
+		// inst-b's next pass puts the age back on what it gave back, which makes it
+		// claimable by anybody at once.
+		if _, err := b.Claim(context.Background(), nil); err != nil {
+			t.Fatalf("inst-b Claim: %v", err)
+		}
+		claimed, err := a.ClaimControl(context.Background())
+		if err != nil || !slices.Equal(ids(claimed), []string{"gap-second"}) {
+			t.Fatalf("inst-a claimed %v (err=%v), want [gap-second]", ids(claimed), err)
+		}
+
+		var after []string
+		for range 3 {
+			delivered, err := read(t, a, "s1")
+			if err != nil {
+				t.Fatalf("read: %v", err)
+			}
+			after = append(after, ids(delivered)...)
+		}
+		if want := []string{"gap-first"}; !slices.Equal(after, want) {
+			t.Fatalf("after claiming gap-second, inst-a's reads handed out %v, want %v", after, want)
+		}
+	})
+}
+
 // What this process was handed and has not finished with is still pending under its
 // name, exactly like what a lost answer left there. Recovering the second must not hand
 // out the first again: not a command still running (invariant 5), and not one given back
