@@ -17,6 +17,7 @@
 //	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveListen
 //	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveMedia
 //	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveRefetch
+//	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveReuse
 //	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveViewOnce$
 //	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveWatchAMessageChange
 //	go test -tags live -timeout 30m -v ./internal/engine/whatsmeow/ -run TestLiveWatchAShare
@@ -959,7 +960,11 @@ func TestLiveViewOnce(t *testing.T) {
 type fetched struct {
 	status int
 	mime   string
-	body   []byte
+	// disposition is what the handler tells a browser to call the file. Kept because a
+	// blob served twice has to be described the same way twice, and the description is
+	// read off the file beside the blob rather than off the request.
+	disposition string
+	body        []byte
 }
 
 // fetchBlob asks the endpoint for a blob the way the client does. An empty token sends
@@ -984,7 +989,10 @@ func fetchBlob(t *testing.T, url, token string) fetched {
 	if err != nil {
 		t.Fatalf("read the blob: %v", err)
 	}
-	return fetched{status: answer.StatusCode, mime: answer.Header.Get("Content-Type"), body: read}
+	return fetched{
+		status: answer.StatusCode, mime: answer.Header.Get("Content-Type"),
+		disposition: answer.Header.Get("Content-Disposition"), body: read,
+	}
 }
 
 // liveWindow is how long a phase waits for a human to send something.
