@@ -365,6 +365,36 @@ func TestADeleteWaitingOnARedialFailsWithoutTearingTheAccountDown(t *testing.T) 
 	}
 }
 
+// An account with no device has nothing to unlink, and whatsmeow says so without going near
+// the socket. So a delete for one does not wait on the dial at all: the ordinary way to be
+// dialling with nothing paired is a pairing nobody finished, and holding the teardown for
+// the caller's whole time only to refuse it would leave an account the client has already
+// destroyed the inbox for, still there to be adopted.
+func TestADeleteWithNothingPairedDoesNotWaitOnADial(t *testing.T) {
+	t.Parallel()
+
+	session, container := newTestSession(t, "")
+	// The local half still closes the client being thrown away, and that close waits on the
+	// same dial under the bound this half runs on -- which is the bound being shortened here,
+	// not the caller's. What the test is about is the unlink in front of it not waiting at all.
+	session.storeLimit = 500 * time.Millisecond
+	holdTheDial(t, session)
+
+	answered := make(chan error, 1)
+	go func() { answered <- session.Delete(t.Context()) }()
+	select {
+	case err := <-answered:
+		if err != nil {
+			t.Fatalf("a delete with nothing to unlink failed: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the delete waited on a dial for an account that has no device to unlink")
+	}
+	if _, bound, err := container.For(session.sid).JID(t.Context()); err != nil || bound {
+		t.Fatalf("the teardown did not run (bound=%v, err=%v)", bound, err)
+	}
+}
+
 // And the teardown that does go through still may not wait on a dial forever. A logout
 // WhatsApp accepted runs its local half next, and the rebuild in it closes the client being
 // thrown away -- on the same lock a dial holds, with the command's own time already spent.

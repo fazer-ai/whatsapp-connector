@@ -1900,7 +1900,21 @@ func (s *Session) Delete(ctx context.Context) error {
 
 	s.cancelPairing()
 	_, paired, pairedErr := s.store.JID(ctx)
-	unlink := s.unlink(ctx, s.current())
+	// Read once and answered for both the wait below and what is logged at the end. A read
+	// that failed says nothing either way, so it counts as paired: the lock is waited for and
+	// the residue is named, which is what this path did before it could tell the two apart.
+	nothingToUnlink := pairedErr == nil && !paired
+	// The socket is waited for only when there is a device to remove. whatsmeow answers
+	// ErrNotLoggedIn for an account with none without going near the socket, so an account
+	// whose pairing dial is in flight -- a QR nobody scanned, a code that ran out -- would
+	// otherwise spend the caller's whole time waiting for a lock it has no use for, and then
+	// be refused below over an unlink that was never going to be sent. There is nothing to
+	// keep for a retry there: no device, and an inbox the client has already destroyed.
+	ask := s.unlink
+	if nothingToUnlink {
+		ask = s.logout
+	}
+	unlink := ask(ctx, s.current())
 	if errors.Is(unlink, errStillDialling) {
 		// The one failure that is not "the unlink was refused": it was never attempted. The
 		// caller's time ran out while a dial held the socket, and nothing has been touched
@@ -1921,7 +1935,7 @@ func (s *Session) Delete(ctx context.Context) error {
 	s.settleLogout()
 	switch {
 	case unlink == nil:
-	case pairedErr == nil && !paired:
+	case nothingToUnlink:
 		// Nothing was linked, so there is nothing WhatsApp has to be told about and no
 		// residue to name. The commonest way here is the redelivery of a delete that
 		// already ran.
