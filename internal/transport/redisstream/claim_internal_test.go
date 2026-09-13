@@ -11,6 +11,7 @@ import (
 
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 	"github.com/fazer-ai/whatsapp-connector/internal/redisx"
+	"github.com/fazer-ai/whatsapp-connector/internal/redisx/redisxtest"
 	"github.com/fazer-ai/whatsapp-connector/internal/transport"
 )
 
@@ -265,5 +266,85 @@ func TestAReceivedPayloadIsForgottenOncePassedOrNoLongerRead(t *testing.T) {
 	}
 	if _, kept := a.received[second]; kept {
 		t.Fatal("payloads still kept for a stream the read no longer reads")
+	}
+}
+
+// A claim keeps apart every entry it asks for, and XCLAIM leaves out one a peer acknowledged
+// in between. Nothing acknowledges that one here and no page carries it, so kept apart it
+// would stay for good; a fleet racing its claims over the control stream would pile them up.
+// What XCLAIM left out and is still pending here is another matter: a claim moved it without
+// hearing so, and it stays apart.
+func TestAnEntryAPeerRetiredBeforeTheClaimTookItIsNotKeptApart(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	direct := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = direct.Close() })
+	proxy := redisxtest.Listen(t, server.Addr())
+	via := redis.NewClient(&redis.Options{Addr: proxy.Addr()})
+	t.Cleanup(func() { _ = via.Close() })
+	client, proxied := redisx.Wrap(direct, "wa:", 8), redisx.Wrap(via, "wa:", 8)
+	ctx := context.Background()
+	stream := client.Keys().Commands("s1")
+
+	a, err := New(proxied, Options{Instance: "inst-a", Block: 50 * time.Millisecond, ReadCount: 8})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	dead, err := New(client, Options{Instance: "inst-dead", Block: 50 * time.Millisecond, ReadCount: 8})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	for _, streams := range []*Streams{a, dead} {
+		if _, err := streams.Read(ctx, []string{"s1"}); err != nil {
+			t.Fatalf("priming Read: %v", err)
+		}
+	}
+	command := &protocol.Command{
+		V: protocol.Version, ID: "retired", Type: protocol.CommandSessionStatus,
+		SID: "s1", TS: 1787000000000, Payload: []byte(`{}`),
+	}
+	fields, err := command.Fields()
+	if err != nil {
+		t.Fatalf("render command: %v", err)
+	}
+	values := make(map[string]any, len(fields))
+	for key, value := range fields {
+		values[key] = value
+	}
+	const id = "7-1"
+	if err := client.XAdd(ctx, &redis.XAddArgs{Stream: stream, ID: id, Values: values}).Err(); err != nil {
+		t.Fatalf("XAdd: %v", err)
+	}
+	if taken, err := dead.Read(ctx, []string{"s1"}); err != nil || len(taken) != 1 {
+		t.Fatalf("the peer read %d commands (err=%v), want 1", len(taken), err)
+	}
+
+	// The list of what is pending is held, and the peer acknowledges the entry before the
+	// claim sends XCLAIM for it.
+	release := make(chan struct{})
+	caught := proxy.Hold(id, release)
+	type result struct {
+		claimed []transport.Delivery
+		err     error
+	}
+	done := make(chan result, 1)
+	go func() {
+		claimed, err := a.ClaimSessions(ctx, []string{"s1"})
+		done <- result{claimed, err}
+	}()
+	<-caught
+	if err := client.XAck(ctx, stream, ConsumerGroup, id).Err(); err != nil {
+		t.Fatalf("XAck: %v", err)
+	}
+	close(release)
+	if got := <-done; got.err != nil || len(got.claimed) != 0 {
+		t.Fatalf("claimed %d (err=%v), want nothing: the peer retired it", len(got.claimed), got.err)
+	}
+	a.marksMu.Lock()
+	kept := len(a.claimedPast[stream])
+	a.marksMu.Unlock()
+	if kept != 0 {
+		t.Fatalf("%d entries kept apart after a claim that took nothing still pending here, want none", kept)
 	}
 }

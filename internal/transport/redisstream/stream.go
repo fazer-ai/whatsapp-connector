@@ -519,6 +519,39 @@ func (s *Streams) letGo(stream string, ids ...string) {
 	}
 }
 
+// letGoRetired stops keeping apart what a claim asked for, did not get, and is not pending
+// here: a peer took it, or ran it and acknowledged it, between the list and the claim.
+// Nothing here would ever let go of it otherwise. What is pending here was moved by the
+// claim all the same, its answer lost, and stays apart. A failure leaves everything kept
+// apart, which costs memory until a page passes it, and nothing else.
+func (s *Streams) letGoRetired(ctx context.Context, stream string, asked []string, took []redis.XMessage) {
+	args := make([]any, 0, len(asked)+2)
+	args = append(args, ConsumerGroup, s.opts.Instance)
+	for _, id := range asked {
+		if !slices.ContainsFunc(took, func(message redis.XMessage) bool { return message.ID == id }) {
+			args = append(args, id)
+		}
+	}
+	gone, err := notPendingHereScript.Run(ctx, s.client, []string{stream}, args...).StringSlice()
+	if err != nil {
+		return
+	}
+	s.letGo(stream, gone...)
+}
+
+// notPendingHereScript returns which of the given entries are not pending under a consumer.
+var notPendingHereScript = redis.NewScript(`
+local group, consumer = ARGV[1], ARGV[2]
+local gone = {}
+for i = 3, #ARGV do
+  local pending = redis.call("XPENDING", KEYS[1], group, "IDLE", 0, ARGV[i], ARGV[i], 1)
+  if not (pending[1] and pending[1][2] == consumer) then
+    gone[#gone + 1] = ARGV[i]
+  end
+end
+return gone
+`)
+
 // pendingPastScript returns, for each stream, up to a count of the entries pending under
 // one consumer past a mark, oldest first, each with its idle time in milliseconds. An empty
 // mark is the start of the stream.
@@ -788,6 +821,9 @@ func (s *Streams) claim(ctx context.Context, streams []string, minIdle time.Dura
 			if !slices.Contains(handed, message.ID) {
 				s.letGo(stream, message.ID)
 			}
+		}
+		if len(messages) < len(ids) {
+			s.letGoRetired(ctx, stream, ids, messages)
 		}
 		if minIdle > 0 {
 			s.rememberAge(stream, minIdle, taken, handed)
