@@ -292,28 +292,33 @@ func TestADialThatEndsAfterItsClientWasReplacedSaysNothing(t *testing.T) {
 		t.Fatalf("the connect published %q, want the session connecting", emission.Type)
 	}
 
+	dialling := session.current()
 	spent, giveUp := context.WithCancel(t.Context())
 	giveUp()
 	if err := session.rebuild(t.Context(), spent); err != nil {
 		t.Fatalf("rebuild: %v", err)
 	}
 
+	// The replacement is dialling by the time the old one gives up, which is the case that
+	// matters: the state the old failure would clear is this dial's.
+	session.setDialing(true)
+
 	_ = parked.Close()
-	// The dial's own end, so the report that follows it has already been decided by the time
-	// the window below opens: the flag is cleared on the failure before anything is said.
-	for deadline := time.Now().Add(10 * time.Second); ; {
-		session.mu.Lock()
-		dialling := session.dialing
-		session.mu.Unlock()
-		if !dialling {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("the dial never ended after the proxy dropped it")
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
+	// The old dial's own end, taken from the client that was dialling: its socket lock comes
+	// free only once the dial is over, so everything the failure does has been done by the
+	// time this returns.
+	dialling.IsConnected()
+
 	saysNothing(t, session, "for a dial that ended on a client the session had already replaced")
+	session.mu.Lock()
+	stillDialling := session.dialing
+	session.mu.Unlock()
+	if !stillDialling {
+		// The same event arriving on the wrong session by another door: `session.status`
+		// would answer `close` over a dial in flight, and a resume landing there would start
+		// a second one alongside it.
+		t.Fatal("a dial that ended on the replaced client cleared the flag of the one that took its place")
+	}
 }
 
 // A delete in the same place gets the same bound, and then does what a delete whose unlink

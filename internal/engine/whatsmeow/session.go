@@ -854,6 +854,24 @@ func (s *Session) identity() (phone, lid string) {
 	return s.phone, s.lid
 }
 
+// stopDialing records a dial that failed, while it is still this session's client that was
+// dialling.
+//
+// A dial detached from the command that asked for it ends whenever the network lets it, and
+// a teardown in between puts the session on a client of its own, which may be dialling by
+// then. Cleared without the check, an old failure says nothing is dialling over a dial in
+// flight: `session.status` answers `close` for a session that is connecting, and a resume
+// arriving there starts a second dial alongside the first.
+func (s *Session) stopDialing(client *wm.Client) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.client != client {
+		return
+	}
+	s.dialing = false
+}
+
 func (s *Session) setDialing(dialing bool) {
 	at := s.now()
 	s.mu.Lock()
@@ -1484,7 +1502,7 @@ func (s *Session) dial(ctx context.Context, client *wm.Client, onDetached func(e
 	go func() {
 		err := client.ConnectContext(s.ctx)
 		if err != nil {
-			s.setDialing(false)
+			s.stopDialing(client)
 		}
 		// On success the flag stands until whatsmeow says the session is authenticated.
 		// ConnectContext returns once the socket is up, and the handshake that follows is
