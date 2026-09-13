@@ -112,6 +112,37 @@ func TestEveryFixtureTypeIsKnown(t *testing.T) {
 	}
 }
 
+// And the schema's own list. A frame type is spelled in three places -- the Go catalog, a
+// fixture, and a branch of the union in the schema -- and the two tests above tie the
+// first two together. Nothing tied the third: a branch left in the union for a type the
+// catalog no longer has is a frame a client's validator accepts and this connector never
+// sends, which is exactly the kind of promise fazer-ai/chatwoot#481 took two of out of
+// the contract. Both directions, so a type added to Go without a branch fails here rather
+// than as a fixture that happens not to validate.
+func TestEverySchemaFrameTypeIsInTheCatalog(t *testing.T) {
+	catalogs := map[string]map[string]bool{"event": {}, "command": {}}
+	for _, event := range protocol.AllEventTypes {
+		catalogs["event"][string(event)] = true
+	}
+	for _, command := range protocol.AllCommandTypes {
+		catalogs["command"][string(command)] = true
+	}
+
+	for kind, catalog := range catalogs {
+		branches := schemaFrameTypes(t, kind)
+		for name := range catalog {
+			if !branches[name] {
+				t.Errorf("%s type %q is in the catalog and has no branch in #/definitions/%s", kind, name, kind)
+			}
+		}
+		for name := range branches {
+			if !catalog[name] {
+				t.Errorf("#/definitions/%s has a branch for %q, which the catalog does not know", kind, name)
+			}
+		}
+	}
+}
+
 // A command fixture carrying reply_to is a golden example of an RPC, so the two ways
 // of saying "this command answers" have to agree. Without this, a fixture can promise a
 // reply for a command no implementation ever replies to, and the caller hangs until its
@@ -581,6 +612,44 @@ func fixtures(t *testing.T, kind string) map[string]any {
 		all[strings.TrimSuffix(filepath.Base(path), ".json")] = fixture
 	}
 	return all
+}
+
+// schemaFrameTypes is every `type` const the union at #/definitions/<kind> names.
+func schemaFrameTypes(t *testing.T, kind string) map[string]bool {
+	t.Helper()
+
+	var document map[string]any
+	read(t, filepath.Join(contractDir, "schema", "protocol.schema.json"), &document)
+	definitions, _ := document["definitions"].(map[string]any)
+
+	found := map[string]bool{}
+	var walk func(node any)
+	// Down arrays as well as objects, for the reason schemaEnumPaths gives: the branches
+	// sit inside `allOf` and `oneOf`, which decode as slices.
+	walk = func(node any) {
+		switch node := node.(type) {
+		case map[string]any:
+			if properties, ok := node["properties"].(map[string]any); ok {
+				if discriminator, ok := properties["type"].(map[string]any); ok {
+					if name, ok := discriminator["const"].(string); ok {
+						found[name] = true
+					}
+				}
+			}
+			for _, value := range node {
+				walk(value)
+			}
+		case []any:
+			for _, value := range node {
+				walk(value)
+			}
+		}
+	}
+	walk(definitions[kind])
+	if len(found) == 0 {
+		t.Fatalf("#/definitions/%s names no frame types, so this check is comparing nothing", kind)
+	}
+	return found
 }
 
 func typesInFixtures(t *testing.T, kind string) map[string]bool {
