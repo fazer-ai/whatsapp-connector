@@ -465,3 +465,88 @@ func TestAClaimBetweenAPageAndItsHandOutTakesNothingTheReadHandsOut(t *testing.T
 		t.Fatalf("the claim took %d (err=%v) of what the read was handing out, want nothing", len(claimed), claimErr)
 	}
 }
+
+// The list a claim works from can predate a read that hands the same entry out: listed while
+// nobody was running it, the entry is past the mark and running by the time the claim keeps
+// its candidates apart. The claim has to look again there, under the lock the read hands out
+// under, or it takes the entry too and the command runs twice.
+func TestAReadBetweenAClaimsListAndItsClaimLeavesTheClaimNothing(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+	ctx := context.Background()
+	stream := client.Keys().Commands("s1")
+
+	a, err := New(client, Options{Instance: "inst-a", Block: 50 * time.Millisecond, ClaimMinIdle: time.Millisecond, ReadCount: 8})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, err := a.Read(ctx, []string{"s1"}); err != nil {
+		t.Fatalf("priming Read: %v", err)
+	}
+	writeOne(t, client, stream, "s1")
+	if err := client.XReadGroup(ctx, &redis.XReadGroupArgs{
+		Group: ConsumerGroup, Consumer: "inst-a", Streams: []string{stream, ">"}, Block: -1,
+	}).Err(); err != nil {
+		t.Fatalf("XREADGROUP: %v", err)
+	}
+	time.Sleep(5 * time.Millisecond)
+
+	var read []transport.Delivery
+	var readErr error
+	a.afterList = func() {
+		a.afterList = nil
+		read, readErr = a.Read(ctx, []string{"s1"})
+	}
+	claimed, err := a.Claim(ctx, []string{"s1"})
+	if readErr != nil || len(read) != 1 {
+		t.Fatalf("the read handed out %d (err=%v), want the command the lost answer left", len(read), readErr)
+	}
+	if err != nil || len(claimed) != 0 {
+		t.Fatalf("the claim took %d (err=%v) of what the read handed out after it listed, want nothing", len(claimed), err)
+	}
+}
+
+// A claim that takes a frame it cannot read acknowledges it as unreadable, so it is off the
+// pending list and no page will ever carry it: it is not kept apart either.
+func TestAnUnreadableEntryAClaimTookIsNotKeptApart(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+	ctx := context.Background()
+	stream := client.Keys().Commands("s1")
+
+	a, err := New(client, Options{Instance: "inst-a", Block: 50 * time.Millisecond, ReadCount: 8})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, err := a.Read(ctx, []string{"s1"}); err != nil {
+		t.Fatalf("priming Read: %v", err)
+	}
+	if err := client.XAdd(ctx, &redis.XAddArgs{Stream: stream, Values: map[string]any{"not": "a frame"}}).Err(); err != nil {
+		t.Fatalf("XAdd: %v", err)
+	}
+	// Taken by a peer that never looked at it.
+	if err := client.XReadGroup(ctx, &redis.XReadGroupArgs{
+		Group: ConsumerGroup, Consumer: "inst-dead", Streams: []string{stream, ">"}, Block: -1,
+	}).Err(); err != nil {
+		t.Fatalf("XREADGROUP: %v", err)
+	}
+
+	claimed, err := a.ClaimSessions(ctx, []string{"s1"})
+	if err != nil || len(claimed) != 0 {
+		t.Fatalf("claimed %d (err=%v), want the unreadable frame dropped", len(claimed), err)
+	}
+	a.marksMu.Lock()
+	kept := len(a.claimedPast[stream])
+	a.marksMu.Unlock()
+	if kept != 0 {
+		t.Fatalf("%d entries kept apart after the claim acknowledged the only one as unreadable, want none", kept)
+	}
+}

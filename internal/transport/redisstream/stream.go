@@ -100,9 +100,12 @@ type Streams struct {
 	// delivered before it is a predecessor's. See Read.
 	started time.Time
 
-	// afterPage runs once a page has been looked at and before what it hands out is, and is
-	// nil outside tests: it is where a claim running alongside a read would interleave.
+	// afterPage runs once a page has been looked at and before what it hands out is, and
+	// afterList once a claim has listed what it may take and before it keeps any of it
+	// apart. Both are nil outside tests: they are where a read and a claim running
+	// alongside each other would interleave.
 	afterPage func()
+	afterList func()
 }
 
 // unrunEntry is one entry given back without being carried out, and the idle time it
@@ -843,6 +846,9 @@ func (s *Streams) claim(ctx context.Context, streams []string, minIdle time.Dura
 			return fail(err)
 		case len(ids) == 0:
 			continue
+		}
+		if s.afterList != nil {
+			s.afterList()
 		}
 
 		// Kept apart before the claim is sent, not once it answers: a read on another

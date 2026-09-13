@@ -150,16 +150,7 @@ func New(cfg *Config, log zerolog.Logger) (connector *Connector, err error) {
 		return nil, err
 	}
 
-	streams, err := redisstream.New(client, redisstream.Options{
-		Instance: cfg.Instance, ClaimMinIdle: cfg.ClaimMinIdle, Block: readBlock(cfg.Heartbeat),
-		// A wake recovered by a read is handed out with the age it already has, and the
-		// claim delay outlives a lease by exactly this much: a peer must not be able to
-		// claim it before the lease this instance takes for it could have expired. Half of
-		// that slack, so the other half stays what it is for a wake read on arrival -- room
-		// for the adoption between the hand-out and the lease.
-		ReadBackMaxAge: (cfg.ClaimMinIdle - cfg.LeaseTTL) / 2,
-		Logger:         log,
-	})
+	streams, err := redisstream.New(client, streamOptions(cfg, &log))
 	if err != nil {
 		return nil, err
 	}
@@ -714,6 +705,20 @@ const readBlockShare = 2
 // readBlock is how long the transport waits for a command before answering "nothing
 // this round".
 func readBlock(heartbeat time.Duration) time.Duration { return heartbeat / readBlockShare }
+
+// streamOptions is how this instance reads its commands.
+func streamOptions(cfg *Config, log *zerolog.Logger) redisstream.Options {
+	return redisstream.Options{
+		Instance: cfg.Instance, ClaimMinIdle: cfg.ClaimMinIdle, Block: readBlock(cfg.Heartbeat),
+		// A wake recovered by a read is handed out with the age it already has, and the
+		// claim delay outlives a lease by exactly this much: a peer must not be able to
+		// claim it before the lease this instance takes for it could have expired. Half of
+		// that slack, so the other half stays what it is for a wake read on arrival -- room
+		// for the adoption between the hand-out and the lease.
+		ReadBackMaxAge: (cfg.ClaimMinIdle - cfg.LeaseTTL) / 2,
+		Logger:         *log,
+	}
+}
 
 // dispatchWithin carries out a batch, and stops when the caller's deadline runs out.
 //
