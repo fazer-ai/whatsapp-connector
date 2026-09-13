@@ -1,0 +1,412 @@
+package redisstream_test
+
+import (
+	"context"
+	"slices"
+	"testing"
+	"time"
+
+	"github.com/redis/go-redis/v9"
+
+	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
+	"github.com/fazer-ai/whatsapp-connector/internal/redisx"
+	"github.com/fazer-ai/whatsapp-connector/internal/redisx/redisxtest"
+	"github.com/fazer-ai/whatsapp-connector/internal/transport"
+	"github.com/fazer-ai/whatsapp-connector/internal/transport/redisstream"
+)
+
+// A read Redis carried out and whose answer never reached this process is the case these
+// tests are about. XREADGROUP moves what it answers with into the consumer's pending list
+// before the answer leaves the server, so a lost answer leaves commands pending under
+// this instance's name that this process never saw. `>` will not return them again, since
+// somebody has taken them, and a claim will not look at them for a whole ClaimMinIdle: 45
+// seconds with the defaults, during which newer commands for the same session are read
+// and run ahead of them (#202).
+//
+// The answer goes missing in two ways, and they fail differently. Held past the window,
+// the read comes back with the deadline's error. Dropped with the connection, go-redis
+// sends the read again on a fresh one, gets nothing, and the read comes back empty with
+// no error at all -- so nothing that waits to see a failure can be what recovers them.
+
+// cutClaimMinIdle is long enough that nothing in these tests can come back through a
+// claim. Whatever returns, returned through a read.
+const cutClaimMinIdle = 30 * time.Second
+
+// cutWindow is the heartbeat the app tests run with, which is the deadline a read gets.
+const cutWindow = 200 * time.Millisecond
+
+// cutFleet reaches Redis two ways: the transport under test through a proxy the test can
+// interfere with, and the test itself directly, so that writing a command or looking at
+// the pending list is never what the proxy catches.
+type cutFleet struct {
+	fleet
+	proxy *redisxtest.Proxy
+	via   *redisx.Client
+}
+
+// cutBackends runs a test against miniredis and, when one is named, against a real Redis:
+// reading a consumer's own pending history is exactly the kind of semantics a double can
+// get subtly wrong, and production runs the real thing.
+func cutBackends(t *testing.T, run func(t *testing.T, f cutFleet)) {
+	t.Helper()
+	for _, backend := range []struct {
+		name  string
+		fleet func(t *testing.T) (fleet, string, int)
+	}{
+		{"miniredis", func(t *testing.T) (fleet, string, int) {
+			f := newFleet(t)
+			return f, f.server.Addr(), 0
+		}},
+		{"redis", func(t *testing.T) (fleet, string, int) {
+			f := realFleet(t)
+			return f, f.rdb.Options().Addr, f.rdb.Options().DB
+		}},
+	} {
+		t.Run(backend.name, func(t *testing.T) {
+			direct, addr, db := backend.fleet(t)
+			proxy := redisxtest.Listen(t, addr)
+			// ContextTimeoutEnabled as redisx.New sets it: without it the window would stop
+			// bounding the read at the socket, and the answer could never be cut off.
+			rdb := redis.NewClient(&redis.Options{Addr: proxy.Addr(), DB: db, ContextTimeoutEnabled: true})
+			t.Cleanup(func() { _ = rdb.Close() })
+			run(t, cutFleet{fleet: direct, proxy: proxy, via: redisx.Wrap(rdb, direct.client.Keys().Prefix(), shards)})
+		})
+	}
+}
+
+func (f cutFleet) streams(t *testing.T, instance string) *redisstream.Streams {
+	t.Helper()
+	streams, err := redisstream.New(f.via, redisstream.Options{
+		Instance: instance, Block: 50 * time.Millisecond, ClaimMinIdle: cutClaimMinIdle,
+	})
+	if err != nil {
+		t.Fatalf("redisstream.New: %v", err)
+	}
+	return streams
+}
+
+// read is one pass of the connector's loop: a read bounded by one window.
+func read(t *testing.T, streams *redisstream.Streams, sids ...string) ([]transport.Delivery, error) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), cutWindow)
+	defer cancel()
+	return streams.Read(ctx, sids)
+}
+
+// loseTheAnswer has the next answer carrying marker go missing on its way to the
+// transport, the way named, while the transport reads sids. It checks the stimulus rather
+// than trusting it: the answer was caught, nothing was handed out, and the command sits
+// pending under the reader's name -- a test that went on without that would pass on a
+// read that simply never happened.
+func (f cutFleet) loseTheAnswer(t *testing.T, how string, streams *redisstream.Streams, instance, marker string, sids ...string) {
+	t.Helper()
+
+	var caught <-chan struct{}
+	release := make(chan struct{})
+	switch how {
+	case "held past the window":
+		caught = f.proxy.Hold(marker, release)
+	case "dropped with the connection":
+		caught = f.proxy.Drop(marker)
+	default:
+		t.Fatalf("no way to lose an answer called %q", how)
+	}
+	delivered, err := read(t, streams, sids...)
+	close(release)
+
+	select {
+	case <-caught:
+	default:
+		t.Fatalf("the proxy never saw an answer carrying %s (read err=%v)", marker, err)
+	}
+	if len(delivered) != 0 {
+		t.Fatalf("the read whose answer was lost handed out %v", ids(delivered))
+	}
+	if holder := f.pendingUnder(t, marker, sids...); holder != instance {
+		t.Fatalf("%s is pending under %q after its answer was lost, want %q", marker, holder, instance)
+	}
+}
+
+// pendingUnder names the consumer a command is pending under, or "" when it is not pending.
+func (f cutFleet) pendingUnder(t *testing.T, commandID string, sids ...string) string {
+	t.Helper()
+	ctx := context.Background()
+	for _, stream := range f.streamsOf(sids...) {
+		pending, err := f.rdb.XPendingExt(ctx, &redis.XPendingExtArgs{
+			Stream: stream, Group: redisstream.ConsumerGroup, Start: "-", End: "+", Count: 100,
+		}).Result()
+		if err != nil {
+			t.Fatalf("XPENDING %s: %v", stream, err)
+		}
+		for _, entry := range pending {
+			messages, err := f.rdb.XRange(ctx, stream, entry.ID, entry.ID).Result()
+			if err != nil || len(messages) != 1 {
+				t.Fatalf("XRANGE %s %s: %v", stream, entry.ID, err)
+			}
+			if messages[0].Values["id"] == commandID {
+				return entry.Consumer
+			}
+		}
+	}
+	return ""
+}
+
+func (f cutFleet) streamsOf(sids ...string) []string {
+	streams := []string{f.client.Keys().Control()}
+	for _, sid := range sids {
+		streams = append(streams, f.client.Keys().Commands(sid))
+	}
+	return streams
+}
+
+func ids(deliveries []transport.Delivery) []string {
+	out := make([]string, 0, len(deliveries))
+	for i := range deliveries {
+		out = append(out, deliveries[i].Command.ID)
+	}
+	return out
+}
+
+func ackAll(t *testing.T, deliveries []transport.Delivery) {
+	t.Helper()
+	for i := range deliveries {
+		if err := deliveries[i].Ack(context.Background()); err != nil {
+			t.Fatalf("ack %s: %v", deliveries[i].Command.ID, err)
+		}
+	}
+}
+
+// A command whose read lost its answer is handed out by the very next read, once, and as a
+// command read for the first time: nobody has run it and its sender is still waiting.
+func TestACommandWhoseReadLostItsAnswerIsHandedOutByTheNextRead(t *testing.T) {
+	cutBackends(t, func(t *testing.T, f cutFleet) {
+		for _, tc := range []struct {
+			name, how string
+			stream    func(f cutFleet) string
+			command   *protocol.Command
+		}{
+			{
+				name: "a session's command, its answer held past the window", how: "held past the window",
+				stream:  func(f cutFleet) string { return f.client.Keys().Commands("s1") },
+				command: command("cut-held", "s1", ""),
+			},
+			{
+				name: "a session's command, its connection dropped", how: "dropped with the connection",
+				stream:  func(f cutFleet) string { return f.client.Keys().Commands("s1") },
+				command: command("cut-dropped", "s1", ""),
+			},
+			{
+				// The control stream is in every read, and a wake lost there is a session that
+				// runs nowhere for the whole delay.
+				name: "a wake, its answer held past the window", how: "held past the window",
+				stream: func(f cutFleet) string { return f.client.Keys().Control() },
+				command: &protocol.Command{
+					V: protocol.Version, ID: "cut-wake", Type: protocol.CommandSessionWake, SID: "s1",
+					TS: 1787000000000, Payload: []byte(`{"desired":"connected"}`),
+				},
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				streams := f.streams(t, "inst-"+tc.command.ID)
+				if _, err := read(t, streams, "s1"); err != nil {
+					t.Fatalf("priming read: %v", err)
+				}
+				writeCommand(t, f.fleet, tc.stream(f), tc.command)
+				f.loseTheAnswer(t, tc.how, streams, "inst-"+tc.command.ID, tc.command.ID, "s1")
+
+				delivered, err := read(t, streams, "s1")
+				if err != nil {
+					t.Fatalf("the read after: %v", err)
+				}
+				if got := ids(delivered); !slices.Equal(got, []string{tc.command.ID}) {
+					t.Fatalf("the read after the lost answer handed out %v, want [%s]", got, tc.command.ID)
+				}
+				if delivered[0].Redelivered {
+					t.Error("handed out as redelivered, want it read for the first time: its sender is still waiting on it")
+				}
+				ackAll(t, delivered)
+				if holder := f.pendingUnder(t, tc.command.ID, "s1"); holder != "" {
+					t.Fatalf("%s still pending under %q after its ack", tc.command.ID, holder)
+				}
+				if again, err := read(t, streams, "s1"); err != nil || len(again) != 0 {
+					t.Fatalf("a later read handed out %v (err=%v), want nothing", ids(again), err)
+				}
+			})
+		}
+	})
+}
+
+// Per-session order is what one stream read by one consumer is for. The connect whose
+// answer was lost has to run before the disconnect written after it, or the account ends
+// connected when the operator's last word was to disconnect it.
+func TestACommandWhoseReadLostItsAnswerRunsBeforeTheOneWrittenAfterIt(t *testing.T) {
+	cutBackends(t, func(t *testing.T, f cutFleet) {
+		streams := f.streams(t, "inst-a")
+		stream := f.client.Keys().Commands("s1")
+		if _, err := read(t, streams, "s1"); err != nil {
+			t.Fatalf("priming read: %v", err)
+		}
+		writeCommand(t, f.fleet, stream, command("order-connect", "s1", ""))
+		f.loseTheAnswer(t, "held past the window", streams, "inst-a", "order-connect", "s1")
+		writeCommand(t, f.fleet, stream, command("order-disconnect", "s1", ""))
+
+		var order []string
+		for range 5 {
+			delivered, err := read(t, streams, "s1")
+			if err != nil {
+				t.Fatalf("read: %v", err)
+			}
+			order = append(order, ids(delivered)...)
+			ackAll(t, delivered)
+		}
+		if want := []string{"order-connect", "order-disconnect"}; !slices.Equal(order, want) {
+			t.Fatalf("handed out %v, want %v", order, want)
+		}
+	})
+}
+
+// The read that recovers a lost answer can lose its own. What it was recovering stays
+// pending and is recovered by the read after, still ahead of what was written since.
+func TestARecoveryThatLosesItsOwnAnswerIsTriedAgain(t *testing.T) {
+	cutBackends(t, func(t *testing.T, f cutFleet) {
+		streams := f.streams(t, "inst-a")
+		stream := f.client.Keys().Commands("s1")
+		if _, err := read(t, streams, "s1"); err != nil {
+			t.Fatalf("priming read: %v", err)
+		}
+		writeCommand(t, f.fleet, stream, command("twice-connect", "s1", ""))
+		f.loseTheAnswer(t, "held past the window", streams, "inst-a", "twice-connect", "s1")
+		writeCommand(t, f.fleet, stream, command("twice-disconnect", "s1", ""))
+		f.loseTheAnswer(t, "held past the window", streams, "inst-a", "twice-connect", "s1")
+
+		var order []string
+		for range 5 {
+			delivered, err := read(t, streams, "s1")
+			if err != nil {
+				t.Fatalf("read: %v", err)
+			}
+			order = append(order, ids(delivered)...)
+			ackAll(t, delivered)
+		}
+		if want := []string{"twice-connect", "twice-disconnect"}; !slices.Equal(order, want) {
+			t.Fatalf("handed out %v, want %v", order, want)
+		}
+	})
+}
+
+// What this process was handed and has not finished with is still pending under its
+// name, exactly like what a lost answer left there. Recovering the second must not hand
+// out the first again: not a command still running (invariant 5), and not one given back
+// unrun or forfeited, which belong to a claim and would otherwise jump back to the front
+// of the queue on every read.
+func TestRecoveringALostAnswerHandsOutNothingThisProcessWasAlreadyGiven(t *testing.T) {
+	cutBackends(t, func(t *testing.T, f cutFleet) {
+		streams := f.streams(t, "inst-a")
+		stream := f.client.Keys().Commands("s1")
+		writeCommand(t, f.fleet, stream, command("given-running", "s1", ""))
+		writeCommand(t, f.fleet, stream, command("given-back", "s1", ""))
+		writeCommand(t, f.fleet, stream, command("given-forfeited", "s1", ""))
+
+		var given []transport.Delivery
+		for len(given) < 3 {
+			delivered, err := read(t, streams, "s1")
+			if err != nil {
+				t.Fatalf("read: %v", err)
+			}
+			if len(delivered) == 0 {
+				t.Fatalf("handed out %v and then nothing, want all three", ids(given))
+			}
+			given = append(given, delivered...)
+		}
+		given[1].Release()
+		given[2].Forfeit()
+
+		writeCommand(t, f.fleet, stream, command("given-lost", "s1", ""))
+		f.loseTheAnswer(t, "held past the window", streams, "inst-a", "given-lost", "s1")
+
+		var after []string
+		for range 5 {
+			delivered, err := read(t, streams, "s1")
+			if err != nil {
+				t.Fatalf("read: %v", err)
+			}
+			after = append(after, ids(delivered)...)
+			ackAll(t, delivered)
+		}
+		if want := []string{"given-lost"}; !slices.Equal(after, want) {
+			t.Fatalf("after the lost answer the reads handed out %v, want only %v", after, want)
+		}
+	})
+}
+
+// A consumer's pending history is its own, and recovery reads nothing else. A command
+// pending under another instance may be running there right now: taking it before the
+// claim delay is how a peer's work runs twice.
+func TestRecoveringALostAnswerTakesNothingPendingUnderAnotherInstance(t *testing.T) {
+	cutBackends(t, func(t *testing.T, f cutFleet) {
+		stream := f.client.Keys().Commands("s1")
+		streams := f.streams(t, "inst-a")
+		if _, err := read(t, streams, "s1"); err != nil {
+			t.Fatalf("priming read: %v", err)
+		}
+		writeCommand(t, f.fleet, stream, command("peer-running", "s1", ""))
+		if taken, err := f.rdb.XReadGroup(context.Background(), &redis.XReadGroupArgs{
+			Group: redisstream.ConsumerGroup, Consumer: "inst-b", Streams: []string{stream, ">"}, Count: 1, Block: -1,
+		}).Result(); err != nil || len(taken) != 1 || len(taken[0].Messages) != 1 {
+			t.Fatalf("inst-b read %v (err=%v), want the one command", taken, err)
+		}
+
+		writeCommand(t, f.fleet, stream, command("mine-lost", "s1", ""))
+		f.loseTheAnswer(t, "held past the window", streams, "inst-a", "mine-lost", "s1")
+
+		var after []string
+		for range 3 {
+			delivered, err := read(t, streams, "s1")
+			if err != nil {
+				t.Fatalf("read: %v", err)
+			}
+			after = append(after, ids(delivered)...)
+		}
+		if want := []string{"mine-lost"}; !slices.Equal(after, want) {
+			t.Fatalf("inst-a handed out %v, want only %v", after, want)
+		}
+		if holder := f.pendingUnder(t, "peer-running", "s1"); holder != "inst-b" {
+			t.Fatalf("the peer's command is pending under %q, want it left with inst-b", holder)
+		}
+	})
+}
+
+// A session this instance stops reading -- its lease went to somebody else -- is not
+// recovered into this instance on the way out. What its lost answer left pending belongs
+// to the new owner, whose drain takes it at once.
+func TestALostAnswerForASessionNoLongerReadIsLeftForItsNewOwner(t *testing.T) {
+	cutBackends(t, func(t *testing.T, f cutFleet) {
+		old := f.streams(t, "inst-a")
+		if _, err := read(t, old, "s1", "s9"); err != nil {
+			t.Fatalf("priming read: %v", err)
+		}
+		writeCommand(t, f.fleet, f.client.Keys().Commands("s1"), command("kept-s1", "s1", ""))
+		writeCommand(t, f.fleet, f.client.Keys().Commands("s9"), command("moved-s9", "s9", ""))
+		f.loseTheAnswer(t, "held past the window", old, "inst-a", "moved-s9", "s1", "s9")
+
+		var kept []string
+		for range 3 {
+			delivered, err := read(t, old, "s1")
+			if err != nil {
+				t.Fatalf("read: %v", err)
+			}
+			kept = append(kept, ids(delivered)...)
+		}
+		if want := []string{"kept-s1"}; !slices.Equal(kept, want) {
+			t.Fatalf("inst-a, reading only s1, handed out %v, want only %v", kept, want)
+		}
+
+		adopted, err := f.streams(t, "inst-b").ClaimSessions(context.Background(), []string{"s9"})
+		if err != nil {
+			t.Fatalf("ClaimSessions: %v", err)
+		}
+		if got := ids(adopted); !slices.Equal(got, []string{"moved-s9"}) {
+			t.Fatalf("the new owner's drain took %v, want [moved-s9]", got)
+		}
+	})
+}
