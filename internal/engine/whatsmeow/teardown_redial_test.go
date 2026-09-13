@@ -395,6 +395,37 @@ func TestADeleteWithNothingPairedDoesNotWaitOnADial(t *testing.T) {
 	}
 }
 
+// A read that failed is not an answer, and the side it is read on is the side that decides
+// whether the socket is waited for. Counted as unpaired, a transient store error would send a
+// delete for an account that does have a device straight into whatsmeow's own logout, which
+// takes the socket lock with no context at all: the caller's deadline would stop being
+// honoured on exactly the path this change exists to bound.
+func TestADeleteWhoseStoreReadFailedStillWaitsOnTheCallersTime(t *testing.T) {
+	t.Parallel()
+
+	session, container := newTestSession(t, "5511999990010")
+	session.storeLimit = 500 * time.Millisecond
+	holdTheDial(t, session)
+	// whatsmeow still holds the device it was built with, so there is one to unlink. What is
+	// gone is the store's answer about whether there is.
+	if err := container.Close(); err != nil {
+		t.Fatalf("Close the store: %v", err)
+	}
+
+	deadline, spent := context.WithTimeout(t.Context(), 300*time.Millisecond)
+	defer spent()
+	answered := make(chan error, 1)
+	go func() { answered <- session.Delete(deadline) }()
+	select {
+	case err := <-answered:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Delete failed with %v, want the caller's deadline", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the delete took a failed store read for an account with no device and waited on whatsmeow's own lock, which no deadline reaches")
+	}
+}
+
 // And the teardown that does go through still may not wait on a dial forever. A logout
 // WhatsApp accepted runs its local half next, and the rebuild in it closes the client being
 // thrown away -- on the same lock a dial holds, with the command's own time already spent.
