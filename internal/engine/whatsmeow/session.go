@@ -1339,7 +1339,7 @@ func (s *Session) Connect(ctx context.Context, req engine.ConnectRequest) error 
 		// built at the time -- or the pairing just replaced above took its client with
 		// it. Nothing on it works, so the connect that would have failed is the connect
 		// that repairs it.
-		if err := s.recover(ctx, ctx); err != nil {
+		if err := s.recover(ctx); err != nil {
 			return fmt.Errorf("whatsmeow: %s is still without a usable device: %w", s.sid, err)
 		}
 	}
@@ -1860,7 +1860,7 @@ func (s *Session) Logout(ctx context.Context) error {
 	// logged out minutes ago, on credentials WhatsApp threw away.
 	s.emit(protocol.EventSessionLoggedOut, map[string]any{"reason": "logout_requested"})
 
-	if err := s.recoverWithin(ctx); err != nil {
+	if err := s.recoverWithin(); err != nil {
 		// The client here is on a deleted device whatever happens next, and a cleanup that
 		// stopped halfway leaves the mapping still pointing at it: rebuilding on top of
 		// that would hand the fresh client the very credentials WhatsApp threw away, so
@@ -1901,6 +1901,21 @@ func (s *Session) Delete(ctx context.Context) error {
 	s.cancelPairing()
 	_, paired, pairedErr := s.store.JID(ctx)
 	unlink := s.unlink(ctx, s.current())
+	if errors.Is(unlink, errStillDialling) {
+		// The one failure that is not "the unlink was refused": it was never attempted. The
+		// caller's time ran out while a dial held the socket, and nothing has been touched
+		// here yet -- so the teardown has not happened, and answering success would throw
+		// away the credentials without ever asking WhatsApp to remove the device. That device
+		// can never be unlinked afterwards: it stays listed on somebody's phone for good,
+		// with nothing but a log line to say so.
+		//
+		// Answered as a failure, which is what the retry has to work from, and the account is
+		// left exactly as it was for that retry to finish once the dial ends. The comment
+		// above is about the other case and still holds: an unlink WhatsApp or a socket that
+		// was down refused is a teardown that goes through, because there the retry has
+		// nothing left to do.
+		return fmt.Errorf("whatsmeow: delete %s: %w", s.sid, unlink)
+	}
 	// Whatever WhatsApp answered, this session is not coming back. settleLogout is what
 	// keeps a reconnect from dialling on credentials that are about to be gone.
 	s.settleLogout()
@@ -1921,7 +1936,7 @@ func (s *Session) Delete(ctx context.Context) error {
 			Msg("the device could not be unlinked before the session was deleted; it may still be listed on the phone")
 	}
 
-	if err := s.recoverWithin(ctx); err != nil {
+	if err := s.recoverWithin(); err != nil {
 		// Answered as a failure, unlike the refused unlink above, because here the retry
 		// has something to do: whichever half did not land is the half the next delete
 		// finishes, the credentials still sitting in the store or the client still being
@@ -2523,12 +2538,10 @@ func unanswered(err error) bool {
 func (s *Session) rebuildWithin() error {
 	ctx, cancel := context.WithTimeout(s.ctx, s.storeLimit)
 	defer cancel()
-	return s.rebuild(ctx, ctx)
+	return s.rebuild(ctx)
 }
 
-// rebuild's caller is whoever is waiting for it, and it bounds only the wait for the old
-// client to close; ctx bounds everything else.
-func (s *Session) rebuild(ctx, caller context.Context) error {
+func (s *Session) rebuild(ctx context.Context) error {
 	if s.isClosed() {
 		// Nothing left to pair with. A session that closed while this was on its way is
 		// one the layer above has already given up.
@@ -2544,13 +2557,12 @@ func (s *Session) rebuild(ctx, caller context.Context) error {
 	previous, handlerID := s.client, s.handlerID
 	s.mu.Unlock()
 	s.detach(previous, handlerID)
-	// Waited for no longer than somebody is waiting. Disconnect takes the socket lock, which
-	// a dial holds for as long as the dial lasts with no context to end it, and a delete
-	// reaches this while a reconnect is dialling exactly when its unlink was given up on for
-	// that reason (#187). Not on the store's bound alone: closing a client nothing listens to
-	// is not store work, and spending that bound on it answers a caller whose time is already
-	// up a whole bound later. The client is detached already, so nothing it does from here is
-	// heard, and the disconnect still lands the moment the dial lets go.
+	// Waited for no longer than the bound this runs on. Disconnect takes the socket lock, and
+	// a dial holds that lock for as long as the dial lasts with no context to end it: a
+	// teardown whose unlink went through while the socket dropped underneath it would answer
+	// when the dial did, which is the wait #187 is about, one step later. The client is
+	// detached already, so nothing it does from here is heard, and the disconnect still lands
+	// the moment the dial lets go.
 	closed := make(chan struct{})
 	go func() {
 		defer close(closed)
@@ -2559,7 +2571,6 @@ func (s *Session) rebuild(ctx, caller context.Context) error {
 	select {
 	case <-closed:
 	case <-ctx.Done():
-	case <-caller.Done():
 	}
 
 	// Dropped with the client it was filed under. Every path here has just forgotten the
@@ -2585,12 +2596,11 @@ func (s *Session) rebuild(ctx, caller context.Context) error {
 // to retry a teardown whose remote half can never succeed again.
 //
 // Still a short bound, and still one the session's own close ends, because a database
-// that stopped answering must not be able to hold a teardown open either. The command's
-// context comes along for the one wait that is not store work: see rebuild.
-func (s *Session) recoverWithin(caller context.Context) error {
+// that stopped answering must not be able to hold a teardown open either.
+func (s *Session) recoverWithin() error {
 	ctx, cancel := context.WithTimeout(s.ctx, s.storeLimit)
 	defer cancel()
-	return s.recover(ctx, caller)
+	return s.recover(ctx)
 }
 
 // recover puts a session that was logged out back where a fresh pairing can start:
@@ -2599,11 +2609,11 @@ func (s *Session) recoverWithin(caller context.Context) error {
 // Both halves, because a cleanup that failed leaves the mapping pointing at the revoked
 // device, and rebuilding from that hands the session the very credentials WhatsApp
 // threw away. Doing them together is what makes the retry a retry.
-func (s *Session) recover(ctx, caller context.Context) error {
+func (s *Session) recover(ctx context.Context) error {
 	if err := s.store.Forget(ctx); err != nil {
 		return err
 	}
-	return s.rebuild(ctx, caller)
+	return s.rebuild(ctx)
 }
 
 // markStale records that this session is on a client nothing works on. The next connect

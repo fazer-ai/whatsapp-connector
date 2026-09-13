@@ -227,9 +227,9 @@ func TestAProbeIsNotSharedWithATeardownOnAnotherClient(t *testing.T) {
 
 	// The session moves to a fresh client while that probe is still parked, which is what a
 	// teardown's own rebuild does.
-	spent, giveUp := context.WithCancel(t.Context())
-	giveUp()
-	if err := session.rebuild(t.Context(), spent); err != nil {
+	rebuilding, doneRebuilding := context.WithTimeout(t.Context(), 500*time.Millisecond)
+	defer doneRebuilding()
+	if err := session.rebuild(rebuilding); err != nil {
 		t.Fatalf("rebuild: %v", err)
 	}
 	asked := make(chan struct{}, 1)
@@ -293,9 +293,9 @@ func TestADialThatEndsAfterItsClientWasReplacedSaysNothing(t *testing.T) {
 	}
 
 	dialling := session.current()
-	spent, giveUp := context.WithCancel(t.Context())
-	giveUp()
-	if err := session.rebuild(t.Context(), spent); err != nil {
+	rebuilding, doneRebuilding := context.WithTimeout(t.Context(), 500*time.Millisecond)
+	defer doneRebuilding()
+	if err := session.rebuild(rebuilding); err != nil {
 		t.Fatalf("rebuild: %v", err)
 	}
 
@@ -309,7 +309,12 @@ func TestADialThatEndsAfterItsClientWasReplacedSaysNothing(t *testing.T) {
 	// time this returns.
 	dialling.IsConnected()
 
-	saysNothing(t, session, "for a dial that ended on a client the session had already replaced")
+	select {
+	case emission := <-session.Events():
+		t.Fatalf("published %q %v for a dial that ended on a client the session had already replaced",
+			emission.Type, decode(t, emission.Payload))
+	case <-time.After(300 * time.Millisecond):
+	}
 	session.mu.Lock()
 	stillDialling := session.dialing
 	session.mu.Unlock()
@@ -321,43 +326,72 @@ func TestADialThatEndsAfterItsClientWasReplacedSaysNothing(t *testing.T) {
 	}
 }
 
-// A delete in the same place gets the same bound, and then does what a delete whose unlink
-// could not be made does: forgets the account anyway and says so. The client destroyed the
-// inbox before sending it, so there is nobody left to keep the credentials for.
-//
-// Two waits stand in its way, not one. The unlink waits on the lock to send, and the
-// rebuild after it waits on the same lock to close the client being thrown away; answering
-// the first and then sitting in the second is the same hang one step later. Nor may the
-// second end on the bound the local cleanup has for the store: closing a client nothing
-// listens to any more is not store work, and spending that bound on it answers the caller
-// a whole bound after its time. Set far above the test's own bound, so it cannot be what
-// ends the wait here.
-func TestADeleteWaitingOnARedialAnswersWithinTheCallersTime(t *testing.T) {
+// A delete in the same place answers on the same bound, and answers a failure: the one
+// thing it must not do is throw the credentials away over an unlink that was never
+// attempted. A refused unlink is a teardown that goes through -- the retry has nothing left
+// to do, and the device is named in the log. This is the other case: nothing was sent, so
+// the account is left whole and the client's retry does the whole thing once the dial ends.
+// Answering success here would leave a device listed on somebody's phone that no later
+// command can ever remove, because the credentials that would sign the unlink are the ones
+// the success threw away.
+func TestADeleteWaitingOnARedialFailsWithoutTearingTheAccountDown(t *testing.T) {
 	t.Parallel()
 
 	session, container := newTestSession(t, "5511999990002")
-	session.storeLimit = time.Minute
+	if err := session.store.PutDesiredConnected(t.Context(), false); err != nil {
+		t.Fatalf("PutDesiredConnected: %v", err)
+	}
 	session.setConnected(false)
 	session.setReconnecting(true, time.Now())
 	holdTheDial(t, session)
-	deleted := session.current()
 
-	if err := answeredWithin(t, session.Delete); err != nil {
-		t.Fatalf("a delete whose unlink ran out of time answered failure (%v); the teardown is finished, and a client that republishes on failure would retry it forever", err)
+	err := answeredWithin(t, session.Delete)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Delete failed with %v, want the caller's deadline", err)
+	}
+	if _, bound, err := container.For(session.sid).JID(t.Context()); err != nil || !bound {
+		t.Fatalf("the delete forgot the credentials over an unlink it never attempted (bound=%v, err=%v); the device stays listed on the phone and nothing can remove it", bound, err)
+	}
+	wanted, err := container.Wanted(t.Context())
+	if err != nil {
+		t.Fatalf("Wanted: %v", err)
+	}
+	if len(wanted) != 1 || wanted[0].SID != session.sid {
+		t.Fatalf("the store wants %v after a delete that did nothing, want %s", wanted, session.sid)
+	}
+	saysNothing(t, session, "for a delete whose unlink was never attempted")
+	if session.Finished() != 0 {
+		t.Fatal("the session was retired for a teardown that did not happen")
+	}
+}
+
+// And the teardown that does go through still may not wait on a dial forever. A logout
+// WhatsApp accepted runs its local half next, and the rebuild in it closes the client being
+// thrown away -- on the same lock a dial holds, with the command's own time already spent.
+// The bound that half runs on is what has to end that wait.
+func TestALogoutWhatsappAcceptedDoesNotWaitOutADialToCloseTheOldClient(t *testing.T) {
+	t.Parallel()
+
+	session, container := newTestSession(t, "5511999990007")
+	session.storeLimit = 500 * time.Millisecond
+	session.logout = func(_ context.Context, client *wm.Client) error {
+		// WhatsApp accepted it, and the socket dropped on the way out: the dial that
+		// follows is what the rebuild's close of this client then waits on.
+		holdTheDialOf(t, client)
+		return nil
+	}
+
+	answered := make(chan error, 1)
+	go func() { answered <- session.Logout(t.Context()) }()
+	select {
+	case err := <-answered:
+		if err != nil {
+			t.Fatalf("Logout: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the logout was still waiting to close the client it threw away")
 	}
 	if _, bound, err := container.For(session.sid).JID(t.Context()); err != nil || bound {
-		t.Fatalf("the delete kept the pairing (bound=%v, err=%v); the session goes on being adopted for an inbox that no longer exists", bound, err)
-	}
-	// Not waiting for the old client to close is not the same as not replacing it: a session
-	// left on the deleted client answers every later command with a device that is gone.
-	if session.current() == deleted {
-		t.Fatal("the session is still on the client that was being dialled when it was deleted")
-	}
-	emission := next(t, session)
-	if emission.Type != protocol.EventSessionLoggedOut {
-		t.Fatalf("a delete published %q, want %q", emission.Type, protocol.EventSessionLoggedOut)
-	}
-	if reason := decode(t, emission.Payload)["reason"]; reason != "session_deleted" {
-		t.Fatalf("a delete published logged_out with reason %v, want session_deleted", reason)
+		t.Fatalf("the credentials survived a logout WhatsApp accepted (bound=%v, err=%v)", bound, err)
 	}
 }

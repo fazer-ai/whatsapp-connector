@@ -2767,7 +2767,7 @@ func TestASessionThatRebuiltIsStillFenced(t *testing.T) {
 	t.Parallel()
 
 	session, _ := newTestSession(t, "5511999990001")
-	if err := session.rebuild(t.Context(), t.Context()); err != nil {
+	if err := session.rebuild(t.Context()); err != nil {
 		t.Fatalf("rebuild: %v", err)
 	}
 	device := session.current().Store
