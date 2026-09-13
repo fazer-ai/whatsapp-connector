@@ -156,6 +156,29 @@ func TestAClaimedEntryIsForgottenOnceAckedOrPassed(t *testing.T) {
 		t.Fatalf("%d claimed entries still kept after the ack, want none", kept)
 	}
 
+	// Acknowledged while a page is on its way, it stays apart until that page is looked at:
+	// the page may carry it.
+	abandon()
+	acked = claimOne()
+	a.marksMu.Lock()
+	a.pagesOut++
+	a.marksMu.Unlock()
+	if err := acked.Ack(ctx); err != nil {
+		t.Fatalf("Ack: %v", err)
+	}
+	if kept := len(a.claimedPast[stream]); kept != 1 {
+		t.Fatalf("%d claimed entries kept after an ack with a page out, want the one acknowledged", kept)
+	}
+	a.marksMu.Lock()
+	a.pagesOut--
+	a.marksMu.Unlock()
+	if _, err := a.Read(ctx, []string{"s1"}); err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if kept := len(a.claimedPast[stream]); kept != 0 {
+		t.Fatalf("%d claimed entries still kept once no page was out, want none", kept)
+	}
+
 	abandon()
 	claimOne().Release()
 	writeOne(t, client, stream, "s1")

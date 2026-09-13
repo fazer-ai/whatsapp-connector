@@ -10,7 +10,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -92,6 +91,10 @@ type Streams struct {
 	marks       map[string]string
 	claimedPast map[string]map[string]struct{}
 	received    map[string]map[string]map[string]any
+	// pagesOut counts history pages sent and not yet looked at, and lettingGo holds what
+	// was acknowledged meanwhile, let go once none is left.
+	pagesOut  int
+	lettingGo map[string][]string
 }
 
 // unrunEntry is one entry given back without being carried out, and the idle time it
@@ -145,6 +148,7 @@ func New(client *redisx.Client, opts Options) (*Streams, error) {
 		marks:       make(map[string]string),
 		claimedPast: make(map[string]map[string]struct{}),
 		received:    make(map[string]map[string]map[string]any),
+		lettingGo:   make(map[string][]string),
 	}, nil
 }
 
@@ -264,9 +268,11 @@ func (s *Streams) blockWithin(ctx context.Context) (time.Duration, bool) {
 // one of those may be a lost answer's; those claimed entries are kept apart instead, and a
 // page skips them. Claims run on another goroutine, and so do the acknowledgements of what
 // they hand out, so both have to be visible to a page already on its way: a claim keeps its
-// entries apart before it sends XCLAIM, and a page skips what was kept apart when it was
-// sent as well as what is now. And the history is this consumer's alone, so what is pending under a
-// peer, which may be running there right now, is never read. On a stream no read has been
+// entries apart before it sends XCLAIM, and an acknowledgement stops keeping one apart only
+// once no page is on its way. What a claim moved here without handing it out -- its answer
+// lost, or sent again and come back empty -- stays apart too, for a later claim to hand out
+// as the redelivery it is. And the history is this consumer's alone, so what is pending
+// under a peer, which may be running there right now, is never read. On a stream no read has been
 // through yet, the mark is the start, and what an earlier process under this name left
 // pending comes back the same way. A group recreated under the read, which starts over at
 // the beginning of the stream, starts the mark over too: `>` handing out an entry at or
@@ -389,17 +395,28 @@ func (s *Streams) Read(ctx context.Context, sids []string) ([]transport.Delivery
 func (s *Streams) readHistory(ctx context.Context, streams []string, answered map[string]struct{}) ([]transport.Delivery, error) {
 	args := make([]any, 0, len(streams)+3)
 	args = append(args, ConsumerGroup, s.opts.Instance, s.opts.ReadCount)
-	// What is kept apart as the page is sent: an entry acknowledged after this is still on
-	// the page, and forgotten by the time the page is looked at.
-	keptApart := make(map[string]map[string]struct{})
 	s.marksMu.Lock()
 	for _, stream := range streams {
 		args = append(args, s.marks[stream])
-		if kept := s.claimedPast[stream]; len(kept) > 0 {
-			keptApart[stream] = maps.Clone(kept)
-		}
 	}
+	// From here until the page has been looked at, an entry acknowledged may still be on
+	// it, so it stays kept apart until then.
+	s.pagesOut++
 	s.marksMu.Unlock()
+	defer func() {
+		s.marksMu.Lock()
+		defer s.marksMu.Unlock()
+		s.pagesOut--
+		if s.pagesOut > 0 {
+			return
+		}
+		for stream, ids := range s.lettingGo {
+			for _, id := range ids {
+				delete(s.claimedPast[stream], id)
+			}
+			delete(s.lettingGo, stream)
+		}
+	}()
 
 	sent := time.Now()
 	raw, err := pendingPastScript.Run(ctx, s.client, streams, args...).Result()
@@ -420,8 +437,7 @@ func (s *Streams) readHistory(ctx context.Context, streams []string, answered ma
 		handing := make([]redis.XMessage, 0, len(page.entries))
 		s.marksMu.Lock()
 		for _, entry := range page.entries {
-			_, keptThen := keptApart[page.stream][entry.ID]
-			if _, keptNow := s.claimedPast[page.stream][entry.ID]; keptThen || keptNow {
+			if _, kept := s.claimedPast[page.stream][entry.ID]; kept {
 				continue
 			}
 			if _, fresh := answered[entry.ID]; page.stream == control && !fresh && entry.idle+trip > s.opts.ReadBackMaxAge {
@@ -468,9 +484,8 @@ func (s *Streams) readHistory(ctx context.Context, streams []string, answered ma
 	return out, nil
 }
 
-// keepApart keeps apart what a claim is about to take past a stream's mark, and returns
-// what was not kept apart already. See Read.
-func (s *Streams) keepApart(stream string, ids []string) (added []string) {
+// keepApart keeps apart what a claim is about to take past a stream's mark. See Read.
+func (s *Streams) keepApart(stream string, ids []string) {
 	s.marksMu.Lock()
 	defer s.marksMu.Unlock()
 	for _, id := range ids {
@@ -480,20 +495,20 @@ func (s *Streams) keepApart(stream string, ids []string) (added []string) {
 		if s.claimedPast[stream] == nil {
 			s.claimedPast[stream] = make(map[string]struct{})
 		}
-		if _, kept := s.claimedPast[stream][id]; !kept {
-			s.claimedPast[stream][id] = struct{}{}
-			added = append(added, id)
-		}
+		s.claimedPast[stream][id] = struct{}{}
 	}
-	return added
 }
 
-// letGo stops keeping entries apart: acknowledged, they are off the pending list and no
-// page will ever carry them to be passed; not handed out by the claim that kept them apart,
-// they are not a claim's to run.
+// letGo stops keeping acknowledged entries apart: they are off the pending list, and no page
+// sent from now on carries them to be passed. One already on its way may, so while any is,
+// they are let go when the last one has been looked at.
 func (s *Streams) letGo(stream string, ids ...string) {
 	s.marksMu.Lock()
 	defer s.marksMu.Unlock()
+	if s.pagesOut > 0 {
+		s.lettingGo[stream] = append(s.lettingGo[stream], ids...)
+		return
+	}
 	for _, id := range ids {
 		delete(s.claimedPast[stream], id)
 	}
@@ -744,10 +759,10 @@ func (s *Streams) claim(ctx context.Context, streams []string, minIdle time.Dura
 		}
 
 		// Kept apart before the claim is sent, not once it answers: a read on another
-		// goroutine can page an entry this claim has already moved here. Only what this
-		// claim kept apart is its to let go of again; the rest was kept apart by an earlier
-		// claim that handed it out, and given back, it is still a claim's.
-		added := s.keepApart(stream, ids)
+		// goroutine can page an entry this claim has already moved here. And kept apart
+		// whatever the answer, since one lost, or one sent again and come back empty, leaves
+		// entries moved here all the same; they are a later claim's. See Read.
+		s.keepApart(stream, ids)
 		messages, err := s.client.XClaim(ctx, &redis.XClaimArgs{
 			Stream:   stream,
 			Group:    ConsumerGroup,
@@ -757,17 +772,18 @@ func (s *Streams) claim(ctx context.Context, streams []string, minIdle time.Dura
 		}).Result()
 		switch {
 		case isNoGroup(err):
-			s.letGo(stream, added...)
 			s.groups.forget(stream)
 			continue
 		case err != nil && !errors.Is(err, redis.Nil):
-			// Whatever it moved here with its answer lost, nobody runs: the history
-			// hands it out.
-			s.letGo(stream, added...)
 			return fail(fmt.Errorf("redisstream: claim %s: %w", stream, err))
 		}
 		taken, handed := s.deliveriesWithIDs([]redis.XStream{{Stream: stream, Messages: messages}}, true)
-		s.letGo(stream, slices.DeleteFunc(added, func(id string) bool { return slices.Contains(handed, id) })...)
+		// What it took and could not read was acknowledged as unreadable.
+		for _, message := range messages {
+			if !slices.Contains(handed, message.ID) {
+				s.letGo(stream, message.ID)
+			}
+		}
 		if minIdle > 0 {
 			s.rememberAge(stream, minIdle, taken, handed)
 		}

@@ -42,6 +42,7 @@ type cutFleet struct {
 	fleet
 	proxy *redisxtest.Proxy
 	via   *redisx.Client
+	fake  bool
 }
 
 // cutBackends runs a test against miniredis and, when one is named, against a real Redis:
@@ -68,7 +69,10 @@ func cutBackends(t *testing.T, run func(t *testing.T, f cutFleet)) {
 			options.ContextTimeoutEnabled = true
 			rdb := redis.NewClient(&options)
 			t.Cleanup(func() { _ = rdb.Close() })
-			run(t, cutFleet{fleet: direct, proxy: proxy, via: redisx.Wrap(rdb, direct.client.Keys().Prefix(), shards)})
+			run(t, cutFleet{
+				fleet: direct, proxy: proxy, via: redisx.Wrap(rdb, direct.client.Keys().Prefix(), shards),
+				fake: backend.name == "miniredis",
+			})
 		})
 	}
 }
@@ -608,78 +612,146 @@ func TestAReadRacingAClaimHandsOutNothingTheClaimDoes(t *testing.T) {
 			}
 			ackAll(t, claimed)
 		})
+
+		t.Run("claimed and acknowledged after the page was sent", func(t *testing.T) {
+			// The command is pending here past the mark, from a read that lost its answer, and
+			// the page carrying it is on its way when a claim takes it, runs it and
+			// acknowledges it.
+			writeCommand(t, f.fleet, stream, command("late-acked", "s1", ""))
+			f.loseTheAnswer(t, "held past the window", adopter, "inst-a", "late-acked", "s1")
+
+			release := make(chan struct{})
+			caught := f.proxy.Hold("late-acked", release)
+			var delivered []transport.Delivery
+			done := make(chan error, 1)
+			go func() {
+				var err error
+				delivered, err = adopter.Read(ctx, []string{"s1"})
+				done <- err
+			}()
+			<-caught
+			claimed, err := adopter.ClaimSessions(ctx, []string{"s1"})
+			if err != nil || !slices.Equal(ids(claimed), []string{"late-acked"}) {
+				t.Fatalf("claimed %v (err=%v), want the command the lost read left", ids(claimed), err)
+			}
+			ackAll(t, claimed)
+			close(release)
+			if err := <-done; err != nil || len(delivered) != 0 {
+				t.Fatalf("the read handed out %v (err=%v), want nothing: the claim ran it", ids(delivered), err)
+			}
+		})
 	})
 }
 
-// A claim whose answer is lost has still moved what it took here, where nobody runs it, and
-// the next read hands out what that claim kept apart. What was kept apart before it, by a
-// claim that handed it out and had it given back, is still a claim's: a read handing it out
-// would run a command given back on every read after.
-func TestAClaimThatLostItsAnswerLetsGoOnlyOfWhatItKeptApart(t *testing.T) {
+// A claim whose answer is lost has still moved what it took here, reset its idle time, and
+// handed nothing out. What it took stays a claim's: the next read does not hand it out, and a
+// later claim does, as a redelivery. A read handing it out would present a command that has
+// been round the pending list as one that just arrived, and a full session queue refuses and
+// retires such a command on the strength of a caller who may have stopped listening. The same
+// holds for what was kept apart before, by a claim that handed it out and had it given back.
+func TestWhatAClaimMovedHereWithoutHearingItStaysAClaims(t *testing.T) {
 	cutBackends(t, func(t *testing.T, f cutFleet) {
-		adopter, dead := f.streams(t, "inst-a"), f.streams(t, "inst-dead")
+		const claimDelay = cutWindow / 2
+
+		adopter := f.streamsWith(t, &redisstream.Options{Instance: "inst-a", Block: 50 * time.Millisecond, ClaimMinIdle: claimDelay})
+		dead := f.streams(t, "inst-dead")
 		for _, streams := range []*redisstream.Streams{adopter, dead} {
 			if _, err := read(t, streams, "s1"); err != nil {
 				t.Fatalf("priming read: %v", err)
 			}
 		}
 		stream := f.client.Keys().Commands("s1")
-		abandon := func(commandID string) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		abandon := func(t *testing.T, commandID string) {
 			t.Helper()
 			writeCommand(t, f.fleet, stream, command(commandID, "s1", ""))
 			if taken, err := read(t, dead, "s1"); err != nil || len(taken) != 1 {
 				t.Fatalf("the peer read %v (err=%v), want the command", ids(taken), err)
 			}
 		}
-		claimLosingItsAnswer := func(commandID string) {
+		stillAClaims := func(t *testing.T, commandID string, claim func(context.Context) ([]transport.Delivery, error)) {
 			t.Helper()
+			if holder := f.pendingUnder(t, commandID, "s1"); holder != "inst-a" {
+				t.Fatalf("%s is pending under %q after the claim, want inst-a", commandID, holder)
+			}
+			if delivered, err := read(t, adopter, "s1"); err != nil || len(delivered) != 0 {
+				t.Fatalf("the next read handed out %v (err=%v), want nothing: it is a claim's", ids(delivered), err)
+			}
+			// The age is the subject: the claim that reset it needs the delay to pass again.
+			time.Sleep(claimDelay + claimDelay/2)
+			again, err := claim(ctx)
+			if err != nil || !slices.Equal(ids(again), []string{commandID}) || !again[0].Redelivered {
+				t.Fatalf("the next claim took %v (err=%v), want %s as a redelivery", ids(again), err, commandID)
+			}
+			ackAll(t, again)
+		}
+		claimSessions := func(ctx context.Context) ([]transport.Delivery, error) {
+			return adopter.ClaimSessions(ctx, []string{"s1"})
+		}
+		reclaim := func(ctx context.Context) ([]transport.Delivery, error) {
+			return adopter.Claim(ctx, []string{"s1"})
+		}
+
+		t.Run("its answer held past the window", func(t *testing.T) {
+			abandon(t, "held-claim")
 			release := make(chan struct{})
-			caught := f.proxy.Hold(commandID, release)
-			ctx, cancel := context.WithTimeout(context.Background(), cutWindow)
-			defer cancel()
-			claimed, err := adopter.ClaimSessions(ctx, []string{"s1"})
+			caught := f.proxy.Hold("held-claim", release)
+			window, stop := context.WithTimeout(ctx, cutWindow)
+			claimed, err := claimSessions(window)
+			stop()
 			close(release)
 			select {
 			case <-caught:
 			default:
-				t.Fatalf("the claim's answer carrying %s was never held (claimed %v, err=%v)", commandID, ids(claimed), err)
+				t.Fatalf("the claim's answer was never held (claimed %v, err=%v)", ids(claimed), err)
 			}
 			if err == nil || len(claimed) != 0 {
 				t.Fatalf("the claim whose answer was lost handed out %v (err=%v)", ids(claimed), err)
 			}
-			if holder := f.pendingUnder(t, commandID, "s1"); holder != "inst-a" {
-				t.Fatalf("%s is pending under %q after the claim, want inst-a", commandID, holder)
-			}
-		}
+			stillAClaims(t, "held-claim", claimSessions)
+		})
 
-		t.Run("a peer's command", func(t *testing.T) {
-			abandon("lost-claim")
-			claimLosingItsAnswer("lost-claim")
-			delivered, err := read(t, adopter, "s1")
-			if err != nil || !slices.Equal(ids(delivered), []string{"lost-claim"}) {
-				t.Fatalf("the next read handed out %v (err=%v), want the command the claim moved here", ids(delivered), err)
+		t.Run("its answer dropped with the connection", func(t *testing.T) {
+			// Sent again by go-redis on a fresh connection, the claim finds the command it
+			// already moved too young to take, and comes back empty with no error.
+			if f.fake {
+				t.Skip("miniredis's XCLAIM never checks the min idle time, so the claim sent again takes the command a second time")
 			}
-			ackAll(t, delivered)
+			abandon(t, "dropped-claim")
+			time.Sleep(claimDelay + claimDelay/2)
+			caught := f.proxy.Drop("dropped-claim")
+			claimed, err := reclaim(ctx)
+			select {
+			case <-caught:
+			default:
+				t.Fatalf("the claim's answer was never dropped (claimed %v, err=%v)", ids(claimed), err)
+			}
+			if len(claimed) != 0 {
+				t.Fatalf("the claim whose answer was dropped handed out %v (err=%v)", ids(claimed), err)
+			}
+			stillAClaims(t, "dropped-claim", reclaim)
 		})
 
 		t.Run("a command already claimed and given back", func(t *testing.T) {
-			abandon("given-back")
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			claimed, err := adopter.ClaimSessions(ctx, []string{"s1"})
+			abandon(t, "given-back")
+			claimed, err := claimSessions(ctx)
 			if err != nil || !slices.Equal(ids(claimed), []string{"given-back"}) {
 				t.Fatalf("claimed %v (err=%v), want the peer's command", ids(claimed), err)
 			}
 			claimed[0].Release()
-			claimLosingItsAnswer("given-back")
-			if delivered, err := read(t, adopter, "s1"); err != nil || len(delivered) != 0 {
-				t.Fatalf("the next read handed out %v (err=%v), want nothing: it was given back to a claim", ids(delivered), err)
+			release := make(chan struct{})
+			caught := f.proxy.Hold("given-back", release)
+			window, stop := context.WithTimeout(ctx, cutWindow)
+			lost, err := claimSessions(window)
+			stop()
+			close(release)
+			select {
+			case <-caught:
+			default:
+				t.Fatalf("the claim's answer was never held (claimed %v, err=%v)", ids(lost), err)
 			}
-			again, err := adopter.ClaimSessions(ctx, []string{"s1"})
-			if err != nil || !slices.Equal(ids(again), []string{"given-back"}) {
-				t.Fatalf("claimed %v (err=%v), want the command given back", ids(again), err)
-			}
-			ackAll(t, again)
+			stillAClaims(t, "given-back", claimSessions)
 		})
 	})
 }
