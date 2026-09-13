@@ -14,6 +14,7 @@ import (
 	"context"
 	"io"
 	"net"
+	"slices"
 	"sync"
 	"testing"
 )
@@ -74,6 +75,10 @@ func Listen(t testing.TB, target string) *Proxy {
 	return proxy
 }
 
+// markerReach is how much of an answer stays in view after it has been relayed, and so the
+// longest marker that is recognised however TCP splits it.
+const markerReach = 256
+
 // Addr is where a client should connect instead of the server.
 func (p *Proxy) Addr() string { return p.addr }
 
@@ -93,6 +98,9 @@ func (p *Proxy) Drop(marker string) <-chan struct{} {
 }
 
 func (p *Proxy) arm(marker string, release <-chan struct{}) <-chan struct{} {
+	if marker == "" || len(marker) > markerReach {
+		panic("redisxtest: a marker has to be between 1 and 256 bytes")
+	}
 	caught := make(chan struct{})
 	p.mu.Lock()
 	p.traps = append(p.traps, &trap{marker: []byte(marker), release: release, caught: caught})
@@ -100,12 +108,14 @@ func (p *Proxy) arm(marker string, release <-chan struct{}) <-chan struct{} {
 	return caught
 }
 
-// spring takes the first trap this chunk of an answer matches, if any.
-func (p *Proxy) spring(chunk []byte) *trap {
+// spring takes the first trap what the server just wrote matches, if any. seen is the
+// chunk that just arrived with the end of what came before it on the same connection in
+// front, so a marker TCP delivered in two pieces is still recognised.
+func (p *Proxy) spring(seen []byte) *trap {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for i, candidate := range p.traps {
-		if bytes.Contains(chunk, candidate.marker) {
+		if bytes.Contains(seen, candidate.marker) {
 			p.traps = append(p.traps[:i], p.traps[i+1:]...)
 			return candidate
 		}
@@ -153,10 +163,15 @@ func (p *Proxy) relay(client net.Conn, target string) {
 	}()
 
 	buf := make([]byte, 64<<10)
+	var tail []byte
 	for {
 		n, err := server.Read(buf)
 		if n > 0 {
-			if sprung := p.spring(buf[:n]); sprung != nil {
+			seen := slices.Concat(tail, buf[:n])
+			// Longer than any marker a test names, so the piece of one that ended the last
+			// chunk is always still here when the rest arrives.
+			tail = append([]byte(nil), seen[max(0, len(seen)-markerReach):]...)
+			if sprung := p.spring(seen); sprung != nil {
 				close(sprung.caught)
 				if sprung.release == nil {
 					return

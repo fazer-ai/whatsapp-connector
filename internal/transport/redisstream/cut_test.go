@@ -51,23 +51,22 @@ func cutBackends(t *testing.T, run func(t *testing.T, f cutFleet)) {
 	t.Helper()
 	for _, backend := range []struct {
 		name  string
-		fleet func(t *testing.T) (fleet, string, int)
+		fleet func(t *testing.T) fleet
 	}{
-		{"miniredis", func(t *testing.T) (fleet, string, int) {
-			f := newFleet(t)
-			return f, f.server.Addr(), 0
-		}},
-		{"redis", func(t *testing.T) (fleet, string, int) {
-			f := realFleet(t)
-			return f, f.rdb.Options().Addr, f.rdb.Options().DB
-		}},
+		{"miniredis", newFleet},
+		{"redis", realFleet},
 	} {
 		t.Run(backend.name, func(t *testing.T) {
-			direct, addr, db := backend.fleet(t)
-			proxy := redisxtest.Listen(t, addr)
-			// ContextTimeoutEnabled as redisx.New sets it: without it the window would stop
-			// bounding the read at the socket, and the answer could never be cut off.
-			rdb := redis.NewClient(&redis.Options{Addr: proxy.Addr(), DB: db, ContextTimeoutEnabled: true})
+			direct := backend.fleet(t)
+			// Everything the test's own client connects with -- credentials, database, TLS
+			// -- except where it connects to. ContextTimeoutEnabled as redisx.New sets it:
+			// without it the window would stop bounding the read at the socket, and the
+			// answer could never be cut off.
+			options := *direct.rdb.Options()
+			proxy := redisxtest.Listen(t, options.Addr)
+			options.Addr = proxy.Addr()
+			options.ContextTimeoutEnabled = true
+			rdb := redis.NewClient(&options)
 			t.Cleanup(func() { _ = rdb.Close() })
 			run(t, cutFleet{fleet: direct, proxy: proxy, via: redisx.Wrap(rdb, direct.client.Keys().Prefix(), shards)})
 		})
@@ -76,8 +75,14 @@ func cutBackends(t *testing.T, run func(t *testing.T, f cutFleet)) {
 
 func (f cutFleet) streams(t *testing.T, instance string) *redisstream.Streams {
 	t.Helper()
+	return f.streamsReading(t, instance, 0)
+}
+
+// streamsReading is streams taking at most count entries per stream a read.
+func (f cutFleet) streamsReading(t *testing.T, instance string, count int64) *redisstream.Streams {
+	t.Helper()
 	streams, err := redisstream.New(f.via, redisstream.Options{
-		Instance: instance, Block: 50 * time.Millisecond, ClaimMinIdle: cutClaimMinIdle,
+		Instance: instance, Block: 50 * time.Millisecond, ClaimMinIdle: cutClaimMinIdle, ReadCount: count,
 	})
 	if err != nil {
 		t.Fatalf("redisstream.New: %v", err)
@@ -94,11 +99,15 @@ func read(t *testing.T, streams *redisstream.Streams, sids ...string) ([]transpo
 }
 
 // loseTheAnswer has the next answer carrying marker go missing on its way to the
-// transport, the way named, while the transport reads sids. It checks the stimulus rather
-// than trusting it: the answer was caught, nothing was handed out, and the command sits
-// pending under the reader's name -- a test that went on without that would pass on a
-// read that simply never happened.
-func (f cutFleet) loseTheAnswer(t *testing.T, how string, streams *redisstream.Streams, instance, marker string, sids ...string) {
+// transport, the way named, while the transport reads sids, and returns what that read
+// handed out. It checks the stimulus rather than trusting it: the answer was caught, and
+// unless the read already handed the command out, it sits pending under the reader's name
+// -- a test that went on without that would pass on a read that simply never happened.
+//
+// Held past the window, the read fails and hands out nothing. Dropped with the connection,
+// go-redis sends it again, and the same read may already hand the command out from the
+// history it reads after.
+func (f cutFleet) loseTheAnswer(t *testing.T, how string, streams *redisstream.Streams, instance, marker string, sids ...string) []transport.Delivery {
 	t.Helper()
 
 	var caught <-chan struct{}
@@ -119,12 +128,15 @@ func (f cutFleet) loseTheAnswer(t *testing.T, how string, streams *redisstream.S
 	default:
 		t.Fatalf("the proxy never saw an answer carrying %s (read err=%v)", marker, err)
 	}
-	if len(delivered) != 0 {
-		t.Fatalf("the read whose answer was lost handed out %v", ids(delivered))
+	if how == "held past the window" && len(delivered) != 0 {
+		t.Fatalf("the read whose answer was held past its window handed out %v (err=%v)", ids(delivered), err)
 	}
-	if holder := f.pendingUnder(t, marker, sids...); holder != instance {
-		t.Fatalf("%s is pending under %q after its answer was lost, want %q", marker, holder, instance)
+	if !slices.Contains(ids(delivered), marker) {
+		if holder := f.pendingUnder(t, marker, sids...); holder != instance {
+			t.Fatalf("%s is pending under %q after its answer was lost, want %q", marker, holder, instance)
+		}
 	}
+	return delivered
 }
 
 // pendingUnder names the consumer a command is pending under, or "" when it is not pending.
@@ -212,14 +224,16 @@ func TestACommandWhoseReadLostItsAnswerIsHandedOutByTheNextRead(t *testing.T) {
 					t.Fatalf("priming read: %v", err)
 				}
 				writeCommand(t, f.fleet, tc.stream(f), tc.command)
-				f.loseTheAnswer(t, tc.how, streams, "inst-"+tc.command.ID, tc.command.ID, "s1")
+				delivered := f.loseTheAnswer(t, tc.how, streams, "inst-"+tc.command.ID, tc.command.ID, "s1")
 
-				delivered, err := read(t, streams, "s1")
-				if err != nil {
-					t.Fatalf("the read after: %v", err)
+				if len(delivered) == 0 {
+					var err error
+					if delivered, err = read(t, streams, "s1"); err != nil {
+						t.Fatalf("the read after: %v", err)
+					}
 				}
 				if got := ids(delivered); !slices.Equal(got, []string{tc.command.ID}) {
-					t.Fatalf("the read after the lost answer handed out %v, want [%s]", got, tc.command.ID)
+					t.Fatalf("by the read after the lost answer, handed out %v, want [%s]", got, tc.command.ID)
 				}
 				if delivered[0].Redelivered {
 					t.Error("handed out as redelivered, want it read for the first time: its sender is still waiting on it")
@@ -260,6 +274,36 @@ func TestACommandWhoseReadLostItsAnswerRunsBeforeTheOneWrittenAfterIt(t *testing
 			ackAll(t, delivered)
 		}
 		if want := []string{"order-connect", "order-disconnect"}; !slices.Equal(order, want) {
+			t.Fatalf("handed out %v, want %v", order, want)
+		}
+	})
+}
+
+// A read sent again after its connection died is a read of whatever is next. With one
+// entry a read, the answer carrying the connect is dropped and the read go-redis sends in
+// its place comes back with the disconnect behind it, without an error: handing out what
+// that answer carried would run the disconnect first and leave the connect below every
+// mark this process keeps, where only a claim finds it.
+func TestAReadSentAgainDoesNotHandOutWhatArrivedAfterTheCommandItLost(t *testing.T) {
+	cutBackends(t, func(t *testing.T, f cutFleet) {
+		streams := f.streamsReading(t, "inst-a", 1)
+		stream := f.client.Keys().Commands("s1")
+		if _, err := read(t, streams, "s1"); err != nil {
+			t.Fatalf("priming read: %v", err)
+		}
+		writeCommand(t, f.fleet, stream, command("resent-connect", "s1", ""))
+		writeCommand(t, f.fleet, stream, command("resent-disconnect", "s1", ""))
+		order := ids(f.loseTheAnswer(t, "dropped with the connection", streams, "inst-a", "resent-connect", "s1"))
+
+		for range 5 {
+			delivered, err := read(t, streams, "s1")
+			if err != nil {
+				t.Fatalf("read: %v", err)
+			}
+			order = append(order, ids(delivered)...)
+			ackAll(t, delivered)
+		}
+		if want := []string{"resent-connect", "resent-disconnect"}; !slices.Equal(order, want) {
 			t.Fatalf("handed out %v, want %v", order, want)
 		}
 	})

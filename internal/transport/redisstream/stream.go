@@ -81,10 +81,7 @@ type Streams struct {
 	unrun   map[string][]unrunEntry
 
 	// received is, per stream, the newest entry this process has been handed, by a read or
-	// by a claim. It is what tells the two kinds of entry pending under this instance's
-	// name apart. One whose read lost its answer was never handed to anybody here, and `>`
-	// only ever hands out what is newer than all of it. Everything this process was handed
-	// -- still running, given back, forfeited -- is at or below it.
+	// by a claim: the mark Read reads this consumer's history past. See Read.
 	receivedMu sync.Mutex
 	received   map[string]string
 }
@@ -194,11 +191,11 @@ func (s *Streams) Reply(ctx context.Context, replyTo string, reply protocol.Repl
 // window costs a short read, never no read.
 //
 // A third of what is left stays unspent, for the round trips the block does not cover:
-// ensuring a group on a stream not seen before, taking back what an earlier read lost,
-// and the answer's own transit. A read cut off by the deadline mid-flight is the failure
+// ensuring a group on a stream not seen before, the answer's own transit, and reading
+// back what the answer moved in. A read cut off by the deadline mid-flight is the failure
 // worth paying that for -- the server may have just moved a command into this consumer's
-// pending list when the connection dies, and although the next read takes it back, that
-// is a window later than it could have run.
+// pending list when the connection dies, and although the next read hands it out, that is
+// a window later than it could have run.
 //
 // A window too thin to name a block in milliseconds is the one case with no read at
 // all: what is left cannot express the reserve, and a non-blocking read would spend a
@@ -219,9 +216,37 @@ func (s *Streams) blockWithin(ctx context.Context) (time.Duration, bool) {
 }
 
 // Read returns the commands waiting for the sessions this instance owns, plus the
-// fleet-wide ones. `>` asks for entries no consumer in the group has taken yet; anything
-// already taken and not acknowledged is Claim's business, with one exception, taken
-// first: what a read of this process took and never got the answer to.
+// fleet-wide ones.
+//
+// It takes two trips, and neither hands out what the other returned. `>` asks for entries
+// no consumer in the group has taken yet, which moves them into this consumer's pending
+// list, and waits for some if there are none. What is handed out is then read back from
+// that list: this consumer's own history, past the newest entry this process has already
+// been handed on each stream.
+//
+// The answer to `>` cannot be what is handed out, because it can go missing with its
+// entries already moved (#202). Held past the window, the read returns the deadline's
+// error. Dropped with the connection, go-redis sends the read again on a fresh one, and the
+// read comes back with whatever arrived since -- or with nothing and no error at all. The
+// entries of the lost answer are then pending under this instance's name with nobody here
+// having seen them: `>` will not return them again, since somebody has taken them, and a
+// claim will not look at them for a whole ClaimMinIdle, while newer commands for the same
+// session are read and run ahead of them. The history has them either way, and in stream
+// order, ahead of anything newer.
+//
+// The mark is what keeps the history to what nobody here has seen. Everything this process
+// was handed -- still running, given back, forfeited -- is at or below it, and none of that
+// may come back through a read: a running command would run twice, and one given back is a
+// claim's to hand out and would otherwise jump the queue on every read. Anything moved in by
+// `>` is above it, since `>` only returns what is newer than all of it. And the history is
+// this consumer's alone, so what is pending under a peer, which may be running there right
+// now, is never read. On a stream this process has been handed nothing from, the mark is
+// the start, and what an earlier process under this name left pending comes back the same
+// way.
+//
+// A history read that fails leaves what `>` moved in pending above the mark, for the
+// history of the next read to hand out. Anything already taken and not acknowledged below
+// the mark is Claim's business.
 func (s *Streams) Read(ctx context.Context, sids []string) ([]transport.Delivery, error) {
 	streams := s.streamsFor(sids)
 	if len(streams) == 0 {
@@ -238,17 +263,9 @@ func (s *Streams) Read(ctx context.Context, sids []string) ([]transport.Delivery
 	}
 	// Before the read, because the read is what destroys the reading this is taken from.
 	s.reportTrimmed(ctx, fresh)
-
-	// Ahead of `>`, because what it takes back is older than anything `>` can return, and
-	// handing out newer commands for a session first is the reordering it exists to undo.
-	lost, err := s.takeBackLost(ctx, streams)
-	if err != nil || len(lost) > 0 {
-		return lost, err
-	}
-
-	// And again after both, because those trips spend the same window the block is
-	// measured against: a block decided before them can outlive the deadline by whatever
-	// they took, which is the severed read this reserve exists to prevent.
+	// And again after it, because that trip spends the same window the block is measured
+	// against: a block decided before it can outlive the deadline by whatever the ensure
+	// took, which is the severed read this reserve exists to prevent.
 	block, room := s.blockWithin(ctx)
 	if !room {
 		return nil, nil
@@ -261,10 +278,11 @@ func (s *Streams) Read(ctx context.Context, sids []string) ([]transport.Delivery
 		Count:    s.opts.ReadCount,
 		Block:    block,
 	}
-	result, err := s.client.XReadGroup(ctx, args).Result()
+	err = s.client.XReadGroup(ctx, args).Err()
 	switch {
 	case errors.Is(err, redis.Nil):
-		return nil, nil
+		// Nothing new, and the history is still worth the trip: a read that lost its answer
+		// and was sent again comes back exactly like this.
 	case isNoGroup(err):
 		// The group went away under us (a flush, an operator). Forgetting the streams
 		// is what makes the next call recreate it instead of failing forever.
@@ -276,52 +294,13 @@ func (s *Streams) Read(ctx context.Context, sids []string) ([]transport.Delivery
 		}
 		return nil, fmt.Errorf("redisstream: read commands: %w", err)
 	}
-	return s.handOutRead(result), nil
+	return s.readHistory(ctx, streams)
 }
 
-// handOutRead turns what a read returned into deliveries.
-func (s *Streams) handOutRead(result []redis.XStream) []transport.Delivery {
-	var out []transport.Delivery
-	for _, stream := range result {
-		taken, ids := s.deliveriesWithIDs([]redis.XStream{stream}, false)
-		// A read entry starts at zero idle and stays there until somebody touches it, so
-		// one this instance gives back unrun is claimable by nobody — not by `>`, which
-		// returns only what no consumer has taken, and not by a claim, which will not
-		// look at it for a whole delay. Recording the delay as its age has the next
-		// reclaim see it instead, which for a command carrying a deadline is the
-		// difference between running late and expiring unrun.
-		s.rememberAge(stream.Stream, s.opts.ClaimMinIdle, taken, ids)
-		out = append(out, taken...)
-	}
-	return out
-}
-
-// takeBackLost hands out what an earlier read of this process took and never got the
-// answer to.
-//
-// XREADGROUP moves the entries it answers with into this consumer's pending list before
-// the answer leaves the server. When the answer is lost on the way -- held past the
-// window, or dropped with the connection -- those entries are pending under this
-// instance's name and nobody here has seen them. `>` will not return them again, since
-// somebody has taken them, and a claim will not look at them for a whole ClaimMinIdle,
-// while newer commands for the same session are read and run ahead of them (#202). A
-// failed read is not a reliable sign it happened, either: a connection that dies after the
-// server answered has go-redis send the read again on a fresh one, and that read comes
-// back empty and without an error. So this runs before every `>`, and costs a round trip
-// that returns nothing almost every time.
-//
-// It reads this consumer's own history, never another's: an entry pending under a peer
-// may be running there right now. And only past the newest entry this process was handed
-// on each stream, which is what keeps it to the lost ones. Everything else pending here
-// was handed out, so it is at or below that mark: a command still running, which must not
-// run twice, and one given back or forfeited, which is a claim's to hand out again and
-// would otherwise jump back to the front of its stream on every read. On a stream this
-// process has been handed nothing from, the mark is the start, and what an earlier
-// process under this name left pending comes back the same way.
-//
-// What it takes back is handed out as read for the first time, not as redelivered: nobody
-// has run it, and whoever sent it is still waiting on the reply.
-func (s *Streams) takeBackLost(ctx context.Context, streams []string) ([]transport.Delivery, error) {
+// readHistory hands out what is pending under this consumer past the mark on each stream.
+// It never waits, and it moves nothing: an answer it loses leaves the same entries pending
+// for the next one.
+func (s *Streams) readHistory(ctx context.Context, streams []string) ([]transport.Delivery, error) {
 	marks := make([]string, len(streams))
 	s.receivedMu.Lock()
 	for i, stream := range streams {
@@ -340,19 +319,27 @@ func (s *Streams) takeBackLost(ctx context.Context, streams []string) ([]transpo
 		// A history read never waits; -1 is go-redis for leaving BLOCK out.
 		Block: -1,
 	}).Result()
-	switch {
-	case isNoGroup(err):
-		// The read below finds the group gone as well, and forgets it.
-		return nil, nil
-	case err != nil:
-		// Lost the same way the read it was recovering was. Nothing moved: a history read
-		// takes no new entries, so what was pending is pending still, for the next read.
+	if err != nil {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		return nil, fmt.Errorf("redisstream: take back what a lost read left pending: %w", err)
+		return nil, fmt.Errorf("redisstream: read commands back: %w", err)
 	}
-	return s.handOutRead(result), nil
+	var out []transport.Delivery
+	for _, stream := range result {
+		// Handed out as read for the first time, not as redelivered, whichever answer it
+		// first arrived in: nobody has run it, and whoever sent it is still waiting.
+		taken, ids := s.deliveriesWithIDs([]redis.XStream{stream}, false)
+		// A read entry starts at zero idle and stays there until somebody touches it, so
+		// one this instance gives back unrun is claimable by nobody — not by `>`, which
+		// returns only what no consumer has taken, and not by a claim, which will not
+		// look at it for a whole delay. Recording the delay as its age has the next
+		// reclaim see it instead, which for a command carrying a deadline is the
+		// difference between running late and expiring unrun.
+		s.rememberAge(stream.Stream, s.opts.ClaimMinIdle, taken, ids)
+		out = append(out, taken...)
+	}
+	return out, nil
 }
 
 // Claim takes over commands another instance read and never acknowledged, which is
