@@ -1791,11 +1791,15 @@ func (s *Session) Logout(ctx context.Context) error {
 
 	s.cancelPairing()
 	if err := s.logout(ctx, s.current()); err != nil {
-		if sentNothing(err) {
-			// Nothing was sent, and the device is untouched on both sides. Clearing
-			// credentials that still resume would cost the operator a fresh pairing for
-			// a logout that visibly failed, while WhatsApp goes on listing the device
-			// they asked to remove.
+		if sentNothing(err) || unanswered(err) {
+			// Nothing WhatsApp said has revoked the device, and it is untouched on both
+			// sides: either nothing was sent, or the request went out and no answer came
+			// back, which whatsmeow returns from before it disconnects or deletes
+			// anything. Clearing credentials that still resume would cost the operator a
+			// fresh pairing for a logout that visibly failed, while WhatsApp goes on
+			// listing the device they asked to remove. When WhatsApp did process a request
+			// that lost its answer, the reconnect is told so, and the session ends there,
+			// on a fact; when it did not, the client's retry finds the session still up.
 			//
 			// The state is left exactly as it was, and that is the same point twice: the
 			// commonest way to get here is a session whatsmeow is already reconnecting.
@@ -2383,6 +2387,31 @@ func sentNothing(err error) bool {
 	return errors.Is(err, wm.ErrNotConnected) ||
 		errors.Is(err, wm.ErrNotLoggedIn) ||
 		errors.Is(err, wm.ErrClientIsNil)
+}
+
+// logoutRequestFailed is how whatsmeow's Logout words a failure of the request itself, as
+// against the local cleanup it runs once WhatsApp has accepted it. Pinned to the library by
+// TestWhatsmeowStillWordsAFailedLogoutRequestTheSameWay.
+const logoutRequestFailed = "error sending logout request: "
+
+// unanswered reports whether a logout's request went out and came back with no answer,
+// which leaves the credentials as good as sentNothing does: nobody knows whether WhatsApp
+// processed it, and whatsmeow returns before it touches anything here.
+//
+// Any DisconnectedError, not ErrIQDisconnected: its Is compares the action's name, and the
+// retry whatsmeow makes after a reconnect names it "info query (retry)".
+func unanswered(err error) bool {
+	var disconnected *wm.DisconnectedError
+	if errors.As(err, &disconnected) || errors.Is(err, wm.ErrIQTimedOut) {
+		return true
+	}
+	// The one error both steps can end on. The cleanup runs on the same context, so a store
+	// that stalls there ends it too, after WhatsApp revoked the device; only the request
+	// step's own wording tells the two apart.
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return strings.HasPrefix(err.Error(), logoutRequestFailed)
+	}
+	return false
 }
 
 // rebuild puts the session on a fresh client.
