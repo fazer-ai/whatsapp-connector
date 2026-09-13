@@ -45,19 +45,21 @@ func TestLiveReuse(t *testing.T) {
 	t.Cleanup(endpoint.Close)
 
 	subject, counterpart, container := liveBoth(t, MediaOptions{Blobs: blobs, BaseURL: endpoint.URL})
-	events := watch(t, subject)
-	for _, s := range []*Session{subject, counterpart} {
-		if err := s.Connect(t.Context(), engine.ConnectRequest{Pairing: "resume"}); err != nil {
-			t.Fatalf("Connect: %v", err)
-		}
-	}
-	events.awaitState(t, "open", 2*time.Minute)
 
 	// Where the file is going: the account under test, as the store knows it.
-	to, bound, err := container.For(liveSID).JID(t.Context())
-	if err != nil || !bound {
-		t.Fatalf("%s is not paired, so there is nobody to send to (bound=%v, err=%v)", liveSID, bound, err)
-	}
+	to := liveMustBePaired(t, container, liveSID)
+	liveMustBePaired(t, container, liveCounterpartSID)
+
+	// Watched before either connects, because the event that matters arrives on the
+	// subject as soon as the counterpart's send lands.
+	events := watch(t, subject)
+	// Each side waited on separately, and the sender as much as the receiver. Connect
+	// answers once the socket is open and authentication finishes after it, so a send
+	// issued on the strength of the other account being up is refused `not_connected` by
+	// a session that was simply slower.
+	resume := engine.ConnectRequest{Pairing: "resume"}
+	liveResumeAsking(t, subject, resume)
+	liveResumeAsking(t, counterpart, resume)
 
 	// The second account sends a real file, fetched from here over HTTP the way a client's
 	// outbound attachment is.
