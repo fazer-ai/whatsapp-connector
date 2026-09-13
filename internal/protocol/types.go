@@ -40,8 +40,6 @@ const (
 	EventGroupUpdated                EventType = "group.updated"
 	EventGroupPictureChanged         EventType = "group.picture_changed"
 	EventGroupActivity               EventType = "group.activity"
-	EventAccountReachoutTimelock     EventType = "account.reachout_timelock"
-	EventAccountNewChatCap           EventType = "account.new_chat_cap"
 	EventCallOffer                   EventType = "call.offer"
 	EventCallTerminate               EventType = "call.terminate"
 	EventHistorySync                 EventType = "history.sync"
@@ -94,12 +92,13 @@ const (
 	CommandCallReject              CommandType = "call.reject"
 )
 
-// AllEventTypes lists every event type in the contract. Eleven of them have no
-// producer in this build, and they are marked below: a client may match on one and
-// never see it, the way it may branch on a reserved error code in errors.go. They stay
-// in the catalog because removing one narrows what a client may already match on, and
-// because Valid and the fixture test are about the contract rather than about this
-// build's reach.
+// AllEventTypes lists every event type in the contract. Nine of them have no producer
+// in this build, and they are marked below: a client may match on one and never see it,
+// the way it may branch on a reserved error code in errors.go. They stay in the catalog
+// because some producer could emit each of them one day, and because Valid and the
+// fixture test are about the contract rather than about this build's reach. A type no
+// producer can ever emit is removed instead, which is how the two account limit events
+// left (contract/README.md, under Compatibility).
 var AllEventTypes = []EventType{
 	EventSessionState,
 	EventSessionLoggedOut,
@@ -128,17 +127,15 @@ var AllEventTypes = []EventType{
 	EventChatPresence,
 	EventPresenceUpdate,
 	// No producer, and each waits on the milestone its family belongs to: contacts,
-	// groups and calls are M3, the two account limits are M5, and the history replay is
-	// M6. The three group events interleaved here are the exception and are marked one by
-	// one, because the session's event handler publishes them now.
+	// groups and calls are M3, and the history replay is M6. The three group events
+	// interleaved here are the exception and are marked one by one, because the
+	// session's event handler publishes them now.
 	EventContactPictureChanged,
 	EventContactIdentityChanged,
 	EventGroupJoined,  // produced
 	EventGroupUpdated, // produced
 	EventGroupPictureChanged,
 	EventGroupActivity, // produced
-	EventAccountReachoutTimelock,
-	EventAccountNewChatCap,
 	EventCallOffer,
 	EventCallTerminate,
 	EventHistorySync,

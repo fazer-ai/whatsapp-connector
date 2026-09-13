@@ -14,7 +14,7 @@ import (
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 )
 
-// Eleven event types in the contract have nothing in this build that produces them,
+// Nine event types in the contract have nothing in this build that produces them,
 // and types.go marks each one. A comment is all that can be written there, and a comment
 // is what goes stale: the day somebody wires up `group.updated`, nothing makes them come
 // back here and say so, and the catalog then tells a client the opposite of the truth
@@ -33,8 +33,6 @@ var eventTypesWithNoProducer = []protocol.EventType{
 	protocol.EventContactPictureChanged,
 	protocol.EventContactIdentityChanged,
 	protocol.EventGroupPictureChanged,
-	protocol.EventAccountReachoutTimelock,
-	protocol.EventAccountNewChatCap,
 	protocol.EventCallOffer,
 	protocol.EventCallTerminate,
 	protocol.EventHistorySync,

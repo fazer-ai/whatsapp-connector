@@ -139,6 +139,11 @@ whatever the connector published while no client was running is still delivered.
 NOT bump it: consumers must ignore unknown event types and unknown payload fields,
 which is why payload objects allow additional properties while frames do not.
 
+Removing an event type that no producer has ever published does not bump it either:
+no consumer can have received one, so there is nothing for an older one to lose. That is
+how `account.reachout_timelock` and `account.new_chat_cap` left. Removing a type that
+something does publish, a command, or an error code is a breaking change.
+
 A connector advertises `protocol{min,max}` in its Redis registry entry and supports
 `N` and `N-1`. Clients refuse to talk to a connector whose range does not overlap
 theirs, and the connector is always upgraded first.
@@ -246,12 +251,17 @@ theirs, and the connector is always upgraded first.
   command for a session nobody is running is delivered to nobody, so the caller waits out
   its own deadline instead. Which four is marked in `internal/protocol/types.go` and held
   there by a test, so wiring one up without saying so fails the build.
-- Fourteen of the event types have no producer in this connector either, and the same
+- Nine of the event types have no producer in this connector either, and the same
   reasoning holds: a client may match on one and never see it. Unlike a command, nothing
   says so at the time -- a command it does not implement comes back `unsupported`, while
   an event that is never published is indistinguishable from one that has not happened.
-  Which fourteen is marked in `internal/protocol/types.go` and held there by a test, so
+  Which nine is marked in `internal/protocol/types.go` and held there by a test, so
   the marking is what the build does rather than what it did when somebody last looked.
+  An unproduced type stays only while some producer could emit it one day:
+  `account.reachout_timelock` and `account.new_chat_cap` were removed because none can.
+  whatsmeow exposes no WhatsApp Business messaging limit, and uazapi, the other provider
+  behind this contract, reports its limits through the instance status rather than by
+  event.
 - A `party` carries both of WhatsApp's namespaces for one person only where this account was in a position to know they are the same person. A LID exists so somebody can take part in a conversation without handing over their number, and which accounts get to see the number behind one is granted per account. So the two halves are linked only where WhatsApp showed this account they belong together: an event that carried both, a group listing that named a participant by each, or the account's own pair. Otherwise a party goes out with the half the event carried, and a client should treat the other as not yet known rather than as absent for good: the next message from the same person usually carries both. A deployment hosting accounts for more than one operator is where this is load-bearing, because the device store's mapping table is shared by all of them.
 - Three of the codes are about *who* failed, and the distinction is what an operator
   reads first: `wa_error` is WhatsApp refusing, `provider_unavailable` is a dependency
@@ -271,7 +281,7 @@ connector that is `contact.info` and `history.request` below, plus `session.upda
 
 | Command | `result` |
 |---|---|
-| `session.connect`, `session.status` | `connection_state`, which also carries `reachout_time_lock` and `new_chat_cap` where a connector reports them. This one does not fill either yet |
+| `session.connect`, `session.status` | `connection_state`, which also carries `reachout_time_lock` and `new_chat_cap` where a connector reports them. This one does not fill either: whatsmeow exposes no WhatsApp Business messaging limit to fill them with |
 | `admin.ping` | `{ "inst": string, "version": string, "sessions": integer }` |
 | `message.send`, `message.edit`, `message.react` | `{ "message_id": string, "timestamp": timestamp_ms, "client_ref": string\|null }`. `message.react` is refused with `unsupported` on a channel, which names a post by a server id the contract has no field for |
 | `message.revoke` | `null`. Refused with `unsupported` on a channel: WhatsApp answers the deletion without an error and leaves the post up, so reporting success would tell the client a post is gone while every follower still sees it |

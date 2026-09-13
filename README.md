@@ -226,7 +226,7 @@ restart, and reports itself healthy while doing it.
 | **M2** ✅ | Messages in and out (text, media, location, contact, reaction, edit, revoke, quoted, mentions), receipts, read marks, chat presence, account presence, idempotent sends. All of them are in both ways, and a body this build has no arm for arrives as a placeholder rather than disappearing, and one WhatsApp masked from every linked device says so rather than reading as a type this build cannot render. What it leaves behind is in the issues rather than here: a presence state is dropped when the publisher has stopped answering and the queue is full ([#47](https://github.com/fazer-ai/whatsapp-connector/issues/47)), and one delayed across a reconnect is published as if it were fresh ([#49](https://github.com/fazer-ai/whatsapp-connector/issues/49)) |
 | **M3** | Groups, contacts, calls |
 | **M4** | Multi-instance under load, quarantine, metrics/lag/DLQ, operations docs |
-| **M5** | Pairing code, passkey relay, per-session proxy, account limits |
+| **M5** | Pairing code, passkey relay, per-session proxy |
 | **M6** | Opt-in history sync |
 
 ## License
