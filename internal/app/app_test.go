@@ -22,6 +22,7 @@ import (
 	"github.com/fazer-ai/whatsapp-connector/internal/media"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 	"github.com/fazer-ai/whatsapp-connector/internal/redisx"
+	"github.com/fazer-ai/whatsapp-connector/internal/redisx/redisxtest"
 	"github.com/fazer-ai/whatsapp-connector/internal/session"
 	"github.com/fazer-ai/whatsapp-connector/internal/transport/redisstream"
 )
@@ -599,6 +600,86 @@ func TestASessionWithALongBacklogIsDrainedBeforeItIsRead(t *testing.T) {
 			t.Fatalf("connection=%v after a disconnect the drain left behind came back, want open", status["connection"])
 		}
 		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// A read whose answer goes missing on its way back has already had its commands moved
+// under this instance's name in Redis, and `>` never returns them again. Before #202 the
+// only way back was the heartbeat's claim, a whole claim delay later -- 7.5s here, 45s with
+// the defaults -- while the disconnect the operator sent next was read and run first, and
+// the account ended connected. This is the flake #202 was opened for, forced instead of
+// waited for: on CI the answer was lost to a loaded runner, here to a proxy holding it.
+func TestAConnectWhoseReadLostItsAnswerStillRunsBeforeTheDisconnectSentAfterIt(t *testing.T) {
+	server := miniredis.RunT(t)
+	proxy := redisxtest.Listen(t, server.Addr())
+	connector := start(t, proxy.Addr(), "inst-a", map[string]string{
+		"WAC_LEASE_TTL": "7s", "WAC_CLAIM_MIN_IDLE": "7500ms",
+	})
+	c := newClient(t, server.Addr())
+	ctx := context.Background()
+
+	const sid = "2f1c6f0e-0000-4000-8000-0000000000c3"
+	c.send(ctx, c.key.Control(), &protocol.Command{
+		V: protocol.Version, ID: "wake-lost", Type: protocol.CommandSessionWake, SID: sid,
+		TS: time.Now().UnixMilli(), Payload: json.RawMessage(`{"desired":"connected"}`),
+	})
+	waitFor(t, "the session to be adopted", func() bool { return connector.Sessions() == 1 })
+
+	release := make(chan struct{})
+	caught := proxy.Hold("lost-connect", release)
+	c.send(ctx, c.key.Commands(sid), &protocol.Command{
+		V: protocol.Version, ID: "lost-connect", Type: protocol.CommandSessionConnect, SID: sid,
+		TS: time.Now().UnixMilli(), ReplyTo: c.key.Reply("lost-connect"), Payload: json.RawMessage(`{"pairing":"resume"}`),
+	})
+	select {
+	case <-caught:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the connector never read the connect, so no answer was there to lose")
+	}
+	// Not a synchronisation: the read's deadline was fixed when it was sent, at most one
+	// heartbeat before the answer was caught, so three heartbeats later it has passed however
+	// the goroutines were scheduled, and the answer arrives to a read that gave up on it.
+	time.Sleep(600 * time.Millisecond)
+	close(release)
+
+	c.send(ctx, c.key.Commands(sid), &protocol.Command{
+		V: protocol.Version, ID: "lost-disconnect", Type: protocol.CommandSessionDisconnect, SID: sid,
+		TS: time.Now().UnixMilli(), ReplyTo: c.key.Reply("lost-disconnect"), Payload: json.RawMessage(`{}`),
+	})
+
+	// Well inside the claim delay: an answer here came back through a read, not a claim.
+	if reply := c.await(ctx, "lost-connect", 2*time.Second); !reply.OK {
+		t.Fatalf("the connect was refused: %+v", reply)
+	}
+	if reply := c.await(ctx, "lost-disconnect", 2*time.Second); !reply.OK {
+		t.Fatalf("the disconnect was refused: %+v", reply)
+	}
+
+	type state struct {
+		State  string `json:"state"`
+		Reason string `json:"reason"`
+	}
+	lastState := func() state {
+		var last state
+		for _, event := range c.events(ctx, sid) {
+			if event.Type != protocol.EventSessionState {
+				continue
+			}
+			if err := json.Unmarshal(event.Payload, &last); err != nil {
+				t.Fatalf("unmarshal a session.state payload: %v", err)
+			}
+		}
+		return last
+	}
+	waitFor(t, "the disconnect to be the last word", func() bool {
+		last := lastState()
+		return last.State == "close" && last.Reason == "disconnect_requested"
+	})
+	// Held a little: a connect that came back late would reopen the account after the
+	// close above, which is the order this test exists to catch.
+	time.Sleep(time.Second)
+	if last := lastState(); last.State != "close" {
+		t.Fatalf("session.state ended %q (reason %q), want the account left disconnected", last.State, last.Reason)
 	}
 }
 
