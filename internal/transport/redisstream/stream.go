@@ -345,10 +345,8 @@ func (s *Streams) Read(ctx context.Context, sids []string) ([]transport.Delivery
 		}
 		return nil, fmt.Errorf("redisstream: read commands: %w", err)
 	}
-	// Entry ids are unique within a stream, not across streams, and only the control
-	// stream's ids are asked about.
-	control := s.client.Keys().Control()
-	answered := make(map[string]struct{})
+	// Per stream, because entry ids are unique within a stream, not across streams.
+	answered := make(map[string]map[string]struct{})
 	s.marksMu.Lock()
 	// Only a stream still read will have a page carry what it received. A page empties a
 	// stream's share as it passes it, so this is almost always nothing to look at.
@@ -378,11 +376,9 @@ func (s *Streams) Read(ctx context.Context, sids []string) ([]transport.Delivery
 		for _, message := range stream.Messages {
 			s.received[stream.Stream][message.ID] = message.Values
 		}
-		if stream.Stream != control {
-			continue
-		}
+		answered[stream.Stream] = make(map[string]struct{}, len(stream.Messages))
 		for _, message := range stream.Messages {
-			answered[message.ID] = struct{}{}
+			answered[stream.Stream][message.ID] = struct{}{}
 		}
 	}
 	s.marksMu.Unlock()
@@ -391,8 +387,8 @@ func (s *Streams) Read(ctx context.Context, sids []string) ([]transport.Delivery
 
 // readHistory hands out what is pending under this consumer past the mark on each stream.
 // It never waits, and it only looks: an answer it loses leaves everything as it found it,
-// for the next one. answered is what the `>` of the same read carried on the control stream.
-func (s *Streams) readHistory(ctx context.Context, streams []string, answered map[string]struct{}) ([]transport.Delivery, error) {
+// for the next one. answered is what the `>` of the same read carried, per stream.
+func (s *Streams) readHistory(ctx context.Context, streams []string, answered map[string]map[string]struct{}) ([]transport.Delivery, error) {
 	args := make([]any, 0, len(streams)+3)
 	args = append(args, ConsumerGroup, s.opts.Instance, s.opts.ReadCount)
 	s.marksMu.Lock()
@@ -411,9 +407,7 @@ func (s *Streams) readHistory(ctx context.Context, streams []string, answered ma
 			return
 		}
 		for stream, ids := range s.lettingGo {
-			for _, id := range ids {
-				delete(s.claimedPast[stream], id)
-			}
+			s.forget(stream, ids)
 			delete(s.lettingGo, stream)
 		}
 	}()
@@ -434,7 +428,7 @@ func (s *Streams) readHistory(ctx context.Context, streams []string, answered ma
 	control := s.client.Keys().Control()
 	var out []transport.Delivery
 	for _, page := range pages {
-		handing := make([]redis.XMessage, 0, len(page.entries))
+		handing := make([]pendingEntry, 0, len(page.entries))
 		s.marksMu.Lock()
 		for _, entry := range page.entries {
 			if _, kept := s.claimedPast[page.stream][entry.ID]; kept {
@@ -448,10 +442,11 @@ func (s *Streams) readHistory(ctx context.Context, streams []string, answered ma
 			if trimmed {
 				entry.Values = values
 			}
-			if _, fresh := answered[entry.ID]; page.stream == control && !fresh && !trimmed && entry.idle+trip > s.opts.ReadBackMaxAge {
+			_, entry.fresh = answered[page.stream][entry.ID]
+			if page.stream == control && !entry.fresh && !trimmed && entry.idle+trip > s.opts.ReadBackMaxAge {
 				continue
 			}
-			handing = append(handing, entry.XMessage)
+			handing = append(handing, entry)
 		}
 		// Past everything on the page, what was handed out and what was skipped alike: a
 		// page is every entry pending here up to its last, and what it skipped belongs to
@@ -474,9 +469,17 @@ func (s *Streams) readHistory(ctx context.Context, streams []string, answered ma
 		}
 		s.marksMu.Unlock()
 
-		// Handed out as read for the first time, not as redelivered, whichever answer it
-		// first arrived in: nobody has run it, and whoever sent it is still waiting.
-		taken, ids := s.deliveriesWithIDs([]redis.XStream{{Stream: page.stream, Messages: handing}}, false)
+		// Handed out as read for the first time, whichever answer it first arrived in: nobody
+		// has run it, and whoever sent it is still waiting. Unless an answer lost left it
+		// unseen past the claim delay, when it is what a claim would have handed out, a
+		// redelivery whose sender may have stopped listening.
+		var taken []transport.Delivery
+		var ids []string
+		for _, entry := range handing {
+			aged := !entry.fresh && entry.idle+trip >= s.opts.ClaimMinIdle
+			one, id := s.deliveriesWithIDs([]redis.XStream{{Stream: page.stream, Messages: []redis.XMessage{entry.XMessage}}}, aged)
+			taken, ids = append(taken, one...), append(ids, id...)
+		}
 		// A read entry starts at zero idle and stays there until somebody touches it, so
 		// one this instance gives back unrun is claimable by nobody — not by `>`, which
 		// returns only what no consumer has taken, and not by a claim, which will not
@@ -504,8 +507,8 @@ func (s *Streams) keepApart(stream string, ids []string) {
 	}
 }
 
-// letGo stops keeping acknowledged entries apart: they are off the pending list, and no page
-// sent from now on carries them to be passed. One already on its way may, so while any is,
+// letGo stops keeping anything for acknowledged entries: they are off the pending list, and
+// no page sent from now on carries them to be passed. One already on its way may, so while any is,
 // they are let go when the last one has been looked at.
 func (s *Streams) letGo(stream string, ids ...string) {
 	s.marksMu.Lock()
@@ -514,8 +517,18 @@ func (s *Streams) letGo(stream string, ids ...string) {
 		s.lettingGo[stream] = append(s.lettingGo[stream], ids...)
 		return
 	}
+	s.forget(stream, ids)
+}
+
+// forget drops what is kept for entries no page will carry again: kept apart, and the
+// payload `>` answered with. marksMu is held.
+func (s *Streams) forget(stream string, ids []string) {
 	for _, id := range ids {
 		delete(s.claimedPast[stream], id)
+		delete(s.received[stream], id)
+	}
+	if len(s.received[stream]) == 0 {
+		delete(s.received, stream)
 	}
 }
 
@@ -597,6 +610,8 @@ type pendingPage struct {
 type pendingEntry struct {
 	redis.XMessage
 	idle time.Duration
+	// fresh is whether the `>` of the same read carried it.
+	fresh bool
 }
 
 // parsePendingPast reads pendingPastScript's answer.

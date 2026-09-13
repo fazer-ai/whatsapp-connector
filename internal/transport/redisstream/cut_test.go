@@ -955,6 +955,40 @@ func TestACommandTrimmedAfterItsReadAnsweredIsStillHandedOut(t *testing.T) {
 	})
 }
 
+// A command recovered promptly is a first delivery: nobody has run it and its sender is
+// still waiting. One that sat unseen past the claim delay is what a claim would have handed
+// out as a redelivery, and it is one: its sender may have given up, and a full session queue
+// must leave it pending rather than refuse it on the strength of a caller still listening.
+func TestACommandRecoveredPastTheClaimDelayIsARedelivery(t *testing.T) {
+	cutBackends(t, func(t *testing.T, f cutFleet) {
+		const claimDelay = 2 * cutWindow
+
+		streams := f.streamsWith(t, &redisstream.Options{Instance: "inst-a", Block: 50 * time.Millisecond, ClaimMinIdle: claimDelay})
+		stream := f.client.Keys().Commands("s1")
+		if _, err := read(t, streams, "s1"); err != nil {
+			t.Fatalf("priming read: %v", err)
+		}
+
+		writeCommand(t, f.fleet, stream, command("prompt", "s1", ""))
+		f.loseTheAnswer(t, "held past the window", streams, "inst-a", "prompt", "s1")
+		delivered, err := read(t, streams, "s1")
+		if err != nil || !slices.Equal(ids(delivered), []string{"prompt"}) || delivered[0].Redelivered {
+			t.Fatalf("handed out %v (err=%v), want the command recovered promptly as a first delivery", ids(delivered), err)
+		}
+		ackAll(t, delivered)
+
+		writeCommand(t, f.fleet, stream, command("stranded", "s1", ""))
+		f.loseTheAnswer(t, "held past the window", streams, "inst-a", "stranded", "s1")
+		// The age is the subject: the command sits unseen past the claim delay.
+		time.Sleep(claimDelay)
+		delivered, err = read(t, streams, "s1")
+		if err != nil || !slices.Equal(ids(delivered), []string{"stranded"}) || !delivered[0].Redelivered {
+			t.Fatalf("handed out %v (err=%v), want the command stranded past the claim delay as a redelivery", ids(delivered), err)
+		}
+		ackAll(t, delivered)
+	})
+}
+
 // A max age as long as the claim delay would hand a recovered wake out already claimable.
 func TestAReadBackMaxAgeNotShorterThanTheClaimDelayIsRefused(t *testing.T) {
 	f := newFleet(t)

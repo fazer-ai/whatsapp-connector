@@ -348,3 +348,74 @@ func TestAnEntryAPeerRetiredBeforeTheClaimTookItIsNotKeptApart(t *testing.T) {
 		t.Fatalf("%d entries kept apart after a claim that took nothing still pending here, want none", kept)
 	}
 }
+
+// A payload `>` answered with waits for a page to pass its entry, and a claim can take the
+// entry, run it and acknowledge it first. Acknowledged, it is on no page again, and an idle
+// session whose mark never moves would hold the payload for as long as it stays owned.
+func TestAReceivedPayloadIsForgottenOnceItsEntryIsAcknowledged(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	proxy := redisxtest.Listen(t, server.Addr())
+	via := redis.NewClient(&redis.Options{Addr: proxy.Addr(), ContextTimeoutEnabled: true})
+	t.Cleanup(func() { _ = via.Close() })
+	client := redisx.Wrap(via, "wa:", 8)
+	ctx := context.Background()
+	stream := client.Keys().Commands("s1")
+
+	a, err := New(client, Options{Instance: "inst-a", Block: 50 * time.Millisecond, ReadCount: 8})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, err := a.Read(ctx, []string{"s1"}); err != nil {
+		t.Fatalf("priming Read: %v", err)
+	}
+	command := &protocol.Command{
+		V: protocol.Version, ID: "acked-payload", Type: protocol.CommandSessionStatus,
+		SID: "s1", TS: 1787000000000, Payload: []byte(`{}`),
+	}
+	fields, err := command.Fields()
+	if err != nil {
+		t.Fatalf("render command: %v", err)
+	}
+	values := make(map[string]any, len(fields))
+	for key, value := range fields {
+		values[key] = value
+	}
+	if err := client.XAdd(ctx, &redis.XAddArgs{Stream: stream, Values: values}).Err(); err != nil {
+		t.Fatalf("XAdd: %v", err)
+	}
+
+	// `>` answers, and the page after it is held past the read's deadline.
+	passed := make(chan struct{})
+	close(passed)
+	carried := proxy.Hold("acked-payload", passed)
+	release := make(chan struct{})
+	paged := proxy.Hold("acked-payload", release)
+	window, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+	delivered, err := a.Read(window, []string{"s1"})
+	cancel()
+	close(release)
+	<-carried
+	<-paged
+	if err == nil || len(delivered) != 0 {
+		t.Fatalf("the read whose page was lost handed out %d (err=%v)", len(delivered), err)
+	}
+	if kept := len(a.received[stream]); kept != 1 {
+		t.Fatalf("%d payloads kept after the page was lost, want the one `>` answered with", kept)
+	}
+
+	claimed, err := a.ClaimSessions(ctx, []string{"s1"})
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("claimed %d (err=%v), want the command", len(claimed), err)
+	}
+	if err := claimed[0].Ack(ctx); err != nil {
+		t.Fatalf("Ack: %v", err)
+	}
+	a.marksMu.Lock()
+	_, kept := a.received[stream]
+	a.marksMu.Unlock()
+	if kept {
+		t.Fatal("the payload is still kept after its entry was acknowledged")
+	}
+}
