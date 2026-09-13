@@ -63,7 +63,10 @@ func Listen(t testing.TB, target string) *Proxy {
 		proxy.mu.Unlock()
 		conns.Wait()
 	})
-	go func() {
+	// The accept loop is in the group too: a relay it registers after an Accept that raced
+	// the listener's close is then added while the count is still above zero, which is
+	// what lets the wait above start before it.
+	conns.Go(func() {
 		for {
 			client, err := listener.Accept()
 			if err != nil {
@@ -71,7 +74,7 @@ func Listen(t testing.TB, target string) *Proxy {
 			}
 			conns.Go(func() { proxy.relay(client, target) })
 		}
-	}()
+	})
 	return proxy
 }
 
