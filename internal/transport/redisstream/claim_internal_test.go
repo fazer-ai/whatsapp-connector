@@ -333,7 +333,11 @@ func TestAnEntryAPeerRetiredBeforeTheClaimTookItIsNotKeptApart(t *testing.T) {
 		claimed, err := a.ClaimSessions(ctx, []string{"s1"})
 		done <- result{claimed, err}
 	}()
-	<-caught
+	select {
+	case <-caught:
+	case got := <-done:
+		t.Fatalf("the claim finished without listing the entry (claimed %d, err=%v)", len(got.claimed), got.err)
+	}
 	if err := client.XAck(ctx, stream, ConsumerGroup, id).Err(); err != nil {
 		t.Fatalf("XAck: %v", err)
 	}
@@ -396,8 +400,13 @@ func TestAReceivedPayloadIsForgottenOnceItsEntryIsAcknowledged(t *testing.T) {
 	delivered, err := a.Read(window, []string{"s1"})
 	cancel()
 	close(release)
-	<-carried
-	<-paged
+	for name, trap := range map[string]<-chan struct{}{"the answer to `>`": carried, "the page": paged} {
+		select {
+		case <-trap:
+		default:
+			t.Fatalf("%s carrying the command was never caught (handed out %d, err=%v)", name, len(delivered), err)
+		}
+	}
 	if err == nil || len(delivered) != 0 {
 		t.Fatalf("the read whose page was lost handed out %d (err=%v)", len(delivered), err)
 	}

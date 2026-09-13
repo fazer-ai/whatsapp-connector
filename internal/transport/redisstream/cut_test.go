@@ -574,7 +574,11 @@ func TestAReadRacingAClaimHandsOutNothingTheClaimDoes(t *testing.T) {
 				delivered, err = adopter.Read(ctx, []string{"s1"})
 				done <- err
 			}()
-			<-caught
+			select {
+			case <-caught:
+			case err := <-done:
+				t.Fatalf("the read finished without a page carrying the command (handed out %v, err=%v)", ids(delivered), err)
+			}
 			if err := claimed[0].Ack(ctx); err != nil {
 				t.Fatalf("Ack: %v", err)
 			}
@@ -601,7 +605,11 @@ func TestAReadRacingAClaimHandsOutNothingTheClaimDoes(t *testing.T) {
 				claimed, err = adopter.ClaimSessions(ctx, []string{"s1"})
 				done <- err
 			}()
-			<-caught
+			select {
+			case <-caught:
+			case err := <-done:
+				t.Fatalf("the claim finished without its answer carrying the command (claimed %v, err=%v)", ids(claimed), err)
+			}
 			delivered, err := adopter.Read(ctx, []string{"s1"})
 			close(release)
 			if claimErr := <-done; claimErr != nil || !slices.Equal(ids(claimed), []string{"racing-claim"}) {
@@ -629,7 +637,11 @@ func TestAReadRacingAClaimHandsOutNothingTheClaimDoes(t *testing.T) {
 				delivered, err = adopter.Read(ctx, []string{"s1"})
 				done <- err
 			}()
-			<-caught
+			select {
+			case <-caught:
+			case err := <-done:
+				t.Fatalf("the read finished without a page carrying the command (handed out %v, err=%v)", ids(delivered), err)
+			}
 			claimed, err := adopter.ClaimSessions(ctx, []string{"s1"})
 			if err != nil || !slices.Equal(ids(claimed), []string{"late-acked"}) {
 				t.Fatalf("claimed %v (err=%v), want the command the lost read left", ids(claimed), err)
@@ -790,7 +802,11 @@ func TestAWakeWhosePageTookLongToArriveCountsTheTripInItsAge(t *testing.T) {
 			delivered, err := streams.Read(ctx, []string{"s1"})
 			done <- result{delivered, err}
 		}()
-		<-caught
+		select {
+		case <-caught:
+		case got := <-done:
+			t.Fatalf("the read finished without a page carrying the wake (handed out %v, err=%v)", ids(got.delivered), got.err)
+		}
 		time.Sleep(maxAge)
 		close(release)
 		if got := <-done; got.err != nil || len(got.delivered) != 0 {
@@ -876,7 +892,11 @@ func TestACommandTrimmedAfterItsReadAnsweredIsStillHandedOut(t *testing.T) {
 				delivered, err := streams.Read(ctx, []string{"s1"})
 				done <- result{delivered, err}
 			}()
-			<-caught
+			select {
+			case <-caught:
+			case got := <-done:
+				t.Fatalf("the read finished without its answer carrying the command (handed out %v, err=%v)", ids(got.delivered), got.err)
+			}
 			trim(stream)
 			close(release)
 			got := <-done
