@@ -908,6 +908,50 @@ func TestACommandTrimmedAfterItsReadAnsweredIsStillHandedOut(t *testing.T) {
 				t.Fatalf("handed out %v (err=%v), want the command an earlier answer carried", ids(delivered), err)
 			}
 		})
+
+		// A wake past ReadBackMaxAge is left to a claim, but a claim of an entry gone from the
+		// stream finds no payload and retires it as unreadable. The payload is here: handed out
+		// late, the wake runs; left to the claim, it is lost.
+		t.Run("a wake read back past its max age", func(t *testing.T) {
+			streams := f.streamsWith(t, &redisstream.Options{
+				Instance: "inst-c", Block: 50 * time.Millisecond, ClaimMinIdle: cutClaimMinIdle, ReadBackMaxAge: cutWindow / 2,
+			})
+			control := f.client.Keys().Control()
+			if _, err := read(t, streams, "s3"); err != nil {
+				t.Fatalf("priming read: %v", err)
+			}
+			writeCommand(t, f.fleet, control, &protocol.Command{
+				V: protocol.Version, ID: "trimmed-wake", Type: protocol.CommandSessionWake, SID: "s9",
+				TS: 1787000000000, Payload: []byte(`{"desired":"connected"}`),
+			})
+
+			// `>` answers, and the history read after it loses its answer past the window.
+			passed := make(chan struct{})
+			close(passed)
+			carried := f.proxy.Hold("trimmed-wake", passed)
+			release := make(chan struct{})
+			paged := f.proxy.Hold("trimmed-wake", release)
+			delivered, err := read(t, streams, "s3")
+			close(release)
+			for name, trap := range map[string]<-chan struct{}{"the answer to `>`": carried, "the page": paged} {
+				select {
+				case <-trap:
+				default:
+					t.Fatalf("%s carrying the wake was never caught (handed out %v, err=%v)", name, ids(delivered), err)
+				}
+			}
+			if len(delivered) != 0 {
+				t.Fatalf("the read whose page was lost handed out %v", ids(delivered))
+			}
+
+			// The age is the subject: the wake is past its max age when it is read back.
+			time.Sleep(cutWindow / 2)
+			trim(control)
+			delivered, err = read(t, streams, "s3")
+			if err != nil || !slices.Equal(ids(delivered), []string{"trimmed-wake"}) {
+				t.Fatalf("handed out %v (err=%v), want the wake whose payload an earlier answer carried", ids(delivered), err)
+			}
+		})
 	})
 }
 

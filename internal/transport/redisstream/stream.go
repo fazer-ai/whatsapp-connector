@@ -293,7 +293,7 @@ func (s *Streams) blockWithin(ctx context.Context) (time.Duration, bool) {
 //
 // The history reads an entry's payload back from the stream, and a producer trimming it can
 // remove the entry in between. What `>` answered with is kept until a page passes it and
-// stands in for an entry no longer there.
+// stands in for an entry no longer there, however old: a claim could only retire it.
 //
 // A history read that fails leaves what `>` moved in pending above the mark, for the
 // history of the next read to hand out. Anything already taken and not acknowledged below
@@ -440,11 +440,16 @@ func (s *Streams) readHistory(ctx context.Context, streams []string, answered ma
 			if _, kept := s.claimedPast[page.stream][entry.ID]; kept {
 				continue
 			}
-			if _, fresh := answered[entry.ID]; page.stream == control && !fresh && entry.idle+trip > s.opts.ReadBackMaxAge {
-				continue
-			}
-			if values, ok := s.received[page.stream][entry.ID]; ok && len(entry.Values) == 0 {
+			// Gone from the stream, an entry is no claim's to recover: a claim finds no payload
+			// and retires it as unreadable. Handed out late from what `>` answered with, it
+			// runs, so the age limit does not apply to it.
+			values, cached := s.received[page.stream][entry.ID]
+			trimmed := cached && len(entry.Values) == 0
+			if trimmed {
 				entry.Values = values
+			}
+			if _, fresh := answered[entry.ID]; page.stream == control && !fresh && !trimmed && entry.idle+trip > s.opts.ReadBackMaxAge {
+				continue
 			}
 			handing = append(handing, entry.XMessage)
 		}
