@@ -265,7 +265,9 @@ func (s *Streams) blockWithin(ctx context.Context) (time.Duration, bool) {
 // sent as well as what is now. And the history is this consumer's alone, so what is pending under a
 // peer, which may be running there right now, is never read. On a stream no read has been
 // through yet, the mark is the start, and what an earlier process under this name left
-// pending comes back the same way.
+// pending comes back the same way. A group recreated under the read, which starts over at
+// the beginning of the stream, starts the mark over too: `>` handing out an entry at or
+// below it is how that shows.
 //
 // Reading back only looks. Nothing on this path resets an entry's idle time, which is what
 // a claim goes by: an instance whose answers keep getting lost must not keep what it never
@@ -275,7 +277,7 @@ func (s *Streams) blockWithin(ctx context.Context) (time.Duration, bool) {
 // handed out like that it would be claimable by a peer early, while this instance is still
 // adopting the session -- and the peer, finding a live lease, would retire the only wake
 // there was. So on the control stream a read hands out a recovered entry only while it is
-// younger than ReadBackMaxAge, and leaves an older one to a claim, which resets the age as it
+// younger than ReadBackMaxAge, counting the trip its page took, and leaves an older one to a claim, which resets the age as it
 // hands it out. What the `>` of the same read carried is exempt: it was delivered a moment
 // ago. The streams of sessions have no such limit, since a peer claims them only once it
 // holds their lease, and order is what they are for.
@@ -334,7 +336,14 @@ func (s *Streams) Read(ctx context.Context, sids []string) ([]transport.Delivery
 	// stream's ids are asked about.
 	control := s.client.Keys().Control()
 	answered := make(map[string]struct{})
+	s.marksMu.Lock()
 	for _, stream := range answer {
+		// `>` returns only what is past the group's cursor, which is never behind a mark this
+		// group's pages set. An entry at or below the mark means the group was recreated,
+		// starting over at the beginning of the stream, and the mark was the old group's.
+		if len(stream.Messages) > 0 && !entryAfter(stream.Messages[0].ID, s.marks[stream.Stream]) {
+			delete(s.marks, stream.Stream)
+		}
 		if stream.Stream != control {
 			continue
 		}
@@ -342,6 +351,7 @@ func (s *Streams) Read(ctx context.Context, sids []string) ([]transport.Delivery
 			answered[message.ID] = struct{}{}
 		}
 	}
+	s.marksMu.Unlock()
 	return s.readHistory(ctx, streams, answered)
 }
 
@@ -363,10 +373,14 @@ func (s *Streams) readHistory(ctx context.Context, streams []string, answered ma
 	}
 	s.marksMu.Unlock()
 
+	sent := time.Now()
 	raw, err := pendingPastScript.Run(ctx, s.client, streams, args...).Result()
 	if err != nil {
 		return nil, fmt.Errorf("redisstream: read commands back: %w", err)
 	}
+	// The idle times are as of when the script ran, somewhere in this trip; counting the
+	// whole trip errs toward leaving a wake to a claim.
+	trip := time.Since(sent)
 	pages, err := parsePendingPast(raw)
 	if err != nil {
 		return nil, err
@@ -382,7 +396,7 @@ func (s *Streams) readHistory(ctx context.Context, streams []string, answered ma
 			if _, keptNow := s.claimedPast[page.stream][entry.ID]; keptThen || keptNow {
 				continue
 			}
-			if _, fresh := answered[entry.ID]; page.stream == control && !fresh && entry.idle > s.opts.ReadBackMaxAge {
+			if _, fresh := answered[entry.ID]; page.stream == control && !fresh && entry.idle+trip > s.opts.ReadBackMaxAge {
 				continue
 			}
 			handing = append(handing, entry.XMessage)

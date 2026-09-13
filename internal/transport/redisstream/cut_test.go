@@ -684,6 +684,89 @@ func TestAClaimThatLostItsAnswerLetsGoOnlyOfWhatItKeptApart(t *testing.T) {
 	})
 }
 
+// The idle time a page carries is the entry's age when Redis ran the script, and the answer
+// can take a while to come back. A wake that was young then may be past ReadBackMaxAge by
+// the time the read hands it out, and the time it spent on the way counts against it.
+func TestAWakeWhosePageTookLongToArriveCountsTheTripInItsAge(t *testing.T) {
+	cutBackends(t, func(t *testing.T, f cutFleet) {
+		const maxAge = 2 * cutWindow
+
+		streams := f.streamsWith(t, &redisstream.Options{
+			Instance: "inst-a", Block: 50 * time.Millisecond, ClaimMinIdle: cutClaimMinIdle, ReadBackMaxAge: maxAge,
+		})
+		if _, err := read(t, streams, "s1"); err != nil {
+			t.Fatalf("priming read: %v", err)
+		}
+		writeCommand(t, f.fleet, f.client.Keys().Control(), &protocol.Command{
+			V: protocol.Version, ID: "slow-page-wake", Type: protocol.CommandSessionWake, SID: "s9",
+			TS: 1787000000000, Payload: []byte(`{"desired":"connected"}`),
+		})
+		f.loseTheAnswer(t, "held past the window", streams, "inst-a", "slow-page-wake", "s1")
+
+		// The page is held for the whole max age: however young the wake was when the script
+		// ran, it is older than that when the page arrives.
+		release := make(chan struct{})
+		caught := f.proxy.Hold("slow-page-wake", release)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		type result struct {
+			delivered []transport.Delivery
+			err       error
+		}
+		done := make(chan result, 1)
+		go func() {
+			delivered, err := streams.Read(ctx, []string{"s1"})
+			done <- result{delivered, err}
+		}()
+		<-caught
+		time.Sleep(maxAge)
+		close(release)
+		if got := <-done; got.err != nil || len(got.delivered) != 0 {
+			t.Fatalf("handed out %v (err=%v), want the wake left to a claim", ids(got.delivered), got.err)
+		}
+	})
+}
+
+// A consumer group recreated -- by an operator, or by any instance that found it gone -- starts
+// again at the beginning of the stream, and `>` hands this consumer entries at or below the
+// mark its old group left. The mark belongs to that group: kept, it would have the history
+// skip the older commands `>` moved in while it hands out the newer ones.
+func TestAGroupRecreatedUnderTheReadStartsItsHistoryOver(t *testing.T) {
+	cutBackends(t, func(t *testing.T, f cutFleet) {
+		streams := f.streams(t, "inst-a")
+		stream := f.client.Keys().Commands("s1")
+		if _, err := read(t, streams, "s1"); err != nil {
+			t.Fatalf("priming read: %v", err)
+		}
+		writeCommand(t, f.fleet, stream, command("before-reset", "s1", ""))
+		delivered, err := read(t, streams, "s1")
+		if err != nil || !slices.Equal(ids(delivered), []string{"before-reset"}) {
+			t.Fatalf("handed out %v (err=%v), want the first command", ids(delivered), err)
+		}
+		writeCommand(t, f.fleet, stream, command("after-reset", "s1", ""))
+
+		ctx := context.Background()
+		if err := f.client.XGroupDestroy(ctx, stream, redisstream.ConsumerGroup).Err(); err != nil {
+			t.Fatalf("XGROUP DESTROY: %v", err)
+		}
+		if err := f.client.XGroupCreate(ctx, stream, redisstream.ConsumerGroup, "0").Err(); err != nil {
+			t.Fatalf("XGROUP CREATE: %v", err)
+		}
+
+		var order []string
+		for range 3 {
+			delivered, err := read(t, streams, "s1")
+			if err != nil {
+				t.Fatalf("read: %v", err)
+			}
+			order = append(order, ids(delivered)...)
+		}
+		if want := []string{"before-reset", "after-reset"}; !slices.Equal(order, want) {
+			t.Fatalf("handed out %v after the group was recreated, want %v", order, want)
+		}
+	})
+}
+
 // A max age as long as the claim delay would hand a recovered wake out already claimable.
 func TestAReadBackMaxAgeNotShorterThanTheClaimDelayIsRefused(t *testing.T) {
 	f := newFleet(t)
