@@ -636,7 +636,9 @@ func TestAConnectWhoseReadLostItsAnswerStillRunsBeforeTheDisconnectSentAfterIt(t
 	case <-time.After(10 * time.Second):
 		t.Fatal("the connector never read the connect, so no answer was there to lose")
 	}
-	// Held for three heartbeats, and the read it answers gives up after one.
+	// Not a synchronisation: the read's deadline was fixed when it was sent, at most one
+	// heartbeat before the answer was caught, so three heartbeats later it has passed however
+	// the goroutines were scheduled, and the answer arrives to a read that gave up on it.
 	time.Sleep(600 * time.Millisecond)
 	close(release)
 

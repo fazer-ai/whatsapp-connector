@@ -1,8 +1,8 @@
 package redisxtest_test
 
 import (
-	"bufio"
 	"context"
+	"io"
 	"net"
 	"testing"
 	"time"
@@ -14,23 +14,28 @@ import (
 // let that answer through, and a test waiting for the trap would fail on a transport doing
 // nothing wrong.
 func TestAMarkerSplitAcrossTwoWritesIsStillCaught(t *testing.T) {
+	const first, second = "answer carrying split-", "marker\n"
+
 	var config net.ListenConfig
 	listener, err := config.Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
 	t.Cleanup(func() { _ = listener.Close() })
+	// The second piece is written only once the client holds the first, which the proxy can
+	// only have relayed after a read that ended there: the two cannot share a read.
+	firstArrived := make(chan struct{})
+	served := make(chan struct{})
 	go func() {
+		defer close(served)
 		conn, err := listener.Accept()
 		if err != nil {
 			return
 		}
 		defer func() { _ = conn.Close() }()
-		// Apart in time, so they cannot arrive as one read on the other side.
-		_, _ = conn.Write([]byte("answer carrying split-"))
-		time.Sleep(50 * time.Millisecond)
-		_, _ = conn.Write([]byte("marker\n"))
-		time.Sleep(time.Second)
+		_, _ = conn.Write([]byte(first))
+		<-firstArrived
+		_, _ = conn.Write([]byte(second))
 	}()
 
 	proxy := redisxtest.Listen(t, listener.Addr().String())
@@ -42,15 +47,22 @@ func TestAMarkerSplitAcrossTwoWritesIsStillCaught(t *testing.T) {
 		t.Fatalf("dial the proxy: %v", err)
 	}
 	t.Cleanup(func() { _ = conn.Close() })
-	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	line, _ := bufio.NewReader(conn).ReadString('\n')
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+
+	got := make([]byte, len(first))
+	if _, err := io.ReadFull(conn, got); err != nil {
+		t.Fatalf("the first piece never arrived: %v", err)
+	}
+	close(firstArrived)
+	rest, _ := io.ReadAll(conn)
+	<-served
 
 	select {
 	case <-caught:
 	default:
-		t.Fatalf("the marker went through in two pieces uncaught; the client read %q", line)
+		t.Fatalf("the marker went through in two pieces uncaught; after the first piece the client read %q", rest)
 	}
-	if line == "answer carrying split-marker\n" {
-		t.Fatal("the answer was dropped and still reached the client whole")
+	if len(rest) != 0 {
+		t.Fatalf("the answer was dropped and the client still read %q after the first piece", rest)
 	}
 }

@@ -338,6 +338,50 @@ func TestARecoveryThatLosesItsOwnAnswerIsTriedAgain(t *testing.T) {
 	})
 }
 
+// An instance whose reads have stopped arriving is the one a claim exists to route
+// around: a wake it took and never saw has to reach a healthy peer once it has sat for the
+// claim delay. Reading the history back must not stand in the way. A read that delivered
+// the wake again each time would set its idle time back to zero on every attempt, answer
+// lost or not, and the peer's claim would never find it old enough.
+func TestReadingBackAWakeWhoseAnswersKeepGettingLostLeavesItForAPeer(t *testing.T) {
+	cutBackends(t, func(t *testing.T, f cutFleet) {
+		const claimDelay = 300 * time.Millisecond
+
+		sick := f.streams(t, "inst-sick")
+		if _, err := read(t, sick, "s1"); err != nil {
+			t.Fatalf("priming read: %v", err)
+		}
+		wake := &protocol.Command{
+			V: protocol.Version, ID: "starved-wake", Type: protocol.CommandSessionWake, SID: "s9",
+			TS: 1787000000000, Payload: []byte(`{"desired":"connected"}`),
+		}
+		writeCommand(t, f.fleet, f.client.Keys().Control(), wake)
+		f.loseTheAnswer(t, "held past the window", sick, "inst-sick", "starved-wake", "s1")
+
+		// Every read after it loses its answer too, for well past the claim delay, and each
+		// one did reach the server: the history it read carried the wake.
+		lost := 0
+		for start := time.Now(); time.Since(start) < 3*claimDelay; lost++ {
+			f.loseTheAnswer(t, "held past the window", sick, "inst-sick", "starved-wake", "s1")
+		}
+		if lost < 3 {
+			t.Fatalf("only %d reads lost their answer inside three claim delays; the test proves nothing", lost)
+		}
+
+		peer, err := redisstream.New(f.client, redisstream.Options{Instance: "inst-peer", ClaimMinIdle: claimDelay})
+		if err != nil {
+			t.Fatalf("redisstream.New: %v", err)
+		}
+		claimed, err := peer.ClaimControl(context.Background())
+		if err != nil {
+			t.Fatalf("ClaimControl: %v", err)
+		}
+		if got := ids(claimed); !slices.Equal(got, []string{"starved-wake"}) {
+			t.Fatalf("the healthy peer claimed %v, want the wake the sick instance never saw", got)
+		}
+	})
+}
+
 // What this process was handed and has not finished with is still pending under its
 // name, exactly like what a lost answer left there. Recovering the second must not hand
 // out the first again: not a command still running (invariant 5), and not one given back

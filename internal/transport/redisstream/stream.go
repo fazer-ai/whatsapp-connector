@@ -298,32 +298,27 @@ func (s *Streams) Read(ctx context.Context, sids []string) ([]transport.Delivery
 }
 
 // readHistory hands out what is pending under this consumer past the mark on each stream.
-// It never waits, and it moves nothing: an answer it loses leaves the same entries pending
+// It never waits, and it only looks: an answer it loses leaves everything as it found it,
 // for the next one.
 func (s *Streams) readHistory(ctx context.Context, streams []string) ([]transport.Delivery, error) {
-	marks := make([]string, len(streams))
+	args := make([]any, 0, len(streams)+3)
+	args = append(args, ConsumerGroup, s.opts.Instance, s.opts.ReadCount)
 	s.receivedMu.Lock()
-	for i, stream := range streams {
-		marks[i] = s.received[stream]
-		if marks[i] == "" {
-			marks[i] = "0"
-		}
+	for _, stream := range streams {
+		args = append(args, s.received[stream])
 	}
 	s.receivedMu.Unlock()
 
-	result, err := s.client.XReadGroup(ctx, &redis.XReadGroupArgs{
-		Group:    ConsumerGroup,
-		Consumer: s.opts.Instance,
-		Streams:  slices.Concat(streams, marks),
-		Count:    s.opts.ReadCount,
-		// A history read never waits; -1 is go-redis for leaving BLOCK out.
-		Block: -1,
-	}).Result()
+	raw, err := pendingPastScript.Run(ctx, s.client, streams, args...).Result()
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
 		return nil, fmt.Errorf("redisstream: read commands back: %w", err)
+	}
+	result, err := parsePendingPast(raw)
+	if err != nil {
+		return nil, err
 	}
 	var out []transport.Delivery
 	for _, stream := range result {
@@ -338,6 +333,89 @@ func (s *Streams) readHistory(ctx context.Context, streams []string) ([]transpor
 		// difference between running late and expiring unrun.
 		s.rememberAge(stream.Stream, s.opts.ClaimMinIdle, taken, ids)
 		out = append(out, taken...)
+	}
+	return out, nil
+}
+
+// pendingPastScript returns, for each stream, up to a count of the entries pending under
+// one consumer past a mark, oldest first. An empty mark is the start of the stream.
+//
+// Not XREADGROUP with an id, which is the command made for reading a consumer's history.
+// That one delivers what it returns again, and a delivery sets the entry's idle time back
+// to zero. A history read whose answer keeps being lost would then keep an entry this
+// process never hands out looking freshly delivered, for as long as its reads keep failing,
+// and a claim goes by idle time: a healthy peer would never take a wake from an instance
+// whose reads have stopped arriving, which is the instance it exists to route around.
+// XPENDING and XRANGE only look.
+//
+// An entry pending but no longer in the stream -- trimmed, or deleted -- comes back with no
+// fields, as XREADGROUP returns it, and is dropped as unreadable.
+var pendingPastScript = redis.NewScript(`
+local group, consumer, count = ARGV[1], ARGV[2], tonumber(ARGV[3])
+local out = {}
+for i, key in ipairs(KEYS) do
+  local mark = ARGV[3 + i]
+  local start = "-"
+  if mark ~= "" then start = mark end
+  local entries = {}
+  for _, pending in ipairs(redis.call("XPENDING", key, group, start, "+", count + 1, consumer)) do
+    if #entries == count then break end
+    if pending[1] ~= mark then
+      local found = redis.call("XRANGE", key, pending[1], pending[1])
+      if found[1] then
+        entries[#entries + 1] = found[1]
+      else
+        entries[#entries + 1] = {pending[1], {}}
+      end
+    end
+  end
+  out[#out + 1] = {key, entries}
+end
+return out
+`)
+
+// parsePendingPast reads pendingPastScript's answer into the shape a read returns.
+func parsePendingPast(raw any) ([]redis.XStream, error) {
+	malformed := func() ([]redis.XStream, error) {
+		return nil, fmt.Errorf("redisstream: read commands back: unexpected answer %T", raw)
+	}
+	streams, ok := raw.([]any)
+	if !ok {
+		return malformed()
+	}
+	out := make([]redis.XStream, 0, len(streams))
+	for _, item := range streams {
+		pair, ok := item.([]any)
+		if !ok || len(pair) != 2 {
+			return malformed()
+		}
+		name, nameOK := pair[0].(string)
+		entries, entriesOK := pair[1].([]any)
+		if !nameOK || !entriesOK {
+			return malformed()
+		}
+		stream := redis.XStream{Stream: name, Messages: make([]redis.XMessage, 0, len(entries))}
+		for _, item := range entries {
+			entry, ok := item.([]any)
+			if !ok || len(entry) != 2 {
+				return malformed()
+			}
+			id, idOK := entry[0].(string)
+			flat, flatOK := entry[1].([]any)
+			if !idOK || !flatOK || len(flat)%2 != 0 {
+				return malformed()
+			}
+			values := make(map[string]any, len(flat)/2)
+			for i := 0; i < len(flat); i += 2 {
+				field, ok := flat[i].(string)
+				if !ok {
+					return malformed()
+				}
+				values[field] = flat[i+1]
+			}
+			stream.Messages = append(stream.Messages, redis.XMessage{ID: id, Values: values})
+		}
+		out = append(out, stream)
 	}
 	return out, nil
 }
