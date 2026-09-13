@@ -10,6 +10,9 @@ import (
 	"testing"
 	"time"
 
+	wm "go.mau.fi/whatsmeow"
+
+	"github.com/fazer-ai/whatsapp-connector/internal/engine"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 )
 
@@ -28,6 +31,14 @@ import (
 func holdTheDial(t *testing.T, session *Session) func() {
 	t.Helper()
 
+	return holdTheDialOf(t, session.current())
+}
+
+// holdTheDialOf is holdTheDial for a client the caller names, for the tests where the
+// session is about to be put on a different one.
+func holdTheDialOf(t *testing.T, client *wm.Client) func() {
+	t.Helper()
+
 	var listening net.ListenConfig
 	listener, err := listening.Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
@@ -42,7 +53,6 @@ func holdTheDial(t *testing.T, session *Session) func() {
 		accepted <- conn
 	}()
 
-	client := session.current()
 	client.SetProxy(http.ProxyURL(&url.URL{Scheme: "http", Host: listener.Addr().String()}))
 	dialling, stop := context.WithCancel(context.Background())
 	dialled := make(chan error, 1)
@@ -181,7 +191,16 @@ func TestAProbeIsNotReusedAfterTheDialItWaitedForEnded(t *testing.T) {
 	if err := answeredWithin(t, session.Logout); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("the logout during the first dial failed with %v, want the caller's deadline", err)
 	}
+	session.mu.Lock()
+	probe := session.probing
+	session.mu.Unlock()
+	if probe == nil {
+		t.Fatal("no probe is waiting on the first dial")
+	}
 	release()
+	// The probe, not just the dial: it forgets itself before it closes, so waiting for it to
+	// close is what makes "the next teardown finds no probe" true rather than likely.
+	<-probe
 
 	// The dial the first probe was waiting for is over, and another one starts, the way a
 	// reconnect that fails and is tried again does.
@@ -189,6 +208,112 @@ func TestAProbeIsNotReusedAfterTheDialItWaitedForEnded(t *testing.T) {
 	if err := answeredWithin(t, session.Logout); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("the logout during the second dial failed with %v, want the caller's deadline", err)
 	}
+}
+
+// Shared between the teardowns of one client, and not across a replacement: a probe is
+// about the lock of the client it was started on. Handed to a teardown on the client that
+// took its place, it is an answer about somebody else's socket, and the teardown waits out
+// its whole deadline for a dial that has nothing to do with it.
+func TestAProbeIsNotSharedWithATeardownOnAnotherClient(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990005")
+	session.storeLimit = time.Minute
+	holdTheDial(t, session)
+
+	if err := answeredWithin(t, session.Logout); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("the logout during the dial failed with %v, want the caller's deadline", err)
+	}
+
+	// The session moves to a fresh client while that probe is still parked, which is what a
+	// teardown's own rebuild does.
+	spent, giveUp := context.WithCancel(t.Context())
+	giveUp()
+	if err := session.rebuild(t.Context(), spent); err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	asked := make(chan struct{}, 1)
+	session.logout = func(context.Context, *wm.Client) error {
+		asked <- struct{}{}
+		return wm.ErrNotConnected
+	}
+
+	if err := answeredWithin(t, session.Logout); !errors.Is(err, wm.ErrNotConnected) {
+		t.Fatalf("the logout on the fresh client failed with %v, want the answer from the library", err)
+	}
+	select {
+	case <-asked:
+	default:
+		t.Fatal("the logout never reached the library: it waited on a probe about the client it replaced")
+	}
+}
+
+// The other half of not waiting for the old client to close: a dial the caller stopped
+// waiting for ends whenever the network lets it, and by then a teardown has put the session
+// on a client of its own. The close that dial reports is about a connection nobody has any
+// more, and published anyway it lands on top of whatever replaced it -- a terminal state
+// over a session that is pairing again, or over the logged_out that retired this one.
+func TestADialThatEndsAfterItsClientWasReplacedSaysNothing(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990006")
+	session.storeLimit = time.Minute
+
+	var listening net.ListenConfig
+	listener, err := listening.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen for the dial: %v", err)
+	}
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		accepted <- conn
+	}()
+	t.Cleanup(func() { _ = listener.Close() })
+	session.current().SetProxy(http.ProxyURL(&url.URL{Scheme: "http", Host: listener.Addr().String()}))
+
+	// The connect the session itself makes, which is the one that leaves a watcher behind
+	// to report how the dial ended.
+	connecting, giveUpConnecting := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer giveUpConnecting()
+	if err := session.Connect(connecting, engine.ConnectRequest{Pairing: "resume"}); err == nil {
+		t.Fatal("a connect that never got past the proxy reported success")
+	}
+	var parked net.Conn
+	select {
+	case parked = <-accepted:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the dial never reached the proxy")
+	}
+	if emission := next(t, session); emission.Type != protocol.EventSessionState {
+		t.Fatalf("the connect published %q, want the session connecting", emission.Type)
+	}
+
+	spent, giveUp := context.WithCancel(t.Context())
+	giveUp()
+	if err := session.rebuild(t.Context(), spent); err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+
+	_ = parked.Close()
+	// The dial's own end, so the report that follows it has already been decided by the time
+	// the window below opens: the flag is cleared on the failure before anything is said.
+	for deadline := time.Now().Add(10 * time.Second); ; {
+		session.mu.Lock()
+		dialling := session.dialing
+		session.mu.Unlock()
+		if !dialling {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the dial never ended after the proxy dropped it")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	saysNothing(t, session, "for a dial that ended on a client the session had already replaced")
 }
 
 // A delete in the same place gets the same bound, and then does what a delete whose unlink

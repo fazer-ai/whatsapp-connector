@@ -1448,6 +1448,15 @@ func (s *Session) resume(ctx context.Context, state string) error {
 	client := s.current()
 	s.emit(protocol.EventSessionState, map[string]any{"state": "connecting"})
 	reportFailure := func(error) {
+		// Only while this is still the session's client, the way abandonPairing reports only
+		// the pairing run that is still current. A detached dial ends whenever the network
+		// lets it, and a teardown in between puts the session on a client of its own: the
+		// close published here would then be about a connection that no longer exists, on
+		// top of whatever replaced it -- a terminal state over a session that is pairing
+		// again, or over the `session.logged_out` that retired this one.
+		if s.current() != client {
+			return
+		}
 		s.emit(protocol.EventSessionState, map[string]any{"state": "close", "reason": "connect_failed"})
 	}
 	if err := s.dial(ctx, client, reportFailure); err != nil {
