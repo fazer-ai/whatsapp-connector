@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sync"
 	"testing"
 	"time"
 
@@ -21,7 +22,10 @@ import (
 // The real library and the real lock, not a seam: what these tests are about is a call
 // into whatsmeow that does not look at its context while the lock is taken, and a stand-in
 // would only prove the stand-in.
-func holdTheDial(t *testing.T, session *Session) {
+//
+// The returned function ends the dial, the way a network that comes back does; it also runs
+// at cleanup, so a test that does not care can ignore it.
+func holdTheDial(t *testing.T, session *Session) func() {
 	t.Helper()
 
 	var listening net.ListenConfig
@@ -49,12 +53,17 @@ func holdTheDial(t *testing.T, session *Session) {
 		// The lock is taken before the dial starts, so a connection reaching the proxy is a
 		// dial holding it. Registered after the session's own cleanup, so it runs first: the
 		// session closes on a client whose dial has already given up.
-		t.Cleanup(func() {
-			stop()
-			<-dialled
-			_ = conn.Close()
-			_ = listener.Close()
-		})
+		var once sync.Once
+		release := func() {
+			once.Do(func() {
+				stop()
+				<-dialled
+				_ = conn.Close()
+				_ = listener.Close()
+			})
+		}
+		t.Cleanup(release)
+		return release
 	case err := <-dialled:
 		stop()
 		_ = listener.Close()
@@ -64,6 +73,7 @@ func holdTheDial(t *testing.T, session *Session) {
 		_ = listener.Close()
 		t.Fatal("the dial never reached the proxy")
 	}
+	return func() {}
 }
 
 // answeredWithin runs a teardown on a caller's deadline and fails if it is still waiting
@@ -118,6 +128,66 @@ func TestALogoutWaitingOnARedialAnswersWithinTheCallersTime(t *testing.T) {
 	}
 	if resolvesAsUnpaired(t, session) {
 		t.Fatal("the session answers not_paired for an account nothing revoked")
+	}
+}
+
+// The wait for the socket cannot be called off: a dial that outlives a teardown's deadline
+// outlives the probe waiting on it too. So there is one probe and not one each, or a client
+// retrying a logout every few seconds through an outage parks a goroutine for every attempt
+// and none of them come back until the dial does.
+func TestTeardownsWaitingOnTheSameDialShareOneProbe(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990003")
+	session.setConnected(false)
+	session.setReconnecting(true, time.Now())
+	holdTheDial(t, session)
+
+	var first chan struct{}
+	for attempt := range 5 {
+		if err := answeredWithin(t, session.Logout); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("logout %d failed with %v, want the caller's deadline", attempt+1, err)
+		}
+		// The probe itself, rather than a count of goroutines: the package's other tests
+		// park probes of their own, and a process-wide stack dump cannot tell them apart.
+		// One goroutine is started per probe, so the same probe is the same goroutine.
+		session.mu.Lock()
+		probe := session.probing
+		session.mu.Unlock()
+		if probe == nil {
+			t.Fatalf("no probe is waiting on the socket after logout %d, so the next teardown starts another", attempt+1)
+		}
+		if first == nil {
+			first = probe
+		}
+		if probe != first {
+			t.Fatalf("logout %d started a probe of its own; a client retrying through an outage parks a goroutine for every attempt", attempt+1)
+		}
+	}
+}
+
+// And the sharing lasts as long as the dial it was about. A probe kept past the dial that
+// ended answers the next teardown that the socket is free, on the strength of a lock that
+// was free a minute ago -- and the teardown goes back to waiting for the new dial with no
+// deadline over it, which is the whole of #187.
+func TestAProbeIsNotReusedAfterTheDialItWaitedForEnded(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990004")
+	session.setConnected(false)
+	session.setReconnecting(true, time.Now())
+
+	release := holdTheDial(t, session)
+	if err := answeredWithin(t, session.Logout); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("the logout during the first dial failed with %v, want the caller's deadline", err)
+	}
+	release()
+
+	// The dial the first probe was waiting for is over, and another one starts, the way a
+	// reconnect that fails and is tried again does.
+	holdTheDial(t, session)
+	if err := answeredWithin(t, session.Logout); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("the logout during the second dial failed with %v, want the caller's deadline", err)
 	}
 }
 

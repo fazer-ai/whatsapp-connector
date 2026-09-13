@@ -494,6 +494,11 @@ type Session struct {
 	// that cleanup a second time, alongside the one the logout is already running.
 	revoked bool
 
+	// probing is the wait for whatsmeow's socket lock that the teardowns share, and probed
+	// is the client it was started on. One for all of them: see socketFree.
+	probing chan struct{}
+	probed  *wm.Client
+
 	// pushName and businessName are this account's own display names. They live here
 	// rather than being read off `client.Store` where they are wanted, because whatsmeow
 	// writes those fields from its own goroutines: the copy is taken where an ordering
@@ -2413,17 +2418,44 @@ var errStillDialling = errors.New("the socket was still being dialled")
 // starts between the probe and the logout's own read is waited for as before; that window
 // is the few instructions between the two calls.
 func (s *Session) unlink(ctx context.Context, client *wm.Client) error {
-	free := make(chan struct{})
-	go func() {
-		defer close(free)
-		client.IsConnected()
-	}()
 	select {
-	case <-free:
+	case <-s.socketFree(client):
 	case <-ctx.Done():
 		return fmt.Errorf("%w: %w", errStillDialling, ctx.Err())
 	}
 	return s.logout(ctx, client)
+}
+
+// socketFree answers when the socket lock has been free, with one probe for all the
+// teardowns waiting on the same client.
+//
+// One and not one each, because the wait itself cannot be called off: a dial that outlives
+// a teardown's deadline outlives its probe too, and a client retrying every few seconds
+// through a long outage would leave a goroutine parked for every attempt. They are all
+// waiting for the same thing, so they can wait on the same channel.
+//
+// A finished probe is forgotten rather than kept, because what it answered was about the
+// moment it ran: the next teardown asks again, and gets a fresh probe if the lock has been
+// taken since.
+func (s *Session) socketFree(client *wm.Client) <-chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.probing != nil && s.probed == client {
+		return s.probing
+	}
+	free := make(chan struct{})
+	s.probing, s.probed = free, client
+	go func() {
+		client.IsConnected()
+		s.mu.Lock()
+		if s.probing == free {
+			s.probing, s.probed = nil, nil
+		}
+		s.mu.Unlock()
+		close(free)
+	}()
+	return free
 }
 
 // logoutRequestFailed is how whatsmeow's Logout words a failure of the request itself, as
