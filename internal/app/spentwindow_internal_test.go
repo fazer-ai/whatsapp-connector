@@ -231,3 +231,28 @@ func TestAnErrorThatIsNotATimeoutIsAFailedReadEvenPastTheDeadline(t *testing.T) 
 		t.Fatalf("a refusal past the deadline was not reported:\n%s", said)
 	}
 }
+
+// The review's case, and the reason the window that ran out has a sentinel of its own: a
+// dial that gave up on the client's own timeout comes back carrying
+// `context.DeadlineExceeded`, with the window wide open. Suppressing everything that
+// carries that value would hide a Redis this instance never reached, which is the outage
+// the alarm exists for.
+func TestADialThatGaveUpIsAFailedReadEvenThoughItCarriesADeadline(t *testing.T) {
+	t.Parallel()
+
+	connector, _, said := muted(t)
+	connector.streams = answeredWith{
+		err: &net.OpError{Op: "dial", Net: "tcp", Err: context.DeadlineExceeded},
+	}
+	window, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	connector.readCommands(window)
+
+	if failures := gathered(t, connector, "wac_command_reads_failed_total"); failures != 1 {
+		t.Fatalf("a dial that gave up counted %v failure(s), want 1:\n%s", failures, said)
+	}
+	if !bytes.Contains(said.Bytes(), []byte("failed to read commands")) {
+		t.Fatalf("a dial that gave up was not reported:\n%s", said)
+	}
+}

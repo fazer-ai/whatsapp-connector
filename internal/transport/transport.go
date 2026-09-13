@@ -8,9 +8,18 @@ package transport
 
 import (
 	"context"
+	"errors"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 )
+
+// ErrWindowSpent is what a read returns when the window it was given ran out with the
+// answer still on its way: the deadline working, not the read failing.
+//
+// A sentinel of its own rather than `context.DeadlineExceeded`, because that value has
+// other producers -- a dial that gives up on its own timeout carries it too -- and a
+// caller that suppressed every one of them would swallow a Redis it never reached.
+var ErrWindowSpent = errors.New("transport: the window ran out with the answer still on its way")
 
 // Publisher hands an event to the clients.
 //

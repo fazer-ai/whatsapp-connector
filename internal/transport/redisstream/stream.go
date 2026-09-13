@@ -1156,5 +1156,5 @@ func spentWindow(ctx context.Context, err error) error {
 	if !errors.As(err, &timeout) || !timeout.Timeout() {
 		return err
 	}
-	return fmt.Errorf("%w: the window ran out with the answer still on its way: %w", context.DeadlineExceeded, err)
+	return fmt.Errorf("%w: %w", transport.ErrWindowSpent, err)
 }

@@ -7,6 +7,8 @@ import (
 	"os"
 	"testing"
 	"time"
+
+	"github.com/fazer-ai/whatsapp-connector/internal/transport"
 )
 
 // The classification this file is about is the whole of the fix, and it has exactly two
@@ -44,7 +46,7 @@ func TestOnlyATimeoutPastTheDeadlineIsAWindowThatRanOut(t *testing.T) {
 	for _, one := range cases {
 		t.Run(one.name, func(t *testing.T) {
 			got := spentWindow(one.ctx, one.err)
-			if spent := errors.Is(got, context.DeadlineExceeded); spent != one.spent {
+			if spent := errors.Is(got, transport.ErrWindowSpent); spent != one.spent {
 				t.Fatalf("spentWindow returned %v (window ran out: %t), want window ran out: %t", got, spent, one.spent)
 			}
 			// Named either way: an operator reading the line still needs what the socket
