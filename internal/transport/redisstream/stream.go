@@ -10,6 +10,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -76,6 +79,14 @@ type Streams struct {
 	// second time, and the session it names runs nowhere for both.
 	unrunMu sync.Mutex
 	unrun   map[string][]unrunEntry
+
+	// received is, per stream, the newest entry this process has been handed, by a read or
+	// by a claim. It is what tells the two kinds of entry pending under this instance's
+	// name apart. One whose read lost its answer was never handed to anybody here, and `>`
+	// only ever hands out what is newer than all of it. Everything this process was handed
+	// -- still running, given back, forfeited -- is at or below it.
+	receivedMu sync.Mutex
+	received   map[string]string
 }
 
 // unrunEntry is one entry given back without being carried out, and the idle time it
@@ -116,6 +127,7 @@ func New(client *redisx.Client, opts Options) (*Streams, error) {
 		client: client, opts: opts, groups: newGroupCache(),
 		inFlight: make(map[string]struct{}),
 		unrun:    make(map[string][]unrunEntry),
+		received: make(map[string]string),
 	}, nil
 }
 
@@ -182,12 +194,11 @@ func (s *Streams) Reply(ctx context.Context, replyTo string, reply protocol.Repl
 // window costs a short read, never no read.
 //
 // A third of what is left stays unspent, for the round trips the block does not cover:
-// ensuring a group on a stream not seen before, and the answer's own transit. A read
-// cut off by the deadline mid-flight is the failure worth paying that for -- the server
-// may have just moved a command into this consumer's pending list when the connection
-// dies, and an entry pending here with no local record of the delivery is claimable by
-// nobody until the whole claim delay has passed, with newer commands for the same
-// session read and run ahead of it meanwhile.
+// ensuring a group on a stream not seen before, taking back what an earlier read lost,
+// and the answer's own transit. A read cut off by the deadline mid-flight is the failure
+// worth paying that for -- the server may have just moved a command into this consumer's
+// pending list when the connection dies, and although the next read takes it back, that
+// is a window later than it could have run.
 //
 // A window too thin to name a block in milliseconds is the one case with no read at
 // all: what is left cannot express the reserve, and a non-blocking read would spend a
@@ -208,8 +219,9 @@ func (s *Streams) blockWithin(ctx context.Context) (time.Duration, bool) {
 }
 
 // Read returns the commands waiting for the sessions this instance owns, plus the
-// fleet-wide ones. `>` asks for entries no consumer in the group has taken yet;
-// anything already taken and not acknowledged is Claim's business.
+// fleet-wide ones. `>` asks for entries no consumer in the group has taken yet; anything
+// already taken and not acknowledged is Claim's business, with one exception, taken
+// first: what a read of this process took and never got the answer to.
 func (s *Streams) Read(ctx context.Context, sids []string) ([]transport.Delivery, error) {
 	streams := s.streamsFor(sids)
 	if len(streams) == 0 {
@@ -226,9 +238,17 @@ func (s *Streams) Read(ctx context.Context, sids []string) ([]transport.Delivery
 	}
 	// Before the read, because the read is what destroys the reading this is taken from.
 	s.reportTrimmed(ctx, fresh)
-	// And again after it, because that trip spends the same window the block is measured
-	// against: a block decided before it can outlive the deadline by whatever the ensure
-	// took, which is the severed read this reserve exists to prevent.
+
+	// Ahead of `>`, because what it takes back is older than anything `>` can return, and
+	// handing out newer commands for a session first is the reordering it exists to undo.
+	lost, err := s.takeBackLost(ctx, streams)
+	if err != nil || len(lost) > 0 {
+		return lost, err
+	}
+
+	// And again after both, because those trips spend the same window the block is
+	// measured against: a block decided before them can outlive the deadline by whatever
+	// they took, which is the severed read this reserve exists to prevent.
 	block, room := s.blockWithin(ctx)
 	if !room {
 		return nil, nil
@@ -237,7 +257,7 @@ func (s *Streams) Read(ctx context.Context, sids []string) ([]transport.Delivery
 	args := &redis.XReadGroupArgs{
 		Group:    ConsumerGroup,
 		Consumer: s.opts.Instance,
-		Streams:  append(streams, newEntries(len(streams))...),
+		Streams:  slices.Concat(streams, newEntries(len(streams))),
 		Count:    s.opts.ReadCount,
 		Block:    block,
 	}
@@ -256,6 +276,11 @@ func (s *Streams) Read(ctx context.Context, sids []string) ([]transport.Delivery
 		}
 		return nil, fmt.Errorf("redisstream: read commands: %w", err)
 	}
+	return s.handOutRead(result), nil
+}
+
+// handOutRead turns what a read returned into deliveries.
+func (s *Streams) handOutRead(result []redis.XStream) []transport.Delivery {
 	var out []transport.Delivery
 	for _, stream := range result {
 		taken, ids := s.deliveriesWithIDs([]redis.XStream{stream}, false)
@@ -268,7 +293,66 @@ func (s *Streams) Read(ctx context.Context, sids []string) ([]transport.Delivery
 		s.rememberAge(stream.Stream, s.opts.ClaimMinIdle, taken, ids)
 		out = append(out, taken...)
 	}
-	return out, nil
+	return out
+}
+
+// takeBackLost hands out what an earlier read of this process took and never got the
+// answer to.
+//
+// XREADGROUP moves the entries it answers with into this consumer's pending list before
+// the answer leaves the server. When the answer is lost on the way -- held past the
+// window, or dropped with the connection -- those entries are pending under this
+// instance's name and nobody here has seen them. `>` will not return them again, since
+// somebody has taken them, and a claim will not look at them for a whole ClaimMinIdle,
+// while newer commands for the same session are read and run ahead of them (#202). A
+// failed read is not a reliable sign it happened, either: a connection that dies after the
+// server answered has go-redis send the read again on a fresh one, and that read comes
+// back empty and without an error. So this runs before every `>`, and costs a round trip
+// that returns nothing almost every time.
+//
+// It reads this consumer's own history, never another's: an entry pending under a peer
+// may be running there right now. And only past the newest entry this process was handed
+// on each stream, which is what keeps it to the lost ones. Everything else pending here
+// was handed out, so it is at or below that mark: a command still running, which must not
+// run twice, and one given back or forfeited, which is a claim's to hand out again and
+// would otherwise jump back to the front of its stream on every read. On a stream this
+// process has been handed nothing from, the mark is the start, and what an earlier
+// process under this name left pending comes back the same way.
+//
+// What it takes back is handed out as read for the first time, not as redelivered: nobody
+// has run it, and whoever sent it is still waiting on the reply.
+func (s *Streams) takeBackLost(ctx context.Context, streams []string) ([]transport.Delivery, error) {
+	marks := make([]string, len(streams))
+	s.receivedMu.Lock()
+	for i, stream := range streams {
+		marks[i] = s.received[stream]
+		if marks[i] == "" {
+			marks[i] = "0"
+		}
+	}
+	s.receivedMu.Unlock()
+
+	result, err := s.client.XReadGroup(ctx, &redis.XReadGroupArgs{
+		Group:    ConsumerGroup,
+		Consumer: s.opts.Instance,
+		Streams:  slices.Concat(streams, marks),
+		Count:    s.opts.ReadCount,
+		// A history read never waits; -1 is go-redis for leaving BLOCK out.
+		Block: -1,
+	}).Result()
+	switch {
+	case isNoGroup(err):
+		// The read below finds the group gone as well, and forgets it.
+		return nil, nil
+	case err != nil:
+		// Lost the same way the read it was recovering was. Nothing moved: a history read
+		// takes no new entries, so what was pending is pending still, for the next read.
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, fmt.Errorf("redisstream: take back what a lost read left pending: %w", err)
+	}
+	return s.handOutRead(result), nil
 }
 
 // Claim takes over commands another instance read and never acknowledged, which is
@@ -566,6 +650,7 @@ func (s *Streams) deliveriesWithIDs(result []redis.XStream, redelivered bool) (o
 				continue
 			}
 			held := s.hold(stream.Stream, message.ID)
+			s.markReceived(stream.Stream, message.ID)
 			out = append(out, transport.Delivery{
 				Command:     command,
 				Ack:         s.acker(stream.Stream, message.ID, held),
@@ -576,6 +661,33 @@ func (s *Streams) deliveriesWithIDs(result []redis.XStream, redelivered bool) (o
 		}
 	}
 	return out, ids
+}
+
+// markReceived moves a stream's mark up to an entry this process has been handed.
+func (s *Streams) markReceived(stream, id string) {
+	s.receivedMu.Lock()
+	defer s.receivedMu.Unlock()
+	if entryAfter(id, s.received[stream]) {
+		s.received[stream] = id
+	}
+}
+
+// entryAfter reports whether stream entry id a comes after b. Everything comes after an
+// empty b. Ids are `<milliseconds>-<sequence>`, and neither half compares as text.
+func entryAfter(a, b string) bool {
+	if b == "" {
+		return true
+	}
+	aMs, aSeq := splitEntryID(a)
+	bMs, bSeq := splitEntryID(b)
+	return aMs > bMs || (aMs == bMs && aSeq > bSeq)
+}
+
+func splitEntryID(id string) (ms, seq uint64) {
+	msPart, seqPart, _ := strings.Cut(id, "-")
+	ms, _ = strconv.ParseUint(msPart, 10, 64)
+	seq, _ = strconv.ParseUint(seqPart, 10, 64)
+	return ms, seq
 }
 
 func (s *Streams) acker(stream, id string, release func()) func(context.Context) error {

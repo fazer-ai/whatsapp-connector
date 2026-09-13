@@ -410,3 +410,86 @@ func TestALostAnswerForASessionNoLongerReadIsLeftForItsNewOwner(t *testing.T) {
 		}
 	})
 }
+
+// The mark recovery reads past is the newest entry this process was handed, and newest is
+// by entry id, not by when it was handed. A claim hands out older entries after newer
+// ones, and ids share a millisecond once a client writes fast enough that the sequence
+// runs past nine. Either way a mark that went backwards would have recovery hand out,
+// a second time, a command this process is still running.
+func TestTheMarkRecoveryReadsPastNeverGoesBackwards(t *testing.T) {
+	cutBackends(t, func(t *testing.T, f cutFleet) {
+		for _, tc := range []struct {
+			name, sid string
+			// given leaves this process running two commands on sid.
+			given func(t *testing.T, f cutFleet, streams *redisstream.Streams, sid string)
+		}{
+			{
+				name: "a claim hands out something older after something newer", sid: "s-claimed",
+				given: func(t *testing.T, f cutFleet, streams *redisstream.Streams, sid string) {
+					stream := f.client.Keys().Commands(sid)
+					writeCommand(t, f.fleet, stream, command("mark-older", sid, ""))
+					if _, err := f.rdb.XReadGroup(context.Background(), &redis.XReadGroupArgs{
+						Group: redisstream.ConsumerGroup, Consumer: "inst-dead", Streams: []string{stream, ">"}, Count: 1, Block: -1,
+					}).Result(); err != nil {
+						t.Fatalf("inst-dead read: %v", err)
+					}
+					writeCommand(t, f.fleet, stream, command("mark-newer", sid, ""))
+					newer, err := read(t, streams, sid)
+					if err != nil || !slices.Equal(ids(newer), []string{"mark-newer"}) {
+						t.Fatalf("read %v (err=%v), want [mark-newer]", ids(newer), err)
+					}
+					older, err := streams.ClaimSessions(context.Background(), []string{sid})
+					if err != nil || !slices.Equal(ids(older), []string{"mark-older"}) {
+						t.Fatalf("claimed %v (err=%v), want [mark-older]", ids(older), err)
+					}
+				},
+			},
+			{
+				name: "two ids in one millisecond whose sequences only compare as numbers", sid: "s-sequence",
+				given: func(t *testing.T, f cutFleet, streams *redisstream.Streams, sid string) {
+					stream := f.client.Keys().Commands(sid)
+					for _, entry := range []struct{ id, command string }{{"1-9", "mark-nine"}, {"1-10", "mark-ten"}} {
+						fields, err := command(entry.command, sid, "").Fields()
+						if err != nil {
+							t.Fatalf("render: %v", err)
+						}
+						values := make(map[string]any, len(fields))
+						for key, value := range fields {
+							values[key] = value
+						}
+						if err := f.rdb.XAdd(context.Background(), &redis.XAddArgs{Stream: stream, ID: entry.id, Values: values}).Err(); err != nil {
+							t.Fatalf("XAdd %s: %v", entry.id, err)
+						}
+					}
+					both, err := read(t, streams, sid)
+					if err != nil || !slices.Equal(ids(both), []string{"mark-nine", "mark-ten"}) {
+						t.Fatalf("read %v (err=%v), want [mark-nine mark-ten]", ids(both), err)
+					}
+				},
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				streams := f.streams(t, "inst-a")
+				if _, err := read(t, streams, tc.sid); err != nil {
+					t.Fatalf("priming read: %v", err)
+				}
+				tc.given(t, f, streams, tc.sid)
+
+				writeCommand(t, f.fleet, f.client.Keys().Commands(tc.sid), command("mark-lost-"+tc.sid, tc.sid, ""))
+				f.loseTheAnswer(t, "held past the window", streams, "inst-a", "mark-lost-"+tc.sid, tc.sid)
+
+				var after []string
+				for range 3 {
+					delivered, err := read(t, streams, tc.sid)
+					if err != nil {
+						t.Fatalf("read: %v", err)
+					}
+					after = append(after, ids(delivered)...)
+				}
+				if want := []string{"mark-lost-" + tc.sid}; !slices.Equal(after, want) {
+					t.Fatalf("with two commands still running, the reads handed out %v, want only %v", after, want)
+				}
+			})
+		}
+	})
+}
