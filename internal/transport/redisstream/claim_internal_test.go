@@ -11,6 +11,7 @@ import (
 
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 	"github.com/fazer-ai/whatsapp-connector/internal/redisx"
+	"github.com/fazer-ai/whatsapp-connector/internal/transport"
 )
 
 // A claim that walks several streams and fails partway has already handed some
@@ -97,5 +98,71 @@ func writeOne(t *testing.T, client *redisx.Client, stream, sid string) {
 	}
 	if err := client.XAdd(context.Background(), &redis.XAddArgs{Stream: stream, Values: values}).Err(); err != nil {
 		t.Fatalf("XAdd: %v", err)
+	}
+}
+
+// What a claim hands out past the mark is kept apart only while it is still pending here and
+// no page has been read past it. Acknowledged, it is off the pending list and no page will
+// ever carry it; passed by a page, the mark keeps it off every later page by itself. Either
+// way it is forgotten, or an instance that claims for weeks holds every id it ever claimed.
+func TestAClaimedEntryIsForgottenOnceAckedOrPassed(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+	ctx := context.Background()
+	stream := client.Keys().Commands("s1")
+
+	a, err := New(client, Options{Instance: "inst-a", Block: 50 * time.Millisecond, ReadCount: 8})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	dead, err := New(client, Options{Instance: "inst-dead", Block: 50 * time.Millisecond, ReadCount: 8})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	for _, streams := range []*Streams{a, dead} {
+		if _, err := streams.Read(ctx, []string{"s1"}); err != nil {
+			t.Fatalf("priming Read: %v", err)
+		}
+	}
+	abandon := func() {
+		t.Helper()
+		writeOne(t, client, stream, "s1")
+		if taken, err := dead.Read(ctx, []string{"s1"}); err != nil || len(taken) != 1 {
+			t.Fatalf("the peer read %d commands (err=%v), want 1", len(taken), err)
+		}
+	}
+	claimOne := func() transport.Delivery {
+		t.Helper()
+		claimed, err := a.claim(ctx, []string{stream}, 0)
+		if err != nil || len(claimed) != 1 {
+			t.Fatalf("claimed %d (err=%v), want the peer's command", len(claimed), err)
+		}
+		if kept := len(a.claimedPast[stream]); kept != 1 {
+			t.Fatalf("%d claimed entries kept apart, want the one claimed past the mark", kept)
+		}
+		return claimed[0]
+	}
+
+	abandon()
+	acked := claimOne()
+	if err := acked.Ack(ctx); err != nil {
+		t.Fatalf("Ack: %v", err)
+	}
+	if kept := len(a.claimedPast[stream]); kept != 0 {
+		t.Fatalf("%d claimed entries still kept after the ack, want none", kept)
+	}
+
+	abandon()
+	claimOne().Release()
+	writeOne(t, client, stream, "s1")
+	if read, err := a.Read(ctx, []string{"s1"}); err != nil || len(read) != 1 {
+		t.Fatalf("read %d commands (err=%v), want the newer one and not the one given back", len(read), err)
+	}
+	if kept := len(a.claimedPast[stream]); kept != 0 {
+		t.Fatalf("%d claimed entries still kept after a page was read past them, want none", kept)
 	}
 }

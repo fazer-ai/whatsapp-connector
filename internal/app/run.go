@@ -152,7 +152,13 @@ func New(cfg *Config, log zerolog.Logger) (connector *Connector, err error) {
 
 	streams, err := redisstream.New(client, redisstream.Options{
 		Instance: cfg.Instance, ClaimMinIdle: cfg.ClaimMinIdle, Block: readBlock(cfg.Heartbeat),
-		Logger: log,
+		// A wake recovered by a read is handed out with the age it already has, and the
+		// claim delay outlives a lease by exactly this much: a peer must not be able to
+		// claim it before the lease this instance takes for it could have expired. Half of
+		// that slack, so the other half stays what it is for a wake read on arrival -- room
+		// for the adoption between the hand-out and the lease.
+		ReadBackMaxAge: (cfg.ClaimMinIdle - cfg.LeaseTTL) / 2,
+		Logger:         log,
 	})
 	if err != nil {
 		return nil, err

@@ -57,6 +57,10 @@ type Options struct {
 	ReplyTTL      time.Duration
 	ClaimMinIdle  time.Duration
 	ReadCount     int64
+	// ReadBackMaxAge is the oldest an entry on the control stream may be and still be
+	// handed out by a read that recovers it, rather than left to a claim. It has to be
+	// shorter than ClaimMinIdle, and the zero value asks for half of it. See Read.
+	ReadBackMaxAge time.Duration
 }
 
 // Streams is the Redis Streams implementation of transport.Transport.
@@ -120,6 +124,16 @@ func New(client *redisx.Client, opts Options) (*Streams, error) {
 	}
 	if opts.ReadCount <= 0 {
 		opts.ReadCount = DefaultReadCount
+	}
+	if opts.ReadBackMaxAge <= 0 {
+		opts.ReadBackMaxAge = opts.ClaimMinIdle / 2
+	}
+	if opts.ReadBackMaxAge >= opts.ClaimMinIdle {
+		// A wake handed out that old would be claimable by a peer the moment it is handed
+		// out, while this instance is still adopting its session. That is a deployment
+		// bug, not a tuning choice.
+		return nil, fmt.Errorf("redisstream: ReadBackMaxAge (%s) must be shorter than ClaimMinIdle (%s)",
+			opts.ReadBackMaxAge, opts.ClaimMinIdle)
 	}
 	return &Streams{
 		client: client, opts: opts, groups: newGroupCache(),
@@ -249,6 +263,19 @@ func (s *Streams) blockWithin(ctx context.Context) (time.Duration, bool) {
 // through yet, the mark is the start, and what an earlier process under this name left
 // pending comes back the same way.
 //
+// Reading back only looks. Nothing on this path resets an entry's idle time, which is what
+// a claim goes by: an instance whose answers keep getting lost must not keep what it never
+// sees looking freshly delivered, or a healthy peer would never take a wake from it. The
+// cost falls on the control stream, the one stream a peer claims without holding a lease
+// on it. A wake recovered late keeps the age it gathered while its answer was lost, and
+// handed out like that it would be claimable by a peer early, while this instance is still
+// adopting the session -- and the peer, finding a live lease, would retire the only wake
+// there was. So on the control stream a read hands out a recovered entry only while it is
+// younger than ReadBackMaxAge, and leaves an older one to a claim, which resets the age as it
+// hands it out. What the `>` of the same read carried is exempt: it was delivered a moment
+// ago. The streams of sessions have no such limit, since a peer claims them only once it
+// holds their lease, and order is what they are for.
+//
 // A history read that fails leaves what `>` moved in pending above the mark, for the
 // history of the next read to hand out. Anything already taken and not acknowledged below
 // the mark is Claim's business.
@@ -283,7 +310,7 @@ func (s *Streams) Read(ctx context.Context, sids []string) ([]transport.Delivery
 		Count:    s.opts.ReadCount,
 		Block:    block,
 	}
-	err = s.client.XReadGroup(ctx, args).Err()
+	answer, err := s.client.XReadGroup(ctx, args).Result()
 	switch {
 	case errors.Is(err, redis.Nil):
 		// Nothing new, and the history is still worth the trip: a read that lost its answer
@@ -299,13 +326,19 @@ func (s *Streams) Read(ctx context.Context, sids []string) ([]transport.Delivery
 		}
 		return nil, fmt.Errorf("redisstream: read commands: %w", err)
 	}
-	return s.readHistory(ctx, streams)
+	answered := make(map[string]struct{})
+	for _, stream := range answer {
+		for _, message := range stream.Messages {
+			answered[message.ID] = struct{}{}
+		}
+	}
+	return s.readHistory(ctx, streams, answered)
 }
 
 // readHistory hands out what is pending under this consumer past the mark on each stream.
-// It never waits, and reading only looks: an answer it loses leaves everything as it found
-// it, for the next one.
-func (s *Streams) readHistory(ctx context.Context, streams []string) ([]transport.Delivery, error) {
+// It never waits, and it only looks: an answer it loses leaves everything as it found it,
+// for the next one. answered is what the `>` of the same read carried.
+func (s *Streams) readHistory(ctx context.Context, streams []string, answered map[string]struct{}) ([]transport.Delivery, error) {
 	args := make([]any, 0, len(streams)+3)
 	args = append(args, ConsumerGroup, s.opts.Instance, s.opts.ReadCount)
 	s.marksMu.Lock()
@@ -316,9 +349,6 @@ func (s *Streams) readHistory(ctx context.Context, streams []string) ([]transpor
 
 	raw, err := pendingPastScript.Run(ctx, s.client, streams, args...).Result()
 	if err != nil {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
 		return nil, fmt.Errorf("redisstream: read commands back: %w", err)
 	}
 	pages, err := parsePendingPast(raw)
@@ -326,67 +356,46 @@ func (s *Streams) readHistory(ctx context.Context, streams []string) ([]transpor
 		return nil, err
 	}
 
-	// Every page is settled before anything is handed out, so a stream that fails leaves
-	// nothing half given: the next read finds the same pages.
-	kept := make([][]redis.XMessage, len(pages))
-	for i, page := range pages {
-		if kept[i], err = s.takeFresh(ctx, page.Stream, s.skipClaimed(page)); err != nil {
-			if ctx.Err() != nil {
-				return nil, ctx.Err()
-			}
-			return nil, fmt.Errorf("redisstream: read commands back from %s: %w", page.Stream, err)
-		}
-	}
-
+	control := s.client.Keys().Control()
 	var out []transport.Delivery
-	for i, page := range pages {
-		stream := redis.XStream{Stream: page.Stream, Messages: kept[i]}
+	for _, page := range pages {
+		handing := make([]redis.XMessage, 0, len(page.entries))
+		s.marksMu.Lock()
+		for _, entry := range page.entries {
+			if _, claimed := s.claimedPast[page.stream][entry.ID]; claimed {
+				continue
+			}
+			if _, fresh := answered[entry.ID]; page.stream == control && !fresh && entry.idle > s.opts.ReadBackMaxAge {
+				continue
+			}
+			handing = append(handing, entry.XMessage)
+		}
+		// Past everything on the page, what was handed out and what was skipped alike: a
+		// page is every entry pending here up to its last, and what it skipped belongs to
+		// a claim.
+		if last := len(page.entries); last > 0 {
+			s.marks[page.stream] = page.entries[last-1].ID
+			for id := range s.claimedPast[page.stream] {
+				if !entryAfter(id, s.marks[page.stream]) {
+					delete(s.claimedPast[page.stream], id)
+				}
+			}
+		}
+		s.marksMu.Unlock()
+
 		// Handed out as read for the first time, not as redelivered, whichever answer it
 		// first arrived in: nobody has run it, and whoever sent it is still waiting.
-		taken, ids := s.deliveriesWithIDs([]redis.XStream{stream}, false)
+		taken, ids := s.deliveriesWithIDs([]redis.XStream{{Stream: page.stream, Messages: handing}}, false)
 		// A read entry starts at zero idle and stays there until somebody touches it, so
 		// one this instance gives back unrun is claimable by nobody — not by `>`, which
 		// returns only what no consumer has taken, and not by a claim, which will not
 		// look at it for a whole delay. Recording the delay as its age has the next
 		// reclaim see it instead, which for a command carrying a deadline is the
 		// difference between running late and expiring unrun.
-		s.rememberAge(stream.Stream, s.opts.ClaimMinIdle, taken, ids)
+		s.rememberAge(page.stream, s.opts.ClaimMinIdle, taken, ids)
 		out = append(out, taken...)
-		s.advanceMark(page.Stream, page.Messages)
 	}
 	return out, nil
-}
-
-// skipClaimed drops from a page what a claim already handed out, which is still pending
-// here and must not be handed out a second time.
-func (s *Streams) skipClaimed(page redis.XStream) []redis.XMessage {
-	s.marksMu.Lock()
-	defer s.marksMu.Unlock()
-	claimed := s.claimedPast[page.Stream]
-	fresh := make([]redis.XMessage, 0, len(page.Messages))
-	for _, message := range page.Messages {
-		if _, taken := claimed[message.ID]; !taken {
-			fresh = append(fresh, message)
-		}
-	}
-	return fresh
-}
-
-// advanceMark moves a stream's mark to the newest entry of a page read back, and forgets
-// the claimed entries it has now passed.
-func (s *Streams) advanceMark(stream string, page []redis.XMessage) {
-	s.marksMu.Lock()
-	defer s.marksMu.Unlock()
-	for _, message := range page {
-		if entryAfter(message.ID, s.marks[stream]) {
-			s.marks[stream] = message.ID
-		}
-	}
-	for id := range s.claimedPast[stream] {
-		if !entryAfter(id, s.marks[stream]) {
-			delete(s.claimedPast[stream], id)
-		}
-	}
 }
 
 // noteClaimed keeps apart what a claim handed out past a stream's mark. See Read.
@@ -404,63 +413,17 @@ func (s *Streams) noteClaimed(stream string, ids []string) {
 	}
 }
 
-// takeFresh sets the idle time of entries about to be handed out back to zero, and returns
-// those still pending under this consumer to hand out.
-//
-// A read hands out an entry that may have sat pending since the answer carrying it was
-// lost, and a claim goes by idle time. Left alone, a wake recovered twenty seconds late
-// would be claimable by a peer twenty seconds early, while this instance is still adopting
-// the session it names -- and the peer, finding a live lease, would retire the only wake
-// there was. Reset here, it waits the whole claim delay from now, as a wake read the moment
-// it arrived does. It is done after the page reached this process, never by reading it: an
-// instance whose answers stop arriving never gets this far, and keeps nothing looking fresh
-// for a peer's claim to wait on.
-//
-// An entry a peer took in between is not this process's to hand out any more, and is left
-// out rather than taken back.
-func (s *Streams) takeFresh(ctx context.Context, stream string, messages []redis.XMessage) ([]redis.XMessage, error) {
-	if len(messages) == 0 {
-		return nil, nil
-	}
-	args := make([]any, 0, len(messages)+2)
-	args = append(args, ConsumerGroup, s.opts.Instance)
-	for _, message := range messages {
-		args = append(args, message.ID)
-	}
-	stillOurs, err := freshenScript.Run(ctx, s.client, []string{stream}, args...).StringSlice()
-	if err != nil {
-		return nil, err
-	}
-	kept := make([]redis.XMessage, 0, len(stillOurs))
-	for _, message := range messages {
-		if slices.Contains(stillOurs, message.ID) {
-			kept = append(kept, message)
-		}
-	}
-	return kept, nil
+// forgetClaimed drops an acknowledged entry from what claims handed out: it is off the
+// pending list, and no page will ever carry it to be passed.
+func (s *Streams) forgetClaimed(stream, id string) {
+	s.marksMu.Lock()
+	defer s.marksMu.Unlock()
+	delete(s.claimedPast[stream], id)
 }
 
-// freshenScript sets each entry's idle time to zero while it is still pending under the
-// consumer, and names the ones it did. One operation for the reason restoreAgeScript is
-// one: XCLAIM transfers an entry without asking who holds it, so a check and a claim apart
-// would take back an entry a peer had just claimed and is carrying out. JUSTID keeps the
-// delivery counter still, since nothing was delivered again.
-var freshenScript = redis.NewScript(`
-local group, consumer = ARGV[1], ARGV[2]
-local kept = {}
-for i = 3, #ARGV do
-  local id = ARGV[i]
-  local pending = redis.call("XPENDING", KEYS[1], group, id, id, 1)
-  if pending[1] and pending[1][2] == consumer then
-    redis.call("XCLAIM", KEYS[1], group, consumer, 0, id, "JUSTID")
-    kept[#kept + 1] = id
-  end
-end
-return kept
-`)
-
 // pendingPastScript returns, for each stream, up to a count of the entries pending under
-// one consumer past a mark, oldest first. An empty mark is the start of the stream.
+// one consumer past a mark, oldest first, each with its idle time in milliseconds. An empty
+// mark is the start of the stream.
 //
 // Not XREADGROUP with an id, which is the command made for reading a consumer's history.
 // That one delivers what it returns again, and a delivery sets the entry's idle time back
@@ -484,11 +447,9 @@ for i, key in ipairs(KEYS) do
     if #entries == count then break end
     if pending[1] ~= mark then
       local found = redis.call("XRANGE", key, pending[1], pending[1])
-      if found[1] then
-        entries[#entries + 1] = found[1]
-      else
-        entries[#entries + 1] = {pending[1], {}}
-      end
+      local fields = {}
+      if found[1] then fields = found[1][2] end
+      entries[#entries + 1] = {pending[1], fields, pending[3]}
     end
   end
   out[#out + 1] = {key, entries}
@@ -496,16 +457,27 @@ end
 return out
 `)
 
-// parsePendingPast reads pendingPastScript's answer into the shape a read returns.
-func parsePendingPast(raw any) ([]redis.XStream, error) {
-	malformed := func() ([]redis.XStream, error) {
+// pendingPage is one stream's part of pendingPastScript's answer.
+type pendingPage struct {
+	stream  string
+	entries []pendingEntry
+}
+
+type pendingEntry struct {
+	redis.XMessage
+	idle time.Duration
+}
+
+// parsePendingPast reads pendingPastScript's answer.
+func parsePendingPast(raw any) ([]pendingPage, error) {
+	malformed := func() ([]pendingPage, error) {
 		return nil, fmt.Errorf("redisstream: read commands back: unexpected answer %T", raw)
 	}
 	streams, ok := raw.([]any)
 	if !ok {
 		return malformed()
 	}
-	out := make([]redis.XStream, 0, len(streams))
+	out := make([]pendingPage, 0, len(streams))
 	for _, item := range streams {
 		pair, ok := item.([]any)
 		if !ok || len(pair) != 2 {
@@ -516,15 +488,16 @@ func parsePendingPast(raw any) ([]redis.XStream, error) {
 		if !nameOK || !entriesOK {
 			return malformed()
 		}
-		stream := redis.XStream{Stream: name, Messages: make([]redis.XMessage, 0, len(entries))}
+		page := pendingPage{stream: name, entries: make([]pendingEntry, 0, len(entries))}
 		for _, item := range entries {
 			entry, ok := item.([]any)
-			if !ok || len(entry) != 2 {
+			if !ok || len(entry) != 3 {
 				return malformed()
 			}
 			id, idOK := entry[0].(string)
 			flat, flatOK := entry[1].([]any)
-			if !idOK || !flatOK || len(flat)%2 != 0 {
+			idle, idleOK := entry[2].(int64)
+			if !idOK || !flatOK || !idleOK || len(flat)%2 != 0 {
 				return malformed()
 			}
 			values := make(map[string]any, len(flat)/2)
@@ -535,9 +508,12 @@ func parsePendingPast(raw any) ([]redis.XStream, error) {
 				}
 				values[field] = flat[i+1]
 			}
-			stream.Messages = append(stream.Messages, redis.XMessage{ID: id, Values: values})
+			page.entries = append(page.entries, pendingEntry{
+				XMessage: redis.XMessage{ID: id, Values: values},
+				idle:     time.Duration(idle) * time.Millisecond,
+			})
 		}
-		out = append(out, stream)
+		out = append(out, page)
 	}
 	return out, nil
 }
@@ -878,6 +854,7 @@ func (s *Streams) acker(stream, id string, release func()) func(context.Context)
 			return fmt.Errorf("redisstream: ack %s on %s: %w", id, stream, err)
 		}
 		release()
+		s.forgetClaimed(stream, id)
 		return nil
 	}
 }

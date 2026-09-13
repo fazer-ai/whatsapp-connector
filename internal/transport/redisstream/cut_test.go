@@ -78,16 +78,22 @@ func (f cutFleet) streams(t *testing.T, instance string) *redisstream.Streams {
 	return f.streamsReading(t, instance, 0)
 }
 
-// streamsReading is streams taking at most count entries per stream a read.
-func (f cutFleet) streamsReading(t *testing.T, instance string, count int64) *redisstream.Streams {
+// streamsWith is the transport under test with options of the test's own.
+func (f cutFleet) streamsWith(t *testing.T, opts *redisstream.Options) *redisstream.Streams {
 	t.Helper()
-	streams, err := redisstream.New(f.via, redisstream.Options{
-		Instance: instance, Block: 50 * time.Millisecond, ClaimMinIdle: cutClaimMinIdle, ReadCount: count,
-	})
+	streams, err := redisstream.New(f.via, *opts)
 	if err != nil {
 		t.Fatalf("redisstream.New: %v", err)
 	}
 	return streams
+}
+
+// streamsReading is streams taking at most count entries per stream a read.
+func (f cutFleet) streamsReading(t *testing.T, instance string, count int64) *redisstream.Streams {
+	t.Helper()
+	return f.streamsWith(t, &redisstream.Options{
+		Instance: instance, Block: 50 * time.Millisecond, ClaimMinIdle: cutClaimMinIdle, ReadCount: count,
+	})
 }
 
 // read is one pass of the connector's loop: a read bounded by one window.
@@ -382,17 +388,18 @@ func TestReadingBackAWakeWhoseAnswersKeepGettingLostLeavesItForAPeer(t *testing.
 	})
 }
 
-// A wake read back late is handed out late, and a claim goes by idle time. The claim delay
-// is longer than a lease precisely so a peer never takes a wake while the instance that read
-// it may still be adopting its session: handed out with the age it gathered while its answer
-// was lost, the wake would be claimable that much early, and a peer finding the new owner's
-// lease would retire the only wake there was. It has to wait the whole delay from when it is
-// handed out, as a wake read the moment it arrived does.
-func TestAWakeReadBackLateWaitsTheWholeClaimDelayFromWhenItIsHandedOut(t *testing.T) {
+// A wake read back late is handed out late, and a claim goes by idle time. Nothing on the
+// read path resets that age, so a wake older than ReadBackMaxAge is not handed out by the
+// read that recovers it: handed out, it would be claimable by a peer while this instance is
+// still adopting its session, and the peer, finding a live lease, would retire the only wake
+// there was. It is left to a claim, which resets the age as it hands it out.
+func TestAWakeReadBackOlderThanItsMaxAgeIsLeftToAClaim(t *testing.T) {
 	cutBackends(t, func(t *testing.T, f cutFleet) {
 		const claimDelay = 400 * time.Millisecond
 
-		adopter := f.streams(t, "inst-a")
+		adopter := f.streamsWith(t, &redisstream.Options{
+			Instance: "inst-a", Block: 50 * time.Millisecond, ClaimMinIdle: claimDelay, ReadBackMaxAge: claimDelay / 4,
+		})
 		if _, err := read(t, adopter, "s1"); err != nil {
 			t.Fatalf("priming read: %v", err)
 		}
@@ -401,26 +408,98 @@ func TestAWakeReadBackLateWaitsTheWholeClaimDelayFromWhenItIsHandedOut(t *testin
 			TS: 1787000000000, Payload: []byte(`{"desired":"connected"}`),
 		})
 		f.loseTheAnswer(t, "held past the window", adopter, "inst-a", "late-wake", "s1")
-		// The age is the subject: the wake sits unseen here for longer than a peer's delay.
+		// The age is the subject: the wake sits unseen here past the claim delay.
 		time.Sleep(claimDelay + claimDelay/2)
 
-		delivered, err := read(t, adopter, "s1")
-		if err != nil || !slices.Equal(ids(delivered), []string{"late-wake"}) {
-			t.Fatalf("the read back handed out %v (err=%v), want [late-wake]", ids(delivered), err)
+		if delivered, err := read(t, adopter, "s1"); err != nil || len(delivered) != 0 {
+			t.Fatalf("the read back handed out %v (err=%v), want the old wake left to a claim", ids(delivered), err)
 		}
-
 		peer, err := redisstream.New(f.client, redisstream.Options{Instance: "inst-peer", ClaimMinIdle: claimDelay})
 		if err != nil {
 			t.Fatalf("redisstream.New: %v", err)
 		}
 		claimed, err := peer.ClaimControl(context.Background())
-		if err != nil {
-			t.Fatalf("ClaimControl: %v", err)
-		}
-		if len(claimed) != 0 {
-			t.Fatalf("a peer claimed %v the moment inst-a handed it out, want it left to inst-a for the whole delay", ids(claimed))
+		if err != nil || !slices.Equal(ids(claimed), []string{"late-wake"}) {
+			t.Fatalf("the peer claimed %v (err=%v), want the wake nobody here handed out", ids(claimed), err)
 		}
 	})
+}
+
+// The age limit is for what a read recovers. A wake the same read's `>` carried was
+// delivered a moment ago, and is handed out however small the limit: otherwise a tight
+// claim delay would leave every wake to a claim.
+func TestAWakeTheSameReadCarriedIsHandedOutWhateverItsMaxAge(t *testing.T) {
+	cutBackends(t, func(t *testing.T, f cutFleet) {
+		streams := f.streamsWith(t, &redisstream.Options{
+			Instance: "inst-a", Block: 50 * time.Millisecond, ClaimMinIdle: cutClaimMinIdle, ReadBackMaxAge: time.Millisecond,
+		})
+		if _, err := read(t, streams, "s1"); err != nil {
+			t.Fatalf("priming read: %v", err)
+		}
+		writeCommand(t, f.fleet, f.client.Keys().Control(), &protocol.Command{
+			V: protocol.Version, ID: "carried-wake", Type: protocol.CommandSessionWake, SID: "s9",
+			TS: 1787000000000, Payload: []byte(`{"desired":"connected"}`),
+		})
+		// The answer to `>` is held inside the window, so the wake has aged well past the
+		// limit by the time the same read reads it back.
+		release := make(chan struct{})
+		caught := f.proxy.Hold("carried-wake", release)
+		time.AfterFunc(50*time.Millisecond, func() { close(release) })
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		delivered, err := streams.Read(ctx, []string{"s1"})
+		select {
+		case <-caught:
+		default:
+			t.Fatal("the answer carrying the wake was never held")
+		}
+		if err != nil || !slices.Equal(ids(delivered), []string{"carried-wake"}) {
+			t.Fatalf("handed out %v (err=%v), want the wake its own `>` carried", ids(delivered), err)
+		}
+	})
+}
+
+// The age limit is the control stream's alone. A peer claims a session's stream only once it
+// holds the session's lease, so a session command recovered late is handed out whatever its
+// age, and in order: leaving it to a claim is the reordering this change exists to undo.
+func TestASessionCommandReadBackLateIsStillHandedOutInOrder(t *testing.T) {
+	cutBackends(t, func(t *testing.T, f cutFleet) {
+		streams := f.streamsWith(t, &redisstream.Options{
+			Instance: "inst-a", Block: 50 * time.Millisecond, ClaimMinIdle: cutClaimMinIdle, ReadBackMaxAge: time.Millisecond,
+		})
+		stream := f.client.Keys().Commands("s1")
+		if _, err := read(t, streams, "s1"); err != nil {
+			t.Fatalf("priming read: %v", err)
+		}
+		writeCommand(t, f.fleet, stream, command("aged-connect", "s1", ""))
+		f.loseTheAnswer(t, "held past the window", streams, "inst-a", "aged-connect", "s1")
+		writeCommand(t, f.fleet, stream, command("aged-disconnect", "s1", ""))
+
+		var order []string
+		for range 5 {
+			delivered, err := read(t, streams, "s1")
+			if err != nil {
+				t.Fatalf("read: %v", err)
+			}
+			order = append(order, ids(delivered)...)
+			ackAll(t, delivered)
+		}
+		if want := []string{"aged-connect", "aged-disconnect"}; !slices.Equal(order, want) {
+			t.Fatalf("handed out %v, want %v", order, want)
+		}
+	})
+}
+
+// A max age as long as the claim delay would hand a recovered wake out already claimable.
+func TestAReadBackMaxAgeNotShorterThanTheClaimDelayIsRefused(t *testing.T) {
+	f := newFleet(t)
+	for _, age := range []time.Duration{cutClaimMinIdle, 2 * cutClaimMinIdle} {
+		if _, err := redisstream.New(f.client, redisstream.Options{
+			Instance: "inst-a", ClaimMinIdle: cutClaimMinIdle, ReadBackMaxAge: age,
+		}); err == nil {
+			t.Errorf("ReadBackMaxAge %s with ClaimMinIdle %s was accepted", age, cutClaimMinIdle)
+		}
+	}
 }
 
 // A claim hands out entries past the mark: a peer's, or one a peer gave back with its age
