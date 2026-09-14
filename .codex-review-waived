@@ -1,3 +1,18 @@
+# PR#216: right that a kept name can outlive its truth in one shape this does not cover.
+# If a rename from A to B fails to reach the table, the record holds B beside rows holding
+# A; and if the account then goes back to A without an app-state mutation -- so the only
+# evidence is a message it sent, carrying A -- whatsmeow's `PutPushName` returns
+# `changed=false` and dispatches nothing, so this session never hears it. The rows still
+# hold what they held, the record still says B, and the next process files B over A.
+# What closing it asks for is an observation point that does not exist here: a hook on the
+# push name of every inbound message, which is precisely the name whatsmeow decided not to
+# report because it had not changed. This connector reads names from events, never from
+# message parsing, and adding that path to cover a name returning to exactly the value the
+# rows hold, with no app-state mutation behind it, buys one display field in a case that
+# needs three things at once. The case is named in the PR body as what this does not cover,
+# beside the one it inherited.
+internal/engine/whatsmeow/session.go: Invalidate pending names when the account returns to the held name  # PR#216
+
 # PR#177: the mechanism is right -- a `select` with two ready cases picks between them at
 # random, so waking because the takedown finished says nothing about whether the caller is
 # still there -- and the remedy is wrong for this connector. Refusing a command whose

@@ -990,3 +990,54 @@ func TestAVerifiedNameTheWriteRanOutOfTimeForIsStillWrittenDown(t *testing.T) {
 		t.Errorf("what was kept reads %+v, want the name the write ran out of time for", kept)
 	}
 }
+
+// The rows go into one column and come back out of it. What is written is this code's own,
+// so what a read has to refuse is not an attack: it is a value that does not say what it
+// claims to, which is a value nothing can be compared against.
+func TestTheRowsSurviveTheColumnTheyAreKeptIn(t *testing.T) {
+	t.Parallel()
+
+	for _, rows := range [][]string{
+		{"", ""},
+		{"Atendimento", ""},
+		{"", "Atendimento"},
+		{"Ana", "Bia"},
+		{"AnaBia", ""},
+		{"1:x", "2:yy"},
+		{"Loja do Bruno LTDA", "Loja do Bruno"},
+	} {
+		written := writtenRows(rows)
+		back, ok := readRows(written)
+		if !ok {
+			t.Errorf("%q, written as %q, did not read back", rows, written)
+			continue
+		}
+		if len(back) != len(rows) {
+			t.Errorf("%q read back as %q", rows, back)
+			continue
+		}
+		for i := range rows {
+			if back[i] != rows[i] {
+				t.Errorf("%q read back as %q", rows, back)
+				break
+			}
+		}
+	}
+
+	// And a value that is not one of those says so, rather than answering with a shape a
+	// comparison would then trust.
+	for _, bogus := range []string{"Atendimento", "3:ab", "x:ab", "-1:a", "5"} {
+		if back, ok := readRows(bogus); ok {
+			t.Errorf("%q was read as the rows %q", bogus, back)
+		}
+	}
+}
+
+// Two rows spelling what one row spells is the whole reason for the length beside each.
+func TestWhatIsWrittenTellsTwoRowsFromOne(t *testing.T) {
+	t.Parallel()
+
+	if one, two := writtenRows([]string{"AnaBia", ""}), writtenRows([]string{"Ana", "Bia"}); one == two {
+		t.Errorf("one row and two rows are both written as %q", one)
+	}
+}
