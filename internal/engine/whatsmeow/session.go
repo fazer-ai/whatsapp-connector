@@ -104,6 +104,13 @@ type Session struct {
 	// which group it made. A field for the same reason as the two above it.
 	createWait time.Duration
 
+	// lookingForNotice is called each time that wait looks, and is nil everywhere but in a
+	// test. What it exists for is the one thing a test cannot otherwise establish: that the
+	// command is inside the wait at the moment the notification is delivered to it. A sleep
+	// long enough to be likely is not the same statement, and this package's tests do not
+	// synchronise on the clock.
+	lookingForNotice func()
+
 	// stalledUntil is when a receipt is worth handing to the publisher again, in
 	// monotonic nanoseconds, and zero while it is.
 	//
@@ -4163,7 +4170,11 @@ func (s *Session) handle(rawEvent any) bool {
 			s.reverify(event.NewBusinessName)
 		}
 	case *waEvents.JoinedGroup:
-		s.joinedAGroup(event)
+		// One of the two group handlers that can withhold an acknowledgement, and for the
+		// same reason as the message path does: this notification is the only place
+		// WhatsApp says which group a `group.create` made, and one that is acknowledged
+		// without being written down is gone for good.
+		return s.joinedAGroup(event)
 	case *waEvents.GroupInfo:
 		s.groupChanged(event)
 	case *waEvents.PairError:

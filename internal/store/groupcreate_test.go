@@ -52,8 +52,13 @@ func TestNamingAGroupTwiceKeepsTheFirstName(t *testing.T) {
 	if err := scoped.FinishGroupCreate(ctx, "idem:k", "120363041234567890@g.us"); err != nil {
 		t.Fatalf("the first naming: %v", err)
 	}
+	// Both ways in, because both can arrive second: the creation's own reply names the
+	// attempt, and WhatsApp's notification names the key.
+	if err := scoped.FinishGroupCreate(ctx, "idem:k", "120363088888888888@g.us"); err != nil {
+		t.Fatalf("the second naming by attempt: %v", err)
+	}
 	if named, err := scoped.FinishGroupCreateByKey(ctx, "WACK", "120363099999999999@g.us"); err != nil {
-		t.Fatalf("the second naming: %v", err)
+		t.Fatalf("the second naming by key: %v", err)
 	} else if named {
 		t.Fatal("the second naming reported that it settled an attempt that was already answered")
 	}

@@ -151,7 +151,6 @@ func TestARedeliveredCreationWaitsForTheNotificationThatNamesItsGroup(t *testing
 
 	session, _ := newTestSession(t, "5511999990001")
 	session.setConnected(true)
-	session.createWait = 2 * time.Second
 	self := waTypes.NewJID("5511999990001", waTypes.DefaultUserServer)
 	made := aMadeGroup("120363041234567890", "Obras", self)
 
@@ -167,17 +166,22 @@ func TestARedeliveredCreationWaitsForTheNotificationThatNamesItsGroup(t *testing
 		asked++
 		return aMadeGroup("120363099999999999", "Obras", self), nil
 	}
-	session.joinedGroups = func(context.Context, *wm.Client) ([]*waTypes.GroupInfo, error) {
-		return []*waTypes.GroupInfo{made}, nil
-	}
 	session.groupInfo = func(context.Context, *wm.Client, waTypes.JID) (*waTypes.GroupInfo, error) {
 		return made, nil
 	}
-	// The notification lands while the command is already waiting on it.
-	go func() {
-		time.Sleep(150 * time.Millisecond)
-		session.joinedAGroup(whatWhatsAppSaysAboutTheGroup("WACLATE", made))
-	}()
+	// Delivered from inside the wait rather than after a sleep: this fires because the
+	// command is looking for the answer, which is the ordering the test is about, and it
+	// fires once so a second look still finds the record rather than the delivery.
+	delivered := false
+	session.lookingForNotice = func() {
+		if delivered {
+			return
+		}
+		delivered = true
+		if !session.joinedAGroup(whatWhatsAppSaysAboutTheGroup("WACLATE", made)) {
+			t.Error("the notification was refused, so nothing recorded which group was made")
+		}
+	}
 
 	answer, err := session.Execute(t.Context(),
 		namedCreate("c1", "once", `{"subject":"Obras","participants":[]}`))
@@ -650,5 +654,106 @@ func TestTheCreateStanzaCarriesTheKeyAndTheSettingsWhatsmeowWouldHaveSent(t *tes
 	approval, found := stanza.GetOptionalChildByTag("membership_approval_mode", "group_join")
 	if !found || approval.Attrs["state"] != "off" {
 		t.Fatalf("group_join is %v (found=%v), want joining without approval", approval.Attrs, found)
+	}
+}
+
+// The record is written whether or not the client is carrying group traffic, and this is
+// the half of that the other test cannot show: a session that does want groups records the
+// pairing too, rather than only publishing the group.
+func TestANotificationIsRecordedWhenTheClientWantsGroupsToo(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setConnected(true)
+	session.setGroups(true)
+	self := waTypes.NewJID("5511999990001", waTypes.DefaultUserServer)
+	made := aMadeGroup("120363041234567890", "Obras", self)
+
+	if _, _, err := session.store.BeginGroupCreate(
+		t.Context(), "idem:once", "WACLOUD", "Obras", time.Now().Add(-time.Minute)); err != nil {
+		t.Fatalf("begin the attempt that crashed: %v", err)
+	}
+	if !session.joinedAGroup(whatWhatsAppSaysAboutTheGroup("WACLOUD", made)) {
+		t.Fatal("the notification was refused")
+	}
+
+	settled, _, err := session.store.GroupCreation(t.Context(), "idem:once")
+	if err != nil {
+		t.Fatalf("read the attempt: %v", err)
+	}
+	if settled.JID != made.JID.String() {
+		t.Fatalf("the attempt was left at %q, want %s", settled.JID, made.JID)
+	}
+}
+
+// Most groups an account joins were made by somebody else and carry no key. Refusing one of
+// those would have WhatsApp send it again, and again, because nothing about it will ever
+// change -- a group the account was added to would never be acknowledged.
+func TestANotificationWithNoKeyIsAcknowledged(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setConnected(true)
+	somebodyElse := waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)
+
+	added := whatWhatsAppSaysAboutTheGroup("", aMadeGroup("120363041234567890", "Churrasco", somebodyElse))
+	if !session.joinedAGroup(added) {
+		t.Fatal("a group the account was added to was left unacknowledged, so WhatsApp will send it forever")
+	}
+}
+
+// A notification this connector could not write down is left unacknowledged, so WhatsApp
+// sends it again: it is the only thing that says which group the creation made, and one
+// acknowledged without being recorded is gone for good.
+func TestANotificationThatCouldNotBeRecordedIsNotAcknowledged(t *testing.T) {
+	t.Parallel()
+
+	session, container := newTestSession(t, "5511999990001")
+	session.setConnected(true)
+	self := waTypes.NewJID("5511999990001", waTypes.DefaultUserServer)
+
+	if _, _, err := session.store.BeginGroupCreate(
+		t.Context(), "idem:once", "WACGONE", "Obras", time.Now().Add(-time.Minute)); err != nil {
+		t.Fatalf("begin the attempt that crashed: %v", err)
+	}
+	if err := container.Close(); err != nil {
+		t.Fatalf("Close the store: %v", err)
+	}
+
+	notice := whatWhatsAppSaysAboutTheGroup("WACGONE", aMadeGroup("120363041234567890", "Obras", self))
+	if session.joinedAGroup(notice) {
+		t.Fatal("a notification nothing could record was acknowledged, and WhatsApp will not send it again")
+	}
+}
+
+// A store that stopped answering during the wait is a fault, not the end of the window, and
+// the two are answered differently: one says the connector could not carry the command out,
+// the other says WhatsApp has not settled it yet and converges on the next delivery.
+func TestAStoreThatFailedDuringTheWaitIsNotReportedAsUnsettled(t *testing.T) {
+	t.Parallel()
+
+	session, container := newTestSession(t, "5511999990001")
+	session.setConnected(true)
+	session.createWait = time.Minute
+	self := waTypes.NewJID("5511999990001", waTypes.DefaultUserServer)
+
+	if _, _, err := session.store.BeginGroupCreate(
+		t.Context(), "idem:once", "WACDOWN", "Obras", time.Now().Add(-time.Minute)); err != nil {
+		t.Fatalf("begin the attempt that crashed: %v", err)
+	}
+	session.createTheGroup = func(context.Context, *wm.Client, keyedCreate) (*waTypes.GroupInfo, error) {
+		t.Error("WhatsApp was asked for a group while the earlier attempt was unresolved")
+		return aMadeGroup("120363099999999999", "Obras", self), nil
+	}
+	// The store goes as the command reaches the wait, which is the one instant this is about.
+	session.lookingForNotice = func() { _ = container.Close() }
+
+	_, err := session.Execute(t.Context(),
+		namedCreate("c1", "once", `{"subject":"Obras","participants":[]}`))
+	if err == nil {
+		t.Fatal("a creation was answered over a store that had stopped answering")
+	}
+	if strings.Contains(err.Error(), "not settled yet") {
+		t.Fatalf("a store failure was reported as %q, which says the wait ran its course", err)
 	}
 }

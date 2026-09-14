@@ -503,22 +503,28 @@ func (s *Session) createGroup(ctx context.Context, command *protocol.Command) (j
 		Subject: req.Subject, Participants: asked, Key: began.Key,
 	})
 	if err != nil {
-		// The context first, because it is the ambiguous failure this whole mechanism is
-		// for and every other reading of the error is about a request that did not go out.
-		if expired := ctx.Err(); expired != nil {
-			// The request may have gone out and been answered after nobody was listening.
-			// The intent stays, which is what a retry finds the group from.
-			return nil, contactFailure(expired, "group creation")
-		}
+		// What the failure says about the group comes first, before what it says about the
+		// caller's clock. A deadline that expired while the participants were being looked
+		// up is still a creation that never left, and reading it as "ran out of time, so
+		// who knows" would leave an intent behind for a group that was never asked for --
+		// and every later delivery under that name waiting on a notification about it.
 		if nothingWasMade(err) {
 			// WhatsApp answered, and the answer was no -- or the stanza never left. Either
 			// way there is no group, and an intent left open here would have every later
 			// request under this name wait on a notification that is never coming, until
 			// the sweep takes the row. Forgotten, so a refusal costs a command and no more.
-			if forget := s.store.AbandonGroupCreate(ctx, attempt); forget != nil {
+			//
+			// On a window of its own, because the caller's may be exactly what expired.
+			forgetting, forgotten := context.WithTimeout(s.ctx, s.storeLimit)
+			defer forgotten()
+			if forget := s.store.AbandonGroupCreate(forgetting, attempt); forget != nil {
 				s.log.Error().Err(forget).Str("sid", s.sid).Str("attempt", attempt).
 					Msg("could not forget a creation that made nothing; retries of it will wait on a notification that is not coming")
 			}
+		} else if expired := ctx.Err(); expired != nil {
+			// The request may have gone out and been answered after nobody was listening.
+			// The intent stays, which is what a later delivery is answered from.
+			return nil, contactFailure(expired, "group creation")
 		}
 		return nil, contactFailure(err, "group creation")
 	}
@@ -657,18 +663,24 @@ func (s *Session) waitForTheGroupItMade(
 	for {
 		select {
 		case <-waited.Done():
-			s.log.Warn().Str("sid", s.sid).Str("attempt", attempt).Str("subject", began.Subject).
-				Msg("a group by this name was made and WhatsApp has not said yet whether this request is what made it")
-			// `internal` because the contract has no word for "cannot be told yet". It is
-			// the closest true answer -- the connector could not carry the command out --
-			// and naming this case on the wire is a contract change, asked in #214.
-			return began, protocol.NewError(protocol.ErrorInternal,
-				"a group by this name was made and which request made it is not settled yet")
+			return began, s.notSettledYet(attempt, began)
 		case <-asking.C:
-			// The caller's context, not the waiting one: a read that outlives the window is
-			// the window ending, and cancelling it mid-statement would report a fault.
-			told, found, err := s.store.GroupCreation(ctx, attempt)
+			if s.lookingForNotice != nil {
+				// A test's one chance to act while this command is demonstrably inside the
+				// wait, which no sleep can establish.
+				s.lookingForNotice()
+			}
+			// On the waiting window rather than the caller's, so a store that has stopped
+			// answering ends the wait instead of holding the session's goroutine: a
+			// `group.create` whose caller named no deadline has no other ceiling, and every
+			// command queued behind this one waits with it.
+			told, found, err := s.store.GroupCreation(waited, attempt)
 			if err != nil {
+				if ctx.Err() == nil && waited.Err() != nil {
+					// The window ran out mid-read, which is the window doing its job and
+					// not a fault: the answer is the same as reaching the end of it.
+					return began, s.notSettledYet(attempt, began)
+				}
 				return began, contactFailure(err, "group creation")
 			}
 			if found && told.Done() {
@@ -678,6 +690,19 @@ func (s *Session) waitForTheGroupItMade(
 			}
 		}
 	}
+}
+
+// notSettledYet is what a delivery is answered with while WhatsApp has not said which group
+// its creation made.
+//
+// `internal` because the contract has no word for "cannot be told yet". It is the closest
+// true answer -- the connector could not carry the command out -- and naming this case on
+// the wire is a contract change, asked in #214.
+func (s *Session) notSettledYet(attempt string, began store.GroupCreation) error {
+	s.log.Warn().Str("sid", s.sid).Str("attempt", attempt).Str("subject", began.Subject).
+		Msg("a creation is on record and WhatsApp has not said yet which group it made")
+	return protocol.NewError(protocol.ErrorInternal,
+		"a group by this name was made and which request made it is not settled yet")
 }
 
 // How long a redelivered creation waits for WhatsApp to name the group it made, and how

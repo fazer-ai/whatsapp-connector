@@ -61,7 +61,7 @@ type joinedGroup struct {
 // group it is now in and there is nothing on its side to merge into. It costs what
 // `group.info` costs, which is a mapping read per participant this notification did not
 // name both namespaces for -- bounded by one group, and paid once.
-func (s *Session) joinedAGroup(event *waEvents.JoinedGroup) {
+func (s *Session) joinedAGroup(event *waEvents.JoinedGroup) bool {
 	// Before anything else, including the filter below: this is the only place WhatsApp
 	// says which group a `group.create` made, and a session that is not carrying group
 	// traffic to its client still has the command's own answer to settle. The key is on the
@@ -69,21 +69,27 @@ func (s *Session) joinedAGroup(event *waEvents.JoinedGroup) {
 	// for this one -- and a notification nobody acknowledged is redelivered on the next
 	// connection, which is how the instance that took a dead one's session over learns what
 	// it made (#131).
-	s.recordTheGroupACreationMade(event)
+	if !s.recordTheGroupACreationMade(event) {
+		// Nothing is published either, and that is the point: this notification has to
+		// come again, so the whole of it is refused rather than half-taken. The client
+		// hears about the group on the redelivery, which is what `receive` does with a
+		// message whose event could not be published.
+		return false
+	}
 
 	if !s.wantsGroups() {
 		// The client asked for direct chats only, and this is group traffic like any
 		// other: `session.connect` decides whether groups reach it at all, and a session
 		// that publishes a group it was not asked about has the client opening a
 		// conversation for a chat it will never receive a message in.
-		return
+		return true
 	}
 	ctx, cancel := s.looking()
 	defer cancel()
 
 	if _, named := addressOf(event.JID); !named {
 		s.log.Warn().Msg("dropping a group the account joined that has no address to publish it under")
-		return
+		return true
 	}
 	// Through the same filter the create command answers through, and for the same
 	// reason: a group just created reports the people WhatsApp would not add -- a privacy
@@ -94,17 +100,19 @@ func (s *Session) joinedAGroup(event *waEvents.JoinedGroup) {
 	s.emit(protocol.EventGroupJoined, joinedGroup{
 		Info: s.describeGroup(ctx, withoutRefused(&event.GroupInfo)),
 	})
+	return true
 }
 
 // recordTheGroupACreationMade writes down which group one of this session's creations
-// made, when WhatsApp's notification says so.
+// made, when WhatsApp's notification says so, and reports whether the notification can be
+// acknowledged.
 //
 // Silent about everything else. Most groups an account joins were made by somebody else and
 // carry no key, and a key this session has no open attempt for belongs to a command that has
 // already been answered and swept -- neither is worth a line in the log.
-func (s *Session) recordTheGroupACreationMade(event *waEvents.JoinedGroup) {
+func (s *Session) recordTheGroupACreationMade(event *waEvents.JoinedGroup) bool {
 	if event.CreateKey == "" {
-		return
+		return true
 	}
 	jid := event.JID.String()
 	// Its own bounded context rather than the one a publication runs on: this is a write
@@ -114,18 +122,21 @@ func (s *Session) recordTheGroupACreationMade(event *waEvents.JoinedGroup) {
 	defer done()
 	named, err := s.store.FinishGroupCreateByKey(ctx, event.CreateKey, jid)
 	if err != nil {
-		// Loud, because this is the one moment the pairing is on offer: WhatsApp has
-		// acknowledged the notification by delivering it, and it will not come again. The
-		// command it belonged to now waits for something that will never arrive, and is
-		// answered as unsettled until the record is swept.
+		// Refused rather than logged and dropped. This notification is the only thing that
+		// says which group the creation made, and WhatsApp holds it until it is
+		// acknowledged: unacknowledged, it comes again on the next connection, key intact,
+		// and the pairing is on offer once more. Acknowledged without being written down,
+		// it is gone, and the command it belonged to waits for something that will never
+		// arrive until the record is swept.
 		s.log.Error().Err(err).Str("sid", s.sid).Str("group", jid).
-			Msg("could not record which group a creation of this session made")
-		return
+			Msg("could not record which group a creation of this session made; leaving it for WhatsApp to send again")
+		return false
 	}
 	if named {
 		s.log.Info().Str("sid", s.sid).Str("group", jid).
 			Msg("WhatsApp named the group one of this session's creations made")
 	}
+	return true
 }
 
 // groupChanged publishes what WhatsApp says changed about a group.
