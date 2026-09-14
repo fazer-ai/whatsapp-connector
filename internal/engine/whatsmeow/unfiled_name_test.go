@@ -723,3 +723,94 @@ func TestAKeptNameIsDroppedWhenTheRowMovedOnWithoutIt(t *testing.T) {
 		t.Error("a copy that lost to the row it was compared against is still kept")
 	}
 }
+
+// A read takes the phone row and falls back to the LID row for what that one does not
+// hold, so an account whose phone row carries no name is answered from its LID row. What
+// is kept has to be compared against the answer, not against one row: otherwise a name
+// that arrived on the LID after the failure is invisible, and gets replayed over.
+func TestAKeptNameLosesToTheRowThatIsActuallyAnswering(t *testing.T) {
+	t.Parallel()
+
+	live := aStoreThatOutlivesItsProcess(t)
+	session, client := live.session(t, "sid-m", ownPhone, ownLID)
+	lidJID := waTypes.NewJID(ownLID, waTypes.HiddenUserServer)
+	client.Store.LID = lidJID
+	session.handle(&waEvents.Connected{})
+	drain(t, session)
+	// The phone row holds no push name at all, so the LID row is the one answering.
+	table := client.Store.Contacts
+	if _, _, err := table.PutPushName(t.Context(), lidJID, "Antigo"); err != nil {
+		t.Fatalf("PutPushName: %v", err)
+	}
+	theRecordSays(t, client, "Atendimento")
+	client.Store.Contacts = shutContacts{ContactStore: table}
+	session.handle(&waEvents.PushNameSetting{
+		Action: &waSyncAction.PushNameSetting{Name: proto.String("Atendimento")},
+	})
+
+	// And then a newer name lands on the LID row, which this process never hears about.
+	if _, _, err := table.PutPushName(t.Context(), lidJID, "Triagem"); err != nil {
+		t.Fatalf("PutPushName: %v", err)
+	}
+
+	restarted, restartedClient := live.restart(t, session, "sid-m", ownPhone, ownLID)
+	if party := resolvedBy(t, restarted, ownPhone); party["push_name"] != "Triagem" {
+		t.Errorf("after the restart the account is called %v, want the name that arrived after the failure", party)
+	}
+	contact, err := restartedClient.Store.Contacts.GetContact(t.Context(), lidJID)
+	if err != nil {
+		t.Fatalf("GetContact: %v", err)
+	}
+	if contact.PushName != "Triagem" {
+		t.Errorf("the LID row was left saying %q, want the name nothing here was newer than", contact.PushName)
+	}
+}
+
+// The verified half of the same ending: the write the last process owed is made, the rows
+// are level again, and what was kept is dropped rather than outliving the question it was
+// there to answer.
+func TestARestartFilesTheVerifiedNameTheLastProcessCouldNot(t *testing.T) {
+	t.Parallel()
+
+	live := aStoreThatOutlivesItsProcess(t)
+	session, client := live.session(t, "sid-n", ownPhone, ownLID)
+	phoneJID := waTypes.NewJID(ownPhone, waTypes.DefaultUserServer)
+	lidJID := waTypes.NewJID(ownLID, waTypes.HiddenUserServer)
+	client.Store.LID = lidJID
+	session.handle(&waEvents.Connected{})
+	drain(t, session)
+	for _, jid := range bothAddresses() {
+		if _, _, err := client.Store.Contacts.PutBusinessName(t.Context(), jid, "Loja do Bruno"); err != nil {
+			t.Fatalf("PutBusinessName: %v", err)
+		}
+	}
+	if _, _, err := client.Store.Contacts.PutBusinessName(t.Context(), lidJID, "Loja do Bruno LTDA"); err != nil {
+		t.Fatalf("PutBusinessName: %v", err)
+	}
+	client.Store.Contacts = &refusingContacts{ContactStore: client.Store.Contacts, refuse: phoneJID}
+	session.handle(&waEvents.BusinessName{
+		JID: lidJID, OldBusinessName: "Loja do Bruno", NewBusinessName: "Loja do Bruno LTDA",
+	})
+	if _, found, err := live.open.For("sid-n").UnfiledName(t.Context(), store.UnfiledVerifiedName); err != nil {
+		t.Fatalf("UnfiledName: %v", err)
+	} else if !found {
+		t.Fatal("nothing was written down about a verified name the row would not take")
+	}
+
+	restarted, restartedClient := live.restart(t, session, "sid-n", ownPhone, ownLID)
+	contact, err := restartedClient.Store.Contacts.GetContact(t.Context(), phoneJID)
+	if err != nil {
+		t.Fatalf("GetContact: %v", err)
+	}
+	if contact.BusinessName != "Loja do Bruno LTDA" {
+		t.Errorf("the phone row still says %q, want the write the last process owed", contact.BusinessName)
+	}
+	if _, found, err := live.open.For("sid-n").UnfiledName(t.Context(), store.UnfiledVerifiedName); err != nil {
+		t.Fatalf("UnfiledName: %v", err)
+	} else if found {
+		t.Error("what was kept is still kept after the write it was waiting on landed")
+	}
+	if names := restarted.names(); names.verifiedUnfiled {
+		t.Error("the session still says its verified name is unfiled after the write landed")
+	}
+}

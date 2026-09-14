@@ -1373,24 +1373,44 @@ func (s *Session) takeUnfiledNames(ctx context.Context) {
 	}
 }
 
-// ownRow is what the contact table holds for the account under the address a read goes to
-// first, which is the row that decides the answer.
+// ownRow is the name the contact table would answer this account with, which is what has
+// to be compared against rather than any one row.
+//
+// The same order `nameFromStore` reads in, and for the same reason: a read takes the phone
+// row and falls back to the LID row for what that one does not hold, so an account whose
+// phone row carries no name is answered from its LID row. Comparing only the phone row
+// would then see nothing move while the row that is actually answering moved, and replay a
+// name over one that had arrived after it.
 func (s *Session) ownRow(ctx context.Context, client *wm.Client, kind string) (string, bool) {
-	phone, _ := s.identity()
-	jid, err := jidOf(protocol.Address{Kind: protocol.AddressPhone, ID: phone})
-	if err != nil {
-		return "", false
+	phone, lid := s.identity()
+	for _, address := range []protocol.Address{
+		{Kind: protocol.AddressPhone, ID: phone},
+		{Kind: protocol.AddressLID, ID: lid},
+	} {
+		if address.ID == "" {
+			continue
+		}
+		jid, err := jidOf(address)
+		if err != nil {
+			return "", false
+		}
+		contact, err := client.Store.Contacts.GetContact(ctx, jid)
+		if err != nil {
+			s.log.Debug().Err(err).Str("kind", string(address.Kind)).Str("name", kind).
+				Msg("could not read a row one of the account's own names belongs in")
+			return "", false
+		}
+		held := contact.PushName
+		if kind == store.UnfiledVerifiedName {
+			held = contact.BusinessName
+		}
+		if held != "" {
+			return held, true
+		}
 	}
-	contact, err := client.Store.Contacts.GetContact(ctx, jid)
-	if err != nil {
-		s.log.Debug().Err(err).Str("name", kind).
-			Msg("could not read the row one of the account's own names belongs in")
-		return "", false
-	}
-	if kind == store.UnfiledVerifiedName {
-		return contact.BusinessName, true
-	}
-	return contact.PushName, true
+	// Every row read, none of them holding one. That is a value like any other: it says the
+	// table has nothing to answer with, and a row that gains a name has moved.
+	return "", true
 }
 
 // fileOwnName writes one of the account's own display names under every address the
