@@ -53,23 +53,36 @@ func (s *Scoped) BeginGroupCreate(
 	if attempt == "" || key == "" {
 		return GroupCreation{}, false, fmt.Errorf("store: a group creation needs an attempt and a key")
 	}
-	const insert = `
+	// One statement, and that is what makes it safe: writing the intent and reading back
+	// whatever was already there as two statements leaves a gap the sweep can delete the
+	// row in, and the read would then answer "nothing is on record" about an attempt that
+	// had one -- sending the caller off to create under a key nothing is filed against. The
+	// conflict updates `touched_at` to itself, which changes nothing and is only there
+	// because a conflict has to do something to return a row. Qualified by the table name
+	// because PostgreSQL reads a bare column on the right of a `DO UPDATE SET` as ambiguous
+	// between the existing row and the one being inserted, and refuses the statement.
+	const claim = `
 		INSERT INTO wac_group_create (sid, attempt, create_key, subject, started_at, touched_at)
 		VALUES (?, ?, ?, ?, ?, ?)
-		ON CONFLICT (sid, attempt) DO NOTHING`
+		ON CONFLICT (sid, attempt) DO UPDATE SET touched_at = wac_group_create.touched_at
+		RETURNING create_key, subject, started_at, group_jid`
 	began := now.UnixMilli()
-	done, err := s.container.db.ExecContext(ctx, s.container.rebind(insert),
-		s.sid, attempt, key, subject, began, began)
-	if err != nil {
+	var (
+		found   GroupCreation
+		started int64
+		jid     sql.NullString
+	)
+	if err := s.container.db.QueryRowContext(ctx, s.container.rebind(claim),
+		s.sid, attempt, key, subject, began, began).
+		Scan(&found.Key, &found.Subject, &started, &jid); err != nil {
 		return GroupCreation{}, false, fmt.Errorf("store: begin the group creation %s of %s: %w", attempt, s.sid, err)
 	}
-	if written, err := done.RowsAffected(); err == nil && written == 1 {
-		// Nothing was on record, so nothing has been attempted: this delivery is the first.
-		return GroupCreation{Key: key, Subject: subject, StartedAt: now}, false, nil
-	}
-	// A row was already there, and what it says goes: the key this attempt is findable
-	// under is the one the first delivery sent, not the one this delivery brought.
-	return s.container.groupCreation(ctx, s.sid, attempt)
+	found.StartedAt, found.JID = time.UnixMilli(started), jid.String
+	// Whose key came back is what says which of the two happened. Keys are drawn at random
+	// per delivery, so a row answering with this delivery's key is the row this delivery
+	// just wrote, and any other key belongs to a delivery that came first -- and that one's
+	// key is the one WhatsApp will echo.
+	return found, found.Key != key, nil
 }
 
 // FinishGroupCreate names the group an attempt made, by the name it was filed under.

@@ -663,6 +663,14 @@ func (s *Session) waitForTheGroupItMade(
 	for {
 		select {
 		case <-waited.Done():
+			if expired := ctx.Err(); expired != nil {
+				// The caller's own deadline, not this window: the command ran out of time,
+				// which is a `timeout` on the wire and not the connector failing to tell
+				// two requests apart. `waited` descends from it, so without this the two
+				// are one case and which error the client sees depends on whether the
+				// clock ran out during a read or between them.
+				return began, contactFailure(expired, "group creation")
+			}
 			return began, s.notSettledYet(attempt, began)
 		case <-asking.C:
 			if s.lookingForNotice != nil {
