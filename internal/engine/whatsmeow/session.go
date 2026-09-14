@@ -1311,14 +1311,14 @@ func (s *Session) keepUnfiled(ctx context.Context, kind, name string) {
 	if client == nil || client.Store == nil || client.Store.Contacts == nil {
 		return
 	}
-	held, read := s.ownRows(ctx, client, kind)
+	rows, read := s.ownRows(ctx, client, kind)
 	if !read {
 		// Without what the row is holding there is nothing to compare against on the way
 		// back, and a copy that answers unconditionally is the one that outlives its own
 		// truth. The session's own memory still covers this process.
 		return
 	}
-	if err := s.store.PutUnfiledName(ctx, kind, name, held); err != nil {
+	if err := s.store.PutUnfiledName(ctx, kind, name, writtenRows(rows)); err != nil {
 		s.log.Debug().Err(err).Str("name", kind).
 			Msg("could not record one of the account's own names as unfiled")
 	}
@@ -1369,7 +1369,8 @@ func (s *Session) takeUnfiledNames(ctx context.Context) {
 		if !read {
 			continue
 		}
-		if rows != kept.Held {
+		held, readable := readRows(kept.Held)
+		if !readable || !stillTheNewer(rows, held, kept.Name) {
 			// Something wrote the row after this was filed, so the row is the newer of the
 			// two and what was kept here has nothing left to say. That is the ordinary
 			// ending as well as the safe one: the write that landed after a failed one is
@@ -1398,40 +1399,85 @@ func (s *Session) takeUnfiledNames(ctx context.Context) {
 	}
 }
 
-// ownRows is what the contact table holds for this account's own name of one kind, under
-// every address it answers under, as a single value.
+// ownRows is what the contact table holds for this account's own name of one kind, one
+// value per address it answers under.
 //
 // Every row, and not just the one a read would answer from. What has to be settled on the
 // way back is whether anything wrote a name here after the failure, and the retry that
 // follows writes under every address -- so a name that arrived on the row a read does not
-// prefer is still one this would overwrite. Comparing only the answer would let that one
-// be replayed over and lost.
-func (s *Session) ownRows(ctx context.Context, client *wm.Client, kind string) (string, bool) {
+// prefer is still one this would overwrite.
+func (s *Session) ownRows(ctx context.Context, client *wm.Client, kind string) ([]string, bool) {
 	phone, lid := s.identity()
-	var held strings.Builder
+	held := make([]string, 0, 2)
 	for _, address := range []protocol.Address{
 		{Kind: protocol.AddressPhone, ID: phone},
 		{Kind: protocol.AddressLID, ID: lid},
 	} {
-		// Length-prefixed rather than separated by some character a name is assumed not to
-		// contain: two rows must not be able to spell what one row spells. Not a NUL, which
-		// is the obvious separator and which PostgreSQL refuses in a text column while
-		// SQLite takes it -- a difference only the second dialect's pass would ever find.
 		var name string
 		if address.ID != "" {
 			read, err := s.rowName(ctx, client, address, kind)
 			if err != nil {
 				s.log.Debug().Err(err).Str("kind", string(address.Kind)).Str("name", kind).
 					Msg("could not read a row one of the account's own names belongs in")
-				return "", false
+				return nil, false
 			}
 			name = read
 		}
-		held.WriteString(strconv.Itoa(len(name)))
-		held.WriteByte(':')
-		held.WriteString(name)
+		held = append(held, name)
 	}
-	return held.String(), true
+	return held, true
+}
+
+// writtenRows is the rows as one string, and readRows is the way back.
+//
+// Length-prefixed rather than separated by some character a name is assumed not to contain:
+// two rows must not be able to spell what one row spells. Not a NUL, which is the obvious
+// separator and which PostgreSQL refuses in a text column while SQLite takes it -- a
+// difference only the second dialect's pass would ever find.
+func writtenRows(rows []string) string {
+	var out strings.Builder
+	for _, row := range rows {
+		out.WriteString(strconv.Itoa(len(row)))
+		out.WriteByte(':')
+		out.WriteString(row)
+	}
+	return out.String()
+}
+
+func readRows(written string) ([]string, bool) {
+	rows := make([]string, 0, 2)
+	for written != "" {
+		mark := strings.IndexByte(written, ':')
+		if mark < 0 {
+			return nil, false
+		}
+		size, err := strconv.Atoi(written[:mark])
+		if err != nil || size < 0 || mark+1+size > len(written) {
+			return nil, false
+		}
+		rows = append(rows, written[mark+1:mark+1+size])
+		written = written[mark+1+size:]
+	}
+	return rows, true
+}
+
+// stillTheNewer says whether a name that was kept is still newer than what the rows hold.
+//
+// Row by row, and a row is allowed to have moved in exactly one way: to the kept name
+// itself. That is this connector's own retry landing on one address and not on the other,
+// and reading it as somebody else's newer rename would have the process that comes after
+// throw away the only copy of the name and answer with the row the retry did not reach --
+// permanently, because nothing would be left to try again.
+func stillTheNewer(rows, held []string, name string) bool {
+	if len(rows) != len(held) {
+		return false
+	}
+	for i, row := range rows {
+		if row != held[i] && row != name {
+			return false
+		}
+	}
+	return true
 }
 
 // rowName is one address's copy of one of the account's own names.

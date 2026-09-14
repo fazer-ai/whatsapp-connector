@@ -320,6 +320,10 @@ func TestAKeptNameAnswersForItsOwnSessionAndNobodyElse(t *testing.T) {
 type liveStore struct {
 	target storetest.Target
 	open   *store.Container
+	// wrap stands between a session and the contact table from the moment the session is
+	// built. It has to be in place before that, not after: what a session does with what
+	// was left unfiled, it does while it is being built.
+	wrap func(waStore.ContactStore) waStore.ContactStore
 }
 
 func aStoreThatOutlivesItsProcess(t *testing.T) *liveStore {
@@ -395,6 +399,9 @@ func (l *liveStore) session(t *testing.T, sid, phone, lid string) (*Session, *wm
 		}
 	}
 	client := wm.NewClient(device, nil)
+	if l.wrap != nil {
+		client.Store.Contacts = l.wrap(client.Store.Contacts)
+	}
 	session := newSession(t.Context(), sid, client, scoped, MediaOptions{}, zerolog.Nop(), newLibraryLogger(zerolog.Nop(), sid))
 	t.Cleanup(func() { _ = session.Close() })
 	return session, client
@@ -904,5 +911,53 @@ func TestTwoRowsCannotSpellWhatOneRowSpells(t *testing.T) {
 	restarted, _ := live.restart(t, session, "sid-p", ownPhone, ownLID)
 	if party := resolvedBy(t, restarted, ownPhone); party["push_name"] != "Ana" {
 		t.Errorf("after the restart the account is called %v, want the name the rows moved on to", party)
+	}
+}
+
+// A retry that lands on one address and not on the other moves a row without anybody else
+// having written it. Read as somebody's newer rename, it would have the process that comes
+// next throw away the only copy of the name and answer from the row the retry never
+// reached -- and permanently, because nothing would be left to try again.
+func TestAPartlyLandedRetryIsNotMistakenForSomebodyElsesRename(t *testing.T) {
+	t.Parallel()
+
+	live := aStoreThatOutlivesItsProcess(t)
+	session, client := live.session(t, "sid-q", ownPhone, ownLID)
+	phoneJID := waTypes.NewJID(ownPhone, waTypes.DefaultUserServer)
+	lidJID := waTypes.NewJID(ownLID, waTypes.HiddenUserServer)
+	client.Store.LID = lidJID
+	session.handle(&waEvents.Connected{})
+	drain(t, session)
+	theTableSays(t, client, "Antigo")
+	theRecordSays(t, client, "Atendimento")
+	table := client.Store.Contacts
+	client.Store.Contacts = shutContacts{ContactStore: table}
+	session.handle(&waEvents.PushNameSetting{
+		Action: &waSyncAction.PushNameSetting{Name: proto.String("Atendimento")},
+	})
+
+	// The retry of a process that is no longer here: the LID row took the name, the phone
+	// row did not, and nothing got as far as writing the new state down.
+	if _, _, err := table.PutPushName(t.Context(), lidJID, "Atendimento"); err != nil {
+		t.Fatalf("PutPushName: %v", err)
+	}
+
+	// And this process cannot file it either, so the answer rests on what was kept.
+	live.wrap = func(table waStore.ContactStore) waStore.ContactStore {
+		return shutContacts{ContactStore: table}
+	}
+	restarted, restartedClient := live.restart(t, session, "sid-q", ownPhone, ownLID)
+	if party := resolvedBy(t, restarted, ownPhone); party["push_name"] != "Atendimento" {
+		t.Errorf("after the restart the account is called %v, want the name its own retry was writing", party)
+	}
+	if _, found, err := live.open.For("sid-q").UnfiledName(t.Context(), store.UnfiledPushName); err != nil {
+		t.Fatalf("UnfiledName: %v", err)
+	} else if !found {
+		t.Error("the only copy of the name was thrown away over this session's own retry")
+	}
+	if contact, err := restartedClient.Store.Contacts.GetContact(t.Context(), phoneJID); err != nil {
+		t.Fatalf("GetContact: %v", err)
+	} else if contact.PushName != "Antigo" {
+		t.Fatalf("the phone row says %q, want the row the retry never reached", contact.PushName)
 	}
 }
