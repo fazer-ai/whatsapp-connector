@@ -3,6 +3,7 @@ package whatsmeow
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -359,7 +360,20 @@ func (s *Session) createGroup(ctx context.Context, command *protocol.Command) (j
 		// expires mid-lookup arrives as text, `errors.Is` cannot see it, and a command
 		// that ran out of time would be reported as a fault in this connector.
 		if expired := ctx.Err(); expired != nil {
+			// Ambiguous: the request may have gone out and been answered after nobody was
+			// listening. The intent stays, which is what a retry reconciles from.
 			return nil, contactFailure(expired, "group creation")
+		}
+		if nothingWasMade(err) {
+			// WhatsApp answered, and the answer was no. There is no group to reconcile to,
+			// and an intent left open here would stop every later request for a group by
+			// this name from reconciling -- for good, because an open attempt never settles
+			// and the sweep does not take open rows. Forgotten, so an ordinary refusal
+			// costs the caller a command and nothing else.
+			if forget := s.store.AbandonGroupCreate(ctx, attempt); forget != nil {
+				s.log.Error().Err(forget).Str("sid", s.sid).Str("attempt", attempt).
+					Msg("could not forget a creation WhatsApp refused; retries of this name will be refused until it is swept")
+			}
 		}
 		return nil, contactFailure(err, "group creation")
 	}
@@ -380,6 +394,19 @@ func (s *Session) createGroup(ctx context.Context, command *protocol.Command) (j
 			Msg("made a group and could not record which one; a redelivery will have to look for it")
 	}
 	return json.Marshal(s.describeGroup(ctx, withoutRefused(made)))
+}
+
+// nothingWasMade reports whether a failed creation is one that certainly made no group.
+//
+// An answer from WhatsApp is one: an IQ error is a reply, and a reply saying no is a group
+// that does not exist. So is a request that never left this process, which is what
+// `sentNothing` already names for the teardowns. Everything else -- a socket that went while
+// the request was in flight, a deadline that passed -- is the ambiguous case this whole
+// mechanism is for, and saying "nothing was made" about one of those is how the record that
+// covers a duplicate gets thrown away.
+func nothingWasMade(err error) bool {
+	var refused *wm.IQError
+	return errors.As(err, &refused) || sentNothing(err)
 }
 
 // attemptName is what a creation is filed under, and it is the name the caller gave the

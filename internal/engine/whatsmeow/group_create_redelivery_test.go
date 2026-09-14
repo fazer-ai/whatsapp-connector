@@ -633,6 +633,46 @@ func TestARedeliveredCreationRefusesWhileAnotherAttemptAtTheSameNameIsOpen(t *te
 	}
 }
 
+// A refusal from WhatsApp is an answer, and the answer is that no group exists. The intent
+// has to go with it: an open attempt is what stops a later request for a group by that name
+// from reconciling, and an open attempt never settles and is never swept -- so a refusal
+// that left one behind would refuse every retry of that name for good.
+func TestACreationWhatsAppRefusedDoesNotBlockTheNextRequestForThatName(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setConnected(true)
+	self := waTypes.NewJID("5511999990001", waTypes.DefaultUserServer)
+
+	refuse := true
+	session.createTheGroup = func(context.Context, *wm.Client, wm.ReqCreateGroup) (*waTypes.GroupInfo, error) {
+		if refuse {
+			return nil, &wm.IQError{Code: 400, Text: "bad-request"}
+		}
+		return aMadeGroup("120363041234567890", "Obras", self), nil
+	}
+	session.joinedGroups = func(context.Context, *wm.Client) ([]*waTypes.GroupInfo, error) {
+		return nil, nil
+	}
+
+	payload := `{"subject":"Obras","participants":[]}`
+	if _, err := session.Execute(t.Context(), namedCreate("c1", "refused", payload)); err == nil {
+		t.Fatal("a creation WhatsApp refused was answered as if it had worked")
+	}
+	if _, found, err := session.store.GroupCreation(t.Context(), "idem:refused"); err != nil {
+		t.Fatalf("read the attempt: %v", err)
+	} else if found {
+		t.Fatal("the refused attempt stayed on record, where it blocks every later request for that name")
+	}
+
+	// And the next request for a group by that name goes through rather than being refused
+	// as ambiguous against an attempt that made nothing.
+	refuse = false
+	if _, err := session.Execute(t.Context(), namedCreate("c2", "next", payload)); err != nil {
+		t.Fatalf("the next request for that name: %v", err)
+	}
+}
+
 // namedGroup reads the group id out of a `group.create` answer.
 func namedGroup(t *testing.T, answer json.RawMessage) string {
 	t.Helper()

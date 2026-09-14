@@ -85,6 +85,27 @@ func (s *Scoped) FinishGroupCreate(ctx context.Context, attempt, jid string) err
 	return nil
 }
 
+// AbandonGroupCreate forgets an attempt that definitely made nothing.
+//
+// The intent exists to say "a group may have been made and nobody wrote down which one".
+// An attempt WhatsApp refused made nothing, so it says no such thing, and leaving it open
+// would be worse than useless: an open attempt is what stops a later one at the same name
+// from reconciling, so two refused requests would block every retry of either, for good --
+// neither can settle, and the sweep does not take open rows.
+//
+// Refuses to forget an attempt that already named a group. That one is the answer a
+// redelivery is owed, and this call is not the one that decides it was wrong.
+func (s *Scoped) AbandonGroupCreate(ctx context.Context, attempt string) error {
+	if err := s.fence.held(); err != nil {
+		return err
+	}
+	const drop = `DELETE FROM wac_group_create WHERE sid = ? AND attempt = ? AND group_jid IS NULL`
+	if _, err := s.container.db.ExecContext(ctx, s.container.rebind(drop), s.sid, attempt); err != nil {
+		return fmt.Errorf("store: abandon the group creation %s of %s: %w", attempt, s.sid, err)
+	}
+	return nil
+}
+
 // GroupCreation reads what is on record for one attempt.
 func (s *Scoped) GroupCreation(ctx context.Context, attempt string) (GroupCreation, bool, error) {
 	return s.container.groupCreation(ctx, s.sid, attempt)
@@ -177,7 +198,19 @@ func (s *Scoped) OtherAttemptsStillOpen(ctx context.Context, except, subject str
 // removes that. What bounds it in practice is the client's own `MAXLEN` trim on the command
 // stream, which is a length and not a time and so is not this table's to measure.
 func (c *Container) SweepGroupCreations(ctx context.Context, before time.Time) (int64, error) {
-	const drop = `DELETE FROM wac_group_create WHERE settled_at IS NOT NULL AND settled_at < ?`
+	// A settled row is not only an answer, it is also what rules its group out of another
+	// attempt's search. Dropping it while an attempt at the same name is still open would
+	// hand that attempt this group -- the retry would find it, no longer see it ruled out,
+	// and report success with a conversation another request made. So a claim outlives the
+	// cutoff for as long as anything could still match it.
+	const drop = `
+		DELETE FROM wac_group_create
+		WHERE settled_at IS NOT NULL AND settled_at < ?
+		  AND NOT EXISTS (
+			SELECT 1 FROM wac_group_create open_attempt
+			WHERE open_attempt.sid = wac_group_create.sid
+			  AND open_attempt.subject = wac_group_create.subject
+			  AND open_attempt.group_jid IS NULL)`
 	done, err := c.db.ExecContext(ctx, c.rebind(drop), before.UnixMilli())
 	if err != nil {
 		return 0, fmt.Errorf("store: sweep the group creations: %w", err)
