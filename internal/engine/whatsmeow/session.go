@@ -1311,6 +1311,18 @@ func (s *Session) keepUnfiled(ctx context.Context, kind, name string) {
 	if client == nil || client.Store == nil || client.Store.Contacts == nil {
 		return
 	}
+	// And only for the name the session is still holding, which is the guard the filing
+	// itself opens with. A rename that landed while this one was failing has a write of
+	// its own behind it, and writing this one down would have the process that comes next
+	// put back a name the account has already left.
+	own := s.names()
+	current := own.push
+	if kind == store.UnfiledVerifiedName {
+		current = own.verified
+	}
+	if current != name {
+		return
+	}
 	rows, read := s.ownRows(ctx, client, kind)
 	if !read {
 		// Without what the row is holding there is nothing to compare against on the way

@@ -1041,3 +1041,34 @@ func TestWhatIsWrittenTellsTwoRowsFromOne(t *testing.T) {
 		t.Errorf("one row and two rows are both written as %q", one)
 	}
 }
+
+// A rename that is already stale must not be written down either. Two can be in flight at
+// once -- whatsmeow dispatches an app-state sync from a goroutine of its own and the notify
+// on a message the account sent from the one that read it -- so the older handler can reach
+// this after the newer name is the one the session holds. Keeping the older one would have
+// the process that comes next put back a name the account has already left.
+func TestANameTheSessionHasLeftIsNotWrittenDown(t *testing.T) {
+	t.Parallel()
+
+	live := aStoreThatOutlivesItsProcess(t)
+	session, client := live.session(t, "sid-s", ownPhone, ownLID)
+	theTableSays(t, client, "Antigo")
+	theRecordSays(t, client, "Atendimento")
+	client.Store.Contacts = shutContacts{ContactStore: client.Store.Contacts}
+	session.handle(&waEvents.PushNameSetting{
+		Action: &waSyncAction.PushNameSetting{Name: proto.String("Atendimento")},
+	})
+
+	// The older handler, resuming with a name the session has already left behind.
+	writing, done := context.WithTimeout(t.Context(), time.Second)
+	defer done()
+	session.keepUnfiled(writing, store.UnfiledPushName, "Antigo")
+
+	kept, found, err := live.open.For("sid-s").UnfiledName(t.Context(), store.UnfiledPushName)
+	if err != nil {
+		t.Fatalf("UnfiledName: %v", err)
+	}
+	if !found || kept.Name != "Atendimento" {
+		t.Errorf("what was kept reads %+v (kept %v), want the name the session is holding", kept, found)
+	}
+}
