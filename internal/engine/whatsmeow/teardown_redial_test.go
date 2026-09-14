@@ -395,6 +395,29 @@ func TestADeleteWithNothingPairedDoesNotWaitOnADial(t *testing.T) {
 	}
 }
 
+// The same for a logout, which reaches whatsmeow the same way and has the same nothing to
+// ask it. Refused is all it can be for an account with no device, and it costs the session's
+// command queue nothing to be refused now rather than a deadline from now.
+func TestALogoutWithNothingPairedDoesNotWaitOnADial(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "")
+	session.storeLimit = 500 * time.Millisecond
+	holdTheDial(t, session)
+
+	answered := make(chan error, 1)
+	go func() { answered <- session.Logout(t.Context()) }()
+	select {
+	case err := <-answered:
+		if !errors.Is(err, wm.ErrNotLoggedIn) {
+			t.Fatalf("Logout failed with %v, want whatsmeow refusing an account with no device", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the logout waited on a dial for an account that has no device to unlink")
+	}
+	saysNothing(t, session, "for a logout on an account with nothing paired")
+}
+
 // A read that failed is not an answer, and the side it is read on is the side that decides
 // whether the socket is waited for. Counted as unpaired, a transient store error would send a
 // delete for an account that does have a device straight into whatsmeow's own logout, which

@@ -1822,7 +1822,8 @@ func (s *Session) Logout(ctx context.Context) error {
 	defer s.endCommand()
 
 	s.cancelPairing()
-	if err := s.unlink(ctx, s.current()); err != nil {
+	ask, _ := s.askToUnlink(ctx)
+	if err := ask(ctx, s.current()); err != nil {
 		if sentNothing(err) || unanswered(err) {
 			// Nothing WhatsApp said has revoked the device, and it is untouched on both
 			// sides: either nothing was sent, or the request went out and no answer came
@@ -1899,21 +1900,8 @@ func (s *Session) Delete(ctx context.Context) error {
 	defer s.endCommand()
 
 	s.cancelPairing()
-	_, paired, pairedErr := s.store.JID(ctx)
-	// Read once and answered for both the wait below and what is logged at the end. A read
-	// that failed says nothing either way, so it counts as paired: the lock is waited for and
-	// the residue is named, which is what this path did before it could tell the two apart.
-	nothingToUnlink := pairedErr == nil && !paired
-	// The socket is waited for only when there is a device to remove. whatsmeow answers
-	// ErrNotLoggedIn for an account with none without going near the socket, so an account
-	// whose pairing dial is in flight -- a QR nobody scanned, a code that ran out -- would
-	// otherwise spend the caller's whole time waiting for a lock it has no use for, and then
-	// be refused below over an unlink that was never going to be sent. There is nothing to
-	// keep for a retry there: no device, and an inbox the client has already destroyed.
-	ask := s.unlink
-	if nothingToUnlink {
-		ask = s.logout
-	}
+	// Asked once and answered for both the wait and what is named at the end.
+	ask, nothingToUnlink := s.askToUnlink(ctx)
 	unlink := ask(ctx, s.current())
 	if errors.Is(unlink, errStillDialling) {
 		// The one failure that is not "the unlink was refused": it was never attempted. The
@@ -2480,6 +2468,36 @@ func (s *Session) unlink(ctx context.Context, client *wm.Client) error {
 		return fmt.Errorf("%w: %w", errStillDialling, ctx.Err())
 	}
 	return s.logout(ctx, client)
+}
+
+// askToUnlink picks how a teardown reaches whatsmeow, and says whether there was anything
+// to reach it about.
+//
+// The wait above is worth the caller's time only when there is a device to remove.
+// whatsmeow answers ErrNotLoggedIn for an account with none without going near the socket,
+// so an account whose dial is a pairing nobody finished -- a QR nobody scanned, a code that
+// ran out -- would spend the whole deadline on a lock it has no use for, to arrive at a
+// refusal that was never in doubt. The teardown a client asks for there is one the caller
+// has already destroyed the inbox for, and holding the session's command queue for it buys
+// nobody anything.
+//
+// A store read that failed is not an answer, and counts as paired: the lock is waited for
+// and the residue named, which is what these paths did before they could tell the two
+// apart. Skipping the wait on a read nobody could make would send a teardown for an account
+// that does have a device into whatsmeow's own logout, which takes the socket lock with no
+// context at all.
+// The read is store work standing in front of a teardown, so it runs under the store's bound
+// as well as the caller's: a store that stalled answers nothing, and spending the whole
+// deadline on it before even reaching whatsmeow is the same wait this change exists to end.
+// Giving up there is a read that failed, which is already the paired side.
+func (s *Session) askToUnlink(ctx context.Context) (ask func(context.Context, *wm.Client) error, nothingToUnlink bool) {
+	asking, asked := context.WithTimeout(ctx, s.storeLimit)
+	defer asked()
+	_, paired, err := s.store.JID(asking)
+	if err == nil && !paired {
+		return s.logout, true
+	}
+	return s.unlink, false
 }
 
 // socketFree answers when the socket lock has been free, with one probe for all the
