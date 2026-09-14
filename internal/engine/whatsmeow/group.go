@@ -686,8 +686,11 @@ func (s *Session) waitForTheGroupItMade(
 			if err != nil {
 				if ctx.Err() == nil && waited.Err() != nil {
 					// The window ran out mid-read, which is the window doing its job and
-					// not a fault: the answer is the same as reaching the end of it.
-					return began, s.notSettledYet(attempt, began)
+					// not a fault. Answered by ending the loop rather than here, so the
+					// window has one exit however the clock falls: a read that straddles
+					// the deadline and one that finishes just inside it must not be two
+					// different answers to the caller.
+					continue
 				}
 				return began, contactFailure(err, "group creation")
 			}
