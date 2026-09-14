@@ -636,8 +636,27 @@ func (c *Connector) sweepPartsOnce(ctx context.Context) bool {
 		c.log.Debug().Int64("messages", dropped).
 			Msg("dropped what was kept to fetch the files of messages past their retention")
 	}
+	// The same pass drops the record of group creations old enough that no redelivery of
+	// the command can still arrive. Bounded by the ledger's own memory rather than by the
+	// media retention: what these rows cover is a redelivered command, and a command stops
+	// being redelivered when the ledger stops answering for it. Without a sweep the row
+	// count is the number of groups the deployment has ever made.
+	begun, err := c.store.SweepGroupCreations(ctx, time.Now().Add(-groupCreateRetention))
+	switch {
+	case errors.Is(err, context.Canceled):
+		return true
+	case err != nil:
+		c.log.Warn().Err(err).Msg("could not sweep the record of group creations")
+	case begun > 0:
+		c.log.Debug().Int64("attempts", begun).Msg("dropped the record of group creations past their retention")
+	}
 	return false
 }
+
+// groupCreateRetention is how long the record of a creation is kept. The ledger's own
+// window, doubled: a record that outlives the redelivery it covers costs a row, and one
+// that does not costs a second group.
+const groupCreateRetention = 2 * redisx.DefaultIdempotencyTTL
 
 // reclaimCommands takes over what nobody acknowledged: what another instance read
 // before it was killed, and what this one deliberately left pending when it could not

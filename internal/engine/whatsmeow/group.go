@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	wm "go.mau.fi/whatsmeow"
 	waTypes "go.mau.fi/whatsmeow/types"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
+	"github.com/fazer-ai/whatsapp-connector/internal/store"
 )
 
 // groupTarget is the payload every command that names one group shares.
@@ -326,6 +328,27 @@ func (s *Session) createGroup(ctx context.Context, command *protocol.Command) (j
 		return nil, err
 	}
 
+	// Everything above this line refuses without touching WhatsApp, and nothing above it
+	// writes: a payload this connector will not send, or a command nobody is waiting for
+	// any more, must leave no trace that a later delivery would take for an attempt.
+	attempt := attemptName(command)
+	began, begun, err := s.store.BeginGroupCreate(ctx, attempt, req.Subject, time.Now())
+	if err != nil {
+		// The intent could not be written, so the cover is not there. Refused rather than
+		// created: the caller's retry costs them a command, and creating anyway costs
+		// them a group they cannot tell from the one a redelivery would make.
+		return nil, contactFailure(err, "group creation")
+	}
+	if begun {
+		// This command has been here before. Either it finished and the answer is on
+		// record, or it did not and the group it may have made is findable.
+		if made, found, err := s.groupFromEarlierAttempt(ctx, attempt, began); err != nil {
+			return nil, err
+		} else if found {
+			return json.Marshal(s.describeGroup(ctx, made))
+		}
+	}
+
 	made, err := s.createTheGroup(ctx, s.current(), wm.ReqCreateGroup{
 		Name: req.Subject, Participants: asked,
 	})
@@ -347,7 +370,96 @@ func (s *Session) createGroup(ctx context.Context, command *protocol.Command) (j
 		return nil, protocol.NewError(protocol.ErrorInternal,
 			"the group was created and WhatsApp said nothing about it")
 	}
+	// Named as soon as there is a name, and before the answer goes back. A failure here is
+	// logged rather than returned: the group exists, and reporting a failure would have the
+	// client retry a creation that happened -- the very duplicate this exists to prevent.
+	// What the record covers is the next delivery, and the reconciliation below covers what
+	// a lost record leaves.
+	if err := s.store.FinishGroupCreate(ctx, attempt, made.JID.String()); err != nil {
+		s.log.Error().Err(err).Str("sid", s.sid).Str("attempt", attempt).
+			Msg("made a group and could not record which one; a redelivery will have to look for it")
+	}
 	return json.Marshal(s.describeGroup(ctx, withoutRefused(made)))
+}
+
+// attemptName is what a creation is filed under, and it is the name the caller gave the
+// command, not one of this connector's making.
+//
+// The same two names the ledger in `internal/session` keys by, and for the same reason: an
+// `idempotency_key` is the caller saying "this is one request however many times you see
+// it", and a command that carries none still arrives with the id the transport redelivers
+// it under. Prefixed apart so a key and an id that happen to read the same are not one
+// attempt.
+func attemptName(command *protocol.Command) string {
+	if command.IdempotencyKey != "" {
+		return "idem:" + command.IdempotencyKey
+	}
+	return "cmd:" + command.ID
+}
+
+// groupFromEarlierAttempt answers the group an earlier delivery of this command made, if
+// there is one to find.
+//
+// Two ways to find it. The attempt that finished says which group it made, and that is the
+// whole answer. The attempt that did not is the case this exists for: something asked
+// WhatsApp to make a group and never got as far as writing down what it made, so the only
+// record of it is on WhatsApp. A group is findable there, which is what separates this from
+// a message that may or may not have been sent -- the objection in `carryOut` to reserving
+// before the fact holds for sends and does not hold here.
+//
+// What the search allows itself is narrow on purpose: a group this account created, called
+// what this attempt was to call it, and created no earlier than the instant the intent was
+// written. The last of those is what keeps a second, genuinely different creation of a
+// group by the same name from being answered with the first one -- that one's intent is
+// younger than the group, so the group is out of its window. The oldest match wins, because
+// the group this attempt made is the first one this account created after it began.
+func (s *Session) groupFromEarlierAttempt(
+	ctx context.Context, attempt string, began store.GroupCreation,
+) (*waTypes.GroupInfo, bool, error) {
+	if began.Done() {
+		jid, err := waTypes.ParseJID(began.JID)
+		if err != nil {
+			return nil, false, protocol.NewError(protocol.ErrorInternal,
+				"the group this command already made is on record under a name that is not a group")
+		}
+		made, err := s.groupInfo(ctx, s.current(), jid)
+		if err != nil {
+			return nil, false, contactFailure(err, "group creation")
+		}
+		return made, made != nil, nil
+	}
+
+	joined, err := s.joinedGroups(ctx, s.current())
+	if err != nil {
+		// Whether the group exists is exactly what could not be read, so this cannot fall
+		// through to creating one: that is the duplicate, made on purpose.
+		return nil, false, contactFailure(err, "group creation")
+	}
+	var found *waTypes.GroupInfo
+	for _, group := range joined {
+		switch {
+		case group == nil, group.Name != began.Subject:
+			continue
+		case group.GroupCreated.Before(began.StartedAt):
+			continue
+		case !s.isSelf(group.OwnerJID) && !s.isSelf(group.OwnerPN):
+			continue
+		case found == nil, group.GroupCreated.Before(found.GroupCreated):
+			found = group
+		}
+	}
+	if found == nil {
+		return nil, false, nil
+	}
+	// Written down now, so the next delivery is answered from the record rather than from
+	// another search, and so two deliveries racing here settle on one group.
+	if err := s.store.FinishGroupCreate(ctx, attempt, found.JID.String()); err != nil {
+		s.log.Error().Err(err).Str("sid", s.sid).Str("attempt", attempt).
+			Msg("found the group an earlier attempt made and could not record it")
+	}
+	s.log.Info().Str("sid", s.sid).Str("attempt", attempt).Str("group", found.JID.String()).
+		Msg("a redelivered creation found the group its first attempt had already made")
+	return found, true, nil
 }
 
 // withoutRefused drops the participants WhatsApp would not add, and the count with them.

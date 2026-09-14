@@ -574,6 +574,25 @@ func (c *Container) migrate(ctx context.Context) error {
 			set_at BIGINT NOT NULL,
 			FOREIGN KEY (sid) REFERENCES wac_session_device (sid) ON DELETE CASCADE
 		)`,
+		// One row per attempt at making a group: the intent, written before WhatsApp is
+		// asked, and the group it turned into, written after. The split is what covers the
+		// one effect this connector serves that a second run duplicates instead of
+		// converging on (#131).
+		//
+		// No foreign key to the device mapping, unlike the presence above. An attempt is
+		// about a command, not about a pairing, and a session that re-paired mid-flight
+		// still has a redelivery of that command to answer; cascading it away would take
+		// the only record of a group that exists.
+		`CREATE TABLE IF NOT EXISTS wac_group_create (
+			sid        TEXT   NOT NULL,
+			attempt    TEXT   NOT NULL,
+			subject    TEXT   NOT NULL,
+			started_at BIGINT NOT NULL,
+			group_jid  TEXT,
+			PRIMARY KEY (sid, attempt)
+		)`,
+		// The sweep goes by age alone, across every session.
+		`CREATE INDEX IF NOT EXISTS wac_group_create_started_at ON wac_group_create (started_at)`,
 	} {
 		if _, err := c.db.ExecContext(ctx, statement); err != nil {
 			return fmt.Errorf("store: bring the connector's own schema up: %w", err)
