@@ -961,3 +961,32 @@ func TestAPartlyLandedRetryIsNotMistakenForSomebodyElsesRename(t *testing.T) {
 		t.Fatalf("the phone row says %q, want the row the retry never reached", contact.PushName)
 	}
 }
+
+// The verified half of the same reservation: a write that ran out of time is written down
+// on what was left of the budget, not on the deadline that ran out.
+func TestAVerifiedNameTheWriteRanOutOfTimeForIsStillWrittenDown(t *testing.T) {
+	t.Parallel()
+
+	live := aStoreThatOutlivesItsProcess(t)
+	session, client := live.session(t, "sid-r", ownPhone, ownLID)
+	lidJID := waTypes.NewJID(ownLID, waTypes.HiddenUserServer)
+	client.Store.LID = lidJID
+	session.handle(&waEvents.Connected{})
+	drain(t, session)
+	session.storeLimit = 150 * time.Millisecond
+	client.Store.Contacts = stalledContacts{ContactStore: client.Store.Contacts}
+	session.handle(&waEvents.BusinessName{
+		JID: lidJID, OldBusinessName: "Loja do Bruno", NewBusinessName: "Loja do Bruno LTDA",
+	})
+
+	kept, found, err := live.open.For("sid-r").UnfiledName(t.Context(), store.UnfiledVerifiedName)
+	if err != nil {
+		t.Fatalf("UnfiledName: %v", err)
+	}
+	if !found {
+		t.Fatal("nothing was written down about a verified name whose write ran out of time")
+	}
+	if kept.Name != "Loja do Bruno LTDA" {
+		t.Errorf("what was kept reads %+v, want the name the write ran out of time for", kept)
+	}
+}
