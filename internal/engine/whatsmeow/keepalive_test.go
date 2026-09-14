@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -1898,6 +1900,16 @@ func (c *drivenClock) read() time.Time {
 	return c.now
 }
 
+// authenticatedAt drives the line whatsmeow logs when it authenticates a socket, at the
+// instant it would have logged it. The library writes it from the socket's own goroutine,
+// synchronously, well before the goroutine that announces the connection gets its turn.
+func authenticatedAt(session *Session, clock *drivenClock, at time.Time) {
+	resume := clock.read()
+	clock.set(at)
+	session.waLog.Infof(authenticatedLine)
+	clock.set(resume)
+}
+
 // The one path where the announcement is not the socket. whatsmeow's keepalive loop starts
 // with the socket, right after the noise handshake, and dates its first "last answered"
 // from that instant; `events.Connected` waits behind the prekey count, the prekey upload
@@ -1920,7 +1932,7 @@ func TestAReplacementAnnouncedLateIsDatedFromItsOwnSocketAndNotFromTheAnnounceme
 	// whatsmeow authenticates a second after the handshake and writes that instant down
 	// synchronously, before the goroutine that announces the connection is even started.
 	authenticated := handshake.Add(time.Second)
-	session.current().LastSuccessfulConnect = authenticated
+	authenticatedAt(session, clock, authenticated)
 
 	// A ping the replacement never answered. Alone it is a blip, and the count rule leaves
 	// it alone, so it is here only to put a timeout before the announcement the way the
@@ -1976,7 +1988,8 @@ func TestAnUnauthenticatedClientDoesNotDateTheReplacement(t *testing.T) {
 	start := time.Now()
 	clock.set(start)
 	dialedAndConnected(session)
-	session.current().LastSuccessfulConnect = time.Time{}
+	// Nothing is driven here: a client that never authenticated is one the library never
+	// logged an authentication for.
 
 	announced := start.Add(90 * time.Second)
 	clock.set(announced)
@@ -2020,7 +2033,7 @@ func TestAStampFromBeforeTheConnectionItReplacesIsNotBelieved(t *testing.T) {
 
 	// The replacement announces itself on time, carrying an instant no socket announcing
 	// itself now could have authenticated at.
-	session.current().LastSuccessfulConnect = start.Add(-10 * time.Minute)
+	authenticatedAt(session, clock, start.Add(-10*time.Minute))
 	clock.set(start.Add(30 * time.Second))
 	session.handle(&waEvents.Connected{})
 	next(t, session)
@@ -2055,7 +2068,7 @@ func TestAStampFromAfterTheAnnouncementIsNotBelieved(t *testing.T) {
 	dialedAndConnected(session)
 
 	announced := start.Add(90 * time.Second)
-	session.current().LastSuccessfulConnect = announced.Add(5 * time.Minute)
+	authenticatedAt(session, clock, announced.Add(5*time.Minute))
 	clock.set(announced)
 	session.handle(&waEvents.Connected{})
 	next(t, session)
@@ -2091,14 +2104,14 @@ func TestASecondReplacementMovesTheStampForward(t *testing.T) {
 	dialedAndConnected(session)
 
 	firstHandshake := start.Add(60 * time.Second)
-	session.current().LastSuccessfulConnect = firstHandshake.Add(time.Second)
+	authenticatedAt(session, clock, firstHandshake.Add(time.Second))
 	firstAnnounced := firstHandshake.Add(45 * time.Second)
 	clock.set(firstAnnounced)
 	session.handle(&waEvents.Connected{})
 	next(t, session)
 
 	secondHandshake := firstAnnounced.Add(120 * time.Second)
-	session.current().LastSuccessfulConnect = secondHandshake.Add(time.Second)
+	authenticatedAt(session, clock, secondHandshake.Add(time.Second))
 	secondAnnounced := secondHandshake.Add(45 * time.Second)
 	clock.set(secondAnnounced)
 	session.handle(&waEvents.Connected{})
@@ -2144,8 +2157,7 @@ func TestADropDispatchedBeforeTheAnnouncementIsStillOvertaken(t *testing.T) {
 	// redials from another, and the replacement authenticates before that first goroutine
 	// gets its turn.
 	dropped := start.Add(70 * time.Second)
-	authenticated := start.Add(63 * time.Second)
-	session.current().LastSuccessfulConnect = authenticated
+	authenticatedAt(session, clock, start.Add(63*time.Second))
 
 	clock.set(start.Add(108 * time.Second))
 	session.handle(&waEvents.Connected{})
@@ -2158,5 +2170,58 @@ func TestADropDispatchedBeforeTheAnnouncementIsStillOvertaken(t *testing.T) {
 	if got := session.state(); got != "open" {
 		t.Fatalf("a drop the reconnect had overtaken was applied over a healthy socket, leaving "+
 			"the session %q with nothing after it to correct the state", got)
+	}
+}
+
+// The coupling this rests on, read back out of the dependency. `socketUpAt` is taken from a
+// line whatsmeow logs, because that line is the only instant of a socket's own life that
+// reaches this process synchronously; the field beside it is written without a lock by
+// whichever connection is authenticating and read here from the goroutine announcing the
+// previous one, which is a data race on this very path.
+//
+// A string is a weak hold on a dependency, and this is what keeps it from rotting quietly: a
+// library that renames the line leaves every replacement dated from its announcement again,
+// which is a silent return to the defect rather than anything that fails.
+func TestTheLineWhatsmeowLogsWhenItAuthenticatesIsTheOneWatched(t *testing.T) {
+	t.Parallel()
+
+	out, err := exec.CommandContext(t.Context(), "go", "list", "-m", "-f", "{{.Dir}}", "go.mau.fi/whatsmeow").Output()
+	if err != nil {
+		t.Fatalf("locate whatsmeow: %v", err)
+	}
+	source, err := os.ReadFile(filepath.Join(strings.TrimSpace(string(out)), "connectionevents.go"))
+	if err != nil {
+		t.Fatalf("read the library's connection events: %v", err)
+	}
+	logged := fmt.Sprintf("cli.Log.Infof(%q)", authenticatedLine)
+	if !strings.Contains(string(source), logged) {
+		t.Fatalf("whatsmeow no longer logs %s when it authenticates, so every replacement is "+
+			"dated from its announcement again and nothing else says so", logged)
+	}
+}
+
+// And the stamp is taken from that line rather than from anything the session does itself:
+// a client whose library never logged an authentication carries the zero instant.
+func TestTheStampComesFromTheLibrarysOwnLine(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newLoggedTestSession(t, "5511999990001")
+	if at := session.authenticated.authenticatedAt(); !at.IsZero() {
+		t.Fatalf("a session that never saw an authentication carries %s", at)
+	}
+
+	clock := &drivenClock{}
+	session.wallClock = clock.read
+	at := time.Now()
+	clock.set(at)
+
+	session.waLog.Infof("Successfully paired 5511999990001")
+	if got := session.authenticated.authenticatedAt(); !got.IsZero() {
+		t.Fatalf("another info line was taken for an authentication: %s", got)
+	}
+
+	session.waLog.Infof(authenticatedLine)
+	if got := session.authenticated.authenticatedAt(); !got.Equal(at) {
+		t.Fatalf("the authentication was dated %s rather than %s", got, at)
 	}
 }

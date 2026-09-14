@@ -326,6 +326,12 @@ type Session struct {
 	// then reads as one about the socket that is gone (#181).
 	socketUpAt time.Time
 
+	// authenticated is when whatsmeow last said it authenticated a socket, kept by the
+	// logger the library writes through and read on the one path that has nothing else:
+	// see `authenticatedLine`. Nil only for a session built with somebody else's logger,
+	// and a nil one dates a replacement the way main did, from the announcement.
+	authenticated *authStamp
+
 	// awaited holds the messages that arrived unreadable and have not been given up on
 	// yet, so the one that arrives afterwards under the same id can call the placeholder
 	// off. Keyed by message id, and emptied by whichever of the two happens first.
@@ -717,6 +723,16 @@ func newSession(
 	}
 	s.adopt(client)
 	go s.forward()
+
+	// The library logs an authentication from the socket's own goroutine, and the session
+	// reads that instant when a connection announces itself over one it still believes in.
+	// Handed the session's clock here, while nothing else can be running, so a test that
+	// drives one drives both.
+	if quiet, ok := wa.(*quietLogger); ok && quiet.authenticated != nil {
+		quiet.authenticated.driveWith(s.now)
+		s.authenticated = quiet.authenticated
+	}
+
 	return s
 }
 
@@ -925,15 +941,12 @@ func (s *Session) setConnected(connected bool) int64 {
 // from when the session heard about it, and a stamp more than `keepAliveStaleAfter` past
 // the new keepalive loop makes every real timeout on that socket read as stale.
 func (s *Session) setConnectedAt(connected bool, at time.Time) int64 {
-	// Read before the lock, because reading it takes this very one, and read on every
-	// announcement because which arm below needs it is not known until the lock is held.
-	// It is a plain field on whatsmeow's client and `socketUp` is what decides whether the
-	// value is one to believe.
+	// Read before the lock, because the stamp takes a lock of its own and this one is held
+	// across the arm that needs it. Which arm that is cannot be known until this lock is
+	// held, so it is read on every announcement; it costs one uncontended mutex.
 	var authenticated time.Time
-	if connected {
-		if client := s.current(); client != nil {
-			authenticated = client.LastSuccessfulConnect
-		}
+	if connected && s.authenticated != nil {
+		authenticated = s.authenticated.authenticatedAt()
 	}
 	s.mu.Lock()
 	replaced := connected && s.connected
