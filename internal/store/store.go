@@ -574,6 +574,30 @@ func (c *Container) migrate(ctx context.Context) error {
 			set_at BIGINT NOT NULL,
 			FOREIGN KEY (sid) REFERENCES wac_session_device (sid) ON DELETE CASCADE
 		)`,
+		// One row per display name of the account's own that did not reach the contact
+		// table. The table is the copy `contact.resolve` answers the account with, because
+		// every change reaches it; a write that failed is the one case where that is not
+		// true, and the session that saw the failure is the only thing that knew (#140).
+		//
+		// `stale` is what the row was holding when it refused, and it is what makes this
+		// answerable on the way back. "Which of these two copies is newer" is the question
+		// nothing on either side settles; "has anything touched the row since" is the same
+		// question asked where there is an answer.
+		//
+		// The same foreign key as the presence above, and for the same reason: the name is
+		// the pairing's, so a row that outlived the pairing would be answering for an
+		// account this device no longer is. No retention sweep either -- a row is deleted
+		// by whichever of its two endings comes first, and one that is left is one whose
+		// write still has not landed, which is precisely the row that still has work to do.
+		`CREATE TABLE IF NOT EXISTS wac_own_name (
+			sid       TEXT   NOT NULL,
+			kind      TEXT   NOT NULL,
+			name      TEXT   NOT NULL,
+			stale     TEXT   NOT NULL,
+			marked_at BIGINT NOT NULL,
+			PRIMARY KEY (sid, kind),
+			FOREIGN KEY (sid) REFERENCES wac_session_device (sid) ON DELETE CASCADE
+		)`,
 		// One row per attempt at making a group: the intent, written before WhatsApp is
 		// asked, and the group it turned into, written after. The split is what covers the
 		// one effect this connector serves that a second run duplicates instead of

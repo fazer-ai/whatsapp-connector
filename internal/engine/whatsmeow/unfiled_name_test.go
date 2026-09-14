@@ -1,0 +1,527 @@
+package whatsmeow
+
+import (
+	"context"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"slices"
+	"strings"
+	"testing"
+
+	"github.com/rs/zerolog"
+	wm "go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/proto/waAdv"
+	waSyncAction "go.mau.fi/whatsmeow/proto/waSyncAction"
+	waStore "go.mau.fi/whatsmeow/store"
+	waTypes "go.mau.fi/whatsmeow/types"
+	waEvents "go.mau.fi/whatsmeow/types/events"
+	"google.golang.org/protobuf/proto"
+
+	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
+	"github.com/fazer-ai/whatsapp-connector/internal/store"
+	"github.com/fazer-ai/whatsapp-connector/internal/store/storetest"
+)
+
+const (
+	ownPhone = "5511999990001"
+	ownLID   = "111222333444555"
+)
+
+// The account renamed itself, the device record took the new name and the contact table
+// refused it. The session that saw the rename answers with the name the account is
+// actually using, which is what #139 left; a process that never saw the event has only the
+// row, and the row is the one the write was supposed to level.
+func TestARestartAnswersWithTheNameTheTableWouldNotTake(t *testing.T) {
+	t.Parallel()
+
+	live := aStoreThatOutlivesItsProcess(t)
+	session, client := live.session(t, "sid-a", ownPhone, ownLID)
+	theTableSays(t, client, "Antigo")
+	theRecordSays(t, client, "Antigo")
+
+	// Calibration: with both copies agreeing there is nothing to decide.
+	if party := resolvedBy(t, session, ownPhone); party["push_name"] != "Antigo" {
+		t.Fatalf("before anything the account is called %v, want the name both copies hold", party)
+	}
+
+	// whatsmeow's half of an app-state rename is the record; the connector's half is the
+	// filing, and only that one fails.
+	theRecordSays(t, client, "Atendimento")
+	client.Store.Contacts = shutContacts{ContactStore: client.Store.Contacts}
+	session.handle(&waEvents.PushNameSetting{
+		Action: &waSyncAction.PushNameSetting{Name: proto.String("Atendimento")},
+	})
+	if names := session.names(); !names.pushUnfiled {
+		t.Fatal("the session says its name is filed after a table that took nothing")
+	}
+	if party := resolvedBy(t, session, ownPhone); party["push_name"] != "Atendimento" {
+		t.Fatalf("before the restart the account is called %v, want the name it renamed itself to", party)
+	}
+
+	restarted, _ := live.restart(t, session, "sid-a", ownPhone, ownLID)
+	restarted.handle(&waEvents.Connected{})
+	drain(t, restarted)
+	if party := resolvedBy(t, restarted, ownPhone); party["push_name"] != "Atendimento" {
+		t.Errorf("after the restart the account is called %v, want the name it renamed itself to", party)
+	}
+}
+
+// The window between a process coming back and its socket opening is exactly when a client
+// resynchronises its contacts, and `contact.resolve` is the one command written to answer
+// without a socket at all. A fix that reconciles on the connection leaves the same wrong
+// answer inside that window.
+func TestARestartAnswersBeforeItsSocketEverOpens(t *testing.T) {
+	t.Parallel()
+
+	live := aStoreThatOutlivesItsProcess(t)
+	session, client := live.session(t, "sid-b", ownPhone, ownLID)
+	theTableSays(t, client, "Antigo")
+	theRecordSays(t, client, "Atendimento")
+	client.Store.Contacts = shutContacts{ContactStore: client.Store.Contacts}
+	session.handle(&waEvents.PushNameSetting{
+		Action: &waSyncAction.PushNameSetting{Name: proto.String("Atendimento")},
+	})
+
+	// No Connected, no socket, nothing but the session that has just been built.
+	restarted, _ := live.restart(t, session, "sid-b", ownPhone, ownLID)
+	if party := resolvedBy(t, restarted, ownPhone); party["push_name"] != "Atendimento" {
+		t.Errorf("before connecting the account is called %v, want the name it renamed itself to", party)
+	}
+}
+
+// The verified name is the harder half. whatsmeow files it under the address the change
+// arrived on and never writes it to the device record, so between the row it left behind
+// and the session there is no third copy: a restart that only remembered a marker would
+// have nothing to put the marker beside.
+func TestARestartAnswersWithTheVerifiedNameARowWouldNotTake(t *testing.T) {
+	t.Parallel()
+
+	live := aStoreThatOutlivesItsProcess(t)
+	session, client := live.session(t, "sid-c", ownPhone, ownLID)
+	phoneJID := waTypes.NewJID(ownPhone, waTypes.DefaultUserServer)
+	lidJID := waTypes.NewJID(ownLID, waTypes.HiddenUserServer)
+	client.Store.LID = lidJID
+	session.handle(&waEvents.Connected{})
+	drain(t, session)
+	for _, jid := range []waTypes.JID{phoneJID, lidJID} {
+		if _, _, err := client.Store.Contacts.PutBusinessName(t.Context(), jid, "Loja do Bruno"); err != nil {
+			t.Fatalf("PutBusinessName: %v", err)
+		}
+	}
+
+	// whatsmeow wrote the row the change arrived on before the event existed, and left the
+	// other one -- the one a read goes to first -- behind.
+	if _, _, err := client.Store.Contacts.PutBusinessName(t.Context(), lidJID, "Loja do Bruno LTDA"); err != nil {
+		t.Fatalf("PutBusinessName: %v", err)
+	}
+	client.Store.Contacts = &refusingContacts{ContactStore: client.Store.Contacts, refuse: phoneJID}
+	session.handle(&waEvents.BusinessName{
+		JID: lidJID, OldBusinessName: "Loja do Bruno", NewBusinessName: "Loja do Bruno LTDA",
+	})
+	if names := session.names(); !names.verifiedUnfiled {
+		t.Fatal("the session says its verified name is filed after the row a read prefers refused it")
+	}
+	if party := resolvedBy(t, session, ownPhone); party["verified_name"] != "Loja do Bruno LTDA" {
+		t.Fatalf("before the restart the account is verified as %v, want the name it changed to", party)
+	}
+
+	restarted, _ := live.restart(t, session, "sid-c", ownPhone, ownLID)
+	restarted.handle(&waEvents.Connected{})
+	drain(t, restarted)
+	if party := resolvedBy(t, restarted, ownPhone); party["verified_name"] != "Loja do Bruno LTDA" {
+		t.Errorf("after the restart the account is verified as %v, want the name it changed to", party)
+	}
+}
+
+// The commoner case, and the price this must not charge for the one above: a rename that
+// only ever reached the table is answered by the table, and the row is not rewritten from
+// the record. Reconciling the other way round would put an older name over a newer row,
+// which is the hole the issue names.
+func TestARestartTakesTheTableWhenNoWriteEverFailed(t *testing.T) {
+	t.Parallel()
+
+	live := aStoreThatOutlivesItsProcess(t)
+	session, client := live.session(t, "sid-d", ownPhone, ownLID)
+	// The record as the pairing wrote it, the table as the notify on a message the account
+	// sent left it. No event reached this process and no write failed.
+	theRecordSays(t, client, "Antigo")
+	theTableSays(t, client, "Atendimento")
+
+	restarted, restartedClient := live.restart(t, session, "sid-d", ownPhone, ownLID)
+	restarted.handle(&waEvents.Connected{})
+	drain(t, restarted)
+	if party := resolvedBy(t, restarted, ownPhone); party["push_name"] != "Atendimento" {
+		t.Errorf("after the restart the account is called %v, want the copy the table holds", party)
+	}
+	for _, jid := range bothAddresses() {
+		contact, err := restartedClient.Store.Contacts.GetContact(t.Context(), jid)
+		if err != nil {
+			t.Fatalf("GetContact: %v", err)
+		}
+		if contact.PushName != "Atendimento" {
+			t.Errorf("the %s row was left saying %q, want the name nothing here had reason to touch",
+				jid.Server, contact.PushName)
+		}
+	}
+}
+
+// What is kept has to stop being true when it stops being true. Once the write lands, the
+// table is level again and a copy that went on answering over it would have traded one
+// wrong name for another.
+func TestAKeptNameLosesToARowThatMovedOnAfterIt(t *testing.T) {
+	t.Parallel()
+
+	live := aStoreThatOutlivesItsProcess(t)
+	session, client := live.session(t, "sid-e", ownPhone, ownLID)
+	theTableSays(t, client, "Antigo")
+	theRecordSays(t, client, "Atendimento")
+	client.Store.Contacts = shutContacts{ContactStore: client.Store.Contacts}
+	session.handle(&waEvents.PushNameSetting{
+		Action: &waSyncAction.PushNameSetting{Name: proto.String("Atendimento")},
+	})
+	session, client = live.restart(t, session, "sid-e", ownPhone, ownLID)
+	session.handle(&waEvents.Connected{})
+	drain(t, session)
+	if party := resolvedBy(t, session, ownPhone); party["push_name"] != "Atendimento" {
+		t.Fatalf("after the first restart the account is called %v, want the name the table would not take", party)
+	}
+
+	// The table takes writes again and the account renames itself. Both rows move, and
+	// whatever was being kept stops being true here.
+	theRecordSays(t, client, "Recepcao")
+	session.handle(&waEvents.PushNameSetting{
+		Action: &waSyncAction.PushNameSetting{Name: proto.String("Recepcao")},
+	})
+	if names := session.names(); names.pushUnfiled {
+		t.Fatal("the session says its name is unfiled after a write that took")
+	}
+	for _, jid := range bothAddresses() {
+		contact, err := client.Store.Contacts.GetContact(t.Context(), jid)
+		if err != nil {
+			t.Fatalf("GetContact: %v", err)
+		}
+		if contact.PushName != "Recepcao" {
+			t.Fatalf("the %s row says %q after a write that took, want the new name", jid.Server, contact.PushName)
+		}
+	}
+
+	// And then the table alone moves again: the notify on a message the account sent from
+	// another device, which writes the row, does not write the record and does not reach
+	// this process at all.
+	theTableSays(t, client, "Triagem")
+
+	restarted, _ := live.restart(t, session, "sid-e", ownPhone, ownLID)
+	restarted.handle(&waEvents.Connected{})
+	drain(t, restarted)
+	if party := resolvedBy(t, restarted, ownPhone); party["push_name"] != "Triagem" {
+		t.Errorf("after the second restart the account is called %v, want the name the row moved on to", party)
+	}
+}
+
+// Invariant 1: losing the lease closes the socket and fences the writes. A durable record
+// written from outside that fence is a dead instance writing over what the live one has
+// just written, and the whole point of the fence is that it cannot.
+func TestAnInstanceThatLostItsLeaseWritesNothingDown(t *testing.T) {
+	t.Parallel()
+
+	live := aStoreThatOutlivesItsProcess(t)
+	session, client := live.session(t, "sid-f", ownPhone, ownLID)
+	theTableSays(t, client, "Antigo")
+	pool := live.target.Pool(t)
+	before := wholeDatabase(t, live.target, pool)
+
+	session.store.Drop()
+	// The field and not a save: whatsmeow's own write of the record goes through the same
+	// fence, so a session in this state is not persisting that half either.
+	client.Store.PushName = "Atendimento"
+	session.handle(&waEvents.PushNameSetting{
+		Action: &waSyncAction.PushNameSetting{Name: proto.String("Atendimento")},
+	})
+	drain(t, session)
+
+	if after := wholeDatabase(t, live.target, pool); after != before {
+		t.Errorf("a session that lost its lease wrote to the database:\nbefore %s\nafter  %s", before, after)
+	}
+	names := session.names()
+	if !names.pushUnfiled || names.push != "Atendimento" {
+		t.Errorf("the session calls itself %q (unfiled %v), want the new name held in memory", names.push, names.pushUnfiled)
+	}
+}
+
+// What one session keeps is that session's, under its own key. A database is shared by a
+// whole fleet, so a copy filed under the wrong one would answer for another operator's
+// account, and one that leaked into a third party's answer would put the account's own
+// name on somebody else's contact.
+func TestAKeptNameAnswersForItsOwnSessionAndNobodyElse(t *testing.T) {
+	t.Parallel()
+
+	const (
+		otherPhone = "5511999990002"
+		knownThird = "5511988887777"
+		emptyThird = "5511988886666"
+	)
+
+	live := aStoreThatOutlivesItsProcess(t)
+	mine, myClient := live.session(t, "sid-g-a", ownPhone, ownLID)
+	theirs, theirClient := live.session(t, "sid-g-b", otherPhone, "111222333444666")
+	unpaired, _ := live.session(t, "sid-g-c", "", "")
+
+	theTableSays(t, myClient, "Antigo")
+	if _, _, err := theirClient.Store.Contacts.PutPushName(t.Context(),
+		waTypes.NewJID(otherPhone, waTypes.DefaultUserServer), "Comercial"); err != nil {
+		t.Fatalf("PutPushName: %v", err)
+	}
+	if _, _, err := myClient.Store.Contacts.PutPushName(t.Context(),
+		waTypes.NewJID(knownThird, waTypes.DefaultUserServer), "Cliente"); err != nil {
+		t.Fatalf("PutPushName: %v", err)
+	}
+
+	theRecordSays(t, myClient, "Atendimento")
+	myClient.Store.Contacts = shutContacts{ContactStore: myClient.Store.Contacts}
+	mine.handle(&waEvents.PushNameSetting{
+		Action: &waSyncAction.PushNameSetting{Name: proto.String("Atendimento")},
+	})
+
+	if err := theirs.Close(); err != nil {
+		t.Fatalf("Close the other session: %v", err)
+	}
+	if err := unpaired.Close(); err != nil {
+		t.Fatalf("Close the unpaired session: %v", err)
+	}
+	mine, _ = live.restart(t, mine, "sid-g-a", ownPhone, ownLID)
+	theirs, _ = live.session(t, "sid-g-b", otherPhone, "111222333444666")
+	unpaired, _ = live.session(t, "sid-g-c", "", "")
+
+	if party := resolvedBy(t, mine, ownPhone); party["push_name"] != "Atendimento" {
+		t.Errorf("the session that was renamed calls itself %v, want its own new name", party)
+	}
+	if party := resolvedBy(t, theirs, otherPhone); party["push_name"] != "Comercial" {
+		t.Errorf("the other account is called %v, want the name that is actually its own", party)
+	}
+	if party := resolvedBy(t, mine, knownThird); party["push_name"] != "Cliente" {
+		t.Errorf("a third party is called %v, want the name the table holds for them", party)
+	}
+	if party := resolvedBy(t, mine, emptyThird); party["push_name"] != nil {
+		t.Errorf("a third party with no row is called %v, want no name at all", party)
+	}
+	_, err := unpaired.Execute(t.Context(),
+		resolveCommand(t, `{"party":{"kind":"phone","id":"`+ownPhone+`"}}`))
+	assertCode(t, err, protocol.ErrorNotPaired)
+}
+
+// aStoreThatOutlivesItsProcess is one database and whatever container is open over it. The
+// container is what a restart replaces: reopening it is deliberate, because a marker kept
+// in a cache of the process would survive rebuilding only the session and would not
+// survive this.
+type liveStore struct {
+	target storetest.Target
+	open   *store.Container
+}
+
+func aStoreThatOutlivesItsProcess(t *testing.T) *liveStore {
+	t.Helper()
+
+	live := &liveStore{target: storetest.New(t)}
+	live.reopen(t)
+	t.Cleanup(func() {
+		if live.open != nil {
+			_ = live.open.Close()
+		}
+	})
+	return live
+}
+
+func (l *liveStore) reopen(t *testing.T) {
+	t.Helper()
+
+	if l.open != nil {
+		if err := l.open.Close(); err != nil {
+			t.Fatalf("Close the store: %v", err)
+		}
+		l.open = nil
+	}
+	container, err := store.Open(t.Context(), l.target.URL, store.AlwaysOwned, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("Open the store: %v", err)
+	}
+	l.open = container
+}
+
+// restart is the whole of one: the session closed, the container closed, another opened
+// over the same database, and a session built from the device record that was left there.
+// Nothing of the process before it survives.
+func (l *liveStore) restart(t *testing.T, session *Session, sid, phone, lid string) (*Session, *wm.Client) {
+	t.Helper()
+
+	if err := session.Close(); err != nil {
+		t.Fatalf("Close the session: %v", err)
+	}
+	l.reopen(t)
+	return l.session(t, sid, phone, lid)
+}
+
+// session builds one over whatever container is open, pairing the device the first time
+// and reading it back every time after.
+func (l *liveStore) session(t *testing.T, sid, phone, lid string) (*Session, *wm.Client) {
+	t.Helper()
+
+	scoped := l.open.For(sid)
+	device, err := scoped.Device(t.Context())
+	if err != nil {
+		t.Fatalf("Device: %v", err)
+	}
+	if device.ID == nil && phone != "" {
+		jid, err := waTypes.ParseJID(phone + ":12@" + waTypes.DefaultUserServer)
+		if err != nil {
+			t.Fatalf("ParseJID: %v", err)
+		}
+		device.ID = &jid
+		device.LID = waTypes.NewJID(lid, waTypes.HiddenUserServer)
+		device.Account = &waAdv.ADVSignedDeviceIdentity{
+			Details:             make([]byte, 32),
+			AccountSignature:    make([]byte, 64),
+			AccountSignatureKey: make([]byte, 32),
+			DeviceSignature:     make([]byte, 64),
+		}
+		if err := device.Save(t.Context()); err != nil {
+			t.Fatalf("Save the device: %v", err)
+		}
+		if err := scoped.Bind(t.Context(), jid); err != nil {
+			t.Fatalf("Bind: %v", err)
+		}
+	}
+	client := wm.NewClient(device, nil)
+	session := newSession(sid, client, scoped, MediaOptions{}, zerolog.Nop(), newLibraryLogger(zerolog.Nop(), sid))
+	t.Cleanup(func() { _ = session.Close() })
+	return session, client
+}
+
+// theTableSays puts a push name on both of the account's rows, which is where a change
+// that reached the table leaves it.
+func theTableSays(t *testing.T, client *wm.Client, name string) {
+	t.Helper()
+
+	for _, jid := range bothAddresses() {
+		if _, _, err := client.Store.Contacts.PutPushName(t.Context(), jid, name); err != nil {
+			t.Fatalf("PutPushName: %v", err)
+		}
+	}
+}
+
+// theRecordSays writes the device record and saves it, which is whatsmeow's half of an
+// app-state rename. Without the save nothing of it crosses a restart.
+func theRecordSays(t *testing.T, client *wm.Client, name string) {
+	t.Helper()
+
+	client.Store.PushName = name
+	if err := client.Store.Save(t.Context()); err != nil {
+		t.Fatalf("Save the device: %v", err)
+	}
+}
+
+func bothAddresses() []waTypes.JID {
+	return []waTypes.JID{
+		waTypes.NewJID(ownPhone, waTypes.DefaultUserServer),
+		waTypes.NewJID(ownLID, waTypes.HiddenUserServer),
+	}
+}
+
+// resolvedBy asks a session to resolve one number.
+func resolvedBy(t *testing.T, session *Session, phone string) map[string]any {
+	t.Helper()
+
+	result, err := session.Execute(t.Context(), resolveCommand(t, `{"party":{"kind":"phone","id":"`+phone+`"}}`))
+	if err != nil {
+		t.Fatalf("contact.resolve: %v", err)
+	}
+	return resolved(t, result)
+}
+
+// shutContacts is a contact store that files no name at all, which is the shape of a
+// failure that is about the write rather than about one row.
+type shutContacts struct {
+	waStore.ContactStore
+}
+
+func (shutContacts) PutPushName(_ context.Context, _ waTypes.JID, _ string) (changed bool, previous string, err error) {
+	return false, "", errors.New("this table is not taking writes")
+}
+
+func (shutContacts) PutBusinessName(_ context.Context, _ waTypes.JID, _ string) (changed bool, previous string, err error) {
+	return false, "", errors.New("this table is not taking writes")
+}
+
+// wholeDatabase is every row of every table, as text, in an order that does not depend on
+// the storage engine. A count would catch a row that was added and miss one that was
+// rewritten, and both are writes a fenced instance must not be making.
+func wholeDatabase(t *testing.T, target storetest.Target, pool *sql.DB) string {
+	t.Helper()
+
+	listing := `SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name`
+	if target.Postgres() {
+		listing = `SELECT table_name FROM information_schema.tables
+			WHERE table_schema = 'public' AND table_type = 'BASE TABLE' ORDER BY table_name`
+	}
+	tables, err := pool.QueryContext(t.Context(), listing)
+	if err != nil {
+		t.Fatalf("list the tables: %v", err)
+	}
+	var named []string
+	for tables.Next() {
+		var name string
+		if err := tables.Scan(&name); err != nil {
+			t.Fatalf("read a table name: %v", err)
+		}
+		named = append(named, name)
+	}
+	if err := tables.Err(); err != nil {
+		t.Fatalf("list the tables: %v", err)
+	}
+	if err := tables.Close(); err != nil {
+		t.Fatalf("close the listing: %v", err)
+	}
+
+	var whole strings.Builder
+	for _, table := range named {
+		fmt.Fprintf(&whole, "%s:%s\n", table, tableContents(t, pool, table))
+	}
+	return whole.String()
+}
+
+func tableContents(t *testing.T, pool *sql.DB, table string) string {
+	t.Helper()
+
+	// The name comes from the database's own catalogue, not from anything a caller passed.
+	rows, err := pool.QueryContext(t.Context(), `SELECT * FROM `+table)
+	if err != nil {
+		t.Fatalf("read %s: %v", table, err)
+	}
+	defer func() { _ = rows.Close() }()
+	columns, err := rows.Columns()
+	if err != nil {
+		t.Fatalf("read the columns of %s: %v", table, err)
+	}
+	var printed []string
+	for rows.Next() {
+		cells := make([]sql.RawBytes, len(columns))
+		into := make([]any, len(columns))
+		for i := range cells {
+			into[i] = &cells[i]
+		}
+		if err := rows.Scan(into...); err != nil {
+			t.Fatalf("read a row of %s: %v", table, err)
+		}
+		printed = append(printed, fmt.Sprintf("%q", cells))
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("read %s: %v", table, err)
+	}
+	// Sorted here rather than in SQL: a row order the engine chooses is not a difference,
+	// and asking the database to order by every column is a different statement per table.
+	slices.Sort(printed)
+	sum := sha256.Sum256([]byte(strings.Join(printed, "\n")))
+	return fmt.Sprintf("%d rows %s", len(printed), hex.EncodeToString(sum[:8]))
+}

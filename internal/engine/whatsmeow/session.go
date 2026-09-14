@@ -884,6 +884,9 @@ func (s *Session) adopt(client *wm.Client) bool {
 	// one, so the two are only ever acquired this way round.
 	s.aliases.forget()
 	s.mu.Unlock()
+	// After the swap, because it reads the client this session has just taken, and before
+	// this returns, because the command it is for answers without waiting for a socket.
+	s.takeUnfiledNames()
 	return true
 }
 
@@ -1216,15 +1219,24 @@ func (s *Session) recordOwnName(pushName string) {
 		return
 	}
 	if !s.fileOwnName(client.Store.Contacts.PutPushName, pushName, "push name") {
+		// Written down as well as remembered. The marker below is what keeps the answer
+		// right while the row is behind, and it is knowledge this event produced: a
+		// process that did not see the event cannot rebuild it, and would answer from the
+		// row (#140).
+		s.keepUnfiled(store.UnfiledPushName, pushName)
 		return
 	}
 	s.mu.Lock()
 	// Only while the name is still the one that was written: a rename that landed during
 	// this has a write of its own behind it.
-	if s.pushName == pushName {
+	filed := s.pushName == pushName
+	if filed {
 		s.pushUnfiled = false
 	}
 	s.mu.Unlock()
+	if filed {
+		s.forgetUnfiled(store.UnfiledPushName)
+	}
 }
 
 // recordOwnVerifiedName files the account's own verified name under the address whatsmeow
@@ -1240,13 +1252,137 @@ func (s *Session) recordOwnVerifiedName(businessName string) {
 		return
 	}
 	if !s.fileOwnName(client.Store.Contacts.PutBusinessName, businessName, "verified name") {
+		s.keepUnfiled(store.UnfiledVerifiedName, businessName)
 		return
 	}
 	s.mu.Lock()
-	if s.businessName == businessName {
+	filed := s.businessName == businessName
+	if filed {
 		s.verifiedUnfiled = false
 	}
 	s.mu.Unlock()
+	if filed {
+		s.forgetUnfiled(store.UnfiledVerifiedName)
+	}
+}
+
+// keepUnfiled writes down a name the contact table would not take, together with what the
+// row was holding instead.
+//
+// The row's own value is the half that makes this answerable later. What a rebuilt session
+// needs to settle is which of the two copies is newer, and neither the device record nor
+// the row says; what it can settle is whether anything has touched the row since, which is
+// the same question asked where there is an answer.
+func (s *Session) keepUnfiled(kind, name string) {
+	client := s.current()
+	if client == nil || client.Store == nil || client.Store.Contacts == nil {
+		return
+	}
+	writing, done := context.WithTimeout(s.ctx, s.storeLimit)
+	defer done()
+	stale, read := s.ownRow(writing, client, kind)
+	if !read {
+		// Without what the row is holding there is nothing to compare against on the way
+		// back, and a copy that answers unconditionally is the one that outlives its own
+		// truth. The session's own memory still covers this process.
+		return
+	}
+	if err := s.store.PutUnfiledName(writing, kind, name, stale); err != nil {
+		s.log.Debug().Err(err).Str("name", kind).
+			Msg("could not record one of the account's own names as unfiled")
+	}
+}
+
+// forgetUnfiled drops the record, because the row took the name or because the row moved
+// on to a newer one.
+func (s *Session) forgetUnfiled(kind string) {
+	writing, done := context.WithTimeout(s.ctx, s.storeLimit)
+	defer done()
+	if err := s.store.DropUnfiledName(writing, kind); err != nil {
+		s.log.Debug().Err(err).Str("name", kind).
+			Msg("could not forget one of the account's own names as unfiled")
+	}
+}
+
+// takeUnfiledNames puts back what a process that ended before this one could not file.
+//
+// The marker is knowledge an event produced, and a session built from a device record has
+// seen no event: without this, `contact.resolve` goes to the row and answers with the name
+// the account has already left behind. The name comes back with the marker rather than
+// being taken from the record, because the record is not always the newer copy either --
+// a verified name change is written to the table and never to the record at all.
+//
+// Here rather than on the connection because this is the one command written to answer
+// without a socket, and the window between a process coming back and its socket opening is
+// exactly when a client resynchronises its contacts.
+func (s *Session) takeUnfiledNames() {
+	client := s.current()
+	if client == nil || client.Store == nil || client.Store.Contacts == nil {
+		return
+	}
+	reading, done := context.WithTimeout(s.ctx, s.storeLimit)
+	defer done()
+	for _, kind := range []string{store.UnfiledPushName, store.UnfiledVerifiedName} {
+		held, found, err := s.store.UnfiledName(reading, kind)
+		if err != nil {
+			s.log.Debug().Err(err).Str("name", kind).
+				Msg("could not read one of the account's own names left unfiled")
+			continue
+		}
+		if !found {
+			continue
+		}
+		row, read := s.ownRow(reading, client, kind)
+		if !read {
+			continue
+		}
+		if row != held.Stale {
+			// Something wrote the row after this was filed, so the row is the newer of the
+			// two and what was kept here has nothing left to say. That is the ordinary
+			// ending as well as the safe one: the write that landed after a failed one is
+			// usually the retry below, from the process that failed.
+			s.forgetUnfiled(kind)
+			continue
+		}
+		s.mu.Lock()
+		if kind == store.UnfiledPushName {
+			s.pushName, s.pushUnfiled = held.Name, true
+		} else {
+			s.businessName, s.verifiedUnfiled = held.Name, true
+		}
+		s.mu.Unlock()
+	}
+	// And tried again, which is what ends this rather than leaving the row behind until the
+	// next rename. A write that failed once is a write this connector still owes: the
+	// design the answer rests on is that the table is never behind, and it is this session
+	// that keeps it level.
+	own := s.names()
+	if own.pushUnfiled {
+		s.recordOwnName(own.push)
+	}
+	if own.verifiedUnfiled {
+		s.recordOwnVerifiedName(own.verified)
+	}
+}
+
+// ownRow is what the contact table holds for the account under the address a read goes to
+// first, which is the row that decides the answer.
+func (s *Session) ownRow(ctx context.Context, client *wm.Client, kind string) (string, bool) {
+	phone, _ := s.identity()
+	jid, err := jidOf(protocol.Address{Kind: protocol.AddressPhone, ID: phone})
+	if err != nil {
+		return "", false
+	}
+	contact, err := client.Store.Contacts.GetContact(ctx, jid)
+	if err != nil {
+		s.log.Debug().Err(err).Str("name", kind).
+			Msg("could not read the row one of the account's own names belongs in")
+		return "", false
+	}
+	if kind == store.UnfiledVerifiedName {
+		return contact.BusinessName, true
+	}
+	return contact.PushName, true
 }
 
 // fileOwnName writes one of the account's own display names under every address the
