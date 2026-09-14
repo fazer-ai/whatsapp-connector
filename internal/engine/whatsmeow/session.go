@@ -1388,28 +1388,43 @@ func (s *Session) ownRows(ctx context.Context, client *wm.Client, kind string) (
 		{Kind: protocol.AddressPhone, ID: phone},
 		{Kind: protocol.AddressLID, ID: lid},
 	} {
-		// A separator no name can contain, so two rows cannot spell the same value as one.
-		held.WriteByte(0)
-		if address.ID == "" {
-			continue
+		// Length-prefixed rather than separated by some character a name is assumed not to
+		// contain: two rows must not be able to spell what one row spells. Not a NUL, which
+		// is the obvious separator and which PostgreSQL refuses in a text column while
+		// SQLite takes it -- a difference only the second dialect's pass would ever find.
+		var name string
+		if address.ID != "" {
+			read, err := s.rowName(ctx, client, address, kind)
+			if err != nil {
+				s.log.Debug().Err(err).Str("kind", string(address.Kind)).Str("name", kind).
+					Msg("could not read a row one of the account's own names belongs in")
+				return "", false
+			}
+			name = read
 		}
-		jid, err := jidOf(address)
-		if err != nil {
-			return "", false
-		}
-		contact, err := client.Store.Contacts.GetContact(ctx, jid)
-		if err != nil {
-			s.log.Debug().Err(err).Str("kind", string(address.Kind)).Str("name", kind).
-				Msg("could not read a row one of the account's own names belongs in")
-			return "", false
-		}
-		if kind == store.UnfiledVerifiedName {
-			held.WriteString(contact.BusinessName)
-		} else {
-			held.WriteString(contact.PushName)
-		}
+		held.WriteString(strconv.Itoa(len(name)))
+		held.WriteByte(':')
+		held.WriteString(name)
 	}
 	return held.String(), true
+}
+
+// rowName is one address's copy of one of the account's own names.
+func (s *Session) rowName(
+	ctx context.Context, client *wm.Client, address protocol.Address, kind string,
+) (string, error) {
+	jid, err := jidOf(address)
+	if err != nil {
+		return "", err
+	}
+	contact, err := client.Store.Contacts.GetContact(ctx, jid)
+	if err != nil {
+		return "", fmt.Errorf("read the contact row of %s: %w", address.Kind, err)
+	}
+	if kind == store.UnfiledVerifiedName {
+		return contact.BusinessName, nil
+	}
+	return contact.PushName, nil
 }
 
 // fileOwnName writes one of the account's own display names under every address the
