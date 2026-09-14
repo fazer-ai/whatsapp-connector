@@ -75,9 +75,11 @@ func (s *Scoped) FinishGroupCreate(ctx context.Context, attempt, jid string) err
 	if jid == "" {
 		return fmt.Errorf("store: a finished group creation needs the group it made")
 	}
-	const name = `UPDATE wac_group_create SET group_jid = ? WHERE sid = ? AND attempt = ? AND group_jid IS NULL`
+	const name = `
+		UPDATE wac_group_create SET group_jid = ?, settled_at = ?
+		WHERE sid = ? AND attempt = ? AND group_jid IS NULL`
 	if _, err := s.container.db.ExecContext(ctx, s.container.rebind(name),
-		jid, s.sid, attempt); err != nil {
+		jid, time.Now().UnixMilli(), s.sid, attempt); err != nil {
 		return fmt.Errorf("store: finish the group creation %s of %s: %w", attempt, s.sid, err)
 	}
 	return nil
@@ -136,13 +138,46 @@ func (s *Scoped) GroupsClaimedByOtherAttempts(ctx context.Context, except string
 	return claimed, nil
 }
 
-// SweepGroupCreations drops the attempts begun before the cutoff, and reports how many.
+// OtherAttemptsStillOpen reports whether this session has another attempt at a group by
+// this subject that has not settled.
 //
-// They are kept only for as long as a redelivery of the command can still arrive, which is
-// the transport's business and not this table's: the cutoff is the caller's. Without a sweep
-// the row count is the number of groups the deployment has ever made.
+// It is what says a search cannot be trusted. Two unfinished attempts for the same subject
+// make a group that matches both, and nothing on WhatsApp separates them: subject, creator
+// and instant are the same evidence for each. Answering one of them with that group hands a
+// request another's conversation and skips the creation it asked for, silently. Refusing is
+// the honest answer, and it is one a retry can recover from once the other attempt settles.
+func (s *Scoped) OtherAttemptsStillOpen(ctx context.Context, except, subject string) (bool, error) {
+	const read = `
+		SELECT 1 FROM wac_group_create
+		WHERE sid = ? AND attempt <> ? AND subject = ? AND group_jid IS NULL LIMIT 1`
+	var open int
+	err := s.container.db.QueryRowContext(ctx, s.container.rebind(read), s.sid, except, subject).Scan(&open)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return false, nil
+	case err != nil:
+		return false, fmt.Errorf("store: read the open group creations of %s: %w", s.sid, err)
+	}
+	return true, nil
+}
+
+// SweepGroupCreations drops the attempts that settled before the cutoff, and reports how
+// many. Without a sweep the row count is the number of groups the deployment has ever made.
+//
+// Two things it deliberately does not do. It does not go by when an attempt began, because
+// what the row covers is a redelivery, and a delivery can sit pending for as long as nobody
+// acknowledges it: an attempt begun long ago whose command is still in flight needs its row
+// exactly as much as a fresh one. And it never drops an attempt that has not settled, which
+// is the only row here that cannot be reconstructed -- something asked WhatsApp for a group
+// and did not get as far as writing down what it made, and the intent is the only thing that
+// says where to look. One row per crash in that window is a price worth paying for it.
+//
+// What is left, stated rather than hidden: a redelivery arriving after both the ledger and
+// this record have forgotten the command makes a second group, and no finite retention
+// removes that. What bounds it in practice is the client's own `MAXLEN` trim on the command
+// stream, which is a length and not a time and so is not this table's to measure.
 func (c *Container) SweepGroupCreations(ctx context.Context, before time.Time) (int64, error) {
-	const drop = `DELETE FROM wac_group_create WHERE started_at < ?`
+	const drop = `DELETE FROM wac_group_create WHERE settled_at IS NOT NULL AND settled_at < ?`
 	done, err := c.db.ExecContext(ctx, c.rebind(drop), before.UnixMilli())
 	if err != nil {
 		return 0, fmt.Errorf("store: sweep the group creations: %w", err)

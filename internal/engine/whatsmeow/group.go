@@ -440,6 +440,24 @@ func (s *Session) groupFromEarlierAttempt(
 		// Same reasoning: which groups are somebody else's is part of the question.
 		return nil, false, contactFailure(err, "group creation")
 	}
+	// A record only rules a group out once the attempt that made it wrote it down. While
+	// another attempt at a group by this name is still open, a match is evidence for both
+	// of them and proof for neither, so there is nothing to answer with: creating would
+	// duplicate and answering would hand this request the other's conversation.
+	contested, err := s.store.OtherAttemptsStillOpen(ctx, attempt, began.Subject)
+	if err != nil {
+		return nil, false, contactFailure(err, "group creation")
+	}
+	if contested {
+		s.log.Warn().Str("sid", s.sid).Str("attempt", attempt).Str("subject", began.Subject).
+			Msg("refused to reconcile a creation while another attempt at a group by the same name is still open")
+		// `internal` because the contract has no word for "cannot be told apart yet". It
+		// is the closest honest answer -- the connector could not carry the command out --
+		// and it converges: once the other attempt settles, a retry reconciles properly.
+		// Naming this case on the wire is a contract change, and #214 is where it is asked.
+		return nil, false, protocol.NewError(protocol.ErrorInternal,
+			"another request for a group by this name has not finished, so which group this one made cannot be told yet")
+	}
 	// WhatsApp dates a group to the second, and the intent is written with the clock this
 	// process has. An intent at .400 and the group it made stamped at .000 are the same
 	// second, and comparing them as they stand would put the group before its own intent

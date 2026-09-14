@@ -435,6 +435,204 @@ func TestARedeliveredCreationDoesNotTakeAGroupAnotherAttemptAlreadyMade(t *testi
 	}
 }
 
+// The subject is what the attempt was to call the group, and a group by another name is
+// another group however well its timing fits. An account that makes groups steadily would
+// otherwise have a crashed attempt answered with whatever it made next.
+func TestARedeliveredCreationDoesNotTakeAGroupByAnotherName(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setConnected(true)
+	self := waTypes.NewJID("5511999990001", waTypes.DefaultUserServer)
+
+	began := time.Now().Add(-time.Minute)
+	if _, _, err := session.store.BeginGroupCreate(t.Context(), "idem:once", "Obras", began); err != nil {
+		t.Fatalf("begin the attempt that crashed: %v", err)
+	}
+	// Made by this account, after the intent, and called something else entirely.
+	other := aMadeGroup("120363041234567890", "Churrasco", self)
+	other.GroupCreated = began.Add(time.Second)
+
+	asked := 0
+	session.createTheGroup = func(context.Context, *wm.Client, wm.ReqCreateGroup) (*waTypes.GroupInfo, error) {
+		asked++
+		return aMadeGroup("120363099999999999", "Obras", self), nil
+	}
+	session.joinedGroups = func(context.Context, *wm.Client) ([]*waTypes.GroupInfo, error) {
+		return []*waTypes.GroupInfo{other}, nil
+	}
+
+	answer, err := session.Execute(t.Context(),
+		namedCreate("c1", "once", `{"subject":"Obras","participants":[]}`))
+	if err != nil {
+		t.Fatalf("the redelivery: %v", err)
+	}
+	if asked != 1 {
+		t.Fatal("the retry took a group by another name for the one it was to make")
+	}
+	if got := namedGroup(t, answer); got == other.JID.String() {
+		t.Fatalf("the retry answered with %s, a group called something else", got)
+	}
+}
+
+// What another session made is not this one's business, in either direction. The groups a
+// search rules out are the ones this session has already filed, and a table read across
+// every session would have one account's creations block another's retry.
+func TestARedeliveredCreationIsNotBlockedByAnotherSessionsGroup(t *testing.T) {
+	t.Parallel()
+
+	session, container := newTestSession(t, "5511999990001")
+	session.setConnected(true)
+	self := waTypes.NewJID("5511999990001", waTypes.DefaultUserServer)
+
+	began := time.Now().Add(-time.Minute)
+	if _, _, err := session.store.BeginGroupCreate(t.Context(), "idem:once", "Obras", began); err != nil {
+		t.Fatalf("begin the attempt that crashed: %v", err)
+	}
+	made := aMadeGroup("120363041234567890", "Obras", self)
+	made.GroupCreated = began.Add(time.Second)
+
+	// Another session filed the same group under a name of its own. Its table is not this
+	// session's, and reading across the two would rule out the group this attempt made.
+	elsewhere := container.For("another-session")
+	if _, _, err := elsewhere.BeginGroupCreate(t.Context(), "idem:once", "Obras", began); err != nil {
+		t.Fatalf("begin the other session's attempt: %v", err)
+	}
+	if err := elsewhere.FinishGroupCreate(t.Context(), "idem:once", made.JID.String()); err != nil {
+		t.Fatalf("record the other session's group: %v", err)
+	}
+
+	asked := 0
+	session.createTheGroup = func(context.Context, *wm.Client, wm.ReqCreateGroup) (*waTypes.GroupInfo, error) {
+		asked++
+		return aMadeGroup("120363099999999999", "Obras", self), nil
+	}
+	session.joinedGroups = func(context.Context, *wm.Client) ([]*waTypes.GroupInfo, error) {
+		return []*waTypes.GroupInfo{made}, nil
+	}
+
+	answer, err := session.Execute(t.Context(),
+		namedCreate("c1", "once", `{"subject":"Obras","participants":[]}`))
+	if err != nil {
+		t.Fatalf("the redelivery: %v", err)
+	}
+	if asked != 0 {
+		t.Fatal("another session's record blocked this one from finding the group it had already made")
+	}
+	if got := namedGroup(t, answer); got != made.JID.String() {
+		t.Fatalf("the redelivery answered %s, want %s", got, made.JID)
+	}
+}
+
+// The intent is the cover, so a creation that could not write one has no cover. Going ahead
+// anyway costs the caller a group they cannot tell from the one a redelivery would make;
+// refusing costs them a command they can send again.
+func TestACreationThatCouldNotWriteItsIntentIsRefused(t *testing.T) {
+	t.Parallel()
+
+	session, container := newTestSession(t, "5511999990001")
+	session.setConnected(true)
+
+	asked := 0
+	session.createTheGroup = func(context.Context, *wm.Client, wm.ReqCreateGroup) (*waTypes.GroupInfo, error) {
+		asked++
+		return aMadeGroup("120363041234567890", "Obras",
+			waTypes.NewJID("5511999990001", waTypes.DefaultUserServer)), nil
+	}
+	// The store stops answering between the payload being accepted and the intent going
+	// down, which is the one instant this refusal is about.
+	if err := container.Close(); err != nil {
+		t.Fatalf("Close the store: %v", err)
+	}
+
+	if _, err := session.Execute(t.Context(),
+		namedCreate("c1", "once", `{"subject":"Obras","participants":[]}`)); err == nil {
+		t.Fatal("a group was made with nothing written down to stop a redelivery making another")
+	}
+	if asked != 0 {
+		t.Fatal("WhatsApp was asked for a group the connector could not record having asked for")
+	}
+}
+
+// The group an attempt made is the first one this account created after the intent went
+// down. Taking the newest match instead would hand back whatever the account made last, which
+// on a busy account is somebody else's creation entirely.
+func TestARedeliveredCreationTakesTheOldestGroupInItsWindow(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setConnected(true)
+	self := waTypes.NewJID("5511999990001", waTypes.DefaultUserServer)
+
+	began := time.Now().Add(-time.Hour)
+	if _, _, err := session.store.BeginGroupCreate(t.Context(), "idem:once", "Obras", began); err != nil {
+		t.Fatalf("begin the attempt that crashed: %v", err)
+	}
+	mine := aMadeGroup("120363041111111111", "Obras", self)
+	mine.GroupCreated = began.Add(time.Second)
+	later := aMadeGroup("120363042222222222", "Obras", self)
+	later.GroupCreated = began.Add(30 * time.Minute)
+
+	session.createTheGroup = func(context.Context, *wm.Client, wm.ReqCreateGroup) (*waTypes.GroupInfo, error) {
+		t.Error("WhatsApp was asked for a group that was already there")
+		return nil, nil
+	}
+	session.joinedGroups = func(context.Context, *wm.Client) ([]*waTypes.GroupInfo, error) {
+		// Newest first, so an answer that takes the first match takes the wrong one.
+		return []*waTypes.GroupInfo{later, mine}, nil
+	}
+
+	answer, err := session.Execute(t.Context(),
+		namedCreate("c1", "once", `{"subject":"Obras","participants":[]}`))
+	if err != nil {
+		t.Fatalf("the redelivery: %v", err)
+	}
+	if got := namedGroup(t, answer); got != mine.JID.String() {
+		t.Fatalf("the redelivery answered %s, want the oldest group in its window, %s", got, mine.JID)
+	}
+}
+
+// Two requests for a group by the same name, both still open, make a group that is evidence
+// for either and proof for neither. Answering one of them with it would hand that request the
+// other's conversation and skip the creation it asked for, in silence.
+func TestARedeliveredCreationRefusesWhileAnotherAttemptAtTheSameNameIsOpen(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setConnected(true)
+	self := waTypes.NewJID("5511999990001", waTypes.DefaultUserServer)
+
+	began := time.Now().Add(-time.Minute)
+	if _, _, err := session.store.BeginGroupCreate(t.Context(), "idem:mine", "Obras", began); err != nil {
+		t.Fatalf("begin this attempt: %v", err)
+	}
+	// Another request for a group by the same name, also unfinished.
+	if _, _, err := session.store.BeginGroupCreate(t.Context(), "idem:theirs", "Obras", began); err != nil {
+		t.Fatalf("begin the competing attempt: %v", err)
+	}
+	ambiguous := aMadeGroup("120363041234567890", "Obras", self)
+	ambiguous.GroupCreated = began.Add(time.Second)
+
+	asked := 0
+	session.createTheGroup = func(context.Context, *wm.Client, wm.ReqCreateGroup) (*waTypes.GroupInfo, error) {
+		asked++
+		return aMadeGroup("120363099999999999", "Obras", self), nil
+	}
+	session.joinedGroups = func(context.Context, *wm.Client) ([]*waTypes.GroupInfo, error) {
+		return []*waTypes.GroupInfo{ambiguous}, nil
+	}
+
+	answer, err := session.Execute(t.Context(),
+		namedCreate("c1", "mine", `{"subject":"Obras","participants":[]}`))
+	if err == nil {
+		t.Fatalf("the redelivery answered %s over a group that is evidence for two requests",
+			namedGroup(t, answer))
+	}
+	if asked != 0 {
+		t.Fatal("a second group was made while which group belonged to this request was in doubt")
+	}
+}
+
 // namedGroup reads the group id out of a `group.create` answer.
 func namedGroup(t *testing.T, answer json.RawMessage) string {
 	t.Helper()

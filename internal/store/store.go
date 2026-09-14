@@ -589,10 +589,12 @@ func (c *Container) migrate(ctx context.Context) error {
 			subject    TEXT   NOT NULL,
 			started_at BIGINT NOT NULL,
 			group_jid  TEXT,
+			settled_at BIGINT,
 			PRIMARY KEY (sid, attempt)
 		)`,
-		// The sweep goes by age alone, across every session.
-		`CREATE INDEX IF NOT EXISTS wac_group_create_started_at ON wac_group_create (started_at)`,
+		// The sweep goes by when an attempt settled, across every session, and never
+		// touches one that has not.
+		`CREATE INDEX IF NOT EXISTS wac_group_create_settled_at ON wac_group_create (settled_at)`,
 	} {
 		if _, err := c.db.ExecContext(ctx, statement); err != nil {
 			return fmt.Errorf("store: bring the connector's own schema up: %w", err)
