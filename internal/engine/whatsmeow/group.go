@@ -435,12 +435,29 @@ func (s *Session) groupFromEarlierAttempt(
 		// through to creating one: that is the duplicate, made on purpose.
 		return nil, false, contactFailure(err, "group creation")
 	}
+	claimed, err := s.store.GroupsClaimedByOtherAttempts(ctx, attempt)
+	if err != nil {
+		// Same reasoning: which groups are somebody else's is part of the question.
+		return nil, false, contactFailure(err, "group creation")
+	}
+	// WhatsApp dates a group to the second, and the intent is written with the clock this
+	// process has. An intent at .400 and the group it made stamped at .000 are the same
+	// second, and comparing them as they stand would put the group before its own intent
+	// and have this search miss it -- which is the duplicate, on the commonest timing
+	// there is, because creating a group takes well under a second.
+	since := began.StartedAt.Truncate(time.Second)
 	var found *waTypes.GroupInfo
 	for _, group := range joined {
-		switch {
-		case group == nil, group.Name != began.Subject:
+		if group == nil {
 			continue
-		case group.GroupCreated.Before(began.StartedAt):
+		}
+		if _, taken := claimed[group.JID.String()]; taken {
+			continue
+		}
+		switch {
+		case group.Name != began.Subject:
+			continue
+		case group.GroupCreated.Before(since):
 			continue
 		case !s.isSelf(group.OwnerJID) && !s.isSelf(group.OwnerPN):
 			continue

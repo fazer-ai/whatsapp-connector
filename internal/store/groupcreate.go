@@ -106,6 +106,36 @@ func (c *Container) groupCreation(ctx context.Context, sid, attempt string) (Gro
 	return found, true, nil
 }
 
+// GroupsClaimedByOtherAttempts answers which groups this session has already recorded as
+// made by some attempt other than the one named.
+//
+// A search for the group an attempt made can only take one nothing else has claimed.
+// Without this, two requests for a group by the same name interleave badly: the first
+// writes its intent and dies before creating anything, the second creates its group, and
+// the first's retry finds that group, answers with it, and files it as its own -- so one
+// request is answered with another's conversation and the creation it asked for never
+// happens.
+func (s *Scoped) GroupsClaimedByOtherAttempts(ctx context.Context, except string) (map[string]struct{}, error) {
+	const read = `SELECT group_jid FROM wac_group_create WHERE sid = ? AND attempt <> ? AND group_jid IS NOT NULL`
+	rows, err := s.container.db.QueryContext(ctx, s.container.rebind(read), s.sid, except)
+	if err != nil {
+		return nil, fmt.Errorf("store: read the groups %s has already made: %w", s.sid, err)
+	}
+	defer func() { _ = rows.Close() }()
+	claimed := map[string]struct{}{}
+	for rows.Next() {
+		var jid string
+		if err := rows.Scan(&jid); err != nil {
+			return nil, fmt.Errorf("store: read the groups %s has already made: %w", s.sid, err)
+		}
+		claimed[jid] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: read the groups %s has already made: %w", s.sid, err)
+	}
+	return claimed, nil
+}
+
 // SweepGroupCreations drops the attempts begun before the cutoff, and reports how many.
 //
 // They are kept only for as long as a redelivery of the command can still arrive, which is
