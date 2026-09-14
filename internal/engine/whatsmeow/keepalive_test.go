@@ -1876,3 +1876,287 @@ func TestTheWindowsNoTestCanStandInsideAreFencedOff(t *testing.T) {
 			"for, rather than the one this timeout was judged against:\n%s", judging)
 	}
 }
+
+// drivenClock is a clock a test moves by hand. A field and a mutex rather than a counter,
+// because the arm under test hands the takedown to a goroutine of its own and that
+// goroutine reads the clock too: a counter closed over by two goroutines is a data race
+// and not a test.
+type drivenClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (c *drivenClock) set(at time.Time) {
+	c.mu.Lock()
+	c.now = at
+	c.mu.Unlock()
+}
+
+func (c *drivenClock) read() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+// The one path where the announcement is not the socket. whatsmeow's keepalive loop starts
+// with the socket, right after the noise handshake, and dates its first "last answered"
+// from that instant; `events.Connected` waits behind the prekey count, the prekey upload
+// and the passive IQ, each bounded by whatsmeow's own 75s request timeout rather than by a
+// handshake. Dating the replacement from the announcement therefore puts the stamp a long
+// way past the clock it is compared against, and every timeout about the socket that is up
+// reads as one about the socket that is gone (#181).
+func TestAReplacementAnnouncedLateIsDatedFromItsOwnSocketAndNotFromTheAnnouncement(t *testing.T) {
+	t.Parallel()
+
+	session, written := newLoggedTestSession(t, "5511999990001")
+	clock := &drivenClock{}
+	session.wallClock = clock.read
+
+	// The socket the session is on, and the one whose replacement is announced late.
+	handshake := time.Now()
+	clock.set(handshake)
+	dialedAndConnected(session)
+
+	// whatsmeow authenticates a second after the handshake and writes that instant down
+	// synchronously, before the goroutine that announces the connection is even started.
+	authenticated := handshake.Add(time.Second)
+	session.current().LastSuccessfulConnect = authenticated
+
+	// A ping the replacement never answered. Alone it is a blip, and the count rule leaves
+	// it alone, so it is here only to put a timeout before the announcement the way the
+	// real sequence does.
+	clock.set(handshake.Add(35 * time.Second))
+	session.handle(&waEvents.KeepAliveTimeout{ErrorCount: 1, LastSuccess: handshake})
+
+	// The announcement, 44s after the socket it describes: above the 20s of slack and well
+	// inside the ~150s the prekey and passive sequence can take.
+	announced := handshake.Add(45 * time.Second)
+	clock.set(announced)
+	session.handle(&waEvents.Connected{})
+	if emission := next(t, session); emission.Type != protocol.EventSessionState {
+		t.Fatalf("the replacement published %s", emission.Type)
+	}
+
+	// The second unanswered ping on that same socket, which is what the session exists to
+	// act on: a minute of a server that stopped answering on a connection still open.
+	clock.set(handshake.Add(60 * time.Second))
+	session.handle(&waEvents.KeepAliveTimeout{ErrorCount: 2, LastSuccess: handshake})
+
+	if got := session.state(); got != "reconnecting" {
+		t.Fatalf("the replacement was dated %s, when it was announced, rather than %s, when it "+
+			"authenticated, so its own timeouts read as stale and the session stayed %q over a mute "+
+			"socket for whatsmeow's three minutes", announced.Format(time.TimeOnly),
+			authenticated.Format(time.TimeOnly), got)
+	}
+	out := written.String()
+	if !strings.Contains(out, "taking it down") || !strings.Contains(out, `"missed":2`) {
+		t.Fatalf("the mute replacement was not taken down: %q", out)
+	}
+	if emission := next(t, session); emission.Type != protocol.EventSessionState {
+		t.Fatalf("the takedown published %s", emission.Type)
+	}
+}
+
+// The field the stamp comes from is whatsmeow's, unsynchronised, and written by whichever
+// connection is authenticating. These four are what bounds a value that cannot be trusted,
+// and each one is a direction a wrong stamp would fail in.
+
+// A client that has never authenticated carries the zero instant, and so does one whose
+// `handleConnectSuccess` took the early return. Believing it would be strictly worse than
+// dating the announcement: `lastKnownAlive` would answer the zero, every timeout on that
+// socket would read as stale, and the session would never take anything down on that
+// connection -- not even in the common case this issue is not about.
+func TestAnUnauthenticatedClientDoesNotDateTheReplacement(t *testing.T) {
+	t.Parallel()
+
+	session, written := newLoggedTestSession(t, "5511999990001")
+	clock := &drivenClock{}
+	session.wallClock = clock.read
+
+	start := time.Now()
+	clock.set(start)
+	dialedAndConnected(session)
+	session.current().LastSuccessfulConnect = time.Time{}
+
+	announced := start.Add(90 * time.Second)
+	clock.set(announced)
+	session.handle(&waEvents.Connected{})
+	next(t, session)
+
+	// The replacement answers a ping as it is announced and then stops, so the run that
+	// follows is dated from the announcement itself.
+	session.handle(&waEvents.KeepAliveRestored{})
+	clock.set(announced.Add(60 * time.Second))
+	session.handle(&waEvents.KeepAliveTimeout{ErrorCount: 2, LastSuccess: announced})
+
+	if got := session.state(); got != "reconnecting" {
+		t.Fatalf("a zero stamp left the session %q over a mute socket, which is worse than "+
+			"dating the announcement: nothing on that connection can ever be taken down", got)
+	}
+	if written.Len() == 0 {
+		t.Fatalf("the mute replacement was not taken down")
+	}
+}
+
+// A value from before the stamp it would replace describes a connection that is already
+// over -- a torn read, or the leftovers of an earlier one. Dating a new socket from before
+// the old one was dated is what makes the old socket's own timeouts read as current, and
+// acting on one of those takes the healthy replacement down, which is the direction #177
+// fenced.
+func TestAStampFromBeforeTheConnectionItReplacesIsNotBelieved(t *testing.T) {
+	t.Parallel()
+
+	session, written := newLoggedTestSession(t, "5511999990001")
+	clock := &drivenClock{}
+	session.wallClock = clock.read
+
+	start := time.Now()
+	clock.set(start)
+	dialedAndConnected(session)
+
+	// The socket answers a ping and then stops answering.
+	clock.set(start.Add(2 * time.Second))
+	session.handle(&waEvents.KeepAliveRestored{})
+
+	// The replacement announces itself on time, carrying an instant no socket announcing
+	// itself now could have authenticated at.
+	session.current().LastSuccessfulConnect = start.Add(-10 * time.Minute)
+	clock.set(start.Add(30 * time.Second))
+	session.handle(&waEvents.Connected{})
+	next(t, session)
+
+	// The run of pings the socket that was replaced stopped answering, arriving late.
+	clock.set(start.Add(40 * time.Second))
+	session.handle(&waEvents.KeepAliveTimeout{ErrorCount: 2, LastSuccess: start.Add(2 * time.Second)})
+
+	if got := session.state(); got != "reconnecting" && written.Len() > 0 {
+		t.Fatalf("an impossible stamp was believed, so a timeout about the socket that was "+
+			"replaced took the healthy one down: %s", written.String())
+	}
+	if got := session.state(); got != "open" {
+		t.Fatalf("the session left itself %q over a timeout about a socket that is gone", got)
+	}
+}
+
+// And a value from after the announcement is one this connection cannot have produced,
+// because whatsmeow writes the field before it dispatches the event: it is the next
+// connection's, or a torn read. A stamp in the future poisons `lastKnownAlive` for as long
+// as it stays ahead of the clock, and makes even a timeout that follows an answered ping
+// read as stale.
+func TestAStampFromAfterTheAnnouncementIsNotBelieved(t *testing.T) {
+	t.Parallel()
+
+	session, written := newLoggedTestSession(t, "5511999990001")
+	clock := &drivenClock{}
+	session.wallClock = clock.read
+
+	start := time.Now()
+	clock.set(start)
+	dialedAndConnected(session)
+
+	announced := start.Add(90 * time.Second)
+	session.current().LastSuccessfulConnect = announced.Add(5 * time.Minute)
+	clock.set(announced)
+	session.handle(&waEvents.Connected{})
+	next(t, session)
+
+	// The replacement answers a ping half a minute in and then goes quiet.
+	answered := announced.Add(30 * time.Second)
+	clock.set(answered)
+	session.handle(&waEvents.KeepAliveRestored{})
+	clock.set(announced.Add(90 * time.Second))
+	session.handle(&waEvents.KeepAliveTimeout{ErrorCount: 2, LastSuccess: answered})
+
+	if got := session.state(); got != "reconnecting" {
+		t.Fatalf("a stamp five minutes in the future left the session %q: it outlives the "+
+			"answered ping it is compared against and reads every timeout as stale", got)
+	}
+	if written.Len() == 0 {
+		t.Fatalf("the mute replacement was not taken down")
+	}
+}
+
+// Two replacements in a row, which is what tells a stamp that is read from a stamp that is
+// remembered. The first socket's timeouts describe a connection replaced twice over and
+// must stay ignored; the second socket's must be acted on.
+func TestASecondReplacementMovesTheStampForward(t *testing.T) {
+	t.Parallel()
+
+	session, written := newLoggedTestSession(t, "5511999990001")
+	clock := &drivenClock{}
+	session.wallClock = clock.read
+
+	start := time.Now()
+	clock.set(start)
+	dialedAndConnected(session)
+
+	firstHandshake := start.Add(60 * time.Second)
+	session.current().LastSuccessfulConnect = firstHandshake.Add(time.Second)
+	firstAnnounced := firstHandshake.Add(45 * time.Second)
+	clock.set(firstAnnounced)
+	session.handle(&waEvents.Connected{})
+	next(t, session)
+
+	secondHandshake := firstAnnounced.Add(120 * time.Second)
+	session.current().LastSuccessfulConnect = secondHandshake.Add(time.Second)
+	secondAnnounced := secondHandshake.Add(45 * time.Second)
+	clock.set(secondAnnounced)
+	session.handle(&waEvents.Connected{})
+	next(t, session)
+
+	// The first socket's run, arriving after its socket was replaced twice.
+	clock.set(secondAnnounced.Add(time.Second))
+	session.handle(&waEvents.KeepAliveTimeout{ErrorCount: 2, LastSuccess: firstHandshake})
+	if got := session.state(); got != "open" {
+		t.Fatalf("a timeout about the first of three sockets left the session %q", got)
+	}
+	if written.Len() != 0 {
+		t.Fatalf("a timeout about a socket replaced twice was acted on: %s", written.String())
+	}
+
+	// And the current socket's own run.
+	clock.set(secondAnnounced.Add(30 * time.Second))
+	session.handle(&waEvents.KeepAliveTimeout{ErrorCount: 2, LastSuccess: secondHandshake})
+	if got := session.state(); got != "reconnecting" {
+		t.Fatalf("the session left itself %q over a mute socket whose replacement it had dated", got)
+	}
+}
+
+// The fence on the other stamp, in the interval this issue is about. A drop dispatched
+// after the replacement authenticated but before it announced itself is still a drop the
+// reconnect overtook: `dropWasOvertaken` asks what this session had learned, and the
+// session had learned nothing until the announcement. Answering it from the authentication
+// instead would reopen #188 across the whole announcing window and write `reconnecting`
+// over a socket that is up, with nothing after it to correct the state.
+func TestADropDispatchedBeforeTheAnnouncementIsStillOvertaken(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.relearn(session.current())
+	clock := &drivenClock{}
+	session.wallClock = clock.read
+
+	start := time.Now()
+	clock.set(start)
+	dialedAndConnected(session)
+
+	// The socket drops; whatsmeow dispatches the event from a goroutine of its own and
+	// redials from another, and the replacement authenticates before that first goroutine
+	// gets its turn.
+	dropped := start.Add(70 * time.Second)
+	authenticated := start.Add(63 * time.Second)
+	session.current().LastSuccessfulConnect = authenticated
+
+	clock.set(start.Add(108 * time.Second))
+	session.handle(&waEvents.Connected{})
+	next(t, session)
+
+	// And only now the drop, carrying the instant it was dispatched at.
+	clock.set(dropped)
+	session.handle(&waEvents.Disconnected{})
+
+	if got := session.state(); got != "open" {
+		t.Fatalf("a drop the reconnect had overtaken was applied over a healthy socket, leaving "+
+			"the session %q with nothing after it to correct the state", got)
+	}
+}

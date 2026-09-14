@@ -291,18 +291,40 @@ type Session struct {
 	// somebody adds. `setConnected` and `offline` are the two functions that own the
 	// flag, and every one of those paths goes through one of them.
 	transitions atomic.Int64
-	// connectedAt is the earliest moment the socket this session is on could have come
-	// up, which is what tells a keepalive timeout about the current connection from one
-	// about a connection that is already gone. Written under mu beside `connected`, by
-	// every path that can tell the socket is a new one: the dials this process asks for,
-	// the reconnects it watches whatsmeow start, and a connection that announces itself
-	// while the session still believes it is on the previous one.
+	// connectedAt is when this session last learned that a connection existed. Written
+	// under mu beside `connected`, by every path that can tell the socket is a new one:
+	// the dials this process asks for, the reconnects it watches whatsmeow start, and a
+	// connection that announces itself while the session still believes it is on the
+	// previous one.
 	//
 	// Those three are all of them. whatsmeow dispatches `events.Connected` from exactly
 	// one place, once per authenticated socket, so a socket that reaches this session at
 	// all reaches it through the third even when the first two miss it -- which is what
 	// keeps this from being a list of library paths to keep up with.
+	//
+	// What reads it is `dropWasOvertaken`, and what it answers there is "did this session
+	// learn of a connection after the instant this drop was dispatched". That is a
+	// question about this session's own knowledge, which is why it is dated by this
+	// session's own clock and why it is not the stamp the keepalive rule reads.
 	connectedAt time.Time
+
+	// socketUpAt is the earliest moment the socket this session is on could have come up,
+	// which is what tells a keepalive timeout about the current connection from one about
+	// a connection that is already gone. Written under mu wherever `connectedAt` is, and
+	// the same instant on two of the three paths: a dial is dated at the attempt and
+	// whatsmeow's own redial at the start of the retry, and both are already earlier than
+	// any socket they can produce.
+	//
+	// The third is the one that needs a stamp of its own. A socket that replaced the
+	// previous one inside whatsmeow -- the 515 path -- reaches this session only as the
+	// announcement, and the announcement is not the socket: whatsmeow's keepalive loop
+	// starts right after the noise handshake and dates its first "last answered" from
+	// there, while `events.Connected` waits behind the prekey count, the prekey upload and
+	// the passive IQ, each bounded by the library's own 75s request timeout rather than by
+	// a handshake. Dating that socket from the announcement puts the stamp up to ~150s
+	// past the clock it is compared against, and every timeout about the socket that is up
+	// then reads as one about the socket that is gone (#181).
+	socketUpAt time.Time
 
 	// awaited holds the messages that arrived unreadable and have not been given up on
 	// yet, so the one that arrives afterwards under the same id can call the placeholder
@@ -885,6 +907,7 @@ func (s *Session) setDialing(dialing bool) {
 		// clock it is compared against, and every timeout on that socket would then read
 		// as one about an older connection.
 		s.connectedAt = at
+		s.socketUpAt = at
 	}
 	s.mu.Unlock()
 }
@@ -902,6 +925,16 @@ func (s *Session) setConnected(connected bool) int64 {
 // from when the session heard about it, and a stamp more than `keepAliveStaleAfter` past
 // the new keepalive loop makes every real timeout on that socket read as stale.
 func (s *Session) setConnectedAt(connected bool, at time.Time) int64 {
+	// Read before the lock, because reading it takes this very one, and read on every
+	// announcement because which arm below needs it is not known until the lock is held.
+	// It is a plain field on whatsmeow's client and `socketUp` is what decides whether the
+	// value is one to believe.
+	var authenticated time.Time
+	if connected {
+		if client := s.current(); client != nil {
+			authenticated = client.LastSuccessfulConnect
+		}
+	}
 	s.mu.Lock()
 	replaced := connected && s.connected
 	// Returned, and that is the whole reason this has a result. A caller that wrote a
@@ -940,6 +973,7 @@ func (s *Session) setConnectedAt(connected bool, at time.Time) int64 {
 			// and the next connection writes it on this very path, so reading it would trade
 			// the window for a race. That residue is issue #181.
 			s.connectedAt = at
+			s.socketUpAt = socketUp(authenticated, s.socketUpAt, at)
 		}
 		s.reconnecting = false
 		// A new socket is a new answer about every group. What was remembered outlives a
@@ -971,6 +1005,7 @@ func (s *Session) setReconnecting(reconnecting bool, at time.Time) {
 	s.reconnecting = reconnecting
 	if reconnecting {
 		s.connectedAt = at
+		s.socketUpAt = at
 	}
 	s.mu.Unlock()
 }
@@ -1022,10 +1057,10 @@ func (s *Session) lastKnownAlive() time.Time {
 	if !s.connected {
 		return time.Time{}
 	}
-	if s.keepAliveAnsweredAt.After(s.connectedAt) {
+	if s.keepAliveAnsweredAt.After(s.socketUpAt) {
 		return s.keepAliveAnsweredAt
 	}
-	return s.connectedAt
+	return s.socketUpAt
 }
 
 // now is this session's clock: the real one, or the one a test drives.
@@ -2306,9 +2341,15 @@ func (s *Session) dropWasAnnounced() bool {
 // being applied -- and each of them means this session learned of something after the
 // instant it records. So a drop older than that stamp is about a connection that is over
 // however the session is currently reporting itself, and adding `connected` or `!dialing`
-// here would only narrow the rule to the one case it was first noticed in: a second drop
-// starved behind the first would then re-date the connection backwards, and the keepalive
-// staleness rule reads that stamp.
+// here would only narrow the rule to the one case it was first noticed in.
+//
+// It is this session's knowledge that is dated here, never the socket, and that is why the
+// two stamps are separate. `socketUpAt` is allowed to sit before the announcement, because
+// the socket did come up before it; this one is not, because a drop cannot be overtaken by
+// a connection the session had not heard of yet. Moving this back to the authentication
+// would stop recognising every drop dispatched between the authentication and the
+// announcement -- the interval of #181, up to ~150s -- and leave it writing `reconnecting`
+// over the healthy socket that replaced it, which is the whole of what #188 closed.
 func (s *Session) dropWasOvertaken(at time.Time) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -56,3 +56,33 @@ func keepAliveIsStale(aliveAt time.Time, event *waEvents.KeepAliveTimeout) bool 
 	}
 	return aliveAt.After(event.LastSuccess.Add(keepAliveStaleAfter))
 }
+
+// socketUp is the instant to date a socket that replaced the previous one inside whatsmeow,
+// where nothing observable stands between the two and the announcement can trail the socket
+// by minutes.
+//
+// `authenticated` is `Client.LastSuccessfulConnect`, which whatsmeow writes synchronously in
+// `handleConnectSuccess` before it starts the goroutine that announces the connection. It is
+// one auth round trip after the keepalive loop this stamp is compared against started, which
+// the slack above covers, so believing it cuts the window from the whole announcing sequence
+// to nothing that matters.
+//
+// It is also an unsynchronised field: whatsmeow writes it from the read loop of whichever
+// connection is authenticating, and this reads it from the goroutine announcing the previous
+// one, which is reachable on this very path. So the value is not trusted, it is bounded, and
+// the two bounds are the two things a wrong value could be. Later than `heard` is a value
+// this connection cannot have produced, because the field is written before the announcement
+// is dispatched: that is either the next connection's or a torn read, and a stamp in the
+// future would poison every comparison until it passes. Not later than `replaced` is a value
+// from a connection that is already over, or the zero a client carries before it has ever
+// authenticated: dating a new socket from before the old one was dated would make the old
+// socket's own timeouts read as current and take the healthy replacement down for them.
+//
+// Anything outside those falls back to `heard`, which is where main already is: a window
+// that is too wide, never a stamp that is wrong.
+func socketUp(authenticated, replaced, heard time.Time) time.Time {
+	if authenticated.After(replaced) && !authenticated.After(heard) {
+		return authenticated
+	}
+	return heard
+}
