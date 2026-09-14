@@ -142,39 +142,6 @@ func (s *Scoped) AbandonGroupCreate(ctx context.Context, attempt string) error {
 	return nil
 }
 
-// GroupsClaimedByOtherAttempts is every group this session's other attempts have already
-// been told they made.
-//
-// Only ever used to rule a group out. An attempt still waiting to hear which group is its
-// own has to decide whether anything it sees could be that group, and one that another
-// attempt of this session has already been given by name certainly is not -- WhatsApp named
-// that one by its key, and a group answers to one key.
-//
-// Scoped to the session, like every read here: what another session's account made is not
-// in this account's groups to begin with.
-func (s *Scoped) GroupsClaimedByOtherAttempts(ctx context.Context, attempt string) (map[string]bool, error) {
-	const read = `
-		SELECT group_jid FROM wac_group_create
-		WHERE sid = ? AND attempt <> ? AND group_jid IS NOT NULL`
-	rows, err := s.container.db.QueryContext(ctx, s.container.rebind(read), s.sid, attempt)
-	if err != nil {
-		return nil, fmt.Errorf("store: read the groups %s already claimed: %w", s.sid, err)
-	}
-	defer func() { _ = rows.Close() }()
-	claimed := map[string]bool{}
-	for rows.Next() {
-		var jid string
-		if err := rows.Scan(&jid); err != nil {
-			return nil, fmt.Errorf("store: read a group %s already claimed: %w", s.sid, err)
-		}
-		claimed[jid] = true
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("store: read the groups %s already claimed: %w", s.sid, err)
-	}
-	return claimed, nil
-}
-
 // GroupCreation reads what is on record for one attempt.
 func (s *Scoped) GroupCreation(ctx context.Context, attempt string) (GroupCreation, bool, error) {
 	return s.container.groupCreation(ctx, s.sid, attempt)

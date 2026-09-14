@@ -3,6 +3,7 @@ package whatsmeow
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -191,10 +192,10 @@ func TestARedeliveredCreationWaitsForTheNotificationThatNamesItsGroup(t *testing
 	}
 }
 
-// A group by this name exists and WhatsApp has not said whose it is. Answering with it would
-// hand this request a conversation it did not make, and making another would be the duplicate
-// the issue is about, so neither happens: the command is refused and converges on the next
-// delivery, once the notification has landed.
+// An attempt is on record and WhatsApp has not said which group it made. Making another
+// would be the duplicate the issue is about, and there is nothing else to answer with, so
+// the command is refused -- saying which of the two it is, because the client reads that
+// text -- and converges on the next delivery once the notification lands.
 func TestARedeliveredCreationRefusesWhileWhatsAppHasNotNamedItsGroup(t *testing.T) {
 	t.Parallel()
 
@@ -208,26 +209,81 @@ func TestARedeliveredCreationRefusesWhileWhatsAppHasNotNamedItsGroup(t *testing.
 		t.Context(), "idem:once", "WACOPEN", "Obras", began); err != nil {
 		t.Fatalf("begin the attempt that crashed: %v", err)
 	}
-	ambiguous := aMadeGroup("120363041234567890", "Obras", self)
-	ambiguous.GroupCreated = began.Add(time.Second)
 
 	asked := 0
 	session.createTheGroup = func(context.Context, *wm.Client, keyedCreate) (*waTypes.GroupInfo, error) {
 		asked++
 		return aMadeGroup("120363099999999999", "Obras", self), nil
 	}
-	session.joinedGroups = func(context.Context, *wm.Client) ([]*waTypes.GroupInfo, error) {
-		return []*waTypes.GroupInfo{ambiguous}, nil
-	}
 
 	answer, err := session.Execute(t.Context(),
 		namedCreate("c1", "once", `{"subject":"Obras","participants":[]}`))
 	if err == nil {
-		t.Fatalf("the redelivery answered %s over a group WhatsApp had not said was its own",
+		t.Fatalf("the redelivery answered %s over a creation WhatsApp had said nothing about",
 			namedGroup(t, answer))
+	}
+	if !strings.Contains(err.Error(), "not settled yet") {
+		t.Fatalf("the refusal reads %q, want the one that says WhatsApp has not named the group yet", err)
 	}
 	if asked != 0 {
 		t.Fatal("a second group was made while which group belonged to this request was in doubt")
+	}
+}
+
+// A creation that may well have happened keeps its intent. WhatsApp answering nothing is
+// exactly the case where a group can exist with nobody having written down which one, so a
+// delivery that threw the record away here would have the next one make the second group.
+func TestACreationThatMayHaveHappenedKeepsItsIntent(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setConnected(true)
+	impatient(session)
+
+	asked := 0
+	session.createTheGroup = func(context.Context, *wm.Client, keyedCreate) (*waTypes.GroupInfo, error) {
+		asked++
+		// The socket went while the answer was outstanding: the stanza may have reached
+		// WhatsApp and the group may exist.
+		return nil, &wm.DisconnectedError{Action: "info query"}
+	}
+
+	payload := `{"subject":"Obras","participants":[]}`
+	if _, err := session.Execute(t.Context(), namedCreate("c1", "once", payload)); err == nil {
+		t.Fatal("a creation whose answer was lost was reported as having worked")
+	}
+	began, found, err := session.store.GroupCreation(t.Context(), "idem:once")
+	if err != nil {
+		t.Fatalf("read the attempt: %v", err)
+	}
+	if !found {
+		t.Fatal("the intent was thrown away over a failure that says nothing about whether a group was made")
+	}
+	if began.Done() {
+		t.Fatalf("the attempt names %s, and nothing named it", began.JID)
+	}
+	// And the next delivery is refused rather than making a second group.
+	if _, err := session.Execute(t.Context(), namedCreate("c2", "once", payload)); err == nil {
+		t.Fatal("the redelivery was answered while which group this request made was unknown")
+	}
+	if asked != 1 {
+		t.Fatalf("WhatsApp was asked for %d groups, want 1: the redelivery made a second one", asked)
+	}
+}
+
+// whatsmeow retries an IQ whose socket died, and answers `ErrNotConnected` when the
+// reconnection does not come -- after the first frame has gone out. This connector reads
+// that error as "nothing was sent" and forgets the intent, so with the retry on, a creation
+// WhatsApp had accepted would be made again by the next delivery.
+func TestTheCreateQueryTurnsOffTheLibrarysOwnRetry(t *testing.T) {
+	t.Parallel()
+
+	query := theCreateQuery("Obras", "WACKEY", nil)
+	if !query.NoRetry {
+		t.Fatal("the creation is sent with the library's retry on, which answers ErrNotConnected after sending")
+	}
+	if query.Namespace != "w:g2" || query.To != waTypes.GroupServerJID {
+		t.Fatalf("the creation goes to %s/%s, want the group server", query.Namespace, query.To)
 	}
 }
 
@@ -257,76 +313,6 @@ func TestACreationTravelsUnderTheKeyItWasFiledUnder(t *testing.T) {
 	if filed := theKeyOnRecord(t, session, "idem:once"); sent.Key != filed {
 		t.Fatalf("the creation went out under %s and was filed under %s, so the notification would name nothing",
 			sent.Key, filed)
-	}
-}
-
-// A redelivery that has to create after all sends the key its first delivery was filed
-// under. A fresh key would leave the intent findable under one name and the group announced
-// under another, which is the record failing at the one job it has.
-func TestARedeliveryThatCreatesUsesTheKeyOnRecord(t *testing.T) {
-	t.Parallel()
-
-	session, _ := newTestSession(t, "5511999990001")
-	session.setConnected(true)
-	self := waTypes.NewJID("5511999990001", waTypes.DefaultUserServer)
-
-	began := time.Now().Add(-time.Minute)
-	if _, _, err := session.store.BeginGroupCreate(
-		t.Context(), "idem:once", "WACFIRST", "Obras", began); err != nil {
-		t.Fatalf("begin the attempt that crashed: %v", err)
-	}
-
-	var sent keyedCreate
-	session.createTheGroup = func(_ context.Context, _ *wm.Client, req keyedCreate) (*waTypes.GroupInfo, error) {
-		sent = req
-		return aMadeGroup("120363041234567890", "Obras", self), nil
-	}
-	// Nothing by that name exists, so the attempt certainly made nothing and this one creates.
-	session.joinedGroups = func(context.Context, *wm.Client) ([]*waTypes.GroupInfo, error) {
-		return nil, nil
-	}
-
-	if _, err := session.Execute(t.Context(),
-		namedCreate("c1", "once", `{"subject":"Obras","participants":[]}`)); err != nil {
-		t.Fatalf("the redelivery: %v", err)
-	}
-	if sent.Key != "WACFIRST" {
-		t.Fatalf("the redelivery created under %s, want the key the first delivery was filed under, WACFIRST", sent.Key)
-	}
-}
-
-// Nothing by that name is on WhatsApp, so nothing was made, and the redelivery creates
-// without waiting for a notification that is never coming. Waiting here would refuse every
-// command whose instance died between writing its intent and sending anything.
-func TestARedeliveryWithNothingOnWhatsAppCreatesWithoutWaiting(t *testing.T) {
-	t.Parallel()
-
-	session, _ := newTestSession(t, "5511999990001")
-	session.setConnected(true)
-	// Long enough that a wait would show up as a test that takes seconds.
-	session.createWait = time.Minute
-	self := waTypes.NewJID("5511999990001", waTypes.DefaultUserServer)
-
-	if _, _, err := session.store.BeginGroupCreate(
-		t.Context(), "idem:once", "WACGONE", "Obras", time.Now().Add(-time.Minute)); err != nil {
-		t.Fatalf("begin the attempt that crashed: %v", err)
-	}
-
-	asked := 0
-	session.createTheGroup = func(context.Context, *wm.Client, keyedCreate) (*waTypes.GroupInfo, error) {
-		asked++
-		return aMadeGroup("120363041234567890", "Obras", self), nil
-	}
-	session.joinedGroups = func(context.Context, *wm.Client) ([]*waTypes.GroupInfo, error) {
-		return nil, nil
-	}
-
-	if _, err := session.Execute(t.Context(),
-		namedCreate("c1", "once", `{"subject":"Obras","participants":[]}`)); err != nil {
-		t.Fatalf("the redelivery: %v", err)
-	}
-	if asked != 1 {
-		t.Fatalf("WhatsApp was asked for %d groups, want 1: a request whose group was never made went unanswered", asked)
 	}
 }
 
@@ -366,291 +352,6 @@ func TestTwoCreationsAskedSeparatelyBothHappen(t *testing.T) {
 	}
 	if namedGroup(t, first) == namedGroup(t, second) {
 		t.Fatalf("both requests were answered with %s, want a group each", namedGroup(t, first))
-	}
-}
-
-// A group this account did not create was made by somebody else, so no attempt of this
-// session is waiting to be told about it. Treating it as one would hold up a creation that
-// never happened until the record is swept.
-func TestAGroupThisAccountDidNotMakeDoesNotHoldUpACreation(t *testing.T) {
-	t.Parallel()
-
-	session, _ := newTestSession(t, "5511999990001")
-	session.setConnected(true)
-	session.createWait = time.Minute
-	somebodyElse := waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)
-
-	began := time.Now().Add(-time.Minute)
-	if _, _, err := session.store.BeginGroupCreate(
-		t.Context(), "idem:once", "WACMINE", "Obras", began); err != nil {
-		t.Fatalf("begin the attempt that crashed: %v", err)
-	}
-	theirs := aMadeGroup("120363041234567890", "Obras", somebodyElse)
-	theirs.GroupCreated = began.Add(time.Second)
-
-	asked := 0
-	session.createTheGroup = func(context.Context, *wm.Client, keyedCreate) (*waTypes.GroupInfo, error) {
-		asked++
-		return aMadeGroup("120363099999999999", "Obras",
-			waTypes.NewJID("5511999990001", waTypes.DefaultUserServer)), nil
-	}
-	session.joinedGroups = func(context.Context, *wm.Client) ([]*waTypes.GroupInfo, error) {
-		return []*waTypes.GroupInfo{theirs}, nil
-	}
-
-	answer, err := session.Execute(t.Context(),
-		namedCreate("c1", "once", `{"subject":"Obras","participants":[]}`))
-	if err != nil {
-		t.Fatalf("the redelivery: %v", err)
-	}
-	if asked != 1 {
-		t.Fatal("somebody else's group held up a creation that had not happened")
-	}
-	if got := namedGroup(t, answer); got == theirs.JID.String() {
-		t.Fatalf("the redelivery answered with %s, a group this account did not make", got)
-	}
-}
-
-// An owner this build cannot read is not evidence that somebody else made the group. The
-// conservative reading is the one that does not make a second group.
-func TestAGroupWithNoReadableOwnerStillHoldsUpACreation(t *testing.T) {
-	t.Parallel()
-
-	session, _ := newTestSession(t, "5511999990001")
-	session.setConnected(true)
-	impatient(session)
-
-	began := time.Now().Add(-time.Minute)
-	if _, _, err := session.store.BeginGroupCreate(
-		t.Context(), "idem:once", "WACANON", "Obras", began); err != nil {
-		t.Fatalf("begin the attempt that crashed: %v", err)
-	}
-	anonymous := aMadeGroup("120363041234567890", "Obras", waTypes.EmptyJID)
-	anonymous.GroupCreated = began.Add(time.Second)
-
-	asked := 0
-	session.createTheGroup = func(context.Context, *wm.Client, keyedCreate) (*waTypes.GroupInfo, error) {
-		asked++
-		return aMadeGroup("120363099999999999", "Obras",
-			waTypes.NewJID("5511999990001", waTypes.DefaultUserServer)), nil
-	}
-	session.joinedGroups = func(context.Context, *wm.Client) ([]*waTypes.GroupInfo, error) {
-		return []*waTypes.GroupInfo{anonymous}, nil
-	}
-
-	if _, err := session.Execute(t.Context(),
-		namedCreate("c1", "once", `{"subject":"Obras","participants":[]}`)); err == nil {
-		t.Fatal("a group whose owner could not be read was taken as somebody else's, and a second group was made")
-	}
-	if asked != 0 {
-		t.Fatalf("WhatsApp was asked for %d groups, want 0", asked)
-	}
-}
-
-// A group made before the intent was written cannot be this attempt's: the intent goes down
-// first, so anything older than it belongs to something else. Without that bound, a request
-// for a group by a name the account already uses would never be carried out.
-func TestAGroupOlderThanTheIntentDoesNotHoldUpACreation(t *testing.T) {
-	t.Parallel()
-
-	session, _ := newTestSession(t, "5511999990001")
-	session.setConnected(true)
-	session.createWait = time.Minute
-	self := waTypes.NewJID("5511999990001", waTypes.DefaultUserServer)
-
-	began := time.Now()
-	if _, _, err := session.store.BeginGroupCreate(
-		t.Context(), "idem:once", "WACOLD", "Obras", began); err != nil {
-		t.Fatalf("begin the attempt that crashed: %v", err)
-	}
-	older := aMadeGroup("120363041234567890", "Obras", self)
-	older.GroupCreated = began.Add(-time.Hour)
-
-	asked := 0
-	session.createTheGroup = func(context.Context, *wm.Client, keyedCreate) (*waTypes.GroupInfo, error) {
-		asked++
-		return aMadeGroup("120363099999999999", "Obras", self), nil
-	}
-	session.joinedGroups = func(context.Context, *wm.Client) ([]*waTypes.GroupInfo, error) {
-		return []*waTypes.GroupInfo{older}, nil
-	}
-
-	answer, err := session.Execute(t.Context(),
-		namedCreate("c1", "once", `{"subject":"Obras","participants":[]}`))
-	if err != nil {
-		t.Fatalf("the redelivery: %v", err)
-	}
-	if asked != 1 {
-		t.Fatal("a group that predates the intent held up the creation the intent was for")
-	}
-	if got := namedGroup(t, answer); got == older.JID.String() {
-		t.Fatalf("the redelivery answered with %s, which existed before the attempt began", got)
-	}
-}
-
-// WhatsApp dates a group to the second, and the intent carries this process's clock. The
-// group a creation makes is stamped in the same second the intent was written, and often at
-// a lower millisecond -- which is what made this the commonest timing, not an edge. Read as
-// older than its own intent, that group would be passed over and made again.
-func TestAGroupStampedInTheSameSecondAsTheIntentStillHoldsUpACreation(t *testing.T) {
-	t.Parallel()
-
-	session, _ := newTestSession(t, "5511999990001")
-	session.setConnected(true)
-	impatient(session)
-	self := waTypes.NewJID("5511999990001", waTypes.DefaultUserServer)
-
-	began := time.Now().Add(-time.Minute)
-	if _, _, err := session.store.BeginGroupCreate(
-		t.Context(), "idem:once", "WACSAME", "Obras", began); err != nil {
-		t.Fatalf("begin the attempt that crashed: %v", err)
-	}
-	// The second the intent fell in, dated the way WhatsApp dates it.
-	made := aMadeGroup("120363041234567890", "Obras", self)
-	made.GroupCreated = time.Unix(began.Truncate(time.Second).Unix(), 0)
-	if !made.GroupCreated.Before(began) {
-		t.Fatal("the fixture does not put the group before the intent, so it proves nothing")
-	}
-
-	asked := 0
-	session.createTheGroup = func(context.Context, *wm.Client, keyedCreate) (*waTypes.GroupInfo, error) {
-		asked++
-		return aMadeGroup("120363099999999999", "Obras", self), nil
-	}
-	session.joinedGroups = func(context.Context, *wm.Client) ([]*waTypes.GroupInfo, error) {
-		return []*waTypes.GroupInfo{made}, nil
-	}
-
-	if _, err := session.Execute(t.Context(),
-		namedCreate("c1", "once", `{"subject":"Obras","participants":[]}`)); err == nil {
-		t.Fatal("the group was made a second time because its own stamp read as older than its intent")
-	}
-	if asked != 0 {
-		t.Fatalf("WhatsApp was asked for %d groups, want 0", asked)
-	}
-}
-
-// A group another attempt of this session has already been told is its own answers to that
-// attempt's key. Leaving it in the way would hold up a creation that never happened.
-func TestAGroupAnotherAttemptWasGivenDoesNotHoldUpACreation(t *testing.T) {
-	t.Parallel()
-
-	session, _ := newTestSession(t, "5511999990001")
-	session.setConnected(true)
-	session.createWait = time.Minute
-	self := waTypes.NewJID("5511999990001", waTypes.DefaultUserServer)
-
-	began := time.Now().Add(-time.Minute)
-	// This attempt wrote its intent and never created anything.
-	if _, _, err := session.store.BeginGroupCreate(
-		t.Context(), "idem:mine", "WACMINE", "Obras", began); err != nil {
-		t.Fatalf("begin the attempt that crashed: %v", err)
-	}
-	// Another request made a group by the same name afterwards, and WhatsApp named it.
-	theirs := aMadeGroup("120363041234567890", "Obras", self)
-	theirs.GroupCreated = began.Add(time.Second)
-	if _, _, err := session.store.BeginGroupCreate(
-		t.Context(), "idem:theirs", "WACTHEIRS", "Obras", began); err != nil {
-		t.Fatalf("begin the other attempt: %v", err)
-	}
-	if _, err := session.store.FinishGroupCreateByKey(
-		t.Context(), "WACTHEIRS", theirs.JID.String()); err != nil {
-		t.Fatalf("record the other attempt's group: %v", err)
-	}
-
-	asked := 0
-	session.createTheGroup = func(context.Context, *wm.Client, keyedCreate) (*waTypes.GroupInfo, error) {
-		asked++
-		return aMadeGroup("120363099999999999", "Obras", self), nil
-	}
-	session.joinedGroups = func(context.Context, *wm.Client) ([]*waTypes.GroupInfo, error) {
-		return []*waTypes.GroupInfo{theirs}, nil
-	}
-
-	answer, err := session.Execute(t.Context(),
-		namedCreate("c1", "mine", `{"subject":"Obras","participants":[]}`))
-	if err != nil {
-		t.Fatalf("the redelivery: %v", err)
-	}
-	if asked != 1 {
-		t.Fatal("a group another request had already been given held up this one's creation")
-	}
-	if got := namedGroup(t, answer); got == theirs.JID.String() {
-		t.Fatalf("the retry answered with %s, which belongs to another request", got)
-	}
-}
-
-// The subject is what the attempt was to call the group, and a group by another name is
-// another group however well its timing fits. An account that makes groups steadily would
-// otherwise have every creation held up by whatever it made last.
-func TestAGroupByAnotherNameDoesNotHoldUpACreation(t *testing.T) {
-	t.Parallel()
-
-	session, _ := newTestSession(t, "5511999990001")
-	session.setConnected(true)
-	session.createWait = time.Minute
-	self := waTypes.NewJID("5511999990001", waTypes.DefaultUserServer)
-
-	began := time.Now().Add(-time.Minute)
-	if _, _, err := session.store.BeginGroupCreate(
-		t.Context(), "idem:once", "WACNAME", "Obras", began); err != nil {
-		t.Fatalf("begin the attempt that crashed: %v", err)
-	}
-	// Made by this account, after the intent, and called something else entirely.
-	other := aMadeGroup("120363041234567890", "Churrasco", self)
-	other.GroupCreated = began.Add(time.Second)
-
-	asked := 0
-	session.createTheGroup = func(context.Context, *wm.Client, keyedCreate) (*waTypes.GroupInfo, error) {
-		asked++
-		return aMadeGroup("120363099999999999", "Obras", self), nil
-	}
-	session.joinedGroups = func(context.Context, *wm.Client) ([]*waTypes.GroupInfo, error) {
-		return []*waTypes.GroupInfo{other}, nil
-	}
-
-	answer, err := session.Execute(t.Context(),
-		namedCreate("c1", "once", `{"subject":"Obras","participants":[]}`))
-	if err != nil {
-		t.Fatalf("the redelivery: %v", err)
-	}
-	if asked != 1 {
-		t.Fatal("a group called something else held up the creation")
-	}
-	if got := namedGroup(t, answer); got == other.JID.String() {
-		t.Fatalf("the retry answered with %s, a group called something else", got)
-	}
-}
-
-// Whether a group exists is the question, so a reading that failed is not an answer.
-// Falling through to a creation here is the duplicate, made deliberately.
-func TestACreationThatCouldNotLookForTheGroupDoesNotMakeASecond(t *testing.T) {
-	t.Parallel()
-
-	session, _ := newTestSession(t, "5511999990001")
-	session.setConnected(true)
-
-	if _, _, err := session.store.BeginGroupCreate(
-		t.Context(), "idem:once", "WACBLIND", "Obras", time.Now().Add(-time.Minute)); err != nil {
-		t.Fatalf("begin the attempt that crashed: %v", err)
-	}
-
-	asked := 0
-	session.createTheGroup = func(context.Context, *wm.Client, keyedCreate) (*waTypes.GroupInfo, error) {
-		asked++
-		return aMadeGroup("120363099999999999", "Obras",
-			waTypes.NewJID("5511999990001", waTypes.DefaultUserServer)), nil
-	}
-	session.joinedGroups = func(context.Context, *wm.Client) ([]*waTypes.GroupInfo, error) {
-		return nil, wm.ErrIQDisconnected
-	}
-
-	if _, err := session.Execute(t.Context(),
-		namedCreate("c1", "once", `{"subject":"Obras","participants":[]}`)); err == nil {
-		t.Fatal("the creation went ahead over a reading that failed, which is how the duplicate gets made")
-	}
-	if asked != 0 {
-		t.Fatal("WhatsApp was asked for a group while whether it already existed was unknown")
 	}
 }
 
