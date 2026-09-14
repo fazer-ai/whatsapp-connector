@@ -509,8 +509,8 @@ func (s *Session) createGroup(ctx context.Context, command *protocol.Command) (j
 	// Named as soon as there is a name, and before the answer goes back. A failure here is
 	// logged rather than returned: the group exists, and reporting a failure would have the
 	// client retry a creation that happened -- the very duplicate this exists to prevent.
-	// What the record covers is the next delivery, and the reconciliation below covers what
-	// a lost record leaves.
+	// It is also not the only chance to write it down: WhatsApp's own notification about
+	// this group carries the key, and `joinedAGroup` records the pair when it arrives.
 	if err := s.store.FinishGroupCreate(ctx, attempt, made.JID.String()); err != nil {
 		s.log.Error().Err(err).Str("sid", s.sid).Str("attempt", attempt).
 			Msg("made a group and could not record which one; a redelivery will have to look for it")
