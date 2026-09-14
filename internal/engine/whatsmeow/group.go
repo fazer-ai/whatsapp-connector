@@ -717,11 +717,21 @@ func (s *Session) notSettledYet(attempt string, began store.GroupCreation) error
 }
 
 // How long a redelivered creation waits for WhatsApp to name the group it made, and how
-// often it looks. The wait is bounded by the caller's own deadline as well, and it holds
-// the session's goroutine, so it is short: what it covers is the notification and the
-// command arriving in the wrong order, not an outage.
+// often it looks. The wait is bounded by the caller's own deadline as well.
+//
+// Sized for the case the mechanism rests on rather than for a local race. What it waits for
+// is a notification WhatsApp held because nobody acknowledged it, and that one arrives with
+// the rest of what the socket missed while it was down: after the reconnection, alongside
+// the redelivered command itself, in an order nothing here guarantees. A window sized for
+// two local deliveries crossing would expire in the middle of that sync and refuse a
+// command whose answer was seconds away.
+//
+// What it costs is the session's goroutine, and the ceiling to measure that against is this
+// command's own: whatsmeow gives a creation IQ 75 seconds before giving up, so a
+// `group.create` can already hold that goroutine for longer than this. It is also only ever
+// paid by a redelivery of a creation nothing has settled, which is the rare path.
 const (
-	createNoticeWait = 3 * time.Second
+	createNoticeWait = 30 * time.Second
 	createNoticePoll = 50 * time.Millisecond
 )
 
