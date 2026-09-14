@@ -100,6 +100,17 @@ type Session struct {
 	// published. A field for the same reason as storeLimit, and for no other.
 	deliverWait time.Duration
 
+	// createWait bounds how long a redelivered `group.create` waits for WhatsApp to say
+	// which group it made. A field for the same reason as the two above it.
+	createWait time.Duration
+
+	// lookingForNotice is called each time that wait looks, and is nil everywhere but in a
+	// test. What it exists for is the one thing a test cannot otherwise establish: that the
+	// command is inside the wait at the moment the notification is delivered to it. A sleep
+	// long enough to be likely is not the same statement, and this package's tests do not
+	// synchronise on the clock.
+	lookingForNotice func()
+
 	// stalledUntil is when a receipt is worth handing to the publisher again, in
 	// monotonic nanoseconds, and zero while it is.
 	//
@@ -143,7 +154,7 @@ type Session struct {
 	// createTheGroup makes one. A seam like the queries above it: one IQ, and a test can
 	// otherwise reach the payload this connector refuses and nothing of what it makes of
 	// an answer.
-	createTheGroup func(context.Context, *wm.Client, wm.ReqCreateGroup) (*waTypes.GroupInfo, error)
+	createTheGroup func(context.Context, *wm.Client, keyedCreate) (*waTypes.GroupInfo, error)
 
 	onWhatsApp func(context.Context, *wm.Client, []string) ([]waTypes.IsOnWhatsAppResponse, error)
 	//nolint:lll // one line per seam reads better than a wrapped signature
@@ -621,16 +632,12 @@ func newSession(
 		download: func(ctx context.Context, client *wm.Client, part wm.DownloadableMessage, file media.File) error {
 			return client.DownloadToFile(ctx, part, file) //nolint:wrapcheck // classified by downloadFailure, which needs the sentinels
 		},
-		retrieve:     retrieveOverHTTP,
-		uploadFile:   uploadOverClient,
-		sendAppState: sendAppStateOverClient,
-		groupInfo:    groupInfoOverClient,
-		joinedGroups: joinedGroupsOverClient,
-		createTheGroup: func(
-			ctx context.Context, client *wm.Client, req wm.ReqCreateGroup,
-		) (*waTypes.GroupInfo, error) {
-			return client.CreateGroup(ctx, req) //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
-		},
+		retrieve:       retrieveOverHTTP,
+		uploadFile:     uploadOverClient,
+		sendAppState:   sendAppStateOverClient,
+		groupInfo:      groupInfoOverClient,
+		joinedGroups:   joinedGroupsOverClient,
+		createTheGroup: createKeyedGroupOverClient,
 		onWhatsApp: func(ctx context.Context, client *wm.Client, phones []string) ([]waTypes.IsOnWhatsAppResponse, error) {
 			return client.IsOnWhatsApp(ctx, phones) //nolint:wrapcheck // wrapped by its caller
 		},
@@ -695,6 +702,7 @@ func newSession(
 
 		storeLimit:  bindTimeout,
 		deliverWait: deliverTimeout,
+		createWait:  createNoticeWait,
 		handoffWait: perishableHandoff,
 		awaited:     make(map[string]*awaiting),
 
@@ -4162,7 +4170,11 @@ func (s *Session) handle(rawEvent any) bool {
 			s.reverify(event.NewBusinessName)
 		}
 	case *waEvents.JoinedGroup:
-		s.joinedAGroup(event)
+		// One of the two group handlers that can withhold an acknowledgement, and for the
+		// same reason as the message path does: this notification is the only place
+		// WhatsApp says which group a `group.create` made, and one that is acknowledged
+		// without being written down is gone for good.
+		return s.joinedAGroup(event)
 	case *waEvents.GroupInfo:
 		s.groupChanged(event)
 	case *waEvents.PairError:
