@@ -1226,7 +1226,10 @@ func (s *Session) recordOwnName(ctx context.Context, pushName string) {
 	if s.names().push != pushName {
 		return
 	}
-	if !s.fileOwnName(ctx, client.Store.Contacts.PutPushName, pushName, "push name") {
+	filing, stop := mostOf(ctx)
+	filed := s.fileOwnName(filing, client.Store.Contacts.PutPushName, pushName, "push name")
+	stop()
+	if !filed {
 		// Written down as well as remembered. The marker below is what keeps the answer
 		// right while the row is behind, and it is knowledge this event produced: a
 		// process that did not see the event cannot rebuild it, and would answer from the
@@ -1237,12 +1240,12 @@ func (s *Session) recordOwnName(ctx context.Context, pushName string) {
 	s.mu.Lock()
 	// Only while the name is still the one that was written: a rename that landed during
 	// this has a write of its own behind it.
-	filed := s.pushName == pushName
-	if filed {
+	current := s.pushName == pushName
+	if current {
 		s.pushUnfiled = false
 	}
 	s.mu.Unlock()
-	if filed {
+	if current {
 		s.forgetUnfiled(ctx, store.UnfiledPushName)
 	}
 }
@@ -1259,19 +1262,41 @@ func (s *Session) recordOwnVerifiedName(ctx context.Context, businessName string
 	if s.names().verified != businessName {
 		return
 	}
-	if !s.fileOwnName(ctx, client.Store.Contacts.PutBusinessName, businessName, "verified name") {
+	filing, stop := mostOf(ctx)
+	wrote := s.fileOwnName(filing, client.Store.Contacts.PutBusinessName, businessName, "verified name")
+	stop()
+	if !wrote {
 		s.keepUnfiled(ctx, store.UnfiledVerifiedName, businessName)
 		return
 	}
 	s.mu.Lock()
-	filed := s.businessName == businessName
-	if filed {
+	current := s.businessName == businessName
+	if current {
 		s.verifiedUnfiled = false
 	}
 	s.mu.Unlock()
-	if filed {
+	if current {
 		s.forgetUnfiled(ctx, store.UnfiledVerifiedName)
 	}
+}
+
+// mostOf is a budget for one step, leaving the rest of what it was given for what has to
+// happen after it.
+//
+// The step here is the filing and what comes after it is writing the failure down, and a
+// deadline that ran out is one of the ways the filing fails: handing that same exhausted
+// deadline to the record would lose exactly the failure this is for, on a store that may
+// well answer the next statement.
+func mostOf(ctx context.Context) (context.Context, context.CancelFunc) {
+	deadline, set := ctx.Deadline()
+	if !set {
+		return context.WithCancel(ctx)
+	}
+	left := time.Until(deadline)
+	if left <= 0 {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, left*2/3)
 }
 
 // keepUnfiled writes down a name the contact table would not take, together with what the

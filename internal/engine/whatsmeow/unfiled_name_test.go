@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/rs/zerolog"
 	wm "go.mau.fi/whatsmeow"
@@ -812,5 +813,96 @@ func TestARestartFilesTheVerifiedNameTheLastProcessCouldNot(t *testing.T) {
 	}
 	if names := restarted.names(); names.verifiedUnfiled {
 		t.Error("the session still says its verified name is unfiled after the write landed")
+	}
+}
+
+// A deadline that ran out is one of the ways the filing fails, and it is the one a loaded
+// store produces: this connector gives the filing its own budget while whatsmeow saves the
+// device record under a deadline of its own. Recording it on the deadline that ran out
+// would lose exactly the failure the record is for.
+func TestANameTheWriteRanOutOfTimeForIsStillWrittenDown(t *testing.T) {
+	t.Parallel()
+
+	live := aStoreThatOutlivesItsProcess(t)
+	session, client := live.session(t, "sid-o", ownPhone, ownLID)
+	theTableSays(t, client, "Antigo")
+	theRecordSays(t, client, "Atendimento")
+	// Short enough that the test does not wait on the real one, which is five seconds.
+	session.storeLimit = 150 * time.Millisecond
+	client.Store.Contacts = stalledContacts{ContactStore: client.Store.Contacts}
+	session.handle(&waEvents.PushNameSetting{
+		Action: &waSyncAction.PushNameSetting{Name: proto.String("Atendimento")},
+	})
+
+	kept, found, err := live.open.For("sid-o").UnfiledName(t.Context(), store.UnfiledPushName)
+	if err != nil {
+		t.Fatalf("UnfiledName: %v", err)
+	}
+	if !found {
+		t.Fatal("nothing was written down about a name whose write ran out of time")
+	}
+	if kept.Name != "Atendimento" {
+		t.Errorf("what was kept reads %+v, want the name the write ran out of time for", kept)
+	}
+
+	restarted, _ := live.restart(t, session, "sid-o", ownPhone, ownLID)
+	if party := resolvedBy(t, restarted, ownPhone); party["push_name"] != "Atendimento" {
+		t.Errorf("after the restart the account is called %v, want the name it renamed itself to", party)
+	}
+}
+
+// stalledContacts is a table that answers reads and never finishes a write, which is what
+// one under load looks like from here: the deadline decides, not the store.
+type stalledContacts struct {
+	waStore.ContactStore
+}
+
+func (stalledContacts) PutPushName(ctx context.Context, _ waTypes.JID, _ string) (changed bool, previous string, err error) {
+	<-ctx.Done()
+	return false, "", ctx.Err()
+}
+
+func (stalledContacts) PutBusinessName(ctx context.Context, _ waTypes.JID, _ string) (changed bool, previous string, err error) {
+	<-ctx.Done()
+	return false, "", ctx.Err()
+}
+
+// Two rows must not be able to spell what one row spells. Without a length beside each
+// value, a name moving from one row to the other leaves the same string behind, the
+// comparison sees nothing move, and a kept name is replayed over a newer one.
+func TestTwoRowsCannotSpellWhatOneRowSpells(t *testing.T) {
+	t.Parallel()
+
+	live := aStoreThatOutlivesItsProcess(t)
+	session, client := live.session(t, "sid-p", ownPhone, ownLID)
+	phoneJID := waTypes.NewJID(ownPhone, waTypes.DefaultUserServer)
+	lidJID := waTypes.NewJID(ownLID, waTypes.HiddenUserServer)
+	client.Store.LID = lidJID
+	session.handle(&waEvents.Connected{})
+	drain(t, session)
+	table := client.Store.Contacts
+	// The whole of it on the phone row, nothing on the LID row.
+	if _, _, err := table.PutPushName(t.Context(), phoneJID, "AnaBia"); err != nil {
+		t.Fatalf("PutPushName: %v", err)
+	}
+	theRecordSays(t, client, "Atendimento")
+	client.Store.Contacts = shutContacts{ContactStore: table}
+	session.handle(&waEvents.PushNameSetting{
+		Action: &waSyncAction.PushNameSetting{Name: proto.String("Atendimento")},
+	})
+
+	// And then the same letters, split across the two rows. Concatenated with nothing
+	// between them the two states are the same string; they are not the same state, and
+	// the second one is newer.
+	if _, _, err := table.PutPushName(t.Context(), phoneJID, "Ana"); err != nil {
+		t.Fatalf("PutPushName: %v", err)
+	}
+	if _, _, err := table.PutPushName(t.Context(), lidJID, "Bia"); err != nil {
+		t.Fatalf("PutPushName: %v", err)
+	}
+
+	restarted, _ := live.restart(t, session, "sid-p", ownPhone, ownLID)
+	if party := resolvedBy(t, restarted, ownPhone); party["push_name"] != "Ana" {
+		t.Errorf("after the restart the account is called %v, want the name the rows moved on to", party)
 	}
 }
