@@ -56,3 +56,32 @@ func keepAliveIsStale(aliveAt time.Time, event *waEvents.KeepAliveTimeout) bool 
 	}
 	return aliveAt.After(event.LastSuccess.Add(keepAliveStaleAfter))
 }
+
+// socketUp is the instant to date a socket that replaced the previous one inside whatsmeow,
+// where nothing observable stands between the two and the announcement can trail the socket
+// by minutes.
+//
+// `authenticated` is when the library said it authenticated a socket, taken from its own log
+// on its own goroutine (`authenticatedLine`). It is one auth round trip after the keepalive
+// loop this stamp is compared against started, which the slack above covers, so believing it
+// cuts the window from the whole announcing sequence to nothing that matters.
+//
+// Believing it is still not the same as trusting it, because nothing ties that line to the
+// connection being announced here: a second connection authenticating while this arm runs
+// logs its own. So the value is bounded, and the two bounds are the two things a wrong one
+// could be. Later than `heard` is a value this connection cannot have produced, because the
+// library logs the line before it dispatches the announcement: that is a later connection's,
+// and a stamp in the future would poison every comparison until the clock passes it. Not
+// later than `replaced` is a value from a connection that is already over, or the zero a
+// session carries before the library has authenticated anything: dating a new socket from
+// before the old one was dated would make the old socket's own timeouts read as current and
+// take the healthy replacement down for them.
+//
+// Anything outside those falls back to `heard`, which is where main already is: a window
+// that is too wide, never a stamp that is wrong.
+func socketUp(authenticated, replaced, heard time.Time) time.Time {
+	if authenticated.After(replaced) && !authenticated.After(heard) {
+		return authenticated
+	}
+	return heard
+}
