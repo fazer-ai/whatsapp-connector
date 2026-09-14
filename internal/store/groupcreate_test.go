@@ -272,3 +272,38 @@ func TestAnAttemptThatNamedAGroupIsNotAbandoned(t *testing.T) {
 		t.Fatalf("the answer a redelivery is owed was thrown away: %+v", found)
 	}
 }
+
+// A command still being delivered keeps its record, however old the intent is. Retention
+// counts from the last delivery and not from the first: a creation retried for longer than
+// the window would otherwise have its record swept out from under it, and the delivery after
+// that would make the second group.
+func TestARetriedCreationKeepsItsRecordPastTheRetention(t *testing.T) {
+	t.Parallel()
+	container := open(t)
+	ctx := t.Context()
+	scoped := container.For("sid-1")
+
+	long := time.Now().Add(-72 * time.Hour)
+	if _, _, err := scoped.BeginGroupCreate(ctx, "idem:k", "WACFIRST", "Obras", long); err != nil {
+		t.Fatalf("the first delivery: %v", err)
+	}
+	// Delivered again just now, which is the client still waiting for an answer.
+	again, found, err := scoped.BeginGroupCreate(ctx, "idem:k", "WACSECOND", "Obras", time.Now())
+	if err != nil {
+		t.Fatalf("the retry: %v", err)
+	}
+	if !found || again.Key != "WACFIRST" {
+		t.Fatalf("the retry read %+v, want the first delivery's record", again)
+	}
+
+	if swept, err := container.SweepGroupCreations(ctx, time.Now().Add(-48*time.Hour)); err != nil {
+		t.Fatalf("sweep: %v", err)
+	} else if swept != 0 {
+		t.Fatalf("the sweep took %d rows, want none: the command is still being delivered", swept)
+	}
+	if _, onRecord, err := scoped.GroupCreation(ctx, "idem:k"); err != nil {
+		t.Fatalf("read it back: %v", err)
+	} else if !onRecord {
+		t.Fatal("the record of a command still being delivered was swept, so the next delivery makes a second group")
+	}
+}

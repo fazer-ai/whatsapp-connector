@@ -56,24 +56,28 @@ func (s *Scoped) BeginGroupCreate(
 	// One statement, and that is what makes it safe: writing the intent and reading back
 	// whatever was already there as two statements leaves a gap the sweep can delete the
 	// row in, and the read would then answer "nothing is on record" about an attempt that
-	// had one -- sending the caller off to create under a key nothing is filed against. The
-	// conflict updates `touched_at` to itself, which changes nothing and is only there
-	// because a conflict has to do something to return a row. Qualified by the table name
-	// because PostgreSQL reads a bare column on the right of a `DO UPDATE SET` as ambiguous
-	// between the existing row and the one being inserted, and refuses the statement.
+	// had one -- sending the caller off to create under a key nothing is filed against.
+	//
+	// What the conflict updates is only `touched_at`, and only forward. The key, the
+	// subject and the instant are the first delivery's and stay its own; the clock is
+	// pushed out because being asked about is what says the command is still being
+	// delivered, which is the same reasoning `redisx.Idempotency.Recall` applies to the
+	// ledger entry this record stands behind. Without it the two clocks run independently:
+	// a command retried for longer than the retention outlives the only record that can
+	// say which group it already made.
 	const claim = `
 		INSERT INTO wac_group_create (sid, attempt, create_key, subject, started_at, touched_at)
 		VALUES (?, ?, ?, ?, ?, ?)
-		ON CONFLICT (sid, attempt) DO UPDATE SET touched_at = wac_group_create.touched_at
+		ON CONFLICT (sid, attempt) DO UPDATE SET touched_at = ?
 		RETURNING create_key, subject, started_at, group_jid`
-	began := now.UnixMilli()
+	began, asked := now.UnixMilli(), time.Now().UnixMilli()
 	var (
 		found   GroupCreation
 		started int64
 		jid     sql.NullString
 	)
 	if err := s.container.db.QueryRowContext(ctx, s.container.rebind(claim),
-		s.sid, attempt, key, subject, began, began).
+		s.sid, attempt, key, subject, began, began, asked).
 		Scan(&found.Key, &found.Subject, &started, &jid); err != nil {
 		return GroupCreation{}, false, fmt.Errorf("store: begin the group creation %s of %s: %w", attempt, s.sid, err)
 	}
