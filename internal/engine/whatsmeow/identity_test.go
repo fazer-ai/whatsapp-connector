@@ -68,7 +68,7 @@ func TestAResolveAnswersTheAccountsOwnNames(t *testing.T) {
 	client.Store.BusinessName = "Loja do Bruno"
 	// Adopted again so the session copies the record out, the way it does for the client
 	// it is built with.
-	if !session.adopt(client) {
+	if !session.adopt(t.Context(), client) {
 		t.Fatal("the session would not take its own client back")
 	}
 
@@ -215,7 +215,7 @@ func TestAResolvePrefersTheNewerVerifiedName(t *testing.T) {
 	client := session.current()
 	// The device record as a restart finds it: what the pairing wrote.
 	client.Store.BusinessName = "Loja do Bruno"
-	if !session.adopt(client) {
+	if !session.adopt(t.Context(), client) {
 		t.Fatal("the session would not take its own client back")
 	}
 	// The table as the rename left it.
@@ -348,7 +348,7 @@ func TestAResolveTakesTheTableWhenTheSessionOnlyHasTheRecord(t *testing.T) {
 		t.Fatalf("PutPushName: %v", err)
 	}
 	// A restart: the session copies the record and has heard no event.
-	if !session.adopt(client) {
+	if !session.adopt(t.Context(), client) {
 		t.Fatal("the session would not take its own client back")
 	}
 
@@ -433,7 +433,7 @@ func TestARenameDoesNotFileANameTheSessionHasLeft(t *testing.T) {
 	})
 
 	// The older handler, resuming with the name the account has already left.
-	session.recordOwnName("Antigo")
+	session.recordOwnName(t.Context(), "Antigo")
 
 	contact, err := session.current().Store.Contacts.GetContact(t.Context(), own)
 	if err != nil {
@@ -562,7 +562,7 @@ func TestAReconnectKeepsARenameTheTableDidNotTake(t *testing.T) {
 	session.handle(&waEvents.PushNameSetting{
 		Action: &waSyncAction.PushNameSetting{Name: proto.String("Atendimento")},
 	})
-	if !session.adopt(client) {
+	if !session.adopt(t.Context(), client) {
 		t.Fatal("the session would not take its own client back")
 	}
 
