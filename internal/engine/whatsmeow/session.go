@@ -1286,14 +1286,14 @@ func (s *Session) keepUnfiled(ctx context.Context, kind, name string) {
 	if client == nil || client.Store == nil || client.Store.Contacts == nil {
 		return
 	}
-	stale, read := s.ownRow(ctx, client, kind)
+	held, read := s.ownRows(ctx, client, kind)
 	if !read {
 		// Without what the row is holding there is nothing to compare against on the way
 		// back, and a copy that answers unconditionally is the one that outlives its own
 		// truth. The session's own memory still covers this process.
 		return
 	}
-	if err := s.store.PutUnfiledName(ctx, kind, name, stale); err != nil {
+	if err := s.store.PutUnfiledName(ctx, kind, name, held); err != nil {
 		s.log.Debug().Err(err).Str("name", kind).
 			Msg("could not record one of the account's own names as unfiled")
 	}
@@ -1331,7 +1331,7 @@ func (s *Session) takeUnfiledNames(ctx context.Context) {
 	reading, done := context.WithTimeout(ctx, s.storeLimit)
 	defer done()
 	for _, kind := range []string{store.UnfiledPushName, store.UnfiledVerifiedName} {
-		held, found, err := s.store.UnfiledName(reading, kind)
+		kept, found, err := s.store.UnfiledName(reading, kind)
 		if err != nil {
 			s.log.Debug().Err(err).Str("name", kind).
 				Msg("could not read one of the account's own names left unfiled")
@@ -1340,11 +1340,11 @@ func (s *Session) takeUnfiledNames(ctx context.Context) {
 		if !found {
 			continue
 		}
-		row, read := s.ownRow(reading, client, kind)
+		rows, read := s.ownRows(reading, client, kind)
 		if !read {
 			continue
 		}
-		if row != held.Stale {
+		if rows != kept.Held {
 			// Something wrote the row after this was filed, so the row is the newer of the
 			// two and what was kept here has nothing left to say. That is the ordinary
 			// ending as well as the safe one: the write that landed after a failed one is
@@ -1354,9 +1354,9 @@ func (s *Session) takeUnfiledNames(ctx context.Context) {
 		}
 		s.mu.Lock()
 		if kind == store.UnfiledPushName {
-			s.pushName, s.pushUnfiled = held.Name, true
+			s.pushName, s.pushUnfiled = kept.Name, true
 		} else {
-			s.businessName, s.verifiedUnfiled = held.Name, true
+			s.businessName, s.verifiedUnfiled = kept.Name, true
 		}
 		s.mu.Unlock()
 	}
@@ -1373,20 +1373,23 @@ func (s *Session) takeUnfiledNames(ctx context.Context) {
 	}
 }
 
-// ownRow is the name the contact table would answer this account with, which is what has
-// to be compared against rather than any one row.
+// ownRows is what the contact table holds for this account's own name of one kind, under
+// every address it answers under, as a single value.
 //
-// The same order `nameFromStore` reads in, and for the same reason: a read takes the phone
-// row and falls back to the LID row for what that one does not hold, so an account whose
-// phone row carries no name is answered from its LID row. Comparing only the phone row
-// would then see nothing move while the row that is actually answering moved, and replay a
-// name over one that had arrived after it.
-func (s *Session) ownRow(ctx context.Context, client *wm.Client, kind string) (string, bool) {
+// Every row, and not just the one a read would answer from. What has to be settled on the
+// way back is whether anything wrote a name here after the failure, and the retry that
+// follows writes under every address -- so a name that arrived on the row a read does not
+// prefer is still one this would overwrite. Comparing only the answer would let that one
+// be replayed over and lost.
+func (s *Session) ownRows(ctx context.Context, client *wm.Client, kind string) (string, bool) {
 	phone, lid := s.identity()
+	var held strings.Builder
 	for _, address := range []protocol.Address{
 		{Kind: protocol.AddressPhone, ID: phone},
 		{Kind: protocol.AddressLID, ID: lid},
 	} {
+		// A separator no name can contain, so two rows cannot spell the same value as one.
+		held.WriteByte(0)
 		if address.ID == "" {
 			continue
 		}
@@ -1400,17 +1403,13 @@ func (s *Session) ownRow(ctx context.Context, client *wm.Client, kind string) (s
 				Msg("could not read a row one of the account's own names belongs in")
 			return "", false
 		}
-		held := contact.PushName
 		if kind == store.UnfiledVerifiedName {
-			held = contact.BusinessName
-		}
-		if held != "" {
-			return held, true
+			held.WriteString(contact.BusinessName)
+		} else {
+			held.WriteString(contact.PushName)
 		}
 	}
-	// Every row read, none of them holding one. That is a value like any other: it says the
-	// table has nothing to answer with, and a row that gains a name has moved.
-	return "", true
+	return held.String(), true
 }
 
 // fileOwnName writes one of the account's own display names under every address the

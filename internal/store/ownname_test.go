@@ -19,15 +19,15 @@ func TestAnUnfiledNameKeepsWhatTheRowWasHolding(t *testing.T) {
 	if err := scoped.PutUnfiledName(ctx, store.UnfiledPushName, "Atendimento", "Antigo"); err != nil {
 		t.Fatalf("PutUnfiledName: %v", err)
 	}
-	held, found, err := scoped.UnfiledName(ctx, store.UnfiledPushName)
+	kept, found, err := scoped.UnfiledName(ctx, store.UnfiledPushName)
 	if err != nil {
 		t.Fatalf("UnfiledName: %v", err)
 	}
 	if !found {
 		t.Fatal("nothing was kept for a name that was written down")
 	}
-	if held.Name != "Atendimento" || held.Stale != "Antigo" {
-		t.Errorf("what was kept reads %+v, want the new name beside the one the row held", held)
+	if kept.Name != "Atendimento" || kept.Held != "Antigo" {
+		t.Errorf("what was kept reads %+v, want the new name beside what the rows held", kept)
 	}
 }
 
@@ -55,12 +55,12 @@ func TestTheTwoKindsOfNameAreKeptApart(t *testing.T) {
 	} else if found {
 		t.Error("the push name is still kept after being dropped")
 	}
-	held, found, err := scoped.UnfiledName(ctx, store.UnfiledVerifiedName)
+	kept, found, err := scoped.UnfiledName(ctx, store.UnfiledVerifiedName)
 	if err != nil {
 		t.Fatalf("UnfiledName: %v", err)
 	}
-	if !found || held.Name != "Loja LTDA" {
-		t.Errorf("the verified name reads %+v (kept %v), want the one nothing dropped", held, found)
+	if !found || kept.Name != "Loja LTDA" {
+		t.Errorf("the verified name reads %+v (kept %v), want the one nothing dropped", kept, found)
 	}
 }
 
@@ -80,12 +80,12 @@ func TestAKeptNameIsReplacedByTheNextOne(t *testing.T) {
 		t.Fatalf("PutUnfiledName: %v", err)
 	}
 
-	held, _, err := scoped.UnfiledName(ctx, store.UnfiledPushName)
+	kept, _, err := scoped.UnfiledName(ctx, store.UnfiledPushName)
 	if err != nil {
 		t.Fatalf("UnfiledName: %v", err)
 	}
-	if held.Name != "Recepcao" || held.Stale != "Atendimento" {
-		t.Errorf("what was kept reads %+v, want the latest failure", held)
+	if kept.Name != "Recepcao" || kept.Held != "Atendimento" {
+		t.Errorf("what was kept reads %+v, want the latest failure", kept)
 	}
 }
 
@@ -169,5 +169,54 @@ func TestAnEmptyNameIsNotKept(t *testing.T) {
 		t.Fatalf("UnfiledName: %v", err)
 	} else if found {
 		t.Error("a record with no name in it is on file")
+	}
+}
+
+// A name kept here is one account's own, held against rows filed under that account's
+// addresses. Pairing the same session id to another account updates the bond rather than
+// deleting it, so the cascade does not fire: without clearing it by hand, a name would wait
+// on the new pairing for a row whose value could match by being empty.
+func TestRepairingASessionDropsTheNameTheLastAccountKept(t *testing.T) {
+	t.Parallel()
+	container := open(t)
+	ctx := t.Context()
+	pair(t, container, "sid-1", "5511999990001")
+	scoped := container.For("sid-1")
+
+	if err := scoped.PutUnfiledName(ctx, store.UnfiledPushName, "Atendimento", "Antigo"); err != nil {
+		t.Fatalf("PutUnfiledName: %v", err)
+	}
+	// The same session, another account.
+	pair(t, container, "sid-1", "5511999990002")
+
+	if _, found, err := container.For("sid-1").UnfiledName(ctx, store.UnfiledPushName); err != nil {
+		t.Fatalf("UnfiledName: %v", err)
+	} else if found {
+		t.Error("a name kept for one account is still kept after the session paired another")
+	}
+}
+
+// And the other way: pairing the same account again is the same account, so what it was
+// holding is still about the rows it is still filed under.
+func TestPairingTheSameAccountAgainKeepsItsName(t *testing.T) {
+	t.Parallel()
+	container := open(t)
+	ctx := t.Context()
+	jid := pair(t, container, "sid-1", "5511999990001")
+	scoped := container.For("sid-1")
+
+	if err := scoped.PutUnfiledName(ctx, store.UnfiledPushName, "Atendimento", "Antigo"); err != nil {
+		t.Fatalf("PutUnfiledName: %v", err)
+	}
+	if err := container.For("sid-1").Bind(ctx, jid); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	kept, found, err := container.For("sid-1").UnfiledName(ctx, store.UnfiledPushName)
+	if err != nil {
+		t.Fatalf("UnfiledName: %v", err)
+	}
+	if !found || kept.Name != "Atendimento" {
+		t.Errorf("the name reads %+v (kept %v), want the one the same pairing was still holding", kept, found)
 	}
 }

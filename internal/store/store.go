@@ -293,6 +293,16 @@ func (c *Container) bind(ctx context.Context, sid string, jid types.JID) error {
 		sid, sid, jid.String()); err != nil {
 		return fmt.Errorf("store: bind %s: %w", sid, err)
 	}
+	// And the names, for the same reason and with the same shape. A name kept here is one
+	// account's own, held against rows filed under that account's addresses; carried into a
+	// pairing with different addresses it is a name nothing here has any claim to, waiting
+	// for rows whose value could match by being empty.
+	if _, err := tx.ExecContext(ctx, c.rebind(`
+		DELETE FROM wac_own_name WHERE sid = ? AND EXISTS (
+			SELECT 1 FROM wac_session_device WHERE sid = ? AND jid <> ?)`),
+		sid, sid, jid.String()); err != nil {
+		return fmt.Errorf("store: bind %s: %w", sid, err)
+	}
 	if _, err := tx.ExecContext(ctx, c.rebind(`
 		INSERT INTO wac_session_device (sid, jid, account, bound_at) VALUES (?, ?, ?, ?)
 		ON CONFLICT (sid) DO UPDATE SET
@@ -579,10 +589,11 @@ func (c *Container) migrate(ctx context.Context) error {
 		// every change reaches it; a write that failed is the one case where that is not
 		// true, and the session that saw the failure is the only thing that knew (#140).
 		//
-		// `stale` is what the row was holding when it refused, and it is what makes this
-		// answerable on the way back. "Which of these two copies is newer" is the question
-		// nothing on either side settles; "has anything touched the row since" is the same
-		// question asked where there is an answer.
+		// `held` is what every row was holding when the write failed, and it is what makes
+		// this answerable on the way back. "Which of these two copies is newer" is the
+		// question nothing on either side settles; "has anything written a name here since"
+		// is the same question asked where there is an answer. Every row and not just the
+		// one a read answers from, because the retry writes under every address.
 		//
 		// The same foreign key as the presence above, and for the same reason: the name is
 		// the pairing's, so a row that outlived the pairing would be answering for an
@@ -593,7 +604,7 @@ func (c *Container) migrate(ctx context.Context) error {
 			sid       TEXT   NOT NULL,
 			kind      TEXT   NOT NULL,
 			name      TEXT   NOT NULL,
-			stale     TEXT   NOT NULL,
+			held      TEXT   NOT NULL,
 			marked_at BIGINT NOT NULL,
 			PRIMARY KEY (sid, kind),
 			FOREIGN KEY (sid) REFERENCES wac_session_device (sid) ON DELETE CASCADE
