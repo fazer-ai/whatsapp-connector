@@ -489,7 +489,7 @@ func TestAdoptingAClientRetiresTheMarkOfTheOneItReplaces(t *testing.T) {
 	dialedAndConnected(session)
 	session.announceDrop()
 
-	if !session.adopt(wm.NewClient(session.current().Store, nil)) {
+	if !session.adopt(t.Context(), wm.NewClient(session.current().Store, nil)) {
 		t.Fatal("the session refused to adopt a client")
 	}
 	dialedAndConnected(session)

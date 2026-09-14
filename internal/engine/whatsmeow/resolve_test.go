@@ -236,7 +236,7 @@ func TestAResolveForgetsWhatThePreviousAccountLearned(t *testing.T) {
 
 	// The device the next pairing produces, with none of what the last one learned.
 	fresh, _ := newTestSession(t, "5511999990002")
-	if !session.adopt(fresh.current()) {
+	if !session.adopt(t.Context(), fresh.current()) {
 		t.Fatal("the session would not take the new client")
 	}
 
@@ -264,7 +264,7 @@ func TestAResolveAnswersTheAccountOutOfItsOwnIdentity(t *testing.T) {
 	// Adopted again so the session copies the identity back out of the device, which is
 	// the only thing that reads it. Nothing in this test publishes an event, so the
 	// second handler the re-adoption registers has nothing to double up on.
-	if !session.adopt(client) {
+	if !session.adopt(t.Context(), client) {
 		t.Fatal("the session would not take its own client back")
 	}
 

@@ -152,3 +152,22 @@ func TestALostLeaseKeepsNoName(t *testing.T) {
 		t.Error("a name was kept by a session that had lost its lease")
 	}
 }
+
+// A record of a name has to have a name in it. An empty one would come back as a name the
+// account calls itself and answer with nothing at all.
+func TestAnEmptyNameIsNotKept(t *testing.T) {
+	t.Parallel()
+	container := open(t)
+	ctx := t.Context()
+	pair(t, container, "sid-1", "5511999990001")
+	scoped := container.For("sid-1")
+
+	if err := scoped.PutUnfiledName(ctx, store.UnfiledPushName, "", "Antigo"); err == nil {
+		t.Error("a record with no name in it was kept")
+	}
+	if _, found, err := scoped.UnfiledName(ctx, store.UnfiledPushName); err != nil {
+		t.Fatalf("UnfiledName: %v", err)
+	} else if found {
+		t.Error("a record with no name in it is on file")
+	}
+}

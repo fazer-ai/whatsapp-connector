@@ -152,7 +152,7 @@ func nextOwner(t *testing.T, container *store.Container, sid string) *Session {
 		t.Fatalf("Device for the next owner: %v", err)
 	}
 	session := newSession(
-		sid, wm.NewClient(device, nil), scoped, MediaOptions{}, zerolog.Nop(),
+		t.Context(), sid, wm.NewClient(device, nil), scoped, MediaOptions{}, zerolog.Nop(),
 		newLibraryLogger(zerolog.Nop(), sid))
 	t.Cleanup(func() { _ = session.Close() })
 	return session

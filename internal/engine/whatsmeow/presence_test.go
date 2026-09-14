@@ -1675,7 +1675,7 @@ func adoptedElsewhere(t *testing.T, container *store.Container, sid string) (*Se
 	if err != nil {
 		t.Fatalf("Device: %v", err)
 	}
-	next := newSession(sid, wm.NewClient(device, nil), scoped, MediaOptions{}, zerolog.Nop(),
+	next := newSession(t.Context(), sid, wm.NewClient(device, nil), scoped, MediaOptions{}, zerolog.Nop(),
 		newLibraryLogger(zerolog.Nop(), sid))
 	t.Cleanup(func() { _ = next.Close() })
 	connect(next)

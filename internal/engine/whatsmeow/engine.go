@@ -212,7 +212,7 @@ func (e *Engine) Open(ctx context.Context, sid string) (engine.Session, error) {
 	}
 
 	wa := newLibraryLogger(e.log, sid)
-	session := newSession(sid, wm.NewClient(device, wa), scoped, e.media, e.log, wa)
+	session := newSession(ctx, sid, wm.NewClient(device, wa), scoped, e.media, e.log, wa)
 	// Registered before the session can be handed out, so a close that happens while
 	// this function is still running is not one nobody hears about.
 	session.onClose(func() { e.forget(sid, session) })

@@ -610,10 +610,10 @@ type pairingRun struct {
 
 //nolint:gocritic // zerolog.Logger is designed to be copied; every With() returns one by value
 func newSession(
-	sid string, client *wm.Client, scoped *store.Scoped,
+	ctx context.Context, sid string, client *wm.Client, scoped *store.Scoped,
 	blobs MediaOptions, log zerolog.Logger, wa waLog.Logger,
 ) *Session {
-	ctx, cancel := context.WithCancel(context.Background())
+	lifetime, cancel := context.WithCancel(context.Background())
 	s := &Session{
 		sid:        sid,
 		aliases:    newAlias(),
@@ -623,7 +623,7 @@ func newSession(
 		inbox:      make(chan pending, inboxDepth),
 		events:     make(chan engine.Emission),
 		done:       make(chan struct{}),
-		ctx:        ctx,
+		ctx:        lifetime,
 		cancel:     cancel,
 		detach:     func(client *wm.Client, id uint32) { client.RemoveEventHandler(id) },
 		disconnect: func(client *wm.Client) { client.Disconnect() },
@@ -729,7 +729,7 @@ func newSession(
 	) error {
 		return s.writeTheDescription(ctx, client, group, description, revision)
 	}
-	s.adopt(client)
+	s.adopt(ctx, client)
 	go s.forward()
 
 	// The library logs an authentication from the socket's own goroutine, and the session
@@ -809,7 +809,7 @@ func identityOf(client *wm.Client) account {
 // It reports false when the session closed while this was happening, in which case the
 // client it was handed is disconnected and nothing is kept: a handler on a closed
 // session is one nothing will ever remove.
-func (s *Session) adopt(client *wm.Client) bool {
+func (s *Session) adopt(ctx context.Context, client *wm.Client) bool {
 	// WhatsApp itself demands a reconnect in the middle of pairing: the server closes
 	// the stream with a 515 and expects the client back. Turning whatsmeow's reconnect
 	// off would leave every pairing hanging one step from done, so the socket's own
@@ -886,7 +886,7 @@ func (s *Session) adopt(client *wm.Client) bool {
 	s.mu.Unlock()
 	// After the swap, because it reads the client this session has just taken, and before
 	// this returns, because the command it is for answers without waiting for a socket.
-	s.takeUnfiledNames()
+	s.takeUnfiledNames(ctx)
 	return true
 }
 
@@ -1176,7 +1176,9 @@ func (s *Session) reverify(businessName string) {
 	s.verifiedUnfiled = true
 	s.mu.Unlock()
 
-	s.recordOwnVerifiedName(businessName)
+	writing, done := context.WithTimeout(s.ctx, s.storeLimit)
+	defer done()
+	s.recordOwnVerifiedName(writing, businessName)
 }
 
 // rename records a push name the account changed while the session was up.
@@ -1195,7 +1197,13 @@ func (s *Session) rename(pushName string) {
 	// on a message the account sent writes the table. Neither writes the other, so a
 	// session rebuilt from the record has no way to tell which of the two it is holding.
 	// Writing here makes the table the one that is never behind.
-	s.recordOwnName(pushName)
+	//
+	// One deadline for the whole of it, taken here. Every step below is a store round
+	// trip, and a budget per step is a budget that multiplies: what a caller waits for
+	// has to be one of these, not four.
+	writing, done := context.WithTimeout(s.ctx, s.storeLimit)
+	defer done()
+	s.recordOwnName(writing, pushName)
 }
 
 // recordOwnName files the account's own push name where the people it has met are filed.
@@ -1203,7 +1211,7 @@ func (s *Session) rename(pushName string) {
 // A failure is logged rather than retried: the name is an annotation and the session's own
 // copy is already current. What it costs is that the row is behind until the next rename,
 // which is why the session remembers that it is.
-func (s *Session) recordOwnName(pushName string) {
+func (s *Session) recordOwnName(ctx context.Context, pushName string) {
 	client := s.current()
 	if client == nil || client.Store == nil || client.Store.Contacts == nil {
 		return
@@ -1218,12 +1226,12 @@ func (s *Session) recordOwnName(pushName string) {
 	if s.names().push != pushName {
 		return
 	}
-	if !s.fileOwnName(client.Store.Contacts.PutPushName, pushName, "push name") {
+	if !s.fileOwnName(ctx, client.Store.Contacts.PutPushName, pushName, "push name") {
 		// Written down as well as remembered. The marker below is what keeps the answer
 		// right while the row is behind, and it is knowledge this event produced: a
 		// process that did not see the event cannot rebuild it, and would answer from the
 		// row (#140).
-		s.keepUnfiled(store.UnfiledPushName, pushName)
+		s.keepUnfiled(ctx, store.UnfiledPushName, pushName)
 		return
 	}
 	s.mu.Lock()
@@ -1235,13 +1243,13 @@ func (s *Session) recordOwnName(pushName string) {
 	}
 	s.mu.Unlock()
 	if filed {
-		s.forgetUnfiled(store.UnfiledPushName)
+		s.forgetUnfiled(ctx, store.UnfiledPushName)
 	}
 }
 
 // recordOwnVerifiedName files the account's own verified name under the address whatsmeow
 // may have left without it.
-func (s *Session) recordOwnVerifiedName(businessName string) {
+func (s *Session) recordOwnVerifiedName(ctx context.Context, businessName string) {
 	client := s.current()
 	if client == nil || client.Store == nil || client.Store.Contacts == nil {
 		return
@@ -1251,8 +1259,8 @@ func (s *Session) recordOwnVerifiedName(businessName string) {
 	if s.names().verified != businessName {
 		return
 	}
-	if !s.fileOwnName(client.Store.Contacts.PutBusinessName, businessName, "verified name") {
-		s.keepUnfiled(store.UnfiledVerifiedName, businessName)
+	if !s.fileOwnName(ctx, client.Store.Contacts.PutBusinessName, businessName, "verified name") {
+		s.keepUnfiled(ctx, store.UnfiledVerifiedName, businessName)
 		return
 	}
 	s.mu.Lock()
@@ -1262,7 +1270,7 @@ func (s *Session) recordOwnVerifiedName(businessName string) {
 	}
 	s.mu.Unlock()
 	if filed {
-		s.forgetUnfiled(store.UnfiledVerifiedName)
+		s.forgetUnfiled(ctx, store.UnfiledVerifiedName)
 	}
 }
 
@@ -1273,21 +1281,19 @@ func (s *Session) recordOwnVerifiedName(businessName string) {
 // needs to settle is which of the two copies is newer, and neither the device record nor
 // the row says; what it can settle is whether anything has touched the row since, which is
 // the same question asked where there is an answer.
-func (s *Session) keepUnfiled(kind, name string) {
+func (s *Session) keepUnfiled(ctx context.Context, kind, name string) {
 	client := s.current()
 	if client == nil || client.Store == nil || client.Store.Contacts == nil {
 		return
 	}
-	writing, done := context.WithTimeout(s.ctx, s.storeLimit)
-	defer done()
-	stale, read := s.ownRow(writing, client, kind)
+	stale, read := s.ownRow(ctx, client, kind)
 	if !read {
 		// Without what the row is holding there is nothing to compare against on the way
 		// back, and a copy that answers unconditionally is the one that outlives its own
 		// truth. The session's own memory still covers this process.
 		return
 	}
-	if err := s.store.PutUnfiledName(writing, kind, name, stale); err != nil {
+	if err := s.store.PutUnfiledName(ctx, kind, name, stale); err != nil {
 		s.log.Debug().Err(err).Str("name", kind).
 			Msg("could not record one of the account's own names as unfiled")
 	}
@@ -1295,10 +1301,8 @@ func (s *Session) keepUnfiled(kind, name string) {
 
 // forgetUnfiled drops the record, because the row took the name or because the row moved
 // on to a newer one.
-func (s *Session) forgetUnfiled(kind string) {
-	writing, done := context.WithTimeout(s.ctx, s.storeLimit)
-	defer done()
-	if err := s.store.DropUnfiledName(writing, kind); err != nil {
+func (s *Session) forgetUnfiled(ctx context.Context, kind string) {
+	if err := s.store.DropUnfiledName(ctx, kind); err != nil {
 		s.log.Debug().Err(err).Str("name", kind).
 			Msg("could not forget one of the account's own names as unfiled")
 	}
@@ -1315,12 +1319,16 @@ func (s *Session) forgetUnfiled(kind string) {
 // Here rather than on the connection because this is the one command written to answer
 // without a socket, and the window between a process coming back and its socket opening is
 // exactly when a client resynchronises its contacts.
-func (s *Session) takeUnfiledNames() {
+func (s *Session) takeUnfiledNames(ctx context.Context) {
 	client := s.current()
 	if client == nil || client.Store == nil || client.Store.Contacts == nil {
 		return
 	}
-	reading, done := context.WithTimeout(s.ctx, s.storeLimit)
+	// One deadline for the read, the drop and the retry together, and taken from the
+	// caller that is adopting rather than from the session: this runs inside `Open`, on
+	// the loop that also renews leases, so a store that has stalled must not be able to
+	// hold it past what that caller allowed.
+	reading, done := context.WithTimeout(ctx, s.storeLimit)
 	defer done()
 	for _, kind := range []string{store.UnfiledPushName, store.UnfiledVerifiedName} {
 		held, found, err := s.store.UnfiledName(reading, kind)
@@ -1341,7 +1349,7 @@ func (s *Session) takeUnfiledNames() {
 			// two and what was kept here has nothing left to say. That is the ordinary
 			// ending as well as the safe one: the write that landed after a failed one is
 			// usually the retry below, from the process that failed.
-			s.forgetUnfiled(kind)
+			s.forgetUnfiled(reading, kind)
 			continue
 		}
 		s.mu.Lock()
@@ -1358,10 +1366,10 @@ func (s *Session) takeUnfiledNames() {
 	// that keeps it level.
 	own := s.names()
 	if own.pushUnfiled {
-		s.recordOwnName(own.push)
+		s.recordOwnName(reading, own.push)
 	}
 	if own.verifiedUnfiled {
-		s.recordOwnVerifiedName(own.verified)
+		s.recordOwnVerifiedName(reading, own.verified)
 	}
 }
 
@@ -1391,12 +1399,11 @@ func (s *Session) ownRow(ctx context.Context, client *wm.Client, kind string) (s
 // All of them, because a read takes the first row that holds a name and the phone row is
 // read first: one row left behind is enough to answer with a name the account has left.
 func (s *Session) fileOwnName(
+	ctx context.Context,
 	put func(context.Context, waTypes.JID, string) (bool, string, error),
 	name, what string,
 ) bool {
 	phone, lid := s.identity()
-	writing, done := context.WithTimeout(s.ctx, s.storeLimit)
-	defer done()
 	filed, missed := false, false
 	for _, address := range []protocol.Address{
 		{Kind: protocol.AddressPhone, ID: phone},
@@ -1410,7 +1417,7 @@ func (s *Session) fileOwnName(
 			missed = true
 			continue
 		}
-		if _, _, err := put(writing, jid, name); err != nil {
+		if _, _, err := put(ctx, jid, name); err != nil {
 			s.log.Debug().Err(err).Str("kind", string(address.Kind)).Str("name", what).
 				Msg("could not file one of the account's own names")
 			missed = true
@@ -2810,7 +2817,7 @@ func (s *Session) rebuild(ctx context.Context) error {
 
 	// A false here is the session having closed while this ran, which adopt has already
 	// cleaned up after. There is nothing left to do either way.
-	_ = s.adopt(wm.NewClient(device, s.waLog))
+	_ = s.adopt(ctx, wm.NewClient(device, s.waLog))
 	return nil
 }
 

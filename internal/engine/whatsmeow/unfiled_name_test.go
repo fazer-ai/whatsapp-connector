@@ -394,7 +394,7 @@ func (l *liveStore) session(t *testing.T, sid, phone, lid string) (*Session, *wm
 		}
 	}
 	client := wm.NewClient(device, nil)
-	session := newSession(sid, client, scoped, MediaOptions{}, zerolog.Nop(), newLibraryLogger(zerolog.Nop(), sid))
+	session := newSession(t.Context(), sid, client, scoped, MediaOptions{}, zerolog.Nop(), newLibraryLogger(zerolog.Nop(), sid))
 	t.Cleanup(func() { _ = session.Close() })
 	return session, client
 }
@@ -524,4 +524,202 @@ func tableContents(t *testing.T, pool *sql.DB, table string) string {
 	slices.Sort(printed)
 	sum := sha256.Sum256([]byte(strings.Join(printed, "\n")))
 	return fmt.Sprintf("%d rows %s", len(printed), hex.EncodeToString(sum[:8]))
+}
+
+// A write this connector still owes is retried when the session comes back, which is what
+// ends this rather than leaving the row behind until the next rename -- and what is kept is
+// dropped as it stops being needed, instead of outliving its own truth in the database.
+func TestARestartFilesWhatTheLastProcessCouldNot(t *testing.T) {
+	t.Parallel()
+
+	live := aStoreThatOutlivesItsProcess(t)
+	session, client := live.session(t, "sid-h", ownPhone, ownLID)
+	theTableSays(t, client, "Antigo")
+	theRecordSays(t, client, "Atendimento")
+	client.Store.Contacts = shutContacts{ContactStore: client.Store.Contacts}
+	session.handle(&waEvents.PushNameSetting{
+		Action: &waSyncAction.PushNameSetting{Name: proto.String("Atendimento")},
+	})
+	if _, found, err := live.open.For("sid-h").UnfiledName(t.Context(), store.UnfiledPushName); err != nil {
+		t.Fatalf("UnfiledName: %v", err)
+	} else if !found {
+		t.Fatal("nothing was written down about a name the table would not take")
+	}
+
+	restarted, restartedClient := live.restart(t, session, "sid-h", ownPhone, ownLID)
+	for _, jid := range bothAddresses() {
+		contact, err := restartedClient.Store.Contacts.GetContact(t.Context(), jid)
+		if err != nil {
+			t.Fatalf("GetContact: %v", err)
+		}
+		if contact.PushName != "Atendimento" {
+			t.Errorf("the %s row still says %q, want the write the last process owed", jid.Server, contact.PushName)
+		}
+	}
+	if _, found, err := live.open.For("sid-h").UnfiledName(t.Context(), store.UnfiledPushName); err != nil {
+		t.Fatalf("UnfiledName: %v", err)
+	} else if found {
+		t.Error("what was kept is still kept after the write it was waiting on landed")
+	}
+	if names := restarted.names(); names.pushUnfiled {
+		t.Error("the session still says its name is unfiled after the write landed")
+	}
+}
+
+// A push name learned from a message the account sent is the case with no third copy on
+// that half either: whatsmeow writes the table and dispatches, and the device record is
+// never touched. Remembering only that a row was behind would leave nothing to answer with.
+func TestARestartAnswersAPushNameTheRecordNeverHeardOf(t *testing.T) {
+	t.Parallel()
+
+	live := aStoreThatOutlivesItsProcess(t)
+	session, client := live.session(t, "sid-i", ownPhone, ownLID)
+	lidJID := waTypes.NewJID(ownLID, waTypes.HiddenUserServer)
+	client.Store.LID = lidJID
+	session.handle(&waEvents.Connected{})
+	drain(t, session)
+	theTableSays(t, client, "Antigo")
+	theRecordSays(t, client, "Antigo")
+
+	// whatsmeow wrote the row the notify arrived on and dispatched. The record is not on
+	// this path at all, so it is still holding what the pairing left.
+	if _, _, err := client.Store.Contacts.PutPushName(t.Context(), lidJID, "Atendimento"); err != nil {
+		t.Fatalf("PutPushName: %v", err)
+	}
+	client.Store.Contacts = &refusingContacts{
+		ContactStore: client.Store.Contacts, refuse: waTypes.NewJID(ownPhone, waTypes.DefaultUserServer),
+	}
+	session.handle(&waEvents.PushName{
+		JID: lidJID, OldPushName: "Antigo", NewPushName: "Atendimento",
+	})
+	if names := session.names(); !names.pushUnfiled {
+		t.Fatal("the session says its name is filed after the row a read prefers refused it")
+	}
+
+	restarted, _ := live.restart(t, session, "sid-i", ownPhone, ownLID)
+	if party := resolvedBy(t, restarted, ownPhone); party["push_name"] != "Atendimento" {
+		t.Errorf("after the restart the account is called %v, want the name the notify brought", party)
+	}
+}
+
+// Each name is compared against its own column. A row carries both, and they move on their
+// own: comparing the verified name against the push name's column would drop a kept
+// verified name because somebody's push name changed, and keep one because it did not.
+func TestAKeptVerifiedNameIsComparedAgainstItsOwnColumn(t *testing.T) {
+	t.Parallel()
+
+	live := aStoreThatOutlivesItsProcess(t)
+	session, client := live.session(t, "sid-j", ownPhone, ownLID)
+	phoneJID := waTypes.NewJID(ownPhone, waTypes.DefaultUserServer)
+	lidJID := waTypes.NewJID(ownLID, waTypes.HiddenUserServer)
+	client.Store.LID = lidJID
+	session.handle(&waEvents.Connected{})
+	drain(t, session)
+	// The row carries both names, which is the ordinary shape of one.
+	theTableSays(t, client, "Antigo")
+	for _, jid := range bothAddresses() {
+		if _, _, err := client.Store.Contacts.PutBusinessName(t.Context(), jid, "Loja do Bruno"); err != nil {
+			t.Fatalf("PutBusinessName: %v", err)
+		}
+	}
+	if _, _, err := client.Store.Contacts.PutBusinessName(t.Context(), lidJID, "Loja do Bruno LTDA"); err != nil {
+		t.Fatalf("PutBusinessName: %v", err)
+	}
+	table := client.Store.Contacts
+	client.Store.Contacts = &refusingContacts{ContactStore: table, refuse: phoneJID}
+	session.handle(&waEvents.BusinessName{
+		JID: lidJID, OldBusinessName: "Loja do Bruno", NewBusinessName: "Loja do Bruno LTDA",
+	})
+
+	// The push name of the same row moves afterwards, and says nothing about the verified
+	// one: a notify writes that column and leaves this one where it was. Written through
+	// the table itself, because what refused the verified name is not what writes this.
+	if _, _, err := table.PutPushName(t.Context(), phoneJID, "Atendimento"); err != nil {
+		t.Fatalf("PutPushName: %v", err)
+	}
+
+	restarted, _ := live.restart(t, session, "sid-j", ownPhone, ownLID)
+	if party := resolvedBy(t, restarted, ownPhone); party["verified_name"] != "Loja do Bruno LTDA" {
+		t.Errorf("after the restart the account is verified as %v, want the name a push name change says nothing about", party)
+	}
+}
+
+// Without what the row was holding there is nothing to compare against later, and a copy
+// that answers unconditionally is the one that outlives its own truth. Writing it down
+// half-known is worse than not writing it down: the session's memory already covers this
+// process, and the next one would inherit a comparison it cannot make.
+func TestANameIsNotKeptWhenTheRowCouldNotBeRead(t *testing.T) {
+	t.Parallel()
+
+	live := aStoreThatOutlivesItsProcess(t)
+	session, client := live.session(t, "sid-k", ownPhone, ownLID)
+	theTableSays(t, client, "Antigo")
+	theRecordSays(t, client, "Atendimento")
+	client.Store.Contacts = blindContacts{ContactStore: client.Store.Contacts}
+	session.handle(&waEvents.PushNameSetting{
+		Action: &waSyncAction.PushNameSetting{Name: proto.String("Atendimento")},
+	})
+
+	if names := session.names(); !names.pushUnfiled || names.push != "Atendimento" {
+		t.Errorf("the session calls itself %q (unfiled %v), want the new name held in memory",
+			names.push, names.pushUnfiled)
+	}
+	if _, found, err := live.open.For("sid-k").UnfiledName(t.Context(), store.UnfiledPushName); err != nil {
+		t.Fatalf("UnfiledName: %v", err)
+	} else if found {
+		t.Error("a name was written down beside a row nothing could read")
+	}
+}
+
+// blindContacts takes no name and answers no question about one, which is the store that
+// has gone away entirely rather than refused one row.
+type blindContacts struct {
+	waStore.ContactStore
+}
+
+func (blindContacts) PutPushName(_ context.Context, _ waTypes.JID, _ string) (changed bool, previous string, err error) {
+	return false, "", errors.New("this table is not taking writes")
+}
+
+func (blindContacts) PutBusinessName(_ context.Context, _ waTypes.JID, _ string) (changed bool, previous string, err error) {
+	return false, "", errors.New("this table is not taking writes")
+}
+
+func (blindContacts) GetContact(_ context.Context, _ waTypes.JID) (waTypes.ContactInfo, error) {
+	return waTypes.ContactInfo{}, errors.New("this table is not answering reads")
+}
+
+// A row that moved on after the failure is the newer copy of the two, so what was kept is
+// answered over and then dropped: leaving it would have every later restart asking the
+// same settled question, and a row that never goes is a row that outlives its pairing.
+func TestAKeptNameIsDroppedWhenTheRowMovedOnWithoutIt(t *testing.T) {
+	t.Parallel()
+
+	live := aStoreThatOutlivesItsProcess(t)
+	session, client := live.session(t, "sid-l", ownPhone, ownLID)
+	theTableSays(t, client, "Antigo")
+	theRecordSays(t, client, "Atendimento")
+	table := client.Store.Contacts
+	client.Store.Contacts = shutContacts{ContactStore: table}
+	session.handle(&waEvents.PushNameSetting{
+		Action: &waSyncAction.PushNameSetting{Name: proto.String("Atendimento")},
+	})
+
+	// The row moves without this process filing anything: the notify on a message the
+	// account sent from another device, arriving at whoever holds the session next.
+	for _, jid := range bothAddresses() {
+		if _, _, err := table.PutPushName(t.Context(), jid, "Triagem"); err != nil {
+			t.Fatalf("PutPushName: %v", err)
+		}
+	}
+
+	restarted, _ := live.restart(t, session, "sid-l", ownPhone, ownLID)
+	if party := resolvedBy(t, restarted, ownPhone); party["push_name"] != "Triagem" {
+		t.Errorf("after the restart the account is called %v, want the name the row moved on to", party)
+	}
+	if _, found, err := live.open.For("sid-l").UnfiledName(t.Context(), store.UnfiledPushName); err != nil {
+		t.Fatalf("UnfiledName: %v", err)
+	} else if found {
+		t.Error("a copy that lost to the row it was compared against is still kept")
+	}
 }

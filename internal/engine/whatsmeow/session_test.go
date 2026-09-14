@@ -612,7 +612,7 @@ func newTestSession(t *testing.T, phone string) (*Session, *store.Container) {
 		}
 	}
 
-	session := newSession(sid, wm.NewClient(device, nil), scoped, MediaOptions{}, zerolog.Nop(), newLibraryLogger(zerolog.Nop(), sid))
+	session := newSession(t.Context(), sid, wm.NewClient(device, nil), scoped, MediaOptions{}, zerolog.Nop(), newLibraryLogger(zerolog.Nop(), sid))
 	t.Cleanup(func() { _ = session.Close() })
 	return session, container
 }
@@ -3225,7 +3225,7 @@ func TestAResumedSessionStillHasTheGroupsItAskedFor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Device: %v", err)
 	}
-	resumed := newSession(sid, wm.NewClient(device, nil), scoped, MediaOptions{},
+	resumed := newSession(t.Context(), sid, wm.NewClient(device, nil), scoped, MediaOptions{},
 		zerolog.Nop(), newLibraryLogger(zerolog.Nop(), sid))
 	t.Cleanup(func() { _ = resumed.Close() })
 
