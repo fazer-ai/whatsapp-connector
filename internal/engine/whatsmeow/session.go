@@ -494,6 +494,11 @@ type Session struct {
 	// that cleanup a second time, alongside the one the logout is already running.
 	revoked bool
 
+	// probing is the wait for whatsmeow's socket lock that the teardowns share, and probed
+	// is the client it was started on. One for all of them: see socketFree.
+	probing chan struct{}
+	probed  *wm.Client
+
 	// pushName and businessName are this account's own display names. They live here
 	// rather than being read off `client.Store` where they are wanted, because whatsmeow
 	// writes those fields from its own goroutines: the copy is taken where an ordering
@@ -847,6 +852,24 @@ func (s *Session) identity() (phone, lid string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.phone, s.lid
+}
+
+// stopDialing records a dial that failed, while it is still this session's client that was
+// dialling.
+//
+// A dial detached from the command that asked for it ends whenever the network lets it, and
+// a teardown in between puts the session on a client of its own, which may be dialling by
+// then. Cleared without the check, an old failure says nothing is dialling over a dial in
+// flight: `session.status` answers `close` for a session that is connecting, and a resume
+// arriving there starts a second dial alongside the first.
+func (s *Session) stopDialing(client *wm.Client) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.client != client {
+		return
+	}
+	s.dialing = false
 }
 
 func (s *Session) setDialing(dialing bool) {
@@ -1443,6 +1466,15 @@ func (s *Session) resume(ctx context.Context, state string) error {
 	client := s.current()
 	s.emit(protocol.EventSessionState, map[string]any{"state": "connecting"})
 	reportFailure := func(error) {
+		// Only while this is still the session's client, the way abandonPairing reports only
+		// the pairing run that is still current. A detached dial ends whenever the network
+		// lets it, and a teardown in between puts the session on a client of its own: the
+		// close published here would then be about a connection that no longer exists, on
+		// top of whatever replaced it -- a terminal state over a session that is pairing
+		// again, or over the `session.logged_out` that retired this one.
+		if s.current() != client {
+			return
+		}
 		s.emit(protocol.EventSessionState, map[string]any{"state": "close", "reason": "connect_failed"})
 	}
 	if err := s.dial(ctx, client, reportFailure); err != nil {
@@ -1470,7 +1502,7 @@ func (s *Session) dial(ctx context.Context, client *wm.Client, onDetached func(e
 	go func() {
 		err := client.ConnectContext(s.ctx)
 		if err != nil {
-			s.setDialing(false)
+			s.stopDialing(client)
 		}
 		// On success the flag stands until whatsmeow says the session is authenticated.
 		// ConnectContext returns once the socket is up, and the handshake that follows is
@@ -1790,7 +1822,8 @@ func (s *Session) Logout(ctx context.Context) error {
 	defer s.endCommand()
 
 	s.cancelPairing()
-	if err := s.logout(ctx, s.current()); err != nil {
+	ask, _ := s.askToUnlink(ctx)
+	if err := ask(ctx, s.current()); err != nil {
 		if sentNothing(err) || unanswered(err) {
 			// Nothing WhatsApp said has revoked the device, and it is untouched on both
 			// sides: either nothing was sent, or the request went out and no answer came
@@ -1867,14 +1900,30 @@ func (s *Session) Delete(ctx context.Context) error {
 	defer s.endCommand()
 
 	s.cancelPairing()
-	_, paired, pairedErr := s.store.JID(ctx)
-	unlink := s.logout(ctx, s.current())
+	// Asked once and answered for both the wait and what is named at the end.
+	ask, nothingToUnlink := s.askToUnlink(ctx)
+	unlink := ask(ctx, s.current())
+	if errors.Is(unlink, errStillDialling) {
+		// The one failure that is not "the unlink was refused": it was never attempted. The
+		// caller's time ran out while a dial held the socket, and nothing has been touched
+		// here yet -- so the teardown has not happened, and answering success would throw
+		// away the credentials without ever asking WhatsApp to remove the device. That device
+		// can never be unlinked afterwards: it stays listed on somebody's phone for good,
+		// with nothing but a log line to say so.
+		//
+		// Answered as a failure, which is what the retry has to work from, and the account is
+		// left exactly as it was for that retry to finish once the dial ends. The comment
+		// above is about the other case and still holds: an unlink WhatsApp or a socket that
+		// was down refused is a teardown that goes through, because there the retry has
+		// nothing left to do.
+		return fmt.Errorf("whatsmeow: delete %s: %w", s.sid, unlink)
+	}
 	// Whatever WhatsApp answered, this session is not coming back. settleLogout is what
 	// keeps a reconnect from dialling on credentials that are about to be gone.
 	s.settleLogout()
 	switch {
 	case unlink == nil:
-	case pairedErr == nil && !paired:
+	case nothingToUnlink:
 		// Nothing was linked, so there is nothing WhatsApp has to be told about and no
 		// residue to name. The commonest way here is the redelivery of a delete that
 		// already ran.
@@ -2386,7 +2435,101 @@ func (s *Session) finishing(eventType protocol.EventType, payload any) {
 func sentNothing(err error) bool {
 	return errors.Is(err, wm.ErrNotConnected) ||
 		errors.Is(err, wm.ErrNotLoggedIn) ||
-		errors.Is(err, wm.ErrClientIsNil)
+		errors.Is(err, wm.ErrClientIsNil) ||
+		errors.Is(err, errStillDialling)
+}
+
+// errStillDialling is an unlink that was never attempted, because the caller's time ran
+// out while a dial held the socket.
+var errStillDialling = errors.New("the socket was still being dialled")
+
+// unlink asks WhatsApp to remove this device, on the caller's time.
+//
+// whatsmeow's Logout reads the socket under a lock that a dial holds for as long as the
+// dial lasts, and that read takes no context. A reconnect is the ordinary way to be
+// dialling, and a teardown is the one kind of command that reaches the library during
+// one, because it does not pass readyToSend: waited on directly, it answers when the dial
+// ends, which can be any amount of time after the client's deadline (#187).
+//
+// So the lock is waited for first, on the context, and the logout is only called once the
+// lock has been free. Given up there, nothing has been sent, which makes the answer
+// certain: the device is exactly as linked as it was. The logout itself is not run in the
+// background and given up on instead, because past the lock everything in it honours the
+// context, and a call abandoned mid-way would leave no way to tell a request that never
+// left from one WhatsApp accepted while its local cleanup ran out of time.
+//
+// IsConnected is the probe because it takes the same lock and nothing else. A dial that
+// starts between the probe and the logout's own read is waited for as before; that window
+// is the few instructions between the two calls.
+func (s *Session) unlink(ctx context.Context, client *wm.Client) error {
+	select {
+	case <-s.socketFree(client):
+	case <-ctx.Done():
+		return fmt.Errorf("%w: %w", errStillDialling, ctx.Err())
+	}
+	return s.logout(ctx, client)
+}
+
+// askToUnlink picks how a teardown reaches whatsmeow, and says whether there was anything
+// to reach it about.
+//
+// The wait above is worth the caller's time only when there is a device to remove.
+// whatsmeow answers ErrNotLoggedIn for an account with none without going near the socket,
+// so an account whose dial is a pairing nobody finished -- a QR nobody scanned, a code that
+// ran out -- would spend the whole deadline on a lock it has no use for, to arrive at a
+// refusal that was never in doubt. The teardown a client asks for there is one the caller
+// has already destroyed the inbox for, and holding the session's command queue for it buys
+// nobody anything.
+//
+// A store read that failed is not an answer, and counts as paired: the lock is waited for
+// and the residue named, which is what these paths did before they could tell the two
+// apart. Skipping the wait on a read nobody could make would send a teardown for an account
+// that does have a device into whatsmeow's own logout, which takes the socket lock with no
+// context at all.
+// The read is store work standing in front of a teardown, so it runs under the store's bound
+// as well as the caller's: a store that stalled answers nothing, and spending the whole
+// deadline on it before even reaching whatsmeow is the same wait this change exists to end.
+// Giving up there is a read that failed, which is already the paired side.
+func (s *Session) askToUnlink(ctx context.Context) (ask func(context.Context, *wm.Client) error, nothingToUnlink bool) {
+	asking, asked := context.WithTimeout(ctx, s.storeLimit)
+	defer asked()
+	_, paired, err := s.store.JID(asking)
+	if err == nil && !paired {
+		return s.logout, true
+	}
+	return s.unlink, false
+}
+
+// socketFree answers when the socket lock has been free, with one probe for all the
+// teardowns waiting on the same client.
+//
+// One and not one each, because the wait itself cannot be called off: a dial that outlives
+// a teardown's deadline outlives its probe too, and a client retrying every few seconds
+// through a long outage would leave a goroutine parked for every attempt. They are all
+// waiting for the same thing, so they can wait on the same channel.
+//
+// A finished probe is forgotten rather than kept, because what it answered was about the
+// moment it ran: the next teardown asks again, and gets a fresh probe if the lock has been
+// taken since.
+func (s *Session) socketFree(client *wm.Client) <-chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.probing != nil && s.probed == client {
+		return s.probing
+	}
+	free := make(chan struct{})
+	s.probing, s.probed = free, client
+	go func() {
+		client.IsConnected()
+		s.mu.Lock()
+		if s.probing == free {
+			s.probing, s.probed = nil, nil
+		}
+		s.mu.Unlock()
+		close(free)
+	}()
+	return free
 }
 
 // logoutRequestFailed is how whatsmeow's Logout words a failure of the request itself, as
@@ -2446,7 +2589,21 @@ func (s *Session) rebuild(ctx context.Context) error {
 	previous, handlerID := s.client, s.handlerID
 	s.mu.Unlock()
 	s.detach(previous, handlerID)
-	previous.Disconnect()
+	// Waited for no longer than the bound this runs on. Disconnect takes the socket lock, and
+	// a dial holds that lock for as long as the dial lasts with no context to end it: a
+	// teardown whose unlink went through while the socket dropped underneath it would answer
+	// when the dial did, which is the wait #187 is about, one step later. The client is
+	// detached already, so nothing it does from here is heard, and the disconnect still lands
+	// the moment the dial lets go.
+	closed := make(chan struct{})
+	go func() {
+		defer close(closed)
+		previous.Disconnect()
+	}()
+	select {
+	case <-closed:
+	case <-ctx.Done():
+	}
 
 	// Dropped with the client it was filed under. Every path here has just forgotten the
 	// device, so the account that asked for it is gone, and carried over it would mark
