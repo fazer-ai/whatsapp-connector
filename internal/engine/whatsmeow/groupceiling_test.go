@@ -226,7 +226,7 @@ func TestTheTwoThatCannotBeRepeatedArriveWithNoCeiling(t *testing.T) {
 			session.setConnected(true)
 			var left time.Duration
 			var set bool
-			session.createTheGroup = func(ctx context.Context, _ *wm.Client, _ wm.ReqCreateGroup) (*waTypes.GroupInfo, error) {
+			session.createTheGroup = func(ctx context.Context, _ *wm.Client, _ keyedCreate) (*waTypes.GroupInfo, error) {
 				if until, ok := ctx.Deadline(); ok {
 					left, set = time.Until(until), true
 				}

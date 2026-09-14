@@ -586,15 +586,18 @@ func (c *Container) migrate(ctx context.Context) error {
 		`CREATE TABLE IF NOT EXISTS wac_group_create (
 			sid        TEXT   NOT NULL,
 			attempt    TEXT   NOT NULL,
+			create_key TEXT   NOT NULL,
 			subject    TEXT   NOT NULL,
 			started_at BIGINT NOT NULL,
 			group_jid  TEXT,
-			settled_at BIGINT,
+			touched_at BIGINT NOT NULL,
 			PRIMARY KEY (sid, attempt)
 		)`,
-		// The sweep goes by when an attempt settled, across every session, and never
-		// touches one that has not.
-		`CREATE INDEX IF NOT EXISTS wac_group_create_settled_at ON wac_group_create (settled_at)`,
+		// The key is how WhatsApp's own notification finds the attempt that sent it, which
+		// is a lookup by (sid, create_key) on every group this account is added to.
+		`CREATE INDEX IF NOT EXISTS wac_group_create_key ON wac_group_create (sid, create_key)`,
+		// The sweep goes by when an attempt was last written, across every session.
+		`CREATE INDEX IF NOT EXISTS wac_group_create_touched_at ON wac_group_create (touched_at)`,
 	} {
 		if _, err := c.db.ExecContext(ctx, statement); err != nil {
 			return fmt.Errorf("store: bring the connector's own schema up: %w", err)

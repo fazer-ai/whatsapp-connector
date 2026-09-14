@@ -9,65 +9,73 @@ import (
 )
 
 // GroupCreation is what one attempt at making a group left behind: the intent, written
-// before anything was asked of WhatsApp, and the group it turned into, written after.
+// before anything was asked of WhatsApp, and the group it turned into, written once
+// WhatsApp said which one that is.
 //
 // The two halves are the point. Every other command this connector serves converges on a
 // retry, so the record of it only has to exist eventually; `group.create` is the one whose
 // second run makes a second group, and a record written only after the fact is no cover for
-// a process that dies in between. The intent is what a later attempt has to go on, and what
-// it says is: an attempt under this name was begun at this instant, for a group with this
-// subject. That is enough to look, which is all that was ever missing -- a group is findable
-// on WhatsApp, unlike a message that may or may not have been sent.
+// a process that dies in between.
+//
+// What ties the halves together is the key. The creation goes out carrying it, WhatsApp
+// echoes it on the notification that announces the group, and a notification nobody
+// acknowledged is redelivered to whoever holds the session next -- measured on the bench,
+// in `probe131b`. So the instance that took a dead one's session over learns exactly which
+// group it made, rather than inferring it from a subject and a timestamp.
 type GroupCreation struct {
-	// Subject is what the group was to be called, and what a later attempt looks for.
+	// Key is what the creation was sent under, and what WhatsApp echoes back.
+	Key string
+	// Subject is what the group was to be called.
 	Subject string
-	// StartedAt is when the intent was written, which is necessarily before WhatsApp was
-	// asked. A group of this account created before it cannot be this attempt's.
+	// StartedAt is when the intent was written, necessarily before WhatsApp was asked.
 	StartedAt time.Time
-	// JID names the group, once there is one. Empty on an attempt that has not finished:
-	// either it is still running, or whatever was running it is gone.
+	// JID names the group, once WhatsApp has said which one. Empty on an attempt that has
+	// not got there: either it is still running, or whatever was running it is gone.
 	JID string
 }
 
-// Done reports whether this attempt got as far as naming the group it made.
+// Done reports whether this attempt knows which group it made.
 func (c GroupCreation) Done() bool { return c.JID != "" }
 
-// BeginGroupCreate writes the intent to make a group, and reports what is already on
-// record under this name.
+// BeginGroupCreate writes the intent to make a group under this key, and reports what is
+// already on record for it.
 //
 // Written before the group is asked for, and that order is the whole mechanism: a record
 // written afterwards is exactly the one a crash in between does not leave. It never
-// overwrites, because a second call under the same name is a redelivery and the first
-// call's intent -- in particular the instant it began -- is the one that bounds the search.
-func (s *Scoped) BeginGroupCreate(ctx context.Context, attempt, subject string, now time.Time) (GroupCreation, bool, error) {
+// overwrites, so a second delivery of one command reads the first delivery's key -- the
+// only key WhatsApp will ever echo for it.
+func (s *Scoped) BeginGroupCreate(
+	ctx context.Context, attempt, key, subject string, now time.Time,
+) (GroupCreation, bool, error) {
 	if err := s.fence.held(); err != nil {
 		return GroupCreation{}, false, err
 	}
-	if attempt == "" {
-		return GroupCreation{}, false, fmt.Errorf("store: a group creation needs a name to be filed under")
+	if attempt == "" || key == "" {
+		return GroupCreation{}, false, fmt.Errorf("store: a group creation needs an attempt and a key")
 	}
 	const insert = `
-		INSERT INTO wac_group_create (sid, attempt, subject, started_at) VALUES (?, ?, ?, ?)
+		INSERT INTO wac_group_create (sid, attempt, create_key, subject, started_at, touched_at)
+		VALUES (?, ?, ?, ?, ?, ?)
 		ON CONFLICT (sid, attempt) DO NOTHING`
+	began := now.UnixMilli()
 	done, err := s.container.db.ExecContext(ctx, s.container.rebind(insert),
-		s.sid, attempt, subject, now.UnixMilli())
+		s.sid, attempt, key, subject, began, began)
 	if err != nil {
 		return GroupCreation{}, false, fmt.Errorf("store: begin the group creation %s of %s: %w", attempt, s.sid, err)
 	}
 	if written, err := done.RowsAffected(); err == nil && written == 1 {
-		// Nothing was there, so nothing has been attempted: this delivery is the first.
-		return GroupCreation{Subject: subject, StartedAt: now}, false, nil
+		// Nothing was on record, so nothing has been attempted: this delivery is the first.
+		return GroupCreation{Key: key, Subject: subject, StartedAt: now}, false, nil
 	}
-	// A row was already there. Read rather than assumed, because what bounds the search is
-	// the first delivery's instant and subject, not this one's.
+	// A row was already there, and what it says goes: the key this attempt is findable
+	// under is the one the first delivery sent, not the one this delivery brought.
 	return s.container.groupCreation(ctx, s.sid, attempt)
 }
 
-// FinishGroupCreate names the group an attempt made.
+// FinishGroupCreate names the group an attempt made, by the name it was filed under.
 //
-// Only the first naming stands. A later attempt that reconciled its way to a group and a
-// first attempt that came back slowly are both writing what they believe the answer is, and
-// two answers to one command have to be one answer.
+// Only the first naming stands. One command has one answer, and both the creation's own
+// reply and WhatsApp's notification can arrive carrying it.
 func (s *Scoped) FinishGroupCreate(ctx context.Context, attempt, jid string) error {
 	if err := s.fence.held(); err != nil {
 		return err
@@ -76,7 +84,7 @@ func (s *Scoped) FinishGroupCreate(ctx context.Context, attempt, jid string) err
 		return fmt.Errorf("store: a finished group creation needs the group it made")
 	}
 	const name = `
-		UPDATE wac_group_create SET group_jid = ?, settled_at = ?
+		UPDATE wac_group_create SET group_jid = ?, touched_at = ?
 		WHERE sid = ? AND attempt = ? AND group_jid IS NULL`
 	if _, err := s.container.db.ExecContext(ctx, s.container.rebind(name),
 		jid, time.Now().UnixMilli(), s.sid, attempt); err != nil {
@@ -85,13 +93,41 @@ func (s *Scoped) FinishGroupCreate(ctx context.Context, attempt, jid string) err
 	return nil
 }
 
-// AbandonGroupCreate forgets an attempt that definitely made nothing.
+// FinishGroupCreateByKey names the group for whichever attempt was sent under this key, and
+// reports whether there was one waiting for it.
 //
-// The intent exists to say "a group may have been made and nobody wrote down which one".
-// An attempt WhatsApp refused made nothing, so it says no such thing, and leaving it open
-// would be worse than useless: an open attempt is what stops a later one at the same name
-// from reconciling, so two refused requests would block every retry of either, for good --
-// neither can settle, and the sweep does not take open rows.
+// This is the path WhatsApp's own notification takes, and the key is what makes it exact:
+// the notification carries back what the creation went out with, so the group in hand
+// belongs to that attempt and to no other -- including when the attempt was made by an
+// instance that is no longer running, which is the case this whole table exists for.
+func (s *Scoped) FinishGroupCreateByKey(ctx context.Context, key, jid string) (bool, error) {
+	if err := s.fence.held(); err != nil {
+		return false, err
+	}
+	if key == "" || jid == "" {
+		return false, fmt.Errorf("store: naming a group by its key needs both the key and the group")
+	}
+	const name = `
+		UPDATE wac_group_create SET group_jid = ?, touched_at = ?
+		WHERE sid = ? AND create_key = ? AND group_jid IS NULL`
+	done, err := s.container.db.ExecContext(ctx, s.container.rebind(name),
+		jid, time.Now().UnixMilli(), s.sid, key)
+	if err != nil {
+		return false, fmt.Errorf("store: finish the group creation under %s of %s: %w", key, s.sid, err)
+	}
+	named, err := done.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("store: count what naming the creation under %s of %s settled: %w", key, s.sid, err)
+	}
+	return named > 0, nil
+}
+
+// AbandonGroupCreate forgets an attempt that certainly made nothing.
+//
+// The intent exists to say "a group may have been made and nobody has written down which
+// one". An attempt WhatsApp refused says no such thing, so the row is a redelivery's cover
+// for a group that does not exist: left behind, it would have every later request for it
+// wait on a notification that is never coming.
 //
 // Refuses to forget an attempt that already named a group. That one is the answer a
 // redelivery is owed, and this call is not the one that decides it was wrong.
@@ -106,19 +142,55 @@ func (s *Scoped) AbandonGroupCreate(ctx context.Context, attempt string) error {
 	return nil
 }
 
+// GroupsClaimedByOtherAttempts is every group this session's other attempts have already
+// been told they made.
+//
+// Only ever used to rule a group out. An attempt still waiting to hear which group is its
+// own has to decide whether anything it sees could be that group, and one that another
+// attempt of this session has already been given by name certainly is not -- WhatsApp named
+// that one by its key, and a group answers to one key.
+//
+// Scoped to the session, like every read here: what another session's account made is not
+// in this account's groups to begin with.
+func (s *Scoped) GroupsClaimedByOtherAttempts(ctx context.Context, attempt string) (map[string]bool, error) {
+	const read = `
+		SELECT group_jid FROM wac_group_create
+		WHERE sid = ? AND attempt <> ? AND group_jid IS NOT NULL`
+	rows, err := s.container.db.QueryContext(ctx, s.container.rebind(read), s.sid, attempt)
+	if err != nil {
+		return nil, fmt.Errorf("store: read the groups %s already claimed: %w", s.sid, err)
+	}
+	defer func() { _ = rows.Close() }()
+	claimed := map[string]bool{}
+	for rows.Next() {
+		var jid string
+		if err := rows.Scan(&jid); err != nil {
+			return nil, fmt.Errorf("store: read a group %s already claimed: %w", s.sid, err)
+		}
+		claimed[jid] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: read the groups %s already claimed: %w", s.sid, err)
+	}
+	return claimed, nil
+}
+
 // GroupCreation reads what is on record for one attempt.
 func (s *Scoped) GroupCreation(ctx context.Context, attempt string) (GroupCreation, bool, error) {
 	return s.container.groupCreation(ctx, s.sid, attempt)
 }
 
 func (c *Container) groupCreation(ctx context.Context, sid, attempt string) (GroupCreation, bool, error) {
-	const read = `SELECT subject, started_at, group_jid FROM wac_group_create WHERE sid = ? AND attempt = ?`
+	const read = `
+		SELECT create_key, subject, started_at, group_jid FROM wac_group_create
+		WHERE sid = ? AND attempt = ?`
 	var (
 		found   GroupCreation
 		started int64
 		jid     sql.NullString
 	)
-	err := c.db.QueryRowContext(ctx, c.rebind(read), sid, attempt).Scan(&found.Subject, &started, &jid)
+	err := c.db.QueryRowContext(ctx, c.rebind(read), sid, attempt).
+		Scan(&found.Key, &found.Subject, &started, &jid)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		return GroupCreation{}, false, nil
@@ -129,88 +201,19 @@ func (c *Container) groupCreation(ctx context.Context, sid, attempt string) (Gro
 	return found, true, nil
 }
 
-// GroupsClaimedByOtherAttempts answers which groups this session has already recorded as
-// made by some attempt other than the one named.
-//
-// A search for the group an attempt made can only take one nothing else has claimed.
-// Without this, two requests for a group by the same name interleave badly: the first
-// writes its intent and dies before creating anything, the second creates its group, and
-// the first's retry finds that group, answers with it, and files it as its own -- so one
-// request is answered with another's conversation and the creation it asked for never
-// happens.
-func (s *Scoped) GroupsClaimedByOtherAttempts(ctx context.Context, except string) (map[string]struct{}, error) {
-	const read = `SELECT group_jid FROM wac_group_create WHERE sid = ? AND attempt <> ? AND group_jid IS NOT NULL`
-	rows, err := s.container.db.QueryContext(ctx, s.container.rebind(read), s.sid, except)
-	if err != nil {
-		return nil, fmt.Errorf("store: read the groups %s has already made: %w", s.sid, err)
-	}
-	defer func() { _ = rows.Close() }()
-	claimed := map[string]struct{}{}
-	for rows.Next() {
-		var jid string
-		if err := rows.Scan(&jid); err != nil {
-			return nil, fmt.Errorf("store: read the groups %s has already made: %w", s.sid, err)
-		}
-		claimed[jid] = struct{}{}
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("store: read the groups %s has already made: %w", s.sid, err)
-	}
-	return claimed, nil
-}
-
-// OtherAttemptsStillOpen reports whether this session has another attempt at a group by
-// this subject that has not settled.
-//
-// It is what says a search cannot be trusted. Two unfinished attempts for the same subject
-// make a group that matches both, and nothing on WhatsApp separates them: subject, creator
-// and instant are the same evidence for each. Answering one of them with that group hands a
-// request another's conversation and skips the creation it asked for, silently. Refusing is
-// the honest answer, and it is one a retry can recover from once the other attempt settles.
-func (s *Scoped) OtherAttemptsStillOpen(ctx context.Context, except, subject string) (bool, error) {
-	const read = `
-		SELECT 1 FROM wac_group_create
-		WHERE sid = ? AND attempt <> ? AND subject = ? AND group_jid IS NULL LIMIT 1`
-	var open int
-	err := s.container.db.QueryRowContext(ctx, s.container.rebind(read), s.sid, except, subject).Scan(&open)
-	switch {
-	case errors.Is(err, sql.ErrNoRows):
-		return false, nil
-	case err != nil:
-		return false, fmt.Errorf("store: read the open group creations of %s: %w", s.sid, err)
-	}
-	return true, nil
-}
-
-// SweepGroupCreations drops the attempts that settled before the cutoff, and reports how
+// SweepGroupCreations drops the attempts last written before the cutoff, and reports how
 // many. Without a sweep the row count is the number of groups the deployment has ever made.
 //
-// Two things it deliberately does not do. It does not go by when an attempt began, because
-// what the row covers is a redelivery, and a delivery can sit pending for as long as nobody
-// acknowledges it: an attempt begun long ago whose command is still in flight needs its row
-// exactly as much as a fresh one. And it never drops an attempt that has not settled, which
-// is the only row here that cannot be reconstructed -- something asked WhatsApp for a group
-// and did not get as far as writing down what it made, and the intent is the only thing that
-// says where to look. One row per crash in that window is a price worth paying for it.
+// By when the row was last written rather than when it began: what it covers is a
+// redelivery, and a delivery can sit pending for as long as nobody acknowledges it, so an
+// attempt still waiting to hear which group it made needs its row as much as a fresh one.
 //
 // What is left, stated rather than hidden: a redelivery arriving after both the ledger and
 // this record have forgotten the command makes a second group, and no finite retention
 // removes that. What bounds it in practice is the client's own `MAXLEN` trim on the command
 // stream, which is a length and not a time and so is not this table's to measure.
 func (c *Container) SweepGroupCreations(ctx context.Context, before time.Time) (int64, error) {
-	// A settled row is not only an answer, it is also what rules its group out of another
-	// attempt's search. Dropping it while an attempt at the same name is still open would
-	// hand that attempt this group -- the retry would find it, no longer see it ruled out,
-	// and report success with a conversation another request made. So a claim outlives the
-	// cutoff for as long as anything could still match it.
-	const drop = `
-		DELETE FROM wac_group_create
-		WHERE settled_at IS NOT NULL AND settled_at < ?
-		  AND NOT EXISTS (
-			SELECT 1 FROM wac_group_create open_attempt
-			WHERE open_attempt.sid = wac_group_create.sid
-			  AND open_attempt.subject = wac_group_create.subject
-			  AND open_attempt.group_jid IS NULL)`
+	const drop = `DELETE FROM wac_group_create WHERE touched_at < ?`
 	done, err := c.db.ExecContext(ctx, c.rebind(drop), before.UnixMilli())
 	if err != nil {
 		return 0, fmt.Errorf("store: sweep the group creations: %w", err)

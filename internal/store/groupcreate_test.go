@@ -8,9 +8,8 @@ import (
 )
 
 // The intent is what a later delivery goes on, so a later delivery must not rewrite it.
-// Moving the instant forward would put the group the first attempt made before its own
-// intent, and the search would miss it: the duplicate, caused by the record meant to
-// prevent it.
+// The key above all: it is what the creation was sent under and what WhatsApp echoes back,
+// so a redelivery that overwrote it would be waiting under a name nothing will ever answer.
 func TestALaterDeliveryDoesNotMoveTheIntentItFound(t *testing.T) {
 	t.Parallel()
 	container := open(t)
@@ -18,42 +17,45 @@ func TestALaterDeliveryDoesNotMoveTheIntentItFound(t *testing.T) {
 	scoped := container.For("sid-1")
 
 	began := time.Now().Add(-time.Hour)
-	if _, found, err := scoped.BeginGroupCreate(ctx, "idem:k", "Obras", began); err != nil {
+	if _, found, err := scoped.BeginGroupCreate(ctx, "idem:k", "WACFIRST", "Obras", began); err != nil {
 		t.Fatalf("the first delivery: %v", err)
 	} else if found {
 		t.Fatal("the first delivery was reported as one that had been here before")
 	}
 
-	again, found, err := scoped.BeginGroupCreate(ctx, "idem:k", "Obras", time.Now())
+	again, found, err := scoped.BeginGroupCreate(ctx, "idem:k", "WACSECOND", "Obras", time.Now())
 	if err != nil {
 		t.Fatalf("the second delivery: %v", err)
 	}
 	if !found {
 		t.Fatal("the second delivery was not reported as a redelivery")
 	}
+	if again.Key != "WACFIRST" {
+		t.Fatalf("the attempt now reads %s, want the key its creation was sent under, WACFIRST", again.Key)
+	}
 	if got := again.StartedAt.UnixMilli(); got != began.UnixMilli() {
-		t.Fatalf("the intent now reads %d, want the first delivery's %d: a search from here would miss the group",
-			got, began.UnixMilli())
+		t.Fatalf("the intent now reads %d, want the first delivery's %d", got, began.UnixMilli())
 	}
 }
 
-// Two answers to one command have to be one answer. A later attempt that reconciled its way
-// to a group and a first attempt that came back slowly both write what they believe, and the
-// first naming is the one every delivery after it has already been answered with.
+// Two answers to one command have to be one answer. WhatsApp's notification and the
+// creation's own reply both say which group was made, and they can arrive in either order.
 func TestNamingAGroupTwiceKeepsTheFirstName(t *testing.T) {
 	t.Parallel()
 	container := open(t)
 	ctx := t.Context()
 	scoped := container.For("sid-1")
 
-	if _, _, err := scoped.BeginGroupCreate(ctx, "idem:k", "Obras", time.Now()); err != nil {
+	if _, _, err := scoped.BeginGroupCreate(ctx, "idem:k", "WACK", "Obras", time.Now()); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	if err := scoped.FinishGroupCreate(ctx, "idem:k", "120363041234567890@g.us"); err != nil {
 		t.Fatalf("the first naming: %v", err)
 	}
-	if err := scoped.FinishGroupCreate(ctx, "idem:k", "120363099999999999@g.us"); err != nil {
+	if named, err := scoped.FinishGroupCreateByKey(ctx, "WACK", "120363099999999999@g.us"); err != nil {
 		t.Fatalf("the second naming: %v", err)
+	} else if named {
+		t.Fatal("the second naming reported that it settled an attempt that was already answered")
 	}
 
 	found, ok, err := scoped.GroupCreation(ctx, "idem:k")
@@ -62,6 +64,71 @@ func TestNamingAGroupTwiceKeepsTheFirstName(t *testing.T) {
 	}
 	if found.JID != "120363041234567890@g.us" {
 		t.Fatalf("the attempt now names %s, want the group it was first answered with", found.JID)
+	}
+}
+
+// The key is how WhatsApp's own notification finds the attempt that sent it, and that is
+// the whole mechanism: the instance that wrote the intent may be gone, so the pairing has
+// to be findable from nothing but what comes back on the wire.
+func TestANotificationNamesTheGroupByTheKeyItsCreationWasSentUnder(t *testing.T) {
+	t.Parallel()
+	container := open(t)
+	ctx := t.Context()
+	scoped := container.For("sid-1")
+
+	if _, _, err := scoped.BeginGroupCreate(ctx, "idem:k", "WACK", "Obras", time.Now()); err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	named, err := scoped.FinishGroupCreateByKey(ctx, "WACK", "120363041234567890@g.us")
+	if err != nil {
+		t.Fatalf("name it by its key: %v", err)
+	}
+	if !named {
+		t.Fatal("the notification settled nothing, so the command it answers waits for good")
+	}
+	found, _, err := scoped.GroupCreation(ctx, "idem:k")
+	if err != nil {
+		t.Fatalf("read it back: %v", err)
+	}
+	if found.JID != "120363041234567890@g.us" {
+		t.Fatalf("the attempt names %q, want the group the notification carried", found.JID)
+	}
+
+	// A key nothing is waiting under settles nothing, and says so: most groups an account
+	// joins were made by somebody else.
+	if named, err := scoped.FinishGroupCreateByKey(ctx, "WACSTRANGER", "120363099999999999@g.us"); err != nil {
+		t.Fatalf("a key nothing is waiting under: %v", err)
+	} else if named {
+		t.Fatal("a key no attempt was filed under was reported as having settled one")
+	}
+}
+
+// The key is this session's, and a notification is about this account's group. Another
+// session's attempt under the same key is another account's business, and settling it from
+// here would answer one client's command with another's group.
+func TestAKeyIsOnlyLookedForInItsOwnSession(t *testing.T) {
+	t.Parallel()
+	container := open(t)
+	ctx := t.Context()
+	mine, theirs := container.For("sid-1"), container.For("sid-2")
+
+	began := time.Now()
+	if _, _, err := mine.BeginGroupCreate(ctx, "idem:k", "WACSHARED", "Obras", began); err != nil {
+		t.Fatalf("begin this session's: %v", err)
+	}
+	if _, _, err := theirs.BeginGroupCreate(ctx, "idem:k", "WACSHARED", "Obras", began); err != nil {
+		t.Fatalf("begin the other session's: %v", err)
+	}
+
+	if _, err := mine.FinishGroupCreateByKey(ctx, "WACSHARED", "120363041234567890@g.us"); err != nil {
+		t.Fatalf("name this session's group: %v", err)
+	}
+	other, _, err := theirs.GroupCreation(ctx, "idem:k")
+	if err != nil {
+		t.Fatalf("read the other session's attempt: %v", err)
+	}
+	if other.Done() {
+		t.Fatalf("the other session's attempt was settled with %s, a group of this session's", other.JID)
 	}
 }
 
@@ -74,16 +141,19 @@ func TestASessionThatLostTheLeaseCannotRecordACreation(t *testing.T) {
 	ctx := t.Context()
 
 	losing := container.For("sid-1")
-	if _, _, err := losing.BeginGroupCreate(ctx, "idem:k", "Obras", time.Now()); err != nil {
+	if _, _, err := losing.BeginGroupCreate(ctx, "idem:k", "WACK", "Obras", time.Now()); err != nil {
 		t.Fatalf("begin while it still owned the session: %v", err)
 	}
 	losing.Drop()
 
-	if _, _, err := losing.BeginGroupCreate(ctx, "idem:other", "Obras", time.Now()); err == nil {
+	if _, _, err := losing.BeginGroupCreate(ctx, "idem:other", "WACOTHER", "Obras", time.Now()); err == nil {
 		t.Fatal("a session that lost the lease wrote the intent to make a group")
 	}
 	if err := losing.FinishGroupCreate(ctx, "idem:k", "120363041234567890@g.us"); err == nil {
 		t.Fatal("a session that lost the lease recorded the group a creation made")
+	}
+	if _, err := losing.FinishGroupCreateByKey(ctx, "WACK", "120363041234567890@g.us"); err == nil {
+		t.Fatal("a session that lost the lease recorded a group from a notification")
 	}
 	// And nothing reached the table: a fence that answers after writing passes the checks
 	// above and still leaves the row behind.
@@ -97,10 +167,10 @@ func TestASessionThatLostTheLeaseCannotRecordACreation(t *testing.T) {
 }
 
 // The sweep exists so the row count is not the number of groups the deployment has ever
-// made, and it must not take a record a delivery still needs. Two things follow: an attempt
-// that settled inside the window stays, and one that never settled stays whatever its age --
-// it is the only row here that cannot be reconstructed.
-func TestTheSweepTakesOnlyWhatSettledLongAgo(t *testing.T) {
+// made, and it must not take a record a delivery still needs. It goes by when the row was
+// last written, not by when it began: an attempt still waiting to hear which group it made
+// is the one row here that cannot be reconstructed.
+func TestTheSweepTakesOnlyWhatWasLastWrittenLongAgo(t *testing.T) {
 	t.Parallel()
 	// The address is kept because this test writes one statement of its own, and the two
 	// dialects spell a placeholder differently: `?` reaches Postgres verbatim through
@@ -110,13 +180,11 @@ func TestTheSweepTakesOnlyWhatSettledLongAgo(t *testing.T) {
 	ctx := t.Context()
 	scoped := container.For("sid-1")
 
-	for attempt, subject := range map[string]string{
-		"idem:old": "Obras", "idem:fresh": "Obras",
-		// Open, and under a name of its own: an open attempt at the same name keeps a
-		// settled row alive, which is its own test below.
-		"idem:open": "Churrasco",
+	long := time.Now().Add(-72 * time.Hour)
+	for attempt, key := range map[string]string{
+		"idem:old": "WACOLD", "idem:fresh": "WACFRESH", "idem:open": "WACOPEN",
 	} {
-		if _, _, err := scoped.BeginGroupCreate(ctx, attempt, subject, time.Now().Add(-72*time.Hour)); err != nil {
+		if _, _, err := scoped.BeginGroupCreate(ctx, attempt, key, "Obras", long); err != nil {
 			t.Fatalf("begin %s: %v", attempt, err)
 		}
 	}
@@ -126,11 +194,11 @@ func TestTheSweepTakesOnlyWhatSettledLongAgo(t *testing.T) {
 	if err := scoped.FinishGroupCreate(ctx, "idem:fresh", "120363042222222222@g.us"); err != nil {
 		t.Fatalf("settle the fresh one: %v", err)
 	}
-	// The old one settled long ago; the fresh one settled just now. Both began long ago,
-	// which is exactly what the sweep must not go by.
+	// The old one was last written long ago; the fresh one just now. Both began long ago,
+	// and the open one has not been written since it began, so the cutoff takes it too.
 	if _, err := container.DB().ExecContext(ctx, target.Rebind(
-		`UPDATE wac_group_create SET settled_at = ? WHERE sid = ? AND attempt = ?`),
-		time.Now().Add(-72*time.Hour).UnixMilli(), "sid-1", "idem:old"); err != nil {
+		`UPDATE wac_group_create SET touched_at = ? WHERE sid = ? AND attempt = ?`),
+		long.UnixMilli(), "sid-1", "idem:old"); err != nil {
 		t.Fatalf("date the old settlement: %v", err)
 	}
 
@@ -138,10 +206,10 @@ func TestTheSweepTakesOnlyWhatSettledLongAgo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sweep: %v", err)
 	}
-	if swept != 1 {
-		t.Fatalf("the sweep took %d rows, want the one that settled before the cutoff", swept)
+	if swept != 2 {
+		t.Fatalf("the sweep took %d rows, want the two last written before the cutoff", swept)
 	}
-	for attempt, want := range map[string]bool{"idem:old": false, "idem:fresh": true, "idem:open": true} {
+	for attempt, want := range map[string]bool{"idem:old": false, "idem:fresh": true, "idem:open": false} {
 		_, found, err := scoped.GroupCreation(ctx, attempt)
 		if err != nil {
 			t.Fatalf("read %s: %v", attempt, err)
@@ -152,75 +220,24 @@ func TestTheSweepTakesOnlyWhatSettledLongAgo(t *testing.T) {
 	}
 }
 
-// A settled row is not only an answer: it is also what rules its group out of another
-// attempt's search. Dropping it while an attempt at the same name is still open would hand
-// that attempt this group, so the claim outlives the cutoff for as long as anything could
-// still match it.
-func TestTheSweepKeepsAClaimAnOpenAttemptCouldStillMatch(t *testing.T) {
+// An attempt that made nothing says nothing, and left on record it would have every later
+// request under that name wait on a notification about a group that does not exist.
+func TestAnAbandonedAttemptIsGone(t *testing.T) {
 	t.Parallel()
 	container := open(t)
 	ctx := t.Context()
 	scoped := container.For("sid-1")
 
-	long := time.Now().Add(-72 * time.Hour)
-	if _, _, err := scoped.BeginGroupCreate(ctx, "idem:settled", "Obras", long); err != nil {
-		t.Fatalf("begin the one that settled: %v", err)
-	}
-	if err := scoped.FinishGroupCreate(ctx, "idem:settled", "120363041111111111@g.us"); err != nil {
-		t.Fatalf("settle it: %v", err)
-	}
-	// Still open, same name: its retry is exactly who would take the group above.
-	if _, _, err := scoped.BeginGroupCreate(ctx, "idem:open", "Obras", long); err != nil {
-		t.Fatalf("begin the open one: %v", err)
-	}
-
-	if swept, err := container.SweepGroupCreations(ctx, time.Now()); err != nil {
-		t.Fatalf("sweep: %v", err)
-	} else if swept != 0 {
-		t.Fatalf("the sweep took %d rows while an open attempt at that name could still match them", swept)
-	}
-
-	// With the open one settled, nothing could match it any more and the claim can go.
-	if err := scoped.FinishGroupCreate(ctx, "idem:open", "120363042222222222@g.us"); err != nil {
-		t.Fatalf("settle the open one: %v", err)
-	}
-	if swept, err := container.SweepGroupCreations(ctx, time.Now()); err != nil {
-		t.Fatalf("the second sweep: %v", err)
-	} else if swept != 2 {
-		t.Fatalf("the second sweep took %d rows, want both now that nothing is open", swept)
-	}
-}
-
-// An attempt that WhatsApp refused made nothing, so it says nothing, and leaving it open
-// would stop every later request for a group by that name from reconciling -- for good,
-// because an open attempt never settles and the sweep does not take open rows.
-func TestAnAbandonedAttemptStopsContestingAndIsGone(t *testing.T) {
-	t.Parallel()
-	container := open(t)
-	ctx := t.Context()
-	scoped := container.For("sid-1")
-
-	began := time.Now()
-	if _, _, err := scoped.BeginGroupCreate(ctx, "idem:refused", "Obras", began); err != nil {
+	if _, _, err := scoped.BeginGroupCreate(ctx, "idem:refused", "WACNO", "Obras", time.Now()); err != nil {
 		t.Fatalf("begin the one WhatsApp refused: %v", err)
 	}
-	if _, _, err := scoped.BeginGroupCreate(ctx, "idem:mine", "Obras", began); err != nil {
-		t.Fatalf("begin this one: %v", err)
-	}
-	if contested, err := scoped.OtherAttemptsStillOpen(ctx, "idem:mine", "Obras"); err != nil || !contested {
-		t.Fatalf("before abandoning: contested=%v, err=%v, want it contested", contested, err)
-	}
-
 	if err := scoped.AbandonGroupCreate(ctx, "idem:refused"); err != nil {
 		t.Fatalf("abandon it: %v", err)
 	}
 	if _, found, err := scoped.GroupCreation(ctx, "idem:refused"); err != nil {
 		t.Fatalf("read it back: %v", err)
 	} else if found {
-		t.Fatal("the abandoned attempt is still on record, so it still blocks every retry of that name")
-	}
-	if contested, err := scoped.OtherAttemptsStillOpen(ctx, "idem:mine", "Obras"); err != nil || contested {
-		t.Fatalf("after abandoning: contested=%v, err=%v, want nothing contesting", contested, err)
+		t.Fatal("the abandoned attempt is still on record, where every retry of that name waits on it")
 	}
 }
 
@@ -233,7 +250,7 @@ func TestAnAttemptThatNamedAGroupIsNotAbandoned(t *testing.T) {
 	ctx := t.Context()
 	scoped := container.For("sid-1")
 
-	if _, _, err := scoped.BeginGroupCreate(ctx, "idem:k", "Obras", time.Now()); err != nil {
+	if _, _, err := scoped.BeginGroupCreate(ctx, "idem:k", "WACK", "Obras", time.Now()); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
 	if err := scoped.FinishGroupCreate(ctx, "idem:k", "120363041234567890@g.us"); err != nil {
@@ -251,65 +268,9 @@ func TestAnAttemptThatNamedAGroupIsNotAbandoned(t *testing.T) {
 	}
 }
 
-// An attempt at a group by another name is not competition, and one that settled is not
-// either: what makes a search untrustworthy is another attempt at the same name that has
-// not finished, because a group that matches one matches both.
-func TestOnlyAnUnsettledAttemptAtTheSameNameContestsASearch(t *testing.T) {
-	t.Parallel()
-	container := open(t)
-	ctx := t.Context()
-	scoped := container.For("sid-1")
-
-	began := time.Now()
-	for _, attempt := range []string{"idem:mine", "idem:other-name", "idem:settled", "idem:open"} {
-		subject := "Obras"
-		if attempt == "idem:other-name" {
-			subject = "Churrasco"
-		}
-		if _, _, err := scoped.BeginGroupCreate(ctx, attempt, subject, began); err != nil {
-			t.Fatalf("begin %s: %v", attempt, err)
-		}
-	}
-	if err := scoped.FinishGroupCreate(ctx, "idem:settled", "120363041111111111@g.us"); err != nil {
-		t.Fatalf("settle one: %v", err)
-	}
-
-	contested, err := scoped.OtherAttemptsStillOpen(ctx, "idem:mine", "Obras")
-	if err != nil {
-		t.Fatalf("OtherAttemptsStillOpen: %v", err)
-	}
-	if !contested {
-		t.Fatal("an open attempt at a group by the same name was not counted as competition")
-	}
-
-	// With the open one settled, nothing is in doubt any more.
-	if err := scoped.FinishGroupCreate(ctx, "idem:open", "120363042222222222@g.us"); err != nil {
-		t.Fatalf("settle the open one: %v", err)
-	}
-	contested, err = scoped.OtherAttemptsStillOpen(ctx, "idem:mine", "Obras")
-	if err != nil {
-		t.Fatalf("OtherAttemptsStillOpen: %v", err)
-	}
-	if contested {
-		t.Fatal("a search was called contested with every competing attempt settled")
-	}
-
-	// And another session's open attempt is not this one's competition.
-	if _, _, err := container.For("sid-2").BeginGroupCreate(ctx, "idem:theirs", "Obras", began); err != nil {
-		t.Fatalf("begin another session's attempt: %v", err)
-	}
-	contested, err = scoped.OtherAttemptsStillOpen(ctx, "idem:mine", "Obras")
-	if err != nil {
-		t.Fatalf("OtherAttemptsStillOpen: %v", err)
-	}
-	if contested {
-		t.Fatal("another session's open attempt was counted against this one")
-	}
-}
-
-// The groups a search rules out are the ones this session has already filed under another
-// name, and only those: an attempt that has not named a group rules nothing out, and another
-// session's records are not this one's.
+// The groups an attempt can rule out are the ones this session has already been told belong
+// to another of its attempts, and only those: an attempt that has not been told rules
+// nothing out, and another session's records are not this one's.
 func TestOnlyThisSessionsNamedGroupsAreRuledOut(t *testing.T) {
 	t.Parallel()
 	container := open(t)
@@ -317,16 +278,16 @@ func TestOnlyThisSessionsNamedGroupsAreRuledOut(t *testing.T) {
 	scoped := container.For("sid-1")
 
 	began := time.Now()
-	if _, _, err := scoped.BeginGroupCreate(ctx, "idem:mine", "Obras", began); err != nil {
+	if _, _, err := scoped.BeginGroupCreate(ctx, "idem:mine", "WACMINE", "Obras", began); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	if _, _, err := scoped.BeginGroupCreate(ctx, "idem:sibling", "Obras", began); err != nil {
+	if _, _, err := scoped.BeginGroupCreate(ctx, "idem:sibling", "WACSIB", "Obras", began); err != nil {
 		t.Fatalf("begin the sibling: %v", err)
 	}
 	if err := scoped.FinishGroupCreate(ctx, "idem:sibling", "120363041111111111@g.us"); err != nil {
 		t.Fatalf("name the sibling's group: %v", err)
 	}
-	if _, _, err := container.For("sid-2").BeginGroupCreate(ctx, "idem:theirs", "Obras", began); err != nil {
+	if _, _, err := container.For("sid-2").BeginGroupCreate(ctx, "idem:theirs", "WACTHEIRS", "Obras", began); err != nil {
 		t.Fatalf("begin another session's attempt: %v", err)
 	}
 	if err := container.For("sid-2").FinishGroupCreate(ctx, "idem:theirs", "120363042222222222@g.us"); err != nil {
@@ -337,13 +298,13 @@ func TestOnlyThisSessionsNamedGroupsAreRuledOut(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GroupsClaimedByOtherAttempts: %v", err)
 	}
-	if _, ruled := claimed["120363041111111111@g.us"]; !ruled {
-		t.Fatal("a group this session already filed under another name was not ruled out")
+	if !claimed["120363041111111111@g.us"] {
+		t.Fatal("a group this session was already told belongs to another attempt was not ruled out")
 	}
-	if _, ruled := claimed["120363042222222222@g.us"]; ruled {
-		t.Fatal("another session's group was ruled out of this session's search")
+	if claimed["120363042222222222@g.us"] {
+		t.Fatal("another session's group was ruled out of this session's reading")
 	}
 	if len(claimed) != 1 {
-		t.Fatalf("the search rules out %v, want only this session's other attempt", claimed)
+		t.Fatalf("the reading rules out %v, want only this session's other attempt", claimed)
 	}
 }

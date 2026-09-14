@@ -613,7 +613,7 @@ func TestCreatingAGroupRefusesAPayloadItCannotCarryOut(t *testing.T) {
 			session, _ := newTestSession(t, "5511999990001")
 			session.setConnected(true)
 			session.createTheGroup = func(
-				context.Context, *wm.Client, wm.ReqCreateGroup,
+				context.Context, *wm.Client, keyedCreate,
 			) (*waTypes.GroupInfo, error) {
 				t.Error("a payload that names no group to create made one anyway")
 				return nil, nil
@@ -631,10 +631,10 @@ func TestCreatingAGroupSendsTheSubjectAndTheParticipants(t *testing.T) {
 	session, _ := newTestSession(t, "5511999990001")
 	session.setConnected(true)
 	session.createTheGroup = func(
-		_ context.Context, _ *wm.Client, req wm.ReqCreateGroup,
+		_ context.Context, _ *wm.Client, req keyedCreate,
 	) (*waTypes.GroupInfo, error) {
-		if req.Name != "Obras" {
-			t.Errorf("the group was called %q, want the subject that was asked", req.Name)
+		if req.Subject != "Obras" {
+			t.Errorf("the group was called %q, want the subject that was asked", req.Subject)
 		}
 		if len(req.Participants) != 2 ||
 			req.Participants[0].User != "5511999990002" || req.Participants[1].User != "77777777777777" {
@@ -672,7 +672,7 @@ func TestCreatingAGroupTakesAnEmptyGuestList(t *testing.T) {
 	session.setConnected(true)
 	asked := false
 	session.createTheGroup = func(
-		_ context.Context, _ *wm.Client, req wm.ReqCreateGroup,
+		_ context.Context, _ *wm.Client, req keyedCreate,
 	) (*waTypes.GroupInfo, error) {
 		asked = true
 		if len(req.Participants) != 0 {
@@ -699,7 +699,7 @@ func TestCreatingAGroupLeavesOutTheParticipantsWhatsAppRefused(t *testing.T) {
 	session, _ := newTestSession(t, "5511999990001")
 	session.setConnected(true)
 	session.createTheGroup = func(
-		context.Context, *wm.Client, wm.ReqCreateGroup,
+		context.Context, *wm.Client, keyedCreate,
 	) (*waTypes.GroupInfo, error) {
 		return &waTypes.GroupInfo{
 			JID:              waTypes.NewJID("120363041234567890", waTypes.GroupServer),
@@ -742,7 +742,7 @@ func TestCreatingAGroupNeedsAConnection(t *testing.T) {
 
 	session, _ := newTestSession(t, "5511999990001")
 	session.createTheGroup = func(
-		context.Context, *wm.Client, wm.ReqCreateGroup,
+		context.Context, *wm.Client, keyedCreate,
 	) (*waTypes.GroupInfo, error) {
 		t.Error("a disconnected session created a group anyway")
 		return nil, nil
@@ -758,7 +758,7 @@ func TestCreatingAGroupAnswersWhatsAppsRefusal(t *testing.T) {
 	session, _ := newTestSession(t, "5511999990001")
 	session.setConnected(true)
 	session.createTheGroup = func(
-		context.Context, *wm.Client, wm.ReqCreateGroup,
+		context.Context, *wm.Client, keyedCreate,
 	) (*waTypes.GroupInfo, error) {
 		// The name is longer than WhatsApp allows, which it answers with 406.
 		return nil, &wm.IQError{Code: 406, Text: "not-acceptable"}
@@ -786,7 +786,7 @@ func TestCreatingAGroupTellsAMissingGuestListFromAnEmptyOne(t *testing.T) {
 			session, _ := newTestSession(t, "5511999990001")
 			session.setConnected(true)
 			session.createTheGroup = func(
-				context.Context, *wm.Client, wm.ReqCreateGroup,
+				context.Context, *wm.Client, keyedCreate,
 			) (*waTypes.GroupInfo, error) {
 				t.Error("a payload that never said who to add created a group anyway")
 				return nil, nil
@@ -808,7 +808,7 @@ func TestCreatingAGroupAnswersTimeoutWhenItRanOutOfTime(t *testing.T) {
 	session, _ := newTestSession(t, "5511999990001")
 	session.setConnected(true)
 	session.createTheGroup = func(
-		ctx context.Context, _ *wm.Client, _ wm.ReqCreateGroup,
+		ctx context.Context, _ *wm.Client, _ keyedCreate,
 	) (*waTypes.GroupInfo, error) {
 		<-ctx.Done()
 		// Exactly what whatsmeow answers: the sentinel flattened into a string.

@@ -62,6 +62,15 @@ type joinedGroup struct {
 // `group.info` costs, which is a mapping read per participant this notification did not
 // name both namespaces for -- bounded by one group, and paid once.
 func (s *Session) joinedAGroup(event *waEvents.JoinedGroup) {
+	// Before anything else, including the filter below: this is the only place WhatsApp
+	// says which group a `group.create` made, and a session that is not carrying group
+	// traffic to its client still has the command's own answer to settle. The key is on the
+	// notification because the creation went out with it, so no other group can be mistaken
+	// for this one -- and a notification nobody acknowledged is redelivered on the next
+	// connection, which is how the instance that took a dead one's session over learns what
+	// it made (#131).
+	s.recordTheGroupACreationMade(event)
+
 	if !s.wantsGroups() {
 		// The client asked for direct chats only, and this is group traffic like any
 		// other: `session.connect` decides whether groups reach it at all, and a session
@@ -85,6 +94,38 @@ func (s *Session) joinedAGroup(event *waEvents.JoinedGroup) {
 	s.emit(protocol.EventGroupJoined, joinedGroup{
 		Info: s.describeGroup(ctx, withoutRefused(&event.GroupInfo)),
 	})
+}
+
+// recordTheGroupACreationMade writes down which group one of this session's creations
+// made, when WhatsApp's notification says so.
+//
+// Silent about everything else. Most groups an account joins were made by somebody else and
+// carry no key, and a key this session has no open attempt for belongs to a command that has
+// already been answered and swept -- neither is worth a line in the log.
+func (s *Session) recordTheGroupACreationMade(event *waEvents.JoinedGroup) {
+	if event.CreateKey == "" {
+		return
+	}
+	jid := event.JID.String()
+	// Its own bounded context rather than the one a publication runs on: this is a write
+	// that must happen whether or not the event goes anywhere, and it is the record a
+	// redelivered command is waiting on.
+	ctx, done := context.WithTimeout(s.ctx, s.storeLimit)
+	defer done()
+	named, err := s.store.FinishGroupCreateByKey(ctx, event.CreateKey, jid)
+	if err != nil {
+		// Loud, because this is the one moment the pairing is on offer: WhatsApp has
+		// acknowledged the notification by delivering it, and it will not come again. The
+		// command it belonged to now waits for something that will never arrive, and is
+		// answered as unsettled until the record is swept.
+		s.log.Error().Err(err).Str("sid", s.sid).Str("group", jid).
+			Msg("could not record which group a creation of this session made")
+		return
+	}
+	if named {
+		s.log.Info().Str("sid", s.sid).Str("group", jid).
+			Msg("WhatsApp named the group one of this session's creations made")
+	}
 }
 
 // groupChanged publishes what WhatsApp says changed about a group.

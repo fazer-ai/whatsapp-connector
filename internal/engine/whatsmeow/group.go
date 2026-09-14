@@ -2,12 +2,16 @@ package whatsmeow
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	wm "go.mau.fi/whatsmeow"
+	waBinary "go.mau.fi/whatsmeow/binary"
 	waTypes "go.mau.fi/whatsmeow/types"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
@@ -188,6 +192,122 @@ func joinedGroupsOverClient(ctx context.Context, client *wm.Client) ([]*waTypes.
 	return client.GetJoinedGroups(ctx) //nolint:wrapcheck // classified by its caller
 }
 
+// keyedCreate is one group this connector asks WhatsApp to make, and the name it asks
+// under.
+//
+// The key is the whole reason this is not `wm.ReqCreateGroup`: whatsmeow's own
+// `CreateGroup` sends no key, and without one an answer that goes missing cannot be tied
+// back to the command that asked for it.
+type keyedCreate struct {
+	Subject      string
+	Participants []waTypes.JID
+	// Key travels on the `create` stanza and comes back on the notification WhatsApp sends
+	// about the group. whatsmeow reads it off that notification as `JoinedGroup.CreateKey`.
+	Key string
+}
+
+// createKeyedGroupOverClient is the default for the seam: whatsmeow's own `CreateGroup`,
+// with the key on it and without the settings this connector never asks for.
+//
+// Hand-built because the key has nowhere else to go. `ReqCreateGroup` has no field for one
+// -- `JoinedGroup.CreateKey` documents a parameter that no longer exists on the request --
+// so the alternative is a fork of the library to add it, which is a dependency this
+// repository would then own. Everything the stanza needs is exported: the mapping and the
+// privacy token per participant, the IQ, and the parser for the answer, so none of what
+// whatsmeow knows about reading a group back is reimplemented here.
+//
+// What is copied is the shape of the request, and it is copied for one request shape only:
+// a plain group with a subject and a list of people. `group.create` sends nothing else --
+// no community, no lock, no announcement, no disappearing timer, no join approval -- so the
+// three settings below are the defaults `CreateGroup` fills in, spelled out rather than
+// inherited. A `group.create` that grows an option grows a node here, and the test that
+// pins this stanza is what says so.
+func createKeyedGroupOverClient(
+	ctx context.Context, client *wm.Client, req keyedCreate,
+) (*waTypes.GroupInfo, error) {
+	// Deprecated as "dangerous", and taken deliberately: the four calls below are the
+	// library's own, reached this way only because the key has no other route out. What the
+	// warning is about is reaching past the library's contract, which is what the comment
+	// above spells out the terms of.
+	inside := client.DangerousInternals() //nolint:staticcheck // the only route a keyed create has
+	asked := make([]waBinary.Node, 0, len(req.Participants)+3)
+	for _, participant := range req.Participants {
+		participant = participant.ToNonAD()
+		attrs := waBinary.Attrs{"jid": participant}
+		if participant.Server == waTypes.HiddenUserServer {
+			// A participant named by LID goes out with the phone number too, the same as
+			// whatsmeow sends it. A LID with no mapping on record is sent as it stands:
+			// WhatsApp answers for it, and refusing here would turn a participant this
+			// connector has never spoken to into a failed creation.
+			phone, err := client.Store.LIDs.GetPNForLID(ctx, participant)
+			if err != nil {
+				return nil, fmt.Errorf("%w: read the phone number of %s: %w", errCreateUnsent, participant, err)
+			}
+			if !phone.IsEmpty() {
+				attrs["phone_number"] = phone
+			}
+		}
+		node := waBinary.Node{Tag: "participant", Attrs: attrs}
+		token, err := inside.EnsureTCToken(ctx, participant)
+		if err != nil {
+			return nil, fmt.Errorf("%w: read the privacy token of %s: %w", errCreateUnsent, participant, err)
+		}
+		if len(token) > 0 {
+			node.Content = []waBinary.Node{{Tag: "privacy", Content: token}}
+		}
+		asked = append(asked, node)
+	}
+	answer, err := inside.SendIQ(ctx, wm.DangerousInfoQuery{
+		Namespace: "w:g2",
+		Type:      createIQ,
+		To:        waTypes.GroupServerJID,
+		Content:   []waBinary.Node{theCreateStanza(req.Subject, req.Key, asked)},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create a group: %w", err)
+	}
+	group, found := answer.GetOptionalChildByTag("group")
+	if !found {
+		return nil, &wm.ElementMissingError{Tag: "group", In: "response to create group query"}
+	}
+	return inside.ParseGroupNode(&group) //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
+}
+
+// theCreateStanza is the `create` node a group is asked for with, people and all.
+//
+// Its own function so a test can read it without a socket. The key is the attribute this
+// whole mechanism turns on; the three settings after the participants are the ones
+// whatsmeow's `CreateGroup` fills in for a request that asks for none of them, and they are
+// spelled out here because nothing else is filling them in any more.
+func theCreateStanza(subject, key string, people []waBinary.Node) waBinary.Node {
+	content := make([]waBinary.Node, 0, len(people)+3)
+	content = append(content, people...)
+	content = append(content,
+		waBinary.Node{Tag: "member_add_mode", Content: string(waTypes.GroupMemberAddModeAllMember)},
+		waBinary.Node{Tag: "ephemeral", Attrs: waBinary.Attrs{"expiration": 0}},
+		waBinary.Node{Tag: "membership_approval_mode", Content: []waBinary.Node{{
+			Tag: "group_join", Attrs: waBinary.Attrs{"state": "off"},
+		}}},
+	)
+	return waBinary.Node{
+		Tag:     "create",
+		Attrs:   waBinary.Attrs{"subject": subject, "key": key},
+		Content: content,
+	}
+}
+
+// createIQ is the `set` a creation is sent as. whatsmeow keeps the constant unexported and
+// exports the type, so the string is spelled here.
+const createIQ = wm.DangerousInfoQueryType("set")
+
+// errCreateUnsent marks a creation that failed before the stanza could go out.
+//
+// It is what separates "this connector could not build the request" from "WhatsApp was
+// asked and something went wrong": the first made no group and the record of it can be
+// forgotten, and reading the second as the first is how a group that exists loses the only
+// note saying it does.
+var errCreateUnsent = errors.New("the creation was never sent")
+
 // groupInfoOverClient is the default for the seam.
 func groupInfoOverClient(ctx context.Context, client *wm.Client, group waTypes.JID) (*waTypes.GroupInfo, error) {
 	return client.GetGroupInfo(ctx, group) //nolint:wrapcheck // classified by its caller
@@ -333,7 +453,11 @@ func (s *Session) createGroup(ctx context.Context, command *protocol.Command) (j
 	// writes: a payload this connector will not send, or a command nobody is waiting for
 	// any more, must leave no trace that a later delivery would take for an attempt.
 	attempt := attemptName(command)
-	began, begun, err := s.store.BeginGroupCreate(ctx, attempt, req.Subject, time.Now())
+	key, err := newCreateKey()
+	if err != nil {
+		return nil, protocol.NewError(protocol.ErrorInternal, "a group creation could not be named")
+	}
+	began, begun, err := s.store.BeginGroupCreate(ctx, attempt, key, req.Subject, time.Now())
 	if err != nil {
 		// The intent could not be written, so the cover is not there. Refused rather than
 		// created: the caller's retry costs them a command, and creating anyway costs
@@ -341,8 +465,8 @@ func (s *Session) createGroup(ctx context.Context, command *protocol.Command) (j
 		return nil, contactFailure(err, "group creation")
 	}
 	if begun {
-		// This command has been here before. Either it finished and the answer is on
-		// record, or it did not and the group it may have made is findable.
+		// This command has been here before. Either WhatsApp has already said which group
+		// it made, or it has not and the question is whether it made one at all.
 		if made, found, err := s.groupFromEarlierAttempt(ctx, attempt, began); err != nil {
 			return nil, err
 		} else if found {
@@ -350,29 +474,27 @@ func (s *Session) createGroup(ctx context.Context, command *protocol.Command) (j
 		}
 	}
 
-	made, err := s.createTheGroup(ctx, s.current(), wm.ReqCreateGroup{
-		Name: req.Subject, Participants: asked,
+	// Under the key that is on record, which on a redelivery is the first delivery's and
+	// not the one generated above: the notification WhatsApp sends carries that one back.
+	made, err := s.createTheGroup(ctx, s.current(), keyedCreate{
+		Subject: req.Subject, Participants: asked, Key: began.Key,
 	})
 	if err != nil {
-		// The context first, because this one call can lose it. `CreateGroup` reads the
-		// LID mapping and a privacy token per participant before it sends anything, and
-		// it wraps a failure there with `%v` rather than `%w` -- so a deadline that
-		// expires mid-lookup arrives as text, `errors.Is` cannot see it, and a command
-		// that ran out of time would be reported as a fault in this connector.
+		// The context first, because it is the ambiguous failure this whole mechanism is
+		// for and every other reading of the error is about a request that did not go out.
 		if expired := ctx.Err(); expired != nil {
-			// Ambiguous: the request may have gone out and been answered after nobody was
-			// listening. The intent stays, which is what a retry reconciles from.
+			// The request may have gone out and been answered after nobody was listening.
+			// The intent stays, which is what a retry finds the group from.
 			return nil, contactFailure(expired, "group creation")
 		}
 		if nothingWasMade(err) {
-			// WhatsApp answered, and the answer was no. There is no group to reconcile to,
-			// and an intent left open here would stop every later request for a group by
-			// this name from reconciling -- for good, because an open attempt never settles
-			// and the sweep does not take open rows. Forgotten, so an ordinary refusal
-			// costs the caller a command and nothing else.
+			// WhatsApp answered, and the answer was no -- or the stanza never left. Either
+			// way there is no group, and an intent left open here would have every later
+			// request under this name wait on a notification that is never coming, until
+			// the sweep takes the row. Forgotten, so a refusal costs a command and no more.
 			if forget := s.store.AbandonGroupCreate(ctx, attempt); forget != nil {
 				s.log.Error().Err(forget).Str("sid", s.sid).Str("attempt", attempt).
-					Msg("could not forget a creation WhatsApp refused; retries of this name will be refused until it is swept")
+					Msg("could not forget a creation that made nothing; retries of it will wait on a notification that is not coming")
 			}
 		}
 		return nil, contactFailure(err, "group creation")
@@ -399,14 +521,30 @@ func (s *Session) createGroup(ctx context.Context, command *protocol.Command) (j
 // nothingWasMade reports whether a failed creation is one that certainly made no group.
 //
 // An answer from WhatsApp is one: an IQ error is a reply, and a reply saying no is a group
-// that does not exist. So is a request that never left this process, which is what
-// `sentNothing` already names for the teardowns. Everything else -- a socket that went while
-// the request was in flight, a deadline that passed -- is the ambiguous case this whole
-// mechanism is for, and saying "nothing was made" about one of those is how the record that
-// covers a duplicate gets thrown away.
+// that does not exist. So is a request that never left this process, whether because there
+// was no socket to send it on (`sentNothing`, which the teardowns already name) or because
+// the stanza could not be built (`errCreateUnsent`). Everything else -- a socket that went
+// while the request was in flight, a deadline that passed -- is the ambiguous case this
+// whole mechanism is for, and saying "nothing was made" about one of those is how the record
+// that covers a duplicate gets thrown away.
 func nothingWasMade(err error) bool {
 	var refused *wm.IQError
-	return errors.As(err, &refused) || sentNothing(err)
+	return errors.As(err, &refused) || sentNothing(err) || errors.Is(err, errCreateUnsent)
+}
+
+// newCreateKey is the name one creation travels under.
+//
+// Random rather than derived from the command, and it does not need to be either: the key
+// is written with the intent, before anything is sent, so a redelivery reads the key its
+// first delivery used instead of recomputing it. Random is what keeps two sessions, or two
+// deployments, from ever sending the same one -- a key WhatsApp echoes onto a notification
+// is only useful while it names exactly one attempt.
+func newCreateKey() (string, error) {
+	var drawn [12]byte
+	if _, err := rand.Read(drawn[:]); err != nil {
+		return "", fmt.Errorf("draw a name for a group creation: %w", err)
+	}
+	return "WAC" + strings.ToUpper(hex.EncodeToString(drawn[:])), nil
 }
 
 // attemptName is what a creation is filed under, and it is the name the caller gave the
@@ -425,104 +563,163 @@ func attemptName(command *protocol.Command) string {
 }
 
 // groupFromEarlierAttempt answers the group an earlier delivery of this command made, if
-// there is one to find.
+// there is one.
 //
-// Two ways to find it. The attempt that finished says which group it made, and that is the
-// whole answer. The attempt that did not is the case this exists for: something asked
-// WhatsApp to make a group and never got as far as writing down what it made, so the only
-// record of it is on WhatsApp. A group is findable there, which is what separates this from
-// a message that may or may not have been sent -- the objection in `carryOut` to reserving
-// before the fact holds for sends and does not hold here.
+// The record answers it whenever WhatsApp has already said which group that is, and it says
+// so by the key: the creation went out carrying one, the notification about the group comes
+// back with it, and `joinedAGroup` writes the pair down. That notification survives the
+// instance that asked for it -- WhatsApp redelivers what nobody acknowledged, key intact,
+// which is what `probe131b` measured -- so the answer reaches whoever holds the session
+// next, which is exactly the instance a redelivered command lands on.
 //
-// What the search allows itself is narrow on purpose: a group this account created, called
-// what this attempt was to call it, and created no earlier than the instant the intent was
-// written. The last of those is what keeps a second, genuinely different creation of a
-// group by the same name from being answered with the first one -- that one's intent is
-// younger than the group, so the group is out of its window. The oldest match wins, because
-// the group this attempt made is the first one this account created after it began.
+// What is left is the wait. The command and the notification both arrive after the socket
+// comes back and nothing orders them, so an attempt with no group on record yet may still
+// be about to have one. Rather than wait on every redelivery, this asks WhatsApp first
+// whether any group by that name exists at all: a group that was made is in the listing,
+// so a listing with nothing in it is proof that nothing was made, and this returns not
+// found and the caller creates with no wait at all. It is a negative test on purpose --
+// it never picks a group out of the listing, because a name and an instant cannot tell two
+// requests for the same group apart, and the key can.
 func (s *Session) groupFromEarlierAttempt(
 	ctx context.Context, attempt string, began store.GroupCreation,
 ) (*waTypes.GroupInfo, bool, error) {
-	if began.Done() {
-		jid, err := waTypes.ParseJID(began.JID)
+	if !began.Done() {
+		joined, err := s.joinedGroups(ctx, s.current())
 		if err != nil {
-			return nil, false, protocol.NewError(protocol.ErrorInternal,
-				"the group this command already made is on record under a name that is not a group")
-		}
-		made, err := s.groupInfo(ctx, s.current(), jid)
-		if err != nil {
+			// Whether a group exists is exactly what could not be read, so this cannot fall
+			// through to creating one: that is the duplicate, made on purpose.
 			return nil, false, contactFailure(err, "group creation")
 		}
-		return made, made != nil, nil
+		claimed, err := s.store.GroupsClaimedByOtherAttempts(ctx, attempt)
+		if err != nil {
+			// Same reasoning: which groups are already somebody else's is part of the
+			// question, and a reading that failed is not the answer "none of them".
+			return nil, false, contactFailure(err, "group creation")
+		}
+		if !s.anythingCouldBeFrom(joined, claimed, began) {
+			return nil, false, nil
+		}
+		if began, err = s.waitForTheGroupItMade(ctx, attempt, began); err != nil {
+			return nil, false, err
+		}
 	}
-
-	joined, err := s.joinedGroups(ctx, s.current())
+	jid, err := waTypes.ParseJID(began.JID)
 	if err != nil {
-		// Whether the group exists is exactly what could not be read, so this cannot fall
-		// through to creating one: that is the duplicate, made on purpose.
-		return nil, false, contactFailure(err, "group creation")
-	}
-	claimed, err := s.store.GroupsClaimedByOtherAttempts(ctx, attempt)
-	if err != nil {
-		// Same reasoning: which groups are somebody else's is part of the question.
-		return nil, false, contactFailure(err, "group creation")
-	}
-	// A record only rules a group out once the attempt that made it wrote it down. While
-	// another attempt at a group by this name is still open, a match is evidence for both
-	// of them and proof for neither, so there is nothing to answer with: creating would
-	// duplicate and answering would hand this request the other's conversation.
-	contested, err := s.store.OtherAttemptsStillOpen(ctx, attempt, began.Subject)
-	if err != nil {
-		return nil, false, contactFailure(err, "group creation")
-	}
-	if contested {
-		s.log.Warn().Str("sid", s.sid).Str("attempt", attempt).Str("subject", began.Subject).
-			Msg("refused to reconcile a creation while another attempt at a group by the same name is still open")
-		// `internal` because the contract has no word for "cannot be told apart yet". It
-		// is the closest honest answer -- the connector could not carry the command out --
-		// and it converges: once the other attempt settles, a retry reconciles properly.
-		// Naming this case on the wire is a contract change, and #214 is where it is asked.
 		return nil, false, protocol.NewError(protocol.ErrorInternal,
-			"another request for a group by this name has not finished, so which group this one made cannot be told yet")
+			"the group this command already made is on record under a name that is not a group")
 	}
-	// WhatsApp dates a group to the second, and the intent is written with the clock this
-	// process has. An intent at .400 and the group it made stamped at .000 are the same
-	// second, and comparing them as they stand would put the group before its own intent
-	// and have this search miss it -- which is the duplicate, on the commonest timing
-	// there is, because creating a group takes well under a second.
-	since := began.StartedAt.Truncate(time.Second)
-	var found *waTypes.GroupInfo
-	for _, group := range joined {
-		if group == nil {
-			continue
-		}
-		if _, taken := claimed[group.JID.String()]; taken {
-			continue
-		}
-		switch {
-		case group.Name != began.Subject:
-			continue
-		case group.GroupCreated.Before(since):
-			continue
-		case !s.isSelf(group.OwnerJID) && !s.isSelf(group.OwnerPN):
-			continue
-		case found == nil, group.GroupCreated.Before(found.GroupCreated):
-			found = group
-		}
+	made, err := s.groupInfo(ctx, s.current(), jid)
+	if err != nil {
+		return nil, false, contactFailure(err, "group creation")
 	}
-	if found == nil {
-		return nil, false, nil
-	}
-	// Written down now, so the next delivery is answered from the record rather than from
-	// another search, and so two deliveries racing here settle on one group.
-	if err := s.store.FinishGroupCreate(ctx, attempt, found.JID.String()); err != nil {
-		s.log.Error().Err(err).Str("sid", s.sid).Str("attempt", attempt).
-			Msg("found the group an earlier attempt made and could not record it")
-	}
-	s.log.Info().Str("sid", s.sid).Str("attempt", attempt).Str("group", found.JID.String()).
-		Msg("a redelivered creation found the group its first attempt had already made")
-	return found, true, nil
+	return made, made != nil, nil
 }
+
+// anythingCouldBeFrom reports whether any group in the listing could be the one this
+// attempt made.
+//
+// Every test here rules a group out, and none of them picks one. That is the whole
+// difference from matching by subject and instant: the answer this feeds is "wait for
+// WhatsApp to say", so being wrong about one group costs a command the caller sends again,
+// where being wrong about which group is this attempt's costs them the conversation. So it
+// is generous wherever it is unsure -- an owner this connector cannot read counts as this
+// account's, because a group with no readable owner may well be the one just made.
+//
+// What each test rules out:
+//
+//   - A group by another name is another group. It is what the attempt was to be called.
+//   - A group older than the intent cannot be what the intent produced, which is what keeps
+//     a group made last year from holding up every creation that reuses its name. Truncated
+//     to the second because WhatsApp dates a group to the second while the intent carries
+//     this process's own clock, so an intent at .400 and the group it made stamped at .000
+//     are the same second and would otherwise read as a group older than its own intent.
+//   - A group this account did not create was made by somebody else, and no attempt of this
+//     session made it.
+//   - A group another attempt of this session has already been told is its own answers to
+//     that attempt's key, and a group answers to one key.
+func (s *Session) anythingCouldBeFrom(
+	joined []*waTypes.GroupInfo, claimed map[string]bool, began store.GroupCreation,
+) bool {
+	since := began.StartedAt.Truncate(time.Second)
+	for _, group := range joined {
+		switch {
+		case group == nil:
+		case group.Name != began.Subject:
+		case group.GroupCreated.Before(since):
+		case claimed[group.JID.String()]:
+		case !s.couldBeThisAccounts(group):
+		default:
+			return true
+		}
+	}
+	return false
+}
+
+// couldBeThisAccounts reports whether this account could be the one that made a group.
+//
+// True when nothing says otherwise, including when the listing named no owner this build
+// can read: an unreadable owner is not evidence that somebody else created the group, and
+// reading it as such is what would have a creation made a second time.
+func (s *Session) couldBeThisAccounts(group *waTypes.GroupInfo) bool {
+	if group.OwnerJID.IsEmpty() && group.OwnerPN.IsEmpty() {
+		return true
+	}
+	return s.isSelf(group.OwnerJID) || s.isSelf(group.OwnerPN)
+}
+
+// waitForTheGroupItMade waits for WhatsApp to say which group an attempt made.
+//
+// Only ever reached with a group that could be this attempt's already on WhatsApp, so what
+// is being waited for is the notification that names it -- a message already sent, not one
+// that has to be asked for. It is short: the notification is redelivered as the socket
+// comes back, ahead of the command in all but a race, and the session's own goroutine is
+// what is being held.
+//
+// Refuses when it runs out, because the alternative is worse in both directions: creating
+// would make the second group this exists to prevent, and answering with a group picked out
+// of the listing would hand this request whatever else has that name. The refusal converges
+// -- the notification lands and the next delivery is answered from the record.
+func (s *Session) waitForTheGroupItMade(
+	ctx context.Context, attempt string, began store.GroupCreation,
+) (store.GroupCreation, error) {
+	waited, giveUp := context.WithTimeout(ctx, s.createWait)
+	defer giveUp()
+	asking := time.NewTicker(createNoticePoll)
+	defer asking.Stop()
+	for {
+		select {
+		case <-waited.Done():
+			s.log.Warn().Str("sid", s.sid).Str("attempt", attempt).Str("subject", began.Subject).
+				Msg("a group by this name was made and WhatsApp has not said yet whether this request is what made it")
+			// `internal` because the contract has no word for "cannot be told yet". It is
+			// the closest true answer -- the connector could not carry the command out --
+			// and naming this case on the wire is a contract change, asked in #214.
+			return began, protocol.NewError(protocol.ErrorInternal,
+				"a group by this name was made and which request made it is not settled yet")
+		case <-asking.C:
+			// The caller's context, not the waiting one: a read that outlives the window is
+			// the window ending, and cancelling it mid-statement would report a fault.
+			told, found, err := s.store.GroupCreation(ctx, attempt)
+			if err != nil {
+				return began, contactFailure(err, "group creation")
+			}
+			if found && told.Done() {
+				s.log.Info().Str("sid", s.sid).Str("attempt", attempt).Str("group", told.JID).
+					Msg("WhatsApp named the group a redelivered creation had already made")
+				return told, nil
+			}
+		}
+	}
+}
+
+// How long a redelivered creation waits for WhatsApp to name the group it made, and how
+// often it looks. The wait is bounded by the caller's own deadline as well, and it holds
+// the session's goroutine, so it is short: what it covers is the notification and the
+// command arriving in the wrong order, not an outage.
+const (
+	createNoticeWait = 3 * time.Second
+	createNoticePoll = 50 * time.Millisecond
+)
 
 // withoutRefused drops the participants WhatsApp would not add, and the count with them.
 //
