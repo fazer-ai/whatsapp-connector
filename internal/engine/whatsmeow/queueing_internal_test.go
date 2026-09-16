@@ -626,8 +626,12 @@ func carriers(t *testing.T, dir string) (found []inboxCarrier, scanned int, decl
 	return found, scanned, declared
 }
 
-// carriersIn is the rule itself, over one file's source. It takes the source rather than a
-// path so the control above can hold the rule to a case it wrote itself.
+// carriersIn is the rule itself, over one file's source. It takes the source rather than
+// a path so the control above can hold the rule to a case the test wrote itself.
+//
+// A function literal answers to whatever names it: the variable it is bound to, or failing
+// that the function it sits inside plus the line. Reporting a bare `file:line` would be
+// accurate and useless, and the key is what somebody has to type into carriersAllowed.
 func carriersIn(t *testing.T, fset *token.FileSet, name, src string) []inboxCarrier {
 	t.Helper()
 
@@ -636,24 +640,64 @@ func carriersIn(t *testing.T, fset *token.FileSet, name, src string) []inboxCarr
 		t.Fatalf("parse %s: %v", name, err)
 	}
 	var found []inboxCarrier
+	seen := map[token.Pos]bool{}
+	record := func(key string, sig *ast.FuncType, pos token.Pos) {
+		if seen[pos] || !carriesTheInbox(sig) {
+			return
+		}
+		seen[pos] = true
+		found = append(found, oneCarrier(fset, name, key, sig, pos))
+	}
+
+	// Bound to a name first, so the name wins over the position.
 	ast.Inspect(parsed, func(node ast.Node) bool {
 		switch n := node.(type) {
-		case *ast.FuncDecl:
-			if carriesTheInbox(n.Type) {
-				found = append(found, oneCarrier(fset, name, declName(n), n.Type, n.Pos()))
+		case *ast.ValueSpec:
+			for i, value := range n.Values {
+				if lit, ok := value.(*ast.FuncLit); ok && i < len(n.Names) {
+					record(n.Names[i].Name, lit.Type, lit.Pos())
+				}
 			}
-		case *ast.FuncLit:
-			// No name of its own, so it answers to where it is written. A literal that
-			// takes the channel is the shape a `go func(inbox chan<- pending)` makes.
-			if carriesTheInbox(n.Type) {
-				at := fset.Position(n.Pos())
-				where := fmt.Sprintf("%s:%d", name, at.Line)
-				found = append(found, oneCarrier(fset, name, where, n.Type, n.Pos()))
+		case *ast.AssignStmt:
+			for i, value := range n.Rhs {
+				lit, ok := value.(*ast.FuncLit)
+				if !ok || i >= len(n.Lhs) {
+					continue
+				}
+				if to, ok := n.Lhs[i].(*ast.Ident); ok {
+					record(to.Name, lit.Type, lit.Pos())
+				}
 			}
 		}
 		return true
 	})
+	for _, decl := range parsed.Decls {
+		if fn, ok := decl.(*ast.FuncDecl); ok {
+			record(declName(fn), fn.Type, fn.Pos())
+		}
+	}
+	// Whatever is left is genuinely anonymous, and answers to where it was written.
+	ast.Inspect(parsed, func(node ast.Node) bool {
+		if lit, ok := node.(*ast.FuncLit); ok {
+			record(within(fset, parsed, name, lit), lit.Type, lit.Pos())
+		}
+		return true
+	})
 	return found
+}
+
+// within names an anonymous literal after the function it sits in, because that is what
+// the person reading the failure has to go and look at.
+func within(fset *token.FileSet, file *ast.File, name string, lit *ast.FuncLit) string {
+	at := fset.Position(lit.Pos()).Line
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || lit.Pos() < fn.Pos() || lit.Pos() > fn.End() {
+			continue
+		}
+		return fmt.Sprintf("%s:%d", declName(fn), at)
+	}
+	return fmt.Sprintf("%s:%d", name, at)
 }
 
 // carriesTheInbox is the match, and the direction is the whole judgement. A parameter that
