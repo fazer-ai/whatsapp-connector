@@ -56,6 +56,22 @@ is willing to wait for an answer, not to how long the teardown is allowed to tak
 `seq` is monotonic per `(sid, epoch)` and, together with the per-session shard
 assignment, is what lets the consumer drop out-of-order redeliveries.
 
+**A client must deduplicate on `message.id`, and `seq` does not do it for you.** Delivery
+is at-least-once per event, and the two mechanisms cover different things. `seq` catches
+the same event handed over twice by the transport. It does not catch the case where one
+WhatsApp message reaches the client as *two different events*, each with its own `seq`,
+which is what a redelivered `message.send` produces: WhatsApp does not deduplicate a
+stanza id, so the second attempt puts a second copy of the message on the wire, and the
+connector publishes both. Measured, from an immediate resend out to thirty minutes
+apart, and for direct chats and groups alike (#215).
+
+This is not an edge case the client may skip. The connector's inbound path publishes a
+message more than once **on purpose** in several places -- a placeholder published before
+the real body arrives, a decryption that resolves after the fact, a session that changed
+hands mid-publish -- and every one of them is written on the assumption that the client
+keeps the first row and discards the repeat. A client that does not deduplicate on
+`message.id` will show the same message twice without having done anything wrong.
+
 **Which stream a command goes on is part of the contract, not a detail.** A connector
 reads `wa:cmd:<sid>` only for the sessions it is running, so a command addressed to a
 session nobody has adopted is delivered to no connector at all and is lost when the
