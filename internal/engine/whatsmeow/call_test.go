@@ -403,6 +403,49 @@ func TestTheCallsASessionRemembersAreBounded(t *testing.T) {
 	}
 }
 
+// The policy decides whether the account rings; the subscription decides what the client
+// is told about. Refusing a group call only when the client also wanted group
+// conversation is an account ringing on the operator's phone in exactly the case they
+// asked it not to. The offer is still not published, for the reason above.
+func TestAGroupCallIsRefusedEvenWhenGroupsAreOff(t *testing.T) {
+	t.Parallel()
+	session, watched := callSession(t, true)
+	session.setGroups(false)
+
+	meta := callMeta("call-1")
+	meta.GroupJID = groupJID()
+	if !session.handle(&waEvents.CallOfferNotice{BasicCallMeta: meta, Media: "audio", Type: "group"}) {
+		t.Fatal("a group call must be acknowledged")
+	}
+
+	refusedWithin(t, watched, "call-1")
+	if queued := len(session.inbox); queued != 0 {
+		t.Fatalf("queued %d emissions for a group call on a session that wanted direct chats only", queued)
+	}
+}
+
+// A rejection has seconds to be written and `emit` has no deadline: it waits on the
+// session's inbox for as long as the publisher is stalled, and `callWait` does not bound
+// that wait. Queued behind a stalled publisher, the refusal arrives after the caller has
+// given up and the account rang the whole time.
+func TestACallIsRefusedEvenWhileThePublisherIsStalled(t *testing.T) {
+	t.Parallel()
+	session, watched := callSession(t, true)
+	session.picked = make(chan struct{}, 1)
+	blockTheForwarder(t, session)
+
+	// Full, which is the state this is about: every further emit parks until the
+	// publisher moves, and in the case being reproduced it never does.
+	for len(session.inbox) < cap(session.inbox) {
+		session.inbox <- pending{event: engine.Emission{Type: protocol.EventSessionState, Payload: []byte(`{}`)}}
+	}
+
+	// On its own goroutine, because the handler is the thing that is expected to park.
+	go session.handle(&waEvents.CallOffer{BasicCallMeta: callMeta("call-1")})
+
+	refusedWithin(t, watched, "call-1")
+}
+
 // A call with no id is still somebody ringing. It cannot be deduplicated, and publishing
 // it twice is better than swallowing it: the alternative silences every call WhatsApp
 // announces without one.
@@ -417,6 +460,34 @@ func TestACallWithNoIDIsStillPublished(t *testing.T) {
 		if got := published(t, session, protocol.EventCallOffer, "event_call_offer")["call_id"]; got != "" {
 			t.Fatalf("offer %d carries call_id %v", i, got)
 		}
+	}
+}
+
+// `pairing.request_code` is a connect this build synthesises, and what it leaves out is
+// not defaulted, it is absent. A client asking for a pairing code is not asking for its
+// call policy to be dropped -- and the connect records what it carries, so the drop would
+// outlive the pairing and be put back by the next resume.
+func TestAskingForAPairingCodeKeepsTheCallPolicy(t *testing.T) {
+	t.Parallel()
+	session, _ := newTestSession(t, "5511999990001")
+	session.setCallPolicy(true)
+	session.setGroups(true)
+
+	payload, err := json.Marshal(map[string]string{"phone": "5511999990001"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	// The pairing that follows has nothing to dial in a unit test; what is asserted is
+	// what the session was left carrying, which is decided before any of that.
+	_ = session.requestCode(t.Context(), &protocol.Command{
+		Type: protocol.CommandPairingRequestCode, Payload: payload,
+	})
+
+	if !session.rejectsCalls() {
+		t.Fatal("asking for a pairing code turned the call policy off")
+	}
+	if !session.wantsGroups() {
+		t.Fatal("asking for a pairing code turned the group subscription off")
 	}
 }
 

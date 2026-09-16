@@ -98,15 +98,7 @@ type rejectRequest struct {
 // WhatsApp does not redeliver a call offer, so withholding the acknowledgement buys no
 // second chance and leaves a node unacknowledged for a call that has already ended.
 func (s *Session) callOffered(meta *waTypes.BasicCallMeta, media callMedia) bool {
-	// A group call is group traffic, and an inbox that asked for direct chats only has
-	// no group conversation to show it in. The contract's `call.offer` carries no group
-	// either, so publishing one would put a call from a group the client does not have
-	// into the direct chat with whoever started it.
-	if !meta.GroupJID.IsEmpty() && !s.wantsGroups() {
-		return true
-	}
-
-	// One event, one publish. WhatsApp sends `offer` and `offer_notice` for the same
+	// One call, one of everything. WhatsApp sends `offer` and `offer_notice` for the same
 	// call, in either order, and both reach here.
 	//
 	// The one that says whether it is video is `offer_notice`, so the first to arrive is
@@ -114,7 +106,35 @@ func (s *Session) callOffered(meta *waTypes.BasicCallMeta, media callMedia) bool
 	// way round: a voice call is what the overwhelming majority of them are, and the
 	// alternative -- holding the offer back until the notice arrives -- delays every
 	// call for one that may never come.
-	if !s.firstSightOf(meta.CallID) {
+	first := s.firstSightOf(meta.CallID)
+
+	// Before anything that can wait, and before the subscription is consulted, because
+	// the two questions are different ones.
+	//
+	// The subscription decides what a client is told about; the policy decides whether
+	// the account rings. A group call refused only when the client also wanted group
+	// conversation is an account ringing on the operator's phone in exactly the case
+	// they asked it not to.
+	//
+	// And publishing can block: `emit` waits on the session's inbox, which is full for
+	// as long as the publisher is stalled, and `callWait` does not bound that wait. A
+	// call rings for seconds, so a rejection queued behind a stalled publisher is a
+	// rejection that arrives after the caller has given up. The ordering this gives up
+	// in exchange is between `call.offer` and the `call.terminate` the rejection
+	// produces, and it was never this handler's to guarantee anyway: the two go through
+	// the same queue from different events, and a client tells them apart by `call_id`.
+	if first && s.rejectsCalls() {
+		s.refuse(meta)
+	}
+	if !first {
+		return true
+	}
+
+	// A group call is group traffic, and an inbox that asked for direct chats only has
+	// no group conversation to show it in. The contract's `call.offer` carries no group
+	// either, so publishing one would put a call from a group the client does not have
+	// into the direct chat with whoever started it.
+	if !meta.GroupJID.IsEmpty() && !s.wantsGroups() {
 		return true
 	}
 
@@ -144,13 +164,6 @@ func (s *Session) callOffered(meta *waTypes.BasicCallMeta, media callMedia) bool
 		Video:     media.known && media.video,
 		Timestamp: meta.Timestamp.UnixMilli(),
 	})
-
-	if s.rejectsCalls() {
-		// After the publish, not before. A client is told a call came in whichever way
-		// this goes, and publishing first is what keeps the offer and the `call.terminate`
-		// the rejection produces in the order they happened.
-		s.refuse(meta)
-	}
 	return true
 }
 

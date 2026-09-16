@@ -3245,12 +3245,16 @@ func (s *Session) requestCode(ctx context.Context, command *protocol.Command) er
 	if err := json.Unmarshal(command.Payload, &body); err != nil {
 		return protocol.NewError(protocol.ErrorInvalidPayload, "the pairing request could not be read")
 	}
-	// The subscription comes along, because this is a connect like any other and the
-	// client is not sending one: leaving it out would turn group traffic off on a
-	// session that had asked for it, at the moment it asked for a pairing code.
-	return s.Connect(ctx, engine.ConnectRequest{
-		Pairing: "code", Phone: body.Phone, Groups: s.wantsGroups(),
-	})
+	// Everything the session is already carrying comes along, because this is a connect
+	// like any other and the client is not sending one. Leaving the subscription out
+	// would turn group traffic off on a session that had asked for it, at the moment it
+	// asked for a pairing code; leaving the call policy out would have the account start
+	// ringing again, and record that as what its client wanted.
+	request := engine.ConnectRequest{Pairing: "code", Phone: body.Phone, Groups: s.wantsGroups()}
+	if s.rejectsCalls() {
+		request.Calls = &engine.CallsRequest{AutoReject: true}
+	}
+	return s.Connect(ctx, request)
 }
 
 // Close ends the session. Events is closed before it returns.
