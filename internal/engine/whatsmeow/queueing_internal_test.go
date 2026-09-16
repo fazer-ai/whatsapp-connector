@@ -572,23 +572,6 @@ func aControlThatMustBeSeen(inbox chan<- pending, p pending) { inbox <- p }
 	}
 }
 
-// boundaryOfThisRule is where the rule above stops, measured rather than guessed, so that
-// what it does not cover is a written decision instead of a discovery.
-//
-// It matches a channel of `pending` spelled out in a parameter list. Anything that puts
-// the same channel behind another name gets past: a type alias or a named channel type
-// (`type inboxCh = chan pending`, one line and as innocent as the refactor this catches),
-// a generic parameter, the channel wrapped in a struct field, a slice or a map, and a
-// function that returns the channel rather than taking it, which is past both halves of
-// the fence. All of them need go/types to see, because each one is the same channel
-// wearing a different spelling, and spelling is all this rule reads.
-//
-// Two shapes that look like they belong on that list are in fact caught, by the other
-// half rather than this one: a struct whose field is named `inbox`, and a closure that
-// captures the session. Both end up writing `.inbox <-` somewhere, which is what
-// TestEveryWriteToTheInboxIsMeasured reads.
-var boundaryOfThisRule struct{}
-
 // inboxCarrier is one function that takes a channel of pending.
 type inboxCarrier struct {
 	key  string
@@ -700,10 +683,27 @@ func within(fset *token.FileSet, file *ast.File, name string, lit *ast.FuncLit) 
 	return fmt.Sprintf("%s:%d", name, at)
 }
 
-// carriesTheInbox is the match, and the direction is the whole judgement. A parameter that
-// can only be received from is not a door: it cannot be sent to at all. (It is a different
+// carriesTheInbox is the match, and it reads a spelling: a channel of `pending` written
+// out in a parameter list.
+//
+// The direction is the whole judgement on what counts. A parameter that can only be
+// received from is not a door, because it cannot be sent to at all. (It is a different
 // danger -- a second consumer racing the forwarder, which invariant 3 is about -- and
-// carrying that here would hide it under the wrong name.)
+// folding it in here would hide it under the wrong name.)
+//
+// Because spelling is all it reads, this is where the rule stops, and the list is written
+// out rather than left to be discovered. Anything that puts the same channel behind
+// another name gets past: a type alias or a named channel type (`type inboxCh = chan
+// pending`, one line and as innocent as the refactor this catches), a type parameter, and
+// the channel wrapped in a struct field, a slice or a map. So does a function that returns
+// the channel instead of taking it, which is past both halves of the fence, since the
+// channel of that send is a call and not a selector. Each one needs go/types to see,
+// because each is the same channel wearing a different spelling.
+//
+// Two shapes that look like they belong on that list are caught, by the other half rather
+// than this one: a struct whose field is named `inbox`, and a closure that captures the
+// session. Both end up writing `.inbox <-` somewhere, which is what
+// TestEveryWriteToTheInboxIsMeasured reads.
 func carriesTheInbox(sig *ast.FuncType) bool {
 	if sig.Params == nil {
 		return false
