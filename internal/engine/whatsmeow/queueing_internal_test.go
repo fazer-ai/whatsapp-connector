@@ -3,6 +3,7 @@ package whatsmeow
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/printer"
@@ -484,5 +485,241 @@ func TestAPresenceRetriedIntoAFullInboxIsCounted(t *testing.T) {
 	session.boardMu.Unlock()
 	if left != 0 {
 		t.Errorf("%d presences are on a board with nothing coming to publish them", left)
+	}
+}
+
+// carriersAllowed names the functions that may take the session inbox as a parameter,
+// and what each one is for.
+//
+// It is empty, and that is the healthy state rather than a starting point: no production
+// function in this package takes a channel of `pending` today, and the fence below exists
+// so that stays a decision instead of an accident. Adding an entry is the whole point --
+// the rule cannot tell a deliberate helper from a door lost by mistake, so it asks the
+// person who knows.
+//
+// The key names one function: a plain name for a function, `(*Session).name` for a
+// method, `file:line` for a function literal. A method and a function of the same name
+// coexist in Go, so a bare name would let one entry excuse two functions. The value is
+// why, and it may not be blank: an entry that has to say what it is for is harder to add
+// without thinking than a name on a list.
+var carriersAllowed = map[string]string{}
+
+// The second half of the inbox fence, and it exists because the first half can only see a
+// send whose channel is named at the send.
+//
+//	func offer(inbox chan<- pending, p pending) bool { ... }
+//
+// Extract the fast path of `emitting` into that and one of the five doors leaves the
+// measurement: the suite stays green, `TestEveryWriteToTheInboxIsMeasured` still finds
+// four doors and so never reaches its own vacuity guard, and `wac_session_inbox_depth`
+// quietly begins describing four fifths of the traffic. Extracting a send helper is an
+// ordinary Tuesday refactor, which is what makes it the plausible way to lose a door.
+//
+// Knowing that such a parameter and `s.inbox` are the same channel is a type fact, so
+// closing this properly means go/types. This is the cheap rule instead: nobody takes the
+// channel as a parameter unless they have written their name and their reason above. It
+// does not ask what the function does with it, so it is broader than the real risk and
+// narrower than the whole hole -- `boundaryOfThisRule` below says where it stops.
+func TestNoFunctionTakesTheInboxWithoutSayingWhy(t *testing.T) {
+	t.Parallel()
+
+	const pkg = "."
+
+	// The rule fires at all. Its expected finding in this package is zero, for ever, so
+	// "found nothing" is the healthy answer and cannot double as evidence that the
+	// matching still works. A control that must be reported is what separates the two.
+	control := carriersIn(t, token.NewFileSet(), "control.go", `package whatsmeow
+func aControlThatMustBeSeen(inbox chan<- pending, p pending) { inbox <- p }
+`)
+	if len(control) != 1 || control[0].name != "aControlThatMustBeSeen" {
+		t.Fatalf("the rule did not report its own control (%d finding(s)): it is matching "+
+			"nothing, so a green result below would mean nothing either", len(control))
+	}
+
+	found, scanned, declared := carriers(t, pkg)
+	if scanned == 0 {
+		t.Fatalf("read %d production file(s) in %q: a rule with nothing to read is not a rule",
+			scanned, pkg)
+	}
+	// And it is still about this package's channel. Rename the type and every match
+	// silently stops happening, which reads exactly like the healthy zero above.
+	if !declared {
+		t.Fatalf("no type named %q is declared in the %d file(s) read: this rule has lost its "+
+			"subject and now matches nothing by construction", "pending", scanned)
+	}
+
+	for _, taker := range found {
+		why, allowed := carriersAllowed[taker.key]
+		switch {
+		case !allowed:
+			t.Errorf("%s:%d: %s takes the session inbox as a parameter:\n\t%s\n"+
+				"a door reached through a parameter reports no wait and no depth, and nothing "+
+				"fails. Either do not write it, or add %q to carriersAllowed with what it is for",
+				taker.file, taker.line, taker.name, taker.text, taker.key)
+		case strings.TrimSpace(why) == "":
+			t.Errorf("%s:%d: %s is in carriersAllowed with no reason given:\n"+
+				"the reason is the whole exemption, since the rule cannot tell a deliberate "+
+				"helper from a door lost by accident", taker.file, taker.line, taker.name)
+		}
+	}
+	// An entry that names nothing is an exemption nobody can check, and it outlives the
+	// function it was written for.
+	for key := range carriersAllowed {
+		if !slices.ContainsFunc(found, func(c inboxCarrier) bool { return c.key == key }) {
+			t.Errorf("carriersAllowed names %q, and no function in the package matches it: "+
+				"either it was renamed or it is gone, and the exemption should go with it", key)
+		}
+	}
+}
+
+// boundaryOfThisRule is where the rule above stops, measured rather than guessed, so that
+// what it does not cover is a written decision instead of a discovery.
+//
+// It matches a channel of `pending` spelled out in a parameter list. Anything that puts
+// the same channel behind another name gets past: a type alias or a named channel type
+// (`type inboxCh = chan pending`, one line and as innocent as the refactor this catches),
+// a generic parameter, the channel wrapped in a struct field, a slice or a map, and a
+// function that returns the channel rather than taking it, which is past both halves of
+// the fence. All of them need go/types to see, because each one is the same channel
+// wearing a different spelling, and spelling is all this rule reads.
+//
+// Two shapes that look like they belong on that list are in fact caught, by the other
+// half rather than this one: a struct whose field is named `inbox`, and a closure that
+// captures the session. Both end up writing `.inbox <-` somewhere, which is what
+// TestEveryWriteToTheInboxIsMeasured reads.
+var boundaryOfThisRule struct{}
+
+// inboxCarrier is one function that takes a channel of pending.
+type inboxCarrier struct {
+	key  string
+	name string
+	file string
+	line int
+	text string
+}
+
+// carriers reads the package and reports every function that takes the inbox, whether the
+// type it matches is still declared here, and how many files it got to read.
+func carriers(t *testing.T, dir string) (found []inboxCarrier, scanned int, declared bool) {
+	t.Helper()
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read the package directory %q: %v", dir, err)
+	}
+	fset := token.NewFileSet()
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		body, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		found = append(found, carriersIn(t, fset, name, string(body))...)
+		scanned++
+		if declaresPending(t, fset, name, string(body)) {
+			declared = true
+		}
+	}
+	return found, scanned, declared
+}
+
+// carriersIn is the rule itself, over one file's source. It takes the source rather than a
+// path so the control above can hold the rule to a case it wrote itself.
+func carriersIn(t *testing.T, fset *token.FileSet, name, src string) []inboxCarrier {
+	t.Helper()
+
+	parsed, err := parser.ParseFile(fset, name, src, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v", name, err)
+	}
+	var found []inboxCarrier
+	ast.Inspect(parsed, func(node ast.Node) bool {
+		switch n := node.(type) {
+		case *ast.FuncDecl:
+			if carriesTheInbox(n.Type) {
+				found = append(found, oneCarrier(fset, name, declName(n), n.Type, n.Pos()))
+			}
+		case *ast.FuncLit:
+			// No name of its own, so it answers to where it is written. A literal that
+			// takes the channel is the shape a `go func(inbox chan<- pending)` makes.
+			if carriesTheInbox(n.Type) {
+				at := fset.Position(n.Pos())
+				where := fmt.Sprintf("%s:%d", name, at.Line)
+				found = append(found, oneCarrier(fset, name, where, n.Type, n.Pos()))
+			}
+		}
+		return true
+	})
+	return found
+}
+
+// carriesTheInbox is the match, and the direction is the whole judgement. A parameter that
+// can only be received from is not a door: it cannot be sent to at all. (It is a different
+// danger -- a second consumer racing the forwarder, which invariant 3 is about -- and
+// carrying that here would hide it under the wrong name.)
+func carriesTheInbox(sig *ast.FuncType) bool {
+	if sig.Params == nil {
+		return false
+	}
+	for _, param := range sig.Params.List {
+		kind := param.Type
+		if spread, ok := kind.(*ast.Ellipsis); ok {
+			kind = spread.Elt
+		}
+		channel, ok := kind.(*ast.ChanType)
+		if !ok || channel.Dir == ast.RECV {
+			continue
+		}
+		if named, ok := channel.Value.(*ast.Ident); ok && named.Name == "pending" {
+			return true
+		}
+	}
+	return false
+}
+
+// declName tells a method from a function of the same name, which Go lets coexist. One
+// entry in carriersAllowed must not excuse both.
+func declName(fn *ast.FuncDecl) string {
+	if fn.Recv == nil || len(fn.Recv.List) == 0 {
+		return fn.Name.Name
+	}
+	var receiver bytes.Buffer
+	if err := printer.Fprint(&receiver, token.NewFileSet(), fn.Recv.List[0].Type); err != nil {
+		receiver.WriteString("?")
+	}
+	return fmt.Sprintf("(%s).%s", receiver.String(), fn.Name.Name)
+}
+
+func declaresPending(t *testing.T, fset *token.FileSet, name, src string) bool {
+	t.Helper()
+
+	parsed, err := parser.ParseFile(fset, name, src, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v", name, err)
+	}
+	declared := false
+	ast.Inspect(parsed, func(node ast.Node) bool {
+		if spec, ok := node.(*ast.TypeSpec); ok && spec.Name.Name == "pending" {
+			declared = true
+		}
+		return true
+	})
+	return declared
+}
+
+func oneCarrier(fset *token.FileSet, file, key string, sig *ast.FuncType, pos token.Pos) inboxCarrier {
+	var rendered bytes.Buffer
+	if err := printer.Fprint(&rendered, fset, sig); err != nil {
+		rendered.WriteString("<the signature would not render>")
+	}
+	return inboxCarrier{
+		key:  key,
+		name: key,
+		file: file,
+		line: fset.Position(pos).Line,
+		text: rendered.String(),
 	}
 }
