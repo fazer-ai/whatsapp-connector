@@ -687,7 +687,11 @@ func (m *Manager) Dispatch(delivery *transport.Delivery) (pending bool) {
 	case protocol.CommandSessionWake:
 		return m.own(delivery, m.wake)
 	case protocol.CommandAdminPing:
-		return m.own(delivery, m.pong)
+		began := m.now()
+		return m.own(delivery, func(ctx context.Context, ping *transport.Delivery) {
+			m.pong(ctx, ping)
+			m.reportCommand(&ping.Command, began, nil)
+		})
 	}
 
 	m.mu.RLock()
@@ -732,8 +736,11 @@ func (m *Manager) Dispatch(delivery *transport.Delivery) (pending bool) {
 			m.GiveBack(delivery)
 			return true
 		}
+		began := m.now()
 		return m.own(delivery, func(ctx context.Context, busy *transport.Delivery) {
-			m.refuse(ctx, busy, protocol.NewError(protocol.ErrorRateLimited, "the session has too many commands waiting"))
+			refusal := protocol.NewError(protocol.ErrorRateLimited, "the session has too many commands waiting")
+			m.refuse(ctx, busy, refusal)
+			m.reportCommand(&busy.Command, began, refusal)
 		})
 	case OfferStopped:
 		// This instance is letting the account go. Refusing would answer for an owner
@@ -1187,15 +1194,8 @@ func (m *Manager) RenewAll(ctx context.Context, by time.Time) {
 		} else {
 			m.log.Warn().Str("sid", sid).Msg("lost a lease; stopping the session")
 		}
-		// Counted for both branches above, because both are this instance ceasing to own
-		// a session it was running, which is what the counter is for. Counted here and
-		// not inside `drop`, which also runs for an ordinary shutdown: a fleet coming
-		// down cleanly is not a flap, and counting it would bury the shape this exists
-		// to show.
-		if m.watch != nil {
-			m.watch.LeaseLost()
-		}
 		session, still := m.drop(sid, running[sid])
+		m.lostLease(still)
 		if !still {
 			// Adopted again since the renewal went out, which means a lease won after
 			// this answer was already stale. Stopping that session would leave an account
@@ -1586,4 +1586,41 @@ func (m *Manager) releaseThis(ctx context.Context, sid string, want *Session) {
 		return
 	}
 	m.abandon(ctx, sid)
+}
+
+// reportCommand is `Session.reportCommand` for the commands that never reach a session.
+//
+// The two of them are the whole of what this instance answers: `admin.ping`, which no
+// session owns, and the `rate_limited` refusal a full queue produces. Leaving them out
+// was the defect -- the outcome distribution would omit exactly the overload refusals an
+// operator goes looking for, and it would omit them precisely when there are most of
+// them, because that is when the queue is full.
+//
+// Timed from the dispatch that picked the command up rather than from the answer, since
+// what a caller waited for is the queueing, not the reply.
+func (m *Manager) reportCommand(command *protocol.Command, began time.Time, err error) {
+	if m.watch == nil {
+		return
+	}
+	outcome := "ok"
+	if err != nil {
+		outcome = string(asProtocolError(err).Code)
+	}
+	m.watch.CommandDone(command.Type, outcome, m.now().Sub(began))
+}
+
+// lostLease counts a lease this instance stopped running a session over.
+//
+// Takes whether the drop found the session it was looking at, and counts nothing when it
+// did not: a renewal that came back unlucky while the account was already released, or
+// adopted again by this same instance, stopped nothing, and counting it would report an
+// ordinary concurrent release as a lease lost. Both losing branches feed it, because both
+// are this instance ceasing to own a session it was running; an ordinary shutdown does
+// not, which is why this is not inside `drop`. A fleet coming down cleanly is not a flap,
+// and a counter that says it is buries the shape it exists to show.
+func (m *Manager) lostLease(stopped bool) {
+	if !stopped || m.watch == nil {
+		return
+	}
+	m.watch.LeaseLost()
 }

@@ -105,3 +105,80 @@ func TestAFinishedCommandWithNobodyWatchingIsNotACrash(t *testing.T) {
 	s := &Session{now: time.Now}
 	s.reportCommand(&protocol.Command{Type: protocol.CommandSessionStatus}, s.now(), nil)
 }
+
+// The manager answers two commands itself, and neither reaches a session: admin.ping and
+// the rate_limited refusal a full queue produces. Leaving them out of the histogram would
+// omit exactly the overload refusals an operator goes looking for, and omit them when
+// there are most of them, because that is when the queue is full.
+func TestTheCommandsTheManagerAnswersItselfAreReported(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name    string
+		kind    protocol.CommandType
+		err     error
+		outcome string
+	}{
+		{name: "admin.ping", kind: protocol.CommandAdminPing, err: nil, outcome: "ok"},
+		{
+			name:    "a full queue refusing",
+			kind:    protocol.CommandMessageSend,
+			err:     protocol.NewError(protocol.ErrorRateLimited, "too many waiting"),
+			outcome: string(protocol.ErrorRateLimited),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			watch := &spyWatch{}
+			ticks := []time.Time{time.Unix(0, 0), time.Unix(0, 0).Add(700 * time.Millisecond)}
+			var read int
+			m := &Manager{watch: watch, now: func() time.Time {
+				if read < len(ticks) {
+					read++
+				}
+				return ticks[read-1]
+			}}
+			m.reportCommand(&protocol.Command{Type: tc.kind}, m.now(), tc.err)
+
+			seen := watch.all()
+			if len(seen) != 1 {
+				t.Fatalf("reported %d commands, want 1", len(seen))
+			}
+			if seen[0].kind != tc.kind || seen[0].outcome != tc.outcome {
+				t.Errorf("reported %q/%q, want %q/%q", seen[0].kind, seen[0].outcome, tc.kind, tc.outcome)
+			}
+			if seen[0].took != 700*time.Millisecond {
+				t.Errorf("took = %s, want 700ms: timed from the dispatch that picked it up", seen[0].took)
+			}
+		})
+	}
+}
+
+// A renewal that came back unlucky while the session was already gone, or already
+// replaced, stopped nothing. Counting it would report an ordinary concurrent release as a
+// lease this instance lost, which is the opposite of the shape the counter exists to show.
+func TestOnlyALeaseLossThatStoppedASessionIsCounted(t *testing.T) {
+	t.Parallel()
+
+	watch := &spyWatch{}
+	m := &Manager{watch: watch}
+
+	m.lostLease(true)
+	m.lostLease(false) // the drop found nothing: this renewal stopped no session
+	m.lostLease(false)
+	m.lostLease(true)
+
+	watch.mu.Lock()
+	got := watch.leases
+	watch.mu.Unlock()
+	if got != 2 {
+		t.Errorf("counted %d lease losses, want 2: only the drops that stopped a session count", got)
+	}
+}
+
+// Nobody watching must not be a crash on this path either.
+func TestALeaseLossWithNobodyWatchingIsNotACrash(t *testing.T) {
+	t.Parallel()
+	(&Manager{}).lostLease(true)
+}
