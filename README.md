@@ -136,6 +136,21 @@ map and the compatibility rules. In short:
 - `contract/PROTOCOL_VERSION` is a major version. Additive changes do not bump it; a
   connector serves the current major and the one before it.
 
+### What `calls.auto_reject` does not silence
+
+A caller on WhatsApp Web ignores the refusal. The node goes out exactly as it does for any
+other caller, WhatsApp routes it and acks it, and the browser on the other end keeps
+ringing until the call times out. Measured on one bench, one binary and four calls minutes
+apart: a call from the Android app ended 0.4s after the refusal, and a call from the web
+client rang its full 89.8s and ended `timeout`. Every measurement of this since agrees, and
+nothing this connector writes changes it.
+
+It matters to whoever reads the inbox rather than to the code: with the policy on, the
+operator's phone still rings for a caller who dialled from a browser, and there is no
+difference in the events to tell that case apart. Most callers to an inbox dial from a
+phone, so the policy does what it says nearly always -- but "nearly" is the part worth
+knowing before somebody reports it as a bug.
+
 ### What an account under Coexistence does not have
 
 A number running [Coexistence](https://docs.360dialog.com/docs/resources/phone-numbers/coexistence),
