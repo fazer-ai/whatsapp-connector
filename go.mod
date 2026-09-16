@@ -13,6 +13,7 @@ require (
 	go.mau.fi/libsignal v0.2.2
 	go.mau.fi/whatsmeow v0.0.0-20260821141805-33cfac511629
 	google.golang.org/protobuf v1.36.12
+	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.58.0
 )
 

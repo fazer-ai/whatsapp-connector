@@ -20,6 +20,13 @@ of truth for both sides; this repository is the side that produces events.
   with a notice and exit 0, which answered "CI will accept this" on evidence it had not
   collected; a single test file with no production lines once aborted the whole package
   under PostgreSQL and passed that way
+- **Adding a gate to CI means adding it to the Makefile**: `.github/workflows/ci.yml`
+  calls the targets instead of spelling the commands a second time, and
+  `internal/toolchain` fails the suite when a workflow step runs something `make check`
+  does not reach. A step that genuinely belongs to CI alone (the lint action, the image
+  build) goes in one of that file's two lists, with the reason. Two hand-written lists is
+  what this replaced, and they had already drifted: CI ran `go mod tidy -diff` and `make
+  check` did not
 - **The half that needs nothing running**: `make check-offline` (lint, `go mod tidy`, the
   SQLite pass). It is what the git hooks and the agent stop hook fall back to, so a commit
   made without Docker running does not fail for a reason that is not the commit's
