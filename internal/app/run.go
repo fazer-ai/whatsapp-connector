@@ -167,7 +167,9 @@ func New(cfg *Config, log zerolog.Logger) (connector *Connector, err error) {
 	quarantine := cluster.NewQuarantine(client, nil)
 	manager := session.NewManager(&session.ManagerConfig{
 		Instance: cfg.Instance, Engine: waEngine, Leases: leases,
-		Publisher: streams, Replier: streams, Ledger: redisx.NewIdempotency(client, 0),
+		Publisher: countingPublisher{to: streams, metrics: metrics}, Replier: streams,
+		Ledger:     redisx.NewIdempotency(client, 0),
+		Watch:      watching{metrics: metrics},
 		Quarantine: quarantine,
 		NewID:      newFrameID, Logger: log,
 	})
@@ -1094,3 +1096,39 @@ func (q queueing) Emitted(waited time.Duration, depth int) {
 	q.metrics.EmissionWait.Observe(waited.Seconds())
 	q.metrics.InboxDepth.Observe(float64(depth))
 }
+
+// countingPublisher counts what actually reached the client, by event type.
+//
+// A wrapper and not a line inside the session, because the count this metric promises is
+// "published", and the only place that is known is the far side of the call that
+// publishes. Counted after the error check for the same reason: an event the stream
+// refused is not an event the client got, and counting it would make the one number that
+// could tell an incident "arriving and not published" from "not arriving" answer the
+// wrong one -- which is the failure #226 describes, in a build where it had no writer at
+// all.
+type countingPublisher struct {
+	to      transport.Publisher
+	metrics *observability.Metrics
+}
+
+func (c countingPublisher) Publish(ctx context.Context, event *protocol.Event) error {
+	if err := c.to.Publish(ctx, event); err != nil {
+		return err
+	}
+	c.metrics.EventsPublished.WithLabelValues(string(event.Type)).Inc()
+	return nil
+}
+
+// watching reports what the session layer measured into the metric set.
+//
+// Same shape and same reason as `queueing` above: the adapter is here because this is
+// where the registry is, and `internal/session` has no business knowing what Prometheus
+// is. Between the two of them they are the route whose absence left three metrics
+// registered and never written (#226).
+type watching struct{ metrics *observability.Metrics }
+
+func (w watching) CommandDone(kind protocol.CommandType, outcome string, took time.Duration) {
+	w.metrics.CommandDuration.WithLabelValues(string(kind), outcome).Observe(took.Seconds())
+}
+
+func (w watching) LeaseLost() { w.metrics.LeasesLost.Inc() }

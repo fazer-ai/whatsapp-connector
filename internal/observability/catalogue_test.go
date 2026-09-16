@@ -30,18 +30,16 @@ var writtenBy = map[string]string{
 	"CommandReadLastSuccess": "internal/app",
 	"EmissionWait":           "internal/app",
 	"InboxDepth":             "internal/app",
+	"EventsPublished":        "internal/app",
+	"CommandDuration":        "internal/app",
+	"LeasesLost":             "internal/app",
 }
 
 // notWrittenYet is the metrics that are registered and known to count nothing, each with
 // what is missing. Being on this list is not permission to stay on it: it is a statement
-// that somebody looked, which is exactly what was absent when #226 was written.
-var notWrittenYet = map[string]string{
-	"EventsPublished": "#226: the publish path is in internal/transport and internal/session, " +
-		"neither of which has a route to this set. It is the only witness invariant 4 could have.",
-	"CommandDuration": "#226: measured in internal/session, which has no route to this set.",
-	"LeasesLost": "#226: lost in internal/cluster and internal/session, neither of which " +
-		"has a route to this set.",
-}
+// that somebody looked, which is exactly what was absent when #226 was written. It is
+// empty now, and the test above is what keeps it honest when it stops being.
+var notWrittenYet = map[string]string{}
 
 // Keyed by field and not by metric name on purpose. A Vec with no children gathers
 // nothing at all, so `wac_events_published_total` and `wac_command_duration_seconds` do

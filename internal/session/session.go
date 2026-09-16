@@ -33,6 +33,7 @@ type Session struct {
 	publisher transport.Publisher
 	replier   transport.Replier
 	ledger    Ledger
+	watch     Watch
 	newID     IDFunc
 	now       func() time.Time
 	log       zerolog.Logger
@@ -121,6 +122,7 @@ type Config struct {
 	Engine    engine.Session
 	Publisher transport.Publisher
 	Replier   transport.Replier
+	Watch     Watch
 	Ledger    Ledger
 	NewID     IDFunc
 	Now       func() time.Time
@@ -178,6 +180,7 @@ func New(ctx context.Context, cfg *Config) *Session {
 		engine:    cfg.Engine,
 		publisher: cfg.Publisher,
 		ledger:    cfg.Ledger,
+		watch:     cfg.Watch,
 		replier:   cfg.Replier,
 		newID:     cfg.NewID,
 		undrained: cfg.Undrained,
@@ -701,6 +704,24 @@ func (s *Session) abandonPending(events <-chan engine.Emission) {
 	}
 }
 
+// Watch is what this layer reports its own work to, so a package that has no business
+// knowing what Prometheus is can still be measured. Nil is nobody watching, which is
+// what every test that is not about the numbers passes.
+//
+// It exists because the absence of it was the defect: three metrics were registered and
+// never written because the packages that know those numbers had no way to reach the
+// metric set (#226).
+type Watch interface {
+	// CommandDone is one command carried out, from being picked up to being answered.
+	// `outcome` is "ok" or the contract error code it failed with, so a latency that
+	// only got bad for refusals is separable from one that got bad for everything.
+	CommandDone(kind protocol.CommandType, outcome string, took time.Duration)
+	// LeaseLost is one session whose lease this instance no longer holds. Counted
+	// where the loss is acted on, not where it is discovered, so it counts sessions
+	// actually stopped rather than renewal attempts that came back unlucky.
+	LeaseLost()
+}
+
 // Ledger remembers what a command did, so a redelivery is answered with the first
 // run's result instead of carrying it out a second time. Invariant 5 in AGENTS.md is
 // this and nothing else.
@@ -765,13 +786,25 @@ func (s *Session) run(ctx context.Context, delivery *transport.Delivery) {
 	command := delivery.Command
 	log := s.log.With().Str("cmd_id", command.ID).Str("type", string(command.Type)).Logger()
 
+	began := s.now()
+	handedBack := false
 	result, err := s.carryOut(ctx, &command)
+	// Reported for the two endings that answer the caller, and not for the two below
+	// that hand the command back: a command given back has not been carried out, and
+	// timing it would put this instance's abandoned turn into the latency of a command
+	// somebody else is about to run properly.
+	defer func() {
+		if !handedBack {
+			s.reportCommand(&command, began, err)
+		}
+	}()
 	if errors.Is(err, errUnknownWhetherItRan) {
 		// Neither answered nor retired: nobody knows whether this already ran, and both of
 		// the other choices are wrong. Handed back so whoever claims it next can ask again
 		// once the record is readable.
 		log.Warn().Err(err).Msg("gave a command back rather than risk carrying it out twice")
 		forfeit(delivery)
+		handedBack = true
 		return
 	}
 	if err != nil && ctx.Err() != nil {
@@ -786,6 +819,7 @@ func (s *Session) run(ctx context.Context, delivery *transport.Delivery) {
 		// discards rather than a message nobody ever hears about again.
 		log.Warn().Err(err).Msg("gave a command back after the session ended under it")
 		forfeit(delivery)
+		handedBack = true
 		return
 	}
 	// The answer and the acknowledgement both go out detached from the session's
@@ -1199,4 +1233,20 @@ func mustMarshal(payload any) json.RawMessage {
 		panic(fmt.Sprintf("session: marshal: %v", err))
 	}
 	return body
+}
+
+// reportCommand hands one finished command to whoever is measuring.
+//
+// The outcome is the contract's own error code rather than a bare "error", because the
+// question an operator actually asks is which kind of failure got slower, and `internal`
+// and `not_connected` are not the same incident.
+func (s *Session) reportCommand(command *protocol.Command, began time.Time, err error) {
+	if s.watch == nil {
+		return
+	}
+	outcome := "ok"
+	if err != nil {
+		outcome = string(asProtocolError(err).Code)
+	}
+	s.watch.CommandDone(command.Type, outcome, s.now().Sub(began))
 }

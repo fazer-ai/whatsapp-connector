@@ -30,6 +30,7 @@ type Manager struct {
 	leases     *cluster.Leases
 	quarantine *cluster.Quarantine
 	publisher  transport.Publisher
+	watch      Watch
 	replier    transport.Replier
 	ledger     Ledger
 	newID      IDFunc
@@ -118,6 +119,8 @@ type ManagerConfig struct {
 	Leases    *cluster.Leases
 	Publisher transport.Publisher
 	Replier   transport.Replier
+	// Watch is told what this layer measured. Nil is nobody watching.
+	Watch Watch
 	// Ledger is where a command's outcome is remembered. Leaving it out turns the
 	// idempotency invariant off, which only a test that is not exercising it should do.
 	Ledger Ledger
@@ -151,6 +154,7 @@ func NewManager(cfg *ManagerConfig) *Manager {
 		leases:      cfg.Leases,
 		quarantine:  cfg.Quarantine,
 		publisher:   cfg.Publisher,
+		watch:       cfg.Watch,
 		replier:     cfg.Replier,
 		ledger:      cfg.Ledger,
 		newID:       cfg.NewID,
@@ -295,7 +299,7 @@ func (m *Manager) Adopt(ctx context.Context, sid string) (*Session, error) {
 	living := context.WithoutCancel(ctx)
 	session := New(living, &Config{
 		Instance: m.instance, Lease: lease, Leases: m.leases, Engine: engineSession,
-		Publisher: m.publisher, Replier: m.replier, Ledger: m.ledger,
+		Publisher: m.publisher, Replier: m.replier, Ledger: m.ledger, Watch: m.watch,
 		NewID: m.newID, Now: m.now, Logger: m.log,
 		Undrained: func() { m.undrained(sid) }, RetireRetry: m.retireRetry,
 		Connected: func() { m.working(living, sid) }, ResumeFailed: func() { m.failing(living, sid) },
@@ -1182,6 +1186,14 @@ func (m *Manager) RenewAll(ctx context.Context, by time.Time) {
 			m.log.Warn().Err(err).Str("sid", sid).Msg("a lease went stale while unreachable; stopping the session")
 		} else {
 			m.log.Warn().Str("sid", sid).Msg("lost a lease; stopping the session")
+		}
+		// Counted for both branches above, because both are this instance ceasing to own
+		// a session it was running, which is what the counter is for. Counted here and
+		// not inside `drop`, which also runs for an ordinary shutdown: a fleet coming
+		// down cleanly is not a flap, and counting it would bury the shape this exists
+		// to show.
+		if m.watch != nil {
+			m.watch.LeaseLost()
 		}
 		session, still := m.drop(sid, running[sid])
 		if !still {
