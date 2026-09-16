@@ -547,13 +547,11 @@ func TestNoFunctionTakesTheInboxWithoutSayingWhy(t *testing.T) {
 			"nothing, so a green result below would mean nothing either", len(control))
 	}
 
+	// One guard for both ways of reading nothing, because a directory with no files and a
+	// directory whose files declare no such type are the same failure with different
+	// causes, and the count in the message is what tells them apart. A second guard on the
+	// file count could never fire on its own: nothing read means nothing declared.
 	found, scanned, declared := carriers(t, pkg)
-	if scanned == 0 {
-		t.Fatalf("read %d production file(s) in %q: a rule with nothing to read is not a rule",
-			scanned, pkg)
-	}
-	// And it is still about this package's channel. Rename the type and every match
-	// silently stops happening, which reads exactly like the healthy zero above.
 	if !declared {
 		t.Fatalf("no type named %q is declared in the %d file(s) read: this rule has lost its "+
 			"subject and now matches nothing by construction", inboxElement, scanned)
