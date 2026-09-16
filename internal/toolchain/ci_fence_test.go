@@ -19,6 +19,16 @@ const (
 	promise = "check"
 )
 
+// An exemption from `make check`, and the local target it leans on. A reason in prose is
+// not an assertion: the exemption for the lint action said "`make lint` is reachable from
+// check", and `check-offline: tidy` would have left that sentence in place while the target
+// stopped running lint and the SQLite pass at all. standsFor is what makes the premise
+// fail with it.
+type exemption struct {
+	standsFor string // the target `make check` has to keep reaching; empty when there is no local counterpart
+	why       string
+}
+
 // Steps that gate nothing: they move bytes into or out of the runner. Keyed by the action
 // without its version, because the version moves and the reason does not.
 var notAGate = map[string]string{
@@ -34,21 +44,21 @@ var notAGate = map[string]string{
 // target reporting "CI will accept this" over a pass CI ran and it did not.
 //
 // Keyed by the action for a `uses:` step and by the step's name for a `run:` step.
-var outsideCheck = map[string]string{
-	"golangci/golangci-lint-action": "the same binary, version and config as `make lint`, which is reachable from check. " +
-		"The action is kept for its own caching and for turning findings into annotations on the diff, neither of which make can do from here.",
-	"docker/build-push-action": "builds the release image. It needs buildx and a layer cache, so `make check` does not promise it; " +
-		"what it protects is that a change cannot break the release build without CI saying so on the pull request that made it.",
-	"It comes up with its own volume attached": "starts the built image with its volume attached, which needs the image the step above built. " +
-		"Nothing a developer runs locally has that image, so this one is CI's alone.",
+var outsideCheck = map[string]exemption{
+	"golangci/golangci-lint-action": {standsFor: "lint", why: "the same binary, version and config as `make lint`. " +
+		"The action is kept for its own caching and for turning findings into annotations on the diff, neither of which make can do from here."},
+	"docker/build-push-action": {why: "builds the release image. It needs buildx and a layer cache, so `make check` does not promise it; " +
+		"what it protects is that a change cannot break the release build without CI saying so on the pull request that made it."},
+	"It comes up with its own volume attached": {why: "starts the built image with its volume attached, which needs the image the step above built. " +
+		"Nothing a developer runs locally has that image, so this one is CI's alone."},
 }
 
 // Targets the workflow runs that `check` does not reach, with the reason. The list exists
 // so that adding a target to CI is a decision somebody writes down, rather than a line
 // that lands and leaves `check` quietly behind.
-var targetsOutsideCheck = map[string]string{
-	"test-cover": "`make test` under a coverage profile: the same packages and the same cleared variables, plus coverage.txt for the artifact. " +
-		"`check` reaches `test`, so the gate is covered; what it does not reach is the profile, and a profile gates nothing.",
+var targetsOutsideCheck = map[string]exemption{
+	"test-cover": {standsFor: "test", why: "`make test` under a coverage profile: the same packages and the same cleared variables, " +
+		"plus coverage.txt for the artifact. What `check` does not reach is the profile, and a profile gates nothing."},
 }
 
 type workflow struct {
@@ -74,20 +84,30 @@ func TestEveryGateCIEnforcesIsReachableFromMakeCheck(t *testing.T) {
 
 	steps := workflowSteps(t)
 	reachable, targets := reachableFrom(t, promise)
+	used := map[string]bool{}
 
 	var gates int
 	for _, step := range steps {
-		called := targetsCalledBy(step.Run)
+		called, only := targetsCalledBy(step.Run)
 		switch {
-		case len(called) > 0:
+		// A script that calls make and then does something else is the drift this fence
+		// exists to catch, hidden inside a step that looks compliant: `make tidy` followed
+		// by `go vet ./...` adds a gate nobody local runs. Such a step is judged as the
+		// script it is, not as the make call it starts with.
+		case len(called) > 0 && only:
 			gates++
 			for _, target := range called {
+				used[target] = true
 				if !targets[target] {
 					t.Errorf("the workflow step %q runs `make %s`, and the Makefile has no such target:\n"+
 						"\tthe step fails on every run, or the target was renamed and this side was not", step.label(), target)
 					continue
 				}
-				if reachable[target] || targetsOutsideCheck[target] != "" {
+				if reachable[target] {
+					continue
+				}
+				if x, ok := targetsOutsideCheck[target]; ok {
+					standsUp(t, reachable, "the target "+target, x)
 					continue
 				}
 				t.Errorf("the workflow step %q runs `make %s`, which `make %s` does not reach:\n"+
@@ -98,23 +118,58 @@ func TestEveryGateCIEnforcesIsReachableFromMakeCheck(t *testing.T) {
 		case step.Uses != "":
 			action := strings.SplitN(step.Uses, "@", 2)[0]
 			if notAGate[action] != "" {
+				used[action] = true
 				continue
 			}
 			gates++
-			if outsideCheck[action] == "" {
+			used[action] = true
+			x, ok := outsideCheck[action]
+			if !ok {
 				t.Errorf("the workflow uses %q and nothing here says what it is:\n"+
 					"\tif it enforces something, `make %s` has to run it too; if it does not, say so in notAGate.\n"+
-					"\tEither way it goes in one of the two lists in this file, with a reason.",
+					"\tEither way it goes in one of the lists in this file, with a reason.",
 					action, promise)
+				continue
 			}
+			standsUp(t, reachable, "the action "+action, x)
 		default:
 			gates++
-			if outsideCheck[step.label()] == "" {
-				t.Errorf("the workflow step %q runs a script of its own instead of a make target:\n"+
-					"\ta script here is a gate `make %s` cannot run and developers cannot reproduce.\n"+
-					"\tMove it behind a target, or add it to outsideCheck with the reason it is CI's alone.",
-					step.label(), promise)
+			used[step.label()] = true
+			x, ok := outsideCheck[step.label()]
+			if !ok {
+				what := "runs a script of its own instead of a make target"
+				if len(called) > 0 {
+					what = "runs make and then commands that are not make"
+				}
+				t.Errorf("the workflow step %q %s:\n"+
+					"\ta command here is a gate `make %s` cannot run and developers cannot reproduce.\n"+
+					"\tMove it behind a target, or add it to outsideCheck with the reason it is CI's alone.\n"+
+					"\tThe script:\n\t\t%s",
+					step.label(), what, promise, strings.ReplaceAll(strings.TrimSpace(step.Run), "\n", "\n\t\t"))
+				continue
 			}
+			standsUp(t, reachable, "the step "+step.label(), x)
+		}
+	}
+
+	// An exemption nobody reaches is a decision about a workflow that has moved on. It is
+	// how these lists rot into a record of what CI used to do, which is the state the
+	// Makefile and this workflow were already in when the issue was filed.
+	for _, list := range []struct {
+		name string
+		of   map[string]exemption
+	}{{"outsideCheck", outsideCheck}, {"targetsOutsideCheck", targetsOutsideCheck}} {
+		for key := range list.of {
+			if !used[key] {
+				t.Errorf("%s exempts %q and no step in %s uses it:\n"+
+					"\tthe step was renamed or removed, and the exemption outlived it", list.name, key, workflowPath)
+			}
+		}
+	}
+	for key := range notAGate {
+		if !used[key] {
+			t.Errorf("notAGate lists %q and no step in %s uses it:\n"+
+				"\tthe step was renamed or removed, and the entry outlived it", key, workflowPath)
 		}
 	}
 
@@ -131,37 +186,68 @@ func TestEveryGateCIEnforcesIsReachableFromMakeCheck(t *testing.T) {
 	}
 }
 
+// standsUp fails when an exemption's own premise has stopped being true. Each one is
+// allowed because `make check` still reaches the local equivalent; when it stops reaching
+// it, the exemption is a sentence about a target that no longer runs.
+func standsUp(t *testing.T, reachable map[string]bool, what string, x exemption) {
+	t.Helper()
+
+	if x.standsFor == "" || reachable[x.standsFor] {
+		return
+	}
+	t.Errorf("%s is exempt from `make %s` because `make %s` covers it locally, and `make %s` no longer reaches `%s`:\n"+
+		"\tthe exemption reads: %s\n"+
+		"\tCI enforces it, nothing local does, and the list still says otherwise.",
+		what, promise, x.standsFor, promise, x.standsFor, x.why)
+}
+
 // The fence reads scripts written for a shell, and a script carries prose: comments,
-// echoed messages, names of things. Every one of these was a target this file claimed the
-// Makefile was missing before the pattern was anchored to a command position.
+// echoed messages, names of things. Every prose case here was a target this file claimed
+// the Makefile was missing before the pattern was anchored to a command position.
+//
+// onlyMake is the other half, and it is what a mixed script turns on: a step that runs a
+// target and then something else is a gate hiding behind a compliant-looking line.
 func TestTargetsCalledByReadsCommandsAndNotProse(t *testing.T) {
 	t.Parallel()
 
 	for _, tc := range []struct {
 		script string
 		want   []string
+		only   bool
 	}{
-		{"make test-postgres", []string{"test-postgres"}},
-		{"make -s check", []string{"check"}},
-		{"make lint test", []string{"lint", "test"}},
-		{"go build ./... && make lint", []string{"lint"}},
-		{"docker ps; make tidy", []string{"tidy"}},
-		{"# make sure the volume is attached\ndocker run smoke", nil},
-		{"echo 'this will make things slow'", nil},
-		{"echo \"nothing here to make of it\"", nil},
+		{script: "make test-postgres", want: []string{"test-postgres"}, only: true},
+		{script: "make -s check", want: []string{"check"}, only: true},
+		{script: "make lint test", want: []string{"lint", "test"}, only: true},
+		{script: "make tidy\nmake lint", want: []string{"tidy", "lint"}, only: true},
+		{script: "make tidy && make lint", want: []string{"tidy", "lint"}, only: true},
+		{script: "# only a comment here\nmake tidy", want: []string{"tidy"}, only: true},
+		// Mixed: make plus a gate nobody local runs.
+		{script: "make tidy\ngo vet ./...", want: []string{"tidy"}},
+		{script: "make tidy && go vet ./...", want: []string{"tidy"}},
+		{script: "go build ./... && make lint", want: []string{"lint"}},
+		{script: "docker ps; make tidy", want: []string{"tidy"}},
+		// Prose: not a call at all.
+		{script: "# make sure the volume is attached\ndocker run smoke"},
+		{script: "echo 'this will make things slow'"},
+		{script: "echo \"nothing here to make of it\""},
 	} {
-		got := targetsCalledBy(tc.script)
-		if len(got) != len(tc.want) {
-			t.Errorf("targetsCalledBy(%q) = %v, want %v", tc.script, got, tc.want)
-			continue
-		}
-		for i := range got {
-			if got[i] != tc.want[i] {
-				t.Errorf("targetsCalledBy(%q) = %v, want %v", tc.script, got, tc.want)
-				break
-			}
+		got, only := targetsCalledBy(tc.script)
+		if !equal(got, tc.want) || only != tc.only {
+			t.Errorf("targetsCalledBy(%q) = %v, %t; want %v, %t", tc.script, got, only, tc.want, tc.only)
 		}
 	}
+}
+
+func equal(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 type step struct {
@@ -201,12 +287,34 @@ func workflowSteps(t *testing.T) []step {
 	return steps
 }
 
-func targetsCalledBy(script string) []string {
-	var called []string
+// targetsCalledBy returns the targets a script invokes, and whether the script is make
+// calls and nothing else. The second half is what stops a compliant-looking step from
+// carrying an extra gate: `make tidy` on one line and `go vet ./...` on the next.
+func targetsCalledBy(script string) (called []string, onlyMake bool) {
 	for _, m := range makeCall.FindAllStringSubmatch(script, -1) {
 		called = append(called, strings.Fields(m[2])...)
 	}
-	return called
+	return called, len(called) > 0 && everyCommandIsMake(script)
+}
+
+// everyCommandIsMake splits a script the way a shell separates commands, ignoring comments
+// and blank lines, and asks whether each one starts with make. A continuation line or a
+// heredoc reads as "not make", which sends the step to the branch that demands a written
+// exemption: the wrong answer there costs a sentence, and the wrong answer the other way
+// costs an unnoticed gate.
+func everyCommandIsMake(script string) bool {
+	for _, line := range strings.Split(script, "\n") {
+		line = strings.TrimSpace(comment.ReplaceAllString(line, ""))
+		if line == "" {
+			continue
+		}
+		for _, cmd := range shellSeparator.Split(line, -1) {
+			if cmd = strings.TrimSpace(cmd); cmd != "" && !strings.HasPrefix(cmd, "make ") && cmd != "make" {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // reachableFrom walks the Makefile's own dependency graph from a target, and also returns
@@ -258,9 +366,11 @@ func reachableFrom(t *testing.T, root string) (reachable, declared map[string]bo
 }
 
 var (
-	comment     = regexp.MustCompile(`#.*$`)
-	assignRe    = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*)\s*[:?+]?=\s*(.*)$`)
-	referenceRe = regexp.MustCompile(`\$\(([A-Za-z_][A-Za-z0-9_]*)\)`)
+	comment = regexp.MustCompile(`#.*$`)
+	// What a shell reads as the end of one command and the start of the next.
+	shellSeparator = regexp.MustCompile(`&&|\|\||[;|]`)
+	assignRe       = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*)\s*[:?+]?=\s*(.*)$`)
+	referenceRe    = regexp.MustCompile(`\$\(([A-Za-z_][A-Za-z0-9_]*)\)`)
 )
 
 func assignment(line string) (name, value string, ok bool) {
