@@ -136,6 +136,22 @@ map and the compatibility rules. In short:
 - `contract/PROTOCOL_VERSION` is a major version. Additive changes do not bump it; a
   connector serves the current major and the one before it.
 
+### What an account under Coexistence does not have
+
+A number running [Coexistence](https://docs.360dialog.com/docs/resources/phone-numbers/coexistence),
+which is the WhatsApp Business app and the Cloud API on the same number, does not do voice
+or video calls, group chats, broadcast lists, disappearing messages, view-once messages,
+live location or the catalog. That is the platform's rule and not this connector's: the
+call never reaches any linked device, including WhatsApp's own web client, so `call.offer`
+is never published and `calls.auto_reject` has nothing to refuse. Measured on a paired
+Coexistence account: three incoming calls, zero call stanzas on the socket.
+
+Nothing on the wire tells such a number apart. Its `<pair-success>` carries the same
+`platform` as any other business account and a `<biz>` with only a name, so the connector
+cannot detect it and does not guess: inferring it from an absence would mark a healthy new
+inbox as limited. A client that onboarded the number knows which path it came in by, and
+that is where the warning belongs.
+
 ## Development
 
 Requirements: Go (version in `go.mod`) and
