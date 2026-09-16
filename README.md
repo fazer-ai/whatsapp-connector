@@ -139,12 +139,22 @@ map and the compatibility rules. In short:
 ### What `calls.auto_reject` does not silence
 
 A caller on WhatsApp Web ignores the refusal. The node goes out exactly as it does for any
-other caller, WhatsApp routes it and acks it, and the browser on the other end keeps
-ringing until the call times out. Sixteen calls to two paired accounts across an afternoon
-divide on the `platform` the offer announces and on nothing else: eleven from the Android
-app, every one of them refused within about a second, and five from the web client, every
-one of them ringing its full course. The longest ran 89.8s and ended `timeout`. Nothing
-this connector writes changes it.
+other caller, WhatsApp routes it and acks it, and the browser on the other end goes on
+ringing.
+
+Sixteen calls with every node captured, to a paired account across an afternoon, divide on
+the `platform` the offer announces and on nothing else. Eleven came from the Android app.
+Nine of those had both nodes written into them, and **all nine ended within a second of the
+`<reject>`** -- the end tracking the node rather than the clock, which is what says it was
+the refusal and not the ring running out. Of the other two, one was refused on the
+operator's own phone before this connector wrote anything, and one was a deliberate control
+that got the `<preaccept>` and no `<reject>` at all: it rang its full course and ended
+normally.
+
+Five came from the web client and **not one of them was ended by a refusal written here**.
+The one that was left to run rang 89.8s and ended `timeout`; another ended at 11s when the
+caller gave up; the remaining three were the bare `<reject>` this connector used to write,
+and the bench came down before any end reached it.
 
 It matters to whoever reads the inbox rather than to the code: with the policy on, the
 operator's phone still rings for a caller who dialled from a browser, and there is no
