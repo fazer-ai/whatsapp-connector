@@ -502,6 +502,15 @@ func TestAPresenceRetriedIntoAFullInboxIsCounted(t *testing.T) {
 // coexist in Go, so a bare name would let one entry excuse two functions. The value is
 // why, and it may not be blank: an entry that has to say what it is for is harder to add
 // without thinking than a name on a list.
+// inboxElement is the type the rule is about, named once.
+//
+// It used to be spelled out in three independent places -- the match, the control, and the
+// guard that says the type is still declared here -- and two of them agreeing was enough
+// to look healthy. Change the match and the control together and the rule goes on
+// reporting its control, finds nothing in the package, and passes with a real door open.
+// One name means no two of the three can drift into agreeing with each other.
+const inboxElement = "pending"
+
 var carriersAllowed = map[string]string{}
 
 // The second half of the inbox fence, and it exists because the first half can only see a
@@ -519,7 +528,7 @@ var carriersAllowed = map[string]string{}
 // closing this properly means go/types. This is the cheap rule instead: nobody takes the
 // channel as a parameter unless they have written their name and their reason above. It
 // does not ask what the function does with it, so it is broader than the real risk and
-// narrower than the whole hole -- `boundaryOfThisRule` below says where it stops.
+// narrower than the whole hole -- the boundary is written out on `carriesTheInbox`, which is where the match is.
 func TestNoFunctionTakesTheInboxWithoutSayingWhy(t *testing.T) {
 	t.Parallel()
 
@@ -528,9 +537,9 @@ func TestNoFunctionTakesTheInboxWithoutSayingWhy(t *testing.T) {
 	// The rule fires at all. Its expected finding in this package is zero, for ever, so
 	// "found nothing" is the healthy answer and cannot double as evidence that the
 	// matching still works. A control that must be reported is what separates the two.
-	control := carriersIn(t, token.NewFileSet(), "control.go", `package whatsmeow
-func aControlThatMustBeSeen(inbox chan<- pending, p pending) { inbox <- p }
-`)
+	control := carriersIn(t, token.NewFileSet(), "control.go", fmt.Sprintf(
+		"package whatsmeow\nfunc aControlThatMustBeSeen(inbox chan<- %[1]s, p %[1]s) { inbox <- p }\n",
+		inboxElement))
 	if len(control) != 1 || control[0].name != "aControlThatMustBeSeen" {
 		t.Fatalf("the rule did not report its own control (%d finding(s)): it is matching "+
 			"nothing, so a green result below would mean nothing either", len(control))
@@ -545,7 +554,7 @@ func aControlThatMustBeSeen(inbox chan<- pending, p pending) { inbox <- p }
 	// silently stops happening, which reads exactly like the healthy zero above.
 	if !declared {
 		t.Fatalf("no type named %q is declared in the %d file(s) read: this rule has lost its "+
-			"subject and now matches nothing by construction", "pending", scanned)
+			"subject and now matches nothing by construction", inboxElement, scanned)
 	}
 
 	for _, taker := range found {
@@ -602,7 +611,7 @@ func carriers(t *testing.T, dir string) (found []inboxCarrier, scanned int, decl
 		}
 		found = append(found, carriersIn(t, fset, name, string(body))...)
 		scanned++
-		if declaresPending(t, fset, name, string(body)) {
+		if declaresTheElement(t, fset, name, string(body)) {
 			declared = true
 		}
 	}
@@ -638,7 +647,7 @@ func carriersIn(t *testing.T, fset *token.FileSet, name, src string) []inboxCarr
 	// not need it: Go already makes a function name unique in a package, and a method
 	// unique on its type.
 	literal := func(called string, sig *ast.FuncType, pos token.Pos) {
-		record(fmt.Sprintf("%s@%s:%d", called, name, fset.Position(pos).Line), sig, pos)
+		record(keyFor(fset, parsed, name, called, pos), sig, pos)
 	}
 
 	// Bound to a name first, so the name wins over the position.
@@ -671,48 +680,34 @@ func carriersIn(t *testing.T, fset *token.FileSet, name, src string) []inboxCarr
 	// Whatever is left is genuinely anonymous, and answers to where it was written.
 	ast.Inspect(parsed, func(node ast.Node) bool {
 		if lit, ok := node.(*ast.FuncLit); ok {
-			record(within(fset, parsed, name, lit), lit.Type, lit.Pos())
+			record(keyFor(fset, parsed, name, "a literal", lit.Pos()), lit.Type, lit.Pos())
 		}
 		return true
 	})
 	return found
 }
 
-// within names an anonymous literal after the function it sits in, because that is what
-// the person reading the failure has to go and look at, and then after where it is.
-func within(fset *token.FileSet, file *ast.File, name string, lit *ast.FuncLit) string {
-	at := fset.Position(lit.Pos()).Line
+// keyFor names a literal after what calls it, the function it sits in, and where it is.
+//
+// All three matter, and the last two for the same reason. Without the enclosing function,
+// `offer@file.go:9` says nothing about which `offer` it is: insert five lines of comment
+// above the function before it and another function's literal lands on line 9, inheriting
+// an exemption that was written for its neighbour, with one entry and one failure before
+// and after. With the function in the key that shift makes the exemption match nothing,
+// and an entry that names nothing already fails loudly.
+func keyFor(fset *token.FileSet, file *ast.File, name, called string, pos token.Pos) string {
+	at := fset.Position(pos).Line
 	for _, decl := range file.Decls {
 		fn, ok := decl.(*ast.FuncDecl)
-		if !ok || lit.Pos() < fn.Pos() || lit.Pos() > fn.End() {
+		if !ok || pos < fn.Pos() || pos > fn.End() {
 			continue
 		}
-		return fmt.Sprintf("a literal in %s@%s:%d", declName(fn), name, at)
+		return fmt.Sprintf("%s in %s@%s:%d", called, declName(fn), name, at)
 	}
-	return fmt.Sprintf("a literal@%s:%d", name, at)
+	// Package level, so there is no function to sit in.
+	return fmt.Sprintf("%s@%s:%d", called, name, at)
 }
 
-// carriesTheInbox is the match, and it reads a spelling: a channel of `pending` written
-// out in a parameter list.
-//
-// The direction is the whole judgement on what counts. A parameter that can only be
-// received from is not a door, because it cannot be sent to at all. (It is a different
-// danger -- a second consumer racing the forwarder, which invariant 3 is about -- and
-// folding it in here would hide it under the wrong name.)
-//
-// Because spelling is all it reads, this is where the rule stops, and the list is written
-// out rather than left to be discovered. Anything that puts the same channel behind
-// another name gets past: a type alias or a named channel type (`type inboxCh = chan
-// pending`, one line and as innocent as the refactor this catches), a type parameter, and
-// the channel wrapped in a struct field, a slice or a map. So does a function that returns
-// the channel instead of taking it, which is past both halves of the fence, since the
-// channel of that send is a call and not a selector. Each one needs go/types to see,
-// because each is the same channel wearing a different spelling.
-//
-// Two shapes that look like they belong on that list are caught, by the other half rather
-// than this one: a struct whose field is named `inbox`, and a closure that captures the
-// session. Both end up writing `.inbox <-` somewhere, which is what
-// TestEveryWriteToTheInboxIsMeasured reads.
 func carriesTheInbox(sig *ast.FuncType) bool {
 	if sig.Params == nil {
 		return false
@@ -726,7 +721,7 @@ func carriesTheInbox(sig *ast.FuncType) bool {
 		if !ok || channel.Dir == ast.RECV {
 			continue
 		}
-		if named, ok := channel.Value.(*ast.Ident); ok && named.Name == "pending" {
+		if named, ok := channel.Value.(*ast.Ident); ok && named.Name == inboxElement {
 			return true
 		}
 	}
@@ -746,7 +741,7 @@ func declName(fn *ast.FuncDecl) string {
 	return fmt.Sprintf("(%s).%s", receiver.String(), fn.Name.Name)
 }
 
-func declaresPending(t *testing.T, fset *token.FileSet, name, src string) bool {
+func declaresTheElement(t *testing.T, fset *token.FileSet, name, src string) bool {
 	t.Helper()
 
 	parsed, err := parser.ParseFile(fset, name, src, 0)
@@ -755,7 +750,7 @@ func declaresPending(t *testing.T, fset *token.FileSet, name, src string) bool {
 	}
 	declared := false
 	ast.Inspect(parsed, func(node ast.Node) bool {
-		if spec, ok := node.(*ast.TypeSpec); ok && spec.Name.Name == "pending" {
+		if spec, ok := node.(*ast.TypeSpec); ok && spec.Name.Name == inboxElement {
 			declared = true
 		}
 		return true
