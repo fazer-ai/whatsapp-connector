@@ -38,13 +38,18 @@ fmt: ## Format the code
 lint: ## Run the linters (formatting included)
 	$(GOLANGCI_LINT) run
 
-# The variable is cleared rather than merely not set: it is inherited from whatever
-# shell runs this, so a developer who exported it -- or `make check`, which passes its
-# own environment to both passes -- would otherwise get PostgreSQL here and never run
-# SQLite at all. Two passes that are the same pass is the one failure this whole
-# arrangement cannot notice.
-test: ## Run the test suite with the race detector, against SQLite
-	WAC_TEST_DATABASE_URL= $(GO) test -race $(PACKAGES)
+# Both variables are cleared rather than merely not set: they are inherited from whatever
+# shell runs this, so a developer who exported one -- or `make check`, which passes its own
+# environment to every pass and now requires both to be set -- would otherwise get
+# PostgreSQL and a real Redis here and never run the doubles at all. Two passes that are
+# the same pass is the one failure this whole arrangement cannot notice.
+#
+# The Redis half of that was missed when `check` stopped being optional, and it reaches
+# further than the duplicated pass: `check-offline` promises to need nothing running, and
+# with an exported WAC_TEST_REDIS_URL and no server it went looking for one. The stop hook
+# falls back to that target, so the promise is what keeps an agent able to stop.
+test: ## Run the test suite with the race detector, against SQLite and the doubles
+	WAC_TEST_DATABASE_URL= WAC_TEST_REDIS_URL= $(GO) test -race $(PACKAGES)
 
 # The guard is a shell test and not $(error) so that `make -n check` prints this recipe
 # instead of dying while expanding it. What that dry run shows is the promise itself: the
@@ -74,7 +79,7 @@ test-redis: ## Run the pass that needs a real Redis (WAC_TEST_REDIS_URL)
 	$(GO) test -count=1 ./internal/transport/redisstream
 
 test-cover: ## Run the test suite and write coverage.txt
-	WAC_TEST_DATABASE_URL= $(GO) test -race -coverprofile=coverage.txt -covermode=atomic $(PACKAGES)
+	WAC_TEST_DATABASE_URL= WAC_TEST_REDIS_URL= $(GO) test -race -coverprofile=coverage.txt -covermode=atomic $(PACKAGES)
 
 # The whole package, and not a -run of the tests whose names sounded like the contract:
 # the filter that used to be here missed the RPC classification and both enum checks, so
