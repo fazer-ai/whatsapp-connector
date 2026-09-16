@@ -14,6 +14,7 @@ import (
 
 	"github.com/fazer-ai/whatsapp-connector/internal/engine"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
+	"github.com/fazer-ai/whatsapp-connector/internal/store"
 )
 
 // holdTheDial puts the session's client where a reconnect puts it: inside a dial, holding
@@ -338,7 +339,7 @@ func TestADeleteWaitingOnARedialFailsWithoutTearingTheAccountDown(t *testing.T) 
 	t.Parallel()
 
 	session, container := newTestSession(t, "5511999990002")
-	if err := session.store.PutDesiredConnected(t.Context(), false); err != nil {
+	if err := session.store.PutDesiredConnected(t.Context(), store.Wants{}); err != nil {
 		t.Fatalf("PutDesiredConnected: %v", err)
 	}
 	session.setConnected(false)

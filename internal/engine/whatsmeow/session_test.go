@@ -137,7 +137,6 @@ var (
 		protocol.CommandSessionUpdate,
 		protocol.CommandHistoryRequest,
 		protocol.CommandContactInfo,
-		protocol.CommandCallReject,
 	}
 
 	// Reached now, which is a different thing from being carried out: an empty payload
@@ -181,6 +180,7 @@ var (
 		{protocol.CommandGroupLeave, protocol.ErrorInvalidPayload},
 		{protocol.CommandGroupPhotoSet, protocol.ErrorInvalidPayload},
 		{protocol.CommandGroupNameSet, protocol.ErrorInvalidPayload},
+		{protocol.CommandCallReject, protocol.ErrorInvalidPayload},
 		{protocol.CommandGroupDescriptionSet, protocol.ErrorInvalidPayload},
 		{protocol.CommandGroupSettingsSet, protocol.ErrorInvalidPayload},
 	}
@@ -2119,8 +2119,7 @@ func TestConnectRefusesTheOptionsThisBuildDoesNotCarryOut(t *testing.T) {
 	t.Parallel()
 
 	for name, payload := range map[string]string{
-		"auto-rejecting calls": `{"pairing":"resume","calls":{"auto_reject":true}}`,
-		"importing history":    `{"pairing":"resume","history_sync":true}`,
+		"importing history": `{"pairing":"resume","history_sync":true}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -3290,10 +3289,9 @@ func TestAConnectThisBuildRefusesIsNotSomethingToResume(t *testing.T) {
 	t.Parallel()
 
 	for name, request := range map[string]engine.ConnectRequest{
-		"history_sync":      {Pairing: "resume", Groups: true, HistorySync: true},
-		"calls.auto_reject": {Pairing: "resume", Groups: true, Calls: &engine.CallsRequest{AutoReject: true}},
-		"proxy":             {Pairing: "resume", Groups: true, Proxy: &engine.ProxyRequest{URL: "socks5://127.0.0.1:1080"}},
-		"pairing":           {Pairing: "telepathy", Groups: true},
+		"history_sync": {Pairing: "resume", Groups: true, HistorySync: true},
+		"proxy":        {Pairing: "resume", Groups: true, Proxy: &engine.ProxyRequest{URL: "socks5://127.0.0.1:1080"}},
+		"pairing":      {Pairing: "telepathy", Groups: true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()

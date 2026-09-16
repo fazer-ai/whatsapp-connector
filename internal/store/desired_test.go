@@ -2,6 +2,8 @@ package store_test
 
 import (
 	"testing"
+
+	"github.com/fazer-ai/whatsapp-connector/internal/store"
 )
 
 // What the sweep that brings sessions back reads, and the three answers it has to get
@@ -16,14 +18,14 @@ func TestWantedIsThePairedSessionsSomebodyAskedToConnect(t *testing.T) {
 
 	pair(t, container, "sid-up", "5511999990001")
 	pair(t, container, "sid-off", "5511999990002")
-	if err := container.For("sid-up").PutDesiredConnected(ctx, false); err != nil {
+	if err := container.For("sid-up").PutDesiredConnected(ctx, store.Wants{}); err != nil {
 		t.Fatalf("PutDesiredConnected: %v", err)
 	}
 	if err := container.For("sid-off").PutDesiredDisconnected(ctx); err != nil {
 		t.Fatalf("PutDesiredDisconnected: %v", err)
 	}
 	// Asked for and never paired, which is a QR somebody walked away from.
-	if err := container.For("sid-never").PutDesiredConnected(ctx, false); err != nil {
+	if err := container.For("sid-never").PutDesiredConnected(ctx, store.Wants{}); err != nil {
 		t.Fatalf("PutDesiredConnected: %v", err)
 	}
 
@@ -45,7 +47,7 @@ func TestADisconnectIsRememberedOverAConnect(t *testing.T) {
 	ctx := t.Context()
 
 	pair(t, container, "sid-1", "5511999990001")
-	if err := container.For("sid-1").PutDesiredConnected(ctx, false); err != nil {
+	if err := container.For("sid-1").PutDesiredConnected(ctx, store.Wants{}); err != nil {
 		t.Fatalf("PutDesiredConnected: %v", err)
 	}
 	if err := container.For("sid-1").PutDesiredDisconnected(ctx); err != nil {
@@ -70,7 +72,7 @@ func TestForgettingASessionForgetsThatItShouldBeConnected(t *testing.T) {
 	ctx := t.Context()
 
 	pair(t, container, "sid-1", "5511999990001")
-	if err := container.For("sid-1").PutDesiredConnected(ctx, false); err != nil {
+	if err := container.For("sid-1").PutDesiredConnected(ctx, store.Wants{}); err != nil {
 		t.Fatalf("PutDesiredConnected: %v", err)
 	}
 	if err := container.For("sid-1").Forget(ctx); err != nil {
@@ -100,10 +102,10 @@ func TestWhatWasAskedForComesBackWithTheSession(t *testing.T) {
 
 	pair(t, container, "sid-groups", "5511999990001")
 	pair(t, container, "sid-direct", "5511999990002")
-	if err := container.For("sid-groups").PutDesiredConnected(ctx, true); err != nil {
+	if err := container.For("sid-groups").PutDesiredConnected(ctx, store.Wants{Groups: true}); err != nil {
 		t.Fatalf("PutDesiredConnected: %v", err)
 	}
-	if err := container.For("sid-direct").PutDesiredConnected(ctx, false); err != nil {
+	if err := container.For("sid-direct").PutDesiredConnected(ctx, store.Wants{}); err != nil {
 		t.Fatalf("PutDesiredConnected: %v", err)
 	}
 
@@ -123,6 +125,70 @@ func TestWhatWasAskedForComesBackWithTheSession(t *testing.T) {
 	}
 }
 
+// The call policy travels the same road as the subscription and for a sharper reason: a
+// session brought back without it lets the account ring on the operator's phone after
+// they asked for calls to be refused, and nothing about the session says it changed its
+// mind. Recorded together with the subscription, because they arrive in one command and
+// an account brought back with half of what was asked for is not the account that was
+// asked for.
+func TestTheCallPolicyComesBackWithTheSession(t *testing.T) {
+	t.Parallel()
+	container := open(t)
+	ctx := t.Context()
+
+	pair(t, container, "sid-quiet", "5511999990001")
+	pair(t, container, "sid-ringing", "5511999990002")
+	if err := container.For("sid-quiet").PutDesiredConnected(ctx, store.Wants{CallAutoReject: true}); err != nil {
+		t.Fatalf("PutDesiredConnected: %v", err)
+	}
+	if err := container.For("sid-ringing").PutDesiredConnected(ctx, store.Wants{Groups: true}); err != nil {
+		t.Fatalf("PutDesiredConnected: %v", err)
+	}
+
+	wanted, err := container.Wanted(ctx)
+	if err != nil {
+		t.Fatalf("Wanted: %v", err)
+	}
+	policy := map[string]store.Wants{}
+	for _, session := range wanted {
+		policy[session.SID] = session.Wants
+	}
+	if got := policy["sid-quiet"]; !got.CallAutoReject || got.Groups {
+		t.Fatalf("the session that asked for calls to be refused would come back as %+v", got)
+	}
+	if got := policy["sid-ringing"]; got.CallAutoReject || !got.Groups {
+		t.Fatalf("the session that asked for groups and left calls alone would come back as %+v", got)
+	}
+}
+
+// Turning the policy off is a connect without it, the same way groups are turned off.
+// Recorded once and never overwritten, an account would keep refusing calls after every
+// restart on the strength of a request its client has replaced.
+func TestTurningTheCallPolicyOffIsRemembered(t *testing.T) {
+	t.Parallel()
+	container := open(t)
+	ctx := t.Context()
+
+	pair(t, container, "sid-1", "5511999990001")
+	if err := container.For("sid-1").PutDesiredConnected(ctx, store.Wants{CallAutoReject: true}); err != nil {
+		t.Fatalf("PutDesiredConnected: %v", err)
+	}
+	if err := container.For("sid-1").PutDesiredConnected(ctx, store.Wants{}); err != nil {
+		t.Fatalf("PutDesiredConnected: %v", err)
+	}
+
+	wanted, err := container.Wanted(ctx)
+	if err != nil {
+		t.Fatalf("Wanted: %v", err)
+	}
+	if len(wanted) != 1 {
+		t.Fatalf("Wanted has %d sessions, want 1", len(wanted))
+	}
+	if wanted[0].CallAutoReject {
+		t.Fatal("the session would come back still refusing calls, on a request its client replaced")
+	}
+}
+
 // A client turns groups off by connecting again without them, which is the only way it
 // can: there is no command that says "keep the connection and stop the groups". Recorded
 // once and never overwritten, an account would go on receiving group conversation after
@@ -133,10 +199,10 @@ func TestTurningGroupsOffIsRemembered(t *testing.T) {
 	ctx := t.Context()
 
 	pair(t, container, "sid-1", "5511999990001")
-	if err := container.For("sid-1").PutDesiredConnected(ctx, true); err != nil {
+	if err := container.For("sid-1").PutDesiredConnected(ctx, store.Wants{Groups: true}); err != nil {
 		t.Fatalf("PutDesiredConnected: %v", err)
 	}
-	if err := container.For("sid-1").PutDesiredConnected(ctx, false); err != nil {
+	if err := container.For("sid-1").PutDesiredConnected(ctx, store.Wants{}); err != nil {
 		t.Fatalf("PutDesiredConnected: %v", err)
 	}
 
@@ -165,7 +231,7 @@ func TestTheDesiredStateIsNotWrittenByASessionThatWasHandedOn(t *testing.T) {
 	losing := container.For("sid-1")
 	losing.Drop()
 
-	if err := losing.PutDesiredConnected(ctx, true); err == nil {
+	if err := losing.PutDesiredConnected(ctx, store.Wants{Groups: true}); err == nil {
 		t.Fatal("a session that no longer owns this one asked for it to be brought back")
 	}
 	if err := losing.PutDesiredDisconnected(ctx); err == nil {
@@ -192,7 +258,7 @@ func TestADisconnectLeavesTheSubscriptionAlone(t *testing.T) {
 	ctx := t.Context()
 
 	pair(t, container, "sid-1", "5511999990001")
-	if err := container.For("sid-1").PutDesiredConnected(ctx, true); err != nil {
+	if err := container.For("sid-1").PutDesiredConnected(ctx, store.Wants{Groups: true}); err != nil {
 		t.Fatalf("PutDesiredConnected: %v", err)
 	}
 	if err := container.For("sid-1").PutDesiredDisconnected(ctx); err != nil {

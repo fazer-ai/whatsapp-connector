@@ -13,6 +13,7 @@ import (
 	waEvents "go.mau.fi/whatsmeow/types/events"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
+	"github.com/fazer-ai/whatsapp-connector/internal/store"
 )
 
 // A logout whose request was written to the socket and never answered has not revoked
@@ -149,7 +150,7 @@ func TestALogoutThatLostItsAnswerKeepsThePairing(t *testing.T) {
 			t.Parallel()
 
 			session, container := newTestSession(t, "5511999990001")
-			if err := session.store.PutDesiredConnected(t.Context(), false); err != nil {
+			if err := session.store.PutDesiredConnected(t.Context(), store.Wants{}); err != nil {
 				t.Fatalf("PutDesiredConnected: %v", err)
 			}
 			session.logout = func(ctx context.Context, _ *wm.Client) error { return logout(ctx) }
@@ -215,7 +216,7 @@ func TestARetriedLogoutAfterALostAnswerLogsOutOnce(t *testing.T) {
 	t.Parallel()
 
 	session, container := newTestSession(t, "5511999990001")
-	if err := session.store.PutDesiredConnected(t.Context(), false); err != nil {
+	if err := session.store.PutDesiredConnected(t.Context(), store.Wants{}); err != nil {
 		t.Fatalf("PutDesiredConnected: %v", err)
 	}
 	var calls atomic.Int32

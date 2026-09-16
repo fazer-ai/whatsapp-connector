@@ -14,7 +14,7 @@ import (
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 )
 
-// Nine event types in the contract have nothing in this build that produces them,
+// Seven event types in the contract have nothing in this build that produces them,
 // and types.go marks each one. A comment is all that can be written there, and a comment
 // is what goes stale: the day somebody wires up `group.updated`, nothing makes them come
 // back here and say so, and the catalog then tells a client the opposite of the truth
@@ -33,8 +33,6 @@ var eventTypesWithNoProducer = []protocol.EventType{
 	protocol.EventContactPictureChanged,
 	protocol.EventContactIdentityChanged,
 	protocol.EventGroupPictureChanged,
-	protocol.EventCallOffer,
-	protocol.EventCallTerminate,
 	protocol.EventHistorySync,
 	protocol.EventRaw,
 }
@@ -54,7 +52,7 @@ func TestEveryEventTypeIsProducedOrMarkedAsNotProduced(t *testing.T) {
 	assertProducers(t, "EventType", "types.go", "producer", catalog, marked)
 }
 
-// Four command types are in the contract with nothing in this build that carries them
+// Three command types are in the contract with nothing in this build that carries them
 // out, and types.go marks each one. A client that sends one is answered `unsupported`,
 // so unlike an unproduced event this is told at the time -- but only to a client that
 // already sent it, and only for a session some instance owns. A command for a session
@@ -64,7 +62,6 @@ var commandTypesWithNoHandler = []protocol.CommandType{
 	protocol.CommandSessionUpdate,
 	protocol.CommandHistoryRequest,
 	protocol.CommandContactInfo,
-	protocol.CommandCallReject,
 }
 
 func TestEveryCommandTypeIsHandledOrMarkedAsNotHandled(t *testing.T) {
