@@ -63,10 +63,10 @@ func TestEveryMetricIsAccountedFor(t *testing.T) {
 		case written && known:
 			t.Errorf("%s is in both tables: say which one is true", name)
 		case !written && !known:
-			t.Errorf("%s is registered and in neither table.\n"+
+			t.Errorf("%s (%s) is registered and in neither table.\n"+
 				"Add it to writtenBy with the package that writes it, or to notWrittenYet "+
 				"with what is missing. A metric nobody writes reads as 0 on a panel, and a "+
-				"labelled one does not appear at all (#226).", name)
+				"labelled one does not appear at all (#226).", name, exposedName(name))
 		}
 	}
 
@@ -93,6 +93,16 @@ func TestAMetricSaidToBeWrittenIsMentionedWhereItIsSaidToBe(t *testing.T) {
 	t.Parallel()
 
 	for field, pkg := range writtenBy {
+		// This package declares every metric, so it names every one of them at
+		// registration. Accepting it as a writer makes the check answer its own
+		// question: the fence would go green on a metric whose only write is in a
+		// `_test.go`, which is the exact shape it exists to catch.
+		if pkg == "internal/observability" {
+			t.Errorf("writtenBy says internal/observability writes %s, which cannot be checked: "+
+				"this package names every metric at registration. Name the package that "+
+				"actually writes it.", field)
+			continue
+		}
 		if !mentions(t, filepath.Join("..", "..", pkg), field) {
 			t.Errorf("writtenBy says %s writes %s, and nothing in %s mentions it", pkg, field, pkg)
 		}
@@ -130,4 +140,33 @@ func mentions(t *testing.T, dir, identifier string) bool {
 		}
 	}
 	return false
+}
+
+// exposedName is the metric a field carries, for an error a reader greps the dashboard
+// with. The field name alone identifies it unambiguously and is the wrong thing to hand
+// somebody looking at a panel.
+func exposedName(field string) string {
+	for _, family := range gathered() {
+		if strings.EqualFold(strings.ReplaceAll(family, "_", ""), "wac"+strings.ToLower(field)) ||
+			strings.EqualFold(strings.ReplaceAll(family, "_", ""), "wac"+strings.ToLower(field)+"total") ||
+			strings.EqualFold(strings.ReplaceAll(family, "_", ""), "wac"+strings.ToLower(field)+"seconds") {
+			return family
+		}
+	}
+	return "no exposed family; it has never been scraped"
+}
+
+// gathered is the families a fresh registry actually exposes. A Vec with no children is
+// absent from it, which is the whole point of #226 and the reason the table above is
+// keyed by field.
+func gathered() []string {
+	families, err := observability.New().Registry.Gather()
+	if err != nil {
+		return nil
+	}
+	out := make([]string, 0, len(families))
+	for _, family := range families {
+		out = append(out, family.GetName())
+	}
+	return out
 }
