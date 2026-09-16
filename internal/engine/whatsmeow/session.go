@@ -3801,13 +3801,20 @@ func (s *Session) emitting(emission *engine.Emission, payload any) {
 	if emission.At == 0 {
 		emission.At = s.learned()
 	}
+	// Read before the first attempt, and reported by all three paths below, because what
+	// the metric promises is the depth this emission ARRIVED at. Read after a successful
+	// send it would count this emission itself; read after a blocked one it would report
+	// what the pump had already drained while we waited, which is lowest exactly when the
+	// pressure that made us wait was highest.
+	depth := len(s.inbox)
+
 	// Offered without waiting first, because the inbox has room almost every time and
 	// this path runs on whatsmeow's dispatch goroutine: the fast case must not pay for
 	// a clock reading, and the slow case is the only one worth a number.
 	waiting := pending{event: *emission}
 	select {
 	case s.inbox <- waiting:
-		s.queued(0, len(s.inbox))
+		s.queued(0, depth)
 		return
 	default:
 	}
@@ -3820,9 +3827,9 @@ func (s *Session) emitting(emission *engine.Emission, payload any) {
 	began := time.Now()
 	select {
 	case s.inbox <- waiting:
-		s.queued(time.Since(began), len(s.inbox))
+		s.queued(time.Since(began), depth)
 	case <-s.done:
-		s.queued(time.Since(began), len(s.inbox))
+		s.queued(time.Since(began), depth)
 	}
 }
 
