@@ -488,20 +488,6 @@ func TestAPresenceRetriedIntoAFullInboxIsCounted(t *testing.T) {
 	}
 }
 
-// carriersAllowed names the functions that may take the session inbox as a parameter,
-// and what each one is for.
-//
-// It is empty, and that is the healthy state rather than a starting point: no production
-// function in this package takes a channel of `pending` today, and the fence below exists
-// so that stays a decision instead of an accident. Adding an entry is the whole point --
-// the rule cannot tell a deliberate helper from a door lost by mistake, so it asks the
-// person who knows.
-//
-// The key names one function: a plain name for a function, `(*Session).name` for a
-// method, `file:line` for a function literal. A method and a function of the same name
-// coexist in Go, so a bare name would let one entry excuse two functions. The value is
-// why, and it may not be blank: an entry that has to say what it is for is harder to add
-// without thinking than a name on a list.
 // inboxElement is the type the rule is about, named once.
 //
 // It used to be spelled out in three independent places -- the match, the control, and the
@@ -511,6 +497,22 @@ func TestAPresenceRetriedIntoAFullInboxIsCounted(t *testing.T) {
 // One name means no two of the three can drift into agreeing with each other.
 const inboxElement = "pending"
 
+// carriersAllowed names the functions that may take the session inbox as a parameter, and
+// what each one is for.
+//
+// It is empty, and that is the healthy state rather than a starting point: no production
+// function in this package takes a channel of `pending` today, and the fence below exists
+// so that stays a decision instead of an accident. Adding an entry is the whole point --
+// the rule cannot tell a deliberate helper from a door lost by mistake, so it asks the
+// person who knows.
+//
+// The key names one function, and the failure prints the exact string to paste: a plain
+// name for a function, `(*Session).name` for a method, and for a literal what calls it
+// plus where it lives, as in `offer in beta@queueing_internal_test.go:9`. A method and a
+// function of the same name coexist in Go, and two functions can each hold a local
+// `offer`, so anything shorter would let one entry excuse two. The value is why, and it
+// may not be blank: an entry that has to say what it is for is harder to add without
+// thinking than a name on a list.
 var carriersAllowed = map[string]string{}
 
 // The second half of the inbox fence, and it exists because the first half can only see a
@@ -708,6 +710,28 @@ func keyFor(fset *token.FileSet, file *ast.File, name, called string, pos token.
 	return fmt.Sprintf("%s@%s:%d", called, name, at)
 }
 
+// carriesTheInbox is the match, and it reads a spelling: a channel of `pending` written
+// out in a parameter list.
+//
+// The direction is the whole judgement on what counts. A parameter that can only be
+// received from is not a door, because it cannot be sent to at all. Letting it through is
+// a decision and not an oversight: it is a different danger -- a second consumer racing
+// the forwarder, which is invariant 3's business -- and folding it in here would file it
+// under the wrong name and call it handled.
+//
+// Because spelling is all it reads, this is where the rule stops, and the list is written
+// out rather than left to be discovered. Anything that puts the same channel behind
+// another name gets past: a type alias or a named channel type (`type inboxCh = chan
+// pending`, one line and as innocent as the refactor this catches), a type parameter, and
+// the channel wrapped in a struct field, a slice or a map. So does a function that returns
+// the channel instead of taking it, which is past both halves of the fence, since the
+// channel of that send is a call and not a selector. Each one needs go/types to see,
+// because each is the same channel wearing a different spelling.
+//
+// Two shapes that look like they belong on that list are caught, by the other half rather
+// than this one: a struct whose field is named `inbox`, and a closure that captures the
+// session. Both end up writing `.inbox <-` somewhere, which is what
+// TestEveryWriteToTheInboxIsMeasured reads.
 func carriesTheInbox(sig *ast.FuncType) bool {
 	if sig.Params == nil {
 		return false
