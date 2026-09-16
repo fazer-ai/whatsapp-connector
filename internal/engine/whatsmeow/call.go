@@ -42,18 +42,18 @@ const answeredCalls = 64
 // be built in the constructor is one a test building a Session by hand would leave nil,
 // and the handler would then panic on a write to a nil map rather than fail a test.
 type ring struct {
-	seen map[string]struct{}
+	seen map[string]waTypes.JID
 	keys []string
 	next int
 }
 
 // add records a key and reports whether it is new.
-func (r *ring) add(key string) bool {
+func (r *ring) add(key string, value waTypes.JID) bool {
 	if _, known := r.seen[key]; known {
 		return false
 	}
 	if r.seen == nil {
-		r.seen = make(map[string]struct{}, answeredCalls)
+		r.seen = make(map[string]waTypes.JID, answeredCalls)
 		r.keys = make([]string, answeredCalls)
 	}
 	// The slot about to be overwritten is the oldest, and its key leaves the set with it.
@@ -64,8 +64,14 @@ func (r *ring) add(key string) bool {
 	}
 	r.keys[r.next] = key
 	r.next = (r.next + 1) % len(r.keys)
-	r.seen[key] = struct{}{}
+	r.seen[key] = value
 	return true
+}
+
+// of is the value remembered for a key, and whether the key is still in the set.
+func (r *ring) of(key string) (waTypes.JID, bool) {
+	value, known := r.seen[key]
+	return value, known
 }
 
 // callMedia is what an announcement said about the kind of call, and whether it said
@@ -137,7 +143,7 @@ func (s *Session) callOffered(meta *waTypes.BasicCallMeta, media callMedia, grou
 	// way round: a voice call is what the overwhelming majority of them are, and the
 	// alternative -- holding the offer back until the notice arrives -- delays every
 	// call for one that may never come.
-	first := s.firstSightOf(meta.CallID)
+	first := s.firstSightOf(meta.CallID, meta.CallCreator)
 
 	// Before anything that can wait, and before the subscription is consulted, because
 	// the two questions are different ones.
@@ -287,6 +293,17 @@ func (s *Session) rejectCall(ctx context.Context, command *protocol.Command) (js
 		return nil, err
 	}
 
+	// The address a client names carries no device, and joining the call needs one. This
+	// session kept it from the offer; a call it never saw leaves the client's address to
+	// stand, which is a refusal WhatsApp will take and not act on. Said plainly in the log
+	// rather than answered as a failure: the node did go out.
+	if rang, known := s.deviceThatRang(req.CallID); known {
+		caller = rang
+	} else {
+		s.log.Warn().Str("sid", s.sid).Str("call_id", req.CallID).
+			Msg("refusing a call this session never saw begin, so the refusal names an account and not a device")
+	}
+
 	if err := s.declineCall(ctx, s.current(), caller, req.CallID); err != nil {
 		return nil, callFailure(err)
 	}
@@ -342,8 +359,8 @@ func declineOverClient(ctx context.Context, client *wm.Client, caller waTypes.JI
 	if own.IsEmpty() {
 		return wm.ErrNotLoggedIn
 	}
-	own, caller = own.ToNonAD(), caller.ToNonAD()
-
+	// `caller` is left as it came: refusalNodes needs the device to address the join, and
+	// flattens it itself for the half that is addressed to the account.
 	join, refusal := refusalNodes(own, caller, callID)
 	// The refusal is not sent when joining failed. A `<reject>` on its own is the node
 	// this function exists to stop writing: it would be acked, it would not end the call,
@@ -365,18 +382,25 @@ func declineOverClient(ctx context.Context, client *wm.Client, caller waTypes.JI
 // written before. Only the stanza id is left for the caller to fill: it is the one
 // attribute that has to differ between two nodes of the same call.
 func refusalNodes(own, caller waTypes.JID, callID string) (join, refusal waBinary.Node) {
-	wrap := func(child waBinary.Node) waBinary.Node {
+	wrap := func(to waTypes.JID, child waBinary.Node) waBinary.Node {
 		return waBinary.Node{
 			Tag:     "call",
-			Attrs:   waBinary.Attrs{"from": own, "to": caller},
+			Attrs:   waBinary.Attrs{"from": own.ToNonAD(), "to": to},
 			Content: []waBinary.Node{child},
 		}
 	}
-	return wrap(waBinary.Node{
+	// The device on one and not the other, which is measured rather than chosen. Joining
+	// is addressed to the device that placed the call, because that is the party whose
+	// signalling this is entering; refusing is addressed to the account, which is how
+	// WhatsApp itself broadcasts a refusal made on the phone. Stripping the device from
+	// both reads as tidier and does not work: the call rings its full course and times
+	// out, which is what the refusal looked like before any of this.
+	account := caller.ToNonAD()
+	return wrap(caller, waBinary.Node{
 			Tag:   "preaccept",
 			Attrs: waBinary.Attrs{"call-id": callID, "call-creator": caller},
-		}), wrap(waBinary.Node{
+		}), wrap(account, waBinary.Node{
 			Tag:   "reject",
-			Attrs: waBinary.Attrs{"call-id": callID, "call-creator": caller, "count": "0"},
+			Attrs: waBinary.Attrs{"call-id": callID, "call-creator": account, "count": "0"},
 		})
 }

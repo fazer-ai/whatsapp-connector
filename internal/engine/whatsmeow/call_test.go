@@ -422,9 +422,13 @@ func TestRejectCallRefusesWhatItCannotCarryOut(t *testing.T) {
 func TestTheCallsASessionRemembersAreBounded(t *testing.T) {
 	t.Parallel()
 
+	rang := func(i int) waTypes.JID {
+		return waTypes.JID{User: theCaller, Server: waTypes.DefaultUserServer, Device: uint16(i % 60)}
+	}
+
 	var remembered ring
 	for i := range answeredCalls * 3 {
-		if !remembered.add("call-" + strconv.Itoa(i)) {
+		if !remembered.add("call-"+strconv.Itoa(i), rang(i)) {
 			t.Fatalf("call-%d was reported as one already seen", i)
 		}
 	}
@@ -434,12 +438,26 @@ func TestTheCallsASessionRemembersAreBounded(t *testing.T) {
 
 	// The most recent are the ones kept, which is what the deduplication needs: the
 	// second half of a call announced a moment ago.
-	if remembered.add("call-" + strconv.Itoa(answeredCalls*3-1)) {
+	last := answeredCalls*3 - 1
+	if remembered.add("call-"+strconv.Itoa(last), rang(last)) {
 		t.Fatal("the call it was just told about was forgotten")
 	}
 	// And the oldest is gone, which is the point of the bound.
-	if !remembered.add("call-0") {
+	if !remembered.add("call-0", rang(0)) {
 		t.Fatal("the oldest call is still remembered, so the set is not bounded")
+	}
+
+	// What is remembered is who rang, not just that somebody did: it is the device the
+	// refusal addresses its join to, and a client naming the call has no device to give.
+	who, known := remembered.of("call-" + strconv.Itoa(last))
+	if !known {
+		t.Fatal("the most recent call is not in the set")
+	}
+	if who != rang(last) {
+		t.Fatalf("remembers %v as the device that rang, want %v", who, rang(last))
+	}
+	if _, stale := remembered.of("call-1"); stale {
+		t.Fatal("an evicted call still answers with a device")
 	}
 }
 
@@ -581,7 +599,7 @@ func TestARefusalJoinsTheCallBeforeItRefusesIt(t *testing.T) {
 
 	own := waTypes.JID{User: "5511999998888", Server: waTypes.DefaultUserServer, Device: 42}
 	caller := waTypes.JID{User: theCaller, Server: waTypes.DefaultUserServer, Device: 58}
-	join, refusal := refusalNodes(own.ToNonAD(), caller.ToNonAD(), "CALL-1")
+	join, refusal := refusalNodes(own, caller, "CALL-1")
 
 	for _, outer := range []waBinary.Node{join, refusal} {
 		if outer.Tag != "call" {
@@ -590,15 +608,23 @@ func TestARefusalJoinsTheCallBeforeItRefusesIt(t *testing.T) {
 		if got := outer.Attrs["from"]; got != own.ToNonAD() {
 			t.Fatalf("the refusal is signed by this account without its device, got %v", got)
 		}
-		if got := outer.Attrs["to"]; got != caller.ToNonAD() {
-			t.Fatalf("the refusal is addressed to the caller without its device, got %v", got)
-		}
 		if _, carried := outer.Attrs["id"]; carried {
 			t.Fatal("the stanza id is the writer's to fill, so that two nodes of one call differ")
 		}
 		if len(outer.GetChildren()) != 1 {
 			t.Fatalf("one child per node, got %d", len(outer.GetChildren()))
 		}
+	}
+
+	// The half that matters, and the one that was got wrong: joining talks to the device
+	// that placed the call, refusing talks to the account. Flattening both looks tidier,
+	// passes every test that does not say this, and leaves the call ringing until it
+	// times out.
+	if got := join.Attrs["to"]; got != caller {
+		t.Fatalf("the join is addressed to the device that rang, got %v", got)
+	}
+	if got := refusal.Attrs["to"]; got != caller.ToNonAD() {
+		t.Fatalf("the refusal is addressed to the account, got %v", got)
 	}
 
 	if tag := join.GetChildren()[0].Tag; tag != "preaccept" {
@@ -612,9 +638,12 @@ func TestARefusalJoinsTheCallBeforeItRefusesIt(t *testing.T) {
 		if got := child.Attrs["call-id"]; got != "CALL-1" {
 			t.Fatalf("<%s> names the call, got %v", child.Tag, got)
 		}
-		if got := child.Attrs["call-creator"]; got != caller.ToNonAD() {
-			t.Fatalf("<%s> names whoever started it, without the device, got %v", child.Tag, got)
-		}
+	}
+	if got := join.GetChildren()[0].Attrs["call-creator"]; got != caller {
+		t.Fatalf("<preaccept> names the device that rang, got %v", got)
+	}
+	if got := refusal.GetChildren()[0].Attrs["call-creator"]; got != caller.ToNonAD() {
+		t.Fatalf("<reject> names the account, got %v", got)
 	}
 	if got := refusal.GetChildren()[0].Attrs["count"]; got != "0" {
 		t.Fatalf(`<reject> carries count="0", got %v`, got)
@@ -628,14 +657,15 @@ func TestTheTwoHalvesOfARefusalAreTheSameCall(t *testing.T) {
 	t.Parallel()
 
 	own := waTypes.JID{User: "5511999998888", Server: waTypes.DefaultUserServer}
-	caller := waTypes.JID{User: theCaller, Server: waTypes.HiddenUserServer}
+	caller := waTypes.JID{User: theCaller, Server: waTypes.HiddenUserServer, Device: 58}
 	join, refusal := refusalNodes(own, caller, "CALL-2")
 
 	if join.GetChildren()[0].Attrs["call-id"] != refusal.GetChildren()[0].Attrs["call-id"] {
 		t.Fatal("the call joined and the call refused must be the same one")
 	}
-	if join.Attrs["to"] != refusal.Attrs["to"] {
-		t.Fatal("both halves go to the same caller")
+	joined, refused := join.Attrs["to"].(waTypes.JID), refusal.Attrs["to"].(waTypes.JID)
+	if joined.ToNonAD() != refused.ToNonAD() {
+		t.Fatal("both halves go to the same caller, whatever device each names")
 	}
 }
 

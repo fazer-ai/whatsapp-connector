@@ -1164,8 +1164,14 @@ func (s *Session) rejectsCalls() bool {
 }
 
 // firstSightOf reports whether this is the first time the session has been told about a
-// call, and records it either way.
-func (s *Session) firstSightOf(callID string) bool {
+// call, and records it either way, against the device that announced it.
+//
+// The device matters and is not decoration: refusing a call means joining its signalling
+// first, and the node that joins is addressed to the caller's device rather than to the
+// account. A client naming a call in `call.reject` has no device to give -- the contract's
+// addresses carry none -- so the one place that ever sees it is the offer, and this is
+// where it is kept until the call is over.
+func (s *Session) firstSightOf(callID string, rang waTypes.JID) bool {
 	if callID == "" {
 		// Nothing to key on. Published rather than dropped: an offer without an id is
 		// still somebody ringing, and the client can at least show it.
@@ -1173,7 +1179,19 @@ func (s *Session) firstSightOf(callID string) bool {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.answered.add(callID)
+	return s.answered.add(callID, rang)
+}
+
+// deviceThatRang is the caller's device as the offer announced it, for a call this session
+// saw begin. A call it never saw -- one that started before this instance owned the account
+// -- answers false, and the caller is left with the address its client named.
+func (s *Session) deviceThatRang(callID string) (waTypes.JID, bool) {
+	if callID == "" {
+		return waTypes.EmptyJID, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.answered.of(callID)
 }
 
 // reportWindow tells the seam, if there is one, under the lock that guards it.
