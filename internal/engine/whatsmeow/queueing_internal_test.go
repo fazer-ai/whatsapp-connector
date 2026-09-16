@@ -1,11 +1,15 @@
 package whatsmeow
 
 import (
+	"os"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
+
+	"github.com/rs/zerolog"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/engine"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
@@ -17,8 +21,21 @@ type emitRecord struct {
 }
 
 type emitWatch struct {
-	mu   sync.Mutex
-	seen []emitRecord
+	mu    sync.Mutex
+	seen  []emitRecord
+	drops []protocol.EventType
+}
+
+func (r *emitWatch) Dropped(eventType protocol.EventType) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.drops = append(r.drops, eventType)
+}
+
+func (r *emitWatch) dropped() []protocol.EventType {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]protocol.EventType(nil), r.drops...)
 }
 
 func (r *emitWatch) Emitted(waited time.Duration, depth int) {
@@ -179,4 +196,66 @@ func TestASessionWithNobodyWatchingStillEmits(t *testing.T) {
 
 func emissionOf(kind protocol.EventType) *engine.Emission {
 	return &engine.Emission{Type: kind}
+}
+
+// The instrument has to cover every door into the inbox, not the one it was written
+// against. Four write to it -- `emitting`, `deliverUnless`, `post` and the retry in
+// `settled` -- and an instrument on one of them describes that door rather than the
+// queue, which is how the backpressure on the path that carries the messages stayed
+// invisible through a round of review.
+//
+// A fence rather than four assertions: a fifth door added later is the thing that breaks
+// this silently, and nothing else would notice.
+func TestEveryWriteToTheInboxIsMeasured(t *testing.T) {
+	t.Parallel()
+
+	for _, name := range []string{"session.go", "message.go"} {
+		body, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		lines := strings.Split(string(body), "\n")
+		for i, line := range lines {
+			if !strings.Contains(line, "s.inbox <- ") {
+				continue
+			}
+			// The reporting sits in the arm this send opens, so look just past it.
+			window := strings.Join(lines[i:min(i+6, len(lines))], "\n")
+			if !strings.Contains(window, "s.queued(") {
+				t.Errorf("%s:%d writes to the inbox and does not report it:\n\t%s\n"+
+					"every door into the inbox reports, or the depth histogram describes "+
+					"the doors that do rather than the queue", name, i+1, strings.TrimSpace(line))
+			}
+		}
+	}
+}
+
+// The inbound path gives up after its bound and withholds the acknowledgement, so
+// WhatsApp sends the message again -- invariant 4 paying a redelivery rather than a
+// message. Nothing else records that it happened, which is what this counter is for.
+func TestAnInboundEventTheInboxHadNoRoomForIsCounted(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		watch := &emitWatch{}
+		s := &Session{
+			inbox:       make(chan pending, 1),
+			done:        make(chan struct{}),
+			queueing:    watch,
+			deliverWait: 250 * time.Millisecond,
+			log:         zerolog.Nop(),
+		}
+		s.inbox <- pending{} // full
+
+		if s.deliverUnless(protocol.EventMessageReceived, map[string]any{"a": 1}, 0, "") {
+			t.Fatal("deliverUnless acknowledged an event it never queued")
+		}
+
+		if got := watch.dropped(); !slices.Equal(got, []protocol.EventType{protocol.EventMessageReceived}) {
+			t.Errorf("dropped = %v, want one message.received", got)
+		}
+		if seen := watch.all(); len(seen) != 0 {
+			t.Errorf("reported %d emissions as queued, want 0: nothing got in", len(seen))
+		}
+	})
 }

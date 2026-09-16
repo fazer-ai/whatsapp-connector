@@ -33,6 +33,7 @@ var writtenBy = map[string]string{
 	"EventsPublished":        "internal/app",
 	"CommandDuration":        "internal/app",
 	"LeasesLost":             "internal/app",
+	"EmissionsDropped":       "internal/app",
 }
 
 // notWrittenYet is the metrics that are registered and known to count nothing, each with

@@ -43,6 +43,11 @@ type Metrics struct {
 	// ceiling is 256, and a distribution pressed against it is a fleet about to start
 	// waiting.
 	InboxDepth prometheus.Histogram
+	// EmissionsDropped counts events the inbox had no room for and whose caller chose
+	// not to wait. Presence does that by design and an inbound delivery does it once
+	// its bound runs out; the client is never told either way, so this is the only
+	// place the loss shows up at all.
+	EmissionsDropped *prometheus.CounterVec
 }
 
 // New builds the metric set and registers it.
@@ -80,6 +85,10 @@ func New() *Metrics {
 			Help:    "Time an event waited for room in its session's inbox before the pump took it.",
 			Buckets: []float64{.001, .01, .1, .5, 1, 5, 15, 60},
 		}),
+		EmissionsDropped: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "wac_emissions_dropped_total",
+			Help: "Events the session inbox had no room for, by event type.",
+		}, []string{"type"}),
 		InboxDepth: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name:    "wac_session_inbox_depth",
 			Help:    "How full a session's inbox was when an emission arrived, out of 256.",
@@ -88,7 +97,7 @@ func New() *Metrics {
 	}
 	registry.MustRegister(
 		m.SessionsRunning, m.EventsPublished, m.CommandDuration, m.LeasesLost,
-		m.CommandReadsFailed, m.CommandReadLastSuccess, m.EmissionWait, m.InboxDepth,
+		m.CommandReadsFailed, m.CommandReadLastSuccess, m.EmissionWait, m.InboxDepth, m.EmissionsDropped,
 	)
 	return m
 }

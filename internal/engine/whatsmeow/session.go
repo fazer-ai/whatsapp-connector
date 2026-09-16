@@ -3665,10 +3665,13 @@ func (s *Session) post(key string, eventType protocol.EventType, payload any, li
 	// so a count of what has been queued is a guess. The older marker resolves to nothing
 	// when its turn comes, which costs a slot in the queue and buys the one thing the
 	// marker exists for -- a state published where it happened, and not earlier.
+	depth := len(s.inbox)
 	select {
 	case s.inbox <- pending{key: key, seq: entry.seq}:
 		s.board[key] = entry
+		s.queued(0, depth)
 	default:
+		s.noRoom(eventType)
 		// The queue presence shares with the messages is full, which is a publisher that
 		// has stopped answering while 256 messages piled up behind it. Presence waits for
 		// nothing, so this is dropped -- and whatever the chat had before is left where it
@@ -3753,13 +3756,16 @@ func (s *Session) settled(key string, seq int64) func(error) {
 			return
 		}
 		entry.retried, entry.sent = true, false
+		depth := len(s.inbox)
 		select {
 		case s.inbox <- pending{key: key, seq: entry.seq}:
 			s.board[key] = entry
+			s.queued(0, depth)
 			s.log.Debug().Str("type", string(entry.emission.Type)).
 				Msg("giving a presence another go after a publish that failed")
 		default:
 			delete(s.board, key)
+			s.noRoom(entry.emission.Type)
 			s.log.Debug().Str("type", string(entry.emission.Type)).
 				Msg("dropping a presence the inbox had no room to try again for")
 		}
@@ -3834,11 +3840,24 @@ func (s *Session) emitting(emission *engine.Emission, payload any) {
 }
 
 // queued reports one emission's wait, and does nothing when nobody is watching.
+//
+// Called from every place that puts something in the inbox, not only from `emitting`.
+// The depth this reports is the one the instrument promises -- how full the queue was
+// when something arrived -- and a reading taken at one of four doors describes the
+// traffic through that door rather than the queue.
 func (s *Session) queued(waited time.Duration, depth int) {
 	if s.queueing == nil {
 		return
 	}
 	s.queueing.Emitted(waited, depth)
+}
+
+// noRoom reports an emission the inbox had no room for, which nothing else records.
+func (s *Session) noRoom(eventType protocol.EventType) {
+	if s.queueing == nil {
+		return
+	}
+	s.queueing.Dropped(eventType)
 }
 
 // readPairing publishes the QR codes and the outcome of the pairing.

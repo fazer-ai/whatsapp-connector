@@ -24,6 +24,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/engine"
+	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 	"github.com/fazer-ai/whatsapp-connector/internal/store"
 )
 
@@ -68,6 +69,11 @@ type Queueing interface {
 	// it sat because the inbox was full, and `depth` is how many were already queued
 	// when it arrived. A waited of zero is the ordinary case and the common one.
 	Emitted(waited time.Duration, depth int)
+	// Dropped is one emission the inbox had no room for and that its caller chose not
+	// to wait for. Presence does that by design, and an inbound delivery does it once
+	// its bound runs out; either way the client is never told, so this counter is the
+	// only place the loss is visible at all.
+	Dropped(eventType protocol.EventType)
 }
 
 // Engine hands out one session per account, backed by a shared device store.

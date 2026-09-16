@@ -1097,6 +1097,10 @@ func (q queueing) Emitted(waited time.Duration, depth int) {
 	q.metrics.InboxDepth.Observe(float64(depth))
 }
 
+func (q queueing) Dropped(eventType protocol.EventType) {
+	q.metrics.EmissionsDropped.WithLabelValues(string(eventType)).Inc()
+}
+
 // countingPublisher counts what actually reached the client, by event type.
 //
 // A wrapper and not a line inside the session, because the count this metric promises is
