@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/rs/zerolog"
 	wm "go.mau.fi/whatsmeow"
@@ -51,13 +52,30 @@ type Options struct {
 	// an instance with nowhere to write, which publishes media messages with no file to
 	// fetch.
 	Media MediaOptions
+	// Queueing is told what an emission had to wait for. Nil means nobody is watching,
+	// which is what a test that does not care about it passes.
+	Queueing Queueing
+}
+
+// Queueing is how the engine reports its own back pressure to whoever is measuring.
+//
+// An interface here and not a metric, because this package has no business knowing what
+// Prometheus is: the one implementation lives in `internal/app`, next to the registry.
+// It is also why the engine can report this at all -- there was no route from here to
+// the metric set, which is exactly why the stall in #221 went unmeasured.
+type Queueing interface {
+	// Emitted is called once per emission that reaches the pump: `waited` is how long
+	// it sat because the inbox was full, and `depth` is how many were already queued
+	// when it arrived. A waited of zero is the ordinary case and the common one.
+	Emitted(waited time.Duration, depth int)
 }
 
 // Engine hands out one session per account, backed by a shared device store.
 type Engine struct {
-	store *store.Container
-	media MediaOptions
-	log   zerolog.Logger
+	store    *store.Container
+	media    MediaOptions
+	queueing Queueing
+	log      zerolog.Logger
 
 	mu       sync.Mutex
 	sessions map[string]*Session
@@ -112,6 +130,7 @@ func New(container *store.Container, opts Options, log zerolog.Logger) (*Engine,
 	return &Engine{
 		store:    container,
 		media:    opts.Media,
+		queueing: opts.Queueing,
 		log:      log,
 		sessions: make(map[string]*Session),
 	}, nil
@@ -212,7 +231,7 @@ func (e *Engine) Open(ctx context.Context, sid string) (engine.Session, error) {
 	}
 
 	wa := newLibraryLogger(e.log, sid)
-	session := newSession(ctx, sid, wm.NewClient(device, wa), scoped, e.media, e.log, wa)
+	session := newSession(ctx, sid, wm.NewClient(device, wa), scoped, e.media, e.queueing, e.log, wa)
 	// Registered before the session can be handed out, so a close that happens while
 	// this function is still running is not one nobody hears about.
 	session.onClose(func() { e.forget(sid, session) })

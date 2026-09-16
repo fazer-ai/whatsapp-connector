@@ -614,6 +614,9 @@ type Session struct {
 	// closing is what the engine wants told when this session ends, so a session that
 	// is over stops being something the engine hands out or holds on to.
 	closing func()
+	// queueing is told how long an emission waited for room in the inbox. Nil is
+	// nobody watching, which is every test that is not about this.
+	queueing Queueing
 }
 
 // pairingRun is one pairing conversation.
@@ -633,7 +636,7 @@ type pairingRun struct {
 //nolint:gocritic // zerolog.Logger is designed to be copied; every With() returns one by value
 func newSession(
 	ctx context.Context, sid string, client *wm.Client, scoped *store.Scoped,
-	blobs MediaOptions, log zerolog.Logger, wa waLog.Logger,
+	blobs MediaOptions, queueing Queueing, log zerolog.Logger, wa waLog.Logger,
 ) *Session {
 	lifetime, cancel := context.WithCancel(context.Background())
 	s := &Session{
@@ -645,6 +648,7 @@ func newSession(
 		inbox:      make(chan pending, inboxDepth),
 		events:     make(chan engine.Emission),
 		done:       make(chan struct{}),
+		queueing:   queueing,
 		ctx:        lifetime,
 		cancel:     cancel,
 		detach:     func(client *wm.Client, id uint32) { client.RemoveEventHandler(id) },
@@ -3797,10 +3801,37 @@ func (s *Session) emitting(emission *engine.Emission, payload any) {
 	if emission.At == 0 {
 		emission.At = s.learned()
 	}
+	// Offered without waiting first, because the inbox has room almost every time and
+	// this path runs on whatsmeow's dispatch goroutine: the fast case must not pay for
+	// a clock reading, and the slow case is the only one worth a number.
+	waiting := pending{event: *emission}
 	select {
-	case s.inbox <- pending{event: *emission}:
-	case <-s.done:
+	case s.inbox <- waiting:
+		s.queued(0, len(s.inbox))
+		return
+	default:
 	}
+
+	// Here the inbox is full, which is the stall #221 is about: this send is now
+	// holding the goroutine whatsmeow dispatched from, and nothing else this account
+	// sends is handled until the publisher moves. The wait is not bounded here on
+	// purpose -- bounding it would change which events may be dropped, and that is
+	// invariant 4's business, not this measurement's.
+	began := time.Now()
+	select {
+	case s.inbox <- waiting:
+		s.queued(time.Since(began), len(s.inbox))
+	case <-s.done:
+		s.queued(time.Since(began), len(s.inbox))
+	}
+}
+
+// queued reports one emission's wait, and does nothing when nobody is watching.
+func (s *Session) queued(waited time.Duration, depth int) {
+	if s.queueing == nil {
+		return
+	}
+	s.queueing.Emitted(waited, depth)
 }
 
 // readPairing publishes the QR codes and the outcome of the pairing.

@@ -145,7 +145,16 @@ func New(cfg *Config, log zerolog.Logger) (connector *Connector, err error) {
 	// it has been told so.
 	leases := cluster.NewLeases(client, cfg.Instance, cluster.Options{TTL: cfg.LeaseTTL})
 
-	waEngine, devices, err := newEngine(startupCtx, cfg, leases.Owns, mediaOpts, log)
+	// Built before the engine, which is the one thing here that takes a metric rather
+	// than being read by one: the engine reports how long its emissions queued, and
+	// there was no route from that package to this set until now (#221, #226).
+	metrics := observability.New()
+	// Registered here rather than inside observability.New, because the value it reports
+	// lives in Redis and that package deliberately knows about nothing but Prometheus.
+	metrics.Registry.MustRegister(redisx.NewStreamLag(client))
+
+	waEngine, devices, err := newEngine(
+		startupCtx, cfg, leases.Owns, mediaOpts, queueingInto(metrics), log)
 	if err != nil {
 		return nil, err
 	}
@@ -155,10 +164,6 @@ func New(cfg *Config, log zerolog.Logger) (connector *Connector, err error) {
 		return nil, err
 	}
 
-	metrics := observability.New()
-	// Registered here rather than inside observability.New, because the value it reports
-	// lives in Redis and that package deliberately knows about nothing but Prometheus.
-	metrics.Registry.MustRegister(redisx.NewStreamLag(client))
 	quarantine := cluster.NewQuarantine(client, nil)
 	manager := session.NewManager(&session.ManagerConfig{
 		Instance: cfg.Instance, Engine: waEngine, Leases: leases,
@@ -1025,7 +1030,8 @@ func (c *Connector) shutdown() {
 //
 //nolint:gocritic // zerolog.Logger is designed to be copied; every With() returns one by value
 func newEngine(
-	ctx context.Context, cfg *Config, owned store.Ownership, blobs meow.MediaOptions, log zerolog.Logger,
+	ctx context.Context, cfg *Config, owned store.Ownership, blobs meow.MediaOptions,
+	queueing meow.Queueing, log zerolog.Logger,
 ) (engine.Engine, *store.Container, error) {
 	switch cfg.Engine {
 	case EngineFake:
@@ -1036,7 +1042,8 @@ func newEngine(
 		if err != nil {
 			return nil, nil, err
 		}
-		waEngine, err := meow.New(devices, meow.Options{DeviceName: cfg.DeviceName, Media: blobs}, log)
+		waEngine, err := meow.New(devices,
+			meow.Options{DeviceName: cfg.DeviceName, Media: blobs, Queueing: queueing}, log)
 		if err != nil {
 			// The container is this function's until it is handed over, and an engine
 			// that refused to be built never took it.
@@ -1068,4 +1075,22 @@ func Hostname() string {
 		return ""
 	}
 	return name
+}
+
+// queueing reports the engine's back pressure into the metric set.
+//
+// The adapter lives here and not in the engine because `internal/engine/whatsmeow` has
+// no business knowing what Prometheus is, and not in `internal/observability` because
+// that package deliberately knows about nothing else. It is three lines, and the shape
+// of those three lines is the route whose absence left #221 unmeasurable and three of
+// the six metrics in #226 registered and counting nothing.
+type queueing struct{ metrics *observability.Metrics }
+
+func queueingInto(metrics *observability.Metrics) meow.Queueing {
+	return queueing{metrics: metrics}
+}
+
+func (q queueing) Emitted(waited time.Duration, depth int) {
+	q.metrics.EmissionWait.Observe(waited.Seconds())
+	q.metrics.InboxDepth.Observe(float64(depth))
 }
