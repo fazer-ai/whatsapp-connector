@@ -849,7 +849,11 @@ func (s *Session) carryOut(ctx context.Context, command *protocol.Command) (json
 		// whether it landed, so an instance reclaiming the command would have to choose
 		// between dropping a message that never went out and sending one that already
 		// did. What covers that window is the caller naming the message, so a resend
-		// carries the id the first attempt used.
+		// carries the id the first attempt used, and every client downstream discards a
+		// repeat of an id it already has. The discarding is theirs and not WhatsApp's:
+		// WhatsApp delivers the second copy in full, whatever the gap (#215). The window
+		// is real; what makes it survivable is the obligation `contract/README.md` puts
+		// on a client, and the same one the inbound path already spends freely.
 		// On a context of its own, because the command's deadline may have run out in
 		// the same instant the work finished, and a record that is not written is a
 		// command that gets carried out again.
@@ -864,7 +868,7 @@ func (s *Session) carryOut(ctx context.Context, command *protocol.Command) (json
 		// window. Giving the delivery back instead would not close it: the side effect
 		// has already happened, so the redelivery would find no record and do it a
 		// second time, turning a risk into a certainty. What covers what is left is the
-		// caller naming the message.
+		// caller naming the message, and the client discarding the repeat.
 		s.remember(ctx, command, key, result)
 	}
 	return result, err

@@ -144,6 +144,13 @@ func (s *Session) readyToSend() error {
 // went out and lost its reply can be sent again under the same one and the receiving
 // client discards the second copy. That is the one retry that cannot duplicate anything,
 // and it is why every command that creates a message carries an id of its own.
+//
+// The discarding is the receiving client's, and WhatsApp's part in this is only lending
+// the id: a resend under an id WhatsApp has already seen is delivered again, in full,
+// however long ago the first one went -- measured from an immediate resend out to thirty
+// minutes, direct and group alike (#215). What makes the retry safe is that every client
+// downstream drops the repeat, which is the same property the inbound path here already
+// spends, and which `contract/README.md` now asks of a client in so many words.
 func (s *Session) putOnTheWire(
 	ctx context.Context, to waTypes.JID, messageID string, message *waE2E.Message,
 ) (wm.SendResponse, error) {
