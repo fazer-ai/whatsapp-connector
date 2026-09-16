@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"time"
 
+	waBinary "go.mau.fi/whatsmeow/binary"
 	waTypes "go.mau.fi/whatsmeow/types"
 	waEvents "go.mau.fi/whatsmeow/types/events"
 
@@ -62,12 +63,34 @@ func (r *ring) add(key string) bool {
 // callMedia is what an announcement said about the kind of call, and whether it said
 // anything at all.
 //
-// The two halves WhatsApp sends do not carry the same thing: `offer_notice` names the
-// media, `offer` does not. A plain bool would render "this is a voice call" and "this
-// announcement did not say" identically, and the second is what a bare `offer` is.
+// A plain bool would render "this is a voice call" and "this announcement did not say"
+// identically, and both happen: `offer_notice` names the media in an attribute, `offer`
+// carries it as a child of the node instead, and a node this connector was handed without
+// either says nothing.
 type callMedia struct {
 	known bool
 	video bool
+}
+
+// mediaOfOffer reads the kind of call off the offer node.
+//
+// `events.CallOffer` has no field for it -- whatsmeow hands the node through as `Data`
+// and leaves the reading to whoever wants it -- and the node is where a 1:1 call says so:
+// the offer carries an `<audio>` or a `<video>` child holding the keys for that stream.
+// Without this every direct video call reaches the client as a voice call, and the notice
+// that does name the media cannot correct it, because by then the call is a call this
+// session has already published.
+func mediaOfOffer(node *waBinary.Node) callMedia {
+	if node == nil {
+		return callMedia{}
+	}
+	if len(node.GetChildrenByTag("video")) > 0 {
+		return callMedia{known: true, video: true}
+	}
+	if len(node.GetChildrenByTag("audio")) > 0 {
+		return callMedia{known: true}
+	}
+	return callMedia{}
 }
 
 // callOffer is the contract's `call.offer`.
@@ -97,7 +120,7 @@ type rejectRequest struct {
 // Acknowledged whatever happens, which is the presence rule rather than the message rule:
 // WhatsApp does not redeliver a call offer, so withholding the acknowledgement buys no
 // second chance and leaves a node unacknowledged for a call that has already ended.
-func (s *Session) callOffered(meta *waTypes.BasicCallMeta, media callMedia) bool {
+func (s *Session) callOffered(meta *waTypes.BasicCallMeta, media callMedia, group bool) bool {
 	// One call, one of everything. WhatsApp sends `offer` and `offer_notice` for the same
 	// call, in either order, and both reach here.
 	//
@@ -134,7 +157,11 @@ func (s *Session) callOffered(meta *waTypes.BasicCallMeta, media callMedia) bool
 	// no group conversation to show it in. The contract's `call.offer` carries no group
 	// either, so publishing one would put a call from a group the client does not have
 	// into the direct chat with whoever started it.
-	if !meta.GroupJID.IsEmpty() && !s.wantsGroups() {
+	//
+	// Whether it is one is the caller's to say, and not `GroupJID` alone: a notice says
+	// so in its `type` attribute and the `group-jid` beside it is optional, so a group
+	// call announced without one would read as a direct call from whoever started it.
+	if group && !s.wantsGroups() {
 		return true
 	}
 

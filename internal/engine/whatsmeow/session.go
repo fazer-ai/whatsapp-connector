@@ -4201,9 +4201,14 @@ func (s *Session) handle(rawEvent any) bool {
 		// message: a call rings for as long as the caller waits and WhatsApp does not
 		// redeliver the offer, so withholding the acknowledgement buys nothing and
 		// leaves the node unacknowledged for a call that has long since ended.
-		return s.callOffered(&event.BasicCallMeta, callMedia{})
+		return s.callOffered(&event.BasicCallMeta, mediaOfOffer(event.Data), !event.GroupJID.IsEmpty())
 	case *waEvents.CallOfferNotice:
-		return s.callOffered(&event.BasicCallMeta, callMedia{known: true, video: event.Media == "video"})
+		// `type` says it is a group call and `group-jid` is optional, so the attribute is
+		// the one that has to decide: a notice without the id would otherwise read as a
+		// direct call from whoever started it.
+		return s.callOffered(&event.BasicCallMeta,
+			callMedia{known: event.Media != "", video: event.Media == "video"},
+			!event.GroupJID.IsEmpty() || event.Type == "group")
 	case *waEvents.CallTerminate:
 		return s.callEnded(event)
 	case *waEvents.MediaRetry:

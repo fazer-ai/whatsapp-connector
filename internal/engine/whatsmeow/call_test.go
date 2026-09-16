@@ -10,6 +10,7 @@ import (
 	"time"
 
 	wm "go.mau.fi/whatsmeow"
+	waBinary "go.mau.fi/whatsmeow/binary"
 	waTypes "go.mau.fi/whatsmeow/types"
 	waEvents "go.mau.fi/whatsmeow/types/events"
 
@@ -66,6 +67,12 @@ func codeOf(err error) protocol.ErrorCode {
 	return coded.Code
 }
 
+// offerNode is the offer whatsmeow hands through as `Data`, carrying the stream WhatsApp
+// put in it.
+func offerNode(media string) *waBinary.Node {
+	return &waBinary.Node{Tag: "offer", Content: []waBinary.Node{{Tag: media}}}
+}
+
 func callMeta(callID string) waTypes.BasicCallMeta {
 	return waTypes.BasicCallMeta{
 		From:        someone(theCaller),
@@ -104,8 +111,9 @@ func TestACallThatArrivesIsPublished(t *testing.T) {
 	t.Parallel()
 
 	for name, event := range map[string]any{
-		"an offer": &waEvents.CallOffer{BasicCallMeta: callMeta("call-1")},
-		"a notice": &waEvents.CallOfferNotice{BasicCallMeta: callMeta("call-1"), Media: "audio"},
+		"an offer":                  &waEvents.CallOffer{BasicCallMeta: callMeta("call-1")},
+		"a notice":                  &waEvents.CallOfferNotice{BasicCallMeta: callMeta("call-1"), Media: "audio"},
+		"an offer naming the media": &waEvents.CallOffer{BasicCallMeta: callMeta("call-1"), Data: offerNode("audio")},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -149,6 +157,36 @@ func TestAVideoCallSaysSo(t *testing.T) {
 	if got := payload["video"]; got != true {
 		t.Errorf("video is %v, want true", got)
 	}
+}
+
+// A 1:1 video call has no notice to name it: whatsmeow hands the offer node through as
+// `Data` and the media is a child of it. Read from the event's fields alone, every direct
+// video call reaches the client as a voice call -- and the notice that would have said so
+// arrives for a call this session has already published, so nothing corrects it.
+func TestADirectVideoCallSaysSoFromItsOwnNode(t *testing.T) {
+	t.Parallel()
+	session, _ := callSession(t, false)
+
+	session.handle(&waEvents.CallOffer{BasicCallMeta: callMeta("call-1"), Data: offerNode("video")})
+
+	if got := published(t, session, protocol.EventCallOffer, "event_call_offer")["video"]; got != true {
+		t.Errorf("video is %v, want true", got)
+	}
+}
+
+// A notice says it is a group call in its `type`, and the `group-jid` beside it is
+// optional. Read from the id alone, a group call announced without one is published to an
+// inbox that asked for direct chats only, as a direct call from whoever started it.
+func TestAGroupCallIsRecognisedFromTheNoticeType(t *testing.T) {
+	t.Parallel()
+	session := silentSession(t, false)
+	session.setCallPolicy(false)
+
+	// No GroupJID on purpose: the attribute is the only thing saying this is a group.
+	if !session.handle(&waEvents.CallOfferNotice{BasicCallMeta: callMeta("call-1"), Media: "audio", Type: "group"}) {
+		t.Fatal("a group call must be acknowledged even when it is not published")
+	}
+	nothingPublished(t, session)
 }
 
 // WhatsApp announces one call twice, as `offer` and as `offer_notice`, and both reach the
@@ -470,6 +508,10 @@ func TestACallWithNoIDIsStillPublished(t *testing.T) {
 func TestAskingForAPairingCodeKeepsTheCallPolicy(t *testing.T) {
 	t.Parallel()
 	session, _ := newTestSession(t, "5511999990001")
+	// Connected before the connect, which is what keeps this off the network: a resume
+	// on a session whatsmeow is already holding open returns without dialling, and what
+	// is being asserted here is decided well before the dial either way.
+	session.setConnected(true)
 	session.setCallPolicy(true)
 	session.setGroups(true)
 
@@ -499,10 +541,11 @@ func TestAskingForAPairingCodeKeepsTheCallPolicy(t *testing.T) {
 func TestAConnectMayAskForCallsToBeRefusedAndIsRememberedThatWay(t *testing.T) {
 	t.Parallel()
 	session, container := newTestSession(t, "5511999990001")
+	// Connected first, so the resume this asks for returns without dialling. A unit test
+	// here must never reach a real socket, and an account paired with fabricated
+	// credentials would try.
+	session.setConnected(true)
 
-	// The dial that follows has no socket to reach in a unit test, so the connect is
-	// expected to fail somewhere past this point. What it must not answer is `unsupported`,
-	// which is the refusal this removes.
 	err := session.Connect(t.Context(), engine.ConnectRequest{
 		Pairing: "resume", Groups: true, Calls: &engine.CallsRequest{AutoReject: true},
 	})
