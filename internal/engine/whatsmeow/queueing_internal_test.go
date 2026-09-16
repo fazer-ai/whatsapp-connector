@@ -343,13 +343,23 @@ func reportedIn(list []ast.Stmt) bool {
 }
 
 // sendsToAnInbox is the fence's boundary, and it is worth stating rather than leaving to
-// be discovered: the channel has to be named at the send. Bound to a local first --
-// `ch := s.inbox` and then `ch <- pending{...}` -- the send walks past unmeasured. That
-// is a known limit and not an oversight. All five doors in production are written
-// `s.inbox <-` directly, the textual fence this replaces had exactly the same hole, and
-// resolving aliases means carrying types into a test whose job is catching the omission
-// somebody makes by accident, not the evasion nobody has written. Somebody who does write
-// it will find this paragraph before they find the missing metric.
+// be discovered: the channel has to be named at the send. Anything that puts the channel
+// somewhere else first walks past unmeasured -- a local (`ch := s.inbox`, then `ch <- p`)
+// and, the one to actually watch for, a helper that takes it as a parameter:
+//
+//	func enqueue(inbox chan<- pending, p pending) { inbox <- p }
+//
+// Extracting a send helper is an ordinary refactor, which makes that the plausible way to
+// lose a door by accident rather than on purpose. Closing it properly needs go/types,
+// because the channel's identity is a type fact and not a syntactic one; the cheap AST
+// trick would only catch the local and leave the shape that is actually likely.
+//
+// It is a known limit and not an oversight. All five doors in production name the channel
+// at the send, and the textual fence this replaces had the same hole. What softens it is
+// the vacuity guard above: move every door behind a helper and the fence fails loudly,
+// saying it read N files and found no write at all. Losing one door quietly means
+// extracting exactly one of the five and leaving the rest, which somebody who reads this
+// paragraph first will not do.
 func sendsToAnInbox(send *ast.SendStmt) bool {
 	sel, ok := send.Chan.(*ast.SelectorExpr)
 	return ok && sel.Sel.Name == "inbox"
