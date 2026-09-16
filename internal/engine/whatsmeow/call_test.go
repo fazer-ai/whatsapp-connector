@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	wm "go.mau.fi/whatsmeow"
@@ -904,22 +905,25 @@ func TestACommandForACallThisSessionNeverSawNamesWhatTheClientGave(t *testing.T)
 // WhatsApp announces one call as `offer` and `offer_notice`, in either order. Refusing on
 // both writes two `<preaccept>` and two `<reject>` into a call with one of each, which is
 // what the ring exists to prevent and what nothing else here would notice.
+//
+// Under synctest, because the refusal is written from a goroutine `refuse` starts and the
+// question is whether a second one exists. `synctest.Wait` returns once every goroutine in
+// the bubble is durably blocked, so "no second refusal" becomes something the test knows.
+// Waiting a while and looking is the weaker version of this and is what AGENTS.md rules
+// out: it passes whenever the duplicate is merely slow.
 func TestOneCallAnnouncedTwiceIsRefusedOnce(t *testing.T) {
 	t.Parallel()
-	session, watched := callSession(t, true)
 
-	session.handle(&waEvents.CallOffer{BasicCallMeta: callMeta("call-twice")})
-	session.handle(&waEvents.CallOfferNotice{BasicCallMeta: callMeta("call-twice"), Media: "video"})
+	synctest.Test(t, func(t *testing.T) {
+		session, watched := callSession(t, true)
 
-	refusedWithin(t, watched, "call-twice")
-	// The second announcement is handled on the caller's goroutine and the refusal is
-	// written off it, so a second one would be in flight rather than already recorded.
-	// Given long enough to land: the first took microseconds.
-	deadline := time.Now().Add(250 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		if seen := watched.seen(); len(seen) > 1 {
-			t.Fatalf("one call was refused %d times: %v", len(seen), seen)
+		session.handle(&waEvents.CallOffer{BasicCallMeta: callMeta("call-twice")})
+		session.handle(&waEvents.CallOfferNotice{BasicCallMeta: callMeta("call-twice"), Media: "video"})
+
+		synctest.Wait()
+
+		if seen := watched.seen(); len(seen) != 1 || seen[0] != "call-twice" {
+			t.Fatalf("one call announced twice is refused once, refused %v", seen)
 		}
-		time.Sleep(time.Millisecond)
-	}
+	})
 }
