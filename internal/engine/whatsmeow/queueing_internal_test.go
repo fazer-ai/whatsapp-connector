@@ -342,6 +342,14 @@ func reportedIn(list []ast.Stmt) bool {
 	return false
 }
 
+// sendsToAnInbox is the fence's boundary, and it is worth stating rather than leaving to
+// be discovered: the channel has to be named at the send. Bound to a local first --
+// `ch := s.inbox` and then `ch <- pending{...}` -- the send walks past unmeasured. That
+// is a known limit and not an oversight. All five doors in production are written
+// `s.inbox <-` directly, the textual fence this replaces had exactly the same hole, and
+// resolving aliases means carrying types into a test whose job is catching the omission
+// somebody makes by accident, not the evasion nobody has written. Somebody who does write
+// it will find this paragraph before they find the missing metric.
 func sendsToAnInbox(send *ast.SendStmt) bool {
 	sel, ok := send.Chan.(*ast.SelectorExpr)
 	return ok && sel.Sel.Name == "inbox"
