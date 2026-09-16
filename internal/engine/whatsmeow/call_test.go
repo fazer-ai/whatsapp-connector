@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,16 +26,23 @@ const theCaller = "5511988887777"
 
 // refusals is what a session was asked to decline, in order, for the cases that assert
 // the policy fired rather than just that an event came out.
+//
+// The address is kept beside the call id, and not only the id, because who the refusal
+// names is a decision this package makes -- the client's `call.reject` carries no device
+// and the session fills one in from the offer -- and a seam that dropped it would let that
+// decision be reversed by a green suite.
 type refusals struct {
 	mu     sync.Mutex
 	calls  []string
+	named  []waTypes.JID
 	answer error
 }
 
-func (r *refusals) record(callID string) error {
+func (r *refusals) record(caller waTypes.JID, callID string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.calls = append(r.calls, callID)
+	r.named = append(r.named, caller)
 	return r.answer
 }
 
@@ -41,6 +50,13 @@ func (r *refusals) seen() []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return append([]string(nil), r.calls...)
+}
+
+// addressed is who each refusal named, in the same order as seen().
+func (r *refusals) addressed() []waTypes.JID {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]waTypes.JID(nil), r.named...)
 }
 
 // callSession is a connected session with the call seam watched.
@@ -53,8 +69,8 @@ func callSession(t *testing.T, autoReject bool) (*Session, *refusals) {
 	session.setCallPolicy(autoReject)
 
 	watched := &refusals{}
-	session.declineCall = func(_ context.Context, _ *wm.Client, _ waTypes.JID, callID string) error {
-		return watched.record(callID)
+	session.declineCall = func(_ context.Context, _ *wm.Client, caller waTypes.JID, callID string) error {
+		return watched.record(caller, callID)
 	}
 	return session, watched
 }
@@ -672,6 +688,13 @@ func TestTheTwoHalvesOfARefusalAreTheSameCall(t *testing.T) {
 func TestNothingCallsTheLibrarysOwnRejection(t *testing.T) {
 	t.Parallel()
 
+	// The needle is a real method, and the compiler is what says so. A fence searching
+	// for a string that can no longer appear passes because there is nothing left to
+	// find, and whatsmeow renaming or removing RejectCall is the way that happens here
+	// -- silently, in a dependency bump, with this test still green. The reference costs
+	// a line and turns that into a build failure on the bump that caused it.
+	var _ func(context.Context, waTypes.JID, string) error = (&wm.Client{}).RejectCall
+
 	entries, err := os.ReadDir(".")
 	if err != nil {
 		t.Fatalf("read the package: %v", err)
@@ -694,5 +717,181 @@ func TestNothingCallsTheLibrarysOwnRejection(t *testing.T) {
 	}
 	if checked == 0 {
 		t.Fatal("the fence read no production files, so it proves nothing")
+	}
+}
+
+// writtenNodes is a refusalSocket that writes nowhere and remembers everything, so the
+// sequence a refusal is -- and not just the shape of its two nodes -- is reachable from a
+// test.
+type writtenNodes struct {
+	own    waTypes.JID
+	nodes  []waBinary.Node
+	ids    int
+	failOn int // 1 refuses the join, 2 refuses the refusal, 0 accepts both
+	err    error
+}
+
+func (w *writtenNodes) ownID() waTypes.JID { return w.own }
+
+func (w *writtenNodes) stanzaID() string {
+	w.ids++
+	return fmt.Sprintf("STANZA-%d", w.ids)
+}
+
+func (w *writtenNodes) send(_ context.Context, node waBinary.Node) error {
+	w.nodes = append(w.nodes, node)
+	if len(w.nodes) == w.failOn {
+		return w.err
+	}
+	return nil
+}
+
+// tags is the tag of each node's one child, in the order they were written.
+func (w *writtenNodes) tags() []string {
+	out := make([]string, 0, len(w.nodes))
+	for _, node := range w.nodes {
+		out = append(out, node.GetChildren()[0].Tag)
+	}
+	return out
+}
+
+func loggedInSocket() *writtenNodes {
+	return &writtenNodes{own: waTypes.JID{User: "5511999998888", Server: waTypes.DefaultUserServer, Device: 12}}
+}
+
+// TestARefusalWritesTheJoinAndThenTheRefusal holds the order, which is the whole of the
+// fix: the `<reject>` on its own is what this connector already wrote, and WhatsApp acked
+// it and did nothing.
+func TestARefusalWritesTheJoinAndThenTheRefusal(t *testing.T) {
+	t.Parallel()
+
+	socket := loggedInSocket()
+	if err := decline(t.Context(), socket, someone(theCaller), "CALL-ORDER"); err != nil {
+		t.Fatalf("a refusal both writes accept: %v", err)
+	}
+	if got := socket.tags(); !slices.Equal(got, []string{"preaccept", "reject"}) {
+		t.Fatalf("a refusal joins the call and then refuses it, wrote %v", got)
+	}
+}
+
+// TestTheTwoNodesOfARefusalCarryDifferentStanzaIDs is the one a mutation battery found
+// alive: both nodes went out under one id and every assertion about their shape still
+// passed. Two nodes of a call sharing an id is a single answer addressed to both.
+func TestTheTwoNodesOfARefusalCarryDifferentStanzaIDs(t *testing.T) {
+	t.Parallel()
+
+	socket := loggedInSocket()
+	if err := decline(t.Context(), socket, someone(theCaller), "CALL-IDS"); err != nil {
+		t.Fatalf("a refusal both writes accept: %v", err)
+	}
+	if len(socket.nodes) != 2 {
+		t.Fatalf("a refusal is two nodes, wrote %d", len(socket.nodes))
+	}
+	first, second := socket.nodes[0].Attrs["id"], socket.nodes[1].Attrs["id"]
+	if first == "" || second == "" {
+		t.Fatalf("both nodes carry a stanza id, got %q and %q", first, second)
+	}
+	if first == second {
+		t.Fatalf("the two nodes of one refusal need different stanza ids, both were %q", first)
+	}
+}
+
+// TestARefusalThatCannotJoinWritesNoRefusal is the other survivor: swallowing the join's
+// error left the `<reject>` going out alone, which is exactly the node this change exists
+// to stop writing, and no test noticed.
+func TestARefusalThatCannotJoinWritesNoRefusal(t *testing.T) {
+	t.Parallel()
+
+	socket := loggedInSocket()
+	socket.failOn, socket.err = 1, errors.New("socket gone")
+
+	err := decline(t.Context(), socket, someone(theCaller), "CALL-HALF")
+	if err == nil {
+		t.Fatal("a refusal whose join did not go out has to say so")
+	}
+	if !strings.Contains(err.Error(), "CALL-HALF") {
+		t.Fatalf("the failure names the call it was refusing, said %q", err)
+	}
+	if got := socket.tags(); !slices.Equal(got, []string{"preaccept"}) {
+		t.Fatalf("a refusal that could not join writes nothing after it, wrote %v", got)
+	}
+}
+
+// TestARefusalFromAnAccountThatIsNotLoggedInWritesNothing keeps the guard in front of both
+// writes rather than letting an empty `from` reach the socket.
+func TestARefusalFromAnAccountThatIsNotLoggedInWritesNothing(t *testing.T) {
+	t.Parallel()
+
+	socket := &writtenNodes{}
+
+	err := decline(t.Context(), socket, someone(theCaller), "CALL-OUT")
+	if !errors.Is(err, wm.ErrNotLoggedIn) {
+		t.Fatalf("an account that is not logged in cannot refuse, said %v", err)
+	}
+	if len(socket.nodes) != 0 {
+		t.Fatalf("nothing is written when there is no account to write it from, wrote %d", len(socket.nodes))
+	}
+}
+
+// TestACommandRefusesTheDeviceThatRang covers what the contract cannot carry: `call.reject`
+// names a person, WhatsApp answers to a device, and the session is the only thing that
+// saw which one rang. Without this the session could go back to refusing whatever address
+// the client handed it and nothing would fail.
+func TestACommandRefusesTheDeviceThatRang(t *testing.T) {
+	t.Parallel()
+	session, watched := callSession(t, false)
+
+	rang := waTypes.JID{User: theCaller, Server: waTypes.DefaultUserServer, Device: 58}
+	meta := callMeta("call-device")
+	meta.CallCreator = rang
+	session.callOffered(&meta, callMedia{}, false)
+
+	payload, err := json.Marshal(map[string]any{
+		"call_id": "call-device",
+		"from":    map[string]string{"kind": "phone", "id": theCaller},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if _, err := session.rejectCall(t.Context(), &protocol.Command{
+		Type: protocol.CommandCallReject, Payload: payload,
+	}); err != nil {
+		t.Fatalf("rejectCall: %v", err)
+	}
+	named := watched.addressed()
+	if len(named) != 1 {
+		t.Fatalf("one refusal, got %d", len(named))
+	}
+	if named[0] != rang {
+		t.Fatalf("the refusal names the device that rang (%s), named %s", rang, named[0])
+	}
+}
+
+// TestACommandForACallThisSessionNeverSawNamesWhatTheClientGave is the other side, and it
+// is a behaviour and not a fallback: the node still goes out, addressed to the account,
+// because a refusal WhatsApp takes and ignores is better than no node at all for a client
+// that is waiting on one.
+func TestACommandForACallThisSessionNeverSawNamesWhatTheClientGave(t *testing.T) {
+	t.Parallel()
+	session, watched := callSession(t, false)
+
+	payload, err := json.Marshal(map[string]any{
+		"call_id": "call-unseen",
+		"from":    map[string]string{"kind": "phone", "id": theCaller},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if _, err := session.rejectCall(t.Context(), &protocol.Command{
+		Type: protocol.CommandCallReject, Payload: payload,
+	}); err != nil {
+		t.Fatalf("rejectCall: %v", err)
+	}
+	named := watched.addressed()
+	if len(named) != 1 {
+		t.Fatalf("one refusal, got %d", len(named))
+	}
+	if named[0].Device != 0 || named[0].User != theCaller {
+		t.Fatalf("a call this session never saw is refused at the address the client gave, named %s", named[0])
 	}
 }

@@ -326,23 +326,64 @@ func callFailure(err error) error {
 	return protocol.NewError(protocol.ErrorWaError, "WhatsApp refused the call rejection")
 }
 
+// refusalSocket is the little of a client a refusal needs: who this account is, a fresh
+// stanza id for each node, and somewhere to write one.
+//
+// Named as an interface rather than taken as a `*wm.Client`, because everything that went
+// wrong here is a property of the sequence and not of the nodes: which node goes first,
+// whether the second one goes at all when the first failed, whether the two carry
+// different ids, and whether either is written by an account that is not logged in.
+// `refusalNodes` returns shapes and a test can hold those; none of the four shows up in a
+// shape. A mutation battery is what settled it -- swallowing the error from the join, and
+// giving both nodes the same id, both survived a green suite before this existed.
+type refusalSocket interface {
+	// ownID is the account this connector is logged in as, empty when it is not.
+	ownID() waTypes.JID
+	// stanzaID is a fresh id, and a different one on every call.
+	stanzaID() string
+	// send writes one node and does not wait for an answer.
+	send(ctx context.Context, node waBinary.Node) error
+}
+
+// clientSocket is the real one.
+//
+// `DangerousInternals` is deprecated as dangerous and taken deliberately, on the same
+// terms as the keyed group create: these are the library's own calls, reached this way
+// because `RejectCall` writes the node that does not work and `sendNode` is not exported.
+type clientSocket struct {
+	client *wm.Client
+	inside *wm.DangerousInternalClient
+}
+
+func socketOf(client *wm.Client) clientSocket {
+	return clientSocket{client: client, inside: client.DangerousInternals()} //nolint:staticcheck // the only route a working refusal has
+}
+
+func (c clientSocket) ownID() waTypes.JID { return c.inside.GetOwnID() }
+
+func (c clientSocket) stanzaID() string { return c.client.GenerateMessageID() }
+
+func (c clientSocket) send(ctx context.Context, node waBinary.Node) error {
+	return c.inside.SendNode(ctx, node) //nolint:wrapcheck // wrapped by decline, which names the call
+}
+
 // declineOverClient refuses a call the way WhatsApp actually honours it: by joining the
 // call's signalling first, and only then refusing.
 //
 // whatsmeow's own RejectCall writes the `<reject>` alone, and WhatsApp takes that node,
 // acks it `<ack class="call" type="reject"/>`, hands it to the caller's client, which
-// answers with a `<receipt>` of its own -- and the call keeps ringing. It was measured
-// five times, across five different addressings (LID and phone on either side, with and
-// without the device suffix, including the exact node the library builds), and it never
-// ended a call. Worse than a no-op: the account's own phone is left with a call
-// notification it cannot dismiss, because the account was never told the call was over.
+// answers with a `<receipt>` of its own -- and the call keeps ringing. Worse than a no-op:
+// the account's own phone is left with a call notification it cannot dismiss, because the
+// account was never told the call was over.
 //
 // What is missing is that this device never entered the call. WhatsApp ignores a refusal
 // from a participant that is not in the call, so the `<preaccept>` is what makes the
-// `<reject>` mean anything. With both nodes written, the call ends in under a second:
-// measured six times, on two paired accounts, from two callers, on voice and on video,
-// with the end tracking the `<reject>` rather than the clock. The stuck notification goes
-// with it.
+// `<reject>` mean anything.
+func declineOverClient(ctx context.Context, client *wm.Client, caller waTypes.JID, callID string) error {
+	return decline(ctx, socketOf(client), caller, callID)
+}
+
+// decline writes the two nodes a refusal is made of, in the order WhatsApp honours.
 //
 // The two go out back to back, with nothing between them, and that is deliberate. Between
 // them the account has entered a call it has not left, so the window is worth having small
@@ -350,27 +391,24 @@ func callFailure(err error) error {
 // and no `<reject>` at all) costs nothing: the call rings its full course and ends normally,
 // the notification clears, and the account behaves as though this connector were not
 // attached. The worst this window can do is the behaviour we already had.
-func declineOverClient(ctx context.Context, client *wm.Client, caller waTypes.JID, callID string) error {
-	// Deprecated as "dangerous", and taken deliberately, on the same terms as the keyed
-	// group create: these are the library's own calls, reached this way because
-	// `RejectCall` writes the node that does not work and `sendNode` is not exported.
-	inside := client.DangerousInternals() //nolint:staticcheck // the only route a working refusal has
-	own := inside.GetOwnID()
+func decline(ctx context.Context, socket refusalSocket, caller waTypes.JID, callID string) error {
+	own := socket.ownID()
 	if own.IsEmpty() {
 		return wm.ErrNotLoggedIn
 	}
-	// `caller` is left as it came: refusalNodes needs the device to address the join, and
-	// flattens it itself for the half that is addressed to the account.
 	join, refusal := refusalNodes(own, caller, callID)
 	// The refusal is not sent when joining failed. A `<reject>` on its own is the node
 	// this function exists to stop writing: it would be acked, it would not end the call,
 	// and it would leave the phone exactly as stuck as before.
-	join.Attrs["id"] = client.GenerateMessageID()
-	if err := inside.SendNode(ctx, join); err != nil {
+	join.Attrs["id"] = socket.stanzaID()
+	if err := socket.send(ctx, join); err != nil {
 		return fmt.Errorf("join call %s to refuse it: %w", callID, err)
 	}
-	refusal.Attrs["id"] = client.GenerateMessageID()
-	if err := inside.SendNode(ctx, refusal); err != nil {
+	// Its own id, and not the join's. Two nodes of one call sharing a stanza id is a
+	// reply addressed to both of them, and whichever waiter answers first cancels the
+	// other -- which is how this would go quiet again without anybody noticing.
+	refusal.Attrs["id"] = socket.stanzaID()
+	if err := socket.send(ctx, refusal); err != nil {
 		return fmt.Errorf("refuse call %s: %w", callID, err)
 	}
 	return nil
