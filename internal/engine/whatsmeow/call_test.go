@@ -616,15 +616,13 @@ func TestARefusalJoinsTheCallBeforeItRefusesIt(t *testing.T) {
 		}
 	}
 
-	// The half that matters, and the one that was got wrong: joining talks to the device
-	// that placed the call, refusing talks to the account. Flattening both looks tidier,
-	// passes every test that does not say this, and leaves the call ringing until it
-	// times out.
-	if got := join.Attrs["to"]; got != caller {
-		t.Fatalf("the join is addressed to the device that rang, got %v", got)
-	}
-	if got := refusal.Attrs["to"]; got != caller.ToNonAD() {
-		t.Fatalf("the refusal is addressed to the account, got %v", got)
+	// Both halves carry the caller exactly as the offer named it. Neither flattened nor
+	// elaborated: no refusal measured to work involved a caller that carried a device at
+	// all, so an address WhatsApp did not name would be invention.
+	for _, outer := range []waBinary.Node{join, refusal} {
+		if got := outer.Attrs["to"]; got != caller {
+			t.Fatalf("addressed to the caller as the offer named them, got %v", got)
+		}
 	}
 
 	if tag := join.GetChildren()[0].Tag; tag != "preaccept" {
@@ -638,12 +636,9 @@ func TestARefusalJoinsTheCallBeforeItRefusesIt(t *testing.T) {
 		if got := child.Attrs["call-id"]; got != "CALL-1" {
 			t.Fatalf("<%s> names the call, got %v", child.Tag, got)
 		}
-	}
-	if got := join.GetChildren()[0].Attrs["call-creator"]; got != caller {
-		t.Fatalf("<preaccept> names the device that rang, got %v", got)
-	}
-	if got := refusal.GetChildren()[0].Attrs["call-creator"]; got != caller.ToNonAD() {
-		t.Fatalf("<reject> names the account, got %v", got)
+		if got := child.Attrs["call-creator"]; got != caller {
+			t.Fatalf("<%s> names whoever started it as the offer did, got %v", child.Tag, got)
+		}
 	}
 	if got := refusal.GetChildren()[0].Attrs["count"]; got != "0" {
 		t.Fatalf(`<reject> carries count="0", got %v`, got)
@@ -663,9 +658,8 @@ func TestTheTwoHalvesOfARefusalAreTheSameCall(t *testing.T) {
 	if join.GetChildren()[0].Attrs["call-id"] != refusal.GetChildren()[0].Attrs["call-id"] {
 		t.Fatal("the call joined and the call refused must be the same one")
 	}
-	joined, refused := join.Attrs["to"].(waTypes.JID), refusal.Attrs["to"].(waTypes.JID)
-	if joined.ToNonAD() != refused.ToNonAD() {
-		t.Fatal("both halves go to the same caller, whatever device each names")
+	if join.Attrs["to"] != refusal.Attrs["to"] {
+		t.Fatal("both halves go to the same caller")
 	}
 }
 

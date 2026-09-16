@@ -382,25 +382,24 @@ func declineOverClient(ctx context.Context, client *wm.Client, caller waTypes.JI
 // written before. Only the stanza id is left for the caller to fill: it is the one
 // attribute that has to differ between two nodes of the same call.
 func refusalNodes(own, caller waTypes.JID, callID string) (join, refusal waBinary.Node) {
-	wrap := func(to waTypes.JID, child waBinary.Node) waBinary.Node {
+	wrap := func(child waBinary.Node) waBinary.Node {
 		return waBinary.Node{
 			Tag:     "call",
-			Attrs:   waBinary.Attrs{"from": own.ToNonAD(), "to": to},
+			Attrs:   waBinary.Attrs{"from": own.ToNonAD(), "to": caller},
 			Content: []waBinary.Node{child},
 		}
 	}
-	// The device on one and not the other, which is measured rather than chosen. Joining
-	// is addressed to the device that placed the call, because that is the party whose
-	// signalling this is entering; refusing is addressed to the account, which is how
-	// WhatsApp itself broadcasts a refusal made on the phone. Stripping the device from
-	// both reads as tidier and does not work: the call rings its full course and times
-	// out, which is what the refusal looked like before any of this.
-	account := caller.ToNonAD()
-	return wrap(caller, waBinary.Node{
+	// `caller` is whatever the offer named, unchanged. Not flattened and not elaborated:
+	// every refusal measured to work came from a caller whose `call-creator` carried no
+	// device at all, so there is no evidence for treating the two halves differently, and
+	// inventing an address WhatsApp did not name would be a guard for a state nothing has
+	// been measured in. The one caller class that does carry a device is the web client,
+	// and that one ignores the refusal whatever it is addressed to (#234).
+	return wrap(waBinary.Node{
 			Tag:   "preaccept",
 			Attrs: waBinary.Attrs{"call-id": callID, "call-creator": caller},
-		}), wrap(account, waBinary.Node{
+		}), wrap(waBinary.Node{
 			Tag:   "reject",
-			Attrs: waBinary.Attrs{"call-id": callID, "call-creator": account, "count": "0"},
+			Attrs: waBinary.Attrs{"call-id": callID, "call-creator": caller, "count": "0"},
 		})
 }
