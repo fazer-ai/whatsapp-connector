@@ -734,6 +734,14 @@ func keyFor(fset *token.FileSet, file *ast.File, name, called string, pos token.
 // than this one: a struct whose field is named `inbox`, and a closure that captures the
 // session. Both end up writing `.inbox <-` somewhere, which is what
 // TestEveryWriteToTheInboxIsMeasured reads.
+//
+// One assumption holds the rest of this up, and it is worth saying because it is one line
+// away from being false. Reading only this package is complete over this channel because
+// `pending` is unexported, so nowhere else can name the type at all. Add `type Pending =
+// pending` -- one line, and a reasonable thing to write the day a neighbouring package
+// needs the type -- and a helper outside this directory can take the channel while every
+// check here still passes. Nothing would say so, which is the failure this whole rule
+// exists to prevent, so if that alias is ever added the rule has to grow with it.
 func carriesTheInbox(sig *ast.FuncType) bool {
 	if sig.Params == nil {
 		return false
