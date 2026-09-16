@@ -6,6 +6,17 @@ GO ?= go
 GOLANGCI_LINT ?= golangci-lint
 PACKAGES ?= ./...
 
+# The passes that need a server, and the variable that names each one. One list: the
+# dependency list of `check` and its preflight are both generated from it.
+#
+# Defined here, above every rule, because make expands a rule's prerequisites when it reads
+# the rule. Defined further down, this arrives empty and `check` quietly loses both passes
+# -- which is this issue's own defect, produced by its fix, and caught by `make -n check`
+# printing a recipe with one `go test` in it instead of three.
+SERVER_PASSES := test-postgres test-redis
+test-postgres_VAR := WAC_TEST_DATABASE_URL
+test-redis_VAR := WAC_TEST_REDIS_URL
+
 .DEFAULT_GOAL := help
 .PHONY: help setup deps hooks fmt lint test test-postgres test-redis test-cover contract tidy check check-offline check-servers clean
 
@@ -87,17 +98,16 @@ tidy: ## Fail when go.mod/go.sum are not tidy
 # exported from a shell profile, a direnv file or an agent's configuration and then never
 # appear again in any command anybody typed or any round recorded. A target has to be
 # named where it is run.
-check: check-servers check-offline test-postgres test-redis ## Everything CI enforces; needs both servers (see check-offline)
+check: check-servers check-offline $(SERVER_PASSES) ## Everything CI enforces; needs both servers (see check-offline)
 
-# Both missing servers at once, before anything runs.
+# Every missing server at once, before anything runs.
 #
 # Without this, make stops at the first prerequisite that fails and reports one variable.
 # Whoever starts a PostgreSQL on that advice gets to the same wall again, one pass later
 # and several minutes in, which is the shape of an instruction people stop following.
 check-servers:
 	@missing=""; \
-	test -n "$(WAC_TEST_DATABASE_URL)" || missing="$$missing WAC_TEST_DATABASE_URL"; \
-	test -n "$(WAC_TEST_REDIS_URL)" || missing="$$missing WAC_TEST_REDIS_URL"; \
+	$(foreach t,$(SERVER_PASSES),test -n "$($($(t)_VAR))" || missing="$$missing $($(t)_VAR)";) \
 	if [ -n "$$missing" ]; then \
 	  echo "make check runs every pass CI enforces, and these are unset or empty:$$missing"; \
 	  echo; \
