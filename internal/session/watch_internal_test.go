@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
+	"github.com/fazer-ai/whatsapp-connector/internal/transport"
 )
 
 type doneCommand struct {
@@ -181,4 +182,42 @@ func TestOnlyALeaseLossThatStoppedASessionIsCounted(t *testing.T) {
 func TestALeaseLossWithNobodyWatchingIsNotACrash(t *testing.T) {
 	t.Parallel()
 	(&Manager{}).lostLease(true)
+}
+
+// The wait in the session's own queue is the caller's wait. Timed from the far side of it,
+// a command that sat a minute behind a backlog reports as having taken a millisecond --
+// and the manager's own paths already time from the dispatch that picked the command up,
+// so the two halves of one histogram would be measuring different spans.
+func TestTheWaitInTheQueueIsPartOfTheLatency(t *testing.T) {
+	t.Parallel()
+
+	var now time.Time
+	s := &Session{
+		commands: make(chan queued, 4),
+		now:      func() time.Time { return now },
+	}
+
+	now = time.Unix(100, 0)
+	if got := s.Offer(&transport.Delivery{Command: protocol.Command{Type: protocol.CommandMessageSend}}); got != OfferAccepted {
+		t.Fatalf("offer = %v, want accepted", got)
+	}
+
+	// Two minutes behind a backlog before its turn comes.
+	now = time.Unix(220, 0)
+	waiting := <-s.commands
+	if stamped := waiting.at; !stamped.Equal(time.Unix(100, 0)) {
+		t.Fatalf("stamped at %s, want the instant it was accepted (100)", stamped)
+	}
+
+	watch := &spyWatch{}
+	s.watch = watch
+	s.reportCommand(&waiting.delivery.Command, waiting.at, nil)
+
+	seen := watch.all()
+	if len(seen) != 1 {
+		t.Fatalf("reported %d commands, want 1", len(seen))
+	}
+	if seen[0].took != 120*time.Second {
+		t.Errorf("took = %s, want 2m: the queue wait is the caller's wait", seen[0].took)
+	}
 }

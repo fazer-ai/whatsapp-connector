@@ -38,7 +38,7 @@ type Session struct {
 	now       func() time.Time
 	log       zerolog.Logger
 
-	commands chan *transport.Delivery
+	commands chan queued
 
 	// seq is written by the pump goroutine alone, which is what keeps it monotonic
 	// without a lock: two writers would have to agree on an order to be ordered, and
@@ -189,7 +189,7 @@ func New(ctx context.Context, cfg *Config) *Session {
 		retryIn:   cfg.RetireRetry,
 		now:       cfg.Now,
 		log:       cfg.Logger.With().Str("sid", cfg.Lease.SID).Uint64("epoch", cfg.Lease.Epoch).Logger(),
-		commands:  make(chan *transport.Delivery, cfg.QueueDepth),
+		commands:  make(chan queued, cfg.QueueDepth),
 		stop:      cancel,
 		done:      make(chan struct{}),
 	}
@@ -251,7 +251,12 @@ func (s *Session) Offer(delivery *transport.Delivery) Offer {
 		return OfferStopped
 	}
 	select {
-	case s.commands <- delivery:
+	// Stamped on the way in, not on the way out. The wait in this queue is the caller's
+	// wait, and a timer started where the work starts reports a command that spent a
+	// minute behind a backlog as having taken a millisecond. It is also the instant the
+	// manager stamps for the commands it answers itself, so the two halves of the same
+	// histogram measure the same span.
+	case s.commands <- queued{delivery: delivery, at: s.now()}:
 		return OfferAccepted
 	default:
 		return OfferBusy
@@ -271,9 +276,9 @@ func (s *Session) abandonQueue() {
 
 	for {
 		select {
-		case delivery := <-s.commands:
-			if delivery.Release != nil {
-				delivery.Release()
+		case waiting := <-s.commands:
+			if waiting.delivery.Release != nil {
+				waiting.delivery.Release()
 			}
 		default:
 			return
@@ -722,6 +727,16 @@ type Watch interface {
 	LeaseLost()
 }
 
+// queued is one command waiting its turn, with the instant this instance took it on.
+//
+// The instant travels with the delivery because the queue is where a caller's time
+// actually goes: a session with a backlog answers the command in front of it first, and
+// a latency measured from the far side of that queue reports the wait as nothing.
+type queued struct {
+	delivery *transport.Delivery
+	at       time.Time
+}
+
 // Ledger remembers what a command did, so a redelivery is answered with the first
 // run's result instead of carrying it out a second time. Invariant 5 in AGENTS.md is
 // this and nothing else.
@@ -766,7 +781,8 @@ func (s *Session) execute(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case delivery := <-s.commands:
+		case waiting := <-s.commands:
+			delivery := waiting.delivery
 			if !s.admit() {
 				// Queued before the engine finished with the session, which `Offer` can
 				// no longer refuse because it was already taken. Carried out, a connect
@@ -776,17 +792,18 @@ func (s *Session) execute(ctx context.Context) {
 				release(delivery)
 				continue
 			}
-			s.run(ctx, delivery)
+			s.run(ctx, waiting)
 			s.doneWith()
 		}
 	}
 }
 
-func (s *Session) run(ctx context.Context, delivery *transport.Delivery) {
+func (s *Session) run(ctx context.Context, waiting queued) {
+	delivery := waiting.delivery
 	command := delivery.Command
 	log := s.log.With().Str("cmd_id", command.ID).Str("type", string(command.Type)).Logger()
 
-	began := s.now()
+	began := waiting.at
 	handedBack := false
 	result, err := s.carryOut(ctx, &command)
 	// Reported for the two endings that answer the caller, and not for the two below

@@ -1132,7 +1132,26 @@ func (c countingPublisher) Publish(ctx context.Context, event *protocol.Event) e
 type watching struct{ metrics *observability.Metrics }
 
 func (w watching) CommandDone(kind protocol.CommandType, outcome string, took time.Duration) {
-	w.metrics.CommandDuration.WithLabelValues(string(kind), outcome).Observe(took.Seconds())
+	w.metrics.CommandDuration.WithLabelValues(commandLabel(kind), outcome).Observe(took.Seconds())
+}
+
+// commandLabel keeps the type label inside the contract's own list.
+//
+// `ParseCommand` does not check the type against anything -- a command this build has no
+// handler for is refused later, by name -- so the string on a frame is whatever the client
+// wrote. Straight into a label that is a series per distinct value, kept for the life of
+// the process: one malformed frame per new name is enough to grow this connector's memory
+// and its Prometheus series without bound, and the commands do not even have to succeed.
+//
+// The other two labels this build uses do not have the problem and were checked rather
+// than assumed: `EventsPublished` and `EmissionsDropped` are both event types this
+// connector chose itself, and `outcome` is a contract error code, which unknown values
+// already degrade to `internal` before they arrive here.
+func commandLabel(kind protocol.CommandType) string {
+	if !kind.Valid() {
+		return "unknown"
+	}
+	return string(kind)
 }
 
 func (w watching) LeaseLost() { w.metrics.LeasesLost.Inc() }
