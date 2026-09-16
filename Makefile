@@ -7,7 +7,7 @@ GOLANGCI_LINT ?= golangci-lint
 PACKAGES ?= ./...
 
 .DEFAULT_GOAL := help
-.PHONY: help setup deps hooks fmt lint test test-postgres test-redis test-cover contract tidy check check-offline clean
+.PHONY: help setup deps hooks fmt lint test test-postgres test-redis test-cover contract tidy check check-offline check-servers clean
 
 help: ## List the available targets
 	@grep -hE '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
@@ -87,7 +87,29 @@ tidy: ## Fail when go.mod/go.sum are not tidy
 # exported from a shell profile, a direnv file or an agent's configuration and then never
 # appear again in any command anybody typed or any round recorded. A target has to be
 # named where it is run.
-check: check-offline test-postgres test-redis ## Everything CI enforces; needs both servers (see check-offline)
+check: check-servers check-offline test-postgres test-redis ## Everything CI enforces; needs both servers (see check-offline)
+
+# Both missing servers at once, before anything runs.
+#
+# Without this, make stops at the first prerequisite that fails and reports one variable.
+# Whoever starts a PostgreSQL on that advice gets to the same wall again, one pass later
+# and several minutes in, which is the shape of an instruction people stop following.
+check-servers:
+	@missing=""; \
+	test -n "$(WAC_TEST_DATABASE_URL)" || missing="$$missing WAC_TEST_DATABASE_URL"; \
+	test -n "$(WAC_TEST_REDIS_URL)" || missing="$$missing WAC_TEST_REDIS_URL"; \
+	if [ -n "$$missing" ]; then \
+	  echo "make check runs every pass CI enforces, and these are unset or empty:$$missing"; \
+	  echo; \
+	  echo "  docker run -d --rm -p 55432:5432 -e POSTGRES_USER=wac -e POSTGRES_PASSWORD=wac -e POSTGRES_DB=wac postgres:18-alpine"; \
+	  echo "  docker run -d --rm -p 56379:6379 redis:8-alpine"; \
+	  echo "  WAC_TEST_DATABASE_URL=postgres://wac:wac@localhost:55432/wac?sslmode=disable \\"; \
+	  echo "  WAC_TEST_REDIS_URL=redis://localhost:56379/0 make check"; \
+	  echo; \
+	  echo "(any free port will do; these only avoid whatever is already on 5432 and 6379)"; \
+	  echo "For the half that needs nothing running: make check-offline"; \
+	  exit 1; \
+	fi
 
 # The half that needs nothing running, which is what the git hooks and the agent stop hook
 # fall back to: requiring a server there would fail every commit made without one, for a
