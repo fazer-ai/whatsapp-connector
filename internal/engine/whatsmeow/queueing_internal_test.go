@@ -270,7 +270,7 @@ type inboxDoor struct {
 // report when it did. Both were out of reach while two files were fenced and both come
 // into reach at twenty-four, so the check is now the thing it was approximating all
 // along -- the report is a statement of the same list the send belongs to.
-func inboxDoors(t *testing.T, dir string) ([]inboxDoor, int) {
+func inboxDoors(t *testing.T, dir string) (doors []inboxDoor, scanned int) {
 	t.Helper()
 
 	entries, err := os.ReadDir(dir)
@@ -278,8 +278,6 @@ func inboxDoors(t *testing.T, dir string) ([]inboxDoor, int) {
 		t.Fatalf("read the package directory %q: %v", dir, err)
 	}
 	fset := token.NewFileSet()
-	var doors []inboxDoor
-	scanned := 0
 	for _, entry := range entries {
 		name := entry.Name()
 		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
