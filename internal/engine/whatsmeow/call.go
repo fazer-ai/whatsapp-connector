@@ -3,8 +3,10 @@ package whatsmeow
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"time"
 
+	wm "go.mau.fi/whatsmeow"
 	waBinary "go.mau.fi/whatsmeow/binary"
 	waTypes "go.mau.fi/whatsmeow/types"
 	waEvents "go.mau.fi/whatsmeow/types/events"
@@ -16,6 +18,12 @@ import (
 // as a presence write: nothing downstream depends on it, a call rings for seconds, and a
 // refusal that arrives after the caller has given up is a node written into a call that
 // no longer exists.
+//
+// It covers both halves of a refusal, not one: the node that joins the call and the node
+// that refuses it go out under the same deadline, so that a deadline reached between them
+// is the same case as a socket lost between them. Measured, that case costs nothing -- the
+// call rings its full course and ends normally, and the account's phone clears -- so the
+// bound is the write, not the pair.
 const callWriteTimeout = 10 * time.Second
 
 // answeredCalls is how many call ids a session remembers to tell a second announcement of
@@ -299,4 +307,76 @@ func callFailure(err error) error {
 		return coded
 	}
 	return protocol.NewError(protocol.ErrorWaError, "WhatsApp refused the call rejection")
+}
+
+// declineOverClient refuses a call the way WhatsApp actually honours it: by joining the
+// call's signalling first, and only then refusing.
+//
+// whatsmeow's own RejectCall writes the `<reject>` alone, and WhatsApp takes that node,
+// acks it `<ack class="call" type="reject"/>`, hands it to the caller's client, which
+// answers with a `<receipt>` of its own -- and the call keeps ringing. It was measured
+// five times, across five different addressings (LID and phone on either side, with and
+// without the device suffix, including the exact node the library builds), and it never
+// ended a call. Worse than a no-op: the account's own phone is left with a call
+// notification it cannot dismiss, because the account was never told the call was over.
+//
+// What is missing is that this device never entered the call. WhatsApp ignores a refusal
+// from a participant that is not in the call, so the `<preaccept>` is what makes the
+// `<reject>` mean anything. With both nodes written, the call ends in under a second:
+// measured six times, on two paired accounts, from two callers, on voice and on video,
+// with the end tracking the `<reject>` rather than the clock. The stuck notification goes
+// with it.
+//
+// The two go out back to back, with nothing between them, and that is deliberate. Between
+// them the account has entered a call it has not left, so the window is worth having small
+// -- and with no wait it is one socket write wide. Exercising it on purpose (a `<preaccept>`
+// and no `<reject>` at all) costs nothing: the call rings its full course and ends normally,
+// the notification clears, and the account behaves as though this connector were not
+// attached. The worst this window can do is the behaviour we already had.
+func declineOverClient(ctx context.Context, client *wm.Client, caller waTypes.JID, callID string) error {
+	// Deprecated as "dangerous", and taken deliberately, on the same terms as the keyed
+	// group create: these are the library's own calls, reached this way because
+	// `RejectCall` writes the node that does not work and `sendNode` is not exported.
+	inside := client.DangerousInternals() //nolint:staticcheck // the only route a working refusal has
+	own := inside.GetOwnID()
+	if own.IsEmpty() {
+		return wm.ErrNotLoggedIn
+	}
+	own, caller = own.ToNonAD(), caller.ToNonAD()
+
+	join, refusal := refusalNodes(own, caller, callID)
+	// The refusal is not sent when joining failed. A `<reject>` on its own is the node
+	// this function exists to stop writing: it would be acked, it would not end the call,
+	// and it would leave the phone exactly as stuck as before.
+	join.Attrs["id"] = client.GenerateMessageID()
+	if err := inside.SendNode(ctx, join); err != nil {
+		return fmt.Errorf("join call %s to refuse it: %w", callID, err)
+	}
+	refusal.Attrs["id"] = client.GenerateMessageID()
+	if err := inside.SendNode(ctx, refusal); err != nil {
+		return fmt.Errorf("refuse call %s: %w", callID, err)
+	}
+	return nil
+}
+
+// refusalNodes is the pair a refusal is made of, in the order they go out. Built apart
+// from the writing so that a test can hold the shape of both without a socket, which is
+// the whole of what separates a refusal WhatsApp honours from the one that was being
+// written before. Only the stanza id is left for the caller to fill: it is the one
+// attribute that has to differ between two nodes of the same call.
+func refusalNodes(own, caller waTypes.JID, callID string) (join, refusal waBinary.Node) {
+	wrap := func(child waBinary.Node) waBinary.Node {
+		return waBinary.Node{
+			Tag:     "call",
+			Attrs:   waBinary.Attrs{"from": own, "to": caller},
+			Content: []waBinary.Node{child},
+		}
+	}
+	return wrap(waBinary.Node{
+			Tag:   "preaccept",
+			Attrs: waBinary.Attrs{"call-id": callID, "call-creator": caller},
+		}), wrap(waBinary.Node{
+			Tag:   "reject",
+			Attrs: waBinary.Attrs{"call-id": callID, "call-creator": caller, "count": "0"},
+		})
 }

@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -565,5 +567,108 @@ func TestAConnectMayAskForCallsToBeRefusedAndIsRememberedThatWay(t *testing.T) {
 	}
 	if !wanted[0].CallAutoReject {
 		t.Fatal("the call policy is not on the desired row, so a resume would not put it back")
+	}
+}
+
+// TestARefusalJoinsTheCallBeforeItRefusesIt holds the shape of both nodes, which is the
+// whole of what separates a refusal WhatsApp honours from the one this connector used to
+// write. A bare `<reject>` was measured five times against a paired account, across five
+// addressings, and never ended a call; with the `<preaccept>` in front of it the call
+// ends in under a second. Nothing but a test keeps the pair together, because the socket
+// takes either one without complaining.
+func TestARefusalJoinsTheCallBeforeItRefusesIt(t *testing.T) {
+	t.Parallel()
+
+	own := waTypes.JID{User: "5511999998888", Server: waTypes.DefaultUserServer, Device: 42}
+	caller := waTypes.JID{User: theCaller, Server: waTypes.DefaultUserServer, Device: 58}
+	join, refusal := refusalNodes(own.ToNonAD(), caller.ToNonAD(), "CALL-1")
+
+	for _, outer := range []waBinary.Node{join, refusal} {
+		if outer.Tag != "call" {
+			t.Fatalf("both nodes are <call>, this one is <%s>", outer.Tag)
+		}
+		if got := outer.Attrs["from"]; got != own.ToNonAD() {
+			t.Fatalf("the refusal is signed by this account without its device, got %v", got)
+		}
+		if got := outer.Attrs["to"]; got != caller.ToNonAD() {
+			t.Fatalf("the refusal is addressed to the caller without its device, got %v", got)
+		}
+		if _, carried := outer.Attrs["id"]; carried {
+			t.Fatal("the stanza id is the writer's to fill, so that two nodes of one call differ")
+		}
+		if len(outer.GetChildren()) != 1 {
+			t.Fatalf("one child per node, got %d", len(outer.GetChildren()))
+		}
+	}
+
+	if tag := join.GetChildren()[0].Tag; tag != "preaccept" {
+		t.Fatalf("the first node joins the call, got <%s>", tag)
+	}
+	if tag := refusal.GetChildren()[0].Tag; tag != "reject" {
+		t.Fatalf("the second node refuses it, got <%s>", tag)
+	}
+
+	for _, child := range []waBinary.Node{join.GetChildren()[0], refusal.GetChildren()[0]} {
+		if got := child.Attrs["call-id"]; got != "CALL-1" {
+			t.Fatalf("<%s> names the call, got %v", child.Tag, got)
+		}
+		if got := child.Attrs["call-creator"]; got != caller.ToNonAD() {
+			t.Fatalf("<%s> names whoever started it, without the device, got %v", child.Tag, got)
+		}
+	}
+	if got := refusal.GetChildren()[0].Attrs["count"]; got != "0" {
+		t.Fatalf(`<reject> carries count="0", got %v`, got)
+	}
+}
+
+// TestTheTwoHalvesOfARefusalAreTheSameCall guards the pairing itself: a preaccept for one
+// call and a reject for another would leave the account inside a call it never left, which
+// is the one state this change creates that did not exist before.
+func TestTheTwoHalvesOfARefusalAreTheSameCall(t *testing.T) {
+	t.Parallel()
+
+	own := waTypes.JID{User: "5511999998888", Server: waTypes.DefaultUserServer}
+	caller := waTypes.JID{User: theCaller, Server: waTypes.HiddenUserServer}
+	join, refusal := refusalNodes(own, caller, "CALL-2")
+
+	if join.GetChildren()[0].Attrs["call-id"] != refusal.GetChildren()[0].Attrs["call-id"] {
+		t.Fatal("the call joined and the call refused must be the same one")
+	}
+	if join.Attrs["to"] != refusal.Attrs["to"] {
+		t.Fatal("both halves go to the same caller")
+	}
+}
+
+// TestNothingCallsTheLibrarysOwnRejection is a fence, and it is the one assertion that
+// fails on the code this change replaces. whatsmeow's RejectCall writes the `<reject>`
+// alone, which WhatsApp acks and does not act on, and which leaves the account's phone
+// holding a call notification it cannot dismiss. Reaching for it again from anywhere in
+// this package would put that back without any other test noticing, because every unit
+// test swaps the seam and never sees the node.
+func TestNothingCallsTheLibrarysOwnRejection(t *testing.T) {
+	t.Parallel()
+
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read the package: %v", err)
+	}
+	checked := 0
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		source, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		checked++
+		if strings.Contains(string(source), ".RejectCall(") {
+			t.Errorf("%s calls whatsmeow's RejectCall, which is refused by nobody and honoured by nobody: "+
+				"a refusal has to join the call first, which is what declineOverClient does", name)
+		}
+	}
+	if checked == 0 {
+		t.Fatal("the fence read no production files, so it proves nothing")
 	}
 }

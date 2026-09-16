@@ -175,7 +175,7 @@ type Session struct {
 	setJoinApproval func(context.Context, *wm.Client, waTypes.JID, bool) error
 	setAddMode      func(context.Context, *wm.Client, waTypes.JID, waTypes.GroupMemberAddMode) error
 	profilePicture  func(context.Context, *wm.Client, waTypes.JID, *wm.GetProfilePictureParams) (*waTypes.ProfilePictureInfo, error)
-	// declineCall is the one node a call ever makes this connector write, and both
+	// declineCall is the pair of nodes a call makes this connector write, and both
 	// writers go through it: the command a client sends and the policy it set on the
 	// connect. A seam for the same reason as the group writes above -- a test can watch
 	// what was refused without a socket, which is the only way to assert that the policy
@@ -752,7 +752,7 @@ func newSession(
 			// shares is what turns it into a word the contract has.
 			return wm.ErrClientIsNil
 		}
-		return client.RejectCall(ctx, caller, callID) //nolint:wrapcheck // classified by callFailure, which needs the sentinels
+		return declineOverClient(ctx, client, caller, callID)
 	}
 	s.setTopic = func(
 		ctx context.Context, client *wm.Client, group waTypes.JID, previous, revision, description string,
