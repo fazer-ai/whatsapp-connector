@@ -1,6 +1,7 @@
 package whatsmeow
 
 import (
+	"errors"
 	"os"
 	"slices"
 	"strings"
@@ -10,6 +11,8 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	waTypes "go.mau.fi/whatsmeow/types"
+	waEvents "go.mau.fi/whatsmeow/types/events"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/engine"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
@@ -258,4 +261,83 @@ func TestAnInboundEventTheInboxHadNoRoomForIsCounted(t *testing.T) {
 			t.Errorf("reported %d emissions as queued, want 0: nothing got in", len(seen))
 		}
 	})
+}
+
+// The second door, driven the way WhatsApp drives it. `TestPresenceLeavesNothingBehind`
+// already proves the board is left clean; what it cannot say is whether the loss shows up
+// anywhere, and a presence dropped here is never told to the client, never retried and
+// never logged as anything but a debug line. This counter is the only place it exists.
+func TestAPresenceTheInboxHadNoRoomForIsCounted(t *testing.T) {
+	t.Parallel()
+
+	session := newPresenceSession(t, "5511999990001")
+	watch := &emitWatch{}
+	session.queueing = watch
+	filler := pending{event: engine.Emission{Type: protocol.EventSessionState, Payload: []byte(`{}`)}}
+	// Park the forwarder before filling, for the reason the neighbouring test gives: it
+	// races the fill for the slot it frees on its way to parking.
+	session.inbox <- filler
+	waitUntil(t, "the forwarder to be holding an emission", func() bool { return len(session.inbox) == 0 })
+	for range cap(session.inbox) {
+		session.inbox <- filler
+	}
+
+	jid := waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)
+	session.chatPresence(&waEvents.ChatPresence{
+		MessageSource: waTypes.MessageSource{Chat: jid, Sender: jid}, State: waTypes.ChatPresencePaused,
+	})
+
+	if got := watch.dropped(); !slices.Equal(got, []protocol.EventType{protocol.EventChatPresence}) {
+		t.Errorf("dropped = %v, want one chat.presence", got)
+	}
+}
+
+// The third door, and the one that is easiest to leave uncounted: the presence is not
+// dropped where it was posted but a publish later, when the retry finds the queue it fit
+// into the first time now full. The client was never told the first attempt failed, so
+// without this the state simply stops being true and nothing anywhere says so.
+func TestAPresenceRetriedIntoAFullInboxIsCounted(t *testing.T) {
+	t.Parallel()
+
+	session := newPresenceSession(t, "5511999990001")
+	watch := &emitWatch{}
+	session.queueing = watch
+	session.picked = make(chan struct{}, 1)
+	blockTheForwarder(t, session)
+
+	jid := waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)
+	// `paused` is the state that ends a burst: nothing comes after it to correct it, which
+	// is why it carries a Settle at all and why the retry exists.
+	session.chatPresence(&waEvents.ChatPresence{
+		MessageSource: waTypes.MessageSource{Chat: jid, Sender: jid}, State: waTypes.ChatPresencePaused,
+	})
+
+	var settle func(error)
+	session.boardMu.Lock()
+	for _, entry := range session.board {
+		settle = entry.emission.Settle
+	}
+	held := len(session.board)
+	session.boardMu.Unlock()
+	if held != 1 || settle == nil {
+		t.Fatalf("the board holds %d entries and a settle func that is %v, want 1 and non-nil",
+			held, settle != nil)
+	}
+	// Room for the first marker and none for its retry, which is the whole state this
+	// test is about.
+	for range cap(session.inbox) - len(session.inbox) {
+		session.inbox <- pending{event: engine.Emission{Type: protocol.EventSessionState, Payload: []byte(`{}`)}}
+	}
+
+	settle(errors.New("the publisher would not take it"))
+
+	if got := watch.dropped(); !slices.Equal(got, []protocol.EventType{protocol.EventChatPresence}) {
+		t.Errorf("dropped = %v, want one chat.presence", got)
+	}
+	session.boardMu.Lock()
+	left := len(session.board)
+	session.boardMu.Unlock()
+	if left != 0 {
+		t.Errorf("%d presences are on a board with nothing coming to publish them", left)
+	}
 }
