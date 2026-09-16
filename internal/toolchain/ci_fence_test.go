@@ -61,8 +61,13 @@ type workflow struct {
 	} `yaml:"jobs"`
 }
 
-// `make foo`, `make -s foo`, `make foo bar`: the target is the first word that is not a flag.
-var makeCall = regexp.MustCompile(`\bmake\b((?:[ \t]+-{1,2}[^\s]+)*)((?:[ \t]+[a-zA-Z0-9][a-zA-Z0-9_.-]*)+)`)
+// `make foo`, `make -s foo`, `make foo bar`, and the same after a shell separator.
+//
+// Anchored to a command position rather than to the word, because the word appears in
+// English: a step whose script says "# make sure the volume is attached" would otherwise
+// report four targets the Makefile does not have, and a fence that fails on prose is a
+// fence somebody deletes.
+var makeCall = regexp.MustCompile(`(?m)(?:^|[;&|(])[ \t]*make\b((?:[ \t]+-{1,2}[^\s]+)*)((?:[ \t]+[a-zA-Z0-9][a-zA-Z0-9_.-]*)+)`)
 
 func TestEveryGateCIEnforcesIsReachableFromMakeCheck(t *testing.T) {
 	t.Parallel()
@@ -123,6 +128,39 @@ func TestEveryGateCIEnforcesIsReachableFromMakeCheck(t *testing.T) {
 	}
 	if len(reachable) < 2 {
 		t.Fatalf("`make %s` reaches %v in %s: a promise with no dependencies is the defect this fence exists to catch", promise, sorted(reachable), makefilePath)
+	}
+}
+
+// The fence reads scripts written for a shell, and a script carries prose: comments,
+// echoed messages, names of things. Every one of these was a target this file claimed the
+// Makefile was missing before the pattern was anchored to a command position.
+func TestTargetsCalledByReadsCommandsAndNotProse(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		script string
+		want   []string
+	}{
+		{"make test-postgres", []string{"test-postgres"}},
+		{"make -s check", []string{"check"}},
+		{"make lint test", []string{"lint", "test"}},
+		{"go build ./... && make lint", []string{"lint"}},
+		{"docker ps; make tidy", []string{"tidy"}},
+		{"# make sure the volume is attached\ndocker run smoke", nil},
+		{"echo 'this will make things slow'", nil},
+		{"echo \"nothing here to make of it\"", nil},
+	} {
+		got := targetsCalledBy(tc.script)
+		if len(got) != len(tc.want) {
+			t.Errorf("targetsCalledBy(%q) = %v, want %v", tc.script, got, tc.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != tc.want[i] {
+				t.Errorf("targetsCalledBy(%q) = %v, want %v", tc.script, got, tc.want)
+				break
+			}
+		}
 	}
 }
 
