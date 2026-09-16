@@ -1,8 +1,14 @@
 package whatsmeow
 
 import (
+	"bytes"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/printer"
+	"go/token"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -209,27 +215,147 @@ func emissionOf(kind protocol.EventType) *engine.Emission {
 //
 // A fence rather than four assertions: a fifth door added later is the thing that breaks
 // this silently, and nothing else would notice.
+// The fence over the package's own source, and the promise it keeps is what the depth
+// histogram means: every door into the session inbox reports the wait it paid and the
+// depth it arrived at, or `wac_session_inbox_depth` describes the doors that report
+// rather than the queue.
 func TestEveryWriteToTheInboxIsMeasured(t *testing.T) {
 	t.Parallel()
 
-	for _, name := range []string{"session.go", "message.go"} {
-		body, err := os.ReadFile(name)
+	doors := inboxDoors(t, ".")
+	// A fence that finds nothing passes everything. Renaming the field, moving the
+	// package, or pointing this at the wrong directory would each leave a green test
+	// asserting nothing whatsoever -- which is this fence's own bug one level up: the
+	// thing that went missing with no way left to announce itself.
+	if len(doors) == 0 {
+		t.Fatal("no writes to the inbox anywhere in the package: this fence is measuring " +
+			"nothing at all, whatever its result says")
+	}
+	for _, found := range doors {
+		if found.reports {
+			continue
+		}
+		t.Errorf("%s:%d writes to the inbox and does not report it:\n\t%s\n"+
+			"every door into the inbox reports, or the depth histogram describes "+
+			"the doors that do rather than the queue", found.file, found.line, found.text)
+	}
+}
+
+// inboxDoor is one send to a session inbox, and whether the reporting sits where the
+// send does.
+type inboxDoor struct {
+	file    string
+	line    int
+	text    string
+	reports bool
+}
+
+// inboxDoors parses every production file in dir and finds the sends to `.inbox`.
+//
+// It walks the directory rather than a list of file names. The list this started as was
+// right on the day it was written -- it named the two files that had inbox writes -- and
+// that is exactly the property a fence must not have, because the twenty-two files it did
+// not name were free to open a door nobody measured.
+//
+// Structural rather than textual, too. The version this replaces looked for `s.queued(`
+// within six lines of the send, which is a guess about layout: it passed a send whose
+// only nearby `s.queued(` belonged to something else, and it failed a send whose
+// reporting sat a comment block further down, with a message saying the send did not
+// report when it did. Both were out of reach while two files were fenced and both come
+// into reach at twenty-four, so the check is now the thing it was approximating all
+// along -- the report is a statement of the same list the send belongs to.
+func inboxDoors(t *testing.T, dir string) []inboxDoor {
+	t.Helper()
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read the package directory %q: %v", dir, err)
+	}
+	fset := token.NewFileSet()
+	var doors []inboxDoor
+	scanned := 0
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		// A file that was listed and then cannot be read fails here instead of being
+		// skipped. Skipping would shrink the fence by exactly the amount nobody notices.
+		parsed, err := parser.ParseFile(fset, filepath.Join(dir, name), nil, 0)
 		if err != nil {
-			t.Fatalf("read %s: %v", name, err)
+			t.Fatalf("parse %s: %v", name, err)
 		}
-		lines := strings.Split(string(body), "\n")
-		for i, line := range lines {
-			if !strings.Contains(line, "s.inbox <- ") {
-				continue
+		scanned++
+		ast.Inspect(parsed, func(node ast.Node) bool {
+			switch n := node.(type) {
+			case *ast.CommClause:
+				// `case s.inbox <- x:` -- the send is the guard, and the reporting
+				// belongs to the arm that guard opens.
+				if send, ok := n.Comm.(*ast.SendStmt); ok && sendsToAnInbox(send) {
+					doors = append(doors, oneDoor(fset, name, send, reportedIn(n.Body)))
+				}
+				doors = append(doors, doorsIn(fset, name, n.Body)...)
+			case *ast.CaseClause:
+				doors = append(doors, doorsIn(fset, name, n.Body)...)
+			case *ast.BlockStmt:
+				doors = append(doors, doorsIn(fset, name, n.List)...)
 			}
-			// The reporting sits in the arm this send opens, so look just past it.
-			window := strings.Join(lines[i:min(i+6, len(lines))], "\n")
-			if !strings.Contains(window, "s.queued(") {
-				t.Errorf("%s:%d writes to the inbox and does not report it:\n\t%s\n"+
-					"every door into the inbox reports, or the depth histogram describes "+
-					"the doors that do rather than the queue", name, i+1, strings.TrimSpace(line))
-			}
+			return true
+		})
+	}
+	if scanned == 0 {
+		t.Fatalf("no production files to scan in %q: a fence with nothing to read is not a fence", dir)
+	}
+	return doors
+}
+
+// doorsIn finds the sends written straight into a statement list, which is the shape a
+// door takes when it is not the guard of a select.
+func doorsIn(fset *token.FileSet, file string, list []ast.Stmt) []inboxDoor {
+	var doors []inboxDoor
+	for _, stmt := range list {
+		if send, ok := stmt.(*ast.SendStmt); ok && sendsToAnInbox(send) {
+			doors = append(doors, oneDoor(fset, file, send, reportedIn(list)))
 		}
+	}
+	return doors
+}
+
+// reportedIn is the whole judgement: a call to queued standing as a statement of this
+// same list. Nested deeper it is some other path's reporting, and a send that is measured
+// only when an `if` happens to go one way is a send that is not measured.
+func reportedIn(list []ast.Stmt) bool {
+	for _, stmt := range list {
+		expr, ok := stmt.(*ast.ExprStmt)
+		if !ok {
+			continue
+		}
+		call, ok := expr.X.(*ast.CallExpr)
+		if !ok {
+			continue
+		}
+		if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "queued" {
+			return true
+		}
+	}
+	return false
+}
+
+func sendsToAnInbox(send *ast.SendStmt) bool {
+	sel, ok := send.Chan.(*ast.SelectorExpr)
+	return ok && sel.Sel.Name == "inbox"
+}
+
+func oneDoor(fset *token.FileSet, file string, send *ast.SendStmt, reports bool) inboxDoor {
+	var rendered bytes.Buffer
+	if err := printer.Fprint(&rendered, fset, send); err != nil {
+		rendered.WriteString("<the send would not render>")
+	}
+	return inboxDoor{
+		file:    file,
+		line:    fset.Position(send.Pos()).Line,
+		text:    rendered.String(),
+		reports: reports,
 	}
 }
 
