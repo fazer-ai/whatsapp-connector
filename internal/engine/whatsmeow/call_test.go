@@ -692,8 +692,9 @@ func TestNothingCallsTheLibrarysOwnRejection(t *testing.T) {
 	// for a string that can no longer appear passes because there is nothing left to
 	// find, and whatsmeow renaming or removing RejectCall is the way that happens here
 	// -- silently, in a dependency bump, with this test still green. The reference costs
-	// a line and turns that into a build failure on the bump that caused it.
-	var _ func(context.Context, waTypes.JID, string) error = (&wm.Client{}).RejectCall
+	// a line and turns that into a build failure on the bump that caused it. The name is
+	// all it pins: what this fence looks for is the call, whatever shape it has.
+	var _ = (&wm.Client{}).RejectCall
 
 	entries, err := os.ReadDir(".")
 	if err != nil {
