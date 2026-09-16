@@ -896,3 +896,30 @@ func TestACommandForACallThisSessionNeverSawNamesWhatTheClientGave(t *testing.T)
 		t.Fatalf("a call this session never saw is refused at the address the client gave, named %s", named[0])
 	}
 }
+
+// TestOneCallAnnouncedTwiceIsRefusedOnce fences the other half of the deduplication, which
+// the publishing test cannot reach: it runs with the policy off, so the gate in front of
+// the refusal is invisible to it.
+//
+// WhatsApp announces one call as `offer` and `offer_notice`, in either order. Refusing on
+// both writes two `<preaccept>` and two `<reject>` into a call with one of each, which is
+// what the ring exists to prevent and what nothing else here would notice.
+func TestOneCallAnnouncedTwiceIsRefusedOnce(t *testing.T) {
+	t.Parallel()
+	session, watched := callSession(t, true)
+
+	session.handle(&waEvents.CallOffer{BasicCallMeta: callMeta("call-twice")})
+	session.handle(&waEvents.CallOfferNotice{BasicCallMeta: callMeta("call-twice"), Media: "video"})
+
+	refusedWithin(t, watched, "call-twice")
+	// The second announcement is handled on the caller's goroutine and the refusal is
+	// written off it, so a second one would be in flight rather than already recorded.
+	// Given long enough to land: the first took microseconds.
+	deadline := time.Now().Add(250 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if seen := watched.seen(); len(seen) > 1 {
+			t.Fatalf("one call was refused %d times: %v", len(seen), seen)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
