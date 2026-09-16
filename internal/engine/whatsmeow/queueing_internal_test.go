@@ -612,9 +612,12 @@ func carriers(t *testing.T, dir string) (found []inboxCarrier, scanned int, decl
 // carriersIn is the rule itself, over one file's source. It takes the source rather than
 // a path so the control above can hold the rule to a case the test wrote itself.
 //
-// A function literal answers to whatever names it: the variable it is bound to, or failing
-// that the function it sits inside plus the line. Reporting a bare `file:line` would be
-// accurate and useless, and the key is what somebody has to type into carriersAllowed.
+// A function literal answers to whatever names it -- the variable it is bound to, or
+// failing that the function it sits inside -- and then to where it is written. Both halves
+// are load-bearing. A bare `file:line` is accurate and useless, since the key is what
+// somebody has to type into carriersAllowed; a bare name is worse than useless, because
+// two functions can each hold a local `offer := func(inbox chan<- pending)` and one
+// exemption would then quietly excuse both, which is the thing keys exist to prevent.
 func carriersIn(t *testing.T, fset *token.FileSet, name, src string) []inboxCarrier {
 	t.Helper()
 
@@ -631,6 +634,12 @@ func carriersIn(t *testing.T, fset *token.FileSet, name, src string) []inboxCarr
 		seen[pos] = true
 		found = append(found, oneCarrier(fset, name, key, sig, pos))
 	}
+	// A literal's key carries where it is as well as what it is called. Declarations do
+	// not need it: Go already makes a function name unique in a package, and a method
+	// unique on its type.
+	literal := func(called string, sig *ast.FuncType, pos token.Pos) {
+		record(fmt.Sprintf("%s@%s:%d", called, name, fset.Position(pos).Line), sig, pos)
+	}
 
 	// Bound to a name first, so the name wins over the position.
 	ast.Inspect(parsed, func(node ast.Node) bool {
@@ -638,7 +647,7 @@ func carriersIn(t *testing.T, fset *token.FileSet, name, src string) []inboxCarr
 		case *ast.ValueSpec:
 			for i, value := range n.Values {
 				if lit, ok := value.(*ast.FuncLit); ok && i < len(n.Names) {
-					record(n.Names[i].Name, lit.Type, lit.Pos())
+					literal(n.Names[i].Name, lit.Type, lit.Pos())
 				}
 			}
 		case *ast.AssignStmt:
@@ -648,7 +657,7 @@ func carriersIn(t *testing.T, fset *token.FileSet, name, src string) []inboxCarr
 					continue
 				}
 				if to, ok := n.Lhs[i].(*ast.Ident); ok {
-					record(to.Name, lit.Type, lit.Pos())
+					literal(to.Name, lit.Type, lit.Pos())
 				}
 			}
 		}
@@ -670,7 +679,7 @@ func carriersIn(t *testing.T, fset *token.FileSet, name, src string) []inboxCarr
 }
 
 // within names an anonymous literal after the function it sits in, because that is what
-// the person reading the failure has to go and look at.
+// the person reading the failure has to go and look at, and then after where it is.
 func within(fset *token.FileSet, file *ast.File, name string, lit *ast.FuncLit) string {
 	at := fset.Position(lit.Pos()).Line
 	for _, decl := range file.Decls {
@@ -678,9 +687,9 @@ func within(fset *token.FileSet, file *ast.File, name string, lit *ast.FuncLit) 
 		if !ok || lit.Pos() < fn.Pos() || lit.Pos() > fn.End() {
 			continue
 		}
-		return fmt.Sprintf("%s:%d", declName(fn), at)
+		return fmt.Sprintf("a literal in %s@%s:%d", declName(fn), name, at)
 	}
-	return fmt.Sprintf("%s:%d", name, at)
+	return fmt.Sprintf("a literal@%s:%d", name, at)
 }
 
 // carriesTheInbox is the match, and it reads a spelling: a channel of `pending` written
