@@ -11,10 +11,18 @@ of truth for both sides; this repository is the side that produces events.
 - **Test**: `make test` (race detector on) — a single one with `go test ./internal/protocol -run TestName`
 - **The other dialect**: `make test-postgres` runs the same suite against a PostgreSQL
   server named by `WAC_TEST_DATABASE_URL`, which is what a deployment runs and what
-  `make test` never touches. CI runs both passes, and `make check` runs this one too
-  whenever the variable is set; the target prints how to start a server when it is not
+  `make test` never touches. `make test-redis` is the same idea for the transport against
+  a real Redis. Both print how to start a server when the variable is unset
 - **Contract only**: `make contract`
-- **Everything CI enforces**: `make check`
+- **Everything CI enforces**: `make check` — lint, `go mod tidy`, and the suite three
+  times over: SQLite, PostgreSQL, and the transport against real Redis. It needs a server
+  for each of the last two and **fails when it cannot reach them**. It used to skip them
+  with a notice and exit 0, which answered "CI will accept this" on evidence it had not
+  collected; a single test file with no production lines once aborted the whole package
+  under PostgreSQL and passed that way
+- **The half that needs nothing running**: `make check-offline` (lint, `go mod tidy`, the
+  SQLite pass). It is what the git hooks and the agent stop hook fall back to, so a commit
+  made without Docker running does not fail for a reason that is not the commit's
 - **Toolchain**: Go as declared in `go.mod`; `golangci-lint` v2
 
 ## Layout

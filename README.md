@@ -139,13 +139,22 @@ map and the compatibility rules. In short:
 ## Development
 
 Requirements: Go (version in `go.mod`) and
-[golangci-lint](https://golangci-lint.run/) v2. The tests bring their own Redis
-(`miniredis`), so nothing has to be running to `make check`. Postgres joins with the
-store in M1.
+[golangci-lint](https://golangci-lint.run/) v2. Most tests bring their own doubles
+(`miniredis`, SQLite), and two passes do not: the suite against a real PostgreSQL, which
+is the dialect a deployment runs, and the transport against a real Redis, for the stream
+counters miniredis answers zero for. `make check` runs all of it and needs both servers;
+`make check-offline` is the half that needs nothing listening.
 
 ```bash
-make setup   # git hooks + module download
-make check   # what CI enforces: lint + tests
+make setup          # git hooks + module download
+make check-offline  # lint, go mod tidy, and the suite against SQLite
+
+# Everything CI enforces, which needs a server for each of the two dialect passes.
+# Any free port will do; these avoid whatever is already on 5432 and 6379.
+docker run -d --rm -p 55432:5432 -e POSTGRES_USER=wac -e POSTGRES_PASSWORD=wac -e POSTGRES_DB=wac postgres:18-alpine
+docker run -d --rm -p 56379:6379 redis:8-alpine
+WAC_TEST_DATABASE_URL=postgres://wac:wac@localhost:55432/wac?sslmode=disable \
+WAC_TEST_REDIS_URL=redis://localhost:56379/0 make check
 make help    # every target
 ```
 

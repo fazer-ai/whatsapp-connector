@@ -1,6 +1,13 @@
 #!/bin/bash
-# Runs `make check` before letting the agent stop, but only if relevant files changed.
-# Returns ok:false with a reason if checks fail, so the agent continues to fix issues.
+# Runs `make check-offline` before letting the agent stop, but only if relevant files
+# changed. Returns ok:false with a reason if checks fail, so the agent continues to fix
+# issues.
+#
+# The offline half on purpose: `make check` needs a PostgreSQL and a Redis of its own, and
+# a stop hook that fails because nothing is listening on this machine would block every
+# agent here for a reason that has nothing to do with what it just wrote. What this hook
+# owes is fast feedback on uncommitted work; the dialect passes are CI's job and the
+# round's, and `make check` is what says so.
 
 # Read stdin (hook input JSON) — check if stop hook is already active to avoid infinite loops
 input=$(cat)
@@ -29,8 +36,8 @@ if [ -z "$relevant" ]; then
   exit 0
 fi
 
-if make check 2>&1; then
+if make check-offline 2>&1; then
   echo '{"ok": true}'
 else
-  echo '{"ok": false, "reason": "make check failed. Please fix the lint or test issues above before stopping."}'
+  echo '{"ok": false, "reason": "make check-offline failed (lint, go mod tidy, or the SQLite test pass). Fix it above before stopping. Note this is the offline half: the PostgreSQL and Redis passes need servers and run in CI, or here via make check."}'
 fi

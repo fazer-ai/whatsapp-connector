@@ -26,9 +26,15 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # Through the target, not a second spelling of it. What `make check` promises and
+      # what this file runs were two hand-written lists, and they had already drifted: an
+      # untidy go.sum failed here and passed `make check` with nothing skipped.
       - name: Check go.mod/go.sum are tidy
-        run: go mod tidy -diff
+        run: make tidy
 
+      # The one step that stays a direct invocation, and deliberately: the action brings
+      # its own caching and turns findings into annotations on the diff, which `make lint`
+      # cannot do from here. Same binary, same version, same config.
       - uses: golangci/golangci-lint-action@v9
         with:
           version: v2.12
@@ -78,7 +84,7 @@ jobs:
           cache: true
 
       - name: Run tests
-        run: go test -race -coverprofile=coverage.txt -covermode=atomic ./...
+        run: make test-cover
 
       # The same suite, against the other dialect. Everything rather than the one
       # package that holds SQL today: "SQL only lives in internal/store" is a
@@ -90,14 +96,14 @@ jobs:
       - name: Run tests against PostgreSQL
         env:
           WAC_TEST_DATABASE_URL: postgres://wac:wac@localhost:5432/wac?sslmode=disable
-        run: go test -count=1 ./...
+        run: make test-postgres
 
       # The transport against a real server, for the counters miniredis does not keep.
       # Its own database index, so nothing here shares state with the smoke job.
       - name: Run the transport against Redis
         env:
           WAC_TEST_REDIS_URL: redis://localhost:6379/15
-        run: go test -count=1 ./internal/transport/redisstream
+        run: make test-redis
 
       - name: Upload coverage
         uses: actions/upload-artifact@v7
