@@ -144,12 +144,13 @@ ringing.
 
 Sixteen calls with every node captured, to a paired account across an afternoon, divide on
 the `platform` the offer announces and on nothing else. Eleven came from the Android app.
-Nine of those had both nodes written into them, and **all nine ended within a second of the
-`<reject>`** -- the end tracking the node rather than the clock, which is what says it was
-the refusal and not the ring running out. Of the other two, one was refused on the
-operator's own phone before this connector wrote anything, and one was a deliberate control
-that got the `<preaccept>` and no `<reject>` at all: it rang its full course and ended
-normally.
+Nine of those had both nodes written into them and **all nine ended, promptly, right behind
+the `<reject>`**. What says the refusal ended them rather than the ring running out is that
+moving the nodes moves the end with them: written back to back, the call is over 0.4s to
+1.3s after the offer; held back by a probe for seventeen seconds, the same call runs to
+19.5s and then ends. Of the other two, one was refused on the operator's own phone before
+this connector wrote anything, and one was a deliberate control that got the `<preaccept>`
+and no `<reject>` at all: it rang its full course and ended normally.
 
 Five came from the web client and **not one of them was ended by a refusal written here**.
 The one that was left to run rang 89.8s and ended `timeout`; another ended at 11s when the
