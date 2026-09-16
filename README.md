@@ -140,10 +140,11 @@ map and the compatibility rules. In short:
 
 A caller on WhatsApp Web ignores the refusal. The node goes out exactly as it does for any
 other caller, WhatsApp routes it and acks it, and the browser on the other end keeps
-ringing until the call times out. Measured on one bench, one binary and four calls minutes
-apart: a call from the Android app ended 0.4s after the refusal, and a call from the web
-client rang its full 89.8s and ended `timeout`. Every measurement of this since agrees, and
-nothing this connector writes changes it.
+ringing until the call times out. Sixteen calls to two paired accounts across an afternoon
+divide on the `platform` the offer announces and on nothing else: eleven from the Android
+app, every one of them refused within about a second, and five from the web client, every
+one of them ringing its full course. The longest ran 89.8s and ended `timeout`. Nothing
+this connector writes changes it.
 
 It matters to whoever reads the inbox rather than to the code: with the policy on, the
 operator's phone still rings for a caller who dialled from a browser, and there is no
@@ -159,7 +160,11 @@ or video calls, group chats, broadcast lists, disappearing messages, view-once m
 live location or the catalog. That is the platform's rule and not this connector's: the
 call never reaches any linked device, including WhatsApp's own web client, so `call.offer`
 is never published and `calls.auto_reject` has nothing to refuse. Measured on a paired
-Coexistence account: three incoming calls, zero call stanzas on the socket.
+Coexistence account, with every node in both directions dumped: not one `<offer>` arrived,
+across every call placed to it. What did arrive was the other half of the exchange -- two
+`<reject>` broadcasts naming calls this device was never offered, one of them
+`reason="busy"` -- which is WhatsApp telling a linked device about a call that was refused
+somewhere it could not see.
 
 Nothing on the wire tells such a number apart. Its `<pair-success>` carries the same
 `platform` as any other business account and a `<biz>` with only a name, so the connector
