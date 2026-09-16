@@ -145,11 +145,13 @@ ringing.
 Sixteen calls with every node captured, to a paired account across an afternoon, divide on
 the `platform` the offer announces and on nothing else. Eleven came from the Android app.
 Nine of those had both nodes written into them and **all nine ended, promptly, right behind
-the `<reject>`**. One of the nine settles on its own what ended it, because three different
-things were tried into it: a `<terminate>` about three seconds in did nothing and the call
-went on ringing, a second one about ten seconds in did nothing either, and the
-`<preaccept>` and `<reject>` written at about seventeen and nineteen seconds ended it at
-19.47s. Same call, same socket, same session. The rest agree from the other direction:
+the `<reject>`**. One of the nine settles on its own what ended it, because three
+different things were tried into it. A `<terminate reason="reject">` about three seconds
+in did nothing and the call went on ringing; a second one about ten seconds in did nothing
+either; and the `<preaccept>` and `<reject>` written at about seventeen and nineteen
+seconds ended it at 19.47s. The `reason` is what makes that a control rather than a
+coincidence: all three were attempts to refuse the same call, on the same socket, in the
+same session, and only the pair was honoured. The rest agree from the other direction:
 written back to back the call is over 0.4s to 1.3s after the offer, so moving the nodes
 moves the end with them. Of the other two, one was refused on the operator's own phone before
 this connector wrote anything, and one was a deliberate control that got the `<preaccept>`
