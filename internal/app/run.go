@@ -156,6 +156,9 @@ func New(cfg *Config, log zerolog.Logger) (connector *Connector, err error) {
 	}
 
 	metrics := observability.New()
+	// Registered here rather than inside observability.New, because the value it reports
+	// lives in Redis and that package deliberately knows about nothing but Prometheus.
+	metrics.Registry.MustRegister(redisx.NewStreamLag(client))
 	quarantine := cluster.NewQuarantine(client, nil)
 	manager := session.NewManager(&session.ManagerConfig{
 		Instance: cfg.Instance, Engine: waEngine, Leases: leases,
