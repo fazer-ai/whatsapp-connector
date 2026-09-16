@@ -14,6 +14,7 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/rs/zerolog"
 	wm "go.mau.fi/whatsmeow"
 	waBinary "go.mau.fi/whatsmeow/binary"
 	waTypes "go.mau.fi/whatsmeow/types"
@@ -898,6 +899,33 @@ func TestACommandForACallThisSessionNeverSawNamesWhatTheClientGave(t *testing.T)
 	}
 }
 
+// refusalOnlySession is a Session built by hand, holding only what the refusal path
+// reads, and deliberately without a store.
+//
+// `newTestSession` opens one, and under `WAC_TEST_DATABASE_URL` that drags `database/sql`
+// into whatever goroutine touches it. A pool is not bubble-safe: its channels get created
+// wherever the first use happens and its connections are handed back from elsewhere, so a
+// synctest bubble around a session built that way dies on "send on synctest channel from
+// outside bubble" as soon as the package runs against PostgreSQL. Announced as a group
+// call with groups off, `callOffered` decides the refusal and returns before it would
+// look anybody up, so none of that is needed here.
+func refusalOnlySession(t *testing.T) (*Session, *refusals) {
+	t.Helper()
+
+	watched := &refusals{}
+	session := &Session{
+		sid:      "sid-" + t.Name(),
+		ctx:      t.Context(),
+		log:      zerolog.Nop(),
+		callWait: callWriteTimeout,
+	}
+	session.setCallPolicy(true)
+	session.declineCall = func(_ context.Context, _ *wm.Client, caller waTypes.JID, callID string) error {
+		return watched.record(caller, callID)
+	}
+	return session, watched
+}
+
 // TestOneCallAnnouncedTwiceIsRefusedOnce fences the other half of the deduplication, which
 // the publishing test cannot reach: it runs with the policy off, so the gate in front of
 // the refusal is invisible to it.
@@ -907,18 +935,19 @@ func TestACommandForACallThisSessionNeverSawNamesWhatTheClientGave(t *testing.T)
 // what the ring exists to prevent and what nothing else here would notice.
 //
 // Under synctest, because the refusal is written from a goroutine `refuse` starts and the
-// question is whether a second one exists. `synctest.Wait` returns once every goroutine in
-// the bubble is durably blocked, so "no second refusal" becomes something the test knows.
-// Waiting a while and looking is the weaker version of this and is what AGENTS.md rules
-// out: it passes whenever the duplicate is merely slow.
+// question asked is whether a second one exists. `synctest.Wait` returns once every
+// goroutine in the bubble is durably blocked, so "there is no second refusal" is something
+// the test knows. Waiting a while and looking is the weaker version and is what AGENTS.md
+// rules out: it passes whenever the duplicate is merely slow.
 func TestOneCallAnnouncedTwiceIsRefusedOnce(t *testing.T) {
 	t.Parallel()
 
 	synctest.Test(t, func(t *testing.T) {
-		session, watched := callSession(t, true)
+		session, watched := refusalOnlySession(t)
 
-		session.handle(&waEvents.CallOffer{BasicCallMeta: callMeta("call-twice")})
-		session.handle(&waEvents.CallOfferNotice{BasicCallMeta: callMeta("call-twice"), Media: "video"})
+		meta := callMeta("call-twice")
+		session.callOffered(&meta, callMedia{}, true)
+		session.callOffered(&meta, callMedia{known: true, video: true}, true)
 
 		synctest.Wait()
 
