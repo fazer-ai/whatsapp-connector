@@ -222,14 +222,20 @@ func emissionOf(kind protocol.EventType) *engine.Emission {
 func TestEveryWriteToTheInboxIsMeasured(t *testing.T) {
 	t.Parallel()
 
-	doors := inboxDoors(t, ".")
+	// The package's own directory: the test runs there.
+	const pkg = "."
+
+	doors, scanned := inboxDoors(t, pkg)
 	// A fence that finds nothing passes everything. Renaming the field, moving the
 	// package, or pointing this at the wrong directory would each leave a green test
 	// asserting nothing whatsoever -- which is this fence's own bug one level up: the
-	// thing that went missing with no way left to announce itself.
+	// thing that went missing with no way left to announce itself. The count of files is
+	// in the message because it separates the two ways of finding nothing, and they have
+	// different causes: nothing to read, or nothing to measure in what was read.
 	if len(doors) == 0 {
-		t.Fatal("no writes to the inbox anywhere in the package: this fence is measuring " +
-			"nothing at all, whatever its result says")
+		t.Fatalf("scanned %d production file(s) in %q and found no write to an inbox in any "+
+			"of them: this fence is measuring nothing at all, whatever its result says",
+			scanned, pkg)
 	}
 	for _, found := range doors {
 		if found.reports {
@@ -264,7 +270,7 @@ type inboxDoor struct {
 // report when it did. Both were out of reach while two files were fenced and both come
 // into reach at twenty-four, so the check is now the thing it was approximating all
 // along -- the report is a statement of the same list the send belongs to.
-func inboxDoors(t *testing.T, dir string) []inboxDoor {
+func inboxDoors(t *testing.T, dir string) ([]inboxDoor, int) {
 	t.Helper()
 
 	entries, err := os.ReadDir(dir)
@@ -303,10 +309,7 @@ func inboxDoors(t *testing.T, dir string) []inboxDoor {
 			return true
 		})
 	}
-	if scanned == 0 {
-		t.Fatalf("no production files to scan in %q: a fence with nothing to read is not a fence", dir)
-	}
-	return doors
+	return doors, scanned
 }
 
 // doorsIn finds the sends written straight into a statement list, which is the shape a
