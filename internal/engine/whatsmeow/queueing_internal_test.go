@@ -547,6 +547,10 @@ func TestNoFunctionTakesTheInboxWithoutSayingWhy(t *testing.T) {
 			"nothing, so a green result below would mean nothing either", len(control))
 	}
 
+	// And it is still about this package's channel. Rename the type -- which an IDE does by
+	// touching identifiers and not the string here -- and every match silently stops
+	// happening, which reads exactly like the healthy zero above.
+	//
 	// One guard for both ways of reading nothing, because a directory with no files and a
 	// directory whose files declare no such type are the same failure with different
 	// causes, and the count in the message is what tells them apart. A second guard on the
