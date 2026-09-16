@@ -42,7 +42,7 @@ func TestTheResumeSweepBringsBackAnAccountNobodyIsRunning(t *testing.T) {
 	// And an account this instance is already running is not asked for again: the sweep
 	// is about accounts nobody has, and a connect offered to a live session would dial a
 	// socket that is already up.
-	if connector.manager.Resume("sid-1", false) {
+	if connector.manager.Resume("sid-1", store.Wants{}) {
 		t.Fatal("an account this instance is running was queued for a resume")
 	}
 }
@@ -230,7 +230,7 @@ func wantConnected(t *testing.T, container *store.Container, sid, phone string, 
 	if err := container.For(sid).Bind(t.Context(), jid); err != nil {
 		t.Fatalf("Bind: %v", err)
 	}
-	if err := container.For(sid).PutDesiredConnected(t.Context(), groups); err != nil {
+	if err := container.For(sid).PutDesiredConnected(t.Context(), store.Wants{Groups: groups}); err != nil {
 		t.Fatalf("PutDesiredConnected: %v", err)
 	}
 }

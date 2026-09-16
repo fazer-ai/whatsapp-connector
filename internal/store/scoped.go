@@ -155,11 +155,15 @@ func (s *Scoped) Availability(ctx context.Context) (state string, kept bool, err
 // two carries a subscription, and a single door would let a caller record a connection
 // without one -- which is the state this issue was, a session brought back deaf to the
 // groups its client asked for.
-func (s *Scoped) PutDesiredConnected(ctx context.Context, groups bool) error {
+//
+// What it carries is a struct and not a pair of bools, so that a switch added to the
+// connect is added here by name rather than by position: two flags that are both off by
+// default swap silently at a call site and compile.
+func (s *Scoped) PutDesiredConnected(ctx context.Context, wants Wants) error {
 	if err := s.fence.held(); err != nil {
 		return err
 	}
-	return s.container.putDesiredConnected(ctx, s.sid, groups, time.Now())
+	return s.container.putDesiredConnected(ctx, s.sid, wants, time.Now())
 }
 
 // PutDesiredDisconnected records that the client asked this session to stay down.

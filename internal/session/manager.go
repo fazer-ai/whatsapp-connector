@@ -14,6 +14,7 @@ import (
 	"github.com/fazer-ai/whatsapp-connector/internal/cluster"
 	"github.com/fazer-ai/whatsapp-connector/internal/engine"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
+	"github.com/fazer-ai/whatsapp-connector/internal/store"
 	"github.com/fazer-ai/whatsapp-connector/internal/transport"
 )
 
@@ -971,11 +972,11 @@ func (m *Manager) takeForDelete(ctx context.Context, delivery *transport.Deliver
 // own events -- and the one thing that differs is that nobody is waiting for it, which is
 // what `Internal` says.
 //
-// `groups` comes from the same record as the licence, and it is the only thing of the
-// client's request that is put back. The rest of a connect is not remembered on purpose:
+// What comes back with the account is what the desired row remembers: the group
+// subscription and the call policy. The rest of a connect is not remembered on purpose:
 // a stored payload replayed here could be a request this build refuses, and a resume that
 // synthesised a refused command would leave the account down and in the sweep's backoff.
-func (m *Manager) Resume(sid string, groups bool) bool {
+func (m *Manager) Resume(sid string, wants store.Wants) bool {
 	if sid == "" {
 		return false
 	}
@@ -990,7 +991,14 @@ func (m *Manager) Resume(sid string, groups bool) bool {
 	// Built from the type the session decodes rather than spelled out as a literal, so
 	// what this writes and what reads it cannot drift: they are the same struct, and a
 	// field renamed on one side stops compiling instead of quietly setting nothing.
-	payload, err := json.Marshal(engine.ConnectRequest{Pairing: "resume", Groups: groups})
+	request := engine.ConnectRequest{Pairing: "resume", Groups: wants.Groups}
+	if wants.CallAutoReject {
+		// Omitted rather than sent as `{auto_reject: false}`: a client that never asked
+		// about calls and one that asked for them to ring are the same request, and the
+		// contract spells the first as an absent object.
+		request.Calls = &engine.CallsRequest{AutoReject: true}
+	}
+	payload, err := json.Marshal(request)
 	if err != nil {
 		// A string and a bool with no marshaller of their own: unreachable. Refused
 		// rather than sent half-built, and the next sweep asks for this account again.

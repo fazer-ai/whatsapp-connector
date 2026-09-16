@@ -25,6 +25,7 @@ import (
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 	"github.com/fazer-ai/whatsapp-connector/internal/redisx"
 	"github.com/fazer-ai/whatsapp-connector/internal/session"
+	"github.com/fazer-ai/whatsapp-connector/internal/store"
 	"github.com/fazer-ai/whatsapp-connector/internal/transport"
 )
 
@@ -886,9 +887,9 @@ func TestAnAdoptionBeingCarriedOutIsNotCutShortByTheInstanceStopping(t *testing.
 	t.Cleanup(func() { _ = rdb.Close() })
 	client := redisx.Wrap(rdb, "wa:", 8)
 
-	store := &gatedEngine{entered: make(chan struct{}), gate: make(chan struct{})}
+	gated := &gatedEngine{entered: make(chan struct{}), gate: make(chan struct{})}
 	manager := session.NewManager(&session.ManagerConfig{
-		Instance: "inst-a", Engine: store, Leases: cluster.NewLeases(client, "inst-a", cluster.Options{}),
+		Instance: "inst-a", Engine: gated, Leases: cluster.NewLeases(client, "inst-a", cluster.Options{}),
 		Publisher: newRecorder(), Replier: &quietReplier{},
 		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
 	})
@@ -903,12 +904,12 @@ func TestAnAdoptionBeingCarriedOutIsNotCutShortByTheInstanceStopping(t *testing.
 		Release: func() {},
 	})
 
-	<-store.entered
+	<-gated.entered
 	stop()
-	close(store.gate)
+	close(gated.gate)
 	<-stopped
 
-	if !store.alive.Load() {
+	if !gated.alive.Load() {
 		t.Fatal("the adoption saw its context already cancelled, want it carried out to the end")
 	}
 }
@@ -2234,7 +2235,7 @@ func TestAResumeTakesASessionNobodyIsRunningAndConnectsIt(t *testing.T) {
 	t.Parallel()
 
 	h := newHarness(t)
-	if !h.manager.Resume("s1", false) {
+	if !h.manager.Resume("s1", store.Wants{}) {
 		t.Fatal("the resume was not even queued, so nothing will bring the account back")
 	}
 
@@ -2265,7 +2266,7 @@ func TestAResumeThatFailedIsNotReportedAsACommandNobodySent(t *testing.T) {
 	engineSession, _ := h.engine.Session("s1")
 	engineSession.FailConnect(errors.New("whatsapp refused the build"))
 
-	if !h.manager.Resume("s1", false) {
+	if !h.manager.Resume("s1", store.Wants{}) {
 		t.Fatal("the resume was not queued")
 	}
 	waitFor(t, "the resume to be attempted", func() bool { return engineSession.Connects() > 0 })
@@ -2314,7 +2315,7 @@ func TestAResumeThatFailedIsLeftAloneForAWhile(t *testing.T) {
 	engineSession, _ := h.engine.Session("s1")
 	engineSession.FailConnect(errors.New("whatsapp refused the build"))
 
-	if !h.manager.Resume("s1", false) {
+	if !h.manager.Resume("s1", store.Wants{}) {
 		t.Fatal("the resume was not queued")
 	}
 	waitFor(t, "the failure to be counted", func() bool {
@@ -3513,19 +3514,25 @@ func (b *syncBuffer) String() string {
 }
 
 // The connect a sweep synthesises is not a frame a client sent, so what it does not carry
-// is absent rather than defaulted. The subscription is the one thing of the original
-// request that has to travel with it: the engine reads it on every message, receipt,
-// presence and group notification, and a resume that dropped it brings the account back
-// acknowledging group traffic and publishing none of it (#190).
-func TestAResumeConnectsWithTheSubscriptionItsClientAskedFor(t *testing.T) {
+// is absent rather than defaulted. What has to travel with it is what the session reads
+// while it runs: the subscription, which the engine consults on every message, receipt,
+// presence and group notification (#190), and the call policy, which decides whether the
+// operator's phone rings (#219). A resume that dropped either brings the account back
+// doing the opposite of what its client asked for, with nothing saying so.
+func TestAResumeConnectsWithWhatItsClientAskedFor(t *testing.T) {
 	t.Parallel()
 
-	for _, wanted := range []bool{true, false} {
-		t.Run(fmt.Sprintf("groups=%v", wanted), func(t *testing.T) {
+	for name, wants := range map[string]store.Wants{
+		"nothing":             {},
+		"groups":              {Groups: true},
+		"auto-rejected calls": {CallAutoReject: true},
+		"both":                {Groups: true, CallAutoReject: true},
+	} {
+		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
 			h := newHarness(t)
-			if !h.manager.Resume("s1", wanted) {
+			if !h.manager.Resume("s1", wants) {
 				t.Fatal("the resume was not even queued, so nothing will bring the account back")
 			}
 			waitFor(t, "the session to be taken and connected", func() bool {
@@ -3538,15 +3545,34 @@ func TestAResumeConnectsWithTheSubscriptionItsClientAskedFor(t *testing.T) {
 			if !connected {
 				t.Fatal("the engine was never handed a connect at all")
 			}
-			// The whole request and not the two fields, which is the fence: a resume
-			// carries the mode and the subscription and nothing else on purpose. A
-			// connect refuses `history_sync`, `calls.auto_reject` and a proxy with a URL
+			// The whole request and not the fields it happens to set, which is the fence:
+			// a resume carries the mode and what the desired row remembers, and nothing
+			// else on purpose. A connect refuses `history_sync` and a proxy with a URL
 			// outright, so a resume that learned to replay more of a client's request
 			// could synthesise a command the session rejects -- and an account left on
 			// the floor in the sweep's backoff is worse off than the silence this fixes.
-			if want := (engine.ConnectRequest{Pairing: "resume", Groups: wanted}); asked != want {
-				t.Fatalf("the sweep synthesised %+v, want %+v", asked, want)
+			//
+			// Compared as the rendered command rather than field by field, because the
+			// request now holds a pointer and two equal requests are not `==`.
+			want := engine.ConnectRequest{Pairing: "resume", Groups: wants.Groups}
+			if wants.CallAutoReject {
+				want.Calls = &engine.CallsRequest{AutoReject: true}
+			}
+			if render(t, asked) != render(t, want) {
+				t.Fatalf("the sweep synthesised %s, want %s", render(t, asked), render(t, want))
 			}
 		})
 	}
+}
+
+// render is a connect as the bytes it travels as, so two of them can be compared without
+// comparing the pointers inside.
+func render(t *testing.T, request engine.ConnectRequest) string {
+	t.Helper()
+
+	rendered, err := json.Marshal(request)
+	if err != nil {
+		t.Fatalf("marshal the connect: %v", err)
+	}
+	return string(rendered)
 }

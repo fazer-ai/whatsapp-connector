@@ -175,6 +175,12 @@ type Session struct {
 	setJoinApproval func(context.Context, *wm.Client, waTypes.JID, bool) error
 	setAddMode      func(context.Context, *wm.Client, waTypes.JID, waTypes.GroupMemberAddMode) error
 	profilePicture  func(context.Context, *wm.Client, waTypes.JID, *wm.GetProfilePictureParams) (*waTypes.ProfilePictureInfo, error)
+	// declineCall is the one node a call ever makes this connector write, and both
+	// writers go through it: the command a client sends and the policy it set on the
+	// connect. A seam for the same reason as the group writes above -- a test can watch
+	// what was refused without a socket, which is the only way to assert that the policy
+	// fired at all.
+	declineCall func(context.Context, *wm.Client, waTypes.JID, string) error
 
 	// uploadWait bounds how long an outbound media message spends fetching its file and
 	// handing it to WhatsApp. A field for the same reason as the three above it.
@@ -445,6 +451,22 @@ type Session struct {
 	// inbound message.
 	groups bool
 
+	// autoRejectCalls is the last connect's `calls.auto_reject`. Guarded by mu, written
+	// by Connect and read by the handler for every call that arrives.
+	autoRejectCalls bool
+
+	// answered remembers which calls this session has already published an offer for.
+	// WhatsApp announces one call twice -- `offer` and `offer_notice` -- and the two
+	// arrive in either order, so without this a single call reaches the inbox as two.
+	// Guarded by mu, and bounded: a session that runs for weeks would otherwise keep a
+	// call id for every call the account has ever received.
+	answered ring
+
+	// callWait bounds the rejection nobody is waiting on: the one `calls.auto_reject`
+	// sends as the call arrives. Same shape and same limit as `presenceWait`, and the
+	// same #74 caveat about the socket lock it cannot reach past.
+	callWait time.Duration
+
 	// transition serialises a change to the socket's state with the event announcing
 	// it. It is not mu: emit can block on a full inbox, and holding the session's own
 	// lock across that would stop everything that reads state, Close included.
@@ -712,9 +734,21 @@ func newSession(
 		rerequestRetry: rerequestRetry,
 		presenceWrite:  make(chan struct{}, 1),
 		presenceWait:   presenceWriteTimeout,
+		callWait:       callWriteTimeout,
 		board:          make(map[string]posted),
 		downloadWait:   downloadTimeout,
 		uploadWait:     uploadTimeout,
+	}
+	s.declineCall = func(ctx context.Context, client *wm.Client, caller waTypes.JID, callID string) error {
+		if client == nil {
+			// The socket this would be written on is gone. Checked here rather than at
+			// the two call sites so that both get it, and so that a test swapping the
+			// seam is reached whether or not it built a client. whatsmeow's own sentinel
+			// rather than a coded error, so that the one classifier every command here
+			// shares is what turns it into a word the contract has.
+			return wm.ErrClientIsNil
+		}
+		return client.RejectCall(ctx, caller, callID) //nolint:wrapcheck // classified by callFailure, which needs the sentinels
 	}
 	s.setTopic = func(
 		ctx context.Context, client *wm.Client, group waTypes.JID, previous, revision, description string,
@@ -1111,6 +1145,31 @@ func (s *Session) wantsGroups() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.groups
+}
+
+func (s *Session) setCallPolicy(autoReject bool) {
+	s.mu.Lock()
+	s.autoRejectCalls = autoReject
+	s.mu.Unlock()
+}
+
+func (s *Session) rejectsCalls() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.autoRejectCalls
+}
+
+// firstSightOf reports whether this is the first time the session has been told about a
+// call, and records it either way.
+func (s *Session) firstSightOf(callID string) bool {
+	if callID == "" {
+		// Nothing to key on. Published rather than dropped: an offer without an id is
+		// still somebody ringing, and the client can at least show it.
+		return true
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.answered.add(callID)
 }
 
 // reportWindow tells the seam, if there is one, under the lock that guards it.
@@ -1612,15 +1671,10 @@ func (s *Session) Connect(ctx context.Context, req engine.ConnectRequest) error 
 		return protocol.NewError(protocol.ErrorUnsupported,
 			"this connector does not route a session through a proxy yet")
 	}
-	// Same rule as the proxy, and for the same reason: these ask the connector to do
+	// Same rule as the proxy, and for the same reason: this asks the connector to do
 	// something, and a build that does not do it answers `open` to a client that will
-	// then wait for a call to be refused, or for a backlog to arrive, and never find out
-	// it was never going to happen. `groups` is not on this list because it is honoured
-	// now that there is conversation traffic to leave out.
-	if req.Calls != nil && req.Calls.AutoReject {
-		return protocol.NewError(protocol.ErrorUnsupported,
-			"this connector does not answer incoming calls yet")
-	}
+	// then wait for a backlog to arrive and never find out it was never going to happen.
+	// `groups` and `calls` are not on this list because they are honoured.
 	if req.HistorySync {
 		return protocol.NewError(protocol.ErrorUnsupported,
 			"this connector does not import the phone's history yet")
@@ -1667,6 +1721,7 @@ func (s *Session) Connect(ctx context.Context, req engine.ConnectRequest) error 
 	// underneath it would go on acknowledging and dropping group messages until the
 	// next connect that happened to succeed.
 	s.setGroups(req.Groups)
+	s.setCallPolicy(req.Calls != nil && req.Calls.AutoReject)
 
 	// Recorded at the same point and for the same reason: this is where the request stops
 	// being one the session might refuse. It is what makes the account survive the
@@ -1683,7 +1738,9 @@ func (s *Session) Connect(ctx context.Context, req engine.ConnectRequest) error 
 	// happening; a memory that could not be written is a session that will not be brought
 	// back by itself later, which is worse than it was but not a reason to refuse what is
 	// working now. The next connect writes it again.
-	if err := s.store.PutDesiredConnected(ctx, req.Groups); err != nil {
+	if err := s.store.PutDesiredConnected(ctx, store.Wants{
+		Groups: req.Groups, CallAutoReject: req.Calls != nil && req.Calls.AutoReject,
+	}); err != nil {
 		s.log.Warn().Err(err).Str("sid", s.sid).
 			Msg("could not record that this session should be connected; it will not be resumed on its own")
 	}
@@ -3065,6 +3122,8 @@ func (s *Session) Execute(ctx context.Context, command *protocol.Command) (json.
 		return s.resolveContact(ctx, command)
 	case protocol.CommandMessageMarkUnread:
 		return s.markUnread(ctx, command)
+	case protocol.CommandCallReject:
+		return s.rejectCall(ctx, command)
 	case protocol.CommandGroupLeave, protocol.CommandGroupPhotoSet, protocol.CommandGroupNameSet,
 		protocol.CommandGroupDescriptionSet, protocol.CommandGroupSettingsSet,
 		protocol.CommandGroupInviteGet, protocol.CommandGroupJoinRequestsList,
@@ -4133,6 +4192,16 @@ func (s *Session) handle(rawEvent any) bool {
 		return s.chatPresence(event)
 	case *waEvents.Presence:
 		return s.presence(event)
+	case *waEvents.CallOffer:
+		// Published and acknowledged whatever happens, like a presence and unlike a
+		// message: a call rings for as long as the caller waits and WhatsApp does not
+		// redeliver the offer, so withholding the acknowledgement buys nothing and
+		// leaves the node unacknowledged for a call that has long since ended.
+		return s.callOffered(&event.BasicCallMeta, callMedia{})
+	case *waEvents.CallOfferNotice:
+		return s.callOffered(&event.BasicCallMeta, callMedia{known: true, video: event.Media == "video"})
+	case *waEvents.CallTerminate:
+		return s.callEnded(event)
 	case *waEvents.MediaRetry:
 		// A sender's phone answering a request this connector made for a file WhatsApp
 		// had dropped. Handed to the command waiting for it, which is the only thing

@@ -202,9 +202,10 @@ type ConnectRequest struct {
 }
 
 // CallsRequest is what a session asks the connector to do about incoming calls.
-// Honouring it is M3.
 type CallsRequest struct {
 	// AutoReject has the connector refuse an incoming call rather than let it ring.
+	// The call is still published either way: a client whose policy is to refuse still
+	// wants to know somebody rang, which is the whole reason the event reaches an inbox.
 	AutoReject bool `json:"auto_reject,omitempty"`
 }
 

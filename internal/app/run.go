@@ -563,9 +563,9 @@ func (c *Connector) resumeOnce(ctx context.Context) {
 	// What each client asked to receive, kept beside the list because everything between
 	// here and the resume speaks in session ids alone: the leases and the backoff are
 	// asked about a set of accounts, not about what any of them subscribed to.
-	subscription := make(map[string]bool, len(wanted))
+	subscription := make(map[string]store.Wants, len(wanted))
 	for _, session := range wanted {
-		subscription[session.SID] = session.Groups
+		subscription[session.SID] = session.Wants
 		if !slices.Contains(running, session.SID) {
 			candidates = append(candidates, session.SID)
 		}
