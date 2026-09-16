@@ -614,6 +614,9 @@ type Session struct {
 	// closing is what the engine wants told when this session ends, so a session that
 	// is over stops being something the engine hands out or holds on to.
 	closing func()
+	// queueing is told how long an emission waited for room in the inbox. Nil is
+	// nobody watching, which is every test that is not about this.
+	queueing Queueing
 }
 
 // pairingRun is one pairing conversation.
@@ -633,7 +636,7 @@ type pairingRun struct {
 //nolint:gocritic // zerolog.Logger is designed to be copied; every With() returns one by value
 func newSession(
 	ctx context.Context, sid string, client *wm.Client, scoped *store.Scoped,
-	blobs MediaOptions, log zerolog.Logger, wa waLog.Logger,
+	blobs MediaOptions, queueing Queueing, log zerolog.Logger, wa waLog.Logger,
 ) *Session {
 	lifetime, cancel := context.WithCancel(context.Background())
 	s := &Session{
@@ -645,6 +648,7 @@ func newSession(
 		inbox:      make(chan pending, inboxDepth),
 		events:     make(chan engine.Emission),
 		done:       make(chan struct{}),
+		queueing:   queueing,
 		ctx:        lifetime,
 		cancel:     cancel,
 		detach:     func(client *wm.Client, id uint32) { client.RemoveEventHandler(id) },
@@ -3661,10 +3665,13 @@ func (s *Session) post(key string, eventType protocol.EventType, payload any, li
 	// so a count of what has been queued is a guess. The older marker resolves to nothing
 	// when its turn comes, which costs a slot in the queue and buys the one thing the
 	// marker exists for -- a state published where it happened, and not earlier.
+	depth := len(s.inbox)
 	select {
 	case s.inbox <- pending{key: key, seq: entry.seq}:
 		s.board[key] = entry
+		s.queued(0, depth)
 	default:
+		s.noRoom(eventType)
 		// The queue presence shares with the messages is full, which is a publisher that
 		// has stopped answering while 256 messages piled up behind it. Presence waits for
 		// nothing, so this is dropped -- and whatever the chat had before is left where it
@@ -3749,13 +3756,16 @@ func (s *Session) settled(key string, seq int64) func(error) {
 			return
 		}
 		entry.retried, entry.sent = true, false
+		depth := len(s.inbox)
 		select {
 		case s.inbox <- pending{key: key, seq: entry.seq}:
 			s.board[key] = entry
+			s.queued(0, depth)
 			s.log.Debug().Str("type", string(entry.emission.Type)).
 				Msg("giving a presence another go after a publish that failed")
 		default:
 			delete(s.board, key)
+			s.noRoom(entry.emission.Type)
 			s.log.Debug().Str("type", string(entry.emission.Type)).
 				Msg("dropping a presence the inbox had no room to try again for")
 		}
@@ -3797,10 +3807,57 @@ func (s *Session) emitting(emission *engine.Emission, payload any) {
 	if emission.At == 0 {
 		emission.At = s.learned()
 	}
+	// Read before the first attempt, and reported by all three paths below, because what
+	// the metric promises is the depth this emission ARRIVED at. Read after a successful
+	// send it would count this emission itself; read after a blocked one it would report
+	// what the pump had already drained while we waited, which is lowest exactly when the
+	// pressure that made us wait was highest.
+	depth := len(s.inbox)
+
+	// Offered without waiting first, because the inbox has room almost every time and
+	// this path runs on whatsmeow's dispatch goroutine: the fast case must not pay for
+	// a clock reading, and the slow case is the only one worth a number.
+	waiting := pending{event: *emission}
 	select {
-	case s.inbox <- pending{event: *emission}:
-	case <-s.done:
+	case s.inbox <- waiting:
+		s.queued(0, depth)
+		return
+	default:
 	}
+
+	// Here the inbox is full, which is the stall #221 is about: this send is now
+	// holding the goroutine whatsmeow dispatched from, and nothing else this account
+	// sends is handled until the publisher moves. The wait is not bounded here on
+	// purpose -- bounding it would change which events may be dropped, and that is
+	// invariant 4's business, not this measurement's.
+	began := time.Now()
+	select {
+	case s.inbox <- waiting:
+		s.queued(time.Since(began), depth)
+	case <-s.done:
+		s.queued(time.Since(began), depth)
+	}
+}
+
+// queued reports one emission's wait, and does nothing when nobody is watching.
+//
+// Called from every place that puts something in the inbox, not only from `emitting`.
+// The depth this reports is the one the instrument promises -- how full the queue was
+// when something arrived -- and a reading taken at one of four doors describes the
+// traffic through that door rather than the queue.
+func (s *Session) queued(waited time.Duration, depth int) {
+	if s.queueing == nil {
+		return
+	}
+	s.queueing.Emitted(waited, depth)
+}
+
+// noRoom reports an emission the inbox had no room for, which nothing else records.
+func (s *Session) noRoom(eventType protocol.EventType) {
+	if s.queueing == nil {
+		return
+	}
+	s.queueing.Dropped(eventType)
 }
 
 // readPairing publishes the QR codes and the outcome of the pairing.

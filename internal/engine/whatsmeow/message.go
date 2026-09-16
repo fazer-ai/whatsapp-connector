@@ -667,9 +667,21 @@ func (s *Session) deliverUnless(eventType protocol.EventType, payload any, learn
 	// which is the state the bound exists to keep whatsmeow out of.
 	timeout := time.NewTimer(s.deliverWait)
 	defer timeout.Stop()
+	// Measured here as well as in `emitting`, and that is the point of measuring at all:
+	// this is the door most of the traffic comes through. An instrument on one of the
+	// four ways into the inbox describes that door and not the queue, which is how the
+	// backpressure it exists to reveal would have stayed invisible on the path that
+	// carries the messages (#221).
+	depth := len(s.inbox)
+	began := time.Now()
 	select {
 	case s.inbox <- pending{event: emission}:
+		s.queued(time.Since(began), depth)
 	case <-timeout.C:
+		// The bound ran out with the inbox still full. The acknowledgement is withheld,
+		// so WhatsApp will send this again -- invariant 4 paying a redelivery rather than
+		// a message -- but nothing else records that it happened.
+		s.noRoom(eventType)
 		s.log.Warn().Str("type", string(eventType)).Dur("waited", s.deliverWait).
 			Msg("withholding an acknowledgement for an event that could not be queued")
 		return false

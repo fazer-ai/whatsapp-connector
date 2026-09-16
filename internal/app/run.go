@@ -145,7 +145,16 @@ func New(cfg *Config, log zerolog.Logger) (connector *Connector, err error) {
 	// it has been told so.
 	leases := cluster.NewLeases(client, cfg.Instance, cluster.Options{TTL: cfg.LeaseTTL})
 
-	waEngine, devices, err := newEngine(startupCtx, cfg, leases.Owns, mediaOpts, log)
+	// Built before the engine, which is the one thing here that takes a metric rather
+	// than being read by one: the engine reports how long its emissions queued, and
+	// there was no route from that package to this set until now (#221, #226).
+	metrics := observability.New()
+	// Registered here rather than inside observability.New, because the value it reports
+	// lives in Redis and that package deliberately knows about nothing but Prometheus.
+	metrics.Registry.MustRegister(redisx.NewStreamLag(client))
+
+	waEngine, devices, err := newEngine(
+		startupCtx, cfg, leases.Owns, mediaOpts, queueingInto(metrics), log)
 	if err != nil {
 		return nil, err
 	}
@@ -155,14 +164,12 @@ func New(cfg *Config, log zerolog.Logger) (connector *Connector, err error) {
 		return nil, err
 	}
 
-	metrics := observability.New()
-	// Registered here rather than inside observability.New, because the value it reports
-	// lives in Redis and that package deliberately knows about nothing but Prometheus.
-	metrics.Registry.MustRegister(redisx.NewStreamLag(client))
 	quarantine := cluster.NewQuarantine(client, nil)
 	manager := session.NewManager(&session.ManagerConfig{
 		Instance: cfg.Instance, Engine: waEngine, Leases: leases,
-		Publisher: streams, Replier: streams, Ledger: redisx.NewIdempotency(client, 0),
+		Publisher: countingPublisher{to: streams, metrics: metrics}, Replier: streams,
+		Ledger:     redisx.NewIdempotency(client, 0),
+		Watch:      watching{metrics: metrics},
 		Quarantine: quarantine,
 		NewID:      newFrameID, Logger: log,
 	})
@@ -1025,7 +1032,8 @@ func (c *Connector) shutdown() {
 //
 //nolint:gocritic // zerolog.Logger is designed to be copied; every With() returns one by value
 func newEngine(
-	ctx context.Context, cfg *Config, owned store.Ownership, blobs meow.MediaOptions, log zerolog.Logger,
+	ctx context.Context, cfg *Config, owned store.Ownership, blobs meow.MediaOptions,
+	queueing meow.Queueing, log zerolog.Logger,
 ) (engine.Engine, *store.Container, error) {
 	switch cfg.Engine {
 	case EngineFake:
@@ -1036,7 +1044,8 @@ func newEngine(
 		if err != nil {
 			return nil, nil, err
 		}
-		waEngine, err := meow.New(devices, meow.Options{DeviceName: cfg.DeviceName, Media: blobs}, log)
+		waEngine, err := meow.New(devices,
+			meow.Options{DeviceName: cfg.DeviceName, Media: blobs, Queueing: queueing}, log)
 		if err != nil {
 			// The container is this function's until it is handed over, and an engine
 			// that refused to be built never took it.
@@ -1069,3 +1078,80 @@ func Hostname() string {
 	}
 	return name
 }
+
+// queueing reports the engine's back pressure into the metric set.
+//
+// The adapter lives here and not in the engine because `internal/engine/whatsmeow` has
+// no business knowing what Prometheus is, and not in `internal/observability` because
+// that package deliberately knows about nothing else. It is three lines, and the shape
+// of those three lines is the route whose absence left #221 unmeasurable and three of
+// the six metrics in #226 registered and counting nothing.
+type queueing struct{ metrics *observability.Metrics }
+
+func queueingInto(metrics *observability.Metrics) meow.Queueing {
+	return queueing{metrics: metrics}
+}
+
+func (q queueing) Emitted(waited time.Duration, depth int) {
+	q.metrics.EmissionWait.Observe(waited.Seconds())
+	q.metrics.InboxDepth.Observe(float64(depth))
+}
+
+func (q queueing) Dropped(eventType protocol.EventType) {
+	q.metrics.EmissionsDropped.WithLabelValues(string(eventType)).Inc()
+}
+
+// countingPublisher counts what actually reached the client, by event type.
+//
+// A wrapper and not a line inside the session, because the count this metric promises is
+// "published", and the only place that is known is the far side of the call that
+// publishes. Counted after the error check for the same reason: an event the stream
+// refused is not an event the client got, and counting it would make the one number that
+// could tell an incident "arriving and not published" from "not arriving" answer the
+// wrong one -- which is the failure #226 describes, in a build where it had no writer at
+// all.
+type countingPublisher struct {
+	to      transport.Publisher
+	metrics *observability.Metrics
+}
+
+func (c countingPublisher) Publish(ctx context.Context, event *protocol.Event) error {
+	if err := c.to.Publish(ctx, event); err != nil {
+		return err
+	}
+	c.metrics.EventsPublished.WithLabelValues(string(event.Type)).Inc()
+	return nil
+}
+
+// watching reports what the session layer measured into the metric set.
+//
+// Same shape and same reason as `queueing` above: the adapter is here because this is
+// where the registry is, and `internal/session` has no business knowing what Prometheus
+// is. Between the two of them they are the route whose absence left three metrics
+// registered and never written (#226).
+type watching struct{ metrics *observability.Metrics }
+
+func (w watching) CommandDone(kind protocol.CommandType, outcome string, took time.Duration) {
+	w.metrics.CommandDuration.WithLabelValues(commandLabel(kind), outcome).Observe(took.Seconds())
+}
+
+// commandLabel keeps the type label inside the contract's own list.
+//
+// `ParseCommand` does not check the type against anything -- a command this build has no
+// handler for is refused later, by name -- so the string on a frame is whatever the client
+// wrote. Straight into a label that is a series per distinct value, kept for the life of
+// the process: one malformed frame per new name is enough to grow this connector's memory
+// and its Prometheus series without bound, and the commands do not even have to succeed.
+//
+// The other two labels this build uses do not have the problem and were checked rather
+// than assumed: `EventsPublished` and `EmissionsDropped` are both event types this
+// connector chose itself, and `outcome` is a contract error code, which unknown values
+// already degrade to `internal` before they arrive here.
+func commandLabel(kind protocol.CommandType) string {
+	if !kind.Valid() {
+		return "unknown"
+	}
+	return string(kind)
+}
+
+func (w watching) LeaseLost() { w.metrics.LeasesLost.Inc() }

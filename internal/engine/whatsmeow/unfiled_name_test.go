@@ -402,7 +402,7 @@ func (l *liveStore) session(t *testing.T, sid, phone, lid string) (*Session, *wm
 	if l.wrap != nil {
 		client.Store.Contacts = l.wrap(client.Store.Contacts)
 	}
-	session := newSession(t.Context(), sid, client, scoped, MediaOptions{}, zerolog.Nop(), newLibraryLogger(zerolog.Nop(), sid))
+	session := newSession(t.Context(), sid, client, scoped, MediaOptions{}, nil, zerolog.Nop(), newLibraryLogger(zerolog.Nop(), sid))
 	t.Cleanup(func() { _ = session.Close() })
 	return session, client
 }

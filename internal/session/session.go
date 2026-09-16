@@ -33,11 +33,12 @@ type Session struct {
 	publisher transport.Publisher
 	replier   transport.Replier
 	ledger    Ledger
+	watch     Watch
 	newID     IDFunc
 	now       func() time.Time
 	log       zerolog.Logger
 
-	commands chan *transport.Delivery
+	commands chan queued
 
 	// seq is written by the pump goroutine alone, which is what keeps it monotonic
 	// without a lock: two writers would have to agree on an order to be ordered, and
@@ -121,6 +122,7 @@ type Config struct {
 	Engine    engine.Session
 	Publisher transport.Publisher
 	Replier   transport.Replier
+	Watch     Watch
 	Ledger    Ledger
 	NewID     IDFunc
 	Now       func() time.Time
@@ -178,6 +180,7 @@ func New(ctx context.Context, cfg *Config) *Session {
 		engine:    cfg.Engine,
 		publisher: cfg.Publisher,
 		ledger:    cfg.Ledger,
+		watch:     cfg.Watch,
 		replier:   cfg.Replier,
 		newID:     cfg.NewID,
 		undrained: cfg.Undrained,
@@ -186,7 +189,7 @@ func New(ctx context.Context, cfg *Config) *Session {
 		retryIn:   cfg.RetireRetry,
 		now:       cfg.Now,
 		log:       cfg.Logger.With().Str("sid", cfg.Lease.SID).Uint64("epoch", cfg.Lease.Epoch).Logger(),
-		commands:  make(chan *transport.Delivery, cfg.QueueDepth),
+		commands:  make(chan queued, cfg.QueueDepth),
 		stop:      cancel,
 		done:      make(chan struct{}),
 	}
@@ -248,7 +251,12 @@ func (s *Session) Offer(delivery *transport.Delivery) Offer {
 		return OfferStopped
 	}
 	select {
-	case s.commands <- delivery:
+	// Stamped on the way in, not on the way out. The wait in this queue is the caller's
+	// wait, and a timer started where the work starts reports a command that spent a
+	// minute behind a backlog as having taken a millisecond. It is also the instant the
+	// manager stamps for the commands it answers itself, so the two halves of the same
+	// histogram measure the same span.
+	case s.commands <- queued{delivery: delivery, at: s.now()}:
 		return OfferAccepted
 	default:
 		return OfferBusy
@@ -268,9 +276,9 @@ func (s *Session) abandonQueue() {
 
 	for {
 		select {
-		case delivery := <-s.commands:
-			if delivery.Release != nil {
-				delivery.Release()
+		case waiting := <-s.commands:
+			if waiting.delivery.Release != nil {
+				waiting.delivery.Release()
 			}
 		default:
 			return
@@ -701,6 +709,34 @@ func (s *Session) abandonPending(events <-chan engine.Emission) {
 	}
 }
 
+// Watch is what this layer reports its own work to, so a package that has no business
+// knowing what Prometheus is can still be measured. Nil is nobody watching, which is
+// what every test that is not about the numbers passes.
+//
+// It exists because the absence of it was the defect: three metrics were registered and
+// never written because the packages that know those numbers had no way to reach the
+// metric set (#226).
+type Watch interface {
+	// CommandDone is one command carried out, from being picked up to being answered.
+	// `outcome` is "ok" or the contract error code it failed with, so a latency that
+	// only got bad for refusals is separable from one that got bad for everything.
+	CommandDone(kind protocol.CommandType, outcome string, took time.Duration)
+	// LeaseLost is one session whose lease this instance no longer holds. Counted
+	// where the loss is acted on, not where it is discovered, so it counts sessions
+	// actually stopped rather than renewal attempts that came back unlucky.
+	LeaseLost()
+}
+
+// queued is one command waiting its turn, with the instant this instance took it on.
+//
+// The instant travels with the delivery because the queue is where a caller's time
+// actually goes: a session with a backlog answers the command in front of it first, and
+// a latency measured from the far side of that queue reports the wait as nothing.
+type queued struct {
+	delivery *transport.Delivery
+	at       time.Time
+}
+
 // Ledger remembers what a command did, so a redelivery is answered with the first
 // run's result instead of carrying it out a second time. Invariant 5 in AGENTS.md is
 // this and nothing else.
@@ -745,7 +781,8 @@ func (s *Session) execute(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case delivery := <-s.commands:
+		case waiting := <-s.commands:
+			delivery := waiting.delivery
 			if !s.admit() {
 				// Queued before the engine finished with the session, which `Offer` can
 				// no longer refuse because it was already taken. Carried out, a connect
@@ -755,23 +792,36 @@ func (s *Session) execute(ctx context.Context) {
 				release(delivery)
 				continue
 			}
-			s.run(ctx, delivery)
+			s.run(ctx, waiting)
 			s.doneWith()
 		}
 	}
 }
 
-func (s *Session) run(ctx context.Context, delivery *transport.Delivery) {
+func (s *Session) run(ctx context.Context, waiting queued) {
+	delivery := waiting.delivery
 	command := delivery.Command
 	log := s.log.With().Str("cmd_id", command.ID).Str("type", string(command.Type)).Logger()
 
+	began := waiting.at
+	handedBack := false
 	result, err := s.carryOut(ctx, &command)
+	// Reported for the two endings that answer the caller, and not for the two below
+	// that hand the command back: a command given back has not been carried out, and
+	// timing it would put this instance's abandoned turn into the latency of a command
+	// somebody else is about to run properly.
+	defer func() {
+		if !handedBack {
+			s.reportCommand(&command, began, err)
+		}
+	}()
 	if errors.Is(err, errUnknownWhetherItRan) {
 		// Neither answered nor retired: nobody knows whether this already ran, and both of
 		// the other choices are wrong. Handed back so whoever claims it next can ask again
 		// once the record is readable.
 		log.Warn().Err(err).Msg("gave a command back rather than risk carrying it out twice")
 		forfeit(delivery)
+		handedBack = true
 		return
 	}
 	if err != nil && ctx.Err() != nil {
@@ -786,6 +836,7 @@ func (s *Session) run(ctx context.Context, delivery *transport.Delivery) {
 		// discards rather than a message nobody ever hears about again.
 		log.Warn().Err(err).Msg("gave a command back after the session ended under it")
 		forfeit(delivery)
+		handedBack = true
 		return
 	}
 	// The answer and the acknowledgement both go out detached from the session's
@@ -1199,4 +1250,20 @@ func mustMarshal(payload any) json.RawMessage {
 		panic(fmt.Sprintf("session: marshal: %v", err))
 	}
 	return body
+}
+
+// reportCommand hands one finished command to whoever is measuring.
+//
+// The outcome is the contract's own error code rather than a bare "error", because the
+// question an operator actually asks is which kind of failure got slower, and `internal`
+// and `not_connected` are not the same incident.
+func (s *Session) reportCommand(command *protocol.Command, began time.Time, err error) {
+	if s.watch == nil {
+		return
+	}
+	outcome := "ok"
+	if err != nil {
+		outcome = string(asProtocolError(err).Code)
+	}
+	s.watch.CommandDone(command.Type, outcome, s.now().Sub(began))
 }

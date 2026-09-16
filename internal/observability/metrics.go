@@ -31,6 +31,23 @@ type Metrics struct {
 	// no success, which is `time() - this`, and it is the only signal an instance that is
 	// silently not serving gives off at all.
 	CommandReadLastSuccess prometheus.Gauge
+	// EmissionWait is how long an event waited for room in its session's inbox.
+	//
+	// Zero almost always, and the tail is the whole point: the wait happens on
+	// whatsmeow's dispatch goroutine, so an emission that waits is an account whose
+	// other traffic is not being handled meanwhile (#221). Buckets reach far past a
+	// second because the question is how bad the tail gets, not whether the median is
+	// fast.
+	EmissionWait prometheus.Histogram
+	// InboxDepth is how full a session's inbox was when an emission arrived. The
+	// ceiling is 256, and a distribution pressed against it is a fleet about to start
+	// waiting.
+	InboxDepth prometheus.Histogram
+	// EmissionsDropped counts events the inbox had no room for and whose caller chose
+	// not to wait. Presence does that by design and an inbound delivery does it once
+	// its bound runs out; the client is never told either way, so this is the only
+	// place the loss shows up at all.
+	EmissionsDropped *prometheus.CounterVec
 }
 
 // New builds the metric set and registers it.
@@ -63,10 +80,24 @@ func New() *Metrics {
 			Name: "wac_command_read_last_success_timestamp_seconds",
 			Help: "When this instance last read commands without an error.",
 		}),
+		EmissionWait: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "wac_emission_wait_seconds",
+			Help:    "Time an event waited for room in its session's inbox before the pump took it.",
+			Buckets: []float64{.001, .01, .1, .5, 1, 5, 15, 60},
+		}),
+		EmissionsDropped: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "wac_emissions_dropped_total",
+			Help: "Events the session inbox had no room for, by event type.",
+		}, []string{"type"}),
+		InboxDepth: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "wac_session_inbox_depth",
+			Help:    "How full a session's inbox was when an emission arrived, out of 256.",
+			Buckets: []float64{1, 8, 32, 64, 128, 192, 240, 256},
+		}),
 	}
 	registry.MustRegister(
 		m.SessionsRunning, m.EventsPublished, m.CommandDuration, m.LeasesLost,
-		m.CommandReadsFailed, m.CommandReadLastSuccess,
+		m.CommandReadsFailed, m.CommandReadLastSuccess, m.EmissionWait, m.InboxDepth, m.EmissionsDropped,
 	)
 	return m
 }
