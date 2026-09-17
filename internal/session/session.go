@@ -573,23 +573,36 @@ func (s *Session) leaving() bool {
 // refused before it ran: nothing about the engine ended, so that session was never
 // retired and `claim` would always say no. What has to be true is the same in spirit --
 // nothing is running and the door is not already shut -- with one clause `claim` has no
-// use for: nothing may be *waiting* either. A command on the queue is somebody who wants
-// this account, and it arrived after the count the manager took, so the queue is the only
-// place it shows.
+// use for: nothing may be *waiting* either, and the count the caller decided on has to
+// still be the count. A command on the queue is somebody who wants this account, and one
+// that was answered between the caller's look and this one leaves no trace in `running` or
+// in the queue at all -- it is finished -- so the count is the only place it shows.
 //
-// That last clause is the one mutant this branch's battery could not kill, and it is kept
-// rather than dropped. It is reachable: commands are dispatched on the reader's goroutine
-// while this runs on the heartbeat, so a delivery can sit in the channel with the executor
-// not yet having picked it up. It is not forceable from a test, because nothing can hold
-// the executor between `Offer` returning and `admit` counting the command -- which is
-// exactly the window. Dropping it would not lose the command, `abandonQueue` releases what
-// is waiting and it comes back pending, so what the clause buys is a client's command not
-// taking a claim delay on the way to an account this instance was about to keep for it.
-func (s *Session) claimIdle() bool {
+// The queue clause cannot be reached through a running session, and is asked about
+// directly instead of argued for: every seam this package has for holding an executor --
+// `Hold`, `HoldUntilCanceled`, `OnDelete` -- blocks inside `Execute`, which is past the
+// point where the command has been counted and `running` is above zero, and nothing runs
+// between `Offer` putting a delivery in the channel and the executor taking it out. So the
+// predicate has a test of its own, on a session built by hand with no executor to race.
+//
+// Dropping the clause would not lose the command: `abandonQueue` releases what is waiting
+// and it comes back pending. What it buys is a client's command not taking a claim delay
+// on the way to an account this instance was about to keep for it, and a teardown still on
+// the queue not being handed back to the fleet that just adopted the account for it.
+func (s *Session) claimIdle(carried int64) bool {
 	s.queueMu.Lock()
 	defer s.queueMu.Unlock()
 
 	if s.stopping || s.shutFor != 0 || s.running > 0 || len(s.commands) > 0 {
+		return false
+	}
+	// Asked here and not only by the caller, and this is the clause that makes the other
+	// three safe rather than nearly safe. The count is read by the heartbeat a step
+	// earlier, and a command can be answered in between: it leaves nothing running and
+	// nothing queued, so every other clause says yes about a session that has just told a
+	// client its connect worked. Under the same lock as the door, the count cannot move
+	// between the question and the answer.
+	if s.carried.Load() != carried {
 		return false
 	}
 	s.stopping = true

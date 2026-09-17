@@ -264,8 +264,13 @@ func TestALateTeardownDeliveredAgainDoesNotPileUpAdoptions(t *testing.T) {
 		if reply := h.answered(t, id); reply.OK || refusalCode(reply) != protocol.ErrorExpired {
 			t.Fatalf("delivery %d: got ok=%v code=%q", round, reply.OK, refusalCode(reply))
 		}
-		h.heartbeat(t)
 	}
+	// One tick, after all five, and deliberately not one between each: the hand-back waits
+	// for a tick, so deliveries two to five land on the session the first one adopted and
+	// are handed to its executor directly. A licence that counted commands rather than
+	// refused teardowns would read those repeats as an account somebody came to want, and
+	// this account would then never go back.
+	h.heartbeat(t)
 
 	if acked.Load() != 5 || released.Load() != 0 || forfeited.Load() != 0 {
 		t.Fatalf("a late teardown was left pending: acked=%d released=%d forfeited=%d, want 5/0/0; pending it comes back on its own and the loop never ends",
@@ -460,5 +465,68 @@ func TestATeardownAdoptedForAndRefusedByTheEngineKeepsTheAccount(t *testing.T) {
 	}
 	if _, owned := h.leases.Owned(sid); !owned {
 		t.Fatal("the lease went back after an attempted teardown failed, so the retry has to win it again")
+	}
+}
+
+// TestAHandBackThatCouldNotRunIsTriedAgain is the other half of keeping the registration.
+//
+// Nothing else will ever look at this session: it is not retired, so no sweep lists it,
+// and its lease is renewed for as long as the instance lives. A tick that found it busy,
+// or found an adoption in the way, or ran out of window, has to leave it on the list, or
+// the one thing that would have given the account back has forgotten it.
+func TestAHandBackThatCouldNotRunIsTriedAgain(t *testing.T) {
+	t.Parallel()
+	h := newTeardownHarness(t)
+	const sid = "sess-249-retry"
+
+	h.manager.Dispatch(teardown(sid, "cmd-retry", time.Now().Add(-time.Minute)))
+	if reply := h.answered(t, "cmd-retry"); refusalCode(reply) != protocol.ErrorExpired {
+		t.Fatalf("given: got %q, want the late refusal", refusalCode(reply))
+	}
+	adopted, ok := h.engine.Session(sid)
+	if !ok {
+		t.Fatal("given: no engine session for the adopted account")
+	}
+
+	// Busy for the whole of the first tick, so the claim is refused for a reason that is
+	// gone by the second.
+	release := adopted.Hold()
+	busy := &transport.Delivery{
+		Command: protocol.Command{
+			V: protocol.Version, Type: protocol.CommandSessionStatus, SID: sid, ID: "cmd-retry-status",
+			ReplyTo: "wa:reply:cmd-retry-status",
+		},
+		Ack: func(context.Context) error { return nil },
+	}
+	h.manager.Dispatch(busy)
+	waitFor(t, "the held command to reach the engine", func() bool { return len(adopted.Commands()) > 0 })
+	h.heartbeat(t)
+	if h.manager.Count() != 1 {
+		t.Fatal("given: the account was handed back while a command was running on it")
+	}
+	release()
+	if reply := h.answered(t, "cmd-retry-status"); !reply.OK {
+		t.Fatalf("given: the held command failed: %+v", reply.Error)
+	}
+
+	// And now a command has been carried out on it, which is what cancels the hand-back:
+	// the account is one a client is talking to. The registration must be gone rather than
+	// retried forever.
+	h.heartbeat(t)
+	if h.manager.Count() != 1 {
+		t.Fatal("an account was handed back although a command had been served on it since the refusal")
+	}
+
+	// A second late teardown re-arms it, and this time nothing is in the way.
+	h.manager.Dispatch(teardown(sid, "cmd-retry-2", time.Now().Add(-time.Minute)))
+	if reply := h.answered(t, "cmd-retry-2"); refusalCode(reply) != protocol.ErrorExpired {
+		t.Fatalf("got %q, want the late refusal", refusalCode(reply))
+	}
+	h.heartbeat(t)
+	if h.manager.Count() != 0 {
+		t.Fatalf("the account was not given back after a second late teardown: %d running", h.manager.Count())
+	}
+	if h.server.Exists(h.keys.Lease(sid)) {
+		t.Fatal("the lease is still held")
 	}
 }

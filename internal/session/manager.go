@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"maps"
 	"slices"
 	"sort"
 	"sync"
@@ -463,6 +464,7 @@ func (m *Manager) stopSession(sid string) {
 	delete(m.sessions, sid)
 	m.mu.Unlock()
 	if ok {
+		m.forgetAdoptedForDelete(sid, session)
 		session.Stop()
 	}
 }
@@ -971,18 +973,24 @@ func (m *Manager) wake(ctx context.Context, delivery *transport.Delivery) {
 	m.ack(ctx, delivery)
 }
 
-// adoptedForDelete is one account opened to serve one teardown.
+// adoptedForDelete is one account opened to serve teardowns and nothing else.
 type adoptedForDelete struct {
 	session *Session
-	// carried is what the session had answered when the teardown was queued. The
-	// hand-back is licensed by this standing exactly one higher afterwards: the teardown
-	// and nothing else.
-	carried int64
-	// refused says the teardown was answered `expired`, so this adoption has nothing left
-	// to serve. Marked here rather than acted on, because the answer comes from the
-	// session's own executor and stopping a session from inside the command it is
-	// answering waits on the goroutine doing the asking.
+	// refused says a teardown on this session was answered `expired`, so what the
+	// adoption was for is not going to happen. Marked here rather than acted on, because
+	// the answer comes from the session's own executor and stopping a session from inside
+	// the command it is answering waits on the goroutine doing the asking.
 	refused bool
+	// carried is what the session had answered when that refusal went out, and the
+	// hand-back is licensed by the count still standing there.
+	//
+	// Written by the refusal and not by the adoption, and the difference is a case the
+	// fleet actually produces: the same late teardown is delivered again while the
+	// hand-back is still waiting for a tick, `Dispatch` finds the session and hands it
+	// straight to the executor, and a count taken once at the adoption would read those
+	// repeats as "something else came to want this account". Re-armed by each refusal,
+	// the licence says what it means -- nothing but refused teardowns has run here.
+	carried int64
 }
 
 // teardownRefused undoes an adoption that existed only to serve a teardown that did not
@@ -1015,6 +1023,9 @@ func (m *Manager) teardownRefused(sid string, code protocol.ErrorCode) {
 	case !adopted:
 	case code == protocol.ErrorExpired:
 		entry.refused = true
+		// Already counting this refusal: `run` adds to the count before it calls here, so
+		// this is the number the hand-back has to find unchanged.
+		entry.carried = entry.session.carriedSoFar()
 		m.forDelete[sid] = entry
 	default:
 		// Tried and could not, so the account stays and the registration goes: a later
@@ -1034,7 +1045,7 @@ func (m *Manager) teardownRefused(sid string, code protocol.ErrorCode) {
 // teardown, with what the session had answered at that moment.
 func (m *Manager) adoptedToDelete(sid string, session *Session) {
 	m.forDeleteMu.Lock()
-	m.forDelete[sid] = adoptedForDelete{session: session, carried: session.carriedSoFar()}
+	m.forDelete[sid] = adoptedForDelete{session: session}
 	m.forDeleteMu.Unlock()
 }
 
@@ -1048,39 +1059,71 @@ func (m *Manager) adoptedToDelete(sid string, session *Session) {
 // which case the count moved. `claimIdle` asks a third time, with the door shut in the
 // same step, about a command that arrived between this pass and the stop.
 func (m *Manager) giveBackRefusedTeardowns(ctx context.Context) {
-	// Read before the lock, and deliberately: `running` takes the map lock every adoption
-	// and every hand-back holds, and taking it underneath this one would be the only
-	// place in the file where those two are held in that order.
+	m.forDeleteMu.Lock()
+	// Every entry and not only the refused ones, because the list has two ways to end and
+	// the quiet one is the common one: a teardown that worked retires its session and the
+	// sweep hands the account back, and the entry for it would otherwise sit here for the
+	// life of the process, one per teardown the fleet ever carries out.
+	listed := make(map[string]adoptedForDelete, len(m.forDelete))
+	maps.Copy(listed, m.forDelete)
+	m.forDeleteMu.Unlock()
+	if len(listed) == 0 {
+		return
+	}
+
+	// Read after the copy above, and that order is the whole of what it buys. An adoption
+	// registers itself only once its session is in the map, so a session missing from a
+	// list taken *after* the copy really is one this instance has let go. Taken before,
+	// the list would be missing the accounts adopted in between, and the entries they had
+	// just written would be dropped as though they had already disappeared -- leaving
+	// exactly the accounts this function exists to give back owned forever.
 	running := m.running()
 
-	m.forDeleteMu.Lock()
-	giving := make(map[string]*Session)
-	for sid, entry := range m.forDelete {
-		switch {
-		case running[sid] != entry.session:
-			// Gone or replaced: there is no adoption of ours left to undo.
-			delete(m.forDelete, sid)
-		case !entry.refused:
-			// The teardown has not been answered yet.
-		case entry.session.carriedSoFar() != entry.carried+1:
-			// Something else came to want this account while the refusal was going out.
-			delete(m.forDelete, sid)
-		default:
-			giving[sid] = entry.session
-			delete(m.forDelete, sid)
+	for sid, entry := range listed {
+		if running[sid] != entry.session {
+			// Gone, or replaced by an adoption of its own: there is nothing of ours left
+			// to undo, and whatever is there now has its own reason to be. This is where
+			// a teardown that worked leaves the list.
+			m.forgetAdoptedForDelete(sid, entry.session)
+			continue
 		}
-	}
-	m.forDeleteMu.Unlock()
-
-	for sid, session := range giving {
+		if !entry.refused {
+			// The teardown has not been answered yet, so there is nothing yet to undo.
+			//
+			// An early-out rather than a guard, said out loud because a mutation battery
+			// will find it: removing it changes no outcome, since a session whose teardown
+			// is still queued or still running is refused by `claimIdle` on those grounds.
+			// What it saves is a turn taken and given back plus a log line, once per tick,
+			// for every teardown in flight on the instance.
+			continue
+		}
 		if ctx.Err() != nil {
-			// Out of tick. The account is idle and nothing is waiting on it, so the next
-			// pass finds it the same way; what it costs is a tick of a lease nobody else
-			// can take.
+			// Out of tick, and the registration stays: the account is idle and nothing is
+			// waiting on it, so the next pass finds it the same way. What it costs is one
+			// more tick of a lease nobody else can take.
 			return
 		}
-		m.releaseIdle(ctx, sid, session)
+		if !m.releaseIdle(ctx, sid, entry.session, entry.carried) {
+			// Refused, and refused for a reason that may be gone next tick: an adoption in
+			// the way, a command that had not finished when this pass began. Kept
+			// registered, because nothing else would ever find this session again -- it is
+			// not retired, so no sweep looks at it, and its lease is renewed for as long as
+			// this instance lives.
+			continue
+		}
+		m.forgetAdoptedForDelete(sid, entry.session)
 	}
+}
+
+// forgetAdoptedForDelete drops a registration, and only while it is still the one the
+// caller was working from: a hand-back that took a tick can finish after the account was
+// adopted again, and the entry by then belongs to that newer adoption.
+func (m *Manager) forgetAdoptedForDelete(sid string, was *Session) {
+	m.forDeleteMu.Lock()
+	if entry, ok := m.forDelete[sid]; ok && entry.session == was {
+		delete(m.forDelete, sid)
+	}
+	m.forDeleteMu.Unlock()
 }
 
 // takeForDelete adopts an account nobody is running so that its own executor can tear it
@@ -1807,32 +1850,41 @@ func (m *Manager) forget(ctx context.Context, sid string, want *Session) bool {
 // answer to its name.
 func (m *Manager) drop(sid string, want *Session) (*Session, bool) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	session, ok := m.sessions[sid]
+	if ok && session == want {
+		delete(m.sessions, sid)
+	}
+	m.mu.Unlock()
 	if !ok || session != want {
 		return nil, false
 	}
-	delete(m.sessions, sid)
+	// Outside the lock, and the registration's life is exactly this session's: an account
+	// adopted to serve a teardown is listed until it stops being an account this instance
+	// runs, whichever way that happens. Swept instead, the commonest ending of all -- a
+	// teardown that worked -- would leave an entry behind for the life of the process.
+	m.forgetAdoptedForDelete(sid, session)
 	return session, true
 }
 
 func (m *Manager) releaseThis(ctx context.Context, sid string, want *Session) {
-	m.releaseClaimed(ctx, sid, want, want.claim)
+	_ = m.releaseClaimed(ctx, sid, want, want.claim)
 }
 
 // releaseIdle is releaseThis for a session that was never retired: the account opened to
-// serve a teardown the executor refused before it ran.
-func (m *Manager) releaseIdle(ctx context.Context, sid string, want *Session) {
-	m.releaseClaimed(ctx, sid, want, want.claimIdle)
+// serve a teardown the executor refused before it ran. It reports whether the account
+// actually went back, because the caller is the only thing that will ever look at this
+// session again and has to keep it on its list until it did.
+func (m *Manager) releaseIdle(ctx context.Context, sid string, want *Session, carried int64) bool {
+	return m.releaseClaimed(ctx, sid, want, func() bool { return want.claimIdle(carried) })
 }
 
-func (m *Manager) releaseClaimed(ctx context.Context, sid string, want *Session, claim func() bool) {
+func (m *Manager) releaseClaimed(ctx context.Context, sid string, want *Session, claim func() bool) bool {
 	if !m.tryHoldHanding(sid) {
 		// An adoption of this account is under way. Tried and not taken: this runs on the
 		// heartbeat, and an adoption reads a store.
 		m.log.Debug().Str("sid", sid).
 			Msg("an adoption is under way; leaving a retired session for the next tick")
-		return
+		return false
 	}
 	defer m.dropHanding(sid)
 
@@ -1844,12 +1896,13 @@ func (m *Manager) releaseClaimed(ctx context.Context, sid string, want *Session,
 	if !claim() {
 		m.log.Info().Str("sid", sid).
 			Msg("a session finished with was not free to be handed over; leaving it for the next tick")
-		return
+		return false
 	}
 	if !m.forget(ctx, sid, want) {
-		return
+		return false
 	}
 	m.abandon(ctx, sid)
+	return true
 }
 
 // reportCommand is `Session.reportCommand` for the commands that never reach a session.
