@@ -5,8 +5,10 @@ import (
 	"go/parser"
 	"go/token"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -240,4 +242,262 @@ func receiverName(recv *ast.FieldList) string {
 		return ""
 	}
 	return recv.List[0].Names[0].Name
+}
+
+// Keys documented nowhere on purpose. Each one carries the reason here, because a bare
+// list is the comment this file exists to stop trusting, and the next person to add a
+// constructor needs to know which of the two exits applies to it.
+var keysTheContractDoesNotName = map[string]string{}
+
+// The other direction, and the one #248 found open: a key the connector renders and the
+// contract's tables never name.
+//
+// #160 fenced constructors against production code, which catches a row describing a key
+// nothing writes -- `wa:sessions` described a registry no connector ever built. Nothing
+// caught the reverse, and `wa:handback:<sid>` sat in five production call sites in
+// `internal/cluster/lease.go` with no row anywhere, while the paragraph nearest to it said
+// a `wa:handoff:<sid>` key "was declared for it once and removed here, having never had
+// anything behind it" -- true of handoff, and read as settling handback too.
+//
+// Matched by shape rather than by name. Every segment a caller supplies becomes `*` on
+// both sides, so the fence compares `wa:idem:*:*` with the row's `wa:idem:<sid>:<key>` and
+// does not care what the contract calls the argument or what Go calls the parameter.
+// Matched against table rows only, never the prose: a fence satisfied by a mention would
+// let the row itself -- owner, type, lifetime and meaning -- be deleted with the suite
+// green, which is exactly the deletion that goes unnoticed today.
+//
+// Both tables count. The contract has one for the streams and one for the keys around
+// them, and a fence that demanded the key table would turn red on `wa:cmd:<sid>`,
+// `wa:control`, `wa:events:<shard>` and `wa:reply:<command_id>`, which are documented in
+// the right place already. A fence that pushes five correct rows into the wrong table is
+// worse than no fence: it cements the mistake and stands in the way of whoever fixes it.
+func TestEveryKeyTheConnectorRendersHasARowInTheContract(t *testing.T) {
+	t.Parallel()
+
+	catalog, _ := readKeyConstructors(t)
+	shapes := keyShapes(t, catalog)
+	documented := shapesNamedByContractTables(t)
+
+	names := make([]string, 0, len(catalog))
+	for name := range catalog {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	for _, name := range names {
+		reason, excused := keysTheContractDoesNotName[name]
+		shape, known := shapes[name]
+		switch {
+		case excused && reason == "":
+			t.Errorf("Keys.%s is excused from the contract's tables with no reason written beside it", name)
+		case excused && documented[shape]:
+			t.Errorf("Keys.%s is excused from the contract's tables and %s is in one of them: drop the exception", name, shape)
+		case excused:
+		case !known:
+			t.Errorf("could not work out the key Keys.%s renders, so this fence cannot say whether the contract names it; teach keyShapes the shape or excuse the constructor with a reason", name)
+		case !documented[shape]:
+			t.Errorf("Keys.%s renders %s and no row of contract/PROTOCOL.md names it: either add the row, with owner, type, lifetime and meaning, or add it to keysTheContractDoesNotName with the reason it is not the client's business", name, shape)
+		}
+	}
+
+	for _, name := range keysTheClientRenders {
+		if _, ok := keysTheContractDoesNotName[name]; ok {
+			t.Errorf("Keys.%s is marked as the client's to render and excused from the contract at the same time: a key a client writes is one both sides have to agree on", name)
+		}
+	}
+}
+
+// keyShapes renders each constructor's key with every caller-supplied segment collapsed to
+// `*`, read off the declarations for the same reason the catalog is: a shape written by
+// hand here would go stale exactly when somebody changes a constructor.
+//
+// A constructor this cannot work out is reported rather than skipped. Silence would turn
+// the fence off for the one constructor whose body somebody just made interesting, which
+// is the shape every fence in this repository is written to avoid.
+func keyShapes(t *testing.T, catalog map[string]bool) map[string]string {
+	t.Helper()
+
+	fileSet := token.NewFileSet()
+	file, err := parser.ParseFile(fileSet, "keys.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse keys.go: %v", err)
+	}
+
+	bodies := map[string]*ast.FuncDecl{}
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if ok && fn.Recv != nil && fn.Name != nil && catalog[fn.Name.Name] {
+			bodies[fn.Name.Name] = fn
+		}
+	}
+
+	shapes := map[string]string{}
+	var shapeOf func(name string, depth int) (string, bool)
+	shapeOf = func(name string, depth int) (string, bool) {
+		if shape, done := shapes[name]; done {
+			return shape, shape != ""
+		}
+		// One constructor builds on another (EventsOf on Events, EventsLease on Events),
+		// and the chain is short. The bound is here so a cycle is a failed shape rather
+		// than a hung test.
+		if depth > 4 {
+			return "", false
+		}
+		fn := bodies[name]
+		if fn == nil || fn.Body == nil || len(fn.Body.List) != 1 {
+			return "", false
+		}
+		ret, ok := fn.Body.List[0].(*ast.ReturnStmt)
+		if !ok || len(ret.Results) != 1 {
+			return "", false
+		}
+		var render func(ast.Expr) (string, bool)
+		render = func(expr ast.Expr) (string, bool) {
+			switch node := expr.(type) {
+			case *ast.BinaryExpr:
+				left, okL := render(node.X)
+				right, okR := render(node.Y)
+				return left + right, okL && okR
+			case *ast.BasicLit:
+				text, err := strconv.Unquote(node.Value)
+				return text, err == nil
+			case *ast.SelectorExpr:
+				// `k.prefix` is the namespace the contract spells out in every row.
+				if ident, ok := node.X.(*ast.Ident); ok && ident.Name == "k" && node.Sel.Name == "prefix" {
+					return "wa:", true
+				}
+				return "", false
+			case *ast.Ident:
+				// A parameter, which is whatever the caller passes.
+				return "*", true
+			case *ast.CallExpr:
+				// Either another constructor on Keys, or a conversion of a parameter
+				// (`strconv.Itoa(shard)`); both stand for one caller-supplied segment,
+				// except the constructor, which contributes its whole shape.
+				if sel, ok := node.Fun.(*ast.SelectorExpr); ok {
+					if ident, ok := sel.X.(*ast.Ident); ok && ident.Name == "k" && catalog[sel.Sel.Name] {
+						return shapeOf(sel.Sel.Name, depth+1)
+					}
+				}
+				return "*", true
+			}
+			return "", false
+		}
+		shape, ok := render(ret.Results[0])
+		if !ok {
+			shapes[name] = ""
+			return "", false
+		}
+		shapes[name] = shape
+		return shape, true
+	}
+	for name := range catalog {
+		shapeOf(name, 0)
+	}
+	for name, shape := range shapes {
+		if shape == "" {
+			delete(shapes, name)
+		}
+	}
+	return shapes
+}
+
+// shapesNamedByContractTables reads the first cell of every markdown table row in the
+// contract and returns the shapes of the keys named there.
+//
+// Table rows only. A key named in a sentence is a key somebody mentioned; a key in a row
+// has an owner, a type, a lifetime and a meaning beside it, and it is the row this fence
+// is about. Both tables are read, because the streams are documented in one and the keys
+// around them in the other, and both are the right place for what they hold.
+func shapesNamedByContractTables(t *testing.T) map[string]bool {
+	t.Helper()
+
+	source, err := os.ReadFile(filepath.Join("..", "..", "contract", "PROTOCOL.md"))
+	if err != nil {
+		t.Fatalf("read the contract: %v", err)
+	}
+	named := map[string]bool{}
+	for _, line := range strings.Split(string(source), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "|") {
+			continue
+		}
+		cell, _, _ := strings.Cut(strings.TrimPrefix(line, "|"), "|")
+		for _, quoted := range codeSpans(cell) {
+			if strings.HasPrefix(quoted, "wa:") {
+				named[placeholdersCollapsed(quoted)] = true
+			}
+		}
+	}
+	if len(named) == 0 {
+		t.Fatal("no key is named in any table of contract/PROTOCOL.md, so this fence would pass for every constructor at once")
+	}
+	return named
+}
+
+// codeSpans returns the contents of each backticked span in a line.
+func codeSpans(line string) []string {
+	var spans []string
+	for {
+		start := strings.Index(line, "`")
+		if start < 0 {
+			return spans
+		}
+		rest := line[start+1:]
+		end := strings.Index(rest, "`")
+		if end < 0 {
+			return spans
+		}
+		spans = append(spans, rest[:end])
+		line = rest[end+1:]
+	}
+}
+
+// placeholdersCollapsed rewrites `<sid>` and friends to `*`, so a row matches whatever the
+// constructor calls its parameters.
+func placeholdersCollapsed(key string) string {
+	var out strings.Builder
+	for {
+		start := strings.Index(key, "<")
+		if start < 0 {
+			out.WriteString(key)
+			return out.String()
+		}
+		end := strings.Index(key[start:], ">")
+		if end < 0 {
+			out.WriteString(key)
+			return out.String()
+		}
+		out.WriteString(key[:start])
+		out.WriteString("*")
+		key = key[start+end+1:]
+	}
+}
+
+// The row is fenced above; the sentence beside it is not, and it is half of what #248 was
+// about. A row says what a key is. This paragraph says what it is *not* -- that the key
+// nothing was ever written behind is `wa:handoff:<sid>`, the giving-up on demand, and not
+// `wa:handback:<sid>`, the giving-up an owner starts itself. Reading the first as settling
+// the second is the mistake the issue found, and it is the mistake this sentence removes.
+//
+// Deleting it leaves every test in this repository green, which is how it drifted in the
+// first place. Fenced in the shape internal/session already uses for the contract's
+// sentences, matched against the prose with its line breaks flattened, because the file is
+// wrapped by hand and a fence a re-wrap turns red is a fence somebody deletes.
+func TestTheContractKeepsHandoffAndHandbackApart(t *testing.T) {
+	t.Parallel()
+
+	source, err := os.ReadFile(filepath.Join("..", "..", "contract", "PROTOCOL.md"))
+	if err != nil {
+		t.Fatalf("read the contract: %v", err)
+	}
+	prose := strings.Join(strings.Fields(string(source)), " ")
+	for _, phrase := range []string{
+		"An owner giving a session up **of its own accord** is a different thing and does exist",
+		"it is `wa:handback:<sid>` in the table below",
+	} {
+		if !strings.Contains(prose, phrase) {
+			t.Errorf("contract/PROTOCOL.md no longer says %q; without it the paragraph reads as though the key that was removed settled the one that exists, which is what #248 found", phrase)
+		}
+	}
 }
