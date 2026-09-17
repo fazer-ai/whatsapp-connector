@@ -21,26 +21,38 @@ import (
 // consuming side what it must do fails here, and belongs in `contract/PROTOCOL.md`, which
 // travels and is checksummed.
 //
-// What it can and cannot see, said out loud because a fence nobody trusts gets deleted.
+// What it can and cannot see, said out loud because a fence nobody trusts gets deleted, and
+// measured adversarially rather than asserted: the holdout verifier was asked to write client
+// obligations this misses, and the first draft of it missed eight out of eight.
 //
-// The variable is an obligation modal whose subject is the consuming side, and the two
-// narrowings are what make it the least bad one available. Both were chosen against the
-// prose as it stands, not in the abstract:
+// What that measurement changed. The first draft could not cross a period, which sounds
+// harmless and is not: this contract is made of `message.id`, `chat.presence`, `session.wake`,
+// so any frame name between the subject and the modal blinded it, and putting the frame name
+// there is the natural way to write the obligation. It also knew neither `should`, which
+// PROTOCOL.md already uses for a client obligation, nor "the consuming side", which is how the
+// README beside this test names the very subject it tells people to write about. Four of the
+// eight misses were in the delivery's own register, not artificial.
 //
-//   - Only obligation modals. `may not` and `cannot` are out: in this file they say "might
-//     not happen" and "is unable to" far more often than they forbid anything, and they
-//     accounted for two of the five sentences a looser version flagged, both descriptive.
-//   - No comma between the subject and the modal. A comma opens a new clause, and the
-//     obligation in a new clause belongs to that clause's subject: "the same thing to a
-//     client, so a field that has to distinguish" is a rule about a field. That was the
-//     third false positive.
+// What it still cannot see, measured on the same corpus rather than guessed:
 //
-// It does not parse English, so an obligation phrased without either token slips through.
-// That residual is bounded by keeping README.md short and orientation-only; it is not
-// bounded by this regexp, and pretending otherwise would be the worse error.
+//   - A sentence with no client subject at all: "Deduplicate on `message.id`" in the
+//     imperative, or "Unknown event types must be ignored" in the passive. No keyword fence
+//     reaches those, and saying so is better than implying otherwise.
+//   - `never` and `always`. They are descriptive in this corpus, not prohibitive: "the client
+//     never sees a JID" is a statement about the design, and adding them produced a false
+//     positive immediately. A false positive is the worse failure here, because it teaches
+//     whoever edits to write less, and that comes back as a rule nobody writes anywhere.
+//   - More than 120 characters between the subject and its modal.
+//
+// So the residual is real and this comment does not pretend it away. What bounds it is that
+// README.md is short and orientation-only, which is a discipline and not a mechanism.
 var clientObligation = regexp.MustCompile(
-	`(?i)\b(?:a |the |every |any )?(?:client|clients|consumer|consumers)\b[^.!?,]{0,60}?\b` +
-		`(?:must|must not|has to|have to|is required to|are required to|shall)\b`,
+	`(?i)\b(?:a |the |every |any )?(?:client|clients|consumer|consumers|consuming side)\b` +
+		// Crosses a `.` inside an identifier but never a comma: a new clause has a new
+		// subject, and "the same thing to a client, so a field that has to distinguish" is a
+		// rule about a field. Sentence-ending periods are already gone, split off below.
+		`[^!?,]{0,120}?\b` +
+		`(?:must|must not|has to|have to|need to|needs to|is required to|are required to|shall|should)\b`,
 )
 
 var sentenceEnd = regexp.MustCompile(`[.!?]\s`)
