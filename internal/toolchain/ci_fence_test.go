@@ -21,6 +21,9 @@ const (
 
 	// The half that needs no server, and therefore the half that leaves gates out.
 	half = "check-offline"
+
+	// What runs that half when an agent tries to end a turn.
+	stopHookPath = "../../.claude/hooks/check-before-stop.sh"
 )
 
 // An exemption from `make check`, and the local target it leans on. A reason in prose is
@@ -261,6 +264,19 @@ func TestEveryGateCIEnforcesIsReachableFromMakeCheck(t *testing.T) {
 				"\tit exits 0 having left a gate out, which is the answer-without-looking this whole target exists to stop.\n"+
 				"\tThe recipe:\n\t\t%s",
 				promise, target, half, half, strings.ReplaceAll(strings.TrimSpace(recipe), "\n", "\n\t\t"))
+		}
+	}
+
+	// And the hook that runs it has to fire on the files this fence reads. It skips the
+	// suite when nothing "relevant" changed, and its list was written for Go code: a change
+	// to exactly the Makefile and the workflows ended the turn having run nothing, so the
+	// one check that reads them was skipped for its own subject.
+	relevant := relevanceOfTheStopHook(t)
+	for _, path := range append([]string{strings.TrimPrefix(makefilePath, "../../")}, workflowPaths(read)...) {
+		if !relevant.MatchString(path) {
+			t.Errorf("%s reads %s and the stop hook does not consider it relevant:\n"+
+				"\ta turn that changed only that file ends with the suite unrun, which skips this fence for the file it is about.\n"+
+				"\tThe hook's filter: %s", makefilePath, path, relevant)
 		}
 	}
 
@@ -561,6 +577,36 @@ func parseMakefile(raw string) map[string][]string {
 	return prereqs
 }
 
+func workflowPaths(names []string) []string {
+	out := make([]string, 0, len(names))
+	for _, name := range names {
+		out = append(out, strings.TrimPrefix(workflowsDir, "../../")+"/"+name)
+	}
+	return out
+}
+
+// relevanceOfTheStopHook compiles the pattern the hook filters changed files with. Go's
+// regexp is not grep's, and for a pattern of anchors and alternation it answers the same;
+// what it cannot do is quietly answer "no match" for a pattern it failed to find, which is
+// why an absent one is fatal rather than an empty regexp that matches everything.
+func relevanceOfTheStopHook(t *testing.T) *regexp.Regexp {
+	t.Helper()
+
+	raw, err := os.ReadFile(stopHookPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", stopHookPath, err)
+	}
+	m := hookFilter.FindStringSubmatch(string(raw))
+	if m == nil {
+		t.Fatalf("%s no longer filters changed files with `grep -E '...'`: the hook was rewritten and this check reads nothing", stopHookPath)
+	}
+	pattern, err := regexp.Compile(m[1])
+	if err != nil {
+		t.Fatalf("the filter in %s does not compile as a regexp: %v", stopHookPath, err)
+	}
+	return pattern
+}
+
 // recipeOf returns a target's recipe: the tab-indented lines under its rule.
 func recipeOf(t *testing.T, target string) (raw, expanded string) {
 	t.Helper()
@@ -623,7 +669,9 @@ var (
 	// What a shell reads as the end of one command and the start of the next.
 	shellSeparator = regexp.MustCompile(`&&|\|\||[;|]`)
 	assignRe       = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*)\s*[:?+]?=\s*(.*)$`)
-	referenceRe    = regexp.MustCompile(`\$\(([A-Za-z_][A-Za-z0-9_]*)\)`)
+	// The one line of the stop hook that decides whether the suite runs at all.
+	hookFilter  = regexp.MustCompile(`grep -E '([^']+)'`)
+	referenceRe = regexp.MustCompile(`\$\(([A-Za-z_][A-Za-z0-9_]*)\)`)
 )
 
 func assignment(line string) (name, value string, ok bool) {

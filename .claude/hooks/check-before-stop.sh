@@ -29,7 +29,11 @@ cd "$repo_root" || {
 
 # Only run if there are uncommitted changes to files that make check cares about
 changed_files=$(git diff --name-only HEAD 2>/dev/null; git diff --name-only --cached 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null)
-relevant=$(echo "$changed_files" | grep -E '(\.go$|^go\.(mod|sum)$|^contract/)' | head -1)
+# The Makefile and the workflows are in the filter because `internal/toolchain` reads
+# them: without them, a change to exactly the files that fence validates ends the turn
+# having run nothing, and the fence is skipped for its own subject. The fence asserts
+# this list covers what it reads, so the two cannot drift apart in silence.
+relevant=$(echo "$changed_files" | grep -E '(\.go$|^go\.(mod|sum)$|^contract/|^Makefile$|^\.github/workflows/.*\.ya?ml$)' | head -1)
 
 if [ -z "$relevant" ]; then
   echo '{"ok": true}'
