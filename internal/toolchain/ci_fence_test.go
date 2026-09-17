@@ -18,6 +18,9 @@ const (
 	// The target whose help text says it is the whole of what CI enforces. Every gate in
 	// the workflow has to be reachable from here, or named below with the reason it is not.
 	promise = "check"
+
+	// The half that needs no server, and therefore the half that leaves gates out.
+	half = "check-offline"
 )
 
 // An exemption from `make check`, and the local target it leans on. A reason in prose is
@@ -161,6 +164,7 @@ func TestEveryGateCIEnforcesIsReachableFromMakeCheck(t *testing.T) {
 	steps, read, skipped := workflowSteps(t)
 	reachable, targets := reachableFrom(t, promise)
 	used := map[string]bool{}
+	skippedBy := map[string]bool{} // targets CI runs, to ask which of them the offline half leaves out
 
 	var gates int
 	for _, step := range steps {
@@ -174,6 +178,7 @@ func TestEveryGateCIEnforcesIsReachableFromMakeCheck(t *testing.T) {
 			gates++
 			for _, target := range called {
 				used[target] = true
+				skippedBy[target] = true
 				if !targets[target] {
 					t.Errorf("%s runs `make %s`, and the Makefile has no such target:\n"+
 						"\tthe step fails on every run, or the target was renamed and this side was not", step.where(), target)
@@ -225,6 +230,37 @@ func TestEveryGateCIEnforcesIsReachableFromMakeCheck(t *testing.T) {
 				continue
 			}
 			standsUp(t, reachable, "the step "+step.label(), x)
+		}
+	}
+
+	// The half that skips a gate has to say which. `check-offline` exits 0 having left two
+	// of CI's four passes out, and said nothing: the last line before the green was the name
+	// of the package that had not run against a real server. That is this issue's own defect
+	// one level down, and until this it was the one part of the fix with nothing versioned
+	// standing behind it -- deleting the block from the Makefile left every test green.
+	offline, _ := reachableFrom(t, half)
+	rawRecipe, recipe := recipeOf(t, half)
+
+	// And it has to decide that by the goal somebody typed. Conditioning on a plain
+	// variable makes the sentence silenceable from a shell profile, a direnv file or an
+	// agent's configuration -- `UNDER_CHECK=1 make check-offline` printed nothing and left
+	// no mark. That is the same objection that kept the way out from being `SKIP=1`, and it
+	// applies to the notice as much as to the skipping. `$(MAKECMDGOALS)` is what make
+	// offers for the question "what was asked for", so it is what the recipe has to read.
+	if !strings.Contains(rawRecipe, "MAKECMDGOALS") {
+		t.Errorf("the recipe of %s decides what to print without reading MAKECMDGOALS:\n"+
+			"\tanything else it can condition on is inherited, and what is inherited can be set by somebody who never saw this target.\n"+
+			"\tThe recipe:\n\t\t%s", half, strings.ReplaceAll(strings.TrimSpace(rawRecipe), "\n", "\n\t\t"))
+	}
+	for target := range skippedBy {
+		if offline[target] || target == half || !reachable[target] {
+			continue
+		}
+		if !strings.Contains(recipe, target) {
+			t.Errorf("`make %s` runs `%s` and `make %s` does not, and the recipe of %s never names it:\n"+
+				"\tit exits 0 having left a gate out, which is the answer-without-looking this whole target exists to stop.\n"+
+				"\tThe recipe:\n\t\t%s",
+				promise, target, half, half, strings.ReplaceAll(strings.TrimSpace(recipe), "\n", "\n\t\t"))
 		}
 	}
 
@@ -518,6 +554,43 @@ func parseMakefile(raw string) map[string][]string {
 		prereqs[name] = strings.Fields(expand(vars, comment.ReplaceAllString(rest, "")))
 	}
 	return prereqs
+}
+
+// recipeOf returns a target's recipe: the tab-indented lines under its rule.
+func recipeOf(t *testing.T, target string) (raw, expanded string) {
+	t.Helper()
+
+	file, err := os.ReadFile(makefilePath)
+	if err != nil {
+		t.Fatalf("read %s: %v", makefilePath, err)
+	}
+	vars := map[string]string{}
+	var lines, subbed []string
+	var inside bool
+	for _, line := range strings.Split(string(file), "\n") {
+		if name, value, ok := assignment(line); ok {
+			vars[name] = value
+		}
+		switch {
+		case strings.HasPrefix(line, target+":") && !strings.Contains(line, ":="):
+			inside = true
+		case inside && strings.HasPrefix(line, "\t"):
+			// Both, because the two questions asked of a recipe are different. What it
+			// names has to be read expanded: the passes come from the same list that
+			// generates everything else, and read literally the line says
+			// `$(SERVER_PASSES)` and names nothing. How it decides has to be read raw:
+			// expansion empties whatever make does not define, which is exactly the
+			// variables that come from outside.
+			lines = append(lines, line)
+			subbed = append(subbed, expand(vars, line))
+		case inside && strings.TrimSpace(line) != "":
+			inside = false
+		}
+	}
+	if len(lines) == 0 {
+		t.Fatalf("%s has no recipe in %s, or its rule was not found", target, makefilePath)
+	}
+	return strings.Join(lines, "\n"), strings.Join(subbed, "\n")
 }
 
 // A target-specific variable shares a rule's shape and is not one. The Makefile puts it

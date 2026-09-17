@@ -113,7 +113,6 @@ tidy: ## Fail when go.mod/go.sum are not tidy
 # exported from a shell profile, a direnv file or an agent's configuration and then never
 # appear again in any command anybody typed or any round recorded. A target has to be
 # named where it is run.
-check: UNDER_CHECK := yes
 check: check-servers check-offline $(SERVER_PASSES) ## Everything CI enforces; needs both servers (see check-offline)
 
 # Every missing server at once, before anything runs.
@@ -138,15 +137,21 @@ check-servers:
 	  exit 1; \
 	fi
 
-# The half that needs nothing running, which is what the git hooks and the agent stop hook
-# fall back to: requiring a server there would fail every commit made without one, for a
-# reason that is not the commit's.
+# The half that needs nothing running, which is what the agent stop hook falls back to:
+# requiring a server there would fail every turn ended without one, for a reason that is
+# not the turn's. The versioned pre-commit hook runs neither target, and this comment said
+# it did until the verifier read `.githooks/pre-commit` instead of believing it.
+#
+# It says which passes it did not run, and decides that by the goal that was typed rather
+# than by a variable. A variable would be silenceable from a shell profile or an agent's
+# configuration, which is the same objection that kept the way out from being `SKIP=1`:
+# whatever can be inherited can be inherited by somebody who never saw it.
 #
 # `tidy` belongs here and was missing from `check` altogether: CI's lint job runs
 # `go mod tidy -diff`, and an untidy go.sum passed `check` green with both servers up and
 # nothing skipped. A target that promises everything has to be told when the list grows.
 check-offline: lint tidy test ## Lint, tidy and the SQLite pass: everything that needs no server
-	@test -n "$(UNDER_CHECK)" || { \
+	@test -n "$(filter check,$(MAKECMDGOALS))" || { \
 	  echo; \
 	  echo "check-offline is done. It does not run the passes that need a server:"; \
 	  $(foreach t,$(SERVER_PASSES),echo "  $(t) ($($(t)_VAR))"; ) \
