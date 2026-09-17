@@ -25,6 +25,13 @@ import (
 // nothing: the suite would stay green, because every other test here uses a Redis that
 // answers at once. Whoever changes one of them should measure again and rewrite the number,
 // and this is what says so.
+//
+// What it holds is the budget, which is narrower than the knee, and the difference matters
+// to whoever trusts it. The knee is that budget divided by how many round trips the mark
+// spends, and today `Strike` spends its first on the `HINCRBY` this was measured against.
+// Give it a command before that one and the arithmetic below is still a second, this stays
+// green, and the knee drops without a word. So the number is owed a fresh measurement by
+// anything that changes what a strike costs, not only by these two constants.
 func TestTheStrikeGetsTheWindowTheMeasurementAssumed(t *testing.T) {
 	t.Parallel()
 
