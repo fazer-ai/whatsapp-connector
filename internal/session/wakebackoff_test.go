@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
@@ -213,4 +214,47 @@ func TestAWakeReadForTheFirstTimeAdoptsAQuarantinedAccount(t *testing.T) {
 		t.Fatalf("Dispatch left the wake on the reader rather than taking it onto the answer goroutine")
 	}
 	waitFor(t, "the engine to be asked", func() bool { return h.engine.opens.Load() > before })
+}
+
+// TestATeardownThatArrivedLateIsRefused is the other half of what the contract now says
+// about the control stream, and it is the half that costs a client something. A
+// `session.delete` travels there but is not carried out there: the connector adopts the
+// account so that the account's own executor can tear it down, and that executor checks
+// both ceilings like it does for any other command.
+//
+// Which makes the client obligation real rather than decorative. A teardown that arrives
+// after its deadline is answered `expired` and the account stays linked -- the device left
+// on somebody's phone with nothing saying so, which is the harm `deadline` and
+// `max_runtime_ms` were split apart to keep separate. The contract now tells clients to
+// bound a teardown with `max_runtime_ms` alone, and this is the behaviour that sentence
+// describes.
+func TestATeardownThatArrivedLateIsRefused(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	const sid = "sess-going"
+
+	var acked atomic.Bool
+	del := &transport.Delivery{
+		Command: protocol.Command{
+			Type: protocol.CommandSessionDelete, SID: sid, ID: "cmd-late",
+			ReplyTo:  "wa:reply:cmd-late",
+			Deadline: time.Now().Add(-time.Minute).UnixMilli(),
+		},
+		Ack: func(context.Context) error { acked.Store(true); return nil },
+	}
+	if pending := h.manager.Dispatch(del); pending {
+		t.Fatalf("Dispatch left the delete on the reader rather than taking it onto the answer goroutine")
+	}
+	waitFor(t, "the teardown to be answered", func() bool {
+		_, answered := h.recorder.reply("wa:reply:cmd-late")
+		return answered
+	})
+
+	reply, _ := h.recorder.reply("wa:reply:cmd-late")
+	if reply.OK {
+		t.Fatalf("a teardown past its deadline was carried out; the contract tells clients it is refused")
+	}
+	if reply.Error == nil || reply.Error.Code != protocol.ErrorExpired {
+		t.Fatalf("got %+v, want error code %q", reply.Error, protocol.ErrorExpired)
+	}
 }

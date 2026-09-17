@@ -10,17 +10,24 @@ import (
 	"testing"
 )
 
-// The contract now says in as many words that neither ceiling reaches the control stream:
-// a client should not expect `expired` for a `session.wake`, a `session.delete` or an
-// `admin.ping`, and the reason is that nothing on that path reads the field. That sentence
-// travels to every vendoring client and is the reason #241 closes without a ceiling on the
-// command, so it needs something that fails when it stops being true.
+// The contract now says in as many words that neither ceiling reaches `session.wake` or
+// `admin.ping`: a client should not expect `expired` for either, and the reason is that
+// nothing on that path reads the field. That sentence travels to every vendoring client and
+// is the reason #241 closes without a ceiling on the wake, so it needs something that fails
+// when it stops being true.
 //
-// It would stop being true quietly. A later round adding an `expired(command, ...)` guard
-// to `wake` would be a small, locally sensible change -- it is exactly what the session
-// path does at the other end -- and it would turn a promise the client is held to into a
-// lie, with every test still green: the three handlers have no test that asserts a command
-// is *not* refused for arriving late, because nothing here refuses anything.
+// It would stop being true quietly. A later round adding an `expired(command, ...)` guard to
+// `wake` would be a small, locally sensible change -- it is exactly what the session path
+// does at the other end -- and it would turn a promise the client is held to into a lie,
+// with every test still green: neither handler has a test that asserts a command is *not*
+// refused for arriving late, because neither refuses anything.
+//
+// `takeForDelete` is held to the same rule and for a different reason. A teardown *is* under
+// both ceilings, because it reaches the account's own executor and `carryOut` checks them
+// there -- the test below this one pins that. What must not happen is the control handler
+// retiring it before it ever gets that far: a delete refused here is refused by an instance
+// that has not adopted the account, so nothing would have torn it down and nothing would be
+// left holding the command.
 //
 // What the fence reads is the three handlers themselves, by name, rather than a list of
 // forbidden lines: `expired` and `Deadline` are the two ways to ask the question in this
@@ -51,11 +58,11 @@ func TestNoControlHandlerReadsTheDeadline(t *testing.T) {
 			switch named := node.(type) {
 			case *ast.Ident:
 				if named.Name == "expired" {
-					t.Errorf("%s reads the deadline; contract/PROTOCOL.md tells clients no control command has a ceiling", fn.Name.Name)
+					t.Errorf("%s reads the deadline; contract/PROTOCOL.md tells clients the control handlers do not", fn.Name.Name)
 				}
 			case *ast.SelectorExpr:
 				if named.Sel.Name == "Deadline" {
-					t.Errorf("%s reads the deadline; contract/PROTOCOL.md tells clients no control command has a ceiling", fn.Name.Name)
+					t.Errorf("%s reads the deadline; contract/PROTOCOL.md tells clients the control handlers do not", fn.Name.Name)
 				}
 			}
 			return true
@@ -64,7 +71,7 @@ func TestNoControlHandlerReadsTheDeadline(t *testing.T) {
 
 	for name, found := range handlers {
 		if !found {
-			t.Errorf("%s is gone from manager.go; the contract still names it as a control command with no ceiling", name)
+			t.Errorf("%s is gone from manager.go; the contract still names it as a command the control path does not time out", name)
 		}
 	}
 }
@@ -83,8 +90,8 @@ func TestTheContractSaysControlHasNoCeiling(t *testing.T) {
 	}
 	prose := strings.Join(strings.Fields(string(source)), " ")
 	for _, phrase := range []string{
-		"a client should not expect `expired` for a command sent there",
-		"A control command therefore has no ceiling, whatever it carries",
+		"Neither ceiling reaches `session.wake` or `admin.ping`, and a client should not expect `expired` for either",
+		"A client should not put a `deadline` on a teardown",
 		"should publish another `session.wake` rather than wait on the one it already sent",
 	} {
 		if !strings.Contains(prose, phrase) {

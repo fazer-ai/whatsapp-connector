@@ -25,16 +25,23 @@ dropped for arriving late is a device left linked on somebody's phone with nothi
 so, while the same command parked on a socket write holds every other command for that
 account behind it. With one field a client had to choose, and chose neither.
 
-**Neither ceiling reaches the control stream, and a client should not expect `expired` for
-a command sent there.** `session.wake`, `session.delete` and `admin.ping` are carried out
-before any session is involved, and nothing on that path reads `deadline`. Dropping a wake
-for arriving late is the worst of the three: a wake is the only thing that starts a session
-with no entry yet in the connector's own record of what each session should be, so retiring
-one leaves an account paired, owned by nobody and silent. A control command therefore has no
-ceiling, whatever it carries. What paces one that keeps coming back is the fleet's own
-backoff described under `wa:quarantine:<sid>` below: not a count of deliveries and not a
-clock, but the connector declining to make the same attempt again for a minute, then two,
-up to an hour.
+**Neither ceiling reaches `session.wake` or `admin.ping`, and a client should not expect
+`expired` for either.** Both are carried out before any session is involved, and nothing on
+that path reads `deadline`. For a wake that is the whole point: it is the only thing that
+starts a session with no entry yet in the connector's own record of what each session should
+be, so retiring one for arriving late leaves an account paired, owned by nobody and silent.
+What paces a wake that keeps coming back is instead the fleet's own backoff described under
+`wa:quarantine:<sid>` below: not a count of deliveries and not a clock, but the connector
+declining to make the same attempt again for a minute, then two, up to an hour.
+
+`session.delete` is the exception among the three, and it is the one that costs a client
+something. It travels the control stream but it is not carried out there: the connector
+adopts the account so that the account's own executor can tear it down, which puts the
+teardown under both ceilings like any other command. **A client should not put a `deadline`
+on a teardown** -- `session.delete` or `session.logout` -- and should bound it with
+`max_runtime_ms` alone. One that arrives after its deadline is answered `expired` and the
+account is not torn down, which is the device left linked on somebody's phone that the two
+fields exist to keep apart.
 
 **Both ceilings bound the wait on WhatsApp, not the bookkeeping that follows it.** Once a
 teardown's unlink has been answered, the connector finishes deleting the credentials, the
