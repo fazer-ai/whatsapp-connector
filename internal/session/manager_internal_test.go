@@ -3361,7 +3361,8 @@ func TestADeleteForAnAccountNobodyRunsAdoptsItAndTearsItDown(t *testing.T) {
 }
 
 // An account another instance is running is left alone. Nothing here can ask that
-// instance to stop -- `handoff:<sid>` has a key constructor and no producer -- so tearing
+// instance to stop -- no command in the protocol asks an owner to give a session up on
+// demand, and `wa:handback:<sid>` is an owner deciding to, not a way to ask -- so tearing
 // it down from here would pull the credentials out from under a live socket that still
 // holds the lease and is still publishing.
 //
