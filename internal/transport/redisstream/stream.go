@@ -931,12 +931,12 @@ func (s *Streams) rememberAge(stream string, idle time.Duration, deliveries []tr
 // consumer already executing it, and dispatched a second time alongside the first.
 // Acknowledging the original does not retire the copy. XPENDING is the only form that
 // says who holds an entry.
-func (s *Streams) reclaimable(ctx context.Context, stream string, minIdle time.Duration) ([]string, map[string]pending, error) {
-	ids := make([]string, 0, s.opts.ReadCount)
+func (s *Streams) reclaimable(ctx context.Context, stream string, minIdle time.Duration) (ids []string, was map[string]pending, err error) {
+	ids = make([]string, 0, s.opts.ReadCount)
 	// What XPENDING said about each one. Kept rather than dropped because this is the
 	// only command that reports either fact, and the claim that follows resets what it
 	// would have been asked about: after it, the holder is this instance.
-	was := make(map[string]pending, s.opts.ReadCount)
+	was = make(map[string]pending, s.opts.ReadCount)
 	start := "-"
 
 	// Paged, because the filter is what makes a page yield nothing: entries this
