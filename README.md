@@ -262,6 +262,35 @@ restart, and reports itself healthy while doing it.
 | `WAC_CLAIM_MIN_IDLE` | `1.5 × lease` | How long a command sits unacknowledged before another instance takes it over. Must exceed `WAC_LEASE_TTL` |
 | `WAC_LOG_LEVEL` | `info` | zerolog level |
 
+### The one key that never expires
+
+`wa:lease-epoch:<sid>` has no TTL, deliberately, and `contract/PROTOCOL.md` says why: it
+is the fencing token a client uses to tell the current owner of a session from a previous
+one, so a counter that restarted would let a stale owner out-rank the live one and
+overwrite its state. Do not give it an `EXPIRE`. `internal/cluster/lease_test.go` fails if
+anyone does.
+
+What that costs is a key of roughly sixty bytes for every session id this deployment ever
+adopted and did not end through a `session.delete` that ran: ids a `session.wake` named and
+nothing ever paired, accounts deleted before this rule existed, and accounts whose delete
+was delivered twice, since the second delivery is answered from the command record while
+the adoption behind it writes the counter back. Count them with:
+
+```sh
+redis-cli --scan --pattern 'wa:lease-epoch:*' | wc -l
+```
+
+That number only grows. It is not comparable to `wa:lease:*`, which counts the sessions an
+instance owns at that second and is smaller than the live fleet whenever anything is
+disconnected; the number to compare it against is how many sessions the client still has an
+inbox for, and only the client has that.
+
+Reclaiming the difference is not something this service can do on its own. An account
+deleted and an account waiting to be paired again leave the same traces here, which is no
+rows at all, and deleting the counter of the second breaks it silently. So a sweep belongs
+on the client side or nowhere, and today it is nowhere
+([#159](https://github.com/fazer-ai/whatsapp-connector/issues/159)).
+
 ### Changing the protocol
 
 1. Edit `contract/schema/protocol.schema.json`.

@@ -543,3 +543,47 @@ func TestForgetEpochOnlyDropsTheCounterOfALeaseYouStillHold(t *testing.T) {
 		t.Fatal("the counter outlived the account it belonged to, which is the leak this exists to close")
 	}
 }
+
+// The counter must not expire, and this is the only thing in the repository that says so.
+//
+// A TTL here is the fix that suggests itself to whoever notices the key growing without
+// bound (#159), and it is worse than the leak it removes. The key would expire while
+// nobody held the session; the next acquisition would count from one again; an owner
+// still holding eight -- a process that was paused, a socket that outlived its lease, a
+// delivery that sat in a queue -- would publish an event that out-ranks the live owner's,
+// and the client, which drops what is lower and keeps what is higher, would take it.
+// Kilobytes against silent corruption is not a trade, and the trade is invisible: with an
+// EXPIRE added after the increment, every other test in this repository still passes.
+//
+// Asserted on both writes, because they are separate statements in separate scripts and
+// a renew that sets one is as wrong as an acquire that does.
+func TestTheEpochCounterOutlivesEveryTTLTheLeaseItselfHas(t *testing.T) {
+	t.Parallel()
+
+	server, a, _ := newFleet(t, newClock())
+	ctx := context.Background()
+	keys := redisx.NewKeys("wa:", 8)
+	epoch := keys.LeaseEpoch("s1")
+
+	if _, err := a.Acquire(ctx, "s1"); err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	if !server.Exists(epoch) {
+		t.Fatal("acquiring a lease wrote no epoch counter, so this test proves nothing")
+	}
+	if ttl := server.TTL(epoch); ttl != 0 {
+		t.Fatalf("the epoch counter was given a TTL of %v by the acquire; it must not expire while the account exists, or a stale owner out-ranks the live one after it does", ttl)
+	}
+	// The lease does expire, and asserting that here is what keeps the check above from
+	// passing against a Redis that lost every TTL it was given.
+	if ttl := server.TTL(keys.Lease("s1")); ttl <= 0 {
+		t.Fatalf("the lease itself has no TTL (%v), so the assertion above cannot tell an epoch that keeps its lifetime from a server that drops every one", ttl)
+	}
+
+	if err := a.Renew(ctx, "s1"); err != nil {
+		t.Fatalf("Renew: %v", err)
+	}
+	if ttl := server.TTL(epoch); ttl != 0 {
+		t.Fatalf("the epoch counter was given a TTL of %v by the renew; the lease is what expires, and the counter is what tells a client which owner is current", ttl)
+	}
+}
