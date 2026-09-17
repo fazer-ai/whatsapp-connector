@@ -7,8 +7,10 @@ import (
 	"strconv"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
+	"github.com/rs/zerolog"
 	wm "go.mau.fi/whatsmeow"
 	waBinary "go.mau.fi/whatsmeow/binary"
 	waTypes "go.mau.fi/whatsmeow/types"
@@ -192,6 +194,65 @@ func TestAGroupCallIsRecognisedFromTheNoticeType(t *testing.T) {
 // WhatsApp announces one call twice, as `offer` and as `offer_notice`, and both reach the
 // handler. Two events for one ring is two conversations' worth of noise in an inbox, and
 // a client with no way to tell they are the same call.
+// refusalOnlySession is a Session built by hand, holding only what the refusal path reads
+// and deliberately without a store.
+//
+// `newTestSession` opens one, and under `WAC_TEST_DATABASE_URL` that pulls `database/sql`
+// into whatever goroutine touches it. A connection pool is not safe inside a synctest
+// bubble in either direction: the process-wide pool it builds on first use outlives the
+// callback, and a per-test pool created inside has its connections handed back from
+// outside, which aborts the whole test binary. Announced as a group call to a session that
+// did not ask for groups, `callOffered` decides the refusal and returns before it would
+// look anybody up, so none of that is needed here.
+func refusalOnlySession(t *testing.T) (*Session, *refusals) {
+	t.Helper()
+
+	watched := &refusals{}
+	session := &Session{
+		sid:      "sid-" + t.Name(),
+		ctx:      t.Context(),
+		log:      zerolog.Nop(),
+		callWait: callWriteTimeout,
+	}
+	session.setCallPolicy(true)
+	session.declineCall = func(_ context.Context, _ *wm.Client, _ waTypes.JID, callID string) error {
+		return watched.record(callID)
+	}
+	return session, watched
+}
+
+// TestOneCallAnnouncedTwiceIsRefusedOnce fences the other half of the deduplication, which
+// the publishing test below cannot reach: it runs with the policy off, so the gate in front
+// of the refusal is invisible to it, and every test that does turn the policy on sends a
+// single announcement.
+//
+// WhatsApp announces one call as `offer` and `offer_notice`, in either order, and both
+// reach the handler. Refusing on both writes two refusals into a call that has one, which
+// is what the ring exists to prevent and what nothing else here would notice.
+//
+// Under synctest, because the refusal is written from a goroutine `refuse` starts and the
+// question asked is whether a second one exists. `synctest.Wait` returns once every
+// goroutine in the bubble is durably blocked, so "there is no second refusal" is something
+// the test knows. Waiting a while and looking is the weaker version of this and is what
+// AGENTS.md rules out: it passes whenever the duplicate is merely slow.
+func TestOneCallAnnouncedTwiceIsRefusedOnce(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		session, watched := refusalOnlySession(t)
+
+		meta := callMeta("call-twice")
+		session.callOffered(&meta, callMedia{}, true)
+		session.callOffered(&meta, callMedia{known: true, video: true}, true)
+
+		synctest.Wait()
+
+		if seen := watched.seen(); len(seen) != 1 || seen[0] != "call-twice" {
+			t.Fatalf("one call announced twice is refused once, refused %v", seen)
+		}
+	})
+}
+
 func TestOneCallAnnouncedTwiceIsPublishedOnce(t *testing.T) {
 	t.Parallel()
 
