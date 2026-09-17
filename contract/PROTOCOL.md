@@ -1,9 +1,10 @@
 # WhatsApp session protocol v1: the normative half
 
 This is the contract a client is held to, and it travels with the directory: the Chatwoot
-side vendors it and counts it in the checksum recorded in `CONTRACT_REF`. `README.md`, which
-sits beside it, is orientation for somebody reading this directory in the connector's own
-repository and is deliberately not vendored.
+side vendors it and counts it in the checksum recorded in `CONTRACT_REF`. The connector's
+repository also has a `README.md` here, which is orientation for somebody reading the
+directory there; it is deliberately not vendored, so a vendored copy does not contain it and
+nothing in this file depends on it.
 
 ## Transport
 
