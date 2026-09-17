@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -328,11 +329,37 @@ func TestAPingInTimeStillAnswers(t *testing.T) {
 	}
 }
 
-// stallQuarantine holds every write the quarantine makes, for as long as it is told to.
-// `HIncrBy` is the first of them and the one Strike blocks on before anything else runs.
+// stallQuarantine holds the write the quarantine makes, for as long as it is told to.
+//
+// It names every command a strike has ever ridden, and counts what it held, because the
+// alternative failed silently once: the hook knew only `hincrby`, the mark moved into a
+// script, and this test went on passing without stalling anything -- a two-instance
+// ownership regression reduced to an assertion that a peer can take a free account. The
+// count below is what makes that impossible to repeat quietly.
 type stallQuarantine struct {
-	held time.Duration
-	on   atomic.Bool
+	held    time.Duration
+	on      atomic.Bool
+	stalled atomic.Int64
+}
+
+// carries reports whether a command is the strike's, by the key it names rather than by its
+// verb.
+//
+// The verb alone is too wide and too narrow at once, and this test has now been wrong in
+// both directions. `hincrby` was the whole of the old mark and became none of it when the
+// mark moved into a script, which left the hook holding nothing. Widening to `eval` then
+// caught `acquireScript` as well, and the adoption failed taking the lease instead of
+// opening the account -- an instrument that stops the thing it was meant to observe.
+//
+// The key is what actually distinguishes them: everything a strike does happens under
+// `…quarantine:<sid>`, whatever verb carries it next.
+func (h *stallQuarantine) carries(cmd redis.Cmder) bool {
+	for _, arg := range cmd.Args() {
+		if key, ok := arg.(string); ok && strings.Contains(key, "quarantine:") {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *stallQuarantine) DialHook(next redis.DialHook) redis.DialHook { return next }
@@ -343,7 +370,8 @@ func (h *stallQuarantine) ProcessPipelineHook(next redis.ProcessPipelineHook) re
 
 func (h *stallQuarantine) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
 	return func(ctx context.Context, cmd redis.Cmder) error {
-		if h.on.Load() && cmd.Name() == "hincrby" {
+		if h.on.Load() && h.carries(cmd) {
+			h.stalled.Add(1)
 			select {
 			case <-time.After(h.held):
 			case <-ctx.Done():
@@ -378,6 +406,14 @@ func TestAStalledStrikeStillLetsThePeerHaveTheAccount(t *testing.T) {
 
 	if _, err := h.manager.Adopt(t.Context(), sid); !errors.Is(err, errCannotOpen) {
 		t.Fatalf("Adopt: got %v, want %v", err, errCannotOpen)
+	}
+
+	// Asked before the assertion that matters, because a hook that intercepts nothing makes
+	// the rest of this test an elaborate way of checking that a peer can take a free
+	// account. That is exactly what happened when the mark stopped riding `hincrby`.
+	if stalled := stall.stalled.Load(); stalled == 0 {
+		t.Fatalf("nothing was stalled: the strike no longer rides a command this hook names, " +
+			"so the budget this test exists for was never under pressure")
 	}
 
 	peer := cluster.NewLeases(redisx.Wrap(h.rdb, "wa:", 8), "inst-b", cluster.Options{})
