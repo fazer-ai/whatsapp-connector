@@ -11,6 +11,7 @@ import (
 
 	"github.com/fazer-ai/whatsapp-connector/internal/observability"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
+	"github.com/fazer-ai/whatsapp-connector/internal/transport"
 )
 
 // What a scrape actually shows, driven through the real adapters rather than a spy.
@@ -192,5 +193,106 @@ wac_command_duration_seconds_count{outcome="rate_limited",type="message.send"} 1
 	if err := testutil.CollectAndCompare(metrics.CommandDuration, strings.NewReader(command),
 		"wac_command_duration_seconds"); err != nil {
 		t.Errorf("the commands this instance answered are not what a scrape shows: %v", err)
+	}
+}
+
+// What a scrape shows about commands the fleet is handing out again.
+//
+// The whole family text, with values that tell four from one from zero, because that is
+// the only comparison that separates a metric being written from a metric being
+// registered: a CounterVec nobody writes has no children and is absent from the
+// exposition entirely, so "nobody writes it" and "it should not exist" read identically
+// from outside. That is exactly how #226 survived, and the test that catches it has to
+// compare text rather than assert a family is present or that a count is above zero.
+func TestWhatAScrapeShowsAboutCommandsHandedOutAgain(t *testing.T) {
+	t.Parallel()
+
+	metrics := observability.New()
+	c := &Connector{metrics: metrics}
+
+	// A wake the fleet cannot act on, coming back out of the pending history four times,
+	// which no claim ever sees because its idle never grows. Then one command claimed
+	// back off a dead peer, which is the other half and the only half XPENDING reports.
+	for range 4 {
+		c.measure([]transport.Delivery{{
+			Command:         protocol.Command{SID: "wac224-loop", Type: protocol.CommandSessionConnect},
+			DeliveredBefore: true,
+		}})
+	}
+	c.measure([]transport.Delivery{{
+		Command:         protocol.Command{SID: "wac224-taken", Type: protocol.CommandSessionConnect},
+		DeliveredBefore: true,
+		TakenFrom:       "connector-b",
+		Deliveries:      3,
+	}})
+	// And one arriving new, which is not a redelivery and must not move anything.
+	c.measure([]transport.Delivery{{
+		Command: protocol.Command{SID: "wac224-fresh", Type: protocol.CommandSessionConnect},
+	}})
+
+	const again = `# HELP wac_commands_delivered_again_total Commands handed out that had been handed out before, by where this delivery came from. source=read is a command coming back out of the pending history, which no claim ever sees.
+# TYPE wac_commands_delivered_again_total counter
+wac_commands_delivered_again_total{sid="wac224-loop",source="read"} 4
+wac_commands_delivered_again_total{sid="wac224-taken",source="claim"} 1
+`
+	if err := testutil.CollectAndCompare(metrics.CommandsDeliveredAgain, strings.NewReader(again), "wac_commands_delivered_again_total"); err != nil {
+		t.Errorf("what a scrape shows for commands handed out again:\n%v", err)
+	}
+
+	const reclaimed = `# HELP wac_commands_reclaimed_total Commands a claim took back, by the consumer that was holding them.
+# TYPE wac_commands_reclaimed_total counter
+wac_commands_reclaimed_total{from="connector-b"} 1
+`
+	if err := testutil.CollectAndCompare(metrics.CommandsReclaimed, strings.NewReader(reclaimed), "wac_commands_reclaimed_total"); err != nil {
+		t.Errorf("what a scrape shows for commands taken back:\n%v", err)
+	}
+
+	// The whole histogram family, buckets and sum together. The sum is what separates
+	// "observed the three deliveries Redis reported" from "observed zero", which every
+	// bucket above the first reads the same for.
+	const redeliveries = `# HELP wac_command_redeliveries How many times Redis says a reclaimed command had been delivered, counting that one. Only a claim can read this, so commands coming back through the read loop are not in it.
+# TYPE wac_command_redeliveries histogram
+wac_command_redeliveries_bucket{le="1"} 0
+wac_command_redeliveries_bucket{le="2"} 0
+wac_command_redeliveries_bucket{le="3"} 1
+wac_command_redeliveries_bucket{le="5"} 1
+wac_command_redeliveries_bucket{le="10"} 1
+wac_command_redeliveries_bucket{le="25"} 1
+wac_command_redeliveries_bucket{le="100"} 1
+wac_command_redeliveries_bucket{le="1000"} 1
+wac_command_redeliveries_bucket{le="+Inf"} 1
+wac_command_redeliveries_sum 3
+wac_command_redeliveries_count 1
+`
+	if err := testutil.CollectAndCompare(metrics.CommandRedeliveries, strings.NewReader(redeliveries), "wac_command_redeliveries"); err != nil {
+		t.Errorf("what a scrape shows for how many times a reclaimed command had been delivered:\n%v", err)
+	}
+}
+
+// A session this instance no longer owns takes its series with it.
+//
+// Without this the label set is every session the process has ever held rather than the
+// ones it holds, and a session id has no ceiling: nothing limits how many an instance
+// adopts over its life, however few run at once. It is the first label in this build
+// without one, and it is only defensible because it is dropped.
+func TestASessionThatIsGoneTakesItsSeriesWithIt(t *testing.T) {
+	t.Parallel()
+
+	metrics := observability.New()
+	c := &Connector{metrics: metrics}
+
+	c.measure([]transport.Delivery{{
+		Command:         protocol.Command{SID: "wac224-gone", Type: protocol.CommandSessionConnect},
+		DeliveredBefore: true,
+	}})
+	if got := testutil.CollectAndCount(metrics.CommandsDeliveredAgain, "wac_commands_delivered_again_total"); got != 1 {
+		t.Fatalf("after one redelivery the exposition has %d series, want 1", got)
+	}
+
+	// Nothing owned any more, which is what a lease lost or a hand-back leaves.
+	c.forgetSessionsGone(nil)
+
+	if got := testutil.CollectAndCount(metrics.CommandsDeliveredAgain, "wac_commands_delivered_again_total"); got != 0 {
+		t.Errorf("the session is gone and the exposition still has %d series for it", got)
 	}
 }

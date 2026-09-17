@@ -10,9 +10,11 @@ import (
 	"os"
 	"os/signal"
 	"slices"
+	"sync"
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/rs/zerolog"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/cluster"
@@ -55,6 +57,14 @@ type Connector struct {
 	engine     engine.Engine
 	store      *store.Container
 	streams    commandStreams
+	// labelled is the sessions wac_commands_delivered_again_total currently has a series
+	// for. A session id has no ceiling -- nothing limits how many an instance adopts over
+	// its life -- so the series are dropped when the session goes, and this is the list
+	// of what there is to drop. Without it the label set becomes "every session this
+	// process has ever held" instead of "the ones it holds", which grows without bound
+	// however few run at once.
+	labelledMu sync.Mutex
+	labelled   map[string]struct{}
 	http       *httpserver.Server
 	blobs      *media.Store
 
@@ -365,6 +375,7 @@ func (c *Connector) tick(ctx context.Context) time.Time {
 	c.reclaimCommands(ctx)
 	c.announce(ctx)
 	c.metrics.SessionsRunning.Set(float64(c.manager.Count()))
+	c.forgetSessionsGone(c.manager.SIDs())
 	return due
 }
 
@@ -919,6 +930,35 @@ func (c *Connector) readCommands(ctx context.Context) {
 	c.dispatchWithin(ctx, deliveries)
 }
 
+// forgetSessionsGone drops the per-session series of sessions this instance no longer
+// owns. Once a heartbeat, off the list of what was ever labelled, because there is no
+// teardown hook to hang it on and a session can leave by any of several routes -- a lease
+// lost, a hand-back, a stop -- of which only one is reported here today.
+func (c *Connector) forgetSessionsGone(owned []string) {
+	c.labelledMu.Lock()
+	defer c.labelledMu.Unlock()
+
+	if len(c.labelled) == 0 {
+		return
+	}
+	held := make(map[string]struct{}, len(owned))
+	for _, sid := range owned {
+		held[sid] = struct{}{}
+	}
+	for sid := range c.labelled {
+		if _, still := held[sid]; still || sid == noSession {
+			continue
+		}
+		c.metrics.CommandsDeliveredAgain.DeletePartialMatch(prometheus.Labels{"sid": sid})
+		delete(c.labelled, sid)
+	}
+}
+
+// noSession labels what came off the control stream, which names no session of its own.
+// A constant rather than the empty string: an empty label value and an absent label read
+// the same in some tooling, and this one is a real category.
+const noSession = "-"
+
 // measure records what the fleet is handing out a second time.
 //
 // Here rather than in the transport, and on receipt rather than after dispatch. In the
@@ -946,7 +986,17 @@ func (c *Connector) measure(deliveries []transport.Delivery) {
 		if d.TakenFrom != "" {
 			source = "claim"
 		}
-		c.metrics.CommandsDeliveredAgain.WithLabelValues(source).Inc()
+		sid := d.Command.SID
+		if sid == "" {
+			sid = noSession
+		}
+		c.metrics.CommandsDeliveredAgain.WithLabelValues(source, sid).Inc()
+		c.labelledMu.Lock()
+		if c.labelled == nil {
+			c.labelled = make(map[string]struct{})
+		}
+		c.labelled[sid] = struct{}{}
+		c.labelledMu.Unlock()
 	}
 }
 

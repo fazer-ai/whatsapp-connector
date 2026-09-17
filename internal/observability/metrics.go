@@ -126,7 +126,7 @@ func New() *Metrics {
 			Name: "wac_commands_delivered_again_total",
 			Help: "Commands handed out that had been handed out before, by where this delivery came from. " +
 				"source=read is a command coming back out of the pending history, which no claim ever sees.",
-		}, []string{"source"}),
+		}, []string{"source", "sid"}),
 		CommandsReclaimed: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "wac_commands_reclaimed_total",
 			Help: "Commands a claim took back, by the consumer that was holding them.",
