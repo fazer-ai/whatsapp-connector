@@ -337,6 +337,11 @@ func TestGatesAChangeReadsTheTriggers(t *testing.T) {
 		{on: "on:\n  push:\n    branches-ignore: [release]\n", want: true},
 		{on: "on:\n  push: {}\n", want: true},
 		{on: "on:\n  push:\n    tags: ['v*']\n    branches: [main]\n", want: true},
+		// The only input `branches-ignore` decides inside tagOnly: with a tag filter
+		// alongside it. Without one, the first half of the rule already answered, so the
+		// `branches-ignore` case above exercises nothing here and removing the clause
+		// left the whole suite green.
+		{on: "on:\n  push:\n    tags: ['v*']\n    branches-ignore: [wip]\n", want: true},
 		// A release: it runs over what was already merged, and gates no change.
 		{on: "on:\n  push:\n    tags: ['v*']\n  workflow_dispatch:\n"},
 		{on: "on:\n  push:\n    tags-ignore: ['v0.*']\n"},
