@@ -107,6 +107,18 @@ type Session struct {
 	resumeBad func()
 	wasOpen   bool
 
+	// teardownRefused reports a `session.delete` this session answered with a refusal,
+	// and carries the code so the caller can tell the refusals apart: this session knows
+	// why it said no, and only the manager knows whether the account was adopted to serve
+	// this very command. Nil outside the manager.
+	teardownRefused func(protocol.ErrorCode)
+	// carried counts the commands this session has answered, refusals included, and
+	// exists for exactly one reader: the manager gives an account back only while the
+	// teardown it adopted for is still the only thing that ran on it. A connect that
+	// landed behind the refusal makes this an account somebody wants up, and the count is
+	// how that is noticed without the manager having to watch the queue.
+	carried atomic.Int64
+
 	// queueMu guards the door to commands rather than the channel itself: the executor
 	// has to be able to say "nothing more comes in" and then empty what is left,
 	// without a command slipping in between the two.
@@ -142,6 +154,10 @@ type Config struct {
 	// one it sends is the connect that brings an account back, so this is "the attempt
 	// to resume this session did not work", which is what the backoff counts.
 	ResumeFailed func()
+	// TeardownRefused is called when this session answered a `session.delete` with a
+	// refusal rather than tearing the account down, with the code it answered. It is what
+	// lets the manager undo an adoption that existed only to serve that teardown.
+	TeardownRefused func(protocol.ErrorCode)
 	// QueueDepth bounds how many commands wait for this session. Beyond it a client
 	// is told the session is busy rather than being queued behind a backlog whose
 	// deadlines have all passed by the time it is reached.
@@ -173,25 +189,26 @@ func New(ctx context.Context, cfg *Config) *Session {
 	}
 	runCtx, cancel := context.WithCancel(ctx)
 	s := &Session{
-		sid:       cfg.Lease.SID,
-		instance:  cfg.Instance,
-		lease:     cfg.Lease,
-		leases:    cfg.Leases,
-		engine:    cfg.Engine,
-		publisher: cfg.Publisher,
-		ledger:    cfg.Ledger,
-		watch:     cfg.Watch,
-		replier:   cfg.Replier,
-		newID:     cfg.NewID,
-		undrained: cfg.Undrained,
-		connected: cfg.Connected,
-		resumeBad: cfg.ResumeFailed,
-		retryIn:   cfg.RetireRetry,
-		now:       cfg.Now,
-		log:       cfg.Logger.With().Str("sid", cfg.Lease.SID).Uint64("epoch", cfg.Lease.Epoch).Logger(),
-		commands:  make(chan queued, cfg.QueueDepth),
-		stop:      cancel,
-		done:      make(chan struct{}),
+		sid:             cfg.Lease.SID,
+		instance:        cfg.Instance,
+		lease:           cfg.Lease,
+		leases:          cfg.Leases,
+		engine:          cfg.Engine,
+		publisher:       cfg.Publisher,
+		ledger:          cfg.Ledger,
+		watch:           cfg.Watch,
+		replier:         cfg.Replier,
+		newID:           cfg.NewID,
+		undrained:       cfg.Undrained,
+		connected:       cfg.Connected,
+		resumeBad:       cfg.ResumeFailed,
+		teardownRefused: cfg.TeardownRefused,
+		retryIn:         cfg.RetireRetry,
+		now:             cfg.Now,
+		log:             cfg.Logger.With().Str("sid", cfg.Lease.SID).Uint64("epoch", cfg.Lease.Epoch).Logger(),
+		commands:        make(chan queued, cfg.QueueDepth),
+		stop:            cancel,
+		done:            make(chan struct{}),
 	}
 
 	var wg sync.WaitGroup
@@ -550,6 +567,35 @@ func (s *Session) leaving() bool {
 	return s.shutFor != 0
 }
 
+// claimIdle takes a session nothing is using, for the hand-back that is about to stop it.
+//
+// The sibling of `claim` below, for an account adopted to serve a teardown that was
+// refused before it ran: nothing about the engine ended, so that session was never
+// retired and `claim` would always say no. What has to be true is the same in spirit --
+// nothing is running and the door is not already shut -- with one clause `claim` has no
+// use for: nothing may be *waiting* either. A command on the queue is somebody who wants
+// this account, and it arrived after the count the manager took, so the queue is the only
+// place it shows.
+//
+// That last clause is the one mutant this branch's battery could not kill, and it is kept
+// rather than dropped. It is reachable: commands are dispatched on the reader's goroutine
+// while this runs on the heartbeat, so a delivery can sit in the channel with the executor
+// not yet having picked it up. It is not forceable from a test, because nothing can hold
+// the executor between `Offer` returning and `admit` counting the command -- which is
+// exactly the window. Dropping it would not lose the command, `abandonQueue` releases what
+// is waiting and it comes back pending, so what the clause buys is a client's command not
+// taking a claim delay on the way to an account this instance was about to keep for it.
+func (s *Session) claimIdle() bool {
+	s.queueMu.Lock()
+	defer s.queueMu.Unlock()
+
+	if s.stopping || s.shutFor != 0 || s.running > 0 || len(s.commands) > 0 {
+		return false
+	}
+	s.stopping = true
+	return true
+}
+
 // claim takes a retired session for the hand-back that is about to stop it, and says
 // whether it may.
 //
@@ -880,6 +926,17 @@ func (s *Session) run(ctx context.Context, waiting queued) {
 		// cannot bring back must not be tried again at the same rate forever.
 		s.resumeBad()
 	}
+	// Counted on the answering paths and not on the two that hand the command back, for
+	// the same reason the timing is: a command given back was not carried out here, and
+	// the count exists to say whether anything but the teardown ran on this session.
+	s.carried.Add(1)
+	if command.Type == protocol.CommandSessionDelete && err != nil && s.teardownRefused != nil {
+		// Before the answer rather than after it, so the account is already spoken for by
+		// the time the client learns its teardown did not happen and sends another. Only
+		// a refusal: a teardown that worked has retired the session by now, and there is
+		// no adoption left to undo.
+		s.teardownRefused(asProtocolError(err).Code)
+	}
 	retire, cancel := context.WithTimeout(context.WithoutCancel(ctx), ackTimeout)
 	defer cancel()
 	s.answer(retire, &command, delivery.Internal, result, err)
@@ -887,6 +944,13 @@ func (s *Session) run(ctx context.Context, waiting queued) {
 		log.Error().Err(ackErr).Msg("failed to acknowledge a command")
 	}
 }
+
+// carriedSoFar is how many commands this session has answered.
+//
+// Its one reader is the manager deciding whether an account adopted to serve a teardown
+// is still an account nothing else wants: the count standing where it was when the
+// teardown was queued means the refusal is all that happened.
+func (s *Session) carriedSoFar() int64 { return s.carried.Load() }
 
 func (s *Session) carryOut(ctx context.Context, command *protocol.Command) (json.RawMessage, error) {
 	if _, owned := s.leases.Owned(s.sid); !owned {

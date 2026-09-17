@@ -27,7 +27,13 @@ func TestTheStrikeIsRecordedBeforeTheAccountGoesBack(t *testing.T) {
 
 	// The two places an account this instance could not keep is given up, and the call
 	// each one hands it back with.
-	sites := map[string]string{"Adopt": "abandon", "SweepRetired": "releaseThis"}
+	//
+	// `adopt` and not `Adopt`: #249 split the exported name into a wrapper that only
+	// drops the "did this call open it" flag, and the body that does the work kept the
+	// lowercase name. The fence went red on that split, which is the behaviour asked of
+	// it -- a body it cannot find is a fence holding nothing -- and the last loop below is
+	// what turned a silent pass into a failure.
+	sites := map[string]string{"adopt": "abandon", "SweepRetired": "releaseThis"}
 
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, "manager.go", nil, 0)
