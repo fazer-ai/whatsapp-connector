@@ -149,3 +149,16 @@ not an implementation detail:
   events and produces these commands.
 - `fazer-ai/baileys-api` — the previous generation (Node/Baileys), frozen. Its
   `src/cluster/` is the reference implementation for the lease protocol ported here.
+
+## Upstream whatsmeow
+
+- **Never open an issue or a pull request on `tulir/whatsmeow`.** The project does not
+  accept AI-authored submissions, and a report filed from here is a report filed in that
+  repository's name for its maintainers to triage. This holds however small the change is
+  and however complete the diagnosis: the diagnosis goes in an issue **here**, with the
+  file and line, and the upstream fix is somebody else's to propose.
+- A whatsmeow defect we cannot work around is tracked as a known limitation in our own
+  backlog, with the pin it was measured on, so that a later pin bump has something to
+  check against. `internal/engine/whatsmeow/upstream_test.go` is the fence that fails when
+  one of them changes shape upstream, which is the signal to re-read the issue rather than
+  to trust that a bump fixed it.
