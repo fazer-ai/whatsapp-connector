@@ -3468,3 +3468,163 @@ func TestATeardownRefusedByAStoppingSessionIsLeftWithoutAMark(t *testing.T) {
 		t.Fatalf("a session on its way out was marked for a drain (%v); the drain claims its stream from under the instance taking the account over", marked)
 	}
 }
+
+// A logout is not the end of an account, and the counter has to survive it. This is the
+// other half of #159: the leak is real, and the two obvious places to close it are the two
+// places closing it corrupts.
+//
+// Both logouts -- the one the client asks for and the one WhatsApp imposes -- forget the
+// device and rebuild the session on a fresh client, under the same sid. The inbox on the
+// other side is still there, and so is the epoch it has already seen: the client keeps the
+// highest epoch per session and drops anything below it, which is what makes a late event
+// from a previous owner harmless. Drop the counter here and the next pairing under that
+// sid publishes epoch 1 beneath a cursor sitting at 8, so the pairing itself is discarded
+// and the inbox cannot be paired again -- with no error anywhere, because every part is
+// behaving as designed.
+//
+// Asserted rather than left to the doc comment on ForgetEpoch, because the doc comment is
+// not a gate: measured on e7e2ac0, moving the call into the logout path leaves `go test
+// ./...` exiting 0 with not one failure.
+func TestALogoutKeepsTheEpochCounterOfASessionThatCanBePairedAgain(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+	keys := client.Keys()
+
+	const sid = "9c2b7d1e-0000-4000-8000-0000000000e2"
+	fakeEngine := fake.New()
+	manager := NewManager(&ManagerConfig{
+		Instance: "inst-a", Engine: fakeEngine,
+		Leases:    cluster.NewLeases(client, "inst-a", cluster.Options{}),
+		Publisher: quietPublisher{}, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	ctx := context.Background()
+	t.Cleanup(func() { manager.StopAll(ctx) })
+	answering, stopAnswering := context.WithCancel(ctx)
+	stopped := manager.Answer(answering)
+	t.Cleanup(func() { stopAnswering(); <-stopped })
+
+	if _, err := manager.Adopt(ctx, sid); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	before, err := rdb.Get(ctx, keys.LeaseEpoch(sid)).Result()
+	if err != nil {
+		t.Fatalf("the adoption wrote no epoch counter, so this test proves nothing: %v", err)
+	}
+
+	var acked atomic.Bool
+	if manager.Dispatch(&transport.Delivery{
+		Command: protocol.Command{V: protocol.Version, ID: "c1", Type: protocol.CommandSessionLogout, SID: sid},
+		Ack:     func(context.Context) error { acked.Store(true); return nil },
+		Release: func() {}, Forfeit: func() {},
+	}) {
+		t.Fatal("the logout was left pending instead of reaching the session this instance runs")
+	}
+	waitFor(t, acked.Load, "the logout was never carried out")
+
+	engineSession, ok := fakeEngine.Session(sid)
+	if !ok || engineSession.LoggedOut() != 1 {
+		t.Fatal("the engine was never logged out, so nothing happened and the assertions below are vacuous")
+	}
+
+	after, err := rdb.Get(ctx, keys.LeaseEpoch(sid)).Result()
+	if err != nil {
+		t.Fatalf("the epoch counter was deleted by a logout; the account can still be paired again under this sid, and its next epoch would count from one beneath a client cursor that is already higher (%v)", err)
+	}
+	if after != before {
+		t.Fatalf("the epoch counter moved from %s to %s across a logout; it moves on ownership changes, not on an account losing its credentials", before, after)
+	}
+	if ttl := server.TTL(keys.LeaseEpoch(sid)); ttl != 0 {
+		t.Fatalf("the logout gave the epoch counter a TTL of %v, which is the same corruption arriving late", ttl)
+	}
+}
+
+// A redelivered delete leaves the counter behind, and closing that would be the very
+// corruption #159 exists to avoid.
+//
+// It is tempting to close. The counter is written by the *adoption*, and the manager
+// adopts the account again to have somebody to answer a redelivery with, so a delete
+// delivered twice ends with the key the first delivery removed. Dropping it in the branch
+// that answers from the ledger looks like the obvious repair, and it passes every other
+// test in this repository.
+//
+// It is wrong because the record outlives the account's absence. It is kept for a day, and
+// within that day the same `sid` can be paired again -- the client destroyed an inbox and
+// made another, a retry reached a fleet that had already run the delete. The branch that
+// reads the record knows one thing, that a delete of this account succeeded at some point;
+// it cannot know whether the account came back, and neither can the adoption that took it,
+// because an account deleted and an account paired and now offline leave the same traces
+// here. Dropping the counter there restarts a live session's fencing token underneath a
+// client cursor that is already higher, which is a TTL's damage arriving by another road.
+//
+// So the leak stays and is named in `contract/PROTOCOL.md` instead, and this is the gate
+// that fails if somebody closes it later. Measured on the sequence below: with the drop
+// added in that branch, the counter of a session still answering `open` is deleted.
+func TestARedeliveredDeleteDoesNotDropTheCounterOfAnAccountPairedAgain(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+	keys := client.Keys()
+
+	const sid = "9c2b7d1e-0000-4000-8000-0000000000e3"
+	manager := NewManager(&ManagerConfig{
+		Instance: "inst-a", Engine: fake.New(),
+		Leases:    cluster.NewLeases(client, "inst-a", cluster.Options{}),
+		Publisher: quietPublisher{}, Replier: quietReplier{},
+		// The record is what makes the second delivery a recall rather than a second
+		// teardown, and the recall is the branch this is about.
+		Ledger: redisx.NewIdempotency(client, 0),
+		NewID:  func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	ctx := context.Background()
+	t.Cleanup(func() { manager.StopAll(ctx) })
+	answering, stopAnswering := context.WithCancel(ctx)
+	stopped := manager.Answer(answering)
+	t.Cleanup(func() { stopAnswering(); <-stopped })
+
+	send := func(t *testing.T, id string, typ protocol.CommandType) {
+		t.Helper()
+		var acked atomic.Bool
+		manager.Dispatch(&transport.Delivery{
+			Command: protocol.Command{V: protocol.Version, ID: id, Type: typ, SID: sid, Payload: []byte(`{}`)},
+			Ack:     func(context.Context) error { acked.Store(true); return nil },
+			Release: func() {}, Forfeit: func() {},
+		})
+		waitFor(t, acked.Load, "the command "+id+" was never answered")
+	}
+
+	send(t, "c1", protocol.CommandSessionDelete)
+	waitFor(t, func() bool {
+		manager.SweepRetired(ctx, time.Now().Add(time.Second))
+		return !server.Exists(keys.Lease(sid))
+	}, "the lease of a deleted account was never handed back")
+
+	// The account comes back under the same id, which is the case the ledger's day-long
+	// memory makes reachable and the one no adoption can tell from a deletion.
+	if _, err := manager.Adopt(ctx, sid); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	send(t, "c2", protocol.CommandSessionConnect)
+	live, err := rdb.Get(ctx, keys.LeaseEpoch(sid)).Result()
+	if err != nil {
+		t.Fatalf("the account paired again has no counter, so the assertion below would pass for the wrong reason: %v", err)
+	}
+
+	// The same frame as before, which is what a redelivery is.
+	send(t, "c1", protocol.CommandSessionDelete)
+
+	after, err := rdb.Get(ctx, keys.LeaseEpoch(sid)).Result()
+	if err != nil {
+		t.Fatalf("a redelivered delete dropped the counter of an account that is live again; its next owner counts from one under a client cursor that is already higher, which is the corruption a TTL on this key would cause (%v)", err)
+	}
+	if after != live {
+		t.Fatalf("the counter of a live account moved from %s to %s when an old delete was redelivered", live, after)
+	}
+}
