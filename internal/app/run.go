@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"slices"
+	"sync"
 	"syscall"
 	"time"
 
@@ -55,8 +56,22 @@ type Connector struct {
 	engine     engine.Engine
 	store      *store.Container
 	streams    commandStreams
-	http       *httpserver.Server
-	blobs      *media.Store
+	// seen is when each label value last had something counted against it, for the two
+	// metrics whose label values have no ceiling of their own: a session id, and the name
+	// of a consumer a claim took work back from. Neither is bounded -- nothing limits how
+	// many sessions an instance adopts over its life, and an instance name defaults to
+	// the hostname, so a fleet of constant size still coins a new one every time a
+	// replica is replaced.
+	//
+	// Dropped on going quiet rather than on the session going away, and that distinction
+	// is the whole point of the metric: a wake for a session this instance cannot adopt
+	// is exactly the case it exists for, and that session is in nobody's owned list.
+	// Evicting by ownership deleted its series on every heartbeat, so the one series that
+	// mattered read as a run of resets, or was missed by a scrape altogether.
+	seenMu sync.Mutex
+	seen   map[seenLabel]time.Time
+	http   *httpserver.Server
+	blobs  *media.Store
 
 	// reclaimCursor is where the next reclaim pass starts. Read and written only by the
 	// loop goroutine, which is also the only one that reclaims.
@@ -165,11 +180,12 @@ func New(cfg *Config, log zerolog.Logger) (connector *Connector, err error) {
 	}
 
 	quarantine := cluster.NewQuarantine(client, nil)
+	watch := &watching{metrics: metrics}
 	manager := session.NewManager(&session.ManagerConfig{
 		Instance: cfg.Instance, Engine: waEngine, Leases: leases,
 		Publisher: countingPublisher{to: streams, metrics: metrics}, Replier: streams,
 		Ledger:     redisx.NewIdempotency(client, 0),
-		Watch:      watching{metrics: metrics},
+		Watch:      watch,
 		Quarantine: quarantine,
 		NewID:      newFrameID, Logger: log,
 	})
@@ -179,6 +195,7 @@ func New(cfg *Config, log zerolog.Logger) (connector *Connector, err error) {
 		registry: cluster.NewRegistry(client, 3*cfg.Heartbeat), manager: manager, engine: waEngine,
 		store: devices, blobs: blobs,
 	}
+	watch.owner = c
 
 	c.http = httpserver.New(httpserver.Options{
 		Addr: cfg.HTTPAddr, Health: c, Registry: metrics.Registry,
@@ -365,6 +382,7 @@ func (c *Connector) tick(ctx context.Context) time.Time {
 	c.reclaimCommands(ctx)
 	c.announce(ctx)
 	c.metrics.SessionsRunning.Set(float64(c.manager.Count()))
+	c.forgetLabelsGoneQuiet(time.Now())
 	return due
 }
 
@@ -711,6 +729,11 @@ func (c *Connector) reclaimPass(ctx context.Context, take func(context.Context) 
 	defer cancel()
 
 	deliveries, err := take(pass)
+	// Counted whatever it found, and before the error check on purpose: a pass that
+	// returns nothing is the ordinary case, and without a series that moves anyway it
+	// reads exactly like a build where nobody writes any of this. A counter family with
+	// no children is absent from the exposition entirely.
+	c.metrics.CommandReclaimPasses.Inc()
 	if err != nil {
 		if ctx.Err() == nil {
 			c.log.Error().Err(err).Msg("failed to reclaim commands")
@@ -759,6 +782,8 @@ func streamOptions(cfg *Config, log *zerolog.Logger) redisstream.Options {
 // than a budget the dispatch can exhaust. What is not dispatched is released, so it
 // stays pending and comes back on a later pass.
 func (c *Connector) dispatchWithin(ctx context.Context, deliveries []transport.Delivery) bool {
+	c.measure(deliveries)
+
 	// The sessions something in this batch was left pending for. A batch is one stream's
 	// worth of commands in order, so a session that gave one back may not have a later
 	// one carried out behind it: the queue that had no room for the first can free a slot
@@ -910,6 +935,174 @@ func (c *Connector) readCommands(ctx context.Context) {
 	}
 	c.commandReadSucceeded()
 	c.dispatchWithin(ctx, deliveries)
+}
+
+// seenLabel is one label value of one metric, which is the grain eviction works at.
+type seenLabel struct {
+	metric string
+	value  string
+}
+
+const (
+	// sessionLabel and consumerLabel name the two label values without a ceiling.
+	sessionLabel  = "sid"
+	consumerLabel = "from"
+
+	// The values of the source label. Named because eviction has to spell the same set
+	// the counting does, and a set spelled twice is a set that drifts -- which it did
+	// the moment a third value was added to a `DeleteLabelValues` pair written by hand.
+	// `everySource` below is the one list, and a fence keeps it honest.
+	sourceRead  = "read"
+	sourceClaim = "claim"
+	// The third case, and the one the issue's question 3 describes. A wake the fleet
+	// cannot adopt is given back unrun; `rememberAge` stamps it with the claim delay so
+	// that the next claim takes it rather than the read leaving it pending forever, and
+	// it comes back with XPENDING naming this instance as the holder. Measured at this
+	// HEAD on the bench that reproduces the sealed scenario s8: fifty stuck sessions,
+	// 6450 deliveries in four minutes and twenty-five seconds, every one of them this
+	// instance taking back its own.
+	//
+	// Folded into `claim` it made two readings false at once: an operator reading
+	// "reclaimed" saw a fleet taking work off each other when nothing of the sort was
+	// happening, and the `from` label accused every instance of having stopped answering.
+	sourceRestored = "restored"
+
+	// labelQuiet is how long a label value goes uncounted before its series is dropped.
+	//
+	// Long, because the failure it has to avoid is a series that comes and goes: a
+	// counter that disappears and reappears reads as a reset, and a run of resets is
+	// exactly what a fleet retrying one command forever would look like if this were
+	// tight. Short enough that what a process has stopped seeing leaves within the hour.
+	labelQuiet = 30 * time.Minute
+)
+
+// everySource is every value the source label takes, which is what eviction walks. A
+// value counted and not listed here keeps its series for the life of the process, and
+// nothing about the exposition would say so.
+var everySource = []string{sourceRead, sourceClaim, sourceRestored}
+
+// noteLabel records that something was counted against a label value just now.
+func (c *Connector) noteLabel(metric, value string, at time.Time) {
+	c.seenMu.Lock()
+	defer c.seenMu.Unlock()
+
+	if c.seen == nil {
+		c.seen = make(map[seenLabel]time.Time)
+	}
+	c.seen[seenLabel{metric: metric, value: value}] = at
+}
+
+// forgetLabelsGoneQuiet drops the series of label values nothing has been counted against
+// for a while. Once a heartbeat, off what was ever counted, because there is no teardown
+// hook to hang it on and what is being counted outlives any one session: a session this
+// instance never owned, a peer that no longer exists.
+func (c *Connector) forgetLabelsGoneQuiet(now time.Time) {
+	c.seenMu.Lock()
+	defer c.seenMu.Unlock()
+
+	for label, last := range c.seen {
+		if now.Sub(last) < labelQuiet {
+			continue
+		}
+		switch label.metric {
+		case sessionLabel:
+			// By the whole label set rather than DeletePartialMatch, which walks the
+			// vector once per call: a batch of sessions expiring together would then be
+			// quadratic, on the goroutine that renews every lease this instance holds.
+			// That goroutine is already bounded twice over for the same reason.
+			for _, source := range everySource {
+				c.metrics.CommandsDeliveredAgain.DeleteLabelValues(source, label.value)
+			}
+		case consumerLabel:
+			c.metrics.CommandsReclaimed.DeleteLabelValues(label.value)
+		}
+		delete(c.seen, label)
+	}
+}
+
+// forgetSession drops what was counted against a session this instance has stopped
+// running, at the moment it stops.
+//
+// The eviction by silence below is the backstop and it is not enough on its own: it
+// keeps a series for `labelQuiet` after the last count, which for a session this
+// instance no longer has means the set of series reads as "every session it ever had"
+// for half an hour. The sealed scenario for this asks for a few heartbeats.
+//
+// Keyed on the session stopping and not on this instance not owning it, and the
+// difference is the whole reason an earlier attempt was reverted: a sweep over "sessions
+// I do not own" deletes the series of a `session.wake` the fleet cannot adopt, which
+// names a session nobody holds, and that is the one series this metric was built for.
+// This fires once, for a session that was being run here and is not any more, which is
+// the event `wac_leases_lost_total` counts; a session this instance never had never
+// reaches it.
+func (c *Connector) forgetSession(sid string) {
+	if sid == "" {
+		return
+	}
+	c.seenMu.Lock()
+	delete(c.seen, seenLabel{metric: sessionLabel, value: sid})
+	c.seenMu.Unlock()
+
+	for _, source := range everySource {
+		c.metrics.CommandsDeliveredAgain.DeleteLabelValues(source, sid)
+	}
+}
+
+// noSession labels what came off the control stream, which names no session of its own.
+// A constant rather than the empty string: an empty label value and an absent label read
+// the same in some tooling, and this one is a real category.
+const noSession = "-"
+
+// measure records what the fleet is handing out a second time.
+//
+// Here rather than in the transport, and on receipt rather than after dispatch. In the
+// transport it would need a metrics dependency the layer does not have and says why it
+// does not have; after dispatch it would count what this instance chose to run rather
+// than what the fleet handed it, and a batch cut short by its window would go unmeasured
+// for exactly the sessions whose commands are not running.
+//
+// Every path that dispatches comes through here: the read, the reclaim of the control
+// stream, the reclaim of session streams, and the drain of a newly adopted session.
+func (c *Connector) measure(deliveries []transport.Delivery) {
+	now := time.Now()
+	for i := range deliveries {
+		d := &deliveries[i]
+		// Taken back from this instance itself, which is what a wake given back unrun
+		// and aged comes back as. It is a claim, and it is not a reclaim from a peer.
+		own := d.TakenFrom != "" && d.TakenFrom == c.cfg.Instance
+		if d.TakenFrom != "" {
+			// A claim: only XPENDING reports who held it and how many times it went out.
+			// The count goes in whoever held it, because "one command forever" is the
+			// question it answers and that is the same question either way.
+			if d.Deliveries > 0 {
+				c.metrics.CommandRedeliveries.Observe(float64(d.Deliveries))
+			}
+			// The consumer label separates a busy fleet from one instance that stopped
+			// answering, so it takes the name of a peer and nobody else. This instance
+			// naming itself there is a false positive on that alarm, and it fires hardest
+			// during the incident the metric exists to show.
+			if !own {
+				c.metrics.CommandsReclaimed.WithLabelValues(d.TakenFrom).Inc()
+				c.noteLabel(consumerLabel, d.TakenFrom, now)
+			}
+		}
+		if !d.DeliveredBefore {
+			continue
+		}
+		source := sourceRead
+		switch {
+		case own:
+			source = sourceRestored
+		case d.TakenFrom != "":
+			source = sourceClaim
+		}
+		sid := d.Command.SID
+		if sid == "" {
+			sid = noSession
+		}
+		c.metrics.CommandsDeliveredAgain.WithLabelValues(source, sid).Inc()
+		c.noteLabel(sessionLabel, sid, now)
+	}
 }
 
 // silentReadsBeforeAlarm is how many command reads have to fail in a row before the
@@ -1129,9 +1322,16 @@ func (c countingPublisher) Publish(ctx context.Context, event *protocol.Event) e
 // where the registry is, and `internal/session` has no business knowing what Prometheus
 // is. Between the two of them they are the route whose absence left three metrics
 // registered and never written (#226).
-type watching struct{ metrics *observability.Metrics }
+// watching is what the session layer reports to. It reaches the connector because one
+// of the things it reports, a lease this instance stopped running a session over, is the
+// moment a series labelled by that session stops being about a session this instance has.
+// Assigned after the connector exists, because the manager needs the watcher to be built.
+type watching struct {
+	metrics *observability.Metrics
+	owner   *Connector
+}
 
-func (w watching) CommandDone(kind protocol.CommandType, outcome string, took time.Duration) {
+func (w *watching) CommandDone(kind protocol.CommandType, outcome string, took time.Duration) {
 	w.metrics.CommandDuration.WithLabelValues(commandLabel(kind), outcome).Observe(took.Seconds())
 }
 
@@ -1154,4 +1354,9 @@ func commandLabel(kind protocol.CommandType) string {
 	return string(kind)
 }
 
-func (w watching) LeaseLost() { w.metrics.LeasesLost.Inc() }
+func (w *watching) LeaseLost(sid string) {
+	w.metrics.LeasesLost.Inc()
+	if w.owner != nil {
+		w.owner.forgetSession(sid)
+	}
+}

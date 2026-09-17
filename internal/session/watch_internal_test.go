@@ -2,6 +2,7 @@ package session
 
 import (
 	"errors"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -20,6 +21,7 @@ type spyWatch struct {
 	mu     sync.Mutex
 	done   []doneCommand
 	leases int
+	lost   []string
 }
 
 func (s *spyWatch) CommandDone(kind protocol.CommandType, outcome string, took time.Duration) {
@@ -28,10 +30,11 @@ func (s *spyWatch) CommandDone(kind protocol.CommandType, outcome string, took t
 	s.done = append(s.done, doneCommand{kind: kind, outcome: outcome, took: took})
 }
 
-func (s *spyWatch) LeaseLost() {
+func (s *spyWatch) LeaseLost(sid string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.leases++
+	s.lost = append(s.lost, sid)
 }
 
 func (s *spyWatch) all() []doneCommand {
@@ -165,23 +168,28 @@ func TestOnlyALeaseLossThatStoppedASessionIsCounted(t *testing.T) {
 	watch := &spyWatch{}
 	m := &Manager{watch: watch}
 
-	m.lostLease(true)
-	m.lostLease(false) // the drop found nothing: this renewal stopped no session
-	m.lostLease(false)
-	m.lostLease(true)
+	m.lostLease("wac-a", true)
+	m.lostLease("wac-b", false) // the drop found nothing: this renewal stopped no session
+	m.lostLease("wac-c", false)
+	m.lostLease("wac-d", true)
 
 	watch.mu.Lock()
-	got := watch.leases
+	got, lost := watch.leases, append([]string(nil), watch.lost...)
 	watch.mu.Unlock()
 	if got != 2 {
 		t.Errorf("counted %d lease losses, want 2: only the drops that stopped a session count", got)
+	}
+	// And it says which sessions, because a watcher keeping anything per session needs
+	// the name to know what stopped being about a session this instance has.
+	if want := []string{"wac-a", "wac-d"}; !slices.Equal(lost, want) {
+		t.Errorf("reported %v, want %v: the drops that stopped nothing must not be named either", lost, want)
 	}
 }
 
 // Nobody watching must not be a crash on this path either.
 func TestALeaseLossWithNobodyWatchingIsNotACrash(t *testing.T) {
 	t.Parallel()
-	(&Manager{}).lostLease(true)
+	(&Manager{}).lostLease("wac-x", true)
 }
 
 // The wait in the session's own queue is the caller's wait. Timed from the far side of it,

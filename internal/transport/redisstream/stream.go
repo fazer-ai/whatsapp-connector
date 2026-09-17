@@ -513,7 +513,10 @@ func (s *Streams) readHistory(ctx context.Context, streams []string, answered ma
 		var ids []string
 		for i, entry := range handing {
 			aged := !entry.fresh && entry.idle+trip >= s.opts.ClaimMinIdle
-			if delivery, ok := s.deliver(page.stream, entry.XMessage, held[i], aged); ok {
+			// `!entry.fresh` alone is the fact the metric wants: it came out of the
+			// pending list, whatever its age. `aged` is that plus a delay, and the two
+			// come apart on the entry that comes back every block and never grows old.
+			if delivery, ok := s.deliver(page.stream, entry.XMessage, held[i], aged, pending{before: !entry.fresh}); ok {
 				taken, ids = append(taken, delivery), append(ids, entry.ID)
 			}
 		}
@@ -842,7 +845,7 @@ func (s *Streams) claim(ctx context.Context, streams []string, minIdle time.Dura
 		return nil, err
 	}
 	for _, stream := range streams {
-		ids, err := s.reclaimable(ctx, stream, minIdle)
+		ids, was, err := s.reclaimable(ctx, stream, minIdle)
 		switch {
 		case isNoGroup(err):
 			s.groups.forget(stream)
@@ -877,7 +880,7 @@ func (s *Streams) claim(ctx context.Context, streams []string, minIdle time.Dura
 		case err != nil && !errors.Is(err, redis.Nil):
 			return fail(fmt.Errorf("redisstream: claim %s: %w", stream, err))
 		}
-		taken, handed := s.deliveriesWithIDs([]redis.XStream{{Stream: stream, Messages: messages}}, true)
+		taken, handed := s.deliveriesWithIDs([]redis.XStream{{Stream: stream, Messages: messages}}, true, was)
 		// What it took and could not read was acknowledged as unreadable.
 		for _, message := range messages {
 			if !slices.Contains(handed, message.ID) {
@@ -928,8 +931,12 @@ func (s *Streams) rememberAge(stream string, idle time.Duration, deliveries []tr
 // consumer already executing it, and dispatched a second time alongside the first.
 // Acknowledging the original does not retire the copy. XPENDING is the only form that
 // says who holds an entry.
-func (s *Streams) reclaimable(ctx context.Context, stream string, minIdle time.Duration) ([]string, error) {
-	ids := make([]string, 0, s.opts.ReadCount)
+func (s *Streams) reclaimable(ctx context.Context, stream string, minIdle time.Duration) (ids []string, was map[string]pending, err error) {
+	ids = make([]string, 0, s.opts.ReadCount)
+	// What XPENDING said about each one. Kept rather than dropped because this is the
+	// only command that reports either fact, and the claim that follows resets what it
+	// would have been asked about: after it, the holder is this instance.
+	was = make(map[string]pending, s.opts.ReadCount)
 	start := "-"
 
 	// Paged, because the filter is what makes a page yield nothing: entries this
@@ -937,7 +944,7 @@ func (s *Streams) reclaimable(ctx context.Context, stream string, minIdle time.D
 	// them would hide everything behind it on every heartbeat, forever. The page cap is
 	// there so one heartbeat cannot walk an arbitrarily long list.
 	for range maxPendingPages {
-		pending, err := s.client.XPendingExt(ctx, &redis.XPendingExtArgs{
+		entries, err := s.client.XPendingExt(ctx, &redis.XPendingExtArgs{
 			Stream: stream,
 			Group:  ConsumerGroup,
 			Idle:   minIdle,
@@ -947,16 +954,16 @@ func (s *Streams) reclaimable(ctx context.Context, stream string, minIdle time.D
 		}).Result()
 		switch {
 		case errors.Is(err, redis.Nil):
-			return ids, nil
+			return ids, was, nil
 		case isNoGroup(err):
-			return nil, err
+			return nil, nil, err
 		case err != nil:
-			return nil, fmt.Errorf("redisstream: list what is pending on %s: %w", stream, err)
-		case len(pending) == 0:
-			return ids, nil
+			return nil, nil, fmt.Errorf("redisstream: list what is pending on %s: %w", stream, err)
+		case len(entries) == 0:
+			return ids, was, nil
 		}
 
-		for _, entry := range pending {
+		for _, entry := range entries {
 			if entry.ID == start {
 				// The page starts inclusively, so the entry the last page ended on
 				// comes back once more.
@@ -970,13 +977,21 @@ func (s *Streams) reclaimable(ctx context.Context, stream string, minIdle time.D
 				continue
 			}
 			ids = append(ids, entry.ID)
+			// As Redis reports it, with nothing added for the claim about to happen. That
+			// claim does increment the delivery counter, but how many times is not
+			// knowable from here: go-redis sends a command again when its answer never
+			// arrives, and a retried XCLAIM increments it once more with the caller
+			// hearing about none of it. A count taken here is a fact; one adjusted for
+			// work still on the wire is a guess, and it is short precisely during the
+			// connection trouble this is meant to show.
+			was[entry.ID] = pending{before: true, consumer: entry.Consumer, deliveries: entry.RetryCount}
 		}
-		if len(ids) >= int(s.opts.ReadCount) || int64(len(pending)) < s.opts.ReadCount {
-			return ids, nil
+		if len(ids) >= int(s.opts.ReadCount) || int64(len(entries)) < s.opts.ReadCount {
+			return ids, was, nil
 		}
-		start = pending[len(pending)-1].ID
+		start = entries[len(entries)-1].ID
 	}
-	return ids, nil
+	return ids, was, nil
 }
 
 // maxPendingPages bounds how much of the pending list one reclaim walks. The next
@@ -1007,10 +1022,10 @@ func (s *Streams) sessionStreams(sids []string) []string {
 // deliveriesWithIDs is the deliveries plus the stream entry each one came from, which
 // both callers need to say what they took: the ids line up with the deliveries, and a
 // frame that could not be read is in neither.
-func (s *Streams) deliveriesWithIDs(result []redis.XStream, redelivered bool) (out []transport.Delivery, ids []string) {
+func (s *Streams) deliveriesWithIDs(result []redis.XStream, redelivered bool, was map[string]pending) (out []transport.Delivery, ids []string) {
 	for _, stream := range result {
 		for _, message := range stream.Messages {
-			if delivery, ok := s.deliver(stream.Stream, message, s.hold(stream.Stream, message.ID), redelivered); ok {
+			if delivery, ok := s.deliver(stream.Stream, message, s.hold(stream.Stream, message.ID), redelivered, was[message.ID]); ok {
 				out = append(out, delivery)
 				ids = append(ids, message.ID)
 			}
@@ -1019,9 +1034,21 @@ func (s *Streams) deliveriesWithIDs(result []redis.XStream, redelivered bool) (o
 	return out, ids
 }
 
+// pending is what is known about an entry that was already in the group's pending list.
+// The zero value is an entry arriving new, which is what a `>` read carries.
+//
+// consumer and deliveries are filled only by a claim, because XPENDING is the only command
+// that reports either and a read never sends one. That asymmetry is the metric's blind spot
+// and is written into its help text rather than left for a reader of a panel to find.
+type pending struct {
+	before     bool
+	consumer   string
+	deliveries int64
+}
+
 // deliver makes a delivery of an entry already marked as running, and reports false for one
 // it cannot read.
-func (s *Streams) deliver(stream string, message redis.XMessage, held func(), redelivered bool) (transport.Delivery, bool) {
+func (s *Streams) deliver(stream string, message redis.XMessage, held func(), redelivered bool, was pending) (transport.Delivery, bool) {
 	command, err := protocol.ParseCommand(toFields(message.Values))
 	if err != nil {
 		// A frame this instance cannot read is not a frame a retry will fix, and leaving
@@ -1032,10 +1059,13 @@ func (s *Streams) deliver(stream string, message redis.XMessage, held func(), re
 		return transport.Delivery{}, false
 	}
 	return transport.Delivery{
-		Command:     command,
-		Ack:         s.acker(stream, message.ID, held),
-		Release:     held,
-		Redelivered: redelivered,
+		Command:         command,
+		Ack:             s.acker(stream, message.ID, held),
+		Release:         held,
+		Redelivered:     redelivered,
+		DeliveredBefore: was.before,
+		TakenFrom:       was.consumer,
+		Deliveries:      was.deliveries,
 	}, true
 }
 

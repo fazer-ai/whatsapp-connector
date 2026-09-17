@@ -724,7 +724,11 @@ type Watch interface {
 	// LeaseLost is one session whose lease this instance no longer holds. Counted
 	// where the loss is acted on, not where it is discovered, so it counts sessions
 	// actually stopped rather than renewal attempts that came back unlucky.
-	LeaseLost()
+	//
+	// It names the session because a watcher may keep something per session, and this
+	// is the moment that something stops being about a session this instance has. A
+	// counter has no use for the name; anything labelled by session does.
+	LeaseLost(sid string)
 }
 
 // queued is one command waiting its turn, with the instant this instance took it on.

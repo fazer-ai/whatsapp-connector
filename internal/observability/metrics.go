@@ -43,6 +43,49 @@ type Metrics struct {
 	// ceiling is 256, and a distribution pressed against it is a fleet about to start
 	// waiting.
 	InboxDepth prometheus.Histogram
+	// CommandsDeliveredAgain counts commands handed out that had been handed out before,
+	// by where this delivery came from.
+	//
+	// It is the fleet doing the same work twice, and it is a counter rather than a gauge
+	// on purpose: the reclaim pass looks at a rotating window of sessions, so a gauge
+	// would be making a claim about the sessions this pass did not look at. A counter
+	// claims nothing beyond what was seen.
+	//
+	// `source="read"` is the one that matters and the one an instrument built on the
+	// reclaim alone cannot see. A wake the fleet cannot act on is handed back unrun and
+	// read out of the pending history on the very next block, so its idle never grows
+	// past a couple of seconds and no claim ever looks at it; measured on 2771941, twenty
+	// redeliveries in forty-five seconds, none of them visible to a claim.
+	CommandsDeliveredAgain *prometheus.CounterVec
+	// CommandsReclaimed counts commands a claim took back, by the consumer that was
+	// holding them.
+	//
+	// The label is what separates "the fleet is busy" from "one instance took commands
+	// and stopped answering", and it is the instance that went quiet whose own metrics
+	// nobody is reading. Its cardinality has the fleet's own ceiling, unlike a session id.
+	CommandsReclaimed *prometheus.CounterVec
+	// CommandRedeliveries is how many times Redis said a command a claim took back had
+	// been delivered when the claim listed it, not counting the claim itself.
+	//
+	// Not counting it because how many times a claim reaches Redis is not knowable from
+	// the side that sent it: a lost answer has go-redis send XCLAIM again, and the
+	// second one increments the delivery counter with the caller told nothing. Adding
+	// one for the claim would be short by every retry, during exactly the connection
+	// trouble this is here to show.
+	//
+	// A counter says the fleet is retrying; this says whether that is many commands once
+	// or one command forever, which is the difference #224's third question turns on and
+	// the number nobody can pick a retry ceiling without. Only a claim can observe it,
+	// so it does not see the read loop above: the two together are the whole picture and
+	// neither is on its own.
+	CommandRedeliveries prometheus.Histogram
+	// CommandReclaimPasses counts reclaim passes that completed, whatever they found.
+	//
+	// Without it, a fleet that is retrying nothing and a build where nobody writes the
+	// three metrics above look identical from outside: a counter with no children is
+	// absent from the exposition entirely, so "zero" and "not measured" are the same
+	// text. This is the series that says the loop ran.
+	CommandReclaimPasses prometheus.Counter
 	// EmissionsDropped counts events the inbox had no room for and whose caller chose
 	// not to wait. Presence does that by design and an inbound delivery does it once
 	// its bound runs out; the client is never told either way, so this is the only
@@ -85,6 +128,28 @@ func New() *Metrics {
 			Help:    "Time an event waited for room in its session's inbox before the pump took it.",
 			Buckets: []float64{.001, .01, .1, .5, 1, 5, 15, 60},
 		}),
+		CommandsDeliveredAgain: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "wac_commands_delivered_again_total",
+			Help: "Commands handed out that had been handed out before, by where this delivery came from. " +
+				"source=restored is one this instance gave back unrun and took again through its own claim, which is the loop a wake nobody can act on makes; " +
+				"source=claim is one a claim took off another consumer; " +
+				"source=read is one that came back out of the pending history in a read.",
+		}, []string{"source", "sid"}),
+		CommandsReclaimed: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "wac_commands_reclaimed_total",
+			Help: "Commands a claim took back from another consumer, by the consumer that was holding them. " +
+				"A command this instance gave back unrun and took again through its own claim is not in it: it was taken from nobody.",
+		}, []string{"from"}),
+		CommandRedeliveries: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name: "wac_command_redeliveries",
+			Help: "How many times Redis said a reclaimed command had been delivered when the claim listed it, not counting the claim itself. " +
+				"Only a claim can read this, so commands coming back through the read loop are not in it.",
+			Buckets: []float64{1, 2, 3, 5, 10, 25, 100, 1000},
+		}),
+		CommandReclaimPasses: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "wac_command_reclaim_passes_total",
+			Help: "Reclaim passes that completed, whatever they found. Tells a fleet retrying nothing from a build where nobody writes these.",
+		}),
 		EmissionsDropped: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "wac_emissions_dropped_total",
 			Help: "Events the session inbox had no room for, by event type.",
@@ -98,6 +163,7 @@ func New() *Metrics {
 	registry.MustRegister(
 		m.SessionsRunning, m.EventsPublished, m.CommandDuration, m.LeasesLost,
 		m.CommandReadsFailed, m.CommandReadLastSuccess, m.EmissionWait, m.InboxDepth, m.EmissionsDropped,
+		m.CommandsDeliveredAgain, m.CommandsReclaimed, m.CommandRedeliveries, m.CommandReclaimPasses,
 	)
 	return m
 }
