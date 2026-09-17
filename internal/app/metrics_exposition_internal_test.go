@@ -223,8 +223,8 @@ func TestWhatAScrapeShowsAboutCommandsHandedOutAgain(t *testing.T) {
 		Command:         protocol.Command{SID: "wac224-taken", Type: protocol.CommandSessionConnect},
 		DeliveredBefore: true,
 		TakenFrom:       "connector-b",
-		// What the transport hands over: XPENDING said two, and the claim that follows
-		// makes it three.
+		// What the transport hands over: the count XPENDING listed, with nothing added
+		// for the claim that took it.
 		Deliveries: 3,
 	}})
 	// And one arriving new, which is not a redelivery and must not move anything.
@@ -252,7 +252,7 @@ wac_commands_reclaimed_total{from="connector-b"} 1
 	// The whole histogram family, buckets and sum together. The sum is what separates
 	// "observed the three deliveries Redis reported" from "observed zero", which every
 	// bucket above the first reads the same for.
-	const redeliveries = `# HELP wac_command_redeliveries How many times Redis says a reclaimed command had been delivered, counting that one. Only a claim can read this, so commands coming back through the read loop are not in it.
+	const redeliveries = `# HELP wac_command_redeliveries How many times Redis said a reclaimed command had been delivered when the claim listed it, not counting the claim itself. Only a claim can read this, so commands coming back through the read loop are not in it.
 # TYPE wac_command_redeliveries histogram
 wac_command_redeliveries_bucket{le="1"} 0
 wac_command_redeliveries_bucket{le="2"} 0

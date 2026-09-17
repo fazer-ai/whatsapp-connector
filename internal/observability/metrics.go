@@ -64,8 +64,14 @@ type Metrics struct {
 	// and stopped answering", and it is the instance that went quiet whose own metrics
 	// nobody is reading. Its cardinality has the fleet's own ceiling, unlike a session id.
 	CommandsReclaimed *prometheus.CounterVec
-	// CommandRedeliveries is how many times Redis says a command a claim took back had
-	// been delivered, counting that one.
+	// CommandRedeliveries is how many times Redis said a command a claim took back had
+	// been delivered when the claim listed it, not counting the claim itself.
+	//
+	// Not counting it because how many times a claim reaches Redis is not knowable from
+	// the side that sent it: a lost answer has go-redis send XCLAIM again, and the
+	// second one increments the delivery counter with the caller told nothing. Adding
+	// one for the claim would be short by every retry, during exactly the connection
+	// trouble this is here to show.
 	//
 	// A counter says the fleet is retrying; this says whether that is many commands once
 	// or one command forever, which is the difference #224's third question turns on and
@@ -133,7 +139,7 @@ func New() *Metrics {
 		}, []string{"from"}),
 		CommandRedeliveries: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name: "wac_command_redeliveries",
-			Help: "How many times Redis says a reclaimed command had been delivered, counting that one. " +
+			Help: "How many times Redis said a reclaimed command had been delivered when the claim listed it, not counting the claim itself. " +
 				"Only a claim can read this, so commands coming back through the read loop are not in it.",
 			Buckets: []float64{1, 2, 3, 5, 10, 25, 100, 1000},
 		}),

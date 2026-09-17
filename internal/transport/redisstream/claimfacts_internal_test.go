@@ -51,10 +51,11 @@ func TestAClaimSaysWhoHeldTheEntryAndHowOftenItWentOut(t *testing.T) {
 	if !claimed[0].DeliveredBefore {
 		t.Error("an entry a claim took back says it is arriving new")
 	}
-	// Twice: once to the peer that died with it, once to this claim. XPENDING answers
-	// before the XCLAIM that follows it, and XCLAIM is what makes it two.
-	if got := claimed[0].Deliveries; got != 2 {
-		t.Errorf("the claim says the entry had been delivered %d times, want 2: the count "+
-			"promises to include this delivery, and XPENDING answers before the claim that makes it", got)
+	// Once: to the peer that died with it. The claim taking it back is not in the number
+	// and must not be added to it, because how many times that claim reached Redis is
+	// not knowable from here.
+	if got := claimed[0].Deliveries; got != 1 {
+		t.Errorf("the claim says the entry had been delivered %d times, want 1: what Redis "+
+			"reported when the claim listed it, with nothing added for a claim still in flight", got)
 	}
 }

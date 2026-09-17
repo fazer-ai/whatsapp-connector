@@ -91,9 +91,17 @@ type Delivery struct {
 	// which is a question nothing else here can answer: the instance that went quiet is
 	// precisely the one whose own metrics nobody is reading.
 	TakenFrom string
-	// Deliveries is how many times Redis says this entry has been handed out, counting
-	// this one, and is zero where that could not be read. Only a claim can know it: it
-	// comes from XPENDING, and a read never asks.
+	// Deliveries is how many times Redis said this entry had been handed out when the
+	// claim listed it, not counting the claim itself, and is zero where that could not
+	// be read. Only a claim can know it: it comes from XPENDING, and a read never asks.
+	//
+	// Up to the claim and no further, because past that the number would be a guess
+	// about a command still on the wire. XCLAIM increments the delivery counter, so
+	// adding one for the claim about to happen is right exactly when the claim happens
+	// once -- and go-redis sends a command again when its answer never arrives, which is
+	// the failure this instrument exists to make visible. Measured on a real Redis with
+	// the claim's answer cut: XCLAIM ran twice, the counter went from 1 to 3, and the
+	// caller was handed a successful claim with no sign that anything had been retried.
 	Deliveries int64
 	// Internal says this command came from the connector rather than from a client: the
 	// resume sweep synthesises a `session.connect` for an account whose owner went away,

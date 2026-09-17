@@ -977,10 +977,14 @@ func (s *Streams) reclaimable(ctx context.Context, stream string, minIdle time.D
 				continue
 			}
 			ids = append(ids, entry.ID)
-			// Plus the claim that is about to happen. XPENDING answers before XCLAIM, and
-			// XCLAIM increments the entry's delivery counter, so what Redis reports here
-			// is one short of the number the caller will be handed.
-			was[entry.ID] = pending{before: true, consumer: entry.Consumer, deliveries: entry.RetryCount + 1}
+			// As Redis reports it, with nothing added for the claim about to happen. That
+			// claim does increment the delivery counter, but how many times is not
+			// knowable from here: go-redis sends a command again when its answer never
+			// arrives, and a retried XCLAIM increments it once more with the caller
+			// hearing about none of it. A count taken here is a fact; one adjusted for
+			// work still on the wire is a guess, and it is short precisely during the
+			// connection trouble this is meant to show.
+			was[entry.ID] = pending{before: true, consumer: entry.Consumer, deliveries: entry.RetryCount}
 		}
 		if len(ids) >= int(s.opts.ReadCount) || int64(len(entries)) < s.opts.ReadCount {
 			return ids, was, nil
