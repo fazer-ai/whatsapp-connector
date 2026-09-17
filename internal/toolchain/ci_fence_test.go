@@ -84,8 +84,13 @@ func gatesAChange(on *yaml.Node) bool {
 		case "pull_request", "pull_request_target", "merge_group":
 			return true
 		case "push":
-			// `push: tags: [v*]` is a release. `push` bare, or with branches, is a change.
-			if trigger.with == nil || hasKey(trigger.with, "branches") {
+			// Excluded by what it IS, not by what it declares. `push` with a tag filter and
+			// no branch filter is a release; everything else -- bare, `branches`, `paths`,
+			// `branches-ignore`, an empty mapping -- runs on a branch push and gates a
+			// change. Written the other way round, as "counts only with an explicit
+			// `branches`", four ordinary forms filed themselves as releases and took a
+			// whole workflow out of the fence with nothing to say so.
+			if !tagOnly(trigger.with) {
 				return true
 			}
 		}
@@ -120,6 +125,17 @@ func triggers(on *yaml.Node) []trigger {
 		return out
 	}
 	return nil
+}
+
+// tagOnly reports GitHub's rule for a push trigger: a tag filter with no branch filter
+// runs on tags alone. With neither, or with any branch filter, the workflow sees branch
+// pushes too.
+func tagOnly(with *yaml.Node) bool {
+	if with == nil {
+		return false
+	}
+	return (hasKey(with, "tags") || hasKey(with, "tags-ignore")) &&
+		!hasKey(with, "branches") && !hasKey(with, "branches-ignore")
 }
 
 func hasKey(mapping *yaml.Node, key string) bool {
@@ -279,8 +295,15 @@ func TestGatesAChangeReadsTheTriggers(t *testing.T) {
 		{on: "on: pull_request\n", want: true},
 		{on: "on:\n  merge_group:\n", want: true},
 		{on: "on:\n  push:\n", want: true},
+		// Every form that runs on a branch push without saying `branches`. Each of these
+		// filed itself as a release under the first version of this rule.
+		{on: "on:\n  push:\n    paths: ['**/*.go']\n", want: true},
+		{on: "on:\n  push:\n    branches-ignore: [release]\n", want: true},
+		{on: "on:\n  push: {}\n", want: true},
+		{on: "on:\n  push:\n    tags: ['v*']\n    branches: [main]\n", want: true},
 		// A release: it runs over what was already merged, and gates no change.
 		{on: "on:\n  push:\n    tags: ['v*']\n  workflow_dispatch:\n"},
+		{on: "on:\n  push:\n    tags-ignore: ['v0.*']\n"},
 		{on: "on:\n  schedule:\n    - cron: '0 0 * * *'\n"},
 		{on: "on: workflow_dispatch\n"},
 	} {
