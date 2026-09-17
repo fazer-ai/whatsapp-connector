@@ -79,14 +79,14 @@ test-postgres: ## Run the test suite against a PostgreSQL server (WAC_TEST_DATAB
 	  exit 1; }
 	$(GO) test -count=1 $(PACKAGES)
 
-test-redis: ## Run the pass that needs a real Redis (WAC_TEST_REDIS_URL)
+test-redis: ## Run the passes that need a real Redis (WAC_TEST_REDIS_URL)
 	@test -n "$(WAC_TEST_REDIS_URL)" || { \
 	  echo "$(test-redis_VAR) is unset or empty. It names the server this pass runs against:"; \
 	  echo "  $(test-redis_RUN)"; \
 	  echo "  $(test-redis_VAR)=$(test-redis_URL) make test-redis"; \
 	  echo "(any free port will do; 56379 only avoids whatever is already on 6379)"; \
 	  exit 1; }
-	$(GO) test -count=1 ./internal/transport/redisstream
+	$(GO) test -count=1 ./internal/transport/redisstream ./internal/cluster
 
 test-cover: ## Run the test suite and write coverage.txt
 	WAC_TEST_DATABASE_URL= WAC_TEST_REDIS_URL= $(GO) test -race -coverprofile=coverage.txt -covermode=atomic $(PACKAGES)
