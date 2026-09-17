@@ -41,7 +41,7 @@ const DefaultIdempotencyTTL = 24 * time.Hour
 // Not WhatsApp dropping it. WhatsApp delivers a resend under an id it has already seen
 // in full, with no window at all -- measured from an immediate resend out to thirty
 // minutes apart, direct and group alike (#215). Every client downstream deduplicates on
-// the message id, which `contract/README.md` states as an obligation and which the
+// the message id, which `contract/PROTOCOL.md` states as an obligation and which the
 // connector's own inbound path already relies on in several places. Reserving before the
 // effect was weighed again against that measurement and is still not worth building: it
 // would answer `indeterminate` for a crash during a media upload, where the message

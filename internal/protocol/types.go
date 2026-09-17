@@ -98,7 +98,7 @@ const (
 // because some producer could emit each of them one day, and because Valid and the
 // fixture test are about the contract rather than about this build's reach. A type no
 // producer can ever emit is removed instead, which is how the two account limit events
-// left (contract/README.md, under Compatibility).
+// left (contract/PROTOCOL.md, under Compatibility).
 var AllEventTypes = []EventType{
 	EventSessionState,
 	EventSessionLoggedOut,

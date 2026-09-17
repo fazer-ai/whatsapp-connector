@@ -907,7 +907,7 @@ func (s *Session) carryOut(ctx context.Context, command *protocol.Command) (json
 		// carries the id the first attempt used, and every client downstream discards a
 		// repeat of an id it already has. The discarding is theirs and not WhatsApp's:
 		// WhatsApp delivers the second copy in full, whatever the gap (#215). The window
-		// is real; what makes it survivable is the obligation `contract/README.md` puts
+		// is real; what makes it survivable is the obligation `contract/PROTOCOL.md` puts
 		// on a client, and the same one the inbound path already spends freely.
 		// On a context of its own, because the command's deadline may have run out in
 		// the same instant the work finished, and a record that is not written is a

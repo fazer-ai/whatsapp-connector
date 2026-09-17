@@ -53,6 +53,14 @@ internal/media/      blob store, inbound download, outbound fetch
 - `contract/` is language neutral. Never put Go (or any other language) files in it:
   clients vendor the directory verbatim and compare checksums, so an extra file
   shows up as drift on their side.
+- **The prose has two halves, and only one of them travels.** `contract/PROTOCOL.md` is the
+  contract a client is held to: transport, compatibility, conventions, RPC results. It is
+  vendored and counted in the client's checksum. `contract/README.md` is orientation for
+  somebody reading the directory here, and the Chatwoot sync deletes it, so anything written
+  there is invisible to the side it addresses. Every obligation on the consuming side goes in
+  `PROTOCOL.md`; `internal/protocol/contract_prose_test.go` fails the suite when one lands in
+  the README instead. #222 shipped a client obligation into the half that does not travel with
+  the suite and CI green, because until #223 nothing read that file.
 - Changing a frame means changing `contract/schema/protocol.schema.json`, adding or
   updating a fixture in `contract/fixtures/`, and updating `internal/protocol`. The
   contract test fails when a frame **type** has no fixture, when a fixture names a type

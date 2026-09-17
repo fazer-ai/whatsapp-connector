@@ -150,7 +150,7 @@ func (s *Session) readyToSend() error {
 // however long ago the first one went -- measured from an immediate resend out to thirty
 // minutes, direct and group alike (#215). What makes the retry safe is that every client
 // downstream drops the repeat, which is the same property the inbound path here already
-// spends, and which `contract/README.md` now asks of a client in so many words.
+// spends, and which `contract/PROTOCOL.md` now asks of a client in so many words.
 func (s *Session) putOnTheWire(
 	ctx context.Context, to waTypes.JID, messageID string, message *waE2E.Message,
 ) (wm.SendResponse, error) {
