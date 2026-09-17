@@ -33,12 +33,11 @@ const ConsumerGroup = "connector"
 // deployment can trade memory for backlog, not because any of them is a tuning knob
 // worth touching by default.
 const (
-	DefaultCommandMaxLen = 1000
-	DefaultEventMaxLen   = 20000
-	DefaultBlock         = 5 * time.Second
-	DefaultReplyTTL      = 60 * time.Second
-	DefaultClaimMinIdle  = 30 * time.Second
-	DefaultReadCount     = 64
+	DefaultEventMaxLen  = 20000
+	DefaultBlock        = 5 * time.Second
+	DefaultReplyTTL     = 60 * time.Second
+	DefaultClaimMinIdle = 30 * time.Second
+	DefaultReadCount    = 64
 )
 
 // Options configures the streams. The zero value asks for the defaults above.
@@ -51,13 +50,12 @@ type Options struct {
 	// otherwise silent by design -- it answers its callers and they decide what is worth
 	// saying -- but a trim that cut undelivered commands leaves a reading the next read
 	// destroys, so there is nobody left to tell afterwards.
-	Logger        zerolog.Logger
-	EventMaxLen   int64
-	CommandMaxLen int64
-	Block         time.Duration
-	ReplyTTL      time.Duration
-	ClaimMinIdle  time.Duration
-	ReadCount     int64
+	Logger       zerolog.Logger
+	EventMaxLen  int64
+	Block        time.Duration
+	ReplyTTL     time.Duration
+	ClaimMinIdle time.Duration
+	ReadCount    int64
 	// ReadBackMaxAge is the oldest an entry on the control stream may be and still be
 	// handed out by a read that recovers it, rather than left to a claim. It has to be
 	// shorter than ClaimMinIdle, and the zero value asks for half of it. See Read.
@@ -127,9 +125,6 @@ func New(client *redisx.Client, opts Options) (*Streams, error) {
 	}
 	if opts.EventMaxLen <= 0 {
 		opts.EventMaxLen = DefaultEventMaxLen
-	}
-	if opts.CommandMaxLen <= 0 {
-		opts.CommandMaxLen = DefaultCommandMaxLen
 	}
 	if opts.Block <= 0 {
 		opts.Block = DefaultBlock
