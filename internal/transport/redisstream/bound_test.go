@@ -10,10 +10,10 @@ import (
 
 // The only MAXLEN this connector emits, and until #246 nothing watched it.
 //
-// Measured while removing `CommandMaxLen`, the option beside this one that nothing read:
-// take `MaxLen` and `Approx` off the `XAdd` in Publish and the whole suite still passes.
-// The bound was being written and never observed, which is the same state the option next
-// to it was in, one step further along.
+// Measured while removing the neighbouring option that nothing read (#246): take `MaxLen`
+// and `Approx` off the `XAdd` in Publish and the whole suite still passes. The bound was
+// being written and never observed, which is the same state the option next to it was in,
+// one step further along.
 //
 // Asserted through Publish rather than by reading the args, because what has to be true is
 // that Redis received the bound: go-redis omits MAXLEN entirely when the field is zero

@@ -12,20 +12,22 @@ import (
 	"testing"
 )
 
-// `CommandMaxLen` was a field of Options with a default, a normalisation in New, and no
-// reader anywhere else: the four lines only ever spoke to each other (#246). It sat beside
-// `EventMaxLen`, which has the same shape and is wired, so neither grep nor review
-// separated them -- the two were written together and only one was connected.
+// The field #246 removed had a default, a normalisation in New, and no reader anywhere
+// else: the four lines only ever spoke to each other. It sat beside EventMaxLen, which has
+// the same shape and is wired, so neither grep nor review separated them -- the two were
+// written together and only one was connected. The name is deliberately not repeated here;
+// it names nothing this build has, and the issue is where it stays legible.
 //
 // The fence has to be "read outside New", not "read anywhere", and that distinction is the
-// whole test. `CommandMaxLen` *was* read, by its own `if opts.CommandMaxLen <= 0`, so a
-// fence that accepts any read at all goes green on precisely the field it exists to catch.
-// Normalising a field is not using it; it is preparing it for a use that has to exist
-// somewhere else.
+// whole test. The removed field *was* read: `if opts.X <= 0` reads X, so a fence that
+// accepts any read at all goes green on precisely the field it exists to catch, and on
+// every future field that has a default, because having a default is what produces that
+// read. Normalising a field is not using it; it is preparing it for a use that has to
+// exist somewhere else.
 //
 // A field that genuinely has nothing to do past construction goes here with the reason,
 // the same way internal/redisx marks the keys the connector does not render. There is none
-// today, and an empty map is the honest starting state rather than a placeholder.
+// today, and an empty map is the state the package is in rather than a placeholder.
 var optionsFieldsNothingReadsOutsideNew = map[string]string{}
 
 func TestEveryOptionsFieldIsReadOutsideNew(t *testing.T) {
