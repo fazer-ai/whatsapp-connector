@@ -946,12 +946,24 @@ const (
 	sessionLabel  = "sid"
 	consumerLabel = "from"
 
-	// The two values of the source label, which is the whole of it: a delivery either
-	// came back out of the pending history or was taken back by a claim. Named because
-	// eviction has to spell the same pair the counting does, and a pair spelled twice is
-	// a pair that drifts.
+	// The values of the source label. Named because eviction has to spell the same set
+	// the counting does, and a set spelled twice is a set that drifts -- which it did
+	// the moment a third value was added to a `DeleteLabelValues` pair written by hand.
+	// `everySource` below is the one list, and a fence keeps it honest.
 	sourceRead  = "read"
 	sourceClaim = "claim"
+	// The third case, and the one the issue's question 3 describes. A wake the fleet
+	// cannot adopt is given back unrun; `rememberAge` stamps it with the claim delay so
+	// that the next claim takes it rather than the read leaving it pending forever, and
+	// it comes back with XPENDING naming this instance as the holder. Measured at this
+	// HEAD on the bench that reproduces the sealed scenario s8: fifty stuck sessions,
+	// 6450 deliveries in four minutes and twenty-five seconds, every one of them this
+	// instance taking back its own.
+	//
+	// Folded into `claim` it made two readings false at once: an operator reading
+	// "reclaimed" saw a fleet taking work off each other when nothing of the sort was
+	// happening, and the `from` label accused every instance of having stopped answering.
+	sourceRestored = "restored"
 
 	// labelQuiet is how long a label value goes uncounted before its series is dropped.
 	//
@@ -961,6 +973,11 @@ const (
 	// tight. Short enough that what a process has stopped seeing leaves within the hour.
 	labelQuiet = 30 * time.Minute
 )
+
+// everySource is every value the source label takes, which is what eviction walks. A
+// value counted and not listed here keeps its series for the life of the process, and
+// nothing about the exposition would say so.
+var everySource = []string{sourceRead, sourceClaim, sourceRestored}
 
 // noteLabel records that something was counted against a label value just now.
 func (c *Connector) noteLabel(metric, value string, at time.Time) {
@@ -991,8 +1008,9 @@ func (c *Connector) forgetLabelsGoneQuiet(now time.Time) {
 			// vector once per call: a batch of sessions expiring together would then be
 			// quadratic, on the goroutine that renews every lease this instance holds.
 			// That goroutine is already bounded twice over for the same reason.
-			c.metrics.CommandsDeliveredAgain.DeleteLabelValues(sourceRead, label.value)
-			c.metrics.CommandsDeliveredAgain.DeleteLabelValues(sourceClaim, label.value)
+			for _, source := range everySource {
+				c.metrics.CommandsDeliveredAgain.DeleteLabelValues(source, label.value)
+			}
 		case consumerLabel:
 			c.metrics.CommandsReclaimed.DeleteLabelValues(label.value)
 		}
@@ -1019,19 +1037,33 @@ func (c *Connector) measure(deliveries []transport.Delivery) {
 	now := time.Now()
 	for i := range deliveries {
 		d := &deliveries[i]
+		// Taken back from this instance itself, which is what a wake given back unrun
+		// and aged comes back as. It is a claim, and it is not a reclaim from a peer.
+		own := d.TakenFrom != "" && d.TakenFrom == c.cfg.Instance
 		if d.TakenFrom != "" {
 			// A claim: only XPENDING reports who held it and how many times it went out.
-			c.metrics.CommandsReclaimed.WithLabelValues(d.TakenFrom).Inc()
-			c.noteLabel(consumerLabel, d.TakenFrom, now)
+			// The count goes in whoever held it, because "one command forever" is the
+			// question it answers and that is the same question either way.
 			if d.Deliveries > 0 {
 				c.metrics.CommandRedeliveries.Observe(float64(d.Deliveries))
+			}
+			// The consumer label separates a busy fleet from one instance that stopped
+			// answering, so it takes the name of a peer and nobody else. This instance
+			// naming itself there is a false positive on that alarm, and it fires hardest
+			// during the incident the metric exists to show.
+			if !own {
+				c.metrics.CommandsReclaimed.WithLabelValues(d.TakenFrom).Inc()
+				c.noteLabel(consumerLabel, d.TakenFrom, now)
 			}
 		}
 		if !d.DeliveredBefore {
 			continue
 		}
 		source := sourceRead
-		if d.TakenFrom != "" {
+		switch {
+		case own:
+			source = sourceRestored
+		case d.TakenFrom != "":
 			source = sourceClaim
 		}
 		sid := d.Command.SID

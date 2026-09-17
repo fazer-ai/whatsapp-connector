@@ -208,7 +208,7 @@ func TestWhatAScrapeShowsAboutCommandsHandedOutAgain(t *testing.T) {
 	t.Parallel()
 
 	metrics := observability.New()
-	c := &Connector{metrics: metrics}
+	c := &Connector{metrics: metrics, cfg: Config{Instance: "inst-under-test"}}
 
 	// A wake the fleet cannot act on, coming back out of the pending history four times,
 	// which no claim ever sees because its idle never grows. Then one command claimed
@@ -232,7 +232,7 @@ func TestWhatAScrapeShowsAboutCommandsHandedOutAgain(t *testing.T) {
 		Command: protocol.Command{SID: "wac224-fresh", Type: protocol.CommandSessionConnect},
 	}})
 
-	const again = `# HELP wac_commands_delivered_again_total Commands handed out that had been handed out before, by where this delivery came from. source=read is a command coming back out of the pending history, which no claim ever sees.
+	const again = `# HELP wac_commands_delivered_again_total Commands handed out that had been handed out before, by where this delivery came from. source=restored is one this instance gave back unrun and took again through its own claim, which is the loop a wake nobody can act on makes; source=claim is one a claim took off another consumer; source=read is one that came back out of the pending history in a read.
 # TYPE wac_commands_delivered_again_total counter
 wac_commands_delivered_again_total{sid="wac224-loop",source="read"} 4
 wac_commands_delivered_again_total{sid="wac224-taken",source="claim"} 1
@@ -241,7 +241,7 @@ wac_commands_delivered_again_total{sid="wac224-taken",source="claim"} 1
 		t.Errorf("what a scrape shows for commands handed out again:\n%v", err)
 	}
 
-	const reclaimed = `# HELP wac_commands_reclaimed_total Commands a claim took back, by the consumer that was holding them.
+	const reclaimed = `# HELP wac_commands_reclaimed_total Commands a claim took back from another consumer, by the consumer that was holding them. A command this instance gave back unrun and took again through its own claim is not in it: it was taken from nobody.
 # TYPE wac_commands_reclaimed_total counter
 wac_commands_reclaimed_total{from="connector-b"} 1
 `
@@ -283,7 +283,7 @@ func TestALabelGoneQuietTakesItsSeriesWithIt(t *testing.T) {
 	t.Parallel()
 
 	metrics := observability.New()
-	c := &Connector{metrics: metrics}
+	c := &Connector{metrics: metrics, cfg: Config{Instance: "inst-under-test"}}
 
 	c.measure([]transport.Delivery{{
 		Command:         protocol.Command{SID: "wac224-quiet", Type: protocol.CommandSessionConnect},

@@ -131,11 +131,14 @@ func New() *Metrics {
 		CommandsDeliveredAgain: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "wac_commands_delivered_again_total",
 			Help: "Commands handed out that had been handed out before, by where this delivery came from. " +
-				"source=read is a command coming back out of the pending history, which no claim ever sees.",
+				"source=restored is one this instance gave back unrun and took again through its own claim, which is the loop a wake nobody can act on makes; " +
+				"source=claim is one a claim took off another consumer; " +
+				"source=read is one that came back out of the pending history in a read.",
 		}, []string{"source", "sid"}),
 		CommandsReclaimed: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "wac_commands_reclaimed_total",
-			Help: "Commands a claim took back, by the consumer that was holding them.",
+			Help: "Commands a claim took back from another consumer, by the consumer that was holding them. " +
+				"A command this instance gave back unrun and took again through its own claim is not in it: it was taken from nobody.",
 		}, []string{"from"}),
 		CommandRedeliveries: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name: "wac_command_redeliveries",
