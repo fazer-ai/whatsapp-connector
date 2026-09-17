@@ -327,3 +327,61 @@ func TestAPingInTimeStillAnswers(t *testing.T) {
 		t.Fatalf("a ping inside its deadline was refused: %+v", reply.Error)
 	}
 }
+
+// stallQuarantine holds every write the quarantine makes, for as long as it is told to.
+// `HIncrBy` is the first of them and the one Strike blocks on before anything else runs.
+type stallQuarantine struct {
+	for_ time.Duration
+	on   atomic.Bool
+}
+
+func (h *stallQuarantine) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (h *stallQuarantine) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+
+func (h *stallQuarantine) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if h.on.Load() && cmd.Name() == "hincrby" {
+			select {
+			case <-time.After(h.for_):
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		return next(ctx, cmd)
+	}
+}
+
+// TestAStalledStrikeStillLetsThePeerHaveTheAccount is the two-instance regression for the
+// window this round put in front of a hand-back.
+//
+// An adoption that cannot open the account does two things on the way out: it records the
+// failure, so the fleet's backoff starts, and it gives the lease back, so a peer whose
+// build may not be broken can try. Both run inside one two-second budget, and the strike
+// goes first. `ackTimeout` is also two seconds, so before `failing` learned to take a share
+// a Redis that stopped answering would let the strike spend the whole thing and hand the
+// release a context that had already expired -- leaving a lease held for a session that
+// never opened, with every peer blocked on it until a later tick.
+//
+// Measured from the peer's side, because that is where it hurts: what matters is not that
+// `abandon` was called, it is that instance B can take the account.
+func TestAStalledStrikeStillLetsThePeerHaveTheAccount(t *testing.T) {
+	t.Parallel()
+	h := newBackoffHarness(t)
+	const sid = "sess-shut"
+
+	stall := &stallQuarantine{for_: 90 * time.Second}
+	stall.on.Store(true)
+	h.rdb.AddHook(stall)
+
+	if _, err := h.manager.Adopt(t.Context(), sid); !errors.Is(err, errCannotOpen) {
+		t.Fatalf("Adopt: got %v, want %v", err, errCannotOpen)
+	}
+
+	peer := cluster.NewLeases(redisx.Wrap(h.rdb, "wa:", 8), "inst-b", cluster.Options{})
+	if _, err := peer.Acquire(t.Context(), sid); err != nil {
+		t.Fatalf("the peer could not take an account the first instance never opened: %v", err)
+	}
+}

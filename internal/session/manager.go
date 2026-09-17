@@ -1558,11 +1558,24 @@ func (m *Manager) working(ctx context.Context, sid string) {
 //
 // Bounded and detached for the reason working is: it is called from the executor, where
 // what waits behind it is every command for this account.
+//
+// A share of the caller's window rather than all of it, and that is load-bearing at both
+// call sites: a hand-back runs immediately behind this one, and `ackTimeout` is the same
+// two seconds `releaseTimeout` is, so a strike against a Redis that has stopped answering
+// would spend the whole budget and hand `abandon` a context that has already expired. The
+// lease of a session that never opened would then stay held, and every peer is blocked on
+// it until a later tick gets round to the orphan -- which is the opposite of what letting
+// the account go is for.
+//
+// The order is not the thing to change here, though it looks like the cheaper fix. The
+// strike goes first on purpose: release the lease and a peer's resume sweep finds the
+// account free with nothing yet saying to leave it alone, and starts the same attempt
+// over. Sharing keeps that ordering and still leaves the hand-back a window to land in.
 func (m *Manager) failing(ctx context.Context, sid string) {
 	if m.quarantine == nil {
 		return
 	}
-	count, cancel := context.WithTimeout(ctx, ackTimeout)
+	count, cancel := context.WithTimeout(ctx, m.sharing(ctx, ackTimeout))
 	defer cancel()
 	until, err := m.quarantine.Strike(count, sid)
 	if err != nil {
