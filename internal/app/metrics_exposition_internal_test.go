@@ -121,8 +121,8 @@ func TestWhatAScrapeShowsForTheThreeThatCountedNothing(t *testing.T) {
 	w.CommandDone(protocol.CommandMessageSend, "ok", 250*time.Millisecond)
 	w.CommandDone(protocol.CommandMessageSend, string(protocol.ErrorRateLimited), 2*time.Second)
 	w.CommandDone("whatever-the-client-wrote", string(protocol.ErrorInvalidPayload), time.Millisecond)
-	w.LeaseLost()
-	w.LeaseLost()
+	w.LeaseLost("wac224-lease")
+	w.LeaseLost("wac224-lease")
 
 	published := `
 # HELP wac_events_published_total Events published to the client, by event type.

@@ -180,11 +180,12 @@ func New(cfg *Config, log zerolog.Logger) (connector *Connector, err error) {
 	}
 
 	quarantine := cluster.NewQuarantine(client, nil)
+	watch := &watching{metrics: metrics}
 	manager := session.NewManager(&session.ManagerConfig{
 		Instance: cfg.Instance, Engine: waEngine, Leases: leases,
 		Publisher: countingPublisher{to: streams, metrics: metrics}, Replier: streams,
 		Ledger:     redisx.NewIdempotency(client, 0),
-		Watch:      watching{metrics: metrics},
+		Watch:      watch,
 		Quarantine: quarantine,
 		NewID:      newFrameID, Logger: log,
 	})
@@ -194,6 +195,7 @@ func New(cfg *Config, log zerolog.Logger) (connector *Connector, err error) {
 		registry: cluster.NewRegistry(client, 3*cfg.Heartbeat), manager: manager, engine: waEngine,
 		store: devices, blobs: blobs,
 	}
+	watch.owner = c
 
 	c.http = httpserver.New(httpserver.Options{
 		Addr: cfg.HTTPAddr, Health: c, Registry: metrics.Registry,
@@ -1018,6 +1020,34 @@ func (c *Connector) forgetLabelsGoneQuiet(now time.Time) {
 	}
 }
 
+// forgetSession drops what was counted against a session this instance has stopped
+// running, at the moment it stops.
+//
+// The eviction by silence below is the backstop and it is not enough on its own: it
+// keeps a series for `labelQuiet` after the last count, which for a session this
+// instance no longer has means the set of series reads as "every session it ever had"
+// for half an hour. The sealed scenario for this asks for a few heartbeats.
+//
+// Keyed on the session stopping and not on this instance not owning it, and the
+// difference is the whole reason an earlier attempt was reverted: a sweep over "sessions
+// I do not own" deletes the series of a `session.wake` the fleet cannot adopt, which
+// names a session nobody holds, and that is the one series this metric was built for.
+// This fires once, for a session that was being run here and is not any more, which is
+// the event `wac_leases_lost_total` counts; a session this instance never had never
+// reaches it.
+func (c *Connector) forgetSession(sid string) {
+	if sid == "" {
+		return
+	}
+	c.seenMu.Lock()
+	delete(c.seen, seenLabel{metric: sessionLabel, value: sid})
+	c.seenMu.Unlock()
+
+	for _, source := range everySource {
+		c.metrics.CommandsDeliveredAgain.DeleteLabelValues(source, sid)
+	}
+}
+
 // noSession labels what came off the control stream, which names no session of its own.
 // A constant rather than the empty string: an empty label value and an absent label read
 // the same in some tooling, and this one is a real category.
@@ -1292,9 +1322,16 @@ func (c countingPublisher) Publish(ctx context.Context, event *protocol.Event) e
 // where the registry is, and `internal/session` has no business knowing what Prometheus
 // is. Between the two of them they are the route whose absence left three metrics
 // registered and never written (#226).
-type watching struct{ metrics *observability.Metrics }
+// watching is what the session layer reports to. It reaches the connector because one
+// of the things it reports, a lease this instance stopped running a session over, is the
+// moment a series labelled by that session stops being about a session this instance has.
+// Assigned after the connector exists, because the manager needs the watcher to be built.
+type watching struct {
+	metrics *observability.Metrics
+	owner   *Connector
+}
 
-func (w watching) CommandDone(kind protocol.CommandType, outcome string, took time.Duration) {
+func (w *watching) CommandDone(kind protocol.CommandType, outcome string, took time.Duration) {
 	w.metrics.CommandDuration.WithLabelValues(commandLabel(kind), outcome).Observe(took.Seconds())
 }
 
@@ -1317,4 +1354,9 @@ func commandLabel(kind protocol.CommandType) string {
 	return string(kind)
 }
 
-func (w watching) LeaseLost() { w.metrics.LeasesLost.Inc() }
+func (w *watching) LeaseLost(sid string) {
+	w.metrics.LeasesLost.Inc()
+	if w.owner != nil {
+		w.owner.forgetSession(sid)
+	}
+}

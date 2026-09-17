@@ -1195,7 +1195,7 @@ func (m *Manager) RenewAll(ctx context.Context, by time.Time) {
 			m.log.Warn().Str("sid", sid).Msg("lost a lease; stopping the session")
 		}
 		session, still := m.drop(sid, running[sid])
-		m.lostLease(still)
+		m.lostLease(sid, still)
 		if !still {
 			// Adopted again since the renewal went out, which means a lease won after
 			// this answer was already stale. Stopping that session would leave an account
@@ -1618,9 +1618,9 @@ func (m *Manager) reportCommand(command *protocol.Command, began time.Time, err 
 // are this instance ceasing to own a session it was running; an ordinary shutdown does
 // not, which is why this is not inside `drop`. A fleet coming down cleanly is not a flap,
 // and a counter that says it is buries the shape it exists to show.
-func (m *Manager) lostLease(stopped bool) {
+func (m *Manager) lostLease(sid string, stopped bool) {
 	if !stopped || m.watch == nil {
 		return
 	}
-	m.watch.LeaseLost()
+	m.watch.LeaseLost(sid)
 }
