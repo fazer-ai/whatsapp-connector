@@ -71,25 +71,54 @@ func (q *Quarantine) Strike(ctx context.Context, sid string) (time.Time, error) 
 		return time.Time{}, errors.New("cluster: a strike needs a session")
 	}
 	key := q.client.Keys().Quarantine(sid)
-	strikes, err := q.client.HIncrBy(ctx, key, "strikes", 1).Result()
+	answer, err := strikeScript.Run(ctx, q.client, []string{key},
+		q.now().UnixMilli(), QuarantineFloor.Milliseconds(), QuarantineCap.Milliseconds(),
+		quarantineMemory.Milliseconds(),
+	).Int64()
 	if err != nil {
 		return time.Time{}, fmt.Errorf("cluster: record a failure for %s: %w", sid, err)
 	}
-	wait := QuarantineWait(strikes)
-	until := q.now().Add(wait)
-
-	pipeline := q.client.Pipeline()
-	pipeline.HSet(ctx, key, "until", strconv.FormatInt(until.UnixMilli(), 10))
-	pipeline.Expire(ctx, key, wait+quarantineMemory)
-	if _, err := pipeline.Exec(ctx); err != nil {
-		// The count landed and the deadline did not, which reads as an account with a
-		// history and no wait: the next pass tries it at once and strikes again. Worth
-		// saying out loud rather than swallowing, and not worth failing the caller for --
-		// the caller is a sweep that has already given the account up.
-		return time.Time{}, fmt.Errorf("cluster: set how long to leave %s alone: %w", sid, err)
-	}
-	return until, nil
+	return time.UnixMilli(answer), nil
 }
+
+// strikeScript writes the whole mark or none of it, and computes the wait where the count
+// it comes from is read.
+//
+// One script and not two round trips, because the wait is a function of the count the
+// increment returns: a transaction cannot read that result in the middle of itself, so
+// MULTI does not reach this. Split across two calls, a Redis that answered the first and
+// not the second left a key holding a count with no deadline -- an account with a history
+// and no wait, which `Waiting` correctly reads as free, so nothing was paced and the next
+// strike computed its wait from a count every unpaced beat had inflated. Seven of those
+// reach the hour the cap keeps for a banned account.
+//
+// The doubling is spelled here rather than passed in, so the wait is decided in the same
+// place the count is, and `QuarantineWait` on the Go side answers for the same rule. A
+// count with no deadline is read as nothing rather than as history, which is the reading
+// `Waiting` already gives that state: a strike whose second half never landed is not a
+// wait the account has served, and trusting it would hand an account that crossed a slow
+// Redis the hour it never earned.
+var strikeScript = redis.NewScript(`
+local now, floor, cap, memory = tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3]), tonumber(ARGV[4])
+local strikes = 1
+if redis.call("HGET", KEYS[1], "until") then
+  strikes = tonumber(redis.call("HINCRBY", KEYS[1], "strikes", 1))
+else
+  redis.call("HSET", KEYS[1], "strikes", 1)
+end
+local wait = floor
+for _ = 2, strikes do
+  wait = wait * 2
+  if wait >= cap then
+    wait = cap
+    break
+  end
+end
+local until_ms = now + wait
+redis.call("HSET", KEYS[1], "until", until_ms)
+redis.call("PEXPIRE", KEYS[1], wait + memory)
+return until_ms
+`)
 
 // QuarantineWait is how long to leave an account alone after this many failures in a row.
 func QuarantineWait(strikes int64) time.Duration {
