@@ -331,7 +331,7 @@ func TestAPingInTimeStillAnswers(t *testing.T) {
 // stallQuarantine holds every write the quarantine makes, for as long as it is told to.
 // `HIncrBy` is the first of them and the one Strike blocks on before anything else runs.
 type stallQuarantine struct {
-	for_ time.Duration
+	held time.Duration
 	on   atomic.Bool
 }
 
@@ -345,7 +345,7 @@ func (h *stallQuarantine) ProcessHook(next redis.ProcessHook) redis.ProcessHook 
 	return func(ctx context.Context, cmd redis.Cmder) error {
 		if h.on.Load() && cmd.Name() == "hincrby" {
 			select {
-			case <-time.After(h.for_):
+			case <-time.After(h.held):
 			case <-ctx.Done():
 				return ctx.Err()
 			}
@@ -372,7 +372,7 @@ func TestAStalledStrikeStillLetsThePeerHaveTheAccount(t *testing.T) {
 	h := newBackoffHarness(t)
 	const sid = "sess-shut"
 
-	stall := &stallQuarantine{for_: 90 * time.Second}
+	stall := &stallQuarantine{held: 90 * time.Second}
 	stall.on.Store(true)
 	h.rdb.AddHook(stall)
 
