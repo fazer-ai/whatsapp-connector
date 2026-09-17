@@ -977,7 +977,10 @@ func (s *Streams) reclaimable(ctx context.Context, stream string, minIdle time.D
 				continue
 			}
 			ids = append(ids, entry.ID)
-			was[entry.ID] = pending{before: true, consumer: entry.Consumer, deliveries: entry.RetryCount}
+			// Plus the claim that is about to happen. XPENDING answers before XCLAIM, and
+			// XCLAIM increments the entry's delivery counter, so what Redis reports here
+			// is one short of the number the caller will be handed.
+			was[entry.ID] = pending{before: true, consumer: entry.Consumer, deliveries: entry.RetryCount + 1}
 		}
 		if len(ids) >= int(s.opts.ReadCount) || int64(len(entries)) < s.opts.ReadCount {
 			return ids, was, nil

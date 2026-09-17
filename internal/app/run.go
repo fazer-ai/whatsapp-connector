@@ -57,16 +57,22 @@ type Connector struct {
 	engine     engine.Engine
 	store      *store.Container
 	streams    commandStreams
-	// labelled is the sessions wac_commands_delivered_again_total currently has a series
-	// for. A session id has no ceiling -- nothing limits how many an instance adopts over
-	// its life -- so the series are dropped when the session goes, and this is the list
-	// of what there is to drop. Without it the label set becomes "every session this
-	// process has ever held" instead of "the ones it holds", which grows without bound
-	// however few run at once.
-	labelledMu sync.Mutex
-	labelled   map[string]struct{}
-	http       *httpserver.Server
-	blobs      *media.Store
+	// seen is when each label value last had something counted against it, for the two
+	// metrics whose label values have no ceiling of their own: a session id, and the name
+	// of a consumer a claim took work back from. Neither is bounded -- nothing limits how
+	// many sessions an instance adopts over its life, and an instance name defaults to
+	// the hostname, so a fleet of constant size still coins a new one every time a
+	// replica is replaced.
+	//
+	// Dropped on going quiet rather than on the session going away, and that distinction
+	// is the whole point of the metric: a wake for a session this instance cannot adopt
+	// is exactly the case it exists for, and that session is in nobody's owned list.
+	// Evicting by ownership deleted its series on every heartbeat, so the one series that
+	// mattered read as a run of resets, or was missed by a scrape altogether.
+	seenMu sync.Mutex
+	seen   map[seenLabel]time.Time
+	http   *httpserver.Server
+	blobs  *media.Store
 
 	// reclaimCursor is where the next reclaim pass starts. Read and written only by the
 	// loop goroutine, which is also the only one that reclaims.
@@ -375,7 +381,7 @@ func (c *Connector) tick(ctx context.Context) time.Time {
 	c.reclaimCommands(ctx)
 	c.announce(ctx)
 	c.metrics.SessionsRunning.Set(float64(c.manager.Count()))
-	c.forgetSessionsGone(c.manager.SIDs())
+	c.forgetLabelsGoneQuiet(time.Now())
 	return due
 }
 
@@ -930,27 +936,56 @@ func (c *Connector) readCommands(ctx context.Context) {
 	c.dispatchWithin(ctx, deliveries)
 }
 
-// forgetSessionsGone drops the per-session series of sessions this instance no longer
-// owns. Once a heartbeat, off the list of what was ever labelled, because there is no
-// teardown hook to hang it on and a session can leave by any of several routes -- a lease
-// lost, a hand-back, a stop -- of which only one is reported here today.
-func (c *Connector) forgetSessionsGone(owned []string) {
-	c.labelledMu.Lock()
-	defer c.labelledMu.Unlock()
+// seenLabel is one label value of one metric, which is the grain eviction works at.
+type seenLabel struct {
+	metric string
+	value  string
+}
 
-	if len(c.labelled) == 0 {
-		return
+const (
+	// sessionLabel and consumerLabel name the two label values without a ceiling.
+	sessionLabel  = "sid"
+	consumerLabel = "from"
+
+	// labelQuiet is how long a label value goes uncounted before its series is dropped.
+	//
+	// Long, because the failure it has to avoid is a series that comes and goes: a
+	// counter that disappears and reappears reads as a reset, and a run of resets is
+	// exactly what a fleet retrying one command forever would look like if this were
+	// tight. Short enough that what a process has stopped seeing leaves within the hour.
+	labelQuiet = 30 * time.Minute
+)
+
+// noteLabel records that something was counted against a label value just now.
+func (c *Connector) noteLabel(metric, value string, at time.Time) {
+	c.seenMu.Lock()
+	defer c.seenMu.Unlock()
+
+	if c.seen == nil {
+		c.seen = make(map[seenLabel]time.Time)
 	}
-	held := make(map[string]struct{}, len(owned))
-	for _, sid := range owned {
-		held[sid] = struct{}{}
-	}
-	for sid := range c.labelled {
-		if _, still := held[sid]; still || sid == noSession {
+	c.seen[seenLabel{metric: metric, value: value}] = at
+}
+
+// forgetLabelsGoneQuiet drops the series of label values nothing has been counted against
+// for a while. Once a heartbeat, off what was ever counted, because there is no teardown
+// hook to hang it on and what is being counted outlives any one session: a session this
+// instance never owned, a peer that no longer exists.
+func (c *Connector) forgetLabelsGoneQuiet(now time.Time) {
+	c.seenMu.Lock()
+	defer c.seenMu.Unlock()
+
+	for label, last := range c.seen {
+		if now.Sub(last) < labelQuiet {
 			continue
 		}
-		c.metrics.CommandsDeliveredAgain.DeletePartialMatch(prometheus.Labels{"sid": sid})
-		delete(c.labelled, sid)
+		switch label.metric {
+		case sessionLabel:
+			c.metrics.CommandsDeliveredAgain.DeletePartialMatch(prometheus.Labels{sessionLabel: label.value})
+		case consumerLabel:
+			c.metrics.CommandsReclaimed.DeleteLabelValues(label.value)
+		}
+		delete(c.seen, label)
 	}
 }
 
@@ -970,11 +1005,13 @@ const noSession = "-"
 // Every path that dispatches comes through here: the read, the reclaim of the control
 // stream, the reclaim of session streams, and the drain of a newly adopted session.
 func (c *Connector) measure(deliveries []transport.Delivery) {
+	now := time.Now()
 	for i := range deliveries {
 		d := &deliveries[i]
 		if d.TakenFrom != "" {
 			// A claim: only XPENDING reports who held it and how many times it went out.
 			c.metrics.CommandsReclaimed.WithLabelValues(d.TakenFrom).Inc()
+			c.noteLabel(consumerLabel, d.TakenFrom, now)
 			if d.Deliveries > 0 {
 				c.metrics.CommandRedeliveries.Observe(float64(d.Deliveries))
 			}
@@ -991,12 +1028,7 @@ func (c *Connector) measure(deliveries []transport.Delivery) {
 			sid = noSession
 		}
 		c.metrics.CommandsDeliveredAgain.WithLabelValues(source, sid).Inc()
-		c.labelledMu.Lock()
-		if c.labelled == nil {
-			c.labelled = make(map[string]struct{})
-		}
-		c.labelled[sid] = struct{}{}
-		c.labelledMu.Unlock()
+		c.noteLabel(sessionLabel, sid, now)
 	}
 }
 

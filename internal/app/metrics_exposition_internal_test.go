@@ -223,7 +223,9 @@ func TestWhatAScrapeShowsAboutCommandsHandedOutAgain(t *testing.T) {
 		Command:         protocol.Command{SID: "wac224-taken", Type: protocol.CommandSessionConnect},
 		DeliveredBefore: true,
 		TakenFrom:       "connector-b",
-		Deliveries:      3,
+		// What the transport hands over: XPENDING said two, and the claim that follows
+		// makes it three.
+		Deliveries: 3,
 	}})
 	// And one arriving new, which is not a redelivery and must not move anything.
 	c.measure([]transport.Delivery{{
@@ -269,30 +271,46 @@ wac_command_redeliveries_count 1
 	}
 }
 
-// A session this instance no longer owns takes its series with it.
+// A label value nothing has been counted against for a while takes its series with it.
 //
-// Without this the label set is every session the process has ever held rather than the
-// ones it holds, and a session id has no ceiling: nothing limits how many an instance
-// adopts over its life, however few run at once. It is the first label in this build
-// without one, and it is only defensible because it is dropped.
-func TestASessionThatIsGoneTakesItsSeriesWithIt(t *testing.T) {
+// On going quiet, not on the session going away, and the difference is the whole reason
+// the metric exists. A wake for a session this instance cannot adopt is the case it was
+// built for, and that session is in nobody's owned list: evicting by ownership deleted
+// its series on every heartbeat, so the one series that mattered read as a run of resets.
+// The consumer label goes the same way, because an instance name defaults to the hostname
+// and a fleet of constant size still coins a new one every time a replica is replaced.
+func TestALabelGoneQuietTakesItsSeriesWithIt(t *testing.T) {
 	t.Parallel()
 
 	metrics := observability.New()
 	c := &Connector{metrics: metrics}
 
 	c.measure([]transport.Delivery{{
-		Command:         protocol.Command{SID: "wac224-gone", Type: protocol.CommandSessionConnect},
+		Command:         protocol.Command{SID: "wac224-quiet", Type: protocol.CommandSessionConnect},
 		DeliveredBefore: true,
+		TakenFrom:       "connector-gone",
+		Deliveries:      2,
 	}})
 	if got := testutil.CollectAndCount(metrics.CommandsDeliveredAgain, "wac_commands_delivered_again_total"); got != 1 {
 		t.Fatalf("after one redelivery the exposition has %d series, want 1", got)
 	}
 
-	// Nothing owned any more, which is what a lease lost or a hand-back leaves.
-	c.forgetSessionsGone(nil)
+	// A heartbeat while it is still being counted against leaves it alone, which is what
+	// keeps a session that keeps retrying from vanishing under the scrape reading it.
+	c.forgetLabelsGoneQuiet(time.Now())
+	if got := testutil.CollectAndCount(metrics.CommandsDeliveredAgain, "wac_commands_delivered_again_total"); got != 1 {
+		t.Errorf("a label counted a moment ago lost its series: %d left, want 1", got)
+	}
+	if got := testutil.CollectAndCount(metrics.CommandsReclaimed, "wac_commands_reclaimed_total"); got != 1 {
+		t.Errorf("a consumer seen a moment ago lost its series: %d left, want 1", got)
+	}
+
+	c.forgetLabelsGoneQuiet(time.Now().Add(labelQuiet + time.Second))
 
 	if got := testutil.CollectAndCount(metrics.CommandsDeliveredAgain, "wac_commands_delivered_again_total"); got != 0 {
-		t.Errorf("the session is gone and the exposition still has %d series for it", got)
+		t.Errorf("the session went quiet and the exposition still has %d series for it", got)
+	}
+	if got := testutil.CollectAndCount(metrics.CommandsReclaimed, "wac_commands_reclaimed_total"); got != 0 {
+		t.Errorf("the consumer went quiet and the exposition still has %d series for it", got)
 	}
 }
