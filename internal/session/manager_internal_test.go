@@ -3574,8 +3574,9 @@ func TestARedeliveredDeleteDoesNotDropTheCounterOfAnAccountPairedAgain(t *testin
 	keys := client.Keys()
 
 	const sid = "9c2b7d1e-0000-4000-8000-0000000000e3"
+	fakeEngine := fake.New()
 	manager := NewManager(&ManagerConfig{
-		Instance: "inst-a", Engine: fake.New(),
+		Instance: "inst-a", Engine: fakeEngine,
 		Leases:    cluster.NewLeases(client, "inst-a", cluster.Options{}),
 		Publisher: quietPublisher{}, Replier: quietReplier{},
 		// The record is what makes the second delivery a recall rather than a second
@@ -3589,36 +3590,46 @@ func TestARedeliveredDeleteDoesNotDropTheCounterOfAnAccountPairedAgain(t *testin
 	stopped := manager.Answer(answering)
 	t.Cleanup(func() { stopAnswering(); <-stopped })
 
-	send := func(t *testing.T, id string, typ protocol.CommandType) {
+	// A failed command is acknowledged like a successful one -- the caller is told, and
+	// the entry is retired either way -- so waiting for the ack says nothing about whether
+	// the command worked. Each step below asserts its own effect instead.
+	send := func(t *testing.T, id string, typ protocol.CommandType, payload string) {
 		t.Helper()
 		var acked atomic.Bool
 		manager.Dispatch(&transport.Delivery{
-			Command: protocol.Command{V: protocol.Version, ID: id, Type: typ, SID: sid, Payload: []byte(`{}`)},
+			Command: protocol.Command{V: protocol.Version, ID: id, Type: typ, SID: sid, Payload: []byte(payload)},
 			Ack:     func(context.Context) error { acked.Store(true); return nil },
 			Release: func() {}, Forfeit: func() {},
 		})
 		waitFor(t, acked.Load, "the command "+id+" was never answered")
 	}
 
-	send(t, "c1", protocol.CommandSessionDelete)
+	send(t, "c1", protocol.CommandSessionDelete, `{}`)
 	waitFor(t, func() bool {
 		manager.SweepRetired(ctx, time.Now().Add(time.Second))
 		return !server.Exists(keys.Lease(sid))
 	}, "the lease of a deleted account was never handed back")
 
 	// The account comes back under the same id, which is the case the ledger's day-long
-	// memory makes reachable and the one no adoption can tell from a deletion.
+	// memory makes reachable and the one no adoption can tell from a deletion. Paired
+	// rather than merely adopted, because what this protects is a session that is up: an
+	// adoption on its own writes the counter and would satisfy the assertion below for a
+	// reason that has nothing to do with the sequence being tested.
 	if _, err := manager.Adopt(ctx, sid); err != nil {
 		t.Fatalf("Adopt: %v", err)
 	}
-	send(t, "c2", protocol.CommandSessionConnect)
+	send(t, "c2", protocol.CommandSessionConnect, `{"pairing":"qr","phone":"5541999991111","device_name":"fazer.ai"}`)
+	engineSession, ok := fakeEngine.Session(sid)
+	if !ok || !engineSession.Connected() {
+		t.Fatal("the account was never brought back up, so the redelivery below would meet a session that is down and this test would prove nothing")
+	}
 	live, err := rdb.Get(ctx, keys.LeaseEpoch(sid)).Result()
 	if err != nil {
 		t.Fatalf("the account paired again has no counter, so the assertion below would pass for the wrong reason: %v", err)
 	}
 
 	// The same frame as before, which is what a redelivery is.
-	send(t, "c1", protocol.CommandSessionDelete)
+	send(t, "c1", protocol.CommandSessionDelete, `{}`)
 
 	after, err := rdb.Get(ctx, keys.LeaseEpoch(sid)).Result()
 	if err != nil {
