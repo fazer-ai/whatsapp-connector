@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -120,9 +121,23 @@ func TestAMetricSaidToBeWrittenIsMentionedWhereItIsSaidToBe(t *testing.T) {
 	// places is right on the day it is written and wrong the first time the code moves,
 	// and this repository has now had that three times (#229, #231, and here).
 	packages := goPackages(t, filepath.Join("..", ".."))
-	if len(packages) < 5 {
-		t.Fatalf("walked the tree and found %d package(s) with Go files in them: the walk is broken, "+
-			"and a walk that finds nothing passes this check without reading anything", len(packages))
+	// A walk that came back short reads nothing and passes this half in silence, which is
+	// the failure it exists to stop rather than a failure it would report. Named
+	// packages and not a count, so that what the check demands is the tree it claims to
+	// read: this one, because the skip below is meaningless without it; the package every
+	// writer lives in today; and the one the hand-written list used to miss, which is
+	// where #224 put the fact the counting is built on.
+	for _, needed := range [][]string{
+		{"internal", "observability"},
+		{"internal", "app"},
+		{"internal", "transport", "redisstream"},
+	} {
+		want := filepath.Join(append([]string{"..", ".."}, needed...)...)
+		if !slices.Contains(packages, want) {
+			t.Fatalf("walked the tree and did not find %s among the %d package(s) it came back with: "+
+				"the walk is not reading this repository, and a walk that reads nothing passes "+
+				"this check without looking at a single file", filepath.Join(needed...), len(packages))
+		}
 	}
 	for field := range notWrittenYet {
 		for _, pkg := range packages {
