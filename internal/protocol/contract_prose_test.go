@@ -38,10 +38,18 @@ import (
 //   - A sentence with no client subject at all: "Deduplicate on `message.id`" in the
 //     imperative, or "Unknown event types must be ignored" in the passive. No keyword fence
 //     reaches those, and saying so is better than implying otherwise.
-//   - `never` and `always`. They are descriptive in this corpus, not prohibitive: "the client
-//     never sees a JID" is a statement about the design, and adding them produced a false
-//     positive immediately. A false positive is the worse failure here, because it teaches
-//     whoever edits to write less, and that comes back as a rule nobody writes anywhere.
+//   - `never` and `always`, and the reason is a prediction rather than a measurement, which
+//     is worth saying because the first version of this comment claimed otherwise. Measured:
+//     neither word occurs in contract/README.md at all, and adding both to the alternation
+//     flags nothing there today. The false positive that argued against them lives in the
+//     repository's root README ("the client never sees a JID"), which this fence never opens,
+//     so that evidence was collected in the wrong condition. They stay out because the word
+//     does both jobs in protocol prose -- it forbids and it describes -- and this file's one
+//     substantive section is about what a client does and does not receive, which is exactly
+//     where the descriptive use turns up. Including them would take the fence from five of
+//     the holdout's eight misses to six. A false positive is the worse failure here, because
+//     it teaches whoever edits to write less, and that comes back as a rule nobody writes
+//     anywhere; whoever disagrees has the number and the reason to reverse this.
 //   - More than 120 characters between the subject and its modal.
 //
 // So the residual is real and this comment does not pretend it away. What bounds it is that
