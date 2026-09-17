@@ -4,6 +4,7 @@ import (
 	"os"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -11,7 +12,7 @@ import (
 )
 
 const (
-	workflowPath = "../../.github/workflows/ci.yml"
+	workflowsDir = "../../.github/workflows"
 	makefilePath = "../../Makefile"
 
 	// The target whose help text says it is the whole of what CI enforces. Every gate in
@@ -62,6 +63,7 @@ var targetsOutsideCheck = map[string]exemption{
 }
 
 type workflow struct {
+	On   yaml.Node `yaml:"on"`
 	Jobs map[string]struct {
 		Steps []struct {
 			Name string `yaml:"name"`
@@ -69,6 +71,64 @@ type workflow struct {
 			Run  string `yaml:"run"`
 		} `yaml:"steps"`
 	} `yaml:"jobs"`
+}
+
+// gatesAChange says whether this workflow runs over a change, which is what makes its
+// green a condition of merging. A workflow that only runs on a tag publishes what was
+// already merged: it enforces nothing on the pull request, and `make check` does not
+// promise it. Asking the triggers is what keeps that out without a list of exemptions per
+// step, and keeps a workflow added next door in, which is the hole a constant path left.
+func gatesAChange(on *yaml.Node) bool {
+	for _, trigger := range triggers(on) {
+		switch trigger.name {
+		case "pull_request", "pull_request_target", "merge_group":
+			return true
+		case "push":
+			// `push: tags: [v*]` is a release. `push` bare, or with branches, is a change.
+			if trigger.with == nil || hasKey(trigger.with, "branches") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+type trigger struct {
+	name string
+	with *yaml.Node // the trigger's own mapping, nil when it was written as a bare name
+}
+
+func triggers(on *yaml.Node) []trigger {
+	switch on.Kind {
+	case yaml.ScalarNode:
+		return []trigger{{name: on.Value}}
+	case yaml.SequenceNode:
+		out := make([]trigger, 0, len(on.Content))
+		for _, item := range on.Content {
+			out = append(out, trigger{name: item.Value})
+		}
+		return out
+	case yaml.MappingNode:
+		out := make([]trigger, 0, len(on.Content)/2)
+		for i := 0; i+1 < len(on.Content); i += 2 {
+			value := on.Content[i+1]
+			if value.Kind != yaml.MappingNode {
+				value = nil
+			}
+			out = append(out, trigger{name: on.Content[i].Value, with: value})
+		}
+		return out
+	}
+	return nil
+}
+
+func hasKey(mapping *yaml.Node, key string) bool {
+	for i := 0; i+1 < len(mapping.Content); i += 2 {
+		if mapping.Content[i].Value == key {
+			return true
+		}
+	}
+	return false
 }
 
 // `make foo`, `make -s foo`, `make foo bar`, and the same after a shell separator.
@@ -82,7 +142,7 @@ var makeCall = regexp.MustCompile(`(?m)(?:^|[;&|(])[ \t]*make\b((?:[ \t]+-{1,2}[
 func TestEveryGateCIEnforcesIsReachableFromMakeCheck(t *testing.T) {
 	t.Parallel()
 
-	steps := workflowSteps(t)
+	steps, read, skipped := workflowSteps(t)
 	reachable, targets := reachableFrom(t, promise)
 	used := map[string]bool{}
 
@@ -99,8 +159,8 @@ func TestEveryGateCIEnforcesIsReachableFromMakeCheck(t *testing.T) {
 			for _, target := range called {
 				used[target] = true
 				if !targets[target] {
-					t.Errorf("the workflow step %q runs `make %s`, and the Makefile has no such target:\n"+
-						"\tthe step fails on every run, or the target was renamed and this side was not", step.label(), target)
+					t.Errorf("%s runs `make %s`, and the Makefile has no such target:\n"+
+						"\tthe step fails on every run, or the target was renamed and this side was not", step.where(), target)
 					continue
 				}
 				if reachable[target] {
@@ -110,10 +170,10 @@ func TestEveryGateCIEnforcesIsReachableFromMakeCheck(t *testing.T) {
 					standsUp(t, reachable, "the target "+target, x)
 					continue
 				}
-				t.Errorf("the workflow step %q runs `make %s`, which `make %s` does not reach:\n"+
+				t.Errorf("%s runs `make %s`, which `make %s` does not reach:\n"+
 					"\tCI enforces it and the target that promises to be everything CI enforces does not run it.\n"+
 					"\tEither add it to the dependencies of %s, or add it to targetsOutsideCheck with the reason it belongs only to CI.",
-					step.label(), target, promise, promise)
+					step.where(), target, promise, promise)
 			}
 		case step.Uses != "":
 			action := strings.SplitN(step.Uses, "@", 2)[0]
@@ -125,10 +185,10 @@ func TestEveryGateCIEnforcesIsReachableFromMakeCheck(t *testing.T) {
 			used[action] = true
 			x, ok := outsideCheck[action]
 			if !ok {
-				t.Errorf("the workflow uses %q and nothing here says what it is:\n"+
+				t.Errorf("%s uses %q and nothing here says what it is:\n"+
 					"\tif it enforces something, `make %s` has to run it too; if it does not, say so in notAGate.\n"+
 					"\tEither way it goes in one of the lists in this file, with a reason.",
-					action, promise)
+					step.File, action, promise)
 				continue
 			}
 			standsUp(t, reachable, "the action "+action, x)
@@ -141,11 +201,11 @@ func TestEveryGateCIEnforcesIsReachableFromMakeCheck(t *testing.T) {
 				if len(called) > 0 {
 					what = "runs make and then commands that are not make"
 				}
-				t.Errorf("the workflow step %q %s:\n"+
+				t.Errorf("%s %s:\n"+
 					"\ta command here is a gate `make %s` cannot run and developers cannot reproduce.\n"+
 					"\tMove it behind a target, or add it to outsideCheck with the reason it is CI's alone.\n"+
 					"\tThe script:\n\t\t%s",
-					step.label(), what, promise, strings.ReplaceAll(strings.TrimSpace(step.Run), "\n", "\n\t\t"))
+					step.where(), what, promise, strings.ReplaceAll(strings.TrimSpace(step.Run), "\n", "\n\t\t"))
 				continue
 			}
 			standsUp(t, reachable, "the step "+step.label(), x)
@@ -162,24 +222,25 @@ func TestEveryGateCIEnforcesIsReachableFromMakeCheck(t *testing.T) {
 		for key := range list.of {
 			if !used[key] {
 				t.Errorf("%s exempts %q and no step in %s uses it:\n"+
-					"\tthe step was renamed or removed, and the exemption outlived it", list.name, key, workflowPath)
+					"\tthe step was renamed or removed, and the exemption outlived it", list.name, key, strings.Join(read, ", "))
 			}
 		}
 	}
 	for key := range notAGate {
 		if !used[key] {
 			t.Errorf("notAGate lists %q and no step in %s uses it:\n"+
-				"\tthe step was renamed or removed, and the entry outlived it", key, workflowPath)
+				"\tthe step was renamed or removed, and the entry outlived it", key, strings.Join(read, ", "))
 		}
 	}
 
-	t.Logf("classified %d gate(s) across %d workflow step(s); `make %s` reaches %v", gates, len(steps), promise, sorted(reachable))
+	t.Logf("read %v, skipped %v as not running over a change; classified %d gate(s) across %d step(s); `make %s` reaches %v",
+		read, skipped, gates, len(steps), promise, sorted(reachable))
 
 	// Anti-vacuity: a fence that walked an empty list reports exactly what a clean one
 	// reports. Everything above is a loop over something parsed out of a file, and a
 	// parse that came back empty is the failure this whole issue was about.
 	if gates == 0 {
-		t.Fatalf("read %d step(s) from %s and classified none of them as a gate: the workflow moved, or the parse is silently empty", len(steps), workflowPath)
+		t.Fatalf("read %d step(s) from %v and classified none of them as a gate: the workflows moved, or the parse is silently empty", len(steps), read)
 	}
 	if len(reachable) < 2 {
 		t.Fatalf("`make %s` reaches %v in %s: a promise with no dependencies is the defect this fence exists to catch", promise, sorted(reachable), makefilePath)
@@ -199,6 +260,39 @@ func standsUp(t *testing.T, reachable map[string]bool, what string, x exemption)
 		"\tthe exemption reads: %s\n"+
 		"\tCI enforces it, nothing local does, and the list still says otherwise.",
 		what, promise, x.standsFor, promise, x.standsFor, x.why)
+}
+
+// Which workflows the fence reads is decided here and nowhere else, silently, so the
+// classification is pinned rather than left to whatever files the repository has today.
+// `on:` is also the one key GitHub writes that a YAML 1.1 reader turns into the boolean
+// true, and a rule that reads it wrong would quietly classify every workflow as a release.
+func TestGatesAChangeReadsTheTriggers(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		on   string
+		want bool
+	}{
+		{on: "on:\n  pull_request:\n    branches: [main]\n", want: true},
+		{on: "on:\n  push:\n    branches: [main]\n", want: true},
+		{on: "on: [push, pull_request]\n", want: true},
+		{on: "on: pull_request\n", want: true},
+		{on: "on:\n  merge_group:\n", want: true},
+		{on: "on:\n  push:\n", want: true},
+		// A release: it runs over what was already merged, and gates no change.
+		{on: "on:\n  push:\n    tags: ['v*']\n  workflow_dispatch:\n"},
+		{on: "on:\n  schedule:\n    - cron: '0 0 * * *'\n"},
+		{on: "on: workflow_dispatch\n"},
+	} {
+		var wf workflow
+		if err := yaml.Unmarshal([]byte(tc.on+"jobs: {}\n"), &wf); err != nil {
+			t.Errorf("parse %q: %v", tc.on, err)
+			continue
+		}
+		if got := gatesAChange(&wf.On); got != tc.want {
+			t.Errorf("gatesAChange(%q) = %t, want %t", tc.on, got, tc.want)
+		}
+	}
 }
 
 // The fence reads scripts written for a shell, and a script carries prose: comments,
@@ -254,6 +348,7 @@ type step struct {
 	Name string
 	Uses string
 	Run  string
+	File string
 }
 
 func (s step) label() string {
@@ -263,28 +358,53 @@ func (s step) label() string {
 	return s.Uses
 }
 
-func workflowSteps(t *testing.T) []step {
+func (s step) where() string { return s.File + " step " + strconv.Quote(s.label()) }
+
+// workflowSteps reads every workflow in the directory rather than one path, and returns
+// the steps of the ones that gate a change. A constant path was the fence's own version of
+// the defect it exists to catch: a gate added in the file next door escapes it entirely,
+// with nothing to say so.
+func workflowSteps(t *testing.T) (steps []step, read, skipped []string) {
 	t.Helper()
 
-	raw, err := os.ReadFile(workflowPath)
+	entries, err := os.ReadDir(workflowsDir)
 	if err != nil {
-		t.Fatalf("read %s: %v", workflowPath, err)
+		t.Fatalf("read %s: %v", workflowsDir, err)
 	}
-	var wf workflow
-	if err := yaml.Unmarshal(raw, &wf); err != nil {
-		t.Fatalf("parse %s: %v", workflowPath, err)
-	}
-
-	var steps []step
-	for _, name := range sortedKeys(wf.Jobs) {
-		for _, s := range wf.Jobs[name].Steps {
-			steps = append(steps, step{Name: s.Name, Uses: s.Uses, Run: s.Run})
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || (!strings.HasSuffix(name, ".yml") && !strings.HasSuffix(name, ".yaml")) {
+			continue
+		}
+		path := workflowsDir + "/" + name
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		var wf workflow
+		if err := yaml.Unmarshal(raw, &wf); err != nil {
+			t.Fatalf("parse %s: %v", path, err)
+		}
+		if !gatesAChange(&wf.On) {
+			skipped = append(skipped, name)
+			continue
+		}
+		read = append(read, name)
+		before := len(steps)
+		for _, job := range sortedKeys(wf.Jobs) {
+			for _, s := range wf.Jobs[job].Steps {
+				steps = append(steps, step{Name: s.Name, Uses: s.Uses, Run: s.Run, File: name})
+			}
+		}
+		if len(steps) == before {
+			t.Fatalf("%s runs over a change, parsed into %d job(s), and gave no steps at all", path, len(wf.Jobs))
 		}
 	}
-	if len(steps) == 0 {
-		t.Fatalf("%s parsed into %d job(s) and no steps at all", workflowPath, len(wf.Jobs))
+	if len(read) == 0 {
+		t.Fatalf("no workflow in %s runs over a change (%d skipped: %v): either none does, or the trigger parse is silently empty",
+			workflowsDir, len(skipped), skipped)
 	}
-	return steps
+	return steps, read, skipped
 }
 
 // targetsCalledBy returns the targets a script invokes, and whether the script is make
