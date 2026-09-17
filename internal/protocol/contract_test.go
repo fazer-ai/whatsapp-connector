@@ -53,7 +53,7 @@ func TestFixturesValidateAgainstSchema(t *testing.T) {
 // schema by TestErrorCodesMatchSchema, which is the check that actually catches a
 // catalogue drifting from the contract. AGENTS.md used to read as though this test
 // covered them, and for as long as it did nobody looked (#70).
-// Four of the commands in contract/README.md answer with an array -- `contact.check`,
+// Four of the commands in contract/PROTOCOL.md answer with an array -- `contact.check`,
 // `group.list`, `group.participants.update` and both `group.join_requests.*` -- and the
 // reply schema admitted only an object or null, so every one of those replies was a frame
 // this connector sends and its own contract rejects. A client that validates what it

@@ -5,7 +5,7 @@
 // because they are shared with the Chatwoot side: a name spelled from memory at one
 // call site is a stream nobody reads.
 //
-// A constructor here is also a claim in contract/README.md that the key exists, and a
+// A constructor here is also a claim in contract/PROTOCOL.md that the key exists, and a
 // client vendoring that file builds against it. So every constructor is either reached
 // from this build's production code or marked below as one only the client writes, and a
 // test holds the marking to what the build actually does -- a key nobody on either side

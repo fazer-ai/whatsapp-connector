@@ -16,7 +16,7 @@ import (
 // code.
 //
 // The reason this is a test rather than a comment is what #160 found: a constructor is
-// read as a promise that the key exists -- contract/README.md had a row for `wa:sessions`
+// read as a promise that the key exists -- contract/PROTOCOL.md had a row for `wa:sessions`
 // and `wa:session:<sid>` describing a session registry no connector ever wrote, and it
 // cost a holdout agent a set of acceptance criteria built on it. Four names were in that
 // state at once, each findable by grep and each found only when somebody happened to
@@ -79,7 +79,7 @@ func TestEveryKeyIsUsedHereOrMarkedAsTheClientsToWrite(t *testing.T) {
 		case marked[name] && reachable[name]:
 			t.Errorf("Keys.%s is marked as the client's to render, and %s names it: move it out of the marked group", name, named[name])
 		case !marked[name] && !reachable[name]:
-			t.Errorf("nothing outside keys.go names Keys.%s and it is not marked as the client's to render: either delete the constructor, or mark it and say in contract/README.md who writes the key", name)
+			t.Errorf("nothing outside keys.go names Keys.%s and it is not marked as the client's to render: either delete the constructor, or mark it and say in contract/PROTOCOL.md who writes the key", name)
 		}
 	}
 }

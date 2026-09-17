@@ -120,7 +120,7 @@ internal/app/             configuration and the run loop that ties them together
 
 ## Protocol
 
-See [`contract/README.md`](contract/README.md) for the frame shapes, the Redis key
+See [`contract/PROTOCOL.md`](contract/PROTOCOL.md) for the frame shapes, the Redis key
 map and the compatibility rules. In short:
 
 - **Events** (connector → client) describe what happened: `message.received`,

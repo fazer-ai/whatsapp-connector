@@ -274,7 +274,7 @@ type photoRequest struct {
 // setGroupPhoto carries out `group.photo.set`.
 //
 // The bytes travel inside the frame, base64, which is the one place this contract puts
-// media on the wire: `contract/README.md` says media never does, and the picture of a
+// media on the wire: `contract/PROTOCOL.md` says media never does, and the picture of a
 // group is the exception the schema spells out. It is a profile picture -- WhatsApp keeps
 // these small -- rather than a message attachment, and there is no `media_ref` for
 // something that was never a message.
