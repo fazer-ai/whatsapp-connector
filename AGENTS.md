@@ -11,10 +11,27 @@ of truth for both sides; this repository is the side that produces events.
 - **Test**: `make test` (race detector on) — a single one with `go test ./internal/protocol -run TestName`
 - **The other dialect**: `make test-postgres` runs the same suite against a PostgreSQL
   server named by `WAC_TEST_DATABASE_URL`, which is what a deployment runs and what
-  `make test` never touches. CI runs both passes, and `make check` runs this one too
-  whenever the variable is set; the target prints how to start a server when it is not
+  `make test` never touches. `make test-redis` is the same idea for the transport against
+  a real Redis. Both print how to start a server when the variable is unset
 - **Contract only**: `make contract`
-- **Everything CI enforces**: `make check`
+- **Everything CI enforces**: `make check` — lint, `go mod tidy`, and the suite three
+  times over: SQLite, PostgreSQL, and the transport against real Redis. It needs a server
+  for each of the last two and **fails when it cannot reach them**. It used to skip them
+  with a notice and exit 0, which answered "CI will accept this" on evidence it had not
+  collected; a single test file with no production lines once aborted the whole package
+  under PostgreSQL and passed that way
+- **Adding a gate to CI means adding it to the Makefile**: `.github/workflows/ci.yml`
+  calls the targets instead of spelling the commands a second time, and
+  `internal/toolchain` fails the suite when a workflow step runs something `make check`
+  does not reach. A step that genuinely belongs to CI alone (the lint action, the image
+  build) goes in one of that file's two lists, with the reason. Two hand-written lists is
+  what this replaced, and they had already drifted: CI ran `go mod tidy -diff` and `make
+  check` did not
+- **The half that needs nothing running**: `make check-offline` (lint, `go mod tidy`, the
+  SQLite pass). It names the two passes it did not run when it finishes, and it is what the
+  agent stop hook falls back to, so ending a turn without Docker running does not fail for a
+  reason that is not the turn's. The versioned `pre-commit` hook runs neither target: gofmt
+  on the staged files, `go vet` and the contract test, and it is meant to stay under a second
 - **Toolchain**: Go as declared in `go.mod`; `golangci-lint` v2
 
 ## Layout
