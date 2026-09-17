@@ -872,13 +872,18 @@ func (s *Session) execute(ctx context.Context) {
 				release(delivery)
 				continue
 			}
-			s.run(ctx, waiting)
+			refusal, refusedTeardown := s.run(ctx, waiting)
 			s.doneWith()
+			if refusedTeardown && s.teardownRefused != nil {
+				// After `doneWith`, so an account adopted for a teardown that will not run
+				// is free to be taken back by the very next tick.
+				s.teardownRefused(refusal)
+			}
 		}
 	}
 }
 
-func (s *Session) run(ctx context.Context, waiting queued) {
+func (s *Session) run(ctx context.Context, waiting queued) (refusal protocol.ErrorCode, refusedTeardown bool) {
 	delivery := waiting.delivery
 	command := delivery.Command
 	log := s.log.With().Str("cmd_id", command.ID).Str("type", string(command.Type)).Logger()
@@ -902,7 +907,7 @@ func (s *Session) run(ctx context.Context, waiting queued) {
 		log.Warn().Err(err).Msg("gave a command back rather than risk carrying it out twice")
 		forfeit(delivery)
 		handedBack = true
-		return
+		return "", false
 	}
 	if err != nil && ctx.Err() != nil {
 		// The session went away underneath this command: the lease moved, or the process
@@ -917,7 +922,7 @@ func (s *Session) run(ctx context.Context, waiting queued) {
 		log.Warn().Err(err).Msg("gave a command back after the session ended under it")
 		forfeit(delivery)
 		handedBack = true
-		return
+		return "", false
 	}
 	// The answer and the acknowledgement both go out detached from the session's
 	// context, because this session is exactly what may have just ended. The work is
@@ -943,19 +948,21 @@ func (s *Session) run(ctx context.Context, waiting queued) {
 	// the same reason the timing is: a command given back was not carried out here, and
 	// the count exists to say whether anything but the teardown ran on this session.
 	s.carried.Add(1)
-	if command.Type == protocol.CommandSessionDelete && err != nil && s.teardownRefused != nil {
-		// Before the answer rather than after it, so the account is already spoken for by
-		// the time the client learns its teardown did not happen and sends another. Only
-		// a refusal: a teardown that worked has retired the session by now, and there is
-		// no adoption left to undo.
-		s.teardownRefused(asProtocolError(err).Code)
-	}
 	retire, cancel := context.WithTimeout(context.WithoutCancel(ctx), ackTimeout)
 	defer cancel()
 	s.answer(retire, &command, delivery.Internal, result, err)
 	if ackErr := delivery.Ack(retire); ackErr != nil {
 		log.Error().Err(ackErr).Msg("failed to acknowledge a command")
 	}
+	// Reported rather than acted on here, and the caller fires it once this command is no
+	// longer running. Called from inside, the manager would be told the teardown is over
+	// while the executor still counts it as in flight, and the first tick after the client
+	// saw its answer would refuse to take the account back on those grounds -- a hand-back
+	// that needs a second tick for no reason anybody can see from outside.
+	if command.Type == protocol.CommandSessionDelete && err != nil {
+		return asProtocolError(err).Code, true
+	}
+	return "", false
 }
 
 // carriedSoFar is how many commands this session has answered.

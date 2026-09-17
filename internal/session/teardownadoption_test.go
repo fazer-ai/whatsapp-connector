@@ -468,13 +468,14 @@ func TestATeardownAdoptedForAndRefusedByTheEngineKeepsTheAccount(t *testing.T) {
 	}
 }
 
-// TestAHandBackThatCouldNotRunIsTriedAgain is the other half of keeping the registration.
+// TestAHandBackThatRanOutOfTickIsTriedAgain keeps the registration honest at the one
+// ending that is nobody's fault.
 //
 // Nothing else will ever look at this session: it is not retired, so no sweep lists it,
-// and its lease is renewed for as long as the instance lives. A tick that found it busy,
-// or found an adoption in the way, or ran out of window, has to leave it on the list, or
-// the one thing that would have given the account back has forgotten it.
-func TestAHandBackThatCouldNotRunIsTriedAgain(t *testing.T) {
+// and its lease is renewed for as long as the instance lives. A tick whose window ran out
+// before it reached this account has to leave it on the list, or the one thing that would
+// have given the account back has forgotten it.
+func TestAHandBackThatRanOutOfTickIsTriedAgain(t *testing.T) {
 	t.Parallel()
 	h := newTeardownHarness(t)
 	const sid = "sess-249-retry"
@@ -483,50 +484,102 @@ func TestAHandBackThatCouldNotRunIsTriedAgain(t *testing.T) {
 	if reply := h.answered(t, "cmd-retry"); refusalCode(reply) != protocol.ErrorExpired {
 		t.Fatalf("given: got %q, want the late refusal", refusalCode(reply))
 	}
-	adopted, ok := h.engine.Session(sid)
-	if !ok {
-		t.Fatal("given: no engine session for the adopted account")
-	}
-
-	// Busy for the whole of the first tick, so the claim is refused for a reason that is
-	// gone by the second.
-	release := adopted.Hold()
-	busy := &transport.Delivery{
-		Command: protocol.Command{
-			V: protocol.Version, Type: protocol.CommandSessionStatus, SID: sid, ID: "cmd-retry-status",
-			ReplyTo: "wa:reply:cmd-retry-status",
-		},
-		Ack: func(context.Context) error { return nil },
-	}
-	h.manager.Dispatch(busy)
-	waitFor(t, "the held command to reach the engine", func() bool { return len(adopted.Commands()) > 0 })
-	h.heartbeat(t)
 	if h.manager.Count() != 1 {
-		t.Fatal("given: the account was handed back while a command was running on it")
-	}
-	release()
-	if reply := h.answered(t, "cmd-retry-status"); !reply.OK {
-		t.Fatalf("given: the held command failed: %+v", reply.Error)
+		t.Fatal("given: the adoption for the teardown did not happen")
 	}
 
-	// And now a command has been carried out on it, which is what cancels the hand-back:
-	// the account is one a client is talking to. The registration must be gone rather than
-	// retried forever.
-	h.heartbeat(t)
+	// A tick with no window left: every hand-back it owes is left for the next one.
+	spent := time.Now().Add(-time.Second)
+	h.manager.RenewAll(context.Background(), spent)
+	h.manager.SweepRetired(context.Background(), spent)
 	if h.manager.Count() != 1 {
-		t.Fatal("an account was handed back although a command had been served on it since the refusal")
+		t.Fatal("given: the account went back on a tick that had no window to do it in")
 	}
 
-	// A second late teardown re-arms it, and this time nothing is in the way.
-	h.manager.Dispatch(teardown(sid, "cmd-retry-2", time.Now().Add(-time.Minute)))
-	if reply := h.answered(t, "cmd-retry-2"); refusalCode(reply) != protocol.ErrorExpired {
-		t.Fatalf("got %q, want the late refusal", refusalCode(reply))
-	}
 	h.heartbeat(t)
 	if h.manager.Count() != 0 {
-		t.Fatalf("the account was not given back after a second late teardown: %d running", h.manager.Count())
+		t.Fatalf("the account was never given back: the tick that ran out forgot it, and nothing else lists this session: %d running", h.manager.Count())
 	}
 	if h.server.Exists(h.keys.Lease(sid)) {
 		t.Fatal("the lease is still held")
+	}
+}
+
+// TestAServedAccountIsNotGivenBackByASecondLateTeardown is the trap the second round of
+// review found, and it is the one that would have closed a live socket.
+//
+// A late teardown adopts the account, a client's command is then carried out on it, and a
+// second late teardown arrives. Both teardowns were refused, so a rule that re-armed on
+// the running total would fold the client's command into the new baseline and hand the
+// account back with the client still talking to it. What the count has to say is not "how
+// much has happened" but "has anything happened that was not a refused teardown".
+func TestAServedAccountIsNotGivenBackByASecondLateTeardown(t *testing.T) {
+	t.Parallel()
+	h := newTeardownHarness(t)
+	const sid = "sess-249-served"
+
+	h.manager.Dispatch(teardown(sid, "cmd-served-1", time.Now().Add(-time.Minute)))
+	if reply := h.answered(t, "cmd-served-1"); refusalCode(reply) != protocol.ErrorExpired {
+		t.Fatalf("given: got %q, want the late refusal", refusalCode(reply))
+	}
+
+	// A client comes along and uses the account, before any tick has taken it back.
+	h.manager.Dispatch(&transport.Delivery{
+		Command: protocol.Command{
+			V: protocol.Version, Type: protocol.CommandSessionStatus, SID: sid, ID: "cmd-served-status",
+			ReplyTo: "wa:reply:cmd-served-status",
+		},
+		Ack: func(context.Context) error { return nil },
+	})
+	if reply := h.answered(t, "cmd-served-status"); !reply.OK {
+		t.Fatalf("given: the status was not served: %+v", reply.Error)
+	}
+
+	// And a second teardown, also late, also refused.
+	h.manager.Dispatch(teardown(sid, "cmd-served-2", time.Now().Add(-time.Minute)))
+	if reply := h.answered(t, "cmd-served-2"); refusalCode(reply) != protocol.ErrorExpired {
+		t.Fatalf("got %q, want the late refusal", refusalCode(reply))
+	}
+	h.heartbeat(t)
+
+	if h.manager.Count() != 1 {
+		t.Fatal("an account a client had used was handed back because two teardowns in a row were refused; the client is talking to an instance that has let it go")
+	}
+	if _, owned := h.leases.Owned(sid); !owned {
+		t.Fatal("the lease of an account a client had used went back")
+	}
+}
+
+// TestAWakeKeepsAnAccountTheHandBackWasAboutToTake is the same trap reached by the one
+// path that leaves no trace in the count.
+//
+// A `session.wake` for an account already running is answered by the manager itself: it
+// adopts, finds the session, acknowledges, and nothing reaches the executor. So the count
+// the hand-back watches does not move, and without something saying otherwise the next
+// tick would give away an account the fleet has just been told to keep up.
+func TestAWakeKeepsAnAccountTheHandBackWasAboutToTake(t *testing.T) {
+	t.Parallel()
+	h := newTeardownHarness(t)
+	const sid = "sess-249-woken"
+
+	h.manager.Dispatch(teardown(sid, "cmd-woken", time.Now().Add(-time.Minute)))
+	if reply := h.answered(t, "cmd-woken"); refusalCode(reply) != protocol.ErrorExpired {
+		t.Fatalf("given: got %q, want the late refusal", refusalCode(reply))
+	}
+
+	var acked atomic.Bool
+	h.manager.Dispatch(&transport.Delivery{
+		Command: protocol.Command{V: protocol.Version, Type: protocol.CommandSessionWake, SID: sid, ID: "cmd-woken-wake"},
+		Ack:     func(context.Context) error { acked.Store(true); return nil },
+		Release: func() {}, Forfeit: func() {},
+	})
+	waitFor(t, "the wake to be answered", acked.Load)
+	h.heartbeat(t)
+
+	if h.manager.Count() != 1 {
+		t.Fatal("an account a wake had just claimed was handed back; whoever sent the wake was told it is running here, and the connect behind it now has no owner")
+	}
+	if _, owned := h.leases.Owned(sid); !owned {
+		t.Fatal("the lease went back under an account a wake had just taken")
 	}
 }

@@ -52,7 +52,7 @@ account is not torn down, which is the device left linked on somebody's phone th
 fields exist to keep apart, and it is the whole of what the refusal costs. The adoption
 behind it costs nothing further: an account opened so that a teardown can reach its
 executor is never connected, and one whose teardown was then refused for arriving late is
-given back, by the heartbeat rather than by the answer, so a refused teardown does not
+given back, by a heartbeat rather than by the answer, so a refused teardown does not
 leave the account owned by the instance that refused it. A client that sends another
 command for that account in between is talking to the instance that still owns it, and one
 that arrives while the lease is going back is left pending for whoever takes the account

@@ -278,6 +278,12 @@ func (m *Manager) adopt(ctx context.Context, sid string) (*Session, bool, error)
 				Msg("a wake found an account this instance is finishing with; leaving it pending")
 			return nil, false, errLeaving
 		}
+		// Somebody wants this account in the air: every caller that gets here asked for
+		// the session rather than for a teardown, and `takeForDelete` is reached only
+		// when the account is not running. An adoption that was made to serve a teardown
+		// and is waiting for a tick to be undone stops being ours the moment one of them
+		// arrives, and unlike a command it leaves no trace in the count.
+		m.forgetAdoptedForDelete(sid, existing)
 		return existing, false, nil
 	}
 
@@ -1021,9 +1027,20 @@ func (m *Manager) teardownRefused(sid string, code protocol.ErrorCode) {
 	entry, adopted := m.forDelete[sid]
 	switch {
 	case !adopted:
+	case entry.session.carriedSoFar() != entry.carried+1:
+		// Something other than teardowns has been carried out on this session since the
+		// last time the count was armed, so the account is one a client is talking to. It
+		// is not ours to give back, whatever this teardown answered.
+		//
+		// Counted rather than inspected, and one at a time rather than "since the
+		// adoption", because re-arming on the total would fold that client's work into the
+		// new baseline: a late delete, a connect that worked, a second late delete, and
+		// the hand-back would then close a live socket on the strength of two commands
+		// that were both refused.
+		delete(m.forDelete, sid)
 	case code == protocol.ErrorExpired:
 		entry.refused = true
-		// Already counting this refusal: `run` adds to the count before it calls here, so
+		// Already counting this refusal: `run` adds to the count before it returns, so
 		// this is the number the hand-back has to find unchanged.
 		entry.carried = entry.session.carriedSoFar()
 		m.forDelete[sid] = entry
@@ -1087,16 +1104,19 @@ func (m *Manager) giveBackRefusedTeardowns(ctx context.Context) {
 			m.forgetAdoptedForDelete(sid, entry.session)
 			continue
 		}
-		if !entry.refused {
-			// The teardown has not been answered yet, so there is nothing yet to undo.
-			//
-			// An early-out rather than a guard, said out loud because a mutation battery
-			// will find it: removing it changes no outcome, since a session whose teardown
-			// is still queued or still running is refused by `claimIdle` on those grounds.
-			// What it saves is a turn taken and given back plus a log line, once per tick,
-			// for every teardown in flight on the instance.
+		if entry.refused && entry.session.carriedSoFar() != entry.carried {
+			// A client's command has been carried out since the refusal, so the account is
+			// one somebody is talking to. Dropped from the list rather than retried every
+			// tick against a claim that can only fail.
+			m.forgetAdoptedForDelete(sid, entry.session)
 			continue
 		}
+		// An entry whose teardown has not been answered yet is offered to the claim like
+		// any other, and refused there. It is not filtered out here on purpose: a guard
+		// saying "not yet" would be a second place deciding what `claimIdle` decides, and
+		// nothing would fail if the two ever disagreed. A session whose teardown is still
+		// on the queue or still running is turned away on those grounds, and both grounds
+		// have a test of their own.
 		if ctx.Err() != nil {
 			// Out of tick, and the registration stays: the account is idle and nothing is
 			// waiting on it, so the next pass finds it the same way. What it costs is one
