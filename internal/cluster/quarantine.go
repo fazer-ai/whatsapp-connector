@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"strconv"
 	"time"
 
@@ -50,6 +51,10 @@ const (
 type Quarantine struct {
 	client *redisx.Client
 	now    func() time.Time
+	// random mints the token that tells one attempt from a retry of the same one. A seam
+	// rather than a call to rand inline, because a test that wants two calls to collide
+	// has no other way to arrange it, and the collision is the case that matters.
+	random func() uint64
 }
 
 // NewQuarantine returns the fleet's quarantine over one Redis.
@@ -57,7 +62,7 @@ func NewQuarantine(client *redisx.Client, now func() time.Time) *Quarantine {
 	if now == nil {
 		now = time.Now
 	}
-	return &Quarantine{client: client, now: now}
+	return &Quarantine{client: client, now: now, random: rand.Uint64}
 }
 
 // Strike records one more failure for a session and returns the moment the fleet may try
@@ -71,9 +76,22 @@ func (q *Quarantine) Strike(ctx context.Context, sid string) (time.Time, error) 
 		return time.Time{}, errors.New("cluster: a strike needs a session")
 	}
 	key := q.client.Keys().Quarantine(sid)
+	// Minted once per call, which is what makes a strike count an attempt rather than a
+	// round trip. go-redis sends a command again when its answer never comes back, and it
+	// sends the command it already built: a script that reached the server, ran, and lost
+	// its reply runs a second time under the arguments this line produced. Measured on a
+	// real Redis with the answer cut on the wire -- one failed adoption, two strikes, and
+	// the connector logging success both times, because from here a retry that worked and
+	// a first try that worked are the same thing.
+	//
+	// Written as its own statement for the reader rather than for the compiler: inlined
+	// into the argument list it is still evaluated once, and a mutation that moves it
+	// there changes nothing, which is why no test fences the position. What would break it
+	// is minting per attempt instead of per call, and nothing here is shaped to do that.
+	attempt := strconv.FormatUint(q.random(), 36)
 	answer, err := strikeScript.Run(ctx, q.client, []string{key},
 		q.now().UnixMilli(), QuarantineFloor.Milliseconds(), QuarantineCap.Milliseconds(),
-		quarantineMemory.Milliseconds(),
+		quarantineMemory.Milliseconds(), attempt,
 	).Int64()
 	if err != nil {
 		return time.Time{}, fmt.Errorf("cluster: record a failure for %s: %w", sid, err)
@@ -100,6 +118,10 @@ func (q *Quarantine) Strike(ctx context.Context, sid string) (time.Time, error) 
 // Redis the hour it never earned.
 var strikeScript = redis.NewScript(`
 local now, floor, cap, memory = tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3]), tonumber(ARGV[4])
+local attempt = ARGV[5]
+if redis.call("HGET", KEYS[1], "attempt") == attempt then
+  return tonumber(redis.call("HGET", KEYS[1], "until"))
+end
 local strikes = 1
 if redis.call("HGET", KEYS[1], "until") then
   strikes = tonumber(redis.call("HINCRBY", KEYS[1], "strikes", 1))
@@ -115,7 +137,7 @@ for _ = 2, strikes do
   end
 end
 local until_ms = now + wait
-redis.call("HSET", KEYS[1], "until", until_ms)
+redis.call("HSET", KEYS[1], "until", until_ms, "attempt", attempt)
 redis.call("PEXPIRE", KEYS[1], wait + memory)
 return until_ms
 `)

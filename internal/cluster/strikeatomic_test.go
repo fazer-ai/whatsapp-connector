@@ -288,3 +288,26 @@ func TestEachTestGetsAKeyspaceOfItsOwn(t *testing.T) {
 			prefix)
 	}
 }
+
+// TestTwoFailuresStillCountTwice is the control beside the retry test in the internal file:
+// the token has to fold a retry of one attempt and nothing else. Folding two real failures
+// into one would flatten the backoff exactly where it is supposed to climb.
+func TestTwoFailuresStillCountTwice(t *testing.T) {
+	t.Parallel()
+	quarantine, rdb, prefix := realQuarantine(t)
+	const sid = "sess-twice"
+	key := prefix + "quarantine:" + sid
+
+	for i := 0; i < 2; i++ {
+		if _, err := quarantine.Strike(t.Context(), sid); err != nil {
+			t.Fatalf("strike %d: %v", i+1, err)
+		}
+	}
+	strikes, err := rdb.HGet(t.Context(), key, "strikes").Int64()
+	if err != nil {
+		t.Fatalf("HGet strikes: %v", err)
+	}
+	if strikes != 2 {
+		t.Fatalf("two failures left %d strikes, want 2", strikes)
+	}
+}
