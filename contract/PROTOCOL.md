@@ -29,15 +29,18 @@ account behind it. With one field a client had to choose, and chose neither.
 It is carried out before any session is involved, and nothing on that path reads `deadline`.
 That is the whole point for a wake: it is the only thing that starts a session with no entry
 yet in the connector's own record of what each session should be, so retiring one for
-arriving late leaves an account paired, owned by nobody and silent.
+arriving late leaves an account paired, owned by nobody and silent. What paces a wake that
+keeps coming back is instead the fleet's own backoff described under `wa:quarantine:<sid>`
+below: not a count of deliveries and not a clock, but the connector declining to make the
+same attempt again for a minute, then two, up to an hour.
 
 `admin.ping` goes the other way, and the difference is what refusing costs. A ping asks what
 this instance is running *now*, so one answered after its deadline is a true sentence about
 the wrong instant, sent to a caller that stopped waiting; refusing starts nothing and tears
-nothing down. A late ping is answered `expired`.
-What paces a wake that keeps coming back is instead the fleet's own backoff described under
-`wa:quarantine:<sid>` below: not a count of deliveries and not a clock, but the connector
-declining to make the same attempt again for a minute, then two, up to an hour.
+nothing down. A late ping is answered `expired`, and a client that sent one without a
+`reply_to` sees nothing at all: the refusal is recorded as
+`wac_command_duration_seconds{type="admin.ping",outcome="expired"}` on the instance and
+nowhere else, with no line in its log.
 
 `session.delete` is the exception among the three, and it is the one that costs a client
 something. It travels the control stream but it is not carried out there: the connector
