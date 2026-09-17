@@ -575,3 +575,14 @@ internal/session/manager.go: Mark each expiring hand-back before another stop ca
 # side is one margin of lease rather than the length of an outage.
 internal/session/manager.go: Stop fresh sockets before blocking on stale releases  # PR#149
 internal/engine/whatsmeow/call.go: Keep call publication from blocking subsequent rejections  # PR#220 -> #221
+
+# PR#242: a constatação descreve o código de antes do 61a2eb6 e ancora nas linhas que
+# dizem que ele mudou. Não há soma nenhuma: `deliveries: entry.RetryCount`, verbatim do
+# XPENDING, é o único lugar que preenche a contagem, e o comentário em cima explica por
+# quê. O que sobra da constatação é uma proposta de desenho oposta à registrada -- pegar a
+# contagem DEPOIS do claim em vez de a que o XPENDING listou --, e essa troca custa outro
+# round trip que pode falhar igual, para responder sobre trabalho que já aconteceu em vez
+# de sobre o histórico da entrada. Um XCLAIM retentado não some: o próximo claim lê o
+# contador já mais alto pelo XPENDING dele. O commit argumenta isso com medição em Redis
+# real, com a resposta do claim cortada no proxy.
+internal/transport/redisstream/stream.go: Account for retried claims in the delivery count  # PR#242
