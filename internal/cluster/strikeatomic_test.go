@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -43,7 +44,12 @@ func realQuarantine(t *testing.T) (*cluster.Quarantine, *redis.Client, string) {
 	}
 	rdb := redis.NewClient(opts)
 	t.Cleanup(func() { _ = rdb.Close() })
-	prefix := "wactest:" + strconv.FormatInt(time.Now().UnixNano(), 36) + ":"
+	// Named after the test and not only after the clock. These run in parallel and the
+	// cleanup below deletes everything under its own prefix, so two of them sharing one
+	// would have the first to finish wipe the keys the second is still walking -- which is
+	// a strike that reads as an account with no history, in the middle of a curve. Measured
+	// the hard way: `make check` runs the suite three times and caught it once.
+	prefix := "wactest:" + t.Name() + ":" + strconv.FormatInt(time.Now().UnixNano(), 36) + ":"
 	t.Cleanup(func() {
 		keys, err := rdb.Keys(context.Background(), prefix+"*").Result()
 		if err == nil && len(keys) > 0 {
@@ -258,5 +264,27 @@ func TestAnExpiredWaitIsStillAHistory(t *testing.T) {
 		t.Fatalf("a ninth failure waits %s, want %s: a deadline that passed is every wait the "+
 			"account already served, and forgiving it resets the backoff of every account due to be tried",
 			got, cluster.QuarantineWait(9))
+	}
+}
+
+// TestEachTestGetsAKeyspaceOfItsOwn is the deterministic gate under the flake above, and it
+// is here because a suite that passes five times running proves nothing about a collision
+// that needs two tests to start inside the same nanosecond.
+//
+// What the prefix has to guarantee is that no two of these share a keyspace, because each
+// one's cleanup deletes everything under its own. A clock alone does not guarantee it: the
+// resolution is the platform's, and `t.Parallel()` starts them together on purpose. The
+// test's name does, by Go's own construction, so this asserts the name is in there rather
+// than asserting that a race did not happen to occur.
+func TestEachTestGetsAKeyspaceOfItsOwn(t *testing.T) {
+	t.Parallel()
+	if os.Getenv(RedisEnv) == "" {
+		t.Skipf("set %s to run this against a real Redis (see 'make test-redis')", RedisEnv)
+	}
+	_, _, prefix := realQuarantine(t)
+	if !strings.Contains(prefix, t.Name()) {
+		t.Fatalf("the prefix %q does not name the test that owns it; two tests starting in the "+
+			"same nanosecond would then share a keyspace, and the first cleanup would wipe the other's keys",
+			prefix)
 	}
 }
