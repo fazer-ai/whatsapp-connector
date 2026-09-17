@@ -271,8 +271,14 @@ func TestEveryGateCIEnforcesIsReachableFromMakeCheck(t *testing.T) {
 	// suite when nothing "relevant" changed, and its list was written for Go code: a change
 	// to exactly the Makefile and the workflows ended the turn having run nothing, so the
 	// one check that reads them was skipped for its own subject.
+	// Every workflow, not only the ones that gate a change: this fence reads `publish.yml`
+	// and decides it is a release, and a decision is a reading. A turn that changed only
+	// that file would end with nothing run, and the reading that skipped it would be the
+	// one thing never re-made.
 	relevant := relevanceOfTheStopHook(t)
-	for _, path := range append([]string{strings.TrimPrefix(makefilePath, "../../")}, workflowPaths(read)...) {
+	paths := append([]string{strings.TrimPrefix(makefilePath, "../../")}, workflowPaths(read)...)
+	paths = append(paths, workflowPaths(skipped)...)
+	for _, path := range paths {
 		if !relevant.MatchString(path) {
 			t.Errorf("%s reads %s and the stop hook does not consider it relevant:\n"+
 				"\ta turn that changed only that file ends with the suite unrun, which skips this fence for the file it is about.\n"+
