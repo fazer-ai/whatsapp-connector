@@ -36,6 +36,24 @@ type Emission struct {
 	// nothing to apply it to. The engine is the only layer that knows when the fact
 	// happened, so it is the one that says.
 	At int64
+	// Decided is when this session judged the thing it is about to report, read before
+	// anything that can wait. Zero is an emission nobody is timing, which is all of them
+	// but the one below.
+	//
+	// It is not `At` and cannot be, although both are moments. `At` is when the fact
+	// happened, in WhatsApp's clock where WhatsApp gives one, and it crosses the wire as
+	// the frame's `ts`; this is when *this process* decided, and it never leaves the
+	// process. Measured: `At` is read inside `emitting`, which runs after the transition
+	// lock has been acquired, so a distance computed from it starts after the wait that
+	// #182 is about -- "every arm waiting on that lock waits behind it, including the one
+	// that decides a socket is gone". Reusing `At` would report the cost of the publish
+	// while omitting the cost of getting to it.
+	//
+	// It travels on the emission rather than in a map of decisions in flight because
+	// `publish` has four ways to return without landing, and a map cleaned only on the
+	// happy path grows without bound in exactly the session whose publisher is down --
+	// the condition this measurement exists to observe.
+	Decided time.Time
 	// Retires says this session has nothing left to do on its own once this emission is
 	// out: the engine is reporting a state it will not come back from without being told
 	// to try again. A temporary ban, a client WhatsApp will not talk to and a connect it

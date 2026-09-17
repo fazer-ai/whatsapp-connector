@@ -1369,7 +1369,11 @@ func TestTheKeepAliveHandlerTakesTheSocketDownBeforeItWaitsOnThePublish(t *testi
 	handler := theCaseFor(t, "*waEvents.KeepAliveTimeout")
 	refused := strings.Index(handler, "setReconnecting(true")
 	closed := strings.Index(handler, "takeDownSoon(")
-	published := strings.Index(handler, "s.emit(")
+	// The family and not one call: what is load-bearing here is where the publish sits
+	// among the three, not which helper makes it. Pinned to `s.emit(`, this went red when
+	// #182 changed the arm to `s.emitDecided(` -- loudly, which is right, but the next
+	// rename would cost the same reading of a fence that was never about the name.
+	published := strings.Index(handler, "s.emit")
 	if refused < 0 || closed < 0 || published < 0 {
 		t.Fatalf("the keepalive handler does not refuse, close and publish:\n%s", handler)
 	}

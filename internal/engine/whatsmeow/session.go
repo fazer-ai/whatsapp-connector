@@ -3787,6 +3787,16 @@ func (s *Session) emitAt(at int64, eventType protocol.EventType, payload any) {
 	s.emitting(&engine.Emission{Type: eventType, At: at}, payload)
 }
 
+// emitDecided is emit for the one state whose distance to the shard is measured.
+//
+// The instant is handed in rather than read here for the reason `Decided` exists: this
+// function is called with the transition lock already held, and reading the clock now
+// would date the decision from whenever the lock came free. The caller has it from
+// `handle`, which reads it before anything can wait.
+func (s *Session) emitDecided(decided time.Time, eventType protocol.EventType, payload any) {
+	s.emitting(&engine.Emission{Type: eventType, Decided: decided}, payload)
+}
+
 // emitLast is emit for a state whatsmeow does not come back from. It says so on the
 // emission, so the connector hands the lease back once the event is out and the account
 // stops belonging to an instance with nothing left to try.
@@ -4385,7 +4395,7 @@ func (s *Session) handle(rawEvent any) bool {
 		// reads the client's socket when it runs rather than when it is asked for, so the
 		// count above is carried along and checked on the other side.
 		s.takeDownSoon(client, judged)
-		s.emit(protocol.EventSessionState, map[string]any{"state": "reconnecting", "reason": "keepalive"})
+		s.emitDecided(dispatched, protocol.EventSessionState, map[string]any{"state": "reconnecting", "reason": "keepalive"})
 	case *waEvents.KeepAliveRestored:
 		// Nothing to announce: the socket never went down, so no state changed. What this
 		// is for is the timeouts that came before it and have not been handled yet.

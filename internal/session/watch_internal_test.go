@@ -22,6 +22,7 @@ type spyWatch struct {
 	done   []doneCommand
 	leases int
 	lost   []string
+	delays []time.Duration
 }
 
 func (s *spyWatch) CommandDone(kind protocol.CommandType, outcome string, took time.Duration) {
@@ -35,6 +36,18 @@ func (s *spyWatch) LeaseLost(sid string) {
 	defer s.mu.Unlock()
 	s.leases++
 	s.lost = append(s.lost, sid)
+}
+
+func (s *spyWatch) StateDecided(took time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.delays = append(s.delays, took)
+}
+
+func (s *spyWatch) stateDelays() []time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]time.Duration(nil), s.delays...)
 }
 
 func (s *spyWatch) all() []doneCommand {

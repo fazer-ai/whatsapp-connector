@@ -1354,6 +1354,10 @@ func commandLabel(kind protocol.CommandType) string {
 	return string(kind)
 }
 
+func (w *watching) StateDecided(took time.Duration) {
+	w.metrics.StateNoticeDelay.Observe(took.Seconds())
+}
+
 func (w *watching) LeaseLost(sid string) {
 	w.metrics.LeasesLost.Inc()
 	if w.owner != nil {

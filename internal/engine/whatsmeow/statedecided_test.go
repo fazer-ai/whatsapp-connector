@@ -1,0 +1,86 @@
+package whatsmeow
+
+import (
+	"testing"
+	"time"
+
+	waEvents "go.mau.fi/whatsmeow/types/events"
+
+	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
+)
+
+// The instant that travels to the publish side is the dispatch, and the whole value of the
+// measurement rides on which of the two it is.
+//
+// The arm takes the transition lock before it judges anything, and a lock already held
+// across a publish waiting on a full inbox holds this arm behind it for as long as that
+// takes. #182's first paragraph is about exactly that wait -- "every arm waiting on that
+// lock waits behind it, including the one that decides a socket is gone" -- so an instant
+// read after the lock came free reports the publish and omits the queueing that made it
+// late, which is the reading that does not answer the question.
+//
+// Driven rather than measured, the way the dating test beside it is: two `time.Now()` calls
+// in a row cannot produce a gap the real thing takes minutes over. The first reading is the
+// dispatch and everything after it is the handling, so `Decided` coming back as the second
+// reading is the delivery having read the clock too late.
+//
+// It also fences reusing `Emission.At`, which is measured to be read inside `emitting`,
+// after the lock: `At` would come back as the later reading here and the test would say so.
+func TestTheKeepAliveStateCarriesTheDispatchInstantToThePublishSide(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newLoggedTestSession(t, "5511999990002")
+	dialedAndConnected(session)
+	drain(t, session)
+
+	dispatched := time.Now()
+	var readings int
+	session.wallClock = func() time.Time {
+		readings++
+		if readings == 1 {
+			return dispatched
+		}
+		return dispatched.Add(time.Minute)
+	}
+
+	session.handle(&waEvents.KeepAliveTimeout{ErrorCount: 2, LastSuccess: dispatched})
+
+	var state *emissionSeen
+	for {
+		select {
+		case emission, open := <-session.Events():
+			if !open {
+				t.Fatal("the session closed without publishing a state")
+			}
+			if emission.Type != protocol.EventSessionState {
+				continue
+			}
+			state = &emissionSeen{decided: emission.Decided, at: emission.At}
+		case <-time.After(time.Second):
+			if state == nil {
+				t.Fatal("no session.state came out of the keepalive arm")
+			}
+		}
+		if state != nil {
+			break
+		}
+	}
+
+	if state.decided.IsZero() {
+		t.Fatal("the state left the keepalive arm with no decision instant, so nothing downstream can measure how long the client waited to be told")
+	}
+	if !state.decided.Equal(dispatched) {
+		t.Errorf("the decision is stamped %s, when the handler got round to it, rather than %s, when the event was dispatched: "+
+			"the wait for the transition lock falls outside the measurement, and that wait is what #182 is about",
+			state.decided.Format(time.TimeOnly), dispatched.Format(time.TimeOnly))
+	}
+	if state.at == dispatched.UnixMilli() {
+		t.Error("`At` and the decision instant are now the same reading, which means one of them stopped meaning what it says: " +
+			"`At` is the engine's reading of when the fact happened and crosses the wire as `ts`, and it is read inside `emitting`, after the lock")
+	}
+}
+
+type emissionSeen struct {
+	decided time.Time
+	at      int64
+}

@@ -31,6 +31,7 @@ var writtenBy = map[string]string{
 	"CommandReadsFailed":     "internal/app",
 	"CommandReadLastSuccess": "internal/app",
 	"EmissionWait":           "internal/app",
+	"StateNoticeDelay":       "internal/app",
 	"InboxDepth":             "internal/app",
 	"EventsPublished":        "internal/app",
 	"CommandDuration":        "internal/app",
