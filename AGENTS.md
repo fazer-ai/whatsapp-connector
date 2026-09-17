@@ -28,8 +28,10 @@ of truth for both sides; this repository is the side that produces events.
   what this replaced, and they had already drifted: CI ran `go mod tidy -diff` and `make
   check` did not
 - **The half that needs nothing running**: `make check-offline` (lint, `go mod tidy`, the
-  SQLite pass). It is what the git hooks and the agent stop hook fall back to, so a commit
-  made without Docker running does not fail for a reason that is not the commit's
+  SQLite pass). It names the two passes it did not run when it finishes, and it is what the
+  agent stop hook falls back to, so ending a turn without Docker running does not fail for a
+  reason that is not the turn's. The versioned `pre-commit` hook runs neither target: gofmt
+  on the staged files, `go vet` and the contract test, and it is meant to stay under a second
 - **Toolchain**: Go as declared in `go.mod`; `golangci-lint` v2
 
 ## Layout

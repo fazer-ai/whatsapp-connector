@@ -1,6 +1,7 @@
 # Development entry points. `make check` is the whole of what CI enforces and needs both
 # servers; `make check-offline` is the part that needs nothing running, and is what the
-# git hooks and the agent stop hook fall back to.
+# agent stop hook falls back to. The versioned pre-commit hook runs neither: it does gofmt
+# on the staged files, `go vet` and the contract test, and is meant to stay under a second.
 
 GO ?= go
 GOLANGCI_LINT ?= golangci-lint
@@ -13,9 +14,18 @@ PACKAGES ?= ./...
 # the rule. Defined further down, this arrives empty and `check` quietly loses both passes
 # -- which is this issue's own defect, produced by its fix, and caught by `make -n check`
 # printing a recipe with one `go test` in it instead of three.
+#
+# `_RUN` and `_URL` are here and not in each recipe for the same reason as `_VAR`: the
+# preflight has to name the server that is actually missing. Spelled per recipe, a shell
+# with PostgreSQL up and no Redis was told to start a PostgreSQL, and an instruction whose
+# first line is already done is one people stop reading.
 SERVER_PASSES := test-postgres test-redis
 test-postgres_VAR := WAC_TEST_DATABASE_URL
+test-postgres_RUN := docker run -d --rm -p 55432:5432 -e POSTGRES_USER=wac -e POSTGRES_PASSWORD=wac -e POSTGRES_DB=wac postgres:18-alpine
+test-postgres_URL := postgres://wac:wac@localhost:55432/wac?sslmode=disable
 test-redis_VAR := WAC_TEST_REDIS_URL
+test-redis_RUN := docker run -d --rm -p 56379:6379 redis:8-alpine
+test-redis_URL := redis://localhost:56379/0
 
 .DEFAULT_GOAL := help
 .PHONY: help setup deps hooks fmt lint test test-postgres test-redis test-cover contract tidy check check-offline check-servers clean
@@ -62,18 +72,18 @@ test: ## Run the test suite with the race detector, against SQLite and the doubl
 # error becomes a target people route around.
 test-postgres: ## Run the test suite against a PostgreSQL server (WAC_TEST_DATABASE_URL)
 	@test -n "$(WAC_TEST_DATABASE_URL)" || { \
-	  echo "WAC_TEST_DATABASE_URL is unset or empty. It names the server this pass runs against:"; \
-	  echo "  docker run -d --rm -p 55432:5432 -e POSTGRES_USER=wac -e POSTGRES_PASSWORD=wac -e POSTGRES_DB=wac postgres:18-alpine"; \
-	  echo "  WAC_TEST_DATABASE_URL=postgres://wac:wac@localhost:55432/wac?sslmode=disable make test-postgres"; \
+	  echo "$(test-postgres_VAR) is unset or empty. It names the server this pass runs against:"; \
+	  echo "  $(test-postgres_RUN)"; \
+	  echo "  $(test-postgres_VAR)=$(test-postgres_URL) make test-postgres"; \
 	  echo "(any free port will do; 55432 only avoids whatever is already on 5432)"; \
 	  exit 1; }
 	$(GO) test -count=1 $(PACKAGES)
 
 test-redis: ## Run the pass that needs a real Redis (WAC_TEST_REDIS_URL)
 	@test -n "$(WAC_TEST_REDIS_URL)" || { \
-	  echo "WAC_TEST_REDIS_URL is unset or empty. It names the server this pass runs against:"; \
-	  echo "  docker run -d --rm -p 56379:6379 redis:8-alpine"; \
-	  echo "  WAC_TEST_REDIS_URL=redis://localhost:56379/0 make test-redis"; \
+	  echo "$(test-redis_VAR) is unset or empty. It names the server this pass runs against:"; \
+	  echo "  $(test-redis_RUN)"; \
+	  echo "  $(test-redis_VAR)=$(test-redis_URL) make test-redis"; \
 	  echo "(any free port will do; 56379 only avoids whatever is already on 6379)"; \
 	  exit 1; }
 	$(GO) test -count=1 ./internal/transport/redisstream
@@ -103,6 +113,7 @@ tidy: ## Fail when go.mod/go.sum are not tidy
 # exported from a shell profile, a direnv file or an agent's configuration and then never
 # appear again in any command anybody typed or any round recorded. A target has to be
 # named where it is run.
+check: UNDER_CHECK := yes
 check: check-servers check-offline $(SERVER_PASSES) ## Everything CI enforces; needs both servers (see check-offline)
 
 # Every missing server at once, before anything runs.
@@ -111,17 +122,18 @@ check: check-servers check-offline $(SERVER_PASSES) ## Everything CI enforces; n
 # Whoever starts a PostgreSQL on that advice gets to the same wall again, one pass later
 # and several minutes in, which is the shape of an instruction people stop following.
 check-servers:
-	@missing=""; \
-	$(foreach t,$(SERVER_PASSES),test -n "$($($(t)_VAR))" || missing="$$missing $($(t)_VAR)";) \
+	@missing=""; remedy=""; setup=""; \
+	$(foreach t,$(SERVER_PASSES),test -n "$($($(t)_VAR))" || { \
+	  missing="$${missing} $($(t)_VAR)"; \
+	  remedy="$${remedy}  $($(t)_RUN)\n"; \
+	  setup="$${setup}$($(t)_VAR)=$($(t)_URL) "; };) \
 	if [ -n "$$missing" ]; then \
 	  echo "make check runs every pass CI enforces, and these are unset or empty:$$missing"; \
 	  echo; \
-	  echo "  docker run -d --rm -p 55432:5432 -e POSTGRES_USER=wac -e POSTGRES_PASSWORD=wac -e POSTGRES_DB=wac postgres:18-alpine"; \
-	  echo "  docker run -d --rm -p 56379:6379 redis:8-alpine"; \
-	  echo "  WAC_TEST_DATABASE_URL=postgres://wac:wac@localhost:55432/wac?sslmode=disable \\"; \
-	  echo "  WAC_TEST_REDIS_URL=redis://localhost:56379/0 make check"; \
+	  printf "$$remedy"; \
+	  echo "  $${setup}make check"; \
 	  echo; \
-	  echo "(any free port will do; these only avoid whatever is already on 5432 and 6379)"; \
+	  echo "(any free port will do; the ports above only avoid whatever is usually listening)"; \
 	  echo "For the half that needs nothing running: make check-offline"; \
 	  exit 1; \
 	fi
@@ -134,6 +146,13 @@ check-servers:
 # `go mod tidy -diff`, and an untidy go.sum passed `check` green with both servers up and
 # nothing skipped. A target that promises everything has to be told when the list grows.
 check-offline: lint tidy test ## Lint, tidy and the SQLite pass: everything that needs no server
+	@test -n "$(UNDER_CHECK)" || { \
+	  echo; \
+	  echo "check-offline is done. It does not run the passes that need a server:"; \
+	  $(foreach t,$(SERVER_PASSES),echo "  $(t) ($($(t)_VAR))"; ) \
+	  echo; \
+	  echo "make check runs those too, and says how to start each server."; \
+	}
 
 clean: ## Remove build and coverage output
 	rm -rf bin dist coverage.txt

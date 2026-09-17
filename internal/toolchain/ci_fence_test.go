@@ -318,8 +318,7 @@ func everyCommandIsMake(script string) bool {
 }
 
 // reachableFrom walks the Makefile's own dependency graph from a target, and also returns
-// every target it declares. Variables are expanded because `check` names its server passes
-// through one: reading the prerequisites literally would report that `check` runs neither.
+// every target it declares.
 func reachableFrom(t *testing.T, root string) (reachable, declared map[string]bool) {
 	t.Helper()
 
@@ -327,23 +326,7 @@ func reachableFrom(t *testing.T, root string) (reachable, declared map[string]bo
 	if err != nil {
 		t.Fatalf("read %s: %v", makefilePath, err)
 	}
-
-	vars := map[string]string{}
-	prereqs := map[string][]string{}
-	for _, line := range strings.Split(string(raw), "\n") {
-		if line == "" || line[0] == '\t' || line[0] == '#' || line[0] == '.' {
-			continue
-		}
-		if name, value, ok := assignment(line); ok {
-			vars[name] = value
-			continue
-		}
-		name, rest, ok := strings.Cut(line, ":")
-		if !ok || strings.ContainsAny(name, " \t$") || name == "" {
-			continue
-		}
-		prereqs[name] = strings.Fields(expand(vars, comment.ReplaceAllString(rest, "")))
-	}
+	prereqs := parseMakefile(string(raw))
 	if len(prereqs) == 0 {
 		t.Fatalf("%s parsed into no targets at all", makefilePath)
 	}
@@ -363,6 +346,55 @@ func reachableFrom(t *testing.T, root string) (reachable, declared map[string]bo
 	}
 	delete(reachable, root)
 	return reachable, declared
+}
+
+// parseMakefile reads the rules as make reads them. Variables are expanded because `check`
+// names its server passes through one: read literally, the prerequisites would say `check`
+// runs neither.
+func parseMakefile(raw string) map[string][]string {
+	vars := map[string]string{}
+	prereqs := map[string][]string{}
+	for _, line := range strings.Split(raw, "\n") {
+		if line == "" || line[0] == '\t' || line[0] == '#' || line[0] == '.' {
+			continue
+		}
+		if name, value, ok := assignment(line); ok {
+			vars[name] = value
+			continue
+		}
+		name, rest, ok := strings.Cut(line, ":")
+		if !ok || strings.ContainsAny(name, " \t$") || name == "" {
+			continue
+		}
+		// `check: UNDER_CHECK := yes` is a target-specific variable, not a rule. Read as
+		// prerequisites it hands `check` three that do not exist, and whether that is
+		// harmless depends only on which side of the real rule the line sits.
+		if _, _, isVar := assignment(strings.TrimSpace(rest)); isVar {
+			continue
+		}
+		prereqs[name] = strings.Fields(expand(vars, comment.ReplaceAllString(rest, "")))
+	}
+	return prereqs
+}
+
+// A target-specific variable shares a rule's shape and is not one. The Makefile puts it
+// above the rule it belongs to, which is where it reads best and also where getting this
+// wrong does no harm, so the order is pinned here rather than left to the file.
+func TestParseMakefileReadsRulesAndNotTargetVariables(t *testing.T) {
+	t.Parallel()
+
+	for _, order := range []string{
+		"check: UNDER_CHECK := yes\ncheck: check-servers check-offline\n",
+		"check: check-servers check-offline\ncheck: UNDER_CHECK := yes\n",
+	} {
+		got := parseMakefile("PASSES := test-postgres\n" + order + "check-offline: lint test $(PASSES)\n")
+		if want := []string{"check-servers", "check-offline"}; !equal(got["check"], want) {
+			t.Errorf("parseMakefile(%q)[\"check\"] = %v, want %v", order, got["check"], want)
+		}
+		if want := []string{"lint", "test", "test-postgres"}; !equal(got["check-offline"], want) {
+			t.Errorf("parseMakefile(%q)[\"check-offline\"] = %v, want %v", order, got["check-offline"], want)
+		}
+	}
 }
 
 var (
