@@ -877,10 +877,16 @@ func (m *Manager) wake(ctx context.Context, delivery *transport.Delivery) {
 	// wrong one here: a wake the fleet cannot act on is handed back unrun and read out of
 	// the history again on the very next block, so its idle never grows and Redelivered
 	// is false on every one of those repeats -- measured on 2771941, twenty times in
-	// forty-five seconds. Gating on it would leave the loop untouched. This is the first
-	// thing in the connector to branch on DeliveredBefore, and the field's own
-	// documentation said nothing did; what makes it the right one is that it separates
-	// the read that carried a client's ask from every copy that came after it.
+	// forty-five seconds. Gating on it would leave the loop untouched.
+	//
+	// What it separates is first delivery from redelivery, which is not quite the same as
+	// separating a client's ask from the fleet repeating itself, and the gap is worth
+	// naming. A wake read by an instance that died before it adopted comes back as a
+	// redelivery carrying an ask nobody ever served, and if the account is waiting out a
+	// backoff this declines it. The cost is bounded and the way out is written into the
+	// contract: the client publishes another wake, which is read fresh and adopts. It is
+	// also a narrow case -- an account is only waiting out a backoff because an earlier
+	// adoption already failed, so the ask this delays is one that was likely to fail too.
 	if delivery.DeliveredBefore {
 		if until, waiting := m.waitingOut(ctx, sid); waiting {
 			m.log.Info().Str("sid", sid).Time("until", until).
@@ -1504,10 +1510,12 @@ func (m *Manager) SweepRetired(ctx context.Context, by time.Time) {
 
 // waitingOut reports whether the fleet is leaving this account alone, and until when.
 //
-// One HGET on the goroutine that renews every lease this instance holds, and bounded
-// like everything else that runs there. What it costs is paid only where it saves
-// something: a wake being acted on is read once and never comes back, so the read
-// happens exactly on the repeats that would otherwise each have paid for an adoption.
+// One HGET on the goroutine that answers a manager's own commands, which is where every
+// wake is carried out and is not the one that renews leases: Dispatch queues through
+// `own` and Answer runs it, so this spends no part of a renewal's budget. Bounded anyway,
+// like everything else there. What it costs is paid only where it saves something: a wake
+// being acted on is read once and never comes back, so the read happens exactly on the
+// repeats that would otherwise each have paid for an adoption.
 //
 // A read that failed answers "not waiting". Not knowing is a reason to try rather than a
 // reason to hold back: the quarantine paces what the connector does on its own, and a

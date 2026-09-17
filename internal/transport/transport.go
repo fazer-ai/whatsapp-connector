@@ -74,7 +74,10 @@ type Delivery struct {
 	Redelivered bool
 	// DeliveredBefore says this entry came out of the consumer group's pending list
 	// rather than arriving new, whatever its age. It is a fact about the entry, not a
-	// judgement about it, and nothing branches on it.
+	// judgement about it. Two things read it: the observability in internal/app counts a
+	// delivery that came back, and `wake` declines to make the same adoption attempt again
+	// while the fleet is leaving that account alone. Both want the same thing from it --
+	// "has this been handed out before" -- and neither wants the narrower question below.
 	//
 	// Redelivered above is the narrower question and answers a different one: has this
 	// been round long enough that its sender has probably stopped listening. The two
