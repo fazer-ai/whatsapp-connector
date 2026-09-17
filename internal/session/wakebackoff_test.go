@@ -43,6 +43,7 @@ type backoffHarness struct {
 	quarantine *cluster.Quarantine
 	engine     *shutEngine
 	manager    *session.Manager
+	rdb        *redis.Client
 }
 
 func newBackoffHarness(t *testing.T) backoffHarness {
@@ -66,7 +67,7 @@ func newBackoffHarness(t *testing.T) backoffHarness {
 	})
 	t.Cleanup(func() { manager.StopAll(context.Background()) })
 	answering(t, manager)
-	return backoffHarness{quarantine: quarantine, engine: shut, manager: manager}
+	return backoffHarness{quarantine: quarantine, engine: shut, manager: manager, rdb: rdb}
 }
 
 // TestAnAdoptionThatCannotOpenStrikesTheQuarantine is the first half of #241: the fleet
@@ -107,11 +108,12 @@ func TestAWakeThatCameRoundAgainLeavesAQuarantinedAccountAlone(t *testing.T) {
 	}
 	before := h.engine.opens.Load()
 
-	var forfeited atomic.Bool
+	var forfeited, acked atomic.Bool
 	wake := &transport.Delivery{
 		Command:         protocol.Command{Type: protocol.CommandSessionWake, SID: sid, ID: "cmd-1"},
 		DeliveredBefore: true,
 		Forfeit:         func() { forfeited.Store(true) },
+		Ack:             func(context.Context) error { acked.Store(true); return nil },
 	}
 	if pending := h.manager.Dispatch(wake); pending {
 		t.Fatalf("Dispatch left the wake on the reader rather than taking it onto the answer goroutine")
@@ -121,6 +123,72 @@ func TestAWakeThatCameRoundAgainLeavesAQuarantinedAccountAlone(t *testing.T) {
 	if opened := h.engine.opens.Load() - before; opened != 0 {
 		t.Fatalf("a wake that came round again tried the engine %d times on an account the fleet is leaving alone", opened)
 	}
+	// Given back, and given back rather than retired. Waiting out a backoff and being
+	// retired look the same for a minute and stop looking the same after that: the wake is
+	// the only thing that starts a session with no `desired` row, so a retired one is an
+	// account left paired, owned by nobody and silent.
+	if acked.Load() {
+		t.Fatalf("a wake was retired while the account waits out its backoff; nothing is left to start that session")
+	}
+}
+
+// failHGet makes exactly the read the quarantine does fail, and nothing else: leases are
+// SET and scripts, the instance registry is HGETALL, and only `Waiting` sends HGET.
+type failHGet struct{ on atomic.Bool }
+
+func (h *failHGet) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (h *failHGet) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return func(ctx context.Context, cmds []redis.Cmder) error {
+		if !h.on.Load() {
+			return next(ctx, cmds)
+		}
+		for _, cmd := range cmds {
+			if cmd.Name() == "hget" {
+				return errors.New("redis: refusing to answer")
+			}
+		}
+		return next(ctx, cmds)
+	}
+}
+
+func (h *failHGet) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if h.on.Load() && cmd.Name() == "hget" {
+			return errors.New("redis: refusing to answer")
+		}
+		return next(ctx, cmd)
+	}
+}
+
+// TestAWakeIsTriedWhenTheQuarantineCannotBeRead fences which way this fails. Not knowing
+// whether an account is being left alone is a reason to try it, not a reason to hold it:
+// the backoff paces what the connector does on its own, and a read that did not come back
+// is no evidence about the account. Held the other way, one unreachable Redis would stop
+// the fleet starting any session that had ever failed once.
+func TestAWakeIsTriedWhenTheQuarantineCannotBeRead(t *testing.T) {
+	t.Parallel()
+	h := newBackoffHarness(t)
+	const sid = "sess-shut"
+
+	if _, err := h.quarantine.Strike(t.Context(), sid); err != nil {
+		t.Fatalf("Strike: %v", err)
+	}
+	refusing := &failHGet{}
+	refusing.on.Store(true)
+	h.rdb.AddHook(refusing)
+	before := h.engine.opens.Load()
+
+	wake := &transport.Delivery{
+		Command:         protocol.Command{Type: protocol.CommandSessionWake, SID: sid, ID: "cmd-1"},
+		DeliveredBefore: true,
+		Forfeit:         func() {},
+		Ack:             func(context.Context) error { return nil },
+	}
+	if pending := h.manager.Dispatch(wake); pending {
+		t.Fatalf("Dispatch left the wake on the reader rather than taking it onto the answer goroutine")
+	}
+	waitFor(t, "the engine to be asked", func() bool { return h.engine.opens.Load() > before })
 }
 
 // TestAWakeReadForTheFirstTimeAdoptsAQuarantinedAccount is the fence in front of the
