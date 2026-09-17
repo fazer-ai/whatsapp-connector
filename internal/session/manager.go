@@ -969,8 +969,10 @@ func (m *Manager) takeForDelete(ctx context.Context, delivery *transport.Deliver
 		release(delivery)
 		return
 	case errors.Is(err, cluster.ErrNotOwner):
-		// A peer is running it, and nothing here can make it stop: `handoff:<sid>` is in
-		// the key set and is written and read by nobody. Tearing down from here would
+		// A peer is running it, and nothing here can make it stop: no command in the
+		// protocol asks an owner to give a session up on demand, and `wa:handback:<sid>`
+		// is an owner deciding to give one up itself, not a way for a peer to ask, so
+		// there is nothing this instance could write. Tearing down from here would
 		// pull the credentials out from under a live socket that still holds the lease.
 		//
 		// Left pending for the owner, which reads the control stream too, and forfeited

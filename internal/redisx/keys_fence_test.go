@@ -501,3 +501,9 @@ func TestTheContractKeepsHandoffAndHandbackApart(t *testing.T) {
 		}
 	}
 }
+
+// The sentences above name `wa:handoff:<sid>` in order to say it never had anything behind
+// it, and that is fenced for this file and for the contract by
+// TestNoCommentClaimsAHandoffKeyExists in handoff_prose_test.go, which sweeps every Go
+// comment and every Markdown file in the tree for the opposite claim. #252 found two of
+// those in internal/session, three rounds into this same family.
