@@ -1,6 +1,7 @@
 package observability_test
 
 import (
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -34,6 +35,10 @@ var writtenBy = map[string]string{
 	"CommandDuration":        "internal/app",
 	"LeasesLost":             "internal/app",
 	"EmissionsDropped":       "internal/app",
+	"CommandsDeliveredAgain": "internal/app",
+	"CommandsReclaimed":      "internal/app",
+	"CommandRedeliveries":    "internal/app",
+	"CommandReclaimPasses":   "internal/app",
 }
 
 // notWrittenYet is the metrics that are registered and known to count nothing, each with
@@ -108,14 +113,64 @@ func TestAMetricSaidToBeWrittenIsMentionedWhereItIsSaidToBe(t *testing.T) {
 		}
 	}
 
+	// Every package, walked, rather than the three somebody thought of. The list used to
+	// be `internal/app`, `internal/session`, `internal/cluster`, and a metric written
+	// from anywhere else passed this half in silence -- which is what #224 does, writing
+	// from a fact the transport puts on a delivery. A fence over a hand-written list of
+	// places is right on the day it is written and wrong the first time the code moves,
+	// and this repository has now had that three times (#229, #231, and here).
+	packages := goPackages(t, filepath.Join("..", ".."))
+	if len(packages) < 5 {
+		t.Fatalf("walked the tree and found %d package(s) with Go files in them: the walk is broken, "+
+			"and a walk that finds nothing passes this check without reading anything", len(packages))
+	}
 	for field := range notWrittenYet {
-		for _, pkg := range []string{"internal/app", "internal/session", "internal/cluster"} {
-			if mentions(t, filepath.Join("..", "..", pkg), field) {
+		for _, pkg := range packages {
+			if pkg == filepath.Join("..", "..", "internal", "observability") {
+				continue // declares every metric; see above
+			}
+			if mentions(t, pkg, field) {
 				t.Errorf("%s is listed as not written, but %s mentions it: move it to writtenBy",
 					field, pkg)
 			}
 		}
 	}
+}
+
+// goPackages is every directory under root holding at least one non-test Go file, with
+// the module's own throwaway directories left out.
+func goPackages(t *testing.T, root string) []string {
+	t.Helper()
+
+	var out []string
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !entry.IsDir() {
+			return nil
+		}
+		switch entry.Name() {
+		case ".git", "node_modules", "bin", "dist", "contract":
+			return fs.SkipDir
+		}
+		files, err := os.ReadDir(path)
+		if err != nil {
+			return err
+		}
+		for _, file := range files {
+			name := file.Name()
+			if !file.IsDir() && strings.HasSuffix(name, ".go") && !strings.HasSuffix(name, "_test.go") {
+				out = append(out, path)
+				return nil
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk %s: %v", root, err)
+	}
+	return out
 }
 
 // mentions reports whether any non-test Go file directly in dir names the identifier.

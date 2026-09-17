@@ -72,6 +72,29 @@ type Delivery struct {
 	// first is backpressure the caller acts on. Refusing the second retires the only copy
 	// of a command nobody ever ran and nobody hears about.
 	Redelivered bool
+	// DeliveredBefore says this entry came out of the consumer group's pending list
+	// rather than arriving new, whatever its age. It is a fact about the entry, not a
+	// judgement about it, and nothing branches on it.
+	//
+	// Redelivered above is the narrower question and answers a different one: has this
+	// been round long enough that its sender has probably stopped listening. The two
+	// come apart exactly where it matters. A wake the fleet cannot act on is handed back
+	// unrun and read out of the history again on the very next block, so its idle never
+	// grows: measured on 2771941 it came round about two and a half times a heartbeat,
+	// twenty times in forty-five seconds, with the idle never reaching two seconds
+	// against a fifteen-second claim delay. Every one of those has Redelivered false, and
+	// every one of them is the fleet doing the same work again.
+	DeliveredBefore bool
+	// TakenFrom names the consumer that was holding this entry when a claim took it
+	// back, and is empty for one that was read rather than claimed. It is the difference
+	// between "the fleet is busy" and "one instance took commands and stopped answering",
+	// which is a question nothing else here can answer: the instance that went quiet is
+	// precisely the one whose own metrics nobody is reading.
+	TakenFrom string
+	// Deliveries is how many times Redis says this entry has been handed out, counting
+	// this one, and is zero where that could not be read. Only a claim can know it: it
+	// comes from XPENDING, and a read never asks.
+	Deliveries int64
 	// Internal says this command came from the connector rather than from a client: the
 	// resume sweep synthesises a `session.connect` for an account whose owner went away,
 	// and nothing else does.

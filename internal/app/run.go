@@ -711,6 +711,11 @@ func (c *Connector) reclaimPass(ctx context.Context, take func(context.Context) 
 	defer cancel()
 
 	deliveries, err := take(pass)
+	// Counted whatever it found, and before the error check on purpose: a pass that
+	// returns nothing is the ordinary case, and without a series that moves anyway it
+	// reads exactly like a build where nobody writes any of this. A counter family with
+	// no children is absent from the exposition entirely.
+	c.metrics.CommandReclaimPasses.Inc()
 	if err != nil {
 		if ctx.Err() == nil {
 			c.log.Error().Err(err).Msg("failed to reclaim commands")
@@ -759,6 +764,8 @@ func streamOptions(cfg *Config, log *zerolog.Logger) redisstream.Options {
 // than a budget the dispatch can exhaust. What is not dispatched is released, so it
 // stays pending and comes back on a later pass.
 func (c *Connector) dispatchWithin(ctx context.Context, deliveries []transport.Delivery) bool {
+	c.measure(deliveries)
+
 	// The sessions something in this batch was left pending for. A batch is one stream's
 	// worth of commands in order, so a session that gave one back may not have a later
 	// one carried out behind it: the queue that had no room for the first can free a slot
@@ -910,6 +917,37 @@ func (c *Connector) readCommands(ctx context.Context) {
 	}
 	c.commandReadSucceeded()
 	c.dispatchWithin(ctx, deliveries)
+}
+
+// measure records what the fleet is handing out a second time.
+//
+// Here rather than in the transport, and on receipt rather than after dispatch. In the
+// transport it would need a metrics dependency the layer does not have and says why it
+// does not have; after dispatch it would count what this instance chose to run rather
+// than what the fleet handed it, and a batch cut short by its window would go unmeasured
+// for exactly the sessions whose commands are not running.
+//
+// Every path that dispatches comes through here: the read, the reclaim of the control
+// stream, the reclaim of session streams, and the drain of a newly adopted session.
+func (c *Connector) measure(deliveries []transport.Delivery) {
+	for i := range deliveries {
+		d := &deliveries[i]
+		if d.TakenFrom != "" {
+			// A claim: only XPENDING reports who held it and how many times it went out.
+			c.metrics.CommandsReclaimed.WithLabelValues(d.TakenFrom).Inc()
+			if d.Deliveries > 0 {
+				c.metrics.CommandRedeliveries.Observe(float64(d.Deliveries))
+			}
+		}
+		if !d.DeliveredBefore {
+			continue
+		}
+		source := "read"
+		if d.TakenFrom != "" {
+			source = "claim"
+		}
+		c.metrics.CommandsDeliveredAgain.WithLabelValues(source).Inc()
+	}
 }
 
 // silentReadsBeforeAlarm is how many command reads have to fail in a row before the
