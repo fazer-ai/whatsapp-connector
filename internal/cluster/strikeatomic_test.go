@@ -21,6 +21,14 @@ import (
 // indistinguishable, and the pass would be green on the very defect it exists for.
 const RedisEnv = "WAC_TEST_REDIS_URL"
 
+// fixedClock is when these tests say it is.
+//
+// The deadline a strike returns is computed inside the script from the instant the caller
+// handed it, so against a wall clock every assertion here would be "the wait, give or take
+// however long Redis took", and a round trip over 500ms would put a correct deadline below
+// the floor. Pinned, the arithmetic is exact and a slow server is slow rather than wrong.
+var fixedClock = time.Date(2026, 9, 17, 21, 0, 0, 0, time.UTC)
+
 // realQuarantine is the fleet's quarantine over the server RedisEnv names, under a prefix
 // of its own so a run leaves nothing behind for the next one.
 func realQuarantine(t *testing.T) (*cluster.Quarantine, *redis.Client, string) {
@@ -42,7 +50,7 @@ func realQuarantine(t *testing.T) (*cluster.Quarantine, *redis.Client, string) {
 			_ = rdb.Del(context.Background(), keys...).Err()
 		}
 	})
-	return cluster.NewQuarantine(redisx.Wrap(rdb, prefix, 8), nil), rdb, prefix
+	return cluster.NewQuarantine(redisx.Wrap(rdb, prefix, 8), func() time.Time { return fixedClock }), rdb, prefix
 }
 
 // cutSecondHalf fails whichever command carries the second half of a mark, and it names
@@ -180,7 +188,7 @@ func TestACountWithNoDeadlineIsNotAHistory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Strike: %v", err)
 	}
-	if got := time.Until(until).Round(time.Second); got != cluster.QuarantineFloor {
+	if got := until.Sub(fixedClock); got != cluster.QuarantineFloor {
 		t.Fatalf("an orphan count of 6 produced a wait of %s, want the floor at %s: "+
 			"a count with no deadline measures how often the loop span, not what the account has served",
 			got, cluster.QuarantineFloor)
@@ -198,21 +206,20 @@ func TestACountWithNoDeadlineIsNotAHistory(t *testing.T) {
 // Walked one strike at a time against a real Redis rather than asserted at a couple of
 // points, because the disagreement worth catching is at the shape of the curve -- an
 // off-by-one in the loop, or a cap applied a step early -- and those hide between samples.
+// Exact rather than rounded, which the pinned clock buys: a tolerance wide enough for a
+// slow round trip is wide enough to swallow a wait that is off by a fraction of a step.
 func TestTheScriptAndTheGoSideAgreeOnTheWait(t *testing.T) {
 	t.Parallel()
 	quarantine, _, _ := realQuarantine(t)
 	const sid = "sess-curve"
 
 	for strikes := int64(1); strikes <= 9; strikes++ {
-		before := time.Now()
 		until, err := quarantine.Strike(t.Context(), sid)
 		if err != nil {
 			t.Fatalf("strike %d: %v", strikes, err)
 		}
 		want := cluster.QuarantineWait(strikes)
-		// Rounded to the second: the script reads its own clock for `now`, so the two
-		// differ by however long the call took.
-		if got := until.Sub(before).Round(time.Second); got != want {
+		if got := until.Sub(fixedClock); got != want {
 			t.Fatalf("strike %d waits %s in the script and %s in QuarantineWait", strikes, got, want)
 		}
 	}
