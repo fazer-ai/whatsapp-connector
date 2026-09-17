@@ -14,7 +14,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
 	"github.com/rs/zerolog"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/cluster"
@@ -947,6 +946,13 @@ const (
 	sessionLabel  = "sid"
 	consumerLabel = "from"
 
+	// The two values of the source label, which is the whole of it: a delivery either
+	// came back out of the pending history or was taken back by a claim. Named because
+	// eviction has to spell the same pair the counting does, and a pair spelled twice is
+	// a pair that drifts.
+	sourceRead  = "read"
+	sourceClaim = "claim"
+
 	// labelQuiet is how long a label value goes uncounted before its series is dropped.
 	//
 	// Long, because the failure it has to avoid is a series that comes and goes: a
@@ -981,7 +987,12 @@ func (c *Connector) forgetLabelsGoneQuiet(now time.Time) {
 		}
 		switch label.metric {
 		case sessionLabel:
-			c.metrics.CommandsDeliveredAgain.DeletePartialMatch(prometheus.Labels{sessionLabel: label.value})
+			// By the whole label set rather than DeletePartialMatch, which walks the
+			// vector once per call: a batch of sessions expiring together would then be
+			// quadratic, on the goroutine that renews every lease this instance holds.
+			// That goroutine is already bounded twice over for the same reason.
+			c.metrics.CommandsDeliveredAgain.DeleteLabelValues(sourceRead, label.value)
+			c.metrics.CommandsDeliveredAgain.DeleteLabelValues(sourceClaim, label.value)
 		case consumerLabel:
 			c.metrics.CommandsReclaimed.DeleteLabelValues(label.value)
 		}
@@ -1019,9 +1030,9 @@ func (c *Connector) measure(deliveries []transport.Delivery) {
 		if !d.DeliveredBefore {
 			continue
 		}
-		source := "read"
+		source := sourceRead
 		if d.TakenFrom != "" {
-			source = "claim"
+			source = sourceClaim
 		}
 		sid := d.Command.SID
 		if sid == "" {
