@@ -224,3 +224,39 @@ func TestTheScriptAndTheGoSideAgreeOnTheWait(t *testing.T) {
 		}
 	}
 }
+
+// TestAnExpiredWaitIsStillAHistory is the other side of the rule above, and the side that
+// costs something if it is got wrong.
+//
+// Starting an orphan count over is right because a count with no deadline is a mark whose
+// second half never landed. A count whose deadline has simply **passed** is the opposite: it
+// is every wait the account has already served, still inside the hour the record outlives
+// them for, and forgiving it would reset the backoff of every account whose current wait had
+// run out -- which is every account the fleet is about to try again. The whole mechanism
+// would collapse to the floor and never leave it.
+//
+// The two look alike from a distance and the discriminator is the field's presence, not its
+// value. This is the test that says so.
+func TestAnExpiredWaitIsStillAHistory(t *testing.T) {
+	t.Parallel()
+	quarantine, rdb, prefix := realQuarantine(t)
+	const sid = "sess-served"
+	key := prefix + "quarantine:" + sid
+
+	// An account that has genuinely failed eight times, whose eighth wait ran out an hour
+	// ago and whose record has not yet been forgotten.
+	served := fixedClock.Add(-time.Hour).UnixMilli()
+	if err := rdb.HSet(t.Context(), key, "strikes", 8, "until", served).Err(); err != nil {
+		t.Fatalf("HSet: %v", err)
+	}
+
+	until, err := quarantine.Strike(t.Context(), sid)
+	if err != nil {
+		t.Fatalf("Strike: %v", err)
+	}
+	if got := until.Sub(fixedClock); got != cluster.QuarantineWait(9) {
+		t.Fatalf("a ninth failure waits %s, want %s: a deadline that passed is every wait the "+
+			"account already served, and forgiving it resets the backoff of every account due to be tried",
+			got, cluster.QuarantineWait(9))
+	}
+}
