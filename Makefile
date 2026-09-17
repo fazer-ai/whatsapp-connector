@@ -28,7 +28,7 @@ test-redis_RUN := docker run -d --rm -p 56379:6379 redis:8-alpine
 test-redis_URL := redis://localhost:56379/0
 
 .DEFAULT_GOAL := help
-.PHONY: help setup deps hooks fmt lint test test-postgres test-redis test-cover contract tidy check check-offline check-servers clean
+.PHONY: help setup deps hooks fmt lint test test-postgres test-redis test-cover contract tidy check check-offline check-servers offline-passes clean
 
 help: ## List the available targets
 	@grep -hE '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
@@ -113,7 +113,7 @@ tidy: ## Fail when go.mod/go.sum are not tidy
 # exported from a shell profile, a direnv file or an agent's configuration and then never
 # appear again in any command anybody typed or any round recorded. A target has to be
 # named where it is run.
-check: check-servers check-offline $(SERVER_PASSES) ## Everything CI enforces; needs both servers (see check-offline)
+check: check-servers offline-passes $(SERVER_PASSES) ## Everything CI enforces; needs both servers (see check-offline)
 
 # Every missing server at once, before anything runs.
 #
@@ -137,27 +137,34 @@ check-servers:
 	  exit 1; \
 	fi
 
+# The passes that need no server, as a target of their own so that two callers can want
+# them without wanting the same thing said about them.
+offline-passes: lint tidy test
+
 # The half that needs nothing running, which is what the agent stop hook falls back to:
 # requiring a server there would fail every turn ended without one, for a reason that is
 # not the turn's. The versioned pre-commit hook runs neither target, and this comment said
 # it did until the verifier read `.githooks/pre-commit` instead of believing it.
 #
-# It says which passes it did not run, and decides that by the goal that was typed rather
-# than by a variable. A variable would be silenceable from a shell profile or an agent's
-# configuration, which is the same objection that kept the way out from being `SKIP=1`:
-# whatever can be inherited can be inherited by somebody who never saw it.
+# It says which passes it did not run, and the notice is unconditional because it belongs
+# to the recipe of the target somebody asked for. `check` depends on `offline-passes` and
+# never comes through here, so there is nothing to suppress and no variable deciding when.
 #
-# `tidy` belongs here and was missing from `check` altogether: CI's lint job runs
-# `go mod tidy -diff`, and an untidy go.sum passed `check` green with both servers up and
-# nothing skipped. A target that promises everything has to be told when the list grows.
-check-offline: lint tidy test ## Lint, tidy and the SQLite pass: everything that needs no server
-	@test -n "$(filter check,$(MAKECMDGOALS))" || { \
-	  echo; \
-	  echo "check-offline is done. It does not run the passes that need a server:"; \
-	  $(foreach t,$(SERVER_PASSES),echo "  $(t) ($($(t)_VAR))"; ) \
-	  echo; \
-	  echo "make check runs those too, and says how to start each server."; \
-	}
+# Two versions of this read a variable instead, and both were silenceable from a shell
+# profile or an agent's configuration -- including `MAKECMDGOALS`, which make does not
+# rewrite when the environment already defines it: `MAKECMDGOALS=check make check-offline`
+# printed nothing. Choosing between them was choosing the least bad one, which is the
+# shape of answer this issue exists to stop taking.
+#
+# `tidy` belongs in the offline half and was missing from `check` altogether: CI's lint job
+# runs `go mod tidy -diff`, and an untidy go.sum passed `check` green with both servers up
+# and nothing skipped. A target that promises everything has to be told when the list grows.
+check-offline: offline-passes ## Lint, tidy and the SQLite pass: everything that needs no server
+	@echo
+	@echo "check-offline is done. It does not run the passes that need a server:"
+	@$(foreach t,$(SERVER_PASSES),echo "  $(t) ($($(t)_VAR))"; )
+	@echo
+	@echo "make check runs those too, and says how to start each server."
 
 clean: ## Remove build and coverage output
 	rm -rf bin dist coverage.txt

@@ -242,19 +242,7 @@ func TestEveryGateCIEnforcesIsReachableFromMakeCheck(t *testing.T) {
 	// one level down, and until this it was the one part of the fix with nothing versioned
 	// standing behind it -- deleting the block from the Makefile left every test green.
 	offline, _ := reachableFrom(t, half)
-	rawRecipe, recipe := recipeOf(t, half)
-
-	// And it has to decide that by the goal somebody typed. Conditioning on a plain
-	// variable makes the sentence silenceable from a shell profile, a direnv file or an
-	// agent's configuration -- `UNDER_CHECK=1 make check-offline` printed nothing and left
-	// no mark. That is the same objection that kept the way out from being `SKIP=1`, and it
-	// applies to the notice as much as to the skipping. `$(MAKECMDGOALS)` is what make
-	// offers for the question "what was asked for", so it is what the recipe has to read.
-	if !strings.Contains(rawRecipe, "MAKECMDGOALS") {
-		t.Errorf("the recipe of %s decides what to print without reading MAKECMDGOALS:\n"+
-			"\tanything else it can condition on is inherited, and what is inherited can be set by somebody who never saw this target.\n"+
-			"\tThe recipe:\n\t\t%s", half, strings.ReplaceAll(strings.TrimSpace(rawRecipe), "\n", "\n\t\t"))
-	}
+	_, recipe := recipeOf(t, half)
 	for target := range skippedBy {
 		if offline[target] || target == half || !reachable[target] {
 			continue
@@ -265,6 +253,18 @@ func TestEveryGateCIEnforcesIsReachableFromMakeCheck(t *testing.T) {
 				"\tThe recipe:\n\t\t%s",
 				promise, target, half, half, strings.ReplaceAll(strings.TrimSpace(recipe), "\n", "\n\t\t"))
 		}
+	}
+
+	// And `make check` must not come through that recipe, or a complete run ends by
+	// announcing it skipped what it had just run. The graph is what says so: `check`
+	// depends on the passes, not on the half that describes them. Two earlier versions
+	// read a variable to decide instead, and both were silenceable from outside --
+	// `MAKECMDGOALS` included, which make leaves alone when the environment defines it, so
+	// the assertion was demanding a variable with the property it claimed to avoid.
+	if reachable[half] {
+		t.Errorf("`make %s` reaches `%s`, whose recipe says which passes it did not run:\n"+
+			"\ta complete run would end by announcing that it skipped the two passes it had just run.\n"+
+			"\tDepend on the passes rather than on the half that describes them.", promise, half)
 	}
 
 	// And the hook that runs it has to fire on the files this fence reads. It skips the
