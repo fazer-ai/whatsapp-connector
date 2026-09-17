@@ -258,3 +258,72 @@ func TestATeardownThatArrivedLateIsRefused(t *testing.T) {
 		t.Fatalf("got %+v, want error code %q", reply.Error, protocol.ErrorExpired)
 	}
 }
+
+// TestALatePingIsRefused is the third answer the control stream gives to a deadline, and
+// the reason the three differ is what refusing costs.
+//
+// A wake refused is an account nobody starts. A teardown refused before adoption is one
+// nothing tore down. A ping refused is nothing at all: it asks what this instance is running
+// now, so an answer produced after the caller stopped waiting is a true sentence about the
+// wrong instant, written to a reply list that has very likely expired. The count is what
+// makes it worse than useless -- `ok:true` with a number from a moment nobody asked about is
+// the shape of an answer, so an operator reading it has no way to tell it is stale.
+func TestALatePingIsRefused(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+
+	var acked atomic.Bool
+	ping := &transport.Delivery{
+		Command: protocol.Command{
+			Type: protocol.CommandAdminPing, ID: "cmd-late-ping",
+			ReplyTo:  "wa:reply:cmd-late-ping",
+			Deadline: time.Now().Add(-time.Minute).UnixMilli(),
+		},
+		Ack: func(context.Context) error { acked.Store(true); return nil },
+	}
+	if pending := h.manager.Dispatch(ping); pending {
+		t.Fatalf("Dispatch left the ping on the reader rather than taking it onto the answer goroutine")
+	}
+	waitFor(t, "the ping to be answered", func() bool {
+		_, answered := h.recorder.reply("wa:reply:cmd-late-ping")
+		return answered
+	})
+
+	reply, _ := h.recorder.reply("wa:reply:cmd-late-ping")
+	if reply.OK {
+		t.Fatalf("a ping past its deadline was answered ok:true with a count from another instant")
+	}
+	if reply.Error == nil || reply.Error.Code != protocol.ErrorExpired {
+		t.Fatalf("got %+v, want error code %q", reply.Error, protocol.ErrorExpired)
+	}
+	// Retired, not left pending. Nothing is waiting for it and nothing starts it again:
+	// unlike a wake, a ping nobody answers costs the fleet nothing to lose.
+	waitFor(t, "the ping to be retired", acked.Load)
+}
+
+// TestAPingInTimeStillAnswers is the control next to the test above: the refusal has to turn
+// on the deadline having passed and on nothing else.
+func TestAPingInTimeStillAnswers(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+
+	ping := &transport.Delivery{
+		Command: protocol.Command{
+			Type: protocol.CommandAdminPing, ID: "cmd-live-ping",
+			ReplyTo:  "wa:reply:cmd-live-ping",
+			Deadline: time.Now().Add(time.Minute).UnixMilli(),
+		},
+		Ack: func(context.Context) error { return nil },
+	}
+	if pending := h.manager.Dispatch(ping); pending {
+		t.Fatalf("Dispatch left the ping on the reader rather than taking it onto the answer goroutine")
+	}
+	waitFor(t, "the ping to be answered", func() bool {
+		_, answered := h.recorder.reply("wa:reply:cmd-live-ping")
+		return answered
+	})
+
+	if reply, _ := h.recorder.reply("wa:reply:cmd-live-ping"); !reply.OK {
+		t.Fatalf("a ping inside its deadline was refused: %+v", reply.Error)
+	}
+}

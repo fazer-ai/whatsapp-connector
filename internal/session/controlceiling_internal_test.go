@@ -10,11 +10,16 @@ import (
 	"testing"
 )
 
-// The contract now says in as many words that neither ceiling reaches `session.wake` or
-// `admin.ping`: a client should not expect `expired` for either, and the reason is that
-// nothing on that path reads the field. That sentence travels to every vendoring client and
-// is the reason #241 closes without a ceiling on the wake, so it needs something that fails
-// when it stops being true.
+// The contract now says in as many words that neither ceiling reaches `session.wake`: a
+// client should not expect `expired` for one, and the reason is that nothing on that path
+// reads the field. That sentence travels to every vendoring client and is the reason #241
+// closes without a ceiling on the wake, so it needs something that fails when it stops
+// being true.
+//
+// `pong` is deliberately not in this list, and the round that wrote it had it here by
+// reflex. A ping asks what this instance is running now; refusing a late one starts nothing
+// and tears nothing down, so the ceiling there is cheap and correct, and fencing it as
+// ceiling-free would have left a red test standing in front of the fix.
 //
 // It would stop being true quietly. A later round adding an `expired(command, ...)` guard to
 // `wake` would be a small, locally sensible change -- it is exactly what the session path
@@ -35,9 +40,10 @@ import (
 func TestNoControlHandlerReadsTheDeadline(t *testing.T) {
 	t.Parallel()
 
-	// The three commands Dispatch carries out before any session is involved. Kept here by
-	// name because that is the set the contract's sentence names.
-	handlers := map[string]bool{"wake": false, "takeForDelete": false, "pong": false}
+	// The two handlers whose refusal would cost something durable: a wake retired is an
+	// account nobody starts, and a teardown refused before adoption is one nothing tore down.
+	// Kept here by name because that is the set the contract's sentence names.
+	handlers := map[string]bool{"wake": false, "takeForDelete": false}
 
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, "manager.go", nil, 0)
@@ -90,7 +96,7 @@ func TestTheContractSaysControlHasNoCeiling(t *testing.T) {
 	}
 	prose := strings.Join(strings.Fields(string(source)), " ")
 	for _, phrase := range []string{
-		"Neither ceiling reaches `session.wake` or `admin.ping`, and a client should not expect `expired` for either",
+		"Neither ceiling reaches `session.wake`, and a client should not expect `expired` for one",
 		"A client should not put a `deadline` on a teardown",
 		"should publish another `session.wake` rather than wait on the one it already sent",
 	} {

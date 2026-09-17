@@ -25,11 +25,16 @@ dropped for arriving late is a device left linked on somebody's phone with nothi
 so, while the same command parked on a socket write holds every other command for that
 account behind it. With one field a client had to choose, and chose neither.
 
-**Neither ceiling reaches `session.wake` or `admin.ping`, and a client should not expect
-`expired` for either.** Both are carried out before any session is involved, and nothing on
-that path reads `deadline`. For a wake that is the whole point: it is the only thing that
-starts a session with no entry yet in the connector's own record of what each session should
-be, so retiring one for arriving late leaves an account paired, owned by nobody and silent.
+**Neither ceiling reaches `session.wake`, and a client should not expect `expired` for one.**
+It is carried out before any session is involved, and nothing on that path reads `deadline`.
+That is the whole point for a wake: it is the only thing that starts a session with no entry
+yet in the connector's own record of what each session should be, so retiring one for
+arriving late leaves an account paired, owned by nobody and silent.
+
+`admin.ping` goes the other way, and the difference is what refusing costs. A ping asks what
+this instance is running *now*, so one answered after its deadline is a true sentence about
+the wrong instant, sent to a caller that stopped waiting; refusing starts nothing and tears
+nothing down. A late ping is answered `expired`.
 What paces a wake that keeps coming back is instead the fleet's own backoff described under
 `wa:quarantine:<sid>` below: not a count of deliveries and not a clock, but the connector
 declining to make the same attempt again for a minute, then two, up to an hour.

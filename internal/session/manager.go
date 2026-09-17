@@ -698,8 +698,7 @@ func (m *Manager) Dispatch(delivery *transport.Delivery) (pending bool) {
 	case protocol.CommandAdminPing:
 		began := m.now()
 		return m.own(delivery, func(ctx context.Context, ping *transport.Delivery) {
-			m.pong(ctx, ping)
-			m.reportCommand(&ping.Command, began, nil)
+			m.reportCommand(&ping.Command, began, m.pong(ctx, ping))
 		})
 	}
 
@@ -1087,8 +1086,19 @@ func (m *Manager) reconnect(ctx context.Context, delivery *transport.Delivery) {
 	}
 }
 
-func (m *Manager) pong(ctx context.Context, delivery *transport.Delivery) {
+func (m *Manager) pong(ctx context.Context, delivery *transport.Delivery) (failed error) {
 	command := delivery.Command
+	if expired(&command, m.now()) {
+		// The one control command where the ceiling is both cheap and right. A ping asks
+		// how many sessions this instance is running *now*, and answering it two minutes
+		// late with a count taken at the answer is a true sentence about the wrong
+		// instant, sent to a caller whose reply list has very likely expired. Nothing is
+		// started and nothing is torn down by refusing, which is what makes this
+		// different from the wake beside it: a wake retired is an account nobody starts.
+		refusal := protocol.NewError(protocol.ErrorExpired, "the command deadline passed before it was reached")
+		m.refuse(ctx, delivery, refusal)
+		return refusal
+	}
 	if command.ReplyTo != "" {
 		result, _ := json.Marshal(map[string]any{
 			"inst": m.instance, "version": protocol.Version, "sessions": m.Count(),
@@ -1108,6 +1118,7 @@ func (m *Manager) pong(ctx context.Context, delivery *transport.Delivery) {
 		}
 	}
 	m.ack(ctx, delivery)
+	return nil
 }
 
 func (m *Manager) refuse(ctx context.Context, delivery *transport.Delivery, failure *protocol.Error) {
