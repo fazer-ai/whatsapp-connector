@@ -284,6 +284,15 @@ func (m *Manager) Adopt(ctx context.Context, sid string) (*Session, error) {
 		// Through abandon, so a hand-back that does not get through is tried again rather
 		// than left as a key naming an instance that is running nothing.
 		release, cancelRelease := context.WithTimeout(context.WithoutCancel(ctx), releaseTimeout)
+		// Struck before the account goes back, for the same reason the sweep strikes a
+		// retired one: this is the connector failing to bring an account up, and the
+		// backoff exists to pace exactly that. It was the one door into the quarantine
+		// that never knocked -- a session that fails to resume strikes it, a retired one
+		// swept strikes it, and one that never opened at all accrued nothing. So the wake
+		// behind it was tried again every claim beat, for as long as the state lasted,
+		// which is the loop #241 is about: the cost is not the entry left pending, it is
+		// this attempt repeating against an account that cannot come up.
+		m.failing(release, sid)
 		m.abandon(release, sid)
 		cancelRelease()
 		return nil, err
@@ -689,8 +698,7 @@ func (m *Manager) Dispatch(delivery *transport.Delivery) (pending bool) {
 	case protocol.CommandAdminPing:
 		began := m.now()
 		return m.own(delivery, func(ctx context.Context, ping *transport.Delivery) {
-			m.pong(ctx, ping)
-			m.reportCommand(&ping.Command, began, nil)
+			m.reportCommand(&ping.Command, began, m.pong(ctx, ping))
 		})
 	}
 
@@ -857,6 +865,42 @@ func (m *Manager) wake(ctx context.Context, delivery *transport.Delivery) {
 	if sid == "" {
 		m.ack(ctx, delivery)
 		return
+	}
+
+	// The quarantine gates what the connector does on its own and nothing else: a client
+	// that asks for a connection gets one, quarantine or not, which PROTOCOL.md promises
+	// in as many words and which the test below this one fences. A wake the fleet has
+	// already handed out is not a client asking, though. It is this fleet repeating an
+	// attempt it has already made, and pacing that is what the backoff is for.
+	//
+	// On DeliveredBefore and not on Redelivered, which is the narrower question and the
+	// wrong one here: a wake the fleet cannot act on is handed back unrun and read out of
+	// the history again on the very next block, so its idle never grows and Redelivered
+	// is false on every one of those repeats -- measured on 2771941, twenty times in
+	// forty-five seconds. Gating on it would leave the loop untouched.
+	//
+	// What it separates is first delivery from redelivery, which is not quite the same as
+	// separating a client's ask from the fleet repeating itself, and the gap is worth
+	// naming. A wake read by an instance that died before it adopted comes back as a
+	// redelivery carrying an ask nobody ever served, and if the account is waiting out a
+	// backoff this declines it. The cost is bounded and the way out is written into the
+	// contract: the client publishes another wake, which is read fresh and adopts. It is
+	// also a narrow case -- an account is only waiting out a backoff because an earlier
+	// adoption already failed, so the ask this delays is one that was likely to fail too.
+	if delivery.DeliveredBefore {
+		if until, waiting := m.waitingOut(ctx, sid); waiting {
+			m.log.Info().Str("sid", sid).Time("until", until).
+				Msg("a wake came round again for an account the fleet is leaving alone; not trying it yet")
+			// Forfeited rather than released, for the reason the failed adoption below
+			// forfeits: kept at the head of the pending list it would be taken first
+			// again on the next pass, and the wakes behind it -- sessions nobody is
+			// running either -- would never get a turn. Never acknowledged: a wake is the
+			// only thing that starts a session with no `desired` row for the resume sweep
+			// to find, so retiring it is how an account ends up paired, unowned and
+			// silent.
+			forfeit(delivery)
+			return
+		}
 	}
 
 	_, err := m.Adopt(ctx, sid)
@@ -1048,8 +1092,19 @@ func (m *Manager) reconnect(ctx context.Context, delivery *transport.Delivery) {
 	}
 }
 
-func (m *Manager) pong(ctx context.Context, delivery *transport.Delivery) {
+func (m *Manager) pong(ctx context.Context, delivery *transport.Delivery) (failed error) {
 	command := delivery.Command
+	if expired(&command, m.now()) {
+		// The one control command where the ceiling is both cheap and right. A ping asks
+		// how many sessions this instance is running *now*, and answering it two minutes
+		// late with a count taken at the answer is a true sentence about the wrong
+		// instant, sent to a caller whose reply list has very likely expired. Nothing is
+		// started and nothing is torn down by refusing, which is what makes this
+		// different from the wake beside it: a wake retired is an account nobody starts.
+		refusal := protocol.NewError(protocol.ErrorExpired, "the command deadline passed before it was reached")
+		m.refuse(ctx, delivery, refusal)
+		return refusal
+	}
 	if command.ReplyTo != "" {
 		result, _ := json.Marshal(map[string]any{
 			"inst": m.instance, "version": protocol.Version, "sessions": m.Count(),
@@ -1069,6 +1124,7 @@ func (m *Manager) pong(ctx context.Context, delivery *transport.Delivery) {
 		}
 	}
 	m.ack(ctx, delivery)
+	return nil
 }
 
 func (m *Manager) refuse(ctx context.Context, delivery *transport.Delivery, failure *protocol.Error) {
@@ -1452,6 +1508,34 @@ func (m *Manager) SweepRetired(ctx context.Context, by time.Time) {
 	}
 }
 
+// waitingOut reports whether the fleet is leaving this account alone, and until when.
+//
+// One HGET on the goroutine that answers a manager's own commands, which is where every
+// wake is carried out and is not the one that renews leases: Dispatch queues through
+// `own` and Answer runs it, so this spends no part of a renewal's budget. Bounded anyway,
+// like everything else there. What it costs is paid only where it saves something: a wake
+// being acted on is read once and never comes back, so the read happens exactly on the
+// repeats that would otherwise each have paid for an adoption.
+//
+// A read that failed answers "not waiting". Not knowing is a reason to try rather than a
+// reason to hold back: the quarantine paces what the connector does on its own, and a
+// Redis that did not answer is no evidence about the account.
+func (m *Manager) waitingOut(ctx context.Context, sid string) (time.Time, bool) {
+	if m.quarantine == nil {
+		return time.Time{}, false
+	}
+	read, cancel := context.WithTimeout(ctx, ackTimeout)
+	defer cancel()
+	waiting, err := m.quarantine.Waiting(read, []string{sid})
+	if err != nil {
+		m.log.Warn().Err(err).Str("sid", sid).
+			Msg("could not read whether a session is being left alone; trying it")
+		return time.Time{}, false
+	}
+	until, found := waiting[sid]
+	return until, found
+}
+
 // working forgets a session's failures, which is what a connection that came up means.
 //
 // Bounded and detached, because it is called from the pump: the goroutine that publishes
@@ -1474,11 +1558,24 @@ func (m *Manager) working(ctx context.Context, sid string) {
 //
 // Bounded and detached for the reason working is: it is called from the executor, where
 // what waits behind it is every command for this account.
+//
+// A share of the caller's window rather than all of it, and that is load-bearing at both
+// call sites: a hand-back runs immediately behind this one, and `ackTimeout` is the same
+// two seconds `releaseTimeout` is, so a strike against a Redis that has stopped answering
+// would spend the whole budget and hand `abandon` a context that has already expired. The
+// lease of a session that never opened would then stay held, and every peer is blocked on
+// it until a later tick gets round to the orphan -- which is the opposite of what letting
+// the account go is for.
+//
+// The order is not the thing to change here, though it looks like the cheaper fix. The
+// strike goes first on purpose: release the lease and a peer's resume sweep finds the
+// account free with nothing yet saying to leave it alone, and starts the same attempt
+// over. Sharing keeps that ordering and still leaves the hand-back a window to land in.
 func (m *Manager) failing(ctx context.Context, sid string) {
 	if m.quarantine == nil {
 		return
 	}
-	count, cancel := context.WithTimeout(ctx, ackTimeout)
+	count, cancel := context.WithTimeout(ctx, m.sharing(ctx, ackTimeout))
 	defer cancel()
 	until, err := m.quarantine.Strike(count, sid)
 	if err != nil {
