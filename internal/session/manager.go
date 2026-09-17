@@ -284,6 +284,15 @@ func (m *Manager) Adopt(ctx context.Context, sid string) (*Session, error) {
 		// Through abandon, so a hand-back that does not get through is tried again rather
 		// than left as a key naming an instance that is running nothing.
 		release, cancelRelease := context.WithTimeout(context.WithoutCancel(ctx), releaseTimeout)
+		// Struck before the account goes back, for the same reason the sweep strikes a
+		// retired one: this is the connector failing to bring an account up, and the
+		// backoff exists to pace exactly that. It was the one door into the quarantine
+		// that never knocked -- a session that fails to resume strikes it, a retired one
+		// swept strikes it, and one that never opened at all accrued nothing. So the wake
+		// behind it was tried again every claim beat, for as long as the state lasted,
+		// which is the loop #241 is about: the cost is not the entry left pending, it is
+		// this attempt repeating against an account that cannot come up.
+		m.failing(release, sid)
 		m.abandon(release, sid)
 		cancelRelease()
 		return nil, err
@@ -857,6 +866,36 @@ func (m *Manager) wake(ctx context.Context, delivery *transport.Delivery) {
 	if sid == "" {
 		m.ack(ctx, delivery)
 		return
+	}
+
+	// The quarantine gates what the connector does on its own and nothing else: a client
+	// that asks for a connection gets one, quarantine or not, which PROTOCOL.md promises
+	// in as many words and which the test below this one fences. A wake the fleet has
+	// already handed out is not a client asking, though. It is this fleet repeating an
+	// attempt it has already made, and pacing that is what the backoff is for.
+	//
+	// On DeliveredBefore and not on Redelivered, which is the narrower question and the
+	// wrong one here: a wake the fleet cannot act on is handed back unrun and read out of
+	// the history again on the very next block, so its idle never grows and Redelivered
+	// is false on every one of those repeats -- measured on 2771941, twenty times in
+	// forty-five seconds. Gating on it would leave the loop untouched. This is the first
+	// thing in the connector to branch on DeliveredBefore, and the field's own
+	// documentation said nothing did; what makes it the right one is that it separates
+	// the read that carried a client's ask from every copy that came after it.
+	if delivery.DeliveredBefore {
+		if until, waiting := m.waitingOut(ctx, sid); waiting {
+			m.log.Info().Str("sid", sid).Time("until", until).
+				Msg("a wake came round again for an account the fleet is leaving alone; not trying it yet")
+			// Forfeited rather than released, for the reason the failed adoption below
+			// forfeits: kept at the head of the pending list it would be taken first
+			// again on the next pass, and the wakes behind it -- sessions nobody is
+			// running either -- would never get a turn. Never acknowledged: a wake is the
+			// only thing that starts a session with no `desired` row for the resume sweep
+			// to find, so retiring it is how an account ends up paired, unowned and
+			// silent.
+			forfeit(delivery)
+			return
+		}
 	}
 
 	_, err := m.Adopt(ctx, sid)
@@ -1450,6 +1489,32 @@ func (m *Manager) SweepRetired(ctx context.Context, by time.Time) {
 		m.failing(window, sid)
 		m.releaseThis(window, sid, session)
 	}
+}
+
+// waitingOut reports whether the fleet is leaving this account alone, and until when.
+//
+// One HGET on the goroutine that renews every lease this instance holds, and bounded
+// like everything else that runs there. What it costs is paid only where it saves
+// something: a wake being acted on is read once and never comes back, so the read
+// happens exactly on the repeats that would otherwise each have paid for an adoption.
+//
+// A read that failed answers "not waiting". Not knowing is a reason to try rather than a
+// reason to hold back: the quarantine paces what the connector does on its own, and a
+// Redis that did not answer is no evidence about the account.
+func (m *Manager) waitingOut(ctx context.Context, sid string) (time.Time, bool) {
+	if m.quarantine == nil {
+		return time.Time{}, false
+	}
+	read, cancel := context.WithTimeout(ctx, ackTimeout)
+	defer cancel()
+	waiting, err := m.quarantine.Waiting(read, []string{sid})
+	if err != nil {
+		m.log.Warn().Err(err).Str("sid", sid).
+			Msg("could not read whether a session is being left alone; trying it")
+		return time.Time{}, false
+	}
+	until, found := waiting[sid]
+	return until, found
 }
 
 // working forgets a session's failures, which is what a connection that came up means.

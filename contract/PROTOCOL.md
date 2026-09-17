@@ -25,6 +25,17 @@ dropped for arriving late is a device left linked on somebody's phone with nothi
 so, while the same command parked on a socket write holds every other command for that
 account behind it. With one field a client had to choose, and chose neither.
 
+**Neither ceiling reaches the control stream, and a client should not expect `expired` for
+a command sent there.** `session.wake`, `session.delete` and `admin.ping` are carried out
+before any session is involved, and nothing on that path reads `deadline`. Dropping a wake
+for arriving late is the worst of the three: a wake is the only thing that starts a session
+with no entry yet in the connector's own record of what each session should be, so retiring
+one leaves an account paired, owned by nobody and silent. A control command therefore has no
+ceiling, whatever it carries. What paces one that keeps coming back is the fleet's own
+backoff described under `wa:quarantine:<sid>` below: not a count of deliveries and not a
+clock, but the connector declining to make the same attempt again for a minute, then two,
+up to an hour.
+
 **Both ceilings bound the wait on WhatsApp, not the bookkeeping that follows it.** Once a
 teardown's unlink has been answered, the connector finishes deleting the credentials, the
 device mapping and the session's epoch counter on a bound of its own, and a ceiling that
@@ -143,9 +154,14 @@ constructor to leave lying around.
 
 `wa:quarantine:<sid>` was in the same state and is not any more: it counts the failures
 of a session the connector could not bring back and says how long the fleet leaves it
-alone, from a minute up to an hour, doubling. It gates the connector's own resume sweep
-and nothing else -- a client that asks for a connection gets one, quarantine or not, which
-is why no command is ever answered `quarantined`. Whether a session registry should exist
+alone, from a minute up to an hour, doubling. It gates what the connector does on its own,
+which is two things: its resume sweep, and a `session.wake` the fleet has already handed
+out once. A wake read for the first time is a client asking, and a client that asks for a
+connection gets one, quarantine or not, which is why no command is ever answered
+`quarantined`. Every copy after that one is this fleet repeating an attempt it already
+made, and it waits out the backoff. **A client whose session does not come up should
+publish another `session.wake` rather than wait on the one it already sent**, which is the
+difference between asking again and being retried. Whether a session registry should exist
 at all is a separate question from this table telling clients that one does.
 
 **The one thing that registry was for does exist, and not here.** A connector keeps what
@@ -270,8 +286,10 @@ theirs, and the connector is always upgraded first.
   never travel, and they exist to be rescued rather than to be sent.
 - Three codes are published and never sent, so a client branching on them writes a branch
   that never runs. `session_not_found` is not answered at all: a command for a session no
-  instance owns stays pending and its caller waits out its own deadline. `quarantined` has
-  no mechanism behind it; a session that keeps failing to connect goes on being retried.
+  instance owns stays pending and its caller waits out its own deadline. `quarantined` is not
+  answered either, and never will be: the backoff behind it paces what the connector does
+  on its own, and refusing a client that asks would put it in front of the person fixing
+  the account.
   `client_outdated` reaches a client as the `session.client_outdated` event instead, never
   as a reply. They stay in the enum because
   removing one narrows what a client may already match on, and each is marked in
