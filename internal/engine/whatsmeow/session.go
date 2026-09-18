@@ -2217,7 +2217,7 @@ func (s *Session) Logout(ctx context.Context) error {
 			// back, and calling it offline would have `session.status` answer `close`
 			// for a reconnect that is going perfectly well — and a resume start a second
 			// dial alongside it.
-			return fmt.Errorf("whatsmeow: log %s out: %w", s.sid, err)
+			return fmt.Errorf("whatsmeow: log %s out: %w", s.sid, neverSent(err))
 		}
 		s.settleLogout()
 		// The request went out. whatsmeow unlinks the device before it deletes the local
@@ -2293,7 +2293,7 @@ func (s *Session) Delete(ctx context.Context) error {
 		// above is about the other case and still holds: an unlink WhatsApp or a socket that
 		// was down refused is a teardown that goes through, because there the retry has
 		// nothing left to do.
-		return fmt.Errorf("whatsmeow: delete %s: %w", s.sid, unlink)
+		return fmt.Errorf("whatsmeow: delete %s: %w", s.sid, neverSent(unlink))
 	}
 	// Whatever WhatsApp answered, this session is not coming back. settleLogout is what
 	// keeps a reconnect from dialling on credentials that are about to be gone.
@@ -2825,6 +2825,28 @@ func sentNothing(err error) bool {
 // errStillDialling is an unlink that was never attempted, because the caller's time ran
 // out while a dial held the socket.
 var errStillDialling = errors.New("the socket was still being dialled")
+
+// neverSent gives an unlink that was never attempted the word the client branches on, and
+// leaves everything else exactly as it was.
+//
+// The chain this wraps ends in the caller's own expired context, and that is what made the
+// answer wrong rather than merely vague: `asProtocolError` matches `context.DeadlineExceeded`
+// and answers `timeout`, which is the word for a command whose outcome nobody here can
+// tell. This one is certain in the other direction -- the socket lock was never free, so
+// nothing was written to WhatsApp and the device is as linked as it was.
+//
+// A coded error is the first thing `asProtocolError` looks for, so the code put here is
+// the one the client sees, and the expired context stays underneath it where the log needs
+// it. Applied on the condition rather than on the branch: a logout that went out and lost
+// its answer shares the branch below and is the opposite case, one nobody here can speak
+// for.
+func neverSent(err error) error {
+	if !errors.Is(err, errStillDialling) {
+		return err
+	}
+	return fmt.Errorf("%w: %w",
+		protocol.NewError(protocol.ErrorNotAttempted, "the request was never sent to WhatsApp"), err)
+}
 
 // unlink asks WhatsApp to remove this device, on the caller's time.
 //

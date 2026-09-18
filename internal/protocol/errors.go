@@ -51,10 +51,25 @@ const (
 	// `session.client_outdated`, published from the session that heard it. No command is
 	// refused with this code, and a command that arrives while the condition holds fails
 	// on the disconnected socket rather than on the version.
-	ErrorClientOutdated         ErrorCode = "client_outdated"
-	ErrorRateLimited            ErrorCode = "rate_limited"
-	ErrorExpired                ErrorCode = "expired"
-	ErrorTimeout                ErrorCode = "timeout"
+	ErrorClientOutdated ErrorCode = "client_outdated"
+	ErrorRateLimited    ErrorCode = "rate_limited"
+	ErrorExpired        ErrorCode = "expired"
+	ErrorTimeout        ErrorCode = "timeout"
+	// ErrorNotAttempted is the connector saying it knows the command never left this
+	// process, which is the one thing `timeout` cannot say.
+	//
+	// `timeout` is the answer for a command whose outcome nobody here can tell: a send
+	// that ran out of time may already be on somebody's phone. This is the opposite and
+	// the connector is certain of it -- nothing was written to WhatsApp, so whatever the
+	// command was about is exactly as it was, and the caller's retry does the whole thing
+	// rather than the half that is left.
+	//
+	// The teardowns are where the difference is worth a word. A `session.delete` whose
+	// unlink was refused is a teardown that goes through, because the retry would have
+	// nothing to do; one whose unlink was never attempted leaves an account that is still
+	// linked, and a caller that read `timeout` there had to assume the teardown had gone
+	// half way and that the device could no longer be removed.
+	ErrorNotAttempted           ErrorCode = "not_attempted"
 	ErrorMediaTooLarge          ErrorCode = "media_too_large"
 	ErrorMediaUnavailable       ErrorCode = "media_unavailable"
 	ErrorRecipientNotOnWhatsapp ErrorCode = "recipient_not_on_whatsapp"
@@ -82,6 +97,7 @@ var AllErrorCodes = []ErrorCode{
 	ErrorRateLimited,
 	ErrorExpired,
 	ErrorTimeout,
+	ErrorNotAttempted,
 	ErrorMediaTooLarge,
 	ErrorMediaUnavailable,
 	ErrorRecipientNotOnWhatsapp,

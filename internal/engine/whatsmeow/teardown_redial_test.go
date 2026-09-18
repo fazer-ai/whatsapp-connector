@@ -3,6 +3,7 @@ package whatsmeow
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/url"
@@ -478,5 +479,97 @@ func TestALogoutWhatsappAcceptedDoesNotWaitOutADialToCloseTheOldClient(t *testin
 	}
 	if _, bound, err := container.For(session.sid).JID(t.Context()); err != nil || bound {
 		t.Fatalf("the credentials survived a logout WhatsApp accepted (bound=%v, err=%v)", bound, err)
+	}
+}
+
+// The failure above carries the word the client branches on, and carrying it is the
+// engine's job because the engine is the only part that knows nothing was sent.
+//
+// Left to the session layer, the chain reads as the caller's expired context and comes out
+// as `timeout` -- the word for a command that may or may not have happened. Here the
+// connector knows exactly: the socket lock was never free, so the unlink was never called,
+// the device is as linked as it was, and a retry does the whole thing. `errors.As` for a
+// coded error is the first case `asProtocolError` tries, so a code put here is the one the
+// client sees, and the expired context underneath it goes on being the truthful cause in
+// the log.
+func TestADeleteThatWasNeverSentCarriesTheWordForIt(t *testing.T) {
+	t.Parallel()
+
+	session, container := newTestSession(t, "5511999990003")
+	if err := session.store.PutDesiredConnected(t.Context(), store.Wants{}); err != nil {
+		t.Fatalf("PutDesiredConnected: %v", err)
+	}
+	session.setConnected(false)
+	session.setReconnecting(true, time.Now())
+	holdTheDial(t, session)
+
+	err := answeredWithin(t, session.Delete)
+	var coded *protocol.Error
+	if !errors.As(err, &coded) {
+		t.Fatalf("Delete answered %v, which carries no code at all: the session layer reads the caller's expired context underneath and answers `timeout`, and a client cannot tell that from a teardown that may have gone half way", err)
+	}
+	if got := string(coded.Code); got != "not_attempted" {
+		t.Fatalf("Delete answered the code %q, want \"not_attempted\"", got)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal("the caller's expired context stopped being in the chain; it is the cause, and the log is where it has to stay readable")
+	}
+	// The same guarantees as the test above, restated here because a code is worth
+	// nothing if the account it describes was torn down anyway.
+	if _, bound, err := container.For(session.sid).JID(t.Context()); err != nil || !bound {
+		t.Fatalf("the delete forgot the credentials (bound=%v, err=%v) while answering that it never tried", bound, err)
+	}
+	if session.Finished() != 0 {
+		t.Fatal("the session was retired for a teardown that did not happen")
+	}
+}
+
+// The same word on the logout, because it is the same physical fact: the socket lock was
+// never free, so nothing was written to WhatsApp.
+//
+// Answering one of them `not_attempted` and the other `timeout` would make the code depend
+// on which command asked rather than on what happened, and a client branching on it would
+// have to know which is which. What it must not spread to is the other half of the branch
+// it shares: a logout whose request went out and lost its answer is the case nobody here
+// can speak for, and it keeps the word for that.
+func TestALogoutThatWasNeverSentCarriesTheSameWord(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990004")
+	session.setConnected(false)
+	session.setReconnecting(true, time.Now())
+	holdTheDial(t, session)
+
+	err := answeredWithin(t, session.Logout)
+	var coded *protocol.Error
+	if !errors.As(err, &coded) {
+		t.Fatalf("Logout answered %v, which carries no code: the client reads the expired context underneath and gets `timeout`, the same word a request that did go out would get", err)
+	}
+	if got := string(coded.Code); got != "not_attempted" {
+		t.Fatalf("Logout answered the code %q, want \"not_attempted\", the same word the delete in the same window answers", got)
+	}
+}
+
+// And the other half of that branch keeps `timeout`, which is the clause that makes the
+// word mean anything: a logout whose request reached WhatsApp and whose answer was lost
+// is a command whose outcome nobody here can tell, and calling it "never attempted" would
+// tell a client to retry a revocation that may already have happened.
+func TestALogoutThatLostItsAnswerIsNotCalledNeverSent(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990005")
+	// The request reached WhatsApp and the socket went away before the answer did, which
+	// is the shape `unanswered` recognises and the one this word must not claim.
+	session.logout = func(context.Context, *wm.Client) error {
+		return fmt.Errorf("error sending logout request: %w", &wm.DisconnectedError{Action: "info query"})
+	}
+
+	err := logoutWithin(t, session)
+	if err == nil {
+		t.Fatal("given: the logout was supposed to fail with its answer lost")
+	}
+	var coded *protocol.Error
+	if errors.As(err, &coded) && string(coded.Code) == "not_attempted" {
+		t.Fatal("a logout whose request went out and lost its answer was called never-attempted; a client told that retries a revocation WhatsApp may already have carried out")
 	}
 }
