@@ -35,8 +35,7 @@ func TestTheContractSaysWhatAClientDoesWithNotSettled(t *testing.T) {
 	var paragraph string
 	for _, block := range strings.Split(string(prose), "\n\n") {
 		if strings.Contains(block, "`not_settled`") {
-			paragraph = block
-			break
+			paragraph += block + "\n\n"
 		}
 	}
 	if paragraph == "" {
@@ -52,6 +51,13 @@ func TestTheContractSaysWhatAClientDoesWithNotSettled(t *testing.T) {
 		{"`internal`", "without the contrast a client pages a human for a case that settles itself"},
 		{"`timeout`", "the word it is carved out of is what tells a client which of the two it got"},
 		{"`not_attempted`", "the third answer about time, and a client has to be able to place this one against it"},
+		// Measured, not supposed: a crash between the intent being recorded and the request
+		// being sent leaves an attempt no notification will ever name, and every redelivery
+		// pushes the intent's clock forward, so the sweep that would drop it never reaches
+		// one that is still being asked about. A contract that promised resolution here
+		// would have a client retrying the same key for good.
+		{"bounds its", "without it the contract promises a resolution one reachable state never delivers"},
+		{"stranded intent", "the client needs a name for the case where asking again is the wrong move"},
 	} {
 		if !strings.Contains(paragraph, clause.phrase) {
 			t.Errorf("the `not_settled` paragraph of contract/PROTOCOL.md never says %q: %s", clause.phrase, clause.why)
