@@ -1397,6 +1397,13 @@ func TestTheKeepAliveHandlerTakesTheSocketDownBeforeItWaitsOnThePublish(t *testi
 	// and watches the arm sit there can tell. Read off the source for the same reason the
 	// order above is -- with no socket under it and an inbox nobody filled, every
 	// arrangement of these lines behaves identically from outside.
+	// These two clauses read the source, which catches an inversion of intent cheaply and
+	// nothing else. What carries the invariant is
+	// TestTheKeepAliveArmHoldsTheTransitionLockAcrossThePublish, which fills the inbox and
+	// asserts the lock is unavailable while the arm sits in the publish: measured, a
+	// `go func() { ... }()` around the publish leaves both readings below true and turns
+	// that one red. Adding a clause per form of goroutine here would be guessing at the
+	// next one.
 	locked := strings.Index(handler, "s.transition.Lock()")
 	if locked < 0 || locked > published {
 		t.Fatalf("the keepalive handler publishes outside the transition lock, so the state on the "+
