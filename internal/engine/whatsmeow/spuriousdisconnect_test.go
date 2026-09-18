@@ -18,7 +18,13 @@ import (
 // `Client.onDisconnect` runs for a socket nobody is asking about. Whether that is harmless is
 // decided by `cli.socket == ns`, and this test is that decision under load-bearing conditions
 // rather than a reading of the source: build a NoiseSocket the client has never heard of, hand
-// it to `onDisconnect` the way the race would, and require that nothing is dispatched.
+// it to `onDisconnect` with the arguments the race produces, on a socket this client never
+// adopted, and require that nothing is dispatched.
+//
+// That distinction is not pedantry. In production the race hands over the socket the client DID
+// adopt, and the branch is false because `cli.socket` has already been cleared. Here the branch
+// is false because the socket was never there to begin with. Same branch, different reason, and
+// the reason production relies on is fenced next door rather than here.
 //
 // `remote` is true because that is what the race produces: the reader is the `go fs.Close(0)`
 // the read pump defers, `Close` passes `code == 0` to the callback, and `code == 0` is the
