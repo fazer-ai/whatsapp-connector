@@ -314,3 +314,52 @@ func TestALabelGoneQuietTakesItsSeriesWithIt(t *testing.T) {
 		t.Errorf("the consumer went quiet and the exposition still has %d series for it", got)
 	}
 }
+
+// The seam itself, which is the one place the rest of this PR's tests cannot reach.
+//
+// `internal/session` proves the duration handed to `Watch` is the distance from the
+// decision; `internal/observability` proves the histogram separates a bad episode from the
+// healthy floor. Between them sits `watching.StateDecided`, three tokens long, and it is
+// where the unit is chosen. Nothing drove it, so a mutant that observed zero, or observed
+// milliseconds into a metric named `_seconds`, or kept the line and dropped the call,
+// survived the whole suite -- measured, three of them at once, all on the same line.
+//
+// That is the #226 defect one layer in: there, three metrics were registered and never
+// written; here, one would be written with a number that means nothing, and a panel would
+// show a flat, plausible, wrong line rather than a zero somebody might question.
+//
+// Asserted through the exposition rather than on a captured argument, because the unit is
+// only wrong once it is in the metric: `Observe(took.Milliseconds())` is a perfectly good
+// float and reads as 45000 seconds, which is a bucket nobody has.
+func TestWhatAScrapeShowsForTheDelayBetweenDecidingAndTelling(t *testing.T) {
+	t.Parallel()
+
+	metrics := observability.New()
+	w := watching{metrics: metrics}
+
+	// One episode that waited and one that did not, in the units the caller uses.
+	w.StateDecided(45 * time.Second)
+	w.StateDecided(200 * time.Millisecond)
+
+	const want = `
+# HELP wac_state_notice_delay_seconds Time from this connector judging a session's connection lost to the state frame reaching the shard, including the wait for the transition lock and for room in the session's inbox.
+# TYPE wac_state_notice_delay_seconds histogram
+wac_state_notice_delay_seconds_bucket{le="0.01"} 0
+wac_state_notice_delay_seconds_bucket{le="0.1"} 0
+wac_state_notice_delay_seconds_bucket{le="0.5"} 1
+wac_state_notice_delay_seconds_bucket{le="1"} 1
+wac_state_notice_delay_seconds_bucket{le="2"} 1
+wac_state_notice_delay_seconds_bucket{le="5"} 1
+wac_state_notice_delay_seconds_bucket{le="15"} 1
+wac_state_notice_delay_seconds_bucket{le="60"} 2
+wac_state_notice_delay_seconds_bucket{le="+Inf"} 2
+wac_state_notice_delay_seconds_sum 45.2
+wac_state_notice_delay_seconds_count 2
+`
+	if err := testutil.CollectAndCompare(metrics.StateNoticeDelay, strings.NewReader(want),
+		"wac_state_notice_delay_seconds"); err != nil {
+		t.Errorf("what a scrape shows for wac_state_notice_delay_seconds: %v\n\n"+
+			"A `_sum` of 45200 is milliseconds written into a metric named `_seconds`; a `_sum` of 0 is the adapter "+
+			"discarding what it was handed; a `_count` of 0 is the line still being there and no longer observing.", err)
+	}
+}
