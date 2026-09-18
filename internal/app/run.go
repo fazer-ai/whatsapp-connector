@@ -11,9 +11,11 @@ import (
 	"os/signal"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
+	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/cluster"
@@ -55,7 +57,10 @@ type Connector struct {
 	manager    *session.Manager
 	engine     engine.Engine
 	store      *store.Container
-	streams    commandStreams
+	// resumePasses counts the finished sweeps, and is read by tests that have to know a
+	// pass is over before they act.
+	resumePasses atomic.Uint64
+	streams      commandStreams
 	// seen is when each label value last had something counted against it, for the two
 	// metrics whose label values have no ceiling of their own: a session id, and the name
 	// of a consumer a claim took work back from. Neither is bounded -- nothing limits how
@@ -246,6 +251,12 @@ func (c *Connector) Handler() http.Handler { return c.http.Handler() }
 
 // Sessions is how many sessions this instance runs.
 func (c *Connector) Sessions() int { return c.manager.Count() }
+
+// ResumePasses is how many sweeps over the accounts that should be in the air this
+// instance has finished. Exposed for the same reason Sessions is: a test that has to know
+// a pass has already happened cannot see it any other way, and the alternative is waiting
+// on the clock, which this repository does not do to synchronise.
+func (c *Connector) ResumePasses() uint64 { return c.resumePasses.Load() }
 
 // Run serves until the context ends or a signal arrives, then releases the sessions.
 func (c *Connector) Run(ctx context.Context) error {
@@ -556,12 +567,24 @@ func (c *Connector) resumeWanted(ctx context.Context) <-chan struct{} {
 	}
 	go func() {
 		defer close(done)
+		// Before the first tick rather than after it, and then again on the catch-up ramp
+		// before settling into the interval. The case this is for is the instance that has
+		// just started: waiting out an interval first would add it to the time an account
+		// spends unowned after every deploy, and one pass on the way in is not enough,
+		// because that pass runs while the instance being replaced is still the owner.
+		for _, wait := range resumeCatchUp {
+			c.resumeOnce(ctx)
+			timer := time.NewTimer(wait)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+		}
 		ticker := time.NewTicker(resumeInterval)
 		defer ticker.Stop()
 		for {
-			// Before the first tick rather than after it, because the case this is for is
-			// the instance that has just started: waiting out an interval first would add
-			// it to the time an account spends unowned after every deploy.
 			c.resumeOnce(ctx)
 			select {
 			case <-ctx.Done():
@@ -573,8 +596,42 @@ func (c *Connector) resumeWanted(ctx context.Context) <-chan struct{} {
 	return done
 }
 
+// resumeCatchUp is how long the sweep waits between its first passes, before settling
+// into resumeInterval for the rest of an instance's life. It exists for one measured case,
+// and that case is every release.
+//
+// A deploy here is a rolling one: the replacement container starts, the one it replaces is
+// signalled about seven tenths of a second later, and takes another second to let its
+// leases go. So the incoming instance makes its pass on the way in while the outgoing one
+// still owns everything, finds nothing anywhere, and on the steady interval alone does not
+// look again for thirty seconds. Measured at chat.fazer.ai: the new container said
+// `connector is up` at 13:15:50, the old one said `connector is down` at 13:15:51, and the
+// account came back at 13:16:20. The one early pass was early by a second, and the account
+// paid thirty for it.
+//
+// A ramp rather than a shorter interval, because the two do not cost the same: this spends
+// five extra passes in the first half minute of an instance's life, once, where a shorter
+// interval would spend them for as long as the fleet runs. And a ramp rather than one
+// retry, because what it is racing is a shutdown whose length is the number of sessions
+// the outgoing instance has to close, not a constant.
+//
+// The fleet asking in chorus is already handled and is not made worse: every pass goes
+// through the `wa:resume:<sid>` cool-off, so one account is asked about once per window
+// however many instances are sweeping.
+var resumeCatchUp = []time.Duration{
+	time.Second,
+	2 * time.Second,
+	4 * time.Second,
+	8 * time.Second,
+	16 * time.Second,
+}
+
 // resumeOnce makes one pass over the accounts that should be in the air.
 func (c *Connector) resumeOnce(ctx context.Context) {
+	// Counted on the way out, whatever the pass decided, so a reader waiting on it knows
+	// the pass is over rather than merely started.
+	defer c.resumePasses.Add(1)
+
 	// Bounded, and on a context of its own: the pass has nothing waiting on it, and a
 	// database or a Redis that hangs would otherwise hold this goroutine for as long as
 	// it takes rather than for as long as a pass is worth.
@@ -1199,7 +1256,11 @@ func (c *Connector) shutdown() {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(context.Background()), ShutdownGrace)
 	defer cancel()
 
+	// Read before the stops, because StopAll empties it: these are the accounts this
+	// instance is about to make ownerless, and after the call there is nothing left to ask.
+	giving := c.manager.SIDs()
 	c.manager.StopAll(ctx)
+	c.clearTheFloorUnderRetry(ctx, giving)
 	if err := c.registry.Withdraw(ctx, c.cfg.Instance); err != nil {
 		c.log.Warn().Err(err).Msg("failed to withdraw this instance")
 	}
@@ -1219,6 +1280,59 @@ func (c *Connector) shutdown() {
 	}
 	c.log.Info().Msg("connector is down")
 }
+
+// clearTheFloorUnderRetry drops the resume cool-off of every account this instance has
+// just given up, so the fleet may bring them back at once.
+//
+// The mark paces failure. Its comment says so: it is "the floor under the retry", there so
+// that an account whose engine keeps retiring it is not dialled again on every pass by
+// every instance. An account released because its instance was asked to stop has not
+// failed at anything, and holding the fleet off it for a minute is the floor being applied
+// to the one case it was not written for.
+//
+// This is what made a deploy expensive, and the size of it was hidden by chance. The
+// outgoing instance takes the mark when it first brings an account back, and the mark
+// outlives the release by whatever is left of its minute; the successor then finds the
+// lease free, cannot take the turn, and waits. Measured at chat.fazer.ai the wait came to
+// thirty seconds, because that deployment's marks were minutes old by the time it was
+// redeployed -- a release that follows an earlier one closely would have paid more.
+//
+// After the releases, never before: a mark dropped while this instance still holds the
+// lease invites a peer to take a turn it cannot use, and that turn is the one thing the
+// mark exists to arbitrate.
+//
+// Logged rather than returned, one by one. The process is leaving either way, and a mark
+// that could not be dropped expires on its own within the minute -- which is the behaviour
+// this replaces, so a failure here costs exactly what the deploy used to cost.
+func (c *Connector) clearTheFloorUnderRetry(ctx context.Context, sids []string) {
+	for _, sid := range sids {
+		if err := dropOwnResumeMark.Run(
+			ctx, c.client, []string{c.client.Keys().Resume(sid)}, c.cfg.Instance,
+		).Err(); err != nil && !errors.Is(err, redis.Nil) {
+			c.log.Warn().Err(err).Str("sid", sid).
+				Msg("could not clear the resume cool-off of an account this instance gave up")
+		}
+	}
+}
+
+// dropOwnResumeMark deletes the cool-off only while it is still this instance's, which is
+// what stops a shutdown erasing a turn that has already moved on.
+//
+// The mark carries the name of whoever took it, and by the time a shutdown gets here the
+// one this instance took may be a minute old and gone: a peer that swept in between holds
+// its own, with an adoption still in flight behind it. An unconditional delete would hand
+// that account back to the next pass while the peer is still bringing it up, which is two
+// instances asked for one account -- the single thing this mark exists to arbitrate.
+//
+// Same shape as releaseScript in internal/cluster for the same reason: read and delete
+// have to be one step, or the value can change between them.
+var dropOwnResumeMark = redis.NewScript(`
+if redis.call("GET", KEYS[1]) ~= ARGV[1] then
+  return 0
+end
+redis.call("DEL", KEYS[1])
+return 1
+`)
 
 // newEngine builds the WhatsApp side, and opens the store when a database is configured.
 //

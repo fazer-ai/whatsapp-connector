@@ -99,6 +99,16 @@ func (c *client) events(ctx context.Context, sid string) []protocol.Event {
 // start runs one connector against the given Redis and stops it when the test ends.
 func start(t *testing.T, addr, instance string, env map[string]string) *app.Connector {
 	t.Helper()
+	connector, _ := startStoppable(t, addr, instance, env)
+	return connector
+}
+
+// startStoppable is start for a test that has to stop the instance itself rather than at
+// cleanup, which is what a rolling deploy does to the instance it replaces. The returned
+// func blocks until the shutdown is over, and calling it twice is harmless: the cleanup
+// start registers calls it again.
+func startStoppable(t *testing.T, addr, instance string, env map[string]string) (connector *app.Connector, stop func()) {
+	t.Helper()
 	t.Setenv("REDIS_URL", "redis://"+addr)
 	t.Setenv("WAC_INSTANCE", instance)
 	t.Setenv("WAC_ENGINE", "fake")
@@ -127,7 +137,7 @@ func start(t *testing.T, addr, instance string, env map[string]string) *app.Conn
 			t.Logf("what the connector logged:\n%s", logged.String())
 		}
 	})
-	connector, err := app.New(&cfg, zerolog.New(logged).Level(zerolog.DebugLevel))
+	connector, err = app.New(&cfg, zerolog.New(logged).Level(zerolog.DebugLevel))
 	if err != nil {
 		t.Fatalf("app.New: %v", err)
 	}
@@ -135,15 +145,19 @@ func start(t *testing.T, addr, instance string, env map[string]string) *app.Conn
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { defer close(done); _ = connector.Run(ctx) }()
-	t.Cleanup(func() {
-		cancel()
-		select {
-		case <-done:
-		case <-time.After(10 * time.Second):
-			t.Error("the connector did not shut down")
-		}
-	})
-	return connector
+	var once sync.Once
+	stop = func() {
+		once.Do(func() {
+			cancel()
+			select {
+			case <-done:
+			case <-time.After(10 * time.Second):
+				t.Error("the connector did not shut down")
+			}
+		})
+	}
+	t.Cleanup(stop)
+	return connector, stop
 }
 
 func waitFor(t *testing.T, what string, cond func() bool) {
