@@ -706,13 +706,15 @@ func (s *Session) waitForTheGroupItMade(
 // notSettledYet is what a delivery is answered with while WhatsApp has not said which group
 // its creation made.
 //
-// `internal` because the contract has no word for "cannot be told yet". It is the closest
-// true answer -- the connector could not carry the command out -- and naming this case on
-// the wire is a contract change, asked in #214.
+// `not_settled` and not `internal`: the outcome exists, the connector will know which one
+// it is as soon as WhatsApp's notification names the group, and a client that asks again
+// in a moment gets a real answer. `internal` read as this connector having a bug, which
+// this is not, and it gave a client no way to tell a retry worth making from one worth
+// paging somebody about (#214).
 func (s *Session) notSettledYet(attempt string, began store.GroupCreation) error {
 	s.log.Warn().Str("sid", s.sid).Str("attempt", attempt).Str("subject", began.Subject).
 		Msg("a creation is on record and WhatsApp has not said yet which group it made")
-	return protocol.NewError(protocol.ErrorInternal,
+	return protocol.NewError(protocol.ErrorNotSettled,
 		"a group by this name was made and which request made it is not settled yet")
 }
 

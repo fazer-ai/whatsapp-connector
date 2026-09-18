@@ -7,7 +7,7 @@ type ErrorCode string
 
 // Every error code in the contract.
 //
-// Four of these are published and never sent. They are marked below with what a client
+// Three of these are published and never sent. They are marked below with what a client
 // receives instead, because a code a client can branch on and nothing produces is a
 // branch that never runs, and the situation it names is answered by something else or
 // by nothing at all. Kept rather than removed: they are in the schema, so dropping one
@@ -69,7 +69,22 @@ const (
 	// nothing to do; one whose unlink was never attempted leaves an account that is still
 	// linked, and a caller that read `timeout` there had to assume the teardown had gone
 	// half way and that the device could no longer be removed.
-	ErrorNotAttempted           ErrorCode = "not_attempted"
+	ErrorNotAttempted ErrorCode = "not_attempted"
+	// ErrorNotSettled is the connector saying the outcome exists and it cannot yet be told
+	// which one it is. It is the third answer about time, and the other two are wrong here.
+	//
+	// `timeout` says nobody here can tell, and leaves it there: a send that ran out of time
+	// may be on somebody's phone and nothing afterwards will say. `not_attempted` says
+	// nothing happened at all. This one says something did happen, the connector will know
+	// which shortly, and asking again in a moment settles it -- so a client retries this
+	// one and pages a human for `internal`, which is this connector having a bug.
+	//
+	// `group.create` is where it is produced. Two requests for a group of the same name,
+	// both still open, make a group that is evidence for either and proof for neither;
+	// answering one of them with it would hand that request the other's conversation and
+	// skip the creation it asked for, so the delivery is refused until WhatsApp's own
+	// notification names which request made which group.
+	ErrorNotSettled             ErrorCode = "not_settled"
 	ErrorMediaTooLarge          ErrorCode = "media_too_large"
 	ErrorMediaUnavailable       ErrorCode = "media_unavailable"
 	ErrorRecipientNotOnWhatsapp ErrorCode = "recipient_not_on_whatsapp"
@@ -98,6 +113,7 @@ var AllErrorCodes = []ErrorCode{
 	ErrorExpired,
 	ErrorTimeout,
 	ErrorNotAttempted,
+	ErrorNotSettled,
 	ErrorMediaTooLarge,
 	ErrorMediaUnavailable,
 	ErrorRecipientNotOnWhatsapp,
