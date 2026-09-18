@@ -23,7 +23,7 @@ import (
 //
 // The sid here is chosen to land on the disagreeing side and is not decoration: measured
 // on the base, it hashes to stream 4 with eight and to stream 12 with sixteen. Of the
-// eight sids this package already used, four were on each side, and all three tests that
+// eight sids `app_test.go` already used, four were on each side, and all three tests that
 // read events happened to hold one from the agreeing half. Green by luck, and the next
 // test written with a sid from the other half would have inherited the luck of the draw.
 func TestTheClientReadsTheSameShardTheFleetPublishesTo(t *testing.T) {

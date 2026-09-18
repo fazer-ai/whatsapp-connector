@@ -17,9 +17,10 @@ import (
 // modulo the count, so two counts agree for some sids and disagree for others: the side
 // holding the stale copy reads a stream nobody wrote to and gets an empty list, with no
 // error and no warning. That is what #269 was: the test client counted eight streams
-// while the connector published to sixteen, four of the package's eight sids fell on the
-// disagreeing side, and all three tests that read events happened to hold a sid from the
-// agreeing half. Green by luck, and the next test written would have drawn from the same
+// while the connector published to sixteen, four of the eight sids in `app_test.go` fell
+// on the disagreeing side, and all three tests that read events happened to hold a sid
+// from the agreeing half. (Four of eight is the count for that file, which is where those
+// tests live; the package as a whole names twenty-five sids and twelve of them disagree.) Green by luck, and the next test written would have drawn from the same
 // hat.
 //
 // So the rule is not "use the right number", it is "do not carry a number at all". A key
@@ -93,13 +94,17 @@ func TestNoTestInThisPackageCarriesItsOwnShardCount(t *testing.T) {
 			// `int(4)` carry the count past this check, each measured, because none of
 			// them is a `BasicLit`. Closing that means folding constants through
 			// `go/types` instead of reading the syntax, and folding does not stop where
-			// this fence stops. Measured on the same four: it reports each as the
-			// constant 4, and it reports `DefaultEventShards*2` as the constant 32,
-			// which is the derived value the rule above deliberately allows; a count
-			// read from the fleet folds to nothing and would stay allowed. So the
-			// instrument that closes the hole also closes the door, for a shape no key
-			// layout in this package is built with. The rune was worth closing because
-			// the fence was already looking at exactly that node.
+			// this fence stops. Measured: it reports each of those four as the constant
+			// 4, and it reports `DefaultEventShards` as the constant 16, which is the
+			// name this fence exists to make people write and the one most counts here
+			// are written as. Erasing the difference between naming the one home and
+			// carrying the number is what folding is for, and that difference is the
+			// whole rule, so a fence built on it would report the idiom it asks for. The
+			// one thing folding still separates is a count read from the fleet, which
+			// folds to nothing. So the instrument that closes the hole closes the rule
+			// with it, and the hole is a shape no key layout here is built with. The
+			// rune was worth closing because the fence was already looking at exactly
+			// that node.
 			literal, ok := call.Args[at].(*ast.BasicLit)
 			if !ok || literal.Value == "0" {
 				return true
