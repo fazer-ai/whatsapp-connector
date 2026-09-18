@@ -7,9 +7,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"image/png"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -18,9 +22,12 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/santhosh-tekuri/jsonschema/v6"
 	wm "go.mau.fi/whatsmeow"
+	waBinary "go.mau.fi/whatsmeow/binary"
 	"go.mau.fi/whatsmeow/proto/waAdv"
+	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
 	waTypes "go.mau.fi/whatsmeow/types"
 	waEvents "go.mau.fi/whatsmeow/types/events"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/engine"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
@@ -3310,4 +3317,654 @@ func TestAConnectThisBuildRefusesIsNotSomethingToResume(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The group subscription a resumed session carries is not remembered, it is rebuilt: the
+// sweep reads `container.Wanted()`, synthesises a `ConnectRequest` from the row, and
+// `Connect` calls `setGroups` with what the row said. Every filter below asks
+// `wantsGroups()` on the far side of that chain.
+//
+// What each of them has on its own is a test that it reads the field, and the field has
+// one writer. That closes by reading code: it says the filter would answer correctly if
+// the chain put the right value there, and says nothing about the chain. #190 measured
+// three of the filters live after a fall and left the rest, and the two the call path
+// added in #220 arrived after the issue was written -- which is the whole reason the
+// fence at the bottom of this file exists rather than a list somebody keeps up to date.
+
+// resumedDoor is one filter, and the stimulus that goes through it.
+type resumedDoor struct {
+	// door is the method whose `wantsGroups()` the stimulus crosses. The fence holds this
+	// against the source, so a name that stops existing fails rather than quietly
+	// covering nothing.
+	door string
+	// definition is the contract shape the payload is held to, so a row proves the event
+	// a client actually validates and not merely that something came out.
+	definition string
+	want       protocol.EventType
+	// give runs the stimulus and answers what the session told WhatsApp.
+	give func(*Session) bool
+	// quiet answers "did this filter hold?" for a session that did not ask for groups, and
+	// it is a different question per route. Reading Events() for all of them is a measured
+	// false negative: a placeholder parked in `awaited` and a presence parked on the board
+	// have published nothing yet and never will, so a build with the filter deleted looks
+	// exactly like a build with it intact.
+	quiet func(*Session) (held int, where string)
+	// carries holds the payload to what the event is ABOUT, and not only to its type and
+	// the contract's shape. Without it a build that published the right kind of event for
+	// the wrong group, the wrong message or the wrong presence state keeps every row
+	// green: a schema catches a field that went missing, never a field that is wrong.
+	carries func(*testing.T, map[string]any)
+	// answers is what the door tells WhatsApp once the event is out, and it is not the
+	// same for all of them. An inbound message and its receipt withhold the
+	// acknowledgement until the event is known to have been delivered -- invariant 4,
+	// losing Redis costs a redelivery and never a message -- and nothing in a unit test
+	// confirms that delivery, so those two answer no here and would answer yes in a
+	// deployment. The rest acknowledge on the spot, because WhatsApp does not redeliver a
+	// call, a presence or a group notification worth waiting for.
+	//
+	// Three values and not a bool, because the zero value of a bool is one of the two
+	// real answers: a row added without thinking about this would claim the door holds
+	// the acknowledgement back, and for a future message-shaped door that claim is true
+	// by accident and the row goes green without anybody having decided it.
+	answers doorAnswer
+}
+
+// doorAnswer is what a door tells WhatsApp, with a zero value that is neither.
+type doorAnswer int
+
+const (
+	answerUndecided doorAnswer = iota
+	answersYes
+	answersNo
+)
+
+// answerOf reads a handler's bool back as one of the two decided answers, so a failure
+// says what happened in the same words the row says what it wanted.
+func answerOf(acknowledged bool) doorAnswer {
+	if acknowledged {
+		return answersYes
+	}
+	return answersNo
+}
+
+func (a doorAnswer) String() string {
+	switch a {
+	case answersYes:
+		return "acknowledged"
+	case answersNo:
+		return "left for redelivery"
+	default:
+		return "undecided"
+	}
+}
+
+// inTheGroup fails unless the payload puts the event in the group the stimulus named, at
+// `path` (a chain of object keys).
+func inTheGroup(t *testing.T, payload map[string]any, path ...string) {
+	t.Helper()
+
+	at := any(payload)
+	for _, key := range path {
+		object, ok := at.(map[string]any)
+		if !ok {
+			t.Fatalf("looked for %v in the payload and %q is not an object: %v", path, key, at)
+		}
+		at = object[key]
+	}
+	address, ok := at.(map[string]any)
+	if !ok {
+		t.Fatalf("the payload carries no address at %v: %v", path, at)
+	}
+	if address["id"] != theGroup || address["kind"] != "group" {
+		t.Errorf("the event is about %v, and the stimulus was about group %s", address, theGroup)
+	}
+}
+
+// field walks the same way and answers one leaf.
+func field(t *testing.T, payload map[string]any, path ...string) any {
+	t.Helper()
+
+	at := any(payload)
+	for _, key := range path {
+		object, ok := at.(map[string]any)
+		if !ok {
+			t.Fatalf("looked for %v in the payload and %q is not an object: %v", path, key, at)
+		}
+		at = object[key]
+	}
+	return at
+}
+
+// inboxIsEmpty is the instrument for the routes that publish straight away. The forwarder
+// is parked before the stimulus, so the inbox is where an emission stops.
+func inboxIsEmpty(s *Session) (held int, where string) { return len(s.inbox), "queued on the inbox" }
+
+// boardIsEmpty is the presence route: a chat presence is held per chat and handed on from
+// there, so it reaches the board before it reaches the inbox.
+func boardIsEmpty(s *Session) (held int, where string) {
+	s.boardMu.Lock()
+	defer s.boardMu.Unlock()
+	return len(s.board), "waiting on the presence board"
+}
+
+// awaitedIsEmpty is the unreadable route, and it is the one that proved the point.
+// `awaitOrPublish` parks the placeholder until the real message turns up, so with the
+// window still open nothing has been published and nothing ever will be if the window
+// closes quietly. Measured: with the filter deleted and the inbox as the instrument, the
+// row stays green.
+func awaitedIsEmpty(s *Session) (held int, where string) {
+	s.awaitedMu.Lock()
+	defer s.awaitedMu.Unlock()
+	return len(s.awaited), "parked as an unreadable message waiting for the real one"
+}
+
+func resumedDoors() []resumedDoor {
+	return []resumedDoor{
+		{
+			door: "receive",
+			// Held back until the event is known to have been delivered.
+			answers: answersNo,
+			carries: func(t *testing.T, payload map[string]any) {
+				inTheGroup(t, payload, "message", "chat")
+				if got := field(t, payload, "message", "id"); got != "3EB0GROUPRESUME" {
+					t.Errorf("published %v as the message that arrived", got)
+				}
+			},
+			quiet:      inboxIsEmpty,
+			definition: "event_message_received",
+			want:       protocol.EventMessageReceived,
+			give: func(s *Session) bool {
+				event := textMessage("3EB0GROUPRESUME", "bom dia, time")
+				event.Info.Chat = groupJID()
+				event.Info.Sender = someone("5511999990002")
+				event.Info.IsGroup = true
+				event.Message = &waE2E.Message{Conversation: proto.String("bom dia, time")}
+				return s.handle(event)
+			},
+		},
+		{
+			// The filter a group message that cannot be decrypted goes through, which is a
+			// different function from the one above and the reason the issue counted it
+			// separately: nothing about `receive` being covered says this one is.
+			door:    "unreadable",
+			answers: answersYes,
+			carries: func(t *testing.T, payload map[string]any) {
+				inTheGroup(t, payload, "message", "chat")
+				// The word the issue names: a message nothing could read is a bubble
+				// saying so, not a message with a body.
+				if got := field(t, payload, "message", "content", "type"); got != "unsupported" {
+					t.Errorf("a message nobody could read was published as %v", got)
+				}
+			},
+			quiet:      awaitedIsEmpty,
+			definition: "event_message_received",
+			want:       protocol.EventMessageReceived,
+			give: func(s *Session) bool {
+				return s.handle(&waEvents.UndecryptableMessage{
+					Info: waTypes.MessageInfo{
+						ID:        "3EB0UNREADABLERESUME",
+						Timestamp: time.UnixMilli(1755000000000),
+						PushName:  "Alice",
+						MessageSource: waTypes.MessageSource{
+							Chat:    groupJID(),
+							Sender:  someone("5511999990002"),
+							IsGroup: true,
+						},
+					},
+					IsUnavailable:   true,
+					UnavailableType: waEvents.UnavailableType("view_once"),
+				})
+			},
+		},
+		{
+			door: "receipt",
+			// Held back until the event is known to have been delivered.
+			answers: answersNo,
+			carries: func(t *testing.T, payload map[string]any) {
+				inTheGroup(t, payload, "chat")
+				ids, _ := payload["message_ids"].([]any)
+				if len(ids) != 1 || ids[0] != "3EB0GROUPRESUME" {
+					t.Errorf("the receipt turned the tick on %v", payload["message_ids"])
+				}
+			},
+			quiet:      inboxIsEmpty,
+			definition: "event_message_receipt",
+			want:       protocol.EventMessageReceipt,
+			give: func(s *Session) bool {
+				return s.handle(&waEvents.Receipt{
+					MessageSource: waTypes.MessageSource{
+						Chat:    groupJID(),
+						Sender:  someone("5511999990002"),
+						IsGroup: true,
+					},
+					MessageIDs: []string{"3EB0GROUPRESUME"},
+					Timestamp:  time.UnixMilli(1755440000123),
+					Type:       waTypes.ReceiptTypeRead,
+				})
+			},
+		},
+		{
+			door:    "chatPresence",
+			answers: answersYes,
+			carries: func(t *testing.T, payload map[string]any) {
+				inTheGroup(t, payload, "chat")
+				if got := payload["state"]; got != "composing" {
+					t.Errorf("somebody typing in the group was published as %v", got)
+				}
+				// The participant and not the group: a presence keyed by the chat alone
+				// would put "somebody is typing" in the conversation with nobody's name on
+				// it, and the group is the chat, never the one who typed.
+				if got := field(t, payload, "sender", "phone"); got != "5511999990002" {
+					t.Errorf("published %v as whoever is typing in the group", got)
+				}
+			},
+			quiet:      boardIsEmpty,
+			definition: "event_chat_presence",
+			want:       protocol.EventChatPresence,
+			give: func(s *Session) bool {
+				return s.handle(&waEvents.ChatPresence{
+					MessageSource: waTypes.MessageSource{
+						Chat:    groupJID(),
+						Sender:  someone("5511999990002"),
+						IsGroup: true,
+					},
+					State: waTypes.ChatPresenceComposing,
+					Media: waTypes.ChatPresenceMediaText,
+				})
+			},
+		},
+		{
+			// The weakest of the three the issue named: `joinedAGroup` is a function of
+			// its own, and nothing -- live or in unit -- had ever crossed this line with a
+			// subscription that came back from a resume.
+			door:    "joinedAGroup",
+			answers: answersYes,
+			carries: func(t *testing.T, payload map[string]any) {
+				inTheGroup(t, payload, "info", "group")
+				if got := field(t, payload, "info", "subject"); got != "Equipe fazer.ai" {
+					t.Errorf("published %v as the subject of the group the account joined", got)
+				}
+			},
+			quiet:      inboxIsEmpty,
+			definition: "event_group_joined",
+			want:       protocol.EventGroupJoined,
+			give: func(s *Session) bool {
+				return s.handle(&waEvents.JoinedGroup{
+					Reason: "invite",
+					GroupInfo: waTypes.GroupInfo{
+						JID:              groupJID(),
+						GroupName:        waTypes.GroupName{Name: "Equipe fazer.ai"},
+						ParticipantCount: 2,
+						Participants: []waTypes.GroupParticipant{
+							{JID: someone("5511999990001")},
+							{JID: someone("5511999990002"), IsAdmin: true},
+						},
+					},
+				})
+			},
+		},
+		{
+			// The residue branch, and not the rename the older test sends: a `GroupInfo`
+			// carrying only what the contract has no field for leaves `changes` empty and
+			// comes out as `group.activity`. The rename exits `groupChanged` by the other
+			// arm, so covering it says nothing about this one.
+			door:    "groupChanged",
+			answers: answersYes,
+			carries: func(t *testing.T, payload map[string]any) {
+				groups, _ := payload["groups"].([]any)
+				if len(groups) != 1 {
+					t.Fatalf("named %v as the groups that moved", payload["groups"])
+				}
+				named, _ := groups[0].(map[string]any)
+				if named["id"] != theGroup {
+					t.Errorf("named %v as the group that moved", groups[0])
+				}
+			},
+			quiet:      inboxIsEmpty,
+			definition: "event_group_activity",
+			want:       protocol.EventGroupActivity,
+			give: func(s *Session) bool {
+				return s.handle(&waEvents.GroupInfo{
+					JID:       groupJID(),
+					Ephemeral: &waTypes.GroupEphemeral{IsEphemeral: true, DisappearingTimer: 86400},
+				})
+			},
+		},
+		{
+			// Added by #220, four days after the issue was written, and so absent from its
+			// table of six. It is the same filter on the same field, reached from a door
+			// nobody had counted.
+			door:    "callOffered",
+			answers: answersYes,
+			carries: func(t *testing.T, payload map[string]any) {
+				if got := payload["call_id"]; got != "call-resumed-1" {
+					t.Errorf("published %v as the call that is ringing", got)
+				}
+				// The creator and not the group: `call.offer` carries no group, and whoever
+				// rang is what an inbox shows.
+				if got := field(t, payload, "from", "phone"); got != theCaller {
+					t.Errorf("published %v as whoever rang", got)
+				}
+			},
+			quiet:      inboxIsEmpty,
+			definition: "event_call_offer",
+			want:       protocol.EventCallOffer,
+			give: func(s *Session) bool {
+				return s.handle(&waEvents.CallOffer{
+					BasicCallMeta: waTypes.BasicCallMeta{
+						From:        groupJID(),
+						CallCreator: someone(theCaller),
+						CallID:      "call-resumed-1",
+						Timestamp:   time.UnixMilli(1755440000123),
+						GroupJID:    groupJID(),
+					},
+					CallRemoteMeta: waTypes.CallRemoteMeta{RemotePlatform: "android"},
+					Data:           &waBinary.Node{Tag: "offer", Content: []waBinary.Node{{Tag: "audio"}}},
+				})
+			},
+		},
+		{
+			door:    "callEnded",
+			answers: answersYes,
+			carries: func(t *testing.T, payload map[string]any) {
+				if got := payload["call_id"]; got != "call-resumed-1" {
+					t.Errorf("published %v as the call that ended", got)
+				}
+			},
+			quiet:      inboxIsEmpty,
+			definition: "event_call_terminate",
+			want:       protocol.EventCallTerminate,
+			give: func(s *Session) bool {
+				return s.handle(&waEvents.CallTerminate{
+					BasicCallMeta: waTypes.BasicCallMeta{
+						From:        groupJID(),
+						CallCreator: someone(theCaller),
+						CallID:      "call-resumed-1",
+						Timestamp:   time.UnixMilli(1755440000123),
+						GroupJID:    groupJID(),
+					},
+				})
+			},
+		},
+	}
+}
+
+// TestEveryGroupDoorOpensForASubscriptionThatCameBackFromAResume crosses each filter with
+// the subscription rebuilt the way the sweep rebuilds it, and asserts the type of what
+// came out.
+//
+// The type and not `len(inbox) != 0`, which is what the older test asserts: a session that
+// published the wrong event, or that published a `session.state` on its way up, satisfies
+// a length and says nothing about which filter opened.
+func TestEveryGroupDoorOpensForASubscriptionThatCameBackFromAResume(t *testing.T) {
+	t.Parallel()
+
+	for _, door := range resumedDoors() {
+		t.Run(door.door, func(t *testing.T) {
+			t.Parallel()
+
+			session := resumedGroupSession(t)
+			// The placeholder the unreadable route parks waits for the real message before
+			// it goes out, and no row here is about that window. Shortened rather than
+			// waited out, the way every other test of that path does it.
+			session.rerequestWait = 10 * time.Millisecond
+			// Off the test's goroutine: the two message routes hold their answer until the
+			// event is delivered, and the delivery is this goroutine reading it.
+			answered := make(chan bool, 1)
+			go func() { answered <- door.give(session) }()
+			door.carries(t, published(t, session, door.want, door.definition))
+			select {
+			case got := <-answered:
+				want := door.answers == answersYes
+				if got != want {
+					t.Errorf("%s %s the group traffic it published, want %s",
+						door.door, answerOf(got), door.answers)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatalf("%s published the event and never answered WhatsApp", door.door)
+			}
+		})
+	}
+}
+
+// And the other direction, on the same chain: a session resumed from a row that did not
+// ask for groups publishes none of it. Without this, every row above passes on a build
+// where `wantsGroups()` is stuck at true, which is the one mutation the positive
+// direction cannot see.
+func TestNoGroupDoorOpensForASubscriptionThatCameBackWithoutGroups(t *testing.T) {
+	t.Parallel()
+
+	for _, door := range resumedDoors() {
+		t.Run(door.door, func(t *testing.T) {
+			t.Parallel()
+
+			session := resumedSession(t, false)
+			// Parked, so the inbox is where an emission stops: waiting a spell on the far
+			// end of the forwarder would pass on a loaded machine whether anything was
+			// enqueued or not, and that is exactly the case this is here to catch.
+			session.picked = make(chan struct{}, 1)
+			blockTheForwarder(t, session)
+			// Long, and the opposite of the positive direction: a placeholder that got past
+			// a deleted filter has to still be parked when the instrument looks, or the
+			// row would be reading an empty inbox and calling it a filter that held.
+			session.rerequestWait = time.Hour
+
+			// Off the test's goroutine: the same deleted filter leaves the unreadable route
+			// sitting out that window, and a direct call would hang the row instead of
+			// failing it.
+			answered := make(chan bool, 1)
+			go func() { answered <- door.give(session) }()
+			acknowledged, inTime := false, false
+			select {
+			case acknowledged = <-answered:
+				inTime = true
+			case <-time.After(2 * time.Second):
+			}
+
+			if held, where := door.quiet(session); held != 0 {
+				t.Fatalf("a session resumed without groups left %d thing(s) %s through %s",
+					held, where, door.door)
+			}
+			if !inTime {
+				t.Fatalf("%s never came back for group traffic a session without groups has nowhere to put",
+					door.door)
+			}
+			if !acknowledged {
+				// Withholding the acknowledgement would have WhatsApp redeliver every
+				// group event the account ever gets, for as long as the session is up.
+				t.Fatalf("%s left group traffic for WhatsApp to send again, and it carries the same thing again",
+					door.door)
+			}
+		})
+	}
+}
+
+// resumedGroupSession is groupSession's counterpart for this file: the subscription is not
+// set on the session, it is carried through a full round trip of the sweep.
+func resumedGroupSession(t *testing.T) *Session {
+	t.Helper()
+
+	return resumedSession(t, true)
+}
+
+// resumedSession opens an account asking for `groups`, closes it, and brings it back the
+// way the manager does: a new handle on the same store, a new session over it, and a
+// connect synthesised from what `container.Wanted()` says about the row.
+//
+// The value under test is never written by this helper. It reads `wanted[0].Groups` and
+// hands that back, so a chain that loses the request fails here rather than being papered
+// over by a literal.
+func resumedSession(t *testing.T, groups bool) *Session {
+	t.Helper()
+
+	session, container := newTestSession(t, "5511999990001")
+	// Connected first, so neither connect below dials. A unit test here must never reach a
+	// real socket: every filter this file crosses reads `wantsGroups()`, not the state of a
+	// socket, and eight websockets to web.whatsapp.com in the pre-push suite is a network
+	// dependency bought for nothing.
+	session.setConnected(true)
+	if err := session.Connect(t.Context(), engine.ConnectRequest{Pairing: "resume", Groups: groups}); err != nil {
+		t.Fatalf("the connect that records the subscription: %v", err)
+	}
+	sid := session.sid
+	if err := session.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	scoped := container.For(sid)
+	device, err := scoped.Device(t.Context())
+	if err != nil {
+		t.Fatalf("Device: %v", err)
+	}
+	resumed := newSession(t.Context(), sid, wm.NewClient(device, nil), scoped, MediaOptions{},
+		nil, zerolog.Nop(), newLibraryLogger(zerolog.Nop(), sid))
+	t.Cleanup(func() { _ = resumed.Close() })
+
+	wanted, err := container.Wanted(t.Context())
+	if err != nil {
+		t.Fatalf("Wanted: %v", err)
+	}
+	if len(wanted) != 1 {
+		t.Fatalf("the sweep would bring back %v, so there is nothing to resume with", wanted)
+	}
+	if wanted[0].Groups != groups {
+		t.Fatalf("the row the sweep reads says groups=%v for a session that connected with groups=%v",
+			wanted[0].Groups, groups)
+	}
+	resumed.setConnected(true)
+	if err := resumed.Connect(t.Context(), engine.ConnectRequest{
+		Pairing: "resume", Groups: wanted[0].Groups,
+	}); err != nil {
+		t.Fatalf("the connect the sweep synthesises: %v", err)
+	}
+	// An inbound message waits to hear its event was delivered, and nothing here is going
+	// to say so: without this the two message rows sit out the whole minute of the real
+	// bound, long after the assertion they exist for has been made. It bounds the
+	// acknowledgement and not the publish, which is what every row reads.
+	resumed.deliverWait = 50 * time.Millisecond
+	// The state the connect itself publishes, read off before the stimulus. Every
+	// assertion below is about the next thing out, and a caller that skipped this would
+	// be told `session.state` whatever the filter did.
+	drain(t, resumed)
+	return resumed
+}
+
+// doorsThatAreNotFilters names the `wantsGroups()` readers that do not gate traffic on it,
+// so the fence below can tell "not covered" from "not a door". Each one needs a reason,
+// because the cheap way to make the fence green is to move a name here.
+var doorsThatAreNotFilters = map[string]string{
+	// Carries the subscription INTO a pairing request rather than filtering anything by
+	// it. A resume never reaches it: a session asking for a pairing code has no account to
+	// resume. What it must not do is lose the value, and `TestACodeRequestKeepsTheGroupSubscriptionTheClientAskedFor`
+	// is what says so.
+	"requestCode": "carries the subscription into a pairing request instead of filtering traffic by it",
+}
+
+// TestEveryGroupFilterHasARowInTheResumeTable is why this file is a table and not three
+// tests. The issue behind it counted six filters; by the time it was picked up there were
+// eight, because #220 added two and nothing said so. A list somebody maintains goes stale
+// in exactly that way, so the list is read off the source instead.
+func TestEveryGroupFilterHasARowInTheResumeTable(t *testing.T) {
+	t.Parallel()
+
+	covered := map[string]bool{}
+	for _, door := range resumedDoors() {
+		if covered[door.door] {
+			t.Errorf("%s has two rows in the table", door.door)
+		}
+		if door.give == nil || door.quiet == nil || door.carries == nil {
+			t.Errorf("the row for %s is missing a stimulus, a quiet instrument or a payload check", door.door)
+		}
+		if door.answers == answerUndecided {
+			t.Errorf("the row for %s does not say what the door answers WhatsApp: pick answersYes or answersNo, "+
+				"and a message-shaped door holds the acknowledgement back until the event is delivered", door.door)
+		}
+		covered[door.door] = true
+	}
+
+	var uncovered, unknown []string
+	for _, reader := range groupFilterReaders(t) {
+		switch {
+		case covered[reader]:
+			delete(covered, reader)
+		case doorsThatAreNotFilters[reader] != "":
+			continue
+		default:
+			uncovered = append(uncovered, reader)
+		}
+	}
+	for name := range covered {
+		unknown = append(unknown, name)
+	}
+	sort.Strings(uncovered)
+	sort.Strings(unknown)
+
+	if len(uncovered) > 0 {
+		t.Errorf("no row crosses %s with a subscription that came back from a resume: "+
+			"add one to resumedDoors, or say in doorsThatAreNotFilters why it is not a filter",
+			strings.Join(uncovered, ", "))
+	}
+	if len(unknown) > 0 {
+		t.Errorf("resumedDoors names %s, and nothing in this package reads wantsGroups() there: "+
+			"the row is covering nothing", strings.Join(unknown, ", "))
+	}
+}
+
+// groupFilterReaders is every function in the package's production files that calls
+// `wantsGroups()`, named by the function it sits in.
+//
+// The directory and not this file: `wantsGroups()` is a method on a package-scoped type,
+// a new door lands in whichever file its event handler lives in, and a fence that parsed
+// one file would go green on exactly the addition it exists to catch.
+func groupFilterReaders(t *testing.T) []string {
+	t.Helper()
+
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read the package directory: %v", err)
+	}
+	fset := token.NewFileSet()
+	seen := map[string]bool{}
+	var readers []string
+	parsed := 0
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(fset, name, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		parsed++
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Body == nil || fn.Name.Name == "wantsGroups" {
+				continue
+			}
+			ast.Inspect(fn.Body, func(node ast.Node) bool {
+				call, ok := node.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				selector, ok := call.Fun.(*ast.SelectorExpr)
+				if !ok || selector.Sel.Name != "wantsGroups" {
+					return true
+				}
+				if !seen[fn.Name.Name] {
+					seen[fn.Name.Name] = true
+					readers = append(readers, fn.Name.Name)
+				}
+				return true
+			})
+		}
+	}
+	if parsed == 0 {
+		t.Fatal("parsed no production file, so this fence is asserting over nothing")
+	}
+	if len(readers) == 0 {
+		t.Fatal("found no caller of wantsGroups() in the package, which cannot be true while the filters exist")
+	}
+	sort.Strings(readers)
+	return readers
 }
