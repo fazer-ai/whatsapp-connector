@@ -35,6 +35,10 @@ func TestTheContractSaysWhatBoundsACommandWithNoCeilingOfItsOwn(t *testing.T) {
 			"which #165 measured to be false: the library bounds every request it sends")
 	}
 
+	// The whole ceiling section, from the sentence that introduces the two caller fields to
+	// the one telling a client to time the reply out itself. Starting at "neither field"
+	// was the first cut, and it left the sentence introducing the section outside the run,
+	// where it went on contradicting the paragraphs under it with nothing reading it.
 	paragraphs := theCeilingRun(t, prose)
 	if len(paragraphs) == 0 {
 		t.Fatal("no paragraph in PROTOCOL.md talks about a command with neither field, so " +
@@ -47,6 +51,14 @@ func TestTheContractSaysWhatBoundsACommandWithNoCeilingOfItsOwn(t *testing.T) {
 		phrase string
 		why    string
 	}{
+		// And the sentence above the run, which introduces it. #287 fixed the bold lead and
+		// left this one saying the connector bounds the command, so the contradiction just
+		// moved up a paragraph. The clause is here rather than in a run of its own because
+		// the sentence's whole job is to hand off to what follows.
+		{"the sentence introducing the run", "something the caller did not\nchoose",
+			"it said the connector bounds the command while the paragraph under it says the " +
+				"ceiling is the library's, which is the same contradiction #287 removed one " +
+				"sentence lower"},
 		// The bold lead specifically, not just the body. It said "bounded by the connector"
 		// while the sentence under it explained the ceiling is the library's, and the
 		// verifier's report on #281 pointed out that the lead is what a client skimming
@@ -119,7 +131,7 @@ func theCeilingRun(t *testing.T, prose string) []string {
 	all := strings.Split(prose, "\n\n")
 	first, last := -1, -1
 	for i, paragraph := range all {
-		if first < 0 && strings.Contains(paragraph, "neither field") {
+		if first < 0 && strings.Contains(paragraph, "carries two different ceilings") {
 			first = i
 		}
 		if strings.Contains(paragraph, "its own timeout on the reply") {
@@ -127,8 +139,8 @@ func theCeilingRun(t *testing.T, prose string) []string {
 		}
 	}
 	if first < 0 {
-		t.Fatal("no paragraph in PROTOCOL.md talks about a command with neither field, so " +
-			"the obligation this test is about is not stated anywhere a client reads")
+		t.Fatal("the paragraph that opens the ceiling section is gone, so the run has no " +
+			"start anchor and none of the clauses below would be read")
 	}
 	if last < 0 {
 		t.Fatal("the paragraph that ends the run, the one telling a client to time out the " +

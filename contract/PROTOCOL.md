@@ -18,8 +18,8 @@ JSON-encoded).
 reaches its owner late is dropped unrun, answered `expired`. `max_runtime_ms` is a
 duration, measured from the moment the work begins, and says *do not let this run longer
 than that*; it says nothing about arriving late. A command carrying both gets whichever
-runs out first, and one carrying neither is bounded by the connector rather than by the
-caller.
+runs out first, and one carrying neither is bounded by something the caller did not
+choose, which the next paragraph names.
 
 The distinction exists because a teardown needs one without the other: a `session.logout`
 dropped for arriving late is a device left linked on somebody's phone with nothing saying
