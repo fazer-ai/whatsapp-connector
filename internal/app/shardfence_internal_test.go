@@ -72,9 +72,26 @@ func TestNoTestInThisPackageCarriesItsOwnShardCount(t *testing.T) {
 			}
 			// Any literal, not only an INT one. `redisx.NewKeys("wa:", 'a')` compiles,
 			// because a rune is assignable to `int`, and it builds a layout counting 97
-			// streams: measured, it sends this package's `...0002` to `wa:events:83`.
-			// Restricting this to INT let that through, and no other literal kind
-			// compiles in that position, so the restriction bought nothing.
+			// streams: measured, it sends this package's `...0002` to `wa:events:83`,
+			// and an INT-only check let that through.
+			//
+			// Measured, what compiles in that position is every INT spelling, a CHAR,
+			// and a FLOAT or IMAG whose value is a whole number (`4.0`, `1e1`, `0i` do;
+			// `4.5` and `4i` do not). Only a STRING is impossible. So the restriction was
+			// not excluding anything that had a right to be there, which is what makes
+			// deleting it the whole fix rather than a widening with a cost.
+			//
+			// The exception below is a spelling and not a value, so zero written another
+			// way (`00`, `0x0`, `0.0`) is reported. That is the message this fence wants
+			// to send anyway: it asks for `0`, and the ten layouts in this package that
+			// name no shard all write it that way.
+			//
+			// What still gets through is not a literal at all. `(4)`, `+4`, `4+0` and
+			// `int(4)` carry the count past this check, each measured, because none of
+			// them is a `BasicLit`. Closing that means folding constants through
+			// `go/types` rather than reading the syntax, which is a different instrument
+			// for a shape nobody writes by accident; the rune was worth closing because
+			// the fence already looked at exactly that node.
 			literal, ok := call.Args[at].(*ast.BasicLit)
 			if !ok || literal.Value == "0" {
 				return true
