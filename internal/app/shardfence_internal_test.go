@@ -87,16 +87,19 @@ func TestNoTestInThisPackageCarriesItsOwnShardCount(t *testing.T) {
 			// The exception below is a spelling and not a value, so zero written another
 			// way is reported: measured, `00`, `0x0` and `0.0` each are, and `0` is not.
 			// That is the message this fence wants to send anyway, since it asks for `0`,
-			// and every layout here that names no shard is written that way.
+			// and every layout here that is built with no count is written that way.
 			//
 			// What still gets through is not a literal at all. `(4)`, `+4`, `4+0` and
 			// `int(4)` carry the count past this check, each measured, because none of
 			// them is a `BasicLit`. Closing that means folding constants through
-			// `go/types` rather than reading the syntax, which is a different instrument
-			// for a shape this package does not contain: every count written here is
-			// either `0`, or `DefaultEventShards`, or a name bound to what the fleet
-			// recorded. The rune was worth closing because the fence was already looking
-			// at exactly that node.
+			// `go/types` instead of reading the syntax, and folding does not stop where
+			// this fence stops. Measured on the same four: it reports each as the
+			// constant 4, and it reports `DefaultEventShards*2` as the constant 32,
+			// which is the derived value the rule above deliberately allows; a count
+			// read from the fleet folds to nothing and would stay allowed. So the
+			// instrument that closes the hole also closes the door, for a shape no key
+			// layout in this package is built with. The rune was worth closing because
+			// the fence was already looking at exactly that node.
 			literal, ok := call.Args[at].(*ast.BasicLit)
 			if !ok || literal.Value == "0" {
 				return true
