@@ -70,8 +70,13 @@ func TestNoTestInThisPackageCarriesItsOwnShardCount(t *testing.T) {
 			if at < 0 {
 				return true
 			}
+			// Any literal, not only an INT one. `redisx.NewKeys("wa:", 'a')` compiles,
+			// because a rune is assignable to `int`, and it builds a layout counting 97
+			// streams: measured, it sends this package's `...0002` to `wa:events:83`.
+			// Restricting this to INT let that through, and no other literal kind
+			// compiles in that position, so the restriction bought nothing.
 			literal, ok := call.Args[at].(*ast.BasicLit)
-			if !ok || literal.Kind != token.INT || literal.Value == "0" {
+			if !ok || literal.Value == "0" {
 				return true
 			}
 			t.Errorf("%s:%d builds a key layout carrying its own shard count of %s.\n"+
