@@ -686,12 +686,22 @@ func (c *Connector) resumeOnce(ctx context.Context) {
 		// The mark is taken before the attempt, and taking it is what wins the turn: two
 		// instances reading the same free account in the same second would otherwise both
 		// adopt, and the loser's adoption is an account handed straight back.
-		won, err := c.client.SetNX(pass, c.client.Keys().Resume(sid), c.cfg.Instance, resumeCooloff).Result()
-		if err != nil {
+		//
+		// `SET NX GET` rather than `SETNX`, so that a turn already taken hands back who has
+		// it in the same round trip, which is the only other thing worth knowing about it.
+		// Asking separately would be a second command on every contended account, and the
+		// value it read could be a different one from the value that blocked the write.
+		// `redis.Nil` is the win: `GET` on a key that did not exist answers nil, and the
+		// mark is never written empty, so a holder that comes back is always a real name.
+		holder, err := c.client.SetArgs(pass, c.client.Keys().Resume(sid), c.cfg.Instance,
+			redis.SetArgs{Mode: "NX", TTL: resumeCooloff, Get: true}).Result()
+		switch {
+		case errors.Is(err, redis.Nil):
+			// Nobody held it, and now this instance does.
+		case err != nil:
 			c.log.Warn().Err(err).Str("sid", sid).Msg("could not take the turn to bring a session back")
 			return
-		}
-		if !won && !c.tookTurnFromAnInstanceThatIsGone(pass, sid) {
+		case !c.tookTurnFromAnInstanceThatIsGone(pass, sid, holder):
 			continue
 		}
 		if c.manager.Resume(sid, subscription[sid]) {
@@ -703,6 +713,10 @@ func (c *Connector) resumeOnce(ctx context.Context) {
 
 // tookTurnFromAnInstanceThatIsGone takes the resume turn of an account whose turn belongs
 // to an instance that is no longer in the fleet, and reports whether it got it.
+//
+// `holder` is the name the caller's own write handed back, not one this function goes and
+// reads: a second read could answer about a different holder from the one that blocked the
+// write, and then the decision would be about a turn nobody is in.
 //
 // The mark paces retries, and it does that by naming whoever is trying. When that instance
 // dies the name stops meaning anything, but the mark keeps standing for the rest of its
@@ -722,18 +736,8 @@ func (c *Connector) resumeOnce(ctx context.Context) {
 // arbitrates and the loser hands its adoption straight back. Two attempts, never two
 // sockets on one account. Weighed against an account nobody may touch for the rest of a
 // minute, on the path where the fleet has just lost a process, it is worth it.
-func (c *Connector) tookTurnFromAnInstanceThatIsGone(ctx context.Context, sid string) bool {
+func (c *Connector) tookTurnFromAnInstanceThatIsGone(ctx context.Context, sid, holder string) bool {
 	mark := c.client.Keys().Resume(sid)
-	holder, err := c.client.Get(ctx, mark).Result()
-	switch {
-	case errors.Is(err, redis.Nil):
-		// Expired between the SETNX and this read. The next pass finds it free, which is
-		// the outcome this function is for, so there is nothing to take here.
-		return false
-	case err != nil:
-		c.log.Warn().Err(err).Str("sid", sid).Msg("could not read who holds the turn for a session")
-		return false
-	}
 	if holder == c.cfg.Instance {
 		// This instance's own turn, from a pass that has not finished with it. Not a
 		// stranger's to take, and not a reason to start a second attempt behind the first.
