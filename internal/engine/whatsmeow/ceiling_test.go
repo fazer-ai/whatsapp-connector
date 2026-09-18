@@ -291,6 +291,14 @@ func releasedChannels(file *ast.File) map[token.Pos]bool {
 			if _, handedAway := inner.(*ast.GoStmt); handedAway {
 				return false
 			}
+			// And a nested function literal, which round 2 of the review found going the
+			// other way round the same hole: `worker := func() { done <- struct{}{} }`
+			// followed by `go worker()` put the send in the enclosing function's deposits
+			// although it runs in another goroutine. A literal is walked as a function of
+			// its own by the outer Inspect, so skipping it here loses nothing.
+			if _, nested := inner.(*ast.FuncLit); nested && inner != ast.Node(body) {
+				return false
+			}
 			if send, ok := inner.(*ast.SendStmt); ok {
 				if name := channelName(send.Chan); name != "" {
 					deposited[name] = true

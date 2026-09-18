@@ -72,6 +72,12 @@ func TestTheContractSaysWhatBoundsACommandWithNoCeilingOfItsOwn(t *testing.T) {
 			"it is the only thing a client can actually do about it"},
 		{"the socket write it does not cover", "not interruptible",
 			"a client would otherwise read `timeout` as proof WhatsApp was asked"},
+		{"the retried send it does not cover", "retried once the connection is back",
+			"round 2 of the review measured this one: whatsmeow retries an interrupted " +
+				"send with a zero timeout, which switches its timer off, so the claim that " +
+				"nothing runs forever was false as written"},
+		{"that both are unbounded, not merely slow", "not bounded",
+			"`covered` and `slower` are what this would degrade into"},
 	} {
 		if !strings.Contains(found, clause.phrase) {
 			t.Errorf("the paragraph about a command with neither field does not say %s (%q): %s",
