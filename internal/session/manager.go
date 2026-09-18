@@ -1150,6 +1150,18 @@ func (m *Manager) adoptedToDelete(sid string, session *Session) {
 // also the only thing that walks the list, so it is where a registration whose session is
 // already gone is dropped.
 //
+// What it does not cover is #259, and the shape of that is worth having here. Between the
+// refusal arming an account and this pass releasing it, this instance owns the account and
+// carries no mark, so a peer reading a `session.wake` for it is told the ordinary
+// `not_owner` and acknowledges it -- measured the same on the base, where the wake is lost
+// just as it is here. What the hand-back adds is the line after: the account is then
+// nobody's, and a `session.connect` for an account nobody runs is left pending, where an
+// instance still holding it would have served it. Closing that means writing the mark when
+// the refusal decides rather than when the release happens, which turns "I am letting this
+// go now" into "I mean to", and a mark that means the second one needs an undoing for
+// every way the hand-back is called off -- none of which exists in `internal/cluster`,
+// where a release and a winning acquire are the only two things that clear it.
+//
 // An account is given back only while it is still the session that was adopted and still
 // has answered nothing but that teardown. Both clauses guard the same thing from two
 // sides: the account may have been handed back and taken again under this instance, in
