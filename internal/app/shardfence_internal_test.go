@@ -75,23 +75,28 @@ func TestNoTestInThisPackageCarriesItsOwnShardCount(t *testing.T) {
 			// streams: measured, it sends this package's `...0002` to `wa:events:83`,
 			// and an INT-only check let that through.
 			//
-			// Measured, what compiles in that position is every INT spelling, a CHAR,
-			// and a FLOAT or IMAG whose value is a whole number (`4.0`, `1e1`, `0i` do;
-			// `4.5` and `4i` do not). Only a STRING is impossible. So the restriction was
-			// not excluding anything that had a right to be there, which is what makes
-			// deleting it the whole fix rather than a widening with a cost.
+			// The compiler takes a literal here on its value, not on its kind: what
+			// compiles is any literal whose constant value is representable as an `int`,
+			// whichever family it is written in. Measured: `4`, `0x10`, `'a'`, `4.0`,
+			// `1e1` and `0i` compile; `4.5`, `4i`, `1e100` and an integer past the word
+			// size are all rejected, and rejected for their value. The one family that
+			// never compiles here is STRING, whatever it holds. So the INT restriction
+			// was not keeping out anything that had a right to be there, which is what
+			// makes deleting it the whole fix rather than a widening with a cost.
 			//
 			// The exception below is a spelling and not a value, so zero written another
-			// way (`00`, `0x0`, `0.0`) is reported. That is the message this fence wants
-			// to send anyway: it asks for `0`, and the ten layouts in this package that
-			// name no shard all write it that way.
+			// way is reported: measured, `00`, `0x0` and `0.0` each are, and `0` is not.
+			// That is the message this fence wants to send anyway, since it asks for `0`,
+			// and every layout here that names no shard is written that way.
 			//
 			// What still gets through is not a literal at all. `(4)`, `+4`, `4+0` and
 			// `int(4)` carry the count past this check, each measured, because none of
 			// them is a `BasicLit`. Closing that means folding constants through
 			// `go/types` rather than reading the syntax, which is a different instrument
-			// for a shape nobody writes by accident; the rune was worth closing because
-			// the fence already looked at exactly that node.
+			// for a shape this package does not contain: every count written here is
+			// either `0`, or `DefaultEventShards`, or a name bound to what the fleet
+			// recorded. The rune was worth closing because the fence was already looking
+			// at exactly that node.
 			literal, ok := call.Args[at].(*ast.BasicLit)
 			if !ok || literal.Value == "0" {
 				return true
