@@ -86,6 +86,7 @@ func TestTheKeepAliveStateCarriesTheDispatchInstantToThePublishSide(t *testing.T
 	// `Round(0)` is the documented way to strip the reading, and `==` on time.Time compares
 	// it, so a value that still has one cannot equal its own stripped copy. `Equal` would
 	// not do: it compares instants and ignores exactly what is under test here.
+	//nolint:staticcheck // QF1009 suggests Equal, which is the one comparison that cannot answer this: it compares instants and ignores the monotonic reading under test
 	if state.decided == state.decided.Round(0) {
 		t.Error("the decision instant reached the publish side with no monotonic reading, so the distance is measured against the wall clock: " +
 			"a clock adjustment inside the window it exists to show would be added to the measurement, and nothing would report that it had been")
