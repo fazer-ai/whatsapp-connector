@@ -19,9 +19,9 @@ import (
 // error and no warning. That is what #269 was: the test client counted eight streams
 // while the connector published to sixteen, four of the eight sids in `app_test.go` fell
 // on the disagreeing side, and all three tests that read events happened to hold a sid
-// from the agreeing half. (Four of eight is the count for that file, which is where those
-// tests live; the package as a whole names twenty-five sids and twelve of them disagree.) Green by luck, and the next test written would have drawn from the same
-// hat.
+// from the agreeing half. Four of eight is the count for that file, which is where those
+// tests live; the package as a whole names more sids, and more of them disagree. Green by
+// luck, and the next test written would have drawn from the same hat.
 //
 // So the rule is not "use the right number", it is "do not carry a number at all". A key
 // layout in a test names command streams, the control stream, reply lists and `wa:meta`,
@@ -96,12 +96,12 @@ func TestNoTestInThisPackageCarriesItsOwnShardCount(t *testing.T) {
 			// `go/types` instead of reading the syntax, and folding does not stop where
 			// this fence stops. Measured: it reports each of those four as the constant
 			// 4, and it reports `DefaultEventShards` as the constant 16, which is the
-			// name this fence exists to make people write and the one most counts here
-			// are written as. Erasing the difference between naming the one home and
-			// carrying the number is what folding is for, and that difference is the
-			// whole rule, so a fence built on it would report the idiom it asks for. The
-			// one thing folding still separates is a count read from the fleet, which
-			// folds to nothing. So the instrument that closes the hole closes the rule
+			// name this fence exists to make people write. That is the same constant it
+			// reports for a bare `16`, measured side by side: after folding, naming the
+			// one home and carrying the number are the same expression, and telling them
+			// apart is the whole rule, so a fence built on it would report the idiom it
+			// asks for. The one thing folding still separates is a count read from the
+			// fleet, which folds to nothing. So the instrument that closes the hole closes the rule
 			// with it, and the hole is a shape no key layout here is built with. The
 			// rune was worth closing because the fence was already looking at exactly
 			// that node.
