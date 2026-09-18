@@ -79,6 +79,7 @@ func TestNoRequestToWhatsAppGivesUpItsOwnCeiling(t *testing.T) {
 	t.Parallel()
 
 	fset, files, _ := theSourceOfThisPackage(t)
+	declared := declaredValues(files)
 	found := 0
 	for _, file := range files {
 		ast.Inspect(file, func(node ast.Node) bool {
@@ -96,7 +97,7 @@ func TestNoRequestToWhatsAppGivesUpItsOwnCeiling(t *testing.T) {
 					continue
 				}
 				found++
-				if positiveDuration(pair.Value) {
+				if positiveDuration(pair.Value, declared) {
 					continue
 				}
 				t.Errorf("%s: %s is written with a value that is not a positive duration, "+
@@ -121,29 +122,71 @@ func TestNoRequestToWhatsAppGivesUpItsOwnCeiling(t *testing.T) {
 // two ways of giving the bound up that are spelled in the expression itself, and both are
 // caught, through `30 * time.Second` and through parentheses.
 //
-// What it does not do is resolve a name. `Timeout: turnedOff`, with the constant declared a
-// few lines up, and `Timeout: whatever`, with a variable, both come back positive and pass.
-// That is a gap and it is the deliberate half of the trade: closing it means a constant
-// folder or a full type-checked load of the package, and the failure mode of getting either
-// slightly wrong is a fence that reports a bound where there is none, which is worse than one
-// whose reach is written down. The reach is written down here, and #165's PR reports which
-// forms were planted and which were caught.
-func positiveDuration(value ast.Expr) bool {
+// It also follows a name to its declaration, one hop, because a named constant is how every
+// other timeout in this package is spelled and a fence that missed `Timeout: turnedOff` would
+// have a hole exactly where the natural spelling is. The hop is package level `const` and
+// `var` with an initialiser, which is what `declaredValues` collects.
+//
+// Where it stops: a name declared inside a function, a value that arrives through a parameter
+// or a return, and any arithmetic that needs evaluating rather than reading. Those come back
+// positive and pass. Closing that would mean a type-checked load of the package, and a fence
+// that reports a bound where there is none is worse than one whose reach is written down.
+func positiveDuration(value ast.Expr, declared map[string]ast.Expr) bool {
 	switch typed := value.(type) {
 	case *ast.BasicLit:
 		return typed.Kind == token.INT && typed.Value != "0"
 	case *ast.UnaryExpr:
 		// `-x` is the documented way to switch whatsmeow's timeout off.
-		return typed.Op != token.SUB && positiveDuration(typed.X)
+		return typed.Op != token.SUB && positiveDuration(typed.X, declared)
 	case *ast.BinaryExpr:
 		// `30 * time.Second`, and the only way to make that not positive is a negative
 		// operand, which the recursion catches.
-		return positiveDuration(typed.X) && positiveDuration(typed.Y)
-	case *ast.SelectorExpr, *ast.Ident, *ast.CallExpr, *ast.ParenExpr:
+		return positiveDuration(typed.X, declared) && positiveDuration(typed.Y, declared)
+	case *ast.ParenExpr:
+		return positiveDuration(typed.X, declared)
+	case *ast.Ident:
+		// One hop, and only to a package level declaration. The name is removed from the
+		// map on the way down so a declaration that refers to itself ends the walk rather
+		// than the test.
+		behind, ok := declared[typed.Name]
+		if !ok {
+			return true
+		}
+		delete(declared, typed.Name)
+		defer func() { declared[typed.Name] = behind }()
+		return positiveDuration(behind, declared)
+	case *ast.SelectorExpr, *ast.CallExpr:
 		return true
 	default:
 		return false
 	}
+}
+
+// declaredValues is every package level `const` and `var` that has an initialiser, by name,
+// so `positiveDuration` can follow one. Collected over the whole package rather than the one
+// file, because the constant and the request that uses it do not have to share a file.
+func declaredValues(files []*ast.File) map[string]ast.Expr {
+	values := map[string]ast.Expr{}
+	for _, file := range files {
+		for _, decl := range file.Decls {
+			general, ok := decl.(*ast.GenDecl)
+			if !ok || (general.Tok != token.CONST && general.Tok != token.VAR) {
+				continue
+			}
+			for _, spec := range general.Specs {
+				valued, ok := spec.(*ast.ValueSpec)
+				if !ok {
+					continue
+				}
+				for i, name := range valued.Names {
+					if i < len(valued.Values) {
+						values[name.Name] = valued.Values[i]
+					}
+				}
+			}
+		}
+	}
+	return values
 }
 
 func rendered(pair *ast.KeyValueExpr) string {
