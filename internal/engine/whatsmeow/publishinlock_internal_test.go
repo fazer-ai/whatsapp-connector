@@ -72,8 +72,13 @@ func TestTheKeepAliveArmHoldsTheTransitionLockAcrossThePublish(t *testing.T) {
 				"as the publish takes, and the arm that decides a socket is gone no longer waits behind it")
 		}
 
-		// Drain one, let the arm finish, and confirm the lock comes back: a test that only
-		// showed the lock held would pass against an arm that never releases it.
+		// Drain one, let the arm finish, and confirm the lock comes back. This is not
+		// symmetry with the assertion above: it is the case in which that assertion would
+		// go green over a session that is wedged. An arm that takes the lock and never
+		// releases it satisfies "the lock is held across the publish" forever, and
+		// `session.status` and the stream then agree for the rest of the session's life
+		// because nothing else can move -- which is a worse way for this invariant to be
+		// broken than the one the first assertion catches, and the only one it cannot see.
 		<-s.inbox
 		synctest.Wait()
 		<-returned
