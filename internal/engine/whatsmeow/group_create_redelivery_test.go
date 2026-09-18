@@ -756,4 +756,10 @@ func TestAStoreThatFailedDuringTheWaitIsNotReportedAsUnsettled(t *testing.T) {
 	if strings.Contains(err.Error(), "not settled yet") {
 		t.Fatalf("a store failure was reported as %q, which says the wait ran its course", err)
 	}
+	// And the code, which is what a client branches on. The sentence above is ours; this is
+	// the client's, and `not_settled` promises an outcome that settles itself, while a store
+	// that stopped answering settles when somebody fixes it.
+	if got := codeOf(err); got == protocol.ErrorNotSettled {
+		t.Fatalf("a store failure answered %q, and a client reading it retries forever against a store that is down", got)
+	}
 }

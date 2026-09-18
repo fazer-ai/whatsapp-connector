@@ -74,6 +74,22 @@ keeps `timeout`. A client that treats `not_attempted` as final leaves a device l
 that no later command can remove, because the credentials that would sign the unlink are
 the ones the teardown would have thrown away.
 
+**A `group.create` whose outcome is not decided yet answers `not_settled`, and a client
+should ask again in a moment.** Two requests for a group of the same name, both still
+open, make a group on WhatsApp that is evidence for either and proof for neither.
+Answering one of them with it would hand that request the other's conversation and skip
+the creation it asked for, so the connector refuses until WhatsApp's own notification
+names which request made which group, which arrives on its own and usually within
+seconds. This is the third answer about time and it is not either of the other two:
+`timeout` says nobody here can tell and nothing afterwards will, `not_attempted` says the
+request never went out, and `not_settled` says it did, the outcome exists, and the
+connector will know which one it is shortly. Retrying with the same `idempotency_key` is
+correct and is the point: a command that failed is not recorded, so the key answers
+nothing and the retry runs, and the retry is what collects the group the first attempt
+made rather than making a second one. A client that treats it as final leaves the
+operator with a group nobody's conversation points at; a client that treats it as
+`internal` pages somebody for a case that settles itself.
+
 **Both ceilings bound the wait on WhatsApp, not the bookkeeping that follows it.** Once a
 teardown's unlink has been answered, the connector finishes deleting the credentials, the
 device mapping and the session's epoch counter on a bound of its own, and a ceiling that
