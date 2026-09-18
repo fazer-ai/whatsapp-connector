@@ -81,6 +81,16 @@ type Session struct {
 	// given up on afresh while an answer about the one before is on its way, and a door
 	// opened by that older answer is a session marked retired and taking commands.
 	shutFor uint64
+	// accepted counts the deliveries this session has taken and not yet finished with,
+	// from the instant `Offer` puts one in the channel to the instant it is answered,
+	// released or abandoned.
+	//
+	// The queue's length and `running` answer that question everywhere except in the gap
+	// between them: the executor takes a delivery out of the channel and then calls
+	// `admit`, and a preemption in between leaves an accepted command that is in neither
+	// -- an empty queue, nothing running, and a client waiting. That is the state the
+	// hand-back must not read as idle.
+	accepted int
 	// refused says a command was turned away while the door was shut, which is what the
 	// drain the reopening schedules is for.
 	refused bool
@@ -283,6 +293,7 @@ func (s *Session) Offer(delivery *transport.Delivery) Offer {
 	// manager stamps for the commands it answers itself, so the two halves of the same
 	// histogram measure the same span.
 	case s.commands <- queued{delivery: delivery, at: s.now()}:
+		s.accepted++
 		return OfferAccepted
 	default:
 		return OfferBusy
@@ -303,6 +314,7 @@ func (s *Session) abandonQueue() {
 	for {
 		select {
 		case waiting := <-s.commands:
+			s.finishedWith()
 			if waiting.delivery.Release != nil {
 				waiting.delivery.Release()
 			}
@@ -544,14 +556,24 @@ func (s *Session) admit() bool {
 	s.queueMu.Lock()
 	defer s.queueMu.Unlock()
 	if s.stopping {
+		s.accepted--
 		return false
 	}
 	if s.shutFor != 0 {
 		s.refused = true
+		s.accepted--
 		return false
 	}
 	s.running++
 	return true
+}
+
+// finishedWith counts out a delivery this session took and will not be answering: the
+// executor released it at the door, or the queue was abandoned with it still waiting.
+func (s *Session) finishedWith() {
+	s.queueMu.Lock()
+	s.accepted--
+	s.queueMu.Unlock()
 }
 
 // doneWith is the other end of `admit`: the command has been answered, and the session is
@@ -559,6 +581,7 @@ func (s *Session) admit() bool {
 func (s *Session) doneWith() {
 	s.queueMu.Lock()
 	s.running--
+	s.accepted--
 	s.queueMu.Unlock()
 }
 
@@ -581,28 +604,31 @@ func (s *Session) leaving() bool {
 // The sibling of `claim` below, for an account adopted to serve a teardown that was
 // refused before it ran: nothing about the engine ended, so that session was never
 // retired and `claim` would always say no. What has to be true is the same in spirit --
-// nothing is running and the door is not already shut -- with one clause `claim` has no
-// use for: nothing may be *waiting* either, and the count the caller decided on has to
-// still be the count. A command on the queue is somebody who wants this account, and one
-// that was answered between the caller's look and this one leaves no trace in `running` or
-// in the queue at all -- it is finished -- so the count is the only place it shows.
+// the door is not already shut, and nothing this session took is unfinished -- with one
+// clause `claim` has no use for: the count the caller decided on has to still be the
+// count. A command that was answered between the caller's look and this one leaves no
+// trace in what is outstanding at all -- it is finished -- so the count is the only place
+// it shows.
 //
-// The queue clause cannot be reached through a running session, and is asked about
-// directly instead of argued for: every seam this package has for holding an executor --
-// `Hold`, `HoldUntilCanceled`, `OnDelete` -- blocks inside `Execute`, which is past the
-// point where the command has been counted and `running` is above zero, and nothing runs
-// between `Offer` putting a delivery in the channel and the executor taking it out. So the
-// predicate has a test of its own, on a session built by hand with no executor to race.
+// Outstanding and not "running, or on the queue", and the difference is a state those two
+// cannot see between them. The executor takes a delivery out of the channel and calls
+// `admit` after, so a preemption in between leaves a command that has left the queue and
+// not yet been counted as running: an empty channel, nothing running, a count that has not
+// moved, and a client waiting on a session about to be stopped underneath it. Counted from
+// the instant `Offer` puts the delivery in the channel, under the same lock, there is no
+// in-between to be preempted in.
 //
-// Dropping the clause would not lose the command: `abandonQueue` releases what is waiting
-// and it comes back pending. What it buys is a client's command not taking a claim delay
-// on the way to an account this instance was about to keep for it, and a teardown still on
-// the queue not being handed back to the fleet that just adopted the account for it.
+// Dropping the clause would not lose the command: it is released and comes back pending.
+// What it buys is a client's command not taking a claim delay on the way to an account
+// this instance was about to keep for it, and a teardown still on the queue not being
+// handed back to the fleet that just adopted the account for it. Since #259 it buys more
+// than that -- an account handed back is one a connect cannot reach until a wake -- which
+// is why the state above is worth closing rather than arguing away.
 func (s *Session) claimIdle(carried int64) bool {
 	s.queueMu.Lock()
 	defer s.queueMu.Unlock()
 
-	if s.stopping || s.shutFor != 0 || s.running > 0 || len(s.commands) > 0 {
+	if s.stopping || s.shutFor != 0 || s.accepted > 0 {
 		return false
 	}
 	// Asked here and not only by the caller, and this is the clause that makes the other

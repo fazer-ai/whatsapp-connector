@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -920,5 +921,88 @@ func TestNoWayOutOfTheSessionMapLeavesARegistrationBehind(t *testing.T) {
 				t.Fatal("an account whose session left the map is still listed to be handed back; the entry and the stopped session it holds outlive every account they were about, and nothing else ever walks this list")
 			}
 		})
+	}
+}
+
+// A peer retires the one wake for an account this instance is about to give back, and
+// this pins that it does, because #259 is the change that will make it stop.
+//
+// Between the refusal arming an account and the heartbeat releasing it, this instance owns
+// the account and has written no mark, so a peer's `Acquire` is answered with the ordinary
+// `not_owner` and the wake is acknowledged rather than left pending. Measured the same on
+// `185ba8f`, so the wake is lost with or without the hand-back. What the hand-back adds is
+// what comes after: on the base the account stayed here and a `session.connect` for it was
+// served by the session still in the map, and once it goes back that connect is released
+// and left pending for an owner that only another wake will produce -- measured `acked=1
+// released=1` against `acked=0 released=2`.
+//
+// Asserting what the connector does today rather than what it should do, which is worth
+// saying out loud: the fix for #259 turns the acknowledgement below into a release, and
+// this test is meant to go red when it does.
+func TestAPeerRetiresTheWakeForAnAccountAboutToGoBack(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+	ctx := context.Background()
+
+	instance := func(name string) *Manager {
+		manager := NewManager(&ManagerConfig{
+			Instance: name, Engine: fake.New(),
+			Leases:    cluster.NewLeases(client, name, cluster.Options{}),
+			Publisher: quietPublisher{}, Replier: quietReplier{},
+			NewID: func() string { return "evt" }, Logger: zerolog.New(io.Discard),
+		})
+		t.Cleanup(func() { manager.StopAll(ctx) })
+		answering, stopAnswering := context.WithCancel(ctx)
+		stopped := manager.Answer(answering)
+		t.Cleanup(func() { stopAnswering(); <-stopped })
+		return manager
+	}
+	holder, peer := instance("inst-a"), instance("inst-b")
+
+	const sid = "sess-registry-peerwake"
+	acked := make(chan struct{})
+	holder.Dispatch(&transport.Delivery{
+		Command: protocol.Command{
+			V: protocol.Version, Type: protocol.CommandSessionDelete, SID: sid, ID: "c-peerwake",
+			Deadline: time.Now().Add(-time.Minute).UnixMilli(),
+		},
+		Ack:     func(context.Context) error { close(acked); return nil },
+		Release: func() {}, Forfeit: func() {},
+	})
+	select {
+	case <-acked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("given: the teardown was never acknowledged")
+	}
+	settled(t, holder, sid, armed)
+
+	// The peer reads the wake off the control stream while this instance still owns the
+	// account, which is the whole of the window.
+	var wakeAcked, wakeReleased, wakeForfeited atomic.Int64
+	peer.Dispatch(&transport.Delivery{
+		Command: protocol.Command{V: protocol.Version, Type: protocol.CommandSessionWake, SID: sid, ID: "c-wake"},
+		Ack:     func(context.Context) error { wakeAcked.Add(1); return nil },
+		Release: func() { wakeReleased.Add(1) },
+		Forfeit: func() { wakeForfeited.Add(1) },
+	})
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && wakeAcked.Load()+wakeReleased.Load()+wakeForfeited.Load() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	if wakeAcked.Load() != 1 {
+		t.Fatalf("the peer no longer retires the wake: acked=%d released=%d forfeited=%d. If #259 is what changed this, the account now keeps the ask that would start it and this test has served its purpose",
+			wakeAcked.Load(), wakeReleased.Load(), wakeForfeited.Load())
+	}
+	if peer.Count() != 0 {
+		t.Fatalf("the peer adopted an account this instance owns: %d running", peer.Count())
+	}
+
+	holder.RenewAll(ctx, time.Now().Add(time.Minute))
+	if holder.Count() != 0 {
+		t.Fatalf("the account was not given back: %d running", holder.Count())
 	}
 }
