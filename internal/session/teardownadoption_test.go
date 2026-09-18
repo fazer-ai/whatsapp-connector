@@ -73,6 +73,23 @@ func (h teardownHarness) heartbeat(t *testing.T) {
 	h.manager.SweepRetired(context.Background(), by)
 }
 
+// handedBack ticks until the account has gone back, and fails if it takes more than the
+// two ticks the design allows for.
+//
+// One tick is the ordinary case and the design's promise, and it is not something a test
+// can demand in one line: the executor finishes with the refusal, tells the manager, and
+// only then is the account on the list, while the client's answer went out a moment
+// earlier. A tick that lands in between is correct and takes the account on the next one.
+func (h teardownHarness) handedBack(t *testing.T) {
+	t.Helper()
+	for range 2 {
+		h.heartbeat(t)
+		if h.manager.Count() == 0 {
+			return
+		}
+	}
+}
+
 func (h teardownHarness) epoch(t *testing.T, sid string) string {
 	t.Helper()
 	value, err := h.server.Get(h.keys.LeaseEpoch(sid))
@@ -581,5 +598,48 @@ func TestAWakeKeepsAnAccountTheHandBackWasAboutToTake(t *testing.T) {
 	}
 	if _, owned := h.leases.Owned(sid); !owned {
 		t.Fatal("the lease went back under an account a wake had just taken")
+	}
+}
+
+// TestALateConnectRefusedDoesNotPinTheAccount is #249 reached by the door the fix itself
+// opened, and the reason the count is about what was carried out rather than what arrived.
+//
+// The hand-back stands down when somebody comes to use the account. A `session.connect`
+// that arrives after its own deadline is not somebody using the account: `carryOut` turns
+// it away before any work happens, exactly as it turned the teardown away, and the client
+// is told so. Counting it would leave an account nobody ever asked for adopted on this
+// instance for the life of the process, which is the defect this branch exists to remove.
+func TestALateConnectRefusedDoesNotPinTheAccount(t *testing.T) {
+	t.Parallel()
+	h := newTeardownHarness(t)
+	const sid = "sess-249-lateconnect"
+
+	h.manager.Dispatch(teardown(sid, "cmd-lc-delete", time.Now().Add(-time.Minute)))
+	if reply := h.answered(t, "cmd-lc-delete"); refusalCode(reply) != protocol.ErrorExpired {
+		t.Fatalf("given: got %q, want the late refusal", refusalCode(reply))
+	}
+
+	h.manager.Dispatch(&transport.Delivery{
+		Command: protocol.Command{
+			V: protocol.Version, Type: protocol.CommandSessionConnect, SID: sid, ID: "cmd-lc-connect",
+			ReplyTo:  "wa:reply:cmd-lc-connect",
+			Deadline: time.Now().Add(-time.Minute).UnixMilli(),
+			Payload:  []byte(`{}`),
+		},
+		Ack: func(context.Context) error { return nil },
+	})
+	if reply := h.answered(t, "cmd-lc-connect"); refusalCode(reply) != protocol.ErrorExpired {
+		t.Fatalf("given: the connect was supposed to be refused for arriving late, got %q", refusalCode(reply))
+	}
+	if opened, ok := h.engine.Session(sid); ok && opened.Connected() {
+		t.Fatal("given: the late connect was carried out; it was supposed to be refused before running")
+	}
+
+	h.handedBack(t)
+	if h.manager.Count() != 0 {
+		t.Fatalf("a command that was refused before it ran kept the account adopted: %d running. Nobody asked for this account and nothing will ever take it back", h.manager.Count())
+	}
+	if h.server.Exists(h.keys.Lease(sid)) {
+		t.Fatal("the lease is still held for an account nobody asked for")
 	}
 }

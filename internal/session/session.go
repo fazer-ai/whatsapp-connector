@@ -107,16 +107,24 @@ type Session struct {
 	resumeBad func()
 	wasOpen   bool
 
-	// teardownRefused reports a `session.delete` this session answered with a refusal,
-	// and carries the code so the caller can tell the refusals apart: this session knows
-	// why it said no, and only the manager knows whether the account was adopted to serve
-	// this very command. Nil outside the manager.
-	teardownRefused func(protocol.ErrorCode)
-	// carried counts the commands this session has answered, refusals included, and
-	// exists for exactly one reader: the manager gives an account back only while the
-	// teardown it adopted for is still the only thing that ran on it. A connect that
-	// landed behind the refusal makes this an account somebody wants up, and the count is
-	// how that is noticed without the manager having to watch the queue.
+	// afterCommand reports every command this session finished with, saying whether it
+	// was a teardown and what it answered. Both halves matter to the one caller there is:
+	// this session knows what it ran and why it said no, and only the manager knows
+	// whether the account was opened to serve that very teardown.
+	//
+	// Every command and not only the refusals, so that the manager's bookkeeping is
+	// ordered by the executor rather than by a count it polls: a client's command
+	// arriving while an adoption waits to be undone is the thing that must cancel the
+	// undoing, and this is where that is known first. Nil outside the manager.
+	afterCommand func(refusal protocol.ErrorCode, teardown bool)
+	// carried counts the commands this session actually carried out, and exists for one
+	// reader: the manager gives an account back only while nothing has been done on it
+	// since the teardown it was adopted for was refused. A connect that landed behind that
+	// refusal and worked makes this an account somebody wants up.
+	//
+	// Commands refused before they ran are left out on purpose. A late connect refused
+	// `expired` is not a client using the account, and counting it would pin an account
+	// nobody ever asked for to this instance for the life of the process.
 	carried atomic.Int64
 
 	// queueMu guards the door to commands rather than the channel itself: the executor
@@ -154,10 +162,11 @@ type Config struct {
 	// one it sends is the connect that brings an account back, so this is "the attempt
 	// to resume this session did not work", which is what the backoff counts.
 	ResumeFailed func()
-	// TeardownRefused is called when this session answered a `session.delete` with a
-	// refusal rather than tearing the account down, with the code it answered. It is what
-	// lets the manager undo an adoption that existed only to serve that teardown.
-	TeardownRefused func(protocol.ErrorCode)
+	// AfterCommand is called once this session has finished with a command and is no
+	// longer running it, saying whether it was a teardown and what it answered. It is
+	// what lets the manager undo an adoption that existed only to serve a teardown, and
+	// what tells it when the account has become one somebody else is using.
+	AfterCommand func(refusal protocol.ErrorCode, teardown bool)
 	// QueueDepth bounds how many commands wait for this session. Beyond it a client
 	// is told the session is busy rather than being queued behind a backlog whose
 	// deadlines have all passed by the time it is reached.
@@ -189,26 +198,26 @@ func New(ctx context.Context, cfg *Config) *Session {
 	}
 	runCtx, cancel := context.WithCancel(ctx)
 	s := &Session{
-		sid:             cfg.Lease.SID,
-		instance:        cfg.Instance,
-		lease:           cfg.Lease,
-		leases:          cfg.Leases,
-		engine:          cfg.Engine,
-		publisher:       cfg.Publisher,
-		ledger:          cfg.Ledger,
-		watch:           cfg.Watch,
-		replier:         cfg.Replier,
-		newID:           cfg.NewID,
-		undrained:       cfg.Undrained,
-		connected:       cfg.Connected,
-		resumeBad:       cfg.ResumeFailed,
-		teardownRefused: cfg.TeardownRefused,
-		retryIn:         cfg.RetireRetry,
-		now:             cfg.Now,
-		log:             cfg.Logger.With().Str("sid", cfg.Lease.SID).Uint64("epoch", cfg.Lease.Epoch).Logger(),
-		commands:        make(chan queued, cfg.QueueDepth),
-		stop:            cancel,
-		done:            make(chan struct{}),
+		sid:          cfg.Lease.SID,
+		instance:     cfg.Instance,
+		lease:        cfg.Lease,
+		leases:       cfg.Leases,
+		engine:       cfg.Engine,
+		publisher:    cfg.Publisher,
+		ledger:       cfg.Ledger,
+		watch:        cfg.Watch,
+		replier:      cfg.Replier,
+		newID:        cfg.NewID,
+		undrained:    cfg.Undrained,
+		connected:    cfg.Connected,
+		resumeBad:    cfg.ResumeFailed,
+		afterCommand: cfg.AfterCommand,
+		retryIn:      cfg.RetireRetry,
+		now:          cfg.Now,
+		log:          cfg.Logger.With().Str("sid", cfg.Lease.SID).Uint64("epoch", cfg.Lease.Epoch).Logger(),
+		commands:     make(chan queued, cfg.QueueDepth),
+		stop:         cancel,
+		done:         make(chan struct{}),
 	}
 
 	var wg sync.WaitGroup
@@ -872,18 +881,19 @@ func (s *Session) execute(ctx context.Context) {
 				release(delivery)
 				continue
 			}
-			refusal, refusedTeardown := s.run(ctx, waiting)
+			refusal, teardown := s.run(ctx, waiting)
 			s.doneWith()
-			if refusedTeardown && s.teardownRefused != nil {
+			if s.afterCommand != nil {
 				// After `doneWith`, so an account adopted for a teardown that will not run
-				// is free to be taken back by the very next tick.
-				s.teardownRefused(refusal)
+				// is free to be taken back by the very next tick rather than being refused
+				// on the grounds that the refusal itself is still in flight.
+				s.afterCommand(refusal, teardown)
 			}
 		}
 	}
 }
 
-func (s *Session) run(ctx context.Context, waiting queued) (refusal protocol.ErrorCode, refusedTeardown bool) {
+func (s *Session) run(ctx context.Context, waiting queued) (refusal protocol.ErrorCode, teardown bool) {
 	delivery := waiting.delivery
 	command := delivery.Command
 	log := s.log.With().Str("cmd_id", command.ID).Str("type", string(command.Type)).Logger()
@@ -947,7 +957,15 @@ func (s *Session) run(ctx context.Context, waiting queued) (refusal protocol.Err
 	// Counted on the answering paths and not on the two that hand the command back, for
 	// the same reason the timing is: a command given back was not carried out here, and
 	// the count exists to say whether anything but the teardown ran on this session.
-	s.carried.Add(1)
+	// Counted only when the command was carried out. `carryOut` turns two away before any
+	// work happens -- a deadline that had passed, a lease that is not fresh -- and neither
+	// is somebody using this account: counting them would have a late `session.connect`,
+	// refused without running, look exactly like a client who wanted the session up, and
+	// pin an account nobody ever asked for to this instance forever. That is #249 by
+	// another door, and the count is the door.
+	if ran(err) {
+		s.carried.Add(1)
+	}
 	retire, cancel := context.WithTimeout(context.WithoutCancel(ctx), ackTimeout)
 	defer cancel()
 	s.answer(retire, &command, delivery.Internal, result, err)
@@ -959,10 +977,29 @@ func (s *Session) run(ctx context.Context, waiting queued) (refusal protocol.Err
 	// while the executor still counts it as in flight, and the first tick after the client
 	// saw its answer would refuse to take the account back on those grounds -- a hand-back
 	// that needs a second tick for no reason anybody can see from outside.
-	if command.Type == protocol.CommandSessionDelete && err != nil {
-		return asProtocolError(err).Code, true
+	if err != nil {
+		return asProtocolError(err).Code, command.Type == protocol.CommandSessionDelete
 	}
-	return "", false
+	return "", command.Type == protocol.CommandSessionDelete
+}
+
+// ran reports whether a command got as far as doing anything.
+//
+// The two refusals `carryOut` makes before the work begins are the whole of the list, and
+// they are the two that say nothing about the account: a deadline that had already passed
+// when the command was reached, and a lease this holder has not renewed recently enough to
+// answer for. Everything else -- an engine that refused, a ledger that would not answer, a
+// command that worked -- happened to this account.
+func ran(err error) bool {
+	if err == nil {
+		return true
+	}
+	switch asProtocolError(err).Code {
+	case protocol.ErrorExpired, protocol.ErrorOwnedElsewhere:
+		return false
+	default:
+		return true
+	}
 }
 
 // carriedSoFar is how many commands this session has answered.

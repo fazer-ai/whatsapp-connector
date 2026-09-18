@@ -221,3 +221,268 @@ func TestAnAccountAClientCameToUseLeavesTheList(t *testing.T) {
 		t.Fatal("an account nobody will ever take back is still listed; every heartbeat from here takes a turn for it and gives it straight back, and the list only grows")
 	}
 }
+
+// The count is what the executor did, and it is read at the one instant nothing else can
+// speak for: a hand-back has been decided on and is about to shut the session's door.
+//
+// Both halves are asserted here rather than through a running fleet, because both are
+// about a number that no outcome shows. A command carried out has to move it, or an
+// account a client is using is handed away; a command refused before it ran must not, or
+// an account nobody ever asked for is pinned to this instance for the life of the process.
+func TestTheCountFollowsWhatWasCarriedOutAndNotWhatArrived(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name  string
+		err   error
+		moves bool
+	}{
+		{name: "a command that worked", moves: true},
+		{name: "a command the engine refused", err: errEngineRefusedTeardown, moves: true},
+		{name: "a command refused for arriving late", err: protocol.NewError(protocol.ErrorExpired, "late")},
+		{name: "a command refused for a stale lease", err: protocol.NewError(protocol.ErrorOwnedElsewhere, "moved")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := ran(tc.err); got != tc.moves {
+				t.Fatalf("ran(%v) = %v, want %v", tc.err, got, tc.moves)
+			}
+			if got := carriedOut(codeOfErr(tc.err)); tc.err != nil && got != tc.moves {
+				t.Fatalf("carriedOut(%q) = %v, want %v; the two sides of this rule disagree",
+					codeOfErr(tc.err), got, tc.moves)
+			}
+		})
+	}
+}
+
+func codeOfErr(err error) protocol.ErrorCode {
+	if err == nil {
+		return ""
+	}
+	return asProtocolError(err).Code
+}
+
+// A hand-back decided on a tick ago is dropped when the account stopped being ours to give
+// back in between.
+//
+// The pass that lists the accounts and the stop that follows are a gate apart, and a
+// `session.wake` landing in that gap is answered with this very session and acknowledged:
+// it takes the entry off the list and leaves nothing in the count to notice, because
+// nothing reached the executor. Asked directly, because winning that race from a test is
+// what makes a test like this flaky rather than exact.
+func TestAHandBackIsDroppedWhenTheAccountStoppedBeingOursToGiveBack(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+	manager := NewManager(&ManagerConfig{
+		Instance: "inst-a", Engine: fake.New(),
+		Leases:    cluster.NewLeases(client, "inst-a", cluster.Options{}),
+		Publisher: quietPublisher{}, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.New(io.Discard),
+	})
+	ctx := context.Background()
+	t.Cleanup(func() { manager.StopAll(ctx) })
+
+	const sid = "sess-registry-gone"
+	session, created, err := manager.adopt(ctx, sid)
+	if err != nil || !created {
+		t.Fatalf("adopt: %v created=%v", err, created)
+	}
+	entry := adoptedForDelete{session: session, refused: true, carried: session.carriedSoFar()}
+
+	// Still listed: the account goes back.
+	manager.adoptedToDelete(sid, session)
+	manager.forDeleteMu.Lock()
+	manager.forDelete[sid] = entry
+	manager.forDeleteMu.Unlock()
+	if !manager.releaseIdle(ctx, sid, entry) {
+		t.Fatal("given: a listed hand-back was refused")
+	}
+
+	// And now the same decision, with the account no longer listed: a wake took it while
+	// the pass was walking.
+	session, created, err = manager.adopt(ctx, sid)
+	if err != nil || !created {
+		t.Fatalf("adopt again: %v created=%v", err, created)
+	}
+	entry = adoptedForDelete{session: session, refused: true, carried: session.carriedSoFar()}
+	if manager.releaseIdle(ctx, sid, entry) {
+		t.Fatal("an account that had been taken off the list was handed back anyway; whoever took it was told it is running here, and the connect behind that has no owner")
+	}
+	if manager.Count() != 1 {
+		t.Fatalf("%d running, want the account still here", manager.Count())
+	}
+}
+
+// A teardown that has not been answered yet is not a hand-back waiting to happen.
+//
+// `takeForDelete` lists the account before it offers the command, so there is an instant
+// with nothing running, nothing queued and a count of zero: everything `claimIdle` asks
+// about says yes, and the account would go back before its teardown was ever offered. The
+// teardown would then be left pending, having never been attempted or refused.
+func TestAnUnansweredTeardownIsNotHandedBack(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+	manager := NewManager(&ManagerConfig{
+		Instance: "inst-a", Engine: fake.New(),
+		Leases:    cluster.NewLeases(client, "inst-a", cluster.Options{}),
+		Publisher: quietPublisher{}, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.New(io.Discard),
+	})
+	ctx := context.Background()
+	t.Cleanup(func() { manager.StopAll(ctx) })
+
+	const sid = "sess-registry-unanswered"
+	session, created, err := manager.adopt(ctx, sid)
+	if err != nil || !created {
+		t.Fatalf("adopt: %v created=%v", err, created)
+	}
+	// Exactly the state `takeForDelete` leaves behind between listing the account and
+	// offering the command to it.
+	manager.adoptedToDelete(sid, session)
+
+	manager.RenewAll(ctx, time.Now().Add(time.Minute))
+
+	if manager.Count() != 1 {
+		t.Fatal("an account was handed back before its teardown had been offered to it; the teardown is left pending having never been attempted")
+	}
+	manager.forDeleteMu.Lock()
+	listed := len(manager.forDelete)
+	manager.forDeleteMu.Unlock()
+	if listed != 1 {
+		t.Fatal("the account stopped being listed although nothing had answered its teardown")
+	}
+}
+
+// The resume sweep is the second route by which an account becomes wanted without a client
+// command reaching it, and it is reached by a race rather than in the ordinary way.
+//
+// `Resume` refuses outright for an account this instance already runs, so it cannot see
+// one adopted for a teardown in the ordinary course. What it can do is ask about an
+// account nobody was running, and have `takeForDelete` adopt it on the answer goroutine
+// before the synthesised connect gets there: `reconnect` then finds the session already
+// present. The record the client wrote says this account should be up, so the undoing is
+// called off, and the connect behind it is about to put the socket in the air.
+func TestAResumeThatFoundTheAccountAlreadyAdoptedCallsOffTheHandBack(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+	manager := NewManager(&ManagerConfig{
+		Instance: "inst-a", Engine: fake.New(),
+		Leases:    cluster.NewLeases(client, "inst-a", cluster.Options{}),
+		Publisher: quietPublisher{}, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.New(io.Discard),
+	})
+	ctx := context.Background()
+	t.Cleanup(func() { manager.StopAll(ctx) })
+
+	const sid = "sess-registry-resumed"
+	session, created, err := manager.adopt(ctx, sid)
+	if err != nil || !created {
+		t.Fatalf("adopt: %v created=%v", err, created)
+	}
+	manager.adoptedToDelete(sid, session)
+	manager.forDeleteMu.Lock()
+	manager.forDelete[sid] = adoptedForDelete{session: session, refused: true, carried: session.carriedSoFar()}
+	manager.forDeleteMu.Unlock()
+
+	manager.reconnect(ctx, &transport.Delivery{
+		Command: protocol.Command{
+			V: protocol.Version, Type: protocol.CommandSessionConnect, SID: sid, ID: "c-resume",
+			Payload: []byte(`{"pairing":"resume"}`),
+		},
+		Ack: func(context.Context) error { return nil }, Release: func() {}, Internal: true,
+	})
+
+	manager.forDeleteMu.Lock()
+	listed := len(manager.forDelete)
+	manager.forDeleteMu.Unlock()
+	if listed != 0 {
+		t.Fatal("a resume found the account already adopted and the undoing was not called off; the next heartbeat takes the account away from under the connect that was about to put it in the air")
+	}
+	manager.RenewAll(ctx, time.Now().Add(time.Minute))
+	if manager.Count() != 1 {
+		t.Fatalf("the account was handed back after a resume asked for it: %d running", manager.Count())
+	}
+}
+
+// And the count is actually kept: the rule above decides what counts, this is the session
+// doing it.
+//
+// Split from the rule on purpose. A session that stopped counting altogether would pass
+// every test of the rule and every test of the predicate that reads it, because a count
+// that never moves is exactly what "nothing has happened here" looks like. The two halves
+// fail for different reasons and neither covers the other.
+func TestASessionCountsTheCommandsItCarriedOut(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+	manager := NewManager(&ManagerConfig{
+		Instance: "inst-a", Engine: fake.New(),
+		Leases:    cluster.NewLeases(client, "inst-a", cluster.Options{}),
+		Publisher: quietPublisher{}, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.New(io.Discard),
+	})
+	ctx := context.Background()
+	t.Cleanup(func() { manager.StopAll(ctx) })
+
+	const sid = "sess-registry-counting"
+	session, created, err := manager.adopt(ctx, sid)
+	if err != nil || !created {
+		t.Fatalf("adopt: %v created=%v", err, created)
+	}
+
+	carry := func(id string, deadline time.Time) {
+		t.Helper()
+		command := protocol.Command{V: protocol.Version, Type: protocol.CommandSessionStatus, SID: sid, ID: id}
+		if !deadline.IsZero() {
+			command.Deadline = deadline.UnixMilli()
+		}
+		acked := make(chan struct{})
+		if offer := session.Offer(&transport.Delivery{
+			Command: command,
+			Ack:     func(context.Context) error { close(acked); return nil },
+			Release: func() {},
+		}); offer != OfferAccepted {
+			t.Fatalf("%s: the session refused the command (%v)", id, offer)
+		}
+		select {
+		case <-acked:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s was never acknowledged", id)
+		}
+	}
+
+	carry("c-count-1", time.Time{})
+	waitForCount(t, session, 1, "a command that was carried out did not move the count; an account a client is using reads as one nothing has happened to, and the heartbeat takes it away")
+	carry("c-count-2", time.Now().Add(-time.Minute))
+	// Given a moment to be wrong: the assertion is that it stays put, so waiting for the
+	// acknowledgement of a later command is what makes it more than a race won by luck.
+	carry("c-count-3", time.Time{})
+	waitForCount(t, session, 2, "a command refused for arriving late moved the count; an account nobody asked for is pinned to this instance for the life of the process")
+}
+
+func waitForCount(t *testing.T, session *Session, want int64, why string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if session.carriedSoFar() == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("%s (count is %d, want %d)", why, session.carriedSoFar(), want)
+}
