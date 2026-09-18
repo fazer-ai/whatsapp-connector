@@ -113,3 +113,65 @@ func TestATurnHeldByAnInstanceStillInTheFleetIsLeftAlone(t *testing.T) {
 		return survivor.Sessions() == 1
 	})
 }
+
+// The edge the fix does not close, measured rather than assumed, and fenced so that it
+// cannot stop being a deliberate choice.
+//
+// Deciding by identity means the question is "whose name is on this turn", and a name is
+// only as good as its uniqueness. `WAC_INSTANCE` defaults to the hostname, and README.md
+// says what that is worth: in a container the hostname is the container id, unique per
+// replica, so a process that dies and comes back is a different name and the turn it left
+// reads as gone. That is the deployment shape this repository ships and the one #272 was
+// opened about.
+//
+// Pin `WAC_INSTANCE` to a fixed string and the property is gone: the replacement announces
+// the same name, its predecessor's turn reads as its own, and the account waits out the
+// whole minute exactly as it did before the fix. That is what this test measures.
+//
+// Treating a turn in one's own name as free is NOT the repair it looks like, and this is
+// where the two cases stop being distinguishable. A turn in this instance's own name has
+// two causes: a predecessor under a pinned name, and this instance's own previous pass,
+// whose attempt failed. Nothing in the mark tells them apart, and the second is the retry
+// floor itself — the account that could not connect is meant to be left alone for a minute.
+// Taking one's own turn would dial it again every pass, which is the cool-off removed and
+// the account hammered. So the choice here is to leave it, and the cost is that a pinned
+// `WAC_INSTANCE` keeps the defect on that one path.
+func TestATurnInThisInstancesOwnNameIsLeftAloneEvenWhenItsPredecessorLeftIt(t *testing.T) {
+	server := miniredis.RunT(t)
+	dsn := "sqlite:" + filepath.Join(t.TempDir(), "wa.db")
+
+	const sid = "2f1c6f0e-0000-4000-8000-000000000279"
+	seedWantedConnected(t, dsn, sid, "5511999990279")
+
+	// A deployment that pins the name: the turn the dead process left carries the name its
+	// replacement comes up under.
+	keys := redisx.NewKeys("wa:", 8)
+	if err := server.Set(keys.Resume(sid), "inst-pinned"); err != nil {
+		t.Fatalf("plant the predecessor's turn under the pinned name: %v", err)
+	}
+	server.SetTTL(keys.Resume(sid), time.Minute)
+
+	replacement := start(t, server.Addr(), "inst-pinned",
+		map[string]string{"WAC_DATABASE_URL": dsn, "WAC_EVENT_SHARDS": "8"})
+
+	waitFor(t, "the replacement to have swept a few times", func() bool {
+		return replacement.ResumePasses() >= 3
+	})
+	if replacement.Sessions() != 0 {
+		t.Fatalf("a turn in this instance's own name was taken: that is the retry floor "+
+			"gone, and an account that failed to connect gets dialled on every pass. "+
+			"Sessions = %d", replacement.Sessions())
+	}
+
+	// And the account is not stuck for some reason of its own: the same instance, same
+	// sweep, same everything, brings it back the moment the name on the turn is one it
+	// does not answer to. The difference between waiting out the minute and coming back
+	// is the name, which is what makes the limitation a naming one.
+	if err := server.Set(keys.Resume(sid), "inst-gone"); err != nil {
+		t.Fatalf("rename the turn to a stranger nobody announces: %v", err)
+	}
+	server.SetTTL(keys.Resume(sid), time.Minute)
+	waitFor(t, "the account to come back once the turn carries a name this instance does not answer to", func() bool {
+		return replacement.Sessions() == 1
+	})
+}
