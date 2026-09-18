@@ -3358,10 +3358,44 @@ type resumedDoor struct {
 	// same for all of them. An inbound message and its receipt withhold the
 	// acknowledgement until the event is known to have been delivered -- invariant 4,
 	// losing Redis costs a redelivery and never a message -- and nothing in a unit test
-	// confirms that delivery, so those two answer false here and would answer true in a
+	// confirms that delivery, so those two answer no here and would answer yes in a
 	// deployment. The rest acknowledge on the spot, because WhatsApp does not redeliver a
 	// call, a presence or a group notification worth waiting for.
-	answers bool
+	//
+	// Three values and not a bool, because the zero value of a bool is one of the two
+	// real answers: a row added without thinking about this would claim the door holds
+	// the acknowledgement back, and for a future message-shaped door that claim is true
+	// by accident and the row goes green without anybody having decided it.
+	answers doorAnswer
+}
+
+// doorAnswer is what a door tells WhatsApp, with a zero value that is neither.
+type doorAnswer int
+
+const (
+	answerUndecided doorAnswer = iota
+	answersYes
+	answersNo
+)
+
+// answerOf reads a handler's bool back as one of the two decided answers, so a failure
+// says what happened in the same words the row says what it wanted.
+func answerOf(acknowledged bool) doorAnswer {
+	if acknowledged {
+		return answersYes
+	}
+	return answersNo
+}
+
+func (a doorAnswer) String() string {
+	switch a {
+	case answersYes:
+		return "acknowledged"
+	case answersNo:
+		return "left for redelivery"
+	default:
+		return "undecided"
+	}
 }
 
 // inTheGroup fails unless the payload puts the event in the group the stimulus named, at
@@ -3429,7 +3463,7 @@ func resumedDoors() []resumedDoor {
 		{
 			door: "receive",
 			// Held back until the event is known to have been delivered.
-			answers: false,
+			answers: answersNo,
 			carries: func(t *testing.T, payload map[string]any) {
 				inTheGroup(t, payload, "message", "chat")
 				if got := field(t, payload, "message", "id"); got != "3EB0GROUPRESUME" {
@@ -3453,7 +3487,7 @@ func resumedDoors() []resumedDoor {
 			// different function from the one above and the reason the issue counted it
 			// separately: nothing about `receive` being covered says this one is.
 			door:    "unreadable",
-			answers: true,
+			answers: answersYes,
 			carries: func(t *testing.T, payload map[string]any) {
 				inTheGroup(t, payload, "message", "chat")
 				// The word the issue names: a message nothing could read is a bubble
@@ -3485,7 +3519,7 @@ func resumedDoors() []resumedDoor {
 		{
 			door: "receipt",
 			// Held back until the event is known to have been delivered.
-			answers: false,
+			answers: answersNo,
 			carries: func(t *testing.T, payload map[string]any) {
 				inTheGroup(t, payload, "chat")
 				ids, _ := payload["message_ids"].([]any)
@@ -3511,7 +3545,7 @@ func resumedDoors() []resumedDoor {
 		},
 		{
 			door:    "chatPresence",
-			answers: true,
+			answers: answersYes,
 			carries: func(t *testing.T, payload map[string]any) {
 				inTheGroup(t, payload, "chat")
 				if got := payload["state"]; got != "composing" {
@@ -3544,7 +3578,7 @@ func resumedDoors() []resumedDoor {
 			// its own, and nothing -- live or in unit -- had ever crossed this line with a
 			// subscription that came back from a resume.
 			door:    "joinedAGroup",
-			answers: true,
+			answers: answersYes,
 			carries: func(t *testing.T, payload map[string]any) {
 				inTheGroup(t, payload, "info", "group")
 				if got := field(t, payload, "info", "subject"); got != "Equipe fazer.ai" {
@@ -3575,7 +3609,7 @@ func resumedDoors() []resumedDoor {
 			// comes out as `group.activity`. The rename exits `groupChanged` by the other
 			// arm, so covering it says nothing about this one.
 			door:    "groupChanged",
-			answers: true,
+			answers: answersYes,
 			carries: func(t *testing.T, payload map[string]any) {
 				groups, _ := payload["groups"].([]any)
 				if len(groups) != 1 {
@@ -3601,7 +3635,7 @@ func resumedDoors() []resumedDoor {
 			// table of six. It is the same filter on the same field, reached from a door
 			// nobody had counted.
 			door:    "callOffered",
-			answers: true,
+			answers: answersYes,
 			carries: func(t *testing.T, payload map[string]any) {
 				if got := payload["call_id"]; got != "call-resumed-1" {
 					t.Errorf("published %v as the call that is ringing", got)
@@ -3631,7 +3665,7 @@ func resumedDoors() []resumedDoor {
 		},
 		{
 			door:    "callEnded",
-			answers: true,
+			answers: answersYes,
 			carries: func(t *testing.T, payload map[string]any) {
 				if got := payload["call_id"]; got != "call-resumed-1" {
 					t.Errorf("published %v as the call that ended", got)
@@ -3681,9 +3715,10 @@ func TestEveryGroupDoorOpensForASubscriptionThatCameBackFromAResume(t *testing.T
 			door.carries(t, published(t, session, door.want, door.definition))
 			select {
 			case got := <-answered:
-				if got != door.answers {
-					t.Errorf("%s answered WhatsApp %v for group traffic it published, want %v",
-						door.door, got, door.answers)
+				want := door.answers == answersYes
+				if got != want {
+					t.Errorf("%s %s the group traffic it published, want %s",
+						door.door, answerOf(got), door.answers)
 				}
 			case <-time.After(3 * time.Second):
 				t.Fatalf("%s published the event and never answered WhatsApp", door.door)
@@ -3820,7 +3855,7 @@ func resumedSession(t *testing.T, groups bool) *Session {
 var doorsThatAreNotFilters = map[string]string{
 	// Carries the subscription INTO a pairing request rather than filtering anything by
 	// it. A resume never reaches it: a session asking for a pairing code has no account to
-	// resume. What it must not do is lose the value, and `TestAskingForAPairingCodeKeepsTheGroupSubscription`
+	// resume. What it must not do is lose the value, and `TestACodeRequestKeepsTheGroupSubscriptionTheClientAskedFor`
 	// is what says so.
 	"requestCode": "carries the subscription into a pairing request instead of filtering traffic by it",
 }
@@ -3839,6 +3874,10 @@ func TestEveryGroupFilterHasARowInTheResumeTable(t *testing.T) {
 		}
 		if door.give == nil || door.quiet == nil || door.carries == nil {
 			t.Errorf("the row for %s is missing a stimulus, a quiet instrument or a payload check", door.door)
+		}
+		if door.answers == answerUndecided {
+			t.Errorf("the row for %s does not say what the door answers WhatsApp: pick answersYes or answersNo, "+
+				"and a message-shaped door holds the acknowledgement back until the event is delivered", door.door)
 		}
 		covered[door.door] = true
 	}
