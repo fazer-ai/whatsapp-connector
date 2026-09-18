@@ -286,7 +286,11 @@ func releasedChannels(file *ast.File) map[token.Pos]bool {
 		if !ok {
 			return true
 		}
-		deposited := map[string]bool{}
+		// The position of the first deposit, not just the fact of one: a receive before the
+		// send is not taking a token back, it is waiting for one. Round 3 of the review
+		// found `<-ch` followed by `ch <- struct{}{}` passing, which is an unbounded wait
+		// wearing the shape of a release.
+		deposited := map[string]token.Pos{}
 		ast.Inspect(body, func(inner ast.Node) bool {
 			if _, handedAway := inner.(*ast.GoStmt); handedAway {
 				return false
@@ -301,7 +305,9 @@ func releasedChannels(file *ast.File) map[token.Pos]bool {
 			}
 			if send, ok := inner.(*ast.SendStmt); ok {
 				if name := channelName(send.Chan); name != "" {
-					deposited[name] = true
+					if at, seen := deposited[name]; !seen || send.Pos() < at {
+						deposited[name] = send.Pos()
+					}
 				}
 			}
 			return true
@@ -311,7 +317,13 @@ func releasedChannels(file *ast.File) map[token.Pos]bool {
 		}
 		ast.Inspect(body, func(inner ast.Node) bool {
 			unary, ok := inner.(*ast.UnaryExpr)
-			if ok && unary.Op == token.ARROW && deposited[channelName(unary.X)] {
+			if !ok || unary.Op != token.ARROW {
+				return true
+			}
+			// Ordering by position, which is what this can see. A receive inside a loop
+			// that sends later in the text is still flagged, and that is the conservative
+			// direction: the fence reports a wait it cannot prove is a release.
+			if at, seen := deposited[channelName(unary.X)]; seen && unary.Pos() > at {
 				released[unary.Pos()] = true
 			}
 			return true

@@ -76,6 +76,11 @@ func TestTheContractSaysWhatBoundsACommandWithNoCeilingOfItsOwn(t *testing.T) {
 			"round 2 of the review measured this one: whatsmeow retries an interrupted " +
 				"send with a zero timeout, which switches its timer off, so the claim that " +
 				"nothing runs forever was false as written"},
+		{"that max_runtime_ms does not reach the socket write", "does **not** reach the first",
+			"round 3 caught the paragraph recommending the field as the remedy for both; " +
+				"measured, a deadline does not free a command blocked on the write lock"},
+		{"what a client can actually do about that one", "its own timeout on the reply",
+			"it is the only remedy left once no field on the command reaches the wait"},
 		{"that both are unbounded, not merely slow", "not bounded",
 			"`covered` and `slower` are what this would degrade into"},
 	} {
