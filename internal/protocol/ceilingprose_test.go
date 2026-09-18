@@ -61,6 +61,9 @@ func TestTheContractSaysWhatBoundsACommandWithNoCeilingOfItsOwn(t *testing.T) {
 		{"that the identifier is not what makes it safe", "the identifier is not what makes that safe",
 			"review round 1 caught this promising more than it delivers: a failed first " +
 				"attempt leaves no record, so the same key answers nothing and the work runs again"},
+		{"why a failed attempt leaves nothing", "records only what succeeded",
+			"it is the reason the same key answers nothing, and without it the paragraph " +
+				"asserts the conclusion without the fact under it"},
 		{"what the identifier does buy", "after the first attempt *succeeded*",
 			"the narrow thing it is actually good for, which is a redelivery after a success"},
 		{"the mutation that is not covered", "rotates the link",
