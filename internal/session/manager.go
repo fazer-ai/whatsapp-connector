@@ -355,13 +355,19 @@ func (m *Manager) adopt(ctx context.Context, sid string, forTeardown bool) (*Ses
 	// The lifetime the callbacks below run under, for the same reason the session gets
 	// it: they fire from the pump and the executor long after this call has returned.
 	living := context.WithoutCancel(ctx)
-	session := New(living, &Config{
+	// Declared ahead of the literal so the callbacks below can name the session they
+	// belong to. Nothing fires before the assignment: the executor runs a command only
+	// once somebody has been handed this pointer and offered it one.
+	var session *Session
+	session = New(living, &Config{
 		Instance: m.instance, Lease: lease, Leases: m.leases, Engine: engineSession,
 		Publisher: m.publisher, Replier: m.replier, Ledger: m.ledger, Watch: m.watch,
 		NewID: m.newID, Now: m.now, Logger: m.log,
 		Undrained: func() { m.undrained(sid) }, RetireRetry: m.retireRetry,
 		Connected: func() { m.working(living, sid) }, ResumeFailed: func() { m.failing(living, sid) },
-		AfterCommand: func(code protocol.ErrorCode, teardown, happened bool) { m.afterCommand(sid, code, teardown, happened) },
+		AfterCommand: func(code protocol.ErrorCode, teardown, happened bool) {
+			m.afterCommand(sid, session, code, teardown, happened)
+		},
 	})
 
 	m.mu.Lock()
@@ -1053,7 +1059,37 @@ type adoptedForDelete struct {
 // A command that is not a teardown ends the undoing, because it means somebody is using
 // the account -- unless it was refused before it ran, which says nothing about the account
 // and must not pin one nobody asked for to this instance.
-func (m *Manager) afterCommand(sid string, code protocol.ErrorCode, teardown, happened bool) {
+//
+// Two routes make an account wanted, and the list is deliberate rather than lucky: a
+// command carried out on it, which is this function, and an adoption that finds the
+// session already there, which is `adopt` and covers `session.wake` and the resume sweep.
+// Everything else that could reach a session is closed by one of the two or by a clause of
+// `claimIdle`, and it is worth naming which, because "it is covered" without saying how is
+// how three of the holes in this design got here:
+//
+//   - An inbound event from the engine needs a socket, and an account opened for a teardown
+//     never dials: `Open` prepares a client and `Session.Connect` is what dials, which only
+//     runs as a command and so is the first route.
+//   - A command refused `rate_limited` by a full queue is answered on the manager's own
+//     goroutine and never reaches here, so it moves nothing -- and the queue it found full
+//     is what `claimIdle` turns the hand-back away on, until it drains and those commands
+//     run, which is the first route again.
+//   - A command refused because the session is stopping is turned away by `claimIdle` on
+//     `stopping` or `shutFor`.
+//   - A drain scheduled by `undrained` claims the session's stream back, and whatever it
+//     finds is dispatched, which is the first route.
+//   - `Release` and `StopAll` take the session out of the map, which the sweep notices by
+//     pointer. That is the account ending rather than being wanted.
+//
+// A route added later needs its own way out of this list, or it arrives as an account
+// handed away from under whoever asked for it.
+// The session is named as well as the account, and that is not belt and braces. A lease
+// that expires has its session taken out of the map before `Stop` has returned, without the
+// adoption gate held, so the answer goroutine can put a replacement in place while the old
+// executor is still finishing its last command. Matched on the account alone, that stale
+// report would erase the replacement's registration, and the teardown the replacement was
+// adopted for would then leave the account owned for good.
+func (m *Manager) afterCommand(sid string, from *Session, code protocol.ErrorCode, teardown, happened bool) {
 	switch {
 	case teardown && !happened && code != protocol.ErrorOwnedElsewhere:
 		// The teardown did not run. It was refused for arriving late, or answered out of
@@ -1069,7 +1105,7 @@ func (m *Manager) afterCommand(sid string, code protocol.ErrorCode, teardown, ha
 		// instance throughout. Giving the account back there would drop a session this
 		// instance still runs and still renews.
 		m.forDeleteMu.Lock()
-		if entry, listed := m.forDelete[sid]; listed {
+		if entry, listed := m.forDelete[sid]; listed && entry.session == from {
 			entry.refused = true
 			entry.carried = entry.session.carriedSoFar()
 			m.forDelete[sid] = entry
@@ -1085,7 +1121,7 @@ func (m *Manager) afterCommand(sid string, code protocol.ErrorCode, teardown, ha
 	default:
 		// Either the account was used, or a teardown was attempted on it and the account
 		// is staying: both end the undoing.
-		m.forgetAdoptedForDelete(sid, nil)
+		m.forgetAdoptedForDelete(sid, from)
 	}
 }
 

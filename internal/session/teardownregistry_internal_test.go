@@ -25,6 +25,30 @@ import (
 // about a session this instance no longer runs, is told no, and asks again on the next
 // tick, forever, with the map growing by one account per teardown the fleet ever refuses.
 // Every test around this one would stay green.
+// settled waits until the bookkeeping for a command has actually run.
+//
+// An acknowledgement is not that moment. `run` publishes the answer, acknowledges, and
+// only then returns, is counted out by `doneWith`, and reports itself: a test that ticks
+// the heartbeat on seeing the ack is asking about a registration that may not have been
+// written yet, and fails for scheduling rather than for behaviour.
+func settled(t *testing.T, manager *Manager, sid string, want func(adoptedForDelete, bool) bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		manager.forDeleteMu.Lock()
+		entry, listed := manager.forDelete[sid]
+		manager.forDeleteMu.Unlock()
+		if want(entry, listed) {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("the bookkeeping for %s never reached the state this test is about", sid)
+}
+
+func armed(entry adoptedForDelete, listed bool) bool { return listed && entry.refused }
+func unlisted(_ adoptedForDelete, listed bool) bool  { return !listed }
+
 var errEngineRefusedTeardown = errors.New("fake: this account will not be torn down")
 
 func TestTheListOfAccountsAdoptedForATeardownEmpties(t *testing.T) {
@@ -88,6 +112,13 @@ func TestTheListOfAccountsAdoptedForATeardownEmpties(t *testing.T) {
 		case <-time.After(5 * time.Second):
 			t.Fatalf("%s: the teardown was never acknowledged", tc.name)
 		}
+		// Waited for rather than assumed: the acknowledgement above proves `Ack` ran, not
+		// that the executor has finished with the command and said so.
+		if tc.deadline.IsZero() {
+			settled(t, manager, sid, unlisted)
+		} else {
+			settled(t, manager, sid, armed)
+		}
 		manager.RenewAll(ctx, time.Now().Add(time.Minute))
 		manager.SweepRetired(ctx, time.Now().Add(time.Minute))
 
@@ -140,6 +171,7 @@ func TestAHandBackAnAdoptionWasInTheWayOfKeepsItsPlace(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("the teardown was never acknowledged")
 	}
+	settled(t, manager, sid, armed)
 
 	// The gate a tick meets: this account is being adopted, so the hand-back cannot run.
 	if !manager.tryHoldHanding(sid) {
@@ -209,6 +241,7 @@ func TestAnAccountAClientCameToUseLeavesTheList(t *testing.T) {
 		Deadline: time.Now().Add(-time.Minute).UnixMilli(),
 	})
 	carry(protocol.Command{V: protocol.Version, Type: protocol.CommandSessionStatus, SID: sid, ID: "c-used-status"})
+	settled(t, manager, sid, unlisted)
 
 	manager.RenewAll(ctx, time.Now().Add(time.Minute))
 	if manager.Count() != 1 {
@@ -489,11 +522,13 @@ func waitForCount(t *testing.T, session *Session, want int64, why string) {
 
 // The rule that decides what an account adopted for a teardown is worth, asked directly.
 //
-// Three of these outcomes cannot be produced from outside on an account this path adopted:
-// `owned_elsewhere` needs the lease to go stale between the adoption and the executor, and
-// the two engine endings need the teardown to reach an engine that was armed before the
-// adoption existed. Asked through a running fleet they would be a handful of races; asked
-// here they are a table, and the table is what a later round reads.
+// Three of these outcomes cannot be produced from outside on an account this path adopted,
+// and each says on its own row why not. That is the point of writing it down: a table
+// asked directly is the one part of a suite that nothing can contradict, so if today's
+// reading of a state is wrong the table is wrong with it and in the same direction. The
+// reason is what goes stale first. On the day a new route makes one of these reachable,
+// that sentence is false and the row is up for re-reading, instead of the table going on
+// agreeing with itself.
 func TestWhatEachEndingOfATeardownIsWorth(t *testing.T) {
 	t.Parallel()
 
@@ -511,10 +546,19 @@ func TestWhatEachEndingOfATeardownIsWorth(t *testing.T) {
 	}{
 		{name: "a teardown refused for arriving late", code: protocol.ErrorExpired, teardown: true, want: armed},
 		{name: "a teardown answered out of the record", teardown: true, want: armed},
+		// Not producible from outside on an account this path adopted: `takeForDelete`
+		// takes the lease and offers the command in the same breath, so the renewal would
+		// have to age past `ttl - margin` in between.
 		{name: "a teardown refused on a stale renewal", code: protocol.ErrorOwnedElsewhere, teardown: true, want: kept},
+		// Not producible from outside on an account this path adopted unless the engine
+		// is armed before the adoption exists, which is a fake's trick rather than a
+		// sequence a fleet produces.
 		{name: "a teardown the engine refused", code: protocol.ErrorInternal, teardown: true, happened: true, want: kept},
 		{name: "a teardown that worked", teardown: true, happened: true, want: kept},
 		{name: "a command that worked", happened: true, want: kept},
+		// Not producible from outside on an account this path adopted: a record for a
+		// command other than the teardown means a session that ran it, and this account
+		// has only ever had the one opened for the teardown.
 		{name: "a command answered out of the record", want: kept},
 		{name: "a command refused for arriving late", code: protocol.ErrorExpired, want: held},
 		{name: "a command refused on a stale renewal", code: protocol.ErrorOwnedElsewhere, want: held},
@@ -541,7 +585,7 @@ func TestWhatEachEndingOfATeardownIsWorth(t *testing.T) {
 				t.Fatalf("adopt: %v created=%v", err, created)
 			}
 
-			manager.afterCommand(sid, tc.code, tc.teardown, tc.happened)
+			manager.afterCommand(sid, session, tc.code, tc.teardown, tc.happened)
 
 			manager.forDeleteMu.Lock()
 			entry, listed := manager.forDelete[sid]
@@ -561,5 +605,72 @@ func TestWhatEachEndingOfATeardownIsWorth(t *testing.T) {
 				t.Fatalf("the hand-back was armed at %d, and the session has carried out %d", entry.carried, session.carriedSoFar())
 			}
 		})
+	}
+}
+
+// A report from a session that is no longer the one running the account changes nothing.
+//
+// A lease that expires has its session taken out of the map before `Stop` has returned,
+// and without the adoption gate held, so the answer goroutine can put a replacement in
+// place while the old executor is still finishing its last command. That report arrives
+// late and is about a session nobody runs. Matched on the account alone it would arm or
+// erase the replacement's registration, and the teardown the replacement was adopted for
+// would then leave the account owned for good.
+//
+// Asked directly: winning that race from a test means killing a lease mid-command and
+// hoping the schedule cooperates, which is a coin toss dressed as an assertion.
+func TestAReportFromASupersededSessionChangesNothing(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+	manager := NewManager(&ManagerConfig{
+		Instance: "inst-a", Engine: fake.New(),
+		Leases:    cluster.NewLeases(client, "inst-a", cluster.Options{}),
+		Publisher: quietPublisher{}, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.New(io.Discard),
+	})
+	ctx := context.Background()
+	t.Cleanup(func() { manager.StopAll(ctx) })
+
+	const sid = "sess-registry-superseded"
+	gone, created, err := manager.adopt(ctx, sid, toTearDown)
+	if err != nil || !created {
+		t.Fatalf("adopt: %v created=%v", err, created)
+	}
+	// The lease goes, the session goes with it, and a replacement is adopted for a
+	// teardown of its own. Through `Release` rather than `stopSession` alone, because the
+	// lease has to go back for the next adoption to be able to win it.
+	manager.Release(ctx, sid)
+	replacement, created, err := manager.adopt(ctx, sid, toTearDown)
+	if err != nil || !created {
+		t.Fatalf("adopt again: %v created=%v", err, created)
+	}
+	if gone == replacement {
+		t.Fatal("given: the replacement is the same session")
+	}
+
+	// The old executor finishes its last command and reports. Both endings, because the
+	// two branches of the rule erase and arm respectively, and a stale report must do
+	// neither.
+	manager.afterCommand(sid, gone, "", false, true)
+	manager.forDeleteMu.Lock()
+	entry, listed := manager.forDelete[sid]
+	manager.forDeleteMu.Unlock()
+	if !listed || entry.session != replacement {
+		t.Fatal("a report from a superseded session erased the replacement's registration; the teardown it was adopted for now leaves the account owned for good")
+	}
+	if entry.refused {
+		t.Fatal("a report from a superseded session armed the replacement's hand-back")
+	}
+
+	manager.afterCommand(sid, gone, protocol.ErrorExpired, true, false)
+	manager.forDeleteMu.Lock()
+	entry, listed = manager.forDelete[sid]
+	manager.forDeleteMu.Unlock()
+	if !listed || entry.refused {
+		t.Fatal("a superseded session's refusal armed a hand-back for the session that replaced it; the next tick stops an account whose own teardown has not been answered")
 	}
 }
