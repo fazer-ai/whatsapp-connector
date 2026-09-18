@@ -81,7 +81,7 @@ func TestTheResumeSweepLeavesAnAccountAPeerIsRunning(t *testing.T) {
 	connector, container, engine, server := newResumeConnector(t)
 	wantConnected(t, container, "sid-1", "5511999990001", false)
 
-	peer := cluster.NewLeases(redisx.Wrap(redis.NewClient(&redis.Options{Addr: server.Addr()}), "wa:", 8),
+	peer := cluster.NewLeases(redisx.Wrap(redis.NewClient(&redis.Options{Addr: server.Addr()}), "wa:", DefaultEventShards),
 		"inst-b", cluster.Options{})
 	if _, err := peer.Acquire(t.Context(), "sid-1"); err != nil {
 		t.Fatalf("the peer could not take the account: %v", err)
@@ -191,7 +191,7 @@ func newResumeConnector(t *testing.T) (*Connector, *store.Container, *fake.Engin
 	server := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
 	t.Cleanup(func() { _ = rdb.Close() })
-	client := redisx.Wrap(rdb, "wa:", 8)
+	client := redisx.Wrap(rdb, "wa:", DefaultEventShards)
 	leases := cluster.NewLeases(client, "inst-a", cluster.Options{})
 	engine := fake.New()
 

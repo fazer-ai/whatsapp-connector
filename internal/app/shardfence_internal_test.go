@@ -31,6 +31,14 @@ import (
 // Derived values are allowed and are the point of the exception: a test that deliberately
 // runs an instance at a different count, to prove the fleet refuses it, writes that as
 // `app.DefaultEventShards*2` and stays tied to the one home.
+//
+// Two spellings build a key layout here and the fence covers both. `redisx.NewKeys` is
+// the one the external tests use; `redisx.Wrap` is the one the internal tests use, and
+// twelve of them carried a literal 8 while the connector they exercise runs on sixteen.
+// None of the twelve could fail the way #269 failed, because the same wrapped client both
+// publishes and reads in those tests, so there is no second party to disagree with. They
+// are still a literal count sitting in a test file, which is the one shape that made the
+// defect invisible, so they name `DefaultEventShards` and the fence holds them to it.
 func TestNoTestInThisPackageCarriesItsOwnShardCount(t *testing.T) {
 	t.Parallel()
 
@@ -55,10 +63,14 @@ func TestNoTestInThisPackageCarriesItsOwnShardCount(t *testing.T) {
 		checked++
 		ast.Inspect(file, func(node ast.Node) bool {
 			call, ok := node.(*ast.CallExpr)
-			if !ok || len(call.Args) != 2 || !isNewKeys(call.Fun) {
+			if !ok {
 				return true
 			}
-			literal, ok := call.Args[1].(*ast.BasicLit)
+			at := shardCountArg(call)
+			if at < 0 {
+				return true
+			}
+			literal, ok := call.Args[at].(*ast.BasicLit)
 			if !ok || literal.Kind != token.INT || literal.Value == "0" {
 				return true
 			}
@@ -81,11 +93,25 @@ func TestNoTestInThisPackageCarriesItsOwnShardCount(t *testing.T) {
 	}
 }
 
-func isNewKeys(fun ast.Expr) bool {
-	selector, ok := fun.(*ast.SelectorExpr)
-	if !ok || selector.Sel.Name != "NewKeys" {
-		return false
+// shardCountArg is which argument of a call carries the fleet's stream count, or -1 when
+// the call is not one that carries it at all.
+func shardCountArg(call *ast.CallExpr) int {
+	selector, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return -1
 	}
 	pkg, ok := selector.X.(*ast.Ident)
-	return ok && pkg.Name == "redisx"
+	if !ok || pkg.Name != "redisx" {
+		return -1
+	}
+	// The arity is checked along with the name so that a future overload, or a different
+	// `redisx` function of the same name, does not have its second argument read as a
+	// shard count on the strength of the name alone.
+	switch {
+	case selector.Sel.Name == "NewKeys" && len(call.Args) == 2:
+		return 1
+	case selector.Sel.Name == "Wrap" && len(call.Args) == 3:
+		return 2
+	}
+	return -1
 }

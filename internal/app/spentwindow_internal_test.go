@@ -44,7 +44,7 @@ func withHeldAnswers(t *testing.T, sid string, options ...func(*redis.Options)) 
 	}
 	rdb := redis.NewClient(settings)
 	t.Cleanup(func() { _ = rdb.Close() })
-	client := redisx.Wrap(rdb, "wa:", 8)
+	client := redisx.Wrap(rdb, "wa:", DefaultEventShards)
 
 	// A block short enough to leave the window room for the answer, and a claim delay
 	// long enough that nothing can come back that way: what returns, returns by a read.

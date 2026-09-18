@@ -10,6 +10,7 @@ import (
 	"github.com/alicebob/miniredis/v2"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
+	"github.com/fazer-ai/whatsapp-connector/internal/redisx"
 )
 
 // The test client and the connector have to agree on which stream a session's events land
@@ -51,12 +52,25 @@ func TestTheClientReadsTheSameShardTheFleetPublishesTo(t *testing.T) {
 		seen = append(seen, string(event.Type))
 	}
 	if !slices.Contains(seen, string(protocol.EventSessionState)) {
-		t.Fatalf("the client read %v from the stream it picked for %s, and the fleet wrote "+
-			"to %v.\nThe client and the connector disagree about how many event streams "+
-			"there are, so the client reads a stream nobody wrote to: no error, no warning, "+
-			"an empty list.",
-			seen, sid, eventStreamsWritten(t, server))
+		stream, counted := client.eventsOf(context.Background(), sid)
+		t.Fatalf("the client counted %d event streams, picked %s for %s and read %v from "+
+			"it; the fleet recorded %s in wa:meta and wrote to %v.\n"+
+			"The client and the connector disagree about how many event streams there are, "+
+			"so the client reads a stream nobody wrote to: no error, no warning, an empty "+
+			"list.",
+			counted, stream, sid, seen, shardsRecordedBy(server), eventStreamsWritten(t, server))
 	}
+}
+
+// shardsRecordedBy is the count the fleet wrote in `wa:meta`, read off the server instead
+// of through the client, so a failure can print both numbers side by side even when the
+// client's is the wrong one. Going through the client would print the same number twice
+// and hide the disagreement that is the whole defect.
+func shardsRecordedBy(server *miniredis.Miniredis) string {
+	if recorded := server.HGet("wa:meta", "event_shards"); recorded != "" {
+		return recorded
+	}
+	return "nothing"
 }
 
 // eventStreamsWritten is which event streams have anything in them, named without this
@@ -86,7 +100,7 @@ func eventStreamsWritten(t *testing.T, server *miniredis.Miniredis) []string {
 // published in the first place.
 //
 // So the instance here runs at four, and the sid is picked to expose the difference:
-// measured, it lands on stream 1 with four and on stream 9 with sixteen.
+// measured, it lands on stream 1 with four and on stream 5 with sixteen.
 func TestTheCountComesFromTheInstanceBeingWatchedAndNotFromTheDefault(t *testing.T) {
 	server := miniredis.RunT(t)
 	dsn := "sqlite:" + filepath.Join(t.TempDir(), "wa.db")
@@ -108,11 +122,12 @@ func TestTheCountComesFromTheInstanceBeingWatchedAndNotFromTheDefault(t *testing
 		seen = append(seen, string(event.Type))
 	}
 	if !slices.Contains(seen, string(protocol.EventSessionState)) {
-		t.Fatalf("the instance runs on four event streams and wrote to %v, and the client "+
-			"read %v from the stream it picked.\n"+
+		stream, counted := client.eventsOf(context.Background(), sid)
+		t.Fatalf("the instance recorded %s in wa:meta as its event stream count and wrote "+
+			"to %v; the client counted %d, picked %s and read %v from it.\n"+
 			"It is taking the count from somewhere other than this instance, which agrees "+
 			"with it only while the instance runs on the default.",
-			eventStreamsWritten(t, server), seen)
+			shardsRecordedBy(server), eventStreamsWritten(t, server), counted, stream, seen)
 	}
 }
 
@@ -184,5 +199,94 @@ func TestAFleetThatHasNotSaidHowManyStreamsItHasGetsNoAnswerInvented(t *testing.
 				t.Errorf("the client counts %d streams, the fleet records %d", shards, tc.want)
 			}
 		})
+	}
+}
+
+// The answer a client keeps is the answer its own fleet gave.
+//
+// `fleetShards` caches, because without it every read of a session's events pays an
+// `HGET` on top of the `XRANGE` it used to cost alone. The cache is on the client, and
+// this is what says so: a package variable would pass every other test that starts one
+// instance, and quietly hand this client's count to the next test's client. That is #269
+// again, with the wrong number arriving from a neighbouring fleet instead of a literal,
+// and it would land on whichever test happened to run second.
+//
+// Both fleets are planted by hand rather than started: the number under test is what the
+// client reads out of `wa:meta`, and a connector would only be a slower way to write it.
+// A is asked again at the end, because a cache that is merely last-write-wins passes the
+// first two assertions and fails only when the earlier client is used after the later one.
+func TestOneClientsCountDoesNotBecomeAnothersCount(t *testing.T) {
+	ctx := context.Background()
+
+	fleetA := miniredis.RunT(t)
+	fleetA.HSet("wa:meta", "event_shards", "4")
+	fleetB := miniredis.RunT(t)
+	fleetB.HSet("wa:meta", "event_shards", "8")
+
+	clientA := newClient(t, fleetA.Addr())
+	clientB := newClient(t, fleetB.Addr())
+
+	const sid = "2f1c6f0e-0000-4000-8000-000000000002"
+	for _, step := range []struct {
+		who    string
+		client *client
+		fleet  *miniredis.Miniredis
+		want   int
+	}{
+		{who: "A", client: clientA, fleet: fleetA, want: 4},
+		{who: "B", client: clientB, fleet: fleetB, want: 8},
+		{who: "A again, after B has asked", client: clientA, fleet: fleetA, want: 4},
+	} {
+		got, err := step.client.fleetShards(ctx)
+		if err != nil {
+			t.Fatalf("client %s could not read its own fleet's count: %v", step.who, err)
+		}
+		if got != step.want {
+			t.Errorf("client %s counts %d event streams; its fleet recorded %s.\n"+
+				"The count is being kept somewhere both clients can see, so one fleet's "+
+				"answer reaches a client watching the other.",
+				step.who, got, shardsRecordedBy(step.fleet))
+		}
+		// `step.want` and not a literal on purpose, and not a hole in the fence either:
+		// this is the oracle, built from what this test itself wrote into that fleet's
+		// `wa:meta`, and it is red the moment the client names a different stream.
+		stream, counted := step.client.eventsOf(ctx, sid)
+		if want := redisx.NewKeys("wa:", step.want).EventsOf(sid); stream != want {
+			t.Errorf("client %s picked %s with a count of %d; its fleet's %d streams put "+
+				"%s on %s", step.who, stream, counted, step.want, sid, want)
+		}
+	}
+}
+
+// Asking the fleet its stream count is paid once, not once per read.
+//
+// Before #269 a read of a session's events was one `XRANGE` and nothing else, because the
+// count was a literal in this file. Taking it from `wa:meta` instead is the fix, and the
+// obvious way of writing it puts an `HGET` in front of every single read: correct, and a
+// cost that multiplies with nothing to show for it, since the count is written once per
+// fleet and `ClaimMeta` refuses to start an instance that disagrees with it.
+//
+// Nothing else in this package would notice that regression -- the reads all pass either
+// way -- so this counts the commands the server actually served. The fleet is planted by
+// hand and no connector runs, so every command counted belongs to the client.
+func TestAskingTheFleetItsStreamCountIsPaidOnce(t *testing.T) {
+	server := miniredis.RunT(t)
+	server.HSet("wa:meta", "event_shards", "16")
+	client := newClient(t, server.Addr())
+	ctx := context.Background()
+
+	const sid = "2f1c6f0e-0000-4000-8000-000000000002"
+	client.events(ctx, sid)
+	afterFirst := server.Server().TotalCommands()
+	client.events(ctx, sid)
+	second := server.Server().TotalCommands() - afterFirst
+
+	// One: the `XRANGE` the read was always made of. Two means the `HGET` came with it.
+	if second > 1 {
+		t.Errorf("a second read of the same session's events cost %d commands; before "+
+			"#269 it cost one.\n"+
+			"The fleet's stream count is being re-read on every call. It is written once "+
+			"per fleet and an instance that disagrees with it is refused at startup, so "+
+			"there is nothing for the extra round trip to catch.", second)
 	}
 }

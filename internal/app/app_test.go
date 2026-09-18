@@ -41,6 +41,18 @@ type client struct {
 	// instead of returning a stream number this side made up. Where the count is really
 	// needed, `eventsOf` gets it from the fleet.
 	key redisx.Keys
+	// shards is the answer `wa:meta` gave the first time this client asked, kept so a
+	// second read of a session's events costs the same one `XRANGE` it cost before #269
+	// instead of an `HGET` on top of it. Safe to keep because the count is a property of
+	// the fleet and not of the moment: `ClaimMeta` refuses to start an instance that
+	// disagrees with what is recorded there, so within one fleet it is written once.
+	//
+	// Per client, never in a package variable. The count belongs to the fleet this client
+	// watches, and this package runs several fleets in one process -- one instance on the
+	// default sixteen, another on four -- so a cache shared between them would hand one
+	// fleet's count to a client watching the other, which is #269 again with the number
+	// coming from a neighbouring test instead of from a literal.
+	shards int
 }
 
 func newClient(t *testing.T, addr string) *client {
@@ -62,7 +74,11 @@ func newClient(t *testing.T, addr string) *client {
 // before any instance exists, and what they name first -- a control stream, a command
 // stream -- does not depend on the count at all. An eager read would find no `wa:meta`
 // and a fallback to some literal would rebuild the defect in other clothes.
-func (c *client) eventsOf(ctx context.Context, sid string) string {
+// It returns the count it used along with the name, because that is what a failure has
+// to say out loud. "The client read nothing" is the same sentence whether it looked at
+// the right stream and the fleet published nothing, or looked at a stream nobody writes
+// to because the two sides count differently, and only the second is #269.
+func (c *client) eventsOf(ctx context.Context, sid string) (stream string, shards int) {
 	c.t.Helper()
 	shards, err := c.fleetShards(ctx)
 	if err != nil {
@@ -71,7 +87,7 @@ func (c *client) eventsOf(ctx context.Context, sid string) string {
 			"land on, and guessing is the whole of #269: the wrong stream reads empty and "+
 			"says so with an empty list rather than an error.", err)
 	}
-	return redisx.NewKeys(c.key.Prefix(), shards).EventsOf(sid)
+	return redisx.NewKeys(c.key.Prefix(), shards).EventsOf(sid), shards
 }
 
 // fleetShards is how many event streams the fleet publishes to, asked of the fleet.
@@ -81,6 +97,9 @@ func (c *client) eventsOf(ctx context.Context, sid string) string {
 // back to a count of its own when `wa:meta` is missing has rebuilt the defect in other
 // clothes, and a helper that can only end the test cannot be tested for that.
 func (c *client) fleetShards(ctx context.Context) (int, error) {
+	if c.shards > 0 {
+		return c.shards, nil
+	}
 	shards, err := c.rdb.HGet(ctx, c.key.Meta(), "event_shards").Int()
 	if err != nil {
 		return 0, fmt.Errorf("read the fleet's event shard count from %s: %w", c.key.Meta(), err)
@@ -89,6 +108,9 @@ func (c *client) fleetShards(ctx context.Context) (int, error) {
 		return 0, fmt.Errorf("the fleet records %d event shards in %s, which is no answer at all",
 			shards, c.key.Meta())
 	}
+	// Only a usable answer is kept. A fleet that has not said yet may say later, and a
+	// cached refusal would turn "no instance has started" into a permanent one.
+	c.shards = shards
 	return shards, nil
 }
 
@@ -125,7 +147,8 @@ func (c *client) await(ctx context.Context, commandID string, timeout time.Durat
 
 func (c *client) events(ctx context.Context, sid string) []protocol.Event {
 	c.t.Helper()
-	entries, err := c.rdb.XRange(ctx, c.eventsOf(ctx, sid), "-", "+").Result()
+	stream, _ := c.eventsOf(ctx, sid)
+	entries, err := c.rdb.XRange(ctx, stream, "-", "+").Result()
 	if err != nil {
 		c.t.Fatalf("XRange: %v", err)
 	}
