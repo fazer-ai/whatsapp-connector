@@ -217,18 +217,20 @@ func TestNoWaitInThisPackageDependsOnItsPeerToEnd(t *testing.T) {
 		// the clause on its own, and reporting it there called every guarded wait in the
 		// package unguarded -- twenty seven of them on the first run of this fence.
 		guarded := map[token.Pos]bool{}
-		// A receive on a channel this same file sends to is the release half of a
-		// semaphore, not a wait: the value it takes back is the one the send put there, so
-		// it cannot block. `takePresenceWrite` in `presence.go` is the one in the tree this
-		// was written against, and it is recognised by the shape rather than by name,
+		// A receive is the release half of a semaphore when the SAME function already put
+		// the value there, in this goroutine: it takes back what it just deposited, so it
+		// cannot block. `takePresenceWrite` in `presence.go` is the one in the tree this
+		// was written against, and it is recognised by that shape rather than by name,
 		// because a list of blessed lines is the thing #160 is about.
-		released := map[string]bool{}
+		//
+		// The first cut of this scoped the exemption to the file and to the channel's name,
+		// which round 1 of the review showed was far too loose: an ordinary worker, with
+		// `done <- struct{}{}` inside a `go func` and an unguarded `<-done` after it, was
+		// exempted although it waits on another goroutine for exactly as long as that
+		// goroutine takes. So the send has to be in the same function AND outside any `go`
+		// statement, which is what separates depositing a token from handing work away.
+		released := releasedChannels(file)
 		ast.Inspect(file, func(node ast.Node) bool {
-			if send, ok := node.(*ast.SendStmt); ok {
-				if name := channelName(send.Chan); name != "" {
-					released[name] = true
-				}
-			}
 			statement, ok := node.(*ast.SelectStmt)
 			if !ok {
 				return true
@@ -259,7 +261,7 @@ func TestNoWaitInThisPackageDependsOnItsPeerToEnd(t *testing.T) {
 					"ctx.Done(), the session's done channel, or a default",
 					fset.Position(typed.Pos()))
 			case *ast.UnaryExpr:
-				if typed.Op == token.ARROW && !guarded[typed.Pos()] && !released[channelName(typed.X)] {
+				if typed.Op == token.ARROW && !guarded[typed.Pos()] && !released[typed.Pos()] {
 					t.Errorf("%s: this receive has no select around it, so nothing but "+
 						"the sender ends it; wait on it alongside a timer, a ctx.Done() "+
 						"or the session's done channel", fset.Position(typed.Pos()))
@@ -271,6 +273,54 @@ func TestNoWaitInThisPackageDependsOnItsPeerToEnd(t *testing.T) {
 	if selects == 0 {
 		t.Fatal("no select was read anywhere in the package, so this fence proved nothing")
 	}
+}
+
+// releasedChannels finds every receive that is taking back a token this same function put
+// there. The walk is per function declaration, and a send that sits inside a `go` statement
+// does not count: that is a worker being handed work, and the receive that follows it waits
+// on the worker rather than on itself.
+func releasedChannels(file *ast.File) map[token.Pos]bool {
+	released := map[token.Pos]bool{}
+	ast.Inspect(file, func(node ast.Node) bool {
+		body, ok := bodyOfAFunction(node)
+		if !ok {
+			return true
+		}
+		deposited := map[string]bool{}
+		ast.Inspect(body, func(inner ast.Node) bool {
+			if _, handedAway := inner.(*ast.GoStmt); handedAway {
+				return false
+			}
+			if send, ok := inner.(*ast.SendStmt); ok {
+				if name := channelName(send.Chan); name != "" {
+					deposited[name] = true
+				}
+			}
+			return true
+		})
+		if len(deposited) == 0 {
+			return true
+		}
+		ast.Inspect(body, func(inner ast.Node) bool {
+			unary, ok := inner.(*ast.UnaryExpr)
+			if ok && unary.Op == token.ARROW && deposited[channelName(unary.X)] {
+				released[unary.Pos()] = true
+			}
+			return true
+		})
+		return true
+	})
+	return released
+}
+
+func bodyOfAFunction(node ast.Node) (*ast.BlockStmt, bool) {
+	switch typed := node.(type) {
+	case *ast.FuncDecl:
+		return typed.Body, typed.Body != nil
+	case *ast.FuncLit:
+		return typed.Body, typed.Body != nil
+	}
+	return nil, false
 }
 
 // channelName renders the channel of a send or a receive as the source spells it, which is
