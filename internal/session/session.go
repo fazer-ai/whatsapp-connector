@@ -116,7 +116,7 @@ type Session struct {
 	// ordered by the executor rather than by a count it polls: a client's command
 	// arriving while an adoption waits to be undone is the thing that must cancel the
 	// undoing, and this is where that is known first. Nil outside the manager.
-	afterCommand func(refusal protocol.ErrorCode, teardown bool)
+	afterCommand func(refusal protocol.ErrorCode, teardown, happened bool)
 	// carried counts the commands this session actually carried out, and exists for one
 	// reader: the manager gives an account back only while nothing has been done on it
 	// since the teardown it was adopted for was refused. A connect that landed behind that
@@ -166,7 +166,7 @@ type Config struct {
 	// longer running it, saying whether it was a teardown and what it answered. It is
 	// what lets the manager undo an adoption that existed only to serve a teardown, and
 	// what tells it when the account has become one somebody else is using.
-	AfterCommand func(refusal protocol.ErrorCode, teardown bool)
+	AfterCommand func(refusal protocol.ErrorCode, teardown, happened bool)
 	// QueueDepth bounds how many commands wait for this session. Beyond it a client
 	// is told the session is busy rather than being queued behind a backlog whose
 	// deadlines have all passed by the time it is reached.
@@ -881,26 +881,26 @@ func (s *Session) execute(ctx context.Context) {
 				release(delivery)
 				continue
 			}
-			refusal, teardown := s.run(ctx, waiting)
+			refusal, teardown, happened := s.run(ctx, waiting)
 			s.doneWith()
 			if s.afterCommand != nil {
 				// After `doneWith`, so an account adopted for a teardown that will not run
 				// is free to be taken back by the very next tick rather than being refused
 				// on the grounds that the refusal itself is still in flight.
-				s.afterCommand(refusal, teardown)
+				s.afterCommand(refusal, teardown, happened)
 			}
 		}
 	}
 }
 
-func (s *Session) run(ctx context.Context, waiting queued) (refusal protocol.ErrorCode, teardown bool) {
+func (s *Session) run(ctx context.Context, waiting queued) (refusal protocol.ErrorCode, teardown, happened bool) {
 	delivery := waiting.delivery
 	command := delivery.Command
 	log := s.log.With().Str("cmd_id", command.ID).Str("type", string(command.Type)).Logger()
 
 	began := waiting.at
 	handedBack := false
-	result, err := s.carryOut(ctx, &command)
+	result, recalled, err := s.carryOut(ctx, &command)
 	// Reported for the two endings that answer the caller, and not for the two below
 	// that hand the command back: a command given back has not been carried out, and
 	// timing it would put this instance's abandoned turn into the latency of a command
@@ -917,7 +917,7 @@ func (s *Session) run(ctx context.Context, waiting queued) (refusal protocol.Err
 		log.Warn().Err(err).Msg("gave a command back rather than risk carrying it out twice")
 		forfeit(delivery)
 		handedBack = true
-		return "", false
+		return "", false, false
 	}
 	if err != nil && ctx.Err() != nil {
 		// The session went away underneath this command: the lease moved, or the process
@@ -932,7 +932,7 @@ func (s *Session) run(ctx context.Context, waiting queued) (refusal protocol.Err
 		log.Warn().Err(err).Msg("gave a command back after the session ended under it")
 		forfeit(delivery)
 		handedBack = true
-		return "", false
+		return "", false, false
 	}
 	// The answer and the acknowledgement both go out detached from the session's
 	// context, because this session is exactly what may have just ended. The work is
@@ -978,9 +978,13 @@ func (s *Session) run(ctx context.Context, waiting queued) (refusal protocol.Err
 	// saw its answer would refuse to take the account back on those grounds -- a hand-back
 	// that needs a second tick for no reason anybody can see from outside.
 	if err != nil {
-		return asProtocolError(err).Code, command.Type == protocol.CommandSessionDelete
+		// `ran` and not a flat no: a teardown the engine refused reached the account and
+		// is an attempt, which is a different thing from one turned away before it began.
+		return asProtocolError(err).Code, command.Type == protocol.CommandSessionDelete, ran(err)
 	}
-	return "", command.Type == protocol.CommandSessionDelete
+	// A recall answered from the record rather than from the account: the command is
+	// finished with, and nothing happened here.
+	return "", command.Type == protocol.CommandSessionDelete, !recalled
 }
 
 // ran reports whether a command got as far as doing anything.
@@ -1009,24 +1013,27 @@ func ran(err error) bool {
 // teardown was queued means the refusal is all that happened.
 func (s *Session) carriedSoFar() int64 { return s.carried.Load() }
 
-func (s *Session) carryOut(ctx context.Context, command *protocol.Command) (json.RawMessage, error) {
+func (s *Session) carryOut(ctx context.Context, command *protocol.Command) (result json.RawMessage, recalled bool, err error) {
 	if _, owned := s.leases.Owned(s.sid); !owned {
-		return nil, protocol.NewError(protocol.ErrorOwnedElsewhere, "the session moved to another instance")
+		return nil, false, protocol.NewError(protocol.ErrorOwnedElsewhere, "the session moved to another instance")
 	}
 	if expired(command, s.now()) {
 		// The caller stopped waiting before this was reached. Running it anyway is a
 		// side effect nobody is expecting the outcome of.
-		return nil, protocol.NewError(protocol.ErrorExpired, "the command deadline passed before it was reached")
+		return nil, false, protocol.NewError(protocol.ErrorExpired, "the command deadline passed before it was reached")
 	}
 
 	key := idempotencyKey(command)
 	result, done, err := s.alreadyDid(ctx, key)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if done {
-		// Only successes are remembered, so a recalled command is one that worked.
-		return result, nil
+		// Only successes are remembered, so a recalled command is one that worked -- once,
+		// and not now. Said out loud to the caller, because the two are different facts
+		// about the account: the record knows something ran a day ago, not that the world
+		// stayed that way.
+		return result, true, nil
 	}
 
 	execCtx, releaseBound := bound(ctx, command)
@@ -1064,7 +1071,7 @@ func (s *Session) carryOut(ctx context.Context, command *protocol.Command) (json
 		// caller naming the message, and the client discarding the repeat.
 		s.remember(ctx, command, key, result)
 	}
-	return result, err
+	return result, false, err
 }
 
 // bound gives the work the ceiling its caller asked for, out of the two the contract has.

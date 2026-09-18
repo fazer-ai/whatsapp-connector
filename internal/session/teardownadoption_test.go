@@ -73,21 +73,25 @@ func (h teardownHarness) heartbeat(t *testing.T) {
 	h.manager.SweepRetired(context.Background(), by)
 }
 
-// handedBack ticks until the account has gone back, and fails if it takes more than the
-// two ticks the design allows for.
+// handedBack ticks until the account has gone back, and fails if it never does.
 //
-// One tick is the ordinary case and the design's promise, and it is not something a test
-// can demand in one line: the executor finishes with the refusal, tells the manager, and
-// only then is the account on the list, while the client's answer went out a moment
-// earlier. A tick that lands in between is correct and takes the account on the next one.
+// Ticking rather than asserting after one tick, and this is not a weaker assertion, it is
+// the honest one from out here. The client's answer goes out inside the command, and the
+// account reaches the list after the executor has finished with it: a tick landing between
+// the two is correct and takes the account on the next one. The one-tick property is real
+// and is pinned where it can be synchronised, in the internal tests, which can wait for
+// the registration itself.
 func (h teardownHarness) handedBack(t *testing.T) {
 	t.Helper()
-	for range 2 {
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
 		h.heartbeat(t)
 		if h.manager.Count() == 0 {
 			return
 		}
+		time.Sleep(time.Millisecond)
 	}
+	t.Fatalf("the account was never given back: %d still running", h.manager.Count())
 }
 
 func (h teardownHarness) epoch(t *testing.T, sid string) string {
@@ -641,5 +645,56 @@ func TestALateConnectRefusedDoesNotPinTheAccount(t *testing.T) {
 	}
 	if h.server.Exists(h.keys.Lease(sid)) {
 		t.Fatal("the lease is still held for an account nobody asked for")
+	}
+}
+
+// TestATeardownAnsweredFromTheRecordGivesTheAccountBack is the purest form of #249, and
+// the one where nobody can want the account: it no longer exists.
+//
+// A teardown that worked leaves a record for a day, and the entry can be handed out again
+// inside it. The redelivery finds no session, so it is adopted from the control stream:
+// a lease, a new epoch, and an engine session, all for a command that is then answered out
+// of the record without touching the account. A record is not a fact about now, and the
+// account it is about was deleted.
+//
+// The counter cannot be undone to compensate, which is why the adoption is what gives:
+// #247 measured that dropping it destroys the fencing token of an account paired again
+// inside that same day.
+func TestATeardownAnsweredFromTheRecordGivesTheAccountBack(t *testing.T) {
+	t.Parallel()
+	h := newTeardownHarness(t)
+	const sid = "sess-249-recalled"
+
+	first := teardown(sid, "cmd-recall", time.Time{})
+	h.manager.Dispatch(first)
+	if reply := h.answered(t, "cmd-recall"); !reply.OK {
+		t.Fatalf("given: the first teardown failed: %+v", reply.Error)
+	}
+	torn, ok := h.engine.Session(sid)
+	if !ok || torn.Deleted() == 0 {
+		t.Fatal("given: the account was not torn down")
+	}
+	h.handedBack(t)
+
+	// The very same entry, handed out again while the record still stands.
+	again := teardown(sid, "cmd-recall", time.Time{})
+	again.Command.ReplyTo = "wa:reply:cmd-recall-2"
+	again.DeliveredBefore = true
+	h.manager.Dispatch(again)
+	if reply := h.answered(t, "cmd-recall-2"); !reply.OK {
+		t.Fatalf("given: the redelivery was supposed to be answered from the record: %+v", reply.Error)
+	}
+	// Asserted rather than skipped past: if the redelivery stopped adopting the account,
+	// this test would go on passing while fencing nothing at all.
+	if h.manager.Count() != 1 {
+		t.Fatalf("given: the redelivery was supposed to adopt the account to answer it, %d running", h.manager.Count())
+	}
+	if h.epoch(t, sid) == "" {
+		t.Fatal("given: the redelivery took no epoch, so it did not adopt")
+	}
+
+	h.handedBack(t)
+	if h.server.Exists(h.keys.Lease(sid)) {
+		t.Fatal("the lease taken to answer a teardown out of the record is still held, for an account that no longer exists and that nobody can ask for")
 	}
 }

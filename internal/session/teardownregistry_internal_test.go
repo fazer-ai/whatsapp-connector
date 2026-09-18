@@ -287,7 +287,7 @@ func TestAHandBackIsDroppedWhenTheAccountStoppedBeingOursToGiveBack(t *testing.T
 	t.Cleanup(func() { manager.StopAll(ctx) })
 
 	const sid = "sess-registry-gone"
-	session, created, err := manager.adopt(ctx, sid)
+	session, created, err := manager.adopt(ctx, sid, wanted)
 	if err != nil || !created {
 		t.Fatalf("adopt: %v created=%v", err, created)
 	}
@@ -304,7 +304,7 @@ func TestAHandBackIsDroppedWhenTheAccountStoppedBeingOursToGiveBack(t *testing.T
 
 	// And now the same decision, with the account no longer listed: a wake took it while
 	// the pass was walking.
-	session, created, err = manager.adopt(ctx, sid)
+	session, created, err = manager.adopt(ctx, sid, wanted)
 	if err != nil || !created {
 		t.Fatalf("adopt again: %v created=%v", err, created)
 	}
@@ -340,7 +340,7 @@ func TestAnUnansweredTeardownIsNotHandedBack(t *testing.T) {
 	t.Cleanup(func() { manager.StopAll(ctx) })
 
 	const sid = "sess-registry-unanswered"
-	session, created, err := manager.adopt(ctx, sid)
+	session, created, err := manager.adopt(ctx, sid, wanted)
 	if err != nil || !created {
 		t.Fatalf("adopt: %v created=%v", err, created)
 	}
@@ -387,7 +387,7 @@ func TestAResumeThatFoundTheAccountAlreadyAdoptedCallsOffTheHandBack(t *testing.
 	t.Cleanup(func() { manager.StopAll(ctx) })
 
 	const sid = "sess-registry-resumed"
-	session, created, err := manager.adopt(ctx, sid)
+	session, created, err := manager.adopt(ctx, sid, wanted)
 	if err != nil || !created {
 		t.Fatalf("adopt: %v created=%v", err, created)
 	}
@@ -440,7 +440,7 @@ func TestASessionCountsTheCommandsItCarriedOut(t *testing.T) {
 	t.Cleanup(func() { manager.StopAll(ctx) })
 
 	const sid = "sess-registry-counting"
-	session, created, err := manager.adopt(ctx, sid)
+	session, created, err := manager.adopt(ctx, sid, wanted)
 	if err != nil || !created {
 		t.Fatalf("adopt: %v created=%v", err, created)
 	}
@@ -485,4 +485,81 @@ func waitForCount(t *testing.T, session *Session, want int64, why string) {
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatalf("%s (count is %d, want %d)", why, session.carriedSoFar(), want)
+}
+
+// The rule that decides what an account adopted for a teardown is worth, asked directly.
+//
+// Three of these outcomes cannot be produced from outside on an account this path adopted:
+// `owned_elsewhere` needs the lease to go stale between the adoption and the executor, and
+// the two engine endings need the teardown to reach an engine that was armed before the
+// adoption existed. Asked through a running fleet they would be a handful of races; asked
+// here they are a table, and the table is what a later round reads.
+func TestWhatEachEndingOfATeardownIsWorth(t *testing.T) {
+	t.Parallel()
+
+	const (
+		armed = "armed: the account goes back"
+		kept  = "kept: the account stays and stops being ours to undo"
+		held  = "held: nothing happened, the decision stands"
+	)
+	for _, tc := range []struct {
+		name     string
+		code     protocol.ErrorCode
+		teardown bool
+		happened bool
+		want     string
+	}{
+		{name: "a teardown refused for arriving late", code: protocol.ErrorExpired, teardown: true, want: armed},
+		{name: "a teardown answered out of the record", teardown: true, want: armed},
+		{name: "a teardown refused on a stale renewal", code: protocol.ErrorOwnedElsewhere, teardown: true, want: kept},
+		{name: "a teardown the engine refused", code: protocol.ErrorInternal, teardown: true, happened: true, want: kept},
+		{name: "a teardown that worked", teardown: true, happened: true, want: kept},
+		{name: "a command that worked", happened: true, want: kept},
+		{name: "a command answered out of the record", want: kept},
+		{name: "a command refused for arriving late", code: protocol.ErrorExpired, want: held},
+		{name: "a command refused on a stale renewal", code: protocol.ErrorOwnedElsewhere, want: held},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			server := miniredis.RunT(t)
+			rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+			t.Cleanup(func() { _ = rdb.Close() })
+			client := redisx.Wrap(rdb, "wa:", 8)
+			manager := NewManager(&ManagerConfig{
+				Instance: "inst-a", Engine: fake.New(),
+				Leases:    cluster.NewLeases(client, "inst-a", cluster.Options{}),
+				Publisher: quietPublisher{}, Replier: quietReplier{},
+				NewID: func() string { return "evt" }, Logger: zerolog.New(io.Discard),
+			})
+			ctx := context.Background()
+			t.Cleanup(func() { manager.StopAll(ctx) })
+
+			sid := "sess-ending"
+			session, created, err := manager.adopt(ctx, sid, toTearDown)
+			if err != nil || !created {
+				t.Fatalf("adopt: %v created=%v", err, created)
+			}
+
+			manager.afterCommand(sid, tc.code, tc.teardown, tc.happened)
+
+			manager.forDeleteMu.Lock()
+			entry, listed := manager.forDelete[sid]
+			manager.forDeleteMu.Unlock()
+
+			got := kept
+			switch {
+			case listed && entry.refused:
+				got = armed
+			case listed:
+				got = held
+			}
+			if got != tc.want {
+				t.Fatalf("%s\ngot  %s\nwant %s", tc.name, got, tc.want)
+			}
+			if tc.want == armed && entry.carried != session.carriedSoFar() {
+				t.Fatalf("the hand-back was armed at %d, and the session has carried out %d", entry.carried, session.carriedSoFar())
+			}
+		})
+	}
 }

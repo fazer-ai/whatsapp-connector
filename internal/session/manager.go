@@ -229,9 +229,26 @@ const releaseTimeout = 2 * time.Second
 // It returns cluster.ErrNotOwner when another instance holds it, which is the ordinary
 // answer in a fleet and not a failure.
 func (m *Manager) Adopt(ctx context.Context, sid string) (*Session, error) {
-	session, _, err := m.adopt(ctx, sid)
+	session, _, err := m.adopt(ctx, sid, wanted)
 	return session, err
 }
+
+// Why an adoption is being made, which decides what it does to the list of accounts held
+// for a teardown. The two are not symmetrical and cannot be inferred from anything the
+// adoption itself can see.
+const (
+	// wanted is somebody asking for the account to be in the air: a wake, the resume
+	// sweep. An undoing waiting for a tick is called off, and it has to happen under the
+	// same turn as the adoption -- released first, the heartbeat takes the turn, finds the
+	// registration still there and stops a session the wake is about to be told is running.
+	wanted = false
+	// toTearDown is `takeForDelete`. It registers the account it opens, under the same
+	// lock that publishes the session, because a command dispatched on another goroutine
+	// can be carried out the instant the session is visible: registered afterwards, that
+	// command's report would find nothing to cancel and the teardown's refusal would then
+	// take a used account as its baseline.
+	toTearDown = true
+)
 
 // adopt is Adopt, and reports whether this call is the one that opened the session.
 //
@@ -241,7 +258,7 @@ func (m *Manager) Adopt(ctx context.Context, sid string) (*Session, error) {
 // wants the account in the air. `takeForDelete` is the one that needs more, because an
 // adoption it made to serve a teardown has no owner if the teardown does not run, while
 // one it merely found belongs to whoever asked for it.
-func (m *Manager) adopt(ctx context.Context, sid string) (*Session, bool, error) {
+func (m *Manager) adopt(ctx context.Context, sid string, forTeardown bool) (*Session, bool, error) {
 	if !m.tryHoldHanding(sid) {
 		// The heartbeat is handing this very account back. Waiting for it would hold every
 		// wake and ping behind it on this goroutine, and what is being waited for is an
@@ -276,6 +293,11 @@ func (m *Manager) adopt(ctx context.Context, sid string) (*Session, bool, error)
 			m.log.Info().Str("sid", sid).
 				Msg("a wake found an account this instance is finishing with; leaving it pending")
 			return nil, false, errLeaving
+		}
+		if !forTeardown {
+			// Somebody wants this account up, and this is the only place that can be said
+			// while the turn for the account is still held.
+			m.forgetAdoptedForDelete(sid, nil)
 		}
 		return existing, false, nil
 	}
@@ -339,7 +361,7 @@ func (m *Manager) adopt(ctx context.Context, sid string) (*Session, bool, error)
 		NewID: m.newID, Now: m.now, Logger: m.log,
 		Undrained: func() { m.undrained(sid) }, RetireRetry: m.retireRetry,
 		Connected: func() { m.working(living, sid) }, ResumeFailed: func() { m.failing(living, sid) },
-		AfterCommand: func(code protocol.ErrorCode, teardown bool) { m.afterCommand(sid, code, teardown) },
+		AfterCommand: func(code protocol.ErrorCode, teardown, happened bool) { m.afterCommand(sid, code, teardown, happened) },
 	})
 
 	m.mu.Lock()
@@ -349,9 +371,20 @@ func (m *Manager) adopt(ctx context.Context, sid string) (*Session, bool, error)
 	if winner, ok := m.sessions[sid]; ok {
 		m.mu.Unlock()
 		session.Stop()
+		if !forTeardown {
+			m.forgetAdoptedForDelete(sid, nil)
+		}
 		return winner, false, nil
 	}
 	m.sessions[sid] = session
+	if forTeardown {
+		// Under the same lock as the insert, for the reason `toTearDown` gives: a command
+		// dispatched on the reader's goroutine can be carried out the instant this session
+		// is visible, and its report has to find a registration to cancel.
+		m.forDeleteMu.Lock()
+		m.forDelete[sid] = adoptedForDelete{session: session}
+		m.forDeleteMu.Unlock()
+	}
 	// Under the same lock as the insert, and this is the ordering the whole file turns
 	// on: between the two there used to be a moment where the session was running and
 	// not yet waiting to be drained. Nothing could observe it while adoption ran on the
@@ -935,13 +968,6 @@ func (m *Manager) wake(ctx context.Context, delivery *transport.Delivery) {
 	_, err := m.Adopt(ctx, sid)
 	switch {
 	case err == nil:
-		// Somebody wants this account in the air, which ends any undoing that was waiting
-		// for a tick. Here and in `reconnect` rather than inside `Adopt`: `takeForDelete`
-		// adopts too, and a second late teardown queued behind the first reaches the same
-		// branch -- clearing the list there would let both be refused with the account
-		// kept forever. A wake leaves no trace in the count either, so this is the only
-		// place it can be noticed.
-		m.forgetAdoptedForDelete(sid, nil)
 	case errors.Is(err, errLeaving):
 		// Not this instance's turn to answer: it is giving the account up, and the wake is
 		// what starts it again once nobody owns it. Released rather than forfeited, so it
@@ -1027,24 +1053,38 @@ type adoptedForDelete struct {
 // A command that is not a teardown ends the undoing, because it means somebody is using
 // the account -- unless it was refused before it ran, which says nothing about the account
 // and must not pin one nobody asked for to this instance.
-func (m *Manager) afterCommand(sid string, code protocol.ErrorCode, teardown bool) {
+func (m *Manager) afterCommand(sid string, code protocol.ErrorCode, teardown, happened bool) {
 	switch {
-	case teardown && code == protocol.ErrorExpired:
+	case teardown && !happened && code != protocol.ErrorOwnedElsewhere:
+		// The teardown did not run. It was refused for arriving late, or answered out of
+		// the idempotency record for a command that ran a day ago -- and a record is not a
+		// fact about now: an account torn down and deleted has no session, so a redelivery
+		// of that teardown adopts it afresh, takes a lease and a new epoch, is answered
+		// `ok` from the record, and tears nothing down. Nobody wants that account; nobody
+		// can, it no longer exists.
+		//
+		// `owned_elsewhere` is the exception and it is measured, not assumed: it does not
+		// mean the account moved, it means this holder's own renewal is older than
+		// `ttl - margin`, which the next heartbeat repairs, with the lease key naming this
+		// instance throughout. Giving the account back there would drop a session this
+		// instance still runs and still renews.
 		m.forDeleteMu.Lock()
 		if entry, listed := m.forDelete[sid]; listed {
 			entry.refused = true
 			entry.carried = entry.session.carriedSoFar()
 			m.forDelete[sid] = entry
-			m.log.Info().Str("sid", sid).
-				Msg("a teardown arrived too late to run; giving back the account it was adopted for")
+			m.log.Info().Str("sid", sid).Str("code", string(code)).
+				Msg("a teardown ran nothing; giving back the account it was adopted for")
 		}
 		m.forDeleteMu.Unlock()
-	case !teardown && code != "" && !carriedOut(code):
+	case !teardown && !carriedOut(code):
 		// Refused before it ran, so nothing happened to this account and the hand-back
-		// still stands.
+		// still stands. A late `session.connect` is not a client using the account, and
+		// treating it as one would pin an account nobody ever asked for to this instance
+		// for the life of the process.
 	default:
-		// Either the account was used, or the teardown was attempted and the account is
-		// staying: both end the undoing.
+		// Either the account was used, or a teardown was attempted on it and the account
+		// is staying: both end the undoing.
 		m.forgetAdoptedForDelete(sid, nil)
 	}
 }
@@ -1061,7 +1101,8 @@ func carriedOut(code protocol.ErrorCode) bool {
 }
 
 // adoptedToDelete records that this instance opened an account in order to serve one
-// teardown, with what the session had answered at that moment.
+// teardown. `adopt` does it under the lock that publishes the session; this is how a test
+// builds the same state on a session it adopted for itself.
 func (m *Manager) adoptedToDelete(sid string, session *Session) {
 	m.forDeleteMu.Lock()
 	m.forDelete[sid] = adoptedForDelete{session: session}
@@ -1158,7 +1199,7 @@ func (m *Manager) forgetAdoptedForDelete(sid string, was *Session) {
 // says which refusals count and which do not, and why.
 func (m *Manager) takeForDelete(ctx context.Context, delivery *transport.Delivery) {
 	sid := delivery.Command.SID
-	session, created, err := m.adopt(ctx, sid)
+	session, _, err := m.adopt(ctx, sid, toTearDown)
 	switch {
 	case err == nil:
 	case errors.Is(err, errLeaving):
@@ -1191,12 +1232,6 @@ func (m *Manager) takeForDelete(ctx context.Context, delivery *transport.Deliver
 		return
 	}
 
-	if created {
-		// Opened for this command and for nothing else. Recorded before the offer,
-		// because the executor can answer before this function returns and the answer is
-		// what decides whether the account has any reason to stay.
-		m.adoptedToDelete(sid, session)
-	}
 	switch session.Offer(delivery) {
 	case OfferAccepted:
 	case OfferStopped:
@@ -1294,9 +1329,6 @@ func (m *Manager) reconnect(ctx context.Context, delivery *transport.Delivery) {
 		m.log.Debug().Err(err).Str("sid", sid).Msg("could not take a session that should be running")
 		return
 	}
-	// The record the client wrote says this account should be up, which ends any undoing
-	// waiting for a tick. Said here as well as in `wake`, for the reason given there.
-	m.forgetAdoptedForDelete(sid, nil)
 	if session.Offer(delivery) != OfferAccepted {
 		m.log.Info().Str("sid", sid).Msg("a session that should be running had no room for the connect that would resume it")
 	}
