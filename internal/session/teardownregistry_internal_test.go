@@ -3,7 +3,12 @@ package session
 import (
 	"context"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -672,5 +677,248 @@ func TestAReportFromASupersededSessionChangesNothing(t *testing.T) {
 	manager.forDeleteMu.Unlock()
 	if !listed || entry.refused {
 		t.Fatal("a superseded session's refusal armed a hand-back for the session that replaced it; the next tick stops an account whose own teardown has not been answered")
+	}
+}
+
+// A tick that ran out of window leaves the hand-back it owes on the list.
+//
+// Nothing else will ever look at this session: it is not retired, so no sweep lists it,
+// and its lease is renewed for as long as the instance lives. A tick whose window was
+// spent before it reached this account has to leave it listed, or the one thing that
+// would have given the account back has forgotten it.
+//
+// Here rather than beside the other endings, because the given is the part that can go
+// missing: from outside the package the only moment a test can wait for is the client's
+// answer, which goes out before the registration is written, and a spent tick that runs
+// with nothing armed yet proves nothing at all. `settled` waits for the registration
+// itself, so the tick under test meets the state the test is named for.
+func TestATickThatRanOutOfWindowKeepsTheHandBackListed(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+	manager := NewManager(&ManagerConfig{
+		Instance: "inst-a", Engine: fake.New(),
+		Leases:    cluster.NewLeases(client, "inst-a", cluster.Options{}),
+		Publisher: quietPublisher{}, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.New(io.Discard),
+	})
+	ctx := context.Background()
+	t.Cleanup(func() { manager.StopAll(ctx) })
+	answering, stopAnswering := context.WithCancel(ctx)
+	stopped := manager.Answer(answering)
+	t.Cleanup(func() { stopAnswering(); <-stopped })
+
+	const sid = "sess-registry-spent"
+	acked := make(chan struct{})
+	manager.Dispatch(&transport.Delivery{
+		Command: protocol.Command{
+			V: protocol.Version, Type: protocol.CommandSessionDelete, SID: sid, ID: "c-spent",
+			Deadline: time.Now().Add(-time.Minute).UnixMilli(),
+		},
+		Ack:     func(context.Context) error { close(acked); return nil },
+		Release: func() {}, Forfeit: func() {},
+	})
+	select {
+	case <-acked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the teardown was never acknowledged")
+	}
+	settled(t, manager, sid, armed)
+
+	// A tick with no window left for anything but the renewals themselves.
+	spent := time.Now().Add(-time.Second)
+	manager.RenewAll(ctx, spent)
+
+	if manager.Count() != 1 {
+		t.Fatal("given: the account went back on a tick that had no window to do it in")
+	}
+	manager.forDeleteMu.Lock()
+	entry, listed := manager.forDelete[sid]
+	manager.forDeleteMu.Unlock()
+	if !listed || !entry.refused {
+		t.Fatal("a hand-back the tick had no time for was struck off the list; nothing else lists this session, so the account is owned for the life of the process")
+	}
+
+	manager.RenewAll(ctx, time.Now().Add(time.Minute))
+	if manager.Count() != 0 {
+		t.Fatalf("the account was never given back on the tick that could run: %d running", manager.Count())
+	}
+}
+
+// No way out of the session map leaves a registration behind, including the ones nothing
+// ever armed.
+//
+// The list of accounts adopted to serve a teardown is a second map under the same sid, and
+// the third leak of this round was a way out of the first that the second never heard
+// about: a lease lost between the adoption and the executor reaching the command. The tick
+// drops the session and stops it, stopping releases what is queued instead of running it,
+// so nothing reports how that teardown ended and the entry is never armed. A sweep that
+// filtered on the mark first could not reach it again -- one entry per teardown that loses
+// that race, each holding a stopped session and the whatsmeow client behind it, for the
+// life of the process, with every other test in this package staying green.
+//
+// Answering that by writing the mark on one more path would be an enumeration, and the
+// next path to end a session without passing through it leaks the same way. What the sweep
+// asks instead is whether the session is still the one in the map, which no new way out
+// can be written around. The ways are still worth counting, because the compiler says
+// nothing when one is added: this asks the source how many there are and fails when the
+// answer changes, then drives each one it knows about.
+func TestNoWayOutOfTheSessionMapLeavesARegistrationBehind(t *testing.T) {
+	t.Parallel()
+
+	intoTheMap := map[string]bool{"adopt": true}
+	outOfTheMap := map[string]bool{"stopSession": true, "drop": true}
+
+	// The whole package and not `manager.go`, which is where the map happens to live
+	// today. `m.sessions` is the package's, so a file added tomorrow could put a session
+	// in it or take one out without this fence saying a word -- and a fence that holds
+	// only as long as nobody rearranges the files is one that lets go on the day it is
+	// for.
+	fset := token.NewFileSet()
+	var files []*ast.File
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read the package directory: %v", err)
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		parsed, err := parser.ParseFile(fset, name, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		files = append(files, parsed)
+	}
+	if len(files) < 2 {
+		t.Fatalf("the package parsed as %d file(s); this fence is reading the wrong directory and would pass on an empty one", len(files))
+	}
+	// `delete` is handed the map itself and an assignment is handed a place in it, so the
+	// two are matched apart rather than through one predicate that would quietly stop
+	// matching either.
+	theMap := func(node ast.Node) bool {
+		selector, ok := node.(*ast.SelectorExpr)
+		return ok && selector.Sel.Name == "sessions"
+	}
+	aPlaceInTheMap := func(node ast.Node) bool {
+		index, ok := node.(*ast.IndexExpr)
+		return ok && theMap(index.X)
+	}
+	for _, file := range files {
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Recv == nil || fn.Body == nil {
+				continue
+			}
+			ast.Inspect(fn.Body, func(node ast.Node) bool {
+				switch stmt := node.(type) {
+				case *ast.AssignStmt:
+					if len(stmt.Lhs) == 1 && aPlaceInTheMap(stmt.Lhs[0]) && !intoTheMap[fn.Name.Name] {
+						t.Errorf("%s puts a session in the map, and this test did not know about it: a session that enters the map somewhere new is one the registration it may carry was not written beside", fn.Name.Name)
+					}
+				case *ast.CallExpr:
+					builtin, ok := stmt.Fun.(*ast.Ident)
+					if !ok || builtin.Name != "delete" || len(stmt.Args) == 0 || !theMap(stmt.Args[0]) {
+						return true
+					}
+					if !outOfTheMap[fn.Name.Name] {
+						t.Errorf("%s takes a session out of the map, and this test did not know about it: add a case below and prove no registration survives it, or the account it was adopted for is held for the life of the process", fn.Name.Name)
+					}
+					delete(outOfTheMap, fn.Name.Name)
+				}
+				return true
+			})
+		}
+	}
+	for name := range outOfTheMap {
+		t.Errorf("%s no longer takes a session out of the map; this fence is watching a way out that is not there any more", name)
+	}
+
+	for _, tc := range []struct {
+		name string
+		// arm says the teardown was answered and the account is waiting to go back, which
+		// is the state the sweep was written for. The other half of the table is the one
+		// it was not: adopted, never answered, and already gone.
+		arm  bool
+		exit func(t *testing.T, manager *Manager, sid string, session *Session)
+	}{
+		{
+			name: "stopped with the account still listed",
+			exit: func(_ *testing.T, manager *Manager, sid string, _ *Session) { manager.stopSession(sid) },
+		},
+		{
+			name: "stopped after the teardown was refused",
+			arm:  true,
+			exit: func(_ *testing.T, manager *Manager, sid string, _ *Session) { manager.stopSession(sid) },
+		},
+		{
+			name: "lease lost before the teardown was answered",
+			exit: func(t *testing.T, manager *Manager, sid string, session *Session) {
+				dropped, still := manager.drop(sid, session)
+				if !still {
+					t.Fatal("given: the session in the map was not the one just adopted")
+				}
+				dropped.Stop()
+			},
+		},
+		{
+			name: "lease lost after the teardown was refused",
+			arm:  true,
+			exit: func(t *testing.T, manager *Manager, sid string, session *Session) {
+				dropped, still := manager.drop(sid, session)
+				if !still {
+					t.Fatal("given: the session in the map was not the one just adopted")
+				}
+				dropped.Stop()
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			server := miniredis.RunT(t)
+			rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+			t.Cleanup(func() { _ = rdb.Close() })
+			client := redisx.Wrap(rdb, "wa:", 8)
+			manager := NewManager(&ManagerConfig{
+				Instance: "inst-a", Engine: fake.New(),
+				Leases:    cluster.NewLeases(client, "inst-a", cluster.Options{}),
+				Publisher: quietPublisher{}, Replier: quietReplier{},
+				NewID: func() string { return "evt" }, Logger: zerolog.New(io.Discard),
+			})
+			ctx := context.Background()
+			t.Cleanup(func() { manager.StopAll(ctx) })
+
+			const sid = "sess-registry-wayout"
+			session, created, err := manager.adopt(ctx, sid, toTearDown)
+			if err != nil || !created {
+				t.Fatalf("adopt: %v created=%v", err, created)
+			}
+			if tc.arm {
+				// The executor's own report, called where the executor calls it: a
+				// teardown turned away for arriving late, having run nothing.
+				manager.afterCommand(sid, session, protocol.ErrorExpired, true, false)
+			}
+			manager.forDeleteMu.Lock()
+			entry, listed := manager.forDelete[sid]
+			manager.forDeleteMu.Unlock()
+			if !listed || entry.refused != tc.arm {
+				t.Fatalf("given: listed=%v refused=%v, want listed=true refused=%v", listed, entry.refused, tc.arm)
+			}
+
+			tc.exit(t, manager, sid, session)
+			manager.RenewAll(ctx, time.Now().Add(time.Minute))
+
+			manager.forDeleteMu.Lock()
+			_, listed = manager.forDelete[sid]
+			manager.forDeleteMu.Unlock()
+			if listed {
+				t.Fatal("an account whose session left the map is still listed to be handed back; the entry and the stopped session it holds outlive every account they were about, and nothing else ever walks this list")
+			}
+		})
 	}
 }

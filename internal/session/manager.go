@@ -1146,7 +1146,9 @@ func (m *Manager) adoptedToDelete(sid string, session *Session) {
 }
 
 // giveBackRefusedTeardowns hands back the accounts opened for a teardown that was refused
-// before it ran, and is called from the heartbeat for the reason the mark exists.
+// before it ran, and is called from the heartbeat for the reason the mark exists. It is
+// also the only thing that walks the list, so it is where a registration whose session is
+// already gone is dropped.
 //
 // An account is given back only while it is still the session that was adopted and still
 // has answered nothing but that teardown. Both clauses guard the same thing from two
@@ -1154,16 +1156,23 @@ func (m *Manager) adoptedToDelete(sid string, session *Session) {
 // which case the pointer differs, or something may have arrived that wants it up, in
 // which case the count moved. `claimIdle` asks a third time, with the door shut in the
 // same step, about a command that arrived between this pass and the stop.
+//
+// The walk is over every registration and not only the ones waiting to go back, because a
+// session can be taken out from under one before its teardown is ever answered. A lease
+// lost between the adoption and the executor reaching the command is the route that
+// happens: the tick drops the session and stops it, and stopping releases what is still
+// queued instead of running it, so `afterCommand` never reports and the registration is
+// never armed. Filtering on the mark first would leave that entry unreachable for the
+// life of the process, holding the session and the whatsmeow client behind it, and the
+// pointer comparison the hand-back already makes is the same question that answers it.
 func (m *Manager) giveBackRefusedTeardowns(ctx context.Context) {
 	m.forDeleteMu.Lock()
-	giving := make(map[string]adoptedForDelete, len(m.forDelete))
+	listed := make(map[string]adoptedForDelete, len(m.forDelete))
 	for sid, entry := range m.forDelete {
-		if entry.refused {
-			giving[sid] = entry
-		}
+		listed[sid] = entry
 	}
 	m.forDeleteMu.Unlock()
-	if len(giving) == 0 {
+	if len(listed) == 0 {
 		return
 	}
 
@@ -1175,11 +1184,21 @@ func (m *Manager) giveBackRefusedTeardowns(ctx context.Context) {
 	// exactly the accounts this function exists to give back owned forever.
 	running := m.running()
 
-	for sid, entry := range giving {
+	// Gone, or replaced by an adoption of its own: there is nothing of ours left to undo,
+	// and whatever is there now has its own reason to be. Done for the whole list before
+	// anything is handed back, so that running out of tick halfway through the hand-backs
+	// does not leave some of them listed against a session nobody has.
+	for sid, entry := range listed {
 		if running[sid] != entry.session {
-			// Gone, or replaced by an adoption of its own: there is nothing of ours left
-			// to undo, and whatever is there now has its own reason to be.
 			m.forgetAdoptedForDelete(sid, entry.session)
+			delete(listed, sid)
+		}
+	}
+
+	for sid, entry := range listed {
+		if !entry.refused {
+			// Adopted, and how its teardown ends is not known yet. The account is this
+			// instance's for as long as that takes, and the report is what arms it.
 			continue
 		}
 		if ctx.Err() != nil {

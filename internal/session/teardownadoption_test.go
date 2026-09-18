@@ -169,11 +169,11 @@ func TestATeardownRefusedForArrivingLateDoesNotLeaveTheAccountAdopted(t *testing
 	}
 	reply := h.answered(t, "cmd-late")
 	adopted, opened := h.engine.Session(sid)
-	h.heartbeat(t)
-
 	if reply.OK || refusalCode(reply) != protocol.ErrorExpired {
 		t.Fatalf("the refusal changed: got ok=%v code=%q, want ok=false code=%q", reply.OK, refusalCode(reply), protocol.ErrorExpired)
 	}
+	h.handedBack(t)
+
 	if opened && adopted.Deleted() != 0 {
 		t.Fatalf("the account was torn down %d time(s) by a command that was refused", adopted.Deleted())
 	}
@@ -286,12 +286,12 @@ func TestALateTeardownDeliveredAgainDoesNotPileUpAdoptions(t *testing.T) {
 			t.Fatalf("delivery %d: got ok=%v code=%q", round, reply.OK, refusalCode(reply))
 		}
 	}
-	// One tick, after all five, and deliberately not one between each: the hand-back waits
+	// Ticks only after all five, and deliberately none between them: the hand-back waits
 	// for a tick, so deliveries two to five land on the session the first one adopted and
 	// are handed to its executor directly. A licence that counted commands rather than
 	// refused teardowns would read those repeats as an account somebody came to want, and
 	// this account would then never go back.
-	h.heartbeat(t)
+	h.handedBack(t)
 
 	if acked.Load() != 5 || released.Load() != 0 || forfeited.Load() != 0 {
 		t.Fatalf("a late teardown was left pending: acked=%d released=%d forfeited=%d, want 5/0/0; pending it comes back on its own and the loop never ends",
@@ -486,43 +486,6 @@ func TestATeardownAdoptedForAndRefusedByTheEngineKeepsTheAccount(t *testing.T) {
 	}
 	if _, owned := h.leases.Owned(sid); !owned {
 		t.Fatal("the lease went back after an attempted teardown failed, so the retry has to win it again")
-	}
-}
-
-// TestAHandBackThatRanOutOfTickIsTriedAgain keeps the registration honest at the one
-// ending that is nobody's fault.
-//
-// Nothing else will ever look at this session: it is not retired, so no sweep lists it,
-// and its lease is renewed for as long as the instance lives. A tick whose window ran out
-// before it reached this account has to leave it on the list, or the one thing that would
-// have given the account back has forgotten it.
-func TestAHandBackThatRanOutOfTickIsTriedAgain(t *testing.T) {
-	t.Parallel()
-	h := newTeardownHarness(t)
-	const sid = "sess-249-retry"
-
-	h.manager.Dispatch(teardown(sid, "cmd-retry", time.Now().Add(-time.Minute)))
-	if reply := h.answered(t, "cmd-retry"); refusalCode(reply) != protocol.ErrorExpired {
-		t.Fatalf("given: got %q, want the late refusal", refusalCode(reply))
-	}
-	if h.manager.Count() != 1 {
-		t.Fatal("given: the adoption for the teardown did not happen")
-	}
-
-	// A tick with no window left: every hand-back it owes is left for the next one.
-	spent := time.Now().Add(-time.Second)
-	h.manager.RenewAll(context.Background(), spent)
-	h.manager.SweepRetired(context.Background(), spent)
-	if h.manager.Count() != 1 {
-		t.Fatal("given: the account went back on a tick that had no window to do it in")
-	}
-
-	h.heartbeat(t)
-	if h.manager.Count() != 0 {
-		t.Fatalf("the account was never given back: the tick that ran out forgot it, and nothing else lists this session: %d running", h.manager.Count())
-	}
-	if h.server.Exists(h.keys.Lease(sid)) {
-		t.Fatal("the lease is still held")
 	}
 }
 
