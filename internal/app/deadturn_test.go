@@ -38,7 +38,7 @@ func TestASurvivorTakesTheTurnOfAnInstanceThatIsGone(t *testing.T) {
 
 	// What a killed instance leaves behind: no lease, and a turn in a name nobody answers
 	// to. No `wa:instance:inst-dead`, which is what makes it gone rather than quiet.
-	keys := redisx.NewKeys("wa:", 8)
+	keys := redisx.NewKeys("wa:", 0)
 	if err := server.Set(keys.Resume(sid), "inst-dead"); err != nil {
 		t.Fatalf("plant the dead instance's turn: %v", err)
 	}
@@ -54,7 +54,7 @@ func TestASurvivorTakesTheTurnOfAnInstanceThatIsGone(t *testing.T) {
 	}
 
 	survivor := start(t, server.Addr(), "inst-alive",
-		map[string]string{"WAC_DATABASE_URL": dsn, "WAC_EVENT_SHARDS": "8"})
+		map[string]string{"WAC_DATABASE_URL": dsn})
 
 	client := newClient(t, server.Addr())
 	waitFor(t, "the survivor to put the account back in the air over a dead instance's turn", func() bool {
@@ -86,7 +86,7 @@ func TestATurnHeldByAnInstanceStillInTheFleetIsLeftAlone(t *testing.T) {
 	const sid = "2f1c6f0e-0000-4000-8000-000000000273"
 	seedWantedConnected(t, dsn, sid, "5511999990273")
 
-	keys := redisx.NewKeys("wa:", 8)
+	keys := redisx.NewKeys("wa:", 0)
 	if err := server.Set(keys.Resume(sid), "inst-peer"); err != nil {
 		t.Fatalf("plant the peer's turn: %v", err)
 	}
@@ -97,7 +97,7 @@ func TestATurnHeldByAnInstanceStillInTheFleetIsLeftAlone(t *testing.T) {
 	server.SetTTL(keys.Instance("inst-peer"), 15*time.Second)
 
 	survivor := start(t, server.Addr(), "inst-alive",
-		map[string]string{"WAC_DATABASE_URL": dsn, "WAC_EVENT_SHARDS": "8"})
+		map[string]string{"WAC_DATABASE_URL": dsn})
 
 	waitFor(t, "the instance to have swept a few times", func() bool {
 		return survivor.ResumePasses() >= 3
@@ -154,14 +154,14 @@ func TestATurnInThisInstancesOwnNameIsLeftAloneEvenWhenItsPredecessorLeftIt(t *t
 
 	// A deployment that pins the name: the turn the dead process left carries the name its
 	// replacement comes up under.
-	keys := redisx.NewKeys("wa:", 8)
+	keys := redisx.NewKeys("wa:", 0)
 	if err := server.Set(keys.Resume(sid), "inst-pinned"); err != nil {
 		t.Fatalf("plant the predecessor's turn under the pinned name: %v", err)
 	}
 	server.SetTTL(keys.Resume(sid), time.Minute)
 
 	replacement := start(t, server.Addr(), "inst-pinned",
-		map[string]string{"WAC_DATABASE_URL": dsn, "WAC_EVENT_SHARDS": "8"})
+		map[string]string{"WAC_DATABASE_URL": dsn})
 
 	waitFor(t, "the replacement to have swept a few times", func() bool {
 		return replacement.ResumePasses() >= 3
