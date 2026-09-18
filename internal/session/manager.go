@@ -1150,17 +1150,23 @@ func (m *Manager) adoptedToDelete(sid string, session *Session) {
 // also the only thing that walks the list, so it is where a registration whose session is
 // already gone is dropped.
 //
-// What it does not cover is #259, and the shape of that is worth having here. Between the
-// refusal arming an account and this pass releasing it, this instance owns the account and
-// carries no mark, so a peer reading a `session.wake` for it is told the ordinary
-// `not_owner` and acknowledges it -- measured the same on the base, where the wake is lost
-// just as it is here. What the hand-back adds is the line after: the account is then
-// nobody's, and a `session.connect` for an account nobody runs is left pending, where an
-// instance still holding it would have served it. Closing that means writing the mark when
-// the refusal decides rather than when the release happens, which turns "I am letting this
-// go now" into "I mean to", and a mark that means the second one needs an undoing for
-// every way the hand-back is called off -- none of which exists in `internal/cluster`,
-// where a release and a winning acquire are the only two things that clear it.
+// What it does not cover is #259, and the shape of that is worth having here. The mark that
+// makes a peer leave a `session.wake` pending is written when the release happens, in
+// `abandon` and in `givingUpAll`, and not when this instance decides to let the account go:
+// in between it is an ordinary owner carrying no mark, the peer's `Acquire` is answered
+// `not_owner`, and the one ask that would have started that account is acknowledged and
+// retired. Measured on the base at the hand-back it already has -- a retired session, the
+// wake acknowledged by the peer, the account released on the next tick -- so this is the
+// window every hand-back here has, and the refusal below is one more place that has it.
+//
+// What this one adds over the base is the line after: the account is then nobody's, and a
+// `session.connect` for an account nobody runs is left pending, where the instance that
+// was still holding it served it. It was holding an account it should not have been, which
+// is what this file is fixing. Closing the window itself means writing the mark when the
+// decision is taken rather than when the release happens, which turns "I am letting this go
+// now" into "I mean to", and a mark that means the second one needs an undoing for every
+// way a hand-back is called off -- none of which exists in `internal/cluster`, where a
+// release and a winning acquire are the only two things that clear it.
 //
 // An account is given back only while it is still the session that was adopted and still
 // has answered nothing but that teardown. Both clauses guard the same thing from two

@@ -929,12 +929,15 @@ func TestNoWayOutOfTheSessionMapLeavesARegistrationBehind(t *testing.T) {
 //
 // Between the refusal arming an account and the heartbeat releasing it, this instance owns
 // the account and has written no mark, so a peer's `Acquire` is answered with the ordinary
-// `not_owner` and the wake is acknowledged rather than left pending. Measured the same on
-// `185ba8f`, so the wake is lost with or without the hand-back. What the hand-back adds is
-// what comes after: on the base the account stayed here and a `session.connect` for it was
-// served by the session still in the map, and once it goes back that connect is released
-// and left pending for an owner that only another wake will produce -- measured `acked=1
-// released=1` against `acked=0 released=2`.
+// `not_owner` and the wake is acknowledged rather than left pending. That window is not
+// this fix's: measured on `185ba8f` at the hand-back the base already has, a retired
+// session loses a peer's wake exactly the same way and is released on the next tick.
+//
+// What this hand-back adds is what comes after: on the base the account stayed here and a
+// `session.connect` for it was served by the session still in the map, and once it goes
+// back that connect is released and left pending for an owner only another wake will
+// produce -- measured `acked=1 released=1` against `acked=0 released=2`. The account it was
+// served by is one this instance should not have been holding.
 //
 // Asserting what the connector does today rather than what it should do, which is worth
 // saying out loud: the fix for #259 turns the acknowledgement below into a release, and
