@@ -43,6 +43,15 @@ func TestASurvivorTakesTheTurnOfAnInstanceThatIsGone(t *testing.T) {
 		t.Fatalf("plant the dead instance's turn: %v", err)
 	}
 	server.SetTTL(keys.Resume(sid), time.Minute)
+	// And still in the directory, which is the half of the state that makes this test
+	// discriminating rather than merely green. `wa:instances` is a set with no TTL of its
+	// own: an instance that dies leaves its name there until something prunes it, while
+	// its entry expires three heartbeats later. So a fix that asked the set instead of the
+	// entry would read `inst-dead` as alive and leave the account down, and without this
+	// line the set is empty and such a fix passes.
+	if _, err := server.SetAdd(keys.Instances(), "inst-dead"); err != nil {
+		t.Fatalf("leave the dead instance in the directory: %v", err)
+	}
 
 	survivor := start(t, server.Addr(), "inst-alive",
 		map[string]string{"WAC_DATABASE_URL": dsn, "WAC_EVENT_SHARDS": "8"})

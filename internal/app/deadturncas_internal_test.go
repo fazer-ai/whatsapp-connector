@@ -109,19 +109,24 @@ func TestWhoseTurnItIsDecidesWhetherItCanBeTaken(t *testing.T) {
 	t.Parallel()
 
 	const me = "inst-mine"
-	// No cell for "nobody holds it": the holder is the value the caller's own `SET NX GET`
-	// handed back, so reaching here at all means the write was refused by a turn that was
-	// standing, and a turn is never written empty. A cell for it would asserts about a call
-	// the caller cannot make.
 	for _, tc := range []struct {
 		name string
-		// holder is the name on the turn, as the caller's write reported it.
+		// holder is the name on the turn; empty means it expired between the write that
+		// was refused and the read, which is a state a pass really does meet.
 		holder string
 		// announced are the instances with a registry entry.
 		announced []string
 		want      bool
 		wantMark  string
 	}{
+		{
+			name: "nobody holds it any more",
+			// Expired between the refused write and the read. Nothing to take, and the
+			// next pass finds it free, which is the outcome this function is for.
+			holder:    "",
+			announced: []string{me},
+			want:      false,
+		},
 		{
 			name:      "mine, and I am announced",
 			holder:    me,
@@ -168,8 +173,10 @@ func TestWhoseTurnItIsDecidesWhetherItCanBeTaken(t *testing.T) {
 
 			const sid = "sid-1"
 			mark := client.Keys().Resume(sid)
-			if err := srv.Set(mark, tc.holder); err != nil {
-				t.Fatalf("set the turn: %v", err)
+			if tc.holder != "" {
+				if err := srv.Set(mark, tc.holder); err != nil {
+					t.Fatalf("set the turn: %v", err)
+				}
 			}
 			for _, instance := range tc.announced {
 				srv.HSet(client.Keys().Instance(instance), "version", "test")
@@ -178,12 +185,18 @@ func TestWhoseTurnItIsDecidesWhetherItCanBeTaken(t *testing.T) {
 			connector := &Connector{
 				cfg: Config{Instance: me}, log: zerolog.Nop(), client: client,
 			}
-			got := connector.tookTurnFromAnInstanceThatIsGone(t.Context(), sid, tc.holder)
+			got := connector.tookTurnFromAnInstanceThatIsGone(t.Context(), sid)
 			if got != tc.want {
 				t.Errorf("took the turn = %v, want %v", got, tc.want)
 			}
 
 			held, err := srv.Get(mark)
+			if tc.wantMark == "" {
+				if err == nil {
+					t.Errorf("a turn was written where there was none, reading %q", held)
+				}
+				return
+			}
 			if err != nil {
 				t.Fatalf("read the turn back: %v", err)
 			}
@@ -231,9 +244,14 @@ func TestATurnTakenByALiveThirdInstanceInsideTheWindowIsNotStampedOver(t *testin
 	// sweep issues other EXISTS calls, and firing on those would be rewriting the turn
 	// before the decision rather than during it.
 	var once sync.Once
+	var mu sync.Mutex
+	fired := false
 	srv.Server().SetPreHook(func(_ *server.Peer, cmd string, args ...string) bool {
 		if strings.EqualFold(cmd, "EXISTS") && len(args) == 1 && args[0] == keys.Instance("inst-dead") {
 			once.Do(func() {
+				mu.Lock()
+				fired = true
+				mu.Unlock()
 				if err := srv.Set(keys.Resume(sid), "inst-third"); err != nil {
 					t.Errorf("hand the turn to a live third instance: %v", err)
 				}
@@ -245,6 +263,21 @@ func TestATurnTakenByALiveThirdInstanceInsideTheWindowIsNotStampedOver(t *testin
 	})
 
 	connector.resumeOnce(t.Context())
+
+	// Asserted before anything else, because everything else is about what happened inside
+	// a window this test is responsible for opening. A pass that never issued the command
+	// the hook waits on leaves the turn in `inst-dead` and the account taken, and the
+	// assertions below would then report a stamped-over turn that was never handed over:
+	// a true-sounding failure about a race that did not happen.
+	mu.Lock()
+	opened := fired
+	mu.Unlock()
+	if !opened {
+		t.Fatalf("the sweep never asked whether inst-dead is still in the fleet, so the "+
+			"window this test exists to force was never opened. Nothing below is about the "+
+			"compare-and-set: read the diff, and see %s.",
+			"TestATurnHeldByAnInstanceStillInTheFleetIsLeftAlone")
+	}
 
 	held, err := srv.Get(keys.Resume(sid))
 	if err != nil {
