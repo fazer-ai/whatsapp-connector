@@ -9,6 +9,7 @@ import (
 	"github.com/alicebob/miniredis/v2"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
+	"github.com/fazer-ai/whatsapp-connector/internal/redisx"
 )
 
 // What a rolling deploy costs, measured on the deployment at chat.fazer.ai and reproduced
@@ -60,11 +61,17 @@ func TestTheSuccessorPutsBackWhatItsPredecessorGaveUpWithoutWaitingOutAWholeInte
 	})
 
 	incoming := start(t, server.Addr(), "inst-in", env)
-	// Not `Sessions() == 0`, which is true the instant the value exists and would prove
-	// nothing about any pass having run. The outgoing instance still holding the account
-	// is what says the successor's early pass had nothing to take.
-	waitFor(t, "the successor to be up with the account still held by its predecessor", func() bool {
-		return incoming.Sessions() == 0 && outgoing.Sessions() == 1
+	// Waited on the pass counter and not on `Sessions() == 0`, which is true the instant
+	// the value exists and would be satisfied by a successor whose goroutines have never
+	// run. That difference decides whether this test reproduces a deploy at all: if the
+	// successor's first pass happened only after the predecessor let go, it would find the
+	// account free and bring it back off that very pass, and the ramp this exists to prove
+	// would not be needed to pass.
+	//
+	// So the barrier is a finished pass while the predecessor is still the owner, which is
+	// exactly the position a new container is in a second before the old one exits.
+	waitFor(t, "the successor to finish a pass while its predecessor still owns the account", func() bool {
+		return incoming.ResumePasses() >= 1 && incoming.Sessions() == 0 && outgoing.Sessions() == 1
 	})
 
 	stopOutgoing()
@@ -119,5 +126,49 @@ func TestAPredecessorsEventIsNotEvidenceThatTheSuccessorPutTheAccountBack(t *tes
 	}
 	if fmt.Sprint(epochs[0]) != "1" {
 		t.Errorf("the first owner published under epoch %v, want 1", epochs[0])
+	}
+}
+
+// The cool-off carries the name of whoever took it, and a shutdown may only drop its own.
+//
+// The case is not hypothetical and it is the one an unconditional delete gets wrong: the
+// mark this instance took when it first brought the account back lasts a minute, and by
+// the time it is asked to stop that minute may be over. A peer that swept in between holds
+// its own mark, with an adoption still in flight behind it. Deleting that one hands the
+// account to the next pass while the peer is still bringing it up, which is two instances
+// asked for one account -- the single thing the mark exists to arbitrate.
+//
+// Written by hand rather than raced into place: what is under test is the delete, not the
+// timing that produces the state, and a test that had to lose a race to be meaningful
+// would be a test that usually proves nothing.
+func TestAShutdownDropsItsOwnResumeCoolOffAndNobodyElses(t *testing.T) {
+	server := miniredis.RunT(t)
+	dsn := "sqlite:" + filepath.Join(t.TempDir(), "wa.db")
+
+	const sid = "2f1c6f0e-0000-4000-8000-00000000026a"
+	seedWantedConnected(t, dsn, sid, "5511999990270")
+	env := map[string]string{"WAC_DATABASE_URL": dsn, "WAC_EVENT_SHARDS": "8"}
+
+	outgoing, stopOutgoing := startStoppable(t, server.Addr(), "inst-out", env)
+	waitFor(t, "the outgoing instance to be running the account", func() bool {
+		return outgoing.Sessions() == 1
+	})
+
+	// Stand in for the peer that swept after this instance's own mark had expired.
+	mark := redisx.NewKeys("wa:", 8).Resume(sid)
+	if err := server.Set(mark, "some-other-instance"); err != nil {
+		t.Fatalf("plant a peer's turn: %v", err)
+	}
+
+	stopOutgoing()
+
+	held, err := server.Get(mark)
+	if err != nil {
+		t.Fatalf("a shutdown deleted a turn belonging to another instance: the peer that "+
+			"holds it is bringing the account up, and the next pass will now be offered "+
+			"the same account: %v", err)
+	}
+	if held != "some-other-instance" {
+		t.Errorf("the resume turn reads %q, want it untouched at %q", held, "some-other-instance")
 	}
 }

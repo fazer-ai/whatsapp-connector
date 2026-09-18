@@ -11,9 +11,11 @@ import (
 	"os/signal"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
+	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/cluster"
@@ -55,7 +57,10 @@ type Connector struct {
 	manager    *session.Manager
 	engine     engine.Engine
 	store      *store.Container
-	streams    commandStreams
+	// resumePasses counts the finished sweeps, and is read by tests that have to know a
+	// pass is over before they act.
+	resumePasses atomic.Uint64
+	streams      commandStreams
 	// seen is when each label value last had something counted against it, for the two
 	// metrics whose label values have no ceiling of their own: a session id, and the name
 	// of a consumer a claim took work back from. Neither is bounded -- nothing limits how
@@ -246,6 +251,12 @@ func (c *Connector) Handler() http.Handler { return c.http.Handler() }
 
 // Sessions is how many sessions this instance runs.
 func (c *Connector) Sessions() int { return c.manager.Count() }
+
+// ResumePasses is how many sweeps over the accounts that should be in the air this
+// instance has finished. Exposed for the same reason Sessions is: a test that has to know
+// a pass has already happened cannot see it any other way, and the alternative is waiting
+// on the clock, which this repository does not do to synchronise.
+func (c *Connector) ResumePasses() uint64 { return c.resumePasses.Load() }
 
 // Run serves until the context ends or a signal arrives, then releases the sessions.
 func (c *Connector) Run(ctx context.Context) error {
@@ -617,6 +628,10 @@ var resumeCatchUp = []time.Duration{
 
 // resumeOnce makes one pass over the accounts that should be in the air.
 func (c *Connector) resumeOnce(ctx context.Context) {
+	// Counted on the way out, whatever the pass decided, so a reader waiting on it knows
+	// the pass is over rather than merely started.
+	defer c.resumePasses.Add(1)
+
 	// Bounded, and on a context of its own: the pass has nothing waiting on it, and a
 	// database or a Redis that hangs would otherwise hold this goroutine for as long as
 	// it takes rather than for as long as a pass is worth.
@@ -1291,12 +1306,33 @@ func (c *Connector) shutdown() {
 // this replaces, so a failure here costs exactly what the deploy used to cost.
 func (c *Connector) clearTheFloorUnderRetry(ctx context.Context, sids []string) {
 	for _, sid := range sids {
-		if err := c.client.Del(ctx, c.client.Keys().Resume(sid)).Err(); err != nil {
+		if err := dropOwnResumeMark.Run(
+			ctx, c.client, []string{c.client.Keys().Resume(sid)}, c.cfg.Instance,
+		).Err(); err != nil && !errors.Is(err, redis.Nil) {
 			c.log.Warn().Err(err).Str("sid", sid).
 				Msg("could not clear the resume cool-off of an account this instance gave up")
 		}
 	}
 }
+
+// dropOwnResumeMark deletes the cool-off only while it is still this instance's, which is
+// what stops a shutdown erasing a turn that has already moved on.
+//
+// The mark carries the name of whoever took it, and by the time a shutdown gets here the
+// one this instance took may be a minute old and gone: a peer that swept in between holds
+// its own, with an adoption still in flight behind it. An unconditional delete would hand
+// that account back to the next pass while the peer is still bringing it up, which is two
+// instances asked for one account -- the single thing this mark exists to arbitrate.
+//
+// Same shape as releaseScript in internal/cluster for the same reason: read and delete
+// have to be one step, or the value can change between them.
+var dropOwnResumeMark = redis.NewScript(`
+if redis.call("GET", KEYS[1]) ~= ARGV[1] then
+  return 0
+end
+redis.call("DEL", KEYS[1])
+return 1
+`)
 
 // newEngine builds the WhatsApp side, and opens the store when a database is configured.
 //
