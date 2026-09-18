@@ -43,6 +43,22 @@ type Metrics struct {
 	// ceiling is 256, and a distribution pressed against it is a fleet about to start
 	// waiting.
 	InboxDepth prometheus.Histogram
+	// StateNoticeDelay is how long a session state took to reach a client, from the
+	// instant this connector judged the thing to the frame being on the shard.
+	//
+	// It is not `EmissionWait` seen from further away, and the difference is the reason
+	// this exists. `EmissionWait` starts when the emission is offered to a full inbox, so
+	// it begins after the transition lock has already been acquired and ends when the pump
+	// accepts the emission rather than when a client can see it. This one spans the whole
+	// of what a client waited for, the lock included, and ends at the shard.
+	//
+	// Written only for the keepalive drop today, which is the one #182 names: a socket the
+	// server stopped answering on, where nothing else is going to say so for three minutes
+	// and the client is refusing work in the meantime. Buckets reach a minute because the
+	// tail is the whole point -- in a healthy fleet this is tenths of a second, and it
+	// turns interesting exactly when a slow consumer fills an inbox and the lock starts
+	// holding a queue behind it.
+	StateNoticeDelay prometheus.Histogram
 	// CommandsDeliveredAgain counts commands handed out that had been handed out before,
 	// by where this delivery came from.
 	//
@@ -159,11 +175,18 @@ func New() *Metrics {
 			Help:    "How full a session's inbox was when an emission arrived, out of 256.",
 			Buckets: []float64{1, 8, 32, 64, 128, 192, 240, 256},
 		}),
+		StateNoticeDelay: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name: "wac_state_notice_delay_seconds",
+			Help: "Time from this connector judging a session's connection lost to the state frame reaching the shard, " +
+				"including the wait for the transition lock and for room in the session's inbox.",
+			Buckets: []float64{.01, .1, .5, 1, 2, 5, 15, 60},
+		}),
 	}
 	registry.MustRegister(
 		m.SessionsRunning, m.EventsPublished, m.CommandDuration, m.LeasesLost,
 		m.CommandReadsFailed, m.CommandReadLastSuccess, m.EmissionWait, m.InboxDepth, m.EmissionsDropped,
 		m.CommandsDeliveredAgain, m.CommandsReclaimed, m.CommandRedeliveries, m.CommandReclaimPasses,
+		m.StateNoticeDelay,
 	)
 	return m
 }

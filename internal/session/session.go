@@ -654,6 +654,14 @@ func (s *Session) publish(ctx context.Context, emission *engine.Emission) bool {
 	if err == nil {
 		err = s.stillOwned()
 	}
+	if err == nil && s.watch != nil && !emission.Decided.IsZero() {
+		// After the write and not around it: what the issue asks for is the distance from
+		// the decision to the frame being on the stream, and this is the first line from
+		// which that is true. Guarded on the instant rather than on the event type, so an
+		// arm that starts timing something else needs no change here and one that stops
+		// leaves no silent zero behind.
+		s.watch.StateDecided(s.now().Sub(emission.Decided))
+	}
 	settle(emission, err)
 	return err == nil
 }
@@ -729,6 +737,15 @@ type Watch interface {
 	// is the moment that something stops being about a session this instance has. A
 	// counter has no use for the name; anything labelled by session does.
 	LeaseLost(sid string)
+	// StateDecided is one session state this instance judged and then published, from the
+	// judgement to the frame being on the stream.
+	//
+	// Reported only for a landing, because the question it answers is how long a client
+	// waited to be told, and a client is told by a frame that arrived. The four ways
+	// `publish` returns without landing are not slow publishes, they are absent ones, and
+	// folding them in here would put a zero-cost drop in the same distribution as a
+	// two-second wait.
+	StateDecided(took time.Duration)
 }
 
 // queued is one command waiting its turn, with the instant this instance took it on.

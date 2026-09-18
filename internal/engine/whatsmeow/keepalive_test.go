@@ -1369,7 +1369,11 @@ func TestTheKeepAliveHandlerTakesTheSocketDownBeforeItWaitsOnThePublish(t *testi
 	handler := theCaseFor(t, "*waEvents.KeepAliveTimeout")
 	refused := strings.Index(handler, "setReconnecting(true")
 	closed := strings.Index(handler, "takeDownSoon(")
-	published := strings.Index(handler, "s.emit(")
+	// The family and not one call: what is load-bearing here is where the publish sits
+	// among the three, not which helper makes it. Pinned to `s.emit(`, this went red when
+	// #182 changed the arm to `s.emitDecided(` -- loudly, which is right, but the next
+	// rename would cost the same reading of a fence that was never about the name.
+	published := strings.Index(handler, "s.emit")
 	if refused < 0 || closed < 0 || published < 0 {
 		t.Fatalf("the keepalive handler does not refuse, close and publish:\n%s", handler)
 	}
@@ -1381,6 +1385,48 @@ func TestTheKeepAliveHandlerTakesTheSocketDownBeforeItWaitsOnThePublish(t *testi
 		t.Fatalf("the keepalive handler publishes before it closes, and `emit` waits on a full "+
 			"inbox: the reset would then land on whatever socket the client had by the time it "+
 			"cleared, which is a healthy one:\n%s", handler)
+	}
+	// And the publish happens with the lock held, which is the invariant #182 measures the
+	// cost of rather than removes. Publishing before the socket is closed, with the lock
+	// held across both, is what keeps `session.status` and the last frame on the stream
+	// from disagreeing; moving the publish out would make the number this arm now reports
+	// look better while breaking the thing the number is about.
+	//
+	// Fenced here because nothing else does. #182 measured it: a build with the publish
+	// taken out of the lock passes the whole suite, and only a bench that fills the inbox
+	// and watches the arm sit there can tell. Read off the source for the same reason the
+	// order above is -- with no socket under it and an inbox nobody filled, every
+	// arrangement of these lines behaves identically from outside.
+	// These two clauses read the source, which catches an inversion of intent cheaply and
+	// nothing else. What carries the invariant is
+	// TestTheKeepAliveArmHoldsTheTransitionLockAcrossThePublish, which fills the inbox and
+	// asserts the lock is unavailable while the arm sits in the publish: measured, a
+	// `go func() { ... }()` around the publish leaves both readings below true and turns
+	// that one red. Adding a clause per form of goroutine here would be guessing at the
+	// next one.
+	locked := strings.Index(handler, "s.transition.Lock()")
+	if locked < 0 || locked > published {
+		t.Fatalf("the keepalive handler publishes outside the transition lock, so the state on the "+
+			"stream and `session.status` can disagree for as long as the publish takes:\n%s", handler)
+	}
+	// A bare unlock and not the `defer` one: the arm releases on return, so the deferred
+	// call sits textually right after the `Lock()` and means the opposite of an early
+	// release. Looking for the substring alone reports the correct code, which is how a
+	// fence earns its deletion.
+	for at := 0; ; {
+		found := strings.Index(handler[at:], "s.transition.Unlock()")
+		if found < 0 {
+			break
+		}
+		found += at
+		at = found + 1
+		if strings.HasSuffix(strings.TrimRight(handler[:found], " \t"), "defer") {
+			continue
+		}
+		if found < published {
+			t.Fatalf("the keepalive handler drops the transition lock before it publishes, which is the "+
+				"same gap by another route:\n%s", handler)
+		}
 	}
 }
 
