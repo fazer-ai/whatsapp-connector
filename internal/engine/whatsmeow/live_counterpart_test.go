@@ -59,7 +59,7 @@ func TestLivePairCounterpart(t *testing.T) {
 			"it apart from the counterpart: %v", err)
 	}
 	// Compared through the same normalisation the pairing itself applies. `pairWithCode`
-	// strips everything that is not a digit, so "+55 11 93619-9421" and "5511936199421"
+	// strips everything that is not a digit, so "+55 11 99999-0001" and "5511999990001"
 	// pair the same account and only one of them would have been caught here -- and the
 	// one that slipped through is the one that destroys the subject.
 	if subjectBound && subject.User == digitsOf(phone) {

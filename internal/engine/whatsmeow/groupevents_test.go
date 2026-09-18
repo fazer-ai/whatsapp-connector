@@ -776,7 +776,7 @@ func TestAnActorNamedOnlyByNumberIsCompletedFromTheSubjectItSet(t *testing.T) {
 	t.Parallel()
 
 	number := someone("5511999990002")
-	lid := waTypes.NewJID("10089566068807", waTypes.HiddenUserServer)
+	lid := waTypes.NewJID("30000000000003", waTypes.HiddenUserServer)
 	session := groupSession(t)
 	session.handle(&waEvents.GroupInfo{
 		JID:      groupJID(),
@@ -809,7 +809,7 @@ func TestASubjectSetBySomebodyElseDoesNotNameTheActor(t *testing.T) {
 
 	number := someone("5511999990002")
 	stranger := someone("5511999990003")
-	strangerLID := waTypes.NewJID("10089566068807", waTypes.HiddenUserServer)
+	strangerLID := waTypes.NewJID("30000000000003", waTypes.HiddenUserServer)
 	session := groupSession(t)
 	session.handle(&waEvents.GroupInfo{
 		JID:      groupJID(),

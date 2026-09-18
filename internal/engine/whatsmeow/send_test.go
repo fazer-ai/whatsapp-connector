@@ -21,7 +21,7 @@ func TestAnAddressSurvivesTheRoundTripToAJIDAndBack(t *testing.T) {
 
 	for _, want := range []protocol.Address{
 		{Kind: protocol.AddressPhone, ID: "5511999990001"},
-		{Kind: protocol.AddressLID, ID: "167392323834034"},
+		{Kind: protocol.AddressLID, ID: "100000000000001"},
 		{Kind: protocol.AddressGroup, ID: "120363000000000000"},
 		{Kind: protocol.AddressNewsletter, ID: "120363111111111111"},
 		{Kind: protocol.AddressBroadcast, ID: "5511999990001-1600000000"},
@@ -246,7 +246,7 @@ func TestATextThatCarriesSomethingElseGoesOutWithIt(t *testing.T) {
 		ID          string            `json:"id"`
 		Participant *protocol.Address `json:"participant"`
 		FromMe      bool              `json:"from_me"`
-	}{ID: "3EB0ORIGINAL", Participant: &protocol.Address{Kind: protocol.AddressLID, ID: "167392323834034"}}
+	}{ID: "3EB0ORIGINAL", Participant: &protocol.Address{Kind: protocol.AddressLID, ID: "100000000000001"}}
 
 	message, err := textWith(req, ownAccount, peer)
 	if err != nil {
@@ -260,7 +260,7 @@ func TestATextThatCarriesSomethingElseGoesOutWithIt(t *testing.T) {
 	if info.GetStanzaID() != "3EB0ORIGINAL" {
 		t.Fatalf("the quote points at %q", info.GetStanzaID())
 	}
-	if info.GetParticipant() != "167392323834034@"+waTypes.HiddenUserServer {
+	if info.GetParticipant() != "100000000000001@"+waTypes.HiddenUserServer {
 		t.Fatalf("the quote attributes the original to %q", info.GetParticipant())
 	}
 	if got := info.GetMentionedJID(); len(got) != 1 || got[0] != "5511999990002@"+waTypes.DefaultUserServer {
@@ -344,9 +344,9 @@ func TestAQuoteOfThisAccountsOwnMessageUsesTheIdentityItWasSentUnder(t *testing.
 		to   waTypes.JID
 		want string
 	}{
-		{"a direct chat the caller addressed by phone", peer, "89572297961476@" + waTypes.HiddenUserServer},
+		{"a direct chat the caller addressed by phone", peer, "20000000000002@" + waTypes.HiddenUserServer},
 		{"a direct chat the caller addressed by LID",
-			waTypes.NewJID("167392323834034", waTypes.HiddenUserServer), "89572297961476@" + waTypes.HiddenUserServer},
+			waTypes.NewJID("100000000000001", waTypes.HiddenUserServer), "20000000000002@" + waTypes.HiddenUserServer},
 		// A group is sent under the LID only when the group itself is LID-addressed,
 		// which is behind a lookup this connector would pay a round trip for on the send
 		// path. Being wrong costs a quote the recipient cannot attribute, which is where
@@ -357,7 +357,7 @@ func TestAQuoteOfThisAccountsOwnMessageUsesTheIdentityItWasSentUnder(t *testing.
 			t.Parallel()
 
 			session, _ := newTestSession(t, "5511999990001")
-			session.setIdentity("5511999990001", "89572297961476")
+			session.setIdentity("5511999990001", "20000000000002")
 
 			message, err := textWith(quotingRequest("3EB0ORIGINAL", true, nil), session.ownJID(tc.to), tc.to)
 			if err != nil {

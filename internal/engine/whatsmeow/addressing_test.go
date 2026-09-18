@@ -41,7 +41,7 @@ func TestAnAddressIsResolvedFromWhatTheAccountWasShown(t *testing.T) {
 	looking, done := session.looking()
 	defer done()
 
-	lid := waTypes.NewJID("167392323834034", waTypes.HiddenUserServer)
+	lid := waTypes.NewJID("100000000000001", waTypes.HiddenUserServer)
 	phone := waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)
 	// The message that named both, which is how this account came to know the two are one
 	// person.
@@ -50,13 +50,13 @@ func TestAnAddressIsResolvedFromWhatTheAccountWasShown(t *testing.T) {
 	// Only the number on the event, which is the shape that used to publish a chat no
 	// LID-keyed contact matched.
 	named := session.party(looking, phone)
-	if named.LID != "167392323834034" || named.Phone != "5511999990002" {
+	if named.LID != "100000000000001" || named.Phone != "5511999990002" {
 		t.Fatalf("the party is %+v, want both halves of the pairing it was shown", named)
 	}
 
 	// And the conversation goes out under the address every other path uses.
 	chat, ok := session.address(looking, phone)
-	if !ok || chat.Kind != protocol.AddressLID || chat.ID != "167392323834034" {
+	if !ok || chat.Kind != protocol.AddressLID || chat.ID != "100000000000001" {
 		t.Fatalf("the chat went out as %+v (ok=%v), want the LID the pairing named", chat, ok)
 	}
 }

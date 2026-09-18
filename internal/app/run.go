@@ -604,7 +604,7 @@ func (c *Connector) resumeWanted(ctx context.Context) <-chan struct{} {
 // signalled about seven tenths of a second later, and takes another second to let its
 // leases go. So the incoming instance makes its pass on the way in while the outgoing one
 // still owns everything, finds nothing anywhere, and on the steady interval alone does not
-// look again for thirty seconds. Measured at chat.fazer.ai: the new container said
+// look again for thirty seconds. Measured in production: the new container said
 // `connector is up` at 13:15:50, the old one said `connector is down` at 13:15:51, and the
 // account came back at 13:16:20. The one early pass was early by a second, and the account
 // paid thirty for it.
@@ -1378,7 +1378,7 @@ func (c *Connector) shutdown() {
 // This is what made a deploy expensive, and the size of it was hidden by chance. The
 // outgoing instance takes the mark when it first brings an account back, and the mark
 // outlives the release by whatever is left of its minute; the successor then finds the
-// lease free, cannot take the turn, and waits. Measured at chat.fazer.ai the wait came to
+// lease free, cannot take the turn, and waits. Measured in production the wait came to
 // thirty seconds, because that deployment's marks were minutes old by the time it was
 // redeployed -- a release that follows an earlier one closely would have paid more.
 //

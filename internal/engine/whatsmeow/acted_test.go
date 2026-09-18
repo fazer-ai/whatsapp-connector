@@ -940,7 +940,7 @@ func TestASealedReactionOpensAgainstWhatsmeowsOwnCrypto(t *testing.T) {
 	// decryption from the sender of the stanza, so the reaction has to arrive as the
 	// account's own for the two to meet -- which is what a reaction of one's own in an
 	// announcement group is.
-	own, err := waTypes.ParseJID("167392323834034@lid")
+	own, err := waTypes.ParseJID("100000000000001@lid")
 	if err != nil {
 		t.Fatalf("ParseJID: %v", err)
 	}

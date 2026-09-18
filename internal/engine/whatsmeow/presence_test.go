@@ -179,7 +179,7 @@ func TestOnlyAPersonHasAPresenceToSubscribeTo(t *testing.T) {
 		{"a channel", `{"kind":"newsletter","id":"120363041234567890@newsletter"}`, true},
 		{"the status feed", `{"kind":"status","id":"status"}`, true},
 		{"a number", `{"kind":"phone","id":"5511999990002"}`, false},
-		{"a lid", `{"kind":"lid","id":"167392323834034"}`, false},
+		{"a lid", `{"kind":"lid","id":"100000000000001"}`, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -691,7 +691,7 @@ func TestOnePersonIsOneKeyWhicheverAddressArrives(t *testing.T) {
 
 	chat := waTypes.NewJID("120363041234567890", waTypes.GroupServer)
 	phone := waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)
-	lid := waTypes.NewJID("167392323834034", waTypes.HiddenUserServer)
+	lid := waTypes.NewJID("100000000000001", waTypes.HiddenUserServer)
 	session.chatPresence(&waEvents.ChatPresence{
 		MessageSource: waTypes.MessageSource{Chat: chat, Sender: lid, SenderAlt: phone, IsGroup: true},
 		State:         waTypes.ChatPresenceComposing,
@@ -990,7 +990,7 @@ func TestADirectChatIsKeyedByThePersonAndNotTheAddressThatArrived(t *testing.T) 
 	blockTheForwarder(t, session)
 
 	phone := waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)
-	lid := waTypes.NewJID("167392323834034", waTypes.HiddenUserServer)
+	lid := waTypes.NewJID("100000000000001", waTypes.HiddenUserServer)
 	session.chatPresence(&waEvents.ChatPresence{
 		MessageSource: waTypes.MessageSource{Chat: lid, Sender: lid, SenderAlt: phone},
 		State:         waTypes.ChatPresenceComposing,
@@ -1121,7 +1121,7 @@ func TestAContactOffTheOrdinaryServerIsStillOneKey(t *testing.T) {
 
 	chat := waTypes.NewJID("120363041234567890", waTypes.GroupServer)
 	legacy := waTypes.NewJID("5511999990002", waTypes.LegacyUserServer)
-	lid := waTypes.NewJID("167392323834034", waTypes.HiddenUserServer)
+	lid := waTypes.NewJID("100000000000001", waTypes.HiddenUserServer)
 	session.chatPresence(&waEvents.ChatPresence{
 		MessageSource: waTypes.MessageSource{Chat: chat, Sender: lid, SenderAlt: legacy, IsGroup: true},
 		State:         waTypes.ChatPresenceComposing,
@@ -1211,7 +1211,7 @@ func TestADirectChatGoesOutUnderOneAddressWhicheverOneArrives(t *testing.T) {
 
 	session := newPresenceSession(t, "5511999990001")
 	phone := waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)
-	lid := waTypes.NewJID("167392323834034", waTypes.HiddenUserServer)
+	lid := waTypes.NewJID("100000000000001", waTypes.HiddenUserServer)
 
 	// Read as they are published, so the two never meet on the board.
 	session.chatPresence(&waEvents.ChatPresence{
@@ -1234,7 +1234,7 @@ func TestADirectChatGoesOutUnderOneAddressWhicheverOneArrives(t *testing.T) {
 	// way would publish under the address the client is migrating away from. WhatsApp is
 	// moving the same direction, and the number is the half that can go missing on a
 	// privacy setting while the LID cannot.
-	if want := (protocol.Address{Kind: protocol.AddressLID, ID: "167392323834034"}); stop != want {
+	if want := (protocol.Address{Kind: protocol.AddressLID, ID: "100000000000001"}); stop != want {
 		t.Errorf("the chat went out as %v, want the LID both paths agree on", stop)
 	}
 }

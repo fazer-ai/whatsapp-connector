@@ -12,7 +12,7 @@ import (
 	"github.com/fazer-ai/whatsapp-connector/internal/redisx"
 )
 
-// What a rolling deploy costs, measured on the deployment at chat.fazer.ai and reproduced
+// What a rolling deploy costs, measured on the production deployment and reproduced
 // here.
 //
 //	+4.317s  new container started

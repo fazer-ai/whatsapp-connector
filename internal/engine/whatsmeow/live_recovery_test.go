@@ -197,7 +197,7 @@ func TestLiveTimeARetryRecovery(t *testing.T) {
 			// Every device of theirs, and keyed the way the store keys it. The
 			// argument is a prefix matched as `<it>:%`, and the rows are named by the
 			// Signal address rather than by the user part: a LID is filed as
-			// `10089566068807_1:7`, so passing the bare user matches nothing, deletes
+			// `30000000000003_1:7`, so passing the bare user matches nothing, deletes
 			// nothing, and reports no error while doing it.
 			address := who.SignalAddress().String()
 			prefix := address[:strings.LastIndex(address, ":")]
