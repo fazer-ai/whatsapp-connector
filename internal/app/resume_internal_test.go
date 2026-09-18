@@ -110,7 +110,13 @@ func TestTheResumeSweepWaitsOutTheMarkAnotherAttemptLeft(t *testing.T) {
 	// rather than proof that nothing has happened yet.
 	wantConnected(t, container, "sid-a-cold", "5511999990001", false)
 	wantConnected(t, container, "sid-b-warm", "5511999990002", false)
-	server.Set(redisx.NewKeys("wa:", 8).Resume("sid-a-cold"), "inst-b")
+	keys := redisx.NewKeys("wa:", 8)
+	server.Set(keys.Resume("sid-a-cold"), "inst-b")
+	// Announced as well as named, because a mark is only somebody else's turn while that
+	// somebody is still in the fleet: a turn in the name of an instance the registry has
+	// never heard of is one this pass now takes over, which is #272. What this test is
+	// about is the turn of a peer that is working, so the peer has to exist.
+	server.HSet(keys.Instance("inst-b"), "version", "test")
 
 	connector.resumeOnce(t.Context())
 

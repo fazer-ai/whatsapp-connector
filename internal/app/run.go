@@ -686,12 +686,20 @@ func (c *Connector) resumeOnce(ctx context.Context) {
 		// The mark is taken before the attempt, and taking it is what wins the turn: two
 		// instances reading the same free account in the same second would otherwise both
 		// adopt, and the loser's adoption is an account handed straight back.
+		//
+		// `SETNX` and a separate read, rather than the one `SET NX GET` that would answer
+		// both: `NX` with `GET` is a syntax error before Redis 7.0, and measured on
+		// 6.2.24 it is the whole pass that dies, because an error here aborts the loop
+		// and the next pass makes the same call. That is every account in the fleet
+		// staying down for good behind one WARN a pass, which is this defect made worse
+		// rather than fixed. This repository declares no minimum Redis version and
+		// `SETNX` needs none, so the second read is the price of not quietly setting one.
 		won, err := c.client.SetNX(pass, c.client.Keys().Resume(sid), c.cfg.Instance, resumeCooloff).Result()
 		if err != nil {
 			c.log.Warn().Err(err).Str("sid", sid).Msg("could not take the turn to bring a session back")
 			return
 		}
-		if !won {
+		if !won && !c.tookTurnFromAnInstanceThatIsGone(pass, sid) {
 			continue
 		}
 		if c.manager.Resume(sid, subscription[sid]) {
@@ -700,6 +708,83 @@ func (c *Connector) resumeOnce(ctx context.Context) {
 		}
 	}
 }
+
+// tookTurnFromAnInstanceThatIsGone takes the resume turn of an account whose turn belongs
+// to an instance that is no longer in the fleet, and reports whether it got it.
+//
+// The mark paces retries, and it does that by naming whoever is trying. When that instance
+// dies the name stops meaning anything, but the mark keeps standing for the rest of its
+// minute, and every survivor's pass skips the account on its account. The information that
+// settles it is already in Redis and is already right: `wa:instance:<name>` is refreshed by
+// the heartbeat and lives `3 * WAC_HEARTBEAT`, fifteen seconds by default, so from fifteen
+// seconds after the last beat the registry knows what the mark does not. The gap between
+// the two is the whole defect, and at the defaults it is forty-five seconds long.
+//
+// Asked only for the accounts the SETNX did not win, which is what keeps the ordinary pass
+// exactly as expensive as it was: an account whose turn is free costs one command, as
+// before, and an account that is already being skipped costs the two reads that say why.
+//
+// A live instance whose beat is late by more than the registry's TTL reads as gone here,
+// and its turn is taken. That is a real cost and it is the smaller one: what the mark buys
+// is that two instances do not both try, and what happens when they do is that the lease
+// arbitrates and the loser hands its adoption straight back. Two attempts, never two
+// sockets on one account. Weighed against an account nobody may touch for the rest of a
+// minute, on the path where the fleet has just lost a process, it is worth it.
+func (c *Connector) tookTurnFromAnInstanceThatIsGone(ctx context.Context, sid string) bool {
+	mark := c.client.Keys().Resume(sid)
+	holder, err := c.client.Get(ctx, mark).Result()
+	switch {
+	case errors.Is(err, redis.Nil):
+		// Expired between the write that was refused and this read. The next pass finds
+		// it free, which is the outcome this function is for, so there is nothing to take.
+		return false
+	case err != nil:
+		c.log.Warn().Err(err).Str("sid", sid).Msg("could not read who holds the turn for a session")
+		return false
+	}
+	if holder == c.cfg.Instance {
+		// This instance's own turn, from a pass that has not finished with it. Not a
+		// stranger's to take, and not a reason to start a second attempt behind the first.
+		return false
+	}
+	alive, err := c.client.Exists(ctx, c.client.Keys().Instance(holder)).Result()
+	if err != nil {
+		c.log.Warn().Err(err).Str("sid", sid).Str("holder", holder).
+			Msg("could not tell whether the instance holding a turn is still in the fleet")
+		return false
+	}
+	if alive > 0 {
+		return false
+	}
+	// Compare-and-set against the name that was read, not a plain overwrite: between the
+	// read and here the mark may have expired and been taken by a third instance, and
+	// stamping over that one is the collision the mark exists to prevent, arrived at by
+	// the code meant to repair it.
+	took, err := takeTurnFromGone.Run(
+		ctx, c.client, []string{mark}, holder, c.cfg.Instance, resumeCooloff.Milliseconds(),
+	).Int()
+	if err != nil {
+		c.log.Warn().Err(err).Str("sid", sid).Str("holder", holder).
+			Msg("could not take over the turn of an instance that is gone")
+		return false
+	}
+	if took == 1 {
+		c.log.Info().Str("sid", sid).Str("holder", holder).
+			Msg("taking over the resume turn of an instance that is no longer in the fleet")
+	}
+	return took == 1
+}
+
+// takeTurnFromGone replaces a resume turn only while it still belongs to the instance the
+// caller found holding it. Same shape as dropOwnResumeMark, and as releaseScript in
+// internal/cluster, for the same reason: read and write have to be one step.
+var takeTurnFromGone = redis.NewScript(`
+if redis.call("GET", KEYS[1]) ~= ARGV[1] then
+  return 0
+end
+redis.call("SET", KEYS[1], ARGV[2], "PX", ARGV[3])
+return 1
+`)
 
 // waitingOut is the quarantine read, with the instance that has none answering "none".
 func (c *Connector) waitingOut(ctx context.Context, sids []string) (map[string]time.Time, error) {
