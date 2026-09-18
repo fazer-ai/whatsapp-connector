@@ -3354,6 +3354,14 @@ type resumedDoor struct {
 	// the wrong group, the wrong message or the wrong presence state keeps every row
 	// green: a schema catches a field that went missing, never a field that is wrong.
 	carries func(*testing.T, map[string]any)
+	// answers is what the door tells WhatsApp once the event is out, and it is not the
+	// same for all of them. An inbound message and its receipt withhold the
+	// acknowledgement until the event is known to have been delivered -- invariant 4,
+	// losing Redis costs a redelivery and never a message -- and nothing in a unit test
+	// confirms that delivery, so those two answer false here and would answer true in a
+	// deployment. The rest acknowledge on the spot, because WhatsApp does not redeliver a
+	// call, a presence or a group notification worth waiting for.
+	answers bool
 }
 
 // inTheGroup fails unless the payload puts the event in the group the stimulus named, at
@@ -3420,6 +3428,8 @@ func resumedDoors() []resumedDoor {
 	return []resumedDoor{
 		{
 			door: "receive",
+			// Held back until the event is known to have been delivered.
+			answers: false,
 			carries: func(t *testing.T, payload map[string]any) {
 				inTheGroup(t, payload, "message", "chat")
 				if got := field(t, payload, "message", "id"); got != "3EB0GROUPRESUME" {
@@ -3442,7 +3452,8 @@ func resumedDoors() []resumedDoor {
 			// The filter a group message that cannot be decrypted goes through, which is a
 			// different function from the one above and the reason the issue counted it
 			// separately: nothing about `receive` being covered says this one is.
-			door: "unreadable",
+			door:    "unreadable",
+			answers: true,
 			carries: func(t *testing.T, payload map[string]any) {
 				inTheGroup(t, payload, "message", "chat")
 				// The word the issue names: a message nothing could read is a bubble
@@ -3473,6 +3484,8 @@ func resumedDoors() []resumedDoor {
 		},
 		{
 			door: "receipt",
+			// Held back until the event is known to have been delivered.
+			answers: false,
 			carries: func(t *testing.T, payload map[string]any) {
 				inTheGroup(t, payload, "chat")
 				ids, _ := payload["message_ids"].([]any)
@@ -3497,11 +3510,18 @@ func resumedDoors() []resumedDoor {
 			},
 		},
 		{
-			door: "chatPresence",
+			door:    "chatPresence",
+			answers: true,
 			carries: func(t *testing.T, payload map[string]any) {
 				inTheGroup(t, payload, "chat")
 				if got := payload["state"]; got != "composing" {
 					t.Errorf("somebody typing in the group was published as %v", got)
+				}
+				// The participant and not the group: a presence keyed by the chat alone
+				// would put "somebody is typing" in the conversation with nobody's name on
+				// it, and the group is the chat, never the one who typed.
+				if got := field(t, payload, "sender", "phone"); got != "5511999990002" {
+					t.Errorf("published %v as whoever is typing in the group", got)
 				}
 			},
 			quiet:      boardIsEmpty,
@@ -3523,7 +3543,8 @@ func resumedDoors() []resumedDoor {
 			// The weakest of the three the issue named: `joinedAGroup` is a function of
 			// its own, and nothing -- live or in unit -- had ever crossed this line with a
 			// subscription that came back from a resume.
-			door: "joinedAGroup",
+			door:    "joinedAGroup",
+			answers: true,
 			carries: func(t *testing.T, payload map[string]any) {
 				inTheGroup(t, payload, "info", "group")
 				if got := field(t, payload, "info", "subject"); got != "Equipe fazer.ai" {
@@ -3553,7 +3574,8 @@ func resumedDoors() []resumedDoor {
 			// carrying only what the contract has no field for leaves `changes` empty and
 			// comes out as `group.activity`. The rename exits `groupChanged` by the other
 			// arm, so covering it says nothing about this one.
-			door: "groupChanged",
+			door:    "groupChanged",
+			answers: true,
 			carries: func(t *testing.T, payload map[string]any) {
 				groups, _ := payload["groups"].([]any)
 				if len(groups) != 1 {
@@ -3578,7 +3600,8 @@ func resumedDoors() []resumedDoor {
 			// Added by #220, four days after the issue was written, and so absent from its
 			// table of six. It is the same filter on the same field, reached from a door
 			// nobody had counted.
-			door: "callOffered",
+			door:    "callOffered",
+			answers: true,
 			carries: func(t *testing.T, payload map[string]any) {
 				if got := payload["call_id"]; got != "call-resumed-1" {
 					t.Errorf("published %v as the call that is ringing", got)
@@ -3607,7 +3630,8 @@ func resumedDoors() []resumedDoor {
 			},
 		},
 		{
-			door: "callEnded",
+			door:    "callEnded",
+			answers: true,
 			carries: func(t *testing.T, payload map[string]any) {
 				if got := payload["call_id"]; got != "call-resumed-1" {
 					t.Errorf("published %v as the call that ended", got)
@@ -3650,8 +3674,20 @@ func TestEveryGroupDoorOpensForASubscriptionThatCameBackFromAResume(t *testing.T
 			// it goes out, and no row here is about that window. Shortened rather than
 			// waited out, the way every other test of that path does it.
 			session.rerequestWait = 10 * time.Millisecond
-			door.give(session)
+			// Off the test's goroutine: the two message routes hold their answer until the
+			// event is delivered, and the delivery is this goroutine reading it.
+			answered := make(chan bool, 1)
+			go func() { answered <- door.give(session) }()
 			door.carries(t, published(t, session, door.want, door.definition))
+			select {
+			case got := <-answered:
+				if got != door.answers {
+					t.Errorf("%s answered WhatsApp %v for group traffic it published, want %v",
+						door.door, got, door.answers)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatalf("%s published the event and never answered WhatsApp", door.door)
+			}
 		})
 	}
 }
