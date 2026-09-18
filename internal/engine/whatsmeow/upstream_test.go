@@ -40,6 +40,36 @@ type upstreamDefect struct {
 
 var upstreamDefects = []upstreamDefect{
 	{
+		issue: "fazer-ai/whatsapp-connector#283",
+		file:  "send.go",
+		// A send interrupted by the connection dropping is retried, and the retry is handed
+		// a zero where every other caller of retryFrame passes a duration. Zero there is not
+		// the default: `retryFrame` only builds a timer `if timeout > 0`, so the retry waits
+		// on the answer and the context and nothing else. The literal is what is asserted,
+		// because a fix is exactly this argument becoming something else.
+		stillThere: []string{`cli.retryFrame(ctx, "message send", req.ID, data, respNode, 0)`},
+		enclosing:  "func (cli *Client) SendMessage(",
+		what: "the retry of an interrupted send being given no timeout, which leaves it " +
+			"bounded by the caller's context alone",
+	},
+	{
+		issue:      "fazer-ai/whatsapp-connector#283",
+		file:       "sendfb.go",
+		stillThere: []string{`cli.retryFrame(ctx, "message send", req.ID, data, respNode, 0)`},
+		enclosing:  "func (cli *Client) SendFBMessage(",
+		what:       "the same zero timeout on the FB send path",
+	},
+	{
+		issue: "fazer-ai/whatsapp-connector#283",
+		file:  "request.go",
+		// The other half of the same defect, and the half a fix would most likely touch:
+		// the timer is built only for a positive value, so zero switches it off rather
+		// than selecting the default the way `sendIQAsync` does a few lines above.
+		inOrder:   []string{"if timeout > 0 {", "timeoutChan = time.After(timeout)"},
+		enclosing: "func (cli *Client) retryFrame(",
+		what:      "zero meaning no timer at all rather than the seventy five second default",
+	},
+	{
 		issue: "fazer-ai/whatsapp-connector#207",
 		file:  "socket/noisesocket.go",
 		// NoiseSocket.Stop clears the callback with no lock at all, while FrameSocket.Close
