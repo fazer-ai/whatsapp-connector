@@ -100,9 +100,13 @@ func TestATurnIsOnlyTakenWhileItStillReadsAsTheOneThatWasFound(t *testing.T) {
 // The cell that nothing else reaches is "mine, and my own registry entry is not there".
 // The early return on one's own name looks like a shortcut for the liveness read that
 // follows it, and on a healthy instance it is: the entry is there, the instance reads as
-// alive, and both paths answer no. It stops being a shortcut the moment a beat has not
-// landed yet -- a instance that has just come up, a Redis that blinked, a heartbeat the
-// scheduler has not run. Without the early return, such an instance reads ITSELF as gone,
+// alive, and both paths answer no. It stops being a shortcut the moment the entry is not
+// there, and there are two ways to get that and they are not the same one: an instance
+// whose beat is late by more than the entry's TTL, and an instance that has just come up
+// and has not beaten once. The second is the sharper case, because a sweep runs from the
+// same goroutine loop the heartbeat does, and the first pass of the ramp can reach an
+// account before the first beat has landed. Without the early return, such an instance
+// reads ITSELF as gone,
 // takes its own turn, and dials an account it decided a moment ago to leave alone: the
 // retry floor removed by the code written to repair a different hole in it.
 func TestWhoseTurnItIsDecidesWhetherItCanBeTaken(t *testing.T) {
