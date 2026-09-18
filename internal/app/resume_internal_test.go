@@ -36,7 +36,7 @@ func TestTheResumeSweepBringsBackAnAccountNobodyIsRunning(t *testing.T) {
 		account, ok := engine.Session("sid-1")
 		return ok && account.Connected()
 	})
-	if !server.Exists(redisx.NewKeys("wa:", 8).Resume("sid-1")) {
+	if !server.Exists(redisx.NewKeys("wa:", 0).Resume("sid-1")) {
 		t.Fatal("the attempt left no mark, so every instance in the fleet would make it again on its own next pass")
 	}
 	// And an account this instance is already running is not asked for again: the sweep
@@ -81,7 +81,7 @@ func TestTheResumeSweepLeavesAnAccountAPeerIsRunning(t *testing.T) {
 	connector, container, engine, server := newResumeConnector(t)
 	wantConnected(t, container, "sid-1", "5511999990001", false)
 
-	peer := cluster.NewLeases(redisx.Wrap(redis.NewClient(&redis.Options{Addr: server.Addr()}), "wa:", 8),
+	peer := cluster.NewLeases(redisx.Wrap(redis.NewClient(&redis.Options{Addr: server.Addr()}), "wa:", DefaultEventShards),
 		"inst-b", cluster.Options{})
 	if _, err := peer.Acquire(t.Context(), "sid-1"); err != nil {
 		t.Fatalf("the peer could not take the account: %v", err)
@@ -92,7 +92,7 @@ func TestTheResumeSweepLeavesAnAccountAPeerIsRunning(t *testing.T) {
 	if _, ok := engine.Session("sid-1"); ok {
 		t.Fatal("an account another instance is running was opened here as well, which is two sockets on one number")
 	}
-	if server.Exists(redisx.NewKeys("wa:", 8).Resume("sid-1")) {
+	if server.Exists(redisx.NewKeys("wa:", 0).Resume("sid-1")) {
 		t.Fatal("the sweep spent a turn on an account that is plainly running; the lease filter is what keeps that traffic off the fleet")
 	}
 }
@@ -110,7 +110,7 @@ func TestTheResumeSweepWaitsOutTheMarkAnotherAttemptLeft(t *testing.T) {
 	// rather than proof that nothing has happened yet.
 	wantConnected(t, container, "sid-a-cold", "5511999990001", false)
 	wantConnected(t, container, "sid-b-warm", "5511999990002", false)
-	keys := redisx.NewKeys("wa:", 8)
+	keys := redisx.NewKeys("wa:", 0)
 	server.Set(keys.Resume("sid-a-cold"), "inst-b")
 	// Announced as well as named, because a mark is only somebody else's turn while that
 	// somebody is still in the fleet: a turn in the name of an instance the registry has
@@ -146,7 +146,7 @@ func TestTheResumeSweepAsksForOneBatchAtATime(t *testing.T) {
 	// without waiting on the goroutine that carries the adoptions out.
 	asked := 0
 	for i := range resumeBatch + 3 {
-		if server.Exists(redisx.NewKeys("wa:", 8).Resume(fmt.Sprintf("sid-%02d", i))) {
+		if server.Exists(redisx.NewKeys("wa:", 0).Resume(fmt.Sprintf("sid-%02d", i))) {
 			asked++
 		}
 	}
@@ -191,7 +191,7 @@ func newResumeConnector(t *testing.T) (*Connector, *store.Container, *fake.Engin
 	server := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
 	t.Cleanup(func() { _ = rdb.Close() })
-	client := redisx.Wrap(rdb, "wa:", 8)
+	client := redisx.Wrap(rdb, "wa:", DefaultEventShards)
 	leases := cluster.NewLeases(client, "inst-a", cluster.Options{})
 	engine := fake.New()
 

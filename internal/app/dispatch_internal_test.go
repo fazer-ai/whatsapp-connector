@@ -90,7 +90,7 @@ func TestADrainThatFailsGivesTheSessionsBack(t *testing.T) {
 	server := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
 	t.Cleanup(func() { _ = rdb.Close() })
-	client := redisx.Wrap(rdb, "wa:", 8)
+	client := redisx.Wrap(rdb, "wa:", DefaultEventShards)
 
 	streams, err := redisstream.New(client, redisstream.Options{
 		Instance: "inst-a", Block: 50 * time.Millisecond, ClaimMinIdle: time.Millisecond,
@@ -140,7 +140,7 @@ func newTestManager(t *testing.T) *session.Manager {
 	server := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
 	t.Cleanup(func() { _ = rdb.Close() })
-	client := redisx.Wrap(rdb, "wa:", 8)
+	client := redisx.Wrap(rdb, "wa:", DefaultEventShards)
 
 	manager := session.NewManager(&session.ManagerConfig{
 		Instance: "inst-a", Engine: fake.New(),
@@ -283,7 +283,7 @@ func TestADrainClaimsOnWhatIsLeftOfItsWindow(t *testing.T) {
 	server := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
 	t.Cleanup(func() { _ = rdb.Close() })
-	client := redisx.Wrap(rdb, "wa:", 8)
+	client := redisx.Wrap(rdb, "wa:", DefaultEventShards)
 
 	newStreams := func(instance string) *redisstream.Streams {
 		streams, err := redisstream.New(client, redisstream.Options{
@@ -448,7 +448,7 @@ func TestTheLoopBoundsItsOptionalWorkByTheTick(t *testing.T) {
 	server := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
 	t.Cleanup(func() { _ = rdb.Close() })
-	client := redisx.Wrap(rdb, "wa:", 8)
+	client := redisx.Wrap(rdb, "wa:", DefaultEventShards)
 
 	newStreams := func(instance string) *redisstream.Streams {
 		streams, err := redisstream.New(client, redisstream.Options{
@@ -545,7 +545,7 @@ func TestASlowDrainStillLeavesRoomToRead(t *testing.T) {
 	server := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
 	t.Cleanup(func() { _ = rdb.Close() })
-	client := redisx.Wrap(rdb, "wa:", 8)
+	client := redisx.Wrap(rdb, "wa:", DefaultEventShards)
 
 	newStreams := func(instance string) *redisstream.Streams {
 		streams, err := redisstream.New(client, redisstream.Options{
@@ -729,7 +729,7 @@ func TestAFailingSessionClaimDoesNotTakeTheControlStreamWithIt(t *testing.T) {
 	server := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
 	t.Cleanup(func() { _ = rdb.Close() })
-	client := redisx.Wrap(rdb, "wa:", 8)
+	client := redisx.Wrap(rdb, "wa:", DefaultEventShards)
 
 	newStreams := func(instance string) *redisstream.Streams {
 		streams, err := redisstream.New(client, redisstream.Options{
@@ -810,7 +810,7 @@ func TestAReclaimDispatchesOnWhatIsLeftOfItsOwnDeadline(t *testing.T) {
 	server := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
 	t.Cleanup(func() { _ = rdb.Close() })
-	client := redisx.Wrap(rdb, "wa:", 8)
+	client := redisx.Wrap(rdb, "wa:", DefaultEventShards)
 
 	newStreams := func(instance string) *redisstream.Streams {
 		streams, err := redisstream.New(client, redisstream.Options{
@@ -1085,7 +1085,7 @@ func adoptedSession(
 	server := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
 	t.Cleanup(func() { _ = rdb.Close() })
-	client := redisx.Wrap(rdb, "wa:", 8)
+	client := redisx.Wrap(rdb, "wa:", DefaultEventShards)
 
 	streams, err := redisstream.New(client, redisstream.Options{
 		Instance: "inst-a", Block: 20 * time.Millisecond, ClaimMinIdle: time.Millisecond,
@@ -1137,7 +1137,7 @@ func TestALaterCommandDoesNotOvertakeOneLeftPendingInTheSameBatch(t *testing.T) 
 	// how the first command of this batch is left pending without a queue to fill.
 	manager := session.NewManager(&session.ManagerConfig{
 		Instance: "inst-a", Engine: fake.New(),
-		Leases:    cluster.NewLeases(redisx.Wrap(rdb, "wa:", 8), "inst-a", cluster.Options{}),
+		Leases:    cluster.NewLeases(redisx.Wrap(rdb, "wa:", DefaultEventShards), "inst-a", cluster.Options{}),
 		Publisher: quietPublisher{}, Replier: quietReplier{},
 		AnswerDepth: 1,
 		NewID:       func() string { return "evt" }, Logger: zerolog.Nop(),

@@ -53,7 +53,7 @@ func TestTheSuccessorPutsBackWhatItsPredecessorGaveUpWithoutWaitingOutAWholeInte
 	// the shard for a session with eight and the connector publishes with sixteen: for
 	// half the session ids the two disagree and the read comes back empty with no error.
 	// That is #269, and pinning it here is what stops this assertion from being vacuous.
-	env := map[string]string{"WAC_DATABASE_URL": dsn, "WAC_EVENT_SHARDS": "8"}
+	env := map[string]string{"WAC_DATABASE_URL": dsn}
 
 	outgoing, stopOutgoing := startStoppable(t, server.Addr(), "inst-out", env)
 	waitFor(t, "the outgoing instance to be running the account", func() bool {
@@ -98,7 +98,7 @@ func TestAPredecessorsEventIsNotEvidenceThatTheSuccessorPutTheAccountBack(t *tes
 
 	const sid = "2f1c6f0e-0000-4000-8000-000000000269"
 	seedWantedConnected(t, dsn, sid, "5511999990269")
-	env := map[string]string{"WAC_DATABASE_URL": dsn, "WAC_EVENT_SHARDS": "8"}
+	env := map[string]string{"WAC_DATABASE_URL": dsn}
 
 	outgoing, _ := startStoppable(t, server.Addr(), "inst-out", env)
 	waitFor(t, "the outgoing instance to be running the account", func() bool {
@@ -147,7 +147,7 @@ func TestAShutdownDropsItsOwnResumeCoolOffAndNobodyElses(t *testing.T) {
 
 	const sid = "2f1c6f0e-0000-4000-8000-00000000026a"
 	seedWantedConnected(t, dsn, sid, "5511999990270")
-	env := map[string]string{"WAC_DATABASE_URL": dsn, "WAC_EVENT_SHARDS": "8"}
+	env := map[string]string{"WAC_DATABASE_URL": dsn}
 
 	outgoing, stopOutgoing := startStoppable(t, server.Addr(), "inst-out", env)
 	waitFor(t, "the outgoing instance to be running the account", func() bool {
@@ -155,7 +155,7 @@ func TestAShutdownDropsItsOwnResumeCoolOffAndNobodyElses(t *testing.T) {
 	})
 
 	// Stand in for the peer that swept after this instance's own mark had expired.
-	mark := redisx.NewKeys("wa:", 8).Resume(sid)
+	mark := redisx.NewKeys("wa:", 0).Resume(sid)
 	if err := server.Set(mark, "some-other-instance"); err != nil {
 		t.Fatalf("plant a peer's turn: %v", err)
 	}

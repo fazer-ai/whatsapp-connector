@@ -234,7 +234,7 @@ func TestWhoseTurnItIsDecidesWhetherItCanBeTaken(t *testing.T) {
 // "the window is broken". The two tests above cover that particular change on its merits.
 func TestATurnTakenByALiveThirdInstanceInsideTheWindowIsNotStampedOver(t *testing.T) {
 	connector, container, _, srv := newResumeConnector(t)
-	keys := redisx.NewKeys("wa:", 8)
+	keys := redisx.NewKeys("wa:", 0)
 
 	const sid = "sid-window"
 	wantConnected(t, container, sid, "5511999990274", false)
