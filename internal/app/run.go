@@ -1220,33 +1220,50 @@ func (c *Connector) shutdown() {
 	c.log.Info().Msg("connector is down")
 }
 
-// newEngine builds the WhatsApp side. The store comes back with it because only the
-// whatsmeow engine has one, and whoever built it has to close it.
+// newEngine builds the WhatsApp side, and opens the store when a database is configured.
+//
+// The store is the connector's rather than the engine's: it holds what each client asked
+// for, the media parts and the group creations, and the resume sweep is the pass that
+// reads it. It is opened in here only because whatsmeow's own tables share the one pool
+// (see the comment on store.OpenWith), and that accident used to decide who got a store:
+// the fake engine returned nil and took `resumeWanted` and `sweepMediaParts` down with
+// it, so an instance configured with a database ran without persistence and said nothing
+// (#265). It follows the database now, not the engine. Whoever built it has to close it.
 //
 //nolint:gocritic // zerolog.Logger is designed to be copied; every With() returns one by value
 func newEngine(
 	ctx context.Context, cfg *Config, owned store.Ownership, blobs meow.MediaOptions,
 	queueing meow.Queueing, log zerolog.Logger,
 ) (engine.Engine, *store.Container, error) {
-	switch cfg.Engine {
-	case EngineFake:
-		return fake.New(), nil, nil
-	case EngineWhatsmeow:
-		devices, err := store.OpenWith(ctx, cfg.DatabaseURL, owned, log,
+	var devices *store.Container
+	if cfg.DatabaseURL != "" {
+		opened, err := store.OpenWith(ctx, cfg.DatabaseURL, owned, log,
 			store.Options{MaxConns: cfg.DatabaseConns})
 		if err != nil {
 			return nil, nil, err
 		}
+		devices = opened
+	}
+
+	// The container is this function's until it is handed over, so every path that does
+	// not hand it over closes it: an engine that refused to be built never took it, and
+	// neither did a name this build does not know.
+	switch cfg.Engine {
+	case EngineFake:
+		return fake.New(), devices, nil
+	case EngineWhatsmeow:
+		// Config refuses a whatsmeow engine with no database url, so devices is set.
 		waEngine, err := meow.New(devices,
 			meow.Options{DeviceName: cfg.DeviceName, Media: blobs, Queueing: queueing}, log)
 		if err != nil {
-			// The container is this function's until it is handed over, and an engine
-			// that refused to be built never took it.
 			_ = devices.Close()
 			return nil, nil, err
 		}
 		return waEngine, devices, nil
 	default:
+		if devices != nil {
+			_ = devices.Close()
+		}
 		return nil, nil, fmt.Errorf("app: unknown engine %q", cfg.Engine)
 	}
 }
