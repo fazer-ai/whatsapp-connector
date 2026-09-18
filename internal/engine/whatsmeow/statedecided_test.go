@@ -74,6 +74,22 @@ func TestTheKeepAliveStateCarriesTheDispatchInstantToThePublishSide(t *testing.T
 			"the wait for the transition lock falls outside the measurement, and that wait is what #182 is about",
 			state.decided.Format(time.TimeOnly), dispatched.Format(time.TimeOnly))
 	}
+	// The monotonic reading has to survive the trip, and this is the only place that can
+	// say so. `Sub` uses the monotonic readings when both ends have one and falls back to
+	// the wall clock when either does not -- silently, with no error and no second return
+	// value. So a `.UTC()` added to a log line, a `.Truncate()` added to round a number for
+	// a message, or this field being serialised one day would leave the measurement working
+	// and wrong, and wrong by exactly whatever the clock was adjusted by during the window.
+	// A metric whose reason to exist is the long tail is a metric whose windows are long
+	// enough for an NTP step to fit inside one.
+	//
+	// `Round(0)` is the documented way to strip the reading, and `==` on time.Time compares
+	// it, so a value that still has one cannot equal its own stripped copy. `Equal` would
+	// not do: it compares instants and ignores exactly what is under test here.
+	if state.decided == state.decided.Round(0) {
+		t.Error("the decision instant reached the publish side with no monotonic reading, so the distance is measured against the wall clock: " +
+			"a clock adjustment inside the window it exists to show would be added to the measurement, and nothing would report that it had been")
+	}
 	if state.at == dispatched.UnixMilli() {
 		t.Error("`At` and the decision instant are now the same reading, which means one of them stopped meaning what it says: " +
 			"`At` is the engine's reading of when the fact happened and crosses the wire as `ts`, and it is read inside `emitting`, after the lock")
