@@ -47,6 +47,13 @@ func TestTheContractSaysWhatBoundsACommandWithNoCeilingOfItsOwn(t *testing.T) {
 		phrase string
 		why    string
 	}{
+		// The bold lead specifically, not just the body. It said "bounded by the connector"
+		// while the sentence under it explained the ceiling is the library's, and the
+		// verifier's report on #281 pointed out that the lead is what a client skimming
+		// the contract keeps. Two true sentences can still leave a false impression, and
+		// the one in bold is the one that does it.
+		{"the lead not handing the bound to this connector", "mostly not by this connector",
+			"a reader who takes only the bold sentence would expect us to own the number"},
 		{"whose bound it is", "not this connector's",
 			"a client that thinks the seventy five seconds is ours will expect us to change it"},
 		{"the number", "seventy five seconds",
