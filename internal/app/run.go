@@ -218,6 +218,7 @@ func New(cfg *Config, log zerolog.Logger) (connector *Connector, err error) {
 // a consequence several paths reach.
 type commandStreams interface {
 	Read(ctx context.Context, sids []string) ([]transport.Delivery, error)
+	Wake(ctx context.Context, sid string) error
 	Claim(ctx context.Context, sids []string) ([]transport.Delivery, error)
 	ClaimControl(ctx context.Context) ([]transport.Delivery, error)
 	ClaimSessions(ctx context.Context, sids []string) ([]transport.Delivery, error)
@@ -1194,12 +1195,17 @@ func (c *Connector) announce(ctx context.Context) {
 }
 
 // shutdown gives the sessions back rather than letting their leases expire, which is
-// the difference between a peer picking them up now and one TTL from now.
+// the difference between a peer picking them up now and one TTL from now -- and then says
+// so, because giving a lease back is what makes it takeable and nothing more.
 func (c *Connector) shutdown() {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(context.Background()), ShutdownGrace)
 	defer cancel()
 
+	// Read before the stops, because StopAll empties it: this is the list of accounts this
+	// instance is about to make ownerless, and after the call there is nothing left to ask.
+	giving := c.manager.SIDs()
 	c.manager.StopAll(ctx)
+	c.wakeWhatWasGivenUp(ctx, giving)
 	if err := c.registry.Withdraw(ctx, c.cfg.Instance); err != nil {
 		c.log.Warn().Err(err).Msg("failed to withdraw this instance")
 	}
@@ -1218,6 +1224,39 @@ func (c *Connector) shutdown() {
 		c.log.Warn().Err(err).Msg("failed to close the redis client")
 	}
 	c.log.Info().Msg("connector is down")
+}
+
+// wakeWhatWasGivenUp tells the fleet about every account this instance just released.
+//
+// After the releases rather than before them, and that ordering is a reasoned choice, not
+// a measured one -- said plainly because the tests beside this cannot tell the two apart.
+// A wake read while the lease is still being handed back is deliberately not acted on:
+// `Manager.Dispatch` sees `ErrHandingBack` and leaves it pending, and pending means waiting
+// for a reclaim, which is longer than the resume pass this exists to beat. Sending after the
+// release means no reader can ever be in that position.
+//
+// What is measured is that the window is not reachable at one session: with the send moved
+// ahead of `StopAll`, the successor still adopts immediately and the hand-back branch never
+// runs, because releasing one session finishes before any peer gets to read. The window this
+// ordering avoids opens with the number of sessions, since `StopAll` closes their sockets in
+// turn, and exercising it needs a fleet under load -- which is #264, not this.
+//
+// Safe to send from here for a reason the shutdown ordering already guarantees: the
+// command reader was stopped before shutdown was called, precisely so "the hand-back is
+// not racing a wake that would adopt a session back onto an instance that is going away".
+// So this instance cannot be the one that answers its own wakes.
+//
+// Logged rather than returned, one by one rather than in a batch. The process is leaving
+// either way, an account whose wake could not be sent is one the resume sweep still picks
+// up on its next pass -- which is exactly the behaviour this replaces, so a failure here
+// costs what the whole fleet used to cost and nothing more.
+func (c *Connector) wakeWhatWasGivenUp(ctx context.Context, sids []string) {
+	for _, sid := range sids {
+		if err := c.streams.Wake(ctx, sid); err != nil {
+			c.log.Warn().Err(err).Str("sid", sid).
+				Msg("could not tell the fleet this account was given up; it waits for a resume pass")
+		}
+	}
 }
 
 // newEngine builds the WhatsApp side, and opens the store when a database is configured.

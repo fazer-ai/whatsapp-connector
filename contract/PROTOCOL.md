@@ -70,7 +70,7 @@ is willing to wait for an answer, not to how long the teardown is allowed to tak
 |---|---|---|
 | `wa:events:<shard>` | connector → client | `event` |
 | `wa:cmd:<sid>` | client → connector | `command` |
-| `wa:control` | client → any connector | `command` (`session.wake`, `admin.ping`, `session.delete`) |
+| `wa:control` | client or connector → any connector | `command` (`session.wake`, `admin.ping`, `session.delete`) |
 | `wa:reply:<command_id>` (LIST) | connector → client | `reply` |
 
 `seq` is monotonic per `(sid, epoch)` and, together with the per-session shard
@@ -107,6 +107,20 @@ Both are accepted on `wa:cmd:<sid>` as well, and a connector running the session
 carries them out from there. A client that publishes `session.delete` only to the
 session's own stream therefore gets the teardown whenever the session happens to be
 up, and silence otherwise.
+
+**A connector also writes `session.wake` to this stream, and a client must not assume it
+is the only writer.** An instance that is shutting down releases the sessions it was
+running and then publishes one `session.wake` per released session, so that a peer adopts
+the account at once instead of finding it on its next resume pass. Releasing a lease only
+makes an account *takeable*; nothing else tells anybody to take it, and without this a
+rolling deploy leaves every account it moves unowned for a whole resume interval.
+
+What this obliges the consuming side to do is nothing, and what it obliges it not to do is
+assume authorship: a client that reads `wa:control` back for its own bookkeeping will see
+`session.wake` frames with ids it never minted, for sessions it did not ask about. They are
+not replays of the client's own commands and must not be matched against them. Sessions
+still reach the client the same way they always have, through `wa:events:<shard>`; nothing
+about this changes which events arrive or in what order.
 
 What `wa:control` guarantees is delivery to *some* connector, not to a particular one.
 Every connector reads the stream under one consumer group, so an entry naming a session

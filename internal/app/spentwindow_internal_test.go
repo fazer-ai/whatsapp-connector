@@ -174,6 +174,10 @@ type answeredWith struct{ err error }
 func (s answeredWith) Read(context.Context, []string) ([]transport.Delivery, error) {
 	return nil, s.err
 }
+
+// Wake is not what any test here watches: this double stands in for the command streams
+// so a dispatch can be driven, and the shutdown that sends wakes never runs.
+func (answeredWith) Wake(context.Context, string) error                            { return nil }
 func (answeredWith) Claim(context.Context, []string) ([]transport.Delivery, error) { return nil, nil }
 func (answeredWith) ClaimControl(context.Context) ([]transport.Delivery, error)    { return nil, nil }
 func (answeredWith) ClaimSessions(context.Context, []string) ([]transport.Delivery, error) {

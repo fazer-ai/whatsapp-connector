@@ -198,6 +198,10 @@ func (s *timedStreams) Claim(ctx context.Context, sids []string) ([]transport.De
 	return s.inner.Claim(ctx, sids)
 }
 
+// Wake is not what any test here watches: these doubles stand in for the command
+// streams so a dispatch can be driven, and the shutdown that sends wakes never runs.
+func (s *timedStreams) Wake(context.Context, string) error { return nil }
+
 func (s *timedStreams) ClaimControl(ctx context.Context) ([]transport.Delivery, error) {
 	s.record(ctx)
 	return s.inner.ClaimControl(ctx)
@@ -1027,6 +1031,10 @@ func (s *undrainableStreams) Read(ctx context.Context, sids []string) ([]transpo
 func (s *undrainableStreams) Claim(ctx context.Context, sids []string) ([]transport.Delivery, error) {
 	return s.inner.Claim(ctx, sids)
 }
+
+// Wake is not what any test here watches: these doubles stand in for the command
+// streams so a dispatch can be driven, and the shutdown that sends wakes never runs.
+func (s *undrainableStreams) Wake(context.Context, string) error { return nil }
 
 func (s *undrainableStreams) ClaimControl(ctx context.Context) ([]transport.Delivery, error) {
 	return s.inner.ClaimControl(ctx)

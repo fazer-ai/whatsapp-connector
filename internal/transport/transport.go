@@ -119,6 +119,17 @@ type Delivery struct {
 	Internal bool
 }
 
+// CommandWaker puts a command on the control stream, which is the one stream this
+// connector writes to that a client otherwise owns.
+type CommandWaker interface {
+	// Wake puts a `session.wake` for one session on the control stream, which is how an
+	// instance that has just let a session go tells the fleet there is an account to pick
+	// up. Releasing a lease only makes an account takeable: without this the peers find
+	// out on their next resume pass, a whole interval later, and a rolling deploy leaves
+	// every account it moves unowned for that interval (#268).
+	Wake(ctx context.Context, sid string) error
+}
+
 // CommandReader delivers the commands addressed to the sessions this instance owns,
 // plus the ones addressed to no session in particular.
 type CommandReader interface {
@@ -150,6 +161,7 @@ type Replier interface {
 // Transport is the three of them together, which is what a running connector needs.
 type Transport interface {
 	Publisher
+	CommandWaker
 	CommandReader
 	Replier
 }

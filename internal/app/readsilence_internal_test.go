@@ -78,6 +78,10 @@ func (s *muteStreams) Claim(ctx context.Context, sids []string) ([]transport.Del
 	return s.inner.Claim(ctx, sids)
 }
 
+// Wake is not what any test here watches: these doubles stand in for the command
+// streams so a dispatch can be driven, and the shutdown that sends wakes never runs.
+func (s *muteStreams) Wake(context.Context, string) error { return nil }
+
 func (s *muteStreams) ClaimControl(ctx context.Context) ([]transport.Delivery, error) {
 	return s.inner.ClaimControl(ctx)
 }

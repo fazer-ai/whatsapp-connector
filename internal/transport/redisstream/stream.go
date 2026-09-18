@@ -8,6 +8,9 @@ package redisstream
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -178,6 +181,44 @@ func (s *Streams) Publish(ctx context.Context, event *protocol.Event) error {
 	}
 	if err := s.client.XAdd(ctx, args).Err(); err != nil {
 		return fmt.Errorf("redisstream: publish %s: %w", event.ID, err)
+	}
+	return nil
+}
+
+// Wake puts a `session.wake` for one session on the control stream.
+//
+// The control stream rather than the session's own, because a session's stream is read
+// only by the instance that owns it, and the whole point here is that nobody owns this one
+// any more. Control is read by every instance, which is what the comment on `streamsFor`
+// calls "how a session with no owner gets one".
+//
+// `desired: connected` is the truth and not a guess: the only caller is an instance that
+// was running the account when it was asked to stop. What the account comes back with is
+// read from its desired row on adoption, not from here, so this payload says why the wake
+// exists rather than carrying the subscription.
+//
+// The id is minted here. Frames from two instances share one stream, so a counter would
+// collide across them, which is the same reason the events side mints random ones.
+func (s *Streams) Wake(ctx context.Context, sid string) error {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return fmt.Errorf("redisstream: mint a wake id for %s: %w", sid, err)
+	}
+	command := &protocol.Command{
+		V:       protocol.Version,
+		ID:      hex.EncodeToString(raw[:]),
+		Type:    protocol.CommandSessionWake,
+		SID:     sid,
+		TS:      time.Now().UnixMilli(),
+		Payload: json.RawMessage(`{"desired":"connected"}`),
+	}
+	fields, err := command.Fields()
+	if err != nil {
+		return fmt.Errorf("redisstream: render the wake for %s: %w", sid, err)
+	}
+	args := &redis.XAddArgs{Stream: s.client.Keys().Control(), Values: toValues(fields)}
+	if err := s.client.XAdd(ctx, args).Err(); err != nil {
+		return fmt.Errorf("redisstream: wake %s: %w", sid, err)
 	}
 	return nil
 }
