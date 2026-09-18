@@ -81,6 +81,16 @@ type Session struct {
 	// given up on afresh while an answer about the one before is on its way, and a door
 	// opened by that older answer is a session marked retired and taking commands.
 	shutFor uint64
+	// accepted counts the deliveries this session has taken and not yet finished with,
+	// from the instant `Offer` puts one in the channel to the instant it is answered,
+	// released or abandoned.
+	//
+	// The queue's length and `running` answer that question everywhere except in the gap
+	// between them: the executor takes a delivery out of the channel and then calls
+	// `admit`, and a preemption in between leaves an accepted command that is in neither
+	// -- an empty queue, nothing running, and a client waiting. That is the state the
+	// hand-back must not read as idle.
+	accepted int
 	// refused says a command was turned away while the door was shut, which is what the
 	// drain the reopening schedules is for.
 	refused bool
@@ -106,6 +116,26 @@ type Session struct {
 	connected func()
 	resumeBad func()
 	wasOpen   bool
+
+	// afterCommand reports every command this session finished with, saying whether it
+	// was a teardown and what it answered. Both halves matter to the one caller there is:
+	// this session knows what it ran and why it said no, and only the manager knows
+	// whether the account was opened to serve that very teardown.
+	//
+	// Every command and not only the refusals, so that the manager's bookkeeping is
+	// ordered by the executor rather than by a count it polls: a client's command
+	// arriving while an adoption waits to be undone is the thing that must cancel the
+	// undoing, and this is where that is known first. Nil outside the manager.
+	afterCommand func(refusal protocol.ErrorCode, teardown, happened bool)
+	// carried counts the commands this session actually carried out, and exists for one
+	// reader: the manager gives an account back only while nothing has been done on it
+	// since the teardown it was adopted for was refused. A connect that landed behind that
+	// refusal and worked makes this an account somebody wants up.
+	//
+	// Commands refused before they ran are left out on purpose. A late connect refused
+	// `expired` is not a client using the account, and counting it would pin an account
+	// nobody ever asked for to this instance for the life of the process.
+	carried atomic.Int64
 
 	// queueMu guards the door to commands rather than the channel itself: the executor
 	// has to be able to say "nothing more comes in" and then empty what is left,
@@ -142,6 +172,11 @@ type Config struct {
 	// one it sends is the connect that brings an account back, so this is "the attempt
 	// to resume this session did not work", which is what the backoff counts.
 	ResumeFailed func()
+	// AfterCommand is called once this session has finished with a command and is no
+	// longer running it, saying whether it was a teardown and what it answered. It is
+	// what lets the manager undo an adoption that existed only to serve a teardown, and
+	// what tells it when the account has become one somebody else is using.
+	AfterCommand func(refusal protocol.ErrorCode, teardown, happened bool)
 	// QueueDepth bounds how many commands wait for this session. Beyond it a client
 	// is told the session is busy rather than being queued behind a backlog whose
 	// deadlines have all passed by the time it is reached.
@@ -173,25 +208,26 @@ func New(ctx context.Context, cfg *Config) *Session {
 	}
 	runCtx, cancel := context.WithCancel(ctx)
 	s := &Session{
-		sid:       cfg.Lease.SID,
-		instance:  cfg.Instance,
-		lease:     cfg.Lease,
-		leases:    cfg.Leases,
-		engine:    cfg.Engine,
-		publisher: cfg.Publisher,
-		ledger:    cfg.Ledger,
-		watch:     cfg.Watch,
-		replier:   cfg.Replier,
-		newID:     cfg.NewID,
-		undrained: cfg.Undrained,
-		connected: cfg.Connected,
-		resumeBad: cfg.ResumeFailed,
-		retryIn:   cfg.RetireRetry,
-		now:       cfg.Now,
-		log:       cfg.Logger.With().Str("sid", cfg.Lease.SID).Uint64("epoch", cfg.Lease.Epoch).Logger(),
-		commands:  make(chan queued, cfg.QueueDepth),
-		stop:      cancel,
-		done:      make(chan struct{}),
+		sid:          cfg.Lease.SID,
+		instance:     cfg.Instance,
+		lease:        cfg.Lease,
+		leases:       cfg.Leases,
+		engine:       cfg.Engine,
+		publisher:    cfg.Publisher,
+		ledger:       cfg.Ledger,
+		watch:        cfg.Watch,
+		replier:      cfg.Replier,
+		newID:        cfg.NewID,
+		undrained:    cfg.Undrained,
+		connected:    cfg.Connected,
+		resumeBad:    cfg.ResumeFailed,
+		afterCommand: cfg.AfterCommand,
+		retryIn:      cfg.RetireRetry,
+		now:          cfg.Now,
+		log:          cfg.Logger.With().Str("sid", cfg.Lease.SID).Uint64("epoch", cfg.Lease.Epoch).Logger(),
+		commands:     make(chan queued, cfg.QueueDepth),
+		stop:         cancel,
+		done:         make(chan struct{}),
 	}
 
 	var wg sync.WaitGroup
@@ -257,6 +293,7 @@ func (s *Session) Offer(delivery *transport.Delivery) Offer {
 	// manager stamps for the commands it answers itself, so the two halves of the same
 	// histogram measure the same span.
 	case s.commands <- queued{delivery: delivery, at: s.now()}:
+		s.accepted++
 		return OfferAccepted
 	default:
 		return OfferBusy
@@ -277,6 +314,7 @@ func (s *Session) abandonQueue() {
 	for {
 		select {
 		case waiting := <-s.commands:
+			s.finishedWith()
 			if waiting.delivery.Release != nil {
 				waiting.delivery.Release()
 			}
@@ -518,14 +556,24 @@ func (s *Session) admit() bool {
 	s.queueMu.Lock()
 	defer s.queueMu.Unlock()
 	if s.stopping {
+		s.accepted--
 		return false
 	}
 	if s.shutFor != 0 {
 		s.refused = true
+		s.accepted--
 		return false
 	}
 	s.running++
 	return true
+}
+
+// finishedWith counts out a delivery this session took and will not be answering: the
+// executor released it at the door, or the queue was abandoned with it still waiting.
+func (s *Session) finishedWith() {
+	s.queueMu.Lock()
+	s.accepted--
+	s.queueMu.Unlock()
 }
 
 // doneWith is the other end of `admit`: the command has been answered, and the session is
@@ -533,6 +581,7 @@ func (s *Session) admit() bool {
 func (s *Session) doneWith() {
 	s.queueMu.Lock()
 	s.running--
+	s.accepted--
 	s.queueMu.Unlock()
 }
 
@@ -548,6 +597,51 @@ func (s *Session) leaving() bool {
 	s.queueMu.Lock()
 	defer s.queueMu.Unlock()
 	return s.shutFor != 0
+}
+
+// claimIdle takes a session nothing is using, for the hand-back that is about to stop it.
+//
+// The sibling of `claim` below, for an account adopted to serve a teardown that was
+// refused before it ran: nothing about the engine ended, so that session was never
+// retired and `claim` would always say no. What has to be true is the same in spirit --
+// the door is not already shut, and nothing this session took is unfinished -- with one
+// clause `claim` has no use for: the count the caller decided on has to still be the
+// count. A command that was answered between the caller's look and this one leaves no
+// trace in what is outstanding at all -- it is finished -- so the count is the only place
+// it shows.
+//
+// Outstanding and not "running, or on the queue", and the difference is a state those two
+// cannot see between them. The executor takes a delivery out of the channel and calls
+// `admit` after, so a preemption in between leaves a command that has left the queue and
+// not yet been counted as running: an empty channel, nothing running, a count that has not
+// moved, and a client waiting on a session about to be stopped underneath it. Counted from
+// the instant `Offer` puts the delivery in the channel, under the same lock, there is no
+// in-between to be preempted in.
+//
+// Dropping the clause would not lose the command: it is released and comes back pending.
+// What it buys is a client's command not taking a claim delay on the way to an account
+// this instance was about to keep for it, and a teardown still on the queue not being
+// handed back to the fleet that just adopted the account for it. Since #259 it buys more
+// than that -- an account handed back is one a connect cannot reach until a wake -- which
+// is why the state above is worth closing rather than arguing away.
+func (s *Session) claimIdle(carried int64) bool {
+	s.queueMu.Lock()
+	defer s.queueMu.Unlock()
+
+	if s.stopping || s.shutFor != 0 || s.accepted > 0 {
+		return false
+	}
+	// Asked here and not only by the caller, and this is the clause that makes the other
+	// three safe rather than nearly safe. The count is read by the heartbeat a step
+	// earlier, and a command can be answered in between: it leaves nothing running and
+	// nothing queued, so every other clause says yes about a session that has just told a
+	// client its connect worked. Under the same lock as the door, the count cannot move
+	// between the question and the answer.
+	if s.carried.Load() != carried {
+		return false
+	}
+	s.stopping = true
+	return true
 }
 
 // claim takes a retired session for the hand-back that is about to stop it, and says
@@ -813,20 +907,26 @@ func (s *Session) execute(ctx context.Context) {
 				release(delivery)
 				continue
 			}
-			s.run(ctx, waiting)
+			refusal, teardown, happened := s.run(ctx, waiting)
 			s.doneWith()
+			if s.afterCommand != nil {
+				// After `doneWith`, so an account adopted for a teardown that will not run
+				// is free to be taken back by the very next tick rather than being refused
+				// on the grounds that the refusal itself is still in flight.
+				s.afterCommand(refusal, teardown, happened)
+			}
 		}
 	}
 }
 
-func (s *Session) run(ctx context.Context, waiting queued) {
+func (s *Session) run(ctx context.Context, waiting queued) (refusal protocol.ErrorCode, teardown, happened bool) {
 	delivery := waiting.delivery
 	command := delivery.Command
 	log := s.log.With().Str("cmd_id", command.ID).Str("type", string(command.Type)).Logger()
 
 	began := waiting.at
 	handedBack := false
-	result, err := s.carryOut(ctx, &command)
+	result, recalled, err := s.carryOut(ctx, &command)
 	// Reported for the two endings that answer the caller, and not for the two below
 	// that hand the command back: a command given back has not been carried out, and
 	// timing it would put this instance's abandoned turn into the latency of a command
@@ -843,7 +943,7 @@ func (s *Session) run(ctx context.Context, waiting queued) {
 		log.Warn().Err(err).Msg("gave a command back rather than risk carrying it out twice")
 		forfeit(delivery)
 		handedBack = true
-		return
+		return "", false, false
 	}
 	if err != nil && ctx.Err() != nil {
 		// The session went away underneath this command: the lease moved, or the process
@@ -858,7 +958,7 @@ func (s *Session) run(ctx context.Context, waiting queued) {
 		log.Warn().Err(err).Msg("gave a command back after the session ended under it")
 		forfeit(delivery)
 		handedBack = true
-		return
+		return "", false, false
 	}
 	// The answer and the acknowledgement both go out detached from the session's
 	// context, because this session is exactly what may have just ended. The work is
@@ -880,32 +980,86 @@ func (s *Session) run(ctx context.Context, waiting queued) {
 		// cannot bring back must not be tried again at the same rate forever.
 		s.resumeBad()
 	}
+	// Counted on the answering paths and not on the two that hand the command back, for
+	// the same reason the timing is: a command given back was not carried out here, and
+	// the count exists to say whether anything but the teardown ran on this session.
+	// Counted only when the command was carried out. `carryOut` turns two away before any
+	// work happens -- a deadline that had passed, a lease that is not fresh -- and neither
+	// is somebody using this account: counting them would have a late `session.connect`,
+	// refused without running, look exactly like a client who wanted the session up, and
+	// pin an account nobody ever asked for to this instance forever. That is #249 by
+	// another door, and the count is the door.
+	if ran(err) {
+		s.carried.Add(1)
+	}
 	retire, cancel := context.WithTimeout(context.WithoutCancel(ctx), ackTimeout)
 	defer cancel()
 	s.answer(retire, &command, delivery.Internal, result, err)
 	if ackErr := delivery.Ack(retire); ackErr != nil {
 		log.Error().Err(ackErr).Msg("failed to acknowledge a command")
 	}
+	// Reported rather than acted on here, and the caller fires it once this command is no
+	// longer running. Called from inside, the manager would be told the teardown is over
+	// while the executor still counts it as in flight, and the first tick after the client
+	// saw its answer would refuse to take the account back on those grounds -- a hand-back
+	// that needs a second tick for no reason anybody can see from outside.
+	if err != nil {
+		// `ran` and not a flat no: a teardown the engine refused reached the account and
+		// is an attempt, which is a different thing from one turned away before it began.
+		return asProtocolError(err).Code, command.Type == protocol.CommandSessionDelete, ran(err)
+	}
+	// A recall answered from the record rather than from the account: the command is
+	// finished with, and nothing happened here.
+	return "", command.Type == protocol.CommandSessionDelete, !recalled
 }
 
-func (s *Session) carryOut(ctx context.Context, command *protocol.Command) (json.RawMessage, error) {
+// ran reports whether a command got as far as doing anything.
+//
+// The two refusals `carryOut` makes before the work begins are the whole of the list, and
+// they are the two that say nothing about the account: a deadline that had already passed
+// when the command was reached, and a lease this holder has not renewed recently enough to
+// answer for. Everything else -- an engine that refused, a ledger that would not answer, a
+// command that worked -- happened to this account.
+func ran(err error) bool {
+	if err == nil {
+		return true
+	}
+	switch asProtocolError(err).Code {
+	case protocol.ErrorExpired, protocol.ErrorOwnedElsewhere:
+		return false
+	default:
+		return true
+	}
+}
+
+// carriedSoFar is how many commands this session has answered.
+//
+// Its one reader is the manager deciding whether an account adopted to serve a teardown
+// is still an account nothing else wants: the count standing where it was when the
+// teardown was queued means the refusal is all that happened.
+func (s *Session) carriedSoFar() int64 { return s.carried.Load() }
+
+func (s *Session) carryOut(ctx context.Context, command *protocol.Command) (result json.RawMessage, recalled bool, err error) {
 	if _, owned := s.leases.Owned(s.sid); !owned {
-		return nil, protocol.NewError(protocol.ErrorOwnedElsewhere, "the session moved to another instance")
+		return nil, false, protocol.NewError(protocol.ErrorOwnedElsewhere, "the session moved to another instance")
 	}
 	if expired(command, s.now()) {
 		// The caller stopped waiting before this was reached. Running it anyway is a
 		// side effect nobody is expecting the outcome of.
-		return nil, protocol.NewError(protocol.ErrorExpired, "the command deadline passed before it was reached")
+		return nil, false, protocol.NewError(protocol.ErrorExpired, "the command deadline passed before it was reached")
 	}
 
 	key := idempotencyKey(command)
 	result, done, err := s.alreadyDid(ctx, key)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if done {
-		// Only successes are remembered, so a recalled command is one that worked.
-		return result, nil
+		// Only successes are remembered, so a recalled command is one that worked -- once,
+		// and not now. Said out loud to the caller, because the two are different facts
+		// about the account: the record knows something ran a day ago, not that the world
+		// stayed that way.
+		return result, true, nil
 	}
 
 	execCtx, releaseBound := bound(ctx, command)
@@ -943,7 +1097,7 @@ func (s *Session) carryOut(ctx context.Context, command *protocol.Command) (json
 		// caller naming the message, and the client discarding the repeat.
 		s.remember(ctx, command, key, result)
 	}
-	return result, err
+	return result, false, err
 }
 
 // bound gives the work the ceiling its caller asked for, out of the two the contract has.
