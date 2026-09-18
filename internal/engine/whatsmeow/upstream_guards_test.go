@@ -59,6 +59,69 @@ var onDisconnectGuards = []struct {
 	},
 }
 
+// The ordering that makes the first guard do its job, which is a separate property from the
+// guard existing and is the one nothing else here can see.
+//
+// `cli.socket == ns` being false is not luck: `Disconnect` takes `cli.socketLock`, and
+// `unlockedDisconnect` clears `cli.socket` before that lock is released, while the spurious
+// callback is parked on the very same `Lock()`. By the time it gets in, there is no socket to
+// match. Move that clear out of the critical section, or after the unlock, and production
+// starts taking the branch that dispatches -- with the guard still written exactly where it is,
+// so the fence above stays green, and with the behavioural test green too, because it builds a
+// socket that could never have matched in the first place.
+//
+// Fragments in the order they must appear, because presence alone says nothing here: a `Lock()`
+// somewhere and a clear somewhere is the same set of strings whether or not one encloses the
+// other.
+var criticalSectionOrder = []struct {
+	enclosing string
+	inOrder   []string
+	what      string
+}{
+	{
+		enclosing: "func (cli *Client) Disconnect()",
+		inOrder: []string{
+			"cli.socketLock.Lock()",
+			"cli.unlockedDisconnect()",
+			"cli.socketLock.Unlock()",
+		},
+		what: "the clear of cli.socket no longer happens while the lock the spurious callback " +
+			"waits on is held, so that callback can arrive early enough to match the socket",
+	},
+	{
+		enclosing: "func (cli *Client) unlockedDisconnect()",
+		inOrder:   []string{"cli.socket = nil"},
+		what:      "the socket is no longer cleared at all on the deliberate-disconnect path",
+	},
+}
+
+func TestTheOrderingThatMakesTheFirstGuardHoldIsStillThere(t *testing.T) {
+	t.Parallel()
+
+	root := whatsmeowRoot(t)
+	source, err := os.ReadFile(filepath.Join(root, "client.go"))
+	if err != nil {
+		t.Fatalf("read client.go of the pinned whatsmeow: %v", err)
+	}
+
+	for _, section := range criticalSectionOrder {
+		body := funcBody(t, string(source), section.enclosing)
+		at := 0
+		for _, fragment := range section.inOrder {
+			found := strings.Index(body[at:], fragment)
+			if found < 0 {
+				t.Errorf("%s no longer holds %q after the fragments before it.\n"+
+					"This is not good news: %s. Re-read "+
+					"fazer-ai/whatsapp-connector#207 -- neither the guard fence nor the "+
+					"behavioural test next to it can see this change.",
+					section.enclosing, fragment, section.what)
+				break
+			}
+			at += found + len(fragment)
+		}
+	}
+}
+
 func TestTheGuardsThatKeepASpuriousDisconnectHarmlessAreStillThere(t *testing.T) {
 	t.Parallel()
 

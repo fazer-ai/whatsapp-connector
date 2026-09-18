@@ -2,6 +2,7 @@ package whatsmeow_test
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"testing/synctest"
 
@@ -9,7 +10,6 @@ import (
 	waSocket "go.mau.fi/whatsmeow/socket"
 	waStore "go.mau.fi/whatsmeow/store"
 	waTypes "go.mau.fi/whatsmeow/types"
-	waEvents "go.mau.fi/whatsmeow/types/events"
 )
 
 // The half of #207 that can be exercised rather than read.
@@ -41,11 +41,23 @@ import (
 // cancelled on the way out so the frame consumer and any parked goroutine finish before the
 // bubble closes.
 //
-// What this does NOT cover: `!cli.isExpectedDisconnect()`, the second guard, whose own false
-// branch needs a drop that SHOULD dispatch. A test device is refused by the server on a path
-// that arms `expectDisconnect` itself, so producing one means driving the transport. That half
-// stays a reading, and #207 says so.
-func TestASpuriousDisconnectCallbackDispatchesNothing(t *testing.T) {
+// Two things this does NOT cover, and the second is the subtler one.
+//
+// It does not cover `!cli.isExpectedDisconnect()`, the second guard, whose own false branch
+// needs a drop that SHOULD dispatch. A test device is refused by the server on a path that
+// arms `expectDisconnect` itself, so producing one means driving the transport. The fence
+// next door covers that guard's existence; its behaviour stays a reading, and #207 says so.
+//
+// And it is sensitive to the PRESENCE of the first guard, not to the reason that guard holds
+// in production. Here the branch is structural: no NoiseSocket built from outside can ever be
+// `cli.socket`, because the only assignment is in handshake.go from a value nothing exported
+// hands back. In production the same branch is taken for a different reason -- `Disconnect`
+// clears `cli.socket` inside the `cli.socketLock` critical section, and the spurious callback
+// is parked on that same Lock until after it. Move that `nil` out of the critical section and
+// production starts taking the other branch while this test stays green. That ordering is
+// fenced in upstream_guards_test.go rather than here, because this test cannot build the
+// state that would distinguish it.
+func TestASpuriousDisconnectOnASocketTheClientNoLongerHoldsDispatchesNothing(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())
 		defer cancel()
@@ -55,11 +67,11 @@ func TestASpuriousDisconnectCallbackDispatchesNothing(t *testing.T) {
 		device.SetAllStores(&waStore.NoopStore{})
 
 		client := wm.NewClient(device, nil)
-		var dispatched int
+		// Every event, not just Disconnected: the claim is that this callback produces
+		// nothing, and a counter for one type would let the name outrun the assertion.
+		var dispatched []string
 		client.AddEventHandler(func(event any) {
-			if _, ok := event.(*waEvents.Disconnected); ok {
-				dispatched++
-			}
+			dispatched = append(dispatched, fmt.Sprintf("%T", event))
 		})
 		// High enough that autoReconnect's backoff is minutes of fake time: it parks on a
 		// timer, which the bubble sees as durably blocked, instead of reaching a real dial.
@@ -86,13 +98,13 @@ func TestASpuriousDisconnectCallbackDispatchesNothing(t *testing.T) {
 		client.DangerousInternals().OnDisconnect(ctx, orphan, true)
 		synctest.Wait()
 
-		if dispatched != 0 {
+		if len(dispatched) != 0 {
 			t.Errorf("a callback about a socket this client never adopted dispatched %d "+
-				"Disconnected event(s), want 0.\n"+
+				"event(s), %v, want none.\n"+
 				"That is the spurious callback of #207 stopping being inert: the connector "+
 				"publishes session.state reconnecting and whatsmeow redials an account whose "+
 				"lease may already be gone, which is operational invariant 1 going false.",
-				dispatched)
+				len(dispatched), dispatched)
 		}
 	})
 }
