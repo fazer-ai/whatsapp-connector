@@ -18,12 +18,17 @@ JSON-encoded).
 reaches its owner late is dropped unrun, answered `expired`. `max_runtime_ms` is a
 duration, measured from the moment the work begins, and says *do not let this run longer
 than that*; it says nothing about arriving late. A command carrying both gets whichever
-runs out first, and one carrying neither has no ceiling at all.
+runs out first, and one carrying neither is bounded by the connector rather than by the
+caller.
 
 The distinction exists because a teardown needs one without the other: a `session.logout`
 dropped for arriving late is a device left linked on somebody's phone with nothing saying
 so, while the same command parked on a socket write holds every other command for that
 account behind it. With one field a client had to choose, and chose neither.
+
+**A command with neither field still gets an answer, and the bound under it is not this connector's.** Every request this connector puts on the wire carries the WhatsApp library's own ceiling, seventy five seconds, and that covers a message send and an information query alike; several paths are held to something tighter that this connector chooses, and none is left to run forever. So a client that names no ceiling is not asking for an unbounded command, it is accepting the connector's. What comes back when that bound runs out is `timeout`, which is the same word a caller's own `max_runtime_ms` produces and means the same thing: nobody here knows the outcome and nothing afterwards will. **A client may resend such a command**, and for anything that changes something it resends under the identifier the first attempt used, the `message_id` for a send and the `idempotency_key` otherwise, because the connector records only what succeeded, so a command answered `timeout` has left no record and a resend under a fresh identifier runs the side effect a second time.
+
+One thing that bound does not cover, named here because a client would otherwise read more into `timeout` than it says: a node already being written to the socket is not interruptible by any ceiling, this connector's or the caller's. A command waiting behind one of those can outlast every number above, and its `timeout` means the wait was given up on rather than that WhatsApp answered. The resend obligation above is what covers it, and it is the same one.
 
 **Neither ceiling reaches `session.wake`, and a client should not expect `expired` for one.**
 It is carried out before any session is involved, and nothing on that path reads `deadline`.
