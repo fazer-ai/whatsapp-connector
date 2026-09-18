@@ -3349,6 +3349,48 @@ type resumedDoor struct {
 	// have published nothing yet and never will, so a build with the filter deleted looks
 	// exactly like a build with it intact.
 	quiet func(*Session) (held int, where string)
+	// carries holds the payload to what the event is ABOUT, and not only to its type and
+	// the contract's shape. Without it a build that published the right kind of event for
+	// the wrong group, the wrong message or the wrong presence state keeps every row
+	// green: a schema catches a field that went missing, never a field that is wrong.
+	carries func(*testing.T, map[string]any)
+}
+
+// inTheGroup fails unless the payload puts the event in the group the stimulus named, at
+// `path` (a chain of object keys).
+func inTheGroup(t *testing.T, payload map[string]any, path ...string) {
+	t.Helper()
+
+	at := any(payload)
+	for _, key := range path {
+		object, ok := at.(map[string]any)
+		if !ok {
+			t.Fatalf("looked for %v in the payload and %q is not an object: %v", path, key, at)
+		}
+		at = object[key]
+	}
+	address, ok := at.(map[string]any)
+	if !ok {
+		t.Fatalf("the payload carries no address at %v: %v", path, at)
+	}
+	if address["id"] != theGroup || address["kind"] != "group" {
+		t.Errorf("the event is about %v, and the stimulus was about group %s", address, theGroup)
+	}
+}
+
+// field walks the same way and answers one leaf.
+func field(t *testing.T, payload map[string]any, path ...string) any {
+	t.Helper()
+
+	at := any(payload)
+	for _, key := range path {
+		object, ok := at.(map[string]any)
+		if !ok {
+			t.Fatalf("looked for %v in the payload and %q is not an object: %v", path, key, at)
+		}
+		at = object[key]
+	}
+	return at
 }
 
 // inboxIsEmpty is the instrument for the routes that publish straight away. The forwarder
@@ -3377,7 +3419,13 @@ func awaitedIsEmpty(s *Session) (held int, where string) {
 func resumedDoors() []resumedDoor {
 	return []resumedDoor{
 		{
-			door:       "receive",
+			door: "receive",
+			carries: func(t *testing.T, payload map[string]any) {
+				inTheGroup(t, payload, "message", "chat")
+				if got := field(t, payload, "message", "id"); got != "3EB0GROUPRESUME" {
+					t.Errorf("published %v as the message that arrived", got)
+				}
+			},
 			quiet:      inboxIsEmpty,
 			definition: "event_message_received",
 			want:       protocol.EventMessageReceived,
@@ -3394,7 +3442,15 @@ func resumedDoors() []resumedDoor {
 			// The filter a group message that cannot be decrypted goes through, which is a
 			// different function from the one above and the reason the issue counted it
 			// separately: nothing about `receive` being covered says this one is.
-			door:       "unreadable",
+			door: "unreadable",
+			carries: func(t *testing.T, payload map[string]any) {
+				inTheGroup(t, payload, "message", "chat")
+				// The word the issue names: a message nothing could read is a bubble
+				// saying so, not a message with a body.
+				if got := field(t, payload, "message", "content", "type"); got != "unsupported" {
+					t.Errorf("a message nobody could read was published as %v", got)
+				}
+			},
 			quiet:      awaitedIsEmpty,
 			definition: "event_message_received",
 			want:       protocol.EventMessageReceived,
@@ -3416,7 +3472,14 @@ func resumedDoors() []resumedDoor {
 			},
 		},
 		{
-			door:       "receipt",
+			door: "receipt",
+			carries: func(t *testing.T, payload map[string]any) {
+				inTheGroup(t, payload, "chat")
+				ids, _ := payload["message_ids"].([]any)
+				if len(ids) != 1 || ids[0] != "3EB0GROUPRESUME" {
+					t.Errorf("the receipt turned the tick on %v", payload["message_ids"])
+				}
+			},
 			quiet:      inboxIsEmpty,
 			definition: "event_message_receipt",
 			want:       protocol.EventMessageReceipt,
@@ -3434,7 +3497,13 @@ func resumedDoors() []resumedDoor {
 			},
 		},
 		{
-			door:       "chatPresence",
+			door: "chatPresence",
+			carries: func(t *testing.T, payload map[string]any) {
+				inTheGroup(t, payload, "chat")
+				if got := payload["state"]; got != "composing" {
+					t.Errorf("somebody typing in the group was published as %v", got)
+				}
+			},
 			quiet:      boardIsEmpty,
 			definition: "event_chat_presence",
 			want:       protocol.EventChatPresence,
@@ -3454,7 +3523,13 @@ func resumedDoors() []resumedDoor {
 			// The weakest of the three the issue named: `joinedAGroup` is a function of
 			// its own, and nothing -- live or in unit -- had ever crossed this line with a
 			// subscription that came back from a resume.
-			door:       "joinedAGroup",
+			door: "joinedAGroup",
+			carries: func(t *testing.T, payload map[string]any) {
+				inTheGroup(t, payload, "info", "group")
+				if got := field(t, payload, "info", "subject"); got != "Equipe fazer.ai" {
+					t.Errorf("published %v as the subject of the group the account joined", got)
+				}
+			},
 			quiet:      inboxIsEmpty,
 			definition: "event_group_joined",
 			want:       protocol.EventGroupJoined,
@@ -3478,7 +3553,17 @@ func resumedDoors() []resumedDoor {
 			// carrying only what the contract has no field for leaves `changes` empty and
 			// comes out as `group.activity`. The rename exits `groupChanged` by the other
 			// arm, so covering it says nothing about this one.
-			door:       "groupChanged",
+			door: "groupChanged",
+			carries: func(t *testing.T, payload map[string]any) {
+				groups, _ := payload["groups"].([]any)
+				if len(groups) != 1 {
+					t.Fatalf("named %v as the groups that moved", payload["groups"])
+				}
+				named, _ := groups[0].(map[string]any)
+				if named["id"] != theGroup {
+					t.Errorf("named %v as the group that moved", groups[0])
+				}
+			},
 			quiet:      inboxIsEmpty,
 			definition: "event_group_activity",
 			want:       protocol.EventGroupActivity,
@@ -3493,7 +3578,17 @@ func resumedDoors() []resumedDoor {
 			// Added by #220, four days after the issue was written, and so absent from its
 			// table of six. It is the same filter on the same field, reached from a door
 			// nobody had counted.
-			door:       "callOffered",
+			door: "callOffered",
+			carries: func(t *testing.T, payload map[string]any) {
+				if got := payload["call_id"]; got != "call-resumed-1" {
+					t.Errorf("published %v as the call that is ringing", got)
+				}
+				// The creator and not the group: `call.offer` carries no group, and whoever
+				// rang is what an inbox shows.
+				if got := field(t, payload, "from", "phone"); got != theCaller {
+					t.Errorf("published %v as whoever rang", got)
+				}
+			},
 			quiet:      inboxIsEmpty,
 			definition: "event_call_offer",
 			want:       protocol.EventCallOffer,
@@ -3512,7 +3607,12 @@ func resumedDoors() []resumedDoor {
 			},
 		},
 		{
-			door:       "callEnded",
+			door: "callEnded",
+			carries: func(t *testing.T, payload map[string]any) {
+				if got := payload["call_id"]; got != "call-resumed-1" {
+					t.Errorf("published %v as the call that ended", got)
+				}
+			},
 			quiet:      inboxIsEmpty,
 			definition: "event_call_terminate",
 			want:       protocol.EventCallTerminate,
@@ -3551,7 +3651,7 @@ func TestEveryGroupDoorOpensForASubscriptionThatCameBackFromAResume(t *testing.T
 			// waited out, the way every other test of that path does it.
 			session.rerequestWait = 10 * time.Millisecond
 			door.give(session)
-			published(t, session, door.want, door.definition)
+			door.carries(t, published(t, session, door.want, door.definition))
 		})
 	}
 }
@@ -3700,6 +3800,9 @@ func TestEveryGroupFilterHasARowInTheResumeTable(t *testing.T) {
 	for _, door := range resumedDoors() {
 		if covered[door.door] {
 			t.Errorf("%s has two rows in the table", door.door)
+		}
+		if door.give == nil || door.quiet == nil || door.carries == nil {
+			t.Errorf("the row for %s is missing a stimulus, a quiet instrument or a payload check", door.door)
 		}
 		covered[door.door] = true
 	}
