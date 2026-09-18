@@ -35,7 +35,7 @@ func TestTheContractSaysWhatBoundsACommandWithNoCeilingOfItsOwn(t *testing.T) {
 			"which #165 measured to be false: the library bounds every request it sends")
 	}
 
-	paragraphs := relevantParagraphs(prose, "neither field")
+	paragraphs := theCeilingRun(t, prose)
 	if len(paragraphs) == 0 {
 		t.Fatal("no paragraph in PROTOCOL.md talks about a command with neither field, so " +
 			"the obligation this test is about is not stated anywhere a client reads")
@@ -81,6 +81,15 @@ func TestTheContractSaysWhatBoundsACommandWithNoCeilingOfItsOwn(t *testing.T) {
 				"measured, a deadline does not free a command blocked on the write lock"},
 		{"what a client can actually do about that one", "its own timeout on the reply",
 			"it is the only remedy left once no field on the command reaches the wait"},
+		{"that the list of unbounded paths is not claimed complete",
+			"does not claim the list is complete",
+			"round 4 found a third one in this connector's own bookkeeping, so an " +
+				"exhaustive-sounding paragraph is a promise that keeps turning out false"},
+		{"the group.create carve-out", "writes down what it is about to do before it asks",
+			"round 4 measured that `left no record at all` is false for this one command, " +
+				"and it is the command `not_settled` was added for"},
+		{"keeping the key for that recovery", "Retrying with a fresh key instead makes a second group",
+			"the actionable half of the carve-out"},
 		{"that both are unbounded, not merely slow", "not bounded",
 			"`covered` and `slower` are what this would degrade into"},
 	} {
@@ -91,19 +100,36 @@ func TestTheContractSaysWhatBoundsACommandWithNoCeilingOfItsOwn(t *testing.T) {
 	}
 }
 
-// relevantParagraphs returns the paragraphs holding the phrase, plus the one after each,
-// because the obligation here runs past its own first paragraph and a client reads both.
-func relevantParagraphs(prose, phrase string) []string {
+// theCeilingRun returns the run of paragraphs the obligation is written across, anchored at
+// both ends. Anchoring only at the start, and taking a fixed number of paragraphs after it,
+// is what this did first: the run grew from two paragraphs to four as the review found
+// exceptions, and the clauses that landed in the new ones went green because nothing was
+// reading them. Both anchors are required, so a paragraph moved out of the run fails here
+// rather than stopping being checked.
+func theCeilingRun(t *testing.T, prose string) []string {
+	t.Helper()
+
 	all := strings.Split(prose, "\n\n")
-	var found []string
+	first, last := -1, -1
 	for i, paragraph := range all {
-		if !strings.Contains(paragraph, phrase) {
-			continue
+		if first < 0 && strings.Contains(paragraph, "neither field") {
+			first = i
 		}
-		found = append(found, paragraph)
-		if i+1 < len(all) {
-			found = append(found, all[i+1])
+		if strings.Contains(paragraph, "its own timeout on the reply") {
+			last = i
 		}
 	}
-	return found
+	if first < 0 {
+		t.Fatal("no paragraph in PROTOCOL.md talks about a command with neither field, so " +
+			"the obligation this test is about is not stated anywhere a client reads")
+	}
+	if last < 0 {
+		t.Fatal("the paragraph that ends the run, the one telling a client to time out the " +
+			"reply itself, is gone: the run has no end anchor and the clauses after the " +
+			"first paragraph would stop being read")
+	}
+	if last < first {
+		t.Fatalf("the run's anchors are out of order: start at paragraph %d, end at %d", first, last)
+	}
+	return all[first : last+1]
 }

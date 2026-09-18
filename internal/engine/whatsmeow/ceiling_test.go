@@ -5,6 +5,7 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -286,11 +287,12 @@ func releasedChannels(file *ast.File) map[token.Pos]bool {
 		if !ok {
 			return true
 		}
-		// The position of the first deposit, not just the fact of one: a receive before the
-		// send is not taking a token back, it is waiting for one. Round 3 of the review
-		// found `<-ch` followed by `ch <- struct{}{}` passing, which is an unbounded wait
-		// wearing the shape of a release.
-		deposited := map[string]token.Pos{}
+		// Deposits are counted and positioned, not just noted. Position, because a receive
+		// before the send is not taking a token back but waiting for one, which round 3 of
+		// the review found passing. Counted, because round 4 found the other half: one send
+		// was justifying every later receive, so `ch <- struct{}{}; <-ch; <-ch` exempted a
+		// second receive that must block forever. A receive spends a deposit.
+		deposits := map[string][]token.Pos{}
 		ast.Inspect(body, func(inner ast.Node) bool {
 			if _, handedAway := inner.(*ast.GoStmt); handedAway {
 				return false
@@ -305,25 +307,32 @@ func releasedChannels(file *ast.File) map[token.Pos]bool {
 			}
 			if send, ok := inner.(*ast.SendStmt); ok {
 				if name := channelName(send.Chan); name != "" {
-					if at, seen := deposited[name]; !seen || send.Pos() < at {
-						deposited[name] = send.Pos()
-					}
+					deposits[name] = append(deposits[name], send.Pos())
 				}
 			}
 			return true
 		})
-		if len(deposited) == 0 {
+		if len(deposits) == 0 {
 			return true
 		}
+		for name := range deposits {
+			sort.Slice(deposits[name], func(i, j int) bool { return deposits[name][i] < deposits[name][j] })
+		}
+		spent := map[string]int{}
 		ast.Inspect(body, func(inner ast.Node) bool {
 			unary, ok := inner.(*ast.UnaryExpr)
 			if !ok || unary.Op != token.ARROW {
 				return true
 			}
-			// Ordering by position, which is what this can see. A receive inside a loop
-			// that sends later in the text is still flagged, and that is the conservative
-			// direction: the fence reports a wait it cannot prove is a release.
-			if at, seen := deposited[channelName(unary.X)]; seen && unary.Pos() > at {
+			// Ordering by position, which is what this can see, and one deposit spent per
+			// receive. A receive inside a loop that sends later in the text is still
+			// flagged, and so is the second receive against a single send; both are the
+			// conservative direction, where the fence reports a wait it cannot prove is a
+			// release.
+			name := channelName(unary.X)
+			at := deposits[name]
+			if i := spent[name]; i < len(at) && unary.Pos() > at[i] {
+				spent[name] = i + 1
 				released[unary.Pos()] = true
 			}
 			return true
