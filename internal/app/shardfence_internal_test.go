@@ -36,8 +36,9 @@ import (
 // Two spellings build a key layout here and the fence covers both. `redisx.NewKeys` is
 // the one the external tests use; `redisx.Wrap` is the one the internal tests use, and
 // twelve of them carried a literal 8 while the connector they exercise runs on sixteen.
-// None of the twelve could fail the way #269 failed, because the same wrapped client both
-// publishes and reads in those tests, so there is no second party to disagree with. They
+// None of the twelve could fail the way #269 failed, because none of them has a second
+// party to disagree with: in most the same wrapped client both publishes and reads, and in
+// the rest the layout only ever names lease keys, which do not depend on the count. They
 // are still a literal count sitting in a test file, which is the one shape that made the
 // defect invisible, so they name `DefaultEventShards` and the fence holds them to it.
 func TestNoTestInThisPackageCarriesItsOwnShardCount(t *testing.T) {
@@ -98,9 +99,9 @@ func TestNoTestInThisPackageCarriesItsOwnShardCount(t *testing.T) {
 			// 4, and it reports `DefaultEventShards` as the constant 16, which is the
 			// name this fence exists to make people write. That is the same constant it
 			// reports for a bare `16`, measured side by side: after folding, naming the
-			// one home and carrying the number are the same expression, and telling them
-			// apart is the whole rule, so a fence built on it would report the idiom it
-			// asks for. The one thing folding still separates is a count read from the
+			// one home and carrying the number come back as the same constant, and
+			// telling them apart is the whole rule, so a fence built on it would report
+			// the idiom it asks for. The one thing folding still separates is a count read from the
 			// fleet, which folds to nothing. So the instrument that closes the hole closes the rule
 			// with it, and the hole is a shape no key layout here is built with. The
 			// rune was worth closing because the fence was already looking at exactly
