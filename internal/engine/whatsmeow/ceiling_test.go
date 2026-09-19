@@ -11,11 +11,17 @@ import (
 )
 
 // #165 asked which commands should be given a ceiling and found, when it was measured, that
-// none of them needs one: whatsmeow bounds every request it sends at `defaultRequestTimeout`,
-// seventy five seconds, and that number covers an info query, a send and a sendfb alike; every
-// wait this package builds for itself comes off a timer. So the catalogue has no unbounded
-// command, and the thing worth having is not a ceiling but the two fences below, because both
-// ways of losing that property are one word long and neither has a symptom.
+// almost none of them needs one: whatsmeow bounds every request it *sends* at
+// `defaultRequestTimeout`, seventy five seconds, covering an info query, a send and a sendfb
+// alike, and every wait this package builds for itself comes off a timer. So what was missing
+// was mostly not a limit but the two fences below, because both ways of losing one are a word
+// long and neither has a symptom.
+//
+// "Almost" is #283, found by review on that same round and fixed since: a send the connection
+// dropped under is retried, and upstream hands that retry a zero timeout, which builds no timer
+// at all. That one did need a ceiling of this connector's, and `sendCeiling` in `send.go` is it.
+// The claim these fences protect is therefore narrower than the one this comment used to make:
+// not that nothing is unbounded, but that nothing which is bounded today silently stops being.
 //
 // The reach is `internal/engine/whatsmeow` and that is deliberate rather than an oversight.
 // This is the only package that talks to WhatsApp, so it is the only one where a wait can

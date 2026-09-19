@@ -183,13 +183,23 @@ func (s *Session) putOnTheWire(
 //
 // The number is the sum of the bounded stages that can run inside this one call, not a
 // figure picked for feeling right, because the context handed to `SendMessage` covers far
-// more than the wait for the acknowledgement. Reading the pinned library, a single
-// legitimate send can spend, in order: the group metadata query, the device list and the
-// LID fetch, the prekey fetch inside the direct send, the acknowledgement wait itself,
-// the reconnect window before the retry, and then the retry's own wait. Every one of
-// those but the reconnect is an info query under the library's own seventy five seconds.
+// more than the wait for the acknowledgement. Reading the pinned library, one send pays:
 //
-//	5 * 75s (five info-query-sized waits) + 5s (the reconnect window) = 380s
+//   - the group metadata query OR the LID fetch, never both: they are the two arms of the
+//     same `else if` on the destination's server, so a group send pays the first and a
+//     direct send pays the second;
+//   - the device list query, which every send pays;
+//   - the prekey fetch, for a recipient this session has no session with;
+//   - the acknowledgement wait for the send itself;
+//   - the reconnect window, if the connection dropped under it;
+//   - the retry's own wait.
+//
+// The first four are info queries under the library's own seventy five seconds. The last
+// one is not, and that is the whole of #283: upstream gives that retry no timer, so the
+// seventy five seconds counted for it here is a budget this connector grants it, chosen to
+// be the same one the first attempt had rather than discovered somewhere.
+//
+//	5 * 75s (four library-bounded waits, plus the retry given the same) + 5s = 380s
 //
 // Adding a stage to that list means adding it here. What the sum deliberately does not
 // contain is the media upload, which is bounded separately and earlier, inside the build,
