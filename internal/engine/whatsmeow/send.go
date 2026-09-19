@@ -167,7 +167,7 @@ func (s *Session) putOnTheWire(
 	// down: `handOver` replaces `overSocket` whole, so a ceiling built in there is one no
 	// test that uses the seam can see. #283 is about a wait nothing ends, and a fence
 	// nothing can observe would be the same defect wearing a fix.
-	wire, giveUp := context.WithTimeout(ctx, sendCeiling)
+	wire, giveUp := context.WithTimeoutCause(ctx, s.wireLimit, errSendCeiling)
 	defer giveUp()
 
 	hand := s.handOver
@@ -176,9 +176,53 @@ func (s *Session) putOnTheWire(
 	}
 	sent, err := hand(wire, to, messageID, message)
 	if err != nil {
-		return wm.SendResponse{}, sendFailure(err)
+		return wm.SendResponse{}, sendFailure(whichClockRanOut(wire, err))
 	}
 	return sent, nil
+}
+
+// errSendCeiling is what `wire` is cancelled with when this connector's own ceiling is
+// the thing that ended a send. It is never returned on its own: it names a cause, and
+// what a caller gets is still the contract's `timeout`.
+var errSendCeiling = errors.New("this connector's ceiling on one send ended it")
+
+// whichClockRanOut names the clock that ended a send.
+//
+// Three clocks can end one and two of them are this connector's: the caller's own
+// `deadline` or `max_runtime_ms`, and `wireLimit`. Those two produce the same
+// `context.DeadlineExceeded` -- not an equal value, the same one -- so nothing that only
+// sees the error can tell them apart, and #291 is about an operator who had to subtract
+// two timestamps by hand to find out which. The third is the library's own answer
+// running out, which arrives as its own sentinel and needs nothing from this.
+//
+// The answer comes from `context.Cause`, and not from asking each context whether it is
+// done, because those are different questions. `Cause` is written once, by whichever
+// cancellation actually happened, and it does not change afterwards; the done-ness of a
+// context is read now and says nothing about the order. The difference is reachable: a
+// send can sit inside the library long past its ceiling, on waits nothing interrupts
+// (#290 and #74), and a caller that gives up during that window would have been read as
+// the one that ended it. Measured: with `wire` expired on its own ceiling and the parent
+// cancelled afterwards, `context.Cause(wire)` is still this connector's while the parent
+// already reports `context.Canceled`.
+//
+// A caller's shorter deadline propagates instead, because `WithTimeoutCause` on a parent
+// that is closer to its own deadline is a plain cancellation of that parent, cause and
+// all. So the default branch is the caller's, and it covers a cause the caller set as
+// well as the bare context errors.
+func whichClockRanOut(wire context.Context, err error) error {
+	if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+		return err
+	}
+	switch cause := context.Cause(wire); {
+	case cause == nil:
+		// Neither of ours: the library reached a deadline of its own inside a context
+		// that is still live. Left as it came, because it already says which.
+		return err
+	case errors.Is(cause, errSendCeiling):
+		return fmt.Errorf("%w: %w", errSendCeiling, err)
+	default:
+		return fmt.Errorf("the command's own context ended this send: %w", err)
+	}
 }
 
 // sendCeiling is how long this connector lets one send run, and it exists because
@@ -386,9 +430,9 @@ const noLIDForNumber = "no LID found for"
 func sendFailure(err error) error {
 	switch {
 	case errors.Is(err, wm.ErrNotLoggedIn):
-		return protocol.NewError(protocol.ErrorNotPaired, "the session has no WhatsApp account to send from")
+		return because(protocol.ErrorNotPaired, "the session has no WhatsApp account to send from", err)
 	case errors.Is(err, wm.ErrNotConnected):
-		return protocol.NewError(protocol.ErrorNotConnected, "the session is not connected to WhatsApp")
+		return because(protocol.ErrorNotConnected, "the session is not connected to WhatsApp", err)
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled),
 		errors.Is(err, wm.ErrMessageTimedOut), errors.Is(err, wm.ErrIQTimedOut):
 		// The message may well have gone out: what ran out is the answer, not the send,
@@ -396,7 +440,7 @@ func sendFailure(err error) error {
 		// the caller retry under the same id, which is the one retry that cannot
 		// duplicate anything. A refusal here would have it give up on a message that is
 		// already in somebody's chat.
-		return protocol.NewError(protocol.ErrorTimeout, "WhatsApp did not answer whether the message went out")
+		return because(protocol.ErrorTimeout, "WhatsApp did not answer whether the message went out", err)
 	case strings.Contains(err.Error(), noLIDForNumber):
 		// whatsmeow sends every direct message under a LID, and looks one up for a
 		// number that does not have it cached. A number nobody has registered has none
@@ -405,18 +449,40 @@ func sendFailure(err error) error {
 		// receive anything. Matched on the text because the library builds it with
 		// fmt.Errorf and there is no sentinel to compare against; a wording change on
 		// their side puts this back to where it is without one.
-		return protocol.NewError(protocol.ErrorRecipientNotOnWhatsapp,
-			"that number is not on WhatsApp")
+		return because(protocol.ErrorRecipientNotOnWhatsapp,
+			"that number is not on WhatsApp", err)
 	case errors.Is(err, wm.ErrBroadcastListUnsupported):
 		// The library's own limit, not WhatsApp's, and the codes mean different things
 		// to a caller: a refusal is worth trying again and a limit never is. Reported as
 		// the former, a client retries a broadcast list for as long as it keeps the
 		// message.
-		return protocol.NewError(protocol.ErrorUnsupported,
-			"this connector cannot send to a broadcast list yet")
+		return because(protocol.ErrorUnsupported,
+			"this connector cannot send to a broadcast list yet", err)
 	case errors.Is(err, wm.ErrUnknownServer), errors.Is(err, wm.ErrRecipientADJID):
-		return protocol.NewError(protocol.ErrorInvalidPayload, "that is not an address a message can be sent to")
+		return because(protocol.ErrorInvalidPayload, "that is not an address a message can be sent to", err)
 	default:
-		return protocol.NewError(protocol.ErrorWaError, "WhatsApp refused the message")
+		return because(protocol.ErrorWaError, "WhatsApp refused the message", err)
 	}
+}
+
+// because is the code a client branches on, carrying what actually happened for the one
+// reader who is allowed to see it.
+//
+// The wire is unchanged and deliberately so: the `*protocol.Error` is what `errors.As`
+// finds, what `asProtocolError` returns and what gets marshalled, so the frame is the
+// same bytes it has always been. What changes is `Error()`, and that is the whole point.
+// `logFailure` is by its own doc "the only place a command's real error is written down",
+// and it writes the failure through `zerolog`'s `Err`, which prints `Error()` and reads
+// nothing else -- no `Unwrap`, no field. Giving `protocol.Error` a cause it does not
+// print would have left that line byte for byte as it was, which is #291 unfixed with
+// `errors.Is` passing over it; measured rather than reasoned about, in the round that
+// wrote this.
+//
+// Two `%w`, so the chain carries both: the code for `errors.As` and the cause for
+// `errors.Is`. The reach of that second half is this function's callers and no further,
+// which is why the cause lives here rather than in `protocol.Error`, where every producer
+// in the repository would have gained one at once and all fourteen sites that ask
+// `errors.Is(err, context.DeadlineExceeded)` would have had to be re-read.
+func because(code protocol.ErrorCode, message string, cause error) error {
+	return fmt.Errorf("%w: %w", protocol.NewError(code, message), cause)
 }
