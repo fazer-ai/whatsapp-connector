@@ -89,15 +89,8 @@ func TestTheContractSaysWhatBoundsACommandWithNoCeilingOfItsOwn(t *testing.T) {
 			"a named example, because `may already have happened` reads as hypothetical"},
 		{"reading the state back", "reads the state back before resending",
 			"it is the only thing a client can actually do about it"},
-		{"the socket write it does not cover", "not interruptible",
+		{"the socket write it does not cover", "already being written to the socket",
 			"a client would otherwise read `timeout` as proof WhatsApp was asked"},
-		{"the retried send it does not cover", "retried once the connection is back",
-			"round 2 of the review measured this one: whatsmeow retries an interrupted " +
-				"send with a zero timeout, which switches its timer off, so the claim that " +
-				"nothing runs forever was false as written"},
-		{"that max_runtime_ms does not reach the socket write", "does **not** reach the first",
-			"round 3 caught the paragraph recommending the field as the remedy for both; " +
-				"measured, a deadline does not free a command blocked on the write lock"},
 		{"what a client can actually do about that one", "its own timeout on the reply",
 			"it is the only remedy left once no field on the command reaches the wait"},
 		{"that the list of unbounded paths is not claimed complete",
@@ -109,8 +102,13 @@ func TestTheContractSaysWhatBoundsACommandWithNoCeilingOfItsOwn(t *testing.T) {
 				"and it is the command `not_settled` was added for"},
 		{"keeping the key for that recovery", "Retrying with a fresh key instead makes a second group",
 			"the actionable half of the carve-out"},
-		{"that both are unbounded, not merely slow", "not bounded",
-			"`covered` and `slower` are what this would degrade into"},
+		{"that the send retry is bounded now", "still ends",
+			"#283 put a ceiling on it, so the paragraph naming it as unbounded became false"},
+		{"the two waits no ceiling reaches", "does not look at the context at all",
+			"they are what stops a ceiling being a promise of a reply inside it"},
+		{"what the ceiling buys instead", "ends the commands queued behind it",
+			"round 1 of #283's holdout asked for exactly this distinction: the held call is " +
+				"not freed, the ones behind it are"},
 	} {
 		if !strings.Contains(found, clause.phrase) {
 			t.Errorf("the paragraph about a command with neither field does not say %s (%q): %s",

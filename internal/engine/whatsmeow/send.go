@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	wm "go.mau.fi/whatsmeow"
 	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
@@ -154,16 +155,61 @@ func (s *Session) readyToSend() error {
 func (s *Session) putOnTheWire(
 	ctx context.Context, to waTypes.JID, messageID string, message *waE2E.Message,
 ) (wm.SendResponse, error) {
+	// Bounded here rather than inside `overSocket`, and the reason is the seam one line
+	// down: `handOver` replaces `overSocket` whole, so a ceiling built in there is one no
+	// test that uses the seam can see. #283 is about a wait nothing ends, and a fence
+	// nothing can observe would be the same defect wearing a fix.
+	wire, giveUp := context.WithTimeout(ctx, sendCeiling)
+	defer giveUp()
+
 	hand := s.handOver
 	if hand == nil {
 		hand = s.overSocket
 	}
-	sent, err := hand(ctx, to, messageID, message)
+	sent, err := hand(wire, to, messageID, message)
 	if err != nil {
 		return wm.SendResponse{}, sendFailure(err)
 	}
 	return sent, nil
 }
+
+// sendCeiling is how long this connector lets one send run, and it exists because
+// whatsmeow does not bound the half of it that matters. A send interrupted by the
+// connection dropping is retried once, and that retry is handed a zero timeout
+// (`send.go` and `sendfb.go` in the pinned library, both calling `retryFrame` with `0`),
+// where zero does not mean the default: the timer is built only `if timeout > 0`, so the
+// retry waits on the answer and on the context, and on nothing else. Tracked as #283,
+// and `upstream_test.go` fails when any of that changes shape.
+//
+// The number is the sum of the bounded stages that can run inside this one call, not a
+// figure picked for feeling right, because the context handed to `SendMessage` covers far
+// more than the wait for the acknowledgement. Reading the pinned library, a single
+// legitimate send can spend, in order: the group metadata query, the device list and the
+// LID fetch, the prekey fetch inside the direct send, the acknowledgement wait itself,
+// the reconnect window before the retry, and then the retry's own wait. Every one of
+// those but the reconnect is an info query under the library's own seventy five seconds.
+//
+//	5 * 75s (five info-query-sized waits) + 5s (the reconnect window) = 380s
+//
+// Adding a stage to that list means adding it here. What the sum deliberately does not
+// contain is the media upload, which is bounded separately and earlier, inside the build,
+// by `uploadTimeout`; by the time a message reaches the wire its bytes are already up.
+//
+// And what no number here reaches: two waits inside this region do not look at the
+// context at all. `SendMessage` takes `cli.messageSendLock` before it does anything, and
+// `NoiseSocket.SendFrame` takes its write lock before reading the context, which is #74.
+// A send held by either does not come back when this ceiling runs out; the ceiling ends
+// the ones queued behind it once the held call finally returns, which is the whole of
+// what it buys.
+const sendCeiling = 5*upstreamRequestWait + upstreamReconnectWait
+
+// upstreamRequestWait and upstreamReconnectWait are the pinned library's own numbers,
+// named here so the arithmetic above reads as a derivation rather than a guess.
+// `defaultRequestTimeout` and the `WaitForConnection` call inside `retryFrame`.
+const (
+	upstreamRequestWait   = 75 * time.Second
+	upstreamReconnectWait = 5 * time.Second
+)
 
 // overSocket is the ordinary way a message leaves: whatsmeow's own send, on whichever
 // client the session holds when it is called rather than one read earlier, so a message

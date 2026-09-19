@@ -1,6 +1,7 @@
 package whatsmeow
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -36,9 +37,35 @@ type upstreamDefect struct {
 	absent    []string
 	enclosing string // the func whose body `absent` is checked against
 	what      string // what the reader should understand from a failure
+	// reliedOn flips what a failure means. Every other entry here describes something
+	// broken upstream that this repository works around, so its failure reads "upstream
+	// may have fixed it, delete this entry". An entry marked this way is the opposite: a
+	// property upstream has that a fix on this side is built on, whose disappearance
+	// breaks us rather than freeing us. Telling a reader to delete the entry would be
+	// exactly the wrong instruction.
+	reliedOn bool
+	// restingOn names what stops working when a relied-on property goes, so the failure
+	// points at the code and the prose that have to be re-read rather than at nothing.
+	restingOn string
 }
 
 var upstreamDefects = []upstreamDefect{
+	{
+		issue: "fazer-ai/whatsapp-connector#283",
+		file:  "request.go",
+		// Not a defect. `retryFrame` watching the caller's context is the single reason a
+		// ceiling set on this side reaches the retry at all: the retry's own timer does not
+		// exist (the entries below), so `ctx.Done()` is the whole of the remedy. The
+		// contract already promises a client that `max_runtime_ms` ends this wait, and
+		// without this case that promise would be false with the suite green.
+		inOrder:   []string{"case <-ctx.Done():", "return nil, ctx.Err()"},
+		enclosing: "func (cli *Client) retryFrame(",
+		what: "the retry watching the caller's context, which is what lets a ceiling set " +
+			"here end a retry that has no timer of its own",
+		reliedOn: true,
+		restingOn: "the `sendCeiling` in internal/engine/whatsmeow/send.go and the paragraph " +
+			"in contract/PROTOCOL.md that tells a client `max_runtime_ms` reaches this retry",
+	},
 	{
 		issue: "fazer-ai/whatsapp-connector#283",
 		file:  "send.go",
@@ -130,20 +157,13 @@ func TestTheUpstreamDefectsWeLiveWithAreStillThere(t *testing.T) {
 			for _, fragment := range defect.inOrder {
 				found := strings.Index(body[at:], fragment)
 				if found < 0 {
-					t.Fatalf("%s no longer holds %q after the fragments before it, so %s "+
-						"may be gone.\nThis is not a defect in this repository: re-read %s, "+
-						"and if upstream fixed it, delete this entry and the limitation it "+
-						"documents.",
-						defect.enclosing, fragment, defect.what, defect.issue)
+					t.Fatal(whatAFailureMeans(&defect, fragment, "no longer holds, in order,"))
 				}
 				at += found + len(fragment)
 			}
 			for _, fragment := range defect.stillThere {
 				if !strings.Contains(body, fragment) {
-					t.Fatalf("%s no longer holds %q, so %s may be gone.\n"+
-						"This is not a defect in this repository: re-read %s, and if upstream "+
-						"fixed it, delete this entry and the limitation it documents.",
-						defect.enclosing, fragment, defect.what, defect.issue)
+					t.Fatal(whatAFailureMeans(&defect, fragment, "no longer holds"))
 				}
 			}
 			for _, fragment := range defect.absent {
@@ -158,6 +178,22 @@ func TestTheUpstreamDefectsWeLiveWithAreStillThere(t *testing.T) {
 			}
 		})
 	}
+}
+
+// whatAFailureMeans writes the two opposite instructions this table can carry. A defect
+// gone is good news and the entry should go with it; a relied-on property gone is the
+// opposite, and the reader has to be sent to the code that was built on it instead of
+// being told to delete the line that noticed.
+func whatAFailureMeans(defect *upstreamDefect, fragment, how string) string {
+	if defect.reliedOn {
+		return fmt.Sprintf("%s %s %q, and that is not a fix upstream: it is a property this "+
+			"repository depends on, namely %s.\nWhat rests on it: %s.\nRe-read %s. Do not "+
+			"delete this entry to make the suite green.",
+			defect.enclosing, how, fragment, defect.what, defect.restingOn, defect.issue)
+	}
+	return fmt.Sprintf("%s %s %q, so %s may be gone.\nThis is not a defect in this "+
+		"repository: re-read %s, and if upstream fixed it, delete this entry and the "+
+		"limitation it documents.", defect.enclosing, how, fragment, defect.what, defect.issue)
 }
 
 // funcBody returns the text between the opening line and the closing brace in column zero,
