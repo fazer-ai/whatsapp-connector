@@ -75,8 +75,8 @@ func TestForgettingASessionForgetsThatItShouldBeConnected(t *testing.T) {
 	if err := container.For("sid-1").PutDesiredConnected(ctx, store.Wants{}); err != nil {
 		t.Fatalf("PutDesiredConnected: %v", err)
 	}
-	if err := container.For("sid-1").Forget(ctx); err != nil {
-		t.Fatalf("Forget: %v", err)
+	if err := container.For("sid-1").ForgetCredentialsAndDesired(ctx); err != nil {
+		t.Fatalf("ForgetCredentialsAndDesired: %v", err)
 	}
 
 	// Paired again under the same id, which is what a fresh inbox reusing a session id

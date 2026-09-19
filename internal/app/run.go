@@ -191,6 +191,7 @@ func New(cfg *Config, log zerolog.Logger) (connector *Connector, err error) {
 		Publisher: countingPublisher{to: streams, metrics: metrics}, Replier: streams,
 		Ledger:     redisx.NewIdempotency(client, 0),
 		Watch:      watch,
+		Store:      devices,
 		Quarantine: quarantine,
 		NewID:      newFrameID, Logger: log,
 	})
@@ -1449,7 +1450,13 @@ func newEngine(
 	// neither did a name this build does not know.
 	switch cfg.Engine {
 	case EngineFake:
-		return fake.New(), devices, nil
+		// With the store, so that a deployment on this engine leaves behind what the
+		// sweep needs to bring an account back. It is not a store the fake reads: the
+		// only thing it writes is the pairing, which `store.Wanted` joins the desired
+		// row against, and without it an account that paired is one nothing can resume.
+		// A nil container is a `serve` with no database url, which this engine allows
+		// and which is a fleet that does not come back on its own by construction.
+		return fake.New(fake.WithStore(devices)), devices, nil
 	case EngineWhatsmeow:
 		// Config refuses a whatsmeow engine with no database url, so devices is set.
 		waEngine, err := meow.New(devices,

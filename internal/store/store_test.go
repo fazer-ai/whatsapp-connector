@@ -130,8 +130,8 @@ func TestForgetRemovesTheDeviceAndTheMapping(t *testing.T) {
 	ctx := t.Context()
 
 	jid := pair(t, container, "sid-1", "5511999990001")
-	if err := container.For("sid-1").Forget(ctx); err != nil {
-		t.Fatalf("Forget: %v", err)
+	if err := container.For("sid-1").ForgetCredentialsAndDesired(ctx); err != nil {
+		t.Fatalf("ForgetCredentialsAndDesired: %v", err)
 	}
 
 	if _, bound, err := container.For("sid-1").JID(ctx); err != nil || bound {
@@ -147,7 +147,7 @@ func TestForgetRemovesTheDeviceAndTheMapping(t *testing.T) {
 
 	// Forgetting a session that never paired is what a delete on an unpaired inbox
 	// does, and it is not an error.
-	if err := container.For("sid-never").Forget(ctx); err != nil {
+	if err := container.For("sid-never").ForgetCredentialsAndDesired(ctx); err != nil {
 		t.Fatalf("Forget on an unpaired session: %v", err)
 	}
 }

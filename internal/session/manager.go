@@ -27,6 +27,7 @@ import (
 type Manager struct {
 	instance   string
 	engine     engine.Engine
+	store      *store.Container
 	leases     *cluster.Leases
 	quarantine *cluster.Quarantine
 	publisher  transport.Publisher
@@ -137,6 +138,13 @@ type ManagerConfig struct {
 	// Ledger is where a command's outcome is remembered. Leaving it out turns the
 	// idempotency invariant off, which only a test that is not exercising it should do.
 	Ledger Ledger
+	// Store is where every session this manager owns records what its client asked for.
+	// Leaving it out turns that record off, which only a test that is not exercising it
+	// should do: a deployment without it pairs accounts that nothing says should be in
+	// the air, and the sweep that brings them back reads an empty list. That was #266,
+	// and it was invisible because the one engine that did write this made it look like
+	// the connector did.
+	Store *store.Container
 	// Quarantine is the fleet's record of the sessions that keep failing to come back.
 	// Leaving it out turns the backoff off, which only a test that is not exercising it
 	// should do: without it an account that cannot connect is asked for again at the
@@ -166,6 +174,7 @@ func NewManager(cfg *ManagerConfig) *Manager {
 		engine:      cfg.Engine,
 		leases:      cfg.Leases,
 		quarantine:  cfg.Quarantine,
+		store:       cfg.Store,
 		publisher:   cfg.Publisher,
 		watch:       cfg.Watch,
 		replier:     cfg.Replier,
@@ -359,8 +368,18 @@ func (m *Manager) adopt(ctx context.Context, sid string, forTeardown bool) (*Ses
 	// belong to. Nothing fires before the assignment: the executor runs a command only
 	// once somebody has been handed this pointer and offered it one.
 	var session *Session
+	// This session's own handle on the store, made here because the manager is where a
+	// session begins and there is nowhere else both this layer and the engine can be
+	// handed the same one: the engine builds its own inside `Open`. Two handles for one
+	// sid is not two fences over one device -- they share the `Ownership` arbiter, so an
+	// instance that lost the lease is refused through either -- and what this one writes
+	// is the client's request, which has no second writer to race.
+	var scoped *store.Scoped
+	if m.store != nil {
+		scoped = m.store.For(sid)
+	}
 	session = New(living, &Config{
-		Instance: m.instance, Lease: lease, Leases: m.leases, Engine: engineSession,
+		Instance: m.instance, Lease: lease, Leases: m.leases, Engine: engineSession, Store: scoped,
 		Publisher: m.publisher, Replier: m.replier, Ledger: m.ledger, Watch: m.watch,
 		NewID: m.newID, Now: m.now, Logger: m.log,
 		Undrained: func() { m.undrained(sid) }, RetireRetry: m.retireRetry,

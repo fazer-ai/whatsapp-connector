@@ -16,6 +16,7 @@ import (
 	"github.com/fazer-ai/whatsapp-connector/internal/cluster"
 	"github.com/fazer-ai/whatsapp-connector/internal/engine"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
+	"github.com/fazer-ai/whatsapp-connector/internal/store"
 	"github.com/fazer-ai/whatsapp-connector/internal/transport"
 )
 
@@ -33,6 +34,7 @@ type Session struct {
 	publisher transport.Publisher
 	replier   transport.Replier
 	ledger    Ledger
+	store     *store.Scoped
 	watch     Watch
 	newID     IDFunc
 	now       func() time.Time
@@ -154,9 +156,22 @@ type Config struct {
 	Replier   transport.Replier
 	Watch     Watch
 	Ledger    Ledger
-	NewID     IDFunc
-	Now       func() time.Time
-	Logger    zerolog.Logger
+	// Store is where this session records what its client asked for, behind the same
+	// ownership arbiter every other write stands behind. Leaving it out turns that
+	// record off, which only a test that is not exercising it should do: without it a
+	// paired account that is in the air leaves nothing saying so, and the sweep that
+	// brings accounts back reads an empty list. That was #266.
+	//
+	// It is a handle of this session's own rather than the engine's, and they are not
+	// interchangeable by accident: both consult the same `Ownership` arbiter, so an
+	// instance that lost the lease is refused on either, and the difference is the
+	// manual drop the engine sets when it closes. That drop exists for device writes,
+	// where two sessions writing one device is the hazard; the row this one writes is
+	// not a device write and has no second writer to race.
+	Store  *store.Scoped
+	NewID  IDFunc
+	Now    func() time.Time
+	Logger zerolog.Logger
 	// RetireRetry is how long to wait before saying again that this session is finished
 	// with, when the first attempt did not reach the stream. Zero asks for the default.
 	RetireRetry time.Duration
@@ -215,6 +230,7 @@ func New(ctx context.Context, cfg *Config) *Session {
 		engine:       cfg.Engine,
 		publisher:    cfg.Publisher,
 		ledger:       cfg.Ledger,
+		store:        cfg.Store,
 		watch:        cfg.Watch,
 		replier:      cfg.Replier,
 		newID:        cfg.NewID,
@@ -1273,6 +1289,7 @@ func (s *Session) lifecycle(ctx context.Context, command *protocol.Command) (jso
 		if err := json.Unmarshal(command.Payload, &request); err != nil {
 			return nil, protocol.NewError(protocol.ErrorInvalidPayload, "session.connect payload is not readable")
 		}
+		s.recordAsked(ctx, request)
 		if err := s.engine.Connect(ctx, request); err != nil {
 			return nil, err
 		}
@@ -1284,6 +1301,7 @@ func (s *Session) lifecycle(ctx context.Context, command *protocol.Command) (jso
 			Payload: json.RawMessage(`{}`),
 		})
 	case protocol.CommandSessionDisconnect:
+		s.recordAskedDown(ctx)
 		return nil, s.engine.Disconnect(ctx)
 	case protocol.CommandSessionLogout:
 		return nil, s.engine.Logout(ctx)
@@ -1291,6 +1309,56 @@ func (s *Session) lifecycle(ctx context.Context, command *protocol.Command) (jso
 		return nil, s.tearDown(ctx)
 	default:
 		return s.engine.Execute(ctx, command)
+	}
+}
+
+// recordAsked remembers that a client asked for this session, and what it asked for.
+//
+// Here rather than inside an engine, which is where it was until #266: only one engine
+// wrote it, so an account running on any other left nothing behind and the sweep that
+// brings accounts back had nothing to read. What the row holds is not a fact about
+// WhatsApp, it is the client's request, and this is the layer the request arrives at.
+//
+// Before the engine is called, and that is the ordering the engine's own comment defended
+// when the write lived there: after the point the request stops being one this session
+// might refuse -- the payload has parsed, which is the only refusal above this line -- and
+// before anything that changes the session. A record written after the connect would be a
+// record missing whenever the instance died in the middle of one, and the middle of a
+// connect is a network handshake with no ceiling by default.
+//
+// The subscription goes with it, because a resume has no other way of learning it: the
+// connect a sweep synthesises is not a frame a client sent, so what it does not carry is
+// not defaulted, it is absent, and the session comes back acknowledging group traffic it
+// publishes nowhere.
+//
+// Logged rather than returned, which is the engine's judgement kept: the connection is
+// what the client asked for and it is happening, and a memory that could not be written
+// is a session that will not come back by itself later, which is worse than it was but
+// not a reason to refuse what is working now. The next connect writes it again.
+func (s *Session) recordAsked(ctx context.Context, request engine.ConnectRequest) {
+	if s.store == nil {
+		return
+	}
+	if err := s.store.PutDesiredConnected(ctx, store.Wants{
+		Groups: request.Groups, CallAutoReject: request.Calls != nil && request.Calls.AutoReject,
+	}); err != nil {
+		s.log.Warn().Err(err).Str("sid", s.sid).
+			Msg("could not record that this session should be connected; it will not be resumed on its own")
+	}
+}
+
+// recordAskedDown remembers that a client asked this session to stay down.
+//
+// Before the socket goes, for the same reason as above and for one more: a disconnect that
+// lands and is not recorded leaves a row saying the account should be up, and the next
+// sweep brings back a session whose client had just asked for it to stop.
+func (s *Session) recordAskedDown(ctx context.Context) {
+	if s.store == nil {
+		return
+	}
+	if err := s.store.PutDesiredDisconnected(ctx); err != nil {
+		s.log.Warn().Err(err).Str("sid", s.sid).
+			Msg("could not record that this session should stay down; a sweep may bring it back")
 	}
 }
 

@@ -11,11 +11,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"sync"
 	"time"
 
+	waTypes "go.mau.fi/whatsmeow/types"
+
 	"github.com/fazer-ai/whatsapp-connector/internal/engine"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
+	"github.com/fazer-ai/whatsapp-connector/internal/store"
 )
 
 // QRData is the pairing image the fake issues. A real data URL rather than a
@@ -25,19 +29,62 @@ const QRData = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="
 // PairingCode is the code the fake issues for code pairing.
 const PairingCode = "K7QP2M4X"
 
-// PairedPhone is the number the fake reports having paired.
+// PairedPhone is the shape of the number this fake pairs with: a Brazilian mobile,
+// thirteen digits. The number a session actually gets is derived from its id, because one
+// constant for a whole fleet is one account for a whole fleet. See PhoneFor.
 const PairedPhone = "5511999990001"
+
+// PhoneFor is the number this fake pairs a given session with.
+//
+// One per session, and that is not decoration. `wac_session_device` carries a UNIQUE
+// index over `account`, and the store binds on the account rather than the device,
+// because re-pairing issues a new device for the same number. A fake that paired every
+// session to one constant would have each new session silently displace the last, and a
+// bench that created ten accounts would be measuring one -- which is how #264's
+// mass-adoption measurement was blocked before this existed.
+func PhoneFor(sid string) string {
+	sum := fnv.New32a()
+	_, _ = sum.Write([]byte(sid))
+	// Thirteen digits, the shape WhatsApp uses for a Brazilian mobile: country, area,
+	// the ninth digit, and eight that vary.
+	return fmt.Sprintf("55119%08d", sum.Sum32()%100000000)
+}
 
 // Engine hands out fake sessions and remembers them, so a test can reach into one it
 // has already handed to the layer under test.
 type Engine struct {
 	mu       sync.Mutex
 	sessions map[string]*Session
+	store    *store.Container
 	closed   bool
 }
 
+// Option configures an engine.
+//
+// Options rather than parameters so the hundred-odd `New()` calls in this repository's
+// tests go on compiling: what they exercise has nothing to do with a store, and making
+// them all name one would be a change to the suite bought for nothing.
+type Option func(*Engine)
+
+// WithStore gives this engine a store to record pairings in.
+//
+// Without it a session pairs and leaves nothing behind, which is what a deployment on
+// this engine did until #266: the sweep that brings accounts back joins the desired row
+// with the pairing, so an account with no pairing row is one nothing can resume. The
+// whatsmeow engine has always written this from inside its pairing handshake, where the
+// JID arrives, and that is a place no layer above can reach.
+func WithStore(container *store.Container) Option {
+	return func(e *Engine) { e.store = container }
+}
+
 // New returns an engine with no sessions open.
-func New() *Engine { return &Engine{sessions: make(map[string]*Session)} }
+func New(opts ...Option) *Engine {
+	e := &Engine{sessions: make(map[string]*Session)}
+	for _, opt := range opts {
+		opt(e)
+	}
+	return e
+}
 
 // Open returns the session for an id, creating it the first time.
 func (e *Engine) Open(_ context.Context, sid string) (engine.Session, error) {
@@ -54,6 +101,9 @@ func (e *Engine) Open(_ context.Context, sid string) (engine.Session, error) {
 	// new owner publishes would go nowhere. An account released and adopted again is an
 	// ordinary sequence now, and the real engine opens a new session for it.
 	session := newSession(sid)
+	if e.store != nil {
+		session.store = e.store.For(sid)
+	}
 	e.sessions[sid] = session
 	return session, nil
 }
@@ -85,6 +135,8 @@ func (e *Engine) Close() error {
 // Session is one fake WhatsApp account.
 type Session struct {
 	sid string
+	// store is where this session records its pairing, or nil when nothing asked it to.
+	store *store.Scoped
 
 	mu           sync.Mutex
 	events       chan engine.Emission
@@ -99,6 +151,7 @@ type Session struct {
 	refuseUnlink error
 	failDelete   error
 	failConnect  error
+	failHangUp   error
 	onDelete     func()
 	commands     []protocol.Command
 	bounds       []time.Time
@@ -169,11 +222,20 @@ func (s *Session) Connect(_ context.Context, req engine.ConnectRequest) error {
 	}
 
 	if req.Pairing != "resume" {
+		// Recorded before the success is announced, and the order is the promise rather
+		// than an implementation detail: a client that sees `pairing.success` may act on
+		// a paired account, and an instance that died between the announcement and the
+		// write would leave one nothing can resume. The whatsmeow engine gets this for
+		// free, because its write is the `PrePairCallback` and refusing it refuses the
+		// pairing; here it has to be written down.
+		if err := s.pair(); err != nil {
+			return err
+		}
 		// `phone`, not an address: the schema requires the digits at the top level, and
 		// a fake that publishes a shape the contract rejects is an end-to-end check that
 		// proves the client would refuse the real thing.
 		s.emit(protocol.EventPairingSuccess, map[string]any{
-			"phone":    PairedPhone,
+			"phone":    PhoneFor(s.sid),
 			"platform": "fake",
 		})
 	}
@@ -188,9 +250,67 @@ func (s *Session) Connect(_ context.Context, req engine.ConnectRequest) error {
 	return nil
 }
 
+// pair records the account this session paired, the way an engine with a socket records
+// the one WhatsApp handed it.
+//
+// A no-op without a store, which is every test above this package that does not care:
+// they exercise what the layers do with a session, not what a deployment leaves behind.
+// A deployment always has one, and the fence over this obligation is what says so.
+func (s *Session) pair() error {
+	if s.store == nil {
+		return nil
+	}
+	jid, err := waTypes.ParseJID(PhoneFor(s.sid) + ":12@" + waTypes.DefaultUserServer)
+	if err != nil {
+		return fmt.Errorf("fake: build the jid of %s: %w", s.sid, err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), bindTimeout)
+	defer cancel()
+	if err := s.store.Bind(ctx, jid); err != nil {
+		return fmt.Errorf("fake: record the pairing of %s: %w", s.sid, err)
+	}
+	return nil
+}
+
+// unpair forgets the account this session paired, and what its client asked for with it.
+//
+// Both, through the one door that says both, because they are the same fact from two
+// sides: the credentials are gone, so there is nothing for a resume to resume, and a row
+// that outlived them is a sweep dialling an account that no longer exists.
+func (s *Session) unpair(ctx context.Context) error {
+	if s.store == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, bindTimeout)
+	defer cancel()
+	if err := s.store.ForgetCredentialsAndDesired(ctx); err != nil {
+		return fmt.Errorf("fake: forget the pairing of %s: %w", s.sid, err)
+	}
+	return nil
+}
+
+// bindTimeout bounds the write that stands between a pairing and the event announcing it,
+// the way the whatsmeow engine bounds its own: short, because nothing useful happens
+// while it is outstanding and the announcement is waiting on it.
+const bindTimeout = 5 * time.Second
+
+// FailDisconnect makes dropping the socket fail, which is the case that separates "the
+// operator asked for this" from "it happened". The record of the request is the first,
+// and a disconnect that could not be carried out does not unask it.
+func (s *Session) FailDisconnect(err error) {
+	s.mu.Lock()
+	s.failHangUp = err
+	s.mu.Unlock()
+}
+
 // Disconnect drops the socket and says so.
 func (s *Session) Disconnect(_ context.Context) error {
 	s.mu.Lock()
+	failWith := s.failHangUp
+	if failWith != nil {
+		s.mu.Unlock()
+		return failWith
+	}
 	s.connected = false
 	s.mu.Unlock()
 	s.emit(protocol.EventSessionState, map[string]any{"state": "close", "reason": "disconnect_requested"})
@@ -198,11 +318,18 @@ func (s *Session) Disconnect(_ context.Context) error {
 }
 
 // Logout ends the session for good.
-func (s *Session) Logout(_ context.Context) error {
+func (s *Session) Logout(ctx context.Context) error {
 	s.mu.Lock()
 	s.connected = false
 	s.loggedOut++
 	s.mu.Unlock()
+	// The pairing goes with the logout, the way the real engine's does. An account whose
+	// credentials are gone and whose row is still there is one the sweep tries to bring
+	// back every pass, for ever, and that is this defect with the sign reversed: the
+	// point of recording what was asked for is that something acts on it.
+	if err := s.unpair(ctx); err != nil {
+		return err
+	}
 	s.emit(protocol.EventSessionLoggedOut, map[string]any{"reason": "logout_requested"})
 	return nil
 }
@@ -210,7 +337,7 @@ func (s *Session) Logout(_ context.Context) error {
 // Delete unlinks and forgets, and counts the two separately so a test can tell a
 // teardown that gave up from one that carried on: the whole point of the real one is
 // that a refused unlink does not stop the deletion.
-func (s *Session) Delete(_ context.Context) error {
+func (s *Session) Delete(ctx context.Context) error {
 	s.mu.Lock()
 	// The real engine drops the store's fence in Close, and every fenced write after
 	// that is refused. Modelled here because a fake that deletes happily after its
@@ -234,6 +361,11 @@ func (s *Session) Delete(_ context.Context) error {
 	}
 	if failWith != nil {
 		return failWith
+	}
+	// Same as the logout, and after the failure above rather than before it: a teardown
+	// that did not happen must not take the record of the account with it.
+	if err := s.unpair(ctx); err != nil {
+		return err
 	}
 	// Marked, the way the real one marks it: the account is gone, so the session has
 	// nothing left to try and the connector hands the lease back once this is out. A
@@ -353,7 +485,10 @@ func (s *Session) Execute(ctx context.Context, command *protocol.Command) (json.
 		state := map[string]any{"connection": "close"}
 		if connected {
 			state["connection"] = "open"
-			state["phone_number"] = PairedPhone
+			// The number this session paired, not the package's, for the same reason
+			// the pairing row carries one per session: a status that answered with a
+			// constant would have every account in a fleet reporting the same phone.
+			state["phone_number"] = PhoneFor(s.sid)
 		}
 		return marshal(state)
 	case protocol.CommandMessageSend, protocol.CommandMessageEdit, protocol.CommandMessageReact:

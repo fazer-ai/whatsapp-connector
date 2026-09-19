@@ -1723,7 +1723,7 @@ func (s *Session) Connect(ctx context.Context, req engine.ConnectRequest) error 
 		// built at the time -- or the pairing just replaced above took its client with
 		// it. Nothing on it works, so the connect that would have failed is the connect
 		// that repairs it.
-		if err := s.recover(ctx); err != nil {
+		if err := s.repairDevice(ctx); err != nil {
 			return fmt.Errorf("whatsmeow: %s is still without a usable device: %w", s.sid, err)
 		}
 	}
@@ -1737,27 +1737,13 @@ func (s *Session) Connect(ctx context.Context, req engine.ConnectRequest) error 
 	s.setGroups(req.Groups)
 	s.setCallPolicy(req.Calls != nil && req.Calls.AutoReject)
 
-	// Recorded at the same point and for the same reason: this is where the request stops
-	// being one the session might refuse. It is what makes the account survive the
-	// instance running it -- a lease dies with its holder and a wake is a frame read once,
-	// so without this there is nothing anywhere that says a paired, unowned account should
-	// be in the air, and it stays down until somebody opens the inbox and asks again.
-	//
-	// The subscription goes with it, because a resume has no other way of learning it.
-	// The connect a sweep synthesises is not a frame a client sent, so what it does not
-	// carry is not defaulted, it is absent: the session came back open and acknowledged
-	// every group message WhatsApp had for it without publishing one.
-	//
-	// Logged rather than returned. The connection is what the client asked for and it is
-	// happening; a memory that could not be written is a session that will not be brought
-	// back by itself later, which is worse than it was but not a reason to refuse what is
-	// working now. The next connect writes it again.
-	if err := s.store.PutDesiredConnected(ctx, store.Wants{
-		Groups: req.Groups, CallAutoReject: req.Calls != nil && req.Calls.AutoReject,
-	}); err != nil {
-		s.log.Warn().Err(err).Str("sid", s.sid).
-			Msg("could not record that this session should be connected; it will not be resumed on its own")
-	}
+	// What the client asked for is recorded a layer up, before this call, and not here.
+	// It used to be here, and being here was #266: an engine is one implementation of
+	// several, the row is the client's request rather than a fact about WhatsApp, and an
+	// account running on any other engine left nothing behind for the sweep to read. The
+	// ordering that comment defended survives the move -- after the last refusal, before
+	// anything that changes the session -- because the refusals it stands after are the
+	// ones the layer above owns.
 
 	// Waited for before the guard comes down, and before anything is dialled. A
 	// disconnect that outlived its command is still going to close the socket, and a
@@ -2186,17 +2172,10 @@ func (s *Session) Disconnect(ctx context.Context) error {
 	defer s.endCommand()
 
 	s.cancelPairing()
-	// Before the socket goes down, because what this records is the answer to "should
-	// anything bring it back": written after, an instance that died in between would
-	// leave an account the operator turned off looking like one that should be resumed.
-	//
-	// Logged rather than returned, like the one in Connect: the disconnect is what was
-	// asked for and it is going to happen either way. What a failure here costs is a
-	// session the resume sweep may bring back, which the next disconnect corrects.
-	if err := s.store.PutDesiredDisconnected(ctx); err != nil {
-		s.log.Warn().Err(err).Str("sid", s.sid).
-			Msg("could not record that this session was asked to stay down; a sweep may bring it back")
-	}
+	// That the operator asked this session to stay down is recorded a layer up, before
+	// this call, for the same reason as in Connect and with the same ordering: before the
+	// socket goes, so an instance that dies in between does not leave an account somebody
+	// turned off looking like one that should be resumed.
 	return s.hangUp(ctx, s.current())
 }
 
@@ -3057,7 +3036,22 @@ func (s *Session) recoverWithin() error {
 // device, and rebuilding from that hands the session the very credentials WhatsApp
 // threw away. Doing them together is what makes the retry a retry.
 func (s *Session) recover(ctx context.Context) error {
-	if err := s.store.Forget(ctx); err != nil {
+	if err := s.store.ForgetCredentialsAndDesired(ctx); err != nil {
+		return err
+	}
+	return s.rebuild(ctx)
+}
+
+// repairDevice is the same repair without the part that ends a session.
+//
+// A connect that finds its device unusable is not a session going away: the client still
+// wants this one connected, and the row that says so is written above this engine now. The
+// wider door would delete it here, and the session layer would have recorded a request
+// that the connect carrying it out threw away -- the account unresumable for exactly the
+// reason #266 exists. The device still has to go, because `rebuild` reads the mapping and
+// would hand back the same dead client.
+func (s *Session) repairDevice(ctx context.Context) error {
+	if err := s.store.ForgetCredentials(ctx); err != nil {
 		return err
 	}
 	return s.rebuild(ctx)
@@ -4642,7 +4636,7 @@ func (s *Session) loggedOut(event *waEvents.LoggedOut) {
 	ctx, cancel := context.WithTimeout(s.ctx, s.storeLimit)
 	defer cancel()
 	cleaned := true
-	if err := s.store.Forget(ctx); err != nil {
+	if err := s.store.ForgetCredentialsAndDesired(ctx); err != nil {
 		cleaned = false
 		s.log.Error().Err(err).Msg("failed to forget the device of a session that was logged out")
 	}

@@ -595,13 +595,16 @@ func TestAskingForAPairingCodeKeepsTheCallPolicy(t *testing.T) {
 }
 
 // A connect asking for the policy used to be refused outright, which is what kept the
-// Chatwoot side from declaring the capability at all. And what it carries has to outlive
-// the command: the sweep brings an account back with its own synthesised connect, so a
-// policy that is not on the desired row is a session that comes back letting calls ring
-// after the operator asked for the opposite, with nothing saying it changed its mind.
-func TestAConnectMayAskForCallsToBeRefusedAndIsRememberedThatWay(t *testing.T) {
+// Chatwoot side from declaring the capability at all.
+//
+// That what it carries outlives the command is the other half, and it is no longer this
+// engine's half: since #266 the desired row is written by the session layer, where the
+// request arrives, and `TestAConnectIsRememberedWithWhatItAskedFor` in `internal/session`
+// is what holds it. Kept apart rather than deleted, because the two can fail separately:
+// a session that takes the policy and a row that carries it are different promises.
+func TestAConnectMayAskForCallsToBeRefused(t *testing.T) {
 	t.Parallel()
-	session, container := newTestSession(t, "5511999990001")
+	session, _ := newTestSession(t, "5511999990001")
 	// Connected first, so the resume this asks for returns without dialling. A unit test
 	// here must never reach a real socket, and an account paired with fabricated
 	// credentials would try.
@@ -615,16 +618,5 @@ func TestAConnectMayAskForCallsToBeRefusedAndIsRememberedThatWay(t *testing.T) {
 	}
 	if !session.rejectsCalls() {
 		t.Fatal("the session did not take the call policy the connect carried")
-	}
-
-	wanted, err := container.Wanted(t.Context())
-	if err != nil {
-		t.Fatalf("Wanted: %v", err)
-	}
-	if len(wanted) != 1 {
-		t.Fatalf("the sweep has %d sessions to bring back, want 1", len(wanted))
-	}
-	if !wanted[0].CallAutoReject {
-		t.Fatal("the call policy is not on the desired row, so a resume would not put it back")
 	}
 }

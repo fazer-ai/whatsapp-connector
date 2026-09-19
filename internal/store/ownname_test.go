@@ -120,8 +120,8 @@ func TestForgettingASessionTakesTheNameItKept(t *testing.T) {
 	if err := scoped.PutUnfiledName(ctx, store.UnfiledPushName, "Atendimento", "Antigo"); err != nil {
 		t.Fatalf("PutUnfiledName: %v", err)
 	}
-	if err := scoped.Forget(ctx); err != nil {
-		t.Fatalf("Forget: %v", err)
+	if err := scoped.ForgetCredentialsAndDesired(ctx); err != nil {
+		t.Fatalf("ForgetCredentialsAndDesired: %v", err)
 	}
 	if _, found, err := container.For("sid-1").UnfiledName(ctx, store.UnfiledPushName); err != nil {
 		t.Fatalf("UnfiledName: %v", err)

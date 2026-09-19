@@ -373,9 +373,13 @@ func (c *Container) deleteDevice(ctx context.Context, jid types.JID) {
 	}
 }
 
-// Forget deletes a session's device and its mapping, which is what a logout means:
-// the credentials are gone and the next connect has to pair.
-func (c *Container) forget(ctx context.Context, sid string) error {
+// forget deletes a session's device and its mapping, and optionally what its client
+// asked for.
+//
+// The two are one function because the order matters and there is only one right one;
+// they are two doors on `Scoped` because the choice between them is not a detail a
+// caller should be able to skip. See the comment on `Scoped.ForgetCredentials`.
+func (c *Container) forget(ctx context.Context, sid string, alsoDesired bool) error {
 	jid, bound, err := c.lookup(ctx, sid)
 	if err != nil {
 		return err
@@ -395,8 +399,15 @@ func (c *Container) forget(ctx context.Context, sid string) error {
 	// on: it is written before a session has a device, so it cannot reference one. Left
 	// behind, it would have the resume sweep trying to bring back an account whose
 	// credentials this call is deleting.
-	if err := c.dropDesired(ctx, sid); err != nil {
-		return err
+	//
+	// And only when the caller means the request to be gone. A connect that finds its
+	// device unusable deletes it to build a replacement, and that is a repair: the
+	// client still wants this session connected, and dropping the row here would leave
+	// the account unresumable for exactly the reason #266 is about.
+	if alsoDesired {
+		if err := c.dropDesired(ctx, sid); err != nil {
+			return err
+		}
 	}
 	// The media parts go with the mapping, by the cascade on wac_media_part rather than
 	// by a delete here. An explicit one would only cover the case the constraint already

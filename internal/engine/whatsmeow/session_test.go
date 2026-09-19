@@ -906,42 +906,6 @@ func TestASocketThatComesBackAfterADisconnectIsClosedAgain(t *testing.T) {
 	}
 }
 
-// What the connector knows about an account after the instance running it is gone. A
-// lease dies with its holder and a wake is a frame read once, so without this a paired
-// account comes up unowned and stays down: the inbox shows `open` and nothing arrives,
-// which is what fazer-ai/chatwoot#577 measured on a live deployment.
-//
-// Written by the two commands that say it, in both directions, because the second one is
-// what keeps the recovery from undoing an operator: a session turned off has to stay off
-// across a restart, and a record that only ever says "connected" would dial it again.
-func TestTheConnectorRemembersWhichSessionsShouldBeConnected(t *testing.T) {
-	t.Parallel()
-
-	session, container := newTestSession(t, "5511999990001")
-
-	if err := session.Connect(t.Context(), engine.ConnectRequest{Pairing: "resume"}); err != nil {
-		t.Fatalf("resuming a paired session: %v", err)
-	}
-	wanted, err := container.Wanted(t.Context())
-	if err != nil {
-		t.Fatalf("Wanted: %v", err)
-	}
-	if len(wanted) != 1 || wanted[0].SID != session.sid {
-		t.Fatalf("after a connect the store wants %v, want just %s: nothing would bring this account back", wanted, session.sid)
-	}
-
-	if err := session.Disconnect(t.Context()); err != nil {
-		t.Fatalf("Disconnect: %v", err)
-	}
-	wanted, err = container.Wanted(t.Context())
-	if err != nil {
-		t.Fatalf("Wanted: %v", err)
-	}
-	if len(wanted) != 0 {
-		t.Fatalf("after a disconnect the store still wants %v; a sweep would dial the socket the operator just closed", wanted)
-	}
-}
-
 // A reconnect already under way is not a reason to start a second one: dialling
 // alongside whatsmeow's retry loses the race about half the time and answers the caller
 // with ErrAlreadyConnected for a socket that was recovering perfectly well.
@@ -2837,7 +2801,7 @@ func TestASessionThatStoppedWritesNoMappingEither(t *testing.T) {
 	if err := session.store.PutMediaPart(t.Context(), &part, time.Now()); !errors.Is(err, store.ErrNotOwned) {
 		t.Errorf("a session that stopped kept a media part: %v", err)
 	}
-	if err := session.store.Forget(t.Context()); !errors.Is(err, store.ErrNotOwned) {
+	if err := session.store.ForgetCredentialsAndDesired(t.Context()); !errors.Is(err, store.ErrNotOwned) {
 		t.Errorf("a session that stopped deleted its own device: %v", err)
 	}
 }
@@ -3216,6 +3180,12 @@ func TestAResumedSessionStillHasTheGroupsItAskedFor(t *testing.T) {
 	t.Parallel()
 
 	session, container := newTestSession(t, "5511999990001")
+	// The record is written a layer up since #266, and what this test is about is the
+	// other end of it: what an instance that comes after makes of the row. Written here
+	// rather than reached through a connect, so the subject stays the reading.
+	if err := container.For(session.sid).PutDesiredConnected(t.Context(), store.Wants{Groups: true}); err != nil {
+		t.Fatalf("record the request for groups: %v", err)
+	}
 	if err := session.Connect(t.Context(), engine.ConnectRequest{Pairing: "resume", Groups: true}); err != nil {
 		t.Fatalf("the connect that asks for groups: %v", err)
 	}
@@ -3268,6 +3238,12 @@ func TestAResumedSessionDoesNotGainGroupsNobodyAskedFor(t *testing.T) {
 	t.Parallel()
 
 	session, container := newTestSession(t, "5511999990001")
+	// Written here for the same reason as above: the row is this test's given, and who
+	// writes it is a layer up since #266. A constant would defeat the point, so it is
+	// written from the same absence the connect below carries.
+	if err := container.For(session.sid).PutDesiredConnected(t.Context(), store.Wants{}); err != nil {
+		t.Fatalf("record the request for direct chats only: %v", err)
+	}
 	if err := session.Connect(t.Context(), engine.ConnectRequest{Pairing: "resume"}); err != nil {
 		t.Fatalf("the connect that asks for direct chats only: %v", err)
 	}
@@ -3791,13 +3767,21 @@ func resumedGroupSession(t *testing.T) *Session {
 // way the manager does: a new handle on the same store, a new session over it, and a
 // connect synthesised from what `container.Wanted()` says about the row.
 //
-// The value under test is never written by this helper. It reads `wanted[0].Groups` and
-// hands that back, so a chain that loses the request fails here rather than being papered
-// over by a literal.
+// The value under test is never written by this helper as a literal into the thing being
+// read. It is written into the table and read back out of it through `Wanted`, so the
+// chain this file exercises -- row, sweep, synthesised connect, `wantsGroups()` -- fails
+// here rather than being papered over.
+//
+// Written by hand rather than by the connect, since #266: what the client asked for is
+// recorded by the session layer now, and an engine that wrote it was the defect. Who
+// writes the row has its own test a layer up; what this helper needs is the row.
 func resumedSession(t *testing.T, groups bool) *Session {
 	t.Helper()
 
 	session, container := newTestSession(t, "5511999990001")
+	if err := container.For(session.sid).PutDesiredConnected(t.Context(), store.Wants{Groups: groups}); err != nil {
+		t.Fatalf("record what the client asked for: %v", err)
+	}
 	// Connected first, so neither connect below dials. A unit test here must never reach a
 	// real socket: every filter this file crosses reads `wantsGroups()`, not the state of a
 	// socket, and eight websockets to web.whatsapp.com in the pre-push suite is a network
