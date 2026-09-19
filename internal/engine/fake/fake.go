@@ -43,11 +43,22 @@ const PairedPhone = "5511999990001"
 // bench that created ten accounts would be measuring one -- which is how #264's
 // mass-adoption measurement was blocked before this existed.
 func PhoneFor(sid string) string {
-	sum := fnv.New32a()
+	sum := fnv.New64a()
 	_, _ = sum.Write([]byte(sid))
-	// Thirteen digits, the shape WhatsApp uses for a Brazilian mobile: country, area,
-	// the ninth digit, and eight that vary.
-	return fmt.Sprintf("55119%08d", sum.Sum32()%100000000)
+	// Thirteen digits, the length of a Brazilian mobile, with the country code kept and
+	// the rest derived. It used to keep the area code and the ninth digit too, which left
+	// eight digits to vary: `PhoneFor("s28693")` and `PhoneFor("s29980")` both came out
+	// 5511994750542, and a collision here is not a duplicate number, it is a deletion.
+	// `wac_session_device` is unique over the account and `Container.bind` matches on it,
+	// so the second session to pair silently displaces the first, which then disappears
+	// from `Wanted` with no error anywhere -- and mass adoption across a fleet is the
+	// measurement this engine exists to make.
+	//
+	// The bound, since a hash into a fixed number of digits cannot promise more than one:
+	// eleven digits is 1e11, so a bench is even money to collide somewhere around 4e5
+	// sessions. `TestTheFakeGivesOneAccountPerSession` measures the encoding over the sid
+	// shapes benches actually use.
+	return fmt.Sprintf("55%011d", sum.Sum64()%100000000000)
 }
 
 // Engine hands out fake sessions and remembers them, so a test can reach into one it
@@ -197,7 +208,7 @@ func (s *Session) Asked() (engine.ConnectRequest, bool) {
 }
 
 // Connect walks the pairing conversation the type asks for and ends `open`.
-func (s *Session) Connect(_ context.Context, req engine.ConnectRequest) error {
+func (s *Session) Connect(ctx context.Context, req engine.ConnectRequest) error {
 	s.mu.Lock()
 	s.connects++
 	// Before the refusal rather than after it: what was asked for is what was asked for,
@@ -235,7 +246,7 @@ func (s *Session) Connect(_ context.Context, req engine.ConnectRequest) error {
 		// write would leave one nothing can resume. The whatsmeow engine gets this for
 		// free, because its write is the `PrePairCallback` and refusing it refuses the
 		// pairing; here it has to be written down.
-		if err := s.pair(); err != nil {
+		if err := s.pair(ctx); err != nil {
 			return err
 		}
 		// `phone`, not an address: the schema requires the digits at the top level, and
@@ -263,7 +274,7 @@ func (s *Session) Connect(_ context.Context, req engine.ConnectRequest) error {
 // A no-op without a store, which is every test above this package that does not care:
 // they exercise what the layers do with a session, not what a deployment leaves behind.
 // A deployment always has one, and the fence over this obligation is what says so.
-func (s *Session) pair() error {
+func (s *Session) pair(ctx context.Context) error {
 	if s.store == nil {
 		return nil
 	}
@@ -271,7 +282,12 @@ func (s *Session) pair() error {
 	if err != nil {
 		return fmt.Errorf("fake: build the jid of %s: %w", s.sid, err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), bindTimeout)
+	// The connect's own context, with a ceiling on top of it rather than instead of it.
+	// Built from `context.Background()` this write outlived the command that asked for
+	// it: a client's `max_runtime_ms` and a session going away underneath both stopped
+	// meaning anything, and a store that blocked held the session's executor for the
+	// whole of `bindTimeout` after its caller had given up.
+	ctx, cancel := context.WithTimeout(ctx, bindTimeout)
 	defer cancel()
 	if err := s.store.Bind(ctx, jid); err != nil {
 		return fmt.Errorf("fake: record the pairing of %s: %w", s.sid, err)
@@ -485,6 +501,26 @@ func (s *Session) Execute(ctx context.Context, command *protocol.Command) (json.
 	}
 
 	switch command.Type {
+	case protocol.CommandPairingRequestCode:
+		// A connect wearing another name, the way the whatsmeow engine treats it: there is
+		// no asking WhatsApp for a code without a socket, so this command opens one. An
+		// engine that answered `unsupported` here would be a deployment where an operator
+		// can pair by scanning and not by typing, and it would hide the half of #266 that
+		// runs through this door from every test that uses this engine.
+		var body struct {
+			Phone string `json:"phone"`
+		}
+		if err := json.Unmarshal(command.Payload, &body); err != nil {
+			return nil, protocol.NewError(protocol.ErrorInvalidPayload, "the pairing request could not be read")
+		}
+		// Everything the session is already carrying comes along, because the client is
+		// not sending a connect: leaving the subscription out would turn group traffic off
+		// at the moment the operator asked for a code.
+		s.mu.Lock()
+		standing := s.asked
+		s.mu.Unlock()
+		standing.Pairing, standing.Phone = "code", body.Phone
+		return nil, s.Connect(ctx, standing)
 	case protocol.CommandSessionStatus:
 		// A `connection_state`, whose key is `connection`. The `session.state` event
 		// reporting the same change spells it `state`, and answering the RPC with the

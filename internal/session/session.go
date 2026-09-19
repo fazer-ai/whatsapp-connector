@@ -1322,20 +1322,36 @@ func (s *Session) lifecycle(ctx context.Context, command *protocol.Command) (jso
 	case protocol.CommandSessionDelete:
 		return nil, s.tearDown(ctx)
 	case protocol.CommandPairingRequestCode:
-		// A connect wearing another name: the engine turns this into a `ConnectRequest`
-		// of its own and dials. It therefore has to leave the same record behind, and
-		// until #266 it did -- through the write that lived inside the whatsmeow engine,
-		// which is the one that moved up here. Without this line an operator who pairs an
-		// inbox by typing a code, rather than by scanning the QR, gets an account that
-		// works until the instance running it goes away and is never brought back: the
-		// #266 defect, through the one door that does not carry a request.
+		// A connect wearing another name: an engine turns this into a `ConnectRequest` of
+		// its own and dials, because there is no asking WhatsApp for a code without a
+		// socket. It therefore has to leave the same record behind, and until #266 it did
+		// -- through the write that lived inside the whatsmeow engine, which is the one
+		// that moved up here. Without this an operator who pairs an inbox by typing a
+		// code, rather than by scanning the QR, gets an account that works until the
+		// instance running it goes away and is never brought back: the #266 defect,
+		// through the one door that does not carry a request.
 		//
-		// What it records is what the last connect asked for, because that is what the
+		// After the engine, which is the opposite of the connect branch above, and the
+		// reason is what the two commands leave behind in the window between the call and
+		// the write. A connect can be open by the time it returns, so a record written
+		// afterwards is a record missing whenever the instance died mid-connect. This one
+		// cannot: the pairing it starts lands when the operator types the code into their
+		// phone, strictly later than the call, so an instance that dies in this window
+		// leaves nothing paired and nothing to resume. What waiting buys is the refusals
+		// -- a phone number with no digits in it, an engine that does not serve the
+		// command at all -- which recorded would have the sweep bring back an account on
+		// the strength of a request that was never carried out.
+		//
+		// What it records is what the last connect asked for, because that is what an
 		// engine carries into the connect it builds: this command names a phone number
 		// and nothing else, and a record that reset the subscription would have the
 		// account come back deaf to the group traffic its client had asked for.
+		result, err := s.engine.Execute(ctx, command)
+		if err != nil {
+			return nil, err
+		}
 		s.recordWanted(ctx)
-		return s.engine.Execute(ctx, command)
+		return result, nil
 	default:
 		return s.engine.Execute(ctx, command)
 	}

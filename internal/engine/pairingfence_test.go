@@ -1,6 +1,7 @@
 package engine_test
 
 import (
+	"context"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -308,5 +309,58 @@ func watchFor(t *testing.T, events <-chan engine.Emission, want protocol.EventTy
 		case <-time.After(within):
 			return false
 		}
+	}
+}
+
+// The pairing write is the caller's command, not a job of its own.
+//
+// It used to run on a context built from `context.Background()`, so a client's
+// `max_runtime_ms`, a session going away and a lease moving all stopped meaning anything
+// the moment the write started: a store that blocked held the session's executor for the
+// whole bind timeout after its caller had given up, and then committed a pairing nobody
+// was waiting for any more.
+//
+// A context already cancelled is the same condition with the timing taken out of it, which
+// is what makes this deterministic rather than a race with a slow store.
+//
+// The order this leaves is the one `TestEveryEngineRecordsThePairingBeforeItAnnouncesIt`
+// holds: the write is refused, so the connect fails and `pairing.success` is never
+// announced. A client is never told about an account that was not recorded.
+func TestAPairingWriteHonoursTheConnectsContext(t *testing.T) {
+	t.Parallel()
+
+	container := openStore(t, store.AlwaysOwned)
+	waEngine := fake.New(fake.WithStore(container))
+	announcedFor := func(session engine.Session) func(time.Duration) bool {
+		return watchFor(t, session.Events(), protocol.EventPairingSuccess)
+	}
+	session, err := waEngine.Open(t.Context(), "sid-cancelled")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = session.Close() })
+
+	announced := announcedFor(session)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	if err := session.Connect(ctx, engine.ConnectRequest{Pairing: "qr"}); err == nil {
+		t.Fatal("a connect whose context was already cancelled paired the account anyway. " +
+			"The command it belongs to is over, and what it wrote outlives the ceiling its " +
+			"client put on it and the ownership the write was fenced against.")
+	}
+
+	var rows int
+	if err := container.DB().QueryRowContext(t.Context(),
+		`SELECT COUNT(*) FROM wac_session_device WHERE sid = 'sid-cancelled'`).Scan(&rows); err != nil {
+		t.Fatalf("count the device rows: %v", err)
+	}
+	if rows != 0 {
+		t.Fatalf("the cancelled connect left %d pairing rows behind", rows)
+	}
+	// The same bound the case above uses, for the same reason: a negative under a watcher
+	// that the case above has been seen to answer.
+	if announced(200 * time.Millisecond) {
+		t.Fatal("the cancelled connect announced `pairing.success` for an account it did not record")
 	}
 }

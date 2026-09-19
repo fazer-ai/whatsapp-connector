@@ -42,13 +42,15 @@ func TestPairingByCodeIsRememberedLikeAnyOtherConnect(t *testing.T) {
 	// stopped working. It is also what gives this assertion something to read: `Wanted`
 	// joins the desired row with the pairing, so on a session that never paired it answers
 	// empty however the row reads.
-	send := func(id string, kind protocol.CommandType, payload string) {
+	send := func(id string, kind protocol.CommandType, payload string) protocol.Reply {
 		t.Helper()
 		h.manager.Dispatch(delivery(&protocol.Command{
 			V: protocol.Version, ID: id, Type: kind, SID: "s1", ReplyTo: id,
 			Payload: json.RawMessage(payload),
 		}, &atomic.Bool{}))
 		waitFor(t, "a reply to "+id, func() bool { _, ok := h.recorder.reply(id); return ok })
+		reply, _ := h.recorder.reply(id)
+		return reply
 	}
 	send("c1", protocol.CommandSessionConnect, `{"pairing":"qr","groups":true,"calls":{"auto_reject":true}}`)
 	send("d1", protocol.CommandSessionDisconnect, `{}`)
@@ -57,7 +59,13 @@ func TestPairingByCodeIsRememberedLikeAnyOtherConnect(t *testing.T) {
 			"would bring back %v (err=%v), want nothing, or the assertion below cannot fail.", seeded, err)
 	}
 
-	send("p1", protocol.CommandPairingRequestCode, `{"phone":"5511999990001"}`)
+	// The reply is asserted and not just waited for, because a command that failed is
+	// answered too: without this the test passed against an engine that refused the
+	// command outright, and what it was measuring was a row written before the refusal.
+	if reply := send("p1", protocol.CommandPairingRequestCode, `{"phone":"5511999990001"}`); !reply.OK {
+		t.Fatalf("the pairing code request failed (%+v), so the row read below would say nothing "+
+			"about what a successful one leaves behind", reply.Error)
+	}
 
 	wanted, err := container.Wanted(ctx)
 	if err != nil {
@@ -76,5 +84,56 @@ func TestPairingByCodeIsRememberedLikeAnyOtherConnect(t *testing.T) {
 			"account comes back acknowledging group traffic it publishes nowhere, and ringing on a "+
 			"phone whose operator had asked for the opposite.",
 			wanted[0].Groups, wanted[0].CallAutoReject)
+	}
+}
+
+// A pairing code request the connector refuses leaves the account as the operator left it.
+//
+// The mirror of the test above, and the reason the write waits for the engine there. This
+// command carries a phone number and nothing else, so a number that is not one -- a field
+// cleared down to the brackets the interface put in it -- is refused, and a refusal that
+// had already recorded `connected` would have the next sweep dial an account whose client
+// asked for nothing of the sort and whose operator had turned it off.
+func TestAPairingCodeRequestThatFailedBringsNothingBack(t *testing.T) {
+	t.Parallel()
+
+	container := openStore(t)
+	h := newHarnessWithStore(t, container)
+	ctx := context.Background()
+
+	if _, err := h.manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	send := func(id string, kind protocol.CommandType, payload string) protocol.Reply {
+		t.Helper()
+		h.manager.Dispatch(delivery(&protocol.Command{
+			V: protocol.Version, ID: id, Type: kind, SID: "s1", ReplyTo: id,
+			Payload: json.RawMessage(payload),
+		}, &atomic.Bool{}))
+		waitFor(t, "a reply to "+id, func() bool { _, ok := h.recorder.reply(id); return ok })
+		reply, _ := h.recorder.reply(id)
+		return reply
+	}
+	send("c1", protocol.CommandSessionConnect, `{"pairing":"qr","groups":true}`)
+	send("d1", protocol.CommandSessionDisconnect, `{}`)
+
+	if reply := send("p1", protocol.CommandPairingRequestCode, `{"phone":"+ ()-"}`); reply.OK {
+		t.Fatal("a pairing code was requested for a phone number with no digits in it and the " +
+			"connector accepted it")
+	}
+
+	var desired string
+	if err := container.DB().QueryRowContext(ctx,
+		`SELECT desired FROM wac_session_desired WHERE sid = 's1'`).Scan(&desired); err != nil {
+		t.Fatalf("read the desired state back: %v", err)
+	}
+	if desired != "disconnected" {
+		t.Fatalf("after a pairing code request was refused, s1 reads %q, want %q.\n"+
+			"The operator turned this account off and the connector refused to turn it back on, "+
+			"so the only thing that may be written here is what the operator asked for.",
+			desired, "disconnected")
+	}
+	if wanted, err := container.Wanted(ctx); err != nil || len(wanted) != 0 {
+		t.Fatalf("the sweep would bring back %v (err=%v) after a request that failed", wanted, err)
 	}
 }
