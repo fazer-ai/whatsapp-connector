@@ -628,7 +628,7 @@ func (s *Session) intentFailure(ctx context.Context, expired, err error, attempt
 		// Not a ceiling at all: the store answered, and what it answered was a failure.
 		return contactFailure(err, "group creation")
 	}
-	s.log.Error().Err(err).Str("sid", s.sid).Str("attempt", attempt).
+	s.log.Error().Err(err).Str("attempt", attempt).
 		Dur("store_limit", s.storeLimit).
 		Msg("the store did not answer in time to record a group creation; refused before anything was asked of WhatsApp")
 	return protocol.NewError(protocol.ErrorInternal,

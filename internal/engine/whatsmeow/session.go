@@ -93,9 +93,10 @@ type Session struct {
 
 	// storeLimit bounds a single store call before whatever is waiting on it can go on:
 	// an event handler before it publishes what the event was, and a command before it
-	// answers. It was written for the first alone, and by #284 that was two call sites
-	// out of date -- `contact.go` reads under it for a command, and a group creation now
-	// writes under it twice.
+	// answers. It was written for the first alone, and had stopped being only that before
+	// #284 touched it -- `contact.go` reads under it for a command, and a group creation
+	// now writes under it as well. Counting the call sites here would be a number nothing
+	// checks, which is the shape this repository has got wrong twice.
 	//
 	// What it does not bound is every way a store can be slow. On SQLite a write already
 	// blocked on another writer of the same file waits out the DSN's `busy_timeout`

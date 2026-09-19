@@ -42,6 +42,41 @@ func TestTheContractSaysWhatAClientDoesWithNotSettled(t *testing.T) {
 		t.Fatal("contract/PROTOCOL.md has no paragraph about `not_settled`: a client that never reads the word cannot branch on it")
 	}
 
+	// #284 wrote "Two things leave it that way" over a list of two, and nothing read the
+	// number. This repository has already shipped that defect twice -- "Four of these"
+	// surviving a list that had come down to three, and a count of the unbounded waits
+	// that was two when there were three -- so the count is compared against the causes
+	// rather than trusted.
+	//
+	// The first version of this check held a map of words and skipped anything outside it,
+	// which left the exact swap the verifier measured, "Seven", passing green. So the
+	// sentence is matched first and the word looked up second: a count this cannot read is
+	// a count nothing can check, and that fails too.
+	counted := regexp.MustCompile(`\b([A-Za-z]+|\d+) things? leaves? it that way`)
+	if said := counted.FindStringSubmatch(paragraph); said != nil {
+		words := map[string]int{"One": 1, "Two": 2, "Three": 3, "Four": 4, "Five": 5, "Six": 6}
+		named := 0
+		for _, cause := range []string{
+			"process can die between the two",
+			"ceiling on that write can run out",
+		} {
+			if strings.Contains(paragraph, cause) {
+				named++
+			}
+		}
+		switch value, known := words[said[1]]; {
+		case !known:
+			t.Errorf("the `not_settled` paragraph counts the causes as %q, which this test cannot "+
+				"read: a number nothing compares against the list is the shape that has already "+
+				"gone stale twice in this repository", said[1])
+		case value != named:
+			t.Errorf("the `not_settled` paragraph says %q while it names %d of the causes this "+
+				"test knows about: a number written as a word does not move when the list under "+
+				"it does, and a client counting reasons it cannot see is worse off than one told "+
+				"none", said[0], named)
+		}
+	}
+
 	for _, clause := range []struct {
 		phrase string
 		why    string

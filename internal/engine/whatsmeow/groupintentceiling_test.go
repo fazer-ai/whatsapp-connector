@@ -1,10 +1,12 @@
 package whatsmeow
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -49,6 +51,15 @@ func stalledStore(t *testing.T) (*store.Container, *Session) {
 func sessionOnStore(t *testing.T, container *store.Container, phone string) *Session {
 	t.Helper()
 
+	return sessionLogging(t, container, phone, zerolog.Nop())
+}
+
+// sessionLogging is the same with a logger a test can read back.
+//
+//nolint:gocritic // zerolog.Logger is designed to be copied; every With() returns one by value
+func sessionLogging(t *testing.T, container *store.Container, phone string, log zerolog.Logger) *Session {
+	t.Helper()
+
 	sid := "sid-" + t.Name()
 	scoped := container.For(sid)
 	device, err := scoped.Device(t.Context())
@@ -71,7 +82,7 @@ func sessionOnStore(t *testing.T, container *store.Container, phone string) *Ses
 		t.Fatalf("Bind: %v", err)
 	}
 	session := newSession(t.Context(), sid, wm.NewClient(device, nil), scoped, MediaOptions{}, nil,
-		zerolog.Nop(), newLibraryLogger(zerolog.Nop(), sid))
+		log, newLibraryLogger(zerolog.Nop(), sid))
 	t.Cleanup(func() { _ = session.Close() })
 	return session
 }
@@ -398,4 +409,69 @@ func TestTheCeilingIsNamedEvenWhenTheDriverSwallowsTheCause(t *testing.T) {
 			"own ceiling: reading the driver's error instead of the context is how that happens, "+
 			"and `lib/pq` reports a cancelled statement as an error wrapping nothing", message)
 	}
+}
+
+// The log line is half of what separates the two causes for an operator, and until #291
+// wraps the cause it is the only half that carries the ceiling's own number. Nothing read
+// it: deleting it left the package green, which the verifier measured before this was
+// written, so a delivery that claims an operator can tell the causes apart was resting on
+// a line no test would miss.
+func TestTheRefusedCreationLogsWhichCeilingFired(t *testing.T) {
+	t.Parallel()
+
+	container, err := store.OpenWith(t.Context(), storetest.New(t).URL, store.AlwaysOwned,
+		zerolog.Nop(), store.Options{MaxConns: 1})
+	if err != nil {
+		t.Fatalf("Open the store: %v", err)
+	}
+	t.Cleanup(func() { _ = container.Close() })
+
+	var written safeBuffer
+	session := sessionLogging(t, container, "5511999990001", zerolog.New(&written))
+	session.setConnected(true)
+	session.storeLimit = 200 * time.Millisecond
+	session.createTheGroup = func(context.Context, *wm.Client, keyedCreate) (*waTypes.GroupInfo, error) {
+		return nil, errors.New("WhatsApp should not have been asked")
+	}
+	hold(t, container)
+
+	if err := answerWithin(context.Background(), t, session, namedCreate("c1", "once", aCreate),
+		30*time.Second); err == nil {
+		t.Fatal("the creation answered as though the intent had been written")
+	}
+
+	logged := written.String()
+	for _, want := range []string{
+		// What happened, in words an operator can grep for.
+		"the store did not answer in time to record a group creation",
+		// And that nothing was asked of WhatsApp, which is what says a retry is safe.
+		"refused before anything was asked of WhatsApp",
+		// The ceiling's own number, which is what tells this apart from the caller's
+		// clock without reading two timestamps.
+		`"store_limit":200`,
+	} {
+		if !strings.Contains(logged, want) {
+			t.Errorf("the refusal logged %q, which never says %q: without it an operator "+
+				"separates this connector's ceiling from the caller's only by subtracting "+
+				"one log line's timestamp from another", logged, want)
+		}
+	}
+}
+
+// safeBuffer is a bytes.Buffer a test can read while a session goroutine writes to it.
+type safeBuffer struct {
+	mu      sync.Mutex
+	written bytes.Buffer
+}
+
+func (b *safeBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.written.Write(p)
+}
+
+func (b *safeBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.written.String()
 }
