@@ -167,7 +167,7 @@ func (s *Session) putOnTheWire(
 	// down: `handOver` replaces `overSocket` whole, so a ceiling built in there is one no
 	// test that uses the seam can see. #283 is about a wait nothing ends, and a fence
 	// nothing can observe would be the same defect wearing a fix.
-	wire, giveUp := context.WithTimeout(ctx, sendCeiling)
+	wire, giveUp := context.WithTimeout(ctx, s.wireLimit)
 	defer giveUp()
 
 	hand := s.handOver
@@ -176,9 +176,38 @@ func (s *Session) putOnTheWire(
 	}
 	sent, err := hand(wire, to, messageID, message)
 	if err != nil {
-		return wm.SendResponse{}, sendFailure(err)
+		return wm.SendResponse{}, sendFailure(whichClockRanOut(ctx, wire, err))
 	}
 	return sent, nil
+}
+
+// whichClockRanOut names the clock that ended a send, and it has to happen here because
+// here is the only place both of them are in hand.
+//
+// Three clocks can end one send and two of them are this connector's: the caller's own
+// `deadline` or `max_runtime_ms`, and `wireLimit` above. Those two produce the same
+// `context.DeadlineExceeded` -- not an equal value, the same one -- so nothing further
+// down can tell them apart, and #291 is about an operator who had to subtract two
+// timestamps by hand to find out which. The third is the library's own answer running
+// out, which does arrive as its own sentinel and needs nothing from this.
+//
+// Read in that order for the reason #284 found the hard way: a derived context that has
+// expired says nothing about whether the one it was derived from expired first. The
+// caller's is asked about first because when both have run out the caller's is the one
+// that decided, `wire` having inherited its deadline.
+func whichClockRanOut(caller, wire context.Context, err error) error {
+	if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+		return err
+	}
+	switch {
+	case caller.Err() != nil:
+		return fmt.Errorf("the command's own context ended this send: %w", err)
+	case wire.Err() != nil:
+		return fmt.Errorf("this connector's ceiling on one send ended it: %w", err)
+	}
+	// Neither of ours, so the library reached a deadline of its own inside a context that
+	// is still live. Left as it came: it already says which.
+	return err
 }
 
 // sendCeiling is how long this connector lets one send run, and it exists because
@@ -386,9 +415,9 @@ const noLIDForNumber = "no LID found for"
 func sendFailure(err error) error {
 	switch {
 	case errors.Is(err, wm.ErrNotLoggedIn):
-		return protocol.NewError(protocol.ErrorNotPaired, "the session has no WhatsApp account to send from")
+		return because(protocol.ErrorNotPaired, "the session has no WhatsApp account to send from", err)
 	case errors.Is(err, wm.ErrNotConnected):
-		return protocol.NewError(protocol.ErrorNotConnected, "the session is not connected to WhatsApp")
+		return because(protocol.ErrorNotConnected, "the session is not connected to WhatsApp", err)
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled),
 		errors.Is(err, wm.ErrMessageTimedOut), errors.Is(err, wm.ErrIQTimedOut):
 		// The message may well have gone out: what ran out is the answer, not the send,
@@ -396,7 +425,7 @@ func sendFailure(err error) error {
 		// the caller retry under the same id, which is the one retry that cannot
 		// duplicate anything. A refusal here would have it give up on a message that is
 		// already in somebody's chat.
-		return protocol.NewError(protocol.ErrorTimeout, "WhatsApp did not answer whether the message went out")
+		return because(protocol.ErrorTimeout, "WhatsApp did not answer whether the message went out", err)
 	case strings.Contains(err.Error(), noLIDForNumber):
 		// whatsmeow sends every direct message under a LID, and looks one up for a
 		// number that does not have it cached. A number nobody has registered has none
@@ -405,18 +434,40 @@ func sendFailure(err error) error {
 		// receive anything. Matched on the text because the library builds it with
 		// fmt.Errorf and there is no sentinel to compare against; a wording change on
 		// their side puts this back to where it is without one.
-		return protocol.NewError(protocol.ErrorRecipientNotOnWhatsapp,
-			"that number is not on WhatsApp")
+		return because(protocol.ErrorRecipientNotOnWhatsapp,
+			"that number is not on WhatsApp", err)
 	case errors.Is(err, wm.ErrBroadcastListUnsupported):
 		// The library's own limit, not WhatsApp's, and the codes mean different things
 		// to a caller: a refusal is worth trying again and a limit never is. Reported as
 		// the former, a client retries a broadcast list for as long as it keeps the
 		// message.
-		return protocol.NewError(protocol.ErrorUnsupported,
-			"this connector cannot send to a broadcast list yet")
+		return because(protocol.ErrorUnsupported,
+			"this connector cannot send to a broadcast list yet", err)
 	case errors.Is(err, wm.ErrUnknownServer), errors.Is(err, wm.ErrRecipientADJID):
-		return protocol.NewError(protocol.ErrorInvalidPayload, "that is not an address a message can be sent to")
+		return because(protocol.ErrorInvalidPayload, "that is not an address a message can be sent to", err)
 	default:
-		return protocol.NewError(protocol.ErrorWaError, "WhatsApp refused the message")
+		return because(protocol.ErrorWaError, "WhatsApp refused the message", err)
 	}
+}
+
+// because is the code a client branches on, carrying what actually happened for the one
+// reader who is allowed to see it.
+//
+// The wire is unchanged and deliberately so: the `*protocol.Error` is what `errors.As`
+// finds, what `asProtocolError` returns and what gets marshalled, so the frame is the
+// same bytes it has always been. What changes is `Error()`, and that is the whole point.
+// `logFailure` is by its own doc "the only place a command's real error is written down",
+// and it writes the failure through `zerolog`'s `Err`, which prints `Error()` and reads
+// nothing else -- no `Unwrap`, no field. Giving `protocol.Error` a cause it does not
+// print would have left that line byte for byte as it was, which is #291 unfixed with
+// `errors.Is` passing over it; measured rather than reasoned about, in the round that
+// wrote this.
+//
+// Two `%w`, so the chain carries both: the code for `errors.As` and the cause for
+// `errors.Is`. The reach of that second half is this function's callers and no further,
+// which is why the cause lives here rather than in `protocol.Error`, where every producer
+// in the repository would have gained one at once and all fourteen sites that ask
+// `errors.Is(err, context.DeadlineExceeded)` would have had to be re-read.
+func because(code protocol.ErrorCode, message string, cause error) error {
+	return fmt.Errorf("%w: %w", protocol.NewError(code, message), cause)
 }

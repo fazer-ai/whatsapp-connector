@@ -106,6 +106,16 @@ type Session struct {
 	// nothing else changes it.
 	storeLimit time.Duration
 
+	// wireLimit is `sendCeiling`, and it is a field for one reason: the ceiling is ten
+	// minutes, and a test that needs it to have run out cannot wait ten minutes. Nothing
+	// in production sets it, exactly as with storeLimit above.
+	//
+	// It carries its own weight beyond that. Which of the two clocks over a send ended it
+	// is decided by asking which context expired (`whichClockRanOut`, `send.go`), and the
+	// case where this one expired while the caller's is still live is not reachable at
+	// all without shortening it.
+	wireLimit time.Duration
+
 	// deliverWait bounds how long an inbound message waits to hear that its event was
 	// published. A field for the same reason as storeLimit, and for no other.
 	deliverWait time.Duration
@@ -737,6 +747,7 @@ func newSession(
 		blobBase:  blobs.BaseURL,
 
 		storeLimit:  bindTimeout,
+		wireLimit:   sendCeiling,
 		deliverWait: deliverTimeout,
 		createWait:  createNoticeWait,
 		handoffWait: perishableHandoff,
