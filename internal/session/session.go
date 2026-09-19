@@ -1331,27 +1331,30 @@ func (s *Session) lifecycle(ctx context.Context, command *protocol.Command) (jso
 		// instance running it goes away and is never brought back: the #266 defect,
 		// through the one door that does not carry a request.
 		//
-		// After the engine, which is the opposite of the connect branch above, and the
-		// reason is what the two commands leave behind in the window between the call and
-		// the write. A connect can be open by the time it returns, so a record written
-		// afterwards is a record missing whenever the instance died mid-connect. This one
-		// cannot: the pairing it starts lands when the operator types the code into their
-		// phone, strictly later than the call, so an instance that dies in this window
-		// leaves nothing paired and nothing to resume. What waiting buys is the refusals
-		// -- a phone number with no digits in it, an engine that does not serve the
-		// command at all -- which recorded would have the sweep bring back an account on
-		// the strength of a request that was never carried out.
-		//
+		// Refused first, recorded second, engine third -- the connect branch's order, and
+		// for the connect branch's reasons. Waiting for the engine's answer instead was
+		// tried and is wrong: on an account that is already paired, `pairWithCode` resumes
+		// rather than pairing, and a resume whose deadline expires answers an error while
+		// the socket carries on opening underneath. Recording only on success loses
+		// exactly that account -- up, and with nothing anywhere saying so.
+		var body struct {
+			Phone string `json:"phone"`
+		}
+		if err := json.Unmarshal(command.Payload, &body); err != nil {
+			return nil, protocol.NewError(protocol.ErrorInvalidPayload, "the pairing request could not be read")
+		}
+		// Only the phone, because it is the only part of this command that can be wrong:
+		// the subscription is not in it, it is the standing one, and it arrived through a
+		// connect that was validated when it did.
+		if err := (engine.ConnectRequest{Pairing: "code", Phone: body.Phone}).Validate(); err != nil {
+			return nil, err
+		}
 		// What it records is what the last connect asked for, because that is what an
 		// engine carries into the connect it builds: this command names a phone number
 		// and nothing else, and a record that reset the subscription would have the
 		// account come back deaf to the group traffic its client had asked for.
-		result, err := s.engine.Execute(ctx, command)
-		if err != nil {
-			return nil, err
-		}
 		s.recordWanted(ctx)
-		return result, nil
+		return s.engine.Execute(ctx, command)
 	default:
 		return s.engine.Execute(ctx, command)
 	}

@@ -3,6 +3,7 @@ package session_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"sync/atomic"
 	"testing"
 
@@ -135,5 +136,76 @@ func TestAPairingCodeRequestThatFailedBringsNothingBack(t *testing.T) {
 	}
 	if wanted, err := container.Wanted(ctx); err != nil || len(wanted) != 0 {
 		t.Fatalf("the sweep would bring back %v (err=%v) after a request that failed", wanted, err)
+	}
+}
+
+// A pairing code request the engine refused is remembered all the same.
+//
+// The other side of the test above, and the pair of them is what pins the ordering. This
+// one is the case that sent the write back in front of the engine after a round where it
+// waited for the answer: on an account that is already paired, `pairWithCode` resumes
+// rather than pairing, and a resume whose deadline expires answers an error while the
+// socket carries on opening underneath it. Recorded only on success, that account is up
+// with `desired = 'disconnected'` on it, and the next instance leaves it down -- #266
+// again, in the window a command's ceiling opens.
+//
+// So the rule is the connect's: what the connector refuses by construction is refused
+// before the record, and what an engine refuses for its own reasons is recorded anyway,
+// because a later attempt may well get through and `cluster.Quarantine` is what stops one
+// that never will from being retried for ever.
+func TestAPairingCodeRequestTheEngineRefusedIsStillRemembered(t *testing.T) {
+	t.Parallel()
+
+	container := openStore(t)
+	h := newHarnessWithStore(t, container)
+	ctx := context.Background()
+
+	if _, err := h.manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	send := func(id string, kind protocol.CommandType, payload string) protocol.Reply {
+		t.Helper()
+		h.manager.Dispatch(delivery(&protocol.Command{
+			V: protocol.Version, ID: id, Type: kind, SID: "s1", ReplyTo: id,
+			Payload: json.RawMessage(payload),
+		}, &atomic.Bool{}))
+		waitFor(t, "a reply to "+id, func() bool { _, ok := h.recorder.reply(id); return ok })
+		reply, _ := h.recorder.reply(id)
+		return reply
+	}
+	send("c1", protocol.CommandSessionConnect, `{"pairing":"qr","groups":true}`)
+	send("d1", protocol.CommandSessionDisconnect, `{}`)
+	if seeded, err := container.Wanted(ctx); err != nil || len(seeded) != 0 {
+		t.Fatalf("the given is not what this test needs: the sweep would already bring back %v "+
+			"(err=%v) before the command under test ran", seeded, err)
+	}
+
+	// The engine answers an error and the socket opens anyway, which is what a resume
+	// whose ceiling ran out does: `dial` returns `ctx.Err()` and says so in as many words,
+	// and the connect it gave up waiting for carries on.
+	session, ok := h.engine.Session("s1")
+	if !ok {
+		t.Fatal("the fake never handed out a session for s1")
+	}
+	session.FailConnect(errors.New("the ceiling ran out while the socket was coming up"))
+
+	if reply := send("p1", protocol.CommandPairingRequestCode, `{"phone":"5511999990001"}`); reply.OK {
+		t.Fatal("the engine refused the pairing code request and the client was told it worked")
+	}
+
+	wanted, err := container.Wanted(ctx)
+	if err != nil {
+		t.Fatalf("Wanted: %v", err)
+	}
+	if len(wanted) != 1 || wanted[0].SID != "s1" {
+		t.Fatalf("after a pairing code request the engine refused, the sweep would bring back %v, "+
+			"want just s1.\n"+
+			"An engine that answers an error has not necessarily done nothing: a resume that ran "+
+			"out of ceiling answers one and keeps connecting. Recorded only on success, that "+
+			"account is in the air with nothing anywhere saying it should be, and the instance "+
+			"after this one leaves it down.", wanted)
+	}
+	if !wanted[0].Groups {
+		t.Fatalf("the row carries groups=%v, want the standing subscription", wanted[0].Groups)
 	}
 }
