@@ -52,7 +52,30 @@ func TestTheContractSaysWhatAClientDoesWithNotSettled(t *testing.T) {
 	// which left the exact swap the verifier measured, "Seven", passing green. So the
 	// sentence is matched first and the word looked up second: a count this cannot read is
 	// a count nothing can check, and that fails too.
-	counted := regexp.MustCompile(`\b([A-Za-z]+|\d+) things? leaves? it that way`)
+	//
+	// The anchor is "leave it that way", the count has to open the sentence, and a few
+	// words are allowed between them, so the noun and the verb can be rewritten without
+	// the count escaping. Measured with the count made wrong at the same time, which is
+	// the only way to tell a hole from a sentence that is simply still correct: "Seven
+	// things can leave it that way", "Seven of them leave it that way" and "Seven ways
+	// leave it that way" all go red. Requiring the sentence to open with it is what stops
+	// the opposite mistake -- without that, "and both leave it that way" was read as a
+	// count of "and" and failed a paragraph that counts nothing.
+	//
+	// Three things this does not reach, measured rather than guessed:
+	//
+	//   - a rewrite that replaces the anchor. "There are seven ways in" and "Seven things
+	//     leave it so" both pass. No fence matching text survives its own anchor being
+	//     rewritten, and widening far enough to try starts firing on prose counting
+	//     something else;
+	//   - a count that grows. `named` comes from the list of cause phrases written below,
+	//     so a third cause added to the paragraph and not to that list is invisible and
+	//     the count stops moving with it. This catches the number ageing downwards, a
+	//     cause deleted under an unchanged count, and not upwards -- which is the
+	//     direction "Four of these" aged in. Counting from a list is one-directional by
+	//     construction and saying so is the honest half of it;
+	//   - anything outside this paragraph.
+	counted := regexp.MustCompile(`(?:^|\. )([A-Za-z]+|\d+)(?: \w+){0,3} leaves? it that way`)
 	if said := counted.FindStringSubmatch(paragraph); said != nil {
 		words := map[string]int{"One": 1, "Two": 2, "Three": 3, "Four": 4, "Five": 5, "Six": 6}
 		named := 0
