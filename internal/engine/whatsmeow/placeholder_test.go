@@ -243,8 +243,8 @@ func TestForgettingASessionTakesThePlaceholdersItWasHolding(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("PutPlaceholder: %v", err)
 	}
-	if err := container.For(session.sid).Forget(t.Context()); err != nil {
-		t.Fatalf("Forget: %v", err)
+	if err := container.For(session.sid).ForgetCredentialsAndDesired(t.Context()); err != nil {
+		t.Fatalf("ForgetCredentialsAndDesired: %v", err)
 	}
 	if held := placeholdersOf(t, container, session.sid); len(held) != 0 {
 		t.Fatalf("%d placeholder(s) outlived the pairing they were held for", len(held))

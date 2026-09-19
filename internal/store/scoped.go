@@ -70,12 +70,37 @@ func (s *Scoped) Bind(ctx context.Context, jid types.JID) error {
 	return s.container.bind(ctx, s.sid, jid)
 }
 
-// Forget deletes this session's device and the mapping to it.
-func (s *Scoped) Forget(ctx context.Context) error {
+// ForgetCredentials deletes this session's device and the mapping to it, and leaves what
+// its client asked for standing.
+//
+// For the caller repairing a session rather than ending one: the device is unusable and a
+// replacement has to be built, which cannot happen while the old row is still there, but
+// the client's request is untouched and the session should come back.
+//
+// There is deliberately no door that does this without saying which of the two it means.
+// The pair replaced a single `Forget` that always did both, and the call that wanted only
+// half of it was the one being written when #266 was fixed: a session layer that records
+// the request and then calls into an engine that drops it has built the defect it was
+// closing. A name that answers the question at the call site is the only thing that stops
+// the next caller getting it by accident; the fence over `PutDesired*` is what catches the
+// one after that.
+func (s *Scoped) ForgetCredentials(ctx context.Context) error {
 	if err := s.fence.held(); err != nil {
 		return err
 	}
-	return s.container.forget(ctx, s.sid)
+	return s.container.forget(ctx, s.sid, false)
+}
+
+// ForgetCredentialsAndDesired does the same and also forgets what the client asked for.
+//
+// For the caller ending a session: a logout, a delete, or an account WhatsApp has taken
+// away. Leaving the request behind would have the resume sweep bringing back an account
+// whose credentials this very call is deleting, every pass, for as long as the row lives.
+func (s *Scoped) ForgetCredentialsAndDesired(ctx context.Context) error {
+	if err := s.fence.held(); err != nil {
+		return err
+	}
+	return s.container.forget(ctx, s.sid, true)
 }
 
 // JID is the device this session paired, if it has paired.

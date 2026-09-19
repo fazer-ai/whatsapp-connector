@@ -9,6 +9,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
@@ -217,6 +219,56 @@ type ConnectRequest struct {
 	HistorySync bool `json:"history_sync,omitempty"`
 	// Calls is the call half of `session.connect`.
 	Calls *CallsRequest `json:"calls,omitempty"`
+}
+
+// Validate answers the part of a connect this connector refuses whichever engine is
+// running, and it is asked above the engines for two reasons that are the same reason.
+//
+// The first is that the answer has to be one answer. `unsupported` for a proxy is a fact
+// about this build, not about an engine, and two engines that spelled it differently
+// would have a client's error code depend on which one a deployment happens to run.
+//
+// The second is the ordering #266 left behind. What a client asked for is recorded before
+// the engine is called, so that an instance dying inside a connect leaves the account
+// resumable; a request refused after that point would be recorded all the same, and the
+// sweep would repeat it for ever against a build that refuses it by construction. For the
+// proxy that is worse than useless: the connect a sweep synthesises carries no proxy at
+// all, so the account would come back dialling WhatsApp directly, which is exactly the
+// deployment address the refusal exists to keep off the wire.
+//
+// What is deliberately not here: whether a session is closed, and whether it has a device
+// it can use. Those are an engine's own state rather than the shape of the request, they
+// do not give the same answer twice, and a connect refused for one of them is one a later
+// sweep may well get through -- so it is recorded, and `cluster.Quarantine` is what stops
+// an account that fails for ever from being asked for for ever.
+func (r ConnectRequest) Validate() error {
+	if r.Proxy != nil && r.Proxy.URL != "" {
+		// Decoding it is not honouring it. Connecting directly for a deployment that
+		// asked for egress routing puts its own address on the wire, and does it
+		// silently; per-session proxies are M5.
+		return protocol.NewError(protocol.ErrorUnsupported,
+			"this connector does not route a session through a proxy yet")
+	}
+	// Same rule as the proxy, and for the same reason: this asks the connector to do
+	// something, and a build that does not do it answers `open` to a client that will
+	// then wait for a backlog to arrive and never find out it was never going to happen.
+	// `groups` and `calls` are not on this list because they are honoured.
+	if r.HistorySync {
+		return protocol.NewError(protocol.ErrorUnsupported,
+			"this connector does not import the phone's history yet")
+	}
+	if r.Pairing != "resume" && r.Pairing != "qr" && r.Pairing != "code" {
+		return protocol.NewError(protocol.ErrorInvalidPayload,
+			fmt.Sprintf("%q is not a pairing mode this connector knows", r.Pairing))
+	}
+	// Digits rather than emptiness, because a phone the operator typed carries spaces,
+	// dashes and brackets and none of them are the number: a string of punctuation is as
+	// unpairable as no string at all, and refusing it here is refusing it before the
+	// session has changed.
+	if r.Pairing == "code" && !strings.ContainsFunc(r.Phone, func(c rune) bool { return c >= '0' && c <= '9' }) {
+		return protocol.NewError(protocol.ErrorInvalidPayload, "code pairing needs the phone number to pair")
+	}
+	return nil
 }
 
 // CallsRequest is what a session asks the connector to do about incoming calls.

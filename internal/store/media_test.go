@@ -241,8 +241,8 @@ func TestForgettingASessionTakesWhatWasKeptToFetchItsFiles(t *testing.T) {
 		}
 	}
 
-	if err := container.For("sid-1").Forget(t.Context()); err != nil {
-		t.Fatalf("Forget: %v", err)
+	if err := container.For("sid-1").ForgetCredentialsAndDesired(t.Context()); err != nil {
+		t.Fatalf("ForgetCredentialsAndDesired: %v", err)
 	}
 	if _, found, _ := container.For("sid-1").MediaPart(t.Context(), "3EB0KEEP"); found {
 		t.Fatal("unpairing left the keys to the session's files behind")
@@ -265,8 +265,8 @@ func TestAWriteThatOutlivesTheSessionItBelongsToIsRefused(t *testing.T) {
 	if err := container.For(part.SID).PutMediaPart(t.Context(), &part, storedAt); err != nil {
 		t.Fatalf("PutMediaPart: %v", err)
 	}
-	if err := container.For("sid-1").Forget(t.Context()); err != nil {
-		t.Fatalf("Forget: %v", err)
+	if err := container.For("sid-1").ForgetCredentialsAndDesired(t.Context()); err != nil {
+		t.Fatalf("ForgetCredentialsAndDesired: %v", err)
 	}
 
 	later := samplePart("sid-1", "3EB0LATE")

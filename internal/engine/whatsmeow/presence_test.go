@@ -1656,8 +1656,8 @@ func TestAPresenceThatCouldNotBeRecordedIsNotReportedAsSet(t *testing.T) {
 	// thing the record cannot hang off: the foreign key refuses it, and nothing else
 	// about the send is different. Through Forget rather than by deleting the row, so
 	// what the test arranges is a state the code actually produces.
-	if err := container.For(session.sid).Forget(t.Context()); err != nil {
-		t.Fatalf("Forget: %v", err)
+	if err := container.For(session.sid).ForgetCredentialsAndDesired(t.Context()); err != nil {
+		t.Fatalf("ForgetCredentialsAndDesired: %v", err)
 	}
 
 	if _, err := session.setPresence(t.Context(), presenceCommand("available")); err == nil {

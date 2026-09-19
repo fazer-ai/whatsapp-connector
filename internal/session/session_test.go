@@ -3453,9 +3453,18 @@ func TestACommandThatFailedSaysWhyInTheLog(t *testing.T) {
 	}{
 		// Answered over a reply key, which is the path that used to write nothing: only
 		// the fire-and-forget one published anything a person could read.
+		//
+		// A send on a session nobody connected, because what this case needs is an error
+		// the engine raised with no code on it -- that is what `internal` means here, and
+		// the sentence the caller gets back says nothing on purpose. It used to be a
+		// connect with a pairing mode nobody knows, and #266 took that away by answering
+		// it `invalid_payload` above the engine: the same refusal, now with a code a
+		// client can act on, under whichever engine the deployment runs.
 		{
 			name: "an internal error on an answered command", code: "internal", level: "error",
-			command: protocol.CommandSessionConnect, payload: `{"pairing":"neither"}`,
+			command: protocol.CommandMessageSend,
+			payload: `{"message_id":"3EB0ABCDEF","to":{"kind":"phone","id":"5511999990002"},` +
+				`"content":{"type":"text","body":"oi"}}`,
 		},
 		// The caller being told no, not a fault of this connector's.
 		{
