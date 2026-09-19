@@ -28,6 +28,12 @@ func event(sid, inst string, epoch, seq uint64) protocol.Event {
 	}
 }
 
+// moment is a fixed instant plus an offset, so a table can say "these two readings are
+// five seconds apart" without depending on when the test runs.
+func moment(after time.Duration) time.Time {
+	return time.Date(2026, 9, 19, 12, 0, 0, 0, time.UTC).Add(after)
+}
+
 func itoa(n uint64) string {
 	if n == 0 {
 		return "0"
@@ -75,16 +81,28 @@ func TestOneOwnerNoticesTwoInstancesUnderOneEpoch(t *testing.T) {
 			state:  "QUEBRADO",
 			says:   "depois de perder a lease",
 		},
-		"a frota somada roda mais sessoes do que existem sids": {
+		"a frota somada roda mais sessoes do que existem sids, e isso se sustenta": {
 			// The third half, and it is invisible to both of the others: every
 			// acquisition bumps the epoch, so two holders never share one and neither
 			// publishes out of order. Only the arithmetic sees it.
 			events: []protocol.Event{event("s1", "a", 1, 1), event("s1", "b", 2, 1)},
 			samples: []fleetSample{
-				{phase: "troca de dono", byInst: map[string]int{"a": 1, "b": 1}, total: 2},
+				{at: moment(0), phase: "troca de dono", byInst: map[string]int{"a": 1, "b": 1}, total: 2},
+				{at: moment(5 * time.Second), phase: "troca de dono", byInst: map[string]int{"a": 1, "b": 1}, total: 2},
 			},
 			state: "QUEBRADO",
 			says:  "mais de uma instancia ao mesmo tempo",
+		},
+		"a mesma sobra dentro de um tick nao e posse dupla": {
+			// The gauge is written once per heartbeat, so while ownership moves one
+			// instance can still be counting a session the next one already counts. Real
+			// in the numbers, false about the fleet, and gone by the next tick.
+			events: []protocol.Event{event("s1", "a", 1, 1), event("s1", "b", 2, 1)},
+			samples: []fleetSample{
+				{at: moment(0), phase: "troca de dono", byInst: map[string]int{"a": 1, "b": 1}, total: 2},
+				{at: moment(300 * time.Millisecond), phase: "troca de dono", byInst: map[string]int{"a": 1, "b": 1}, total: 2},
+			},
+			state: "AFIRMADO",
 		},
 	}
 	for name, tc := range tests {

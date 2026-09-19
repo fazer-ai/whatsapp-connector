@@ -141,11 +141,27 @@ func assertOneOwner(rep *report, published map[string][]protocol.Event,
 	// same account. What says otherwise is arithmetic: a fleet with N distinct sessions
 	// cannot have its instances add up to more than N.
 	top, taken := counted.worst()
-	if top.total > sids {
-		offenders = append(offenders, fmt.Sprintf(
-			"a frota inteira disse estar rodando %d sessoes, e so existem %d sids distintos nesta "+
-				"corrida, entao alguma sessao esta sendo rodada por mais de uma instancia ao mesmo "+
-				"tempo. O censo mais alto foi %s", top.total, sids, top))
+	above, sustained := counted.over(sids)
+	switch {
+	case sustained:
+		lines := make([]string, 0, len(above)+1)
+		lines = append(lines, fmt.Sprintf(
+			"a frota inteira disse estar rodando mais sessoes do que existem sids (%d distintos), e a "+
+				"sobra se manteve por mais de dois heartbeats, entao nao e o atraso do gauge: alguma "+
+				"sessao esta sendo rodada por mais de uma instancia ao mesmo tempo. Os %d censos acima "+
+				"do limite foram:", sids, len(above)))
+		for _, sample := range above {
+			lines = append(lines, "  "+sample.String())
+		}
+		offenders = append(offenders, strings.Join(lines, "\n"))
+	case len(above) > 0:
+		// Reported and not asserted on. A gauge written once a heartbeat can show one
+		// instance still counting a session the next one already counts, and that is a
+		// fact about when the numbers were written rather than about who owns the
+		// account.
+		rep.note(fmt.Sprintf("%d censo(s) da frota passaram de %d sessoes sem se sustentar por dois "+
+			"heartbeats, o que e o atraso esperado de um gauge escrito uma vez por tick e nao posse "+
+			"dupla. O mais alto foi %s", len(above), sids, top))
 	}
 
 	rep.assert(&assertion{

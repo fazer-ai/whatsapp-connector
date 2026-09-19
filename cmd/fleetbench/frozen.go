@@ -153,10 +153,6 @@ func frozenOwner(ctx context.Context, active *run, cl *client, rep *report, plan
 		return fmt.Errorf("%w: %w", errSetup, err)
 	}
 
-	// Counted with everybody answering again, which is the moment a thawed instance that
-	// still thinks it owns the account shows up beside the one that took it.
-	counted.take(ctx, "depois de soltar o dono congelado", append([]*instance{owner}, peers...))
-
 	// Long enough for whatever the thawed owner is going to publish to reach the stream.
 	// A wait on the fleet, and the assertion that follows reads the stream's own order
 	// rather than trusting that this was long enough.

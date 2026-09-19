@@ -63,6 +63,34 @@ func (c *census) take(ctx context.Context, phase string, live []*instance) {
 	c.samples = append(c.samples, sample)
 }
 
+// over returns every sample whose total went above `sids`, and whether that overshoot
+// lasted longer than a gauge can lag.
+//
+// The distinction is the whole difference between a reading and a verdict.
+// `wac_sessions_running` is written once per heartbeat, inside the same tick that renews
+// the leases, so while ownership is moving one instance can still be counting a session
+// the next one already counts. That overlap is real in the numbers and false about the
+// fleet, and it cannot outlive a tick.
+//
+// What cannot be explained that way is an overshoot still there a couple of ticks later:
+// by then every instance involved has written its gauge at least once, and they still add
+// up to more sessions than exist.
+func (c *census) over(sids int) (above []fleetSample, sustained bool) {
+	for _, sample := range c.samples {
+		if sample.total > sids {
+			above = append(above, sample)
+		}
+	}
+	for i := range above {
+		for j := i + 1; j < len(above); j++ {
+			if above[j].at.Sub(above[i].at) > 2*benchHeartbeat {
+				return above, true
+			}
+		}
+	}
+	return above, false
+}
+
 // worst returns the sample with the highest total, which is the one that decides the
 // claim, and the number of samples behind the answer.
 func (c *census) worst() (highest fleetSample, samples int) {
