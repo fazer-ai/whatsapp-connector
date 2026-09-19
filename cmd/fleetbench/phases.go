@@ -115,7 +115,7 @@ func measure(ctx context.Context, active *run, group *fleet, rep *report, plan b
 	}
 	rep.note(fmt.Sprintf("condicoes desta corrida: %d sessoes, %d shards, %d processos, %d comandos em voo "+
 		"por sessao na troca de dono, WAC_ENGINE=fake, WAC_HEARTBEAT=%s, WAC_LEASE_TTL=%s, "+
-		"WAC_CLAIM_MIN_IDLE=%s, WAC_DATABASE_MAX_CONNS=%d. O custo da adocao em massa e, antes de tudo, um WAC_LEASE_TTL: "+
+		"WAC_CLAIM_MIN_IDLE=%s, WAC_DATABASE_MAX_CONNS=%d, WAC_FAKE_RECEIPT_PER_SEND=1. O custo da adocao em massa e, antes de tudo, um WAC_LEASE_TTL: "+
 		"a lease do processo morto so vence depois dele.",
 		plan.sessions, plan.shards, plan.processes, plan.sends,
 		benchHeartbeat, benchLeaseTTL, benchClaimMinIdle, benchMaxConns))

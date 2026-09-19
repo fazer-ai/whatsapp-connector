@@ -172,6 +172,12 @@ func (r *run) connectorEnv(shards int) map[string]string {
 		// Pinned for the same reason, and because the issue asks for the pool reading to
 		// be about a cap: "4 connections" says nothing until it is 4 out of something.
 		"WAC_DATABASE_MAX_CONNS": strconv.Itoa(benchMaxConns),
+		// A session that publishes nothing while it runs is a session no assertion about
+		// the order of two publishers can be made over. MEASURED: without this, a run
+		// carrying 2304 commands produced 12 events, every one of them from an adoption,
+		// so the check that sees an old owner publishing after a new one had no event to
+		// see it in. The real engine publishes a receipt for every message it sends.
+		"WAC_FAKE_RECEIPT_PER_SEND": "1",
 	}
 }
 

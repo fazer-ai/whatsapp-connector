@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"os"
 	"sync"
 	"time"
 
@@ -538,8 +539,21 @@ func (s *Session) Execute(ctx context.Context, command *protocol.Command) (json.
 		if !connected {
 			return nil, errNotConnected
 		}
+		id := messageIDOf(command)
+		if receiptPerSend {
+			// A running session that publishes nothing is a session no assertion about
+			// ordering can be made over. The real engine publishes a receipt for every
+			// message it sends; this is that, and it is off unless asked for, so no
+			// existing test changes shape.
+			s.emit(protocol.EventMessageReceipt, map[string]any{
+				"chat":        map[string]any{"kind": "phone", "id": "5511999990002"},
+				"message_ids": []string{id},
+				"type":        "delivered",
+				"timestamp":   time.Now().UnixMilli(),
+			})
+		}
 		return marshal(map[string]any{
-			"message_id": messageIDOf(command),
+			"message_id": id,
 			"timestamp":  time.Now().UnixMilli(),
 			"client_ref": nil,
 		})
@@ -553,6 +567,17 @@ func (s *Session) Execute(ctx context.Context, command *protocol.Command) (json.
 		return nil, engine.ErrNotSupported
 	}
 }
+
+// receiptPerSend makes this engine publish a `message.receipt` for every message it is
+// asked to send, which the real engine does and this one did not.
+//
+// Read once, from the environment, and off unless asked for. It exists for the fleet bench
+// (`cmd/fleetbench`), which needs sessions that keep publishing while ownership moves: an
+// assertion about the order of two publishers cannot be made over a session that emits
+// nothing, and measured against this engine, a run with 2304 commands in it produced 12
+// events, all of them from adoptions. Off by default because every test in this repository
+// counts on the shapes this engine already had.
+var receiptPerSend = os.Getenv("WAC_FAKE_RECEIPT_PER_SEND") == "1"
 
 // Hold makes every later Execute wait before it does anything, until the returned
 // function is called or the command's context ends. It is how a test puts a command in
