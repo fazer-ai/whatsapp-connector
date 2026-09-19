@@ -205,6 +205,13 @@ func (s *Session) Connect(_ context.Context, req engine.ConnectRequest) error {
 	s.asked = req
 	failWith := s.failConnect
 	s.mu.Unlock()
+	// The same question the whatsmeow engine asks, asked the same way, because the answer
+	// a client gets must not depend on which engine a deployment runs: before #266 this
+	// engine refused an unknown pairing mode with a bare error, which reaches a client as
+	// `internal`, while the other one answered `invalid_payload` for the same request.
+	if err := req.Validate(); err != nil {
+		return err
+	}
 	if failWith != nil {
 		return failWith
 	}
@@ -212,12 +219,12 @@ func (s *Session) Connect(_ context.Context, req engine.ConnectRequest) error {
 	case "qr":
 		s.emit(protocol.EventPairingQR, map[string]any{"png_data_url": QRData, "expires_in_ms": 20000})
 	case "code":
-		if req.Phone == "" {
-			return errors.New("fake: code pairing needs a phone")
-		}
 		s.emit(protocol.EventPairingCode, map[string]any{"code": PairingCode, "phone": req.Phone})
 	case "resume":
 	default:
+		// Unreachable: `Validate` has already refused every mode but these three. Loud
+		// rather than silent all the same, because the silent version of this branch is a
+		// connect that answers `open` having done nothing at all.
 		return fmt.Errorf("fake: unknown pairing mode %q", req.Pairing)
 	}
 

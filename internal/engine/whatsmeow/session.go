@@ -1678,30 +1678,17 @@ func (s *Session) Connect(ctx context.Context, req engine.ConnectRequest) error 
 		return errors.New("whatsmeow: the session is closed")
 	}
 
-	if req.Proxy != nil && req.Proxy.URL != "" {
-		// Decoding it is not honouring it. Connecting directly for a deployment that
-		// asked for egress routing puts its own address on the wire, and does it
-		// silently; per-session proxies are M5.
-		return protocol.NewError(protocol.ErrorUnsupported,
-			"this connector does not route a session through a proxy yet")
-	}
-	// Same rule as the proxy, and for the same reason: this asks the connector to do
-	// something, and a build that does not do it answers `open` to a client that will
-	// then wait for a backlog to arrive and never find out it was never going to happen.
-	// `groups` and `calls` are not on this list because they are honoured.
-	if req.HistorySync {
-		return protocol.NewError(protocol.ErrorUnsupported,
-			"this connector does not import the phone's history yet")
-	}
-	if req.Pairing != "resume" && req.Pairing != "qr" && req.Pairing != "code" {
-		return protocol.NewError(protocol.ErrorInvalidPayload,
-			fmt.Sprintf("%q is not a pairing mode this connector knows", req.Pairing))
-	}
-	if req.Pairing == "code" && digitsOf(req.Phone) == "" {
-		// Checked here rather than only where it is used, because everything below this
-		// point changes the session, and a refusal that has already changed it is a
-		// command that failed and took effect.
-		return protocol.NewError(protocol.ErrorInvalidPayload, "code pairing needs the phone number to pair")
+	// The shape of the request is refused before anything below this line, because
+	// everything below it changes the session and a refusal that has already changed it
+	// is a command that failed and took effect. Asked of the request rather than spelled
+	// out here since #266: the session layer asks the same question before it records
+	// what the client wants, and a second spelling would be a second answer.
+	//
+	// Still asked here, and not left to that caller, because this engine reaches its own
+	// `Connect` from `requestCode`, with a request it built rather than one a client
+	// sent.
+	if err := req.Validate(); err != nil {
+		return err
 	}
 
 	// A pairing already in flight is the operator changing their mind, not an error: they
