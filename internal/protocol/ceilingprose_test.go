@@ -35,6 +35,23 @@ func TestTheContractSaysWhatBoundsACommandWithNoCeilingOfItsOwn(t *testing.T) {
 			"which #165 measured to be false: the library bounds every request it sends")
 	}
 
+	// Two sentences that counted the unbounded waits, and were wrong by one. The count of
+	// that shape has been wrong twice: the paragraph above already says the list is not
+	// claimed complete, and these two contradicted it two sentences later. They are asserted
+	// as absent rather than rewritten into a clause because any exhaustive phrasing of this
+	// is the defect, not this particular wording of it.
+	for _, gone := range []string{
+		"there are two of them on a send's way out",
+		"all of them but those two",
+	} {
+		if strings.Contains(prose, gone) {
+			t.Errorf("PROTOCOL.md says %q, which counts the waits no ceiling reaches and "+
+				"gets the count wrong: the socket read lock is a third, held for the length "+
+				"of a reconnection's dial. The paragraph above says the list is not claimed "+
+				"complete; this sentence claimed it two sentences later", gone)
+		}
+	}
+
 	// The whole ceiling section, from the sentence that introduces the two caller fields to
 	// the one telling a client to time the reply out itself. Starting at "neither field"
 	// was the first cut, and it left the sentence introducing the section outside the run,
@@ -45,6 +62,29 @@ func TestTheContractSaysWhatBoundsACommandWithNoCeilingOfItsOwn(t *testing.T) {
 			"the obligation this test is about is not stated anywhere a client reads")
 	}
 	found := strings.Join(paragraphs, "\n\n")
+
+	// The count in that lead is a word, and a word does not move when the list under it
+	// does. #285's fence was written after "Four of these" survived a list that had gone
+	// down to three, so this compares the two rather than trusting either.
+	countedCommands := map[string]int{"One": 1, "Two": 2, "Three": 3, "Four": 4, "Five": 5}
+	for word, want := range countedCommands {
+		if !strings.Contains(found, word+" commands now carry a ceiling") {
+			continue
+		}
+		named := 0
+		for _, command := range []string{
+			"`message.send`", "`message.edit`", "`message.revoke`", "`message.react`",
+		} {
+			if strings.Contains(found, command) {
+				named++
+			}
+		}
+		if named != want {
+			t.Errorf("the lead says %q but the run names %d of the four commands that reach "+
+				"putOnTheWire: a count written as a word does not move when the list does",
+				word+" commands", named)
+		}
+	}
 
 	for _, clause := range []struct {
 		what   string
@@ -109,6 +149,23 @@ func TestTheContractSaysWhatBoundsACommandWithNoCeilingOfItsOwn(t *testing.T) {
 		{"what the ceiling buys instead", "ends the commands queued behind it",
 			"round 1 of #283's holdout asked for exactly this distinction: the held call is " +
 				"not freed, the ones behind it are"},
+		// The bold lead of the paragraph #283 added. #281 and #287 were both about a bold
+		// lead saying something the paragraph under it did not, and neither was caught by a
+		// clause, because no clause read a lead. This one does.
+		{"the lead saying how many commands the ceiling reaches", "Four commands now carry a ceiling",
+			"the lead used to say a send, and the gate the ceiling sits on is left by four " +
+				"commands; a client sending message.edit with no ceiling of its own now gets " +
+				"timeout and was told nowhere"},
+		{"which four they are", "`message.edit`, `message.revoke` and `message.react`",
+			"naming the count without naming the members is a tally nobody can check, and the " +
+				"count is checked against these names below"},
+		{"why the other three are safe to resend", "an identifier the receiving side already holds",
+			"the argument that makes a resend safe is the same one the send has, and it was " +
+				"written for the send alone"},
+		{"the third wait no ceiling reaches", "the read lock on the socket",
+			"a reconnection holds the write half for the length of its dial, and autoReconnect " +
+				"is what calls it, so this one is held precisely during the reconnection #283 " +
+				"is about"},
 	} {
 		if !strings.Contains(found, clause.phrase) {
 			t.Errorf("the paragraph about a command with neither field does not say %s (%q): %s",

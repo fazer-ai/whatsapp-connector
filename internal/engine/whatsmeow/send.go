@@ -152,6 +152,14 @@ func (s *Session) readyToSend() error {
 // minutes, direct and group alike (#215). What makes the retry safe is that every client
 // downstream drops the repeat, which is the same property the inbound path here already
 // spends, and which `contract/PROTOCOL.md` now asks of a client in so many words.
+//
+// Four commands come through here, not one: `message.send` names its own id, and
+// `message.edit`, `message.revoke` and `message.react` take one from `orDerived`, which
+// falls back to the `idempotency_key` or the command's id. So the ceiling below reaches
+// all four, and the safety argument above covers all four with it -- each resend names a
+// message the receiving side already holds. `orDerived` has one case that does not, a
+// command carrying neither key nor id, and the schema makes that unreachable for a
+// conforming client by requiring `id` on every command frame.
 func (s *Session) putOnTheWire(
 	ctx context.Context, to waTypes.JID, messageID string, message *waE2E.Message,
 ) (wm.SendResponse, error) {
@@ -212,12 +220,19 @@ func (s *Session) putOnTheWire(
 // contain is the media upload, which is bounded separately and earlier, inside the build,
 // by `uploadTimeout`; by the time a message reaches the wire its bytes are already up.
 //
-// And what no number here reaches: two waits inside this region do not look at the
-// context at all. `SendMessage` takes `cli.messageSendLock` before it does anything, and
-// `NoiseSocket.SendFrame` takes its write lock before reading the context, which is #74.
-// A send held by either does not come back when this ceiling runs out; the ceiling ends
-// the ones queued behind it once the held call finally returns, which is the whole of
-// what it buys. The queue wait does spend this budget, since the deadline is set before
+// And what no number here reaches: three waits inside this region do not look at the
+// context at all. `SendMessage` takes `cli.messageSendLock` before it does anything;
+// `NoiseSocket.SendFrame` takes its write lock before reading the context, which is #74;
+// and `sendNodeAndGetData` and `retryFrame` both take `cli.socketLock.RLock()` to read
+// the socket, against a `connect()` that holds the write half for the length of a dial
+// and a handshake. That third one is the one worth naming here rather than counting as
+// more of the same: `autoReconnect` calls exactly that `connect()`, so it is held
+// precisely during the reconnection this ceiling exists to survive. Three is what has
+// been found, not what is there: an exhaustive count of this shape has turned out wrong
+// twice already, which is why `contract/PROTOCOL.md` no longer publishes one.
+// A send held by any of them does not come back when this ceiling runs out; the ceiling
+// ends the ones queued behind it once the held call finally returns, which is the whole
+// of what it buys. The queue wait does spend this budget, since the deadline is set before
 // the call and the lock is taken inside it, but in this connector one client belongs to
 // one session and the session executor already runs sends one at a time, so the only
 // contention left is whatsmeow's own short internal sends.
