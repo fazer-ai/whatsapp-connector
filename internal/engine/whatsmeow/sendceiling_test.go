@@ -115,22 +115,29 @@ func TestTheShorterOfTheTwoCeilingsIsTheOneTheWireGets(t *testing.T) {
 // the source says it as a sum.
 //
 // The value check alone would be a tautology, and it was one when this was first written:
-// `sendCeiling` replaced by a literal `380 * time.Second` compares equal to the sum and
+// `sendCeiling` replaced by a literal `620 * time.Second` compares equal to the sum and
 // passes, so the comment claiming it caught that was wrong. The declaration is read below
 // for that reason. A derived number stops being derived exactly when somebody writes the
 // answer down instead of the arithmetic, and that edit leaves the value untouched.
+//
+// The shape of the sum is itself the thing review corrected, so it is spelled out rather
+// than folded into one multiplication: four stages, each attempted twice with a reconnect
+// window between the attempts. The first version counted one attempt per stage and came to
+// 380s, which is under what the pinned library will spend on the prerequisites alone.
 func TestTheCeilingIsTheSumOfTheStagesInsideIt(t *testing.T) {
 	t.Parallel()
 
 	const (
-		infoQueriesInOneSend = 5
-		wanted               = infoQueriesInOneSend*upstreamRequestWait + upstreamReconnectWait
+		stagesInOneSend = 4
+		perStage        = 2*upstreamRequestWait + upstreamReconnectWait
+		wanted          = stagesInOneSend * perStage
 	)
 	if sendCeiling != wanted {
 		t.Fatalf("sendCeiling is %s but the stages inside one send add up to %s "+
-			"(%d info queries at %s, plus %s of reconnect); if a stage was added or removed, "+
-			"say which in the comment on sendCeiling and change both",
-			sendCeiling, wanted, infoQueriesInOneSend, upstreamRequestWait, upstreamReconnectWait)
+			"(%d stages at %s each: two waits of %s with %s of reconnect between them); "+
+			"if a stage was added or removed, say which in the comment on sendCeiling "+
+			"and change both",
+			sendCeiling, wanted, stagesInOneSend, perStage, upstreamRequestWait, upstreamReconnectWait)
 	}
 	if declared := howSendCeilingIsWritten(t); !strings.Contains(declared, "upstreamRequestWait") ||
 		!strings.Contains(declared, "upstreamReconnectWait") {

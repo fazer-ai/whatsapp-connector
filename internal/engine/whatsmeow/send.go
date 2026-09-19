@@ -183,23 +183,30 @@ func (s *Session) putOnTheWire(
 //
 // The number is the sum of the bounded stages that can run inside this one call, not a
 // figure picked for feeling right, because the context handed to `SendMessage` covers far
-// more than the wait for the acknowledgement. Reading the pinned library, one send pays:
+// more than the wait for the acknowledgement. Reading the pinned library, one send waits
+// on four things in turn:
 //
 //   - the group metadata query OR the LID fetch, never both: they are the two arms of the
 //     same `else if` on the destination's server, so a group send pays the first and a
 //     direct send pays the second;
 //   - the device list query, which every send pays;
 //   - the prekey fetch, for a recipient this session has no session with;
-//   - the acknowledgement wait for the send itself;
-//   - the reconnect window, if the connection dropped under it;
-//   - the retry's own wait.
+//   - the acknowledgement for the send itself.
 //
-// The first four are info queries under the library's own seventy five seconds. The last
-// one is not, and that is the whole of #283: upstream gives that retry no timer, so the
+// And each of those four is attempted twice, not once, which is what the first version of
+// this derivation missed and review caught. A disconnect under any of them produces a
+// disconnect node rather than an answer, and the library reacts by waiting up to five
+// seconds for the socket to come back and then sending the same frame again. So a stage
+// costs a wait, a reconnect window, and a second wait of the same size.
+//
+//	4 stages * (75s + 5s + 75s) = 620s
+//
+// Where the two halves of a stage differ is only in who grants the second wait. For the
+// three info queries the library passes its own `query.Timeout` down to `retryFrame`, so
+// both attempts are its seventy five seconds. For the acknowledgement it passes zero, and
+// that is the whole of #283: the retry of a send has no timer upstream at all, and the
 // seventy five seconds counted for it here is a budget this connector grants it, chosen to
 // be the same one the first attempt had rather than discovered somewhere.
-//
-//	5 * 75s (four library-bounded waits, plus the retry given the same) + 5s = 380s
 //
 // Adding a stage to that list means adding it here. What the sum deliberately does not
 // contain is the media upload, which is bounded separately and earlier, inside the build,
@@ -210,8 +217,11 @@ func (s *Session) putOnTheWire(
 // `NoiseSocket.SendFrame` takes its write lock before reading the context, which is #74.
 // A send held by either does not come back when this ceiling runs out; the ceiling ends
 // the ones queued behind it once the held call finally returns, which is the whole of
-// what it buys.
-const sendCeiling = 5*upstreamRequestWait + upstreamReconnectWait
+// what it buys. The queue wait does spend this budget, since the deadline is set before
+// the call and the lock is taken inside it, but in this connector one client belongs to
+// one session and the session executor already runs sends one at a time, so the only
+// contention left is whatsmeow's own short internal sends.
+const sendCeiling = 4 * (2*upstreamRequestWait + upstreamReconnectWait)
 
 // upstreamRequestWait and upstreamReconnectWait are the pinned library's own numbers,
 // named here so the arithmetic above reads as a derivation rather than a guess.

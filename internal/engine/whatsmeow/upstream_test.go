@@ -97,6 +97,43 @@ var upstreamDefects = []upstreamDefect{
 		what:      "zero meaning no timer at all rather than the seventy five second default",
 	},
 	{
+		issue: "fazer-ai/whatsapp-connector#283",
+		file:  "request.go",
+		// Not a defect, and one of the two things `sendCeiling` counts with. An info query
+		// interrupted by a disconnect is sent again, and unlike the message send it is
+		// handed `query.Timeout` rather than zero, so a stage is two bounded waits with a
+		// reconnect window between them. That is where the 155 seconds per stage in
+		// send.go comes from; the first version of that derivation counted one wait per
+		// stage and was short by the whole of the second attempt.
+		inOrder: []string{
+			"if isDisconnectNode(res) {",
+			`cli.retryFrame(ctx, "info query", query.ID, data, res, query.Timeout)`,
+		},
+		enclosing: "func (cli *Client) sendIQ(",
+		what: "an interrupted info query being retried once, under the same timeout the " +
+			"first attempt had",
+		reliedOn:  true,
+		restingOn: "the per-stage arithmetic in `sendCeiling`, internal/engine/whatsmeow/send.go",
+	},
+	{
+		issue: "fazer-ai/whatsapp-connector#283",
+		file:  "request.go",
+		// The other thing it counts with: the retry is one retry. A second disconnect on
+		// the same frame gives up instead of going round again, so a stage cannot cost
+		// three waits, or ten. If this ever became a loop, `sendCeiling` would start
+		// cutting sends the library would have completed, which is the failure this
+		// connector least wants to introduce with a ceiling.
+		inOrder: []string{
+			"if isDisconnectNode(resp) {",
+			"not retrying anymore",
+			"return nil, &DisconnectedError{",
+		},
+		enclosing: "func (cli *Client) retryFrame(",
+		what:      "the retry being attempted once and not in a loop",
+		reliedOn:  true,
+		restingOn: "the `4 stages` in `sendCeiling`, internal/engine/whatsmeow/send.go",
+	},
+	{
 		issue: "fazer-ai/whatsapp-connector#207",
 		file:  "socket/noisesocket.go",
 		// NoiseSocket.Stop clears the callback with no lock at all, while FrameSocket.Close
