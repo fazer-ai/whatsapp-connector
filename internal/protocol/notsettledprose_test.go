@@ -62,12 +62,23 @@ func TestTheContractSaysWhatAClientDoesWithNotSettled(t *testing.T) {
 	// the opposite mistake -- without that, "and both leave it that way" was read as a
 	// count of "and" and failed a paragraph that counts nothing.
 	//
-	// Three things this does not reach, measured rather than guessed:
+	// What this does not reach, measured rather than guessed. Each one was planted with
+	// the count made wrong, because a variant that keeps the count true is not an escape:
 	//
 	//   - a rewrite that replaces the anchor. "There are seven ways in" and "Seven things
 	//     leave it so" both pass. No fence matching text survives its own anchor being
 	//     rewritten, and widening far enough to try starts firing on prose counting
 	//     something else;
+	//   - a count that does not open its sentence. "It is seven things that leave it that
+	//     way" passes, and that is the direct price of requiring the sentence to open
+	//     with it. Before that requirement this read any word touching the anchor as the
+	//     count and failed "The process and a ceiling both leave it that way", a
+	//     paragraph that counts nothing. Anyone dropping the `(?:^|\. )` to close this
+	//     row reopens that one;
+	//   - more than three words between the count and the anchor, which is the `{0,3}`
+	//     and not a vague "a few": "Seven separate and distinct things leave it that way"
+	//     passes, "Seven separate distinct things" does not;
+	//   - punctuation between them: "Seven, and only seven, things leave it that way";
 	//   - a count that grows. `named` comes from the list of cause phrases written below,
 	//     so a third cause added to the paragraph and not to that list is invisible and
 	//     the count stops moving with it. This catches the number ageing downwards, a
