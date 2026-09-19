@@ -15,6 +15,7 @@ import (
 // ownership change under load does to the invariants.
 func measure(ctx context.Context, active *run, group *fleet, rep *report, plan benchPlan) error {
 	cl := newClient(active.rdb, active.prefix, plan.shards)
+	counted := &census{}
 
 	first, err := group.start(ctx, "bench-"+active.id+"-a")
 	if err != nil {
@@ -118,6 +119,7 @@ func measure(ctx context.Context, active *run, group *fleet, rep *report, plan b
 		"a lease do processo morto so vence depois dele.",
 		plan.sessions, plan.shards, plan.processes, plan.sends,
 		benchHeartbeat, benchLeaseTTL, benchClaimMinIdle, benchMaxConns))
+	counted.take(ctx, "estado de partida", []*instance{first})
 	rep.note(fmt.Sprintf("estado de partida afirmado antes de qualquer morte: %d sessoes com desired='connected', "+
 		"%d leases, soma de wac_sessions_running = %d", settled.desired, settled.leases, settled.running))
 
@@ -194,6 +196,7 @@ func measure(ctx context.Context, active *run, group *fleet, rep *report, plan b
 			return fmt.Errorf("%w: %w", errSetup, err)
 		}
 		back = int(running["wac_sessions_running"])
+		counted.take(ctx, "adocao em massa", []*instance{second})
 		if back >= plan.sessions {
 			adopted = time.Since(adoptionStart)
 			break
@@ -212,7 +215,7 @@ func measure(ctx context.Context, active *run, group *fleet, rep *report, plan b
 		rep.measurements[len(rep.measurements)-2].outside = outside
 	}
 
-	return handover(ctx, active, group, cl, rep, plan, second, sids, pairs)
+	return handover(ctx, active, group, cl, rep, plan, second, sids, pairs, counted)
 }
 
 // startingState is the four readings s5 asks for, taken from the four places that hold

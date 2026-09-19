@@ -21,7 +21,7 @@ import (
 // it is an assertion that never ran, and printing it as a pass is how a bench ends up
 // saying more than it measured.
 func assertInvariants(ctx context.Context, cl *client, rep *report, plan benchPlan,
-	answers map[string][]string, sids []string, pairs []idempotentPair) error {
+	answers map[string][]string, sids []string, pairs []idempotentPair, counted *census) error {
 
 	published := map[string][]protocol.Event{}          // sid -> events, in stream order
 	shardOf := map[string]map[string]bool{}             // sid -> streams it was seen on
@@ -62,7 +62,7 @@ func assertInvariants(ctx context.Context, cl *client, rep *report, plan benchPl
 		rep.measure("troca de dono sob carga", "entradas em "+read.stream, float64(read.length), "entradas")
 	}
 
-	assertOneOwner(rep, published, inOrder)
+	assertOneOwner(rep, published, inOrder, counted, len(sids))
 	assertEpochRises(rep, published)
 	assertSeqMonotonic(rep, published)
 	assertOneShard(rep, shardOf, firstOn, sids)
@@ -91,7 +91,7 @@ func assertInvariants(ctx context.Context, cl *client, rep *report, plan benchPl
 // stream. A session on two streams is a different finding, and `assertOneShard` is the one
 // that makes it.
 func assertOneOwner(rep *report, published map[string][]protocol.Event,
-	inOrder map[string]map[string][]protocol.Event) {
+	inOrder map[string]map[string][]protocol.Event, counted *census, sids int) {
 
 	pairs, offenders := 0, []string{}
 	for sid, events := range published {
@@ -135,15 +135,30 @@ func assertOneOwner(rep *report, published map[string][]protocol.Event,
 		}
 	}
 
+	// The third reading, and the only one that sees two holders who never shared an
+	// epoch. Every acquisition runs an `INCR`, so a second holder publishes under a
+	// higher epoch and the per-epoch check above stays green while two instances run the
+	// same account. What says otherwise is arithmetic: a fleet with N distinct sessions
+	// cannot have its instances add up to more than N.
+	top, taken := counted.worst()
+	if top.total > sids {
+		offenders = append(offenders, fmt.Sprintf(
+			"a frota inteira disse estar rodando %d sessoes, e so existem %d sids distintos nesta "+
+				"corrida, entao alguma sessao esta sendo rodada por mais de uma instancia ao mesmo "+
+				"tempo. O censo mais alto foi %s", top.total, sids, top))
+	}
+
 	rep.assert(&assertion{
 		invariant: "1 (uma instancia dona da sessao por vez, arbitrada pela lease; perder a lease cerca a sessao na hora)",
-		claim: "nunca duas instancias com a mesma lease: um epoch, um publicador, e nenhum evento de " +
-			"epoch velho depois de um novo no mesmo stream",
-		series: fmt.Sprintf("%d pares (sid, epoch) sobre %d sessoes, e %d eventos lidos na ordem do stream deles",
-			pairs, len(published), fenced),
-		points: pairs,
+		claim: "nunca duas instancias com a mesma lease: um epoch, um publicador; nenhum evento de " +
+			"epoch velho depois de um novo no mesmo stream; e a frota somada nunca roda mais sessoes do que existem sids",
+		series: fmt.Sprintf("%d pares (sid, epoch) sobre %d sessoes, %d eventos lidos na ordem do stream deles, "+
+			"e %d censos da frota (o mais alto somou %d de %d sids)",
+			pairs, len(published), fenced, taken, top.total, sids),
+		points: pairs + taken,
 		held:   len(offenders) == 0,
 		detail: strings.Join(offenders, "\n"),
+		notWhy: ifEmpty(pairs+taken, "nenhum evento foi publicado e nenhum censo foi tomado"),
 	})
 }
 

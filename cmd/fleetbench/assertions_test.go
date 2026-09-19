@@ -54,9 +54,10 @@ func TestOneOwnerNoticesTwoInstancesUnderOneEpoch(t *testing.T) {
 	t.Parallel()
 
 	tests := map[string]struct {
-		events []protocol.Event
-		state  string
-		says   string
+		events  []protocol.Event
+		samples []fleetSample
+		state   string
+		says    string
 	}{
 		"um publicador por epoch": {
 			events: []protocol.Event{event("s1", "a", 1, 1), event("s1", "a", 1, 2)},
@@ -74,6 +75,17 @@ func TestOneOwnerNoticesTwoInstancesUnderOneEpoch(t *testing.T) {
 			state:  "QUEBRADO",
 			says:   "depois de perder a lease",
 		},
+		"a frota somada roda mais sessoes do que existem sids": {
+			// The third half, and it is invisible to both of the others: every
+			// acquisition bumps the epoch, so two holders never share one and neither
+			// publishes out of order. Only the arithmetic sees it.
+			events: []protocol.Event{event("s1", "a", 1, 1), event("s1", "b", 2, 1)},
+			samples: []fleetSample{
+				{phase: "troca de dono", byInst: map[string]int{"a": 1, "b": 1}, total: 2},
+			},
+			state: "QUEBRADO",
+			says:  "mais de uma instancia ao mesmo tempo",
+		},
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -81,7 +93,7 @@ func TestOneOwnerNoticesTwoInstancesUnderOneEpoch(t *testing.T) {
 			rep := &report{}
 			published := map[string][]protocol.Event{"s1": tc.events}
 			inOrder := map[string]map[string][]protocol.Event{"s1": {"wa:events:0": tc.events}}
-			assertOneOwner(rep, published, inOrder)
+			assertOneOwner(rep, published, inOrder, &census{samples: tc.samples}, 1)
 
 			got := only(t, rep)
 			if got.state() != tc.state {

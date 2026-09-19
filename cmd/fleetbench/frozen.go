@@ -34,7 +34,7 @@ import (
 // The freeze has to outlast the lease, which is why it is the lease TTL plus a margin
 // rather than a number picked to feel long enough.
 func frozenOwner(ctx context.Context, active *run, cl *client, rep *report, plan benchPlan,
-	owner *instance, peers []*instance, sids []string) error {
+	owner *instance, peers []*instance, sids []string, counted *census) error {
 
 	// Who is frozen is measured, not assumed. The handover leaves the sessions split
 	// between the peers however the sweep happened to fall, and freezing one that owns
@@ -134,6 +134,7 @@ func frozenOwner(ctx context.Context, active *run, cl *client, rep *report, plan
 			return fmt.Errorf("%w: %w", errSetup, failed)
 		}
 		taken -= held
+		counted.take(ctx, "dono congelado", peers)
 		if taken > 0 || time.Now().After(deadline) {
 			break
 		}
@@ -152,6 +153,10 @@ func frozenOwner(ctx context.Context, active *run, cl *client, rep *report, plan
 		return fmt.Errorf("%w: %w", errSetup, err)
 	}
 
+	// Counted with everybody answering again, which is the moment a thawed instance that
+	// still thinks it owns the account shows up beside the one that took it.
+	counted.take(ctx, "depois de soltar o dono congelado", append([]*instance{owner}, peers...))
+
 	// Long enough for whatever the thawed owner is going to publish to reach the stream.
 	// A wait on the fleet, and the assertion that follows reads the stream's own order
 	// rather than trusting that this was long enough.
@@ -161,6 +166,7 @@ func frozenOwner(ctx context.Context, active *run, cl *client, rep *report, plan
 	case <-time.After(15 * time.Second):
 	}
 
+	counted.take(ctx, "fim da fase do dono congelado", append([]*instance{owner}, peers...))
 	rep.measure("dono congelado", "tempo congelado ate um par assumir", hold.Seconds(), "s")
 	rep.measure("dono congelado", "sessoes que os pares assumiram com o dono congelado",
 		float64(taken), "sessoes")

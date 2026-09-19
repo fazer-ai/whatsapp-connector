@@ -19,7 +19,7 @@ import (
 // event and the next, which is what a machine losing power does and what every one of
 // these invariants is written against.
 func handover(ctx context.Context, active *run, group *fleet, cl *client, rep *report, plan benchPlan,
-	owner *instance, sids []string, pairs []idempotentPair) error {
+	owner *instance, sids []string, pairs []idempotentPair, counted *census) error {
 
 	others := make([]*instance, 0, plan.processes-1)
 	for i := 2; i < plan.processes+1; i++ {
@@ -96,6 +96,9 @@ func handover(ctx context.Context, active *run, group *fleet, cl *client, rep *r
 			total += int(found["wac_sessions_running"])
 		}
 		moved = total
+		// Counted while ownership is moving, which is where a fleet that lets two
+		// instances hold one session shows the extra copies.
+		counted.take(ctx, "troca de dono sob carga", others)
 		if moved >= len(sids) {
 			break
 		}
@@ -143,7 +146,7 @@ func handover(ctx context.Context, active *run, group *fleet, cl *client, rep *r
 	// to have lost the lease. Everything the thawed instance publishes lands in the
 	// streams the assertions below read, in the order the shard kept.
 	if len(others) > 1 {
-		if err := frozenOwner(ctx, active, cl, rep, plan, others[0], others[1:], sids); err != nil {
+		if err := frozenOwner(ctx, active, cl, rep, plan, others[0], others[1:], sids, counted); err != nil {
 			return err
 		}
 	} else {
@@ -167,7 +170,7 @@ func handover(ctx context.Context, active *run, group *fleet, cl *client, rep *r
 			"asserção de grupo consumidor disser e sobre uma frota que ainda estava trabalhando")
 	}
 
-	return assertInvariants(ctx, cl, rep, plan, answers, sids, pairs)
+	return assertInvariants(ctx, cl, rep, plan, answers, sids, pairs, counted)
 }
 
 func shortSID(sid string) string {
