@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	wm "go.mau.fi/whatsmeow"
 	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
@@ -151,19 +152,102 @@ func (s *Session) readyToSend() error {
 // minutes, direct and group alike (#215). What makes the retry safe is that every client
 // downstream drops the repeat, which is the same property the inbound path here already
 // spends, and which `contract/PROTOCOL.md` now asks of a client in so many words.
+//
+// Four commands come through here, not one: `message.send` names its own id, and
+// `message.edit`, `message.revoke` and `message.react` take one from `orDerived`, which
+// falls back to the `idempotency_key` or the command's id. So the ceiling below reaches
+// all four, and the safety argument above covers all four with it -- each resend names a
+// message the receiving side already holds. `orDerived` has one case that does not, a
+// command carrying neither key nor id, and the schema makes that unreachable for a
+// conforming client by requiring `id` on every command frame.
 func (s *Session) putOnTheWire(
 	ctx context.Context, to waTypes.JID, messageID string, message *waE2E.Message,
 ) (wm.SendResponse, error) {
+	// Bounded here rather than inside `overSocket`, and the reason is the seam one line
+	// down: `handOver` replaces `overSocket` whole, so a ceiling built in there is one no
+	// test that uses the seam can see. #283 is about a wait nothing ends, and a fence
+	// nothing can observe would be the same defect wearing a fix.
+	wire, giveUp := context.WithTimeout(ctx, sendCeiling)
+	defer giveUp()
+
 	hand := s.handOver
 	if hand == nil {
 		hand = s.overSocket
 	}
-	sent, err := hand(ctx, to, messageID, message)
+	sent, err := hand(wire, to, messageID, message)
 	if err != nil {
 		return wm.SendResponse{}, sendFailure(err)
 	}
 	return sent, nil
 }
+
+// sendCeiling is how long this connector lets one send run, and it exists because
+// whatsmeow does not bound the half of it that matters. A send interrupted by the
+// connection dropping is retried once, and that retry is handed a zero timeout
+// (`send.go` and `sendfb.go` in the pinned library, both calling `retryFrame` with `0`),
+// where zero does not mean the default: the timer is built only `if timeout > 0`, so the
+// retry waits on the answer and on the context, and on nothing else. Tracked as #283,
+// and `upstream_test.go` fails when any of that changes shape.
+//
+// The number is the sum of the bounded stages that can run inside this one call, not a
+// figure picked for feeling right, because the context handed to `SendMessage` covers far
+// more than the wait for the acknowledgement. Reading the pinned library, one send waits
+// on four things in turn:
+//
+//   - the group metadata query OR the LID fetch, never both: they are the two arms of the
+//     same `else if` on the destination's server, so a group send pays the first and a
+//     direct send pays the second;
+//   - the device list query, which every send pays;
+//   - the prekey fetch, for a recipient this session has no session with;
+//   - the acknowledgement for the send itself.
+//
+// And each of those four is attempted twice, not once, which is what the first version of
+// this derivation missed and review caught. A disconnect under any of them produces a
+// disconnect node rather than an answer, and the library reacts by waiting up to five
+// seconds for the socket to come back and then sending the same frame again. So a stage
+// costs a wait, a reconnect window, and a second wait of the same size.
+//
+//	4 stages * (75s + 5s + 75s) = 620s
+//
+// Where the two halves of a stage differ is only in who grants the second wait. For the
+// three info queries the library passes its own `query.Timeout` down to `retryFrame`, so
+// both attempts are its seventy five seconds. For the acknowledgement it passes zero, and
+// that is the whole of #283: the retry of a send has no timer upstream at all, and the
+// seventy five seconds counted for it here is a budget this connector grants it, chosen to
+// be the same one the first attempt had rather than discovered somewhere.
+//
+// Adding a stage to that list means adding it here. What the sum deliberately does not
+// contain is the media upload, which is bounded separately and earlier, inside the build,
+// by `uploadTimeout`; by the time a message reaches the wire its bytes are already up.
+//
+// And what no number here reaches: three waits inside this region do not look at the
+// context at all. `SendMessage` takes `cli.messageSendLock` before it does anything;
+// `NoiseSocket.SendFrame` takes its write lock before reading the context, which is #74;
+// and `sendNodeAndGetData` and `retryFrame` both take `cli.socketLock.RLock()` to read
+// the socket, against a `connect()` that holds the write half for the length of a dial
+// and a handshake. That third one is the one worth naming here rather than counting as
+// more of the same: `autoReconnect` calls exactly that `connect()`, so it is held
+// precisely during the reconnection this ceiling exists to survive. Three is what has
+// been found, not what is there: an exhaustive count of this shape has turned out wrong
+// twice already, which is why `contract/PROTOCOL.md` no longer publishes one.
+// A send held by any of them does not come back when this ceiling runs out, and the ones
+// queued behind it are not ended by it either: `bound` in the session layer starts a
+// `max_runtime_ms` budget when a command begins, not when it arrives, so a command that
+// waited its turn begins with a full one. What the ceiling buys the queue is that the
+// held call returns the moment it is released, instead of spending what is left of a
+// reply nobody is bringing, which is the whole of what it buys. The queue wait does spend this budget, since the deadline is set before
+// the call and the lock is taken inside it, but in this connector one client belongs to
+// one session and the session executor already runs sends one at a time, so the only
+// contention left is whatsmeow's own short internal sends.
+const sendCeiling = 4 * (2*upstreamRequestWait + upstreamReconnectWait)
+
+// upstreamRequestWait and upstreamReconnectWait are the pinned library's own numbers,
+// named here so the arithmetic above reads as a derivation rather than a guess.
+// `defaultRequestTimeout` and the `WaitForConnection` call inside `retryFrame`.
+const (
+	upstreamRequestWait   = 75 * time.Second
+	upstreamReconnectWait = 5 * time.Second
+)
 
 // overSocket is the ordinary way a message leaves: whatsmeow's own send, on whichever
 // client the session holds when it is called rather than one read earlier, so a message
