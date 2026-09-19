@@ -146,9 +146,18 @@ func TestTheContractSaysWhatBoundsACommandWithNoCeilingOfItsOwn(t *testing.T) {
 			"#283 put a ceiling on it, so the paragraph naming it as unbounded became false"},
 		{"the two waits no ceiling reaches", "does not look at the context at all",
 			"they are what stops a ceiling being a promise of a reply inside it"},
-		{"what the ceiling buys instead", "ends the commands queued behind it",
-			"round 1 of #283's holdout asked for exactly this distinction: the held call is " +
-				"not freed, the ones behind it are"},
+		{"that a ceiling does not expire what is queued behind it",
+			"it does not end the commands queued behind it either",
+			"round 1 of #283's holdout asked for the distinction between the held call and " +
+				"the queue, and the sentence that answered it promised the wrong half: " +
+				"`bound` starts a max_runtime_ms budget when a command begins, not when it " +
+				"arrives, so a queued command runs with a full one however long it waited"},
+		{"what a ceiling does buy the queue", "returns the instant it is released",
+			"the honest version of the same distinction: nothing frees the held call, and " +
+				"what the ceiling saves is the rest of a reply wait after it is released"},
+		{"the field that does drop a queued command", "names a `deadline`, which is the field checked before the work starts",
+			"a client told that a runtime ceiling clears the queue would use the wrong field; " +
+				"`expired` reads the absolute deadline and nothing else"},
 		// The bold lead of the paragraph #283 added. #281 and #287 were both about a bold
 		// lead saying something the paragraph under it did not, and neither was caught by a
 		// clause, because no clause read a lead. This one does.

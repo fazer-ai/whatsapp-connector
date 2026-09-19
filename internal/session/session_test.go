@@ -3576,3 +3576,71 @@ func render(t *testing.T, request engine.ConnectRequest) string {
 	}
 	return string(rendered)
 }
+
+// The contract tells a client that a ceiling does not end what is queued behind a command
+// that will not come back, and that `deadline` is the field which does. #283 published
+// that sentence after review found the earlier one promising the opposite, so both halves
+// are asserted here rather than left to the prose fence, which only reads that the words
+// are present.
+func TestWaitingInTheQueueSpendsNoRuntimeBudgetAndAnInstantStillDrops(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	ctx := context.Background()
+	if _, err := h.manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, _ := h.engine.Session("s1")
+
+	// The command in front holds the executor, which is the only thing that puts the two
+	// behind it in a queue at all.
+	release := engineSession.Hold()
+
+	var first, queued, dated atomic.Bool
+	h.manager.Dispatch(delivery(&protocol.Command{
+		V: protocol.Version, ID: "c1", Type: protocol.CommandMessageMarkRead, SID: "s1",
+		TS:      time.Now().UnixMilli(),
+		Payload: json.RawMessage(`{"chat":{"kind":"phone","id":"5541999990000"},"message_ids":["A"],"type":"read"}`),
+	}, &first))
+
+	// Behind it, one carrying a duration and one carrying an instant that will have passed
+	// by the time its turn comes. The duration one is stamped an hour ago on purpose: that
+	// is what makes the window below discriminating instead of decorative, because a
+	// `bound` that measured from the stamp rather than from the start of the work would
+	// hand this command a deadline an hour in the past.
+	began := time.Now()
+	h.manager.Dispatch(delivery(&protocol.Command{
+		V: protocol.Version, ID: "c2", Type: protocol.CommandMessageMarkRead, SID: "s1",
+		TS: began.Add(-time.Hour).UnixMilli(), MaxRuntimeMs: (30 * time.Second).Milliseconds(),
+		Payload: json.RawMessage(`{"chat":{"kind":"phone","id":"5541999990000"},"message_ids":["B"],"type":"read"}`),
+	}, &queued))
+	h.manager.Dispatch(delivery(&protocol.Command{
+		V: protocol.Version, ID: "c3", Type: protocol.CommandMessageMarkRead, SID: "s1",
+		TS: began.UnixMilli(), Deadline: began.Add(-time.Second).UnixMilli(),
+		Payload: json.RawMessage(`{"chat":{"kind":"phone","id":"5541999990000"},"message_ids":["C"],"type":"read"}`),
+	}, &dated))
+
+	release()
+	waitFor(t, "all three commands to be answered", func() bool {
+		return first.Load() && queued.Load() && dated.Load()
+	})
+
+	ran := engineSession.Commands()
+	if len(ran) != 2 {
+		t.Fatalf("the engine ran %d commands, want 2: the one in front and the one carrying a "+
+			"duration. A command carrying an instant that has passed must not reach the engine", len(ran))
+	}
+	bounds := engineSession.Bounds()
+	if bounds[1].IsZero() {
+		t.Fatal("the queued command ran with no ceiling at all, so its max_runtime_ms was lost " +
+			"somewhere between arriving and running")
+	}
+	// The point of the sentence: the time spent behind c1 is not taken out of c2's budget,
+	// because `bound` starts the duration when the work begins. Measured from the dispatch,
+	// so any queue wait would show up as a shortfall here.
+	if window := bounds[1].Sub(began); window < 29*time.Second {
+		t.Fatalf("the queued command ran under %s measured from when it was dispatched, want "+
+			"at least the 30s it asked for: waiting its turn is not supposed to spend the budget",
+			window)
+	}
+}

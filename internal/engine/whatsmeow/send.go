@@ -230,9 +230,12 @@ func (s *Session) putOnTheWire(
 // precisely during the reconnection this ceiling exists to survive. Three is what has
 // been found, not what is there: an exhaustive count of this shape has turned out wrong
 // twice already, which is why `contract/PROTOCOL.md` no longer publishes one.
-// A send held by any of them does not come back when this ceiling runs out; the ceiling
-// ends the ones queued behind it once the held call finally returns, which is the whole
-// of what it buys. The queue wait does spend this budget, since the deadline is set before
+// A send held by any of them does not come back when this ceiling runs out, and the ones
+// queued behind it are not ended by it either: `bound` in the session layer starts a
+// `max_runtime_ms` budget when a command begins, not when it arrives, so a command that
+// waited its turn begins with a full one. What the ceiling buys the queue is that the
+// held call returns the moment it is released, instead of spending what is left of a
+// reply nobody is bringing, which is the whole of what it buys. The queue wait does spend this budget, since the deadline is set before
 // the call and the lock is taken inside it, but in this connector one client belongs to
 // one session and the session executor already runs sends one at a time, so the only
 // contention left is whatsmeow's own short internal sends.
