@@ -5,6 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"os"
+	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -311,6 +318,82 @@ func TestEveryOtherRefusalKeepsItsCodeAndItsSentence(t *testing.T) {
 	}
 }
 
+// Every sentence `sendFailure` can build, read out of its source rather than listed.
+//
+// The list version of this left the seventh out while claiming to cover them all, and
+// then survived an eighth `case` being added, because a list proves a property for the
+// arms that existed when somebody wrote it. This reads the function's own body, so an arm
+// added tomorrow is covered the day it lands.
+//
+// Read from the directory and not from one file, and the returned set is required to be
+// non-empty and to contain a sentence a reader here can recognise, because a parse that
+// silently finds nothing is a fence that passes by finding nothing.
+//
+// The directory is a variable so the emptiness guard above can be exercised: pointing it
+// somewhere without `sendFailure` has to fail with that message rather than pass.
+var sendFailureDir = "."
+
+func everySentenceSendFailureBuilds(t *testing.T) []string {
+	t.Helper()
+
+	fset := token.NewFileSet()
+	entries, err := os.ReadDir(sendFailureDir)
+	if err != nil {
+		t.Fatalf("read %s: %v", sendFailureDir, err)
+	}
+	var found []string
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(fset, filepath.Join(sendFailureDir, name), nil, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		ast.Inspect(file, func(n ast.Node) bool {
+			decl, ok := n.(*ast.FuncDecl)
+			if !ok || decl.Name.Name != "sendFailure" {
+				return true
+			}
+			ast.Inspect(decl.Body, func(inner ast.Node) bool {
+				call, ok := inner.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				name, ok := call.Fun.(*ast.Ident)
+				if !ok || name.Name != "because" || len(call.Args) < 2 {
+					return true
+				}
+				// The sentence is the second argument, and it has to be a literal:
+				// one built at runtime is one this cannot read, and reporting that
+				// is the point rather than skipping it.
+				lit, ok := call.Args[1].(*ast.BasicLit)
+				if !ok || lit.Kind != token.STRING {
+					t.Errorf("a `because` in sendFailure builds its sentence at runtime, "+
+						"so this fence cannot read it: %s", fset.Position(call.Pos()))
+					return true
+				}
+				text, err := strconv.Unquote(lit.Value)
+				if err != nil {
+					t.Fatalf("unquote %s: %v", lit.Value, err)
+				}
+				found = append(found, text)
+				return true
+			})
+			return false
+		})
+	}
+	if len(found) == 0 {
+		t.Fatal("no sentence was read out of sendFailure, so this fence proves nothing")
+	}
+	if !slices.Contains(found, "WhatsApp refused the message") {
+		t.Fatalf("the sentences read do not include the default arm's, so the parse is "+
+			"looking at the wrong thing: %q", found)
+	}
+	return found
+}
+
 // The one branch of `sendFailure` that decides on the *text* of an error, and the reason
 // it survives wrapping: none of the sentences this function can produce contains the
 // phrase that branch matches on, so an answer of its own can never be re-aimed into it.
@@ -324,29 +407,10 @@ func TestEveryOtherRefusalKeepsItsCodeAndItsSentence(t *testing.T) {
 func TestNoSentenceThisBuildsCanReAimTheBranchThatReadsTheText(t *testing.T) {
 	t.Parallel()
 
-	// Every input the table above covers, plus the branch's own and the timeout four, so
-	// the set of sentences is every one `sendFailure` can emit. Counted against the
-	// `case` arms of that function rather than asserted: seven sentences, and all seven
-	// are produced below.
-	inputs := []error{
-		wm.ErrNotLoggedIn, wm.ErrNotConnected, wm.ErrBroadcastListUnsupported,
-		wm.ErrUnknownServer, wm.ErrRecipientADJID, errors.New("something new in the protocol"),
-		// The branch's own input, and the one the first draft of this left out while
-		// claiming to cover every sentence. Its answer is the sentence most able to
-		// re-aim the branch, since that is the branch it comes from.
-		errors.New("no LID found for 5511999999999@s.whatsapp.net from server"),
-	}
-	for _, cause := range theFourCauses() {
-		inputs = append(inputs, cause.err)
-	}
-	for _, in := range inputs {
-		var coded *protocol.Error
-		if !errors.As(sendFailure(in), &coded) {
-			t.Fatalf("no code came out of %v", in)
-		}
-		if strings.Contains(coded.Message, noLIDForNumber) {
-			t.Errorf("the sentence for %v contains %q, so this connector's own answer "+
-				"would be read as a number nobody has registered: %q", in, noLIDForNumber, coded.Message)
+	for _, sentence := range everySentenceSendFailureBuilds(t) {
+		if strings.Contains(sentence, noLIDForNumber) {
+			t.Errorf("a sentence this function builds contains %q, so an answer of its own "+
+				"would be read as a number nobody has registered: %q", noLIDForNumber, sentence)
 		}
 	}
 	// And the branch does fire on the phrase, so the check above is about something that
