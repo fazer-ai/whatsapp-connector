@@ -110,10 +110,11 @@ type Session struct {
 	// minutes, and a test that needs it to have run out cannot wait ten minutes. Nothing
 	// in production sets it, exactly as with storeLimit above.
 	//
-	// It carries its own weight beyond that. Which of the two clocks over a send ended it
-	// is decided by asking which context expired (`whichClockRanOut`, `send.go`), and the
-	// case where this one expired while the caller's is still live is not reachable at
-	// all without shortening it.
+	// It carries its own weight beyond that. Three clocks can end a send, and which one
+	// did is decided by the cancellation cause this context carries, not by asking each
+	// one afterwards whether it is done (`whichClockRanOut`, `send.go`). The case where
+	// this one ran out while the caller's is still live is not reachable at all without
+	// shortening it.
 	wireLimit time.Duration
 
 	// deliverWait bounds how long an inbound message waits to hear that its event was

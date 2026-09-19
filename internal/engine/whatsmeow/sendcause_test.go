@@ -106,13 +106,14 @@ func TestTheThreeClocksOverOneSendAreToldApartInTheLog(t *testing.T) {
 	t.Parallel()
 
 	for _, tc := range []struct {
-		name      string
-		wireLimit time.Duration
-		caller    time.Duration
-		fromWire  error
-		cancels   bool
-		names     string
-		forbids   string
+		name       string
+		wireLimit  time.Duration
+		caller     time.Duration
+		fromWire   error
+		cancels    bool
+		waitsFirst bool
+		names      string
+		forbids    string
 	}{
 		{
 			name:      "the caller's own clock, which is the shorter one",
@@ -148,6 +149,21 @@ func TestTheThreeClocksOverOneSendAreToldApartInTheLog(t *testing.T) {
 			forbids:   "ended",
 		},
 		{
+			// The case the guard at the top of `whichClockRanOut` is for, and the only
+			// one that reaches it: our ceiling has run out, so the cause on `wire` names
+			// us, and the library still answers with a sentinel of its own. Without the
+			// guard the library's answer is credited to this connector's ceiling, which
+			// is the misattribution #291 exists to end. Found by the verifier: the
+			// battery had mutated each half of the guard and never its removal.
+			name:       "WhatsApp's own answer, with our ceiling already run out",
+			wireLimit:  20 * time.Millisecond,
+			caller:     time.Minute,
+			waitsFirst: true,
+			fromWire:   wm.ErrMessageTimedOut,
+			names:      wm.ErrMessageTimedOut.Error(),
+			forbids:    "ended",
+		},
+		{
 			// The library reaching a deadline of one of its own contexts, with both of
 			// ours still live. Named by neither of the two above, and left as it came.
 			name:      "a deadline from inside the library, with both of ours still live",
@@ -166,6 +182,9 @@ func TestTheThreeClocksOverOneSendAreToldApartInTheLog(t *testing.T) {
 			session.handOver = func(
 				ctx context.Context, _ waTypes.JID, _ string, _ *waE2E.Message,
 			) (wm.SendResponse, error) {
+				if tc.waitsFirst {
+					<-ctx.Done()
+				}
 				if tc.fromWire != nil {
 					return wm.SendResponse{}, tc.fromWire
 				}
@@ -292,25 +311,43 @@ func TestEveryOtherRefusalKeepsItsCodeAndItsSentence(t *testing.T) {
 	}
 }
 
-// The text branch reads the error it is given, not the one it builds, so wrapping the
-// answer cannot feed it its own output. Asserted because `strings.Contains` on an error's
-// text is the one branch here that a change in error shape can silently re-aim.
-func TestTheBranchThatReadsTheTextStillReadsTheCause(t *testing.T) {
+// The one branch of `sendFailure` that decides on the *text* of an error, and the reason
+// it survives wrapping: none of the sentences this function can produce contains the
+// phrase that branch matches on, so an answer of its own can never be re-aimed into it.
+//
+// Written this way after the verifier measured that the first version asserted nothing.
+// It had claimed that feeding the answer back in would not find the phrase again, and the
+// opposite is what happens -- `because` keeps the cause's text inside `Error()`, so
+// `sendFailure(sendFailure(x))` matches `no LID found` a second time and answers
+// `recipient_not_on_whatsapp` again. That is harmless, and it is not what needed pinning.
+// What needed pinning is that the phrase can only come from the input.
+func TestNoSentenceThisBuildsCanReAimTheBranchThatReadsTheText(t *testing.T) {
 	t.Parallel()
 
-	once := sendFailure(errors.New("no LID found for 5511999999999@s.whatsapp.net from server"))
+	// Every input the table above covers, plus the timeout four, so the set of sentences
+	// is every one `sendFailure` can emit.
+	inputs := []error{
+		wm.ErrNotLoggedIn, wm.ErrNotConnected, wm.ErrBroadcastListUnsupported,
+		wm.ErrUnknownServer, wm.ErrRecipientADJID, errors.New("something new in the protocol"),
+	}
+	for _, cause := range theFourCauses() {
+		inputs = append(inputs, cause.err)
+	}
+	for _, in := range inputs {
+		var coded *protocol.Error
+		if !errors.As(sendFailure(in), &coded) {
+			t.Fatalf("no code came out of %v", in)
+		}
+		if strings.Contains(coded.Message, noLIDForNumber) {
+			t.Errorf("the sentence for %v contains %q, so this connector's own answer "+
+				"would be read as a number nobody has registered: %q", in, noLIDForNumber, coded.Message)
+		}
+	}
+	// And the branch does fire on the phrase, so the check above is about something that
+	// exists rather than about a branch nothing reaches.
 	var coded *protocol.Error
-	if !errors.As(once, &coded) || coded.Code != protocol.ErrorRecipientNotOnWhatsapp {
-		t.Fatalf("the first pass answers %v", once)
-	}
-	// Feeding the answer back in must not find the phrase again: if it did, the branch
-	// would be reading text this function wrote rather than what WhatsApp said.
-	twice := sendFailure(once)
-	var again *protocol.Error
-	if !errors.As(twice, &again) {
-		t.Fatalf("the second pass answers %v", twice)
-	}
-	if again.Code == protocol.ErrorRecipientNotOnWhatsapp && !strings.Contains(once.Error(), "no LID found") {
-		t.Error("the text branch matched on something this function built")
+	if !errors.As(sendFailure(errors.New("no LID found for 5511999999999@s.whatsapp.net from server")), &coded) ||
+		coded.Code != protocol.ErrorRecipientNotOnWhatsapp {
+		t.Fatalf("the phrase no longer reaches its branch: %v", coded)
 	}
 }
