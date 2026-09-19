@@ -198,6 +198,49 @@ func TestTheThreeClocksOverOneSendAreToldApartInTheLog(t *testing.T) {
 	}
 }
 
+// The order matters and reading the two contexts afterwards cannot recover it. A send
+// can sit inside the library long past its ceiling, on waits nothing interrupts (#290,
+// #74), so a caller giving up during that window is ordinary rather than exotic: by the
+// time the error comes back both contexts are done, and the one that ended the send is
+// the one that was first.
+//
+// Found in review of this PR. The version before it asked each context whether it was
+// done and called this one the caller's.
+func TestACallerGivingUpAfterOurCeilingDoesNotTakeTheBlameForIt(t *testing.T) {
+	t.Parallel()
+
+	session, _, _ := outboundSession(t)
+	session.wireLimit = 20 * time.Millisecond
+
+	released := make(chan struct{})
+	ctx, giveUp := context.WithCancel(context.Background())
+	session.handOver = func(
+		wire context.Context, _ waTypes.JID, _ string, _ *waE2E.Message,
+	) (wm.SendResponse, error) {
+		<-wire.Done()
+		// Our ceiling has fired. Now the caller gives up, which is what the library
+		// holding on past the ceiling would let happen, and only then does the send
+		// come back.
+		giveUp()
+		<-ctx.Done()
+		close(released)
+		return wm.SendResponse{}, wire.Err()
+	}
+
+	_, err := session.putOnTheWire(ctx, peer, "m1", aBodyToSend())
+	<-released
+	if err == nil {
+		t.Fatal("the send came back without a failure")
+	}
+	line := renderedFailure(t, err)
+	if !strings.Contains(line, "this connector's ceiling") {
+		t.Errorf("the line does not name the ceiling that actually fired: %s", line)
+	}
+	if strings.Contains(line, "the command's own context") {
+		t.Errorf("the line blames the caller, which only gave up afterwards: %s", line)
+	}
+}
+
 // The other six answers of `sendFailure` are not this issue's, and the table that guards
 // them compares the sentence as well as the code from this round on: the change here
 // rebuilds every one of those sentences, and a code alone would not have noticed.
