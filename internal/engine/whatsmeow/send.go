@@ -167,7 +167,7 @@ func (s *Session) putOnTheWire(
 	// down: `handOver` replaces `overSocket` whole, so a ceiling built in there is one no
 	// test that uses the seam can see. #283 is about a wait nothing ends, and a fence
 	// nothing can observe would be the same defect wearing a fix.
-	wire, giveUp := context.WithTimeout(ctx, s.wireLimit)
+	wire, giveUp := context.WithTimeoutCause(ctx, s.wireLimit, errSendCeiling)
 	defer giveUp()
 
 	hand := s.handOver
@@ -176,38 +176,53 @@ func (s *Session) putOnTheWire(
 	}
 	sent, err := hand(wire, to, messageID, message)
 	if err != nil {
-		return wm.SendResponse{}, sendFailure(whichClockRanOut(ctx, wire, err))
+		return wm.SendResponse{}, sendFailure(whichClockRanOut(wire, err))
 	}
 	return sent, nil
 }
 
-// whichClockRanOut names the clock that ended a send, and it has to happen here because
-// here is the only place both of them are in hand.
+// errSendCeiling is what `wire` is cancelled with when this connector's own ceiling is
+// the thing that ended a send. It is never returned on its own: it names a cause, and
+// what a caller gets is still the contract's `timeout`.
+var errSendCeiling = errors.New("this connector's ceiling on one send ended it")
+
+// whichClockRanOut names the clock that ended a send.
 //
-// Three clocks can end one send and two of them are this connector's: the caller's own
-// `deadline` or `max_runtime_ms`, and `wireLimit` above. Those two produce the same
-// `context.DeadlineExceeded` -- not an equal value, the same one -- so nothing further
-// down can tell them apart, and #291 is about an operator who had to subtract two
-// timestamps by hand to find out which. The third is the library's own answer running
-// out, which does arrive as its own sentinel and needs nothing from this.
+// Three clocks can end one and two of them are this connector's: the caller's own
+// `deadline` or `max_runtime_ms`, and `wireLimit`. Those two produce the same
+// `context.DeadlineExceeded` -- not an equal value, the same one -- so nothing that only
+// sees the error can tell them apart, and #291 is about an operator who had to subtract
+// two timestamps by hand to find out which. The third is the library's own answer
+// running out, which arrives as its own sentinel and needs nothing from this.
 //
-// Read in that order for the reason #284 found the hard way: a derived context that has
-// expired says nothing about whether the one it was derived from expired first. The
-// caller's is asked about first because when both have run out the caller's is the one
-// that decided, `wire` having inherited its deadline.
-func whichClockRanOut(caller, wire context.Context, err error) error {
+// The answer comes from `context.Cause`, and not from asking each context whether it is
+// done, because those are different questions. `Cause` is written once, by whichever
+// cancellation actually happened, and it does not change afterwards; the done-ness of a
+// context is read now and says nothing about the order. The difference is reachable: a
+// send can sit inside the library long past its ceiling, on waits nothing interrupts
+// (#290 and #74), and a caller that gives up during that window would have been read as
+// the one that ended it. Measured: with `wire` expired on its own ceiling and the parent
+// cancelled afterwards, `context.Cause(wire)` is still this connector's while the parent
+// already reports `context.Canceled`.
+//
+// A caller's shorter deadline propagates instead, because `WithTimeoutCause` on a parent
+// that is closer to its own deadline is a plain cancellation of that parent, cause and
+// all. So the default branch is the caller's, and it covers a cause the caller set as
+// well as the bare context errors.
+func whichClockRanOut(wire context.Context, err error) error {
 	if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
 		return err
 	}
-	switch {
-	case caller.Err() != nil:
+	switch cause := context.Cause(wire); {
+	case cause == nil:
+		// Neither of ours: the library reached a deadline of its own inside a context
+		// that is still live. Left as it came, because it already says which.
+		return err
+	case errors.Is(cause, errSendCeiling):
+		return fmt.Errorf("%w: %w", errSendCeiling, err)
+	default:
 		return fmt.Errorf("the command's own context ended this send: %w", err)
-	case wire.Err() != nil:
-		return fmt.Errorf("this connector's ceiling on one send ended it: %w", err)
 	}
-	// Neither of ours, so the library reached a deadline of its own inside a context that
-	// is still live. Left as it came: it already says which.
-	return err
 }
 
 // sendCeiling is how long this connector lets one send run, and it exists because
