@@ -151,9 +151,47 @@ func (i *instance) kill() error {
 	return nil
 }
 
+// freeze stops an instance without ending it, and thaw lets it go on.
+//
+// The pair exists because a kill cannot produce the case invariant 1's fence is written
+// against. A killed owner publishes nothing more, so "an instance that lost the lease
+// stops at once" is asserted over a series where it could not have failed: the mutant that
+// removes the fence comes out green, which is the bench saying it measured something it
+// never reached.
+//
+// A frozen owner is a live one that stopped renewing. Its lease expires on the server, a
+// peer takes the account and publishes under a higher epoch, and when the freeze is lifted
+// the old owner wakes up holding work it was in the middle of. Whether it then publishes
+// is exactly the fence.
+//
+// By the pid this run captured, to its own process group, and never by a pattern over the
+// process name: this machine runs other people's connectors.
+func (i *instance) freeze() error {
+	if i.cmd.Process == nil {
+		return nil
+	}
+	if err := syscall.Kill(-i.pid, syscall.SIGSTOP); err != nil {
+		return fmt.Errorf("freeze %s (pid %d): %w", i.name, i.pid, err)
+	}
+	return nil
+}
+
+func (i *instance) thaw() error {
+	if i.cmd.Process == nil {
+		return nil
+	}
+	if err := syscall.Kill(-i.pid, syscall.SIGCONT); err != nil {
+		return fmt.Errorf("thaw %s (pid %d): %w", i.name, i.pid, err)
+	}
+	return nil
+}
+
 // stop ends an instance the way an operator does, and waits for it.
 func (i *instance) stop() {
 	if i.cmd.Process != nil {
+		// Continued first: a process left frozen never sees the SIGTERM, and the wait
+		// below would spend its ten seconds before falling back to the kill.
+		_ = syscall.Kill(-i.pid, syscall.SIGCONT)
 		_ = syscall.Kill(-i.pid, syscall.SIGTERM)
 		done := make(chan struct{})
 		go func() { _, _ = i.cmd.Process.Wait(); close(done) }()
@@ -179,7 +217,27 @@ func (f *fleet) shutdown() {
 }
 
 // metrics reads one instance's /metrics and returns the samples it asked for, by name.
+//
+// Every name in `want` has to be there. Absence is an error and not a zero, because for an
+// unlabelled metric the two say opposite things: `wac_sessions_running` reads zero when the
+// instance runs nothing, and is absent only when nobody registered it.
 func (i *instance) metrics(ctx context.Context, want ...string) (map[string]float64, error) {
+	return i.readMetrics(ctx, want, nil)
+}
+
+// metricsWithOptional is metrics for the case where absence is a reading and not a gap.
+//
+// A `CounterVec` with no children is absent from the exposition entirely -- there is no
+// zero row to serve -- so "this instance reclaimed nothing" and "this build counts
+// nothing" look identical from outside. What tells them apart is a plain counter beside
+// it: `wac_command_reclaim_passes_total` is written on every completed pass whatever the
+// pass found, so a run with passes and no `wac_commands_reclaimed_total` is a fleet that
+// looked and found nothing. That counter belongs in `want`, and the Vec in `optional`.
+func (i *instance) metricsWithOptional(ctx context.Context, want, optional []string) (map[string]float64, error) {
+	return i.readMetrics(ctx, want, optional)
+}
+
+func (i *instance) readMetrics(ctx context.Context, want, optional []string) (map[string]float64, error) {
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+i.httpAddr+"/metrics", http.NoBody)
 	if err != nil {
 		return nil, err
@@ -199,6 +257,9 @@ func (i *instance) metrics(ctx context.Context, want ...string) (map[string]floa
 
 	wanted := map[string]bool{}
 	for _, name := range want {
+		wanted[name] = true
+	}
+	for _, name := range optional {
 		wanted[name] = true
 	}
 	found := map[string]float64{}
@@ -233,6 +294,13 @@ func (i *instance) metrics(ctx context.Context, want ...string) (map[string]floa
 		if _, there := found[name]; !there {
 			return nil, fmt.Errorf("/metrics of %s carries no %s at all, so there is no number to "+
 				"read: a metric that is missing is not a metric that is zero", i.name, name)
+		}
+	}
+	// The optional ones are filled in as zero once they are known to be absent, which is
+	// what the caller asked for by putting them there.
+	for _, name := range optional {
+		if _, there := found[name]; !there {
+			found[name] = 0
 		}
 	}
 	return found, nil

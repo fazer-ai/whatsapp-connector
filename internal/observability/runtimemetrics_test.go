@@ -44,14 +44,26 @@ func TestTheRuntimeAndTheProcessAreExposed(t *testing.T) {
 			"whole endpoint down under HTTPErrorOnError:\n%s", recorder.Code, recorder.Body.String())
 	}
 	body := recorder.Body.String()
-	for _, want := range []string{
-		"go_goroutines ",
-		"go_memstats_heap_inuse_bytes ",
-		"process_resident_memory_bytes ",
-		"process_open_fds ",
-	} {
+	// The runtime half is portable: the Go collector reads the runtime itself, so these
+	// are there on every platform and every build, and a build without them is a build
+	// that did not register it.
+	for _, want := range []string{"go_goroutines ", "go_memstats_heap_inuse_bytes "} {
 		if !strings.Contains(body, want) {
 			t.Errorf("/metrics carries no %q, so there is no series for a capacity panel to read", want)
 		}
+	}
+
+	// The process half is not portable, and asserting it unconditionally is a red that
+	// says nothing about this repository. What is portable is that the collector is
+	// registered at all, which `process_open_fds` shows on every build measured here.
+	if !strings.Contains(body, "process_open_fds ") {
+		t.Error("/metrics carries no process_* series at all, so the process collector is not registered")
+	}
+	// Resident memory is the one number a cgo-less darwin build cannot read, and the
+	// build tag is what says which build this is. Gated rather than skipped on what the
+	// body happens to hold: a test that lets the endpoint decide what to expect goes
+	// green the day the collector stops reporting anything.
+	if residentMemoryIsReported && !strings.Contains(body, "process_resident_memory_bytes ") {
+		t.Error("/metrics carries no process_resident_memory_bytes, and this build reports it")
 	}
 }

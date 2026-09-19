@@ -65,7 +65,7 @@ func TestOneOwnerNoticesTwoInstancesUnderOneEpoch(t *testing.T) {
 		"dois publicadores sob o mesmo epoch": {
 			events: []protocol.Event{event("s1", "a", 1, 1), event("s1", "b", 1, 2)},
 			state:  "QUEBRADO",
-			says:   "ao mesmo tempo",
+			says:   "dois donos da mesma lease",
 		},
 		"epoch velho depois de um novo, no mesmo stream": {
 			// The fence half, and it is invisible to the first: every (sid, epoch) here
@@ -204,6 +204,36 @@ func TestNoLostEventTellsAHoleFromATruncation(t *testing.T) {
 		}
 	})
 
+	t.Run("seq repetido nao e buraco", func(t *testing.T) {
+		t.Parallel()
+		// 1, 1, 2 covers every number from 1 to 2. What is wrong is the repetition, and
+		// that belongs to the order assertion: read with duplicates in, this said "falta
+		// seq 2 entre 1 e 1", which names a hole between a number and itself.
+		rep := &report{}
+		assertNoLostEvent(rep, map[string][]protocol.Event{
+			"s1": {event("s1", "a", 1, 1), event("s1", "a", 1, 1), event("s1", "a", 1, 2)},
+		}, map[string]bool{})
+		got := only(t, rep)
+		if got.state() == "QUEBRADO" {
+			t.Fatalf("um seq repetido foi reportado como evento perdido:\n%s", got.detail)
+		}
+	})
+
+	t.Run("buraco continua visivel com repetido em volta", func(t *testing.T) {
+		t.Parallel()
+		rep := &report{}
+		assertNoLostEvent(rep, map[string][]protocol.Event{
+			"s1": {event("s1", "a", 1, 1), event("s1", "a", 1, 1), event("s1", "a", 1, 3)},
+		}, map[string]bool{})
+		got := only(t, rep)
+		if got.state() != "QUEBRADO" {
+			t.Fatalf("um seq faltando entre repetidos saiu %q", got.state())
+		}
+		if !strings.Contains(got.detail, "falta seq 2 entre 1 e 3") {
+			t.Errorf("a evidencia nao nomeia o buraco de verdade:\n%s", got.detail)
+		}
+	})
+
 	t.Run("o mesmo buraco sob stream truncado nao e perda", func(t *testing.T) {
 		t.Parallel()
 		rep := &report{}
@@ -251,11 +281,9 @@ func TestNoDuplicateEffectReadsTheRepeatedMessageID(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			rep := &report{}
-			// No command ids in flight: this test is about the second door, and giving it
-			// the first as well would let a pass come from either.
-			if err := assertNoDuplicateEffect(t.Context(), nil, rep, nil, tc.pairs); err != nil {
-				t.Fatalf("assertNoDuplicateEffect: %v", err)
-			}
+			// No answers from the handover: this test is about the second door, and
+			// giving it the first as well would let a pass come from either.
+			assertNoDuplicateEffect(rep, nil, tc.pairs)
 			got := only(t, rep)
 			if got.state() != tc.state {
 				t.Fatalf("estado %q, queria %q (serie: %s, evidencia: %s)",

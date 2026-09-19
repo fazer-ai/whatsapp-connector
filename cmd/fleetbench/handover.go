@@ -54,12 +54,35 @@ func handover(ctx context.Context, active *run, group *fleet, cl *client, rep *r
 		}
 	}
 
+	// Measured, not assumed: how many of those the owner had not retired when it died.
+	//
+	// The fake engine answers a send at once, and these go on the streams one after
+	// another, so with a small run every command can already be answered and acknowledged
+	// by the time the kill lands. Calling them "in flight" then describes a handover that
+	// interrupted nothing, and the recovery it claims to have exercised never ran. The
+	// pending entries of the consumer groups are what says otherwise, and they are read
+	// from Redis rather than counted from what this bench sent.
+	pending, err := cl.pendingOn(ctx, sids)
+	if err != nil {
+		return fmt.Errorf("%w: %w", errSetup, err)
+	}
+
 	// The owner goes while those are being carried out. No wait for them first: a
 	// handover with nothing in flight is the orderly case wearing a kill.
 	if err := owner.kill(); err != nil {
 		return fmt.Errorf("%w: %w", errSetup, err)
 	}
-	rep.note(fmt.Sprintf("troca de dono: %s morta com SIGKILL com %d comandos em voo", owner.name, len(inFlight)))
+	rep.measure("troca de dono sob carga", "comandos ainda pendentes quando o dono morreu",
+		float64(pending), "comandos")
+	if pending == 0 {
+		rep.note(fmt.Sprintf("troca de dono: %s morta com SIGKILL, e nenhum dos %d comandos enviados "+
+			"ainda estava pendente nesse instante. A troca aconteceu, mas ela NAO interrompeu trabalho: "+
+			"o que um par reivindica depois disso e nada, e a parte de reentrega desta fase fica sem "+
+			"medida. Aumentar -sends e o que fecha essa janela.", owner.name, len(inFlight)))
+	} else {
+		rep.note(fmt.Sprintf("troca de dono: %s morta com SIGKILL com %d dos %d comandos ainda pendentes "+
+			"no grupo consumidor", owner.name, pending, len(inFlight)))
+	}
 
 	moved := 0
 	deadline := time.Now().Add(3 * time.Minute)
@@ -84,27 +107,67 @@ func handover(ctx context.Context, active *run, group *fleet, cl *client, rep *r
 			"o que afirmar sobre epoch", errSetup, moved, len(sids))
 	}
 
-	// A quiet moment before reading, so that what is in flight has landed. This is a wait
-	// on the fleet catching up, not a wait dressed as a synchronisation: everything read
-	// after it is read from the streams, which keep their own order.
-	settle := time.Now()
-	for time.Now().Before(settle.Add(20 * time.Second)) {
-		reclaimed := 0.0
-		for _, peer := range others {
-			found, err := peer.metrics(ctx, "wac_commands_reclaimed_total")
-			if err == nil {
-				reclaimed += found["wac_commands_reclaimed_total"]
-			}
-		}
-		if reclaimed > 0 {
-			rep.measure("troca de dono sob carga", "comandos reivindicados do pendente", reclaimed, "comandos")
-			break
-		}
-		time.Sleep(500 * time.Millisecond)
+	// Waited for the thing that has to be true, and not for the first sign of it.
+	//
+	// The reading below is taken from the consumer groups, and a group with work still in
+	// it is a group with pending entries. Stopping at the first reclaimed command and
+	// sleeping a fixed three seconds would hand `assertConsumerGroups` a fleet that is
+	// legitimately busy, and it would report ordinary work in progress as a hole. What
+	// ends the wait is the drain; what ends the waiting is a deadline, and a deadline that
+	// passes is said out loud instead of being spent as a pass.
+	drained, reclaimed, passes, err := waitForDrain(ctx, cl, others, sids, 90*time.Second)
+	if err != nil {
+		return fmt.Errorf("%w: %w", errSetup, err)
 	}
-	time.Sleep(3 * time.Second)
+	rep.measure("troca de dono sob carga", "comandos reivindicados do pendente", reclaimed, "comandos")
+	rep.measure("troca de dono sob carga", "passadas de reivindicacao que os pares completaram", passes, "passadas")
+	if reclaimed == 0 && passes == 0 {
+		rep.note("os pares nao completaram nenhuma passada de reivindicacao: um zero em 'comandos " +
+			"reivindicados' aqui nao e 'nao havia o que reivindicar', e sim que ninguem contou")
+	}
+	if !drained {
+		rep.note("o grupo consumidor nao drenou em 90 s: o que a asserção de grupo consumidor disser " +
+			"abaixo e sobre uma frota que ainda estava trabalhando, e nao sobre um buraco")
+	}
 
-	return assertInvariants(ctx, cl, rep, plan, inFlight, sids, pairs)
+	// Read here and not after the phase below, because a reply list has a TTL: the
+	// connector puts one on it so an answer nobody came back for does not sit in Redis
+	// forever. MEASURED: with the frozen phase in between, the assertion found 0 replies
+	// where the same run without it found 8, and a series of zero is not an assertion.
+	answers, err := cl.repliesToAll(ctx, inFlight)
+	if err != nil {
+		return fmt.Errorf("%w: %w", errSetup, err)
+	}
+
+	// The fence, and it comes last because it is the only phase that needs a live owner
+	// to have lost the lease. Everything the thawed instance publishes lands in the
+	// streams the assertions below read, in the order the shard kept.
+	if len(others) > 1 {
+		if err := frozenOwner(ctx, active, cl, rep, plan, others[0], others[1:], sids); err != nil {
+			return err
+		}
+	} else {
+		rep.note(fmt.Sprintf("fase do dono congelado: pulada, porque a corrida subiu %d processos e "+
+			"congelar o unico par deixaria a frota sem ninguem para assumir as sessoes dele. Sem ela, a "+
+			"metade da cerca da invariante 1 (perder a lease para a sessao na hora) fica SEM MEDIDA: "+
+			"um dono morto nao publica, entao nenhuma morte desta corrida pode quebra-la. Use "+
+			"-processes 3 ou mais.", plan.processes))
+	}
+
+	// Drained again, because the phase above put work in front of an instance that spent
+	// a minute frozen. A command a thawed owner is still finishing is ordinary work in
+	// progress, and reading it as a hole in the consumer group is the same mistake as
+	// reading it before the first drain.
+	drainedAgain, _, _, err := waitForDrain(ctx, cl, append([]*instance{}, others...), sids, 60*time.Second)
+	if err != nil {
+		return fmt.Errorf("%w: %w", errSetup, err)
+	}
+	if !drainedAgain {
+		rep.note("o grupo consumidor nao drenou nos 60 s depois da fase do dono congelado: o que a " +
+			"asserção de grupo consumidor disser e sobre uma frota que ainda estava trabalhando")
+	}
+
+	return assertInvariants(ctx, cl, rep, plan, answers, sids, pairs)
 }
 
 func shortSID(sid string) string {
@@ -152,4 +215,47 @@ func desiredConnected(ctx context.Context, active *run) (int, error) {
 		return 0, fmt.Errorf("%w: count the sessions the fleet should be running: %w", errSetup, err)
 	}
 	return count, nil
+}
+
+// waitForDrain waits until every command stream of the run has nothing pending, and says
+// whether it got there and how many commands the peers reclaimed on the way.
+//
+// Both numbers come from the fleet: the pending count from the consumer groups, the
+// reclaimed count from the peers' own metric. Neither is inferred from what this bench
+// sent, which is the difference between measuring a handover and describing one.
+func waitForDrain(ctx context.Context, cl *client, peers []*instance, sids []string,
+	within time.Duration) (drained bool, reclaimed, passes float64, err error) {
+
+	deadline := time.Now().Add(within)
+	for {
+		pending, err := cl.pendingOn(ctx, sids)
+		if err != nil {
+			return false, 0, 0, err
+		}
+		reclaimed, passes = 0, 0
+		for _, peer := range peers {
+			// The Vec is optional and the pass counter is not: a peer that reclaimed
+			// nothing has no `wac_commands_reclaimed_total` row at all, and reading that
+			// absence as an error would fail a run for the peer that had nothing to take.
+			found, err := peer.metricsWithOptional(ctx,
+				[]string{"wac_command_reclaim_passes_total"},
+				[]string{"wac_commands_reclaimed_total"})
+			if err != nil {
+				return false, 0, 0, err
+			}
+			reclaimed += found["wac_commands_reclaimed_total"]
+			passes += found["wac_command_reclaim_passes_total"]
+		}
+		if pending == 0 {
+			return true, reclaimed, passes, nil
+		}
+		if time.Now().After(deadline) {
+			return false, reclaimed, passes, nil
+		}
+		select {
+		case <-ctx.Done():
+			return false, reclaimed, passes, ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
 }

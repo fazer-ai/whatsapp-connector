@@ -34,6 +34,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -41,7 +42,8 @@ import (
 func main() {
 	sessions := flag.Int("sessions", 40, "how many sessions the fleet carries")
 	shards := flag.Int("shards", 4, "how many event shards the fleet publishes to (more than one, or the shard half of invariant 3 is invisible)")
-	processes := flag.Int("processes", 2, "how many connector processes to run (two or more, or there is no ownership to move)")
+	processes := flag.Int("processes", 3, "how many connector processes to run. Two moves ownership; three is what "+
+		"reaches invariant 1's fence, because freezing an owner needs a second peer left to take its sessions")
 	sends := flag.Int("sends", 6, "how many commands to put in flight per session during the handover")
 	maxAdoption := flag.Duration("max-adoption", 0, "optional: a mass adoption slower than this is reported as a measurement outside its range, never as a defect")
 	keep := flag.Bool("keep", false, "keep the run's database, keys and logs instead of giving them back")
@@ -91,33 +93,22 @@ func runBench(sessions, shards, processes, sends int, maxAdoption time.Duration,
 		return outcomeSetup, fmt.Errorf("%w: %w", errSetup, err)
 	}
 
-	// Before anything of this run exists, so that what it writes can be told from what
-	// was already on a Redis it shares with everything else on this machine.
-	before, err := active.snapshotKeys(ctx)
-	if err != nil {
-		return outcomeSetup, fmt.Errorf("%w: read the Redis this run is about to share: %w", errSetup, err)
-	}
-
-	workDir, err := os.MkdirTemp("", "wac-fleetbench-"+active.id+"-")
-	if err != nil {
-		return outcomeSetup, fmt.Errorf("%w: make a directory for this run: %w", errSetup, err)
-	}
-
 	rep := &report{engine: "fake"}
 	rep.note("motor: fake, por decisao (issue #264). Nenhuma corrida desta bancada toca conta real do WhatsApp.")
 	rep.note("nao coberto: o motor whatsmeow sob troca de dono. Parear conta de verdade exige aparelho fisico " +
 		"(NEEDS_PHYSICAL_DEVICE), entao o que um verde daqui NAO diz e se um socket, um pareamento e uma " +
 		"mensagem de verdade sobrevivem a troca de dono.")
-	rep.note("banco desta corrida: " + active.database + " · prefixo: " + active.prefix + " · arquivos: " + workDir)
 
-	binary, sum, err := buildConnector(ctx, moduleDir, workDir)
-	if err != nil {
-		_ = active.cleanup(context.WithoutCancel(ctx))
-		return outcomeSetup, fmt.Errorf("%w: %w", errSetup, err)
-	}
-	rep.binary, rep.binarySum = binary, sum
-
-	group := &fleet{binary: binary, binarySum: sum, dir: workDir, env: active.connectorEnv(shards)}
+	// Armed here and not further down, because from the line above this one there is
+	// already a database on the server with this run's name on it. Every failure between
+	// that line and the fleet starting -- a snapshot that cannot read, an interrupt, a
+	// directory that will not be made -- returned without dropping it, and what that
+	// leaves behind is a database nobody will ever look for again.
+	//
+	// `workDir` is read at call time, so the deferred call sees the directory whenever it
+	// came to exist rather than the empty string it holds here.
+	workDir := ""
+	group := &fleet{}
 	defer func() {
 		group.shutdown()
 		if keep {
@@ -125,10 +116,33 @@ func runBench(sessions, shards, processes, sends int, maxAdoption time.Duration,
 			return
 		}
 		for _, trouble := range active.cleanup(context.WithoutCancel(ctx)) {
-			fmt.Fprintf(os.Stderr, "limpeza: %s\n", trouble)
+			_, _ = fmt.Fprintf(os.Stderr, "limpeza: %s\n", trouble)
 		}
-		_ = os.RemoveAll(workDir)
+		if workDir != "" {
+			_ = os.RemoveAll(workDir)
+		}
 	}()
+
+	// Before anything of this run exists, so that what it writes can be told from what
+	// was already on a Redis it shares with everything else on this machine.
+	before, err := active.snapshotKeys(ctx)
+	if err != nil {
+		return outcomeSetup, fmt.Errorf("%w: read the Redis this run is about to share: %w", errSetup, err)
+	}
+
+	workDir, err = os.MkdirTemp("", "wac-fleetbench-"+active.id+"-")
+	if err != nil {
+		return outcomeSetup, fmt.Errorf("%w: make a directory for this run: %w", errSetup, err)
+	}
+
+	rep.note("banco desta corrida: " + active.database + " · prefixo: " + active.prefix + " · arquivos: " + workDir)
+
+	binary, sum, err := buildConnector(ctx, moduleDir, workDir)
+	if err != nil {
+		return outcomeSetup, fmt.Errorf("%w: %w", errSetup, err)
+	}
+	rep.binary, rep.binarySum = binary, sum
+	*group = fleet{binary: binary, binarySum: sum, dir: workDir, env: active.connectorEnv(shards)}
 
 	if err := measure(ctx, active, group, rep, benchPlan{
 		sessions: sessions, shards: shards, processes: processes, sends: sends, maxAdoption: maxAdoption,
@@ -153,20 +167,39 @@ func runBench(sessions, shards, processes, sends int, maxAdoption time.Duration,
 	// prefix touched a fleet it does not own, and nothing it asserted about "the" fleet
 	// can be trusted afterwards. Reported as setup and not as a broken invariant, because
 	// what is wrong is the instrument.
+	// Two questions, and only one of them a before/after inventory can answer.
+	//
+	// "Did a key outside this run's prefix appear" it can answer. "Did this run write it"
+	// it cannot: this Redis is shared on purpose, and another fleet, another bench or a
+	// developer's own client can write during the same minutes. Failing the run on that
+	// would reject a correctly isolated run because somebody else was working.
+	//
+	// So the attributable half is the one that fails: a key carrying this run's id was
+	// written by this run, wherever it landed. Everything else is reported by name and
+	// left to whoever reads it, which is more than a silent pass and less than a verdict
+	// the evidence does not support.
 	strayed, err := active.unprefixed(context.WithoutCancel(ctx), before)
-	if err != nil {
+	switch {
+	case err != nil:
 		rep.note("nao deu para conferir se a corrida escreveu fora do proprio prefixo: " + err.Error())
-	} else if len(strayed) > 0 {
-		shown := strayed
-		if len(shown) > 10 {
-			shown = shown[:10]
+	case len(strayed) == 0:
+		rep.note("nenhuma chave nova fora do prefixo " + active.prefix + " apareceu no Redis durante a corrida")
+	default:
+		mine := []string{}
+		for _, key := range strayed {
+			if strings.Contains(key, active.id) {
+				mine = append(mine, key)
+			}
 		}
-		reason := fmt.Errorf("%w: a corrida escreveu %d chaves fora do prefixo %s, entao ela tocou uma "+
-			"frota que nao e a dela: %v", errSetup, len(strayed), active.prefix, shown)
-		rep.write(os.Stdout, outcomeSetup, reason)
-		return outcomeSetup, nil
-	} else {
-		rep.note("nenhuma chave fora do prefixo " + active.prefix + " apareceu no Redis durante a corrida")
+		if len(mine) > 0 {
+			reason := fmt.Errorf("%w: a corrida escreveu %d chaves fora do prefixo %s e elas carregam o id "+
+				"desta corrida, entao sao dela: %s", errSetup, len(mine), active.prefix, shortList(mine))
+			rep.write(os.Stdout, outcomeSetup, reason)
+			return outcomeSetup, nil
+		}
+		rep.note(fmt.Sprintf("apareceram %d chaves novas fora do prefixo %s durante a corrida, e nenhuma "+
+			"carrega o id dela. Este Redis e compartilhado de proposito, e um inventario antes e depois "+
+			"nao diz quem escreveu: %s", len(strayed), active.prefix, shortList(strayed)))
 	}
 
 	final := rep.outcome()
@@ -197,4 +230,13 @@ func moduleRoot(from string) (string, error) {
 		}
 		dir = parent
 	}
+}
+
+// shortList keeps a report line readable when the list is long, and says how many it left
+// out rather than trimming in silence.
+func shortList(keys []string) string {
+	if len(keys) <= 10 {
+		return fmt.Sprint(keys)
+	}
+	return fmt.Sprintf("%v e mais %d", keys[:10], len(keys)-10)
 }

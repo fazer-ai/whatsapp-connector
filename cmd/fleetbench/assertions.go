@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 	"github.com/fazer-ai/whatsapp-connector/internal/transport/redisstream"
@@ -18,7 +21,7 @@ import (
 // it is an assertion that never ran, and printing it as a pass is how a bench ends up
 // saying more than it measured.
 func assertInvariants(ctx context.Context, cl *client, rep *report, plan benchPlan,
-	inFlight, sids []string, pairs []idempotentPair) error {
+	answers map[string][]string, sids []string, pairs []idempotentPair) error {
 
 	published := map[string][]protocol.Event{}          // sid -> events, in stream order
 	shardOf := map[string]map[string]bool{}             // sid -> streams it was seen on
@@ -64,9 +67,7 @@ func assertInvariants(ctx context.Context, cl *client, rep *report, plan benchPl
 	assertSeqMonotonic(rep, published)
 	assertOneShard(rep, shardOf, firstOn, sids)
 	assertNoLostEvent(rep, published, truncated)
-	if err := assertNoDuplicateEffect(ctx, cl, rep, inFlight, pairs); err != nil {
-		return err
-	}
+	assertNoDuplicateEffect(rep, answers, pairs)
 	return assertConsumerGroups(ctx, cl, rep, sids)
 }
 
@@ -105,7 +106,9 @@ func assertOneOwner(rep *report, published map[string][]protocol.Event,
 			pairs++
 			if len(holders) > 1 {
 				offenders = append(offenders, fmt.Sprintf(
-					"%s no epoch %d foi publicado por %s ao mesmo tempo", sid, epoch, strings.Join(sorted(holders), " e ")))
+					"%s foi publicado sob o epoch %d por %s, e um epoch e uma geracao de posse: "+
+						"dois publicadores nele sao dois donos da mesma lease",
+					sid, epoch, strings.Join(sorted(holders), " e ")))
 			}
 		}
 	}
@@ -261,9 +264,17 @@ func assertNoLostEvent(rep *report, published map[string][]protocol.Event, trunc
 				continue
 			}
 			runs++
-			seqs := make([]uint64, 0, len(run))
+			// Distinct and sorted, because a repeated `seq` is not a missing one. Read
+			// with duplicates in, 1,1,3 reports "falta seq 2 entre 1 e 1", which names a
+			// hole between a number and itself: the repetition is what is wrong there,
+			// and `assertSeqMonotonic` is the assertion that says so.
+			distinct := map[uint64]bool{}
 			for _, event := range run {
-				seqs = append(seqs, event.Seq)
+				distinct[event.Seq] = true
+			}
+			seqs := make([]uint64, 0, len(distinct))
+			for seq := range distinct {
+				seqs = append(seqs, seq)
 			}
 			sort.Slice(seqs, func(i, j int) bool { return seqs[i] < seqs[j] })
 			for i := 1; i < len(seqs); i++ {
@@ -314,29 +325,24 @@ func assertNoLostEvent(rep *report, published map[string][]protocol.Event, trunc
 //
 // One claim and not two, because they are one claim: the issue asks whether a side effect
 // can happen twice, and these are the two doors to it that a client can see from outside.
-func assertNoDuplicateEffect(ctx context.Context, cl *client, rep *report, inFlight []string,
-	pairs []idempotentPair) error {
+func assertNoDuplicateEffect(rep *report, answers map[string][]string, pairs []idempotentPair) {
 	examined, repeated, offenders := 0, 0, []string{}
-	for _, id := range inFlight {
-		answers, err := cl.repliesTo(ctx, id)
-		if err != nil {
-			return fmt.Errorf("%w: %w", errSetup, err)
-		}
-		if len(answers) == 0 {
+	for id, given := range answers {
+		if len(given) == 0 {
 			continue
 		}
 		examined++
-		if len(answers) < 2 {
+		if len(given) < 2 {
 			continue
 		}
 		repeated++
-		first := answers[0]
-		for _, other := range answers[1:] {
+		first := given[0]
+		for _, other := range given[1:] {
 			if other != first {
 				offenders = append(offenders, fmt.Sprintf(
 					"o comando %s foi respondido %d vezes com respostas diferentes, entao ele rodou de novo "+
 						"em vez de ser lembrado pela idempotencia de message_id:\n  %s\n  %s",
-					id, len(answers), first, other))
+					id, len(given), first, other))
 				break
 			}
 		}
@@ -368,10 +374,23 @@ func assertNoDuplicateEffect(ctx context.Context, cl *client, rep *report, inFli
 		notWhy: ifEmpty(repeated+len(pairs), "nenhum comando desta corrida foi respondido duas vezes e "+
 			"nenhuma mensagem foi pedida duas vezes, entao nao houve o que duplicar"),
 	})
-	return nil
 }
 
 // The consumer group ends without a hole: nothing pending and nothing waiting to be read.
+//
+// What this speaks for, and what it does not.
+//
+// It is the sixth claim the issue asks for, and it is about command delivery: every
+// command this bench put on a session's stream was read, carried out and acknowledged, so
+// the group has nothing pending and no lag. A hole here is a command the fleet took and
+// never retired, which after an ownership change is a command nobody will run.
+//
+// It is NOT invariant 4. That one is about an inbound WhatsApp message being acknowledged
+// to WhatsApp only after its event is published, and nothing in this run touches it: the
+// workload is outbound commands, no inbound message arrives, and Redis is never cut
+// mid-publish. A build that acknowledged inbound messages before publishing would pass
+// this check untouched. Saying so here rather than leaving the label to imply otherwise is
+// the difference between a bench that measures six things and one that claims seven.
 func assertConsumerGroups(ctx context.Context, cl *client, rep *report, sids []string) error {
 	checked, offenders := 0, []string{}
 	streams := append([]string{cl.keys.Control()}, nil...)
@@ -381,8 +400,14 @@ func assertConsumerGroups(ctx context.Context, cl *client, rep *report, sids []s
 	for _, stream := range streams {
 		groups, err := cl.rdb.XInfoGroups(ctx, stream).Result()
 		if err != nil {
-			// A stream with no group is a stream nothing consumed, which is not a hole.
-			continue
+			// A stream that does not exist is a stream nothing consumed, which is not a
+			// hole. Anything else -- a connection that dropped, a timeout, an ACL -- is a
+			// reading that failed, and spending it as "nothing to check here" is how the
+			// last inspection of a run comes back green on the groups it never read.
+			if errors.Is(err, redis.Nil) || strings.Contains(err.Error(), "no such key") {
+				continue
+			}
+			return fmt.Errorf("%w: read the consumer groups of %s: %w", errSetup, stream, err)
 		}
 		for _, group := range groups {
 			checked++
@@ -393,12 +418,13 @@ func assertConsumerGroups(ctx context.Context, cl *client, rep *report, sids []s
 		}
 	}
 	rep.assert(&assertion{
-		invariant: "4 (o ack so acontece depois da publicacao: perder o Redis custa reentrega, nunca mensagem)",
-		claim:     "grupo consumidor sem buraco: nada pendente e lag zero ao fim",
-		series:    fmt.Sprintf("%d grupos consumidores sobre %d streams de comando", checked, len(streams)),
-		points:    checked,
-		held:      len(offenders) == 0,
-		detail:    strings.Join(offenders, "\n"),
+		invariant: "entrega de comando pelo transporte (NAO e a invariante 4: o ack de mensagem que " +
+			"CHEGA, depois da publicacao, nao e exercitado por esta carga e fica sem medida)",
+		claim:  "grupo consumidor sem buraco: nada pendente e lag zero ao fim",
+		series: fmt.Sprintf("%d grupos consumidores sobre %d streams de comando", checked, len(streams)),
+		points: checked,
+		held:   len(offenders) == 0,
+		detail: strings.Join(offenders, "\n"),
 	})
 	return nil
 }

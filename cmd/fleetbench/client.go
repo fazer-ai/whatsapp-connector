@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -158,4 +159,54 @@ func (c *client) instances(ctx context.Context) (map[string]map[string]string, e
 		registry[name] = fields
 	}
 	return registry, nil
+}
+
+// pendingOn is how many commands the fleet has taken and not yet retired, across every
+// command stream of this run.
+//
+// Read from the consumer groups and not from what this bench sent: "I put six commands on
+// a stream" says nothing about whether any of them is still in flight a moment later, and
+// the fake engine answers a send before the next one is written.
+func (c *client) pendingOn(ctx context.Context, sids []string) (int64, error) {
+	streams := make([]string, 0, len(sids)+1)
+	streams = append(streams, c.keys.Control())
+	for _, sid := range sids {
+		streams = append(streams, c.keys.Commands(sid))
+	}
+	total := int64(0)
+	for _, stream := range streams {
+		groups, err := c.rdb.XInfoGroups(ctx, stream).Result()
+		if err != nil {
+			// A stream nothing ever consumed has no group and no pending entries. Any
+			// other failure is a reading that did not happen, and returning zero for it
+			// would be a drain that was never observed.
+			if errors.Is(err, redis.Nil) || strings.Contains(err.Error(), "no such key") {
+				continue
+			}
+			return 0, fmt.Errorf("read the consumer groups of %s: %w", stream, err)
+		}
+		for _, group := range groups {
+			total += group.Pending
+		}
+	}
+	return total, nil
+}
+
+// repliesToAll takes the answers of every command in one go, so they are read while they
+// are still there.
+//
+// A reply list carries a TTL: the connector puts one on it rather than leaving an answer
+// nobody came back for in Redis forever. Reading them at the end of a run that spends a
+// minute on a later phase reads a list that has already expired, and an empty list is not
+// evidence that a command answered once.
+func (c *client) repliesToAll(ctx context.Context, ids []string) (map[string][]string, error) {
+	answers := make(map[string][]string, len(ids))
+	for _, id := range ids {
+		found, err := c.repliesTo(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		answers[id] = found
+	}
+	return answers, nil
 }

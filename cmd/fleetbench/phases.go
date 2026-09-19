@@ -126,8 +126,7 @@ func measure(ctx context.Context, active *run, group *fleet, rep *report, plan b
 	// All four are about the connector and none about the bench. A goroutine count of
 	// this process would be a number about the measuring instrument, which is the kind
 	// of figure that gets copied into an issue as if it described the fleet.
-	capacity, err := first.metrics(ctx, "wac_sessions_running", "wac_events_published_total",
-		"go_goroutines", "process_resident_memory_bytes")
+	capacity, err := first.metrics(ctx, "wac_sessions_running", "wac_events_published_total", "go_goroutines")
 	if err != nil {
 		return fmt.Errorf("%w: %w", errSetup, err)
 	}
@@ -135,7 +134,21 @@ func measure(ctx context.Context, active *run, group *fleet, rep *report, plan b
 	rep.measure(phase1, "sessoes na instancia", capacity["wac_sessions_running"], "sessoes")
 	rep.measure(phase1, "eventos publicados ate aqui", capacity["wac_events_published_total"], "eventos")
 	rep.measure(phase1, "goroutines da instancia", capacity["go_goroutines"], "goroutines")
-	rep.measure(phase1, "memoria residente da instancia", capacity["process_resident_memory_bytes"]/(1<<20), "MiB")
+
+	// Asked for on its own, because this one can legitimately be absent. MEASURED on
+	// darwin/arm64: with `CGO_ENABLED=0` the process collector's memory reader returns
+	// `errNotImplemented` and the series is missing from a healthy endpoint. A deployment
+	// runs Linux and has it. Reading a missing metric as zero would print "0.00 MiB" for a
+	// running fleet; refusing the run over it would make the whole bench unusable on this
+	// machine, and neither is the truth, which is that the number was not available.
+	if resident, err := first.metrics(ctx, "process_resident_memory_bytes"); err == nil {
+		rep.measure(phase1, "memoria residente da instancia",
+			resident["process_resident_memory_bytes"]/(1<<20), "MiB")
+	} else {
+		rep.note("memoria residente: sem medida nesta corrida. O /metrics de " + first.name +
+			" nao traz process_resident_memory_bytes, o que acontece num build darwin com " +
+			"CGO_ENABLED=0. Um zero aqui seria uma frota sem memoria nenhuma.")
+	}
 	backends, err := poolBackends(ctx, active)
 	if err != nil {
 		return err
