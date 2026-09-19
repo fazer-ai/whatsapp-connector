@@ -493,20 +493,15 @@ func (s *Session) createGroup(ctx context.Context, command *protocol.Command) (j
 	// which call it is. #284 measured the cost of having no answer at all: with the store
 	// stalled, a `group.create` carrying neither ceiling field did not come back.
 	//
-	// What it bounds is the wait, not every way a store can be slow, and the difference is
-	// a dialect's. On PostgreSQL the deadline reaches the server, which cancels the
-	// statement in flight. On SQLite a write already blocked on another writer of the same
-	// file sits out `busy_timeout` before it looks at the context at all: measured at
-	// 10.09s against a three hundred millisecond deadline, on this repository's own driver
-	// and pragmas. The error that comes back is the context's and the time is not, and it
-	// is per call rather than per command -- a second bounded write that starts with a
-	// live context gets its own window, so the worst case for a creation on that dialect
-	// is two of them, against the two five second ceilings this function declares.
-	// `busy_timeout` and `storeLimit` are two ceilings that do not know about each other
-	// and the smaller does not win, which is #293 and is true of every `storeLimit` in
-	// this package rather than anything #284 introduced. It is written here because "the
-	// command comes back inside the ceiling" is otherwise a claim wider than the
-	// measurement behind it.
+	// How the wait ends is a dialect's business, and on one of them it used to ignore this
+	// ceiling. On PostgreSQL the deadline reaches the server, which cancels the statement
+	// in flight. On SQLite a write already blocked on a writer in another process sat out
+	// `busy_timeout` first -- measured at 10.09s against a three hundred millisecond
+	// deadline, per call rather than per command, so a creation's worst case was two of
+	// those windows against the two five second ceilings declared here (#293). The pragma
+	// is derived from the caller's remaining time now, in
+	// `internal/store/sqlitebudget.go`, which is what lets this say "the command comes
+	// back inside the ceiling" without the claim being wider than the measurement.
 	writing, written := context.WithTimeout(ctx, s.storeLimit)
 	began, begun, err := s.store.BeginGroupCreate(writing, attempt, key, req.Subject, time.Now())
 	expired := writing.Err()
