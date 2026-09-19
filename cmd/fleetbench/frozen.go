@@ -162,7 +162,19 @@ func frozenOwner(ctx context.Context, active *run, cl *client, rep *report, plan
 	case <-time.After(15 * time.Second):
 	}
 
-	counted.take(ctx, "fim da fase do dono congelado", append([]*instance{owner}, peers...))
+	// Several, spaced, and not one. "Sustained" is decided by comparing two readings more
+	// than two heartbeats apart, so a single census at the end of the phase can never be
+	// sustained however wrong the number is: MEASURED, a mutant that leaves the thawed
+	// owner running its sessions produced a fleet total of 8 over 4 sids here, in one
+	// sample, and the rule discarded it as gauge lag.
+	for range 8 {
+		counted.take(ctx, "fim da fase do dono congelado", append([]*instance{owner}, peers...))
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Second):
+		}
+	}
 	rep.measure("dono congelado", "tempo congelado ate um par assumir", hold.Seconds(), "s")
 	rep.measure("dono congelado", "sessoes que os pares assumiram com o dono congelado",
 		float64(taken), "sessoes")

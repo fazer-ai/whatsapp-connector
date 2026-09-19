@@ -54,6 +54,11 @@ func handover(ctx context.Context, active *run, group *fleet, cl *client, rep *r
 		}
 	}
 
+	// From here to the end of the frozen phase the fleet never goes quiet. What a short
+	// overlap of two owners writes is an event under the older epoch landing after one
+	// under the newer, and that only exists if somebody is asking the session to publish.
+	steady := startLoad(ctx, active, cl, sids, 200*time.Millisecond)
+
 	// Measured, not assumed: how many of those the owner had not retired when it died.
 	//
 	// The fake engine answers a send at once, and these go on the streams one after
@@ -156,6 +161,10 @@ func handover(ctx context.Context, active *run, group *fleet, cl *client, rep *r
 			"um dono morto nao publica, entao nenhuma morte desta corrida pode quebra-la. Use "+
 			"-processes 3 ou mais.", plan.processes))
 	}
+
+	// Stopped before anything is read, so nothing is still writing to a stream the
+	// assertions are about to walk.
+	rep.measure("troca de dono sob carga", "comandos da carga continua", float64(steady.end()), "comandos")
 
 	// Drained again, because the phase above put work in front of an instance that spent
 	// a minute frozen. A command a thawed owner is still finishing is ordinary work in
