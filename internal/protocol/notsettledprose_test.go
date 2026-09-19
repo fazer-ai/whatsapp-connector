@@ -58,6 +58,14 @@ func TestTheContractSaysWhatAClientDoesWithNotSettled(t *testing.T) {
 		// would have a client retrying the same key for good.
 		{"bounds its", "without it the contract promises a resolution one reachable state never delivers"},
 		{"stranded intent", "the client needs a name for the case where asking again is the wrong move"},
+		// #284 put a ceiling on the intent write, and a ceiling that runs out after the
+		// database committed the row leaves the same stranded intent by a second route --
+		// one that needs no crash, and that a client will meet whenever its database is
+		// slow rather than dead. The paragraph named the crash alone, and nothing here read
+		// the cause at all: swapping it for any other sentence left this green.
+		{"ceiling on that write can run out", "the crash is not the only way in, and the other way needs nothing to have gone wrong with the process"},
+		{"row is on record, nothing was ever asked of WhatsApp", "what makes it stranded is the pair, and a client that reads only the first half retries against WhatsApp"},
+		{"already answered that it could not record the intent", "the client saw a failure for this key and still has to treat the key as spent"},
 	} {
 		if !strings.Contains(paragraph, clause.phrase) {
 			t.Errorf("the `not_settled` paragraph of contract/PROTOCOL.md never says %q: %s", clause.phrase, clause.why)

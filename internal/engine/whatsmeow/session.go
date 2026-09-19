@@ -91,9 +91,18 @@ type Session struct {
 	// the local cleanup is what fails.
 	logout func(context.Context, *wm.Client) error
 
-	// storeLimit bounds the store work an event handler does before it can publish what
-	// the event was. A field only so a test can make a store that stalls take less than
-	// the real bound; nothing else changes it.
+	// storeLimit bounds a single store call before whatever is waiting on it can go on:
+	// an event handler before it publishes what the event was, and a command before it
+	// answers. It was written for the first alone, and by #284 that was two call sites
+	// out of date -- `contact.go` reads under it for a command, and a group creation now
+	// writes under it twice.
+	//
+	// What it does not bound is every way a store can be slow. On SQLite a write already
+	// blocked on another writer of the same file waits out the DSN's `busy_timeout`
+	// before it looks at a context, which is #293.
+	//
+	// A field only so a test can make a store that stalls take less than the real bound;
+	// nothing else changes it.
 	storeLimit time.Duration
 
 	// deliverWait bounds how long an inbound message waits to hear that its event was
