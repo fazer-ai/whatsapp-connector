@@ -2,6 +2,7 @@ package protocol_test
 
 import (
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -35,21 +36,42 @@ func TestTheContractSaysWhatBoundsACommandWithNoCeilingOfItsOwn(t *testing.T) {
 			"which #165 measured to be false: the library bounds every request it sends")
 	}
 
-	// Two sentences that counted the unbounded waits, and were wrong by one. The count of
-	// that shape has been wrong twice: the paragraph above already says the list is not
-	// claimed complete, and these two contradicted it two sentences later. They are asserted
-	// as absent rather than rewritten into a clause because any exhaustive phrasing of this
-	// is the defect, not this particular wording of it.
-	for _, gone := range []string{
-		"there are two of them on a send's way out",
-		"all of them but those two",
+	// The count of the waits no ceiling reaches has been wrong twice, and the second time it
+	// was wrong in a paragraph the fix to the first one did not touch: the sentence counting
+	// them moved up by one and went on counting, while the paragraph below it grew a third.
+	// So the check is the one the command count already uses -- read the number and compare
+	// it against the things it stands for, in the same document -- rather than a literal
+	// match on the two sentences that happened to carry it last time.
+	//
+	// A phrase that does not fix a number ("more than one", "named below") parses as no
+	// count and passes, which is the intent: the contract says two paragraphs up that it
+	// does not claim the list is complete, and a lower bound agrees with that while an exact
+	// count is a promise the next pin bump can break.
+	run := strings.Join(theCeilingRun(t, prose), "\n\n")
+	named := 0
+	for _, wait := range []string{
+		"already being written to the socket",
+		"one send per connection at a time",
+		"the read lock on the socket",
 	} {
-		if strings.Contains(prose, gone) {
-			t.Errorf("PROTOCOL.md says %q, which counts the waits no ceiling reaches and "+
-				"gets the count wrong: the socket read lock is a third, held for the length "+
-				"of a reconnection's dial. The paragraph above says the list is not claimed "+
-				"complete; this sentence claimed it two sentences later", gone)
+		if strings.Contains(run, wait) {
+			named++
 		}
+	}
+	words := map[string]int{"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6}
+	counting := regexp.MustCompile(`(?i)\b(one|two|three|four|five|six)\b of (?:them|these|those)\b[^.]{0,30}?\b(?:named below|on a send's way out)\b|\ball of (?:them|these|those) but (?:those )?\b(one|two|three|four|five|six)\b`)
+	for _, hit := range counting.FindAllStringSubmatch(run, -1) {
+		word := hit[1] + hit[2]
+		if words[word] != named {
+			t.Errorf("PROTOCOL.md says %q while the run names %d waits no ceiling reaches: "+
+				"the count was two, then three when the socket read lock turned up, and a "+
+				"number written out does not move when the list under it does. Say it "+
+				"without fixing a number, or move both", hit[0], named)
+		}
+	}
+	if !strings.Contains(run, "does not claim the list is complete") {
+		t.Error("PROTOCOL.md no longer says the list of paths that escape every ceiling is " +
+			"not claimed complete, and it has been wrong about that twice")
 	}
 
 	// The whole ceiling section, from the sentence that introduces the two caller fields to
@@ -144,7 +166,7 @@ func TestTheContractSaysWhatBoundsACommandWithNoCeilingOfItsOwn(t *testing.T) {
 			"the actionable half of the carve-out"},
 		{"that the send retry is bounded now", "still ends",
 			"#283 put a ceiling on it, so the paragraph naming it as unbounded became false"},
-		{"the two waits no ceiling reaches", "does not look at the context at all",
+		{"the waits no ceiling reaches", "does not look at the context at all",
 			"they are what stops a ceiling being a promise of a reply inside it"},
 		{"that a ceiling does not expire what is queued behind it",
 			"it does not end the commands queued behind it either",
