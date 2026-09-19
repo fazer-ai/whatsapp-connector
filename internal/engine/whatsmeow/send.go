@@ -481,8 +481,10 @@ func sendFailure(err error) error {
 // Two `%w`, so the chain carries both: the code for `errors.As` and the cause for
 // `errors.Is`. The reach of that second half is this function's callers and no further,
 // which is why the cause lives here rather than in `protocol.Error`, where every producer
-// in the repository would have gained one at once and all fourteen sites that ask
-// `errors.Is(err, context.DeadlineExceeded)` would have had to be re-read.
+// in the repository would have gained one at once, and every site that asks `errors.Is`
+// against a context sentinel would have had to be re-read. The count of those is not
+// published here on purpose: a number in a comment is a number nothing checks, and this
+// one was already wrong once, in two different readings of what it counted.
 func because(code protocol.ErrorCode, message string, cause error) error {
 	return fmt.Errorf("%w: %w", protocol.NewError(code, message), cause)
 }

@@ -324,11 +324,17 @@ func TestEveryOtherRefusalKeepsItsCodeAndItsSentence(t *testing.T) {
 func TestNoSentenceThisBuildsCanReAimTheBranchThatReadsTheText(t *testing.T) {
 	t.Parallel()
 
-	// Every input the table above covers, plus the timeout four, so the set of sentences
-	// is every one `sendFailure` can emit.
+	// Every input the table above covers, plus the branch's own and the timeout four, so
+	// the set of sentences is every one `sendFailure` can emit. Counted against the
+	// `case` arms of that function rather than asserted: seven sentences, and all seven
+	// are produced below.
 	inputs := []error{
 		wm.ErrNotLoggedIn, wm.ErrNotConnected, wm.ErrBroadcastListUnsupported,
 		wm.ErrUnknownServer, wm.ErrRecipientADJID, errors.New("something new in the protocol"),
+		// The branch's own input, and the one the first draft of this left out while
+		// claiming to cover every sentence. Its answer is the sentence most able to
+		// re-aim the branch, since that is the branch it comes from.
+		errors.New("no LID found for 5511999999999@s.whatsapp.net from server"),
 	}
 	for _, cause := range theFourCauses() {
 		inputs = append(inputs, cause.err)
