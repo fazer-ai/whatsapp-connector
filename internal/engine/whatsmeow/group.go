@@ -478,12 +478,44 @@ func (s *Session) createGroup(ctx context.Context, command *protocol.Command) (j
 	if err != nil {
 		return nil, protocol.NewError(protocol.ErrorInternal, "a group creation could not be named")
 	}
-	began, begun, err := s.store.BeginGroupCreate(ctx, attempt, key, req.Subject, time.Now())
+	// Bounded, and derived from the caller's context rather than the session's, which is
+	// the opposite of the abandon write thirty lines down. The two differ in when they
+	// run: this one runs before any request, so a caller who has stopped waiting has
+	// nothing to lose by it being dropped, and a ceiling shorter than this one is theirs
+	// to set and should win. The abandon write runs after a creation failed, when the
+	// caller's deadline may be exactly what expired, and it has to outlive that.
+	//
+	// The number is `storeLimit`, the same one every other store write in this package
+	// uses, and the reason is not that it was picked for a write like this one: it was
+	// picked for a bind. The question it answers here is the one it answers everywhere in
+	// this package, which is how long this connector is willing to hold an account's
+	// whole command queue on a single store call, and that answer does not depend on
+	// which call it is. #284 measured the cost of having no answer at all: with the store
+	// stalled, a `group.create` carrying neither ceiling field did not come back.
+	//
+	// What it bounds is the wait, not every way a store can be slow, and the difference is
+	// a dialect's. On PostgreSQL the deadline reaches the server, which cancels the
+	// statement in flight. On SQLite a write already blocked on another writer of the same
+	// file sits out `busy_timeout` before it looks at the context at all: measured at
+	// 10.09s against a three hundred millisecond deadline, on this repository's own driver
+	// and pragmas. The error that comes back is the context's and the time is not, and it
+	// is per call rather than per command -- a second bounded write that starts with a
+	// live context gets its own window, so the worst case for a creation on that dialect
+	// is two of them, against the two five second ceilings this function declares.
+	// `busy_timeout` and `storeLimit` are two ceilings that do not know about each other
+	// and the smaller does not win, which is #293 and is true of every `storeLimit` in
+	// this package rather than anything #284 introduced. It is written here because "the
+	// command comes back inside the ceiling" is otherwise a claim wider than the
+	// measurement behind it.
+	writing, written := context.WithTimeout(ctx, s.storeLimit)
+	began, begun, err := s.store.BeginGroupCreate(writing, attempt, key, req.Subject, time.Now())
+	expired := writing.Err()
+	written()
 	if err != nil {
 		// The intent could not be written, so the cover is not there. Refused rather than
 		// created: the caller's retry costs them a command, and creating anyway costs
 		// them a group they cannot tell from the one a redelivery would make.
-		return nil, contactFailure(err, "group creation")
+		return nil, s.intentFailure(ctx, expired, err, attempt)
 	}
 	if begun {
 		// This command has been here before, so a group may already exist for it and this
@@ -540,11 +572,67 @@ func (s *Session) createGroup(ctx context.Context, command *protocol.Command) (j
 	// client retry a creation that happened -- the very duplicate this exists to prevent.
 	// It is also not the only chance to write it down: WhatsApp's own notification about
 	// this group carries the key, and `joinedAGroup` records the pair when it arrives.
-	if err := s.store.FinishGroupCreate(ctx, attempt, made.JID.String()); err != nil {
+	//
+	// On a window of its own, and off the session's context rather than the caller's, for
+	// the reason the abandon write above has: the group exists now, so this write has to
+	// happen whether or not whoever asked is still waiting. Bounded all the same, because
+	// a store that stopped answering would otherwise hold this command, and every command
+	// queued behind it for that account, for as long as the process runs -- which #284
+	// measured happening here as well as at the intent write, so closing only the first
+	// would have left the account held at the second.
+	naming, named := context.WithTimeout(s.ctx, s.storeLimit)
+	defer named()
+	if err := s.store.FinishGroupCreate(naming, attempt, made.JID.String()); err != nil {
 		s.log.Error().Err(err).Str("sid", s.sid).Str("attempt", attempt).
 			Msg("made a group and could not record which one; a redelivery will have to look for it")
 	}
 	return json.Marshal(s.describeGroup(ctx, withoutRefused(made)))
+}
+
+// intentFailure names what went wrong writing a creation's intent, and it exists because
+// the shared answer is wrong here in both halves.
+//
+// `commandFailure` turns a `context.DeadlineExceeded` into `timeout` with "did not go out
+// before the command's deadline". Over this write that says two false things at once:
+// nothing went out, because the intent is written before any request, and the deadline
+// that passed is this connector's own rather than the caller's. A client told `timeout`
+// reads it as WhatsApp not answering and retries against WhatsApp; what actually happened
+// is that the local store did not answer this connector.
+//
+// So the caller's clock keeps its word and this connector's ceiling gets the one the
+// package already uses for a store that will not answer: `internal`, which
+// `TestACreationThatCouldNotRecordItsIntentIsStillInternal` pins for a store that is
+// down, and which says the same thing about a store that is merely too slow to be waited
+// on -- this connector could not carry the command out, and it settles when somebody
+// fixes the store. #291 is where the two stop being distinguishable only by their
+// message; the log line below is what separates them until then.
+//
+// Which ceiling fired is read off the contexts and not off the error, and that is the
+// whole reason this takes `expired`. The first version of it asked
+// `errors.Is(err, context.DeadlineExceeded)`, which is true when the wait was for a free
+// connection in the pool and false when the query was already in flight: PostgreSQL
+// cancels the statement and `lib/pq` reports `canceling statement due to user request`,
+// which wraps nothing. Measured against a second pool holding the row's lock, that is
+// exactly what comes back, so the version that read the error would have taken the
+// deployment's own path -- contention on the row -- down the branch for an ordinary store
+// failure, with the suite green because the suite's stall is the pool one.
+func (s *Session) intentFailure(ctx context.Context, expired, err error, attempt string) error {
+	switch {
+	case ctx.Err() != nil:
+		// The caller's own clock, which is the case `commandFailure` was written for.
+		// Asked first because the two are not exclusive: `expired` is the derived
+		// context's error and a dead caller kills the child with it, so asking the other
+		// way round would call every caller ceiling ours.
+		return contactFailure(context.Cause(ctx), "group creation")
+	case expired == nil:
+		// Not a ceiling at all: the store answered, and what it answered was a failure.
+		return contactFailure(err, "group creation")
+	}
+	s.log.Error().Err(err).Str("attempt", attempt).
+		Dur("store_limit", s.storeLimit).
+		Msg("the store did not answer in time to record a group creation; refused before anything was asked of WhatsApp")
+	return protocol.NewError(protocol.ErrorInternal,
+		"the store did not answer in time to record the group creation")
 }
 
 // nothingWasMade reports whether a failed creation is one that certainly made no group.

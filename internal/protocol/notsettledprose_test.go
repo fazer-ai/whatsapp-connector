@@ -42,6 +42,75 @@ func TestTheContractSaysWhatAClientDoesWithNotSettled(t *testing.T) {
 		t.Fatal("contract/PROTOCOL.md has no paragraph about `not_settled`: a client that never reads the word cannot branch on it")
 	}
 
+	// #284 wrote "Two things leave it that way" over a list of two, and nothing read the
+	// number. This repository has already shipped that defect twice -- "Four of these"
+	// surviving a list that had come down to three, and a count of the unbounded waits
+	// that was two when there were three -- so the count is compared against the causes
+	// rather than trusted.
+	//
+	// The first version of this check held a map of words and skipped anything outside it,
+	// which left the exact swap the verifier measured, "Seven", passing green. So the
+	// sentence is matched first and the word looked up second: a count this cannot read is
+	// a count nothing can check, and that fails too.
+	//
+	// The anchor is "leave it that way", the count has to open the sentence, and a few
+	// words are allowed between them, so the noun and the verb can be rewritten without
+	// the count escaping. Measured with the count made wrong at the same time, which is
+	// the only way to tell a hole from a sentence that is simply still correct: "Seven
+	// things can leave it that way", "Seven of them leave it that way" and "Seven ways
+	// leave it that way" all go red. Requiring the sentence to open with it is what stops
+	// the opposite mistake -- without that, "and both leave it that way" was read as a
+	// count of "and" and failed a paragraph that counts nothing.
+	//
+	// What this does not reach, measured rather than guessed. Each one was planted with
+	// the count made wrong, because a variant that keeps the count true is not an escape:
+	//
+	//   - a rewrite that replaces the anchor. "There are seven ways in" and "Seven things
+	//     leave it so" both pass. No fence matching text survives its own anchor being
+	//     rewritten, and widening far enough to try starts firing on prose counting
+	//     something else;
+	//   - a count that does not open its sentence. "It is seven things that leave it that
+	//     way" passes, and that is the direct price of requiring the sentence to open
+	//     with it. Before that requirement this read any word touching the anchor as the
+	//     count and failed "The process and a ceiling both leave it that way", a
+	//     paragraph that counts nothing. Anyone dropping the `(?:^|\. )` to close this
+	//     row reopens that one;
+	//   - more than three words between the count and the anchor, which is the `{0,3}`
+	//     and not a vague "a few": "Seven separate and distinct things leave it that way"
+	//     passes, "Seven separate distinct things" does not;
+	//   - punctuation between them: "Seven, and only seven, things leave it that way";
+	//   - a count that grows. `named` comes from the list of cause phrases written below,
+	//     so a third cause added to the paragraph and not to that list is invisible and
+	//     the count stops moving with it. This catches the number ageing downwards, a
+	//     cause deleted under an unchanged count, and not upwards -- which is the
+	//     direction "Four of these" aged in. Counting from a list is one-directional by
+	//     construction and saying so is the honest half of it;
+	//   - anything outside this paragraph.
+	counted := regexp.MustCompile(`(?:^|\. )([A-Za-z]+|\d+)(?: \w+){0,3} leaves? it that way`)
+	if said := counted.FindStringSubmatch(paragraph); said != nil {
+		words := map[string]int{"One": 1, "Two": 2, "Three": 3, "Four": 4, "Five": 5, "Six": 6}
+		named := 0
+		for _, cause := range []string{
+			"process can die between the two",
+			"ceiling on that write can run out",
+		} {
+			if strings.Contains(paragraph, cause) {
+				named++
+			}
+		}
+		switch value, known := words[said[1]]; {
+		case !known:
+			t.Errorf("the `not_settled` paragraph counts the causes as %q, which this test cannot "+
+				"read: a number nothing compares against the list is the shape that has already "+
+				"gone stale twice in this repository", said[1])
+		case value != named:
+			t.Errorf("the `not_settled` paragraph says %q while it names %d of the causes this "+
+				"test knows about: a number written as a word does not move when the list under "+
+				"it does, and a client counting reasons it cannot see is worse off than one told "+
+				"none", said[0], named)
+		}
+	}
+
 	for _, clause := range []struct {
 		phrase string
 		why    string
@@ -58,6 +127,14 @@ func TestTheContractSaysWhatAClientDoesWithNotSettled(t *testing.T) {
 		// would have a client retrying the same key for good.
 		{"bounds its", "without it the contract promises a resolution one reachable state never delivers"},
 		{"stranded intent", "the client needs a name for the case where asking again is the wrong move"},
+		// #284 put a ceiling on the intent write, and a ceiling that runs out after the
+		// database committed the row leaves the same stranded intent by a second route --
+		// one that needs no crash, and that a client will meet whenever its database is
+		// slow rather than dead. The paragraph named the crash alone, and nothing here read
+		// the cause at all: swapping it for any other sentence left this green.
+		{"ceiling on that write can run out", "the crash is not the only way in, and the other way needs nothing to have gone wrong with the process"},
+		{"row is on record, nothing was ever asked of WhatsApp", "what makes it stranded is the pair, and a client that reads only the first half retries against WhatsApp"},
+		{"already answered that it could not record the intent", "the client saw a failure for this key and still has to treat the key as spent"},
 	} {
 		if !strings.Contains(paragraph, clause.phrase) {
 			t.Errorf("the `not_settled` paragraph of contract/PROTOCOL.md never says %q: %s", clause.phrase, clause.why)
