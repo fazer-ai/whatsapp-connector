@@ -234,6 +234,32 @@ Starting the whatsmeow engine without a database is refused rather than defaulte
 connector with nowhere to keep a pairing asks every session to scan a QR code on every
 restart, and reports itself healthy while doing it.
 
+### The fleet bench
+
+Leases, epochs, shards, `seq` and fencing are the half of this connector that only two
+processes under load can disprove, and the suite runs in one. `make bench-fleet` starts a
+real fleet against a real PostgreSQL and a real Redis, kills the owner with commands in
+flight, and asserts the operational invariants over what reached the streams:
+
+```bash
+WAC_TEST_DATABASE_URL=postgres://wac:wac@localhost:55432/wac?sslmode=disable \
+WAC_TEST_REDIS_URL=redis://localhost:56379/0 make bench-fleet
+```
+
+It runs with `WAC_ENGINE=fake`, and the run says so in its own output, so that no number
+it prints is ever read as a number about the real engine. The fake is not a shortcut
+around the thing being measured: none of the machinery these assertions are about knows
+which engine is behind the session. What the choice costs is that **whatsmeow under an
+ownership change is not covered by this bench and cannot be** -- pairing a real account
+needs a physical device (`NEEDS_PHYSICAL_DEVICE`), and no run of it ever touches a real
+WhatsApp account. So a green run says the fleet's own machinery holds across processes;
+it does not say whether a real socket, a real pairing and a real message survive an
+ownership change. That half has no measurement here.
+
+It is deliberately outside `make check`: it builds a binary, starts processes and waits on
+real clocks, which is minutes rather than the seconds `check` is allowed on every change.
+The exemption is recorded in `internal/toolchain`, where the suite reads it.
+
 ### Configuration
 
 | Variable | Default | What it is |
