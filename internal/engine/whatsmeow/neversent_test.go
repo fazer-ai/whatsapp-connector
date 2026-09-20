@@ -1,6 +1,7 @@
 package whatsmeow
 
 import (
+	"context"
 	"errors"
 	"testing"
 
@@ -86,5 +87,43 @@ func TestTheMarkOnARefusalDoesNotReachWhatTheClientIsTold(t *testing.T) {
 	}
 	if engine.NeverSent(nil) != nil {
 		t.Error("marking nothing produced an error")
+	}
+}
+
+// A command that gave up waiting for a socket to be taken down never reached the engine at
+// all, which is one step earlier than the pre-flight above and the same fact.
+//
+// It matters because this one is not a refusal the client asked for: the caller's own
+// runtime ran out while a reset held every command back. Left unmarked, the idempotency
+// ledger holds that command's key against every retry, and the reset that caused it is
+// over in a moment.
+func TestACommandThatGaveUpWaitingForATakedownSaysNothingWasSent(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	closing := make(chan struct{})
+	session.mu.Lock()
+	session.resetting = closing
+	session.mu.Unlock()
+	t.Cleanup(func() {
+		session.mu.Lock()
+		session.resetting = nil
+		session.mu.Unlock()
+		close(closing)
+	})
+
+	expired, giveUp := context.WithCancel(t.Context())
+	giveUp()
+
+	err := session.startCommand(expired)
+	if err == nil {
+		t.Fatal("a command began while a takedown was closing the socket")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("the refusal does not carry the caller's own reason: %v", err)
+	}
+	if !errors.Is(err, engine.ErrNeverSent) {
+		t.Errorf("a command that never reached the engine does not say so, so its key is held "+
+			"against a retry the reset it waited for has already made possible: %v", err)
 	}
 }

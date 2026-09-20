@@ -1045,11 +1045,15 @@ func (s *Session) run(ctx context.Context, waiting queued) (refusal protocol.Err
 		// `ran` and not a flat no: a teardown the engine refused reached the account and
 		// is an attempt, which is a different thing from one turned away before it began.
 		//
-		// And not when the answer came from the record. A redelivery answered from an
-		// attempt this instance never made touched nothing here, so counting it as work
-		// would take an adopted session off the list of ones to hand back and leave its
-		// lease renewed for an account nothing is using.
-		return asProtocolError(err).Code, command.Type == protocol.CommandSessionDelete, ran(err) && !recalled
+		// `recalled` is deliberately not consulted here, and it is only safe not to
+		// because no teardown is reserved. A failure answered from a record rather than
+		// from the account happens only on the attempt branch of `carryOut`, which only
+		// fires for `protocol.ReservedCommands`; `happened` is only read for a teardown;
+		// and `TestTheCommandsWithARecoveryOfTheirOwnAreNotReserved` is what keeps those
+		// two sets apart. Reserve a teardown and this line starts reporting work that did
+		// not happen here, which leaves an adopted session's lease renewed for an account
+		// nothing is using -- so that test failing is the signal to come back and read this.
+		return asProtocolError(err).Code, command.Type == protocol.CommandSessionDelete, ran(err)
 	}
 	// A recall answered from the record rather than from the account: the command is
 	// finished with, and nothing happened here.

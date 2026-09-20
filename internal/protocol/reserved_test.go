@@ -48,6 +48,12 @@ func TestEveryReservedCommandIsOneTheLedgerKeys(t *testing.T) {
 // Each of these has a recovery of its own that this one would stand in front of, and each
 // was found in review standing behind it. Written down so that adding one back is a
 // decision somebody takes rather than a line somebody appends.
+//
+// The teardowns carry a second consequence, named where it lives: `Session.run` reports
+// whether a command did anything here, and it reads the failure alone because a failure
+// answered from a record can only reach it for a reserved command. Reserve a teardown and
+// a redelivery answered from an attempt starts counting as work done, which keeps an
+// adopted session's lease renewed for an account nobody wants.
 func TestTheCommandsWithARecoveryOfTheirOwnAreNotReserved(t *testing.T) {
 	t.Parallel()
 
