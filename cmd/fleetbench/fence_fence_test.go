@@ -91,6 +91,13 @@ func TestEveryRedisClientHonoursCancellation(t *testing.T) {
 
 	built := 0
 	for path, file := range packageFiles(t) {
+		// The run's own clients, which talk to a Redis shared with other fleets. A client
+		// built inside a test speaks to a miniredis of that test's own, started and thrown
+		// away with it, and nothing it waits on outlives the test: the wait this flag is
+		// about does not exist there.
+		if strings.HasSuffix(path, "_test.go") {
+			continue
+		}
 		ast.Inspect(file, func(n ast.Node) bool {
 			call, isCall := n.(*ast.CallExpr)
 			if !isCall || calleeName(call) != "NewClient" {
@@ -111,9 +118,10 @@ func TestEveryRedisClientHonoursCancellation(t *testing.T) {
 				return true
 			}
 			if !setsContextTimeout(file, name) {
-				t.Errorf("%s: o cliente montado de %s nao liga ContextTimeoutEnabled. Sem isso, uma "+
-					"leitura bloqueante ignora o cancelamento e a corrida fica parada ate o timeout "+
-					"dela, com os conectores ja mortos e a limpeza sem comecar", path, name)
+				t.Errorf("%s: o cliente montado de %s nao liga ContextTimeoutEnabled. Sem isso, um "+
+					"contexto COM PRAZO nao chega ao socket: medido, um prazo de 1 s numa leitura "+
+					"bloqueante de 60 s so voltou em 60,07 s. (Cancelamento no meio da leitura e outro "+
+					"problema, e quem cobre ele e a espera em fatias de blockingPop.)", path, name)
 			}
 			return true
 		})
