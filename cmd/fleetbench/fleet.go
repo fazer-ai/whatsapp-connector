@@ -41,6 +41,10 @@ type instance struct {
 	logPath  string
 	cmd      *exec.Cmd
 	log      *os.File
+
+	// reaped says this pid has already been waited for, so it names nothing any more and
+	// must not be signalled again. See gone().
+	reaped bool
 }
 
 // buildConnector compiles cmd/connector out of the module this bench belongs to.
@@ -147,14 +151,29 @@ func (i *instance) waitHealthy(ctx context.Context, within time.Duration) error 
 // kill stops one instance the way a machine losing power stops it: no signal it can
 // handle, no chance to hand anything back. That is the case the handover phase is about.
 func (i *instance) kill() error {
-	if i.cmd.Process == nil {
+	if i.gone() {
 		return nil
 	}
 	if err := syscall.Kill(-i.pid, syscall.SIGKILL); err != nil && !strings.Contains(err.Error(), "no such process") {
 		return fmt.Errorf("kill %s (pid %d): %w", i.name, i.pid, err)
 	}
 	_, _ = i.cmd.Process.Wait()
+	i.reaped = true
 	return nil
+}
+
+// gone reports whether this instance has already been waited for, and it is what every
+// signal in this file is guarded by.
+//
+// A pid stops naming a process the moment it is reaped, and the number is then free for
+// the kernel to hand to somebody else. This bench kills two instances in the middle of a
+// run and shuts the fleet down minutes later, so without this the shutdown would send
+// SIGCONT and SIGTERM to two pids that have been dead since then -- to a process GROUP,
+// at that, which on a machine running several of these at once is somebody else's work
+// with no warning. `cmd.Process` stays non-nil after a wait, so it cannot answer this on
+// its own.
+func (i *instance) gone() bool {
+	return i.cmd == nil || i.cmd.Process == nil || i.reaped
 }
 
 // freeze stops an instance without ending it, and thaw lets it go on.
@@ -173,7 +192,7 @@ func (i *instance) kill() error {
 // By the pid this run captured, to its own process group, and never by a pattern over the
 // process name: this machine runs other people's connectors.
 func (i *instance) freeze() error {
-	if i.cmd.Process == nil {
+	if i.gone() {
 		return nil
 	}
 	if err := syscall.Kill(-i.pid, syscall.SIGSTOP); err != nil {
@@ -183,7 +202,7 @@ func (i *instance) freeze() error {
 }
 
 func (i *instance) thaw() error {
-	if i.cmd.Process == nil {
+	if i.gone() {
 		return nil
 	}
 	if err := syscall.Kill(-i.pid, syscall.SIGCONT); err != nil {
@@ -194,7 +213,7 @@ func (i *instance) thaw() error {
 
 // stop ends an instance the way an operator does, and waits for it.
 func (i *instance) stop() {
-	if i.cmd.Process != nil {
+	if !i.gone() {
 		// Continued first: a process left frozen never sees the SIGTERM, and the wait
 		// below would spend its ten seconds before falling back to the kill.
 		_ = syscall.Kill(-i.pid, syscall.SIGCONT)
@@ -207,6 +226,7 @@ func (i *instance) stop() {
 			_ = syscall.Kill(-i.pid, syscall.SIGKILL)
 			<-done
 		}
+		i.reaped = true
 	}
 	if i.log != nil {
 		_ = i.log.Close()

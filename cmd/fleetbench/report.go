@@ -103,12 +103,35 @@ func (r *report) outcome() outcome {
 			return outcomeInvariant
 		}
 	}
+	// An assertion that was not measured is not a pass, and a run that ends on one is not
+	// green. VERDE means every claim held; a claim with no series behind it did not hold
+	// and did not fail -- it never ran, and the run that ends on it is incomplete.
+	//
+	// It comes out as SETUP INCOMPLETO on purpose, which is the code for "the machine was
+	// not ready", because that is what produces this: a drain that ran out of time, a
+	// phase that could not be set up, a series a fleet this small never generated. Read as
+	// green, a connector that stopped reclaiming pending commands would pass this bench
+	// while the delivery it stopped doing went unverified.
+	if missing := r.unmeasured(); len(missing) > 0 {
+		return outcomeSetup
+	}
 	for _, m := range r.measurements {
 		if m.outside {
 			return outcomeOutside
 		}
 	}
 	return outcomeGreen
+}
+
+// unmeasured names the claims that never ran, in the order they were asserted.
+func (r *report) unmeasured() []string {
+	var out []string
+	for _, a := range r.assertions {
+		if a.state() == "NAO MEDIDO" {
+			out = append(out, a.claim)
+		}
+	}
+	return out
 }
 
 func (o outcome) label() string {
@@ -185,6 +208,14 @@ func (r *report) write(out io.Writer, o outcome, reason error) {
 	_, _ = fmt.Fprintf(out, "\n=== %s (exit %d) ===\n", o.label(), int(o))
 	if reason != nil {
 		_, _ = fmt.Fprintf(out, "%v\n", reason)
+	}
+	// Named, because "SETUP INCOMPLETO" without the claim behind it sends the reader back
+	// through the whole report looking for which line said NAO MEDIDO.
+	if missing := r.unmeasured(); reason == nil && len(missing) > 0 {
+		_, _ = fmt.Fprintf(out, "nao foi medido, e por isso esta corrida nao e verde:\n")
+		for _, claim := range missing {
+			_, _ = fmt.Fprintf(out, "  - %s\n", claim)
+		}
 	}
 }
 

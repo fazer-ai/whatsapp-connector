@@ -605,3 +605,82 @@ func TestAnExpiredReadIsSaidOutLoud(t *testing.T) {
 		t.Errorf("a corrida nao diz que leu as respostas depois do TTL:\n%v", rep.notes)
 	}
 }
+
+// A claim that was never measured is not a pass, and a run that ends on one is not green.
+//
+// The case this comes from is real: when the consumer group never drains, the delivery
+// claim comes out NAO MEDIDO on purpose, because a deadline that passed does not tell a
+// busy fleet from a hole. Read as green, a connector that stopped reclaiming pending
+// commands altogether would pass this bench with the delivery it stopped doing unverified.
+func TestAnUnmeasuredClaimIsNotGreen(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		assertions []*assertion
+		outside    bool
+		want       outcome
+	}{
+		"tudo afirmado": {
+			assertions: []*assertion{{claim: "a", points: 1, held: true}},
+			want:       outcomeGreen,
+		},
+		"uma afirmada e uma sem medida": {
+			assertions: []*assertion{
+				{claim: "a", points: 1, held: true},
+				{claim: "entrega de comando", points: 5, held: true, notWhy: "a frota ainda estava trabalhando"},
+			},
+			want: outcomeSetup,
+		},
+		"serie vazia tambem nao e verde": {
+			assertions: []*assertion{{claim: "a", points: 0, held: true}},
+			want:       outcomeSetup,
+		},
+		"quebrada vence sem medida": {
+			assertions: []*assertion{
+				{claim: "a", points: 1, held: false},
+				{claim: "b", points: 1, held: true, notWhy: "nao deu"},
+			},
+			want: outcomeInvariant,
+		},
+		"sem medida vence numero fora da faixa": {
+			// Both are "this run did not answer the question", and the one that says a
+			// claim went unchecked is the one a reader has to act on first.
+			assertions: []*assertion{{claim: "a", points: 1, held: true, notWhy: "nao deu"}},
+			outside:    true,
+			want:       outcomeSetup,
+		},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			rep := &report{}
+			for _, a := range tc.assertions {
+				rep.assert(a)
+			}
+			if tc.outside {
+				rep.measure("f", "m", 1, "u")
+				rep.measurements[0].outside = true
+			}
+			if got := rep.outcome(); got != tc.want {
+				t.Fatalf("saiu %d (%s), queria %d (%s)", got, got.label(), tc.want, tc.want.label())
+			}
+		})
+	}
+}
+
+// And the outcome names what went unmeasured, so the reader does not have to walk the
+// whole report looking for the line that said so.
+func TestTheOutcomeNamesWhatWentUnmeasured(t *testing.T) {
+	t.Parallel()
+
+	rep := &report{}
+	rep.assert(&assertion{claim: "grupo consumidor sem buraco", points: 5, held: true, notWhy: "ainda trabalhando"})
+	var out strings.Builder
+	rep.write(&out, rep.outcome(), nil)
+	if !strings.Contains(out.String(), "nao foi medido, e por isso esta corrida nao e verde") {
+		t.Errorf("o desfecho nao diz que algo ficou sem medida:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "- grupo consumidor sem buraco") {
+		t.Errorf("o desfecho nao nomeia a afirmacao que ficou sem medida:\n%s", out.String())
+	}
+}

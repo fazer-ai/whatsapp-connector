@@ -1,8 +1,10 @@
 package main
 
 import (
+	"os/exec"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -66,4 +68,49 @@ func TestTheFleetNeverInheritsAWACVariable(t *testing.T) {
 	if last != "fake" {
 		t.Errorf("o WAC_ENGINE que vale e %q, e esta corrida pediu fake", last)
 	}
+}
+
+// A pid that has been waited for names nothing, and signalling it again is signalling
+// whatever the kernel handed the number to next.
+//
+// This bench kills two instances in the middle of a run and shuts the fleet down minutes
+// later. On a machine running several of these at once -- which is the machine this was
+// written on -- the number is very likely somebody else's process group by then, and a
+// SIGTERM to it arrives with no warning and no way to trace it back here.
+func TestAKilledInstanceIsNeverSignalledAgain(t *testing.T) {
+	t.Parallel()
+
+	// A real process of this test's own, so the reaping is the real reaping and not a
+	// struct filled in by hand to agree with the code under test.
+	cmd := exec.Command("sleep", "60")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("nao consegui subir o processo da prova: %v", err)
+	}
+	live := &instance{name: "prova", pid: cmd.Process.Pid, cmd: cmd}
+
+	if live.gone() {
+		t.Fatal("a instancia se diz enterrada antes de qualquer sinal")
+	}
+	if err := live.kill(); err != nil {
+		t.Fatalf("kill: %v", err)
+	}
+	if !live.gone() {
+		t.Fatal("depois do kill e do wait, a instancia nao se diz enterrada, entao o shutdown " +
+			"mandaria SIGCONT e SIGTERM para um pid que o kernel ja pode ter reciclado")
+	}
+
+	// And the later calls take the early return rather than reaching a signal: a second
+	// kill of a reaped pid would otherwisecome back as an error from the kernel, or worse,
+	// land on somebody else.
+	if err := live.kill(); err != nil {
+		t.Errorf("um segundo kill devia nao fazer nada: %v", err)
+	}
+	if err := live.freeze(); err != nil {
+		t.Errorf("freeze depois do enterro devia nao fazer nada: %v", err)
+	}
+	if err := live.thaw(); err != nil {
+		t.Errorf("thaw depois do enterro devia nao fazer nada: %v", err)
+	}
+	live.stop() // não pode travar nem sinalizar
 }
