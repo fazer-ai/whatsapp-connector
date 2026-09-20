@@ -385,3 +385,78 @@ func TestATeardownTheConnectorNeverAttemptedIsCarriedOutOnTheRetry(t *testing.T)
 		t.Errorf("the teardown happened %d times, want once on the retry", got)
 	}
 }
+
+// Which commands are written down before they run is the table's to say, and the moment
+// that can be observed is while the command is in flight: a reserve followed by a release
+// leaves the same Redis as never having reserved at all, so a test that looks afterwards
+// cannot tell the two apart. The engine double reads the key from inside the call.
+//
+// Widening the guard to every command is the mutation this exists for. It survives every
+// other test here, because the failure paths release what they reserved and the successful
+// ones settle it -- and it is a real defect: a command whose own recovery is its retry,
+// interrupted by a process that dies before the release, would be answered `timeout` for
+// ever instead of reaching that recovery.
+func TestOnlyTheCommandsTheTableNamesAreWrittenDownBeforeTheyRun(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+
+	var inFlight sync.Map // idempotency key -> whether the attempt was on record mid-call
+	eng := newLandedEngine(func(effects *atomic.Int64) (json.RawMessage, error) {
+		effects.Add(1)
+		return json.RawMessage(`{}`), nil
+	})
+	rec := newReplies()
+	manager := instanceOn(t, "inst-a", rdb, eng, rec, storetest.New(t).URL)
+	if _, err := manager.Adopt(context.Background(), attemptSID); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+
+	for _, tc := range []struct {
+		what     string
+		command  *protocol.Command
+		key      string
+		reserved bool
+	}{
+		{
+			what:     "a participant update, which the table names",
+			command:  participantAdd("c-reserved", "k-reserved"),
+			key:      "k-reserved",
+			reserved: true,
+		},
+		{
+			what: "a creation, whose own recovery is its retry",
+			command: &protocol.Command{
+				V: protocol.Version, ID: "c-open", Type: protocol.CommandGroupCreate,
+				SID: attemptSID, ReplyTo: "c-open", IdempotencyKey: "k-open",
+				Payload: json.RawMessage(`{"subject":"Obras","participants":[]}`),
+			},
+			key:      "k-open",
+			reserved: false,
+		},
+	} {
+		key := "wa:idem-try:" + attemptSID + ":idem:" + tc.key
+		eng.answer = func(effects *atomic.Int64) (json.RawMessage, error) {
+			effects.Add(1)
+			inFlight.Store(tc.key, rdb.Exists(context.Background(), key).Val() == 1)
+			return json.RawMessage(`{}`), nil
+		}
+		deliver(t, manager, rec, tc.command)
+
+		saw, ok := inFlight.Load(tc.key)
+		if !ok {
+			t.Fatalf("%s never reached the engine, so nothing was observed", tc.what)
+		}
+		switch {
+		case tc.reserved && saw != true:
+			t.Errorf("%s ran with no attempt on record, so an instance that took the session "+
+				"over mid-call would carry it out a second time (#282)", tc.what)
+		case !tc.reserved && saw != false:
+			t.Errorf("%s was written down before it ran although the table does not name it, "+
+				"so a redelivery after a process that died mid-call is answered %s instead of "+
+				"reaching the recovery that belongs to it", tc.what, protocol.ErrorTimeout)
+		}
+	}
+}
