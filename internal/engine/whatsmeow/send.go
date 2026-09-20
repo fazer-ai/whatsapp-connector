@@ -13,6 +13,7 @@ import (
 	waTypes "go.mau.fi/whatsmeow/types"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/fazer-ai/whatsapp-connector/internal/engine"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 )
 
@@ -125,7 +126,9 @@ func (s *Session) readyToSend() error {
 		// other waits for a connection to come back. Answering `not_connected` to a
 		// session that has no account leaves it waiting for something nothing is going
 		// to do.
-		return protocol.NewError(protocol.ErrorNotPaired, "this session has no WhatsApp account to send from")
+		return fmt.Errorf("%w: %w",
+			protocol.NewError(protocol.ErrorNotPaired, "this session has no WhatsApp account to send from"),
+			engine.ErrNeverSent)
 	}
 	if s.state() != "open" {
 		// The session's own state, not whatsmeow's. IsConnected takes the socket lock,
@@ -134,7 +137,9 @@ func (s *Session) readyToSend() error {
 		// session's queue behind it. It also goes true when the websocket opens and
 		// before the account is authenticated, which is a send onto a stream WhatsApp
 		// has not accepted yet.
-		return protocol.NewError(protocol.ErrorNotConnected, "the session is not connected to WhatsApp")
+		return fmt.Errorf("%w: %w",
+			protocol.NewError(protocol.ErrorNotConnected, "the session is not connected to WhatsApp"),
+			engine.ErrNeverSent)
 	}
 	return nil
 }

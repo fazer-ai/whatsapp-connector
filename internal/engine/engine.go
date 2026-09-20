@@ -20,6 +20,22 @@ import (
 // reported to the client as protocol.ErrorUnsupported.
 var ErrNotSupported = errors.New("engine: command not supported")
 
+// ErrNeverSent marks a refusal the engine is certain about: nothing was written to
+// WhatsApp, so the account is exactly as it was and the caller's retry does the whole
+// thing rather than the half that is left.
+//
+// It is wrapped underneath whatever the client is told rather than replacing it. The two
+// answer different questions and only one of them is the client's: `not_connected` and
+// `not_paired` send a client down different roads, and both of them mean "nothing went
+// out" to the layer that has to decide whether a redelivery may run the command again.
+// Without this mark that layer cannot tell a pre-flight refusal from a socket that died
+// with the frame already written, because they arrive as the same code (#282).
+//
+// Only where the engine is certain. A refusal that shares a branch with a request that
+// went out and lost its answer is not one of these, and marking it would turn "nobody
+// knows" into "nothing happened", which is the one direction this must never get wrong.
+var ErrNeverSent = errors.New("engine: nothing was sent to WhatsApp")
+
 // Emission is one thing the engine has to tell the client about. The engine names the
 // type and renders the payload; stamping it (id, epoch, seq, instance) belongs to the
 // session, which is the only thing that knows the ownership it is publishing under.
