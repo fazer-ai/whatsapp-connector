@@ -1,8 +1,11 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -615,13 +618,17 @@ func TestTheLoadStopsTwice(t *testing.T) {
 	t.Parallel()
 
 	gen := &load{stop: func() {}}
-	first := gen.end()
-	done := make(chan int64, 1)
-	go func() { done <- gen.end() }()
+	first, firstRefused := gen.end()
+	done := make(chan [2]int64, 1)
+	go func() {
+		landed, refused := gen.end()
+		done <- [2]int64{landed, refused}
+	}()
 	select {
 	case second := <-done:
-		if second != first {
-			t.Errorf("a segunda parada contou %d comandos e a primeira %d", second, first)
+		if second[0] != first || second[1] != firstRefused {
+			t.Errorf("a segunda parada contou %d chegados e %d recusados, a primeira %d e %d",
+				second[0], second[1], first, firstRefused)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("a segunda chamada de end travou, entao o defer que protege as saidas de erro trava a corrida")
@@ -1544,5 +1551,116 @@ func TestTheIdempotencyScopeNamesWhatItLeftOut(t *testing.T) {
 	}
 	if !strings.Contains(said, "nao diz que nenhum comando da carga continua duplicou efeito") {
 		t.Errorf("a nota diz o que foi lido e nao o que um verde deixa de significar:\n%s", said)
+	}
+}
+
+// "Asked for" and "arrived" are different facts, and the measurement is named after the
+// second.
+//
+// The counter behind a command's id rises on every attempt, because the id has to be
+// unique. Reported as the load the fleet carried it said the fleet was asked for work that
+// never reached it, and a Redis refusing every write would make the number climb exactly as
+// fast as a healthy one. A send cancelled with the phase is neither landed nor refused: the
+// load is being stopped, and the last tick of every session can lose that race on the way
+// out.
+func TestTheLoadCountsWhatLandedAndNotWhatItTried(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		err            error
+		landed, failed int64
+	}{
+		"envio que chegou":                      {err: nil, landed: 1},
+		"envio recusado pelo Redis":             {err: errors.New("READONLY You can't write"), failed: 1},
+		"envio cancelado com a fase":            {err: context.Canceled},
+		"envio que estourou o prazo da fase":    {err: context.DeadlineExceeded},
+		"recusa embrulhada continua uma recusa": {err: fmt.Errorf("xadd: %w", errors.New("LOADING")), failed: 1},
+		"cancelamento embrulhado nao e recusa":  {err: fmt.Errorf("xadd: %w", context.Canceled)},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			gen := &load{}
+			gen.record(tc.err)
+			if got := gen.landed.Load(); got != tc.landed {
+				t.Errorf("chegaram %d, esperado %d", got, tc.landed)
+			}
+			if got := gen.failed.Load(); got != tc.failed {
+				t.Errorf("recusados %d, esperado %d", got, tc.failed)
+			}
+		})
+	}
+}
+
+// The two connection strings a run builds are built ABOUT a string somebody else wrote,
+// and each edit exists because trusting it produced a wrong number or a write in the wrong
+// place.
+func TestTheRunDerivesBothURLsFromTheOneItWasGiven(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		supplied string
+		wants    func(t *testing.T, fleet, bench url.Values, fleetPath string)
+	}{
+		"um dbname na query nao decide o banco": {
+			// `lib/pq` lets `dbname` and `database` override the path, so a supplied one
+			// would have every connector migrate into the shared database while the
+			// cleanup dropped the empty one this run created.
+			supplied: "postgres://u:p@h:5432/compartilhado?dbname=compartilhado&sslmode=disable",
+			wants: func(t *testing.T, fleet, bench url.Values, fleetPath string) {
+				t.Helper()
+				if fleet.Has("dbname") || bench.Has("dbname") {
+					t.Error("dbname sobreviveu na query, e ele vence o caminho")
+				}
+				if fleetPath != "/wacbench1" {
+					t.Errorf("o caminho ficou %q, e nao o banco desta corrida", fleetPath)
+				}
+				if fleet.Get("sslmode") != "disable" {
+					t.Error("sslmode do chamador foi perdido, e ele nao e desta familia")
+				}
+			},
+		},
+		"um application_name do chamador nao chega na frota": {
+			// The pool reading counts by the fleet's name. A supplied name equal to the
+			// bench's own left every connector connection uncounted and the reading at zero.
+			supplied: "postgres://u:p@h:5432/base?application_name=" + benchApplicationName,
+			wants: func(t *testing.T, fleet, bench url.Values, _ string) {
+				t.Helper()
+				if got := fleet.Get("application_name"); got != fleetApplicationName {
+					t.Errorf("a frota anuncia %q, e a leitura da pool conta por %q", got, fleetApplicationName)
+				}
+				if got := bench.Get("application_name"); got != benchApplicationName {
+					t.Errorf("a bancada anuncia %q", got)
+				}
+			},
+		},
+		"sem nada na query, os dois nomes sao postos assim mesmo": {
+			supplied: "postgres://u:p@h:5432/base",
+			wants: func(t *testing.T, fleet, bench url.Values, _ string) {
+				t.Helper()
+				if fleet.Get("application_name") == bench.Get("application_name") {
+					t.Error("frota e bancada anunciam o mesmo nome, entao a leitura da pool nao as separa")
+				}
+			},
+		},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			fleetURL, benchURL, err := runURLs(tc.supplied, "wacbench1")
+			if err != nil {
+				t.Fatalf("runURLs recusou %q: %v", tc.supplied, err)
+			}
+			fleet, errFleet := url.Parse(fleetURL)
+			bench, errBench := url.Parse(benchURL)
+			if errFleet != nil || errBench != nil {
+				t.Fatalf("as URLs derivadas nao sao URLs: %v / %v", errFleet, errBench)
+			}
+			tc.wants(t, fleet.Query(), bench.Query(), fleet.Path)
+		})
+	}
+
+	if _, _, err := runURLs("://sem esquema", "wacbench1"); err == nil {
+		t.Error("uma URL que nao e URL passou, e ela vem da variavel de quem rodou a bancada")
 	}
 }

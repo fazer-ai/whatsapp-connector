@@ -15,9 +15,20 @@ import (
 	_ "github.com/lib/pq"
 )
 
-// benchApplicationName is what the bench's own PostgreSQL connections announce
-// themselves as, so a reading of the connector's pool can exclude the reader taking it.
-const benchApplicationName = "fleetbench"
+// The two names the run's PostgreSQL connections announce themselves as, so the pool
+// reading can tell the fleet's connections from the reader taking the measurement.
+//
+// Counted POSITIVELY, by the fleet's name, and not as "everything that is not the bench".
+// Exclusion made the number depend on a string nobody in the run controls: the fleet's URL
+// used to carry whatever `application_name` the caller put in `WAC_TEST_DATABASE_URL`, or
+// inherited through `PGAPPNAME`, and one that happened to equal the bench's own left every
+// connector connection excluded, the pool reading at zero and the ceiling check passing
+// over a fleet it had not counted. Both names are set by this run on the URL it builds,
+// which is what makes them names and not guesses.
+const (
+	benchApplicationName = "fleetbench"
+	fleetApplicationName = "fleetbench-connector"
+)
 
 // The three timings every process of a run is started with. They are named in the run's
 // own output, because each of the measurements is a number about them as much as about
@@ -54,6 +65,44 @@ type run struct {
 	rdb      *redis.Client
 }
 
+// runURLs derives the two connection strings of a run from the one the caller supplied.
+//
+// Out of `newRun` so a test reaches it: everything it decides is decided ABOUT a string
+// somebody else wrote, and each of the three edits below exists because trusting that
+// string produced a wrong number or a write in the wrong place.
+func runURLs(supplied, database string) (fleetURL, benchURL string, err error) {
+	parsed, err := url.Parse(supplied)
+	if err != nil {
+		return "", "", fmt.Errorf("read %s back: %w", databaseVar, err)
+	}
+	// The path alone does not decide the database. `lib/pq` accepts `dbname` and
+	// `database` as query parameters and lets them override what the path says, so a
+	// `WAC_TEST_DATABASE_URL` carrying either would have every connector of this run
+	// migrate and write into the shared database while the cleanup dropped the empty one
+	// this run created. Stripped rather than trusted, because the variable comes from
+	// whoever ran the bench.
+	base := parsed.Query()
+	base.Del("dbname")
+	base.Del("database")
+	// Set and not preserved, for the same reason and with a sharper edge: the pool reading
+	// counts by this name, so a caller's `application_name` reaching the fleet would make
+	// the count answer about somebody else's string -- and one that happened to equal the
+	// bench's own left the reading at zero over a fleet it had not counted.
+	base.Set("application_name", fleetApplicationName)
+	parsed.RawQuery = base.Encode()
+	parsed.Path = "/" + database
+
+	// The bench's own connections carry a name of their own, so the pool measurement can
+	// tell them apart from the fleet's. Without it, the run's own reader counts as part of
+	// what the connector holds, and the error grows with however many readings a phase
+	// happens to take.
+	tagged := *parsed
+	query := tagged.Query()
+	query.Set("application_name", benchApplicationName)
+	tagged.RawQuery = query.Encode()
+	return parsed.String(), tagged.String(), nil
+}
+
 func newRun(ctx context.Context, s servers) (*run, error) {
 	// A name for this run's database, prefix and instances. Nothing about it is a
 	// secret: it exists so two runs on one machine do not collide.
@@ -77,31 +126,11 @@ func newRun(ctx context.Context, s servers) (*run, error) {
 		return nil, fmt.Errorf("create the database for this run (%s): %w", r.database, err)
 	}
 
-	parsed, err := url.Parse(s.databaseURL)
+	fleetURL, benchURL, err := runURLs(s.databaseURL, r.database)
 	if err != nil {
-		return nil, fmt.Errorf("read %s back: %w", databaseVar, err)
+		return nil, err
 	}
-	// The path alone does not decide the database. `lib/pq` accepts `dbname` and
-	// `database` as query parameters and lets them override what the path says, so a
-	// `WAC_TEST_DATABASE_URL` carrying either would have every connector of this run
-	// migrate and write into the shared database while the cleanup dropped the empty one
-	// this run created. Stripped rather than trusted, because the variable comes from
-	// whoever ran the bench.
-	base := parsed.Query()
-	base.Del("dbname")
-	base.Del("database")
-	parsed.RawQuery = base.Encode()
-	parsed.Path = "/" + r.database
-	r.fleetURL = parsed.String()
-	// The bench's own connections carry a name, so that the pool measurement can leave
-	// them out. Counting backends on the run's database without it would report the
-	// bench's own reader as part of what the connector holds, and the error grows with
-	// however many readings a phase happens to take.
-	tagged := *parsed
-	query := tagged.Query()
-	query.Set("application_name", benchApplicationName)
-	tagged.RawQuery = query.Encode()
-	r.benchURL = tagged.String()
+	r.fleetURL, r.benchURL = fleetURL, benchURL
 
 	options, err := redis.ParseURL(s.redisURL)
 	if err != nil {

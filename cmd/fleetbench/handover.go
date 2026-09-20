@@ -204,8 +204,13 @@ func handover(ctx context.Context, active *run, group *fleet, cl *client, rep *r
 
 	// Stopped before anything is read, so nothing is still writing to a stream the
 	// assertions are about to walk.
-	loaded := steady.end()
+	loaded, refused := steady.end()
 	rep.measure("troca de dono sob carga", "comandos da carga continua", float64(loaded), "comandos")
+	if refused > 0 {
+		rep.note(fmt.Sprintf("%d envio(s) da carga continua foram recusados pelo Redis e nao entraram "+
+			"em nenhum stream. A medida acima conta o que chegou, entao ela nao os inclui; o que eles "+
+			"significam e que a frota ficou menos ocupada do que esta corrida pediu", refused))
+	}
 
 	// What the idempotency reading does NOT cover, said with the numbers rather than left
 	// for a reader to infer from a series of sixteen over a run of thousands.
@@ -301,8 +306,8 @@ func poolBackends(ctx context.Context, active *run) (int, error) {
 	defer func() { _ = db.Close() }()
 	var count int
 	err = db.QueryRowContext(ctx,
-		`SELECT count(*) FROM pg_stat_activity WHERE datname = $1 AND application_name <> $2`,
-		active.database, benchApplicationName).Scan(&count)
+		`SELECT count(*) FROM pg_stat_activity WHERE datname = $1 AND application_name = $2`,
+		active.database, fleetApplicationName).Scan(&count)
 	if err != nil {
 		return 0, fmt.Errorf("%w: count the fleet's connections on %s: %w", errSetup, active.database, err)
 	}

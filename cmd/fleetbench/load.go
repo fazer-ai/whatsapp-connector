@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -36,10 +37,34 @@ import (
 // Not a throughput measurement. Nothing here times a send or counts a rate: it exists to
 // keep the fleet busy while ownership moves, and the numbers it produces are the series
 // the assertions run over.
+// Three counters and not one, because "asked for" and "arrived" are different facts and
+// the measurement is named after the second.
+//
+// `attempted` only exists to make an id unique, and it rises whether or not the send
+// lands. Reported as the load the fleet carried, it says the fleet was asked for work that
+// never reached it -- a Redis refusing writes would have the number climb exactly as fast
+// as a healthy one. `landed` is what the assertions can actually read off the streams.
+//
+// A send cancelled with the phase is neither: the load is being stopped, the last tick of
+// every session can lose that race on the way out, and counting those as failures would
+// put a line about a fleet in trouble on the end of every healthy run.
 type load struct {
-	sent    atomic.Int64
-	stop    context.CancelFunc
-	stopped sync.WaitGroup
+	attempted atomic.Int64
+	landed    atomic.Int64
+	failed    atomic.Int64
+	stop      context.CancelFunc
+	stopped   sync.WaitGroup
+}
+
+// record files one send's outcome, out of the goroutine so a table can disprove it.
+func (l *load) record(err error) {
+	switch {
+	case err == nil:
+		l.landed.Add(1)
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+	default:
+		l.failed.Add(1)
+	}
 }
 
 // startLoad asks every session for something, over and over, until stop is called.
@@ -63,18 +88,19 @@ func startLoad(ctx context.Context, active *run, cl *client, sids []string, ever
 					return
 				case <-ticker.C:
 				}
-				n := gen.sent.Add(1)
+				n := gen.attempted.Add(1)
 				id := fmt.Sprintf("carga-%s-%s-%d", active.id, shortSID(sid), n)
 				payload := fmt.Sprintf(`{"message_id":%q,"to":{"kind":"phone","id":"5511999990002"},`+
 					`"content":{"type":"text","body":"carga continua %d"}}`, id, n)
 				// A failure here is not a failure of the run: the load exists to keep the
 				// fleet busy, and a command that did not reach Redis simply did not add to
-				// the stream. What the assertions read is what landed.
-				_ = cl.send(running, cl.keys.Commands(sid), &protocol.Command{
+				// the stream. What the assertions read is what landed, so that is what is
+				// counted, and a refusal is counted separately instead of discarded.
+				gen.record(cl.send(running, cl.keys.Commands(sid), &protocol.Command{
 					V: protocol.Version, ID: id, Type: protocol.CommandMessageSend, SID: sid,
 					TS: time.Now().UnixMilli(), ReplyTo: cl.keys.Reply(id),
 					Payload: json.RawMessage(payload),
-				})
+				}))
 			}
 		}(sid)
 	}
@@ -82,9 +108,9 @@ func startLoad(ctx context.Context, active *run, cl *client, sids []string, ever
 }
 
 // end stops the load and waits for its goroutines, so nothing is still writing to a stream
-// the assertions are about to read.
-func (l *load) end() int64 {
+// the assertions are about to read. It answers what landed and what was refused.
+func (l *load) end() (landed, failed int64) {
 	l.stop()
 	l.stopped.Wait()
-	return l.sent.Load()
+	return l.landed.Load(), l.failed.Load()
 }
