@@ -27,22 +27,37 @@ func TestTheFleetNeverInheritsAWACVariable(t *testing.T) {
 		"WAC_MEDIA_TOKEN=segredo-de-outra-frota",
 		"WAC_ENGINE=whatsmeow",
 		"WAC_TEST_DATABASE_URL=postgres://nao-e-desta-corrida",
+		// Read by the connector WITHOUT the prefix: this run hands its fleet a REDIS_URL
+		// of its own, and a password exported in the shell overrides the one inside that
+		// URL, while the bench's preflight and client read the URL alone.
+		"REDIS_PASSWORD=senha-de-outra-frota",
+		"REDIS_URL=redis://nao-e-desta-corrida:6379",
 	}
-	own := map[string]string{"WAC_ENGINE": "fake", "WAC_REDIS_PREFIX": "wacbench1:"}
+	own := map[string]string{
+		"WAC_ENGINE": "fake", "WAC_REDIS_PREFIX": "wacbench1:",
+		"REDIS_URL": "redis://127.0.0.1:56265/0",
+	}
 
 	got := fleetEnv(environ, own, "bench-1-a", "127.0.0.1:5000")
 
 	for _, entry := range got {
-		if !strings.HasPrefix(entry, "WAC_") {
+		name, value, _ := strings.Cut(entry, "=")
+		if !strings.HasPrefix(name, "WAC_") && !unprefixedConfig[name] {
 			continue
 		}
-		name, value, _ := strings.Cut(entry, "=")
 		switch name {
 		case "WAC_INSTANCE", "WAC_HTTP_ADDR":
 		default:
 			if own[name] != value {
 				t.Errorf("o conector receberia %s, que nao veio desta corrida", entry)
 			}
+		}
+	}
+	// And the one the run does not set at all has to be gone rather than inherited.
+	for _, entry := range got {
+		if strings.HasPrefix(entry, "REDIS_PASSWORD=") {
+			t.Errorf("o conector receberia %s, herdada do shell: ela sobrepoe a senha que esta "+
+				"dentro do REDIS_URL desta corrida", entry)
 		}
 	}
 	// What is not WAC_ has to survive: a connector still needs its PATH.
