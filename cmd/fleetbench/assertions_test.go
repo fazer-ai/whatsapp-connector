@@ -1081,3 +1081,30 @@ func TestEpochRisesReadsWhatAClientWouldAccept(t *testing.T) {
 		t.Errorf("uma troca de dono sob o mesmo epoch saiu %q", state)
 	}
 }
+
+// The claim has to say what it checks, and it stopped checking one of the things it used
+// to say.
+//
+// It read "nenhum evento de epoch velho depois de um novo no mesmo stream" while the run
+// had started allowing exactly one of those -- the write in flight, which the contract
+// names and the client drops on the cursor. A claim printed over a run says what that run
+// proved, and this one would have said more.
+func TestTheOneOwnerClaimSaysWhatItChecks(t *testing.T) {
+	t.Parallel()
+
+	rep := &report{}
+	assertOneOwner(rep, map[string][]protocol.Event{"s1": {event("s1", "a", 1, 1)}},
+		map[string]map[string][]protocol.Event{"s1": {"wa:events:0": {event("s1", "a", 1, 1)}}},
+		&census{}, 1)
+	claim := only(t, rep).claim
+
+	if strings.Contains(claim, "nenhum evento de epoch velho") {
+		t.Errorf("a afirmacao ainda promete que nenhum evento de epoch velho aparece, e um aparece "+
+			"por desenho:\n%s", claim)
+	}
+	for _, half := range []string{"um epoch, um publicador", "publicando de novo", "mais sessoes do que existem sids"} {
+		if !strings.Contains(claim, half) {
+			t.Errorf("a afirmacao nao menciona %q, que e uma das tres leituras que ela faz:\n%s", half, claim)
+		}
+	}
+}

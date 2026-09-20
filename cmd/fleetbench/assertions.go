@@ -226,8 +226,9 @@ func assertOneOwner(rep *report, published map[string][]protocol.Event,
 
 	rep.assert(&assertion{
 		invariant: "1 (uma instancia dona da sessao por vez, arbitrada pela lease; perder a lease cerca a publicacao na hora; a metade do store fica sem medida, ver notas)",
-		claim: "nunca duas instancias com a mesma lease: um epoch, um publicador; nenhum evento de " +
-			"epoch velho depois de um novo no mesmo stream; e a frota somada nunca roda mais sessoes do que existem sids",
+		claim: "nunca duas instancias com a mesma lease: um epoch, um publicador; nenhuma instancia " +
+			"publicando de novo depois de um evento de epoch velho (o primeiro e a escrita em voo, que " +
+			"o contrato preve); e a frota somada nunca roda mais sessoes do que existem sids",
 		series: fmt.Sprintf("%d pares (sid, epoch) sobre %d sessoes, %d eventos lidos na ordem do stream deles, "+
 			"e %d censos da frota (o mais alto somou %d de %d sids)",
 			pairs, len(published), fenced, taken, top.total, sids),
