@@ -1307,14 +1307,14 @@ var errLeaving = errors.New("session: this instance is finishing with the accoun
 // another claim. The store is the same Redis the command arrived through, so one that
 // cannot answer this is one the reply and the acknowledgement would not reach either,
 // and the delivery was coming round again regardless.
-func (s *Session) alreadyDid(ctx context.Context, key string) (json.RawMessage, bool, bool, error) {
+func (s *Session) alreadyDid(ctx context.Context, key string) (result json.RawMessage, done, attempted bool, err error) {
 	if key == "" || s.ledger == nil {
 		return nil, false, false, nil
 	}
 	read, cancel := context.WithTimeout(ctx, ledgerTimeout)
 	defer cancel()
 
-	result, done, attempted, err := s.ledger.Recall(read, s.sid, key)
+	result, done, attempted, err = s.ledger.Recall(read, s.sid, key)
 	if err != nil {
 		return nil, false, false, fmt.Errorf("%w: %w", errUnknownWhetherItRan, err)
 	}

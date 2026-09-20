@@ -76,12 +76,12 @@ func NewIdempotency(client *Client, ttl time.Duration) *Idempotency {
 // `done` is the command having finished, and `result` is what it answered. `attempted`
 // with no `done` is the command having run with nobody able to say how it ended. Neither
 // is a command this session has never seen.
-func (i *Idempotency) Recall(ctx context.Context, sid, key string) (json.RawMessage, bool, bool, error) {
+func (i *Idempotency) Recall(ctx context.Context, sid, key string) (result json.RawMessage, done, attempted bool, err error) {
 	keys := i.client.Keys()
-	done, attempt := keys.Idempotency(sid, key), keys.Attempt(sid, key)
+	resultKey, attemptKey := keys.Idempotency(sid, key), keys.Attempt(sid, key)
 	// One round trip for both, because the miss is the common case and it is the one
 	// every command pays for.
-	stored, err := i.client.MGet(ctx, done, attempt).Result()
+	stored, err := i.client.MGet(ctx, resultKey, attemptKey).Result()
 	if err != nil {
 		return nil, false, false, fmt.Errorf("redisx: recall %s of %s: %w", key, sid, err)
 	}
@@ -105,7 +105,7 @@ func (i *Idempotency) Recall(ctx context.Context, sid, key string) (json.RawMess
 	// turn a shortened record into no record at all. What a failure here costs is the
 	// original expiry, which is where this stood before, and the transport's own age
 	// bound is what stands behind it.
-	_ = i.client.Expire(ctx, done, i.ttl).Err()
+	_ = i.client.Expire(ctx, resultKey, i.ttl).Err()
 
 	text, ok := stored[0].(string)
 	if !ok {

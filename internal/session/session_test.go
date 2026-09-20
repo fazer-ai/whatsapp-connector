@@ -206,7 +206,7 @@ func (l *ledger) refusal() error {
 	return l.err
 }
 
-func (l *ledger) Recall(ctx context.Context, sid, key string) (json.RawMessage, bool, bool, error) {
+func (l *ledger) Recall(ctx context.Context, sid, key string) (result json.RawMessage, done, attempted bool, err error) {
 	if err := l.refusal(); err != nil {
 		return nil, false, false, err
 	}
