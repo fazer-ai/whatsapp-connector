@@ -1264,11 +1264,17 @@ func TestTheEpochCounterIsReadWhereTheEpochComesFrom(t *testing.T) {
 			says:      "nao tem contador de epoch nenhum",
 		},
 		{
-			// Zero is not a generation: the counter only exists from the first INCR, so a
-			// session whose events all carry zero never had one to fall below.
-			name:      "epoch zero nao e geracao, entao nao ha o que comparar",
-			published: map[string][]protocol.Event{"s1": {event("s1", "a", 0, 1)}},
+			// Zero is not "nothing to compare": the counter answers 1 on the first INCR and
+			// an acquire that cannot get one releases the lease instead of publishing, so a
+			// published event under epoch 0 is an event with no generation of ownership at
+			// all. Skipped, this reading was blind under the mutant that freezes the counter,
+			// where every event carries zero.
+			name:      "evento sob epoch zero saiu sem geracao de posse",
+			published: map[string][]protocol.Event{"s1": {event("s1", "a", 0, 1), event("s1", "a", 0, 2)}},
 			counters:  map[string]uint64{},
+			checked:   1,
+			offenders: 1,
+			says:      "publicou 2 evento(s) e o epoch mais alto entre eles e 0",
 		},
 		{
 			name: "uma sessao regredida entre sessoes sas e achado so dela",

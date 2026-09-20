@@ -419,13 +419,24 @@ func epochCounterOffenders(published map[string][]protocol.Event,
 				highest, by = event.Epoch, event.Inst
 			}
 		}
-		// An epoch of zero is no epoch: the counter starts at 1 on the first `INCR`, so a
-		// session whose events all carry zero never had a generation to compare against,
-		// and calling that a regression would be a finding about a session nobody owned.
+		// An epoch of zero is not a session with nothing to compare: it is a session that
+		// published without a generation of ownership at all.
+		//
+		// `INCR` on a missing key answers 1, and an acquire whose `INCR` fails releases the
+		// lease instead of publishing under a stale epoch (`internal/cluster/lease.go`), so
+		// nothing a healthy connector puts on a stream carries zero. This used to skip it,
+		// and MEASURED that made the reading blind exactly where it is needed: under the
+		// mutant that freezes the counter every event carries zero, and the assertion built
+		// for invariant 2 came out NAO MEDIDO with a series of nothing.
+		checked++
 		if highest == 0 {
+			offenders = append(offenders, fmt.Sprintf(
+				"%s publicou %d evento(s) e o epoch mais alto entre eles e 0: o contador comeca em 1 "+
+					"no primeiro INCR, e uma posse que nao consegue um epoch solta a lease em vez de "+
+					"publicar, entao esses eventos sairam sem geracao de posse nenhuma",
+				sid, len(published[sid])))
 			continue
 		}
-		checked++
 		counter, present := counters[sid]
 		if !present {
 			offenders = append(offenders, fmt.Sprintf(
