@@ -382,6 +382,20 @@ func assertOneShard(rep *report, shardOf map[string]map[string]bool,
 	firstOn map[string]map[string]string, sids []string) {
 
 	offenders := []string{}
+	// A session with no event at all is a finding, and it is invisible to every reading
+	// that walks what was published: they all iterate over the sessions that produced
+	// something. Lose an entire session's events -- a shard nobody wrote to, a publisher
+	// that never ran, a stream deleted under the run -- and the claims below hold over the
+	// sessions that survived while saying nothing about the one that did not. The run
+	// asked for these sids, connected them and sent to them, so silence from one of them
+	// is not a session that had nothing to say.
+	for _, sid := range sids {
+		if len(shardOf[sid]) == 0 {
+			offenders = append(offenders, fmt.Sprintf(
+				"%s foi pedida e conectada nesta corrida e nao publicou evento nenhum, entao nenhuma "+
+					"afirmacao sobre ordem, epoch ou continuidade a alcancou", sid))
+		}
+	}
 	for sid, streams := range shardOf {
 		if len(streams) > 1 {
 			// Named with an event id on each stream, because "it appeared on two" is not
@@ -396,9 +410,9 @@ func assertOneShard(rep *report, shardOf map[string]map[string]bool,
 	}
 	rep.assert(&assertion{
 		invariant: "3 (uma sessao sempre no mesmo stream de eventos)",
-		claim:     "cada sid publicado num shard so",
+		claim:     "cada sid pedido publicou, e publicou num shard so",
 		series:    fmt.Sprintf("%d sessoes com evento publicado, de %d pedidas", len(shardOf), len(sids)),
-		points:    len(shardOf),
+		points:    len(sids),
 		held:      len(offenders) == 0,
 		detail:    strings.Join(offenders, "\n"),
 	})
@@ -680,8 +694,18 @@ func inspectGroups(stream string, groups []redis.XInfoGroup, err error) (
 }
 
 func consumerGroupVerdict(checked, streams int, offenders []string, stillWorking string) *assertion {
+	// A deadline that passed explains entries still pending. It does not explain a stream
+	// that is gone or a stream nobody consumed: those are not work in progress, and a busy
+	// session exhausting the drain deadline while another session's stream was deleted
+	// would otherwise file the deletion as "not measured" and exit 2.
+	structural := []string{}
+	for _, offender := range offenders {
+		if strings.Contains(offender, "nao existe mais") || strings.Contains(offender, "grupo consumidor nenhum") {
+			structural = append(structural, offender)
+		}
+	}
 	undecided := ""
-	if len(offenders) > 0 && stillWorking != "" {
+	if len(offenders) > 0 && len(structural) == 0 && stillWorking != "" {
 		undecided = stillWorking
 	}
 	// The findings count as points, and not only the groups that answered.

@@ -1117,3 +1117,79 @@ func TestTheOneOwnerClaimSaysWhatItChecks(t *testing.T) {
 		}
 	}
 }
+
+// A session that published nothing is a finding, and every other reading is blind to it:
+// they all walk what was published.
+func TestASilentSessionIsAFinding(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		shardOf map[string]map[string]bool
+		sids    []string
+		state   string
+		says    string
+	}{
+		"as duas publicaram, cada uma num shard": {
+			shardOf: map[string]map[string]bool{
+				"s1": {"wa:events:0": true}, "s2": {"wa:events:1": true},
+			},
+			sids:  []string{"s1", "s2"},
+			state: "AFIRMADO",
+		},
+		"uma delas nao publicou nada": {
+			shardOf: map[string]map[string]bool{"s1": {"wa:events:0": true}},
+			sids:    []string{"s1", "s2"},
+			state:   "QUEBRADO",
+			says:    "nao publicou evento nenhum",
+		},
+		"uma delas apareceu em dois shards": {
+			shardOf: map[string]map[string]bool{
+				"s1": {"wa:events:0": true, "wa:events:1": true}, "s2": {"wa:events:1": true},
+			},
+			sids:  []string{"s1", "s2"},
+			state: "QUEBRADO",
+			says:  "apareceu em",
+		},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			rep := &report{}
+			firstOn := map[string]map[string]string{}
+			for sid, streams := range tc.shardOf {
+				firstOn[sid] = map[string]string{}
+				for stream := range streams {
+					firstOn[sid][stream] = "1-0"
+				}
+			}
+			assertOneShard(rep, tc.shardOf, firstOn, tc.sids)
+			got := only(t, rep)
+			if got.state() != tc.state {
+				t.Fatalf("estado %q, queria %q (evidencia: %s)", got.state(), tc.state, got.detail)
+			}
+			if tc.says != "" && !strings.Contains(got.detail, tc.says) {
+				t.Errorf("a evidencia nao diz %q:\n%s", tc.says, got.detail)
+			}
+		})
+	}
+}
+
+// A drain deadline explains entries still pending. It does not explain a stream that is
+// gone, and downgrading that to "not measured" turns a deletion into exit 2.
+func TestAMissingStreamSurvivesADrainTimeout(t *testing.T) {
+	t.Parallel()
+
+	busy := "o grupo consumidor nao drenou em 90 s"
+	pending := []string{"wacbench1:cmd:s1, grupo connector: 2 pendentes e lag 0 depois dos acks"}
+	gone := []string{"wacbench1:cmd:s2: o stream nao existe mais, e esta corrida escreveu nele"}
+
+	if got := consumerGroupVerdict(5, 5, pending, busy).state(); got != "NAO MEDIDO" {
+		t.Errorf("pendencia sob prazo estourado saiu %q", got)
+	}
+	if got := consumerGroupVerdict(5, 5, gone, busy).state(); got != "QUEBRADO" {
+		t.Errorf("um stream apagado sob prazo estourado saiu %q, e ele nao e trabalho em curso", got)
+	}
+	if got := consumerGroupVerdict(5, 5, append(append([]string{}, pending...), gone...), busy).state(); got != "QUEBRADO" {
+		t.Errorf("com pendencia E stream apagado o veredito saiu %q", got)
+	}
+}
