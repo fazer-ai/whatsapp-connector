@@ -346,15 +346,15 @@ func waitForQuietStreams(ctx context.Context, cl *client, shards int, within tim
 		// ones: two readings agreeing on the length would then report a fleet at full
 		// throughput as one that had gone quiet. A stream id only ever grows, so the pair
 		// (length, last id) moves whenever anything was published.
-		mark := ""
+		reads := make([]shardRead, 0, shards)
 		for shard := range shards {
 			read, err := cl.eventsOn(ctx, shard)
 			if err != nil {
 				return false, err
 			}
-			mark += fmt.Sprintf("%d:%d:%s|", shard, read.length, read.lastID)
+			reads = append(reads, read)
 		}
-		if quiet.saw(mark) {
+		if quiet.saw(streamMark(reads)) {
 			return true, nil
 		}
 		if time.Now().After(deadline) {
@@ -388,4 +388,20 @@ func (s *stillness) saw(mark string) bool {
 	}
 	s.last, s.runs, s.begun = mark, 1, true
 	return false
+}
+
+// streamMark is what two readings are compared by: every shard's length AND the id of its
+// last entry.
+//
+// The id, and not the length alone. `Streams.Publish` trims with approximate MAXLEN, so a
+// shard that reached `DefaultEventMaxLen` keeps its length while new entries replace old
+// ones -- and two readings agreeing on the length would report a fleet at full throughput
+// as one that had gone quiet, which is the one thing this wait exists to prevent. A stream
+// id only ever grows, so the pair moves whenever anything was published.
+func streamMark(reads []shardRead) string {
+	mark := strings.Builder{}
+	for _, read := range reads {
+		fmt.Fprintf(&mark, "%s:%d:%s|", read.stream, read.length, read.lastID)
+	}
+	return mark.String()
 }

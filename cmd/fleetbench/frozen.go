@@ -36,6 +36,19 @@ import (
 func frozenOwner(ctx context.Context, active *run, cl *client, rep *report, plan benchPlan,
 	owner *instance, peers []*instance, sids []string, counted *census) error {
 
+	// The fence claim is asserted once, on the way out, whatever happened in between.
+	//
+	// Asserted here and not at each return because there are four ways out of this phase
+	// and every one of them says something different about the fence -- nobody held a
+	// session, nobody adopted, the phase ran, an error cut it short. A branch that forgets
+	// to claim leaves the run green over a fence it never reached, and that is exactly the
+	// bug this shape removes: the branches set the words, the exit does the claiming.
+	fence := fenceOutcome{
+		series: "a fase que produz a cerca nao chegou ao fim",
+		why:    "a fase do dono congelado terminou antes de produzir posse perdida",
+	}
+	defer func() { rep.assert(fenceExercised(fence.taken, fence.series, fence.why)) }()
+
 	// Who is frozen is measured, not assumed. The handover leaves the sessions split
 	// between the peers however the sweep happened to fall, and freezing one that owns
 	// nothing proves nothing: nobody has to take anything from it, and the phase spends a
@@ -66,12 +79,9 @@ func frozenOwner(ctx context.Context, active *run, cl *client, rep *report, plan
 	rep.note(fmt.Sprintf("fase do dono congelado: antes de congelar, a frota estava assim: %v. "+
 		"Congelada a que mais segura, %s, com %d sessoes.", holding, frozen.name, most))
 	if most == 0 {
-		// Claimed, not noted, for the same reason as the empty-adoption branch below: a
-		// note does not reach the exit code, and the earlier phases leave enough behind for
-		// every other assertion to hold.
-		rep.assert(fenceExercised(0, "nenhuma instancia viva segurava sessao quando a fase comecou",
-			"nenhuma instancia viva segurava sessao nenhuma, entao nao havia posse a perder e nada "+
-				"nesta corrida pode quebrar a cerca"))
+		fence.series = "nenhuma instancia viva segurava sessao quando a fase comecou"
+		fence.why = "nenhuma instancia viva segurava sessao nenhuma, entao nao havia posse a perder " +
+			"e nada nesta corrida pode quebrar a cerca"
 		return nil
 	}
 	owner, peers = frozen, watching
@@ -194,13 +204,13 @@ func frozenOwner(ctx context.Context, active *run, cl *client, rep *report, plan
 	// this phase existed, and what let the mutant that removes the fence come out green.
 	// As an assertion with an empty series it comes out NAO MEDIDO, and the run says so in
 	// its exit code.
-	rep.assert(fenceExercised(taken,
-		fmt.Sprintf("%d sessoes assumidas pelos pares durante %s de congelamento de %s",
-			taken, hold.Round(time.Second), owner.name),
-		fmt.Sprintf("%s ficou parada %s, mais que o WAC_LEASE_TTL de %s, e ainda assim nenhum par "+
-			"assumiu sessao nenhuma. Sem adocao, o que ela publicar ao voltar nao e publicacao sem "+
-			"posse, e nada nesta corrida pode quebrar a cerca",
-			owner.name, hold.Round(time.Second), benchLeaseTTL)))
+	fence.taken = taken
+	fence.series = fmt.Sprintf("%d sessoes assumidas pelos pares durante %s de congelamento de %s",
+		taken, hold.Round(time.Second), owner.name)
+	fence.why = fmt.Sprintf("%s ficou parada %s, mais que o WAC_LEASE_TTL de %s, e ainda assim nenhum "+
+		"par assumiu sessao nenhuma. Sem adocao, o que ela publicar ao voltar nao e publicacao sem "+
+		"posse, e nada nesta corrida pode quebrar a cerca",
+		owner.name, hold.Round(time.Second), benchLeaseTTL)
 	if taken == 0 {
 		return nil
 	}
@@ -209,6 +219,13 @@ func frozenOwner(ctx context.Context, active *run, cl *client, rep *report, plan
 		"depois disso e publicacao de quem ja nao tem a lease, e a ordem do stream do shard e o que "+
 		"torna isso visivel daqui.", owner.name, hold.Round(time.Second), sent, taken))
 	return nil
+}
+
+// fenceOutcome is what the phase's branches fill in for the single claim at its exit.
+type fenceOutcome struct {
+	taken  int
+	series string
+	why    string
 }
 
 // fenceExercised is the claim that the fence half of invariant 1 was actually reached, and

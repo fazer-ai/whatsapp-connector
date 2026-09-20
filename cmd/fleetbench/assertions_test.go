@@ -841,3 +841,25 @@ func TestAProvenViolationSurvivesAnUnsettledStream(t *testing.T) {
 		t.Errorf("o desfecho saiu %s, e um defeito nao pode virar corrida incompleta", got.label())
 	}
 }
+
+// Two readings are compared by every shard's length AND the id of its last entry, because
+// a full shard keeps its length while approximate trimming replaces its entries.
+func TestTheStreamMarkCarriesTheLastEntryID(t *testing.T) {
+	t.Parallel()
+
+	full := []shardRead{
+		{stream: "wacbench1:events:0", length: 1000, firstID: "900-1", lastID: "1900-1"},
+		{stream: "wacbench1:events:1", length: 1000, firstID: "880-1", lastID: "1880-1"},
+	}
+	trimmed := []shardRead{
+		{stream: "wacbench1:events:0", length: 1000, firstID: "901-1", lastID: "1901-1"},
+		{stream: "wacbench1:events:1", length: 1000, firstID: "880-1", lastID: "1880-1"},
+	}
+	if streamMark(full) == streamMark(trimmed) {
+		t.Errorf("dois instantes de um shard cheio que seguiu publicando deram a mesma marca:\n  %s",
+			streamMark(full))
+	}
+	if streamMark(full) != streamMark(full) {
+		t.Error("a marca nao e estavel para a mesma leitura")
+	}
+}
