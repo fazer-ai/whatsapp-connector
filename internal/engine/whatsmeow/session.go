@@ -98,9 +98,10 @@ type Session struct {
 	// now writes under it as well. Counting the call sites here would be a number nothing
 	// checks, which is the shape this repository has got wrong twice.
 	//
-	// What it does not bound is every way a store can be slow. On SQLite a write already
-	// blocked on another writer of the same file waits out the DSN's `busy_timeout`
-	// before it looks at a context, which is #293.
+	// It did not always bound what it says. On SQLite a write already blocked on a writer
+	// in another process used to wait out the DSN's whole `busy_timeout` before it looked
+	// at a context at all, which was #293; `internal/store/sqlitebudget.go` derives that
+	// pragma from the caller's deadline now, so what this declares is what the call takes.
 	//
 	// A field only so a test can make a store that stalls take less than the real bound;
 	// nothing else changes it.

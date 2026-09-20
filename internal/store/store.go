@@ -137,17 +137,28 @@ func OpenWith(ctx context.Context, address string, owned Ownership, log zerolog.
 	// `database is locked (5)` from whatsmeow trying to save an identity key while the
 	// mapping was being written, and a message that cannot have its identity saved
 	// cannot be decrypted.
-	db, err := sql.Open(dialect, dsn)
-	if err != nil {
-		return nil, fmt.Errorf("store: open %s: %w", dialect, err)
-	}
+	var db *sql.DB
 	if dialect == dialectSQLite {
+		// Not `sql.Open`: the connector is wrapped so every statement runs under a
+		// `busy_timeout` derived from its caller's deadline. Why that has to happen
+		// under `*sql.DB` rather than at the call sites is in `sqlitebudget.go`.
+		connector, err := sqliteBudgeted(dsn)
+		if err != nil {
+			return nil, err
+		}
+		db = sql.OpenDB(connector)
 		// A file holds one writer at a time whatever the pool says, and a pool that
 		// hands out more connections than that only converts waiting into
 		// `database is locked`. Serialising here is what makes busy_timeout the
-		// backstop rather than the mechanism.
+		// backstop rather than the mechanism -- and it is also why the budget above
+		// has to be set on every statement: one connection is one shared setting.
 		db.SetMaxOpenConns(1)
 	} else {
+		opened, err := sql.Open(dialect, dsn)
+		if err != nil {
+			return nil, fmt.Errorf("store: open %s: %w", dialect, err)
+		}
+		db = opened
 		maxConns := opts.MaxConns
 		if maxConns <= 0 {
 			maxConns = DefaultMaxConns
@@ -936,7 +947,9 @@ func parseURL(address string) (dialect, dsn string, err error) {
 //   - busy_timeout: without it a contended write returns `database is locked` on the
 //     spot instead of waiting. That is what a live pairing produced: identity keys that
 //     could not be saved, messages that then could not be decrypted, and an app state
-//     sync that failed because the key share it needed was inside one of them.
+//     sync that failed because the key share it needed was inside one of them. What is
+//     spelled here is the value a call with no deadline of its own gets; a call that
+//     carries one waits on that instead (`sqlitebudget.go`, #293).
 //   - _txlock=immediate: a transaction that starts out reading and later writes has to
 //     upgrade its lock, and two of those upgrading at once is a deadlock SQLite breaks
 //     by failing one of them, which no timeout can save. Taking the write lock at BEGIN
