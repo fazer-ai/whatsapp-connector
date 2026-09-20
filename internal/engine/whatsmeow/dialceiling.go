@@ -33,17 +33,26 @@ const dialCeiling = 20 * time.Second
 // `SetWebsocketHTTPClient` is what carries it: `coder/websocket` turns `HTTPClient.Timeout`
 // into a `context.WithTimeout` around the dial and zeroes it on the client it then uses, so
 // the ceiling ends the handshake for the connection rather than the connection itself.
-// Read out of the pinned `dial.go` rather than assumed, because a timeout that killed the
-// socket after it opened would be a much worse bug than the one this fixes.
+// Read out of the pinned `dial.go` rather than assumed, and measured by
+// `TestTheCeilingDoesNotOutliveTheDialItBounds`, because a timeout that killed the socket
+// after it opened would be a much worse bug than the one this fixes.
 //
-// The websocket client is its own, separate from the one media downloads use, so a ceiling
-// here does not put one on a download of any size. The transport is a clone of the
-// default, which is what the library builds its own clients from; a pin that starts
-// configuring that transport would not reach this one, and `TestTheClientWeBuildIsTheOneTheLibraryWouldHave`
-// is what notices.
+// Both of them, because whatsmeow dials through two different clients and picks between
+// them on whether the device has an ID: a session that has never paired goes out through
+// the pre-login one. That is the QR dial, which is a connect like any other and holds the
+// same write lock, so a ceiling on one of the two would leave pairing with none.
+//
+// Neither is the client media downloads use, so a ceiling here does not put one on a
+// download of any size. Each gets its own clone of the default transport, which is what
+// the library builds its own from; a pin that starts configuring that transport would not
+// reach these, and `TestTheClientWeBuildIsTheOneTheLibraryWouldHave` is what notices.
 func newClient(device *store.Device, log waLog.Logger) *wm.Client {
 	client := wm.NewClient(device, log)
 	client.SetWebsocketHTTPClient(&http.Client{
+		Timeout:   dialCeiling,
+		Transport: http.DefaultTransport.(*http.Transport).Clone(),
+	})
+	client.SetPreLoginHTTPClient(&http.Client{
 		Timeout:   dialCeiling,
 		Transport: http.DefaultTransport.(*http.Transport).Clone(),
 	})
