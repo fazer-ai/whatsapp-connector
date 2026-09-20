@@ -96,6 +96,15 @@ func TestOneOwnerNoticesTwoInstancesUnderOneEpoch(t *testing.T) {
 			events: []protocol.Event{event("s1", "b", 2, 1), event("s1", "a", 1, 3)},
 			state:  "AFIRMADO",
 		},
+		"o MESMO evento tardio entregue duas vezes continua sendo um": {
+			// At-least-once is the transport's guarantee: a retried XADD whose first answer
+			// was lost puts the same entry on the stream again. Counted as two late
+			// publications, the contract's own delivery would read as the fence failing.
+			events: []protocol.Event{
+				event("s1", "b", 2, 1), event("s1", "a", 1, 3), event("s1", "a", 1, 3),
+			},
+			state: "AFIRMADO",
+		},
 		"o SEGUNDO epoch velho da mesma instancia e a cerca nao tendo agido": {
 			// The fence half, and it is invisible to the first reading: every (sid, epoch)
 			// here still has exactly one publisher. On the first late event the connector
