@@ -1098,7 +1098,7 @@ func (s *Session) carryOut(ctx context.Context, command *protocol.Command) (resu
 		// knows something ran a day ago, not that the world stayed that way.
 		return result, true, nil
 	}
-	if attempted && !protocol.SelfSettlingCommands[command.Type] {
+	if attempted {
 		// It ran, and what it did is not on record, which happens when the answer never
 		// came back. Carrying it out again instead is a participant added twice, or a
 		// name set over one somebody has since changed (#282).
@@ -1118,8 +1118,11 @@ func (s *Session) carryOut(ctx context.Context, command *protocol.Command) (resu
 	}
 
 	if !protocol.SelfSettlingCommands[command.Type] {
-		// Skipped and not merely ignored above: a record this layer would never read is
-		// one nothing takes off either, so it would sit in Redis until it expired.
+		// Not reserving is the whole of the exemption, and the branch above needs no
+		// second one: with no attempt on record a redelivery of one of these reads as a
+		// command nobody has heard of and goes to the engine, which is where its own
+		// recovery lives. A guard there as well would be a guard nothing can reach, and
+		// two that mask each other are two that no test can tell apart.
 		s.reserve(ctx, command, key)
 	}
 
