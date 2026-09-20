@@ -176,6 +176,16 @@ func measure(ctx context.Context, active *run, group *fleet, rep *report, plan b
 	// The process goes without a chance to hand anything back, which is the case the
 	// sweep exists for: the leases die with their holder and what brings the accounts
 	// back is the record each connect left in the store.
+	//
+	// The clock starts at the death and not at the replacement being healthy, because the
+	// number answers how long the accounts stay down after an instance dies, and the
+	// replacement's own startup is part of that outage. Started after `group.start`
+	// returns, it read SHORTER the slower that startup was: the dead process's lease
+	// expires on a clock that began here, so the wait that follows is the remainder of a
+	// WAC_LEASE_TTL minus however long the replacement took to come up, and a slow start
+	// could carry a run past its `-max-adoption`. A replacement that had adopted
+	// everything before answering /healthz would have reported a recovery of zero.
+	adoptionStart := time.Now()
 	if err := first.kill(); err != nil {
 		return fmt.Errorf("%w: %w", errSetup, err)
 	}
@@ -187,7 +197,6 @@ func measure(ctx context.Context, active *run, group *fleet, rep *report, plan b
 	}
 	rep.processes = append(rep.processes, noteOf(second))
 
-	adoptionStart := time.Now()
 	back, adopted := 0, time.Duration(0)
 	deadline := time.Now().Add(3 * time.Minute)
 	for time.Now().Before(deadline) {

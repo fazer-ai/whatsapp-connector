@@ -15,8 +15,8 @@ import (
 	"github.com/fazer-ai/whatsapp-connector/internal/transport/redisstream"
 )
 
-// The six claims the issue asks of the third measurement, each with the series it looked
-// at and a verdict, or with the reason it was not measured.
+// The claims the issue asks of the third measurement, each with the series it looked at
+// and a verdict, or with the reason it was not measured.
 //
 // Never both and never neither: an item with no series is not an assertion that passed,
 // it is an assertion that never ran, and printing it as a pass is how a bench ends up
@@ -64,12 +64,21 @@ func assertInvariants(ctx context.Context, cl *client, rep *report, plan benchPl
 		rep.measure("troca de dono sob carga", "entradas em "+read.stream, float64(read.length), "entradas")
 	}
 
+	// Read after the streams, and the order is the safe one. An acquire landing between the
+	// two reads can only push a counter up, so the gap can hide a regression and cannot
+	// invent one, and a false positive here would be a bench calling a healthy fleet broken.
+	counters, err := cl.epochCounters(ctx, sids)
+	if err != nil {
+		return fmt.Errorf("%w: %w", errSetup, err)
+	}
+
 	// Marked from here, and not over the whole report: the fence claim was asserted by the
 	// frozen phase and its series is adoptions, not stream entries. Blanketing the report
 	// would say a claim went unmeasured because of something it never read.
 	fromStreams := len(rep.assertions)
 	assertOneOwner(rep, published, inOrder, counted, len(sids))
 	assertEpochRises(rep, published)
+	assertEpochCounter(rep, published, counters, cl.keys.LeaseEpoch("<sid>"))
 	assertSeqMonotonic(rep, published)
 	assertOneShard(rep, shardOf, firstOn, sids)
 	assertNoLostEvent(rep, published, truncated)
@@ -263,6 +272,12 @@ func assertEpochRises(rep *report, published map[string][]protocol.Event) {
 	// where the only thing that happened was a write that was in flight when the freeze
 	// landed. Whether that late event is allowed at all is `assertOneOwner`'s question,
 	// and it is answered there; this one is about the epoch of an actual handover.
+	//
+	// What this reading cannot decide, and what `assertEpochCounter` is for: a handover to
+	// an instance that publishes exactly ONE event under a regressed epoch has, in the
+	// stream, the same shape as the in-flight write the contract allows -- one event below
+	// the highest, and nothing after it from that publisher. Nothing in the stream tells
+	// the two apart, so the counter the epoch is handed out from is read instead.
 	changes, offenders, dropped := 0, []string{}, 0
 	for sid, events := range published {
 		var lastInst string
@@ -289,18 +304,102 @@ func assertEpochRises(rep *report, published map[string][]protocol.Event) {
 	if dropped > 0 {
 		rep.note(fmt.Sprintf("%d evento(s) de epoch inferior ao mais alto ja visto ficaram de fora desta "+
 			"leitura, porque e isso que um cliente faz com eles. Contados, cada um pareceria uma troca "+
-			"de dono de volta para a instancia velha", dropped))
+			"de dono de volta para a instancia velha. Uma posse que comecasse com epoch regredido e "+
+			"publicasse um evento so tem essa mesma forma no stream, e quem a separa da escrita em voo "+
+			"e a afirmacao do contador de epoch, logo abaixo", dropped))
 	}
 	rep.assert(&assertion{
 		invariant: "2 (todo evento carrega o epoch do dono, e ele sobe em toda troca de posse)",
-		claim:     "epoch estritamente crescente a cada troca de dono",
-		series:    fmt.Sprintf("%d trocas de dono observadas sobre %d sessoes", changes, len(published)),
-		points:    changes,
-		held:      len(offenders) == 0,
-		detail:    strings.Join(offenders, "\n"),
+		claim: "epoch estritamente crescente a cada troca de dono, entre os eventos que um cliente " +
+			"aceita (o epoch de onde eles saem e afirmado pelo contador, na linha seguinte)",
+		series: fmt.Sprintf("%d trocas de dono observadas sobre %d sessoes", changes, len(published)),
+		points: changes,
+		held:   len(offenders) == 0,
+		detail: strings.Join(offenders, "\n"),
 		notWhy: ifEmpty(changes, "nenhuma troca de dono apareceu nos streams, entao nao havia o que "+
 			"afirmar: uma asserção de epoch sem troca nao tem como ficar vermelha"),
 	})
+}
+
+// Invariant 2, at the source: the counter an epoch is handed out from never falls below an
+// epoch that session has already published under.
+//
+// `assertEpochRises` reads the streams the way a client does, and there is one case that
+// reading cannot decide (its own comment says which). The epoch is not a number the events
+// carry from nowhere: it is `INCR <prefix>lease-epoch:<sid>`, monotonic by construction, so
+// the only way it falls is the key being deleted or lost -- `ForgetEpoch` firing on a
+// session that is not gone is the reachable one. A counter sitting below an epoch already
+// on the wire means the next acquire hands out a generation that has been published under,
+// and a client keeping the highest epoch it has seen would drop that new owner's whole
+// session. That is invariant 2 failing at the source, before an event exists to read it
+// from, and it is red here whatever the streams looked like.
+//
+// What it does NOT catch, and the claim says so by naming its series: a regression that was
+// climbed back over before this read, which needs an acquire that published nothing under
+// the reissued generation -- had it published, `assertOneOwner` would have two instances
+// under one epoch to show.
+func assertEpochCounter(rep *report, published map[string][]protocol.Event,
+	counters map[string]uint64, keyShape string,
+) {
+	offenders, checked := epochCounterOffenders(published, counters)
+	rep.assert(&assertion{
+		invariant: "2 (todo evento carrega o epoch do dono, e ele sobe em toda troca de posse)",
+		claim: "o contador de onde sai o epoch nunca esta abaixo do epoch mais alto que aquela " +
+			"sessao ja publicou, lido ao fim da corrida",
+		series: fmt.Sprintf("%d sessoes com evento publicado, cada uma contra o seu %s",
+			checked, keyShape),
+		points: checked,
+		held:   len(offenders) == 0,
+		detail: strings.Join(offenders, "\n"),
+		notWhy: ifEmpty(checked, "nenhuma sessao publicou evento, entao nao ha epoch no stream "+
+			"para comparar com contador nenhum"),
+	})
+}
+
+// epochCounterOffenders is the decision, out of the assertion so that a test reaches it
+// without a fleet: the phases are processes and sockets, and a table is what says which
+// shapes are offenders.
+func epochCounterOffenders(published map[string][]protocol.Event,
+	counters map[string]uint64,
+) (offenders []string, checked int) {
+	sids := make([]string, 0, len(published))
+	for sid := range published {
+		sids = append(sids, sid)
+	}
+	sort.Strings(sids)
+
+	for _, sid := range sids {
+		var highest uint64
+		var by string
+		for _, event := range published[sid] {
+			if event.Epoch > highest {
+				highest, by = event.Epoch, event.Inst
+			}
+		}
+		// An epoch of zero is no epoch: the counter starts at 1 on the first `INCR`, so a
+		// session whose events all carry zero never had a generation to compare against,
+		// and calling that a regression would be a finding about a session nobody owned.
+		if highest == 0 {
+			continue
+		}
+		checked++
+		counter, present := counters[sid]
+		if !present {
+			offenders = append(offenders, fmt.Sprintf(
+				"%s publicou sob o epoch %d (%s) e nao tem contador de epoch nenhum: a proxima "+
+					"posse comeca de novo no 1 e reemite geracoes que ja sairam no stream",
+				sid, highest, by))
+			continue
+		}
+		if counter < highest {
+			offenders = append(offenders, fmt.Sprintf(
+				"%s tem o contador de epoch em %d, abaixo do epoch %d que %s ja publicou: a "+
+					"proxima posse recebe uma geracao que ja saiu no stream, e um cliente "+
+					"descarta a sessao inteira do dono novo",
+				sid, counter, highest, by))
+		}
+	}
+	return offenders, checked
 }
 
 // Invariant 3, first half: `seq` is monotonic per `(sid, epoch)`.

@@ -146,6 +146,27 @@ func (c *client) leaseHolders(ctx context.Context, sids []string) (map[string]st
 	return held, nil
 }
 
+// epochCounters reads the counter every epoch of a session is handed out from.
+//
+// `INCR` on `<prefix>lease-epoch:<sid>`: the one place an epoch can come from, and the one
+// place a regression can come from, neither of which is visible in the event streams. A sid
+// absent from the map has no counter at all, which is not a counter of zero -- the next
+// acquire of a session without one starts again at 1.
+func (c *client) epochCounters(ctx context.Context, sids []string) (map[string]uint64, error) {
+	counters := make(map[string]uint64, len(sids))
+	for _, sid := range sids {
+		value, err := c.rdb.Get(ctx, c.keys.LeaseEpoch(sid)).Uint64()
+		switch {
+		case errors.Is(err, redis.Nil):
+			continue
+		case err != nil:
+			return nil, fmt.Errorf("read the epoch counter of %s: %w", sid, err)
+		}
+		counters[sid] = value
+	}
+	return counters, nil
+}
+
 // instances is the fleet's own registry, which is how a client learns who is up.
 func (c *client) instances(ctx context.Context) (map[string]map[string]string, error) {
 	names, err := c.rdb.SMembers(ctx, c.keys.Instances()).Result()

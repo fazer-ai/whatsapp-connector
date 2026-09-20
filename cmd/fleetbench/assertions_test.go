@@ -1193,3 +1193,145 @@ func TestAMissingStreamSurvivesADrainTimeout(t *testing.T) {
 		t.Errorf("com pendencia E stream apagado o veredito saiu %q", got)
 	}
 }
+
+// The case the stream reading cannot decide, decided by the counter the epoch comes from.
+//
+// A handover to an instance that publishes exactly ONE event under a regressed epoch has
+// the same shape in the stream as the in-flight write the contract allows, and both
+// assertions that walk the streams tolerate it: `assertEpochRises` drops it the way a
+// client would, and `assertOneOwner` counts one late event per instance as the write that
+// was in flight. So the epoch is checked where it is handed out instead.
+func TestTheEpochCounterIsReadWhereTheEpochComesFrom(t *testing.T) {
+	t.Parallel()
+
+	// `says` is checked and not only the count, because the two offenders are two different
+	// diagnoses and one of them collapses into the other on its own: with the missing-key
+	// branch gone, a session with no counter reads as a counter of zero and still comes out
+	// as one offender, under the wrong sentence. The number alone cannot see that.
+	cases := []struct {
+		name      string
+		published map[string][]protocol.Event
+		counters  map[string]uint64
+		checked   int
+		offenders int
+		says      string
+	}{
+		{
+			name:      "contador acima do publicado e a corrida saudavel",
+			published: map[string][]protocol.Event{"s1": {event("s1", "a", 1, 1), event("s1", "b", 2, 1)}},
+			counters:  map[string]uint64{"s1": 2},
+			checked:   1,
+		},
+		{
+			name:      "contador abaixo do epoch ja publicado e a geracao sendo reemitida",
+			published: map[string][]protocol.Event{"s1": {event("s1", "a", 3, 1)}},
+			counters:  map[string]uint64{"s1": 1},
+			checked:   1,
+			offenders: 1,
+			says:      "contador de epoch em 1, abaixo do epoch 3",
+		},
+		{
+			name:      "sessao que publicou e nao tem contador nenhum recomeca no 1",
+			published: map[string][]protocol.Event{"s1": {event("s1", "a", 4, 1)}},
+			counters:  map[string]uint64{},
+			checked:   1,
+			offenders: 1,
+			says:      "nao tem contador de epoch nenhum",
+		},
+		{
+			// Zero is not a generation: the counter only exists from the first INCR, so a
+			// session whose events all carry zero never had one to fall below.
+			name:      "epoch zero nao e geracao, entao nao ha o que comparar",
+			published: map[string][]protocol.Event{"s1": {event("s1", "a", 0, 1)}},
+			counters:  map[string]uint64{},
+		},
+		{
+			name: "uma sessao regredida entre sessoes sas e achado so dela",
+			published: map[string][]protocol.Event{
+				"s1": {event("s1", "a", 2, 1)},
+				"s2": {event("s2", "b", 5, 1)},
+				"s3": {event("s3", "c", 1, 1)},
+			},
+			counters: map[string]uint64{"s1": 2, "s2": 4, "s3": 1},
+			checked:  3,
+			// only s2, whose counter reads below the epoch it already published under
+			offenders: 1,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			offenders, checked := epochCounterOffenders(tc.published, tc.counters)
+			if checked != tc.checked {
+				t.Errorf("conferiu %d sessoes, esperado %d", checked, tc.checked)
+			}
+			if len(offenders) != tc.offenders {
+				t.Errorf("achou %d infratores, esperado %d:\n%s",
+					len(offenders), tc.offenders, strings.Join(offenders, "\n"))
+			}
+			if tc.says != "" && !strings.Contains(strings.Join(offenders, "\n"), tc.says) {
+				t.Errorf("o achado nao diz %q, entao ele nomeia o diagnostico errado:\n%s",
+					tc.says, strings.Join(offenders, "\n"))
+			}
+		})
+	}
+}
+
+// A regression the streams tolerate has to come out red somewhere, and this is where.
+func TestTheRegressedEpochIsRedAtTheCounterAndNotInTheStream(t *testing.T) {
+	t.Parallel()
+
+	// a/1, b/3, c/2: c took the session under a generation below one already published,
+	// and it published exactly one event, which is the shape of an allowed in-flight write.
+	published := map[string][]protocol.Event{
+		"s1": {event("s1", "a", 1, 1), event("s1", "b", 3, 1), event("s1", "c", 2, 1)},
+	}
+
+	stream := &report{}
+	assertEpochRises(stream, published)
+	if state := only(t, stream).state(); state == "QUEBRADO" {
+		t.Errorf("a leitura de stream deu veredito sobre um caso que ela nao distingue: %s", state)
+	}
+
+	counter := &report{}
+	assertEpochCounter(counter, published, map[string]uint64{"s1": 2}, "wa:lease-epoch:<sid>")
+	got := only(t, counter)
+	if got.state() != "QUEBRADO" {
+		t.Fatalf("o contador em 2, abaixo do epoch 3 ja publicado, saiu %q", got.state())
+	}
+	if !strings.Contains(got.detail, "s1") {
+		t.Errorf("o detalhe nao nomeia a sessao:\n%s", got.detail)
+	}
+	if !strings.Contains(got.series, "wa:lease-epoch:<sid>") {
+		t.Errorf("a serie nao diz contra o que comparou:\n%s", got.series)
+	}
+}
+
+// Nothing published means nothing to compare, and that is NAO MEDIDO and not a pass.
+func TestTheEpochCounterClaimIsNotGreenWithoutEvents(t *testing.T) {
+	t.Parallel()
+
+	rep := &report{}
+	assertEpochCounter(rep, map[string][]protocol.Event{}, map[string]uint64{"s1": 7}, "wa:lease-epoch:<sid>")
+	if state := only(t, rep).state(); state != "NAO MEDIDO" {
+		t.Errorf("uma corrida sem evento nenhum afirmou o contador de epoch: %q", state)
+	}
+}
+
+// The stream claim used to promise the whole of invariant 2, and it stopped checking part
+// of it on purpose. A claim printed over a run says what that run proved.
+func TestTheEpochRisesClaimSaysItReadsWhatAClientAccepts(t *testing.T) {
+	t.Parallel()
+
+	rep := &report{}
+	assertEpochRises(rep, map[string][]protocol.Event{
+		"s1": {event("s1", "a", 1, 1), event("s1", "b", 2, 1)},
+	})
+	claim := only(t, rep).claim
+	for _, half := range []string{"eventos que um cliente", "contador"} {
+		if !strings.Contains(claim, half) {
+			t.Errorf("a afirmacao nao diz %q, entao ela promete a invariante 2 inteira sobre uma "+
+				"leitura que nao a decide inteira:\n%s", half, claim)
+		}
+	}
+}
