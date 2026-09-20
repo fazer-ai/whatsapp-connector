@@ -368,3 +368,30 @@ func closeBody(response *http.Response) {
 		_ = response.Body.Close()
 	}
 }
+
+// A transport nobody chose is said out loud rather than dialled through.
+//
+// Through the seam and not by replacing http.DefaultTransport: every other test in this
+// package runs in parallel and would see that replacement.
+func TestATransportTheProcessDidNotChooseIsRefused(t *testing.T) {
+	t.Parallel()
+
+	defer func() {
+		said, panicked := recover().(string)
+		if !panicked {
+			t.Error("a round tripper that is not an *http.Transport was accepted, so the " +
+				"dial clients would be built from something nobody chose")
+			return
+		}
+		if !strings.Contains(said, "not *http.Transport") {
+			t.Errorf("the panic says %q, which does not name what went wrong", said)
+		}
+	}()
+	_ = transportOf(roundTripperThatIsNotATransport{})
+}
+
+type roundTripperThatIsNotATransport struct{}
+
+func (roundTripperThatIsNotATransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, nil
+}

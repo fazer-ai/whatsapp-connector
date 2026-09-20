@@ -67,11 +67,17 @@ func newClient(device *store.Device, log waLog.Logger) *wm.Client {
 // dependency replacing it at init, and dialling through a transport nobody chose is worse
 // than saying so.
 func dialTransport() *http.Transport {
-	transport, ok := http.DefaultTransport.(*http.Transport)
+	return transportOf(http.DefaultTransport)
+}
+
+// transportOf takes the round tripper rather than reading the global, so the branch below
+// can be exercised without replacing a process-wide variable that every other test in this
+// package would see.
+func transportOf(rt http.RoundTripper) *http.Transport {
+	transport, ok := rt.(*http.Transport)
 	if !ok {
 		panic(fmt.Sprintf("whatsmeow: http.DefaultTransport is %T and not *http.Transport, "+
-			"so the dial clients built here are not the ones the library would have built",
-			http.DefaultTransport))
+			"so the dial clients built here are not the ones the library would have built", rt))
 	}
 	return transport
 }
