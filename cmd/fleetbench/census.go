@@ -76,19 +76,28 @@ func (c *census) take(ctx context.Context, phase string, live []*instance) {
 // by then every instance involved has written its gauge at least once, and they still add
 // up to more sessions than exist.
 func (c *census) over(sids int) (above []fleetSample, sustained bool) {
+	// Contiguous, and not merely "two of them far apart". Two isolated spikes with an
+	// hour of healthy readings between them are two ownership changes, each with its own
+	// tick of gauge lag; reading them as one overshoot that lasted an hour turns ordinary
+	// fleet movement into a broken invariant. What has to last is the state, so a reading
+	// back inside the limit ends the run being measured.
+	var runStart time.Time
+	inRun := false
 	for _, sample := range c.samples {
-		if sample.total > sids {
-			above = append(above, sample)
+		if sample.total <= sids {
+			inRun = false
+			continue
+		}
+		above = append(above, sample)
+		if !inRun {
+			runStart, inRun = sample.at, true
+			continue
+		}
+		if sample.at.Sub(runStart) > 2*benchHeartbeat {
+			sustained = true
 		}
 	}
-	for i := range above {
-		for j := i + 1; j < len(above); j++ {
-			if above[j].at.Sub(above[i].at) > 2*benchHeartbeat {
-				return above, true
-			}
-		}
-	}
-	return above, false
+	return above, sustained
 }
 
 // worst returns the sample with the highest total, which is the one that decides the

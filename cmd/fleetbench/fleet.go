@@ -121,14 +121,23 @@ func (i *instance) waitHealthy(ctx context.Context, within time.Duration) error 
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		request, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+i.httpAddr+"/healthz", http.NoBody)
+		// A deadline per request, and not only between them. A connector that accepts the
+		// connection and then stops answering leaves `Do` waiting forever on a context
+		// that has none, and the loop below never gets to look at its own deadline again:
+		// the 30 seconds this function promises would never fire.
+		attempt, cancelAttempt := context.WithTimeout(ctx, 5*time.Second)
+		request, _ := http.NewRequestWithContext(attempt, http.MethodGet, "http://"+i.httpAddr+"/healthz", http.NoBody)
 		response, err := http.DefaultClient.Do(request)
 		if err == nil {
 			_, _ = io.Copy(io.Discard, response.Body)
 			_ = response.Body.Close()
-			if response.StatusCode == http.StatusOK {
+			healthy := response.StatusCode == http.StatusOK
+			cancelAttempt()
+			if healthy {
 				return nil
 			}
+		} else {
+			cancelAttempt()
 		}
 		if i.cmd.ProcessState != nil {
 			return fmt.Errorf("%s exited before it was healthy; its log is at %s", i.name, i.logPath)
@@ -238,7 +247,13 @@ func (i *instance) metricsWithOptional(ctx context.Context, want, optional []str
 }
 
 func (i *instance) readMetrics(ctx context.Context, want, optional []string) (map[string]float64, error) {
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+i.httpAddr+"/metrics", http.NoBody)
+	// Bounded on its own, for the reason the health probe is: a connector that accepts
+	// the connection and answers nothing would otherwise hold this call forever, and every
+	// deadline above it -- adoption, drain, the frozen phase -- is checked only between
+	// readings.
+	read, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	request, err := http.NewRequestWithContext(read, http.MethodGet, "http://"+i.httpAddr+"/metrics", http.NoBody)
 	if err != nil {
 		return nil, err
 	}

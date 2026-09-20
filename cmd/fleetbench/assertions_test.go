@@ -93,6 +93,18 @@ func TestOneOwnerNoticesTwoInstancesUnderOneEpoch(t *testing.T) {
 			state: "QUEBRADO",
 			says:  "mais de uma instancia ao mesmo tempo",
 		},
+		"duas sobras isoladas, com leitura sa no meio, sao duas trocas": {
+			// Each spike is one ownership change paying its own tick of gauge lag. Read
+			// as a single overshoot that lasted the whole interval, ordinary fleet
+			// movement becomes a broken invariant.
+			events: []protocol.Event{event("s1", "a", 1, 1), event("s1", "b", 2, 1)},
+			samples: []fleetSample{
+				{at: moment(0), phase: "troca", byInst: map[string]int{"a": 1, "b": 1}, total: 2},
+				{at: moment(30 * time.Second), phase: "troca", byInst: map[string]int{"a": 1}, total: 1},
+				{at: moment(60 * time.Second), phase: "troca", byInst: map[string]int{"a": 1, "b": 1}, total: 2},
+			},
+			state: "AFIRMADO",
+		},
 		"a mesma sobra dentro de um tick nao e posse dupla": {
 			// The gauge is written once per heartbeat, so while ownership moves one
 			// instance can still be counting a session the next one already counts. Real

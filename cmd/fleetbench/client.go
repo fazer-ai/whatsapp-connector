@@ -161,12 +161,17 @@ func (c *client) instances(ctx context.Context) (map[string]map[string]string, e
 	return registry, nil
 }
 
-// pendingOn is how many commands the fleet has taken and not yet retired, across every
-// command stream of this run.
+// pendingOn is how much work the consumer groups of this run still have: entries taken
+// and not retired, plus entries nobody has read yet.
 //
 // Read from the consumer groups and not from what this bench sent: "I put six commands on
 // a stream" says nothing about whether any of them is still in flight a moment later, and
 // the fake engine answers a send before the next one is written.
+//
+// Both numbers, because the assertion at the end of the run reads both. A group can be at
+// zero pending with a hundred entries still unread, and a drain that stopped there would
+// hand `assertConsumerGroups` a fleet with a backlog and let it report the backlog as a
+// hole. What is waited for has to be what is asserted.
 func (c *client) pendingOn(ctx context.Context, sids []string) (int64, error) {
 	streams := make([]string, 0, len(sids)+1)
 	streams = append(streams, c.keys.Control())
@@ -186,7 +191,7 @@ func (c *client) pendingOn(ctx context.Context, sids []string) (int64, error) {
 			return 0, fmt.Errorf("read the consumer groups of %s: %w", stream, err)
 		}
 		for _, group := range groups {
-			total += group.Pending
+			total += group.Pending + group.Lag
 		}
 	}
 	return total, nil

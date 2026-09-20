@@ -78,6 +78,16 @@ func newRun(ctx context.Context, s servers) (*run, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read %s back: %w", databaseVar, err)
 	}
+	// The path alone does not decide the database. `lib/pq` accepts `dbname` and
+	// `database` as query parameters and lets them override what the path says, so a
+	// `WAC_TEST_DATABASE_URL` carrying either would have every connector of this run
+	// migrate and write into the shared database while the cleanup dropped the empty one
+	// this run created. Stripped rather than trusted, because the variable comes from
+	// whoever ran the bench.
+	base := parsed.Query()
+	base.Del("dbname")
+	base.Del("database")
+	parsed.RawQuery = base.Encode()
 	parsed.Path = "/" + r.database
 	r.fleetURL = parsed.String()
 	// The bench's own connections carry a name, so that the pool measurement can leave
