@@ -26,6 +26,7 @@ import (
 	"github.com/fazer-ai/whatsapp-connector/internal/redisx"
 	"github.com/fazer-ai/whatsapp-connector/internal/session"
 	"github.com/fazer-ai/whatsapp-connector/internal/store"
+	"github.com/fazer-ai/whatsapp-connector/internal/testwait"
 	"github.com/fazer-ai/whatsapp-connector/internal/transport"
 )
 
@@ -292,12 +293,12 @@ func delivery(cmd *protocol.Command, acked *atomic.Bool) *transport.Delivery {
 
 func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(testwait.Budget)
 	for time.Now().Before(deadline) {
 		if cond() {
 			return
 		}
-		time.Sleep(time.Millisecond)
+		time.Sleep(testwait.Poll)
 	}
 	t.Fatalf("timed out waiting for %s", what)
 }
@@ -1406,12 +1407,12 @@ func status(id, sid string, released *atomic.Bool) *transport.Delivery {
 
 func waitUntil(t *testing.T, what string, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(testwait.Budget)
 	for time.Now().Before(deadline) {
 		if cond() {
 			return
 		}
-		time.Sleep(time.Millisecond)
+		time.Sleep(testwait.Poll)
 	}
 	t.Fatalf("timed out waiting for %s", what)
 }

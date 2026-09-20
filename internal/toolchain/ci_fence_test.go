@@ -65,7 +65,12 @@ var outsideCheck = map[string]exemption{
 // that lands and leaves `check` quietly behind.
 var targetsOutsideCheck = map[string]exemption{
 	"test-cover": {standsFor: "test", why: "`make test` under a coverage profile: the same packages and the same cleared variables, " +
-		"plus coverage.txt for the artifact. What `check` does not reach is the profile, and a profile gates nothing."},
+		"plus coverage.txt for the artifact. What `check` does not reach is the profile, and what a profile decides is " +
+		"coverage.txt, which gates nothing. It is not that the two builds behave alike: the instrumented one is slower, " +
+		"and #298 is a test that failed on CI under it and nowhere else. Running it here would not have caught that -- " +
+		"measured, the path takes 0.25s under the profile on this machine against the 2s budget it blew on the runner -- " +
+		"so what the difference costs is a timing margin, and margins are held by " +
+		"`internal/testwait`, not by which target a developer types."},
 }
 
 type workflow struct {

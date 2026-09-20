@@ -23,6 +23,7 @@ import (
 	waEvents "go.mau.fi/whatsmeow/types/events"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
+	"github.com/fazer-ai/whatsapp-connector/internal/testwait"
 )
 
 // The count is what the rule is about, so it is asked directly rather than through a
@@ -654,7 +655,7 @@ func mustStartCommand(t *testing.T, session *Session) {
 func waitFor(t *testing.T, done func() bool, complaint string) {
 	t.Helper()
 
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(testwait.Budget)
 	for time.Now().Before(deadline) {
 		if done() {
 			return

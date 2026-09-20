@@ -21,6 +21,7 @@ import (
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 	"github.com/fazer-ai/whatsapp-connector/internal/redisx"
 	"github.com/fazer-ai/whatsapp-connector/internal/session"
+	"github.com/fazer-ai/whatsapp-connector/internal/testwait"
 	"github.com/fazer-ai/whatsapp-connector/internal/transport"
 	"github.com/fazer-ai/whatsapp-connector/internal/transport/redisstream"
 )
@@ -214,12 +215,12 @@ func (s *timedStreams) ClaimSessions(ctx context.Context, sids []string) ([]tran
 // carried out rather than by whoever dispatched it.
 func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(testwait.Budget)
 	for time.Now().Before(deadline) {
 		if cond() {
 			return
 		}
-		time.Sleep(time.Millisecond)
+		time.Sleep(testwait.Poll)
 	}
 	t.Fatalf("timed out waiting for %s", what)
 }

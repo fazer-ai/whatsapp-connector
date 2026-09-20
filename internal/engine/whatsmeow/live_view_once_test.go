@@ -379,6 +379,9 @@ func liveDownload(t *testing.T, session *Session, message *waEvents.Message) []b
 func whyNoFile(t *testing.T, sent string, watching *recorder) string {
 	t.Helper()
 
+	// testwait: this one waits on WhatsApp rather than on this machine, so the budget is
+	// about a real download over a real network and not about how quickly a goroutine
+	// gets scheduled here.
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		failure := watching.await(t, protocol.EventMediaDownloadFailed, time.Until(deadline))

@@ -18,6 +18,7 @@ import (
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 	"github.com/fazer-ai/whatsapp-connector/internal/redisx"
 	"github.com/fazer-ai/whatsapp-connector/internal/session"
+	"github.com/fazer-ai/whatsapp-connector/internal/testwait"
 	"github.com/fazer-ai/whatsapp-connector/internal/transport"
 )
 
@@ -83,13 +84,13 @@ func (h teardownHarness) heartbeat(t *testing.T) {
 // the registration itself.
 func (h teardownHarness) handedBack(t *testing.T) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(testwait.Budget)
 	for time.Now().Before(deadline) {
 		h.heartbeat(t)
 		if h.manager.Count() == 0 {
 			return
 		}
-		time.Sleep(time.Millisecond)
+		time.Sleep(testwait.Poll)
 	}
 	t.Fatalf("the account was never given back: %d still running", h.manager.Count())
 }
