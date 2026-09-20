@@ -151,12 +151,20 @@ func assertOneOwner(rep *report, published map[string][]protocol.Event,
 		for stream, events := range streams {
 			var highest uint64
 			var highestBy, highestID string
-			stale := map[string]int{}
+			// Distinct ids, because the transport is allowed to hand the same event over
+			// twice: a retried XADD whose first answer was lost puts the same late event on
+			// the stream again, and counted as two this would report the contract's own
+			// at-least-once delivery as the fence having failed. The same reason
+			// `assertSeqMonotonic` discounts a repeat before comparing.
+			stale := map[string]map[string]bool{}
 			for _, event := range events {
 				if event.Epoch < highest {
 					late++
-					stale[event.Inst]++
-					if stale[event.Inst] > 1 {
+					if stale[event.Inst] == nil {
+						stale[event.Inst] = map[string]bool{}
+					}
+					stale[event.Inst][event.ID] = true
+					if len(stale[event.Inst]) > 1 {
 						offenders = append(offenders, fmt.Sprintf(
 							"%s: a instancia %s publicou o evento %s sob o epoch %d em %s DEPOIS de %s ja "+
 								"ter publicado o evento %s sob o epoch %d, e essa ja e a %da vez dela nesta "+
@@ -164,7 +172,7 @@ func assertOneOwner(rep *report, published map[string][]protocol.Event,
 								"cliente descarta pelo cursor, mas ao detecta-la o conector derruba a sessao, "+
 								"entao a segunda e a cerca nao tendo agido",
 							sid, event.Inst, event.ID, event.Epoch, stream, highestBy, highestID, highest,
-							stale[event.Inst]))
+							len(stale[event.Inst])))
 					}
 					continue
 				}

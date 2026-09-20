@@ -352,6 +352,22 @@ func freePort(ctx context.Context) (int, error) {
 	return tcp.Port, nil
 }
 
+// unprefixedConfig is what the connector reads WITHOUT the WAC_ prefix, and it has to be
+// dropped from an inherited environment just like the prefixed half.
+//
+// `REDIS_PASSWORD` is the one that bites: this run hands its connectors a `REDIS_URL` of
+// its own, but a password exported in the shell for somebody else's connector overrides
+// the one inside that URL -- and the bench's preflight and client, which read the URL
+// alone, would go on talking to the right server while the fleet talked to another one or
+// to none.
+//
+// `TestTheFilterCoversEveryUnprefixedVariable` reads this list against `internal/app`, so
+// a variable the connector learns to read later cannot quietly stay inherited.
+var unprefixedConfig = map[string]bool{
+	"REDIS_URL":      true,
+	"REDIS_PASSWORD": true,
+}
+
 // fleetEnv is the environment a connector of this run is started with, and every WAC_
 // variable in it comes from the run.
 //
@@ -371,7 +387,8 @@ func freePort(ctx context.Context) (int, error) {
 func fleetEnv(environ []string, own map[string]string, name, addr string) []string {
 	out := make([]string, 0, len(environ)+len(own)+2)
 	for _, entry := range environ {
-		if strings.HasPrefix(entry, "WAC_") {
+		key, _, _ := strings.Cut(entry, "=")
+		if strings.HasPrefix(key, "WAC_") || unprefixedConfig[key] {
 			continue
 		}
 		out = append(out, entry)

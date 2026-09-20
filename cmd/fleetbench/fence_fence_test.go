@@ -2,6 +2,8 @@ package main
 
 import (
 	"go/ast"
+	"go/parser"
+	"go/token"
 	"strings"
 	"testing"
 )
@@ -195,6 +197,59 @@ func TestOnlyTheSlicedWaitCallsBLPop(t *testing.T) {
 			t.Errorf("%s chama BLPop direto. Uma espera bloqueante que nao olha o contexto entre "+
 				"fatias nao e interrompivel: o cancelamento nao alcanca a leitura em andamento, "+
 				"medido em 60 s com a flag ligada e desligada", who)
+		}
+	}
+}
+
+// The environment filter covers every variable the connector reads without the WAC_
+// prefix, read from the connector's own config rather than from a list kept by hand.
+//
+// A list by hand goes stale silently: the day `internal/app` learns to read another bare
+// name, an inherited value reaches this run's fleet and nothing says so. `REDIS_PASSWORD`
+// is the one that showed why it matters -- this run hands its connectors a `REDIS_URL` of
+// its own, and a password exported in the shell overrides the one inside that URL, while
+// the bench's preflight and client read the URL alone and go on talking to the right
+// server.
+func TestTheFilterCoversEveryUnprefixedVariable(t *testing.T) {
+	t.Parallel()
+
+	config, err := parser.ParseFile(token.NewFileSet(), "../../internal/app/config.go", nil,
+		parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("a cerca nao conseguiu ler a config do conector: %v", err)
+	}
+
+	read := map[string]bool{}
+	ast.Inspect(config, func(n ast.Node) bool {
+		call, isCall := n.(*ast.CallExpr)
+		if !isCall || !strings.HasPrefix(calleeName(call), "env") || len(call.Args) == 0 {
+			return true
+		}
+		name, isString := call.Args[0].(*ast.BasicLit)
+		if !isString || name.Kind != token.STRING {
+			return true
+		}
+		value := strings.Trim(name.Value, `"`)
+		if !strings.HasPrefix(value, "WAC_") {
+			read[value] = true
+		}
+		return true
+	})
+	if len(read) == 0 {
+		t.Fatal("a cerca nao achou variavel nenhuma na config do conector, entao ela nao esta lendo o " +
+			"que pensa que le")
+	}
+	for name := range read {
+		if !unprefixedConfig[name] {
+			t.Errorf("o conector le %s sem o prefixo WAC_, e o filtro desta bancada nao a derruba: "+
+				"um valor exportado no shell para outro conector chega aos processos desta corrida",
+				name)
+		}
+	}
+	for name := range unprefixedConfig {
+		if !read[name] {
+			t.Errorf("o filtro derruba %s, e a config do conector nao le mais essa variavel: uma lista "+
+				"que so cresce deixa de dizer o que cobre", name)
 		}
 	}
 }
