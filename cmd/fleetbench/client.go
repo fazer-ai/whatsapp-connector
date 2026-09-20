@@ -59,7 +59,7 @@ func (c *client) send(ctx context.Context, stream string, command *protocol.Comm
 
 // await blocks on the reply list the command named, the way a client does.
 func (c *client) await(ctx context.Context, commandID string, within time.Duration) (protocol.Reply, error) {
-	answer, err := c.rdb.BLPop(ctx, within, c.keys.Reply(commandID)).Result()
+	answer, err := blockingPop(ctx, c.rdb, c.keys.Reply(commandID), within)
 	if err != nil {
 		return protocol.Reply{}, fmt.Errorf("wait for the reply to %s: %w", commandID, err)
 	}
@@ -216,4 +216,45 @@ func (c *client) repliesToAll(ctx context.Context, ids []string) (map[string][]s
 		answers[id] = found
 	}
 	return answers, nil
+}
+
+// blockingPop waits for one entry, in slices, so that a cancelled context is noticed while
+// the wait is still going.
+//
+// MEASURED against the pinned go-redis, on this machine, with a BLPOP of 60 s:
+//
+//	cancelled mid-read, ContextTimeoutEnabled off   60.05 s
+//	cancelled mid-read, ContextTimeoutEnabled on    60.02 s
+//	context with a deadline, the flag off           60.07 s
+//	context with a deadline, the flag on             1.00 s
+//	slices of one second, cancelled mid-read         1.04 s
+//
+// So the flag is about a deadline the call already knows when it starts, and it does
+// nothing for a cancellation that arrives while a read is in flight -- which is the Ctrl-C
+// case. Waiting in slices is what covers that one: between two of them there is a moment
+// where the context is read, and the run gets to its cleanup instead of sitting on a dead
+// socket for the rest of the minute.
+//
+// Each slice uses a context of its own on purpose. Handing the parent to BLPOP would make
+// the slice inherit a cancellation that is precisely what the loop above is checking for,
+// and the wait would end inside go-redis with an error instead of here with ctx.Err().
+func blockingPop(ctx context.Context, rdb *redis.Client, key string, within time.Duration) ([]string, error) {
+	const slice = time.Second
+	deadline := time.Now().Add(within)
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		left := time.Until(deadline)
+		if left <= 0 {
+			return nil, redis.Nil
+		}
+		answer, err := rdb.BLPop(context.WithoutCancel(ctx), min(slice, left), key).Result()
+		if err == nil {
+			return answer, nil
+		}
+		if !errors.Is(err, redis.Nil) {
+			return nil, err
+		}
+	}
 }

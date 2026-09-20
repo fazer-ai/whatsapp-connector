@@ -946,3 +946,23 @@ func TestTheStoppedOutcomePrefersWhatWasAlreadyFound(t *testing.T) {
 		})
 	}
 }
+
+// The worst case this claim can find is every expected stream gone, and that one must not
+// print as "not measured": there were findings, so something was examined.
+func TestFindingsWithoutGroupsStillCountAsMeasured(t *testing.T) {
+	t.Parallel()
+
+	gone := []string{
+		"wacbench1:cmd:s1: o stream nao existe mais, e esta corrida escreveu nele",
+		"wacbench1:cmd:s2: o stream nao existe mais, e esta corrida escreveu nele",
+	}
+	got := consumerGroupVerdict(0, 3, gone, "")
+	if got.state() != "QUEBRADO" {
+		t.Fatalf("com %d achados e nenhum grupo contado o estado saiu %q", len(gone), got.state())
+	}
+	rep := &report{}
+	rep.assert(got)
+	if out := rep.outcome(); out != outcomeInvariant {
+		t.Errorf("o desfecho saiu %s, e streams desta corrida que sumiram sao defeito, nao maquina", out.label())
+	}
+}

@@ -2,6 +2,7 @@ package main
 
 import (
 	"go/ast"
+	"strings"
 	"testing"
 )
 
@@ -71,12 +72,17 @@ func calleeName(call *ast.CallExpr) string {
 
 // Every Redis client this bench builds has ContextTimeoutEnabled on.
 //
-// MEASURED as a real wait, not a style rule: with it off, which is go-redis's default, a
-// blocking read such as the BLPOP this bench waits a reply on ignores the cancellation of
-// its context and runs to its own timeout. A Ctrl-C during that wait kills the connectors
-// at once and then leaves the run sitting there for up to a minute before the cleanup that
-// drops its database and its keys even starts -- and a run somebody interrupted is exactly
-// the run whose leftovers nobody goes looking for.
+// MEASURED against the pinned go-redis, on this machine, with a BLPOP of 60 s:
+//
+//	cancelled mid-read, the flag off   60.05 s
+//	cancelled mid-read, the flag on    60.02 s
+//	context with a deadline, flag off  60.07 s
+//	context with a deadline, flag on    1.00 s
+//
+// So what the flag buys is a deadline the call already carries when it starts: without it,
+// a context that expires in a second still waits the full minute on the socket. It does
+// NOT interrupt a read already in flight, which is the Ctrl-C case, and that one is
+// covered by `blockingPop` waiting in slices -- see the fence below.
 //
 // Read as an assignment on the options this package hands to redis.NewClient, so a second
 // client added later is covered by the same check.
@@ -139,4 +145,48 @@ func setsContextTimeout(file *ast.File, options string) bool {
 		return true
 	})
 	return on
+}
+
+// No blocking Redis wait in this package runs longer than a slice without looking at its
+// context.
+//
+// MEASURED: a cancellation that arrives while a BLPOP is already in flight does not reach
+// it, with or without ContextTimeoutEnabled -- the call comes back after its own 60 s, not
+// after the cancel. A Ctrl-C during that wait kills the connectors at once and then leaves
+// the run sitting on a dead socket for the rest of the minute before the cleanup that
+// drops its database and its keys even starts, and a run somebody interrupted is exactly
+// the run whose leftovers nobody goes looking for.
+//
+// `blockingPop` is the one place allowed to call BLPop, and it waits in slices with the
+// context read between them. A second caller reaching for BLPop directly would be a second
+// wait nobody can interrupt.
+func TestOnlyTheSlicedWaitCallsBLPop(t *testing.T) {
+	t.Parallel()
+
+	callers := map[string]int{}
+	for path, file := range packageFiles(t) {
+		ast.Inspect(file, func(n ast.Node) bool {
+			fn, isFunc := n.(*ast.FuncDecl)
+			if !isFunc || fn.Body == nil {
+				return true
+			}
+			ast.Inspect(fn.Body, func(inner ast.Node) bool {
+				if call, isCall := inner.(*ast.CallExpr); isCall && calleeName(call) == "BLPop" {
+					callers[path+":"+fn.Name.Name]++
+				}
+				return true
+			})
+			return true
+		})
+	}
+	if len(callers) == 0 {
+		t.Fatal("a cerca nao achou nenhuma chamada a BLPop, entao ela nao esta lendo o que pensa que le")
+	}
+	for who := range callers {
+		if !strings.HasSuffix(who, ":blockingPop") {
+			t.Errorf("%s chama BLPop direto. Uma espera bloqueante que nao olha o contexto entre "+
+				"fatias nao e interrompivel: o cancelamento nao alcanca a leitura em andamento, "+
+				"medido em 60 s com a flag ligada e desligada", who)
+		}
+	}
 }

@@ -78,26 +78,41 @@ func handover(ctx context.Context, active *run, group *fleet, cl *client, rep *r
 	// interrupted nothing, and the recovery it claims to have exercised never ran. The
 	// pending entries of the consumer groups are what says otherwise, and they are read
 	// from Redis rather than counted from what this bench sent.
-	pending, err := cl.pendingOn(ctx, sids)
-	if err != nil {
-		return fmt.Errorf("%w: %w", errSetup, err)
-	}
-
 	// The owner goes while those are being carried out. No wait for them first: a
 	// handover with nothing in flight is the orderly case wearing a kill.
 	if err := owner.kill(); err != nil {
 		return fmt.Errorf("%w: %w", errSetup, err)
 	}
-	rep.measure("troca de dono sob carga", "comandos ainda pendentes quando o dono morreu",
+
+	// Read AFTER the kill, because what this number has to say is what the dead owner left
+	// behind.
+	//
+	// Read before, it was a reading of a moving fleet: `pendingOn` walks the streams one at
+	// a time while the owner goes on working, so what it counted on the first stream could
+	// be acknowledged before it reached the last, and all of it before the kill landed. The
+	// count would then describe a handover that interrupted nothing while claiming it
+	// interrupted that much. After the kill nobody is retiring those entries: the peers
+	// have not claimed them yet, and the number is the work that was actually cut off.
+	pending, err := cl.pendingOn(ctx, sids)
+	if err != nil {
+		return fmt.Errorf("%w: %w", errSetup, err)
+	}
+	rep.measure("troca de dono sob carga", "comandos pendentes logo depois de o dono morrer",
 		float64(pending), "comandos")
 	if pending == 0 {
-		rep.note(fmt.Sprintf("troca de dono: %s morta com SIGKILL, e nenhum dos %d comandos enviados "+
-			"ainda estava pendente nesse instante. A troca aconteceu, mas ela NAO interrompeu trabalho: "+
-			"o que um par reivindica depois disso e nada, e a parte de reentrega desta fase fica sem "+
-			"medida. Aumentar -sends e o que fecha essa janela.", owner.name, len(inFlight)))
+		rep.note(fmt.Sprintf("troca de dono: %s morta com SIGKILL, e logo depois nao havia entrada "+
+			"pendente nenhuma nos grupos consumidores. A troca aconteceu, mas ela NAO interrompeu "+
+			"trabalho: o que um par reivindica depois disso e nada, e a parte de reentrega desta fase "+
+			"fica sem medida. Aumentar -sends e o que fecha essa janela.", owner.name))
 	} else {
-		rep.note(fmt.Sprintf("troca de dono: %s morta com SIGKILL com %d dos %d comandos ainda pendentes "+
-			"no grupo consumidor", owner.name, pending, len(inFlight)))
+		// The number is entries pending in the consumer groups: the batch of sends plus
+		// whatever the steady load had left there, which together is the work the kill cut
+		// off. Said that way because the old wording, "N of M commands still pending",
+		// invited the reading that the other M-N had been retired -- and nothing here
+		// measured that.
+		rep.note(fmt.Sprintf("troca de dono: %s morta com SIGKILL, e logo depois %d entradas seguiam "+
+			"pendentes nos grupos consumidores, entre o lote de %d envios e a carga continua. E o "+
+			"trabalho que a morte cortou, e nao uma fracao do lote", owner.name, pending, len(inFlight)))
 	}
 
 	moved := 0

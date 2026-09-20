@@ -607,12 +607,22 @@ func consumerGroupVerdict(checked, streams int, offenders []string, stillWorking
 	if len(offenders) > 0 && stillWorking != "" {
 		undecided = stillWorking
 	}
+	// The findings count as points, and not only the groups that answered.
+	//
+	// A run where every expected stream is gone produces offenders and no groups at all,
+	// and a series of zero prints as NAO MEDIDO -- so the worst case this claim can find
+	// would come out as "not measured" and exit 2, while the report above it listed every
+	// missing stream. Something was examined whenever there is something to report.
+	points := checked
+	if len(offenders) > points {
+		points = len(offenders)
+	}
 	return &assertion{
 		invariant: "entrega de comando pelo transporte (NAO e a invariante 4: o ack de mensagem que " +
 			"CHEGA, depois da publicacao, nao e exercitado por esta carga e fica sem medida)",
 		claim:  "grupo consumidor sem buraco: nada pendente e lag zero ao fim",
 		series: fmt.Sprintf("%d grupos consumidores sobre %d streams de comando", checked, streams),
-		points: checked,
+		points: points,
 		held:   len(offenders) == 0,
 		detail: strings.Join(offenders, "\n"),
 		notWhy: undecided,
