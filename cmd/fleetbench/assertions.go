@@ -369,6 +369,21 @@ func assertNoLostEvent(rep *report, published map[string][]protocol.Event, trunc
 				seqs = append(seqs, seq)
 			}
 			sort.Slice(seqs, func(i, j int) bool { return seqs[i] < seqs[j] })
+			// The first event of an epoch is seq 1, and a series that starts higher is
+			// missing what came before it.
+			//
+			// `Session.publish` numbers from a counter that belongs to the session object,
+			// and a new owner builds a new one: the contract says as much -- a higher epoch
+			// means the session was re-owned, "so its numbering restarts". This bench reads
+			// streams it created itself, from the first entry, so the beginning of every
+			// epoch is inside what it read. Comparing only neighbours, a series of 2,3
+			// reports nothing: the two are adjacent, and the event that is gone left no
+			// gap between survivors, only a hole at the front.
+			if len(seqs) > 0 && seqs[0] != 1 {
+				offenders = append(offenders, fmt.Sprintf(
+					"%s no epoch %d: a serie comeca em seq %d, e todo epoch comeca em 1, entao falta "+
+						"o que veio antes; o stream dele nao foi truncado", sid, epoch, seqs[0]))
+			}
 			for i := 1; i < len(seqs); i++ {
 				if seqs[i] != seqs[i-1]+1 {
 					offenders = append(offenders, fmt.Sprintf(

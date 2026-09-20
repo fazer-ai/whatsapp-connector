@@ -97,13 +97,17 @@ func handover(ctx context.Context, active *run, group *fleet, cl *client, rep *r
 	if err != nil {
 		return fmt.Errorf("%w: %w", errSetup, err)
 	}
-	rep.measure("troca de dono sob carga", "comandos pendentes logo depois de o dono morrer",
-		float64(pending), "comandos")
-	if pending == 0 {
+	// The two halves, apart, because only one of them is work this kill interrupted.
+	rep.measure("troca de dono sob carga", "comandos entregues e nao confirmados quando o dono morreu",
+		float64(pending.pending), "comandos")
+	rep.measure("troca de dono sob carga", "comandos ainda nao lidos por ninguem nesse instante",
+		float64(pending.lag), "comandos")
+	if pending.pending == 0 {
 		rep.note(fmt.Sprintf("troca de dono: %s morta com SIGKILL, e logo depois nao havia entrada "+
-			"pendente nenhuma nos grupos consumidores. A troca aconteceu, mas ela NAO interrompeu "+
+			"ENTREGUE e nao confirmada em grupo nenhum (havia %d ainda nao lidas por ninguem, que sao "+
+			"carga chegando e nao trabalho cortado). A troca aconteceu, mas ela NAO interrompeu "+
 			"trabalho: o que um par reivindica depois disso e nada, e a parte de reentrega desta fase "+
-			"fica sem medida. Aumentar -sends e o que fecha essa janela.", owner.name))
+			"fica sem medida. Aumentar -sends e o que fecha essa janela.", owner.name, pending.lag))
 	} else {
 		// The number is entries pending in the consumer groups: the batch of sends plus
 		// whatever the steady load had left there, which together is the work the kill cut
@@ -111,8 +115,9 @@ func handover(ctx context.Context, active *run, group *fleet, cl *client, rep *r
 		// invited the reading that the other M-N had been retired -- and nothing here
 		// measured that.
 		rep.note(fmt.Sprintf("troca de dono: %s morta com SIGKILL, e logo depois %d entradas seguiam "+
-			"pendentes nos grupos consumidores, entre o lote de %d envios e a carga continua. E o "+
-			"trabalho que a morte cortou, e nao uma fracao do lote", owner.name, pending, len(inFlight)))
+			"ENTREGUES e nao confirmadas nos grupos consumidores, do lote de %d envios mais a carga "+
+			"continua. Esse e o trabalho que a morte cortou; as %d ainda nao lidas por ninguem ficam "+
+			"de fora dele, porque ninguem as comecou", owner.name, pending.pending, len(inFlight), pending.lag))
 	}
 
 	moved := 0
@@ -317,6 +322,9 @@ func waitForDrain(ctx context.Context, cl *client, peers []*instance, sids []str
 		if err != nil {
 			return false, 0, 0, err
 		}
+		// The drain waits on both halves: what is left unread is work the fleet still owes,
+		// even if nobody has been handed it yet.
+		left := pending.total()
 		reclaimed, passes = 0, 0
 		for _, peer := range peers {
 			// The Vec is optional and the pass counter is not: a peer that reclaimed
@@ -331,7 +339,7 @@ func waitForDrain(ctx context.Context, cl *client, peers []*instance, sids []str
 			reclaimed += found["wac_commands_reclaimed_total"]
 			passes += found["wac_command_reclaim_passes_total"]
 		}
-		if pending == 0 {
+		if left == 0 {
 			return true, reclaimed, passes, nil
 		}
 		if time.Now().After(deadline) {

@@ -174,13 +174,28 @@ func (c *client) instances(ctx context.Context) (map[string]map[string]string, e
 // zero pending with a hundred entries still unread, and a drain that stopped there would
 // hand `assertConsumerGroups` a fleet with a backlog and let it report the backlog as a
 // hole. What is waited for has to be what is asserted.
-func (c *client) pendingOn(ctx context.Context, sids []string) (int64, error) {
+// backlog is what a fleet still owes, kept in its two halves.
+//
+// They are different facts and a sum of them answers neither. `pending` counts entries
+// handed to a consumer that never acknowledged them, which after a kill is the work the
+// dead owner was in the middle of. `lag` counts entries no consumer has been handed at
+// all, which under a steady load is simply the load that kept arriving. Added together, a
+// fast owner that acknowledged its whole batch before dying reports a positive "work
+// interrupted" made entirely of commands that arrived afterwards.
+type backlog struct {
+	pending int64
+	lag     int64
+}
+
+func (b backlog) total() int64 { return b.pending + b.lag }
+
+func (c *client) pendingOn(ctx context.Context, sids []string) (backlog, error) {
 	streams := make([]string, 0, len(sids)+1)
 	streams = append(streams, c.keys.Control())
 	for _, sid := range sids {
 		streams = append(streams, c.keys.Commands(sid))
 	}
-	total := int64(0)
+	found := backlog{}
 	for _, stream := range streams {
 		groups, err := c.rdb.XInfoGroups(ctx, stream).Result()
 		if err != nil {
@@ -190,13 +205,14 @@ func (c *client) pendingOn(ctx context.Context, sids []string) (int64, error) {
 			if errors.Is(err, redis.Nil) || strings.Contains(err.Error(), "no such key") {
 				continue
 			}
-			return 0, fmt.Errorf("read the consumer groups of %s: %w", stream, err)
+			return backlog{}, fmt.Errorf("read the consumer groups of %s: %w", stream, err)
 		}
 		for _, group := range groups {
-			total += group.Pending + group.Lag
+			found.pending += group.Pending
+			found.lag += group.Lag
 		}
 	}
-	return total, nil
+	return found, nil
 }
 
 // repliesToAll takes the answers of every command in one go, so they are read while they

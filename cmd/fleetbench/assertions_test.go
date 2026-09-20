@@ -295,6 +295,36 @@ func TestNoLostEventTellsAHoleFromATruncation(t *testing.T) {
 		}
 	})
 
+	t.Run("serie que comeca depois do 1 perdeu o comeco", func(t *testing.T) {
+		t.Parallel()
+		// Adjacent to each other, so a check that only compares neighbours sees nothing:
+		// what is gone left no gap between survivors, only a hole at the front. Every epoch
+		// starts at seq 1, so a series starting at 2 is missing the event before it.
+		rep := &report{}
+		assertNoLostEvent(rep, map[string][]protocol.Event{
+			"s1": {event("s1", "a", 1, 2), event("s1", "a", 1, 3)},
+		}, map[string]bool{})
+		got := only(t, rep)
+		if got.state() != "QUEBRADO" {
+			t.Fatalf("uma serie comecando em 2 saiu %q", got.state())
+		}
+		if !strings.Contains(got.detail, "comeca em seq 2") {
+			t.Errorf("a evidencia nao diz onde a serie comecou:\n%s", got.detail)
+		}
+	})
+
+	t.Run("o mesmo comeco faltando sob stream truncado nao e perda", func(t *testing.T) {
+		t.Parallel()
+		rep := &report{}
+		assertNoLostEvent(rep, map[string][]protocol.Event{
+			"s1": {event("s1", "a", 1, 2), event("s1", "a", 1, 3)},
+		}, map[string]bool{"s1": true})
+		got := only(t, rep)
+		if got.state() == "QUEBRADO" {
+			t.Fatalf("um comeco cortado pelo limite do stream foi reportado como perda:\n%s", got.detail)
+		}
+	})
+
 	t.Run("o mesmo buraco sob stream truncado nao e perda", func(t *testing.T) {
 		t.Parallel()
 		rep := &report{}
