@@ -1098,7 +1098,7 @@ func (s *Session) carryOut(ctx context.Context, command *protocol.Command) (resu
 		// knows something ran a day ago, not that the world stayed that way.
 		return result, true, nil
 	}
-	if attempted {
+	if attempted && !protocol.SelfSettlingCommands[command.Type] {
 		// It ran, and what it did is not on record, which happens when the answer never
 		// came back. Carrying it out again instead is a participant added twice, or a
 		// name set over one somebody has since changed (#282).
@@ -1117,7 +1117,11 @@ func (s *Session) carryOut(ctx context.Context, command *protocol.Command) (resu
 			"this command was carried out and its outcome is not known; read the state back before sending it again")
 	}
 
-	s.reserve(ctx, command, key)
+	if !protocol.SelfSettlingCommands[command.Type] {
+		// Skipped and not merely ignored above: a record this layer would never read is
+		// one nothing takes off either, so it would sit in Redis until it expired.
+		s.reserve(ctx, command, key)
+	}
 
 	execCtx, releaseBound := bound(ctx, command)
 	defer releaseBound()

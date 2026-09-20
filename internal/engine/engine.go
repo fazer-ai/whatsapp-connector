@@ -36,6 +36,25 @@ var ErrNotSupported = errors.New("engine: command not supported")
 // knows" into "nothing happened", which is the one direction this must never get wrong.
 var ErrNeverSent = errors.New("engine: nothing was sent to WhatsApp")
 
+// NeverSent marks an error as one of those without changing a character of what it says.
+//
+// The message belongs to the client and the mark belongs to the ledger, and joining them
+// with %w would put "nothing was sent to WhatsApp" into the text of a failure that is about
+// a disk this instance could not write -- which is exactly the confusion
+// `TestADiskThisInstanceCouldNotWriteIsNotWhatsAppRefusingTheFile` exists to stop.
+func NeverSent(err error) error {
+	if err == nil {
+		return nil
+	}
+	return neverSent{err}
+}
+
+type neverSent struct{ error }
+
+func (n neverSent) Is(target error) bool { return target == ErrNeverSent }
+
+func (n neverSent) Unwrap() error { return n.error }
+
 // Emission is one thing the engine has to tell the client about. The engine names the
 // type and renders the payload; stamping it (id, epoch, seq, instance) belongs to the
 // session, which is the only thing that knows the ownership it is publishing under.

@@ -27,6 +27,7 @@ import (
 	waTypes "go.mau.fi/whatsmeow/types"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/fazer-ai/whatsapp-connector/internal/engine"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 )
 
@@ -1851,6 +1852,15 @@ func TestADiskThisInstanceCouldNotWriteIsNotWhatsAppRefusingTheFile(t *testing.T
 	assertCode(t, err, protocol.ErrorInternal)
 	if strings.Contains(err.Error(), "WhatsApp") {
 		t.Fatalf("a disk of this instance's own was reported as WhatsApp: %v", err)
+	}
+	// And nothing was sent, which is a separate fact and the one the idempotency ledger
+	// reads: the staging failed before `putOnTheWire`, so no message exists and the
+	// caller's retry under the same id has to do the whole thing rather than be answered
+	// from an attempt nobody can speak for (#282).
+	if !errors.Is(err, engine.ErrNeverSent) {
+		t.Errorf("a send that failed while staging the file does not say nothing was sent, "+
+			"so a retry under the same message_id would be refused for as long as the "+
+			"attempt lived: %v", err)
 	}
 }
 

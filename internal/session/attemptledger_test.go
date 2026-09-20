@@ -275,3 +275,51 @@ func TestACommandRefusedBeforeItReachedWhatsAppIsCarriedOutOnTheRetry(t *testing
 // fakeRefusal is what the fake engine answers a command that needs a live socket, which
 // carries engine.ErrNeverSent the way the whatsmeow engine's own pre-flight refusal does.
 func fakeRefusal() error { return fake.NotConnected() }
+
+// `group.create` keeps a record of its own attempts, and this one must not stand in front
+// of it.
+//
+// Its recovery is the thing `contract/PROTOCOL.md` promises: a retry under the same key
+// returns the group the first attempt made, or `not_settled` while WhatsApp's notification
+// is still deciding which request made which. That only happens if the command reaches the
+// engine, so answering the redelivery from the ledger -- right for every other command,
+// because nothing else can ever say what theirs did -- would replace a group with a
+// refusal for as long as the record lived.
+func TestACreationRedeliveredStillReachesItsOwnRecovery(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+
+	eng := newLandedEngine(func(effects *atomic.Int64) (json.RawMessage, error) {
+		effects.Add(1)
+		return nil, protocol.NewError(protocol.ErrorNotConnected, "the socket died after the write")
+	})
+	rec := newReplies()
+	manager := instanceOn(t, "inst-a", rdb, eng, rec, storetest.New(t).URL)
+	if _, err := manager.Adopt(context.Background(), attemptSID); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+
+	create := func(id string) *protocol.Command {
+		return &protocol.Command{
+			V: protocol.Version, ID: id, Type: protocol.CommandGroupCreate,
+			SID: attemptSID, ReplyTo: id, IdempotencyKey: "k-create",
+			Payload: json.RawMessage(`{"subject":"Obras","participants":[]}`),
+		}
+	}
+	if reply := deliver(t, manager, rec, create("c1")); reply.OK {
+		t.Fatal("the first creation reported success for a command the engine refused")
+	}
+	second := deliver(t, manager, rec, create("c2"))
+
+	if got := eng.applied(); got != 2 {
+		t.Errorf("the engine saw the creation %d times, want twice: the redelivery was "+
+			"answered from the ledger instead of reaching the recovery that consults the "+
+			"store, so a group that was made would never be handed back", got)
+	}
+	if second.Error != nil && second.Error.Code == protocol.ErrorTimeout {
+		t.Error("the redelivery of a creation was answered from the attempt ledger")
+	}
+}

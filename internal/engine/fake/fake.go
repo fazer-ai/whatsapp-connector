@@ -801,7 +801,7 @@ func (s *Session) emit(eventType protocol.EventType, payload any) {
 // exactly as it was and a retry does the whole thing. Without the mark the layer above
 // cannot tell this from a socket that died with the frame already out, and it would hold
 // the command's key against a retry that should run (#282).
-var errNotConnected = fmt.Errorf("%w: %w", errors.New("fake: session is not connected"), engine.ErrNeverSent)
+var errNotConnected = engine.NeverSent(errors.New("fake: session is not connected"))
 
 // NotConnected is the error the fake returns for a command that needs a live socket,
 // exported so a test can assert on it rather than on a string.

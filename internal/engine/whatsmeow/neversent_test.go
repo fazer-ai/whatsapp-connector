@@ -59,3 +59,32 @@ func TestARefusalMadeBeforeTheSocketSaysNothingWasSent(t *testing.T) {
 		})
 	}
 }
+
+// A send whose attachment could not be prepared is one of those refusals too, and it is
+// the case the ledger would most obviously have got wrong: the file was never fetched or
+// its upload never finished, so no message exists, and a retry under the same id has to do
+// the whole thing rather than be answered from an attempt nobody can speak for.
+//
+// And the mark does not reach the text. A failure about a disk of this instance's own must
+// not read as WhatsApp refusing anything, which is a separate promise with a test of its
+// own; joining the sentinel with %w would have put those words into that message.
+func TestTheMarkOnARefusalDoesNotReachWhatTheClientIsTold(t *testing.T) {
+	t.Parallel()
+
+	refused := errors.New("this instance could not stage the file to send")
+	marked := engine.NeverSent(refused)
+
+	if !errors.Is(marked, engine.ErrNeverSent) {
+		t.Error("the marked error does not carry engine.ErrNeverSent")
+	}
+	if !errors.Is(marked, refused) {
+		t.Error("the marked error no longer unwraps to what went wrong")
+	}
+	if got := marked.Error(); got != refused.Error() {
+		t.Errorf("the marked error reads %q and the refusal reads %q: the mark belongs to "+
+			"the ledger and the message belongs to the client", got, refused.Error())
+	}
+	if engine.NeverSent(nil) != nil {
+		t.Error("marking nothing produced an error")
+	}
+}

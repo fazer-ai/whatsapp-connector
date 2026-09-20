@@ -292,6 +292,20 @@ var RepeatableCommands = map[CommandType]bool{
 	CommandPresenceSubscribe: true,
 }
 
+// SelfSettlingCommands keep a record of their own attempts, with a recovery the generic
+// ledger cannot do and must not stand in front of.
+//
+// `group.create` writes its intent to the store before it asks WhatsApp, and a retry under
+// the same `idempotency_key` consults that row: it answers with the group the first attempt
+// made, or `not_settled` while WhatsApp's notification is still deciding which request made
+// which group. That recovery is what `contract/PROTOCOL.md` promises, and it only happens
+// if the command is allowed to reach the engine. Answering the redelivery from the ledger
+// first -- which is right for every other command, because nothing else can ever say what
+// theirs did -- would replace a group with a refusal for as long as the record lived.
+var SelfSettlingCommands = map[CommandType]bool{
+	CommandGroupCreate: true,
+}
+
 // messageIDKeyed are the commands whose `message_id` names the message the command
 // itself puts on the wire. Those are the ones the contract remembers as
 // `msg:<message_id>`, and the id being the caller's own is what makes the key hold
