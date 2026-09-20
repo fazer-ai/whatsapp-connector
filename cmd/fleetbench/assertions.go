@@ -287,8 +287,13 @@ func assertSeqMonotonic(rep *report, published map[string][]protocol.Event) {
 				}
 				atSeq[event.Seq] = event.ID
 			}
+			// Strictly less, and not less-or-equal: two different events sharing a seq is
+			// the check above, which names both ids. Asking for it here as well would be
+			// two lines answering one question, and neither of them provable on its own --
+			// removing either leaves the other covering the case, so nothing says which is
+			// load-bearing.
 			for i := 1; i < len(ordered); i++ {
-				if ordered[i].Seq <= ordered[i-1].Seq {
+				if ordered[i].Seq < ordered[i-1].Seq {
 					offenders = append(offenders, fmt.Sprintf(
 						"%s no epoch %d: seq %d (evento %s) veio depois de seq %d (evento %s)",
 						sid, k.epoch, ordered[i].Seq, ordered[i].ID, ordered[i-1].Seq, ordered[i-1].ID))
