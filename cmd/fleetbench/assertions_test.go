@@ -117,6 +117,30 @@ func TestOneOwnerNoticesTwoInstancesUnderOneEpoch(t *testing.T) {
 			state: "QUEBRADO",
 			says:  "a cerca nao tendo agido",
 		},
+		"duas geracoes da mesma instancia tem uma escrita em voo cada": {
+			// The sweep hands a session back to a process that already had it, and each
+			// ownership generation can leave one write in flight when it ends. Counted
+			// under the instance's name alone the two add up and read as the fence having
+			// failed; the allowance belongs to the epoch, which is what a generation is.
+			// a@1 loses to b@2, a@3 loses to b@4, and each of a's late events is the one
+			// the contract allows.
+			events: []protocol.Event{
+				event("s1", "b", 2, 1), eventAs("tardio-a1", "s1", "a", 1, 9),
+				event("s1", "b", 4, 1), eventAs("tardio-a3", "s1", "a", 3, 9),
+			},
+			state: "AFIRMADO",
+		},
+		"duas escritas em voo da mesma geracao continuam sendo a cerca parada": {
+			// And the allowance does not widen: within one epoch the connector tears the
+			// session down on the first, so a second under that same epoch is the fence
+			// not having acted, whatever else the instance did in other generations.
+			events: []protocol.Event{
+				event("s1", "b", 2, 1), eventAs("tardio-a1", "s1", "a", 1, 9),
+				event("s1", "b", 4, 1), eventAs("tardio-a1-bis", "s1", "a", 1, 10),
+			},
+			state: "QUEBRADO",
+			says:  "SOB ESSE MESMO epoch",
+		},
 		"a frota somada roda mais sessoes do que existem sids, e isso se sustenta": {
 			// The third half, and it is invisible to both of the others: every
 			// acquisition bumps the epoch, so two holders never share one and neither
@@ -159,7 +183,7 @@ func TestOneOwnerNoticesTwoInstancesUnderOneEpoch(t *testing.T) {
 			rep := &report{}
 			published := map[string][]protocol.Event{"s1": tc.events}
 			inOrder := map[string]map[string][]protocol.Event{"s1": {"wa:events:0": tc.events}}
-			assertOneOwner(rep, published, inOrder, &census{samples: tc.samples}, 1)
+			assertOneOwner(rep, published, inOrder, &census{samples: tc.samples}, 1, &fenceOutcome{})
 
 			got := only(t, rep)
 			if got.state() != tc.state {
@@ -1104,7 +1128,7 @@ func TestTheOneOwnerClaimSaysWhatItChecks(t *testing.T) {
 	rep := &report{}
 	assertOneOwner(rep, map[string][]protocol.Event{"s1": {event("s1", "a", 1, 1)}},
 		map[string]map[string][]protocol.Event{"s1": {"wa:events:0": {event("s1", "a", 1, 1)}}},
-		&census{}, 1)
+		&census{}, 1, &fenceOutcome{})
 	claim := only(t, rep).claim
 
 	if strings.Contains(claim, "nenhum evento de epoch velho") {
@@ -1333,5 +1357,94 @@ func TestTheEpochRisesClaimSaysItReadsWhatAClientAccepts(t *testing.T) {
 			t.Errorf("a afirmacao nao diz %q, entao ela promete a invariante 2 inteira sobre uma "+
 				"leitura que nao a decide inteira:\n%s", half, claim)
 		}
+	}
+}
+
+// An adoption is the condition of the fence, and the fence is exercised by a publish.
+//
+// The frozen phase ended with a peer having taken the sessions and called the fence
+// exercised on that alone. Nothing in it makes the thawed owner attempt a publication: the
+// commands go in right before the SIGSTOP, and a fake fast enough to answer them all
+// leaves the phase with an adoption, an owner with nothing to say, and a claim about a line
+// that never ran.
+func TestTheFenceIsOnlyExercisedBySomethingPublished(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		claim *assertion
+		late  int
+		state string
+		says  string
+	}{
+		"adocao sem publicacao nenhuma depois da lease perdida": {
+			claim: fenceExercised(4, "4 sessoes assumidas", ""),
+			late:  0,
+			state: "NAO MEDIDO",
+			says:  "a tentativa de publicar, e ela nao aconteceu",
+		},
+		"adocao e um evento publicado depois da lease perdida": {
+			claim: fenceExercised(4, "4 sessoes assumidas", ""),
+			late:  1,
+			state: "AFIRMADO",
+		},
+		"a razao que a propria fase deu nao e sobrescrita": {
+			claim: fenceExercised(0, "nenhuma sessao assumida", "ninguem assumiu nada nesta corrida"),
+			late:  0,
+			state: "NAO MEDIDO",
+			says:  "ninguem assumiu nada nesta corrida",
+		},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			fenceReached(tc.claim, tc.late)
+			if got := tc.claim.state(); got != tc.state {
+				t.Fatalf("estado %q, queria %q (razao: %q)", got, tc.state, tc.claim.notWhy)
+			}
+			if tc.says != "" && !strings.Contains(tc.claim.notWhy, tc.says) {
+				t.Errorf("a razao nao diz %q:\n%s", tc.says, tc.claim.notWhy)
+			}
+		})
+	}
+
+	// A phase that returned before building its claim leaves nothing to downgrade, and the
+	// downgrade is not the place to find that out.
+	fenceReached(nil, 0)
+}
+
+// The reading that counts late events is the reading that decides the fence claim, and
+// this is what keeps the two together.
+//
+// Separated, the late count had to travel from here to the caller, and a caller that took
+// it and did not pass it on left the run green over a fence it never reached. That is the
+// same class the frozen phase's deferred claim removes, and it is removed here the same
+// way: the only place that can forget is the one a table can disprove.
+func TestTheOneOwnerReadingDecidesTheFenceClaim(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		events []protocol.Event
+		state  string
+	}{
+		"nada publicado sob epoch vencido deixa a cerca sem medida": {
+			events: []protocol.Event{event("s1", "a", 1, 1), event("s1", "b", 2, 1)},
+			state:  "NAO MEDIDO",
+		},
+		"uma escrita em voo depois da lease perdida e a cerca alcancada": {
+			events: []protocol.Event{event("s1", "b", 2, 1), event("s1", "a", 1, 3)},
+			state:  "AFIRMADO",
+		},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			fence := &fenceOutcome{claim: fenceExercised(4, "4 sessoes assumidas", "")}
+			assertOneOwner(&report{}, map[string][]protocol.Event{"s1": tc.events},
+				map[string]map[string][]protocol.Event{"s1": {"wa:events:0": tc.events}},
+				&census{}, 1, fence)
+			if got := fence.claim.state(); got != tc.state {
+				t.Errorf("a cerca saiu %q, queria %q (razao: %q)", got, tc.state, fence.claim.notWhy)
+			}
+		})
 	}
 }

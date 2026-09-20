@@ -34,7 +34,7 @@ import (
 // The freeze has to outlast the lease, which is why it is the lease TTL plus a margin
 // rather than a number picked to feel long enough.
 func frozenOwner(ctx context.Context, active *run, cl *client, rep *report, plan benchPlan,
-	owner *instance, peers []*instance, sids []string, counted *census) error {
+	owner *instance, peers []*instance, sids []string, counted *census, fence *fenceOutcome) error {
 
 	// The fence claim is asserted once, on the way out, whatever happened in between.
 	//
@@ -43,11 +43,18 @@ func frozenOwner(ctx context.Context, active *run, cl *client, rep *report, plan
 	// session, nobody adopted, the phase ran, an error cut it short. A branch that forgets
 	// to claim leaves the run green over a fence it never reached, and that is exactly the
 	// bug this shape removes: the branches set the words, the exit does the claiming.
-	fence := fenceOutcome{
+	*fence = fenceOutcome{
 		series: "a fase que produz a cerca nao chegou ao fim",
 		why:    "a fase do dono congelado terminou antes de produzir posse perdida",
 	}
-	defer func() { rep.assert(fenceExercised(fence.taken, fence.series, fence.why)) }()
+	// The claim is kept, and not only appended: whether the fence was exercised is decided
+	// by something this phase cannot see. An adoption is the condition; the exercise is a
+	// publish that happened after the lease was gone, and that shows up in the streams,
+	// which are read after every phase has ended. `fenceReached` is what reads it.
+	defer func() {
+		fence.claim = fenceExercised(fence.taken, fence.series, fence.why)
+		rep.assert(fence.claim)
+	}()
 
 	// Who is frozen is measured, not assumed. The handover leaves the sessions split
 	// between the peers however the sweep happened to fall, and freezing one that owns
@@ -221,11 +228,13 @@ func frozenOwner(ctx context.Context, active *run, cl *client, rep *report, plan
 	return nil
 }
 
-// fenceOutcome is what the phase's branches fill in for the single claim at its exit.
+// fenceOutcome is what the phase's branches fill in for the single claim at its exit, and
+// the claim itself, which one later reading can still downgrade.
 type fenceOutcome struct {
 	taken  int
 	series string
 	why    string
+	claim  *assertion
 }
 
 // fenceExercised is the claim that the fence half of invariant 1 was actually reached, and

@@ -186,18 +186,20 @@ func handover(ctx context.Context, active *run, group *fleet, cl *client, rep *r
 	// The fence, and it comes last because it is the only phase that needs a live owner
 	// to have lost the lease. Everything the thawed instance publishes lands in the
 	// streams the assertions below read, in the order the shard kept.
+	fence := &fenceOutcome{}
 	if len(others) > 1 {
-		if err := frozenOwner(ctx, active, cl, rep, plan, others[0], others[1:], sids, counted); err != nil {
+		if err := frozenOwner(ctx, active, cl, rep, plan, others[0], others[1:], sids, counted, fence); err != nil {
 			return err
 		}
 	} else {
 		// Same shape as the phase's own empty result: an assertion with no series, so the
 		// run's exit code says the fence went unmeasured instead of a note saying it while
 		// the code says VERDE.
-		rep.assert(fenceExercised(0, "a fase que produz a cerca nao rodou",
+		fence.claim = fenceExercised(0, "a fase que produz a cerca nao rodou",
 			fmt.Sprintf("a corrida subiu %d processos, e congelar o unico par deixaria a frota sem "+
 				"ninguem para assumir as sessoes dele. Um dono morto nao publica, entao nenhuma morte "+
-				"desta corrida pode quebrar a cerca. Use -processes 3 ou mais", plan.processes)))
+				"desta corrida pode quebrar a cerca. Use -processes 3 ou mais", plan.processes))
+		rep.assert(fence.claim)
 	}
 
 	// Stopped before anything is read, so nothing is still writing to a stream the
@@ -240,7 +242,7 @@ func handover(ctx context.Context, active *run, group *fleet, cl *client, rep *r
 		rep.note(stillPublishing)
 	}
 
-	return assertInvariants(ctx, cl, rep, plan, answers, sids, pairs, counted,
+	return assertInvariants(ctx, cl, rep, plan, answers, sids, pairs, counted, fence,
 		stillWorking, expired, stillPublishing)
 }
 

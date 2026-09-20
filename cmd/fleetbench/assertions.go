@@ -23,7 +23,7 @@ import (
 // saying more than it measured.
 func assertInvariants(ctx context.Context, cl *client, rep *report, plan benchPlan,
 	answers map[string][]string, sids []string, pairs []idempotentPair, counted *census,
-	stillWorking, expired, stillPublishing string) error {
+	fence *fenceOutcome, stillWorking, expired, stillPublishing string) error {
 
 	published := map[string][]protocol.Event{}          // sid -> events, in stream order
 	shardOf := map[string]map[string]bool{}             // sid -> streams it was seen on
@@ -76,7 +76,7 @@ func assertInvariants(ctx context.Context, cl *client, rep *report, plan benchPl
 	// frozen phase and its series is adoptions, not stream entries. Blanketing the report
 	// would say a claim went unmeasured because of something it never read.
 	fromStreams := len(rep.assertions)
-	assertOneOwner(rep, published, inOrder, counted, len(sids))
+	assertOneOwner(rep, published, inOrder, counted, len(sids), fence)
 	assertEpochRises(rep, published)
 	assertEpochCounter(rep, published, counters, cl.keys.LeaseEpoch("<sid>"))
 	assertSeqMonotonic(rep, published)
@@ -112,8 +112,15 @@ func assertInvariants(ctx context.Context, cl *client, rep *report, plan benchPl
 // Read per stream and not across them, because "after" only means something inside one
 // stream. A session on two streams is a different finding, and `assertOneShard` is the one
 // that makes it.
+// The fence claim comes in rather than the late count going out, because the two are one
+// reading. `late` is counted here and nowhere else, and a caller that took it and forgot
+// to pass it on is the same branch that leaves a run green over a fence it never reached
+// -- the class the deferred claim in the frozen phase exists to remove. Passed in, the
+// only place that can forget it is this function, which a table can disprove.
 func assertOneOwner(rep *report, published map[string][]protocol.Event,
-	inOrder map[string]map[string][]protocol.Event, counted *census, sids int) {
+	inOrder map[string]map[string][]protocol.Event, counted *census, sids int,
+	fence *fenceOutcome,
+) {
 
 	pairs, offenders := 0, []string{}
 	for sid, events := range published {
@@ -160,6 +167,16 @@ func assertOneOwner(rep *report, published map[string][]protocol.Event,
 		for stream, events := range streams {
 			var highest uint64
 			var highestBy, highestID string
+			// Counted per (instance, epoch) and not per instance, because an epoch is a
+			// generation of ownership and the allowance belongs to the generation. An
+			// instance can take a session, lose it with a write in flight, take it again
+			// under a higher epoch and lose it again the same way: two late events, from
+			// one instance, each of them the write the contract allows. Added up under the
+			// instance's name they read as the fence having failed, and the fleet that
+			// produces them is the ordinary one where the sweep hands a session back to a
+			// process that already had it. Within ONE generation there is no second
+			// allowance: the connector tears the session down when it detects the first.
+			//
 			// Distinct ids, because the transport is allowed to hand the same event over
 			// twice: a retried XADD whose first answer was lost puts the same late event on
 			// the stream again, and counted as two this would report the contract's own
@@ -169,19 +186,20 @@ func assertOneOwner(rep *report, published map[string][]protocol.Event,
 			for _, event := range events {
 				if event.Epoch < highest {
 					late++
-					if stale[event.Inst] == nil {
-						stale[event.Inst] = map[string]bool{}
+					generation := fmt.Sprintf("%s@%d", event.Inst, event.Epoch)
+					if stale[generation] == nil {
+						stale[generation] = map[string]bool{}
 					}
-					stale[event.Inst][event.ID] = true
-					if len(stale[event.Inst]) > 1 {
+					stale[generation][event.ID] = true
+					if len(stale[generation]) > 1 {
 						offenders = append(offenders, fmt.Sprintf(
 							"%s: a instancia %s publicou o evento %s sob o epoch %d em %s DEPOIS de %s ja "+
-								"ter publicado o evento %s sob o epoch %d, e essa ja e a %da vez dela nesta "+
-								"sessao: a primeira e a escrita que estava em voo, que o contrato preve e o "+
-								"cliente descarta pelo cursor, mas ao detecta-la o conector derruba a sessao, "+
-								"entao a segunda e a cerca nao tendo agido",
+								"ter publicado o evento %s sob o epoch %d, e essa ja e a %da vez dela SOB "+
+								"ESSE MESMO epoch nesta sessao: a primeira e a escrita que estava em voo, "+
+								"que o contrato preve e o cliente descarta pelo cursor, mas ao detecta-la o "+
+								"conector derruba a sessao, entao a segunda e a cerca nao tendo agido",
 							sid, event.Inst, event.ID, event.Epoch, stream, highestBy, highestID, highest,
-							len(stale[event.Inst])))
+							len(stale[generation])))
 					}
 					continue
 				}
@@ -254,6 +272,32 @@ func assertOneOwner(rep *report, published map[string][]protocol.Event,
 		detail: strings.Join(offenders, "\n"),
 		notWhy: ifEmpty(pairs+taken, "nenhum evento foi publicado e nenhum censo foi tomado"),
 	})
+	fenceReached(fence.claim, late)
+}
+
+// fenceReached downgrades the frozen phase's claim when nothing in the run ever published
+// after losing the lease.
+//
+// The phase creates the condition -- a peer takes the sessions of an owner that is alive
+// and stopped -- and an adoption alone was being reported as the fence having been
+// exercised. It is not: the fence guards a publish, and an owner that comes back with
+// nothing to say never reaches it. Between the sends and the SIGSTOP there is a race the
+// phase does not control, and a fake fast enough to answer all of them leaves a thawed
+// owner with no work, an adoption above zero, and a claim saying the fence was exercised
+// over a run in which the guarded line never ran.
+//
+// Measured at the outcome and not at the input: a command still pending when the freeze
+// landed is a proxy for an attempt, while a late event IS one -- an event under an epoch
+// the stream had already passed is a publish that happened after the lease was gone. Zero
+// of them means the connector's `stillOwned` was never reached, and neither AFIRMADO nor
+// QUEBRADO is an answer about a line that did not run.
+func fenceReached(claim *assertion, late int) {
+	if claim == nil || claim.notWhy != "" || late > 0 {
+		return
+	}
+	claim.notWhy = "nenhum evento de dono anterior apareceu nos streams desta corrida, entao nenhuma " +
+		"instancia chegou a publicar depois de perder a lease e a linha que a cerca guarda nao foi " +
+		"alcancada. A adocao cria a condicao; o exercicio e a tentativa de publicar, e ela nao aconteceu"
 }
 
 // Invariant 2: the epoch rises on every ownership change.
