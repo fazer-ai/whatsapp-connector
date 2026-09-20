@@ -164,6 +164,61 @@ var upstreamDefects = []upstreamDefect{
 			"is what puts the wait for it outside every deadline this connector sets",
 	},
 	{
+		issue: "fazer-ai/whatsapp-connector#290",
+		file:  "client.go",
+		// The holder. `connect` takes the write lock and runs the whole of the connection
+		// under it, and what is inside is the dial and then the handshake. The handshake
+		// ends on its own (`NoiseHandshakeResponseTimeout`, twenty seconds); the dial is
+		// bounded by the context it is handed, which on the reconnection path is the
+		// library's own. So the order is what is asserted: a fix is the dial moved out of
+		// the locked section, and that leaves both fragments present.
+		inOrder:   []string{"cli.socketLock.Lock()", "cli.unlockedConnect(ctx)"},
+		enclosing: "func (cli *Client) connect(",
+		what: "the whole of the connection running under the socket write lock, so a dial " +
+			"that hangs holds every node writer waiting on the read half",
+	},
+	{
+		issue: "fazer-ai/whatsapp-connector#290",
+		file:  "client.go",
+		// What is inside the locked body, which is the half the entry above cannot see:
+		// `connect` names no network work at all, so a pin that moved the dial out of
+		// `unlockedConnect` would leave that entry green while the sentence it asserts --
+		// a dial holds the lock -- had stopped being true. Both halves are named because
+		// both are held: the handshake ends on its own at twenty seconds, and the dial
+		// ends on ours (dialceiling.go), so the hold is bounded now rather than absent.
+		inOrder:   []string{"fs.Connect(ctx)", "cli.doHandshake(ctx, fs,"},
+		enclosing: "func (cli *Client) unlockedConnect(",
+		what: "the dial and the handshake being the work that runs inside the body the " +
+			"write lock holds, which is what makes the hold last as long as they do",
+	},
+	{
+		issue: "fazer-ai/whatsapp-connector#290",
+		file:  "client.go",
+		// The waiter a send meets first. `sync.RWMutex.RLock` takes no context, so a
+		// caller that reaches this with a deadline of its own keeps none of it.
+		stillThere: []string{"cli.socketLock.RLock()"},
+		// `TryRLock` alone, and not `ctx.Done()`: `retryFrame` below already watches the
+		// caller's context for a different reason -- it is the entry two above this one,
+		// where that is the good news -- so a fix expressed as "reads the context" cannot
+		// be told apart there from what is already true. What a fix to this wait adds is a
+		// way to give up on the lock, and that is what is checked.
+		absent:    []string{"TryRLock"},
+		enclosing: "func (cli *Client) sendNodeAndGetData(",
+		what: "the read lock being taken with no context, which is what puts a node write " +
+			"outside every deadline this connector sets",
+	},
+	{
+		issue: "fazer-ai/whatsapp-connector#290",
+		file:  "request.go",
+		// And the one the retry meets, which is the same wait on the path a send takes
+		// after a disconnect -- the path #283's ceiling exists to survive.
+		stillThere: []string{"cli.socketLock.RLock()"},
+		absent:     []string{"TryRLock"},
+		enclosing:  "func (cli *Client) retryFrame(",
+		what: "the retry waiting for the socket on the same context-free read lock, on the " +
+			"path a send takes after the disconnect its ceiling is meant to survive",
+	},
+	{
 		issue: "fazer-ai/whatsapp-connector#90",
 		file:  "download-to-file.go",
 		// The retry rewinds and writes over the same file without shortening it, so an
