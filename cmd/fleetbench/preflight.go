@@ -92,6 +92,10 @@ Start one with:
 	if err != nil {
 		return "", fmt.Errorf("%s is not a Redis URL this bench can read: %w", redisVar, err)
 	}
+	// Cancellation has to reach the socket here too: the ping below runs against a server
+	// that may be reachable and not answering, and without this the five-second context
+	// above would not be what ends the wait.
+	options.ContextTimeoutEnabled = true
 	client := redis.NewClient(options)
 	defer func() { _ = client.Close() }()
 

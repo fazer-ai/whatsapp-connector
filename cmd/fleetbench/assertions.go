@@ -527,22 +527,12 @@ func assertConsumerGroups(ctx context.Context, cl *client, rep *report, sids []s
 	}
 	for _, stream := range streams {
 		groups, err := cl.rdb.XInfoGroups(ctx, stream).Result()
-		if err != nil {
-			// A stream that does not exist is a stream nothing consumed, which is not a
-			// hole. Anything else -- a connection that dropped, a timeout, an ACL -- is a
-			// reading that failed, and spending it as "nothing to check here" is how the
-			// last inspection of a run comes back green on the groups it never read.
-			if errors.Is(err, redis.Nil) || strings.Contains(err.Error(), "no such key") {
-				continue
-			}
-			return fmt.Errorf("%w: read the consumer groups of %s: %w", errSetup, stream, err)
+		found, seen, fatal := inspectGroups(stream, groups, err)
+		if fatal != nil {
+			return fatal
 		}
-		for _, group := range groups {
-			checked++
-			if found := groupOffender(stream, group); found != "" {
-				offenders = append(offenders, found)
-			}
-		}
+		offenders = append(offenders, found...)
+		checked += seen
 	}
 	rep.assert(consumerGroupVerdict(checked, len(streams), offenders, stillWorking))
 	return nil
@@ -576,6 +566,40 @@ func groupOffender(stream string, group redis.XInfoGroup) string {
 	}
 	return fmt.Sprintf("%s, grupo %s: %d pendentes e lag %d depois dos acks",
 		stream, group.Name, group.Pending, group.Lag)
+}
+
+// inspectGroups judges one stream's consumer groups, apart from the call that read them.
+//
+// A stream of this run that is gone is a finding, not a skip. Every stream handed here was
+// written to earlier in the run -- the control stream and one command stream per session,
+// each carrying the sends this bench put in flight -- so "it is not there" means it was
+// trimmed away, deleted, or never created, and none of those is "nothing to check here".
+// Skipped silently, the claim came back AFIRMADO over the groups it did read while saying
+// nothing about the ones it did not. A stream that exists with no group at all is the same
+// finding wearing another shape: nobody consumed what this run sent through it.
+//
+// Anything else -- a connection that dropped, a timeout, an ACL -- is a reading that
+// failed, and it stops the run instead of being spent as a pass.
+func inspectGroups(stream string, groups []redis.XInfoGroup, err error) (
+	offenders []string, checked int, fatal error,
+) {
+	if err != nil {
+		if errors.Is(err, redis.Nil) || strings.Contains(err.Error(), "no such key") {
+			return []string{fmt.Sprintf("%s: o stream nao existe mais, e esta corrida escreveu nele",
+				stream)}, 0, nil
+		}
+		return nil, 0, fmt.Errorf("%w: read the consumer groups of %s: %w", errSetup, stream, err)
+	}
+	if len(groups) == 0 {
+		return []string{fmt.Sprintf("%s: o stream existe e nao tem grupo consumidor nenhum, entao "+
+			"ninguem leu o que esta corrida mandou por ele", stream)}, 0, nil
+	}
+	for _, group := range groups {
+		if offender := groupOffender(stream, group); offender != "" {
+			offenders = append(offenders, offender)
+		}
+	}
+	return offenders, len(groups), nil
 }
 
 func consumerGroupVerdict(checked, streams int, offenders []string, stillWorking string) *assertion {

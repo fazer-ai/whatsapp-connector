@@ -107,6 +107,14 @@ func newRun(ctx context.Context, s servers) (*run, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read %s back: %w", redisVar, err)
 	}
+	// Cancelling the context has to reach the socket, and go-redis only does that with
+	// this on.
+	//
+	// Off (its default), a blocking read such as the BLPOP this bench waits a reply on
+	// ignores the cancellation and runs to its own timeout: a Ctrl-C during that wait kills
+	// the connectors at once and then leaves the run sitting there for up to a minute
+	// before the cleanup that drops its database and keys even starts.
+	options.ContextTimeoutEnabled = true
 	r.rdb = redis.NewClient(options)
 	return r, nil
 }

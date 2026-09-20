@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -859,7 +860,89 @@ func TestTheStreamMarkCarriesTheLastEntryID(t *testing.T) {
 		t.Errorf("dois instantes de um shard cheio que seguiu publicando deram a mesma marca:\n  %s",
 			streamMark(full))
 	}
-	if streamMark(full) != streamMark(full) {
-		t.Error("a marca nao e estavel para a mesma leitura")
+	// Stable across two readings that found the same thing, which is what lets three
+	// equal marks in a row mean the shards held still.
+	again := []shardRead{
+		{stream: "wacbench1:events:0", length: 1000, firstID: "900-1", lastID: "1900-1"},
+		{stream: "wacbench1:events:1", length: 1000, firstID: "880-1", lastID: "1880-1"},
+	}
+	if streamMark(full) != streamMark(again) {
+		t.Errorf("duas leituras iguais deram marcas diferentes:\n  %s\n  %s",
+			streamMark(full), streamMark(again))
+	}
+}
+
+// A command stream of this run that is gone, or that nobody consumed, is a finding: it was
+// written to earlier in the same run.
+func TestAMissingStreamIsAFindingAndNotASkip(t *testing.T) {
+	t.Parallel()
+
+	full := []redis.XInfoGroup{{Name: "connector", Pending: 0, Lag: 0}}
+	tests := map[string]struct {
+		groups    []redis.XInfoGroup
+		err       error
+		offenders int
+		checked   int
+		fatal     bool
+	}{
+		"grupo vazio e o caso bom":       {full, nil, 0, 1, false},
+		"grupo com trabalho parado":      {[]redis.XInfoGroup{{Name: "connector", Pending: 2}}, nil, 1, 1, false},
+		"o stream sumiu":                 {nil, redis.Nil, 1, 0, false},
+		"o stream nao tem grupo nenhum":  {nil, nil, 1, 0, false},
+		"a leitura falhou por outra via": {nil, errors.New("connection refused"), 0, 0, true},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			offenders, checked, fatal := inspectGroups("wacbench1:cmd:s1", tc.groups, tc.err)
+			if (fatal != nil) != tc.fatal {
+				t.Fatalf("erro fatal = %v, queria %v", fatal, tc.fatal)
+			}
+			if len(offenders) != tc.offenders {
+				t.Errorf("%d achados, queria %d: %v", len(offenders), tc.offenders, offenders)
+			}
+			if checked != tc.checked {
+				t.Errorf("%d grupos contados, queria %d", checked, tc.checked)
+			}
+			if tc.offenders > 0 && !strings.Contains(offenders[0], "wacbench1:cmd:s1") {
+				t.Errorf("o achado nao nomeia o stream: %q", offenders[0])
+			}
+		})
+	}
+}
+
+// A violation already in the report outranks a reading that failed after it, and a run
+// that stopped because of one exits on the defect rather than on "the machine".
+func TestTheStoppedOutcomePrefersWhatWasAlreadyFound(t *testing.T) {
+	t.Parallel()
+
+	withBroken := func() *report {
+		rep := &report{}
+		rep.assert(&assertion{claim: "duas instancias com uma lease", points: 4, held: false,
+			detail: "s1: epoch 2 e epoch 4 publicando juntos"})
+		return rep
+	}
+	clean := func() *report {
+		rep := &report{}
+		rep.assert(&assertion{claim: "c", points: 4, held: true})
+		return rep
+	}
+
+	tests := map[string]struct {
+		rep  *report
+		err  error
+		want outcome
+	}{
+		"parou por invariante quebrada":         {withBroken(), errInvariantBroken, outcomeInvariant},
+		"leitura final falhou depois da quebra": {withBroken(), errSetup, outcomeInvariant},
+		"parou por setup, sem quebra nenhuma":   {clean(), errSetup, outcomeSetup},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if got := stoppedOutcome(tc.rep, tc.err); got != tc.want {
+				t.Fatalf("saiu %s, queria %s", got.label(), tc.want.label())
+			}
+		})
 	}
 }

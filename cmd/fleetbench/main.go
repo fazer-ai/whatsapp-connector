@@ -155,10 +155,7 @@ func runBench(sessions, shards, processes, sends int, maxAdoption time.Duration,
 		// that stopped early: a run that gave up because it had already found a broken
 		// lease is a defect, and filing it as "the machine was not ready" is how the
 		// clearest red in the whole bench ends up in the category a reader skips.
-		stopped := outcomeSetup
-		if errors.Is(err, errInvariantBroken) {
-			stopped = rep.outcome()
-		}
+		stopped := stoppedOutcome(rep, err)
 		rep.write(os.Stdout, stopped, err)
 		return stopped, nil
 	}
@@ -239,4 +236,24 @@ func shortList(keys []string) string {
 		return fmt.Sprint(keys)
 	}
 	return fmt.Sprintf("%v e mais %d", keys[:10], len(keys)-10)
+}
+
+// stoppedOutcome is the code a run that stopped early exits on.
+//
+// Two rules, and the order between them is the point. A run that gave up because it had
+// already found a broken lease is a defect, so it exits on what the report says rather
+// than on "the machine was not ready" -- filing the clearest red in the bench under the
+// category a reader skips is how it stops being read. And a violation already in the
+// report outranks a reading that failed after it: the assertions run before the last Redis
+// inspection, so a connection dropping in between would otherwise make the printed report,
+// which shows the QUEBRADO, disagree with the number the run exits on. What failed last
+// does not decide what was already found.
+func stoppedOutcome(rep *report, err error) outcome {
+	if rep.outcome() == outcomeInvariant {
+		return outcomeInvariant
+	}
+	if errors.Is(err, errInvariantBroken) {
+		return rep.outcome()
+	}
+	return outcomeSetup
 }
