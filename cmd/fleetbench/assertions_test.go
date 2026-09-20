@@ -800,7 +800,7 @@ func TestTheFenceIsAClaimWithASeries(t *testing.T) {
 			// Through the function the phase itself calls, and not through an assertion
 			// built here to agree with it: a copy of the verdict in the test is a test that
 			// passes whatever the phase does.
-			rep.assert(fenceExercised(tc.taken, "serie", "nenhum par assumiu sessao nenhuma"))
+			rep.assert(fenceCondition(tc.taken, "serie", "nenhum par assumiu sessao nenhuma"))
 			if got := only(t, rep).state(); got != tc.state {
 				t.Fatalf("com %d adocoes o estado saiu %q, queria %q", tc.taken, got, tc.state)
 			}
@@ -867,7 +867,7 @@ func TestAnUnsettledStreamLeavesTheStreamClaimsUnmeasured(t *testing.T) {
 	// The fence claim comes from the frozen phase and its series is adoptions, so it is
 	// not one of the claims a growing stream leaves unmeasured.
 	rep := &report{}
-	rep.assert(fenceExercised(2, "duas sessoes assumidas", ""))
+	rep.assert(fenceCondition(2, "duas sessoes assumidas", ""))
 	fromStreams := len(rep.assertions)
 	rep.assert(&assertion{claim: "seq estritamente crescente", points: 4, held: true})
 	rep.assert(&assertion{claim: "sem buraco em seq", points: 4, held: true,
@@ -1360,90 +1360,94 @@ func TestTheEpochRisesClaimSaysItReadsWhatAClientAccepts(t *testing.T) {
 	}
 }
 
-// An adoption is the condition of the fence, and the fence is exercised by a publish.
+// An adoption is the condition of the fence; whether the guarded line ran is a count, and
+// a count that zero does not settle.
 //
-// The frozen phase ended with a peer having taken the sessions and called the fence
-// exercised on that alone. Nothing in it makes the thawed owner attempt a publication: the
-// commands go in right before the SIGSTOP, and a fake fast enough to answer them all
-// leaves the phase with an adoption, an owner with nothing to say, and a claim about a line
-// that never ran.
-func TestTheFenceIsOnlyExercisedBySomethingPublished(t *testing.T) {
+// The phase reported the fence as exercised on the adoption alone. It is not: the thawed
+// owner usually has nothing left to publish, because the peers claim its pending entries
+// while it is frozen. But zero is also what a working fence produces, so the number belongs
+// in the series and not in the verdict -- what shows the pair is sensitive is the mutation
+// battery, where removing the fence turns 0 into 246.
+func TestTheFenceClaimCarriesWhatWasPublishedOutOfTurn(t *testing.T) {
 	t.Parallel()
 
 	tests := map[string]struct {
-		claim *assertion
 		late  int
 		state string
 		says  string
 	}{
-		"adocao sem publicacao nenhuma depois da lease perdida": {
-			claim: fenceExercised(4, "4 sessoes assumidas", ""),
+		"nenhuma publicacao sob epoch vencido": {
 			late:  0,
-			state: "NAO MEDIDO",
-			says:  "a tentativa de publicar, e ela nao aconteceu",
+			state: "AFIRMADO",
+			says:  "0 evento(s) publicado(s) sob epoch ja vencido",
 		},
-		"adocao e um evento publicado depois da lease perdida": {
-			claim: fenceExercised(4, "4 sessoes assumidas", ""),
+		"uma escrita em voo depois da lease perdida": {
 			late:  1,
 			state: "AFIRMADO",
-		},
-		"a razao que a propria fase deu nao e sobrescrita": {
-			claim: fenceExercised(0, "nenhuma sessao assumida", "ninguem assumiu nada nesta corrida"),
-			late:  0,
-			state: "NAO MEDIDO",
-			says:  "ninguem assumiu nada nesta corrida",
+			says:  "1 evento(s) publicado(s) sob epoch ja vencido",
 		},
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			fenceReached(tc.claim, tc.late)
-			if got := tc.claim.state(); got != tc.state {
-				t.Fatalf("estado %q, queria %q (razao: %q)", got, tc.state, tc.claim.notWhy)
+			claim := fenceCondition(4, "4 sessoes assumidas", "")
+			fenceLateEvents(claim, tc.late)
+			if got := claim.state(); got != tc.state {
+				t.Errorf("a cerca saiu %q, queria %q", got, tc.state)
 			}
-			if tc.says != "" && !strings.Contains(tc.claim.notWhy, tc.says) {
-				t.Errorf("a razao nao diz %q:\n%s", tc.says, tc.claim.notWhy)
+			if !strings.Contains(claim.series, tc.says) {
+				t.Errorf("a serie nao diz %q:\n%s", tc.says, claim.series)
 			}
 		})
 	}
 
-	// A phase that returned before building its claim leaves nothing to downgrade, and the
-	// downgrade is not the place to find that out.
-	fenceReached(nil, 0)
+	// The claim no longer promises the exercise, and the word is what promised it.
+	claim := fenceCondition(4, "4 sessoes assumidas", "")
+	if strings.Contains(claim.claim, "exercitada") {
+		t.Errorf("a afirmacao ainda diz que a cerca foi exercitada, e o que ela mede e a adocao:\n%s",
+			claim.claim)
+	}
+	if !strings.Contains(claim.claim, "condicao") {
+		t.Errorf("a afirmacao nao diz que o que ela mede e a condicao:\n%s", claim.claim)
+	}
+
+	// A phase that returned before building its claim leaves nothing to annotate, and the
+	// annotation is not the place to find that out.
+	fenceLateEvents(nil, 0)
 }
 
-// The reading that counts late events is the reading that decides the fence claim, and
+// The reading that counts late events is the reading that annotates the fence claim, and
 // this is what keeps the two together.
 //
 // Separated, the late count had to travel from here to the caller, and a caller that took
-// it and did not pass it on left the run green over a fence it never reached. That is the
-// same class the frozen phase's deferred claim removes, and it is removed here the same
-// way: the only place that can forget is the one a table can disprove.
-func TestTheOneOwnerReadingDecidesTheFenceClaim(t *testing.T) {
+// it and did not pass it on left the claim saying nothing about what the run published out
+// of turn. That is the same class the frozen phase's deferred claim removes, and it is
+// removed here the same way: the only place that can forget is the one a table disproves.
+func TestTheOneOwnerReadingAnnotatesTheFenceClaim(t *testing.T) {
 	t.Parallel()
 
 	tests := map[string]struct {
 		events []protocol.Event
-		state  string
+		says   string
 	}{
-		"nada publicado sob epoch vencido deixa a cerca sem medida": {
+		"nada publicado sob epoch vencido": {
 			events: []protocol.Event{event("s1", "a", 1, 1), event("s1", "b", 2, 1)},
-			state:  "NAO MEDIDO",
+			says:   "0 evento(s) publicado(s) sob epoch ja vencido",
 		},
-		"uma escrita em voo depois da lease perdida e a cerca alcancada": {
+		"uma escrita em voo depois da lease perdida": {
 			events: []protocol.Event{event("s1", "b", 2, 1), event("s1", "a", 1, 3)},
-			state:  "AFIRMADO",
+			says:   "1 evento(s) publicado(s) sob epoch ja vencido",
 		},
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			fence := &fenceOutcome{claim: fenceExercised(4, "4 sessoes assumidas", "")}
+			fence := &fenceOutcome{claim: fenceCondition(4, "4 sessoes assumidas", "")}
 			assertOneOwner(&report{}, map[string][]protocol.Event{"s1": tc.events},
 				map[string]map[string][]protocol.Event{"s1": {"wa:events:0": tc.events}},
 				&census{}, 1, fence)
-			if got := fence.claim.state(); got != tc.state {
-				t.Errorf("a cerca saiu %q, queria %q (razao: %q)", got, tc.state, fence.claim.notWhy)
+			if !strings.Contains(fence.claim.series, tc.says) {
+				t.Errorf("a serie da cerca nao diz %q:\n%s", tc.says, fence.claim.series)
 			}
 		})
 	}

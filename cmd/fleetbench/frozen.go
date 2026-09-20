@@ -52,7 +52,7 @@ func frozenOwner(ctx context.Context, active *run, cl *client, rep *report, plan
 	// publish that happened after the lease was gone, and that shows up in the streams,
 	// which are read after every phase has ended. `fenceReached` is what reads it.
 	defer func() {
-		fence.claim = fenceExercised(fence.taken, fence.series, fence.why)
+		fence.claim = fenceCondition(fence.taken, fence.series, fence.why)
 		rep.assert(fence.claim)
 	}()
 
@@ -237,20 +237,27 @@ type fenceOutcome struct {
 	claim  *assertion
 }
 
-// fenceExercised is the claim that the fence half of invariant 1 was actually reached, and
-// the adoptions are its series.
+// fenceCondition is the claim that the run reached the only state the fence can be reached
+// in, and the adoptions are its series.
+//
+// The condition and not the exercise. A peer taking a session from an owner that is alive
+// and stopped is what no kill produces, and it is what makes a publish under a spent epoch
+// possible at all; whether one happened is a different fact, and this claim used to be
+// worded as if the adoption settled it. `fenceLateEvents` appends that count to the series
+// once the streams have been read, and its comment says why the count is not a verdict.
 //
 // A function of its own, called by both the phase and the branch that skips it, because a
 // verdict built inline is a verdict only a four-minute run against two servers can
 // disprove -- and the case worth disproving is the empty one, which a healthy fleet will
 // not produce on demand.
-func fenceExercised(taken int, series, why string) *assertion {
+func fenceCondition(taken int, series, why string) *assertion {
 	return &assertion{
 		invariant: "1 (perder a lease cerca a sessao na hora: o dono que ficou sem ela para de publicar)",
-		claim:     "a cerca foi exercitada: um par assumiu sessao enquanto o dono seguia vivo e parado",
-		series:    series,
-		points:    taken,
-		held:      taken > 0,
-		notWhy:    ifEmpty(taken, why),
+		claim: "a condicao da cerca existiu: um par assumiu sessao de um dono que seguia vivo e " +
+			"parado, que e o unico estado em que a linha cercada pode rodar",
+		series: series,
+		points: taken,
+		held:   taken > 0,
+		notWhy: ifEmpty(taken, why),
 	}
 }

@@ -272,32 +272,31 @@ func assertOneOwner(rep *report, published map[string][]protocol.Event,
 		detail: strings.Join(offenders, "\n"),
 		notWhy: ifEmpty(pairs+taken, "nenhum evento foi publicado e nenhum censo foi tomado"),
 	})
-	fenceReached(fence.claim, late)
+	fenceLateEvents(fence.claim, late)
 }
 
-// fenceReached downgrades the frozen phase's claim when nothing in the run ever published
-// after losing the lease.
+// fenceLateEvents puts, on the frozen phase's claim, how many events this run saw
+// published under an epoch the stream had already passed.
 //
-// The phase creates the condition -- a peer takes the sessions of an owner that is alive
-// and stopped -- and an adoption alone was being reported as the fence having been
-// exercised. It is not: the fence guards a publish, and an owner that comes back with
-// nothing to say never reaches it. Between the sends and the SIGSTOP there is a race the
-// phase does not control, and a fake fast enough to answer all of them leaves a thawed
-// owner with no work, an adoption above zero, and a claim saying the fence was exercised
-// over a run in which the guarded line never ran.
+// The phase claims a CONDITION and not an exercise: a peer took sessions from an owner
+// that was alive and stopped, which no kill can produce and which is the only state the
+// guarded line can run in. It used to claim the exercise on that alone, and an adoption is
+// not one -- the thawed owner, whose pending entries the peers claim after
+// WAC_CLAIM_MIN_IDLE, usually comes back with nothing left to publish.
 //
-// Measured at the outcome and not at the input: a command still pending when the freeze
-// landed is a proxy for an attempt, while a late event IS one -- an event under an epoch
-// the stream had already passed is a publish that happened after the lease was gone. Zero
-// of them means the connector's `stillOwned` was never reached, and neither AFIRMADO nor
-// QUEBRADO is an answer about a line that did not run.
-func fenceReached(claim *assertion, late int) {
-	if claim == nil || claim.notWhy != "" || late > 0 {
+// The count goes in the series rather than into the verdict, because zero is ambiguous
+// from out here: it is what an owner with nothing to say produces AND what a fence that
+// works produces, since the session is torn down on the lost lease before a publish gets
+// out. MEASURED over this bench: a clean tree produced zero in 83 of 87 runs and one in
+// the other four, while the mutant that removes the fence from `session.publish` produced
+// 246 in a single run -- without it the old owner keeps every session alive and keeps
+// emitting, so what separates the two is a flood and not one in-flight write. The pair is
+// therefore sensitive, and what shows it is the mutation battery, not this claim.
+func fenceLateEvents(claim *assertion, late int) {
+	if claim == nil {
 		return
 	}
-	claim.notWhy = "nenhum evento de dono anterior apareceu nos streams desta corrida, entao nenhuma " +
-		"instancia chegou a publicar depois de perder a lease e a linha que a cerca guarda nao foi " +
-		"alcancada. A adocao cria a condicao; o exercicio e a tentativa de publicar, e ela nao aconteceu"
+	claim.series += fmt.Sprintf("; %d evento(s) publicado(s) sob epoch ja vencido nesta corrida", late)
 }
 
 // Invariant 2: the epoch rises on every ownership change.

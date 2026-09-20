@@ -38,19 +38,19 @@ func TestTheFrozenPhaseClaimsTheFenceOnTheWayOut(t *testing.T) {
 	ast.Inspect(phase.Body, func(n ast.Node) bool {
 		if d, isDefer := n.(*ast.DeferStmt); isDefer {
 			ast.Inspect(d, func(inner ast.Node) bool {
-				if call, isCall := inner.(*ast.CallExpr); isCall && calleeName(call) == "fenceExercised" {
+				if call, isCall := inner.(*ast.CallExpr); isCall && calleeName(call) == "fenceCondition" {
 					deferred++
 				}
 				return true
 			})
 		}
-		if call, isCall := n.(*ast.CallExpr); isCall && calleeName(call) == "fenceExercised" {
+		if call, isCall := n.(*ast.CallExpr); isCall && calleeName(call) == "fenceCondition" {
 			claims++
 		}
 		return true
 	})
 	if deferred != 1 {
-		t.Errorf("frozenOwner tem %d chamadas adiadas a fenceExercised, e a cerca se afirma uma vez, "+
+		t.Errorf("frozenOwner tem %d chamadas adiadas a fenceCondition, e a cerca se afirma uma vez, "+
 			"na saida: cada ramo que volta sem afirmar deixa a corrida verde sobre uma cerca que ela "+
 			"nao alcancou", deferred)
 	}
