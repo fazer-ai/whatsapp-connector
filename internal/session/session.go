@@ -877,11 +877,27 @@ type queued struct {
 // Ledger remembers what a command did, so a redelivery is answered with the first
 // run's result instead of carrying it out a second time. Invariant 5 in AGENTS.md is
 // this and nothing else.
+//
+// It remembers two things, because a command has three states. A result is a command
+// that finished. An attempt with no result is a command that ran and whose outcome
+// nobody here can tell, which is a different fact from both "it worked" and "it never
+// happened", and the one a redelivery used to have no way to find out (#282).
 type Ledger interface {
-	// Recall answers what a command with this key did, and whether it ran at all.
-	Recall(ctx context.Context, sid, key string) (json.RawMessage, bool, error)
-	// Remember records what a command did, without overwriting an earlier answer.
+	// Recall answers what a command with this key did, and how far the first attempt
+	// got. `done` is the command having finished, and `result` is its answer;
+	// `attempted` without `done` is the command having run with nobody able to say how
+	// it ended.
+	Recall(ctx context.Context, sid, key string) (result json.RawMessage, done, attempted bool, err error)
+	// Reserve records that a command is about to be carried out, without overwriting an
+	// attempt already on record: a second Reserve under one key is a redelivery of the
+	// first, not a new command, and restarting its clock is how a record stops expiring.
+	Reserve(ctx context.Context, sid, key string) error
+	// Remember records what a command did, without overwriting an earlier answer, and
+	// settles the attempt it was carried out under.
 	Remember(ctx context.Context, sid, key string, result json.RawMessage) error
+	// Release takes an attempt back off, for a command the connector is certain never
+	// reached WhatsApp.
+	Release(ctx context.Context, sid, key string) error
 }
 
 // errStopped is what an emission this pump stopped before publishing settles with.
@@ -1028,6 +1044,15 @@ func (s *Session) run(ctx context.Context, waiting queued) (refusal protocol.Err
 	if err != nil {
 		// `ran` and not a flat no: a teardown the engine refused reached the account and
 		// is an attempt, which is a different thing from one turned away before it began.
+		//
+		// `recalled` is deliberately not consulted here, and it is only safe not to
+		// because no teardown is reserved. A failure answered from a record rather than
+		// from the account happens only on the attempt branch of `carryOut`, which only
+		// fires for `protocol.ReservedCommands`; `happened` is only read for a teardown;
+		// and `TestTheCommandsWithARecoveryOfTheirOwnAreNotReserved` is what keeps those
+		// two sets apart. Reserve a teardown and this line starts reporting work that did
+		// not happen here, which leaves an adopted session's lease renewed for an account
+		// nothing is using -- so that test failing is the signal to come back and read this.
 		return asProtocolError(err).Code, command.Type == protocol.CommandSessionDelete, ran(err)
 	}
 	// A recall answered from the record rather than from the account: the command is
@@ -1072,36 +1097,77 @@ func (s *Session) carryOut(ctx context.Context, command *protocol.Command) (resu
 	}
 
 	key := idempotencyKey(command)
-	result, done, err := s.alreadyDid(ctx, key)
+	result, done, attempted, err := s.alreadyDid(ctx, key)
 	if err != nil {
 		return nil, false, err
 	}
 	if done {
-		// Only successes are remembered, so a recalled command is one that worked -- once,
-		// and not now. Said out loud to the caller, because the two are different facts
-		// about the account: the record knows something ran a day ago, not that the world
-		// stayed that way.
+		// A recalled command is one that worked -- once, and not now. Said out loud to
+		// the caller, because the two are different facts about the account: the record
+		// knows something ran a day ago, not that the world stayed that way.
 		return result, true, nil
+	}
+	if attempted {
+		// It ran, and what it did is not on record, which happens when the answer never
+		// came back. Carrying it out again instead is a participant added twice, or a
+		// name set over one somebody has since changed (#282).
+		//
+		// `timeout` and not `not_settled`, although the second is the word the issue
+		// reaches for. `not_settled` promises that the outcome settles itself and that
+		// asking again in a moment gets a real answer, which is true of a `group.create`
+		// waiting on WhatsApp's notification and false here: nothing is coming that names
+		// what this command did, so a client that follows that promise retries against a
+		// case that never settles, and `contract/PROTOCOL.md` would have it escalate to a
+		// human for what is an ordinary socket dying at the wrong moment. `timeout` is
+		// already defined as the outcome nobody here knows and nothing afterwards will,
+		// which is this exactly, and it is the same word the first attempt's own ceiling
+		// produces -- so a client that already handles one handles the other.
+		return nil, true, protocol.NewError(protocol.ErrorTimeout,
+			"this command was carried out and its outcome is not known; read the state back before sending it again")
+	}
+
+	if protocol.ReservedCommands[command.Type] {
+		// Only the ones the table names, and the branch above needs no guard of its own:
+		// with no attempt on record a redelivery of anything else reads as a command
+		// nobody has heard of and goes to the engine, which is where the recoveries that
+		// belong to particular commands live. A second guard there would be one nothing
+		// can reach, and two that mask each other are two no test can tell apart.
+		s.reserve(ctx, command, key)
 	}
 
 	execCtx, releaseBound := bound(ctx, command)
 	defer releaseBound()
 
 	result, err = s.lifecycle(execCtx, command)
-	if err == nil && key != "" && s.ledger != nil {
-		// Only a success is remembered. A failure is the caller's to try again, and a
-		// remembered one would answer every later attempt with the same refusal.
+	if err != nil && !keepsTheAttempt(err) && key != "" && s.ledger != nil {
+		// The attempt stands only for a failure the engine marked as having a write
+		// already on its way. Everything else comes back off, so the retry does the whole
+		// thing rather than being refused for ever.
 		//
-		// Written after the fact and not reserved before it, because a reservation
-		// cannot be resolved: an entry saying an attempt was made says nothing about
-		// whether it landed, so an instance reclaiming the command would have to choose
-		// between dropping a message that never went out and sending one that already
-		// did. What covers that window is the caller naming the message, so a resend
+		// This way round on purpose. A mark forgotten upstream costs a redelivery that
+		// carries the work out again, which is what this did before #282; the opposite
+		// default -- keep unless something says otherwise -- costs a command that can
+		// never run again under its key, and four rounds of review found five of those,
+		// each in a different family. `engine.ErrMayHaveLanded` says why at more length.
+		s.release(ctx, command, key)
+	}
+	if err == nil && key != "" && s.ledger != nil {
+		// The result settles the attempt written above, and a failure does not: what is
+		// left standing is a command that ran with nobody able to say how it ended, which
+		// is what the branch above answers `not_settled` with.
+		//
+		// A refusal is still not remembered as an answer. Remembering one would reply to
+		// every later attempt with the same refusal, so a number that was briefly
+		// unreachable would stay unreachable, and that is why the attempt is a record of
+		// its own rather than the failure being stored here.
+		//
+		// What the attempt does not replace is the caller naming the message. A resend
 		// carries the id the first attempt used, and every client downstream discards a
-		// repeat of an id it already has. The discarding is theirs and not WhatsApp's:
-		// WhatsApp delivers the second copy in full, whatever the gap (#215). The window
-		// is real; what makes it survivable is the obligation `contract/PROTOCOL.md` puts
-		// on a client, and the same one the inbound path already spends freely.
+		// repeat of an id it already has; the discarding is theirs and not WhatsApp's,
+		// which delivers the second copy in full whatever the gap (#215). That is what
+		// covers a send, and it is why a send that the connector knows never went out is
+		// released rather than left to answer `not_settled` for ever.
+		//
 		// On a context of its own, because the command's deadline may have run out in
 		// the same instant the work finished, and a record that is not written is a
 		// command that gets carried out again.
@@ -1160,27 +1226,71 @@ func bound(ctx context.Context, command *protocol.Command) (context.Context, con
 // gets carried out again. Bounded all the same: this runs on the session's executor, so
 // every attempt is a command behind it that is not running.
 func (s *Session) remember(ctx context.Context, command *protocol.Command, key string, result json.RawMessage) {
-	write, cancel := context.WithTimeout(context.WithoutCancel(ctx), ledgerWindow)
+	s.writeToLedger(ctx, command, key, "record what it did",
+		"carried a command out and could not record it; a redelivery will do it again",
+		func(write context.Context) error { return s.ledger.Remember(write, s.sid, key, result) })
+}
+
+// reserve puts the attempt on record before the work starts, so a redelivery of a command
+// whose outcome never came back is answered instead of carried out again.
+//
+// Best effort, like the two below it, and for the same reason: what a failure here costs
+// is the window this exists to narrow, and refusing to carry the command out because the
+// attempt could not be written would turn a risk into a certainty the other way -- a
+// command that never runs because Redis was briefly unwell.
+func (s *Session) reserve(ctx context.Context, command *protocol.Command, key string) {
+	if key == "" || s.ledger == nil {
+		return
+	}
+	s.writeToLedger(ctx, command, key, "record that it is about to run",
+		"could not record that a command is about to run; a redelivery may carry it out again",
+		func(write context.Context) error { return s.ledger.Reserve(write, s.sid, key) })
+}
+
+// release takes the attempt back off for a failure that left no write standing at WhatsApp,
+// which is every failure the engine did not mark. A failure here is the one that costs the
+// caller something real: the retry is answered `timeout` for work that never happened, so
+// it is tried as hard as the others and said just as loudly.
+func (s *Session) release(ctx context.Context, command *protocol.Command, key string) {
+	s.writeToLedger(ctx, command, key, "take the attempt back off",
+		"a command failed without leaving a write at WhatsApp and the attempt could not be taken back off; "+
+			"a redelivery will answer timeout for work that never happened",
+		func(write context.Context) error { return s.ledger.Release(write, s.sid, key) })
+}
+
+// writeToLedger is the one retry loop the three of them share.
+//
+// Tried more than once, because whatever it is recording has already happened and this is
+// the only thing left that can stop a redelivery getting it wrong. A Redis that refuses
+// one call and answers the next is the common shape of a failure here, and giving up on
+// the first refusal spends the whole window on it.
+//
+// A failure that outlasts the attempts is logged and the command is still answered and
+// retired, which is the one place this layer knowingly leaves a window. Giving the
+// delivery back instead would not close it: for a write that follows the work, the side
+// effect has already happened, so the redelivery would find no record and do it a second
+// time.
+func (s *Session) writeToLedger(ctx context.Context, command *protocol.Command, key, what, lost string, write func(context.Context) error) {
+	bounded, cancel := context.WithTimeout(context.WithoutCancel(ctx), ledgerWindow)
 	defer cancel()
 
 	var err error
 	for attempt := range ledgerAttempts {
 		if attempt > 0 {
 			select {
-			case <-write.Done():
+			case <-bounded.Done():
 				// Out of window. The error from the last attempt is what gets reported.
 			case <-time.After(ledgerBackoff):
 			}
-			if write.Err() != nil {
+			if bounded.Err() != nil {
 				break
 			}
 		}
-		if err = s.ledger.Remember(write, s.sid, key, result); err == nil {
+		if err = write(bounded); err == nil {
 			return
 		}
 	}
-	s.log.Error().Err(err).Str("cmd_id", command.ID).Str("key", key).
-		Msg("carried a command out and could not record it; a redelivery will do it again")
+	s.log.Error().Err(err).Str("cmd_id", command.ID).Str("key", key).Str("ledger_write", what).Msg(lost)
 }
 
 // ledgerWindow bounds the whole of that, and ledgerAttempts and ledgerBackoff divide it
@@ -1217,23 +1327,36 @@ var errLeaving = errors.New("session: this instance is finishing with the accoun
 // another claim. The store is the same Redis the command arrived through, so one that
 // cannot answer this is one the reply and the acknowledgement would not reach either,
 // and the delivery was coming round again regardless.
-func (s *Session) alreadyDid(ctx context.Context, key string) (json.RawMessage, bool, error) {
+func (s *Session) alreadyDid(ctx context.Context, key string) (result json.RawMessage, done, attempted bool, err error) {
 	if key == "" || s.ledger == nil {
-		return nil, false, nil
+		return nil, false, false, nil
 	}
 	read, cancel := context.WithTimeout(ctx, ledgerTimeout)
 	defer cancel()
 
-	result, found, err := s.ledger.Recall(read, s.sid, key)
+	result, done, attempted, err = s.ledger.Recall(read, s.sid, key)
 	if err != nil {
-		return nil, false, fmt.Errorf("%w: %w", errUnknownWhetherItRan, err)
+		return nil, false, false, fmt.Errorf("%w: %w", errUnknownWhetherItRan, err)
 	}
-	if !found {
-		return nil, false, nil
+	if done {
+		s.log.Info().Str("key", key).Msg("answered a redelivered command with what the first one did")
+		return result, true, true, nil
 	}
-	s.log.Info().Str("key", key).Msg("answered a redelivered command with what the first one did")
-	return result, true, nil
+	if attempted {
+		s.log.Warn().Str("key", key).
+			Msg("a redelivered command was carried out before and its outcome is not on record")
+	}
+	return nil, false, attempted, nil
 }
+
+// keepsTheAttempt reports whether a failure leaves the command's attempt on record, so
+// that a redelivery is answered rather than carried out again.
+//
+// The engine's mark and nothing else. A failure that reached nothing -- a lookup before the
+// write, a privacy setting that could not be read, a socket that was never open -- releases
+// the attempt, because the retry has the whole thing to do. `engine.ErrMayHaveLanded` says
+// why the default is this way round rather than the other.
+func keepsTheAttempt(err error) bool { return errors.Is(err, engine.ErrMayHaveLanded) }
 
 // idempotencyKey is what a command is remembered under, and the empty string for one
 // that names nothing to be remembered by.

@@ -693,10 +693,12 @@ func newSession(
 			ctx context.Context, client *wm.Client, group waTypes.JID,
 			participants []waTypes.JID, action wm.ParticipantChange,
 		) ([]waTypes.GroupParticipant, error) {
-			return client.UpdateGroupParticipants(ctx, group, participants, action) //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
+			changed, err := client.UpdateGroupParticipants(ctx, group, participants, action)
+			return changed, engine.MayHaveLanded(err) //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
 		},
 		inviteLink: func(ctx context.Context, client *wm.Client, group waTypes.JID, revoke bool) (string, error) {
-			return client.GetGroupInviteLink(ctx, group, revoke) //nolint:wrapcheck // the sentinels are read by inviteFailure
+			link, err := client.GetGroupInviteLink(ctx, group, revoke)
+			return link, engine.MayHaveLanded(err) //nolint:wrapcheck // the sentinels are read by inviteFailure
 		},
 		joinRequests: func(
 			ctx context.Context, client *wm.Client, group waTypes.JID,
@@ -707,31 +709,32 @@ func newSession(
 			ctx context.Context, client *wm.Client, group waTypes.JID,
 			participants []waTypes.JID, action wm.ParticipantRequestChange,
 		) ([]waTypes.GroupParticipant, error) {
-			return client.UpdateGroupRequestParticipants(ctx, group, participants, action) //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
+			decided, err := client.UpdateGroupRequestParticipants(ctx, group, participants, action)
+			return decided, engine.MayHaveLanded(err) //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
 		},
 		leave: func(ctx context.Context, client *wm.Client, group waTypes.JID) error {
 			return client.LeaveGroup(ctx, group) //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
 		},
 		setPhoto: func(ctx context.Context, client *wm.Client, group waTypes.JID, picture []byte) error {
 			_, err := client.SetGroupPhoto(ctx, group, picture)
-			return err //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
+			return engine.MayHaveLanded(err) //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
 		},
 		setName: func(ctx context.Context, client *wm.Client, group waTypes.JID, subject string) error {
-			return client.SetGroupName(ctx, group, subject) //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
+			return engine.MayHaveLanded(client.SetGroupName(ctx, group, subject)) //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
 		},
 		setAnnounce: func(ctx context.Context, client *wm.Client, group waTypes.JID, on bool) error {
-			return client.SetGroupAnnounce(ctx, group, on) //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
+			return engine.MayHaveLanded(client.SetGroupAnnounce(ctx, group, on)) //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
 		},
 		setLocked: func(ctx context.Context, client *wm.Client, group waTypes.JID, on bool) error {
-			return client.SetGroupLocked(ctx, group, on) //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
+			return engine.MayHaveLanded(client.SetGroupLocked(ctx, group, on)) //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
 		},
 		setJoinApproval: func(ctx context.Context, client *wm.Client, group waTypes.JID, on bool) error {
-			return client.SetGroupJoinApprovalMode(ctx, group, on) //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
+			return engine.MayHaveLanded(client.SetGroupJoinApprovalMode(ctx, group, on)) //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
 		},
 		setAddMode: func(
 			ctx context.Context, client *wm.Client, group waTypes.JID, mode waTypes.GroupMemberAddMode,
 		) error {
-			return client.SetGroupMemberAddMode(ctx, group, mode) //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
+			return engine.MayHaveLanded(client.SetGroupMemberAddMode(ctx, group, mode)) //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
 		},
 		profilePicture: func(
 			ctx context.Context, client *wm.Client, party waTypes.JID, params *wm.GetProfilePictureParams,
@@ -742,7 +745,7 @@ func newSession(
 			return client.SendMediaRetryReceipt(ctx, info, key) //nolint:wrapcheck // wrapped by its caller
 		},
 		sendPresence: func(ctx context.Context, client *wm.Client, state waTypes.Presence) error {
-			return client.SendPresence(ctx, state) //nolint:wrapcheck // classified by presenceFailure, which needs the sentinels
+			return engine.MayHaveLanded(client.SendPresence(ctx, state)) //nolint:wrapcheck // classified by presenceFailure, which needs the sentinels
 		},
 		sendLimit: cmp.Or(blobs.SendMax, media.DefaultSendMax),
 		blobs:     blobs.Blobs,
@@ -780,7 +783,7 @@ func newSession(
 	s.setTopic = func(
 		ctx context.Context, client *wm.Client, group waTypes.JID, previous, revision, description string,
 	) error {
-		return client.SetGroupTopic(ctx, group, previous, revision, description) //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
+		return engine.MayHaveLanded(client.SetGroupTopic(ctx, group, previous, revision, description)) //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
 	}
 	// Assigned after the literal, not in it: this one reads the group before it writes,
 	// and it reads it through the seam beside it rather than off the client, so a test

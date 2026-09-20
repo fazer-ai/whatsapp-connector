@@ -11,6 +11,7 @@ import (
 	waTypes "go.mau.fi/whatsmeow/types"
 	waEvents "go.mau.fi/whatsmeow/types/events"
 
+	"github.com/fazer-ai/whatsapp-connector/internal/engine"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 )
 
@@ -308,7 +309,12 @@ func (s *Session) markRead(ctx context.Context, command *protocol.Command) (json
 
 	if err := s.current().MarkRead(ctx, req.MessageIDs, time.Now(), chat, sender, kind); err != nil {
 		s.log.Warn().Err(err).Str("chat", chat.String()).Msg("a read mark did not go out")
-		return nil, markFailure(err, "WhatsApp did not take the read mark")
+		// The write is out of this process by the time this can fail, so the mark may be on
+		// WhatsApp already and a redelivery must not set it again over a chat the user has
+		// since marked unread (#282). Everything above this line -- the privacy setting
+		// that could not be read, the address that would not resolve -- reached nothing and
+		// is deliberately left unmarked.
+		return nil, engine.MayHaveLanded(markFailure(err, "WhatsApp did not take the read mark"))
 	}
 	return nil, nil
 }
