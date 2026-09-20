@@ -48,6 +48,14 @@ func itoa(n uint64) string {
 	return string(out)
 }
 
+// eventAs is an event with an id of its own, which is how a table says "two different
+// events at the same seq" without depending on which field the assertion reads.
+func eventAs(id, sid, inst string, epoch, seq uint64) protocol.Event {
+	made := event(sid, inst, epoch, seq)
+	made.ID = id
+	return made
+}
+
 // only returns the single assertion a report holds, failing when it holds anything else:
 // a test that read the wrong one would be checking a verdict it did not ask for.
 func only(t *testing.T, rep *report) *assertion {
@@ -186,8 +194,16 @@ func TestSeqMonotonicNeedsMoreThanOnePoint(t *testing.T) {
 			events: []protocol.Event{event("s1", "a", 1, 1), event("s1", "a", 1, 2)},
 			state:  "AFIRMADO",
 		},
-		"seq repetido": {
+		"o mesmo evento entregue duas vezes": {
+			// `contract/PROTOCOL.md`: delivery is at-least-once, and `seq` is what lets the
+			// consumer drop the copy. Reporting it would report the contract's own
+			// guarantee as a defect. `event` builds its id out of (sid, inst, epoch, seq),
+			// so these two are the same event.
 			events: []protocol.Event{event("s1", "a", 1, 1), event("s1", "a", 1, 1)},
+			state:  "AFIRMADO",
+		},
+		"dois eventos diferentes com o mesmo seq": {
+			events: []protocol.Event{event("s1", "a", 1, 1), eventAs("outro", "s1", "a", 1, 1)},
 			state:  "QUEBRADO",
 		},
 		"seq reiniciando": {
@@ -754,5 +770,48 @@ func TestStillnessNeedsMoreThanOneQuietReading(t *testing.T) {
 					map[bool]string{true: "terminar", false: "seguir"}[tc.settled])
 			}
 		})
+	}
+}
+
+// A snapshot taken while the shards were still growing cannot give a verdict about
+// ordering: the event that is missing may not have arrived yet.
+func TestAnUnsettledStreamLeavesTheStreamClaimsUnmeasured(t *testing.T) {
+	t.Parallel()
+
+	growing := "os shards de evento ainda cresciam quando o prazo acabou"
+
+	// The fence claim comes from the frozen phase and its series is adoptions, so it is
+	// not one of the claims a growing stream leaves unmeasured.
+	rep := &report{}
+	rep.assert(fenceExercised(2, "duas sessoes assumidas", ""))
+	fromStreams := len(rep.assertions)
+	rep.assert(&assertion{claim: "seq estritamente crescente", points: 4, held: true})
+	rep.assert(&assertion{claim: "sem buraco em seq", points: 4, held: true,
+		notWhy: "nenhuma serie sobrou depois de tirar os streams truncados"})
+	// Through the function the run itself calls, over the same slice it hands it.
+	markUnmeasured(rep.assertions[fromStreams:], growing)
+
+	if got := rep.assertions[0].state(); got != "AFIRMADO" {
+		t.Errorf("a cerca, que nao le stream, saiu %q", got)
+	}
+	for _, a := range rep.assertions[1:] {
+		if a.state() != "NAO MEDIDO" {
+			t.Errorf("%q saiu %q sobre um stream que ainda crescia", a.claim, a.state())
+		}
+	}
+	// The specific reason wins over the general one: "no series survived the truncation"
+	// says more than "the stream was still growing", and the second would bury it.
+	if got := rep.assertions[2].notWhy; got == growing {
+		t.Errorf("a razao especifica foi trocada pela geral: %q", got)
+	}
+	// And a run whose streams settled changes nothing.
+	quiet := &report{}
+	quiet.assert(&assertion{claim: "seq", points: 4, held: true})
+	markUnmeasured(quiet.assertions, "")
+	if got := quiet.assertions[0].state(); got != "AFIRMADO" {
+		t.Errorf("com os shards parados a afirmacao saiu %q", got)
+	}
+	if got := rep.outcome(); got != outcomeSetup {
+		t.Errorf("o desfecho saiu %s, e uma corrida que leu sequencia parcial nao e verde", got.label())
 	}
 }

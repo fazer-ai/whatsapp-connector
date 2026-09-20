@@ -23,7 +23,7 @@ import (
 // saying more than it measured.
 func assertInvariants(ctx context.Context, cl *client, rep *report, plan benchPlan,
 	answers map[string][]string, sids []string, pairs []idempotentPair, counted *census,
-	stillWorking, expired string) error {
+	stillWorking, expired, stillPublishing string) error {
 
 	published := map[string][]protocol.Event{}          // sid -> events, in stream order
 	shardOf := map[string]map[string]bool{}             // sid -> streams it was seen on
@@ -64,11 +64,22 @@ func assertInvariants(ctx context.Context, cl *client, rep *report, plan benchPl
 		rep.measure("troca de dono sob carga", "entradas em "+read.stream, float64(read.length), "entradas")
 	}
 
+	// Marked from here, and not over the whole report: the fence claim was asserted by the
+	// frozen phase and its series is adoptions, not stream entries. Blanketing the report
+	// would say a claim went unmeasured because of something it never read.
+	fromStreams := len(rep.assertions)
 	assertOneOwner(rep, published, inOrder, counted, len(sids))
 	assertEpochRises(rep, published)
 	assertSeqMonotonic(rep, published)
 	assertOneShard(rep, shardOf, firstOn, sids)
 	assertNoLostEvent(rep, published, truncated)
+
+	// Everything above walks the event streams, so a snapshot taken while they were still
+	// growing is a snapshot none of them can give a verdict over: the stale-owner event
+	// that is missing, or the seq that would close a gap, may simply not have arrived yet.
+	// A note does not reach the exit code, and a run that ends VERDE over a partial
+	// sequence says it measured an ordering it only half read.
+	markUnmeasured(rep.assertions[fromStreams:], stillPublishing)
 	assertNoDuplicateEffect(rep, answers, pairs, expired)
 	return assertConsumerGroups(ctx, cl, rep, sids, stillWorking)
 }
@@ -246,18 +257,49 @@ func assertSeqMonotonic(rep *report, published map[string][]protocol.Event) {
 			if len(run) > 1 {
 				withOrder++
 			}
-			for i := 1; i < len(run); i++ {
-				if run[i].Seq <= run[i-1].Seq {
+			// The same event id twice is redelivery, and the contract allows it.
+			//
+			// `contract/PROTOCOL.md`: delivery is at-least-once per event, and `seq` is
+			// what lets the consumer drop the copy the transport handed over twice. Redis
+			// can produce one without anything being wrong -- an XADD that ran and whose
+			// answer was lost comes back on the retry -- so reading a repeated id as a
+			// broken invariant would report the contract's own guarantee as a defect.
+			//
+			// What is NOT allowed is two DIFFERENT events under one seq, and that is the
+			// defect this looks for: the id is carried into the comparison rather than
+			// dropped with the duplicate.
+			seen := map[string]bool{}
+			ordered := make([]protocol.Event, 0, len(run))
+			for _, event := range run {
+				if seen[event.ID] {
+					continue
+				}
+				seen[event.ID] = true
+				ordered = append(ordered, event)
+			}
+			atSeq := map[uint64]string{}
+			for _, event := range ordered {
+				if other, clash := atSeq[event.Seq]; clash {
+					offenders = append(offenders, fmt.Sprintf(
+						"%s no epoch %d: dois eventos diferentes com seq %d (%s e %s), e um seq so "+
+							"nomeia um evento", sid, k.epoch, event.Seq, other, event.ID))
+					continue
+				}
+				atSeq[event.Seq] = event.ID
+			}
+			for i := 1; i < len(ordered); i++ {
+				if ordered[i].Seq <= ordered[i-1].Seq {
 					offenders = append(offenders, fmt.Sprintf(
 						"%s no epoch %d: seq %d (evento %s) veio depois de seq %d (evento %s)",
-						sid, k.epoch, run[i].Seq, run[i].ID, run[i-1].Seq, run[i-1].ID))
+						sid, k.epoch, ordered[i].Seq, ordered[i].ID, ordered[i-1].Seq, ordered[i-1].ID))
 				}
 			}
 		}
 	}
 	rep.assert(&assertion{
 		invariant: "3 (seq monotonico por (sid, epoch))",
-		claim:     "seq estritamente crescente dentro de cada (sid, epoch)",
+		claim: "seq estritamente crescente dentro de cada (sid, epoch), com a reentrega do mesmo " +
+			"evento descontada porque o contrato a permite",
 		series: fmt.Sprintf("%d eventos, dos quais %d pares (sid, epoch) com dois ou mais pontos",
 			points, withOrder),
 		points: withOrder,
@@ -564,4 +606,21 @@ func ifEmpty(points int, why string) string {
 		return why
 	}
 	return ""
+}
+
+// markUnmeasured turns claims into unmeasured ones when the reading they ran over could
+// not be trusted, and does nothing when `why` is empty.
+//
+// It leaves a claim that already has a reason alone: the first reason is the specific one
+// -- "no (sid, epoch) had more than one event" says more than "the stream was still
+// growing" -- and the second would overwrite it with the general case.
+func markUnmeasured(claims []*assertion, why string) {
+	if why == "" {
+		return
+	}
+	for _, claim := range claims {
+		if claim.notWhy == "" {
+			claim.notWhy = why
+		}
+	}
 }

@@ -228,13 +228,16 @@ func handover(ctx context.Context, active *run, group *fleet, cl *client, rep *r
 	if err != nil {
 		return fmt.Errorf("%w: %w", errSetup, err)
 	}
+	stillPublishing := ""
 	if !settled {
-		stillPublishing := "os shards de evento ainda cresciam quando o prazo de 30 s acabou, entao as " +
-			"assercoes sobre ordem e continuidade abaixo leem uma sequencia que pode estar sem a cauda"
+		stillPublishing = "os shards de evento ainda cresciam quando o prazo de 30 s acabou, entao o que " +
+			"esta lido aqui e uma sequencia que pode estar sem a cauda: o evento de dono velho que falta, " +
+			"ou o buraco que fecharia, ainda pode estar a caminho"
 		rep.note(stillPublishing)
 	}
 
-	return assertInvariants(ctx, cl, rep, plan, answers, sids, pairs, counted, stillWorking, expired)
+	return assertInvariants(ctx, cl, rep, plan, answers, sids, pairs, counted,
+		stillWorking, expired, stillPublishing)
 }
 
 func shortSID(sid string) string {
