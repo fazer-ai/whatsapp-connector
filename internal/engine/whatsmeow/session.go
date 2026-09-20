@@ -3006,7 +3006,7 @@ func (s *Session) rebuild(ctx context.Context) error {
 
 	// A false here is the session having closed while this ran, which adopt has already
 	// cleaned up after. There is nothing left to do either way.
-	_ = s.adopt(ctx, wm.NewClient(device, s.waLog))
+	_ = s.adopt(ctx, newClient(device, s.waLog))
 	return nil
 }
 

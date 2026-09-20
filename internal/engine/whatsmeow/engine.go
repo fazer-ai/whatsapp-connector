@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
-	wm "go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waCompanionReg"
 	waStore "go.mau.fi/whatsmeow/store"
 	"google.golang.org/protobuf/proto"
@@ -237,7 +236,7 @@ func (e *Engine) Open(ctx context.Context, sid string) (engine.Session, error) {
 	}
 
 	wa := newLibraryLogger(e.log, sid)
-	session := newSession(ctx, sid, wm.NewClient(device, wa), scoped, e.media, e.queueing, e.log, wa)
+	session := newSession(ctx, sid, newClient(device, wa), scoped, e.media, e.queueing, e.log, wa)
 	// Registered before the session can be handed out, so a close that happens while
 	// this function is still running is not one nobody hears about.
 	session.onClose(func() { e.forget(sid, session) })
