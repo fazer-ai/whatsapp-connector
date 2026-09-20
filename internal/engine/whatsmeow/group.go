@@ -500,8 +500,17 @@ func (s *Session) createGroup(ctx context.Context, command *protocol.Command) (j
 	// deadline, per call rather than per command, so a creation's worst case was two of
 	// those windows against the two five second ceilings declared here (#293). The pragma
 	// is derived from the caller's remaining time now, in
-	// `internal/store/sqlitebudget.go`, which is what lets this say "the command comes
-	// back inside the ceiling" without the claim being wider than the measurement.
+	// `internal/store/sqlitebudget.go`.
+	//
+	// Which makes the wait the caller's, and not the caller's exactly. That file gives
+	// the busy wait `budgetSlack` longer than the deadline it derives from, deliberately,
+	// so that the failure is `context deadline exceeded` rather than whichever of the two
+	// clocks the scheduler noticed first. A contended call therefore overruns the ceiling
+	// it declared by that much plus the round trip: 363..368ms over six runs against a
+	// three hundred millisecond one, and once per call, so the two writes below carry it
+	// twice. It is a constant rather than a share, so against the five seconds declared
+	// here it is about one percent, and it is the short ceilings a test sets where it is
+	// worth knowing.
 	writing, written := context.WithTimeout(ctx, s.storeLimit)
 	began, begun, err := s.store.BeginGroupCreate(writing, attempt, key, req.Subject, time.Now())
 	expired := writing.Err()

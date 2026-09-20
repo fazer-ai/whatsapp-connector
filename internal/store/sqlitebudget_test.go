@@ -11,6 +11,7 @@ import (
 	"go/token"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -747,4 +748,66 @@ func TestAnOperatorsOwnSpellingOfBusyTimeoutIsNotReadAsZero(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The slack's own documentation names its value, and this is what keeps the two together.
+//
+// Both comments that talk about the overrun -- this constant's and the one over
+// `group.create`'s two writes -- carry numbers derived from it: how long a contended call
+// takes, what share of a five second ceiling it is. Change the constant and those numbers
+// are wrong, silently, in a file nobody re-reads. #302 exists because exactly that had
+// already happened to one sentence, and prose is where this repository keeps the reasons,
+// so prose going stale is not a cosmetic failure.
+func TestTheSlacksDocumentationNamesItsValue(t *testing.T) {
+	t.Parallel()
+
+	// "the slack is 50ms" and not the bare "50ms": the same comment lists the four slacks
+	// the tie was measured at, 50ms among them, so a looser match is satisfied by a
+	// sentence about the measurement rather than by one about the value.
+	doc := docOf(t, "budgetSlack")
+	written := "the slack is " + strconv.FormatInt(budgetSlack.Milliseconds(), 10) + "ms"
+	if !strings.Contains(doc, written) {
+		t.Errorf("budgetSlack's documentation does not say %q, so the durations it and "+
+			"group.go quote are about some other value: %q", written, doc)
+	}
+}
+
+// docOf returns the doc comment of a package-level constant or variable, by name.
+func docOf(t *testing.T, name string) string {
+	t.Helper()
+
+	fset := token.NewFileSet()
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read the package directory: %v", err)
+	}
+	for _, entry := range entries {
+		file := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(file, ".go") || strings.HasSuffix(file, "_test.go") {
+			continue
+		}
+		parsed, err := parser.ParseFile(fset, file, nil, parser.ParseComments|parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("parse %s: %v", file, err)
+		}
+		for _, decl := range parsed.Decls {
+			gen, ok := decl.(*ast.GenDecl)
+			if !ok || gen.Doc == nil {
+				continue
+			}
+			for _, spec := range gen.Specs {
+				value, ok := spec.(*ast.ValueSpec)
+				if !ok {
+					continue
+				}
+				for _, ident := range value.Names {
+					if ident.Name == name {
+						return gen.Doc.Text()
+					}
+				}
+			}
+		}
+	}
+	t.Fatalf("no package-level %s with a doc comment, so this fence is measuring nothing", name)
+	return ""
 }
