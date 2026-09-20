@@ -111,8 +111,31 @@ tidy: ## Fail when go.mod/go.sum are not tidy
 # It refuses SQLite on purpose. Two processes do not share an SQLite file, and the fencing
 # operational invariant 1 promises lives in the store, so a run against SQLite would be two
 # connectors on two databases calling themselves a fleet.
-bench-fleet: ## Fleet bench with WAC_ENGINE=fake: 2+ connector processes on real PostgreSQL and Redis, invariants under an ownership change. Minutes, not seconds, so it is outside `check`. Does NOT cover whatsmeow under handover (needs a real account). Needs WAC_TEST_DATABASE_URL and WAC_TEST_REDIS_URL
-	$(GO) run ./cmd/fleetbench $(BENCH_FLAGS)
+# The bench answers in four exit codes, and two layers would swallow them.
+#
+# MEASURED: `go run` reports any non-zero status as 1 of its own (a program exiting 3 comes
+# back as 1, with `exit status 3` on stderr), and `make` exits 2 for any recipe that fails,
+# whatever the recipe's own code was. Read through both, a broken invariant, a measurement
+# outside its range and a machine that was not ready are one number -- which is exactly
+# what having three codes exists to prevent.
+#
+# The `go run` layer is removable and is removed here: the target builds the binary and
+# runs it, so the recipe sees the real code and names it. The `make` layer is not: GNU make
+# exits 2 on any failure by design. So a script reads the binary, and the line below says
+# so and prints the code it got.
+BENCH_BIN ?= $(CURDIR)/bin/fleetbench
+
+bench-fleet: ## Fleet bench with WAC_ENGINE=fake: 2+ connector processes on real PostgreSQL and Redis, invariants under an ownership change. Minutes, not seconds, so it is outside `check`. Does NOT cover whatsmeow under handover (needs a real account). Needs WAC_TEST_DATABASE_URL and WAC_TEST_REDIS_URL. A script wanting the four exit codes apart runs bin/fleetbench: make reports any failure as 2
+	@mkdir -p $(dir $(BENCH_BIN))
+	@$(GO) build -o $(BENCH_BIN) ./cmd/fleetbench
+	@$(BENCH_BIN) $(BENCH_FLAGS); code=$$?; \
+	  if [ $$code -ne 0 ]; then \
+	    echo ""; \
+	    echo "a bancada saiu com o codigo $$code (1 invariante quebrada, 2 setup incompleto, 3 medida fora da faixa)."; \
+	    echo "make responde 2 para qualquer receita que falhe, seja qual for o codigo dela: um script que"; \
+	    echo "precise dos tres separados roda $(BENCH_BIN) direto."; \
+	  fi; \
+	  exit $$code
 
 # Everything CI enforces, and it fails when it cannot run all of it.
 #

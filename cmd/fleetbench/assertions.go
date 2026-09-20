@@ -164,8 +164,20 @@ func assertOneOwner(rep *report, published map[string][]protocol.Event,
 			"dupla. O mais alto foi %s", len(above), sids, top))
 	}
 
+	// The half this claim does not reach, said out loud rather than left to the label.
+	//
+	// Invariant 1 fences two things when a lease moves: publishing and writing to the
+	// store. The streams show the first, because an event carries the instance that wrote
+	// it. They cannot show the second: MEASURED, no table of the store carries an instance
+	// or an epoch in a column, so a row written by an instance that had already lost the
+	// lease is indistinguishable, after the fact, from one the new owner wrote.
+	rep.note("metade do store da invariante 1 (escrita fencida depois de perder a lease): NAO MEDIDA. " +
+		"Nenhuma tabela do store carrega instancia ou epoch em coluna, entao uma linha escrita por quem " +
+		"ja perdeu a lease nao se distingue, depois do fato, de uma escrita pelo dono novo. O que esta " +
+		"afirmado abaixo e a metade que publica, que os streams mostram porque o evento carrega o inst.")
+
 	rep.assert(&assertion{
-		invariant: "1 (uma instancia dona da sessao por vez, arbitrada pela lease; perder a lease cerca a sessao na hora)",
+		invariant: "1 (uma instancia dona da sessao por vez, arbitrada pela lease; perder a lease cerca a publicacao na hora; a metade do store fica sem medida, ver notas)",
 		claim: "nunca duas instancias com a mesma lease: um epoch, um publicador; nenhum evento de " +
 			"epoch velho depois de um novo no mesmo stream; e a frota somada nunca roda mais sessoes do que existem sids",
 		series: fmt.Sprintf("%d pares (sid, epoch) sobre %d sessoes, %d eventos lidos na ordem do stream deles, "+

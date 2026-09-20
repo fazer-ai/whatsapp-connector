@@ -256,6 +256,28 @@ WhatsApp account. So a green run says the fleet's own machinery holds across pro
 it does not say whether a real socket, a real pairing and a real message survive an
 ownership change. That half has no measurement here.
 
+It answers in four exit codes, because a script reads the code and not the prose:
+
+| code | outcome | what it means |
+|---|---|---|
+| 0 | `VERDE` | every assertion held |
+| 1 | `INVARIANTE QUEBRADA` | an operational invariant is broken: a defect |
+| 2 | `SETUP INCOMPLETO` | the machine was not ready: not a defect, and not a pass |
+| 3 | `MEDIDA FORA DA FAIXA` | a measurement fell outside a range somebody declared |
+
+One code for all of them is what turns a bad capacity number into a rejection and a broken
+invariant into "that number again", so they are kept apart on purpose. **`make` cannot keep
+them apart**: GNU make exits 2 for any failing recipe, whatever the recipe's own code was.
+A script that needs the three failures told apart runs the binary the target builds:
+
+```bash
+go build -o bin/fleetbench ./cmd/fleetbench
+WAC_TEST_DATABASE_URL=… WAC_TEST_REDIS_URL=… bin/fleetbench; echo $?
+```
+
+`make bench-fleet` prints the code it got before it exits, so a human reading the output
+still sees which of the three it was.
+
 It is deliberately outside `make check`: it builds a binary, starts processes and waits on
 real clocks, which is minutes rather than the seconds `check` is allowed on every change.
 The exemption is recorded in `internal/toolchain`, where the suite reads it.

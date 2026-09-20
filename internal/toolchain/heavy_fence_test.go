@@ -67,6 +67,38 @@ func TestEveryDeliberateExemptionStillDescribesTheMakefile(t *testing.T) {
 	}
 }
 
+// A target whose exit code is part of its contract cannot be run through `go run`.
+//
+// MEASURED on go1.24/darwin: a program that exits 3 comes back from `go run` as 1, with
+// `exit status 3` printed on stderr. The fleet bench answers in four codes on purpose --
+// 0 green, 1 a broken invariant, 2 a machine that was not ready, 3 a measurement outside
+// its range -- and one of the scenarios this repository is held to fails outright if a
+// reader of a script cannot tell them apart. Read through `go run`, all three failures are
+// the number 1.
+//
+// `make` collapses further, to 2, and that one is not removable: GNU make exits 2 for any
+// failing recipe by design. What the target can do is stop adding a layer of its own and
+// say what the remaining one does, which is what it does.
+func TestTheBenchTargetDoesNotRunThroughGoRun(t *testing.T) {
+	t.Parallel()
+
+	// Through the parser the fence beside this one uses, and not a second one of its own:
+	// two readers of one Makefile are two answers, and the day they disagreed the
+	// disagreement would be silent.
+	recipe, _ := recipeOf(t, "bench-fleet")
+	if strings.TrimSpace(recipe) == "" {
+		t.Fatal("the Makefile has no bench-fleet recipe, so this fence read nothing")
+	}
+	if strings.Contains(recipe, "go run") || strings.Contains(recipe, "$(GO) run") {
+		t.Errorf("bench-fleet runs the bench through `go run`, which reports every non-zero "+
+			"status as 1 of its own. The bench's three failure codes then arrive as one number:\n%s", recipe)
+	}
+	if !strings.Contains(recipe, "exit $$code") {
+		t.Errorf("bench-fleet does not hand the bench's own exit code back. The three outcomes are "+
+			"distinguishable only if the code survives the recipe:\n%s", recipe)
+	}
+}
+
 // reachableFromCheck answers what `make check` pulls in, reading the Makefile the way make
 // does, through the same parser the other direction uses: two parsers would be two answers
 // about one file, and the day they disagreed the disagreement would be silent.
