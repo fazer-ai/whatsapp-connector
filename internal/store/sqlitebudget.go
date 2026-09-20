@@ -70,8 +70,9 @@ func (c budgetedConnector) Connect(ctx context.Context) (driver.Conn, error) {
 // It is also the amount by which a contended call overruns the ceiling its caller
 // declared, once per call, because the busy handler is what ends the wait and the context
 // is only what names the error: 363..368ms over six runs against a three hundred
-// millisecond ceiling. A caller that sets seconds will not notice; a test that sets three
-// hundred milliseconds and asserts on the ceiling has to.
+// millisecond ceiling, because the slack is 50ms and the round trip is the rest. A caller
+// that sets seconds will not notice; a test that sets three hundred milliseconds and
+// asserts on the ceiling has to.
 //
 // What holds that is `TestTheBudgetOnTheConnectionIsTheCallersTimePlusTheSlack`, which
 // reads the number off the connection, and not an assertion on how long a call took: a
