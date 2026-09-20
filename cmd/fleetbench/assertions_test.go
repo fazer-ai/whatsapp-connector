@@ -1521,7 +1521,13 @@ func TestTheIdempotencyScopeNamesWhatItLeftOut(t *testing.T) {
 	t.Parallel()
 
 	said := idempotencyScope(16, 40, 240, 34880)
-	for _, half := range []string{"16 comandos", "40 pedidos em par", "240 comandos", "34880 da carga continua"} {
+	for _, half := range []string{
+		// The two it read, each with its number.
+		"os 16 comandos", "os 40 pedidos em par",
+		// The two it did not, each with its number AND the words that say they are out:
+		// without them the same numbers read as a longer list of what was covered.
+		"Os 240 comandos", "os 34880 da carga continua ficam de fora",
+	} {
 		if !strings.Contains(said, half) {
 			t.Errorf("a nota nao diz %q:\n%s", half, said)
 		}
