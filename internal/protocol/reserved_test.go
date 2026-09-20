@@ -101,7 +101,6 @@ func TestTheContractNamesEveryCommandItReserves(t *testing.T) {
 		protocol.CommandGroupSettingsSet:        "a group's name, description, photo or settings",
 		protocol.CommandGroupInviteGet:          "an invite link rotated",
 		protocol.CommandPresenceSet:             "a presence",
-		protocol.CommandPairingRequestCode:      "a request for a pairing code",
 	}
 	prose := readContract(t)
 

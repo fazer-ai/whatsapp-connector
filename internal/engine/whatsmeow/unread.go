@@ -11,6 +11,7 @@ import (
 	waCommon "go.mau.fi/whatsmeow/proto/waCommon"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/fazer-ai/whatsapp-connector/internal/engine"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 )
 
@@ -116,5 +117,5 @@ func appStateFailure(err error, subject string) error {
 
 // sendAppStateOverClient is the default for the seam below.
 func sendAppStateOverClient(ctx context.Context, client *wm.Client, patch appstate.PatchInfo) error {
-	return client.SendAppState(ctx, patch) //nolint:wrapcheck // classified by its caller
+	return engine.MayHaveLanded(client.SendAppState(ctx, patch)) //nolint:wrapcheck // classified by its caller
 }

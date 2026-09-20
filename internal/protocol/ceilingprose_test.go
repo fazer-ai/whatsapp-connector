@@ -268,9 +268,15 @@ func TestTheContractSaysWhatBoundsACommandWithNoCeilingOfItsOwn(t *testing.T) {
 			"it is the obligation this half of the contract exists to put on a client, and the " +
 				"one thing about #282 a client has to change its behaviour for: the same key " +
 				"stops being a way to force the work to happen"},
-		{"which failures still leave no record", "certain never reached WhatsApp",
+		{"which failures still leave no record", "left nothing standing there",
 			"without it the paragraph above reads as every failure being unrepeatable, which " +
 				"would strand a send whose upload crashed before anything went out"},
+		{"that it is the write, not the failure's wording, that holds the key",
+			"Only a write that may have reached WhatsApp holds the key",
+			"it is the rule the connector actually implements: the attempt is released " +
+				"unless the write it failed on may have landed, and a client that reads the " +
+				"exception list instead of the rule will expect a retry to run wherever the " +
+				"listed cases do not obviously apply"},
 		{"what the identifier does buy", "after the first attempt *succeeded*",
 			"the narrow thing it is actually good for, which is a redelivery after a success"},
 		{"which commands those are", "a participant added or removed, a join request answered",

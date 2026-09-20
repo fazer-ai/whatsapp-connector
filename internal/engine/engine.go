@@ -20,40 +20,41 @@ import (
 // reported to the client as protocol.ErrorUnsupported.
 var ErrNotSupported = errors.New("engine: command not supported")
 
-// ErrNeverSent marks a refusal the engine is certain about: nothing was written to
-// WhatsApp, so the account is exactly as it was and the caller's retry does the whole
-// thing rather than the half that is left.
+// ErrMayHaveLanded marks a failure that happened with a write already on its way to
+// WhatsApp, so what the command was about may have happened and nothing here will ever say
+// whether it did.
 //
-// It is wrapped underneath whatever the client is told rather than replacing it. The two
-// answer different questions and only one of them is the client's: `not_connected` and
-// `not_paired` send a client down different roads, and both of them mean "nothing went
-// out" to the layer that has to decide whether a redelivery may run the command again.
-// Without this mark that layer cannot tell a pre-flight refusal from a socket that died
-// with the frame already written, because they arrive as the same code (#282).
+// The mark goes on the failure and not on its absence, and that asymmetry is the whole
+// design. The layer above keeps a command's idempotency record standing only for a failure
+// carrying this, and releases every other one. A mark forgotten therefore costs a
+// redelivery that carries the work out again, which is what this connector did before #282
+// and what the receiving side has always had to tolerate; a mark put where it does not
+// belong costs a command that can never run again under its key -- a device left linked, a
+// message that never goes out -- with nothing to say why. Four review rounds of #282 found
+// five of that second kind under the opposite default, each in a different family, which is
+// what a design that has to be complete before it is safe looks like from the inside.
 //
-// Only where the engine is certain. A refusal that shares a branch with a request that
-// went out and lost its answer is not one of these, and marking it would turn "nobody
-// knows" into "nothing happened", which is the one direction this must never get wrong.
-var ErrNeverSent = errors.New("engine: nothing was sent to WhatsApp")
+// So it belongs at the call that writes, and nowhere earlier. A lookup before the write, a
+// privacy setting that could not be read, a lock that timed out: none of those reached
+// WhatsApp, and none of them carries this.
+var ErrMayHaveLanded = errors.New("engine: the write may already have reached WhatsApp")
 
-// NeverSent marks an error as one of those without changing a character of what it says.
-//
-// The message belongs to the client and the mark belongs to the ledger, and joining them
-// with %w would put "nothing was sent to WhatsApp" into the text of a failure that is about
-// a disk this instance could not write -- which is exactly the confusion
-// `TestADiskThisInstanceCouldNotWriteIsNotWhatsAppRefusingTheFile` exists to stop.
-func NeverSent(err error) error {
+// MayHaveLanded marks an error as one of those without changing a character of what it
+// says. The message belongs to the client and the mark belongs to the ledger, and joining
+// them with %w would put "may already have reached WhatsApp" into the text of a failure
+// that is about a disk this instance could not write.
+func MayHaveLanded(err error) error {
 	if err == nil {
 		return nil
 	}
-	return neverSent{err}
+	return mayHaveLanded{err}
 }
 
-type neverSent struct{ error }
+type mayHaveLanded struct{ error }
 
-func (n neverSent) Is(target error) bool { return target == ErrNeverSent }
+func (m mayHaveLanded) Is(target error) bool { return target == ErrMayHaveLanded }
 
-func (n neverSent) Unwrap() error { return n.error }
+func (m mayHaveLanded) Unwrap() error { return m.error }
 
 // Emission is one thing the engine has to tell the client about. The engine names the
 // type and renders the payload; stamping it (id, epoch, seq, instance) belongs to the

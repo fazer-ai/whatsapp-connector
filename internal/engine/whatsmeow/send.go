@@ -13,7 +13,6 @@ import (
 	waTypes "go.mau.fi/whatsmeow/types"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/fazer-ai/whatsapp-connector/internal/engine"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 )
 
@@ -101,13 +100,7 @@ func (s *Session) send(ctx context.Context, command *protocol.Command) (json.Raw
 		building, cancel := context.WithTimeout(ctx, s.uploadWait)
 		defer cancel()
 		if message, err = s.mediaToSend(building, plan, alongside); err != nil {
-			// Nothing about the message was written to WhatsApp: the file could not be
-			// fetched, or its upload did not finish, and `putOnTheWire` below is the only
-			// thing that creates one. So the caller's retry does the whole thing rather
-			// than being answered from an attempt nobody can speak for -- which is the
-			// objection that kept a reservation out of the ledger until #282, and the one
-			// case it would have got wrong.
-			return nil, engine.NeverSent(err)
+			return nil, err
 		}
 	}
 
@@ -132,8 +125,7 @@ func (s *Session) readyToSend() error {
 		// other waits for a connection to come back. Answering `not_connected` to a
 		// session that has no account leaves it waiting for something nothing is going
 		// to do.
-		return engine.NeverSent(
-			protocol.NewError(protocol.ErrorNotPaired, "this session has no WhatsApp account to send from"))
+		return protocol.NewError(protocol.ErrorNotPaired, "this session has no WhatsApp account to send from")
 	}
 	if s.state() != "open" {
 		// The session's own state, not whatsmeow's. IsConnected takes the socket lock,
@@ -142,8 +134,7 @@ func (s *Session) readyToSend() error {
 		// session's queue behind it. It also goes true when the websocket opens and
 		// before the account is authenticated, which is a send onto a stream WhatsApp
 		// has not accepted yet.
-		return engine.NeverSent(
-			protocol.NewError(protocol.ErrorNotConnected, "the session is not connected to WhatsApp"))
+		return protocol.NewError(protocol.ErrorNotConnected, "the session is not connected to WhatsApp")
 	}
 	return nil
 }

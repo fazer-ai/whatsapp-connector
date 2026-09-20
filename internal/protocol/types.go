@@ -325,6 +325,11 @@ var RepeatableCommands = map[CommandType]bool{
 //     costs nothing, because an account that is already unlinked has nothing to unlink.
 //   - Everything transient: a typing indicator, a call rejection, a history request. What
 //     repeating them costs is nothing, or one more request.
+//   - `pairing.request_code`, although repeating it does cost something -- a second code
+//     invalidates the one the operator is typing. Its write is the pairing conversation
+//     itself rather than one library call, so there is nowhere to mark a failure as having
+//     reached WhatsApp, and an attempt that nothing can ever keep standing is a record that
+//     does nothing. Worth revisiting if that path grows a point of no return to mark.
 var ReservedCommands = map[CommandType]bool{
 	CommandPresenceSet:             true,
 	CommandMessageMarkRead:         true,
@@ -336,7 +341,6 @@ var ReservedCommands = map[CommandType]bool{
 	CommandGroupPhotoSet:           true,
 	CommandGroupSettingsSet:        true,
 	CommandGroupInviteGet:          true,
-	CommandPairingRequestCode:      true,
 }
 
 // messageIDKeyed are the commands whose `message_id` names the message the command

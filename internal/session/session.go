@@ -1139,12 +1139,16 @@ func (s *Session) carryOut(ctx context.Context, command *protocol.Command) (resu
 	defer releaseBound()
 
 	result, err = s.lifecycle(execCtx, command)
-	if err != nil && neverReachedWhatsApp(err) && key != "" && s.ledger != nil {
-		// Certain that nothing was written, so the attempt comes back off and the retry
-		// does the whole thing rather than being refused for ever. This is the half of
-		// the old argument against reserving that still holds: without it a media upload
-		// that crashed before the send would answer `not_settled` for a message that
-		// provably never went out.
+	if err != nil && !keepsTheAttempt(err) && key != "" && s.ledger != nil {
+		// The attempt stands only for a failure the engine marked as having a write
+		// already on its way. Everything else comes back off, so the retry does the whole
+		// thing rather than being refused for ever.
+		//
+		// This way round on purpose. A mark forgotten upstream costs a redelivery that
+		// carries the work out again, which is what this did before #282; the opposite
+		// default -- keep unless something says otherwise -- costs a command that can
+		// never run again under its key, and four rounds of review found five of those,
+		// each in a different family. `engine.ErrMayHaveLanded` says why at more length.
 		s.release(ctx, command, key)
 	}
 	if err == nil && key != "" && s.ledger != nil {
@@ -1345,37 +1349,14 @@ func (s *Session) alreadyDid(ctx context.Context, key string) (result json.RawMe
 	return nil, false, attempted, nil
 }
 
-// neverReachedWhatsApp reports whether a failure is one the connector can be certain left
-// the account untouched, so that the attempt it was carried out under comes back off.
+// keepsTheAttempt reports whether a failure leaves the command's attempt on record, so
+// that a redelivery is answered rather than carried out again.
 //
-// Certainty and not likelihood. Getting this wrong in the permissive direction undoes the
-// whole of #282: a command whose effect landed would have its attempt released and be
-// carried out a second time by the next delivery.
-//
-// Three things count. The engine's own mark, which it puts only where it refused before the
-// socket and which exists because `not_connected` says both "never started" and "died with
-// the frame already written". `not_attempted`, which is the contract's word for this and
-// nothing else -- "the connector knows the command never left this process" -- so an engine
-// answering it is already asserting what this asks; the teardowns are where it is produced,
-// and a `session.logout` refused that way leaves a device still linked that the retry has to
-// be able to unlink. And the two refusals that cannot have reached a socket by construction:
-// a command this engine does not implement, and one whose payload would not decode into
-// anything to send.
-//
-// `not_attempted` is read here rather than having its producer carry the mark as well. Two
-// mechanisms for one fact are two that mask each other, and neither can then be shown to
-// matter on its own.
-func neverReachedWhatsApp(err error) bool {
-	if errors.Is(err, engine.ErrNeverSent) {
-		return true
-	}
-	switch asProtocolError(err).Code {
-	case protocol.ErrorNotAttempted, protocol.ErrorUnsupported, protocol.ErrorInvalidPayload:
-		return true
-	default:
-		return false
-	}
-}
+// The engine's mark and nothing else. A failure that reached nothing -- a lookup before the
+// write, a privacy setting that could not be read, a socket that was never open -- releases
+// the attempt, because the retry has the whole thing to do. `engine.ErrMayHaveLanded` says
+// why the default is this way round rather than the other.
+func keepsTheAttempt(err error) bool { return errors.Is(err, engine.ErrMayHaveLanded) }
 
 // idempotencyKey is what a command is remembered under, and the empty string for one
 // that names nothing to be remembered by.

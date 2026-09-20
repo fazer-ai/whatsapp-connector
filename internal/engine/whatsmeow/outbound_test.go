@@ -1853,14 +1853,13 @@ func TestADiskThisInstanceCouldNotWriteIsNotWhatsAppRefusingTheFile(t *testing.T
 	if strings.Contains(err.Error(), "WhatsApp") {
 		t.Fatalf("a disk of this instance's own was reported as WhatsApp: %v", err)
 	}
-	// And nothing was sent, which is a separate fact and the one the idempotency ledger
-	// reads: the staging failed before `putOnTheWire`, so no message exists and the
-	// caller's retry under the same id has to do the whole thing rather than be answered
-	// from an attempt nobody can speak for (#282).
-	if !errors.Is(err, engine.ErrNeverSent) {
-		t.Errorf("a send that failed while staging the file does not say nothing was sent, "+
-			"so a retry under the same message_id would be refused for as long as the "+
-			"attempt lived: %v", err)
+	// And it is not marked as a write that may have landed, which is the separate fact the
+	// idempotency ledger reads: the staging failed before `putOnTheWire`, so no message
+	// exists and the caller's retry under the same id has the whole thing to do (#282).
+	if errors.Is(err, engine.ErrMayHaveLanded) {
+		t.Errorf("a send that failed while staging the file is marked as a write that may "+
+			"have landed, so a retry under the same message_id would be refused for as long "+
+			"as the attempt lived: %v", err)
 	}
 }
 

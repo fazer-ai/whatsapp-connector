@@ -166,7 +166,10 @@ func TestAnAttemptNobodyCanSpeakForIsAnsweredRatherThanCarriedOutAgain(t *testin
 
 	eng := newLandedEngine(func(effects *atomic.Int64) (json.RawMessage, error) {
 		effects.Add(1) // the participant was added at WhatsApp
-		return nil, protocol.NewError(protocol.ErrorNotConnected, "the socket died after the write")
+		// Marked, because the write was already on its way when the socket went: that is
+		// the one thing the engine knows and the code alone cannot say.
+		return nil, engine.MayHaveLanded(
+			protocol.NewError(protocol.ErrorNotConnected, "the socket died after the write"))
 	})
 	rec := newReplies()
 	manager := instanceOn(t, "inst-a", rdb, eng, rec, storetest.New(t).URL)
@@ -206,7 +209,8 @@ func TestAnAttemptIsVisibleToTheInstanceThatTakesTheSessionOver(t *testing.T) {
 
 	landed := func(effects *atomic.Int64) (json.RawMessage, error) {
 		effects.Add(1)
-		return nil, protocol.NewError(protocol.ErrorNotConnected, "the socket died after the write")
+		return nil, engine.MayHaveLanded(
+			protocol.NewError(protocol.ErrorNotConnected, "the socket died after the write"))
 	}
 	engA, engB := newLandedEngine(landed), newLandedEngine(landed)
 	recA, recB := newReplies(), newReplies()
@@ -252,8 +256,8 @@ func TestACommandRefusedBeforeItReachedWhatsAppIsCarriedOutOnTheRetry(t *testing
 	refuse.Store(true)
 	eng := newLandedEngine(func(effects *atomic.Int64) (json.RawMessage, error) {
 		if refuse.Load() {
-			// The shape of a pre-flight refusal: nothing was written, and the engine says
-			// so underneath whatever the client is told.
+			// A pre-flight refusal: nothing was written, so it carries no mark and the
+			// attempt comes back off.
 			return nil, fakeRefusal()
 		}
 		effects.Add(1)

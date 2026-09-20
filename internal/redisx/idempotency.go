@@ -46,12 +46,15 @@ const DefaultIdempotencyTTL = 24 * time.Hour
 // is not known, and a client reads the state back rather than being told a lie in either
 // direction.
 //
-// The half that still holds is why Release exists. A refusal the connector is certain
-// about -- the pre-flight that never reached the socket -- takes the attempt back off, so
-// the retry does the whole thing rather than being refused for ever. Without it this would
-// refuse a retry after a crash during a media upload, where the message provably never went
-// out and a resend gets it right, which is the objection that kept the reservation out
-// until #282 measured the other side of it.
+// The half that still holds is why Release exists, and it is why the caller releases by
+// default. A failure takes the attempt back off unless the write that failed may have
+// reached WhatsApp, so the retry does the whole thing rather than being refused for ever.
+// The direction matters more than it looks: written the other way round -- hold the attempt
+// unless the failure is known to be harmless -- every failure path somebody forgets to
+// classify strands the command, and four rounds of review found five of them, one at a
+// time, each stranding a device or a message with no way back. This way round a forgotten
+// classification costs a duplicate the receiving side already tolerates, which is the
+// behaviour of every release before #282.
 //
 // For a send the old cover is still there and still worth having. WhatsApp delivers a
 // resend under an id it has already seen in full, with no window at all -- measured from
@@ -138,7 +141,7 @@ func (i *Idempotency) Reserve(ctx context.Context, sid, key string) error {
 	return nil
 }
 
-// Release takes an attempt back off, for a command the connector is certain never reached
+// Release takes an attempt back off, for a failure that did not leave a write standing at
 // WhatsApp. What is left is a key nobody has heard of, which is what it was before.
 func (i *Idempotency) Release(ctx context.Context, sid, key string) error {
 	if err := i.client.Del(ctx, i.client.Keys().Attempt(sid, key)).Err(); err != nil {
