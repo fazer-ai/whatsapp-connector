@@ -723,7 +723,10 @@ func assertNoDuplicateEffect(rep *report, answers map[string][]string, pairs []i
 	}
 	rep.assert(&assertion{
 		invariant: "5 (comandos idempotentes por message_id: uma reentrega nao duplica efeito)",
-		claim:     "nenhum efeito colateral duplicado: nem resposta que discorda de si mesma, nem message_id repetido que saiu de novo",
+		claim: "nenhum efeito colateral duplicado NOS LOTES LIDOS (os comandos em voo na troca de " +
+			"dono e os pedidos em par): nem resposta que discorda de si mesma, nem message_id " +
+			"repetido que saiu de novo. A carga continua e o lote do dono congelado ficam de fora, " +
+			"ver notas",
 		series: fmt.Sprintf("%d comandos com resposta, dos quais %d responderam mais de uma vez "+
 			"(%d com alguma tentativa que falhou antes, que a idempotencia nao lembra por decisao); "+
 			"e %d mensagens pedidas duas vezes, a maior folga entre os dois pedidos sendo %s",

@@ -204,7 +204,20 @@ func handover(ctx context.Context, active *run, group *fleet, cl *client, rep *r
 
 	// Stopped before anything is read, so nothing is still writing to a stream the
 	// assertions are about to walk.
-	rep.measure("troca de dono sob carga", "comandos da carga continua", float64(steady.end()), "comandos")
+	loaded := steady.end()
+	rep.measure("troca de dono sob carga", "comandos da carga continua", float64(loaded), "comandos")
+
+	// What the idempotency reading does NOT cover, said with the numbers rather than left
+	// for a reader to infer from a series of sixteen over a run of thousands.
+	//
+	// Two batches are probes, placed on purpose: the commands put in flight across the
+	// handover, whose replies are read the moment the phase ends, and the paired sends of
+	// phase 1, which ask for the same message twice and are judged by the timestamp the
+	// engine puts on a send it really makes. Everything else is load, and its replies are
+	// gone: a reply list carries a TTL of `redisstream.DefaultReplyTTL` and the frozen
+	// phase alone outlasts it, so a second answer that existed is no longer there to be
+	// compared against the first.
+	rep.note(idempotencyScope(len(inFlight), len(pairs), plan.sessions*plan.sends, loaded))
 
 	// Drained again, because the phase above put work in front of an instance that spent
 	// a minute frozen. A command a thawed owner is still finishing is ordinary work in
@@ -244,6 +257,26 @@ func handover(ctx context.Context, active *run, group *fleet, cl *client, rep *r
 
 	return assertInvariants(ctx, cl, rep, plan, answers, sids, pairs, counted, fence,
 		stillWorking, expired, stillPublishing)
+}
+
+// idempotencyScope says, with the numbers, which commands the idempotency reading covered
+// and which it did not.
+//
+// Out of the phase so a test reaches it, and said at all because the claim's series is a
+// count of sixteen over a run of tens of thousands, and a reader who does not divide those
+// two numbers reads a verdict about the run. Two batches are probes placed on purpose: the
+// commands put in flight across the handover, whose replies are read the moment that phase
+// ends, and the paired sends of phase 1, which ask for the same message twice and are
+// judged by the timestamp the engine puts on a send it really makes. The rest is load, and
+// its answers are gone -- a reply list carries a TTL and the frozen phase alone outlasts
+// it, so a second answer that existed is no longer there to disagree with the first.
+func idempotencyScope(inFlight, pairs, frozen int, loaded int64) string {
+	return fmt.Sprintf("a leitura de idempotencia cobre dois lotes por desenho: os %d comandos postos "+
+		"em voo na troca de dono e os %d pedidos em par da fase 1. Os %d comandos postos na frente do "+
+		"dono congelado e os %d da carga continua ficam de fora, porque a lista de resposta expira em "+
+		"%s e a fase do congelado sozinha dura mais que isso. Um verde aqui nao diz que nenhum comando "+
+		"da carga continua duplicou efeito: diz que nenhum dos lotes lidos duplicou",
+		inFlight, pairs, frozen, loaded, redisstream.DefaultReplyTTL)
 }
 
 func shortSID(sid string) string {

@@ -68,6 +68,18 @@ func runBench(sessions, shards, processes, sends int, maxAdoption time.Duration,
 		return outcomeSetup, fmt.Errorf("%w: -shards is %d; with one shard a session cannot be seen on two, "+
 			"so the shard half of invariant 3 would pass by construction", errSetup, shards)
 	}
+	// The two sizes the run allocates from, checked beside the two it already checked.
+	// A negative one panics inside `make`, and it panics LATE: the connect phase and the
+	// mass adoption finish first, so the run has already created a database and three
+	// processes and given back neither. A setup error is what a bad flag is.
+	if sessions < 1 {
+		return outcomeSetup, fmt.Errorf("%w: -sessions is %d, and a fleet carrying no session "+
+			"measures nothing", errSetup, sessions)
+	}
+	if sends < 1 {
+		return outcomeSetup, fmt.Errorf("%w: -sends is %d, and the handover needs a command in "+
+			"flight to have anything to redeliver", errSetup, sends)
+	}
 
 	// Its own context, cancelled on the first interrupt, so that a run somebody stops by
 	// hand still gives back its database, its keys and its processes.

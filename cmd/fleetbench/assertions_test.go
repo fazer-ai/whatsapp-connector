@@ -10,6 +10,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
+	"github.com/fazer-ai/whatsapp-connector/internal/transport/redisstream"
 )
 
 // The assertions are predicates, and a predicate is cheapest to disprove by hand.
@@ -1450,5 +1451,86 @@ func TestTheOneOwnerReadingAnnotatesTheFenceClaim(t *testing.T) {
 				t.Errorf("a serie da cerca nao diz %q:\n%s", tc.says, fence.claim.series)
 			}
 		})
+	}
+}
+
+// A bad flag is a setup error, and it has to be one BEFORE the run costs anything.
+//
+// MEASURED: `-sessions=-1` and `-sends=-1` were accepted, and the panic came from inside
+// `make` two phases later -- after a database had been created, three processes started and
+// the mass adoption finished. Checked beside the two sizes that were already checked, the
+// run refuses on the flag and gives nothing back because it took nothing.
+func TestAWorkloadSizeIsRefusedBeforeTheRunCostsAnything(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		sessions, shards, processes, sends int
+		says                               string
+	}{
+		"menos de dois processos":   {sessions: 4, shards: 4, processes: 1, sends: 4, says: "-processes is 1"},
+		"um shard so":               {sessions: 4, shards: 1, processes: 3, sends: 4, says: "-shards is 1"},
+		"sessoes negativas":         {sessions: -1, shards: 4, processes: 3, sends: 4, says: "-sessions is -1"},
+		"nenhuma sessao":            {sessions: 0, shards: 4, processes: 3, sends: 4, says: "-sessions is 0"},
+		"comandos em voo negativos": {sessions: 4, shards: 4, processes: 3, sends: -1, says: "-sends is -1"},
+		"nenhum comando em voo":     {sessions: 4, shards: 4, processes: 3, sends: 0, says: "-sends is 0"},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			code, err := runBench(tc.sessions, tc.shards, tc.processes, tc.sends, 0, false)
+			if err == nil {
+				t.Fatalf("a corrida aceitou a combinacao e devolveu %v", code)
+			}
+			if !errors.Is(err, errSetup) {
+				t.Errorf("o erro nao e de setup: %v", err)
+			}
+			if code != outcomeSetup {
+				t.Errorf("o desfecho e %v, e uma flag ruim e setup incompleto", code)
+			}
+			if !strings.Contains(err.Error(), tc.says) {
+				t.Errorf("o erro nao nomeia a flag (%q):\n%v", tc.says, err)
+			}
+		})
+	}
+}
+
+// The idempotency claim reads two batches placed on purpose, and it used to be worded as if
+// it read the run. A run of thousands of commands with a series of sixteen says the number
+// to whoever reads the series; the claim is what whoever reads the verdict sees.
+func TestTheIdempotencyClaimNamesTheBatchesItRead(t *testing.T) {
+	t.Parallel()
+
+	rep := &report{}
+	assertNoDuplicateEffect(rep, map[string][]string{"c1": {`{"ok":true}`}}, nil, "")
+	claim := only(t, rep).claim
+	for _, half := range []string{"LOTES LIDOS", "carga continua", "ver notas"} {
+		if !strings.Contains(claim, half) {
+			t.Errorf("a afirmacao nao diz %q, entao ela promete a invariante 5 sobre a corrida "+
+				"inteira tendo lido dois lotes:\n%s", half, claim)
+		}
+	}
+}
+
+// The scope note has to name the batches AND the ones it left out, with their numbers.
+//
+// The idempotency claim's series is a count of the probes, and a run of tens of thousands
+// of commands with a series of sixteen reads as a verdict about the run to anyone who does
+// not divide the two. This is the sentence that does the dividing, so it is checked for
+// both halves and not only for the covered one.
+func TestTheIdempotencyScopeNamesWhatItLeftOut(t *testing.T) {
+	t.Parallel()
+
+	said := idempotencyScope(16, 40, 240, 34880)
+	for _, half := range []string{"16 comandos", "40 pedidos em par", "240 comandos", "34880 da carga continua"} {
+		if !strings.Contains(said, half) {
+			t.Errorf("a nota nao diz %q:\n%s", half, said)
+		}
+	}
+	if !strings.Contains(said, redisstream.DefaultReplyTTL.String()) {
+		t.Errorf("a nota nao diz por quanto tempo uma resposta sobrevive, que e a razao de o resto "+
+			"ficar de fora:\n%s", said)
+	}
+	if !strings.Contains(said, "nao diz que nenhum comando da carga continua duplicou efeito") {
+		t.Errorf("a nota diz o que foi lido e nao o que um verde deixa de significar:\n%s", said)
 	}
 }
