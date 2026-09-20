@@ -996,3 +996,43 @@ func TestFindingsWithoutGroupsStillCountAsMeasured(t *testing.T) {
 		t.Errorf("o desfecho saiu %s, e streams desta corrida que sumiram sao defeito, nao maquina", out.label())
 	}
 }
+
+// Work interrupted and load still arriving are different facts, and their sum answers
+// neither.
+func TestTheKillAftermathKeepsTheTwoHalvesApart(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		left        backlog
+		cut, unread float64
+		says        string
+	}{
+		"o dono morreu no meio do trabalho": {
+			left: backlog{pending: 10, lag: 1}, cut: 10, unread: 1,
+			says: "10 entradas seguiam ENTREGUES",
+		},
+		"o dono confirmou tudo antes de morrer": {
+			// The case the sum got wrong: a fast owner with the whole batch acknowledged,
+			// and a load that kept arriving. Summed, this reported five commands of
+			// interrupted work with an empty pending list.
+			left: backlog{pending: 0, lag: 5}, cut: 0, unread: 5,
+			says: "NAO interrompeu trabalho",
+		},
+		"nada pendente e nada atrasado": {
+			left: backlog{}, cut: 0, unread: 0,
+			says: "NAO interrompeu trabalho",
+		},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			cut, unread, note := killAftermath("bench-1-a", 16, tc.left)
+			if cut != tc.cut || unread != tc.unread {
+				t.Fatalf("cortado=%v nao lido=%v, queria %v e %v", cut, unread, tc.cut, tc.unread)
+			}
+			if !strings.Contains(note, tc.says) {
+				t.Errorf("a nota nao diz %q:\n%s", tc.says, note)
+			}
+		})
+	}
+}

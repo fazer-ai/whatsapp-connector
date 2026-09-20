@@ -97,28 +97,12 @@ func handover(ctx context.Context, active *run, group *fleet, cl *client, rep *r
 	if err != nil {
 		return fmt.Errorf("%w: %w", errSetup, err)
 	}
-	// The two halves, apart, because only one of them is work this kill interrupted.
+	cut, unread, aftermath := killAftermath(owner.name, len(inFlight), pending)
 	rep.measure("troca de dono sob carga", "comandos entregues e nao confirmados quando o dono morreu",
-		float64(pending.pending), "comandos")
+		cut, "comandos")
 	rep.measure("troca de dono sob carga", "comandos ainda nao lidos por ninguem nesse instante",
-		float64(pending.lag), "comandos")
-	if pending.pending == 0 {
-		rep.note(fmt.Sprintf("troca de dono: %s morta com SIGKILL, e logo depois nao havia entrada "+
-			"ENTREGUE e nao confirmada em grupo nenhum (havia %d ainda nao lidas por ninguem, que sao "+
-			"carga chegando e nao trabalho cortado). A troca aconteceu, mas ela NAO interrompeu "+
-			"trabalho: o que um par reivindica depois disso e nada, e a parte de reentrega desta fase "+
-			"fica sem medida. Aumentar -sends e o que fecha essa janela.", owner.name, pending.lag))
-	} else {
-		// The number is entries pending in the consumer groups: the batch of sends plus
-		// whatever the steady load had left there, which together is the work the kill cut
-		// off. Said that way because the old wording, "N of M commands still pending",
-		// invited the reading that the other M-N had been retired -- and nothing here
-		// measured that.
-		rep.note(fmt.Sprintf("troca de dono: %s morta com SIGKILL, e logo depois %d entradas seguiam "+
-			"ENTREGUES e nao confirmadas nos grupos consumidores, do lote de %d envios mais a carga "+
-			"continua. Esse e o trabalho que a morte cortou; as %d ainda nao lidas por ninguem ficam "+
-			"de fora dele, porque ninguem as comecou", owner.name, pending.pending, len(inFlight), pending.lag))
-	}
+		unread, "comandos")
+	rep.note(aftermath)
 
 	moved := 0
 	deadline := time.Now().Add(3 * time.Minute)
@@ -427,4 +411,30 @@ func streamMark(reads []shardRead) string {
 		fmt.Fprintf(&mark, "%s:%d:%s|", read.stream, read.length, read.lastID)
 	}
 	return mark.String()
+}
+
+// killAftermath turns what the consumer groups held right after the kill into the two
+// numbers the report carries and the note that says what they mean.
+//
+// The two halves stay apart because only one of them is work this kill interrupted.
+// `Pending` is an entry handed to a consumer that never acknowledged it, which after a
+// kill is what the dead owner was in the middle of; `lag` is an entry nobody has been
+// handed at all, which under a steady load is the load still arriving. Summed, a fast
+// owner that acknowledged its whole batch before dying would report "work interrupted"
+// made entirely of commands that showed up afterwards -- and the phase that follows,
+// which is about peers reclaiming what was cut off, would be described as exercised when
+// nothing was cut off at all.
+func killAftermath(owner string, sent int, left backlog) (cut, unread float64, note string) {
+	if left.pending == 0 {
+		return 0, float64(left.lag), fmt.Sprintf("troca de dono: %s morta com SIGKILL, e logo depois "+
+			"nao havia entrada ENTREGUE e nao confirmada em grupo nenhum (havia %d ainda nao lidas por "+
+			"ninguem, que sao carga chegando e nao trabalho cortado). A troca aconteceu, mas ela NAO "+
+			"interrompeu trabalho: o que um par reivindica depois disso e nada, e a parte de reentrega "+
+			"desta fase fica sem medida. Aumentar -sends e o que fecha essa janela.", owner, left.lag)
+	}
+	return float64(left.pending), float64(left.lag), fmt.Sprintf("troca de dono: %s morta com SIGKILL, "+
+		"e logo depois %d entradas seguiam ENTREGUES e nao confirmadas nos grupos consumidores, do "+
+		"lote de %d envios mais a carga continua. Esse e o trabalho que a morte cortou; as %d ainda "+
+		"nao lidas por ninguem ficam de fora dele, porque ninguem as comecou",
+		owner, left.pending, sent, left.lag)
 }
