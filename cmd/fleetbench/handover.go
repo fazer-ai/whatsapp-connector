@@ -187,11 +187,18 @@ func handover(ctx context.Context, active *run, group *fleet, cl *client, rep *r
 			return err
 		}
 	} else {
-		rep.note(fmt.Sprintf("fase do dono congelado: pulada, porque a corrida subiu %d processos e "+
-			"congelar o unico par deixaria a frota sem ninguem para assumir as sessoes dele. Sem ela, a "+
-			"metade da cerca da invariante 1 (perder a lease para a sessao na hora) fica SEM MEDIDA: "+
-			"um dono morto nao publica, entao nenhuma morte desta corrida pode quebra-la. Use "+
-			"-processes 3 ou mais.", plan.processes))
+		// Same shape as the phase's own empty result: an assertion with no series, so the
+		// run's exit code says the fence went unmeasured instead of a note saying it while
+		// the code says VERDE.
+		rep.assert(&assertion{
+			invariant: "1 (perder a lease cerca a sessao na hora: o dono que ficou sem ela para de publicar)",
+			claim:     "a cerca foi exercitada: um par assumiu sessao enquanto o dono seguia vivo e parado",
+			series:    "a fase que produz a cerca nao rodou",
+			points:    0,
+			notWhy: fmt.Sprintf("a corrida subiu %d processos, e congelar o unico par deixaria a frota "+
+				"sem ninguem para assumir as sessoes dele. Um dono morto nao publica, entao nenhuma morte "+
+				"desta corrida pode quebrar a cerca. Use -processes 3 ou mais", plan.processes),
+		})
 	}
 
 	// Stopped before anything is read, so nothing is still writing to a stream the
@@ -210,6 +217,26 @@ func handover(ctx context.Context, active *run, group *fleet, cl *client, rep *r
 		stillWorking = "o grupo consumidor nao drenou nos 60 s depois da fase do dono congelado, entao " +
 			"o que sobrou pendente e trabalho em curso de uma frota ocupada, e nao um buraco na entrega"
 		rep.note(stillWorking)
+	}
+
+	// Drained commands are not published events, and the assertions below walk the event
+	// streams.
+	//
+	// The two are independent: `Session.pump` publishes on its own schedule, not on the
+	// acknowledgement of the command that caused the work, and the fake engine buffers its
+	// receipt before that. So a fleet with empty consumer groups can still have events on
+	// the way, and reading the shards at that moment gives a sequence that is missing its
+	// tail -- which reads exactly like a lost event, or hides one. What ends this wait is
+	// the shards holding still, and a deadline that passes is said out loud rather than
+	// spent as a pass.
+	settled, err := waitForQuietStreams(ctx, cl, plan.shards, 30*time.Second)
+	if err != nil {
+		return fmt.Errorf("%w: %w", errSetup, err)
+	}
+	if !settled {
+		stillPublishing := "os shards de evento ainda cresciam quando o prazo de 30 s acabou, entao as " +
+			"assercoes sobre ordem e continuidade abaixo leem uma sequencia que pode estar sem a cauda"
+		rep.note(stillPublishing)
 	}
 
 	return assertInvariants(ctx, cl, rep, plan, answers, sids, pairs, counted, stillWorking, expired)
@@ -301,6 +328,42 @@ func waitForDrain(ctx context.Context, cl *client, peers []*instance, sids []str
 		case <-ctx.Done():
 			return false, reclaimed, passes, ctx.Err()
 		case <-time.After(500 * time.Millisecond):
+		}
+	}
+}
+
+// waitForQuietStreams waits until the event shards stop growing, and says whether they did.
+//
+// Still for three readings in a row rather than for one: a publisher between two events is
+// a stream that did not grow since the last look, and stopping there would be stopping in
+// the middle of exactly the burst this bench produces on purpose.
+func waitForQuietStreams(ctx context.Context, cl *client, shards int, within time.Duration) (bool, error) {
+	deadline := time.Now().Add(within)
+	last, still := int64(-1), 0
+	for {
+		total := int64(0)
+		for shard := range shards {
+			read, err := cl.eventsOn(ctx, shard)
+			if err != nil {
+				return false, err
+			}
+			total += read.length
+		}
+		if total == last {
+			still++
+			if still == 3 {
+				return true, nil
+			}
+		} else {
+			last, still = total, 0
+		}
+		if time.Now().After(deadline) {
+			return false, nil
+		}
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case <-time.After(time.Second):
 		}
 	}
 }

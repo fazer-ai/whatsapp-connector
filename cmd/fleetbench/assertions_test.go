@@ -684,3 +684,43 @@ func TestTheOutcomeNamesWhatWentUnmeasured(t *testing.T) {
 		t.Errorf("o desfecho nao nomeia a afirmacao que ficou sem medida:\n%s", out.String())
 	}
 }
+
+// The fence half of invariant 1 is claimed as an assertion with a series, so a run where
+// no peer adopted anything cannot end green over a fence it never reached.
+func TestTheFenceIsAClaimWithASeries(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		taken int
+		state string
+	}{
+		"um par assumiu com o dono parado": {2, "AFIRMADO"},
+		"ninguem assumiu":                  {0, "NAO MEDIDO"},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			rep := &report{}
+			rep.assert(&assertion{
+				invariant: "1",
+				claim:     "a cerca foi exercitada",
+				series:    "serie",
+				points:    tc.taken,
+				held:      tc.taken > 0,
+				notWhy:    ifEmpty(tc.taken, "nenhum par assumiu sessao nenhuma"),
+			})
+			if got := only(t, rep).state(); got != tc.state {
+				t.Fatalf("com %d adocoes o estado saiu %q, queria %q", tc.taken, got, tc.state)
+			}
+			// And the run's code follows the state, which is the whole point of claiming it
+			// instead of noting it.
+			want := outcomeGreen
+			if tc.taken == 0 {
+				want = outcomeSetup
+			}
+			if got := rep.outcome(); got != want {
+				t.Errorf("o desfecho saiu %s, queria %s", got.label(), want.label())
+			}
+		})
+	}
+}

@@ -82,7 +82,7 @@ func TestAKilledInstanceIsNeverSignalledAgain(t *testing.T) {
 
 	// A real process of this test's own, so the reaping is the real reaping and not a
 	// struct filled in by hand to agree with the code under test.
-	cmd := exec.Command("sleep", "60")
+	cmd := exec.CommandContext(t.Context(), "sleep", "60")
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("nao consegui subir o processo da prova: %v", err)

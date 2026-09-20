@@ -181,11 +181,28 @@ func frozenOwner(ctx context.Context, active *run, cl *client, rep *report, plan
 	rep.measure("dono congelado", "comandos postos na frente do dono antes do congelamento",
 		float64(sent), "comandos")
 
+	// The fence half is claimed as an assertion, with the adoptions as its series, and not
+	// only as a note.
+	//
+	// A note does not reach the outcome. With the phase producing nothing, the earlier
+	// phases still leave `assertOneOwner` enough events to hold, so the run would end VERDE
+	// over a fence it never reached -- which is precisely what a kill-only bench did before
+	// this phase existed, and what let the mutant that removes the fence come out green.
+	// As an assertion with an empty series it comes out NAO MEDIDO, and the run says so in
+	// its exit code.
+	rep.assert(&assertion{
+		invariant: "1 (perder a lease cerca a sessao na hora: o dono que ficou sem ela para de publicar)",
+		claim:     "a cerca foi exercitada: um par assumiu sessao enquanto o dono seguia vivo e parado",
+		series: fmt.Sprintf("%d sessoes assumidas pelos pares durante %s de congelamento de %s",
+			taken, hold.Round(time.Second), owner.name),
+		points: taken,
+		held:   taken > 0,
+		notWhy: ifEmpty(taken, fmt.Sprintf("%s ficou parada %s, mais que o WAC_LEASE_TTL de %s, e ainda "+
+			"assim nenhum par assumiu sessao nenhuma. Sem adocao, o que ela publicar ao voltar nao e "+
+			"publicacao sem posse, e nada nesta corrida pode quebrar a cerca",
+			owner.name, hold.Round(time.Second), benchLeaseTTL)),
+	})
 	if taken == 0 {
-		rep.note(fmt.Sprintf("fase do dono congelado: %s ficou parada %s, mais que o WAC_LEASE_TTL de %s, "+
-			"e ainda assim nenhum par assumiu sessao nenhuma. Entao o que ela publicar ao voltar "+
-			"nao e publicacao sem posse, e a metade da cerca da invariante 1 fica SEM MEDIDA nesta corrida.",
-			owner.name, hold.Round(time.Second), benchLeaseTTL))
 		return nil
 	}
 	rep.note(fmt.Sprintf("fase do dono congelado: %s ficou parada %s com %d comandos na frente dela; "+
