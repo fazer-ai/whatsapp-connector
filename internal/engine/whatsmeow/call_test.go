@@ -18,6 +18,7 @@ import (
 
 	"github.com/fazer-ai/whatsapp-connector/internal/engine"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
+	"github.com/fazer-ai/whatsapp-connector/internal/testwait"
 )
 
 const theCaller = "5511988887777"
@@ -93,7 +94,7 @@ func callMeta(callID string) waTypes.BasicCallMeta {
 func refusedWithin(t *testing.T, watched *refusals, want string) {
 	t.Helper()
 
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(testwait.Budget)
 	for time.Now().Before(deadline) {
 		if seen := watched.seen(); len(seen) > 0 {
 			if seen[0] != want {
@@ -101,7 +102,7 @@ func refusedWithin(t *testing.T, watched *refusals, want string) {
 			}
 			return
 		}
-		time.Sleep(time.Millisecond)
+		time.Sleep(testwait.Poll)
 	}
 	t.Fatalf("the call was never refused")
 }

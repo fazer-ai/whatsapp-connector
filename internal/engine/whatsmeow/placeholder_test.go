@@ -10,6 +10,7 @@ import (
 	wm "go.mau.fi/whatsmeow"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/store"
+	"github.com/fazer-ai/whatsapp-connector/internal/testwait"
 )
 
 // scheduledAt is the moment the first owner receives the unreadable message. Fixed, so
@@ -180,12 +181,12 @@ func placeholdersOf(t *testing.T, container *store.Container, sid string) []stor
 func waitForNoPlaceholders(t *testing.T, container *store.Container, sid string) {
 	t.Helper()
 
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(testwait.Budget)
 	for time.Now().Before(deadline) {
 		if len(placeholdersOf(t, container, sid)) == 0 {
 			return
 		}
-		time.Sleep(time.Millisecond)
+		time.Sleep(testwait.Poll)
 	}
 	t.Fatal("the row for a decided placeholder is still there, and the next owner would publish it again")
 }

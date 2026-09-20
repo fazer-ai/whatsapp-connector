@@ -25,6 +25,7 @@ import (
 	"github.com/fazer-ai/whatsapp-connector/internal/redisx"
 	"github.com/fazer-ai/whatsapp-connector/internal/redisx/redisxtest"
 	"github.com/fazer-ai/whatsapp-connector/internal/session"
+	"github.com/fazer-ai/whatsapp-connector/internal/testwait"
 	"github.com/fazer-ai/whatsapp-connector/internal/transport/redisstream"
 )
 
@@ -233,14 +234,30 @@ func startStoppable(t *testing.T, addr, instance string, env map[string]string) 
 	return connector, stop
 }
 
-func waitFor(t *testing.T, what string, cond func() bool) {
+// waitPast is waitFor for a condition a configured delay stands in front of: the delay is
+// the scenario's and the patience is `testwait.Budget`, which keeps the second half in the
+// one place every other helper reads it from.
+func waitPast(t *testing.T, delay time.Duration, what string, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
+
+	deadline := time.Now().Add(delay + testwait.Budget)
 	for time.Now().Before(deadline) {
 		if cond() {
 			return
 		}
-		time.Sleep(5 * time.Millisecond)
+		time.Sleep(testwait.Poll)
+	}
+	t.Fatalf("timed out waiting for %s, %s after the %s delay it waits out", what, testwait.Budget, delay)
+}
+
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(testwait.Budget)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(testwait.Poll)
 	}
 	t.Fatalf("timed out waiting for %s", what)
 }
@@ -428,8 +445,13 @@ func TestAWakeLeftPendingIsPickedUpAgain(t *testing.T) {
 	}
 
 	// A live instance now starts. A plain read will never show it this entry.
-	connector := start(t, server.Addr(), "inst-a", map[string]string{"WAC_LEASE_TTL": "7s", "WAC_CLAIM_MIN_IDLE": "7500ms"})
-	waitFor(t, "the pending wake to be reclaimed and acted on", func() bool {
+	const claimMinIdle = 7500 * time.Millisecond
+	connector := start(t, server.Addr(), "inst-a", map[string]string{"WAC_LEASE_TTL": "7s", "WAC_CLAIM_MIN_IDLE": claimMinIdle.String()})
+	// Past the reclaim delay and then the ordinary budget, because nothing can happen
+	// here until that delay is over: an entry is not reclaimable before it has been idle
+	// that long, so a plain wait would be asserting that the connector beats its own
+	// configuration.
+	waitPast(t, claimMinIdle, "the pending wake to be reclaimed and acted on", func() bool {
 		return connector.Sessions() == 1
 	})
 }
@@ -668,6 +690,10 @@ func TestASessionWithALongBacklogIsDrainedBeforeItIsRead(t *testing.T) {
 
 	// Held past the reclaim delay: a disconnect left behind by the drain comes back on a
 	// later heartbeat and undoes the connect that replaced it.
+	//
+	// testwait: the nine seconds are the assertion, not patience -- the reclaim delay is
+	// what this has to outlast, and a shorter wait stops testing the thing it is named
+	// after.
 	deadline := time.Now().Add(9 * time.Second)
 	for time.Now().Before(deadline) {
 		c.send(ctx, commands, &protocol.Command{

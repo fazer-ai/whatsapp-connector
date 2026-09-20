@@ -21,6 +21,7 @@ import (
 	"github.com/fazer-ai/whatsapp-connector/internal/engine/fake"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 	"github.com/fazer-ai/whatsapp-connector/internal/redisx"
+	"github.com/fazer-ai/whatsapp-connector/internal/testwait"
 	"github.com/fazer-ai/whatsapp-connector/internal/transport"
 )
 
@@ -224,12 +225,12 @@ func TestASessionTheEngineFinishedWithHandsItsLeaseBack(t *testing.T) {
 func waitFor(t *testing.T, done func() bool, complaint string) {
 	t.Helper()
 
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(testwait.Budget)
 	for time.Now().Before(deadline) {
 		if done() {
 			return
 		}
-		time.Sleep(5 * time.Millisecond)
+		time.Sleep(testwait.Poll)
 	}
 	t.Fatal(complaint)
 }

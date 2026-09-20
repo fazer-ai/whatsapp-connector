@@ -13,6 +13,7 @@ import (
 
 	"github.com/fazer-ai/whatsapp-connector/internal/engine"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
+	"github.com/fazer-ai/whatsapp-connector/internal/testwait"
 )
 
 func TestAnAddressNamesTheKindTheContractHasForEachServer(t *testing.T) {
@@ -571,12 +572,12 @@ func TestAMessageThatCannotEvenBeQueuedIsLeftUnacknowledgedWithinTheBound(t *tes
 func waitUntil(t *testing.T, what string, cond func() bool) {
 	t.Helper()
 
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(testwait.Budget)
 	for time.Now().Before(deadline) {
 		if cond() {
 			return
 		}
-		time.Sleep(time.Millisecond)
+		time.Sleep(testwait.Poll)
 	}
 	t.Fatalf("timed out waiting for %s", what)
 }

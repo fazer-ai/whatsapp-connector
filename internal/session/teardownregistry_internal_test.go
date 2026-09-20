@@ -21,6 +21,7 @@ import (
 	"github.com/fazer-ai/whatsapp-connector/internal/engine/fake"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 	"github.com/fazer-ai/whatsapp-connector/internal/redisx"
+	"github.com/fazer-ai/whatsapp-connector/internal/testwait"
 	"github.com/fazer-ai/whatsapp-connector/internal/transport"
 )
 
@@ -39,7 +40,7 @@ import (
 // written yet, and fails for scheduling rather than for behaviour.
 func settled(t *testing.T, manager *Manager, sid string, want func(adoptedForDelete, bool) bool) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(testwait.Budget)
 	for time.Now().Before(deadline) {
 		manager.forDeleteMu.Lock()
 		entry, listed := manager.forDelete[sid]
@@ -47,7 +48,7 @@ func settled(t *testing.T, manager *Manager, sid string, want func(adoptedForDel
 		if want(entry, listed) {
 			return
 		}
-		time.Sleep(time.Millisecond)
+		time.Sleep(testwait.Poll)
 	}
 	t.Fatalf("the bookkeeping for %s never reached the state this test is about", sid)
 }
@@ -516,12 +517,12 @@ func TestASessionCountsTheCommandsItCarriedOut(t *testing.T) {
 
 func waitForCount(t *testing.T, session *Session, want int64, why string) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(testwait.Budget)
 	for time.Now().Before(deadline) {
 		if session.carriedSoFar() == want {
 			return
 		}
-		time.Sleep(time.Millisecond)
+		time.Sleep(testwait.Poll)
 	}
 	t.Fatalf("%s (count is %d, want %d)", why, session.carriedSoFar(), want)
 }
@@ -992,9 +993,9 @@ func TestAPeerRetiresTheWakeForAnAccountAboutToGoBack(t *testing.T) {
 		Release: func() { wakeReleased.Add(1) },
 		Forfeit: func() { wakeForfeited.Add(1) },
 	})
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(testwait.Budget)
 	for time.Now().Before(deadline) && wakeAcked.Load()+wakeReleased.Load()+wakeForfeited.Load() == 0 {
-		time.Sleep(time.Millisecond)
+		time.Sleep(testwait.Poll)
 	}
 	if wakeAcked.Load() != 1 {
 		t.Fatalf("the peer no longer retires the wake: acked=%d released=%d forfeited=%d. If #259 is what changed this, the account now keeps the ask that would start it and this test has served its purpose",

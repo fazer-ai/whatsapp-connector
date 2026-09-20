@@ -33,6 +33,7 @@ import (
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 	"github.com/fazer-ai/whatsapp-connector/internal/store"
 	"github.com/fazer-ai/whatsapp-connector/internal/store/storetest"
+	"github.com/fazer-ai/whatsapp-connector/internal/testwait"
 )
 
 func TestQRDataURLIsAnImageTheContractAccepts(t *testing.T) {
@@ -1209,12 +1210,12 @@ func TestCloseReleasesABlockedHandlerBeforeWaitingOnIt(t *testing.T) {
 func waitForBlockedInbox(t *testing.T, session *Session) {
 	t.Helper()
 
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(testwait.Budget)
 	for time.Now().Before(deadline) {
 		if len(session.inbox) == inboxDepth {
 			return
 		}
-		time.Sleep(time.Millisecond)
+		time.Sleep(testwait.Poll)
 	}
 	t.Fatal("the inbox never filled")
 }
