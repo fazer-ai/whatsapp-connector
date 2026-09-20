@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+
 	"github.com/fazer-ai/whatsapp-connector/internal/testwait"
 )
 
@@ -29,7 +30,7 @@ import (
 func TestADialThatNeverAnswersEndsOnTheCeiling(t *testing.T) {
 	t.Parallel()
 
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	listener, err := new(net.ListenConfig).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
@@ -46,9 +47,10 @@ func TestADialThatNeverAnswersEndsOnTheCeiling(t *testing.T) {
 	const ceiling = 300 * time.Millisecond
 	client := &http.Client{Timeout: ceiling, Transport: http.DefaultTransport.(*http.Transport).Clone()}
 	began := time.Now()
-	_, _, err = websocket.Dial(context.Background(), "ws://"+listener.Addr().String(),
+	_, refused, err := websocket.Dial(context.Background(), "ws://"+listener.Addr().String(),
 		&websocket.DialOptions{HTTPClient: client})
 	took := time.Since(began)
+	closeBody(refused)
 
 	if err == nil {
 		t.Fatal("the dial completed against a listener that never answered")
@@ -80,6 +82,14 @@ func TestTheClientWeBuildIsTheOneTheLibraryWouldHave(t *testing.T) {
 		t.Errorf("dialCeiling is %s and whatsmeow's NoiseHandshakeResponseTimeout is %s: the "+
 			"two halves of a connection under the same lock no longer end together, which "+
 			"is the reason written on the constant", dialCeiling, wmHandshakeCeiling)
+	}
+	// The same transport and not merely one of the same type: a fresh `&http.Transport{}`
+	// would dial without the proxy settings and the HTTP/2 configuration the process was
+	// started with, which is a second difference from whatsmeow's own client hiding behind
+	// a field that looks set.
+	if dialTransport() != http.DefaultTransport {
+		t.Error("the dial clients are built from a transport that is not http.DefaultTransport, " +
+			"so they are not the clients whatsmeow would have built")
 	}
 }
 
@@ -171,8 +181,9 @@ func TestTheCeilingDoesNotOutliveTheDialItBounds(t *testing.T) {
 
 	const ceiling = 300 * time.Millisecond
 	client := &http.Client{Timeout: ceiling, Transport: http.DefaultTransport.(*http.Transport).Clone()}
-	conn, _, err := websocket.Dial(context.Background(), "ws"+strings.TrimPrefix(server.URL, "http"),
+	conn, upgraded, err := websocket.Dial(context.Background(), "ws"+strings.TrimPrefix(server.URL, "http"),
 		&websocket.DialOptions{HTTPClient: client})
+	closeBody(upgraded)
 	if err != nil {
 		t.Fatalf("dial the echo server under a %s ceiling: %v", ceiling, err)
 	}
@@ -347,4 +358,13 @@ func ownsItsTransport(arg ast.Expr) bool {
 		return isSel && selector.Sel.Name == "Clone"
 	}
 	return false
+}
+
+// closeBody drains what websocket.Dial hands back alongside the connection. A successful
+// upgrade leaves nothing to read, and a failed one leaves a body the linter is right to
+// want closed.
+func closeBody(response *http.Response) {
+	if response != nil && response.Body != nil {
+		_ = response.Body.Close()
+	}
 }

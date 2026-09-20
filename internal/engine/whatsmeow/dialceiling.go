@@ -1,6 +1,7 @@
 package whatsmeow
 
 import (
+	"fmt"
 	"net/http"
 	"time"
 
@@ -50,11 +51,27 @@ func newClient(device *store.Device, log waLog.Logger) *wm.Client {
 	client := wm.NewClient(device, log)
 	client.SetWebsocketHTTPClient(&http.Client{
 		Timeout:   dialCeiling,
-		Transport: http.DefaultTransport.(*http.Transport).Clone(),
+		Transport: dialTransport().Clone(),
 	})
 	client.SetPreLoginHTTPClient(&http.Client{
 		Timeout:   dialCeiling,
-		Transport: http.DefaultTransport.(*http.Transport).Clone(),
+		Transport: dialTransport().Clone(),
 	})
 	return client
+}
+
+// dialTransport is the one whatsmeow clones for the clients it builds itself, so cloning
+// the same one keeps the ceiling the only difference between its dial and ours.
+//
+// Nothing in this repository replaces `http.DefaultTransport`, so a failure here is a
+// dependency replacing it at init, and dialling through a transport nobody chose is worse
+// than saying so.
+func dialTransport() *http.Transport {
+	transport, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		panic(fmt.Sprintf("whatsmeow: http.DefaultTransport is %T and not *http.Transport, "+
+			"so the dial clients built here are not the ones the library would have built",
+			http.DefaultTransport))
+	}
+	return transport
 }
