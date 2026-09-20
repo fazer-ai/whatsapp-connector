@@ -265,6 +265,12 @@ func TestNewClientPutsTheCeilingOnBothDialClients(t *testing.T) {
 			return true
 		}
 		ceilinged[selector.Sel.Name] = carriesTheCeiling(call.Args[0])
+		if _, set := ceilinged[selector.Sel.Name]; set && !ownsItsTransport(call.Args[0]) {
+			t.Errorf("newClient calls %s with a client that does not clone a transport of "+
+				"its own, so it shares http.DefaultTransport with the rest of the process "+
+				"instead of matching what whatsmeow builds its own clients from",
+				selector.Sel.Name)
+		}
 		return true
 	})
 
@@ -310,6 +316,35 @@ func carriesTheCeiling(arg ast.Expr) bool {
 		}
 		value, isIdent := field.Value.(*ast.Ident)
 		return isIdent && value.Name == "dialCeiling"
+	}
+	return false
+}
+
+// ownsItsTransport reports whether the same literal builds a transport for itself rather
+// than leaving the field zero, which would hand the client the shared http.DefaultTransport.
+func ownsItsTransport(arg ast.Expr) bool {
+	unary, isUnary := arg.(*ast.UnaryExpr)
+	if !isUnary {
+		return false
+	}
+	composite, isComposite := unary.X.(*ast.CompositeLit)
+	if !isComposite {
+		return false
+	}
+	for _, element := range composite.Elts {
+		field, isField := element.(*ast.KeyValueExpr)
+		if !isField {
+			continue
+		}
+		if key, isIdent := field.Key.(*ast.Ident); !isIdent || key.Name != "Transport" {
+			continue
+		}
+		call, isCall := field.Value.(*ast.CallExpr)
+		if !isCall {
+			return false
+		}
+		selector, isSel := call.Fun.(*ast.SelectorExpr)
+		return isSel && selector.Sel.Name == "Clone"
 	}
 	return false
 }
