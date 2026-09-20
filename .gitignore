@@ -20,3 +20,6 @@ coverage.txt
 .DS_Store
 .idea/
 *.swp
+
+# Binário que `make bench-fleet` compila quando BENCH_BIN aponta para a raiz
+/fleetbench
