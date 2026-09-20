@@ -9,6 +9,7 @@ import (
 	"go/parser"
 	"go/printer"
 	"go/token"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -158,7 +159,7 @@ func TestAWriteWithNoDeadlineOfItsOwnStillWaitsTheDSNsValue(t *testing.T) {
 	if err := db.QueryRowContext(context.Background(), `PRAGMA busy_timeout`).Scan(&onTheConnection); err != nil {
 		t.Fatalf("read the pragma back: %v", err)
 	}
-	if want := int(dsnBusyTimeout(mustDSN(t, path)).Milliseconds()); onTheConnection != want {
+	if want := whatTheDSNOpensWith(t, path); onTheConnection != want {
 		t.Errorf("a call with no deadline left %dms on the connection, want the DSN's %dms", onTheConnection, want)
 	}
 }
@@ -180,19 +181,45 @@ func TestOneCallersBudgetIsNotTheNextCallersCeiling(t *testing.T) {
 	if err := db.QueryRowContext(context.Background(), `PRAGMA busy_timeout`).Scan(&inherited); err != nil {
 		t.Fatalf("read the pragma back: %v", err)
 	}
-	if want := int(dsnBusyTimeout(mustDSN(t, path)).Milliseconds()); inherited != want {
+	if want := whatTheDSNOpensWith(t, path); inherited != want {
 		t.Errorf("the next call inherited %dms from the one before it, want the DSN's %dms", inherited, want)
 	}
 }
 
-func mustDSN(t *testing.T, path string) string {
+// whatTheDSNOpensWith is the `busy_timeout` a connection of this store's own making
+// starts on, read from a connection outside the wrapper so the expectation is not taken
+// from the thing under test.
+func whatTheDSNOpensWith(t *testing.T, path string) int {
 	t.Helper()
 
 	_, dsn, err := parseURL("sqlite:" + path)
 	if err != nil {
 		t.Fatalf("parseURL: %v", err)
 	}
-	return dsn
+	connector, err := sqlite.NewConnector(dsn)
+	if err != nil {
+		t.Fatalf("NewConnector: %v", err)
+	}
+	raw, err := connector.Connect(t.Context())
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer func() { _ = raw.Close() }()
+
+	rows, err := raw.(driver.QueryerContext).QueryContext(t.Context(), "PRAGMA busy_timeout", nil)
+	if err != nil {
+		t.Fatalf("read busy_timeout: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	values := make([]driver.Value, len(rows.Columns()))
+	if err := rows.Next(values); err != nil {
+		t.Fatalf("read busy_timeout row: %v", err)
+	}
+	ms, ok := values[0].(int64)
+	if !ok {
+		t.Fatalf("busy_timeout came back as %T", values[0])
+	}
+	return int(ms)
 }
 
 // A wrapper decides what `database/sql` may use by what it implements, and it falls back
@@ -209,7 +236,7 @@ func TestTheWrappedConnectionOffersWhatTheDriverOffers(t *testing.T) {
 
 	raw := rawConn(t)
 	defer func() { _ = raw.Close() }()
-	wrapped, err := newBudgetedConn(raw, time.Second)
+	wrapped, err := newBudgetedConn(raw)
 	if err != nil {
 		t.Fatalf("newBudgetedConn: %v", err)
 	}
@@ -402,7 +429,7 @@ func TestPostgresStillStopsOnTheCallersDeadline(t *testing.T) {
 func TestADriverThatStoppedOfferingOneOfThemFailsTheOpen(t *testing.T) {
 	t.Parallel()
 
-	_, err := newBudgetedConn(bareConn{}, time.Second)
+	_, err := newBudgetedConn(bareConn{})
 	if err == nil {
 		t.Fatal("a connection offering none of the optional interfaces was wrapped anyway, " +
 			"so database/sql would fall back to the paths this file exists to keep")
@@ -445,37 +472,86 @@ func TestTheBudgetOnTheConnectionIsTheCallersTimePlusTheSlack(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
 		deadline time.Duration
-		low, up  int64
 	}{
-		// The lower bound allows for the time between taking the deadline and running
-		// the pragma; the upper is exact, because nothing can make the budget larger
-		// than the deadline it was derived from.
-		{"a tight caller", 300 * time.Millisecond, 330, 350},
-		{"a roomier one", 3 * time.Second, 3030, 3050},
-		// No deadline: the DSN's own value, so a background writer does not lose the
-		// backstop that exists to keep `database is locked` off the pairing path.
-		{"one with no deadline at all", 0, 10000, 10000},
+		{"a tight caller", 300 * time.Millisecond},
+		{"a roomier one", 3 * time.Second},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			ctx := t.Context()
-			if tc.deadline > 0 {
-				var cancel context.CancelFunc
-				ctx, cancel = context.WithTimeout(ctx, tc.deadline)
-				defer cancel()
-			}
+			ctx, cancel := context.WithTimeout(t.Context(), tc.deadline)
+			defer cancel()
+
+			// The bounds are read off the same clock the budget is, on either side of
+			// the call, rather than assumed from the timeout: the pragma is installed
+			// somewhere inside this window, so the value has to be what was left at
+			// some instant in it. A fixed allowance would instead be a bet on how long
+			// a loaded runner takes to get here, which under `-race` and t.Parallel is
+			// not a bet worth making.
+			before := time.Until(deadlineOf(ctx, t))
 			var got int64
 			if err := db.QueryRowContext(ctx, "PRAGMA busy_timeout").Scan(&got); err != nil {
 				t.Fatalf("read back busy_timeout: %v", err)
 			}
-			if got < tc.low || got > tc.up {
+			after := time.Until(deadlineOf(ctx, t))
+
+			low, up := after.Milliseconds()+slackMs, before.Milliseconds()+slackMs
+			if got < low || got > up {
 				t.Errorf("busy_timeout on the connection is %dms, wanted %d..%dms: the "+
 					"statement is not running under the ceiling its caller asked for",
-					got, tc.low, tc.up)
+					got, low, up)
 			}
 		})
 	}
+
+	// No deadline: the DSN's own value, so a background writer does not lose the backstop
+	// that exists to keep `database is locked` off the pairing path.
+	t.Run("one with no deadline at all", func(t *testing.T) {
+		t.Parallel()
+
+		var got int
+		if err := db.QueryRowContext(context.Background(), "PRAGMA busy_timeout").Scan(&got); err != nil {
+			t.Fatalf("read back busy_timeout: %v", err)
+		}
+		if want := whatTheDSNOpensWith(t, path); got != want {
+			t.Errorf("busy_timeout on the connection is %dms, wanted the DSN's %dms", got, want)
+		}
+	})
+}
+
+// slackMs is `budgetSlack` in the unit the pragma reports, so the bounds above move with
+// the constant instead of restating it.
+var slackMs = budgetSlack.Milliseconds()
+
+// Which is exactly why the value of the constant needs its own assertion: bounds derived
+// from it follow it anywhere, zero included, and zero is the one value that breaks what it
+// is for. At zero the busy wait and the context expire together and the error a caller
+// gets is the scheduler's to pick -- `context deadline exceeded`, which every caller above
+// reads with `errors.Is`, or SQLite's `database is locked`, which none of them do.
+func TestTheSlackIsLongerThanTheDeadlineItIsDerivedFrom(t *testing.T) {
+	t.Parallel()
+
+	if budgetSlack <= 0 {
+		t.Errorf("budgetSlack is %v: the two clocks expire at the same instant, so which "+
+			"error a contended write returns stops being decided and starts being raced",
+			budgetSlack)
+	}
+	// And not so long that the ceiling stops being the caller's. A `storeLimit` is
+	// measured in seconds; a slack of that order would be a second ceiling in disguise.
+	if budgetSlack > 500*time.Millisecond {
+		t.Errorf("budgetSlack is %v, which is a meaningful share of the ceilings callers "+
+			"actually set: the wait is no longer the caller's", budgetSlack)
+	}
+}
+
+func deadlineOf(ctx context.Context, t *testing.T) time.Time {
+	t.Helper()
+
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		t.Fatal("the context carries no deadline, so there is nothing to derive a budget from")
+	}
+	return deadline
 }
 
 // Three things this file decides are true of its source and not of anything the pinned
@@ -631,4 +707,44 @@ func render(node ast.Expr) string {
 		return ""
 	}
 	return out.String()
+}
+
+// The DSN's value is read off the connection, not parsed out of the DSN, and this is why.
+//
+// `modernc.org/sqlite` accepts several spellings of the same pragma and `sqliteDefaults`
+// leaves an operator's alone once it recognises the name, so a DSN can legitimately arrive
+// in any of these. A parser that knows one spelling answers zero for the others, and zero
+// is not a small error here: it is the ceiling every call with no deadline of its own
+// inherits, and at zero a contended write fails on the spot with `database is locked`,
+// which is the pairing failure `busy_timeout` was added to stop.
+func TestAnOperatorsOwnSpellingOfBusyTimeoutIsNotReadAsZero(t *testing.T) {
+	t.Parallel()
+
+	for _, spelling := range []string{
+		"busy_timeout(7777)",
+		"busy_timeout=7777",
+		" busy_timeout(7777) ",
+		"busy_timeout (7777)",
+	} {
+		t.Run(spelling, func(t *testing.T) {
+			t.Parallel()
+
+			dsn := "sqlite:" + t.TempDir() + "/spelled.db?_pragma=" + url.QueryEscape(spelling)
+			container, err := Open(t.Context(), dsn, AlwaysOwned, zerolog.Nop())
+			if err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			defer func() { _ = container.Close() }()
+
+			var onTheConnection int
+			if err := container.DB().QueryRowContext(context.Background(),
+				"PRAGMA busy_timeout").Scan(&onTheConnection); err != nil {
+				t.Fatalf("read the pragma back: %v", err)
+			}
+			if onTheConnection != 7777 {
+				t.Errorf("a call with no deadline left %dms on a connection opened with %q, "+
+					"want the 7777ms the operator asked for", onTheConnection, spelling)
+			}
+		})
+	}
 }

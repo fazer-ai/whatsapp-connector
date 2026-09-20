@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql/driver"
 	"fmt"
-	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -33,11 +32,6 @@ import (
 // to wrap.
 type budgetedConnector struct {
 	driver.Connector
-
-	// fallback is what the DSN asked for, and what a call with no deadline of its own
-	// gets. Without it the previous caller's budget would stay on the connection, which
-	// with one connection means one account's ceiling becoming everybody's.
-	fallback time.Duration
 }
 
 // sqliteBudgeted wraps the driver's connector so every statement runs under a
@@ -47,7 +41,7 @@ func sqliteBudgeted(dsn string) (driver.Connector, error) {
 	if err != nil {
 		return nil, fmt.Errorf("store: sqlite connector: %w", err)
 	}
-	return budgetedConnector{Connector: base, fallback: dsnBusyTimeout(dsn)}, nil
+	return budgetedConnector{Connector: base}, nil
 }
 
 func (c budgetedConnector) Connect(ctx context.Context) (driver.Conn, error) {
@@ -55,7 +49,7 @@ func (c budgetedConnector) Connect(ctx context.Context) (driver.Conn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("store: sqlite connect: %w", err)
 	}
-	return newBudgetedConn(conn, c.fallback)
+	return newBudgetedConn(conn)
 }
 
 // budgetSlack is how much longer than the caller's own deadline the busy wait is allowed
@@ -99,11 +93,22 @@ type budgetedConn struct {
 	valid   driver.Validator
 	ping    driver.Pinger
 
+	// fallback is what this connection was opened with, and what a call with no deadline
+	// of its own gets back. Without it the previous caller's budget would stay on the
+	// connection, which with one connection means one account's ceiling becoming
+	// everybody's.
+	//
+	// Read off the connection rather than parsed out of the DSN. The driver accepts
+	// `busy_timeout(10000)`, `busy_timeout=10000`, either with surrounding whitespace,
+	// and `sqliteDefaults` leaves an operator's spelling alone -- measured, all five
+	// forms open at 7777. A parser that knows one of them answers zero for the rest, and
+	// zero here would turn every deadline-free call into an instant `database is locked`,
+	// which is the failure `busy_timeout` was added to stop.
 	fallback time.Duration
 }
 
-func newBudgetedConn(conn driver.Conn, fallback time.Duration) (driver.Conn, error) {
-	wrapped := &budgetedConn{Conn: conn, fallback: fallback}
+func newBudgetedConn(conn driver.Conn) (driver.Conn, error) {
+	wrapped := &budgetedConn{Conn: conn}
 	var missing []string
 	var ok bool
 	if wrapped.exec, ok = conn.(driver.ExecerContext); !ok {
@@ -137,7 +142,34 @@ func newBudgetedConn(conn driver.Conn, fallback time.Duration) (driver.Conn, err
 			"so wrapping its connection would drop what database/sql does with it",
 			strings.Join(missing, ", driver."))
 	}
+	fallback, err := readBusyTimeout(wrapped.query)
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	wrapped.fallback = fallback
 	return wrapped, nil
+}
+
+// readBusyTimeout asks the connection what it was opened with.
+func readBusyTimeout(query driver.QueryerContext) (time.Duration, error) {
+	rows, err := query.QueryContext(context.Background(), "PRAGMA busy_timeout", nil)
+	if err != nil {
+		return 0, fmt.Errorf("store: read sqlite busy_timeout: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	values := make([]driver.Value, len(rows.Columns()))
+	if err := rows.Next(values); err != nil {
+		return 0, fmt.Errorf("store: read sqlite busy_timeout: %w", err)
+	}
+	ms, ok := values[0].(int64)
+	if !ok {
+		// A build problem: this pragma answers one integer, and a driver that answers
+		// something else has changed under this file.
+		return 0, fmt.Errorf("store: sqlite reported busy_timeout as %T, wanted an integer", values[0])
+	}
+	return time.Duration(ms) * time.Millisecond, nil
 }
 
 // budget puts the caller's remaining time on the connection, and the DSN's value back
@@ -221,38 +253,4 @@ func (c *budgetedConn) Ping(ctx context.Context) error {
 		return fmt.Errorf("store: sqlite ping: %w", err)
 	}
 	return nil
-}
-
-// dsnBusyTimeout reads back the value `sqliteDefaults` put in, so a connection with no
-// caller deadline behaves exactly as it did before this existed. An operator who spelled
-// their own `busy_timeout` keeps theirs, which is the same rule `sqliteDefaults` follows.
-func dsnBusyTimeout(dsn string) time.Duration {
-	_, query, _ := strings.Cut(dsn, "?")
-	for _, pair := range strings.Split(query, "&") {
-		key, value, ok := strings.Cut(pair, "=")
-		if !ok || key != "_pragma" {
-			continue
-		}
-		decoded, err := url.QueryUnescape(value)
-		if err != nil {
-			continue
-		}
-		inside, found := strings.CutPrefix(strings.TrimSpace(decoded), "busy_timeout(")
-		if !found {
-			continue
-		}
-		digits, closed := strings.CutSuffix(inside, ")")
-		if !closed {
-			continue
-		}
-		ms, err := strconv.Atoi(digits)
-		if err != nil {
-			continue
-		}
-		return time.Duration(ms) * time.Millisecond
-	}
-	// Unreachable through `parseURL`, which always spells one. A build that got here
-	// would wait the driver's own default of zero, which is an immediate
-	// `database is locked` -- loud, and better than a silent ten seconds.
-	return 0
 }
