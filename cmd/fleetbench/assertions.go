@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -21,7 +22,8 @@ import (
 // it is an assertion that never ran, and printing it as a pass is how a bench ends up
 // saying more than it measured.
 func assertInvariants(ctx context.Context, cl *client, rep *report, plan benchPlan,
-	answers map[string][]string, sids []string, pairs []idempotentPair, counted *census) error {
+	answers map[string][]string, sids []string, pairs []idempotentPair, counted *census,
+	stillWorking string) error {
 
 	published := map[string][]protocol.Event{}          // sid -> events, in stream order
 	shardOf := map[string]map[string]bool{}             // sid -> streams it was seen on
@@ -68,7 +70,7 @@ func assertInvariants(ctx context.Context, cl *client, rep *report, plan benchPl
 	assertOneShard(rep, shardOf, firstOn, sids)
 	assertNoLostEvent(rep, published, truncated)
 	assertNoDuplicateEffect(rep, answers, pairs)
-	return assertConsumerGroups(ctx, cl, rep, sids)
+	return assertConsumerGroups(ctx, cl, rep, sids, stillWorking)
 }
 
 // Invariant 1: one instance owns a session at a time, and losing the lease stops it.
@@ -369,7 +371,7 @@ func assertNoLostEvent(rep *report, published map[string][]protocol.Event, trunc
 // One claim and not two, because they are one claim: the issue asks whether a side effect
 // can happen twice, and these are the two doors to it that a client can see from outside.
 func assertNoDuplicateEffect(rep *report, answers map[string][]string, pairs []idempotentPair) {
-	examined, repeated, offenders := 0, 0, []string{}
+	examined, repeated, retried, offenders := 0, 0, 0, []string{}
 	for id, given := range answers {
 		if len(given) == 0 {
 			continue
@@ -379,13 +381,43 @@ func assertNoDuplicateEffect(rep *report, answers map[string][]string, pairs []i
 			continue
 		}
 		repeated++
-		first := given[0]
-		for _, other := range given[1:] {
+
+		// Only the answers that say the command WORKED, and this is the difference between
+		// a duplicated effect and an ordinary retry.
+		//
+		// MEASURED in the connector: `Session.carryOut` remembers successes and nothing
+		// else (internal/session/session.go, "Only a success is remembered. A failure is
+		// the caller's to try again"). So a command whose first attempt answered with an
+		// error and whose owner died before the XACK is redelivered, runs for real, and
+		// answers differently the second time -- by design, because the first attempt left
+		// no side effect to duplicate. Comparing whole reply strings calls that a
+		// duplicated side effect and reports the connector's retry path as a defect.
+		//
+		// What cannot happen is two answers that BOTH claim success and disagree: the
+		// ledger is what makes the second one a recall of the first, and two different
+		// successes mean it ran twice.
+		worked := []string{}
+		for _, answer := range given {
+			var reply protocol.Reply
+			// An answer that does not parse is compared as it came: it is not a success
+			// this can vouch for, and dropping it would be dropping evidence.
+			if err := json.Unmarshal([]byte(answer), &reply); err != nil || reply.OK {
+				worked = append(worked, answer)
+			}
+		}
+		if len(worked) < len(given) {
+			retried++
+		}
+		if len(worked) < 2 {
+			continue
+		}
+		first := worked[0]
+		for _, other := range worked[1:] {
 			if other != first {
 				offenders = append(offenders, fmt.Sprintf(
-					"o comando %s foi respondido %d vezes com respostas diferentes, entao ele rodou de novo "+
-						"em vez de ser lembrado pela idempotencia de message_id:\n  %s\n  %s",
-					id, len(given), first, other))
+					"o comando %s foi respondido com sucesso %d vezes, com respostas diferentes, entao ele "+
+						"rodou de novo em vez de ser lembrado pela idempotencia de message_id:\n  %s\n  %s",
+					id, len(worked), first, other))
 				break
 			}
 		}
@@ -408,9 +440,10 @@ func assertNoDuplicateEffect(rep *report, answers map[string][]string, pairs []i
 	rep.assert(&assertion{
 		invariant: "5 (comandos idempotentes por message_id: uma reentrega nao duplica efeito)",
 		claim:     "nenhum efeito colateral duplicado: nem resposta que discorda de si mesma, nem message_id repetido que saiu de novo",
-		series: fmt.Sprintf("%d comandos com resposta, dos quais %d responderam mais de uma vez; "+
+		series: fmt.Sprintf("%d comandos com resposta, dos quais %d responderam mais de uma vez "+
+			"(%d com alguma tentativa que falhou antes, que a idempotencia nao lembra por decisao); "+
 			"e %d mensagens pedidas duas vezes, a maior folga entre os dois pedidos sendo %s",
-			examined, repeated, len(pairs), widest.Round(time.Millisecond)),
+			examined, repeated, retried, len(pairs), widest.Round(time.Millisecond)),
 		points: repeated + len(pairs),
 		held:   len(offenders) == 0,
 		detail: strings.Join(offenders, "\n"),
@@ -434,7 +467,8 @@ func assertNoDuplicateEffect(rep *report, answers map[string][]string, pairs []i
 // mid-publish. A build that acknowledged inbound messages before publishing would pass
 // this check untouched. Saying so here rather than leaving the label to imply otherwise is
 // the difference between a bench that measures six things and one that claims seven.
-func assertConsumerGroups(ctx context.Context, cl *client, rep *report, sids []string) error {
+func assertConsumerGroups(ctx context.Context, cl *client, rep *report, sids []string,
+	stillWorking string) error {
 	checked, offenders := 0, []string{}
 	streams := append([]string{cl.keys.Control()}, nil...)
 	for _, sid := range sids {
@@ -454,22 +488,60 @@ func assertConsumerGroups(ctx context.Context, cl *client, rep *report, sids []s
 		}
 		for _, group := range groups {
 			checked++
-			if group.Pending != 0 || group.Lag != 0 {
-				offenders = append(offenders, fmt.Sprintf(
-					"%s, grupo %s: %d pendentes e lag %d depois dos acks", stream, group.Name, group.Pending, group.Lag))
+			if found := groupOffender(stream, group); found != "" {
+				offenders = append(offenders, found)
 			}
 		}
 	}
-	rep.assert(&assertion{
+	rep.assert(consumerGroupVerdict(checked, len(streams), offenders, stillWorking))
+	return nil
+}
+
+// consumerGroupVerdict is the judgement, apart from the reading that feeds it.
+//
+// Apart because the reading needs a server and the judgement needs a table: kept together,
+// the only instrument that could disprove this is a four-minute run against two real
+// servers, and the case that matters most -- a deadline that passed with work still in
+// flight -- is exactly the one a healthy bench will not produce on demand.
+//
+// A drain deadline that passed is NOT a hole. What is left pending after a wait that ended
+// on the clock is the work of a busy fleet (a large load, a slow server, a full machine),
+// and reading it as lost delivery turns "not enough time" into a defect of the connector,
+// which is the confusion the four exit codes exist to avoid. So this gives a verdict only
+// when the wait ended on the fact it was waiting for; without that, whatever is pending
+// comes out as NAO MEDIDO with the reason written down.
+// groupOffender says whether one consumer group still holds work, and names it when it
+// does.
+//
+// Both numbers, and not either one: `Pending` counts entries delivered to a consumer that
+// never acknowledged them, and `Lag` counts entries the group has not been handed at all.
+// A group can have one without the other -- a redelivered command sitting unacknowledged
+// with nothing new behind it is pending 1, lag 0, which is what a run measured after an
+// owner was killed -- so a check that wanted both to be non-zero would report an empty
+// stream as fine and a stuck consumer as fine too.
+func groupOffender(stream string, group redis.XInfoGroup) string {
+	if group.Pending == 0 && group.Lag == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%s, grupo %s: %d pendentes e lag %d depois dos acks",
+		stream, group.Name, group.Pending, group.Lag)
+}
+
+func consumerGroupVerdict(checked, streams int, offenders []string, stillWorking string) *assertion {
+	undecided := ""
+	if len(offenders) > 0 && stillWorking != "" {
+		undecided = stillWorking
+	}
+	return &assertion{
 		invariant: "entrega de comando pelo transporte (NAO e a invariante 4: o ack de mensagem que " +
 			"CHEGA, depois da publicacao, nao e exercitado por esta carga e fica sem medida)",
 		claim:  "grupo consumidor sem buraco: nada pendente e lag zero ao fim",
-		series: fmt.Sprintf("%d grupos consumidores sobre %d streams de comando", checked, len(streams)),
+		series: fmt.Sprintf("%d grupos consumidores sobre %d streams de comando", checked, streams),
 		points: checked,
 		held:   len(offenders) == 0,
 		detail: strings.Join(offenders, "\n"),
-	})
-	return nil
+		notWhy: undecided,
+	}
 }
 
 func sorted(set map[string]bool) []string {

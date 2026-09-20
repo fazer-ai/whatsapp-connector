@@ -59,6 +59,15 @@ func handover(ctx context.Context, active *run, group *fleet, cl *client, rep *r
 	// under the newer, and that only exists if somebody is asking the session to publish.
 	steady := startLoad(ctx, active, cl, sids, 200*time.Millisecond)
 
+	// Parada em toda saida, e nao so na que le os streams. Qualquer fase abaixo pode
+	// devolver erro, e as goroutines seguiriam mandando comando para os streams desta
+	// corrida enquanto a limpeza adiada varre e apaga as chaves dela: a corrida passaria a
+	// reportar chave propria como chave vazada que nao conseguiu remover. Chamar `end` duas
+	// vezes e seguro (o cancel e idempotente e a espera volta na hora depois da primeira), e
+	// a chamada la embaixo continua sendo a que conta, porque a ordem importa: a carga para
+	// ANTES de qualquer leitura.
+	defer steady.end()
+
 	// Measured, not assumed: how many of those the owner had not retired when it died.
 	//
 	// The fake engine answers a send at once, and these go on the streams one after
@@ -133,9 +142,14 @@ func handover(ctx context.Context, active *run, group *fleet, cl *client, rep *r
 		rep.note("os pares nao completaram nenhuma passada de reivindicacao: um zero em 'comandos " +
 			"reivindicados' aqui nao e 'nao havia o que reivindicar', e sim que ninguem contou")
 	}
+	// Dito em nota E levado a assercao. A nota e para quem le a corrida; o que a assercao
+	// precisa e nao dar veredito sobre o que sobrou pendente, porque uma espera que terminou
+	// pelo relogio nao separa "a frota estava ocupada" de "a entrega furou".
+	stillWorking := ""
 	if !drained {
-		rep.note("o grupo consumidor nao drenou em 90 s: o que a asserção de grupo consumidor disser " +
-			"abaixo e sobre uma frota que ainda estava trabalhando, e nao sobre um buraco")
+		stillWorking = "o grupo consumidor nao drenou em 90 s depois da troca de dono, entao o que " +
+			"sobrou pendente e trabalho em curso de uma frota ocupada, e nao um buraco na entrega"
+		rep.note(stillWorking)
 	}
 
 	// Read here and not after the phase below, because a reply list has a TTL: the
@@ -175,11 +189,12 @@ func handover(ctx context.Context, active *run, group *fleet, cl *client, rep *r
 		return fmt.Errorf("%w: %w", errSetup, err)
 	}
 	if !drainedAgain {
-		rep.note("o grupo consumidor nao drenou nos 60 s depois da fase do dono congelado: o que a " +
-			"asserção de grupo consumidor disser e sobre uma frota que ainda estava trabalhando")
+		stillWorking = "o grupo consumidor nao drenou nos 60 s depois da fase do dono congelado, entao " +
+			"o que sobrou pendente e trabalho em curso de uma frota ocupada, e nao um buraco na entrega"
+		rep.note(stillWorking)
 	}
 
-	return assertInvariants(ctx, cl, rep, plan, answers, sids, pairs, counted)
+	return assertInvariants(ctx, cl, rep, plan, answers, sids, pairs, counted, stillWorking)
 }
 
 func shortSID(sid string) string {

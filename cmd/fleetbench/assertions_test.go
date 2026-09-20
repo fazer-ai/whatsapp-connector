@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/redis/go-redis/v9"
+
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 )
 
@@ -371,5 +373,206 @@ func TestTheThreeOutcomesAreDistinct(t *testing.T) {
 			t.Errorf("%q e %q saem com o mesmo codigo %d", before, o.label(), int(o))
 		}
 		seen[o] = o.label()
+	}
+}
+
+// The counters a run reports are part of what it claims, and a wrong one is not cosmetic:
+// "0 comandos responderam mais de uma vez" is what says the idempotency series had nothing
+// in it, and a bench that inflates it claims to have measured something it did not.
+func TestTheIdempotencySeriesCountsWhatItSays(t *testing.T) {
+	t.Parallel()
+
+	ok := func(body string) string { return `{"v":1,"id":"c1","ok":true,"result":{"b":"` + body + `"}}` }
+	failed := `{"v":1,"id":"c1","ok":false,"error":{"code":"internal","message":"nao deu"}}`
+
+	tests := map[string]struct {
+		answers  map[string][]string
+		pairs    []idempotentPair
+		state    string
+		contains []string
+	}{
+		"um comando que respondeu uma vez nao e um comando repetido": {
+			answers:  map[string][]string{"c1": {ok("a")}},
+			state:    "NAO MEDIDO",
+			contains: []string{"1 comandos com resposta, dos quais 0 responderam mais de uma vez"},
+		},
+		"um comando sem resposta nenhuma nao conta como comando com resposta": {
+			answers:  map[string][]string{"c1": {}},
+			state:    "NAO MEDIDO",
+			contains: []string{"0 comandos com resposta"},
+		},
+		"duas respostas de sucesso iguais sao a idempotencia funcionando": {
+			answers:  map[string][]string{"c1": {ok("a"), ok("a")}},
+			state:    "AFIRMADO",
+			contains: []string{"1 comandos com resposta, dos quais 1 responderam mais de uma vez"},
+		},
+		"duas respostas de sucesso diferentes sao efeito duplicado": {
+			answers:  map[string][]string{"c1": {ok("a"), ok("b")}},
+			state:    "QUEBRADO",
+			contains: []string{"foi respondido com sucesso 2 vezes"},
+		},
+		"uma falha e depois um sucesso diferente e reentrega, nao duplicacao": {
+			// MEASURED in the connector: the ledger remembers successes and nothing else
+			// (internal/session/session.go, "Only a success is remembered"). So the second
+			// attempt runs for real and answers differently, by design: the first left no
+			// side effect to duplicate.
+			answers:  map[string][]string{"c1": {failed, ok("a")}},
+			state:    "AFIRMADO",
+			contains: []string{"1 com alguma tentativa que falhou antes"},
+		},
+		"a maior folga e a maior, e nao a primeira": {
+			answers: map[string][]string{},
+			pairs: []idempotentPair{
+				{messageID: "m1", sid: "s1", firstID: "c-a", secondID: "c-b",
+					first: json.RawMessage(`{"message_id":"m1"}`), second: json.RawMessage(`{"message_id":"m1"}`),
+					gap: 200 * time.Millisecond},
+				{messageID: "m2", sid: "s1", firstID: "c-c", secondID: "c-d",
+					first: json.RawMessage(`{"message_id":"m2"}`), second: json.RawMessage(`{"message_id":"m2"}`),
+					gap: 50 * time.Millisecond},
+			},
+			state:    "AFIRMADO",
+			contains: []string{"a maior folga entre os dois pedidos sendo 200ms"},
+		},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			rep := &report{}
+			assertNoDuplicateEffect(rep, tc.answers, tc.pairs)
+			got := only(t, rep)
+			if got.state() != tc.state {
+				t.Fatalf("estado %q, queria %q (serie: %s, evidencia: %s)",
+					got.state(), tc.state, got.series, got.detail)
+			}
+			for _, want := range tc.contains {
+				if !strings.Contains(got.series+"\n"+got.detail, want) {
+					t.Errorf("nao diz %q:\n  serie: %s\n  evidencia: %s", want, got.series, got.detail)
+				}
+			}
+		})
+	}
+}
+
+// A deadline that passed and a hole in the delivery look the same from the consumer
+// groups, and only one of them is a defect of the connector.
+func TestPendingAfterADeadlineIsNotAHole(t *testing.T) {
+	t.Parallel()
+
+	busy := "o grupo consumidor nao drenou em 90 s depois da troca de dono"
+	tests := map[string]struct {
+		offenders    []string
+		stillWorking string
+		state        string
+	}{
+		"nada pendente, e a espera terminou pelo dreno": {nil, "", "AFIRMADO"},
+		"nada pendente, e a espera terminou pelo prazo": {nil, busy, "AFIRMADO"},
+		"pendente depois de um dreno que completou":     {[]string{"cmd:s1, grupo connector: 1 pendentes"}, "", "QUEBRADO"},
+		"pendente depois de uma espera que estourou":    {[]string{"cmd:s1, grupo connector: 1 pendentes"}, busy, "NAO MEDIDO"},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			got := consumerGroupVerdict(5, 5, tc.offenders, tc.stillWorking)
+			if got.state() != tc.state {
+				t.Fatalf("estado %q, queria %q (razao de nao medir: %q)", got.state(), tc.state, got.notWhy)
+			}
+			// The reason given is the reason printed, and not a rephrasing of it: the
+			// caller is the one that knows which deadline passed and how long it was.
+			if tc.state == "NAO MEDIDO" && got.notWhy != tc.stillWorking {
+				t.Errorf("a razao de nao ter medido nao e a que a fase deu:\n  saiu:  %q\n  queria: %q",
+					got.notWhy, tc.stillWorking)
+			}
+			if tc.state == "QUEBRADO" && got.notWhy != "" {
+				t.Errorf("um veredito de quebrado nao pode vir com razao de nao medir: %q", got.notWhy)
+			}
+		})
+	}
+}
+
+// A run where some streams were trimmed and others were not still has to say so: the note
+// is what keeps "no hole found" from being read as "every series was examined".
+func TestTruncationIsNamedEvenWhenOtherSeriesWereExamined(t *testing.T) {
+	t.Parallel()
+
+	rep := &report{}
+	assertNoLostEvent(rep, map[string][]protocol.Event{
+		"s1": {event("s1", "a", 1, 1), event("s1", "a", 1, 2)},
+		"s2": {event("s2", "a", 1, 1), event("s2", "a", 1, 3)},
+	}, map[string]bool{"s2": true})
+	got := only(t, rep)
+	if got.state() != "AFIRMADO" {
+		t.Fatalf("a serie intacta nao rendeu veredito: %q (%s)", got.state(), got.detail)
+	}
+	if !strings.Contains(got.detail, "ficaram de fora porque o stream delas chegou ao limite de corte") {
+		t.Errorf("uma serie ficou de fora por truncamento e a corrida nao diz:\n%s", got.detail)
+	}
+	if !strings.Contains(got.series, "1 de fora por truncamento") {
+		t.Errorf("a serie nao conta quantas ficaram de fora: %s", got.series)
+	}
+}
+
+// The load has to stop on every exit path, so `end` is called twice on the ordinary one:
+// once by the phase that reads the streams, once by the deferred call that covers the
+// error returns. Calling it twice has to be safe, or the safety net deadlocks the run.
+func TestTheLoadStopsTwice(t *testing.T) {
+	t.Parallel()
+
+	gen := &load{stop: func() {}}
+	first := gen.end()
+	done := make(chan int64, 1)
+	go func() { done <- gen.end() }()
+	select {
+	case second := <-done:
+		if second != first {
+			t.Errorf("a segunda parada contou %d comandos e a primeira %d", second, first)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a segunda chamada de end travou, entao o defer que protege as saidas de erro trava a corrida")
+	}
+}
+
+// Pending and lag are two ways for a group to still hold work, and a run that wanted both
+// at once would call a stuck consumer fine.
+func TestAGroupHoldsWorkUnderEitherNumber(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		pending, lag int64
+		offender     bool
+	}{
+		"nada pendente e nada atrasado":             {0, 0, false},
+		"entregue e nao confirmado, sem nada atras": {1, 0, true},
+		"nada entregue, e entradas esperando":       {0, 3, true},
+		"pendente e atrasado ao mesmo tempo":        {2, 5, true},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			got := groupOffender("wacbench1:cmd:s1", redis.XInfoGroup{
+				Name: "connector", Pending: tc.pending, Lag: tc.lag,
+			})
+			if (got != "") != tc.offender {
+				t.Fatalf("pendentes=%d lag=%d rendeu %q", tc.pending, tc.lag, got)
+			}
+			if tc.offender && !strings.Contains(got, "wacbench1:cmd:s1") {
+				t.Errorf("a evidencia nao nomeia o stream: %q", got)
+			}
+		})
+	}
+}
+
+// An answer that does not parse is not an answer this can vouch for, and it is also not
+// evidence to drop: dropping it is how two disagreeing replies stop being a finding
+// because neither could be read.
+func TestAnUnreadableAnswerIsStillCompared(t *testing.T) {
+	t.Parallel()
+
+	rep := &report{}
+	assertNoDuplicateEffect(rep, map[string][]string{
+		"c1": {`nao e json`, `tambem nao e json, e e outro texto`},
+	}, nil)
+	got := only(t, rep)
+	if got.state() != "QUEBRADO" {
+		t.Fatalf("duas respostas ilegiveis e diferentes sairam %q (evidencia: %s)", got.state(), got.detail)
 	}
 }

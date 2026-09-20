@@ -275,8 +275,9 @@ go build -o bin/fleetbench ./cmd/fleetbench
 WAC_TEST_DATABASE_URL=… WAC_TEST_REDIS_URL=… bin/fleetbench; echo $?
 ```
 
-`make bench-fleet` prints the code it got before it exits, so a human reading the output
-still sees which of the three it was.
+`make bench-fleet` prints the code it got before it exits, and make's own
+`*** [bench-fleet] Error 3` names it too, so a human reading the output sees which of the
+three it was. What neither of them changes is the status make leaves behind, which is 2.
 
 It is deliberately outside `make check`: it builds a binary, starts processes and waits on
 real clocks, which is minutes rather than the seconds `check` is allowed on every change.

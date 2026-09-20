@@ -39,7 +39,10 @@ const benchMaxConns = 20
 // same PostgreSQL, and `FLUSHDB` would take them; `SCRIPT FLUSH` would take them from
 // every database at once, because the script cache is per server and not per database.
 // So this file has no flush of any kind, which is a thing to check rather than to trust:
-// `grep -rn 'FLUSH' cmd/fleetbench` comes back empty.
+// `TestNoFlushReachesTheSharedRedis` walks the package's calls and fails on any of them.
+// It reads calls through the AST rather than grepping for the word, because a grep matches
+// this very sentence: a check that reports its own prose as the thing it was looking for
+// can never come back empty, and one that can never fail is not a check.
 type run struct {
 	id       string
 	prefix   string

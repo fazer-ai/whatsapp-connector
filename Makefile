@@ -113,8 +113,9 @@ tidy: ## Fail when go.mod/go.sum are not tidy
 # connectors on two databases calling themselves a fleet.
 # The bench answers in four exit codes, and two layers would swallow them.
 #
-# MEASURED: `go run` reports any non-zero status as 1 of its own (a program exiting 3 comes
-# back as 1, with `exit status 3` on stderr), and `make` exits 2 for any recipe that fails,
+# MEASURED on go1.26.6 and GNU Make 3.81: `go run` reports any non-zero status as 1 of its
+# own (a program exiting 3 comes back as 1, with `exit status 3` on stderr), and `make`
+# exits 2 for any recipe that fails,
 # whatever the recipe's own code was. Read through both, a broken invariant, a measurement
 # outside its range and a machine that was not ready are one number -- which is exactly
 # what having three codes exists to prevent.

@@ -69,7 +69,7 @@ func TestEveryDeliberateExemptionStillDescribesTheMakefile(t *testing.T) {
 
 // A target whose exit code is part of its contract cannot be run through `go run`.
 //
-// MEASURED on go1.24/darwin: a program that exits 3 comes back from `go run` as 1, with
+// MEASURED on go1.26.6/darwin: a program that exits 3 comes back from `go run` as 1, with
 // `exit status 3` printed on stderr. The fleet bench answers in four codes on purpose --
 // 0 green, 1 a broken invariant, 2 a machine that was not ready, 3 a measurement outside
 // its range -- and one of the scenarios this repository is held to fails outright if a
