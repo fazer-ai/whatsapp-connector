@@ -339,15 +339,22 @@ func waitForQuietStreams(ctx context.Context, cl *client, shards int, within tim
 	deadline := time.Now().Add(within)
 	var quiet stillness
 	for {
-		total := int64(0)
+		// The last entry id of every shard, and not the sum of their lengths.
+		//
+		// `Streams.Publish` trims with approximate MAXLEN, so once a shard reaches
+		// `DefaultEventMaxLen` its length stops moving while new entries keep replacing old
+		// ones: two readings agreeing on the length would then report a fleet at full
+		// throughput as one that had gone quiet. A stream id only ever grows, so the pair
+		// (length, last id) moves whenever anything was published.
+		mark := ""
 		for shard := range shards {
 			read, err := cl.eventsOn(ctx, shard)
 			if err != nil {
 				return false, err
 			}
-			total += read.length
+			mark += fmt.Sprintf("%d:%d:%s|", shard, read.length, read.lastID)
 		}
-		if quiet.saw(total) {
+		if quiet.saw(mark) {
 			return true, nil
 		}
 		if time.Now().After(deadline) {
@@ -368,17 +375,17 @@ func waitForQuietStreams(ctx context.Context, cl *client, shards int, within tim
 // produces on purpose. Its own type so the count can be disproved in a table, instead of
 // only by a four-minute run whose streams would have to be caught mid-burst.
 type stillness struct {
-	last  int64
+	last  string
 	runs  int
 	begun bool
 }
 
 // saw records a reading and reports whether the streams have held still long enough.
-func (s *stillness) saw(total int64) bool {
-	if s.begun && total == s.last {
+func (s *stillness) saw(mark string) bool {
+	if s.begun && mark == s.last {
 		s.runs++
 		return s.runs >= 3
 	}
-	s.last, s.runs, s.begun = total, 1, true
+	s.last, s.runs, s.begun = mark, 1, true
 	return false
 }

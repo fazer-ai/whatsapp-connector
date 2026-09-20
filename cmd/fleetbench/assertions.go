@@ -624,6 +624,14 @@ func markUnmeasured(claims []*assertion, why string) {
 		return
 	}
 	for _, claim := range claims {
+		// A violation already observed stays a violation. More events cannot undo a seq
+		// that regressed, a session that landed on two shards, or two instances that held
+		// one lease: the tail that had not arrived could only have added to the evidence.
+		// Overwriting it would turn a defect (exit 1) into an incomplete run (exit 2),
+		// which is the one direction this must never move.
+		if claim.state() == "QUEBRADO" {
+			continue
+		}
 		if claim.notWhy == "" {
 			claim.notWhy = why
 		}

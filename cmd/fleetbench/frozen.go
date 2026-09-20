@@ -66,8 +66,12 @@ func frozenOwner(ctx context.Context, active *run, cl *client, rep *report, plan
 	rep.note(fmt.Sprintf("fase do dono congelado: antes de congelar, a frota estava assim: %v. "+
 		"Congelada a que mais segura, %s, com %d sessoes.", holding, frozen.name, most))
 	if most == 0 {
-		rep.note("fase do dono congelado: nenhuma instancia viva segurava sessao nenhuma, entao nao ha " +
-			"posse a perder e a metade da cerca da invariante 1 fica SEM MEDIDA nesta corrida")
+		// Claimed, not noted, for the same reason as the empty-adoption branch below: a
+		// note does not reach the exit code, and the earlier phases leave enough behind for
+		// every other assertion to hold.
+		rep.assert(fenceExercised(0, "nenhuma instancia viva segurava sessao quando a fase comecou",
+			"nenhuma instancia viva segurava sessao nenhuma, entao nao havia posse a perder e nada "+
+				"nesta corrida pode quebrar a cerca"))
 		return nil
 	}
 	owner, peers = frozen, watching

@@ -92,6 +92,7 @@ type shardRead struct {
 	events  []protocol.Event
 	length  int64
 	firstID string
+	lastID  string
 }
 
 func (c *client) eventsOn(ctx context.Context, shard int) (shardRead, error) {
@@ -110,6 +111,7 @@ func (c *client) eventsOn(ctx context.Context, shard int) (shardRead, error) {
 	}
 	if len(entries) > 0 {
 		read.firstID = entries[0].ID
+		read.lastID = entries[len(entries)-1].ID
 	}
 	for _, entry := range entries {
 		fields := make(map[string]string, len(entry.Values))

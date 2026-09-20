@@ -743,23 +743,27 @@ func TestStillnessNeedsMoreThanOneQuietReading(t *testing.T) {
 	t.Parallel()
 
 	tests := map[string]struct {
-		readings []int64
+		readings []string
 		settled  bool
 	}{
-		"uma leitura so nao basta":            {[]int64{10}, false},
-		"duas iguais ainda nao bastam":        {[]int64{10, 10}, false},
-		"tres iguais seguidas bastam":         {[]int64{10, 10, 10}, true},
-		"o publicador entre dois eventos":     {[]int64{10, 10, 12, 12}, false},
-		"a contagem recomeca depois de subir": {[]int64{10, 10, 12, 12, 12}, true},
-		"crescendo o tempo todo":              {[]int64{1, 2, 3, 4, 5, 6}, false},
+		"uma leitura so nao basta":            {[]string{"0:10:5-1|"}, false},
+		"duas iguais ainda nao bastam":        {[]string{"0:10:5-1|", "0:10:5-1|"}, false},
+		"tres iguais seguidas bastam":         {[]string{"0:10:5-1|", "0:10:5-1|", "0:10:5-1|"}, true},
+		"o publicador entre dois eventos":     {[]string{"0:10:5-1|", "0:10:5-1|", "0:12:7-1|", "0:12:7-1|"}, false},
+		"a contagem recomeca depois de subir": {[]string{"0:10:5-1|", "0:10:5-1|", "0:12:7-1|", "0:12:7-1|", "0:12:7-1|"}, true},
+		"crescendo o tempo todo":              {[]string{"0:1:1-1|", "0:2:2-1|", "0:3:3-1|", "0:4:4-1|"}, false},
+		// The case the length alone cannot see: a shard at DefaultEventMaxLen keeps its
+		// length while approximate trimming replaces its entries.
+		"stream cheio, comprimento parado, id andando": {
+			[]string{"0:1000:900-1|", "0:1000:901-1|", "0:1000:902-1|", "0:1000:903-1|"}, false},
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			var quiet stillness
 			settled := false
-			for _, total := range tc.readings {
-				settled = quiet.saw(total)
+			for _, mark := range tc.readings {
+				settled = quiet.saw(mark)
 				if settled {
 					break
 				}
@@ -813,5 +817,27 @@ func TestAnUnsettledStreamLeavesTheStreamClaimsUnmeasured(t *testing.T) {
 	}
 	if got := rep.outcome(); got != outcomeSetup {
 		t.Errorf("o desfecho saiu %s, e uma corrida que leu sequencia parcial nao e verde", got.label())
+	}
+}
+
+// More events cannot undo a violation that was already observed, so an unsettled stream
+// must not turn a defect into an incomplete run.
+func TestAProvenViolationSurvivesAnUnsettledStream(t *testing.T) {
+	t.Parallel()
+
+	rep := &report{}
+	rep.assert(&assertion{claim: "seq nao diminui", points: 4, held: false,
+		detail: "s1 no epoch 2: seq 3 veio depois de seq 7"})
+	rep.assert(&assertion{claim: "cada sid num shard so", points: 4, held: true})
+	markUnmeasured(rep.assertions, "os shards ainda cresciam quando o prazo acabou")
+
+	if got := rep.assertions[0].state(); got != "QUEBRADO" {
+		t.Fatalf("a violacao ja observada virou %q, e evento que faltava chegar so somaria evidencia", got)
+	}
+	if got := rep.assertions[1].state(); got != "NAO MEDIDO" {
+		t.Errorf("a afirmacao que valia sobre leitura parcial saiu %q", got)
+	}
+	if got := rep.outcome(); got != outcomeInvariant {
+		t.Errorf("o desfecho saiu %s, e um defeito nao pode virar corrida incompleta", got.label())
 	}
 }
