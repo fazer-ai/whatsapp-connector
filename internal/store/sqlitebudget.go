@@ -72,6 +72,12 @@ func (c budgetedConnector) Connect(ctx context.Context) (driver.Conn, error) {
 // is only what names the error: 363..368ms over six runs against a three hundred
 // millisecond ceiling. A caller that sets seconds will not notice; a test that sets three
 // hundred milliseconds and asserts on the ceiling has to.
+//
+// What holds that is `TestTheBudgetOnTheConnectionIsTheCallersTimePlusTheSlack`, which
+// reads the number off the connection, and not an assertion on how long a call took: a
+// goroutine descheduled past its own deadline is answered by `database/sql` before the
+// driver is reached, and a floor on the elapsed time would call that correct run a
+// failure.
 const budgetSlack = 50 * time.Millisecond
 
 // budgetedConn holds what it forwards, rather than asserting per call.

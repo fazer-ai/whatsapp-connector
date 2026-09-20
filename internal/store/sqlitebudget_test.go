@@ -102,8 +102,7 @@ func TestAContendedWriteComesBackOnTheCallersClock(t *testing.T) {
 
 			began := time.Now()
 			_, err := db.ExecContext(ctx, `INSERT INTO wac293 VALUES ('mine')`)
-			returned := time.Now()
-			took := returned.Sub(began)
+			took := time.Since(began)
 
 			if err == nil {
 				t.Fatal("the write went through, so nothing was holding the file")
@@ -116,24 +115,6 @@ func TestAContendedWriteComesBackOnTheCallersClock(t *testing.T) {
 			}
 			if !errors.Is(err, context.DeadlineExceeded) {
 				t.Errorf("the failure is %v, want the caller's own deadline: every classifier above branches on that", err)
-			}
-			// And it does not come back early either, which is what makes the overrun
-			// the comments above and in `group.go` name a measured number rather than a
-			// guess. What ends the wait is the busy handler, at the caller's deadline
-			// plus `budgetSlack`; the context only names the error. A write that came
-			// back before that did not wait out the budget it installed, and the
-			// arithmetic said one thing while the connection did another.
-			//
-			// Against the deadline itself rather than against the timeout it was made
-			// from, because the two are not the same instant: whatever the budget is
-			// derived from, the wait it installs ends at `deadline + budgetSlack`, and
-			// that holds however long this goroutine waited to be scheduled in between.
-			// The millisecond is the truncation in `wanted.Milliseconds()`.
-			floor := deadlineOf(ctx, t).Add(budgetSlack - time.Millisecond)
-			if returned.Before(floor) {
-				t.Errorf("the write came back %s before its budget ran out: the busy "+
-					"handler gave up early, so the ceiling installed was not the one "+
-					"derived", floor.Sub(returned))
 			}
 		})
 	}
