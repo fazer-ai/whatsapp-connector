@@ -55,30 +55,39 @@ func namesOf(commands map[protocol.CommandType]bool) string {
 	return strings.Join(names, ", ")
 }
 
-// sentenceIntroducing is the sentence that presents the list of waits, with the waits
-// themselves taken out of it.
+// sentencesAboutTheList is every sentence in the run that talks about the waits, with the
+// waits' own phrases taken out of them.
 //
-// The sentence and not the run, because the run opens with "A command carries two different
-// ceilings" and the waits themselves say "one send per connection at a time": a check over
-// the whole run that trips on any numeral trips on those, and a fence that cries wolf gets
-// turned off. Taking the phrases out is what lets the rest of the sentence be read plainly.
-func sentenceIntroducing(run string) string {
-	first := strings.Index(run, waitsNoCeilingReaches[0].phrase)
-	if first < 0 {
-		return ""
-	}
-	opening := strings.LastIndex(run[:first], ". ")
-	if opening < 0 {
-		opening = -2
-	}
-	sentence := run[opening+2:]
-	if end := strings.Index(sentence, ". "); end >= 0 {
-		sentence = sentence[:end]
-	}
+// Every sentence and not just the one presenting the list: review round 1 on #305 found
+// that narrowing to the presenting sentence dropped the paragraph above it, where `But
+// some paths escape every ceiling, named below` could become `But two of them escape every
+// ceiling, named below` and pass. That sentence counts the same list from a distance, and
+// the old regex caught it by accident, through the `named below` it happens to contain.
+//
+// The phrases come out because a check that trips on any numeral trips on the waits
+// themselves -- `one send per connection at a time` -- and on the run's own opening, `A
+// command carries two different ceilings`, which counts the caller's fields and not the
+// waits. What is left is the sentence talking about the list in its own words.
+func sentencesAboutTheList(run string) string {
+	withoutWaits := run
 	for _, wait := range waitsNoCeilingReaches {
-		sentence = strings.ReplaceAll(sentence, wait.phrase, "")
+		withoutWaits = strings.ReplaceAll(withoutWaits, wait.phrase, "")
 	}
-	return sentence
+	// What makes a sentence one of these is that it refers to the list rather than
+	// mentioning a wait: the presenting sentence, and any other that points at it.
+	var about []string
+	for _, sentence := range strings.Split(withoutWaits, ". ") {
+		for _, marker := range []string{
+			"way out holds", "escape every ceiling", "named below",
+			"waits on a send's way out", "such waits",
+		} {
+			if strings.Contains(sentence, marker) {
+				about = append(about, sentence)
+				break
+			}
+		}
+	}
+	return strings.Join(about, ". ")
 }
 
 // countsIn reads the counts a sentence fixes.
@@ -162,7 +171,7 @@ func TestTheContractSaysWhatBoundsACommandWithNoCeilingOfItsOwn(t *testing.T) {
 			named++
 		}
 	}
-	for _, hit := range countsIn(sentenceIntroducing(run)) {
+	for _, hit := range countsIn(sentencesAboutTheList(run)) {
 		if hit.is != named {
 			t.Errorf("PROTOCOL.md says %q while the run names %d waits no ceiling reaches: "+
 				"the count was two, then three when the socket read lock turned up, and a "+
