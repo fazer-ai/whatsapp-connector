@@ -3,8 +3,11 @@ package protocol_test
 import (
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 	"testing"
+
+	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 )
 
 // #165 asked which commands should be given a ceiling. Measured, the answer was that none
@@ -19,6 +22,120 @@ import (
 // rather than the file. The difference is not pedantry: `timeout`, `message_id` and
 // `idempotency_key` all appear elsewhere in `PROTOCOL.md`, so a whole-file search would go
 // green on a paragraph that had been cut down to its first sentence.
+// waitsNoCeilingReaches is the list the contract names and the list this file checks, and
+// it is one list because it used to be two.
+//
+// The count read one of them and the clauses read the other, and the second was missing an
+// entry: deleting the send lock from `PROTOCOL.md` left the suite green while deleting
+// either of the other two went red (#292). That is the wait a client is most likely to
+// meet, because every send takes it.
+var waitsNoCeilingReaches = []struct {
+	what   string
+	phrase string
+	why    string
+}{
+	{"the socket write it does not cover", "already being written to the socket",
+		"a client would otherwise read `timeout` as proof WhatsApp was asked"},
+	{"the send lock the library takes", "one send per connection at a time",
+		"every send takes it, so it is the one of the three a client actually meets, and a " +
+			"command held by it comes back no sooner for having named a ceiling"},
+	{"the third wait no ceiling reaches", "the read lock on the socket",
+		"a reconnection holds the write half for the length of its dial, and autoReconnect " +
+			"is what calls it, so this one is held precisely during the reconnection #283 " +
+			"is about"},
+}
+
+// namesOf lists a set of commands for a failure message, in a stable order.
+func namesOf(commands map[protocol.CommandType]bool) string {
+	var names []string
+	for command := range commands {
+		names = append(names, string(command))
+	}
+	sort.Strings(names)
+	return strings.Join(names, ", ")
+}
+
+// sentencesAboutTheList is every sentence in the run that talks about the waits, with the
+// waits' own phrases taken out of them.
+//
+// Every sentence and not just the one presenting the list: review round 1 on #305 found
+// that narrowing to the presenting sentence dropped the paragraph above it, where `But
+// some paths escape every ceiling, named below` could become `But two of them escape every
+// ceiling, named below` and pass. That sentence counts the same list from a distance, and
+// the old regex caught it by accident, through the `named below` it happens to contain.
+//
+// The phrases come out because a check that trips on any numeral trips on the waits
+// themselves -- `one send per connection at a time` -- and on the run's own opening, `A
+// command carries two different ceilings`, which counts the caller's fields and not the
+// waits. What is left is the sentence talking about the list in its own words.
+func sentencesAboutTheList(run string) string {
+	withoutWaits := run
+	for _, wait := range waitsNoCeilingReaches {
+		withoutWaits = strings.ReplaceAll(withoutWaits, wait.phrase, "")
+	}
+	// What makes a sentence one of these is that it refers to the list rather than
+	// mentioning a wait: the presenting sentence, and any other that points at it.
+	var about []string
+	for _, sentence := range strings.Split(withoutWaits, ". ") {
+		for _, marker := range []string{
+			"way out holds", "escape every ceiling", "named below",
+			"waits on a send's way out", "such waits",
+		} {
+			if strings.Contains(sentence, marker) {
+				about = append(about, sentence)
+				break
+			}
+		}
+	}
+	return strings.Join(about, ". ")
+}
+
+// countsIn reads the counts a sentence fixes.
+//
+// By the number rather than by the phrasing around it, which is the hole #292 names: the
+// old check matched two constructions and its own comment promised all of them, so `holds
+// exactly two:`, `holds two, and no more:`, `there are two such waits...` and `holds a pair
+// of them:` all passed green on a list of three. A lower bound is not a count and is meant
+// to pass -- the contract says two paragraphs up that it does not claim the list complete,
+// and a lower bound agrees with that while an exact count is a promise the next pin bump
+// can break.
+//
+// It does not catch every way English can fix a number, and that is worth saying rather
+// than promising otherwise: a sentence that spells the count some way this does not know
+// passes. What stops that from being the whole defence is the clause requiring the contract
+// to say the list is not claimed complete, which is checked separately and is the sentence
+// that makes any count a lower bound.
+func countsIn(sentence string) []struct {
+	written string
+	is      int
+} {
+	words := map[string]int{
+		"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+		"a pair": 2, "a couple": 2, "both": 2,
+	}
+	var found []struct {
+		written string
+		is      int
+	}
+	for word, value := range words {
+		spelling := regexp.MustCompile(`(?i)(\w+\s+\w+\s+)?\b` + regexp.QuoteMeta(word) + `\b`)
+		for _, hit := range spelling.FindAllString(sentence, -1) {
+			// "more than one" and "at least two" are lower bounds, which the paragraph is
+			// entitled to give: they stay true when the list grows.
+			lower := strings.ToLower(hit)
+			if strings.Contains(lower, "more than") || strings.Contains(lower, "at least") ||
+				strings.Contains(lower, "no fewer") {
+				continue
+			}
+			found = append(found, struct {
+				written string
+				is      int
+			}{hit, value})
+		}
+	}
+	return found
+}
+
 func TestTheContractSaysWhatBoundsACommandWithNoCeilingOfItsOwn(t *testing.T) {
 	t.Parallel()
 
@@ -49,24 +166,17 @@ func TestTheContractSaysWhatBoundsACommandWithNoCeilingOfItsOwn(t *testing.T) {
 	// count is a promise the next pin bump can break.
 	run := strings.Join(theCeilingRun(t, prose), "\n\n")
 	named := 0
-	for _, wait := range []string{
-		"already being written to the socket",
-		"one send per connection at a time",
-		"the read lock on the socket",
-	} {
-		if strings.Contains(run, wait) {
+	for _, wait := range waitsNoCeilingReaches {
+		if strings.Contains(run, wait.phrase) {
 			named++
 		}
 	}
-	words := map[string]int{"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6}
-	counting := regexp.MustCompile(`(?i)\b(one|two|three|four|five|six)\b of (?:them|these|those)\b[^.]{0,30}?\b(?:named below|on a send's way out)\b|\ball of (?:them|these|those) but (?:those )?\b(one|two|three|four|five|six)\b`)
-	for _, hit := range counting.FindAllStringSubmatch(run, -1) {
-		word := hit[1] + hit[2]
-		if words[word] != named {
+	for _, hit := range countsIn(sentencesAboutTheList(run)) {
+		if hit.is != named {
 			t.Errorf("PROTOCOL.md says %q while the run names %d waits no ceiling reaches: "+
 				"the count was two, then three when the socket read lock turned up, and a "+
 				"number written out does not move when the list under it does. Say it "+
-				"without fixing a number, or move both", hit[0], named)
+				"without fixing a number, or move both", hit.written, named)
 		}
 	}
 	if !strings.Contains(run, "does not claim the list is complete") {
@@ -88,27 +198,34 @@ func TestTheContractSaysWhatBoundsACommandWithNoCeilingOfItsOwn(t *testing.T) {
 	// The count in that lead is a word, and a word does not move when the list under it
 	// does. #285's fence was written after "Four of these" survived a list that had gone
 	// down to three, so this compares the two rather than trusting either.
-	countedCommands := map[string]int{"One": 1, "Two": 2, "Three": 3, "Four": 4, "Five": 5}
+	// Which commands those are comes from the code, not from a list here. A fifth command
+	// reaching the gate would leave a literal saying four, and so would a literal moved
+	// into a constant or a table: what separates a derived list from a relocated one is
+	// that a command leaving the gate moves it too (#292).
+	reaching := commandsThatReach(t, "putOnTheWire")
+	countedCommands := map[string]int{"One": 1, "Two": 2, "Three": 3, "Four": 4, "Five": 5, "Six": 6}
 	for word, want := range countedCommands {
 		if !strings.Contains(found, word+" commands now carry a ceiling") {
 			continue
 		}
+		if len(reaching) != want {
+			t.Errorf("the lead says %q but %d commands reach putOnTheWire (%s): a count "+
+				"written as a word does not move when the code does",
+				word+" commands", len(reaching), namesOf(reaching))
+		}
 		named := 0
-		for _, command := range []string{
-			"`message.send`", "`message.edit`", "`message.revoke`", "`message.react`",
-		} {
-			if strings.Contains(found, command) {
+		for command := range reaching {
+			if strings.Contains(found, "`"+string(command)+"`") {
 				named++
 			}
 		}
-		if named != want {
-			t.Errorf("the lead says %q but the run names %d of the four commands that reach "+
-				"putOnTheWire: a count written as a word does not move when the list does",
-				word+" commands", named)
+		if named != len(reaching) {
+			t.Errorf("the run names %d of the %d commands that reach putOnTheWire (%s): a "+
+				"client reads the paragraph, not the switch", named, len(reaching), namesOf(reaching))
 		}
 	}
 
-	for _, clause := range []struct {
+	clauses := []struct {
 		what   string
 		phrase string
 		why    string
@@ -151,8 +268,6 @@ func TestTheContractSaysWhatBoundsACommandWithNoCeilingOfItsOwn(t *testing.T) {
 			"a named example, because `may already have happened` reads as hypothetical"},
 		{"reading the state back", "reads the state back before resending",
 			"it is the only thing a client can actually do about it"},
-		{"the socket write it does not cover", "already being written to the socket",
-			"a client would otherwise read `timeout` as proof WhatsApp was asked"},
 		{"what a client can actually do about that one", "its own timeout on the reply",
 			"it is the only remedy left once no field on the command reaches the wait"},
 		{"that the list of unbounded paths is not claimed complete",
@@ -193,11 +308,11 @@ func TestTheContractSaysWhatBoundsACommandWithNoCeilingOfItsOwn(t *testing.T) {
 		{"why the other three are safe to resend", "an identifier the receiving side already holds",
 			"the argument that makes a resend safe is the same one the send has, and it was " +
 				"written for the send alone"},
-		{"the third wait no ceiling reaches", "the read lock on the socket",
-			"a reconnection holds the write half for the length of its dial, and autoReconnect " +
-				"is what calls it, so this one is held precisely during the reconnection #283 " +
-				"is about"},
-	} {
+	}
+	// The three waits are checked as clauses too, from the same list the count reads, so
+	// the two cannot disagree about which waits exist the way they did before #292.
+	clauses = append(clauses, waitsNoCeilingReaches...)
+	for _, clause := range clauses {
 		if !strings.Contains(found, clause.phrase) {
 			t.Errorf("the paragraph about a command with neither field does not say %s (%q): %s",
 				clause.what, clause.phrase, clause.why)
