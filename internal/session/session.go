@@ -1247,14 +1247,14 @@ func (s *Session) reserve(ctx context.Context, command *protocol.Command, key st
 		func(write context.Context) error { return s.ledger.Reserve(write, s.sid, key) })
 }
 
-// release takes the attempt back off for a command the connector is certain never reached
-// WhatsApp. A failure here is the one that costs the caller something real: the retry is
-// answered `not_settled` for work that provably never happened, so it is tried as hard as
-// the others and said just as loudly.
+// release takes the attempt back off for a failure that left no write standing at WhatsApp,
+// which is every failure the engine did not mark. A failure here is the one that costs the
+// caller something real: the retry is answered `timeout` for work that never happened, so
+// it is tried as hard as the others and said just as loudly.
 func (s *Session) release(ctx context.Context, command *protocol.Command, key string) {
 	s.writeToLedger(ctx, command, key, "take the attempt back off",
-		"a command was refused before it reached WhatsApp and the attempt could not be taken back off; "+
-			"a redelivery will answer not_settled for work that never happened",
+		"a command failed without leaving a write at WhatsApp and the attempt could not be taken back off; "+
+			"a redelivery will answer timeout for work that never happened",
 		func(write context.Context) error { return s.ledger.Release(write, s.sid, key) })
 }
 
