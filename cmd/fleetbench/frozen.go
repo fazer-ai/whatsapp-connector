@@ -190,18 +190,13 @@ func frozenOwner(ctx context.Context, active *run, cl *client, rep *report, plan
 	// this phase existed, and what let the mutant that removes the fence come out green.
 	// As an assertion with an empty series it comes out NAO MEDIDO, and the run says so in
 	// its exit code.
-	rep.assert(&assertion{
-		invariant: "1 (perder a lease cerca a sessao na hora: o dono que ficou sem ela para de publicar)",
-		claim:     "a cerca foi exercitada: um par assumiu sessao enquanto o dono seguia vivo e parado",
-		series: fmt.Sprintf("%d sessoes assumidas pelos pares durante %s de congelamento de %s",
+	rep.assert(fenceExercised(taken,
+		fmt.Sprintf("%d sessoes assumidas pelos pares durante %s de congelamento de %s",
 			taken, hold.Round(time.Second), owner.name),
-		points: taken,
-		held:   taken > 0,
-		notWhy: ifEmpty(taken, fmt.Sprintf("%s ficou parada %s, mais que o WAC_LEASE_TTL de %s, e ainda "+
-			"assim nenhum par assumiu sessao nenhuma. Sem adocao, o que ela publicar ao voltar nao e "+
-			"publicacao sem posse, e nada nesta corrida pode quebrar a cerca",
-			owner.name, hold.Round(time.Second), benchLeaseTTL)),
-	})
+		fmt.Sprintf("%s ficou parada %s, mais que o WAC_LEASE_TTL de %s, e ainda assim nenhum par "+
+			"assumiu sessao nenhuma. Sem adocao, o que ela publicar ao voltar nao e publicacao sem "+
+			"posse, e nada nesta corrida pode quebrar a cerca",
+			owner.name, hold.Round(time.Second), benchLeaseTTL)))
 	if taken == 0 {
 		return nil
 	}
@@ -210,4 +205,22 @@ func frozenOwner(ctx context.Context, active *run, cl *client, rep *report, plan
 		"depois disso e publicacao de quem ja nao tem a lease, e a ordem do stream do shard e o que "+
 		"torna isso visivel daqui.", owner.name, hold.Round(time.Second), sent, taken))
 	return nil
+}
+
+// fenceExercised is the claim that the fence half of invariant 1 was actually reached, and
+// the adoptions are its series.
+//
+// A function of its own, called by both the phase and the branch that skips it, because a
+// verdict built inline is a verdict only a four-minute run against two servers can
+// disprove -- and the case worth disproving is the empty one, which a healthy fleet will
+// not produce on demand.
+func fenceExercised(taken int, series, why string) *assertion {
+	return &assertion{
+		invariant: "1 (perder a lease cerca a sessao na hora: o dono que ficou sem ela para de publicar)",
+		claim:     "a cerca foi exercitada: um par assumiu sessao enquanto o dono seguia vivo e parado",
+		series:    series,
+		points:    taken,
+		held:      taken > 0,
+		notWhy:    ifEmpty(taken, why),
+	}
 }

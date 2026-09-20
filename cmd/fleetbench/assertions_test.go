@@ -701,14 +701,10 @@ func TestTheFenceIsAClaimWithASeries(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			rep := &report{}
-			rep.assert(&assertion{
-				invariant: "1",
-				claim:     "a cerca foi exercitada",
-				series:    "serie",
-				points:    tc.taken,
-				held:      tc.taken > 0,
-				notWhy:    ifEmpty(tc.taken, "nenhum par assumiu sessao nenhuma"),
-			})
+			// Through the function the phase itself calls, and not through an assertion
+			// built here to agree with it: a copy of the verdict in the test is a test that
+			// passes whatever the phase does.
+			rep.assert(fenceExercised(tc.taken, "serie", "nenhum par assumiu sessao nenhuma"))
 			if got := only(t, rep).state(); got != tc.state {
 				t.Fatalf("com %d adocoes o estado saiu %q, queria %q", tc.taken, got, tc.state)
 			}
@@ -720,6 +716,42 @@ func TestTheFenceIsAClaimWithASeries(t *testing.T) {
 			}
 			if got := rep.outcome(); got != want {
 				t.Errorf("o desfecho saiu %s, queria %s", got.label(), want.label())
+			}
+		})
+	}
+}
+
+// A stream that did not grow since the last look is not a stream that stopped: it can be a
+// publisher between two events, and this bench produces bursts on purpose.
+func TestStillnessNeedsMoreThanOneQuietReading(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		readings []int64
+		settled  bool
+	}{
+		"uma leitura so nao basta":            {[]int64{10}, false},
+		"duas iguais ainda nao bastam":        {[]int64{10, 10}, false},
+		"tres iguais seguidas bastam":         {[]int64{10, 10, 10}, true},
+		"o publicador entre dois eventos":     {[]int64{10, 10, 12, 12}, false},
+		"a contagem recomeca depois de subir": {[]int64{10, 10, 12, 12, 12}, true},
+		"crescendo o tempo todo":              {[]int64{1, 2, 3, 4, 5, 6}, false},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			var quiet stillness
+			settled := false
+			for _, total := range tc.readings {
+				settled = quiet.saw(total)
+				if settled {
+					break
+				}
+			}
+			if settled != tc.settled {
+				t.Fatalf("depois de %v a espera %s, e devia %s", tc.readings,
+					map[bool]string{true: "terminou", false: "seguiu"}[settled],
+					map[bool]string{true: "terminar", false: "seguir"}[tc.settled])
 			}
 		})
 	}

@@ -190,15 +190,10 @@ func handover(ctx context.Context, active *run, group *fleet, cl *client, rep *r
 		// Same shape as the phase's own empty result: an assertion with no series, so the
 		// run's exit code says the fence went unmeasured instead of a note saying it while
 		// the code says VERDE.
-		rep.assert(&assertion{
-			invariant: "1 (perder a lease cerca a sessao na hora: o dono que ficou sem ela para de publicar)",
-			claim:     "a cerca foi exercitada: um par assumiu sessao enquanto o dono seguia vivo e parado",
-			series:    "a fase que produz a cerca nao rodou",
-			points:    0,
-			notWhy: fmt.Sprintf("a corrida subiu %d processos, e congelar o unico par deixaria a frota "+
-				"sem ninguem para assumir as sessoes dele. Um dono morto nao publica, entao nenhuma morte "+
-				"desta corrida pode quebrar a cerca. Use -processes 3 ou mais", plan.processes),
-		})
+		rep.assert(fenceExercised(0, "a fase que produz a cerca nao rodou",
+			fmt.Sprintf("a corrida subiu %d processos, e congelar o unico par deixaria a frota sem "+
+				"ninguem para assumir as sessoes dele. Um dono morto nao publica, entao nenhuma morte "+
+				"desta corrida pode quebrar a cerca. Use -processes 3 ou mais", plan.processes)))
 	}
 
 	// Stopped before anything is read, so nothing is still writing to a stream the
@@ -339,7 +334,7 @@ func waitForDrain(ctx context.Context, cl *client, peers []*instance, sids []str
 // the middle of exactly the burst this bench produces on purpose.
 func waitForQuietStreams(ctx context.Context, cl *client, shards int, within time.Duration) (bool, error) {
 	deadline := time.Now().Add(within)
-	last, still := int64(-1), 0
+	var quiet stillness
 	for {
 		total := int64(0)
 		for shard := range shards {
@@ -349,13 +344,8 @@ func waitForQuietStreams(ctx context.Context, cl *client, shards int, within tim
 			}
 			total += read.length
 		}
-		if total == last {
-			still++
-			if still == 3 {
-				return true, nil
-			}
-		} else {
-			last, still = total, 0
+		if quiet.saw(total) {
+			return true, nil
 		}
 		if time.Now().After(deadline) {
 			return false, nil
@@ -366,4 +356,26 @@ func waitForQuietStreams(ctx context.Context, cl *client, shards int, within tim
 		case <-time.After(time.Second):
 		}
 	}
+}
+
+// stillness counts how many readings in a row found the same total.
+//
+// Three and not one: a publisher between two events leaves a stream that did not grow
+// since the last look, and stopping there stops in the middle of the burst this bench
+// produces on purpose. Its own type so the count can be disproved in a table, instead of
+// only by a four-minute run whose streams would have to be caught mid-burst.
+type stillness struct {
+	last  int64
+	runs  int
+	begun bool
+}
+
+// saw records a reading and reports whether the streams have held still long enough.
+func (s *stillness) saw(total int64) bool {
+	if s.begun && total == s.last {
+		s.runs++
+		return s.runs >= 3
+	}
+	s.last, s.runs, s.begun = total, 1, true
+	return false
 }
