@@ -2,8 +2,6 @@ package main
 
 import (
 	"go/ast"
-	"go/parser"
-	"go/token"
 	"strings"
 	"testing"
 )
@@ -24,36 +22,30 @@ import (
 func TestNoFlushReachesTheSharedRedis(t *testing.T) {
 	t.Parallel()
 
-	pkgs, err := parser.ParseDir(token.NewFileSet(), ".", nil, 0)
-	if err != nil {
-		t.Fatalf("a cerca nao conseguiu ler o pacote: %v", err)
-	}
 	calls := 0
-	for _, pkg := range pkgs {
-		for path, file := range pkg.Files {
-			ast.Inspect(file, func(n ast.Node) bool {
-				call, ok := n.(*ast.CallExpr)
-				if !ok {
-					return true
-				}
-				calls++
-				name := ""
-				switch fn := call.Fun.(type) {
-				case *ast.SelectorExpr:
-					name = fn.Sel.Name
-				case *ast.Ident:
-					name = fn.Name
-				}
-				// FlushDB, FlushAll, FlushDBAsync, ScriptFlush: every one of them reaches
-				// past this run's prefix, and go-redis spells them all with `Flush`.
-				if strings.Contains(name, "Flush") {
-					t.Errorf("%s: chama %s. Esta bancada divide o Redis com outras frotas da maquina, "+
-						"e o isolamento dela e so por identificador: um flush leva chave que nao e desta "+
-						"corrida", path, name)
-				}
+	for path, file := range packageFiles(t) {
+		ast.Inspect(file, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
 				return true
-			})
-		}
+			}
+			calls++
+			name := ""
+			switch fn := call.Fun.(type) {
+			case *ast.SelectorExpr:
+				name = fn.Sel.Name
+			case *ast.Ident:
+				name = fn.Name
+			}
+			// FlushDB, FlushAll, FlushDBAsync, ScriptFlush: every one of them reaches past
+			// this run's prefix, and go-redis spells them all with `Flush`.
+			if strings.Contains(name, "Flush") {
+				t.Errorf("%s: chama %s. Esta bancada divide o Redis com outras frotas da maquina, "+
+					"e o isolamento dela e so por identificador: um flush leva chave que nao e desta "+
+					"corrida", path, name)
+			}
+			return true
+		})
 	}
 	if calls == 0 {
 		t.Fatal("a cerca nao achou chamada nenhuma, entao ela nao esta lendo o que pensa que le")

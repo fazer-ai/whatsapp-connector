@@ -4,6 +4,8 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"os"
+	"strings"
 	"testing"
 )
 
@@ -22,30 +24,24 @@ import (
 func TestEveryLoadIsStoppedOnEveryPath(t *testing.T) {
 	t.Parallel()
 
-	pkgs, err := parser.ParseDir(token.NewFileSet(), ".", nil, 0)
-	if err != nil {
-		t.Fatalf("a cerca nao conseguiu ler o pacote: %v", err)
-	}
 	found := 0
-	for _, pkg := range pkgs {
-		for path, file := range pkg.Files {
-			ast.Inspect(file, func(n ast.Node) bool {
-				fn, ok := n.(*ast.FuncDecl)
-				if !ok || fn.Body == nil {
-					return true
-				}
-				for _, name := range startedLoads(fn.Body) {
-					found++
-					if !deferredStopOf(fn.Body, name) {
-						t.Errorf("%s: %s recebe o retorno de startLoad e nao tem `defer %s.end()`. "+
-							"Um erro em qualquer fase seguinte volta com as goroutines da carga ainda "+
-							"escrevendo nos streams desta corrida, enquanto a limpeza apaga as chaves dela",
-							path, name, name)
-					}
-				}
+	for path, file := range packageFiles(t) {
+		ast.Inspect(file, func(n ast.Node) bool {
+			fn, ok := n.(*ast.FuncDecl)
+			if !ok || fn.Body == nil {
 				return true
-			})
-		}
+			}
+			for _, name := range startedLoads(fn.Body) {
+				found++
+				if !deferredStopOf(fn.Body, name) {
+					t.Errorf("%s: %s recebe o retorno de startLoad e nao tem `defer %s.end()`. "+
+						"Um erro em qualquer fase seguinte volta com as goroutines da carga ainda "+
+						"escrevendo nos streams desta corrida, enquanto a limpeza apaga as chaves dela",
+						path, name, name)
+				}
+			}
+			return true
+		})
 	}
 	if found == 0 {
 		t.Fatal("a cerca nao achou nenhuma chamada a startLoad, entao ela nao esta lendo o que pensa que le")
@@ -93,4 +89,36 @@ func deferredStopOf(body *ast.BlockStmt, name string) bool {
 		return true
 	})
 	return stopped
+}
+
+// packageFiles parses every .go file of this directory, keyed by file name.
+//
+// Walked by hand rather than through `parser.ParseDir`, which is deprecated since Go 1.25
+// -- the same way `internal/app` walks its own package. It reads the DIRECTORY and not a
+// list of names, because a phase added in a new file is exactly the case a fence that
+// knows its filenames would miss.
+func packageFiles(t *testing.T) map[string]*ast.File {
+	t.Helper()
+
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("a cerca nao conseguiu ler o diretorio do pacote: %v", err)
+	}
+	fset := token.NewFileSet()
+	files := map[string]*ast.File{}
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") {
+			continue
+		}
+		file, parseErr := parser.ParseFile(fset, name, nil, parser.SkipObjectResolution)
+		if parseErr != nil {
+			t.Fatalf("a cerca nao conseguiu ler %s: %v", name, parseErr)
+		}
+		files[name] = file
+	}
+	if len(files) == 0 {
+		t.Fatal("a cerca nao achou arquivo .go nenhum, entao ela nao esta lendo o que pensa que le")
+	}
+	return files
 }
