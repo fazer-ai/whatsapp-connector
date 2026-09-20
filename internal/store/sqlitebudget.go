@@ -66,6 +66,12 @@ func (c budgetedConnector) Connect(ctx context.Context) (driver.Conn, error) {
 // times, zero included -- what twenty runs cannot tell apart is "always" from "almost
 // always" when the two instants coincide, and that is the tie this removes rather than
 // wins.
+//
+// It is also the amount by which a contended call overruns the ceiling its caller
+// declared, once per call, because the busy handler is what ends the wait and the context
+// is only what names the error: 363..368ms over six runs against a three hundred
+// millisecond ceiling. A caller that sets seconds will not notice; a test that sets three
+// hundred milliseconds and asserts on the ceiling has to.
 const budgetSlack = 50 * time.Millisecond
 
 // budgetedConn holds what it forwards, rather than asserting per call.

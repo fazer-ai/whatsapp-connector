@@ -116,6 +116,16 @@ func TestAContendedWriteComesBackOnTheCallersClock(t *testing.T) {
 			if !errors.Is(err, context.DeadlineExceeded) {
 				t.Errorf("the failure is %v, want the caller's own deadline: every classifier above branches on that", err)
 			}
+			// And it does not come back early either, which is what makes the overrun
+			// the comments above and in `group.go` name a measured number rather than a
+			// guess. What ends the wait is the busy handler, at the caller's deadline
+			// plus `budgetSlack`; the context only names the error. A write that came
+			// back before that did not wait out the budget it installed, and the
+			// arithmetic said one thing while the connection did another.
+			if floor := tc.budget + budgetSlack; took < floor {
+				t.Errorf("the write took %s, want at least %s: the busy handler gave up "+
+					"before the budget this call installed ran out", took, floor)
+			}
 		})
 	}
 }
