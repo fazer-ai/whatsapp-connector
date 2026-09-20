@@ -1100,13 +1100,20 @@ func (s *Session) carryOut(ctx context.Context, command *protocol.Command) (resu
 	}
 	if attempted {
 		// It ran, and what it did is not on record, which happens when the answer never
-		// came back. `not_settled` is the only one of the contract's three words about
-		// time that says what is true here: `timeout` says nobody here knows and nothing
-		// afterwards will, `not_attempted` says nothing happened, and this one says
-		// something happened and which is not known. Carrying it out again instead is a
-		// participant added twice, or a name set over one somebody has since changed
-		// (#282).
-		return nil, true, protocol.NewError(protocol.ErrorNotSettled,
+		// came back. Carrying it out again instead is a participant added twice, or a
+		// name set over one somebody has since changed (#282).
+		//
+		// `timeout` and not `not_settled`, although the second is the word the issue
+		// reaches for. `not_settled` promises that the outcome settles itself and that
+		// asking again in a moment gets a real answer, which is true of a `group.create`
+		// waiting on WhatsApp's notification and false here: nothing is coming that names
+		// what this command did, so a client that follows that promise retries against a
+		// case that never settles, and `contract/PROTOCOL.md` would have it escalate to a
+		// human for what is an ordinary socket dying at the wrong moment. `timeout` is
+		// already defined as the outcome nobody here knows and nothing afterwards will,
+		// which is this exactly, and it is the same word the first attempt's own ceiling
+		// produces -- so a client that already handles one handles the other.
+		return nil, true, protocol.NewError(protocol.ErrorTimeout,
 			"this command was carried out and its outcome is not known; read the state back before sending it again")
 	}
 

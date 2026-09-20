@@ -796,7 +796,12 @@ func (s *Session) emit(eventType protocol.EventType, payload any) {
 	}
 }
 
-var errNotConnected = errors.New("fake: session is not connected")
+// errNotConnected carries engine.ErrNeverSent for the same reason the whatsmeow engine's
+// own pre-flight refusal does: it is decided before anything is written, so the account is
+// exactly as it was and a retry does the whole thing. Without the mark the layer above
+// cannot tell this from a socket that died with the frame already out, and it would hold
+// the command's key against a retry that should run (#282).
+var errNotConnected = fmt.Errorf("%w: %w", errors.New("fake: session is not connected"), engine.ErrNeverSent)
 
 // NotConnected is the error the fake returns for a command that needs a live socket,
 // exported so a test can assert on it rather than on a string.

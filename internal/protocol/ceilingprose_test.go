@@ -256,12 +256,21 @@ func TestTheContractSaysWhatBoundsACommandWithNoCeilingOfItsOwn(t *testing.T) {
 			"a client branches on the code, and this is the one it gets"},
 		{"that resending is allowed", "may resend",
 			"the whole point of the paragraph is what to do next"},
-		{"that the identifier is not what makes it safe", "the identifier is not what makes that safe",
-			"review round 1 caught this promising more than it delivers: a failed first " +
-				"attempt leaves no record, so the same key answers nothing and the work runs again"},
-		{"why a failed attempt leaves nothing", "records only what succeeded",
-			"it is the reason the same key answers nothing, and without it the paragraph " +
-				"asserts the conclusion without the fact under it"},
+		{"what the identifier does and does not do", "stops the work being repeated rather than saying what happened",
+			"review round 1 caught the lead promising more than it delivered, and #282 changed " +
+				"which half is the lie: the key now does stop the repeat, and what it still " +
+				"cannot do is tell the client whether the first attempt landed"},
+		{"the three things the connector can say about a command", "three things it can say about one",
+			"the paragraph's conclusions all rest on there being three states and not two, and " +
+				"before #282 there were two: without this the rest asserts a conclusion with " +
+				"nothing under it"},
+		{"that a resend of an attempt nobody can speak for is refused", "answered `timeout` again rather than run a second time",
+			"it is the obligation this half of the contract exists to put on a client, and the " +
+				"one thing about #282 a client has to change its behaviour for: the same key " +
+				"stops being a way to force the work to happen"},
+		{"which failures still leave no record", "certain never reached WhatsApp",
+			"without it the paragraph above reads as every failure being unrepeatable, which " +
+				"would strand a send whose upload crashed before anything went out"},
 		{"what the identifier does buy", "after the first attempt *succeeded*",
 			"the narrow thing it is actually good for, which is a redelivery after a success"},
 		{"the mutation that is not covered", "rotates the link",
