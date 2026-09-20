@@ -1341,16 +1341,27 @@ func (s *Session) alreadyDid(ctx context.Context, key string) (result json.RawMe
 //
 // Certainty and not likelihood. Getting this wrong in the permissive direction undoes the
 // whole of #282: a command whose effect landed would have its attempt released and be
-// carried out a second time by the next delivery. So the list is the engine's own mark,
-// which it puts only where it refused before the socket, plus the two refusals that cannot
-// have reached a socket by construction -- a command this engine does not implement, and
-// one whose payload would not decode into anything to send.
+// carried out a second time by the next delivery.
+//
+// Three things count. The engine's own mark, which it puts only where it refused before the
+// socket and which exists because `not_connected` says both "never started" and "died with
+// the frame already written". `not_attempted`, which is the contract's word for this and
+// nothing else -- "the connector knows the command never left this process" -- so an engine
+// answering it is already asserting what this asks; the teardowns are where it is produced,
+// and a `session.logout` refused that way leaves a device still linked that the retry has to
+// be able to unlink. And the two refusals that cannot have reached a socket by construction:
+// a command this engine does not implement, and one whose payload would not decode into
+// anything to send.
+//
+// `not_attempted` is read here rather than having its producer carry the mark as well. Two
+// mechanisms for one fact are two that mask each other, and neither can then be shown to
+// matter on its own.
 func neverReachedWhatsApp(err error) bool {
 	if errors.Is(err, engine.ErrNeverSent) {
 		return true
 	}
 	switch asProtocolError(err).Code {
-	case protocol.ErrorUnsupported, protocol.ErrorInvalidPayload:
+	case protocol.ErrorNotAttempted, protocol.ErrorUnsupported, protocol.ErrorInvalidPayload:
 		return true
 	default:
 		return false

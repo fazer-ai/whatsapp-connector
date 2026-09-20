@@ -67,6 +67,14 @@ func (s *landedSession) Execute(context.Context, *protocol.Command) (json.RawMes
 	return s.owner.answer(&s.owner.effects)
 }
 
+// The teardowns go to the engine's own methods rather than through Execute, so a double
+// that only answered Execute would measure the fake on the one path `not_attempted` is
+// actually produced on.
+func (s *landedSession) Logout(context.Context) error {
+	_, err := s.owner.answer(&s.owner.effects)
+	return err
+}
+
 // replies keeps what each command was answered with.
 type replies struct {
 	mu   sync.Mutex
@@ -321,5 +329,55 @@ func TestACreationRedeliveredStillReachesItsOwnRecovery(t *testing.T) {
 	}
 	if second.Error != nil && second.Error.Code == protocol.ErrorTimeout {
 		t.Error("the redelivery of a creation was answered from the attempt ledger")
+	}
+}
+
+// A teardown the connector refused before the socket is retryable, which is the case the
+// word `not_attempted` was added for.
+//
+// `session.logout` and `session.delete` answer it when whatsmeow's socket lock was never
+// free, so WhatsApp was never told and the device is exactly as linked as it was. Held
+// against a retry, the account stays linked with nothing on this side able to unlink it.
+func TestATeardownTheConnectorNeverAttemptedIsCarriedOutOnTheRetry(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+
+	var refuse atomic.Bool
+	refuse.Store(true)
+	eng := newLandedEngine(func(effects *atomic.Int64) (json.RawMessage, error) {
+		if refuse.Load() {
+			return nil, protocol.NewError(protocol.ErrorNotAttempted, "the request was never sent to WhatsApp")
+		}
+		effects.Add(1)
+		return nil, nil
+	})
+	rec := newReplies()
+	manager := instanceOn(t, "inst-a", rdb, eng, rec, storetest.New(t).URL)
+	if _, err := manager.Adopt(context.Background(), attemptSID); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+
+	unlink := func(id string) *protocol.Command {
+		return &protocol.Command{
+			V: protocol.Version, ID: id, Type: protocol.CommandSessionLogout,
+			SID: attemptSID, ReplyTo: id, IdempotencyKey: "k-logout",
+			Payload: json.RawMessage(`{}`),
+		}
+	}
+	if reply := deliver(t, manager, rec, unlink("c1")); reply.OK {
+		t.Fatal("a logout the connector never attempted reported success")
+	}
+	refuse.Store(false)
+	retry := deliver(t, manager, rec, unlink("c2"))
+
+	if !retry.OK {
+		t.Fatalf("the retry of a teardown that was never attempted was refused: %+v, and the "+
+			"device stays linked with nothing on this side able to unlink it", retry.Error)
+	}
+	if got := eng.applied(); got != 1 {
+		t.Errorf("the teardown happened %d times, want once on the retry", got)
 	}
 }
