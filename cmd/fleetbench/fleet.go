@@ -95,10 +95,7 @@ func (f *fleet) start(ctx context.Context, name string) (*instance, error) {
 	cmd.Dir = f.dir
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
-	cmd.Env = append(os.Environ(), "WAC_INSTANCE="+name, "WAC_HTTP_ADDR="+addr)
-	for key, value := range f.env {
-		cmd.Env = append(cmd.Env, key+"="+value)
-	}
+	cmd.Env = fleetEnv(os.Environ(), f.env, name, addr)
 	// Its own process group, so that a kill reaches the connector and whatever it started,
 	// and never reaches this bench or the shell that ran it.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -333,4 +330,35 @@ func freePort(ctx context.Context) (int, error) {
 		return 0, fmt.Errorf("the listener came back on %s, which names no port", listener.Addr())
 	}
 	return tcp.Port, nil
+}
+
+// fleetEnv is the environment a connector of this run is started with, and every WAC_
+// variable in it comes from the run.
+//
+// MEASURED as a real hazard, not a tidiness rule: `app.New` opens the media store whenever
+// `WAC_MEDIA_ROOT` is set, with the fake engine like with any other, and `sweepBlobs` then
+// deletes expired blobs under that directory once a minute. A shell that exports the
+// variable for a connector somebody is running by hand would hand this run four processes
+// sweeping that connector's blobs -- and `media.Store` only knows about writes from its own
+// process, so a blob being written elsewhere is a blob this run can delete under it.
+//
+// The isolation of this bench is by identifier everywhere else (a database named after the
+// run, a key prefix named after the run, processes killed by captured pids), and an
+// inherited variable is the one door left open in it. So the WAC_ half of the environment
+// is dropped wholesale rather than one name at a time: the next variable the connector
+// learns to read would otherwise arrive here inherited and unnoticed. Everything that is
+// not WAC_ is passed through, because a connector still needs PATH, HOME and the rest.
+func fleetEnv(environ []string, own map[string]string, name, addr string) []string {
+	out := make([]string, 0, len(environ)+len(own)+2)
+	for _, entry := range environ {
+		if strings.HasPrefix(entry, "WAC_") {
+			continue
+		}
+		out = append(out, entry)
+	}
+	out = append(out, "WAC_INSTANCE="+name, "WAC_HTTP_ADDR="+addr)
+	for key, value := range own {
+		out = append(out, key+"="+value)
+	}
+	return out
 }

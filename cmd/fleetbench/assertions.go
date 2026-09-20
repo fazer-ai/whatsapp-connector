@@ -23,7 +23,7 @@ import (
 // saying more than it measured.
 func assertInvariants(ctx context.Context, cl *client, rep *report, plan benchPlan,
 	answers map[string][]string, sids []string, pairs []idempotentPair, counted *census,
-	stillWorking string) error {
+	stillWorking, expired string) error {
 
 	published := map[string][]protocol.Event{}          // sid -> events, in stream order
 	shardOf := map[string]map[string]bool{}             // sid -> streams it was seen on
@@ -69,7 +69,7 @@ func assertInvariants(ctx context.Context, cl *client, rep *report, plan benchPl
 	assertSeqMonotonic(rep, published)
 	assertOneShard(rep, shardOf, firstOn, sids)
 	assertNoLostEvent(rep, published, truncated)
-	assertNoDuplicateEffect(rep, answers, pairs)
+	assertNoDuplicateEffect(rep, answers, pairs, expired)
 	return assertConsumerGroups(ctx, cl, rep, sids, stillWorking)
 }
 
@@ -370,7 +370,8 @@ func assertNoLostEvent(rep *report, published map[string][]protocol.Event, trunc
 //
 // One claim and not two, because they are one claim: the issue asks whether a side effect
 // can happen twice, and these are the two doors to it that a client can see from outside.
-func assertNoDuplicateEffect(rep *report, answers map[string][]string, pairs []idempotentPair) {
+func assertNoDuplicateEffect(rep *report, answers map[string][]string, pairs []idempotentPair,
+	expired string) {
 	examined, repeated, retried, offenders := 0, 0, 0, []string{}
 	for id, given := range answers {
 		if len(given) == 0 {
@@ -436,6 +437,9 @@ func assertNoDuplicateEffect(rep *report, answers map[string][]string, pairs []i
 				pair.messageID, pair.sid, pair.firstID, pair.secondID, pair.gap.Round(time.Millisecond),
 				pair.messageID, pair.first, pair.second))
 		}
+	}
+	if expired != "" {
+		rep.note(expired)
 	}
 	rep.assert(&assertion{
 		invariant: "5 (comandos idempotentes por message_id: uma reentrega nao duplica efeito)",

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
+	"github.com/fazer-ai/whatsapp-connector/internal/transport/redisstream"
 )
 
 // The third measurement, and the one the item is named after: two processes, the owner
@@ -38,6 +39,7 @@ func handover(ctx context.Context, active *run, group *fleet, cl *client, rep *r
 	// lists rather than popped, because what a duplicated side effect looks like from out
 	// here is two answers to one command that do not agree.
 	inFlight := make([]string, 0, len(sids)*plan.sends)
+	sentAt := time.Now()
 	for _, sid := range sids {
 		for n := range plan.sends {
 			id := fmt.Sprintf("send-%s-%s-%d", active.id, shortSID(sid), n)
@@ -161,6 +163,22 @@ func handover(ctx context.Context, active *run, group *fleet, cl *client, rep *r
 		return fmt.Errorf("%w: %w", errSetup, err)
 	}
 
+	// How old the answers were when they were read, because a reply list expires.
+	//
+	// The connector puts a TTL on it so an answer nobody came back for does not sit in
+	// Redis forever, and the waits above are not short: an ownership change can take
+	// minutes and the drain has 90 s of its own. Past that TTL, a command that answered
+	// twice reads exactly like a command that never answered, and the half of this
+	// assertion that looks for two answers that disagree stops being measured. It stops
+	// silently unless the run says so, which is what this passes down.
+	expired := ""
+	if age := time.Since(sentAt); age >= redisstream.DefaultReplyTTL {
+		expired = fmt.Sprintf("os comandos em voo foram lidos %s depois de enviados, e a lista de "+
+			"resposta expira em %s: uma resposta que existiu pode nao estar mais la, entao a metade "+
+			"que procura duas respostas discordantes nao foi medida nesta corrida",
+			age.Round(time.Second), redisstream.DefaultReplyTTL)
+	}
+
 	// The fence, and it comes last because it is the only phase that needs a live owner
 	// to have lost the lease. Everything the thawed instance publishes lands in the
 	// streams the assertions below read, in the order the shard kept.
@@ -194,7 +212,7 @@ func handover(ctx context.Context, active *run, group *fleet, cl *client, rep *r
 		rep.note(stillWorking)
 	}
 
-	return assertInvariants(ctx, cl, rep, plan, answers, sids, pairs, counted, stillWorking)
+	return assertInvariants(ctx, cl, rep, plan, answers, sids, pairs, counted, stillWorking, expired)
 }
 
 func shortSID(sid string) string {

@@ -327,7 +327,7 @@ func TestNoDuplicateEffectReadsTheRepeatedMessageID(t *testing.T) {
 			rep := &report{}
 			// No answers from the handover: this test is about the second door, and
 			// giving it the first as well would let a pass come from either.
-			assertNoDuplicateEffect(rep, nil, tc.pairs)
+			assertNoDuplicateEffect(rep, nil, tc.pairs, "")
 			got := only(t, rep)
 			if got.state() != tc.state {
 				t.Fatalf("estado %q, queria %q (serie: %s, evidencia: %s)",
@@ -438,7 +438,7 @@ func TestTheIdempotencySeriesCountsWhatItSays(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			rep := &report{}
-			assertNoDuplicateEffect(rep, tc.answers, tc.pairs)
+			assertNoDuplicateEffect(rep, tc.answers, tc.pairs, "")
 			got := only(t, rep)
 			if got.state() != tc.state {
 				t.Fatalf("estado %q, queria %q (serie: %s, evidencia: %s)",
@@ -570,9 +570,38 @@ func TestAnUnreadableAnswerIsStillCompared(t *testing.T) {
 	rep := &report{}
 	assertNoDuplicateEffect(rep, map[string][]string{
 		"c1": {`nao e json`, `tambem nao e json, e e outro texto`},
-	}, nil)
+	}, nil, "")
 	got := only(t, rep)
 	if got.state() != "QUEBRADO" {
 		t.Fatalf("duas respostas ilegiveis e diferentes sairam %q (evidencia: %s)", got.state(), got.detail)
+	}
+}
+
+// A reply list expires, and the run has to say so instead of reading an expired list as a
+// command that answered once.
+func TestAnExpiredReadIsSaidOutLoud(t *testing.T) {
+	t.Parallel()
+
+	aged := "os comandos em voo foram lidos 3m0s depois de enviados, e a lista de resposta expira em 1m0s"
+	rep := &report{}
+	assertNoDuplicateEffect(rep, map[string][]string{}, []idempotentPair{{
+		messageID: "m1", sid: "s1", firstID: "c-a", secondID: "c-b",
+		first: json.RawMessage(`{"message_id":"m1"}`), second: json.RawMessage(`{"message_id":"m1"}`),
+		gap: 50 * time.Millisecond,
+	}}, aged)
+	got := only(t, rep)
+	if got.state() != "AFIRMADO" {
+		t.Fatalf("a metade dos pares nao rendeu veredito: %q", got.state())
+	}
+	// The other half did not run, and a run that does not say so claims to have measured
+	// a population it never read.
+	found := false
+	for _, note := range rep.notes {
+		if note == aged {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("a corrida nao diz que leu as respostas depois do TTL:\n%v", rep.notes)
 	}
 }
