@@ -24,7 +24,7 @@ import (
 //
 // Twenty seconds because that is what the library already chose for the other half of the
 // same connection, so the two halves now end rather than one. Measured against the real
-// endpoint, five dials took 209, 399, 465, 517 and 833ms, so this is a ceiling on a wait
+// endpoint, five dials took 211, 629, 429, 452 and 423ms, so this is a ceiling on a wait
 // that has gone wrong rather than a bound on a healthy one.
 const dialCeiling = 20 * time.Second
 
