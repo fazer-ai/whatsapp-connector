@@ -7,6 +7,11 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/printer"
+	"go/token"
+	"os"
 	"slices"
 	"strings"
 	"testing"
@@ -835,7 +840,7 @@ func TestANameTheWriteRanOutOfTimeForIsStillWrittenDown(t *testing.T) {
 	theTableSays(t, client, "Antigo")
 	theRecordSays(t, client, "Atendimento")
 	// Short enough that the test does not wait on the real one, which is five seconds.
-	session.storeLimit = 150 * time.Millisecond
+	session.storeLimit = stalledFilingBudget
 	client.Store.Contacts = stalledContacts{ContactStore: client.Store.Contacts}
 	session.handle(&waEvents.PushNameSetting{
 		Action: &waSyncAction.PushNameSetting{Name: proto.String("Atendimento")},
@@ -860,6 +865,24 @@ func TestANameTheWriteRanOutOfTimeForIsStillWrittenDown(t *testing.T) {
 
 // stalledContacts is a table that answers reads and never finishes a write, which is what
 // one under load looks like from here: the deadline decides, not the store.
+// stalledFilingBudget is the `storeLimit` a test gives a session when it is going to stall
+// the filing and then assert on what the rest of the budget managed to do.
+//
+// One constant because there are two such tests and they are the same test twice, and a
+// number rather than the 150ms they used to carry because that number was a race. The
+// filing gets two thirds of this (`mostOf`) and spends all of it waiting on a context it
+// will never see succeed; the record is then written on the third that is left, and on
+// PostgreSQL that costs three roundtrips. At 150ms the third was 50ms, and #296 is the CI
+// run where those three roundtrips did not fit.
+//
+// Chosen by measurement rather than by feel, against a TCP proxy that delays every chunk
+// it forwards, which is roughly twice the delay per roundtrip. On the old 150ms the pair
+// already failed at 8ms per chunk. At 750ms it still failed at 32ms. At 1500ms it survived
+// 32ms and failed at 48ms. This survives 96ms and fails at 128ms, which is a threefold
+// margin over the worst the holdout asks for, and it costs the suite two thirds of itself
+// twice: 2.0..2.3s per test on either dialect, where the old number cost 0.1s and a flake.
+const stalledFilingBudget = 3 * time.Second
+
 type stalledContacts struct {
 	waStore.ContactStore
 }
@@ -973,7 +996,7 @@ func TestAVerifiedNameTheWriteRanOutOfTimeForIsStillWrittenDown(t *testing.T) {
 	client.Store.LID = lidJID
 	session.handle(&waEvents.Connected{})
 	drain(t, session)
-	session.storeLimit = 150 * time.Millisecond
+	session.storeLimit = stalledFilingBudget
 	client.Store.Contacts = stalledContacts{ContactStore: client.Store.Contacts}
 	session.handle(&waEvents.BusinessName{
 		JID: lidJID, OldBusinessName: "Loja do Bruno", NewBusinessName: "Loja do Bruno LTDA",
@@ -1071,4 +1094,99 @@ func TestANameTheSessionHasLeftIsNotWrittenDown(t *testing.T) {
 	if !found || kept.Name != "Atendimento" {
 		t.Errorf("what was kept reads %+v (kept %v), want the name the session is holding", kept, found)
 	}
+}
+
+// A test that stalls a filing takes its budget from `stalledFilingBudget`.
+//
+// The shape is what #296 is about, and it is not the two tests: it is that the shape
+// leaves a third of whatever number the test picked for three roundtrips to a real
+// database, so any number picked by feel is a race whose odds nobody measured. Two tests
+// had the same one and the same flake. This fails on a third being written with a number
+// of its own, which is the only part of it a reviewer would not catch.
+func TestEveryStalledFilingTakesTheSameBudget(t *testing.T) {
+	t.Parallel()
+
+	fset := token.NewFileSet()
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read the package directory: %v", err)
+	}
+	stalling, budgeted := 0, 0
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(fset, name, nil, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Body == nil || !installsTheStall(fn) {
+				continue
+			}
+			stalling++
+			limit, set := storeLimitAssigned(fn)
+			switch {
+			case !set:
+				t.Errorf("%s:%s stalls a filing and never sets storeLimit, so it waits out "+
+					"whatever the session's real one is", name, fn.Name.Name)
+			case limit != "stalledFilingBudget":
+				t.Errorf("%s:%s stalls a filing on a budget of its own (%s): the third of it "+
+					"that is left has to fit three roundtrips to a real database, which is "+
+					"the race #296 came from", name, fn.Name.Name, limit)
+			default:
+				budgeted++
+			}
+		}
+	}
+	// A fence over a shape nobody has any more is a fence measuring nothing, and this one
+	// would go quiet rather than red: no test stalls a filing, no test is checked.
+	if stalling == 0 {
+		t.Fatal("no test installs stalledContacts, so this fence has nothing to check")
+	}
+	t.Logf("%d of %d stalled filings take the shared budget", budgeted, stalling)
+}
+
+// installsTheStall says whether a function hands a session the contact store that never
+// finishes a write.
+func installsTheStall(fn *ast.FuncDecl) bool {
+	stalls := false
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		composite, ok := n.(*ast.CompositeLit)
+		if !ok {
+			return true
+		}
+		if ident, isIdent := composite.Type.(*ast.Ident); isIdent && ident.Name == "stalledContacts" {
+			stalls = true
+		}
+		return !stalls
+	})
+	return stalls
+}
+
+// storeLimitAssigned returns what a function assigns to `storeLimit`, as written.
+func storeLimitAssigned(fn *ast.FuncDecl) (string, bool) {
+	found, expr := false, ""
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		assign, ok := n.(*ast.AssignStmt)
+		if !ok || found || len(assign.Lhs) != 1 || len(assign.Rhs) != 1 {
+			return true
+		}
+		if selector, isSel := assign.Lhs[0].(*ast.SelectorExpr); !isSel || selector.Sel.Name != "storeLimit" {
+			return true
+		}
+		found, expr = true, renderNode(assign.Rhs[0])
+		return false
+	})
+	return expr, found
+}
+
+func renderNode(node ast.Expr) string {
+	var out strings.Builder
+	if err := printer.Fprint(&out, token.NewFileSet(), node); err != nil {
+		return ""
+	}
+	return out.String()
 }
