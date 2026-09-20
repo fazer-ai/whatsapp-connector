@@ -2437,7 +2437,11 @@ func (s *Session) startCommand(ctx context.Context) error {
 			// answer is still worth having. A command let through after it expired is one
 			// the session layer has stopped waiting for, and for a lifecycle command that
 			// means a socket effect launched for nobody.
-			return fmt.Errorf("whatsmeow: %s: waiting for the socket to be taken down: %w", s.sid, ctx.Err())
+			// Nothing was dispatched, so nothing was written: the command gave up waiting
+			// for a socket that was being taken down, before it ever reached the engine's
+			// own pre-flight. Marked for the same reason that one is (#282).
+			return engine.NeverSent(fmt.Errorf(
+				"whatsmeow: %s: waiting for the socket to be taken down: %w", s.sid, ctx.Err()))
 		case <-s.ctx.Done():
 			// And the session going away, which the caller's context does not have to know
 			// about: a command with no deadline of its own would otherwise wait here for a

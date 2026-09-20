@@ -292,18 +292,51 @@ var RepeatableCommands = map[CommandType]bool{
 	CommandPresenceSubscribe: true,
 }
 
-// SelfSettlingCommands keep a record of their own attempts, with a recovery the generic
-// ledger cannot do and must not stand in front of.
+// ReservedCommands are the ones whose attempt is written down before the work starts, so
+// that a redelivery of one whose answer never came back is answered rather than carried out
+// a second time (#282).
 //
-// `group.create` writes its intent to the store before it asks WhatsApp, and a retry under
-// the same `idempotency_key` consults that row: it answers with the group the first attempt
-// made, or `not_settled` while WhatsApp's notification is still deciding which request made
-// which group. That recovery is what `contract/PROTOCOL.md` promises, and it only happens
-// if the command is allowed to reach the engine. Answering the redelivery from the ledger
-// first -- which is right for every other command, because nothing else can ever say what
-// theirs did -- would replace a group with a refusal for as long as the record lived.
-var SelfSettlingCommands = map[CommandType]bool{
-	CommandGroupCreate: true,
+// A list of what is reserved and not a list of exemptions, because the two ways of being
+// wrong here cost different things and only one of them is recoverable. Reserve too little
+// and a redelivery repeats an effect that already landed, which is the defect #282 names
+// and which the client can see and correct. Reserve too much and the command can never run
+// again under that key for as long as the record lives: a device that stays linked because
+// the retry meant to finish its teardown is refused, a message that never goes out, a group
+// creation whose own recovery is never reached. Three of those were found in review, each
+// in a different family, which is what a list of exemptions keeps leaking. A command added
+// without thinking about it is left exactly as it behaved before.
+//
+// What earns a place is one shape: the command fixes a value or applies a delta, so that
+// running it again on top of state that has since moved writes something nobody asked for.
+// A participant added or removed, a read marker set over one the user has since cleared, a
+// group's name or photo put back to what it was, an invite link rotated a second time, a
+// pairing code that invalidates the one the operator is typing.
+//
+// What is deliberately absent, with the reason:
+//
+//   - The sends. A resend carries the `message_id` the first attempt used and every client
+//     downstream discards the repeat, which `contract/PROTOCOL.md` states as an obligation,
+//     so the duplicate this would prevent does not reach anybody.
+//   - `group.create`. It keeps a record of its own attempts in the store, and a retry under
+//     the same key answers with the group the first one made. Reserving it puts this in
+//     front of a recovery that is better than this one.
+//   - The teardowns. A `session.delete` whose local cleanup failed returns an error
+//     precisely so the retry finishes it, and `session.logout` the same; re-running one
+//     costs nothing, because an account that is already unlinked has nothing to unlink.
+//   - Everything transient: a typing indicator, a call rejection, a history request. What
+//     repeating them costs is nothing, or one more request.
+var ReservedCommands = map[CommandType]bool{
+	CommandPresenceSet:             true,
+	CommandMessageMarkRead:         true,
+	CommandMessageMarkUnread:       true,
+	CommandGroupParticipantsUpdate: true,
+	CommandGroupJoinRequestsUpdate: true,
+	CommandGroupNameSet:            true,
+	CommandGroupDescriptionSet:     true,
+	CommandGroupPhotoSet:           true,
+	CommandGroupSettingsSet:        true,
+	CommandGroupInviteGet:          true,
+	CommandPairingRequestCode:      true,
 }
 
 // messageIDKeyed are the commands whose `message_id` names the message the command

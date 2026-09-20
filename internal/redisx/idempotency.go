@@ -27,11 +27,15 @@ const DefaultIdempotencyTTL = 24 * time.Hour
 // Idempotency remembers what a command did, so a redelivery answers with the first
 // run's result instead of carrying it out a second time.
 //
-// Two records and not one, because a command has three states and not two. The result is
-// written after it succeeds; the attempt is written before it starts and removed when the
+// Two records and not one, because a command can be in three states and not two. The result
+// is written after it succeeds; the attempt is written before it starts and removed when the
 // outcome is known either way. What is left standing -- an attempt with no result -- is a
-// command that ran and whose outcome nobody here can tell, which is what `not_settled`
-// says to a client.
+// command that ran and whose outcome nobody here can tell, and a redelivery of one is
+// answered `timeout` rather than carried out again.
+//
+// Which commands get an attempt is the caller's to decide and not this store's: it is a
+// narrow list, because holding one against a command whose retry was the recovery is worse
+// than the duplicate it prevents. `protocol.ReservedCommands` is the list and says why.
 //
 // This used to be one record, written only after a success, and the argument for that is
 // worth keeping because half of it still holds: an entry saying an attempt was made says
@@ -44,10 +48,10 @@ const DefaultIdempotencyTTL = 24 * time.Hour
 //
 // The half that still holds is why Release exists. A refusal the connector is certain
 // about -- the pre-flight that never reached the socket -- takes the attempt back off, so
-// the retry does the whole thing rather than being refused for ever. Without it this
-// would answer `not_settled` for a crash during a media upload, where the message provably
-// never went out and a resend gets it right, which is the objection that kept the
-// reservation out until #282 measured the other side of it.
+// the retry does the whole thing rather than being refused for ever. Without it this would
+// refuse a retry after a crash during a media upload, where the message provably never went
+// out and a resend gets it right, which is the objection that kept the reservation out
+// until #282 measured the other side of it.
 //
 // For a send the old cover is still there and still worth having. WhatsApp delivers a
 // resend under an id it has already seen in full, with no window at all -- measured from

@@ -1044,7 +1044,12 @@ func (s *Session) run(ctx context.Context, waiting queued) (refusal protocol.Err
 	if err != nil {
 		// `ran` and not a flat no: a teardown the engine refused reached the account and
 		// is an attempt, which is a different thing from one turned away before it began.
-		return asProtocolError(err).Code, command.Type == protocol.CommandSessionDelete, ran(err)
+		//
+		// And not when the answer came from the record. A redelivery answered from an
+		// attempt this instance never made touched nothing here, so counting it as work
+		// would take an adopted session off the list of ones to hand back and leave its
+		// lease renewed for an account nothing is using.
+		return asProtocolError(err).Code, command.Type == protocol.CommandSessionDelete, ran(err) && !recalled
 	}
 	// A recall answered from the record rather than from the account: the command is
 	// finished with, and nothing happened here.
@@ -1117,12 +1122,12 @@ func (s *Session) carryOut(ctx context.Context, command *protocol.Command) (resu
 			"this command was carried out and its outcome is not known; read the state back before sending it again")
 	}
 
-	if !protocol.SelfSettlingCommands[command.Type] {
-		// Not reserving is the whole of the exemption, and the branch above needs no
-		// second one: with no attempt on record a redelivery of one of these reads as a
-		// command nobody has heard of and goes to the engine, which is where its own
-		// recovery lives. A guard there as well would be a guard nothing can reach, and
-		// two that mask each other are two that no test can tell apart.
+	if protocol.ReservedCommands[command.Type] {
+		// Only the ones the table names, and the branch above needs no guard of its own:
+		// with no attempt on record a redelivery of anything else reads as a command
+		// nobody has heard of and goes to the engine, which is where the recoveries that
+		// belong to particular commands live. A second guard there would be one nothing
+		// can reach, and two that mask each other are two no test can tell apart.
 		s.reserve(ctx, command, key)
 	}
 
