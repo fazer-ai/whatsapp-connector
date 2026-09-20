@@ -59,7 +59,10 @@ func TestThePoolReadingCountsTheFleetAndNotTheBench(t *testing.T) {
 		}
 	})
 
-	fleetURL, benchURL, err := runURLs(server, name)
+	// The supplied URL already carries the bench's own `application_name`, which is the
+	// collision the reading has to survive: read by exclusion, every connector connection
+	// would be excluded and the count would come back zero over a fleet it had not counted.
+	fleetURL, benchURL, err := runURLs(server+suppliedName(server), name)
 	if err != nil {
 		t.Fatalf("derivar as URLs: %v", err)
 	}
@@ -92,9 +95,19 @@ func TestThePoolReadingCountsTheFleetAndNotTheBench(t *testing.T) {
 	// wrong direction counts two and not one: this asserts the number, not merely that it
 	// is non-zero.
 	if count != 1 {
-		t.Errorf("a leitura contou %d conexoes com uma da frota e duas da bancada abertas: ela "+
-			"esta contando por exclusao do nome da bancada em vez de casar o nome da frota", count)
+		t.Errorf("a leitura contou %d conexoes com uma da frota e duas da bancada abertas, e a URL "+
+			"dada ja trazia application_name=%s: ou ela conta por exclusao do nome da bancada, ou o "+
+			"nome do chamador chegou na frota", count, benchApplicationName)
 	}
+}
+
+// suppliedName is the query fragment that puts the bench's own application_name on the URL
+// the caller supplies, appended the way a caller would have written it.
+func suppliedName(server string) string {
+	if strings.Contains(server, "?") {
+		return "&application_name=" + benchApplicationName
+	}
+	return "?application_name=" + benchApplicationName
 }
 
 // And the collision the finding named: a caller whose URL already carries the bench's own
