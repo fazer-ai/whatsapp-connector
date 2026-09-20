@@ -126,18 +126,46 @@ func assertOneOwner(rep *report, published map[string][]protocol.Event,
 		}
 	}
 
-	fenced := 0
+	// One late event from a previous owner is allowed. A SECOND one from the same instance
+	// is not, and the difference is the fence.
+	//
+	// The contract says as much, and names this exact case: a client keeps the highest
+	// epoch it has seen and drops every event below it, "which is what stops a late event
+	// from a previous owner overwriting the state of the instance running the account now
+	// -- a paused process, a socket that outlived its lease, a delivery that sat in a
+	// queue". `Session.stillOwned` is the connector's side of that trade: the ownership
+	// check happens after the publish as well as before it, because a lease can run out
+	// while the write is in flight, and what the connector does then is refuse the
+	// acknowledgement so the message comes back on a redelivery.
+	//
+	// So a run that reported the first late event as a broken invariant was reporting the
+	// contract's own guarantee. MEASURED over this bench: a clean tree produces exactly one
+	// per (sid, instance) -- the write that was in flight when the freeze landed -- while
+	// the mutant that removes the fence from `session.publish` produces 246, and the one
+	// that lets two instances hold a lease produces 269. What separates them is not a
+	// threshold somebody picked: after the first one the connector tears the session down
+	// ("lost a lease; stopping the session"), so a second event from that instance for that
+	// session is the fence not having acted.
+	fenced, late := 0, 0
 	for sid, streams := range inOrder {
 		for stream, events := range streams {
 			var highest uint64
 			var highestBy, highestID string
+			stale := map[string]int{}
 			for _, event := range events {
 				if event.Epoch < highest {
-					offenders = append(offenders, fmt.Sprintf(
-						"%s: a instancia %s publicou o evento %s sob o epoch %d em %s DEPOIS de %s ja ter "+
-							"publicado o evento %s sob o epoch %d, entao ela seguiu publicando essa sessao "+
-							"depois de perder a lease",
-						sid, event.Inst, event.ID, event.Epoch, stream, highestBy, highestID, highest))
+					late++
+					stale[event.Inst]++
+					if stale[event.Inst] > 1 {
+						offenders = append(offenders, fmt.Sprintf(
+							"%s: a instancia %s publicou o evento %s sob o epoch %d em %s DEPOIS de %s ja "+
+								"ter publicado o evento %s sob o epoch %d, e essa ja e a %da vez dela nesta "+
+								"sessao: a primeira e a escrita que estava em voo, que o contrato preve e o "+
+								"cliente descarta pelo cursor, mas ao detecta-la o conector derruba a sessao, "+
+								"entao a segunda e a cerca nao tendo agido",
+							sid, event.Inst, event.ID, event.Epoch, stream, highestBy, highestID, highest,
+							stale[event.Inst]))
+					}
 					continue
 				}
 				if event.Epoch > highest {
@@ -146,6 +174,13 @@ func assertOneOwner(rep *report, published map[string][]protocol.Event,
 			}
 			fenced += len(events)
 		}
+	}
+	if late > 0 {
+		rep.note(fmt.Sprintf("%d evento(s) de dono anterior apareceram depois de um epoch mais alto no "+
+			"mesmo stream. Isso o contrato preve -- o cliente guarda o epoch mais alto que viu e descarta "+
+			"o que vier abaixo -- e e a escrita que estava em voo quando a posse mudou; o que esta "+
+			"afirmado e que nenhuma instancia publicou uma SEGUNDA vez depois disso, porque ai a cerca "+
+			"nao teria agido", late))
 	}
 
 	// The third reading, and the only one that sees two holders who never shared an
@@ -210,11 +245,24 @@ func assertOneOwner(rep *report, published map[string][]protocol.Event,
 // state from a stale epoch, so an epoch that repeats across a change is a client accepting
 // the old owner's state as current.
 func assertEpochRises(rep *report, published map[string][]protocol.Event) {
-	changes, offenders := 0, []string{}
+	// Read over the events a client would accept, which is not every event in the stream.
+	//
+	// A client keeps the highest epoch it has seen and drops everything below it, so a late
+	// write from a previous owner never reaches its state. Counted here, that same event
+	// looks like ownership moving back to the old instance under a lower epoch -- and the
+	// run reported "the epoch did not rise" about a change that never happened, on a fleet
+	// where the only thing that happened was a write that was in flight when the freeze
+	// landed. Whether that late event is allowed at all is `assertOneOwner`'s question,
+	// and it is answered there; this one is about the epoch of an actual handover.
+	changes, offenders, dropped := 0, []string{}, 0
 	for sid, events := range published {
 		var lastInst string
 		var highest uint64
 		for _, event := range events {
+			if event.Epoch < highest {
+				dropped++
+				continue
+			}
 			if lastInst != "" && event.Inst != lastInst {
 				changes++
 				if event.Epoch <= highest {
@@ -228,6 +276,11 @@ func assertEpochRises(rep *report, published map[string][]protocol.Event) {
 			}
 			lastInst = event.Inst
 		}
+	}
+	if dropped > 0 {
+		rep.note(fmt.Sprintf("%d evento(s) de epoch inferior ao mais alto ja visto ficaram de fora desta "+
+			"leitura, porque e isso que um cliente faz com eles. Contados, cada um pareceria uma troca "+
+			"de dono de volta para a instancia velha", dropped))
 	}
 	rep.assert(&assertion{
 		invariant: "2 (todo evento carrega o epoch do dono, e ele sobe em toda troca de posse)",

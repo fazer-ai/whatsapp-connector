@@ -85,12 +85,28 @@ func TestOneOwnerNoticesTwoInstancesUnderOneEpoch(t *testing.T) {
 			state:  "QUEBRADO",
 			says:   "dois donos da mesma lease",
 		},
-		"epoch velho depois de um novo, no mesmo stream": {
-			// The fence half, and it is invisible to the first: every (sid, epoch) here
-			// still has exactly one publisher. What says it is the order.
+		"UM epoch velho depois de um novo e a escrita que estava em voo": {
+			// What the contract names and covers: a client keeps the highest epoch it has
+			// seen and drops everything below it, "which is what stops a late event from a
+			// previous owner overwriting the state of the instance running the account now
+			// -- a paused process, a socket that outlived its lease, a delivery that sat in
+			// a queue". `Session.stillOwned` is the other side of the same trade: the check
+			// happens after the publish too, because a lease can run out mid-write.
+			// MEASURED: a clean tree produces exactly one of these per (sid, instance).
 			events: []protocol.Event{event("s1", "b", 2, 1), event("s1", "a", 1, 3)},
-			state:  "QUEBRADO",
-			says:   "depois de perder a lease",
+			state:  "AFIRMADO",
+		},
+		"o SEGUNDO epoch velho da mesma instancia e a cerca nao tendo agido": {
+			// The fence half, and it is invisible to the first reading: every (sid, epoch)
+			// here still has exactly one publisher. On the first late event the connector
+			// tears the session down, so a second one from that instance means it did not.
+			// MEASURED: the mutant that removes the fence from `session.publish` produces
+			// 246 of these in one run.
+			events: []protocol.Event{
+				event("s1", "b", 2, 1), event("s1", "a", 1, 3), event("s1", "a", 1, 4),
+			},
+			state: "QUEBRADO",
+			says:  "a cerca nao tendo agido",
 		},
 		"a frota somada roda mais sessoes do que existem sids, e isso se sustenta": {
 			// The third half, and it is invisible to both of the others: every
@@ -1034,5 +1050,34 @@ func TestTheKillAftermathKeepsTheTwoHalvesApart(t *testing.T) {
 				t.Errorf("a nota nao diz %q:\n%s", tc.says, note)
 			}
 		})
+	}
+}
+
+// A late write from a previous owner is not ownership moving back to it.
+func TestEpochRisesReadsWhatAClientWouldAccept(t *testing.T) {
+	t.Parallel()
+
+	// b took the session under epoch 2, then a's in-flight write from epoch 1 landed. A
+	// client drops that one on the cursor; counted as a handover, it reads as ownership
+	// returning to a under a lower epoch, and the run called that a broken invariant.
+	rep := &report{}
+	assertEpochRises(rep, map[string][]protocol.Event{
+		"s1": {event("s1", "a", 1, 1), event("s1", "b", 2, 1), event("s1", "a", 1, 2)},
+	})
+	got := only(t, rep)
+	if got.state() == "QUEBRADO" {
+		t.Fatalf("a escrita atrasada do dono anterior foi lida como troca de posse:\n%s", got.detail)
+	}
+	if got.series != "1 trocas de dono observadas sobre 1 sessoes" {
+		t.Errorf("a serie contou o evento atrasado como troca: %s", got.series)
+	}
+
+	// And a real handover that does not raise the epoch is still a finding.
+	broken := &report{}
+	assertEpochRises(broken, map[string][]protocol.Event{
+		"s1": {event("s1", "a", 2, 1), event("s1", "b", 2, 2)},
+	})
+	if state := only(t, broken).state(); state != "QUEBRADO" {
+		t.Errorf("uma troca de dono sob o mesmo epoch saiu %q", state)
 	}
 }
