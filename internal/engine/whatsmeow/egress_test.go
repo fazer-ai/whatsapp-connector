@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -461,4 +462,102 @@ func TestASessionOpenedHereStandsOnWhatItsClientAskedFor(t *testing.T) {
 	if said := proxy.next(t); said != "socks5" {
 		t.Fatalf("the pairing dial reached the proxy saying %q", said)
 	}
+}
+
+// The route moves before the socket on the old one is hung up.
+//
+// whatsmeow's own reconnect can be waiting on the socket lock the hang-up holds, and it
+// dials the moment the lock is let go. If the route were still on the old path then, that
+// dial would open a socket there, and a later connect naming the new proxy would find
+// nothing to change. Read inside the hang-up itself: a dial started at that instant is
+// the one the reconnect would make.
+func TestTheRouteMovesBeforeTheSocketIsHungUp(t *testing.T) {
+	t.Parallel()
+
+	before, after := listenAsProxy(t), listenAsProxy(t)
+	session, _ := newTestSession(t, "5511999990001")
+	standOn(t, session, "socks5://"+before.addr)
+	session.handle(&waEvents.Connected{})
+	next(t, session)
+
+	onAfter := "http://" + after.addr
+	session.disconnect = func(*wm.Client) {
+		_ = reach(t, &http.Client{Transport: &session.route.websocket})
+	}
+	_ = session.Connect(t.Context(), engine.ConnectRequest{
+		Pairing: "resume", Proxy: &engine.ProxyRequest{URL: onAfter},
+	})
+	if said := after.next(t); said != "CONNECT web.whatsapp.com:443 HTTP/1.1" {
+		t.Fatalf("a dial made during the hang-up reached the new proxy saying %q", said)
+	}
+	// The resume that follows dials through the new proxy too, so what matters is that
+	// nothing went to the old one at any point.
+	before.quiet(t, 200*time.Millisecond)
+}
+
+// A move waits for a hang-up an earlier command left running, rather than starting a
+// second one over it.
+//
+// `hangingUp` holds only the latest hang-up. A move that started its own over one still
+// running would have the connect after it wait on the new one alone, and the old one
+// could then land after the replacement socket opened: closing it, or publishing a
+// `close` about a connection that is no longer the session's.
+func TestAMoveWaitsForAHangUpStillRunning(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	var hangUps atomic.Int32
+	session.disconnect = func(*wm.Client) {
+		hangUps.Add(1)
+		<-release
+	}
+	session.handle(&waEvents.Connected{})
+	next(t, session)
+
+	gaveUp, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	if err := session.Disconnect(gaveUp); err == nil {
+		t.Fatal("a disconnect held by the socket lock answered success")
+	}
+
+	moving, cancelMove := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancelMove()
+	if err := session.Connect(moving, engine.ConnectRequest{
+		Pairing: "resume", Proxy: &engine.ProxyRequest{URL: "socks5://127.0.0.1:2"},
+	}); err == nil {
+		t.Fatal("a move over a hang-up still running answered success")
+	}
+	if n := hangUps.Load(); n != 1 {
+		t.Fatalf("the move started hang-up number %d over the one still running", n)
+	}
+}
+
+// A move whose hang-up ran out of time puts the route back where the session believes it
+// is, so the two agree and a connect naming the old proxy again is no change at all.
+func TestAMoveThatCouldNotHangUpLeavesTheRouteWhereItWas(t *testing.T) {
+	t.Parallel()
+
+	before, after := listenAsProxy(t), listenAsProxy(t)
+	session, _ := newTestSession(t, "5511999990001")
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	session.disconnect = func(*wm.Client) { <-release }
+	onBefore := "socks5://" + before.addr
+	standOn(t, session, onBefore)
+	session.handle(&waEvents.Connected{})
+	next(t, session)
+
+	gaveUp, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	_ = session.Connect(gaveUp, engine.ConnectRequest{
+		Pairing: "resume", Proxy: &engine.ProxyRequest{URL: "socks5://" + after.addr},
+	})
+
+	_ = reach(t, &http.Client{Transport: &session.route.websocket})
+	if said := before.next(t); said != "socks5" {
+		t.Fatalf("after a move that could not hang up, a dial reached the old proxy saying %q", said)
+	}
+	after.quiet(t, 200*time.Millisecond)
 }

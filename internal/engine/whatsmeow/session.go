@@ -1763,6 +1763,11 @@ func (s *Session) Connect(ctx context.Context, req engine.ConnectRequest) error 
 	s.setGroups(req.Groups)
 	s.setCallPolicy(req.Calls != nil && req.Calls.AutoReject)
 
+	// A hang-up an earlier command left running is waited for first: the move below may
+	// start one of its own, and awaitHangUp only knows about the latest.
+	if err := s.awaitHangUp(ctx); err != nil {
+		return err
+	}
 	if err := s.reroute(ctx, req.ProxyURL()); err != nil {
 		return err
 	}
@@ -1872,20 +1877,32 @@ func (s *Session) standOnWhatWasAsked(ctx context.Context) error {
 // always did, and recycling the socket on each of them is the thing a resume on a live
 // session is written not to do.
 //
-// `proxy` is only updated once the current client routes through the new path, so a
-// hang-up that ran out of time leaves the session knowing it is still on the old one,
-// and the next connect tries again.
+// The route moves before the socket is hung up, not after. A dial reads the route when
+// it happens, and whatsmeow's own reconnect can be waiting on the socket lock the hang-up
+// holds: moved after, that dial could run in the gap and open a socket on the old path,
+// which a later connect naming the new proxy would then take as already moved. Moved
+// before, any dial that starts from here goes the new way, and the one already holding
+// the lock on the old path is the socket the hang-up then closes.
+//
+// `proxy` is only updated once the socket on the old path is down, so a hang-up that ran
+// out of time leaves the session knowing it may still be on the old one, and the next
+// connect tries again.
 func (s *Session) reroute(ctx context.Context, proxyURL string) error {
 	if proxyURL == s.proxyURL() {
 		return nil
 	}
-	if state := s.state(); state == "open" || state == "connecting" || state == "reconnecting" {
-		if err := s.hangUp(ctx, s.current()); err != nil {
-			return err
-		}
-	}
 	if err := s.route.set(proxyURL); err != nil {
 		return err
+	}
+	if state := s.state(); state == "open" || state == "connecting" || state == "reconnecting" {
+		if err := s.hangUp(ctx, s.current()); err != nil {
+			// Back where `proxy` says it is, so the two agree: a connect naming the old
+			// proxy again is then truly no change, and one naming the new proxy moves it
+			// again. Left on the new path, the first of those would find nothing to do and
+			// leave the route on a proxy the client just moved away from.
+			_ = s.route.set(s.proxyURL())
+			return err
+		}
 	}
 	s.setProxy(proxyURL)
 	return nil
