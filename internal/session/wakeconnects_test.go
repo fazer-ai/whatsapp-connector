@@ -345,3 +345,49 @@ func TestAWakeWhoseConnectFindsNoRoomIsLeftPending(t *testing.T) {
 		t.Fatal("a wake whose connect was never queued was acknowledged, so nothing will carry it out")
 	}
 }
+
+// The same, with a connect naming another proxy queued ahead of the wake's: the account
+// ends on the proxy its client asked for last. Carried out on the copy the wake read, the
+// resume would put the old proxy back on the socket and write it back over the new one.
+func TestAWakeDoesNotRestoreAProxyAConnectAheadOfItReplaced(t *testing.T) {
+	t.Parallel()
+
+	container := openStore(t)
+	const before, after = "socks5://user:secret@10.0.0.1:1080", "http://10.0.0.2:3128"
+	pairedAs(t, container, "s1", store.Wants{Proxy: before})
+	h := newHarnessWithStore(t, container)
+	if _, err := h.manager.Adopt(context.Background(), "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, _ := h.engine.Session("s1")
+
+	release := engineSession.Hold()
+	defer release()
+	h.manager.Dispatch(delivery(&protocol.Command{
+		V: protocol.Version, ID: "held", Type: protocol.CommandSessionStatus, SID: "s1",
+		Payload: json.RawMessage(`{}`),
+	}, &atomic.Bool{}))
+	waitFor(t, "the held command to reach the engine", func() bool { return len(engineSession.Commands()) == 1 })
+	h.manager.Dispatch(delivery(&protocol.Command{
+		V: protocol.Version, ID: "c1", Type: protocol.CommandSessionConnect, SID: "s1", ReplyTo: "c1",
+		Payload: json.RawMessage(`{"pairing":"resume","proxy":{"url":"` + after + `"}}`),
+	}, &atomic.Bool{}))
+	var acked atomic.Bool
+	wake(h, "s1", `{"desired":"connected"}`, &acked)
+	waitFor(t, "the wake to be acknowledged", acked.Load)
+	release()
+
+	waitFor(t, "a reply to the connect", func() bool { _, ok := h.recorder.reply("c1"); return ok })
+	h.manager.Dispatch(delivery(&protocol.Command{
+		V: protocol.Version, ID: "st", Type: protocol.CommandSessionStatus, SID: "s1", ReplyTo: "st",
+		Payload: json.RawMessage(`{}`),
+	}, &atomic.Bool{}))
+	waitFor(t, "a reply to the status", func() bool { _, ok := h.recorder.reply("st"); return ok })
+
+	if request, _ := engineSession.Asked(); request.ProxyURL() != after {
+		t.Fatalf("the last connect the engine was handed goes through %q, want %q", request.ProxyURL(), after)
+	}
+	if standing, _, err := container.For("s1").Standing(t.Context()); err != nil || standing.Proxy != after {
+		t.Fatalf("the record names %q (err %v), want the proxy the client asked for last", standing.Proxy, err)
+	}
+}
