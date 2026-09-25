@@ -3,6 +3,7 @@ package session_test
 import (
 	"context"
 	"encoding/json"
+	"strconv"
 	"sync/atomic"
 	"testing"
 
@@ -12,6 +13,7 @@ import (
 	"github.com/fazer-ai/whatsapp-connector/internal/engine"
 	"github.com/fazer-ai/whatsapp-connector/internal/engine/fake"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
+	"github.com/fazer-ai/whatsapp-connector/internal/session"
 	"github.com/fazer-ai/whatsapp-connector/internal/store"
 	"github.com/fazer-ai/whatsapp-connector/internal/store/storetest"
 	"github.com/fazer-ai/whatsapp-connector/internal/transport"
@@ -248,4 +250,98 @@ func stateOf(t *testing.T, event *protocol.Event) string {
 		t.Fatalf("decode a session.state: %v", err)
 	}
 	return payload.State
+}
+
+// The connect a wake queues acts on what the client asks for when it runs, not on what
+// the record said when the wake read it. A disconnect already queued ahead of it is
+// carried out first, and the wake's copy of the record then says `connected` about an
+// account its client has just turned off: carried out on that copy, the resume dials the
+// socket the disconnect closed and writes `connected` back over the disconnect.
+func TestAWakeDoesNotUndoADisconnectQueuedAheadOfIt(t *testing.T) {
+	t.Parallel()
+
+	container := openStore(t)
+	pairedAs(t, container, "s1", store.Wants{Proxy: "socks5://user:secret@10.0.0.1:1080"})
+	h := newHarnessWithStore(t, container)
+	if _, err := h.manager.Adopt(context.Background(), "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, _ := h.engine.Session("s1")
+
+	// A command in flight holds the executor, so what is dispatched next waits behind it
+	// in the order it was dispatched: the disconnect, then whatever the wake queues.
+	release := engineSession.Hold()
+	defer release()
+	h.manager.Dispatch(delivery(&protocol.Command{
+		V: protocol.Version, ID: "held", Type: protocol.CommandSessionStatus, SID: "s1", ReplyTo: "held",
+		Payload: json.RawMessage(`{}`),
+	}, &atomic.Bool{}))
+	waitFor(t, "the held command to reach the engine", func() bool { return len(engineSession.Commands()) == 1 })
+	h.manager.Dispatch(delivery(&protocol.Command{
+		V: protocol.Version, ID: "d1", Type: protocol.CommandSessionDisconnect, SID: "s1", ReplyTo: "d1",
+		Payload: json.RawMessage(`{}`),
+	}, &atomic.Bool{}))
+	var acked atomic.Bool
+	wake(h, "s1", `{"desired":"connected"}`, &acked)
+	waitFor(t, "the wake to be acknowledged", acked.Load)
+	release()
+
+	waitFor(t, "a reply to the disconnect", func() bool { _, ok := h.recorder.reply("d1"); return ok })
+	h.manager.Dispatch(delivery(&protocol.Command{
+		V: protocol.Version, ID: "st", Type: protocol.CommandSessionStatus, SID: "s1", ReplyTo: "st",
+		Payload: json.RawMessage(`{}`),
+	}, &atomic.Bool{}))
+	waitFor(t, "a reply to the status", func() bool { _, ok := h.recorder.reply("st"); return ok })
+
+	if got := engineSession.Connects(); got != 0 {
+		t.Fatalf("the account was dialled %d times after its client turned it off", got)
+	}
+	if _, wanted, err := container.WantedSession(t.Context(), "s1"); err != nil || wanted {
+		t.Fatalf("after a disconnect and the wake behind it the record says wanted=%v (err %v), "+
+			"want the disconnect standing", wanted, err)
+	}
+}
+
+// A wake whose connect finds no room on the session is not acknowledged. Acknowledged, the
+// client's ask is retired with nothing queued to carry it out, and nothing else comes for
+// an account this instance runs.
+func TestAWakeWhoseConnectFindsNoRoomIsLeftPending(t *testing.T) {
+	t.Parallel()
+
+	container := openStore(t)
+	pairedAs(t, container, "s1", store.Wants{})
+	h := newHarnessWithStore(t, container)
+	if _, err := h.manager.Adopt(context.Background(), "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	engineSession, _ := h.engine.Session("s1")
+
+	release := engineSession.Hold()
+	defer release()
+	status := func(id string) {
+		h.manager.Dispatch(delivery(&protocol.Command{
+			V: protocol.Version, ID: id, Type: protocol.CommandSessionStatus, SID: "s1",
+			Payload: json.RawMessage(`{}`),
+		}, &atomic.Bool{}))
+	}
+	status("held")
+	waitFor(t, "the held command to reach the engine", func() bool { return len(engineSession.Commands()) == 1 })
+	for i := range session.DefaultQueueDepth {
+		status("fill-" + strconv.Itoa(i))
+	}
+
+	var acked, forfeited atomic.Bool
+	h.manager.Dispatch(&transport.Delivery{
+		Command: protocol.Command{
+			V: protocol.Version, ID: "w1", Type: protocol.CommandSessionWake, SID: "s1",
+			Payload: json.RawMessage(`{"desired":"connected"}`),
+		},
+		Ack:     func(context.Context) error { acked.Store(true); return nil },
+		Release: func() {},
+		Forfeit: func() { forfeited.Store(true) },
+	})
+	waitFor(t, "the wake to be given back", forfeited.Load)
+	if acked.Load() {
+		t.Fatal("a wake whose connect was never queued was acknowledged, so nothing will carry it out")
+	}
 }

@@ -207,6 +207,15 @@ func (s *Scoped) Standing(ctx context.Context) (Wants, bool, error) {
 	return s.container.standing(ctx, s.sid)
 }
 
+// Wanted is WantedSession for this session: what its client asked for, and whether it
+// is an account the sweep would bring back. Read by the connect the connector synthesises
+// for itself, when it runs, so it acts on the request as it stands then.
+//
+// Not fenced: it reads.
+func (s *Scoped) Wanted(ctx context.Context) (Wants, bool, error) {
+	return s.container.WantedSession(ctx, s.sid)
+}
+
 // PutDesiredDisconnected records that the client asked this session to stay down.
 //
 // Fenced for the same reason as the one above, and carrying no subscription because the

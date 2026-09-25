@@ -152,9 +152,11 @@ that have to reach an account nobody owns ride it:
   never finished pairing, which has nothing to resume. So a client that has never
   connected a session, or wants it connected differently, still sends `session.connect`
   after the wake; sending it after a wake that already connected is harmless, since a
-  resume on a session that is up or on its way up changes nothing. A wake for a session
-  the connector is already running and that is down connects it again, which is what
-  makes publishing another wake the way to retry.
+  resume on a session that is up or on its way up changes nothing. The record is read
+  again when that connect runs, so a `session.disconnect` or a `session.connect` sent
+  before the wake is what the account ends up doing. A wake is not a way to reach the
+  instance already running a session: the fleet hands it to whichever instance reads it
+  first, and one that does not own the account acknowledges it and does nothing.
 - `session.delete` tears one down, and the account it matters most for is exactly the
   one that is down: an inbox destroyed while its session was not connected, or
   destroyed while the fleet was restarting.

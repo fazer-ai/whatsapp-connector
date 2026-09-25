@@ -952,7 +952,7 @@ func (s *Session) run(ctx context.Context, waiting queued) (refusal protocol.Err
 
 	began := waiting.at
 	handedBack := false
-	result, recalled, err := s.carryOut(ctx, &command)
+	result, recalled, err := s.carryOut(ctx, &command, delivery.Internal)
 	// Reported for the two endings that answer the caller, and not for the two below
 	// that hand the command back: a command given back has not been carried out, and
 	// timing it would put this instance's abandoned turn into the latency of a command
@@ -1065,7 +1065,7 @@ func ran(err error) bool {
 // teardown was queued means the refusal is all that happened.
 func (s *Session) carriedSoFar() int64 { return s.carried.Load() }
 
-func (s *Session) carryOut(ctx context.Context, command *protocol.Command) (result json.RawMessage, recalled bool, err error) {
+func (s *Session) carryOut(ctx context.Context, command *protocol.Command, internal bool) (result json.RawMessage, recalled bool, err error) {
 	if _, owned := s.leases.Owned(s.sid); !owned {
 		return nil, false, protocol.NewError(protocol.ErrorOwnedElsewhere, "the session moved to another instance")
 	}
@@ -1091,7 +1091,7 @@ func (s *Session) carryOut(ctx context.Context, command *protocol.Command) (resu
 	execCtx, releaseBound := bound(ctx, command)
 	defer releaseBound()
 
-	result, err = s.lifecycle(execCtx, command)
+	result, err = s.lifecycle(execCtx, command, internal)
 	if err == nil && key != "" && s.ledger != nil {
 		// Only a success is remembered. A failure is the caller's to try again, and a
 		// remembered one would answer every later attempt with the same refusal.
@@ -1292,7 +1292,9 @@ func idempotencyKey(command *protocol.Command) string {
 // Execute: they are not requests about a live session, they are what makes one live or
 // ends it, and an engine that had to recognise them inside Execute would be answering
 // two different kinds of question through one door.
-func (s *Session) lifecycle(ctx context.Context, command *protocol.Command) (json.RawMessage, error) {
+// `internal` says the connector synthesised the command itself rather than a client sending
+// it, which only a resume does.
+func (s *Session) lifecycle(ctx context.Context, command *protocol.Command, internal bool) (json.RawMessage, error) {
 	switch command.Type {
 	case protocol.CommandSessionConnect:
 		var request engine.ConnectRequest
@@ -1306,6 +1308,24 @@ func (s *Session) lifecycle(ctx context.Context, command *protocol.Command) (jso
 		// what puts the answer before the write rather than after it.
 		if err := request.Validate(); err != nil {
 			return nil, err
+		}
+		if internal && s.store != nil {
+			// A resume the connector queued for itself carries what the record said when
+			// it was queued, and a command queued ahead of it -- a disconnect, a connect
+			// naming another proxy -- may have changed that since. Read again here, on the
+			// executor that ran that command, so the resume brings back what the client
+			// asks for now; carried out on the old copy it would undo the disconnect, or
+			// write the old proxy back over the new one.
+			current, still, err := s.stillWanted(ctx)
+			if err != nil {
+				return nil, err
+			}
+			if !still {
+				s.log.Info().Str("sid", s.sid).
+					Msg("a resume found the account no longer asked to be connected; not dialling")
+				return nil, nil
+			}
+			request = current
 		}
 		if err := s.recordAsked(ctx, request); err != nil {
 			return nil, err
@@ -1427,6 +1447,16 @@ func (s *Session) recordAsked(ctx context.Context, request engine.ConnectRequest
 		s.warnUnrecorded(err)
 	}
 	return nil
+}
+
+// stillWanted reads whether the account is still one to bring back, and the connect that
+// does it.
+func (s *Session) stillWanted(ctx context.Context) (engine.ConnectRequest, bool, error) {
+	wants, wanted, err := s.store.Wanted(ctx)
+	if err != nil {
+		return engine.ConnectRequest{}, false, fmt.Errorf("session %s: %w", s.sid, err)
+	}
+	return resumeRequest(wants), wanted, nil
 }
 
 // knowWhatWasAsked reads the standing request off the row when no connect on this

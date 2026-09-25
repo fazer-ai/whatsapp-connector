@@ -1006,8 +1006,12 @@ func (m *Manager) wake(ctx context.Context, delivery *transport.Delivery) {
 	session, err := m.Adopt(ctx, sid)
 	switch {
 	case err == nil:
-		if bringUp {
-			m.bringUp(session, wants)
+		if bringUp && !m.bringUp(session, wants) {
+			// Left pending rather than acknowledged: acknowledged, the client's ask is
+			// retired with nothing queued to carry it out, and the sweep does not look at an
+			// account this instance runs. Forfeited, for the reason a failed adoption is.
+			forfeit(delivery)
+			return
 		}
 	case errors.Is(err, errLeaving):
 		// Not this instance's turn to answer: it is giving the account up, and the wake is
@@ -1077,17 +1081,22 @@ func (m *Manager) wakeWants(ctx context.Context, delivery *transport.Delivery) (
 //
 // Whether this wake opened the session or found it running here: a resume on a socket that
 // is up, or on its way up, is no change at all in either engine, and one on a session whose
-// last dial failed is the retry the contract tells a client to ask for by sending another
-// wake.
-func (m *Manager) bringUp(session *Session, wants store.Wants) {
+// last dial failed dials again. What it carries is only a first guess: the session reads
+// the record again when it runs the connect, because a command queued ahead of it -- a
+// disconnect, a connect naming another proxy -- may have changed it by then.
+//
+// It reports whether the connect was queued.
+func (m *Manager) bringUp(session *Session, wants store.Wants) bool {
 	delivery, built := m.resumeConnect(session.SID(), wants)
 	if !built {
-		return
+		return false
 	}
 	if session.Offer(delivery) != OfferAccepted {
 		m.log.Info().Str("sid", session.SID()).
-			Msg("a woken session had no room for the connect that would put it in the air")
+			Msg("a woken session had no room for the connect that would put it in the air; leaving the wake pending")
+		return false
 	}
+	return true
 }
 
 // adoptedForDelete is one account opened to serve teardowns and nothing else.
@@ -1451,24 +1460,7 @@ func (m *Manager) Resume(sid string, wants store.Wants) bool {
 // the one thing that differs is that nobody is waiting for it, which is what `Internal`
 // says.
 func (m *Manager) resumeConnect(sid string, wants store.Wants) (*transport.Delivery, bool) {
-	// Built from the type the session decodes rather than spelled out as a literal, so
-	// what this writes and what reads it cannot drift: they are the same struct, and a
-	// field renamed on one side stops compiling instead of quietly setting nothing.
-	request := engine.ConnectRequest{Pairing: "resume", Groups: wants.Groups}
-	if wants.CallAutoReject {
-		// Omitted rather than sent as `{auto_reject: false}`: a client that never asked
-		// about calls and one that asked for them to ring are the same request, and the
-		// contract spells the first as an absent object.
-		request.Calls = &engine.CallsRequest{AutoReject: true}
-	}
-	if wants.Proxy != "" {
-		// Omitted for the same reason, and with more riding on it than the call policy:
-		// an account that asked for a proxy and is brought back without one dials
-		// WhatsApp from this instance's own address. The payload goes to this instance's
-		// own executor and nowhere else, so the credentials in it stay in this process.
-		request.Proxy = &engine.ProxyRequest{URL: wants.Proxy}
-	}
-	payload, err := json.Marshal(request)
+	payload, err := json.Marshal(resumeRequest(wants))
 	if err != nil {
 		// A string and a bool with no marshaller of their own: unreachable. Refused
 		// rather than sent half-built, and the next sweep asks for this account again.
@@ -1487,6 +1479,29 @@ func (m *Manager) resumeConnect(sid string, wants store.Wants) (*transport.Deliv
 		Release:  func() {},
 		Internal: true,
 	}, true
+}
+
+// resumeRequest is the connect that brings an account back with what its client asked for:
+// the mode, and what the desired row remembers.
+func resumeRequest(wants store.Wants) engine.ConnectRequest {
+	// Built from the type the session decodes rather than spelled out as a literal, so
+	// what this writes and what reads it cannot drift: they are the same struct, and a
+	// field renamed on one side stops compiling instead of quietly setting nothing.
+	request := engine.ConnectRequest{Pairing: "resume", Groups: wants.Groups}
+	if wants.CallAutoReject {
+		// Omitted rather than sent as `{auto_reject: false}`: a client that never asked
+		// about calls and one that asked for them to ring are the same request, and the
+		// contract spells the first as an absent object.
+		request.Calls = &engine.CallsRequest{AutoReject: true}
+	}
+	if wants.Proxy != "" {
+		// Omitted for the same reason, and with more riding on it than the call policy:
+		// an account that asked for a proxy and is brought back without one dials
+		// WhatsApp from this instance's own address. The payload goes to this instance's
+		// own executor and nowhere else, so the credentials in it stay in this process.
+		request.Proxy = &engine.ProxyRequest{URL: wants.Proxy}
+	}
+	return request
 }
 
 // reconnect adopts an account that should be running and hands the synthesised connect to
