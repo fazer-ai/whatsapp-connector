@@ -399,6 +399,11 @@ func TestMovingTheRouteDoesNotRaceARequestGoingThroughIt(t *testing.T) {
 	}
 	recorded := &clientRecorder{}
 	route.install(recorded)
+	// Asked here rather than found out inside the goroutine: a nil client there is a panic
+	// that takes every other test in the binary down with it, and says nothing about which.
+	if recorded.media == nil || recorded.websocket == nil {
+		t.Fatal("the route did not install the media and websocket clients, so there is nothing to race")
+	}
 
 	done := make(chan struct{})
 	go func() {
