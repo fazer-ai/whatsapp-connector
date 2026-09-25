@@ -39,6 +39,10 @@ var keysTheClientRenders = []string{
 // method on Keys that names nothing a client could read.
 var notAKey = map[string]bool{"Prefix": true}
 
+// clientSide is the directory in this module that speaks as a client rather than as the
+// connector. Its key usage says nothing about which names this side renders.
+const clientSide = "cmd/fleetbench"
+
 func TestEveryKeyIsUsedHereOrMarkedAsTheClientsToWrite(t *testing.T) {
 	t.Parallel()
 
@@ -161,9 +165,11 @@ func keysNamedByProductionCode(t *testing.T, catalog map[string]bool) map[string
 	root := filepath.Join("..", "..")
 	fileSet := token.NewFileSet()
 	walk := func(path string, entry fs.DirEntry, err error) error {
-		switch {
-		case err != nil:
+		if err != nil {
 			return err
+		}
+		where, _ := filepath.Rel(root, path)
+		switch {
 		case entry.IsDir():
 			return nil
 		case !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go"):
@@ -171,13 +177,20 @@ func keysNamedByProductionCode(t *testing.T, catalog map[string]bool) map[string
 		case filepath.Base(path) == "keys.go":
 			// The declarations themselves, where every constructor is named.
 			return nil
+		case strings.HasPrefix(filepath.ToSlash(where), clientSide+"/"):
+			// The fleet bench stands where a client stands: it sends commands, names its
+			// own reply list, and reads the event shards from outside. Counting it as
+			// this connector's production code would make `Reply` look like a name this
+			// side renders, and the marked group above is exactly the list of names it
+			// does not. The names it uses are still held to something -- the connector
+			// refuses a `reply_to` that IsReply does not accept -- just not to this.
+			return nil
 		}
 
 		file, parseErr := parser.ParseFile(fileSet, path, nil, 0)
 		if parseErr != nil {
 			return parseErr
 		}
-		where, _ := filepath.Rel(root, path)
 		ast.Inspect(file, func(node ast.Node) bool {
 			call, ok := node.(*ast.CallExpr)
 			if !ok {

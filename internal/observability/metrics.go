@@ -1,7 +1,10 @@
 // Package observability holds the logger and the metrics the connector publishes.
 package observability
 
-import "github.com/prometheus/client_golang/prometheus"
+import (
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+)
 
 // Metrics is everything this build measures. It carries its own registry so a test can
 // build a set without touching the process-wide default, where a second one would
@@ -187,6 +190,24 @@ func New() *Metrics {
 		m.CommandReadsFailed, m.CommandReadLastSuccess, m.EmissionWait, m.InboxDepth, m.EmissionsDropped,
 		m.CommandsDeliveredAgain, m.CommandsReclaimed, m.CommandRedeliveries, m.CommandReclaimPasses,
 		m.StateNoticeDelay,
+	)
+	// The runtime and the process, alongside what this build counts itself.
+	//
+	// Every metric above is about what the connector did; none is about what it cost.
+	// "Is this instance leaking goroutines", "how much memory does a fleet of N sessions
+	// need", "is it near its file descriptor ceiling" are the first three questions of a
+	// capacity incident, and until these two collectors were registered `/metrics`
+	// answered none of them -- there was no series to put on a panel, so the answer had
+	// to come from `ps` on the host, which Grafana never sees.
+	//
+	// They are not fields of `Metrics` and so do not appear in the catalogue test: that
+	// table exists because a metric this build registers can be left unwired and read as
+	// a zero forever (#226), and these two are written by the Go runtime on every scrape
+	// instead of by a call site that might never be added. What holds them honest is
+	// `TestTheRuntimeAndTheProcessAreExposed`, which scrapes and looks for the series.
+	registry.MustRegister(
+		collectors.NewGoCollector(),
+		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	)
 	return m
 }

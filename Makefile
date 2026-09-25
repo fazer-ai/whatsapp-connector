@@ -28,7 +28,7 @@ test-redis_RUN := docker run -d --rm -p 56379:6379 redis:8-alpine
 test-redis_URL := redis://localhost:56379/0
 
 .DEFAULT_GOAL := help
-.PHONY: help setup deps hooks fmt lint test test-postgres test-redis test-cover contract tidy check check-offline check-servers offline-passes clean
+.PHONY: help setup deps hooks fmt lint test test-postgres test-redis test-cover contract tidy check check-offline check-servers offline-passes bench-fleet clean
 
 help: ## List the available targets
 	@grep -hE '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
@@ -100,6 +100,43 @@ contract: ## Check the Go protocol binding against contract/
 
 tidy: ## Fail when go.mod/go.sum are not tidy
 	$(GO) mod tidy -diff
+
+# Two real processes against a real fleet, under load, with ownership forced to move.
+#
+# Deliberately outside `check`, and the reason is in `internal/toolchain` rather than only
+# here: it builds a binary, starts processes and waits on real clocks, which is minutes
+# rather than seconds, and `check` runs on every change. A comment is not an assertion, so
+# the exemption is written where the suite reads it and fails when it stops being true.
+#
+# It refuses SQLite on purpose. Two processes do not share an SQLite file, and the fencing
+# operational invariant 1 promises lives in the store, so a run against SQLite would be two
+# connectors on two databases calling themselves a fleet.
+# The bench answers in four exit codes, and two layers would swallow them.
+#
+# MEASURED on go1.26.6 and GNU Make 3.81: `go run` reports any non-zero status as 1 of its
+# own (a program exiting 3 comes back as 1, with `exit status 3` on stderr), and `make`
+# exits 2 for any recipe that fails,
+# whatever the recipe's own code was. Read through both, a broken invariant, a measurement
+# outside its range and a machine that was not ready are one number -- which is exactly
+# what having three codes exists to prevent.
+#
+# The `go run` layer is removable and is removed here: the target builds the binary and
+# runs it, so the recipe sees the real code and names it. The `make` layer is not: GNU make
+# exits 2 on any failure by design. So a script reads the binary, and the line below says
+# so and prints the code it got.
+BENCH_BIN ?= $(CURDIR)/bin/fleetbench
+
+bench-fleet: ## Fleet bench with WAC_ENGINE=fake: 2+ connector processes on real PostgreSQL and Redis, invariants under an ownership change. Minutes, not seconds, so it is outside `check`. Does NOT cover whatsmeow under handover (needs a real account). Needs WAC_TEST_DATABASE_URL and WAC_TEST_REDIS_URL. A script wanting the four exit codes apart runs bin/fleetbench: make reports any failure as 2
+	@mkdir -p $(dir $(BENCH_BIN))
+	@$(GO) build -o $(BENCH_BIN) ./cmd/fleetbench
+	@$(BENCH_BIN) $(BENCH_FLAGS); code=$$?; \
+	  if [ $$code -ne 0 ]; then \
+	    echo ""; \
+	    echo "a bancada saiu com o codigo $$code (1 invariante quebrada, 2 setup incompleto, 3 medida fora da faixa)."; \
+	    echo "make responde 2 para qualquer receita que falhe, seja qual for o codigo dela: um script que"; \
+	    echo "precise dos tres separados roda $(BENCH_BIN) direto."; \
+	  fi; \
+	  exit $$code
 
 # Everything CI enforces, and it fails when it cannot run all of it.
 #
