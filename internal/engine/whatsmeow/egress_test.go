@@ -342,3 +342,34 @@ func TestAPairingCodeIsAskedForThroughTheSessionsProxy(t *testing.T) {
 		t.Fatalf("asking for a code left the session on %q", got)
 	}
 }
+
+// A client built to replace a stale one dials through the session's proxy.
+//
+// The second of the two places a client is made: a connect on a session whose device is
+// gone -- a pairing replaced by its operator, a logout that stopped halfway -- repairs it
+// by building a fresh client, and that client is what dials the pairing that follows. One
+// built without the proxy is a session that leaves through it until its first relogin and
+// from this instance's own address after, with nothing on the wire to say it moved.
+func TestARebuiltClientKeepsTheSessionsProxy(t *testing.T) {
+	t.Parallel()
+
+	proxy := listenAsProxy(t)
+	session, _ := newTestSession(t, "")
+	onProxy := "socks5://" + proxy.addr
+	if err := routeThrough(session.current(), onProxy); err != nil {
+		t.Fatalf("routeThrough: %v", err)
+	}
+	session.setProxy(onProxy)
+	previous := session.current()
+	session.markStale()
+
+	_ = session.Connect(t.Context(), engine.ConnectRequest{
+		Pairing: "qr", Proxy: &engine.ProxyRequest{URL: onProxy},
+	})
+	if session.current() == previous {
+		t.Fatal("the stale client was not replaced, so this says nothing about the one that replaces it")
+	}
+	if said := proxy.next(t); said != "socks5" {
+		t.Fatalf("the rebuilt client reached the proxy saying %q", said)
+	}
+}
