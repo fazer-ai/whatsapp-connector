@@ -242,14 +242,29 @@ var upstreamDefects = []upstreamDefect{
 	{
 		issue: "fazer-ai/whatsapp-connector#280",
 		file:  "client.go",
-		// What that branch calls retryable. A network error is what a resume meets when the
-		// network or the proxy is away, and it is the case #280 is about.
-		stillThere: []string{"exhttp.IsNetworkError(err)"},
+		// What that branch calls retryable. A dial that fails is wrapped in ErrDialFailed
+		// (the entry below), which is the case #280 is about: the network or the proxy was
+		// away. The network error covers a failure after the socket, in the handshake.
+		// The condition as a whole line where the body allows it, so one that grew a clause
+		// does not read as the same one.
+		stillThere: []string{"\tif exhttp.IsNetworkError(err) {\n", "\treturn errors.Is(err, socket.ErrDialFailed)"},
 		enclosing:  "func isRetryableConnectError(",
-		what:       "a network error counting as a retryable failure of the first dial",
+		what:       "a failed dial and a network error counting as retryable failures of the first dial",
 		reliedOn:   true,
 		restingOn: "the same line in adopt: without it a resume that met a network that was " +
 			"away is left adopted and unconnected again",
+	},
+	{
+		issue: "fazer-ai/whatsapp-connector#280",
+		file:  "socket/framesocket.go",
+		// And the wrapping that makes a failed dial one of those, whatever the error below
+		// it was: a refused connection, a proxy that hung up, a name that did not resolve.
+		stillThere: []string{"return fmt.Errorf(\"%w: %w\", ErrDialFailed, err)"},
+		enclosing:  "func (fs *FrameSocket) Connect(",
+		what:       "a websocket dial that failed being reported as ErrDialFailed",
+		reliedOn:   true,
+		restingOn: "the retry adopt turns on for the first dial, which only takes failures " +
+			"isRetryableConnectError recognises",
 	},
 	{
 		issue: "fazer-ai/whatsapp-connector#90",
