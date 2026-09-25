@@ -391,6 +391,11 @@ func TestMovingTheRouteDoesNotRaceARequestGoingThroughIt(t *testing.T) {
 
 	first, second := listenAsProxy(t), listenAsProxy(t)
 	route := newEgressRoute()
+	// On a local listener before anything is sent, so no request of this test can go out
+	// by the direct route a new one starts on.
+	if err := route.set("socks5://" + first.addr); err != nil {
+		t.Fatalf("route.set: %v", err)
+	}
 	recorded := &clientRecorder{}
 	route.install(recorded)
 

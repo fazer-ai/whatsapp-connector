@@ -1307,7 +1307,9 @@ func (s *Session) lifecycle(ctx context.Context, command *protocol.Command) (jso
 		if err := request.Validate(); err != nil {
 			return nil, err
 		}
-		s.recordAsked(ctx, request)
+		if err := s.recordAsked(ctx, request); err != nil {
+			return nil, err
+		}
 		if err := s.engine.Connect(ctx, request); err != nil {
 			return nil, err
 		}
@@ -1401,13 +1403,30 @@ func (s *Session) lifecycle(ctx context.Context, command *protocol.Command) (jso
 // what the client asked for and it is happening, and a memory that could not be written
 // is a session that will not come back by itself later, which is worse than it was but
 // not a reason to refuse what is working now. The next connect writes it again.
-func (s *Session) recordAsked(ctx context.Context, request engine.ConnectRequest) {
-	s.asked = store.Wants{
+//
+// Except for a connect that names a proxy, which is refused instead. The row is what the
+// next resume dials through, so a proxy the socket uses and the row does not hold is an
+// account that goes out through the proxy now and from this instance's own address after
+// the next restart or ownership change -- the one outcome a client that asked for a proxy
+// asked not to happen, and one it would never be told about. Refused here, before the
+// engine is called, nothing has moved yet and the client sees the command fail. A connect
+// asking to go out directly is not refused on the same failure: the row it leaves behind
+// still names the proxy from before, and a resume through that exposes nothing.
+func (s *Session) recordAsked(ctx context.Context, request engine.ConnectRequest) error {
+	wants := store.Wants{
 		Groups: request.Groups, CallAutoReject: request.Calls != nil && request.Calls.AutoReject,
 		Proxy: request.ProxyURL(),
 	}
-	s.askedKnown = true
-	s.recordWanted(ctx)
+	err := s.writeWanted(ctx, wants)
+	if err != nil && wants.Proxy != "" {
+		return fmt.Errorf("session %s: the proxy could not be recorded, so a resume would not go "+
+			"through it: %w", s.sid, err)
+	}
+	s.asked, s.askedKnown = wants, true
+	if err != nil {
+		s.warnUnrecorded(err)
+	}
+	return nil
 }
 
 // knowWhatWasAsked reads the standing request off the row when no connect on this
@@ -1428,13 +1447,21 @@ func (s *Session) knowWhatWasAsked(ctx context.Context) error {
 // recordWanted writes the standing request. A plain field holds it because every caller
 // runs on this session's executor, which is one goroutine taking one command at a time.
 func (s *Session) recordWanted(ctx context.Context) {
+	if err := s.writeWanted(ctx, s.asked); err != nil {
+		s.warnUnrecorded(err)
+	}
+}
+
+func (s *Session) writeWanted(ctx context.Context, wants store.Wants) error {
 	if s.store == nil {
-		return
+		return nil
 	}
-	if err := s.store.PutDesiredConnected(ctx, s.asked); err != nil {
-		s.log.Warn().Err(err).Str("sid", s.sid).
-			Msg("could not record that this session should be connected; it will not be resumed on its own")
-	}
+	return s.store.PutDesiredConnected(ctx, wants) //nolint:wrapcheck // the callers wrap or log it with the session
+}
+
+func (s *Session) warnUnrecorded(err error) {
+	s.log.Warn().Err(err).Str("sid", s.sid).
+		Msg("could not record that this session should be connected; it will not be resumed on its own")
 }
 
 // recordAskedDown remembers that a client asked this session to stay down.
