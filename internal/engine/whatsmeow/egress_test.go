@@ -404,6 +404,9 @@ func TestMovingTheRouteDoesNotRaceARequestGoingThroughIt(t *testing.T) {
 	if recorded.media == nil || recorded.websocket == nil {
 		t.Fatal("the route did not install the media and websocket clients, so there is nothing to race")
 	}
+	if route.media.current.Load() == nil || route.websocket.current.Load() == nil {
+		t.Fatal("the route has no transport behind a client it installed, so a request through it panics")
+	}
 
 	done := make(chan struct{})
 	go func() {
