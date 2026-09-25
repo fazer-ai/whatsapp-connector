@@ -141,6 +141,20 @@ stream is trimmed. `wa:control` is read by every connector, which is why the com
 that have to reach an account nobody owns ride it:
 
 - `session.wake` starts a session nobody is running, which is the whole point of it.
+  **It puts the account in the air only when the connector already knows it should be.**
+  A wake carries no connect of its own, so what licenses the dial is the record the
+  client's own `session.connect` left (see the desired state below the key table): a wake
+  with `desired: "connected"` for an account that has paired and whose client last asked
+  for it to be connected adopts it and connects it with what that connect asked for, the
+  group subscription, the call policy and the proxy included, the same way the resume
+  sweep does. Every other wake adopts the account and stops there: `desired:
+  "disconnected"`, an account with no record, one its client turned off, and one that
+  never finished pairing, which has nothing to resume. So a client that has never
+  connected a session, or wants it connected differently, still sends `session.connect`
+  after the wake; sending it after a wake that already connected is harmless, since a
+  resume on a session that is up or on its way up changes nothing. A wake for a session
+  the connector is already running and that is down connects it again, which is what
+  makes publishing another wake the way to retry.
 - `session.delete` tears one down, and the account it matters most for is exactly the
   one that is down: an inbox destroyed while its session was not connected, or
   destroyed while the fleet was restarting.

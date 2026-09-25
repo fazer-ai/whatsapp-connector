@@ -990,9 +990,25 @@ func (m *Manager) wake(ctx context.Context, delivery *transport.Delivery) {
 		}
 	}
 
-	_, err := m.Adopt(ctx, sid)
+	// Read before the account is adopted, so a store that does not answer costs the wake
+	// a turn and nothing else: adopted first, the redelivery would find the session
+	// already running here, and the sweep that could have brought it up asks only about
+	// accounts nobody runs.
+	wants, bringUp, err := m.wakeWants(ctx, delivery)
+	if err != nil {
+		m.log.Error().Err(err).Str("sid", sid).
+			Msg("could not read whether a woken session should be connected; leaving the wake pending")
+		// Forfeited, for the reason the failed adoption below forfeits.
+		forfeit(delivery)
+		return
+	}
+
+	session, err := m.Adopt(ctx, sid)
 	switch {
 	case err == nil:
+		if bringUp {
+			m.bringUp(session, wants)
+		}
 	case errors.Is(err, errLeaving):
 		// Not this instance's turn to answer: it is giving the account up, and the wake is
 		// what starts it again once nobody owns it. Released rather than forfeited, so it
@@ -1028,6 +1044,50 @@ func (m *Manager) wake(ctx context.Context, delivery *transport.Delivery) {
 		return
 	}
 	m.ack(ctx, delivery)
+}
+
+// wakeWants reads whether a `session.wake` puts its account in the air, and with what.
+//
+// It does when the wake asks for the account to be connected and the account is one the
+// resume sweep would bring back: its client asked for it to be connected, and it has a
+// device to connect with. The wake carries no connect of its own, so what licenses the
+// dial is the record the client's own connect left, and what the account comes back with
+// is what that record remembers. Anything short of that and the wake adopts and stops
+// there, which is all a wake for an account nobody has paired, or one its client turned
+// off, can do.
+//
+// A payload that does not decode asks for nothing: the frame names no state, and a dial
+// is not the default for a request that did not say so.
+func (m *Manager) wakeWants(ctx context.Context, delivery *transport.Delivery) (store.Wants, bool, error) {
+	if m.store == nil {
+		return store.Wants{}, false, nil
+	}
+	var asked struct {
+		Desired string `json:"desired"`
+	}
+	if err := json.Unmarshal(delivery.Command.Payload, &asked); err != nil || asked.Desired != store.DesiredConnected {
+		return store.Wants{}, false, nil
+	}
+	read, cancel := context.WithTimeout(ctx, AdoptTimeout)
+	defer cancel()
+	return m.store.WantedSession(read, delivery.Command.SID)
+}
+
+// bringUp hands a woken session the connect that puts it in the air.
+//
+// Whether this wake opened the session or found it running here: a resume on a socket that
+// is up, or on its way up, is no change at all in either engine, and one on a session whose
+// last dial failed is the retry the contract tells a client to ask for by sending another
+// wake.
+func (m *Manager) bringUp(session *Session, wants store.Wants) {
+	delivery, built := m.resumeConnect(session.SID(), wants)
+	if !built {
+		return
+	}
+	if session.Offer(delivery) != OfferAccepted {
+		m.log.Info().Str("sid", session.SID()).
+			Msg("a woken session had no room for the connect that would put it in the air")
+	}
 }
 
 // adoptedForDelete is one account opened to serve teardowns and nothing else.
@@ -1356,10 +1416,7 @@ func (m *Manager) takeForDelete(ctx context.Context, delivery *transport.Deliver
 // Measured in production as an inbox showing `open` and delivering nothing until somebody
 // opened it and pressed connect (fazer-ai/chatwoot#577).
 //
-// The connect is a real command on the session's own queue, synthesised here. Everything
-// a connect needs is then what it has always had -- the executor, the order, the engine's
-// own events -- and the one thing that differs is that nobody is waiting for it, which is
-// what `Internal` says.
+// The connect is `resumeConnect`'s.
 //
 // What comes back with the account is what the desired row remembers: the group
 // subscription and the call policy. The rest of a connect is not remembered on purpose:
@@ -1377,6 +1434,23 @@ func (m *Manager) Resume(sid string, wants store.Wants) bool {
 		// dial a socket that is already there. The sweep asks about accounts nobody runs.
 		return false
 	}
+	delivery, built := m.resumeConnect(sid, wants)
+	if !built {
+		return false
+	}
+	return !m.own(delivery, m.reconnect)
+}
+
+// resumeConnect is the connect that puts an account back in the air with what its client
+// asked for, synthesised here because nobody is sending one: the sweep bringing back an
+// account nobody runs, and a `session.wake` for an account whose client asked for it to
+// be connected.
+//
+// The connect is a real command on the session's own queue. Everything a connect needs is
+// then what it has always had -- the executor, the order, the engine's own events -- and
+// the one thing that differs is that nobody is waiting for it, which is what `Internal`
+// says.
+func (m *Manager) resumeConnect(sid string, wants store.Wants) (*transport.Delivery, bool) {
 	// Built from the type the session decodes rather than spelled out as a literal, so
 	// what this writes and what reads it cannot drift: they are the same struct, and a
 	// field renamed on one side stops compiling instead of quietly setting nothing.
@@ -1399,20 +1473,20 @@ func (m *Manager) Resume(sid string, wants store.Wants) bool {
 		// A string and a bool with no marshaller of their own: unreachable. Refused
 		// rather than sent half-built, and the next sweep asks for this account again.
 		m.log.Warn().Err(err).Str("sid", sid).Msg("could not build the connect to bring a session back")
-		return false
+		return nil, false
 	}
-	return !m.own(&transport.Delivery{
+	return &transport.Delivery{
 		Command: protocol.Command{
 			V: protocol.Version, ID: m.newID(), Type: protocol.CommandSessionConnect, SID: sid,
 			Payload: payload,
 		},
 		// Nothing to acknowledge and nothing to leave pending: this command is not an
 		// entry on a stream, so the only thing a refusal costs is a pass, and the next
-		// sweep asks again.
+		// sweep or wake asks again.
 		Ack:      func(context.Context) error { return nil },
 		Release:  func() {},
 		Internal: true,
-	}, m.reconnect)
+	}, true
 }
 
 // reconnect adopts an account that should be running and hands the synthesised connect to

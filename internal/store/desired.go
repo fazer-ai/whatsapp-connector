@@ -124,6 +124,32 @@ func (c *Container) standing(ctx context.Context, sid string) (Wants, bool, erro
 	return Wants{Groups: groups != 0, CallAutoReject: autoReject != 0, Proxy: proxy}, true, nil
 }
 
+// WantedSession is Wanted for one session: what its client asked for, and whether the
+// account is one the sweep would bring back -- asked to be connected, with a device to
+// connect with.
+//
+// Read by a `session.wake`, which adopts an account and has nothing else to say whether
+// it should dial. The rule is the sweep's on purpose: an account the wake brings up is one
+// the sweep would have brought up had nobody been running it, and a pairing nobody
+// finished is left out here for the reason it is left out there.
+func (c *Container) WantedSession(ctx context.Context, sid string) (Wants, bool, error) {
+	const query = `
+		SELECT d.wants_groups, d.wants_call_auto_reject, d.wants_proxy
+		FROM wac_session_desired d
+		JOIN wac_session_device v ON v.sid = d.sid
+		WHERE d.sid = ? AND d.desired = ?`
+	var proxy string
+	var groups, autoReject int64
+	err := c.db.QueryRowContext(ctx, c.rebind(query), sid, DesiredConnected).Scan(&groups, &autoReject, &proxy)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Wants{}, false, nil
+	}
+	if err != nil {
+		return Wants{}, false, fmt.Errorf("store: read whether %s should be connected: %w", sid, err)
+	}
+	return Wants{Groups: groups != 0, CallAutoReject: autoReject != 0, Proxy: proxy}, true, nil
+}
+
 // dropDesired forgets what was asked for, which is what a session that no longer exists
 // leaves behind.
 func (c *Container) dropDesired(ctx context.Context, sid string) error {
