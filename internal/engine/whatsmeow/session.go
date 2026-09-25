@@ -477,6 +477,15 @@ type Session struct {
 	// by Connect and read by the handler for every call that arrives.
 	autoRejectCalls bool
 
+	// proxy is the last connect's `proxy.url`, empty for a session that goes out
+	// directly. Guarded by mu, and written once route goes through it. It carries
+	// credentials: nothing here logs or publishes it.
+	proxy string
+
+	// route is what every client this session adopts dials through. Set in newSession and
+	// never replaced; what changes is the path inside it.
+	route *egressRoute
+
 	// answered remembers which calls this session has already published an offer for.
 	// WhatsApp announces one call twice -- `offer` and `offer_notice` -- and the two
 	// arrive in either order, so without this a single call reaches the inbox as two.
@@ -663,6 +672,7 @@ func newSession(
 	lifetime, cancel := context.WithCancel(context.Background())
 	s := &Session{
 		sid:        sid,
+		route:      newEgressRoute(),
 		aliases:    newAlias(),
 		store:      scoped,
 		log:        log.With().Str("sid", sid).Logger(),
@@ -899,6 +909,10 @@ func (s *Session) adopt(ctx context.Context, client *wm.Client) bool {
 	// instead of being prevented. The buffer keeps the plaintext, keyed by the
 	// ciphertext, until a handler accepts it.
 	client.EnableDecryptedEventBuffer = true
+	// The session's route, and not one of the client's own: the route outlives every
+	// client the session goes through, so the one built after a relogin leaves by the
+	// same path the one before it did, with the dial ceiling on it (see newClient).
+	s.route.install(client)
 
 	// Read here and not later: this client was built for this session and nothing else
 	// holds it yet, so whatsmeow's own goroutines are not writing to it.
@@ -1184,6 +1198,18 @@ func (s *Session) rejectsCalls() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.autoRejectCalls
+}
+
+func (s *Session) setProxy(proxyURL string) {
+	s.mu.Lock()
+	s.proxy = proxyURL
+	s.mu.Unlock()
+}
+
+func (s *Session) proxyURL() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.proxy
 }
 
 // firstSightOf reports whether this is the first time the session has been told about a
@@ -1737,6 +1763,15 @@ func (s *Session) Connect(ctx context.Context, req engine.ConnectRequest) error 
 	s.setGroups(req.Groups)
 	s.setCallPolicy(req.Calls != nil && req.Calls.AutoReject)
 
+	// A hang-up an earlier command left running is waited for first: the move below may
+	// start one of its own, and awaitHangUp only knows about the latest.
+	if err := s.awaitHangUp(ctx); err != nil {
+		return err
+	}
+	if err := s.reroute(ctx, req.ProxyURL()); err != nil {
+		return err
+	}
+
 	// What the client asked for is recorded a layer up, before this call, and not here.
 	// It used to be here, and being here was #266: an engine is one implementation of
 	// several, the row is the client's request rather than a fact about WhatsApp, and an
@@ -1793,6 +1828,84 @@ func (s *Session) Connect(ctx context.Context, req engine.ConnectRequest) error 
 		s.transition.Unlock()
 	}
 	return err
+}
+
+// standOnWhatWasAsked puts back what the account's client last asked for, before any
+// command reaches a session this instance has just opened.
+//
+// A connect sets all of it, and the sweep's connect carries it, so on those paths this is
+// overwritten a moment later with the same values. It matters on the one that carries
+// none: a `session.wake` brings the account up here, and the next command is a pairing
+// code, which builds its connect out of what the session is standing on. Standing on
+// nothing, that connect asks for no proxy -- which is a request to go out directly -- and
+// the account dials WhatsApp from this instance's own address, with the subscription and
+// the call policy reset beside it.
+//
+// Failing to read it fails the open. A session opened on a guess would be one that may
+// dial from the address its client asked it not to, and the wake that opened it is retried.
+func (s *Session) standOnWhatWasAsked(ctx context.Context) error {
+	standing, asked, err := s.store.Standing(ctx)
+	if err != nil {
+		return err
+	}
+	if !asked {
+		return nil
+	}
+	s.setGroups(standing.Groups)
+	s.setCallPolicy(standing.CallAutoReject)
+	// Nothing is dialled yet, so there is no socket to hang up: moving the route is all a
+	// proxy needs here.
+	if err := s.route.set(standing.Proxy); err != nil {
+		return err
+	}
+	s.setProxy(standing.Proxy)
+	return nil
+}
+
+// reroute puts the session's traffic on the path this connect asked for, when that is not
+// the path it is on.
+//
+// A different path is a different socket: whatsmeow reads its HTTP clients when it dials,
+// so a socket that is up stays on the path it was opened on until it is closed. Taking it
+// down is what makes the change real, and it is the same hang-up `session.disconnect`
+// does, so the client sees the session close and then come back through the connect that
+// follows. The alternative, refusing a connect whose proxy differs from the live one,
+// leaves a client that wants to move an account's egress no way to do it short of
+// disconnecting first, and a connect is already how an operator changes their mind.
+//
+// The same path is no change at all. A client's periodic reconnect carries the proxy it
+// always did, and recycling the socket on each of them is the thing a resume on a live
+// session is written not to do.
+//
+// The route moves before the socket is hung up, not after. A dial reads the route when
+// it happens, and whatsmeow's own reconnect can be waiting on the socket lock the hang-up
+// holds: moved after, that dial could run in the gap and open a socket on the old path,
+// which a later connect naming the new proxy would then take as already moved. Moved
+// before, any dial that starts from here goes the new way, and the one already holding
+// the lock on the old path is the socket the hang-up then closes.
+//
+// `proxy` is only updated once the socket on the old path is down, so a hang-up that ran
+// out of time leaves the session knowing it may still be on the old one, and the next
+// connect tries again.
+func (s *Session) reroute(ctx context.Context, proxyURL string) error {
+	if proxyURL == s.proxyURL() {
+		return nil
+	}
+	if err := s.route.set(proxyURL); err != nil {
+		return err
+	}
+	if state := s.state(); state == "open" || state == "connecting" || state == "reconnecting" {
+		if err := s.hangUp(ctx, s.current()); err != nil {
+			// Back where `proxy` says it is, so the two agree: a connect naming the old
+			// proxy again is then truly no change, and one naming the new proxy moves it
+			// again. Left on the new path, the first of those would find nothing to do and
+			// leave the route on a proxy the client just moved away from.
+			_ = s.route.set(s.proxyURL())
+			return err
+		}
+	}
+	s.setProxy(proxyURL)
+	return nil
 }
 
 // awaitHangUp waits for a disconnect this session started and has not seen finish.
@@ -3283,6 +3396,12 @@ func (s *Session) requestCode(ctx context.Context, command *protocol.Command) er
 	request := engine.ConnectRequest{Pairing: "code", Phone: body.Phone, Groups: s.wantsGroups()}
 	if s.rejectsCalls() {
 		request.Calls = &engine.CallsRequest{AutoReject: true}
+	}
+	// And the proxy most of all: a connect without one is a request to go out directly,
+	// so leaving it off would move the account to this instance's address at the moment
+	// its operator asked for a code.
+	if proxyURL := s.proxyURL(); proxyURL != "" {
+		request.Proxy = &engine.ProxyRequest{URL: proxyURL}
 	}
 	return s.Connect(ctx, request)
 }

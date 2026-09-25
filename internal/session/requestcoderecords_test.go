@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
+	"github.com/fazer-ai/whatsapp-connector/internal/store"
 )
 
 // Pairing an inbox by typing a code leaves the same record as pairing it by scanning.
@@ -53,7 +54,8 @@ func TestPairingByCodeIsRememberedLikeAnyOtherConnect(t *testing.T) {
 		reply, _ := h.recorder.reply(id)
 		return reply
 	}
-	send("c1", protocol.CommandSessionConnect, `{"pairing":"qr","groups":true,"calls":{"auto_reject":true}}`)
+	send("c1", protocol.CommandSessionConnect, `{"pairing":"qr","groups":true,"calls":{"auto_reject":true},`+
+		`"proxy":{"url":"http://user:secret@10.0.0.1:3128"}}`)
 	send("d1", protocol.CommandSessionDisconnect, `{}`)
 	if seeded, err := container.Wanted(ctx); err != nil || len(seeded) != 0 {
 		t.Fatalf("the given is not what this test needs: after pairing and disconnecting the sweep "+
@@ -85,6 +87,12 @@ func TestPairingByCodeIsRememberedLikeAnyOtherConnect(t *testing.T) {
 			"account comes back acknowledging group traffic it publishes nowhere, and ringing on a "+
 			"phone whose operator had asked for the opposite.",
 			wanted[0].Groups, wanted[0].CallAutoReject)
+	}
+	if wanted[0].Proxy != "http://user:secret@10.0.0.1:3128" {
+		t.Fatalf("the row left by a pairing code carries the proxy %q.\n"+
+			"The command has no field for one, so what it records is the proxy already standing. "+
+			"Cleared here, the next resume dials WhatsApp from this instance's own address.",
+			wanted[0].Proxy)
 	}
 }
 
@@ -207,5 +215,87 @@ func TestAPairingCodeRequestTheEngineRefusedIsStillRemembered(t *testing.T) {
 	}
 	if !wanted[0].Groups {
 		t.Fatalf("the row carries groups=%v, want the standing subscription", wanted[0].Groups)
+	}
+}
+
+// A pairing code on a session this instance took over by a wake keeps what its client
+// asked for on the instance before.
+//
+// The connect behind the account happened somewhere else, so nothing on this instance has
+// heard it, and the row it left is the only record. This command records the standing
+// request before it goes on; recording one nobody here knows would replace the row with
+// defaults, and for the proxy the default is going out directly -- the next resume would
+// dial WhatsApp from this instance's own address.
+func TestAPairingCodeAfterAWakeKeepsWhatWasAskedElsewhere(t *testing.T) {
+	t.Parallel()
+
+	container := openStore(t)
+	asked := store.Wants{Groups: true, CallAutoReject: true, Proxy: "socks5://user:secret@10.0.0.1:1080"}
+	if err := container.For("s1").PutDesiredConnected(t.Context(), asked); err != nil {
+		t.Fatalf("PutDesiredConnected: %v", err)
+	}
+	h := newHarnessWithStore(t, container)
+	if _, err := h.manager.Adopt(context.Background(), "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+
+	h.manager.Dispatch(delivery(&protocol.Command{
+		V: protocol.Version, ID: "p1", Type: protocol.CommandPairingRequestCode, SID: "s1", ReplyTo: "p1",
+		Payload: json.RawMessage(`{"phone":"5511999990001"}`),
+	}, &atomic.Bool{}))
+	waitFor(t, "a reply to p1", func() bool { _, ok := h.recorder.reply("p1"); return ok })
+
+	standing, connected, err := container.For("s1").Standing(t.Context())
+	if err != nil {
+		t.Fatalf("Standing: %v", err)
+	}
+	if !connected || standing != asked {
+		t.Fatalf("after a pairing code on a woken session the row reads %+v (connected=%v), want %+v.\n"+
+			"This instance never heard the connect, so what it wrote is a default -- and a proxy "+
+			"defaulted to nothing is an account that comes back from this instance's own address.",
+			standing, connected, asked)
+	}
+}
+
+// The same, with a disconnect in between: woken, turned off, and then asked for a code.
+//
+// A disconnect says the session should be down and leaves the request standing, so the
+// code that follows is still asked through the proxy its client named. A disconnect read
+// as having cleared the request would have that code rewrite the row with no proxy, and
+// the next resume would go out directly.
+func TestAPairingCodeAfterAWakeAndADisconnectKeepsTheProxy(t *testing.T) {
+	t.Parallel()
+
+	container := openStore(t)
+	asked := store.Wants{Groups: true, Proxy: "socks5://user:secret@10.0.0.1:1080"}
+	if err := container.For("s1").PutDesiredConnected(t.Context(), asked); err != nil {
+		t.Fatalf("PutDesiredConnected: %v", err)
+	}
+	h := newHarnessWithStore(t, container)
+	if _, err := h.manager.Adopt(context.Background(), "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	for _, command := range []struct {
+		id      string
+		kind    protocol.CommandType
+		payload string
+	}{
+		{"d1", protocol.CommandSessionDisconnect, `{}`},
+		{"p1", protocol.CommandPairingRequestCode, `{"phone":"5511999990001"}`},
+	} {
+		h.manager.Dispatch(delivery(&protocol.Command{
+			V: protocol.Version, ID: command.id, Type: command.kind, SID: "s1", ReplyTo: command.id,
+			Payload: json.RawMessage(command.payload),
+		}, &atomic.Bool{}))
+		waitFor(t, "a reply to "+command.id, func() bool { _, ok := h.recorder.reply(command.id); return ok })
+	}
+
+	standing, _, err := container.For("s1").Standing(t.Context())
+	if err != nil {
+		t.Fatalf("Standing: %v", err)
+	}
+	if standing != asked {
+		t.Fatalf("after a wake, a disconnect and a pairing code the row stands on %+v, want %+v: the "+
+			"next resume would go out %s", standing, asked, map[bool]string{true: "directly", false: "as asked"}[standing.Proxy == ""])
 	}
 }

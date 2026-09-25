@@ -237,6 +237,10 @@ func (e *Engine) Open(ctx context.Context, sid string) (engine.Session, error) {
 
 	wa := newLibraryLogger(e.log, sid)
 	session := newSession(ctx, sid, newClient(device, wa), scoped, e.media, e.queueing, e.log, wa)
+	if err := session.standOnWhatWasAsked(ctx); err != nil {
+		_ = session.Close()
+		return nil, fmt.Errorf("whatsmeow: open %s: %w", sid, err)
+	}
 	// Registered before the session can be handed out, so a close that happens while
 	// this function is still running is not one nobody hears about.
 	session.onClose(func() { e.forget(sid, session) })

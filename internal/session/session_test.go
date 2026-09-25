@@ -3526,9 +3526,11 @@ func (b *syncBuffer) String() string {
 // The connect a sweep synthesises is not a frame a client sent, so what it does not carry
 // is absent rather than defaulted. What has to travel with it is what the session reads
 // while it runs: the subscription, which the engine consults on every message, receipt,
-// presence and group notification (#190), and the call policy, which decides whether the
-// operator's phone rings (#219). A resume that dropped either brings the account back
-// doing the opposite of what its client asked for, with nothing saying so.
+// presence and group notification (#190), the call policy, which decides whether the
+// operator's phone rings (#219), and the proxy, which decides which address WhatsApp sees
+// (#217). A resume that dropped any of them brings the account back doing the opposite of
+// what its client asked for, with nothing saying so -- and for the proxy, from the one
+// address the client asked this connector not to use.
 func TestAResumeConnectsWithWhatItsClientAskedFor(t *testing.T) {
 	t.Parallel()
 
@@ -3537,6 +3539,8 @@ func TestAResumeConnectsWithWhatItsClientAskedFor(t *testing.T) {
 		"groups":              {Groups: true},
 		"auto-rejected calls": {CallAutoReject: true},
 		"both":                {Groups: true, CallAutoReject: true},
+		"a proxy":             {Proxy: "socks5://user:secret@10.0.0.1:1080"},
+		"all three":           {Groups: true, CallAutoReject: true, Proxy: "http://10.0.0.1:3128"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -3557,16 +3561,19 @@ func TestAResumeConnectsWithWhatItsClientAskedFor(t *testing.T) {
 			}
 			// The whole request and not the fields it happens to set, which is the fence:
 			// a resume carries the mode and what the desired row remembers, and nothing
-			// else on purpose. A connect refuses `history_sync` and a proxy with a URL
-			// outright, so a resume that learned to replay more of a client's request
-			// could synthesise a command the session rejects -- and an account left on
-			// the floor in the sweep's backoff is worse off than the silence this fixes.
+			// else on purpose. A connect refuses `history_sync` outright, so a resume that
+			// learned to replay more of a client's request could synthesise a command the
+			// session rejects -- and an account left on the floor in the sweep's backoff
+			// is worse off than the silence this fixes.
 			//
 			// Compared as the rendered command rather than field by field, because the
 			// request now holds a pointer and two equal requests are not `==`.
 			want := engine.ConnectRequest{Pairing: "resume", Groups: wants.Groups}
 			if wants.CallAutoReject {
 				want.Calls = &engine.CallsRequest{AutoReject: true}
+			}
+			if wants.Proxy != "" {
+				want.Proxy = &engine.ProxyRequest{URL: wants.Proxy}
 			}
 			if render(t, asked) != render(t, want) {
 				t.Fatalf("the sweep synthesised %s, want %s", render(t, asked), render(t, want))

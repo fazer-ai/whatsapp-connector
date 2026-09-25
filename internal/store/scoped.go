@@ -191,6 +191,22 @@ func (s *Scoped) PutDesiredConnected(ctx context.Context, wants Wants) error {
 	return s.container.putDesiredConnected(ctx, s.sid, wants, time.Now())
 }
 
+// Standing is what the client last asked this session to be connected with, and whether
+// anybody has asked about it at all. A session turned off still has one: a disconnect
+// says the session should be down, not that its client stopped wanting the proxy it
+// named, and the next thing that opens a socket for it goes out the way it was asked to.
+//
+// Read by whoever takes the session over without a connect in hand. A `session.wake`
+// brings an account up on an instance that never saw the connect behind it, and the next
+// command may be one that opens a socket without carrying a request of its own -- a
+// pairing code. What that socket goes out through is this, and a default in its place
+// would be a session that asked for a proxy dialling WhatsApp directly.
+//
+// Not fenced: it reads, and what it reads was written behind the fence.
+func (s *Scoped) Standing(ctx context.Context) (Wants, bool, error) {
+	return s.container.standing(ctx, s.sid)
+}
+
 // PutDesiredDisconnected records that the client asked this session to stay down.
 //
 // Fenced for the same reason as the one above, and carrying no subscription because the

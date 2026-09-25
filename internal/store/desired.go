@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -30,6 +32,13 @@ type Wants struct {
 	// lets the account ring on the operator's phone after they asked for the opposite,
 	// and nothing about the session says it changed its mind.
 	CallAutoReject bool
+	// Proxy is the address the session's traffic with WhatsApp left through, empty for a
+	// session that went out directly. The sharpest of the three: a resumed session that
+	// dropped it would dial WhatsApp from this instance's own address, which is the one
+	// thing a client that asked for a proxy asked not to happen, and nothing on the wire
+	// would say so. It carries credentials, so it is kept here with the rest of a
+	// session's auth state and never read back into a log or a frame.
+	Proxy string
 }
 
 // Wanted is a session a client asked to have running, and what it asked for.
@@ -44,10 +53,10 @@ type Wanted struct {
 // The subscription is left as it stands rather than written, because the command this
 // serves does not carry one. A disconnect says nothing about which traffic a client
 // wants when it comes back, and a disconnect that wrote the column would be answering
-// that question with a default nobody asked for. Nothing reads the column of a session
-// that is down -- `Wanted` selects on the state first -- so the choice is between a value
-// that is not read and a falsehood that is not read, and only the second is waiting for a
-// reader to arrive.
+// that question with a default nobody asked for. And the columns are read while the
+// session is down: `Standing` hands them to a pairing code asked for on a session turned
+// off, which is still asking through the proxy its client named. Cleared here, that code
+// would be asked for directly, and the row it writes would carry the default onwards.
 func (c *Container) putDesiredDisconnected(ctx context.Context, sid string, now time.Time) error {
 	if sid == "" {
 		return fmt.Errorf("store: a desired state needs a session, got %q", sid)
@@ -72,27 +81,47 @@ func (c *Container) putDesiredDisconnected(ctx context.Context, sid string, now 
 // subscription from a connect that never happened.
 //
 // The switches are persisted and not the request they arrived in. A connect carries
-// things this build refuses outright -- `history_sync`, a proxy with a URL -- and a
-// resume that replayed a stored payload would synthesise a command the session rejects,
-// leaving the account down and in the sweep's backoff: worse than the silence this
-// exists to fix.
+// things this build refuses outright -- `history_sync` -- and a resume that replayed a
+// stored payload would synthesise a command the session rejects, leaving the account
+// down and in the sweep's backoff: worse than the silence this exists to fix.
 func (c *Container) putDesiredConnected(ctx context.Context, sid string, wants Wants, now time.Time) error {
 	if sid == "" {
 		return fmt.Errorf("store: a desired state needs a session, got %q", sid)
 	}
 	const upsert = `
-		INSERT INTO wac_session_desired (sid, desired, wants_groups, wants_call_auto_reject, asked_at)
-		VALUES (?, ?, ?, ?, ?)
+		INSERT INTO wac_session_desired
+			(sid, desired, wants_groups, wants_call_auto_reject, wants_proxy, asked_at)
+		VALUES (?, ?, ?, ?, ?, ?)
 		ON CONFLICT (sid) DO UPDATE SET
 			desired = excluded.desired, wants_groups = excluded.wants_groups,
 			wants_call_auto_reject = excluded.wants_call_auto_reject,
+			wants_proxy = excluded.wants_proxy,
 			asked_at = excluded.asked_at`
 	if _, err := c.db.ExecContext(ctx, c.rebind(upsert),
-		sid, DesiredConnected, asFlag(wants.Groups), asFlag(wants.CallAutoReject),
+		sid, DesiredConnected, asFlag(wants.Groups), asFlag(wants.CallAutoReject), wants.Proxy,
 		now.UnixMilli()); err != nil {
 		return fmt.Errorf("store: record the desired state of %s: %w", sid, err)
 	}
 	return nil
+}
+
+// standing reads one session's row, with no join on the pairing: a session asking for a
+// pairing code has, by definition, nothing paired yet. And whatever the state, because a
+// disconnect leaves the request standing (see putDesiredDisconnected).
+func (c *Container) standing(ctx context.Context, sid string) (Wants, bool, error) {
+	const query = `
+		SELECT d.wants_groups, d.wants_call_auto_reject, d.wants_proxy
+		FROM wac_session_desired d WHERE d.sid = ?`
+	var proxy string
+	var groups, autoReject int64
+	err := c.db.QueryRowContext(ctx, c.rebind(query), sid).Scan(&groups, &autoReject, &proxy)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Wants{}, false, nil
+	}
+	if err != nil {
+		return Wants{}, false, fmt.Errorf("store: read what %s was asked to be: %w", sid, err)
+	}
+	return Wants{Groups: groups != 0, CallAutoReject: autoReject != 0, Proxy: proxy}, true, nil
 }
 
 // dropDesired forgets what was asked for, which is what a session that no longer exists
@@ -120,7 +149,8 @@ func (c *Container) dropDesired(ctx context.Context, sid string) error {
 // caller cannot reason about at all.
 func (c *Container) Wanted(ctx context.Context) ([]Wanted, error) {
 	const query = `
-		SELECT d.sid, d.wants_groups, d.wants_call_auto_reject FROM wac_session_desired d
+		SELECT d.sid, d.wants_groups, d.wants_call_auto_reject, d.wants_proxy
+		FROM wac_session_desired d
 		JOIN wac_session_device v ON v.sid = d.sid
 		WHERE d.desired = ?
 		ORDER BY d.asked_at, d.sid`
@@ -132,14 +162,14 @@ func (c *Container) Wanted(ctx context.Context) ([]Wanted, error) {
 
 	var wanted []Wanted
 	for rows.Next() {
-		var sid string
+		var sid, proxy string
 		var groups, autoReject int64
-		if err := rows.Scan(&sid, &groups, &autoReject); err != nil {
+		if err := rows.Scan(&sid, &groups, &autoReject, &proxy); err != nil {
 			return nil, fmt.Errorf("store: read the sessions that should be connected: %w", err)
 		}
 		wanted = append(wanted, Wanted{
 			SID:   sid,
-			Wants: Wants{Groups: groups != 0, CallAutoReject: autoReject != 0},
+			Wants: Wants{Groups: groups != 0, CallAutoReject: autoReject != 0, Proxy: proxy},
 		})
 	}
 	if err := rows.Err(); err != nil {
