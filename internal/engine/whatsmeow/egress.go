@@ -1,6 +1,7 @@
 package whatsmeow
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -131,6 +132,13 @@ func (t *swappedTransport) swap(next *http.Transport) {
 // errors below are for a caller that skipped it, and none of them repeats the URL, which
 // carries credentials.
 func egressTransport(proxyURL string) (*http.Transport, error) {
+	return egressTransportWithin(proxyURL, egressDial)
+}
+
+// egressTransportWithin is egressTransport with the bound on a SOCKS5 handshake passed in,
+// which only a test sets to anything but egressDial: waiting out thirty seconds to watch a
+// silent proxy be given up on is not a test anybody runs.
+func egressTransportWithin(proxyURL string, handshake time.Duration) (*http.Transport, error) {
 	transport := dialTransport().Clone()
 	// Not `ProxyFromEnvironment`, which is what the clone carries: see routeThrough.
 	transport.Proxy = nil
@@ -163,7 +171,18 @@ func egressTransport(proxyURL string) (*http.Transport, error) {
 			// without the command's deadline, which is worth failing over.
 			return nil, fmt.Errorf("whatsmeow: the SOCKS5 dialer is %T and takes no context", socks)
 		}
-		transport.DialContext = contextual.DialContext
+		// Bounded as a whole, and not only by the dialer's Timeout, which covers opening
+		// the TCP connection and nothing after it. A proxy that accepts and then says
+		// nothing would otherwise hold the negotiation for ever: http.Transport carries on
+		// with a dial after the request that started it has given up, so the websocket's
+		// dialCeiling answers its caller and leaves this running, and every retry on the
+		// same route adds another. x/net's SOCKS client puts a context's deadline on the
+		// connection for the length of the negotiation, which is what this hands it.
+		transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+			bounded, cancel := context.WithTimeout(ctx, handshake)
+			defer cancel()
+			return contextual.DialContext(bounded, network, address) //nolint:wrapcheck // the transport wraps a dial error itself
+		}
 	default:
 		return nil, fmt.Errorf("whatsmeow: a proxy with the scheme %q", parsed.Scheme)
 	}

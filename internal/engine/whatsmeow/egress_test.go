@@ -566,3 +566,59 @@ func TestAMoveThatCouldNotHangUpLeavesTheRouteWhereItWas(t *testing.T) {
 	}
 	after.quiet(t, 200*time.Millisecond)
 }
+
+// A SOCKS5 proxy that takes the connection and then says nothing is given up on.
+//
+// The dialer's own timeout covers opening the TCP connection and nothing after it, and
+// http.Transport carries on with a dial after the request that started it has gone, so an
+// unbounded negotiation would outlive the dial ceiling and pile up with every retry. The
+// bound here is the one production passes as thirty seconds.
+func TestASilentSOCKSProxyIsGivenUpOn(t *testing.T) {
+	t.Parallel()
+
+	listener, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err == nil {
+			accepted <- conn // held open and never answered
+		}
+	}()
+	t.Cleanup(func() {
+		select {
+		case conn := <-accepted:
+			_ = conn.Close()
+		default:
+		}
+	})
+
+	const handshake = 200 * time.Millisecond
+	transport, err := egressTransportWithin("socks5://"+listener.Addr().String(), handshake)
+	if err != nil {
+		t.Fatalf("egressTransportWithin: %v", err)
+	}
+	// A context with no deadline, which is what the transport hands a dial it has detached
+	// from its request: the bound has to come from the route itself. Waited for on a clock
+	// of its own, so a dial that never ends fails this test by name instead of hanging the
+	// package.
+	dialed := make(chan error, 1)
+	go func() {
+		conn, err := transport.DialContext(context.Background(), "tcp", "web.whatsapp.com:443")
+		if err == nil {
+			_ = conn.Close()
+		}
+		dialed <- err
+	}()
+	select {
+	case err := <-dialed:
+		if err == nil {
+			t.Fatal("the dial completed through a proxy that never answered")
+		}
+	case <-time.After(handshake + 2*time.Second):
+		t.Fatalf("a silent proxy held the dial past a %s bound, and nothing is going to end it", handshake)
+	}
+}
