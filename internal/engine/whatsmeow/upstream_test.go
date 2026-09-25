@@ -219,6 +219,39 @@ var upstreamDefects = []upstreamDefect{
 			"path a send takes after the disconnect its ceiling is meant to survive",
 	},
 	{
+		issue: "fazer-ai/whatsapp-connector#280",
+		file:  "client.go",
+		// Not a defect. A resume whose first dial fails is retried only because this branch
+		// hands a retryable failure to the reconnect loop and answers nil, and it runs only
+		// with `InitialAutoReconnect`, which `adopt` sets for exactly this. A pin that stopped
+		// dispatching the drop, stopped starting the loop, or went back to returning the
+		// error would leave that line setting a field nothing reads, with the suite green.
+		inOrder: []string{
+			"isRetryableConnectError(err) && cli.InitialAutoReconnect && cli.EnableAutoReconnect {",
+			"go cli.dispatchEvent(&events.Disconnected{})",
+			"go cli.autoReconnect(ctx)",
+			"return nil",
+		},
+		enclosing: "func (cli *Client) ConnectContext(",
+		what: "a retryable failure of the first dial being handed to the reconnect loop, " +
+			"announced as a drop, and answered nil",
+		reliedOn: true,
+		restingOn: "`client.InitialAutoReconnect = true` in session.go's adopt, and the " +
+			"account whose resume dial met a network that was away coming back on its own",
+	},
+	{
+		issue: "fazer-ai/whatsapp-connector#280",
+		file:  "client.go",
+		// What that branch calls retryable. A network error is what a resume meets when the
+		// network or the proxy is away, and it is the case #280 is about.
+		stillThere: []string{"exhttp.IsNetworkError(err)"},
+		enclosing:  "func isRetryableConnectError(",
+		what:       "a network error counting as a retryable failure of the first dial",
+		reliedOn:   true,
+		restingOn: "the same line in adopt: without it a resume that met a network that was " +
+			"away is left adopted and unconnected again",
+	},
+	{
 		issue: "fazer-ai/whatsapp-connector#90",
 		file:  "download-to-file.go",
 		// The retry rewinds and writes over the same file without shortening it, so an

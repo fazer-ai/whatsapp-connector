@@ -888,6 +888,15 @@ func (s *Session) adopt(ctx context.Context, client *wm.Client) bool {
 	// session the moment the lease is gone, which is what keeps two instances off one
 	// account.
 	client.EnableAutoReconnect = true
+	// And the first dial as well, which whatsmeow leaves out unless asked. Without it a
+	// resume whose dial met a network that was away returned the error and started no
+	// retry: the account stayed adopted here, holding its lease, and nothing came back for
+	// it -- the sweep asks only about accounts nobody runs, and nothing retires a failure
+	// that is not terminal (#280). With it, a retryable failure is handed to the same
+	// backoff that already recovers every drop after the socket came up, on the session's
+	// own context, so it ends when the session does. What whatsmeow does not call
+	// retryable still comes back as an error.
+	client.InitialAutoReconnect = true
 	client.PrePairCallback = s.bind
 	client.BackgroundEventCtx = s.ctx
 	// The ack for an inbound message waits for the handlers, and a handler that reports
