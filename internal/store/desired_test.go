@@ -161,6 +161,44 @@ func TestTheCallPolicyComesBackWithTheSession(t *testing.T) {
 	}
 }
 
+// The proxy a connect named is the proxy the account comes back through, and a connect
+// naming another, or none, replaces it.
+//
+// This is the field with the sharpest edge of the three. A resume that lost it would dial
+// WhatsApp from this instance's own address, the one address a client that asked for a
+// proxy asked this connector not to use; one that kept a proxy its client had replaced
+// would go on leaving through somewhere the client has moved away from, possibly with
+// credentials that no longer work, and never come back at all.
+func TestTheProxyComesBackWithTheSession(t *testing.T) {
+	t.Parallel()
+	container := open(t)
+	ctx := t.Context()
+
+	pair(t, container, "sid-1", "5511999990001")
+	for _, asked := range []string{
+		"socks5://user:secret@10.0.0.1:1080",
+		"http://user:secret@10.0.0.2:3128",
+		"",
+	} {
+		if err := container.For("sid-1").PutDesiredConnected(ctx, store.Wants{Groups: true, Proxy: asked}); err != nil {
+			t.Fatalf("PutDesiredConnected: %v", err)
+		}
+		wanted, err := container.Wanted(ctx)
+		if err != nil {
+			t.Fatalf("Wanted: %v", err)
+		}
+		if len(wanted) != 1 {
+			t.Fatalf("Wanted has %d sessions, want 1", len(wanted))
+		}
+		if wanted[0].Proxy != asked {
+			t.Fatalf("after a connect asking for %q the session would come back through %q", asked, wanted[0].Proxy)
+		}
+		if !wanted[0].Groups {
+			t.Fatal("recording the proxy lost the subscription beside it")
+		}
+	}
+}
+
 // Turning the policy off is a connect without it, the same way groups are turned off.
 // Recorded once and never overwritten, an account would keep refusing calls after every
 // restart on the strength of a request its client has replaced.

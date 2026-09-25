@@ -38,7 +38,7 @@ import (
 // a session turned off has to stay off across a restart, and a record that only ever said
 // "connected" would dial it again.
 //
-// The subscription and the call policy travel with it. A resume has no other way of
+// The subscription, the call policy and the proxy travel with it. A resume has no other way of
 // learning them: the connect a sweep synthesises is not a frame a client sent, so what it
 // does not carry is absent rather than defaulted, and the session comes back acknowledging
 // group traffic it publishes nowhere.
@@ -55,7 +55,8 @@ func TestAConnectIsRememberedWithWhatItAskedFor(t *testing.T) {
 
 	connect := &protocol.Command{
 		V: protocol.Version, ID: "c1", Type: protocol.CommandSessionConnect, SID: "s1", ReplyTo: "c1",
-		Payload: json.RawMessage(`{"pairing":"qr","groups":true,"calls":{"auto_reject":true}}`),
+		Payload: json.RawMessage(`{"pairing":"qr","groups":true,"calls":{"auto_reject":true},` +
+			`"proxy":{"url":"socks5://user:secret@10.0.0.1:1080"}}`),
 	}
 	var acked atomic.Bool
 	h.manager.Dispatch(delivery(connect, &acked))
@@ -79,6 +80,12 @@ func TestAConnectIsRememberedWithWhatItAskedFor(t *testing.T) {
 			"missing here is a session that comes back deaf to the traffic its client asked "+
 			"for, acknowledging it and publishing it nowhere.",
 			wanted[0].Groups, wanted[0].CallAutoReject)
+	}
+	if wanted[0].Proxy != "socks5://user:secret@10.0.0.1:1080" {
+		t.Fatalf("the row carries the proxy %q.\n"+
+			"The resume dials through whatever this says, so a proxy missing here is an account "+
+			"that comes back from this instance's own address -- the one its client asked not "+
+			"to be seen from.", wanted[0].Proxy)
 	}
 
 	disconnect := &protocol.Command{

@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 
@@ -224,17 +225,17 @@ type ConnectRequest struct {
 // Validate answers the part of a connect this connector refuses whichever engine is
 // running, and it is asked above the engines for two reasons that are the same reason.
 //
-// The first is that the answer has to be one answer. `unsupported` for a proxy is a fact
-// about this build, not about an engine, and two engines that spelled it differently
-// would have a client's error code depend on which one a deployment happens to run.
+// The first is that the answer has to be one answer. `unsupported` for a history import is
+// a fact about this build, not about an engine, and two engines that spelled it
+// differently would have a client's error code depend on which one a deployment happens
+// to run. A proxy URL that cannot be dialled is the same: a fact about the request.
 //
 // The second is the ordering #266 left behind. What a client asked for is recorded before
 // the engine is called, so that an instance dying inside a connect leaves the account
 // resumable; a request refused after that point would be recorded all the same, and the
-// sweep would repeat it for ever against a build that refuses it by construction. For the
-// proxy that is worse than useless: the connect a sweep synthesises carries no proxy at
-// all, so the account would come back dialling WhatsApp directly, which is exactly the
-// deployment address the refusal exists to keep off the wire.
+// sweep would repeat it for ever against a build that refuses it by construction. For a
+// proxy that is worse than useless: the row now carries it, so a malformed one would be
+// replayed on every sweep, each time refused, and the account would never come back.
 //
 // What is deliberately not here: whether a session is closed, and whether it has a device
 // it can use. Those are an engine's own state rather than the shape of the request, they
@@ -242,17 +243,13 @@ type ConnectRequest struct {
 // sweep may well get through -- so it is recorded, and `cluster.Quarantine` is what stops
 // an account that fails for ever from being asked for for ever.
 func (r ConnectRequest) Validate() error {
-	if r.Proxy != nil && r.Proxy.URL != "" {
-		// Decoding it is not honouring it. Connecting directly for a deployment that
-		// asked for egress routing puts its own address on the wire, and does it
-		// silently; per-session proxies are M5.
-		return protocol.NewError(protocol.ErrorUnsupported,
-			"this connector does not route a session through a proxy yet")
+	if err := r.Proxy.validate(); err != nil {
+		return err
 	}
-	// Same rule as the proxy, and for the same reason: this asks the connector to do
-	// something, and a build that does not do it answers `open` to a client that will
-	// then wait for a backlog to arrive and never find out it was never going to happen.
-	// `groups` and `calls` are not on this list because they are honoured.
+	// This asks the connector to do something, and a build that does not do it answers
+	// `open` to a client that will then wait for a backlog to arrive and never find out it
+	// was never going to happen. `groups`, `calls` and `proxy` are not on this list
+	// because they are honoured.
 	if r.HistorySync {
 		return protocol.NewError(protocol.ErrorUnsupported,
 			"this connector does not import the phone's history yet")
@@ -279,8 +276,63 @@ type CallsRequest struct {
 	AutoReject bool `json:"auto_reject,omitempty"`
 }
 
-// ProxyRequest is the proxy half of `session.connect`. Honouring it is M5; parsing it
-// is here so a client that sends one is not answered with invalid_payload.
+// ProxyRequest is the proxy half of `session.connect`: the address a session's traffic
+// with WhatsApp leaves through, instead of this instance's own.
+//
+// The URL carries credentials more often than not (`socks5://user:secret@host:1080` is the
+// usual shape), so it is auth state and is treated like it: it never goes into a log line,
+// an event, an error message or a reply. Only what `validate` says about it does, and that
+// never repeats it.
 type ProxyRequest struct {
 	URL string `json:"url,omitempty"`
+}
+
+// ProxySchemes are the schemes a session's proxy may use: the ones whatsmeow's own
+// `SetProxyAddress` accepts, so a URL this connector takes is one the library would have
+// taken too. `socks5h` is not among them, and not because it is worse: the library does
+// not know it, and a scheme accepted here that the pin does not is a connect answered
+// `ok` over a dial that cannot happen.
+var ProxySchemes = []string{"http", "https", "socks5"}
+
+// ProxyURL is the proxy the request asks for, or "" for a session that goes out directly.
+//
+// Absent, `null` and `{"url": ""}` are the same request and read the same way: no proxy.
+// That includes a session that had one, because a connect replaces what the last one
+// asked for rather than adding to it -- the same reading `groups` has always had.
+func (r ConnectRequest) ProxyURL() string {
+	if r.Proxy == nil {
+		return ""
+	}
+	return r.Proxy.URL
+}
+
+// validate refuses a proxy this connector could not dial, as the client's mistake.
+//
+// `invalid_payload` and not `unsupported`: the build does route through a proxy, and what
+// is wrong is the address. Every message is written here rather than passed through,
+// because the parse error Go returns quotes the URL it could not read -- credentials and
+// all -- and a reply is a frame a client stores and shows.
+func (p *ProxyRequest) validate() error {
+	if p == nil || p.URL == "" {
+		return nil
+	}
+	parsed, err := url.Parse(p.URL)
+	if err != nil {
+		return protocol.NewError(protocol.ErrorInvalidPayload, "proxy.url is not a URL")
+	}
+	known := false
+	for _, scheme := range ProxySchemes {
+		if parsed.Scheme == scheme {
+			known = true
+		}
+	}
+	if !known {
+		return protocol.NewError(protocol.ErrorInvalidPayload, fmt.Sprintf(
+			"proxy.url has to use one of %s", strings.Join(ProxySchemes, ", ")))
+	}
+	// Hostname and not Host: `socks5://:1080` has a host of ":1080" and nobody to dial.
+	if parsed.Hostname() == "" {
+		return protocol.NewError(protocol.ErrorInvalidPayload, "proxy.url names no host to dial")
+	}
+	return nil
 }

@@ -53,7 +53,8 @@ func TestPairingByCodeIsRememberedLikeAnyOtherConnect(t *testing.T) {
 		reply, _ := h.recorder.reply(id)
 		return reply
 	}
-	send("c1", protocol.CommandSessionConnect, `{"pairing":"qr","groups":true,"calls":{"auto_reject":true}}`)
+	send("c1", protocol.CommandSessionConnect, `{"pairing":"qr","groups":true,"calls":{"auto_reject":true},`+
+		`"proxy":{"url":"http://user:secret@10.0.0.1:3128"}}`)
 	send("d1", protocol.CommandSessionDisconnect, `{}`)
 	if seeded, err := container.Wanted(ctx); err != nil || len(seeded) != 0 {
 		t.Fatalf("the given is not what this test needs: after pairing and disconnecting the sweep "+
@@ -85,6 +86,12 @@ func TestPairingByCodeIsRememberedLikeAnyOtherConnect(t *testing.T) {
 			"account comes back acknowledging group traffic it publishes nowhere, and ringing on a "+
 			"phone whose operator had asked for the opposite.",
 			wanted[0].Groups, wanted[0].CallAutoReject)
+	}
+	if wanted[0].Proxy != "http://user:secret@10.0.0.1:3128" {
+		t.Fatalf("the row left by a pairing code carries the proxy %q.\n"+
+			"The command has no field for one, so what it records is the proxy already standing. "+
+			"Cleared here, the next resume dials WhatsApp from this instance's own address.",
+			wanted[0].Proxy)
 	}
 }
 

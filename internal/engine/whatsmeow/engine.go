@@ -236,7 +236,13 @@ func (e *Engine) Open(ctx context.Context, sid string) (engine.Session, error) {
 	}
 
 	wa := newLibraryLogger(e.log, sid)
-	session := newSession(ctx, sid, newClient(device, wa), scoped, e.media, e.queueing, e.log, wa)
+	// Direct until a connect says otherwise: the proxy arrives with the connect, and
+	// nothing is dialled before one.
+	client, err := newClient(device, wa, "")
+	if err != nil {
+		return nil, fmt.Errorf("whatsmeow: open %s: %w", sid, err)
+	}
+	session := newSession(ctx, sid, client, scoped, e.media, e.queueing, e.log, wa)
 	// Registered before the session can be handed out, so a close that happens while
 	// this function is still running is not one nobody hears about.
 	session.onClose(func() { e.forget(sid, session) })

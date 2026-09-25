@@ -1392,6 +1392,7 @@ func (s *Session) lifecycle(ctx context.Context, command *protocol.Command) (jso
 func (s *Session) recordAsked(ctx context.Context, request engine.ConnectRequest) {
 	s.asked = store.Wants{
 		Groups: request.Groups, CallAutoReject: request.Calls != nil && request.Calls.AutoReject,
+		Proxy: request.ProxyURL(),
 	}
 	s.recordWanted(ctx)
 }

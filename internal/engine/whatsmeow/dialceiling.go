@@ -47,17 +47,16 @@ const dialCeiling = 20 * time.Second
 // download of any size. Each gets its own clone of the default transport, which is what
 // the library builds its own from; a pin that starts configuring that transport would not
 // reach these, and `TestTheClientWeBuildIsTheOneTheLibraryWouldHave` is what notices.
-func newClient(device *store.Device, log waLog.Logger) *wm.Client {
+//
+// The proxy is decided here too, by `routeThrough`, and for the same reason: a client built
+// without it is a session that leaves from this instance's address after a relogin, having
+// left from its proxy's before.
+func newClient(device *store.Device, log waLog.Logger, proxyURL string) (*wm.Client, error) {
 	client := wm.NewClient(device, log)
-	client.SetWebsocketHTTPClient(&http.Client{
-		Timeout:   dialCeiling,
-		Transport: dialTransport().Clone(),
-	})
-	client.SetPreLoginHTTPClient(&http.Client{
-		Timeout:   dialCeiling,
-		Transport: dialTransport().Clone(),
-	})
-	return client
+	if err := routeThrough(client, proxyURL); err != nil {
+		return nil, err
+	}
+	return client, nil
 }
 
 // dialTransport is the one whatsmeow clones for the clients it builds itself, so cloning

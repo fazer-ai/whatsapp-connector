@@ -681,6 +681,10 @@ func (c *Container) migrate(ctx context.Context) error {
 	// so an upgrade that defaulted it on would start silently declining calls for every
 	// account on the deployment on the strength of a request nobody made.
 	//
+	// `wants_proxy` defaults to empty, a session that goes out directly, which is the only
+	// thing any session did before the column existed: the connect refused a proxy until
+	// #217, so no row written before it can stand for one.
+	//
 	// `rev` defaults to 0 and counts writes from there, so a row that predates it is a
 	// row nobody has written since -- which is true, and is the only thing a caller
 	// comparing against it needs.
@@ -701,6 +705,7 @@ func (c *Container) migrate(ctx context.Context) error {
 		{"wac_media_part", "rev", "BIGINT NOT NULL DEFAULT 0"},
 		{"wac_session_desired", "wants_groups", "BIGINT NOT NULL DEFAULT 0"},
 		{"wac_session_desired", "wants_call_auto_reject", "BIGINT NOT NULL DEFAULT 0"},
+		{"wac_session_desired", "wants_proxy", "TEXT NOT NULL DEFAULT ''"},
 	} {
 		if err := c.addColumn(ctx, column.table, column.name, column.definition); err != nil {
 			return err

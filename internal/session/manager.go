@@ -1387,6 +1387,13 @@ func (m *Manager) Resume(sid string, wants store.Wants) bool {
 		// contract spells the first as an absent object.
 		request.Calls = &engine.CallsRequest{AutoReject: true}
 	}
+	if wants.Proxy != "" {
+		// Omitted for the same reason, and with more riding on it than the call policy:
+		// an account that asked for a proxy and is brought back without one dials
+		// WhatsApp from this instance's own address. The payload goes to this instance's
+		// own executor and nowhere else, so the credentials in it stay in this process.
+		request.Proxy = &engine.ProxyRequest{URL: wants.Proxy}
+	}
 	payload, err := json.Marshal(request)
 	if err != nil {
 		// A string and a bool with no marshaller of their own: unreachable. Refused

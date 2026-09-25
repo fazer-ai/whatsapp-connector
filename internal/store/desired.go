@@ -30,6 +30,13 @@ type Wants struct {
 	// lets the account ring on the operator's phone after they asked for the opposite,
 	// and nothing about the session says it changed its mind.
 	CallAutoReject bool
+	// Proxy is the address the session's traffic with WhatsApp left through, empty for a
+	// session that went out directly. The sharpest of the three: a resumed session that
+	// dropped it would dial WhatsApp from this instance's own address, which is the one
+	// thing a client that asked for a proxy asked not to happen, and nothing on the wire
+	// would say so. It carries credentials, so it is kept here with the rest of a
+	// session's auth state and never read back into a log or a frame.
+	Proxy string
 }
 
 // Wanted is a session a client asked to have running, and what it asked for.
@@ -72,23 +79,24 @@ func (c *Container) putDesiredDisconnected(ctx context.Context, sid string, now 
 // subscription from a connect that never happened.
 //
 // The switches are persisted and not the request they arrived in. A connect carries
-// things this build refuses outright -- `history_sync`, a proxy with a URL -- and a
-// resume that replayed a stored payload would synthesise a command the session rejects,
-// leaving the account down and in the sweep's backoff: worse than the silence this
-// exists to fix.
+// things this build refuses outright -- `history_sync` -- and a resume that replayed a
+// stored payload would synthesise a command the session rejects, leaving the account
+// down and in the sweep's backoff: worse than the silence this exists to fix.
 func (c *Container) putDesiredConnected(ctx context.Context, sid string, wants Wants, now time.Time) error {
 	if sid == "" {
 		return fmt.Errorf("store: a desired state needs a session, got %q", sid)
 	}
 	const upsert = `
-		INSERT INTO wac_session_desired (sid, desired, wants_groups, wants_call_auto_reject, asked_at)
-		VALUES (?, ?, ?, ?, ?)
+		INSERT INTO wac_session_desired
+			(sid, desired, wants_groups, wants_call_auto_reject, wants_proxy, asked_at)
+		VALUES (?, ?, ?, ?, ?, ?)
 		ON CONFLICT (sid) DO UPDATE SET
 			desired = excluded.desired, wants_groups = excluded.wants_groups,
 			wants_call_auto_reject = excluded.wants_call_auto_reject,
+			wants_proxy = excluded.wants_proxy,
 			asked_at = excluded.asked_at`
 	if _, err := c.db.ExecContext(ctx, c.rebind(upsert),
-		sid, DesiredConnected, asFlag(wants.Groups), asFlag(wants.CallAutoReject),
+		sid, DesiredConnected, asFlag(wants.Groups), asFlag(wants.CallAutoReject), wants.Proxy,
 		now.UnixMilli()); err != nil {
 		return fmt.Errorf("store: record the desired state of %s: %w", sid, err)
 	}
@@ -120,7 +128,8 @@ func (c *Container) dropDesired(ctx context.Context, sid string) error {
 // caller cannot reason about at all.
 func (c *Container) Wanted(ctx context.Context) ([]Wanted, error) {
 	const query = `
-		SELECT d.sid, d.wants_groups, d.wants_call_auto_reject FROM wac_session_desired d
+		SELECT d.sid, d.wants_groups, d.wants_call_auto_reject, d.wants_proxy
+		FROM wac_session_desired d
 		JOIN wac_session_device v ON v.sid = d.sid
 		WHERE d.desired = ?
 		ORDER BY d.asked_at, d.sid`
@@ -132,14 +141,14 @@ func (c *Container) Wanted(ctx context.Context) ([]Wanted, error) {
 
 	var wanted []Wanted
 	for rows.Next() {
-		var sid string
+		var sid, proxy string
 		var groups, autoReject int64
-		if err := rows.Scan(&sid, &groups, &autoReject); err != nil {
+		if err := rows.Scan(&sid, &groups, &autoReject, &proxy); err != nil {
 			return nil, fmt.Errorf("store: read the sessions that should be connected: %w", err)
 		}
 		wanted = append(wanted, Wanted{
 			SID:   sid,
-			Wants: Wants{Groups: groups != 0, CallAutoReject: autoReject != 0},
+			Wants: Wants{Groups: groups != 0, CallAutoReject: autoReject != 0, Proxy: proxy},
 		})
 	}
 	if err := rows.Err(); err != nil {

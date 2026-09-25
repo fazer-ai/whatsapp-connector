@@ -30,7 +30,7 @@ func TestTheFakeEngineRefusesAConnectTheWayTheConnectorDoes(t *testing.T) {
 		request engine.ConnectRequest
 		code    protocol.ErrorCode
 	}{
-		{"proxy", engine.ConnectRequest{Pairing: "qr", Proxy: &engine.ProxyRequest{URL: "socks5://10.0.0.1:1080"}}, protocol.ErrorUnsupported},
+		{"proxy", engine.ConnectRequest{Pairing: "qr", Proxy: &engine.ProxyRequest{URL: "ftp://10.0.0.1:21"}}, protocol.ErrorInvalidPayload},
 		{"history sync", engine.ConnectRequest{Pairing: "qr", HistorySync: true}, protocol.ErrorUnsupported},
 		{"unknown pairing mode", engine.ConnectRequest{Pairing: "telepatia"}, protocol.ErrorInvalidPayload},
 		{"code pairing without a phone", engine.ConnectRequest{Pairing: "code", Phone: "+ ()-"}, protocol.ErrorInvalidPayload},
