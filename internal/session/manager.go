@@ -954,9 +954,9 @@ func (m *Manager) wake(ctx context.Context, delivery *transport.Delivery) {
 		return
 	}
 
-	// The quarantine gates what the connector does on its own and nothing else: a client
-	// that asks for a connection gets one, quarantine or not, which PROTOCOL.md promises
-	// in as many words and which the test below this one fences. A wake the fleet has
+	// The quarantine gates what the connector does on its own and nothing else: what a
+	// client asks for is carried out, quarantine or not, which PROTOCOL.md promises in as
+	// many words and which the test below this one fences. A wake the fleet has
 	// already handed out is not a client asking, though. It is this fleet repeating an
 	// attempt it has already made, and pacing that is what the backoff is for.
 	//

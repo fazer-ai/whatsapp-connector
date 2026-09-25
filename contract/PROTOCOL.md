@@ -238,9 +238,11 @@ constructor to leave lying around.
 of a session the connector could not bring back and says how long the fleet leaves it
 alone, from a minute up to an hour, doubling. It gates what the connector does on its own,
 which is two things: its resume sweep, and a `session.wake` the fleet has already handed
-out once. A wake read for the first time is a client asking, and a client that asks for a
-connection gets one, quarantine or not, which is why no command is ever answered
-`quarantined`. Every copy after that one is this fleet repeating an attempt it already
+out once. A wake read for the first time is a client asking, and the quarantine does not
+stand between a client and what it asked for, which is why no command is ever answered
+`quarantined`: a `session.connect` is carried out whatever the backoff says, and so is a
+first-read wake, which adopts the account and connects it when the record says it should
+be connected (see `session.wake` above). Every copy after that one is this fleet repeating an attempt it already
 made, and it waits out the backoff. **A client whose session does not come up should
 publish another `session.wake` rather than wait on the one it already sent**, which is the
 difference between asking again and being retried. Whether a session registry should exist
