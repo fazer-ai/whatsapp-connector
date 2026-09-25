@@ -312,3 +312,36 @@ func TestADisconnectLeavesTheSubscriptionAlone(t *testing.T) {
 		t.Fatal("the disconnect answered a question it was not asked, and cleared the subscription")
 	}
 }
+
+// What a session stands on is the row, whether or not the session ever paired, and
+// nothing at all for a session turned off or never asked about.
+//
+// Paired or not, because the reader is a pairing code: a session asking for one has, by
+// definition, nothing paired yet, so the join `Wanted` makes would hide the very row it
+// needs. And nothing for a session turned off, because what it stood on then was a
+// request its client has since withdrawn.
+func TestStandingIsTheRowAndOnlyWhileConnectedIsWanted(t *testing.T) {
+	t.Parallel()
+	container := open(t)
+	ctx := t.Context()
+
+	asked := store.Wants{Groups: true, Proxy: "http://user:secret@10.0.0.2:3128"}
+	if err := container.For("sid-unpaired").PutDesiredConnected(ctx, asked); err != nil {
+		t.Fatalf("PutDesiredConnected: %v", err)
+	}
+	if got, ok, err := container.For("sid-unpaired").Standing(ctx); err != nil || !ok || got != asked {
+		t.Fatalf("an unpaired session asked to connect stands on %+v (ok=%v, err=%v), want %+v", got, ok, err, asked)
+	}
+
+	if err := container.For("sid-off").PutDesiredConnected(ctx, asked); err != nil {
+		t.Fatalf("PutDesiredConnected: %v", err)
+	}
+	if err := container.For("sid-off").PutDesiredDisconnected(ctx); err != nil {
+		t.Fatalf("PutDesiredDisconnected: %v", err)
+	}
+	for _, sid := range []string{"sid-off", "sid-never"} {
+		if got, ok, err := container.For(sid).Standing(ctx); err != nil || ok || got != (store.Wants{}) {
+			t.Fatalf("%s stands on %+v (ok=%v, err=%v), want nothing", sid, got, ok, err)
+		}
+	}
+}

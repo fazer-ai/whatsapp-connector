@@ -45,6 +45,10 @@ type Session struct {
 	// record the standing one instead of a default nobody chose. Written and read on the
 	// executor goroutine only, which is why it needs no lock.
 	asked store.Wants
+	// askedKnown is whether asked holds a request rather than the zero value: a connect
+	// on this instance sets it, and so does reading the row a connect elsewhere left.
+	// Until then an empty asked means "not known here", not "asked for nothing".
+	askedKnown bool
 
 	commands chan queued
 
@@ -1353,6 +1357,14 @@ func (s *Session) lifecycle(ctx context.Context, command *protocol.Command) (jso
 		// engine carries into the connect it builds: this command names a phone number
 		// and nothing else, and a record that reset the subscription would have the
 		// account come back deaf to the group traffic its client had asked for.
+		//
+		// On a session this instance took over by a wake, the last connect happened
+		// somewhere else, and the row it left is the only record of it. Read before it is
+		// written, or the write replaces a proxy with nothing -- and the next resume dials
+		// WhatsApp from this instance's own address.
+		if err := s.knowWhatWasAsked(ctx); err != nil {
+			return nil, err
+		}
 		s.recordWanted(ctx)
 		return s.engine.Execute(ctx, command)
 	default:
@@ -1394,7 +1406,23 @@ func (s *Session) recordAsked(ctx context.Context, request engine.ConnectRequest
 		Groups: request.Groups, CallAutoReject: request.Calls != nil && request.Calls.AutoReject,
 		Proxy: request.ProxyURL(),
 	}
+	s.askedKnown = true
 	s.recordWanted(ctx)
+}
+
+// knowWhatWasAsked reads the standing request off the row when no connect on this
+// instance has said it. Failing to read it fails the command: guessing would be writing a
+// default over a request somebody made.
+func (s *Session) knowWhatWasAsked(ctx context.Context) error {
+	if s.askedKnown || s.store == nil {
+		return nil
+	}
+	standing, _, err := s.store.Standing(ctx)
+	if err != nil {
+		return fmt.Errorf("session %s: %w", s.sid, err)
+	}
+	s.asked, s.askedKnown = standing, true
+	return nil
 }
 
 // recordWanted writes the standing request. A plain field holds it because every caller

@@ -11,11 +11,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rs/zerolog"
 	wm "go.mau.fi/whatsmeow"
 	waEvents "go.mau.fi/whatsmeow/types/events"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/engine"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
+	"github.com/fazer-ai/whatsapp-connector/internal/store"
 	"github.com/fazer-ai/whatsapp-connector/internal/testwait"
 )
 
@@ -101,6 +103,16 @@ func reach(t *testing.T, client *http.Client) error {
 	return err
 }
 
+// standOn puts a session on a proxy the way a connect that already happened would have.
+func standOn(t *testing.T, session *Session, proxyURL string) {
+	t.Helper()
+
+	if err := session.route.set(proxyURL); err != nil {
+		t.Fatalf("route.set: %v", err)
+	}
+	session.setProxy(proxyURL)
+}
+
 // A session that asked for no proxy goes out directly, whatever the environment says.
 //
 // The transport whatsmeow clones reads `https_proxy` through `ProxyFromEnvironment`, and
@@ -138,9 +150,11 @@ func TestEveryClientWhatsmeowDialsThroughTakesTheRoute(t *testing.T) {
 
 			proxy := listenAsProxy(t)
 			recorded := &clientRecorder{}
-			if err := routeThrough(recorded, scheme+"://user:secret@"+proxy.addr); err != nil {
-				t.Fatalf("routeThrough: %v", err)
+			route := newEgressRoute()
+			if err := route.set(scheme + "://user:secret@" + proxy.addr); err != nil {
+				t.Fatalf("route.set: %v", err)
 			}
+			route.install(recorded)
 			for name, client := range map[string]*http.Client{
 				"pre-login": recorded.preLogin, "websocket": recorded.websocket, "media": recorded.media,
 			} {
@@ -248,10 +262,7 @@ func TestAConnectMovesTheSessionOnlyWhenTheProxyChanges(t *testing.T) {
 	hungUp := make(chan struct{}, 4)
 	session.disconnect = func(*wm.Client) { hungUp <- struct{}{} }
 	onBefore := "socks5://" + before.addr
-	if err := routeThrough(session.current(), onBefore); err != nil {
-		t.Fatalf("routeThrough: %v", err)
-	}
-	session.setProxy(onBefore)
+	standOn(t, session, onBefore)
 	session.handle(&waEvents.Connected{})
 	next(t, session)
 
@@ -299,7 +310,7 @@ func TestAMoveThatCouldNotHangUpIsTriedAgain(t *testing.T) {
 	release := make(chan struct{})
 	t.Cleanup(func() { close(release) })
 	session.disconnect = func(*wm.Client) { <-release }
-	session.setProxy("socks5://127.0.0.1:1")
+	standOn(t, session, "socks5://127.0.0.1:1")
 	session.handle(&waEvents.Connected{})
 	next(t, session)
 
@@ -327,10 +338,7 @@ func TestAPairingCodeIsAskedForThroughTheSessionsProxy(t *testing.T) {
 	proxy := listenAsProxy(t)
 	session, _ := newTestSession(t, "")
 	onProxy := "socks5://" + proxy.addr
-	if err := routeThrough(session.current(), onProxy); err != nil {
-		t.Fatalf("routeThrough: %v", err)
-	}
-	session.setProxy(onProxy)
+	standOn(t, session, onProxy)
 
 	_ = session.requestCode(t.Context(), &protocol.Command{
 		Type: protocol.CommandPairingRequestCode, Payload: json.RawMessage(`{"phone":"5511999990002"}`),
@@ -356,10 +364,7 @@ func TestARebuiltClientKeepsTheSessionsProxy(t *testing.T) {
 	proxy := listenAsProxy(t)
 	session, _ := newTestSession(t, "")
 	onProxy := "socks5://" + proxy.addr
-	if err := routeThrough(session.current(), onProxy); err != nil {
-		t.Fatalf("routeThrough: %v", err)
-	}
-	session.setProxy(onProxy)
+	standOn(t, session, onProxy)
 	previous := session.current()
 	session.markStale()
 
@@ -371,5 +376,84 @@ func TestARebuiltClientKeepsTheSessionsProxy(t *testing.T) {
 	}
 	if said := proxy.next(t); said != "socks5" {
 		t.Fatalf("the rebuilt client reached the proxy saying %q", said)
+	}
+}
+
+// Moving a session's route while a request is going through it is not a race.
+//
+// whatsmeow reads its media client from whichever goroutine is downloading, and a download
+// can still be running after the socket that announced it went down -- which is exactly
+// when a connect moving the session to another proxy runs. Replacing the client there
+// would be a write racing that read; what moves is the transport behind a round tripper
+// the client already holds, and this is the test that runs the two at once under -race.
+func TestMovingTheRouteDoesNotRaceARequestGoingThroughIt(t *testing.T) {
+	t.Parallel()
+
+	first, second := listenAsProxy(t), listenAsProxy(t)
+	route := newEgressRoute()
+	recorded := &clientRecorder{}
+	route.install(recorded)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := range 20 {
+			_ = reach(t, recorded.media)
+			if i%2 == 0 {
+				_ = reach(t, recorded.websocket)
+			}
+		}
+	}()
+	for i := range 20 {
+		at := first.addr
+		if i%2 == 1 {
+			at = second.addr
+		}
+		if err := route.set("socks5://" + at); err != nil {
+			t.Fatalf("route.set: %v", err)
+		}
+	}
+	<-done
+}
+
+// A session this instance opens stands on what its client last asked for, before anything
+// is dialled.
+//
+// A `session.wake` brings an account up on an instance that never saw the connect behind
+// it, and a pairing code is a command that opens a socket without carrying a request of
+// its own. Standing on nothing, that socket is a request for no proxy, which is a request
+// to go out directly: the account would dial WhatsApp from this instance's own address,
+// the one its client asked this connector not to use.
+func TestASessionOpenedHereStandsOnWhatItsClientAskedFor(t *testing.T) {
+	t.Parallel()
+
+	proxy := listenAsProxy(t)
+	container := openStore(t)
+	waEngine, err := New(container, Options{}, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = waEngine.Close() })
+	onProxy := "socks5://" + proxy.addr
+	if err := container.For("sid-1").PutDesiredConnected(t.Context(), store.Wants{
+		Groups: true, CallAutoReject: true, Proxy: onProxy,
+	}); err != nil {
+		t.Fatalf("PutDesiredConnected: %v", err)
+	}
+
+	opened, err := waEngine.Open(t.Context(), "sid-1")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	session, _ := opened.(*Session)
+	if session.proxyURL() != onProxy || !session.wantsGroups() || !session.rejectsCalls() {
+		t.Fatalf("the session opened standing on proxy=%q groups=%v auto_reject=%v, not on what "+
+			"its client asked for", session.proxyURL(), session.wantsGroups(), session.rejectsCalls())
+	}
+	_, _ = session.Execute(t.Context(), &protocol.Command{
+		Type: protocol.CommandPairingRequestCode, Payload: json.RawMessage(`{"phone":"5511999990002"}`),
+	})
+	if said := proxy.next(t); said != "socks5" {
+		t.Fatalf("the pairing dial reached the proxy saying %q", said)
 	}
 }

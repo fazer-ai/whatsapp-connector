@@ -478,10 +478,13 @@ type Session struct {
 	autoRejectCalls bool
 
 	// proxy is the last connect's `proxy.url`, empty for a session that goes out
-	// directly. Guarded by mu, written by Connect once the current client routes through
-	// it, and read by every client built after that. It carries credentials: nothing
-	// here logs or publishes it.
+	// directly. Guarded by mu, and written once route goes through it. It carries
+	// credentials: nothing here logs or publishes it.
 	proxy string
+
+	// route is what every client this session adopts dials through. Set in newSession and
+	// never replaced; what changes is the path inside it.
+	route *egressRoute
 
 	// answered remembers which calls this session has already published an offer for.
 	// WhatsApp announces one call twice -- `offer` and `offer_notice` -- and the two
@@ -669,6 +672,7 @@ func newSession(
 	lifetime, cancel := context.WithCancel(context.Background())
 	s := &Session{
 		sid:        sid,
+		route:      newEgressRoute(),
 		aliases:    newAlias(),
 		store:      scoped,
 		log:        log.With().Str("sid", sid).Logger(),
@@ -905,6 +909,10 @@ func (s *Session) adopt(ctx context.Context, client *wm.Client) bool {
 	// instead of being prevented. The buffer keeps the plaintext, keyed by the
 	// ciphertext, until a handler accepts it.
 	client.EnableDecryptedEventBuffer = true
+	// The session's route, and not one of the client's own: the route outlives every
+	// client the session goes through, so the one built after a relogin leaves by the
+	// same path the one before it did, with the dial ceiling on it (see newClient).
+	s.route.install(client)
 
 	// Read here and not later: this client was built for this session and nothing else
 	// holds it yet, so whatsmeow's own goroutines are not writing to it.
@@ -1817,6 +1825,38 @@ func (s *Session) Connect(ctx context.Context, req engine.ConnectRequest) error 
 	return err
 }
 
+// standOnWhatWasAsked puts back what the account's client last asked for, before any
+// command reaches a session this instance has just opened.
+//
+// A connect sets all of it, and the sweep's connect carries it, so on those paths this is
+// overwritten a moment later with the same values. It matters on the one that carries
+// none: a `session.wake` brings the account up here, and the next command is a pairing
+// code, which builds its connect out of what the session is standing on. Standing on
+// nothing, that connect asks for no proxy -- which is a request to go out directly -- and
+// the account dials WhatsApp from this instance's own address, with the subscription and
+// the call policy reset beside it.
+//
+// Failing to read it fails the open. A session opened on a guess would be one that may
+// dial from the address its client asked it not to, and the wake that opened it is retried.
+func (s *Session) standOnWhatWasAsked(ctx context.Context) error {
+	standing, asked, err := s.store.Standing(ctx)
+	if err != nil {
+		return err
+	}
+	if !asked {
+		return nil
+	}
+	s.setGroups(standing.Groups)
+	s.setCallPolicy(standing.CallAutoReject)
+	// Nothing is dialled yet, so there is no socket to hang up: moving the route is all a
+	// proxy needs here.
+	if err := s.route.set(standing.Proxy); err != nil {
+		return err
+	}
+	s.setProxy(standing.Proxy)
+	return nil
+}
+
 // reroute puts the session's traffic on the path this connect asked for, when that is not
 // the path it is on.
 //
@@ -1844,7 +1884,7 @@ func (s *Session) reroute(ctx context.Context, proxyURL string) error {
 			return err
 		}
 	}
-	if err := routeThrough(s.current(), proxyURL); err != nil {
+	if err := s.route.set(proxyURL); err != nil {
 		return err
 	}
 	s.setProxy(proxyURL)
@@ -3062,14 +3102,7 @@ func (s *Session) rebuild(ctx context.Context) error {
 
 	// A false here is the session having closed while this ran, which adopt has already
 	// cleaned up after. There is nothing left to do either way.
-	client, err := newClient(device, s.waLog, s.proxyURL())
-	if err != nil {
-		// Unreachable for a proxy that got through Validate, which is the only way one
-		// gets here. Left on the stale client rather than on one routed nowhere: the next
-		// connect repairs it again.
-		return fmt.Errorf("whatsmeow: rebuild %s: %w", s.sid, err)
-	}
-	_ = s.adopt(ctx, client)
+	_ = s.adopt(ctx, newClient(device, s.waLog))
 	return nil
 }
 

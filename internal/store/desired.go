@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -101,6 +103,27 @@ func (c *Container) putDesiredConnected(ctx context.Context, sid string, wants W
 		return fmt.Errorf("store: record the desired state of %s: %w", sid, err)
 	}
 	return nil
+}
+
+// standing reads one session's row, with no join on the pairing: a session asking for a
+// pairing code has, by definition, nothing paired yet.
+func (c *Container) standing(ctx context.Context, sid string) (Wants, bool, error) {
+	const query = `
+		SELECT d.desired, d.wants_groups, d.wants_call_auto_reject, d.wants_proxy
+		FROM wac_session_desired d WHERE d.sid = ?`
+	var desired, proxy string
+	var groups, autoReject int64
+	err := c.db.QueryRowContext(ctx, c.rebind(query), sid).Scan(&desired, &groups, &autoReject, &proxy)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Wants{}, false, nil
+	}
+	if err != nil {
+		return Wants{}, false, fmt.Errorf("store: read what %s was asked to be: %w", sid, err)
+	}
+	if desired != DesiredConnected {
+		return Wants{}, false, nil
+	}
+	return Wants{Groups: groups != 0, CallAutoReject: autoReject != 0, Proxy: proxy}, true, nil
 }
 
 // dropDesired forgets what was asked for, which is what a session that no longer exists

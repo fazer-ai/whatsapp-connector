@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
+	"github.com/fazer-ai/whatsapp-connector/internal/store"
 )
 
 // Pairing an inbox by typing a code leaves the same record as pairing it by scanning.
@@ -214,5 +215,44 @@ func TestAPairingCodeRequestTheEngineRefusedIsStillRemembered(t *testing.T) {
 	}
 	if !wanted[0].Groups {
 		t.Fatalf("the row carries groups=%v, want the standing subscription", wanted[0].Groups)
+	}
+}
+
+// A pairing code on a session this instance took over by a wake keeps what its client
+// asked for on the instance before.
+//
+// The connect behind the account happened somewhere else, so nothing on this instance has
+// heard it, and the row it left is the only record. This command records the standing
+// request before it goes on; recording one nobody here knows would replace the row with
+// defaults, and for the proxy the default is going out directly -- the next resume would
+// dial WhatsApp from this instance's own address.
+func TestAPairingCodeAfterAWakeKeepsWhatWasAskedElsewhere(t *testing.T) {
+	t.Parallel()
+
+	container := openStore(t)
+	asked := store.Wants{Groups: true, CallAutoReject: true, Proxy: "socks5://user:secret@10.0.0.1:1080"}
+	if err := container.For("s1").PutDesiredConnected(t.Context(), asked); err != nil {
+		t.Fatalf("PutDesiredConnected: %v", err)
+	}
+	h := newHarnessWithStore(t, container)
+	if _, err := h.manager.Adopt(context.Background(), "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+
+	h.manager.Dispatch(delivery(&protocol.Command{
+		V: protocol.Version, ID: "p1", Type: protocol.CommandPairingRequestCode, SID: "s1", ReplyTo: "p1",
+		Payload: json.RawMessage(`{"phone":"5511999990001"}`),
+	}, &atomic.Bool{}))
+	waitFor(t, "a reply to p1", func() bool { _, ok := h.recorder.reply("p1"); return ok })
+
+	standing, connected, err := container.For("s1").Standing(t.Context())
+	if err != nil {
+		t.Fatalf("Standing: %v", err)
+	}
+	if !connected || standing != asked {
+		t.Fatalf("after a pairing code on a woken session the row reads %+v (connected=%v), want %+v.\n"+
+			"This instance never heard the connect, so what it wrote is a default -- and a proxy "+
+			"defaulted to nothing is an account that comes back from this instance's own address.",
+			standing, connected, asked)
 	}
 }

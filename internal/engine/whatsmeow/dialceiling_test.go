@@ -213,7 +213,7 @@ func TestTheCeilingDoesNotOutliveTheDialItBounds(t *testing.T) {
 // `unlockedConnect` picks between `websocketHTTP` and `preLoginHTTP` on whether the device
 // has an ID, so a ceiling installed on one of the two leaves the other dial unbounded, and
 // the unbounded one would be pairing. A pin that adds a third, or renames one, needs
-// `newClient` to move with it, and nothing else in this repository would notice: the
+// `egressRoute.install` to move with it, and nothing else in this repository would notice: the
 // fields are unexported, so the ceiling cannot be read back off the client at run time.
 func TestTheDialGoesOutThroughTheClientsNewClientSets(t *testing.T) {
 	t.Parallel()
@@ -231,32 +231,35 @@ func TestTheDialGoesOutThroughTheClientsNewClientSets(t *testing.T) {
 	for _, wanted := range []string{"websocketHTTP", "preLoginHTTP"} {
 		if !found[wanted] {
 			t.Errorf("the pinned whatsmeow no longer dials through cli.%s: re-read which "+
-				"clients unlockedConnect picks between and move newClient's ceiling to "+
+				"clients unlockedConnect picks between and move the route's ceiling to "+
 				"them, because a dial through a client it does not set has none (#290)", wanted)
 		}
 		delete(found, wanted)
 	}
 	for extra := range found {
-		t.Errorf("the pinned whatsmeow also dials through cli.%s, which newClient does not "+
+		t.Errorf("the pinned whatsmeow also dials through cli.%s, which the route does not "+
 			"set: that dial holds the socket write lock with no ceiling on it (#290)", extra)
 	}
 }
 
-// And newClient puts the ceiling on both of them, whichever way the session goes out.
+// And every client a session adopts gets the ceiling on both of them, whichever way the
+// session goes out.
 //
-// Read off the clients themselves since #217. `routeThrough` sets them through an
-// interface, so a recorder can be handed in where the library's client keeps them in
-// fields nothing can read back; before that, the only thing that could be checked was the
-// shape of the calls in newClient's source. What newClient still has to be read for is
-// that it calls routeThrough at all, which is the half below.
+// Read off the clients themselves since #217. The route sets them through an interface, so
+// a recorder can be handed in where the library's client keeps them in fields nothing can
+// read back; before that, the only thing that could be checked was the shape of the calls
+// in newClient's source. What still has to be read off the source is that `adopt` installs
+// the route at all, which is the half below.
 func TestNewClientPutsTheCeilingOnBothDialClients(t *testing.T) {
 	t.Parallel()
 
 	for _, proxyURL := range []string{"", "socks5://127.0.0.1:1080", "http://127.0.0.1:3128"} {
-		recorded := &clientRecorder{}
-		if err := routeThrough(recorded, proxyURL); err != nil {
-			t.Fatalf("routeThrough(%q): %v", proxyURL, err)
+		route := newEgressRoute()
+		if err := route.set(proxyURL); err != nil {
+			t.Fatalf("route.set(%q): %v", proxyURL, err)
 		}
+		recorded := &clientRecorder{}
+		route.install(recorded)
 		for name, client := range map[string]*http.Client{
 			"SetWebsocketHTTPClient": recorded.websocket, "SetPreLoginHTTPClient": recorded.preLogin,
 		} {
@@ -277,46 +280,53 @@ func TestNewClientPutsTheCeilingOnBothDialClients(t *testing.T) {
 		}
 		// Each its own transport, and none the process-wide one: a zero field would hand the
 		// client http.DefaultTransport, shared with everything else in the process.
-		seen := map[http.RoundTripper]bool{}
+		seen := map[*http.Transport]bool{}
 		for _, client := range []*http.Client{recorded.websocket, recorded.preLogin, recorded.media} {
 			if client == nil {
 				continue
 			}
-			if _, built := client.Transport.(*http.Transport); !built || client.Transport == http.DefaultTransport {
-				t.Errorf("with proxy %q a client dials through %T, not a transport of its own",
-					proxyURL, client.Transport)
+			swapped, isRoute := client.Transport.(*swappedTransport)
+			if !isRoute {
+				t.Errorf("with proxy %q a client dials through %T, not the session's route", proxyURL, client.Transport)
+				continue
 			}
-			if seen[client.Transport] {
+			current := swapped.current.Load()
+			if current == nil || current == http.DefaultTransport {
+				t.Errorf("with proxy %q a client's route goes through %v, not a transport of its own", proxyURL, current)
+			}
+			if seen[current] {
 				t.Errorf("with proxy %q two clients share one transport", proxyURL)
 			}
-			seen[client.Transport] = true
+			seen[current] = true
 		}
 	}
 
 	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, "dialceiling.go", nil, parser.SkipObjectResolution)
+	file, err := parser.ParseFile(fset, "session.go", nil, parser.SkipObjectResolution)
 	if err != nil {
-		t.Fatalf("parse dialceiling.go: %v", err)
+		t.Fatalf("parse session.go: %v", err)
 	}
-	routed := false
+	installed := false
 	for _, decl := range file.Decls {
 		fn, ok := decl.(*ast.FuncDecl)
-		if !ok || fn.Name.Name != "newClient" {
+		if !ok || fn.Name.Name != "adopt" {
 			continue
 		}
 		ast.Inspect(fn.Body, func(n ast.Node) bool {
-			if call, isCall := n.(*ast.CallExpr); isCall {
-				if name, isIdent := call.Fun.(*ast.Ident); isIdent && name.Name == "routeThrough" {
-					routed = true
-				}
+			call, isCall := n.(*ast.CallExpr)
+			if !isCall {
+				return true
+			}
+			if selector, isSel := call.Fun.(*ast.SelectorExpr); isSel && selector.Sel.Name == "install" {
+				installed = true
 			}
 			return true
 		})
 	}
-	if !routed {
-		t.Fatal("newClient does not call routeThrough, so a client it builds keeps whatsmeow's own " +
-			"dial clients: no ceiling on the dial (#290), and the environment's proxy instead of the " +
-			"session's (#217)")
+	if !installed {
+		t.Fatal("adopt does not install the session's route, so a client it takes on keeps " +
+			"whatsmeow's own dial clients: no ceiling on the dial (#290), and the environment's " +
+			"proxy instead of the session's (#217)")
 	}
 }
 
