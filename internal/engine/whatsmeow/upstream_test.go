@@ -223,7 +223,7 @@ var upstreamDefects = []upstreamDefect{
 		file:  "client.go",
 		// Not a defect. A resume whose first dial fails is retried only because this branch
 		// hands a retryable failure to the reconnect loop and answers nil, and it runs only
-		// with `InitialAutoReconnect`, which `adopt` sets for exactly this. A pin that stopped
+		// with `InitialAutoReconnect`, which `dial` sets for a resume and for nothing else. A pin that stopped
 		// dispatching the drop, stopped starting the loop, or went back to returning the
 		// error would leave that line setting a field nothing reads, with the suite green.
 		inOrder: []string{
@@ -236,7 +236,7 @@ var upstreamDefects = []upstreamDefect{
 		what: "a retryable failure of the first dial being handed to the reconnect loop, " +
 			"announced as a drop, and answered nil",
 		reliedOn: true,
-		restingOn: "`client.InitialAutoReconnect = true` in session.go's adopt, and the " +
+		restingOn: "`client.InitialAutoReconnect = retry` in session.go's dial, and the " +
 			"account whose resume dial met a network that was away coming back on its own",
 	},
 	{
@@ -251,7 +251,7 @@ var upstreamDefects = []upstreamDefect{
 		enclosing:  "func isRetryableConnectError(",
 		what:       "a failed dial and a network error counting as retryable failures of the first dial",
 		reliedOn:   true,
-		restingOn: "the same line in adopt: without it a resume that met a network that was " +
+		restingOn: "the same line in dial: without it a resume that met a network that was " +
 			"away is left adopted and unconnected again",
 	},
 	{
@@ -263,7 +263,7 @@ var upstreamDefects = []upstreamDefect{
 		enclosing:  "func (fs *FrameSocket) Connect(",
 		what:       "a websocket dial that failed being reported as ErrDialFailed",
 		reliedOn:   true,
-		restingOn: "the retry adopt turns on for the first dial, which only takes failures " +
+		restingOn: "the retry dial turns on for a resume, which only takes failures " +
 			"isRetryableConnectError recognises",
 	},
 	{

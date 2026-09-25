@@ -888,15 +888,6 @@ func (s *Session) adopt(ctx context.Context, client *wm.Client) bool {
 	// session the moment the lease is gone, which is what keeps two instances off one
 	// account.
 	client.EnableAutoReconnect = true
-	// And the first dial as well, which whatsmeow leaves out unless asked. Without it a
-	// resume whose dial met a network that was away returned the error and started no
-	// retry: the account stayed adopted here, holding its lease, and nothing came back for
-	// it -- the sweep asks only about accounts nobody runs, and nothing retires a failure
-	// that is not terminal (#280). With it, a retryable failure is handed to the same
-	// backoff that already recovers every drop after the socket came up, on the session's
-	// own context, so it ends when the session does. What whatsmeow does not call
-	// retryable still comes back as an error.
-	client.InitialAutoReconnect = true
 	client.PrePairCallback = s.bind
 	client.BackgroundEventCtx = s.ctx
 	// The ack for an inbound message waits for the handlers, and a handler that reports
@@ -1972,7 +1963,7 @@ func (s *Session) resume(ctx context.Context, state string) error {
 		}
 		s.emit(protocol.EventSessionState, map[string]any{"state": "close", "reason": "connect_failed"})
 	}
-	if err := s.dial(ctx, client, reportFailure); err != nil {
+	if err := s.dial(ctx, client, reportFailure, true); err != nil {
 		// Only when the dial itself failed. A caller that stopped waiting leaves the
 		// connect running, and a `close` published over it is a terminal state the very
 		// next event contradicts.
@@ -1991,7 +1982,20 @@ func (s *Session) resume(ctx context.Context, state string) error {
 // whatsmeow a context that dies with the RPC, would also kill the reconnect loop it
 // starts from the same one. What the deadline must not do is hold the session's command
 // queue, which is single-file, behind a network round trip nobody is waiting for.
-func (s *Session) dial(ctx context.Context, client *wm.Client, onDetached func(error)) error {
+//
+// `retry` hands a first dial that fails for a reason whatsmeow calls retryable to its
+// reconnect loop, which is what a resume wants and a pairing must not get. Without it a
+// resume whose dial met a network or a proxy that was away returned the error and started
+// no retry: the account stayed adopted here, holding its lease, and nothing came back for
+// it -- the sweep asks only about accounts nobody runs, and nothing retires a failure that
+// is not terminal (#280). With it the failure goes to the same backoff that recovers every
+// drop after the socket came up, on the session's own context, so it ends when the session
+// does. A pairing has no device id yet, and whatsmeow's loop does nothing for a client
+// without one: the dial would answer nil, announce a drop, and never try again, so a
+// pairing keeps the error it has always had.
+func (s *Session) dial(ctx context.Context, client *wm.Client, onDetached func(error), retry bool) error {
+	// Written before the dial starts and read only inside it, by ConnectContext.
+	client.InitialAutoReconnect = retry
 	s.setDialing(true)
 	dialed := make(chan error, 1)
 	go func() {
@@ -2074,7 +2078,7 @@ func (s *Session) pairWithQR(ctx context.Context, standing string) error {
 
 	s.emit(protocol.EventSessionState, map[string]any{"state": "connecting"})
 	abandon := func(err error) { s.abandonPairing(run, client, "connect_failed", err) }
-	if err := s.dial(ctx, client, abandon); err != nil {
+	if err := s.dial(ctx, client, abandon, false); err != nil {
 		s.giveUpOn(ctx, run, client, err)
 		return fmt.Errorf("whatsmeow: connect %s: %w", s.sid, err)
 	}
@@ -2249,7 +2253,7 @@ func (s *Session) pairWithCode(ctx context.Context, rawPhone, standing string) e
 	s.emit(protocol.EventSessionState, map[string]any{"state": "connecting"})
 	// Nothing to report if this one detaches: the attempt is torn down below whatever
 	// the dial goes on to do, and a code pairing cannot continue without its command.
-	if err := s.dial(ctx, client, nil); err != nil {
+	if err := s.dial(ctx, client, nil, false); err != nil {
 		// Off the executor when the dial is still running: Disconnect waits on the lock
 		// that dial is holding, and this attempt is over either way.
 		go s.abandonPairing(run, client, "connect_failed", err)

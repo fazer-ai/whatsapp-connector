@@ -61,3 +61,34 @@ func TestAResumeWhoseDialFailedIsTriedAgain(t *testing.T) {
 		}
 	}
 }
+
+// A pairing whose first dial fails still fails. whatsmeow's reconnect loop does nothing
+// for a client with no device id yet, so a pairing handed to it would answer nil, announce
+// a drop, and never dial again: the operator would be left on a QR screen waiting for a
+// code that is not coming, told nothing about the network that was away.
+func TestAPairingWhoseDialFailedStillFails(t *testing.T) {
+	t.Parallel()
+
+	for _, pairing := range []string{"qr", "code"} {
+		t.Run(pairing, func(t *testing.T) {
+			t.Parallel()
+
+			proxy := listenAsProxy(t)
+			session, _ := newTestSession(t, "")
+			onProxy := "socks5://" + proxy.addr
+			standOn(t, session, onProxy)
+
+			request := engine.ConnectRequest{Pairing: pairing, Proxy: &engine.ProxyRequest{URL: onProxy}}
+			if pairing == "code" {
+				request.Phone = "5511999990002"
+			}
+			err := session.Connect(t.Context(), request)
+			if said := proxy.next(t); said != "socks5" {
+				t.Fatalf("the pairing reached the proxy saying %q", said)
+			}
+			if err == nil {
+				t.Fatal("a pairing whose dial failed answered as though it had started")
+			}
+		})
+	}
+}
