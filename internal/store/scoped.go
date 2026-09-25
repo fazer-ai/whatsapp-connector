@@ -192,8 +192,9 @@ func (s *Scoped) PutDesiredConnected(ctx context.Context, wants Wants) error {
 }
 
 // Standing is what the client last asked this session to be connected with, and whether
-// it asked for a connection at all: false for a session turned off, and for one nobody
-// has asked about.
+// anybody has asked about it at all. A session turned off still has one: a disconnect
+// says the session should be down, not that its client stopped wanting the proxy it
+// named, and the next thing that opens a socket for it goes out the way it was asked to.
 //
 // Read by whoever takes the session over without a connect in hand. A `session.wake`
 // brings an account up on an instance that never saw the connect behind it, and the next

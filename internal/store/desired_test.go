@@ -314,13 +314,15 @@ func TestADisconnectLeavesTheSubscriptionAlone(t *testing.T) {
 }
 
 // What a session stands on is the row, whether or not the session ever paired, and
-// nothing at all for a session turned off or never asked about.
+// whether or not it is turned off; and nothing for a session never asked about.
 //
 // Paired or not, because the reader is a pairing code: a session asking for one has, by
 // definition, nothing paired yet, so the join `Wanted` makes would hide the very row it
-// needs. And nothing for a session turned off, because what it stood on then was a
-// request its client has since withdrawn.
-func TestStandingIsTheRowAndOnlyWhileConnectedIsWanted(t *testing.T) {
+// needs. Turned off or not, because a disconnect says the session should be down and not
+// that its client stopped wanting the proxy it named: a pairing code asked for after a
+// disconnect still goes through it, and a row read as empty there would be rewritten
+// empty by that code, and the next resume would go out directly.
+func TestStandingIsTheRowWhateverItsState(t *testing.T) {
 	t.Parallel()
 	container := open(t)
 	ctx := t.Context()
@@ -329,19 +331,18 @@ func TestStandingIsTheRowAndOnlyWhileConnectedIsWanted(t *testing.T) {
 	if err := container.For("sid-unpaired").PutDesiredConnected(ctx, asked); err != nil {
 		t.Fatalf("PutDesiredConnected: %v", err)
 	}
-	if got, ok, err := container.For("sid-unpaired").Standing(ctx); err != nil || !ok || got != asked {
-		t.Fatalf("an unpaired session asked to connect stands on %+v (ok=%v, err=%v), want %+v", got, ok, err, asked)
-	}
-
 	if err := container.For("sid-off").PutDesiredConnected(ctx, asked); err != nil {
 		t.Fatalf("PutDesiredConnected: %v", err)
 	}
 	if err := container.For("sid-off").PutDesiredDisconnected(ctx); err != nil {
 		t.Fatalf("PutDesiredDisconnected: %v", err)
 	}
-	for _, sid := range []string{"sid-off", "sid-never"} {
-		if got, ok, err := container.For(sid).Standing(ctx); err != nil || ok || got != (store.Wants{}) {
-			t.Fatalf("%s stands on %+v (ok=%v, err=%v), want nothing", sid, got, ok, err)
+	for _, sid := range []string{"sid-unpaired", "sid-off"} {
+		if got, ok, err := container.For(sid).Standing(ctx); err != nil || !ok || got != asked {
+			t.Fatalf("%s stands on %+v (ok=%v, err=%v), want %+v", sid, got, ok, err, asked)
 		}
+	}
+	if got, ok, err := container.For("sid-never").Standing(ctx); err != nil || ok || got != (store.Wants{}) {
+		t.Fatalf("a session nobody asked about stands on %+v (ok=%v, err=%v), want nothing", got, ok, err)
 	}
 }

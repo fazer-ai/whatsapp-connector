@@ -53,10 +53,10 @@ type Wanted struct {
 // The subscription is left as it stands rather than written, because the command this
 // serves does not carry one. A disconnect says nothing about which traffic a client
 // wants when it comes back, and a disconnect that wrote the column would be answering
-// that question with a default nobody asked for. Nothing reads the column of a session
-// that is down -- `Wanted` selects on the state first -- so the choice is between a value
-// that is not read and a falsehood that is not read, and only the second is waiting for a
-// reader to arrive.
+// that question with a default nobody asked for. And the columns are read while the
+// session is down: `Standing` hands them to a pairing code asked for on a session turned
+// off, which is still asking through the proxy its client named. Cleared here, that code
+// would be asked for directly, and the row it writes would carry the default onwards.
 func (c *Container) putDesiredDisconnected(ctx context.Context, sid string, now time.Time) error {
 	if sid == "" {
 		return fmt.Errorf("store: a desired state needs a session, got %q", sid)
@@ -106,22 +106,20 @@ func (c *Container) putDesiredConnected(ctx context.Context, sid string, wants W
 }
 
 // standing reads one session's row, with no join on the pairing: a session asking for a
-// pairing code has, by definition, nothing paired yet.
+// pairing code has, by definition, nothing paired yet. And whatever the state, because a
+// disconnect leaves the request standing (see putDesiredDisconnected).
 func (c *Container) standing(ctx context.Context, sid string) (Wants, bool, error) {
 	const query = `
-		SELECT d.desired, d.wants_groups, d.wants_call_auto_reject, d.wants_proxy
+		SELECT d.wants_groups, d.wants_call_auto_reject, d.wants_proxy
 		FROM wac_session_desired d WHERE d.sid = ?`
-	var desired, proxy string
+	var proxy string
 	var groups, autoReject int64
-	err := c.db.QueryRowContext(ctx, c.rebind(query), sid).Scan(&desired, &groups, &autoReject, &proxy)
+	err := c.db.QueryRowContext(ctx, c.rebind(query), sid).Scan(&groups, &autoReject, &proxy)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Wants{}, false, nil
 	}
 	if err != nil {
 		return Wants{}, false, fmt.Errorf("store: read what %s was asked to be: %w", sid, err)
-	}
-	if desired != DesiredConnected {
-		return Wants{}, false, nil
 	}
 	return Wants{Groups: groups != 0, CallAutoReject: autoReject != 0, Proxy: proxy}, true, nil
 }

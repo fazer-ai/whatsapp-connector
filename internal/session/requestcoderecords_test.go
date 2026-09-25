@@ -256,3 +256,46 @@ func TestAPairingCodeAfterAWakeKeepsWhatWasAskedElsewhere(t *testing.T) {
 			standing, connected, asked)
 	}
 }
+
+// The same, with a disconnect in between: woken, turned off, and then asked for a code.
+//
+// A disconnect says the session should be down and leaves the request standing, so the
+// code that follows is still asked through the proxy its client named. A disconnect read
+// as having cleared the request would have that code rewrite the row with no proxy, and
+// the next resume would go out directly.
+func TestAPairingCodeAfterAWakeAndADisconnectKeepsTheProxy(t *testing.T) {
+	t.Parallel()
+
+	container := openStore(t)
+	asked := store.Wants{Groups: true, Proxy: "socks5://user:secret@10.0.0.1:1080"}
+	if err := container.For("s1").PutDesiredConnected(t.Context(), asked); err != nil {
+		t.Fatalf("PutDesiredConnected: %v", err)
+	}
+	h := newHarnessWithStore(t, container)
+	if _, err := h.manager.Adopt(context.Background(), "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	for _, command := range []struct {
+		id      string
+		kind    protocol.CommandType
+		payload string
+	}{
+		{"d1", protocol.CommandSessionDisconnect, `{}`},
+		{"p1", protocol.CommandPairingRequestCode, `{"phone":"5511999990001"}`},
+	} {
+		h.manager.Dispatch(delivery(&protocol.Command{
+			V: protocol.Version, ID: command.id, Type: command.kind, SID: "s1", ReplyTo: command.id,
+			Payload: json.RawMessage(command.payload),
+		}, &atomic.Bool{}))
+		waitFor(t, "a reply to "+command.id, func() bool { _, ok := h.recorder.reply(command.id); return ok })
+	}
+
+	standing, _, err := container.For("s1").Standing(t.Context())
+	if err != nil {
+		t.Fatalf("Standing: %v", err)
+	}
+	if standing != asked {
+		t.Fatalf("after a wake, a disconnect and a pairing code the row stands on %+v, want %+v: the "+
+			"next resume would go out %s", standing, asked, map[bool]string{true: "directly", false: "as asked"}[standing.Proxy == ""])
+	}
+}
