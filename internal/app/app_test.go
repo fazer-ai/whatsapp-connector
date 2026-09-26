@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -388,6 +389,40 @@ func TestAnInstanceWithADifferentShardCountRefusesToStart(t *testing.T) {
 	}
 	if _, err := app.New(&cfg, zerolog.Nop()); err == nil {
 		t.Fatal("an instance with a different shard count started")
+	}
+}
+
+// A Redis older than the floor refuses commands the fleet issues, and does it one pass at
+// a time while the process reports itself healthy (#279). So the instance does not start,
+// and it says why before it has written anything: a refused instance that had claimed the
+// fleet's metadata, or announced itself, would leave a trace of a member that never ran.
+func TestAnInstanceRefusesARedisOlderThanTheFloor(t *testing.T) {
+	stub := redisxtest.NewStub(t, "%3\r\n$6\r\nserver\r\n$5\r\nredis\r\n$7\r\nversion\r\n$6\r\n6.0.20\r\n$5\r\nproto\r\n:3\r\n")
+	t.Setenv("REDIS_URL", "redis://"+stub.Addr())
+	t.Setenv("WAC_INSTANCE", "inst-a")
+	t.Setenv("WAC_ENGINE", "fake")
+	t.Setenv("WAC_HTTP_ADDR", "127.0.0.1:0")
+	cfg, err := app.LoadConfig("test-host")
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+
+	if _, err = app.New(&cfg, zerolog.Nop()); err == nil {
+		t.Fatal("an instance started on Redis 6.0")
+	}
+	for _, want := range []string{"6.0.20", "6.2"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not say %q: %v", want, err)
+		}
+	}
+	// What a client sends to set up a connection, and the two questions asked before the
+	// refusal. Anything else reached the server before the instance knew it could run.
+	for _, command := range stub.Seen() {
+		switch command {
+		case "HELLO", "CLIENT", "PING":
+		default:
+			t.Errorf("the instance sent %s to a server it then refused; every command it saw: %v", command, stub.Seen())
+		}
 	}
 }
 

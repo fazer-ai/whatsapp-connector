@@ -111,6 +111,12 @@ func New(cfg *Config, log zerolog.Logger) (connector *Connector, err error) {
 	if err := client.Ping(context.Background(), 5*time.Second); err != nil {
 		return nil, err
 	}
+	// Before anything is written: a server too old for the commands the fleet issues is a
+	// misconfigured deployment, and the fleet's own metadata is the first thing that would
+	// be left behind by an instance that then could not run.
+	if err := client.RequireServerVersion(context.Background(), 5*time.Second); err != nil {
+		return nil, err
+	}
 	if err := client.ClaimMeta(context.Background(), redisx.Meta{
 		ProtocolMin: protocol.MinVersion, ProtocolMax: protocol.Version, Shards: cfg.EventShards,
 	}); err != nil {

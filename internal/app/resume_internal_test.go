@@ -191,7 +191,14 @@ func newResumeConnector(t *testing.T) (*Connector, *store.Container, *fake.Engin
 	server := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
 	t.Cleanup(func() { _ = rdb.Close() })
-	client := redisx.Wrap(rdb, "wa:", DefaultEventShards)
+	connector, container, engine := newResumeConnectorOver(t, redisx.Wrap(rdb, "wa:", DefaultEventShards))
+	return connector, container, engine, server
+}
+
+// newResumeConnectorOver is newResumeConnector over a Redis the caller chose.
+func newResumeConnectorOver(t *testing.T, client *redisx.Client) (*Connector, *store.Container, *fake.Engine) {
+	t.Helper()
+
 	leases := cluster.NewLeases(client, "inst-a", cluster.Options{})
 	engine := fake.New()
 
@@ -212,7 +219,7 @@ func newResumeConnector(t *testing.T) (*Connector, *store.Container, *fake.Engin
 		cfg: Config{Instance: "inst-a"}, log: zerolog.Nop(),
 		client: client, leases: leases, quarantine: quarantine, manager: manager, store: container,
 	}
-	return connector, container, engine, server
+	return connector, container, engine
 }
 
 // wantConnected pairs a session and records that a client asked for it to be connected,

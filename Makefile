@@ -79,6 +79,13 @@ test-postgres: ## Run the test suite against a PostgreSQL server (WAC_TEST_DATAB
 	  exit 1; }
 	$(GO) test -count=1 $(PACKAGES)
 
+# Every package with a test that reads WAC_TEST_REDIS_URL, which `internal/toolchain` holds
+# this list to: a package left off is skipped in every pass there is. CI runs this target
+# twice, against the newest Redis and against the oldest one README.md supports, because a
+# command form the floor refuses passes against the newest (#279). Locally one server is
+# enough for `make check`; to run the floor pass, point WAC_TEST_REDIS_URL at a 6.2:
+#   docker run -d --rm -p 56362:6379 redis:6.2-alpine
+#   WAC_TEST_REDIS_URL=redis://localhost:56362/0 make test-redis
 test-redis: ## Run the passes that need a real Redis (WAC_TEST_REDIS_URL)
 	@test -n "$(WAC_TEST_REDIS_URL)" || { \
 	  echo "$(test-redis_VAR) is unset or empty. It names the server this pass runs against:"; \
@@ -86,7 +93,7 @@ test-redis: ## Run the passes that need a real Redis (WAC_TEST_REDIS_URL)
 	  echo "  $(test-redis_VAR)=$(test-redis_URL) make test-redis"; \
 	  echo "(any free port will do; 56379 only avoids whatever is already on 6379)"; \
 	  exit 1; }
-	$(GO) test -count=1 ./internal/transport/redisstream ./internal/cluster
+	$(GO) test -count=1 ./internal/transport/redisstream ./internal/cluster ./internal/app ./internal/redisx
 
 test-cover: ## Run the test suite and write coverage.txt
 	WAC_TEST_DATABASE_URL= WAC_TEST_REDIS_URL= $(GO) test -race -coverprofile=coverage.txt -covermode=atomic $(PACKAGES)
