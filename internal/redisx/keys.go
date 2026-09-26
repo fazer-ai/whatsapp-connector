@@ -144,6 +144,6 @@ func (k Keys) Idempotency(sid, key string) string { return k.prefix + "idem:" + 
 // clocks and the difference is the point. Recall pushes the result's expiry out, so a
 // record still being asked about outlives the entry that asks; an attempt whose clock
 // worked that way would never expire at all, since a redelivery is exactly what asks
-// about it, and the command would answer `not_settled` for ever (#277 measured that
+// about it, and the command would answer `timeout` for ever (#277 measured that
 // shape on the transport's own entries).
 func (k Keys) Attempt(sid, key string) string { return k.prefix + "idem-try:" + sid + ":" + key }

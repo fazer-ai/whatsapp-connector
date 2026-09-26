@@ -677,13 +677,14 @@ func assertNoDuplicateEffect(rep *report, answers map[string][]string, pairs []i
 		// Only the answers that say the command WORKED, and this is the difference between
 		// a duplicated effect and an ordinary retry.
 		//
-		// MEASURED in the connector: `Session.carryOut` remembers successes and nothing
-		// else (internal/session/session.go, "Only a success is remembered. A failure is
-		// the caller's to try again"). So a command whose first attempt answered with an
-		// error and whose owner died before the XACK is redelivered, runs for real, and
-		// answers differently the second time -- by design, because the first attempt left
-		// no side effect to duplicate. Comparing whole reply strings calls that a
-		// duplicated side effect and reports the connector's retry path as a defect.
+		// MEASURED in the connector: `Session.carryOut` remembers a success as the answer
+		// and never a failure (internal/session/session.go). A failed attempt leaves either
+		// nothing, and the redelivery runs for real, or -- for a reserved command whose write
+		// may have landed -- an attempt, and the redelivery is answered `timeout` without
+		// running (#282). Either way a command whose first attempt answered with an error
+		// and whose owner died before the XACK answers differently the second time, by
+		// design. Comparing whole reply strings calls that a duplicated side effect and
+		// reports the connector's retry path as a defect.
 		//
 		// What cannot happen is two answers that BOTH claim success and disagree: the
 		// ledger is what makes the second one a recall of the first, and two different

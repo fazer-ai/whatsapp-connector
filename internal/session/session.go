@@ -1163,7 +1163,7 @@ func (s *Session) carryOut(ctx context.Context, command *protocol.Command, inter
 	if err == nil && key != "" && s.ledger != nil {
 		// The result settles the attempt written above, and a failure does not: what is
 		// left standing is a command that ran with nobody able to say how it ended, which
-		// is what the branch above answers `not_settled` with.
+		// is what the branch above answers `timeout` with.
 		//
 		// A refusal is still not remembered as an answer. Remembering one would reply to
 		// every later attempt with the same refusal, so a number that was briefly
@@ -1175,7 +1175,7 @@ func (s *Session) carryOut(ctx context.Context, command *protocol.Command, inter
 		// repeat of an id it already has; the discarding is theirs and not WhatsApp's,
 		// which delivers the second copy in full whatever the gap (#215). That is what
 		// covers a send, and it is why a send that the connector knows never went out is
-		// released rather than left to answer `not_settled` for ever.
+		// released rather than left to answer `timeout` for a day.
 		//
 		// On a context of its own, because the command's deadline may have run out in
 		// the same instant the work finished, and a record that is not written is a
@@ -1208,8 +1208,10 @@ func (s *Session) carryOut(ctx context.Context, command *protocol.Command, inter
 // A command carrying both gets whichever runs out first, which is what each of them
 // separately asked for. The zero value of both is no ceiling at all, and that is a real
 // answer rather than an oversight: a teardown is published precisely so it can sit
-// pending, and a group write has no ceiling because the ledger only remembers successes,
-// so a write cut off mid-flight would be reported as failed and redone.
+// pending, and a group write has no ceiling because a deadline releases the attempt the
+// command reserved (a deadline can end the work before its write goes out as easily as
+// after, so it holds nothing), and a write cut off mid-flight would be reported as failed
+// and redone.
 func bound(ctx context.Context, command *protocol.Command) (context.Context, context.CancelFunc) {
 	deadline := time.Time{}
 	if command.Deadline > 0 {
