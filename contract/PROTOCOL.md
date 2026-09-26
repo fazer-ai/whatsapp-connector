@@ -118,7 +118,7 @@ is willing to wait for an answer, not to how long the teardown is allowed to tak
 `seq` is monotonic per `(sid, epoch)` and, together with the per-session shard
 assignment, is what lets the consumer drop out-of-order redeliveries.
 
-**A client reads the number of event streams from `wa:meta`, and consumes every one of
+**A client must read the number of event streams from `wa:meta`, and consume every one of
 them.** The count is the `event_shards` field of the `wa:meta` hash, and the streams are
 `wa:events:0` up to `wa:events:<event_shards - 1>`. A session's events all land on one of
 them, and which one is `fnv1a32(sid) % event_shards`: the 32-bit FNV-1a hash of the sid's
@@ -129,7 +129,7 @@ instead of reading one is wrong for a fraction of its sessions and silently so: 
 streams read against 16 published, every session on streams 8 to 15 never receives an
 event, and everything else works.
 
-Read it when the client starts, and keep it. A connector writes `wa:meta` when it starts,
+A client must read it when it starts, and can keep it from then on. A connector writes `wa:meta` when it starts,
 before it opens any session, so no event exists until the count does. A client that starts
 first may read a provisional count meanwhile, provided it takes the published one as soon
 as it appears and never reads fewer streams than that. The published count only changes with
