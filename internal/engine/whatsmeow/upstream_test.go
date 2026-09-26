@@ -22,7 +22,11 @@ import (
 // A failure here is therefore good news, and never a reason to change connector code.
 type upstreamDefect struct {
 	issue string // where the diagnosis lives
-	file  string // relative to the whatsmeow module root
+	// module is where file lives, when it is not whatsmeow itself: whatsmeow brings its
+	// schema up through go.mau.fi/util, and a defect there is pinned by that module's
+	// version, not by whatsmeow's.
+	module string
+	file   string // relative to the module root
 	// stillThere are the fragments the defect is made of. All of them have to be present.
 	// Text, not line numbers: the write of #207 moved from line 83 to line 82 between two
 	// pins 27 days apart without changing at all.
@@ -35,7 +39,7 @@ type upstreamDefect struct {
 	// absent is what the fix would add. Checked inside enclosing, so that the same call
 	// appearing elsewhere in the file does not read as a repair.
 	absent    []string
-	enclosing string // the func whose body `absent` is checked against
+	enclosing string // the func whose body `absent` is checked against; empty is the whole file
 	what      string // what the reader should understand from a failure
 	// reliedOn flips what a failure means. Every other entry here describes something
 	// broken upstream that this repository works around, so its failure reads "upstream
@@ -280,19 +284,36 @@ var upstreamDefects = []upstreamDefect{
 		what: "the retry rewinding without shortening the file, which leaves a shorter " +
 			"attempt carrying the tail of the one before it",
 	},
+	{
+		issue:  "fazer-ai/whatsapp-connector#278",
+		module: "go.mau.fi/util",
+		file:   "dbutil/upgrades.go",
+		// The Postgres existence checks the version table goes through, asked by table name
+		// with no schema condition. A fix is either query growing one, so the literals are
+		// what is asserted. The whole file, because they are constants and not a func.
+		stillThere: []string{
+			`"SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_name=$1)"`,
+			`"SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name=$1 AND column_name=$2)"`,
+		},
+		what: "the version table's existence being asked of every schema while it is read " +
+			"through search_path, which is what refuseAnUnreachableVersionTable in " +
+			"internal/store/store.go stands in front of (it goes with this entry)",
+	},
 }
 
 func TestTheUpstreamDefectsWeLiveWithAreStillThere(t *testing.T) {
 	t.Parallel()
-	root := whatsmeowRoot(t)
 	for _, defect := range upstreamDefects {
 		t.Run(defect.file+" "+defect.what, func(t *testing.T) {
 			t.Parallel()
-			source, err := os.ReadFile(filepath.Join(root, defect.file))
+			source, err := os.ReadFile(filepath.Join(moduleRoot(t, defect.pinnedIn()), defect.file))
 			if err != nil {
-				t.Fatalf("read %s of the pinned whatsmeow: %v", defect.file, err)
+				t.Fatalf("read %s of the pinned %s: %v", defect.file, defect.pinnedIn(), err)
 			}
-			body := funcBody(t, string(source), defect.enclosing)
+			body := string(source)
+			if defect.enclosing != "" {
+				body = funcBody(t, body, defect.enclosing)
+			}
 			at := 0
 			for _, fragment := range defect.inOrder {
 				found := strings.Index(body[at:], fragment)
@@ -313,7 +334,7 @@ func TestTheUpstreamDefectsWeLiveWithAreStillThere(t *testing.T) {
 					// expects reads as nonsense on an entry whose fix is a truncate.
 					t.Fatalf("%s now contains %q, which is what a fix would add, so %s "+
 						"may be over.\nRe-read %s before trusting it, then delete this entry.",
-						defect.enclosing, fragment, defect.what, defect.issue)
+						defect.where(), fragment, defect.what, defect.issue)
 				}
 			}
 		})
@@ -329,11 +350,11 @@ func whatAFailureMeans(defect *upstreamDefect, fragment, how string) string {
 		return fmt.Sprintf("%s %s %q, and that is not a fix upstream: it is a property this "+
 			"repository depends on, namely %s.\nWhat rests on it: %s.\nRe-read %s. Do not "+
 			"delete this entry to make the suite green.",
-			defect.enclosing, how, fragment, defect.what, defect.restingOn, defect.issue)
+			defect.where(), how, fragment, defect.what, defect.restingOn, defect.issue)
 	}
 	return fmt.Sprintf("%s %s %q, so %s may be gone.\nThis is not a defect in this "+
 		"repository: re-read %s, and if upstream fixed it, delete this entry and the "+
-		"limitation it documents.", defect.enclosing, how, fragment, defect.what, defect.issue)
+		"limitation it documents.", defect.where(), how, fragment, defect.what, defect.issue)
 }
 
 // funcBody returns the text between the opening line and the closing brace in column zero,
@@ -353,15 +374,37 @@ func funcBody(t *testing.T, source, signature string) string {
 	return rest
 }
 
+// pinnedIn is the module the defect's file belongs to.
+func (d *upstreamDefect) pinnedIn() string {
+	if d.module == "" {
+		return "go.mau.fi/whatsmeow"
+	}
+	return d.module
+}
+
+// where names what a failure is about: the func when there is one, otherwise the file,
+// with the module either way so that a reader knows which pin moved.
+func (d *upstreamDefect) where() string {
+	if d.enclosing == "" {
+		return d.pinnedIn() + "/" + d.file
+	}
+	return d.pinnedIn() + " " + d.enclosing
+}
+
 func whatsmeowRoot(t *testing.T) string {
 	t.Helper()
-	out, err := exec.CommandContext(t.Context(), "go", "list", "-m", "-f", "{{.Dir}}", "go.mau.fi/whatsmeow").Output()
+	return moduleRoot(t, "go.mau.fi/whatsmeow")
+}
+
+func moduleRoot(t *testing.T, module string) string {
+	t.Helper()
+	out, err := exec.CommandContext(t.Context(), "go", "list", "-m", "-f", "{{.Dir}}", module).Output()
 	if err != nil {
-		t.Fatalf("locate the pinned whatsmeow: %v", err)
+		t.Fatalf("locate the pinned %s: %v", module, err)
 	}
 	dir := strings.TrimSpace(string(out))
 	if dir == "" {
-		t.Fatal("the pinned whatsmeow has no directory on this machine")
+		t.Fatalf("the pinned %s has no directory on this machine", module)
 	}
 	return dir
 }

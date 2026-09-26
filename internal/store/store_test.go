@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -964,6 +965,105 @@ func TestAColumnInAnotherSchemaIsNotMistakenForThisOne(t *testing.T) {
 	if err := scoped.PutMediaPart(t.Context(), &part, time.Now()); err != nil {
 		t.Fatalf("a write landed on a table the migration thought already had the column: %v", err)
 	}
+}
+
+// whatsmeow's upgrade asks `information_schema` whether its version table exists, by name
+// alone, and then reads it through `search_path`. A version table in a schema the path
+// does not reach is therefore "there" for the first question and missing for the second,
+// and the connector refused to start with `relation "whatsmeow_version" does not exist`,
+// which sends the reader looking for a table that plainly exists.
+func TestAVersionTableTheSearchPathDoesNotReachIsNamedRatherThanMissing(t *testing.T) {
+	t.Parallel()
+
+	target := storetest.New(t)
+	if !target.Postgres() {
+		t.Skip("the schema search path is a Postgres question, and this pass is on SQLite")
+	}
+	// Tables where a plain connect puts them, and a schema next to them with nothing.
+	container := openAt(t, target)
+	if _, err := container.DB().ExecContext(t.Context(), `CREATE SCHEMA IF NOT EXISTS elsewhere`); err != nil {
+		t.Fatalf("create the second schema: %v", err)
+	}
+	if err := container.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	through := func(path string) string {
+		separator := "?"
+		if strings.Contains(target.URL, "?") {
+			separator = "&"
+		}
+		return target.URL + separator + "search_path=" + path
+	}
+
+	t.Run("a path that does not reach the tables is refused, naming them", func(t *testing.T) {
+		opened, err := store.Open(t.Context(), through("elsewhere"), store.AlwaysOwned, zerolog.Nop())
+		if err == nil {
+			_ = opened.Close()
+			t.Fatal("opened through a search_path that reaches none of the tables")
+		}
+		for _, named := range []string{"whatsmeow_version", "public", "search_path", "elsewhere"} {
+			if !strings.Contains(err.Error(), named) {
+				t.Errorf("the refusal does not name %q: %v", named, err)
+			}
+		}
+		if strings.Contains(err.Error(), "does not exist") {
+			t.Errorf("the refusal still says the table does not exist: %v", err)
+		}
+		var created int
+		if err := target.Pool(t).QueryRowContext(t.Context(), `SELECT count(*) FROM information_schema.tables
+			WHERE table_schema = 'elsewhere' AND table_name LIKE 'whatsmeow%'`).Scan(&created); err != nil {
+			t.Fatalf("count what the refusal left behind: %v", err)
+		}
+		if created != 0 {
+			t.Errorf("the refusal left %d whatsmeow tables in the schema it refused", created)
+		}
+	})
+
+	// whatsmeow's own check reads `information_schema`, which shows a role only the tables
+	// it holds some privilege on. A role that cannot see the other schema's tables is
+	// therefore never misled, creates its own and starts, and a refusal that asked the
+	// catalogue instead would stop a deployment that works.
+	t.Run("a role that cannot see the other tables opens in its own schema", func(t *testing.T) {
+		role := fmt.Sprintf("wac_role_%d", time.Now().UnixNano())
+		admin := target.Pool(t)
+		for _, statement := range []string{
+			`CREATE ROLE ` + role + ` LOGIN PASSWORD 'p'`,
+			`CREATE SCHEMA ` + role + ` AUTHORIZATION ` + role,
+		} {
+			if _, err := admin.ExecContext(t.Context(), statement); err != nil {
+				t.Fatalf("set the role up: %v", err)
+			}
+		}
+		t.Cleanup(func() {
+			for _, statement := range []string{`DROP OWNED BY ` + role, `DROP ROLE ` + role} {
+				if _, err := admin.ExecContext(context.Background(), statement); err != nil {
+					t.Errorf("cleanup: %s: %v", statement, err)
+				}
+			}
+		})
+		as, err := url.Parse(through(role))
+		if err != nil {
+			t.Fatalf("parse %s: %v", storetest.AddressEnv, err)
+		}
+		as.User = url.UserPassword(role, "p")
+		opened, err := store.Open(t.Context(), as.String(), store.AlwaysOwned, zerolog.Nop())
+		if err != nil {
+			t.Fatalf("refused a role whose view of the database has no other version table: %v", err)
+		}
+		if err := opened.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	})
+
+	t.Run("a path that reaches them through a later schema opens", func(t *testing.T) {
+		opened, err := store.Open(t.Context(), through("elsewhere,public"), store.AlwaysOwned, zerolog.Nop())
+		if err != nil {
+			t.Fatalf("refused a search_path that reaches the tables: %v", err)
+		}
+		if err := opened.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	})
 }
 
 // leaseClock is the fleet's clock, driven by the test rather than by the wall.
