@@ -699,8 +699,9 @@ func (c *Connector) resumeOnce(ctx context.Context) {
 		// 6.2.24 it is the whole pass that dies, because an error here aborts the loop
 		// and the next pass makes the same call. That is every account in the fleet
 		// staying down for good behind one WARN a pass, which is this defect made worse
-		// rather than fixed. This repository declares no minimum Redis version and
-		// `SETNX` needs none, so the second read is the price of not quietly setting one.
+		// rather than fixed. The floor is 6.2 (README.md), so the second read is the price
+		// of staying on it, and `TestTheResumeSweepRunsOnARealRedis` is what fails when a
+		// command form above it comes back, in CI's pass against 6.2.
 		won, err := c.client.SetNX(pass, c.client.Keys().Resume(sid), c.cfg.Instance, resumeCooloff).Result()
 		if err != nil {
 			c.log.Warn().Err(err).Str("sid", sid).Msg("could not take the turn to bring a session back")
