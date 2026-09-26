@@ -36,6 +36,7 @@ func newFleet(t *testing.T) fleet {
 	t.Helper()
 	server := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	rdb.AddHook(passReads{})
 	t.Cleanup(func() { _ = rdb.Close() })
 	return fleet{server: server, rdb: rdb, client: redisx.Wrap(rdb, "wa:", shards)}
 }
@@ -1272,6 +1273,7 @@ func realFleet(t *testing.T) fleet {
 		t.Fatalf("parse %s: %v", RedisEnv, err)
 	}
 	rdb := redis.NewClient(opts)
+	rdb.AddHook(passReads{})
 	t.Cleanup(func() { _ = rdb.Close() })
 	prefix := "wactest:" + strconv.FormatInt(time.Now().UnixNano(), 36) + ":"
 	t.Cleanup(func() {

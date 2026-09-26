@@ -72,6 +72,7 @@ func cutBackends(t *testing.T, run func(t *testing.T, f cutFleet)) {
 			options.Addr = proxy.Addr()
 			options.ContextTimeoutEnabled = true
 			rdb := redis.NewClient(&options)
+			rdb.AddHook(passReads{})
 			t.Cleanup(func() { _ = rdb.Close() })
 			run(t, cutFleet{
 				fleet: direct, proxy: proxy, via: redisx.Wrap(rdb, direct.client.Keys().Prefix(), shards),
@@ -110,10 +111,15 @@ func (f cutFleet) streamsReading(t *testing.T, instance string, count int64) *re
 // comes back empty and without an error without touching Redis (`blockWithin`), which in
 // the loop costs nothing, since the next pass does the work; here it is a goroutine the
 // scheduler kept waiting, and a test that expects a delivery would read it as a verdict
-// (#328). So a pass that came back empty with its window spent is run again with a new
-// window. One that went out has most of its window left when it returns, because the
-// block is capped at two thirds of it, and is never repeated: an empty pass stays a
+// (#328). So a pass that sent no XREADGROUP is run again with a new window. One that did
+// is never repeated, however late its caller gets the CPU back: an empty pass stays a
 // result for the tests that expect nothing.
+//
+// Whether it went out is counted, not inferred from the clock: the scheduler that starves
+// a pass before it goes out can as easily starve one after it came back, and the time
+// left would then call a finished read starved (#333). The count comes from passReads,
+// which every client these tests build carries; one that does not makes every empty pass
+// look starved, and the helper fails loudly rather than passing on it.
 func read(t *testing.T, streams *redisstream.Streams, sids ...string) ([]transport.Delivery, error) {
 	t.Helper()
 	return readWithin(t, cutWindow, streams, sids...)
@@ -140,14 +146,46 @@ func readWithin(t testing.TB, window time.Duration, streams *redisstream.Streams
 // hung instead of failing would say less.
 const starvedPasses = 5
 
-// pass is a single read, and whether its window was spent before it could have gone out:
-// less left than `blockWithin` needs to name a block.
+// pass is a single read, and whether it never went out: no XREADGROUP was sent under it.
 func pass(streams *redisstream.Streams, window time.Duration, sids []string) (delivered []transport.Delivery, spent bool, err error) {
-	ctx, cancel := context.WithTimeout(context.Background(), window)
+	sent := &passSent{}
+	ctx, cancel := context.WithTimeout(context.WithValue(context.Background(), passKey{}, sent), window)
 	defer cancel()
 	delivered, err = streams.Read(ctx, sids)
-	deadline, _ := ctx.Deadline()
-	return delivered, time.Until(deadline)*2/3 < time.Millisecond, err
+	return delivered, sent.reads.Load() == 0, err
+}
+
+// passKey carries a pass's own count through the client's hooks, so that passes running
+// in parallel on one client count apart.
+type passKey struct{}
+
+type passSent struct{ reads atomic.Int64 }
+
+// passReads counts each XREADGROUP against the pass whose context sent it.
+type passReads struct{}
+
+func (passReads) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (passReads) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		countRead(ctx, cmd)
+		return next(ctx, cmd)
+	}
+}
+
+func (passReads) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return func(ctx context.Context, cmds []redis.Cmder) error {
+		for _, cmd := range cmds {
+			countRead(ctx, cmd)
+		}
+		return next(ctx, cmds)
+	}
+}
+
+func countRead(ctx context.Context, cmd redis.Cmder) {
+	if sent, ok := ctx.Value(passKey{}).(*passSent); ok && cmd.Name() == "xreadgroup" {
+		sent.reads.Add(1)
+	}
 }
 
 // spendTheWindow holds the first XGROUP a transport sends until its window is over, the
@@ -280,6 +318,53 @@ func TestAnEmptyPassThatWentOutIsNotReadAgain(t *testing.T) {
 			t.Fatalf("an empty pass that went out was read %d times, want once", got)
 		}
 	})
+}
+
+// And however late the caller gets the CPU back: a pass that went out and found nothing,
+// whose goroutine was then kept waiting past the end of its window, is still an answer.
+func TestAnEmptyPassWhoseCallerResumesLateIsNotReadAgain(t *testing.T) {
+	t.Parallel()
+
+	cutBackends(t, func(t *testing.T, f cutFleet) {
+		streams := f.fleet.streams(t, "inst-a")
+		if _, err := read(t, streams, "s1"); err != nil {
+			t.Fatalf("priming read: %v", err)
+		}
+		late := &resumeLate{}
+		f.rdb.AddHook(late)
+
+		delivered, err := read(t, streams, "s1")
+		if err != nil || len(delivered) != 0 {
+			t.Fatalf("handed out %v (err=%v) from a stream with nothing on it", ids(delivered), err)
+		}
+		if got := late.reads.Load(); got != 1 {
+			t.Fatalf("an empty pass whose caller resumed after its window was read %d times, want once", got)
+		}
+	})
+}
+
+// resumeLate counts the XREADGROUPs, and holds the answer of the trip that closes a pass,
+// the read back that follows the `>`, until the window is over: what the read looks like
+// from a goroutine descheduled once it is done.
+type resumeLate struct{ reads atomic.Int64 }
+
+func (*resumeLate) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (h *resumeLate) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if cmd.Name() == "xreadgroup" {
+			h.reads.Add(1)
+		}
+		err := next(ctx, cmd)
+		if h.reads.Load() > 0 && (cmd.Name() == "evalsha" || cmd.Name() == "eval") {
+			<-ctx.Done()
+		}
+		return err
+	}
+}
+
+func (*resumeLate) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
 }
 
 // loseTheAnswer has the next answer carrying marker go missing on its way to the
