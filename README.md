@@ -244,6 +244,12 @@ Starting the whatsmeow engine without a database is refused rather than defaulte
 connector with nowhere to keep a pairing asks every session to scan a QR code on every
 restart, and reports itself healthy while doing it.
 
+Give each connector a PostgreSQL database of its own. Its tables go in whichever schema
+the connection's `search_path` resolves to, and whatsmeow's upgrade looks for its version
+table in every schema it can see: a `whatsmeow_version` in a schema that path does not
+reach, whether another connector's or another application's, makes the connector refuse
+to start rather than guess which one is its own.
+
 ### The fleet bench
 
 Leases, epochs, shards, `seq` and fencing are the half of this connector that only two

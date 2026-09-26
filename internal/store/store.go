@@ -171,6 +171,12 @@ func OpenWith(ctx context.Context, address string, owned Ownership, log zerolog.
 		db.SetConnMaxIdleTime(idleConnLifetime)
 	}
 
+	if dialect == dialectPostgres {
+		if err := refuseAnUnreachableVersionTable(ctx, db); err != nil {
+			_ = db.Close()
+			return nil, err
+		}
+	}
 	devices := sqlstore.NewWithDB(db, dialect, nil)
 	if err := devices.Upgrade(ctx); err != nil {
 		_ = db.Close()
@@ -183,6 +189,47 @@ func OpenWith(ctx context.Context, address string, owned Ownership, log zerolog.
 		return nil, err
 	}
 	return c, nil
+}
+
+// whatsmeowVersionTable is the name whatsmeow's sqlstore gives go.mau.fi/util/dbutil for
+// the table it keeps its schema version in.
+const whatsmeowVersionTable = "whatsmeow_version"
+
+// refuseAnUnreachableVersionTable stops a start that whatsmeow's upgrade would end with an
+// error pointing at a table that exists.
+//
+// dbutil decides whether the version table needs creating by asking
+// `information_schema` for it by name alone, with no schema condition, and then reads it
+// by bare name, which resolves through `search_path`. When a schema the path does not
+// reach has one, the first answer is yes and the read fails with `relation
+// "whatsmeow_version" does not exist`. Two connectors with a schema each in one database,
+// a role whose `search_path` was changed, or another application's table of that name
+// all get there, and the upgrade cannot be pointed anywhere else from here.
+//
+// The question asked is the one dbutil asks, through the same view, so a table the role
+// has no privilege on is invisible here exactly as it is to the upgrade: that case
+// creates its own tables and starts, and refusing it would break a working deployment.
+// The upstream half is fenced in internal/engine/whatsmeow/upstream_test.go.
+func refuseAnUnreachableVersionTable(ctx context.Context, db *sql.DB) error {
+	var (
+		schemas    sql.NullString
+		reachable  bool
+		searchPath string
+	)
+	err := db.QueryRowContext(ctx, `SELECT
+		(SELECT string_agg(DISTINCT table_schema, ', ') FROM information_schema.tables WHERE table_name = $1),
+		to_regclass($1) IS NOT NULL,
+		current_setting('search_path')`, whatsmeowVersionTable).Scan(&schemas, &reachable, &searchPath)
+	if err != nil {
+		return fmt.Errorf("store: look for %s: %w", whatsmeowVersionTable, err)
+	}
+	if !schemas.Valid || reachable {
+		return nil
+	}
+	return fmt.Errorf("store: %s is in schema %s, which this connection's search_path (%s) "+
+		"does not reach, and whatsmeow's upgrade would take it for this connector's own and "+
+		"then fail to read it: give the connector a database of its own, or a search_path "+
+		"that includes the schema its tables are in", whatsmeowVersionTable, schemas.String, searchPath)
 }
 
 // idleConnLifetime is how long an unused connection is kept. Long enough that a quiet
