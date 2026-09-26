@@ -124,14 +124,24 @@ func TestARunWithKeepSaysWhatItKeptInItsReport(t *testing.T) {
 		t.Fatalf("the run stopped before it had a report: %v\nstderr:\n%s", err, errOut.String())
 	}
 
+	// Given back by the names the run's own first note prints, which is there whether or not
+	// the -keep line is: -keep is exactly what the run did not do, and a failure here must
+	// not leave a database behind on the server make check shares.
+	own := regexp.MustCompile(`banco desta corrida: (\S+) · prefixo: (\S+) · arquivos: (\S+)`).FindStringSubmatch(out.String())
+	if own == nil {
+		t.Fatalf("the report does not say which database and prefix the run made:\n%s", out.String())
+	}
+	t.Cleanup(func() { giveBack(t, own[1], own[2], own[3]) })
+
 	kept := regexp.MustCompile(`guardado a pedido \(-keep\): banco (\S+), prefixo (\S+), (\S+)`)
 	found := kept.FindAllStringSubmatch(out.String(), -1)
 	if len(found) != 1 {
 		t.Fatalf("the report (outcome %v) carries the -keep line %d times, want once:\n%s", code, len(found), out.String())
 	}
 	database, prefix, dir := found[0][1], found[0][2], found[0][3]
-	// What the line names is given back here, since -keep is exactly what the run did not do.
-	t.Cleanup(func() { giveBack(t, database, prefix, dir) })
+	if database != own[1] || prefix != own[2] || dir != own[3] {
+		t.Errorf("the -keep line names %s, %s, %s, and the run made %s, %s, %s", database, prefix, dir, own[1], own[2], own[3])
+	}
 	if strings.Contains(errOut.String(), "guardado a pedido") {
 		t.Errorf("the -keep line went to stderr as well, so a reader of the whole output sees it twice:\n%s", errOut.String())
 	}
