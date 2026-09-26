@@ -819,7 +819,8 @@ func (c *Connector) sweepPartsOnce(ctx context.Context) bool {
 	// media retention: what these rows cover is a redelivered command, and a command stops
 	// being redelivered when the ledger stops answering for it. Without a sweep the row
 	// count is the number of groups the deployment has ever made.
-	begun, err := c.store.SweepGroupCreations(ctx, time.Now().Add(-groupCreateRetention))
+	now := time.Now()
+	begun, err := c.store.SweepGroupCreations(ctx, now.Add(-groupCreateRetention), now.Add(-groupCreateCeiling))
 	switch {
 	case errors.Is(err, context.Canceled):
 		return true
@@ -835,6 +836,15 @@ func (c *Connector) sweepPartsOnce(ctx context.Context) bool {
 // window, doubled: a record that outlives the redelivery it covers costs a row, and one
 // that does not costs a second group.
 const groupCreateRetention = 2 * redisx.DefaultIdempotencyTTL
+
+// groupCreateCeiling is how long an attempt that never learned which group it made is kept,
+// counted from when it began and however often it is asked about since (#277). The ledger's
+// own window: a creation takes seconds, and the notification that names its group is
+// redelivered as the socket comes back, so an attempt still unnamed a day later is one whose
+// request never went out, and every retry of it was answered `not_settled` for nothing.
+// contract/PROTOCOL.md names this value, and TestTheContractNamesTheGroupCreateCeiling holds
+// the two together.
+const groupCreateCeiling = redisx.DefaultIdempotencyTTL
 
 // reclaimCommands takes over what nobody acknowledged: what another instance read
 // before it was killed, and what this one deliberately left pending when it could not
