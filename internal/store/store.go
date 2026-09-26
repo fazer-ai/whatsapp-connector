@@ -252,14 +252,19 @@ const ownTable = "wac_session_device"
 // connector's tables behind whatsmeow's, which is why both are asked about.
 //
 // Only a table the path does reach is compared: one it does not reach at all is either
-// #278's case, refused above, or a neighbour this connector never reads.
+// #278's case, refused above, or a neighbour this connector never reads. And only one the
+// role holds some privilege on, the filter `information_schema` applies and the reason
+// whatsmeow's upgrade does not see the rest: a role with a schema of its own in front of
+// `public` can see another role's tables there by name, cannot use them, and builds its
+// own store where it creates, which works and is not a split.
 func refuseASplitAcrossSchemas(ctx context.Context, db *sql.DB) error {
 	var (
 		current, searchPath string
 		found               [2]sql.NullString
 	)
 	const schemaOf = `(SELECT n.nspname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-		WHERE c.oid = to_regclass(%s))`
+		WHERE c.oid = to_regclass(%[1]s)
+			AND has_table_privilege(to_regclass(%[1]s), 'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER'))`
 	query := `SELECT COALESCE(current_schema(), ''), current_setting('search_path'), ` +
 		fmt.Sprintf(schemaOf, "$1") + `, ` + fmt.Sprintf(schemaOf, "$2")
 	tables := [2]string{whatsmeowVersionTable, ownTable}

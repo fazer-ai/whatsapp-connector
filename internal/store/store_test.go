@@ -1042,7 +1042,10 @@ func TestAVersionTableTheSearchPathDoesNotReachIsNamedRatherThanMissing(t *testi
 				}
 			}
 		})
-		as, err := url.Parse(through(role))
+		// Its own schema first and `public` behind it, which is the default path for a role
+		// with a schema of its own name: the other tables are then visible by name,
+		// though the role can do nothing with them.
+		as, err := url.Parse(through(role + ",public"))
 		if err != nil {
 			t.Fatalf("parse %s: %v", storetest.AddressEnv, err)
 		}
