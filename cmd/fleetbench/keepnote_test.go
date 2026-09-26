@@ -2,10 +2,16 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"database/sql"
 	"go/ast"
 	"go/token"
+	"os"
+	"regexp"
 	"strings"
 	"testing"
+
+	"github.com/redis/go-redis/v9"
 )
 
 // A run started with -keep says in its report what it left behind, and the report is
@@ -97,4 +103,67 @@ func TestTheKeepNoteGoesOutWithTheReport(t *testing.T) {
 	if got := keptNote(active, ""); !strings.Contains(got, "nenhuma pasta criada") {
 		t.Fatalf("sem pasta, a nota diz %q", got)
 	}
+}
+
+// The run itself, with -keep, reading what it prints (#310): the line naming the database,
+// prefix and directory it kept is in the report, once, and the three exist afterwards.
+//
+// Against the servers `make check` names, and stopped once the connector is built, which is
+// the interrupt path: the report goes out with what the run had got to, and the question is
+// only what that report says. A whole run costs minutes and adds nothing to the answer.
+func TestARunWithKeepSaysWhatItKeptInItsReport(t *testing.T) {
+	if os.Getenv(databaseVar) == "" || os.Getenv(redisVar) == "" {
+		t.Skipf("set %s and %s to run the bench against real servers (see 'make check')", databaseVar, redisVar)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	var out, errOut bytes.Buffer
+	code, err := runBench(ctx, benchIO{out: &out, errOut: &errOut, afterBuild: cancel}, 2, 2, 2, 1, 0, true)
+	if err != nil {
+		t.Fatalf("the run stopped before it had a report: %v\nstderr:\n%s", err, errOut.String())
+	}
+
+	kept := regexp.MustCompile(`guardado a pedido \(-keep\): banco (\S+), prefixo (\S+), (\S+)`)
+	found := kept.FindAllStringSubmatch(out.String(), -1)
+	if len(found) != 1 {
+		t.Fatalf("the report (outcome %v) carries the -keep line %d times, want once:\n%s", code, len(found), out.String())
+	}
+	database, prefix, dir := found[0][1], found[0][2], found[0][3]
+	// What the line names is given back here, since -keep is exactly what the run did not do.
+	t.Cleanup(func() { giveBack(t, database, prefix, dir) })
+	if strings.Contains(errOut.String(), "guardado a pedido") {
+		t.Errorf("the -keep line went to stderr as well, so a reader of the whole output sees it twice:\n%s", errOut.String())
+	}
+	if _, statErr := os.Stat(dir); statErr != nil {
+		t.Errorf("the directory the note names is not there: %v", statErr)
+	}
+	admin, err := sql.Open("postgres", os.Getenv(databaseVar))
+	if err != nil {
+		t.Fatalf("open the server: %v", err)
+	}
+	defer func() { _ = admin.Close() }()
+	var exists bool
+	if err := admin.QueryRowContext(t.Context(),
+		`SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)`, database).Scan(&exists); err != nil {
+		t.Fatalf("look the database up: %v", err)
+	}
+	if !exists {
+		t.Errorf("the database the note names, %s, is not on the server", database)
+	}
+}
+
+// giveBack drops what a run with -keep left, by the names it printed.
+func giveBack(t *testing.T, database, prefix, dir string) {
+	t.Helper()
+	options, err := redis.ParseURL(os.Getenv(redisVar))
+	if err != nil {
+		t.Errorf("give back: parse %s: %v", redisVar, err)
+		return
+	}
+	left := &run{database: database, prefix: prefix, adminURL: os.Getenv(databaseVar), rdb: redis.NewClient(options)}
+	for _, trouble := range left.cleanup(context.Background()) {
+		t.Errorf("give back: %s", trouble)
+	}
+	_ = os.RemoveAll(dir)
 }

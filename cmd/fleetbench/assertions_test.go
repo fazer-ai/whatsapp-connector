@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"strings"
 	"testing"
@@ -1490,7 +1491,8 @@ func TestAWorkloadSizeIsRefusedBeforeTheRunCostsAnything(t *testing.T) {
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			code, err := runBench(tc.sessions, tc.shards, tc.processes, tc.sends, 0, false)
+			code, err := runBench(t.Context(), benchIO{out: io.Discard, errOut: io.Discard},
+				tc.sessions, tc.shards, tc.processes, tc.sends, 0, false)
 			if err == nil {
 				t.Fatalf("a corrida aceitou a combinacao e devolveu %v", code)
 			}
