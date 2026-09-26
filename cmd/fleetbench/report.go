@@ -25,6 +25,10 @@ type report struct {
 	assertions   []*assertion
 	measurements []measurement
 	notes        []string
+
+	// written is whether the report went out, which is what tells the cleanup of a run
+	// started with -keep whether the report already named what it left behind.
+	written bool
 }
 
 // assertion is a claim with a verdict and the size of what it looked at.
@@ -157,6 +161,7 @@ func (o outcome) label() string {
 // printed a second time by the caller, and two `=== SETUP INCOMPLETO ===` headers -- one of
 // them on stderr -- is how a reader of the log counts two failures in one run.
 func (r *report) write(out io.Writer, o outcome, reason error) {
+	r.written = true
 	_, _ = fmt.Fprintf(out, "\n=== bancada de frota · motor %s ===\n", r.engine)
 	_, _ = fmt.Fprintf(out, "binario: %s (sha256 %s)\n", r.binary, r.binarySum)
 	for _, p := range r.processes {

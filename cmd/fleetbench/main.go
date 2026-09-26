@@ -124,7 +124,12 @@ func runBench(sessions, shards, processes, sends int, maxAdoption time.Duration,
 	defer func() {
 		group.shutdown()
 		if keep {
-			rep.note("guardado a pedido (-keep): banco " + active.database + ", prefixo " + active.prefix + ", " + workDir)
+			// The report already says so when it went out. A run that stopped before
+			// printing one -- a connector that would not build, an interrupt before the
+			// directory existed -- has nowhere else to say what it left behind.
+			if !rep.written {
+				_, _ = fmt.Fprintln(os.Stderr, keptNote(active, workDir))
+			}
 			return
 		}
 		for _, trouble := range active.cleanup(context.WithoutCancel(ctx)) {
@@ -148,6 +153,13 @@ func runBench(sessions, shards, processes, sends int, maxAdoption time.Duration,
 	}
 
 	rep.note("banco desta corrida: " + active.database + " · prefixo: " + active.prefix + " · arquivos: " + workDir)
+	// Here, before every path that prints the report, and not in the deferred cleanup: a
+	// note added there lands in a report that has already been printed and is never
+	// printed again, so whoever asked for -keep was not told what to clean up (#310).
+	// TestTheKeepNoteIsTakenBeforeTheReportIsPrinted holds the order.
+	if keep {
+		rep.note(keptNote(active, workDir))
+	}
 
 	binary, sum, err := buildConnector(ctx, moduleDir, workDir)
 	if err != nil {
@@ -214,6 +226,14 @@ func runBench(sessions, shards, processes, sends int, maxAdoption time.Duration,
 	final := rep.outcome()
 	rep.write(os.Stdout, final, nil)
 	return final, nil
+}
+
+// keptNote names what a run started with -keep leaves behind, for whoever cleans it up.
+func keptNote(active *run, workDir string) string {
+	if workDir == "" {
+		workDir = "nenhuma pasta criada"
+	}
+	return "guardado a pedido (-keep): banco " + active.database + ", prefixo " + active.prefix + ", " + workDir
 }
 
 type benchPlan struct {
