@@ -112,7 +112,7 @@ is willing to wait for an answer, not to how long the teardown is allowed to tak
 |---|---|---|
 | `wa:events:<shard>` | connector → client | `event` |
 | `wa:cmd:<sid>` | client → connector | `command` |
-| `wa:control` | client → any connector | `command` (`session.wake`, `admin.ping`, `session.delete`) |
+| `wa:control` | client → any connector | `command` (`session.wake`, `admin.ping`, `session.delete`). A connector also writes a `session.wake` here, putting back one it acknowledged for an account whose owner then gave it back (see `wa:owed-wake:<sid>`) |
 | `wa:reply:<command_id>` (LIST) | connector → client | `reply` |
 
 `seq` is monotonic per `(sid, epoch)` and, together with the per-session shard
@@ -207,11 +207,18 @@ torn down when the entry reaches that connector, which happens but is not bounde
 so the entry is acknowledged and never reaches that owner (see `session.wake` above). The
 exception is an owner that is giving the account back (`wa:handback:<sid>` below): there
 the wake is left pending, because once the account is unowned it is the wake that starts it
-again. Nothing in the protocol asks an owner to
-give a session up **on demand**: a `wa:handoff:<sid>` key was declared for that once and
-removed here, having never had anything behind it. An owner giving a session up **of its
-own accord** is a different thing and does exist -- it is `wa:handback:<sid>` in the table
-below, and it is the reason a wake can meet an account that is owned and on its way to
+again. An owner can decide to give an account back a moment before it writes that mark, and
+a wake read in between is acknowledged like any other; so the connector that acknowledged
+it leaves it owed to the owner (`wa:owed-wake:<sid>` below), and if the owner then lets the
+account go, the release puts a `session.wake` for it back on `wa:control`, with the same
+payload and an `id` of its own. A client can therefore see a `session.wake` on `wa:control`
+that it did not write. Nothing is put back by an owner that keeps the account, by one that
+deleted it, or for an account the fleet is leaving alone after failed attempts: that one is
+brought back by the connector when its wait is over, as it would have been without the wake.
+Nothing in the protocol asks an owner to give a session up **on demand**: a
+`wa:handoff:<sid>` key was declared for that once and removed here, having never had
+anything behind it. An owner giving a session up **of its own accord** is a different thing
+and does exist -- it is `wa:handback:<sid>` in the table below, and it is the reason a wake can meet an account that is owned and on its way to
 being unowned.
 
 Around those four keys sit the ones that decide who reads and who writes. They are not
@@ -222,6 +229,7 @@ frames, but both sides have to agree on them, so they are part of the contract:
 | `wa:meta` | HASH | connector | `protocol_min`, `protocol_max`, `event_shards`; a connector whose `event_shards` disagrees refuses to start |
 | `wa:instances`, `wa:instance:<inst>` | SET, HASH (PX 15s) | connector | live instances and what they advertise: `version`, `protocol_min`, `protocol_max`, `advertise_url`, `media_token` |
 | `wa:handback:<sid>` | STRING (PX 30s, not renewed) | connector | the instance that holds a session's lease and has started giving it up. Written before the release, compared against the lease holder by the acquire, cleared by the release, and left to expire when the release never lands. A `session.wake` that arrives in that window is left pending rather than acknowledged, so a client can see up to one lease TTL of silence before the account is picked up |
+| `wa:owed-wake:<sid>` | HASH (PX 30s, not renewed) | connector | a `session.wake` acknowledged for an account some instance owns: `holder` names that instance, and the other fields are the wake to put back. The holder's release writes them to `wa:control` in the same step and deletes the key; a holder that keeps the account lets it expire. The release of an account its holder deleted drops it instead |
 | `wa:lease:<sid>` | STRING (PX 30s, renewed) | connector | which instance owns a session. It expires on its own, which is what lets an account whose owner died be taken over |
 | `wa:lease-epoch:<sid>` | STRING (**no expiry**) | connector | the epoch that owner holds the session under, incremented on every acquisition. It must outlive every disconnection, logout and re-pairing of the account, and only a `session.delete` removes it |
 | `wa:idem:<sid>:<key>` | STRING | connector | command idempotency (`msg:<message_id>` for sends) |
