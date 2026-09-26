@@ -1298,13 +1298,14 @@ func TestAWakeReadBeforeADeleteIsNotPutBackAfterIt(t *testing.T) {
 	if got := dispatchWake(t, peer, sid, "c-wake-after-delete"); got != "acked" {
 		t.Fatalf("a wake read between the delete and the release ended %s, want acked", got)
 	}
-	for range 3 {
+	// Swept until the account is gone rather than a fixed number of times. The delete is
+	// acknowledged before the session reads as retired, which waits on the pump publishing
+	// the engine's last word, and a sweep that runs first finds nothing to hand back.
+	waitFor(t, func() bool {
 		holder.RenewAll(ctx, time.Now().Add(time.Minute))
 		holder.SweepRetired(ctx, time.Now().Add(time.Minute))
-	}
-	if holder.Count() != 0 {
-		t.Fatalf("given: the deleted account is still running here: %d", holder.Count())
-	}
+		return holder.Count() == 0
+	}, "the deleted account was never handed back")
 	if woken := controlWakes(t, rdb); len(woken) != 0 {
 		t.Fatalf("the release after the delete put %d wakes back, so a peer adopts an account that no longer exists", len(woken))
 	}
