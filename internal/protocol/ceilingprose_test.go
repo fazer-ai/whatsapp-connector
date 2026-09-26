@@ -256,16 +256,33 @@ func TestTheContractSaysWhatBoundsACommandWithNoCeilingOfItsOwn(t *testing.T) {
 			"a client branches on the code, and this is the one it gets"},
 		{"that resending is allowed", "may resend",
 			"the whole point of the paragraph is what to do next"},
-		{"that the identifier is not what makes it safe", "the identifier is not what makes that safe",
-			"review round 1 caught this promising more than it delivers: a failed first " +
-				"attempt leaves no record, so the same key answers nothing and the work runs again"},
-		{"why a failed attempt leaves nothing", "records only what succeeded",
-			"it is the reason the same key answers nothing, and without it the paragraph " +
-				"asserts the conclusion without the fact under it"},
+		{"that what the identifier buys is not the same for every command", "depends on which command it is",
+			"review round 1 caught the lead promising more than it delivered, and #282 made it " +
+				"conditional: a resend still forces the work for most commands and no longer " +
+				"does for the ones that set a value, and a client that reads one rule gets the " +
+				"other wrong half the time"},
+		{"that some commands are written down before they run", "also writes down that the command is about to run",
+			"it is the mechanism every conclusion below rests on, and without it the paragraph " +
+				"asserts that a resend is answered with nothing under it"},
+		{"that a resend of an attempt nobody can speak for is refused", "answered `timeout` again rather than run a second time",
+			"it is the obligation this half of the contract exists to put on a client, and the " +
+				"one thing about #282 a client has to change its behaviour for: the same key " +
+				"stops being a way to force the work to happen"},
+		{"which failures still leave no record", "left nothing standing there",
+			"without it the paragraph above reads as every failure being unrepeatable, which " +
+				"would strand a send whose upload crashed before anything went out"},
+		{"that it is the write, not the failure's wording, that holds the key",
+			"Only a write that may have reached WhatsApp holds the key",
+			"it is the rule the connector actually implements: the attempt is released " +
+				"unless the write it failed on may have landed, and a client that reads the " +
+				"exception list instead of the rule will expect a retry to run wherever the " +
+				"listed cases do not obviously apply"},
 		{"what the identifier does buy", "after the first attempt *succeeded*",
 			"the narrow thing it is actually good for, which is a redelivery after a success"},
-		{"the mutation that is not covered", "rotates the link",
-			"a named example, because `may already have happened` reads as hypothetical"},
+		{"which commands those are", "a participant added or removed, a join request answered",
+			"the class has to be named rather than described, because a client cannot tell " +
+				"from `sets a value` which of its commands are in it; the list is compared " +
+				"against the table in the code by TestTheContractNamesEveryCommandItReserves"},
 		{"reading the state back", "reads the state back before resending",
 			"it is the only thing a client can actually do about it"},
 		{"what a client can actually do about that one", "its own timeout on the reply",

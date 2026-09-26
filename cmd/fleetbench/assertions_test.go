@@ -513,10 +513,10 @@ func TestTheIdempotencySeriesCountsWhatItSays(t *testing.T) {
 			contains: []string{"foi respondido com sucesso 2 vezes"},
 		},
 		"uma falha e depois um sucesso diferente e reentrega, nao duplicacao": {
-			// MEASURED in the connector: the ledger remembers successes and nothing else
-			// (internal/session/session.go, "Only a success is remembered"). So the second
-			// attempt runs for real and answers differently, by design: the first left no
-			// side effect to duplicate.
+			// MEASURED in the connector: the ledger remembers a success as the answer and
+			// never a failure (internal/session/session.go). So the second attempt either runs
+			// for real or, for a reserved command whose write may have landed, is answered
+			// `timeout` (#282); either way it answers differently, by design.
 			answers:  map[string][]string{"c1": {failed, ok("a")}},
 			state:    "AFIRMADO",
 			contains: []string{"1 com alguma tentativa que falhou antes"},

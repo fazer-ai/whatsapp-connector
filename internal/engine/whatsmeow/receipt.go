@@ -11,6 +11,7 @@ import (
 	waTypes "go.mau.fi/whatsmeow/types"
 	waEvents "go.mau.fi/whatsmeow/types/events"
 
+	"github.com/fazer-ai/whatsapp-connector/internal/engine"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 )
 
@@ -308,7 +309,12 @@ func (s *Session) markRead(ctx context.Context, command *protocol.Command) (json
 
 	if err := s.current().MarkRead(ctx, req.MessageIDs, time.Now(), chat, sender, kind); err != nil {
 		s.log.Warn().Err(err).Str("chat", chat.String()).Msg("a read mark did not go out")
-		return nil, markFailure(err, "WhatsApp did not take the read mark")
+		// The write is out of this process by the time this can fail, so the mark may be on
+		// WhatsApp already and a redelivery must not set it again over a chat the user has
+		// since marked unread (#282). Everything above this line -- the privacy setting
+		// that could not be read, the address that would not resolve -- reached nothing and
+		// is deliberately left unmarked.
+		return nil, keepMark(engine.MayHaveLanded(err), markFailure(err, "WhatsApp did not take the read mark"))
 	}
 	return nil, nil
 }
@@ -316,6 +322,52 @@ func (s *Session) markRead(ctx context.Context, command *protocol.Command) (json
 func (s *Session) privacyOverSocket(ctx context.Context) error {
 	_, err := s.current().TryFetchPrivacySettings(ctx, false)
 	return err
+}
+
+// keepMark carries the mark a write site put on raw across the classification that turned
+// raw into the contract's words: every classifier here builds a fresh protocol error, and
+// one that dropped the mark would release the attempt the command reserved, so a redelivery
+// carries the write out a second time (#282).
+//
+// Only for a failure that is unanswered: the write went out and nothing came back to say
+// what became of it. Entering the library call is not evidence of a write --
+// `sendNodeAndGetData` answers ErrNotConnected when the socket went away after readyToSend
+// looked, and a missing push name is refused before any node is built -- and a refusal is
+// an answer: an IQ error or a rejected patch says the change did not happen. A mark on
+// either would keep the attempt standing for a command whose outcome is known, answering
+// `timeout` to every retry for a day. Listed by what is ambiguous rather than by what is
+// not, for the reason engine.ErrMayHaveLanded gives: a failure nobody listed here costs a
+// redelivery that carries the work out again, and the opposite default costs a command that
+// can never run again under its key.
+func keepMark(raw, classified error) error {
+	if errors.Is(raw, engine.ErrMayHaveLanded) && noAnswer(raw) {
+		return engine.MayHaveLanded(classified)
+	}
+	return classified
+}
+
+// noAnswer is the two failures whatsmeow only returns once the frame is out: the socket
+// went before the answer, and the answer did not come within the query's own timeout. Any
+// DisconnectedError rather than ErrIQDisconnected, because whatsmeow's retry after a
+// reconnect names its action "info query (retry)" and that Is does not match it.
+//
+// Not the command's deadline, although it is the commonest way to stop waiting. A context
+// error comes back as the same bare ctx.Err() whether it ended the wait for an answer or a
+// store read the library does before it builds the node -- SendAppState reads the app state
+// version and keys and encodes the patch on the caller's context first -- and a mark on the
+// second is a command that never went out answering `timeout` for a day. So a deadline costs
+// a redelivery that carries the write out again, which is what it cost before #282.
+//
+// A rejected patch wins over both. On a 409 whatsmeow fetches the conflicting patches before
+// it would try again, and a download that times out or loses the socket there comes back
+// wrapping ErrAppStateUpdate together with the timeout: WhatsApp refused the write, and the
+// retry never went out.
+func noAnswer(err error) bool {
+	if errors.Is(err, wm.ErrAppStateUpdate) {
+		return false
+	}
+	var disconnected *wm.DisconnectedError
+	return errors.As(err, &disconnected) || errors.Is(err, wm.ErrIQTimedOut)
 }
 
 // markFailure names what went wrong in the contract's own words.

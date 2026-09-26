@@ -206,14 +206,31 @@ func (l *ledger) refusal() error {
 	return l.err
 }
 
-func (l *ledger) Recall(ctx context.Context, sid, key string) (json.RawMessage, bool, error) {
+func (l *ledger) Recall(ctx context.Context, sid, key string) (result json.RawMessage, done, attempted bool, err error) {
 	if err := l.refusal(); err != nil {
-		return nil, false, err
+		return nil, false, false, err
 	}
 	return l.inner.Recall(ctx, sid, key)
 }
 
-func (l *ledger) Remember(ctx context.Context, sid, key string, result json.RawMessage) error {
+// Reserve and Release count as writes and are refused alongside Remember: whatever turns
+// one of the three away turns all three away, because they are the same Redis.
+func (l *ledger) Reserve(ctx context.Context, sid, key string) error {
+	if err := l.beforeWriting(); err != nil {
+		return err
+	}
+	return l.inner.Reserve(ctx, sid, key)
+}
+
+func (l *ledger) Release(ctx context.Context, sid, key string) error {
+	if err := l.beforeWriting(); err != nil {
+		return err
+	}
+	return l.inner.Release(ctx, sid, key)
+}
+
+// beforeWriting is the counting and the refusing the three writes share.
+func (l *ledger) beforeWriting() error {
 	l.mu.Lock()
 	l.writes++
 	refusing := l.refuseWrites > 0
@@ -228,6 +245,13 @@ func (l *ledger) Remember(ctx context.Context, sid, key string, result json.RawM
 		return err
 	case refusing:
 		return errors.New("redis refused the write")
+	}
+	return nil
+}
+
+func (l *ledger) Remember(ctx context.Context, sid, key string, result json.RawMessage) error {
+	if err := l.beforeWriting(); err != nil {
+		return err
 	}
 	return l.inner.Remember(ctx, sid, key, result)
 }
