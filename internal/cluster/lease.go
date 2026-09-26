@@ -291,7 +291,8 @@ func (l *Leases) Acquire(ctx context.Context, sid string) (Lease, error) {
 	l.mu.Lock()
 	l.held[sid] = held{epoch: uint64(epoch), renewedAt: sent} //nolint:gosec // INCR from 0 never returns a negative
 	// An account acquired again is one paired again, or never deleted after all: its
-	// release is an ordinary one.
+	// release is an ordinary one. Here and not only in Release, because a lease lost to
+	// its TTL is never released by this instance.
 	delete(l.deleted, sid)
 	l.mu.Unlock()
 
@@ -540,18 +541,17 @@ func (l *Leases) Release(ctx context.Context, sid string) (bool, error) {
 }
 
 // releaseDeletedScript is releaseScript for an account this instance deleted: the lease and
-// the mark go the same way, and a wake owed to this instance is dropped instead of put back,
-// since the account it asked for no longer exists. Same arguments as the ordinary release,
-// so everything that recognises a release by its shape recognises this one.
+// the mark go the same way, and an owed wake is dropped instead of put back, whoever it was
+// left for, since the account it asked for no longer exists. Same arguments as the
+// ordinary release, so everything that recognises a release by its shape recognises this
+// one.
 var releaseDeletedScript = redis.NewScript(`
 if redis.call("GET", KEYS[1]) ~= ARGV[1] then
   return 0
 end
 redis.call("DEL", KEYS[1])
 redis.call("DEL", KEYS[2])
-if redis.call("HGET", KEYS[3], "holder") == ARGV[1] then
-  redis.call("DEL", KEYS[3])
-end
+redis.call("DEL", KEYS[3])
 return 1
 `)
 

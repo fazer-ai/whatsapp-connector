@@ -240,6 +240,30 @@ func TestADeletedAccountPutsNoWakeBack(t *testing.T) {
 					if n, _ := rdb.XLen(ctx, keys.Control()).Result(); n != 1 {
 						t.Fatalf("the release of an account acquired again after a delete put %d wakes back, want the one owed", n)
 					}
+
+					// A delete whose lease then ran out, with no release here, and the
+					// account acquired again: an ordinary account from then on.
+					if _, err := holder.Acquire(ctx, "s2"); err != nil {
+						t.Fatalf("given: %v", err)
+					}
+					if err := holder.ForgetEpoch(ctx, "s2"); err != nil {
+						t.Fatalf("given: %v", err)
+					}
+					if err := rdb.Del(ctx, keys.Lease("s2")).Err(); err != nil {
+						t.Fatalf("given: the lease runs out: %v", err)
+					}
+					if _, err := holder.Acquire(ctx, "s2"); err != nil {
+						t.Fatalf("acquire after the lease ran out: %v", err)
+					}
+					if owed, err := peer.OweWake(ctx, "s2", aWake); err != nil || owed != cluster.OwedToHolder {
+						t.Fatalf("given: %v %v", owed, err)
+					}
+					if _, err := holder.Release(ctx, "s2"); err != nil {
+						t.Fatalf("release s2: %v", err)
+					}
+					if n, _ := rdb.XLen(ctx, keys.Control()).Result(); n != 2 {
+						t.Fatalf("an account acquired again after a delete whose lease ran out put back %d wakes in all, want 2", n)
+					}
 				})
 			}
 		})
