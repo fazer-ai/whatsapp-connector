@@ -1045,6 +1045,13 @@ type heldPublisher struct {
 	// could not complete it.
 	fails error
 
+	// lingers is an event type kept inside Publish after it is recorded, until lingering
+	// is closed: the publish has landed and the pump has not got its answer yet. recorded
+	// is told when it gets there. Nil for a publisher that does not linger.
+	lingers   protocol.EventType
+	recorded  chan struct{}
+	lingering chan struct{}
+
 	mu     sync.Mutex
 	events []protocol.EventType
 }
@@ -1060,6 +1067,10 @@ func (p *heldPublisher) Publish(_ context.Context, event *protocol.Event) error 
 	p.mu.Lock()
 	p.events = append(p.events, event.Type)
 	p.mu.Unlock()
+	if p.lingering != nil && event.Type == p.lingers {
+		p.recorded <- struct{}{}
+		<-p.lingering
+	}
 	return nil
 }
 
@@ -1077,6 +1088,13 @@ func (p *heldPublisher) published() []protocol.EventType {
 // queueing its last word and the pump taking it -- a gap as long as whatever the pump is
 // publishing -- a connect can run and put the socket back up, and handing the account
 // over on an answer about the attempt before that one tears down a retry that worked.
+//
+// The door is shut while the last word goes out, whatever came before it, and opened
+// again only once the pump has its answer. So the test waits on the door and not on the
+// publish: the event is on the stream a moment before the door opens, and a command
+// offered in that moment is refused by a session that is working as it should (#308). The
+// publisher lingers there to make the moment one the test holds rather than one the
+// scheduler sometimes gives it.
 func TestAConnectThatWorkedCancelsAnOutcomeQueuedBeforeIt(t *testing.T) {
 	t.Parallel()
 
@@ -1087,9 +1105,12 @@ func TestAConnectThatWorkedCancelsAnOutcomeQueuedBeforeIt(t *testing.T) {
 
 	engines := fake.New()
 	publisher := &heldPublisher{
-		holds:   protocol.EventSessionState,
-		entered: make(chan protocol.EventType, 8),
-		let:     make(chan struct{}),
+		holds:     protocol.EventSessionState,
+		entered:   make(chan protocol.EventType, 8),
+		let:       make(chan struct{}),
+		lingers:   protocol.EventSessionConnectFailure,
+		recorded:  make(chan struct{}, 1),
+		lingering: make(chan struct{}),
 	}
 	manager := NewManager(&ManagerConfig{
 		Instance: "inst-a", Engine: engines,
@@ -1101,6 +1122,9 @@ func TestAConnectThatWorkedCancelsAnOutcomeQueuedBeforeIt(t *testing.T) {
 	// publish still being held is a pump that never stops.
 	t.Cleanup(func() { manager.StopAll(context.Background()) })
 	t.Cleanup(publisher.release)
+	var stopLingering sync.Once
+	letGo := func() { stopLingering.Do(func() { close(publisher.lingering) }) }
+	t.Cleanup(letGo)
 
 	const sid = "9c2b7d1e-0000-4000-8000-0000000000b5"
 	session, err := manager.Adopt(context.Background(), sid)
@@ -1123,7 +1147,19 @@ func TestAConnectThatWorkedCancelsAnOutcomeQueuedBeforeIt(t *testing.T) {
 	}
 	publisher.release()
 
-	waitFor(t, func() bool { return len(publisher.published()) >= 2 }, "the queued outcome was never published")
+	// The queued outcome is on the stream and the pump has not heard back: the door is
+	// shut for it, which is the moment the assertion below used to land in.
+	select {
+	case <-publisher.recorded:
+	case <-time.After(testwait.Budget):
+		t.Fatal("the queued outcome was never published")
+	}
+	if !session.leaving() {
+		t.Fatal("the door was open while the engine's last word was going out")
+	}
+	letGo()
+
+	waitFor(t, func() bool { return !session.leaving() }, "the door never opened again after a retry that worked")
 	if session.Retired() {
 		t.Fatal("a connect that worked was undone by an outcome the engine had already given up on")
 	}
