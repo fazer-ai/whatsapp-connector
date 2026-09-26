@@ -598,6 +598,7 @@ if redis.call("GET", KEYS[1]) ~= ARGV[1] then
   return 0
 end
 redis.call("DEL", KEYS[2])
+redis.call("DEL", KEYS[3])
 return 1
 `)
 
@@ -616,10 +617,14 @@ return 1
 // itself is gone. The credentials are deleted, the mapping with them, and there is no
 // inbox on the other side left for anybody's late event to corrupt. An account paired
 // again is a new one, and a count starting over is the truth about it.
+//
+// A wake a peer left owed to this instance goes with it (#259): it asked for the account
+// deleted here, and the release that follows a teardown would otherwise put it back on the
+// control stream and have a peer adopt an account that no longer exists.
 func (l *Leases) ForgetEpoch(ctx context.Context, sid string) error {
 	keys := l.client.Keys()
 	held, err := forgetEpochScript.Run(
-		ctx, l.client, []string{keys.Lease(sid), keys.LeaseEpoch(sid)}, l.instance,
+		ctx, l.client, []string{keys.Lease(sid), keys.LeaseEpoch(sid), keys.OwedWake(sid)}, l.instance,
 	).Int()
 	if err != nil {
 		return fmt.Errorf("cluster: forget the epoch of %s: %w", sid, err)

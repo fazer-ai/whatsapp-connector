@@ -1198,3 +1198,47 @@ func TestAWakeThatCannotBeOwedIsLeftPending(t *testing.T) {
 		}
 	}
 }
+
+// A wake a peer read before the account was deleted is not put back once it is (#259): the
+// teardown forgets it with the epoch, and the release after the teardown puts nothing on
+// the control stream, so no peer adopts an account that no longer exists.
+func TestAWakeReadBeforeADeleteIsNotPutBackAfterIt(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+	ctx := context.Background()
+	holder, peer := twoOverOneRedis(t, client)
+
+	const sid = "sess-deleted-peerwake"
+	if _, err := holder.Adopt(ctx, sid); err != nil {
+		t.Fatalf("given: Adopt: %v", err)
+	}
+	if got := dispatchWake(t, peer, sid, "c-wake-before-delete"); got != "acked" {
+		t.Fatalf("given: the wake ended %s", got)
+	}
+
+	acked := make(chan struct{})
+	holder.Dispatch(&transport.Delivery{
+		Command: protocol.Command{V: protocol.Version, Type: protocol.CommandSessionDelete, SID: sid, ID: "c-delete"},
+		Ack:     func(context.Context) error { close(acked); return nil },
+		Release: func() {}, Forfeit: func() {},
+	})
+	select {
+	case <-acked:
+	case <-time.After(testwait.Budget):
+		t.Fatal("the delete was never acknowledged")
+	}
+	for range 3 {
+		holder.RenewAll(ctx, time.Now().Add(time.Minute))
+		holder.SweepRetired(ctx, time.Now().Add(time.Minute))
+	}
+	if holder.Count() != 0 {
+		t.Fatalf("given: the deleted account is still running here: %d", holder.Count())
+	}
+	if woken := controlWakes(t, rdb); len(woken) != 0 {
+		t.Fatalf("the release after the delete put %d wakes back, so a peer adopts an account that no longer exists", len(woken))
+	}
+}
