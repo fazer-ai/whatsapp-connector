@@ -4,13 +4,15 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
-	"io/fs"
+	"go/types"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"testing"
+
+	"golang.org/x/tools/go/packages"
 )
 
 // Four of the key constructors render a name this connector never has to render, and
@@ -152,62 +154,83 @@ func readKeyConstructors(t *testing.T) (catalog map[string]bool, calls map[strin
 
 // keysNamedByProductionCode reports which constructors this build calls, and where.
 //
-// A call counts when the receiver is a key set: the value is spelled `keys` where it is
-// held in a field or a variable, and `<something>.Keys()` where it is asked of the client.
-// Matching on the method name alone would count `manager.Resume(sid)` as a use of
-// `Keys.Resume` and report a key as written when nothing writes it, which is the exact
-// lie this test exists to catch. A third spelling fails the test rather than passing it
-// silently: the constructor reads as unnamed, and the message says to teach this.
+// A call counts when its receiver is a `redisx.Keys`, whatever the value is called: the
+// packages are type-checked and the selection is asked for the type it was made on. It
+// used to match the spelling instead -- `keys`, `.keys`, a `Keys()` call -- and a
+// parameter named `k` made a use invisible in both directions (#299): a constructor the
+// client renders could be rendered here without a word, and one used only through `k`
+// read as unused, with the test advising to delete it. Matching the method name alone
+// is no better: `manager.Resume(sid)` would count as a use of `Keys.Resume`.
+//
+// A file the default build leaves out, behind a build constraint, cannot be type-checked
+// with the rest, and it is not left out of this silently: any call in it to a method that
+// shares a constructor's name fails the test, naming the file, so whoever wrote it decides.
 func keysNamedByProductionCode(t *testing.T, catalog map[string]bool) map[string]string {
 	t.Helper()
 
-	named := map[string]string{}
-	root := filepath.Join("..", "..")
-	fileSet := token.NewFileSet()
-	walk := func(path string, entry fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		where, _ := filepath.Rel(root, path)
-		switch {
-		case entry.IsDir():
-			return nil
-		case !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go"):
-			return nil
-		case filepath.Base(path) == "keys.go":
-			// The declarations themselves, where every constructor is named.
-			return nil
-		case strings.HasPrefix(filepath.ToSlash(where), clientSide+"/"):
-			// The fleet bench stands where a client stands: it sends commands, names its
-			// own reply list, and reads the event shards from outside. Counting it as
-			// this connector's production code would make `Reply` look like a name this
-			// side renders, and the marked group above is exactly the list of names it
-			// does not. The names it uses are still held to something -- the connector
-			// refuses a `reply_to` that IsReply does not accept -- just not to this.
-			return nil
-		}
-
-		file, parseErr := parser.ParseFile(fileSet, path, nil, 0)
-		if parseErr != nil {
-			return parseErr
-		}
-		ast.Inspect(file, func(node ast.Node) bool {
-			call, ok := node.(*ast.CallExpr)
-			if !ok {
-				return true
-			}
-			selector, ok := call.Fun.(*ast.SelectorExpr)
-			if !ok || !catalog[selector.Sel.Name] || !isKeySet(selector.X) {
-				return true
-			}
-			named[selector.Sel.Name] = where
-			return true
-		})
-		return nil
+	root, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatalf("locate the module: %v", err)
 	}
-	for _, dir := range []string{"internal", "cmd"} {
-		if err := filepath.WalkDir(filepath.Join(root, dir), walk); err != nil {
-			t.Fatalf("read the packages that name keys: %v", err)
+	config := &packages.Config{
+		Context: t.Context(),
+		Mode: packages.NeedName | packages.NeedFiles | packages.NeedSyntax |
+			packages.NeedTypes | packages.NeedTypesInfo,
+		Dir: root,
+	}
+	loaded, err := packages.Load(config, "./internal/...", "./cmd/...")
+	if err != nil {
+		t.Fatalf("load the packages that name keys: %v", err)
+	}
+
+	named := map[string]string{}
+	fileSet := token.NewFileSet()
+	for _, pkg := range loaded {
+		if len(pkg.Errors) > 0 {
+			t.Fatalf("type-check %s: %v", pkg.PkgPath, pkg.Errors[0])
+		}
+		for _, file := range pkg.Syntax {
+			where := relative(t, root, pkg.Fset.Position(file.Pos()).Filename)
+			if skipsProduction(where) {
+				continue
+			}
+			ast.Inspect(file, func(node ast.Node) bool {
+				call, ok := node.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				selector, ok := call.Fun.(*ast.SelectorExpr)
+				if !ok || !catalog[selector.Sel.Name] {
+					return true
+				}
+				if selection := pkg.TypesInfo.Selections[selector]; selection != nil && isKeysType(selection.Recv()) {
+					named[selector.Sel.Name] = where
+				}
+				return true
+			})
+		}
+		for _, path := range pkg.IgnoredFiles {
+			where := relative(t, root, path)
+			if skipsProduction(where) {
+				continue
+			}
+			file, parseErr := parser.ParseFile(fileSet, path, nil, 0)
+			if parseErr != nil {
+				t.Fatalf("parse %s: %v", where, parseErr)
+			}
+			ast.Inspect(file, func(node ast.Node) bool {
+				call, ok := node.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				if selector, ok := call.Fun.(*ast.SelectorExpr); ok && catalog[selector.Sel.Name] {
+					t.Errorf("%s is left out of the default build and calls %s, which is the name of a key "+
+						"constructor: this test cannot type-check it to tell whether it is one. Move the call into a "+
+						"file the default build compiles, or teach this test to load that build",
+						where, selector.Sel.Name)
+				}
+				return true
+			})
 		}
 	}
 	if len(named) == 0 {
@@ -216,23 +239,47 @@ func keysNamedByProductionCode(t *testing.T, catalog map[string]bool) map[string
 	return named
 }
 
-// isKeySet reports whether an expression is a key set: `keys`, anything ending in
-// `.keys`, or a call to a `Keys()` accessor.
-func isKeySet(expr ast.Expr) bool {
-	switch found := expr.(type) {
-	case *ast.Ident:
-		return found.Name == "keys"
-	case *ast.SelectorExpr:
-		return found.Sel.Name == "keys"
-	case *ast.CallExpr:
-		switch fn := found.Fun.(type) {
-		case *ast.Ident:
-			return fn.Name == "Keys"
-		case *ast.SelectorExpr:
-			return fn.Sel.Name == "Keys"
-		}
+// skipsProduction says whether a file is left out of what this test reads.
+func skipsProduction(where string) bool {
+	switch {
+	case !strings.HasSuffix(where, ".go") || strings.HasSuffix(where, "_test.go"):
+		return true
+	case where == "internal/redisx/keys.go":
+		// The declarations themselves, where every constructor is named.
+		return true
+	case strings.HasPrefix(where, clientSide+"/"):
+		// The fleet bench stands where a client stands: it sends commands, names its
+		// own reply list, and reads the event shards from outside. Counting it as this
+		// connector's production code would make `Reply` look like a name this side
+		// renders, and the marked group above is exactly the list of names it does not.
+		// The names it uses are still held to something -- the connector refuses a
+		// `reply_to` that IsReply does not accept -- just not to this.
+		return true
 	}
 	return false
+}
+
+// isKeysType reports whether a receiver is this package's Keys, by value or by pointer.
+func isKeysType(receiver types.Type) bool {
+	if pointer, ok := receiver.(*types.Pointer); ok {
+		receiver = pointer.Elem()
+	}
+	named, ok := receiver.(*types.Named)
+	if !ok {
+		return false
+	}
+	object := named.Obj()
+	return object.Name() == "Keys" && object.Pkg() != nil &&
+		object.Pkg().Path() == "github.com/fazer-ai/whatsapp-connector/internal/redisx"
+}
+
+func relative(t *testing.T, root, path string) string {
+	t.Helper()
+	where, err := filepath.Rel(root, path)
+	if err != nil {
+		t.Fatalf("place %s in the module: %v", path, err)
+	}
+	return filepath.ToSlash(where)
 }
 
 func receiverTypeName(recv *ast.FieldList) string {
