@@ -187,9 +187,19 @@ that is where the warning belongs.
 Requirements: Go (version in `go.mod`) and
 [golangci-lint](https://golangci-lint.run/) v2. Most tests bring their own doubles
 (`miniredis`, SQLite), and two passes do not: the suite against a real PostgreSQL, which
-is the dialect a deployment runs, and the transport against a real Redis, for the stream
-counters miniredis answers zero for. `make check` runs all of it and needs both servers;
-`make check-offline` is the half that needs nothing listening.
+is the dialect a deployment runs, and the packages that talk to Redis against a real one,
+for what miniredis answers differently from a server. `make check` runs all of it and
+needs both servers; `make check-offline` is the half that needs nothing listening.
+
+CI runs the Redis pass twice: against `redis:8`, and against `redis:6.2`, the oldest
+version this connector supports, because a command form newer than the floor passes
+against the newest server and miniredis alike. `make check` asks for one Redis and does
+not run the floor pass. To run it locally, point `WAC_TEST_REDIS_URL` at a 6.2:
+
+```bash
+docker run -d --rm -p 56362:6379 redis:6.2-alpine
+WAC_TEST_REDIS_URL=redis://localhost:56362/0 make test-redis
+```
 
 ```bash
 make setup          # git hooks + module download
@@ -287,7 +297,7 @@ The exemption is recorded in `internal/toolchain`, where the suite reads it.
 
 | Variable | Default | What it is |
 |---|---|---|
-| `REDIS_URL` | `redis://127.0.0.1:6379` | The Redis shared with the client. Deliberately not `WAC_`-prefixed: both sides read the same variable, so they cannot be pointed at different servers |
+| `REDIS_URL` | `redis://127.0.0.1:6379` | The Redis shared with the client, 6.2 or newer (see below). Deliberately not `WAC_`-prefixed: both sides read the same variable, so they cannot be pointed at different servers |
 | `REDIS_PASSWORD` | — | Overrides the password in the URL, for deployments that pass the two separately |
 | `WAC_INSTANCE` | the hostname | This instance's id. In a container the hostname is the container id, which is unique per replica |
 | `WAC_REDIS_PREFIX` | `wa:` | Namespaces every key, so one Redis can host two independent fleets |
@@ -310,6 +320,19 @@ The exemption is recorded in `internal/toolchain`, where the suite reads it.
 | `WAC_HEARTBEAT` | `5s` | How often leases are renewed and the instance re-announces. Also bounds how long a read waits on Redis (half a heartbeat), and has to leave room for the read and the batch before it: `1.5 × heartbeat + lease/3 < lease` |
 | `WAC_CLAIM_MIN_IDLE` | `1.5 × lease` | How long a command sits unacknowledged before another instance takes it over. Must exceed `WAC_LEASE_TTL` |
 | `WAC_LOG_LEVEL` | `info` | zerolog level |
+
+### Which Redis
+
+Redis 6.2 or newer. `XAUTOCLAIM`, which the transport reclaims unanswered commands with,
+arrived in 6.2, so that is the floor. The connector asks the server its version with
+`HELLO` when it starts and refuses to start below 6.2, or when the server does not say
+which version it runs, naming both. It does that before it writes anything to Redis, so a
+refused instance leaves no trace in the fleet. A server that speaks the Redis protocol
+under another name, such as Valkey, is held to the version it reports.
+
+Two things need 7.0 and are absent on 6.2, where the server does not report the counters
+they read: the warning when a `MAXLEN` trim cut commands nobody was handed, and
+`wac_stream_lag`, which on 6.2 reads 0 for every group whatever the backlog (#320).
 
 ### The one key that never expires
 

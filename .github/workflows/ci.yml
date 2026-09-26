@@ -79,6 +79,19 @@ jobs:
           --health-timeout 5s
           --health-retries 10
 
+      # The oldest Redis README.md supports. The newest is the server least likely to refuse
+      # anything, so a pass against it alone says nothing about the floor: `SET NX GET` is a
+      # syntax error before 7.0 and passed both miniredis and the service above (#279).
+      redis-floor:
+        image: redis:6.2-alpine
+        ports:
+          - 6380:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
     steps:
       - uses: actions/checkout@v7
 
@@ -108,6 +121,12 @@ jobs:
       - name: Run the passes that need a real Redis
         env:
           WAC_TEST_REDIS_URL: redis://localhost:6379/15
+        run: make test-redis
+
+      # The same passes against the floor, where a command form newer than it fails.
+      - name: Run the passes that need a real Redis, against the oldest supported
+        env:
+          WAC_TEST_REDIS_URL: redis://localhost:6380/15
         run: make test-redis
 
       - name: Upload coverage
