@@ -994,12 +994,20 @@ func TestAWakeAPeerReadsWhileARetiredSessionIsAboutToGoBackReturnsWithTheRelease
 		t.Fatal("given: no engine session")
 	}
 	session.EmitLast(protocol.EventSessionLoggedOut, map[string]any{"reason": "logged_out"})
+	// The managed session's own reading, which is what the sweep asks: the fake records its
+	// last word at once, and the pump that retires the session reads it on its own goroutine.
+	retired := func() bool {
+		holder.mu.Lock()
+		managed, ok := holder.sessions[sid]
+		holder.mu.Unlock()
+		return ok && managed.Retired()
+	}
 	deadline := time.Now().Add(testwait.Budget)
-	for time.Now().Before(deadline) && session.Finished() == 0 {
+	for time.Now().Before(deadline) && !retired() {
 		time.Sleep(testwait.Poll)
 	}
-	if session.Finished() == 0 {
-		t.Fatal("given: the engine never said its last word")
+	if !retired() {
+		t.Fatal("given: the session was never retired")
 	}
 
 	wakeThroughTheWindow(t, holder, peer, rdb, sid, func() {
