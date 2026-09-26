@@ -70,10 +70,9 @@ return 0
 // Only the holder's own entry: one left for an instance that no longer holds the lease
 // is about a hand-back that already happened or never will.
 //
-// And not when there is nothing the wake may start. An account this instance deleted
-// leaves a tombstone instead of an entry (ForgetEpoch), and a wake for it put back would
-// have a peer adopt an account that no longer exists. An account the fleet is leaving
-// alone after failed attempts is not given one either: a wake put back is a new entry,
+// And not when there is nothing the wake may start. An account this instance deleted is
+// released by releaseDeletedScript instead, which drops the entry. An account the fleet is
+// leaving alone after failed attempts is not given one either: a wake put back is a new entry,
 // read as a first delivery, and would bring the account up past the backoff the release's
 // own caller has just struck. The resume sweep brings it back when the wait is over. The
 // wait is read against the server's clock: a strike writes it from the striking instance's
@@ -91,7 +90,7 @@ end
 local wait = tonumber(redis.call("HGET", KEYS[5], "until"))
 local clock = redis.call("TIME")
 local now = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
-if redis.call("HGET", KEYS[3], "deleted") or (wait and wait > now) then
+if wait and wait > now then
   redis.call("DEL", KEYS[3])
   return 1
 end
@@ -121,9 +120,8 @@ return 1
 // or after, and it finds the entry.
 //
 // Answers 0 when nobody holds the lease any more, 2 when the holder has already marked
-// itself as handing it back (the wake is then left pending, as before), 3 when the holder
-// deleted the account and is only waiting to release it (nothing is owed, and the wake is
-// acknowledged as it always was), and 1 when the wake is owed.
+// itself as handing it back (the wake is then left pending, as before), and 1 when the
+// wake is owed.
 var oweWakeScript = redis.NewScript(`
 local holder = redis.call("GET", KEYS[1])
 if not holder then
@@ -131,9 +129,6 @@ if not holder then
 end
 if redis.call("GET", KEYS[2]) == holder then
   return 2
-end
-if redis.call("HGET", KEYS[3], "deleted") and redis.call("HGET", KEYS[3], "holder") == holder then
-  return 3
 end
 redis.call("DEL", KEYS[3])
 redis.call("HSET", KEYS[3], "holder", holder, unpack(ARGV, 2))
@@ -190,8 +185,11 @@ type Leases struct {
 	// held by value, not by pointer: Owned answers from local state on every write, and
 	// an entry that can escape the lock as a pointer is one a renewal can be rewriting
 	// while a caller reads it.
-	held  map[string]held
-	clock Clock
+	held map[string]held
+	// deleted is the accounts ForgetEpoch was called for and that have not been released
+	// since: their release puts back no owed wake (#259).
+	deleted map[string]struct{}
+	clock   Clock
 }
 
 // Clock is the monotonic reading used to decide whether a lease is still fresh. It is
@@ -233,6 +231,7 @@ func NewLeases(client *redisx.Client, instance string, opts Options) *Leases {
 		ttl:      opts.TTL,
 		margin:   opts.Margin,
 		held:     make(map[string]held),
+		deleted:  make(map[string]struct{}),
 		clock:    opts.Clock,
 	}
 }
@@ -291,6 +290,9 @@ func (l *Leases) Acquire(ctx context.Context, sid string) (Lease, error) {
 
 	l.mu.Lock()
 	l.held[sid] = held{epoch: uint64(epoch), renewedAt: sent} //nolint:gosec // INCR from 0 never returns a negative
+	// An account acquired again is one paired again, or never deleted after all: its
+	// release is an ordinary one.
+	delete(l.deleted, sid)
 	l.mu.Unlock()
 
 	return Lease{SID: sid, Epoch: uint64(epoch)}, nil //nolint:gosec // same
@@ -520,17 +522,38 @@ func (l *Leases) MarkHandingBack(ctx context.Context, sid string) error {
 // instance was the one holding it. A wake a peer left owed to this instance goes back on
 // the control stream in the same step (see releaseScript).
 func (l *Leases) Release(ctx context.Context, sid string) (bool, error) {
-	l.forget(sid)
+	l.mu.Lock()
+	delete(l.held, sid)
+	_, deleted := l.deleted[sid]
+	delete(l.deleted, sid)
+	l.mu.Unlock()
 	keys := l.client.Keys()
-	released, err := releaseScript.Run(ctx, l.client,
-		[]string{keys.Lease(sid), keys.HandBack(sid), keys.OwedWake(sid), keys.Control(), keys.Quarantine(sid)},
-		l.instance,
-	).Int()
+	script, names := releaseScript, []string{keys.Lease(sid), keys.HandBack(sid), keys.OwedWake(sid), keys.Control(), keys.Quarantine(sid)}
+	if deleted {
+		script, names = releaseDeletedScript, names[:3]
+	}
+	released, err := script.Run(ctx, l.client, names, l.instance).Int()
 	if err != nil {
 		return false, fmt.Errorf("cluster: release %s: %w", sid, err)
 	}
 	return released > 0, nil
 }
+
+// releaseDeletedScript is releaseScript for an account this instance deleted: the lease and
+// the mark go the same way, and a wake owed to this instance is dropped instead of put back,
+// since the account it asked for no longer exists. Same arguments as the ordinary release,
+// so everything that recognises a release by its shape recognises this one.
+var releaseDeletedScript = redis.NewScript(`
+if redis.call("GET", KEYS[1]) ~= ARGV[1] then
+  return 0
+end
+redis.call("DEL", KEYS[1])
+redis.call("DEL", KEYS[2])
+if redis.call("HGET", KEYS[3], "holder") == ARGV[1] then
+  redis.call("DEL", KEYS[3])
+end
+return 1
+`)
 
 // Owed is what OweWake found.
 type Owed int
@@ -544,9 +567,6 @@ const (
 	// OwedHandingBack is a holder that has already marked itself as giving the account
 	// back, so the wake is to be left pending rather than owed.
 	OwedHandingBack
-	// OwedNothing is a holder that deleted the account and has not released it yet. There
-	// is nothing a wake could start, and it is acknowledged as it always was.
-	OwedNothing
 )
 
 // OweWake leaves the wake whose stream fields are given for whichever instance holds sid's
@@ -571,8 +591,6 @@ func (l *Leases) OweWake(ctx context.Context, sid string, wake map[string]string
 		return OwedToHolder, nil
 	case 2:
 		return OwedHandingBack, nil
-	case 3:
-		return OwedNothing, nil
 	default:
 		return OwedNobodyHolds, nil
 	}
@@ -628,9 +646,6 @@ if redis.call("GET", KEYS[1]) ~= ARGV[1] then
   return 0
 end
 redis.call("DEL", KEYS[2])
-redis.call("DEL", KEYS[3])
-redis.call("HSET", KEYS[3], "holder", ARGV[1], "deleted", "1")
-redis.call("PEXPIRE", KEYS[3], ARGV[2])
 return 1
 `)
 
@@ -650,14 +665,19 @@ return 1
 // inbox on the other side left for anybody's late event to corrupt. An account paired
 // again is a new one, and a count starting over is the truth about it.
 //
-// A wake a peer left owed to this instance goes with it (#259), and a tombstone takes its
-// place until the release: a wake read before the delete, or after it and before the
-// release, asked for an account that no longer exists, and put back by the release it would
-// have a peer adopt it.
+// It also tells the release that follows that the account is gone (#259): a wake a peer
+// left owed to this instance, read before the delete or after it, asked for an account
+// that no longer exists, and put back it would have a peer adopt it. Recorded here, before
+// the round trip, and not in Redis: the teardown goes on when this call fails, and a
+// deletion only Redis remembered would be forgotten by exactly the failure that left the
+// counter behind.
 func (l *Leases) ForgetEpoch(ctx context.Context, sid string) error {
+	l.mu.Lock()
+	l.deleted[sid] = struct{}{}
+	l.mu.Unlock()
 	keys := l.client.Keys()
 	held, err := forgetEpochScript.Run(
-		ctx, l.client, []string{keys.Lease(sid), keys.LeaseEpoch(sid), keys.OwedWake(sid)}, l.instance, l.ttl.Milliseconds(),
+		ctx, l.client, []string{keys.Lease(sid), keys.LeaseEpoch(sid)}, l.instance,
 	).Int()
 	if err != nil {
 		return fmt.Errorf("cluster: forget the epoch of %s: %w", sid, err)
@@ -727,10 +747,4 @@ func (l *Leases) Held() []string {
 		sids = append(sids, sid)
 	}
 	return sids
-}
-
-func (l *Leases) forget(sid string) {
-	l.mu.Lock()
-	delete(l.held, sid)
-	l.mu.Unlock()
 }

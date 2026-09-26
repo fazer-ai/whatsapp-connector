@@ -1077,7 +1077,12 @@ func (m *Manager) oweWake(ctx context.Context, delivery *transport.Delivery) boo
 		forfeit(delivery)
 		return false
 	}
-	owed, err := m.leases.OweWake(ctx, sid, fields)
+	// On a deadline of its own, like the ack that follows: the caller's context has no
+	// deadline, and a Redis that stopped answering would hold every wake and ping behind
+	// this one, and a shutdown waiting for it.
+	owing, cancel := context.WithTimeout(ctx, ackTimeout)
+	defer cancel()
+	owed, err := m.leases.OweWake(owing, sid, fields)
 	switch {
 	case err != nil:
 		m.log.Error().Err(err).Str("sid", sid).Msg("could not leave a wake for the account's owner; leaving it pending")
@@ -1087,10 +1092,6 @@ func (m *Manager) oweWake(ctx context.Context, delivery *transport.Delivery) boo
 		m.log.Warn().Str("sid", sid).Msg("a wake found a lease that is still being handed back; leaving it pending")
 		release(delivery)
 		return false
-	case owed == cluster.OwedNothing:
-		// The owner deleted the account and is about to let it go: there is nothing for the
-		// wake to start, and it is acknowledged as it was before #259.
-		return true
 	case owed == cluster.OwedNobodyHolds:
 		// Let go between the adoption that failed and here: the account is free, and the
 		// wake is what starts it. Kept at its age, so it is taken first on the next pass.

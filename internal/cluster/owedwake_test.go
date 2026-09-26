@@ -2,8 +2,11 @@ package cluster_test
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strconv"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -172,44 +175,99 @@ func TestTheHoldersReleasePutsTheOwedWakeBack(t *testing.T) {
 	}
 }
 
-// An account deleted here leaves nothing to put back: a wake owed before the delete goes
-// with it, and one a peer leaves after the delete and before the release is acknowledged
-// without being owed, because the release that follows would otherwise have a peer adopt an
-// account that no longer exists.
-func TestADeletedAccountIsOwedNoWake(t *testing.T) {
+// An account deleted here puts no wake back when it is released (#259): one owed before the
+// delete or after it asked for an account that no longer exists, and put back it would have
+// a peer adopt it. Also when the delete could not reach Redis, since the teardown goes on
+// regardless, and only for that account's next release: acquired again, it is an ordinary
+// account.
+func TestADeletedAccountPutsNoWakeBack(t *testing.T) {
 	t.Parallel()
 
 	for name, rdb := range owedServers(t) {
 		t.Run(name, func(t *testing.T) {
-			ctx := context.Background()
-			client := redisx.Wrap(rdb, owedPrefix(t, rdb), 8)
-			keys := client.Keys()
-			holder := cluster.NewLeases(client, "inst-a", cluster.Options{})
-			peer := cluster.NewLeases(client, "inst-b", cluster.Options{})
+			for _, tc := range []struct {
+				name        string
+				forgetFails bool
+			}{
+				{"the delete reached Redis", false},
+				{"the delete did not reach Redis", true},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					ctx := context.Background()
+					own := redis.NewClient(rdb.Options())
+					t.Cleanup(func() { _ = own.Close() })
+					failing := &failEpochWrites{}
+					own.AddHook(failing)
+					client := redisx.Wrap(own, owedPrefix(t, rdb), 8)
+					keys := client.Keys()
+					holder := cluster.NewLeases(client, "inst-a", cluster.Options{})
+					peer := cluster.NewLeases(client, "inst-b", cluster.Options{})
 
-			if _, err := holder.Acquire(ctx, "s1"); err != nil {
-				t.Fatalf("given: %v", err)
-			}
-			if owed, err := peer.OweWake(ctx, "s1", aWake); err != nil || owed != cluster.OwedToHolder {
-				t.Fatalf("given: %v %v", owed, err)
-			}
-			if err := holder.ForgetEpoch(ctx, "s1"); err != nil {
-				t.Fatalf("delete: %v", err)
-			}
-			if owed, err := peer.OweWake(ctx, "s1", aWake); err != nil || owed != cluster.OwedNothing {
-				t.Fatalf("a wake for an account deleted and not yet released answered %v (%v), want OwedNothing", owed, err)
-			}
-			if released, err := holder.Release(ctx, "s1"); err != nil || !released {
-				t.Fatalf("the holder's release: %v %v", released, err)
-			}
-			if n, _ := rdb.XLen(ctx, keys.Control()).Result(); n != 0 {
-				t.Fatalf("the release of a deleted account put %d wakes back", n)
-			}
-			if n, _ := rdb.Exists(ctx, keys.OwedWake("s1")).Result(); n != 0 {
-				t.Fatal("the tombstone outlived the release it was waiting for")
+					if _, err := holder.Acquire(ctx, "s1"); err != nil {
+						t.Fatalf("given: %v", err)
+					}
+					if owed, err := peer.OweWake(ctx, "s1", aWake); err != nil || owed != cluster.OwedToHolder {
+						t.Fatalf("given: %v %v", owed, err)
+					}
+					failing.on.Store(tc.forgetFails)
+					err := holder.ForgetEpoch(ctx, "s1")
+					failing.on.Store(false)
+					if tc.forgetFails != (err != nil) {
+						t.Fatalf("given: ForgetEpoch answered %v", err)
+					}
+					if owed, err := peer.OweWake(ctx, "s1", aWake); err != nil || owed != cluster.OwedToHolder {
+						t.Fatalf("given: a wake after the delete answered %v %v", owed, err)
+					}
+					if released, err := holder.Release(ctx, "s1"); err != nil || !released {
+						t.Fatalf("the holder's release: %v %v", released, err)
+					}
+					if n, _ := rdb.XLen(ctx, keys.Control()).Result(); n != 0 {
+						t.Fatalf("the release of a deleted account put %d wakes back", n)
+					}
+					if n, _ := rdb.Exists(ctx, keys.OwedWake("s1")).Result(); n != 0 {
+						t.Fatal("the owed wake outlived the release of a deleted account")
+					}
+
+					if _, err := holder.Acquire(ctx, "s1"); err != nil {
+						t.Fatalf("acquire again: %v", err)
+					}
+					if owed, err := peer.OweWake(ctx, "s1", aWake); err != nil || owed != cluster.OwedToHolder {
+						t.Fatalf("given: %v %v", owed, err)
+					}
+					if _, err := holder.Release(ctx, "s1"); err != nil {
+						t.Fatalf("release again: %v", err)
+					}
+					if n, _ := rdb.XLen(ctx, keys.Control()).Result(); n != 1 {
+						t.Fatalf("the release of an account acquired again after a delete put %d wakes back, want the one owed", n)
+					}
+				})
 			}
 		})
 	}
+}
+
+// failEpochWrites fails, while on, every command naming an epoch counter, which is what a
+// Redis that went away in the middle of a teardown looks like to ForgetEpoch.
+type failEpochWrites struct{ on atomic.Bool }
+
+func (*failEpochWrites) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (h *failEpochWrites) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if h.on.Load() {
+			for _, arg := range cmd.Args() {
+				if key, ok := arg.(string); ok && strings.Contains(key, "lease-epoch:") {
+					cmd.SetErr(errors.New("injected: redis went away"))
+					return cmd.Err()
+				}
+			}
+		}
+		return next(ctx, cmd)
+	}
+}
+
+func (*failEpochWrites) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
 }
 
 // A wake owed to an account the fleet is leaving alone is dropped by the release rather than

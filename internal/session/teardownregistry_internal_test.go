@@ -1199,9 +1199,71 @@ func TestAWakeThatCannotBeOwedIsLeftPending(t *testing.T) {
 	}
 }
 
-// A wake a peer read before the account was deleted is not put back once it is (#259): the
-// teardown forgets it with the epoch, and the release after the teardown puts nothing on
-// the control stream, so no peer adopts an account that no longer exists.
+// A Redis that stops answering the peer's owed wake costs that wake its turn and nothing
+// else: the call is on a deadline of its own, since what dispatches a wake passes a context
+// with none, and without one every wake and ping behind it would wait on this one.
+func TestAWakeWhoseOwedWriteStallsIsLeftPendingOnADeadline(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	rdb.AddHook(stallOwedWake{})
+	client := redisx.Wrap(rdb, "wa:", 8)
+	ctx := context.Background()
+	holder, peer := twoOverOneRedis(t, client)
+
+	if _, err := holder.leases.Acquire(ctx, "s-kept"); err != nil {
+		t.Fatalf("given: %v", err)
+	}
+	var acked, released, forfeited int
+	delivery := &transport.Delivery{
+		Command: protocol.Command{V: protocol.Version, Type: protocol.CommandSessionWake, SID: "s-kept", ID: "c-stalled"},
+		Ack:     func(context.Context) error { acked++; return nil },
+		Release: func() { released++ },
+		Forfeit: func() { forfeited++ },
+	}
+	done := make(chan bool, 1)
+	go func() { done <- peer.oweWake(context.WithoutCancel(ctx), delivery) }()
+	select {
+	case owed := <-done:
+		if owed {
+			t.Fatal("a wake whose owed write never landed was reported owed, so it would be acknowledged")
+		}
+	case <-time.After(testwait.Budget):
+		t.Fatal("the owed write had no deadline: the wake is still waiting on a Redis that does not answer")
+	}
+	if forfeited != 1 || acked != 0 || released != 0 {
+		t.Fatalf("acked=%d released=%d forfeited=%d, want it forfeited", acked, released, forfeited)
+	}
+}
+
+// stallOwedWake holds every command naming an owed wake until its context ends, which is a
+// Redis that stopped answering as the caller sees it.
+type stallOwedWake struct{}
+
+func (stallOwedWake) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (stallOwedWake) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		for _, arg := range cmd.Args() {
+			if key, ok := arg.(string); ok && strings.Contains(key, "owed-wake:") {
+				<-ctx.Done()
+				cmd.SetErr(ctx.Err())
+				return ctx.Err()
+			}
+		}
+		return next(ctx, cmd)
+	}
+}
+
+func (stallOwedWake) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+
+// A wake a peer read before the account was deleted is not put back once it is (#259), nor
+// one read after the delete and before the release: the release after a teardown puts
+// nothing on the control stream, so no peer adopts an account that no longer exists.
 func TestAWakeReadBeforeADeleteIsNotPutBackAfterIt(t *testing.T) {
 	t.Parallel()
 
