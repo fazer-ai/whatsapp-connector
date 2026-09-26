@@ -1510,6 +1510,8 @@ func (s *Session) knowWhatWasAsked(ctx context.Context) error {
 // recordWanted writes the standing request. A plain field holds it because every caller
 // runs on this session's executor, which is one goroutine taking one command at a time.
 func (s *Session) recordWanted(ctx context.Context) {
+	// A pairing code is a connect by another name, so it ends a disconnect the same way.
+	s.askedDown = false
 	if err := s.writeWanted(ctx, s.asked); err != nil {
 		s.warnUnrecorded(err)
 	}

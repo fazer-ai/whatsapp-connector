@@ -521,3 +521,45 @@ func TestAWakeDoesNotUndoADisconnectThatCouldNotBeRecorded(t *testing.T) {
 		t.Fatalf("the account was dialled %d times after a disconnect this instance carried out", got)
 	}
 }
+
+// A pairing code after a disconnect is a connect by another name, and it ends the
+// disconnect for the resume too: a wake after it brings the account up, where one that
+// still went by the disconnect would leave it down with its record saying connected.
+func TestAPairingCodeAfterADisconnectLetsAWakeBringTheAccountUp(t *testing.T) {
+	t.Parallel()
+
+	container := openStore(t)
+	pairedAs(t, container, "s1", store.Wants{})
+	h := newHarnessWithStore(t, container)
+	if _, err := h.manager.Adopt(context.Background(), "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	for _, command := range []struct {
+		id      string
+		kind    protocol.CommandType
+		payload string
+	}{
+		{"d1", protocol.CommandSessionDisconnect, `{}`},
+		{"p1", protocol.CommandPairingRequestCode, `{"phone":"5511999990001"}`},
+	} {
+		h.manager.Dispatch(delivery(&protocol.Command{
+			V: protocol.Version, ID: command.id, Type: command.kind, SID: "s1", ReplyTo: command.id,
+			Payload: json.RawMessage(command.payload),
+		}, &atomic.Bool{}))
+		waitFor(t, "a reply to "+command.id, func() bool { _, ok := h.recorder.reply(command.id); return ok })
+	}
+	engineSession, _ := h.engine.Session("s1")
+	before := engineSession.Connects()
+
+	var acked atomic.Bool
+	wake(h, "s1", `{"desired":"connected"}`, &acked)
+	waitFor(t, "the wake to be acknowledged", acked.Load)
+	h.manager.Dispatch(delivery(&protocol.Command{
+		V: protocol.Version, ID: "st", Type: protocol.CommandSessionStatus, SID: "s1", ReplyTo: "st",
+		Payload: json.RawMessage(`{}`),
+	}, &atomic.Bool{}))
+	waitFor(t, "a reply to the status", func() bool { _, ok := h.recorder.reply("st"); return ok })
+	if got := engineSession.Connects(); got != before+1 {
+		t.Fatalf("the wake dialled %d times, want once: the pairing code ended the disconnect", got-before)
+	}
+}
