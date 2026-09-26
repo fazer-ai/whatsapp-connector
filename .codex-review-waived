@@ -575,3 +575,10 @@ internal/session/manager.go: Mark each expiring hand-back before another stop ca
 # side is one margin of lease rather than the length of an outage.
 internal/session/manager.go: Stop fresh sockets before blocking on stale releases  # PR#149
 internal/engine/whatsmeow/call.go: Keep call publication from blocking subsequent rejections  # PR#220 -> #221
+# PR#314: a wake is not a way to reach the instance that owns a session, and the contract now says so
+# (PROTOCOL.md, session.wake): the fleet hands it to whichever instance reads it first, and a peer that
+# does not own the account acknowledges it. A wake forfeited because the owner's queue was full can
+# therefore be acknowledged by a peer. The owned session's retry path is `session.connect` on its own
+# stream, which reaches the owner; a queue of 128 commands is a client actively driving the session.
+internal/session/manager.go: Preserve the connect retry when another instance claims the wake  # PR#314
+internal/session/manager.go: Deliver wake retries to the existing owner  # PR#314
