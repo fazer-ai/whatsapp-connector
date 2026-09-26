@@ -10,8 +10,8 @@ import (
 	"testing"
 )
 
-// Stub is a server that answers `HELLO` the way a test says and every other command
-// with a plain success, and remembers which commands it was sent.
+// Stub is a server that answers `HELLO`, and any command a test names, the way the test
+// says, every other command with a plain success, and remembers which commands it was sent.
 //
 // It stands in for a server miniredis cannot be: one of another version, or one whose
 // `HELLO` is not what a Redis at or above the floor answers. What it records is how a
@@ -19,8 +19,9 @@ import (
 type Stub struct {
 	addr string
 
-	mu   sync.Mutex
-	seen []string
+	mu      sync.Mutex
+	seen    []string
+	answers map[string]string
 }
 
 // NewStub starts a stub whose answer to `HELLO` is hello, verbatim RESP, stopped when the
@@ -33,7 +34,7 @@ func NewStub(t testing.TB, hello string) *Stub {
 	if err != nil {
 		t.Fatalf("redisxtest: listen: %v", err)
 	}
-	stub := &Stub{addr: listener.Addr().String()}
+	stub := &Stub{addr: listener.Addr().String(), answers: map[string]string{}}
 
 	var conns sync.WaitGroup
 	var mu sync.Mutex
@@ -73,6 +74,13 @@ func NewStub(t testing.TB, hello string) *Stub {
 // Addr is where the stub listens.
 func (s *Stub) Addr() string { return s.addr }
 
+// Answer has the stub answer command, whatever its arguments, with reply, verbatim RESP.
+func (s *Stub) Answer(command, reply string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.answers[strings.ToUpper(command)] = reply
+}
+
 // Seen is every command the stub was sent, upper-cased, in the order they arrived.
 func (s *Stub) Seen() []string {
 	s.mu.Lock()
@@ -90,13 +98,16 @@ func (s *Stub) serve(conn net.Conn, hello string) {
 		name := strings.ToUpper(args[0])
 		s.mu.Lock()
 		s.seen = append(s.seen, name)
+		answer, told := s.answers[name]
 		s.mu.Unlock()
-		answer := "+OK\r\n"
-		switch name {
-		case "HELLO":
+		switch {
+		case told:
+		case name == "HELLO":
 			answer = hello
-		case "PING":
+		case name == "PING":
 			answer = "+PONG\r\n"
+		default:
+			answer = "+OK\r\n"
 		}
 		if _, err := io.WriteString(conn, answer); err != nil {
 			return

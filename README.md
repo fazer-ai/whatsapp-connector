@@ -331,8 +331,10 @@ refused instance leaves no trace in the fleet. A server that speaks the Redis pr
 under another name, such as Valkey, is held to the version it reports.
 
 Two things need 7.0 and are absent on 6.2, where the server does not report the counters
-they read: the warning when a `MAXLEN` trim cut commands nobody was handed, and
-`wac_stream_lag`, which on 6.2 reads 0 for every group whatever the backlog (#320).
+they read: the warning when a `MAXLEN` trim cut commands nobody was handed, and the lag of
+a consumer group. On 6.2 every group reports `wac_stream_lag_unknown 1` and no
+`wac_stream_lag` sample; `wac_stream_pending` and `wac_stream_consumers` are reported as
+on any other version.
 
 ### The one key that never expires
 
