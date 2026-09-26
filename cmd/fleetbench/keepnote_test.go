@@ -121,6 +121,11 @@ func TestARunWithKeepSaysWhatItKeptInItsReport(t *testing.T) {
 	var out, errOut bytes.Buffer
 	code, err := runBench(ctx, benchIO{out: &out, errOut: &errOut, afterBuild: cancel}, 2, 2, 2, 1, 0, true)
 	if err != nil {
+		// A run that stopped before its report (a connector that did not build) still kept
+		// what it had made, and says so on stderr: given back by those names before failing.
+		if left := keptLine.FindStringSubmatch(errOut.String()); left != nil {
+			giveBack(t, left[1], left[2], left[3])
+		}
 		t.Fatalf("the run stopped before it had a report: %v\nstderr:\n%s", err, errOut.String())
 	}
 
@@ -133,8 +138,7 @@ func TestARunWithKeepSaysWhatItKeptInItsReport(t *testing.T) {
 	}
 	t.Cleanup(func() { giveBack(t, own[1], own[2], own[3]) })
 
-	kept := regexp.MustCompile(`guardado a pedido \(-keep\): banco (\S+), prefixo (\S+), (\S+)`)
-	found := kept.FindAllStringSubmatch(out.String(), -1)
+	found := keptLine.FindAllStringSubmatch(out.String(), -1)
 	if len(found) != 1 {
 		t.Fatalf("the report (outcome %v) carries the -keep line %d times, want once:\n%s", code, len(found), out.String())
 	}
@@ -162,6 +166,9 @@ func TestARunWithKeepSaysWhatItKeptInItsReport(t *testing.T) {
 		t.Errorf("the database the note names, %s, is not on the server", database)
 	}
 }
+
+// keptLine is the note a run with -keep prints, with the three names it gives.
+var keptLine = regexp.MustCompile(`guardado a pedido \(-keep\): banco (\S+), prefixo (\S+), (\S+)`)
 
 // giveBack drops what a run with -keep left, by the names it printed.
 func giveBack(t *testing.T, database, prefix, dir string) {
