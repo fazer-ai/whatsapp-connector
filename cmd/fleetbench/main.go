@@ -31,6 +31,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -52,7 +53,8 @@ func main() {
 	// An error back from `runBench` means it stopped before there was a report to write,
 	// so this is the only place that prints one. Once there is a report, the outcome and
 	// its reason are printed with it, and `runBench` answers with the code alone.
-	code, err := runBench(*sessions, *shards, *processes, *sends, *maxAdoption, *keep)
+	code, err := runBench(context.Background(), benchIO{out: os.Stdout, errOut: os.Stderr},
+		*sessions, *shards, *processes, *sends, *maxAdoption, *keep)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "\n=== %s (exit %d) ===\n%v\n", outcomeSetup.label(), int(outcomeSetup), err)
 		os.Exit(int(outcomeSetup))
@@ -60,7 +62,19 @@ func main() {
 	os.Exit(int(code))
 }
 
-func runBench(sessions, shards, processes, sends int, maxAdoption time.Duration, keep bool) (outcome, error) {
+// benchIO is where a run writes, and the one seam a test has into its middle.
+type benchIO struct {
+	out, errOut io.Writer
+	// afterBuild runs once the connector under test is built, before the fleet starts. Nil
+	// in production. A test cancels the run's context here to reach a printed report in
+	// seconds rather than after a whole run: what it asks is what the report says, and the
+	// fleet is not part of the answer.
+	afterBuild func()
+}
+
+func runBench(parent context.Context, dest benchIO, sessions, shards, processes, sends int,
+	maxAdoption time.Duration, keep bool,
+) (outcome, error) {
 	if processes < 2 {
 		return outcomeSetup, fmt.Errorf("%w: -processes is %d, and an ownership change needs at least two", errSetup, processes)
 	}
@@ -83,7 +97,7 @@ func runBench(sessions, shards, processes, sends int, maxAdoption time.Duration,
 
 	// Its own context, cancelled on the first interrupt, so that a run somebody stops by
 	// hand still gives back its database, its keys and its processes.
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(parent, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	s, err := preflight(ctx)
@@ -124,11 +138,16 @@ func runBench(sessions, shards, processes, sends int, maxAdoption time.Duration,
 	defer func() {
 		group.shutdown()
 		if keep {
-			rep.note("guardado a pedido (-keep): banco " + active.database + ", prefixo " + active.prefix + ", " + workDir)
+			// The report already says so when it went out. A run that stopped before
+			// printing one -- a connector that would not build, an interrupt before the
+			// directory existed -- has nowhere else to say what it left behind.
+			if !rep.written {
+				_, _ = fmt.Fprintln(dest.errOut, keptNote(active, workDir))
+			}
 			return
 		}
 		for _, trouble := range active.cleanup(context.WithoutCancel(ctx)) {
-			_, _ = fmt.Fprintf(os.Stderr, "limpeza: %s\n", trouble)
+			_, _ = fmt.Fprintf(dest.errOut, "limpeza: %s\n", trouble)
 		}
 		if workDir != "" {
 			_ = os.RemoveAll(workDir)
@@ -148,6 +167,13 @@ func runBench(sessions, shards, processes, sends int, maxAdoption time.Duration,
 	}
 
 	rep.note("banco desta corrida: " + active.database + " · prefixo: " + active.prefix + " · arquivos: " + workDir)
+	// Here, before every path that prints the report, and not in the deferred cleanup: a
+	// note added there lands in a report that has already been printed and is never
+	// printed again, so whoever asked for -keep was not told what to clean up (#310).
+	// TestTheKeepNoteIsTakenBeforeTheReportIsPrinted holds the order.
+	if keep {
+		rep.note(keptNote(active, workDir))
+	}
 
 	binary, sum, err := buildConnector(ctx, moduleDir, workDir)
 	if err != nil {
@@ -155,6 +181,9 @@ func runBench(sessions, shards, processes, sends int, maxAdoption time.Duration,
 	}
 	rep.binary, rep.binarySum = binary, sum
 	*group = fleet{binary: binary, binarySum: sum, dir: workDir, env: active.connectorEnv(shards)}
+	if dest.afterBuild != nil {
+		dest.afterBuild()
+	}
 
 	if err := measure(ctx, active, group, rep, benchPlan{
 		sessions: sessions, shards: shards, processes: processes, sends: sends, maxAdoption: maxAdoption,
@@ -168,7 +197,7 @@ func runBench(sessions, shards, processes, sends int, maxAdoption time.Duration,
 		// lease is a defect, and filing it as "the machine was not ready" is how the
 		// clearest red in the whole bench ends up in the category a reader skips.
 		stopped := stoppedOutcome(rep, err)
-		rep.write(os.Stdout, stopped, err)
+		rep.write(dest.out, stopped, err)
 		return stopped, nil
 	}
 
@@ -203,7 +232,7 @@ func runBench(sessions, shards, processes, sends int, maxAdoption time.Duration,
 		if len(mine) > 0 {
 			reason := fmt.Errorf("%w: a corrida escreveu %d chaves fora do prefixo %s e elas carregam o id "+
 				"desta corrida, entao sao dela: %s", errSetup, len(mine), active.prefix, shortList(mine))
-			rep.write(os.Stdout, outcomeSetup, reason)
+			rep.write(dest.out, outcomeSetup, reason)
 			return outcomeSetup, nil
 		}
 		rep.note(fmt.Sprintf("apareceram %d chaves novas fora do prefixo %s durante a corrida, e nenhuma "+
@@ -212,8 +241,16 @@ func runBench(sessions, shards, processes, sends int, maxAdoption time.Duration,
 	}
 
 	final := rep.outcome()
-	rep.write(os.Stdout, final, nil)
+	rep.write(dest.out, final, nil)
 	return final, nil
+}
+
+// keptNote names what a run started with -keep leaves behind, for whoever cleans it up.
+func keptNote(active *run, workDir string) string {
+	if workDir == "" {
+		workDir = "nenhuma pasta criada"
+	}
+	return "guardado a pedido (-keep): banco " + active.database + ", prefixo " + active.prefix + ", " + workDir
 }
 
 type benchPlan struct {
