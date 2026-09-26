@@ -49,6 +49,11 @@ type Session struct {
 	// on this instance sets it, and so does reading the row a connect elsewhere left.
 	// Until then an empty asked means "not known here", not "asked for nothing".
 	askedKnown bool
+	// askedDown is whether the last request this executor carried out said the session
+	// should stay down. With asked, it is what this instance knows the client wants without
+	// asking the store: every command that changes it reaches the lease holder and runs
+	// here, so it is the fallback when the store cannot be read.
+	askedDown bool
 
 	commands chan queued
 
@@ -1318,7 +1323,15 @@ func (s *Session) lifecycle(ctx context.Context, command *protocol.Command, inte
 			// write the old proxy back over the new one.
 			current, still, err := s.stillWanted(ctx)
 			if err != nil {
-				return nil, err
+				// Not a reason to give up. The session is adopted and nothing else comes
+				// for it -- the sweep asks only about accounts nobody runs -- so failing
+				// here leaves it down until the process ends. What the client asked for
+				// since this instance took the account over ran on this executor, so it is
+				// known here without the store; and when nothing has, the copy that was
+				// queued is the last reading there is.
+				s.log.Warn().Err(err).Str("sid", s.sid).
+					Msg("could not read the record again before a resume; going by what this instance was last asked")
+				current, still = s.lastAskedHere(request)
 			}
 			if !still {
 				s.log.Info().Str("sid", s.sid).
@@ -1442,7 +1455,7 @@ func (s *Session) recordAsked(ctx context.Context, request engine.ConnectRequest
 		return fmt.Errorf("session %s: the proxy could not be recorded, so a resume would not go "+
 			"through it: %w", s.sid, err)
 	}
-	s.asked, s.askedKnown = wants, true
+	s.asked, s.askedKnown, s.askedDown = wants, true, false
 	if err != nil {
 		s.warnUnrecorded(err)
 	}
@@ -1457,6 +1470,19 @@ func (s *Session) stillWanted(ctx context.Context) (engine.ConnectRequest, bool,
 		return engine.ConnectRequest{}, false, fmt.Errorf("session %s: %w", s.sid, err)
 	}
 	return resumeRequest(wants), wanted, nil
+}
+
+// lastAskedHere is what the client last asked this instance for, or the queued request
+// when it has asked nothing here since the account was taken over.
+func (s *Session) lastAskedHere(queued engine.ConnectRequest) (engine.ConnectRequest, bool) {
+	switch {
+	case s.askedDown:
+		return engine.ConnectRequest{}, false
+	case s.askedKnown:
+		return resumeRequest(s.asked), true
+	default:
+		return queued, true
+	}
 }
 
 // knowWhatWasAsked reads the standing request off the row when no connect on this
@@ -1500,6 +1526,7 @@ func (s *Session) warnUnrecorded(err error) {
 // lands and is not recorded leaves a row saying the account should be up, and the next
 // sweep brings back a session whose client had just asked for it to stop.
 func (s *Session) recordAskedDown(ctx context.Context) {
+	s.askedDown = true
 	if s.store == nil {
 		return
 	}

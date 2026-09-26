@@ -391,3 +391,69 @@ func TestAWakeDoesNotRestoreAProxyAConnectAheadOfItReplaced(t *testing.T) {
 		t.Fatalf("the record names %q (err %v), want the proxy the client asked for last", standing.Proxy, err)
 	}
 }
+
+// A resume whose second reading of the record fails still goes by what the client asked
+// for. Failing it would strand the account: it is adopted, so the sweep does not ask about
+// it, and nothing retires a resume that never started. What changed since the account was
+// taken over ran on this instance's executor, so that is what decides: a disconnect queued
+// ahead still keeps the account down, and with nothing ahead the queued request stands.
+func TestAResumeWhoseRecordCannotBeReadAgainGoesByWhatThisInstanceKnows(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct {
+		ahead string // a lifecycle command queued ahead of the wake's connect, if any
+		dials int
+	}{
+		"nothing asked here since":  {dials: 1},
+		"a disconnect queued ahead": {ahead: `{"type":"session.disconnect"}`, dials: 0},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			target := storetest.New(t)
+			container, err := store.Open(t.Context(), target.URL, store.AlwaysOwned, zerolog.Nop())
+			if err != nil {
+				t.Fatalf("store.Open: %v", err)
+			}
+			t.Cleanup(func() { _ = container.Close() })
+			pairedAs(t, container, "s1", store.Wants{})
+			h := newHarnessWithStore(t, container)
+			if _, err := h.manager.Adopt(context.Background(), "s1"); err != nil {
+				t.Fatalf("Adopt: %v", err)
+			}
+			engineSession, _ := h.engine.Session("s1")
+
+			release := engineSession.Hold()
+			defer release()
+			h.manager.Dispatch(delivery(&protocol.Command{
+				V: protocol.Version, ID: "held", Type: protocol.CommandSessionStatus, SID: "s1",
+				Payload: json.RawMessage(`{}`),
+			}, &atomic.Bool{}))
+			waitFor(t, "the held command to reach the engine", func() bool { return len(engineSession.Commands()) == 1 })
+			if tc.ahead != "" {
+				h.manager.Dispatch(delivery(&protocol.Command{
+					V: protocol.Version, ID: "d1", Type: protocol.CommandSessionDisconnect, SID: "s1",
+					Payload: json.RawMessage(`{}`),
+				}, &atomic.Bool{}))
+			}
+			var acked atomic.Bool
+			wake(h, "s1", `{"desired":"connected"}`, &acked)
+			waitFor(t, "the wake to be acknowledged", acked.Load)
+			// The record goes away between the wake's reading and the connect's.
+			if _, err := target.Pool(t).ExecContext(t.Context(),
+				`ALTER TABLE wac_session_desired RENAME TO wac_session_desired_away`); err != nil {
+				t.Fatalf("take the table away: %v", err)
+			}
+			release()
+
+			h.manager.Dispatch(delivery(&protocol.Command{
+				V: protocol.Version, ID: "st", Type: protocol.CommandSessionStatus, SID: "s1", ReplyTo: "st",
+				Payload: json.RawMessage(`{}`),
+			}, &atomic.Bool{}))
+			waitFor(t, "a reply to the status", func() bool { _, ok := h.recorder.reply("st"); return ok })
+			if got := engineSession.Connects(); got != tc.dials {
+				t.Fatalf("the account was dialled %d times, want %d", got, tc.dials)
+			}
+		})
+	}
+}
