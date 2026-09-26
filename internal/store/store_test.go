@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"net/url"
@@ -1055,13 +1056,129 @@ func TestAVersionTableTheSearchPathDoesNotReachIsNamedRatherThanMissing(t *testi
 		}
 	})
 
+	// Through a later schema, behind one that does not exist. Behind `elsewhere`, which
+	// does, is a different defect: new tables would go there, and #331 refuses it.
 	t.Run("a path that reaches them through a later schema opens", func(t *testing.T) {
-		opened, err := store.Open(t.Context(), through("elsewhere,public"), store.AlwaysOwned, zerolog.Nop())
+		opened, err := store.Open(t.Context(), through("nowhere,public"), store.AlwaysOwned, zerolog.Nop())
 		if err != nil {
 			t.Fatalf("refused a search_path that reaches the tables: %v", err)
 		}
 		if err := opened.Close(); err != nil {
 			t.Errorf("Close: %v", err)
+		}
+	})
+}
+
+// The connector's own tables are created with unqualified `CREATE TABLE IF NOT EXISTS`,
+// which lands in the first schema of `search_path` and only looks there. With a schema
+// put in front of the one that holds them, a start created a second, empty set and read
+// from it: a paired account came back unbound and unwanted, and the next connect would
+// pair it again while its device was still in the other schema.
+func TestTheConnectorsTablesAreNotSplitAcrossSchemas(t *testing.T) {
+	t.Parallel()
+
+	if os.Getenv(storetest.AddressEnv) == "" {
+		t.Skip("the schema search path is a Postgres question, and this pass is on SQLite")
+	}
+	// A database per case would be the tidy arrangement, and the mirror case needs one: it
+	// has to be built through a path that #278's check refuses while another schema holds
+	// whatsmeow's tables.
+	type database struct {
+		through func(path string) string
+		exec    func(statements ...string)
+		admin   *sql.DB
+	}
+	newDatabase := func(t *testing.T) database {
+		t.Helper()
+		target := storetest.New(t)
+		admin := target.Pool(t)
+		return database{
+			through: func(path string) string {
+				separator := "?"
+				if strings.Contains(target.URL, "?") {
+					separator = "&"
+				}
+				return target.URL + separator + "search_path=" + path
+			},
+			exec: func(statements ...string) {
+				t.Helper()
+				for _, statement := range statements {
+					if _, err := admin.ExecContext(t.Context(), statement); err != nil {
+						t.Fatalf("%s: %v", statement, err)
+					}
+				}
+			},
+			admin: admin,
+		}
+	}
+	relationsIn := func(t *testing.T, db database, schema string) int {
+		t.Helper()
+		var n int
+		if err := db.admin.QueryRowContext(t.Context(), `SELECT count(*) FROM pg_class c
+			JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1`, schema).Scan(&n); err != nil {
+			t.Fatalf("count the relations in %s: %v", schema, err)
+		}
+		return n
+	}
+	openThrough := func(t *testing.T, db database, path string) {
+		t.Helper()
+		opened, err := store.Open(t.Context(), db.through(path), store.AlwaysOwned, zerolog.Nop())
+		if err != nil {
+			t.Fatalf("open through %s: %v", path, err)
+		}
+		_ = opened.Close()
+	}
+	refused := func(t *testing.T, db database, path string, named ...string) {
+		t.Helper()
+		opened, err := store.Open(t.Context(), db.through(path), store.AlwaysOwned, zerolog.Nop())
+		if err == nil {
+			_ = opened.Close()
+			t.Fatalf("opened through search_path=%s, with the connector's tables split across two schemas", path)
+		}
+		for _, schema := range named {
+			if !strings.Contains(err.Error(), schema) {
+				t.Errorf("the refusal does not name %q: %v", schema, err)
+			}
+		}
+	}
+
+	// Everything in `holding`. Each case puts a schema of its own in front of it, so that
+	// a start the base lets through leaves nothing behind for the next case to trip on.
+	db := newDatabase(t)
+	db.exec(`CREATE SCHEMA holding`)
+	openThrough(t, db, "holding")
+
+	t.Run("an empty schema in front of the tables is refused, creating nothing in it", func(t *testing.T) {
+		db.exec(`CREATE SCHEMA front`)
+		refused(t, db, "front,holding", "front", "holding")
+		if n := relationsIn(t, db, "front"); n != 0 {
+			t.Errorf("the refusal left %d relations in the schema in front", n)
+		}
+	})
+
+	t.Run("a database an older start already split is refused too", func(t *testing.T) {
+		db.exec(`CREATE SCHEMA split`,
+			`CREATE TABLE split.wac_session_device (LIKE holding.wac_session_device INCLUDING ALL)`)
+		refused(t, db, "split,holding", "split", "holding")
+	})
+
+	t.Run("the connector's tables in front of whatsmeow's are refused", func(t *testing.T) {
+		// The mirror image: whatsmeow's tables are where new ones would go, and the
+		// connector's own are behind them, so a check on whatsmeow's alone passes it.
+		mirror := newDatabase(t)
+		mirror.exec(`CREATE SCHEMA mirror`)
+		openThrough(t, mirror, "mirror")
+		mirror.exec(`CREATE SCHEMA behind`, `ALTER TABLE mirror.wac_session_device SET SCHEMA behind`)
+		refused(t, mirror, "mirror,behind", "mirror", "behind")
+	})
+
+	t.Run("a path that reaches every table in the schema it would create in opens", func(t *testing.T) {
+		for _, path := range []string{"holding", "nowhere,holding"} {
+			opened, err := store.Open(t.Context(), db.through(path), store.AlwaysOwned, zerolog.Nop())
+			if err != nil {
+				t.Fatalf("refused search_path=%s, which reaches every table in one schema: %v", path, err)
+			}
+			_ = opened.Close()
 		}
 	})
 }
