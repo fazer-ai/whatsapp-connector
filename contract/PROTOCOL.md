@@ -167,12 +167,17 @@ session's own stream therefore gets the teardown whenever the session happens to
 up, and silence otherwise.
 
 What `wa:control` guarantees is delivery to *some* connector, not to a particular one.
-Every connector reads the stream under one consumer group, so an entry naming a session
-another connector is running is given up by the one that read it and reclaimed later,
-possibly by the same one. For `session.delete` that means: an account **nobody** owns is
-torn down by whoever reads the entry, which is the case this route exists for and is
-deterministic; an account a connector is **running** is torn down when the entry reaches
-that connector, which happens but is not bounded. Nothing in the protocol asks an owner to
+Every connector reads the stream under one consumer group, and what the one that read an
+entry does with a session another connector is running depends on the command. A
+`session.delete` is given up by the one that read it and reclaimed later, possibly by the
+same one: an account **nobody** owns is torn down by whoever reads the entry, which is the
+case this route exists for and is deterministic; an account a connector is **running** is
+torn down when the entry reaches that connector, which happens but is not bounded. A
+`session.wake` is not given up: it asks for the account to have an owner, and it has one,
+so the entry is acknowledged and never reaches that owner (see `session.wake` above). The
+exception is an owner that is giving the account back (`wa:handback:<sid>` below): there
+the wake is left pending, because once the account is unowned it is the wake that starts it
+again. Nothing in the protocol asks an owner to
 give a session up **on demand**: a `wa:handoff:<sid>` key was declared for that once and
 removed here, having never had anything behind it. An owner giving a session up **of its
 own accord** is a different thing and does exist -- it is `wa:handback:<sid>` in the table

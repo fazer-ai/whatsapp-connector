@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -1968,6 +1969,57 @@ func TestASessionThatTookACommandIsNotFreeToBeHandedOver(t *testing.T) {
 		t.Fatal("a session that had just taken a command in was handed over as free")
 	}
 	session.doneWith()
+}
+
+// A wake for an account a peer runs is acknowledged where it lands and never reaches that
+// peer. The account has the owner the wake asked for, and the contract says so in two
+// places (#316): the `session.wake` bullet and the paragraph on what `wa:control`
+// guarantees, which used to say every entry for an owned session is given up and
+// reclaimed. A client that believed that would build a retry on a frame this retires.
+func TestAPeerAcknowledgesAWakeForAnAccountItsOwnerKeeps(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	holding := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	reading := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = holding.Close(); _ = reading.Close() })
+
+	const sid = "9c2b7d1e-0000-4000-8000-0000000000c2"
+	holder := NewManager(&ManagerConfig{
+		Instance: "inst-a", Engine: fake.New(),
+		Leases:    cluster.NewLeases(redisx.Wrap(holding, "wa:", 8), "inst-a", cluster.Options{}),
+		Publisher: quietPublisher{}, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	peer := NewManager(&ManagerConfig{
+		Instance: "inst-b", Engine: fake.New(),
+		Leases:    cluster.NewLeases(redisx.Wrap(reading, "wa:", 8), "inst-b", cluster.Options{}),
+		Publisher: quietPublisher{}, Replier: quietReplier{},
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	ctx := context.Background()
+	t.Cleanup(func() { holder.StopAll(ctx); peer.StopAll(ctx) })
+	if _, err := holder.Adopt(ctx, sid); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+
+	var acked, left bool
+	peer.wake(ctx, &transport.Delivery{
+		Command: protocol.Command{
+			V: protocol.Version, ID: "wake", Type: protocol.CommandSessionWake, SID: sid,
+			Payload: json.RawMessage(`{"desired":"connected"}`),
+		},
+		Ack:     func(context.Context) error { acked = true; return nil },
+		Release: func() { left = true },
+		Forfeit: func() { left = true },
+	})
+	if !acked || left {
+		t.Fatalf("a peer's wake for an account its owner keeps was acknowledged=%v and left pending=%v; "+
+			"the contract says it is acknowledged and never reaches the owner", acked, left)
+	}
+	if got := peer.Count(); got != 0 {
+		t.Fatalf("the peer runs %d sessions after a wake for an account somebody else owns", got)
+	}
 }
 
 // A hand-back is one instance's own business until it lands, and the wake that would put
