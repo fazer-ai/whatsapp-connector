@@ -75,6 +75,10 @@ func (s *Session) groupInviteOf(ctx context.Context, command *protocol.Command) 
 // are not allowed to" -- and the message is what tells them apart, because the three send
 // an operator somewhere different: ask an admin, check the group, or rejoin it.
 func inviteFailure(err error) error {
+	return keepMark(err, inviteFailureOf(err))
+}
+
+func inviteFailureOf(err error) error {
 	if named, coded := commandFailure(err, "invite request"); named {
 		return coded
 	}

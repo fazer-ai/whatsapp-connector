@@ -314,7 +314,7 @@ func (s *Session) markRead(ctx context.Context, command *protocol.Command) (json
 		// since marked unread (#282). Everything above this line -- the privacy setting
 		// that could not be read, the address that would not resolve -- reached nothing and
 		// is deliberately left unmarked.
-		return nil, engine.MayHaveLanded(markFailure(err, "WhatsApp did not take the read mark"))
+		return nil, keepMark(engine.MayHaveLanded(err), markFailure(err, "WhatsApp did not take the read mark"))
 	}
 	return nil, nil
 }
@@ -322,6 +322,38 @@ func (s *Session) markRead(ctx context.Context, command *protocol.Command) (json
 func (s *Session) privacyOverSocket(ctx context.Context) error {
 	_, err := s.current().TryFetchPrivacySettings(ctx, false)
 	return err
+}
+
+// keepMark carries the mark a write site put on raw across the classification that turned
+// raw into the contract's words: every classifier here builds a fresh protocol error, and
+// one that dropped the mark would release the attempt the command reserved, so a redelivery
+// carries the write out a second time (#282).
+//
+// Only for a failure that is unanswered: the write went out and nothing came back to say
+// what became of it. Entering the library call is not evidence of a write --
+// `sendNodeAndGetData` answers ErrNotConnected when the socket went away after readyToSend
+// looked, and a missing push name is refused before any node is built -- and a refusal is
+// an answer: an IQ error or a rejected patch says the change did not happen. A mark on
+// either would keep the attempt standing for a command whose outcome is known, answering
+// `timeout` to every retry for a day. Listed by what is ambiguous rather than by what is
+// not, for the reason engine.ErrMayHaveLanded gives: a failure nobody listed here costs a
+// redelivery that carries the work out again, and the opposite default costs a command that
+// can never run again under its key.
+func keepMark(raw, classified error) error {
+	if errors.Is(raw, engine.ErrMayHaveLanded) && noAnswer(raw) {
+		return engine.MayHaveLanded(classified)
+	}
+	return classified
+}
+
+// noAnswer is the write's side of unanswered, which is the logout's: any DisconnectedError
+// rather than ErrIQDisconnected, because whatsmeow's retry after a reconnect names its
+// action "info query (retry)" and that Is does not match it. A deadline counts whole here,
+// since a write has no local cleanup behind it for the deadline to have ended instead.
+func noAnswer(err error) bool {
+	var disconnected *wm.DisconnectedError
+	return errors.As(err, &disconnected) || errors.Is(err, wm.ErrIQTimedOut) ||
+		errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)
 }
 
 // markFailure names what went wrong in the contract's own words.

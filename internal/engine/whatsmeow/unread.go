@@ -101,6 +101,10 @@ func (s *Session) markUnread(ctx context.Context, command *protocol.Command) (js
 // is inside it. Left to the default that would read as this connector's own failure, and
 // send an operator to these logs for something WhatsApp decided.
 func appStateFailure(err error, subject string) error {
+	return keepMark(err, appStateFailureOf(err, subject))
+}
+
+func appStateFailureOf(err error, subject string) error {
 	// The shared failures first, and the order is load-bearing rather than tidy. A 409
 	// conflict has whatsmeow parse and apply the patches it got back before retrying, and
 	// a deadline that runs out in there comes back wrapping both this sentinel and the

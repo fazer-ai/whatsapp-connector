@@ -54,19 +54,22 @@ func TestEveryWriteAReservedCommandMakesIsMarked(t *testing.T) {
 		},
 	}
 
+	// Read up front, before the subtests go parallel: they only look things up here, so the
+	// map is never written while they read it.
 	sources := map[string]string{}
-	read := func(t *testing.T, name string) string {
-		t.Helper()
-		if body, ok := sources[name]; ok {
-			return body
+	for _, made := range writes {
+		for _, w := range made {
+			if _, ok := sources[w.file]; ok {
+				continue
+			}
+			body, err := os.ReadFile(w.file)
+			if err != nil {
+				t.Fatalf("read %s: %v", w.file, err)
+			}
+			sources[w.file] = string(body)
 		}
-		body, err := os.ReadFile(name)
-		if err != nil {
-			t.Fatalf("read %s: %v", name, err)
-		}
-		sources[name] = string(body)
-		return string(body)
 	}
+	read := func(_ *testing.T, name string) string { return sources[name] }
 
 	t.Run("the table covers exactly the commands the ledger reserves", func(t *testing.T) {
 		for command := range protocol.ReservedCommands {

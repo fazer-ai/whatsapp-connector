@@ -482,6 +482,10 @@ var typingStates = map[string]protocol.TypingState{
 // as a read mark's: the library's text does not cross into a reply, and the code is what
 // a caller branches on.
 func presenceFailure(err error) error {
+	return keepMark(err, presenceFailureOf(err))
+}
+
+func presenceFailureOf(err error) error {
 	if named, coded := commandFailure(err, "presence"); named {
 		return coded
 	}

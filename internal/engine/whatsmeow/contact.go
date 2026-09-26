@@ -156,6 +156,10 @@ func resolvedNumber(one *waTypes.IsOnWhatsAppResponse) string {
 // mid-query is the socket rather than a refusal, and reads as `not_connected` like every
 // other command's would.
 func contactFailure(err error, subject string) error {
+	return keepMark(err, contactFailureOf(err, subject))
+}
+
+func contactFailureOf(err error, subject string) error {
 	if named, coded := commandFailure(err, subject); named {
 		return coded
 	}
