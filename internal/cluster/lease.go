@@ -526,7 +526,6 @@ func (l *Leases) Release(ctx context.Context, sid string) (bool, error) {
 	l.mu.Lock()
 	delete(l.held, sid)
 	_, deleted := l.deleted[sid]
-	delete(l.deleted, sid)
 	l.mu.Unlock()
 	keys := l.client.Keys()
 	script, names := releaseScript, []string{keys.Lease(sid), keys.HandBack(sid), keys.OwedWake(sid), keys.Control(), keys.Quarantine(sid)}
@@ -535,7 +534,14 @@ func (l *Leases) Release(ctx context.Context, sid string) (bool, error) {
 	}
 	released, err := script.Run(ctx, l.client, names, l.instance).Int()
 	if err != nil {
+		// The deletion stays recorded: a release that did not land leaves the lease and
+		// the owed wake where they were, and the retry has to drop the wake as well.
 		return false, fmt.Errorf("cluster: release %s: %w", sid, err)
+	}
+	if deleted {
+		l.mu.Lock()
+		delete(l.deleted, sid)
+		l.mu.Unlock()
 	}
 	return released > 0, nil
 }

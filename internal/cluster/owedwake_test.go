@@ -186,17 +186,19 @@ func TestADeletedAccountPutsNoWakeBack(t *testing.T) {
 	for name, rdb := range owedServers(t) {
 		t.Run(name, func(t *testing.T) {
 			for _, tc := range []struct {
-				name        string
-				forgetFails bool
+				name         string
+				forgetFails  bool
+				releaseFails bool
 			}{
-				{"the delete reached Redis", false},
-				{"the delete did not reach Redis", true},
+				{"the delete reached Redis", false, false},
+				{"the delete did not reach Redis", true, false},
+				{"the first release did not reach Redis", false, true},
 			} {
 				t.Run(tc.name, func(t *testing.T) {
 					ctx := context.Background()
 					own := redis.NewClient(rdb.Options())
 					t.Cleanup(func() { _ = own.Close() })
-					failing := &failEpochWrites{}
+					failing := &failWrites{}
 					own.AddHook(failing)
 					client := redisx.Wrap(own, owedPrefix(t, rdb), 8)
 					keys := client.Keys()
@@ -209,14 +211,22 @@ func TestADeletedAccountPutsNoWakeBack(t *testing.T) {
 					if owed, err := peer.OweWake(ctx, "s1", aWake); err != nil || owed != cluster.OwedToHolder {
 						t.Fatalf("given: %v %v", owed, err)
 					}
-					failing.on.Store(tc.forgetFails)
+					failing.naming("lease-epoch:", tc.forgetFails)
 					err := holder.ForgetEpoch(ctx, "s1")
-					failing.on.Store(false)
+					failing.naming("", false)
 					if tc.forgetFails != (err != nil) {
 						t.Fatalf("given: ForgetEpoch answered %v", err)
 					}
 					if owed, err := peer.OweWake(ctx, "s1", aWake); err != nil || owed != cluster.OwedToHolder {
 						t.Fatalf("given: a wake after the delete answered %v %v", owed, err)
+					}
+					if tc.releaseFails {
+						failing.naming("handback:", true)
+						_, err := holder.Release(ctx, "s1")
+						failing.naming("", false)
+						if err == nil {
+							t.Fatal("given: the first release went through")
+						}
 					}
 					if released, err := holder.Release(ctx, "s1"); err != nil || !released {
 						t.Fatalf("the holder's release: %v %v", released, err)
@@ -270,17 +280,27 @@ func TestADeletedAccountPutsNoWakeBack(t *testing.T) {
 	}
 }
 
-// failEpochWrites fails, while on, every command naming an epoch counter, which is what a
-// Redis that went away in the middle of a teardown looks like to ForgetEpoch.
-type failEpochWrites struct{ on atomic.Bool }
+// failWrites fails, while on, every command naming a key that contains the given part,
+// which is what a Redis that went away in the middle of a teardown looks like to the call
+// that sent it.
+type failWrites struct {
+	on   atomic.Bool
+	part atomic.Value
+}
 
-func (*failEpochWrites) DialHook(next redis.DialHook) redis.DialHook { return next }
+func (h *failWrites) naming(part string, on bool) {
+	h.part.Store(part)
+	h.on.Store(on)
+}
 
-func (h *failEpochWrites) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+func (*failWrites) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (h *failWrites) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
 	return func(ctx context.Context, cmd redis.Cmder) error {
 		if h.on.Load() {
+			part, _ := h.part.Load().(string)
 			for _, arg := range cmd.Args() {
-				if key, ok := arg.(string); ok && strings.Contains(key, "lease-epoch:") {
+				if key, ok := arg.(string); ok && strings.Contains(key, part) {
 					cmd.SetErr(errors.New("injected: redis went away"))
 					return cmd.Err()
 				}
@@ -290,7 +310,7 @@ func (h *failEpochWrites) ProcessHook(next redis.ProcessHook) redis.ProcessHook 
 	}
 }
 
-func (*failEpochWrites) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+func (*failWrites) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
 	return next
 }
 
