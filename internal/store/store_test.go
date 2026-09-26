@@ -1153,7 +1153,7 @@ func TestTheConnectorsTablesAreNotSplitAcrossSchemas(t *testing.T) {
 
 	t.Run("an empty schema in front of the tables is refused, creating nothing in it", func(t *testing.T) {
 		db.exec(`CREATE SCHEMA front`)
-		refused(t, db, "front,holding", "front", "holding")
+		refused(t, db, "front,holding", "front", "holding", "put holding first")
 		if n := relationsIn(t, db, "front"); n != 0 {
 			t.Errorf("the refusal left %d relations in the schema in front", n)
 		}
@@ -1162,7 +1162,7 @@ func TestTheConnectorsTablesAreNotSplitAcrossSchemas(t *testing.T) {
 	t.Run("a database an older start already split is refused too", func(t *testing.T) {
 		db.exec(`CREATE SCHEMA split`,
 			`CREATE TABLE split.wac_session_device (LIKE holding.wac_session_device INCLUDING ALL)`)
-		refused(t, db, "split,holding", "split", "holding")
+		refused(t, db, "split,holding", "split", "holding", "put holding first")
 	})
 
 	t.Run("the connector's tables in front of whatsmeow's are refused", func(t *testing.T) {
@@ -1172,7 +1172,11 @@ func TestTheConnectorsTablesAreNotSplitAcrossSchemas(t *testing.T) {
 		mirror.exec(`CREATE SCHEMA mirror`)
 		openThrough(t, mirror, "mirror")
 		mirror.exec(`CREATE SCHEMA behind`, `ALTER TABLE mirror.wac_session_device SET SCHEMA behind`)
-		refused(t, mirror, "mirror,behind", "mirror", "behind")
+		// And from both orders, with the same advice: reordering the path only moves the
+		// refusal from one table to the other, so the message cannot suggest it.
+		for _, path := range []string{"mirror,behind", "behind,mirror"} {
+			refused(t, mirror, path, "mirror", "behind", "move the store into one schema")
+		}
 	})
 
 	t.Run("a path that reaches every table in the schema it would create in opens", func(t *testing.T) {

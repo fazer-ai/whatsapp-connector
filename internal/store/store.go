@@ -276,10 +276,24 @@ func refuseASplitAcrossSchemas(ctx context.Context, db *sql.DB) error {
 		if !at.Valid || at.String == current {
 			continue
 		}
+		// Where the whole store is, if anywhere: that is the schema to put first. With each
+		// half in a schema of its own there is none, and reordering the path would only move
+		// the refusal from one table to the other.
+		var home sql.NullString
+		err := db.QueryRowContext(ctx, `SELECT string_agg(a.table_schema, ', ')
+			FROM information_schema.tables a JOIN information_schema.tables b ON b.table_schema = a.table_schema
+			WHERE a.table_name = $1 AND b.table_name = $2`, tables[0], tables[1]).Scan(&home)
+		if err != nil {
+			return fmt.Errorf("store: look for a schema holding both %s and %s: %w", tables[0], tables[1], err)
+		}
+		mend := "move the store into one schema"
+		if home.Valid {
+			mend = "put " + home.String + " first in the search_path"
+		}
 		return fmt.Errorf("store: %s is in schema %s, but this connection's search_path (%s) "+
 			"creates tables in %s, so the store would be split across the two and what is in "+
-			"%s left unread: put %s first in the search_path, or give the connector a database "+
-			"of its own", tables[i], at.String, searchPath, current, at.String, at.String)
+			"%s left unread: %s, or give the connector a database of its own",
+			tables[i], at.String, searchPath, current, at.String, mend)
 	}
 	return nil
 }
