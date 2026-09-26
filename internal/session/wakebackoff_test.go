@@ -352,14 +352,25 @@ type stallQuarantine struct {
 // opening the account -- an instrument that stops the thing it was meant to observe.
 //
 // The key is what actually distinguishes them: everything a strike does happens under
-// `…quarantine:<sid>`, whatever verb carries it next.
+// `…quarantine:<sid>`, whatever verb carries it next. And nothing else it names is a lease:
+// since #259 the release reads the quarantine too, to hold back a wake it would otherwise
+// put back past the backoff, and a hook that held the release as well would be the
+// instrument stopping the hand-back this test measures the peer's side of.
 func (h *stallQuarantine) carries(cmd redis.Cmder) bool {
+	quarantine := false
 	for _, arg := range cmd.Args() {
-		if key, ok := arg.(string); ok && strings.Contains(key, "quarantine:") {
-			return true
+		key, ok := arg.(string)
+		if !ok {
+			continue
+		}
+		if strings.Contains(key, ":lease:") {
+			return false
+		}
+		if strings.Contains(key, "quarantine:") {
+			quarantine = true
 		}
 	}
-	return false
+	return quarantine
 }
 
 func (h *stallQuarantine) DialHook(next redis.DialHook) redis.DialHook { return next }

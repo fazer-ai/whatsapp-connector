@@ -171,3 +171,97 @@ func TestTheHoldersReleasePutsTheOwedWakeBack(t *testing.T) {
 		})
 	}
 }
+
+// An account deleted here leaves nothing to put back: a wake owed before the delete goes
+// with it, and one a peer leaves after the delete and before the release is acknowledged
+// without being owed, because the release that follows would otherwise have a peer adopt an
+// account that no longer exists.
+func TestADeletedAccountIsOwedNoWake(t *testing.T) {
+	t.Parallel()
+
+	for name, rdb := range owedServers(t) {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			client := redisx.Wrap(rdb, owedPrefix(t, rdb), 8)
+			keys := client.Keys()
+			holder := cluster.NewLeases(client, "inst-a", cluster.Options{})
+			peer := cluster.NewLeases(client, "inst-b", cluster.Options{})
+
+			if _, err := holder.Acquire(ctx, "s1"); err != nil {
+				t.Fatalf("given: %v", err)
+			}
+			if owed, err := peer.OweWake(ctx, "s1", aWake); err != nil || owed != cluster.OwedToHolder {
+				t.Fatalf("given: %v %v", owed, err)
+			}
+			if err := holder.ForgetEpoch(ctx, "s1"); err != nil {
+				t.Fatalf("delete: %v", err)
+			}
+			if owed, err := peer.OweWake(ctx, "s1", aWake); err != nil || owed != cluster.OwedNothing {
+				t.Fatalf("a wake for an account deleted and not yet released answered %v (%v), want OwedNothing", owed, err)
+			}
+			if released, err := holder.Release(ctx, "s1"); err != nil || !released {
+				t.Fatalf("the holder's release: %v %v", released, err)
+			}
+			if n, _ := rdb.XLen(ctx, keys.Control()).Result(); n != 0 {
+				t.Fatalf("the release of a deleted account put %d wakes back", n)
+			}
+			if n, _ := rdb.Exists(ctx, keys.OwedWake("s1")).Result(); n != 0 {
+				t.Fatal("the tombstone outlived the release it was waiting for")
+			}
+		})
+	}
+}
+
+// A wake owed to an account the fleet is leaving alone is dropped by the release rather than
+// put back while the wait lasts, and put back once it is over. A wake put back is a new
+// entry, read as a first delivery, so a put back inside the wait would bring the account up
+// past the backoff; the resume sweep is what brings it back.
+func TestAWakeOwedToAQuarantinedAccountWaitsForTheBackoff(t *testing.T) {
+	t.Parallel()
+
+	for name, rdb := range owedServers(t) {
+		t.Run(name, func(t *testing.T) {
+			for _, tc := range []struct {
+				name    string
+				until   time.Duration
+				putBack int64
+			}{
+				{"inside the wait", time.Hour, 0},
+				{"after the wait", -time.Hour, 1},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					ctx := context.Background()
+					client := redisx.Wrap(rdb, owedPrefix(t, rdb), 8)
+					keys := client.Keys()
+					holder := cluster.NewLeases(client, "inst-a", cluster.Options{})
+					peer := cluster.NewLeases(client, "inst-b", cluster.Options{})
+
+					if _, err := holder.Acquire(ctx, "s1"); err != nil {
+						t.Fatalf("given: %v", err)
+					}
+					if owed, err := peer.OweWake(ctx, "s1", aWake); err != nil || owed != cluster.OwedToHolder {
+						t.Fatalf("given: %v %v", owed, err)
+					}
+					// Against the server's own clock, which is the one the release reads.
+					now, err := rdb.Time(ctx).Result()
+					if err != nil {
+						t.Fatalf("read the server's clock: %v", err)
+					}
+					until := now.Add(tc.until).UnixMilli()
+					if err := rdb.HSet(ctx, keys.Quarantine("s1"), "strikes", 1, "until", until).Err(); err != nil {
+						t.Fatalf("given: %v", err)
+					}
+					if released, err := holder.Release(ctx, "s1"); err != nil || !released {
+						t.Fatalf("the holder's release: %v %v", released, err)
+					}
+					if n, _ := rdb.XLen(ctx, keys.Control()).Result(); n != tc.putBack {
+						t.Fatalf("the release put %d wakes back, want %d", n, tc.putBack)
+					}
+					if n, _ := rdb.Exists(ctx, keys.OwedWake("s1")).Result(); n != 0 {
+						t.Fatal("the owed wake outlived the release that settled it")
+					}
+				})
+			}
+		})
+	}
+}

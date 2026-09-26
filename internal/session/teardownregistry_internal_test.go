@@ -1231,6 +1231,11 @@ func TestAWakeReadBeforeADeleteIsNotPutBackAfterIt(t *testing.T) {
 	case <-time.After(testwait.Budget):
 		t.Fatal("the delete was never acknowledged")
 	}
+	// And one read after the delete, while the holder still holds the lease it is about to
+	// let go: acknowledged, because there is nothing it could start, and left owed to nobody.
+	if got := dispatchWake(t, peer, sid, "c-wake-after-delete"); got != "acked" {
+		t.Fatalf("a wake read between the delete and the release ended %s, want acked", got)
+	}
 	for range 3 {
 		holder.RenewAll(ctx, time.Now().Add(time.Minute))
 		holder.SweepRetired(ctx, time.Now().Add(time.Minute))

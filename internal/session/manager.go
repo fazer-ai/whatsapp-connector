@@ -1087,6 +1087,10 @@ func (m *Manager) oweWake(ctx context.Context, delivery *transport.Delivery) boo
 		m.log.Warn().Str("sid", sid).Msg("a wake found a lease that is still being handed back; leaving it pending")
 		release(delivery)
 		return false
+	case owed == cluster.OwedNothing:
+		// The owner deleted the account and is about to let it go: there is nothing for the
+		// wake to start, and it is acknowledged as it was before #259.
+		return true
 	case owed == cluster.OwedNobodyHolds:
 		// Let go between the adoption that failed and here: the account is free, and the
 		// wake is what starts it. Kept at its age, so it is taken first on the next pass.
