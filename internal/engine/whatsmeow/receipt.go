@@ -357,7 +357,15 @@ func keepMark(raw, classified error) error {
 // version and keys and encodes the patch on the caller's context first -- and a mark on the
 // second is a command that never went out answering `timeout` for a day. So a deadline costs
 // a redelivery that carries the write out again, which is what it cost before #282.
+//
+// A rejected patch wins over both. On a 409 whatsmeow fetches the conflicting patches before
+// it would try again, and a download that times out or loses the socket there comes back
+// wrapping ErrAppStateUpdate together with the timeout: WhatsApp refused the write, and the
+// retry never went out.
 func noAnswer(err error) bool {
+	if errors.Is(err, wm.ErrAppStateUpdate) {
+		return false
+	}
 	var disconnected *wm.DisconnectedError
 	return errors.As(err, &disconnected) || errors.Is(err, wm.ErrIQTimedOut)
 }

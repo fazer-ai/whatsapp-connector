@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 
 	wm "go.mau.fi/whatsmeow"
@@ -47,6 +48,10 @@ func TestTheMarkSurvivesClassificationOnlyForAnUnansweredWrite(t *testing.T) {
 		// Ambiguous, and so not marked: the same error ends a store read before the node is
 		// built, where nothing went out.
 		{"the command's deadline ran out", context.DeadlineExceeded, false, protocol.ErrorTimeout},
+		// How SendAppState words a 409 whose conflicting patches could not be fetched:
+		// the write was refused, and the timeout is the download's, not the write's.
+		{"a refused patch whose conflicts could not be fetched", fmt.Errorf("%w (also, parsing patches in the response failed: %w)",
+			fmt.Errorf("%w: conflict", wm.ErrAppStateUpdate), wm.ErrIQTimedOut), false, ""},
 	}
 
 	commands := []struct {
