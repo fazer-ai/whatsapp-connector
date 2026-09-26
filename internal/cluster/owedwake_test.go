@@ -30,9 +30,9 @@ func owedServers(t *testing.T) map[string]*redis.Client {
 		if err != nil {
 			t.Fatalf("parse %s: %v", RedisEnv, err)
 		}
-		real := redis.NewClient(opts)
-		t.Cleanup(func() { _ = real.Close() })
-		servers["redis"] = real
+		server := redis.NewClient(opts)
+		t.Cleanup(func() { _ = server.Close() })
+		servers["redis"] = server
 	}
 	return servers
 }
