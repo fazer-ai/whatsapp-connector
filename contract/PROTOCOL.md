@@ -138,15 +138,15 @@ start. So a count that changes under a running client is an operator re-sharding
 safe answer is to stop reading and restart on the new count once the old streams are
 drained, not to follow it on the fly: the sessions that moved would be read out of order.
 
-| sid | shard of 8 | shard of 16 |
-|---|---|---|
-| (empty string) | 5 | 5 |
-| `inbox-1` | 1 | 9 |
-| `inbox-2` | 0 | 0 |
-| `inbox-7` | 7 | 15 |
-| `9c2b7d1e-0000-4000-8000-0000000000c1` | 0 | 8 |
-| `sessão-ç` | 7 | 7 |
-| `abc` | 3 | 11 |
+| sid | `fnv1a32(sid)` | shard of 8 | shard of 16 |
+|---|---|---|---|
+| (empty string) | `0x811c9dc5` | 5 | 5 |
+| `inbox-1` | `0x2cb1ca69` | 1 | 9 |
+| `inbox-2` | `0x29b1c5b0` | 0 | 0 |
+| `inbox-7` | `0x2eb1cd8f` | 7 | 15 |
+| `9c2b7d1e-0000-4000-8000-0000000000c1` | `0x9cac14b8` | 0 | 8 |
+| `sessão-ç` | `0x71e18cc7` | 7 | 7 |
+| `abc` | `0x1a47e90b` | 3 | 11 |
 
 **A client must deduplicate on `message.id`, and `seq` does not do it for you.** Delivery
 is at-least-once per event, and the two mechanisms cover different things. `seq` catches
