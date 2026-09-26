@@ -462,3 +462,62 @@ func TestAResumeWhoseRecordCannotBeReadAgainGoesByWhatThisInstanceKnows(t *testi
 		})
 	}
 }
+
+// A disconnect whose row could not be written is still a disconnect. The executor that ran
+// it knows, and the row -- which still says `connected` -- is older than that: a wake that
+// reads it and believes it would dial the account its client has just turned off.
+func TestAWakeDoesNotUndoADisconnectThatCouldNotBeRecorded(t *testing.T) {
+	t.Parallel()
+
+	target := storetest.New(t)
+	container, err := store.Open(t.Context(), target.URL, store.AlwaysOwned, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = container.Close() })
+	pairedAs(t, container, "s1", store.Wants{})
+	h := newHarnessWithStore(t, container)
+	if _, err := h.manager.Adopt(context.Background(), "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+
+	// Writes to the row refused from here on, reads left alone.
+	refuse := []string{
+		`CREATE TRIGGER wac_refuse_insert BEFORE INSERT ON wac_session_desired BEGIN SELECT RAISE(ABORT, 'refused'); END`,
+		`CREATE TRIGGER wac_refuse_update BEFORE UPDATE ON wac_session_desired BEGIN SELECT RAISE(ABORT, 'refused'); END`,
+	}
+	if target.Postgres() {
+		refuse = []string{
+			`CREATE FUNCTION wac_refuse() RETURNS trigger AS $$ BEGIN RAISE EXCEPTION 'refused'; END $$ LANGUAGE plpgsql`,
+			`CREATE TRIGGER wac_refuse BEFORE INSERT OR UPDATE ON wac_session_desired FOR EACH ROW EXECUTE FUNCTION wac_refuse()`,
+		}
+	}
+	for _, statement := range refuse {
+		if _, err := target.Pool(t).ExecContext(t.Context(), statement); err != nil {
+			t.Fatalf("refuse writes: %v", err)
+		}
+	}
+
+	h.manager.Dispatch(delivery(&protocol.Command{
+		V: protocol.Version, ID: "d1", Type: protocol.CommandSessionDisconnect, SID: "s1", ReplyTo: "d1",
+		Payload: json.RawMessage(`{}`),
+	}, &atomic.Bool{}))
+	waitFor(t, "a reply to the disconnect", func() bool { _, ok := h.recorder.reply("d1"); return ok })
+	if _, wanted, err := container.WantedSession(t.Context(), "s1"); err != nil || !wanted {
+		t.Fatalf("the row reads wanted=%v (err %v); this test needs it still saying connected", wanted, err)
+	}
+
+	var acked atomic.Bool
+	wake(h, "s1", `{"desired":"connected"}`, &acked)
+	waitFor(t, "the wake to be acknowledged", acked.Load)
+	h.manager.Dispatch(delivery(&protocol.Command{
+		V: protocol.Version, ID: "st", Type: protocol.CommandSessionStatus, SID: "s1", ReplyTo: "st",
+		Payload: json.RawMessage(`{}`),
+	}, &atomic.Bool{}))
+	waitFor(t, "a reply to the status", func() bool { _, ok := h.recorder.reply("st"); return ok })
+
+	engineSession, _ := h.engine.Session("s1")
+	if got := engineSession.Connects(); got != 0 {
+		t.Fatalf("the account was dialled %d times after a disconnect this instance carried out", got)
+	}
+}

@@ -50,9 +50,9 @@ type Session struct {
 	// Until then an empty asked means "not known here", not "asked for nothing".
 	askedKnown bool
 	// askedDown is whether the last request this executor carried out said the session
-	// should stay down. With asked, it is what this instance knows the client wants without
-	// asking the store: every command that changes it reaches the lease holder and runs
-	// here, so it is the fallback when the store cannot be read.
+	// should stay down. With asked, it is what this instance knows the client wants: every
+	// command that changes it reaches the lease holder and runs here, so it is never older
+	// than the row, and newer when writing the row failed.
 	askedDown bool
 
 	commands chan queued
@@ -1317,21 +1317,28 @@ func (s *Session) lifecycle(ctx context.Context, command *protocol.Command, inte
 		if internal && s.store != nil {
 			// A resume the connector queued for itself carries what the record said when
 			// it was queued, and a command queued ahead of it -- a disconnect, a connect
-			// naming another proxy -- may have changed that since. Read again here, on the
-			// executor that ran that command, so the resume brings back what the client
-			// asks for now; carried out on the old copy it would undo the disconnect, or
-			// write the old proxy back over the new one.
-			current, still, err := s.stillWanted(ctx)
-			if err != nil {
-				// Not a reason to give up. The session is adopted and nothing else comes
-				// for it -- the sweep asks only about accounts nobody runs -- so failing
-				// here leaves it down until the process ends. What the client asked for
-				// since this instance took the account over ran on this executor, so it is
-				// known here without the store; and when nothing has, the copy that was
-				// queued is the last reading there is.
-				s.log.Warn().Err(err).Str("sid", s.sid).
-					Msg("could not read the record again before a resume; going by what this instance was last asked")
-				current, still = s.lastAskedHere(request)
+			// naming another proxy -- may have changed that since. Carried out on that
+			// copy it would undo the disconnect, or put the old proxy back.
+			//
+			// What this executor was last asked comes first. Every command that changes
+			// what the client wants reaches the lease holder and runs here, and only here
+			// is the row written, so what is known here is never older than the row -- and
+			// it is newer when a write failed: a disconnect whose row still says
+			// `connected` is still a disconnect. The row is read only when nothing has
+			// been asked here since the account was taken over, because the instance
+			// before this one may have written it after the copy was queued. A row that
+			// cannot be read is not a reason to give up: the account is adopted, the sweep
+			// does not ask about it, and failing here would leave it down until the process
+			// ends. The queued copy is then the last reading there is.
+			current, still, known := s.lastAskedHere()
+			if !known {
+				read, wanted, err := s.stillWanted(ctx)
+				if err != nil {
+					s.log.Warn().Err(err).Str("sid", s.sid).
+						Msg("could not read the record again before a resume; going by the request as queued")
+					read, wanted = request, true
+				}
+				current, still = read, wanted
 			}
 			if !still {
 				s.log.Info().Str("sid", s.sid).
@@ -1472,16 +1479,16 @@ func (s *Session) stillWanted(ctx context.Context) (engine.ConnectRequest, bool,
 	return resumeRequest(wants), wanted, nil
 }
 
-// lastAskedHere is what the client last asked this instance for, or the queued request
-// when it has asked nothing here since the account was taken over.
-func (s *Session) lastAskedHere(queued engine.ConnectRequest) (engine.ConnectRequest, bool) {
+// lastAskedHere is what the client last asked this instance for, and whether it has asked
+// anything here at all since the account was taken over.
+func (s *Session) lastAskedHere() (engine.ConnectRequest, bool, bool) {
 	switch {
 	case s.askedDown:
-		return engine.ConnectRequest{}, false
+		return engine.ConnectRequest{}, false, true
 	case s.askedKnown:
-		return resumeRequest(s.asked), true
+		return resumeRequest(s.asked), true, true
 	default:
-		return queued, true
+		return engine.ConnectRequest{}, false, false
 	}
 }
 
