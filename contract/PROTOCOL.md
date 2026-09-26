@@ -118,6 +118,36 @@ is willing to wait for an answer, not to how long the teardown is allowed to tak
 `seq` is monotonic per `(sid, epoch)` and, together with the per-session shard
 assignment, is what lets the consumer drop out-of-order redeliveries.
 
+**A client must read the number of event streams from `wa:meta`, and consume every one of
+them.** The count is the `event_shards` field of the `wa:meta` hash, and the streams are
+`wa:events:0` up to `wa:events:<event_shards - 1>`. A session's events all land on one of
+them, and which one is `fnv1a32(sid) % event_shards`: the 32-bit FNV-1a hash of the sid's
+UTF-8 bytes, taken modulo the count. A client that reads every stream does not need the
+hash; one that wants to locate a single session's stream does, and it is half of the
+agreement, so it is spelled out here with vectors below. A client that assumes a count
+instead of reading one is wrong for a fraction of its sessions and silently so: with 8
+streams read against 16 published, every session on streams 8 to 15 never receives an
+event, and everything else works.
+
+A client must read it when it starts, and can keep it from then on. A connector writes `wa:meta` when it starts,
+before it opens any session, so no event exists until the count does. A client that starts
+first may read a provisional count meanwhile, provided it takes the published one as soon
+as it appears and never reads fewer streams than that. The published count only changes with
+the whole fleet stopped: a connector whose own count disagrees with `wa:meta` refuses to
+start. So a count that changes under a running client is an operator re-sharding, and the
+safe answer is to stop reading and restart on the new count once the old streams are
+drained, not to follow it on the fly: the sessions that moved would be read out of order.
+
+| sid | `fnv1a32(sid)` | shard of 8 | shard of 16 |
+|---|---|---|---|
+| (empty string) | `0x811c9dc5` | 5 | 5 |
+| `inbox-1` | `0x2cb1ca69` | 1 | 9 |
+| `inbox-2` | `0x29b1c5b0` | 0 | 0 |
+| `inbox-7` | `0x2eb1cd8f` | 7 | 15 |
+| `9c2b7d1e-0000-4000-8000-0000000000c1` | `0x9cac14b8` | 0 | 8 |
+| `sessão-ç` | `0x71e18cc7` | 7 | 7 |
+| `abc` | `0x1a47e90b` | 3 | 11 |
+
 **A client must deduplicate on `message.id`, and `seq` does not do it for you.** Delivery
 is at-least-once per event, and the two mechanisms cover different things. `seq` catches
 the same event handed over twice by the transport. It does not catch the case where one
