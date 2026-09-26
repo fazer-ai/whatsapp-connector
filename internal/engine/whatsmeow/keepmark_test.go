@@ -32,8 +32,9 @@ func TestTheMarkSurvivesClassificationOnlyForAnUnansweredWrite(t *testing.T) {
 		marked bool
 		code   protocol.ErrorCode
 	}
-	// The same six failures for each classifier: three with the write out and no answer,
-	// and three where the outcome is known -- refused by WhatsApp, or never sent.
+	// The same failures for each classifier: three with the write out and no answer, three
+	// where the outcome is known -- refused by WhatsApp, or never sent -- and a deadline,
+	// which could be either.
 	outcomes := []outcome{
 		// No code: what a disconnect reads as is each classifier's own business, and the
 		// presence one, which never sends a query, has no word for it.
@@ -43,6 +44,9 @@ func TestTheMarkSurvivesClassificationOnlyForAnUnansweredWrite(t *testing.T) {
 		{"WhatsApp refused it", &wm.IQError{Code: 403, Text: "forbidden"}, false, protocol.ErrorWaError},
 		{"the socket was gone before the write", wm.ErrNotConnected, false, protocol.ErrorNotConnected},
 		{"there was no client to write with", wm.ErrClientIsNil, false, protocol.ErrorNotConnected},
+		// Ambiguous, and so not marked: the same error ends a store read before the node is
+		// built, where nothing went out.
+		{"the command's deadline ran out", context.DeadlineExceeded, false, protocol.ErrorTimeout},
 	}
 
 	commands := []struct {

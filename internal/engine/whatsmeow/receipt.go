@@ -346,14 +346,20 @@ func keepMark(raw, classified error) error {
 	return classified
 }
 
-// noAnswer is the write's side of unanswered, which is the logout's: any DisconnectedError
-// rather than ErrIQDisconnected, because whatsmeow's retry after a reconnect names its
-// action "info query (retry)" and that Is does not match it. A deadline counts whole here,
-// since a write has no local cleanup behind it for the deadline to have ended instead.
+// noAnswer is the two failures whatsmeow only returns once the frame is out: the socket
+// went before the answer, and the answer did not come within the query's own timeout. Any
+// DisconnectedError rather than ErrIQDisconnected, because whatsmeow's retry after a
+// reconnect names its action "info query (retry)" and that Is does not match it.
+//
+// Not the command's deadline, although it is the commonest way to stop waiting. A context
+// error comes back as the same bare ctx.Err() whether it ended the wait for an answer or a
+// store read the library does before it builds the node -- SendAppState reads the app state
+// version and keys and encodes the patch on the caller's context first -- and a mark on the
+// second is a command that never went out answering `timeout` for a day. So a deadline costs
+// a redelivery that carries the write out again, which is what it cost before #282.
 func noAnswer(err error) bool {
 	var disconnected *wm.DisconnectedError
-	return errors.As(err, &disconnected) || errors.Is(err, wm.ErrIQTimedOut) ||
-		errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)
+	return errors.As(err, &disconnected) || errors.Is(err, wm.ErrIQTimedOut)
 }
 
 // markFailure names what went wrong in the contract's own words.
