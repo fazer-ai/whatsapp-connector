@@ -416,7 +416,7 @@ func TestAResumeWhoseRecordCannotBeReadAgainGoesByWhatThisInstanceKnows(t *testi
 				t.Fatalf("store.Open: %v", err)
 			}
 			t.Cleanup(func() { _ = container.Close() })
-			pairedAs(t, container, "s1", store.Wants{})
+			pairedAs(t, container, "s1", store.Wants{Groups: true, CallAutoReject: true})
 			h := newHarnessWithStore(t, container)
 			if _, err := h.manager.Adopt(context.Background(), "s1"); err != nil {
 				t.Fatalf("Adopt: %v", err)
@@ -453,6 +453,11 @@ func TestAResumeWhoseRecordCannotBeReadAgainGoesByWhatThisInstanceKnows(t *testi
 			waitFor(t, "a reply to the status", func() bool { _, ok := h.recorder.reply("st"); return ok })
 			if got := engineSession.Connects(); got != tc.dials {
 				t.Fatalf("the account was dialled %d times, want %d", got, tc.dials)
+			}
+			// And with what the client asked for, which is all the queued copy carries.
+			if request, dialled := engineSession.Asked(); dialled && (!request.Groups || request.Calls == nil) {
+				t.Fatalf("the resume went out as %s, without the subscription and call policy it was queued with",
+					render(t, request))
 			}
 		})
 	}
