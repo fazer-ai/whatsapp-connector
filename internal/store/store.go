@@ -176,6 +176,10 @@ func OpenWith(ctx context.Context, address string, owned Ownership, log zerolog.
 			_ = db.Close()
 			return nil, err
 		}
+		if err := refuseASplitAcrossSchemas(ctx, db); err != nil {
+			_ = db.Close()
+			return nil, err
+		}
 	}
 	devices := sqlstore.NewWithDB(db, dialect, nil)
 	if err := devices.Upgrade(ctx); err != nil {
@@ -230,6 +234,68 @@ func refuseAnUnreachableVersionTable(ctx context.Context, db *sql.DB) error {
 		"does not reach, and whatsmeow's upgrade would take it for this connector's own and "+
 		"then fail to read it: give the connector a database of its own, or a search_path "+
 		"that includes the schema its tables are in", whatsmeowVersionTable, schemas.String, searchPath)
+}
+
+// ownTable stands for the tables this package creates, which are created together: the one
+// whose schema says where the rest of them are.
+const ownTable = "wac_session_device"
+
+// refuseASplitAcrossSchemas stops a start that would leave the store's tables in two
+// schemas, reading half of them from one and half from the other.
+//
+// Every table here and in whatsmeow is named bare, so a new one goes into the first
+// schema of `search_path` that exists (`current_schema()`), and `CREATE TABLE IF NOT
+// EXISTS` only looks there. With another schema put in front of the one holding the
+// tables, a start created an empty second set in it and read from that: a paired account
+// came back unbound and unwanted, and the next connect paired it again while its device
+// was still in the schema behind (#331). The same holds the other way round, the
+// connector's tables behind whatsmeow's, which is why both are asked about.
+//
+// Only a table the path does reach is compared: one it does not reach at all is either
+// #278's case, refused above, or a neighbour this connector never reads. And only one the
+// role holds some privilege on, the filter `information_schema` applies and the reason
+// whatsmeow's upgrade does not see the rest: a role with a schema of its own in front of
+// `public` can see another role's tables there by name, cannot use them, and builds its
+// own store where it creates, which works and is not a split.
+func refuseASplitAcrossSchemas(ctx context.Context, db *sql.DB) error {
+	var (
+		current, searchPath string
+		found               [2]sql.NullString
+	)
+	const schemaOf = `(SELECT n.nspname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE c.oid = to_regclass(%[1]s)
+			AND has_table_privilege(to_regclass(%[1]s), 'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER'))`
+	query := `SELECT COALESCE(current_schema(), ''), current_setting('search_path'), ` +
+		fmt.Sprintf(schemaOf, "$1") + `, ` + fmt.Sprintf(schemaOf, "$2")
+	tables := [2]string{whatsmeowVersionTable, ownTable}
+	err := db.QueryRowContext(ctx, query, tables[0], tables[1]).Scan(&current, &searchPath, &found[0], &found[1])
+	if err != nil {
+		return fmt.Errorf("store: look for %s and %s: %w", tables[0], tables[1], err)
+	}
+	for i, at := range found {
+		if !at.Valid || at.String == current {
+			continue
+		}
+		// Where the whole store is, if anywhere: that is the schema to put first. With each
+		// half in a schema of its own there is none, and reordering the path would only move
+		// the refusal from one table to the other.
+		var home sql.NullString
+		err := db.QueryRowContext(ctx, `SELECT string_agg(a.table_schema, ', ')
+			FROM information_schema.tables a JOIN information_schema.tables b ON b.table_schema = a.table_schema
+			WHERE a.table_name = $1 AND b.table_name = $2`, tables[0], tables[1]).Scan(&home)
+		if err != nil {
+			return fmt.Errorf("store: look for a schema holding both %s and %s: %w", tables[0], tables[1], err)
+		}
+		mend := "move the store into one schema"
+		if home.Valid {
+			mend = "put " + home.String + " first in the search_path"
+		}
+		return fmt.Errorf("store: %s is in schema %s, but this connection's search_path (%s) "+
+			"creates tables in %s, so the store would be split across the two and what is in "+
+			"%s left unread: %s, or give the connector a database of its own",
+			tables[i], at.String, searchPath, current, at.String, mend)
+	}
+	return nil
 }
 
 // idleConnLifetime is how long an unused connection is kept. Long enough that a quiet

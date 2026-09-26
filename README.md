@@ -248,7 +248,9 @@ Give each connector a PostgreSQL database of its own. Its tables go in whichever
 the connection's `search_path` resolves to, and whatsmeow's upgrade looks for its version
 table in every schema it can see: a `whatsmeow_version` in a schema that path does not
 reach, whether another connector's or another application's, makes the connector refuse
-to start rather than guess which one is its own.
+to start rather than guess which one is its own. So does a path that puts another schema in
+front of the one holding the tables, since new tables would go there and the store would be
+read from two places.
 
 ### The fleet bench
 
