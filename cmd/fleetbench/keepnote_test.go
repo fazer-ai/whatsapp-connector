@@ -7,6 +7,7 @@ import (
 	"go/ast"
 	"go/token"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -132,7 +133,7 @@ func TestARunWithKeepSaysWhatItKeptInItsReport(t *testing.T) {
 	// Given back by the names the run's own first note prints, which is there whether or not
 	// the -keep line is: -keep is exactly what the run did not do, and a failure here must
 	// not leave a database behind on the server make check shares.
-	own := regexp.MustCompile(`banco desta corrida: (\S+) · prefixo: (\S+) · arquivos: (\S+)`).FindStringSubmatch(out.String())
+	own := regexp.MustCompile(`(?m)banco desta corrida: (\S+) · prefixo: (\S+) · arquivos: (.+)$`).FindStringSubmatch(out.String())
 	if own == nil {
 		t.Fatalf("the report does not say which database and prefix the run made:\n%s", out.String())
 	}
@@ -168,7 +169,9 @@ func TestARunWithKeepSaysWhatItKeptInItsReport(t *testing.T) {
 }
 
 // keptLine is the note a run with -keep prints, with the three names it gives.
-var keptLine = regexp.MustCompile(`guardado a pedido \(-keep\): banco (\S+), prefixo (\S+), (\S+)`)
+// The directory runs to the end of the line: a TMPDIR with a space in it would otherwise
+// cut the path short, and the cleanup would be handed a different directory.
+var keptLine = regexp.MustCompile(`(?m)guardado a pedido \(-keep\): banco (\S+), prefixo (\S+), (.+)$`)
 
 // giveBack drops what a run with -keep left, by the names it printed.
 func giveBack(t *testing.T, database, prefix, dir string) {
@@ -181,6 +184,12 @@ func giveBack(t *testing.T, database, prefix, dir string) {
 	left := &run{database: database, prefix: prefix, adminURL: os.Getenv(databaseVar), rdb: redis.NewClient(options)}
 	for _, trouble := range left.cleanup(context.Background()) {
 		t.Errorf("give back: %s", trouble)
+	}
+	// Only a directory the bench names itself: the path came out of text this test parsed,
+	// and a parse that went wrong must not end in removing something else.
+	if !strings.HasPrefix(filepath.Base(dir), "wac-fleetbench-") {
+		t.Errorf("give back: %q is not a directory the bench makes, so it is left alone", dir)
+		return
 	}
 	_ = os.RemoveAll(dir)
 }
