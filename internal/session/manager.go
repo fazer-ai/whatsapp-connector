@@ -1033,6 +1033,9 @@ func (m *Manager) wake(ctx context.Context, delivery *transport.Delivery) {
 			release(delivery)
 			return
 		}
+		if !m.oweWake(ctx, delivery) {
+			return
+		}
 	default:
 		// Left unacknowledged on purpose. Every instance reads this stream through one
 		// consumer group, so acknowledging a wake nobody could act on retires it: the
@@ -1048,6 +1051,49 @@ func (m *Manager) wake(ctx context.Context, delivery *transport.Delivery) {
 		return
 	}
 	m.ack(ctx, delivery)
+}
+
+// oweWake leaves a wake for the instance that owns its account, and reports whether the
+// wake may now be acknowledged (#259).
+//
+// Acknowledged, because the account has an owner. But the owner may have decided a moment
+// ago to give the account back and not have written its mark yet, and acknowledged into
+// that gap the wake is the one thing that would have started the account again once it is
+// unowned. So it is left owed to the owner, and the owner's release puts it back on the
+// control stream in the same step (cluster.Leases.OweWake). An owner that keeps the
+// account never releases, and the entry expires having done nothing: a peer still does not
+// hold wakes pending for an account somebody runs, which is the loop #241 was.
+//
+// Put back under an id of its own, since the original is acknowledged here, with the same
+// account and the same payload.
+func (m *Manager) oweWake(ctx context.Context, delivery *transport.Delivery) bool {
+	sid := delivery.Command.SID
+	again := delivery.Command
+	again.ID = m.newID()
+	again.TS = time.Now().UnixMilli()
+	fields, err := again.Fields()
+	if err != nil {
+		m.log.Error().Err(err).Str("sid", sid).Msg("could not render a wake to leave for the account's owner; leaving it pending")
+		forfeit(delivery)
+		return false
+	}
+	owed, err := m.leases.OweWake(ctx, sid, fields)
+	switch {
+	case err != nil:
+		m.log.Error().Err(err).Str("sid", sid).Msg("could not leave a wake for the account's owner; leaving it pending")
+		forfeit(delivery)
+		return false
+	case owed == cluster.OwedHandingBack:
+		m.log.Warn().Str("sid", sid).Msg("a wake found a lease that is still being handed back; leaving it pending")
+		release(delivery)
+		return false
+	case owed == cluster.OwedNobodyHolds:
+		// Let go between the adoption that failed and here: the account is free, and the
+		// wake is what starts it. Kept at its age, so it is taken first on the next pass.
+		release(delivery)
+		return false
+	}
+	return true
 }
 
 // wakeWants reads whether a `session.wake` puts its account in the air, and with what.

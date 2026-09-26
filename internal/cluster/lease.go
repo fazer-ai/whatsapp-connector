@@ -57,12 +57,63 @@ return 0
 // hand-back mark with it in the same step: the mark says an owner is on its way to
 // letting go, and the moment it has, the account is free and a peer asking should be
 // told so rather than told to wait for a hand-back that already happened.
+//
+// And it puts back the wake a peer acknowledged while this instance held the account
+// (#259). A peer that reads a wake for an account some instance owns acknowledges it,
+// because the account has an owner; it cannot tell an owner that keeps the account from
+// one that decided a moment ago to give it back and has not written its mark yet. So the
+// peer leaves the wake here, under the holder's name, and the release is where it is
+// settled: an owner that lets go puts the wake on the control stream again, in the same
+// step as the release, so no peer can read the lease free and the wake gone. An owner
+// that keeps the account never releases, and the entry expires with nothing done.
+//
+// Only the holder's own entry: one left for an instance that no longer holds the lease
+// is about a hand-back that already happened or never will.
 var releaseScript = redis.NewScript(`
 if redis.call("GET", KEYS[1]) ~= ARGV[1] then
   return 0
 end
 redis.call("DEL", KEYS[1])
 redis.call("DEL", KEYS[2])
+if redis.call("HGET", KEYS[3], "holder") == ARGV[1] then
+  local fields = redis.call("HGETALL", KEYS[3])
+  local entry = {}
+  for i = 1, #fields, 2 do
+    if fields[i] ~= "holder" then
+      entry[#entry + 1] = fields[i]
+      entry[#entry + 1] = fields[i + 1]
+    end
+  end
+  redis.call("XADD", KEYS[4], "*", unpack(entry))
+  redis.call("DEL", KEYS[3])
+  return 2
+end
+return 1
+`)
+
+// oweWakeScript leaves a wake for the instance holding an account, to be put back on the
+// control stream if that instance lets the account go.
+//
+// In one step with reading the holder, for the same reason the acquire reads the mark in
+// its own: a release landing between a failed acquisition and a separate write would find
+// nothing owed, and the entry written after it would name an instance that has already
+// let go. Inside the script the release either lands first, and the account is free (0),
+// or after, and it finds the entry.
+//
+// Answers 0 when nobody holds the lease any more, 2 when the holder has already marked
+// itself as handing it back (the wake is then left pending, as before), and 1 when the
+// wake is owed.
+var oweWakeScript = redis.NewScript(`
+local holder = redis.call("GET", KEYS[1])
+if not holder then
+  return 0
+end
+if redis.call("GET", KEYS[2]) == holder then
+  return 2
+end
+redis.call("DEL", KEYS[3])
+redis.call("HSET", KEYS[3], "holder", holder, unpack(ARGV, 2))
+redis.call("PEXPIRE", KEYS[3], ARGV[1])
 return 1
 `)
 
@@ -442,17 +493,59 @@ func (l *Leases) MarkHandingBack(ctx context.Context, sid string) error {
 }
 
 // Release gives up a lease and clears the hand-back mark. It reports whether this
-// instance was the one holding it.
+// instance was the one holding it. A wake a peer left owed to this instance goes back on
+// the control stream in the same step (see releaseScript).
 func (l *Leases) Release(ctx context.Context, sid string) (bool, error) {
 	l.forget(sid)
 	keys := l.client.Keys()
-	released, err := releaseScript.Run(
-		ctx, l.client, []string{keys.Lease(sid), keys.HandBack(sid)}, l.instance,
+	released, err := releaseScript.Run(ctx, l.client,
+		[]string{keys.Lease(sid), keys.HandBack(sid), keys.OwedWake(sid), keys.Control()}, l.instance,
 	).Int()
 	if err != nil {
 		return false, fmt.Errorf("cluster: release %s: %w", sid, err)
 	}
-	return released == 1, nil
+	return released > 0, nil
+}
+
+// Owed is what OweWake found.
+type Owed int
+
+const (
+	// OwedNobodyHolds is a lease nobody holds any more: the account is free to adopt.
+	OwedNobodyHolds Owed = iota
+	// OwedToHolder is a wake left for the holder, put back on the control stream if the
+	// holder lets the account go.
+	OwedToHolder
+	// OwedHandingBack is a holder that has already marked itself as giving the account
+	// back, so the wake is to be left pending rather than owed.
+	OwedHandingBack
+)
+
+// OweWake leaves the wake whose stream fields are given for whichever instance holds sid's
+// lease, to be put back on the control stream if that instance lets the account go (#259).
+// It is kept for one lease TTL: a holder that has not let go by then is one that kept the
+// account.
+func (l *Leases) OweWake(ctx context.Context, sid string, wake map[string]string) (Owed, error) {
+	keys := l.client.Keys()
+	args := make([]any, 0, 1+2*len(wake))
+	args = append(args, l.ttl.Milliseconds())
+	for field, value := range wake {
+		args = append(args, field, value)
+	}
+	owed, err := oweWakeScript.Run(ctx, l.client,
+		[]string{keys.Lease(sid), keys.HandBack(sid), keys.OwedWake(sid)}, args...,
+	).Int()
+	if err != nil {
+		return OwedNobodyHolds, fmt.Errorf("cluster: owe a wake for %s: %w", sid, err)
+	}
+	switch owed {
+	case 1:
+		return OwedToHolder, nil
+	case 2:
+		return OwedHandingBack, nil
+	default:
+		return OwedNobodyHolds, nil
+	}
 }
 
 // Unleased keeps the sessions no instance holds a lease for, in the order they came in.

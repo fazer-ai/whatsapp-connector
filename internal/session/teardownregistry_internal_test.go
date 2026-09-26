@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"errors"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -925,25 +926,19 @@ func TestNoWayOutOfTheSessionMapLeavesARegistrationBehind(t *testing.T) {
 	}
 }
 
-// A peer retires the one wake for an account this instance is about to give back, and
-// this pins that it does, because #259 is the change that will make it stop.
+// A peer that reads the wake for an account this instance is about to give back no longer
+// retires it for good (#259).
 //
 // Between the refusal arming an account and the heartbeat releasing it, this instance owns
-// the account and has written no mark, so a peer's `Acquire` is answered with the ordinary
-// `not_owner` and the wake is acknowledged rather than left pending. That window is not
-// this fix's: measured on `185ba8f` at the hand-back the base already has, a retired
-// session loses a peer's wake exactly the same way and is released on the next tick.
+// the account and has written no mark, so a peer's acquisition is answered with the ordinary
+// `not_owner`. The peer still acknowledges the wake -- it cannot tell this owner from one
+// that keeps the account -- but leaves it owed to the owner, and the release that the next
+// beat makes puts it back on the control stream. Read from there by the peer, it adopts.
 //
-// What this hand-back adds is what comes after: on the base the account stayed here and a
-// `session.connect` for it was served by the session still in the map, and once it goes
-// back that connect is released and left pending for an owner only another wake will
-// produce -- measured `acked=1 released=1` against `acked=0 released=2`. The account it was
-// served by is one this instance should not have been holding.
-//
-// Asserting what the connector does today rather than what it should do, which is worth
-// saying out loud: the fix for #259 turns the acknowledgement below into a release, and
-// this test is meant to go red when it does.
-func TestAPeerRetiresTheWakeForAnAccountAboutToGoBack(t *testing.T) {
+// It used to be the other way, and this test pinned it: the wake was acknowledged into
+// nothing, the account went back owned by nobody, and a `session.connect` that followed was
+// left pending on both instances (`acked=0 released=2`).
+func TestAWakeAPeerReadsWhileTheAccountIsAboutToGoBackReturnsWithTheRelease(t *testing.T) {
 	t.Parallel()
 
 	server := miniredis.RunT(t)
@@ -952,20 +947,7 @@ func TestAPeerRetiresTheWakeForAnAccountAboutToGoBack(t *testing.T) {
 	client := redisx.Wrap(rdb, "wa:", 8)
 	ctx := context.Background()
 
-	instance := func(name string) *Manager {
-		manager := NewManager(&ManagerConfig{
-			Instance: name, Engine: fake.New(),
-			Leases:    cluster.NewLeases(client, name, cluster.Options{}),
-			Publisher: quietPublisher{}, Replier: quietReplier{},
-			NewID: func() string { return "evt" }, Logger: zerolog.New(io.Discard),
-		})
-		t.Cleanup(func() { manager.StopAll(ctx) })
-		answering, stopAnswering := context.WithCancel(ctx)
-		stopped := manager.Answer(answering)
-		t.Cleanup(func() { stopAnswering(); <-stopped })
-		return manager
-	}
-	holder, peer := instance("inst-a"), instance("inst-b")
+	holder, peer := twoOverOneRedis(t, client)
 
 	const sid = "sess-registry-peerwake"
 	acked := make(chan struct{})
@@ -984,29 +966,227 @@ func TestAPeerRetiresTheWakeForAnAccountAboutToGoBack(t *testing.T) {
 	}
 	settled(t, holder, sid, armed)
 
-	// The peer reads the wake off the control stream while this instance still owns the
-	// account, which is the whole of the window.
-	var wakeAcked, wakeReleased, wakeForfeited atomic.Int64
-	peer.Dispatch(&transport.Delivery{
-		Command: protocol.Command{V: protocol.Version, Type: protocol.CommandSessionWake, SID: sid, ID: "c-wake"},
-		Ack:     func(context.Context) error { wakeAcked.Add(1); return nil },
-		Release: func() { wakeReleased.Add(1) },
-		Forfeit: func() { wakeForfeited.Add(1) },
+	wakeThroughTheWindow(t, holder, peer, rdb, sid, func() {
+		holder.RenewAll(ctx, time.Now().Add(time.Minute))
 	})
+}
+
+// The hand-back the base already had, the same way: a session the engine retired is let go
+// on the next beat, and a wake a peer read in between comes back with the release.
+func TestAWakeAPeerReadsWhileARetiredSessionIsAboutToGoBackReturnsWithTheRelease(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+	ctx := context.Background()
+
+	holder, peer := twoOverOneRedis(t, client)
+
+	const sid = "sess-retired-peerwake"
+	if _, err := holder.Adopt(ctx, sid); err != nil {
+		t.Fatalf("given: Adopt: %v", err)
+	}
+	engine := holder.engine.(*fake.Engine)
+	session, ok := engine.Session(sid)
+	if !ok {
+		t.Fatal("given: no engine session")
+	}
+	session.EmitLast(protocol.EventSessionLoggedOut, map[string]any{"reason": "logged_out"})
 	deadline := time.Now().Add(testwait.Budget)
-	for time.Now().Before(deadline) && wakeAcked.Load()+wakeReleased.Load()+wakeForfeited.Load() == 0 {
+	for time.Now().Before(deadline) && session.Finished() == 0 {
 		time.Sleep(testwait.Poll)
 	}
-	if wakeAcked.Load() != 1 {
-		t.Fatalf("the peer no longer retires the wake: acked=%d released=%d forfeited=%d. If #259 is what changed this, the account now keeps the ask that would start it and this test has served its purpose",
-			wakeAcked.Load(), wakeReleased.Load(), wakeForfeited.Load())
-	}
-	if peer.Count() != 0 {
-		t.Fatalf("the peer adopted an account this instance owns: %d running", peer.Count())
+	if session.Finished() == 0 {
+		t.Fatal("given: the engine never said its last word")
 	}
 
-	holder.RenewAll(ctx, time.Now().Add(time.Minute))
+	wakeThroughTheWindow(t, holder, peer, rdb, sid, func() {
+		holder.RenewAll(ctx, time.Now().Add(time.Minute))
+		holder.SweepRetired(ctx, time.Now().Add(time.Minute))
+	})
+}
+
+// And an owner that keeps the account puts nothing back: the wake is acknowledged, as it
+// always was, and no entry reaches the control stream however many beats go by. This is
+// what keeps a peer from bouncing wakes for an account somebody runs, which is #241.
+func TestAWakeForAnAccountItsOwnerKeepsIsNotPutBack(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+	ctx := context.Background()
+
+	holder, peer := twoOverOneRedis(t, client)
+	const sid = "sess-kept-peerwake"
+	if _, err := holder.Adopt(ctx, sid); err != nil {
+		t.Fatalf("given: Adopt: %v", err)
+	}
+
+	for range 3 {
+		if got := dispatchWake(t, peer, sid, "c-wake-kept"); got != "acked" {
+			t.Fatalf("a wake for an account its owner runs ended %s, want acknowledged", got)
+		}
+		holder.RenewAll(ctx, time.Now().Add(time.Minute))
+		holder.SweepRetired(ctx, time.Now().Add(time.Minute))
+	}
+	if woken := controlWakes(t, rdb); len(woken) != 0 {
+		t.Fatalf("an owner that kept the account put %d wakes back on the control stream", len(woken))
+	}
+	if holder.Count() != 1 || peer.Count() != 0 {
+		t.Fatalf("ownership moved: holder runs %d, peer runs %d", holder.Count(), peer.Count())
+	}
+}
+
+// twoOverOneRedis is two instances sharing one Redis, each answering its own sessions.
+func twoOverOneRedis(t *testing.T, client *redisx.Client) (holder, peer *Manager) {
+	t.Helper()
+	ctx := context.Background()
+	ids := atomic.Int64{}
+	instance := func(name string) *Manager {
+		manager := NewManager(&ManagerConfig{
+			Instance: name, Engine: fake.New(),
+			Leases:    cluster.NewLeases(client, name, cluster.Options{}),
+			Publisher: quietPublisher{}, Replier: quietReplier{},
+			NewID:  func() string { return fmt.Sprintf("%s-%d", name, ids.Add(1)) },
+			Logger: zerolog.New(io.Discard),
+		})
+		t.Cleanup(func() { manager.StopAll(ctx) })
+		answering, stopAnswering := context.WithCancel(ctx)
+		stopped := manager.Answer(answering)
+		t.Cleanup(func() { stopAnswering(); <-stopped })
+		return manager
+	}
+	return instance("inst-a"), instance("inst-b")
+}
+
+// dispatchWake hands a wake to manager and says how it ended: acked, released or forfeited.
+func dispatchWake(t *testing.T, manager *Manager, sid, id string) string {
+	t.Helper()
+	ended := make(chan string, 1)
+	manager.Dispatch(&transport.Delivery{
+		Command: protocol.Command{V: protocol.Version, Type: protocol.CommandSessionWake, SID: sid, ID: id},
+		Ack:     func(context.Context) error { ended <- "acked"; return nil },
+		Release: func() { ended <- "released" },
+		Forfeit: func() { ended <- "forfeited" },
+	})
+	select {
+	case got := <-ended:
+		return got
+	case <-time.After(testwait.Budget):
+		t.Fatalf("the wake %s was never settled", id)
+		return ""
+	}
+}
+
+// controlWakes reads the wakes on the control stream, oldest first.
+func controlWakes(t *testing.T, rdb *redis.Client) []protocol.Command {
+	t.Helper()
+	entries, err := rdb.XRange(context.Background(), "wa:control", "-", "+").Result()
+	if err != nil {
+		t.Fatalf("read the control stream: %v", err)
+	}
+	var wakes []protocol.Command
+	for _, entry := range entries {
+		fields := map[string]string{}
+		for name, value := range entry.Values {
+			fields[name], _ = value.(string)
+		}
+		command, err := protocol.ParseCommand(fields)
+		if err != nil {
+			t.Fatalf("an entry on the control stream does not parse as a command: %v (%v)", err, entry.Values)
+		}
+		if command.Type == protocol.CommandSessionWake {
+			wakes = append(wakes, command)
+		}
+	}
+	return wakes
+}
+
+// wakeThroughTheWindow is the two-instance sequence both hand-backs share: the peer reads a
+// wake while holder still owns sid and has not marked it, beat lets the account go, and the
+// wake that comes back on the control stream makes the peer the owner, under a newer epoch.
+func wakeThroughTheWindow(t *testing.T, holder, peer *Manager, rdb *redis.Client, sid string, beat func()) {
+	t.Helper()
+	before, ok := holder.leases.Owned(sid)
+	if !ok {
+		t.Fatal("given: the holder does not own the account")
+	}
+
+	if got := dispatchWake(t, peer, sid, "c-wake"); got != "acked" {
+		t.Fatalf("the peer ended the wake %s; with the account owned it is acknowledged", got)
+	}
+	if peer.Count() != 0 {
+		t.Fatalf("the peer adopted an account the holder owns: %d running", peer.Count())
+	}
+	if woken := controlWakes(t, rdb); len(woken) != 0 {
+		t.Fatalf("a wake went back on the control stream before the account was let go: %v", woken)
+	}
+
+	beat()
 	if holder.Count() != 0 {
-		t.Fatalf("the account was not given back: %d running", holder.Count())
+		t.Fatalf("given: the account was not given back: %d running", holder.Count())
+	}
+
+	woken := controlWakes(t, rdb)
+	if len(woken) != 1 {
+		t.Fatalf("the release put %d wakes back on the control stream, want the one the peer acknowledged", len(woken))
+	}
+	if woken[0].SID != sid || woken[0].ID == "c-wake" {
+		t.Fatalf("the wake put back is %+v, want one for %s under an id of its own", woken[0], sid)
+	}
+	if got := dispatchWake(t, peer, sid, woken[0].ID); got != "acked" {
+		t.Fatalf("the wake put back ended %s at the peer, want it to adopt", got)
+	}
+	after, ok := peer.leases.Owned(sid)
+	if !ok || peer.Count() != 1 {
+		t.Fatalf("the peer does not own the account after the wake came back: owned=%v running=%d", ok, peer.Count())
+	}
+	if after.Epoch <= before.Epoch {
+		t.Fatalf("the account changed hands under epoch %d, not above the holder's %d", after.Epoch, before.Epoch)
+	}
+}
+
+// The two answers that leave the wake pending rather than owed (#259): the account was let
+// go between the adoption that failed and the wake being left, so it is free and the wake
+// is what starts it; or its owner has already marked the hand-back, and the wake waits for
+// the release as it always did. Acknowledged in either, the wake would be retired into an
+// account nobody will start.
+func TestAWakeThatCannotBeOwedIsLeftPending(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", 8)
+	ctx := context.Background()
+	holder, peer := twoOverOneRedis(t, client)
+
+	if _, err := holder.leases.Acquire(ctx, "s-back"); err != nil {
+		t.Fatalf("given: %v", err)
+	}
+	if err := holder.leases.MarkHandingBack(ctx, "s-back"); err != nil {
+		t.Fatalf("given: %v", err)
+	}
+	for sid, why := range map[string]string{
+		"s-free": "an account nobody holds",
+		"s-back": "an account whose owner marked the hand-back",
+	} {
+		var acked, released, forfeited int
+		delivery := &transport.Delivery{
+			Command: protocol.Command{V: protocol.Version, Type: protocol.CommandSessionWake, SID: sid, ID: "c-" + sid},
+			Ack:     func(context.Context) error { acked++; return nil },
+			Release: func() { released++ },
+			Forfeit: func() { forfeited++ },
+		}
+		if peer.oweWake(ctx, delivery) {
+			t.Fatalf("%s: the wake was reported owed, so it would be acknowledged", why)
+		}
+		if released != 1 || acked != 0 || forfeited != 0 {
+			t.Fatalf("%s: acked=%d released=%d forfeited=%d, want it released", why, acked, released, forfeited)
+		}
 	}
 }
