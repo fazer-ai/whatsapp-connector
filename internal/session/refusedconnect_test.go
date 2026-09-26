@@ -16,18 +16,17 @@ import (
 //
 // The record of what a client asked for moved out of the whatsmeow engine in #266 and now
 // sits here, written before the engine is called so that an instance dying inside a
-// connect still leaves a resumable account. That ordering put the write in front of five
+// connect still leaves a resumable account. That ordering put the write in front of the
 // refusals that used to sit above it, and each of them is a request no later attempt can
-// get through: a proxy and a history sync this build does not do, and two payloads it
-// cannot read. Recorded, they would have the sweep dial the account again every pass, for
-// ever.
+// get through: a history sync this build does not do, a proxy it cannot dial, and two
+// payloads it cannot read. Recorded, they would have the sweep dial the account again
+// every pass, for ever.
 //
 // The proxy is the one with teeth, and it is why this is a correctness test and not a
-// tidiness one. The connect a sweep synthesises carries no proxy at all -- `store.Wants`
-// holds the subscription and the call policy, and nothing else -- so an account recorded
-// from a refused proxy request comes back connected *directly*, putting the deployment's
-// own address on the wire. That is the exact outcome the refusal exists to prevent, and
-// the client is never told, because from its side the command it sent failed.
+// tidiness one. The row carries the proxy since #217, so the connect the sweep synthesises
+// would carry the malformed one too: refused on every pass, the account would never come
+// back, and the client is never told why, because from its side the command it sent
+// failed once and was answered.
 //
 // Both halves are asserted for each request, because either alone passes for the wrong
 // reason: a refusal with the row written is the defect above, and an empty table with the
@@ -40,7 +39,7 @@ func TestAConnectThisBuildRefusesIsNotRecorded(t *testing.T) {
 		payload string
 		code    protocol.ErrorCode
 	}{
-		{"proxy", `{"pairing":"qr","proxy":{"url":"socks5://10.0.0.1:1080"}}`, protocol.ErrorUnsupported},
+		{"proxy", `{"pairing":"qr","proxy":{"url":"ftp://10.0.0.1:21"}}`, protocol.ErrorInvalidPayload},
 		{"history sync", `{"pairing":"qr","history_sync":true}`, protocol.ErrorUnsupported},
 		{"unknown pairing mode", `{"pairing":"telepatia"}`, protocol.ErrorInvalidPayload},
 		{"code pairing without a phone", `{"pairing":"code","phone":"+ ()-"}`, protocol.ErrorInvalidPayload},
@@ -127,9 +126,8 @@ func TestAConnectThisBuildRefusesIsNotRecorded(t *testing.T) {
 				t.Fatalf("after a connect carrying %s was refused, the sweep would bring back %v.\n"+
 					"Nothing can make that request succeed -- it is this build refusing a capability, "+
 					"or a payload it cannot read -- so the sweep retries it every pass for ever. For "+
-					"the proxy it is worse than a wasted pass: the synthesised connect carries no "+
-					"proxy, so the account comes back dialling WhatsApp directly and the deployment's "+
-					"address goes on the wire, which is what the refusal existed to prevent.",
+					"the proxy it is worse than a wasted pass: the row carries the proxy, so every "+
+					"synthesised connect repeats the malformed one and the account never comes back.",
 					c.name, wanted)
 			}
 		})
@@ -152,7 +150,7 @@ func TestTheRefusalsOfAConnectDoNotDependOnTheEngine(t *testing.T) {
 		request engine.ConnectRequest
 		code    protocol.ErrorCode
 	}{
-		{"proxy", engine.ConnectRequest{Pairing: "qr", Proxy: &engine.ProxyRequest{URL: "socks5://10.0.0.1:1080"}}, protocol.ErrorUnsupported},
+		{"proxy", engine.ConnectRequest{Pairing: "qr", Proxy: &engine.ProxyRequest{URL: "ftp://10.0.0.1:21"}}, protocol.ErrorInvalidPayload},
 		{"history sync", engine.ConnectRequest{Pairing: "qr", HistorySync: true}, protocol.ErrorUnsupported},
 		{"unknown pairing mode", engine.ConnectRequest{Pairing: "telepatia"}, protocol.ErrorInvalidPayload},
 		{"code pairing without a phone", engine.ConnectRequest{Pairing: "code", Phone: "+ ()-"}, protocol.ErrorInvalidPayload},

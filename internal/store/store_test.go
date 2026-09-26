@@ -1188,4 +1188,9 @@ func TestAnOlderStoreResumesItsSessionsWithoutGroups(t *testing.T) {
 	if wanted[0].Groups {
 		t.Fatal("an upgrade turned group conversation on for a session whose client never asked for it")
 	}
+	// And direct, which is the only thing a session did before #217: the connect refused
+	// a proxy, so no row an older build wrote can stand for one.
+	if wanted[0].Proxy != "" {
+		t.Fatalf("an upgrade resumes a session through %q, which its client never asked for", wanted[0].Proxy)
+	}
 }

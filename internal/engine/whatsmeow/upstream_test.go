@@ -219,6 +219,54 @@ var upstreamDefects = []upstreamDefect{
 			"path a send takes after the disconnect its ceiling is meant to survive",
 	},
 	{
+		issue: "fazer-ai/whatsapp-connector#280",
+		file:  "client.go",
+		// Not a defect. A resume whose first dial fails is retried only because this branch
+		// hands a retryable failure to the reconnect loop and answers nil, and it runs only
+		// with `InitialAutoReconnect`, which `dial` sets for a resume and for nothing else. A pin that stopped
+		// dispatching the drop, stopped starting the loop, or went back to returning the
+		// error would leave that line setting a field nothing reads, with the suite green.
+		inOrder: []string{
+			"isRetryableConnectError(err) && cli.InitialAutoReconnect && cli.EnableAutoReconnect {",
+			"go cli.dispatchEvent(&events.Disconnected{})",
+			"go cli.autoReconnect(ctx)",
+			"return nil",
+		},
+		enclosing: "func (cli *Client) ConnectContext(",
+		what: "a retryable failure of the first dial being handed to the reconnect loop, " +
+			"announced as a drop, and answered nil",
+		reliedOn: true,
+		restingOn: "`client.InitialAutoReconnect = retry` in session.go's dial, and the " +
+			"account whose resume dial met a network that was away coming back on its own",
+	},
+	{
+		issue: "fazer-ai/whatsapp-connector#280",
+		file:  "client.go",
+		// What that branch calls retryable. A dial that fails is wrapped in ErrDialFailed
+		// (the entry below), which is the case #280 is about: the network or the proxy was
+		// away. The network error covers a failure after the socket, in the handshake.
+		// The condition as a whole line where the body allows it, so one that grew a clause
+		// does not read as the same one.
+		stillThere: []string{"\tif exhttp.IsNetworkError(err) {\n", "\treturn errors.Is(err, socket.ErrDialFailed)"},
+		enclosing:  "func isRetryableConnectError(",
+		what:       "a failed dial and a network error counting as retryable failures of the first dial",
+		reliedOn:   true,
+		restingOn: "the same line in dial: without it a resume that met a network that was " +
+			"away is left adopted and unconnected again",
+	},
+	{
+		issue: "fazer-ai/whatsapp-connector#280",
+		file:  "socket/framesocket.go",
+		// And the wrapping that makes a failed dial one of those, whatever the error below
+		// it was: a refused connection, a proxy that hung up, a name that did not resolve.
+		stillThere: []string{"return fmt.Errorf(\"%w: %w\", ErrDialFailed, err)"},
+		enclosing:  "func (fs *FrameSocket) Connect(",
+		what:       "a websocket dial that failed being reported as ErrDialFailed",
+		reliedOn:   true,
+		restingOn: "the retry dial turns on for a resume, which only takes failures " +
+			"isRetryableConnectError recognises",
+	},
+	{
 		issue: "fazer-ai/whatsapp-connector#90",
 		file:  "download-to-file.go",
 		// The retry rewinds and writes over the same file without shortening it, so an

@@ -187,9 +187,19 @@ that is where the warning belongs.
 Requirements: Go (version in `go.mod`) and
 [golangci-lint](https://golangci-lint.run/) v2. Most tests bring their own doubles
 (`miniredis`, SQLite), and two passes do not: the suite against a real PostgreSQL, which
-is the dialect a deployment runs, and the transport against a real Redis, for the stream
-counters miniredis answers zero for. `make check` runs all of it and needs both servers;
-`make check-offline` is the half that needs nothing listening.
+is the dialect a deployment runs, and the packages that talk to Redis against a real one,
+for what miniredis answers differently from a server. `make check` runs all of it and
+needs both servers; `make check-offline` is the half that needs nothing listening.
+
+CI runs the Redis pass twice: against `redis:8`, and against `redis:6.2`, the oldest
+version this connector supports, because a command form newer than the floor passes
+against the newest server and miniredis alike. `make check` asks for one Redis and does
+not run the floor pass. To run it locally, point `WAC_TEST_REDIS_URL` at a 6.2:
+
+```bash
+docker run -d --rm -p 56362:6379 redis:6.2-alpine
+WAC_TEST_REDIS_URL=redis://localhost:56362/0 make test-redis
+```
 
 ```bash
 make setup          # git hooks + module download
@@ -234,11 +244,60 @@ Starting the whatsmeow engine without a database is refused rather than defaulte
 connector with nowhere to keep a pairing asks every session to scan a QR code on every
 restart, and reports itself healthy while doing it.
 
+### The fleet bench
+
+Leases, epochs, shards, `seq` and fencing are the half of this connector that only two
+processes under load can disprove, and the suite runs in one. `make bench-fleet` starts a
+real fleet against a real PostgreSQL and a real Redis, kills the owner with commands in
+flight, and asserts the operational invariants over what reached the streams:
+
+```bash
+WAC_TEST_DATABASE_URL=postgres://wac:wac@localhost:55432/wac?sslmode=disable \
+WAC_TEST_REDIS_URL=redis://localhost:56379/0 make bench-fleet
+```
+
+It runs with `WAC_ENGINE=fake`, and the run says so in its own output, so that no number
+it prints is ever read as a number about the real engine. The fake is not a shortcut
+around the thing being measured: none of the machinery these assertions are about knows
+which engine is behind the session. What the choice costs is that **whatsmeow under an
+ownership change is not covered by this bench and cannot be** -- pairing a real account
+needs a physical device (`NEEDS_PHYSICAL_DEVICE`), and no run of it ever touches a real
+WhatsApp account. So a green run says the fleet's own machinery holds across processes;
+it does not say whether a real socket, a real pairing and a real message survive an
+ownership change. That half has no measurement here.
+
+It answers in four exit codes, because a script reads the code and not the prose:
+
+| code | outcome | what it means |
+|---|---|---|
+| 0 | `VERDE` | every assertion held |
+| 1 | `INVARIANTE QUEBRADA` | an operational invariant is broken: a defect |
+| 2 | `SETUP INCOMPLETO` | the machine was not ready: not a defect, and not a pass |
+| 3 | `MEDIDA FORA DA FAIXA` | a measurement fell outside a range somebody declared |
+
+One code for all of them is what turns a bad capacity number into a rejection and a broken
+invariant into "that number again", so they are kept apart on purpose. **`make` cannot keep
+them apart**: GNU make exits 2 for any failing recipe, whatever the recipe's own code was.
+A script that needs the three failures told apart runs the binary the target builds:
+
+```bash
+go build -o bin/fleetbench ./cmd/fleetbench
+WAC_TEST_DATABASE_URL=… WAC_TEST_REDIS_URL=… bin/fleetbench; echo $?
+```
+
+`make bench-fleet` prints the code it got before it exits, and make's own
+`*** [bench-fleet] Error 3` names it too, so a human reading the output sees which of the
+three it was. What neither of them changes is the status make leaves behind, which is 2.
+
+It is deliberately outside `make check`: it builds a binary, starts processes and waits on
+real clocks, which is minutes rather than the seconds `check` is allowed on every change.
+The exemption is recorded in `internal/toolchain`, where the suite reads it.
+
 ### Configuration
 
 | Variable | Default | What it is |
 |---|---|---|
-| `REDIS_URL` | `redis://127.0.0.1:6379` | The Redis shared with the client. Deliberately not `WAC_`-prefixed: both sides read the same variable, so they cannot be pointed at different servers |
+| `REDIS_URL` | `redis://127.0.0.1:6379` | The Redis shared with the client, 6.2 or newer (see below). Deliberately not `WAC_`-prefixed: both sides read the same variable, so they cannot be pointed at different servers |
 | `REDIS_PASSWORD` | — | Overrides the password in the URL, for deployments that pass the two separately |
 | `WAC_INSTANCE` | the hostname | This instance's id. In a container the hostname is the container id, which is unique per replica |
 | `WAC_REDIS_PREFIX` | `wa:` | Namespaces every key, so one Redis can host two independent fleets |
@@ -261,6 +320,21 @@ restart, and reports itself healthy while doing it.
 | `WAC_HEARTBEAT` | `5s` | How often leases are renewed and the instance re-announces. Also bounds how long a read waits on Redis (half a heartbeat), and has to leave room for the read and the batch before it: `1.5 × heartbeat + lease/3 < lease` |
 | `WAC_CLAIM_MIN_IDLE` | `1.5 × lease` | How long a command sits unacknowledged before another instance takes it over. Must exceed `WAC_LEASE_TTL` |
 | `WAC_LOG_LEVEL` | `info` | zerolog level |
+
+### Which Redis
+
+Redis 6.2 or newer. `XAUTOCLAIM`, which the transport reclaims unanswered commands with,
+arrived in 6.2, so that is the floor. The connector asks the server its version with
+`HELLO` when it starts and refuses to start below 6.2, or when the server does not say
+which version it runs, naming both. It does that before it writes anything to Redis, so a
+refused instance leaves no trace in the fleet. A server that speaks the Redis protocol
+under another name, such as Valkey, is held to the version it reports.
+
+Two things need 7.0 and are absent on 6.2, where the server does not report the counters
+they read: the warning when a `MAXLEN` trim cut commands nobody was handed, and the lag of
+a consumer group. On 6.2 every group reports `wac_stream_lag_unknown 1` and no
+`wac_stream_lag` sample; `wac_stream_pending` and `wac_stream_consumers` are reported as
+on any other version.
 
 ### The one key that never expires
 
@@ -310,7 +384,7 @@ on the client side or nowhere, and today it is nowhere
 | **M2** ✅ | Messages in and out (text, media, location, contact, reaction, edit, revoke, quoted, mentions), receipts, read marks, chat presence, account presence, idempotent sends. All of them are in both ways, and a body this build has no arm for arrives as a placeholder rather than disappearing, and one WhatsApp masked from every linked device says so rather than reading as a type this build cannot render. What it leaves behind is in the issues rather than here: a presence state is dropped when the publisher has stopped answering and the queue is full ([#47](https://github.com/fazer-ai/whatsapp-connector/issues/47)), and one delayed across a reconnect is published as if it were fresh ([#49](https://github.com/fazer-ai/whatsapp-connector/issues/49)) |
 | **M3** ✅ | Groups, contacts and calls. A group is created, read, listed and left, renamed, given a description, a photo and its settings (`announce`, `locked`, `join_approval`, `member_add_mode`), and its participants added, removed, promoted and demoted; its invite link is served and its join requests are listed and answered. What changes about a group while the connection is up is published rather than waiting for the next reconnect. A contact is checked for an account, asked for its profile and its picture, and resolved to the address the wire uses. A call is published as it arrives and again when it ends, announced once however many times WhatsApp announces it, and `calls.auto_reject` on the connect has the connector refuse it without the account ever ringing -- the offer still goes out, because somebody rang either way. What a connect asks for is remembered beside the account, so an instance that brings it back puts back the group traffic and the call policy its client asked for rather than half of them |
 | **M4** | Multi-instance under load, quarantine, metrics/lag/DLQ, operations docs. Quarantine is in: a session that keeps failing to start is held out of the retry cadence instead of being dialled at the same rate forever. The six metrics this exposes count what one instance did (sessions running, events published, command duration, leases lost, and whether commands are still being read) and none of them measure the fleet: how far behind a client's consumer group is, how many commands are pending, and what happened to one that no instance could carry out. Operations docs are the configuration table above and nothing else |
-| **M5** | Pairing code ✅ and the passkey relay ✅: WhatsApp's challenge is handed to the operator's client, the assertion it signs is handed back, and the confirmation code is published for the operator to read off their phone. A **per-session proxy** is the one left ([#217](https://github.com/fazer-ai/whatsapp-connector/issues/217)): the connect parses one and then refuses it with `unsupported`, because connecting directly for a deployment that asked for its egress to be routed puts that deployment's own address on the wire, and does it silently |
+| **M5** ✅ | Pairing code ✅, the passkey relay ✅ (WhatsApp's challenge is handed to the operator's client, the assertion it signs is handed back, and the confirmation code is published for the operator to read off their phone) and a **per-session proxy** ✅ ([#217](https://github.com/fazer-ai/whatsapp-connector/issues/217)): a connect naming `http`, `https` or `socks5` sends that session's traffic with WhatsApp through it, remembers it for the resume, and never falls back to connecting directly |
 | **M6** | Opt-in history sync, and the only milestone that does not hold up a general release. `history.request` and `history.sync` are in the contract, `HistorySync` reaches the engine, and a connect asking for it is refused with `unsupported`: what the phone answers with is the whole dump it hands a newly linked device, so the window and the volume are a policy this side has to decide before it publishes any of it |
 
 ## License

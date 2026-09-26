@@ -1297,6 +1297,17 @@ func TestATrimThatCutUndeliveredCommandsIsSaidOutLoud(t *testing.T) {
 
 	f := realFleet(t)
 	ctx := context.Background()
+	// Both counters arrived in Redis 7.0. On 6.2, the oldest server this connector runs on,
+	// neither is reported, the arithmetic has nothing to work with, and the cut goes
+	// unsaid: the diagnosis does not exist there, which is what the skip says rather than
+	// a red CI pass against the floor would.
+	version, found, err := f.client.ServerVersion(ctx)
+	if err != nil || !found {
+		t.Fatalf("ask the server its version: %q, found %v, err %v", version, found, err)
+	}
+	if major, _, _ := strings.Cut(version, "."); major == "6" {
+		t.Skipf("Redis %s reports neither entries-added nor entries-read, which arrived in 7.0, so there is no cut to say", version)
+	}
 	stream := f.client.Keys().Commands("s1")
 	// An earlier owner read what there was and stopped there, which is where the group's
 	// last-delivered-id stays.

@@ -185,20 +185,33 @@ func (c *Container) groupCreation(ctx context.Context, sid, attempt string) (Gro
 	return found, true, nil
 }
 
-// SweepGroupCreations drops the attempts last written before the cutoff, and reports how
-// many. Without a sweep the row count is the number of groups the deployment has ever made.
+// SweepGroupCreations drops the attempts last written before `before`, and the attempts
+// that began before `unnamedBefore` without ever learning which group they made, and
+// reports how many. Without a sweep the row count is the number of groups the deployment
+// has ever made.
 //
 // By when the row was last written rather than when it began: what it covers is a
 // redelivery, and a delivery can sit pending for as long as nobody acknowledges it, so an
 // attempt still waiting to hear which group it made needs its row as much as a fresh one.
 //
+// Except past a ceiling counted from when it began, for an attempt that never named a
+// group (#277). Being asked about pushes `touched_at` forward, so an intent whose request
+// never reached WhatsApp -- a process that died between writing it and sending, or a write
+// the connector gave up on after the database had committed it -- was kept alive by the
+// very retries that could not settle it, and answered `not_settled` for as long as the
+// client asked. Measured from `started_at`, the ceiling reaches it however often it is
+// retried, and the delivery after that creates cleanly under the same key. What it costs is
+// stated in contract/PROTOCOL.md: a notification that arrives later than the ceiling, for a
+// request that did go out, loses to it, and the retry after the sweep makes a second group.
+//
 // What is left, stated rather than hidden: a redelivery arriving after both the ledger and
 // this record have forgotten the command makes a second group, and no finite retention
 // removes that. What bounds it in practice is the client's own `MAXLEN` trim on the command
 // stream, which is a length and not a time and so is not this table's to measure.
-func (c *Container) SweepGroupCreations(ctx context.Context, before time.Time) (int64, error) {
-	const drop = `DELETE FROM wac_group_create WHERE touched_at < ?`
-	done, err := c.db.ExecContext(ctx, c.rebind(drop), before.UnixMilli())
+func (c *Container) SweepGroupCreations(ctx context.Context, before, unnamedBefore time.Time) (int64, error) {
+	const drop = `DELETE FROM wac_group_create
+		WHERE touched_at < ? OR (group_jid IS NULL AND started_at < ?)`
+	done, err := c.db.ExecContext(ctx, c.rebind(drop), before.UnixMilli(), unnamedBefore.UnixMilli())
 	if err != nil {
 		return 0, fmt.Errorf("store: sweep the group creations: %w", err)
 	}

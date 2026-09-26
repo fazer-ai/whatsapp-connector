@@ -596,8 +596,8 @@ func TestARefusedConnectLeavesTheGroupSubscriptionAlone(t *testing.T) {
 	}{
 		{"code pairing with no phone", engine.ConnectRequest{Pairing: "code"}},
 		{"a pairing mode this connector does not know", engine.ConnectRequest{Pairing: "telepathy"}},
-		{"a proxy this build cannot route through", engine.ConnectRequest{
-			Pairing: "resume", Proxy: &engine.ProxyRequest{URL: "socks5://127.0.0.1:1080"},
+		{"a proxy nobody can dial", engine.ConnectRequest{
+			Pairing: "resume", Proxy: &engine.ProxyRequest{URL: "ftp://127.0.0.1:21"},
 		}},
 		{"a history import this build cannot do", engine.ConnectRequest{Pairing: "resume", HistorySync: true}},
 	} {

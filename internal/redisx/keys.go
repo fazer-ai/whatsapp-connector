@@ -111,6 +111,10 @@ func (k Keys) LeaseEpoch(sid string) string { return k.prefix + "lease-epoch:" +
 // account is owned by nobody with the one wake that would have started it retired.
 func (k Keys) HandBack(sid string) string { return k.prefix + "handback:" + sid }
 
+// OwedWake is a `session.wake` a peer acknowledged for an account this instance held, kept
+// so that handing the account back puts the wake on the control stream again (#259).
+func (k Keys) OwedWake(sid string) string { return k.prefix + "owed-wake:" + sid }
+
 // Resume is the cool-off that follows an attempt to bring a session back, so the fleet
 // asks about one account at most once per window rather than once per instance per pass.
 func (k Keys) Resume(sid string) string { return k.prefix + "resume:" + sid }

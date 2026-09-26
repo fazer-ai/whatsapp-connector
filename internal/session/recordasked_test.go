@@ -38,7 +38,7 @@ import (
 // a session turned off has to stay off across a restart, and a record that only ever said
 // "connected" would dial it again.
 //
-// The subscription and the call policy travel with it. A resume has no other way of
+// The subscription, the call policy and the proxy travel with it. A resume has no other way of
 // learning them: the connect a sweep synthesises is not a frame a client sent, so what it
 // does not carry is absent rather than defaulted, and the session comes back acknowledging
 // group traffic it publishes nowhere.
@@ -55,7 +55,8 @@ func TestAConnectIsRememberedWithWhatItAskedFor(t *testing.T) {
 
 	connect := &protocol.Command{
 		V: protocol.Version, ID: "c1", Type: protocol.CommandSessionConnect, SID: "s1", ReplyTo: "c1",
-		Payload: json.RawMessage(`{"pairing":"qr","groups":true,"calls":{"auto_reject":true}}`),
+		Payload: json.RawMessage(`{"pairing":"qr","groups":true,"calls":{"auto_reject":true},` +
+			`"proxy":{"url":"socks5://user:secret@10.0.0.1:1080"}}`),
 	}
 	var acked atomic.Bool
 	h.manager.Dispatch(delivery(connect, &acked))
@@ -79,6 +80,12 @@ func TestAConnectIsRememberedWithWhatItAskedFor(t *testing.T) {
 			"missing here is a session that comes back deaf to the traffic its client asked "+
 			"for, acknowledging it and publishing it nowhere.",
 			wanted[0].Groups, wanted[0].CallAutoReject)
+	}
+	if wanted[0].Proxy != "socks5://user:secret@10.0.0.1:1080" {
+		t.Fatalf("the row carries the proxy %q.\n"+
+			"The resume dials through whatever this says, so a proxy missing here is an account "+
+			"that comes back from this instance's own address -- the one its client asked not "+
+			"to be seen from.", wanted[0].Proxy)
 	}
 
 	disconnect := &protocol.Command{
@@ -436,5 +443,69 @@ func TestTwoSessionsArePairedToTwoAccounts(t *testing.T) {
 	}
 	if len(wanted) != 2 {
 		t.Fatalf("the sweep would bring back %v, want both sessions", wanted)
+	}
+}
+
+// A connect naming a proxy that could not be recorded is refused before anything moves.
+//
+// The row is what the next resume dials through. A socket on the proxy with a row that
+// does not hold it is an account that goes out through the proxy now and from this
+// instance's own address after the next restart or ownership change, and the client that
+// asked for the proxy is never told. A connect asking to go out directly is the control,
+// in the same condition: it carries on as before, because the row it failed to replace
+// exposes nothing.
+func TestAProxyThatCouldNotBeRecordedIsNotUsed(t *testing.T) {
+	t.Parallel()
+
+	var owned atomic.Bool
+	owned.Store(true)
+	container, err := store.Open(t.Context(), storetest.New(t).URL,
+		func(string) bool { return owned.Load() }, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = container.Close() })
+	h := newHarnessWithStore(t, container)
+	for _, sid := range []string{"s1", "s2"} {
+		if _, err := h.manager.Adopt(context.Background(), sid); err != nil {
+			t.Fatalf("Adopt %s: %v", sid, err)
+		}
+	}
+	// Every write from here is refused by the fence, which is the simplest honest way a
+	// write fails: the same refusal an instance that lost the lease meets.
+	owned.Store(false)
+
+	connect := func(sid, payload string) protocol.Reply {
+		t.Helper()
+		h.manager.Dispatch(delivery(&protocol.Command{
+			V: protocol.Version, ID: "c-" + sid, Type: protocol.CommandSessionConnect, SID: sid, ReplyTo: "c-" + sid,
+			Payload: json.RawMessage(payload),
+		}, &atomic.Bool{}))
+		waitFor(t, "a reply to c-"+sid, func() bool { _, ok := h.recorder.reply("c-" + sid); return ok })
+		reply, _ := h.recorder.reply("c-" + sid)
+		return reply
+	}
+
+	if reply := connect("s1", `{"pairing":"qr","proxy":{"url":"socks5://user:secret@10.0.0.1:1080"}}`); reply.OK {
+		t.Fatal("a connect naming a proxy was answered ok while its record could not be written, " +
+			"so the next resume would dial WhatsApp directly")
+	}
+	if engineSession, ok := h.engine.Session("s1"); ok {
+		if _, connected := engineSession.Asked(); connected {
+			t.Fatal("the engine was handed the connect, so the socket is on a proxy the row does not hold")
+		}
+	}
+
+	// Asked of the engine and not of the reply: the fake engine writes through the same
+	// fenced store and fails on its own, so the reply says nothing about whether this
+	// layer let the connect through.
+	connect("s2", `{"pairing":"qr"}`)
+	engineSession, ok := h.engine.Session("s2")
+	if !ok {
+		t.Fatal("the direct connect never reached the engine")
+	}
+	if _, connected := engineSession.Asked(); !connected {
+		t.Fatal("a connect going out directly was stopped over the same failed write: the control " +
+			"this test needs is that only the proxy is held to the record")
 	}
 }

@@ -111,6 +111,12 @@ func New(cfg *Config, log zerolog.Logger) (connector *Connector, err error) {
 	if err := client.Ping(context.Background(), 5*time.Second); err != nil {
 		return nil, err
 	}
+	// Before anything is written: a server too old for the commands the fleet issues is a
+	// misconfigured deployment, and the fleet's own metadata is the first thing that would
+	// be left behind by an instance that then could not run.
+	if err := client.RequireServerVersion(context.Background(), 5*time.Second); err != nil {
+		return nil, err
+	}
 	if err := client.ClaimMeta(context.Background(), redisx.Meta{
 		ProtocolMin: protocol.MinVersion, ProtocolMax: protocol.Version, Shards: cfg.EventShards,
 	}); err != nil {
@@ -693,8 +699,9 @@ func (c *Connector) resumeOnce(ctx context.Context) {
 		// 6.2.24 it is the whole pass that dies, because an error here aborts the loop
 		// and the next pass makes the same call. That is every account in the fleet
 		// staying down for good behind one WARN a pass, which is this defect made worse
-		// rather than fixed. This repository declares no minimum Redis version and
-		// `SETNX` needs none, so the second read is the price of not quietly setting one.
+		// rather than fixed. The floor is 6.2 (README.md), so the second read is the price
+		// of staying on it, and `TestTheResumeSweepRunsOnARealRedis` is what fails when a
+		// command form above it comes back, in CI's pass against 6.2.
 		won, err := c.client.SetNX(pass, c.client.Keys().Resume(sid), c.cfg.Instance, resumeCooloff).Result()
 		if err != nil {
 			c.log.Warn().Err(err).Str("sid", sid).Msg("could not take the turn to bring a session back")
@@ -812,7 +819,8 @@ func (c *Connector) sweepPartsOnce(ctx context.Context) bool {
 	// media retention: what these rows cover is a redelivered command, and a command stops
 	// being redelivered when the ledger stops answering for it. Without a sweep the row
 	// count is the number of groups the deployment has ever made.
-	begun, err := c.store.SweepGroupCreations(ctx, time.Now().Add(-groupCreateRetention))
+	now := time.Now()
+	begun, err := c.store.SweepGroupCreations(ctx, now.Add(-groupCreateRetention), now.Add(-groupCreateCeiling))
 	switch {
 	case errors.Is(err, context.Canceled):
 		return true
@@ -828,6 +836,15 @@ func (c *Connector) sweepPartsOnce(ctx context.Context) bool {
 // window, doubled: a record that outlives the redelivery it covers costs a row, and one
 // that does not costs a second group.
 const groupCreateRetention = 2 * redisx.DefaultIdempotencyTTL
+
+// groupCreateCeiling is how long an attempt that never learned which group it made is kept,
+// counted from when it began and however often it is asked about since (#277). The ledger's
+// own window: a creation takes seconds, and the notification that names its group is
+// redelivered as the socket comes back, so an attempt still unnamed a day later is one whose
+// request never went out, and every retry of it was answered `not_settled` for nothing.
+// contract/PROTOCOL.md names this value, and TestTheContractNamesTheGroupCreateCeiling holds
+// the two together.
+const groupCreateCeiling = redisx.DefaultIdempotencyTTL
 
 // reclaimCommands takes over what nobody acknowledged: what another instance read
 // before it was killed, and what this one deliberately left pending when it could not

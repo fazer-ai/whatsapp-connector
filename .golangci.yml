@@ -46,6 +46,13 @@ linters:
         linters:
           - errcheck
           - gosec
+      # The fleet bench prints its report in Portuguese, because the report is read by
+      # whoever ran it and not by the compiler. `misspell` reads en_US, where `comando`
+      # is a misspelt `commando` and `colateral` a misspelt `collateral`, so it is off
+      # for that one directory rather than for the repository.
+      - path: ^cmd/fleetbench/
+        linters:
+          - misspell
 
 formatters:
   enable:

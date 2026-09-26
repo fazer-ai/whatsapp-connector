@@ -2,6 +2,7 @@ package redisx
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -76,7 +77,7 @@ func (s *StreamLag) Collect(out chan<- prometheus.Metric) {
 
 	for shard := range s.client.Keys().Shards() {
 		stream := s.client.Keys().Events(shard)
-		groups, err := s.client.XInfoGroups(ctx, stream).Result()
+		groups, err := s.groups(ctx, stream)
 		if err != nil {
 			// Includes the stream not existing yet, which is an ordinary state for a
 			// fleet that has not published to this shard: there is nothing to say about
@@ -88,31 +89,88 @@ func (s *StreamLag) Collect(out chan<- prometheus.Metric) {
 		out <- prometheus.MustNewConstMetric(s.scrapeFailed, prometheus.GaugeValue, 0, stream)
 		for _, group := range groups {
 			out <- prometheus.MustNewConstMetric(s.pending, prometheus.GaugeValue,
-				float64(group.Pending), stream, group.Name)
+				float64(group.pending), stream, group.name)
 			out <- prometheus.MustNewConstMetric(s.consumers, prometheus.GaugeValue,
-				float64(group.Consumers), stream, group.Name)
+				float64(group.consumers), stream, group.name)
 
-			lag, known := lagOf(group.Lag)
-			if !known {
-				out <- prometheus.MustNewConstMetric(s.lagUnknown, prometheus.GaugeValue, 1, stream, group.Name)
+			if !group.lagKnown {
+				out <- prometheus.MustNewConstMetric(s.lagUnknown, prometheus.GaugeValue, 1, stream, group.name)
 				continue
 			}
-			out <- prometheus.MustNewConstMetric(s.lagUnknown, prometheus.GaugeValue, 0, stream, group.Name)
-			out <- prometheus.MustNewConstMetric(s.lag, prometheus.GaugeValue, lag, stream, group.Name)
+			out <- prometheus.MustNewConstMetric(s.lagUnknown, prometheus.GaugeValue, 0, stream, group.name)
+			out <- prometheus.MustNewConstMetric(s.lag, prometheus.GaugeValue, group.lag, stream, group.name)
 		}
 	}
 }
 
-// lagOf reads the lag Redis reported, and says whether it reported one at all.
+// groupReading is what one consumer group reports about itself.
+type groupReading struct {
+	name               string
+	pending, consumers int64
+	lag                float64
+	lagKnown           bool
+}
+
+// groups reads a stream's consumer groups from the reply itself rather than through
+// go-redis's XInfoGroup, because the question that matters here is one the struct cannot
+// answer: whether the server reported a lag at all. Redis before 7.0 has no `lag` field,
+// and the struct leaves it at zero, which is "the client is up to date" on every group of
+// a server that never said so (#320).
+func (s *StreamLag) groups(ctx context.Context, stream string) ([]groupReading, error) {
+	reply, err := s.client.Do(ctx, "XINFO", "GROUPS", stream).Slice()
+	if err != nil {
+		return nil, err
+	}
+	groups := make([]groupReading, 0, len(reply))
+	for _, item := range reply {
+		fields, ok := fieldsOf(item)
+		if !ok {
+			return nil, fmt.Errorf("redisx: XINFO GROUPS %s answered a group as %T", stream, item)
+		}
+		name, _ := fields["name"].(string)
+		pending, _ := fields["pending"].(int64)
+		consumers, _ := fields["consumers"].(int64)
+		lag, known := lagOf(fields)
+		groups = append(groups, groupReading{name: name, pending: pending, consumers: consumers, lag: lag, lagKnown: known})
+	}
+	return groups, nil
+}
+
+// fieldsOf reads one group's fields, which RESP3 carries as a map and RESP2 as a flat list
+// of names and values.
+func fieldsOf(item any) (map[string]any, bool) {
+	fields := map[string]any{}
+	switch reply := item.(type) {
+	case map[any]any:
+		for name, value := range reply {
+			if name, ok := name.(string); ok {
+				fields[name] = value
+			}
+		}
+	case []any:
+		for i := 0; i+1 < len(reply); i += 2 {
+			if name, ok := reply[i].(string); ok {
+				fields[name] = reply[i+1]
+			}
+		}
+	default:
+		return nil, false
+	}
+	return fields, true
+}
+
+// lagOf reads the lag a group reported, and says whether it reported one at all.
 //
-// Redis answers the lag as nil when it cannot work it out without walking the stream,
-// which is what an XTRIM or an XDEL leaves behind, and go-redis carries that through as
-// -1. Neither value is publishable: raw, it puts a negative on a panel; as zero, it puts
-// "the client is up to date" on one, which is the worse of the two because it is the
-// answer an operator stops looking after. So an unknown lag is not reported as a lag at
-// all, and `wac_stream_lag_unknown` carries the fact that it could not be read.
-func lagOf(reported int64) (float64, bool) {
-	if reported < 0 {
+// Two answers are not a lag, and neither is publishable as one. Redis answers null when
+// it cannot work the lag out without walking the stream, which is what an XTRIM or an XDEL
+// leaves behind. And Redis before 7.0 does not answer the field at all. Raw, either would
+// put a guess on a panel; as zero, they put "the client is up to date" on one, which is
+// the worse of the two because it is the answer an operator stops looking after. So an
+// unknown lag is not reported as a lag, and `wac_stream_lag_unknown` carries the fact
+// that it could not be read.
+func lagOf(fields map[string]any) (float64, bool) {
+	reported, ok := fields["lag"].(int64)
+	if !ok || reported < 0 {
 		return 0, false
 	}
 	return float64(reported), true

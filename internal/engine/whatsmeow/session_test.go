@@ -825,22 +825,6 @@ func TestAReconnectingSessionSaysSo(t *testing.T) {
 	}
 }
 
-// Decoding a proxy is not honouring one. Connecting directly for a deployment that
-// asked for egress routing puts its own address on the wire, and does it silently.
-func TestAProxyIsRefusedRatherThanIgnored(t *testing.T) {
-	t.Parallel()
-	session, _ := newTestSession(t, "5511999990001")
-
-	err := session.Connect(t.Context(), engine.ConnectRequest{
-		Pairing: "resume",
-		Proxy:   &engine.ProxyRequest{URL: "socks5://10.0.0.9:1080"},
-	})
-	var coded *protocol.Error
-	if !errors.As(err, &coded) || coded.Code != protocol.ErrorUnsupported {
-		t.Fatalf("a connect carrying a proxy answered %v, want unsupported", err)
-	}
-}
-
 // whatsmeow stops retrying once the connection ends for a reason retrying cannot fix.
 // A session left holding the retry flag reports itself reconnecting forever.
 func TestATerminalOutcomeEndsTheReconnect(t *testing.T) {
@@ -1230,8 +1214,8 @@ func TestARefusedConnectLeavesTheDisconnectGuardStanding(t *testing.T) {
 
 	for name, request := range map[string]engine.ConnectRequest{
 		"a pairing mode nobody knows": {Pairing: "telepathy"},
-		"a proxy this build cannot honour": {
-			Pairing: "resume", Proxy: &engine.ProxyRequest{URL: "socks5://127.0.0.1:1080"},
+		"a proxy nobody can dial": {
+			Pairing: "resume", Proxy: &engine.ProxyRequest{URL: "ftp://127.0.0.1:21"},
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -2084,9 +2068,8 @@ func TestARequestForACodeReachesTheCodePairing(t *testing.T) {
 // A connect option is a thing the client asked the connector to do, and a build that does
 // not do it must say so rather than answer `open`. The client is then waiting for a call
 // to be refused, or for a backlog to arrive, with nothing on the stream to tell it that
-// neither was ever going to happen — which is the same silence the proxy check exists to
-// break. The canonical connect fixture sends both fields, so this is what a client really
-// puts on the wire and not a shape invented for the test.
+// neither was ever going to happen. The canonical connect fixture sends both fields, so
+// this is what a client really puts on the wire and not a shape invented for the test.
 func TestConnectRefusesTheOptionsThisBuildDoesNotCarryOut(t *testing.T) {
 	t.Parallel()
 
@@ -3275,7 +3258,7 @@ func TestAConnectThisBuildRefusesIsNotSomethingToResume(t *testing.T) {
 
 	for name, request := range map[string]engine.ConnectRequest{
 		"history_sync": {Pairing: "resume", Groups: true, HistorySync: true},
-		"proxy":        {Pairing: "resume", Groups: true, Proxy: &engine.ProxyRequest{URL: "socks5://127.0.0.1:1080"}},
+		"proxy":        {Pairing: "resume", Groups: true, Proxy: &engine.ProxyRequest{URL: "ftp://127.0.0.1:21"}},
 		"pairing":      {Pairing: "telepathy", Groups: true},
 	} {
 		t.Run(name, func(t *testing.T) {

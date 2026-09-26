@@ -28,36 +28,29 @@ import (
 // that has gone wrong rather than a bound on a healthy one.
 const dialCeiling = 20 * time.Second
 
-// newClient is the only place a whatsmeow client is made, so the ceiling above cannot be
-// missing from one of them.
+// newClient is the only place a whatsmeow client is made.
 //
-// `SetWebsocketHTTPClient` is what carries it: `coder/websocket` turns `HTTPClient.Timeout`
-// into a `context.WithTimeout` around the dial and zeroes it on the client it then uses, so
-// the ceiling ends the handshake for the connection rather than the connection itself.
-// Read out of the pinned `dial.go` rather than assumed, and measured by
-// `TestTheCeilingDoesNotOutliveTheDialItBounds`, because a timeout that killed the socket
-// after it opened would be a much worse bug than the one this fixes.
+// What it dials through is not decided here but when a session adopts it: every client a
+// session holds is handed the session's `egressRoute`, and the ceiling above lives there,
+// on the websocket clients `install` sets. One place for both, because a client built
+// without the ceiling holds the socket lock with no bound (#290), and one built without
+// the route leaves from this instance's address after a relogin, having left from its
+// proxy's before (#217).
 //
-// Both of them, because whatsmeow dials through two different clients and picks between
-// them on whether the device has an ID: a session that has never paired goes out through
-// the pre-login one. That is the QR dial, which is a connect like any other and holds the
-// same write lock, so a ceiling on one of the two would leave pairing with none.
+// `SetWebsocketHTTPClient` is what carries the ceiling: `coder/websocket` turns
+// `HTTPClient.Timeout` into a `context.WithTimeout` around the dial and zeroes it on the
+// client it then uses, so the ceiling ends the handshake for the connection rather than
+// the connection itself. Read out of the pinned `dial.go` rather than assumed, and
+// measured by `TestTheCeilingDoesNotOutliveTheDialItBounds`, because a timeout that killed
+// the socket after it opened would be a much worse bug than the one this fixes.
 //
-// Neither is the client media downloads use, so a ceiling here does not put one on a
-// download of any size. Each gets its own clone of the default transport, which is what
-// the library builds its own from; a pin that starts configuring that transport would not
-// reach these, and `TestTheClientWeBuildIsTheOneTheLibraryWouldHave` is what notices.
+// Both websocket clients, because whatsmeow dials through two and picks between them on
+// whether the device has an ID: a session that has never paired goes out through the
+// pre-login one. That is the QR dial, which is a connect like any other and holds the same
+// write lock, so a ceiling on one of the two would leave pairing with none. Neither is the
+// media client, so the ceiling does not reach a download of any size.
 func newClient(device *store.Device, log waLog.Logger) *wm.Client {
-	client := wm.NewClient(device, log)
-	client.SetWebsocketHTTPClient(&http.Client{
-		Timeout:   dialCeiling,
-		Transport: dialTransport().Clone(),
-	})
-	client.SetPreLoginHTTPClient(&http.Client{
-		Timeout:   dialCeiling,
-		Transport: dialTransport().Clone(),
-	})
-	return client
+	return wm.NewClient(device, log)
 }
 
 // dialTransport is the one whatsmeow clones for the clients it builds itself, so cloning

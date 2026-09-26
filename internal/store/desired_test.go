@@ -161,6 +161,44 @@ func TestTheCallPolicyComesBackWithTheSession(t *testing.T) {
 	}
 }
 
+// The proxy a connect named is the proxy the account comes back through, and a connect
+// naming another, or none, replaces it.
+//
+// This is the field with the sharpest edge of the three. A resume that lost it would dial
+// WhatsApp from this instance's own address, the one address a client that asked for a
+// proxy asked this connector not to use; one that kept a proxy its client had replaced
+// would go on leaving through somewhere the client has moved away from, possibly with
+// credentials that no longer work, and never come back at all.
+func TestTheProxyComesBackWithTheSession(t *testing.T) {
+	t.Parallel()
+	container := open(t)
+	ctx := t.Context()
+
+	pair(t, container, "sid-1", "5511999990001")
+	for _, asked := range []string{
+		"socks5://user:secret@10.0.0.1:1080",
+		"http://user:secret@10.0.0.2:3128",
+		"",
+	} {
+		if err := container.For("sid-1").PutDesiredConnected(ctx, store.Wants{Groups: true, Proxy: asked}); err != nil {
+			t.Fatalf("PutDesiredConnected: %v", err)
+		}
+		wanted, err := container.Wanted(ctx)
+		if err != nil {
+			t.Fatalf("Wanted: %v", err)
+		}
+		if len(wanted) != 1 {
+			t.Fatalf("Wanted has %d sessions, want 1", len(wanted))
+		}
+		if wanted[0].Proxy != asked {
+			t.Fatalf("after a connect asking for %q the session would come back through %q", asked, wanted[0].Proxy)
+		}
+		if !wanted[0].Groups {
+			t.Fatal("recording the proxy lost the subscription beside it")
+		}
+	}
+}
+
 // Turning the policy off is a connect without it, the same way groups are turned off.
 // Recorded once and never overwritten, an account would keep refusing calls after every
 // restart on the strength of a request its client has replaced.
@@ -272,5 +310,39 @@ func TestADisconnectLeavesTheSubscriptionAlone(t *testing.T) {
 	}
 	if groups == 0 {
 		t.Fatal("the disconnect answered a question it was not asked, and cleared the subscription")
+	}
+}
+
+// What a session stands on is the row, whether or not the session ever paired, and
+// whether or not it is turned off; and nothing for a session never asked about.
+//
+// Paired or not, because the reader is a pairing code: a session asking for one has, by
+// definition, nothing paired yet, so the join `Wanted` makes would hide the very row it
+// needs. Turned off or not, because a disconnect says the session should be down and not
+// that its client stopped wanting the proxy it named: a pairing code asked for after a
+// disconnect still goes through it, and a row read as empty there would be rewritten
+// empty by that code, and the next resume would go out directly.
+func TestStandingIsTheRowWhateverItsState(t *testing.T) {
+	t.Parallel()
+	container := open(t)
+	ctx := t.Context()
+
+	asked := store.Wants{Groups: true, Proxy: "http://user:secret@10.0.0.2:3128"}
+	if err := container.For("sid-unpaired").PutDesiredConnected(ctx, asked); err != nil {
+		t.Fatalf("PutDesiredConnected: %v", err)
+	}
+	if err := container.For("sid-off").PutDesiredConnected(ctx, asked); err != nil {
+		t.Fatalf("PutDesiredConnected: %v", err)
+	}
+	if err := container.For("sid-off").PutDesiredDisconnected(ctx); err != nil {
+		t.Fatalf("PutDesiredDisconnected: %v", err)
+	}
+	for _, sid := range []string{"sid-unpaired", "sid-off"} {
+		if got, ok, err := container.For(sid).Standing(ctx); err != nil || !ok || got != asked {
+			t.Fatalf("%s stands on %+v (ok=%v, err=%v), want %+v", sid, got, ok, err, asked)
+		}
+	}
+	if got, ok, err := container.For("sid-never").Standing(ctx); err != nil || ok || got != (store.Wants{}) {
+		t.Fatalf("a session nobody asked about stands on %+v (ok=%v, err=%v), want nothing", got, ok, err)
 	}
 }
