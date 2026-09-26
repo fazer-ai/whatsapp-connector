@@ -207,7 +207,7 @@ func TestTheSweepTakesOnlyWhatWasLastWrittenLongAgo(t *testing.T) {
 		t.Fatalf("date the old settlement: %v", err)
 	}
 
-	swept, err := container.SweepGroupCreations(ctx, time.Now().Add(-48*time.Hour))
+	swept, err := container.SweepGroupCreations(ctx, time.Now().Add(-48*time.Hour), time.Now().Add(-24*time.Hour))
 	if err != nil {
 		t.Fatalf("sweep: %v", err)
 	}
@@ -273,10 +273,10 @@ func TestAnAttemptThatNamedAGroupIsNotAbandoned(t *testing.T) {
 	}
 }
 
-// A command still being delivered keeps its record, however old the intent is. Retention
-// counts from the last delivery and not from the first: a creation retried for longer than
-// the window would otherwise have its record swept out from under it, and the delivery after
-// that would make the second group.
+// A command still being delivered keeps its record past the retention once it knows its
+// group. Retention counts from the last delivery and not from the first: a creation whose
+// group is on record and that is retried for longer than the window would otherwise have its
+// record swept out from under it, and the delivery after that would make the second group.
 func TestARetriedCreationKeepsItsRecordPastTheRetention(t *testing.T) {
 	t.Parallel()
 	container := open(t)
@@ -287,6 +287,9 @@ func TestARetriedCreationKeepsItsRecordPastTheRetention(t *testing.T) {
 	if _, _, err := scoped.BeginGroupCreate(ctx, "idem:k", "WACFIRST", "Obras", long); err != nil {
 		t.Fatalf("the first delivery: %v", err)
 	}
+	if err := scoped.FinishGroupCreate(ctx, "idem:k", "120363041234567890@g.us"); err != nil {
+		t.Fatalf("name the group: %v", err)
+	}
 	// Delivered again just now, which is the client still waiting for an answer.
 	again, found, err := scoped.BeginGroupCreate(ctx, "idem:k", "WACSECOND", "Obras", time.Now())
 	if err != nil {
@@ -296,7 +299,7 @@ func TestARetriedCreationKeepsItsRecordPastTheRetention(t *testing.T) {
 		t.Fatalf("the retry read %+v, want the first delivery's record", again)
 	}
 
-	if swept, err := container.SweepGroupCreations(ctx, time.Now().Add(-48*time.Hour)); err != nil {
+	if swept, err := container.SweepGroupCreations(ctx, time.Now().Add(-48*time.Hour), time.Now().Add(-24*time.Hour)); err != nil {
 		t.Fatalf("sweep: %v", err)
 	} else if swept != 0 {
 		t.Fatalf("the sweep took %d rows, want none: the command is still being delivered", swept)
@@ -305,5 +308,56 @@ func TestARetriedCreationKeepsItsRecordPastTheRetention(t *testing.T) {
 		t.Fatalf("read it back: %v", err)
 	} else if !onRecord {
 		t.Fatal("the record of a command still being delivered was swept, so the next delivery makes a second group")
+	}
+}
+
+// An attempt that never learned which group it made is dropped once it is older than the
+// ceiling, counted from when it began, however recently it was asked about (#277). The
+// retries are what used to keep it: each delivery pushed `touched_at` forward, so an intent
+// whose request never left was answered `not_settled` for as long as the client asked.
+//
+// On both sides of the ceiling, and beside the rows it must not take: an unnamed attempt
+// just inside it, one that is young, and a named one as old as the one that goes.
+func TestAnUnnamedAttemptIsSweptPastTheCeilingHoweverOftenItIsAsked(t *testing.T) {
+	t.Parallel()
+	container := open(t)
+	ctx := t.Context()
+	scoped := container.For("sid-1")
+
+	const ceiling = 24 * time.Hour
+	now := time.Now()
+	for attempt, began := range map[string]time.Time{
+		"idem:stranded": now.Add(-ceiling - 2*time.Minute),
+		"idem:inside":   now.Add(-ceiling + 2*time.Minute),
+		"idem:young":    now.Add(-time.Minute),
+		"idem:named":    now.Add(-ceiling - 2*time.Minute),
+	} {
+		if _, _, err := scoped.BeginGroupCreate(ctx, attempt, "WAC"+attempt, "Obras", began); err != nil {
+			t.Fatalf("begin %s: %v", attempt, err)
+		}
+		// Asked about again just now, which is what kept a stranded intent alive.
+		if _, _, err := scoped.BeginGroupCreate(ctx, attempt, "WACAGAIN", "Obras", now); err != nil {
+			t.Fatalf("retry %s: %v", attempt, err)
+		}
+	}
+	if err := scoped.FinishGroupCreate(ctx, "idem:named", "120363041234567890@g.us"); err != nil {
+		t.Fatalf("name the group: %v", err)
+	}
+
+	swept, err := container.SweepGroupCreations(ctx, now.Add(-2*ceiling), now.Add(-ceiling))
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if swept != 1 {
+		t.Fatalf("the sweep took %d rows, want only the stranded one", swept)
+	}
+	for attempt, want := range map[string]bool{
+		"idem:stranded": false, "idem:inside": true, "idem:young": true, "idem:named": true,
+	} {
+		if _, found, err := scoped.GroupCreation(ctx, attempt); err != nil {
+			t.Fatalf("read %s: %v", attempt, err)
+		} else if found != want {
+			t.Fatalf("%s present=%v, want %v", attempt, found, want)
+		}
 	}
 }

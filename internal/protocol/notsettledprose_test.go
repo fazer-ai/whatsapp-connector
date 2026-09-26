@@ -121,11 +121,17 @@ func TestTheContractSaysWhatAClientDoesWithNotSettled(t *testing.T) {
 		{"`timeout`", "the word it is carved out of is what tells a client which of the two it got"},
 		{"`not_attempted`", "the third answer about time, and a client has to be able to place this one against it"},
 		// Measured, not supposed: a crash between the intent being recorded and the request
-		// being sent leaves an attempt no notification will ever name, and every redelivery
-		// pushes the intent's clock forward, so the sweep that would drop it never reaches
-		// one that is still being asked about. A contract that promised resolution here
-		// would have a client retrying the same key for good.
+		// being sent leaves an attempt no notification will ever name, so asking again does
+		// not settle it. A contract that promised resolution by asking would have a client
+		// retrying the same key for a day.
 		{"bounds its", "without it the contract promises a resolution one reachable state never delivers"},
+		// #277: the sweep reaches a stranded intent by its age from the first delivery,
+		// however often it is asked about, and the same key then creates. Both halves, and
+		// the cost, because a client deciding whether to wait a day or escalate needs all
+		// three. The number itself is held to the connector's constant in internal/app.
+		{"24 hours after its first delivery, however often it was asked about since", "when a stranded intent stops being one"},
+		{"creates the group as if for the first time", "what the same key does after that"},
+		{"that later delivery makes a second group", "what the ceiling costs when the request did go out"},
 		{"stranded intent", "the client needs a name for the case where asking again is the wrong move"},
 		// #284 put a ceiling on the intent write, and a ceiling that runs out after the
 		// database committed the row leaves the same stranded intent by a second route --
