@@ -654,3 +654,22 @@ func TestADialFailureIsReportedOnce(t *testing.T) {
 		t.Fatalf("a refused dial reported %v", outcomes)
 	}
 }
+
+// The detached dial of a request that already reported its failure ends later: in the same
+// failure, which is not reported twice, since by then another retry may have opened a
+// tunnel; or in an answer, which is.
+func TestASettledAttemptReportsOnlyALateAnswer(t *testing.T) {
+	t.Parallel()
+
+	var outcomes []bool
+	report := func(reached bool) { outcomes = append(outcomes, reached) }
+	attempt := &proxyAttempt{}
+	attempt.dialling(report)
+	attempt.unanswered()
+
+	attempt.answered(report, false)
+	attempt.answered(report, true)
+	if len(outcomes) != 2 || outcomes[0] || !outcomes[1] {
+		t.Fatalf("a settled attempt reported %v", outcomes)
+	}
+}

@@ -200,9 +200,17 @@ func (a *proxyAttempt) dialling(report func(reached bool)) {
 // answered is the proxy's answer to the CONNECT, reported with the record held so it cannot
 // cross with the request's own failure: a deadline running out as the answer arrives would
 // otherwise report the failure after the answer, and be judged the newer of the two.
+//
+// A failure on an attempt already settled is not reported again: the request's own
+// failure got in first, and the transport's detached dial ending later in the same failure
+// would come out as the newest outcome, over a tunnel another retry may have opened since.
+// A late answer that opened the tunnel still is, because that one is news.
 func (a *proxyAttempt) answered(report func(reached bool), reached bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.settled && !reached {
+		return
+	}
 	a.settled = true
 	report(reached)
 }
