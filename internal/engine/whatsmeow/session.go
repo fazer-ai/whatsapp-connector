@@ -485,6 +485,11 @@ type Session struct {
 	// route is what every client this session adopts dials through. Set in newSession and
 	// never replaced; what changes is the path inside it.
 	route *egressRoute
+	// proxyBlamed is whether the last session.state this session published named the
+	// proxy as the cause. Written by every state that goes out, whoever publishes it, so
+	// judgeProxy weighs a new outcome against what the client last read and not against
+	// what judgeProxy itself last said.
+	proxyBlamed atomic.Bool
 
 	// answered remembers which calls this session has already published an offer for.
 	// WhatsApp announces one call twice -- `offer` and `offer_notice` -- and the two
@@ -571,6 +576,9 @@ type Session struct {
 	// this session's dial. Without it a status would report `close` while the event
 	// stream says reconnecting, and a resume would start a second dial alongside it.
 	reconnecting bool
+	// proxyJudged is the last of the route's outcomes judgeProxy weighed, which it reads
+	// and writes under the transition lock.
+	proxyJudged uint64
 	// connected is what the socket is actually doing, kept from the events that report
 	// it. whatsmeow's own IsLoggedIn is set on authentication and cleared only by a
 	// stream error, so it stays true through a Disconnect and cannot answer this.
@@ -779,6 +787,7 @@ func newSession(
 		downloadWait:   downloadTimeout,
 		uploadWait:     uploadTimeout,
 	}
+	s.route.notify = s.proxyOutcome
 	s.declineCall = func(ctx context.Context, client *wm.Client, caller waTypes.JID, callID string) error {
 		if client == nil {
 			// The socket this would be written on is gone. Checked here rather than at
@@ -3614,6 +3623,59 @@ func (s *Session) sessionState() map[string]any {
 	return payload
 }
 
+// reasonProxyUnreachable is the state reason for a session that cannot get out through its
+// proxy: the proxy could not be reached, or it refused the tunnel. Never with the address
+// or the error that said so, because the proxy's URL is a credential.
+const reasonProxyUnreachable = "proxy_unreachable"
+
+// proxyOutcome is the route telling this session how a dial ended at the proxy. It runs
+// on the goroutine that dialled, and that can be one holding the transition lock -- a
+// resume dials under it -- so the judgement is made on a goroutine of its own.
+func (s *Session) proxyOutcome(generation, seq uint64, reached bool) {
+	go s.judgeProxy(generation, seq, reached)
+}
+
+// judgeProxy publishes a change of cause while the session is trying to get its socket
+// up -- whatsmeow redialling after a drop (`reconnecting`), or a dial this connector started
+// that whatsmeow goes on retrying (`connecting`), which is where a session resumed after a
+// restart sits when its proxy is down -- and nothing else. Neither publishes anything per
+// attempt, so without this a session whose proxy went away reads, for as long as the outage
+// lasts, exactly like one whose network did. Once per change and not per attempt: the loop tries every few seconds, for hours
+// if the proxy stays down, and each of those would be one more event on the stream saying
+// what the last one said.
+//
+// Under the transition lock, so the state read here is the one the stream last said: a
+// judgement that lands after the socket came back finds it `open` and publishes nothing,
+// one that lands late behind a newer outcome is dropped by its number, and one about a
+// route the session has left is dropped by the route's generation.
+func (s *Session) judgeProxy(generation, seq uint64, reached bool) {
+	s.transition.Lock()
+	defer s.transition.Unlock()
+
+	// An outcome from a route the session has since left is about a proxy it no longer
+	// uses, and naming it would blame the path it is on now.
+	if generation != s.route.generation.Load() {
+		return
+	}
+	s.mu.Lock()
+	stale := seq <= s.proxyJudged
+	if !stale {
+		s.proxyJudged = seq
+	}
+	s.mu.Unlock()
+	state := s.state()
+	if stale || s.proxyBlamed.Load() != reached || (state != "reconnecting" && state != "connecting") {
+		return
+	}
+	// A proxy that answers again while the socket is still down leaves it down for some
+	// other reason, and the state says so rather than going on naming the proxy.
+	reason := reasonProxyUnreachable
+	if reached {
+		reason = "disconnected"
+	}
+	s.emit(protocol.EventSessionState, map[string]any{"state": state, "reason": reason})
+}
+
 // state answers without asking the client anything.
 //
 // Every question whatsmeow answers about its socket takes the lock a dial holds for its
@@ -3967,6 +4029,13 @@ func (s *Session) emitLast(eventType protocol.EventType, payload any) {
 
 func (s *Session) emitting(emission *engine.Emission, payload any) {
 	eventType := emission.Type
+	if eventType == protocol.EventSessionState {
+		reason := ""
+		if fields, ok := payload.(map[string]any); ok {
+			reason, _ = fields["reason"].(string)
+		}
+		s.proxyBlamed.Store(reason == reasonProxyUnreachable)
+	}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		// Everything reaching this is built a few lines above, so a failure is a

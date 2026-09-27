@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -51,6 +52,16 @@ const egressDial = 30 * time.Second
 // variable nobody set for it.
 type egressRoute struct {
 	websocket, preLogin, media swappedTransport
+
+	// Numbers the outcomes, so a session judging them off the dial's goroutine can tell
+	// the latest from one that arrived late.
+	outcomes atomic.Uint64
+	// Which path the route is on, moved by every set: an outcome from a dial started on a
+	// path the route has since left carries the old number, and is not about this one.
+	generation atomic.Uint64
+	// Told of every outcome, from the goroutine that dialled. Set once, before anything
+	// is dialled through the route.
+	notify func(generation, seq uint64, reached bool)
 }
 
 // newEgressRoute is a route that goes out directly, which is where every session starts:
@@ -68,19 +79,42 @@ func newEgressRoute() *egressRoute {
 // set moves the route to a proxy, or to "" for direct. Only the dials that start after it
 // take the new path: a socket already open keeps the one it was opened on, which is why a
 // session moving an open socket hangs it up first.
+//
+// Only the two socket clients report how the proxy answered. The media client dials the
+// same proxy, but a download that could not start says nothing about whether the account
+// can get back online, which is what the report is for.
 func (r *egressRoute) set(proxyURL string) error {
+	generation := r.generation.Load() + 1
 	built := make([]*http.Transport, 3)
 	for i := range built {
-		transport, err := egressTransport(proxyURL)
+		report := func(reached bool) { r.reported(generation, reached) }
+		if i == 2 {
+			report = nil
+		}
+		transport, err := egressTransportWithin(proxyURL, egressDial, report)
 		if err != nil {
 			return err
 		}
 		built[i] = transport
 	}
+	r.generation.Store(generation)
 	r.websocket.swap(built[0])
 	r.preLogin.swap(built[1])
 	r.media.swap(built[2])
 	return nil
+}
+
+// reported is how a dial through the proxy ended at the proxy: reached, or failed there.
+// One from a path the route has left is dropped here, and a judgement already queued for
+// one is dropped by the session, which compares the generation again when it runs.
+func (r *egressRoute) reported(generation uint64, reached bool) {
+	if generation != r.generation.Load() {
+		return
+	}
+	seq := r.outcomes.Add(1)
+	if r.notify != nil {
+		r.notify(generation, seq, reached)
+	}
 }
 
 // install hands a client the route's three clients. Called once per client, before
@@ -113,8 +147,84 @@ type swappedTransport struct {
 }
 
 // RoundTrip sends a request through whichever transport is current when it starts.
+//
+// Each request carries a record of how far it got with the proxy, which the transport's
+// hooks fill in: a dial to the proxy that succeeded and a CONNECT that was never answered
+// -- a TLS handshake with an HTTPS proxy that failed, a proxy that hung up while reading the
+// CONNECT -- is a failure at the proxy that neither hook sees on its own, and is reported
+// here once the request has failed.
 func (t *swappedTransport) RoundTrip(request *http.Request) (*http.Response, error) {
-	return t.current.Load().RoundTrip(request) //nolint:wrapcheck // a round tripper passes its transport's errors on untouched
+	attempt := &proxyAttempt{}
+	response, err := t.current.Load().RoundTrip(request.WithContext(context.WithValue(request.Context(), proxyAttemptKey{}, attempt)))
+	if err != nil && !abandoned(request.Context()) {
+		attempt.unanswered()
+	}
+	return response, err //nolint:wrapcheck // a round tripper passes its transport's errors on untouched
+}
+
+// abandoned is a request its caller cancelled, which says when somebody stopped waiting and
+// nothing about the proxy. A deadline that ran out is not that: the websocket clients carry
+// a dial ceiling, and a proxy that accepts the connection and never answers the CONNECT
+// keeps a dial waiting until the ceiling cancels it -- the failure is the proxy's, and it
+// would otherwise go unreported on every retry for as long as the proxy stayed silent.
+func abandoned(ctx context.Context) bool {
+	return errors.Is(ctx.Err(), context.Canceled)
+}
+
+// proxyAttempt is how far one request got with an HTTP proxy.
+type proxyAttempt struct {
+	mu      sync.Mutex
+	report  func(reached bool)
+	settled bool
+}
+
+type proxyAttemptKey struct{}
+
+// attemptOf is the record a request's context carries, or nil for a dial that did not come
+// through swappedTransport -- a test dialling the transport directly.
+func attemptOf(ctx context.Context) *proxyAttempt {
+	attempt, _ := ctx.Value(proxyAttemptKey{}).(*proxyAttempt)
+	return attempt
+}
+
+// dialling is a dial to the proxy starting. From here on, a request that fails without the
+// proxy having answered is the proxy's failure, including one whose deadline ran out with
+// the connection to the proxy still not open: the transport carries on with that dial
+// after the request has given up, and nothing would report how it ended.
+func (a *proxyAttempt) dialling(report func(reached bool)) {
+	a.mu.Lock()
+	a.report = report
+	a.mu.Unlock()
+}
+
+// answered is the proxy's answer to the CONNECT, reported with the record held so it cannot
+// cross with the request's own failure: a deadline running out as the answer arrives would
+// otherwise report the failure after the answer, and be judged the newer of the two.
+//
+// A failure on an attempt already settled is not reported again: the request's own
+// failure got in first, and the transport's detached dial ending later in the same failure
+// would come out as the newest outcome, over a tunnel another retry may have opened since.
+// A late answer that opened the tunnel still is, because that one is news.
+func (a *proxyAttempt) answered(report func(reached bool), reached bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.settled && !reached {
+		return
+	}
+	a.settled = true
+	report(reached)
+}
+
+// unanswered is the request failed: a proxy that was dialled and never answered -- the
+// connection never opened, or the CONNECT went unanswered -- is reported as failed there,
+// unless its answer, or the dial's own failure, got in first.
+func (a *proxyAttempt) unanswered() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if !a.settled && a.report != nil {
+		a.settled = true
+		a.report(false)
+	}
 }
 
 // swap installs the next transport and lets go of the previous one's idle connections,
@@ -132,13 +242,25 @@ func (t *swappedTransport) swap(next *http.Transport) {
 // errors below are for a caller that skipped it, and none of them repeats the URL, which
 // carries credentials.
 func egressTransport(proxyURL string) (*http.Transport, error) {
-	return egressTransportWithin(proxyURL, egressDial)
+	return egressTransportWithin(proxyURL, egressDial, nil)
+}
+
+// egressTransportReporting is egressTransport telling report how each dial ended at the
+// proxy.
+func egressTransportReporting(proxyURL string, report func(reached bool)) (*http.Transport, error) {
+	return egressTransportWithin(proxyURL, egressDial, report)
 }
 
 // egressTransportWithin is egressTransport with the bound on a SOCKS5 handshake passed in,
 // which only a test sets to anything but egressDial: waiting out thirty seconds to watch a
 // silent proxy be given up on is not a test anybody runs.
-func egressTransportWithin(proxyURL string, handshake time.Duration) (*http.Transport, error) {
+//
+// With report, every dial that goes for the proxy says how it ended there: false when the
+// proxy could not be reached or refused the tunnel, true when the tunnel opened. What
+// happens past the proxy -- a TLS handshake WhatsApp never answers -- is not reported,
+// because it is not the proxy's to answer for. Nothing is reported on the direct route,
+// and nothing for a dial whose caller cancelled it (see abandoned).
+func egressTransportWithin(proxyURL string, handshake time.Duration, report func(reached bool)) (*http.Transport, error) {
 	transport := dialTransport().Clone()
 	// Not `ProxyFromEnvironment`, which is what the clone carries: see routeThrough.
 	transport.Proxy = nil
@@ -158,6 +280,34 @@ func egressTransportWithin(proxyURL string, handshake time.Duration) (*http.Tran
 		// is on the proxy's resolved address -- a name that resolves into the metadata
 		// range is refused the same as the address written out.
 		transport.Proxy = http.ProxyURL(parsed)
+		if report != nil {
+			// With a proxy set, every dial this transport makes is to the proxy.
+			dial := transport.DialContext
+			transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+				attempt := attemptOf(ctx)
+				if attempt != nil {
+					attempt.dialling(report)
+				}
+				conn, err := dial(ctx, network, address)
+				if err != nil && !abandoned(ctx) {
+					if attempt != nil {
+						attempt.answered(report, false)
+					} else {
+						report(false)
+					}
+				}
+				return conn, err
+			}
+			transport.OnProxyConnectResponse = func(ctx context.Context, _ *url.URL, _ *http.Request, response *http.Response) error {
+				reached := response.StatusCode == http.StatusOK
+				if attempt := attemptOf(ctx); attempt != nil {
+					attempt.answered(report, reached)
+				} else {
+					report(reached)
+				}
+				return nil
+			}
+		}
 	case "socks5":
 		// The forward dialer is the one above, for the same reason.
 		socks, err := proxy.FromURL(parsed, dialer)
@@ -181,7 +331,23 @@ func egressTransportWithin(proxyURL string, handshake time.Duration) (*http.Tran
 		transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
 			bounded, cancel := context.WithTimeout(ctx, handshake)
 			defer cancel()
-			return contextual.DialContext(bounded, network, address) //nolint:wrapcheck // the transport wraps a dial error itself
+			attempt := attemptOf(ctx)
+			if attempt != nil && report != nil {
+				attempt.dialling(report)
+			}
+			conn, err := contextual.DialContext(bounded, network, address)
+			// The SOCKS5 dial ends when the proxy has opened the connection to WhatsApp,
+			// so any failure in it is at the proxy: unreachable, silent, or refusing. Through
+			// the request's record, like the HTTP proxy's answer, so a negotiation still
+			// running after its request reported the failure does not report it again.
+			if report != nil && !abandoned(ctx) {
+				if attempt != nil {
+					attempt.answered(report, err == nil)
+				} else {
+					report(err == nil)
+				}
+			}
+			return conn, err //nolint:wrapcheck // the transport wraps a dial error itself
 		}
 	default:
 		return nil, fmt.Errorf("whatsmeow: a proxy with the scheme %q", parsed.Scheme)

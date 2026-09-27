@@ -600,7 +600,7 @@ func TestASilentSOCKSProxyIsGivenUpOn(t *testing.T) {
 	})
 
 	const handshake = 200 * time.Millisecond
-	transport, err := egressTransportWithin("socks5://"+listener.Addr().String(), handshake)
+	transport, err := egressTransportWithin("socks5://"+listener.Addr().String(), handshake, nil)
 	if err != nil {
 		t.Fatalf("egressTransportWithin: %v", err)
 	}
