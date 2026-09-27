@@ -534,6 +534,53 @@ func (*sendAfterTheWindow) ProcessPipelineHook(next redis.ProcessPipelineHook) r
 	return next
 }
 
+// A trap armed for an answer is no stimulus while the command it waits for has not left:
+// the verifier saw a read back cut by the window before it was sent, with a trap armed for
+// the wake it would have carried, and the test waited for an answer nobody had asked for
+// (#334). That pass is the machine's, and the next one is what asks.
+func TestAPassCutBeforeItsCommandLeftIsTheMachinesWhateverIsArmed(t *testing.T) {
+	t.Parallel()
+
+	cutBackends(t, func(t *testing.T, f cutFleet) {
+		streams := f.streams(t, "inst-a")
+		if _, err := read(t, streams, "s1"); err != nil {
+			t.Fatalf("priming read: %v", err)
+		}
+		writeCommand(t, f.fleet, f.client.Keys().Control(), &protocol.Command{
+			V: protocol.Version, ID: "unasked-wake", Type: protocol.CommandSessionWake, SID: "s9",
+			TS: 1787000000000, Payload: []byte(`{"desired":"connected"}`),
+		})
+		f.loseTheAnswer(t, "held past the window", streams, "inst-a", "unasked-wake", "s1")
+
+		cut := &cutBeforeItLeaves{}
+		f.through.AddHook(cut)
+		f.loseTheAnswer(t, "held past the window", streams, "inst-a", "unasked-wake", "s1")
+		if cut.cut.Load() != 1 {
+			t.Fatalf("the machine cut %d read backs before they left, want one", cut.cut.Load())
+		}
+	})
+}
+
+// cutBeforeItLeaves keeps the first read back from being sent until the window is over,
+// and fails it the way go-redis does a command whose context ran out first.
+type cutBeforeItLeaves struct{ cut atomic.Int64 }
+
+func (*cutBeforeItLeaves) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (h *cutBeforeItLeaves) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if (cmd.Name() == "evalsha" || cmd.Name() == "eval") && h.cut.CompareAndSwap(0, 1) {
+			<-ctx.Done()
+			return ctx.Err()
+		}
+		return next(ctx, cmd)
+	}
+}
+
+func (*cutBeforeItLeaves) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+
 // cutTheReadBack lets the first read back after a `>` reach Redis, then keeps its answer
 // until the window is over and fails it the way the socket's deadline does: what a
 // loaded machine does to a pass without anything in the proxy's hands.
