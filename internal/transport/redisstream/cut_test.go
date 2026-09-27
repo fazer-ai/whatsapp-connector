@@ -372,6 +372,15 @@ func TestAPassIsTheTestsDoingWheneverTheProxySteppedIn(t *testing.T) {
 				<-caught
 				<-done
 			}, false},
+			{"an answer caught before a later command of the same pass", func(_ *testing.T, begin func()) {
+				begin()
+				caught := f.proxy.Drop("dropped-early")
+				done := echo("dropped-early")
+				<-caught
+				<-done
+				// The pass goes on sending: what it began with is still what counts.
+				begin()
+			}, false},
 			// Last: the trap it arms is never sprung, and the proxy stays busy after it.
 			{"a trap armed while it ran", func(_ *testing.T, begin func()) {
 				begin()
