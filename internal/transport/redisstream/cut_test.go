@@ -341,48 +341,56 @@ func TestAPassIsTheTestsDoingWheneverTheProxySteppedIn(t *testing.T) {
 
 	cutBackends(t, func(t *testing.T, f cutFleet) {
 		ctx := context.Background()
-		// echo sends marker through the proxy, which is what springs a trap on it.
-		echo := func(marker string) <-chan struct{} {
-			done := make(chan struct{})
-			go func() {
-				defer close(done)
-				_ = f.through.Echo(ctx, marker).Err()
-			}()
-			return done
+		// springOn sends marker through the proxy and waits for the trap to catch it, then
+		// returns a channel closed once the ECHO is done. An ECHO that finishes with the trap
+		// still armed (a server that refused it, a URL that reaches nothing) fails the case,
+		// rather than leaving it waiting for an answer that will never come.
+		springOn := func(t *testing.T, marker string, caught <-chan struct{}) <-chan struct{} {
+			t.Helper()
+			sent := make(chan error, 1)
+			go func() { sent <- f.through.Echo(ctx, marker).Err() }()
+			finished := make(chan struct{})
+			select {
+			case <-caught:
+				go func() {
+					<-sent
+					close(finished)
+				}()
+			case err := <-sent:
+				select {
+				case <-caught:
+					close(finished)
+				default:
+					t.Fatalf("ECHO %s finished (err=%v) without the proxy catching it", marker, err)
+				}
+			}
+			return finished
 		}
 		for _, tc := range []struct {
 			name   string
-			during func(begin func())
+			during func(t *testing.T, begin func())
 			want   bool
 		}{
-			{"nothing armed, held or caught", func(begin func()) { begin() }, true},
-			{"an answer still held when it began", func(begin func()) {
+			{"nothing armed, held or caught", func(_ *testing.T, begin func()) { begin() }, true},
+			{"an answer still held when it began", func(t *testing.T, begin func()) {
 				release := make(chan struct{})
-				caught := f.proxy.Hold("held-at-begin", release)
-				done := echo("held-at-begin")
-				<-caught
+				done := springOn(t, "held-at-begin", f.proxy.Hold("held-at-begin", release))
 				begin()
 				close(release)
 				<-done
 			}, false},
-			{"an answer caught while it ran", func(begin func()) {
+			{"an answer caught while it ran", func(t *testing.T, begin func()) {
 				begin()
-				caught := f.proxy.Drop("dropped-meanwhile")
-				done := echo("dropped-meanwhile")
-				<-caught
-				<-done
+				<-springOn(t, "dropped-meanwhile", f.proxy.Drop("dropped-meanwhile"))
 			}, false},
-			{"an answer caught before a later command of the same pass", func(begin func()) {
+			{"an answer caught before a later command of the same pass", func(t *testing.T, begin func()) {
 				begin()
-				caught := f.proxy.Drop("dropped-early")
-				done := echo("dropped-early")
-				<-caught
-				<-done
+				<-springOn(t, "dropped-early", f.proxy.Drop("dropped-early"))
 				// The pass goes on sending: what it began with is still what counts.
 				begin()
 			}, false},
 			// Last: the trap it arms is never sprung, and the proxy stays busy after it.
-			{"a trap armed while it ran", func(begin func()) {
+			{"a trap armed while it ran", func(_ *testing.T, begin func()) {
 				begin()
 				f.proxy.Hold("armed-meanwhile", make(chan struct{}))
 			}, false},
@@ -394,7 +402,7 @@ func TestAPassIsTheTestsDoingWheneverTheProxySteppedIn(t *testing.T) {
 				}
 				sent := &passSent{}
 				passCtx := context.WithValue(ctx, passKey{}, sent)
-				tc.during(func() { passReads{proxy: f.proxy}.countRead(passCtx, redis.NewCmd(passCtx, "ping")) })
+				tc.during(t, func() { passReads{proxy: f.proxy}.countRead(passCtx, redis.NewCmd(passCtx, "ping")) })
 				if got := sent.unprovoked(); got != tc.want {
 					t.Fatalf("unprovoked = %v, want %v", got, tc.want)
 				}
