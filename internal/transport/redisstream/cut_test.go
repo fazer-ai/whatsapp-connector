@@ -1167,6 +1167,14 @@ func TestAReadRacingAClaimHandsOutNothingTheClaimDoes(t *testing.T) {
 // been round the pending list as one that just arrived, and a full session queue refuses and
 // retires such a command on the strength of a caller who may have stopped listening. The same
 // holds for what was kept apart before, by a claim that handed it out and had it given back.
+// slowResend is how long a loaded machine took to send a claim again on a fresh connection
+// after the first one's answer was dropped, and patientDelay a claim delay that outlasts it
+// with room to spare.
+const (
+	slowResend   = 3 * cutWindow / 2
+	patientDelay = 5 * cutWindow
+)
+
 func TestWhatAClaimMovedHereWithoutHearingItStaysAClaims(t *testing.T) {
 	cutBackends(t, func(t *testing.T, f cutFleet) {
 		const claimDelay = cutWindow / 2
@@ -1188,7 +1196,7 @@ func TestWhatAClaimMovedHereWithoutHearingItStaysAClaims(t *testing.T) {
 				t.Fatalf("the peer read %v (err=%v), want the command", ids(taken), err)
 			}
 		}
-		stillAClaims := func(t *testing.T, commandID string, claim func(context.Context) ([]transport.Delivery, error)) {
+		stillAClaims := func(t *testing.T, commandID string, claim func(context.Context) ([]transport.Delivery, error), delay time.Duration) {
 			t.Helper()
 			if holder := f.pendingUnder(t, commandID, "s1"); holder != "inst-a" {
 				t.Fatalf("%s is pending under %q after the claim, want inst-a", commandID, holder)
@@ -1197,7 +1205,7 @@ func TestWhatAClaimMovedHereWithoutHearingItStaysAClaims(t *testing.T) {
 				t.Fatalf("the next read handed out %v (err=%v), want nothing: it is a claim's", ids(delivered), err)
 			}
 			// The age is the subject: the claim that reset it needs the delay to pass again.
-			time.Sleep(claimDelay + claimDelay/2)
+			time.Sleep(delay + delay/2)
 			again, err := claim(ctx)
 			if err != nil || !slices.Equal(ids(again), []string{commandID}) || !again[0].Redelivered {
 				t.Fatalf("the next claim took %v (err=%v), want %s as a redelivery", ids(again), err, commandID)
@@ -1206,9 +1214,6 @@ func TestWhatAClaimMovedHereWithoutHearingItStaysAClaims(t *testing.T) {
 		}
 		claimSessions := func(ctx context.Context) ([]transport.Delivery, error) {
 			return adopter.ClaimSessions(ctx, []string{"s1"})
-		}
-		reclaim := func(ctx context.Context) ([]transport.Delivery, error) {
-			return adopter.Claim(ctx, []string{"s1"})
 		}
 
 		t.Run("its answer held past the window", func(t *testing.T) {
@@ -1227,7 +1232,7 @@ func TestWhatAClaimMovedHereWithoutHearingItStaysAClaims(t *testing.T) {
 			if err == nil || len(claimed) != 0 {
 				t.Fatalf("the claim whose answer was lost handed out %v (err=%v)", ids(claimed), err)
 			}
-			stillAClaims(t, "held-claim", claimSessions)
+			stillAClaims(t, "held-claim", claimSessions, claimDelay)
 		})
 
 		t.Run("its answer dropped with the connection", func(t *testing.T) {
@@ -1236,6 +1241,28 @@ func TestWhatAClaimMovedHereWithoutHearingItStaysAClaims(t *testing.T) {
 			if f.fake {
 				t.Skip("miniredis's XCLAIM never checks the min idle time, so the claim sent again takes the command a second time")
 			}
+			// On a loaded machine the dial and the resend take a while (#334). The client
+			// here waits that long on purpose before it sends again, and the claim delay is
+			// long enough that the resend still finds the command too young.
+			options := *f.through.Options()
+			options.MinRetryBackoff, options.MaxRetryBackoff = slowResend, slowResend
+			rdb := redis.NewClient(&options)
+			rdb.AddHook(passReads{proxy: f.proxy})
+			t.Cleanup(func() { _ = rdb.Close() })
+			slow, err := redisstream.New(redisx.Wrap(rdb, f.client.Keys().Prefix(), shards),
+				redisstream.Options{Instance: "inst-a", Block: 50 * time.Millisecond, ClaimMinIdle: claimDelay})
+			if err != nil {
+				t.Fatalf("redisstream.New: %v", err)
+			}
+			reclaim := func(ctx context.Context) ([]transport.Delivery, error) {
+				return slow.Claim(ctx, []string{"s1"})
+			}
+			// Primed first: a transport's first look at a stream asks for its last entry,
+			// which carries the marker, and the trap would spring on that instead.
+			if _, err := read(t, slow, "s1"); err != nil {
+				t.Fatalf("priming read: %v", err)
+			}
+
 			abandon(t, "dropped-claim")
 			time.Sleep(claimDelay + claimDelay/2)
 			caught := f.proxy.Drop("dropped-claim")
@@ -1248,7 +1275,7 @@ func TestWhatAClaimMovedHereWithoutHearingItStaysAClaims(t *testing.T) {
 			if len(claimed) != 0 {
 				t.Fatalf("the claim whose answer was dropped handed out %v (err=%v)", ids(claimed), err)
 			}
-			stillAClaims(t, "dropped-claim", reclaim)
+			stillAClaims(t, "dropped-claim", reclaim, claimDelay)
 		})
 
 		t.Run("a command already claimed and given back", func(t *testing.T) {
@@ -1269,7 +1296,7 @@ func TestWhatAClaimMovedHereWithoutHearingItStaysAClaims(t *testing.T) {
 			default:
 				t.Fatalf("the claim's answer was never held (claimed %v, err=%v)", ids(lost), err)
 			}
-			stillAClaims(t, "given-back", claimSessions)
+			stillAClaims(t, "given-back", claimSessions, claimDelay)
 		})
 	})
 }
