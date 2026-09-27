@@ -447,3 +447,20 @@ func TestAJudgementQueuedBeforeAMoveIsDropped(t *testing.T) {
 	session.judgeProxy(left, 1, false)
 	publishesNothing(t, session, 300*time.Millisecond)
 }
+
+// A dial this connector started, and whatsmeow went on retrying, is `connecting`: the proxy
+// is named from there too. Set by hand, because which of `connecting` and `reconnecting` a
+// real failed resume shows first is whatsmeow's scheduling.
+func TestAProxyFailureWhileConnectingIsNamedFromConnecting(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	standOn(t, session, "http://"+deadProxy(t))
+	session.setDialing(true)
+
+	session.judgeProxy(session.route.generation.Load(), 1, false)
+	got := nextState(t, session)
+	if got["state"] != "connecting" || got["reason"] != reasonProxyUnreachable {
+		t.Fatalf("a proxy failure while connecting published %v", got)
+	}
+}
