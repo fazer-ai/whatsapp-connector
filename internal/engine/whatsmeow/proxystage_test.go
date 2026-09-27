@@ -2,6 +2,7 @@ package whatsmeow
 
 import (
 	"bufio"
+	"context"
 	"net"
 	"net/http"
 	"strings"
@@ -291,4 +292,45 @@ func TestAMediaDialThatFailsAtTheProxyNamesNothing(t *testing.T) {
 	session := reconnectingOn(t, "http://"+deadProxy(t))
 	_ = reach(t, &http.Client{Transport: &session.route.media})
 	publishesNothing(t, session, 300*time.Millisecond)
+}
+
+// Outcomes are judged off the dial's goroutine, so two can be judged out of order. A
+// failure that lands after the success that followed it is old news: publishing it would
+// name the proxy over a proxy that already answered.
+func TestAnOutcomeJudgedLateIsDropped(t *testing.T) {
+	t.Parallel()
+
+	session := reconnectingOn(t, "http://"+deadProxy(t))
+	session.judgeProxy(1, false)
+	if got := nextState(t, session); got["reason"] != reasonProxyUnreachable {
+		t.Fatalf("the failure published %v", got)
+	}
+	session.judgeProxy(3, true)
+	if got := nextState(t, session); got["reason"] == reasonProxyUnreachable {
+		t.Fatalf("the answer published %v", got)
+	}
+
+	session.judgeProxy(2, false)
+	publishesNothing(t, session, 300*time.Millisecond)
+}
+
+// A dial its caller gave up on failed because somebody stopped waiting, not because of the
+// proxy, and says nothing about it.
+func TestADialItsCallerGaveUpOnReportsNothing(t *testing.T) {
+	t.Parallel()
+
+	calls := 0
+	transport, err := egressTransportReporting("http://"+deadProxy(t), func(bool) { calls++ })
+	if err != nil {
+		t.Fatalf("egressTransportReporting: %v", err)
+	}
+	gaveUp, cancel := context.WithCancel(t.Context())
+	cancel()
+	if conn, err := transport.DialContext(gaveUp, "tcp", deadProxy(t)); err == nil {
+		_ = conn.Close()
+		t.Fatal("a dial whose caller had given up succeeded")
+	}
+	if calls != 0 {
+		t.Fatalf("a dial its caller gave up on reported %d proxy outcomes", calls)
+	}
 }
