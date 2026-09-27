@@ -538,7 +538,12 @@ func TestARequestCancelledBeforeTheProxyAnsweredReportsNothing(t *testing.T) {
 				return
 			}
 			t.Cleanup(func() { _ = conn.Close() })
-			accepted <- struct{}{}
+			go func() {
+				// Signalled once the CONNECT has been read, so the dial is over on the
+				// client's side and the request is waiting on the answer when it is cut.
+				_, _ = bufio.NewReader(conn).ReadString('\n')
+				accepted <- struct{}{}
+			}()
 		}
 	}()
 	route := newEgressRoute()
