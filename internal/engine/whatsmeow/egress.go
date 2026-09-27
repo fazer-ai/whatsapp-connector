@@ -156,10 +156,19 @@ type swappedTransport struct {
 func (t *swappedTransport) RoundTrip(request *http.Request) (*http.Response, error) {
 	attempt := &proxyAttempt{}
 	response, err := t.current.Load().RoundTrip(request.WithContext(context.WithValue(request.Context(), proxyAttemptKey{}, attempt)))
-	if err != nil && request.Context().Err() == nil {
+	if err != nil && !abandoned(request.Context()) {
 		attempt.unanswered()
 	}
 	return response, err //nolint:wrapcheck // a round tripper passes its transport's errors on untouched
+}
+
+// abandoned is a request its caller cancelled, which says when somebody stopped waiting and
+// nothing about the proxy. A deadline that ran out is not that: the websocket clients carry
+// a dial ceiling, and a proxy that accepts the connection and never answers the CONNECT
+// keeps a dial waiting until the ceiling cancels it -- the failure is the proxy's, and it
+// would otherwise go unreported on every retry for as long as the proxy stayed silent.
+func abandoned(ctx context.Context) bool {
+	return errors.Is(ctx.Err(), context.Canceled)
 }
 
 // proxyAttempt is how far one request got with an HTTP proxy.
@@ -235,8 +244,7 @@ func egressTransportReporting(proxyURL string, report func(reached bool)) (*http
 // proxy could not be reached or refused the tunnel, true when the tunnel opened. What
 // happens past the proxy -- a TLS handshake WhatsApp never answers -- is not reported,
 // because it is not the proxy's to answer for. Nothing is reported on the direct route,
-// and nothing for a dial whose caller gave up first: that says when somebody stopped
-// waiting, not where the dial failed.
+// and nothing for a dial whose caller cancelled it (see abandoned).
 func egressTransportWithin(proxyURL string, handshake time.Duration, report func(reached bool)) (*http.Transport, error) {
 	transport := dialTransport().Clone()
 	// Not `ProxyFromEnvironment`, which is what the clone carries: see routeThrough.
@@ -263,7 +271,7 @@ func egressTransportWithin(proxyURL string, handshake time.Duration, report func
 			transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
 				conn, err := dial(ctx, network, address)
 				switch {
-				case err != nil && ctx.Err() == nil:
+				case err != nil && !abandoned(ctx):
 					report(false)
 				case err == nil:
 					if attempt := attemptOf(ctx); attempt != nil {
@@ -306,7 +314,7 @@ func egressTransportWithin(proxyURL string, handshake time.Duration, report func
 			conn, err := contextual.DialContext(bounded, network, address)
 			// The SOCKS5 dial ends when the proxy has opened the connection to WhatsApp,
 			// so any failure in it is at the proxy: unreachable, silent, or refusing.
-			if report != nil && ctx.Err() == nil {
+			if report != nil && !abandoned(ctx) {
 				report(err == nil)
 			}
 			return conn, err //nolint:wrapcheck // the transport wraps a dial error itself

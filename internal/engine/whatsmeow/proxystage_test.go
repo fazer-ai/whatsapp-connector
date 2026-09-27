@@ -464,3 +464,56 @@ func TestAProxyFailureWhileConnectingIsNamedFromConnecting(t *testing.T) {
 		t.Fatalf("a proxy failure while connecting published %v", got)
 	}
 }
+
+// A proxy that takes the connection and never answers the CONNECT is found out by the dial
+// ceiling, not by net/http's own CONNECT timeout, which is longer. The request's deadline
+// running out there is the proxy's silence, and it names the proxy. Measured by review:
+// before this, every retry against a silent proxy was cut by the ceiling and reported
+// nothing for as long as the outage lasted.
+func TestAProxyThatNeverAnswersTheConnectIsNamed(t *testing.T) {
+	t.Parallel()
+
+	listener, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			t.Cleanup(func() { _ = conn.Close() })
+		}
+	}()
+	session := reconnectingOn(t, "http://"+listener.Addr().String())
+
+	_ = reach(t, &http.Client{Timeout: 200 * time.Millisecond, Transport: &session.route.websocket})
+	if got := nextState(t, session); got["reason"] != reasonProxyUnreachable {
+		t.Fatalf("a proxy silent on the CONNECT published %v", got)
+	}
+}
+
+// The same holds for the dial itself: a proxy address that swallows the connection attempt
+// runs out the caller's deadline, and that is the proxy.
+func TestADialToTheProxyThatRunsOutItsDeadlineIsReported(t *testing.T) {
+	t.Parallel()
+
+	var outcomes []bool
+	transport, err := egressTransportReporting("http://"+deadProxy(t), func(reached bool) {
+		outcomes = append(outcomes, reached)
+	})
+	if err != nil {
+		t.Fatalf("egressTransportReporting: %v", err)
+	}
+	expired, cancel := context.WithDeadline(t.Context(), time.Now().Add(-time.Second))
+	defer cancel()
+	if conn, err := transport.DialContext(expired, "tcp", deadProxy(t)); err == nil {
+		_ = conn.Close()
+		t.Fatal("a dial past its deadline succeeded")
+	}
+	if len(outcomes) != 1 || outcomes[0] {
+		t.Fatalf("a dial that ran out its deadline reported %v", outcomes)
+	}
+}
