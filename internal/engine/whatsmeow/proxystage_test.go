@@ -174,7 +174,7 @@ func TestTheBlameLeavesTheProxyOnceItAnswersAgain(t *testing.T) {
 
 	addr := answeringProxy(t, "200 Connection established")
 	session := reconnectingOn(t, "http://"+addr)
-	session.route.reported(false)
+	session.route.reported(session.route.generation.Load(), false)
 	if got := nextState(t, session); got["reason"] != reasonProxyUnreachable {
 		t.Fatalf("a proxy failure published %v", got)
 	}
@@ -263,8 +263,9 @@ func TestASOCKS5ProxyThatCannotBeReachedIsReported(t *testing.T) {
 }
 
 // A resume that cannot get past its proxy says so too. whatsmeow goes on retrying the dial
-// the connector started, so the session stays `connecting` rather than closing -- which is
-// where an account resumed after a restart sits while its proxy is down.
+// the connector started, so the session does not close: it names the proxy from
+// `connecting`, or from `reconnecting` if whatsmeow's own Disconnected for the failed dial
+// is handled first. Which of the two is scheduling, and both are the documented states.
 func TestAResumeThatCannotReachItsProxyNamesIt(t *testing.T) {
 	t.Parallel()
 
@@ -276,12 +277,88 @@ func TestAResumeThatCannotReachItsProxyNamesIt(t *testing.T) {
 	for {
 		got := nextState(t, session)
 		if got["reason"] == reasonProxyUnreachable {
-			if got["state"] != "connecting" {
+			if got["state"] != "connecting" && got["state"] != "reconnecting" {
 				t.Fatalf("the resume named the proxy on %v", got)
 			}
 			return
 		}
 	}
+}
+
+// Another state going out in between is what the client now reads, so the next failure at
+// the proxy names it again rather than being taken for a repeat. Measured by review before
+// this: a Disconnected published after the proxy was named left it counted as named, and
+// every later failure was held back for good.
+func TestAStatePublishedInBetweenLetsTheProxyBeNamedAgain(t *testing.T) {
+	t.Parallel()
+
+	session := reconnectingOn(t, "http://"+deadProxy(t))
+	redial(t, session)
+	if got := nextState(t, session); got["reason"] != reasonProxyUnreachable {
+		t.Fatalf("the failure published %v", got)
+	}
+	session.handle(&waEvents.Disconnected{})
+	if got := nextState(t, session); got["reason"] == reasonProxyUnreachable {
+		t.Fatalf("the drop published %v", got)
+	}
+
+	redial(t, session)
+	if got := nextState(t, session); got["reason"] != reasonProxyUnreachable {
+		t.Fatalf("the failure after the drop published %v", got)
+	}
+}
+
+// A proxy reached and gone before it answered the CONNECT -- hung up, or a TLS handshake
+// with an HTTPS proxy that failed -- is a failure at the proxy, though neither the dial nor
+// the CONNECT answer says so on its own.
+func TestAProxyThatHangsUpBeforeAnsweringIsNamed(t *testing.T) {
+	t.Parallel()
+
+	listener, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			_ = conn.Close()
+		}
+	}()
+	session := reconnectingOn(t, "http://"+listener.Addr().String())
+
+	redial(t, session)
+	if got := nextState(t, session); got["reason"] != reasonProxyUnreachable {
+		t.Fatalf("a proxy that hung up on the CONNECT published %v", got)
+	}
+}
+
+// A dial still under way on a path the session has left is about a proxy it no longer
+// uses: blaming it would name the wrong cause for a session now going out another way.
+func TestAnOutcomeFromAPathTheSessionLeftIsDropped(t *testing.T) {
+	t.Parallel()
+
+	session := reconnectingOn(t, "http://"+deadProxy(t))
+	left := session.route.websocket.current.Load()
+	if err := session.route.set(""); err != nil {
+		t.Fatalf("route.set: %v", err)
+	}
+
+	_ = reach(t, &http.Client{Transport: &swappedAt{left}})
+	publishesNothing(t, session, 300*time.Millisecond)
+}
+
+// swappedAt is a swappedTransport pinned to one transport, the way a request that started
+// before a move goes on with the one it started on.
+type swappedAt struct{ transport *http.Transport }
+
+func (s *swappedAt) RoundTrip(request *http.Request) (*http.Response, error) {
+	var pinned swappedTransport
+	pinned.current.Store(s.transport)
+	return pinned.RoundTrip(request)
 }
 
 // The media client dials the same proxy, but a download that could not start says nothing
@@ -301,16 +378,16 @@ func TestAnOutcomeJudgedLateIsDropped(t *testing.T) {
 	t.Parallel()
 
 	session := reconnectingOn(t, "http://"+deadProxy(t))
-	session.judgeProxy(1, false)
+	session.judgeProxy(session.route.generation.Load(), 1, false)
 	if got := nextState(t, session); got["reason"] != reasonProxyUnreachable {
 		t.Fatalf("the failure published %v", got)
 	}
-	session.judgeProxy(3, true)
+	session.judgeProxy(session.route.generation.Load(), 3, true)
 	if got := nextState(t, session); got["reason"] == reasonProxyUnreachable {
 		t.Fatalf("the answer published %v", got)
 	}
 
-	session.judgeProxy(2, false)
+	session.judgeProxy(session.route.generation.Load(), 2, false)
 	publishesNothing(t, session, 300*time.Millisecond)
 }
 
@@ -333,4 +410,40 @@ func TestADialItsCallerGaveUpOnReportsNothing(t *testing.T) {
 	if calls != 0 {
 		t.Fatalf("a dial its caller gave up on reported %d proxy outcomes", calls)
 	}
+}
+
+// The route drops an outcome from a path it has left before telling anybody: the check at
+// the session covers only the judgements already queued when the route moved.
+func TestTheRouteDropsAnOutcomeFromAPathItLeft(t *testing.T) {
+	t.Parallel()
+
+	route := newEgressRoute()
+	told := 0
+	route.notify = func(uint64, uint64, bool) { told++ }
+	if err := route.set("http://" + deadProxy(t)); err != nil {
+		t.Fatalf("route.set: %v", err)
+	}
+	left := route.generation.Load()
+	if err := route.set(""); err != nil {
+		t.Fatalf("route.set: %v", err)
+	}
+
+	route.reported(left, false)
+	if told != 0 {
+		t.Fatalf("an outcome from the path the route left was passed on %d times", told)
+	}
+}
+
+// A judgement queued before the route moved runs after it, and is dropped then.
+func TestAJudgementQueuedBeforeAMoveIsDropped(t *testing.T) {
+	t.Parallel()
+
+	session := reconnectingOn(t, "http://"+deadProxy(t))
+	left := session.route.generation.Load()
+	if err := session.route.set(""); err != nil {
+		t.Fatalf("route.set: %v", err)
+	}
+
+	session.judgeProxy(left, 1, false)
+	publishesNothing(t, session, 300*time.Millisecond)
 }
