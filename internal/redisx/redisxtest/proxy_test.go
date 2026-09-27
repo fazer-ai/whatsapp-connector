@@ -137,11 +137,11 @@ func TestAMarkerAlreadyRelayedDoesNotSpringATrapArmedAfterIt(t *testing.T) {
 	}
 }
 
-// A test that reads Caught and Busy on both sides of a read learns whether the proxy
-// stepped in during it, which is what tells a window the test spent on purpose from one
-// the machine spent (#334). So the proxy is busy from the moment a trap is armed until
-// the answer it holds is let through, and the answer counts as caught once it is.
-func TestTheProxyIsBusyFromArmingATrapUntilItsAnswerIsLetThrough(t *testing.T) {
+// A test that reads Caught, Armed and Holding on both sides of a read learns whether the
+// proxy stepped in during it, which is what tells a window the test spent on purpose from
+// one the machine spent (#334). So a trap is armed until its answer arrives, the answer
+// is held from then until it is let through, and it counts as caught once it arrives.
+func TestTheProxyReportsATrapFromArmingItUntilItsAnswerIsLetThrough(t *testing.T) {
 	const answer = "answer carrying held-marker\n"
 
 	var config net.ListenConfig
@@ -163,13 +163,14 @@ func TestTheProxyIsBusyFromArmingATrapUntilItsAnswerIsLetThrough(t *testing.T) {
 	}()
 
 	proxy := redisxtest.Listen(t, listener.Addr().String())
-	if proxy.Busy() || proxy.Caught() != 0 {
-		t.Fatalf("a proxy nobody armed is busy=%v with %d caught, want idle with none", proxy.Busy(), proxy.Caught())
+	if proxy.Armed() || proxy.Holding() || proxy.Caught() != 0 {
+		t.Fatalf("a proxy nobody armed is armed=%v holding=%v with %d caught, want none of it",
+			proxy.Armed(), proxy.Holding(), proxy.Caught())
 	}
 	release := make(chan struct{})
 	caught := proxy.Hold("held-marker", release)
-	if !proxy.Busy() {
-		t.Fatalf("a proxy with a trap armed says it is idle")
+	if !proxy.Armed() || proxy.Holding() {
+		t.Fatalf("a proxy with a trap armed and nothing caught is armed=%v holding=%v", proxy.Armed(), proxy.Holding())
 	}
 
 	var dialer net.Dialer
@@ -183,8 +184,9 @@ func TestTheProxyIsBusyFromArmingATrapUntilItsAnswerIsLetThrough(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatalf("the answer was never caught")
 	}
-	if !proxy.Busy() || proxy.Caught() != 1 {
-		t.Fatalf("a proxy holding an answer is busy=%v with %d caught, want busy with one", proxy.Busy(), proxy.Caught())
+	if proxy.Armed() || !proxy.Holding() || proxy.Caught() != 1 {
+		t.Fatalf("a proxy holding the answer its trap caught is armed=%v holding=%v with %d caught, want holding with one",
+			proxy.Armed(), proxy.Holding(), proxy.Caught())
 	}
 
 	close(release)
@@ -193,8 +195,9 @@ func TestTheProxyIsBusyFromArmingATrapUntilItsAnswerIsLetThrough(t *testing.T) {
 		t.Fatalf("the released answer never arrived: %v", err)
 	}
 	// The client has the answer, so the relay is past letting it through.
-	if proxy.Busy() || proxy.Caught() != 1 {
-		t.Fatalf("a proxy that let its answer through is busy=%v with %d caught, want idle with one", proxy.Busy(), proxy.Caught())
+	if proxy.Armed() || proxy.Holding() || proxy.Caught() != 1 {
+		t.Fatalf("a proxy that let its answer through is armed=%v holding=%v with %d caught, want only the one caught",
+			proxy.Armed(), proxy.Holding(), proxy.Caught())
 	}
 	_ = conn.Close()
 	<-served

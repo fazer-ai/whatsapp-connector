@@ -96,12 +96,18 @@ func (p *Proxy) Caught() uint64 {
 	return p.caught
 }
 
-// Busy reports whether the proxy stands to step in: a trap is armed and has not sprung,
-// or an answer it caught is still held.
-func (p *Proxy) Busy() bool {
+// Armed reports whether a trap is waiting for its answer.
+func (p *Proxy) Armed() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return len(p.traps) > 0 || p.holding > 0
+	return len(p.traps) > 0
+}
+
+// Holding reports whether an answer the proxy caught is still held.
+func (p *Proxy) Holding() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.holding > 0
 }
 
 // Hold keeps the next answer containing marker from reaching the client until release is

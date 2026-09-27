@@ -133,7 +133,10 @@ func (f cutFleet) streamsReading(t *testing.T, instance string, count int64) *re
 // a loaded machine the same failure comes with nothing held, from a trip that simply took
 // longer than the window (#334), and like the starved pass it is no verdict: the loop's
 // next pass reads back what it left pending. So a spent pass is run again when the proxy
-// the client goes through neither stepped in nor stood ready to while it ran.
+// the client goes through did not step in while it ran: it caught nothing, and held
+// nothing. A trap armed for an answer is a stimulus only once the command it waits for
+// has left: until then there is no answer for it to catch, and the pass is as much the
+// machine's as one with nothing armed.
 func read(t *testing.T, streams *redisstream.Streams, sids ...string) ([]transport.Delivery, error) {
 	t.Helper()
 	return readWithin(t, cutWindow, streams, sids...)
@@ -158,7 +161,7 @@ func readWithin(t testing.TB, window time.Duration, streams *redisstream.Streams
 // starvedPasses bounds how many times read runs a pass the machine starved. A machine
 // that starves this many windows in a row is not going to be waited out, and a test that
 // hung instead of failing would say less.
-const starvedPasses = 5
+const starvedPasses = 20
 
 // pass is a single read, and whether the machine rather than the test decided how it came
 // out: it never went out, or it had its window spent with the proxy idle, whether on the
@@ -168,7 +171,7 @@ func pass(streams *redisstream.Streams, window time.Duration, sids []string) (de
 	ctx, cancel := context.WithTimeout(context.WithValue(context.Background(), passKey{}, sent), window)
 	defer cancel()
 	delivered, err = streams.Read(ctx, sids)
-	spent := errors.Is(err, transport.ErrWindowSpent) && sent.unprovoked()
+	spent := errors.Is(err, transport.ErrWindowSpent) && sent.unprovoked(err)
 	if sent.reads.Load() == 0 {
 		return delivered, (len(delivered) == 0 && err == nil) || spent, err
 	}
@@ -183,20 +186,31 @@ type passSent struct {
 	reads atomic.Int64
 
 	// What the proxy had done and stood ready to do when the pass sent its first command.
-	began  sync.Once
-	proxy  *redisxtest.Proxy
-	caught uint64
-	busy   bool
+	began   sync.Once
+	proxy   *redisxtest.Proxy
+	caught  uint64
+	armed   bool
+	holding bool
 }
 
-// unprovoked reports whether the proxy the pass went through left it alone: nothing
-// armed or held when it began or when it ended, and nothing caught in between. A client
-// with no proxy in front has nobody to provoke anything.
-func (s *passSent) unprovoked() bool {
+// unprovoked reports whether the proxy the pass went through left it alone, given the
+// error the pass was cut with: nothing held when it began or when it ended, nothing caught
+// in between, and a trap armed at either end only if the command the pass was cut on never
+// left. go-redis fails a command whose context ran out before it was written with the
+// context's own error, and one whose answer the deadline overtook with the socket's: only
+// the second can still have an answer on its way to the trap. A client with no proxy in
+// front has nobody to provoke anything.
+func (s *passSent) unprovoked(err error) bool {
 	if s.proxy == nil {
 		return true
 	}
-	return !s.busy && !s.proxy.Busy() && s.proxy.Caught() == s.caught
+	if s.holding || s.proxy.Holding() || s.proxy.Caught() != s.caught {
+		return false
+	}
+	if s.armed || s.proxy.Armed() {
+		return errors.Is(err, context.DeadlineExceeded)
+	}
+	return true
 }
 
 // passReads counts each XREADGROUP against the pass whose context sent it, and has the
@@ -229,7 +243,7 @@ func (h passReads) countRead(ctx context.Context, cmd redis.Cmder) {
 	}
 	sent.began.Do(func() {
 		if h.proxy != nil {
-			sent.proxy, sent.caught, sent.busy = h.proxy, h.proxy.Caught(), h.proxy.Busy()
+			sent.proxy, sent.caught, sent.armed, sent.holding = h.proxy, h.proxy.Caught(), h.proxy.Armed(), h.proxy.Holding()
 		}
 	})
 	if cmd.Name() == "xreadgroup" {
@@ -336,8 +350,9 @@ func TestAPassTheMachineCutIsReadAgain(t *testing.T) {
 
 // What decides whether a spent pass is run again is whether the proxy stepped in while it
 // ran, and each way it can have done so is a clause of its own: an answer still held when
-// the pass began, a trap armed while it ran and not yet sprung, an answer caught in
-// between. Any one of them makes the pass the test's doing.
+// the pass began, an answer caught in between, a trap armed while the command it waits for
+// was on its way. Any one of them makes the pass the test's doing. A trap armed for a
+// command that never left is not one of them.
 func TestAPassIsTheTestsDoingWheneverTheProxySteppedIn(t *testing.T) {
 	t.Parallel()
 
@@ -368,44 +383,53 @@ func TestAPassIsTheTestsDoingWheneverTheProxySteppedIn(t *testing.T) {
 			}
 			return finished
 		}
+		// How the pass was cut: after its command left, the deadline overtook the answer on
+		// the socket; before, go-redis gave up on the context.
+		afterItLeft := &net.OpError{Op: "read", Net: "tcp", Err: os.ErrDeadlineExceeded}
+		beforeItLeft := context.DeadlineExceeded
 		for _, tc := range []struct {
 			name   string
 			during func(t *testing.T, begin func())
+			cut    error
 			want   bool
 		}{
-			{"nothing armed, held or caught", func(_ *testing.T, begin func()) { begin() }, true},
+			{"nothing armed, held or caught", func(_ *testing.T, begin func()) { begin() }, afterItLeft, true},
 			{"an answer still held when it began", func(t *testing.T, begin func()) {
 				release := make(chan struct{})
 				done := springOn(t, "held-at-begin", f.proxy.Hold("held-at-begin", release))
 				begin()
 				close(release)
 				<-done
-			}, false},
+			}, afterItLeft, false},
 			{"an answer caught while it ran", func(t *testing.T, begin func()) {
 				begin()
 				<-springOn(t, "dropped-meanwhile", f.proxy.Drop("dropped-meanwhile"))
-			}, false},
+			}, beforeItLeft, false},
 			{"an answer caught before a later command of the same pass", func(t *testing.T, begin func()) {
 				begin()
 				<-springOn(t, "dropped-early", f.proxy.Drop("dropped-early"))
 				// The pass goes on sending: what it began with is still what counts.
 				begin()
-			}, false},
-			// Last: the trap it arms is never sprung, and the proxy stays busy after it.
-			{"a trap armed while it ran", func(_ *testing.T, begin func()) {
+			}, beforeItLeft, false},
+			// Last: the traps they arm are never sprung, and stay armed after them.
+			{"a trap armed and the command it waits for gone out", func(_ *testing.T, begin func()) {
 				begin()
 				f.proxy.Hold("armed-meanwhile", make(chan struct{}))
-			}, false},
+			}, afterItLeft, false},
+			{"a trap armed and the command it waits for never sent", func(_ *testing.T, begin func()) {
+				f.proxy.Hold("armed-before", make(chan struct{}))
+				begin()
+			}, beforeItLeft, true},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
-				// Every case starts from an idle proxy, or it would be judging the last one's.
-				if f.proxy.Busy() {
-					t.Fatalf("the proxy is still busy from an earlier case")
+				// Every case starts with nothing held, or it would be judging the last one's.
+				if f.proxy.Holding() {
+					t.Fatalf("the proxy still holds an answer from an earlier case")
 				}
 				sent := &passSent{}
 				passCtx := context.WithValue(ctx, passKey{}, sent)
 				tc.during(t, func() { passReads{proxy: f.proxy}.countRead(passCtx, redis.NewCmd(passCtx, "ping")) })
-				if got := sent.unprovoked(); got != tc.want {
+				if got := sent.unprovoked(tc.cut); got != tc.want {
 					t.Fatalf("unprovoked = %v, want %v", got, tc.want)
 				}
 			})
@@ -415,7 +439,7 @@ func TestAPassIsTheTestsDoingWheneverTheProxySteppedIn(t *testing.T) {
 			sent := &passSent{}
 			passCtx := context.WithValue(ctx, passKey{}, sent)
 			passReads{}.countRead(passCtx, redis.NewCmd(passCtx, "ping"))
-			if !sent.unprovoked() {
+			if !sent.unprovoked(&net.OpError{Op: "read", Net: "tcp", Err: os.ErrDeadlineExceeded}) {
 				t.Fatalf("a pass with no proxy in front was taken for the test's doing")
 			}
 		})
