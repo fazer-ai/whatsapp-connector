@@ -331,11 +331,21 @@ func egressTransportWithin(proxyURL string, handshake time.Duration, report func
 		transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
 			bounded, cancel := context.WithTimeout(ctx, handshake)
 			defer cancel()
+			attempt := attemptOf(ctx)
+			if attempt != nil && report != nil {
+				attempt.dialling(report)
+			}
 			conn, err := contextual.DialContext(bounded, network, address)
 			// The SOCKS5 dial ends when the proxy has opened the connection to WhatsApp,
-			// so any failure in it is at the proxy: unreachable, silent, or refusing.
+			// so any failure in it is at the proxy: unreachable, silent, or refusing. Through
+			// the request's record, like the HTTP proxy's answer, so a negotiation still
+			// running after its request reported the failure does not report it again.
 			if report != nil && !abandoned(ctx) {
-				report(err == nil)
+				if attempt != nil {
+					attempt.answered(report, err == nil)
+				} else {
+					report(err == nil)
+				}
 			}
 			return conn, err //nolint:wrapcheck // the transport wraps a dial error itself
 		}

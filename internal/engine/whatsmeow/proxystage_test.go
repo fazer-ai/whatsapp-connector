@@ -673,3 +673,28 @@ func TestASettledAttemptReportsOnlyALateAnswer(t *testing.T) {
 		t.Fatalf("a settled attempt reported %v", outcomes)
 	}
 }
+
+// A SOCKS5 negotiation outlives its request the same way an HTTP dial does, and ends in a
+// failure the request already reported: that one is not reported again either.
+func TestASOCKS5FailureAfterItsRequestReportedIsNotRepeated(t *testing.T) {
+	t.Parallel()
+
+	var outcomes []bool
+	report := func(reached bool) { outcomes = append(outcomes, reached) }
+	transport, err := egressTransportReporting("socks5://"+deadProxy(t), report)
+	if err != nil {
+		t.Fatalf("egressTransportReporting: %v", err)
+	}
+	attempt := &proxyAttempt{}
+	attempt.dialling(report)
+	attempt.unanswered()
+
+	ctx := context.WithValue(t.Context(), proxyAttemptKey{}, attempt)
+	if conn, err := transport.DialContext(ctx, "tcp", "web.whatsapp.com:443"); err == nil {
+		_ = conn.Close()
+		t.Fatal("a dial through a proxy nothing listens on succeeded")
+	}
+	if len(outcomes) != 1 || outcomes[0] {
+		t.Fatalf("a SOCKS5 failure after its request reported was reported as %v", outcomes)
+	}
+}
