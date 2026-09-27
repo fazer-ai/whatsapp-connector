@@ -664,6 +664,56 @@ func TestAPassCutBeforeItsCommandLeftIsTheMachinesWhateverIsArmed(t *testing.T) 
 	})
 }
 
+// A command can also leave the client and never reach Redis: under load the window ran
+// out, go-redis closed the connection, and what it had written died in the proxy with it
+// (#334). No answer comes for the trap, however long the test waits, and the stimulus has
+// to be tried again.
+func TestAStimulusWhoseCommandDiedOnTheWayIsTriedAgain(t *testing.T) {
+	t.Parallel()
+
+	cutBackends(t, func(t *testing.T, f cutFleet) {
+		streams := f.streams(t, "inst-a")
+		if _, err := read(t, streams, "s1"); err != nil {
+			t.Fatalf("priming read: %v", err)
+		}
+		writeCommand(t, f.fleet, f.client.Keys().Control(), &protocol.Command{
+			V: protocol.Version, ID: "lost-on-the-way", Type: protocol.CommandSessionWake, SID: "s9",
+			TS: 1787000000000, Payload: []byte(`{"desired":"connected"}`),
+		})
+		f.loseTheAnswer(t, "held past the window", streams, "inst-a", "lost-on-the-way", "s1")
+
+		died := &dieOnTheWay{}
+		f.through.AddHook(died)
+		f.loseTheAnswer(t, "held past the window", streams, "inst-a", "lost-on-the-way", "s1")
+		if died.died.Load() != 1 {
+			t.Fatalf("%d read backs died on the way, want one", died.died.Load())
+		}
+	})
+}
+
+// dieOnTheWay has the first read back write something and then fail the way the socket's
+// deadline does, without the command itself ever reaching Redis.
+type dieOnTheWay struct{ died atomic.Int64 }
+
+func (*dieOnTheWay) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (h *dieOnTheWay) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if (cmd.Name() == "evalsha" || cmd.Name() == "eval") && h.died.CompareAndSwap(0, 1) {
+			if err := next(ctx, redis.NewCmd(ctx, "ping")); err != nil {
+				return err
+			}
+			<-ctx.Done()
+			return &net.OpError{Op: "read", Net: "tcp", Err: os.ErrDeadlineExceeded}
+		}
+		return next(ctx, cmd)
+	}
+}
+
+func (*dieOnTheWay) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+
 // cutBeforeItLeaves keeps the first read back from being sent until the window is over,
 // and fails it the way go-redis does a command whose context ran out first.
 type cutBeforeItLeaves struct{ cut atomic.Int64 }
