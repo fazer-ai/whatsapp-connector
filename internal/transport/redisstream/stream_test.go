@@ -1275,7 +1275,9 @@ func realFleet(t *testing.T) fleet {
 	rdb := redis.NewClient(opts)
 	rdb.AddHook(passReads{})
 	t.Cleanup(func() { _ = rdb.Close() })
-	prefix := "wactest:" + strconv.FormatInt(time.Now().UnixNano(), 36) + ":"
+	// The test's name as well as the clock: the clock only resolves microseconds here, and
+	// two parallel tests that started in the same one shared their streams (#334).
+	prefix := "wactest:" + t.Name() + ":" + strconv.FormatInt(time.Now().UnixNano(), 36) + ":"
 	t.Cleanup(func() {
 		keys, err := rdb.Keys(context.Background(), prefix+"*").Result()
 		if err == nil && len(keys) > 0 {
