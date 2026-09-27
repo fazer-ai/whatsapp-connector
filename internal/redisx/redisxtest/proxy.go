@@ -90,31 +90,27 @@ const markerReach = 256
 // Addr is where a client should connect instead of the server.
 func (p *Proxy) Addr() string { return p.addr }
 
-// Caught is how many answers the proxy has caught so far, held or dropped. A caller that
-// reads it on both sides of something learns whether the proxy stepped in meanwhile.
-func (p *Proxy) Caught() uint64 {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.caught
+// State is what the proxy has done and stands ready to do, read at one instant: how many
+// answers it has caught so far, held or dropped, whether a trap is waiting for its answer,
+// and whether an answer it caught is still held. Read together because a trap springs
+// between any two separate reads, and a caller comparing them would see one without the
+// other.
+type State struct {
+	Caught  uint64
+	Armed   bool
+	Holding bool
 }
 
-// Armed reports whether a trap is waiting for its answer.
-func (p *Proxy) Armed() bool {
+// State reads the proxy's state.
+func (p *Proxy) State() State {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return len(p.traps) > 0
-}
-
-// Holding reports whether an answer the proxy caught is still held.
-func (p *Proxy) Holding() bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.holding > 0
+	return State{Caught: p.caught, Armed: len(p.traps) > 0, Holding: p.holding > 0}
 }
 
 // AwaitNothingHeld returns once no caught answer is held any longer, or with ctx's error.
-// Closing a release only lets the relay go on when it next runs; a test that reads Holding
-// right after, as the first command of its next read does, has to wait for that first.
+// Closing a release only lets the relay go on when it next runs; a test that reads the
+// state right after, as the first command of its next read does, has to wait for that.
 func (p *Proxy) AwaitNothingHeld(ctx context.Context) error {
 	stop := context.AfterFunc(ctx, func() {
 		p.mu.Lock()

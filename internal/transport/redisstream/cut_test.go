@@ -210,10 +210,11 @@ func (s *passSent) unprovoked() bool {
 	if s.proxy == nil {
 		return true
 	}
-	if s.holding || s.proxy.Caught() != s.caught {
+	now := s.proxy.State()
+	if s.holding || now.Caught != s.caught {
 		return false
 	}
-	if s.proxy.Armed() {
+	if now.Armed {
 		return !s.cutLeft.Load()
 	}
 	return true
@@ -296,7 +297,8 @@ func (h passReads) countRead(ctx context.Context, cmd redis.Cmder) {
 	}
 	sent.began.Do(func() {
 		if h.proxy != nil {
-			sent.proxy, sent.caught, sent.holding = h.proxy, h.proxy.Caught(), h.proxy.Holding()
+			began := h.proxy.State()
+			sent.proxy, sent.caught, sent.holding = h.proxy, began.Caught, began.Holding
 		}
 	})
 	if cmd.Name() == "xreadgroup" {
@@ -486,7 +488,7 @@ func TestAPassIsTheTestsDoingWheneverTheProxySteppedIn(t *testing.T) {
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				// Every case starts with nothing held, or it would be judging the last one's.
-				if f.proxy.Holding() {
+				if f.proxy.State().Holding {
 					t.Fatalf("the proxy still holds an answer from an earlier case")
 				}
 				sent := &passSent{}
@@ -938,16 +940,26 @@ func (f cutFleet) loseTheAnswer(t *testing.T, how string, streams *redisstream.S
 	default:
 		t.Fatalf("no way to lose an answer called %q", how)
 	}
-	delivered, err := read(t, streams, sids...)
-	close(release)
-
 	// Waited for, not looked at: a read the machine cut before its answer was back has its
 	// answer reach the proxy after it gave up, and that answer is lost all the same (#334).
-	select {
-	case <-caught:
-	case <-time.After(5 * time.Second):
-		t.Fatalf("the proxy never saw an answer carrying %s (read err=%v)", marker, err)
+	// And tried again when nothing comes in all that time: the command then died on the way,
+	// in a connection go-redis closed before Redis read it, and there is no answer to lose.
+	var delivered []transport.Delivery
+	var err error
+	for attempt := 1; ; attempt++ {
+		delivered, err = read(t, streams, sids...)
+		select {
+		case <-caught:
+		case <-time.After(5 * time.Second):
+			if attempt < stimulusAttempts && errors.Is(err, transport.ErrWindowSpent) {
+				continue
+			}
+			close(release)
+			t.Fatalf("the proxy never saw an answer carrying %s in %d reads (read err=%v)", marker, attempt, err)
+		}
+		break
 	}
+	close(release)
 	// And let through before the next read looks at the proxy, or that read would find the
 	// answer still held and take a cut of its own for the test's doing.
 	settled, stop := context.WithTimeout(context.Background(), 5*time.Second)
@@ -965,6 +977,9 @@ func (f cutFleet) loseTheAnswer(t *testing.T, how string, streams *redisstream.S
 	}
 	return delivered
 }
+
+// stimulusAttempts bounds how many reads loseTheAnswer sends for an answer to lose.
+const stimulusAttempts = 3
 
 // writeCommandAt is writeCommand at an entry id of the test's choosing.
 func writeCommandAt(t *testing.T, f fleet, stream, id string, cmd *protocol.Command) {
