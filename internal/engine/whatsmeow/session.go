@@ -635,6 +635,9 @@ type Session struct {
 	// holds its socket lock for the length of a dial and Disconnect waits for the same
 	// lock, so a disconnect can outlive the command that asked for it.
 	hangingUp chan struct{}
+	// hangUpClaim is how the latest hang-up gets reported, decided once between the
+	// hang-up and the command waiting on it (see hangUp).
+	hangUpClaim *atomic.Int32
 	// runs counts the conversations this session has started. Paired with nonce it is
 	// what gives each one a name the client can answer to.
 	runs uint64
@@ -1907,7 +1910,11 @@ func (s *Session) reroute(ctx context.Context, proxyURL string) error {
 		return err
 	}
 	if state := s.state(); state == "open" || state == "connecting" || state == "reconnecting" {
-		if err := s.hangUp(ctx, s.current()); err != nil {
+		// A paired session comes back through the resume that follows, so the hang-up is
+		// published as the reconnect it is. One still pairing has no connection to come
+		// back to: what follows is a new pairing, and the hang-up is a plain close.
+		phone, _ := s.identity()
+		if err := s.hangUp(ctx, s.current(), phone != ""); err != nil {
 			// Back where `proxy` says it is, so the two agree: a connect naming the old
 			// proxy again is then truly no change, and one naming the new proxy moves it
 			// again. Left on the new path, the first of those would find nothing to do and
@@ -1931,6 +1938,14 @@ func (s *Session) awaitHangUp(ctx context.Context) error {
 	s.mu.Unlock()
 	if pending == nil {
 		return nil
+	}
+	// A hang-up already over is over, whatever the deadline says: a move whose hang-up
+	// finished as its deadline ran out has published the reconnect, and the redial that
+	// follows is what makes it true.
+	select {
+	case <-pending:
+		return nil
+	default:
 	}
 	select {
 	case <-pending:
@@ -2122,10 +2137,12 @@ func (s *Session) giveUpOn(ctx context.Context, run *pairingRun, client *wm.Clie
 // that same lock, so a disconnect arriving mid-handshake would otherwise sit there long
 // past its deadline and then report success. Cancelling the session context is what
 // actually interrupts the dial; this is the part that stops waiting.
-func (s *Session) hangUp(ctx context.Context, client *wm.Client) error {
+func (s *Session) hangUp(ctx context.Context, client *wm.Client, move bool) error {
 	done := make(chan struct{})
+	claim := new(atomic.Int32)
 	s.mu.Lock()
 	s.hangingUp = done
+	s.hangUpClaim = claim
 	s.mu.Unlock()
 	go func() {
 		defer close(done)
@@ -2135,13 +2152,26 @@ func (s *Session) hangUp(ctx context.Context, client *wm.Client) error {
 		// down a moment later regardless, and a session that never recorded it would go
 		// on reporting itself open over a connection that no longer exists, with no close
 		// event to correct it.
-		s.settleHangUp()
+		//
+		// A move is a reconnect only while its command is still there to make it: one the
+		// caller gave up on is followed by no redial, and the socket is down for good.
+		s.settleHangUp(move && claim.CompareAndSwap(hangUpPending, hangUpSettled))
 	}()
 
 	select {
 	case <-done:
 		return nil
 	case <-ctx.Done():
+		// The hang-up already claimed this as the move's reconnect, so the socket is down
+		// and the client has been, or is being, told a redial follows. Waited for, so that
+		// the reconnect is published before the `connecting` of the redial.
+		if move && !claim.CompareAndSwap(hangUpPending, hangUpAbandoned) {
+			select {
+			case <-done:
+			case <-s.done:
+			}
+			return nil
+		}
 		// The socket is still up, held by a dial this had to queue behind. Answering the
 		// caller with success would have it record a session as closed while events from
 		// that connection are still on their way.
@@ -2151,6 +2181,14 @@ func (s *Session) hangUp(ctx context.Context, client *wm.Client) error {
 	}
 }
 
+// How a hang-up is reported is decided once, by whichever of the hang-up and the command
+// waiting on it gets there first.
+const (
+	hangUpPending int32 = iota
+	hangUpSettled
+	hangUpAbandoned
+)
+
 // settleHangUp records a socket this session took down on purpose.
 //
 // Held under transition like every other socket transition, and for the same reason.
@@ -2158,7 +2196,11 @@ func (s *Session) hangUp(ctx context.Context, client *wm.Client) error {
 // handler reads hungUp before this sets it, publishes `close` here, and then sets the
 // state to connected and publishes `open` on top of it. A socket that is down would then
 // be reported open for good, with nothing arriving later to correct it.
-func (s *Session) settleHangUp() {
+//
+// `moved` is a hang-up that moved a paired session to another path, with the redial still
+// to come: published as `reconnecting` with reasonProxyChanged, because the session comes
+// back without anybody asking. Every other hang-up is the `close` a disconnect publishes.
+func (s *Session) settleHangUp(moved bool) {
 	s.transition.Lock()
 	defer s.transition.Unlock()
 
@@ -2173,6 +2215,10 @@ func (s *Session) settleHangUp() {
 
 	s.refuseLateConnect()
 	s.offline()
+	if moved {
+		s.emit(protocol.EventSessionState, map[string]any{"state": "reconnecting", "reason": reasonProxyChanged})
+		return
+	}
 	s.emit(protocol.EventSessionState, map[string]any{"state": "close", "reason": "disconnect_requested"})
 }
 
@@ -2314,7 +2360,7 @@ func (s *Session) Disconnect(ctx context.Context) error {
 	// this call, for the same reason as in Connect and with the same ordering: before the
 	// socket goes, so an instance that dies in between does not leave an account somebody
 	// turned off looking like one that should be resumed.
-	return s.hangUp(ctx, s.current())
+	return s.hangUp(ctx, s.current(), false)
 }
 
 // Logout ends the session on WhatsApp's side and forgets the credentials here, so the
@@ -3627,6 +3673,10 @@ func (s *Session) sessionState() map[string]any {
 // proxy: the proxy could not be reached, or it refused the tunnel. Never with the address
 // or the error that said so, because the proxy's URL is a credential.
 const reasonProxyUnreachable = "proxy_unreachable"
+
+// reasonProxyChanged is the state reason for a paired session whose socket a connect took
+// down to dial again through another path. It comes back by itself, within that connect.
+const reasonProxyChanged = "proxy_changed"
 
 // proxyOutcome is the route telling this session how a dial ended at the proxy. It runs
 // on the goroutine that dialled, and that can be one holding the transition lock -- a
