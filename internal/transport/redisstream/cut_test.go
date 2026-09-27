@@ -790,14 +790,15 @@ func TestAReadWaitsOutARunOfStarvedWindows(t *testing.T) {
 }
 
 // starveWindows keeps the first command of each of the next few passes from going out
-// until its window is over, and fails it the way go-redis does.
+// until its window is over, and fails it the way go-redis does. Only a pass's commands:
+// the test's own, and the fleet's cleanup, have no window to wait out.
 type starveWindows struct{ left atomic.Int64 }
 
 func (*starveWindows) DialHook(next redis.DialHook) redis.DialHook { return next }
 
 func (h *starveWindows) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
 	return func(ctx context.Context, cmd redis.Cmder) error {
-		if h.left.Add(-1) >= 0 {
+		if _, inPass := ctx.Value(passKey{}).(*passSent); inPass && h.left.Add(-1) >= 0 {
 			<-ctx.Done()
 			return ctx.Err()
 		}
