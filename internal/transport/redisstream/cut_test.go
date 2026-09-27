@@ -1196,12 +1196,12 @@ func TestWhatAClaimMovedHereWithoutHearingItStaysAClaims(t *testing.T) {
 				t.Fatalf("the peer read %v (err=%v), want the command", ids(taken), err)
 			}
 		}
-		stillAClaims := func(t *testing.T, commandID string, claim func(context.Context) ([]transport.Delivery, error), delay time.Duration) {
+		stillAClaims := func(t *testing.T, commandID string, reader *redisstream.Streams, claim func(context.Context) ([]transport.Delivery, error), delay time.Duration) {
 			t.Helper()
 			if holder := f.pendingUnder(t, commandID, "s1"); holder != "inst-a" {
 				t.Fatalf("%s is pending under %q after the claim, want inst-a", commandID, holder)
 			}
-			if delivered, err := read(t, adopter, "s1"); err != nil || len(delivered) != 0 {
+			if delivered, err := read(t, reader, "s1"); err != nil || len(delivered) != 0 {
 				t.Fatalf("the next read handed out %v (err=%v), want nothing: it is a claim's", ids(delivered), err)
 			}
 			// The age is the subject: the claim that reset it needs the delay to pass again.
@@ -1232,7 +1232,7 @@ func TestWhatAClaimMovedHereWithoutHearingItStaysAClaims(t *testing.T) {
 			if err == nil || len(claimed) != 0 {
 				t.Fatalf("the claim whose answer was lost handed out %v (err=%v)", ids(claimed), err)
 			}
-			stillAClaims(t, "held-claim", claimSessions, claimDelay)
+			stillAClaims(t, "held-claim", adopter, claimSessions, claimDelay)
 		})
 
 		t.Run("its answer dropped with the connection", func(t *testing.T) {
@@ -1250,7 +1250,7 @@ func TestWhatAClaimMovedHereWithoutHearingItStaysAClaims(t *testing.T) {
 			rdb.AddHook(passReads{proxy: f.proxy})
 			t.Cleanup(func() { _ = rdb.Close() })
 			slow, err := redisstream.New(redisx.Wrap(rdb, f.client.Keys().Prefix(), shards),
-				redisstream.Options{Instance: "inst-a", Block: 50 * time.Millisecond, ClaimMinIdle: claimDelay})
+				redisstream.Options{Instance: "inst-a", Block: 50 * time.Millisecond, ClaimMinIdle: patientDelay})
 			if err != nil {
 				t.Fatalf("redisstream.New: %v", err)
 			}
@@ -1264,7 +1264,7 @@ func TestWhatAClaimMovedHereWithoutHearingItStaysAClaims(t *testing.T) {
 			}
 
 			abandon(t, "dropped-claim")
-			time.Sleep(claimDelay + claimDelay/2)
+			time.Sleep(patientDelay + patientDelay/2)
 			caught := f.proxy.Drop("dropped-claim")
 			claimed, err := reclaim(ctx)
 			select {
@@ -1275,7 +1275,7 @@ func TestWhatAClaimMovedHereWithoutHearingItStaysAClaims(t *testing.T) {
 			if len(claimed) != 0 {
 				t.Fatalf("the claim whose answer was dropped handed out %v (err=%v)", ids(claimed), err)
 			}
-			stillAClaims(t, "dropped-claim", reclaim, claimDelay)
+			stillAClaims(t, "dropped-claim", slow, reclaim, patientDelay)
 		})
 
 		t.Run("a command already claimed and given back", func(t *testing.T) {
@@ -1296,7 +1296,7 @@ func TestWhatAClaimMovedHereWithoutHearingItStaysAClaims(t *testing.T) {
 			default:
 				t.Fatalf("the claim's answer was never held (claimed %v, err=%v)", ids(lost), err)
 			}
-			stillAClaims(t, "given-back", claimSessions, claimDelay)
+			stillAClaims(t, "given-back", adopter, claimSessions, claimDelay)
 		})
 	})
 }
