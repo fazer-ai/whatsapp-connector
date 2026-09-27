@@ -420,6 +420,61 @@ func TestAPassIsTheTestsDoingWheneverTheProxySteppedIn(t *testing.T) {
 	})
 }
 
+// The window can also run out earlier, on the XGROUP that creates the groups, before any
+// XREADGROUP goes out: the verifier saw a priming read fail with "create group on ...:
+// context deadline exceeded" under load (#334). It is the same machine cut, one step
+// sooner, and it comes back as whichever error the deadline took on the way.
+func TestAGroupCreationTheMachineCutIsTriedAgain(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"as the context's deadline", context.DeadlineExceeded},
+		{"as the socket's timeout", &net.OpError{Op: "read", Net: "tcp", Err: os.ErrDeadlineExceeded}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			cutBackends(t, func(t *testing.T, f cutFleet) {
+				cut := &cutTheGroupCreation{err: tc.err}
+				f.through.AddHook(cut)
+
+				if _, err := read(t, f.streams(t, "inst-a"), "s1"); err != nil {
+					t.Fatalf("a priming read whose XGROUP the machine cut failed: %v", err)
+				}
+				if cut.cut.Load() != 1 {
+					t.Fatalf("the machine cut %d group creations, want one", cut.cut.Load())
+				}
+			})
+		})
+	}
+}
+
+// cutTheGroupCreation keeps the first XGROUP from going out until the window is over, and
+// fails it with err.
+type cutTheGroupCreation struct {
+	err error
+	cut atomic.Int64
+}
+
+func (*cutTheGroupCreation) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (h *cutTheGroupCreation) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if cmd.Name() == "xgroup" && h.cut.CompareAndSwap(0, 1) {
+			<-ctx.Done()
+			return h.err
+		}
+		return next(ctx, cmd)
+	}
+}
+
+func (*cutTheGroupCreation) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+
 // cutTheReadBack lets the first read back after a `>` reach Redis, then keeps its answer
 // until the window is over and fails it the way the socket's deadline does: what a
 // loaded machine does to a pass without anything in the proxy's hands.
