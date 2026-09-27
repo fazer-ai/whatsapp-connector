@@ -352,11 +352,11 @@ func TestAPassIsTheTestsDoingWheneverTheProxySteppedIn(t *testing.T) {
 		}
 		for _, tc := range []struct {
 			name   string
-			during func(t *testing.T, begin func())
+			during func(begin func())
 			want   bool
 		}{
-			{"nothing armed, held or caught", func(_ *testing.T, begin func()) { begin() }, true},
-			{"an answer still held when it began", func(t *testing.T, begin func()) {
+			{"nothing armed, held or caught", func(begin func()) { begin() }, true},
+			{"an answer still held when it began", func(begin func()) {
 				release := make(chan struct{})
 				caught := f.proxy.Hold("held-at-begin", release)
 				done := echo("held-at-begin")
@@ -365,14 +365,14 @@ func TestAPassIsTheTestsDoingWheneverTheProxySteppedIn(t *testing.T) {
 				close(release)
 				<-done
 			}, false},
-			{"an answer caught while it ran", func(_ *testing.T, begin func()) {
+			{"an answer caught while it ran", func(begin func()) {
 				begin()
 				caught := f.proxy.Drop("dropped-meanwhile")
 				done := echo("dropped-meanwhile")
 				<-caught
 				<-done
 			}, false},
-			{"an answer caught before a later command of the same pass", func(_ *testing.T, begin func()) {
+			{"an answer caught before a later command of the same pass", func(begin func()) {
 				begin()
 				caught := f.proxy.Drop("dropped-early")
 				done := echo("dropped-early")
@@ -382,7 +382,7 @@ func TestAPassIsTheTestsDoingWheneverTheProxySteppedIn(t *testing.T) {
 				begin()
 			}, false},
 			// Last: the trap it arms is never sprung, and the proxy stays busy after it.
-			{"a trap armed while it ran", func(_ *testing.T, begin func()) {
+			{"a trap armed while it ran", func(begin func()) {
 				begin()
 				f.proxy.Hold("armed-meanwhile", make(chan struct{}))
 			}, false},
@@ -394,7 +394,7 @@ func TestAPassIsTheTestsDoingWheneverTheProxySteppedIn(t *testing.T) {
 				}
 				sent := &passSent{}
 				passCtx := context.WithValue(ctx, passKey{}, sent)
-				tc.during(t, func() { passReads{proxy: f.proxy}.countRead(passCtx, redis.NewCmd(passCtx, "ping")) })
+				tc.during(func() { passReads{proxy: f.proxy}.countRead(passCtx, redis.NewCmd(passCtx, "ping")) })
 				if got := sent.unprovoked(); got != tc.want {
 					t.Fatalf("unprovoked = %v, want %v", got, tc.want)
 				}
