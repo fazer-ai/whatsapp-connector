@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"os"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -46,7 +48,10 @@ type cutFleet struct {
 	fleet
 	proxy *redisxtest.Proxy
 	via   *redisx.Client
-	fake  bool
+	// through is the client under via, for a hook a test puts on the transport's side of
+	// the proxy only.
+	through *redis.Client
+	fake    bool
 }
 
 // cutBackends runs a test against miniredis and, when one is named, against a real Redis:
@@ -76,7 +81,7 @@ func cutBackends(t *testing.T, run func(t *testing.T, f cutFleet)) {
 			t.Cleanup(func() { _ = rdb.Close() })
 			run(t, cutFleet{
 				fleet: direct, proxy: proxy, via: redisx.Wrap(rdb, direct.client.Keys().Prefix(), shards),
-				fake: backend.name == "miniredis",
+				through: rdb, fake: backend.name == "miniredis",
 			})
 		})
 	}
@@ -256,6 +261,61 @@ func TestAPassThatNeverWentOutIsReadAgain(t *testing.T) {
 			t.Fatalf("handed out %v (err=%v) after a pass that never went out, want the command", ids(delivered), err)
 		}
 	})
+}
+
+// A pass can also go out and have the machine, not the test, spend its window: under a
+// load average of 10 the answer of the read back was still on its way when the window
+// ran out, and a priming read failed the test with ErrWindowSpent (#334). Nothing here
+// held that answer, so the pass is no verdict, and the loop's next pass is what reads the
+// command back.
+func TestAPassTheMachineCutIsReadAgain(t *testing.T) {
+	t.Parallel()
+
+	cutBackends(t, func(t *testing.T, f cutFleet) {
+		streams := f.streams(t, "inst-a")
+		if _, err := read(t, streams, "s1"); err != nil {
+			t.Fatalf("priming read: %v", err)
+		}
+		writeCommand(t, f.fleet, f.client.Keys().Commands("s1"), command("cut-by-the-machine", "s1", ""))
+		cut := &cutTheReadBack{}
+		f.through.AddHook(cut)
+
+		delivered, err := read(t, streams, "s1")
+		if cut.cut.Load() != 1 {
+			t.Fatalf("the machine cut %d passes, want one", cut.cut.Load())
+		}
+		if err != nil || !slices.Equal(ids(delivered), []string{"cut-by-the-machine"}) {
+			t.Fatalf("handed out %v (err=%v) after a pass the machine cut, want the command", ids(delivered), err)
+		}
+	})
+}
+
+// cutTheReadBack lets the first read back after a `>` reach Redis, then keeps its answer
+// until the window is over and fails it the way the socket's deadline does: what a
+// loaded machine does to a pass without anything in the proxy's hands.
+type cutTheReadBack struct {
+	reads atomic.Int64
+	cut   atomic.Int64
+}
+
+func (*cutTheReadBack) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (h *cutTheReadBack) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if cmd.Name() == "xreadgroup" {
+			h.reads.Add(1)
+		}
+		err := next(ctx, cmd)
+		if h.reads.Load() > 0 && (cmd.Name() == "evalsha" || cmd.Name() == "eval") && h.cut.CompareAndSwap(0, 1) {
+			<-ctx.Done()
+			return &net.OpError{Op: "read", Net: "tcp", Err: os.ErrDeadlineExceeded}
+		}
+		return err
+	}
+}
+
+func (*cutTheReadBack) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
 }
 
 // failures is a test that keeps what it was told to fail with, so that a helper's own
