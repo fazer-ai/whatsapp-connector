@@ -582,7 +582,14 @@ func TestAnAnswerThatReachesTheProxyAfterTheReadGaveUpIsStillLost(t *testing.T) 
 		f.through.AddHook(late)
 
 		f.loseTheAnswer(t, "held past the window", streams, "inst-a", "late-answer", "s1")
-		<-late.sent
+		select {
+		case <-late.sent:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("the late XREADGROUP was never sent")
+		}
+		if late.unsent != nil {
+			t.Fatalf("the late XREADGROUP was never sent: its pass failed first with %v", late.unsent)
+		}
 	})
 }
 
@@ -593,6 +600,8 @@ func TestAnAnswerThatReachesTheProxyAfterTheReadGaveUpIsStillLost(t *testing.T) 
 type sendAfterTheWindow struct {
 	once sync.Once
 	sent chan struct{}
+	// Why the command was never sent, when the pass that should have sent it failed first.
+	unsent error
 }
 
 func (*sendAfterTheWindow) DialHook(next redis.DialHook) redis.DialHook { return next }
@@ -608,6 +617,8 @@ func (h *sendAfterTheWindow) ProcessHook(next redis.ProcessHook) redis.ProcessHo
 			return next(ctx, cmd)
 		}
 		if err := next(ctx, redis.NewCmd(ctx, "ping")); err != nil {
+			h.unsent = err
+			close(h.sent)
 			return err
 		}
 		<-ctx.Done()
