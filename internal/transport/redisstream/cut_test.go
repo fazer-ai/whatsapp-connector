@@ -696,9 +696,11 @@ func (f cutFleet) loseTheAnswer(t *testing.T, how string, streams *redisstream.S
 	delivered, err := read(t, streams, sids...)
 	close(release)
 
+	// Waited for, not looked at: a read the machine cut before its answer was back has its
+	// answer reach the proxy after it gave up, and that answer is lost all the same (#334).
 	select {
 	case <-caught:
-	default:
+	case <-time.After(5 * time.Second):
 		t.Fatalf("the proxy never saw an answer carrying %s (read err=%v)", marker, err)
 	}
 	if how == "held past the window" && len(delivered) != 0 {
@@ -1244,8 +1246,13 @@ func TestWhatAClaimMovedHereWithoutHearingItStaysAClaims(t *testing.T) {
 			}
 		}
 		stream := f.client.Keys().Commands("s1")
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
+		// Each step gets a budget of its own: shared, the claim delays of the earlier
+		// subtests spent most of it, and a loaded machine the rest (#334).
+		within := func(t *testing.T) context.Context {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			t.Cleanup(cancel)
+			return ctx
+		}
 		abandon := func(t *testing.T, commandID string) {
 			t.Helper()
 			writeCommand(t, f.fleet, stream, command(commandID, "s1", ""))
@@ -1263,7 +1270,7 @@ func TestWhatAClaimMovedHereWithoutHearingItStaysAClaims(t *testing.T) {
 			}
 			// The age is the subject: the claim that reset it needs the delay to pass again.
 			time.Sleep(delay + delay/2)
-			again, err := claim(ctx)
+			again, err := claim(within(t))
 			if err != nil || !slices.Equal(ids(again), []string{commandID}) || !again[0].Redelivered {
 				t.Fatalf("the next claim took %v (err=%v), want %s as a redelivery", ids(again), err, commandID)
 			}
@@ -1277,7 +1284,7 @@ func TestWhatAClaimMovedHereWithoutHearingItStaysAClaims(t *testing.T) {
 			abandon(t, "held-claim")
 			release := make(chan struct{})
 			caught := f.proxy.Hold("held-claim", release)
-			window, stop := context.WithTimeout(ctx, cutWindow)
+			window, stop := context.WithTimeout(within(t), cutWindow)
 			claimed, err := claimSessions(window)
 			stop()
 			close(release)
@@ -1323,7 +1330,7 @@ func TestWhatAClaimMovedHereWithoutHearingItStaysAClaims(t *testing.T) {
 			abandon(t, "dropped-claim")
 			time.Sleep(patientDelay + patientDelay/2)
 			caught := f.proxy.Drop("dropped-claim")
-			claimed, err := reclaim(ctx)
+			claimed, err := reclaim(within(t))
 			select {
 			case <-caught:
 			default:
@@ -1337,14 +1344,14 @@ func TestWhatAClaimMovedHereWithoutHearingItStaysAClaims(t *testing.T) {
 
 		t.Run("a command already claimed and given back", func(t *testing.T) {
 			abandon(t, "given-back")
-			claimed, err := claimSessions(ctx)
+			claimed, err := claimSessions(within(t))
 			if err != nil || !slices.Equal(ids(claimed), []string{"given-back"}) {
 				t.Fatalf("claimed %v (err=%v), want the peer's command", ids(claimed), err)
 			}
 			claimed[0].Release()
 			release := make(chan struct{})
 			caught := f.proxy.Hold("given-back", release)
-			window, stop := context.WithTimeout(ctx, cutWindow)
+			window, stop := context.WithTimeout(within(t), cutWindow)
 			lost, err := claimSessions(window)
 			stop()
 			close(release)
@@ -1575,7 +1582,8 @@ const lateRecovery = 5 * cutWindow / 2
 
 func TestACommandRecoveredPastTheClaimDelayIsARedelivery(t *testing.T) {
 	cutBackends(t, func(t *testing.T, f cutFleet) {
-		const claimDelay = 2 * cutWindow
+		// Well past a late recovery, so that promptly and past the delay stay apart.
+		const claimDelay = 4 * lateRecovery
 
 		streams := f.streamsWith(t, &redisstream.Options{Instance: "inst-a", Block: 50 * time.Millisecond, ClaimMinIdle: claimDelay})
 		stream := f.client.Keys().Commands("s1")
