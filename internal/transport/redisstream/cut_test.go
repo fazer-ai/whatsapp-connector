@@ -161,16 +161,18 @@ func readWithin(t testing.TB, window time.Duration, streams *redisstream.Streams
 const starvedPasses = 5
 
 // pass is a single read, and whether the machine rather than the test decided how it came
-// out: it never went out, or it went out and had its window spent with the proxy idle.
+// out: it never went out, or it had its window spent with the proxy idle, whether on the
+// read itself or earlier, on the XGROUP that creates the groups.
 func pass(streams *redisstream.Streams, window time.Duration, sids []string) (delivered []transport.Delivery, again bool, err error) {
 	sent := &passSent{}
 	ctx, cancel := context.WithTimeout(context.WithValue(context.Background(), passKey{}, sent), window)
 	defer cancel()
 	delivered, err = streams.Read(ctx, sids)
+	spent := errors.Is(err, transport.ErrWindowSpent) && sent.unprovoked()
 	if sent.reads.Load() == 0 {
-		return delivered, len(delivered) == 0 && err == nil, err
+		return delivered, (len(delivered) == 0 && err == nil) || spent, err
 	}
-	return delivered, errors.Is(err, transport.ErrWindowSpent) && sent.unprovoked(), err
+	return delivered, spent, err
 }
 
 // passKey carries a pass's own count through the client's hooks, so that passes running
