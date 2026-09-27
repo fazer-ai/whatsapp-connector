@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -515,5 +516,52 @@ func TestADialToTheProxyThatRunsOutItsDeadlineIsReported(t *testing.T) {
 	}
 	if len(outcomes) != 1 || outcomes[0] {
 		t.Fatalf("a dial that ran out its deadline reported %v", outcomes)
+	}
+}
+
+// A request its caller cancels while the proxy is still to answer the CONNECT says nothing
+// about the proxy either: it was cut short by somebody who stopped waiting, not by the
+// proxy's silence running out a deadline.
+func TestARequestCancelledBeforeTheProxyAnsweredReportsNothing(t *testing.T) {
+	t.Parallel()
+
+	listener, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	accepted := make(chan struct{}, 1)
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			t.Cleanup(func() { _ = conn.Close() })
+			accepted <- struct{}{}
+		}
+	}()
+	route := newEgressRoute()
+	var told atomic.Int32
+	route.notify = func(uint64, uint64, bool) { told.Add(1) }
+	if err := route.set("http://" + listener.Addr().String()); err != nil {
+		t.Fatalf("route.set: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	go func() {
+		<-accepted
+		cancel()
+	}()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://web.whatsapp.com/", http.NoBody)
+	if err != nil {
+		t.Fatalf("build the request: %v", err)
+	}
+	if response, err := (&http.Client{Transport: &route.websocket}).Do(request); err == nil {
+		_ = response.Body.Close()
+		t.Fatal("a request to a proxy that never answers succeeded")
+	}
+	if n := told.Load(); n != 0 {
+		t.Fatalf("a request cancelled before the proxy answered reported %d outcomes", n)
 	}
 }
