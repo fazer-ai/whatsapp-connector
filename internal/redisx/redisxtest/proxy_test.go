@@ -136,3 +136,66 @@ func TestAMarkerAlreadyRelayedDoesNotSpringATrapArmedAfterIt(t *testing.T) {
 		t.Fatalf("the next answer carrying the marker went through uncaught; the client read %q", rest)
 	}
 }
+
+// A test that reads Caught and Busy on both sides of a read learns whether the proxy
+// stepped in during it, which is what tells a window the test spent on purpose from one
+// the machine spent (#334). So the proxy is busy from the moment a trap is armed until
+// the answer it holds is let through, and the answer counts as caught once it is.
+func TestTheProxyIsBusyFromArmingATrapUntilItsAnswerIsLetThrough(t *testing.T) {
+	const answer = "answer carrying held-marker\n"
+
+	var config net.ListenConfig
+	listener, err := config.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		_, _ = conn.Write([]byte(answer))
+		_, _ = io.Copy(io.Discard, conn)
+	}()
+
+	proxy := redisxtest.Listen(t, listener.Addr().String())
+	if proxy.Busy() || proxy.Caught() != 0 {
+		t.Fatalf("a proxy nobody armed is busy=%v with %d caught, want idle with none", proxy.Busy(), proxy.Caught())
+	}
+	release := make(chan struct{})
+	caught := proxy.Hold("held-marker", release)
+	if !proxy.Busy() {
+		t.Fatalf("a proxy with a trap armed says it is idle")
+	}
+
+	var dialer net.Dialer
+	conn, err := dialer.DialContext(context.Background(), "tcp", proxy.Addr())
+	if err != nil {
+		t.Fatalf("dial the proxy: %v", err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	select {
+	case <-caught:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("the answer was never caught")
+	}
+	if !proxy.Busy() || proxy.Caught() != 1 {
+		t.Fatalf("a proxy holding an answer is busy=%v with %d caught, want busy with one", proxy.Busy(), proxy.Caught())
+	}
+
+	close(release)
+	got := make([]byte, len(answer))
+	if _, err := io.ReadFull(conn, got); err != nil {
+		t.Fatalf("the released answer never arrived: %v", err)
+	}
+	// The client has the answer, so the relay is past letting it through.
+	if proxy.Busy() || proxy.Caught() != 1 {
+		t.Fatalf("a proxy that let its answer through is busy=%v with %d caught, want idle with one", proxy.Busy(), proxy.Caught())
+	}
+	_ = conn.Close()
+	<-served
+}

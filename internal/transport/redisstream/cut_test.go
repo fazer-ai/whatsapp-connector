@@ -8,6 +8,7 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -77,7 +78,7 @@ func cutBackends(t *testing.T, run func(t *testing.T, f cutFleet)) {
 			options.Addr = proxy.Addr()
 			options.ContextTimeoutEnabled = true
 			rdb := redis.NewClient(&options)
-			rdb.AddHook(passReads{})
+			rdb.AddHook(passReads{proxy: proxy})
 			t.Cleanup(func() { _ = rdb.Close() })
 			run(t, cutFleet{
 				fleet: direct, proxy: proxy, via: redisx.Wrap(rdb, direct.client.Keys().Prefix(), shards),
@@ -117,14 +118,22 @@ func (f cutFleet) streamsReading(t *testing.T, instance string, count int64) *re
 // the loop costs nothing, since the next pass does the work; here it is a goroutine the
 // scheduler kept waiting, and a test that expects a delivery would read it as a verdict
 // (#328). So a pass that sent no XREADGROUP is run again with a new window. One that did
-// is never repeated, however late its caller gets the CPU back: an empty pass stays a
-// result for the tests that expect nothing.
+// is never repeated for being empty, however late its caller gets the CPU back: an empty
+// pass stays a result for the tests that expect nothing.
 //
 // Whether it went out is counted, not inferred from the clock: the scheduler that starves
 // a pass before it goes out can as easily starve one after it came back, and the time
 // left would then call a finished read starved (#333). The count comes from passReads,
 // which every client these tests build carries; one that does not makes every empty pass
 // look starved, and the helper fails loudly rather than passing on it.
+//
+// A pass that went out can also come back with its window spent, and that is either the
+// test's doing or the machine's. The tests that lose an answer on purpose hold it in the
+// proxy past the window, and the pass that fails that way is exactly what they assert. On
+// a loaded machine the same failure comes with nothing held, from a trip that simply took
+// longer than the window (#334), and like the starved pass it is no verdict: the loop's
+// next pass reads back what it left pending. So a spent pass is run again when the proxy
+// the client goes through neither stepped in nor stood ready to while it ran.
 func read(t *testing.T, streams *redisstream.Streams, sids ...string) ([]transport.Delivery, error) {
 	t.Helper()
 	return readWithin(t, cutWindow, streams, sids...)
@@ -135,60 +144,93 @@ func read(t *testing.T, streams *redisstream.Streams, sids ...string) ([]transpo
 func readWithin(t testing.TB, window time.Duration, streams *redisstream.Streams, sids ...string) ([]transport.Delivery, error) {
 	t.Helper()
 	for range starvedPasses {
-		delivered, spent, err := pass(streams, window, sids)
-		if len(delivered) > 0 || err != nil || !spent {
+		delivered, again, err := pass(streams, window, sids)
+		if !again {
 			return delivered, err
 		}
 	}
 	// Errorf rather than Fatalf: some callers read from a goroutine of their own.
-	t.Errorf("read: %d passes in a row came back empty with their window spent before they "+
-		"could go out, so none of them read anything", starvedPasses)
+	t.Errorf("read: %d passes in a row came back with their window spent, before they could "+
+		"go out or with nothing held in the proxy, so none of them read anything", starvedPasses)
 	return nil, errors.New("read: every pass was starved of its window")
 }
 
-// starvedPasses bounds how many times read runs a pass that never went out. A machine
+// starvedPasses bounds how many times read runs a pass the machine starved. A machine
 // that starves this many windows in a row is not going to be waited out, and a test that
 // hung instead of failing would say less.
 const starvedPasses = 5
 
-// pass is a single read, and whether it never went out: no XREADGROUP was sent under it.
-func pass(streams *redisstream.Streams, window time.Duration, sids []string) (delivered []transport.Delivery, spent bool, err error) {
+// pass is a single read, and whether the machine rather than the test decided how it came
+// out: it never went out, or it went out and had its window spent with the proxy idle.
+func pass(streams *redisstream.Streams, window time.Duration, sids []string) (delivered []transport.Delivery, again bool, err error) {
 	sent := &passSent{}
 	ctx, cancel := context.WithTimeout(context.WithValue(context.Background(), passKey{}, sent), window)
 	defer cancel()
 	delivered, err = streams.Read(ctx, sids)
-	return delivered, sent.reads.Load() == 0, err
+	if sent.reads.Load() == 0 {
+		return delivered, len(delivered) == 0 && err == nil, err
+	}
+	return delivered, errors.Is(err, transport.ErrWindowSpent) && sent.unprovoked(), err
 }
 
 // passKey carries a pass's own count through the client's hooks, so that passes running
 // in parallel on one client count apart.
 type passKey struct{}
 
-type passSent struct{ reads atomic.Int64 }
+type passSent struct {
+	reads atomic.Int64
 
-// passReads counts each XREADGROUP against the pass whose context sent it.
-type passReads struct{}
+	// What the proxy had done and stood ready to do when the pass sent its first command.
+	began  sync.Once
+	proxy  *redisxtest.Proxy
+	caught uint64
+	busy   bool
+}
+
+// unprovoked reports whether the proxy the pass went through left it alone: nothing
+// armed or held when it began or when it ended, and nothing caught in between. A client
+// with no proxy in front has nobody to provoke anything.
+func (s *passSent) unprovoked() bool {
+	if s.proxy == nil {
+		return true
+	}
+	return !s.busy && !s.proxy.Busy() && s.proxy.Caught() == s.caught
+}
+
+// passReads counts each XREADGROUP against the pass whose context sent it, and has the
+// pass note the state of proxy, the one the client goes through, before its first command
+// leaves. A client that reaches Redis directly carries it with no proxy.
+type passReads struct{ proxy *redisxtest.Proxy }
 
 func (passReads) DialHook(next redis.DialHook) redis.DialHook { return next }
 
-func (passReads) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+func (h passReads) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
 	return func(ctx context.Context, cmd redis.Cmder) error {
-		countRead(ctx, cmd)
+		h.countRead(ctx, cmd)
 		return next(ctx, cmd)
 	}
 }
 
-func (passReads) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+func (h passReads) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
 	return func(ctx context.Context, cmds []redis.Cmder) error {
 		for _, cmd := range cmds {
-			countRead(ctx, cmd)
+			h.countRead(ctx, cmd)
 		}
 		return next(ctx, cmds)
 	}
 }
 
-func countRead(ctx context.Context, cmd redis.Cmder) {
-	if sent, ok := ctx.Value(passKey{}).(*passSent); ok && cmd.Name() == "xreadgroup" {
+func (h passReads) countRead(ctx context.Context, cmd redis.Cmder) {
+	sent, ok := ctx.Value(passKey{}).(*passSent)
+	if !ok {
+		return
+	}
+	sent.began.Do(func() {
+		if h.proxy != nil {
+			sent.proxy, sent.caught, sent.busy = h.proxy, h.proxy.Caught(), h.proxy.Busy()
+		}
+	})
+	if cmd.Name() == "xreadgroup" {
 		sent.reads.Add(1)
 	}
 }
@@ -286,6 +328,68 @@ func TestAPassTheMachineCutIsReadAgain(t *testing.T) {
 		}
 		if err != nil || !slices.Equal(ids(delivered), []string{"cut-by-the-machine"}) {
 			t.Fatalf("handed out %v (err=%v) after a pass the machine cut, want the command", ids(delivered), err)
+		}
+	})
+}
+
+// What decides whether a spent pass is run again is whether the proxy stepped in while it
+// ran, and each way it can have done so is a clause of its own: an answer still held when
+// the pass began, a trap armed while it ran and not yet sprung, an answer caught in
+// between. Any one of them makes the pass the test's doing.
+func TestAPassIsTheTestsDoingWheneverTheProxySteppedIn(t *testing.T) {
+	t.Parallel()
+
+	cutBackends(t, func(t *testing.T, f cutFleet) {
+		ctx := context.Background()
+		// echo sends marker through the proxy, which is what springs a trap on it.
+		echo := func(marker string) <-chan struct{} {
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				_ = f.through.Echo(ctx, marker).Err()
+			}()
+			return done
+		}
+		for _, tc := range []struct {
+			name   string
+			during func(t *testing.T, begin func())
+			want   bool
+		}{
+			{"nothing armed, held or caught", func(_ *testing.T, begin func()) { begin() }, true},
+			{"an answer still held when it began", func(t *testing.T, begin func()) {
+				release := make(chan struct{})
+				caught := f.proxy.Hold("held-at-begin", release)
+				done := echo("held-at-begin")
+				<-caught
+				begin()
+				close(release)
+				<-done
+			}, false},
+			{"an answer caught while it ran", func(_ *testing.T, begin func()) {
+				begin()
+				caught := f.proxy.Drop("dropped-meanwhile")
+				done := echo("dropped-meanwhile")
+				<-caught
+				<-done
+			}, false},
+			// Last: the trap it arms is never sprung, and the proxy stays busy after it.
+			{"a trap armed while it ran", func(_ *testing.T, begin func()) {
+				begin()
+				f.proxy.Hold("armed-meanwhile", make(chan struct{}))
+			}, false},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				// Every case starts from an idle proxy, or it would be judging the last one's.
+				if f.proxy.Busy() {
+					t.Fatalf("the proxy is still busy from an earlier case")
+				}
+				sent := &passSent{}
+				passCtx := context.WithValue(ctx, passKey{}, sent)
+				tc.during(t, func() { passReads{proxy: f.proxy}.countRead(passCtx, redis.NewCmd(passCtx, "ping")) })
+				if got := sent.unprovoked(); got != tc.want {
+					t.Fatalf("unprovoked = %v, want %v", got, tc.want)
+				}
+			})
 		}
 	})
 }

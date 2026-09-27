@@ -28,6 +28,9 @@ type Proxy struct {
 	mu    sync.Mutex
 	traps []*trap
 	open  map[net.Conn]struct{}
+
+	caught  uint64 // answers caught so far, held or dropped
+	holding int    // answers caught and not yet released
 }
 
 // trap is one answer a test asked to catch. The first answer from the server containing
@@ -85,6 +88,22 @@ const markerReach = 256
 // Addr is where a client should connect instead of the server.
 func (p *Proxy) Addr() string { return p.addr }
 
+// Caught is how many answers the proxy has caught so far, held or dropped. A caller that
+// reads it on both sides of something learns whether the proxy stepped in meanwhile.
+func (p *Proxy) Caught() uint64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.caught
+}
+
+// Busy reports whether the proxy stands to step in: a trap is armed and has not sprung,
+// or an answer it caught is still held.
+func (p *Proxy) Busy() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.traps) > 0 || p.holding > 0
+}
+
 // Hold keeps the next answer containing marker from reaching the client until release is
 // closed. Everything behind it on that connection waits too, so what the client reads
 // stays in the order the server wrote it. The returned channel closes when the answer is
@@ -111,6 +130,13 @@ func (p *Proxy) arm(marker string, release <-chan struct{}) <-chan struct{} {
 	return caught
 }
 
+// released is a held answer let through, or given up on when the proxy stops.
+func (p *Proxy) released() {
+	p.mu.Lock()
+	p.holding--
+	p.mu.Unlock()
+}
+
 // spring takes the first trap what the server just wrote matches, if any. seen is the
 // chunk that just arrived with the end of what came before it on the same connection in
 // front, the first relayed bytes of it, so a marker TCP delivered in two pieces is still
@@ -123,6 +149,12 @@ func (p *Proxy) spring(seen []byte, relayed int) *trap {
 	for i, candidate := range p.traps {
 		if bytes.Contains(seen[max(0, relayed-len(candidate.marker)+1):], candidate.marker) {
 			p.traps = append(p.traps[:i], p.traps[i+1:]...)
+			// Counted in the same step that disarms the trap, so that the proxy is never
+			// seen idle between the two.
+			p.caught++
+			if candidate.release != nil {
+				p.holding++
+			}
 			return candidate
 		}
 	}
@@ -185,7 +217,9 @@ func (p *Proxy) relay(client net.Conn, target string) {
 				}
 				select {
 				case <-sprung.release:
+					p.released()
 				case <-p.done:
+					p.released()
 					return
 				}
 			}
