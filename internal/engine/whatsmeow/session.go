@@ -635,9 +635,9 @@ type Session struct {
 	// holds its socket lock for the length of a dial and Disconnect waits for the same
 	// lock, so a disconnect can outlive the command that asked for it.
 	hangingUp chan struct{}
-	// hangUpClaim is how the latest hang-up gets reported, decided once between the
-	// hang-up and the command waiting on it (see hangUp).
-	hangUpClaim *atomic.Int32
+	// hangUpClaim is how the latest hang-up gets reported, decided between the hang-up
+	// and the command waiting on it (see moveClaim).
+	hangUpClaim *moveClaim
 	// runs counts the conversations this session has started. Paired with nonce it is
 	// what gives each one a name the client can answer to.
 	runs uint64
@@ -2139,7 +2139,7 @@ func (s *Session) giveUpOn(ctx context.Context, run *pairingRun, client *wm.Clie
 // actually interrupts the dial; this is the part that stops waiting.
 func (s *Session) hangUp(ctx context.Context, client *wm.Client, move bool) error {
 	done := make(chan struct{})
-	claim := new(atomic.Int32)
+	claim := new(moveClaim)
 	s.mu.Lock()
 	s.hangingUp = done
 	s.hangUpClaim = claim
@@ -2155,17 +2155,21 @@ func (s *Session) hangUp(ctx context.Context, client *wm.Client, move bool) erro
 		//
 		// A move is a reconnect only while its command is still there to make it: one the
 		// caller gave up on is followed by no redial, and the socket is down for good.
-		s.settleHangUp(move && claim.CompareAndSwap(hangUpPending, hangUpSettled))
+		var moving *moveClaim
+		if move && claim.settle() {
+			moving = claim
+		}
+		s.settleHangUp(moving)
 	}()
 
 	select {
 	case <-done:
 		return nil
 	case <-ctx.Done():
-		// The hang-up already claimed this as the move's reconnect, so the socket is down
-		// and the client has been, or is being, told a redial follows. Waited for, so that
-		// the reconnect is published before the `connecting` of the redial.
-		if move && !claim.CompareAndSwap(hangUpPending, hangUpAbandoned) {
+		// The reconnect is already out, so the socket is down and the client has been told
+		// a redial follows: the command goes on to make it. What is left of the hang-up is
+		// closing `done`, waited for so the redial reads the session as down.
+		if move && !claim.abandon() {
 			select {
 			case <-done:
 			case <-s.done:
@@ -2174,20 +2178,47 @@ func (s *Session) hangUp(ctx context.Context, client *wm.Client, move bool) erro
 		}
 		// The socket is still up, held by a dial this had to queue behind. Answering the
 		// caller with success would have it record a session as closed while events from
-		// that connection are still on their way.
+		// that connection are still on their way. A move given up on while its reconnect
+		// was going out ends here too, and the hang-up follows the reconnect with the close.
 		return fmt.Errorf("whatsmeow: %s was still connecting: %w", s.sid, ctx.Err())
 	case <-s.done:
 		return nil
 	}
 }
 
-// How a hang-up is reported is decided once, by whichever of the hang-up and the command
-// waiting on it gets there first.
+// moveClaim is how the hang-up of a move is reported, decided between the hang-up and
+// the command that is waiting on it to redial.
+//
+// A move is a reconnect only while its command is still there to make the redial. The
+// command can give up at its deadline at any point, including while the reconnect is being
+// published -- which waits on the transition lock and on the inbox, and so on a publisher
+// that may be stalled -- and it must: holding it past its deadline holds the session's
+// command queue. So the claim has four states, and each side moves it only forward.
+type moveClaim struct{ state atomic.Int32 }
+
 const (
-	hangUpPending int32 = iota
-	hangUpSettled
-	hangUpAbandoned
+	claimPending int32 = iota
+	claimSettled
+	claimPublished
+	claimAbandoned
 )
+
+// settle is the hang-up taking the move as a reconnect to publish. False when the command
+// already gave up: no redial follows, and the hang-up is a plain close.
+func (c *moveClaim) settle() bool { return c.state.CompareAndSwap(claimPending, claimSettled) }
+
+// published is the hang-up saying the reconnect is out. False when the command gave up
+// while it was going out, so no redial follows it and the hang-up has to say so.
+func (c *moveClaim) published() bool {
+	return c.state.CompareAndSwap(claimSettled, claimPublished)
+}
+
+// abandon is the command giving up. False once the reconnect is out: the socket is down,
+// the client has been told a redial follows, and the command goes on to make it.
+func (c *moveClaim) abandon() bool {
+	return c.state.CompareAndSwap(claimPending, claimAbandoned) ||
+		c.state.CompareAndSwap(claimSettled, claimAbandoned)
+}
 
 // settleHangUp records a socket this session took down on purpose.
 //
@@ -2197,10 +2228,12 @@ const (
 // state to connected and publishes `open` on top of it. A socket that is down would then
 // be reported open for good, with nothing arriving later to correct it.
 //
-// `moved` is a hang-up that moved a paired session to another path, with the redial still
-// to come: published as `reconnecting` with reasonProxyChanged, because the session comes
-// back without anybody asking. Every other hang-up is the `close` a disconnect publishes.
-func (s *Session) settleHangUp(moved bool) {
+// `moving` is the claim of a hang-up that moved a paired session to another path, with the
+// redial still to come: published as `reconnecting` with reasonProxyChanged, because the
+// session comes back without anybody asking. Every other hang-up is the `close` a
+// disconnect publishes, and so is a move whose command gave up while the reconnect was
+// going out: it is followed straight away by that close, since no redial is coming.
+func (s *Session) settleHangUp(moving *moveClaim) {
 	s.transition.Lock()
 	defer s.transition.Unlock()
 
@@ -2215,9 +2248,11 @@ func (s *Session) settleHangUp(moved bool) {
 
 	s.refuseLateConnect()
 	s.offline()
-	if moved {
+	if moving != nil {
 		s.emit(protocol.EventSessionState, map[string]any{"state": "reconnecting", "reason": reasonProxyChanged})
-		return
+		if moving.published() {
+			return
+		}
 	}
 	s.emit(protocol.EventSessionState, map[string]any{"state": "close", "reason": "disconnect_requested"})
 }

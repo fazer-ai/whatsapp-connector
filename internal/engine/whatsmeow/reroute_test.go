@@ -100,13 +100,14 @@ func TestAMoveWhoseHangUpOutlivedItsCommandIsAClose(t *testing.T) {
 	}
 }
 
-// A hang-up that finished as the command gave up is the move's, not a late one.
+// A move given up on while its reconnect is going out answers at its deadline.
 //
-// The two can meet: the socket is down and the hang-up has already decided to publish the
-// reconnect when the deadline runs out. Answering the connect as failed then would stop
-// the redial that reconnect promised, and the client would wait on it for good. Held
-// here by the transition lock, which the hang-up takes to publish after it has decided.
-func TestAMoveDecidedAsTheDeadlineRunsOutGoesOn(t *testing.T) {
+// Publishing waits on the transition lock and on the inbox, and so on a publisher that may
+// be stalled. The command holds the session's queue while it waits, so it answers at its
+// deadline like any other, and the hang-up follows the reconnect it had started to publish
+// with the close: nothing is going to redial. Held here by the transition lock, which the
+// hang-up takes to publish once it has decided.
+func TestAMoveGivenUpWhileItsReconnectIsGoingOutAnswersAtItsDeadline(t *testing.T) {
 	t.Parallel()
 
 	session, _ := newTestSession(t, "5511999990001")
@@ -119,6 +120,12 @@ func TestAMoveDecidedAsTheDeadlineRunsOutGoesOn(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	session.transition.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			session.transition.Unlock()
+		}
+	}()
 	answered := make(chan error, 1)
 	go func() {
 		answered <- session.Connect(ctx, engine.ConnectRequest{
@@ -128,26 +135,66 @@ func TestAMoveDecidedAsTheDeadlineRunsOutGoesOn(t *testing.T) {
 	select {
 	case <-disconnected:
 	case <-time.After(2 * time.Second):
-		session.transition.Unlock()
 		t.Fatal("the move never hung up")
 	}
-	// The hang-up is past its decision and waiting on the lock; the command gives up now.
-	waitFor(t, func() bool { return hangUpDecided(session) }, "the hang-up never decided how to report itself")
+	waitFor(t, func() bool { return hangUpIn(session, claimSettled) }, "the hang-up never decided to publish the reconnect")
 	cancel()
-	session.transition.Unlock()
 
+	select {
+	case err := <-answered:
+		if err == nil {
+			t.Fatal("a move given up on before its reconnect went out answered success, with no redial to follow")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the move held the command past its deadline, waiting on the publication")
+	}
+
+	session.transition.Unlock()
+	locked = false
 	if state, reason := publishedState(t, session); state != "reconnecting" || reason != reasonProxyChanged {
-		t.Fatalf("the move published %s/%s, want reconnecting/%s", state, reason, reasonProxyChanged)
+		t.Fatalf("the hang-up published %s/%s first, want reconnecting/%s", state, reason, reasonProxyChanged)
 	}
-	// And the redial it promised follows. Carried on before the hang-up had finished, the
-	// connect would still read the session as open and leave the socket down.
-	if state, _ := publishedState(t, session); state != "connecting" {
-		t.Fatalf("the move was followed by %s, want the redial's connecting", state)
+	if state, reason := publishedState(t, session); state != "close" || reason != "disconnect_requested" {
+		t.Fatalf("the reconnect nobody will make was followed by %s/%s, want close/disconnect_requested", state, reason)
 	}
-	if got := session.proxyURL(); got != "socks5://127.0.0.1:2" {
-		t.Fatalf("the session records %q after a move whose socket did go down", got)
+}
+
+// The claim moves only forward, and each side learns from it whether the other got there
+// first. Every path of the hang-up and the command meeting is a row.
+func TestAMoveClaimIsDecidedOnce(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name  string
+		steps func(c *moveClaim) []bool
+		want  []bool
+	}{
+		{"published before the deadline: the command goes on", func(c *moveClaim) []bool {
+			return []bool{c.settle(), c.published(), c.abandon()}
+		}, []bool{true, true, false}},
+		{"given up while going out: the hang-up follows with a close", func(c *moveClaim) []bool {
+			return []bool{c.settle(), c.abandon(), c.published()}
+		}, []bool{true, true, false}},
+		{"given up before the hang-up decided: a plain close", func(c *moveClaim) []bool {
+			return []bool{c.abandon(), c.settle()}
+		}, []bool{true, false}},
+		{"given up twice", func(c *moveClaim) []bool {
+			return []bool{c.abandon(), c.abandon()}
+		}, []bool{true, false}},
+		{"published without being settled", func(c *moveClaim) []bool {
+			return []bool{c.published(), c.settle(), c.published()}
+		}, []bool{false, true, true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := tc.steps(new(moveClaim))
+			for i := range tc.want {
+				if got[i] != tc.want[i] {
+					t.Fatalf("step %d answered %v, want %v (all: %v)", i, got[i], tc.want[i], got)
+				}
+			}
+		})
 	}
-	<-answered
 }
 
 // A disconnect is not a move, however the session got there: nothing redials after it.
@@ -168,11 +215,11 @@ func TestADisconnectOfAPairedSessionIsStillAClose(t *testing.T) {
 	}
 }
 
-// hangUpDecided reports whether the latest hang-up has claimed how it will be published.
-func hangUpDecided(session *Session) bool {
+// hangUpIn reports whether the latest hang-up's claim is in the given state.
+func hangUpIn(session *Session, state int32) bool {
 	session.mu.Lock()
 	defer session.mu.Unlock()
-	return session.hangUpClaim != nil && session.hangUpClaim.Load() == hangUpSettled
+	return session.hangUpClaim != nil && session.hangUpClaim.state.Load() == state
 }
 
 // A hang-up that is already over is not waited on, even by a command out of time.

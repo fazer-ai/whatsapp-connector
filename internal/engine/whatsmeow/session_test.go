@@ -1596,7 +1596,7 @@ func TestAHangUpThatFinishedIsNeverPaintedOverByALateConnect(t *testing.T) {
 	// handler mid-transition, so this is what pins the rule itself.
 	session.transition.Lock()
 	settled := make(chan struct{})
-	go func() { defer close(settled); session.settleHangUp(false) }()
+	go func() { defer close(settled); session.settleHangUp(nil) }()
 	select {
 	case <-settled:
 		t.Fatal("a hang-up settled while another socket transition was in progress")
@@ -1615,7 +1615,7 @@ func TestAHangUpThatFinishedIsNeverPaintedOverByALateConnect(t *testing.T) {
 		var wg sync.WaitGroup
 		wg.Add(2)
 		go func() { defer wg.Done(); session.handle(&waEvents.Connected{}) }()
-		go func() { defer wg.Done(); session.settleHangUp(false) }()
+		go func() { defer wg.Done(); session.settleHangUp(nil) }()
 		wg.Wait()
 
 		if state := session.state(); state != "close" {
@@ -2105,7 +2105,7 @@ func TestDroppingTheHangUpGuardAndReadingTheStateIsOneStep(t *testing.T) {
 
 	session, _ := newTestSession(t, "5511999990001")
 	session.setConnected(true)
-	session.settleHangUp(false)
+	session.settleHangUp(nil)
 	if emission := next(t, session); emission.Type != protocol.EventSessionState {
 		t.Fatalf("published %q, want the socket coming down", emission.Type)
 	}
@@ -2139,7 +2139,7 @@ func TestAConnectQueuedBehindADisconnectIsStillRefused(t *testing.T) {
 
 	session, _ := newTestSession(t, "5511999990001")
 	session.setConnected(true)
-	session.settleHangUp(false)
+	session.settleHangUp(nil)
 	drain(t, session)
 
 	session.handle(&waEvents.Connected{})
@@ -2166,7 +2166,7 @@ func TestADropFromASocketAlreadyHungUpDoesNotAnnounceARetry(t *testing.T) {
 	session, _ := newTestSession(t, "5511999990001")
 	session.setConnected(true)
 
-	session.settleHangUp(false)
+	session.settleHangUp(nil)
 	if emission := next(t, session); emission.Type != protocol.EventSessionState {
 		t.Fatalf("published %q, want the socket coming down", emission.Type)
 	}
@@ -2290,7 +2290,7 @@ func TestARefusedConnectPutsTheDisconnectGuardBack(t *testing.T) {
 			session.setConnected(true)
 
 			// The operator disconnects, and whatsmeow has a Connected already on its way.
-			session.settleHangUp(false)
+			session.settleHangUp(nil)
 			drain(t, session)
 
 			if err := session.Connect(t.Context(), request); err == nil {
