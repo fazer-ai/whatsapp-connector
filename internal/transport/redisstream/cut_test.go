@@ -191,7 +191,6 @@ type passSent struct {
 	began   sync.Once
 	proxy   *redisxtest.Proxy
 	caught  uint64
-	armed   bool
 	holding bool
 
 	// Whether the command the pass was cut on had written anything by the time it failed.
@@ -199,8 +198,10 @@ type passSent struct {
 }
 
 // unprovoked reports whether the proxy the pass went through left it alone: nothing held
-// when it began or when it ended, nothing caught in between, and a trap armed at either end
-// only if the command the pass was cut on never left the client. One that left may have an
+// when it began, nothing caught while it ran, and a trap armed when it ended only if the
+// command the pass was cut on never left the client. An answer held when the pass ends was
+// caught while it ran or held when it began, and a trap armed when it began is still armed
+// or has caught something, so the other ends add nothing. One that left may have an
 // answer still on its way to the trap, and which error the pass ended with does not say:
 // go-redis sends a command again after a socket timeout, and a window spent in the pause
 // before that comes back as the context's error. So it is measured, as bytes written. A
@@ -209,10 +210,10 @@ func (s *passSent) unprovoked() bool {
 	if s.proxy == nil {
 		return true
 	}
-	if s.holding || s.proxy.Holding() || s.proxy.Caught() != s.caught {
+	if s.holding || s.proxy.Caught() != s.caught {
 		return false
 	}
-	if s.armed || s.proxy.Armed() {
+	if s.proxy.Armed() {
 		return !s.cutLeft.Load()
 	}
 	return true
@@ -295,7 +296,7 @@ func (h passReads) countRead(ctx context.Context, cmd redis.Cmder) {
 	}
 	sent.began.Do(func() {
 		if h.proxy != nil {
-			sent.proxy, sent.caught, sent.armed, sent.holding = h.proxy, h.proxy.Caught(), h.proxy.Armed(), h.proxy.Holding()
+			sent.proxy, sent.caught, sent.holding = h.proxy, h.proxy.Caught(), h.proxy.Holding()
 		}
 	})
 	if cmd.Name() == "xreadgroup" {
@@ -708,6 +709,51 @@ func (h *cutTheReadBack) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
 }
 
 func (*cutTheReadBack) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+
+// A loaded machine starved six windows in a row in the verifier's runs (#334), and the
+// helper waits that out rather than failing the test on it.
+func TestAReadWaitsOutARunOfStarvedWindows(t *testing.T) {
+	t.Parallel()
+
+	cutBackends(t, func(t *testing.T, f cutFleet) {
+		streams := f.fleet.streams(t, "inst-a")
+		if _, err := read(t, streams, "s1"); err != nil {
+			t.Fatalf("priming read: %v", err)
+		}
+		writeCommand(t, f.fleet, f.client.Keys().Commands("s1"), command("after-six", "s1", ""))
+		starve := &starveWindows{}
+		starve.left.Store(6)
+		f.rdb.AddHook(starve)
+
+		delivered, err := read(t, streams, "s1")
+		if left := starve.left.Load(); left > 0 {
+			t.Fatalf("%d windows were left to starve, want all six spent", left)
+		}
+		if err != nil || !slices.Equal(ids(delivered), []string{"after-six"}) {
+			t.Fatalf("handed out %v (err=%v) after six starved windows, want the command", ids(delivered), err)
+		}
+	})
+}
+
+// starveWindows keeps the first command of each of the next few passes from going out
+// until its window is over, and fails it the way go-redis does.
+type starveWindows struct{ left atomic.Int64 }
+
+func (*starveWindows) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (h *starveWindows) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if h.left.Add(-1) >= 0 {
+			<-ctx.Done()
+			return ctx.Err()
+		}
+		return next(ctx, cmd)
+	}
+}
+
+func (*starveWindows) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
 	return next
 }
 
