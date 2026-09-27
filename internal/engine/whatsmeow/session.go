@@ -635,6 +635,9 @@ type Session struct {
 	// holds its socket lock for the length of a dial and Disconnect waits for the same
 	// lock, so a disconnect can outlive the command that asked for it.
 	hangingUp chan struct{}
+	// hangUpClaim is how the latest hang-up gets reported, decided between the hang-up
+	// and the command waiting on it (see moveClaim).
+	hangUpClaim *moveClaim
 	// runs counts the conversations this session has started. Paired with nonce it is
 	// what gives each one a name the client can answer to.
 	runs uint64
@@ -1907,7 +1910,11 @@ func (s *Session) reroute(ctx context.Context, proxyURL string) error {
 		return err
 	}
 	if state := s.state(); state == "open" || state == "connecting" || state == "reconnecting" {
-		if err := s.hangUp(ctx, s.current()); err != nil {
+		// A paired session comes back through the resume that follows, so the hang-up is
+		// published as the reconnect it is. One still pairing has no connection to come
+		// back to: what follows is a new pairing, and the hang-up is a plain close.
+		phone, _ := s.identity()
+		if err := s.hangUp(ctx, s.current(), phone != ""); err != nil {
 			// Back where `proxy` says it is, so the two agree: a connect naming the old
 			// proxy again is then truly no change, and one naming the new proxy moves it
 			// again. Left on the new path, the first of those would find nothing to do and
@@ -1931,6 +1938,14 @@ func (s *Session) awaitHangUp(ctx context.Context) error {
 	s.mu.Unlock()
 	if pending == nil {
 		return nil
+	}
+	// A hang-up already over is over, whatever the deadline says: a move whose hang-up
+	// finished as its deadline ran out has published the reconnect, and the redial that
+	// follows is what makes it true.
+	select {
+	case <-pending:
+		return nil
+	default:
 	}
 	select {
 	case <-pending:
@@ -2122,10 +2137,12 @@ func (s *Session) giveUpOn(ctx context.Context, run *pairingRun, client *wm.Clie
 // that same lock, so a disconnect arriving mid-handshake would otherwise sit there long
 // past its deadline and then report success. Cancelling the session context is what
 // actually interrupts the dial; this is the part that stops waiting.
-func (s *Session) hangUp(ctx context.Context, client *wm.Client) error {
+func (s *Session) hangUp(ctx context.Context, client *wm.Client, move bool) error {
 	done := make(chan struct{})
+	claim := new(moveClaim)
 	s.mu.Lock()
 	s.hangingUp = done
+	s.hangUpClaim = claim
 	s.mu.Unlock()
 	go func() {
 		defer close(done)
@@ -2135,20 +2152,72 @@ func (s *Session) hangUp(ctx context.Context, client *wm.Client) error {
 		// down a moment later regardless, and a session that never recorded it would go
 		// on reporting itself open over a connection that no longer exists, with no close
 		// event to correct it.
-		s.settleHangUp()
+		//
+		// A move is a reconnect only while its command is still there to make it: one the
+		// caller gave up on is followed by no redial, and the socket is down for good.
+		var moving *moveClaim
+		if move && claim.settle() {
+			moving = claim
+		}
+		s.settleHangUp(moving)
 	}()
 
 	select {
 	case <-done:
 		return nil
 	case <-ctx.Done():
+		// The reconnect is already out, so the socket is down and the client has been told
+		// a redial follows: the command goes on to make it. What is left of the hang-up is
+		// closing `done`, waited for so the redial reads the session as down.
+		if move && !claim.abandon() {
+			select {
+			case <-done:
+			case <-s.done:
+			}
+			return nil
+		}
 		// The socket is still up, held by a dial this had to queue behind. Answering the
 		// caller with success would have it record a session as closed while events from
-		// that connection are still on their way.
+		// that connection are still on their way. A move given up on while its reconnect
+		// was going out ends here too, and the hang-up follows the reconnect with the close.
 		return fmt.Errorf("whatsmeow: %s was still connecting: %w", s.sid, ctx.Err())
 	case <-s.done:
 		return nil
 	}
+}
+
+// moveClaim is how the hang-up of a move is reported, decided between the hang-up and
+// the command that is waiting on it to redial.
+//
+// A move is a reconnect only while its command is still there to make the redial. The
+// command can give up at its deadline at any point, including while the reconnect is being
+// published -- which waits on the transition lock and on the inbox, and so on a publisher
+// that may be stalled -- and it must: holding it past its deadline holds the session's
+// command queue. So the claim has four states, and each side moves it only forward.
+type moveClaim struct{ state atomic.Int32 }
+
+const (
+	claimPending int32 = iota
+	claimSettled
+	claimPublished
+	claimAbandoned
+)
+
+// settle is the hang-up taking the move as a reconnect to publish. False when the command
+// already gave up: no redial follows, and the hang-up is a plain close.
+func (c *moveClaim) settle() bool { return c.state.CompareAndSwap(claimPending, claimSettled) }
+
+// published is the hang-up saying the reconnect is out. False when the command gave up
+// while it was going out, so no redial follows it and the hang-up has to say so.
+func (c *moveClaim) published() bool {
+	return c.state.CompareAndSwap(claimSettled, claimPublished)
+}
+
+// abandon is the command giving up. False once the reconnect is out: the socket is down,
+// the client has been told a redial follows, and the command goes on to make it.
+func (c *moveClaim) abandon() bool {
+	return c.state.CompareAndSwap(claimPending, claimAbandoned) ||
+		c.state.CompareAndSwap(claimSettled, claimAbandoned)
 }
 
 // settleHangUp records a socket this session took down on purpose.
@@ -2158,7 +2227,13 @@ func (s *Session) hangUp(ctx context.Context, client *wm.Client) error {
 // handler reads hungUp before this sets it, publishes `close` here, and then sets the
 // state to connected and publishes `open` on top of it. A socket that is down would then
 // be reported open for good, with nothing arriving later to correct it.
-func (s *Session) settleHangUp() {
+//
+// `moving` is the claim of a hang-up that moved a paired session to another path, with the
+// redial still to come: published as `reconnecting` with reasonProxyChanged, because the
+// session comes back without anybody asking. Every other hang-up is the `close` a
+// disconnect publishes, and so is a move whose command gave up while the reconnect was
+// going out: it is followed straight away by that close, since no redial is coming.
+func (s *Session) settleHangUp(moving *moveClaim) {
 	s.transition.Lock()
 	defer s.transition.Unlock()
 
@@ -2173,6 +2248,12 @@ func (s *Session) settleHangUp() {
 
 	s.refuseLateConnect()
 	s.offline()
+	if moving != nil {
+		s.emit(protocol.EventSessionState, map[string]any{"state": "reconnecting", "reason": reasonProxyChanged})
+		if moving.published() {
+			return
+		}
+	}
 	s.emit(protocol.EventSessionState, map[string]any{"state": "close", "reason": "disconnect_requested"})
 }
 
@@ -2314,7 +2395,7 @@ func (s *Session) Disconnect(ctx context.Context) error {
 	// this call, for the same reason as in Connect and with the same ordering: before the
 	// socket goes, so an instance that dies in between does not leave an account somebody
 	// turned off looking like one that should be resumed.
-	return s.hangUp(ctx, s.current())
+	return s.hangUp(ctx, s.current(), false)
 }
 
 // Logout ends the session on WhatsApp's side and forgets the credentials here, so the
@@ -3627,6 +3708,10 @@ func (s *Session) sessionState() map[string]any {
 // proxy: the proxy could not be reached, or it refused the tunnel. Never with the address
 // or the error that said so, because the proxy's URL is a credential.
 const reasonProxyUnreachable = "proxy_unreachable"
+
+// reasonProxyChanged is the state reason for a paired session whose socket a connect took
+// down to dial again through another path. It comes back by itself, within that connect.
+const reasonProxyChanged = "proxy_changed"
 
 // proxyOutcome is the route telling this session how a dial ended at the proxy. It runs
 // on the goroutine that dialled, and that can be one holding the transition lock -- a
