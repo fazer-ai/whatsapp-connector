@@ -173,10 +173,10 @@ func abandoned(ctx context.Context) bool {
 
 // proxyAttempt is how far one request got with an HTTP proxy.
 type proxyAttempt struct {
-	mu       sync.Mutex
-	report   func(reached bool)
-	dialled  bool
-	answered bool
+	mu      sync.Mutex
+	report  func(reached bool)
+	dialled bool
+	settled bool
 }
 
 type proxyAttemptKey struct{}
@@ -194,21 +194,24 @@ func (a *proxyAttempt) dialledProxy(report func(reached bool)) {
 	a.mu.Unlock()
 }
 
-func (a *proxyAttempt) gotAnswer() {
+// answered is the proxy's answer to the CONNECT, reported with the record held so it cannot
+// cross with the request's own failure: a deadline running out as the answer arrives would
+// otherwise report the failure after the answer, and be judged the newer of the two.
+func (a *proxyAttempt) answered(report func(reached bool), reached bool) {
 	a.mu.Lock()
-	a.answered = true
-	a.mu.Unlock()
+	defer a.mu.Unlock()
+	a.settled = true
+	report(reached)
 }
 
 // unanswered is the request failed: a proxy that was reached and never answered the
-// CONNECT is reported as failed there.
+// CONNECT is reported as failed there, unless its answer got in first.
 func (a *proxyAttempt) unanswered() {
 	a.mu.Lock()
-	report := a.report
-	pending := a.dialled && !a.answered
-	a.mu.Unlock()
-	if pending && report != nil {
-		report(false)
+	defer a.mu.Unlock()
+	if a.dialled && !a.settled && a.report != nil {
+		a.settled = true
+		a.report(false)
 	}
 }
 
@@ -281,10 +284,12 @@ func egressTransportWithin(proxyURL string, handshake time.Duration, report func
 				return conn, err
 			}
 			transport.OnProxyConnectResponse = func(ctx context.Context, _ *url.URL, _ *http.Request, response *http.Response) error {
+				reached := response.StatusCode == http.StatusOK
 				if attempt := attemptOf(ctx); attempt != nil {
-					attempt.gotAnswer()
+					attempt.answered(report, reached)
+				} else {
+					report(reached)
 				}
-				report(response.StatusCode == http.StatusOK)
 				return nil
 			}
 		}

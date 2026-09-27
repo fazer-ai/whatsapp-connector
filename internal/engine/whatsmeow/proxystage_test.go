@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -568,5 +569,54 @@ func TestARequestCancelledBeforeTheProxyAnsweredReportsNothing(t *testing.T) {
 	}
 	if n := told.Load(); n != 0 {
 		t.Fatalf("a request cancelled before the proxy answered reported %d outcomes", n)
+	}
+}
+
+// The request's failure and the proxy's answer can land together -- the deadline running
+// out as the CONNECT answer arrives, which the transport's detached dial makes reachable --
+// and the one reported last is judged the newer. Held inside the failure's report, the
+// answer has to wait its turn: it cannot be overtaken by a failure observed before it.
+func TestAnAnswerCannotBeOvertakenByTheFailureBeforeIt(t *testing.T) {
+	t.Parallel()
+
+	var mu sync.Mutex
+	var order []bool
+	inFailure, release := make(chan struct{}), make(chan struct{})
+	report := func(reached bool) {
+		if !reached {
+			close(inFailure)
+			<-release
+		}
+		mu.Lock()
+		order = append(order, reached)
+		mu.Unlock()
+	}
+	attempt := &proxyAttempt{}
+	attempt.dialledProxy(report)
+
+	failed := make(chan struct{})
+	go func() {
+		attempt.unanswered()
+		close(failed)
+	}()
+	<-inFailure
+	answered := make(chan struct{})
+	go func() {
+		attempt.answered(report, true)
+		close(answered)
+	}()
+	select {
+	case <-answered:
+		t.Fatal("the answer was reported while the failure before it was still being reported")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	<-failed
+	<-answered
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(order) != 2 || order[0] || !order[1] {
+		t.Fatalf("the outcomes were reported as %v", order)
 	}
 }
