@@ -400,6 +400,15 @@ func TestAPassIsTheTestsDoingWheneverTheProxySteppedIn(t *testing.T) {
 				}
 			})
 		}
+		// A client that reaches Redis directly has nobody in front to provoke anything.
+		t.Run("no proxy in front", func(t *testing.T) {
+			sent := &passSent{}
+			passCtx := context.WithValue(ctx, passKey{}, sent)
+			passReads{}.countRead(passCtx, redis.NewCmd(passCtx, "ping"))
+			if !sent.unprovoked() {
+				t.Fatalf("a pass with no proxy in front was taken for the test's doing")
+			}
+		})
 	})
 }
 
