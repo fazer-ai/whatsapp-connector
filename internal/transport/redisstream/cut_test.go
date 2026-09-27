@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"os"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -46,7 +49,11 @@ type cutFleet struct {
 	fleet
 	proxy *redisxtest.Proxy
 	via   *redisx.Client
-	fake  bool
+	// through is the client under via, for a hook a test puts on the transport's side of
+	// the proxy only, and reads the hook it carries.
+	through *redis.Client
+	reads   passReads
+	fake    bool
 }
 
 // cutBackends runs a test against miniredis and, when one is named, against a real Redis:
@@ -72,11 +79,12 @@ func cutBackends(t *testing.T, run func(t *testing.T, f cutFleet)) {
 			options.Addr = proxy.Addr()
 			options.ContextTimeoutEnabled = true
 			rdb := redis.NewClient(&options)
-			rdb.AddHook(passReads{})
+			reads := throughProxy(proxy)
+			rdb.AddHook(reads)
 			t.Cleanup(func() { _ = rdb.Close() })
 			run(t, cutFleet{
 				fleet: direct, proxy: proxy, via: redisx.Wrap(rdb, direct.client.Keys().Prefix(), shards),
-				fake: backend.name == "miniredis",
+				through: rdb, reads: reads, fake: backend.name == "miniredis",
 			})
 		})
 	}
@@ -112,14 +120,25 @@ func (f cutFleet) streamsReading(t *testing.T, instance string, count int64) *re
 // the loop costs nothing, since the next pass does the work; here it is a goroutine the
 // scheduler kept waiting, and a test that expects a delivery would read it as a verdict
 // (#328). So a pass that sent no XREADGROUP is run again with a new window. One that did
-// is never repeated, however late its caller gets the CPU back: an empty pass stays a
-// result for the tests that expect nothing.
+// is never repeated for being empty, however late its caller gets the CPU back: an empty
+// pass stays a result for the tests that expect nothing.
 //
 // Whether it went out is counted, not inferred from the clock: the scheduler that starves
 // a pass before it goes out can as easily starve one after it came back, and the time
 // left would then call a finished read starved (#333). The count comes from passReads,
 // which every client these tests build carries; one that does not makes every empty pass
 // look starved, and the helper fails loudly rather than passing on it.
+//
+// A pass that went out can also come back with its window spent, and that is either the
+// test's doing or the machine's. The tests that lose an answer on purpose hold it in the
+// proxy past the window, and the pass that fails that way is exactly what they assert. On
+// a loaded machine the same failure comes with nothing held, from a trip that simply took
+// longer than the window (#334), and like the starved pass it is no verdict: the loop's
+// next pass reads back what it left pending. So a spent pass is run again when the proxy
+// the client goes through did not step in while it ran: it caught nothing, and held
+// nothing. A trap armed for an answer is a stimulus only once the pass has sent
+// something: until then there is no answer for it to catch, and the pass is as much the
+// machine's as one with nothing armed.
 func read(t *testing.T, streams *redisstream.Streams, sids ...string) ([]transport.Delivery, error) {
 	t.Helper()
 	return readWithin(t, cutWindow, streams, sids...)
@@ -130,60 +149,159 @@ func read(t *testing.T, streams *redisstream.Streams, sids ...string) ([]transpo
 func readWithin(t testing.TB, window time.Duration, streams *redisstream.Streams, sids ...string) ([]transport.Delivery, error) {
 	t.Helper()
 	for range starvedPasses {
-		delivered, spent, err := pass(streams, window, sids)
-		if len(delivered) > 0 || err != nil || !spent {
+		delivered, again, err := pass(streams, window, sids)
+		if !again {
 			return delivered, err
 		}
 	}
 	// Errorf rather than Fatalf: some callers read from a goroutine of their own.
-	t.Errorf("read: %d passes in a row came back empty with their window spent before they "+
-		"could go out, so none of them read anything", starvedPasses)
+	t.Errorf("read: %d passes in a row came back with their window spent, before they could "+
+		"go out or with nothing held in the proxy, so none of them read anything", starvedPasses)
 	return nil, errors.New("read: every pass was starved of its window")
 }
 
-// starvedPasses bounds how many times read runs a pass that never went out. A machine
+// starvedPasses bounds how many times read runs a pass the machine starved. A machine
 // that starves this many windows in a row is not going to be waited out, and a test that
 // hung instead of failing would say less.
-const starvedPasses = 5
+const starvedPasses = 20
 
-// pass is a single read, and whether it never went out: no XREADGROUP was sent under it.
-func pass(streams *redisstream.Streams, window time.Duration, sids []string) (delivered []transport.Delivery, spent bool, err error) {
+// pass is a single read, and whether the machine rather than the test decided how it came
+// out: it never went out, or it had its window spent with the proxy idle, whether on the
+// read itself or earlier, on the XGROUP that creates the groups.
+func pass(streams *redisstream.Streams, window time.Duration, sids []string) (delivered []transport.Delivery, again bool, err error) {
 	sent := &passSent{}
 	ctx, cancel := context.WithTimeout(context.WithValue(context.Background(), passKey{}, sent), window)
 	defer cancel()
 	delivered, err = streams.Read(ctx, sids)
-	return delivered, sent.reads.Load() == 0, err
+	spent := errors.Is(err, transport.ErrWindowSpent) && sent.unprovoked()
+	if sent.reads.Load() == 0 {
+		return delivered, (len(delivered) == 0 && err == nil) || spent, err
+	}
+	return delivered, spent, err
 }
 
 // passKey carries a pass's own count through the client's hooks, so that passes running
 // in parallel on one client count apart.
 type passKey struct{}
 
-type passSent struct{ reads atomic.Int64 }
+type passSent struct {
+	reads atomic.Int64
 
-// passReads counts each XREADGROUP against the pass whose context sent it.
-type passReads struct{}
+	// What the proxy had done and stood ready to do when the pass sent its first command.
+	began   sync.Once
+	proxy   *redisxtest.Proxy
+	caught  uint64
+	holding bool
 
-func (passReads) DialHook(next redis.DialHook) redis.DialHook { return next }
+	// Whether the command the pass was cut on had written anything by the time it failed.
+	cutLeft atomic.Bool
+}
 
-func (passReads) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
-	return func(ctx context.Context, cmd redis.Cmder) error {
-		countRead(ctx, cmd)
-		return next(ctx, cmd)
+// unprovoked reports whether the proxy the pass went through left it alone: nothing held
+// when it began, nothing caught while it ran, and a trap armed when it ended only if the
+// command the pass was cut on never left the client. An answer held when the pass ends was
+// caught while it ran or held when it began, and a trap armed when it began is still armed
+// or has caught something, so the other ends add nothing. One that left may have an
+// answer still on its way to the trap, and which error the pass ended with does not say:
+// go-redis sends a command again after a socket timeout, and a window spent in the pause
+// before that comes back as the context's error. So it is measured, as bytes written. A
+// client with no proxy in front has nobody to provoke anything.
+func (s *passSent) unprovoked() bool {
+	if s.proxy == nil {
+		return true
+	}
+	now := s.proxy.State()
+	if s.holding || now.Caught != s.caught {
+		return false
+	}
+	if now.Armed {
+		return !s.cutLeft.Load()
+	}
+	return true
+}
+
+// passReads counts each XREADGROUP against the pass whose context sent it, and has the
+// pass note the state of proxy, the one the client goes through, and how much the client
+// has written, before its first command leaves. A client that reaches Redis directly
+// carries it with no proxy.
+type passReads struct {
+	proxy *redisxtest.Proxy
+	wrote *atomic.Int64 // bytes the client has written to its connections, with a proxy
+}
+
+// throughProxy is passReads for a client that goes through proxy.
+func throughProxy(proxy *redisxtest.Proxy) passReads {
+	return passReads{proxy: proxy, wrote: new(atomic.Int64)}
+}
+
+func (h passReads) DialHook(next redis.DialHook) redis.DialHook {
+	if h.wrote == nil {
+		return next
+	}
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		conn, err := next(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		return countWrites{Conn: conn, n: h.wrote}, nil
 	}
 }
 
-func (passReads) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+// countWrites counts what the client wrote, which is what has left it.
+type countWrites struct {
+	net.Conn
+	n *atomic.Int64
+}
+
+func (c countWrites) Write(b []byte) (int, error) {
+	n, err := c.Conn.Write(b)
+	c.n.Add(int64(n))
+	return n, err
+}
+
+func (h passReads) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		h.countRead(ctx, cmd)
+		return h.measure(ctx, func() error { return next(ctx, cmd) })
+	}
+}
+
+func (h passReads) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
 	return func(ctx context.Context, cmds []redis.Cmder) error {
 		for _, cmd := range cmds {
-			countRead(ctx, cmd)
+			h.countRead(ctx, cmd)
 		}
-		return next(ctx, cmds)
+		return h.measure(ctx, func() error { return next(ctx, cmds) })
 	}
 }
 
-func countRead(ctx context.Context, cmd redis.Cmder) {
-	if sent, ok := ctx.Value(passKey{}).(*passSent); ok && cmd.Name() == "xreadgroup" {
+// measure runs one command of a pass, retries and all, and when it fails notes on the pass
+// whether it had written anything by then.
+func (h passReads) measure(ctx context.Context, run func() error) error {
+	sent, ok := ctx.Value(passKey{}).(*passSent)
+	if !ok || h.wrote == nil {
+		return run()
+	}
+	before := h.wrote.Load()
+	err := run()
+	if err != nil {
+		sent.cutLeft.Store(h.wrote.Load() != before)
+	}
+	return err
+}
+
+func (h passReads) countRead(ctx context.Context, cmd redis.Cmder) {
+	sent, ok := ctx.Value(passKey{}).(*passSent)
+	if !ok {
+		return
+	}
+	sent.began.Do(func() {
+		if h.proxy != nil {
+			began := h.proxy.State()
+			sent.proxy, sent.caught, sent.holding = h.proxy, began.Caught, began.Holding
+		}
+	})
+	if cmd.Name() == "xreadgroup" {
 		sent.reads.Add(1)
 	}
 }
@@ -256,6 +374,440 @@ func TestAPassThatNeverWentOutIsReadAgain(t *testing.T) {
 			t.Fatalf("handed out %v (err=%v) after a pass that never went out, want the command", ids(delivered), err)
 		}
 	})
+}
+
+// A pass can also go out and have the machine, not the test, spend its window: under a
+// load average of 10 the answer of the read back was still on its way when the window
+// ran out, and a priming read failed the test with ErrWindowSpent (#334). Nothing here
+// held that answer, so the pass is no verdict, and the loop's next pass is what reads the
+// command back.
+func TestAPassTheMachineCutIsReadAgain(t *testing.T) {
+	t.Parallel()
+
+	cutBackends(t, func(t *testing.T, f cutFleet) {
+		streams := f.streams(t, "inst-a")
+		if _, err := read(t, streams, "s1"); err != nil {
+			t.Fatalf("priming read: %v", err)
+		}
+		writeCommand(t, f.fleet, f.client.Keys().Commands("s1"), command("cut-by-the-machine", "s1", ""))
+		cut := &cutTheReadBack{}
+		f.through.AddHook(cut)
+
+		delivered, err := read(t, streams, "s1")
+		if cut.cut.Load() != 1 {
+			t.Fatalf("the machine cut %d passes, want one", cut.cut.Load())
+		}
+		if err != nil || !slices.Equal(ids(delivered), []string{"cut-by-the-machine"}) {
+			t.Fatalf("handed out %v (err=%v) after a pass the machine cut, want the command", ids(delivered), err)
+		}
+	})
+}
+
+// What decides whether a spent pass is run again is whether the proxy stepped in while it
+// ran, and each way it can have done so is a clause of its own: an answer still held when
+// the pass began, an answer caught in between, a trap armed while the command it waits for
+// was on its way. Any one of them makes the pass the test's doing. A trap armed while
+// nothing left the client is not one of them.
+func TestAPassIsTheTestsDoingWheneverTheProxySteppedIn(t *testing.T) {
+	t.Parallel()
+
+	cutBackends(t, func(t *testing.T, f cutFleet) {
+		ctx := context.Background()
+		// springOn sends marker through the proxy and waits for the trap to catch it, then
+		// returns a channel closed once the ECHO is done. An ECHO that finishes with the trap
+		// still armed (a server that refused it, a URL that reaches nothing) fails the case,
+		// rather than leaving it waiting for an answer that will never come.
+		springOn := func(t *testing.T, marker string, caught <-chan struct{}) <-chan struct{} {
+			t.Helper()
+			sent := make(chan error, 1)
+			go func() { sent <- f.through.Echo(ctx, marker).Err() }()
+			finished := make(chan struct{})
+			select {
+			case <-caught:
+				go func() {
+					<-sent
+					close(finished)
+				}()
+			case err := <-sent:
+				select {
+				case <-caught:
+					close(finished)
+				default:
+					t.Fatalf("ECHO %s finished (err=%v) without the proxy catching it", marker, err)
+				}
+			}
+			return finished
+		}
+		// cutOn runs one failing command through the hook, as the one the pass was cut on,
+		// writing something first when it left.
+		cutOn := func(t *testing.T, passCtx context.Context, left bool) {
+			t.Helper()
+			failing := f.reads.ProcessHook(func(context.Context, redis.Cmder) error {
+				if left {
+					if err := f.through.Echo(ctx, "not-the-marker").Err(); err != nil {
+						t.Fatalf("ECHO: %v", err)
+					}
+				}
+				return context.DeadlineExceeded
+			})
+			_ = failing(passCtx, redis.NewCmd(passCtx, "evalsha"))
+		}
+		for _, tc := range []struct {
+			name   string
+			during func(t *testing.T, begin func())
+			left   bool
+			want   bool
+		}{
+			{"nothing armed, held or caught", func(_ *testing.T, begin func()) { begin() }, true, true},
+			{"an answer still held when it began", func(t *testing.T, begin func()) {
+				release := make(chan struct{})
+				done := springOn(t, "held-at-begin", f.proxy.Hold("held-at-begin", release))
+				begin()
+				close(release)
+				<-done
+			}, false, false},
+			{"an answer caught while it ran", func(t *testing.T, begin func()) {
+				begin()
+				<-springOn(t, "dropped-meanwhile", f.proxy.Drop("dropped-meanwhile"))
+			}, false, false},
+			{"an answer caught before a later command of the same pass", func(t *testing.T, begin func()) {
+				begin()
+				<-springOn(t, "dropped-early", f.proxy.Drop("dropped-early"))
+				// The pass goes on sending: what it began with is still what counts.
+				begin()
+			}, false, false},
+			// Last: the traps they arm are never sprung, and stay armed after them.
+			{"a trap armed, cut on a command that left", func(_ *testing.T, begin func()) {
+				begin()
+				f.proxy.Hold("armed-meanwhile", make(chan struct{}))
+			}, true, false},
+			{"a trap armed, cut on a command that never left", func(_ *testing.T, begin func()) {
+				f.proxy.Hold("armed-before", make(chan struct{}))
+				begin()
+			}, false, true},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				// Every case starts with nothing held, or it would be judging the last one's.
+				if f.proxy.State().Holding {
+					t.Fatalf("the proxy still holds an answer from an earlier case")
+				}
+				sent := &passSent{}
+				passCtx := context.WithValue(ctx, passKey{}, sent)
+				tc.during(t, func() { f.reads.countRead(passCtx, redis.NewCmd(passCtx, "ping")) })
+				cutOn(t, passCtx, tc.left)
+				if got := sent.unprovoked(); got != tc.want {
+					t.Fatalf("unprovoked = %v, want %v", got, tc.want)
+				}
+			})
+		}
+		// A client that reaches Redis directly has nobody in front to provoke anything.
+		t.Run("no proxy in front", func(t *testing.T) {
+			sent := &passSent{}
+			passCtx := context.WithValue(ctx, passKey{}, sent)
+			passReads{}.countRead(passCtx, redis.NewCmd(passCtx, "ping"))
+			if !sent.unprovoked() {
+				t.Fatalf("a pass with no proxy in front was taken for the test's doing")
+			}
+		})
+	})
+}
+
+// The window can also run out earlier, on the XGROUP that creates the groups, before any
+// XREADGROUP goes out: the verifier saw a priming read fail with "create group on ...:
+// context deadline exceeded" under load (#334). It is the same machine cut, one step
+// sooner, and it comes back as whichever error the deadline took on the way.
+func TestAGroupCreationTheMachineCutIsTriedAgain(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"as the context's deadline", context.DeadlineExceeded},
+		{"as the socket's timeout", &net.OpError{Op: "read", Net: "tcp", Err: os.ErrDeadlineExceeded}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			cutBackends(t, func(t *testing.T, f cutFleet) {
+				cut := &cutTheGroupCreation{err: tc.err}
+				f.through.AddHook(cut)
+
+				if _, err := read(t, f.streams(t, "inst-a"), "s1"); err != nil {
+					t.Fatalf("a priming read whose XGROUP the machine cut failed: %v", err)
+				}
+				if cut.cut.Load() != 1 {
+					t.Fatalf("the machine cut %d group creations, want one", cut.cut.Load())
+				}
+			})
+		})
+	}
+}
+
+// cutTheGroupCreation keeps the first XGROUP from going out until the window is over, and
+// fails it with err.
+type cutTheGroupCreation struct {
+	err error
+	cut atomic.Int64
+}
+
+func (*cutTheGroupCreation) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (h *cutTheGroupCreation) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if cmd.Name() == "xgroup" && h.cut.CompareAndSwap(0, 1) {
+			<-ctx.Done()
+			return h.err
+		}
+		return next(ctx, cmd)
+	}
+}
+
+func (*cutTheGroupCreation) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+
+// Under load a read can give up before its own answer is back, and the answer reaches the
+// proxy after it: the verifier saw "the proxy never saw an answer carrying starved-wake"
+// with the read cut by the window (#334). The answer was still lost, and the command is
+// pending under the reader all the same, which is everything loseTheAnswer is there to
+// bring about.
+func TestAnAnswerThatReachesTheProxyAfterTheReadGaveUpIsStillLost(t *testing.T) {
+	t.Parallel()
+
+	cutBackends(t, func(t *testing.T, f cutFleet) {
+		streams := f.streams(t, "inst-a")
+		if _, err := read(t, streams, "s1"); err != nil {
+			t.Fatalf("priming read: %v", err)
+		}
+		writeCommand(t, f.fleet, f.client.Keys().Commands("s1"), command("late-answer", "s1", ""))
+		late := &sendAfterTheWindow{sent: make(chan struct{})}
+		f.through.AddHook(late)
+
+		f.loseTheAnswer(t, "held past the window", streams, "inst-a", "late-answer", "s1")
+		select {
+		case <-late.sent:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("the late XREADGROUP was never sent")
+		}
+		if late.unsent != nil {
+			t.Fatalf("the late XREADGROUP was never sent: its pass failed first with %v", late.unsent)
+		}
+	})
+}
+
+// sendAfterTheWindow has the first XREADGROUP leave the client and its answer reach the
+// proxy only after the read that asked for it has given up: something is written while the
+// pass waits, as the command itself would be, the window runs out, and the command is sent
+// on its own afterwards, which is when Redis carries it out and answers.
+type sendAfterTheWindow struct {
+	once sync.Once
+	sent chan struct{}
+	// Why the command was never sent, when the pass that should have sent it failed first.
+	unsent error
+}
+
+func (*sendAfterTheWindow) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (h *sendAfterTheWindow) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if cmd.Name() != "xreadgroup" {
+			return next(ctx, cmd)
+		}
+		late := false
+		h.once.Do(func() { late = true })
+		if !late {
+			return next(ctx, cmd)
+		}
+		if err := next(ctx, redis.NewCmd(ctx, "ping")); err != nil {
+			h.unsent = err
+			close(h.sent)
+			return err
+		}
+		<-ctx.Done()
+		sent := context.WithoutCancel(ctx)
+		again := redis.NewCmd(sent, cmd.Args()...)
+		go func() {
+			defer close(h.sent)
+			_ = next(sent, again)
+		}()
+		return &net.OpError{Op: "read", Net: "tcp", Err: os.ErrDeadlineExceeded}
+	}
+}
+
+func (*sendAfterTheWindow) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+
+// A trap armed for an answer is no stimulus while the command it waits for has not left:
+// the verifier saw a read back cut by the window before it was sent, with a trap armed for
+// the wake it would have carried, and the test waited for an answer nobody had asked for
+// (#334). That pass is the machine's, and the next one is what asks.
+func TestAPassCutBeforeItsCommandLeftIsTheMachinesWhateverIsArmed(t *testing.T) {
+	t.Parallel()
+
+	cutBackends(t, func(t *testing.T, f cutFleet) {
+		streams := f.streams(t, "inst-a")
+		if _, err := read(t, streams, "s1"); err != nil {
+			t.Fatalf("priming read: %v", err)
+		}
+		writeCommand(t, f.fleet, f.client.Keys().Control(), &protocol.Command{
+			V: protocol.Version, ID: "unasked-wake", Type: protocol.CommandSessionWake, SID: "s9",
+			TS: 1787000000000, Payload: []byte(`{"desired":"connected"}`),
+		})
+		f.loseTheAnswer(t, "held past the window", streams, "inst-a", "unasked-wake", "s1")
+
+		cut := &cutBeforeItLeaves{}
+		f.through.AddHook(cut)
+		f.loseTheAnswer(t, "held past the window", streams, "inst-a", "unasked-wake", "s1")
+		if cut.cut.Load() != 1 {
+			t.Fatalf("the machine cut %d read backs before they left, want one", cut.cut.Load())
+		}
+	})
+}
+
+// A command can also leave the client and never reach Redis: under load the window ran
+// out, go-redis closed the connection, and what it had written died in the proxy with it
+// (#334). No answer comes for the trap, however long the test waits, and the stimulus has
+// to be tried again.
+func TestAStimulusWhoseCommandDiedOnTheWayIsTriedAgain(t *testing.T) {
+	t.Parallel()
+
+	cutBackends(t, func(t *testing.T, f cutFleet) {
+		streams := f.streams(t, "inst-a")
+		if _, err := read(t, streams, "s1"); err != nil {
+			t.Fatalf("priming read: %v", err)
+		}
+		writeCommand(t, f.fleet, f.client.Keys().Control(), &protocol.Command{
+			V: protocol.Version, ID: "lost-on-the-way", Type: protocol.CommandSessionWake, SID: "s9",
+			TS: 1787000000000, Payload: []byte(`{"desired":"connected"}`),
+		})
+		f.loseTheAnswer(t, "held past the window", streams, "inst-a", "lost-on-the-way", "s1")
+
+		died := &dieOnTheWay{}
+		f.through.AddHook(died)
+		f.loseTheAnswer(t, "held past the window", streams, "inst-a", "lost-on-the-way", "s1")
+		if died.died.Load() != 1 {
+			t.Fatalf("%d read backs died on the way, want one", died.died.Load())
+		}
+	})
+}
+
+// dieOnTheWay has the first read back write something and then fail the way the socket's
+// deadline does, without the command itself ever reaching Redis.
+type dieOnTheWay struct{ died atomic.Int64 }
+
+func (*dieOnTheWay) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (h *dieOnTheWay) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if (cmd.Name() == "evalsha" || cmd.Name() == "eval") && h.died.CompareAndSwap(0, 1) {
+			if err := next(ctx, redis.NewCmd(ctx, "ping")); err != nil {
+				return err
+			}
+			<-ctx.Done()
+			return &net.OpError{Op: "read", Net: "tcp", Err: os.ErrDeadlineExceeded}
+		}
+		return next(ctx, cmd)
+	}
+}
+
+func (*dieOnTheWay) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+
+// cutBeforeItLeaves keeps the first read back from being sent until the window is over,
+// and fails it the way go-redis does a command whose context ran out first.
+type cutBeforeItLeaves struct{ cut atomic.Int64 }
+
+func (*cutBeforeItLeaves) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (h *cutBeforeItLeaves) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if (cmd.Name() == "evalsha" || cmd.Name() == "eval") && h.cut.CompareAndSwap(0, 1) {
+			<-ctx.Done()
+			return ctx.Err()
+		}
+		return next(ctx, cmd)
+	}
+}
+
+func (*cutBeforeItLeaves) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+
+// cutTheReadBack lets the first read back after a `>` reach Redis, then keeps its answer
+// until the window is over and fails it the way the socket's deadline does: what a
+// loaded machine does to a pass without anything in the proxy's hands.
+type cutTheReadBack struct {
+	reads atomic.Int64
+	cut   atomic.Int64
+}
+
+func (*cutTheReadBack) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (h *cutTheReadBack) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if cmd.Name() == "xreadgroup" {
+			h.reads.Add(1)
+		}
+		err := next(ctx, cmd)
+		if h.reads.Load() > 0 && (cmd.Name() == "evalsha" || cmd.Name() == "eval") && h.cut.CompareAndSwap(0, 1) {
+			<-ctx.Done()
+			return &net.OpError{Op: "read", Net: "tcp", Err: os.ErrDeadlineExceeded}
+		}
+		return err
+	}
+}
+
+func (*cutTheReadBack) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+
+// A loaded machine starved six windows in a row in the verifier's runs (#334), and the
+// helper waits that out rather than failing the test on it.
+func TestAReadWaitsOutARunOfStarvedWindows(t *testing.T) {
+	t.Parallel()
+
+	cutBackends(t, func(t *testing.T, f cutFleet) {
+		streams := f.fleet.streams(t, "inst-a")
+		if _, err := read(t, streams, "s1"); err != nil {
+			t.Fatalf("priming read: %v", err)
+		}
+		writeCommand(t, f.fleet, f.client.Keys().Commands("s1"), command("after-six", "s1", ""))
+		starve := &starveWindows{}
+		starve.left.Store(6)
+		f.rdb.AddHook(starve)
+
+		delivered, err := read(t, streams, "s1")
+		if left := starve.left.Load(); left > 0 {
+			t.Fatalf("%d windows were left to starve, want all six spent", left)
+		}
+		if err != nil || !slices.Equal(ids(delivered), []string{"after-six"}) {
+			t.Fatalf("handed out %v (err=%v) after six starved windows, want the command", ids(delivered), err)
+		}
+	})
+}
+
+// starveWindows keeps the first command of each of the next few passes from going out
+// until its window is over, and fails it the way go-redis does. Only a pass's commands:
+// the test's own, and the fleet's cleanup, have no window to wait out.
+type starveWindows struct{ left atomic.Int64 }
+
+func (*starveWindows) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (h *starveWindows) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if _, inPass := ctx.Value(passKey{}).(*passSent); inPass && h.left.Add(-1) >= 0 {
+			<-ctx.Done()
+			return ctx.Err()
+		}
+		return next(ctx, cmd)
+	}
+}
+
+func (*starveWindows) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
 }
 
 // failures is a test that keeps what it was told to fail with, so that a helper's own
@@ -389,13 +941,32 @@ func (f cutFleet) loseTheAnswer(t *testing.T, how string, streams *redisstream.S
 	default:
 		t.Fatalf("no way to lose an answer called %q", how)
 	}
-	delivered, err := read(t, streams, sids...)
+	// Waited for, not looked at: a read the machine cut before its answer was back has its
+	// answer reach the proxy after it gave up, and that answer is lost all the same (#334).
+	// And tried again when nothing comes in all that time: the command then died on the way,
+	// in a connection go-redis closed before Redis read it, and there is no answer to lose.
+	var delivered []transport.Delivery
+	var err error
+	for attempt := 1; ; attempt++ {
+		delivered, err = read(t, streams, sids...)
+		select {
+		case <-caught:
+		case <-time.After(5 * time.Second):
+			if attempt < stimulusAttempts && errors.Is(err, transport.ErrWindowSpent) {
+				continue
+			}
+			close(release)
+			t.Fatalf("the proxy never saw an answer carrying %s in %d reads (read err=%v)", marker, attempt, err)
+		}
+		break
+	}
 	close(release)
-
-	select {
-	case <-caught:
-	default:
-		t.Fatalf("the proxy never saw an answer carrying %s (read err=%v)", marker, err)
+	// And let through before the next read looks at the proxy, or that read would find the
+	// answer still held and take a cut of its own for the test's doing.
+	settled, stop := context.WithTimeout(context.Background(), 5*time.Second)
+	defer stop()
+	if err := f.proxy.AwaitNothingHeld(settled); err != nil {
+		t.Fatalf("the answer carrying %s was never let through: %v", marker, err)
 	}
 	if how == "held past the window" && len(delivered) != 0 {
 		t.Fatalf("the read whose answer was held past its window handed out %v (err=%v)", ids(delivered), err)
@@ -407,6 +978,9 @@ func (f cutFleet) loseTheAnswer(t *testing.T, how string, streams *redisstream.S
 	}
 	return delivered
 }
+
+// stimulusAttempts bounds how many reads loseTheAnswer sends for an answer to lose.
+const stimulusAttempts = 3
 
 // writeCommandAt is writeCommand at an entry id of the test's choosing.
 func writeCommandAt(t *testing.T, f fleet, stream, id string, cmd *protocol.Command) {
@@ -920,6 +1494,14 @@ func TestAReadRacingAClaimHandsOutNothingTheClaimDoes(t *testing.T) {
 // been round the pending list as one that just arrived, and a full session queue refuses and
 // retires such a command on the strength of a caller who may have stopped listening. The same
 // holds for what was kept apart before, by a claim that handed it out and had it given back.
+// slowResend is how long a loaded machine took to send a claim again on a fresh connection
+// after the first one's answer was dropped, and patientDelay a claim delay that outlasts it
+// with room to spare.
+const (
+	slowResend   = 3 * cutWindow / 2
+	patientDelay = 5 * cutWindow
+)
+
 func TestWhatAClaimMovedHereWithoutHearingItStaysAClaims(t *testing.T) {
 	cutBackends(t, func(t *testing.T, f cutFleet) {
 		const claimDelay = cutWindow / 2
@@ -932,8 +1514,13 @@ func TestWhatAClaimMovedHereWithoutHearingItStaysAClaims(t *testing.T) {
 			}
 		}
 		stream := f.client.Keys().Commands("s1")
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
+		// Each step gets a budget of its own: shared, the claim delays of the earlier
+		// subtests spent most of it, and a loaded machine the rest (#334).
+		within := func(t *testing.T) context.Context {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			t.Cleanup(cancel)
+			return ctx
+		}
 		abandon := func(t *testing.T, commandID string) {
 			t.Helper()
 			writeCommand(t, f.fleet, stream, command(commandID, "s1", ""))
@@ -941,17 +1528,17 @@ func TestWhatAClaimMovedHereWithoutHearingItStaysAClaims(t *testing.T) {
 				t.Fatalf("the peer read %v (err=%v), want the command", ids(taken), err)
 			}
 		}
-		stillAClaims := func(t *testing.T, commandID string, claim func(context.Context) ([]transport.Delivery, error)) {
+		stillAClaims := func(t *testing.T, commandID string, reader *redisstream.Streams, claim func(context.Context) ([]transport.Delivery, error), delay time.Duration) {
 			t.Helper()
 			if holder := f.pendingUnder(t, commandID, "s1"); holder != "inst-a" {
 				t.Fatalf("%s is pending under %q after the claim, want inst-a", commandID, holder)
 			}
-			if delivered, err := read(t, adopter, "s1"); err != nil || len(delivered) != 0 {
+			if delivered, err := read(t, reader, "s1"); err != nil || len(delivered) != 0 {
 				t.Fatalf("the next read handed out %v (err=%v), want nothing: it is a claim's", ids(delivered), err)
 			}
 			// The age is the subject: the claim that reset it needs the delay to pass again.
-			time.Sleep(claimDelay + claimDelay/2)
-			again, err := claim(ctx)
+			time.Sleep(delay + delay/2)
+			again, err := claim(within(t))
 			if err != nil || !slices.Equal(ids(again), []string{commandID}) || !again[0].Redelivered {
 				t.Fatalf("the next claim took %v (err=%v), want %s as a redelivery", ids(again), err, commandID)
 			}
@@ -960,15 +1547,12 @@ func TestWhatAClaimMovedHereWithoutHearingItStaysAClaims(t *testing.T) {
 		claimSessions := func(ctx context.Context) ([]transport.Delivery, error) {
 			return adopter.ClaimSessions(ctx, []string{"s1"})
 		}
-		reclaim := func(ctx context.Context) ([]transport.Delivery, error) {
-			return adopter.Claim(ctx, []string{"s1"})
-		}
 
 		t.Run("its answer held past the window", func(t *testing.T) {
 			abandon(t, "held-claim")
 			release := make(chan struct{})
 			caught := f.proxy.Hold("held-claim", release)
-			window, stop := context.WithTimeout(ctx, cutWindow)
+			window, stop := context.WithTimeout(within(t), cutWindow)
 			claimed, err := claimSessions(window)
 			stop()
 			close(release)
@@ -980,7 +1564,7 @@ func TestWhatAClaimMovedHereWithoutHearingItStaysAClaims(t *testing.T) {
 			if err == nil || len(claimed) != 0 {
 				t.Fatalf("the claim whose answer was lost handed out %v (err=%v)", ids(claimed), err)
 			}
-			stillAClaims(t, "held-claim", claimSessions)
+			stillAClaims(t, "held-claim", adopter, claimSessions, claimDelay)
 		})
 
 		t.Run("its answer dropped with the connection", func(t *testing.T) {
@@ -989,10 +1573,32 @@ func TestWhatAClaimMovedHereWithoutHearingItStaysAClaims(t *testing.T) {
 			if f.fake {
 				t.Skip("miniredis's XCLAIM never checks the min idle time, so the claim sent again takes the command a second time")
 			}
+			// On a loaded machine the dial and the resend take a while (#334). The client
+			// here waits that long on purpose before it sends again, and the claim delay is
+			// long enough that the resend still finds the command too young.
+			options := *f.through.Options()
+			options.MinRetryBackoff, options.MaxRetryBackoff = slowResend, slowResend
+			rdb := redis.NewClient(&options)
+			rdb.AddHook(throughProxy(f.proxy))
+			t.Cleanup(func() { _ = rdb.Close() })
+			slow, err := redisstream.New(redisx.Wrap(rdb, f.client.Keys().Prefix(), shards),
+				redisstream.Options{Instance: "inst-a", Block: 50 * time.Millisecond, ClaimMinIdle: patientDelay})
+			if err != nil {
+				t.Fatalf("redisstream.New: %v", err)
+			}
+			reclaim := func(ctx context.Context) ([]transport.Delivery, error) {
+				return slow.Claim(ctx, []string{"s1"})
+			}
+			// Primed first: a transport's first look at a stream asks for its last entry,
+			// which carries the marker, and the trap would spring on that instead.
+			if _, err := read(t, slow, "s1"); err != nil {
+				t.Fatalf("priming read: %v", err)
+			}
+
 			abandon(t, "dropped-claim")
-			time.Sleep(claimDelay + claimDelay/2)
+			time.Sleep(patientDelay + patientDelay/2)
 			caught := f.proxy.Drop("dropped-claim")
-			claimed, err := reclaim(ctx)
+			claimed, err := reclaim(within(t))
 			select {
 			case <-caught:
 			default:
@@ -1001,19 +1607,19 @@ func TestWhatAClaimMovedHereWithoutHearingItStaysAClaims(t *testing.T) {
 			if len(claimed) != 0 {
 				t.Fatalf("the claim whose answer was dropped handed out %v (err=%v)", ids(claimed), err)
 			}
-			stillAClaims(t, "dropped-claim", reclaim)
+			stillAClaims(t, "dropped-claim", slow, reclaim, patientDelay)
 		})
 
 		t.Run("a command already claimed and given back", func(t *testing.T) {
 			abandon(t, "given-back")
-			claimed, err := claimSessions(ctx)
+			claimed, err := claimSessions(within(t))
 			if err != nil || !slices.Equal(ids(claimed), []string{"given-back"}) {
 				t.Fatalf("claimed %v (err=%v), want the peer's command", ids(claimed), err)
 			}
 			claimed[0].Release()
 			release := make(chan struct{})
 			caught := f.proxy.Hold("given-back", release)
-			window, stop := context.WithTimeout(ctx, cutWindow)
+			window, stop := context.WithTimeout(within(t), cutWindow)
 			lost, err := claimSessions(window)
 			stop()
 			close(release)
@@ -1022,7 +1628,7 @@ func TestWhatAClaimMovedHereWithoutHearingItStaysAClaims(t *testing.T) {
 			default:
 				t.Fatalf("the claim's answer was never held (claimed %v, err=%v)", ids(lost), err)
 			}
-			stillAClaims(t, "given-back", claimSessions)
+			stillAClaims(t, "given-back", adopter, claimSessions, claimDelay)
 		})
 	})
 }
@@ -1238,9 +1844,14 @@ func TestACommandTrimmedAfterItsReadAnsweredIsStillHandedOut(t *testing.T) {
 // still waiting. One that sat unseen past the claim delay is what a claim would have handed
 // out as a redelivery, and it is one: its sender may have given up, and a full session queue
 // must leave it pending rather than refuse it on the strength of a caller still listening.
+// lateRecovery is how long after losing an answer a loaded machine got to the read that
+// recovered it.
+const lateRecovery = 5 * cutWindow / 2
+
 func TestACommandRecoveredPastTheClaimDelayIsARedelivery(t *testing.T) {
 	cutBackends(t, func(t *testing.T, f cutFleet) {
-		const claimDelay = 2 * cutWindow
+		// Well past a late recovery, so that promptly and past the delay stay apart.
+		const claimDelay = 4 * lateRecovery
 
 		streams := f.streamsWith(t, &redisstream.Options{Instance: "inst-a", Block: 50 * time.Millisecond, ClaimMinIdle: claimDelay})
 		stream := f.client.Keys().Commands("s1")
@@ -1250,6 +1861,9 @@ func TestACommandRecoveredPastTheClaimDelayIsARedelivery(t *testing.T) {
 
 		writeCommand(t, f.fleet, stream, command("prompt", "s1", ""))
 		f.loseTheAnswer(t, "held past the window", streams, "inst-a", "prompt", "s1")
+		// Promptly is still not at once: a loaded machine took this long to get to the next
+		// read (#334).
+		time.Sleep(lateRecovery)
 		delivered, err := read(t, streams, "s1")
 		if err != nil || !slices.Equal(ids(delivered), []string{"prompt"}) || delivered[0].Redelivered {
 			t.Fatalf("handed out %v (err=%v), want the command recovered promptly as a first delivery", ids(delivered), err)

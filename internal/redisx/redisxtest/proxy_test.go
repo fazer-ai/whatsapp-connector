@@ -136,3 +136,90 @@ func TestAMarkerAlreadyRelayedDoesNotSpringATrapArmedAfterIt(t *testing.T) {
 		t.Fatalf("the next answer carrying the marker went through uncaught; the client read %q", rest)
 	}
 }
+
+// A test that reads Caught, Armed and Holding on both sides of a read learns whether the
+// proxy stepped in during it, which is what tells a window the test spent on purpose from
+// one the machine spent (#334). So a trap is armed until its answer arrives, the answer
+// is held from then until it is let through, and it counts as caught once it arrives.
+func TestTheProxyReportsATrapFromArmingItUntilItsAnswerIsLetThrough(t *testing.T) {
+	const answer = "answer carrying held-marker\n"
+
+	var config net.ListenConfig
+	listener, err := config.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		_, _ = conn.Write([]byte(answer))
+		_, _ = io.Copy(io.Discard, conn)
+	}()
+
+	proxy := redisxtest.Listen(t, listener.Addr().String())
+	if (proxy.State() != redisxtest.State{}) {
+		t.Fatalf("a proxy nobody armed is armed=%v holding=%v with %d caught, want none of it",
+			proxy.State().Armed, proxy.State().Holding, proxy.State().Caught)
+	}
+	release := make(chan struct{})
+	caught := proxy.Hold("held-marker", release)
+	if (proxy.State() != redisxtest.State{Armed: true}) {
+		t.Fatalf("a proxy with a trap armed and nothing caught is armed=%v holding=%v", proxy.State().Armed, proxy.State().Holding)
+	}
+
+	var dialer net.Dialer
+	conn, err := dialer.DialContext(context.Background(), "tcp", proxy.Addr())
+	if err != nil {
+		t.Fatalf("dial the proxy: %v", err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	select {
+	case <-caught:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("the answer was never caught")
+	}
+	if (proxy.State() != redisxtest.State{Caught: 1, Holding: true}) {
+		t.Fatalf("a proxy holding the answer its trap caught is armed=%v holding=%v with %d caught, want holding with one",
+			proxy.State().Armed, proxy.State().Holding, proxy.State().Caught)
+	}
+
+	// Waiting for nothing to be held does not return while the answer is held, however it
+	// is asked to stop.
+	gaveUp, giveUp := context.WithCancel(context.Background())
+	giveUp()
+	if err := proxy.AwaitNothingHeld(gaveUp); err == nil {
+		t.Fatalf("waiting for nothing held returned without an error with the answer still held")
+	}
+	// Waiting for nothing to be held waits for the release, and no longer than that.
+	waited := make(chan error, 1)
+	go func() { waited <- proxy.AwaitNothingHeld(context.Background()) }()
+	select {
+	case err := <-waited:
+		t.Fatalf("waiting for nothing held returned (err=%v) with the answer still held", err)
+	default:
+	}
+	close(release)
+	if err := <-waited; err != nil {
+		t.Fatalf("waiting for nothing held: %v", err)
+	}
+	if proxy.State().Holding {
+		t.Fatalf("the proxy still holds an answer after waiting for nothing held")
+	}
+	got := make([]byte, len(answer))
+	if _, err := io.ReadFull(conn, got); err != nil {
+		t.Fatalf("the released answer never arrived: %v", err)
+	}
+	// The client has the answer, so the relay is past letting it through.
+	if (proxy.State() != redisxtest.State{Caught: 1}) {
+		t.Fatalf("a proxy that let its answer through is armed=%v holding=%v with %d caught, want only the one caught",
+			proxy.State().Armed, proxy.State().Holding, proxy.State().Caught)
+	}
+	_ = conn.Close()
+	<-served
+}
