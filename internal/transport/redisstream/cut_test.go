@@ -477,6 +477,63 @@ func (*cutTheGroupCreation) ProcessPipelineHook(next redis.ProcessPipelineHook) 
 	return next
 }
 
+// Under load a read can give up before its own answer is back, and the answer reaches the
+// proxy after it: the verifier saw "the proxy never saw an answer carrying starved-wake"
+// with the read cut by the window (#334). The answer was still lost, and the command is
+// pending under the reader all the same, which is everything loseTheAnswer is there to
+// bring about.
+func TestAnAnswerThatReachesTheProxyAfterTheReadGaveUpIsStillLost(t *testing.T) {
+	t.Parallel()
+
+	cutBackends(t, func(t *testing.T, f cutFleet) {
+		streams := f.streams(t, "inst-a")
+		if _, err := read(t, streams, "s1"); err != nil {
+			t.Fatalf("priming read: %v", err)
+		}
+		writeCommand(t, f.fleet, f.client.Keys().Commands("s1"), command("late-answer", "s1", ""))
+		late := &sendAfterTheWindow{sent: make(chan struct{})}
+		f.through.AddHook(late)
+
+		f.loseTheAnswer(t, "held past the window", streams, "inst-a", "late-answer", "s1")
+		<-late.sent
+	})
+}
+
+// sendAfterTheWindow holds the first XREADGROUP until its window is over, fails it the way
+// the socket's deadline does, and only then sends it, on its own: the answer reaches the
+// proxy after the read that asked for it has given up.
+type sendAfterTheWindow struct {
+	once sync.Once
+	sent chan struct{}
+}
+
+func (*sendAfterTheWindow) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (h *sendAfterTheWindow) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if cmd.Name() != "xreadgroup" {
+			return next(ctx, cmd)
+		}
+		late := false
+		h.once.Do(func() { late = true })
+		if !late {
+			return next(ctx, cmd)
+		}
+		<-ctx.Done()
+		sent := context.WithoutCancel(ctx)
+		again := redis.NewCmd(sent, cmd.Args()...)
+		go func() {
+			defer close(h.sent)
+			_ = next(sent, again)
+		}()
+		return &net.OpError{Op: "read", Net: "tcp", Err: os.ErrDeadlineExceeded}
+	}
+}
+
+func (*sendAfterTheWindow) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+
 // cutTheReadBack lets the first read back after a `>` reach Redis, then keeps its answer
 // until the window is over and fails it the way the socket's deadline does: what a
 // loaded machine does to a pass without anything in the proxy's hands.
@@ -1512,6 +1569,10 @@ func TestACommandTrimmedAfterItsReadAnsweredIsStillHandedOut(t *testing.T) {
 // still waiting. One that sat unseen past the claim delay is what a claim would have handed
 // out as a redelivery, and it is one: its sender may have given up, and a full session queue
 // must leave it pending rather than refuse it on the strength of a caller still listening.
+// lateRecovery is how long after losing an answer a loaded machine got to the read that
+// recovered it.
+const lateRecovery = 5 * cutWindow / 2
+
 func TestACommandRecoveredPastTheClaimDelayIsARedelivery(t *testing.T) {
 	cutBackends(t, func(t *testing.T, f cutFleet) {
 		const claimDelay = 2 * cutWindow
@@ -1524,6 +1585,9 @@ func TestACommandRecoveredPastTheClaimDelayIsARedelivery(t *testing.T) {
 
 		writeCommand(t, f.fleet, stream, command("prompt", "s1", ""))
 		f.loseTheAnswer(t, "held past the window", streams, "inst-a", "prompt", "s1")
+		// Promptly is still not at once: a loaded machine took this long to get to the next
+		// read (#334).
+		time.Sleep(lateRecovery)
 		delivered, err := read(t, streams, "s1")
 		if err != nil || !slices.Equal(ids(delivered), []string{"prompt"}) || delivered[0].Redelivered {
 			t.Fatalf("handed out %v (err=%v), want the command recovered promptly as a first delivery", ids(delivered), err)
