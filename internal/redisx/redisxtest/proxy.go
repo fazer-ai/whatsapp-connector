@@ -29,8 +29,9 @@ type Proxy struct {
 	traps []*trap
 	open  map[net.Conn]struct{}
 
-	caught  uint64 // answers caught so far, held or dropped
-	holding int    // answers caught and not yet released
+	caught  uint64     // answers caught so far, held or dropped
+	holding int        // answers caught and not yet released
+	settled *sync.Cond // broadcast when holding falls to zero
 }
 
 // trap is one answer a test asked to catch. The first answer from the server containing
@@ -51,6 +52,7 @@ func Listen(t testing.TB, target string) *Proxy {
 		t.Fatalf("redisxtest: listen: %v", err)
 	}
 	proxy := &Proxy{addr: listener.Addr().String(), done: make(chan struct{}), open: make(map[net.Conn]struct{})}
+	proxy.settled = sync.NewCond(&proxy.mu)
 
 	// Every connection is closed from here rather than left to whoever holds its other end:
 	// the server usually outlives the proxy in a test's cleanup order, and a relay blocked
@@ -110,6 +112,27 @@ func (p *Proxy) Holding() bool {
 	return p.holding > 0
 }
 
+// AwaitNothingHeld returns once no caught answer is held any longer, or with ctx's error.
+// Closing a release only lets the relay go on when it next runs; a test that reads Holding
+// right after, as the first command of its next read does, has to wait for that first.
+func (p *Proxy) AwaitNothingHeld(ctx context.Context) error {
+	stop := context.AfterFunc(ctx, func() {
+		p.mu.Lock()
+		p.settled.Broadcast()
+		p.mu.Unlock()
+	})
+	defer stop()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for p.holding > 0 {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		p.settled.Wait()
+	}
+	return nil
+}
+
 // Hold keeps the next answer containing marker from reaching the client until release is
 // closed. Everything behind it on that connection waits too, so what the client reads
 // stays in the order the server wrote it. The returned channel closes when the answer is
@@ -140,6 +163,9 @@ func (p *Proxy) arm(marker string, release <-chan struct{}) <-chan struct{} {
 func (p *Proxy) released() {
 	p.mu.Lock()
 	p.holding--
+	if p.holding == 0 {
+		p.settled.Broadcast()
+	}
 	p.mu.Unlock()
 }
 

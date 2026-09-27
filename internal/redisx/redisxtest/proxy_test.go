@@ -189,7 +189,21 @@ func TestTheProxyReportsATrapFromArmingItUntilItsAnswerIsLetThrough(t *testing.T
 			proxy.Armed(), proxy.Holding(), proxy.Caught())
 	}
 
+	// Waiting for nothing to be held waits for the release, and no longer than that.
+	waited := make(chan error, 1)
+	go func() { waited <- proxy.AwaitNothingHeld(context.Background()) }()
+	select {
+	case err := <-waited:
+		t.Fatalf("waiting for nothing held returned (err=%v) with the answer still held", err)
+	default:
+	}
 	close(release)
+	if err := <-waited; err != nil {
+		t.Fatalf("waiting for nothing held: %v", err)
+	}
+	if proxy.Holding() {
+		t.Fatalf("the proxy still holds an answer after waiting for nothing held")
+	}
 	got := make([]byte, len(answer))
 	if _, err := io.ReadFull(conn, got); err != nil {
 		t.Fatalf("the released answer never arrived: %v", err)

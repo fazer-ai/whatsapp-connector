@@ -841,6 +841,13 @@ func (f cutFleet) loseTheAnswer(t *testing.T, how string, streams *redisstream.S
 	case <-time.After(5 * time.Second):
 		t.Fatalf("the proxy never saw an answer carrying %s (read err=%v)", marker, err)
 	}
+	// And let through before the next read looks at the proxy, or that read would find the
+	// answer still held and take a cut of its own for the test's doing.
+	settled, stop := context.WithTimeout(context.Background(), 5*time.Second)
+	defer stop()
+	if err := f.proxy.AwaitNothingHeld(settled); err != nil {
+		t.Fatalf("the answer carrying %s was never let through: %v", marker, err)
+	}
 	if how == "held past the window" && len(delivered) != 0 {
 		t.Fatalf("the read whose answer was held past its window handed out %v (err=%v)", ids(delivered), err)
 	}
