@@ -592,7 +592,7 @@ func TestAnAnswerCannotBeOvertakenByTheFailureBeforeIt(t *testing.T) {
 		mu.Unlock()
 	}
 	attempt := &proxyAttempt{}
-	attempt.dialledProxy(report)
+	attempt.dialling(report)
 
 	failed := make(chan struct{})
 	go func() {
@@ -618,5 +618,39 @@ func TestAnAnswerCannotBeOvertakenByTheFailureBeforeIt(t *testing.T) {
 	defer mu.Unlock()
 	if len(order) != 2 || order[0] || !order[1] {
 		t.Fatalf("the outcomes were reported as %v", order)
+	}
+}
+
+// A request whose deadline ran out with the connection to the proxy still not open is the
+// proxy's failure too: the transport goes on with that dial after the request has given up,
+// and if it then fails past the connection -- a TLS handshake with an HTTPS proxy, a proxy
+// that hangs up -- nothing else reports it.
+func TestARequestThatFailsWhileTheProxyDialIsPendingNamesIt(t *testing.T) {
+	t.Parallel()
+
+	var outcomes []bool
+	attempt := &proxyAttempt{}
+	attempt.dialling(func(reached bool) { outcomes = append(outcomes, reached) })
+
+	attempt.unanswered()
+	if len(outcomes) != 1 || outcomes[0] {
+		t.Fatalf("a request that failed with the proxy dial pending reported %v", outcomes)
+	}
+}
+
+// A dial that fails settles the attempt, so the request failing after it does not report
+// the same failure a second time.
+func TestADialFailureIsReportedOnce(t *testing.T) {
+	t.Parallel()
+
+	var outcomes []bool
+	route := newEgressRoute()
+	route.notify = func(_, _ uint64, reached bool) { outcomes = append(outcomes, reached) }
+	if err := route.set("http://" + deadProxy(t)); err != nil {
+		t.Fatalf("route.set: %v", err)
+	}
+	_ = reach(t, &http.Client{Transport: &route.websocket})
+	if len(outcomes) != 1 || outcomes[0] {
+		t.Fatalf("a refused dial reported %v", outcomes)
 	}
 }

@@ -175,7 +175,6 @@ func abandoned(ctx context.Context) bool {
 type proxyAttempt struct {
 	mu      sync.Mutex
 	report  func(reached bool)
-	dialled bool
 	settled bool
 }
 
@@ -188,9 +187,13 @@ func attemptOf(ctx context.Context) *proxyAttempt {
 	return attempt
 }
 
-func (a *proxyAttempt) dialledProxy(report func(reached bool)) {
+// dialling is a dial to the proxy starting. From here on, a request that fails without the
+// proxy having answered is the proxy's failure, including one whose deadline ran out with
+// the connection to the proxy still not open: the transport carries on with that dial
+// after the request has given up, and nothing would report how it ended.
+func (a *proxyAttempt) dialling(report func(reached bool)) {
 	a.mu.Lock()
-	a.dialled, a.report = true, report
+	a.report = report
 	a.mu.Unlock()
 }
 
@@ -204,12 +207,13 @@ func (a *proxyAttempt) answered(report func(reached bool), reached bool) {
 	report(reached)
 }
 
-// unanswered is the request failed: a proxy that was reached and never answered the
-// CONNECT is reported as failed there, unless its answer got in first.
+// unanswered is the request failed: a proxy that was dialled and never answered -- the
+// connection never opened, or the CONNECT went unanswered -- is reported as failed there,
+// unless its answer, or the dial's own failure, got in first.
 func (a *proxyAttempt) unanswered() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.dialled && !a.settled && a.report != nil {
+	if !a.settled && a.report != nil {
 		a.settled = true
 		a.report(false)
 	}
@@ -272,13 +276,16 @@ func egressTransportWithin(proxyURL string, handshake time.Duration, report func
 			// With a proxy set, every dial this transport makes is to the proxy.
 			dial := transport.DialContext
 			transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+				attempt := attemptOf(ctx)
+				if attempt != nil {
+					attempt.dialling(report)
+				}
 				conn, err := dial(ctx, network, address)
-				switch {
-				case err != nil && !abandoned(ctx):
-					report(false)
-				case err == nil:
-					if attempt := attemptOf(ctx); attempt != nil {
-						attempt.dialledProxy(report)
+				if err != nil && !abandoned(ctx) {
+					if attempt != nil {
+						attempt.answered(report, false)
+					} else {
+						report(false)
 					}
 				}
 				return conn, err
