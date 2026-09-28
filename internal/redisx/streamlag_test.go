@@ -4,10 +4,8 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"strconv"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -185,7 +183,7 @@ func TestTheLagOfARealServerIsReportedOnlyWhereItHasOne(t *testing.T) {
 	if url == "" {
 		t.Skip("set WAC_TEST_REDIS_URL to run this against a real Redis (see 'make test-redis')")
 	}
-	client, err := redisx.New(redisx.Config{URL: url, Prefix: "wactest:" + t.Name() + ":" + strconv.FormatInt(time.Now().UnixNano(), 36), Shards: 1})
+	client, err := redisx.New(redisx.Config{URL: url, Prefix: redisxtest.Prefix(t), Shards: 1})
 	if err != nil {
 		t.Fatalf("redisx.New: %v", err)
 	}

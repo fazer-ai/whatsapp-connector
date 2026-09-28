@@ -3,13 +3,13 @@ package app
 import (
 	"context"
 	"os"
-	"strconv"
 	"testing"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/redisx"
+	"github.com/fazer-ai/whatsapp-connector/internal/redisx/redisxtest"
 )
 
 // The resume sweep against the server `make test-redis` names, which CI points at the
@@ -101,7 +101,7 @@ func realRedis(t *testing.T, url string) *redis.Client {
 // another is still reading.
 func rdbPrefix(t *testing.T, rdb *redis.Client) string {
 	t.Helper()
-	prefix := "wactest:" + t.Name() + ":" + strconv.FormatInt(time.Now().UnixNano(), 36) + ":"
+	prefix := redisxtest.Prefix(t)
 	t.Cleanup(func() {
 		keys, err := rdb.Keys(context.Background(), prefix+"*").Result()
 		if err == nil && len(keys) > 0 {

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"os"
-	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -15,6 +14,7 @@ import (
 
 	"github.com/fazer-ai/whatsapp-connector/internal/cluster"
 	"github.com/fazer-ai/whatsapp-connector/internal/redisx"
+	"github.com/fazer-ai/whatsapp-connector/internal/redisx/redisxtest"
 )
 
 // owedServers is the Redis a test runs the owed-wake scripts against: miniredis always, and
@@ -43,7 +43,7 @@ func owedServers(t *testing.T) map[string]*redis.Client {
 // owedPrefix is a key prefix of this test's own, deleted when it ends.
 func owedPrefix(t *testing.T, rdb *redis.Client) string {
 	t.Helper()
-	prefix := "wactest:" + t.Name() + ":" + strconv.FormatInt(time.Now().UnixNano(), 36) + ":"
+	prefix := redisxtest.Prefix(t)
 	t.Cleanup(func() {
 		keys, err := rdb.Keys(context.Background(), prefix+"*").Result()
 		if err == nil && len(keys) > 0 {

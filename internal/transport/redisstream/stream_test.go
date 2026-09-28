@@ -20,6 +20,7 @@ import (
 
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 	"github.com/fazer-ai/whatsapp-connector/internal/redisx"
+	"github.com/fazer-ai/whatsapp-connector/internal/redisx/redisxtest"
 	"github.com/fazer-ai/whatsapp-connector/internal/transport"
 	"github.com/fazer-ai/whatsapp-connector/internal/transport/redisstream"
 )
@@ -1275,9 +1276,10 @@ func realFleet(t *testing.T) fleet {
 	rdb := redis.NewClient(opts)
 	rdb.AddHook(passReads{})
 	t.Cleanup(func() { _ = rdb.Close() })
-	// The test's name as well as the clock: the clock only resolves microseconds here, and
-	// two parallel tests that started in the same one shared their streams (#334).
-	prefix := "wactest:" + t.Name() + ":" + strconv.FormatInt(time.Now().UnixNano(), 36) + ":"
+	// Not the clock: it only resolves microseconds here, and two parallel tests that started
+	// in the same one shared their streams (#334), as did two processes running the same
+	// test (#345).
+	prefix := redisxtest.Prefix(t)
 	t.Cleanup(func() {
 		keys, err := rdb.Keys(context.Background(), prefix+"*").Result()
 		if err == nil && len(keys) > 0 {

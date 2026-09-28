@@ -3,13 +3,13 @@ package cluster
 import (
 	"context"
 	"os"
-	"strconv"
 	"testing"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/redisx"
+	"github.com/fazer-ai/whatsapp-connector/internal/redisx/redisxtest"
 )
 
 // A strike that ran twice for one attempt counts once, and this is the seam that decides it.
@@ -38,7 +38,7 @@ func TestOneAttemptRunTwiceIsOneStrike(t *testing.T) {
 	}
 	rdb := redis.NewClient(opts)
 	t.Cleanup(func() { _ = rdb.Close() })
-	prefix := "wactest:" + t.Name() + ":" + strconv.FormatInt(time.Now().UnixNano(), 36) + ":"
+	prefix := redisxtest.Prefix(t)
 	t.Cleanup(func() {
 		keys, err := rdb.Keys(context.Background(), prefix+"*").Result()
 		if err == nil && len(keys) > 0 {
