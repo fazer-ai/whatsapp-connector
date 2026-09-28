@@ -43,24 +43,10 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
 
+    # No PostgreSQL here: it is started by a step below, through the Makefile, because a
+    # service takes no command and the server has to be given the flags that make the pass
+    # affordable (#342).
     services:
-      # The store speaks two dialects and a deployment runs this one. A statement that
-      # is valid in SQLite and not here compiles, lints and passes the SQLite pass, so
-      # without a server in CI the first execution is in production.
-      postgres:
-        image: postgres:18-alpine
-        env:
-          POSTGRES_USER: wac
-          POSTGRES_PASSWORD: wac
-          POSTGRES_DB: wac
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U wac"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-
       # miniredis stands in for Redis everywhere else and cannot stand in here, for two
       # reasons that fail the same way. It answers zero for `entries-added` and
       # `entries-read`, the two counters that say whether a MAXLEN trim took commands the
@@ -110,9 +96,16 @@ jobs:
       #
       # Without -race: this pass is about what the server accepts, and the race
       # detector has already had its say on the same code a step earlier.
+      # The store speaks two dialects and a deployment runs this one. A statement that is
+      # valid in SQLite and not here compiles, lints and passes the SQLite pass, so without
+      # a server in CI the first execution is in production. The same server a developer
+      # starts from the line `make test-postgres` prints, and it returns once it answers.
+      - name: Start the PostgreSQL the tests run against
+        run: make test-postgres-server
+
       - name: Run tests against PostgreSQL
         env:
-          WAC_TEST_DATABASE_URL: postgres://wac:wac@localhost:5432/wac?sslmode=disable
+          WAC_TEST_DATABASE_URL: postgres://wac:wac@localhost:55432/wac?sslmode=disable
           # Both servers, the way `make check` runs this pass locally: a test that needs
           # the two together, the fleet bench's own, skips in every pass that names one.
           WAC_TEST_REDIS_URL: redis://localhost:6379/14

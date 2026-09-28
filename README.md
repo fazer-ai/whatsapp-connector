@@ -206,8 +206,10 @@ make setup          # git hooks + module download
 make check-offline  # lint, go mod tidy, and the suite against SQLite
 
 # Everything CI enforces, which needs a server for each of the two dialect passes.
-# Any free port will do; these avoid whatever is already on 5432 and 6379.
-docker run -d --rm -p 55432:5432 -e POSTGRES_USER=wac -e POSTGRES_PASSWORD=wac -e POSTGRES_DB=wac postgres:18-alpine
+# Any free port will do; these avoid whatever is already on 5432 and 6379. The PostgreSQL
+# is the one CI starts, without durability: every test creates and drops a database, and a
+# durable server spends the pass on that (#342).
+make test-postgres-server
 docker run -d --rm -p 56379:6379 redis:8-alpine
 WAC_TEST_DATABASE_URL=postgres://wac:wac@localhost:55432/wac?sslmode=disable \
 WAC_TEST_REDIS_URL=redis://localhost:56379/0 make check
