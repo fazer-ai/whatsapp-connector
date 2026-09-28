@@ -95,8 +95,33 @@ func (f cutFleet) streams(t *testing.T, instance string) *redisstream.Streams {
 	return f.streamsReading(t, instance, 0)
 }
 
-// streamsWith is the transport under test with options of the test's own.
+// streamsWith is the transport under test with options of the test's own, up for an hour
+// already.
+//
+// A read back leaves to a claim whatever has been pending here longer than the process has
+// been up, as a predecessor's, and measures the uptime as the page leaves: an entry handed to
+// a process a few milliseconds after it started looks older than the process as soon as the
+// trip to Redis takes longer than those milliseconds. That errs to the safe side on purpose,
+// and in production it only shows in the moments after a restart. A test starts its transport
+// a few milliseconds before it loses an answer, though, and on a loaded host that was enough
+// to leave the recovered entry to a claim the test never waited for (#341). What these tests
+// are about is the recovery, not the restart, so the transport starts well before them; the
+// one about a restart asks for streamsStartedNow.
 func (f cutFleet) streamsWith(t *testing.T, opts *redisstream.Options) *redisstream.Streams {
+	t.Helper()
+	streams := f.streamsStartedNow(t, opts)
+	redisstream.Backdate(streams, testUptime)
+	return streams
+}
+
+// testUptime is how long the transport of a cut test has been up when the test begins. Far
+// past anything a test can leave pending, so no entry of its own reads as a predecessor's.
+const testUptime = time.Hour
+
+// streamsStartedNow is the transport under test counting its uptime from now, for the test
+// about a process that has just restarted: what its predecessor left pending is older than it
+// by exactly the time since the restart, and that difference is what the test is about.
+func (f cutFleet) streamsStartedNow(t *testing.T, opts *redisstream.Options) *redisstream.Streams {
 	t.Helper()
 	streams, err := redisstream.New(f.via, *opts)
 	if err != nil {
@@ -1907,7 +1932,7 @@ func TestWhatAPredecessorUnderTheSameNameLeftPendingIsLeftToAClaim(t *testing.T)
 		// The predecessor dies holding both. Idle times are whole milliseconds, so the restart
 		// is a few of them later.
 		time.Sleep(5 * time.Millisecond)
-		restarted := f.streamsWith(t, &redisstream.Options{Instance: "inst-x", Block: 50 * time.Millisecond, ClaimMinIdle: claimDelay})
+		restarted := f.streamsStartedNow(t, &redisstream.Options{Instance: "inst-x", Block: 50 * time.Millisecond, ClaimMinIdle: claimDelay})
 		if delivered, err := read(t, restarted, "s1"); err != nil || len(delivered) != 0 {
 			t.Fatalf("the restarted process handed out %v (err=%v), want what its predecessor held left to a claim", ids(delivered), err)
 		}
