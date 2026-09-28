@@ -80,9 +80,13 @@ func TestALostAnswerReadBackOnASlowTripIsStillHandedOut(t *testing.T) {
 		f.loseTheAnswer(t, "held past the window", streams, "inst-a", "lost-on-a-slow-trip", "s1")
 		slow.armed.Store(true)
 
+		// On a window of their own: against a real Redis a read that blocks for 50ms comes
+		// back after 140 or so, because the server looks at blocked clients' timeouts on its
+		// own tick, and that plus the delay is past the passes' usual 200ms. What the delay is
+		// here to reach is the trip against the uptime, which no window changes.
 		var after []transport.Delivery
 		for range 3 {
-			delivered, err := read(t, streams, "s1")
+			delivered, err := readWithin(t, time.Second, streams, "s1")
 			if err != nil {
 				t.Fatalf("read: %v", err)
 			}
