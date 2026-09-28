@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"os"
-	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -14,6 +13,7 @@ import (
 
 	"github.com/fazer-ai/whatsapp-connector/internal/cluster"
 	"github.com/fazer-ai/whatsapp-connector/internal/redisx"
+	"github.com/fazer-ai/whatsapp-connector/internal/redisx/redisxtest"
 )
 
 // RedisEnv names a real Redis for the passes miniredis cannot stand in for. A mark that
@@ -49,7 +49,7 @@ func realQuarantine(t *testing.T) (*cluster.Quarantine, *redis.Client, string) {
 	// would have the first to finish wipe the keys the second is still walking -- which is
 	// a strike that reads as an account with no history, in the middle of a curve. Measured
 	// the hard way: `make check` runs the suite three times and caught it once.
-	prefix := "wactest:" + t.Name() + ":" + strconv.FormatInt(time.Now().UnixNano(), 36) + ":"
+	prefix := redisxtest.Prefix(t)
 	t.Cleanup(func() {
 		keys, err := rdb.Keys(context.Background(), prefix+"*").Result()
 		if err == nil && len(keys) > 0 {
