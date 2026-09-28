@@ -141,6 +141,7 @@ func TestAPhoneThatNeverAnswersIsWorthAskingAgainRatherThanFinal(t *testing.T) {
 
 	session, phone, _ := reuploadSession(t, "3EB0QUIET")
 	phone.answersWith(nil)
+	slowDownloads(session)
 
 	deadline, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
 	defer cancel()
@@ -213,6 +214,25 @@ func reuploadSession(t *testing.T, messageID string) (*Session, *phoneAsked, str
 		return err
 	}
 	return session, phone, root
+}
+
+// loadedDelay is how long a loaded machine can take over a step these tests would
+// otherwise expect in an instant: a make check running beside a mutation battery took
+// seconds over this package's own (#258).
+const loadedDelay = 150 * time.Millisecond
+
+// slowDownloads has every download the session tries take loadedDelay longer, the way it
+// does on a machine that is busy with something else, and give up on the caller's deadline
+// the way whatsmeow's does.
+func slowDownloads(session *Session) {
+	download := session.download
+	session.download = func(ctx context.Context, client *wm.Client, part wm.DownloadableMessage, file media.File) error {
+		time.Sleep(loadedDelay)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return download(ctx, client, part, file)
+	}
 }
 
 // phoneAsked stands in for the sender's phone: it counts what it was asked and answers
@@ -318,6 +338,7 @@ func TestARowThatCannotAddressAReceiptIsNotAskedAbout(t *testing.T) {
 			session, phone, _ := reuploadSession(t, "3EB0NONAME")
 			phone.answersWith(nil)
 			forgetWhoSent(t, session, "3EB0NONAME", tc.forget)
+			slowDownloads(session)
 
 			deadline, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
 			defer cancel()

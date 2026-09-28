@@ -239,6 +239,9 @@ func TestAProbeIsNotSharedWithATeardownOnAnotherClient(t *testing.T) {
 		asked <- struct{}{}
 		return wm.ErrNotConnected
 	}
+	// The fresh client's own lock is not free at once either: on a loaded machine the probe
+	// that asks for it took longer to run than the caller's deadline here (#258).
+	time.AfterFunc(loadedDelay, holdTheDialOf(t, session.current()))
 
 	if err := answeredWithin(t, session.Logout); !errors.Is(err, wm.ErrNotConnected) {
 		t.Fatalf("the logout on the fresh client failed with %v, want the answer from the library", err)
