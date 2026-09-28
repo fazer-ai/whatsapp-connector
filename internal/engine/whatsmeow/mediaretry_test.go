@@ -143,8 +143,12 @@ func TestAPhoneThatNeverAnswersIsWorthAskingAgainRatherThanFinal(t *testing.T) {
 	phone.answersWith(nil)
 	slowDownloads(session)
 
-	deadline, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	// The caller gives up once the phone has been asked, which is the moment the wait under
+	// test begins: a fixed deadline short enough to keep this quick also ran out before the
+	// phone was reached, on a machine busy with something else (#258).
+	deadline, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
+	phone.onAsk = cancel
 	_, err := session.downloadMedia(deadline, &protocol.Command{
 		Type:    protocol.CommandMessageDownloadMedia,
 		Payload: []byte(`{"message_id":"3EB0QUIET"}`),
@@ -243,6 +247,7 @@ type phoneAsked struct {
 	calls       int
 	chat        string
 	participant string
+	onAsk       func() // run once the phone has been asked, when set
 }
 
 // reupload is what the phone will answer: either a notification it seals under the media
@@ -262,6 +267,9 @@ func (p *phoneAsked) addressed() (chat, participant string) { return p.chat, p.p
 
 func (p *phoneAsked) hand(_ context.Context, _ *wm.Client, info *waTypes.MessageInfo, key []byte) error {
 	p.calls++
+	if p.onAsk != nil {
+		defer p.onAsk()
+	}
 	p.chat = info.Chat.String()
 	// What SendMediaRetryReceipt would put on the `rmr` node, and the flag that decides
 	// whether it does.
@@ -340,7 +348,10 @@ func TestARowThatCannotAddressAReceiptIsNotAskedAbout(t *testing.T) {
 			forgetWhoSent(t, session, "3EB0NONAME", tc.forget)
 			slowDownloads(session)
 
-			deadline, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+			// Long enough for a busy machine to reach the answer, which needs no reply from
+			// anybody (#258). A session that asked the phone anyway waits all of it for an
+			// answer that never comes, and is still caught by the count below.
+			deadline, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 			defer cancel()
 			_, err := session.downloadMedia(deadline, &protocol.Command{
 				Type:    protocol.CommandMessageDownloadMedia,

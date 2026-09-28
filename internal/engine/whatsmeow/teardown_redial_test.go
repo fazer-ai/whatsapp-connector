@@ -94,15 +94,22 @@ func holdTheDialOf(t *testing.T, client *wm.Client) func() {
 // here lasts the whole test, or a bound of the session's own set far above this one.
 func answeredWithin(t *testing.T, tearDown func(context.Context) error) error {
 	t.Helper()
+	return answeredWithinDeadline(t, 100*time.Millisecond, tearDown)
+}
 
-	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+// answeredWithinDeadline is answeredWithin with a deadline of the caller's, for a teardown
+// whose answer is not the deadline and that a busy machine has to be given room to reach.
+func answeredWithinDeadline(t *testing.T, deadline time.Duration, tearDown func(context.Context) error) error {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(t.Context(), deadline)
 	defer cancel()
 	answered := make(chan error, 1)
 	go func() { answered <- tearDown(ctx) }()
 	select {
 	case err := <-answered:
 		return err
-	case <-time.After(5 * time.Second):
+	case <-time.After(deadline + 5*time.Second):
 		t.Fatal("the teardown was still waiting on the dial seconds after the caller's deadline")
 		return nil
 	}
@@ -240,10 +247,12 @@ func TestAProbeIsNotSharedWithATeardownOnAnotherClient(t *testing.T) {
 		return wm.ErrNotConnected
 	}
 	// The fresh client's own lock is not free at once either: on a loaded machine the probe
-	// that asks for it took longer to run than the caller's deadline here (#258).
+	// that asks for it took longer to run than the caller's deadline here (#258). So this
+	// deadline is long, and it still separates the two: a teardown handed the probe about
+	// the client it replaced waits for a dial that lasts the whole test, and runs all of it.
 	time.AfterFunc(loadedDelay, holdTheDialOf(t, session.current()))
 
-	if err := answeredWithin(t, session.Logout); !errors.Is(err, wm.ErrNotConnected) {
+	if err := answeredWithinDeadline(t, 5*time.Second, session.Logout); !errors.Is(err, wm.ErrNotConnected) {
 		t.Fatalf("the logout on the fresh client failed with %v, want the answer from the library", err)
 	}
 	select {
