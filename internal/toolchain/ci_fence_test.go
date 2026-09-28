@@ -64,6 +64,9 @@ var outsideCheck = map[string]exemption{
 // so that adding a target to CI is a decision somebody writes down, rather than a line
 // that lands and leaves `check` quietly behind.
 var targetsOutsideCheck = map[string]exemption{
+	"test-postgres-server": {standsFor: "test-postgres", why: "starts the server the PostgreSQL pass runs against and waits for it. " +
+		"It gates nothing of its own: `make check` asks for a server rather than starting one, and the gate is the pass, which it reaches. " +
+		"CI starts it here because a `services:` container takes no command, and the flags that make the pass affordable are a command (#342)."},
 	"test-cover": {standsFor: "test", why: "`make test` under a coverage profile: the same packages and the same cleared variables, " +
 		"plus coverage.txt for the artifact. What `check` does not reach is the profile, and what a profile decides is " +
 		"coverage.txt, which gates nothing. It is not that the two builds behave alike: the instrumented one is slower, " +

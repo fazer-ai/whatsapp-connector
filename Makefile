@@ -19,19 +19,28 @@ PACKAGES ?= ./...
 # preflight has to name the server that is actually missing. Spelled per recipe, a shell
 # with PostgreSQL up and no Redis was told to start a PostgreSQL, and an instruction whose
 # first line is already done is one people stop reading.
+#
+# The PostgreSQL runs without durability, and that is the whole of what makes the pass
+# affordable. Every test creates a database and drops it again, and with fsync on those two
+# statements are what the pass spends its time on: `internal/engine/whatsmeow` took 148s
+# against a default server and 15s against this one, on the same machine with nothing else
+# running (#342). Turning it off per session does not reach them -- `synchronous_commit` in
+# the url left the package at 112s -- because `fsync` and `full_page_writes` belong to the
+# server. Nothing a test writes has to survive a crash of the server it wrote it to.
 SERVER_PASSES := test-postgres test-redis
 test-postgres_VAR := WAC_TEST_DATABASE_URL
-test-postgres_RUN := docker run -d --rm -p 55432:5432 -e POSTGRES_USER=wac -e POSTGRES_PASSWORD=wac -e POSTGRES_DB=wac postgres:18-alpine
+test-postgres_NAME := wac-test-postgres
+test-postgres_RUN := docker run -d --rm --name $(test-postgres_NAME) -p 55432:5432 -e POSTGRES_USER=wac -e POSTGRES_PASSWORD=wac -e POSTGRES_DB=wac postgres:18-alpine postgres -c fsync=off -c synchronous_commit=off -c full_page_writes=off
 test-postgres_URL := postgres://wac:wac@localhost:55432/wac?sslmode=disable
 test-redis_VAR := WAC_TEST_REDIS_URL
 test-redis_RUN := docker run -d --rm -p 56379:6379 redis:8-alpine
 test-redis_URL := redis://localhost:56379/0
 
 .DEFAULT_GOAL := help
-.PHONY: help setup deps hooks fmt lint test test-postgres test-redis test-cover contract tidy check check-offline check-servers offline-passes bench-fleet clean
+.PHONY: help setup deps hooks fmt lint test test-postgres test-postgres-server test-redis test-cover contract tidy check check-offline check-servers offline-passes bench-fleet clean
 
 help: ## List the available targets
-	@grep -hE '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
+	@grep -hE '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
 
 setup: hooks deps ## Prepare a fresh clone for development
 
@@ -78,6 +87,21 @@ test-postgres: ## Run the test suite against a PostgreSQL server (WAC_TEST_DATAB
 	  echo "(any free port will do; 55432 only avoids whatever is already on 5432)"; \
 	  exit 1; }
 	$(GO) test -count=1 $(PACKAGES)
+
+# The server the line above prints, started and waited for, which is how CI gets one: a
+# `services:` container takes no command, so it cannot be given the flags that make the pass
+# cheap. Ready means answering over TCP, and not merely running: the image initialises the
+# cluster on a server that listens on the socket alone, then restarts it, and a pass that
+# starts in between fails on its first connection.
+test-postgres-server: ## Start the PostgreSQL the PostgreSQL pass runs against, and wait until it answers
+	$(test-postgres_RUN)
+	@for i in $$(seq 1 60); do \
+	  docker exec $(test-postgres_NAME) pg_isready -q -h 127.0.0.1 -U wac && exit 0; \
+	  sleep 1; \
+	done; \
+	echo "$(test-postgres_NAME) did not answer within 60s:"; \
+	docker logs --tail 20 $(test-postgres_NAME); \
+	exit 1
 
 # Every package with a test that reads WAC_TEST_REDIS_URL, which `internal/toolchain` holds
 # this list to: a package left off is skipped in every pass there is. CI runs this target
