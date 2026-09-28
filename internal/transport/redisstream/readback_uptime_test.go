@@ -2,8 +2,6 @@ package redisstream_test
 
 import (
 	"context"
-	"crypto/sha1"
-	"encoding/hex"
 	"fmt"
 	"slices"
 	"sync/atomic"
@@ -49,21 +47,13 @@ func (*slowReadBack) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.P
 	return next
 }
 
-// readsBack says whether a command is the history script: by its hash, or by the hash of
-// the source go-redis falls back to when the server does not have it cached.
+// readsBack says whether a command is the history script. By its hash alone: the reads
+// before the hook is armed have put the script in the server's cache, so what goes out
+// armed is EVALSHA and never the source.
 func readsBack(cmd redis.Cmder) bool {
 	args := cmd.Args()
-	if len(args) < 2 {
-		return false
-	}
-	switch cmd.Name() {
-	case "evalsha", "evalsha_ro":
-		return fmt.Sprint(args[1]) == redisstream.ReadBackScript
-	case "eval", "eval_ro":
-		sum := sha1.Sum([]byte(fmt.Sprint(args[1])))
-		return hex.EncodeToString(sum[:]) == redisstream.ReadBackScript
-	}
-	return false
+	return len(args) >= 2 && (cmd.Name() == "evalsha" || cmd.Name() == "evalsha_ro") &&
+		fmt.Sprint(args[1]) == redisstream.ReadBackScript
 }
 
 // A lost answer recovered by a read whose trip to Redis was slow is still this process's.
