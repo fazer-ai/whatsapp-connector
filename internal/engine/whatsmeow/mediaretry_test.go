@@ -141,9 +141,14 @@ func TestAPhoneThatNeverAnswersIsWorthAskingAgainRatherThanFinal(t *testing.T) {
 
 	session, phone, _ := reuploadSession(t, "3EB0QUIET")
 	phone.answersWith(nil)
+	slowDownloads(session)
 
-	deadline, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	// The caller gives up once the phone has been asked, which is the moment the wait under
+	// test begins: a fixed deadline short enough to keep this quick also ran out before the
+	// phone was reached, on a machine busy with something else (#258).
+	deadline, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
+	phone.onAsk = cancel
 	_, err := session.downloadMedia(deadline, &protocol.Command{
 		Type:    protocol.CommandMessageDownloadMedia,
 		Payload: []byte(`{"message_id":"3EB0QUIET"}`),
@@ -215,6 +220,25 @@ func reuploadSession(t *testing.T, messageID string) (*Session, *phoneAsked, str
 	return session, phone, root
 }
 
+// loadedDelay is how long a loaded machine can take over a step these tests would
+// otherwise expect in an instant: a make check running beside a mutation battery took
+// seconds over this package's own (#258).
+const loadedDelay = 150 * time.Millisecond
+
+// slowDownloads has every download the session tries take loadedDelay longer, the way it
+// does on a machine that is busy with something else, and give up on the caller's deadline
+// the way whatsmeow's does.
+func slowDownloads(session *Session) {
+	download := session.download
+	session.download = func(ctx context.Context, client *wm.Client, part wm.DownloadableMessage, file media.File) error {
+		time.Sleep(loadedDelay)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return download(ctx, client, part, file)
+	}
+}
+
 // phoneAsked stands in for the sender's phone: it counts what it was asked and answers
 // on the session's own event path, the way a real one does.
 type phoneAsked struct {
@@ -223,6 +247,7 @@ type phoneAsked struct {
 	calls       int
 	chat        string
 	participant string
+	onAsk       func() // run once the phone has been asked, when set
 }
 
 // reupload is what the phone will answer: either a notification it seals under the media
@@ -242,6 +267,9 @@ func (p *phoneAsked) addressed() (chat, participant string) { return p.chat, p.p
 
 func (p *phoneAsked) hand(_ context.Context, _ *wm.Client, info *waTypes.MessageInfo, key []byte) error {
 	p.calls++
+	if p.onAsk != nil {
+		defer p.onAsk()
+	}
 	p.chat = info.Chat.String()
 	// What SendMediaRetryReceipt would put on the `rmr` node, and the flag that decides
 	// whether it does.
@@ -318,8 +346,12 @@ func TestARowThatCannotAddressAReceiptIsNotAskedAbout(t *testing.T) {
 			session, phone, _ := reuploadSession(t, "3EB0NONAME")
 			phone.answersWith(nil)
 			forgetWhoSent(t, session, "3EB0NONAME", tc.forget)
+			slowDownloads(session)
 
-			deadline, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+			// Long enough for a busy machine to reach the answer, which needs no reply from
+			// anybody (#258). A session that asked the phone anyway waits all of it for an
+			// answer that never comes, and is still caught by the count below.
+			deadline, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 			defer cancel()
 			_, err := session.downloadMedia(deadline, &protocol.Command{
 				Type:    protocol.CommandMessageDownloadMedia,

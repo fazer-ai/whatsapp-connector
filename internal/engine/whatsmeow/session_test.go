@@ -640,7 +640,9 @@ func openStore(t *testing.T) *store.Container {
 	return container
 }
 
-// next reads the emission the session just published, or fails rather than hanging.
+// next reads the emission the session just published, or fails rather than hanging. The
+// bound only ever runs out on a test that is failing, so it is set for a machine that
+// stalled this package for seconds under a loaded make check, not for an idle one (#258).
 func next(t *testing.T, session *Session) *engine.Emission {
 	t.Helper()
 
@@ -650,7 +652,7 @@ func next(t *testing.T, session *Session) *engine.Emission {
 			t.Fatal("the session published nothing and closed")
 		}
 		return &emission
-	case <-time.After(2 * time.Second):
+	case <-time.After(15 * time.Second):
 		t.Fatal("the session published nothing")
 		return nil
 	}

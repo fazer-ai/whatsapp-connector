@@ -45,12 +45,14 @@ var unansweredLogouts = map[string]func(context.Context) error{
 	},
 }
 
-// logoutWithin runs a logout on a context of its own, short enough for the case that
-// waits on it and long enough for every other one.
+// logoutWithin runs a logout on a context of its own, long enough for a busy machine to
+// reach the library: at a tenth of a second the wait for the socket ran out first under
+// load, and the logout under test was never called (#258). The one case that waits on it
+// waits all of it, in parallel with the rest.
 func logoutWithin(t *testing.T, session *Session) error {
 	t.Helper()
 
-	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	return session.Logout(ctx)
 }
@@ -229,6 +231,8 @@ func TestARetriedLogoutAfterALostAnswerLogsOutOnce(t *testing.T) {
 		return fmt.Errorf("error sending logout request: %w", &wm.DisconnectedError{Action: "info query"})
 	}
 	session.setConnected(true)
+	// On a loaded machine the socket is not free the instant the logout asks for it (#258).
+	time.AfterFunc(loadedDelay, holdTheDial(t, session))
 
 	if err := logoutWithin(t, session); err == nil {
 		t.Fatal("a logout nobody answered was reported as one that went through")
