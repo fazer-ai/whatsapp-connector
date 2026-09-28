@@ -379,6 +379,15 @@ func TestADeleteWaitingOnARedialFailsWithoutTearingTheAccountDown(t *testing.T) 
 	}
 }
 
+// teardownStoreLimit is the bound the local half of a teardown runs on in the tests where a
+// held dial spends all of it: the close of the old client waits out whatever is left, so
+// the store writes in front of that close have to fit first. Half a second did not, on a
+// machine loaded the way a make check beside a mutation battery loads it (#258): the delete
+// of the device ran out of time before the close was ever reached. What these tests tell
+// apart is a wait that ends from one that does not, and the guard above the bound still
+// does that.
+const teardownStoreLimit = 5 * time.Second
+
 // An account with no device has nothing to unlink, and whatsmeow says so without going near
 // the socket. So a delete for one does not wait on the dial at all: the ordinary way to be
 // dialling with nothing paired is a pairing nobody finished, and holding the teardown for
@@ -391,7 +400,7 @@ func TestADeleteWithNothingPairedDoesNotWaitOnADial(t *testing.T) {
 	// The local half still closes the client being thrown away, and that close waits on the
 	// same dial under the bound this half runs on -- which is the bound being shortened here,
 	// not the caller's. What the test is about is the unlink in front of it not waiting at all.
-	session.storeLimit = 500 * time.Millisecond
+	session.storeLimit = teardownStoreLimit
 	holdTheDial(t, session)
 
 	answered := make(chan error, 1)
@@ -401,7 +410,7 @@ func TestADeleteWithNothingPairedDoesNotWaitOnADial(t *testing.T) {
 		if err != nil {
 			t.Fatalf("a delete with nothing to unlink failed: %v", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(teardownStoreLimit + 5*time.Second):
 		t.Fatal("the delete waited on a dial for an account that has no device to unlink")
 	}
 	if _, bound, err := container.For(session.sid).JID(t.Context()); err != nil || bound {
@@ -471,7 +480,7 @@ func TestALogoutWhatsappAcceptedDoesNotWaitOutADialToCloseTheOldClient(t *testin
 	t.Parallel()
 
 	session, container := newTestSession(t, "5511999990007")
-	session.storeLimit = 500 * time.Millisecond
+	session.storeLimit = teardownStoreLimit
 	session.logout = func(_ context.Context, client *wm.Client) error {
 		// WhatsApp accepted it, and the socket dropped on the way out: the dial that
 		// follows is what the rebuild's close of this client then waits on.
@@ -486,7 +495,7 @@ func TestALogoutWhatsappAcceptedDoesNotWaitOutADialToCloseTheOldClient(t *testin
 		if err != nil {
 			t.Fatalf("Logout: %v", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(teardownStoreLimit + 5*time.Second):
 		t.Fatal("the logout was still waiting to close the client it threw away")
 	}
 	if _, bound, err := container.For(session.sid).JID(t.Context()); err != nil || bound {
