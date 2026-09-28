@@ -575,6 +575,8 @@ func TestALogoutThatLostItsAnswerIsNotCalledNeverSent(t *testing.T) {
 	session.logout = func(context.Context, *wm.Client) error {
 		return fmt.Errorf("error sending logout request: %w", &wm.DisconnectedError{Action: "info query"})
 	}
+	// On a loaded machine the socket is not free the instant the logout asks for it (#258).
+	time.AfterFunc(loadedDelay, holdTheDial(t, session))
 
 	err := logoutWithin(t, session)
 	if err == nil {

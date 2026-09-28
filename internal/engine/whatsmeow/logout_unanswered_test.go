@@ -229,6 +229,8 @@ func TestARetriedLogoutAfterALostAnswerLogsOutOnce(t *testing.T) {
 		return fmt.Errorf("error sending logout request: %w", &wm.DisconnectedError{Action: "info query"})
 	}
 	session.setConnected(true)
+	// On a loaded machine the socket is not free the instant the logout asks for it (#258).
+	time.AfterFunc(loadedDelay, holdTheDial(t, session))
 
 	if err := logoutWithin(t, session); err == nil {
 		t.Fatal("a logout nobody answered was reported as one that went through")
