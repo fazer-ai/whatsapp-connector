@@ -497,8 +497,12 @@ func (r *dumpRun) publishConversation(conversation *waHistorySync.Conversation) 
 		return true
 	}
 	kind, named := addressOf(jid)
+	// A group is left out for a client that did not ask for groups, except in an answer to
+	// `history.request`: that one only exists because this client asked for this chat, and
+	// dropping it leaves the client waiting for an answer that never comes, not even the
+	// empty one that tells it to stop asking.
 	if !named || jid.IsBot() || !conversational(kind.Kind) ||
-		(kind.Kind == protocol.AddressGroup && !s.wantsGroups()) {
+		(kind.Kind == protocol.AddressGroup && !s.wantsGroups() && sync != protocol.HistoryOnDemand) {
 		return true
 	}
 	// Through the session's resolver, which is what each message in the slice is addressed

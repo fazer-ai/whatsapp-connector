@@ -1947,3 +1947,33 @@ func TestAMessageSendWaitsForItsTurnUnderItsOwnDeadline(t *testing.T) {
 		t.Fatalf("a send that never got its turn was handed to the socket %d times", handed)
 	}
 }
+
+// A group's history is left out for a client that did not ask for groups, except the
+// answer to its own `history.request`: dropped, the client waits for an answer that never
+// comes, not even the empty one that tells it to stop asking.
+func TestAGroupsOnDemandAnswerIsPublishedWithoutTheGroupsSubscription(t *testing.T) {
+	t.Parallel()
+
+	group := groupJID().String()
+	for _, tc := range []struct {
+		name    string
+		kind    waHistorySync.HistorySync_HistorySyncType
+		notice  waE2E.HistorySyncType
+		publish bool
+	}{
+		{"an answer to a request", waHistorySync.HistorySync_ON_DEMAND, waE2E.HistorySyncType_ON_DEMAND, true},
+		{"a dump nobody asked for", waHistorySync.HistorySync_RECENT, waE2E.HistorySyncType_RECENT, false},
+	} {
+		session, _ := newTestSession(t, "5511999990001")
+		session.setHistory(true)
+		bench := &historyBench{dump: dumpOf(tc.kind, &waHistorySync.Conversation{ID: proto.String(group)})}
+		bench.install(session)
+
+		acknowledged := make(chan bool, 1)
+		go func() { acknowledged <- session.receive(historyNotification("NOTIF49", tc.notice)) }()
+		slices, _ := slicesUntil(t, session, acknowledged)
+		if published := len(slices) == 1 && slices[0].Exhausted; published != tc.publish {
+			t.Errorf("%s: published %+v, want the empty exhausted answer %v", tc.name, slices, tc.publish)
+		}
+	}
+}
