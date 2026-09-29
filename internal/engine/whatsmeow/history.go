@@ -32,6 +32,10 @@ const historySliceLimit = 100
 // deliverTimeout, still ends under the five minutes whatsmeow gives a node handler.
 const historyBudget = 5*time.Minute - deliverTimeout - time.Minute
 
+// historyReceiptTimeout bounds the one write a dump makes after its budget: the receipt, or
+// the request to upload it again. Half of the minute the budget leaves over.
+const historyReceiptTimeout = 30 * time.Second
+
 func (s *Session) setHistory(history bool) {
 	s.mu.Lock()
 	s.history = history
@@ -52,6 +56,12 @@ func downloadHistoryOverClient(ctx context.Context, client *wm.Client, notificat
 
 func receiptHistoryOverClient(ctx context.Context, client *wm.Client, id waTypes.MessageID) error {
 	return client.SendProtocolMessageReceipt(ctx, id, waTypes.ReceiptTypeHistorySync) //nolint:wrapcheck // wrapped by its caller
+}
+
+// reuploadHistoryOverClient asks the phone to upload a dump again, which is the answer to
+// a blob the CDN no longer has.
+func reuploadHistoryOverClient(ctx context.Context, client *wm.Client, id waTypes.MessageID, mediaKey []byte) error {
+	return client.SendHistorySyncServerErrorReceipt(ctx, id, mediaKey) //nolint:wrapcheck // wrapped by its caller
 }
 
 func sendPeerOverClient(ctx context.Context, client *wm.Client, message *waE2E.Message) error {
@@ -112,13 +122,23 @@ func (s *Session) receiveHistory(event *waEvents.Message, notice *waE2E.HistoryS
 	switch {
 	case err != nil && errors.As(downloadFailure(err), &gone):
 		// The blob is gone or is not the one the notification describes, and a
-		// redelivery names the same blob: withheld, the phone would send it again for
-		// good. Receipted, the dump is lost, which it already was.
+		// redelivery of this notification names the same blob, so withholding it would
+		// have the phone send it for good. What the phone can do is upload the dump
+		// again, which is what a server-error receipt asks for; the new upload arrives
+		// as a notification of its own. The dump is not receipted as done, because it
+		// is not. Only a request that did not go out withholds this one, so it is asked
+		// again on the redelivery.
 		// Redacted, as every download error is: whatsmeow puts the blob's URL in it,
 		// built from the direct path and the hash.
 		s.log.Warn().Str("error", redact(err.Error())).Str("message_id", event.Info.ID).
-			Msg("receipting a history dump whose blob can no longer be downloaded")
-		s.receiptDump(client, event.Info.ID)
+			Msg("asking the phone to upload again a history dump whose blob can no longer be downloaded")
+		asking, cancel := context.WithTimeout(s.ctx, s.historyReceiptWait)
+		defer cancel()
+		if err := s.reuploadHistory(asking, client, event.Info.ID, notice.GetMediaKey()); err != nil {
+			s.log.Warn().Err(err).Str("message_id", event.Info.ID).
+				Msg("withholding a history dump the phone could not be asked to upload again")
+			return false
+		}
 		return true
 	case err != nil:
 		s.log.Warn().Str("error", redact(err.Error())).Str("message_id", event.Info.ID).
@@ -156,10 +176,11 @@ func (s *Session) receiveHistory(event *waEvents.Message, notice *waE2E.HistoryS
 // whatever the dump held was already published or stored, and the phone sending the
 // notification again costs a download and slices the client deduplicates.
 //
-// Bounded by the send ceiling, because it is a write on the socket inside the node
-// handler, and a write that stalls holds the handler with it.
+// Bounded, because it is a write on the socket inside the node handler, and by a wait of
+// its own rather than the send ceiling, which is minutes: what is left of the handler's
+// five minutes after the dump's budget and the last slice's wait is what it gets.
 func (s *Session) receiptDump(client *wm.Client, id waTypes.MessageID) {
-	ctx, cancel := context.WithTimeoutCause(s.ctx, s.wireLimit, errSendCeiling)
+	ctx, cancel := context.WithTimeout(s.ctx, s.historyReceiptWait)
 	defer cancel()
 	if err := s.receiptHistory(ctx, client, id); err != nil {
 		s.log.Warn().Err(err).Str("message_id", id).Msg("could not receipt a history dump")

@@ -69,6 +69,7 @@ type historyBench struct {
 	dump      *waHistorySync.HistorySync
 	downloads int
 	receipts  []string
+	reuploads []string
 	peers     []*waE2E.Message
 }
 
@@ -85,12 +86,24 @@ func (b *historyBench) install(session *Session) {
 		b.receipts = append(b.receipts, id)
 		return nil
 	}
+	session.reuploadHistory = func(_ context.Context, _ *wm.Client, id waTypes.MessageID, _ []byte) error {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		b.reuploads = append(b.reuploads, id)
+		return nil
+	}
 	session.sendPeer = func(_ context.Context, _ *wm.Client, message *waE2E.Message) error {
 		b.mu.Lock()
 		defer b.mu.Unlock()
 		b.peers = append(b.peers, message)
 		return nil
 	}
+}
+
+func (b *historyBench) reuploaded() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]string(nil), b.reuploads...)
 }
 
 func (b *historyBench) receipted() []string {
@@ -449,19 +462,22 @@ func TestAPairingAsksForTheFullHistoryOnlyWhenTheClientDid(t *testing.T) {
 	}
 }
 
-// A dump whose blob WhatsApp no longer has is one a redelivery names again, so withholding
-// it would have the phone send it for good; a download that may work next time is withheld.
-func TestADumpThatCannotBeDownloadedIsReceiptedOnlyWhenItNeverWill(t *testing.T) {
+// A dump whose blob WhatsApp no longer has is one a redelivery of the same notification
+// names again, so withholding it would have the phone send it for good. The phone is asked
+// to upload it again instead, and it is not receipted as done; a download that may work
+// next time is withheld.
+func TestADumpThatCannotBeDownloadedIsAskedForAgainOrWithheld(t *testing.T) {
 	t.Parallel()
 
 	for _, tc := range []struct {
-		name  string
-		err   error
-		acked bool
+		name      string
+		err       error
+		acked     bool
+		reuploads int
 	}{
-		{"gone from the CDN", wm.ErrMediaDownloadFailedWith404, true},
-		{"expired", wm.ErrMediaDownloadFailedWith403, true},
-		{"the network", errors.New("dial tcp: i/o timeout"), false},
+		{"gone from the CDN", wm.ErrMediaDownloadFailedWith404, true, 1},
+		{"expired", wm.ErrMediaDownloadFailedWith403, true, 1},
+		{"the network", errors.New("dial tcp: i/o timeout"), false, 0},
 	} {
 		session, _ := newTestSession(t, "5511999990001")
 		session.setHistory(true)
@@ -474,9 +490,31 @@ func TestADumpThatCannotBeDownloadedIsReceiptedOnlyWhenItNeverWill(t *testing.T)
 		if got := session.receive(historyNotification("NOTIF7", waE2E.HistorySyncType_RECENT)); got != tc.acked {
 			t.Errorf("%s: acknowledged %v, want %v", tc.name, got, tc.acked)
 		}
-		if receipted := len(bench.receipted()) == 1; receipted != tc.acked {
-			t.Errorf("%s: receipted %v, want %v", tc.name, receipted, tc.acked)
+		if got := len(bench.reuploaded()); got != tc.reuploads {
+			t.Errorf("%s: asked the phone to upload again %d times, want %d", tc.name, got, tc.reuploads)
 		}
+		if got := bench.receipted(); len(got) != 0 {
+			t.Errorf("%s: receipted %v a dump that was never published", tc.name, got)
+		}
+	}
+}
+
+// Asking the phone to upload again is a write, and one that did not go out leaves the
+// dump with nothing coming: withheld, the redelivery asks again.
+func TestADumpThePhoneCouldNotBeAskedToUploadAgainIsWithheld(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setHistory(true)
+	(&historyBench{}).install(session)
+	session.downloadHistory = func(context.Context, *wm.Client, *waE2E.HistorySyncNotification) (*waHistorySync.HistorySync, error) {
+		return nil, wm.ErrMediaDownloadFailedWith410
+	}
+	session.reuploadHistory = func(context.Context, *wm.Client, waTypes.MessageID, []byte) error {
+		return wm.ErrNotConnected
+	}
+	if session.receive(historyNotification("NOTIF25", waE2E.HistorySyncType_RECENT)) {
+		t.Fatal("a dump nobody could ask for again was acknowledged, so nothing would bring it back")
 	}
 }
 
@@ -1007,11 +1045,11 @@ func TestADumpWhoseFileCouldNotBeKeptIsWithheld(t *testing.T) {
 
 // A receipt is a write on the socket inside the node handler, and one that stalls holds
 // the handler past the watchdog after the whole dump was published in time.
-func TestTheDumpsReceiptIsHeldToTheSendCeiling(t *testing.T) {
+func TestTheDumpsReceiptIsHeldToItsOwnWait(t *testing.T) {
 	t.Parallel()
 
 	session, _ := newTestSession(t, "5511999990001")
-	session.wireLimit = 50 * time.Millisecond
+	session.historyReceiptWait = 50 * time.Millisecond
 	(&historyBench{dump: dumpOf(waHistorySync.HistorySync_PUSH_NAME)}).install(session)
 	session.receiptHistory = func(ctx context.Context, _ *wm.Client, _ waTypes.MessageID) error {
 		<-ctx.Done()
@@ -1025,7 +1063,7 @@ func TestTheDumpsReceiptIsHeldToTheSendCeiling(t *testing.T) {
 	select {
 	case <-acknowledged:
 	case <-time.After(10 * time.Second):
-		t.Fatal("a receipt that never went out held the node handler past the send ceiling")
+		t.Fatal("a receipt that never went out held the node handler past its wait")
 	}
 }
 
@@ -1048,5 +1086,17 @@ func TestAFileKeptUnderANumberIsServedUnderItsLID(t *testing.T) {
 
 	if ref := refetch(t, session, "3EB0ALIAS", &protocol.Address{Kind: protocol.AddressLID, ID: lid.User}); ref.ID == "" {
 		t.Fatal("a download naming the chat's LID was not served")
+	}
+}
+
+// Everything a dump can spend in the node handler, added up, is under the five minutes
+// whatsmeow gives it before starting the next node beside it: the budget, the last
+// slice's wait on the publisher that the budget is checked before, and the receipt.
+func TestADumpsWorstCaseFitsUnderTheNodeWatchdog(t *testing.T) {
+	t.Parallel()
+
+	const watchdog = 5 * time.Minute
+	if worst := historyBudget + deliverTimeout + historyReceiptTimeout; worst >= watchdog {
+		t.Fatalf("a dump can hold the node handler for %s, which is not under the %s watchdog", worst, watchdog)
 	}
 }

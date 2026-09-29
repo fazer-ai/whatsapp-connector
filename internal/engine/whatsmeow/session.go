@@ -149,6 +149,9 @@ type Session struct {
 	// historyBudget bounds how long one history dump spends being published. A field for
 	// the same reason as deliverWait: a test cannot wait out the real one.
 	historyBudget time.Duration
+	// historyReceiptWait bounds the write a dump makes after its budget, for the same
+	// reason.
+	historyReceiptWait time.Duration
 
 	// downloadWait bounds how long an inbound media message spends fetching its file.
 	// A field for the same reason as the two above it, and for no other.
@@ -171,11 +174,13 @@ type Session struct {
 	sendAppState func(context.Context, *wm.Client, appstate.PatchInfo) error
 
 	// downloadHistory fetches and decodes one history dump, storing what whatsmeow keeps
-	// from it; receiptHistory tells the phone the dump is done with; sendPeer hands the
-	// phone a request of this device's own. Fields for the same reason as sendAppState:
+	// from it; receiptHistory tells the phone the dump is done with, and reuploadHistory
+	// asks it to upload one whose blob is gone; sendPeer hands the phone a request of this
+	// device's own. Fields for the same reason as sendAppState:
 	// only a real socket answers any of them.
 	downloadHistory func(context.Context, *wm.Client, *waE2E.HistorySyncNotification) (*waHistorySync.HistorySync, error)
 	receiptHistory  func(context.Context, *wm.Client, waTypes.MessageID) error
+	reuploadHistory func(context.Context, *wm.Client, waTypes.MessageID, []byte) error
 	sendPeer        func(context.Context, *wm.Client, *waE2E.Message) error
 
 	// groupInfo reads a group's metadata. A field for the same reason as the queries
@@ -723,6 +728,7 @@ func newSession(
 		sendAppState:    sendAppStateOverClient,
 		downloadHistory: downloadHistoryOverClient,
 		receiptHistory:  receiptHistoryOverClient,
+		reuploadHistory: reuploadHistoryOverClient,
 		sendPeer:        sendPeerOverClient,
 		groupInfo:       groupInfoOverClient,
 		joinedGroups:    joinedGroupsOverClient,
@@ -799,17 +805,18 @@ func newSession(
 		handoffWait: perishableHandoff,
 		awaited:     make(map[string]*awaiting),
 
-		reuploads:      make(map[string]chan *waEvents.MediaRetry),
-		reuploadWait:   reuploadTimeout,
-		rerequestWait:  rerequestTimeout,
-		rerequestRetry: rerequestRetry,
-		presenceWrite:  make(chan struct{}, 1),
-		presenceWait:   presenceWriteTimeout,
-		callWait:       callWriteTimeout,
-		board:          make(map[string]posted),
-		downloadWait:   downloadTimeout,
-		historyBudget:  historyBudget,
-		uploadWait:     uploadTimeout,
+		reuploads:          make(map[string]chan *waEvents.MediaRetry),
+		reuploadWait:       reuploadTimeout,
+		rerequestWait:      rerequestTimeout,
+		rerequestRetry:     rerequestRetry,
+		presenceWrite:      make(chan struct{}, 1),
+		presenceWait:       presenceWriteTimeout,
+		callWait:           callWriteTimeout,
+		board:              make(map[string]posted),
+		downloadWait:       downloadTimeout,
+		historyBudget:      historyBudget,
+		historyReceiptWait: historyReceiptTimeout,
+		uploadWait:         uploadTimeout,
 	}
 	s.route.notify = s.proxyOutcome
 	s.declineCall = func(ctx context.Context, client *wm.Client, caller waTypes.JID, callID string) error {
