@@ -156,6 +156,8 @@ type Session struct {
 	// finish, and are fields for the same reason.
 	historyRetry        time.Duration
 	historyRetryCeiling time.Duration
+	// historyReplayBudget is historyBudget for a retry, and a field for the same reason.
+	historyReplayBudget time.Duration
 	// dumps keeps two attempts at one dump apart.
 	dumps pendingDumps
 
@@ -824,6 +826,7 @@ func newSession(
 		historyReceiptWait:  historyReceiptTimeout,
 		historyRetry:        historyRetry,
 		historyRetryCeiling: historyRetryCeiling,
+		historyReplayBudget: historyReplayBudget,
 		uploadWait:          uploadTimeout,
 	}
 	s.route.notify = s.proxyOutcome

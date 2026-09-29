@@ -1,6 +1,7 @@
 package whatsmeow
 
 import (
+	"sort"
 	"sync"
 	"time"
 )
@@ -11,6 +12,43 @@ type pendingDumps struct {
 	handling map[string]bool
 	armed    bool
 	wait     time.Duration
+	// unwritten is the dumps that arrived while the store would not take them.
+	unwritten map[string]unwrittenDump
+}
+
+// unwrittenDump is a notification kept in memory until it can be written down.
+type unwrittenDump struct {
+	id         string
+	notice     []byte
+	learned    int64
+	generation uint64
+}
+
+func (d *pendingDumps) keepUnwritten(id string, notice []byte, learned int64, generation uint64) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.unwritten == nil {
+		d.unwritten = make(map[string]unwrittenDump)
+	}
+	d.unwritten[id] = unwrittenDump{id: id, notice: notice, learned: learned, generation: generation}
+}
+
+func (d *pendingDumps) forgetUnwritten(id string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	delete(d.unwritten, id)
+}
+
+// unwrittenDumps is what is kept in memory, oldest first.
+func (d *pendingDumps) unwrittenDumps() []unwrittenDump {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	dumps := make([]unwrittenDump, 0, len(d.unwritten))
+	for _, dump := range d.unwritten {
+		dumps = append(dumps, dump)
+	}
+	sort.Slice(dumps, func(i, j int) bool { return dumps[i].learned < dumps[j].learned })
+	return dumps
 }
 
 func (d *pendingDumps) claim(id string) bool {
