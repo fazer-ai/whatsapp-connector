@@ -27,6 +27,11 @@ import (
 // longer than this arrives in several events, so no stream entry holds a whole dump.
 const historySliceLimit = 100
 
+// historyBudget is how long one dump may spend being published before it is left for the
+// phone to send again. Three minutes, so that the last slice, which may wait out the whole
+// deliverTimeout, still ends under the five minutes whatsmeow gives a node handler.
+const historyBudget = 5*time.Minute - deliverTimeout - time.Minute
+
 func (s *Session) setHistory(history bool) {
 	s.mu.Lock()
 	s.history = history
@@ -127,8 +132,15 @@ func (s *Session) receiveHistory(event *waEvents.Message, notice *waE2E.HistoryS
 
 	sync, conversational := historySyncs[dump.GetSyncType()]
 	if conversational && s.wantsHistory() {
+		// The dump is published inside the node handler, and whatsmeow starts the next
+		// node alongside a handler that has run for five minutes, which is the order of
+		// everything after it gone. So the whole dump has a budget, checked before each
+		// slice, that leaves room under the watchdog for the one slice that may still wait
+		// out deliverWait. Over it, the dump is left unreceipted and comes back whole, and
+		// the client deduplicates what it already has: the same trade as a message.
+		over := time.Now().Add(s.historyBudget)
 		for _, conversation := range dump.GetConversations() {
-			if !s.publishConversation(client, sync, dump, conversation, learned) {
+			if !s.publishConversation(client, sync, dump, conversation, learned, over) {
 				return false
 			}
 		}
@@ -149,7 +161,7 @@ func (s *Session) receiptDump(client *wm.Client, id waTypes.MessageID) {
 
 // publishConversation publishes one chat of a dump, oldest first, in slices of at most
 // historySliceLimit messages, and reports whether every slice was published.
-func (s *Session) publishConversation(client *wm.Client, sync protocol.HistorySync, dump *waHistorySync.HistorySync, conversation *waHistorySync.Conversation, learned int64) bool {
+func (s *Session) publishConversation(client *wm.Client, sync protocol.HistorySync, dump *waHistorySync.HistorySync, conversation *waHistorySync.Conversation, learned int64, over time.Time) bool {
 	jid, err := waTypes.ParseJID(conversation.GetID())
 	if err != nil {
 		s.log.Debug().Err(err).Msg("skipping a chat in a history dump that names no chat")
@@ -201,6 +213,11 @@ func (s *Session) publishConversation(client *wm.Client, sync protocol.HistorySy
 			Messages: messages[start:end], Progress: progress,
 			// On the last slice of the chat only: until then there is more on its way.
 			Exhausted: exhausted && end == len(messages),
+		}
+		if time.Now().After(over) {
+			s.log.Warn().Dur("budget", s.historyBudget).
+				Msg("withholding a history dump that did not publish within its budget")
+			return false
 		}
 		if !s.deliver(protocol.EventHistorySync, slice, learned) {
 			return false
@@ -294,7 +311,7 @@ func (s *Session) pastBody(event *waEvents.Message) (body, bool) {
 			part.content.Thumbnail = ""
 			return body{content: part.content, context: part.context}, true
 		}
-		s.remember(event, &part)
+		s.rememberPast(event, &part)
 		return body{content: part.content, context: part.context}, true
 	}
 	return unreadableBody(event)
@@ -345,17 +362,19 @@ func (s *Session) requestHistory(ctx context.Context, command *protocol.Command)
 		return nil, err
 	}
 
+	// Under the ceiling every send has, because this is one: whatsmeow's retry after a
+	// reconnect has no deadline of its own, and a command that brought none would hold
+	// the session's queue for as long as the socket stayed down.
+	wire, giveUp := context.WithTimeoutCause(ctx, s.wireLimit, errSendCeiling)
+	defer giveUp()
 	client := s.current()
 	request := client.BuildHistorySyncRequest(&waTypes.MessageInfo{
 		MessageSource: waTypes.MessageSource{Chat: chat, IsFromMe: ask.Before.FromMe},
 		ID:            ask.Before.ID,
 		Timestamp:     time.UnixMilli(ask.Before.Timestamp),
 	}, count)
-	if err := s.sendPeer(ctx, client, request); err != nil {
-		if named, coded := commandFailure(err, "history request"); named {
-			return nil, coded
-		}
-		return nil, protocol.NewError(protocol.ErrorWaError, "WhatsApp refused the history request")
+	if err := s.sendPeer(wire, client, request); err != nil {
+		return nil, sendFailure(whichClockRanOut(wire, err))
 	}
 	return nil, nil
 }

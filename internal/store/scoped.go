@@ -122,6 +122,16 @@ func (s *Scoped) PutMediaPart(ctx context.Context, part *MediaPart, now time.Tim
 	return s.container.putMediaPart(ctx, &kept, now)
 }
 
+// KeepMediaPart is PutMediaPart for a message whose row, if it has one, stays as it is.
+func (s *Scoped) KeepMediaPart(ctx context.Context, part *MediaPart, now time.Time) error {
+	if err := s.fence.held(); err != nil {
+		return err
+	}
+	kept := *part
+	kept.SID = s.sid
+	return s.container.keepMediaPart(ctx, &kept, now)
+}
+
 // RefreshDirectPath replaces where a message's file is fetched from, and only while the
 // row is still the one the caller read.
 func (s *Scoped) RefreshDirectPath(ctx context.Context, messageID, path string, unchangedSince int64) error {

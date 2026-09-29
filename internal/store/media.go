@@ -149,6 +149,32 @@ func (c *Container) putMediaPart(ctx context.Context, part *MediaPart, now time.
 	return nil
 }
 
+// keepMediaPart writes a row only where the message has none.
+//
+// For a message that arrives a second time, out of a history dump: what was kept the
+// first time may name the file on this instance's disk, and the dump's copy cannot.
+func (c *Container) keepMediaPart(ctx context.Context, part *MediaPart, now time.Time) error {
+	if part.SID == "" || part.MessageID == "" {
+		return fmt.Errorf("store: a media part needs a session and a message, got %q and %q", part.SID, part.MessageID)
+	}
+	const insert = `
+		INSERT INTO wac_media_part
+			(sid, message_id, chat_kind, chat_id, kind, direct_path, media_key,
+			 file_enc_sha256, file_sha256, file_length, mime, filename,
+			 receipt_chat, sender, from_me, blob_id, stored_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT (sid, message_id) DO NOTHING`
+	_, err := c.db.ExecContext(ctx, c.rebind(insert),
+		part.SID, part.MessageID, part.ChatKind, part.ChatID, part.Kind, part.DirectPath,
+		encode(part.MediaKey), encode(part.FileEncSHA256), encode(part.FileSHA256),
+		part.FileLength, part.Mime, part.Filename,
+		part.ReceiptChat, part.Sender, asFlag(part.FromMe), part.BlobID, now.UnixMilli())
+	if err != nil {
+		return fmt.Errorf("store: record how to fetch the file of %s: %w", part.MessageID, err)
+	}
+	return nil
+}
+
 // MediaPart reads back how to fetch one message's file, and whether anything was kept
 // for it at all.
 func (c *Container) mediaPart(ctx context.Context, sid, messageID string) (MediaPart, bool, error) {

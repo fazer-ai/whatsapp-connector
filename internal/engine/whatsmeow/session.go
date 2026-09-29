@@ -146,6 +146,10 @@ type Session struct {
 	// costs a redelivery, which is the trade the whole path is built on.
 	stalledUntil atomic.Int64
 
+	// historyBudget bounds how long one history dump spends being published. A field for
+	// the same reason as deliverWait: a test cannot wait out the real one.
+	historyBudget time.Duration
+
 	// downloadWait bounds how long an inbound media message spends fetching its file.
 	// A field for the same reason as the two above it, and for no other.
 	downloadWait time.Duration
@@ -804,6 +808,7 @@ func newSession(
 		callWait:       callWriteTimeout,
 		board:          make(map[string]posted),
 		downloadWait:   downloadTimeout,
+		historyBudget:  historyBudget,
 		uploadWait:     uploadTimeout,
 	}
 	s.route.notify = s.proxyOutcome

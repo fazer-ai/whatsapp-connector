@@ -515,6 +515,32 @@ func (s *Session) remember(event *waEvents.Message, part *attachment) bool {
 	ctx, cancel := context.WithTimeout(s.ctx, s.storeLimit)
 	defer cancel()
 
+	kept := s.mediaPartOf(ctx, event, part)
+	if err := s.store.PutMediaPart(ctx, &kept, time.Now()); err != nil {
+		s.log.Warn().Err(err).Str("message_id", kept.MessageID).
+			Msg("published a file this session will not be able to fetch a second time")
+		return false
+	}
+	return true
+}
+
+// rememberPast is remember for a message out of a history dump, which is the one place a
+// message this session already knows arrives again: live and then in a dump, or in two
+// dumps. What was kept first wins, because it can only be as new as the dump's copy and
+// it may name the file already on this instance's disk, which the dump's copy cannot.
+func (s *Session) rememberPast(event *waEvents.Message, part *attachment) {
+	ctx, cancel := context.WithTimeout(s.ctx, s.storeLimit)
+	defer cancel()
+
+	kept := s.mediaPartOf(ctx, event, part)
+	if err := s.store.KeepMediaPart(ctx, &kept, time.Now()); err != nil {
+		s.log.Warn().Err(err).Str("message_id", kept.MessageID).
+			Msg("published a file out of a dump this session will not be able to fetch")
+	}
+}
+
+// mediaPartOf is the row that says how to fetch this message's file again.
+func (s *Session) mediaPartOf(ctx context.Context, event *waEvents.Message, part *attachment) store.MediaPart {
 	messageID := event.Info.ID
 	// Through chatOf, which is what the event was published under. Recomputing it here
 	// would be a second copy of the broadcast rule, and a copy that drifted would file a
@@ -542,12 +568,7 @@ func (s *Session) remember(event *waEvents.Message, part *attachment) bool {
 		// point at, and the invitation to come back for it is the whole point of the row.
 		kept.BlobID = part.content.Ref.ID
 	}
-	if err := s.store.PutMediaPart(ctx, &kept, time.Now()); err != nil {
-		s.log.Warn().Err(err).Str("message_id", messageID).
-			Msg("published a file this session will not be able to fetch a second time")
-		return false
-	}
-	return true
+	return kept
 }
 
 // downloadMedia is `message.download_media`: the file of a message this session already

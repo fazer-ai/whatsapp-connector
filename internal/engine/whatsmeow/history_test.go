@@ -24,6 +24,7 @@ import (
 	"github.com/fazer-ai/whatsapp-connector/internal/engine"
 	"github.com/fazer-ai/whatsapp-connector/internal/media"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
+	"github.com/fazer-ai/whatsapp-connector/internal/store"
 )
 
 // historyNotification is the protocol message the phone sends this device when a dump is
@@ -309,7 +310,8 @@ func TestAnOnDemandAnswerWithNothingOlderMarksTheChatExhausted(t *testing.T) {
 func TestHistoryMediaIsPublishedWithoutBeingDownloaded(t *testing.T) {
 	t.Parallel()
 
-	session, _ := newTestSession(t, "5511999990001")
+	// With somewhere to put the file, so a download would have happened had it been asked.
+	session, _ := mediaSession(t, media.Options{})
 	session.setHistory(true)
 	var fetched int
 	session.download = func(context.Context, *wm.Client, wm.DownloadableMessage, media.File) error {
@@ -775,6 +777,154 @@ func TestMessagesThatTieOnTheSecondKeepThePhonesOrder(t *testing.T) {
 	for i, want := range []string{"3EB0T1", "3EB0T2", "3EB0T3"} {
 		if got := slices[0].Messages[i].ID; got != want {
 			t.Fatalf("message %d is %s, want %s: the tie reversed the conversation", i, got, want)
+		}
+	}
+}
+
+// A history request is a send, and whatsmeow's retry after a reconnect has no deadline of
+// its own: without the ceiling, a command that brought none holds the session's queue for
+// as long as the socket stays down.
+func TestAHistoryRequestIsHeldToTheSendCeiling(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setConnected(true)
+	session.wireLimit = 50 * time.Millisecond
+	(&historyBench{}).install(session)
+	session.sendPeer = func(ctx context.Context, _ *wm.Client, _ *waE2E.Message) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+
+	answered := make(chan error, 1)
+	go func() {
+		_, err := session.Execute(context.WithoutCancel(t.Context()), historyRequest(t,
+			`{"chat":{"kind":"phone","id":"5511999990002"},"before":{"id":"3EB0F1","timestamp":1754000000123,"from_me":false}}`))
+		answered <- err
+	}()
+	select {
+	case err := <-answered:
+		var coded *protocol.Error
+		if !errors.As(err, &coded) || coded.Code != protocol.ErrorTimeout {
+			t.Fatalf("a request that never went out answered %v, want timeout", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("a request that never went out held the session past its ceiling")
+	}
+}
+
+// A message can reach a dump after it arrived live, and what was kept then names the file
+// already on this instance's disk. The dump's copy must not replace it; a message only the
+// dump has is kept, so its file can still be fetched.
+func TestHistoryMediaKeepsWhatWasAlreadyKeptAndRecordsTheRest(t *testing.T) {
+	t.Parallel()
+
+	const chat = "5511999990002@s.whatsapp.net"
+	session, _ := newTestSession(t, "5511999990001")
+	session.setHistory(true)
+	known := store.MediaPart{MessageID: "3EB0K1", ChatKind: "phone", ChatID: "5511999990002", Kind: "image",
+		DirectPath: "/v/live", BlobID: "blob-live"}
+	if err := session.store.PutMediaPart(t.Context(), &known, time.Now()); err != nil {
+		t.Fatalf("PutMediaPart: %v", err)
+	}
+	image := func() *waE2E.Message {
+		return &waE2E.Message{ImageMessage: &waE2E.ImageMessage{
+			Mimetype: proto.String("image/jpeg"), DirectPath: proto.String("/v/dump"), MediaKey: make([]byte, 32),
+			FileSHA256: make([]byte, 32), FileEncSHA256: make([]byte, 32), FileLength: proto.Uint64(1024),
+		}}
+	}
+	(&historyBench{dump: dumpOf(waHistorySync.HistorySync_RECENT,
+		&waHistorySync.Conversation{ID: proto.String(chat), Messages: []*waHistorySync.HistorySyncMsg{
+			pastMessage(chat, "3EB0K1", 1754000000, false, image()),
+			pastMessage(chat, "3EB0K2", 1754000001, false, image()),
+		}})}).install(session)
+
+	acknowledged := make(chan bool, 1)
+	go func() { acknowledged <- session.receive(historyNotification("NOTIF18", waE2E.HistorySyncType_RECENT)) }()
+	slicesUntil(t, session, acknowledged)
+
+	kept, found, err := session.store.MediaPart(t.Context(), "3EB0K1")
+	if err != nil || !found || kept.BlobID != "blob-live" || kept.DirectPath != "/v/live" {
+		t.Fatalf("the row kept live is now %+v (found %v, %v), want it untouched", kept, found, err)
+	}
+	fresh, found, err := session.store.MediaPart(t.Context(), "3EB0K2")
+	if err != nil || !found || fresh.DirectPath != "/v/dump" {
+		t.Fatalf("the row for a message only the dump has is %+v (found %v, %v), want the dump's coordinates", fresh, found, err)
+	}
+}
+
+// A dump that cannot be published within its budget is left for the phone to send again,
+// rather than holding the node handler past the watchdog that would start the next node
+// beside it.
+func TestADumpOverItsBudgetIsLeftForThePhoneToSendAgain(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setHistory(true)
+	session.historyBudget = -time.Second
+	bench := &historyBench{dump: dumpOf(waHistorySync.HistorySync_RECENT,
+		&waHistorySync.Conversation{ID: proto.String("5511999990002@s.whatsapp.net"), Messages: []*waHistorySync.HistorySyncMsg{
+			pastText("5511999990002@s.whatsapp.net", "3EB0B9", 1754000000, "oi"),
+		}})}
+	bench.install(session)
+
+	acknowledged := make(chan bool, 1)
+	go func() { acknowledged <- session.receive(historyNotification("NOTIF19", waE2E.HistorySyncType_RECENT)) }()
+	slices, got := slicesUntil(t, session, acknowledged)
+	if got || len(slices) != 0 || len(bench.receipted()) != 0 {
+		t.Fatalf("a dump over its budget published %d slices, acknowledged %v, receipted %v", len(slices), got, bench.receipted())
+	}
+}
+
+// A dump carries the account's own protocol messages among a chat's messages: a
+// disappearing-timer change, a deletion. None is a message somebody sent, and each would
+// otherwise go out as an unreadable bubble.
+func TestAProtocolMessageInADumpIsNotPublished(t *testing.T) {
+	t.Parallel()
+
+	const chat = "5511999990002@s.whatsapp.net"
+	session, _ := newTestSession(t, "5511999990001")
+	session.setHistory(true)
+	timer := pastMessage(chat, "3EB0PR", 1754000001, false, &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{
+		Type: waE2E.ProtocolMessage_EPHEMERAL_SETTING.Enum(), EphemeralExpiration: proto.Uint32(86400),
+	}})
+	(&historyBench{dump: dumpOf(waHistorySync.HistorySync_RECENT,
+		&waHistorySync.Conversation{ID: proto.String(chat), Messages: []*waHistorySync.HistorySyncMsg{
+			timer, pastText(chat, "3EB0PT", 1754000000, "oi"),
+		}})}).install(session)
+
+	acknowledged := make(chan bool, 1)
+	go func() { acknowledged <- session.receive(historyNotification("NOTIF20", waE2E.HistorySyncType_RECENT)) }()
+	slices, _ := slicesUntil(t, session, acknowledged)
+	if len(slices) != 1 || len(slices[0].Messages) != 1 || slices[0].Messages[0].ID != "3EB0PT" {
+		t.Fatalf("published %+v, want only the text", slices)
+	}
+}
+
+// Newest first is how the phone has been seen to list a chat, not something its protocol
+// says, so the slices are put in order by the clock rather than trusted to be.
+func TestADumpListedOutOfOrderIsPublishedOldestFirst(t *testing.T) {
+	t.Parallel()
+
+	const chat = "5511999990002@s.whatsapp.net"
+	session, _ := newTestSession(t, "5511999990001")
+	session.setHistory(true)
+	(&historyBench{dump: dumpOf(waHistorySync.HistorySync_RECENT,
+		&waHistorySync.Conversation{ID: proto.String(chat), Messages: []*waHistorySync.HistorySyncMsg{
+			pastText(chat, "3EB0O2", 1754000020, "b"),
+			pastText(chat, "3EB0O3", 1754000030, "c"),
+			pastText(chat, "3EB0O1", 1754000010, "a"),
+		}})}).install(session)
+
+	acknowledged := make(chan bool, 1)
+	go func() { acknowledged <- session.receive(historyNotification("NOTIF21", waE2E.HistorySyncType_RECENT)) }()
+	slices, _ := slicesUntil(t, session, acknowledged)
+	if len(slices) != 1 || len(slices[0].Messages) != 3 {
+		t.Fatalf("published %+v, want one slice of three", slices)
+	}
+	for i, want := range []string{"3EB0O1", "3EB0O2", "3EB0O3"} {
+		if got := slices[0].Messages[i].ID; got != want {
+			t.Fatalf("message %d is %s, want %s", i, got, want)
 		}
 	}
 }
