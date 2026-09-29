@@ -164,8 +164,8 @@ type Session struct {
 	readPendingHistory func(context.Context) ([]store.PendingHistory, error)
 	// dumps keeps two attempts at one dump apart.
 	dumps pendingDumps
-	// askingHistory is the turn a request for history waits for; see askHistory.
-	askingHistory chan struct{}
+	// sending is the turn a message send waits for; see takeTurnToSend.
+	sending chan struct{}
 
 	// downloadWait bounds how long an inbound media message spends fetching its file.
 	// A field for the same reason as the two above it, and for no other.
@@ -833,7 +833,7 @@ func newSession(
 		historyRetry:        historyRetry,
 		historyRetryCeiling: historyRetryCeiling,
 		historyReplayBudget: historyReplayBudget,
-		askingHistory:       make(chan struct{}, 1),
+		sending:             make(chan struct{}, 1),
 		uploadWait:          uploadTimeout,
 	}
 	s.route.notify = s.proxyOutcome

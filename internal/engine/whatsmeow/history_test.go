@@ -1874,7 +1874,7 @@ func TestAHistoryRequestWaitsForItsTurnUnderItsOwnDeadline(t *testing.T) {
 		return nil
 	}
 	// The turn the dump's own request is holding.
-	session.askingHistory <- struct{}{}
+	session.sending <- struct{}{}
 
 	answered := make(chan error, 1)
 	go func() {
@@ -1910,5 +1910,40 @@ func TestEveryMessageOfASliceIsAddressedToTheSlicesChat(t *testing.T) {
 		if message.Chat != chat {
 			t.Fatalf("message %s is addressed to %+v in a slice of %+v", message.ID, message.Chat, chat)
 		}
+	}
+}
+
+// A message send lands behind the request for history a dump sends by itself the same way
+// a `history.request` does, and waits for its turn under its own deadline too.
+func TestAMessageSendWaitsForItsTurnUnderItsOwnDeadline(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.wireLimit = 50 * time.Millisecond
+	handed := 0
+	session.handOver = func(context.Context, waTypes.JID, string, *waE2E.Message) (wm.SendResponse, error) {
+		handed++
+		return wm.SendResponse{}, nil
+	}
+	// The turn the dump's own request is holding.
+	session.sending <- struct{}{}
+
+	answered := make(chan error, 1)
+	go func() {
+		_, err := session.putOnTheWire(t.Context(), waTypes.NewJID("5511999990002", waTypes.DefaultUserServer),
+			"3EB0TURN", &waE2E.Message{Conversation: proto.String("oi")})
+		answered <- err
+	}()
+	select {
+	case err := <-answered:
+		var coded *protocol.Error
+		if !errors.As(err, &coded) || coded.Code != protocol.ErrorTimeout {
+			t.Fatalf("a send that never got its turn answered %v, want timeout", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("a send waiting for its turn held the session past its deadline")
+	}
+	if handed != 0 {
+		t.Fatalf("a send that never got its turn was handed to the socket %d times", handed)
 	}
 }

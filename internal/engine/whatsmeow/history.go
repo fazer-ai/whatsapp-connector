@@ -779,21 +779,14 @@ func (s *Session) requestHistory(ctx context.Context, command *protocol.Command)
 	return nil, nil
 }
 
-// askHistory sends a request for history, one at a time per session and waiting for its
-// turn under the caller's deadline.
-//
-// The turn is taken here because whatsmeow's own is a mutex that no context reaches: a
-// `history.request` queued behind the request a dump sends by itself would hold the
-// session's command queue for as long as that send took, whatever deadline it came with.
+// askHistory sends a request for history once it has the session's turn to send, waiting
+// for the turn under the caller's deadline; see takeTurnToSend.
 func (s *Session) askHistory(ctx context.Context, client *wm.Client, request *waE2E.Message) error {
-	select {
-	case s.askingHistory <- struct{}{}:
-	case <-ctx.Done():
-		// The error a send cut short returns, so the caller tells the two clocks apart
-		// the same way.
-		return ctx.Err()
+	done, err := s.takeTurnToSend(ctx)
+	if err != nil {
+		return err
 	}
-	defer func() { <-s.askingHistory }()
+	defer done()
 	return s.sendPeer(ctx, client, request)
 }
 
