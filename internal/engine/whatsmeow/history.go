@@ -21,20 +21,30 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
+	"github.com/fazer-ai/whatsapp-connector/internal/store"
 )
 
 // historySliceLimit is how many messages one history.sync event carries at most. A chat
 // longer than this arrives in several events, so no stream entry holds a whole dump.
 const historySliceLimit = 100
 
-// historyBudget is how long one dump may spend being published before it is left for the
-// phone to send again. Three minutes, so that the last slice, which may wait out the whole
+// historyBudget is how long one dump may spend being published before it is left for a
+// later attempt. Three minutes, so that the last slice, which may wait out the whole
 // deliverTimeout, still ends under the five minutes whatsmeow gives a node handler.
 const historyBudget = 5*time.Minute - deliverTimeout - time.Minute
 
 // historyReceiptTimeout bounds the one write a dump makes after its budget: the receipt, or
 // the request to upload it again. Half of the minute the budget leaves over.
 const historyReceiptTimeout = 30 * time.Second
+
+// historyRetry is the wait before a dump that did not finish is tried again, doubled after
+// every attempt that does not finish either, up to historyRetryCeiling. What usually stops
+// a dump is the client's Redis, and each attempt downloads the dump again, so an outage of
+// an hour costs a dozen downloads rather than one every half minute.
+const (
+	historyRetry        = 30 * time.Second
+	historyRetryCeiling = 5 * time.Minute
+)
 
 func (s *Session) setHistory(history bool) {
 	s.mu.Lock()
@@ -94,8 +104,127 @@ var historySyncs = map[waHistorySync.HistorySync_HistorySyncType]protocol.Histor
 	waHistorySync.HistorySync_ON_DEMAND:         protocol.HistoryOnDemand,
 }
 
-// receiveHistory handles a history dump and reports whether its notification may be
-// acknowledged.
+// receiveHistory writes a history dump down before doing anything with it, and reports
+// whether its notification may be acknowledged: only when the row is written.
+//
+// The row is what brings back a dump that does not finish, and nothing else does. The
+// phone announces a dump once, whatsmeow answers the announcement with a peer receipt
+// before this runs, and a notification whose node was left unacknowledged was measured not
+// to come again, on the same socket or on a new one. So a dump that stops here -- the
+// client's Redis gone, the budget spent, a lease lost -- is tried again by this session
+// after a wait, and by whichever session connects the account next.
+func (s *Session) receiveHistory(event *waEvents.Message, notice *waE2E.HistorySyncNotification, learned int64) bool {
+	id := event.Info.ID
+	if !s.dumps.claim(id) {
+		// The same notification is already being worked on by a retry, which answers for
+		// it: two attempts at one dump would publish it twice.
+		return true
+	}
+	defer s.dumps.release(id)
+
+	raw, err := proto.Marshal(notice)
+	if err == nil {
+		err = s.store.PutPendingHistory(s.ctx, &store.PendingHistory{MessageID: id, Notice: raw, LearnedAt: learned})
+	}
+	if err != nil {
+		s.log.Warn().Err(err).Str("message_id", id).Msg("withholding a history dump that could not be written down")
+		return false
+	}
+	s.finishDump(id, notice, learned)
+	return true
+}
+
+// finishDump makes one attempt at a dump that is written down, and forgets it when the
+// attempt finished with it.
+func (s *Session) finishDump(id string, notice *waE2E.HistorySyncNotification, learned int64) bool {
+	if !s.handleDump(id, notice, learned) {
+		s.retryHistoryLater()
+		return false
+	}
+	if err := s.store.DropPendingHistory(s.ctx, id); err != nil {
+		// Left for the next owner, which publishes it again: the client deduplicates.
+		s.log.Warn().Err(err).Str("message_id", id).Msg("could not forget a history dump that is finished with")
+	}
+	return true
+}
+
+// retryHistoryLater arms one attempt at the dumps still written down, unless one is armed.
+func (s *Session) retryHistoryLater() {
+	wait, arm := s.dumps.arm(s.historyRetry, s.historyRetryCeiling)
+	if !arm {
+		return
+	}
+	go func() {
+		timer := time.NewTimer(wait)
+		defer timer.Stop()
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-timer.C:
+		}
+		s.dumps.disarm()
+		s.replayHistory()
+	}()
+}
+
+// replayHistory works through the dumps this session has written down and not finished
+// with, its own or a previous owner's, oldest first. One replay at a time: a call while
+// one runs has it go round again once it is done, so a row written meanwhile is not left
+// for the next connection.
+func (s *Session) replayHistory() {
+	if !s.dumps.begin() {
+		return
+	}
+	for {
+		finished := s.replayOnce()
+		if s.dumps.end(finished) {
+			continue
+		}
+		if !finished {
+			s.retryHistoryLater()
+		}
+		return
+	}
+}
+
+// replayOnce makes one attempt at every dump written down, and reports whether all of them
+// finished.
+func (s *Session) replayOnce() bool {
+	held, err := s.store.PendingHistory(s.ctx)
+	if err != nil {
+		s.log.Warn().Err(err).Msg("could not read the history dumps this session left pending")
+		return false
+	}
+	finished := true
+	for _, pending := range held {
+		if s.ctx.Err() != nil {
+			return false
+		}
+		if !s.dumps.claim(pending.MessageID) {
+			continue
+		}
+		var notice waE2E.HistorySyncNotification
+		if err := proto.Unmarshal(pending.Notice, &notice); err != nil {
+			// A row nothing can read is a row no attempt will ever finish, and every owner
+			// after this one would fail on it the same way.
+			s.log.Error().Err(err).Str("message_id", pending.MessageID).
+				Msg("dropping a pending history dump this build cannot read")
+			if err := s.store.DropPendingHistory(s.ctx, pending.MessageID); err != nil {
+				s.log.Warn().Err(err).Str("message_id", pending.MessageID).Msg("could not drop an unreadable history dump")
+			}
+			s.dumps.release(pending.MessageID)
+			continue
+		}
+		s.log.Info().Str("message_id", pending.MessageID).Msg("picking up a history dump that did not finish")
+		if !s.finishDump(pending.MessageID, &notice, pending.LearnedAt) {
+			finished = false
+		}
+		s.dumps.release(pending.MessageID)
+	}
+	return finished
+}
+
+// handleDump makes one attempt at a history dump and reports whether it is finished with.
 //
 // The dump is downloaded whether or not the client asked for history, because the download
 // is also where whatsmeow stores what the live traffic depends on: the pairs of phone
@@ -103,17 +232,16 @@ var historySyncs = map[waHistorySync.HistorySync_HistorySyncType]protocol.Histor
 // is whether the conversations in it are published.
 //
 // The receipt is what tells the phone the dump arrived, and it is sent last, after every
-// slice was published. A dump receipted before that is a dump a lost Redis loses, which is
-// invariant 4 for a whole account's history at once; withheld, WhatsApp sends the
-// notification again and the dump is downloaded again.
-func (s *Session) receiveHistory(event *waEvents.Message, notice *waE2E.HistorySyncNotification, learned int64) bool {
+// slice was published. A dump that did not get there is not receipted and stays written
+// down, and the next attempt downloads it again.
+func (s *Session) handleDump(id string, notice *waE2E.HistorySyncNotification, learned int64) bool {
 	client := s.current()
 	// The dump is handled inside the node handler, and whatsmeow starts the next node
 	// alongside a handler that has run for five minutes, which is the order of everything
 	// after it gone. So the whole of it has a budget, from the download on: whatsmeow's
 	// media client has no overall timeout of its own, and a dump's rows are one store write
-	// per file. Over it, the dump is left unreceipted and comes back whole, and the client
-	// deduplicates what it already has: the same trade as a message.
+	// per file. Over it, the dump is left unreceipted for the next attempt, which publishes it
+	// whole, and the client deduplicates what it already has.
 	ctx, cancel := context.WithTimeout(s.ctx, s.historyBudget)
 	defer cancel()
 	// Stamped before the download, the way a command is: a logout during it rebuilds the
@@ -123,28 +251,28 @@ func (s *Session) receiveHistory(event *waEvents.Message, notice *waE2E.HistoryS
 	var gone refused
 	switch {
 	case err != nil && errors.As(downloadFailure(err), &gone):
-		// The blob is gone or is not the one the notification describes, and a
-		// redelivery of this notification names the same blob, so withholding it would
-		// have the phone send it for good. What the phone can do is upload the dump
+		// The blob is gone or is not the one the notification describes, and another
+		// attempt at this notification names the same blob, so keeping it would fail
+		// for good. What the phone can do is upload the dump
 		// again, which is what a server-error receipt asks for; the new upload arrives
 		// as a notification of its own. The dump is not receipted as done, because it
-		// is not. Only a request that did not go out withholds this one, so it is asked
-		// again on the redelivery.
+		// is not. Only a request that did not go out keeps this one, so it is asked
+		// again on the next attempt.
 		// Redacted, as every download error is: whatsmeow puts the blob's URL in it,
 		// built from the direct path and the hash.
-		s.log.Warn().Str("error", redact(err.Error())).Str("message_id", event.Info.ID).
+		s.log.Warn().Str("error", redact(err.Error())).Str("message_id", id).
 			Msg("asking the phone to upload again a history dump whose blob can no longer be downloaded")
 		asking, cancel := context.WithTimeout(s.ctx, s.historyReceiptWait)
 		defer cancel()
-		if err := s.reuploadHistory(asking, client, event.Info.ID, notice.GetMediaKey()); err != nil {
-			s.log.Warn().Err(err).Str("message_id", event.Info.ID).
-				Msg("withholding a history dump the phone could not be asked to upload again")
+		if err := s.reuploadHistory(asking, client, id, notice.GetMediaKey()); err != nil {
+			s.log.Warn().Err(err).Str("message_id", id).
+				Msg("keeping for another attempt a history dump the phone could not be asked to upload again")
 			return false
 		}
 		return true
 	case err != nil:
-		s.log.Warn().Str("error", redact(err.Error())).Str("message_id", event.Info.ID).
-			Msg("withholding the acknowledgement for a history dump that did not download")
+		s.log.Warn().Str("error", redact(err.Error())).Str("message_id", id).
+			Msg("keeping for another attempt a history dump that did not download")
 		return false
 	}
 
@@ -179,19 +307,18 @@ func (s *Session) receiveHistory(event *waEvents.Message, notice *waE2E.HistoryS
 	for _, conversation := range dump.GetConversations() {
 		sent += len(conversation.GetMessages())
 	}
-	s.log.Info().Str("message_id", event.Info.ID).Str("sync_type", dump.GetSyncType().String()).
+	s.log.Info().Str("message_id", id).Str("sync_type", dump.GetSyncType().String()).
 		Uint32("chunk", dump.GetChunkOrder()).Uint32("progress", dump.GetProgress()).
 		Int("conversations", len(dump.GetConversations())).Int("messages_sent", sent).
 		Bool("publishing", publishing).Int("slices", run.slices).Int("messages_published", run.published).
 		Msg("history dump handled")
 
-	s.receiptDump(client, event.Info.ID)
+	s.receiptDump(client, id)
 	return true
 }
 
 // receiptDump tells the phone a dump arrived. A failure is logged and nothing else:
-// whatever the dump held was already published or stored, and the phone sending the
-// notification again costs a download and slices the client deduplicates.
+// whatever the dump held was already published or stored.
 //
 // Bounded, because it is a write on the socket inside the node handler, and by a wait of
 // its own rather than the send ceiling, which is minutes: what is left of the handler's
@@ -243,7 +370,7 @@ func (r *dumpRun) overBudget() bool {
 		return false
 	}
 	r.s.log.Warn().Dur("budget", r.s.historyBudget).
-		Msg("withholding a history dump that did not publish within its budget")
+		Msg("keeping for another attempt a history dump that did not publish within its budget")
 	return true
 }
 
@@ -278,7 +405,7 @@ func (r *dumpRun) publishConversation(conversation *waHistorySync.Conversation) 
 		}
 	}
 	if r.unkept {
-		s.log.Warn().Msg("withholding a history dump with a file whose coordinates could not be kept")
+		s.log.Warn().Msg("keeping for another attempt a history dump with a file whose coordinates could not be kept")
 		return false
 	}
 	// The phone lists a chat newest first, and a client imports it in the order it arrives.

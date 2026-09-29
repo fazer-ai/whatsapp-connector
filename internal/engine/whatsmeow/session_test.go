@@ -3600,8 +3600,10 @@ func resumedDoors() []resumedDoor {
 			// A group's history, which a dump carries alongside the direct chats and the
 			// subscription decides the same way it decides a live message.
 			door: "publishConversation",
-			// Held back until the slice is known to have been delivered.
-			answers: answersNo,
+			// Answered once the dump is written down, delivered or not: the phone does
+			// not announce a dump twice, so the row is what a slice that did not deliver
+			// is tried again from.
+			answers: answersYes,
 			carries: func(t *testing.T, payload map[string]any) {
 				inTheGroup(t, payload, "data", "chat")
 				messages, _ := field(t, payload, "data", "messages").([]any)

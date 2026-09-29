@@ -268,3 +268,33 @@ func (s *Scoped) DropPlaceholder(ctx context.Context, messageID string) error {
 func (s *Scoped) Placeholders(ctx context.Context) ([]Placeholder, error) {
 	return s.container.placeholders(ctx, s.sid)
 }
+
+// PutPendingHistory writes down a history dump this session was announced, before anything
+// is done with it, so a dump that does not finish is not a dump that is lost.
+//
+// Fenced like a placeholder: the row is read by whoever owns the session next.
+func (s *Scoped) PutPendingHistory(ctx context.Context, held *PendingHistory) error {
+	if err := s.fence.held(); err != nil {
+		return err
+	}
+	pending := *held
+	pending.SID = s.sid
+	return s.container.putPendingHistory(ctx, &pending)
+}
+
+// DropPendingHistory forgets a dump that is finished with: published and receipted, or
+// handed back to the phone to upload again.
+//
+// Fenced like the write: a session that lost the account deleting the row would take the
+// dump away from the owner that has to finish it.
+func (s *Scoped) DropPendingHistory(ctx context.Context, messageID string) error {
+	if err := s.fence.held(); err != nil {
+		return err
+	}
+	return s.container.dropPendingHistory(ctx, s.sid, messageID)
+}
+
+// PendingHistory lists the dumps this session has not finished with, oldest first.
+func (s *Scoped) PendingHistory(ctx context.Context) ([]PendingHistory, error) {
+	return s.container.pendingHistory(ctx, s.sid)
+}

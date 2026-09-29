@@ -112,6 +112,20 @@ func (b *historyBench) receipted() []string {
 	return append([]string(nil), b.receipts...)
 }
 
+// heldDumps is what the session has written down and not finished with.
+func heldDumps(t *testing.T, session *Session) []string {
+	t.Helper()
+	held, err := session.store.PendingHistory(t.Context())
+	if err != nil {
+		t.Fatalf("PendingHistory: %v", err)
+	}
+	ids := make([]string, 0, len(held))
+	for _, pending := range held {
+		ids = append(ids, pending.MessageID)
+	}
+	return ids
+}
+
 // seenSlice is a published slice as the tests read it: the batch, with the envelope's
 // kind and progress beside it.
 type seenSlice struct {
@@ -286,7 +300,10 @@ func TestADumpNobodyAskedForIsDownloadedAndReceiptedButNotPublished(t *testing.T
 	}
 }
 
-func TestADumpThatWasNotPublishedIsNeitherReceiptedNorAcknowledged(t *testing.T) {
+// The phone announces a dump once: a notification left unacknowledged was measured not to
+// come again, after the outage or after a restart. So a dump the client never got is kept
+// here and tried again, and it is receipted only once a later attempt published it.
+func TestADumpThatWasNotPublishedIsKeptAndPublishedByTheNextAttempt(t *testing.T) {
 	t.Parallel()
 
 	session, _ := newTestSession(t, "5511999990001")
@@ -302,11 +319,30 @@ func TestADumpThatWasNotPublishedIsNeitherReceiptedNorAcknowledged(t *testing.T)
 		acknowledged <- session.receive(historyNotification("NOTIF4", waE2E.HistorySyncType_INITIAL_BOOTSTRAP))
 	}()
 	next(t, session).Settle(errors.New("redis is gone"))
-	if got := <-acknowledged; got {
-		t.Fatal("a dump the client never got was acknowledged, which is how it is lost")
+	if got := <-acknowledged; !got {
+		t.Fatal("a dump that is written down was withheld, and nothing ever sends it again")
 	}
 	if got := bench.receipted(); len(got) != 0 {
-		t.Fatalf("a dump the client never got was receipted (%v), so the phone would not send it again", got)
+		t.Fatalf("a dump the client never got was receipted (%v)", got)
+	}
+	if got := heldDumps(t, session); len(got) != 1 || got[0] != "NOTIF4" {
+		t.Fatalf("what is left for the next attempt is %v, want the dump", got)
+	}
+
+	replayed := make(chan bool, 1)
+	go func() {
+		session.replayHistory()
+		replayed <- true
+	}()
+	slices, _ := slicesUntil(t, session, replayed)
+	if len(slices) != 1 || len(slices[0].Messages) != 1 || slices[0].Messages[0].ID != "3EB0D1" {
+		t.Fatalf("the next attempt published %+v", slices)
+	}
+	if got := bench.receipted(); len(got) != 1 || got[0] != "NOTIF4" {
+		t.Fatalf("receipts after the next attempt: %v, want the dump's", got)
+	}
+	if got := heldDumps(t, session); len(got) != 0 {
+		t.Fatalf("a dump that is finished with is still pending: %v", got)
 	}
 }
 
@@ -474,22 +510,21 @@ func TestAPairingAsksForTheFullHistoryOnlyWhenTheClientDid(t *testing.T) {
 	}
 }
 
-// A dump whose blob WhatsApp no longer has is one a redelivery of the same notification
-// names again, so withholding it would have the phone send it for good. The phone is asked
-// to upload it again instead, and it is not receipted as done; a download that may work
-// next time is withheld.
-func TestADumpThatCannotBeDownloadedIsAskedForAgainOrWithheld(t *testing.T) {
+// A dump whose blob WhatsApp no longer has is one another attempt at the same notification
+// names again, so keeping it would fail for good. The phone is asked to upload it again
+// instead, and it is not receipted as done; a download that may work next time is kept.
+func TestADumpThatCannotBeDownloadedIsAskedForAgainOrKept(t *testing.T) {
 	t.Parallel()
 
 	for _, tc := range []struct {
 		name      string
 		err       error
-		acked     bool
+		kept      bool
 		reuploads int
 	}{
-		{"gone from the CDN", wm.ErrMediaDownloadFailedWith404, true, 1},
-		{"expired", wm.ErrMediaDownloadFailedWith403, true, 1},
-		{"the network", errors.New("dial tcp: i/o timeout"), false, 0},
+		{"gone from the CDN", wm.ErrMediaDownloadFailedWith404, false, 1},
+		{"expired", wm.ErrMediaDownloadFailedWith403, false, 1},
+		{"the network", errors.New("dial tcp: i/o timeout"), true, 0},
 	} {
 		session, _ := newTestSession(t, "5511999990001")
 		session.setHistory(true)
@@ -499,8 +534,11 @@ func TestADumpThatCannotBeDownloadedIsAskedForAgainOrWithheld(t *testing.T) {
 			return nil, tc.err
 		}
 
-		if got := session.receive(historyNotification("NOTIF7", waE2E.HistorySyncType_RECENT)); got != tc.acked {
-			t.Errorf("%s: acknowledged %v, want %v", tc.name, got, tc.acked)
+		if !session.receive(historyNotification("NOTIF7", waE2E.HistorySyncType_RECENT)) {
+			t.Errorf("%s: a dump that is written down was withheld", tc.name)
+		}
+		if got := len(heldDumps(t, session)) == 1; got != tc.kept {
+			t.Errorf("%s: kept for another attempt %v, want %v", tc.name, got, tc.kept)
 		}
 		if got := len(bench.reuploaded()); got != tc.reuploads {
 			t.Errorf("%s: asked the phone to upload again %d times, want %d", tc.name, got, tc.reuploads)
@@ -512,8 +550,8 @@ func TestADumpThatCannotBeDownloadedIsAskedForAgainOrWithheld(t *testing.T) {
 }
 
 // Asking the phone to upload again is a write, and one that did not go out leaves the
-// dump with nothing coming: withheld, the redelivery asks again.
-func TestADumpThePhoneCouldNotBeAskedToUploadAgainIsWithheld(t *testing.T) {
+// dump with nothing coming: kept, the next attempt asks again.
+func TestADumpThePhoneCouldNotBeAskedToUploadAgainIsKept(t *testing.T) {
 	t.Parallel()
 
 	session, _ := newTestSession(t, "5511999990001")
@@ -525,8 +563,9 @@ func TestADumpThePhoneCouldNotBeAskedToUploadAgainIsWithheld(t *testing.T) {
 	session.reuploadHistory = func(context.Context, *wm.Client, waTypes.MessageID, []byte) error {
 		return wm.ErrNotConnected
 	}
-	if session.receive(historyNotification("NOTIF25", waE2E.HistorySyncType_RECENT)) {
-		t.Fatal("a dump nobody could ask for again was acknowledged, so nothing would bring it back")
+	session.receive(historyNotification("NOTIF25", waE2E.HistorySyncType_RECENT))
+	if got := heldDumps(t, session); len(got) != 1 {
+		t.Fatalf("a dump nobody could ask for again is not kept (%v), so nothing would bring it back", got)
 	}
 }
 
@@ -926,10 +965,9 @@ func TestHistoryMediaKeepsWhatWasAlreadyKeptAndRecordsTheRest(t *testing.T) {
 	}
 }
 
-// A dump that cannot be published within its budget is left for the phone to send again,
-// rather than holding the node handler past the watchdog that would start the next node
-// beside it.
-func TestADumpOverItsBudgetIsLeftForThePhoneToSendAgain(t *testing.T) {
+// A dump that cannot be published within its budget is left for another attempt, rather
+// than holding the node handler past the watchdog that would start the next node beside it.
+func TestADumpOverItsBudgetIsLeftForAnotherAttempt(t *testing.T) {
 	t.Parallel()
 
 	session, _ := newTestSession(t, "5511999990001")
@@ -944,8 +982,9 @@ func TestADumpOverItsBudgetIsLeftForThePhoneToSendAgain(t *testing.T) {
 	acknowledged := make(chan bool, 1)
 	go func() { acknowledged <- session.receive(historyNotification("NOTIF19", waE2E.HistorySyncType_RECENT)) }()
 	slices, got := slicesUntil(t, session, acknowledged)
-	if got || len(slices) != 0 || len(bench.receipted()) != 0 {
-		t.Fatalf("a dump over its budget published %d slices, acknowledged %v, receipted %v", len(slices), got, bench.receipted())
+	if !got || len(slices) != 0 || len(bench.receipted()) != 0 || len(heldDumps(t, session)) != 1 {
+		t.Fatalf("a dump over its budget published %d slices, acknowledged %v, receipted %v, kept %v",
+			len(slices), got, bench.receipted(), heldDumps(t, session))
 	}
 }
 
@@ -1040,8 +1079,9 @@ func TestTheDumpsBudgetBoundsItsDownload(t *testing.T) {
 	go func() { acknowledged <- session.receive(historyNotification("NOTIF22", waE2E.HistorySyncType_RECENT)) }()
 	select {
 	case got := <-acknowledged:
-		if got || len(bench.receipted()) != 0 {
-			t.Fatalf("a download that ran out of time was acknowledged %v, receipted %v", got, bench.receipted())
+		if !got || len(bench.receipted()) != 0 || len(heldDumps(t, session)) != 1 {
+			t.Fatalf("a download that ran out of time was acknowledged %v, receipted %v, kept %v",
+				got, bench.receipted(), heldDumps(t, session))
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("a download that never finished held the node handler past its budget")
@@ -1049,9 +1089,9 @@ func TestTheDumpsBudgetBoundsItsDownload(t *testing.T) {
 }
 
 // A dump's media carries no reference, so the row that says how to fetch the file is the
-// only way it is ever fetched. A row that could not be written withholds the dump, and the
-// redelivery writes it; published and receipted, the file would be gone for good.
-func TestADumpWhoseFileCouldNotBeKeptIsWithheld(t *testing.T) {
+// only way it is ever fetched. A row that could not be written keeps the dump for another
+// attempt, which writes it; published and receipted, the file would be gone for good.
+func TestADumpWhoseFileCouldNotBeKeptIsKept(t *testing.T) {
 	t.Parallel()
 
 	const chat = "5511999990002@s.whatsapp.net"
@@ -1066,15 +1106,19 @@ func TestADumpWhoseFileCouldNotBeKeptIsWithheld(t *testing.T) {
 			pastMessage(chat, "3EB0U1", 1754000000, false, image),
 		}})}
 	bench.install(session)
-	// The store refuses every write, the way it does for a session another instance took.
-	session.store.Drop()
+	// The store refuses every write from the download on, the way it does for a session
+	// another instance took: the dump itself is written down first, and its file is not.
+	session.downloadHistory = func(context.Context, *wm.Client, *waE2E.HistorySyncNotification) (*waHistorySync.HistorySync, error) {
+		session.store.Drop()
+		return bench.dump, nil
+	}
 
 	acknowledged := make(chan bool, 1)
 	go func() { acknowledged <- session.receive(historyNotification("NOTIF23", waE2E.HistorySyncType_RECENT)) }()
 	slices, got := slicesUntil(t, session, acknowledged)
-	if got || len(slices) != 0 || len(bench.receipted()) != 0 {
-		t.Fatalf("a dump whose file could not be kept published %d slices, acknowledged %v, receipted %v",
-			len(slices), got, bench.receipted())
+	if !got || len(slices) != 0 || len(bench.receipted()) != 0 || len(heldDumps(t, session)) != 1 {
+		t.Fatalf("a dump whose file could not be kept published %d slices, acknowledged %v, receipted %v, kept %v",
+			len(slices), got, bench.receipted(), heldDumps(t, session))
 	}
 }
 
@@ -1214,5 +1258,234 @@ func TestAHistoryRequestOnASessionThatIsNotConnectedIsRefused(t *testing.T) {
 	}
 	if len(bench.peers) != 0 {
 		t.Fatal("a request went to the phone from a session that is not connected")
+	}
+}
+
+// The row is written before anything else, and it is the one thing that brings a dump
+// back. A dump that could not be written down is the only one withheld, and nothing about
+// it is attempted.
+func TestADumpThatCouldNotBeWrittenDownIsWithheld(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setHistory(true)
+	bench := &historyBench{dump: dumpOf(waHistorySync.HistorySync_RECENT)}
+	bench.install(session)
+	session.store.Drop()
+
+	if session.receive(historyNotification("NOTIF30", waE2E.HistorySyncType_RECENT)) {
+		t.Fatal("a dump nothing wrote down was acknowledged, and nothing would bring it back")
+	}
+	if bench.downloads != 0 {
+		t.Fatalf("a dump nothing wrote down was downloaded %d times", bench.downloads)
+	}
+}
+
+// holdDump writes a dump down the way a previous owner of the session would have left it.
+func holdDump(t *testing.T, session *Session, id string, notice []byte) {
+	t.Helper()
+	if err := session.store.PutPendingHistory(t.Context(), &store.PendingHistory{
+		MessageID: id, Notice: notice, LearnedAt: 1755000000000,
+	}); err != nil {
+		t.Fatalf("PutPendingHistory: %v", err)
+	}
+}
+
+func recentNotice(t *testing.T) []byte {
+	t.Helper()
+	raw, err := proto.Marshal(&waE2E.HistorySyncNotification{SyncType: waE2E.HistorySyncType_RECENT.Enum()})
+	if err != nil {
+		t.Fatalf("marshal a notice: %v", err)
+	}
+	return raw
+}
+
+// A dump a previous owner left is finished by the next socket this session opens: that is
+// where a lost lease, a restart and a Redis outage long enough to lose the lease all end.
+func TestAPendingDumpIsFinishedWhenTheSessionConnects(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setHistory(true)
+	bench := &historyBench{dump: dumpOf(waHistorySync.HistorySync_RECENT,
+		&waHistorySync.Conversation{ID: proto.String("5511999990002@s.whatsapp.net"), Messages: []*waHistorySync.HistorySyncMsg{
+			pastText("5511999990002@s.whatsapp.net", "3EB0R1", 1754000000, "oi"),
+		}})}
+	bench.install(session)
+	holdDump(t, session, "NOTIF31", recentNotice(t))
+
+	session.handle(&waEvents.Connected{})
+	for {
+		emission := next(t, session)
+		if emission.Settle != nil {
+			emission.Settle(nil)
+		}
+		if emission.Type == protocol.EventHistorySync {
+			break
+		}
+	}
+	deadline := time.After(10 * time.Second)
+	for len(bench.receipted()) == 0 || len(heldDumps(t, session)) != 0 {
+		select {
+		case <-deadline:
+			t.Fatalf("after the connect the dump was receipted %v and is pending %v", bench.receipted(), heldDumps(t, session))
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	if got := bench.receipted(); got[0] != "NOTIF31" {
+		t.Fatalf("receipted %v, want the pending dump", got)
+	}
+}
+
+// A dump that did not finish is tried again by this session after a wait, without anybody
+// reconnecting: an outage shorter than the lease ends with the same socket up.
+func TestADumpThatDidNotFinishIsTriedAgainAfterAWait(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setHistory(true)
+	session.historyRetry = 10 * time.Millisecond
+	bench := &historyBench{dump: dumpOf(waHistorySync.HistorySync_RECENT,
+		&waHistorySync.Conversation{ID: proto.String("5511999990002@s.whatsapp.net"), Messages: []*waHistorySync.HistorySyncMsg{
+			pastText("5511999990002@s.whatsapp.net", "3EB0R2", 1754000000, "oi"),
+		}})}
+	bench.install(session)
+
+	go session.receive(historyNotification("NOTIF32", waE2E.HistorySyncType_RECENT))
+	next(t, session).Settle(errors.New("redis is gone"))
+	retried := next(t, session)
+	if retried.Type != protocol.EventHistorySync {
+		t.Fatalf("the retry published %s", retried.Type)
+	}
+	retried.Settle(nil)
+	deadline := time.After(10 * time.Second)
+	for len(bench.receipted()) == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("the retry published the dump and never receipted it")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
+// Each attempt downloads the dump again, so the wait doubles, up to a ceiling, and starts
+// over once everything finished.
+func TestTheWaitBetweenAttemptsDoublesUpToTheCeiling(t *testing.T) {
+	t.Parallel()
+
+	var dumps pendingDumps
+	var waits []time.Duration
+	for range 5 {
+		wait, armed := dumps.arm(time.Second, 5*time.Second)
+		if !armed {
+			t.Fatal("an attempt was not armed with none armed")
+		}
+		if _, again := dumps.arm(time.Second, 5*time.Second); again {
+			t.Fatal("a second attempt was armed beside the first")
+		}
+		dumps.disarm()
+		waits = append(waits, wait)
+	}
+	want := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 5 * time.Second, 5 * time.Second}
+	if fmt.Sprint(waits) != fmt.Sprint(want) {
+		t.Fatalf("waits %v, want %v", waits, want)
+	}
+
+	if !dumps.begin() {
+		t.Fatal("a replay did not begin with none running")
+	}
+	if dumps.end(false) {
+		t.Fatal("a replay nobody asked for again went round again")
+	}
+	if wait, _ := dumps.arm(time.Second, 5*time.Second); wait != 5*time.Second {
+		t.Fatalf("after a replay that did not finish the wait is %v, want it to stay at the ceiling", wait)
+	}
+	dumps.disarm()
+	dumps.begin()
+	dumps.end(true)
+	if wait, _ := dumps.arm(time.Second, 5*time.Second); wait != time.Second {
+		t.Fatalf("after a replay that finished everything the wait is %v, want the first", wait)
+	}
+}
+
+// A replay asked for while one runs goes round again when it is done, so a dump written
+// down meanwhile is not left for the next connection.
+func TestAReplayAskedForWhileOneRunsGoesRoundAgain(t *testing.T) {
+	t.Parallel()
+
+	var dumps pendingDumps
+	if !dumps.begin() {
+		t.Fatal("a replay did not begin with none running")
+	}
+	if dumps.begin() {
+		t.Fatal("a second replay began beside the first")
+	}
+	if !dumps.end(true) {
+		t.Fatal("the running replay did not go round again for the one asked for meanwhile")
+	}
+	if dumps.end(true) {
+		t.Fatal("the replay went round twice for one ask")
+	}
+	if !dumps.begin() {
+		t.Fatal("a replay could not begin after the last one ended")
+	}
+}
+
+// A row nothing can read is one no attempt will ever finish, and every later owner would
+// fail on it the same way.
+func TestAPendingDumpNothingCanReadIsDropped(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	bench := &historyBench{}
+	bench.install(session)
+	holdDump(t, session, "NOTIF33", []byte{0xff, 0xff, 0xff})
+
+	session.replayHistory()
+	if got := heldDumps(t, session); len(got) != 0 {
+		t.Fatalf("an unreadable dump is still pending: %v", got)
+	}
+	if bench.downloads != 0 {
+		t.Fatalf("an unreadable dump was downloaded %d times", bench.downloads)
+	}
+}
+
+// A notification that arrives again while a retry of it runs is the same dump, and one
+// attempt at it is all there is: two would publish it twice.
+func TestADumpBeingRetriedIsNotStartedASecondTime(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setHistory(true)
+	bench := &historyBench{dump: dumpOf(waHistorySync.HistorySync_RECENT)}
+	bench.install(session)
+	started, carryOn := make(chan struct{}), make(chan struct{})
+	var downloads sync.Mutex
+	count := 0
+	session.downloadHistory = func(context.Context, *wm.Client, *waE2E.HistorySyncNotification) (*waHistorySync.HistorySync, error) {
+		downloads.Lock()
+		count++
+		downloads.Unlock()
+		close(started)
+		<-carryOn
+		return bench.dump, nil
+	}
+	holdDump(t, session, "NOTIF34", recentNotice(t))
+
+	replayed := make(chan struct{})
+	go func() {
+		session.replayHistory()
+		close(replayed)
+	}()
+	<-started
+	if !session.receive(historyNotification("NOTIF34", waE2E.HistorySyncType_RECENT)) {
+		t.Error("the notification of a dump being retried was withheld")
+	}
+	close(carryOn)
+	<-replayed
+	downloads.Lock()
+	defer downloads.Unlock()
+	if count != 1 {
+		t.Fatalf("one dump was downloaded %d times", count)
 	}
 }

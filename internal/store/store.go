@@ -681,6 +681,20 @@ func (c *Container) migrate(ctx context.Context) error {
 			FOREIGN KEY (sid) REFERENCES wac_session_device (sid) ON DELETE CASCADE
 		)`,
 
+		// A history dump that was announced and not finished with. The phone announces a
+		// dump once and does not announce it again for a notification left unacknowledged,
+		// so this row is what a lost Redis, a lost lease or a restart in the middle of one
+		// leaves for the next attempt. The same cascade as the placeholder: a dump of an
+		// account that was logged out is one nobody should publish.
+		`CREATE TABLE IF NOT EXISTS wac_pending_history (
+			sid        TEXT   NOT NULL,
+			message_id TEXT   NOT NULL,
+			notice     TEXT   NOT NULL,
+			learned_at BIGINT NOT NULL,
+			PRIMARY KEY (sid, message_id),
+			FOREIGN KEY (sid) REFERENCES wac_session_device (sid) ON DELETE CASCADE
+		)`,
+
 		// What a client asked this account to be shown as, so the first connection of a
 		// new owner can put it back the way a reconnect does. The session's own memory
 		// cannot: it is per instance, and a handoff builds one that has never heard the

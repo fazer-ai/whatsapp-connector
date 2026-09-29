@@ -152,6 +152,12 @@ type Session struct {
 	// historyReceiptWait bounds the write a dump makes after its budget, for the same
 	// reason.
 	historyReceiptWait time.Duration
+	// historyRetry and historyRetryCeiling pace the attempts at a dump that did not
+	// finish, and are fields for the same reason.
+	historyRetry        time.Duration
+	historyRetryCeiling time.Duration
+	// dumps keeps two attempts at one dump apart.
+	dumps pendingDumps
 
 	// downloadWait bounds how long an inbound media message spends fetching its file.
 	// A field for the same reason as the two above it, and for no other.
@@ -805,18 +811,20 @@ func newSession(
 		handoffWait: perishableHandoff,
 		awaited:     make(map[string]*awaiting),
 
-		reuploads:          make(map[string]chan *waEvents.MediaRetry),
-		reuploadWait:       reuploadTimeout,
-		rerequestWait:      rerequestTimeout,
-		rerequestRetry:     rerequestRetry,
-		presenceWrite:      make(chan struct{}, 1),
-		presenceWait:       presenceWriteTimeout,
-		callWait:           callWriteTimeout,
-		board:              make(map[string]posted),
-		downloadWait:       downloadTimeout,
-		historyBudget:      historyBudget,
-		historyReceiptWait: historyReceiptTimeout,
-		uploadWait:         uploadTimeout,
+		reuploads:           make(map[string]chan *waEvents.MediaRetry),
+		reuploadWait:        reuploadTimeout,
+		rerequestWait:       rerequestTimeout,
+		rerequestRetry:      rerequestRetry,
+		presenceWrite:       make(chan struct{}, 1),
+		presenceWait:        presenceWriteTimeout,
+		callWait:            callWriteTimeout,
+		board:               make(map[string]posted),
+		downloadWait:        downloadTimeout,
+		historyBudget:       historyBudget,
+		historyReceiptWait:  historyReceiptTimeout,
+		historyRetry:        historyRetry,
+		historyRetryCeiling: historyRetryCeiling,
+		uploadWait:          uploadTimeout,
 	}
 	s.route.notify = s.proxyOutcome
 	s.declineCall = func(ctx context.Context, client *wm.Client, caller waTypes.JID, callID string) error {
@@ -4674,6 +4682,10 @@ func (s *Session) handle(rawEvent any) bool {
 		// and this has none -- so what this buys is a head start, not a guarantee.
 		go s.reapplyAvailability(s.ctx, s.current())
 		s.emit(protocol.EventSessionState, s.sessionState())
+		// A dump written down and not finished with, this session's or the previous
+		// owner's, is finished on a socket that can download it. Nothing else brings it
+		// back: the phone does not announce a dump twice.
+		go s.replayHistory()
 	case *waEvents.KeepAliveTimeout:
 		// The socket is open and the server stopped answering on it. Nobody else is going
 		// to say so for a while: whatsmeow's own patience here is KeepAliveMaxFailTime,
