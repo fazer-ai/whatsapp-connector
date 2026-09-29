@@ -25,6 +25,7 @@ import (
 	waBinary "go.mau.fi/whatsmeow/binary"
 	"go.mau.fi/whatsmeow/proto/waAdv"
 	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
+	waHistorySync "go.mau.fi/whatsmeow/proto/waHistorySync"
 	waTypes "go.mau.fi/whatsmeow/types"
 	waEvents "go.mau.fi/whatsmeow/types/events"
 	"google.golang.org/protobuf/proto"
@@ -3593,6 +3594,33 @@ func resumedDoors() []resumedDoor {
 					CallRemoteMeta: waTypes.CallRemoteMeta{RemotePlatform: "android"},
 					Data:           &waBinary.Node{Tag: "offer", Content: []waBinary.Node{{Tag: "audio"}}},
 				})
+			},
+		},
+		{
+			// A group's history, which a dump carries alongside the direct chats and the
+			// subscription decides the same way it decides a live message.
+			door: "publishConversation",
+			// Held back until the slice is known to have been delivered.
+			answers: answersNo,
+			carries: func(t *testing.T, payload map[string]any) {
+				inTheGroup(t, payload, "chat")
+				messages, _ := payload["messages"].([]any)
+				if len(messages) != 1 {
+					t.Errorf("published %v as the group's history", payload["messages"])
+				}
+			},
+			quiet:      inboxIsEmpty,
+			definition: "event_history_sync",
+			want:       protocol.EventHistorySync,
+			give: func(s *Session) bool {
+				s.setHistory(true)
+				group := groupJID().String()
+				past := pastText(group, "3EB0HISTORYRESUME", 1754000000, "bom dia, time")
+				past.Message.Key.Participant = proto.String(someone("5511999990002").String())
+				(&historyBench{dump: dumpOf(waHistorySync.HistorySync_RECENT,
+					&waHistorySync.Conversation{ID: proto.String(group), Messages: []*waHistorySync.HistorySyncMsg{past}},
+				)}).install(s)
+				return s.handle(historyNotification("NOTIFRESUME", waE2E.HistorySyncType_RECENT))
 			},
 		},
 		{

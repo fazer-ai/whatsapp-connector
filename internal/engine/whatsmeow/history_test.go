@@ -11,9 +11,11 @@ import (
 
 	wm "go.mau.fi/whatsmeow"
 	waCommon "go.mau.fi/whatsmeow/proto/waCommon"
+	waCompanionReg "go.mau.fi/whatsmeow/proto/waCompanionReg"
 	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
 	waHistorySync "go.mau.fi/whatsmeow/proto/waHistorySync"
 	waWeb "go.mau.fi/whatsmeow/proto/waWeb"
+	waStore "go.mau.fi/whatsmeow/store"
 	waTypes "go.mau.fi/whatsmeow/types"
 	waEvents "go.mau.fi/whatsmeow/types/events"
 	"google.golang.org/protobuf/proto"
@@ -411,5 +413,94 @@ func TestTheConnectDecidesWhetherHistoryIsPublished(t *testing.T) {
 	request := engine.ConnectRequest{Pairing: "resume", HistorySync: true}
 	if err := request.Validate(); err != nil {
 		t.Fatalf("a connect asking for history was refused: %v", err)
+	}
+}
+
+// Whether the phone sends everything it has is decided when the device pairs, by what the
+// device says it wants, and that is each session's choice rather than the process's.
+func TestAPairingAsksForTheFullHistoryOnlyWhenTheClientDid(t *testing.T) {
+	t.Parallel()
+
+	for _, wants := range []bool{true, false} {
+		session, _ := newTestSession(t, "5511999990001")
+		client := session.current()
+		if !session.adopt(t.Context(), client) {
+			t.Fatal("the session would not take its own client back")
+		}
+		session.setHistory(wants)
+		// A device with no account yet, which is the one whose payload carries the
+		// properties: pairing is where they are read.
+		client.Store.ID = nil
+
+		payload := client.GetClientPayload()
+		var props waCompanionReg.DeviceProps
+		if err := proto.Unmarshal(payload.GetDevicePairingData().GetDeviceProps(), &props); err != nil {
+			t.Fatalf("unmarshal the device properties: %v", err)
+		}
+		if props.GetRequireFullSync() != wants {
+			t.Errorf("a session whose client asked for history=%v paired asking for the full sync=%v", wants, props.GetRequireFullSync())
+		}
+		if props.GetPlatformType() != waStore.DeviceProps.GetPlatformType() || props.GetOs() != waStore.DeviceProps.GetOs() {
+			t.Errorf("the rest of the properties changed on the way: %v", &props)
+		}
+	}
+}
+
+// A dump whose blob WhatsApp no longer has is one a redelivery names again, so withholding
+// it would have the phone send it for good; a download that may work next time is withheld.
+func TestADumpThatCannotBeDownloadedIsReceiptedOnlyWhenItNeverWill(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name  string
+		err   error
+		acked bool
+	}{
+		{"gone from the CDN", wm.ErrMediaDownloadFailedWith404, true},
+		{"expired", wm.ErrMediaDownloadFailedWith403, true},
+		{"the network", errors.New("dial tcp: i/o timeout"), false},
+	} {
+		session, _ := newTestSession(t, "5511999990001")
+		session.setHistory(true)
+		bench := &historyBench{}
+		bench.install(session)
+		session.downloadHistory = func(context.Context, *wm.Client, *waE2E.HistorySyncNotification) (*waHistorySync.HistorySync, error) {
+			return nil, tc.err
+		}
+
+		if got := session.receive(historyNotification("NOTIF7", waE2E.HistorySyncType_RECENT)); got != tc.acked {
+			t.Errorf("%s: acknowledged %v, want %v", tc.name, got, tc.acked)
+		}
+		if receipted := len(bench.receipted()) == 1; receipted != tc.acked {
+			t.Errorf("%s: receipted %v, want %v", tc.name, receipted, tc.acked)
+		}
+	}
+}
+
+// The status feed, a broadcast list and a channel ride in a dump beside the conversations,
+// and none of them is one.
+func TestAFeedInADumpIsNotPublishedAsAConversation(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setHistory(true)
+	status := pastText("status@broadcast", "3EB0S1", 1754000000, "meu status")
+	status.Message.Key.Participant = proto.String("5511999990002@s.whatsapp.net")
+	bench := &historyBench{dump: dumpOf(waHistorySync.HistorySync_RECENT,
+		&waHistorySync.Conversation{ID: proto.String("status@broadcast"), Messages: []*waHistorySync.HistorySyncMsg{status}},
+		&waHistorySync.Conversation{ID: proto.String("120363000000000001@newsletter"), Messages: []*waHistorySync.HistorySyncMsg{
+			pastText("120363000000000001@newsletter", "3EB0N1", 1754000000, "post"),
+		}},
+		&waHistorySync.Conversation{ID: proto.String("5511999990002@s.whatsapp.net"), Messages: []*waHistorySync.HistorySyncMsg{
+			pastText("5511999990002@s.whatsapp.net", "3EB0P1", 1754000000, "oi"),
+		}},
+	)}
+	bench.install(session)
+
+	acknowledged := make(chan bool, 1)
+	go func() { acknowledged <- session.receive(historyNotification("NOTIF8", waE2E.HistorySyncType_RECENT)) }()
+	slices, _ := slicesUntil(t, session, acknowledged)
+	if len(slices) != 1 || slices[0].Chat.Kind != protocol.AddressPhone {
+		t.Fatalf("published %+v, want only the direct chat", slices)
 	}
 }

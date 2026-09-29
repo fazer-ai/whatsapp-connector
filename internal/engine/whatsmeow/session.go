@@ -920,6 +920,7 @@ func (s *Session) adopt(ctx context.Context, client *wm.Client) bool {
 	// account.
 	client.EnableAutoReconnect = true
 	client.PrePairCallback = s.bind
+	client.GetClientPayload = s.payloadWithHistory(client)
 	client.BackgroundEventCtx = s.ctx
 	// The ack for an inbound message waits for the handlers, and a handler that reports
 	// failure stops it being sent at all. That pairing is what lets this build refuse a
@@ -929,8 +930,8 @@ func (s *Session) adopt(ctx context.Context, client *wm.Client) bool {
 	// The history dump has an acknowledgement of its own that the handler gate does not
 	// cover: whatsmeow downloads it and receipts it on its own. Both are turned off
 	// together, because receipting a dump nobody published is the same loss as
-	// acknowledging a message nobody published, and M6 is where the dump gets somewhere
-	// to go.
+	// acknowledging a message nobody published: receiveHistory downloads it and sends the
+	// receipt once the slices are out.
 	client.ManualHistorySyncDownload = true
 	client.DisableManualHistorySyncReceipt = true
 	// Refusing the ack only keeps a message if the redelivery can still be read.
@@ -1792,6 +1793,7 @@ func (s *Session) Connect(ctx context.Context, req engine.ConnectRequest) error 
 	// underneath it would go on acknowledging and dropping group messages until the
 	// next connect that happened to succeed.
 	s.setGroups(req.Groups)
+	s.setHistory(req.HistorySync)
 	s.setCallPolicy(req.Calls != nil && req.Calls.AutoReject)
 
 	// A hang-up an earlier command left running is waited for first: the move below may
@@ -1883,6 +1885,7 @@ func (s *Session) standOnWhatWasAsked(ctx context.Context) error {
 		return nil
 	}
 	s.setGroups(standing.Groups)
+	s.setHistory(standing.History)
 	s.setCallPolicy(standing.CallAutoReject)
 	// Nothing is dialled yet, so there is no socket to hang up: moving the route is all a
 	// proxy needs here.
@@ -3389,6 +3392,8 @@ func (s *Session) Execute(ctx context.Context, command *protocol.Command) (json.
 		return s.markUnread(ctx, command)
 	case protocol.CommandCallReject:
 		return s.rejectCall(ctx, command)
+	case protocol.CommandHistoryRequest:
+		return s.requestHistory(ctx, command)
 	case protocol.CommandGroupLeave, protocol.CommandGroupPhotoSet, protocol.CommandGroupNameSet,
 		protocol.CommandGroupDescriptionSet, protocol.CommandGroupSettingsSet,
 		protocol.CommandGroupInviteGet, protocol.CommandGroupJoinRequestsList,

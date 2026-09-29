@@ -527,6 +527,12 @@ func (s *Session) receive(event *waEvents.Message) bool {
 	// before it published either.
 	learned := s.learned()
 
+	if notice := historyNotice(event); notice != nil {
+		// Before the switch below, which drops every other protocol message the account
+		// sends itself as plumbing.
+		return s.receiveHistory(event, notice, learned)
+	}
+
 	if event.Info.Sender.IsBot() || event.Info.Chat.IsBot() {
 		// Meta's assistants, either in a chat of their own or replying inline in
 		// somebody else's. The contract has no kind for them on purpose, so no slice of

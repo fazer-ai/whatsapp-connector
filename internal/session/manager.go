@@ -1538,7 +1538,7 @@ func resumeRequest(wants store.Wants) engine.ConnectRequest {
 	// Built from the type the session decodes rather than spelled out as a literal, so
 	// what this writes and what reads it cannot drift: they are the same struct, and a
 	// field renamed on one side stops compiling instead of quietly setting nothing.
-	request := engine.ConnectRequest{Pairing: "resume", Groups: wants.Groups}
+	request := engine.ConnectRequest{Pairing: "resume", Groups: wants.Groups, HistorySync: wants.History}
 	if wants.CallAutoReject {
 		// Omitted rather than sent as `{auto_reject: false}`: a client that never asked
 		// about calls and one that asked for them to ring are the same request, and the

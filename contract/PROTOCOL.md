@@ -345,6 +345,7 @@ theirs, and the connector is always upgraded first.
   `presence.update` states, are facts that hold until something says otherwise and carry
   no such rule.
 - `session.connect` may carry `proxy: {url}`, and a session that does leaves for WhatsApp through that proxy rather than from the connector's own address: the pairing, the running socket, and the uploads and downloads of media to WhatsApp's hosts. The URL uses `http`, `https` or `socks5`, and names a host; anything else, including `socks5h`, is refused with `invalid_payload` before the connector records or dials anything. A proxy whose address is link-local or a cloud metadata service is refused when it is dialled, and the connect fails rather than going out directly; loopback and private addresses are dialled like any other. **Each connect states the whole request**, as it does for `groups` and `calls`: a connect without `proxy`, with `proxy: null` or with an empty `url` asks for the session to go out directly, including on a session that had a proxy. A connect naming a different path than the one a session is on takes its socket down and dials again through the new one, so for a paired session the client sees `session.state` `reconnecting` with `reason: proxy_changed`, then `connecting` and `open`, and no `close`: the session comes back within that connect, without anybody asking again. A session still pairing has no connection to come back to, and its hang-up is the `close` with `reason: disconnect_requested` that a `session.disconnect` publishes; so is the hang-up of a move whose connect was answered as failed before the socket went down, because no redial follows it. A connect naming the same path changes nothing, which is what keeps a periodic reconnect from recycling a healthy socket. The proxy is remembered with the rest of the request and used when the connector brings the account back by itself, and a proxy that stops working keeps the account down rather than letting it go out directly. While a session with a proxy is trying to get its socket up -- `session.state` `reconnecting` after a drop, or `connecting` for a dial the connector goes on retrying, which is where a session resumed with its proxy down sits -- a dial that fails at the proxy (the proxy cannot be reached, or it refuses the tunnel) publishes that same state with `reason: proxy_unreachable`, once per change of cause and not once per attempt, although the retries go on for as long as the outage lasts. A failure past the proxy, a tunnel that opens and carries nothing back from WhatsApp, is not the proxy's and never carries that reason; and once the proxy answers again with the socket still down, the state is published again with `reason: disconnected`, so the proxy is not left named as the cause. A session with no proxy never carries `proxy_unreachable`, and the event says nothing about which proxy or what error: the reason is all there is. A connect naming a proxy that the connector could not record is refused before anything changes, because the account would otherwise leave through the proxy now and directly after the next restart. The URL is treated as a credential: it never appears in a reply, an event or an error message, so a client that needs to show which proxy an inbox uses keeps its own copy.
+- `session.connect` may carry `history_sync: true`, and a session that does publishes the conversations the phone sends a linked device as `history.sync` events: the dump it sends when the device pairs (`sync` `bootstrap` and `recent`, and `full` for everything older, which the phone only sends to a device that asked for history when it paired) and each answer to a `history.request` (`on_demand`). Like `groups` and `calls`, each connect states it again and it is remembered with the rest of the request when the connector brings the account back by itself. A session without it still receives the dumps and publishes none of them. Each event is one chat's messages, oldest first, at most 100 per event, so a longer chat arrives in several; each message is an `inbound_message` as `message.received` carries it, with its `from_me`. Reactions, edits, deletions and votes are not in it, because the phone sends the messages with those already applied. Media in a slice carries no `ref`: nothing is downloaded while a dump is published, and `message.download_media` fetches the file when the client wants it. `exhausted` on a chat's last event means the phone has nothing older for it, and an on-demand answer with no messages is sent as one empty event with `exhausted` so a client stops asking. A dump is acknowledged to the phone only after every event in it was published, so a dump that could not be published arrives again, whole: a client deduplicates by message id, which it already does for `message.received`. `history.request` needs `before`, the oldest message the client has for the chat, because the phone can only walk back from a message it is shown; one without it is refused with `unsupported`. `count` defaults to 50 and is a hint the phone does not always honour. The request is answered `null` once it went out, and the phone's answer, if any, arrives later as `on_demand` events; a phone that is offline never answers.
 - `presence.set` takes effect when WhatsApp says so, not when the reply comes back: the
   node is written and acknowledged locally, and a `chat.presence` sent in the same breath
   as the `available` before it has been observed not to render on the other phone, while
@@ -427,17 +428,16 @@ theirs, and the connector is always upgraded first.
   as a reply. They stay in the enum because
   removing one narrows what a client may already match on, and each is marked in
   `internal/protocol/errors.go` with what arrives in its place.
-- Four command types have no handler here -- `session.update`, `history.request`,
-  `contact.info` and `call.reject` -- and a client that sends one is answered
-  `unsupported`. That answer only reaches a client whose session some instance owns: a
+- Two command types have no handler here -- `session.update` and `contact.info` --
+  and a client that sends one is answered `unsupported`. That answer only reaches a client whose session some instance owns: a
   command for a session nobody is running is delivered to nobody, so the caller waits out
-  its own deadline instead. Which four is marked in `internal/protocol/types.go` and held
+  its own deadline instead. Which two is marked in `internal/protocol/types.go` and held
   there by a test, so wiring one up without saying so fails the build.
-- Nine of the event types have no producer in this connector either, and the same
+- Six of the event types have no producer in this connector either, and the same
   reasoning holds: a client may match on one and never see it. Unlike a command, nothing
   says so at the time -- a command it does not implement comes back `unsupported`, while
   an event that is never published is indistinguishable from one that has not happened.
-  Which nine is marked in `internal/protocol/types.go` and held there by a test, so
+  Which six is marked in `internal/protocol/types.go` and held there by a test, so
   the marking is what the build does rather than what it did when somebody last looked.
   An unproduced type stays only while some producer could emit it one day:
   `account.reachout_timelock` and `account.new_chat_cap` were removed because none can.
@@ -458,8 +458,8 @@ it per command type, because a result is only ever read by the caller of that on
 command. What the two sides agreed on is listed here, and it is what a command answers
 when a connector carries it out at all: one that does not implement a command refuses
 it with `unsupported` rather than answering a result of the wrong shape. In this
-connector that is `contact.info` and `history.request` below, plus `session.update` and
-`call.reject`, which have no result of their own to list.
+connector that is `contact.info` below, plus `session.update`, which has no result of its
+own to list.
 
 | Command | `result` |
 |---|---|
