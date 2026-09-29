@@ -427,6 +427,14 @@ func (c *Container) bind(ctx context.Context, sid string, jid types.JID) error {
 		sid, sid, jid.String()); err != nil {
 		return fmt.Errorf("store: bind %s: %w", sid, err)
 	}
+	// And the history dumps, which the device's own writes are already held to: a row is
+	// only ever written for the device the session is bound to, and this is the bond
+	// changing, so what the previous device left is the previous account's.
+	if _, err := tx.ExecContext(ctx, c.rebind(`
+		DELETE FROM wac_pending_history WHERE sid = ? AND device_jid <> ?`),
+		sid, jid.String()); err != nil {
+		return fmt.Errorf("store: bind %s: %w", sid, err)
+	}
 	if _, err := tx.ExecContext(ctx, c.rebind(`
 		INSERT INTO wac_session_device (sid, jid, account, bound_at) VALUES (?, ?, ?, ?)
 		ON CONFLICT (sid) DO UPDATE SET
@@ -689,6 +697,7 @@ func (c *Container) migrate(ctx context.Context) error {
 		`CREATE TABLE IF NOT EXISTS wac_pending_history (
 			sid        TEXT   NOT NULL,
 			message_id TEXT   NOT NULL,
+			device_jid TEXT   NOT NULL,
 			notice     TEXT   NOT NULL,
 			learned_at BIGINT NOT NULL,
 			PRIMARY KEY (sid, message_id),

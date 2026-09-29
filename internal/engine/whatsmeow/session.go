@@ -158,6 +158,10 @@ type Session struct {
 	historyRetryCeiling time.Duration
 	// historyReplayBudget is historyBudget for a retry, and a field for the same reason.
 	historyReplayBudget time.Duration
+	// readPendingHistory reads the dumps a retry works through. A seam so a test can land
+	// a logout in the middle of the read, which is the window the account check after it
+	// is for.
+	readPendingHistory func(context.Context) ([]store.PendingHistory, error)
 	// dumps keeps two attempts at one dump apart.
 	dumps pendingDumps
 
@@ -830,6 +834,7 @@ func newSession(
 		uploadWait:          uploadTimeout,
 	}
 	s.route.notify = s.proxyOutcome
+	s.readPendingHistory = s.store.PendingHistory
 	s.declineCall = func(ctx context.Context, client *wm.Client, caller waTypes.JID, callID string) error {
 		if client == nil {
 			// The socket this would be written on is gone. Checked here rather than at

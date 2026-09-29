@@ -18,18 +18,19 @@ type pendingDumps struct {
 // unwrittenDump is a notification kept in memory until it can be written down.
 type unwrittenDump struct {
 	id         string
+	device     string
 	notice     []byte
 	learned    int64
 	generation uint64
 }
 
-func (d *pendingDumps) keepUnwritten(id string, notice []byte, learned int64, generation uint64) {
+func (d *pendingDumps) keepUnwritten(dump unwrittenDump) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.unwritten == nil {
 		d.unwritten = make(map[string]unwrittenDump)
 	}
-	d.unwritten[id] = unwrittenDump{id: id, notice: notice, learned: learned, generation: generation}
+	d.unwritten[dump.id] = dump
 }
 
 func (d *pendingDumps) forgetUnwritten(id string) {

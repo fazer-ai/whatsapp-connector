@@ -1267,9 +1267,11 @@ func TestAHistoryRequestOnASessionThatIsNotConnectedIsRefused(t *testing.T) {
 func TestADumpThatCouldNotBeWrittenDownIsWrittenByTheNextAttempt(t *testing.T) {
 	t.Parallel()
 
-	// Not paired yet, so the row has no device to hang from and the write is refused.
-	session, _ := newTestSession(t, "")
+	// The store refuses the write, the way it does while the lease is in doubt; a handle
+	// with a fence of its own below is the store answering again.
+	session, container := newTestSession(t, "5511999990001")
 	session.historyRetry = time.Hour
+	session.store.Drop()
 	bench := &historyBench{dump: dumpOf(waHistorySync.HistorySync_RECENT)}
 	bench.install(session)
 
@@ -1298,13 +1300,7 @@ func TestADumpThatCouldNotBeWrittenDownIsWrittenByTheNextAttempt(t *testing.T) {
 		t.Fatal("a retry that could not write the dump down counted as finished")
 	}
 
-	jid, err := waTypes.ParseJID("5511999990001:12@" + waTypes.DefaultUserServer)
-	if err != nil {
-		t.Fatalf("ParseJID: %v", err)
-	}
-	if err := session.store.Bind(t.Context(), jid); err != nil {
-		t.Fatalf("Bind: %v", err)
-	}
+	session.store = container.For(session.sid)
 	session.replayHistory()
 	if got := bench.receipted(); len(got) != 1 || got[0] != "NOTIF30" {
 		t.Fatalf("after the store came back the dump was receipted %v", got)
@@ -1322,7 +1318,10 @@ func TestAnUnwrittenDumpOfAReplacedAccountIsLetGo(t *testing.T) {
 	t.Parallel()
 
 	session, _ := newTestSession(t, "5511999990001")
-	session.dumps.keepUnwritten("NOTIF43", recentNotice(t), 1755000000000, session.aliases.learning())
+	session.dumps.keepUnwritten(unwrittenDump{
+		id: "NOTIF43", device: deviceOf(session.current()), notice: recentNotice(t),
+		learned: 1755000000000, generation: session.aliases.learning(),
+	})
 	session.aliases.forget()
 
 	session.replayHistory()
@@ -1369,7 +1368,7 @@ func TestARetryHasABudgetOfItsOwn(t *testing.T) {
 func holdDump(t *testing.T, session *Session, id string, notice []byte) {
 	t.Helper()
 	if err := session.store.PutPendingHistory(t.Context(), &store.PendingHistory{
-		MessageID: id, Notice: notice, LearnedAt: 1755000000000,
+		MessageID: id, Device: deviceOf(session.current()), Notice: notice, LearnedAt: 1755000000000,
 	}); err != nil {
 		t.Fatalf("PutPendingHistory: %v", err)
 	}
@@ -1780,5 +1779,49 @@ func TestAReplayForAReplacedAccountDeletesNothing(t *testing.T) {
 	session.replayHistory()
 	if got := heldDumps(t, session); len(got) != 1 {
 		t.Fatalf("the row under the replaced account's dump was deleted: %v", got)
+	}
+}
+
+// A logout landing while the rows are read leaves them unattempted: they may be the next
+// account's, read under the old one's generation.
+func TestRowsReadAcrossALogoutAreNotAttempted(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.historyRetry = time.Hour
+	bench := &historyBench{dump: dumpOf(waHistorySync.HistorySync_RECENT)}
+	bench.install(session)
+	holdDump(t, session, "NOTIF46", recentNotice(t))
+	read := session.readPendingHistory
+	session.readPendingHistory = func(ctx context.Context) ([]store.PendingHistory, error) {
+		session.aliases.forget()
+		return read(ctx)
+	}
+
+	session.replayHistory()
+	if bench.downloads != 0 || len(bench.receipted()) != 0 {
+		t.Fatalf("rows read across a logout were attempted: %d downloads, receipts %v", bench.downloads, bench.receipted())
+	}
+	if got := heldDumps(t, session); len(got) != 1 {
+		t.Fatalf("rows read across a logout were deleted: %v", got)
+	}
+}
+
+// A logout and a new pairing can land while a dump kept in memory is written, with the
+// generation still the old one. The write is held to the device the dump reached, so it
+// is not filed under the account that paired after it.
+func TestAnUnwrittenDumpOfAnotherDeviceIsNotFiledUnderThisOne(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.historyRetry = time.Hour
+	session.dumps.keepUnwritten(unwrittenDump{
+		id: "NOTIF47", device: "5511999990009:3@s.whatsapp.net", notice: recentNotice(t),
+		learned: 1755000000000, generation: session.aliases.learning(),
+	})
+
+	session.replayHistory()
+	if got := heldDumps(t, session); len(got) != 0 {
+		t.Fatalf("the other device's dump was filed under this one: %v", got)
 	}
 }

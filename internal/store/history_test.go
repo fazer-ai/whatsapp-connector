@@ -4,20 +4,25 @@ import (
 	"reflect"
 	"testing"
 
+	"go.mau.fi/whatsmeow/types"
+
 	"github.com/fazer-ai/whatsapp-connector/internal/store"
 )
 
-func sampleDump(messageID string, learnedAt int64) store.PendingHistory {
-	return store.PendingHistory{MessageID: messageID, Notice: []byte{0x08, 0x01, 0x12, 0x03, 'a', 'b', 'c'}, LearnedAt: learnedAt}
+func sampleDump(device types.JID, messageID string, learnedAt int64) store.PendingHistory {
+	return store.PendingHistory{
+		MessageID: messageID, Device: device.String(),
+		Notice: []byte{0x08, 0x01, 0x12, 0x03, 'a', 'b', 'c'}, LearnedAt: learnedAt,
+	}
 }
 
 // The notice is what the download is made from, so it has to come back byte for byte.
 func TestAPendingDumpComesBackExactly(t *testing.T) {
 	t.Parallel()
 	container := open(t)
-	pair(t, container, "sid-1", "5511999990001")
+	device := pair(t, container, "sid-1", "5511999990001")
 
-	held := sampleDump("NOTIF1", 1755000000000)
+	held := sampleDump(device, "NOTIF1", 1755000000000)
 	if err := container.For("sid-1").PutPendingHistory(t.Context(), &held); err != nil {
 		t.Fatalf("PutPendingHistory: %v", err)
 	}
@@ -36,9 +41,9 @@ func TestAPendingDumpComesBackExactly(t *testing.T) {
 func TestHoldingTheSameDumpTwiceKeepsTheFirst(t *testing.T) {
 	t.Parallel()
 	container := open(t)
-	pair(t, container, "sid-1", "5511999990001")
+	device := pair(t, container, "sid-1", "5511999990001")
 
-	for _, held := range []store.PendingHistory{sampleDump("NOTIF2", 1755000000000), sampleDump("NOTIF2", 1755000009000)} {
+	for _, held := range []store.PendingHistory{sampleDump(device, "NOTIF2", 1755000000000), sampleDump(device, "NOTIF2", 1755000009000)} {
 		if err := container.For("sid-1").PutPendingHistory(t.Context(), &held); err != nil {
 			t.Fatalf("PutPendingHistory: %v", err)
 		}
@@ -56,9 +61,9 @@ func TestHoldingTheSameDumpTwiceKeepsTheFirst(t *testing.T) {
 func TestPendingDumpsComeBackInTheOrderTheyArrived(t *testing.T) {
 	t.Parallel()
 	container := open(t)
-	pair(t, container, "sid-1", "5511999990001")
+	device := pair(t, container, "sid-1", "5511999990001")
 
-	for _, held := range []store.PendingHistory{sampleDump("NOTIFLATER", 1755000020000), sampleDump("NOTIFSOONER", 1755000000000)} {
+	for _, held := range []store.PendingHistory{sampleDump(device, "NOTIFLATER", 1755000020000), sampleDump(device, "NOTIFSOONER", 1755000000000)} {
 		if err := container.For("sid-1").PutPendingHistory(t.Context(), &held); err != nil {
 			t.Fatalf("PutPendingHistory: %v", err)
 		}
@@ -76,10 +81,10 @@ func TestPendingDumpsComeBackInTheOrderTheyArrived(t *testing.T) {
 func TestAPendingDumpOfOneSessionIsNotReadByAnother(t *testing.T) {
 	t.Parallel()
 	container := open(t)
-	pair(t, container, "sid-1", "5511999990001")
+	device := pair(t, container, "sid-1", "5511999990001")
 	pair(t, container, "sid-2", "5511999990002")
 
-	held := sampleDump("NOTIF3", 1755000000000)
+	held := sampleDump(device, "NOTIF3", 1755000000000)
 	if err := container.For("sid-1").PutPendingHistory(t.Context(), &held); err != nil {
 		t.Fatalf("PutPendingHistory: %v", err)
 	}
@@ -92,16 +97,16 @@ func TestAPendingDumpOfOneSessionIsNotReadByAnother(t *testing.T) {
 func TestAPendingDumpIsWrittenAndDroppedOnlyByTheOwner(t *testing.T) {
 	t.Parallel()
 	container := open(t)
-	pair(t, container, "sid-1", "5511999990001")
+	device := pair(t, container, "sid-1", "5511999990001")
 
 	owner := container.For("sid-1")
-	held := sampleDump("NOTIF4", 1755000000000)
+	held := sampleDump(device, "NOTIF4", 1755000000000)
 	if err := owner.PutPendingHistory(t.Context(), &held); err != nil {
 		t.Fatalf("PutPendingHistory: %v", err)
 	}
 	owner.Drop()
 
-	stale := sampleDump("NOTIF5", 1755000001000)
+	stale := sampleDump(device, "NOTIF5", 1755000001000)
 	if err := owner.PutPendingHistory(t.Context(), &stale); err == nil {
 		t.Error("a session that no longer owns this one wrote a dump for its successor")
 	}
@@ -118,9 +123,9 @@ func TestAPendingDumpIsWrittenAndDroppedOnlyByTheOwner(t *testing.T) {
 func TestDroppingAPendingDumpLeavesTheRest(t *testing.T) {
 	t.Parallel()
 	container := open(t)
-	pair(t, container, "sid-1", "5511999990001")
+	device := pair(t, container, "sid-1", "5511999990001")
 
-	for _, held := range []store.PendingHistory{sampleDump("NOTIFDONE", 1755000000000), sampleDump("NOTIFLEFT", 1755000001000)} {
+	for _, held := range []store.PendingHistory{sampleDump(device, "NOTIFDONE", 1755000000000), sampleDump(device, "NOTIFLEFT", 1755000001000)} {
 		if err := container.For("sid-1").PutPendingHistory(t.Context(), &held); err != nil {
 			t.Fatalf("PutPendingHistory: %v", err)
 		}
@@ -138,9 +143,9 @@ func TestDroppingAPendingDumpLeavesTheRest(t *testing.T) {
 func TestForgettingASessionForgetsItsPendingDumps(t *testing.T) {
 	t.Parallel()
 	container := open(t)
-	pair(t, container, "sid-1", "5511999990001")
+	device := pair(t, container, "sid-1", "5511999990001")
 
-	held := sampleDump("NOTIF6", 1755000000000)
+	held := sampleDump(device, "NOTIF6", 1755000000000)
 	if err := container.For("sid-1").PutPendingHistory(t.Context(), &held); err != nil {
 		t.Fatalf("PutPendingHistory: %v", err)
 	}
@@ -149,5 +154,40 @@ func TestForgettingASessionForgetsItsPendingDumps(t *testing.T) {
 	}
 	if back, _ := container.For("sid-1").PendingHistory(t.Context()); len(back) != 0 {
 		t.Fatalf("%d dump(s) outlived the account they belong to", len(back))
+	}
+}
+
+// A dump is written only for the device the session is bound to, in the same statement: a
+// logout and a new pairing between the arrival and the write would otherwise file the old
+// account's dump under the new one.
+func TestADumpForADeviceTheSessionIsNotBoundToIsNotWritten(t *testing.T) {
+	t.Parallel()
+	container := open(t)
+	old := pair(t, container, "sid-1", "5511999990001")
+	pair(t, container, "sid-1", "5511999990009")
+
+	held := sampleDump(old, "NOTIF7", 1755000000000)
+	if err := container.For("sid-1").PutPendingHistory(t.Context(), &held); err != nil {
+		t.Fatalf("PutPendingHistory: %v", err)
+	}
+	if back, _ := container.For("sid-1").PendingHistory(t.Context()); len(back) != 0 {
+		t.Fatalf("the previous device's dump was written for the new one: %+v", back)
+	}
+}
+
+// A new pairing takes with it what the previous device left: those dumps are the previous
+// account's, and the bond is updated in place, so no cascade clears them.
+func TestPairingAgainForgetsThePreviousDevicesDumps(t *testing.T) {
+	t.Parallel()
+	container := open(t)
+	device := pair(t, container, "sid-1", "5511999990001")
+
+	held := sampleDump(device, "NOTIF8", 1755000000000)
+	if err := container.For("sid-1").PutPendingHistory(t.Context(), &held); err != nil {
+		t.Fatalf("PutPendingHistory: %v", err)
+	}
+	next := pair(t, container, "sid-1", "5511999990009")
+	if back, _ := container.For("sid-1").PendingHistory(t.Context()); len(back) != 0 {
+		t.Fatalf("the new pairing (%s) inherited the previous device's dumps: %+v", next, back)
 	}
 }

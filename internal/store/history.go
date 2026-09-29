@@ -18,6 +18,11 @@ type PendingHistory struct {
 	SID       string
 	MessageID string
 
+	// Device is the paired device the notification reached, as a JID. The row is written
+	// only while the session is still bound to it: a logout and a new pairing in the middle
+	// of an attempt would otherwise file the old account's dump under the new one.
+	Device string
+
 	// Notice is the notification as the phone sent it, marshalled: the blob's path and
 	// keys, which is everything the download needs. Base64 in a TEXT column, for the
 	// reason the media keys are.
@@ -31,6 +36,11 @@ type PendingHistory struct {
 
 // putPendingHistory writes down a dump that has been announced, and leaves alone a row that
 // is already there for the same notification: it is the same dump.
+//
+// Nothing is written when the session is no longer bound to the device the dump reached,
+// and that is not an error: the dump belongs to an account this session no longer holds,
+// and not writing it is the whole point. The condition is in the statement, so no
+// pairing can land between a check and the write.
 func (c *Container) putPendingHistory(ctx context.Context, held *PendingHistory) error {
 	if held.SID == "" || held.MessageID == "" {
 		return fmt.Errorf(
@@ -38,10 +48,12 @@ func (c *Container) putPendingHistory(ctx context.Context, held *PendingHistory)
 	}
 
 	const upsert = `
-		INSERT INTO wac_pending_history (sid, message_id, notice, learned_at)
-		VALUES (?, ?, ?, ?)
+		INSERT INTO wac_pending_history (sid, message_id, device_jid, notice, learned_at)
+		SELECT ?, ?, ?, ?, ?
+		WHERE EXISTS (SELECT 1 FROM wac_session_device WHERE sid = ? AND jid = ?)
 		ON CONFLICT (sid, message_id) DO NOTHING`
-	_, err := c.db.ExecContext(ctx, c.rebind(upsert), held.SID, held.MessageID, encode(held.Notice), held.LearnedAt)
+	_, err := c.db.ExecContext(ctx, c.rebind(upsert),
+		held.SID, held.MessageID, held.Device, encode(held.Notice), held.LearnedAt, held.SID, held.Device)
 	if err != nil {
 		return fmt.Errorf("store: hold the history dump %s: %w", held.MessageID, err)
 	}
@@ -62,7 +74,7 @@ func (c *Container) dropPendingHistory(ctx context.Context, sid, messageID strin
 // arrived, which is the order the phone sent them in.
 func (c *Container) pendingHistory(ctx context.Context, sid string) ([]PendingHistory, error) {
 	const query = `
-		SELECT message_id, notice, learned_at
+		SELECT message_id, device_jid, notice, learned_at
 		FROM wac_pending_history WHERE sid = ? ORDER BY learned_at, message_id`
 
 	rows, err := c.db.QueryContext(ctx, c.rebind(query), sid)
@@ -75,7 +87,7 @@ func (c *Container) pendingHistory(ctx context.Context, sid string) ([]PendingHi
 	for rows.Next() {
 		pending := PendingHistory{SID: sid}
 		var notice string
-		if err := rows.Scan(&pending.MessageID, &notice, &pending.LearnedAt); err != nil {
+		if err := rows.Scan(&pending.MessageID, &pending.Device, &notice, &pending.LearnedAt); err != nil {
 			return nil, fmt.Errorf("store: read the history dumps %s left pending: %w", sid, err)
 		}
 		if pending.Notice, err = decode(notice); err != nil {

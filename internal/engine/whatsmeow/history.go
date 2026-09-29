@@ -122,6 +122,7 @@ var historySyncs = map[waHistorySync.HistorySync_HistorySyncType]protocol.Histor
 func (s *Session) receiveHistory(event *waEvents.Message, notice *waE2E.HistorySyncNotification, learned int64) bool {
 	id := event.Info.ID
 	generation := s.aliases.learning()
+	device := deviceOf(s.current())
 	if !s.dumps.claim(id) {
 		// The same notification is already being worked on by a retry, which answers for
 		// it: two attempts at one dump would publish it twice.
@@ -139,14 +140,14 @@ func (s *Session) receiveHistory(event *waEvents.Message, notice *waE2E.HistoryS
 	// Bounded like every store write in the handler, which is part of what keeps it under
 	// whatsmeow's watchdog.
 	writing, cancel := context.WithTimeout(s.ctx, s.storeLimit)
-	err = s.store.PutPendingHistory(writing, &store.PendingHistory{MessageID: id, Notice: raw, LearnedAt: learned})
+	err = s.store.PutPendingHistory(writing, &store.PendingHistory{MessageID: id, Device: device, Notice: raw, LearnedAt: learned})
 	cancel()
 	if err != nil {
 		// Kept in memory and written by the retry: withholding the acknowledgement brings
 		// nothing back, for the reason above. What a process ending before then loses, it
 		// would have lost anyway.
 		s.log.Warn().Err(err).Str("message_id", id).Msg("keeping in memory a history dump that could not be written down")
-		s.dumps.keepUnwritten(id, raw, learned, generation)
+		s.dumps.keepUnwritten(unwrittenDump{id: id, device: device, notice: raw, learned: learned, generation: generation})
 		s.retryHistoryLater()
 		return true
 	}
@@ -213,7 +214,7 @@ func (s *Session) replayOnce() bool {
 	// before it is published only while the account is still the one read under.
 	generation := s.aliases.learning()
 	finished := s.writeUnwritten(generation)
-	held, err := s.store.PendingHistory(s.ctx)
+	held, err := s.readPendingHistory(s.ctx)
 	if err != nil {
 		s.log.Warn().Err(err).Msg("could not read the history dumps this session left pending")
 		return false
@@ -251,6 +252,15 @@ func (s *Session) replayOnce() bool {
 	return finished
 }
 
+// deviceOf is the device a client is paired as, which is what a pending dump is filed
+// against: none for a client that has not paired.
+func deviceOf(client *wm.Client) string {
+	if id := client.Store.ID; id != nil {
+		return id.String()
+	}
+	return ""
+}
+
 // writeUnwritten writes down the dumps that could not be written when they arrived, and
 // reports whether all of them are. One announced to an account this session no longer
 // holds is dropped: its rows went with the device.
@@ -263,7 +273,7 @@ func (s *Session) writeUnwritten(generation uint64) bool {
 		}
 		writing, cancel := context.WithTimeout(s.ctx, s.storeLimit)
 		err := s.store.PutPendingHistory(writing, &store.PendingHistory{
-			MessageID: dump.id, Notice: dump.notice, LearnedAt: dump.learned,
+			MessageID: dump.id, Device: dump.device, Notice: dump.notice, LearnedAt: dump.learned,
 		})
 		cancel()
 		if err != nil {
