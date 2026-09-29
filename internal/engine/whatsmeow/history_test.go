@@ -607,6 +607,15 @@ func TestAnOnDemandAnswerOfOnlyReactionsIsNotTheEnd(t *testing.T) {
 		ID: proto.String(chat), Messages: []*waHistorySync.HistorySyncMsg{reaction},
 	})}
 	bench.install(session)
+	// Held until the handler has come back: the request goes out off the node handler, and
+	// a send stuck on whatsmeow's lock must not hold the handler with it.
+	release := make(chan struct{})
+	asked := make(chan *waE2E.Message, 1)
+	session.sendPeer = func(_ context.Context, _ *wm.Client, message *waE2E.Message) error {
+		<-release
+		asked <- message
+		return nil
+	}
 
 	acknowledged := make(chan bool, 1)
 	go func() {
@@ -615,13 +624,17 @@ func TestAnOnDemandAnswerOfOnlyReactionsIsNotTheEnd(t *testing.T) {
 	if slices, _ := slicesUntil(t, session, acknowledged); len(slices) != 0 {
 		t.Fatalf("published %+v for an answer holding only a reaction", slices)
 	}
+	close(release)
 	// And the next page is asked for from the reaction, the oldest thing the phone sent:
 	// the client has nothing new to anchor on, and asking from its old anchor gets this
 	// same page again.
-	if len(bench.peers) != 1 {
-		t.Fatalf("%d requests went to the phone, want the next page asked for once", len(bench.peers))
+	var sent *waE2E.Message
+	select {
+	case sent = <-asked:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the next page was never asked for")
 	}
-	request := bench.peers[0].GetProtocolMessage().GetPeerDataOperationRequestMessage().GetHistorySyncOnDemandRequest()
+	request := sent.GetProtocolMessage().GetPeerDataOperationRequestMessage().GetHistorySyncOnDemandRequest()
 	if request.GetChatJID() != chat || request.GetOldestMsgID() != "3EB0R1" {
 		t.Fatalf("the phone was asked %+v, want the page before the reaction", request)
 	}
@@ -1108,5 +1121,28 @@ func TestADumpsWorstCaseFitsUnderTheNodeWatchdog(t *testing.T) {
 	const watchdog = 5 * time.Minute
 	if worst := historyBudget + deliverTimeout + historyReceiptTimeout; worst >= watchdog {
 		t.Fatalf("a dump can hold the node handler for %s, which is not under the %s watchdog", worst, watchdog)
+	}
+}
+
+// A conversation names its other party's second address itself, and not always in the
+// dump's own list of pairs: the chat still goes out under the LID the live traffic uses.
+func TestAConversationsOwnPairNamesItsChat(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setHistory(true)
+	phone := "5511999990002@s.whatsapp.net"
+	(&historyBench{dump: dumpOf(waHistorySync.HistorySync_INITIAL_BOOTSTRAP,
+		&waHistorySync.Conversation{ID: proto.String(phone), LidJID: proto.String("167392323834066@lid"),
+			Messages: []*waHistorySync.HistorySyncMsg{pastText(phone, "3EB0C9", 1754000000, "oi")}},
+	)}).install(session)
+
+	acknowledged := make(chan bool, 1)
+	go func() {
+		acknowledged <- session.receive(historyNotification("NOTIF26", waE2E.HistorySyncType_INITIAL_BOOTSTRAP))
+	}()
+	slices, _ := slicesUntil(t, session, acknowledged)
+	if len(slices) != 1 || slices[0].Chat != (protocol.Address{Kind: protocol.AddressLID, ID: "167392323834066"}) {
+		t.Fatalf("published %+v, want the chat under the LID its conversation names", slices)
 	}
 }

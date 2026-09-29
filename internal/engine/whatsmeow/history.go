@@ -151,11 +151,13 @@ func (s *Session) receiveHistory(event *waEvents.Message, notice *waE2E.HistoryS
 	// resolver deliberately does not read; learned here, the history below and the live
 	// traffic after it name each person the same way.
 	for _, pair := range dump.GetPhoneNumberToLidMappings() {
-		phone, phoneErr := waTypes.ParseJID(pair.GetPnJID())
-		lid, lidErr := waTypes.ParseJID(pair.GetLidJID())
-		if phoneErr == nil && lidErr == nil {
-			s.aliases.observe(learning, phone, lid)
-		}
+		s.aliases.observe(learning, parsedJIDs(pair.GetPnJID(), pair.GetLidJID())...)
+	}
+	// And the pair a conversation names its other party by, which is not always repeated
+	// in the list above.
+	for _, conversation := range dump.GetConversations() {
+		s.aliases.observe(learning,
+			parsedJIDs(conversation.GetID(), conversation.GetPnJID(), conversation.GetLidJID())...)
 	}
 
 	sync, conversational := historySyncs[dump.GetSyncType()]
@@ -185,6 +187,21 @@ func (s *Session) receiptDump(client *wm.Client, id waTypes.MessageID) {
 	if err := s.receiptHistory(ctx, client, id); err != nil {
 		s.log.Warn().Err(err).Str("message_id", id).Msg("could not receipt a history dump")
 	}
+}
+
+// parsedJIDs is the JIDs among these strings that parse, which is what observe takes a
+// pair out of: it keeps the first number and the first LID it is handed.
+func parsedJIDs(raw ...string) []waTypes.JID {
+	jids := make([]waTypes.JID, 0, len(raw))
+	for _, one := range raw {
+		if one == "" {
+			continue
+		}
+		if jid, err := waTypes.ParseJID(one); err == nil {
+			jids = append(jids, jid)
+		}
+	}
+	return jids
 }
 
 // dumpRun is one dump being published: what every chat in it shares, and whether a file
@@ -325,8 +342,13 @@ func conversational(kind protocol.AddressKind) bool {
 }
 
 // askPastThePage asks the phone for what came before the oldest message of an on-demand
-// page that published nothing, and reports whether the request went out. Within the
-// dump's budget, like everything else the handler does for it.
+// page that published nothing.
+//
+// Off the node handler, the way a call is refused: whatsmeow sends a peer message under
+// the lock every send takes, which does not watch a context, so a send already on the wire
+// would hold the handler for as long as that one takes. Nothing waits on the answer
+// either, since it arrives as a dump of its own; a request that did not go out is logged,
+// and the client asking again gets this page again, which is where it was before.
 func (r *dumpRun) askPastThePage(chat waTypes.JID, conversation *waHistorySync.Conversation) bool {
 	var oldest *waWeb.WebMessageInfo
 	for _, past := range conversation.GetMessages() {
@@ -341,17 +363,19 @@ func (r *dumpRun) askPastThePage(chat waTypes.JID, conversation *waHistorySync.C
 	if oldest == nil {
 		return true
 	}
-	ctx, cancel := context.WithTimeout(r.ctx, r.s.historyReceiptWait)
-	defer cancel()
-	request := r.client.BuildHistorySyncRequest(&waTypes.MessageInfo{
+	s, client := r.s, r.client
+	request := client.BuildHistorySyncRequest(&waTypes.MessageInfo{
 		MessageSource: waTypes.MessageSource{Chat: chat, IsFromMe: oldest.GetKey().GetFromMe()},
 		ID:            oldest.GetKey().GetID(),
 		Timestamp:     time.Unix(int64(oldest.GetMessageTimestamp()), 0), //nolint:gosec // a WhatsApp timestamp in seconds fits
 	}, historyAskCount)
-	if err := r.s.sendPeer(ctx, r.client, request); err != nil {
-		r.s.log.Warn().Err(err).Msg("withholding an on-demand page that published nothing and could not be followed")
-		return false
-	}
+	go func() {
+		ctx, cancel := context.WithTimeoutCause(s.ctx, s.wireLimit, errSendCeiling)
+		defer cancel()
+		if err := s.sendPeer(ctx, client, request); err != nil {
+			s.log.Warn().Err(err).Msg("could not ask for the page before an on-demand page that published nothing")
+		}
+	}()
 	return true
 }
 
