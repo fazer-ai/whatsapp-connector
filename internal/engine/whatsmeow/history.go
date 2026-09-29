@@ -97,12 +97,14 @@ func (s *Session) receiveHistory(event *waEvents.Message, notice *waE2E.HistoryS
 		// The blob is gone or is not the one the notification describes, and a
 		// redelivery names the same blob: withheld, the phone would send it again for
 		// good. Receipted, the dump is lost, which it already was.
-		s.log.Warn().Err(err).Str("message_id", event.Info.ID).
+		// Redacted, as every download error is: whatsmeow puts the blob's URL in it,
+		// built from the direct path and the hash.
+		s.log.Warn().Str("error", redact(err.Error())).Str("message_id", event.Info.ID).
 			Msg("receipting a history dump whose blob can no longer be downloaded")
 		s.receiptDump(client, event.Info.ID)
 		return true
 	case err != nil:
-		s.log.Warn().Err(err).Str("message_id", event.Info.ID).
+		s.log.Warn().Str("error", redact(err.Error())).Str("message_id", event.Info.ID).
 			Msg("withholding the acknowledgement for a history dump that did not download")
 		return false
 	}
@@ -137,11 +139,17 @@ func (s *Session) publishConversation(client *wm.Client, sync protocol.HistorySy
 		s.log.Debug().Err(err).Msg("skipping a chat in a history dump that names no chat")
 		return true
 	}
-	chat, named := addressOf(jid)
-	if !named || jid.IsBot() || !conversational(chat.Kind) ||
-		(chat.Kind == protocol.AddressGroup && !s.wantsGroups()) {
+	kind, named := addressOf(jid)
+	if !named || jid.IsBot() || !conversational(kind.Kind) ||
+		(kind.Kind == protocol.AddressGroup && !s.wantsGroups()) {
 		return true
 	}
+	// Through the session's resolver, which is what each message in the slice is addressed
+	// by: a slice naming a chat by phone while its messages name it by LID is two chats to
+	// a client, and a `message.download_media` naming the slice's chat misses the file.
+	looking, done := s.looking()
+	chat, _ := s.address(looking, jid)
+	done()
 
 	messages := make([]protocol.InboundMessage, 0, len(conversation.GetMessages()))
 	for _, past := range conversation.GetMessages() {
@@ -152,8 +160,7 @@ func (s *Session) publishConversation(client *wm.Client, sync protocol.HistorySy
 	// The phone lists a chat newest first, and a client imports it in the order it arrives.
 	sort.SliceStable(messages, func(i, j int) bool { return messages[i].Timestamp < messages[j].Timestamp })
 
-	exhausted := conversation.GetEndOfHistoryTransfer() ||
-		(sync == protocol.HistoryOnDemand && len(messages) == 0)
+	exhausted := exhaustedBy(sync, conversation)
 	if len(messages) == 0 && !exhausted {
 		return true
 	}
@@ -181,6 +188,29 @@ func (s *Session) publishConversation(client *wm.Client, sync protocol.HistorySy
 		}
 	}
 	return true
+}
+
+// exhaustedBy reports whether the phone said it has nothing older for this chat.
+//
+// Read off what the phone sent, not off what is left after filtering: an on-demand answer
+// holding only reactions publishes nothing and still has older messages behind it. The end
+// of a transfer is not the answer either, because WhatsApp marks the end of every transfer
+// and says separately whether more remains on the phone. A transfer that ended with more
+// the phone will not share counts as exhausted, since asking again gets no further.
+func exhaustedBy(sync protocol.HistorySync, conversation *waHistorySync.Conversation) bool {
+	if sync == protocol.HistoryOnDemand && len(conversation.GetMessages()) == 0 {
+		return true
+	}
+	if conversation.EndOfHistoryTransferType == nil {
+		return false
+	}
+	switch conversation.GetEndOfHistoryTransferType() {
+	case waHistorySync.Conversation_COMPLETE_AND_NO_MORE_MESSAGE_REMAIN_ON_PRIMARY,
+		waHistorySync.Conversation_COMPLETE_ON_DEMAND_SYNC_WITH_MORE_MSG_ON_PRIMARY_BUT_NO_ACCESS:
+		return true
+	default:
+		return false
+	}
 }
 
 // conversational reports whether a chat of this kind is a conversation a dump is

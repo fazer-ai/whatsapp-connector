@@ -504,3 +504,167 @@ func TestAFeedInADumpIsNotPublishedAsAConversation(t *testing.T) {
 		t.Fatalf("published %+v, want only the direct chat", slices)
 	}
 }
+
+// Where the phone said what is left, and what the slices say about it. `exhausted` stops a
+// client asking for more, so it is only on the last slice of a chat the phone has nothing
+// older for, and never on a chat the phone kept some of.
+func TestExhaustedIsWhatThePhoneSaidIsLeftOnTheLastSliceOnly(t *testing.T) {
+	t.Parallel()
+
+	const chat = "5511999990002@s.whatsapp.net"
+	long := func() []*waHistorySync.HistorySyncMsg {
+		messages := make([]*waHistorySync.HistorySyncMsg, 0, historySliceLimit+1)
+		for i := historySliceLimit; i >= 0; i-- {
+			messages = append(messages, pastText(chat, fmt.Sprintf("3EB1%04d", i), 1754000000+int64(i), "oi"))
+		}
+		return messages
+	}
+	for _, tc := range []struct {
+		name  string
+		ended *waHistorySync.Conversation_EndOfHistoryTransferType
+		want  []bool
+	}{
+		{"nothing more on the phone", waHistorySync.Conversation_COMPLETE_AND_NO_MORE_MESSAGE_REMAIN_ON_PRIMARY.Enum(), []bool{false, true}},
+		{"more the phone will not share", waHistorySync.Conversation_COMPLETE_ON_DEMAND_SYNC_WITH_MORE_MSG_ON_PRIMARY_BUT_NO_ACCESS.Enum(), []bool{false, true}},
+		{"more on the phone", waHistorySync.Conversation_COMPLETE_BUT_MORE_MESSAGES_REMAIN_ON_PRIMARY.Enum(), []bool{false, false}},
+		{"the phone did not say", nil, []bool{false, false}},
+	} {
+		session, _ := newTestSession(t, "5511999990001")
+		session.setHistory(true)
+		bench := &historyBench{dump: dumpOf(waHistorySync.HistorySync_FULL, &waHistorySync.Conversation{
+			ID: proto.String(chat), Messages: long(),
+			EndOfHistoryTransfer: proto.Bool(true), EndOfHistoryTransferType: tc.ended,
+		})}
+		bench.install(session)
+
+		acknowledged := make(chan bool, 1)
+		go func() { acknowledged <- session.receive(historyNotification("NOTIF9", waE2E.HistorySyncType_FULL)) }()
+		slices, _ := slicesUntil(t, session, acknowledged)
+		got := make([]bool, 0, len(slices))
+		for _, slice := range slices {
+			got = append(got, slice.Exhausted)
+		}
+		if fmt.Sprint(got) != fmt.Sprint(tc.want) {
+			t.Errorf("%s: slices marked exhausted %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// An on-demand answer whose messages are all things that change another message publishes
+// nothing, and is not the phone running out: it sent something, just nothing to show.
+func TestAnOnDemandAnswerOfOnlyReactionsIsNotTheEnd(t *testing.T) {
+	t.Parallel()
+
+	const chat = "5511999990002@s.whatsapp.net"
+	session, _ := newTestSession(t, "5511999990001")
+	session.setHistory(true)
+	reaction := pastMessage(chat, "3EB0R1", 1754000000, false, &waE2E.Message{ReactionMessage: &waE2E.ReactionMessage{
+		Key:  &waCommon.MessageKey{RemoteJID: proto.String(chat), ID: proto.String("3EB0R0")},
+		Text: proto.String("👍"),
+	}})
+	bench := &historyBench{dump: dumpOf(waHistorySync.HistorySync_ON_DEMAND, &waHistorySync.Conversation{
+		ID: proto.String(chat), Messages: []*waHistorySync.HistorySyncMsg{reaction},
+	})}
+	bench.install(session)
+
+	acknowledged := make(chan bool, 1)
+	go func() {
+		acknowledged <- session.receive(historyNotification("NOTIF10", waE2E.HistorySyncType_ON_DEMAND))
+	}()
+	if slices, _ := slicesUntil(t, session, acknowledged); len(slices) != 0 {
+		t.Fatalf("published %+v for an answer holding only a reaction", slices)
+	}
+}
+
+// A chat the dump names with nothing in it is not published outside an on-demand answer:
+// it says nothing, and an empty slice is a row a client imports for no reason.
+func TestAnEmptyChatInADumpIsNotPublished(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setHistory(true)
+	bench := &historyBench{dump: dumpOf(waHistorySync.HistorySync_RECENT,
+		&waHistorySync.Conversation{ID: proto.String("5511999990002@s.whatsapp.net")})}
+	bench.install(session)
+
+	acknowledged := make(chan bool, 1)
+	go func() { acknowledged <- session.receive(historyNotification("NOTIF11", waE2E.HistorySyncType_RECENT)) }()
+	if slices, _ := slicesUntil(t, session, acknowledged); len(slices) != 0 {
+		t.Fatalf("published %+v for a chat with nothing in it", slices)
+	}
+}
+
+// What a slice says about where it sits: a group's subject, which a client names the
+// conversation with, and how far the dump has got. A direct chat's name is the phone's
+// label for a contact and is not sent.
+func TestASliceCarriesTheGroupsSubjectAndTheDumpsProgress(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setHistory(true)
+	session.setGroups(true)
+	group := groupJID().String()
+	past := pastText(group, "3EB0G1", 1754000000, "bom dia")
+	past.Message.Key.Participant = proto.String("5511999990002@s.whatsapp.net")
+	dump := dumpOf(waHistorySync.HistorySync_INITIAL_BOOTSTRAP,
+		&waHistorySync.Conversation{ID: proto.String(group), Name: proto.String("Equipe fazer.ai"),
+			Messages: []*waHistorySync.HistorySyncMsg{past}},
+		&waHistorySync.Conversation{ID: proto.String("5511999990002@s.whatsapp.net"), Name: proto.String("Ana do trabalho"),
+			Messages: []*waHistorySync.HistorySyncMsg{pastText("5511999990002@s.whatsapp.net", "3EB0D9", 1754000000, "oi")}},
+	)
+	dump.Progress = proto.Uint32(40)
+	(&historyBench{dump: dump}).install(session)
+
+	acknowledged := make(chan bool, 1)
+	go func() {
+		acknowledged <- session.receive(historyNotification("NOTIF12", waE2E.HistorySyncType_INITIAL_BOOTSTRAP))
+	}()
+	slices, _ := slicesUntil(t, session, acknowledged)
+	if len(slices) != 2 {
+		t.Fatalf("published %d slices, want one per chat", len(slices))
+	}
+	for _, slice := range slices {
+		want := ""
+		if slice.Chat.Kind == protocol.AddressGroup {
+			want = "Equipe fazer.ai"
+		}
+		if slice.Name != want {
+			t.Errorf("the %s slice is named %q, want %q", slice.Chat.Kind, slice.Name, want)
+		}
+		if slice.Progress == nil || *slice.Progress != 40 {
+			t.Errorf("the %s slice carries progress %v, want 40", slice.Chat.Kind, slice.Progress)
+		}
+	}
+}
+
+// A slice names its chat the way its messages and the live events do. With the pairing
+// known to this account, that is the LID, even for a chat the dump names by number.
+func TestASliceNamesItsChatTheWayItsMessagesDo(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setHistory(true)
+	lid := waTypes.NewJID("167392323834099", waTypes.HiddenUserServer)
+	phone := waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)
+	if err := session.current().Store.LIDs.PutLIDMapping(t.Context(), lid, phone); err != nil {
+		t.Fatalf("PutLIDMapping: %v", err)
+	}
+	session.aliases.observe(session.aliases.stamp(t.Context()), phone, lid)
+	(&historyBench{dump: dumpOf(waHistorySync.HistorySync_RECENT,
+		&waHistorySync.Conversation{ID: proto.String(phone.String()), Messages: []*waHistorySync.HistorySyncMsg{
+			pastText(phone.String(), "3EB0L1", 1754000000, "oi"),
+		}})}).install(session)
+
+	acknowledged := make(chan bool, 1)
+	go func() { acknowledged <- session.receive(historyNotification("NOTIF13", waE2E.HistorySyncType_RECENT)) }()
+	slices, _ := slicesUntil(t, session, acknowledged)
+	if len(slices) != 1 || len(slices[0].Messages) != 1 {
+		t.Fatalf("published %+v, want one slice with the message", slices)
+	}
+	if slices[0].Chat != slices[0].Messages[0].Chat {
+		t.Fatalf("the slice names its chat %+v and its message names it %+v", slices[0].Chat, slices[0].Messages[0].Chat)
+	}
+	if slices[0].Chat.Kind != protocol.AddressLID {
+		t.Fatalf("the slice names its chat %+v, want the LID this account was shown", slices[0].Chat)
+	}
+}
