@@ -1175,7 +1175,8 @@ func TestADumpsWorstCaseFitsUnderTheNodeWatchdog(t *testing.T) {
 	t.Parallel()
 
 	const watchdog = 5 * time.Minute
-	if worst := historyBudget + deliverTimeout + historyReceiptTimeout; worst >= watchdog {
+	// The row written before the dump and dropped after it, each on the store's bound.
+	if worst := bindTimeout + historyBudget + deliverTimeout + historyReceiptTimeout + bindTimeout; worst >= watchdog {
 		t.Fatalf("a dump can hold the node handler for %s, which is not under the %s watchdog", worst, watchdog)
 	}
 }
@@ -1353,6 +1354,9 @@ func TestADumpThatDidNotFinishIsTriedAgainAfterAWait(t *testing.T) {
 
 	go session.receive(historyNotification("NOTIF32", waE2E.HistorySyncType_RECENT))
 	next(t, session).Settle(errors.New("redis is gone"))
+	// A retry that fails is followed by another: the first one firing is what lets the
+	// next be armed.
+	next(t, session).Settle(errors.New("redis is still gone"))
 	retried := next(t, session)
 	if retried.Type != protocol.EventHistorySync {
 		t.Fatalf("the retry published %s", retried.Type)
@@ -1391,43 +1395,9 @@ func TestTheWaitBetweenAttemptsDoublesUpToTheCeiling(t *testing.T) {
 		t.Fatalf("waits %v, want %v", waits, want)
 	}
 
-	if !dumps.begin() {
-		t.Fatal("a replay did not begin with none running")
-	}
-	if dumps.end(false) {
-		t.Fatal("a replay nobody asked for again went round again")
-	}
-	if wait, _ := dumps.arm(time.Second, 5*time.Second); wait != 5*time.Second {
-		t.Fatalf("after a replay that did not finish the wait is %v, want it to stay at the ceiling", wait)
-	}
-	dumps.disarm()
-	dumps.begin()
-	dumps.end(true)
+	dumps.settle()
 	if wait, _ := dumps.arm(time.Second, 5*time.Second); wait != time.Second {
 		t.Fatalf("after a replay that finished everything the wait is %v, want the first", wait)
-	}
-}
-
-// A replay asked for while one runs goes round again when it is done, so a dump written
-// down meanwhile is not left for the next connection.
-func TestAReplayAskedForWhileOneRunsGoesRoundAgain(t *testing.T) {
-	t.Parallel()
-
-	var dumps pendingDumps
-	if !dumps.begin() {
-		t.Fatal("a replay did not begin with none running")
-	}
-	if dumps.begin() {
-		t.Fatal("a second replay began beside the first")
-	}
-	if !dumps.end(true) {
-		t.Fatal("the running replay did not go round again for the one asked for meanwhile")
-	}
-	if dumps.end(true) {
-		t.Fatal("the replay went round twice for one ask")
-	}
-	if !dumps.begin() {
-		t.Fatal("a replay could not begin after the last one ended")
 	}
 }
 
@@ -1487,5 +1457,108 @@ func TestADumpBeingRetriedIsNotStartedASecondTime(t *testing.T) {
 	defer downloads.Unlock()
 	if count != 1 {
 		t.Fatalf("one dump was downloaded %d times", count)
+	}
+}
+
+// A replay whose attempt did not finish arms another, the way a live dump does.
+func TestAReplayThatDidNotFinishIsTriedAgain(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setHistory(true)
+	session.historyRetry = 10 * time.Millisecond
+	bench := &historyBench{dump: dumpOf(waHistorySync.HistorySync_RECENT)}
+	bench.install(session)
+	var mu sync.Mutex
+	failures := 1
+	session.downloadHistory = func(context.Context, *wm.Client, *waE2E.HistorySyncNotification) (*waHistorySync.HistorySync, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if failures > 0 {
+			failures--
+			return nil, errors.New("dial tcp: i/o timeout")
+		}
+		return bench.dump, nil
+	}
+	holdDump(t, session, "NOTIF35", recentNotice(t))
+
+	session.replayHistory()
+	deadline := time.After(10 * time.Second)
+	for len(bench.receipted()) == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("a replay that did not finish was never tried again")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
+// A replay that could not even read what is pending is tried again as well.
+func TestAReplayThatCouldNotReadWhatIsPendingIsTriedAgain(t *testing.T) {
+	t.Parallel()
+
+	session, container := newTestSession(t, "5511999990001")
+	session.historyRetry = time.Hour
+	if err := container.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	session.replayHistory()
+	session.dumps.mu.Lock()
+	defer session.dumps.mu.Unlock()
+	if !session.dumps.armed {
+		t.Fatal("a replay that read nothing armed no retry, so the dumps wait for the next connection")
+	}
+}
+
+// A logout during an attempt rebuilds the session, possibly on another account. What the
+// old account was announced is not published under the new one, nor receipted.
+func TestADumpOfAnAccountThatWasReplacedIsNotPublished(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setHistory(true)
+	bench := &historyBench{dump: dumpOf(waHistorySync.HistorySync_RECENT,
+		&waHistorySync.Conversation{ID: proto.String("5511999990002@s.whatsapp.net"), Messages: []*waHistorySync.HistorySyncMsg{
+			pastText("5511999990002@s.whatsapp.net", "3EB0OLD", 1754000000, "oi"),
+		}})}
+	bench.install(session)
+	session.downloadHistory = func(context.Context, *wm.Client, *waE2E.HistorySyncNotification) (*waHistorySync.HistorySync, error) {
+		// The rebuild a logout ends in, landing while the dump downloads.
+		session.aliases.forget()
+		return bench.dump, nil
+	}
+	holdDump(t, session, "NOTIF36", recentNotice(t))
+
+	session.replayHistory()
+	select {
+	case emission := <-session.Events():
+		t.Fatalf("the replaced account's dump published %s", emission.Type)
+	default:
+	}
+	if got := bench.receipted(); len(got) != 0 {
+		t.Fatalf("the replaced account's dump was receipted: %v", got)
+	}
+}
+
+// And a row read before the logout is not attempted on the account after it.
+func TestAPendingDumpReadBeforeALogoutIsNotAttemptedAfterIt(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setHistory(true)
+	bench := &historyBench{dump: dumpOf(waHistorySync.HistorySync_RECENT)}
+	bench.install(session)
+	holdDump(t, session, "NOTIF37", recentNotice(t))
+	holdDump(t, session, "NOTIF38", recentNotice(t))
+	downloads := 0
+	session.downloadHistory = func(context.Context, *wm.Client, *waE2E.HistorySyncNotification) (*waHistorySync.HistorySync, error) {
+		downloads++
+		session.aliases.forget()
+		return bench.dump, nil
+	}
+
+	session.replayHistory()
+	if downloads != 1 {
+		t.Fatalf("after the account was replaced %d more dump(s) of the old one were downloaded", downloads-1)
 	}
 }

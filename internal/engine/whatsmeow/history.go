@@ -115,6 +115,7 @@ var historySyncs = map[waHistorySync.HistorySync_HistorySyncType]protocol.Histor
 // after a wait, and by whichever session connects the account next.
 func (s *Session) receiveHistory(event *waEvents.Message, notice *waE2E.HistorySyncNotification, learned int64) bool {
 	id := event.Info.ID
+	generation := s.aliases.learning()
 	if !s.dumps.claim(id) {
 		// The same notification is already being worked on by a retry, which answers for
 		// it: two attempts at one dump would publish it twice.
@@ -124,24 +125,30 @@ func (s *Session) receiveHistory(event *waEvents.Message, notice *waE2E.HistoryS
 
 	raw, err := proto.Marshal(notice)
 	if err == nil {
-		err = s.store.PutPendingHistory(s.ctx, &store.PendingHistory{MessageID: id, Notice: raw, LearnedAt: learned})
+		// Bounded like every store write in the handler, which is part of what keeps it
+		// under whatsmeow's watchdog.
+		writing, cancel := context.WithTimeout(s.ctx, s.storeLimit)
+		err = s.store.PutPendingHistory(writing, &store.PendingHistory{MessageID: id, Notice: raw, LearnedAt: learned})
+		cancel()
 	}
 	if err != nil {
 		s.log.Warn().Err(err).Str("message_id", id).Msg("withholding a history dump that could not be written down")
 		return false
 	}
-	s.finishDump(id, notice, learned)
+	s.finishDump(id, notice, learned, generation)
 	return true
 }
 
 // finishDump makes one attempt at a dump that is written down, and forgets it when the
 // attempt finished with it.
-func (s *Session) finishDump(id string, notice *waE2E.HistorySyncNotification, learned int64) bool {
-	if !s.handleDump(id, notice, learned) {
+func (s *Session) finishDump(id string, notice *waE2E.HistorySyncNotification, learned int64, generation uint64) bool {
+	if !s.handleDump(id, notice, learned, generation) {
 		s.retryHistoryLater()
 		return false
 	}
-	if err := s.store.DropPendingHistory(s.ctx, id); err != nil {
+	dropping, cancel := context.WithTimeout(s.ctx, s.storeLimit)
+	defer cancel()
+	if err := s.store.DropPendingHistory(dropping, id); err != nil {
 		// Left for the next owner, which publishes it again: the client deduplicates.
 		s.log.Warn().Err(err).Str("message_id", id).Msg("could not forget a history dump that is finished with")
 	}
@@ -168,28 +175,22 @@ func (s *Session) retryHistoryLater() {
 }
 
 // replayHistory works through the dumps this session has written down and not finished
-// with, its own or a previous owner's, oldest first. One replay at a time: a call while
-// one runs has it go round again once it is done, so a row written meanwhile is not left
-// for the next connection.
+// with, its own or a previous owner's, oldest first. Two replays at once are harmless: each
+// dump is claimed by one attempt, so the second only picks up what the first did not list.
 func (s *Session) replayHistory() {
-	if !s.dumps.begin() {
+	if s.replayOnce() {
+		s.dumps.settle()
 		return
 	}
-	for {
-		finished := s.replayOnce()
-		if s.dumps.end(finished) {
-			continue
-		}
-		if !finished {
-			s.retryHistoryLater()
-		}
-		return
-	}
+	s.retryHistoryLater()
 }
 
 // replayOnce makes one attempt at every dump written down, and reports whether all of them
 // finished.
 func (s *Session) replayOnce() bool {
+	// Before the read: a row read after a logout is the next account's, and one read
+	// before it is published only while the account is still the one read under.
+	generation := s.aliases.learning()
 	held, err := s.store.PendingHistory(s.ctx)
 	if err != nil {
 		s.log.Warn().Err(err).Msg("could not read the history dumps this session left pending")
@@ -216,7 +217,7 @@ func (s *Session) replayOnce() bool {
 			continue
 		}
 		s.log.Info().Str("message_id", pending.MessageID).Msg("picking up a history dump that did not finish")
-		if !s.finishDump(pending.MessageID, &notice, pending.LearnedAt) {
+		if !s.finishDump(pending.MessageID, &notice, pending.LearnedAt, generation) {
 			finished = false
 		}
 		s.dumps.release(pending.MessageID)
@@ -234,8 +235,21 @@ func (s *Session) replayOnce() bool {
 // The receipt is what tells the phone the dump arrived, and it is sent last, after every
 // slice was published. A dump that did not get there is not receipted and stays written
 // down, and the next attempt downloads it again.
-func (s *Session) handleDump(id string, notice *waE2E.HistorySyncNotification, learned int64) bool {
+//
+// A dump belongs to the account that was announced it. A logout during an attempt rebuilds
+// the session, possibly on another account, and deletes the row with the old device, so
+// an attempt that finds the account replaced stops publishing and reports the dump
+// finished with: there is nobody left to finish it for.
+//
+// generation is the account the caller found the dump under, read before the dump was:
+// the client and the generation are swapped under one lock, so a rebuild after that read
+// leaves an old generation beside a new client, which the checks below catch.
+func (s *Session) handleDump(id string, notice *waE2E.HistorySyncNotification, learned int64, generation uint64) bool {
 	client := s.current()
+	if s.aliases.learning() != generation {
+		s.log.Info().Str("message_id", id).Msg("dropping a history dump of an account this session no longer holds")
+		return true
+	}
 	// The dump is handled inside the node handler, and whatsmeow starts the next node
 	// alongside a handler that has run for five minutes, which is the order of everything
 	// after it gone. So the whole of it has a budget, from the download on: whatsmeow's
@@ -244,9 +258,9 @@ func (s *Session) handleDump(id string, notice *waE2E.HistorySyncNotification, l
 	// whole, and the client deduplicates what it already has.
 	ctx, cancel := context.WithTimeout(s.ctx, s.historyBudget)
 	defer cancel()
-	// Stamped before the download, the way a command is: a logout during it rebuilds the
-	// session on another account, and the pairs in this dump are the old one's.
-	learning := s.aliases.stamp(s.ctx)
+	// Stamped with the dump's own account, the way a command is: a logout during it
+	// rebuilds the session on another account, and the pairs in this dump are the old one's.
+	learning := context.WithValue(s.ctx, generationKey{}, generation)
 	dump, err := s.downloadHistory(ctx, client, notice)
 	var gone refused
 	switch {
@@ -291,12 +305,12 @@ func (s *Session) handleDump(id string, notice *waE2E.HistorySyncNotification, l
 	}
 
 	sync, conversational := historySyncs[dump.GetSyncType()]
-	run := &dumpRun{s: s, ctx: ctx, client: client, sync: sync, dump: dump, learned: learned}
+	run := &dumpRun{s: s, ctx: ctx, client: client, sync: sync, dump: dump, learned: learned, generation: generation}
 	publishing := conversational && s.wantsHistory()
 	if publishing {
 		for _, conversation := range dump.GetConversations() {
 			if !run.publishConversation(conversation) {
-				return false
+				return run.replaced()
 			}
 		}
 	}
@@ -312,6 +326,9 @@ func (s *Session) handleDump(id string, notice *waE2E.HistorySyncNotification, l
 		Int("conversations", len(dump.GetConversations())).Int("messages_sent", sent).
 		Bool("publishing", publishing).Int("slices", run.slices).Int("messages_published", run.published).
 		Msg("history dump handled")
+	if run.replaced() {
+		return true
+	}
 
 	s.receiptDump(client, id)
 	return true
@@ -355,6 +372,8 @@ type dumpRun struct {
 	sync    protocol.HistorySync
 	dump    *waHistorySync.HistorySync
 	learned int64
+	// generation is the account the dump was announced to.
+	generation uint64
 	// slices and published count what went out, for the line the dump is logged with.
 	slices, published int
 	// unkept is a file this run published and could not record how to fetch. A dump's
@@ -371,6 +390,15 @@ func (r *dumpRun) overBudget() bool {
 	}
 	r.s.log.Warn().Dur("budget", r.s.historyBudget).
 		Msg("keeping for another attempt a history dump that did not publish within its budget")
+	return true
+}
+
+// replaced reports whether the account the dump belongs to is no longer this session's.
+func (r *dumpRun) replaced() bool {
+	if r.s.aliases.learning() == r.generation {
+		return false
+	}
+	r.s.log.Info().Msg("dropping a history dump of an account this session no longer holds")
 	return true
 }
 
@@ -446,7 +474,7 @@ func (r *dumpRun) publishConversation(conversation *waHistorySync.Conversation) 
 				Exhausted: exhausted && end == len(messages),
 			},
 		}
-		if r.overBudget() {
+		if r.overBudget() || r.replaced() {
 			return false
 		}
 		if !s.deliver(protocol.EventHistorySync, slice, r.learned) {
