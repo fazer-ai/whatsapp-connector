@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"math"
+	"slices"
 	"sort"
 	"time"
 
@@ -90,6 +91,9 @@ var historySyncs = map[waHistorySync.HistorySync_HistorySyncType]protocol.Histor
 // notification again and the dump is downloaded again.
 func (s *Session) receiveHistory(event *waEvents.Message, notice *waE2E.HistorySyncNotification, learned int64) bool {
 	client := s.current()
+	// Stamped before the download, the way a command is: a logout during it rebuilds the
+	// session on another account, and the pairs in this dump are the old one's.
+	learning := s.aliases.stamp(s.ctx)
 	dump, err := s.downloadHistory(s.ctx, client, notice)
 	var gone refused
 	switch {
@@ -107,6 +111,18 @@ func (s *Session) receiveHistory(event *waEvents.Message, notice *waE2E.HistoryS
 		s.log.Warn().Str("error", redact(err.Error())).Str("message_id", event.Info.ID).
 			Msg("withholding the acknowledgement for a history dump that did not download")
 		return false
+	}
+
+	// The dump is this account's own, so the pairs of number and LID in it are pairs it
+	// was shown. whatsmeow writes them to the store every session shares, which the
+	// resolver deliberately does not read; learned here, the history below and the live
+	// traffic after it name each person the same way.
+	for _, pair := range dump.GetPhoneNumberToLidMappings() {
+		phone, phoneErr := waTypes.ParseJID(pair.GetPnJID())
+		lid, lidErr := waTypes.ParseJID(pair.GetLidJID())
+		if phoneErr == nil && lidErr == nil {
+			s.aliases.observe(learning, phone, lid)
+		}
 	}
 
 	sync, conversational := historySyncs[dump.GetSyncType()]
@@ -158,6 +174,9 @@ func (s *Session) publishConversation(client *wm.Client, sync protocol.HistorySy
 		}
 	}
 	// The phone lists a chat newest first, and a client imports it in the order it arrives.
+	// Reversed before the sort, because a dump's clock has seconds only: messages sent
+	// within one second tie, and the stable sort keeps them in the order it was given.
+	slices.Reverse(messages)
 	sort.SliceStable(messages, func(i, j int) bool { return messages[i].Timestamp < messages[j].Timestamp })
 
 	exhausted := exhaustedBy(sync, conversation)
@@ -239,6 +258,11 @@ func (s *Session) pastMessageOf(client *wm.Client, chat waTypes.JID, past *waWeb
 	}
 	message := event.Message
 	switch {
+	case event.IsEdit, resentEdit(event):
+		// A correction, which the parser has already turned into the message it corrects:
+		// the id is the original's and the body the new one. The original is in the dump
+		// on its own, already corrected.
+		return protocol.InboundMessage{}, false
 	case event.Info.Sender.IsBot(),
 		bodyless(message),
 		message.GetProtocolMessage() != nil,

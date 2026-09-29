@@ -694,3 +694,87 @@ func TestAFailedHistoryDownloadIsLoggedWithoutTheBlobsAddress(t *testing.T) {
 		}
 	}
 }
+
+// A dump carries the account's own pairs of number and LID, and a new pairing has nothing
+// else to go on: named by number in the dump, the chat still goes out under the LID the
+// live traffic will use, so a client does not open two conversations for one person.
+func TestTheDumpsOwnPairsNameItsChats(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setHistory(true)
+	phone := "5511999990002@s.whatsapp.net"
+	dump := dumpOf(waHistorySync.HistorySync_INITIAL_BOOTSTRAP,
+		&waHistorySync.Conversation{ID: proto.String(phone), Messages: []*waHistorySync.HistorySyncMsg{
+			pastText(phone, "3EB0M1", 1754000000, "oi"),
+		}})
+	dump.PhoneNumberToLidMappings = []*waHistorySync.PhoneNumberToLIDMapping{
+		{PnJID: proto.String(phone), LidJID: proto.String("167392323834077@lid")},
+	}
+	(&historyBench{dump: dump}).install(session)
+
+	acknowledged := make(chan bool, 1)
+	go func() {
+		acknowledged <- session.receive(historyNotification("NOTIF15", waE2E.HistorySyncType_INITIAL_BOOTSTRAP))
+	}()
+	slices, _ := slicesUntil(t, session, acknowledged)
+	if len(slices) != 1 || slices[0].Chat != (protocol.Address{Kind: protocol.AddressLID, ID: "167392323834077"}) {
+		t.Fatalf("published %+v, want the chat under the LID the dump paired the number with", slices)
+	}
+}
+
+// A correction in a dump is parsed into the message it corrects, same id, new body. The
+// original is in the dump too, already corrected, so publishing the correction would be
+// the same id twice with the correction's clock on it.
+func TestACorrectionInADumpIsNotPublishedAsAMessage(t *testing.T) {
+	t.Parallel()
+
+	const chat = "5511999990002@s.whatsapp.net"
+	session, _ := newTestSession(t, "5511999990001")
+	session.setHistory(true)
+	edit := pastMessage(chat, "3EB0E2", 1754000100, false, &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{
+		Type:          waE2E.ProtocolMessage_MESSAGE_EDIT.Enum(),
+		Key:           &waCommon.MessageKey{RemoteJID: proto.String(chat), ID: proto.String("3EB0E1")},
+		EditedMessage: &waE2E.Message{Conversation: proto.String("corrigido")},
+	}})
+	(&historyBench{dump: dumpOf(waHistorySync.HistorySync_RECENT,
+		&waHistorySync.Conversation{ID: proto.String(chat), Messages: []*waHistorySync.HistorySyncMsg{
+			edit, pastText(chat, "3EB0E1", 1754000000, "corrigido"),
+		}})}).install(session)
+
+	acknowledged := make(chan bool, 1)
+	go func() { acknowledged <- session.receive(historyNotification("NOTIF16", waE2E.HistorySyncType_RECENT)) }()
+	slices, _ := slicesUntil(t, session, acknowledged)
+	if len(slices) != 1 || len(slices[0].Messages) != 1 || slices[0].Messages[0].Timestamp != 1754000000000 {
+		t.Fatalf("published %+v, want the corrected message once, at its own time", slices)
+	}
+}
+
+// A dump's clock has seconds only, so messages sent within one second tie, and the order
+// the phone listed them in is all that says which came first.
+func TestMessagesThatTieOnTheSecondKeepThePhonesOrder(t *testing.T) {
+	t.Parallel()
+
+	const chat = "5511999990002@s.whatsapp.net"
+	session, _ := newTestSession(t, "5511999990001")
+	session.setHistory(true)
+	(&historyBench{dump: dumpOf(waHistorySync.HistorySync_RECENT,
+		&waHistorySync.Conversation{ID: proto.String(chat), Messages: []*waHistorySync.HistorySyncMsg{
+			// Newest first, the way the phone lists them.
+			pastText(chat, "3EB0T3", 1754000000, "terceira"),
+			pastText(chat, "3EB0T2", 1754000000, "segunda"),
+			pastText(chat, "3EB0T1", 1754000000, "primeira"),
+		}})}).install(session)
+
+	acknowledged := make(chan bool, 1)
+	go func() { acknowledged <- session.receive(historyNotification("NOTIF17", waE2E.HistorySyncType_RECENT)) }()
+	slices, _ := slicesUntil(t, session, acknowledged)
+	if len(slices) != 1 || len(slices[0].Messages) != 3 {
+		t.Fatalf("published %+v, want one slice of three", slices)
+	}
+	for i, want := range []string{"3EB0T1", "3EB0T2", "3EB0T3"} {
+		if got := slices[0].Messages[i].ID; got != want {
+			t.Fatalf("message %d is %s, want %s: the tie reversed the conversation", i, got, want)
+		}
+	}
+}
