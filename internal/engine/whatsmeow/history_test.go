@@ -1146,3 +1146,61 @@ func TestAConversationsOwnPairNamesItsChat(t *testing.T) {
 		t.Fatalf("published %+v, want the chat under the LID its conversation names", slices)
 	}
 }
+
+// Each connect says again whether history is wanted, and the session reads it on every
+// dump: turned on by one connect, off by the next.
+func TestEachConnectSaysWhetherHistoryIsPublished(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	// Connected first, so the connects below do not dial.
+	session.setConnected(true)
+	for _, wants := range []bool{true, false} {
+		if err := session.Connect(t.Context(), engine.ConnectRequest{Pairing: "resume", HistorySync: wants}); err != nil {
+			t.Fatalf("Connect: %v", err)
+		}
+		if session.wantsHistory() != wants {
+			t.Fatalf("a connect asking for history=%v left the session at %v", wants, session.wantsHistory())
+		}
+	}
+}
+
+// The account's own device announces a dump. The same protocol message from anybody else
+// is not one, and nothing is downloaded for it.
+func TestOnlyTheAccountsOwnDeviceAnnouncesADump(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setHistory(true)
+	bench := &historyBench{dump: dumpOf(waHistorySync.HistorySync_RECENT)}
+	bench.install(session)
+	notice := historyNotification("NOTIF27", waE2E.HistorySyncType_RECENT)
+	notice.Info.IsFromMe = false
+	notice.Info.Sender = waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)
+	notice.Info.Chat = notice.Info.Sender
+
+	session.receive(notice)
+	if bench.downloads != 0 || len(bench.receipted()) != 0 {
+		t.Fatalf("a notification from somebody else was downloaded %d times and receipted %v", bench.downloads, bench.receipted())
+	}
+}
+
+// A history request puts a message on the wire, so it is refused on a session that is not
+// connected, the way a send is, rather than handed to a socket that is not there.
+func TestAHistoryRequestOnASessionThatIsNotConnectedIsRefused(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	bench := &historyBench{}
+	bench.install(session)
+
+	_, err := session.Execute(t.Context(), historyRequest(t,
+		`{"chat":{"kind":"phone","id":"5511999990002"},"before":{"id":"3EB0F1","timestamp":1754000000123,"from_me":false}}`))
+	var coded *protocol.Error
+	if !errors.As(err, &coded) || coded.Code != protocol.ErrorNotConnected {
+		t.Fatalf("answered %v, want not_connected", err)
+	}
+	if len(bench.peers) != 0 {
+		t.Fatal("a request went to the phone from a session that is not connected")
+	}
+}

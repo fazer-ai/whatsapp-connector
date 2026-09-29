@@ -450,7 +450,7 @@ func TestASessionOpenedHereStandsOnWhatItsClientAskedFor(t *testing.T) {
 	t.Cleanup(func() { _ = waEngine.Close() })
 	onProxy := "socks5://" + proxy.addr
 	if err := container.For("sid-1").PutDesiredConnected(t.Context(), store.Wants{
-		Groups: true, CallAutoReject: true, Proxy: onProxy,
+		Groups: true, CallAutoReject: true, Proxy: onProxy, History: true,
 	}); err != nil {
 		t.Fatalf("PutDesiredConnected: %v", err)
 	}
@@ -460,9 +460,9 @@ func TestASessionOpenedHereStandsOnWhatItsClientAskedFor(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	session, _ := opened.(*Session)
-	if session.proxyURL() != onProxy || !session.wantsGroups() || !session.rejectsCalls() {
-		t.Fatalf("the session opened standing on proxy=%q groups=%v auto_reject=%v, not on what "+
-			"its client asked for", session.proxyURL(), session.wantsGroups(), session.rejectsCalls())
+	if session.proxyURL() != onProxy || !session.wantsGroups() || !session.rejectsCalls() || !session.wantsHistory() {
+		t.Fatalf("the session opened standing on proxy=%q groups=%v auto_reject=%v history=%v, not on what "+
+			"its client asked for", session.proxyURL(), session.wantsGroups(), session.rejectsCalls(), session.wantsHistory())
 	}
 	_, _ = session.Execute(t.Context(), &protocol.Command{
 		Type: protocol.CommandPairingRequestCode, Payload: json.RawMessage(`{"phone":"5511999990002"}`),
