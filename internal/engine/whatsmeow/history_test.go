@@ -1857,3 +1857,58 @@ func TestAFileOfADumpForAnotherDeviceIsNotRecorded(t *testing.T) {
 		t.Fatalf("another device's file was recorded under the session (found %v, err %v)", found, err)
 	}
 }
+
+// A request a dump sent by itself holds whatsmeow's send lock for as long as the send
+// takes, and that lock reads no context. A `history.request` queued behind it waits for its
+// turn under its own deadline instead, so it does not hold the session's command queue.
+func TestAHistoryRequestWaitsForItsTurnUnderItsOwnDeadline(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setConnected(true)
+	session.wireLimit = 50 * time.Millisecond
+	(&historyBench{}).install(session)
+	sent := 0
+	session.sendPeer = func(context.Context, *wm.Client, *waE2E.Message) error {
+		sent++
+		return nil
+	}
+	// The turn the dump's own request is holding.
+	session.askingHistory <- struct{}{}
+
+	answered := make(chan error, 1)
+	go func() {
+		_, err := session.Execute(context.WithoutCancel(t.Context()), historyRequest(t,
+			`{"chat":{"kind":"phone","id":"5511999990002"},"before":{"id":"3EB0F2","timestamp":1754000000123,"from_me":false}}`))
+		answered <- err
+	}()
+	select {
+	case err := <-answered:
+		var coded *protocol.Error
+		if !errors.As(err, &coded) || coded.Code != protocol.ErrorTimeout {
+			t.Fatalf("a request that never got its turn answered %v, want timeout", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("a request waiting for its turn held the session past its deadline")
+	}
+	if sent != 0 {
+		t.Fatalf("a request that never got its turn was sent %d times", sent)
+	}
+}
+
+// Every message of a slice carries the slice's chat, whatever address it resolved itself.
+func TestEveryMessageOfASliceIsAddressedToTheSlicesChat(t *testing.T) {
+	t.Parallel()
+
+	chat := protocol.Address{Kind: protocol.AddressLID, ID: "123456789012345"}
+	messages := []protocol.InboundMessage{
+		{ID: "3EB0A1", Chat: protocol.Address{Kind: protocol.AddressPhone, ID: "5511999990002"}},
+		{ID: "3EB0A2", Chat: chat},
+	}
+	addressedTo(messages, chat)
+	for _, message := range messages {
+		if message.Chat != chat {
+			t.Fatalf("message %s is addressed to %+v in a slice of %+v", message.ID, message.Chat, chat)
+		}
+	}
+}

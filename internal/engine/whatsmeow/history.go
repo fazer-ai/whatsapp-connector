@@ -503,7 +503,9 @@ func (r *dumpRun) publishConversation(conversation *waHistorySync.Conversation) 
 	}
 	// Through the session's resolver, which is what each message in the slice is addressed
 	// by: a slice naming a chat by phone while its messages name it by LID is two chats to
-	// a client, and a `message.download_media` naming the slice's chat misses the file.
+	// a client, and a `message.download_media` naming the slice's chat misses the file. Each
+	// message is then given this same address, because it resolves its own and a pair
+	// learned in between, from live traffic or another dump, would split the slice.
 	looking, done := s.looking()
 	chat, _ := s.address(looking, jid)
 	done()
@@ -521,6 +523,7 @@ func (r *dumpRun) publishConversation(conversation *waHistorySync.Conversation) 
 		s.log.Warn().Msg("keeping for another attempt a history dump with a file whose coordinates could not be kept")
 		return false
 	}
+	addressedTo(messages, chat)
 	// The phone lists a chat newest first, and a client imports it in the order it arrives.
 	// Reversed before the sort, because a dump's clock has seconds only: messages sent
 	// within one second tie, and the stable sort keeps them in the order it was given.
@@ -569,6 +572,13 @@ func (r *dumpRun) publishConversation(conversation *waHistorySync.Conversation) 
 		r.published += end - start
 	}
 	return true
+}
+
+// addressedTo gives every message of a slice the slice's own chat.
+func addressedTo(messages []protocol.InboundMessage, chat protocol.Address) {
+	for i := range messages {
+		messages[i].Chat = chat
+	}
 }
 
 // exhaustedBy reports whether the phone said it has nothing older for this chat.
@@ -633,7 +643,7 @@ func (r *dumpRun) askPastThePage(chat waTypes.JID, conversation *waHistorySync.C
 	go func() {
 		ctx, cancel := context.WithTimeoutCause(s.ctx, s.wireLimit, errSendCeiling)
 		defer cancel()
-		if err := s.sendPeer(ctx, client, request); err != nil {
+		if err := s.askHistory(ctx, client, request); err != nil {
 			s.log.Warn().Err(err).Msg("could not ask for the page before an on-demand page that published nothing")
 		}
 	}()
@@ -763,10 +773,28 @@ func (s *Session) requestHistory(ctx context.Context, command *protocol.Command)
 		ID:            ask.Before.ID,
 		Timestamp:     time.UnixMilli(ask.Before.Timestamp),
 	}, count)
-	if err := s.sendPeer(wire, client, request); err != nil {
+	if err := s.askHistory(wire, client, request); err != nil {
 		return nil, sendFailure(whichClockRanOut(wire, err))
 	}
 	return nil, nil
+}
+
+// askHistory sends a request for history, one at a time per session and waiting for its
+// turn under the caller's deadline.
+//
+// The turn is taken here because whatsmeow's own is a mutex that no context reaches: a
+// `history.request` queued behind the request a dump sends by itself would hold the
+// session's command queue for as long as that send took, whatever deadline it came with.
+func (s *Session) askHistory(ctx context.Context, client *wm.Client, request *waE2E.Message) error {
+	select {
+	case s.askingHistory <- struct{}{}:
+	case <-ctx.Done():
+		// The error a send cut short returns, so the caller tells the two clocks apart
+		// the same way.
+		return ctx.Err()
+	}
+	defer func() { <-s.askingHistory }()
+	return s.sendPeer(ctx, client, request)
 }
 
 // payloadWithHistory is the handshake payload this session dials with: whatsmeow's own,
