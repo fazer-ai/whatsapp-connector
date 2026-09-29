@@ -1,7 +1,6 @@
 package whatsmeow
 
 import (
-	"sort"
 	"sync"
 	"time"
 )
@@ -39,7 +38,8 @@ func (d *pendingDumps) forgetUnwritten(id string) {
 	delete(d.unwritten, id)
 }
 
-// unwrittenDumps is what is kept in memory, oldest first.
+// unwrittenDumps is what is kept in memory. In no order: once written, the rows are read
+// back oldest first.
 func (d *pendingDumps) unwrittenDumps() []unwrittenDump {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -47,7 +47,6 @@ func (d *pendingDumps) unwrittenDumps() []unwrittenDump {
 	for _, dump := range d.unwritten {
 		dumps = append(dumps, dump)
 	}
-	sort.Slice(dumps, func(i, j int) bool { return dumps[i].learned < dumps[j].learned })
 	return dumps
 }
 

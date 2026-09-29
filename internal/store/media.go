@@ -149,10 +149,14 @@ func (c *Container) putMediaPart(ctx context.Context, part *MediaPart, now time.
 	return nil
 }
 
-// keepMediaPart writes a row only where the message has none.
+// keepMediaPart writes a row only where the message has none, and otherwise only renews
+// how long the row is kept.
 //
 // For a message that arrives a second time, out of a history dump: what was kept the
-// first time may name the file on this instance's disk, and the dump's copy cannot.
+// first time may name the file on this instance's disk, and the dump's copy cannot. The
+// retention is renewed all the same, because the dump has just published the message
+// again with no reference of its own, and a row the sweep takes right after is a file the
+// client was just shown and cannot fetch.
 func (c *Container) keepMediaPart(ctx context.Context, part *MediaPart, now time.Time) error {
 	if part.SID == "" || part.MessageID == "" {
 		return fmt.Errorf("store: a media part needs a session and a message, got %q and %q", part.SID, part.MessageID)
@@ -163,7 +167,8 @@ func (c *Container) keepMediaPart(ctx context.Context, part *MediaPart, now time
 			 file_enc_sha256, file_sha256, file_length, mime, filename,
 			 receipt_chat, sender, from_me, blob_id, stored_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT (sid, message_id) DO NOTHING`
+		ON CONFLICT (sid, message_id) DO UPDATE SET stored_at = excluded.stored_at
+		WHERE excluded.stored_at > wac_media_part.stored_at`
 	_, err := c.db.ExecContext(ctx, c.rebind(insert),
 		part.SID, part.MessageID, part.ChatKind, part.ChatID, part.Kind, part.DirectPath,
 		encode(part.MediaKey), encode(part.FileEncSHA256), encode(part.FileSHA256),

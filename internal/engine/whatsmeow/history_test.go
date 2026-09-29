@@ -1279,6 +1279,24 @@ func TestADumpThatCouldNotBeWrittenDownIsWrittenByTheNextAttempt(t *testing.T) {
 	if got := heldDumps(t, session); len(got) != 0 || bench.downloads != 0 {
 		t.Fatalf("a dump the store refused is pending %v and was downloaded %d times", got, bench.downloads)
 	}
+	session.dumps.mu.Lock()
+	armed := session.dumps.armed
+	session.dumps.mu.Unlock()
+	if !armed {
+		t.Fatal("a dump kept in memory armed no retry, so it waits for a connection that may not come")
+	}
+
+	// A retry the store still refuses has not finished, and keeps backing off.
+	session.dumps.mu.Lock()
+	session.dumps.wait = 4 * time.Minute
+	session.dumps.mu.Unlock()
+	session.replayHistory()
+	session.dumps.mu.Lock()
+	wait := session.dumps.wait
+	session.dumps.mu.Unlock()
+	if wait == 0 {
+		t.Fatal("a retry that could not write the dump down counted as finished")
+	}
 
 	jid, err := waTypes.ParseJID("5511999990001:12@" + waTypes.DefaultUserServer)
 	if err != nil {
@@ -1293,6 +1311,9 @@ func TestADumpThatCouldNotBeWrittenDownIsWrittenByTheNextAttempt(t *testing.T) {
 	}
 	if got := heldDumps(t, session); len(got) != 0 {
 		t.Fatalf("a dump that is finished with is still pending: %v", got)
+	}
+	if got := session.dumps.unwrittenDumps(); len(got) != 0 {
+		t.Fatalf("a dump written down is still kept in memory: %v", got)
 	}
 }
 
@@ -1319,12 +1340,23 @@ func TestARetryHasABudgetOfItsOwn(t *testing.T) {
 	t.Parallel()
 
 	session, _ := newTestSession(t, "5511999990001")
+	session.setHistory(true)
 	session.historyBudget = -time.Second
-	bench := &historyBench{dump: dumpOf(waHistorySync.HistorySync_RECENT)}
+	bench := &historyBench{dump: dumpOf(waHistorySync.HistorySync_RECENT,
+		&waHistorySync.Conversation{ID: proto.String("5511999990002@s.whatsapp.net"), Messages: []*waHistorySync.HistorySyncMsg{
+			pastText("5511999990002@s.whatsapp.net", "3EB0BIG", 1754000000, "oi"),
+		}})}
 	bench.install(session)
 	holdDump(t, session, "NOTIF44", recentNotice(t))
 
-	session.replayHistory()
+	replayed := make(chan bool, 1)
+	go func() {
+		session.replayHistory()
+		replayed <- true
+	}()
+	if slices, _ := slicesUntil(t, session, replayed); len(slices) != 1 {
+		t.Fatalf("a retry held to the first attempt's budget published %d slices", len(slices))
+	}
 	if got := bench.receipted(); len(got) != 1 {
 		t.Fatalf("a retry held to the first attempt's budget receipted %v", got)
 	}
@@ -1590,8 +1622,10 @@ func TestADumpOfAnAccountThatWasReplacedIsNotPublished(t *testing.T) {
 		t.Fatalf("the replaced account's dump was receipted: %v", got)
 	}
 	// Finished with rather than tried again: there is nobody left to finish it for.
-	if got := heldDumps(t, session); len(got) != 0 {
-		t.Fatalf("the replaced account's dump is still pending: %v", got)
+	session.dumps.mu.Lock()
+	defer session.dumps.mu.Unlock()
+	if session.dumps.armed {
+		t.Fatal("the replaced account's dump armed a retry")
 	}
 }
 
@@ -1725,5 +1759,26 @@ func TestTheDumpsPairsAreNotLearnedByTheAccountAfterIt(t *testing.T) {
 	defer session.aliases.mu.RUnlock()
 	if len(session.aliases.seen) != 0 {
 		t.Fatalf("the account after the logout learned the old one's pairs: %v", session.aliases.seen)
+	}
+}
+
+// A replay that finds the account replaced leaves the rows alone: a row under the dump's
+// id after a logout is the next account's, and the phone does not announce it again.
+func TestAReplayForAReplacedAccountDeletesNothing(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	bench := &historyBench{dump: dumpOf(waHistorySync.HistorySync_RECENT)}
+	bench.install(session)
+	session.historyRetry = time.Hour
+	session.downloadHistory = func(context.Context, *wm.Client, *waE2E.HistorySyncNotification) (*waHistorySync.HistorySync, error) {
+		session.aliases.forget()
+		return bench.dump, nil
+	}
+	holdDump(t, session, "NOTIF45", recentNotice(t))
+
+	session.replayHistory()
+	if got := heldDumps(t, session); len(got) != 1 {
+		t.Fatalf("the row under the replaced account's dump was deleted: %v", got)
 	}
 }

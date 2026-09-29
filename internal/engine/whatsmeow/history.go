@@ -161,6 +161,12 @@ func (s *Session) finishDump(id string, notice *waE2E.HistorySyncNotification, l
 		s.retryHistoryLater()
 		return false
 	}
+	if s.aliases.learning() != generation {
+		// Finished because the account is gone, and the row it had went with the device.
+		// A row under this id now is the next account's, and deleting it would lose a dump
+		// nobody announces again.
+		return true
+	}
 	dropping, cancel := context.WithTimeout(s.ctx, s.storeLimit)
 	defer cancel()
 	if err := s.store.DropPendingHistory(dropping, id); err != nil {
@@ -210,6 +216,11 @@ func (s *Session) replayOnce() bool {
 	held, err := s.store.PendingHistory(s.ctx)
 	if err != nil {
 		s.log.Warn().Err(err).Msg("could not read the history dumps this session left pending")
+		return false
+	}
+	if s.aliases.learning() != generation {
+		// The account changed while the rows were read, so they may be the next one's
+		// under the old one's generation. Left for the retry, which reads them again.
 		return false
 	}
 	for _, pending := range held {

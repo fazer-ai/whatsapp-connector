@@ -568,3 +568,40 @@ func TestABlobRememberedByASessionThatWasHandedOnIsRefused(t *testing.T) {
 		t.Errorf("the row points at %q, want the file it was written with, %q", got.BlobID, part.BlobID)
 	}
 }
+
+// A file a history dump names again keeps the coordinates it already had, and is kept as
+// long as a file first seen now: the dump just published the message with no reference.
+func TestKeepingAFileThatIsKeptRenewsOnlyItsRetention(t *testing.T) {
+	t.Parallel()
+	container := open(t)
+	pair(t, container, "sid-1", "5511999990001")
+
+	first := samplePart("sid-1", "3EB0AGAINFILE")
+	if err := container.For("sid-1").PutMediaPart(t.Context(), &first, storedAt); err != nil {
+		t.Fatalf("PutMediaPart: %v", err)
+	}
+	again := samplePart("sid-1", "3EB0AGAINFILE")
+	again.DirectPath, again.BlobID = "/v/from-the-dump", ""
+	later := storedAt.Add(time.Hour)
+	if err := container.For("sid-1").KeepMediaPart(t.Context(), &again, later); err != nil {
+		t.Fatalf("KeepMediaPart: %v", err)
+	}
+	got, _, err := container.For("sid-1").MediaPart(t.Context(), "3EB0AGAINFILE")
+	if err != nil {
+		t.Fatalf("MediaPart: %v", err)
+	}
+	if got.DirectPath != first.DirectPath || got.BlobID != first.BlobID {
+		t.Errorf("the kept file's coordinates became %q and %q", got.DirectPath, got.BlobID)
+	}
+	if got.StoredAt != later.UnixMilli() {
+		t.Errorf("the kept file is stored at %d, want the dump's %d", got.StoredAt, later.UnixMilli())
+	}
+
+	// And an older sighting does not take the retention back.
+	if err := container.For("sid-1").KeepMediaPart(t.Context(), &again, storedAt); err != nil {
+		t.Fatalf("KeepMediaPart: %v", err)
+	}
+	if got, _, _ := container.For("sid-1").MediaPart(t.Context(), "3EB0AGAINFILE"); got.StoredAt != later.UnixMilli() {
+		t.Errorf("an older sighting moved the retention back to %d", got.StoredAt)
+	}
+}
