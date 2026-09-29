@@ -1825,3 +1825,35 @@ func TestAnUnwrittenDumpOfAnotherDeviceIsNotFiledUnderThisOne(t *testing.T) {
 		t.Fatalf("the other device's dump was filed under this one: %v", got)
 	}
 }
+
+// The files a dump names are held to the device it reached, the same way its row is.
+func TestAFileOfADumpForAnotherDeviceIsNotRecorded(t *testing.T) {
+	t.Parallel()
+
+	const chat = "5511999990002@s.whatsapp.net"
+	session, _ := newTestSession(t, "5511999990001")
+	session.setHistory(true)
+	session.historyRetry = time.Hour
+	image := &waE2E.Message{ImageMessage: &waE2E.ImageMessage{
+		Mimetype: proto.String("image/jpeg"), DirectPath: proto.String("/v/other"), MediaKey: make([]byte, 32),
+		FileSHA256: make([]byte, 32), FileEncSHA256: make([]byte, 32), FileLength: proto.Uint64(1024),
+	}}
+	bench := &historyBench{dump: dumpOf(waHistorySync.HistorySync_RECENT,
+		&waHistorySync.Conversation{ID: proto.String(chat), Messages: []*waHistorySync.HistorySyncMsg{
+			pastMessage(chat, "3EB0OTHERDEV", 1754000000, false, image),
+		}})}
+	bench.install(session)
+
+	finished := make(chan bool, 1)
+	go func() {
+		finished <- session.finishDump(dumpAttempt{
+			id: "NOTIF48", device: "5511999990009:3@s.whatsapp.net",
+			notice:  &waE2E.HistorySyncNotification{SyncType: waE2E.HistorySyncType_RECENT.Enum()},
+			learned: 1755000000000, generation: session.aliases.learning(), budget: time.Minute,
+		})
+	}()
+	slicesUntil(t, session, finished)
+	if _, found, err := session.store.MediaPart(t.Context(), "3EB0OTHERDEV"); err != nil || found {
+		t.Fatalf("another device's file was recorded under the session (found %v, err %v)", found, err)
+	}
+}

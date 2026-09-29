@@ -574,7 +574,7 @@ func TestABlobRememberedByASessionThatWasHandedOnIsRefused(t *testing.T) {
 func TestKeepingAFileThatIsKeptRenewsOnlyItsRetention(t *testing.T) {
 	t.Parallel()
 	container := open(t)
-	pair(t, container, "sid-1", "5511999990001")
+	device := pair(t, container, "sid-1", "5511999990001")
 
 	first := samplePart("sid-1", "3EB0AGAINFILE")
 	if err := container.For("sid-1").PutMediaPart(t.Context(), &first, storedAt); err != nil {
@@ -583,7 +583,7 @@ func TestKeepingAFileThatIsKeptRenewsOnlyItsRetention(t *testing.T) {
 	again := samplePart("sid-1", "3EB0AGAINFILE")
 	again.DirectPath, again.BlobID = "/v/from-the-dump", ""
 	later := storedAt.Add(time.Hour)
-	if err := container.For("sid-1").KeepMediaPart(t.Context(), &again, later); err != nil {
+	if err := container.For("sid-1").KeepMediaPart(t.Context(), &again, device.String(), later); err != nil {
 		t.Fatalf("KeepMediaPart: %v", err)
 	}
 	got, _, err := container.For("sid-1").MediaPart(t.Context(), "3EB0AGAINFILE")
@@ -598,10 +598,28 @@ func TestKeepingAFileThatIsKeptRenewsOnlyItsRetention(t *testing.T) {
 	}
 
 	// And an older sighting does not take the retention back.
-	if err := container.For("sid-1").KeepMediaPart(t.Context(), &again, storedAt); err != nil {
+	if err := container.For("sid-1").KeepMediaPart(t.Context(), &again, device.String(), storedAt); err != nil {
 		t.Fatalf("KeepMediaPart: %v", err)
 	}
 	if got, _, _ := container.For("sid-1").MediaPart(t.Context(), "3EB0AGAINFILE"); got.StoredAt != later.UnixMilli() {
 		t.Errorf("an older sighting moved the retention back to %d", got.StoredAt)
+	}
+}
+
+// A file out of a dump is recorded only for the device the dump reached, in the same
+// statement: across a logout and a new pairing, the previous account's media keys would
+// otherwise be downloadable by the next one.
+func TestAFileForADeviceTheSessionIsNotBoundToIsNotKept(t *testing.T) {
+	t.Parallel()
+	container := open(t)
+	old := pair(t, container, "sid-1", "5511999990001")
+	pair(t, container, "sid-1", "5511999990009")
+
+	part := samplePart("sid-1", "3EB0OLDDEVICE")
+	if err := container.For("sid-1").KeepMediaPart(t.Context(), &part, old.String(), storedAt); err != nil {
+		t.Fatalf("KeepMediaPart: %v", err)
+	}
+	if _, found, err := container.For("sid-1").MediaPart(t.Context(), "3EB0OLDDEVICE"); err != nil || found {
+		t.Fatalf("the previous device's file was recorded for the new one (found %v, err %v)", found, err)
 	}
 }

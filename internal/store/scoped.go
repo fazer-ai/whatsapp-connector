@@ -122,14 +122,15 @@ func (s *Scoped) PutMediaPart(ctx context.Context, part *MediaPart, now time.Tim
 	return s.container.putMediaPart(ctx, &kept, now)
 }
 
-// KeepMediaPart is PutMediaPart for a message whose row, if it has one, stays as it is.
-func (s *Scoped) KeepMediaPart(ctx context.Context, part *MediaPart, now time.Time) error {
+// KeepMediaPart is PutMediaPart for a message whose row, if it has one, stays as it is,
+// written only while the session is bound to device, the one the dump reached.
+func (s *Scoped) KeepMediaPart(ctx context.Context, part *MediaPart, device string, now time.Time) error {
 	if err := s.fence.held(); err != nil {
 		return err
 	}
 	kept := *part
 	kept.SID = s.sid
-	return s.container.keepMediaPart(ctx, &kept, now)
+	return s.container.keepMediaPart(ctx, &kept, device, now)
 }
 
 // RefreshDirectPath replaces where a message's file is fetched from, and only while the

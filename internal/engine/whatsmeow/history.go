@@ -151,14 +151,28 @@ func (s *Session) receiveHistory(event *waEvents.Message, notice *waE2E.HistoryS
 		s.retryHistoryLater()
 		return true
 	}
-	s.finishDump(id, notice, learned, generation, s.historyBudget)
+	s.finishDump(dumpAttempt{
+		id: id, device: device, notice: notice, learned: learned, generation: generation, budget: s.historyBudget,
+	})
 	return true
+}
+
+// dumpAttempt is one attempt at a dump: which notification, the device and the account it
+// reached, and how long the attempt may take.
+type dumpAttempt struct {
+	id         string
+	device     string
+	notice     *waE2E.HistorySyncNotification
+	learned    int64
+	generation uint64
+	budget     time.Duration
 }
 
 // finishDump makes one attempt at a dump that is written down, and forgets it when the
 // attempt finished with it.
-func (s *Session) finishDump(id string, notice *waE2E.HistorySyncNotification, learned int64, generation uint64, budget time.Duration) bool {
-	if !s.handleDump(id, notice, learned, generation, budget) {
+func (s *Session) finishDump(attempt dumpAttempt) bool {
+	id, generation := attempt.id, attempt.generation
+	if !s.handleDump(attempt) {
 		s.retryHistoryLater()
 		return false
 	}
@@ -244,7 +258,10 @@ func (s *Session) replayOnce() bool {
 			continue
 		}
 		s.log.Info().Str("message_id", pending.MessageID).Msg("picking up a history dump that did not finish")
-		if !s.finishDump(pending.MessageID, &notice, pending.LearnedAt, generation, s.historyReplayBudget) {
+		if !s.finishDump(dumpAttempt{
+			id: pending.MessageID, device: pending.Device, notice: &notice, learned: pending.LearnedAt,
+			generation: generation, budget: s.historyReplayBudget,
+		}) {
 			finished = false
 		}
 		s.dumps.release(pending.MessageID)
@@ -307,7 +324,8 @@ func (s *Session) writeUnwritten(generation uint64) bool {
 // generation is the account the caller found the dump under, read before the dump was:
 // the client and the generation are swapped under one lock, so a rebuild after that read
 // leaves an old generation beside a new client, which the checks below catch.
-func (s *Session) handleDump(id string, notice *waE2E.HistorySyncNotification, learned int64, generation uint64, budget time.Duration) bool {
+func (s *Session) handleDump(attempt dumpAttempt) bool {
+	id, notice, learned, generation, budget := attempt.id, attempt.notice, attempt.learned, attempt.generation, attempt.budget
 	client := s.current()
 	if s.aliases.learning() != generation {
 		s.log.Info().Str("message_id", id).Msg("dropping a history dump of an account this session no longer holds")
@@ -368,7 +386,7 @@ func (s *Session) handleDump(id string, notice *waE2E.HistorySyncNotification, l
 	}
 
 	sync, conversational := historySyncs[dump.GetSyncType()]
-	run := &dumpRun{s: s, ctx: ctx, budget: budget, client: client, sync: sync, dump: dump, learned: learned, generation: generation}
+	run := &dumpRun{s: s, ctx: ctx, budget: budget, device: attempt.device, client: client, sync: sync, dump: dump, learned: learned, generation: generation}
 	publishing := conversational && s.wantsHistory()
 	if publishing {
 		for _, conversation := range dump.GetConversations() {
@@ -429,9 +447,11 @@ func parsedJIDs(raw ...string) []waTypes.JID {
 // dumpRun is one dump being published: what every chat in it shares, and whether a file
 // in it could not be recorded.
 type dumpRun struct {
-	s       *Session
-	ctx     context.Context // the dump's budget
-	budget  time.Duration
+	s      *Session
+	ctx    context.Context // the dump's budget
+	budget time.Duration
+	// device is the one the dump reached, which every file row it writes is held to.
+	device  string
 	client  *wm.Client
 	sync    protocol.HistorySync
 	dump    *waHistorySync.HistorySync
@@ -684,7 +704,7 @@ func (r *dumpRun) pastBody(event *waEvents.Message) (body, bool) {
 		// Checked right before the write: the fence is about the lease and not the
 		// account, and a row written after a logout would hand the old account's file to
 		// whatever pairs next under this session.
-		if r.replaced() || !s.rememberPast(r.ctx, event, &part) {
+		if r.replaced() || !s.rememberPast(r.ctx, event, &part, r.device) {
 			r.unkept = true
 		}
 		return body{content: part.content, context: part.context}, true

@@ -157,7 +157,11 @@ func (c *Container) putMediaPart(ctx context.Context, part *MediaPart, now time.
 // retention is renewed all the same, because the dump has just published the message
 // again with no reference of its own, and a row the sweep takes right after is a file the
 // client was just shown and cannot fetch.
-func (c *Container) keepMediaPart(ctx context.Context, part *MediaPart, now time.Time) error {
+//
+// Nothing is written unless the session is still bound to device, checked in the same
+// statement: a dump retried across a logout and a new pairing would otherwise file the
+// previous account's media keys under the next account, which could then download them.
+func (c *Container) keepMediaPart(ctx context.Context, part *MediaPart, device string, now time.Time) error {
 	if part.SID == "" || part.MessageID == "" {
 		return fmt.Errorf("store: a media part needs a session and a message, got %q and %q", part.SID, part.MessageID)
 	}
@@ -166,14 +170,16 @@ func (c *Container) keepMediaPart(ctx context.Context, part *MediaPart, now time
 			(sid, message_id, chat_kind, chat_id, kind, direct_path, media_key,
 			 file_enc_sha256, file_sha256, file_length, mime, filename,
 			 receipt_chat, sender, from_me, blob_id, stored_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+		WHERE EXISTS (SELECT 1 FROM wac_session_device WHERE sid = ? AND jid = ?)
 		ON CONFLICT (sid, message_id) DO UPDATE SET stored_at = excluded.stored_at
 		WHERE excluded.stored_at > wac_media_part.stored_at`
 	_, err := c.db.ExecContext(ctx, c.rebind(insert),
 		part.SID, part.MessageID, part.ChatKind, part.ChatID, part.Kind, part.DirectPath,
 		encode(part.MediaKey), encode(part.FileEncSHA256), encode(part.FileSHA256),
 		part.FileLength, part.Mime, part.Filename,
-		part.ReceiptChat, part.Sender, asFlag(part.FromMe), part.BlobID, now.UnixMilli())
+		part.ReceiptChat, part.Sender, asFlag(part.FromMe), part.BlobID, now.UnixMilli(),
+		part.SID, device)
 	if err != nil {
 		return fmt.Errorf("store: record how to fetch the file of %s: %w", part.MessageID, err)
 	}

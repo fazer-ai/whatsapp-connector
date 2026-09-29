@@ -552,12 +552,12 @@ func (s *Session) remember(event *waEvents.Message, part *attachment) bool {
 //
 // Unlike remember, a failure is the caller's to act on: a dump's media goes out with no
 // reference, so this row is the only way its file is ever fetched.
-func (s *Session) rememberPast(ctx context.Context, event *waEvents.Message, part *attachment) bool {
+func (s *Session) rememberPast(ctx context.Context, event *waEvents.Message, part *attachment, device string) bool {
 	ctx, cancel := context.WithTimeout(ctx, s.storeLimit)
 	defer cancel()
 
 	kept := s.mediaPartOf(ctx, event, part)
-	if err := s.store.KeepMediaPart(ctx, &kept, time.Now()); err != nil {
+	if err := s.store.KeepMediaPart(ctx, &kept, device, time.Now()); err != nil {
 		s.log.Warn().Err(err).Str("message_id", kept.MessageID).
 			Msg("could not keep how to fetch the file of a message out of a dump")
 		return false
