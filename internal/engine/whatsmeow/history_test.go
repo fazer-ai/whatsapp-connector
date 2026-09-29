@@ -928,3 +928,79 @@ func TestADumpListedOutOfOrderIsPublishedOldestFirst(t *testing.T) {
 		}
 	}
 }
+
+// A code request is a connect the client did not send, so it carries the history choice
+// the client already made. Lost here, the pairing it asks for would not ask the phone for
+// the full history, and every dump after it would be receipted and published nowhere.
+func TestACodeRequestKeepsTheHistoryTheClientAskedFor(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "")
+	session.setHistory(true)
+	// The connect underneath fails: there is no socket here. What matters is what it was
+	// asked for on the way, which the session records before it dials.
+	_ = session.requestCode(t.Context(), &protocol.Command{
+		Type:    protocol.CommandPairingRequestCode,
+		Payload: json.RawMessage(`{"phone":"5511999990001"}`),
+	})
+	if !session.wantsHistory() {
+		t.Fatal("asking for a pairing code turned history off")
+	}
+}
+
+// The budget starts before the download: whatsmeow's media client has no overall timeout,
+// and a download that stalls is the node handler stalling with it.
+func TestTheDumpsBudgetBoundsItsDownload(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setHistory(true)
+	session.historyBudget = 50 * time.Millisecond
+	bench := &historyBench{}
+	bench.install(session)
+	session.downloadHistory = func(ctx context.Context, _ *wm.Client, _ *waE2E.HistorySyncNotification) (*waHistorySync.HistorySync, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+
+	acknowledged := make(chan bool, 1)
+	go func() { acknowledged <- session.receive(historyNotification("NOTIF22", waE2E.HistorySyncType_RECENT)) }()
+	select {
+	case got := <-acknowledged:
+		if got || len(bench.receipted()) != 0 {
+			t.Fatalf("a download that ran out of time was acknowledged %v, receipted %v", got, bench.receipted())
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("a download that never finished held the node handler past its budget")
+	}
+}
+
+// A dump's media carries no reference, so the row that says how to fetch the file is the
+// only way it is ever fetched. A row that could not be written withholds the dump, and the
+// redelivery writes it; published and receipted, the file would be gone for good.
+func TestADumpWhoseFileCouldNotBeKeptIsWithheld(t *testing.T) {
+	t.Parallel()
+
+	const chat = "5511999990002@s.whatsapp.net"
+	session, _ := newTestSession(t, "5511999990001")
+	session.setHistory(true)
+	image := &waE2E.Message{ImageMessage: &waE2E.ImageMessage{
+		Mimetype: proto.String("image/jpeg"), DirectPath: proto.String("/v/dump"), MediaKey: make([]byte, 32),
+		FileSHA256: make([]byte, 32), FileEncSHA256: make([]byte, 32), FileLength: proto.Uint64(1024),
+	}}
+	bench := &historyBench{dump: dumpOf(waHistorySync.HistorySync_RECENT,
+		&waHistorySync.Conversation{ID: proto.String(chat), Messages: []*waHistorySync.HistorySyncMsg{
+			pastMessage(chat, "3EB0U1", 1754000000, false, image),
+		}})}
+	bench.install(session)
+	// The store refuses every write, the way it does for a session another instance took.
+	session.store.Drop()
+
+	acknowledged := make(chan bool, 1)
+	go func() { acknowledged <- session.receive(historyNotification("NOTIF23", waE2E.HistorySyncType_RECENT)) }()
+	slices, got := slicesUntil(t, session, acknowledged)
+	if got || len(slices) != 0 || len(bench.receipted()) != 0 {
+		t.Fatalf("a dump whose file could not be kept published %d slices, acknowledged %v, receipted %v",
+			len(slices), got, bench.receipted())
+	}
+}

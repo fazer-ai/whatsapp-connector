@@ -96,10 +96,18 @@ var historySyncs = map[waHistorySync.HistorySync_HistorySyncType]protocol.Histor
 // notification again and the dump is downloaded again.
 func (s *Session) receiveHistory(event *waEvents.Message, notice *waE2E.HistorySyncNotification, learned int64) bool {
 	client := s.current()
+	// The dump is handled inside the node handler, and whatsmeow starts the next node
+	// alongside a handler that has run for five minutes, which is the order of everything
+	// after it gone. So the whole of it has a budget, from the download on: whatsmeow's
+	// media client has no overall timeout of its own, and a dump's rows are one store write
+	// per file. Over it, the dump is left unreceipted and comes back whole, and the client
+	// deduplicates what it already has: the same trade as a message.
+	ctx, cancel := context.WithTimeout(s.ctx, s.historyBudget)
+	defer cancel()
 	// Stamped before the download, the way a command is: a logout during it rebuilds the
 	// session on another account, and the pairs in this dump are the old one's.
 	learning := s.aliases.stamp(s.ctx)
-	dump, err := s.downloadHistory(s.ctx, client, notice)
+	dump, err := s.downloadHistory(ctx, client, notice)
 	var gone refused
 	switch {
 	case err != nil && errors.As(downloadFailure(err), &gone):
@@ -132,15 +140,9 @@ func (s *Session) receiveHistory(event *waEvents.Message, notice *waE2E.HistoryS
 
 	sync, conversational := historySyncs[dump.GetSyncType()]
 	if conversational && s.wantsHistory() {
-		// The dump is published inside the node handler, and whatsmeow starts the next
-		// node alongside a handler that has run for five minutes, which is the order of
-		// everything after it gone. So the whole dump has a budget, checked before each
-		// slice, that leaves room under the watchdog for the one slice that may still wait
-		// out deliverWait. Over it, the dump is left unreceipted and comes back whole, and
-		// the client deduplicates what it already has: the same trade as a message.
-		over := time.Now().Add(s.historyBudget)
+		run := &dumpRun{s: s, ctx: ctx, client: client, sync: sync, dump: dump, learned: learned}
 		for _, conversation := range dump.GetConversations() {
-			if !s.publishConversation(client, sync, dump, conversation, learned, over) {
+			if !run.publishConversation(conversation) {
 				return false
 			}
 		}
@@ -159,9 +161,36 @@ func (s *Session) receiptDump(client *wm.Client, id waTypes.MessageID) {
 	}
 }
 
+// dumpRun is one dump being published: what every chat in it shares, and whether a file
+// in it could not be recorded.
+type dumpRun struct {
+	s       *Session
+	ctx     context.Context // the dump's budget
+	client  *wm.Client
+	sync    protocol.HistorySync
+	dump    *waHistorySync.HistorySync
+	learned int64
+	// unkept is a file this run published and could not record how to fetch. A dump's
+	// media carries no reference, so that row is the only way the file is ever fetched,
+	// and the dump is withheld for it the way a message is for an event that did not
+	// publish.
+	unkept bool
+}
+
+// overBudget reports whether the dump has run out of time, and says so once.
+func (r *dumpRun) overBudget() bool {
+	if r.ctx.Err() == nil {
+		return false
+	}
+	r.s.log.Warn().Dur("budget", r.s.historyBudget).
+		Msg("withholding a history dump that did not publish within its budget")
+	return true
+}
+
 // publishConversation publishes one chat of a dump, oldest first, in slices of at most
 // historySliceLimit messages, and reports whether every slice was published.
-func (s *Session) publishConversation(client *wm.Client, sync protocol.HistorySync, dump *waHistorySync.HistorySync, conversation *waHistorySync.Conversation, learned int64, over time.Time) bool {
+func (r *dumpRun) publishConversation(conversation *waHistorySync.Conversation) bool {
+	s, sync, dump := r.s, r.sync, r.dump
 	jid, err := waTypes.ParseJID(conversation.GetID())
 	if err != nil {
 		s.log.Debug().Err(err).Msg("skipping a chat in a history dump that names no chat")
@@ -181,9 +210,16 @@ func (s *Session) publishConversation(client *wm.Client, sync protocol.HistorySy
 
 	messages := make([]protocol.InboundMessage, 0, len(conversation.GetMessages()))
 	for _, past := range conversation.GetMessages() {
-		if message, ok := s.pastMessageOf(client, jid, past.GetMessage()); ok {
+		if r.overBudget() {
+			return false
+		}
+		if message, ok := r.pastMessageOf(jid, past.GetMessage()); ok {
 			messages = append(messages, message)
 		}
+	}
+	if r.unkept {
+		s.log.Warn().Msg("withholding a history dump with a file whose coordinates could not be kept")
+		return false
 	}
 	// The phone lists a chat newest first, and a client imports it in the order it arrives.
 	// Reversed before the sort, because a dump's clock has seconds only: messages sent
@@ -214,12 +250,10 @@ func (s *Session) publishConversation(client *wm.Client, sync protocol.HistorySy
 			// On the last slice of the chat only: until then there is more on its way.
 			Exhausted: exhausted && end == len(messages),
 		}
-		if time.Now().After(over) {
-			s.log.Warn().Dur("budget", s.historyBudget).
-				Msg("withholding a history dump that did not publish within its budget")
+		if r.overBudget() {
 			return false
 		}
-		if !s.deliver(protocol.EventHistorySync, slice, learned) {
+		if !s.deliver(protocol.EventHistorySync, slice, r.learned) {
 			return false
 		}
 	}
@@ -263,7 +297,8 @@ func conversational(kind protocol.AddressKind) bool {
 // What is left out is what the live path turns into something other than a message: a
 // reaction, an edit, a deletion, a vote. In a dump those arrive already applied to the
 // message they change, so publishing them as well would only put a second bubble next to it.
-func (s *Session) pastMessageOf(client *wm.Client, chat waTypes.JID, past *waWeb.WebMessageInfo) (protocol.InboundMessage, bool) {
+func (r *dumpRun) pastMessageOf(chat waTypes.JID, past *waWeb.WebMessageInfo) (protocol.InboundMessage, bool) {
+	s, client := r.s, r.client
 	if past == nil {
 		return protocol.InboundMessage{}, false
 	}
@@ -288,7 +323,7 @@ func (s *Session) pastMessageOf(client *wm.Client, chat waTypes.JID, past *waWeb
 		marksAMessage(message):
 		return protocol.InboundMessage{}, false
 	}
-	inbound, _, ok := s.inboundOf(event, s.pastBody)
+	inbound, _, ok := s.inboundOf(event, r.pastBody)
 	return inbound, ok
 }
 
@@ -298,7 +333,8 @@ func (s *Session) pastMessageOf(client *wm.Client, chat waTypes.JID, past *waWeb
 // carry thousands of pictures, and downloading each before publishing its slice would hold
 // the whole dump behind the slowest of them. The message goes out with no reference, and
 // what it takes to fetch the file later is recorded, so `message.download_media` can.
-func (s *Session) pastBody(event *waEvents.Message) (body, bool) {
+func (r *dumpRun) pastBody(event *waEvents.Message) (body, bool) {
+	s := r.s
 	if plain, ok := plainBody(event); ok {
 		return plain, true
 	}
@@ -311,7 +347,9 @@ func (s *Session) pastBody(event *waEvents.Message) (body, bool) {
 			part.content.Thumbnail = ""
 			return body{content: part.content, context: part.context}, true
 		}
-		s.rememberPast(event, &part)
+		if !s.rememberPast(r.ctx, event, &part) {
+			r.unkept = true
+		}
 		return body{content: part.content, context: part.context}, true
 	}
 	return unreadableBody(event)

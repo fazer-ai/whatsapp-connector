@@ -528,15 +528,20 @@ func (s *Session) remember(event *waEvents.Message, part *attachment) bool {
 // message this session already knows arrives again: live and then in a dump, or in two
 // dumps. What was kept first wins, because it can only be as new as the dump's copy and
 // it may name the file already on this instance's disk, which the dump's copy cannot.
-func (s *Session) rememberPast(event *waEvents.Message, part *attachment) {
-	ctx, cancel := context.WithTimeout(s.ctx, s.storeLimit)
+//
+// Unlike remember, a failure is the caller's to act on: a dump's media goes out with no
+// reference, so this row is the only way its file is ever fetched.
+func (s *Session) rememberPast(ctx context.Context, event *waEvents.Message, part *attachment) bool {
+	ctx, cancel := context.WithTimeout(ctx, s.storeLimit)
 	defer cancel()
 
 	kept := s.mediaPartOf(ctx, event, part)
 	if err := s.store.KeepMediaPart(ctx, &kept, time.Now()); err != nil {
 		s.log.Warn().Err(err).Str("message_id", kept.MessageID).
-			Msg("published a file out of a dump this session will not be able to fetch")
+			Msg("could not keep how to fetch the file of a message out of a dump")
+		return false
 	}
+	return true
 }
 
 // mediaPartOf is the row that says how to fetch this message's file again.

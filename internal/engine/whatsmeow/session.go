@@ -3525,7 +3525,9 @@ func (s *Session) requestCode(ctx context.Context, command *protocol.Command) er
 	// would turn group traffic off on a session that had asked for it, at the moment it
 	// asked for a pairing code; leaving the call policy out would have the account start
 	// ringing again, and record that as what its client wanted.
-	request := engine.ConnectRequest{Pairing: "code", Phone: body.Phone, Groups: s.wantsGroups()}
+	request := engine.ConnectRequest{
+		Pairing: "code", Phone: body.Phone, Groups: s.wantsGroups(), HistorySync: s.wantsHistory(),
+	}
 	if s.rejectsCalls() {
 		request.Calls = &engine.CallsRequest{AutoReject: true}
 	}
