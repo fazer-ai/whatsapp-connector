@@ -428,10 +428,10 @@ theirs, and the connector is always upgraded first.
   as a reply. They stay in the enum because
   removing one narrows what a client may already match on, and each is marked in
   `internal/protocol/errors.go` with what arrives in its place.
-- Two command types have no handler here -- `session.update` and `contact.info` --
-  and a client that sends one is answered `unsupported`. That answer only reaches a client whose session some instance owns: a
-  command for a session nobody is running is delivered to nobody, so the caller waits out
-  its own deadline instead. Which two is marked in `internal/protocol/types.go` and held
+- Two command types have no handler here -- `session.update` and `contact.info` -- and a
+  client that sends one is answered `unsupported`. That answer only reaches a client whose
+  session some instance owns: a command for a session nobody is running is delivered to
+  nobody, so the caller waits out its own deadline instead. Which two is marked in `internal/protocol/types.go` and held
   there by a test, so wiring one up without saying so fails the build.
 - Six of the event types have no producer in this connector either, and the same
   reasoning holds: a client may match on one and never see it. Unlike a command, nothing
