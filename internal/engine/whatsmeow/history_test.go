@@ -1562,3 +1562,32 @@ func TestAPendingDumpReadBeforeALogoutIsNotAttemptedAfterIt(t *testing.T) {
 		t.Fatalf("after the account was replaced %d more dump(s) of the old one were downloaded", downloads-1)
 	}
 }
+
+// Nor is a file of the replaced account recorded under the session: the fence is about the
+// lease, and the row would hand the old account's file to whatever pairs next.
+func TestAFileOfAnAccountThatWasReplacedIsNotRecorded(t *testing.T) {
+	t.Parallel()
+
+	const chat = "5511999990002@s.whatsapp.net"
+	session, _ := newTestSession(t, "5511999990001")
+	session.setHistory(true)
+	image := &waE2E.Message{ImageMessage: &waE2E.ImageMessage{
+		Mimetype: proto.String("image/jpeg"), DirectPath: proto.String("/v/old"), MediaKey: make([]byte, 32),
+		FileSHA256: make([]byte, 32), FileEncSHA256: make([]byte, 32), FileLength: proto.Uint64(1024),
+	}}
+	bench := &historyBench{dump: dumpOf(waHistorySync.HistorySync_RECENT,
+		&waHistorySync.Conversation{ID: proto.String(chat), Messages: []*waHistorySync.HistorySyncMsg{
+			pastMessage(chat, "3EB0OLDFILE", 1754000000, false, image),
+		}})}
+	bench.install(session)
+	session.downloadHistory = func(context.Context, *wm.Client, *waE2E.HistorySyncNotification) (*waHistorySync.HistorySync, error) {
+		session.aliases.forget()
+		return bench.dump, nil
+	}
+	holdDump(t, session, "NOTIF39", recentNotice(t))
+
+	session.replayHistory()
+	if _, found, err := session.store.MediaPart(t.Context(), "3EB0OLDFILE"); err != nil || found {
+		t.Fatalf("the replaced account's file was recorded under the session (found %v, err %v)", found, err)
+	}
+}

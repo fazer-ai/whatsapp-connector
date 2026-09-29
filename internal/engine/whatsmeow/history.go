@@ -372,8 +372,10 @@ type dumpRun struct {
 	sync    protocol.HistorySync
 	dump    *waHistorySync.HistorySync
 	learned int64
-	// generation is the account the dump was announced to.
+	// generation is the account the dump was announced to, and gone is it having been
+	// replaced, said once.
 	generation uint64
+	gone       bool
 	// slices and published count what went out, for the line the dump is logged with.
 	slices, published int
 	// unkept is a file this run published and could not record how to fetch. A dump's
@@ -395,9 +397,13 @@ func (r *dumpRun) overBudget() bool {
 
 // replaced reports whether the account the dump belongs to is no longer this session's.
 func (r *dumpRun) replaced() bool {
+	if r.gone {
+		return true
+	}
 	if r.s.aliases.learning() == r.generation {
 		return false
 	}
+	r.gone = true
 	r.s.log.Info().Msg("dropping a history dump of an account this session no longer holds")
 	return true
 }
@@ -611,7 +617,10 @@ func (r *dumpRun) pastBody(event *waEvents.Message) (body, bool) {
 			part.content.Thumbnail = ""
 			return body{content: part.content, context: part.context}, true
 		}
-		if !s.rememberPast(r.ctx, event, &part) {
+		// Checked right before the write: the fence is about the lease and not the
+		// account, and a row written after a logout would hand the old account's file to
+		// whatever pairs next under this session.
+		if r.replaced() || !s.rememberPast(r.ctx, event, &part) {
 			r.unkept = true
 		}
 		return body{content: part.content, context: part.context}, true
