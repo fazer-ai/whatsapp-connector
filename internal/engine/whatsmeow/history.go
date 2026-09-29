@@ -163,14 +163,27 @@ func (s *Session) receiveHistory(event *waEvents.Message, notice *waE2E.HistoryS
 	}
 
 	sync, conversational := historySyncs[dump.GetSyncType()]
-	if conversational && s.wantsHistory() {
-		run := &dumpRun{s: s, ctx: ctx, client: client, sync: sync, dump: dump, learned: learned}
+	run := &dumpRun{s: s, ctx: ctx, client: client, sync: sync, dump: dump, learned: learned}
+	publishing := conversational && s.wantsHistory()
+	if publishing {
 		for _, conversation := range dump.GetConversations() {
 			if !run.publishConversation(conversation) {
 				return false
 			}
 		}
 	}
+	// One line per dump, with counts and nothing a message said: without it, a dump the
+	// phone sent empty and one whose messages were all filtered here look the same from
+	// outside, and that is the first question anybody asks about history that did not show.
+	sent := 0
+	for _, conversation := range dump.GetConversations() {
+		sent += len(conversation.GetMessages())
+	}
+	s.log.Info().Str("message_id", event.Info.ID).Str("sync_type", dump.GetSyncType().String()).
+		Uint32("chunk", dump.GetChunkOrder()).Uint32("progress", dump.GetProgress()).
+		Int("conversations", len(dump.GetConversations())).Int("messages_sent", sent).
+		Bool("publishing", publishing).Int("slices", run.slices).Int("messages_published", run.published).
+		Msg("history dump handled")
 
 	s.receiptDump(client, event.Info.ID)
 	return true
@@ -215,6 +228,8 @@ type dumpRun struct {
 	sync    protocol.HistorySync
 	dump    *waHistorySync.HistorySync
 	learned int64
+	// slices and published count what went out, for the line the dump is logged with.
+	slices, published int
 	// unkept is a file this run published and could not record how to fetch. A dump's
 	// media carries no reference, so that row is the only way the file is ever fetched,
 	// and the dump is withheld for it the way a message is for an event that did not
@@ -297,10 +312,12 @@ func (r *dumpRun) publishConversation(conversation *waHistorySync.Conversation) 
 	for start := 0; start == 0 || start < len(messages); start += historySliceLimit {
 		end := min(start+historySliceLimit, len(messages))
 		slice := protocol.HistorySlice{
-			Kind: protocol.HistoryKindMessages, Sync: sync, Chat: chat, Name: name,
-			Messages: messages[start:end], Progress: progress,
-			// On the last slice of the chat only: until then there is more on its way.
-			Exhausted: exhausted && end == len(messages),
+			Kind: protocol.HistoryKindMessages, Progress: progress,
+			Data: protocol.HistoryMessages{
+				Sync: sync, Chat: chat, Name: name, Messages: messages[start:end],
+				// On the last slice of the chat only: until then there is more on its way.
+				Exhausted: exhausted && end == len(messages),
+			},
 		}
 		if r.overBudget() {
 			return false
@@ -308,6 +325,8 @@ func (r *dumpRun) publishConversation(conversation *waHistorySync.Conversation) 
 		if !s.deliver(protocol.EventHistorySync, slice, r.learned) {
 			return false
 		}
+		r.slices++
+		r.published += end - start
 	}
 	return true
 }

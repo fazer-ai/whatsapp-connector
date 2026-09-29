@@ -398,7 +398,7 @@ func payloadEnums() map[string]payloadEnum {
 		},
 		"history sync": {
 			known: asStrings(protocol.AllHistorySyncs),
-			paths: [][]string{{"definitions", "event_history_sync", "properties", "sync"}},
+			paths: [][]string{{"definitions", "history_messages", "properties", "sync"}},
 		},
 		"unsupported reason": {
 			known: asStrings(protocol.AllUnsupportedReasons),

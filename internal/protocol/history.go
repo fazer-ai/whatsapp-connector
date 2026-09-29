@@ -24,10 +24,18 @@ var AllHistorySyncs = []HistorySync{HistoryBootstrap, HistoryRecent, HistoryFull
 // one chat.
 const HistoryKindMessages = "messages"
 
-// HistorySlice is one slice of one chat's history, oldest first. A chat longer than a
-// slice arrives in several, so no stream entry carries a whole dump.
+// HistorySlice is the payload of `history.sync`: a kind, how far the dump has got, and the
+// batch itself under `data`. The envelope is the one the Chatwoot side already reads for
+// every provider's history, so one handler serves them all.
 type HistorySlice struct {
-	Kind     string           `json:"kind"`
+	Kind     string          `json:"kind"`
+	Progress *int            `json:"progress,omitempty"`
+	Data     HistoryMessages `json:"data"`
+}
+
+// HistoryMessages is one slice of one chat's history, oldest first. A chat longer than a
+// slice arrives in several, so no stream entry carries a whole dump.
+type HistoryMessages struct {
 	Sync     HistorySync      `json:"sync"`
 	Chat     Address          `json:"chat"`
 	Name     string           `json:"name,omitempty"`
@@ -35,5 +43,4 @@ type HistorySlice struct {
 	// Exhausted is the phone having nothing older for this chat, which is what lets a
 	// client stop offering to ask for more.
 	Exhausted bool `json:"exhausted,omitempty"`
-	Progress  *int `json:"progress,omitempty"`
 }

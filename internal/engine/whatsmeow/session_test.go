@@ -3603,10 +3603,10 @@ func resumedDoors() []resumedDoor {
 			// Held back until the slice is known to have been delivered.
 			answers: answersNo,
 			carries: func(t *testing.T, payload map[string]any) {
-				inTheGroup(t, payload, "chat")
-				messages, _ := payload["messages"].([]any)
+				inTheGroup(t, payload, "data", "chat")
+				messages, _ := field(t, payload, "data", "messages").([]any)
 				if len(messages) != 1 {
-					t.Errorf("published %v as the group's history", payload["messages"])
+					t.Errorf("published %v as the group's history", messages)
 				}
 			},
 			quiet:      inboxIsEmpty,

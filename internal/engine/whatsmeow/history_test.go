@@ -112,11 +112,23 @@ func (b *historyBench) receipted() []string {
 	return append([]string(nil), b.receipts...)
 }
 
+// seenSlice is a published slice as the tests read it: the batch, with the envelope's
+// kind and progress beside it.
+type seenSlice struct {
+	protocol.HistoryMessages
+	Kind     string
+	Progress *int
+}
+
+func seen(slice *protocol.HistorySlice) seenSlice {
+	return seenSlice{HistoryMessages: slice.Data, Kind: slice.Kind, Progress: slice.Progress}
+}
+
 // slices reads history.sync emissions, settling each, until the handler comes back.
-func slicesUntil(t *testing.T, session *Session, acknowledged <-chan bool) ([]protocol.HistorySlice, bool) {
+func slicesUntil(t *testing.T, session *Session, acknowledged <-chan bool) ([]seenSlice, bool) {
 	t.Helper()
 
-	var slices []protocol.HistorySlice
+	var slices []seenSlice
 	for {
 		select {
 		case got := <-acknowledged:
@@ -133,7 +145,7 @@ func slicesUntil(t *testing.T, session *Session, acknowledged <-chan bool) ([]pr
 			if err := json.Unmarshal(emission.Payload, &slice); err != nil {
 				t.Fatalf("unmarshal a slice: %v", err)
 			}
-			slices = append(slices, slice)
+			slices = append(slices, seen(&slice))
 			emission.Settle(nil)
 		case <-time.After(15 * time.Second):
 			t.Fatal("the session neither published nor came back")
@@ -178,12 +190,12 @@ func TestAHistoryDumpIsPublishedOneSliceAChatAndReceiptedOnlyAfterward(t *testin
 	if !got {
 		t.Fatal("a dump that was published was left unacknowledged")
 	}
-	slices := append([]protocol.HistorySlice{first}, rest...)
+	slices := append([]seenSlice{seen(&first)}, rest...)
 
 	if len(slices) != 2 {
 		t.Fatalf("published %d slices, want one for each of the two chats", len(slices))
 	}
-	byChat := map[string]protocol.HistorySlice{}
+	byChat := map[string]seenSlice{}
 	for _, slice := range slices {
 		if slice.Kind != protocol.HistoryKindMessages || slice.Sync != protocol.HistoryBootstrap {
 			t.Errorf("a slice went out as %q/%q, want %q/%q", slice.Kind, slice.Sync, protocol.HistoryKindMessages, protocol.HistoryBootstrap)
