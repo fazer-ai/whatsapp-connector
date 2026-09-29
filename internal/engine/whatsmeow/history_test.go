@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -666,5 +667,30 @@ func TestASliceNamesItsChatTheWayItsMessagesDo(t *testing.T) {
 	}
 	if slices[0].Chat.Kind != protocol.AddressLID {
 		t.Fatalf("the slice names its chat %+v, want the LID this account was shown", slices[0].Chat)
+	}
+}
+
+// whatsmeow puts the blob's URL in a failed download, built from the direct path and the
+// hash, and neither belongs in a log. Both ways out of a failed download are asked.
+func TestAFailedHistoryDownloadIsLoggedWithoutTheBlobsAddress(t *testing.T) {
+	t.Parallel()
+
+	const where = "https://mmg.whatsapp.net/v/t62.7117-24/AbCdEfGhIjKlMnOpQrStUvWxYz0123456789?ccb=11-4&oh=SECRETHASHSECRETHASHSECRET"
+	for _, err := range []error{
+		fmt.Errorf("failed to download: Get %q: dial tcp: i/o timeout", where),
+		fmt.Errorf("failed to download %s: %w", where, wm.ErrMediaDownloadFailedWith404),
+	} {
+		session, written := newLoggedTestSession(t, "5511999990001")
+		session.setHistory(true)
+		(&historyBench{}).install(session)
+		session.downloadHistory = func(context.Context, *wm.Client, *waE2E.HistorySyncNotification) (*waHistorySync.HistorySync, error) {
+			return nil, err
+		}
+
+		session.receive(historyNotification("NOTIF14", waE2E.HistorySyncType_RECENT))
+		if logged := written.String(); strings.Contains(logged, "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789") ||
+			strings.Contains(logged, "SECRETHASHSECRETHASHSECRET") {
+			t.Errorf("the blob's address reached the log: %s", logged)
+		}
 	}
 }
