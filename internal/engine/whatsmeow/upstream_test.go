@@ -55,6 +55,24 @@ type upstreamDefect struct {
 
 var upstreamDefects = []upstreamDefect{
 	{
+		issue: "fazer-ai/whatsapp-connector#350",
+		file:  "message.go",
+		// A dump's message secrets that fail to store are logged and dropped, and the dump
+		// is returned as if nothing happened, so a history dump can be receipted with
+		// secrets that a later sealed reaction or correction needs gone.
+		stillThere: []string{`cli.Log.Errorf("Failed to store message secret keys in history sync: %v", err)`},
+		enclosing:  "func (cli *Client) storeHistoricalMessageSecrets(",
+		what: "a failure to store a history dump's message secrets being logged and swallowed " +
+			"rather than returned to DownloadHistorySync's caller",
+	},
+	{
+		issue:      "fazer-ai/whatsapp-connector#350",
+		file:       "message.go",
+		stillThere: []string{"doStorage := func(ctx context.Context) {"},
+		enclosing:  "func (cli *Client) DownloadHistorySync(",
+		what:       "the storage step of a history download having no error to return",
+	},
+	{
 		issue: "fazer-ai/whatsapp-connector#283",
 		file:  "request.go",
 		// Not a defect. `retryFrame` watching the caller's context is the single reason a

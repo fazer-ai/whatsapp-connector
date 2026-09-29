@@ -50,6 +50,8 @@ func (s *Session) wantsHistory() bool {
 
 // downloadHistoryOverClient is the default for the seam of the same name. The storage is
 // synchronous so that what whatsmeow keeps from a dump is written before it is receipted.
+// Written, not known to be written: a failure to store the dump's message secrets is
+// logged inside whatsmeow and never returned (#350).
 func downloadHistoryOverClient(ctx context.Context, client *wm.Client, notification *waE2E.HistorySyncNotification) (*waHistorySync.HistorySync, error) {
 	return client.DownloadHistorySync(ctx, notification, true) //nolint:wrapcheck // wrapped by its caller
 }
