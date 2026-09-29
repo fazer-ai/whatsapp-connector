@@ -199,6 +199,33 @@ func TestTheProxyComesBackWithTheSession(t *testing.T) {
 	}
 }
 
+func TestTheHistoryRequestComesBackWithTheSession(t *testing.T) {
+	t.Parallel()
+	container := open(t)
+	ctx := t.Context()
+
+	pair(t, container, "sid-1", "5511999990001")
+	for _, asked := range []bool{true, false} {
+		if err := container.For("sid-1").PutDesiredConnected(ctx, store.Wants{Groups: true, History: asked}); err != nil {
+			t.Fatalf("PutDesiredConnected: %v", err)
+		}
+		wanted, err := container.Wanted(ctx)
+		if err != nil {
+			t.Fatalf("Wanted: %v", err)
+		}
+		if len(wanted) != 1 || wanted[0].History != asked {
+			t.Fatalf("after a connect asking for history=%v the session comes back with %+v", asked, wanted)
+		}
+		standing, _, err := container.For("sid-1").Standing(ctx)
+		if err != nil {
+			t.Fatalf("Standing: %v", err)
+		}
+		if standing.History != asked {
+			t.Fatalf("after a connect asking for history=%v the session stands on %v", asked, standing.History)
+		}
+	}
+}
+
 // Turning the policy off is a connect without it, the same way groups are turned off.
 // Recorded once and never overwritten, an account would keep refusing calls after every
 // restart on the strength of a request its client has replaced.

@@ -40,7 +40,6 @@ func TestAConnectThisBuildRefusesIsNotRecorded(t *testing.T) {
 		code    protocol.ErrorCode
 	}{
 		{"proxy", `{"pairing":"qr","proxy":{"url":"ftp://10.0.0.1:21"}}`, protocol.ErrorInvalidPayload},
-		{"history sync", `{"pairing":"qr","history_sync":true}`, protocol.ErrorUnsupported},
 		{"unknown pairing mode", `{"pairing":"telepatia"}`, protocol.ErrorInvalidPayload},
 		{"code pairing without a phone", `{"pairing":"code","phone":"+ ()-"}`, protocol.ErrorInvalidPayload},
 	}
@@ -151,7 +150,6 @@ func TestTheRefusalsOfAConnectDoNotDependOnTheEngine(t *testing.T) {
 		code    protocol.ErrorCode
 	}{
 		{"proxy", engine.ConnectRequest{Pairing: "qr", Proxy: &engine.ProxyRequest{URL: "ftp://10.0.0.1:21"}}, protocol.ErrorInvalidPayload},
-		{"history sync", engine.ConnectRequest{Pairing: "qr", HistorySync: true}, protocol.ErrorUnsupported},
 		{"unknown pairing mode", engine.ConnectRequest{Pairing: "telepatia"}, protocol.ErrorInvalidPayload},
 		{"code pairing without a phone", engine.ConnectRequest{Pairing: "code", Phone: "+ ()-"}, protocol.ErrorInvalidPayload},
 	}

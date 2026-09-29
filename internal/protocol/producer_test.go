@@ -33,7 +33,6 @@ var eventTypesWithNoProducer = []protocol.EventType{
 	protocol.EventContactPictureChanged,
 	protocol.EventContactIdentityChanged,
 	protocol.EventGroupPictureChanged,
-	protocol.EventHistorySync,
 	protocol.EventRaw,
 }
 
@@ -52,7 +51,7 @@ func TestEveryEventTypeIsProducedOrMarkedAsNotProduced(t *testing.T) {
 	assertProducers(t, "EventType", "types.go", "producer", catalog, marked)
 }
 
-// Three command types are in the contract with nothing in this build that carries them
+// Two command types are in the contract with nothing in this build that carries them
 // out, and types.go marks each one. A client that sends one is answered `unsupported`,
 // so unlike an unproduced event this is told at the time -- but only to a client that
 // already sent it, and only for a session some instance owns. A command for a session
@@ -60,7 +59,6 @@ func TestEveryEventTypeIsProducedOrMarkedAsNotProduced(t *testing.T) {
 // deadline and learns nothing about why.
 var commandTypesWithNoHandler = []protocol.CommandType{
 	protocol.CommandSessionUpdate,
-	protocol.CommandHistoryRequest,
 	protocol.CommandContactInfo,
 }
 

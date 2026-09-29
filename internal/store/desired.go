@@ -39,6 +39,10 @@ type Wants struct {
 	// would say so. It carries credentials, so it is kept here with the rest of a
 	// session's auth state and never read back into a log or a frame.
 	Proxy string
+	// History is whether the client asked for the phone's history to be published. A
+	// resumed session that dropped it would receipt every dump the phone sends and
+	// publish none of them.
+	History bool
 }
 
 // Wanted is a session a client asked to have running, and what it asked for.

@@ -21,6 +21,7 @@ import (
 	wm "go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/appstate"
 	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
+	waHistorySync "go.mau.fi/whatsmeow/proto/waHistorySync"
 	waTypes "go.mau.fi/whatsmeow/types"
 	waEvents "go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
@@ -164,6 +165,14 @@ type Session struct {
 	// same reason as the two below it: nothing outside a real socket can answer one, so
 	// a test cannot otherwise reach what a failed patch is reported as.
 	sendAppState func(context.Context, *wm.Client, appstate.PatchInfo) error
+
+	// downloadHistory fetches and decodes one history dump, storing what whatsmeow keeps
+	// from it; receiptHistory tells the phone the dump is done with; sendPeer hands the
+	// phone a request of this device's own. Fields for the same reason as sendAppState:
+	// only a real socket answers any of them.
+	downloadHistory func(context.Context, *wm.Client, *waE2E.HistorySyncNotification) (*waHistorySync.HistorySync, error)
+	receiptHistory  func(context.Context, *wm.Client, waTypes.MessageID) error
+	sendPeer        func(context.Context, *wm.Client, *waE2E.Message) error
 
 	// groupInfo reads a group's metadata. A field for the same reason as the queries
 	// below it: it is one IQ, so a test can otherwise reach the payload this connector
@@ -477,6 +486,10 @@ type Session struct {
 	// by Connect and read by the handler for every call that arrives.
 	autoRejectCalls bool
 
+	// history is the last connect's `history_sync`: whether the client wants the phone's
+	// history published. Guarded by mu, written by Connect and read for every dump.
+	history bool
+
 	// proxy is the last connect's `proxy.url`, empty for a session that goes out
 	// directly. Guarded by mu, and written once route goes through it. It carries
 	// credentials: nothing here logs or publishes it.
@@ -701,12 +714,15 @@ func newSession(
 		download: func(ctx context.Context, client *wm.Client, part wm.DownloadableMessage, file media.File) error {
 			return client.DownloadToFile(ctx, part, file) //nolint:wrapcheck // classified by downloadFailure, which needs the sentinels
 		},
-		retrieve:       retrieveOverHTTP,
-		uploadFile:     uploadOverClient,
-		sendAppState:   sendAppStateOverClient,
-		groupInfo:      groupInfoOverClient,
-		joinedGroups:   joinedGroupsOverClient,
-		createTheGroup: createKeyedGroupOverClient,
+		retrieve:        retrieveOverHTTP,
+		uploadFile:      uploadOverClient,
+		sendAppState:    sendAppStateOverClient,
+		downloadHistory: downloadHistoryOverClient,
+		receiptHistory:  receiptHistoryOverClient,
+		sendPeer:        sendPeerOverClient,
+		groupInfo:       groupInfoOverClient,
+		joinedGroups:    joinedGroupsOverClient,
+		createTheGroup:  createKeyedGroupOverClient,
 		onWhatsApp: func(ctx context.Context, client *wm.Client, phones []string) ([]waTypes.IsOnWhatsAppResponse, error) {
 			return client.IsOnWhatsApp(ctx, phones) //nolint:wrapcheck // wrapped by its caller
 		},

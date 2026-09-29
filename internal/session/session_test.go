@@ -3565,6 +3565,7 @@ func TestAResumeConnectsWithWhatItsClientAskedFor(t *testing.T) {
 		"both":                {Groups: true, CallAutoReject: true},
 		"a proxy":             {Proxy: "socks5://user:secret@10.0.0.1:1080"},
 		"all three":           {Groups: true, CallAutoReject: true, Proxy: "http://10.0.0.1:3128"},
+		"history":             {History: true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -3585,14 +3586,13 @@ func TestAResumeConnectsWithWhatItsClientAskedFor(t *testing.T) {
 			}
 			// The whole request and not the fields it happens to set, which is the fence:
 			// a resume carries the mode and what the desired row remembers, and nothing
-			// else on purpose. A connect refuses `history_sync` outright, so a resume that
-			// learned to replay more of a client's request could synthesise a command the
-			// session rejects -- and an account left on the floor in the sweep's backoff
-			// is worse off than the silence this fixes.
+			// else on purpose: a resume that learned to replay more of a client's request
+			// could synthesise a command the session rejects -- and an account left on the
+			// floor in the sweep's backoff is worse off than the silence this fixes.
 			//
 			// Compared as the rendered command rather than field by field, because the
 			// request now holds a pointer and two equal requests are not `==`.
-			want := engine.ConnectRequest{Pairing: "resume", Groups: wants.Groups}
+			want := engine.ConnectRequest{Pairing: "resume", Groups: wants.Groups, HistorySync: wants.History}
 			if wants.CallAutoReject {
 				want.Calls = &engine.CallsRequest{AutoReject: true}
 			}
