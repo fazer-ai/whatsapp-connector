@@ -1004,3 +1004,49 @@ func TestADumpWhoseFileCouldNotBeKeptIsWithheld(t *testing.T) {
 			len(slices), got, bench.receipted())
 	}
 }
+
+// A receipt is a write on the socket inside the node handler, and one that stalls holds
+// the handler past the watchdog after the whole dump was published in time.
+func TestTheDumpsReceiptIsHeldToTheSendCeiling(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.wireLimit = 50 * time.Millisecond
+	(&historyBench{dump: dumpOf(waHistorySync.HistorySync_PUSH_NAME)}).install(session)
+	session.receiptHistory = func(ctx context.Context, _ *wm.Client, _ waTypes.MessageID) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+
+	acknowledged := make(chan bool, 1)
+	go func() {
+		acknowledged <- session.receive(historyNotification("NOTIF24", waE2E.HistorySyncType_PUSH_NAME))
+	}()
+	select {
+	case <-acknowledged:
+	case <-time.After(10 * time.Second):
+		t.Fatal("a receipt that never went out held the node handler past the send ceiling")
+	}
+}
+
+// A file kept under the number before this account knew the person's LID is still the
+// same conversation's file once a dump carries the pairing and the history names the chat
+// by LID. Refusing it would leave a bubble the client can never fill in.
+func TestAFileKeptUnderANumberIsServedUnderItsLID(t *testing.T) {
+	t.Parallel()
+
+	session, downloads := mediaSession(t, media.Options{})
+	downloads.answer([]byte("os mesmos bytes"), nil)
+	connect(session)
+	event := imageEvent("3EB0ALIAS")
+	if _, acknowledged := deliver(t, session, event, 1); !acknowledged {
+		t.Fatal("a media message with a file was left unacknowledged")
+	}
+	phone := event.Info.Chat
+	lid := waTypes.NewJID("167392323834055", waTypes.HiddenUserServer)
+	session.aliases.observe(session.aliases.stamp(t.Context()), phone, lid)
+
+	if ref := refetch(t, session, "3EB0ALIAS", &protocol.Address{Kind: protocol.AddressLID, ID: lid.User}); ref.ID == "" {
+		t.Fatal("a download naming the chat's LID was not served")
+	}
+}

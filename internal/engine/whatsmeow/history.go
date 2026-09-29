@@ -155,8 +155,13 @@ func (s *Session) receiveHistory(event *waEvents.Message, notice *waE2E.HistoryS
 // receiptDump tells the phone a dump arrived. A failure is logged and nothing else:
 // whatever the dump held was already published or stored, and the phone sending the
 // notification again costs a download and slices the client deduplicates.
+//
+// Bounded by the send ceiling, because it is a write on the socket inside the node
+// handler, and a write that stalls holds the handler with it.
 func (s *Session) receiptDump(client *wm.Client, id waTypes.MessageID) {
-	if err := s.receiptHistory(s.ctx, client, id); err != nil {
+	ctx, cancel := context.WithTimeoutCause(s.ctx, s.wireLimit, errSendCeiling)
+	defer cancel()
+	if err := s.receiptHistory(ctx, client, id); err != nil {
 		s.log.Warn().Err(err).Str("message_id", id).Msg("could not receipt a history dump")
 	}
 }

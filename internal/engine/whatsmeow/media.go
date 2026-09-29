@@ -498,6 +498,27 @@ func (s *Session) blobURL(id string) string {
 
 // --- fetching the same file a second time ------------------------------------------
 
+// sameChat reports whether two addresses name one chat: the same address, or the number
+// and the LID of one person as this account was shown them. A message filed under the
+// number before the pairing was known is published under the LID afterwards, by a history
+// dump that carries the pairing, and a client asking for its file under either is asking
+// about the same conversation.
+func (s *Session) sameChat(asked, kept protocol.Address) bool {
+	if asked == kept {
+		return true
+	}
+	askedJID, askedErr := jidOf(asked)
+	keptJID, keptErr := jidOf(kept)
+	if askedErr != nil || keptErr != nil {
+		return false
+	}
+	looking, done := s.looking()
+	defer done()
+	askedAs, askedOK := s.address(looking, askedJID)
+	keptAs, keptOK := s.address(looking, keptJID)
+	return askedOK && keptOK && askedAs == keptAs
+}
+
 // remember records how to fetch this message's file again, and reports whether it did.
 //
 // The reference published with an event stops working, and on a schedule the client
@@ -614,7 +635,7 @@ func (s *Session) downloadMedia(ctx context.Context, command *protocol.Command) 
 			"nothing is kept for that message to fetch its file with")
 	}
 
-	if body.Chat != nil && (string(body.Chat.Kind) != kept.ChatKind || body.Chat.ID != kept.ChatID) {
+	if body.Chat != nil && !s.sameChat(*body.Chat, protocol.Address{Kind: protocol.AddressKind(kept.ChatKind), ID: kept.ChatID}) {
 		// A message id is the sender's to choose, so two chats under one account can
 		// carry the same one and the second row replaces the first. Vanishingly rare and
 		// the client keys by message id too, so it is not a case this can resolve -- but
