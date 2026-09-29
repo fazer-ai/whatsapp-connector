@@ -233,11 +233,6 @@ func (s *Session) replayOnce() bool {
 		s.log.Warn().Err(err).Msg("could not read the history dumps this session left pending")
 		return false
 	}
-	if s.aliases.learning() != generation {
-		// The account changed while the rows were read, so they may be the next one's
-		// under the old one's generation. Left for the retry, which reads them again.
-		return false
-	}
 	for _, pending := range held {
 		if s.ctx.Err() != nil {
 			return false

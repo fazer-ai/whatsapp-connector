@@ -159,8 +159,8 @@ type Session struct {
 	// historyReplayBudget is historyBudget for a retry, and a field for the same reason.
 	historyReplayBudget time.Duration
 	// readPendingHistory reads the dumps a retry works through. A seam so a test can land
-	// a logout in the middle of the read, which is the window the account check after it
-	// is for.
+	// a logout in the middle of the read, which the account check at the start of each
+	// attempt has to catch.
 	readPendingHistory func(context.Context) ([]store.PendingHistory, error)
 	// dumps keeps two attempts at one dump apart.
 	dumps pendingDumps
