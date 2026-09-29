@@ -615,6 +615,16 @@ func TestAnOnDemandAnswerOfOnlyReactionsIsNotTheEnd(t *testing.T) {
 	if slices, _ := slicesUntil(t, session, acknowledged); len(slices) != 0 {
 		t.Fatalf("published %+v for an answer holding only a reaction", slices)
 	}
+	// And the next page is asked for from the reaction, the oldest thing the phone sent:
+	// the client has nothing new to anchor on, and asking from its old anchor gets this
+	// same page again.
+	if len(bench.peers) != 1 {
+		t.Fatalf("%d requests went to the phone, want the next page asked for once", len(bench.peers))
+	}
+	request := bench.peers[0].GetProtocolMessage().GetPeerDataOperationRequestMessage().GetHistorySyncOnDemandRequest()
+	if request.GetChatJID() != chat || request.GetOldestMsgID() != "3EB0R1" {
+		t.Fatalf("the phone was asked %+v, want the page before the reaction", request)
+	}
 }
 
 // A chat the dump names with nothing in it is not published outside an on-demand answer:

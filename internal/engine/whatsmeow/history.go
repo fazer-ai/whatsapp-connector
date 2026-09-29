@@ -255,6 +255,13 @@ func (r *dumpRun) publishConversation(conversation *waHistorySync.Conversation) 
 
 	exhausted := exhaustedBy(sync, conversation)
 	if len(messages) == 0 && !exhausted {
+		if sync == protocol.HistoryOnDemand {
+			// A page of nothing but reactions, corrections and the like. Published as
+			// nothing, it leaves the client asking again from the anchor it already used,
+			// which gets it this same page for good; so the next page is asked for here,
+			// from the oldest message the phone sent.
+			return r.askPastThePage(jid, conversation)
+		}
 		return true
 	}
 
@@ -315,6 +322,37 @@ func exhaustedBy(sync protocol.HistorySync, conversation *waHistorySync.Conversa
 // direct chat of each recipient, and the other two are feeds.
 func conversational(kind protocol.AddressKind) bool {
 	return kind == protocol.AddressPhone || kind == protocol.AddressLID || kind == protocol.AddressGroup
+}
+
+// askPastThePage asks the phone for what came before the oldest message of an on-demand
+// page that published nothing, and reports whether the request went out. Within the
+// dump's budget, like everything else the handler does for it.
+func (r *dumpRun) askPastThePage(chat waTypes.JID, conversation *waHistorySync.Conversation) bool {
+	var oldest *waWeb.WebMessageInfo
+	for _, past := range conversation.GetMessages() {
+		message := past.GetMessage()
+		if message.GetKey().GetID() == "" {
+			continue
+		}
+		if oldest == nil || message.GetMessageTimestamp() < oldest.GetMessageTimestamp() {
+			oldest = message
+		}
+	}
+	if oldest == nil {
+		return true
+	}
+	ctx, cancel := context.WithTimeout(r.ctx, r.s.historyReceiptWait)
+	defer cancel()
+	request := r.client.BuildHistorySyncRequest(&waTypes.MessageInfo{
+		MessageSource: waTypes.MessageSource{Chat: chat, IsFromMe: oldest.GetKey().GetFromMe()},
+		ID:            oldest.GetKey().GetID(),
+		Timestamp:     time.Unix(int64(oldest.GetMessageTimestamp()), 0), //nolint:gosec // a WhatsApp timestamp in seconds fits
+	}, historyAskCount)
+	if err := r.s.sendPeer(ctx, r.client, request); err != nil {
+		r.s.log.Warn().Err(err).Msg("withholding an on-demand page that published nothing and could not be followed")
+		return false
+	}
+	return true
 }
 
 // pastMessageOf renders one message of a dump the way a live one is rendered, and reports
