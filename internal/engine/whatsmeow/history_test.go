@@ -2022,12 +2022,61 @@ func TestAFileADumpPublishedUnderItsLIDIsServedAfterTheAliasesAreGone(t *testing
 	}
 	// The dump names the chat by its LID, with nothing in memory pairing the two.
 	dumped := kept
-	dumped.ChatKind, dumped.ChatID = string(protocol.AddressLID), "167392323834055"
+	dumped.AltChatKind, dumped.AltChatID = string(protocol.AddressLID), "167392323834055"
 	if err := session.store.KeepMediaPart(t.Context(), &dumped, deviceOf(session.current()), time.Now()); err != nil {
 		t.Fatalf("KeepMediaPart: %v", err)
 	}
 
 	if ref := refetch(t, session, "3EB0NOALIAS", &protocol.Address{Kind: protocol.AddressLID, ID: "167392323834055"}); ref.ID == "" {
 		t.Fatal("a download naming the LID the dump published the file under was not served")
+	}
+}
+
+// A dump that names a message's chat by another address records it beside the first only
+// when the resolver says the two are one chat. A message id is the sender's to choose, and
+// another chat holding the same one is no evidence of anything.
+func TestADumpRecordsASecondAddressOnlyForTheSameChat(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name   string
+		chat   string
+		paired bool
+		alt    string
+	}{
+		{"the LID of the same person", "167392323834055@lid", true, "167392323834055"},
+		{"another person with the same id", "5511999990003@s.whatsapp.net", false, ""},
+	} {
+		session, _ := newTestSession(t, "5511999990001")
+		session.setHistory(true)
+		known := store.MediaPart{MessageID: "3EB0SAMEID", ChatKind: "phone", ChatID: "5511999990002", Kind: "image",
+			DirectPath: "/v/live", BlobID: "blob-live"}
+		if err := session.store.PutMediaPart(t.Context(), &known, time.Now()); err != nil {
+			t.Fatalf("PutMediaPart: %v", err)
+		}
+		if tc.paired {
+			session.aliases.observe(session.aliases.stamp(t.Context()),
+				waTypes.NewJID("5511999990002", waTypes.DefaultUserServer), waTypes.NewJID("167392323834055", waTypes.HiddenUserServer))
+		}
+		image := &waE2E.Message{ImageMessage: &waE2E.ImageMessage{
+			Mimetype: proto.String("image/jpeg"), DirectPath: proto.String("/v/dump"), MediaKey: make([]byte, 32),
+			FileSHA256: make([]byte, 32), FileEncSHA256: make([]byte, 32), FileLength: proto.Uint64(1024),
+		}}
+		(&historyBench{dump: dumpOf(waHistorySync.HistorySync_RECENT,
+			&waHistorySync.Conversation{ID: proto.String(tc.chat), Messages: []*waHistorySync.HistorySyncMsg{
+				pastMessage(tc.chat, "3EB0SAMEID", 1754000000, false, image),
+			}})}).install(session)
+
+		acknowledged := make(chan bool, 1)
+		go func() { acknowledged <- session.receive(historyNotification("NOTIF51", waE2E.HistorySyncType_RECENT)) }()
+		slicesUntil(t, session, acknowledged)
+
+		kept, _, err := session.store.MediaPart(t.Context(), "3EB0SAMEID")
+		if err != nil {
+			t.Fatalf("%s: MediaPart: %v", tc.name, err)
+		}
+		if kept.AltChatID != tc.alt || kept.DirectPath != "/v/live" {
+			t.Errorf("%s: the row is %+v, want the first file with second address %q", tc.name, kept, tc.alt)
+		}
 	}
 }

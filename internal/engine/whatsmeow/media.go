@@ -557,6 +557,17 @@ func (s *Session) rememberPast(ctx context.Context, event *waEvents.Message, par
 	defer cancel()
 
 	kept := s.mediaPartOf(ctx, event, part)
+	// A row this message already has, under another address for what the resolver says is
+	// the same chat, gets the dump's address beside its own: the pairing that says so lives
+	// in memory, and a download after a restart only has the row to go by. Another chat that
+	// happens to hold the same id is left alone.
+	if already, found, err := s.store.MediaPart(ctx, kept.MessageID); err == nil && found {
+		published := protocol.Address{Kind: protocol.AddressKind(kept.ChatKind), ID: kept.ChatID}
+		first := protocol.Address{Kind: protocol.AddressKind(already.ChatKind), ID: already.ChatID}
+		if published != first && s.sameChat(published, first) {
+			kept.AltChatKind, kept.AltChatID = kept.ChatKind, kept.ChatID
+		}
+	}
 	if err := s.store.KeepMediaPart(ctx, &kept, device, time.Now()); err != nil {
 		s.log.Warn().Err(err).Str("message_id", kept.MessageID).
 			Msg("could not keep how to fetch the file of a message out of a dump")

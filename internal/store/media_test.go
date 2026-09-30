@@ -624,9 +624,8 @@ func TestAFileForADeviceTheSessionIsNotBoundToIsNotKept(t *testing.T) {
 	}
 }
 
-// A file a dump publishes under another address than the first publication keeps both: the
-// pairing that says the two are one chat lives in memory and does not survive a restart,
-// and a client may ask for the file under either.
+// A second address the caller names is recorded beside the first, and the first stays. The
+// caller is who knows the two are one chat; a different chat on its own records nothing.
 func TestAFileADumpNamesUnderAnotherChatKeepsBothAddresses(t *testing.T) {
 	t.Parallel()
 	container := open(t)
@@ -636,9 +635,22 @@ func TestAFileADumpNamesUnderAnotherChatKeepsBothAddresses(t *testing.T) {
 	if err := container.For("sid-1").PutMediaPart(t.Context(), &first, storedAt); err != nil {
 		t.Fatalf("PutMediaPart: %v", err)
 	}
+	// Another chat under the same id, with no second address named: nothing to record.
+	stranger := samplePart("sid-1", "3EB0TWOCHATS")
+	stranger.ChatKind, stranger.ChatID = "phone", "5511999990003"
+	if err := container.For("sid-1").KeepMediaPart(t.Context(), &stranger, device.String(), storedAt); err != nil {
+		t.Fatalf("KeepMediaPart: %v", err)
+	}
+	if got, _, _ := container.For("sid-1").MediaPart(t.Context(), "3EB0TWOCHATS"); got.AltChatID != "" {
+		t.Fatalf("a different chat under the same id was recorded as a second address: %q", got.AltChatID)
+	}
+
+	// In the same millisecond as the row, the way a live message and its sighting in a dump
+	// can land: the second address is still recorded.
 	again := samplePart("sid-1", "3EB0TWOCHATS")
 	again.ChatKind, again.ChatID = "lid", "123456789012345"
-	if err := container.For("sid-1").KeepMediaPart(t.Context(), &again, device.String(), storedAt.Add(time.Hour)); err != nil {
+	again.AltChatKind, again.AltChatID = "lid", "123456789012345"
+	if err := container.For("sid-1").KeepMediaPart(t.Context(), &again, device.String(), storedAt); err != nil {
 		t.Fatalf("KeepMediaPart: %v", err)
 	}
 	got, _, err := container.For("sid-1").MediaPart(t.Context(), "3EB0TWOCHATS")
@@ -649,15 +661,15 @@ func TestAFileADumpNamesUnderAnotherChatKeepsBothAddresses(t *testing.T) {
 		t.Errorf("the first address became %s/%s", got.ChatKind, got.ChatID)
 	}
 	if got.AltChatKind != "lid" || got.AltChatID != "123456789012345" {
-		t.Errorf("the dump's address is %q/%q, want lid/123456789012345", got.AltChatKind, got.AltChatID)
+		t.Errorf("the second address is %q/%q, want lid/123456789012345", got.AltChatKind, got.AltChatID)
 	}
 
-	// Named the same way again, the second address is left as it is.
+	// A later sighting that names none leaves the second address as it is.
 	same := samplePart("sid-1", "3EB0TWOCHATS")
 	if err := container.For("sid-1").KeepMediaPart(t.Context(), &same, device.String(), storedAt.Add(2*time.Hour)); err != nil {
 		t.Fatalf("KeepMediaPart: %v", err)
 	}
 	if got, _, _ := container.For("sid-1").MediaPart(t.Context(), "3EB0TWOCHATS"); got.AltChatID != "123456789012345" {
-		t.Errorf("a dump naming the first address erased the second: %q", got.AltChatID)
+		t.Errorf("a sighting naming no second address erased it: %q", got.AltChatID)
 	}
 }

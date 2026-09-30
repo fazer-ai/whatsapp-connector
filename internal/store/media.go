@@ -158,8 +158,10 @@ func (c *Container) putMediaPart(ctx context.Context, part *MediaPart, now time.
 }
 
 // keepMediaPart writes a row only where the message has none, and otherwise only renews
-// how long the row is kept and, when the dump names the chat differently, records that
-// address beside the first one.
+// how long the row is kept and, when the caller names one in AltChatKind and AltChatID,
+// records a second address for the chat beside the first. Which address is the same chat
+// is the caller's to establish: a message id is chosen by the sender, and two chats can hold
+// one, so a differing chat on its own is no evidence of anything.
 //
 // For a message that arrives a second time, out of a history dump: what was kept the
 // first time may name the file on this instance's disk, and the dump's copy cannot. The
@@ -176,21 +178,20 @@ func (c *Container) keepMediaPart(ctx context.Context, part *MediaPart, device s
 	}
 	const insert = `
 		INSERT INTO wac_media_part
-			(sid, message_id, chat_kind, chat_id, kind, direct_path, media_key,
-			 file_enc_sha256, file_sha256, file_length, mime, filename,
+			(sid, message_id, chat_kind, chat_id, alt_chat_kind, alt_chat_id, kind, direct_path,
+			 media_key, file_enc_sha256, file_sha256, file_length, mime, filename,
 			 receipt_chat, sender, from_me, blob_id, stored_at)
-		SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+		SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
 		WHERE EXISTS (SELECT 1 FROM wac_session_device WHERE sid = ? AND jid = ?)
 		ON CONFLICT (sid, message_id) DO UPDATE SET stored_at = excluded.stored_at,
-			alt_chat_kind = CASE
-				WHEN wac_media_part.chat_kind <> excluded.chat_kind OR wac_media_part.chat_id <> excluded.chat_id
-				THEN excluded.chat_kind ELSE wac_media_part.alt_chat_kind END,
-			alt_chat_id = CASE
-				WHEN wac_media_part.chat_kind <> excluded.chat_kind OR wac_media_part.chat_id <> excluded.chat_id
-				THEN excluded.chat_id ELSE wac_media_part.alt_chat_id END
-		WHERE excluded.stored_at > wac_media_part.stored_at`
+			alt_chat_kind = CASE WHEN excluded.alt_chat_id <> ''
+				THEN excluded.alt_chat_kind ELSE wac_media_part.alt_chat_kind END,
+			alt_chat_id = CASE WHEN excluded.alt_chat_id <> ''
+				THEN excluded.alt_chat_id ELSE wac_media_part.alt_chat_id END
+		WHERE excluded.stored_at >= wac_media_part.stored_at`
 	_, err := c.db.ExecContext(ctx, c.rebind(insert),
-		part.SID, part.MessageID, part.ChatKind, part.ChatID, part.Kind, part.DirectPath,
+		part.SID, part.MessageID, part.ChatKind, part.ChatID, part.AltChatKind, part.AltChatID,
+		part.Kind, part.DirectPath,
 		encode(part.MediaKey), encode(part.FileEncSHA256), encode(part.FileSHA256),
 		part.FileLength, part.Mime, part.Filename,
 		part.ReceiptChat, part.Sender, asFlag(part.FromMe), part.BlobID, now.UnixMilli(),
