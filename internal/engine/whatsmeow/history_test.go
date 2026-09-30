@@ -2105,3 +2105,28 @@ func TestAFileOfADumpIsFiledUnderTheSlicesChat(t *testing.T) {
 		t.Fatalf("the file is filed under %s/%s, and the slice published it under %+v", kept.ChatKind, kept.ChatID, pinned)
 	}
 }
+
+// A file row whose existing entry could not be read is not written blind: a row under the
+// number would keep only the number, the dump would be finished with, and the LID it
+// published would stop being served after a restart. Kept for another attempt instead.
+func TestAFileWhoseRowCouldNotBeReadIsKeptForAnotherAttempt(t *testing.T) {
+	t.Parallel()
+
+	session, container := newTestSession(t, "5511999990001")
+	known := store.MediaPart{MessageID: "3EB0UNREAD", ChatKind: "phone", ChatID: "5511999990002", Kind: "image",
+		DirectPath: "/v/live"}
+	if err := session.store.PutMediaPart(t.Context(), &known, time.Now()); err != nil {
+		t.Fatalf("PutMediaPart: %v", err)
+	}
+	// A key that does not decode is what makes the read fail while the write still works.
+	if _, err := container.DB().ExecContext(t.Context(),
+		`UPDATE wac_media_part SET media_key = '!!!' WHERE message_id = '3EB0UNREAD'`); err != nil {
+		t.Fatalf("corrupt the row: %v", err)
+	}
+	event := imageEvent("3EB0UNREAD")
+	part, _ := attachmentOf(event.Message)
+	if session.rememberPast(t.Context(), event, &part, deviceOf(session.current()),
+		protocol.Address{Kind: protocol.AddressLID, ID: "167392323834055"}) {
+		t.Fatal("a file whose row could not be read was reported kept")
+	}
+}

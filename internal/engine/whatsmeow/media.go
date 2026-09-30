@@ -567,7 +567,15 @@ func (s *Session) rememberPast(
 	// the same chat, gets the dump's address beside its own: the pairing that says so lives
 	// in memory, and a download after a restart only has the row to go by. Another chat that
 	// happens to hold the same id is left alone.
-	if already, found, err := s.store.MediaPart(ctx, kept.MessageID); err == nil && found {
+	already, found, err := s.store.MediaPart(ctx, kept.MessageID)
+	if err != nil {
+		// Written without the lookup, a row under the other address would keep only the
+		// first one, and the dump would be finished with. Kept for another attempt instead.
+		s.log.Warn().Err(err).Str("message_id", kept.MessageID).
+			Msg("could not read how the file of a message out of a dump was kept")
+		return false
+	}
+	if found {
 		published := protocol.Address{Kind: protocol.AddressKind(kept.ChatKind), ID: kept.ChatID}
 		first := protocol.Address{Kind: protocol.AddressKind(already.ChatKind), ID: already.ChatID}
 		if published != first && s.sameChat(published, first) {
