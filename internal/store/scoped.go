@@ -122,6 +122,17 @@ func (s *Scoped) PutMediaPart(ctx context.Context, part *MediaPart, now time.Tim
 	return s.container.putMediaPart(ctx, &kept, now)
 }
 
+// KeepMediaPart is PutMediaPart for a message whose row, if it has one, stays as it is,
+// written only while the session is bound to device, the one the dump reached.
+func (s *Scoped) KeepMediaPart(ctx context.Context, part *MediaPart, device string, now time.Time) error {
+	if err := s.fence.held(); err != nil {
+		return err
+	}
+	kept := *part
+	kept.SID = s.sid
+	return s.container.keepMediaPart(ctx, &kept, device, now)
+}
+
 // RefreshDirectPath replaces where a message's file is fetched from, and only while the
 // row is still the one the caller read.
 func (s *Scoped) RefreshDirectPath(ctx context.Context, messageID, path string, unchangedSince int64) error {
@@ -257,4 +268,34 @@ func (s *Scoped) DropPlaceholder(ctx context.Context, messageID string) error {
 // Placeholders lists the bubbles this session left undecided, oldest deadline first.
 func (s *Scoped) Placeholders(ctx context.Context) ([]Placeholder, error) {
 	return s.container.placeholders(ctx, s.sid)
+}
+
+// PutPendingHistory writes down a history dump this session was announced, before anything
+// is done with it, so a dump that does not finish is not a dump that is lost.
+//
+// Fenced like a placeholder: the row is read by whoever owns the session next.
+func (s *Scoped) PutPendingHistory(ctx context.Context, held *PendingHistory) error {
+	if err := s.fence.held(); err != nil {
+		return err
+	}
+	pending := *held
+	pending.SID = s.sid
+	return s.container.putPendingHistory(ctx, &pending)
+}
+
+// DropPendingHistory forgets a dump that is finished with: published and receipted, or
+// handed back to the phone to upload again.
+//
+// Fenced like the write: a session that lost the account deleting the row would take the
+// dump away from the owner that has to finish it.
+func (s *Scoped) DropPendingHistory(ctx context.Context, messageID string) error {
+	if err := s.fence.held(); err != nil {
+		return err
+	}
+	return s.container.dropPendingHistory(ctx, s.sid, messageID)
+}
+
+// PendingHistory lists the dumps this session has not finished with, oldest first.
+func (s *Scoped) PendingHistory(ctx context.Context) ([]PendingHistory, error) {
+	return s.container.pendingHistory(ctx, s.sid)
 }

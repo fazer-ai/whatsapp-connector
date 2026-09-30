@@ -252,7 +252,10 @@ type ConnectRequest struct {
 	// answer. Wanting group conversation to arrive and being able to ask about or
 	// administer a group are separate, and this switch is only about the first.
 	Groups bool `json:"groups,omitempty"`
-	// HistorySync asks for the backlog the phone holds. Honouring it is M6.
+	// HistorySync asks for the conversations the phone sends a linked device: the dump it
+	// sends on pairing, and the answers to `history.request`. Without it they are still
+	// downloaded, for the addresses and names whatsmeow keeps from them, and published
+	// nowhere.
 	HistorySync bool `json:"history_sync,omitempty"`
 	// Calls is the call half of `session.connect`.
 	Calls *CallsRequest `json:"calls,omitempty"`
@@ -261,10 +264,10 @@ type ConnectRequest struct {
 // Validate answers the part of a connect this connector refuses whichever engine is
 // running, and it is asked above the engines for two reasons that are the same reason.
 //
-// The first is that the answer has to be one answer. `unsupported` for a history import is
-// a fact about this build, not about an engine, and two engines that spelled it
+// The first is that the answer has to be one answer. A proxy URL that cannot be dialled
+// is a fact about the request, not about an engine, and two engines that spelled it
 // differently would have a client's error code depend on which one a deployment happens
-// to run. A proxy URL that cannot be dialled is the same: a fact about the request.
+// to run.
 //
 // The second is the ordering #266 left behind. What a client asked for is recorded before
 // the engine is called, so that an instance dying inside a connect leaves the account
@@ -281,14 +284,6 @@ type ConnectRequest struct {
 func (r ConnectRequest) Validate() error {
 	if err := r.Proxy.validate(); err != nil {
 		return err
-	}
-	// This asks the connector to do something, and a build that does not do it answers
-	// `open` to a client that will then wait for a backlog to arrive and never find out it
-	// was never going to happen. `groups`, `calls` and `proxy` are not on this list
-	// because they are honoured.
-	if r.HistorySync {
-		return protocol.NewError(protocol.ErrorUnsupported,
-			"this connector does not import the phone's history yet")
 	}
 	if r.Pairing != "resume" && r.Pairing != "qr" && r.Pairing != "code" {
 		return protocol.NewError(protocol.ErrorInvalidPayload,

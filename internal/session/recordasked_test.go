@@ -56,7 +56,7 @@ func TestAConnectIsRememberedWithWhatItAskedFor(t *testing.T) {
 	connect := &protocol.Command{
 		V: protocol.Version, ID: "c1", Type: protocol.CommandSessionConnect, SID: "s1", ReplyTo: "c1",
 		Payload: json.RawMessage(`{"pairing":"qr","groups":true,"calls":{"auto_reject":true},` +
-			`"proxy":{"url":"socks5://user:secret@10.0.0.1:1080"}}`),
+			`"proxy":{"url":"socks5://user:secret@10.0.0.1:1080"},"history_sync":true}`),
 	}
 	var acked atomic.Bool
 	h.manager.Dispatch(delivery(connect, &acked))
@@ -80,6 +80,11 @@ func TestAConnectIsRememberedWithWhatItAskedFor(t *testing.T) {
 			"missing here is a session that comes back deaf to the traffic its client asked "+
 			"for, acknowledging it and publishing it nowhere.",
 			wanted[0].Groups, wanted[0].CallAutoReject)
+	}
+	if !wanted[0].History {
+		t.Fatal("the row does not carry history_sync.\n" +
+			"A resume synthesises its connect from this row, so the session comes back " +
+			"receipting every dump the phone sends and publishing none of them.")
 	}
 	if wanted[0].Proxy != "socks5://user:secret@10.0.0.1:1080" {
 		t.Fatalf("the row carries the proxy %q.\n"+

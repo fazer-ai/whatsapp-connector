@@ -599,7 +599,6 @@ func TestARefusedConnectLeavesTheGroupSubscriptionAlone(t *testing.T) {
 		{"a proxy nobody can dial", engine.ConnectRequest{
 			Pairing: "resume", Proxy: &engine.ProxyRequest{URL: "ftp://127.0.0.1:21"},
 		}},
-		{"a history import this build cannot do", engine.ConnectRequest{Pairing: "resume", HistorySync: true}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()

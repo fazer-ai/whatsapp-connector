@@ -33,12 +33,16 @@ type Wants struct {
 	// and nothing about the session says it changed its mind.
 	CallAutoReject bool
 	// Proxy is the address the session's traffic with WhatsApp left through, empty for a
-	// session that went out directly. The sharpest of the three: a resumed session that
+	// session that went out directly. The sharpest of them: a resumed session that
 	// dropped it would dial WhatsApp from this instance's own address, which is the one
 	// thing a client that asked for a proxy asked not to happen, and nothing on the wire
 	// would say so. It carries credentials, so it is kept here with the rest of a
 	// session's auth state and never read back into a log or a frame.
 	Proxy string
+	// History is whether the client asked for the phone's history to be published. A
+	// resumed session that dropped it would receipt every dump the phone sends and
+	// publish none of them.
+	History bool
 }
 
 // Wanted is a session a client asked to have running, and what it asked for.
@@ -81,25 +85,26 @@ func (c *Container) putDesiredDisconnected(ctx context.Context, sid string, now 
 // subscription from a connect that never happened.
 //
 // The switches are persisted and not the request they arrived in. A connect carries
-// things this build refuses outright -- `history_sync` -- and a resume that replayed a
-// stored payload would synthesise a command the session rejects, leaving the account
-// down and in the sweep's backoff: worse than the silence this exists to fix.
+// things that are not the session's to keep -- the pairing mode, the phone a code is for
+// -- and a resume that replayed a stored payload would synthesise a pairing nobody is
+// waiting on, leaving the account down and in the sweep's backoff: worse than the silence
+// this exists to fix.
 func (c *Container) putDesiredConnected(ctx context.Context, sid string, wants Wants, now time.Time) error {
 	if sid == "" {
 		return fmt.Errorf("store: a desired state needs a session, got %q", sid)
 	}
 	const upsert = `
 		INSERT INTO wac_session_desired
-			(sid, desired, wants_groups, wants_call_auto_reject, wants_proxy, asked_at)
-		VALUES (?, ?, ?, ?, ?, ?)
+			(sid, desired, wants_groups, wants_call_auto_reject, wants_proxy, wants_history, asked_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (sid) DO UPDATE SET
 			desired = excluded.desired, wants_groups = excluded.wants_groups,
 			wants_call_auto_reject = excluded.wants_call_auto_reject,
-			wants_proxy = excluded.wants_proxy,
+			wants_proxy = excluded.wants_proxy, wants_history = excluded.wants_history,
 			asked_at = excluded.asked_at`
 	if _, err := c.db.ExecContext(ctx, c.rebind(upsert),
 		sid, DesiredConnected, asFlag(wants.Groups), asFlag(wants.CallAutoReject), wants.Proxy,
-		now.UnixMilli()); err != nil {
+		asFlag(wants.History), now.UnixMilli()); err != nil {
 		return fmt.Errorf("store: record the desired state of %s: %w", sid, err)
 	}
 	return nil
@@ -110,18 +115,18 @@ func (c *Container) putDesiredConnected(ctx context.Context, sid string, wants W
 // disconnect leaves the request standing (see putDesiredDisconnected).
 func (c *Container) standing(ctx context.Context, sid string) (Wants, bool, error) {
 	const query = `
-		SELECT d.wants_groups, d.wants_call_auto_reject, d.wants_proxy
+		SELECT d.wants_groups, d.wants_call_auto_reject, d.wants_proxy, d.wants_history
 		FROM wac_session_desired d WHERE d.sid = ?`
 	var proxy string
-	var groups, autoReject int64
-	err := c.db.QueryRowContext(ctx, c.rebind(query), sid).Scan(&groups, &autoReject, &proxy)
+	var groups, autoReject, history int64
+	err := c.db.QueryRowContext(ctx, c.rebind(query), sid).Scan(&groups, &autoReject, &proxy, &history)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Wants{}, false, nil
 	}
 	if err != nil {
 		return Wants{}, false, fmt.Errorf("store: read what %s was asked to be: %w", sid, err)
 	}
-	return Wants{Groups: groups != 0, CallAutoReject: autoReject != 0, Proxy: proxy}, true, nil
+	return Wants{Groups: groups != 0, CallAutoReject: autoReject != 0, Proxy: proxy, History: history != 0}, true, nil
 }
 
 // WantedSession is Wanted for one session: what its client asked for, and whether the
@@ -134,20 +139,20 @@ func (c *Container) standing(ctx context.Context, sid string) (Wants, bool, erro
 // finished is left out here for the reason it is left out there.
 func (c *Container) WantedSession(ctx context.Context, sid string) (Wants, bool, error) {
 	const query = `
-		SELECT d.wants_groups, d.wants_call_auto_reject, d.wants_proxy
+		SELECT d.wants_groups, d.wants_call_auto_reject, d.wants_proxy, d.wants_history
 		FROM wac_session_desired d
 		JOIN wac_session_device v ON v.sid = d.sid
 		WHERE d.sid = ? AND d.desired = ?`
 	var proxy string
-	var groups, autoReject int64
-	err := c.db.QueryRowContext(ctx, c.rebind(query), sid, DesiredConnected).Scan(&groups, &autoReject, &proxy)
+	var groups, autoReject, history int64
+	err := c.db.QueryRowContext(ctx, c.rebind(query), sid, DesiredConnected).Scan(&groups, &autoReject, &proxy, &history)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Wants{}, false, nil
 	}
 	if err != nil {
 		return Wants{}, false, fmt.Errorf("store: read whether %s should be connected: %w", sid, err)
 	}
-	return Wants{Groups: groups != 0, CallAutoReject: autoReject != 0, Proxy: proxy}, true, nil
+	return Wants{Groups: groups != 0, CallAutoReject: autoReject != 0, Proxy: proxy, History: history != 0}, true, nil
 }
 
 // dropDesired forgets what was asked for, which is what a session that no longer exists
@@ -175,7 +180,7 @@ func (c *Container) dropDesired(ctx context.Context, sid string) error {
 // caller cannot reason about at all.
 func (c *Container) Wanted(ctx context.Context) ([]Wanted, error) {
 	const query = `
-		SELECT d.sid, d.wants_groups, d.wants_call_auto_reject, d.wants_proxy
+		SELECT d.sid, d.wants_groups, d.wants_call_auto_reject, d.wants_proxy, d.wants_history
 		FROM wac_session_desired d
 		JOIN wac_session_device v ON v.sid = d.sid
 		WHERE d.desired = ?
@@ -189,13 +194,13 @@ func (c *Container) Wanted(ctx context.Context) ([]Wanted, error) {
 	var wanted []Wanted
 	for rows.Next() {
 		var sid, proxy string
-		var groups, autoReject int64
-		if err := rows.Scan(&sid, &groups, &autoReject, &proxy); err != nil {
+		var groups, autoReject, history int64
+		if err := rows.Scan(&sid, &groups, &autoReject, &proxy, &history); err != nil {
 			return nil, fmt.Errorf("store: read the sessions that should be connected: %w", err)
 		}
 		wanted = append(wanted, Wanted{
 			SID:   sid,
-			Wants: Wants{Groups: groups != 0, CallAutoReject: autoReject != 0, Proxy: proxy},
+			Wants: Wants{Groups: groups != 0, CallAutoReject: autoReject != 0, Proxy: proxy, History: history != 0},
 		})
 	}
 	if err := rows.Err(); err != nil {

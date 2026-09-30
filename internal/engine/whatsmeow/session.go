@@ -21,6 +21,7 @@ import (
 	wm "go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/appstate"
 	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
+	waHistorySync "go.mau.fi/whatsmeow/proto/waHistorySync"
 	waTypes "go.mau.fi/whatsmeow/types"
 	waEvents "go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
@@ -145,6 +146,27 @@ type Session struct {
 	// costs a redelivery, which is the trade the whole path is built on.
 	stalledUntil atomic.Int64
 
+	// historyBudget bounds how long one history dump spends being published. A field for
+	// the same reason as deliverWait: a test cannot wait out the real one.
+	historyBudget time.Duration
+	// historyReceiptWait bounds the write a dump makes after its budget, for the same
+	// reason.
+	historyReceiptWait time.Duration
+	// historyRetry and historyRetryCeiling pace the attempts at a dump that did not
+	// finish, and are fields for the same reason.
+	historyRetry        time.Duration
+	historyRetryCeiling time.Duration
+	// historyReplayBudget is historyBudget for a retry, and a field for the same reason.
+	historyReplayBudget time.Duration
+	// readPendingHistory reads the dumps a retry works through. A seam so a test can land
+	// a logout in the middle of the read, which the account check at the start of each
+	// attempt has to catch.
+	readPendingHistory func(context.Context) ([]store.PendingHistory, error)
+	// dumps keeps two attempts at one dump apart.
+	dumps pendingDumps
+	// sending is the turn a message send waits for; see takeTurnToSend.
+	sending chan struct{}
+
 	// downloadWait bounds how long an inbound media message spends fetching its file.
 	// A field for the same reason as the two above it, and for no other.
 	downloadWait time.Duration
@@ -164,6 +186,16 @@ type Session struct {
 	// same reason as the two below it: nothing outside a real socket can answer one, so
 	// a test cannot otherwise reach what a failed patch is reported as.
 	sendAppState func(context.Context, *wm.Client, appstate.PatchInfo) error
+
+	// downloadHistory fetches and decodes one history dump, storing what whatsmeow keeps
+	// from it; receiptHistory tells the phone the dump is done with, and reuploadHistory
+	// asks it to upload one whose blob is gone; sendPeer hands the phone a request of this
+	// device's own. Fields for the same reason as sendAppState:
+	// only a real socket answers any of them.
+	downloadHistory func(context.Context, *wm.Client, *waE2E.HistorySyncNotification) (*waHistorySync.HistorySync, error)
+	receiptHistory  func(context.Context, *wm.Client, waTypes.MessageID) error
+	reuploadHistory func(context.Context, *wm.Client, waTypes.MessageID, []byte) error
+	sendPeer        func(context.Context, *wm.Client, *waE2E.Message) error
 
 	// groupInfo reads a group's metadata. A field for the same reason as the queries
 	// below it: it is one IQ, so a test can otherwise reach the payload this connector
@@ -477,6 +509,10 @@ type Session struct {
 	// by Connect and read by the handler for every call that arrives.
 	autoRejectCalls bool
 
+	// history is the last connect's `history_sync`: whether the client wants the phone's
+	// history published. Guarded by mu, written by Connect and read for every dump.
+	history bool
+
 	// proxy is the last connect's `proxy.url`, empty for a session that goes out
 	// directly. Guarded by mu, and written once route goes through it. It carries
 	// credentials: nothing here logs or publishes it.
@@ -701,12 +737,16 @@ func newSession(
 		download: func(ctx context.Context, client *wm.Client, part wm.DownloadableMessage, file media.File) error {
 			return client.DownloadToFile(ctx, part, file) //nolint:wrapcheck // classified by downloadFailure, which needs the sentinels
 		},
-		retrieve:       retrieveOverHTTP,
-		uploadFile:     uploadOverClient,
-		sendAppState:   sendAppStateOverClient,
-		groupInfo:      groupInfoOverClient,
-		joinedGroups:   joinedGroupsOverClient,
-		createTheGroup: createKeyedGroupOverClient,
+		retrieve:        retrieveOverHTTP,
+		uploadFile:      uploadOverClient,
+		sendAppState:    sendAppStateOverClient,
+		downloadHistory: downloadHistoryOverClient,
+		receiptHistory:  receiptHistoryOverClient,
+		reuploadHistory: reuploadHistoryOverClient,
+		sendPeer:        sendPeerOverClient,
+		groupInfo:       groupInfoOverClient,
+		joinedGroups:    joinedGroupsOverClient,
+		createTheGroup:  createKeyedGroupOverClient,
 		onWhatsApp: func(ctx context.Context, client *wm.Client, phones []string) ([]waTypes.IsOnWhatsAppResponse, error) {
 			return client.IsOnWhatsApp(ctx, phones) //nolint:wrapcheck // wrapped by its caller
 		},
@@ -779,18 +819,25 @@ func newSession(
 		handoffWait: perishableHandoff,
 		awaited:     make(map[string]*awaiting),
 
-		reuploads:      make(map[string]chan *waEvents.MediaRetry),
-		reuploadWait:   reuploadTimeout,
-		rerequestWait:  rerequestTimeout,
-		rerequestRetry: rerequestRetry,
-		presenceWrite:  make(chan struct{}, 1),
-		presenceWait:   presenceWriteTimeout,
-		callWait:       callWriteTimeout,
-		board:          make(map[string]posted),
-		downloadWait:   downloadTimeout,
-		uploadWait:     uploadTimeout,
+		reuploads:           make(map[string]chan *waEvents.MediaRetry),
+		reuploadWait:        reuploadTimeout,
+		rerequestWait:       rerequestTimeout,
+		rerequestRetry:      rerequestRetry,
+		presenceWrite:       make(chan struct{}, 1),
+		presenceWait:        presenceWriteTimeout,
+		callWait:            callWriteTimeout,
+		board:               make(map[string]posted),
+		downloadWait:        downloadTimeout,
+		historyBudget:       historyBudget,
+		historyReceiptWait:  historyReceiptTimeout,
+		historyRetry:        historyRetry,
+		historyRetryCeiling: historyRetryCeiling,
+		historyReplayBudget: historyReplayBudget,
+		sending:             make(chan struct{}, 1),
+		uploadWait:          uploadTimeout,
 	}
 	s.route.notify = s.proxyOutcome
+	s.readPendingHistory = s.store.PendingHistory
 	s.declineCall = func(ctx context.Context, client *wm.Client, caller waTypes.JID, callID string) error {
 		if client == nil {
 			// The socket this would be written on is gone. Checked here rather than at
@@ -904,6 +951,7 @@ func (s *Session) adopt(ctx context.Context, client *wm.Client) bool {
 	// account.
 	client.EnableAutoReconnect = true
 	client.PrePairCallback = s.bind
+	client.GetClientPayload = s.payloadWithHistory(client)
 	client.BackgroundEventCtx = s.ctx
 	// The ack for an inbound message waits for the handlers, and a handler that reports
 	// failure stops it being sent at all. That pairing is what lets this build refuse a
@@ -913,8 +961,8 @@ func (s *Session) adopt(ctx context.Context, client *wm.Client) bool {
 	// The history dump has an acknowledgement of its own that the handler gate does not
 	// cover: whatsmeow downloads it and receipts it on its own. Both are turned off
 	// together, because receipting a dump nobody published is the same loss as
-	// acknowledging a message nobody published, and M6 is where the dump gets somewhere
-	// to go.
+	// acknowledging a message nobody published: receiveHistory downloads it and sends the
+	// receipt once the slices are out.
 	client.ManualHistorySyncDownload = true
 	client.DisableManualHistorySyncReceipt = true
 	// Refusing the ack only keeps a message if the redelivery can still be read.
@@ -1776,6 +1824,7 @@ func (s *Session) Connect(ctx context.Context, req engine.ConnectRequest) error 
 	// underneath it would go on acknowledging and dropping group messages until the
 	// next connect that happened to succeed.
 	s.setGroups(req.Groups)
+	s.setHistory(req.HistorySync)
 	s.setCallPolicy(req.Calls != nil && req.Calls.AutoReject)
 
 	// A hang-up an earlier command left running is waited for first: the move below may
@@ -1867,6 +1916,7 @@ func (s *Session) standOnWhatWasAsked(ctx context.Context) error {
 		return nil
 	}
 	s.setGroups(standing.Groups)
+	s.setHistory(standing.History)
 	s.setCallPolicy(standing.CallAutoReject)
 	// Nothing is dialled yet, so there is no socket to hang up: moving the route is all a
 	// proxy needs here.
@@ -3373,6 +3423,8 @@ func (s *Session) Execute(ctx context.Context, command *protocol.Command) (json.
 		return s.markUnread(ctx, command)
 	case protocol.CommandCallReject:
 		return s.rejectCall(ctx, command)
+	case protocol.CommandHistoryRequest:
+		return s.requestHistory(ctx, command)
 	case protocol.CommandGroupLeave, protocol.CommandGroupPhotoSet, protocol.CommandGroupNameSet,
 		protocol.CommandGroupDescriptionSet, protocol.CommandGroupSettingsSet,
 		protocol.CommandGroupInviteGet, protocol.CommandGroupJoinRequestsList,
@@ -3499,7 +3551,9 @@ func (s *Session) requestCode(ctx context.Context, command *protocol.Command) er
 	// would turn group traffic off on a session that had asked for it, at the moment it
 	// asked for a pairing code; leaving the call policy out would have the account start
 	// ringing again, and record that as what its client wanted.
-	request := engine.ConnectRequest{Pairing: "code", Phone: body.Phone, Groups: s.wantsGroups()}
+	request := engine.ConnectRequest{
+		Pairing: "code", Phone: body.Phone, Groups: s.wantsGroups(), HistorySync: s.wantsHistory(),
+	}
 	if s.rejectsCalls() {
 		request.Calls = &engine.CallsRequest{AutoReject: true}
 	}
@@ -4639,6 +4693,10 @@ func (s *Session) handle(rawEvent any) bool {
 		// and this has none -- so what this buys is a head start, not a guarantee.
 		go s.reapplyAvailability(s.ctx, s.current())
 		s.emit(protocol.EventSessionState, s.sessionState())
+		// A dump written down and not finished with, this session's or the previous
+		// owner's, is finished on a socket that can download it. Nothing else brings it
+		// back: the phone does not announce a dump twice.
+		go s.replayHistory()
 	case *waEvents.KeepAliveTimeout:
 		// The socket is open and the server stopped answering on it. Nobody else is going
 		// to say so for a while: whatsmeow's own patience here is KeepAliveMaxFailTime,

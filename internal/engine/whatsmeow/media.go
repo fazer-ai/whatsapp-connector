@@ -498,6 +498,27 @@ func (s *Session) blobURL(id string) string {
 
 // --- fetching the same file a second time ------------------------------------------
 
+// sameChat reports whether two addresses name one chat: the same address, or the number
+// and the LID of one person as this account was shown them. A message filed under the
+// number before the pairing was known is published under the LID afterwards, by a history
+// dump that carries the pairing, and a client asking for its file under either is asking
+// about the same conversation.
+func (s *Session) sameChat(asked, kept protocol.Address) bool {
+	if asked == kept {
+		return true
+	}
+	askedJID, askedErr := jidOf(asked)
+	keptJID, keptErr := jidOf(kept)
+	if askedErr != nil || keptErr != nil {
+		return false
+	}
+	looking, done := s.looking()
+	defer done()
+	askedAs, askedOK := s.address(looking, askedJID)
+	keptAs, keptOK := s.address(looking, keptJID)
+	return askedOK && keptOK && askedAs == keptAs
+}
+
 // remember records how to fetch this message's file again, and reports whether it did.
 //
 // The reference published with an event stops working, and on a schedule the client
@@ -515,6 +536,64 @@ func (s *Session) remember(event *waEvents.Message, part *attachment) bool {
 	ctx, cancel := context.WithTimeout(s.ctx, s.storeLimit)
 	defer cancel()
 
+	kept := s.mediaPartOf(ctx, event, part)
+	if err := s.store.PutMediaPart(ctx, &kept, time.Now()); err != nil {
+		s.log.Warn().Err(err).Str("message_id", kept.MessageID).
+			Msg("published a file this session will not be able to fetch a second time")
+		return false
+	}
+	return true
+}
+
+// rememberPast is remember for a message out of a history dump, which is the one place a
+// message this session already knows arrives again: live and then in a dump, or in two
+// dumps. What was kept first wins, because it can only be as new as the dump's copy and
+// it may name the file already on this instance's disk, which the dump's copy cannot.
+//
+// Unlike remember, a failure is the caller's to act on: a dump's media goes out with no
+// reference, so this row is the only way its file is ever fetched.
+func (s *Session) rememberPast(
+	ctx context.Context, event *waEvents.Message, part *attachment, device string, chat protocol.Address,
+) bool {
+	ctx, cancel := context.WithTimeout(ctx, s.storeLimit)
+	defer cancel()
+
+	kept := s.mediaPartOf(ctx, event, part)
+	// Under the address the slice publishes the message under, which the slice pinned before
+	// rendering it: resolved again here, a pairing learned in between would file the row
+	// under an address the client was never shown.
+	kept.ChatKind, kept.ChatID = string(chat.Kind), chat.ID
+	// A row this message already has, under another address for what the resolver says is
+	// the same chat, gets the dump's address beside its own: the pairing that says so lives
+	// in memory, and a download after a restart only has the row to go by. Another chat that
+	// happens to hold the same id is left alone.
+	already, found, err := s.store.MediaPart(ctx, kept.MessageID)
+	if err != nil {
+		// Written without the lookup, a row under the other address would keep only the
+		// first one, and the dump would be finished with. Kept for another attempt instead.
+		s.log.Warn().Err(err).Str("message_id", kept.MessageID).
+			Msg("could not read how the file of a message out of a dump was kept")
+		return false
+	}
+	if found {
+		published := protocol.Address{Kind: protocol.AddressKind(kept.ChatKind), ID: kept.ChatID}
+		first := protocol.Address{Kind: protocol.AddressKind(already.ChatKind), ID: already.ChatID}
+		if published != first && s.sameChat(published, first) {
+			// The first address stays the row's, and is what the write holds the second to.
+			kept.AltChatKind, kept.AltChatID = kept.ChatKind, kept.ChatID
+			kept.ChatKind, kept.ChatID = already.ChatKind, already.ChatID
+		}
+	}
+	if err := s.store.KeepMediaPart(ctx, &kept, device, time.Now()); err != nil {
+		s.log.Warn().Err(err).Str("message_id", kept.MessageID).
+			Msg("could not keep how to fetch the file of a message out of a dump")
+		return false
+	}
+	return true
+}
+
+// mediaPartOf is the row that says how to fetch this message's file again.
+func (s *Session) mediaPartOf(ctx context.Context, event *waEvents.Message, part *attachment) store.MediaPart {
 	messageID := event.Info.ID
 	// Through chatOf, which is what the event was published under. Recomputing it here
 	// would be a second copy of the broadcast rule, and a copy that drifted would file a
@@ -542,12 +621,7 @@ func (s *Session) remember(event *waEvents.Message, part *attachment) bool {
 		// point at, and the invitation to come back for it is the whole point of the row.
 		kept.BlobID = part.content.Ref.ID
 	}
-	if err := s.store.PutMediaPart(ctx, &kept, time.Now()); err != nil {
-		s.log.Warn().Err(err).Str("message_id", messageID).
-			Msg("published a file this session will not be able to fetch a second time")
-		return false
-	}
-	return true
+	return kept
 }
 
 // downloadMedia is `message.download_media`: the file of a message this session already
@@ -588,7 +662,8 @@ func (s *Session) downloadMedia(ctx context.Context, command *protocol.Command) 
 			"nothing is kept for that message to fetch its file with")
 	}
 
-	if body.Chat != nil && (string(body.Chat.Kind) != kept.ChatKind || body.Chat.ID != kept.ChatID) {
+	if body.Chat != nil && !s.sameChat(*body.Chat, protocol.Address{Kind: protocol.AddressKind(kept.ChatKind), ID: kept.ChatID}) &&
+		(kept.AltChatID == "" || !s.sameChat(*body.Chat, protocol.Address{Kind: protocol.AddressKind(kept.AltChatKind), ID: kept.AltChatID})) {
 		// A message id is the sender's to choose, so two chats under one account can
 		// carry the same one and the second row replaces the first. Vanishingly rare and
 		// the client keys by message id too, so it is not a case this can resolve -- but

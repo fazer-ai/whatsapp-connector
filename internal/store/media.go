@@ -31,6 +31,14 @@ type MediaPart struct {
 	// for it, and refuse rather than hand over somebody else's file.
 	ChatKind string
 	ChatID   string
+
+	// AltChatKind and AltChatID are the other address the message was published under, when
+	// a history dump named its chat differently from the first publication: the number the
+	// live message went out under, and the LID the dump carries. A client asking for the
+	// file under either is asking about the same conversation, and the in-memory pairing
+	// that would say so does not survive a restart or a handoff. Empty when there is none.
+	AltChatKind string
+	AltChatID   string
 	// Kind is the contract's media kind, and it decides which of whatsmeow's message
 	// types the download is rebuilt as, which is how whatsmeow knows the media type.
 	Kind string
@@ -129,6 +137,13 @@ func (c *Container) putMediaPart(ctx context.Context, part *MediaPart, now time.
 		-- rev is left to its default on the way in and bumped on the way through, so it
 		-- counts writes rather than being something a caller can hand in wrong.
 		ON CONFLICT (sid, message_id) DO UPDATE SET
+			-- A second address belongs to the chat it was recorded beside. A row taken over
+			-- by another chat under the same id loses it, or a download naming the old
+			-- chat's other address would be served the new chat's file.
+			alt_chat_kind = CASE WHEN wac_media_part.chat_kind = excluded.chat_kind AND wac_media_part.chat_id = excluded.chat_id
+				THEN wac_media_part.alt_chat_kind ELSE '' END,
+			alt_chat_id = CASE WHEN wac_media_part.chat_kind = excluded.chat_kind AND wac_media_part.chat_id = excluded.chat_id
+				THEN wac_media_part.alt_chat_id ELSE '' END,
 			chat_kind = excluded.chat_kind, chat_id = excluded.chat_id,
 			kind = excluded.kind, direct_path = excluded.direct_path, media_key = excluded.media_key,
 			file_enc_sha256 = excluded.file_enc_sha256, file_sha256 = excluded.file_sha256,
@@ -149,19 +164,70 @@ func (c *Container) putMediaPart(ctx context.Context, part *MediaPart, now time.
 	return nil
 }
 
+// keepMediaPart writes a row only where the message has none, and otherwise only renews
+// how long the row is kept and, when the caller names one in AltChatKind and AltChatID,
+// records a second address for the chat beside the first. Which address is the same chat
+// is the caller's to establish: a message id is chosen by the sender, and two chats can hold
+// one, so a differing chat on its own is no evidence of anything. The caller names in
+// ChatKind and ChatID the first address it checked the second against, and the second is
+// recorded only while the row still carries that one: a live write for another chat under
+// the same id can take the row over between the check and this write.
+//
+// For a message that arrives a second time, out of a history dump: what was kept the
+// first time may name the file on this instance's disk, and the dump's copy cannot. The
+// retention is renewed all the same, because the dump has just published the message
+// again with no reference of its own, and a row the sweep takes right after is a file the
+// client was just shown and cannot fetch.
+//
+// Nothing is written unless the session is still bound to device, checked in the same
+// statement: a dump retried across a logout and a new pairing would otherwise file the
+// previous account's media keys under the next account, which could then download them.
+func (c *Container) keepMediaPart(ctx context.Context, part *MediaPart, device string, now time.Time) error {
+	if part.SID == "" || part.MessageID == "" {
+		return fmt.Errorf("store: a media part needs a session and a message, got %q and %q", part.SID, part.MessageID)
+	}
+	const insert = `
+		INSERT INTO wac_media_part
+			(sid, message_id, chat_kind, chat_id, alt_chat_kind, alt_chat_id, kind, direct_path,
+			 media_key, file_enc_sha256, file_sha256, file_length, mime, filename,
+			 receipt_chat, sender, from_me, blob_id, stored_at)
+		SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+		WHERE EXISTS (SELECT 1 FROM wac_session_device WHERE sid = ? AND jid = ?)
+		ON CONFLICT (sid, message_id) DO UPDATE SET stored_at = excluded.stored_at,
+			alt_chat_kind = CASE WHEN excluded.alt_chat_id <> ''
+				AND wac_media_part.chat_kind = excluded.chat_kind AND wac_media_part.chat_id = excluded.chat_id
+				THEN excluded.alt_chat_kind ELSE wac_media_part.alt_chat_kind END,
+			alt_chat_id = CASE WHEN excluded.alt_chat_id <> ''
+				AND wac_media_part.chat_kind = excluded.chat_kind AND wac_media_part.chat_id = excluded.chat_id
+				THEN excluded.alt_chat_id ELSE wac_media_part.alt_chat_id END
+		WHERE excluded.stored_at >= wac_media_part.stored_at`
+	_, err := c.db.ExecContext(ctx, c.rebind(insert),
+		part.SID, part.MessageID, part.ChatKind, part.ChatID, part.AltChatKind, part.AltChatID,
+		part.Kind, part.DirectPath,
+		encode(part.MediaKey), encode(part.FileEncSHA256), encode(part.FileSHA256),
+		part.FileLength, part.Mime, part.Filename,
+		part.ReceiptChat, part.Sender, asFlag(part.FromMe), part.BlobID, now.UnixMilli(),
+		part.SID, device)
+	if err != nil {
+		return fmt.Errorf("store: record how to fetch the file of %s: %w", part.MessageID, err)
+	}
+	return nil
+}
+
 // MediaPart reads back how to fetch one message's file, and whether anything was kept
 // for it at all.
 func (c *Container) mediaPart(ctx context.Context, sid, messageID string) (MediaPart, bool, error) {
 	const query = `
-		SELECT chat_kind, chat_id, kind, direct_path, media_key, file_enc_sha256, file_sha256,
-		       file_length, mime, filename, receipt_chat, sender, from_me, blob_id, rev, stored_at
+		SELECT chat_kind, chat_id, alt_chat_kind, alt_chat_id, kind, direct_path, media_key,
+		       file_enc_sha256, file_sha256, file_length, mime, filename, receipt_chat, sender,
+		       from_me, blob_id, rev, stored_at
 		FROM wac_media_part WHERE sid = ? AND message_id = ?`
 
 	part := MediaPart{SID: sid, MessageID: messageID}
 	var key, encDigest, digest string
 	var fromMe int64
 	err := c.db.QueryRowContext(ctx, c.rebind(query), sid, messageID).Scan(
-		&part.ChatKind, &part.ChatID,
+		&part.ChatKind, &part.ChatID, &part.AltChatKind, &part.AltChatID,
 		&part.Kind, &part.DirectPath, &key, &encDigest, &digest,
 		&part.FileLength, &part.Mime, &part.Filename,
 		&part.ReceiptChat, &part.Sender, &fromMe, &part.BlobID, &part.Rev, &part.StoredAt)

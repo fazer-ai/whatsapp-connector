@@ -396,6 +396,10 @@ func payloadEnums() map[string]payloadEnum {
 				{"definitions", "command_presence_set", "properties", "state"},
 			},
 		},
+		"history sync": {
+			known: asStrings(protocol.AllHistorySyncs),
+			paths: [][]string{{"definitions", "history_messages", "properties", "sync"}},
+		},
 		"unsupported reason": {
 			known: asStrings(protocol.AllUnsupportedReasons),
 			paths: [][]string{{"definitions", "content_unsupported", "properties", "reason"}},

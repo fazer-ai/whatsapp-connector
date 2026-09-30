@@ -427,6 +427,14 @@ func (c *Container) bind(ctx context.Context, sid string, jid types.JID) error {
 		sid, sid, jid.String()); err != nil {
 		return fmt.Errorf("store: bind %s: %w", sid, err)
 	}
+	// And the history dumps, which the device's own writes are already held to: a row is
+	// only ever written for the device the session is bound to, and this is the bond
+	// changing, so what the previous device left is the previous account's.
+	if _, err := tx.ExecContext(ctx, c.rebind(`
+		DELETE FROM wac_pending_history WHERE sid = ? AND device_jid <> ?`),
+		sid, jid.String()); err != nil {
+		return fmt.Errorf("store: bind %s: %w", sid, err)
+	}
 	if _, err := tx.ExecContext(ctx, c.rebind(`
 		INSERT INTO wac_session_device (sid, jid, account, bound_at) VALUES (?, ?, ?, ?)
 		ON CONFLICT (sid) DO UPDATE SET
@@ -681,6 +689,21 @@ func (c *Container) migrate(ctx context.Context) error {
 			FOREIGN KEY (sid) REFERENCES wac_session_device (sid) ON DELETE CASCADE
 		)`,
 
+		// A history dump that was announced and not finished with. The phone announces a
+		// dump once and does not announce it again for a notification left unacknowledged,
+		// so this row is what a lost Redis, a lost lease or a restart in the middle of one
+		// leaves for the next attempt. The same cascade as the placeholder: a dump of an
+		// account that was logged out is one nobody should publish.
+		`CREATE TABLE IF NOT EXISTS wac_pending_history (
+			sid        TEXT   NOT NULL,
+			message_id TEXT   NOT NULL,
+			device_jid TEXT   NOT NULL,
+			notice     TEXT   NOT NULL,
+			learned_at BIGINT NOT NULL,
+			PRIMARY KEY (sid, message_id),
+			FOREIGN KEY (sid) REFERENCES wac_session_device (sid) ON DELETE CASCADE
+		)`,
+
 		// What a client asked this account to be shown as, so the first connection of a
 		// new owner can put it back the way a reconnect does. The session's own memory
 		// cannot: it is per instance, and a handoff builds one that has never heard the
@@ -798,16 +821,23 @@ func (c *Container) migrate(ctx context.Context) error {
 	// thing any session did before the column existed: the connect refused a proxy until
 	// #217, so no row written before it can stand for one.
 	//
+	// `wants_history` defaults to 0 on the same ground: the connect refused `history_sync`
+	// until #348, so no row written before the column can have asked for it.
+	//
 	// `rev` defaults to 0 and counts writes from there, so a row that predates it is a
 	// row nobody has written since -- which is true, and is the only thing a caller
 	// comparing against it needs.
+	//
+	// `alt_chat_kind` and `alt_chat_id` default to empty, a row published under one address
+	// only, which is every row written before a history dump could name a chat again.
 	//
 	// `blob_id` defaults to empty, which is a row with no file kept for it on this
 	// instance's disk. That is what every row in an upgrading deployment is, because the
 	// blobs predate the column that would have named them, and it is also what a row
 	// whose blob has been swept comes back to.
 	//
-	// Those two are the columns a fresh store does not have either, on purpose: the
+	// `rev`, `blob_id` and the two `alt_chat_` columns are ones a fresh store does not have
+	// either, on purpose: the
 	// default belongs in one place, and this is the place that has to have it right for
 	// the store that already has rows.
 	for _, column := range []struct{ table, name, definition string }{
@@ -816,9 +846,12 @@ func (c *Container) migrate(ctx context.Context) error {
 		{"wac_media_part", "from_me", "BIGINT NOT NULL DEFAULT 0"},
 		{"wac_media_part", "blob_id", "TEXT NOT NULL DEFAULT ''"},
 		{"wac_media_part", "rev", "BIGINT NOT NULL DEFAULT 0"},
+		{"wac_media_part", "alt_chat_kind", "TEXT NOT NULL DEFAULT ''"},
+		{"wac_media_part", "alt_chat_id", "TEXT NOT NULL DEFAULT ''"},
 		{"wac_session_desired", "wants_groups", "BIGINT NOT NULL DEFAULT 0"},
 		{"wac_session_desired", "wants_call_auto_reject", "BIGINT NOT NULL DEFAULT 0"},
 		{"wac_session_desired", "wants_proxy", "TEXT NOT NULL DEFAULT ''"},
+		{"wac_session_desired", "wants_history", "BIGINT NOT NULL DEFAULT 0"},
 	} {
 		if err := c.addColumn(ctx, column.table, column.name, column.definition); err != nil {
 			return err

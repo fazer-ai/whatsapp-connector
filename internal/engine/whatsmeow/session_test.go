@@ -25,6 +25,7 @@ import (
 	waBinary "go.mau.fi/whatsmeow/binary"
 	"go.mau.fi/whatsmeow/proto/waAdv"
 	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
+	waHistorySync "go.mau.fi/whatsmeow/proto/waHistorySync"
 	waTypes "go.mau.fi/whatsmeow/types"
 	waEvents "go.mau.fi/whatsmeow/types/events"
 	"google.golang.org/protobuf/proto"
@@ -143,7 +144,6 @@ var (
 	// than something that drifted.
 	commandsNoHandlerCarriesOut = []protocol.CommandType{
 		protocol.CommandSessionUpdate,
-		protocol.CommandHistoryRequest,
 		protocol.CommandContactInfo,
 	}
 
@@ -171,6 +171,7 @@ var (
 		{protocol.CommandMessageReact, protocol.ErrorInvalidPayload},
 		{protocol.CommandMessageMarkRead, protocol.ErrorInvalidPayload},
 		{protocol.CommandMessageDownloadMedia, protocol.ErrorInvalidPayload},
+		{protocol.CommandHistoryRequest, protocol.ErrorInvalidPayload},
 		{protocol.CommandPresenceSet, protocol.ErrorInvalidPayload},
 		{protocol.CommandPresenceSubscribe, protocol.ErrorInvalidPayload},
 		{protocol.CommandChatPresence, protocol.ErrorInvalidPayload},
@@ -2067,35 +2068,6 @@ func TestARequestForACodeReachesTheCodePairing(t *testing.T) {
 	}
 }
 
-// A connect option is a thing the client asked the connector to do, and a build that does
-// not do it must say so rather than answer `open`. The client is then waiting for a call
-// to be refused, or for a backlog to arrive, with nothing on the stream to tell it that
-// neither was ever going to happen. The canonical connect fixture sends both fields, so
-// this is what a client really puts on the wire and not a shape invented for the test.
-func TestConnectRefusesTheOptionsThisBuildDoesNotCarryOut(t *testing.T) {
-	t.Parallel()
-
-	for name, payload := range map[string]string{
-		"importing history": `{"pairing":"resume","history_sync":true}`,
-	} {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-			session, _ := newTestSession(t, "5511999990001")
-
-			var request engine.ConnectRequest
-			if err := json.Unmarshal([]byte(payload), &request); err != nil {
-				t.Fatalf("unmarshal: %v", err)
-			}
-
-			err := session.Connect(t.Context(), request)
-			var coded *protocol.Error
-			if !errors.As(err, &coded) || coded.Code != protocol.ErrorUnsupported {
-				t.Fatalf("Connect answered %v, want unsupported", err)
-			}
-		})
-	}
-}
-
 // A manual disconnect is followed by no Disconnected, so the guard that refuses the
 // Connected whatsmeow had already queued has to come off for the next connect — and the
 // state that decides whether that connect dials has to be read in the same breath.
@@ -3259,9 +3231,8 @@ func TestAConnectThisBuildRefusesIsNotSomethingToResume(t *testing.T) {
 	t.Parallel()
 
 	for name, request := range map[string]engine.ConnectRequest{
-		"history_sync": {Pairing: "resume", Groups: true, HistorySync: true},
-		"proxy":        {Pairing: "resume", Groups: true, Proxy: &engine.ProxyRequest{URL: "ftp://127.0.0.1:21"}},
-		"pairing":      {Pairing: "telepathy", Groups: true},
+		"proxy":   {Pairing: "resume", Groups: true, Proxy: &engine.ProxyRequest{URL: "ftp://127.0.0.1:21"}},
+		"pairing": {Pairing: "telepathy", Groups: true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -3623,6 +3594,35 @@ func resumedDoors() []resumedDoor {
 					CallRemoteMeta: waTypes.CallRemoteMeta{RemotePlatform: "android"},
 					Data:           &waBinary.Node{Tag: "offer", Content: []waBinary.Node{{Tag: "audio"}}},
 				})
+			},
+		},
+		{
+			// A group's history, which a dump carries alongside the direct chats and the
+			// subscription decides the same way it decides a live message.
+			door: "publishConversation",
+			// Answered once the dump is written down, delivered or not: the phone does
+			// not announce a dump twice, so the row is what a slice that did not deliver
+			// is tried again from.
+			answers: answersYes,
+			carries: func(t *testing.T, payload map[string]any) {
+				inTheGroup(t, payload, "data", "chat")
+				messages, _ := field(t, payload, "data", "messages").([]any)
+				if len(messages) != 1 {
+					t.Errorf("published %v as the group's history", messages)
+				}
+			},
+			quiet:      inboxIsEmpty,
+			definition: "event_history_sync",
+			want:       protocol.EventHistorySync,
+			give: func(s *Session) bool {
+				s.setHistory(true)
+				group := groupJID().String()
+				past := pastText(group, "3EB0HISTORYRESUME", 1754000000, "bom dia, time")
+				past.Message.Key.Participant = proto.String(someone("5511999990002").String())
+				(&historyBench{dump: dumpOf(waHistorySync.HistorySync_RECENT,
+					&waHistorySync.Conversation{ID: proto.String(group), Messages: []*waHistorySync.HistorySyncMsg{past}},
+				)}).install(s)
+				return s.handle(historyNotification("NOTIFRESUME", waE2E.HistorySyncType_RECENT))
 			},
 		},
 		{

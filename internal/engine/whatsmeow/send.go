@@ -174,11 +174,36 @@ func (s *Session) putOnTheWire(
 	if hand == nil {
 		hand = s.overSocket
 	}
+	done, err := s.takeTurnToSend(wire)
+	if err != nil {
+		return wm.SendResponse{}, sendFailure(whichClockRanOut(wire, err))
+	}
+	defer done()
 	sent, err := hand(wire, to, messageID, message)
 	if err != nil {
 		return wm.SendResponse{}, sendFailure(whichClockRanOut(wire, err))
 	}
 	return sent, nil
+}
+
+// takeTurnToSend waits for this session's turn to send a message, under ctx, and returns
+// what gives the turn back.
+//
+// whatsmeow sends one message at a time behind a mutex that reads no context, so a send
+// waiting on another would outlive its own deadline and hold the session's command queue
+// with it. The command sends already go one at a time through the executor; what they can
+// land behind is the request for history a dump sends by itself, off the executor. Taking
+// the turn here first makes that wait one the caller's deadline ends, and costs nothing in
+// concurrency the library was not already refusing.
+func (s *Session) takeTurnToSend(ctx context.Context) (func(), error) {
+	select {
+	case s.sending <- struct{}{}:
+		return func() { <-s.sending }, nil
+	case <-ctx.Done():
+		// The error a send cut short returns, so the caller tells the clocks apart the
+		// same way.
+		return nil, ctx.Err()
+	}
 }
 
 // errSendCeiling is what `wire` is cancelled with when this connector's own ceiling is

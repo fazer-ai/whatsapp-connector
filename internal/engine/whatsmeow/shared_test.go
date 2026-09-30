@@ -611,6 +611,9 @@ func TestWhatIsNotAMessageIsAcknowledgedRatherThanShownToAnAgent(t *testing.T) {
 
 			session, _ := newTestSession(t, "5511999990001")
 			session.deliverWait = 50 * time.Millisecond
+			// The history notification is downloaded for what whatsmeow stores from it,
+			// and a test has no socket to download over.
+			(&historyBench{}).install(session)
 			event := textMessage("3EB0NOTAMESSAGE", "")
 			event.Info.IsFromMe = true
 			event.Message = tc.body

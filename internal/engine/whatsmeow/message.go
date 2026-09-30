@@ -527,6 +527,12 @@ func (s *Session) receive(event *waEvents.Message) bool {
 	// before it published either.
 	learned := s.learned()
 
+	if notice := historyNotice(event); notice != nil {
+		// Before the switch below, which drops every other protocol message the account
+		// sends itself as plumbing.
+		return s.receiveHistory(event, notice, learned)
+	}
+
 	if event.Info.Sender.IsBot() || event.Info.Chat.IsBot() {
 		// Meta's assistants, either in a chat of their own or replying inline in
 		// somebody else's. The contract has no kind for them on purpose, so no slice of
@@ -643,6 +649,16 @@ func (s *Session) deliver(eventType protocol.EventType, payload any, learned int
 // whether it is still true, the choice is made where it stops being reversible, and under
 // the lock the arrival takes.
 func (s *Session) deliverUnless(eventType protocol.EventType, payload any, learned int64, unless string) bool {
+	var claim func() bool
+	if unless != "" {
+		claim = func() bool { return s.commit(unless) }
+	}
+	return s.deliverClaimed(eventType, payload, learned, claim)
+}
+
+// deliverClaimed is deliver for an event the publisher asks claim about at the last moment
+// before the write, dropping it when claim says no. A nil claim is no question at all.
+func (s *Session) deliverClaimed(eventType protocol.EventType, payload any, learned int64, claim func() bool) bool {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		s.log.Error().Err(err).Str("type", string(eventType)).Msg("failed to render an event payload")
@@ -657,9 +673,7 @@ func (s *Session) deliverUnless(eventType protocol.EventType, payload any, learn
 		Payload: body,
 		At:      learned,
 		Settle:  func(err error) { settled <- err },
-	}
-	if unless != "" {
-		emission.Claim = func() bool { return s.commit(unless) }
+		Claim:   claim,
 	}
 	// Started before the emission is queued, not after: the inbox is bounded, and a
 	// pump stalled behind a publisher that answers neither way fills it. Timing only
