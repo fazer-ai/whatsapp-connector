@@ -552,11 +552,17 @@ func (s *Session) remember(event *waEvents.Message, part *attachment) bool {
 //
 // Unlike remember, a failure is the caller's to act on: a dump's media goes out with no
 // reference, so this row is the only way its file is ever fetched.
-func (s *Session) rememberPast(ctx context.Context, event *waEvents.Message, part *attachment, device string) bool {
+func (s *Session) rememberPast(
+	ctx context.Context, event *waEvents.Message, part *attachment, device string, chat protocol.Address,
+) bool {
 	ctx, cancel := context.WithTimeout(ctx, s.storeLimit)
 	defer cancel()
 
 	kept := s.mediaPartOf(ctx, event, part)
+	// Under the address the slice publishes the message under, which the slice pinned before
+	// rendering it: resolved again here, a pairing learned in between would file the row
+	// under an address the client was never shown.
+	kept.ChatKind, kept.ChatID = string(chat.Kind), chat.ID
 	// A row this message already has, under another address for what the resolver says is
 	// the same chat, gets the dump's address beside its own: the pairing that says so lives
 	// in memory, and a download after a restart only has the row to go by. Another chat that

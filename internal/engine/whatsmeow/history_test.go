@@ -2080,3 +2080,28 @@ func TestADumpRecordsASecondAddressOnlyForTheSameChat(t *testing.T) {
 		}
 	}
 }
+
+// A file row out of a dump is filed under the address the slice publishes the message under,
+// not one resolved again at the write: a pairing learned in between would file it under an
+// address the client was never shown.
+func TestAFileOfADumpIsFiledUnderTheSlicesChat(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	event := imageEvent("3EB0PINNED")
+	part, isAFile := attachmentOf(event.Message)
+	if !isAFile {
+		t.Fatal("the image event carries no file")
+	}
+	pinned := protocol.Address{Kind: protocol.AddressLID, ID: "167392323834055"}
+	if !session.rememberPast(t.Context(), event, &part, deviceOf(session.current()), pinned) {
+		t.Fatal("the file row was not written")
+	}
+	kept, found, err := session.store.MediaPart(t.Context(), "3EB0PINNED")
+	if err != nil || !found {
+		t.Fatalf("MediaPart: found %v, err %v", found, err)
+	}
+	if kept.ChatKind != string(pinned.Kind) || kept.ChatID != pinned.ID {
+		t.Fatalf("the file is filed under %s/%s, and the slice published it under %+v", kept.ChatKind, kept.ChatID, pinned)
+	}
+}

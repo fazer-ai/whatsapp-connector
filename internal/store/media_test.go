@@ -673,3 +673,44 @@ func TestAFileADumpNamesUnderAnotherChatKeepsBothAddresses(t *testing.T) {
 		t.Errorf("a sighting naming no second address erased it: %q", got.AltChatID)
 	}
 }
+
+// A second address belongs to the chat it was recorded beside. Another chat taking the row
+// over under the same id drops it, or a download naming the old chat's other address would
+// be served the new chat's file; the same chat writing again keeps it.
+func TestAChatTakingARowOverDropsItsSecondAddress(t *testing.T) {
+	t.Parallel()
+	container := open(t)
+	device := pair(t, container, "sid-1", "5511999990001")
+
+	for _, tc := range []struct {
+		name    string
+		chatID  string
+		keepAlt bool
+	}{
+		{"the same chat", "5511999990002", true},
+		{"another chat", "5511999990003", false},
+	} {
+		id := "3EB0TAKEN" + tc.chatID
+		first := samplePart("sid-1", id)
+		if err := container.For("sid-1").PutMediaPart(t.Context(), &first, storedAt); err != nil {
+			t.Fatalf("PutMediaPart: %v", err)
+		}
+		alt := samplePart("sid-1", id)
+		alt.AltChatKind, alt.AltChatID = "lid", "123456789012345"
+		if err := container.For("sid-1").KeepMediaPart(t.Context(), &alt, device.String(), storedAt); err != nil {
+			t.Fatalf("KeepMediaPart: %v", err)
+		}
+		live := samplePart("sid-1", id)
+		live.ChatID = tc.chatID
+		if err := container.For("sid-1").PutMediaPart(t.Context(), &live, storedAt.Add(time.Minute)); err != nil {
+			t.Fatalf("PutMediaPart: %v", err)
+		}
+		got, _, err := container.For("sid-1").MediaPart(t.Context(), id)
+		if err != nil {
+			t.Fatalf("MediaPart: %v", err)
+		}
+		if kept := got.AltChatID != ""; kept != tc.keepAlt {
+			t.Errorf("%s: the second address is %q, want kept %v", tc.name, got.AltChatID, tc.keepAlt)
+		}
+	}
+}

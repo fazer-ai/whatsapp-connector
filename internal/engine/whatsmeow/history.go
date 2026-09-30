@@ -446,7 +446,10 @@ type dumpRun struct {
 	ctx    context.Context // the dump's budget
 	budget time.Duration
 	// device is the one the dump reached, which every file row it writes is held to.
-	device  string
+	device string
+	// chat is the address of the conversation being published, which each of its messages
+	// and each of its file rows goes out under.
+	chat    protocol.Address
 	client  *wm.Client
 	sync    protocol.HistorySync
 	dump    *waHistorySync.HistorySync
@@ -519,6 +522,7 @@ func (r *dumpRun) publishConversation(conversation *waHistorySync.Conversation) 
 	looking, done := s.looking()
 	chat, _ := s.address(looking, jid)
 	done()
+	r.chat = chat
 
 	messages := make([]protocol.InboundMessage, 0, len(conversation.GetMessages()))
 	for _, past := range conversation.GetMessages() {
@@ -722,7 +726,7 @@ func (r *dumpRun) pastBody(event *waEvents.Message) (body, bool) {
 		// Checked right before the write: the fence is about the lease and not the
 		// account, and a row written after a logout would hand the old account's file to
 		// whatever pairs next under this session.
-		if r.replaced() || !s.rememberPast(r.ctx, event, &part, r.device) {
+		if r.replaced() || !s.rememberPast(r.ctx, event, &part, r.device, r.chat) {
 			r.unkept = true
 		}
 		return body{content: part.content, context: part.context}, true

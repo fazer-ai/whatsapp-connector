@@ -137,6 +137,13 @@ func (c *Container) putMediaPart(ctx context.Context, part *MediaPart, now time.
 		-- rev is left to its default on the way in and bumped on the way through, so it
 		-- counts writes rather than being something a caller can hand in wrong.
 		ON CONFLICT (sid, message_id) DO UPDATE SET
+			-- A second address belongs to the chat it was recorded beside. A row taken over
+			-- by another chat under the same id loses it, or a download naming the old
+			-- chat's other address would be served the new chat's file.
+			alt_chat_kind = CASE WHEN wac_media_part.chat_kind = excluded.chat_kind AND wac_media_part.chat_id = excluded.chat_id
+				THEN wac_media_part.alt_chat_kind ELSE '' END,
+			alt_chat_id = CASE WHEN wac_media_part.chat_kind = excluded.chat_kind AND wac_media_part.chat_id = excluded.chat_id
+				THEN wac_media_part.alt_chat_id ELSE '' END,
 			chat_kind = excluded.chat_kind, chat_id = excluded.chat_id,
 			kind = excluded.kind, direct_path = excluded.direct_path, media_key = excluded.media_key,
 			file_enc_sha256 = excluded.file_enc_sha256, file_sha256 = excluded.file_sha256,
