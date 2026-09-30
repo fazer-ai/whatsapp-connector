@@ -1977,3 +1977,28 @@ func TestAGroupsOnDemandAnswerIsPublishedWithoutTheGroupsSubscription(t *testing
 		}
 	}
 }
+
+// The queue and the pump between a slice being queued and being written are room enough for
+// a logout and a new pairing, so the slice is asked again at the write.
+func TestASliceIsAskedAtTheWriteWhetherTheAccountIsStillTheSame(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	session.setHistory(true)
+	bench := &historyBench{dump: dumpOf(waHistorySync.HistorySync_RECENT,
+		&waHistorySync.Conversation{ID: proto.String("5511999990002@s.whatsapp.net"), Messages: []*waHistorySync.HistorySyncMsg{
+			pastText("5511999990002@s.whatsapp.net", "3EB0CLAIM", 1754000000, "oi"),
+		}})}
+	bench.install(session)
+
+	go session.receive(historyNotification("NOTIF50", waE2E.HistorySyncType_RECENT))
+	emission := next(t, session)
+	if emission.Claim == nil || !emission.Claim() {
+		t.Fatal("a slice of the session's own account is not claimed at the write")
+	}
+	session.aliases.forget()
+	if emission.Claim() {
+		t.Fatal("a slice of an account the session no longer holds is still claimed at the write")
+	}
+	emission.Settle(nil)
+}

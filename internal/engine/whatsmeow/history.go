@@ -487,6 +487,12 @@ func (r *dumpRun) replaced() bool {
 	return true
 }
 
+// stillTheAccount is the question a slice is published under: whether the account the dump
+// belongs to is still the session's.
+func (r *dumpRun) stillTheAccount() bool {
+	return r.s.aliases.learning() == r.generation
+}
+
 // publishConversation publishes one chat of a dump, oldest first, in slices of at most
 // historySliceLimit messages, and reports whether every slice was published.
 func (r *dumpRun) publishConversation(conversation *waHistorySync.Conversation) bool {
@@ -569,7 +575,10 @@ func (r *dumpRun) publishConversation(conversation *waHistorySync.Conversation) 
 		if r.overBudget() || r.replaced() {
 			return false
 		}
-		if !s.deliver(protocol.EventHistorySync, slice, r.learned) {
+		// Asked again where the slice is written, because the queue and the pump between
+		// here and the write are room enough for a logout and a new pairing: a slice
+		// published after them would carry the previous account's messages under the next.
+		if !s.deliverClaimed(protocol.EventHistorySync, slice, r.learned, r.stillTheAccount) {
 			return false
 		}
 		r.slices++
