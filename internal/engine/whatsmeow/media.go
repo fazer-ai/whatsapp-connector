@@ -571,7 +571,9 @@ func (s *Session) rememberPast(
 		published := protocol.Address{Kind: protocol.AddressKind(kept.ChatKind), ID: kept.ChatID}
 		first := protocol.Address{Kind: protocol.AddressKind(already.ChatKind), ID: already.ChatID}
 		if published != first && s.sameChat(published, first) {
+			// The first address stays the row's, and is what the write holds the second to.
 			kept.AltChatKind, kept.AltChatID = kept.ChatKind, kept.ChatID
+			kept.ChatKind, kept.ChatID = already.ChatKind, already.ChatID
 		}
 	}
 	if err := s.store.KeepMediaPart(ctx, &kept, device, time.Now()); err != nil {

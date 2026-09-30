@@ -168,7 +168,10 @@ func (c *Container) putMediaPart(ctx context.Context, part *MediaPart, now time.
 // how long the row is kept and, when the caller names one in AltChatKind and AltChatID,
 // records a second address for the chat beside the first. Which address is the same chat
 // is the caller's to establish: a message id is chosen by the sender, and two chats can hold
-// one, so a differing chat on its own is no evidence of anything.
+// one, so a differing chat on its own is no evidence of anything. The caller names in
+// ChatKind and ChatID the first address it checked the second against, and the second is
+// recorded only while the row still carries that one: a live write for another chat under
+// the same id can take the row over between the check and this write.
 //
 // For a message that arrives a second time, out of a history dump: what was kept the
 // first time may name the file on this instance's disk, and the dump's copy cannot. The
@@ -192,8 +195,10 @@ func (c *Container) keepMediaPart(ctx context.Context, part *MediaPart, device s
 		WHERE EXISTS (SELECT 1 FROM wac_session_device WHERE sid = ? AND jid = ?)
 		ON CONFLICT (sid, message_id) DO UPDATE SET stored_at = excluded.stored_at,
 			alt_chat_kind = CASE WHEN excluded.alt_chat_id <> ''
+				AND wac_media_part.chat_kind = excluded.chat_kind AND wac_media_part.chat_id = excluded.chat_id
 				THEN excluded.alt_chat_kind ELSE wac_media_part.alt_chat_kind END,
 			alt_chat_id = CASE WHEN excluded.alt_chat_id <> ''
+				AND wac_media_part.chat_kind = excluded.chat_kind AND wac_media_part.chat_id = excluded.chat_id
 				THEN excluded.alt_chat_id ELSE wac_media_part.alt_chat_id END
 		WHERE excluded.stored_at >= wac_media_part.stored_at`
 	_, err := c.db.ExecContext(ctx, c.rebind(insert),

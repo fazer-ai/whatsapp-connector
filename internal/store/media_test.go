@@ -646,9 +646,9 @@ func TestAFileADumpNamesUnderAnotherChatKeepsBothAddresses(t *testing.T) {
 	}
 
 	// In the same millisecond as the row, the way a live message and its sighting in a dump
-	// can land: the second address is still recorded.
+	// can land: the second address is still recorded. The caller names the first address it
+	// checked the second against.
 	again := samplePart("sid-1", "3EB0TWOCHATS")
-	again.ChatKind, again.ChatID = "lid", "123456789012345"
 	again.AltChatKind, again.AltChatID = "lid", "123456789012345"
 	if err := container.For("sid-1").KeepMediaPart(t.Context(), &again, device.String(), storedAt); err != nil {
 		t.Fatalf("KeepMediaPart: %v", err)
@@ -712,5 +712,28 @@ func TestAChatTakingARowOverDropsItsSecondAddress(t *testing.T) {
 		if kept := got.AltChatID != ""; kept != tc.keepAlt {
 			t.Errorf("%s: the second address is %q, want kept %v", tc.name, got.AltChatID, tc.keepAlt)
 		}
+	}
+}
+
+// A second address is recorded only while the row still carries the first address it was
+// checked against: another chat can take the row over under the same id in between.
+func TestASecondAddressIsNotRecordedOnARowAnotherChatTookOver(t *testing.T) {
+	t.Parallel()
+	container := open(t)
+	device := pair(t, container, "sid-1", "5511999990001")
+
+	taken := samplePart("sid-1", "3EB0RACED")
+	taken.ChatID = "5511999990003"
+	if err := container.For("sid-1").PutMediaPart(t.Context(), &taken, storedAt); err != nil {
+		t.Fatalf("PutMediaPart: %v", err)
+	}
+	// Checked against 5511999990002, which the row no longer carries.
+	alt := samplePart("sid-1", "3EB0RACED")
+	alt.AltChatKind, alt.AltChatID = "lid", "123456789012345"
+	if err := container.For("sid-1").KeepMediaPart(t.Context(), &alt, device.String(), storedAt.Add(time.Minute)); err != nil {
+		t.Fatalf("KeepMediaPart: %v", err)
+	}
+	if got, _, _ := container.For("sid-1").MediaPart(t.Context(), "3EB0RACED"); got.AltChatID != "" {
+		t.Fatalf("a second address checked against another chat was recorded: %q", got.AltChatID)
 	}
 }
