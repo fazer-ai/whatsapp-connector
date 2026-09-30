@@ -828,12 +828,16 @@ func (c *Container) migrate(ctx context.Context) error {
 	// row nobody has written since -- which is true, and is the only thing a caller
 	// comparing against it needs.
 	//
+	// `alt_chat_kind` and `alt_chat_id` default to empty, a row published under one address
+	// only, which is every row written before a history dump could name a chat again.
+	//
 	// `blob_id` defaults to empty, which is a row with no file kept for it on this
 	// instance's disk. That is what every row in an upgrading deployment is, because the
 	// blobs predate the column that would have named them, and it is also what a row
 	// whose blob has been swept comes back to.
 	//
-	// Those two are the columns a fresh store does not have either, on purpose: the
+	// `rev`, `blob_id` and the two `alt_chat_` columns are ones a fresh store does not have
+	// either, on purpose: the
 	// default belongs in one place, and this is the place that has to have it right for
 	// the store that already has rows.
 	for _, column := range []struct{ table, name, definition string }{
@@ -842,6 +846,8 @@ func (c *Container) migrate(ctx context.Context) error {
 		{"wac_media_part", "from_me", "BIGINT NOT NULL DEFAULT 0"},
 		{"wac_media_part", "blob_id", "TEXT NOT NULL DEFAULT ''"},
 		{"wac_media_part", "rev", "BIGINT NOT NULL DEFAULT 0"},
+		{"wac_media_part", "alt_chat_kind", "TEXT NOT NULL DEFAULT ''"},
+		{"wac_media_part", "alt_chat_id", "TEXT NOT NULL DEFAULT ''"},
 		{"wac_session_desired", "wants_groups", "BIGINT NOT NULL DEFAULT 0"},
 		{"wac_session_desired", "wants_call_auto_reject", "BIGINT NOT NULL DEFAULT 0"},
 		{"wac_session_desired", "wants_proxy", "TEXT NOT NULL DEFAULT ''"},

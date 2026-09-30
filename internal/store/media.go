@@ -31,6 +31,14 @@ type MediaPart struct {
 	// for it, and refuse rather than hand over somebody else's file.
 	ChatKind string
 	ChatID   string
+
+	// AltChatKind and AltChatID are the other address the message was published under, when
+	// a history dump named its chat differently from the first publication: the number the
+	// live message went out under, and the LID the dump carries. A client asking for the
+	// file under either is asking about the same conversation, and the in-memory pairing
+	// that would say so does not survive a restart or a handoff. Empty when there is none.
+	AltChatKind string
+	AltChatID   string
 	// Kind is the contract's media kind, and it decides which of whatsmeow's message
 	// types the download is rebuilt as, which is how whatsmeow knows the media type.
 	Kind string
@@ -150,7 +158,8 @@ func (c *Container) putMediaPart(ctx context.Context, part *MediaPart, now time.
 }
 
 // keepMediaPart writes a row only where the message has none, and otherwise only renews
-// how long the row is kept.
+// how long the row is kept and, when the dump names the chat differently, records that
+// address beside the first one.
 //
 // For a message that arrives a second time, out of a history dump: what was kept the
 // first time may name the file on this instance's disk, and the dump's copy cannot. The
@@ -172,7 +181,13 @@ func (c *Container) keepMediaPart(ctx context.Context, part *MediaPart, device s
 			 receipt_chat, sender, from_me, blob_id, stored_at)
 		SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
 		WHERE EXISTS (SELECT 1 FROM wac_session_device WHERE sid = ? AND jid = ?)
-		ON CONFLICT (sid, message_id) DO UPDATE SET stored_at = excluded.stored_at
+		ON CONFLICT (sid, message_id) DO UPDATE SET stored_at = excluded.stored_at,
+			alt_chat_kind = CASE
+				WHEN wac_media_part.chat_kind <> excluded.chat_kind OR wac_media_part.chat_id <> excluded.chat_id
+				THEN excluded.chat_kind ELSE wac_media_part.alt_chat_kind END,
+			alt_chat_id = CASE
+				WHEN wac_media_part.chat_kind <> excluded.chat_kind OR wac_media_part.chat_id <> excluded.chat_id
+				THEN excluded.chat_id ELSE wac_media_part.alt_chat_id END
 		WHERE excluded.stored_at > wac_media_part.stored_at`
 	_, err := c.db.ExecContext(ctx, c.rebind(insert),
 		part.SID, part.MessageID, part.ChatKind, part.ChatID, part.Kind, part.DirectPath,
@@ -190,15 +205,16 @@ func (c *Container) keepMediaPart(ctx context.Context, part *MediaPart, device s
 // for it at all.
 func (c *Container) mediaPart(ctx context.Context, sid, messageID string) (MediaPart, bool, error) {
 	const query = `
-		SELECT chat_kind, chat_id, kind, direct_path, media_key, file_enc_sha256, file_sha256,
-		       file_length, mime, filename, receipt_chat, sender, from_me, blob_id, rev, stored_at
+		SELECT chat_kind, chat_id, alt_chat_kind, alt_chat_id, kind, direct_path, media_key,
+		       file_enc_sha256, file_sha256, file_length, mime, filename, receipt_chat, sender,
+		       from_me, blob_id, rev, stored_at
 		FROM wac_media_part WHERE sid = ? AND message_id = ?`
 
 	part := MediaPart{SID: sid, MessageID: messageID}
 	var key, encDigest, digest string
 	var fromMe int64
 	err := c.db.QueryRowContext(ctx, c.rebind(query), sid, messageID).Scan(
-		&part.ChatKind, &part.ChatID,
+		&part.ChatKind, &part.ChatID, &part.AltChatKind, &part.AltChatID,
 		&part.Kind, &part.DirectPath, &key, &encDigest, &digest,
 		&part.FileLength, &part.Mime, &part.Filename,
 		&part.ReceiptChat, &part.Sender, &fromMe, &part.BlobID, &part.Rev, &part.StoredAt)

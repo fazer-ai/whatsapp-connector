@@ -635,7 +635,8 @@ func (s *Session) downloadMedia(ctx context.Context, command *protocol.Command) 
 			"nothing is kept for that message to fetch its file with")
 	}
 
-	if body.Chat != nil && !s.sameChat(*body.Chat, protocol.Address{Kind: protocol.AddressKind(kept.ChatKind), ID: kept.ChatID}) {
+	if body.Chat != nil && !s.sameChat(*body.Chat, protocol.Address{Kind: protocol.AddressKind(kept.ChatKind), ID: kept.ChatID}) &&
+		(kept.AltChatID == "" || !s.sameChat(*body.Chat, protocol.Address{Kind: protocol.AddressKind(kept.AltChatKind), ID: kept.AltChatID})) {
 		// A message id is the sender's to choose, so two chats under one account can
 		// carry the same one and the second row replaces the first. Vanishingly rare and
 		// the client keys by message id too, so it is not a case this can resolve -- but

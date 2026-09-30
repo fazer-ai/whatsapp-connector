@@ -2002,3 +2002,32 @@ func TestASliceIsAskedAtTheWriteWhetherTheAccountIsStillTheSame(t *testing.T) {
 	}
 	emission.Settle(nil)
 }
+
+// The pairing that says a number and a LID are one chat lives in memory, and a restart or a
+// handoff starts without it. A file a dump published under the LID is still served under the
+// LID from the address the row kept.
+func TestAFileADumpPublishedUnderItsLIDIsServedAfterTheAliasesAreGone(t *testing.T) {
+	t.Parallel()
+
+	session, downloads := mediaSession(t, media.Options{})
+	downloads.answer([]byte("os mesmos bytes"), nil)
+	connect(session)
+	event := imageEvent("3EB0NOALIAS")
+	if _, acknowledged := deliver(t, session, event, 1); !acknowledged {
+		t.Fatal("a media message with a file was left unacknowledged")
+	}
+	kept, found, err := session.store.MediaPart(t.Context(), "3EB0NOALIAS")
+	if err != nil || !found {
+		t.Fatalf("MediaPart: found %v, err %v", found, err)
+	}
+	// The dump names the chat by its LID, with nothing in memory pairing the two.
+	dumped := kept
+	dumped.ChatKind, dumped.ChatID = string(protocol.AddressLID), "167392323834055"
+	if err := session.store.KeepMediaPart(t.Context(), &dumped, deviceOf(session.current()), time.Now()); err != nil {
+		t.Fatalf("KeepMediaPart: %v", err)
+	}
+
+	if ref := refetch(t, session, "3EB0NOALIAS", &protocol.Address{Kind: protocol.AddressLID, ID: "167392323834055"}); ref.ID == "" {
+		t.Fatal("a download naming the LID the dump published the file under was not served")
+	}
+}
