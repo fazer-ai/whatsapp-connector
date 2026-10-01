@@ -86,6 +86,10 @@ type Manager struct {
 	orphanMu sync.Mutex
 	orphans  map[string]bool
 
+	// stopsInFlight are the stale sessions StopStale is still taking down. They are out of
+	// the map already, so StopAll waits on this rather than finding them there.
+	stopsInFlight sync.WaitGroup
+
 	// adoptedForDelete are the accounts this instance opened in order to serve a
 	// `session.delete` that has not been carried out yet, and the number of commands the
 	// session had answered when the teardown was queued. An entry is the connector saying
@@ -1843,7 +1847,9 @@ func (m *Manager) StopStale() time.Duration {
 			m.orphans[sid] = false
 		}
 		m.orphanMu.Unlock()
+		m.stopsInFlight.Add(1)
 		go func() {
+			defer m.stopsInFlight.Done()
 			defer m.dropHanding(sid)
 			session.Stop()
 		}()
@@ -1933,6 +1939,12 @@ func (m *Manager) StopAll(ctx context.Context) {
 	for _, sid := range sids {
 		m.abandon(ctx, sid)
 	}
+	// The sessions the lease watcher was taking down are out of the map, so nothing above
+	// reached them. Their stops finish here, before the caller closes the Redis and the
+	// store a command being finished is still writing to, and their leases go back with
+	// the rest.
+	m.stopsInFlight.Wait()
+	m.releaseOrphans(ctx)
 }
 
 // roomToMark splits a shutdown's list into the leases worth marking before their stops

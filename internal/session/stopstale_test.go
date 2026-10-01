@@ -352,3 +352,62 @@ func TestOneSessionSlowToDrainDoesNotKeepTheOtherStaleSessionsOpen(t *testing.T)
 		time.Sleep(testwait.Poll)
 	}
 }
+
+// A shutdown that lands while a stale session is still draining waits for it. The
+// session is out of the map by then, so StopAll would otherwise return with it still
+// finishing a command, and the caller would close the Redis and the store under it.
+func TestStopAllWaitsForAStaleSessionStillComingDown(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	clock := &steppingClock{now: time.Now()}
+	replies := &gatedReplier{entered: make(chan struct{}), gate: make(chan struct{})}
+	manager := session.NewManager(&session.ManagerConfig{
+		Instance: "inst-a", Engine: fake.New(),
+		Leases:    cluster.NewLeases(redisx.Wrap(rdb, "wa:", 8), "inst-a", cluster.Options{Clock: clock}),
+		Publisher: newRecorder(), Replier: replies,
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	answering, stopAnswering := context.WithCancel(context.Background())
+	answered := manager.Answer(answering)
+	var release sync.Once
+	open := func() { release.Do(func() { close(replies.gate) }) }
+	t.Cleanup(func() { open(); stopAnswering(); <-answered })
+
+	ctx := context.Background()
+	if _, err := manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	manager.Dispatch(&transport.Delivery{
+		Command: protocol.Command{V: protocol.Version, ID: "c1", Type: protocol.CommandSessionStatus, SID: "s1", ReplyTo: "wa:reply:1"},
+		Ack:     func(context.Context) error { return nil },
+		Release: func() {},
+	})
+	<-replies.entered
+
+	clock.step(cluster.DefaultTTL)
+	manager.StopStale()
+
+	stopped := make(chan struct{})
+	go func() {
+		manager.StopAll(ctx)
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+		t.Fatal("StopAll returned while a stale session was still finishing a command")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	open()
+	select {
+	case <-stopped:
+	case <-time.After(testwait.Budget):
+		t.Fatal("StopAll never returned after the stale session finished")
+	}
+	if server.Exists("wa:lease:s1") {
+		t.Fatal("the stale session's lease was not handed back by the shutdown")
+	}
+}
