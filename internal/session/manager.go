@@ -711,6 +711,12 @@ func (m *Manager) handingBack(sid string) bool {
 	return queued
 }
 
+// HandingBack reports whether this instance still has the lease of an account it stopped
+// queued to be given back. An adoption of that account is refused until the hand-back has
+// run, so a caller about to spend something on one -- the resume sweep's fleet-wide turn --
+// asks first.
+func (m *Manager) HandingBack(sid string) bool { return m.handingBack(sid) }
+
 func (m *Manager) forgetOrphan(sid string) {
 	m.orphanMu.Lock()
 	delete(m.orphans, sid)

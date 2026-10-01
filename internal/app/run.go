@@ -725,6 +725,14 @@ func (c *Connector) resumeOnce(ctx context.Context) {
 		if asked >= resumeBatch {
 			return
 		}
+		if c.manager.HandingBack(sid) {
+			// This instance stopped the account and its lease is still queued to go back,
+			// which the next tick does. An adoption is refused until then, and the turn
+			// taken for it would hold every instance off the account for a whole cool-off:
+			// measured after a Redis outage, the account came back 70 s after Redis did
+			// instead of on the next pass (#353). Left for that pass, turn untaken.
+			continue
+		}
 		// The mark is taken before the attempt, and taking it is what wins the turn: two
 		// instances reading the same free account in the same second would otherwise both
 		// adopt, and the loser's adoption is an account handed straight back.

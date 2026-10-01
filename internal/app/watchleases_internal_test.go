@@ -101,3 +101,61 @@ func TestTheLeaseWatcherReturnsWhenItsContextEnds(t *testing.T) {
 		t.Fatal("the lease watcher did not return after its context ended")
 	}
 }
+
+// An account the lease watcher stopped is queued to be handed back, and the hand-back runs
+// on the tick. A resume pass that lands first -- both wake up when Redis answers again --
+// must not spend the fleet-wide turn on it: the adoption is refused while the hand-back is
+// pending, and the turn would then keep every instance off the account for a whole
+// cool-off. Measured on the bench at 70 s after Redis came back (#353).
+func TestTheResumeSweepDoesNotSpendItsTurnOnAnAccountStillBeingHandedBack(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := redisx.Wrap(rdb, "wa:", DefaultEventShards)
+	clock := &leaseClock{now: time.Now()}
+	leases := cluster.NewLeases(client, "inst-a", cluster.Options{Clock: clock})
+	engine := fake.New()
+	quarantine := cluster.NewQuarantine(client, nil)
+	manager := session.NewManager(&session.ManagerConfig{
+		Instance: "inst-a", Engine: engine, Leases: leases,
+		Publisher: quietPublisher{}, Replier: quietReplier{}, Quarantine: quarantine,
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	t.Cleanup(func() { manager.StopAll(context.Background()) })
+	answering(t, manager)
+	container := openTestStore(t)
+	connector := &Connector{
+		metrics: observability.New(), cfg: Config{Instance: "inst-a"}, log: zerolog.Nop(),
+		client: client, leases: leases, quarantine: quarantine, manager: manager, store: container,
+	}
+	wantConnected(t, container, "sid-1", "5511999990001", false)
+
+	ctx := context.Background()
+	if _, err := manager.Adopt(ctx, "sid-1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	// The lease runs out on this instance's clock, the watcher stops the session, and the
+	// key has meanwhile expired in Redis -- the shape a long outage leaves.
+	clock.step(cluster.DefaultTTL)
+	manager.StopStale()
+	keys := redisx.NewKeys("wa:", 0)
+	server.Del(keys.Lease("sid-1"))
+	if !manager.HandingBack("sid-1") {
+		t.Fatal("the stopped account is not queued to be handed back, so this test would not see the case")
+	}
+
+	connector.resumeOnce(t.Context())
+	if server.Exists(keys.Resume("sid-1")) {
+		t.Fatal("the sweep took the fleet's turn on an account this instance is still handing back")
+	}
+
+	// The tick hands it back, and the next pass brings it up.
+	manager.RenewAll(ctx, manager.HandBackBy())
+	if manager.HandingBack("sid-1") {
+		t.Fatal("the tick did not hand the account back")
+	}
+	connector.resumeOnce(t.Context())
+	waitFor(t, "the account to come back on the next pass", func() bool { return manager.Count() == 1 })
+}
