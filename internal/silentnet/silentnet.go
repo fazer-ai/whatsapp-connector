@@ -6,6 +6,7 @@
 package silentnet
 
 import (
+	"context"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -16,6 +17,7 @@ import (
 type Relay struct {
 	listener net.Listener
 	target   string
+	dialer   net.Dialer
 	muted    atomic.Bool
 	wg       sync.WaitGroup
 
@@ -26,7 +28,8 @@ type Relay struct {
 // New starts a relay to target, closed when the test ends.
 func New(t *testing.T, target string) *Relay {
 	t.Helper()
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	var config net.ListenConfig
+	listener, err := config.Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("silentnet: listen: %v", err)
 	}
@@ -72,7 +75,9 @@ func (r *Relay) accept() {
 		if err != nil {
 			return
 		}
-		out, err := net.Dial("tcp", r.target)
+		// Not tied to the test's context: the relay outlives the parts of a test that
+		// finish before its cleanup, and it is torn down by closing the listener.
+		out, err := r.dialer.DialContext(context.Background(), "tcp", r.target)
 		if err != nil {
 			_ = in.Close()
 			continue
