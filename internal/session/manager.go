@@ -1789,6 +1789,45 @@ func (m *Manager) RenewAll(ctx context.Context, by time.Time) {
 	m.releaseOrphans(window)
 }
 
+// StopStale stops every running session whose lease this instance can no longer act on,
+// without asking Redis anything, and says how long until the next one would be.
+//
+// RenewAll does the same for a renewal that comes back refused, and that is the
+// trouble: it needs the answer. With Redis not answering, the renewal and everything
+// else on the tick wait out the client's timeouts and retries, and the answer that
+// would have said "stale" arrives with Redis itself. Meanwhile the store has refused
+// every write since the lease ran out -- it asks Owned, which is local -- while the
+// socket stays open, so whatsmeow cannot save the Signal state a message needs to be
+// decrypted, gives up on it, and WhatsApp counts it delivered (#353). The moment the
+// lease runs out is already known here, so the socket comes down at that moment, on a
+// goroutine nothing on Redis can hold.
+//
+// The lease is not handed back here: that is a round trip, and this exists for when
+// round trips do not come back. It is queued for the tick, which releases it once
+// Redis answers again.
+func (m *Manager) StopStale() time.Duration {
+	next := m.leases.TTL()
+	for sid, running := range m.running() {
+		if left := m.leases.Freshness(sid); left > 0 {
+			next = min(next, left)
+			continue
+		}
+		session, still := m.drop(sid, running)
+		if !still {
+			continue
+		}
+		m.log.Warn().Str("sid", sid).Msg("a lease ran out before it could be renewed; stopping the session")
+		m.lostLease(sid, true)
+		session.Stop()
+		m.orphanMu.Lock()
+		if _, queued := m.orphans[sid]; !queued {
+			m.orphans[sid] = false
+		}
+		m.orphanMu.Unlock()
+	}
+	return next
+}
+
 // HandBackBy is the moment every hand-back in one tick has to be done by, counted from
 // the call rather than per pass.
 //

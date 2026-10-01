@@ -301,6 +301,12 @@ func (c *Connector) Run(ctx context.Context) error {
 	answering, stopAnswering := context.WithCancel(ctx)
 	answered := c.manager.Answer(answering)
 
+	// Off the loop, because the loop is what Redis can hold: every step of a tick waits
+	// on it, and a lease that runs out while one of them waits has to take its socket down
+	// anyway (#353).
+	watchingLeases, stopWatchingLeases := context.WithCancel(ctx)
+	watchedLeases := c.watchLeases(watchingLeases)
+
 	c.log.Info().
 		Str("addr", c.cfg.HTTPAddr).
 		Str("engine", c.cfg.Engine).
@@ -323,6 +329,10 @@ func (c *Connector) Run(ctx context.Context) error {
 	// would adopt a session back onto an instance that is going away.
 	stopAnswering()
 	<-answered
+
+	// Before the shutdown, which stops and hands back every session itself.
+	stopWatchingLeases()
+	<-watchedLeases
 
 	c.shutdown()
 	// After the loop, so the sweep is not walking a directory the shutdown is still
@@ -402,6 +412,31 @@ func (c *Connector) tick(ctx context.Context) time.Time {
 	c.metrics.SessionsRunning.Set(float64(c.manager.Count()))
 	c.forgetLabelsGoneQuiet(time.Now())
 	return due
+}
+
+// watchLeases stops each session at the moment its lease runs out, on a goroutine of its
+// own. The returned channel closes once it has stopped.
+//
+// It sleeps until the earliest lease is due rather than polling, so a session comes down
+// at its lease's end and not up to a period later. Capped at the heartbeat, because a
+// session adopted while it sleeps has a lease nobody measured yet; a fresh one has a
+// whole TTL left, and the heartbeat is shorter than that.
+func (c *Connector) watchLeases(ctx context.Context) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		wake := time.NewTimer(0)
+		defer wake.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-wake.C:
+				wake.Reset(min(c.manager.StopStale(), c.cfg.Heartbeat))
+			}
+		}
+	}()
+	return done
 }
 
 // serverEnded turns the HTTP server's exit into the loop's own result.
