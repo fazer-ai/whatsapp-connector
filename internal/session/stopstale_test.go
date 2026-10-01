@@ -358,6 +358,23 @@ func TestOneSessionSlowToDrainDoesNotKeepTheOtherStaleSessionsOpen(t *testing.T)
 // finishing a command, and the caller would close the Redis and the store under it.
 func TestStopAllWaitsForAStaleSessionStillComingDown(t *testing.T) {
 	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		// alsoEnding adopts a second session whose lease is too close to its end to mark,
+		// which is the path where StopAll returns from its loop early.
+		alsoEnding bool
+	}{
+		{"alone", false},
+		{"with another session too close to its end to mark", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			stopAllWaitsForAStaleSession(t, tc.alsoEnding)
+		})
+	}
+}
+
+func stopAllWaitsForAStaleSession(t *testing.T, alsoEnding bool) {
 
 	server := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
@@ -387,8 +404,21 @@ func TestStopAllWaitsForAStaleSessionStillComingDown(t *testing.T) {
 	})
 	<-replies.entered
 
-	clock.step(cluster.DefaultTTL)
+	if alsoEnding {
+		// s2 is adopted a second after s1, so when s1's lease is spent s2 has a second
+		// left: less than a mark needs.
+		clock.step(time.Second)
+		if _, err := manager.Adopt(ctx, "s2"); err != nil {
+			t.Fatalf("Adopt(s2): %v", err)
+		}
+		clock.step(cluster.DefaultTTL - cluster.DefaultRenewMargin - time.Second)
+	} else {
+		clock.step(cluster.DefaultTTL)
+	}
 	manager.StopStale()
+	if got := manager.Count(); alsoEnding && got != 1 {
+		t.Fatalf("running %d sessions after the stale one was stopped, want s2 still up", got)
+	}
 
 	stopped := make(chan struct{})
 	go func() {

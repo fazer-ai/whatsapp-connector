@@ -1886,6 +1886,16 @@ const ReleaseShare = 3
 // exits: a released lease is one a peer can take immediately instead of waiting a full
 // TTL for it to expire.
 func (m *Manager) StopAll(ctx context.Context) {
+	// Deferred, because the stops below have a way out before their end: a run where every
+	// session left is too close to its lease's end to mark returns from the loop. The
+	// sessions the lease watcher was taking down are out of the map, so nothing below
+	// reaches them. Their stops finish here, before the caller closes the Redis and the
+	// store a command being finished is still writing to, and their leases go back with
+	// the rest.
+	defer func() {
+		m.stopsInFlight.Wait()
+		m.releaseOrphans(ctx)
+	}()
 	sids := m.SIDs()
 	// All of them in one round trip, ahead of every stop, and this is the shape rather
 	// than a mark per Release because the releases are serial: a Redis that answers
@@ -1939,12 +1949,6 @@ func (m *Manager) StopAll(ctx context.Context) {
 	for _, sid := range sids {
 		m.abandon(ctx, sid)
 	}
-	// The sessions the lease watcher was taking down are out of the map, so nothing above
-	// reached them. Their stops finish here, before the caller closes the Redis and the
-	// store a command being finished is still writing to, and their leases go back with
-	// the rest.
-	m.stopsInFlight.Wait()
-	m.releaseOrphans(ctx)
 }
 
 // roomToMark splits a shutdown's list into the leases worth marking before their stops
