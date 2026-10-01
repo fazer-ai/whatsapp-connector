@@ -68,17 +68,21 @@ func TestTheLeaseWatcherStopsASessionWhoseLeaseRanOutWithNoTick(t *testing.T) {
 	watched := connector.watchLeases(ctx)
 	t.Cleanup(func() { cancel(); <-watched })
 
-	// Fresh: nothing to stop, for several of the watcher's wakes.
-	time.Sleep(50 * time.Millisecond)
+	// The watcher is the only writer of the gauge here, so the gauge reading 1 is a pass
+	// that has completed: waited for, not slept through.
+	deadline := time.Now().Add(testwait.Budget)
+	for gathered(t, connector, "wac_sessions_running") != 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("the watcher never reported the session it found fresh")
+		}
+		time.Sleep(testwait.Poll)
+	}
 	if got := manager.Count(); got != 1 {
 		t.Fatalf("the watcher stopped a session whose lease is fresh (running %d)", got)
 	}
-	if got := gathered(t, connector, "wac_sessions_running"); got != 1 {
-		t.Fatalf("wac_sessions_running = %v before anything stopped, want 1", got)
-	}
 
 	clock.step(cluster.DefaultTTL)
-	deadline := time.Now().Add(testwait.Budget)
+	deadline = time.Now().Add(testwait.Budget)
 	for manager.Count() != 0 {
 		if time.Now().After(deadline) {
 			t.Fatal("the watcher never stopped a session whose lease ran out")
