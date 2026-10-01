@@ -433,6 +433,10 @@ func (c *Connector) watchLeases(ctx context.Context) <-chan struct{} {
 				return
 			case <-wake.C:
 				wake.Reset(min(c.manager.StopStale(), c.cfg.Heartbeat))
+				// Here as well as on the tick, which is what Redis is holding: a session
+				// this stopped would otherwise still count as running for as long as the
+				// tick is stuck, on the one metric an operator reads during the outage.
+				c.metrics.SessionsRunning.Set(float64(c.manager.Count()))
 			}
 		}
 	}()

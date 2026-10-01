@@ -73,12 +73,24 @@ func TestTheLeaseWatcherStopsASessionWhoseLeaseRanOutWithNoTick(t *testing.T) {
 	if got := manager.Count(); got != 1 {
 		t.Fatalf("the watcher stopped a session whose lease is fresh (running %d)", got)
 	}
+	if got := gathered(t, connector, "wac_sessions_running"); got != 1 {
+		t.Fatalf("wac_sessions_running = %v before anything stopped, want 1", got)
+	}
 
 	clock.step(cluster.DefaultTTL)
 	deadline := time.Now().Add(testwait.Budget)
 	for manager.Count() != 0 {
 		if time.Now().After(deadline) {
 			t.Fatal("the watcher never stopped a session whose lease ran out")
+		}
+		time.Sleep(testwait.Poll)
+	}
+	// And says so, with no tick to do it: the gauge is what an operator reads during the
+	// outage that stopped the tick.
+	deadline = time.Now().Add(testwait.Budget)
+	for gathered(t, connector, "wac_sessions_running") != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("wac_sessions_running still counts a session the watcher stopped")
 		}
 		time.Sleep(testwait.Poll)
 	}
