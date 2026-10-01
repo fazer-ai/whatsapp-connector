@@ -18,6 +18,8 @@ import (
 	"github.com/fazer-ai/whatsapp-connector/internal/redisx"
 	"github.com/fazer-ai/whatsapp-connector/internal/session"
 	"github.com/fazer-ai/whatsapp-connector/internal/silentnet"
+	"github.com/fazer-ai/whatsapp-connector/internal/testwait"
+	"github.com/fazer-ai/whatsapp-connector/internal/transport"
 )
 
 // staleSetup is one adopted session on inst-a, whose Redis can be muted and whose lease
@@ -41,6 +43,33 @@ func (w *lostWatch) seen() []string {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return append([]string(nil), w.lost...)
+}
+
+// disconnected waits for a fake session to lose its socket: StopStale takes each stale
+// session down on a goroutine of its own, so the close lands just after it returns.
+func disconnected(t *testing.T, engineSession *fake.Session, what string) {
+	t.Helper()
+	deadline := time.Now().Add(testwait.Budget)
+	for engineSession.Connected() {
+		if time.Now().After(deadline) {
+			t.Fatal(what)
+		}
+		time.Sleep(testwait.Poll)
+	}
+}
+
+// handedBack runs ticks until the lease key is gone. The hand-back waits for the stop it
+// follows, which runs on its own goroutine, so the first tick may find it not done yet.
+func handedBack(t *testing.T, s *staleSetup, key string) {
+	t.Helper()
+	deadline := time.Now().Add(testwait.Budget)
+	for s.server.Exists(key) {
+		if time.Now().After(deadline) {
+			t.Fatalf("%s was never handed back", key)
+		}
+		s.manager.RenewAll(context.Background(), s.manager.HandBackBy())
+		time.Sleep(testwait.Poll)
+	}
 }
 
 type staleSetup struct {
@@ -112,9 +141,7 @@ func TestStopStaleTakesASessionDownWhenItsLeaseRunsOutWhileRedisIsSilent(t *test
 		t.Fatalf("the manager still runs %d sessions on a lease that ran out", got)
 	}
 	engineSession, _ := s.engine.Session("s1")
-	if engineSession.Connected() {
-		t.Fatal("the engine session is still connected on a lease that ran out")
-	}
+	disconnected(t, engineSession, "the engine session is still connected on a lease that ran out")
 	// Counted, like every other lease this instance gives up: an operator reading
 	// wac_leases_lost_total during a Redis outage would otherwise see nothing lost.
 	if got := s.watch.seen(); len(got) != 1 || got[0] != "s1" {
@@ -153,11 +180,7 @@ func TestALeaseStoppedOnItsOwnClockIsHandedBackByTheNextTick(t *testing.T) {
 		t.Fatal("the key is already gone, so this test would not see a hand-back")
 	}
 
-	s.manager.RenewAll(context.Background(), s.manager.HandBackBy())
-
-	if s.server.Exists("wa:lease:s1") {
-		t.Fatal("the lease of a session stopped on its own clock was not handed back by the tick")
-	}
+	handedBack(t, s, "wa:lease:s1")
 }
 
 // Two instances: inst-a's socket has to be down before inst-b can take the account, and
@@ -181,9 +204,7 @@ func TestAPeerNeverTakesAnAccountWhileTheSilentOwnerStillHoldsTheSocket(t *testi
 	}
 	s.manager.StopStale()
 	engineSession, _ := s.engine.Session("s1")
-	if engineSession.Connected() {
-		t.Fatal("inst-a still holds the socket at the end of its lease")
-	}
+	disconnected(t, engineSession, "inst-a still holds the socket at the end of its lease")
 
 	// Now the key runs out in Redis, and the peer is free to take it.
 	s.server.FastForward(cluster.DefaultTTL)
@@ -247,5 +268,87 @@ func TestStopStaleLeavesASessionSomethingElseStoppedFirst(t *testing.T) {
 	}
 	if got := manager.Count(); got != 0 {
 		t.Fatalf("running %d sessions, want 0", got)
+	}
+}
+
+// One stale session that is slow to drain does not keep the others open. Stop closes the
+// socket and then waits for the session's goroutines, and a command being answered is one
+// of the things it waits for; stopped one after another, the first session's answer would
+// hold every other stale socket on the instance past its lease.
+//
+// And the slow one's lease is not handed back while it is still coming down: the hand-back
+// is what lets a peer take the account, and the socket being closed is not the session
+// being done.
+func TestOneSessionSlowToDrainDoesNotKeepTheOtherStaleSessionsOpen(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	clock := &steppingClock{now: time.Now()}
+	replies := &gatedReplier{entered: make(chan struct{}), gate: make(chan struct{})}
+	fakeEngine := fake.New()
+	manager := session.NewManager(&session.ManagerConfig{
+		Instance: "inst-a", Engine: fakeEngine,
+		Leases:    cluster.NewLeases(redisx.Wrap(rdb, "wa:", 8), "inst-a", cluster.Options{Clock: clock}),
+		Publisher: newRecorder(), Replier: replies,
+		NewID: func() string { return "evt" }, Logger: zerolog.Nop(),
+	})
+	answering, stopAnswering := context.WithCancel(context.Background())
+	answered := manager.Answer(answering)
+	var release sync.Once
+	open := func() { release.Do(func() { close(replies.gate) }) }
+	// A failure below must not leave the answer gated, or the cleanup waits on it forever.
+	t.Cleanup(func() { open(); stopAnswering(); <-answered })
+
+	ctx := context.Background()
+	sockets := map[string]*fake.Session{}
+	for _, sid := range []string{"s1", "s2"} {
+		if _, err := manager.Adopt(ctx, sid); err != nil {
+			t.Fatalf("Adopt(%s): %v", sid, err)
+		}
+		socket, _ := fakeEngine.Session(sid)
+		if err := socket.Connect(ctx, engine.ConnectRequest{Pairing: "resume"}); err != nil {
+			t.Fatalf("Connect(%s): %v", sid, err)
+		}
+		sockets[sid] = socket
+	}
+
+	// s1 is in the middle of answering a command, and stays there until the test says so.
+	manager.Dispatch(&transport.Delivery{
+		Command: protocol.Command{V: protocol.Version, ID: "c1", Type: protocol.CommandSessionStatus, SID: "s1", ReplyTo: "wa:reply:1"},
+		Ack:     func(context.Context) error { return nil },
+		Release: func() {},
+	})
+	<-replies.entered
+
+	clock.step(cluster.DefaultTTL)
+	returned := make(chan struct{})
+	go func() {
+		manager.StopStale()
+		close(returned)
+	}()
+	select {
+	case <-returned:
+	case <-time.After(time.Second):
+		t.Fatal("StopStale waited on a session that was still answering a command")
+	}
+	disconnected(t, sockets["s2"], "s2 is still connected while s1 drains: one slow session held the others open")
+	disconnected(t, sockets["s1"], "s1 kept its socket while it drained: closing it does not have to wait for the answer")
+
+	// s1 is still answering, so its stop has not finished: its lease stays where it is.
+	manager.RenewAll(ctx, manager.HandBackBy())
+	if !server.Exists("wa:lease:s1") {
+		t.Fatal("s1's lease was handed back while s1 was still coming down")
+	}
+
+	open()
+	deadline := time.Now().Add(testwait.Budget)
+	for server.Exists("wa:lease:s1") || server.Exists("wa:lease:s2") {
+		if time.Now().After(deadline) {
+			t.Fatal("the leases were not handed back once the sessions had stopped")
+		}
+		manager.RenewAll(ctx, manager.HandBackBy())
+		time.Sleep(testwait.Poll)
 	}
 }

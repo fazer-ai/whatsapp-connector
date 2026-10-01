@@ -1811,6 +1811,13 @@ func (m *Manager) RenewAll(ctx context.Context, by time.Time) {
 // The lease is not handed back here: that is a round trip, and this exists for when
 // round trips do not come back. It is queued for the tick, which releases it once
 // Redis answers again.
+//
+// Each session is stopped on a goroutine of its own. Stop closes the socket and then
+// waits for the session to drain -- a publish in flight, a command being answered -- and
+// waited for here, one session draining would keep every other stale socket on this
+// instance open past its lease. The account stays marked as being handed back until its
+// own stop has finished, which is what keeps an adoption and the tick's release off a
+// socket that is still coming down.
 func (m *Manager) StopStale() time.Duration {
 	next := m.leases.TTL()
 	for sid, running := range m.running() {
@@ -1818,21 +1825,35 @@ func (m *Manager) StopStale() time.Duration {
 			next = min(next, left)
 			continue
 		}
+		if !m.tryHoldHanding(sid) {
+			// Something else is acting on this account this instant: an adoption checking
+			// it, a hand-back in flight. Asked again shortly rather than at the next lease.
+			next = min(next, staleRetry)
+			continue
+		}
 		session, still := m.drop(sid, running)
 		if !still {
+			m.dropHanding(sid)
 			continue
 		}
 		m.log.Warn().Str("sid", sid).Msg("a lease ran out before it could be renewed; stopping the session")
 		m.lostLease(sid, true)
-		session.Stop()
 		m.orphanMu.Lock()
 		if _, queued := m.orphans[sid]; !queued {
 			m.orphans[sid] = false
 		}
 		m.orphanMu.Unlock()
+		go func() {
+			defer m.dropHanding(sid)
+			session.Stop()
+		}()
 	}
 	return next
 }
+
+// staleRetry is how soon StopStale looks again at a stale session it could not take
+// because something else held it.
+const staleRetry = 50 * time.Millisecond
 
 // HandBackBy is the moment every hand-back in one tick has to be done by, counted from
 // the call rather than per pass.

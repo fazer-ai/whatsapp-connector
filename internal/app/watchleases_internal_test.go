@@ -151,11 +151,11 @@ func TestTheResumeSweepDoesNotSpendItsTurnOnAnAccountStillBeingHandedBack(t *tes
 		t.Fatal("the sweep took the fleet's turn on an account this instance is still handing back")
 	}
 
-	// The tick hands it back, and the next pass brings it up.
-	manager.RenewAll(ctx, manager.HandBackBy())
-	if manager.HandingBack("sid-1") {
-		t.Fatal("the tick did not hand the account back")
-	}
+	// The tick hands it back once the stop has finished, and the next pass brings it up.
+	waitFor(t, "the tick to hand the account back", func() bool {
+		manager.RenewAll(ctx, manager.HandBackBy())
+		return !manager.HandingBack("sid-1")
+	})
 	connector.resumeOnce(t.Context())
 	waitFor(t, "the account to come back on the next pass", func() bool { return manager.Count() == 1 })
 }
