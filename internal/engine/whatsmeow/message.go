@@ -635,8 +635,11 @@ func stanzaOf(event *waEvents.Message) string {
 // succeeds after this gave up on it is delivered to the client and redelivered by
 // WhatsApp afterwards. Which is why the client deduplicates on the message id, and why
 // this way round is the right one — a duplicate is a nuisance, a lost message is not.
+//
+// Only for an event whose WhatsApp acknowledgement waits on the answer: a failure here is a
+// withheld acknowledgement, and WhatsApp sends that again only to a new connection.
 func (s *Session) deliver(eventType protocol.EventType, payload any, learned int64) bool {
-	return s.deliverUnless(eventType, payload, learned, "")
+	return s.deliverClaimed(eventType, payload, learned, nil, true)
 }
 
 // deliverUnless is deliver for an event to be dropped if the message named here has arrived
@@ -653,12 +656,25 @@ func (s *Session) deliverUnless(eventType protocol.EventType, payload any, learn
 	if unless != "" {
 		claim = func() bool { return s.commit(unless) }
 	}
-	return s.deliverClaimed(eventType, payload, learned, claim)
+	return s.deliverClaimed(eventType, payload, learned, claim, false)
 }
 
 // deliverClaimed is deliver for an event the publisher asks claim about at the last moment
 // before the write, dropping it when claim says no. A nil claim is no question at all.
-func (s *Session) deliverClaimed(eventType protocol.EventType, payload any, learned int64, claim func() bool) bool {
+//
+// withheld says a WhatsApp acknowledgement waits on the answer, so a failure leaves one
+// withheld and owes the redelivery that only a new connection brings. A placeholder and a
+// history slice have nothing at WhatsApp to send again -- the stanza was acknowledged
+// before they were made -- and retry on their own.
+func (s *Session) deliverClaimed(eventType protocol.EventType, payload any, learned int64, claim func() bool, withheld bool) bool {
+	// The connection this arrived on, read before anything waits: by the time a failure
+	// is known the socket may have been replaced, and that replacement is the redelivery.
+	on := s.transitions.Load()
+	owe := func() {
+		if withheld {
+			s.oweRedelivery(on)
+		}
+	}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		s.log.Error().Err(err).Str("type", string(eventType)).Msg("failed to render an event payload")
@@ -698,7 +714,7 @@ func (s *Session) deliverClaimed(eventType protocol.EventType, payload any, lear
 		s.noRoom(eventType)
 		s.log.Warn().Str("type", string(eventType)).Dur("waited", s.deliverWait).
 			Msg("withholding an acknowledgement for an event that could not be queued")
-		s.oweRedelivery()
+		owe()
 		return false
 	case <-s.done:
 		return false
@@ -709,7 +725,7 @@ func (s *Session) deliverClaimed(eventType protocol.EventType, payload any, lear
 		if err != nil {
 			s.log.Warn().Err(err).Str("type", string(eventType)).
 				Msg("withholding an acknowledgement for an event that was not published")
-			s.oweRedelivery()
+			owe()
 			return false
 		}
 		return true
@@ -722,7 +738,7 @@ func (s *Session) deliverClaimed(eventType protocol.EventType, payload any, lear
 			select {
 			case err := <-settled:
 				if err != nil {
-					s.oweRedelivery()
+					owe()
 				}
 			case <-s.done:
 			}

@@ -582,7 +582,7 @@ func (r *dumpRun) publishConversation(conversation *waHistorySync.Conversation) 
 		// Asked again where the slice is written, because the queue and the pump between
 		// here and the write are room enough for a logout and a new pairing: a slice
 		// published after them would carry the previous account's messages under the next.
-		if !s.deliverClaimed(protocol.EventHistorySync, slice, r.learned, r.stillTheAccount) {
+		if !s.deliverClaimed(protocol.EventHistorySync, slice, r.learned, r.stillTheAccount, false) {
 			return false
 		}
 		r.slices++

@@ -30,12 +30,17 @@ const reasonRedelivery = "redelivery"
 // stream takes a write again -- earlier, the redelivered message would only be withheld a
 // second time.
 //
-// Recorded against the connection it happened on, so a session that is off that socket by
-// the time the stream answers has nothing to take down: the connection it gets next is the
-// redelivery.
-func (s *Session) oweRedelivery() {
+// Recorded against the connection the message arrived on, read before the publish was
+// waited on: a failure that settles after the socket was replaced is about a connection
+// whose redelivery the replacement already was, and a session no longer on it has nothing
+// to take down.
+func (s *Session) oweRedelivery(on int64) {
 	s.mu.Lock()
-	s.redeliveryOn = s.transitions.Load()
+	if !s.connected || s.transitions.Load() != on {
+		s.mu.Unlock()
+		return
+	}
+	s.redeliveryOn = on
 	start := !s.redelivering
 	s.redelivering = true
 	s.mu.Unlock()
@@ -140,6 +145,9 @@ func (s *Session) redeliver() bool {
 	s.log.Warn().Msg("the stream takes writes again; taking the socket down so WhatsApp redelivers what was left unacknowledged")
 	client := s.current()
 	judged := s.setConnected(false)
+	s.mu.Lock()
+	s.redeliveryTakedown = judged
+	s.mu.Unlock()
 	s.setReconnecting(true, s.now())
 	s.announceDrop()
 	s.takeDownSoon(client, judged)

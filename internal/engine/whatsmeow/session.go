@@ -567,6 +567,9 @@ type Session struct {
 	// is already waiting for the stream to come back to take that connection down.
 	redeliveryOn int64
 	redelivering bool
+	// redeliveryTakedown is the connection count a redelivery took the socket down at, so
+	// a takedown of that one left waiting for a command can be told from a keepalive's.
+	redeliveryTakedown int64
 	// owed is a socket takedown the keepalive handler decided on and could not perform,
 	// because of the above. It runs when the command in flight is answered.
 	owed *owedReset
@@ -2891,6 +2894,12 @@ func (s *Session) cancelOwedReset() bool {
 		return false
 	}
 	superseded := s.owed.judged != s.transitions.Load()
+	if !superseded && s.owed.judged == s.redeliveryTakedown {
+		// Taken down for WhatsApp to send again what is unacknowledged, not because the
+		// socket stopped answering, so a ping coming back answers nothing about it: the
+		// takedown waits for its command like any other and then goes ahead.
+		return false
+	}
 	s.owed = nil
 	if superseded {
 		return false
