@@ -1,0 +1,236 @@
+package whatsmeow
+
+import (
+	"errors"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/fazer-ai/whatsapp-connector/internal/engine"
+	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
+)
+
+// redeliveringSession is a session on a socket, asking about the stream every few
+// milliseconds instead of every few seconds.
+func redeliveringSession(t *testing.T) (*Session, *syncBuffer) {
+	t.Helper()
+
+	session, written := newLoggedTestSession(t, "5511999990001")
+	session.redeliveryProbe = 5 * time.Millisecond
+	dialedAndConnected(session)
+	return session, written
+}
+
+// withheld hands the session one inbound message and fails its publish, which is the
+// acknowledgement WhatsApp only sends again on a new connection (#354).
+func withheld(t *testing.T, session *Session, id string) {
+	t.Helper()
+
+	acknowledged := make(chan bool, 1)
+	go func() { acknowledged <- session.receive(textMessage(id, "bom dia")) }()
+	emission := next(t, session)
+	if emission.Type != protocol.EventMessageReceived {
+		t.Fatalf("the message went out as %s", emission.Type)
+	}
+	emission.Settle(errors.New("redis is gone"))
+	if <-acknowledged {
+		t.Fatal("a message that was not published was acknowledged")
+	}
+}
+
+// state is what a session.state emission says.
+func state(t *testing.T, emission *engine.Emission) (string, string) {
+	t.Helper()
+
+	if emission.Type != protocol.EventSessionState {
+		t.Fatalf("expected a session.state, got %s", emission.Type)
+	}
+	published := decode(t, emission.Payload)
+	reason, _ := published["reason"].(string)
+	return published["state"].(string), reason
+}
+
+// quiet fails when the session publishes anything within a few probe intervals.
+func quiet(t *testing.T, session *Session, why string) {
+	t.Helper()
+
+	select {
+	case emission := <-session.Events():
+		t.Fatalf("%s, and the session published %s: %s", why, emission.Type, emission.Payload)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// The whole of the issue: an acknowledgement withheld because the stream failed is one
+// WhatsApp sends again only on a new connection, and with the lease still good nothing
+// else brings one. Once the stream takes a write again the session takes its own socket
+// down, so the redelivery comes now and not whenever the connection next drops.
+func TestAnAcknowledgementWithheldForAFailedPublishTakesTheSocketDownOnceTheStreamIsBack(t *testing.T) {
+	t.Parallel()
+
+	session, written := redeliveringSession(t)
+	withheld(t, session, "3EB0REDELIVER")
+
+	// The stream is still down: the session asks, hears no, and stays on its socket. A
+	// reconnect now would only withhold the redelivered message again.
+	probe := next(t, session)
+	if got, _ := state(t, probe); got != "open" {
+		t.Fatalf("the session asked about the stream with state %q, which is not what it is", got)
+	}
+	probe.Settle(errors.New("redis is still gone"))
+	if got := session.state(); got != "open" {
+		t.Fatalf("the session went %q while the stream was still down", got)
+	}
+
+	// And now it is back.
+	next(t, session).Settle(nil)
+	took, reason := state(t, next(t, session))
+	if took != "reconnecting" || reason != reasonRedelivery {
+		t.Fatalf("the session published %s (%s) once the stream was back, want reconnecting (%s)", took, reason, reasonRedelivery)
+	}
+	if got := session.state(); got != "reconnecting" {
+		t.Fatalf("the session reports %q while taking its own socket down", got)
+	}
+	if !strings.Contains(written.String(), "redelivers") {
+		t.Fatalf("the takedown is not in the log: %s", written.String())
+	}
+}
+
+// Several messages withheld through one outage are all redelivered by one new
+// connection, so one takedown answers all of them.
+func TestSeveralWithheldAcknowledgementsCostOneTakedown(t *testing.T) {
+	t.Parallel()
+
+	session, _ := redeliveringSession(t)
+	withheld(t, session, "3EB0FIRST")
+	withheld(t, session, "3EB0SECOND")
+
+	next(t, session).Settle(nil)
+	if took, _ := state(t, next(t, session)); took != "reconnecting" {
+		t.Fatalf("the session published %q once the stream was back", took)
+	}
+	quiet(t, session, "a second takedown followed the first")
+}
+
+// A connection that came and went since the acknowledgement was withheld has already had
+// the redelivery: WhatsApp sends what is unacknowledged to every new connection. Taking
+// that one down too is a reconnect for nothing.
+func TestAWithheldAcknowledgementANewConnectionAlreadyAnsweredIsLeftAlone(t *testing.T) {
+	t.Parallel()
+
+	session, _ := redeliveringSession(t)
+	session.redeliveryProbe = 50 * time.Millisecond
+	withheld(t, session, "3EB0OVERTAKEN")
+
+	session.setConnected(false)
+	session.setConnected(true)
+
+	quiet(t, session, "the session acted on a withheld acknowledgement a new connection already redelivered")
+	if got := session.state(); got != "open" {
+		t.Fatalf("the session went %q over a redelivery that already happened", got)
+	}
+}
+
+// Withheld for a reason that is not the stream -- something this build cannot publish at
+// all -- is a message a reconnect would only bring back to be withheld again.
+func TestAnAcknowledgementWithheldForAnythingButThePublishTakesNothingDown(t *testing.T) {
+	t.Parallel()
+
+	session, _ := redeliveringSession(t)
+	unpublishable := textMessage("", "sem id")
+	session.deliverWait = 50 * time.Millisecond
+	if session.receive(unpublishable) {
+		t.Fatal("the test needs a message this build cannot publish, and this one was acknowledged")
+	}
+	quiet(t, session, "a message withheld for a reason the stream has nothing to do with started a takedown")
+}
+
+// A publish that ran past deliverWait has no outcome yet when the acknowledgement is
+// withheld. If it lands after all, the message is on the stream and a redelivery would
+// only publish it a second time; if it fails, it is the case above.
+func TestAPublishThatOutlivedTheWaitDecidesAfterwards(t *testing.T) {
+	t.Parallel()
+
+	for _, outcome := range []struct {
+		name     string
+		err      error
+		takeDown bool
+	}{
+		{name: "landed", err: nil, takeDown: false},
+		{name: "failed", err: errors.New("redis is gone"), takeDown: true},
+	} {
+		t.Run(outcome.name, func(t *testing.T) {
+			t.Parallel()
+
+			session, _ := redeliveringSession(t)
+			session.deliverWait = 20 * time.Millisecond
+			acknowledged := make(chan bool, 1)
+			go func() { acknowledged <- session.receive(textMessage("3EB0SLOW", "bom dia")) }()
+			late := next(t, session)
+			if <-acknowledged {
+				t.Fatal("a message whose publish had not finished was acknowledged")
+			}
+			late.Settle(outcome.err)
+
+			if !outcome.takeDown {
+				quiet(t, session, "a message that did reach the stream started a takedown")
+				return
+			}
+			next(t, session).Settle(nil)
+			if took, _ := state(t, next(t, session)); took != "reconnecting" {
+				t.Fatalf("the session published %q once the stream was back", took)
+			}
+		})
+	}
+}
+
+// An inbox that stayed full for the whole wait never got the message into the queue, so
+// nothing will ever publish it and only a redelivery brings it back.
+func TestAnAcknowledgementWithheldForAFullInboxIsRedelivered(t *testing.T) {
+	t.Parallel()
+
+	session, written := redeliveringSession(t)
+	session.deliverWait = 20 * time.Millisecond
+	// The forwarder takes one emission out and then blocks handing it on, since nobody is
+	// reading: waited for, so the inbox filled after it stays full.
+	filler := pending{event: engine.Emission{Type: protocol.EventMessageReceived}}
+	session.inbox <- filler
+	waitUntil(t, "the forwarder to take the first emission", func() bool { return len(session.inbox) == 0 })
+	for len(session.inbox) < cap(session.inbox) {
+		session.inbox <- filler
+	}
+	if session.receive(textMessage("3EB0NOROOM", "bom dia")) {
+		t.Fatal("a message that never got into the queue was acknowledged")
+	}
+	if !strings.Contains(written.String(), "could not be queued") {
+		t.Fatalf("the message was not withheld for want of room, so this test is not about that: %s", written.String())
+	}
+
+	// Drain what filled it, and the probe follows.
+	for range cap(session.inbox) + 1 {
+		if emission := next(t, session); emission.Type != protocol.EventMessageReceived {
+			t.Fatalf("expected the fillers first, got %s", emission.Type)
+		}
+	}
+	next(t, session).Settle(nil)
+	if took, _ := state(t, next(t, session)); took != "reconnecting" {
+		t.Fatalf("the session published %q once the stream was back", took)
+	}
+}
+
+// The session going away ends the wait for the stream: nothing is left to take down.
+func TestTheWaitForTheStreamEndsWithTheSession(t *testing.T) {
+	t.Parallel()
+
+	session, _ := redeliveringSession(t)
+	withheld(t, session, "3EB0CLOSING")
+	next(t, session)
+	if err := session.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	// What would fail here is the race detector or a goroutine leak check, and a takedown
+	// running against a closed session; the state is the observable half.
+	if got := session.state(); got == "reconnecting" {
+		t.Fatal("a session that closed went on to take its socket down")
+	}
+}

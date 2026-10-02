@@ -698,6 +698,7 @@ func (s *Session) deliverClaimed(eventType protocol.EventType, payload any, lear
 		s.noRoom(eventType)
 		s.log.Warn().Str("type", string(eventType)).Dur("waited", s.deliverWait).
 			Msg("withholding an acknowledgement for an event that could not be queued")
+		s.oweRedelivery()
 		return false
 	case <-s.done:
 		return false
@@ -708,12 +709,24 @@ func (s *Session) deliverClaimed(eventType protocol.EventType, payload any, lear
 		if err != nil {
 			s.log.Warn().Err(err).Str("type", string(eventType)).
 				Msg("withholding an acknowledgement for an event that was not published")
+			s.oweRedelivery()
 			return false
 		}
 		return true
 	case <-timeout.C:
 		s.log.Warn().Str("type", string(eventType)).Dur("waited", s.deliverWait).
 			Msg("withholding an acknowledgement for an event that took too long to publish")
+		// Still in the pump, so how it ends is not known yet. One that lands is on the
+		// stream, and a redelivery would only publish it twice; one that fails is owed it.
+		go func() {
+			select {
+			case err := <-settled:
+				if err != nil {
+					s.oweRedelivery()
+				}
+			case <-s.done:
+			}
+		}()
 		return false
 	case <-s.done:
 		return false
