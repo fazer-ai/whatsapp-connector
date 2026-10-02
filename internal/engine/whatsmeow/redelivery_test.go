@@ -256,12 +256,14 @@ func TestAClosingSessionIsNotProbed(t *testing.T) {
 	session.mu.Lock()
 	session.closed = true
 	session.mu.Unlock()
+	// Put back before the cleanup that closes the session, which runs after this one: its
+	// Close returns early on a session marked closed and would leave the forwarder running.
+	t.Cleanup(func() {
+		session.mu.Lock()
+		session.closed = false
+		session.mu.Unlock()
+	})
 	quiet(t, session, "a session already closing restated its state to ask about the stream")
-	// Put back for the cleanup, whose Close returns early on a session marked closed and
-	// would leave the forwarder running.
-	session.mu.Lock()
-	session.closed = false
-	session.mu.Unlock()
 }
 
 // The session going away ends the wait for the stream: nothing is left to take down.
