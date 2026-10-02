@@ -95,6 +95,12 @@ func TestAnAcknowledgementWithheldForAFailedPublishTakesTheSocketDownOnceTheStre
 	if !strings.Contains(written.String(), "redelivers") {
 		t.Fatalf("the takedown is not in the log: %s", written.String())
 	}
+	// The reset itself, as far as a test client lets it be seen: with no socket under the
+	// client it stands down saying so, and a session that only published the state would
+	// never get this far.
+	waitUntil(t, "the takedown to reach the socket", func() bool {
+		return strings.Contains(written.String(), "already gone before it could be taken down")
+	})
 }
 
 // Several messages withheld through one outage are all redelivered by one new
@@ -238,6 +244,24 @@ func TestAnAcknowledgementWithheldForAFullInboxIsRedelivered(t *testing.T) {
 	if took, _ := state(t, next(t, session)); took != "reconnecting" {
 		t.Fatalf("the session published %q once the stream was back", took)
 	}
+}
+
+// A session already closing is not asked about: restating `close` would be a probe that
+// tells the client the account is finished in the middle of a takedown that is not.
+func TestAClosingSessionIsNotProbed(t *testing.T) {
+	t.Parallel()
+
+	session, _ := redeliveringSession(t)
+	withheld(t, session, "3EB0CLOSED")
+	session.mu.Lock()
+	session.closed = true
+	session.mu.Unlock()
+	quiet(t, session, "a session already closing restated its state to ask about the stream")
+	// Put back for the cleanup, whose Close returns early on a session marked closed and
+	// would leave the forwarder running.
+	session.mu.Lock()
+	session.closed = false
+	session.mu.Unlock()
 }
 
 // The session going away ends the wait for the stream: nothing is left to take down.
