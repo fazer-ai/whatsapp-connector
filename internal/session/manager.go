@@ -86,6 +86,10 @@ type Manager struct {
 	orphanMu sync.Mutex
 	orphans  map[string]bool
 
+	// stopsInFlight are the stale sessions StopStale is still taking down. They are out of
+	// the map already, so StopAll waits on this rather than finding them there.
+	stopsInFlight sync.WaitGroup
+
 	// adoptedForDelete are the accounts this instance opened in order to serve a
 	// `session.delete` that has not been carried out yet, and the number of commands the
 	// session had answered when the teardown was queued. An entry is the connector saying
@@ -710,6 +714,12 @@ func (m *Manager) handingBack(sid string) bool {
 	_, queued := m.orphans[sid]
 	return queued
 }
+
+// HandingBack reports whether this instance still has the lease of an account it stopped
+// queued to be given back. An adoption of that account is refused until the hand-back has
+// run, so a caller about to spend something on one -- the resume sweep's fleet-wide turn --
+// asks first.
+func (m *Manager) HandingBack(sid string) bool { return m.handingBack(sid) }
 
 func (m *Manager) forgetOrphan(sid string) {
 	m.orphanMu.Lock()
@@ -1789,6 +1799,68 @@ func (m *Manager) RenewAll(ctx context.Context, by time.Time) {
 	m.releaseOrphans(window)
 }
 
+// StopStale stops every running session whose lease this instance can no longer act on,
+// without asking Redis anything, and says how long until the next one would be.
+//
+// RenewAll does the same for a renewal that comes back refused, and that is the
+// trouble: it needs the answer. With Redis not answering, the renewal and everything
+// else on the tick wait out the client's timeouts and retries, and the answer that
+// would have said "stale" arrives with Redis itself. Meanwhile the store has refused
+// every write since the lease ran out -- it asks Owned, which is local -- while the
+// socket stays open, so whatsmeow cannot save the Signal state a message needs to be
+// decrypted, gives up on it, and WhatsApp counts it delivered (#353). The moment the
+// lease runs out is already known here, so the socket comes down at that moment, on a
+// goroutine nothing on Redis can hold.
+//
+// The lease is not handed back here: that is a round trip, and this exists for when
+// round trips do not come back. It is queued for the tick, which releases it once
+// Redis answers again.
+//
+// Each session is stopped on a goroutine of its own. Stop closes the socket and then
+// waits for the session to drain -- a publish in flight, a command being answered -- and
+// waited for here, one session draining would keep every other stale socket on this
+// instance open past its lease. The account stays marked as being handed back until its
+// own stop has finished, which is what keeps an adoption and the tick's release off a
+// socket that is still coming down.
+func (m *Manager) StopStale() time.Duration {
+	next := m.leases.TTL()
+	for sid, running := range m.running() {
+		if left := m.leases.Freshness(sid); left > 0 {
+			next = min(next, left)
+			continue
+		}
+		if !m.tryHoldHanding(sid) {
+			// Something else is acting on this account this instant: an adoption checking
+			// it, a hand-back in flight. Asked again shortly rather than at the next lease.
+			next = min(next, staleRetry)
+			continue
+		}
+		session, still := m.drop(sid, running)
+		if !still {
+			m.dropHanding(sid)
+			continue
+		}
+		m.log.Warn().Str("sid", sid).Msg("a lease ran out before it could be renewed; stopping the session")
+		m.lostLease(sid, true)
+		m.orphanMu.Lock()
+		if _, queued := m.orphans[sid]; !queued {
+			m.orphans[sid] = false
+		}
+		m.orphanMu.Unlock()
+		m.stopsInFlight.Add(1)
+		go func() {
+			defer m.stopsInFlight.Done()
+			defer m.dropHanding(sid)
+			session.Stop()
+		}()
+	}
+	return next
+}
+
+// staleRetry is how soon StopStale looks again at a stale session it could not take
+// because something else held it.
+const staleRetry = 50 * time.Millisecond
+
 // HandBackBy is the moment every hand-back in one tick has to be done by, counted from
 // the call rather than per pass.
 //
@@ -1814,6 +1886,16 @@ const ReleaseShare = 3
 // exits: a released lease is one a peer can take immediately instead of waiting a full
 // TTL for it to expire.
 func (m *Manager) StopAll(ctx context.Context) {
+	// Deferred, because the stops below have a way out before their end: a run where every
+	// session left is too close to its lease's end to mark returns from the loop. The
+	// sessions the lease watcher was taking down are out of the map, so nothing below
+	// reaches them. Their stops finish here, before the caller closes the Redis and the
+	// store a command being finished is still writing to, and their leases go back with
+	// the rest.
+	defer func() {
+		m.stopsInFlight.Wait()
+		m.releaseOrphans(ctx)
+	}()
 	sids := m.SIDs()
 	// All of them in one round trip, ahead of every stop, and this is the shape rather
 	// than a mark per Release because the releases are serial: a Redis that answers
