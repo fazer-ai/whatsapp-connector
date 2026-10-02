@@ -2913,7 +2913,14 @@ func (s *Session) cancelOwedReset() bool {
 // group modes included, still describes it.
 func (s *Session) recovered() {
 	s.mu.Lock()
-	s.transitions.Add(1)
+	// The count moved twice over one socket: once when the keepalive gave up on it, once
+	// here. A redelivery owed to that socket before the first is still owed -- no new
+	// connection brought it -- so it is carried onto the count the socket now goes by.
+	was := s.transitions.Load()
+	now := s.transitions.Add(1)
+	if s.redeliveryOn != 0 && s.redeliveryOn == was-1 {
+		s.redeliveryOn = now
+	}
 	s.connected = true
 	s.reconnecting = false
 	s.mu.Unlock()

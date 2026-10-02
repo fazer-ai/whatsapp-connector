@@ -732,17 +732,12 @@ func (s *Session) deliverClaimed(eventType protocol.EventType, payload any, lear
 	case <-timeout.C:
 		s.log.Warn().Str("type", string(eventType)).Dur("waited", s.deliverWait).
 			Msg("withholding an acknowledgement for an event that took too long to publish")
-		// Still in the pump, so how it ends is not known yet. One that lands is on the
-		// stream, and a redelivery would only publish it twice; one that fails is owed it.
-		go func() {
-			select {
-			case err := <-settled:
-				if err != nil {
-					owe()
-				}
-			case <-s.done:
-			}
-		}()
+		// Owed whatever the publish turns out to do. One that lands later has put this
+		// event on the stream, but the stanza is still unacknowledged and whatever the
+		// handler had left to publish after it -- a media failure behind its message --
+		// never went out; a redelivery publishes the event twice, which the client
+		// deduplicates on the id, and is the only thing that brings the rest.
+		owe()
 		return false
 	case <-s.done:
 		return false

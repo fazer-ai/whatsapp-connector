@@ -178,11 +178,13 @@ func TestAWithheldAcknowledgementANewConnectionAlreadyAnsweredIsLeftAlone(t *tes
 	t.Parallel()
 
 	session, _ := redeliveringSession(t)
-	session.redeliveryProbe = 50 * time.Millisecond
 	withheld(t, session, "3EB0OVERTAKEN")
+	probe := next(t, session)
 
+	// Replaced while the question about the stream was out, and the answer comes after.
 	session.setConnected(false)
 	session.setConnected(true)
+	probe.Settle(nil)
 
 	quiet(t, session, "the session acted on a withheld acknowledgement a new connection already redelivered")
 	if got := session.state(); got != "open" {
@@ -204,19 +206,19 @@ func TestAnAcknowledgementWithheldForAnythingButThePublishTakesNothingDown(t *te
 	quiet(t, session, "a message withheld for a reason the stream has nothing to do with started a takedown")
 }
 
-// A publish that ran past deliverWait has no outcome yet when the acknowledgement is
-// withheld. If it lands after all, the message is on the stream and a redelivery would
-// only publish it a second time; if it fails, it is the case above.
-func TestAPublishThatOutlivedTheWaitDecidesAfterwards(t *testing.T) {
+// A publish that ran past deliverWait is owed the redelivery whatever it does afterwards.
+// Landing later puts this event on the stream, but the stanza is still unacknowledged and
+// what the handler had left to publish behind it never went out; a redelivery publishes
+// the event twice, which the client deduplicates on the id, and brings the rest.
+func TestAPublishThatOutlivedTheWaitIsRedeliveredEitherWay(t *testing.T) {
 	t.Parallel()
 
 	for _, outcome := range []struct {
-		name     string
-		err      error
-		takeDown bool
+		name string
+		err  error
 	}{
-		{name: "landed", err: nil, takeDown: false},
-		{name: "failed", err: errors.New("redis is gone"), takeDown: true},
+		{name: "landed", err: nil},
+		{name: "failed", err: errors.New("redis is gone")},
 	} {
 		t.Run(outcome.name, func(t *testing.T) {
 			t.Parallel()
@@ -231,10 +233,6 @@ func TestAPublishThatOutlivedTheWaitDecidesAfterwards(t *testing.T) {
 			}
 			late.Settle(outcome.err)
 
-			if !outcome.takeDown {
-				quiet(t, session, "a message that did reach the stream started a takedown")
-				return
-			}
 			next(t, session).Settle(nil)
 			if took, _ := state(t, next(t, session)); took != "reconnecting" {
 				t.Fatalf("the session published %q once the stream was back", took)
@@ -283,10 +281,11 @@ func TestAClosingSessionIsNotProbed(t *testing.T) {
 	t.Parallel()
 
 	session, _ := redeliveringSession(t)
-	withheld(t, session, "3EB0CLOSED")
+	// Marked before the withhold, so the wait it starts can only ever find it closing.
 	session.mu.Lock()
 	session.closed = true
 	session.mu.Unlock()
+	withheld(t, session, "3EB0CLOSED")
 	// Put back before the cleanup that closes the session, which runs after this one: its
 	// Close returns early on a session marked closed and would leave the forwarder running.
 	t.Cleanup(func() {
@@ -300,21 +299,20 @@ func TestAClosingSessionIsNotProbed(t *testing.T) {
 // A failure that settles after the socket was replaced is about the connection the message
 // arrived on, and the replacement already was its redelivery: taking the replacement down
 // too is a reconnect for nothing.
-func TestALateFailureAfterTheSocketWasReplacedTakesNothingDown(t *testing.T) {
+func TestAFailureThatSettlesAfterTheSocketWasReplacedTakesNothingDown(t *testing.T) {
 	t.Parallel()
 
 	session, _ := redeliveringSession(t)
-	session.deliverWait = 20 * time.Millisecond
 	acknowledged := make(chan bool, 1)
 	go func() { acknowledged <- session.receive(textMessage("3EB0LATE", "bom dia")) }()
-	late := next(t, session)
-	if <-acknowledged {
-		t.Fatal("a message whose publish had not finished was acknowledged")
-	}
+	pending := next(t, session)
 
 	session.setConnected(false)
 	session.setConnected(true)
-	late.Settle(errors.New("redis is gone"))
+	pending.Settle(errors.New("redis is gone"))
+	if <-acknowledged {
+		t.Fatal("a message that was not published was acknowledged")
+	}
 
 	quiet(t, session, "a failure about a connection already replaced started a takedown of its replacement")
 	if got := session.state(); got != "open" {
@@ -331,19 +329,18 @@ func TestALateFailureFromTheOldSocketKeepsTheNewSocketsDebt(t *testing.T) {
 	t.Parallel()
 
 	session, _ := redeliveringSession(t)
-	session.deliverWait = 20 * time.Millisecond
 	acknowledged := make(chan bool, 1)
 	go func() { acknowledged <- session.receive(textMessage("3EB0OLD", "bom dia")) }()
-	late := next(t, session)
-	if <-acknowledged {
-		t.Fatal("a message whose publish had not finished was acknowledged")
-	}
+	old := next(t, session)
 
 	session.setConnected(false)
 	session.setConnected(true)
 	withheld(t, session, "3EB0NEW")
 	probe := next(t, session)
-	late.Settle(errors.New("redis is gone"))
+	old.Settle(errors.New("redis is gone"))
+	if <-acknowledged {
+		t.Fatal("a message that was not published was acknowledged")
+	}
 	probe.Settle(nil)
 
 	if took, reason := state(t, next(t, session)); took != "reconnecting" || reason != reasonRedelivery {
@@ -433,6 +430,34 @@ func TestARecoveredKeepAliveDoesNotCallOffARedeliveryTakedown(t *testing.T) {
 	waitUntil(t, "the takedown to reach the socket once the command was answered", func() bool {
 		return strings.Contains(written.String(), "already gone before it could be taken down")
 	})
+}
+
+// A keepalive that gave up on the socket and then heard it answer again leaves it the same
+// socket: the count moved twice and nothing new connected, so what was withheld on it is
+// still owed its takedown.
+func TestADebtSurvivesAKeepAliveTheSocketRecoveredFrom(t *testing.T) {
+	t.Parallel()
+
+	session, _ := redeliveringSession(t)
+	withheld(t, session, "3EB0KEPT")
+	probe := next(t, session)
+
+	// A command in flight keeps the keepalive's takedown waiting, so the recovery can call
+	// it off and put the same socket back.
+	session.countCommand()
+	session.handle(&waEvents.KeepAliveTimeout{ErrorCount: 2, LastSuccess: time.Now()})
+	if took, _ := state(t, next(t, session)); took != "reconnecting" {
+		t.Fatalf("the keepalive published %q", took)
+	}
+	session.handle(&waEvents.KeepAliveRestored{})
+	if took, _ := state(t, next(t, session)); took != "open" {
+		t.Fatalf("the recovery published %q", took)
+	}
+
+	probe.Settle(nil)
+	if took, reason := state(t, next(t, session)); took != "reconnecting" || reason != reasonRedelivery {
+		t.Fatalf("a keepalive the socket recovered from wiped what was withheld on it: %s (%s)", took, reason)
+	}
 }
 
 // The session going away ends the wait for the stream: nothing is left to take down.
