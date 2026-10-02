@@ -39,15 +39,16 @@ func withheld(t *testing.T, session *Session, id string) {
 }
 
 // state is what a session.state emission says.
-func state(t *testing.T, emission *engine.Emission) (string, string) {
+func state(t *testing.T, emission *engine.Emission) (took, reason string) {
 	t.Helper()
 
 	if emission.Type != protocol.EventSessionState {
 		t.Fatalf("expected a session.state, got %s", emission.Type)
 	}
 	published := decode(t, emission.Payload)
-	reason, _ := published["reason"].(string)
-	return published["state"].(string), reason
+	took, _ = published["state"].(string)
+	reason, _ = published["reason"].(string)
+	return took, reason
 }
 
 // quiet fails when the session publishes anything within a few probe intervals.
@@ -110,6 +111,27 @@ func TestSeveralWithheldAcknowledgementsCostOneTakedown(t *testing.T) {
 		t.Fatalf("the session published %q once the stream was back", took)
 	}
 	quiet(t, session, "a second takedown followed the first")
+}
+
+// The wait ends with the takedown, and the next failure on the new connection starts a
+// new one: a session that remembered the first wait as still running would leave every
+// later outage to the next drop, which is the issue all over again.
+func TestAWithholdingAfterATakedownWaitsForTheStreamAgain(t *testing.T) {
+	t.Parallel()
+
+	session, _ := redeliveringSession(t)
+	withheld(t, session, "3EB0BEFORE")
+	next(t, session).Settle(nil)
+	if took, _ := state(t, next(t, session)); took != "reconnecting" {
+		t.Fatalf("the session published %q once the stream was back", took)
+	}
+
+	session.setConnected(true)
+	withheld(t, session, "3EB0AFTER")
+	next(t, session).Settle(nil)
+	if took, reason := state(t, next(t, session)); took != "reconnecting" || reason != reasonRedelivery {
+		t.Fatalf("a second outage on the new connection published %s (%s)", took, reason)
+	}
 }
 
 // A connection that came and went since the acknowledgement was withheld has already had

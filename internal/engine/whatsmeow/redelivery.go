@@ -30,14 +30,11 @@ const reasonRedelivery = "redelivery"
 // stream takes a write again -- earlier, the redelivered message would only be withheld a
 // second time.
 //
-// A session that is not on a socket has nothing to take down, and the connection it gets
-// next is the redelivery.
+// Recorded against the connection it happened on, so a session that is off that socket by
+// the time the stream answers has nothing to take down: the connection it gets next is the
+// redelivery.
 func (s *Session) oweRedelivery() {
 	s.mu.Lock()
-	if !s.connected {
-		s.mu.Unlock()
-		return
-	}
 	s.redeliveryOn = s.transitions.Load()
 	start := !s.redelivering
 	s.redelivering = true
