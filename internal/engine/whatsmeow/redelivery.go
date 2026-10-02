@@ -34,11 +34,20 @@ const reasonRedelivery = "redelivery"
 // that settles after a new socket authenticated is about one whose redelivery the new socket
 // already was. Zero is no socket -- nothing waits on WhatsApp, or the session never
 // authenticated one -- and nothing to take down.
+//
+// The socket is read under the same lock the debt is written under, here and in stillOwed:
+// read before it, a socket that authenticated in between could have its own debt recorded
+// and then overwritten, or cleared, by a decision about the one before. The stamp's lock is
+// never held while this one is taken, so the order cannot invert.
 func (s *Session) oweRedelivery(on time.Time) {
-	if on.IsZero() || !s.socket().Equal(on) {
+	if on.IsZero() {
 		return
 	}
 	s.mu.Lock()
+	if !s.socket().Equal(on) {
+		s.mu.Unlock()
+		return
+	}
 	s.redeliveryOn = on
 	start := !s.redelivering
 	s.redelivering = true
@@ -186,11 +195,9 @@ func (s *Session) redeliver() bool {
 // stillOwed reports whether the socket an acknowledgement was withheld on is the one the
 // session is on, and forgets the debt when it is not: a new socket is the redelivery.
 func (s *Session) stillOwed() bool {
-	// Read before the lock, as every reading of the stamp is: it takes a lock of its own.
-	socket := s.socket()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.redeliveryOn.Equal(socket) {
+	if s.redeliveryOn.Equal(s.socket()) {
 		return true
 	}
 	s.redeliveryOn, s.redelivering = time.Time{}, false
