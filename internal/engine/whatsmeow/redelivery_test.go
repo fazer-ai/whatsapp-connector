@@ -112,7 +112,11 @@ func TestSeveralWithheldAcknowledgementsCostOneTakedown(t *testing.T) {
 	withheld(t, session, "3EB0FIRST")
 	withheld(t, session, "3EB0SECOND")
 
-	next(t, session).Settle(nil)
+	// One wait, so one question in flight: a second waiter would ask again while the first
+	// is still waiting for its answer.
+	probe := next(t, session)
+	quiet(t, session, "a second question about the stream went out while the first was unanswered")
+	probe.Settle(nil)
 	if took, _ := state(t, next(t, session)); took != "reconnecting" {
 		t.Fatalf("the session published %q once the stream was back", took)
 	}
