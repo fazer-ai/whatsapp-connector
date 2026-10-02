@@ -562,9 +562,13 @@ type Session struct {
 	// connections: measured, a `group.create` caught by that resend leaves the account with
 	// two groups, and the caller is told about the second one only.
 	running int
-	// redeliveryOn is the connection an acknowledgement withheld for a failed publish was
-	// withheld on, as `transitions` counted it, and redelivering is whether a goroutine
-	// is already waiting for the stream to come back to take that connection down.
+	// sockets counts the connections this session came up on, and only those: unlike
+	// `transitions` it does not move when a keepalive gives up on a socket that then
+	// answers again, which is still the socket WhatsApp has the unacknowledged stanzas on.
+	sockets atomic.Int64
+	// redeliveryOn is the socket an acknowledgement withheld for a failed publish was
+	// withheld on, as `sockets` counted it, and redelivering is whether a goroutine is
+	// already waiting for the stream to come back to take that socket down.
 	redeliveryOn int64
 	redelivering bool
 	// redeliveryTakedown is the connection count a redelivery took the socket down at, so
@@ -1125,6 +1129,7 @@ func (s *Session) setConnectedAt(connected bool, at time.Time) int64 {
 	// authenticated session or with the socket going down again.
 	s.dialing = false
 	if connected {
+		s.sockets.Add(1)
 		if replaced {
 			// A socket announcing itself while the session still believes it is on one can
 			// only be a socket that replaced the previous one without anything telling this
@@ -2913,14 +2918,7 @@ func (s *Session) cancelOwedReset() bool {
 // group modes included, still describes it.
 func (s *Session) recovered() {
 	s.mu.Lock()
-	// The count moved twice over one socket: once when the keepalive gave up on it, once
-	// here. A redelivery owed to that socket before the first is still owed -- no new
-	// connection brought it -- so it is carried onto the count the socket now goes by.
-	was := s.transitions.Load()
-	now := s.transitions.Add(1)
-	if s.redeliveryOn != 0 && s.redeliveryOn == was-1 {
-		s.redeliveryOn = now
-	}
+	s.transitions.Add(1)
 	s.connected = true
 	s.reconnecting = false
 	s.mu.Unlock()

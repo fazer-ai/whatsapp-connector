@@ -30,13 +30,12 @@ const reasonRedelivery = "redelivery"
 // stream takes a write again -- earlier, the redelivered message would only be withheld a
 // second time.
 //
-// Recorded against the connection the message arrived on, read before the publish was
-// waited on: a failure that settles after the socket was replaced is about a connection
-// whose redelivery the replacement already was, and a session no longer on it has nothing
-// to take down.
+// Recorded against the socket the message arrived on, read before the publish was waited
+// on: a failure that settles after the socket was replaced is about one whose redelivery
+// the replacement already was. A session that never came up has nothing to take down.
 func (s *Session) oweRedelivery(on int64) {
 	s.mu.Lock()
-	if !s.connected || s.transitions.Load() != on {
+	if on == 0 || s.sockets.Load() != on {
 		s.mu.Unlock()
 		return
 	}
@@ -97,9 +96,10 @@ func (s *Session) redeliverIfTheStreamIsBack() bool {
 // lock, because a state read here and queued behind a newer one would put an old state
 // last on the stream. Never waited into a full inbox, which already answers the question.
 //
-// A nil channel with owed true is "not now"; owed false is a withheld acknowledgement a
-// new connection has already answered, or a session no longer on the socket it was
-// withheld on.
+// A nil channel with owed true is "not now": the inbox is full, or the socket is not
+// answering for the moment -- a keepalive that gave up on it may yet hear it again, and it
+// is still the one the stanzas are on. Owed false is a debt a new socket has already
+// answered, or a session that is finished.
 func (s *Session) probe() (settled chan error, owed bool) {
 	s.transition.Lock()
 	defer s.transition.Unlock()
@@ -108,9 +108,13 @@ func (s *Session) probe() (settled chan error, owed bool) {
 		return nil, false
 	}
 	payload := s.sessionState()
-	if payload["state"] != "open" {
+	switch payload["state"] {
+	case "open":
+	case "close":
 		s.forgetRedelivery()
 		return nil, false
+	default:
+		return nil, true
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -141,7 +145,16 @@ func (s *Session) redeliver() bool {
 	if !s.stillOwed() {
 		return true
 	}
+	if s.state() != "open" {
+		// Went quiet between the question and the answer. Asked again on the next round.
+		return false
+	}
 	s.forgetRedelivery()
+	// The answer just landed, so the publisher is answering again, and a receipt arriving
+	// on the new socket must be tried rather than refused for a stall this already outlived:
+	// refused, it would be withheld with no publish behind it, and nothing would owe it the
+	// next redelivery.
+	s.stalledUntil.Store(0)
 	s.log.Warn().Msg("the stream takes writes again; taking the socket down so WhatsApp redelivers what was left unacknowledged")
 	client := s.current()
 	judged := s.setConnected(false)
@@ -155,13 +168,12 @@ func (s *Session) redeliver() bool {
 	return true
 }
 
-// stillOwed reports whether the connection an acknowledgement was withheld on is the one
-// the session is on, and forgets the debt when it is not: a new connection is the
-// redelivery.
+// stillOwed reports whether the socket an acknowledgement was withheld on is the one the
+// session is on, and forgets the debt when it is not: a new socket is the redelivery.
 func (s *Session) stillOwed() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.connected && s.redeliveryOn == s.transitions.Load() {
+	if s.redeliveryOn == s.sockets.Load() {
 		return true
 	}
 	s.redeliveryOn, s.redelivering = 0, false

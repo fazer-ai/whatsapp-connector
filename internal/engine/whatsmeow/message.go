@@ -667,9 +667,9 @@ func (s *Session) deliverUnless(eventType protocol.EventType, payload any, learn
 // history slice have nothing at WhatsApp to send again -- the stanza was acknowledged
 // before they were made -- and retry on their own.
 func (s *Session) deliverClaimed(eventType protocol.EventType, payload any, learned int64, claim func() bool, withheld bool) bool {
-	// The connection this arrived on, read before anything waits: by the time a failure
-	// is known the socket may have been replaced, and that replacement is the redelivery.
-	on := s.transitions.Load()
+	// The socket this arrived on, read before anything waits: by the time a failure is
+	// known the socket may have been replaced, and that replacement is the redelivery.
+	on := s.sockets.Load()
 	owe := func() {
 		if withheld {
 			s.oweRedelivery(on)

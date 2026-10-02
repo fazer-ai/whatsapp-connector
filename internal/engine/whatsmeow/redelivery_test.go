@@ -460,6 +460,55 @@ func TestADebtSurvivesAKeepAliveTheSocketRecoveredFrom(t *testing.T) {
 	}
 }
 
+// A message withheld while a keepalive's takedown is waiting on a command is on a socket
+// that may yet answer again, and when it does it is the same socket: the wait goes on,
+// asking nothing while the session reports itself down, and takes that socket down once
+// it is back and the stream is too.
+func TestADebtTakenWhileAKeepAliveResetWaitsOutlivesIt(t *testing.T) {
+	t.Parallel()
+
+	session, _ := redeliveringSession(t)
+	session.countCommand()
+	session.handle(&waEvents.KeepAliveTimeout{ErrorCount: 2, LastSuccess: time.Now()})
+	if took, _ := state(t, next(t, session)); took != "reconnecting" {
+		t.Fatalf("the keepalive published %q", took)
+	}
+	withheld(t, session, "3EB0MUTE")
+	quiet(t, session, "the session asked about the stream while it reported its socket down")
+
+	session.handle(&waEvents.KeepAliveRestored{})
+	if took, _ := state(t, next(t, session)); took != "open" {
+		t.Fatalf("the recovery published %q", took)
+	}
+	next(t, session).Settle(nil)
+	if took, reason := state(t, next(t, session)); took != "reconnecting" || reason != reasonRedelivery {
+		t.Fatalf("what was withheld while the keepalive waited was dropped: %s (%s)", took, reason)
+	}
+}
+
+// A receipt that failed to publish opens a window in which the next ones are refused
+// without being tried. The takedown is made because the stream answered, so the receipts
+// WhatsApp sends again on the new socket are tried: refused, they would be withheld with
+// nothing owing them a redelivery.
+func TestTheTakedownReopensTheReceiptWindow(t *testing.T) {
+	t.Parallel()
+
+	session, _ := redeliveringSession(t)
+	withheld(t, session, "3EB0RECEIPTS")
+	session.publisherAnswered(false)
+	if !session.publisherStalled() {
+		t.Fatal("the test needs the receipt window shut")
+	}
+
+	next(t, session).Settle(nil)
+	if took, _ := state(t, next(t, session)); took != "reconnecting" {
+		t.Fatalf("the session published %q once the stream was back", took)
+	}
+	if session.publisherStalled() {
+		t.Fatal("receipts redelivered on the new socket would be refused for a stall the stream already came back from")
+	}
+}
+
 // The session going away ends the wait for the stream: nothing is left to take down.
 func TestTheWaitForTheStreamEndsWithTheSession(t *testing.T) {
 	t.Parallel()
