@@ -123,6 +123,11 @@ type Session struct {
 	// published. A field for the same reason as storeLimit, and for no other.
 	deliverWait time.Duration
 
+	// redeliveryProbe is how long the session waits, after an acknowledgement withheld for
+	// a failed publish and between attempts, before asking whether the stream takes a write
+	// again. A field for the same reason as deliverWait.
+	redeliveryProbe time.Duration
+
 	// createWait bounds how long a redelivered `group.create` waits for WhatsApp to say
 	// which group it made. A field for the same reason as the two above it.
 	createWait time.Duration
@@ -557,6 +562,14 @@ type Session struct {
 	// connections: measured, a `group.create` caught by that resend leaves the account with
 	// two groups, and the caller is told about the second one only.
 	running int
+	// redeliveryOn is the socket an acknowledgement withheld for a failed publish was
+	// withheld on, named by when it authenticated (`socket`), and redelivering is whether a
+	// goroutine is already waiting for the stream to come back to take that socket down.
+	redeliveryOn time.Time
+	redelivering bool
+	// redeliveryTakedown is the connection count a redelivery took the socket down at, so
+	// a takedown of that one left waiting for a command can be told from a keepalive's.
+	redeliveryTakedown int64
 	// owed is a socket takedown the keepalive handler decided on and could not perform,
 	// because of the above. It runs when the command in flight is answered.
 	owed *owedReset
@@ -812,12 +825,13 @@ func newSession(
 		blobs:     blobs.Blobs,
 		blobBase:  blobs.BaseURL,
 
-		storeLimit:  bindTimeout,
-		wireLimit:   sendCeiling,
-		deliverWait: deliverTimeout,
-		createWait:  createNoticeWait,
-		handoffWait: perishableHandoff,
-		awaited:     make(map[string]*awaiting),
+		storeLimit:      bindTimeout,
+		wireLimit:       sendCeiling,
+		deliverWait:     deliverTimeout,
+		redeliveryProbe: redeliveryProbeEvery,
+		createWait:      createNoticeWait,
+		handoffWait:     perishableHandoff,
+		awaited:         make(map[string]*awaiting),
 
 		reuploads:           make(map[string]chan *waEvents.MediaRetry),
 		reuploadWait:        reuploadTimeout,
@@ -2880,6 +2894,12 @@ func (s *Session) cancelOwedReset() bool {
 		return false
 	}
 	superseded := s.owed.judged != s.transitions.Load()
+	if !superseded && s.owed.judged == s.redeliveryTakedown {
+		// Taken down for WhatsApp to send again what is unacknowledged, not because the
+		// socket stopped answering, so a ping coming back answers nothing about it: the
+		// takedown waits for its command like any other and then goes ahead.
+		return false
+	}
 	s.owed = nil
 	if superseded {
 		return false
