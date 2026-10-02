@@ -486,6 +486,34 @@ func TestADebtTakenWhileAKeepAliveResetWaitsOutlivesIt(t *testing.T) {
 	}
 }
 
+// The stream can answer just as the socket stops: the keepalive gave up on it between the
+// question and the answer. Taking it down then is the keepalive's business and not this
+// one's, and the debt waits for the socket to be back rather than being spent on it.
+func TestAnAnswerThatArrivesWhileTheSocketIsQuietWaitsForIt(t *testing.T) {
+	t.Parallel()
+
+	session, _ := redeliveringSession(t)
+	withheld(t, session, "3EB0BETWEEN")
+	probe := next(t, session)
+
+	session.countCommand()
+	session.handle(&waEvents.KeepAliveTimeout{ErrorCount: 2, LastSuccess: time.Now()})
+	if took, _ := state(t, next(t, session)); took != "reconnecting" {
+		t.Fatalf("the keepalive published %q", took)
+	}
+	probe.Settle(nil)
+	quiet(t, session, "the session took down a socket the keepalive had already given up on")
+
+	session.handle(&waEvents.KeepAliveRestored{})
+	if took, _ := state(t, next(t, session)); took != "open" {
+		t.Fatalf("the recovery published %q", took)
+	}
+	next(t, session).Settle(nil)
+	if took, reason := state(t, next(t, session)); took != "reconnecting" || reason != reasonRedelivery {
+		t.Fatalf("the debt was spent on a quiet socket instead of waiting for it: %s (%s)", took, reason)
+	}
+}
+
 // A receipt that failed to publish opens a window in which the next ones are refused
 // without being tried. The takedown is made because the stream answered, so the receipts
 // WhatsApp sends again on the new socket are tried: refused, they would be withheld with
