@@ -322,6 +322,35 @@ func TestALateFailureAfterTheSocketWasReplacedTakesNothingDown(t *testing.T) {
 	}
 }
 
+// And the replacement's own debt survives it. A message withheld on the new connection is
+// owed a takedown of that one, and a late failure from the old connection landing while
+// the session waits for the stream must not write its connection over the new one: the
+// wait would then find nothing current to take down, and the message withheld on the new
+// socket would sit there until the next drop.
+func TestALateFailureFromTheOldSocketKeepsTheNewSocketsDebt(t *testing.T) {
+	t.Parallel()
+
+	session, _ := redeliveringSession(t)
+	session.deliverWait = 20 * time.Millisecond
+	acknowledged := make(chan bool, 1)
+	go func() { acknowledged <- session.receive(textMessage("3EB0OLD", "bom dia")) }()
+	late := next(t, session)
+	if <-acknowledged {
+		t.Fatal("a message whose publish had not finished was acknowledged")
+	}
+
+	session.setConnected(false)
+	session.setConnected(true)
+	withheld(t, session, "3EB0NEW")
+	probe := next(t, session)
+	late.Settle(errors.New("redis is gone"))
+	probe.Settle(nil)
+
+	if took, reason := state(t, next(t, session)); took != "reconnecting" || reason != reasonRedelivery {
+		t.Fatalf("the new socket's debt was lost to a failure from the old one: %s (%s)", took, reason)
+	}
+}
+
 // A placeholder has nothing at WhatsApp to send again: whatsmeow acknowledged the stanza
 // before it said the message could not be read. A failed publish of one is retried by the
 // session itself, and a reconnect would bring back nothing.
