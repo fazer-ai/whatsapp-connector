@@ -526,6 +526,9 @@ func (s *Session) receive(event *waEvents.Message) bool {
 	// publisher bound later than the message it is about, for something the session knew
 	// before it published either.
 	learned := s.learned()
+	// And the socket it came in on, for the same reason: a media download can run past a
+	// reconnect, and the socket read after it would be the one that already redelivered this.
+	on := s.socket()
 
 	if notice := historyNotice(event); notice != nil {
 		// Before the switch below, which drops every other protocol message the account
@@ -579,7 +582,7 @@ func (s *Session) receive(event *waEvents.Message) bool {
 		// It waits on the publisher exactly as a message does: WhatsApp redelivers what
 		// is not acknowledged, and a correction or a deletion nobody published is one
 		// the conversation never learns about.
-		return s.deliver(what.kind, what.payload, learned)
+		return s.deliver(what.kind, what.payload, learned, on)
 	case dropChange:
 		s.log.Info().Err(what.err).Str("message_id", event.Info.ID).Msg(what.why)
 		return true
@@ -594,7 +597,7 @@ func (s *Session) receive(event *waEvents.Message) bool {
 			Msg("refusing to acknowledge an inbound message this build cannot publish")
 		return false
 	}
-	if !s.deliver(protocol.EventMessageReceived, map[string]any{"message": message}, learned) {
+	if !s.deliver(protocol.EventMessageReceived, map[string]any{"message": message}, learned, on) {
 		return false
 	}
 	if !missing.said() {
@@ -607,7 +610,7 @@ func (s *Session) receive(event *waEvents.Message) bool {
 	return s.deliver(protocol.EventMediaDownloadFailed, protocol.MediaDownloadFailure{
 		Chat: message.Chat, MessageID: message.ID,
 		Reason: missing.reason, Recoverable: missing.recoverable,
-	}, learned)
+	}, learned, on)
 }
 
 // stanzaOf is the id of the stanza this event arrived in, which is what a placeholder for
@@ -638,8 +641,10 @@ func stanzaOf(event *waEvents.Message) string {
 //
 // Only for an event whose WhatsApp acknowledgement waits on the answer: a failure here is a
 // withheld acknowledgement, and WhatsApp sends that again only to a new connection.
-func (s *Session) deliver(eventType protocol.EventType, payload any, learned int64) bool {
-	return s.deliverClaimed(eventType, payload, learned, nil, true)
+//
+// `on` is the socket the stanza came in on (`socket`), read when the handler began.
+func (s *Session) deliver(eventType protocol.EventType, payload any, learned int64, on time.Time) bool {
+	return s.deliverClaimed(eventType, payload, learned, nil, on)
 }
 
 // deliverUnless is deliver for an event to be dropped if the message named here has arrived
@@ -656,25 +661,18 @@ func (s *Session) deliverUnless(eventType protocol.EventType, payload any, learn
 	if unless != "" {
 		claim = func() bool { return s.commit(unless) }
 	}
-	return s.deliverClaimed(eventType, payload, learned, claim, false)
+	return s.deliverClaimed(eventType, payload, learned, claim, time.Time{})
 }
 
 // deliverClaimed is deliver for an event the publisher asks claim about at the last moment
 // before the write, dropping it when claim says no. A nil claim is no question at all.
 //
-// withheld says a WhatsApp acknowledgement waits on the answer, so a failure leaves one
-// withheld and owes the redelivery that only a new connection brings. A placeholder and a
-// history slice have nothing at WhatsApp to send again -- the stanza was acknowledged
-// before they were made -- and retry on their own.
-func (s *Session) deliverClaimed(eventType protocol.EventType, payload any, learned int64, claim func() bool, withheld bool) bool {
-	// The socket this arrived on, read before anything waits: by the time a failure is
-	// known the socket may have been replaced, and that replacement is the redelivery.
-	on := s.sockets.Load()
-	owe := func() {
-		if withheld {
-			s.oweRedelivery(on)
-		}
-	}
+// on is the socket a WhatsApp acknowledgement waiting on the answer belongs to, so a failure
+// leaves one withheld there and owes the redelivery that only a new socket brings. Zero is
+// nothing waiting: a placeholder and a history slice have nothing at WhatsApp to send again
+// -- the stanza was acknowledged before they were made -- and retry on their own.
+func (s *Session) deliverClaimed(eventType protocol.EventType, payload any, learned int64, claim func() bool, on time.Time) bool {
+	owe := func() { s.oweRedelivery(on) }
 	body, err := json.Marshal(payload)
 	if err != nil {
 		s.log.Error().Err(err).Str("type", string(eventType)).Msg("failed to render an event payload")

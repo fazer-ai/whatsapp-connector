@@ -30,15 +30,15 @@ const reasonRedelivery = "redelivery"
 // stream takes a write again -- earlier, the redelivered message would only be withheld a
 // second time.
 //
-// Recorded against the socket the message arrived on, read before the publish was waited
-// on: a failure that settles after the socket was replaced is about one whose redelivery
-// the replacement already was. A session that never came up has nothing to take down.
-func (s *Session) oweRedelivery(on int64) {
-	s.mu.Lock()
-	if on == 0 || s.sockets.Load() != on {
-		s.mu.Unlock()
+// Recorded against the socket the stanza came in on, read when its handler began: a failure
+// that settles after a new socket authenticated is about one whose redelivery the new socket
+// already was. Zero is no socket -- nothing waits on WhatsApp, or the session never
+// authenticated one -- and nothing to take down.
+func (s *Session) oweRedelivery(on time.Time) {
+	if on.IsZero() || !s.socket().Equal(on) {
 		return
 	}
+	s.mu.Lock()
 	s.redeliveryOn = on
 	start := !s.redelivering
 	s.redelivering = true
@@ -46,6 +46,21 @@ func (s *Session) oweRedelivery(on int64) {
 	if start {
 		go s.redeliverOnceTheStreamIsBack()
 	}
+}
+
+// socket names the socket the session is on by the instant whatsmeow said it authenticated.
+//
+// Not by a count of `Connected`, which whatsmeow dispatches only after the prekey and
+// passive IQs (#181): the stanzas a socket brings with it are handled before that, and a
+// count would file them under the socket before. Not by `transitions` either, which moves
+// when a keepalive gives up on a socket that then answers again -- still the socket WhatsApp
+// holds the unacknowledged stanzas for. The authentication is logged before the socket reads
+// anything, and moves only when another socket authenticates.
+func (s *Session) socket() time.Time {
+	if s.authenticated == nil {
+		return time.Time{}
+	}
+	return s.authenticated.authenticatedAt()
 }
 
 // redeliverOnceTheStreamIsBack asks the stream, every redeliveryProbe, whether it takes a
@@ -171,18 +186,20 @@ func (s *Session) redeliver() bool {
 // stillOwed reports whether the socket an acknowledgement was withheld on is the one the
 // session is on, and forgets the debt when it is not: a new socket is the redelivery.
 func (s *Session) stillOwed() bool {
+	// Read before the lock, as every reading of the stamp is: it takes a lock of its own.
+	socket := s.socket()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.redeliveryOn == s.sockets.Load() {
+	if s.redeliveryOn.Equal(socket) {
 		return true
 	}
-	s.redeliveryOn, s.redelivering = 0, false
+	s.redeliveryOn, s.redelivering = time.Time{}, false
 	return false
 }
 
 // forgetRedelivery ends the wait, so the next withheld acknowledgement starts a new one.
 func (s *Session) forgetRedelivery() {
 	s.mu.Lock()
-	s.redeliveryOn, s.redelivering = 0, false
+	s.redeliveryOn, s.redelivering = time.Time{}, false
 	s.mu.Unlock()
 }

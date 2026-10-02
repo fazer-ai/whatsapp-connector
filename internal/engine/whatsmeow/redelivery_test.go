@@ -1,6 +1,7 @@
 package whatsmeow
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -8,10 +9,14 @@ import (
 
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/proto/waHistorySync"
+	waTypes "go.mau.fi/whatsmeow/types"
 	waEvents "go.mau.fi/whatsmeow/types/events"
 	"google.golang.org/protobuf/proto"
 
+	wm "go.mau.fi/whatsmeow"
+
 	"github.com/fazer-ai/whatsapp-connector/internal/engine"
+	"github.com/fazer-ai/whatsapp-connector/internal/media"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 )
 
@@ -22,8 +27,22 @@ func redeliveringSession(t *testing.T) (*Session, *syncBuffer) {
 
 	session, written := newLoggedTestSession(t, "5511999990001")
 	session.redeliveryProbe = 5 * time.Millisecond
+	newSocket(session)
 	dialedAndConnected(session)
 	return session, written
+}
+
+// newSocket is whatsmeow authenticating a socket, which is what names it to the session:
+// a second later than the last one, so two in a row are never read as the same.
+func newSocket(session *Session) {
+	stamp := session.authenticated
+	stamp.mu.Lock()
+	if stamp.last.IsZero() {
+		stamp.last = time.Now()
+	} else {
+		stamp.last = stamp.last.Add(time.Second)
+	}
+	stamp.mu.Unlock()
 }
 
 // withheld hands the session one inbound message and fails its publish, which is the
@@ -163,6 +182,7 @@ func TestAWithholdingAfterATakedownWaitsForTheStreamAgain(t *testing.T) {
 		t.Fatalf("the session published %q once the stream was back", took)
 	}
 
+	newSocket(session)
 	session.setConnected(true)
 	withheld(t, session, "3EB0AFTER")
 	next(t, session).Settle(nil)
@@ -183,6 +203,7 @@ func TestAWithheldAcknowledgementANewConnectionAlreadyAnsweredIsLeftAlone(t *tes
 
 	// Replaced while the question about the stream was out, and the answer comes after.
 	session.setConnected(false)
+	newSocket(session)
 	session.setConnected(true)
 	probe.Settle(nil)
 
@@ -308,6 +329,7 @@ func TestAFailureThatSettlesAfterTheSocketWasReplacedTakesNothingDown(t *testing
 	pending := next(t, session)
 
 	session.setConnected(false)
+	newSocket(session)
 	session.setConnected(true)
 	pending.Settle(errors.New("redis is gone"))
 	if <-acknowledged {
@@ -334,6 +356,7 @@ func TestALateFailureFromTheOldSocketKeepsTheNewSocketsDebt(t *testing.T) {
 	old := next(t, session)
 
 	session.setConnected(false)
+	newSocket(session)
 	session.setConnected(true)
 	withheld(t, session, "3EB0NEW")
 	probe := next(t, session)
@@ -345,6 +368,80 @@ func TestALateFailureFromTheOldSocketKeepsTheNewSocketsDebt(t *testing.T) {
 
 	if took, reason := state(t, next(t, session)); took != "reconnecting" || reason != reasonRedelivery {
 		t.Fatalf("the new socket's debt was lost to a failure from the old one: %s (%s)", took, reason)
+	}
+}
+
+// whatsmeow announces a socket only after its prekey and passive IQs (#181), and the stanzas
+// it brings are handled before that. One withheld there is on the new socket, and the
+// announcement that follows is that same socket coming up, not a replacement that already
+// redelivered it.
+func TestADebtTakenBeforeTheSocketIsAnnouncedIsKept(t *testing.T) {
+	t.Parallel()
+
+	session, _ := redeliveringSession(t)
+	session.setConnected(false)
+	session.setReconnecting(true, time.Now())
+	newSocket(session)
+	withheld(t, session, "3EB0EARLY")
+
+	session.setConnected(true)
+	next(t, session).Settle(nil)
+	if took, reason := state(t, next(t, session)); took != "reconnecting" || reason != reasonRedelivery {
+		t.Fatalf("a message withheld before its socket was announced was filed under the socket before: %s (%s)", took, reason)
+	}
+}
+
+// The socket is read when the stanza is handled and not when its event is published: a
+// media download can outlast a reconnect, and the socket read after it is the replacement,
+// which already redelivered the message.
+func TestTheSocketIsReadWhenTheMessageArrives(t *testing.T) {
+	t.Parallel()
+
+	session, _ := mediaSession(t, media.Options{})
+	session.redeliveryProbe = 5 * time.Millisecond
+	newSocket(session)
+	dialedAndConnected(session)
+	session.download = func(context.Context, *wm.Client, wm.DownloadableMessage, media.File) error {
+		// The socket the message came in on goes while its media is being fetched.
+		session.setConnected(false)
+		newSocket(session)
+		session.setConnected(true)
+		return wm.ErrMediaDownloadFailedWith403
+	}
+
+	acknowledged := make(chan bool, 1)
+	go func() { acknowledged <- session.receive(imageEvent("3EB0SLOWMEDIA")) }()
+	emission := next(t, session)
+	if emission.Type != protocol.EventMessageReceived {
+		t.Fatalf("the message went out as %s", emission.Type)
+	}
+	emission.Settle(errors.New("redis is gone"))
+	if <-acknowledged {
+		t.Fatal("a message that was not published was acknowledged")
+	}
+	quiet(t, session, "a message from a socket already replaced owed the replacement a takedown")
+}
+
+// A receipt is a stanza like a message: withheld when its event does not reach the stream,
+// and sent again only to a new socket.
+func TestAWithheldReceiptIsRedelivered(t *testing.T) {
+	t.Parallel()
+
+	session, _ := redeliveringSession(t)
+	acknowledged := make(chan bool, 1)
+	go func() { acknowledged <- session.receipt(receiptEvent(waTypes.ReceiptTypeRead, "3EB0READ")) }()
+	emission := next(t, session)
+	if emission.Type != protocol.EventMessageReceipt {
+		t.Fatalf("the receipt went out as %s", emission.Type)
+	}
+	emission.Settle(errors.New("redis is gone"))
+	if <-acknowledged {
+		t.Fatal("a receipt that was not published was acknowledged")
+	}
+
+	next(t, session).Settle(nil)
+	if took, reason := state(t, next(t, session)); took != "reconnecting" || reason != reasonRedelivery {
+		t.Fatalf("a withheld receipt was left for the next drop: %s (%s)", took, reason)
 	}
 }
 

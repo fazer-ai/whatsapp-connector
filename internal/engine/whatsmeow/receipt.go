@@ -27,6 +27,7 @@ func (s *Session) receipt(event *waEvents.Receipt) bool {
 	// a frame's `ts` says is when the session learned the thing, and the checks below can
 	// spend the whole publisher bound before this goes out.
 	learned := s.learned()
+	on := s.socket()
 
 	published, ok := s.receiptOf(event)
 	if !ok {
@@ -56,7 +57,7 @@ func (s *Session) receipt(event *waEvents.Receipt) bool {
 			Msg("withholding a receipt while the publisher is not answering")
 		return false
 	}
-	delivered := s.deliver(protocol.EventMessageReceipt, published, learned)
+	delivered := s.deliver(protocol.EventMessageReceipt, published, learned, on)
 	s.publisherAnswered(delivered)
 	return delivered
 }
