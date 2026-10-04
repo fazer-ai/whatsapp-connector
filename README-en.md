@@ -21,7 +21,7 @@
 </div>
 
 > [!IMPORTANT]
-> This channel is in beta and appears in Chatwoot as “WhatsApp (native)” with a beta badge. The installation administrator enables it for each account, following the installation steps below. The connection is unofficial and pairs as a linked device, just like WhatsApp Web. For Meta's official API, use Chatwoot's WhatsApp Cloud inbox. Report problems in [this repository's issues](https://github.com/fazer-ai/whatsapp-connector/issues).
+> This channel is in beta and appears in Chatwoot as “WhatsApp (native)” with a beta badge. It is on for every account in the installation. The connection is unofficial and pairs as a linked device, just like WhatsApp Web. For Meta's official API, use Chatwoot's WhatsApp Cloud inbox. Report problems in [this repository's issues](https://github.com/fazer-ai/whatsapp-connector/issues).
 
 ## About
 
@@ -108,13 +108,11 @@ Chatwoot starts on port 3000.
 
 ### Embedded mode
 
-Set one variable in Chatwoot:
+This is Chatwoot's default and needs no configuration: the entire integration, the event consumer in Sidekiq, and the connector itself are already on. To turn everything off, set in Chatwoot:
 
 ```bash
-WHATSAPP_CONNECTOR_ENABLED=true
+WHATSAPP_CONNECTOR_ENABLED=false
 ```
-
-This enables the entire integration, the event consumer in Sidekiq, and the connector itself.
 
 The connector uses Chatwoot's Redis server and creates its own database on the same PostgreSQL server on first startup. The database name is Chatwoot's database name followed by `_whatsapp_connector`. Media is stored in a directory local to the container, and a media token is generated each time the container starts. Chatwoot reads this token automatically.
 
@@ -124,10 +122,9 @@ If the connector crashes, it restarts automatically without taking Sidekiq down.
 
 ### Separate mode
 
-Set these variables in Chatwoot:
+Set this variable in Chatwoot:
 
 ```bash
-WHATSAPP_CONNECTOR_ENABLED=true
 WHATSAPP_CONNECTOR_EMBEDDED=false
 ```
 
@@ -156,12 +153,12 @@ WAC_MEDIA_TOKEN=a-long-random-token
 > [!WARNING]
 > If you already run the connector as a separate service, set `WHATSAPP_CONNECTOR_EMBEDDED=false` in Chatwoot before updating to an image that includes the connector. Otherwise, a second connector starts inside Sidekiq with a database that has none of your pairings, competing for the same sessions through the same Redis server.
 
-### Enable the channel for an account
+### Remove the channel from an account
 
-During the beta, the channel is visible only to accounts enabled individually. The installation administrator enables it in Chatwoot's Rails console, deliberately outside the admin interface:
+Every account sees the channel. To remove it from one account, use Chatwoot's Rails console:
 
 ```ruby
-Account.find(ACCOUNT_ID).update!(whatsapp_native_enabled: true)
+Account.find(ACCOUNT_ID).update!(whatsapp_native_disabled: true)
 ```
 
 ### Create the inbox
