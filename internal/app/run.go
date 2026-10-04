@@ -1409,7 +1409,8 @@ func (c *Connector) shutdown() {
 	// Read before the stops, because StopAll empties it: these are the accounts this
 	// instance is about to make ownerless, and after the call there is nothing left to ask.
 	giving := c.manager.SIDs()
-	c.manager.StopAll(ctx)
+	handed := c.manager.StopAll(ctx)
+	c.reportHandBack(handed.Owed, handed.Unreturned)
 	c.clearTheFloorUnderRetry(ctx, giving)
 	if err := c.registry.Withdraw(ctx, c.cfg.Instance); err != nil {
 		c.log.Warn().Err(err).Msg("failed to withdraw this instance")
@@ -1429,6 +1430,24 @@ func (c *Connector) shutdown() {
 		c.log.Warn().Err(err).Msg("failed to close the redis client")
 	}
 	c.log.Info().Msg("connector is down")
+}
+
+// reportHandBack says what the stop did with the sessions, because "connector is down" on
+// its own cannot tell a hand-back from a set of leases left to expire, and the difference
+// is whether a peer picks the accounts up now or a lease TTL from now.
+func (c *Connector) reportHandBack(owed, unreturned int) {
+	switch {
+	case owed == 0:
+		c.log.Info().Msg("no sessions to hand back")
+	case unreturned == 0:
+		c.log.Info().Int("sessions", owed).Msg("handed the sessions back")
+	default:
+		if returned := owed - unreturned; returned > 0 {
+			c.log.Info().Int("sessions", returned).Msg("handed the sessions back")
+		}
+		c.log.Warn().Int("sessions", unreturned).
+			Msg("could not hand every session back; those leases expire on their own")
+	}
 }
 
 // clearTheFloorUnderRetry drops the resume cool-off of every account this instance has

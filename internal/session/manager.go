@@ -721,6 +721,34 @@ func (m *Manager) handingBack(sid string) bool {
 // asks first.
 func (m *Manager) HandingBack(sid string) bool { return m.handingBack(sid) }
 
+// unreturned counts how many of these sessions still have a lease this instance could not
+// hand back.
+func (m *Manager) unreturned(sids []string) int {
+	m.orphanMu.Lock()
+	defer m.orphanMu.Unlock()
+	n := 0
+	for _, sid := range sids {
+		if _, queued := m.orphans[sid]; queued {
+			n++
+		}
+	}
+	return n
+}
+
+// owedHandBacks is every lease a shutdown is about to give back: the sessions running, and
+// the ones stopped earlier whose hand-back did not reach Redis and is still queued.
+func (m *Manager) owedHandBacks() []string {
+	owed := m.SIDs()
+	m.orphanMu.Lock()
+	for sid := range m.orphans {
+		if !slices.Contains(owed, sid) {
+			owed = append(owed, sid)
+		}
+	}
+	m.orphanMu.Unlock()
+	return owed
+}
+
 func (m *Manager) forgetOrphan(sid string) {
 	m.orphanMu.Lock()
 	delete(m.orphans, sid)
@@ -1882,10 +1910,25 @@ func (m *Manager) HandBackBy() time.Time {
 // bound that drifts the day either one is tuned.
 const ReleaseShare = 3
 
+// HandBack is what a StopAll did with the leases it owed: how many there were, and how
+// many of their hand-backs had still not reached Redis when it returned. Those expire on
+// their own, a lease TTL from now.
+type HandBack struct {
+	Owed       int
+	Unreturned int
+}
+
 // StopAll releases every session, which is what a SIGTERM does before the process
 // exits: a released lease is one a peer can take immediately instead of waiting a full
-// TTL for it to expire.
-func (m *Manager) StopAll(ctx context.Context) {
+// TTL for it to expire. It counts every lease it owes, including the hand-backs of
+// sessions stopped earlier that are still queued, since those are retried here too.
+func (m *Manager) StopAll(ctx context.Context) HandBack {
+	owed := m.owedHandBacks()
+	m.stopAll(ctx)
+	return HandBack{Owed: len(owed), Unreturned: m.unreturned(owed)}
+}
+
+func (m *Manager) stopAll(ctx context.Context) {
 	// Deferred, because the stops below have a way out before their end: a run where every
 	// session left is too close to its lease's end to mark returns from the loop. The
 	// sessions the lease watcher was taking down are out of the map, so nothing below

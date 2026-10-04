@@ -184,6 +184,16 @@ func start(t *testing.T, addr, instance string, env map[string]string) *app.Conn
 // start registers calls it again.
 func startStoppable(t *testing.T, addr, instance string, env map[string]string) (connector *app.Connector, stop func()) {
 	t.Helper()
+	connector, stop, _ = startStoppableLogged(t, addr, instance, env)
+	return connector, stop
+}
+
+// startStoppableLogged is startStoppable for a test whose subject is what the connector
+// says, and that has to read it back rather than see it only when the test fails.
+func startStoppableLogged(
+	t *testing.T, addr, instance string, env map[string]string,
+) (connector *app.Connector, stop func(), logged *syncBuffer) {
+	t.Helper()
 	t.Setenv("REDIS_URL", "redis://"+addr)
 	t.Setenv("WAC_INSTANCE", instance)
 	t.Setenv("WAC_ENGINE", "fake")
@@ -206,7 +216,7 @@ func startStoppable(t *testing.T, addr, instance string, env map[string]string) 
 	// at ERROR on stderr, a warning never appears at all, and at anything louder every
 	// passing test buries the run. Registered before the shutdown below so it runs after
 	// it, with everything the connector had to say already in the buffer.
-	logged := &syncBuffer{}
+	logged = &syncBuffer{}
 	t.Cleanup(func() {
 		if t.Failed() {
 			t.Logf("what the connector logged:\n%s", logged.String())
@@ -226,13 +236,15 @@ func startStoppable(t *testing.T, addr, instance string, env map[string]string) 
 			cancel()
 			select {
 			case <-done:
-			case <-time.After(10 * time.Second):
+			// The stop's own bound plus room: a stop that cannot reach Redis spends the whole
+			// grace period trying to hand its sessions back, and that is a stop, not a hang.
+			case <-time.After(app.ShutdownGrace + 5*time.Second):
 				t.Error("the connector did not shut down")
 			}
 		})
 	}
 	t.Cleanup(stop)
-	return connector, stop
+	return connector, stop, logged
 }
 
 // waitPast is waitFor for a condition a configured delay stands in front of: the delay is
