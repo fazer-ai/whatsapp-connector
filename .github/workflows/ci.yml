@@ -65,7 +65,7 @@ jobs:
           --health-timeout 5s
           --health-retries 10
 
-      # The oldest Redis docs/operations.md supports. The newest is the server least likely to refuse
+      # The oldest Redis README.md supports. The newest is the server least likely to refuse
       # anything, so a pass against it alone says nothing about the floor: `SET NX GET` is a
       # syntax error before 7.0 and passed both miniredis and the service above (#279).
       redis-floor:
