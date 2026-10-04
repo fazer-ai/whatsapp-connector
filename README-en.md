@@ -1,9 +1,9 @@
 <div align="center">
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset=".github/brand/logo-dark.png">
-  <source media="(prefers-color-scheme: light)" srcset=".github/brand/logo-light.png">
-  <img src=".github/brand/logo-light.png" alt="fazer.ai" width="200">
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="docs/assets/logo-light.png">
+  <img src="docs/assets/logo-light.png" alt="fazer.ai" width="200">
 </picture>
 
 <h1>fazer.ai WhatsApp Connector</h1>
