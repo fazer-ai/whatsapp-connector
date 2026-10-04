@@ -102,6 +102,6 @@ Usage:
   connector healthcheck   ask the local instance whether it is up
   connector version       print the build version
 
-Configuration is read from the environment; see docs/operations.md.
+Configuration is read from the environment; see the README.
 `)
 }
