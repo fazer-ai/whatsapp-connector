@@ -116,7 +116,7 @@ WHATSAPP_CONNECTOR_ENABLED=true
 
 This enables the entire integration, the event consumer in Sidekiq, and the connector itself.
 
-The connector uses Chatwoot's Redis server and creates its own database on the same PostgreSQL server on first startup. The database name is Chatwoot's database name followed by `_whatsapp_connector`. Media is stored in a directory under `storage/`, and a media token is generated each time the container starts. Chatwoot reads this token automatically.
+The connector uses Chatwoot's Redis server and creates its own database on the same PostgreSQL server on first startup. The database name is Chatwoot's database name followed by `_whatsapp_connector`. Media is stored in a directory local to the container, and a media token is generated each time the container starts. Chatwoot reads this token automatically.
 
 Any `WAC_*` variable set in the Sidekiq container overrides the corresponding setting derived from Chatwoot. Pairings survive restarts because they are stored in the database.
 

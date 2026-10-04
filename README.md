@@ -116,7 +116,7 @@ WHATSAPP_CONNECTOR_ENABLED=true
 
 Ela liga a integração inteira, o consumidor de eventos no Sidekiq e o próprio conector.
 
-O conector usa o mesmo Redis do Chatwoot e cria um banco próprio no mesmo PostgreSQL no primeiro start. O nome é o do banco do Chatwoot seguido de `_whatsapp_connector`. A mídia fica num diretório dentro de `storage/`, e o token de mídia é gerado a cada start do container. O Chatwoot lê esse token sozinho.
+O conector usa o mesmo Redis do Chatwoot e cria um banco próprio no mesmo PostgreSQL no primeiro start. O nome é o do banco do Chatwoot seguido de `_whatsapp_connector`. A mídia fica num diretório local do container, e o token de mídia é gerado a cada start do container. O Chatwoot lê esse token sozinho.
 
 Qualquer variável `WAC_*` definida no container do Sidekiq vale no lugar da configuração derivada do Chatwoot. O pareamento sobrevive a reinícios porque fica no banco.
 

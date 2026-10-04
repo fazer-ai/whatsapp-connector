@@ -35,7 +35,7 @@ The connector's configuration is derived from Chatwoot's. Any `WAC_*` variable s
 | `REDIS_URL`, `REDIS_PASSWORD` | Chatwoot's own, read as they are |
 | `WAC_ENGINE` | `whatsmeow` |
 | `WAC_DATABASE_URL` | Chatwoot's database connection (`DATABASE_URL`, else the `POSTGRES_*` variables), pointed at a database named after Chatwoot's with `_whatsapp_connector` appended: `chatwoot_production_whatsapp_connector`. `sslmode` follows the URL, then `PGSSLMODE`, then `prefer`, which is what Chatwoot's own driver does |
-| `WAC_MEDIA_ROOT` | `storage/whatsapp-connector` inside the app directory, on the storage volume when one is mounted |
+| `WAC_MEDIA_ROOT` | `whatsapp-connector` under the container's temporary directory. A cache, so it does not need to survive the container, and deliberately not on a volume replicas share: each connector sweeps the temporary files it does not know of, including another replica's downloads in progress |
 | `WAC_MEDIA_TOKEN` | random, generated when the container starts and kept across connector restarts |
 | `WAC_EVENT_SHARDS` | `WHATSAPP_CONNECTOR_EVENT_SHARDS` |
 | `WAC_REDIS_PREFIX` | `WHATSAPP_CONNECTOR_REDIS_PREFIX` |
