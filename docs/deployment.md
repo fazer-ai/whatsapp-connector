@@ -18,7 +18,7 @@ cp examples/.env.example .env     # fill in the secrets: openssl rand -hex 32
 docker compose -f examples/docker-compose.embedded.yaml --env-file .env up -d --wait
 ```
 
-Chatwoot then answers on port 3000. Enabling the channel for an account and creating the inbox are the same in both modes, and the [README](../README-en.md#install-with-chatwoot-fazerai) covers them.
+Chatwoot then answers on port 3000. Creating the inbox, and removing the channel from an account, are the same in both modes, and the [README](../README-en.md#install-with-chatwoot-fazerai) covers them.
 
 ## Embedded in Sidekiq
 
