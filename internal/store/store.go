@@ -1086,7 +1086,7 @@ func parseURL(address string) (dialect, dsn string, err error) {
 
 // sqliteDefaults fills in what the driver leaves off and whatsmeow needs on. An
 // operator who spells any of these themselves keeps their value; the defaults are for
-// the url the README documents, which is a path and nothing else.
+// the url docs/operations.md documents, which is a path and nothing else.
 //
 // Each one is here because of a failure, not a preference:
 //

@@ -15,7 +15,7 @@ const realRedisVar = "WAC_TEST_" + "REDIS_URL"
 
 // Every package with a test that runs against a real Redis is in `make test-redis`, which
 // is the only pass that sets the variable: `make test` clears it, and CI runs that target
-// against the newest Redis and against the oldest one README.md supports.
+// against the newest Redis and against the oldest one docs/operations.md supports.
 //
 // A test of that kind in a package the target does not name is skipped in every pass
 // there is, and green by skipping. #279 is the shape of what that hides: a command form

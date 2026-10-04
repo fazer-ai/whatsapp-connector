@@ -10,7 +10,7 @@ import (
 
 // The oldest Redis this connector runs against. `XAUTOCLAIM`, which the transport reclaims
 // commands with, arrived in 6.2, so on an older server the reclaim fails on every pass
-// while the process reports itself healthy. It is what README.md documents and what CI
+// while the process reports itself healthy. It is what docs/operations.md documents and what CI
 // runs a pass against.
 const (
 	minMajor = 6

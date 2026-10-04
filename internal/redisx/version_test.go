@@ -134,7 +134,7 @@ func TestMiniredisIsAboveTheFloor(t *testing.T) {
 
 // The server `make test-redis` names, which CI points at the newest Redis and at the floor.
 // Both have to start: a check that refused the floor itself would refuse every deployment
-// that followed the README.
+// that followed docs/operations.md.
 func TestARealServerAtOrAboveTheFloorIsAccepted(t *testing.T) {
 	t.Parallel()
 

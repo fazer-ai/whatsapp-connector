@@ -127,7 +127,7 @@ func TestATurnHeldByAnInstanceStillInTheFleetIsLeftAlone(t *testing.T) {
 // cannot stop being a deliberate choice.
 //
 // Deciding by identity means the question is "whose name is on this turn", and a name is
-// only as good as its uniqueness. `WAC_INSTANCE` defaults to the hostname, and README.md
+// only as good as its uniqueness. `WAC_INSTANCE` defaults to the hostname, and docs/operations.md
 // says what that is worth: in a container the hostname is the container id, unique per
 // replica, so a process that dies and comes back is a different name and the turn it left
 // reads as gone. That is the deployment shape this repository ships and the one #272 was

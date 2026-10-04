@@ -105,7 +105,7 @@ test-postgres-server: ## Start the PostgreSQL the PostgreSQL pass runs against, 
 
 # Every package with a test that reads WAC_TEST_REDIS_URL, which `internal/toolchain` holds
 # this list to: a package left off is skipped in every pass there is. CI runs this target
-# twice, against the newest Redis and against the oldest one README.md supports, because a
+# twice, against the newest Redis and against the oldest one docs/operations.md supports, because a
 # command form the floor refuses passes against the newest (#279). Locally one server is
 # enough for `make check`; to run the floor pass, point WAC_TEST_REDIS_URL at a 6.2:
 #   docker run -d --rm -p 56362:6379 redis:6.2-alpine

@@ -48,6 +48,19 @@ internal/store/      Postgres/SQLite persistence, fenced against a lost lease
 internal/media/      blob store, inbound download, outbound fetch
 ```
 
+## Where the docs go
+
+- `README.md` (PT-BR) and `README-en.md` are the product page, in the shape of the
+  `fazer-ai/chatwoot` and `fazer-ai/agents` READMEs: what it is, what it does, how to
+  install it next to Chatwoot, limitations, links. They are authorial text, so their prose
+  is drafted by Codex from a brief and edited here, never written by hand; the two stay in
+  step, and a change to one is a change to both.
+- Everything technical is in English and lives elsewhere: `docs/operations.md` (running,
+  the configuration table, Redis), `docs/architecture.md`, `docs/limitations.md`,
+  `docs/roadmap.md`, and `CONTRIBUTING.md` (development, the fleet bench, changing the
+  protocol). A new environment variable goes in the `docs/operations.md` table; the README
+  lists only the minimum to get a session up.
+
 ## The contract comes first
 
 - `contract/` is language neutral. Never put Go (or any other language) files in it:

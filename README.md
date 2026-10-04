@@ -1,402 +1,183 @@
-# whatsapp-connector
+<div align="center">
 
-<a href="https://fazer.ai?utm_source=github&utm_medium=en&utm_campaign=whatsapp-connector"><img alt="fazer.ai logo" src="https://framerusercontent.com/images/HqY9djLTzyutSKnuLLqBr92KbM.png?scale-down-to=256" height="75"/></a>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/brand/logo-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset=".github/brand/logo-light.png">
+  <img src=".github/brand/logo-light.png" alt="fazer.ai" width="200">
+</picture>
 
-Session-based WhatsApp connector for [fazer.ai Chatwoot](https://github.com/fazer-ai/chatwoot).
-One process owns N WhatsApp sessions, speaks the WhatsApp multi-device protocol
-through [whatsmeow](https://github.com/tulir/whatsmeow), and exchanges canonical
-events and commands with its clients over Redis Streams.
+<h1>fazer.ai WhatsApp Connector</h1>
+
+<p>WhatsApp pelo QR code no Chatwoot fazer.ai.</p>
+<p>Sessões no seu servidor, sem API paga de terceiros.</p>
+
+**Português (Brasil)** · [English](README-en.md)
+
+[![Release](https://img.shields.io/github/v/release/fazer-ai/whatsapp-connector)](https://github.com/fazer-ai/whatsapp-connector/releases)
+[![Imagem Docker](https://img.shields.io/badge/ghcr.io-whatsapp--connector-2496ED?logo=docker&logoColor=fff)](https://github.com/fazer-ai/whatsapp-connector/pkgs/container/whatsapp-connector)
+![Licença: MIT](https://img.shields.io/badge/licen%C3%A7a-MIT-3B82F6)
+![Go](https://img.shields.io/badge/Go-00ADD8?logo=go&logoColor=fff)
+
+</div>
 
 > [!IMPORTANT]
-> **Status: M2 and M3 are in, both ways.** A session pairs with a real WhatsApp account, resumes
-> across restarts, publishes the text messages that arrive on it, and sends text back:
-> quotes, mentions and the chat's disappearing-message timer included. `groups` on the
-> connect decides whether group chats come with them, and a group is created, read, renamed, given a description, a photo and its settings, left, and its participants and join requests administered; a contact is checked for an account, asked for its profile and its picture; a call the account is rung for reaches the inbox, and is refused as it arrives when the connect asked for that. An inbound image, video, audio,
-> document or sticker is downloaded as it arrives, kept in this instance's blob cache and
-> published as a reference the client fetches over HTTP; a file WhatsApp will not serve
-> again is announced with `media.download_failed` so the bubble says the attachment is
-> unavailable rather than loading forever. A blob lives on the instance that downloaded it
-> and for a bounded time, and `message.download_media` fetches the file again from the
-> coordinates kept beside the message, so an attachment survives the instance being
-> replaced between the event and the client's fetch. When WhatsApp has dropped the file
-> but the sender's phone may still hold it, that same command asks the phone to upload it
-> again, and the failure that announced it says `recoverable` so a client knows to ask.
->
-> Outbound, a media message names a URL this connector fetches, with whatever headers open
-> it, and streams to WhatsApp without holding the file in memory; a location goes out as a
-> pin with the name and the street beside it, and contacts as a card or a stack of them,
-> with the vCard written here when the caller only has a name and a number. Anything the
-> caller's own address answers is separated into what it has to fix and what is worth
-> another go, because a client told the wrong one either retries forever or gives up on a
-> file that would have arrived.
->
-> A file sent to be seen once is announced as unavailable and never kept: a blob is served
-> for as long as anybody keeps asking for it, so storing one would turn something the
-> sender expected to disappear into something the account holds indefinitely. WhatsApp
-> usually does not hand one to a linked device at all, and what it sends instead reaches
-> the inbox as a placeholder, asked of the phone first and published on its own if the
-> phone never answers -- how long to wait before giving up on it is still a guess
-> ([#51](https://github.com/fazer-ai/whatsapp-connector/issues/51)). What this build
-> cannot render is left unacknowledged on WhatsApp's side, with its plaintext buffered so
-> the redelivery can still be read: the
-> account keeps the message and delivers it again once there is somewhere to put it. A
-> number paired on this build therefore still accumulates a backlog of everything it cannot
-> render (see [Roadmap](#roadmap)).
->
-> Around the messages, what a conversation looks like while nobody is writing one: the
-> ticks a message collects on their way to being read, a read mark this account can set
-> on somebody else's, the typing and recording indicators both ways, and whether a
-> contact is at their phone. A `composing` or a `recording` is the one shape here that
-> describes a moment rather than a fact, and it is the only thing this connector drops
-> when it goes stale instead of retrying it: delivered a minute late it is somebody shown
-> typing who stopped long ago, and the state that would have corrected it went out while
-> the stale one was still on its way. The stop that ends a burst is not like that, and
-> neither is an availability -- both hold until something says otherwise. WhatsApp forgets
-> both on a reconnect, so the session remembers the availability it was asked for and puts
-> it back as soon as a connection comes up. Subscriptions are deliberately not reapplied:
-> which parties are worth watching is the client's to know, and `session.state: open` is
-> where it re-establishes them. The availability is kept next to the account rather than
-> in the session, so an instance that takes the account over puts back the state its
-> client asked for without having heard the command.
->
-> A message is acknowledged to WhatsApp only after its event reaches the stream, so
-> losing Redis costs a redelivery and never a message. The client deduplicates on the
-> message id, which is what makes that trade safe. A send is answered from the other
-> end of the same trade: what a command did is remembered under
-> `wa:idem:<sid>:<key>`, so a redelivery is answered with the first run's result
-> instead of being carried out again.
+> O canal está em beta e aparece no Chatwoot como “WhatsApp (nativo)”, com selo de beta. Quem administra a instalação libera cada conta, conforme os passos de instalação abaixo. A conexão é não oficial, pareada como um aparelho conectado, igual ao WhatsApp Web. Para a API oficial da Meta, use a caixa WhatsApp Cloud do Chatwoot. Relate problemas nas [issues deste repositório](https://github.com/fazer-ai/whatsapp-connector/issues).
 
-## Why a separate service
+## O que é
 
-A WhatsApp session is a long-lived, stateful socket with its own reconnect and
-key-rotation lifecycle. That does not fit a request/response Rails process or a
-Sidekiq job, and it does not want the release cadence of an application either: the
-WhatsApp protocol moves roughly twice a month, so this ships as its own image with
-its own hotfix cadence.
+O fazer.ai WhatsApp Connector é um serviço em Go que mantém sessões de WhatsApp de várias contas num único processo. Cada sessão funciona como um aparelho conectado da conta, pelo protocolo multi-device, usando a biblioteca [whatsmeow](https://github.com/tulir/whatsmeow).
 
-Keeping the WhatsApp side behind an explicit contract also means the client never
-sees a JID, a protobuf, or a library-specific shape. The same canonical events reach
-Chatwoot whether they came from this connector or from a hosted WhatsApp API
-translated on the client side.
+O conector troca eventos e comandos com o [Chatwoot fazer.ai](https://github.com/fazer-ai/chatwoot) pelo Redis que a instalação já usa. Essa comunicação segue o contrato versionado em [`contract/`](contract/). O Chatwoot recebe eventos canônicos, sem depender de detalhes da biblioteca.
 
-## How it fits together
+A sessão do WhatsApp mantém um socket aberto por longos períodos e cuida da própria reconexão. Como o protocolo do WhatsApp muda com frequência, o conector tem imagem e ciclo de release próprios. Assim, ele pode ser atualizado sem esperar uma release do Chatwoot.
 
-```
-        ┌──────────────────────────────┐          ┌────────────────────────────┐
-        │ client (fazer-ai/chatwoot)   │          │ whatsapp-connector         │
-        │                              │          │                            │
-        │  consumer  ◀── wa:events:<n> ─┼──────────┼── publisher                │
-        │  client    ─── wa:cmd:<sid> ─▶┼──────────┼─▶ session executor         │
-        │            ◀── wa:reply:<id> ─┼──────────┼── (RPC answers)            │
-        └──────────────────────────────┘          │      │                     │
-                        Redis                     │      ▼                     │
-                                                  │  engine (whatsmeow)        │
-                                                  │  store (Postgres/SQLite)   │
-                                                  └────────────────────────────┘
-```
+## O que ele faz
 
-A session is owned by exactly one instance at a time, arbitrated by a Redis lease.
-Every event carries the owner's `epoch`, and `seq` is monotonic per `(sid, epoch)`,
-so a client can drop anything it has already seen or that comes from a stale owner.
+### Conexão
 
-## Layout
+- Pareamento por QR code ou por código de 8 caracteres digitado no celular.
+- Quando o WhatsApp pede confirmação por passkey, o desafio segue para o Chatwoot e o código de confirmação aparece para o operador.
+- A sessão volta sozinha depois de um reinício do conector, sem parear de novo.
+- Proxy por sessão, com http, https ou socks5. Se o proxy cair, a sessão nunca se conecta diretamente.
+- Importação opcional do histórico do celular ao conectar e pedido de mensagens mais antigas de uma conversa.
 
-```
-contract/                 protocol v1: JSON Schema + golden fixtures (source of truth)
-cmd/connector/            the binary: serve, healthcheck, version
-internal/protocol/        Go binding for the contract: frames, type catalog, error codes
-internal/redisx/          the Redis key layout, and the session to shard mapping
-internal/transport/       publish, read commands, reply — Redis Streams behind an interface
-internal/cluster/         leases, epochs and the instance registry: who owns a session
-internal/session/         one account: the event pump and the per-session command queue
-internal/engine/          the WhatsApp side behind an interface, plus a fake for tests
-internal/observability/   the redacting logger and the metric set
-internal/store/           the device store and which session paired which device
-internal/media/           the blob cache for inbound media, and the endpoint that serves it
-internal/httpserver/      /healthz, /readyz, /metrics
-internal/app/             configuration and the run loop that ties them together
-```
+### Mensagens
 
+- Texto, imagem, vídeo, áudio, documento, figurinha, localização e contatos, nos dois sentidos.
+- Respostas citando mensagens, menções, reações, edição e exclusão.
+- Respeita o temporizador de mensagens temporárias da conversa.
+- Mídia recebida baixada na hora e entregue ao Chatwoot por HTTP. Se o arquivo sumir do servidor do WhatsApp, o conector pede ao celular do remetente que o reenvie.
+- Mídia enviada lida da URL que o Chatwoot informa, em fluxo, sem carregar o arquivo inteiro na memória.
+- Mídia de visualização única aparece como indisponível e nunca é guardada.
 
-## Protocol
+### Conversa
 
-See [`contract/PROTOCOL.md`](contract/PROTOCOL.md) for the frame shapes, the Redis key
-map and the compatibility rules. In short:
+- Confirmações de entrega e leitura, além da opção de marcar como lida.
+- Indicadores de “digitando” e “gravando áudio” nos dois sentidos, além da presença do contato.
 
-- **Events** (connector → client) describe what happened: `message.received`,
-  `message.receipt`, `session.state`, `pairing.qr`, ... The catalog is the contract's,
-  so it is wider than this build: the types nothing here produces yet are marked in
-  `internal/protocol/types.go`.
-- **Commands** (client → connector) ask for something: `message.send`,
-  `session.connect`, `group.participants.update`, ... RPC commands get a single
-  answer on `wa:reply:<command id>`; the rest are fire and forget and report failures
-  as a `command.failed` event.
-- **Addresses** are canonical (`{kind: phone|lid|group|..., id}`), timestamps are
-  epoch milliseconds, and media never travels inside a frame.
-- `contract/PROTOCOL_VERSION` is a major version. Additive changes do not bump it; a
-  connector serves the current major and the one before it.
+### Grupos
 
-### What `calls.auto_reject` does not silence
+- Criar, renomear, alterar descrição, foto e configurações, além de sair do grupo.
+- Adicionar, remover, promover e rebaixar participantes.
+- Link de convite e pedidos de entrada.
 
-A caller on WhatsApp Web ignores the refusal. The connector writes the same node it writes
-for anybody else, WhatsApp routes it, and the browser on the other end goes on ringing.
+### Contatos e chamadas
 
-Twenty-seven calls to a paired account, with every node in both directions captured, divide
-on one attribute of the offer and on nothing else -- the caller's `platform`:
+- Verificação de número com WhatsApp, consulta de perfil e foto do contato.
+- Chamadas recebidas aparecem na caixa de entrada, com recusa automática opcional.
 
-| caller | calls | ended by the refusal |
-| --- | --- | --- |
-| `android` | 22 | every one that had a refusal written into it, in 0.4s to 1.6s |
-| `web` | 5 | none |
+## Feito para não perder mensagem
 
-The two web calls that were left to run ended on their own: one rang its full 89.8s and
-ended `timeout`, the other at 11s when the caller hung up. The `call-creator` on a web
-offer carries a device suffix and on an Android offer does not, which is how the two tell
-apart in a capture, but nothing this connector writes changes the outcome either way.
+- O conector só confirma uma mensagem ao WhatsApp depois de publicá-la no Redis. Se o Redis cair, o WhatsApp reentrega a mensagem.
+- Quando o Redis volta, o conector encerra a própria conexão com o WhatsApp para receber de novo, na hora, o que ficou sem confirmação. Isso não precisa esperar a próxima queda da conexão.
+- Comandos são idempotentes: um envio repetido pela fila não envia a mensagem duas vezes.
+- Várias instâncias podem rodar juntas. Cada sessão tem um único dono por vez, definido por uma lease no Redis. Se uma instância cair, outra assume a sessão.
+- Se uma instância ficar sem Redis por mais tempo que a lease, ela fecha a sessão sozinha. Outra pode assumir sem que as duas atendam ao mesmo tempo.
+- Métricas Prometheus em `/metrics` e endpoints de healthcheck em `/healthz` e `/readyz`, na porta 8080.
 
-It matters to whoever reads the inbox rather than to the code: with the policy on, the
-operator's phone still rings for somebody who dialled from a browser, and nothing in the
-events tells that case apart. Most callers to an inbox dial from a phone, so the policy
-does what it says nearly always, and "nearly" is the part worth knowing before somebody
-reports it as a bug.
+## Instalar com o Chatwoot fazer.ai
 
-### What an account under Coexistence does not have
+### Requisitos
 
-A number running [Coexistence](https://docs.360dialog.com/docs/resources/phone-numbers/coexistence),
-which is the WhatsApp Business app and the Cloud API on the same number, does not do voice
-or video calls, group chats, broadcast lists, disappearing messages, view-once messages,
-live location or the catalog. That is the platform's rule and not this connector's: the
-call never reaches any linked device, including WhatsApp's own web client, so `call.offer`
-is never published and `calls.auto_reject` has nothing to refuse.
+- Chatwoot fazer.ai recente. O provedor nativo já vem nas duas edições.
+- O mesmo Redis do Chatwoot, na versão 6.2 ou mais nova.
+- Um banco para os pareamentos: PostgreSQL próprio do conector para várias instâncias ou SQLite para uma instância só.
 
-Measured on a paired Coexistence account with every node dumped: not one `<offer>` arrived,
-across every call placed to it. What did arrive was the other half of the exchange -- two
-`<reject>` broadcasts naming calls this device was never offered, one of them
-`reason="busy"` -- which is WhatsApp telling a linked device about a call refused somewhere
-it could not see. Somebody reading that capture will find call traffic and should not read
-it as the offer having been missed.
+### Imagem
 
-Nothing on the wire tells such a number apart. Its `<pair-success>` carries the same
-`platform` as any other business account and a `<biz>` with only a name, so the connector
-cannot detect it and does not guess: inferring it from an absence would mark a healthy new
-inbox as limited. A client that onboarded the number knows which path it came in by, and
-that is where the warning belongs.
+Use a imagem pública `ghcr.io/fazer-ai/whatsapp-connector:latest`. Há tags por release, como `0.5.0` e `0.5`. Para fixar a versão, use a tag correspondente.
 
-## Development
+### Variáveis do conector
 
-Requirements: Go (version in `go.mod`) and
-[golangci-lint](https://golangci-lint.run/) v2. Most tests bring their own doubles
-(`miniredis`, SQLite), and two passes do not: the suite against a real PostgreSQL, which
-is the dialect a deployment runs, and the packages that talk to Redis against a real one,
-for what miniredis answers differently from a server. `make check` runs all of it and
-needs both servers; `make check-offline` is the half that needs nothing listening.
-
-CI runs the Redis pass twice: against `redis:8`, and against `redis:6.2`, the oldest
-version this connector supports, because a command form newer than the floor passes
-against the newest server and miniredis alike. `make check` asks for one Redis and does
-not run the floor pass. To run it locally, point `WAC_TEST_REDIS_URL` at a 6.2:
+Configure, no mínimo, estas variáveis com os valores da sua instalação:
 
 ```bash
-docker run -d --rm -p 56362:6379 redis:6.2-alpine
-WAC_TEST_REDIS_URL=redis://localhost:56362/0 make test-redis
+REDIS_URL=redis://redis:6379
+WAC_ENGINE=whatsmeow
+WAC_DATABASE_URL=postgres://wac:senha@postgres:5432/wac
+WAC_MEDIA_ROOT=/data/media
+WAC_MEDIA_TOKEN=um-token-longo-e-aleatorio
 ```
+
+- `REDIS_URL` usa de propósito o mesmo nome de variável e o mesmo servidor do Chatwoot.
+- Sem `WAC_MEDIA_ROOT`, nenhuma mídia recebida chega ao Chatwoot. Quando ela está definida, `WAC_MEDIA_TOKEN` é obrigatório. O Chatwoot lê o token sozinho, pelo registro do conector no Redis.
+- `WAC_EVENT_SHARDS`, com padrão 16, precisa ser igual a `WHATSAPP_CONNECTOR_EVENT_SHARDS` do Chatwoot.
+- Use armazenamento persistente para `WAC_MEDIA_ROOT` e para o banco. O pareamento sobrevive a reinícios porque fica no banco.
+- A tabela completa de variáveis está em [docs/operations.md](docs/operations.md).
+
+### No Chatwoot
 
 ```bash
-make setup          # git hooks + module download
-make check-offline  # lint, go mod tidy, and the suite against SQLite
-
-# Everything CI enforces, which needs a server for each of the two dialect passes.
-# Any free port will do; these avoid whatever is already on 5432 and 6379. The PostgreSQL
-# is the one CI starts, without durability: every test creates and drops a database, and a
-# durable server spends the pass on that (#342).
-make test-postgres-server
-docker run -d --rm -p 56379:6379 redis:8-alpine
-WAC_TEST_DATABASE_URL=postgres://wac:wac@localhost:55432/wac?sslmode=disable \
-WAC_TEST_REDIS_URL=redis://localhost:56379/0 make check
-make help    # every target
+WHATSAPP_CONNECTOR_ENABLED=true
 ```
 
-`make setup` points git at the versioned hooks in `.githooks/`: `pre-commit` refuses
-unformatted Go and runs the contract test, `commit-msg` enforces Conventional
-Commits.
+Essa variável liga a integração inteira, inclusive o consumidor de eventos que roda no Sidekiq.
 
-### Running one
+### Liberar o canal para uma conta
+
+Durante o beta, o canal aparece só para contas liberadas individualmente. Quem administra a instalação faz a liberação no console Rails do Chatwoot, de propósito fora da tela de administração:
+
+```ruby
+Account.find(ID_DA_CONTA).update!(whatsapp_native_enabled: true)
+```
+
+### Criar a caixa de entrada
+
+No Chatwoot, vá a **Configurações > Caixas de entrada > Adicionar > WhatsApp > WhatsApp (nativo)**. Pareie pelo QR code ou pelo código digitado no celular.
+
+### Migrar uma caixa existente
+
+Você pode converter uma caixa existente, por exemplo Baileys, para o nativo sem perder o histórico de conversas da caixa:
 
 ```bash
-docker run --rm -p 6379:6379 redis:7-alpine   # in another terminal
-REDIS_URL=redis://127.0.0.1:6379 WAC_ENGINE=fake go run ./cmd/connector serve
+bundle exec rails "whatsapp:providers:convert[ID_DA_CAIXA,native]"
+APPLY=1 bundle exec rails "whatsapp:providers:convert[ID_DA_CAIXA,native]"
 ```
 
-`WAC_ENGINE=fake` pairs instantly with nothing behind it, publishes the same frames a
-real session would, and answers the commands the contract's result table names. It is
-what the tests run against, and what an operator can point a client at to see the whole
-path work without a phone.
+A primeira linha mostra o que vai acontecer. A segunda executa a conversão. Depois, pareie de novo na caixa de entrada.
 
-`WAC_ENGINE=whatsmeow` is the real thing, and it needs somewhere to keep a pairing:
+Para instalar pelo Coolify, siga o [guia de deploy do Chatwoot fazer.ai](https://github.com/fazer-ai/chatwoot/blob/main/docker/README-coolify-deploy.md), em português. Ele inclui o conector.
+
+## Limitações conhecidas
+
+- A recusa automática de chamada não silencia quem liga pelo WhatsApp Web. O navegador de quem ligou continua chamando.
+- Números em Coexistence, com app WhatsApp Business e API oficial no mesmo número, não recebem chamadas, grupos, listas de transmissão, mensagens temporárias, visualização única nem localização em tempo real. É uma regra da plataforma.
+- Mensagens de tipos que esta versão ainda não reconhece, como uma enquete, aparecem na conversa como um aviso de que algo foi enviado, sem o conteúdo.
+- Veja os detalhes em [docs/limitations.md](docs/limitations.md). As limitações abertas e os próximos recursos estão nas [issues do repositório](https://github.com/fazer-ai/whatsapp-connector/issues) e em [docs/roadmap.md](docs/roadmap.md).
+
+## Documentação
+
+- [Arquitetura](docs/architecture.md): organização do serviço, posse das sessões e resumo do protocolo.
+- [Operação](docs/operations.md): como rodar o conector, todas as variáveis e Redis suportado.
+- [Limitações conhecidas](docs/limitations.md): restrições e comportamentos que afetam o uso.
+- [Roadmap](docs/roadmap.md): o que já está pronto e o que falta.
+- [Protocolo](contract/PROTOCOL.md): o contrato com o cliente, em inglês.
+- [Contribuição](CONTRIBUTING.md): desenvolvimento, testes e como mudar o protocolo.
+
+## Desenvolvimento
+
+Use a versão de Go declarada no `go.mod` e golangci-lint v2. Para preparar o ambiente e rodar as verificações que não dependem de servidores:
 
 ```bash
-REDIS_URL=redis://127.0.0.1:6379 \
-  WAC_ENGINE=whatsmeow WAC_DATABASE_URL=sqlite:wa.db \
-  go run ./cmd/connector serve
+make setup
+make check-offline
 ```
 
-Postgres (`postgres://…`) is what a fleet runs, since a session that moves between
-instances has to find its device wherever it lands. SQLite is the single-instance case.
-Starting the whatsmeow engine without a database is refused rather than defaulted: a
-connector with nowhere to keep a pairing asks every session to scan a QR code on every
-restart, and reports itself healthy while doing it.
+O `make check` roda todas as verificações da CI e precisa de PostgreSQL e Redis. Os detalhes estão em [CONTRIBUTING.md](CONTRIBUTING.md).
 
-Give each connector a PostgreSQL database of its own. Its tables go in whichever schema
-the connection's `search_path` resolves to, and whatsmeow's upgrade looks for its version
-table in every schema it can see: a `whatsmeow_version` in a schema that path does not
-reach, whether another connector's or another application's, makes the connector refuse
-to start rather than guess which one is its own. So does a path that puts another schema in
-front of the one holding the tables, since new tables would go there and the store would be
-read from two places.
+## Suporte e comunidade
 
-### The fleet bench
+- Dúvidas de instalação e uso: [perguntas e respostas da Comunidade Lucas Moreira](https://www.lucasmoreira.ai/c/perguntas-e-respostas).
+- Bugs e pedidos de funcionalidade: [issues no GitHub](https://github.com/fazer-ai/whatsapp-connector/issues).
 
-Leases, epochs, shards, `seq` and fencing are the half of this connector that only two
-processes under load can disprove, and the suite runs in one. `make bench-fleet` starts a
-real fleet against a real PostgreSQL and a real Redis, kills the owner with commands in
-flight, and asserts the operational invariants over what reached the streams:
+## Licença
 
-```bash
-WAC_TEST_DATABASE_URL=postgres://wac:wac@localhost:55432/wac?sslmode=disable \
-WAC_TEST_REDIS_URL=redis://localhost:56379/0 make bench-fleet
-```
+Licença MIT, copyright (c) 2026 FAZER.AI LTDA. Consulte [LICENSE](LICENSE). O conector usa a whatsmeow, sob Mozilla Public License 2.0. Componentes de terceiros mantêm suas respectivas licenças.
 
-It runs with `WAC_ENGINE=fake`, and the run says so in its own output, so that no number
-it prints is ever read as a number about the real engine. The fake is not a shortcut
-around the thing being measured: none of the machinery these assertions are about knows
-which engine is behind the session. What the choice costs is that **whatsmeow under an
-ownership change is not covered by this bench and cannot be** -- pairing a real account
-needs a physical device (`NEEDS_PHYSICAL_DEVICE`), and no run of it ever touches a real
-WhatsApp account. So a green run says the fleet's own machinery holds across processes;
-it does not say whether a real socket, a real pairing and a real message survive an
-ownership change. That half has no measurement here.
+## Links
 
-It answers in four exit codes, because a script reads the code and not the prose:
+- [Chatwoot fazer.ai](https://github.com/fazer-ai/chatwoot)
+- [whatsmeow](https://github.com/tulir/whatsmeow)
+- [fazer.ai](https://fazer.ai)
 
-| code | outcome | what it means |
-|---|---|---|
-| 0 | `VERDE` | every assertion held |
-| 1 | `INVARIANTE QUEBRADA` | an operational invariant is broken: a defect |
-| 2 | `SETUP INCOMPLETO` | the machine was not ready: not a defect, and not a pass |
-| 3 | `MEDIDA FORA DA FAIXA` | a measurement fell outside a range somebody declared |
-
-One code for all of them is what turns a bad capacity number into a rejection and a broken
-invariant into "that number again", so they are kept apart on purpose. **`make` cannot keep
-them apart**: GNU make exits 2 for any failing recipe, whatever the recipe's own code was.
-A script that needs the three failures told apart runs the binary the target builds:
-
-```bash
-go build -o bin/fleetbench ./cmd/fleetbench
-WAC_TEST_DATABASE_URL=… WAC_TEST_REDIS_URL=… bin/fleetbench; echo $?
-```
-
-`make bench-fleet` prints the code it got before it exits, and make's own
-`*** [bench-fleet] Error 3` names it too, so a human reading the output sees which of the
-three it was. What neither of them changes is the status make leaves behind, which is 2.
-
-It is deliberately outside `make check`: it builds a binary, starts processes and waits on
-real clocks, which is minutes rather than the seconds `check` is allowed on every change.
-The exemption is recorded in `internal/toolchain`, where the suite reads it.
-
-### Configuration
-
-| Variable | Default | What it is |
-|---|---|---|
-| `REDIS_URL` | `redis://127.0.0.1:6379` | The Redis shared with the client, 6.2 or newer (see below). Deliberately not `WAC_`-prefixed: both sides read the same variable, so they cannot be pointed at different servers |
-| `REDIS_PASSWORD` | — | Overrides the password in the URL, for deployments that pass the two separately |
-| `WAC_INSTANCE` | the hostname | This instance's id. In a container the hostname is the container id, which is unique per replica |
-| `WAC_REDIS_PREFIX` | `wa:` | Namespaces every key, so one Redis can host two independent fleets |
-| `WAC_EVENT_SHARDS` | `16` | How many event streams the fleet publishes to. Fleet-wide and effectively permanent: an instance that disagrees with what is recorded refuses to start |
-| `WAC_ENGINE` | `fake` | `whatsmeow` for a real account, `fake` for a fleet with nothing behind it |
-| `WAC_DATABASE_URL` | none | Where pairings live. `postgres://…`, `sqlite:…` or `file:…`. Required by the `whatsmeow` engine |
-| `WAC_DATABASE_MAX_CONNS` | `20` | Ceiling on the Postgres pool. There is one pool per process, shared by every session on it, and a connection is taken per query rather than held per account, so this bounds concurrent queries and not paired numbers. Left uncapped, `database/sql` opens one per concurrent query and a burst can reach Postgres's own `max_connections`, which refuses connections to every other application on that server. Ignored for SQLite, where a file holds one writer whatever the pool says |
-| `WAC_DEVICE_NAME` | `Chrome` | What the account's linked-devices list shows, paired with a CHROME platform so the entry reads like the web session it behaves as. A browser's name because that is what the list is full of, and a row naming a product nobody recognises is the one part of the handshake that says out loud this is not a browser. Fleet-wide, not per session: whatsmeow keeps device properties process-wide |
-| `WAC_HTTP_ADDR` | `:8080` | Where `/healthz`, `/readyz` and `/metrics` listen |
-| `WAC_ADVERTISE_URL` | derived | How clients reach this instance for media |
-| `WAC_MEDIA_ROOT` | unset | Where inbound media is cached. Unset turns the store and the endpoint off, and every media message is then published with `media.download_failed` behind it |
-| `WAC_MEDIA_TOKEN` | unset | Bearer token the media endpoint requires. Required whenever `WAC_MEDIA_ROOT` is set: the endpoint hands out message contents |
-| `WAC_MEDIA_TTL` | `24h` | How long a blob is kept without being collected. The cache is walked every half of it, between a second and a minute, so a short TTL is swept often |
-| `WAC_MEDIA_QUOTA` | `2GiB` | Disk the blobs may take, counted in whole blocks and including each blob's description. Over it, the least recently collected go first |
-| `WAC_MEDIA_MAX_BLOB` | `100MiB` | The largest single file this instance keeps, and the most an inbound download is allowed to move. The file is written straight to the cache and a transfer is refused at the byte past this, so what a sender who understates its length can make this instance hold is bounded here rather than by whatever the far end decides to serve |
-| `WAC_MEDIA_BLOCK_SIZE` | `4KiB` | The allocation unit of the volume the cache sits on. Set it to match a filesystem formatted with larger units, or every file is undercharged against the quota |
-| `WAC_MEDIA_SEND_MAX` | `100MiB` | The largest file this instance will send. Independent of the cache: an instance given no `WAC_MEDIA_ROOT` at all still sends, and the caller's own declared size is refused against this before anything is fetched. WhatsApp's own ceiling is per type and moves on its own schedule, so a file past that is refused by WhatsApp with an answer the caller is told. The binding limit is the command's own deadline rather than this, so a caller that sends a fixed one never reaches this cap however high it is set: what has to fit inside that deadline is the fetch, the encryption pass and the upload together. The supported client used to allow 18 seconds for every send and now sizes a send carrying a file from the length it declares ([fazer-ai/chatwoot#479](https://github.com/fazer-ai/chatwoot/pull/479)); a client that does not is still bounded by whatever it sends ([#29](https://github.com/fazer-ai/whatsapp-connector/issues/29)) |
-| `WAC_MEDIA_REFETCH_TTL` | `168h`, or `WAC_MEDIA_TTL` when that is longer | How long a message can still be asked for its file again, after the blob it was published with has gone. Must be at least `WAC_MEDIA_TTL`, which is why the default follows it up. What is kept for that long is a row per media message holding the key to the file, so it is retention rather than cache |
-| `WAC_LEASE_TTL` | `30s` | How long a session lease survives without a renewal |
-| `WAC_HEARTBEAT` | `5s` | How often leases are renewed and the instance re-announces. Also bounds how long a read waits on Redis (half a heartbeat), and has to leave room for the read and the batch before it: `1.5 × heartbeat + lease/3 < lease` |
-| `WAC_CLAIM_MIN_IDLE` | `1.5 × lease` | How long a command sits unacknowledged before another instance takes it over. Must exceed `WAC_LEASE_TTL` |
-| `WAC_LOG_LEVEL` | `info` | zerolog level |
-
-### Which Redis
-
-Redis 6.2 or newer. `XAUTOCLAIM`, which the transport reclaims unanswered commands with,
-arrived in 6.2, so that is the floor. The connector asks the server its version with
-`HELLO` when it starts and refuses to start below 6.2, or when the server does not say
-which version it runs, naming both. It does that before it writes anything to Redis, so a
-refused instance leaves no trace in the fleet. A server that speaks the Redis protocol
-under another name, such as Valkey, is held to the version it reports.
-
-Two things need 7.0 and are absent on 6.2, where the server does not report the counters
-they read: the warning when a `MAXLEN` trim cut commands nobody was handed, and the lag of
-a consumer group. On 6.2 every group reports `wac_stream_lag_unknown 1` and no
-`wac_stream_lag` sample; `wac_stream_pending` and `wac_stream_consumers` are reported as
-on any other version.
-
-### The one key that never expires
-
-`wa:lease-epoch:<sid>` has no TTL, deliberately, and `contract/PROTOCOL.md` says why: it
-is the fencing token a client uses to tell the current owner of a session from a previous
-one, so a counter that restarted would let a stale owner out-rank the live one and
-overwrite its state. Do not give it an `EXPIRE`. `internal/cluster/lease_test.go` fails if
-anyone does.
-
-What that costs is a key of roughly sixty bytes for every session id this deployment ever
-adopted and did not end through a `session.delete` that ran: ids a `session.wake` named and
-nothing ever paired, accounts deleted before this rule existed, and accounts whose delete
-was delivered twice, since the second delivery is answered from the command record while
-the adoption behind it writes the counter back. Count them with:
-
-```sh
-redis-cli --scan --pattern 'wa:lease-epoch:*' | wc -l
-```
-
-That number only grows. It is not comparable to `wa:lease:*`, which counts the sessions an
-instance owns at that second and is smaller than the live fleet whenever anything is
-disconnected; the number to compare it against is how many sessions the client still has an
-inbox for, and only the client has that.
-
-Reclaiming the difference is not something this service can do on its own. An account
-deleted and an account waiting to be paired again leave the same traces here, which is no
-rows at all, and deleting the counter of the second breaks it silently. So a sweep belongs
-on the client side or nowhere, and today it is nowhere
-([#159](https://github.com/fazer-ai/whatsapp-connector/issues/159)).
-
-### Changing the protocol
-
-1. Edit `contract/schema/protocol.schema.json`.
-2. Add or update the golden frame under `contract/fixtures/`.
-3. Update `internal/protocol` accordingly.
-4. `make contract` — it fails if any of the three lags behind, and if a type has no
-   fixture.
-5. Bump `contract/PROTOCOL_VERSION` **only** for a breaking change, and say so in the
-   PR's *Protocol impact* section: clients re-pin their vendored copy from that ref.
-
-## Roadmap
-
-| Milestone | Scope |
-|---|---|
-| **M0** ✅ | Skeleton, Redis Streams transport, lease/ownership port, fake engine, health and metrics, Docker image, publish pipeline |
-| **M1** ✅ | whatsmeow engine: QR and code pairing, session state, logout/ban/outdated handling, the device store. A session that has been handed on writes nothing more: every write a device can make is refused from the moment this instance stops owning it, whichever context it arrives with, and the fence asks the lease rather than this instance's own belief -- so a claim that ran out while nobody was looking stops the writes too. Reconnect backoff is still open |
-| **M2** ✅ | Messages in and out (text, media, location, contact, reaction, edit, revoke, quoted, mentions), receipts, read marks, chat presence, account presence, idempotent sends. All of them are in both ways, and a body this build has no arm for arrives as a placeholder rather than disappearing, and one WhatsApp masked from every linked device says so rather than reading as a type this build cannot render. What it leaves behind is in the issues rather than here: a presence state is dropped when the publisher has stopped answering and the queue is full ([#47](https://github.com/fazer-ai/whatsapp-connector/issues/47)), and one delayed across a reconnect is published as if it were fresh ([#49](https://github.com/fazer-ai/whatsapp-connector/issues/49)) |
-| **M3** ✅ | Groups, contacts and calls. A group is created, read, listed and left, renamed, given a description, a photo and its settings (`announce`, `locked`, `join_approval`, `member_add_mode`), and its participants added, removed, promoted and demoted; its invite link is served and its join requests are listed and answered. What changes about a group while the connection is up is published rather than waiting for the next reconnect. A contact is checked for an account, asked for its profile and its picture, and resolved to the address the wire uses. A call is published as it arrives and again when it ends, announced once however many times WhatsApp announces it, and `calls.auto_reject` on the connect has the connector refuse it without the account ever ringing -- the offer still goes out, because somebody rang either way. What a connect asks for is remembered beside the account, so an instance that brings it back puts back the group traffic and the call policy its client asked for rather than half of them |
-| **M4** | Multi-instance under load, quarantine, metrics/lag/DLQ, operations docs. Quarantine is in: a session that keeps failing to start is held out of the retry cadence instead of being dialled at the same rate forever. The six metrics this exposes count what one instance did (sessions running, events published, command duration, leases lost, and whether commands are still being read) and none of them measure the fleet: how far behind a client's consumer group is, how many commands are pending, and what happened to one that no instance could carry out. Operations docs are the configuration table above and nothing else |
-| **M5** ✅ | Pairing code ✅, the passkey relay ✅ (WhatsApp's challenge is handed to the operator's client, the assertion it signs is handed back, and the confirmation code is published for the operator to read off their phone) and a **per-session proxy** ✅ ([#217](https://github.com/fazer-ai/whatsapp-connector/issues/217)): a connect naming `http`, `https` or `socks5` sends that session's traffic with WhatsApp through it, remembers it for the resume, and never falls back to connecting directly |
-| **M6** ✅ | Opt-in history sync. A connect with `history_sync` publishes the phone's dumps as `history.sync`, one chat per event and at most 100 messages each, oldest first, media without a file; the dump is receipted to the phone only after it was published. `history.request` asks the phone for what came before a message the client names. Whether the phone sends its whole history is decided per session at pairing, by the same flag |
-
-## License
-
-MIT. See [`LICENSE`](LICENSE).
+Mantido pela fazer.ai.

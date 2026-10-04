@@ -13,7 +13,7 @@ import (
 )
 
 // The resume sweep against the server `make test-redis` names, which CI points at the
-// newest Redis and at the oldest one README.md supports (#279).
+// newest Redis and at the oldest one docs/operations.md supports (#279).
 //
 // Everything else in this package runs on miniredis, and miniredis accepts command forms a
 // supported server refuses: `SET NX GET` went into this loop in #272, passed every test
