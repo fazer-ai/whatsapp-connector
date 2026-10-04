@@ -1,0 +1,101 @@
+# Chatwoot fazer.ai with the WhatsApp connector embedded in the Sidekiq container, which is
+# the default. The Chatwoot image carries the connector's binary, and the worker container
+# starts it next to Sidekiq whenever WHATSAPP_CONNECTOR_ENABLED=true. It derives its
+# configuration from Chatwoot's: the same Redis, a database of its own on the same
+# PostgreSQL (created on the first start), a media directory under the storage volume and a
+# media token generated at start. See docs/deployment.md.
+#
+#   cp examples/.env.example .env      # fill in the three secrets
+#   docker compose -f examples/docker-compose.embedded.yaml --env-file .env up -d --wait
+
+x-chatwoot: &chatwoot
+  image: ghcr.io/fazer-ai/chatwoot:${CHATWOOT_TAG:-latest}
+  restart: always
+  volumes:
+    - storage:/app/storage
+  environment: &chatwoot-env
+    RAILS_ENV: production
+    NODE_ENV: production
+    INSTALLATION_ENV: docker
+    DEFAULT_LOCALE: pt_BR
+    FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3000}
+    INTERNAL_HOST_URL: http://rails:3000
+    SECRET_KEY_BASE: ${SECRET_KEY_BASE:?set SECRET_KEY_BASE}
+    POSTGRES_HOST: postgres
+    POSTGRES_PORT: '5432'
+    POSTGRES_USERNAME: chatwoot
+    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    POSTGRES_DATABASE: chatwoot_production
+    REDIS_URL: redis://redis:6379
+    REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD}
+    WHATSAPP_CONNECTOR_ENABLED: 'true'
+
+services:
+  rails:
+    <<: *chatwoot
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # rails.sh prepares the database (schema load on a fresh one, migrations after)
+    entrypoint: docker/entrypoints/rails.sh
+    command: [bundle, exec, rails, s, -p, '3000', -b, 0.0.0.0]
+    ports:
+      - '3000:3000'
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -qO- --header="Accept: text/html" http://127.0.0.1:3000/ > /dev/null']
+      interval: 20s
+      timeout: 20s
+      retries: 15
+
+  sidekiq:
+    <<: *chatwoot
+    depends_on:
+      rails:
+        condition: service_healthy
+    command: [bundle, exec, sidekiq, -C, config/sidekiq.yml]
+    # Sidekiq and the connector both drain on SIGTERM: Sidekiq finishes its jobs and the
+    # connector hands its sessions back. Docker's default of 10 s cuts that short.
+    stop_grace_period: 30s
+    healthcheck:
+      # The worker's argv carries the word sidekiq through the entrypoint scripts, which is
+      # why they are dropped from the match. The connector's process does not carry it.
+      test: ['CMD-SHELL', 'ps aux | grep [s]idekiq | grep -qv entrypoints']
+      interval: 20s
+      timeout: 20s
+      retries: 10
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: always
+    volumes:
+      - postgres:/var/lib/postgresql/data
+    environment:
+      POSTGRES_DB: chatwoot_production
+      POSTGRES_USER: chatwoot
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U chatwoot -d chatwoot_production']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: always
+    command: ['sh', '-c', 'redis-server --requirepass "$$REDIS_PASSWORD"']
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD}
+    volumes:
+      - redis:/data
+    healthcheck:
+      test: ['CMD-SHELL', 'redis-cli -a "$$REDIS_PASSWORD" ping | grep -q PONG']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  storage:
+  postgres:
+  redis:
