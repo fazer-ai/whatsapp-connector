@@ -721,6 +721,21 @@ func (m *Manager) handingBack(sid string) bool {
 // asks first.
 func (m *Manager) HandingBack(sid string) bool { return m.handingBack(sid) }
 
+// Unreturned counts how many of these sessions still have a lease this instance could not
+// hand back. Asked by a shutdown after StopAll, whose last act is one more attempt at every
+// queued hand-back: what is still queued then is a lease that expires on its own.
+func (m *Manager) Unreturned(sids []string) int {
+	m.orphanMu.Lock()
+	defer m.orphanMu.Unlock()
+	n := 0
+	for _, sid := range sids {
+		if _, queued := m.orphans[sid]; queued {
+			n++
+		}
+	}
+	return n
+}
+
 func (m *Manager) forgetOrphan(sid string) {
 	m.orphanMu.Lock()
 	delete(m.orphans, sid)
