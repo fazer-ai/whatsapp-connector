@@ -21,9 +21,9 @@ func TestReportHandBackSaysWhatTheStopDidWithTheSessions(t *testing.T) {
 		Sessions int
 	}
 	cases := []struct {
-		name                string
-		stopped, unreturned int
-		want                []line
+		name             string
+		owed, unreturned int
+		want             []line
 	}{
 		{"nothing to hand back", 0, 0, []line{{"info", "no sessions to hand back", 0}}},
 		{"all handed back", 2, 0, []line{{"info", "handed the sessions back", 2}}},
@@ -41,7 +41,7 @@ func TestReportHandBackSaysWhatTheStopDidWithTheSessions(t *testing.T) {
 
 			said := &bytes.Buffer{}
 			c := &Connector{log: zerolog.New(said)}
-			c.reportHandBack(tc.stopped, tc.unreturned)
+			c.reportHandBack(tc.owed, tc.unreturned)
 
 			var got []line
 			for _, raw := range strings.Split(strings.TrimSpace(said.String()), "\n") {
