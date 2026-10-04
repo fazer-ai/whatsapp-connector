@@ -5,7 +5,7 @@ There are two ways to run the connector with Chatwoot fazer.ai, and both are exe
 | | Embedded (default) | Separate container |
 |---|---|---|
 | Who runs it | the Sidekiq container, next to the worker | a service of its own, from `ghcr.io/fazer-ai/whatsapp-connector` |
-| Chatwoot settings | `WHATSAPP_CONNECTOR_ENABLED=true` | `WHATSAPP_CONNECTOR_ENABLED=true` and `WHATSAPP_CONNECTOR_EMBEDDED=false` |
+| Chatwoot settings | none: on unless `WHATSAPP_CONNECTOR_ENABLED=false` | `WHATSAPP_CONNECTOR_EMBEDDED=false` |
 | Connector version | the one the Chatwoot image pins | whatever tag the service names |
 | Pairings | a database of its own on Chatwoot's PostgreSQL, created on the first start | `WAC_DATABASE_URL`, set by the operator |
 | Media token | generated at every container start | `WAC_MEDIA_TOKEN`, set by the operator |
@@ -22,7 +22,7 @@ Chatwoot then answers on port 3000. Enabling the channel for an account and crea
 
 ## Embedded in Sidekiq
 
-The Chatwoot image copies the connector's static binary from a pinned release of this image (`FROM ghcr.io/fazer-ai/whatsapp-connector:<version>` in its Dockerfile, moved by Dependabot). With `WHATSAPP_CONNECTOR_ENABLED=true`, the worker container's entrypoint hands the Sidekiq command to a supervisor, `docker/entrypoints/helpers/whatsapp_connector.rb` in the Chatwoot repository, which becomes PID 1 and starts both:
+The Chatwoot image copies the connector's static binary from a pinned release of this image (`FROM ghcr.io/fazer-ai/whatsapp-connector:<version>` in its Dockerfile, moved by Dependabot). Unless `WHATSAPP_CONNECTOR_ENABLED=false`, the worker container's entrypoint hands the Sidekiq command to a supervisor, `docker/entrypoints/helpers/whatsapp_connector.rb` in the Chatwoot repository, which becomes PID 1 and starts both:
 
 - **Sidekiq is the container.** When it exits the connector is stopped and the container exits with Sidekiq's status, so restart policies and healthchecks behave as they did without the connector.
 - **The connector is restarted, Sidekiq is not touched.** A connector that exits is started again after a backoff that doubles from one second up to thirty, and starts over once a run has lasted a minute.

@@ -1,6 +1,7 @@
 # Chatwoot fazer.ai with the WhatsApp connector embedded in the Sidekiq container, which is
 # the default. The Chatwoot image carries the connector's binary, and the worker container
-# starts it next to Sidekiq whenever WHATSAPP_CONNECTOR_ENABLED=true. It derives its
+# starts it next to Sidekiq unless WHATSAPP_CONNECTOR_ENABLED=false (set to true below so
+# the example also runs on images from before that default). It derives its
 # configuration from Chatwoot's: the same Redis, a database of its own on the same
 # PostgreSQL (created on the first start), a media directory inside the container and a
 # media token generated at start. See docs/deployment.md.

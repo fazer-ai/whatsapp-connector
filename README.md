@@ -21,7 +21,7 @@
 </div>
 
 > [!IMPORTANT]
-> O canal está em beta e aparece no Chatwoot como “WhatsApp (nativo)”, com selo de beta. Quem administra a instalação libera cada conta, conforme os passos de instalação abaixo. A conexão é não oficial, pareada como um aparelho conectado, igual ao WhatsApp Web. Para a API oficial da Meta, use a caixa WhatsApp Cloud do Chatwoot. Relate problemas nas [issues deste repositório](https://github.com/fazer-ai/whatsapp-connector/issues).
+> O canal está em beta e aparece no Chatwoot como “WhatsApp (nativo)”, com selo de beta. Vem ligado em toda conta da instalação. A conexão é não oficial, pareada como um aparelho conectado, igual ao WhatsApp Web. Para a API oficial da Meta, use a caixa WhatsApp Cloud do Chatwoot. Relate problemas nas [issues deste repositório](https://github.com/fazer-ai/whatsapp-connector/issues).
 
 ## O que é
 
@@ -108,13 +108,11 @@ O Chatwoot sobe na porta 3000.
 
 ### Modo embutido
 
-No Chatwoot, configure uma variável:
+É o padrão do Chatwoot e não pede configuração: a integração inteira, o consumidor de eventos no Sidekiq e o próprio conector já vêm ligados. Para desligar tudo, configure no Chatwoot:
 
 ```bash
-WHATSAPP_CONNECTOR_ENABLED=true
+WHATSAPP_CONNECTOR_ENABLED=false
 ```
-
-Ela liga a integração inteira, o consumidor de eventos no Sidekiq e o próprio conector.
 
 O conector usa o mesmo Redis do Chatwoot e cria um banco próprio no mesmo PostgreSQL no primeiro start. O nome é o do banco do Chatwoot seguido de `_whatsapp_connector`. A mídia fica num diretório local do container, e o token de mídia é gerado a cada start do container. O Chatwoot lê esse token sozinho.
 
@@ -127,7 +125,6 @@ Se o conector cair, ele volta sozinho, sem derrubar o Sidekiq. Ao parar o contai
 No Chatwoot, configure:
 
 ```bash
-WHATSAPP_CONNECTOR_ENABLED=true
 WHATSAPP_CONNECTOR_EMBEDDED=false
 ```
 
@@ -156,12 +153,12 @@ WAC_MEDIA_TOKEN=um-token-longo-e-aleatorio
 > [!WARNING]
 > Se você já roda o conector como serviço separado, configure `WHATSAPP_CONNECTOR_EMBEDDED=false` no Chatwoot antes de atualizar para uma imagem que traz o conector. Sem isso, um segundo conector sobe dentro do Sidekiq, com um banco sem os pareamentos, disputando as mesmas sessões pelo mesmo Redis.
 
-### Liberar o canal para uma conta
+### Tirar o canal de uma conta
 
-Durante o beta, o canal aparece só para contas liberadas individualmente. Quem administra a instalação faz a liberação no console Rails do Chatwoot, de propósito fora da tela de administração:
+Toda conta enxerga o canal. Para tirá-lo de uma conta, use o console Rails do Chatwoot:
 
 ```ruby
-Account.find(ID_DA_CONTA).update!(whatsapp_native_enabled: true)
+Account.find(ID_DA_CONTA).update!(whatsapp_native_disabled: true)
 ```
 
 ### Criar a caixa de entrada
