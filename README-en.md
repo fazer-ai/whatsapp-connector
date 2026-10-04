@@ -79,39 +79,82 @@ A WhatsApp session keeps a socket open for long periods and handles its own reco
 
 ### Requirements
 
-- A recent version of Chatwoot fazer.ai. The “WhatsApp (native)” provider is included in both editions.
+- Chatwoot fazer.ai. For embedded mode, use a version that includes the connector in its image. The native provider is included in both editions.
 - The same Redis server as Chatwoot, version 6.2 or newer.
-- A database for pairings: a dedicated PostgreSQL database for the connector when running multiple instances, or SQLite for a single instance.
+- In embedded mode, Chatwoot's PostgreSQL user must be able to create databases. The superuser created by the official postgres image has this permission. If your user does not, create the database manually or set `WAC_DATABASE_URL`.
 
-### Image
+### Choose a mode
 
-Use the public `ghcr.io/fazer-ai/whatsapp-connector:latest` image. Release tags such as `0.5.0` and `0.5` are also available. To pin a version, use its corresponding tag.
+- **Embedded (default):** the connector runs inside the Sidekiq container, with no new service in your stack. Its version is pinned by the Chatwoot image.
+- **Separate:** the connector runs as its own service using the `ghcr.io/fazer-ai/whatsapp-connector` image. Use this to update the connector without waiting for a Chatwoot release or to run multiple instances.
 
-### Connector variables
+Both modes have an example compose file: [`docker-compose.embedded.yaml`](examples/docker-compose.embedded.yaml) and [`docker-compose.separate.yaml`](examples/docker-compose.separate.yaml). See [docs/deployment.md](docs/deployment.md) for details.
 
-At a minimum, set these variables to match your installation:
+To try it out, copy the environment file:
+
+```bash
+cp examples/.env.example .env
+```
+
+Fill in the three secrets in `.env`: `SECRET_KEY_BASE`, `POSTGRES_PASSWORD`, and `REDIS_PASSWORD`. Generate each one with `openssl rand -hex 32`. Separate mode also requires `WAC_MEDIA_TOKEN`.
+
+To start the embedded example:
+
+```bash
+docker compose -f examples/docker-compose.embedded.yaml --env-file .env up -d --wait
+```
+
+Chatwoot starts on port 3000.
+
+### Embedded mode
+
+Set one variable in Chatwoot:
+
+```bash
+WHATSAPP_CONNECTOR_ENABLED=true
+```
+
+This enables the entire integration, the event consumer in Sidekiq, and the connector itself.
+
+The connector uses Chatwoot's Redis server and creates its own database on the same PostgreSQL server on first startup. The database name is Chatwoot's database name followed by `_whatsapp_connector`. Media is stored in a directory local to the container, and a media token is generated each time the container starts. Chatwoot reads this token automatically.
+
+Any `WAC_*` variable set in the Sidekiq container overrides the corresponding setting derived from Chatwoot. Pairings survive restarts because they are stored in the database.
+
+If the connector crashes, it restarts automatically without taking Sidekiq down. When the container stops, the connector releases its sessions before exiting.
+
+### Separate mode
+
+Set these variables in Chatwoot:
+
+```bash
+WHATSAPP_CONNECTOR_ENABLED=true
+WHATSAPP_CONNECTOR_EMBEDDED=false
+```
+
+Use the public `ghcr.io/fazer-ai/whatsapp-connector:latest` image. Release tags such as `0.5.1` and `0.5` are also available. To pin a version, use its corresponding tag.
+
+For the connector, set at least these variables to match your installation:
 
 ```bash
 REDIS_URL=redis://redis:6379
+REDIS_PASSWORD=the-redis-password
 WAC_ENGINE=whatsmeow
 WAC_DATABASE_URL=postgres://wac:password@postgres:5432/wac
 WAC_MEDIA_ROOT=/data/media
 WAC_MEDIA_TOKEN=a-long-random-token
 ```
 
-- `REDIS_URL` deliberately uses the same variable name and server as Chatwoot.
+- `REDIS_URL` and `REDIS_PASSWORD` deliberately use the same variable names and refer to the same server as Chatwoot.
 - Without `WAC_MEDIA_ROOT`, no incoming media reaches Chatwoot. When it is set, `WAC_MEDIA_TOKEN` is required. Chatwoot reads the token automatically from the connector's registry entry in Redis.
 - `WAC_EVENT_SHARDS`, which defaults to 16, must match Chatwoot's `WHATSAPP_CONNECTOR_EVENT_SHARDS`.
-- Use persistent storage for `WAC_MEDIA_ROOT` and the database. Pairings survive restarts because they are stored in the database.
+- Use a dedicated PostgreSQL database for the connector when running multiple instances, or SQLite for a single instance. The example compose file uses SQLite on a volume.
+- Use persistent storage for the database and `WAC_MEDIA_ROOT`.
 - The full variable table is in [docs/operations.md](docs/operations.md).
 
-### In Chatwoot
+### Update an installation with a separate connector
 
-```bash
-WHATSAPP_CONNECTOR_ENABLED=true
-```
-
-This variable enables the entire integration, including the event consumer running in Sidekiq.
+> [!WARNING]
+> If you already run the connector as a separate service, set `WHATSAPP_CONNECTOR_EMBEDDED=false` in Chatwoot before updating to an image that includes the connector. Otherwise, a second connector starts inside Sidekiq with a database that has none of your pairings, competing for the same sessions through the same Redis server.
 
 ### Enable the channel for an account
 
@@ -136,7 +179,7 @@ APPLY=1 bundle exec rails "whatsapp:providers:convert[INBOX_ID,native]"
 
 The first line previews the changes. The second performs the conversion. Then pair again in the inbox.
 
-To install through Coolify, follow the [Chatwoot fazer.ai deployment guide](https://github.com/fazer-ai/chatwoot/blob/main/docker/README-coolify-deploy.md), written in Portuguese. It includes the connector.
+To install through Coolify, follow the [Chatwoot fazer.ai deployment guide](https://github.com/fazer-ai/chatwoot/blob/main/docker/README-coolify-deploy.md), written in Portuguese, which covers both modes.
 
 ## Known limitations
 

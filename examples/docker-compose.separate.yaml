@@ -1,0 +1,120 @@
+# Chatwoot fazer.ai with the WhatsApp connector running as its own service. Chatwoot is told
+# so with WHATSAPP_CONNECTOR_EMBEDDED=false, which keeps its Sidekiq container from starting
+# a second connector. This is the arrangement for updating the connector on its own release
+# schedule, or for running more than one instance of it. See docs/deployment.md.
+#
+#   cp examples/.env.example .env      # fill in the secrets, WAC_MEDIA_TOKEN included
+#   docker compose -f examples/docker-compose.separate.yaml --env-file .env up -d --wait
+
+x-chatwoot: &chatwoot
+  image: ghcr.io/fazer-ai/chatwoot:${CHATWOOT_TAG:-latest}
+  restart: always
+  volumes:
+    - storage:/app/storage
+  environment: &chatwoot-env
+    RAILS_ENV: production
+    NODE_ENV: production
+    INSTALLATION_ENV: docker
+    DEFAULT_LOCALE: pt_BR
+    FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3000}
+    INTERNAL_HOST_URL: http://rails:3000
+    SECRET_KEY_BASE: ${SECRET_KEY_BASE:?set SECRET_KEY_BASE}
+    POSTGRES_HOST: postgres
+    POSTGRES_PORT: '5432'
+    POSTGRES_USERNAME: chatwoot
+    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    POSTGRES_DATABASE: chatwoot_production
+    REDIS_URL: redis://redis:6379
+    REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD}
+    WHATSAPP_CONNECTOR_ENABLED: 'true'
+    WHATSAPP_CONNECTOR_EMBEDDED: 'false'
+
+services:
+  rails:
+    <<: *chatwoot
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # rails.sh prepares the database (schema load on a fresh one, migrations after)
+    entrypoint: docker/entrypoints/rails.sh
+    command: [bundle, exec, rails, s, -p, '3000', -b, 0.0.0.0]
+    ports:
+      - '3000:3000'
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -qO- --header="Accept: text/html" http://127.0.0.1:3000/ > /dev/null']
+      interval: 20s
+      timeout: 20s
+      retries: 15
+
+  sidekiq:
+    <<: *chatwoot
+    depends_on:
+      rails:
+        condition: service_healthy
+    command: [bundle, exec, sidekiq, -C, config/sidekiq.yml]
+    stop_grace_period: 30s
+    healthcheck:
+      # The worker's argv carries the word sidekiq through the entrypoint script while it
+      # waits for the schema, which is why the script is dropped from the match.
+      test: ['CMD-SHELL', 'ps aux | grep [s]idekiq | grep -qv entrypoints']
+      interval: 20s
+      timeout: 20s
+      retries: 10
+
+  whatsapp-connector:
+    image: ghcr.io/fazer-ai/whatsapp-connector:${WAC_TAG:-latest}
+    restart: always
+    depends_on:
+      redis:
+        condition: service_healthy
+    # SIGTERM hands the sessions back to Redis before the process exits
+    stop_grace_period: 30s
+    environment:
+      REDIS_URL: redis://redis:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD}
+      WAC_ENGINE: ${WAC_ENGINE:-whatsmeow}
+      # SQLite is enough for one instance. For more than one, point every instance at the
+      # same PostgreSQL database of its own: postgres://user:pass@postgres:5432/whatsapp_connector
+      WAC_DATABASE_URL: sqlite:/data/connector.db
+      WAC_MEDIA_ROOT: /data/media
+      WAC_MEDIA_TOKEN: ${WAC_MEDIA_TOKEN:?set WAC_MEDIA_TOKEN}
+    volumes:
+      - whatsapp-connector:/data
+    # the image is distroless and carries its own HEALTHCHECK (/connector healthcheck)
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: always
+    volumes:
+      - postgres:/var/lib/postgresql/data
+    environment:
+      POSTGRES_DB: chatwoot_production
+      POSTGRES_USER: chatwoot
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U chatwoot -d chatwoot_production']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: always
+    command: ['sh', '-c', 'redis-server --requirepass "$$REDIS_PASSWORD"']
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD}
+    volumes:
+      - redis:/data
+    healthcheck:
+      test: ['CMD-SHELL', 'redis-cli -a "$$REDIS_PASSWORD" ping | grep -q PONG']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  storage:
+  postgres:
+  redis:
+  whatsapp-connector:

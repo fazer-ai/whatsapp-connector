@@ -1,5 +1,7 @@
 # Running the connector
 
+Next to Chatwoot, the connector runs either inside the Sidekiq container or as a service of its own: [deployment.md](deployment.md) has both, with an example compose for each. This page is about the connector itself.
+
 ## Running one
 
 ```bash

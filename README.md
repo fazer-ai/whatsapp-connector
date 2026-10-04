@@ -79,39 +79,82 @@ A sessão do WhatsApp mantém um socket aberto por longos períodos e cuida da p
 
 ### Requisitos
 
-- Chatwoot fazer.ai recente. O provedor nativo já vem nas duas edições.
+- Chatwoot fazer.ai. Para o modo embutido, use uma versão que já traz o conector na imagem. O provedor nativo vem nas duas edições.
 - O mesmo Redis do Chatwoot, na versão 6.2 ou mais nova.
-- Um banco para os pareamentos: PostgreSQL próprio do conector para várias instâncias ou SQLite para uma instância só.
+- No modo embutido, o usuário do PostgreSQL do Chatwoot precisa poder criar banco. O superusuário criado pela imagem oficial do postgres tem essa permissão. Se o seu usuário não tiver, crie o banco à mão ou configure `WAC_DATABASE_URL`.
 
-### Imagem
+### Escolher o modo
 
-Use a imagem pública `ghcr.io/fazer-ai/whatsapp-connector:latest`. Há tags por release, como `0.5.0` e `0.5`. Para fixar a versão, use a tag correspondente.
+- **Embutido (padrão):** o conector roda junto no container do Sidekiq, sem serviço novo na stack. A versão do conector é a que a imagem do Chatwoot fixa.
+- **Separado:** o conector roda como serviço próprio, com a imagem `ghcr.io/fazer-ai/whatsapp-connector`. Use para atualizar o conector sem esperar uma release do Chatwoot ou para rodar mais de uma instância.
 
-### Variáveis do conector
+Os dois modos têm um compose de exemplo: [`docker-compose.embedded.yaml`](examples/docker-compose.embedded.yaml) e [`docker-compose.separate.yaml`](examples/docker-compose.separate.yaml). Os detalhes estão em [docs/deployment.md](docs/deployment.md).
 
-Configure, no mínimo, estas variáveis com os valores da sua instalação:
+Para experimentar, copie o arquivo de variáveis:
+
+```bash
+cp examples/.env.example .env
+```
+
+Preencha no `.env` os três segredos: `SECRET_KEY_BASE`, `POSTGRES_PASSWORD` e `REDIS_PASSWORD`. Gere cada um com `openssl rand -hex 32`. O modo separado pede também `WAC_MEDIA_TOKEN`.
+
+Para subir o exemplo embutido:
+
+```bash
+docker compose -f examples/docker-compose.embedded.yaml --env-file .env up -d --wait
+```
+
+O Chatwoot sobe na porta 3000.
+
+### Modo embutido
+
+No Chatwoot, configure uma variável:
+
+```bash
+WHATSAPP_CONNECTOR_ENABLED=true
+```
+
+Ela liga a integração inteira, o consumidor de eventos no Sidekiq e o próprio conector.
+
+O conector usa o mesmo Redis do Chatwoot e cria um banco próprio no mesmo PostgreSQL no primeiro start. O nome é o do banco do Chatwoot seguido de `_whatsapp_connector`. A mídia fica num diretório local do container, e o token de mídia é gerado a cada start do container. O Chatwoot lê esse token sozinho.
+
+Qualquer variável `WAC_*` definida no container do Sidekiq vale no lugar da configuração derivada do Chatwoot. O pareamento sobrevive a reinícios porque fica no banco.
+
+Se o conector cair, ele volta sozinho, sem derrubar o Sidekiq. Ao parar o container, o conector devolve as sessões antes de sair.
+
+### Modo separado
+
+No Chatwoot, configure:
+
+```bash
+WHATSAPP_CONNECTOR_ENABLED=true
+WHATSAPP_CONNECTOR_EMBEDDED=false
+```
+
+Use a imagem pública `ghcr.io/fazer-ai/whatsapp-connector:latest`. Há tags por release, como `0.5.1` e `0.5`. Para fixar a versão, use a tag correspondente.
+
+No conector, configure no mínimo estas variáveis com os valores da sua instalação:
 
 ```bash
 REDIS_URL=redis://redis:6379
+REDIS_PASSWORD=a-senha-do-redis
 WAC_ENGINE=whatsmeow
 WAC_DATABASE_URL=postgres://wac:senha@postgres:5432/wac
 WAC_MEDIA_ROOT=/data/media
 WAC_MEDIA_TOKEN=um-token-longo-e-aleatorio
 ```
 
-- `REDIS_URL` usa de propósito o mesmo nome de variável e o mesmo servidor do Chatwoot.
+- `REDIS_URL` e `REDIS_PASSWORD` usam de propósito os mesmos nomes de variável e apontam para o mesmo servidor do Chatwoot.
 - Sem `WAC_MEDIA_ROOT`, nenhuma mídia recebida chega ao Chatwoot. Quando ela está definida, `WAC_MEDIA_TOKEN` é obrigatório. O Chatwoot lê o token sozinho, pelo registro do conector no Redis.
 - `WAC_EVENT_SHARDS`, com padrão 16, precisa ser igual a `WHATSAPP_CONNECTOR_EVENT_SHARDS` do Chatwoot.
-- Use armazenamento persistente para `WAC_MEDIA_ROOT` e para o banco. O pareamento sobrevive a reinícios porque fica no banco.
+- Use um banco PostgreSQL próprio do conector para várias instâncias ou SQLite para uma instância só. O compose de exemplo usa SQLite num volume.
+- Use armazenamento persistente para o banco e para `WAC_MEDIA_ROOT`.
 - A tabela completa de variáveis está em [docs/operations.md](docs/operations.md).
 
-### No Chatwoot
+### Atualizar uma instalação com o conector separado
 
-```bash
-WHATSAPP_CONNECTOR_ENABLED=true
-```
-
-Essa variável liga a integração inteira, inclusive o consumidor de eventos que roda no Sidekiq.
+> [!WARNING]
+> Se você já roda o conector como serviço separado, configure `WHATSAPP_CONNECTOR_EMBEDDED=false` no Chatwoot antes de atualizar para uma imagem que traz o conector. Sem isso, um segundo conector sobe dentro do Sidekiq, com um banco sem os pareamentos, disputando as mesmas sessões pelo mesmo Redis.
 
 ### Liberar o canal para uma conta
 
@@ -136,7 +179,7 @@ APPLY=1 bundle exec rails "whatsapp:providers:convert[ID_DA_CAIXA,native]"
 
 A primeira linha mostra o que vai acontecer. A segunda executa a conversão. Depois, pareie de novo na caixa de entrada.
 
-Para instalar pelo Coolify, siga o [guia de deploy do Chatwoot fazer.ai](https://github.com/fazer-ai/chatwoot/blob/main/docker/README-coolify-deploy.md), em português. Ele inclui o conector.
+Para instalar pelo Coolify, siga o [guia de deploy do Chatwoot fazer.ai](https://github.com/fazer-ai/chatwoot/blob/main/docker/README-coolify-deploy.md), em português, que cobre os dois modos.
 
 ## Limitações conhecidas
 
