@@ -109,14 +109,16 @@ func (s *Session) edit(ctx context.Context, command *protocol.Command) (json.Raw
 // correction is the message an edit puts on the wire, and the chat it goes to.
 //
 // A text correction of a media message this account sent is a new caption, and it goes
-// out as the whole media message again: an edit replaces the message it names, so one
-// built from the text alone would put a file with nothing behind it on the wire (#32). It
+// out as the whole media message again: measured on a real account, WhatsApp ignores a
+// text correction of a file, and the recipient keeps the original caption while the edit
+// is reported as done (#32). It
 // goes to the chat the file was sent to, whatever the edit named: the id names the
 // message, which lives in that one chat, and the client may name it by the number or the
 // LID of one person, which this account cannot always tell apart once it has restarted.
 // Sent anywhere else the file's keys would reach a chat that never had them.
 //
 // A message that is not kept goes out as the text it was asked to be, to the chat named.
+// When it was a file after all, WhatsApp leaves it as it was.
 func (s *Session) correction(
 	ctx context.Context, to waTypes.JID, targetID, text string,
 ) (*waE2E.Message, waTypes.JID, error) {
@@ -125,8 +127,8 @@ func (s *Session) correction(
 	read()
 	if err != nil {
 		// Not knowing whether the target is a file is not a reason to guess that it is
-		// text: sent as text onto a media message, the correction is the one that leaves
-		// the recipient a broken attachment.
+		// text: sent as text onto a media message, the correction is acknowledged and
+		// WhatsApp quietly leaves the caption as it was.
 		return nil, waTypes.EmptyJID, fmt.Errorf("read whether %s is a media message this account sent: %w", targetID, err)
 	}
 	if !found {
@@ -174,7 +176,8 @@ func recaptioned(body []byte, caption string) (*waE2E.Message, error) {
 		}}, nil
 	default:
 		// A voice note, an audio file or a sticker: WhatsApp gives them no caption, so
-		// there is nothing to correct, and a text correction would replace the file.
+		// there is nothing to correct, and a text correction would be acknowledged and
+		// change nothing.
 		return nil, protocol.NewError(protocol.ErrorUnsupported,
 			"the message this edit names is a file that carries no caption")
 	}

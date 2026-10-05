@@ -260,8 +260,8 @@ func correctionIn(m *waE2E.Message) *waE2E.Message {
 }
 
 // A file whose record could not be kept is not sent: a later edit of it would find no
-// record, go out as text and replace the file with nothing, and a send refused now is one
-// the client can deliver again.
+// record and go out as text, which WhatsApp ignores while reporting it done, and a send
+// refused now is one the client can deliver again.
 func TestAFileThatCannotBeKeptIsNotSent(t *testing.T) {
 	t.Parallel()
 

@@ -130,9 +130,10 @@ func (s *Session) send(ctx context.Context, command *protocol.Command) (json.Raw
 // refuses an edit of a message it never took.
 //
 // A failure refuses the send. Without the record a later edit of this message cannot tell
-// it is a file, goes out as text, and replaces the file it names with nothing: the store
-// that would not take a note is a store a redelivery of the send can try again, and the
-// broken attachment is not something anything can take back.
+// it is a file and goes out as text, which WhatsApp ignores while the client is told the
+// caption changed: the store that would not take a note is a store a redelivery of the
+// send can try again, and a correction reported as done and never shown is not something
+// the client can find out about.
 func (s *Session) keepForItsCaption(ctx context.Context, to waTypes.JID, messageID string, message *waE2E.Message) error {
 	body, err := proto.Marshal(message)
 	if err != nil {
