@@ -876,6 +876,17 @@ func (c *Connector) sweepPartsOnce(ctx context.Context) bool {
 	case begun > 0:
 		c.log.Debug().Int64("attempts", begun).Msg("dropped the record of group creations past their retention")
 	}
+	// And the media messages kept for their caption to be corrected, once WhatsApp would no
+	// longer take the correction anyway.
+	kept, err := c.store.SweepSentMedia(ctx, now.Add(-store.SentMediaRetention))
+	switch {
+	case errors.Is(err, context.Canceled):
+		return true
+	case err != nil:
+		c.log.Warn().Err(err).Msg("could not sweep the media messages kept for their captions")
+	case kept > 0:
+		c.log.Debug().Int64("messages", kept).Msg("dropped the media messages past the window their captions can be corrected in")
+	}
 	return false
 }
 

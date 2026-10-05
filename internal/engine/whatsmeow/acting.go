@@ -13,6 +13,7 @@ import (
 
 	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
 	waTypes "go.mau.fi/whatsmeow/types"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 )
@@ -77,11 +78,15 @@ func (s *Session) edit(ctx context.Context, command *protocol.Command) (json.Raw
 	if err != nil {
 		return nil, err
 	}
-	corrected, err := editedBody(req.Content)
+	text, err := editedText(req.Content)
 	if err != nil {
 		return nil, err
 	}
 	if err := s.readyToSend(); err != nil {
+		return nil, err
+	}
+	corrected, to, err := s.correction(ctx, to, req.TargetID, text)
+	if err != nil {
 		return nil, err
 	}
 
@@ -99,6 +104,84 @@ func (s *Session) edit(ctx context.Context, command *protocol.Command) (json.Raw
 		"timestamp":  sent.Timestamp.UnixMilli(),
 		"client_ref": nil,
 	})
+}
+
+// correction is the message an edit puts on the wire, and the chat it goes to.
+//
+// A text correction of a media message this account sent is a new caption, and it goes
+// out as the whole media message again: measured on a real account, WhatsApp ignores a
+// text correction of a file, and the recipient keeps the original caption while the edit
+// is reported as done (#32). It
+// goes to the chat the file was sent to, whatever the edit named: the id names the
+// message, which lives in that one chat, and the client may name it by the number or the
+// LID of one person, which this account cannot always tell apart once it has restarted.
+// Sent anywhere else the file's keys would reach a chat that never had them.
+//
+// A message that is not kept goes out as the text it was asked to be, to the chat named.
+// When it was a file after all, WhatsApp leaves it as it was.
+func (s *Session) correction(
+	ctx context.Context, to waTypes.JID, targetID, text string,
+) (*waE2E.Message, waTypes.JID, error) {
+	reading, read := context.WithTimeout(ctx, s.storeLimit)
+	kept, found, err := s.store.SentMedia(reading, targetID)
+	read()
+	if err != nil {
+		// Not knowing whether the target is a file is not a reason to guess that it is
+		// text: sent as text onto a media message, the correction is acknowledged and
+		// WhatsApp quietly leaves the caption as it was.
+		return nil, waTypes.EmptyJID, fmt.Errorf("read whether %s is a media message this account sent: %w", targetID, err)
+	}
+	if !found {
+		// No context alongside it. The contract's edit payload carries no quote and no
+		// mentions, so there is nothing to put in one, and a correction that invented an
+		// empty context would drop the quote the original was sent with.
+		corrected, err := textToSend(&textContent{Body: text}, nil)
+		return corrected, to, err
+	}
+	chat, err := waTypes.ParseJID(kept.Chat)
+	if err != nil {
+		return nil, waTypes.EmptyJID, fmt.Errorf("read the chat %s was sent to: %w", targetID, err)
+	}
+	// An empty caption is one removed, which a text message has no equivalent of.
+	corrected, err := recaptioned(kept.Body, text)
+	return corrected, chat, err
+}
+
+// recaptioned is a media message as it was sent, with its caption replaced.
+//
+// The file's coordinates, its preview and whatever it quoted go out again as they were,
+// so the recipient's copy of the file keeps resolving and nothing is uploaded again.
+func recaptioned(body []byte, caption string) (*waE2E.Message, error) {
+	var message waE2E.Message
+	if err := proto.Unmarshal(body, &message); err != nil {
+		return nil, fmt.Errorf("decode a kept media message: %w", err)
+	}
+	switch {
+	case message.GetImageMessage() != nil:
+		message.ImageMessage.Caption = proto.String(caption)
+	case message.GetVideoMessage() != nil:
+		message.VideoMessage.Caption = proto.String(caption)
+	case message.GetDocumentWithCaptionMessage().GetMessage().GetDocumentMessage() != nil:
+		message.DocumentWithCaptionMessage.Message.DocumentMessage.Caption = proto.String(caption)
+	case message.GetDocumentMessage() != nil:
+		// Sent without a caption, so it went out bare, and with one it travels in the
+		// envelope a send would have put it in: see renderMedia.
+		if caption == "" {
+			break
+		}
+		document := message.DocumentMessage
+		document.Caption = proto.String(caption)
+		return &waE2E.Message{DocumentWithCaptionMessage: &waE2E.FutureProofMessage{
+			Message: &waE2E.Message{DocumentMessage: document},
+		}}, nil
+	default:
+		// A voice note, an audio file or a sticker: WhatsApp gives them no caption, so
+		// there is nothing to correct, and a text correction would be acknowledged and
+		// change nothing.
+		return nil, protocol.NewError(protocol.ErrorUnsupported,
+			"the message this edit names is a file that carries no caption")
+	}
+	return &message, nil
 }
 
 // revoke carries out `message.revoke`.
@@ -595,31 +678,34 @@ func (s *Session) orDerived(command *protocol.Command, messageID string) string 
 	return wm.WebMessageIDPrefix + strings.ToUpper(hex.EncodeToString(sum[:9]))
 }
 
-// editedBody renders what a message is being corrected to.
+// editedText is the text a message is being corrected to.
 //
-// Text only, and that is a limitation rather than a reading of the contract: WhatsApp
-// does let a caption be edited, but the message that carries the correction has to be
-// the whole media message again -- upload coordinates, keys and hashes -- and nothing
-// here keeps those once a send is done. Building one without them puts a message on the
-// wire whose file resolves to nothing. See #32.
-func editedBody(raw json.RawMessage) (*waE2E.Message, error) {
+// Text only: the contract carries a correction as text, and a caption is corrected by
+// naming a media message this account sent, which is the edit's to find out (#32).
+func editedText(raw json.RawMessage) (string, error) {
 	var body struct {
 		Type string `json:"type"`
 	}
 	if err := json.Unmarshal(raw, &body); err != nil || body.Type == "" {
-		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
+		return "", protocol.NewError(protocol.ErrorInvalidPayload,
 			"an edit has to say what the message is being corrected to")
 	}
 	if body.Type != "text" {
-		return nil, protocol.NewError(protocol.ErrorUnsupported,
+		return "", protocol.NewError(protocol.ErrorUnsupported,
 			fmt.Sprintf("this connector cannot correct a message to %q yet", body.Type))
+	}
+	// A body the payload leaves out, or sends as null, is a malformed edit and not an empty
+	// one: on a file an empty correction removes the caption, which nothing should do by
+	// omission.
+	var present struct {
+		Body *string `json:"body"`
+	}
+	if err := json.Unmarshal(raw, &present); err != nil || present.Body == nil {
+		return "", protocol.NewError(protocol.ErrorInvalidPayload, "an edit to text has to carry the text")
 	}
 	content, err := decodeBody[textContent](raw, body.Type)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
-	// No context alongside it. The contract's edit payload carries no quote and no
-	// mentions, so there is nothing to put in one, and a correction that invented an
-	// empty context would drop the quote the original was sent with.
-	return textToSend(&content, nil)
+	return content.Body, nil
 }

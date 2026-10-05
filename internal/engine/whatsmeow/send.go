@@ -14,6 +14,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
+	"github.com/fazer-ai/whatsapp-connector/internal/store"
 )
 
 // sendRequest is `message.send`, decoded.
@@ -102,6 +103,9 @@ func (s *Session) send(ctx context.Context, command *protocol.Command) (json.Raw
 		if message, err = s.mediaToSend(building, plan, alongside); err != nil {
 			return nil, err
 		}
+		if err := s.keepForItsCaption(ctx, to, req.MessageID, message); err != nil {
+			return nil, err
+		}
 	}
 
 	sent, err := s.putOnTheWire(ctx, to, req.MessageID, message)
@@ -114,6 +118,33 @@ func (s *Session) send(ctx context.Context, command *protocol.Command) (json.Raw
 		"timestamp":  sent.Timestamp.UnixMilli(),
 		"client_ref": req.ClientRef,
 	})
+}
+
+// keepForItsCaption keeps a media message as it is about to go out, so its caption can be
+// corrected later (#32). An edit carries the corrected message in full, and the file's
+// coordinates exist only in this message once the upload has answered.
+//
+// Kept before the send rather than after it: a process that dies between the two has
+// still sent the file, and the caption it went out with is still somebody's to correct.
+// A row for a send that then fails costs nothing an edit can reach, because WhatsApp
+// refuses an edit of a message it never took.
+//
+// A failure refuses the send. Without the record a later edit of this message cannot tell
+// it is a file and goes out as text, which WhatsApp ignores while the client is told the
+// caption changed: the store that would not take a note is a store a redelivery of the
+// send can try again, and a correction reported as done and never shown is not something
+// the client can find out about.
+func (s *Session) keepForItsCaption(ctx context.Context, to waTypes.JID, messageID string, message *waE2E.Message) error {
+	body, err := proto.Marshal(message)
+	if err != nil {
+		return fmt.Errorf("encode the media message %s to keep it: %w", messageID, err)
+	}
+	writing, written := context.WithTimeout(ctx, s.storeLimit)
+	defer written()
+	if err := s.store.PutSentMedia(writing, messageID, store.SentMedia{Chat: to.String(), Body: body}); err != nil {
+		return fmt.Errorf("keep the media message %s for its caption to be corrected: %w", messageID, err)
+	}
+	return nil
 }
 
 // readyToSend refuses a session that cannot put anything on the wire, and the order of
