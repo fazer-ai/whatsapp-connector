@@ -477,6 +477,14 @@ func (c *Container) bind(ctx context.Context, sid string, jid types.JID) error {
 		sid, sid, jid.String()); err != nil {
 		return fmt.Errorf("store: bind %s: %w", sid, err)
 	}
+	// And the files this account sent, whose keys and chats are the previous account's:
+	// an edit under the new pairing must not be built out of one of them.
+	if _, err := tx.ExecContext(ctx, c.rebind(`
+		DELETE FROM wac_sent_media WHERE sid = ? AND EXISTS (
+			SELECT 1 FROM wac_session_device WHERE sid = ? AND jid <> ?)`),
+		sid, sid, jid.String()); err != nil {
+		return fmt.Errorf("store: bind %s: %w", sid, err)
+	}
 	// And the history dumps, which the device's own writes are already held to: a row is
 	// only ever written for the device the session is bound to, and this is the bond
 	// changing, so what the previous device left is the previous account's.

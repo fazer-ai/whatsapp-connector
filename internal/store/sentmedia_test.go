@@ -99,3 +99,28 @@ func TestSentMediaGoesWithThePairing(t *testing.T) {
 		t.Errorf("an unpaired session still holds a sent file's key (found=%v, err=%v)", found, err)
 	}
 }
+
+// The same session pairing another account does not hand it the previous account's files:
+// the binding is rewritten in place, so the cascade does not fire, and the pairing clears
+// them itself. Binding the same device again keeps them.
+func TestSentMediaGoesWhenTheSessionPairsAnotherAccount(t *testing.T) {
+	t.Parallel()
+	container := open(t)
+	device := pair(t, container, "sid-1", "5511999990001")
+	scoped := container.For("sid-1")
+	if err := scoped.PutSentMedia(t.Context(), "3EB0FILE", store.SentMedia{Chat: "c@s.whatsapp.net", Body: []byte{1}}); err != nil {
+		t.Fatalf("PutSentMedia: %v", err)
+	}
+
+	if err := container.For("sid-1").Bind(t.Context(), device); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	if _, found, err := scoped.SentMedia(t.Context(), "3EB0FILE"); err != nil || !found {
+		t.Fatalf("binding the same device again dropped its file (found=%v, err=%v)", found, err)
+	}
+
+	pair(t, container, "sid-1", "5511999990009")
+	if _, found, err := scoped.SentMedia(t.Context(), "3EB0FILE"); err != nil || found {
+		t.Errorf("another account inherited a sent file's key (found=%v, err=%v)", found, err)
+	}
+}

@@ -691,6 +691,15 @@ func editedText(raw json.RawMessage) (string, error) {
 		return "", protocol.NewError(protocol.ErrorUnsupported,
 			fmt.Sprintf("this connector cannot correct a message to %q yet", body.Type))
 	}
+	// A body the payload leaves out, or sends as null, is a malformed edit and not an empty
+	// one: on a file an empty correction removes the caption, which nothing should do by
+	// omission.
+	var present struct {
+		Body *string `json:"body"`
+	}
+	if err := json.Unmarshal(raw, &present); err != nil || present.Body == nil {
+		return "", protocol.NewError(protocol.ErrorInvalidPayload, "an edit to text has to carry the text")
+	}
 	content, err := decodeBody[textContent](raw, body.Type)
 	if err != nil {
 		return "", err

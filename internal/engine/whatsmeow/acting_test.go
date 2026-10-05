@@ -217,6 +217,8 @@ func TestOnlyATextBodyCanBeCorrected(t *testing.T) {
 		{"a location", `{"type":"location","latitude":-25.4,"longitude":-49.2}`,
 			protocol.ErrorUnsupported},
 		{"a body that does not say what it is", `{"body":"corrigido"}`, protocol.ErrorInvalidPayload},
+		{"text with no body", `{"type":"text"}`, protocol.ErrorInvalidPayload},
+		{"text with a null body", `{"type":"text","body":null}`, protocol.ErrorInvalidPayload},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
