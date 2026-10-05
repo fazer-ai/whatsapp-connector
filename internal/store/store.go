@@ -110,6 +110,9 @@ type Options struct {
 	// query and given back -- which is why the number that matters is how many queries
 	// run at once, not how many accounts are paired.
 	//
+	// Opening takes one connection more than this, held outside the pool and only until
+	// the schema is up: see holdTheSchemaUpgrade.
+	//
 	// SQLite ignores it: a file holds one writer whatever the pool says.
 	MaxConns int
 }
@@ -172,6 +175,12 @@ func OpenWith(ctx context.Context, address string, owned Ownership, log zerolog.
 	}
 
 	if dialect == dialectPostgres {
+		release, err := holdTheSchemaUpgrade(ctx, dsn)
+		if err != nil {
+			_ = db.Close()
+			return nil, err
+		}
+		defer release()
 		if err := refuseAnUnreachableVersionTable(ctx, db); err != nil {
 			_ = db.Close()
 			return nil, err
@@ -193,6 +202,47 @@ func OpenWith(ctx context.Context, address string, owned Ownership, log zerolog.
 		return nil, err
 	}
 	return c, nil
+}
+
+// schemaUpgradeLock is the Postgres advisory lock the schema checks and upgrades run
+// under. Advisory locks are scoped to the database, so connectors on different databases
+// of one server do not wait for each other.
+const schemaUpgradeLock int64 = 0x7761635f73636865 // "wac_sche"
+
+// holdTheSchemaUpgrade makes the instances that open one Postgres database at the same
+// time take turns at bringing its schema up, and returns what lets the next one in.
+//
+// whatsmeow's upgrade and this package's migration both create with `IF NOT EXISTS`,
+// which is not safe against a concurrent create of the same name: both sessions pass the
+// check and the second fails on the unique index of `pg_type`, so on an empty database
+// every replica but one died on its first start (#359). Taking turns costs the replicas
+// that come second a wait for work that is then a no-op.
+//
+// The lock lives on a connection of its own, outside the store's pool, because it has to
+// be held while the upgrade runs on the pool: with `MaxConns` at one, a lock held on a
+// pooled connection would leave the upgrade nothing to run on. Waiting honours ctx, which
+// lib/pq turns into a cancel request, and closing the connection ends the session, which
+// is what releases a session-level lock even when the unlock is never sent.
+func holdTheSchemaUpgrade(ctx context.Context, dsn string) (func(), error) {
+	lockDB, err := sql.Open(dialectPostgres, dsn)
+	if err != nil {
+		return nil, fmt.Errorf("store: open the schema upgrade lock: %w", err)
+	}
+	lockDB.SetMaxOpenConns(1)
+	conn, err := lockDB.Conn(ctx)
+	if err != nil {
+		_ = lockDB.Close()
+		return nil, fmt.Errorf("store: connect for the schema upgrade lock: %w", err)
+	}
+	if _, err := conn.ExecContext(ctx, `SELECT pg_advisory_lock($1)`, schemaUpgradeLock); err != nil {
+		_ = conn.Close()
+		_ = lockDB.Close()
+		return nil, fmt.Errorf("store: wait for another instance's schema upgrade: %w", err)
+	}
+	return func() {
+		_ = conn.Close()
+		_ = lockDB.Close()
+	}, nil
 }
 
 // whatsmeowVersionTable is the name whatsmeow's sqlstore gives go.mau.fi/util/dbutil for

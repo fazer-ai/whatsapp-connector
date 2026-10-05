@@ -926,6 +926,165 @@ func TestTwoInstancesUpgradingAtOnceBothStart(t *testing.T) {
 	}
 }
 
+// Several replicas of a fresh deployment start against a database nobody has opened yet,
+// and each of them creates the schema. `CREATE TABLE IF NOT EXISTS` is not safe against a
+// concurrent create of the same name under Postgres: both pass the check and the second
+// hits the unique index on `pg_type`, so before the first start was serialised one
+// replica out of two died on its first boot (#359). Several rounds, each on its own empty
+// database, because a single race is won by luck often enough to pass.
+func TestInstancesOpeningAnEmptyDatabaseAtOnceAllStart(t *testing.T) {
+	t.Parallel()
+	if !storetest.New(t).Postgres() {
+		t.Skip("a SQLite file is opened by one process; the race is between servers' sessions")
+	}
+
+	const instances, rounds = 4, 5
+	for round := range rounds {
+		target := storetest.New(t)
+		var racing sync.WaitGroup
+		failures := make(chan error, instances)
+		start := make(chan struct{})
+		for range instances {
+			racing.Add(1)
+			go func() {
+				defer racing.Done()
+				<-start
+				opened, err := store.Open(t.Context(), target.URL, store.AlwaysOwned, zerolog.Nop())
+				if err != nil {
+					failures <- err
+					return
+				}
+				if err := opened.Close(); err != nil {
+					failures <- err
+				}
+			}()
+		}
+		close(start)
+		racing.Wait()
+		close(failures)
+		for err := range failures {
+			t.Errorf("round %d: an instance refused to start on an empty database another was creating: %v", round, err)
+		}
+
+		// One version row per schema whatsmeow keeps: a second instance that ran the
+		// upgrade again after the first would have inserted its own.
+		var versions int
+		if err := target.Pool(t).QueryRowContext(t.Context(),
+			`SELECT count(*) FROM whatsmeow_version`).Scan(&versions); err != nil {
+			t.Fatalf("round %d: read whatsmeow_version: %v", round, err)
+		}
+		if versions != 1 {
+			t.Errorf("round %d: whatsmeow_version has %d rows, want 1", round, versions)
+		}
+	}
+}
+
+// A deployment can cap its pool at a single connection, and the turn-taking on the first
+// start must not need a second one from that pool: a lock held on the only pooled
+// connection would leave the upgrade it guards nothing to run on.
+func TestAPoolOfOneStillUpgradesAnEmptyDatabaseAlongsideAnotherInstance(t *testing.T) {
+	t.Parallel()
+	target := storetest.New(t)
+	if !target.Postgres() {
+		t.Skip("SQLite ignores MaxConns")
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	var racing sync.WaitGroup
+	failures := make(chan error, 2)
+	for range 2 {
+		racing.Add(1)
+		go func() {
+			defer racing.Done()
+			opened, err := store.OpenWith(ctx, target.URL, store.AlwaysOwned, zerolog.Nop(), store.Options{MaxConns: 1})
+			if err != nil {
+				failures <- err
+				return
+			}
+			if err := opened.Close(); err != nil {
+				failures <- err
+			}
+		}()
+	}
+	racing.Wait()
+	close(failures)
+	for err := range failures {
+		t.Errorf("an instance with a pool of one did not start: %v", err)
+	}
+}
+
+// An instance that waits for another one's first start is still bound by its own
+// deadline. Here the first instance is stuck inside the upgrade behind a schema create
+// somebody else holds open, and the second, waiting its turn, has to give up when the
+// deployment told it to rather than hang its readiness probe. Once the hold goes, the
+// first finishes as if nothing had happened.
+func TestAnInstanceWaitingItsTurnGivesUpAtItsDeadline(t *testing.T) {
+	t.Parallel()
+	target := storetest.New(t)
+	if !target.Postgres() {
+		t.Skip("SQLite has no other session to hold the schema")
+	}
+
+	pool := target.Pool(t)
+	holder, err := pool.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	t.Cleanup(func() { _ = holder.Rollback() })
+	if _, err := holder.ExecContext(t.Context(),
+		`CREATE TABLE whatsmeow_version (version INTEGER, compat INTEGER)`); err != nil {
+		t.Fatalf("hold the version table: %v", err)
+	}
+
+	first := make(chan error, 1)
+	go func() {
+		opened, err := store.Open(t.Context(), target.URL, store.AlwaysOwned, zerolog.Nop())
+		if err == nil {
+			err = opened.Close()
+		}
+		first <- err
+	}()
+	// The first instance is in the upgrade once a session of this database is waiting
+	// on a lock to create the version table.
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		var stuck int
+		if err := pool.QueryRowContext(t.Context(), `
+			SELECT count(*) FROM pg_stat_activity
+			WHERE datname = current_database() AND wait_event_type = 'Lock'
+			  AND query ILIKE '%whatsmeow_version%'`).Scan(&stuck); err != nil {
+			t.Fatalf("read pg_stat_activity: %v", err)
+		}
+		if stuck > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the first instance never reached the held schema create")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	began := time.Now()
+	opened, err := store.Open(ctx, target.URL, store.AlwaysOwned, zerolog.Nop())
+	if err == nil {
+		_ = opened.Close()
+		t.Fatal("the second instance opened while the first was still upgrading")
+	}
+	if took := time.Since(began); took > 10*time.Second {
+		t.Errorf("the second instance took %s to give up on a 2s deadline", took)
+	}
+
+	if err := holder.Rollback(); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+	if err := <-first; err != nil {
+		t.Errorf("the first instance did not finish once the hold went: %v", err)
+	}
+}
+
 // `information_schema.columns` filtered by table name alone spans every schema the role
 // can see, so a copy of this table in another schema answers for the one the writes land
 // in. Reported present on a table that has not got it, the migration skips the ALTER and

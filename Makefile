@@ -27,10 +27,16 @@ PACKAGES ?= ./...
 # running (#342). Turning it off per session does not reach them -- `synchronous_commit` in
 # the url left the package at 112s -- because `fsync` and `full_page_writes` belong to the
 # server. Nothing a test writes has to survive a crash of the server it wrote it to.
+#
+# It also takes more connections than a server ships with. Every test opens a pool on a
+# database of its own and the packages run at once, so the pass sits at Postgres's default
+# `max_connections = 100` already, and each store open holds one more connection while it
+# waits its turn at the schema upgrade (#359): with the default, one pass in three failed
+# with `too many clients already` in tests that were not about connections at all.
 SERVER_PASSES := test-postgres test-redis
 test-postgres_VAR := WAC_TEST_DATABASE_URL
 test-postgres_NAME := wac-test-postgres
-test-postgres_RUN := docker run -d --rm --name $(test-postgres_NAME) -p 55432:5432 -e POSTGRES_USER=wac -e POSTGRES_PASSWORD=wac -e POSTGRES_DB=wac postgres:18-alpine postgres -c fsync=off -c synchronous_commit=off -c full_page_writes=off
+test-postgres_RUN := docker run -d --rm --name $(test-postgres_NAME) -p 55432:5432 -e POSTGRES_USER=wac -e POSTGRES_PASSWORD=wac -e POSTGRES_DB=wac postgres:18-alpine postgres -c fsync=off -c synchronous_commit=off -c full_page_writes=off -c max_connections=200
 test-postgres_URL := postgres://wac:wac@localhost:55432/wac?sslmode=disable
 test-redis_VAR := WAC_TEST_REDIS_URL
 test-redis_RUN := docker run -d --rm -p 56379:6379 redis:8-alpine
