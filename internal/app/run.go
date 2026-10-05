@@ -144,6 +144,7 @@ func New(cfg *Config, log zerolog.Logger) (connector *Connector, err error) {
 	// Set whether or not there is a blob root: sending a file does not go through the
 	// cache, and an instance told to keep nothing still has to be able to send.
 	mediaOpts.SendMax = cfg.MediaSendMax
+	mediaOpts.FetchHosts = cfg.MediaFetchHosts
 	if cfg.MediaRoot != "" {
 		blobs, err = media.New(media.Options{
 			Root: cfg.MediaRoot, TTL: cfg.MediaTTL,

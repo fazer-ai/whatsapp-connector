@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/cluster"
+	meow "github.com/fazer-ai/whatsapp-connector/internal/engine/whatsmeow"
 	"github.com/fazer-ai/whatsapp-connector/internal/media"
 	"github.com/fazer-ai/whatsapp-connector/internal/redisx"
 	"github.com/fazer-ai/whatsapp-connector/internal/session"
@@ -64,9 +65,12 @@ type Config struct {
 	// from an address the caller chose and an upload to WhatsApp, neither of which
 	// touches the cache.
 	MediaSendMax int64
-	LogLevel     string
-	LeaseTTL     time.Duration
-	Heartbeat    time.Duration
+	// MediaFetchHosts is the hosts a file to send may be fetched from (#31). Empty is
+	// any host, which is what an instance that never set it has always done.
+	MediaFetchHosts meow.FetchHosts
+	LogLevel        string
+	LeaseTTL        time.Duration
+	Heartbeat       time.Duration
 	// ClaimMinIdle is how long a command has to sit unacknowledged before another
 	// instance takes it over. It bounds how long a session stays unowned after the
 	// instance that woke it died, and it has to stay comfortably above the time a
@@ -179,31 +183,36 @@ func LoadConfig(hostname string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	mediaFetchHosts, err := meow.ParseFetchHosts(envString("WAC_MEDIA_FETCH_HOSTS", ""))
+	if err != nil {
+		return Config{}, err
+	}
 
 	cfg := Config{
-		Instance:       envString("WAC_INSTANCE", hostname),
-		RedisURL:       envString("REDIS_URL", ""),
-		RedisPass:      envString("REDIS_PASSWORD", ""),
-		RedisPrefix:    envString("WAC_REDIS_PREFIX", redisx.DefaultPrefix),
-		EventShards:    shards,
-		Engine:         envString("WAC_ENGINE", "fake"),
-		DatabaseURL:    envString("WAC_DATABASE_URL", ""),
-		DatabaseConns:  databaseConns,
-		DeviceName:     envString("WAC_DEVICE_NAME", DefaultDeviceName),
-		HTTPAddr:       envString("WAC_HTTP_ADDR", ":8080"),
-		AdvertiseURL:   envString("WAC_ADVERTISE_URL", ""),
-		MediaToken:     envString("WAC_MEDIA_TOKEN", ""),
-		MediaRoot:      envString("WAC_MEDIA_ROOT", ""),
-		MediaTTL:       mediaTTL,
-		MediaRefetch:   mediaRefetch,
-		MediaQuota:     mediaQuota,
-		MediaMaxBlob:   mediaMaxBlob,
-		MediaBlockSize: mediaBlockSize,
-		MediaSendMax:   mediaSendMax,
-		LogLevel:       envString("WAC_LOG_LEVEL", "info"),
-		LeaseTTL:       leaseTTL,
-		Heartbeat:      heartbeat,
-		ClaimMinIdle:   claimMinIdle,
+		Instance:        envString("WAC_INSTANCE", hostname),
+		RedisURL:        envString("REDIS_URL", ""),
+		RedisPass:       envString("REDIS_PASSWORD", ""),
+		RedisPrefix:     envString("WAC_REDIS_PREFIX", redisx.DefaultPrefix),
+		EventShards:     shards,
+		Engine:          envString("WAC_ENGINE", "fake"),
+		DatabaseURL:     envString("WAC_DATABASE_URL", ""),
+		DatabaseConns:   databaseConns,
+		DeviceName:      envString("WAC_DEVICE_NAME", DefaultDeviceName),
+		HTTPAddr:        envString("WAC_HTTP_ADDR", ":8080"),
+		AdvertiseURL:    envString("WAC_ADVERTISE_URL", ""),
+		MediaToken:      envString("WAC_MEDIA_TOKEN", ""),
+		MediaRoot:       envString("WAC_MEDIA_ROOT", ""),
+		MediaTTL:        mediaTTL,
+		MediaRefetch:    mediaRefetch,
+		MediaQuota:      mediaQuota,
+		MediaMaxBlob:    mediaMaxBlob,
+		MediaBlockSize:  mediaBlockSize,
+		MediaSendMax:    mediaSendMax,
+		MediaFetchHosts: mediaFetchHosts,
+		LogLevel:        envString("WAC_LOG_LEVEL", "info"),
+		LeaseTTL:        leaseTTL,
+		Heartbeat:       heartbeat,
+		ClaimMinIdle:    claimMinIdle,
 	}
 	if cfg.Instance == "" {
 		return Config{}, fmt.Errorf("app: WAC_INSTANCE is empty and the hostname is unknown")

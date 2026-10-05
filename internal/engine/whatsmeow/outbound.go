@@ -53,6 +53,9 @@ const fetchRedirects = 5
 // reference to fix rather than something to try again.
 var errTooManyRedirects = errors.New("whatsmeow: the address of the file to send redirects without ending")
 
+// errHostNotAllowed is a redirect to a host outside WAC_MEDIA_FETCH_HOSTS (#31).
+var errHostNotAllowed = errors.New("whatsmeow: the address of the file to send redirects outside the hosts it may be fetched from")
+
 // vcardVersion is the vCard the connector writes when the caller gave it a number and a
 // name rather than a card. 3.0 because that is what WhatsApp's own clients send and what
 // every one of them parses back.
@@ -1368,8 +1371,8 @@ var errMetadataAddress = errors.New("whatsmeow: that address answers with creden
 //
 // A list of known endpoints is not a boundary, and this one is not complete by
 // construction: a cloud that answers somewhere new is reachable until it is named here.
-// What would be complete is an allowlist of the hosts this connector may fetch from,
-// which is #31 and needs an operator to configure it.
+// What is complete is the operator's list of hosts this connector may fetch from,
+// FetchHosts, and it is opt-in; this refusal holds with it or without it.
 var metadataAddresses = map[netip.Addr]struct{}{
 	// AWS, on an IPv6-enabled instance.
 	netip.MustParseAddr("fd00:ec2::254"): {},
@@ -1388,8 +1391,9 @@ var metadataAddresses = map[netip.Addr]struct{}{
 // contract describes. What it refuses is where the answer is credentials rather than a
 // file: 169.254.169.254 is the instance metadata endpoint on every major cloud, and a
 // fetch of it hands the host's own keys to whatever WhatsApp number the command named.
-// No deployment serves media from there, so nothing is lost by never dialling it. See
-// #31 for the general question, which an allowlist is the only real answer to.
+// No deployment serves media from there, so nothing is lost by never dialling it. The
+// general question has the operator's answer in FetchHosts, which is checked on the
+// name before this is checked on the address.
 //
 // Checked on the address actually dialled rather than on the host in the URL, which is
 // what makes it cover a name that resolves to one, a name that resolves to one only on
@@ -1449,6 +1453,72 @@ func refusedAddress(address netip.Addr) bool {
 	return refused
 }
 
+// FetchHosts is the operator's list of hosts a caller's URL may be fetched from (#31).
+//
+// Empty is every host, which is what an instance without WAC_MEDIA_FETCH_HOSTS has always
+// done: the client sits next to this connector and hands over an address on its own
+// network, and an upgrade that started refusing those would break every deployment that
+// never heard of the setting. Set, it closes what the metadata refusal leaves open --
+// every other service on the network the connector can reach.
+//
+// Compared by the name in the URL and not by the address dialled, because the address
+// is all a dial is handed and a list of addresses is not what an operator knows: the
+// client's blob URL names a host. A redirect is compared the same way at every hop.
+type FetchHosts []fetchHost
+
+type fetchHost struct {
+	name string
+	// port is empty for an entry that names no port, which allows the host on any.
+	port string
+}
+
+// ParseFetchHosts reads WAC_MEDIA_FETCH_HOSTS: host names, or host:port, separated by
+// commas. A scheme, a path or a port that is not one is refused rather than read as some
+// nearby host, because a list that silently matches nothing refuses every file and one
+// that matches the wrong thing allows what the operator meant to close.
+func ParseFetchHosts(raw string) (FetchHosts, error) {
+	var hosts FetchHosts
+	for entry := range strings.SplitSeq(raw, ",") {
+		entry = strings.ToLower(strings.TrimSpace(entry))
+		if entry == "" {
+			continue
+		}
+		if strings.ContainsAny(entry, "/@?#") {
+			return nil, fmt.Errorf("WAC_MEDIA_FETCH_HOSTS: %q is not a host or host:port", entry)
+		}
+		host := fetchHost{name: entry}
+		if name, port, err := net.SplitHostPort(entry); err == nil {
+			number, err := strconv.Atoi(port)
+			if err != nil || number < 1 || number > 65535 || name == "" {
+				return nil, fmt.Errorf("WAC_MEDIA_FETCH_HOSTS: %q is not a host or host:port", entry)
+			}
+			host = fetchHost{name: name, port: port}
+		} else if strings.HasPrefix(entry, "[") {
+			host.name = strings.TrimSuffix(strings.TrimPrefix(entry, "["), "]")
+		}
+		hosts = append(hosts, host)
+	}
+	return hosts, nil
+}
+
+// allows reports whether a URL may be fetched under this list.
+func (hosts FetchHosts) allows(address *url.URL) bool {
+	if len(hosts) == 0 {
+		return true
+	}
+	name := strings.ToLower(address.Hostname())
+	port := address.Port()
+	if port == "" {
+		port = map[string]string{"http": "80", "https": "443"}[address.Scheme]
+	}
+	for _, host := range hosts {
+		if host.name == name && (host.port == "" || host.port == port) {
+			return true
+		}
+	}
+	return false
+}
+
 // retrieveOverHTTP fetches the caller's URL.
 //
 // The address comes from the client, which is the only thing this connector takes
@@ -1456,17 +1526,26 @@ func refusedAddress(address netip.Addr) bool {
 // redirect ceiling, and a refusal to read past the cap, because the failure mode of
 // getting that wrong is a session's command queue held open by a server that never
 // answers.
-func retrieveOverHTTP(ctx context.Context, address string, headers map[string]string) (source, error) {
+func retrieveOverHTTP(
+	ctx context.Context, address string, headers map[string]string, allowed FetchHosts,
+) (source, error) {
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, address, http.NoBody)
 	if err != nil {
 		return source{}, protocol.NewError(protocol.ErrorInvalidPayload,
 			"that is not an address a file can be fetched from")
 	}
+	if !allowed.allows(request.URL) {
+		// The caller's payload, and the same answer every time: retried, it would be
+		// refused for as long as the caller keeps the message. The list itself is not
+		// named, because it is a map of the operator's network.
+		return source{}, protocol.NewError(protocol.ErrorInvalidPayload,
+			"the address of the file to send names a host this connector is not configured to fetch from")
+	}
 	for name, value := range headers {
 		request.Header.Set(name, value)
 	}
 
-	client := &http.Client{Transport: fetchTransport, CheckRedirect: followingRedirects(headers)}
+	client := &http.Client{Transport: fetchTransport, CheckRedirect: followingRedirects(headers, allowed)}
 	answer, err := client.Do(request)
 	switch {
 	case errors.Is(err, errNotOverHTTP):
@@ -1475,6 +1554,11 @@ func retrieveOverHTTP(ctx context.Context, address string, headers map[string]st
 		// retrying, and the same reference redirects the same way every time.
 		return source{}, protocol.NewError(protocol.ErrorInvalidPayload,
 			"the address of the file to send redirects somewhere this connector cannot fetch from")
+	case errors.Is(err, errHostNotAllowed):
+		// A redirect out of the list: the first host is trusted and the one it points
+		// at is not, which is the hop an allowlist checked only on the way in would miss.
+		return source{}, protocol.NewError(protocol.ErrorInvalidPayload,
+			"the address of the file to send redirects to a host this connector is not configured to fetch from")
 	case errors.Is(err, errTooManyRedirects):
 		// Deterministic: the same reference redirects the same way every time, so this is
 		// the caller's address to fix and not a minute to wait out. Reported as retryable
@@ -1528,7 +1612,7 @@ func retrieveOverHTTP(ctx context.Context, address string, headers map[string]st
 // A function of its own rather than a closure written inline, because what it decides is
 // worth testing without a TLS server and a swapped-out process-wide transport standing
 // between the test and the decision.
-func followingRedirects(headers map[string]string) func(*http.Request, []*http.Request) error {
+func followingRedirects(headers map[string]string, allowed FetchHosts) func(*http.Request, []*http.Request) error {
 	return func(hop *http.Request, via []*http.Request) error {
 		// Strictly greater: via holds the requests already made, so on the first redirect
 		// it has one entry. Comparing with >= would follow one hop fewer than the
@@ -1538,6 +1622,9 @@ func followingRedirects(headers map[string]string) func(*http.Request, []*http.R
 		}
 		if err := overHTTP(hop.URL); err != nil {
 			return err
+		}
+		if !allowed.allows(hop.URL) {
+			return errHostNotAllowed
 		}
 		// net/http drops Authorization, Cookie and WWW-Authenticate of its own accord
 		// when a redirect leaves the host, and nothing else: a reference authenticated

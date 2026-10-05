@@ -114,6 +114,8 @@ type MediaOptions struct {
 	// root at all still sends. The zero value asks for DefaultSendMax, so an engine
 	// built without one is not an engine that refuses every file.
 	SendMax int64
+	// FetchHosts is the hosts a file to send may be fetched from. Empty is any host.
+	FetchHosts FetchHosts
 }
 
 // attachment is the media part of a message: what the contract says about the file, the

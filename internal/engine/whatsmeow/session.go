@@ -750,7 +750,9 @@ func newSession(
 		download: func(ctx context.Context, client *wm.Client, part wm.DownloadableMessage, file media.File) error {
 			return client.DownloadToFile(ctx, part, file) //nolint:wrapcheck // classified by downloadFailure, which needs the sentinels
 		},
-		retrieve:        retrieveOverHTTP,
+		retrieve: func(ctx context.Context, address string, headers map[string]string) (source, error) {
+			return retrieveOverHTTP(ctx, address, headers, blobs.FetchHosts)
+		},
 		uploadFile:      uploadOverClient,
 		sendAppState:    sendAppStateOverClient,
 		downloadHistory: downloadHistoryOverClient,
