@@ -548,6 +548,12 @@ func correctedContent(corrected *waE2E.Message) (any, bool) {
 	if corrected == nil {
 		return nil, false
 	}
+	// A document that gains a caption is sent in its own envelope, and inside an edit
+	// whatsmeow unwraps the edit and not that envelope: this connector sends one for a
+	// caption correction of a document (#32), and so may any other client.
+	if inner := corrected.GetDocumentWithCaptionMessage().GetMessage(); inner != nil {
+		corrected = inner
+	}
 	if text, _, ok := textOf(corrected); ok {
 		return protocol.Text(text), true
 	}

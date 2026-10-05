@@ -327,6 +327,38 @@ func TestACaptionEditCarriesTheNewCaptionAndFetchesNoFile(t *testing.T) {
 	}
 }
 
+// A document's caption correction travels in the envelope a captioned document is sent
+// in, which is what this connector's own send of one puts on the wire (#32): read on the
+// other side it is still a caption edit, and still published.
+func TestADocumentCaptionEditInItsEnvelopeIsPublished(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	sent, err := proto.Marshal(&waE2E.Message{DocumentMessage: &waE2E.DocumentMessage{
+		Mimetype:      proto.String("application/pdf"),
+		FileName:      proto.String("a.pdf"),
+		FileLength:    proto.Uint64(2048),
+		DirectPath:    proto.String("/v/t62.7119-24/whatever"),
+		MediaKey:      make([]byte, 32),
+		FileEncSHA256: make([]byte, 32),
+		FileSHA256:    make([]byte, 32),
+	}})
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	corrected, err := recaptioned(sent, "legenda nova")
+	if err != nil {
+		t.Fatalf("recaptioned: %v", err)
+	}
+	emission := publishedBy(t, session, editEvent(carrier, subject, corrected, 1755000009000))
+
+	validateAgainstContract(t, "event_message_edited", emission.Payload)
+	content, _ := decode(t, emission.Payload)["content"].(map[string]any)
+	if content["type"] != "media" || content["kind"] != "document" || content["caption"] != "legenda nova" {
+		t.Fatalf("a document caption edit was published as %v", content)
+	}
+}
+
 // A channel's edit arrives unwrapped, under the original post's id, with the edit's own
 // clock off to the side. Read the ordinary way there is no key to name a target in.
 func TestAChannelEditNamesThePostItself(t *testing.T) {
