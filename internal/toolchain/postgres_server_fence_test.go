@@ -21,6 +21,13 @@ var notDurable = []string{
 	"-c full_page_writes=off",
 }
 
+// The pass opens a pool per test on a database per test, with the packages running at
+// once, and that sits at the default ceiling of 100 connections; the extra connection a
+// store open holds while it waits for the schema upgrade (#359) is what tips it over.
+var headroom = []string{
+	"-c max_connections=200",
+}
+
 var (
 	makeVar = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_-]*)\s*[:?]?=\s*(.*)$`)
 	makeRef = regexp.MustCompile(`\$\(([A-Za-z_][A-Za-z0-9_-]*)\)`)
@@ -65,6 +72,13 @@ func TestThePostgreSQLTheTestsRunAgainstIsNotDurable(t *testing.T) {
 	_, server, found := strings.Cut(command, "postgres:18-alpine")
 	if !found {
 		t.Fatalf("%s is %q, which starts no postgres:18-alpine: the image CI and the Makefile agree on", serverVar, command)
+	}
+	for _, flag := range headroom {
+		if !strings.Contains(server, flag) {
+			t.Errorf("%s does not pass %q to the server:\n\t%s\n"+
+				"\tthe pass needs more than the default 100 connections, and short of them it fails in tests about something else",
+				serverVar, flag, command)
+		}
 	}
 	for _, flag := range notDurable {
 		if !strings.Contains(server, flag) {
