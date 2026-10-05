@@ -30,7 +30,8 @@ type SentMedia struct {
 
 // PutSentMedia keeps a media message this session is about to send, under the id it goes
 // out with. Written again under the same id it replaces what was kept, which is what a
-// redelivered send does.
+// redelivered send does, except for an alternate chat the retry did not know: a retry
+// after a restart has lost the pairing from memory, and the row is where it survived.
 func (s *Scoped) PutSentMedia(ctx context.Context, messageID string, sent SentMedia) error {
 	if err := s.fence.held(); err != nil {
 		return err
@@ -51,7 +52,11 @@ func (c *Container) putSentMedia(ctx context.Context, sid, messageID string, sen
 	const upsert = `
 		INSERT INTO wac_sent_media (sid, message_id, chat, alt_chat, body, sent_at) VALUES (?, ?, ?, ?, ?, ?)
 		ON CONFLICT (sid, message_id) DO UPDATE SET
-			chat = excluded.chat, alt_chat = excluded.alt_chat, body = excluded.body, sent_at = excluded.sent_at`
+			chat = excluded.chat, body = excluded.body, sent_at = excluded.sent_at,
+			alt_chat = CASE
+				WHEN excluded.alt_chat = '' AND wac_sent_media.chat = excluded.chat THEN wac_sent_media.alt_chat
+				ELSE excluded.alt_chat
+			END`
 	// Base64 in a TEXT column rather than a blob, so the one schema reads the same under
 	// both dialects.
 	body := base64.StdEncoding.EncodeToString(sent.Body)

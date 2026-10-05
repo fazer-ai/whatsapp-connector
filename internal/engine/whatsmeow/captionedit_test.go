@@ -272,3 +272,35 @@ func TestAFileThatCannotBeKeptIsNotSent(t *testing.T) {
 		t.Fatalf("a refused send reached the wire: %v", wired.message)
 	}
 }
+
+// The same the other way round: a file sent to a LID whose number this account knows, and
+// an edit by that number after a restart.
+func TestACaptionEditByTheNumberOfTheLIDItWasSentToIsTheSameChat(t *testing.T) {
+	t.Parallel()
+
+	session, files, _ := outboundSession(t)
+	wired := &wire{}
+	session.handOver = wired.hand
+	files.answer(tinyPNG(t), "image/png")
+	lid := waTypes.NewJID("167392323834078", waTypes.HiddenUserServer)
+	phone := waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)
+	if err := session.current().Store.LIDs.PutLIDMapping(t.Context(), lid, phone); err != nil {
+		t.Fatalf("PutLIDMapping: %v", err)
+	}
+	session.aliases.observe(session.aliases.stamp(t.Context()), phone, lid)
+
+	if _, err := session.send(t.Context(), &protocol.Command{Type: protocol.CommandMessageSend, Payload: json.RawMessage(
+		`{"message_id":"3EB0SENTFILE","to":{"kind":"lid","id":"167392323834078"},"content":{"type":"media","kind":"image",` +
+			`"mime":"image/png","caption":"antes","ref":{"kind":"url","url":"http://rails:3000/blob.png"}}}`)}); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	session.aliases = newAlias()
+	wired.message = nil
+	if _, err := session.edit(t.Context(), &protocol.Command{Type: protocol.CommandMessageEdit, Payload: json.RawMessage(
+		`{` + captionChat + `,"target_id":"3EB0SENTFILE","content":{"type":"text","body":"depois"}}`)}); err != nil {
+		t.Fatalf("edit by the number after a restart: %v", err)
+	}
+	if got := correctionIn(wired.message).GetImageMessage().GetCaption(); got != "depois" {
+		t.Fatalf("the correction went out as %v", wired.message)
+	}
+}

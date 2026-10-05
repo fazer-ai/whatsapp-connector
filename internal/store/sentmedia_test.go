@@ -99,3 +99,34 @@ func TestSentMediaGoesWithThePairing(t *testing.T) {
 		t.Errorf("an unpaired session still holds a sent file's key (found=%v, err=%v)", found, err)
 	}
 }
+
+// A redelivered send after a restart no longer knows the pairing, and writing the row again
+// does not erase the one that survived in it. A retry that names another chat is a new
+// send and takes nothing from the old row.
+func TestARedeliveredSendKeepsTheAlternateChatItDidNotKnow(t *testing.T) {
+	t.Parallel()
+	container := open(t)
+	pair(t, container, "sid-1", "5511999990001")
+	scoped := container.For("sid-1")
+
+	put := func(sent store.SentMedia) {
+		t.Helper()
+		if err := scoped.PutSentMedia(t.Context(), "3EB0FILE", sent); err != nil {
+			t.Fatalf("PutSentMedia: %v", err)
+		}
+	}
+	put(store.SentMedia{Chat: "5511999990002@s.whatsapp.net", AltChat: "167392323834077@lid", Body: []byte{1}})
+	put(store.SentMedia{Chat: "5511999990002@s.whatsapp.net", Body: []byte{2}})
+	kept, _, err := scoped.SentMedia(t.Context(), "3EB0FILE")
+	if err != nil {
+		t.Fatalf("SentMedia: %v", err)
+	}
+	if kept.AltChat != "167392323834077@lid" || !bytes.Equal(kept.Body, []byte{2}) {
+		t.Errorf("after the retry the row is %q and % x, want the alternate kept and the body replaced", kept.AltChat, kept.Body)
+	}
+
+	put(store.SentMedia{Chat: "5511999990003@s.whatsapp.net", Body: []byte{3}})
+	if kept, _, _ = scoped.SentMedia(t.Context(), "3EB0FILE"); kept.AltChat != "" {
+		t.Errorf("a send to another chat inherited the alternate %q", kept.AltChat)
+	}
+}
