@@ -9,7 +9,6 @@ import (
 	"testing"
 
 	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
-	waTypes "go.mau.fi/whatsmeow/types"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 )
@@ -174,75 +173,90 @@ func TestATextEditOfAMessageNotKeptGoesOutAsText(t *testing.T) {
 	}
 }
 
-// The record is the session's own and names the chat it went to: an edit that names a
-// kept message in another chat is refused rather than sent with somebody else's file.
-func TestACaptionEditNamingAnotherChatIsRefused(t *testing.T) {
+// The correction goes to the chat the file was sent to, whichever chat the edit named. The
+// client may name it by the LID of the number it was sent to, and after a restart nothing
+// in memory says the two are one person; the id names the message, and the message lives
+// in one chat. Sent anywhere else, the file's keys would reach a chat that never had them.
+func TestACaptionEditGoesToTheChatTheFileWasSentTo(t *testing.T) {
 	t.Parallel()
 
-	session, files, _ := outboundSession(t)
-	wired := &wire{}
-	session.handOver = wired.hand
-	files.answer(tinyPNG(t), "image/png")
-	if _, err := session.send(t.Context(), &protocol.Command{Type: protocol.CommandMessageSend, Payload: json.RawMessage(
-		`{"message_id":"3EB0SENTFILE",` + captionChat + `,"content":{"type":"media","kind":"image","mime":"image/png",` +
-			`"caption":"antes","ref":{"kind":"url","url":"http://rails:3000/blob.png"}}}`)}); err != nil {
-		t.Fatalf("send: %v", err)
+	for name, named := range map[string]string{
+		"named by a LID nothing here pairs with the number": `{"kind":"lid","id":"167392323834077"}`,
+		"named as another chat altogether":                  `{"kind":"phone","id":"5511999990003"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			session, files, _ := outboundSession(t)
+			wired := &wire{}
+			session.handOver = wired.hand
+			files.answer(tinyPNG(t), "image/png")
+			if _, err := session.send(t.Context(), &protocol.Command{Type: protocol.CommandMessageSend, Payload: json.RawMessage(
+				`{"message_id":"3EB0SENTFILE",` + captionChat + `,"content":{"type":"media","kind":"image","mime":"image/png",` +
+					`"caption":"antes","ref":{"kind":"url","url":"http://rails:3000/blob.png"}}}`)}); err != nil {
+				t.Fatalf("send: %v", err)
+			}
+			sentTo := wired.to
+			wired.message = nil
+			if _, err := session.edit(t.Context(), &protocol.Command{Type: protocol.CommandMessageEdit, Payload: json.RawMessage(
+				`{"to":` + named + `,"target_id":"3EB0SENTFILE","content":{"type":"text","body":"depois"}}`)}); err != nil {
+				t.Fatalf("edit: %v", err)
+			}
+			if wired.to != sentTo {
+				t.Fatalf("the correction went to %s, the file to %s", wired.to, sentTo)
+			}
+			if got := correctionIn(wired.message).GetImageMessage().GetCaption(); got != "depois" {
+				t.Fatalf("the correction went out as %v", wired.message)
+			}
+		})
 	}
-	wired.message = nil
-	_, err := session.edit(t.Context(), &protocol.Command{Type: protocol.CommandMessageEdit, Payload: json.RawMessage(
-		`{"to":{"kind":"phone","id":"5511999990003"},"target_id":"3EB0SENTFILE","content":{"type":"text","body":"x"}}`)})
-	assertCode(t, err, protocol.ErrorInvalidPayload)
-	if wired.message != nil {
-		t.Fatalf("a refused edit reached the wire: %v", wired.message)
-	}
+}
+
+// An empty correction of a file removes its caption and keeps the file; a document that
+// went out bare stays bare. Text has no such thing, so an empty correction of a message
+// that is not kept is still refused.
+func TestACaptionCanBeRemoved(t *testing.T) {
+	t.Parallel()
+
+	const ref = `"ref":{"kind":"url","url":"http://rails:3000/blob.png"}`
+	t.Run("an image", func(t *testing.T) {
+		t.Parallel()
+		_, edited, _, _, err := sendThenEdit(t,
+			`{"type":"media","kind":"image","mime":"image/png","caption":"antes",`+ref+`}`, "")
+		if err != nil {
+			t.Fatalf("edit: %v", err)
+		}
+		photo := correctionIn(edited).GetImageMessage()
+		if photo.GetDirectPath() != "/v/t62/x.enc" || photo.GetCaption() != "" {
+			t.Fatalf("the correction went out as %v", edited)
+		}
+	})
+	t.Run("a document sent without one", func(t *testing.T) {
+		t.Parallel()
+		_, edited, _, _, err := sendThenEdit(t,
+			`{"type":"media","kind":"document","mime":"application/pdf","filename":"a.pdf",`+ref+`}`, "")
+		if err != nil {
+			t.Fatalf("edit: %v", err)
+		}
+		if document := correctionIn(edited).GetDocumentMessage(); document.GetDirectPath() != "/v/t62/x.enc" {
+			t.Fatalf("the correction went out as %v", edited)
+		}
+	})
+	t.Run("text that is not kept", func(t *testing.T) {
+		t.Parallel()
+		session, sent := actingSession(t)
+		_, err := session.edit(t.Context(), &protocol.Command{Type: protocol.CommandMessageEdit, Payload: json.RawMessage(
+			`{` + captionChat + `,"target_id":"3EB0NEVERKEPT","content":{"type":"text","body":""}}`)})
+		assertCode(t, err, protocol.ErrorInvalidPayload)
+		if sent.message != nil {
+			t.Fatalf("a refused edit reached the wire: %v", sent.message)
+		}
+	})
 }
 
 // correctionIn is the corrected message inside the envelopes an edit travels in.
 func correctionIn(m *waE2E.Message) *waE2E.Message {
 	return m.GetEditedMessage().GetMessage().GetProtocolMessage().GetEditedMessage()
-}
-
-// A file sent to a number is in the conversation the client has under the LID once the
-// pairing is known, and an edit that names that LID is an edit of the same chat.
-func TestACaptionEditByTheLIDOfTheNumberItWasSentToIsTheSameChat(t *testing.T) {
-	t.Parallel()
-
-	session, files, _ := outboundSession(t)
-	wired := &wire{}
-	session.handOver = wired.hand
-	files.answer(tinyPNG(t), "image/png")
-	lid := waTypes.NewJID("167392323834077", waTypes.HiddenUserServer)
-	phone := waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)
-	if err := session.current().Store.LIDs.PutLIDMapping(t.Context(), lid, phone); err != nil {
-		t.Fatalf("PutLIDMapping: %v", err)
-	}
-	session.aliases.observe(session.aliases.stamp(t.Context()), phone, lid)
-
-	if _, err := session.send(t.Context(), &protocol.Command{Type: protocol.CommandMessageSend, Payload: json.RawMessage(
-		`{"message_id":"3EB0SENTFILE",` + captionChat + `,"content":{"type":"media","kind":"image","mime":"image/png",` +
-			`"caption":"antes","ref":{"kind":"url","url":"http://rails:3000/blob.png"}}}`)}); err != nil {
-		t.Fatalf("send: %v", err)
-	}
-	wired.message = nil
-	if _, err := session.edit(t.Context(), &protocol.Command{Type: protocol.CommandMessageEdit, Payload: json.RawMessage(
-		`{"to":{"kind":"lid","id":"167392323834077"},"target_id":"3EB0SENTFILE","content":{"type":"text","body":"depois"}}`)}); err != nil {
-		t.Fatalf("edit by the LID: %v", err)
-	}
-	if got := correctionIn(wired.message).GetImageMessage().GetCaption(); got != "depois" {
-		t.Fatalf("the correction went out as %v", wired.message)
-	}
-
-	// After a restart the pairings this account was shown are gone from memory, and the
-	// record is what still says the two addresses are one chat.
-	session.aliases = newAlias()
-	wired.message = nil
-	if _, err := session.edit(t.Context(), &protocol.Command{Type: protocol.CommandMessageEdit, Payload: json.RawMessage(
-		`{"to":{"kind":"lid","id":"167392323834077"},"target_id":"3EB0SENTFILE","content":{"type":"text","body":"de novo"}}`)}); err != nil {
-		t.Fatalf("edit by the LID after a restart: %v", err)
-	}
-	if got := correctionIn(wired.message).GetImageMessage().GetCaption(); got != "de novo" {
-		t.Fatalf("the correction after a restart went out as %v", wired.message)
-	}
 }
 
 // A file whose record could not be kept is not sent: a later edit of it would find no
@@ -270,37 +284,5 @@ func TestAFileThatCannotBeKeptIsNotSent(t *testing.T) {
 	}
 	if wired.message != nil {
 		t.Fatalf("a refused send reached the wire: %v", wired.message)
-	}
-}
-
-// The same the other way round: a file sent to a LID whose number this account knows, and
-// an edit by that number after a restart.
-func TestACaptionEditByTheNumberOfTheLIDItWasSentToIsTheSameChat(t *testing.T) {
-	t.Parallel()
-
-	session, files, _ := outboundSession(t)
-	wired := &wire{}
-	session.handOver = wired.hand
-	files.answer(tinyPNG(t), "image/png")
-	lid := waTypes.NewJID("167392323834078", waTypes.HiddenUserServer)
-	phone := waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)
-	if err := session.current().Store.LIDs.PutLIDMapping(t.Context(), lid, phone); err != nil {
-		t.Fatalf("PutLIDMapping: %v", err)
-	}
-	session.aliases.observe(session.aliases.stamp(t.Context()), phone, lid)
-
-	if _, err := session.send(t.Context(), &protocol.Command{Type: protocol.CommandMessageSend, Payload: json.RawMessage(
-		`{"message_id":"3EB0SENTFILE","to":{"kind":"lid","id":"167392323834078"},"content":{"type":"media","kind":"image",` +
-			`"mime":"image/png","caption":"antes","ref":{"kind":"url","url":"http://rails:3000/blob.png"}}}`)}); err != nil {
-		t.Fatalf("send: %v", err)
-	}
-	session.aliases = newAlias()
-	wired.message = nil
-	if _, err := session.edit(t.Context(), &protocol.Command{Type: protocol.CommandMessageEdit, Payload: json.RawMessage(
-		`{` + captionChat + `,"target_id":"3EB0SENTFILE","content":{"type":"text","body":"depois"}}`)}); err != nil {
-		t.Fatalf("edit by the number after a restart: %v", err)
-	}
-	if got := correctionIn(wired.message).GetImageMessage().GetCaption(); got != "depois" {
-		t.Fatalf("the correction went out as %v", wired.message)
 	}
 }

@@ -19,19 +19,13 @@ const SentMediaRetention = time.Hour
 type SentMedia struct {
 	// Chat is the address it was sent to, as a JID string.
 	Chat string
-	// AltChat is the address the chat was published under when that differs from Chat,
-	// the LID of a number this account knows the pairing of, and empty otherwise. Kept
-	// because the pairing is otherwise only in memory, and an edit after a restart names
-	// the chat the way the client was shown it.
-	AltChat string
 	// Body is the message, serialised as WhatsApp's protobuf.
 	Body []byte
 }
 
 // PutSentMedia keeps a media message this session is about to send, under the id it goes
 // out with. Written again under the same id it replaces what was kept, which is what a
-// redelivered send does, except for an alternate chat the retry did not know: a retry
-// after a restart has lost the pairing from memory, and the row is where it survived.
+// redelivered send does.
 func (s *Scoped) PutSentMedia(ctx context.Context, messageID string, sent SentMedia) error {
 	if err := s.fence.held(); err != nil {
 		return err
@@ -50,17 +44,13 @@ func (c *Container) putSentMedia(ctx context.Context, sid, messageID string, sen
 			sid, messageID, sent.Chat, len(sent.Body))
 	}
 	const upsert = `
-		INSERT INTO wac_sent_media (sid, message_id, chat, alt_chat, body, sent_at) VALUES (?, ?, ?, ?, ?, ?)
+		INSERT INTO wac_sent_media (sid, message_id, chat, body, sent_at) VALUES (?, ?, ?, ?, ?)
 		ON CONFLICT (sid, message_id) DO UPDATE SET
-			chat = excluded.chat, body = excluded.body, sent_at = excluded.sent_at,
-			alt_chat = CASE
-				WHEN excluded.alt_chat = '' AND wac_sent_media.chat = excluded.chat THEN wac_sent_media.alt_chat
-				ELSE excluded.alt_chat
-			END`
+			chat = excluded.chat, body = excluded.body, sent_at = excluded.sent_at`
 	// Base64 in a TEXT column rather than a blob, so the one schema reads the same under
 	// both dialects.
 	body := base64.StdEncoding.EncodeToString(sent.Body)
-	if _, err := c.db.ExecContext(ctx, c.rebind(upsert), sid, messageID, sent.Chat, sent.AltChat, body, now.UnixMilli()); err != nil {
+	if _, err := c.db.ExecContext(ctx, c.rebind(upsert), sid, messageID, sent.Chat, body, now.UnixMilli()); err != nil {
 		return fmt.Errorf("store: keep the media message %s of %s: %w", messageID, sid, err)
 	}
 	return nil
@@ -70,8 +60,8 @@ func (c *Container) sentMedia(ctx context.Context, sid, messageID string) (SentM
 	var kept SentMedia
 	var body string
 	err := c.db.QueryRowContext(ctx,
-		c.rebind(`SELECT chat, alt_chat, body FROM wac_sent_media WHERE sid = ? AND message_id = ?`), sid, messageID,
-	).Scan(&kept.Chat, &kept.AltChat, &body)
+		c.rebind(`SELECT chat, body FROM wac_sent_media WHERE sid = ? AND message_id = ?`), sid, messageID,
+	).Scan(&kept.Chat, &body)
 	if errors.Is(err, sql.ErrNoRows) {
 		return SentMedia{}, false, nil
 	}

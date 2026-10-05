@@ -140,14 +140,7 @@ func (s *Session) keepForItsCaption(ctx context.Context, to waTypes.JID, message
 	}
 	writing, written := context.WithTimeout(ctx, s.storeLimit)
 	defer written()
-	sent := store.SentMedia{Chat: to.String(), Body: body}
-	// The other half of the pairing, whichever namespace the send named: the client may
-	// name the chat either way in an edit, and after a restart the pairing is no longer in
-	// memory to say the two are one.
-	if alt, found := s.aliases.lookup(s, to); found {
-		sent.AltChat = alt.String()
-	}
-	if err := s.store.PutSentMedia(writing, messageID, sent); err != nil {
+	if err := s.store.PutSentMedia(writing, messageID, store.SentMedia{Chat: to.String(), Body: body}); err != nil {
 		return fmt.Errorf("keep the media message %s for its caption to be corrected: %w", messageID, err)
 	}
 	return nil

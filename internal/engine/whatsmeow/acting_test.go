@@ -202,10 +202,9 @@ func TestACommandThatActsOnNothingIsRefused(t *testing.T) {
 	}
 }
 
-// A correction is the whole corrected message, so a caption edit needs the file's upload
-// coordinates again and nothing here keeps them once a send is done. Refused with the
-// reason rather than sent with coordinates that resolve to nothing, which would replace a
-// caption with a broken attachment and report success. See #32.
+// The contract carries a correction as text. A caption is corrected by a text edit that
+// names the media message (#32), and a correction to anything else is refused with the
+// reason rather than guessed at.
 func TestOnlyATextBodyCanBeCorrected(t *testing.T) {
 	t.Parallel()
 
@@ -222,18 +221,18 @@ func TestOnlyATextBodyCanBeCorrected(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			_, err := editedBody(json.RawMessage(tc.content))
+			_, err := editedText(json.RawMessage(tc.content))
 			assertCode(t, err, tc.code)
 		})
 	}
 
 	// And the one that can.
-	corrected, err := editedBody(json.RawMessage(`{"type":"text","body":"corrigido"}`))
+	corrected, err := editedText(json.RawMessage(`{"type":"text","body":"corrigido"}`))
 	if err != nil {
-		t.Fatalf("editedBody: %v", err)
+		t.Fatalf("editedText: %v", err)
 	}
-	if got := corrected.GetConversation(); got != "corrigido" {
-		t.Fatalf("the correction reads %q", got)
+	if corrected != "corrigido" {
+		t.Fatalf("the correction reads %q", corrected)
 	}
 }
 
