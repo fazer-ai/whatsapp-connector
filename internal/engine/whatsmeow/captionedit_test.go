@@ -231,6 +231,18 @@ func TestACaptionEditByTheLIDOfTheNumberItWasSentToIsTheSameChat(t *testing.T) {
 	if got := correctionIn(wired.message).GetImageMessage().GetCaption(); got != "depois" {
 		t.Fatalf("the correction went out as %v", wired.message)
 	}
+
+	// After a restart the pairings this account was shown are gone from memory, and the
+	// record is what still says the two addresses are one chat.
+	session.aliases = newAlias()
+	wired.message = nil
+	if _, err := session.edit(t.Context(), &protocol.Command{Type: protocol.CommandMessageEdit, Payload: json.RawMessage(
+		`{"to":{"kind":"lid","id":"167392323834077"},"target_id":"3EB0SENTFILE","content":{"type":"text","body":"de novo"}}`)}); err != nil {
+		t.Fatalf("edit by the LID after a restart: %v", err)
+	}
+	if got := correctionIn(wired.message).GetImageMessage().GetCaption(); got != "de novo" {
+		t.Fatalf("the correction after a restart went out as %v", wired.message)
+	}
 }
 
 // A file whose record could not be kept is not sent: a later edit of it would find no

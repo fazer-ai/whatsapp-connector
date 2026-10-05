@@ -140,7 +140,13 @@ func (s *Session) keepForItsCaption(ctx context.Context, to waTypes.JID, message
 	}
 	writing, written := context.WithTimeout(ctx, s.storeLimit)
 	defer written()
-	if err := s.store.PutSentMedia(writing, messageID, store.SentMedia{Chat: to.String(), Body: body}); err != nil {
+	sent := store.SentMedia{Chat: to.String(), Body: body}
+	if published, ok := s.address(writing, to); ok {
+		if alt, err := jidOf(published); err == nil && alt != to {
+			sent.AltChat = alt.String()
+		}
+	}
+	if err := s.store.PutSentMedia(writing, messageID, sent); err != nil {
 		return fmt.Errorf("keep the media message %s for its caption to be corrected: %w", messageID, err)
 	}
 	return nil

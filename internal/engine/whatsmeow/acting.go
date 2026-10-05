@@ -128,12 +128,21 @@ func (s *Session) recaptionedIfMedia(
 		return corrected, nil
 	}
 	// The send may have named the chat by number and the client the edit by the LID it
-	// was published under since, which is one chat.
-	keptJID, err := waTypes.ParseJID(kept.Chat)
-	if err != nil {
-		return nil, fmt.Errorf("read the chat %s was sent to: %w", targetID, err)
+	// was published under, which is one chat: the LID it was published under at the send
+	// is kept with it, and one learned since is in the session's own pairings.
+	same := false
+	for _, chat := range []string{kept.Chat, kept.AltChat} {
+		if chat == "" || same {
+			continue
+		}
+		keptJID, err := waTypes.ParseJID(chat)
+		if err != nil {
+			return nil, fmt.Errorf("read the chat %s was sent to: %w", targetID, err)
+		}
+		keptChat, ok := addressOf(keptJID)
+		same = ok && s.sameChat(to, keptChat)
 	}
-	if keptChat, ok := addressOf(keptJID); !ok || !s.sameChat(to, keptChat) {
+	if !same {
 		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
 			"the message this edit names was sent to another chat")
 	}

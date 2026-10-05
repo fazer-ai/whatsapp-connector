@@ -20,7 +20,7 @@ func TestASentMediaMessageIsReadBackAfterAReopen(t *testing.T) {
 
 	body := []byte{0x0a, 0x03, 'a', 'b', 0x00, 0xff}
 	if err := container.For("sid-1").PutSentMedia(t.Context(), "3EB0FILE",
-		store.SentMedia{Chat: "5511999990002@s.whatsapp.net", Body: body}); err != nil {
+		store.SentMedia{Chat: "5511999990002@s.whatsapp.net", AltChat: "167392323834077@lid", Body: body}); err != nil {
 		t.Fatalf("PutSentMedia: %v", err)
 	}
 	if err := container.Close(); err != nil {
@@ -35,8 +35,8 @@ func TestASentMediaMessageIsReadBackAfterAReopen(t *testing.T) {
 	if !found {
 		t.Fatal("a media message kept before a restart was gone after it")
 	}
-	if kept.Chat != "5511999990002@s.whatsapp.net" || !bytes.Equal(kept.Body, body) {
-		t.Errorf("read back %q and % x, want what was kept", kept.Chat, kept.Body)
+	if kept.Chat != "5511999990002@s.whatsapp.net" || kept.AltChat != "167392323834077@lid" || !bytes.Equal(kept.Body, body) {
+		t.Errorf("read back %q, %q and % x, want what was kept", kept.Chat, kept.AltChat, kept.Body)
 	}
 
 	if _, found, err := reopened.For("sid-2").SentMedia(t.Context(), "3EB0FILE"); err != nil || found {

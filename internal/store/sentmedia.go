@@ -19,6 +19,11 @@ const SentMediaRetention = time.Hour
 type SentMedia struct {
 	// Chat is the address it was sent to, as a JID string.
 	Chat string
+	// AltChat is the address the chat was published under when that differs from Chat,
+	// the LID of a number this account knows the pairing of, and empty otherwise. Kept
+	// because the pairing is otherwise only in memory, and an edit after a restart names
+	// the chat the way the client was shown it.
+	AltChat string
 	// Body is the message, serialised as WhatsApp's protobuf.
 	Body []byte
 }
@@ -44,13 +49,13 @@ func (c *Container) putSentMedia(ctx context.Context, sid, messageID string, sen
 			sid, messageID, sent.Chat, len(sent.Body))
 	}
 	const upsert = `
-		INSERT INTO wac_sent_media (sid, message_id, chat, body, sent_at) VALUES (?, ?, ?, ?, ?)
+		INSERT INTO wac_sent_media (sid, message_id, chat, alt_chat, body, sent_at) VALUES (?, ?, ?, ?, ?, ?)
 		ON CONFLICT (sid, message_id) DO UPDATE SET
-			chat = excluded.chat, body = excluded.body, sent_at = excluded.sent_at`
+			chat = excluded.chat, alt_chat = excluded.alt_chat, body = excluded.body, sent_at = excluded.sent_at`
 	// Base64 in a TEXT column rather than a blob, so the one schema reads the same under
 	// both dialects.
 	body := base64.StdEncoding.EncodeToString(sent.Body)
-	if _, err := c.db.ExecContext(ctx, c.rebind(upsert), sid, messageID, sent.Chat, body, now.UnixMilli()); err != nil {
+	if _, err := c.db.ExecContext(ctx, c.rebind(upsert), sid, messageID, sent.Chat, sent.AltChat, body, now.UnixMilli()); err != nil {
 		return fmt.Errorf("store: keep the media message %s of %s: %w", messageID, sid, err)
 	}
 	return nil
@@ -60,8 +65,8 @@ func (c *Container) sentMedia(ctx context.Context, sid, messageID string) (SentM
 	var kept SentMedia
 	var body string
 	err := c.db.QueryRowContext(ctx,
-		c.rebind(`SELECT chat, body FROM wac_sent_media WHERE sid = ? AND message_id = ?`), sid, messageID,
-	).Scan(&kept.Chat, &body)
+		c.rebind(`SELECT chat, alt_chat, body FROM wac_sent_media WHERE sid = ? AND message_id = ?`), sid, messageID,
+	).Scan(&kept.Chat, &kept.AltChat, &body)
 	if errors.Is(err, sql.ErrNoRows) {
 		return SentMedia{}, false, nil
 	}

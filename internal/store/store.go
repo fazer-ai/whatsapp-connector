@@ -852,6 +852,7 @@ func (c *Container) migrate(ctx context.Context) error {
 			sid        TEXT   NOT NULL,
 			message_id TEXT   NOT NULL,
 			chat       TEXT   NOT NULL,
+			alt_chat   TEXT   NOT NULL,
 			body       TEXT   NOT NULL,
 			sent_at    BIGINT NOT NULL,
 			PRIMARY KEY (sid, message_id),
