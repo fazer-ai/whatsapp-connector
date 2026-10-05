@@ -286,3 +286,34 @@ func TestAFileThatCannotBeKeptIsNotSent(t *testing.T) {
 		t.Fatalf("a refused send reached the wire: %v", wired.message)
 	}
 }
+
+// Not knowing whether the message is a file is not a reason to correct it as text: a store
+// that will not answer refuses the edit, and nothing goes out that could replace a file.
+func TestACaptionEditTheStoreCannotAnswerForIsRefused(t *testing.T) {
+	t.Parallel()
+
+	session, container := newTestSession(t, "5511999990001")
+	connect(session)
+	files, sent := &serving{}, &uploads{}
+	session.retrieve = files.hand
+	session.uploadFile = sent.hand
+	wired := &wire{}
+	session.handOver = wired.hand
+	files.answer(tinyPNG(t), "image/png")
+	if _, err := session.send(t.Context(), &protocol.Command{Type: protocol.CommandMessageSend, Payload: json.RawMessage(
+		`{"message_id":"3EB0SENTFILE",` + captionChat + `,"content":{"type":"media","kind":"image","mime":"image/png",` +
+			`"caption":"antes","ref":{"kind":"url","url":"http://rails:3000/blob.png"}}}`)}); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	if err := container.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	wired.message = nil
+	if _, err := session.edit(t.Context(), &protocol.Command{Type: protocol.CommandMessageEdit, Payload: json.RawMessage(
+		`{` + captionChat + `,"target_id":"3EB0SENTFILE","content":{"type":"text","body":"depois"}}`)}); err == nil {
+		t.Fatal("an edit the store could not answer for was sent")
+	}
+	if wired.message != nil {
+		t.Fatalf("an edit the store could not answer for reached the wire: %v", wired.message)
+	}
+}
