@@ -14,6 +14,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
+	"github.com/fazer-ai/whatsapp-connector/internal/store"
 )
 
 // sendRequest is `message.send`, decoded.
@@ -102,6 +103,7 @@ func (s *Session) send(ctx context.Context, command *protocol.Command) (json.Raw
 		if message, err = s.mediaToSend(building, plan, alongside); err != nil {
 			return nil, err
 		}
+		s.keepForItsCaption(ctx, to, req.MessageID, message)
 	}
 
 	sent, err := s.putOnTheWire(ctx, to, req.MessageID, message)
@@ -114,6 +116,31 @@ func (s *Session) send(ctx context.Context, command *protocol.Command) (json.Raw
 		"timestamp":  sent.Timestamp.UnixMilli(),
 		"client_ref": req.ClientRef,
 	})
+}
+
+// keepForItsCaption keeps a media message as it is about to go out, so its caption can be
+// corrected later (#32). An edit carries the corrected message in full, and the file's
+// coordinates exist only in this message once the upload has answered.
+//
+// Kept before the send rather than after it: a process that dies between the two has
+// still sent the file, and the caption it went out with is still somebody's to correct.
+// A row for a send that then fails costs nothing an edit can reach, because WhatsApp
+// refuses an edit of a message it never took.
+//
+// A failure is logged and the send goes on. The record buys a later correction; refusing
+// the file the operator asked for now, because the store would not take a note about it,
+// trades the request for a convenience.
+func (s *Session) keepForItsCaption(ctx context.Context, to waTypes.JID, messageID string, message *waE2E.Message) {
+	body, err := proto.Marshal(message)
+	if err == nil {
+		writing, written := context.WithTimeout(ctx, s.storeLimit)
+		err = s.store.PutSentMedia(writing, messageID, store.SentMedia{Chat: to.String(), Body: body})
+		written()
+	}
+	if err != nil {
+		s.log.Warn().Err(err).Str("msg_id", messageID).
+			Msg("could not keep a media message for its caption to be corrected; an edit of it will be refused")
+	}
 }
 
 // readyToSend refuses a session that cannot put anything on the wire, and the order of

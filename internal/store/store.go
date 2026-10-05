@@ -841,6 +841,24 @@ func (c *Container) migrate(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS wac_group_create_key ON wac_group_create (sid, create_key)`,
 		// The sweep goes by when an attempt was last written, across every session.
 		`CREATE INDEX IF NOT EXISTS wac_group_create_touched_at ON wac_group_create (touched_at)`,
+		// A media message this account sent, kept whole for as long as WhatsApp lets its
+		// caption be corrected (#32). An edit carries the corrected message in full, file
+		// coordinates included, and nothing else here remembers them once the send has
+		// answered; rebuilt without them the correction replaces the file with nothing.
+		//
+		// The same foreign key as the media parts: the row holds a file's key on behalf of
+		// a pairing, and it goes with the pairing.
+		`CREATE TABLE IF NOT EXISTS wac_sent_media (
+			sid        TEXT   NOT NULL,
+			message_id TEXT   NOT NULL,
+			chat       TEXT   NOT NULL,
+			body       TEXT   NOT NULL,
+			sent_at    BIGINT NOT NULL,
+			PRIMARY KEY (sid, message_id),
+			FOREIGN KEY (sid) REFERENCES wac_session_device (sid) ON DELETE CASCADE
+		)`,
+		// The sweep reads nothing but the clock.
+		`CREATE INDEX IF NOT EXISTS wac_sent_media_sent_at ON wac_sent_media (sent_at)`,
 	} {
 		if _, err := c.db.ExecContext(ctx, statement); err != nil {
 			return fmt.Errorf("store: bring the connector's own schema up: %w", err)

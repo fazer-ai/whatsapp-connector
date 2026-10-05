@@ -13,6 +13,7 @@ import (
 
 	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
 	waTypes "go.mau.fi/whatsmeow/types"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 )
@@ -84,6 +85,13 @@ func (s *Session) edit(ctx context.Context, command *protocol.Command) (json.Raw
 	if err := s.readyToSend(); err != nil {
 		return nil, err
 	}
+	// A text correction of a media message this account sent is a new caption, and it
+	// goes out as the whole media message again: an edit replaces the message it names, so
+	// one built from the text alone would put a file with nothing behind it on the wire
+	// (#32). A message that is not kept goes out as the text it was asked to be.
+	if corrected, err = s.recaptionedIfMedia(ctx, to, req.TargetID, corrected); err != nil {
+		return nil, err
+	}
 
 	client := s.current()
 	// The key BuildEdit puts together is `from_me: true` and nothing else, which is the
@@ -99,6 +107,64 @@ func (s *Session) edit(ctx context.Context, command *protocol.Command) (json.Raw
 		"timestamp":  sent.Timestamp.UnixMilli(),
 		"client_ref": nil,
 	})
+}
+
+// recaptionedIfMedia turns a text correction into a caption correction when the message it
+// names is a media message this session sent and still keeps, and leaves it alone when
+// the message is not kept.
+func (s *Session) recaptionedIfMedia(
+	ctx context.Context, to waTypes.JID, targetID string, corrected *waE2E.Message,
+) (*waE2E.Message, error) {
+	reading, read := context.WithTimeout(ctx, s.storeLimit)
+	kept, found, err := s.store.SentMedia(reading, targetID)
+	read()
+	if err != nil {
+		// Not knowing whether the target is a file is not a reason to guess that it is
+		// text: sent as text onto a media message, the correction is the one that leaves
+		// the recipient a broken attachment.
+		return nil, fmt.Errorf("read whether %s is a media message this account sent: %w", targetID, err)
+	}
+	if !found {
+		return corrected, nil
+	}
+	if kept.Chat != to.String() {
+		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
+			"the message this edit names was sent to another chat")
+	}
+	return recaptioned(kept.Body, corrected.GetConversation())
+}
+
+// recaptioned is a media message as it was sent, with its caption replaced.
+//
+// The file's coordinates, its preview and whatever it quoted go out again as they were,
+// so the recipient's copy of the file keeps resolving and nothing is uploaded again.
+func recaptioned(body []byte, caption string) (*waE2E.Message, error) {
+	var message waE2E.Message
+	if err := proto.Unmarshal(body, &message); err != nil {
+		return nil, fmt.Errorf("decode a kept media message: %w", err)
+	}
+	switch {
+	case message.GetImageMessage() != nil:
+		message.ImageMessage.Caption = proto.String(caption)
+	case message.GetVideoMessage() != nil:
+		message.VideoMessage.Caption = proto.String(caption)
+	case message.GetDocumentWithCaptionMessage().GetMessage().GetDocumentMessage() != nil:
+		message.DocumentWithCaptionMessage.Message.DocumentMessage.Caption = proto.String(caption)
+	case message.GetDocumentMessage() != nil:
+		// Sent without a caption, so it went out bare, and with one it travels in the
+		// envelope a send would have put it in: see renderMedia.
+		document := message.DocumentMessage
+		document.Caption = proto.String(caption)
+		return &waE2E.Message{DocumentWithCaptionMessage: &waE2E.FutureProofMessage{
+			Message: &waE2E.Message{DocumentMessage: document},
+		}}, nil
+	default:
+		// A voice note, an audio file or a sticker: WhatsApp gives them no caption, so
+		// there is nothing to correct, and a text correction would replace the file.
+		return nil, protocol.NewError(protocol.ErrorUnsupported,
+			"the message this edit names is a file that carries no caption")
+	}
+	return &message, nil
 }
 
 // revoke carries out `message.revoke`.
