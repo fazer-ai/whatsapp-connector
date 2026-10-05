@@ -1486,19 +1486,54 @@ func ParseFetchHosts(raw string) (FetchHosts, error) {
 		if strings.ContainsAny(entry, "/@?#") {
 			return nil, fmt.Errorf("WAC_MEDIA_FETCH_HOSTS: %q is not a host or host:port", entry)
 		}
-		host := fetchHost{name: entry}
-		if name, port, err := net.SplitHostPort(entry); err == nil {
-			number, err := strconv.Atoi(port)
-			if err != nil || number < 1 || number > 65535 || name == "" {
-				return nil, fmt.Errorf("WAC_MEDIA_FETCH_HOSTS: %q is not a host or host:port", entry)
-			}
-			host = fetchHost{name: name, port: port}
-		} else if strings.HasPrefix(entry, "[") {
-			host.name = strings.TrimSuffix(strings.TrimPrefix(entry, "["), "]")
+		host, ok := fetchHostOf(entry)
+		if !ok {
+			return nil, fmt.Errorf("WAC_MEDIA_FETCH_HOSTS: %q is not a host or host:port", entry)
 		}
 		hosts = append(hosts, host)
 	}
 	return hosts, nil
+}
+
+// fetchHostOf reads one entry, and reports whether it is one of the forms the list takes:
+// a name, an address, either of them with a port, or an IPv6 address in brackets. Anything
+// else -- a second colon, a character no host name has -- is not read as a host at all.
+func fetchHostOf(entry string) (fetchHost, bool) {
+	if name, port, err := net.SplitHostPort(entry); err == nil {
+		number, err := strconv.Atoi(port)
+		if err != nil || number < 1 || number > 65535 || !hostName(name) {
+			return fetchHost{}, false
+		}
+		return fetchHost{name: name, port: port}, true
+	}
+	if inner, bracketed := strings.CutPrefix(entry, "["); bracketed {
+		inner, closed := strings.CutSuffix(inner, "]")
+		if address, err := netip.ParseAddr(inner); closed && err == nil && address.Is6() {
+			return fetchHost{name: inner}, true
+		}
+		return fetchHost{}, false
+	}
+	if hostName(entry) {
+		return fetchHost{name: entry}, true
+	}
+	return fetchHost{}, false
+}
+
+// hostName reports whether a string is a host name or an address a URL can carry: the
+// characters of a DNS name, or an IP address, IPv6 included once it is out of its brackets.
+func hostName(name string) bool {
+	if _, err := netip.ParseAddr(name); err == nil {
+		return true
+	}
+	if name == "" {
+		return false
+	}
+	for _, r := range name {
+		if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '.' && r != '-' && r != '_' {
+			return false
+		}
+	}
+	return true
 }
 
 // allows reports whether a URL may be fetched under this list.

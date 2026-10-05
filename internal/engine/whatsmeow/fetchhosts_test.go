@@ -8,6 +8,9 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/rs/zerolog"
+	wm "go.mau.fi/whatsmeow"
+
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 )
 
@@ -25,6 +28,9 @@ func TestFetchHostsAreReadAsWritten(t *testing.T) {
 		"rails, blobs.example.com": {{name: "rails"}, {name: "blobs.example.com"}},
 		"[::1]:8080":               {{name: "::1", port: "8080"}},
 		"[::1]":                    {{name: "::1"}},
+		"::1":                      {{name: "::1"}},
+		"10.0.0.5:9000":            {{name: "10.0.0.5", port: "9000"}},
+		"minio_1":                  {{name: "minio_1"}},
 	} {
 		got, err := ParseFetchHosts(raw)
 		if err != nil {
@@ -40,7 +46,10 @@ func TestFetchHostsAreReadAsWritten(t *testing.T) {
 		}
 	}
 
-	for _, bad := range []string{"http://rails", "rails/blobs", "rails:0", "rails:70000", "rails:abc", ":80", "user@rails", "rails?x"} {
+	for _, bad := range []string{
+		"http://rails", "rails/blobs", "rails:0", "rails:70000", "rails:abc", ":80", "user@rails", "rails?x",
+		"rails:3000:80", "[rails]", "[::1", "rai ls", "rails;x",
+	} {
 		if _, err := ParseFetchHosts(bad); err == nil {
 			t.Errorf("ParseFetchHosts(%q) was accepted", bad)
 		}
@@ -182,4 +191,32 @@ func TestARedirectOutOfTheListIsRefused(t *testing.T) {
 		t.Fatalf("a redirect between two listed hosts: %v", err)
 	}
 	_ = file.body.Close()
+}
+
+// The list reaches the fetch a session makes, and not only the function that takes it:
+// a session built with one refuses a host outside it without dialling.
+func TestASessionFetchesOnlyFromItsList(t *testing.T) {
+	t.Parallel()
+
+	server, hits := counted(t, serveFile)
+	hosts, err := ParseFetchHosts("rails:3000")
+	if err != nil {
+		t.Fatalf("ParseFetchHosts: %v", err)
+	}
+	container := openStore(t)
+	sid := "sid-" + t.Name()
+	scoped := container.For(sid)
+	device, err := scoped.Device(t.Context())
+	if err != nil {
+		t.Fatalf("Device: %v", err)
+	}
+	session := newSession(t.Context(), sid, wm.NewClient(device, nil), scoped, MediaOptions{FetchHosts: hosts}, nil,
+		zerolog.Nop(), newLibraryLogger(zerolog.Nop(), sid))
+	t.Cleanup(func() { _ = session.Close() })
+
+	_, err = session.retrieve(t.Context(), server.URL+"/f.pdf", nil)
+	assertCode(t, err, protocol.ErrorInvalidPayload)
+	if n := hits.Load(); n != 0 {
+		t.Fatalf("a session with a list asked a host outside it %d times", n)
+	}
 }
