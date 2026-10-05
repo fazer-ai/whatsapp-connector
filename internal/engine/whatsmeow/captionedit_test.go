@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
+	waTypes "go.mau.fi/whatsmeow/types"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 )
@@ -199,4 +200,63 @@ func TestACaptionEditNamingAnotherChatIsRefused(t *testing.T) {
 // correctionIn is the corrected message inside the envelopes an edit travels in.
 func correctionIn(m *waE2E.Message) *waE2E.Message {
 	return m.GetEditedMessage().GetMessage().GetProtocolMessage().GetEditedMessage()
+}
+
+// A file sent to a number is in the conversation the client has under the LID once the
+// pairing is known, and an edit that names that LID is an edit of the same chat.
+func TestACaptionEditByTheLIDOfTheNumberItWasSentToIsTheSameChat(t *testing.T) {
+	t.Parallel()
+
+	session, files, _ := outboundSession(t)
+	wired := &wire{}
+	session.handOver = wired.hand
+	files.answer(tinyPNG(t), "image/png")
+	lid := waTypes.NewJID("167392323834077", waTypes.HiddenUserServer)
+	phone := waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)
+	if err := session.current().Store.LIDs.PutLIDMapping(t.Context(), lid, phone); err != nil {
+		t.Fatalf("PutLIDMapping: %v", err)
+	}
+	session.aliases.observe(session.aliases.stamp(t.Context()), phone, lid)
+
+	if _, err := session.send(t.Context(), &protocol.Command{Type: protocol.CommandMessageSend, Payload: json.RawMessage(
+		`{"message_id":"3EB0SENTFILE",` + captionChat + `,"content":{"type":"media","kind":"image","mime":"image/png",` +
+			`"caption":"antes","ref":{"kind":"url","url":"http://rails:3000/blob.png"}}}`)}); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	wired.message = nil
+	if _, err := session.edit(t.Context(), &protocol.Command{Type: protocol.CommandMessageEdit, Payload: json.RawMessage(
+		`{"to":{"kind":"lid","id":"167392323834077"},"target_id":"3EB0SENTFILE","content":{"type":"text","body":"depois"}}`)}); err != nil {
+		t.Fatalf("edit by the LID: %v", err)
+	}
+	if got := correctionIn(wired.message).GetImageMessage().GetCaption(); got != "depois" {
+		t.Fatalf("the correction went out as %v", wired.message)
+	}
+}
+
+// A file whose record could not be kept is not sent: a later edit of it would find no
+// record, go out as text and replace the file with nothing, and a send refused now is one
+// the client can deliver again.
+func TestAFileThatCannotBeKeptIsNotSent(t *testing.T) {
+	t.Parallel()
+
+	session, container := newTestSession(t, "5511999990001")
+	connect(session)
+	files, sent := &serving{}, &uploads{}
+	session.retrieve = files.hand
+	session.uploadFile = sent.hand
+	wired := &wire{}
+	session.handOver = wired.hand
+	files.answer(tinyPNG(t), "image/png")
+	if err := container.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if _, err := session.send(t.Context(), &protocol.Command{Type: protocol.CommandMessageSend, Payload: json.RawMessage(
+		`{"message_id":"3EB0SENTFILE",` + captionChat + `,"content":{"type":"media","kind":"image","mime":"image/png",` +
+			`"caption":"antes","ref":{"kind":"url","url":"http://rails:3000/blob.png"}}}`)}); err == nil {
+		t.Fatal("a file whose record the store refused was sent")
+	}
+	if wired.message != nil {
+		t.Fatalf("a refused send reached the wire: %v", wired.message)
+	}
 }

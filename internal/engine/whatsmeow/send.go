@@ -103,7 +103,9 @@ func (s *Session) send(ctx context.Context, command *protocol.Command) (json.Raw
 		if message, err = s.mediaToSend(building, plan, alongside); err != nil {
 			return nil, err
 		}
-		s.keepForItsCaption(ctx, to, req.MessageID, message)
+		if err := s.keepForItsCaption(ctx, to, req.MessageID, message); err != nil {
+			return nil, err
+		}
 	}
 
 	sent, err := s.putOnTheWire(ctx, to, req.MessageID, message)
@@ -127,20 +129,21 @@ func (s *Session) send(ctx context.Context, command *protocol.Command) (json.Raw
 // A row for a send that then fails costs nothing an edit can reach, because WhatsApp
 // refuses an edit of a message it never took.
 //
-// A failure is logged and the send goes on. The record buys a later correction; refusing
-// the file the operator asked for now, because the store would not take a note about it,
-// trades the request for a convenience.
-func (s *Session) keepForItsCaption(ctx context.Context, to waTypes.JID, messageID string, message *waE2E.Message) {
+// A failure refuses the send. Without the record a later edit of this message cannot tell
+// it is a file, goes out as text, and replaces the file it names with nothing: the store
+// that would not take a note is a store a redelivery of the send can try again, and the
+// broken attachment is not something anything can take back.
+func (s *Session) keepForItsCaption(ctx context.Context, to waTypes.JID, messageID string, message *waE2E.Message) error {
 	body, err := proto.Marshal(message)
-	if err == nil {
-		writing, written := context.WithTimeout(ctx, s.storeLimit)
-		err = s.store.PutSentMedia(writing, messageID, store.SentMedia{Chat: to.String(), Body: body})
-		written()
-	}
 	if err != nil {
-		s.log.Warn().Err(err).Str("msg_id", messageID).
-			Msg("could not keep a media message for its caption to be corrected; an edit of it will be refused")
+		return fmt.Errorf("encode the media message %s to keep it: %w", messageID, err)
 	}
+	writing, written := context.WithTimeout(ctx, s.storeLimit)
+	defer written()
+	if err := s.store.PutSentMedia(writing, messageID, store.SentMedia{Chat: to.String(), Body: body}); err != nil {
+		return fmt.Errorf("keep the media message %s for its caption to be corrected: %w", messageID, err)
+	}
+	return nil
 }
 
 // readyToSend refuses a session that cannot put anything on the wire, and the order of

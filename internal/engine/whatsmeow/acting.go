@@ -89,7 +89,7 @@ func (s *Session) edit(ctx context.Context, command *protocol.Command) (json.Raw
 	// goes out as the whole media message again: an edit replaces the message it names, so
 	// one built from the text alone would put a file with nothing behind it on the wire
 	// (#32). A message that is not kept goes out as the text it was asked to be.
-	if corrected, err = s.recaptionedIfMedia(ctx, to, req.TargetID, corrected); err != nil {
+	if corrected, err = s.recaptionedIfMedia(ctx, req.To, req.TargetID, corrected); err != nil {
 		return nil, err
 	}
 
@@ -113,7 +113,7 @@ func (s *Session) edit(ctx context.Context, command *protocol.Command) (json.Raw
 // names is a media message this session sent and still keeps, and leaves it alone when
 // the message is not kept.
 func (s *Session) recaptionedIfMedia(
-	ctx context.Context, to waTypes.JID, targetID string, corrected *waE2E.Message,
+	ctx context.Context, to protocol.Address, targetID string, corrected *waE2E.Message,
 ) (*waE2E.Message, error) {
 	reading, read := context.WithTimeout(ctx, s.storeLimit)
 	kept, found, err := s.store.SentMedia(reading, targetID)
@@ -127,7 +127,13 @@ func (s *Session) recaptionedIfMedia(
 	if !found {
 		return corrected, nil
 	}
-	if kept.Chat != to.String() {
+	// The send may have named the chat by number and the client the edit by the LID it
+	// was published under since, which is one chat.
+	keptJID, err := waTypes.ParseJID(kept.Chat)
+	if err != nil {
+		return nil, fmt.Errorf("read the chat %s was sent to: %w", targetID, err)
+	}
+	if keptChat, ok := addressOf(keptJID); !ok || !s.sameChat(to, keptChat) {
 		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
 			"the message this edit names was sent to another chat")
 	}
