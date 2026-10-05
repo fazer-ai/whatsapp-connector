@@ -1875,8 +1875,10 @@ const lateRecovery = 5 * cutWindow / 2
 
 func TestACommandRecoveredPastTheClaimDelayIsARedelivery(t *testing.T) {
 	cutBackends(t, func(t *testing.T, f cutFleet) {
-		// Well past a late recovery, so that promptly and past the delay stay apart.
-		const claimDelay = 4 * lateRecovery
+		// Well past a late recovery, so that promptly and past the delay stay apart. The gap
+		// is what a loaded machine may stall for between the sleep and the read: at four late
+		// recoveries it was 1.5s, and two suites running at once went past it (#365).
+		const claimDelay = 10 * lateRecovery
 
 		streams := f.streamsWith(t, &redisstream.Options{Instance: "inst-a", Block: 50 * time.Millisecond, ClaimMinIdle: claimDelay})
 		stream := f.client.Keys().Commands("s1")
