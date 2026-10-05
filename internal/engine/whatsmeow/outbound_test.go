@@ -1119,7 +1119,7 @@ func TestASignedAddressDoesNotTravelIntoTheFailure(t *testing.T) {
 
 	signed := "http://" + closed + "/bucket/file.pdf" +
 		"?X-Amz-Credential=AKIAEXAMPLE&X-Amz-Signature=deadbeefcafe&X-Amz-Expires=900"
-	_, err = retrieveOverHTTP(t.Context(), signed, nil)
+	_, err = retrieveOverHTTP(t.Context(), signed, nil, nil)
 	if err == nil {
 		t.Fatal("fetching from a port nothing answers on reported success")
 	}
@@ -1184,7 +1184,7 @@ func TestAFetchThatOutlivedTheDeadlineIsATimeoutRatherThanABreakage(t *testing.T
 	expiring, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
 	defer cancel()
 
-	_, err := retrieveOverHTTP(expiring, blocking.URL+"/blob.pdf", nil)
+	_, err := retrieveOverHTTP(expiring, blocking.URL+"/blob.pdf", nil, nil)
 	assertCode(t, err, protocol.ErrorTimeout)
 }
 
@@ -1252,7 +1252,7 @@ func TestACallersHeadersDoNotFollowARedirectOffItsOwnHost(t *testing.T) {
 	file, err := retrieveOverHTTP(t.Context(), origin.URL+"/file.pdf", map[string]string{
 		"X-API-Key":     "sk_live_deadbeef",
 		"Authorization": "Bearer t",
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("retrieveOverHTTP: %v", err)
 	}
@@ -1280,7 +1280,7 @@ func TestAnEndlessRedirectIsTheCallersToFixRatherThanToRetry(t *testing.T) {
 	}))
 	t.Cleanup(loop.Close)
 
-	_, err := retrieveOverHTTP(t.Context(), loop.URL+"/file.pdf", nil)
+	_, err := retrieveOverHTTP(t.Context(), loop.URL+"/file.pdf", nil, nil)
 	assertCode(t, err, protocol.ErrorInvalidPayload)
 }
 
@@ -1390,7 +1390,7 @@ func TestWhereACallersHeadersStopOnARedirect(t *testing.T) {
 			first := requestTo(t, tc.from, headers)
 			hop := requestTo(t, tc.to, headers)
 
-			if err := followingRedirects(headers)(hop, []*http.Request{first}); err != nil {
+			if err := followingRedirects(headers, nil)(hop, []*http.Request{first}); err != nil {
 				t.Fatalf("the hop was refused: %v", err)
 			}
 			carried := hop.Header.Get("X-API-Key") == secret
@@ -1406,7 +1406,7 @@ func TestWhereACallersHeadersStopOnARedirect(t *testing.T) {
 func TestARedirectChainIsFollowedAsFarAsTheConstantSays(t *testing.T) {
 	t.Parallel()
 
-	policy := followingRedirects(nil)
+	policy := followingRedirects(nil, nil)
 	hop := requestTo(t, "https://storage.example/b", nil)
 	for made := 1; made <= fetchRedirects; made++ {
 		via := make([]*http.Request, made)
@@ -1456,7 +1456,7 @@ func TestWhatTheServerCalledTheFileArrivesWithItsParameters(t *testing.T) {
 	}))
 	t.Cleanup(serving.Close)
 
-	file, err := retrieveOverHTTP(t.Context(), serving.URL+"/voice.ogg", nil)
+	file, err := retrieveOverHTTP(t.Context(), serving.URL+"/voice.ogg", nil, nil)
 	if err != nil {
 		t.Fatalf("retrieveOverHTTP: %v", err)
 	}
@@ -1742,7 +1742,7 @@ func TestTheSignedAddressDoesNotFollowTheRedirectAsAReferer(t *testing.T) {
 	// What the client itself does just before calling the policy.
 	hop.Header.Set("Referer", signed)
 
-	if err := followingRedirects(nil)(hop, []*http.Request{requestTo(t, signed, nil)}); err != nil {
+	if err := followingRedirects(nil, nil)(hop, []*http.Request{requestTo(t, signed, nil)}); err != nil {
 		t.Fatalf("the hop was refused: %v", err)
 	}
 	if got := hop.Header.Get("Referer"); got != "" {
@@ -1753,7 +1753,7 @@ func TestTheSignedAddressDoesNotFollowTheRedirectAsAReferer(t *testing.T) {
 	// would be this connector rewriting an ordinary request for no gain.
 	same := requestTo(t, "https://storage.example/bucket/other.pdf", nil)
 	same.Header.Set("Referer", signed)
-	if err := followingRedirects(nil)(same, []*http.Request{requestTo(t, signed, nil)}); err != nil {
+	if err := followingRedirects(nil, nil)(same, []*http.Request{requestTo(t, signed, nil)}); err != nil {
 		t.Fatalf("the hop was refused: %v", err)
 	}
 	if got := same.Header.Get("Referer"); got != signed {
@@ -2021,7 +2021,7 @@ func TestARedirectSomewhereThisConnectorDoesNotFetchFromIsRefused(t *testing.T) 
 			}))
 			t.Cleanup(sending.Close)
 
-			_, err := retrieveOverHTTP(t.Context(), sending.URL+"/f.pdf", nil)
+			_, err := retrieveOverHTTP(t.Context(), sending.URL+"/f.pdf", nil, nil)
 			assertCode(t, err, protocol.ErrorInvalidPayload)
 		})
 	}
@@ -2316,7 +2316,7 @@ func TestAFetchRedirectedIntoTheMetadataRangeIsRefusedAsThePayload(t *testing.T)
 	}))
 	t.Cleanup(serving.Close)
 
-	file, err := retrieveOverHTTP(t.Context(), serving.URL+"/blob", nil)
+	file, err := retrieveOverHTTP(t.Context(), serving.URL+"/blob", nil, nil)
 	if err == nil {
 		_ = file.body.Close()
 		t.Fatal("the fetch followed the redirect into the metadata range")
@@ -2372,7 +2372,7 @@ func TestAnAddressThatIsNotAnsweringIsNamedAsTheCallersOwnAndNotAsThisConnector(
 	address := gone.URL + "/blob.pdf"
 	gone.Close()
 
-	_, err := retrieveOverHTTP(t.Context(), address, nil)
+	_, err := retrieveOverHTTP(t.Context(), address, nil, nil)
 	assertCode(t, err, protocol.ErrorProviderUnavailable)
 	if !strings.Contains(err.Error(), "could not fetch the file to send") {
 		t.Fatalf("the failure does not say what could not be fetched: %v", err)
