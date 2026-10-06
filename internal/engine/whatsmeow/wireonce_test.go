@@ -518,7 +518,16 @@ func TestAStaleDropLeavesTheReplacementsWritesAlone(t *testing.T) {
 	// The replacement announced itself after the drop was dispatched: whatsmeow hands the
 	// two to different goroutines, and this is the order in which the drop arrives late.
 	session.setConnectedAt(true, time.Now().Add(time.Hour))
+	session.lineMu.Lock()
+	line := session.line
+	session.lineMu.Unlock()
 	session.handle(&waEvents.Disconnected{})
+	// The cut is made inside the handler, so this is its answer, not a race with it.
+	select {
+	case <-line:
+		t.Fatal("a drop the replacement had overtaken cut the replacement's line")
+	default:
+	}
 	if w.answer(session.current(), resultFor) != 1 {
 		t.Fatal("the write was not waiting for its answer")
 	}
