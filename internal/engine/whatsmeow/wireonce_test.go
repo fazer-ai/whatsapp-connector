@@ -443,3 +443,31 @@ func TestDropsOnTwoSessionsAtOnceKeepEachWriteToOneFrame(t *testing.T) {
 		}
 	}
 }
+
+// A write the caller stopped waiting for is the caller's to answer for, not the drop's: it
+// is not marked as one that may have landed, because the contract does not hold a key for a
+// command its own deadline ended -- the deadline can end it before the write as easily as
+// after.
+func TestAGroupWriteTheCallerAbandonedIsNotHeldForTheDrop(t *testing.T) {
+	t.Parallel()
+
+	session, w := wiredSession(t)
+	ctx, abandon := context.WithCancel(t.Context())
+	done := make(chan answered, 1)
+	go func() {
+		result, err := session.Execute(ctx, setCommand(t, groupWrites[4].kind, groupWrites[4].payload))
+		done <- answered{result, err}
+	}()
+	if _, ok := w.nextFrame(5 * time.Second); !ok {
+		t.Fatal("the write never reached the wire")
+	}
+	abandon()
+	select {
+	case got := <-done:
+		if errors.Is(got.err, errUnanswered) || errors.Is(got.err, engine.ErrMayHaveLanded) {
+			t.Errorf("a write the caller abandoned answered as one the drop caught: %v", got.err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("an abandoned write never answered")
+	}
+}
