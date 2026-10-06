@@ -367,10 +367,10 @@ type Session struct {
 	// somebody adds. `setConnected` and `offline` are the two functions that own the
 	// flag, and every one of those paths goes through one of them.
 	transitions atomic.Int64
-	// line is closed when the connection this session's writes go out on is over, and
-	// replaced by the next one's; `onThisConnection` cancels a group write on it.
-	lineMu sync.Mutex
-	line   chan struct{}
+	// line is closed when the connection this session's writes go out on is over;
+	// `onThisConnection` cancels a group write on it. Guarded by mu, beside connectedAt,
+	// because whether a drop may close it is a question about connectedAt (#180).
+	line chan struct{}
 	// connectedAt is when this session last learned that a connection existed. Written
 	// under mu beside `connected`, by every path that can tell the socket is a new one:
 	// the dials this process asks for, the reconnects it watches whatsmeow start, and a
@@ -4850,12 +4850,8 @@ func (s *Session) handle(rawEvent any) bool {
 		s.forgetOwedReset()
 		// The group writes in flight went out on the connection that went, and whatsmeow
 		// sends each of them again on the one that replaces it unless this ends them first
-		// (#180). Not for a drop the replacement has already overtaken: the writes running
-		// now are the replacement's, and the ones that were the old socket's were resent
-		// before a drop this late could have stopped them anyway.
-		if !s.dropWasOvertaken(dispatched) {
-			s.cutLine()
-		}
+		// (#180).
+		s.cutLine(dispatched)
 
 		s.transition.Lock()
 		defer s.transition.Unlock()

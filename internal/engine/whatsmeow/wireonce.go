@@ -3,6 +3,7 @@ package whatsmeow
 import (
 	"context"
 	"errors"
+	"time"
 
 	wm "go.mau.fi/whatsmeow"
 
@@ -41,9 +42,9 @@ var errUnanswered = errors.New("the connection went before WhatsApp answered the
 // rather than run. The other way round, not holding a cancelled write, would have every
 // redelivery of the ordinary case -- the frame out, the answer lost -- write it again.
 func (s *Session) onThisConnection(ctx context.Context, write func(context.Context) error) error {
-	s.lineMu.Lock()
+	s.mu.Lock()
 	line := s.line
-	s.lineMu.Unlock()
+	s.mu.Unlock()
 
 	bound, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -71,10 +72,24 @@ func (s *Session) onThisConnection(ctx context.Context, write func(context.Conte
 	return errUnanswered
 }
 
-// cutLine ends the connection the writes in flight went out on.
-func (s *Session) cutLine() {
-	s.lineMu.Lock()
-	defer s.lineMu.Unlock()
+// cutLine ends the line the writes in flight went out on, for a drop dispatched at `at`,
+// unless the replacement has already overtaken it.
+//
+// A drop the replacement has overtaken is late news about a socket whose writes were resent
+// before it could have stopped them, and the writes on the line now went out on the
+// replacement. The question and the cut are one step under mu, the lock `Connected` stamps
+// connectedAt under: asked and acted on apart, a `Connected` handled between them would
+// have the replacement's writes cancelled on a healthy socket.
+//
+// What remains is whatsmeow's own window: the replacement is up and taking writes before
+// it dispatches `Connected` (#181), and a write in that window is on the old line. A drop
+// handled then ends it with the rest, which answers it `timeout` on a socket that was fine.
+func (s *Session) cutLine(at time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.connectedAt.After(at) {
+		return
+	}
 	close(s.line)
 	s.line = make(chan struct{})
 }
