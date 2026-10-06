@@ -245,8 +245,10 @@ func TestAGroupFactThatFindsRoomInTimeIsAcknowledged(t *testing.T) {
 }
 
 // A stall of any length costs a constant: the moments that do not fit are dropped as they
-// come, so twenty thousand calls ringing into a stalled publisher leave the inbox exactly
-// as full as it was, and every one of them is counted.
+// come, so eight inboxes' worth of calls ringing into a stalled publisher leave the inbox
+// exactly as full as it was, and every one of them is counted. Eight and not more: the
+// handler coming back within the budget is the claim, and a count large enough to make
+// that a question of throughput under -race on a slow runner proves nothing more (#377).
 func TestAFloodOfMomentsDuringAStallKeepsNothing(t *testing.T) {
 	t.Parallel()
 	session, _ := callSession(t, false)
@@ -254,7 +256,7 @@ func TestAFloodOfMomentsDuringAStallKeepsNothing(t *testing.T) {
 	session.queueing = watch
 	stall(t, session)
 
-	const calls = 20000
+	calls := 8 * cap(session.inbox)
 	returnsWithin(t, testwait.Budget, func() bool {
 		for i := range calls {
 			session.handle(&waEvents.CallOffer{BasicCallMeta: callMeta(fmt.Sprintf("call-%d", i))})
