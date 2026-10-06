@@ -65,10 +65,12 @@ func TestEveryCallRingingDuringAStallIsRefused(t *testing.T) {
 	}
 }
 
-// A moment that does not fit is dropped, not waited for, and the instrument hears of every
-// one: a call that rang is worth nothing once the publisher is back, and the dispatch it
-// would have held is every other event the account has.
-func TestACallMomentThatDoesNotFitIsDroppedAndCounted(t *testing.T) {
+// An offer that does not fit is dropped, not waited for, and the instrument hears of it: a
+// call that rang is worth nothing once the publisher is back, and the dispatch it would
+// have held is every other event the account has. Its end is not dropped with it -- the
+// contract publishes an end the client may have learned of some other way -- but waits for
+// room off the dispatch.
+func TestACallOfferThatDoesNotFitIsDroppedAndCounted(t *testing.T) {
 	t.Parallel()
 	session, _ := callSession(t, false)
 	watch := &emitWatch{}
@@ -80,10 +82,85 @@ func TestACallMomentThatDoesNotFitIsDroppedAndCounted(t *testing.T) {
 		session.handle(&waEvents.CallTerminate{BasicCallMeta: callMeta("call-1"), Reason: "timeout"})
 		return true
 	})
-	if dropped := watch.dropped(); len(dropped) != 2 ||
-		dropped[0] != protocol.EventCallOffer || dropped[1] != protocol.EventCallTerminate {
-		t.Fatalf("the instrument heard of %v, want the offer and the terminate", dropped)
+	if dropped := watch.dropped(); len(dropped) != 1 || dropped[0] != protocol.EventCallOffer {
+		t.Fatalf("the instrument heard of %v, want the offer alone", dropped)
 	}
+}
+
+// publishedAfterTheStall reads what the session publishes once the publisher comes back,
+// until it has seen want of eventType, and returns the call events in the order they came.
+func publishedAfterTheStall(t *testing.T, session *Session, eventType protocol.EventType, want int) []protocol.EventType {
+	t.Helper()
+	var calls []protocol.EventType
+	seen := 0
+	deadline := time.After(testwait.Budget)
+	for seen < want {
+		select {
+		case emission := <-session.Events():
+			if emission.Settle != nil {
+				emission.Settle(nil)
+			}
+			if emission.Type == protocol.EventCallOffer || emission.Type == protocol.EventCallTerminate {
+				calls = append(calls, emission.Type)
+			}
+			if emission.Type == eventType {
+				seen++
+			}
+		case <-deadline:
+			t.Fatalf("saw %d %s once the publisher came back, want %d (calls: %v)", seen, eventType, want, calls)
+		}
+	}
+	return calls
+}
+
+// An offer that took the last slot before the stall is not left without its end. The end
+// does not fit, does not hold the dispatch, and is published behind its offer once the
+// publisher is back, so the client does not keep showing a call that is over.
+func TestTheEndOfAQueuedCallIsPublishedAfterTheStall(t *testing.T) {
+	t.Parallel()
+	session, _ := callSession(t, false)
+	watch := &emitWatch{}
+	session.queueing = watch
+	session.picked = make(chan struct{}, 1)
+	blockTheForwarder(t, session)
+	for len(session.inbox) < cap(session.inbox)-1 {
+		session.inbox <- pending{event: engine.Emission{Type: protocol.EventSessionState, Payload: []byte(`{}`)}}
+	}
+
+	returnsWithin(t, testwait.Budget, func() bool {
+		session.handle(&waEvents.CallOffer{BasicCallMeta: callMeta("call-1")})
+		session.handle(&waEvents.CallTerminate{BasicCallMeta: callMeta("call-1"), Reason: "timeout"})
+		return true
+	})
+	if dropped := watch.dropped(); len(dropped) != 0 {
+		t.Fatalf("the instrument heard of %v dropped, want nothing: the offer fit and its end waited", dropped)
+	}
+	calls := publishedAfterTheStall(t, session, protocol.EventCallTerminate, 1)
+	if len(calls) != 2 || calls[0] != protocol.EventCallOffer || calls[1] != protocol.EventCallTerminate {
+		t.Fatalf("published %v once the publisher came back, want the offer and then its end", calls)
+	}
+}
+
+// The ends waiting for room are bounded: a flood of them into a stalled publisher returns
+// at once, keeps owedEnds of them for when it comes back, and counts the rest as dropped.
+func TestAFloodOfCallEndsDuringAStallKeepsABoundedFew(t *testing.T) {
+	t.Parallel()
+	session, _ := callSession(t, false)
+	watch := &emitWatch{}
+	session.queueing = watch
+	stall(t, session)
+
+	const ends = 2000
+	returnsWithin(t, testwait.Budget, func() bool {
+		for i := range ends {
+			session.handle(&waEvents.CallTerminate{BasicCallMeta: callMeta(fmt.Sprintf("call-%d", i)), Reason: "timeout"})
+		}
+		return true
+	})
+	if dropped := len(watch.dropped()); dropped != ends-owedEnds {
+		t.Errorf("the instrument heard of %d drops, want %d", dropped, ends-owedEnds)
+	}
+	publishedAfterTheStall(t, session, protocol.EventCallTerminate, owedEnds)
 }
 
 // A group notification that cannot be queued in time is not acknowledged, so WhatsApp sends

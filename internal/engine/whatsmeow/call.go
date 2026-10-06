@@ -242,7 +242,7 @@ func (s *Session) callEnded(event *waEvents.CallTerminate) bool {
 		reason := event.Reason
 		payload.Reason = &reason
 	}
-	s.emitMoment(protocol.EventCallTerminate, payload)
+	s.emitEnd(protocol.EventCallTerminate, payload)
 	return true
 }
 

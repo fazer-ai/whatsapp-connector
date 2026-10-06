@@ -58,7 +58,9 @@ type Session struct {
 	// only thing that closes it. Two channels rather than one because whatsmeow's
 	// handlers can still be running when Close is called, and a send on a closed
 	// channel is a panic in a library goroutine we do not own.
-	inbox  chan pending
+	inbox chan pending
+	// ends holds a slot for every end waiting for room off the dispatch (offDispatch).
+	ends   chan struct{}
 	events chan engine.Emission
 	done   chan struct{}
 
@@ -743,6 +745,7 @@ func newSession(
 		log:        log.With().Str("sid", sid).Logger(),
 		waLog:      wa,
 		inbox:      make(chan pending, inboxDepth),
+		ends:       make(chan struct{}, owedEnds),
 		events:     make(chan engine.Emission),
 		done:       make(chan struct{}),
 		inFlight:   map[*groupWrite]struct{}{},
@@ -4193,6 +4196,18 @@ func (s *Session) emitting(emission *engine.Emission, payload any) {
 // back is a session whose lease runs out and closes.
 const waitForRoom = time.Duration(-1)
 
+// offDispatch is the bound `offer` takes for an end: an emission that closes something the
+// client may already be showing, which nothing sends again, and which runs on whatsmeow's
+// dispatch. One that does not fit waits for room on a goroutine of its own, so it is
+// neither dropped nor holding the dispatch (#221).
+const offDispatch = time.Duration(-2)
+
+// owedEnds is how many ends a session holds off the dispatch at once. A call ends once, so
+// this is calls ending during one stall on one account, and an end past it is dropped and
+// counted like a moment: what it bounds is the goroutines a flood can leave parked on a
+// publisher that is not coming back.
+const owedEnds = 64
+
 // emitFact queues an event whose node whatsmeow acknowledges only when the handler says
 // so, and reports whether it was queued. One that does not fit within the delivery budget
 // is answered by withholding the acknowledgement: WhatsApp sends the node again, which is
@@ -4221,6 +4236,16 @@ func (s *Session) emitFact(on time.Time, at int64, eventType protocol.EventType,
 func (s *Session) emitMoment(eventType protocol.EventType, payload any) {
 	if !s.offer(&engine.Emission{Type: eventType}, payload, 0) {
 		s.log.Debug().Str("type", string(eventType)).Msg("dropping a moment the inbox had no room for")
+	}
+}
+
+// emitEnd queues an event that closes what an earlier one opened, without waiting on the
+// dispatch for it. Dropped like a moment, a `call.terminate` whose offer was queued, or
+// published before the stall, leaves the client showing a call that is over; waited for,
+// it is the dispatch held again. An end that does not fit waits off the dispatch instead.
+func (s *Session) emitEnd(eventType protocol.EventType, payload any) {
+	if !s.offer(&engine.Emission{Type: eventType}, payload, offDispatch) {
+		s.log.Debug().Str("type", string(eventType)).Msg("dropping an end with too many already waiting for room")
 	}
 }
 
@@ -4267,6 +4292,24 @@ func (s *Session) offer(emission *engine.Emission, payload any, wait time.Durati
 	if wait == 0 {
 		s.noRoom(eventType)
 		return false
+	}
+	if wait == offDispatch {
+		select {
+		case s.ends <- struct{}{}:
+		default:
+			s.noRoom(eventType)
+			return false
+		}
+		go func() {
+			defer func() { <-s.ends }()
+			began := time.Now()
+			select {
+			case s.inbox <- waiting:
+			case <-s.done:
+			}
+			s.queued(time.Since(began), depth)
+		}()
+		return true
 	}
 
 	// Here the inbox is full, which is the stall #221 is about: this send is holding the
