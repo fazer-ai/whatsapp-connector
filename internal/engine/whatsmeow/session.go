@@ -58,7 +58,9 @@ type Session struct {
 	// only thing that closes it. Two channels rather than one because whatsmeow's
 	// handlers can still be running when Close is called, and a send on a closed
 	// channel is a panic in a library goroutine we do not own.
-	inbox  chan pending
+	inbox chan pending
+	// ends holds a slot for every end waiting for room off the dispatch (offDispatch).
+	ends   chan struct{}
 	events chan engine.Emission
 	done   chan struct{}
 
@@ -743,6 +745,7 @@ func newSession(
 		log:        log.With().Str("sid", sid).Logger(),
 		waLog:      wa,
 		inbox:      make(chan pending, inboxDepth),
+		ends:       make(chan struct{}, owedEnds),
 		events:     make(chan engine.Emission),
 		done:       make(chan struct{}),
 		inFlight:   map[*groupWrite]struct{}{},
@@ -4166,17 +4169,6 @@ func (s *Session) emit(eventType protocol.EventType, payload any) {
 	s.emitting(&engine.Emission{Type: eventType}, payload)
 }
 
-// emitAt is emit for a reading of the clock taken somewhere else.
-//
-// Two events that report one notification have one learned time, and taking it inside
-// each `emitting` gives them two: the first call blocks on a full inbox until the
-// publisher recovers, and the second is then stamped an outage after the thing it
-// reports, which is the opposite of what `Emission.At` promises a reader. So whoever
-// knows the two belong together reads the clock once and hands the reading down.
-func (s *Session) emitAt(at int64, eventType protocol.EventType, payload any) {
-	s.emitting(&engine.Emission{Type: eventType, At: at}, payload)
-}
-
 // emitDecided is emit for the one state whose distance to the shard is measured.
 //
 // The instant is handed in rather than read here for the reason `Decided` exists: this
@@ -4195,6 +4187,72 @@ func (s *Session) emitLast(eventType protocol.EventType, payload any) {
 }
 
 func (s *Session) emitting(emission *engine.Emission, payload any) {
+	s.offer(emission, payload, waitForRoom)
+}
+
+// waitForRoom is the bound `offer` takes for an emission this session produces about itself
+// -- a state, a pairing, a logout -- which nothing sends again if it is lost. Those wait for
+// the publisher however long it takes, which the lease bounds: a publisher that never comes
+// back is a session whose lease runs out and closes.
+const waitForRoom = time.Duration(-1)
+
+// offDispatch is the bound `offer` takes for an end: an emission that closes something the
+// client may already be showing, which nothing sends again, and which runs on whatsmeow's
+// dispatch. One that does not fit waits for room on a goroutine of its own, so it is
+// neither dropped nor holding the dispatch (#221).
+const offDispatch = time.Duration(-2)
+
+// owedEnds is how many ends a session holds off the dispatch at once. A call ends once, so
+// this is calls ending during one stall on one account, and an end past it is dropped and
+// counted like a moment: what it bounds is the goroutines a flood can leave parked on a
+// publisher that is not coming back.
+const owedEnds = 64
+
+// emitFact queues an event whose node whatsmeow acknowledges only when the handler says
+// so, and reports whether it was queued. One that does not fit within the delivery budget
+// is answered by withholding the acknowledgement: WhatsApp sends the node again, which is
+// invariant 4 paying a redelivery rather than an event, and the dispatch is held no longer
+// than a message holds it (#221). `on` is the socket that acknowledgement belongs to.
+//
+// `at` is a reading of the clock taken by the caller, or zero for now. Two events that
+// report one notification have one learned time, and taking it inside each offer gives
+// them two: the first can wait out the whole budget on a full inbox, and the second is
+// then stamped that long after the thing it reports, which is the opposite of what
+// `Emission.At` promises a reader.
+func (s *Session) emitFact(on time.Time, at int64, eventType protocol.EventType, payload any) bool {
+	if s.offer(&engine.Emission{Type: eventType, At: at}, payload, s.deliverWait) {
+		return true
+	}
+	s.log.Warn().Str("type", string(eventType)).Dur("waited", s.deliverWait).
+		Msg("withholding an acknowledgement for an event that could not be queued")
+	s.oweRedelivery(on)
+	return false
+}
+
+// emitMoment queues an event that is worth nothing late and that nothing sends again, or
+// drops it when there is no room. It never waits: it runs on whatsmeow's dispatch, and a
+// wait here is every event behind it held for something already stale (#221). The drop is
+// counted, which is the only trace a moment leaves.
+func (s *Session) emitMoment(eventType protocol.EventType, payload any) {
+	if !s.offer(&engine.Emission{Type: eventType}, payload, 0) {
+		s.log.Debug().Str("type", string(eventType)).Msg("dropping a moment the inbox had no room for")
+	}
+}
+
+// emitEnd queues an event that closes what an earlier one opened, without waiting on the
+// dispatch for it. Dropped like a moment, a `call.terminate` whose offer was queued, or
+// published before the stall, leaves the client showing a call that is over; waited for,
+// it is the dispatch held again. An end that does not fit waits off the dispatch instead.
+func (s *Session) emitEnd(eventType protocol.EventType, payload any) {
+	if !s.offer(&engine.Emission{Type: eventType}, payload, offDispatch) {
+		s.log.Debug().Str("type", string(eventType)).Msg("dropping an end with too many already waiting for room")
+	}
+}
+
+// offer queues an emission, waiting at most `wait` for room -- not at all when it is zero,
+// for as long as it takes when it is waitForRoom -- and reports whether it was queued. One
+// that was not is counted as dropped.
+func (s *Session) offer(emission *engine.Emission, payload any, wait time.Duration) bool {
 	eventType := emission.Type
 	if eventType == protocol.EventSessionState {
 		reason := ""
@@ -4208,7 +4266,7 @@ func (s *Session) emitting(emission *engine.Emission, payload any) {
 		// Everything reaching this is built a few lines above, so a failure is a
 		// programming error rather than something a session should carry on through.
 		s.log.Error().Err(err).Str("type", string(eventType)).Msg("failed to render an event payload")
-		return
+		return false
 	}
 	emission.Payload = body
 	if emission.At == 0 {
@@ -4228,21 +4286,53 @@ func (s *Session) emitting(emission *engine.Emission, payload any) {
 	select {
 	case s.inbox <- waiting:
 		s.queued(0, depth)
-		return
+		return true
 	default:
 	}
+	if wait == 0 {
+		s.noRoom(eventType)
+		return false
+	}
+	if wait == offDispatch {
+		select {
+		case s.ends <- struct{}{}:
+		default:
+			s.noRoom(eventType)
+			return false
+		}
+		go func() {
+			defer func() { <-s.ends }()
+			began := time.Now()
+			select {
+			case s.inbox <- waiting:
+				s.queued(time.Since(began), depth)
+			case <-s.done:
+				s.queued(time.Since(began), depth)
+			}
+		}()
+		return true
+	}
 
-	// Here the inbox is full, which is the stall #221 is about: this send is now
-	// holding the goroutine whatsmeow dispatched from, and nothing else this account
-	// sends is handled until the publisher moves. The wait is not bounded here on
-	// purpose -- bounding it would change which events may be dropped, and that is
-	// invariant 4's business, not this measurement's.
+	// Here the inbox is full, which is the stall #221 is about: this send is holding the
+	// goroutine whatsmeow dispatched from, and nothing else this account sends is handled
+	// until it ends. What ends it is the caller's to say, by what the event is.
+	var expired <-chan time.Time
+	if wait > 0 {
+		timer := time.NewTimer(wait)
+		defer timer.Stop()
+		expired = timer.C
+	}
 	began := time.Now()
 	select {
 	case s.inbox <- waiting:
 		s.queued(time.Since(began), depth)
+		return true
+	case <-expired:
+		s.noRoom(eventType)
+		return false
 	case <-s.done:
 		s.queued(time.Since(began), depth)
+		return false
 	}
 }
 
@@ -4986,7 +5076,9 @@ func (s *Session) handle(rawEvent any) bool {
 		// without being written down is gone for good.
 		return s.joinedAGroup(event)
 	case *waEvents.GroupInfo:
-		s.groupChanged(event)
+		// The other: a change that could not be queued is not acknowledged, and comes
+		// again (#221).
+		return s.groupChanged(event)
 	case *waEvents.PairError:
 		// Whatever the QR channel does with this, the client is on a device whatsmeow
 		// may have half-written: an id with no credentials, or one it marked deleted.

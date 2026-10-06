@@ -6,6 +6,7 @@ import (
 	waTypes "go.mau.fi/whatsmeow/types"
 	waEvents "go.mau.fi/whatsmeow/types/events"
 
+	"github.com/fazer-ai/whatsapp-connector/internal/engine"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 )
 
@@ -62,6 +63,7 @@ type joinedGroup struct {
 // `group.info` costs, which is a mapping read per participant this notification did not
 // name both namespaces for -- bounded by one group, and paid once.
 func (s *Session) joinedAGroup(event *waEvents.JoinedGroup) bool {
+	on := s.socket()
 	// Before anything else, including the filter below: this is the only place WhatsApp
 	// says which group a `group.create` made, and a session that is not carrying group
 	// traffic to its client still has the command's own answer to settle. The key is on the
@@ -97,10 +99,9 @@ func (s *Session) joinedAGroup(event *waEvents.JoinedGroup) bool {
 	// with `Error` filled in. They are on the list WhatsApp sent and they are not members,
 	// and this roster is the one a client builds the group's membership out of, so
 	// publishing them adds people to a group they were kept out of.
-	s.emit(protocol.EventGroupJoined, joinedGroup{
+	return s.emitFact(on, 0, protocol.EventGroupJoined, joinedGroup{
 		Info: s.describeGroup(ctx, withoutRefused(&event.GroupInfo)),
 	})
-	return true
 }
 
 // recordTheGroupACreationMade writes down which group one of this session's creations
@@ -163,9 +164,13 @@ func (s *Session) recordTheGroupACreationMade(event *waEvents.JoinedGroup) bool 
 // alongside a change the client has just been handed is a metadata query for what it
 // already has, and that is the whole of why the second event is conditioned on residue
 // rather than on there having been an update at all.
-func (s *Session) groupChanged(event *waEvents.GroupInfo) {
+//
+// It reports whether the notification may be acknowledged, which is false only when its
+// event could not be queued in time: WhatsApp sends it again (#221).
+func (s *Session) groupChanged(event *waEvents.GroupInfo) bool {
+	on := s.socket()
 	if !s.wantsGroups() {
-		return
+		return true
 	}
 	// One reading of the clock for whatever this notification produces, taken here rather
 	// than inside each emission. `handle` calls this on the goroutine that dispatched the
@@ -179,16 +184,15 @@ func (s *Session) groupChanged(event *waEvents.GroupInfo) {
 	group, named := addressOf(event.JID)
 	if !named {
 		s.log.Warn().Msg("dropping a group change for a group with no address to publish it under")
-		return
+		return true
 	}
 
 	changes := s.describeChanges(ctx, event)
 	if changes.empty() {
 		if reportsNothing(event) {
-			return
+			return true
 		}
-		s.emitAt(learned, protocol.EventGroupActivity, groupActivity{Groups: []protocol.Address{group}})
-		return
+		return s.emitFact(on, learned, protocol.EventGroupActivity, groupActivity{Groups: []protocol.Address{group}})
 	}
 
 	update := groupUpdate{Group: group, Changes: changes}
@@ -198,15 +202,23 @@ func (s *Session) groupChanged(event *waEvents.GroupInfo) {
 	if actor := s.actorOf(ctx, event); actor != nil {
 		update.Actor = actor
 	}
-	s.emitAt(learned, protocol.EventGroupUpdated, update)
+	if !s.emitFact(on, learned, protocol.EventGroupUpdated, update) {
+		return false
+	}
 
 	if reportsResidue(event) {
 		// The update goes first and the sync second, because the two say different things
 		// about the same instant: one is the line an operator reads, the other is a
 		// prompt to go and read state. Reversed, a client that syncs on the prompt can
 		// land its query before the update it already had the answer to.
-		s.emitAt(learned, protocol.EventGroupActivity, groupActivity{Groups: []protocol.Address{group}})
+		//
+		// Not the acknowledgement's to decide once the update is queued: a redelivery
+		// would publish the update a second time, and an operator would read the change
+		// twice. The prompt that does not fit is counted as dropped instead.
+		s.offer(&engine.Emission{Type: protocol.EventGroupActivity, At: learned},
+			groupActivity{Groups: []protocol.Address{group}}, s.deliverWait)
 	}
+	return true
 }
 
 // actorOf names whoever made the change, when the notification says who.

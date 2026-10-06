@@ -139,8 +139,9 @@ func (s *Session) callOffered(meta *waTypes.BasicCallMeta, media callMedia, grou
 	// conversation is an account ringing on the operator's phone in exactly the case
 	// they asked it not to.
 	//
-	// And publishing can block: `emit` waits on the session's inbox, which is full for
-	// as long as the publisher is stalled, and `callWait` does not bound that wait. A
+	// And the rejection is written before the offer is published, off the dispatch. The
+	// offer is a moment and never waits for room, but the inbox is still shared with
+	// everything else, and a rejection put behind it would wait on whatever that is. A
 	// call rings for seconds, so a rejection queued behind a stalled publisher is a
 	// rejection that arrives after the caller has given up. The ordering this gives up
 	// in exchange is between `call.offer` and the `call.terminate` the rejection
@@ -185,7 +186,7 @@ func (s *Session) callOffered(meta *waTypes.BasicCallMeta, media callMedia, grou
 		return true
 	}
 
-	s.emit(protocol.EventCallOffer, callOffer{
+	s.emitMoment(protocol.EventCallOffer, callOffer{
 		CallID:    meta.CallID,
 		From:      from,
 		Video:     media.known && media.video,
@@ -241,7 +242,7 @@ func (s *Session) callEnded(event *waEvents.CallTerminate) bool {
 		reason := event.Reason
 		payload.Reason = &reason
 	}
-	s.emit(protocol.EventCallTerminate, payload)
+	s.emitEnd(protocol.EventCallTerminate, payload)
 	return true
 }
 
