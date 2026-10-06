@@ -39,13 +39,11 @@ func (s *Session) onThisConnection(ctx context.Context, write func(context.Conte
 
 	bound, cancel := context.WithCancel(ctx)
 	defer cancel()
-	stop := make(chan struct{})
-	defer close(stop)
 	go func() {
 		select {
 		case <-line:
 			cancel()
-		case <-stop:
+		case <-bound.Done():
 		}
 	}()
 

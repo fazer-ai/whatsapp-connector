@@ -663,9 +663,11 @@ func TestARefusalThatIsNotAConcurrentEditIsAnswered(t *testing.T) {
 		// Frozen: read again, same id, so there was no concurrent edit to write over.
 		"a frozen description": {&wm.IQError{Code: 409}, protocol.ErrorWaError, 2},
 		// Not a conflict at all, so there is nothing to look at a second time.
-		"not an admin":            {&wm.IQError{Code: 403}, protocol.ErrorWaError, 1},
-		"WhatsApp is throttling":  {&wm.IQError{Code: 429}, protocol.ErrorRateLimited, 1},
-		"the connection went":     {wm.ErrIQDisconnected, protocol.ErrorNotConnected, 1},
+		"not an admin":           {&wm.IQError{Code: 403}, protocol.ErrorWaError, 1},
+		"WhatsApp is throttling": {&wm.IQError{Code: 429}, protocol.ErrorRateLimited, 1},
+		// The write went out on a connection that dropped before the answer: whether
+		// WhatsApp applied it is not known, which is `timeout` (#180).
+		"the connection went":     {wm.ErrIQDisconnected, protocol.ErrorTimeout, 1},
 		"WhatsApp never answered": {wm.ErrIQTimedOut, protocol.ErrorTimeout, 1},
 		// whatsmeow's own `%v` around a failure of the lookup it does for itself. Nothing
 		// here can put the sentinel back, and this repository answers a cause it cannot

@@ -485,7 +485,8 @@ func TestLeavingAnswersWhatsAppsRefusal(t *testing.T) {
 	}{
 		{name: "not in the group", err: &wm.IQError{Code: 403, Text: "forbidden"}, want: protocol.ErrorWaError},
 		{name: "no such group", err: &wm.IQError{Code: 404, Text: "item-not-found"}, want: protocol.ErrorWaError},
-		{name: "the connection went", err: wm.ErrIQDisconnected, want: protocol.ErrorNotConnected},
+		// The departure went out and the connection dropped before the answer (#180).
+		{name: "the connection went", err: wm.ErrIQDisconnected, want: protocol.ErrorTimeout},
 		{name: "rate limited", err: &wm.IQError{Code: 429}, want: protocol.ErrorRateLimited},
 	} {
 		t.Run(refused.name, func(t *testing.T) {
