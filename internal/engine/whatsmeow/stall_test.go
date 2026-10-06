@@ -170,6 +170,9 @@ func TestAGroupFactThatCannotBeQueuedIsNotAcknowledged(t *testing.T) {
 	t.Parallel()
 	session := groupSession(t)
 	session.deliverWait = 50 * time.Millisecond
+	watch := &emitWatch{}
+	session.queueing = watch
+	newSocket(session)
 	stall(t, session)
 
 	changed := returnsWithin(t, testwait.Budget, func() bool {
@@ -185,6 +188,28 @@ func TestAGroupFactThatCannotBeQueuedIsNotAcknowledged(t *testing.T) {
 	})
 	if joined {
 		t.Error("a joined group that was never queued was acknowledged, and nothing will send it again")
+	}
+	// A notification that changed nothing a client can read still says the group moved, and
+	// is held back the same way.
+	activity := returnsWithin(t, testwait.Budget, func() bool {
+		return session.handle(&waEvents.GroupInfo{JID: groupJID(), Suspended: true})
+	})
+	if activity {
+		t.Error("a group activity that was never queued was acknowledged, and nothing will send it again")
+	}
+
+	// Withholding is half of it: the socket the notifications came on is owed a takedown
+	// once the stream is back, which is what makes WhatsApp send them again.
+	session.mu.Lock()
+	owed := session.redelivering && session.redeliveryOn.Equal(session.socket())
+	session.mu.Unlock()
+	if !owed {
+		t.Error("the acknowledgements were withheld and nothing is waiting to take the socket down for their redelivery")
+	}
+	dropped := watch.dropped()
+	if len(dropped) != 3 || dropped[0] != protocol.EventGroupUpdated ||
+		dropped[1] != protocol.EventGroupJoined || dropped[2] != protocol.EventGroupActivity {
+		t.Errorf("the instrument heard of %v, want the update, the join and the activity", dropped)
 	}
 }
 
@@ -241,5 +266,35 @@ func TestAFloodOfMomentsDuringAStallKeepsNothing(t *testing.T) {
 	}
 	if dropped := len(watch.dropped()); dropped != calls {
 		t.Errorf("the instrument heard of %d drops, want %d", dropped, calls)
+	}
+}
+
+// An end's slot is given back once it is queued: a second stall holds as many ends as the
+// first did, rather than dropping what the first one used up.
+func TestEndsWaitingThroughOneStallDoNotUseUpTheNext(t *testing.T) {
+	t.Parallel()
+	session, _ := callSession(t, false)
+	watch := &emitWatch{}
+	session.queueing = watch
+	for round := range 2 {
+		stall(t, session)
+		returnsWithin(t, testwait.Budget, func() bool {
+			for i := range owedEnds {
+				session.handle(&waEvents.CallTerminate{BasicCallMeta: callMeta(fmt.Sprintf("call-%d-%d", round, i)), Reason: "timeout"})
+			}
+			return true
+		})
+		if dropped := watch.dropped(); len(dropped) != 0 {
+			t.Fatalf("stall %d dropped %d ends, want none: %d fit off the dispatch", round+1, len(dropped), owedEnds)
+		}
+		publishedAfterTheStall(t, session, protocol.EventCallTerminate, owedEnds)
+		// Every slot back before the next stall: the last end can be published a moment
+		// before its goroutine lets go of the slot.
+		for deadline := time.Now().Add(testwait.Budget); len(session.ends) != 0; {
+			if time.Now().After(deadline) {
+				t.Fatalf("%d end slots still held after every end was published", len(session.ends))
+			}
+			time.Sleep(testwait.Poll)
+		}
 	}
 }
