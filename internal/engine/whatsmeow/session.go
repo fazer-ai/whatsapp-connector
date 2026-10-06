@@ -4166,17 +4166,6 @@ func (s *Session) emit(eventType protocol.EventType, payload any) {
 	s.emitting(&engine.Emission{Type: eventType}, payload)
 }
 
-// emitAt is emit for a reading of the clock taken somewhere else.
-//
-// Two events that report one notification have one learned time, and taking it inside
-// each `emitting` gives them two: the first call blocks on a full inbox until the
-// publisher recovers, and the second is then stamped an outage after the thing it
-// reports, which is the opposite of what `Emission.At` promises a reader. So whoever
-// knows the two belong together reads the clock once and hands the reading down.
-func (s *Session) emitAt(at int64, eventType protocol.EventType, payload any) {
-	s.emitting(&engine.Emission{Type: eventType, At: at}, payload)
-}
-
 // emitDecided is emit for the one state whose distance to the shard is measured.
 //
 // The instant is handed in rather than read here for the reason `Decided` exists: this
@@ -4209,6 +4198,12 @@ const waitForRoom = time.Duration(-1)
 // is answered by withholding the acknowledgement: WhatsApp sends the node again, which is
 // invariant 4 paying a redelivery rather than an event, and the dispatch is held no longer
 // than a message holds it (#221). `on` is the socket that acknowledgement belongs to.
+//
+// `at` is a reading of the clock taken by the caller, or zero for now. Two events that
+// report one notification have one learned time, and taking it inside each offer gives
+// them two: the first can wait out the whole budget on a full inbox, and the second is
+// then stamped that long after the thing it reports, which is the opposite of what
+// `Emission.At` promises a reader.
 func (s *Session) emitFact(on time.Time, at int64, eventType protocol.EventType, payload any) bool {
 	if s.offer(&engine.Emission{Type: eventType, At: at}, payload, s.deliverWait) {
 		return true
