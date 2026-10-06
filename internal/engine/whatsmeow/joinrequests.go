@@ -145,7 +145,11 @@ func (s *Session) updateJoinRequests(ctx context.Context, command *protocol.Comm
 		return nil, err
 	}
 
-	answered, err := s.decideJoinRequests(ctx, s.current(), group, asked, action)
+	var answered []waTypes.GroupParticipant
+	err = s.onThisConnection(ctx, func(ctx context.Context) (err error) {
+		answered, err = s.decideJoinRequests(ctx, s.current(), group, asked, action)
+		return err
+	})
 	if err != nil {
 		return nil, contactFailure(err, "join request update")
 	}

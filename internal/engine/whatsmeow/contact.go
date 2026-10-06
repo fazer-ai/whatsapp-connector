@@ -160,6 +160,10 @@ func contactFailure(err error, subject string) error {
 }
 
 func contactFailureOf(err error, subject string) error {
+	if errors.Is(err, errUnanswered) {
+		return protocol.NewError(protocol.ErrorTimeout,
+			"the connection went after the "+subject+" was sent, and whether WhatsApp applied it is not known")
+	}
 	if named, coded := commandFailure(err, subject); named {
 		return coded
 	}

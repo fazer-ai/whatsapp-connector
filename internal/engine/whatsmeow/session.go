@@ -367,6 +367,10 @@ type Session struct {
 	// somebody adds. `setConnected` and `offline` are the two functions that own the
 	// flag, and every one of those paths goes through one of them.
 	transitions atomic.Int64
+	// line is closed when the connection this session's writes go out on is over, and
+	// replaced by the next one's; `onThisConnection` cancels a group write on it.
+	lineMu sync.Mutex
+	line   chan struct{}
 	// connectedAt is when this session last learned that a connection existed. Written
 	// under mu beside `connected`, by every path that can tell the socket is a new one:
 	// the dials this process asks for, the reconnects it watches whatsmeow start, and a
@@ -740,6 +744,7 @@ func newSession(
 		inbox:      make(chan pending, inboxDepth),
 		events:     make(chan engine.Emission),
 		done:       make(chan struct{}),
+		line:       make(chan struct{}),
 		queueing:   queueing,
 		ctx:        lifetime,
 		cancel:     cancel,
@@ -2873,8 +2878,12 @@ func (s *Session) forgetOwedReset() {
 //
 // Counted rather than flagged, because the count is what the takedown already judges by, and
 // counting twice for one drop costs nothing: every reader compares it against a snapshot.
+//
+// It also ends the line the group writes in flight went out on, so that whatsmeow does not
+// send them again on the connection that replaces it (#180).
 func (s *Session) dropped() {
 	s.transitions.Add(1)
+	s.cutLine()
 }
 
 // cancelOwedReset drops a takedown that was still waiting for a command to be answered, and

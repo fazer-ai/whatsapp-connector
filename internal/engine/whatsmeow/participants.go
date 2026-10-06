@@ -91,7 +91,11 @@ func (s *Session) updateGroupParticipants(ctx context.Context, command *protocol
 		return nil, err
 	}
 
-	answered, err := s.updateParticipants(ctx, s.current(), group, asked, action)
+	var answered []waTypes.GroupParticipant
+	err = s.onThisConnection(ctx, func(ctx context.Context) (err error) {
+		answered, err = s.updateParticipants(ctx, s.current(), group, asked, action)
+		return err
+	})
 	if err != nil {
 		return nil, contactFailure(err, "participants update")
 	}

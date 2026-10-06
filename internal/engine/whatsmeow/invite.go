@@ -53,7 +53,18 @@ func (s *Session) groupInviteOf(ctx context.Context, command *protocol.Command) 
 		return nil, err
 	}
 
-	link, err := s.inviteLink(ctx, s.current(), group, req.Revoke)
+	var link string
+	ask := func(ctx context.Context) (err error) {
+		link, err = s.inviteLink(ctx, s.current(), group, req.Revoke)
+		return err
+	}
+	if req.Revoke {
+		// A rotation is a write, and a resend rotates the link twice. Reading the link is
+		// not, and its resend costs nothing.
+		err = s.onThisConnection(ctx, ask)
+	} else {
+		err = ask(ctx)
+	}
 	if err != nil {
 		return nil, inviteFailure(err)
 	}
