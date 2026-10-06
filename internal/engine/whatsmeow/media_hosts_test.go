@@ -172,3 +172,37 @@ func deliverAll(t *testing.T, session *Session, event *waEvents.Message) ([]*eng
 		}
 	}
 }
+
+// A file that travels unencrypted has no MAC to trim, so nothing after the transfer shortens
+// the file: a host that served more bytes than the next one left its tail behind the good
+// file, and the hash of the whole failed. Each transfer starting on an empty file is what
+// keeps the shorter, right one as served.
+func TestAShorterGoodFileAfterALongerBadOneIsKeptAsServed(t *testing.T) {
+	t.Parallel()
+
+	session, _ := mediaSession(t, media.Options{})
+	session.download = downloadOverClient
+	plain := bytes.Repeat([]byte("jpeg"), 1024)
+	plainSum := sha256.Sum256(plain)
+	var badAsked, goodAsked atomic.Int64
+	mediaHosts(t, session,
+		mediaHost(t, bytes.Repeat([]byte{0x55}, 2*len(plain)), &badAsked),
+		mediaHost(t, plain, &goodAsked))
+
+	unencrypted := &waE2E.ImageMessage{
+		Mimetype:   proto.String("image/jpeg"),
+		DirectPath: proto.String("/v/t62.7118-24/plain.jpg?ccb=11-4"),
+		FileSHA256: plainSum[:],
+		FileLength: proto.Uint64(uint64(len(plain))),
+	}
+	emissions, acknowledged := deliverAll(t, session, mediaEvent("3EB0PLAIN", &waE2E.Message{ImageMessage: unencrypted}))
+	if !acknowledged {
+		t.Fatal("a message whose file the second host served was left to be redelivered")
+	}
+	if len(emissions) != 1 {
+		t.Fatalf("published %d events, want the message alone: %s", len(emissions), emissions[len(emissions)-1].Payload)
+	}
+	if content := mediaContentOf(t, emissions[0]); content.Ref == nil {
+		t.Fatalf("the message carries no file (%+v), want the one the good host served", content)
+	}
+}
