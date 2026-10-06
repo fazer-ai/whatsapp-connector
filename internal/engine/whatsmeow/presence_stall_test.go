@@ -226,3 +226,22 @@ func TestAStateAfterADropDoesNotTakeAPlaceFromBeforeIt(t *testing.T) {
 		}
 	}
 }
+
+// What a reused place publishes is the newest state, not the one that opened it: somebody
+// who went away and came back during a stall is shown as back.
+func TestTheNewestStateThroughAStallIsTheOnePublished(t *testing.T) {
+	t.Parallel()
+	session := newPresenceSession(t, "5511999990001")
+	stall(t, session)
+
+	from := waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)
+	returnsWithin(t, testwait.Budget, func() bool {
+		session.presence(&waEvents.Presence{From: from, Unavailable: true})
+		return session.presence(&waEvents.Presence{From: from})
+	})
+
+	presences := presencesAfterTheStall(t, session, 1)
+	if len(presences) != 1 || stateOf(t, presences[0]) != "available" {
+		t.Fatalf("published %d presences once the publisher came back, want the one coming back", len(presences))
+	}
+}
