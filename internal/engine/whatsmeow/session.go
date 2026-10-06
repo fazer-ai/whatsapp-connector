@@ -367,6 +367,11 @@ type Session struct {
 	// somebody adds. `setConnected` and `offline` are the two functions that own the
 	// flag, and every one of those paths goes through one of them.
 	transitions atomic.Int64
+	// inFlight holds the group writes running on the connection this session has now,
+	// each by the cancel that ends it when that connection goes (#180). Guarded by mu,
+	// beside connectedAt, because whether a drop may end them is a question about
+	// connectedAt.
+	inFlight map[*groupWrite]struct{}
 	// connectedAt is when this session last learned that a connection existed. Written
 	// under mu beside `connected`, by every path that can tell the socket is a new one:
 	// the dials this process asks for, the reconnects it watches whatsmeow start, and a
@@ -740,6 +745,7 @@ func newSession(
 		inbox:      make(chan pending, inboxDepth),
 		events:     make(chan engine.Emission),
 		done:       make(chan struct{}),
+		inFlight:   map[*groupWrite]struct{}{},
 		queueing:   queueing,
 		ctx:        lifetime,
 		cancel:     cancel,
@@ -4843,6 +4849,10 @@ func (s *Session) handle(rawEvent any) bool {
 		// launched from here on stand down, whether the debt was forgotten or claimed.
 		s.dropped()
 		s.forgetOwedReset()
+		// The group writes in flight went out on the connection that went, and whatsmeow
+		// sends each of them again on the one that replaces it unless this ends them first
+		// (#180).
+		s.cutLine(dispatched)
 
 		s.transition.Lock()
 		defer s.transition.Unlock()

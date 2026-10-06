@@ -368,7 +368,7 @@ func noAnswer(err error) bool {
 		return false
 	}
 	var disconnected *wm.DisconnectedError
-	return errors.As(err, &disconnected) || errors.Is(err, wm.ErrIQTimedOut)
+	return errors.As(err, &disconnected) || errors.Is(err, wm.ErrIQTimedOut) || errors.Is(err, errUnanswered)
 }
 
 // markFailure names what went wrong in the contract's own words.

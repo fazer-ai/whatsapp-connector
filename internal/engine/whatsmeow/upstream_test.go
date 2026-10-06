@@ -99,6 +99,42 @@ var upstreamDefects = []upstreamDefect{
 			"(internal/engine/whatsmeow/history.go)",
 	},
 	{
+		issue: "fazer-ai/whatsapp-connector#180",
+		file:  "request.go",
+		// Not a defect. The frame `retryFrame` sends again after a drop goes out under the
+		// caller's context, which is the one handle this connector has on that resend:
+		// `onThisConnection` cancels it when the connection goes, and a resend on a context
+		// of its own would write every group change twice again with the suite green.
+		inOrder:   []string{"if !cli.WaitForConnection(5 * time.Second) {", "err := sock.SendFrame(ctx, data)"},
+		enclosing: "func (cli *Client) retryFrame(",
+		what:      "the resend after a drop going out under the caller's context",
+		reliedOn:  true,
+		restingOn: "onThisConnection in internal/engine/whatsmeow/wireonce.go, which keeps a group " +
+			"write to the connection it went out on",
+	},
+	{
+		issue:      "fazer-ai/whatsapp-connector#180",
+		file:       "socket/noisesocket.go",
+		stillThere: []string{"if ctx.Err() != nil {\n\t\treturn ctx.Err()\n\t}"},
+		enclosing:  "func (ns *NoiseSocket) SendFrame(",
+		what:       "a frame refused, before it is encrypted and written, when its context is done",
+		reliedOn:   true,
+		restingOn:  "onThisConnection in internal/engine/whatsmeow/wireonce.go",
+	},
+	{
+		issue: "fazer-ai/whatsapp-connector#180",
+		file:  "client.go",
+		// The socket is gone before anybody hears of the drop, so a write that starts after
+		// the drop finds no socket and answers ErrNotConnected -- nothing went out -- rather
+		// than being cancelled and answered as one that may have landed.
+		inOrder:   []string{"cli.socket = nil", "go cli.dispatchEvent(&events.Disconnected{})"},
+		enclosing: "func (cli *Client) onDisconnect(",
+		what:      "the socket being cleared before the drop is dispatched",
+		reliedOn:  true,
+		restingOn: "onThisConnection in internal/engine/whatsmeow/wireonce.go, which reads a " +
+			"cancelled write as one that went out",
+	},
+	{
 		issue: "fazer-ai/whatsapp-connector#283",
 		file:  "request.go",
 		// Not a defect. `retryFrame` watching the caller's context is the single reason a

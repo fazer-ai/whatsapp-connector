@@ -54,7 +54,9 @@ func (s *Session) setGroupName(ctx context.Context, command *protocol.Command) (
 	if err := s.readyToSend(); err != nil {
 		return nil, err
 	}
-	if err := s.setName(ctx, s.current(), group, req.Subject); err != nil {
+	if err := s.onThisConnection(ctx, func(ctx context.Context) error {
+		return s.setName(ctx, s.current(), group, req.Subject)
+	}); err != nil {
 		return nil, contactFailure(err, "name change")
 	}
 	return nil, nil
@@ -128,7 +130,9 @@ func (s *Session) setGroupSetting(ctx context.Context, command *protocol.Command
 		if err := s.readyToSend(); err != nil {
 			return nil, err
 		}
-		if err := s.setAddMode(ctx, s.current(), group, mode); err != nil {
+		if err := s.onThisConnection(ctx, func(ctx context.Context) error {
+			return s.setAddMode(ctx, s.current(), group, mode)
+		}); err != nil {
 			return nil, contactFailure(err, "settings change")
 		}
 		return nil, nil
@@ -145,7 +149,9 @@ func (s *Session) setGroupSetting(ctx context.Context, command *protocol.Command
 	if err := s.readyToSend(); err != nil {
 		return nil, err
 	}
-	if err := flip(ctx, s.current(), group, on); err != nil {
+	if err := s.onThisConnection(ctx, func(ctx context.Context) error {
+		return flip(ctx, s.current(), group, on)
+	}); err != nil {
 		return nil, contactFailure(err, "settings change")
 	}
 	return nil, nil
@@ -249,7 +255,9 @@ func (s *Session) leaveGroup(ctx context.Context, command *protocol.Command) (js
 	if err := s.readyToSend(); err != nil {
 		return nil, err
 	}
-	if err := s.leave(ctx, s.current(), group); err != nil {
+	if err := s.onThisConnection(ctx, func(ctx context.Context) error {
+		return s.leave(ctx, s.current(), group)
+	}); err != nil {
 		return nil, contactFailure(err, "group departure")
 	}
 	return nil, nil
@@ -309,7 +317,9 @@ func (s *Session) setGroupPhoto(ctx context.Context, command *protocol.Command) 
 	}
 	// nil is what removes it: whatsmeow reads a nil avatar as the removal, and that is
 	// the one way to say it to WhatsApp.
-	if err := s.setPhoto(ctx, s.current(), group, picture); err != nil {
+	if err := s.onThisConnection(ctx, func(ctx context.Context) error {
+		return s.setPhoto(ctx, s.current(), group, picture)
+	}); err != nil {
 		if errors.Is(err, wm.ErrInvalidImageFormat) {
 			// WhatsApp refusing the bytes themselves. It answers `not-acceptable`, which
 			// every other command here reports as `wa_error` -- and `wa_error` is
@@ -454,7 +464,9 @@ func (s *Session) writeTheDescription(
 func (s *Session) writeUnder(
 	ctx context.Context, client *wm.Client, group waTypes.JID, previous, revision, description string,
 ) error {
-	err := s.setTopic(ctx, client, group, previous, revision, description)
+	err := s.onThisConnection(ctx, func(ctx context.Context) error {
+		return s.setTopic(ctx, client, group, previous, revision, description)
+	})
 	if err != nil {
 		if ended := ctx.Err(); ended != nil {
 			return ended //nolint:wrapcheck // classified by contactFailure, which needs the sentinels
