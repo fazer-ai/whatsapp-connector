@@ -2,6 +2,7 @@ package whatsmeow
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -19,6 +20,7 @@ import (
 	waTypes "go.mau.fi/whatsmeow/types"
 	waLog "go.mau.fi/whatsmeow/util/log"
 
+	"github.com/fazer-ai/whatsapp-connector/internal/engine"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 )
 
@@ -258,6 +260,11 @@ func TestAGroupWriteCaughtByADropIsNotWrittenAgain(t *testing.T) {
 			}
 			if code := codeOf(answer.err); code != protocol.ErrorTimeout {
 				t.Errorf("a write the drop caught answered %v (%q), want timeout", answer.err, code)
+			}
+			// The mark is what has the ledger answer a redelivery instead of writing again.
+			// A departure is the one write the ledger does not hold.
+			if marked := errors.Is(answer.err, engine.ErrMayHaveLanded); marked != (write.kind != protocol.CommandGroupLeave) {
+				t.Errorf("a write the drop caught is marked as one that may have landed: %v", marked)
 			}
 		})
 	}
