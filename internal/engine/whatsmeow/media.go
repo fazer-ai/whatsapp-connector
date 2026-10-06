@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net/url"
 	"strings"
@@ -348,37 +349,14 @@ func (s *Session) fetch(ctx context.Context, part *attachment) (protocol.MediaRe
 	// that come back through here are answered differently and one of them is not the
 	// store's: what WhatsApp said about the file decides whether the message is worth
 	// redelivering, and only the sentinels carry that.
-	attempt := func() (media.Blob, error, error) {
-		var reached error
-		stored, err := s.blobs.Receive(ctx,
-			&media.Blob{Mime: part.content.Mime, Filename: part.content.Filename},
-			func(file media.File) error {
-				reached = s.download(ctx, s.current(), part.download, file)
-				return reached
-			},
-		)
-		return stored, reached, err
-	}
-
-	stored, reached, err := attempt()
-	if integrityFailure(reached) {
-		// Once more, on a file of its own. whatsmeow walks the media hosts writing into
-		// the one file it was given and rewinds between hosts no more than it truncates,
-		// so a host that fails partway leaves bytes the next one's transfer is appended
-		// to -- and every length it works out afterwards is that transfer's, measured
-		// against a file holding both. The MAC is then read from the wrong offset and the
-		// integrity check fails on a file that was never wrong.
-		//
-		// Receive opens a new temporary file for each call, so this attempt cannot see
-		// those leftovers, and a second failure is the file itself rather than the
-		// walking. Only then is the message given a verdict a client never revisits.
-		//
-		// The cost is one extra transfer, and only where the alternative is calling a
-		// good file permanently corrupt.
-		s.log.Warn().Str("kind", string(part.content.Kind)).
-			Msg("a media download failed its integrity check; trying once more on a clean file")
-		stored, reached, err = attempt()
-	}
+	var reached error
+	stored, err := s.blobs.Receive(ctx,
+		&media.Blob{Mime: part.content.Mime, Filename: part.content.Filename},
+		func(file media.File) error {
+			reached = s.download(ctx, s.current(), part.download, file)
+			return reached
+		},
+	)
 	switch {
 	case errors.Is(err, media.ErrTooLarge):
 		// The sender understated the length. Permanent for this file: the same bytes
@@ -438,12 +416,10 @@ func unfetchable(part wm.DownloadableMessage) error {
 }
 
 // integrityFailure reports the answers that mean the bytes on disk are not the ones the
-// message describes.
-//
-// Named rather than inlined into downloadFailure because fetch asks the same question
-// one step earlier, and for a reason the classification cannot see: whatsmeow measures
-// these against the file it was handed, so any of them can be an artefact of that file
-// holding an earlier attempt's bytes rather than a fact about the message.
+// message describes. whatsmeow measures these against the file it was handed, which is
+// why each of its transfers starts on an empty one (eachTransferAnew): otherwise any of
+// them could be an artefact of an earlier transfer's bytes rather than a fact about the
+// message.
 func integrityFailure(err error) bool {
 	return errors.Is(err, wm.ErrInvalidMediaHMAC) ||
 		errors.Is(err, wm.ErrInvalidMediaSHA256) ||
@@ -978,4 +954,44 @@ func downloadableOf(kept *store.MediaPart) (wm.DownloadableMessage, error) {
 	// type would ask WhatsApp for the file under the wrong endpoint.
 	return nil, protocol.NewError(protocol.ErrorMediaUnavailable,
 		fmt.Sprintf("what is kept for that message is a %q, which this connector cannot fetch", kept.Kind))
+}
+
+// downloadOverClient fetches a message's file into the store's file through whatsmeow,
+// each transfer into an empty file.
+func downloadOverClient(ctx context.Context, client *wm.Client, part wm.DownloadableMessage, file media.File) error {
+	return client.DownloadToFile(ctx, part, eachTransferAnew{file}) //nolint:wrapcheck // classified by downloadFailure, which needs the sentinels
+}
+
+// eachTransferAnew empties the file before every transfer whatsmeow writes into it.
+//
+// whatsmeow walks the media hosts, and retries each one, writing into the one file it was
+// handed (#90). Between hosts it neither rewinds nor truncates, so a host that serves bytes
+// the message does not describe -- a failure that does not stop the walk -- leaves them in
+// front of the next host's transfer. Every length worked out afterwards is that transfer's,
+// measured against a file holding both: the MAC is read from the wrong offset and a good
+// file is announced as corrupt, permanently. Between retries it rewinds without
+// truncating, which leaves a longer earlier attempt's tail behind an unencrypted file.
+//
+// Each transfer is one `io.Copy` into the file (`downloadMediaToFile`), and `io.Copy`
+// hands the whole of it to `ReadFrom` when the destination has one. So a transfer is
+// exactly one call here, whichever loop made it, and it starts on an empty file. Nothing
+// else whatsmeow does to the file goes through `ReadFrom`: the MAC check and the hashing
+// read it, and the decryption writes it block by block with `WriteAt`.
+//
+// The store's file is embedded as the interface, so this has the methods File asks for
+// and `ReadFrom`, and nothing that would reach the descriptor past the store's cap: the
+// copy below writes through the file's own `Write`. upstream_test.go fails the day the
+// transfer stops being one `io.Copy`.
+type eachTransferAnew struct {
+	media.File
+}
+
+func (f eachTransferAnew) ReadFrom(transfer io.Reader) (int64, error) {
+	if err := f.Truncate(0); err != nil {
+		return 0, fmt.Errorf("empty the file for a transfer: %w", err)
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return 0, fmt.Errorf("rewind the file for a transfer: %w", err)
+	}
+	return io.Copy(struct{ io.Writer }{f.File}, transfer) //nolint:wrapcheck // whatsmeow's own transfer, classified by its caller
 }

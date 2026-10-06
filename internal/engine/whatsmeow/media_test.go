@@ -428,56 +428,11 @@ func TestADownloadIsOnlyGivenUpOnWhenAnotherAttemptWouldFailTheSameWay(t *testin
 	}
 }
 
-// whatsmeow walks the media hosts writing into the one file it was handed, and rewinds
-// between hosts no more than it truncates. A host that fails partway therefore leaves
-// bytes the next one's transfer is appended to, and every length worked out afterwards is
-// that transfer's, measured against a file holding both -- so the MAC is read from the
-// wrong offset and a file that was never wrong fails its integrity check. The verdict is
-// permanent and the client never asks again, which is the whole cost.
-//
-// The second attempt is what makes the verdict honest: it gets a file of its own, so what
-// it decides is about the message rather than about the leftovers.
-func TestAFileWhoseIntegrityFailedIsFetchedAgainOnAFileOfItsOwn(t *testing.T) {
-	t.Parallel()
-
-	session, _ := mediaSession(t, media.Options{})
-	var attempts atomic.Int64
-	var sawLeftovers atomic.Bool
-	session.download = func(_ context.Context, _ *wm.Client, _ wm.DownloadableMessage, file media.File) error {
-		// Whatever the previous attempt left is what this one would be appended to.
-		if end, err := file.Seek(0, io.SeekEnd); err == nil && end != 0 {
-			sawLeftovers.Store(true)
-		}
-		if _, err := file.Write([]byte("o que o host serviu antes de cair")); err != nil {
-			return err
-		}
-		if attempts.Add(1) == 1 {
-			return wm.ErrInvalidMediaHMAC
-		}
-		return nil
-	}
-
-	emissions, acknowledged := deliver(t, session, imageEvent("3EB0LEFTOVER"), 1)
-	if !acknowledged {
-		t.Fatal("a media message whose second attempt succeeded was left to be redelivered")
-	}
-	if got := attempts.Load(); got != 2 {
-		t.Fatalf("the file was fetched %d time(s), want a second attempt after the integrity check failed", got)
-	}
-	if sawLeftovers.Load() {
-		t.Fatal("the second attempt was handed a file the first had already written to")
-	}
-
-	if content := mediaContentOf(t, emissions[0]); content.Ref == nil {
-		t.Fatal("the message carries no reference, want the file the second attempt fetched")
-	}
-}
-
-// The other half, and the one that keeps the verdict worth having: a file that fails on a
-// clean attempt too is the message being wrong rather than the walking, and it is still
-// announced as corrupt. Without this the change above would read as "never trust an
-// integrity failure", which is the opposite of what it says.
-func TestAFileWhoseIntegrityFailsOnACleanAttemptIsStillCorrupt(t *testing.T) {
+// A file that fails its integrity check is announced as corrupt after one attempt. Each of
+// whatsmeow's transfers starts on an empty file (media_hosts_test.go has the real walk), so
+// a failure is about the message, and a second download would only pay for the same
+// bytes again.
+func TestAFileWhoseIntegrityFailsIsCorruptAfterOneAttempt(t *testing.T) {
 	t.Parallel()
 
 	session, downloads := mediaSession(t, media.Options{})
@@ -485,10 +440,10 @@ func TestAFileWhoseIntegrityFailsOnACleanAttemptIsStillCorrupt(t *testing.T) {
 
 	emissions, acknowledged := deliver(t, session, imageEvent("3EB0BADFILE"), 2)
 	if !acknowledged {
-		t.Fatal("a file that fails the same way twice was left to be redelivered")
+		t.Fatal("a file that failed its integrity check was left to be redelivered")
 	}
-	if got := downloads.count(); got != 2 {
-		t.Fatalf("the file was fetched %d time(s), want exactly one retry before giving up", got)
+	if got := downloads.count(); got != 1 {
+		t.Fatalf("the file was fetched %d time(s), want once", got)
 	}
 	var failure protocol.MediaDownloadFailure
 	if err := json.Unmarshal(emissions[1].Payload, &failure); err != nil {

@@ -365,6 +365,21 @@ var upstreamDefects = []upstreamDefect{
 			"attempt carrying the tail of the one before it",
 	},
 	{
+		issue: "fazer-ai/whatsapp-connector#90",
+		file:  "download-to-file.go",
+		// Not a defect. Each transfer is one io.Copy into the file, which io.Copy hands to
+		// the destination's ReadFrom whole: that call is how eachTransferAnew knows a
+		// transfer is starting, from whichever of the two loops. A transfer written any
+		// other way would reach the file with nothing emptying it first, and the host walk
+		// would announce good files as corrupt again with the suite green.
+		stillThere: []string{"n, err := io.Copy(file, io.TeeReader(resp.Body, hasher))"},
+		enclosing:  "func (cli *Client) downloadMediaToFile(",
+		what:       "each media transfer being one io.Copy into the file it was handed",
+		reliedOn:   true,
+		restingOn: "eachTransferAnew in internal/engine/whatsmeow/media.go, which empties the " +
+			"file in ReadFrom before every transfer",
+	},
+	{
 		issue:  "fazer-ai/whatsapp-connector#278",
 		module: "go.mau.fi/util",
 		file:   "dbutil/upgrades.go",
