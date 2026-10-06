@@ -367,10 +367,11 @@ type Session struct {
 	// somebody adds. `setConnected` and `offline` are the two functions that own the
 	// flag, and every one of those paths goes through one of them.
 	transitions atomic.Int64
-	// line is closed when the connection this session's writes go out on is over;
-	// `onThisConnection` cancels a group write on it. Guarded by mu, beside connectedAt,
-	// because whether a drop may close it is a question about connectedAt (#180).
-	line chan struct{}
+	// inFlight holds the group writes running on the connection this session has now,
+	// each by the cancel that ends it when that connection goes (#180). Guarded by mu,
+	// beside connectedAt, because whether a drop may end them is a question about
+	// connectedAt.
+	inFlight map[*groupWrite]struct{}
 	// connectedAt is when this session last learned that a connection existed. Written
 	// under mu beside `connected`, by every path that can tell the socket is a new one:
 	// the dials this process asks for, the reconnects it watches whatsmeow start, and a
@@ -744,7 +745,7 @@ func newSession(
 		inbox:      make(chan pending, inboxDepth),
 		events:     make(chan engine.Emission),
 		done:       make(chan struct{}),
-		line:       make(chan struct{}),
+		inFlight:   map[*groupWrite]struct{}{},
 		queueing:   queueing,
 		ctx:        lifetime,
 		cancel:     cancel,

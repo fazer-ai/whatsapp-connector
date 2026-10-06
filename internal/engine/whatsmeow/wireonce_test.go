@@ -242,14 +242,16 @@ func interrupted(t *testing.T, kind protocol.CommandType, payload string, back t
 		t.Fatalf("the write never reached the wsWire (frame on %d, %v)", index, ok)
 	}
 
-	before := session.transitions.Load()
 	w.cut(0)
 	// The drop reaches the session before anything can reconnect: a reconnect is a dial and
 	// two round trips to WhatsApp, and the drop is one goroutine away. Waited for rather than
-	// slept on, so that the reconnect below is never the one that wins.
-	for deadline := time.Now().Add(5 * time.Second); session.transitions.Load() == before; {
+	// slept on, so that the reconnect below is never the one that wins, and waited for as
+	// the write leaving the list: the drop cancels it under the lock it takes it off under.
+	// A write that is not on the list at all, one this build does not keep to its
+	// connection, passes straight through and is caught by the frames it sends.
+	for deadline := time.Now().Add(5 * time.Second); inFlight(session) != 0; {
 		if time.Now().After(deadline) {
-			t.Fatal("the session never heard of the drop")
+			t.Fatal("the session never ended the write its drop caught")
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -431,19 +433,17 @@ func TestDropsOnTwoSessionsAtOnceKeepEachWriteToOneFrame(t *testing.T) {
 		sessions = append(sessions, one)
 	}
 
-	before := make([]int64, len(sessions))
-	for i, one := range sessions {
-		before[i] = one.session.transitions.Load()
-	}
 	var cuts sync.WaitGroup
 	for _, one := range sessions {
 		cuts.Go(func() { one.wire.cut(0) })
 	}
 	cuts.Wait()
-	for i, one := range sessions {
-		for deadline := time.Now().Add(5 * time.Second); one.session.transitions.Load() == before[i]; {
+	// The drop ends the write under the lock it takes it off the list under, so an empty
+	// list is a cancelled write, and the replacement adopted below cannot meet a live one.
+	for _, one := range sessions {
+		for deadline := time.Now().Add(5 * time.Second); inFlight(one.session) != 0; {
 			if time.Now().After(deadline) {
-				t.Fatal("a session never heard of its drop")
+				t.Fatal("a session never ended the write its drop caught")
 			}
 			time.Sleep(time.Millisecond)
 		}
@@ -518,15 +518,10 @@ func TestAStaleDropLeavesTheReplacementsWritesAlone(t *testing.T) {
 	// The replacement announced itself after the drop was dispatched: whatsmeow hands the
 	// two to different goroutines, and this is the order in which the drop arrives late.
 	session.setConnectedAt(true, time.Now().Add(time.Hour))
-	session.mu.Lock()
-	line := session.line
-	session.mu.Unlock()
 	session.handle(&waEvents.Disconnected{})
 	// The cut is made inside the handler, so this is its answer, not a race with it.
-	select {
-	case <-line:
-		t.Fatal("a drop the replacement had overtaken cut the replacement's line")
-	default:
+	if inFlight(session) != 1 {
+		t.Fatal("a drop the replacement had overtaken ended the replacement's write")
 	}
 	if w.answer(session.current(), resultFor) != 1 {
 		t.Fatal("the write was not waiting for its answer")
@@ -539,4 +534,11 @@ func TestAStaleDropLeavesTheReplacementsWritesAlone(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("the write never answered")
 	}
+}
+
+// inFlight is how many group writes the session is running on the connection it has now.
+func inFlight(session *Session) int {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	return len(session.inFlight)
 }
