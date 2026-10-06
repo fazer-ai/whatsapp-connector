@@ -560,17 +560,20 @@ func (s *Session) placeInTheGroup(
 // group read mark, for as long as the session is up. What it costs instead is one per
 // group, on the first of those.
 //
-// Nothing drops an entry on a timer, and nothing needs to. The migration only runs one
-// way, phone numbers to LIDs, so a stale entry says phone about a group that has moved,
-// and that has exactly two outcomes. A member with both spellings is named by phone in a
+// Nothing drops an entry on a timer. A notification about the group drops its entry
+// (`handle`, #125), which bounds a stale reading by the group's next change rather than by
+// the next reconnection, and costs one round trip on the next action after a change.
+// Past that, nothing needs to. The migration only runs one way, phone numbers to LIDs, so
+// a stale entry says phone about a group that has moved, and that has exactly two
+// outcomes. A member with both spellings is named by phone in a
 // LID group, which `TestLiveGroupKeyNamespace` measured as harmless. A member known by
 // LID alone -- a privacy setting is enough, and `addressing.go` says why the number is
 // the half that goes missing -- has no phone to be named by, and translating into one
 // that does not exist would refuse a reaction that was correct as it came.
 //
-// That second outcome is what invalidates an entry: `asTheGroupAddresses` forgets the
-// group and asks again rather than refusing, so the round trip is paid on the path that
-// was about to fail and on no other. The inverse staleness, which is the one this whole
+// That second outcome is the other thing that invalidates an entry: `asTheGroupAddresses`
+// forgets the group and asks again rather than refusing, so the round trip is paid on the
+// path that was about to fail. The inverse staleness, which is the one this whole
 // translation exists for, a cache cannot produce: it would need a group to move from LIDs
 // back to phone numbers.
 //
