@@ -644,11 +644,12 @@ func TestAGroupsTypingIsKeptPerPersonRatherThanPerChat(t *testing.T) {
 	}
 }
 
-// A queue with no room left is a publisher that has already stopped answering, and there
-// is nothing presence can do about that which is worth holding WhatsApp's node handler
-// for. What it must not do is leave a mark behind: an entry with no marker to resolve it
-// would sit on the board unpublished, and the next state for that chat would take it for
-// one already on its way and quietly replace it instead of queueing one of its own.
+// A queue with no room left is a publisher that has already stopped answering, and a
+// typing indicator is not worth holding WhatsApp's node handler for: it is dropped. What
+// it must not do is leave a mark behind: an entry with no marker to resolve it would sit on
+// the board unpublished, and the next state for that chat would take it for one already on
+// its way and quietly replace it instead of queueing one of its own. (A stop is kept for
+// when there is room; presence_stall_test.go has that half.)
 func TestPresenceLeavesNothingBehindWhenTheInboxIsFull(t *testing.T) {
 	t.Parallel()
 
@@ -665,7 +666,7 @@ func TestPresenceLeavesNothingBehindWhenTheInboxIsFull(t *testing.T) {
 
 	jid := waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)
 	session.chatPresence(&waEvents.ChatPresence{
-		MessageSource: waTypes.MessageSource{Chat: jid, Sender: jid}, State: waTypes.ChatPresencePaused,
+		MessageSource: waTypes.MessageSource{Chat: jid, Sender: jid}, State: waTypes.ChatPresenceComposing,
 	})
 
 	session.boardMu.Lock()

@@ -430,7 +430,7 @@ func TestAPresenceTheInboxHadNoRoomForIsCounted(t *testing.T) {
 
 	jid := waTypes.NewJID("5511999990002", waTypes.DefaultUserServer)
 	session.chatPresence(&waEvents.ChatPresence{
-		MessageSource: waTypes.MessageSource{Chat: jid, Sender: jid}, State: waTypes.ChatPresencePaused,
+		MessageSource: waTypes.MessageSource{Chat: jid, Sender: jid}, State: waTypes.ChatPresenceComposing,
 	})
 
 	if got := watch.dropped(); !slices.Equal(got, []protocol.EventType{protocol.EventChatPresence}) {

@@ -59,7 +59,8 @@ type Session struct {
 	// handlers can still be running when Close is called, and a send on a closed
 	// channel is a panic in a library goroutine we do not own.
 	inbox chan pending
-	// ends holds a slot for every end waiting for room off the dispatch (offDispatch).
+	// ends holds a slot for every end waiting for room off the dispatch (offDispatch and
+	// owePlace).
 	ends   chan struct{}
 	events chan engine.Emission
 	done   chan struct{}
@@ -309,6 +310,9 @@ type Session struct {
 	board    map[string]posted
 	boardMu  sync.Mutex
 	boardSeq int64
+	// owedPlaces is the place each chat has waiting for room off the dispatch (owePlace), by the
+	// seq its marker carries, until that marker is resolved. Guarded by boardMu.
+	owedPlaces map[string]int64
 
 	// availability is the last presence WhatsApp took from this account, and nil while
 	// the client has asked for none. It is kept because WhatsApp forgets it when the
@@ -852,6 +856,7 @@ func newSession(
 		presenceWait:        presenceWriteTimeout,
 		callWait:            callWriteTimeout,
 		board:               make(map[string]posted),
+		owedPlaces:          make(map[string]int64),
 		downloadWait:        downloadTimeout,
 		historyBudget:       historyBudget,
 		historyReceiptWait:  historyReceiptTimeout,
@@ -4064,17 +4069,65 @@ func (s *Session) post(key string, eventType protocol.EventType, payload any, li
 		s.board[key] = entry
 		s.queued(0, depth)
 	default:
-		s.noRoom(eventType)
 		// The queue presence shares with the messages is full, which is a publisher that
-		// has stopped answering while 256 messages piled up behind it. Presence waits for
-		// nothing, so this is dropped -- and whatever the chat had before is left where it
-		// is, because that one is already on its way and this one never started.
-		//
-		// A stop dropped here is a stop nothing replaces, which is the cost of sharing the
-		// queue and what buys the order. Registered as #47.
+		// has stopped answering while 256 messages piled up behind it.
+		if life == 0 {
+			s.owePlace(key, &entry, eventType)
+			return
+		}
+		// A moment waits for nothing, so this is dropped -- and whatever the chat had
+		// before is left where it is, because that one is already on its way and this
+		// one never started.
+		s.noRoom(eventType)
 		s.log.Debug().Str("type", string(eventType)).
 			Msg("dropping presence the inbox had no room for")
 	}
+}
+
+// owePlace keeps a state that has nothing after it for when the inbox has room, without
+// holding the dispatch for it. Called with boardMu held.
+//
+// Dropped, a stop or a going-away is one nothing replaces: the client is left showing
+// somebody typing, or somebody there, with nothing coming to correct it (#47). So the state
+// goes on the board now and its marker waits for room on a goroutine of its own, bounded
+// with the other ends by owedEnds. The marker lands behind everything queued before it,
+// which is where a state that closes something belongs; what it publishes is read off the
+// board when its turn comes, like every marker.
+//
+// A chat that already has a marker waiting here does not get a second one. The newer state
+// takes the waiting marker's place on the board, so a burst through a stall is one slot
+// and one event, the last one. That place is the chat's only until the marker is resolved
+// (resolve forgets it): after that it has been published, and a state reusing it would
+// have nothing coming to publish it.
+func (s *Session) owePlace(key string, entry *posted, eventType protocol.EventType) {
+	if seq, waiting := s.owedPlaces[key]; waiting {
+		entry.seq = seq
+		entry.emission.Settle = s.settled(key, seq)
+		s.board[key] = *entry
+		return
+	}
+	select {
+	case s.ends <- struct{}{}:
+	default:
+		s.noRoom(eventType)
+		s.log.Debug().Str("type", string(eventType)).
+			Msg("dropping presence with too many ends already waiting for room")
+		return
+	}
+	s.board[key] = *entry
+	s.owedPlaces[key] = entry.seq
+	marker := pending{key: key, seq: entry.seq}
+	depth := len(s.inbox)
+	go func() {
+		defer func() { <-s.ends }()
+		began := time.Now()
+		select {
+		case s.inbox <- marker:
+			s.queued(time.Since(began), depth)
+		case <-s.done:
+			s.queued(time.Since(began), depth)
+		}
+	}()
 }
 
 // resolve reads what a marker stands for, and is the last moment that value can still
@@ -4084,6 +4137,9 @@ func (s *Session) post(key string, eventType protocol.EventType, payload any, li
 func (s *Session) resolve(key string, seq int64) (engine.Emission, bool) {
 	s.boardMu.Lock()
 	defer s.boardMu.Unlock()
+	if s.owedPlaces[key] == seq {
+		delete(s.owedPlaces, key)
+	}
 	entry, waiting := s.board[key]
 	if !waiting || entry.seq != seq {
 		// A place the chat has moved on from: the state this marker was for was replaced,
@@ -4202,10 +4258,11 @@ const waitForRoom = time.Duration(-1)
 // neither dropped nor holding the dispatch (#221).
 const offDispatch = time.Duration(-2)
 
-// owedEnds is how many ends a session holds off the dispatch at once. A call ends once, so
-// this is calls ending during one stall on one account, and an end past it is dropped and
-// counted like a moment: what it bounds is the goroutines a flood can leave parked on a
-// publisher that is not coming back.
+// owedEnds is how many ends a session holds off the dispatch at once: calls ending, and
+// chats or contacts whose last state is a stop or a going-away (owePlace), during one stall
+// on one account. A call ends once and a chat holds one place however many times it stops,
+// so an end past this is dropped and counted like a moment: what it bounds is the
+// goroutines a flood can leave parked on a publisher that is not coming back.
 const owedEnds = 64
 
 // emitFact queues an event whose node whatsmeow acknowledges only when the handler says
