@@ -1,9 +1,15 @@
 package store
 
 import (
+	"context"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"os"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 
 	"go.mau.fi/whatsmeow/store"
@@ -192,16 +198,81 @@ func TestEveryWriteIsFenced(t *testing.T) {
 	}
 }
 
-// zeroArgs is one zero value per parameter. What the write is called with does not matter:
-// the fence is asked before anything looks at them. A variadic method is called with none
-// of its variadic half, which is the same nothing by another spelling.
+// Every write a fence refuses is seen by the witness of the context it was made under, and
+// by no other. A write that skipped the witness would be one whose failure a history dump
+// could not see, and would be receipted without (#350).
+func TestEveryRefusedWriteIsWitnessed(t *testing.T) {
+	t.Parallel()
+
+	for _, group := range fenced {
+		t.Run(group.name, func(t *testing.T) {
+			t.Parallel()
+
+			for _, name := range group.writes {
+				t.Run(name, func(t *testing.T) {
+					t.Parallel()
+
+					fence := NewFence(held)
+					fence.Drop()
+					watched, writes := WatchWrites(t.Context())
+					_, elsewhere := WatchWrites(t.Context())
+
+					method := reflect.ValueOf(group.build(fence)).MethodByName(name)
+					args := zeroArgs(method.Type())
+					args[0] = reflect.ValueOf(watched)
+					method.Call(args)
+
+					if !errors.Is(writes.Err(), ErrNotOwned) {
+						t.Errorf("%s.%s was refused and its witness saw %v", group.name, name, writes.Err())
+					}
+					if elsewhere.Err() != nil {
+						t.Errorf("%s.%s was seen by the witness of another context", group.name, name)
+					}
+				})
+			}
+		})
+	}
+}
+
+type derivedKey struct{}
+
+// A witness keeps the first failure, and a write that went through is not one.
+func TestAWitnessKeepsTheFirstFailure(t *testing.T) {
+	t.Parallel()
+
+	ctx, writes := WatchWrites(t.Context())
+	if err := witnessed(ctx, nil); err != nil || writes.Err() != nil {
+		t.Fatalf("a write that went through was witnessed as %v", writes.Err())
+	}
+	first, second := errors.New("first"), errors.New("second")
+	if err := witnessed(ctx, first); !errors.Is(err, first) {
+		t.Fatalf("the error came back as %v", err)
+	}
+	witnessed(context.WithValue(ctx, derivedKey{}, 1), second)
+	if !errors.Is(writes.Err(), first) {
+		t.Fatalf("the witness kept %v, want the first failure", writes.Err())
+	}
+	if err := witnessed(t.Context(), second); !errors.Is(err, second) {
+		t.Fatalf("an unwatched write's error came back as %v", err)
+	}
+}
+
+// zeroArgs is one zero value per parameter, except the context, which no caller leaves nil
+// and which a refused write still hands its witness. What the write is called with does not
+// matter otherwise: the fence is asked before anything looks at them. A variadic method is
+// called with none of its variadic half, which is the same nothing by another spelling.
 func zeroArgs(signature reflect.Type) []reflect.Value {
 	fixed := signature.NumIn()
 	if signature.IsVariadic() {
 		fixed--
 	}
+	contextType := reflect.TypeFor[context.Context]()
 	args := make([]reflect.Value, 0, fixed)
 	for i := range fixed {
+		if signature.In(i) == contextType {
+			args = append(args, reflect.ValueOf(context.Background()))
+			continue
+		}
 		args = append(args, reflect.Zero(signature.In(i)))
 	}
 	return args
@@ -226,3 +297,78 @@ func TestAHeldFenceLetsAWriteThrough(t *testing.T) {
 // held is the arbiter for a test that is not about losing a lease: the session is this
 // instance's and stays that way, so what the fence refuses is what Drop refused.
 func held() bool { return true }
+
+// Every answer a fenced write gives goes through its witness: the refusal, which the test
+// above exercises for every write, and the store's own answer behind it, which no fake
+// here can make fail for all of them at once. A return that skipped `witnessed` is a write
+// whose failure a history dump would not see (#350).
+func TestEveryFencedAnswerGoesThroughTheWitness(t *testing.T) {
+	t.Parallel()
+
+	files := token.NewFileSet()
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("list the package: %v", err)
+	}
+	methods := 0
+	for _, entry := range entries {
+		if !strings.HasSuffix(entry.Name(), ".go") || strings.HasSuffix(entry.Name(), "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(files, entry.Name(), nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", entry.Name(), err)
+		}
+		for _, decl := range file.Decls {
+			method, ok := decl.(*ast.FuncDecl)
+			if !ok || method.Recv == nil || !strings.HasPrefix(receiverName(method), "fenced") || !method.Name.IsExported() {
+				continue
+			}
+			methods++
+			ast.Inspect(method.Body, func(node ast.Node) bool {
+				if _, nested := node.(*ast.FuncLit); nested {
+					return false
+				}
+				ret, ok := node.(*ast.ReturnStmt)
+				if !ok {
+					return true
+				}
+				if !answersThroughTheWitness(ret) {
+					t.Errorf("%s.%s answers at %s without telling the witness",
+						receiverName(method), method.Name.Name, files.Position(ret.Pos()))
+				}
+				return true
+			})
+		}
+	}
+	if methods != len(slices.Concat(writesOf()...)) {
+		t.Errorf("found %d fenced writes in the source, the table lists %d", methods, len(slices.Concat(writesOf()...)))
+	}
+}
+
+func answersThroughTheWitness(ret *ast.ReturnStmt) bool {
+	if len(ret.Results) == 0 {
+		return false
+	}
+	last, ok := ret.Results[len(ret.Results)-1].(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	name, ok := last.Fun.(*ast.Ident)
+	return ok && name.Name == "witnessed"
+}
+
+func receiverName(method *ast.FuncDecl) string {
+	if ident, ok := method.Recv.List[0].Type.(*ast.Ident); ok {
+		return ident.Name
+	}
+	return ""
+}
+
+func writesOf() [][]string {
+	all := make([][]string, 0, len(fenced))
+	for _, group := range fenced {
+		all = append(all, group.writes)
+	}
+	return all
+}

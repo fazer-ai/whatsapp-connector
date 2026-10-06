@@ -337,7 +337,12 @@ func (s *Session) handleDump(attempt dumpAttempt) bool {
 	// Stamped with the dump's own account, the way a command is: a logout during it
 	// rebuilds the session on another account, and the pairs in this dump are the old one's.
 	learning := context.WithValue(s.ctx, generationKey{}, generation)
-	dump, err := s.downloadHistory(ctx, client, notice)
+	// whatsmeow stores what it keeps of the dump inside the download and logs a failure to
+	// store it rather than returning one (#350), so the writes are watched here instead.
+	// The message secrets in a dump are sent once: receipted without them, a sealed reaction
+	// or correction to those messages can never be opened.
+	downloading, writes := store.WatchWrites(ctx)
+	dump, err := s.downloadHistory(downloading, client, notice)
 	var gone refused
 	switch {
 	case err != nil && errors.As(downloadFailure(err), &gone):
@@ -363,6 +368,12 @@ func (s *Session) handleDump(attempt dumpAttempt) bool {
 	case err != nil:
 		s.log.Warn().Str("error", redact(err.Error())).Str("message_id", id).
 			Msg("keeping for another attempt a history dump that did not download")
+		return false
+	case writes.Err() != nil:
+		// Before anything is published: the next attempt downloads the dump again and
+		// publishes it whole, and the client deduplicates.
+		s.log.Warn().Err(writes.Err()).Str("message_id", id).
+			Msg("keeping for another attempt a history dump whose keys could not be stored")
 		return false
 	}
 

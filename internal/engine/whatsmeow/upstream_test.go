@@ -73,6 +73,32 @@ var upstreamDefects = []upstreamDefect{
 		what:       "the storage step of a history download having no error to return",
 	},
 	{
+		issue: "fazer-ai/whatsapp-connector#350",
+		file:  "message.go",
+		// Not a defect. The storage step runs on the caller's context when it is asked to
+		// run synchronously, and every write in it is made under that context, which is
+		// the only way the witness `handleDump` puts on it sees a write fail. Run on a
+		// context of its own, or in the background, and a dump whose secrets were lost is
+		// receipted again with the suite green.
+		inOrder:   []string{"if synchronousStorage {", "doStorage(ctx)"},
+		enclosing: "func (cli *Client) DownloadHistorySync(",
+		what:      "the synchronous storage of a history dump running on the caller's context",
+		reliedOn:  true,
+		restingOn: "the write witness in internal/store/witness.go and its use in handleDump " +
+			"(internal/engine/whatsmeow/history.go), which hold back the receipt of a dump " +
+			"whose keys did not store",
+	},
+	{
+		issue:     "fazer-ai/whatsapp-connector#350",
+		file:      "message.go",
+		inOrder:   []string{"err := cli.Store.MsgSecrets.PutMessageSecrets(ctx, secrets)"},
+		enclosing: "func (cli *Client) storeHistoricalMessageSecrets(",
+		what:      "a history dump's message secrets being stored under the context the storage step was given",
+		reliedOn:  true,
+		restingOn: "the write witness in internal/store/witness.go and its use in handleDump " +
+			"(internal/engine/whatsmeow/history.go)",
+	},
+	{
 		issue: "fazer-ai/whatsapp-connector#283",
 		file:  "request.go",
 		// Not a defect. `retryFrame` watching the caller's context is the single reason a
