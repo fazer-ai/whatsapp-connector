@@ -760,9 +760,7 @@ func newSession(
 		disconnect: func(client *wm.Client) { client.Disconnect() },
 		nonce:      sessionNonce(),
 		logout:     func(ctx context.Context, client *wm.Client) error { return client.Logout(ctx) },
-		download: func(ctx context.Context, client *wm.Client, part wm.DownloadableMessage, file media.File) error {
-			return client.DownloadToFile(ctx, part, file) //nolint:wrapcheck // classified by downloadFailure, which needs the sentinels
-		},
+		download:   downloadOverClient,
 		retrieve: func(ctx context.Context, address string, headers map[string]string) (source, error) {
 			return retrieveOverHTTP(ctx, address, headers, blobs.FetchHosts)
 		},
