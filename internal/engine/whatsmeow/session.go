@@ -310,9 +310,9 @@ type Session struct {
 	board    map[string]posted
 	boardMu  sync.Mutex
 	boardSeq int64
-	// owedPlaces is the place each chat has waiting for room off the dispatch (owePlace), by the
-	// seq its marker carries, until that marker is resolved. Guarded by boardMu.
-	owedPlaces map[string]int64
+	// owedPlaces is the place each chat has waiting for room off the dispatch (owePlace),
+	// until that marker is resolved. Guarded by boardMu.
+	owedPlaces map[string]owedPlace
 
 	// availability is the last presence WhatsApp took from this account, and nil while
 	// the client has asked for none. It is kept because WhatsApp forgets it when the
@@ -856,7 +856,7 @@ func newSession(
 		presenceWait:        presenceWriteTimeout,
 		callWait:            callWriteTimeout,
 		board:               make(map[string]posted),
-		owedPlaces:          make(map[string]int64),
+		owedPlaces:          make(map[string]owedPlace),
 		downloadWait:        downloadTimeout,
 		historyBudget:       historyBudget,
 		historyReceiptWait:  historyReceiptTimeout,
@@ -3947,6 +3947,13 @@ type pending struct {
 // so does the callback the publisher owes it, so both can tell that the chat has moved on
 // since. `sent` says the marker has already been resolved. `retried` is what makes the
 // retry one more go rather than a loop.
+// owedPlace is a marker owePlace has waiting for room, and the connection its state was
+// reported on.
+type owedPlace struct {
+	seq         int64
+	transitions int64
+}
+
 type posted struct {
 	emission engine.Emission
 	seq      int64
@@ -4098,11 +4105,14 @@ func (s *Session) post(key string, eventType protocol.EventType, payload any, li
 // takes the waiting marker's place on the board, so a burst through a stall is one slot
 // and one event, the last one. That place is the chat's only until the marker is resolved
 // (resolve forgets it): after that it has been published, and a state reusing it would
-// have nothing coming to publish it.
+// have nothing coming to publish it. And only for a state from the same connection: the
+// marker may already be in the inbox with the session's own events behind it, and a state
+// from the connection after a drop, put in its place, would be published ahead of the
+// drop that a client clears presence on.
 func (s *Session) owePlace(key string, entry *posted, eventType protocol.EventType) {
-	if seq, waiting := s.owedPlaces[key]; waiting {
-		entry.seq = seq
-		entry.emission.Settle = s.settled(key, seq)
+	if place, waiting := s.owedPlaces[key]; waiting && place.transitions == entry.transitions {
+		entry.seq = place.seq
+		entry.emission.Settle = s.settled(key, place.seq)
 		s.board[key] = *entry
 		return
 	}
@@ -4115,7 +4125,7 @@ func (s *Session) owePlace(key string, entry *posted, eventType protocol.EventTy
 		return
 	}
 	s.board[key] = *entry
-	s.owedPlaces[key] = entry.seq
+	s.owedPlaces[key] = owedPlace{seq: entry.seq, transitions: entry.transitions}
 	marker := pending{key: key, seq: entry.seq}
 	depth := len(s.inbox)
 	go func() {
@@ -4137,7 +4147,7 @@ func (s *Session) owePlace(key string, entry *posted, eventType protocol.EventTy
 func (s *Session) resolve(key string, seq int64) (engine.Emission, bool) {
 	s.boardMu.Lock()
 	defer s.boardMu.Unlock()
-	if s.owedPlaces[key] == seq {
+	if s.owedPlaces[key].seq == seq {
 		delete(s.owedPlaces, key)
 	}
 	entry, waiting := s.board[key]
