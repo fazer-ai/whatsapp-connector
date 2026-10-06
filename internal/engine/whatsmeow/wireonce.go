@@ -54,7 +54,8 @@ func (s *Session) onThisConnection(ctx context.Context, write func(context.Conte
 		return err
 	}
 	var disconnected *wm.DisconnectedError
-	if !errors.As(err, &disconnected) && !(bound.Err() != nil && errors.Is(err, context.Canceled)) {
+	cut := bound.Err() != nil && errors.Is(err, context.Canceled)
+	if !cut && !errors.As(err, &disconnected) {
 		return err
 	}
 	s.log.Debug().Err(err).Msg("a group write lost its connection before WhatsApp answered it")

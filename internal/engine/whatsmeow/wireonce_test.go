@@ -104,6 +104,33 @@ func (w *wsWire) cut(index int) {
 	_ = conn.CloseNow()
 }
 
+// release drops every connection from the server's side and waits until the client has
+// let go of its socket.
+func (w *wsWire) release(client *wm.Client) {
+	w.mu.Lock()
+	conns := append([]*websocket.Conn(nil), w.conns...)
+	w.mu.Unlock()
+	for _, conn := range conns {
+		_ = conn.CloseNow()
+	}
+	value := reflect.ValueOf(client).Elem()
+	lock := (*sync.RWMutex)(unsafe.Pointer(value.FieldByName("socketLock").UnsafeAddr()))
+	socket := (**waSocket.NoiseSocket)(unsafe.Pointer(value.FieldByName("socket").UnsafeAddr()))
+	for deadline := time.Now().Add(5 * time.Second); ; {
+		lock.RLock()
+		held := *socket != nil
+		lock.RUnlock()
+		if !held {
+			return
+		}
+		if time.Now().After(deadline) {
+			w.t.Error("the client never let go of the socket")
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 // adopt opens a connection to the wsWire and makes it the client's socket, logged in.
 //
 // The handshake a real connection goes through ends by assigning `cli.socket` and, once
@@ -159,11 +186,12 @@ func wiredSession(t *testing.T) (*Session, *wsWire) {
 	}
 	w := newWire(t)
 	w.adopt(t.Context(), client)
-	// Registered after the wire, so it runs before the wire closes: the client lets go of the
-	// socket first. The other order has the server's close reach the read pump while the
-	// session's own Close stops the socket, which is whatsmeow's race of #207 and nothing to
-	// do with this test.
-	t.Cleanup(client.Disconnect)
+	// Registered after the wire and the session, so it runs before either closes. The socket
+	// goes from the server's side and the test waits for whatsmeow to let go of it, because
+	// every other way of taking it down has a `Stop` writing the socket's disconnect handler
+	// while the read pump's `Close` reads it, which is whatsmeow's race of #207 and nothing
+	// to do with this test.
+	t.Cleanup(func() { w.release(client) })
 	session.setConnected(true)
 	return session, w
 }
