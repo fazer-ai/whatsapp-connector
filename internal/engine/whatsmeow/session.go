@@ -2878,12 +2878,8 @@ func (s *Session) forgetOwedReset() {
 //
 // Counted rather than flagged, because the count is what the takedown already judges by, and
 // counting twice for one drop costs nothing: every reader compares it against a snapshot.
-//
-// It also ends the line the group writes in flight went out on, so that whatsmeow does not
-// send them again on the connection that replaces it (#180).
 func (s *Session) dropped() {
 	s.transitions.Add(1)
-	s.cutLine()
 }
 
 // cancelOwedReset drops a takedown that was still waiting for a command to be answered, and
@@ -4852,6 +4848,14 @@ func (s *Session) handle(rawEvent any) bool {
 		// launched from here on stand down, whether the debt was forgotten or claimed.
 		s.dropped()
 		s.forgetOwedReset()
+		// The group writes in flight went out on the connection that went, and whatsmeow
+		// sends each of them again on the one that replaces it unless this ends them first
+		// (#180). Not for a drop the replacement has already overtaken: the writes running
+		// now are the replacement's, and the ones that were the old socket's were resent
+		// before a drop this late could have stopped them anyway.
+		if !s.dropWasOvertaken(dispatched) {
+			s.cutLine()
+		}
 
 		s.transition.Lock()
 		defer s.transition.Unlock()

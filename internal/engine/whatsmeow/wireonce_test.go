@@ -18,6 +18,7 @@ import (
 	waBinary "go.mau.fi/whatsmeow/binary"
 	waSocket "go.mau.fi/whatsmeow/socket"
 	waTypes "go.mau.fi/whatsmeow/types"
+	waEvents "go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/engine"
@@ -497,5 +498,36 @@ func TestAGroupWriteTheCallerAbandonedIsNotHeldForTheDrop(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("an abandoned write never answered")
+	}
+}
+
+// A drop the replacement connection has already overtaken is about a socket that is gone,
+// and the writes running now went out on the replacement: they are left alone.
+func TestAStaleDropLeavesTheReplacementsWritesAlone(t *testing.T) {
+	t.Parallel()
+
+	session, w := wiredSession(t)
+	done := make(chan answered, 1)
+	go func() {
+		result, err := session.Execute(t.Context(), setCommand(t, groupWrites[4].kind, groupWrites[4].payload))
+		done <- answered{result, err}
+	}()
+	if _, ok := w.nextFrame(5 * time.Second); !ok {
+		t.Fatal("the write never reached the wire")
+	}
+	// The replacement announced itself after the drop was dispatched: whatsmeow hands the
+	// two to different goroutines, and this is the order in which the drop arrives late.
+	session.setConnectedAt(true, time.Now().Add(time.Hour))
+	session.handle(&waEvents.Disconnected{})
+	if w.answer(session.current(), resultFor) != 1 {
+		t.Fatal("the write was not waiting for its answer")
+	}
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Errorf("a write on the replacement answered %v after a stale drop, want ok", got.err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the write never answered")
 	}
 }

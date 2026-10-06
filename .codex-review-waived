@@ -582,3 +582,4 @@ internal/engine/whatsmeow/call.go: Keep call publication from blocking subsequen
 # stream, which reaches the owner; a queue of 128 commands is a client actively driving the session.
 internal/session/manager.go: Preserve the connect retry when another instance claims the wake  # PR#314
 internal/session/manager.go: Deliver wake retries to the existing owner  # PR#314
+internal/engine/whatsmeow/wireonce.go: Distinguish pre-send cancellation from an unanswered write  # PR#371
