@@ -5141,6 +5141,13 @@ func (s *Session) handle(rawEvent any) bool {
 		// without being written down is gone for good.
 		return s.joinedAGroup(event)
 	case *waEvents.GroupInfo:
+		// Whatever the change, the group's addressing is read again the next time it is
+		// needed. Nothing announces a move from phone numbers to LIDs, but a notification
+		// about the group is the one signal there is that it changed, a child whatsmeow
+		// could not parse included, and without this a reading lasted until the next
+		// reconnection (#125). Before the filters below: what this session remembers is
+		// used by commands, whether or not the client asked to hear about groups.
+		s.forgetGroupMode(event.JID)
 		// The other: a change that could not be queued is not acknowledged, and comes
 		// again (#221).
 		return s.groupChanged(event)
