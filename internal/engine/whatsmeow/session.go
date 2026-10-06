@@ -4305,9 +4305,10 @@ func (s *Session) offer(emission *engine.Emission, payload any, wait time.Durati
 			began := time.Now()
 			select {
 			case s.inbox <- waiting:
+				s.queued(time.Since(began), depth)
 			case <-s.done:
+				s.queued(time.Since(began), depth)
 			}
-			s.queued(time.Since(began), depth)
 		}()
 		return true
 	}
