@@ -112,6 +112,10 @@ func Fenced(device *store.Device, fence *Fence) *store.Device {
 // through, and overrides every method that writes. Embedding is what keeps this to the
 // writes; `TestEveryWriteIsFenced` is what stops a write added by a later whatsmeow
 // passing through with them.
+//
+// Every answer one of them gives, the refusal and the store's own, goes through
+// `witnessed`, which is how a caller whatsmeow does not tell learns that a write failed
+// (see Writes).
 
 type fencedIdentities struct {
 	store.IdentityStore
@@ -120,23 +124,23 @@ type fencedIdentities struct {
 
 func (f fencedIdentities) PutIdentity(ctx context.Context, address string, key [32]byte) error {
 	if err := f.fence.held(); err != nil {
-		return err
+		return witnessed(ctx, err)
 	}
-	return f.IdentityStore.PutIdentity(ctx, address, key)
+	return witnessed(ctx, f.IdentityStore.PutIdentity(ctx, address, key))
 }
 
 func (f fencedIdentities) DeleteAllIdentities(ctx context.Context, phone string) error {
 	if err := f.fence.held(); err != nil {
-		return err
+		return witnessed(ctx, err)
 	}
-	return f.IdentityStore.DeleteAllIdentities(ctx, phone)
+	return witnessed(ctx, f.IdentityStore.DeleteAllIdentities(ctx, phone))
 }
 
 func (f fencedIdentities) DeleteIdentity(ctx context.Context, address string) error {
 	if err := f.fence.held(); err != nil {
-		return err
+		return witnessed(ctx, err)
 	}
-	return f.IdentityStore.DeleteIdentity(ctx, address)
+	return witnessed(ctx, f.IdentityStore.DeleteIdentity(ctx, address))
 }
 
 type fencedSessions struct {
@@ -146,37 +150,37 @@ type fencedSessions struct {
 
 func (f fencedSessions) PutSession(ctx context.Context, address string, session []byte) error {
 	if err := f.fence.held(); err != nil {
-		return err
+		return witnessed(ctx, err)
 	}
-	return f.SessionStore.PutSession(ctx, address, session)
+	return witnessed(ctx, f.SessionStore.PutSession(ctx, address, session))
 }
 
 func (f fencedSessions) PutManySessions(ctx context.Context, sessions map[string][]byte) error {
 	if err := f.fence.held(); err != nil {
-		return err
+		return witnessed(ctx, err)
 	}
-	return f.SessionStore.PutManySessions(ctx, sessions)
+	return witnessed(ctx, f.SessionStore.PutManySessions(ctx, sessions))
 }
 
 func (f fencedSessions) DeleteAllSessions(ctx context.Context, phone string) error {
 	if err := f.fence.held(); err != nil {
-		return err
+		return witnessed(ctx, err)
 	}
-	return f.SessionStore.DeleteAllSessions(ctx, phone)
+	return witnessed(ctx, f.SessionStore.DeleteAllSessions(ctx, phone))
 }
 
 func (f fencedSessions) DeleteSession(ctx context.Context, address string) error {
 	if err := f.fence.held(); err != nil {
-		return err
+		return witnessed(ctx, err)
 	}
-	return f.SessionStore.DeleteSession(ctx, address)
+	return witnessed(ctx, f.SessionStore.DeleteSession(ctx, address))
 }
 
 func (f fencedSessions) MigratePNToLID(ctx context.Context, pn, lid types.JID) error {
 	if err := f.fence.held(); err != nil {
-		return err
+		return witnessed(ctx, err)
 	}
-	return f.SessionStore.MigratePNToLID(ctx, pn, lid)
+	return witnessed(ctx, f.SessionStore.MigratePNToLID(ctx, pn, lid))
 }
 
 type fencedPreKeys struct {
@@ -190,30 +194,32 @@ type fencedPreKeys struct {
 
 func (f fencedPreKeys) GetOrGenPreKeys(ctx context.Context, count uint32) ([]*keys.PreKey, error) {
 	if err := f.fence.held(); err != nil {
-		return nil, err
+		return nil, witnessed(ctx, err)
 	}
-	return f.PreKeyStore.GetOrGenPreKeys(ctx, count)
+	generated, err := f.PreKeyStore.GetOrGenPreKeys(ctx, count)
+	return generated, witnessed(ctx, err)
 }
 
 func (f fencedPreKeys) GenOnePreKey(ctx context.Context) (*keys.PreKey, error) {
 	if err := f.fence.held(); err != nil {
-		return nil, err
+		return nil, witnessed(ctx, err)
 	}
-	return f.PreKeyStore.GenOnePreKey(ctx)
+	key, err := f.PreKeyStore.GenOnePreKey(ctx)
+	return key, witnessed(ctx, err)
 }
 
 func (f fencedPreKeys) RemovePreKey(ctx context.Context, id uint32) error {
 	if err := f.fence.held(); err != nil {
-		return err
+		return witnessed(ctx, err)
 	}
-	return f.PreKeyStore.RemovePreKey(ctx, id)
+	return witnessed(ctx, f.PreKeyStore.RemovePreKey(ctx, id))
 }
 
 func (f fencedPreKeys) MarkPreKeysAsUploaded(ctx context.Context, upToID uint32) error {
 	if err := f.fence.held(); err != nil {
-		return err
+		return witnessed(ctx, err)
 	}
-	return f.PreKeyStore.MarkPreKeysAsUploaded(ctx, upToID)
+	return witnessed(ctx, f.PreKeyStore.MarkPreKeysAsUploaded(ctx, upToID))
 }
 
 type fencedSenderKeys struct {
@@ -223,9 +229,9 @@ type fencedSenderKeys struct {
 
 func (f fencedSenderKeys) PutSenderKey(ctx context.Context, group, user string, session []byte) error {
 	if err := f.fence.held(); err != nil {
-		return err
+		return witnessed(ctx, err)
 	}
-	return f.SenderKeyStore.PutSenderKey(ctx, group, user, session)
+	return witnessed(ctx, f.SenderKeyStore.PutSenderKey(ctx, group, user, session))
 }
 
 type fencedAppStateKeys struct {
@@ -235,9 +241,9 @@ type fencedAppStateKeys struct {
 
 func (f fencedAppStateKeys) PutAppStateSyncKey(ctx context.Context, id []byte, key store.AppStateSyncKey) error {
 	if err := f.fence.held(); err != nil {
-		return err
+		return witnessed(ctx, err)
 	}
-	return f.AppStateSyncKeyStore.PutAppStateSyncKey(ctx, id, key)
+	return witnessed(ctx, f.AppStateSyncKeyStore.PutAppStateSyncKey(ctx, id, key))
 }
 
 type fencedAppState struct {
@@ -248,30 +254,30 @@ type fencedAppState struct {
 //nolint:gocritic // the signature is whatsmeow's AppStateStore; a pointer would not implement it
 func (f fencedAppState) PutAppStateVersion(ctx context.Context, name string, version uint64, hash [128]byte) error {
 	if err := f.fence.held(); err != nil {
-		return err
+		return witnessed(ctx, err)
 	}
-	return f.AppStateStore.PutAppStateVersion(ctx, name, version, hash)
+	return witnessed(ctx, f.AppStateStore.PutAppStateVersion(ctx, name, version, hash))
 }
 
 func (f fencedAppState) DeleteAppStateVersion(ctx context.Context, name string) error {
 	if err := f.fence.held(); err != nil {
-		return err
+		return witnessed(ctx, err)
 	}
-	return f.AppStateStore.DeleteAppStateVersion(ctx, name)
+	return witnessed(ctx, f.AppStateStore.DeleteAppStateVersion(ctx, name))
 }
 
 func (f fencedAppState) PutAppStateMutationMACs(ctx context.Context, name string, version uint64, mutations []store.AppStateMutationMAC) error {
 	if err := f.fence.held(); err != nil {
-		return err
+		return witnessed(ctx, err)
 	}
-	return f.AppStateStore.PutAppStateMutationMACs(ctx, name, version, mutations)
+	return witnessed(ctx, f.AppStateStore.PutAppStateMutationMACs(ctx, name, version, mutations))
 }
 
 func (f fencedAppState) DeleteAppStateMutationMACs(ctx context.Context, name string, indexMACs [][]byte) error {
 	if err := f.fence.held(); err != nil {
-		return err
+		return witnessed(ctx, err)
 	}
-	return f.AppStateStore.DeleteAppStateMutationMACs(ctx, name, indexMACs)
+	return witnessed(ctx, f.AppStateStore.DeleteAppStateMutationMACs(ctx, name, indexMACs))
 }
 
 type fencedContacts struct {
@@ -281,37 +287,39 @@ type fencedContacts struct {
 
 func (f fencedContacts) PutPushName(ctx context.Context, user types.JID, pushName string) (changed bool, previous string, err error) {
 	if err := f.fence.held(); err != nil {
-		return false, "", err
+		return false, "", witnessed(ctx, err)
 	}
-	return f.ContactStore.PutPushName(ctx, user, pushName)
+	changed, previous, err = f.ContactStore.PutPushName(ctx, user, pushName)
+	return changed, previous, witnessed(ctx, err)
 }
 
 func (f fencedContacts) PutBusinessName(ctx context.Context, user types.JID, businessName string) (changed bool, previous string, err error) {
 	if err := f.fence.held(); err != nil {
-		return false, "", err
+		return false, "", witnessed(ctx, err)
 	}
-	return f.ContactStore.PutBusinessName(ctx, user, businessName)
+	changed, previous, err = f.ContactStore.PutBusinessName(ctx, user, businessName)
+	return changed, previous, witnessed(ctx, err)
 }
 
 func (f fencedContacts) PutContactName(ctx context.Context, user types.JID, fullName, firstName string) error {
 	if err := f.fence.held(); err != nil {
-		return err
+		return witnessed(ctx, err)
 	}
-	return f.ContactStore.PutContactName(ctx, user, fullName, firstName)
+	return witnessed(ctx, f.ContactStore.PutContactName(ctx, user, fullName, firstName))
 }
 
 func (f fencedContacts) PutAllContactNames(ctx context.Context, contacts []store.ContactEntry) error {
 	if err := f.fence.held(); err != nil {
-		return err
+		return witnessed(ctx, err)
 	}
-	return f.ContactStore.PutAllContactNames(ctx, contacts)
+	return witnessed(ctx, f.ContactStore.PutAllContactNames(ctx, contacts))
 }
 
 func (f fencedContacts) PutManyRedactedPhones(ctx context.Context, entries []store.RedactedPhoneEntry) error {
 	if err := f.fence.held(); err != nil {
-		return err
+		return witnessed(ctx, err)
 	}
-	return f.ContactStore.PutManyRedactedPhones(ctx, entries)
+	return witnessed(ctx, f.ContactStore.PutManyRedactedPhones(ctx, entries))
 }
 
 type fencedChatSettings struct {
@@ -321,23 +329,23 @@ type fencedChatSettings struct {
 
 func (f fencedChatSettings) PutMutedUntil(ctx context.Context, chat types.JID, mutedUntil time.Time) error {
 	if err := f.fence.held(); err != nil {
-		return err
+		return witnessed(ctx, err)
 	}
-	return f.ChatSettingsStore.PutMutedUntil(ctx, chat, mutedUntil)
+	return witnessed(ctx, f.ChatSettingsStore.PutMutedUntil(ctx, chat, mutedUntil))
 }
 
 func (f fencedChatSettings) PutPinned(ctx context.Context, chat types.JID, pinned bool) error {
 	if err := f.fence.held(); err != nil {
-		return err
+		return witnessed(ctx, err)
 	}
-	return f.ChatSettingsStore.PutPinned(ctx, chat, pinned)
+	return witnessed(ctx, f.ChatSettingsStore.PutPinned(ctx, chat, pinned))
 }
 
 func (f fencedChatSettings) PutArchived(ctx context.Context, chat types.JID, archived bool) error {
 	if err := f.fence.held(); err != nil {
-		return err
+		return witnessed(ctx, err)
 	}
-	return f.ChatSettingsStore.PutArchived(ctx, chat, archived)
+	return witnessed(ctx, f.ChatSettingsStore.PutArchived(ctx, chat, archived))
 }
 
 type fencedMsgSecrets struct {
@@ -347,16 +355,16 @@ type fencedMsgSecrets struct {
 
 func (f fencedMsgSecrets) PutMessageSecrets(ctx context.Context, inserts []store.MessageSecretInsert) error {
 	if err := f.fence.held(); err != nil {
-		return err
+		return witnessed(ctx, err)
 	}
-	return f.MsgSecretStore.PutMessageSecrets(ctx, inserts)
+	return witnessed(ctx, f.MsgSecretStore.PutMessageSecrets(ctx, inserts))
 }
 
 func (f fencedMsgSecrets) PutMessageSecret(ctx context.Context, chat, sender types.JID, id types.MessageID, secret []byte) error {
 	if err := f.fence.held(); err != nil {
-		return err
+		return witnessed(ctx, err)
 	}
-	return f.MsgSecretStore.PutMessageSecret(ctx, chat, sender, id, secret)
+	return witnessed(ctx, f.MsgSecretStore.PutMessageSecret(ctx, chat, sender, id, secret))
 }
 
 type fencedPrivacyTokens struct {
@@ -366,16 +374,17 @@ type fencedPrivacyTokens struct {
 
 func (f fencedPrivacyTokens) PutPrivacyTokens(ctx context.Context, tokens ...store.PrivacyToken) error {
 	if err := f.fence.held(); err != nil {
-		return err
+		return witnessed(ctx, err)
 	}
-	return f.PrivacyTokenStore.PutPrivacyTokens(ctx, tokens...)
+	return witnessed(ctx, f.PrivacyTokenStore.PutPrivacyTokens(ctx, tokens...))
 }
 
 func (f fencedPrivacyTokens) DeleteExpiredPrivacyTokens(ctx context.Context, cutoff time.Time) (int64, error) {
 	if err := f.fence.held(); err != nil {
-		return 0, err
+		return 0, witnessed(ctx, err)
 	}
-	return f.PrivacyTokenStore.DeleteExpiredPrivacyTokens(ctx, cutoff)
+	n, err := f.PrivacyTokenStore.DeleteExpiredPrivacyTokens(ctx, cutoff)
+	return n, witnessed(ctx, err)
 }
 
 type fencedNCTSalt struct {
@@ -385,16 +394,16 @@ type fencedNCTSalt struct {
 
 func (f fencedNCTSalt) PutNCTSalt(ctx context.Context, salt []byte) error {
 	if err := f.fence.held(); err != nil {
-		return err
+		return witnessed(ctx, err)
 	}
-	return f.NCTSaltStore.PutNCTSalt(ctx, salt)
+	return witnessed(ctx, f.NCTSaltStore.PutNCTSalt(ctx, salt))
 }
 
 func (f fencedNCTSalt) DeleteNCTSalt(ctx context.Context) error {
 	if err := f.fence.held(); err != nil {
-		return err
+		return witnessed(ctx, err)
 	}
-	return f.NCTSaltStore.DeleteNCTSalt(ctx)
+	return witnessed(ctx, f.NCTSaltStore.DeleteNCTSalt(ctx))
 }
 
 type fencedEventBuffer struct {
@@ -404,9 +413,9 @@ type fencedEventBuffer struct {
 
 func (f fencedEventBuffer) PutBufferedEvent(ctx context.Context, ciphertextHash [32]byte, plaintext []byte, serverTimestamp time.Time) error {
 	if err := f.fence.held(); err != nil {
-		return err
+		return witnessed(ctx, err)
 	}
-	return f.EventBuffer.PutBufferedEvent(ctx, ciphertextHash, plaintext, serverTimestamp)
+	return witnessed(ctx, f.EventBuffer.PutBufferedEvent(ctx, ciphertextHash, plaintext, serverTimestamp))
 }
 
 // DoDecryptionTxn runs its callback inside a transaction, and what that callback does is
@@ -415,37 +424,37 @@ func (f fencedEventBuffer) PutBufferedEvent(ctx context.Context, ciphertextHash 
 // no longer runs.
 func (f fencedEventBuffer) DoDecryptionTxn(ctx context.Context, fn func(context.Context) error) error {
 	if err := f.fence.held(); err != nil {
-		return err
+		return witnessed(ctx, err)
 	}
-	return f.EventBuffer.DoDecryptionTxn(ctx, fn)
+	return witnessed(ctx, f.EventBuffer.DoDecryptionTxn(ctx, fn))
 }
 
 func (f fencedEventBuffer) ClearBufferedEventPlaintext(ctx context.Context, ciphertextHash [32]byte) error {
 	if err := f.fence.held(); err != nil {
-		return err
+		return witnessed(ctx, err)
 	}
-	return f.EventBuffer.ClearBufferedEventPlaintext(ctx, ciphertextHash)
+	return witnessed(ctx, f.EventBuffer.ClearBufferedEventPlaintext(ctx, ciphertextHash))
 }
 
 func (f fencedEventBuffer) DeleteOldBufferedHashes(ctx context.Context) error {
 	if err := f.fence.held(); err != nil {
-		return err
+		return witnessed(ctx, err)
 	}
-	return f.EventBuffer.DeleteOldBufferedHashes(ctx)
+	return witnessed(ctx, f.EventBuffer.DeleteOldBufferedHashes(ctx))
 }
 
 func (f fencedEventBuffer) AddOutgoingEvent(ctx context.Context, chatJID types.JID, id types.MessageID, format string, plaintext []byte) error {
 	if err := f.fence.held(); err != nil {
-		return err
+		return witnessed(ctx, err)
 	}
-	return f.EventBuffer.AddOutgoingEvent(ctx, chatJID, id, format, plaintext)
+	return witnessed(ctx, f.EventBuffer.AddOutgoingEvent(ctx, chatJID, id, format, plaintext))
 }
 
 func (f fencedEventBuffer) DeleteOldOutgoingEvents(ctx context.Context) error {
 	if err := f.fence.held(); err != nil {
-		return err
+		return witnessed(ctx, err)
 	}
-	return f.EventBuffer.DeleteOldOutgoingEvents(ctx)
+	return witnessed(ctx, f.EventBuffer.DeleteOldOutgoingEvents(ctx))
 }
 
 type fencedLIDs struct {
@@ -455,16 +464,16 @@ type fencedLIDs struct {
 
 func (f fencedLIDs) PutManyLIDMappings(ctx context.Context, mappings []store.LIDMapping) error {
 	if err := f.fence.held(); err != nil {
-		return err
+		return witnessed(ctx, err)
 	}
-	return f.LIDStore.PutManyLIDMappings(ctx, mappings)
+	return witnessed(ctx, f.LIDStore.PutManyLIDMappings(ctx, mappings))
 }
 
 func (f fencedLIDs) PutLIDMapping(ctx context.Context, lid, jid types.JID) error {
 	if err := f.fence.held(); err != nil {
-		return err
+		return witnessed(ctx, err)
 	}
-	return f.LIDStore.PutLIDMapping(ctx, lid, jid)
+	return witnessed(ctx, f.LIDStore.PutLIDMapping(ctx, lid, jid))
 }
 
 type fencedContainer struct {
@@ -486,19 +495,19 @@ type fencedContainer struct {
 // a fence on every write the device ever makes.
 func (f fencedContainer) PutDevice(ctx context.Context, device *store.Device) error {
 	if err := f.fence.held(); err != nil {
-		return err
+		return witnessed(ctx, err)
 	}
 	fresh := !device.Initialized
 	err := f.DeviceContainer.PutDevice(ctx, device)
 	if fresh && device.Initialized {
 		Fenced(device, f.fence)
 	}
-	return err
+	return witnessed(ctx, err)
 }
 
 func (f fencedContainer) DeleteDevice(ctx context.Context, device *store.Device) error {
 	if err := f.fence.held(); err != nil {
-		return err
+		return witnessed(ctx, err)
 	}
-	return f.DeviceContainer.DeleteDevice(ctx, device)
+	return witnessed(ctx, f.DeviceContainer.DeleteDevice(ctx, device))
 }
