@@ -107,6 +107,12 @@ func (e *engine) maybeStartMedia(callID string) {
 	}()
 }
 
+// relayConnectGrace is how long the other relays get to finish connecting once
+// the first one is up. A relay handshake completes in well under a second when
+// the relay is reachable, so this costs nothing on a healthy call and bounds what
+// an unreachable one costs.
+const relayConnectGrace = 2 * time.Second
+
 // connectAndAllocateAll opens a relay DataChannel and sends the STUN allocate
 // on every usable relay in the offer, returning them as one fanout. Phones run
 // client relay election shortly after accept and migrate their media to the
@@ -139,19 +145,68 @@ func (e *engine) connectAndAllocateAll(ctx context.Context, rd *relayData, strea
 		}
 	}
 
+	// Every relay is dialled at once, and the fanout starts once the first one is
+	// up and the others had relayConnectGrace to join. Dialled one after the
+	// other, a relay that blackholes its handshake held the call for the whole
+	// connect timeout before any media flowed, once per such relay.
+	type dialed struct {
+		i        int
+		ch       *relay.RelayMediaChannel
+		allocate []byte
+		err      error
+	}
+	results := make(chan dialed, len(targets))
+	for i, ep := range targets {
+		go func() {
+			ch, allocate, err := e.connectOneRelay(ctx, rd, ep, streamSsrcs)
+			results <- dialed{i, ch, allocate, err}
+		}()
+	}
+	got := make([]*dialed, len(targets))
+	pending := len(targets)
+	var grace <-chan time.Time
+collect:
+	for pending > 0 {
+		select {
+		case r := <-results:
+			pending--
+			got[r.i] = &r
+			if r.err == nil && grace == nil {
+				grace = time.After(relayConnectGrace)
+			}
+		case <-grace:
+			break collect
+		}
+	}
+	if pending > 0 {
+		// Late arrivals are not part of this fanout; whatever connects after the
+		// grace is closed rather than leaked.
+		go func(n int) {
+			for ; n > 0; n-- {
+				if r := <-results; r.err == nil {
+					_ = r.ch.Close()
+				}
+			}
+		}(pending)
+	}
+
 	var chans []*relay.RelayMediaChannel
 	var allocs [][]byte
 	var names []string
-	for _, ep := range targets {
-		ch, allocate, err := e.connectOneRelay(ctx, rd, ep, streamSsrcs)
-		if err != nil {
-			// Secondary relays failing is survivable; the primary failing with
-			// no fallback is not.
-			e.c.log.Warn().Err(err).Str("relay_name", ep.relayName).Msg("relay connect failed; continuing without it")
+	for i, ep := range targets {
+		r := got[i]
+		if r == nil {
+			e.c.log.Warn().Str("relay_name", ep.relayName).Msg("relay still connecting after the grace; continuing without it")
 			continue
 		}
-		chans = append(chans, ch)
-		allocs = append(allocs, allocate)
+		if r.err != nil {
+			// Secondary relays failing is survivable; the primary failing with
+			// no fallback is not.
+			e.c.log.Warn().Err(r.err).Str("relay_name", ep.relayName).Msg("relay connect failed; continuing without it")
+			continue
+		}
+		chans = append(chans, r.ch)
+		allocs = append(allocs, r.allocate)
 		names = append(names, ep.relayName)
 	}
 	if len(chans) == 0 {
