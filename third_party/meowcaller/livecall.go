@@ -21,7 +21,9 @@ type Call struct {
 	player                    *Player
 	sink                      AudioSink
 	onReady                   func()
-	readyClaimed              bool // OnReady was fired; see claimReady
+	readyClaimed              bool     // OnReady was queued; see claimReady
+	notifyQ                   []func() // OnReady/OnEnd waiting to run, in order; see deliver
+	delivering                bool     // a goroutine is draining notifyQ
 	onEnd                     func(reason string)
 	onState                   func(CallPhase)
 	onPeerAccept              func()

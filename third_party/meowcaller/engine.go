@@ -139,25 +139,61 @@ func (e *engine) requireRawCallAdapter() error {
 	return nil
 }
 
-// onEndFn returns the Call's OnEnd listener under its lock (the field is unexported
-// and guarded by Call.mu; same-package engine code reads it through here).
-func (c *Call) onEndFn() func(string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.onEnd
-}
-
-// claimReady returns the OnReady listener if the call is Active and readiness was
-// not claimed before, and marks it claimed; nil otherwise. Ended is set under the
-// same lock, so a claim cannot succeed once the call has ended.
-func (c *Call) claimReady() func() {
+// claimReady queues the OnReady listener if the call is Active and readiness was
+// not claimed before, and reports whether it did. The check and the queueing
+// happen under c.mu, the lock Ended is set under, and endAndNotify queues OnEnd
+// only after setting Ended, so a claim that succeeds is always queued ahead of
+// OnEnd and one attempted after the call ended fails. The caller runs deliver.
+func (c *Call) claimReady() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.phase != CallPhaseActive || c.readyClaimed {
-		return nil
+		return false
 	}
 	c.readyClaimed = true
-	return c.onReady
+	if fn := c.onReady; fn != nil {
+		c.notifyQ = append(c.notifyQ, fn)
+	}
+	return true
+}
+
+// endAndNotify moves the call to Ended and delivers OnEnd after anything queued
+// before it, OnReady included.
+func (c *Call) endAndNotify(reason string) {
+	c.setPhase(CallPhaseEnded)
+	c.mu.Lock()
+	if fn := c.onEnd; fn != nil {
+		c.notifyQ = append(c.notifyQ, func() { fn(reason) })
+	}
+	c.mu.Unlock()
+	c.deliver()
+}
+
+// deliver runs queued notifications one at a time, in queue order, without
+// holding c.mu. Whoever finds the queue idle drains it; a notification queued
+// meanwhile, by another goroutine or by a callback (which may hang up from
+// OnReady), runs after the ones ahead of it instead of interleaving with them.
+func (c *Call) deliver() {
+	c.mu.Lock()
+	if c.delivering {
+		c.mu.Unlock()
+		return
+	}
+	c.delivering = true
+	defer func() {
+		c.delivering = false
+		c.mu.Unlock()
+	}()
+	for len(c.notifyQ) > 0 {
+		fn := c.notifyQ[0]
+		c.notifyQ[0] = nil
+		c.notifyQ = c.notifyQ[1:]
+		c.mu.Unlock()
+		func() {
+			defer c.mu.Lock()
+			fn()
+		}()
+	}
 }
 
 // playerAndSink returns the Call's current Player and sink under its lock (the engine's
@@ -1466,10 +1502,7 @@ func (e *engine) finishCall(callID, reason string) {
 			e.c.log.Warn().Err(err).Str("call_id", callID).Msg("close call audio sink failed")
 		}
 	}
-	call.setPhase(CallPhaseEnded)
-	if fn := call.onEndFn(); fn != nil {
-		fn(reason)
-	}
+	call.endAndNotify(reason)
 }
 
 // installCallAckHook injects an "ack" entry into whatsmeow's unexported nodeHandlers map

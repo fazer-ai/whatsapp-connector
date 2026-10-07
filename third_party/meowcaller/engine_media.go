@@ -1295,11 +1295,11 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 			e.c.diag.Emit("meta", map[string]any{"event": "first_rtp_in", "call_id": callID})
 			if call != nil {
 				call.setPhase(CallPhaseActive)
-				// Claimed under the call's lock, which Ended is set under too, so
-				// OnReady never starts on a call that has ended, however the state
-				// callback above or a concurrent hangup interleaves with it.
-				if fn := call.claimReady(); fn != nil {
-					fn()
+				// Queued under the call's lock and delivered in order with OnEnd,
+				// so OnReady never runs on a call that ended before the claim nor
+				// after an OnEnd, however a hangup interleaves with it.
+				if call.claimReady() {
+					call.deliver()
 				}
 			}
 		}
