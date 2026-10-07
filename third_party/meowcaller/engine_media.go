@@ -102,8 +102,19 @@ func (e *engine) maybeStartMedia(callID string) {
 	e.c.log.Info().Str("call_id", callID).Msg("starting media")
 	go func() {
 		defer clear(callKey)
-		if err := e.runMedia(mctx, callID, call, callKey, selfLID, peerLID, rd, inbound); err != nil {
-			e.c.log.Warn().Err(err).Str("call_id", callID).Msg("media ended")
+		err := e.runMedia(mctx, callID, call, callKey, selfLID, peerLID, rd, inbound)
+		if err == nil {
+			return
+		}
+		e.c.log.Warn().Err(err).Str("call_id", callID).Msg("media ended")
+		// A cancelled mctx means the call is already being torn down. Anything
+		// else (every relay gone, the allocate refused) leaves a call with no
+		// media that signaling alone would keep Active, its listeners and
+		// workers waiting on a terminate that may never come: end it here.
+		if mctx.Err() == nil && call != nil {
+			if terr := e.terminate(call, "media_failed"); terr != nil {
+				e.c.log.Warn().Err(terr).Str("call_id", callID).Msg("terminate after media failure")
+			}
 		}
 	}()
 }

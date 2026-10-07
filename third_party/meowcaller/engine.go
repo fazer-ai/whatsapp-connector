@@ -833,6 +833,11 @@ func (e *engine) reject(c *Call) error {
 
 // hangup ends a call (either direction) and tears down its media.
 func (e *engine) hangup(c *Call) error {
+	return e.terminate(c, "hangup")
+}
+
+// terminate ends the call locally with reason and tells the peer.
+func (e *engine) terminate(c *Call, reason string) error {
 	m := e.lookup(c.id)
 	to, creator := c.peer, c.peer
 	if m != nil {
@@ -840,7 +845,7 @@ func (e *engine) hangup(c *Call) error {
 	}
 	term := signaling.BuildTerminate(&signaling.TerminateParams{CallID: c.id, To: to, CallCreator: creator})
 	term.Attrs["id"] = e.nextCallNodeID()
-	e.finishCall(c.id, "hangup")
+	e.finishCall(c.id, reason)
 	if err := e.transmitCallNode(context.Background(), term); err != nil {
 		return fmt.Errorf("send terminate: %w", err)
 	}
