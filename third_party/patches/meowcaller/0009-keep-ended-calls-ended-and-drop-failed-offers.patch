@@ -1,0 +1,75 @@
+Keep an ended call ended, and drop the registration of an offer that failed to send.
+
+Origin: fazer-ai/whatsapp-connector, upstream meowcaller code (not from a pull request).
+
+Why, two lifecycle defects on the 1:1 path:
+
+- Call.setPhase accepted any transition, so a hangup that finished the call while the
+  media loop was handling its first inbound audio packet could be undone: the loop set
+  the phase back to Active and fired OnReady on a call that had ended. Ended is now
+  terminal, setPhase reports whether it changed anything, and OnReady fires only when
+  the move to Active happened.
+- placeCall registers the call in e.calls before sending the <offer>, and returned the
+  send error without unregistering it. The caller gets no Call to hang up, so every
+  failed attempt left an entry, key material included, for the client's lifetime. It
+  now finishes the call as "offer_failed" before returning.
+
+Found in the review of fazer-ai/whatsapp-connector#387, round 14.
+
+diff --git a/engine.go b/engine.go
+index ba5e65e..8ecb745 100644
+--- a/engine.go
++++ b/engine.go
+@@ -551,6 +551,9 @@ func (e *engine) placeCall(ctx context.Context, target string, opts CallOptions)
+ 	})
+ 
+ 	if err := cli.DangerousInternals().SendNode(ctx, offer); err != nil {
++		// The caller gets no Call to hang up, so the registration and its key
++		// material would otherwise stay in e.calls for the client's lifetime.
++		e.finishCall(callID, "offer_failed")
+ 		return nil, fmt.Errorf("send offer: %w", err)
+ 	}
+ 	e.c.log.Info().Str("call_id", callID).Bool("video", opts.Video).Msg("offer sent; media starts when the relay endpoint arrives")
+diff --git a/engine_media.go b/engine_media.go
+index 7e4e1e2..75a9186 100644
+--- a/engine_media.go
++++ b/engine_media.go
+@@ -1293,8 +1293,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
+ 		if rtpIn++; rtpIn == 1 {
+ 			log.Info().Msg("first RTP decoded from relay, inbound audio flowing")
+ 			e.c.diag.Emit("meta", map[string]any{"event": "first_rtp_in", "call_id": callID})
+-			if call != nil {
+-				call.setPhase(CallPhaseActive)
++			if call != nil && call.setPhase(CallPhaseActive) {
+ 				if fn := call.onReadyFn(); fn != nil {
+ 					fn()
+ 				}
+diff --git a/livecall.go b/livecall.go
+index 67c10dd..80b9b28 100644
+--- a/livecall.go
++++ b/livecall.go
+@@ -753,11 +753,15 @@ func (c *Call) onMuteStateFn() func(bool) {
+ }
+ 
+ // setPhase advances the call's phase and fires OnStateChange (used by the engine).
+-func (c *Call) setPhase(next CallPhase) {
++//
++// Ended is terminal: a call that ended does not move to any other phase, so a
++// media loop that reaches "first audio" while a hangup is finishing the call
++// cannot bring it back. It reports whether the phase changed.
++func (c *Call) setPhase(next CallPhase) bool {
+ 	c.mu.Lock()
+-	if c.phase == next {
++	if c.phase == next || c.phase == CallPhaseEnded {
+ 		c.mu.Unlock()
+-		return
++		return false
+ 	}
+ 	c.phase = next
+ 	fn := c.onState
+@@ -765,4 +769,5 @@ func (c *Call) setPhase(next CallPhase) {
+ 	if fn != nil {
+ 		fn(next)
+ 	}
++	return true
+ }

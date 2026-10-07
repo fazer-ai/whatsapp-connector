@@ -1,0 +1,63 @@
+End the call, and tell the peer, when its media loop fails on its own.
+
+Origin: fazer-ai/whatsapp-connector, upstream meowcaller code (not from a pull request).
+
+Why: when runMedia returns an error that is not the call's own cancellation (every
+relay connection gone, the allocate refused), the media goroutine only logged it.
+Signaling still had the call Connecting or Active, OnEnd never fired, and the
+workers, sinks and listeners stayed up waiting for a terminate stanza that may never
+come; for the connector that is a browser left in a silent call. The goroutine now
+ends the call with reason "media_failed" and sends the terminate, through the same
+path hangup uses. Found in the review of fazer-ai/whatsapp-connector#387, round 12.
+
+diff --git a/engine.go b/engine.go
+index ab4f45f..ba5e65e 100644
+--- a/engine.go
++++ b/engine.go
+@@ -833,6 +833,11 @@ func (e *engine) reject(c *Call) error {
+ 
+ // hangup ends a call (either direction) and tears down its media.
+ func (e *engine) hangup(c *Call) error {
++	return e.terminate(c, "hangup")
++}
++
++// terminate ends the call locally with reason and tells the peer.
++func (e *engine) terminate(c *Call, reason string) error {
+ 	m := e.lookup(c.id)
+ 	to, creator := c.peer, c.peer
+ 	if m != nil {
+@@ -840,7 +845,7 @@ func (e *engine) hangup(c *Call) error {
+ 	}
+ 	term := signaling.BuildTerminate(&signaling.TerminateParams{CallID: c.id, To: to, CallCreator: creator})
+ 	term.Attrs["id"] = e.nextCallNodeID()
+-	e.finishCall(c.id, "hangup")
++	e.finishCall(c.id, reason)
+ 	if err := e.transmitCallNode(context.Background(), term); err != nil {
+ 		return fmt.Errorf("send terminate: %w", err)
+ 	}
+diff --git a/engine_media.go b/engine_media.go
+index 7eecd2c..7e4e1e2 100644
+--- a/engine_media.go
++++ b/engine_media.go
+@@ -102,8 +102,19 @@ func (e *engine) maybeStartMedia(callID string) {
+ 	e.c.log.Info().Str("call_id", callID).Msg("starting media")
+ 	go func() {
+ 		defer clear(callKey)
+-		if err := e.runMedia(mctx, callID, call, callKey, selfLID, peerLID, rd, inbound); err != nil {
+-			e.c.log.Warn().Err(err).Str("call_id", callID).Msg("media ended")
++		err := e.runMedia(mctx, callID, call, callKey, selfLID, peerLID, rd, inbound)
++		if err == nil {
++			return
++		}
++		e.c.log.Warn().Err(err).Str("call_id", callID).Msg("media ended")
++		// A cancelled mctx means the call is already being torn down. Anything
++		// else (every relay gone, the allocate refused) leaves a call with no
++		// media that signaling alone would keep Active, its listeners and
++		// workers waiting on a terminate that may never come: end it here.
++		if mctx.Err() == nil && call != nil {
++			if terr := e.terminate(call, "media_failed"); terr != nil {
++				e.c.log.Warn().Err(terr).Str("call_id", callID).Msg("terminate after media failure")
++			}
+ 		}
+ 	}()
+ }

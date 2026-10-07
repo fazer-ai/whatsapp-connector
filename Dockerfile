@@ -7,6 +7,8 @@ WORKDIR /src
 
 # Modules first, so a change to the source does not re-download the world.
 COPY go.mod go.sum ./
+# go.mod replaces meowcaller with this copy (third_party/README.md), so module resolution reads it.
+COPY third_party/meowcaller ./third_party/meowcaller
 RUN go mod download
 
 COPY . .

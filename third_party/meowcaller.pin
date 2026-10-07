@@ -1,0 +1,10 @@
+# The meowcaller this repository vendors, read by third_party/meowcaller.sh and by the
+# weekly upstream watch. Bumping is: change COMMIT, run `make meowcaller`, fix whatever
+# patch no longer applies, and commit the copy together with this file.
+#
+# COMMIT is a commit of purpshell/meowcaller. PR and PR_HEAD name the upstream pull
+# request whose diff is one of our patches, and the head it was taken at, so the watch
+# notices when that pull request is updated, merged or closed.
+COMMIT=c48c3e2a243c672c942cbf0c941d14161720d540
+PR=26
+PR_HEAD=3494d987fa8df585697e09c7fb0541eaff81c2c3

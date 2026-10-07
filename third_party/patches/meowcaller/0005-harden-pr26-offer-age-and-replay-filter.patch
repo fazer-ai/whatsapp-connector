@@ -1,0 +1,200 @@
+Read a replayed offer's age from the <call> wrapper, and filter RTP replays only on authenticated packets, with a cap.
+
+Origin: fazer-ai/whatsapp-connector, on top of 0002 (upstream PR #26).
+
+Why, defects in the PR #26 code on the inbound call path:
+
+- PR #26 drops an offer replayed from the offline queue when its `e` attribute (the
+  seconds the server held it) is over the caller's 90 s ring timeout, but reads `e`
+  off the node CallOffer carries, and whatsmeow hands CallOffer only the <offer>
+  child: `e` is on the <call> wrapper, so the check never fired and expired offers
+  still rang. onCallRaw now reads the wrapper of a lone <offer> (the only shape
+  whatsmeow dispatches as CallOffer) on the way in and marks the call;
+  onOffer consumes the mark before any of its early returns and drops a marked one.
+- rtpReplayFilter recorded (ssrc, seq) before SRTP authentication: a forged copy
+  arriving through one relay suppressed the authentic one arriving through another,
+  and packets claiming ever-changing SSRCs grew the filter without bound. The check
+  (Seen) still runs first, the record (Record) now runs only once the packet
+  authenticated, and at most 64 streams are tracked.
+
+Found in the review of fazer-ai/whatsapp-connector#387, rounds 5, 6 and 11.
+
+diff --git a/engine.go b/engine.go
+index f6d2ec5..8b38d7f 100644
+--- a/engine.go
++++ b/engine.go
+@@ -34,6 +34,7 @@ type engine struct {
+ 
+ 	mu              sync.Mutex
+ 	calls           map[string]*engineCall // keyed by call-id
++	staleOffers     map[string]struct{}    // offers replayed too old to answer, by call-id; see onCallRaw
+ 	sendCallNode    func(context.Context, waBinary.Node) error
+ 	requestCallNode func(context.Context, waBinary.Node, string) (*waBinary.Node, error)
+ 	rawCallHookErr  error
+@@ -558,6 +559,12 @@ func (e *engine) placeCall(ctx context.Context, target string, opts CallOptions)
+ // preparation step, independent of the later Answer/Reject), and fires the
+ // OnIncomingCall listener. Only the <accept> is deferred to Answer.
+ func (e *engine) onOffer(ev *events.CallOffer) {
++	// Consumed before any return below, so a mark never outlives its offer.
++	e.mu.Lock()
++	_, stale := e.staleOffers[ev.CallID]
++	delete(e.staleOffers, ev.CallID)
++	e.mu.Unlock()
++
+ 	// Source of truth: https://github.com/purpshell/meowcaller/blob/33854919e64bdd4b053054ac9764d8fc63027b57/datasheets/voip-group-invite-accept.md#L28-L40
+ 	groupSnapshot, isGroup, groupErr := signaling.ParseGroupInviteSnapshot(ev.Data)
+ 	if groupErr != nil {
+@@ -584,11 +591,12 @@ func (e *engine) onOffer(ev *events.CallOffer) {
+ 	// server-computed elapsed seconds (0 on live delivery), so it is immune to
+ 	// local clock skew. Anything older than the caller's own 90s ring timeout
+ 	// cannot be answered — ringing it just races the queued terminate.
+-	if raw := oag.OptionalString("e"); raw != "" {
+-		if elapsed, err := strconv.Atoi(raw); err == nil && elapsed > 90 {
+-			e.c.log.Warn().Str("call_id", ev.CallID).Int("elapsed_s", elapsed).Msg("ignoring stale offer replayed from the offline queue")
+-			return
+-		}
++	//
++	// `e` is on the <call> wrapper, and whatsmeow hands CallOffer only the <offer>
++	// child, so onCallRaw reads it on the way in; the mark was consumed at the top.
++	if stale {
++		e.c.log.Warn().Str("call_id", ev.CallID).Msg("ignoring stale offer replayed from the offline queue")
++		return
+ 	}
+ 
+ 	callKey, err := decryptInboundCallKey(context.Background(), e.c.wa, ev)
+@@ -1162,6 +1170,12 @@ func (e *engine) onCallRaw(callNode *waBinary.Node) bool {
+ 	if len(kids) == 0 {
+ 		return false
+ 	}
++	// Only a lone <offer> becomes a CallOffer (whatsmeow dispatches anything
++	// with more children as UnknownCallEvent), and only a CallOffer consumes
++	// the mark.
++	if len(kids) == 1 && kids[0].Tag == "offer" {
++		e.markStaleOffer(callNode, &kids[0])
++	}
+ 	switch kids[0].Tag {
+ 	case "group_update", "enc_rekey", "waiting_room_update", "user_action", "screen_share":
+ 		// Source of truth: https://github.com/purpshell/meowcaller/blob/36d54857c74e45ccb08f6444a32d2afa13f20be9/datasheets/group-video-reactions.md#L31-L56
+@@ -1474,6 +1488,28 @@ func (e *engine) installCallAckHook() error {
+ 	return nil
+ }
+ 
++// markStaleOffer records an offer whose <call> wrapper says the server held it for
++// longer than the caller's 90 s ring timeout, for onOffer to drop. It runs before
++// whatsmeow dispatches CallOffer from the same node, on the same goroutine.
++func (e *engine) markStaleOffer(callNode, offer *waBinary.Node) {
++	raw := callNode.AttrGetter().OptionalString("e")
++	elapsed, err := strconv.Atoi(raw)
++	if raw == "" || err != nil || elapsed <= 90 {
++		return
++	}
++	callID := offer.AttrGetter().OptionalString("call-id")
++	if callID == "" {
++		return
++	}
++	e.mu.Lock()
++	if e.staleOffers == nil {
++		e.staleOffers = map[string]struct{}{}
++	}
++	e.staleOffers[callID] = struct{}{}
++	e.mu.Unlock()
++	e.c.log.Debug().Str("call_id", callID).Int("elapsed_s", elapsed).Msg("offer replayed from the offline queue")
++}
++
+ // ---- whatsmeow glue (ported from examples/cli/call.go) ----
+ 
+ // parseCallTarget turns a CLI-style target into a JID. A string with '@' is a real JID
+diff --git a/engine_media.go b/engine_media.go
+index 53ee495..6acd94f 100644
+--- a/engine_media.go
++++ b/engine_media.go
+@@ -1040,7 +1040,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
+ 		// With bind-to-all, the same packet can arrive once per relay. A
+ 		// duplicate reaching the playout buffer reads as a zero timestamp delta
+ 		// and resets it, so drop replays before any processing.
+-		if rtpDedup.Duplicate(vh.Ssrc, vh.SequenceNumber) {
++		if rtpDedup.Seen(vh.Ssrc, vh.SequenceNumber) {
+ 			continue
+ 		}
+ 		kind := classifyMediaPayload(vh)
+@@ -1053,6 +1053,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
+ 				e.c.diag.Emit("app_data", map[string]any{"event": "unprotect_failed", "ssrc": vh.Ssrc, "seq": vh.SequenceNumber})
+ 				continue
+ 			}
++			rtpDedup.Record(vh.Ssrc, vh.SequenceNumber)
+ 			receiver := appDataReceivers[media.receiver]
+ 			if receiver == nil {
+ 				receiver = &appDataReceiver{}
+@@ -1093,6 +1094,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
+ 				e.c.diag.Emit("video", map[string]any{"event": "unprotect_failed", "ssrc": vh.Ssrc, "seq": vh.SequenceNumber})
+ 				continue
+ 			}
++			rtpDedup.Record(vh.Ssrc, vh.SequenceNumber)
+ 			vh = media.Header
+ 			videoState := videoReceiveStates[media.receiver]
+ 			if videoState == nil {
+@@ -1206,6 +1208,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
+ 			e.c.diag.Emit("srtp", map[string]any{"event": "unprotect_failed", "ssrc": vh.Ssrc, "bytes": n})
+ 			continue
+ 		}
++		rtpDedup.Record(vh.Ssrc, vh.SequenceNumber)
+ 		audioReception.Observe(audio.SSRC, vh.SequenceNumber, audio.Timestamp, uint64(time.Now().UnixMilli()), SampleRate)
+ 		e.c.diag.Emit("rtp", map[string]any{
+ 			"event": "in", "ssrc": audio.SSRC, "seq": vh.SequenceNumber,
+diff --git a/engine_relay_fanout.go b/engine_relay_fanout.go
+index 44473ba..b2fc440 100644
+--- a/engine_relay_fanout.go
++++ b/engine_relay_fanout.go
+@@ -202,6 +202,9 @@ func (f *relayFanout) Close() error {
+ // duplicates reaching the playout buffer read as a zero-timestamp delta, which
+ // resets it and audibly glitches the stream. A 1024-slot ring per SSRC covers
+ // ~61s of 60ms audio frames — far beyond any realistic reorder window.
++// maxReplayStreams bounds how many SSRCs the filter tracks.
++const maxReplayStreams = 64
++
+ type rtpReplayFilter struct {
+ 	streams map[uint32]*replayRing
+ }
+@@ -216,20 +219,36 @@ func newRtpReplayFilter() *rtpReplayFilter {
+ 	return &rtpReplayFilter{streams: make(map[uint32]*replayRing)}
+ }
+ 
+-// Duplicate records (ssrc, seq) and reports whether it was already seen.
+-func (r *rtpReplayFilter) Duplicate(ssrc uint32, seq uint16) bool {
++// Seen reports whether (ssrc, seq) was already recorded, without recording it.
++// The check runs before SRTP authentication and the record after it, so a forged
++// copy arriving through one relay cannot suppress the authentic one arriving
++// through another.
++func (r *rtpReplayFilter) Seen(ssrc uint32, seq uint16) bool {
++	ring, ok := r.streams[ssrc]
++	if !ok || !ring.primed {
++		return false
++	}
++	slot := int(seq) % 1024
++	word, bit := slot/64, uint(slot%64)
++	return ring.seen[word]&(1<<bit) != 0 && ring.seq[slot] == seq
++}
++
++// Record marks (ssrc, seq) as seen. Call it once the packet authenticated.
++func (r *rtpReplayFilter) Record(ssrc uint32, seq uint16) {
+ 	ring, ok := r.streams[ssrc]
+ 	if !ok {
++		// Authenticated or not, a 1:1 call carries a handful of SSRCs. Past the
++		// cap an unknown stream is passed through unfiltered rather than given a
++		// ring, so the filter's memory stays bounded whatever the peer sends.
++		if len(r.streams) >= maxReplayStreams {
++			return
++		}
+ 		ring = &replayRing{}
+ 		r.streams[ssrc] = ring
+ 	}
+ 	slot := int(seq) % 1024
+ 	word, bit := slot/64, uint(slot%64)
+-	if ring.primed && ring.seen[word]&(1<<bit) != 0 && ring.seq[slot] == seq {
+-		return true
+-	}
+ 	ring.primed = true
+ 	ring.seen[word] |= 1 << bit
+ 	ring.seq[slot] = seq
+-	return false
+ }

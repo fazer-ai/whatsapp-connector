@@ -1,0 +1,27 @@
+name: meowcaller upstream
+
+# Opens (or updates) the issue "o meowcaller andou" when purpshell/meowcaller main moves
+# past the commit in third_party/meowcaller.pin, or when the upstream pull request one of
+# our patches comes from is updated, merged or closed. That issue is the signal to bump
+# the vendored copy (third_party/README.md). Not a gate: it runs on a schedule, never on
+# a change.
+on:
+  schedule:
+    - cron: "17 9 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  watch:
+    name: Watch
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Compare the pin with upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./third_party/meowcaller.sh watch

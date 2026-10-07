@@ -1,0 +1,26 @@
+Skip a relay token whose id attribute is negative.
+
+Origin: fazer-ai/whatsapp-connector, upstream meowcaller code (not from a pull request).
+
+Why: parseIndexedTokens bounds the wire-supplied id only from above, so `id="-1"`
+indexes the token slice at -1 and panics. onOffer calls it while holding e.mu, and
+whatsmeow's handler recovery leaves that mutex locked, so every later call operation
+on the client hangs. Measured with a probe: the unpatched parser panics with
+`index out of range [-1]`. Found in the review of fazer-ai/whatsapp-connector#387,
+round 10.
+
+diff --git a/engine.go b/engine.go
+index 2b88830..ee8517a 100644
+--- a/engine.go
++++ b/engine.go
+@@ -1769,7 +1769,9 @@ func parseIndexedTokens(node *waBinary.Node, tag string) [][]byte {
+ 				id = n
+ 			}
+ 		}
+-		if id >= maxRelayTokens {
++		// The id is wire input: a negative one passed the upper bound and
++		// indexed the slice, panicking while onOffer holds e.mu.
++		if id < 0 || id >= maxRelayTokens {
+ 			continue
+ 		}
+ 		for len(tokens) <= id {
