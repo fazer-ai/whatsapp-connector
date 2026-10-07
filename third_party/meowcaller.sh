@@ -105,18 +105,16 @@ watch_body() {
 			--jq '"Commits à frente: \(.ahead_by), atrás: \(.behind_by).\n", (.commits[] | "- `\(.sha[0:10])` \(.commit.message | split("\n")[0])")'
 		echo
 	fi
-	if [ "$pr_state" != "open" ] || [ "$pr_head" != "$PR_HEAD" ]; then
-		echo "## PR #$PR do $upstream_repo"
-		echo
-		echo "Estado: \`$pr_state\`. Head usado no patch: \`$PR_HEAD\`; head agora: \`$pr_head\`. $upstream_url/pull/$PR"
-		echo
-		case "$pr_state" in
-		merged) echo "Mergeada: no bump, o patch dela sai de \`third_party/patches/meowcaller\`." ;;
-		closed) echo "Fechada sem merge: o patch dela continua sendo nosso, e vale ler por que foi fechada." ;;
-		*) echo "A PR ganhou commits: compare o diff novo com o nosso patch." ;;
-		esac
-		echo
-	fi
+	echo "## PR #$PR do $upstream_repo"
+	echo
+	echo "Estado: \`$pr_state\`. Head usado no patch: \`$PR_HEAD\`; head agora: \`$pr_head\`. $upstream_url/pull/$PR"
+	echo
+	case "$pr_state" in
+	merged) echo "Mergeada: no bump, o patch dela sai de \`third_party/patches/meowcaller\`." ;;
+	closed) echo "Fechada sem merge: o patch dela continua sendo nosso, e vale ler por que foi fechada." ;;
+	*) if [ "$pr_head" != "$PR_HEAD" ]; then echo "A PR ganhou commits: compare o diff novo com o nosso patch."; else echo "Sem mudança desde o patch."; fi ;;
+	esac
+	echo
 	echo "Para atualizar: troque \`COMMIT\` em \`third_party/meowcaller.pin\`, rode \`make meowcaller\` e ajuste o patch que não aplicar."
 }
 
@@ -127,7 +125,9 @@ cmd_watch() {
 	pr_head=$(gh api "repos/$upstream_repo/pulls/$PR" --jq .head.sha)
 
 	local existing
-	existing=$(gh issue list --state open --search "in:title \"$watch_title\"" --json number,title \
+	# The plain list rather than search: search indexes a new issue with a delay, and a
+	# second run inside that window opened a duplicate when this read it.
+	existing=$(gh issue list --state open --limit 1000 --json number,title \
 		--jq "[.[] | select(.title == \"$watch_title\")][0].number // empty")
 
 	if [ "$main" = "$COMMIT" ] && [ "$pr_state" = "open" ] && [ "$pr_head" = "$PR_HEAD" ]; then
