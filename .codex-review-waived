@@ -587,3 +587,4 @@ third_party/meowcaller/engine.go: Endorse only relays with successful media bind
 third_party/meowcaller/engine_media.go: Refresh allocations using the current call mode  # PR#387, group calls out of #380
 third_party/meowcaller/engine.go: Drain deferred video controls before allowing live updates  # PR#387, video out of #380
 third_party/meowcaller/engine.go: Preserve orientation set before the video sender exists  # PR#387, video out of #380
+third_party/meowcaller/engine.go: Endorse only relays included in the established fanout  # PR#387 → #388
