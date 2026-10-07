@@ -14,7 +14,7 @@ import (
 // what nobody requires. It fails the day somebody imports it, in the image job only, which
 // is the one a developer does not run, so the rule is held here instead of discovered there.
 func TestEveryLocalReplaceIsCopiedBeforeTheModuleDownload(t *testing.T) {
-	out, err := exec.Command("go", "mod", "edit", "-json", "../../go.mod").Output()
+	out, err := exec.CommandContext(t.Context(), "go", "mod", "edit", "-json", "../../go.mod").Output()
 	if err != nil {
 		t.Fatalf("go mod edit -json: %v", err)
 	}
