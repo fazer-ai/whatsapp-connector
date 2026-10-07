@@ -202,6 +202,9 @@ func (f *relayFanout) Close() error {
 // duplicates reaching the playout buffer read as a zero-timestamp delta, which
 // resets it and audibly glitches the stream. A 1024-slot ring per SSRC covers
 // ~61s of 60ms audio frames — far beyond any realistic reorder window.
+// maxReplayStreams bounds how many SSRCs the filter tracks.
+const maxReplayStreams = 64
+
 type rtpReplayFilter struct {
 	streams map[uint32]*replayRing
 }
@@ -220,6 +223,13 @@ func newRtpReplayFilter() *rtpReplayFilter {
 func (r *rtpReplayFilter) Duplicate(ssrc uint32, seq uint16) bool {
 	ring, ok := r.streams[ssrc]
 	if !ok {
+		// This runs before SRTP authentication, so the SSRC is whatever the
+		// packet claims. Past the cap an unknown stream is passed through
+		// unfiltered rather than given a ring: a 1:1 call carries a handful of
+		// SSRCs, and SRTP still rejects what is forged.
+		if len(r.streams) >= maxReplayStreams {
+			return false
+		}
 		ring = &replayRing{}
 		r.streams[ssrc] = ring
 	}

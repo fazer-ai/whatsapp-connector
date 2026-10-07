@@ -34,6 +34,7 @@ type engine struct {
 
 	mu              sync.Mutex
 	calls           map[string]*engineCall // keyed by call-id
+	staleOffers     map[string]struct{}    // offers replayed too old to answer, by call-id; see onCallRaw
 	sendCallNode    func(context.Context, waBinary.Node) error
 	requestCallNode func(context.Context, waBinary.Node, string) (*waBinary.Node, error)
 	rawCallHookErr  error
@@ -584,11 +585,16 @@ func (e *engine) onOffer(ev *events.CallOffer) {
 	// server-computed elapsed seconds (0 on live delivery), so it is immune to
 	// local clock skew. Anything older than the caller's own 90s ring timeout
 	// cannot be answered — ringing it just races the queued terminate.
-	if raw := oag.OptionalString("e"); raw != "" {
-		if elapsed, err := strconv.Atoi(raw); err == nil && elapsed > 90 {
-			e.c.log.Warn().Str("call_id", ev.CallID).Int("elapsed_s", elapsed).Msg("ignoring stale offer replayed from the offline queue")
-			return
-		}
+	//
+	// `e` is on the <call> wrapper, and whatsmeow hands CallOffer only the <offer>
+	// child, so onCallRaw reads it on the way in and marks the call here.
+	e.mu.Lock()
+	_, stale := e.staleOffers[ev.CallID]
+	delete(e.staleOffers, ev.CallID)
+	e.mu.Unlock()
+	if stale {
+		e.c.log.Warn().Str("call_id", ev.CallID).Msg("ignoring stale offer replayed from the offline queue")
+		return
 	}
 
 	callKey, err := decryptInboundCallKey(context.Background(), e.c.wa, ev)
@@ -1162,6 +1168,9 @@ func (e *engine) onCallRaw(callNode *waBinary.Node) bool {
 	if len(kids) == 0 {
 		return false
 	}
+	if kids[0].Tag == "offer" {
+		e.markStaleOffer(callNode, &kids[0])
+	}
 	switch kids[0].Tag {
 	case "group_update", "enc_rekey", "waiting_room_update", "user_action", "screen_share":
 		// Source of truth: https://github.com/purpshell/meowcaller/blob/36d54857c74e45ccb08f6444a32d2afa13f20be9/datasheets/group-video-reactions.md#L31-L56
@@ -1472,6 +1481,28 @@ func (e *engine) installCallAckHook() error {
 	})
 	handlers.SetMapIndex(reflect.ValueOf("call"), callHandler)
 	return nil
+}
+
+// markStaleOffer records an offer whose <call> wrapper says the server held it for
+// longer than the caller's 90 s ring timeout, for onOffer to drop. It runs before
+// whatsmeow dispatches CallOffer from the same node, on the same goroutine.
+func (e *engine) markStaleOffer(callNode, offer *waBinary.Node) {
+	raw := callNode.AttrGetter().OptionalString("e")
+	elapsed, err := strconv.Atoi(raw)
+	if raw == "" || err != nil || elapsed <= 90 {
+		return
+	}
+	callID := offer.AttrGetter().OptionalString("call-id")
+	if callID == "" {
+		return
+	}
+	e.mu.Lock()
+	if e.staleOffers == nil {
+		e.staleOffers = map[string]struct{}{}
+	}
+	e.staleOffers[callID] = struct{}{}
+	e.mu.Unlock()
+	e.c.log.Debug().Str("call_id", callID).Int("elapsed_s", elapsed).Msg("offer replayed from the offline queue")
 }
 
 // ---- whatsmeow glue (ported from examples/cli/call.go) ----
