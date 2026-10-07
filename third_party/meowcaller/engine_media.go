@@ -1293,7 +1293,9 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 		if rtpIn++; rtpIn == 1 {
 			log.Info().Msg("first RTP decoded from relay, inbound audio flowing")
 			e.c.diag.Emit("meta", map[string]any{"event": "first_rtp_in", "call_id": callID})
-			if call != nil && call.setPhase(CallPhaseActive) {
+			// Rechecked after setPhase: its state callback runs synchronously and
+			// may itself hang up, and OnReady must not follow OnEnd.
+			if call != nil && call.setPhase(CallPhaseActive) && call.State() == CallPhaseActive {
 				if fn := call.onReadyFn(); fn != nil {
 					fn()
 				}

@@ -81,6 +81,12 @@ type engineCall struct {
 
 	// The callee <accept> is deferred until the caller's <mute_v2> arrives.
 	acceptPending bool
+	// earlyMute records a first <mute_v2> that arrived on an incoming call before
+	// Answer, with the from and call-creator it carried, so Answer can send the
+	// accept itself instead of waiting for a handshake that already happened.
+	earlyMute        bool
+	earlyMuteFrom    types.JID
+	earlyMuteCreator types.JID
 	// acceptSent flips once the <accept> is actually on the wire. Video-state
 	// stanzas sent before it are a sequence no real client produces, and phones
 	// react badly (observed: the caller's microphone goes silent while their
@@ -761,10 +767,16 @@ func (e *engine) answer(c *Call) error {
 	}
 	e.mu.Lock()
 	m.acceptPending = true
+	early, from, creator := m.earlyMute, m.earlyMuteFrom, m.earlyMuteCreator
+	m.earlyMute = false
 	e.mu.Unlock()
 
 	c.setPhase(CallPhaseConnecting)
 	e.maybeStartMedia(c.id)
+	if early {
+		e.c.log.Info().Str("call_id", c.id).Msg("mute_v2 arrived before Answer; sending the deferred accept now")
+		e.sendAccept(c.id, from, creator)
+	}
 	return nil
 }
 
@@ -789,7 +801,11 @@ func (e *engine) sendAccept(callID string, to, creator types.JID) {
 	})
 	accept.Attrs["id"] = e.c.wa.DangerousInternals().GenerateRequestID()
 	if err := e.c.wa.DangerousInternals().SendNode(context.Background(), accept); err != nil {
+		// acceptPending is already cleared, so no later mute_v2 retries this, and
+		// the peer never learns the call was answered: end it rather than leave
+		// media running for a call nobody accepted.
 		e.c.log.Error().Err(err).Str("call_id", callID).Msg("send accept failed")
+		e.finishCall(callID, "accept_failed")
 		return
 	}
 	e.c.log.Info().Str("call_id", callID).Bool("video", isVideo).Msg("accepted (after mute_v2)")
@@ -1240,6 +1256,11 @@ func (e *engine) onCallRaw(callNode *waBinary.Node) bool {
 		e.mu.Lock()
 		m := e.calls[callID]
 		pending := m != nil && m.acceptPending
+		if m != nil && !pending && !m.group && m.direction == CallDirectionIncoming && !m.acceptSent && !m.earlyMute {
+			m.earlyMute = true
+			m.earlyMuteFrom = callNode.AttrGetter().JID("from")
+			m.earlyMuteCreator = mv.JID("call-creator")
+		}
 		e.mu.Unlock()
 		if m != nil && m.call != nil {
 			if fn := m.call.onMuteStateFn(); fn != nil {

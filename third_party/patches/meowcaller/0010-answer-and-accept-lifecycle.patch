@@ -1,0 +1,96 @@
+Accept a call whose mute handshake came before Answer, end it when the accept cannot be sent, and keep OnReady from following OnEnd.
+
+Origin: fazer-ai/whatsapp-connector, upstream meowcaller code (not from a pull request).
+
+Why, three defects in how an incoming call is answered, the path the connector uses
+when an agent answers in the browser while the phone rings:
+
+- The callee <accept> waits for the caller's first <mute_v2>, and a <mute_v2> that
+  arrived before Answer was dropped as "not awaiting accept". Answer then only set the
+  flag, and the call stayed unaccepted until some later mute change. In the spike calls
+  (fazer-ai/whatsapp-connector#235) the first <mute_v2> came in the same second as
+  Answer, after it; the early case was not observed, but its failure is a call that is
+  never accepted and says nothing. The early handshake is now remembered, with the from
+  and call-creator it carried, and Answer sends the accept itself when one is there.
+- When sending the accept failed, acceptPending was already cleared, so nothing retried
+  it, and the call and its media workers stayed up for a peer that never learned it was
+  answered. The call is now finished as "accept_failed".
+- The media loop fired OnReady when setPhase(Active) reported a change, but setPhase runs
+  the state callback synchronously and that callback may hang up: OnReady then followed
+  OnEnd. The phase is checked again before OnReady.
+
+Found in the review of fazer-ai/whatsapp-connector#387, round 15.
+
+diff --git a/engine.go b/engine.go
+index 8ecb745..9e2c760 100644
+--- a/engine.go
++++ b/engine.go
+@@ -81,6 +81,12 @@ type engineCall struct {
+ 
+ 	// The callee <accept> is deferred until the caller's <mute_v2> arrives.
+ 	acceptPending bool
++	// earlyMute records a first <mute_v2> that arrived on an incoming call before
++	// Answer, with the from and call-creator it carried, so Answer can send the
++	// accept itself instead of waiting for a handshake that already happened.
++	earlyMute        bool
++	earlyMuteFrom    types.JID
++	earlyMuteCreator types.JID
+ 	// acceptSent flips once the <accept> is actually on the wire. Video-state
+ 	// stanzas sent before it are a sequence no real client produces, and phones
+ 	// react badly (observed: the caller's microphone goes silent while their
+@@ -761,10 +767,16 @@ func (e *engine) answer(c *Call) error {
+ 	}
+ 	e.mu.Lock()
+ 	m.acceptPending = true
++	early, from, creator := m.earlyMute, m.earlyMuteFrom, m.earlyMuteCreator
++	m.earlyMute = false
+ 	e.mu.Unlock()
+ 
+ 	c.setPhase(CallPhaseConnecting)
+ 	e.maybeStartMedia(c.id)
++	if early {
++		e.c.log.Info().Str("call_id", c.id).Msg("mute_v2 arrived before Answer; sending the deferred accept now")
++		e.sendAccept(c.id, from, creator)
++	}
+ 	return nil
+ }
+ 
+@@ -789,7 +801,11 @@ func (e *engine) sendAccept(callID string, to, creator types.JID) {
+ 	})
+ 	accept.Attrs["id"] = e.c.wa.DangerousInternals().GenerateRequestID()
+ 	if err := e.c.wa.DangerousInternals().SendNode(context.Background(), accept); err != nil {
++		// acceptPending is already cleared, so no later mute_v2 retries this, and
++		// the peer never learns the call was answered: end it rather than leave
++		// media running for a call nobody accepted.
+ 		e.c.log.Error().Err(err).Str("call_id", callID).Msg("send accept failed")
++		e.finishCall(callID, "accept_failed")
+ 		return
+ 	}
+ 	e.c.log.Info().Str("call_id", callID).Bool("video", isVideo).Msg("accepted (after mute_v2)")
+@@ -1240,6 +1256,11 @@ func (e *engine) onCallRaw(callNode *waBinary.Node) bool {
+ 		e.mu.Lock()
+ 		m := e.calls[callID]
+ 		pending := m != nil && m.acceptPending
++		if m != nil && !pending && !m.group && m.direction == CallDirectionIncoming && !m.acceptSent && !m.earlyMute {
++			m.earlyMute = true
++			m.earlyMuteFrom = callNode.AttrGetter().JID("from")
++			m.earlyMuteCreator = mv.JID("call-creator")
++		}
+ 		e.mu.Unlock()
+ 		if m != nil && m.call != nil {
+ 			if fn := m.call.onMuteStateFn(); fn != nil {
+diff --git a/engine_media.go b/engine_media.go
+index 75a9186..32b9412 100644
+--- a/engine_media.go
++++ b/engine_media.go
+@@ -1293,7 +1293,9 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
+ 		if rtpIn++; rtpIn == 1 {
+ 			log.Info().Msg("first RTP decoded from relay, inbound audio flowing")
+ 			e.c.diag.Emit("meta", map[string]any{"event": "first_rtp_in", "call_id": callID})
+-			if call != nil && call.setPhase(CallPhaseActive) {
++			// Rechecked after setPhase: its state callback runs synchronously and
++			// may itself hang up, and OnReady must not follow OnEnd.
++			if call != nil && call.setPhase(CallPhaseActive) && call.State() == CallPhaseActive {
+ 				if fn := call.onReadyFn(); fn != nil {
+ 					fn()
+ 				}
