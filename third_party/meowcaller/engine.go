@@ -48,8 +48,8 @@ type engineCall struct {
 	call    *Call
 	callKey []byte
 	relay   *relayData
-	// boundRelays names the relays the media fanout actually connected to, set
-	// once it is up; nil before. See onRelayLatency.
+	// boundRelays names the relays the media fanout connected to, each added as
+	// it connects; nil until the first one does. See onRelayLatency.
 	boundRelays map[string]bool
 	selfLID     string
 	peerLID     string
@@ -884,7 +884,8 @@ func (e *engine) onRelay(callID string, data *waBinary.Node) {
 }
 
 // endorsableRelays is the set of relay names onRelayLatency may answer for: the
-// relays the fanout connected to once it exists, the offered ones before that.
+// relays the fanout has connected to once the first one has, the offered ones
+// before that.
 func (e *engine) endorsableRelays(m *engineCall) map[string]bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -926,7 +927,7 @@ func (e *engine) onRelayLatency(ev *events.CallRelayLatency) {
 	// again about a second after accept, and it is that second round that elects
 	// the relay its media moves to. By then the fanout is up, and a relay that
 	// failed to connect or missed the grace is in the offer but carries nothing
-	// for us, so once the fanout exists only its relays are endorsed.
+	// for us, so once a relay is connected only the connected ones are endorsed.
 	offered := e.endorsableRelays(m)
 
 	var probes []rlProbe

@@ -124,7 +124,7 @@ const relayConnectGrace = 2 * time.Second
 // multi=false preserves the original single-relay behavior (group calls).
 //
 // NOT VALIDATED: live-relay only.
-func (e *engine) connectAndAllocateAll(ctx context.Context, rd *relayData, streamSsrcs [9]uint32, inbound bool, multi bool) (*relayFanout, error) {
+func (e *engine) connectAndAllocateAll(ctx context.Context, rd *relayData, streamSsrcs [9]uint32, inbound bool, multi bool, onBound func(relayName string)) (*relayFanout, error) {
 	primary := getMediaRelayEndpoint(rd, inbound)
 	if primary == nil || len(primary.addresses) == 0 {
 		return nil, fmt.Errorf("relay has no usable endpoint")
@@ -172,8 +172,15 @@ collect:
 		case r := <-results:
 			pending--
 			got[r.i] = &r
-			if r.err == nil && grace == nil {
-				grace = time.After(relayConnectGrace)
+			if r.err == nil {
+				// As it happens rather than once collection ends: the caller's
+				// post-accept probes can land inside the grace.
+				if onBound != nil {
+					onBound(targets[r.i].relayName)
+				}
+				if grace == nil {
+					grace = time.After(relayConnectGrace)
+				}
 			}
 		case <-grace:
 			break collect
@@ -325,22 +332,30 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 	}
 	e.mu.Unlock()
 
-	ch, err := e.connectAndAllocateAll(ctx, rd, streamSsrcs, inbound, !isGroup)
+	// Each relay the fanout keeps is recorded the moment it connects, for
+	// onRelayLatency to endorse; one that never connects never is.
+	ch, err := e.connectAndAllocateAll(ctx, rd, streamSsrcs, inbound, !isGroup, func(name string) {
+		if name == "" {
+			return
+		}
+		e.mu.Lock()
+		if mm := e.calls[callID]; mm != nil {
+			if mm.boundRelays == nil {
+				mm.boundRelays = map[string]bool{}
+			}
+			mm.boundRelays[name] = true
+		}
+		e.mu.Unlock()
+	})
 	if err != nil {
 		return err
 	}
 	defer ch.Close()
-	bound := make(map[string]bool, len(ch.names))
-	for _, name := range ch.names {
-		if name != "" {
-			bound[name] = true
-		}
-	}
-	e.mu.Lock()
-	if mm := e.calls[callID]; mm != nil {
-		mm.boundRelays = bound
-	}
-	e.mu.Unlock()
+	// Recv waits for a packet or for the fanout to close, not for ctx: a relay
+	// that goes quiet with its transport still open would otherwise hold this
+	// goroutine, the readers and the sockets past hangup.
+	stopCloseOnCancel := context.AfterFunc(ctx, func() { _ = ch.Close() })
+	defer stopCloseOnCancel()
 	allocateState := newGroupRelayAllocateStateWithHBHFEC(
 		ch.allocs[0],
 		rd.relayKeyASCII,

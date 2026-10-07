@@ -1,22 +1,30 @@
-Once the media fanout is up, answer relay-latency probes only for the relays it connected to.
+Endorse only the relays the media fanout connected to, and close the fanout when the call ends.
 
 Origin: fazer-ai/whatsapp-connector, on top of 0002 (upstream PR #26) and 0004.
 
-Why: onRelayLatency endorses every relay in the offer. The caller probes twice, once
-while ringing and again about a second after accept (seen in the spike logs of
-fazer-ai/whatsapp-connector#235: fanout established at 13:01:13, second probe round
-at 13:01:14), and the second round is what elects the relay its media moves to. A
-relay that failed to connect, or that 0004 left out for missing its 2 s grace, was
-still endorsed then, and electing it silences inbound audio while another relay is
-connected. runMedia now records the relays the fanout holds, and onRelayLatency
-answers only for those once they exist; before the fanout, it still answers for the
-offered ones, which is all there is to go on while ringing.
+Why:
 
-Found in the review of fazer-ai/whatsapp-connector#387 (rounds 1, 7 and 8); tracked
-as fazer-ai/whatsapp-connector#388.
+- onRelayLatency endorses every relay in the offer. The caller probes twice, once
+  while ringing and again about a second after accept (seen in the spike logs of
+  fazer-ai/whatsapp-connector#235: fanout established at 13:01:13, second probe
+  round at 13:01:14), and the second round elects the relay its media moves to. A
+  relay that failed to connect, or that 0004 left out for missing its 2 s grace,
+  was still endorsed then, and electing it silences inbound audio while another
+  relay is connected. connectAndAllocateAll now reports each relay as it connects,
+  runMedia records it, and once the first one has, onRelayLatency answers only for
+  the connected ones. Recording as they connect, rather than when collection ends,
+  matters because the post-accept probes can land inside the grace. Before any
+  relay connects it still answers for the offered ones, all there is to go on.
+- The fanout's Recv waits for a packet or for the fanout to close, not for the
+  call's context, so a relay that went quiet with its transport still open held
+  the media goroutine, the relay readers and the sockets past hangup. runMedia now
+  closes the fanout when its context ends.
+
+Found in the review of fazer-ai/whatsapp-connector#387 (rounds 1, 7, 8 and 9);
+tracked as fazer-ai/whatsapp-connector#388.
 
 diff --git a/engine.go b/engine.go
-index 248852f..d4458fb 100644
+index 248852f..a56f879 100644
 --- a/engine.go
 +++ b/engine.go
 @@ -48,8 +48,11 @@ type engineCall struct {
@@ -25,20 +33,21 @@ index 248852f..d4458fb 100644
  	relay   *relayData
 -	selfLID string
 -	peerLID string
-+	// boundRelays names the relays the media fanout actually connected to, set
-+	// once it is up; nil before. See onRelayLatency.
++	// boundRelays names the relays the media fanout connected to, each added as
++	// it connects; nil until the first one does. See onRelayLatency.
 +	boundRelays map[string]bool
 +	selfLID     string
 +	peerLID     string
  
  	creator types.JID // call-creator JID (for accept/relaylatency)
  	from    types.JID // the <call> "from" — where stanzas are addressed
-@@ -880,6 +883,28 @@ func (e *engine) onRelay(callID string, data *waBinary.Node) {
+@@ -880,6 +883,29 @@ func (e *engine) onRelay(callID string, data *waBinary.Node) {
  	e.maybeStartMedia(callID)
  }
  
 +// endorsableRelays is the set of relay names onRelayLatency may answer for: the
-+// relays the fanout connected to once it exists, the offered ones before that.
++// relays the fanout has connected to once the first one has, the offered ones
++// before that.
 +func (e *engine) endorsableRelays(m *engineCall) map[string]bool {
 +	e.mu.Lock()
 +	defer e.mu.Unlock()
@@ -62,7 +71,7 @@ index 248852f..d4458fb 100644
  // onRelayLatency answers the caller's relaylatency probes (the callee's half of the
  // relay election). It does NOT send the accept — that is deferred until <mute_v2>.
  func (e *engine) onRelayLatency(ev *events.CallRelayLatency) {
-@@ -896,16 +921,13 @@ func (e *engine) onRelayLatency(ev *events.CallRelayLatency) {
+@@ -896,16 +922,13 @@ func (e *engine) onRelayLatency(ev *events.CallRelayLatency) {
  	// and holds no tokens for us; echoing that entry back tells the caller both
  	// sides reach it, the election picks it, and the caller's media moves to a
  	// relay we were never connected to.
@@ -81,30 +90,71 @@ index 248852f..d4458fb 100644
 +	// again about a second after accept, and it is that second round that elects
 +	// the relay its media moves to. By then the fanout is up, and a relay that
 +	// failed to connect or missed the grace is in the offer but carries nothing
-+	// for us, so once the fanout exists only its relays are endorsed.
++	// for us, so once a relay is connected only the connected ones are endorsed.
 +	offered := e.endorsableRelays(m)
  
  	var probes []rlProbe
  	for i := range rl.GetChildren() {
 diff --git a/engine_media.go b/engine_media.go
-index 6acd94f..072331b 100644
+index 6acd94f..4be3191 100644
 --- a/engine_media.go
 +++ b/engine_media.go
-@@ -330,6 +330,17 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
+@@ -124,7 +124,7 @@ const relayConnectGrace = 2 * time.Second
+ // multi=false preserves the original single-relay behavior (group calls).
+ //
+ // NOT VALIDATED: live-relay only.
+-func (e *engine) connectAndAllocateAll(ctx context.Context, rd *relayData, streamSsrcs [9]uint32, inbound bool, multi bool) (*relayFanout, error) {
++func (e *engine) connectAndAllocateAll(ctx context.Context, rd *relayData, streamSsrcs [9]uint32, inbound bool, multi bool, onBound func(relayName string)) (*relayFanout, error) {
+ 	primary := getMediaRelayEndpoint(rd, inbound)
+ 	if primary == nil || len(primary.addresses) == 0 {
+ 		return nil, fmt.Errorf("relay has no usable endpoint")
+@@ -172,8 +172,15 @@ collect:
+ 		case r := <-results:
+ 			pending--
+ 			got[r.i] = &r
+-			if r.err == nil && grace == nil {
+-				grace = time.After(relayConnectGrace)
++			if r.err == nil {
++				// As it happens rather than once collection ends: the caller's
++				// post-accept probes can land inside the grace.
++				if onBound != nil {
++					onBound(targets[r.i].relayName)
++				}
++				if grace == nil {
++					grace = time.After(relayConnectGrace)
++				}
+ 			}
+ 		case <-grace:
+ 			break collect
+@@ -325,11 +332,30 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
+ 	}
+ 	e.mu.Unlock()
+ 
+-	ch, err := e.connectAndAllocateAll(ctx, rd, streamSsrcs, inbound, !isGroup)
++	// Each relay the fanout keeps is recorded the moment it connects, for
++	// onRelayLatency to endorse; one that never connects never is.
++	ch, err := e.connectAndAllocateAll(ctx, rd, streamSsrcs, inbound, !isGroup, func(name string) {
++		if name == "" {
++			return
++		}
++		e.mu.Lock()
++		if mm := e.calls[callID]; mm != nil {
++			if mm.boundRelays == nil {
++				mm.boundRelays = map[string]bool{}
++			}
++			mm.boundRelays[name] = true
++		}
++		e.mu.Unlock()
++	})
+ 	if err != nil {
  		return err
  	}
  	defer ch.Close()
-+	bound := make(map[string]bool, len(ch.names))
-+	for _, name := range ch.names {
-+		if name != "" {
-+			bound[name] = true
-+		}
-+	}
-+	e.mu.Lock()
-+	if mm := e.calls[callID]; mm != nil {
-+		mm.boundRelays = bound
-+	}
-+	e.mu.Unlock()
++	// Recv waits for a packet or for the fanout to close, not for ctx: a relay
++	// that goes quiet with its transport still open would otherwise hold this
++	// goroutine, the readers and the sockets past hangup.
++	stopCloseOnCancel := context.AfterFunc(ctx, func() { _ = ch.Close() })
++	defer stopCloseOnCancel()
  	allocateState := newGroupRelayAllocateStateWithHBHFEC(
  		ch.allocs[0],
  		rd.relayKeyASCII,
