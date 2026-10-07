@@ -33,6 +33,7 @@ var eventTypesWithNoProducer = []protocol.EventType{
 	protocol.EventContactPictureChanged,
 	protocol.EventContactIdentityChanged,
 	protocol.EventGroupPictureChanged,
+	protocol.EventCallAnswered,
 	protocol.EventRaw,
 }
 
@@ -60,6 +61,9 @@ func TestEveryEventTypeIsProducedOrMarkedAsNotProduced(t *testing.T) {
 var commandTypesWithNoHandler = []protocol.CommandType{
 	protocol.CommandSessionUpdate,
 	protocol.CommandContactInfo,
+	protocol.CommandCallAccept,
+	protocol.CommandCallStart,
+	protocol.CommandCallTerminate,
 }
 
 func TestEveryCommandTypeIsHandledOrMarkedAsNotHandled(t *testing.T) {
