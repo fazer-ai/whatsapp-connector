@@ -48,8 +48,11 @@ type engineCall struct {
 	call    *Call
 	callKey []byte
 	relay   *relayData
-	selfLID string
-	peerLID string
+	// boundRelays names the relays the media fanout actually connected to, set
+	// once it is up; nil before. See onRelayLatency.
+	boundRelays map[string]bool
+	selfLID     string
+	peerLID     string
 
 	creator types.JID // call-creator JID (for accept/relaylatency)
 	from    types.JID // the <call> "from" — where stanzas are addressed
@@ -880,6 +883,28 @@ func (e *engine) onRelay(callID string, data *waBinary.Node) {
 	e.maybeStartMedia(callID)
 }
 
+// endorsableRelays is the set of relay names onRelayLatency may answer for: the
+// relays the fanout connected to once it exists, the offered ones before that.
+func (e *engine) endorsableRelays(m *engineCall) map[string]bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := map[string]bool{}
+	if m.boundRelays != nil {
+		for name := range m.boundRelays {
+			out[name] = true
+		}
+		return out
+	}
+	if m.relay != nil {
+		for i := range m.relay.endpoints {
+			if name := m.relay.endpoints[i].relayName; name != "" {
+				out[name] = true
+			}
+		}
+	}
+	return out
+}
+
 // onRelayLatency answers the caller's relaylatency probes (the callee's half of the
 // relay election). It does NOT send the accept — that is deferred until <mute_v2>.
 func (e *engine) onRelayLatency(ev *events.CallRelayLatency) {
@@ -896,16 +921,13 @@ func (e *engine) onRelayLatency(ev *events.CallRelayLatency) {
 	// and holds no tokens for us; echoing that entry back tells the caller both
 	// sides reach it, the election picks it, and the caller's media moves to a
 	// relay we were never connected to.
-	e.mu.Lock()
-	offered := map[string]bool{}
-	if m.relay != nil {
-		for i := range m.relay.endpoints {
-			if name := m.relay.endpoints[i].relayName; name != "" {
-				offered[name] = true
-			}
-		}
-	}
-	e.mu.Unlock()
+	//
+	// The caller probes twice: once while ringing, before any relay is bound, and
+	// again about a second after accept, and it is that second round that elects
+	// the relay its media moves to. By then the fanout is up, and a relay that
+	// failed to connect or missed the grace is in the offer but carries nothing
+	// for us, so once the fanout exists only its relays are endorsed.
+	offered := e.endorsableRelays(m)
 
 	var probes []rlProbe
 	for i := range rl.GetChildren() {

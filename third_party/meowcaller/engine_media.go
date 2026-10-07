@@ -330,6 +330,17 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 		return err
 	}
 	defer ch.Close()
+	bound := make(map[string]bool, len(ch.names))
+	for _, name := range ch.names {
+		if name != "" {
+			bound[name] = true
+		}
+	}
+	e.mu.Lock()
+	if mm := e.calls[callID]; mm != nil {
+		mm.boundRelays = bound
+	}
+	e.mu.Unlock()
 	allocateState := newGroupRelayAllocateStateWithHBHFEC(
 		ch.allocs[0],
 		rd.relayKeyASCII,
