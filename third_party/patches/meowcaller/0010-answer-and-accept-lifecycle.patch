@@ -15,14 +15,16 @@ when an agent answers in the browser while the phone rings:
 - When sending the accept failed, acceptPending was already cleared, so nothing retried
   it, and the call and its media workers stayed up for a peer that never learned it was
   answered. The call is now finished as "accept_failed".
-- The media loop fired OnReady when setPhase(Active) reported a change, but setPhase runs
-  the state callback synchronously and that callback may hang up: OnReady then followed
-  OnEnd. The phase is checked again before OnReady.
+- The media loop fired OnReady right after setPhase(Active), but setPhase runs the state
+  callback synchronously and that callback, or a concurrent hangup, may end the call:
+  OnReady then followed OnEnd. Readiness is now claimed under the call's lock, the same
+  lock Ended is set under, and only while the call is Active, so OnReady never starts
+  on a call that has ended; the claim also makes it fire at most once.
 
-Found in the review of fazer-ai/whatsapp-connector#387, round 15.
+Found in the review of fazer-ai/whatsapp-connector#387, rounds 15 and 16.
 
 diff --git a/engine.go b/engine.go
-index 8ecb745..9e2c760 100644
+index 8ecb745..6e71150 100644
 --- a/engine.go
 +++ b/engine.go
 @@ -81,6 +81,12 @@ type engineCall struct {
@@ -38,7 +40,26 @@ index 8ecb745..9e2c760 100644
  	// acceptSent flips once the <accept> is actually on the wire. Video-state
  	// stanzas sent before it are a sequence no real client produces, and phones
  	// react badly (observed: the caller's microphone goes silent while their
-@@ -761,10 +767,16 @@ func (e *engine) answer(c *Call) error {
+@@ -141,10 +147,16 @@ func (c *Call) onEndFn() func(string) {
+ 	return c.onEnd
+ }
+ 
+-// onReadyFn returns the Call's OnReady listener under its lock.
+-func (c *Call) onReadyFn() func() {
++// claimReady returns the OnReady listener if the call is Active and readiness was
++// not claimed before, and marks it claimed; nil otherwise. Ended is set under the
++// same lock, so a claim cannot succeed once the call has ended.
++func (c *Call) claimReady() func() {
+ 	c.mu.Lock()
+ 	defer c.mu.Unlock()
++	if c.phase != CallPhaseActive || c.readyClaimed {
++		return nil
++	}
++	c.readyClaimed = true
+ 	return c.onReady
+ }
+ 
+@@ -761,10 +773,16 @@ func (e *engine) answer(c *Call) error {
  	}
  	e.mu.Lock()
  	m.acceptPending = true
@@ -55,7 +76,7 @@ index 8ecb745..9e2c760 100644
  	return nil
  }
  
-@@ -789,7 +801,11 @@ func (e *engine) sendAccept(callID string, to, creator types.JID) {
+@@ -789,7 +807,11 @@ func (e *engine) sendAccept(callID string, to, creator types.JID) {
  	})
  	accept.Attrs["id"] = e.c.wa.DangerousInternals().GenerateRequestID()
  	if err := e.c.wa.DangerousInternals().SendNode(context.Background(), accept); err != nil {
@@ -67,7 +88,7 @@ index 8ecb745..9e2c760 100644
  		return
  	}
  	e.c.log.Info().Str("call_id", callID).Bool("video", isVideo).Msg("accepted (after mute_v2)")
-@@ -1240,6 +1256,11 @@ func (e *engine) onCallRaw(callNode *waBinary.Node) bool {
+@@ -1240,6 +1262,11 @@ func (e *engine) onCallRaw(callNode *waBinary.Node) bool {
  		e.mu.Lock()
  		m := e.calls[callID]
  		pending := m != nil && m.acceptPending
@@ -80,17 +101,33 @@ index 8ecb745..9e2c760 100644
  		if m != nil && m.call != nil {
  			if fn := m.call.onMuteStateFn(); fn != nil {
 diff --git a/engine_media.go b/engine_media.go
-index 75a9186..32b9412 100644
+index 75a9186..fbecdcc 100644
 --- a/engine_media.go
 +++ b/engine_media.go
-@@ -1293,7 +1293,9 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
+@@ -1293,8 +1293,12 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
  		if rtpIn++; rtpIn == 1 {
  			log.Info().Msg("first RTP decoded from relay, inbound audio flowing")
  			e.c.diag.Emit("meta", map[string]any{"event": "first_rtp_in", "call_id": callID})
 -			if call != nil && call.setPhase(CallPhaseActive) {
-+			// Rechecked after setPhase: its state callback runs synchronously and
-+			// may itself hang up, and OnReady must not follow OnEnd.
-+			if call != nil && call.setPhase(CallPhaseActive) && call.State() == CallPhaseActive {
- 				if fn := call.onReadyFn(); fn != nil {
+-				if fn := call.onReadyFn(); fn != nil {
++			if call != nil {
++				call.setPhase(CallPhaseActive)
++				// Claimed under the call's lock, which Ended is set under too, so
++				// OnReady never starts on a call that has ended, however the state
++				// callback above or a concurrent hangup interleaves with it.
++				if fn := call.claimReady(); fn != nil {
  					fn()
  				}
+ 			}
+diff --git a/livecall.go b/livecall.go
+index 80b9b28..a59f072 100644
+--- a/livecall.go
++++ b/livecall.go
+@@ -21,6 +21,7 @@ type Call struct {
+ 	player                    *Player
+ 	sink                      AudioSink
+ 	onReady                   func()
++	readyClaimed              bool // OnReady was fired; see claimReady
+ 	onEnd                     func(reason string)
+ 	onState                   func(CallPhase)
+ 	onPeerAccept              func()

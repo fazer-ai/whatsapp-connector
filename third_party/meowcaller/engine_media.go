@@ -1293,10 +1293,12 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 		if rtpIn++; rtpIn == 1 {
 			log.Info().Msg("first RTP decoded from relay, inbound audio flowing")
 			e.c.diag.Emit("meta", map[string]any{"event": "first_rtp_in", "call_id": callID})
-			// Rechecked after setPhase: its state callback runs synchronously and
-			// may itself hang up, and OnReady must not follow OnEnd.
-			if call != nil && call.setPhase(CallPhaseActive) && call.State() == CallPhaseActive {
-				if fn := call.onReadyFn(); fn != nil {
+			if call != nil {
+				call.setPhase(CallPhaseActive)
+				// Claimed under the call's lock, which Ended is set under too, so
+				// OnReady never starts on a call that has ended, however the state
+				// callback above or a concurrent hangup interleaves with it.
+				if fn := call.claimReady(); fn != nil {
 					fn()
 				}
 			}

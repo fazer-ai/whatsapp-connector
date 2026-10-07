@@ -21,6 +21,7 @@ type Call struct {
 	player                    *Player
 	sink                      AudioSink
 	onReady                   func()
+	readyClaimed              bool // OnReady was fired; see claimReady
 	onEnd                     func(reason string)
 	onState                   func(CallPhase)
 	onPeerAccept              func()

@@ -147,10 +147,16 @@ func (c *Call) onEndFn() func(string) {
 	return c.onEnd
 }
 
-// onReadyFn returns the Call's OnReady listener under its lock.
-func (c *Call) onReadyFn() func() {
+// claimReady returns the OnReady listener if the call is Active and readiness was
+// not claimed before, and marks it claimed; nil otherwise. Ended is set under the
+// same lock, so a claim cannot succeed once the call has ended.
+func (c *Call) claimReady() func() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.phase != CallPhaseActive || c.readyClaimed {
+		return nil
+	}
+	c.readyClaimed = true
 	return c.onReady
 }
 
