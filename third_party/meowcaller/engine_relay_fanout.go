@@ -219,27 +219,36 @@ func newRtpReplayFilter() *rtpReplayFilter {
 	return &rtpReplayFilter{streams: make(map[uint32]*replayRing)}
 }
 
-// Duplicate records (ssrc, seq) and reports whether it was already seen.
-func (r *rtpReplayFilter) Duplicate(ssrc uint32, seq uint16) bool {
+// Seen reports whether (ssrc, seq) was already recorded, without recording it.
+// The check runs before SRTP authentication and the record after it, so a forged
+// copy arriving through one relay cannot suppress the authentic one arriving
+// through another.
+func (r *rtpReplayFilter) Seen(ssrc uint32, seq uint16) bool {
+	ring, ok := r.streams[ssrc]
+	if !ok || !ring.primed {
+		return false
+	}
+	slot := int(seq) % 1024
+	word, bit := slot/64, uint(slot%64)
+	return ring.seen[word]&(1<<bit) != 0 && ring.seq[slot] == seq
+}
+
+// Record marks (ssrc, seq) as seen. Call it once the packet authenticated.
+func (r *rtpReplayFilter) Record(ssrc uint32, seq uint16) {
 	ring, ok := r.streams[ssrc]
 	if !ok {
-		// This runs before SRTP authentication, so the SSRC is whatever the
-		// packet claims. Past the cap an unknown stream is passed through
-		// unfiltered rather than given a ring: a 1:1 call carries a handful of
-		// SSRCs, and SRTP still rejects what is forged.
+		// Authenticated or not, a 1:1 call carries a handful of SSRCs. Past the
+		// cap an unknown stream is passed through unfiltered rather than given a
+		// ring, so the filter's memory stays bounded whatever the peer sends.
 		if len(r.streams) >= maxReplayStreams {
-			return false
+			return
 		}
 		ring = &replayRing{}
 		r.streams[ssrc] = ring
 	}
 	slot := int(seq) % 1024
 	word, bit := slot/64, uint(slot%64)
-	if ring.primed && ring.seen[word]&(1<<bit) != 0 && ring.seq[slot] == seq {
-		return true
-	}
 	ring.primed = true
 	ring.seen[word] |= 1 << bit
 	ring.seq[slot] = seq
-	return false
 }

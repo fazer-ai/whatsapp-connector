@@ -559,6 +559,12 @@ func (e *engine) placeCall(ctx context.Context, target string, opts CallOptions)
 // preparation step, independent of the later Answer/Reject), and fires the
 // OnIncomingCall listener. Only the <accept> is deferred to Answer.
 func (e *engine) onOffer(ev *events.CallOffer) {
+	// Consumed before any return below, so a mark never outlives its offer.
+	e.mu.Lock()
+	_, stale := e.staleOffers[ev.CallID]
+	delete(e.staleOffers, ev.CallID)
+	e.mu.Unlock()
+
 	// Source of truth: https://github.com/purpshell/meowcaller/blob/33854919e64bdd4b053054ac9764d8fc63027b57/datasheets/voip-group-invite-accept.md#L28-L40
 	groupSnapshot, isGroup, groupErr := signaling.ParseGroupInviteSnapshot(ev.Data)
 	if groupErr != nil {
@@ -587,11 +593,7 @@ func (e *engine) onOffer(ev *events.CallOffer) {
 	// cannot be answered — ringing it just races the queued terminate.
 	//
 	// `e` is on the <call> wrapper, and whatsmeow hands CallOffer only the <offer>
-	// child, so onCallRaw reads it on the way in and marks the call here.
-	e.mu.Lock()
-	_, stale := e.staleOffers[ev.CallID]
-	delete(e.staleOffers, ev.CallID)
-	e.mu.Unlock()
+	// child, so onCallRaw reads it on the way in; the mark was consumed at the top.
 	if stale {
 		e.c.log.Warn().Str("call_id", ev.CallID).Msg("ignoring stale offer replayed from the offline queue")
 		return

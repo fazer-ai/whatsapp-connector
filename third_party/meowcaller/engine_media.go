@@ -1040,7 +1040,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 		// With bind-to-all, the same packet can arrive once per relay. A
 		// duplicate reaching the playout buffer reads as a zero timestamp delta
 		// and resets it, so drop replays before any processing.
-		if rtpDedup.Duplicate(vh.Ssrc, vh.SequenceNumber) {
+		if rtpDedup.Seen(vh.Ssrc, vh.SequenceNumber) {
 			continue
 		}
 		kind := classifyMediaPayload(vh)
@@ -1053,6 +1053,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 				e.c.diag.Emit("app_data", map[string]any{"event": "unprotect_failed", "ssrc": vh.Ssrc, "seq": vh.SequenceNumber})
 				continue
 			}
+			rtpDedup.Record(vh.Ssrc, vh.SequenceNumber)
 			receiver := appDataReceivers[media.receiver]
 			if receiver == nil {
 				receiver = &appDataReceiver{}
@@ -1093,6 +1094,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 				e.c.diag.Emit("video", map[string]any{"event": "unprotect_failed", "ssrc": vh.Ssrc, "seq": vh.SequenceNumber})
 				continue
 			}
+			rtpDedup.Record(vh.Ssrc, vh.SequenceNumber)
 			vh = media.Header
 			videoState := videoReceiveStates[media.receiver]
 			if videoState == nil {
@@ -1206,6 +1208,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 			e.c.diag.Emit("srtp", map[string]any{"event": "unprotect_failed", "ssrc": vh.Ssrc, "bytes": n})
 			continue
 		}
+		rtpDedup.Record(vh.Ssrc, vh.SequenceNumber)
 		audioReception.Observe(audio.SSRC, vh.SequenceNumber, audio.Timestamp, uint64(time.Now().UnixMilli()), SampleRate)
 		e.c.diag.Emit("rtp", map[string]any{
 			"event": "in", "ssrc": audio.SSRC, "seq": vh.SequenceNumber,
