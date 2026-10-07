@@ -10,9 +10,10 @@ Why:
   round at 13:01:14), and the second round elects the relay its media moves to. A
   relay that failed to connect, or that 0004 left out for missing its 2 s grace,
   was still endorsed then, and electing it silences inbound audio while another
-  relay is connected. connectAndAllocateAll now reports each relay as it connects,
-  runMedia records it, and once the first one has, onRelayLatency answers only for
-  the connected ones. Recording as they connect, rather than when collection ends,
+  relay is connected. connectAndAllocateAll now reports each relay as it connects
+  and the fanout each one whose connection dies, runMedia keeps that set, and once
+  the first relay has connected onRelayLatency answers only for the ones still held
+  (none, if they are all gone). Recording as they connect, rather than when collection ends,
   matters because the post-accept probes can land inside the grace. Before any
   relay connects it still answers for the offered ones, all there is to go on.
 - The fanout's Recv waits for a packet or for the fanout to close, not for the
@@ -20,43 +21,45 @@ Why:
   the media goroutine, the relay readers and the sockets past hangup. runMedia now
   closes the fanout when its context ends.
 
-Found in the review of fazer-ai/whatsapp-connector#387 (rounds 1, 7, 8 and 9);
+Found in the review of fazer-ai/whatsapp-connector#387 (rounds 1, 7, 8, 9 and 10);
 tracked as fazer-ai/whatsapp-connector#388.
 
 diff --git a/engine.go b/engine.go
-index 248852f..a56f879 100644
+index 248852f..2b88830 100644
 --- a/engine.go
 +++ b/engine.go
-@@ -48,8 +48,11 @@ type engineCall struct {
+@@ -48,8 +48,12 @@ type engineCall struct {
  	call    *Call
  	callKey []byte
  	relay   *relayData
 -	selfLID string
 -	peerLID string
-+	// boundRelays names the relays the media fanout connected to, each added as
-+	// it connects; nil until the first one does. See onRelayLatency.
++	// boundRelays names the relays the media fanout holds, each added as it
++	// connects and removed when its connection dies; nil until the first one
++	// connects, and empty, not nil, once they are all gone. See onRelayLatency.
 +	boundRelays map[string]bool
 +	selfLID     string
 +	peerLID     string
  
  	creator types.JID // call-creator JID (for accept/relaylatency)
  	from    types.JID // the <call> "from" — where stanzas are addressed
-@@ -880,6 +883,29 @@ func (e *engine) onRelay(callID string, data *waBinary.Node) {
+@@ -880,6 +884,30 @@ func (e *engine) onRelay(callID string, data *waBinary.Node) {
  	e.maybeStartMedia(callID)
  }
  
 +// endorsableRelays is the set of relay names onRelayLatency may answer for: the
-+// relays the fanout has connected to once the first one has, the offered ones
-+// before that.
-+func (e *engine) endorsableRelays(m *engineCall) map[string]bool {
++// relays the fanout holds once the first one has connected, the offered ones
++// before that. restrict is false only when there is nothing to go on (no fanout
++// yet and no names in the offer), and then every probe is answered as before.
++func (e *engine) endorsableRelays(m *engineCall) (out map[string]bool, restrict bool) {
 +	e.mu.Lock()
 +	defer e.mu.Unlock()
-+	out := map[string]bool{}
++	out = map[string]bool{}
 +	if m.boundRelays != nil {
 +		for name := range m.boundRelays {
 +			out[name] = true
 +		}
-+		return out
++		return out, true
 +	}
 +	if m.relay != nil {
 +		for i := range m.relay.endpoints {
@@ -65,13 +68,13 @@ index 248852f..a56f879 100644
 +			}
 +		}
 +	}
-+	return out
++	return out, len(out) > 0
 +}
 +
  // onRelayLatency answers the caller's relaylatency probes (the callee's half of the
  // relay election). It does NOT send the accept — that is deferred until <mute_v2>.
  func (e *engine) onRelayLatency(ev *events.CallRelayLatency) {
-@@ -896,16 +922,13 @@ func (e *engine) onRelayLatency(ev *events.CallRelayLatency) {
+@@ -896,16 +924,13 @@ func (e *engine) onRelayLatency(ev *events.CallRelayLatency) {
  	// and holds no tokens for us; echoing that entry back tells the caller both
  	// sides reach it, the election picks it, and the caller's media moves to a
  	// relay we were never connected to.
@@ -91,12 +94,21 @@ index 248852f..a56f879 100644
 +	// the relay its media moves to. By then the fanout is up, and a relay that
 +	// failed to connect or missed the grace is in the offer but carries nothing
 +	// for us, so once a relay is connected only the connected ones are endorsed.
-+	offered := e.endorsableRelays(m)
++	offered, restrict := e.endorsableRelays(m)
  
  	var probes []rlProbe
  	for i := range rl.GetChildren() {
+@@ -915,7 +940,7 @@ func (e *engine) onRelayLatency(ev *events.CallRelayLatency) {
+ 		}
+ 		ag := te.AttrGetter()
+ 		name := ag.String("relay_name")
+-		if len(offered) > 0 && !offered[name] {
++		if restrict && !offered[name] {
+ 			e.c.log.Debug().Str("call_id", ev.CallID).Str("relay_name", name).Msg("skipping latency response for relay outside the offer")
+ 			continue
+ 		}
 diff --git a/engine_media.go b/engine_media.go
-index 6acd94f..4be3191 100644
+index 6acd94f..7eecd2c 100644
 --- a/engine_media.go
 +++ b/engine_media.go
 @@ -124,7 +124,7 @@ const relayConnectGrace = 2 * time.Second
@@ -104,7 +116,7 @@ index 6acd94f..4be3191 100644
  //
  // NOT VALIDATED: live-relay only.
 -func (e *engine) connectAndAllocateAll(ctx context.Context, rd *relayData, streamSsrcs [9]uint32, inbound bool, multi bool) (*relayFanout, error) {
-+func (e *engine) connectAndAllocateAll(ctx context.Context, rd *relayData, streamSsrcs [9]uint32, inbound bool, multi bool, onBound func(relayName string)) (*relayFanout, error) {
++func (e *engine) connectAndAllocateAll(ctx context.Context, rd *relayData, streamSsrcs [9]uint32, inbound bool, multi bool, onBound, onLost func(relayName string)) (*relayFanout, error) {
  	primary := getMediaRelayEndpoint(rd, inbound)
  	if primary == nil || len(primary.addresses) == 0 {
  		return nil, fmt.Errorf("relay has no usable endpoint")
@@ -126,14 +138,24 @@ index 6acd94f..4be3191 100644
  			}
  		case <-grace:
  			break collect
-@@ -325,11 +332,30 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
+@@ -214,7 +221,7 @@ collect:
+ 		return nil, fmt.Errorf("no relay reachable (%d offered)", len(targets))
+ 	}
+ 	e.c.log.Info().Int("connected", len(chans)).Int("offered", len(targets)).Strs("relays", names).Msg("relay fanout established")
+-	return newRelayFanout(chans, allocs, names), nil
++	return newRelayFanout(chans, allocs, names, onLost), nil
+ }
+ 
+ // connectOneRelay opens the relay DataChannel and sends the STUN allocate for a
+@@ -325,11 +332,38 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
  	}
  	e.mu.Unlock()
  
 -	ch, err := e.connectAndAllocateAll(ctx, rd, streamSsrcs, inbound, !isGroup)
 +	// Each relay the fanout keeps is recorded the moment it connects, for
-+	// onRelayLatency to endorse; one that never connects never is.
-+	ch, err := e.connectAndAllocateAll(ctx, rd, streamSsrcs, inbound, !isGroup, func(name string) {
++	// onRelayLatency to endorse, and dropped when its connection dies; one that
++	// never connects never is.
++	setBound := func(name string, bound bool) {
 +		if name == "" {
 +			return
 +		}
@@ -142,10 +164,17 @@ index 6acd94f..4be3191 100644
 +			if mm.boundRelays == nil {
 +				mm.boundRelays = map[string]bool{}
 +			}
-+			mm.boundRelays[name] = true
++			if bound {
++				mm.boundRelays[name] = true
++			} else {
++				delete(mm.boundRelays, name)
++			}
 +		}
 +		e.mu.Unlock()
-+	})
++	}
++	ch, err := e.connectAndAllocateAll(ctx, rd, streamSsrcs, inbound, !isGroup,
++		func(name string) { setBound(name, true) },
++		func(name string) { setBound(name, false) })
  	if err != nil {
  		return err
  	}
@@ -158,3 +187,43 @@ index 6acd94f..4be3191 100644
  	allocateState := newGroupRelayAllocateStateWithHBHFEC(
  		ch.allocs[0],
  		rd.relayKeyASCII,
+diff --git a/engine_relay_fanout.go b/engine_relay_fanout.go
+index b2fc440..5efa648 100644
+--- a/engine_relay_fanout.go
++++ b/engine_relay_fanout.go
+@@ -41,7 +41,10 @@ var errFanoutClosed = errors.New("meowcaller: relay fanout closed")
+ 
+ // newRelayFanout takes ownership of the channels and their matching per-relay
+ // allocate payloads, and starts one reader per channel.
+-func newRelayFanout(chans []*relay.RelayMediaChannel, allocs [][]byte, names []string) *relayFanout {
++//
++// onLost, when set, is told the name of each relay whose reader exits, so whoever
++// advertises the bound relays stops advertising one that is gone.
++func newRelayFanout(chans []*relay.RelayMediaChannel, allocs [][]byte, names []string, onLost func(relayName string)) *relayFanout {
+ 	// Source of truth: https://github.com/JotaDev66/WaCalls/blob/edeb31f0427aba896639db503153b777a405eccf/internal/voip/transport/sctprelay.go#L105-L127
+ 	f := &relayFanout{
+ 		chans:   chans,
+@@ -51,17 +54,20 @@ func newRelayFanout(chans []*relay.RelayMediaChannel, allocs [][]byte, names []s
+ 		done:    make(chan struct{}),
+ 		live:    len(chans),
+ 	}
+-	for _, ch := range chans {
+-		go f.readLoop(ch)
++	for i, ch := range chans {
++		go f.readLoop(ch, names[i], onLost)
+ 	}
+ 	return f
+ }
+ 
+-func (f *relayFanout) readLoop(ch *relay.RelayMediaChannel) {
++func (f *relayFanout) readLoop(ch *relay.RelayMediaChannel, name string, onLost func(string)) {
+ 	buf := make([]byte, 2048)
+ 	for {
+ 		n, err := ch.Recv(buf)
+ 		if err != nil {
++			if onLost != nil {
++				onLost(name)
++			}
+ 			f.readerExited()
+ 			return
+ 		}

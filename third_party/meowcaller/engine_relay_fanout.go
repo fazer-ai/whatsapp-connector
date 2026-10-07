@@ -41,7 +41,10 @@ var errFanoutClosed = errors.New("meowcaller: relay fanout closed")
 
 // newRelayFanout takes ownership of the channels and their matching per-relay
 // allocate payloads, and starts one reader per channel.
-func newRelayFanout(chans []*relay.RelayMediaChannel, allocs [][]byte, names []string) *relayFanout {
+//
+// onLost, when set, is told the name of each relay whose reader exits, so whoever
+// advertises the bound relays stops advertising one that is gone.
+func newRelayFanout(chans []*relay.RelayMediaChannel, allocs [][]byte, names []string, onLost func(relayName string)) *relayFanout {
 	// Source of truth: https://github.com/JotaDev66/WaCalls/blob/edeb31f0427aba896639db503153b777a405eccf/internal/voip/transport/sctprelay.go#L105-L127
 	f := &relayFanout{
 		chans:   chans,
@@ -51,17 +54,20 @@ func newRelayFanout(chans []*relay.RelayMediaChannel, allocs [][]byte, names []s
 		done:    make(chan struct{}),
 		live:    len(chans),
 	}
-	for _, ch := range chans {
-		go f.readLoop(ch)
+	for i, ch := range chans {
+		go f.readLoop(ch, names[i], onLost)
 	}
 	return f
 }
 
-func (f *relayFanout) readLoop(ch *relay.RelayMediaChannel) {
+func (f *relayFanout) readLoop(ch *relay.RelayMediaChannel, name string, onLost func(string)) {
 	buf := make([]byte, 2048)
 	for {
 		n, err := ch.Recv(buf)
 		if err != nil {
+			if onLost != nil {
+				onLost(name)
+			}
 			f.readerExited()
 			return
 		}

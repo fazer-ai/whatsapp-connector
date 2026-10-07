@@ -124,7 +124,7 @@ const relayConnectGrace = 2 * time.Second
 // multi=false preserves the original single-relay behavior (group calls).
 //
 // NOT VALIDATED: live-relay only.
-func (e *engine) connectAndAllocateAll(ctx context.Context, rd *relayData, streamSsrcs [9]uint32, inbound bool, multi bool, onBound func(relayName string)) (*relayFanout, error) {
+func (e *engine) connectAndAllocateAll(ctx context.Context, rd *relayData, streamSsrcs [9]uint32, inbound bool, multi bool, onBound, onLost func(relayName string)) (*relayFanout, error) {
 	primary := getMediaRelayEndpoint(rd, inbound)
 	if primary == nil || len(primary.addresses) == 0 {
 		return nil, fmt.Errorf("relay has no usable endpoint")
@@ -221,7 +221,7 @@ collect:
 		return nil, fmt.Errorf("no relay reachable (%d offered)", len(targets))
 	}
 	e.c.log.Info().Int("connected", len(chans)).Int("offered", len(targets)).Strs("relays", names).Msg("relay fanout established")
-	return newRelayFanout(chans, allocs, names), nil
+	return newRelayFanout(chans, allocs, names, onLost), nil
 }
 
 // connectOneRelay opens the relay DataChannel and sends the STUN allocate for a
@@ -333,8 +333,9 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 	e.mu.Unlock()
 
 	// Each relay the fanout keeps is recorded the moment it connects, for
-	// onRelayLatency to endorse; one that never connects never is.
-	ch, err := e.connectAndAllocateAll(ctx, rd, streamSsrcs, inbound, !isGroup, func(name string) {
+	// onRelayLatency to endorse, and dropped when its connection dies; one that
+	// never connects never is.
+	setBound := func(name string, bound bool) {
 		if name == "" {
 			return
 		}
@@ -343,10 +344,17 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 			if mm.boundRelays == nil {
 				mm.boundRelays = map[string]bool{}
 			}
-			mm.boundRelays[name] = true
+			if bound {
+				mm.boundRelays[name] = true
+			} else {
+				delete(mm.boundRelays, name)
+			}
 		}
 		e.mu.Unlock()
-	})
+	}
+	ch, err := e.connectAndAllocateAll(ctx, rd, streamSsrcs, inbound, !isGroup,
+		func(name string) { setBound(name, true) },
+		func(name string) { setBound(name, false) })
 	if err != nil {
 		return err
 	}

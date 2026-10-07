@@ -48,8 +48,9 @@ type engineCall struct {
 	call    *Call
 	callKey []byte
 	relay   *relayData
-	// boundRelays names the relays the media fanout connected to, each added as
-	// it connects; nil until the first one does. See onRelayLatency.
+	// boundRelays names the relays the media fanout holds, each added as it
+	// connects and removed when its connection dies; nil until the first one
+	// connects, and empty, not nil, once they are all gone. See onRelayLatency.
 	boundRelays map[string]bool
 	selfLID     string
 	peerLID     string
@@ -884,17 +885,18 @@ func (e *engine) onRelay(callID string, data *waBinary.Node) {
 }
 
 // endorsableRelays is the set of relay names onRelayLatency may answer for: the
-// relays the fanout has connected to once the first one has, the offered ones
-// before that.
-func (e *engine) endorsableRelays(m *engineCall) map[string]bool {
+// relays the fanout holds once the first one has connected, the offered ones
+// before that. restrict is false only when there is nothing to go on (no fanout
+// yet and no names in the offer), and then every probe is answered as before.
+func (e *engine) endorsableRelays(m *engineCall) (out map[string]bool, restrict bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	out := map[string]bool{}
+	out = map[string]bool{}
 	if m.boundRelays != nil {
 		for name := range m.boundRelays {
 			out[name] = true
 		}
-		return out
+		return out, true
 	}
 	if m.relay != nil {
 		for i := range m.relay.endpoints {
@@ -903,7 +905,7 @@ func (e *engine) endorsableRelays(m *engineCall) map[string]bool {
 			}
 		}
 	}
-	return out
+	return out, len(out) > 0
 }
 
 // onRelayLatency answers the caller's relaylatency probes (the callee's half of the
@@ -928,7 +930,7 @@ func (e *engine) onRelayLatency(ev *events.CallRelayLatency) {
 	// the relay its media moves to. By then the fanout is up, and a relay that
 	// failed to connect or missed the grace is in the offer but carries nothing
 	// for us, so once a relay is connected only the connected ones are endorsed.
-	offered := e.endorsableRelays(m)
+	offered, restrict := e.endorsableRelays(m)
 
 	var probes []rlProbe
 	for i := range rl.GetChildren() {
@@ -938,7 +940,7 @@ func (e *engine) onRelayLatency(ev *events.CallRelayLatency) {
 		}
 		ag := te.AttrGetter()
 		name := ag.String("relay_name")
-		if len(offered) > 0 && !offered[name] {
+		if restrict && !offered[name] {
 			e.c.log.Debug().Str("call_id", ev.CallID).Str("relay_name", name).Msg("skipping latency response for relay outside the offer")
 			continue
 		}
@@ -1767,7 +1769,9 @@ func parseIndexedTokens(node *waBinary.Node, tag string) [][]byte {
 				id = n
 			}
 		}
-		if id >= maxRelayTokens {
+		// The id is wire input: a negative one passed the upper bound and
+		// indexed the slice, panicking while onOffer holds e.mu.
+		if id < 0 || id >= maxRelayTokens {
 			continue
 		}
 		for len(tokens) <= id {
