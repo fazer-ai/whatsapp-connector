@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"context"
 	"fmt"
 	"net"
 
@@ -127,6 +128,15 @@ func (c *RelayMediaChannel) Recv(buf []byte) (int, error) {
 // relay endpoint. Self-signed cert; server-cert verification skipped (media auth is
 // HBH SRTP, not DTLS). No vector — validated only against a live relay.
 func ConnectRelayMedia(relayAddr *net.UDPAddr, opts ...Option) (*RelayMediaChannel, error) {
+	return ConnectRelayMediaContext(context.Background(), relayAddr, opts...)
+}
+
+// ConnectRelayMediaContext is ConnectRelayMedia bounded by ctx: when ctx ends
+// before the DataChannel is open, the UDP socket is closed, which fails the
+// handshake in progress and releases everything it had allocated. The returned
+// error then wraps ctx.Err(). A channel that is returned is not affected by ctx
+// afterwards.
+func ConnectRelayMediaContext(ctx context.Context, relayAddr *net.UDPAddr, opts ...Option) (*RelayMediaChannel, error) {
 	// NOT VALIDATED: no vector exists for the live transport; exercised only against a real relay.
 	// Source of truth: https://github.com/oxidezap/whatsapp-rust/blob/41095d4e6ba4610e054e9ede3af1d5e88a83faee/src/voip/transport.rs#L136-L195
 	cfg := resolveConfig(opts)
@@ -150,6 +160,29 @@ func ConnectRelayMedia(relayAddr *net.UDPAddr, opts ...Option) (*RelayMediaChann
 	}
 	cleanup = append(cleanup, udp.Close)
 	lg.Debug().Str("local_addr", udp.LocalAddr().String()).Msg("relay udp socket bound")
+
+	// Closing the socket is the only cancellation the DTLS and SCTP clients
+	// below honour. stop() reports whether ctx won the race, so a connect that
+	// finished at the same instant is not handed back over a closed socket.
+	stop := context.AfterFunc(ctx, func() { _ = udp.Close() })
+	connected := func(ch *RelayMediaChannel) (*RelayMediaChannel, error) {
+		if !stop() {
+			_ = ch.Close()
+			return nil, &CallTransportError{Op: "connect", Err: ctx.Err()}
+		}
+		return ch, nil
+	}
+	fail = func(err error) (*RelayMediaChannel, error) {
+		stop()
+		for i := len(cleanup) - 1; i >= 0; i-- {
+			_ = cleanup[i]()
+		}
+		if ctx.Err() != nil {
+			err = fmt.Errorf("%w (%w)", ctx.Err(), err)
+		}
+		lg.Debug().Err(err).Msg("relay media connect failed")
+		return nil, &CallTransportError{Op: "connect", Err: err}
+	}
 
 	// 2. DTLS client (self-signed cert; skip server-cert verification).
 	cert, err := selfsign.GenerateSelfSignedWithDNS("wa-voip")
@@ -186,5 +219,5 @@ func ConnectRelayMedia(relayAddr *net.UDPAddr, opts ...Option) (*RelayMediaChann
 	}
 	lg.Debug().Str("label", DataChannelLabel).Msg("relay datachannel open")
 
-	return &RelayMediaChannel{udp: udp, dtlsConn: dtlsConn, assoc: assoc, dc: dc, log: lg}, nil
+	return connected(&RelayMediaChannel{udp: udp, dtlsConn: dtlsConn, assoc: assoc, dc: dc, log: lg})
 }

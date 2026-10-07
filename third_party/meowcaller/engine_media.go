@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -233,26 +234,14 @@ func (e *engine) connectOneRelay(ctx context.Context, rd *relayData, ep *relayEn
 		"ipv4": ep.addresses[0].ipv4, "port": ep.addresses[0].port, "token_id": ep.tokenID,
 	})
 
-	type result struct {
-		ch  *relay.RelayMediaChannel
-		err error
-	}
-	done := make(chan result, 1)
-	go func() {
-		ch, err := relay.ConnectRelayMedia(addr, relay.WithLogger(log))
-		done <- result{ch, err}
-	}()
-	var ch *relay.RelayMediaChannel
-	select {
-	case r := <-done:
-		if r.err != nil {
-			return nil, nil, fmt.Errorf("relay connect: %w", r.err)
+	dialCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
+	ch, err := relay.ConnectRelayMediaContext(dialCtx, addr, relay.WithLogger(log))
+	cancel()
+	if err != nil {
+		if ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded) {
+			return nil, nil, fmt.Errorf("relay connect timed out (DTLS didn't complete)")
 		}
-		ch = r.ch
-	case <-time.After(12 * time.Second):
-		return nil, nil, fmt.Errorf("relay connect timed out (DTLS didn't complete)")
-	case <-ctx.Done():
-		return nil, nil, ctx.Err()
+		return nil, nil, fmt.Errorf("relay connect: %w", err)
 	}
 	log.Info().Str("relay_name", ep.relayName).Msg("relay DataChannel open")
 
