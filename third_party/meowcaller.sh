@@ -30,11 +30,12 @@ build() {
 	rm -rf "$out/.git"
 
 	# Upstream builds against a whatsmeow fork with the same packages; this repository
-	# builds against whatsmeow itself. The rewrite is a path and nothing else (upstream's
-	# own #33 says the same of the fork), so it is done here rather than kept as a patch
-	# touching every file. The require line it leaves names a fork version that whatsmeow
-	# does not have, and the first patch is what sets it to this repository's pin.
-	grep -rlF 'github.com/polymorfa/hypermeow' "$out" | while IFS= read -r f; do
+	# builds against whatsmeow itself. In the Go sources the change is an import path and
+	# nothing else (upstream's own #33 says the same of the fork), so it is done here
+	# rather than kept as a patch touching every file. go.mod and go.sum are not
+	# rewritten: the first patch replaces the fork's requirement with this repository's
+	# whatsmeow pin, which a path substitution could not get right anyway.
+	grep -rlF --include='*.go' 'github.com/polymorfa/hypermeow' "$out" | while IFS= read -r f; do
 		perl -pi -e 's#github\.com/polymorfa/hypermeow#go.mau.fi/whatsmeow#g' "$f"
 	done
 

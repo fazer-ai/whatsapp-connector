@@ -2,7 +2,7 @@
 
 `meowcaller/` is [purpshell/meowcaller](https://github.com/purpshell/meowcaller) at the commit in `meowcaller.pin`, with these changes on top, and `go.mod` replaces the module with it:
 
-- the import path `github.com/polymorfa/hypermeow` (the whatsmeow fork upstream builds against) rewritten to `go.mau.fi/whatsmeow`, which `meowcaller.sh` does as a plain text substitution;
+- the import path `github.com/polymorfa/hypermeow` (the whatsmeow fork upstream builds against) rewritten to `go.mau.fi/whatsmeow` in the Go sources, which `meowcaller.sh` does as a plain text substitution (`go.mod` and `go.sum` are the first patch's);
 - the patches in `patches/meowcaller/`, applied in lexical order. Each one says where it came from and why it is here.
 - upstream's tests left out: every `*_test.go` and every `testdata/` directory. Nothing here runs their suite, and its crypto known-answer vectors read as secrets to the push guard of this public repository. Everything that builds is kept.
 

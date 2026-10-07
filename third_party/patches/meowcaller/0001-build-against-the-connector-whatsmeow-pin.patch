@@ -4,13 +4,13 @@ Origin: fazer-ai/whatsapp-connector, not upstream.
 
 Why: meowcaller requires github.com/polymorfa/hypermeow, a whatsmeow fork with the
 same packages. third_party/meowcaller.sh rewrites that import path to go.mau.fi/whatsmeow
-(upstream's own #33 says the fork needs no code change), which leaves a require line
-naming a fork pseudo-version whatsmeow does not have. This sets it to the pin in the
-connector's go.mod and is the `go mod tidy` that follows. A whatsmeow bump in the
-connector regenerates this patch.
+in the Go sources (upstream's own #33 says the fork needs no code change); go.mod and
+go.sum are left to this patch, which drops the fork's requirement, requires whatsmeow at
+the pin in the connector's go.mod, and is the `go mod tidy` that follows. A whatsmeow
+bump in the connector regenerates this patch.
 
 diff --git a/go.mod b/go.mod
-index 9a6ca61..f38c26f 100644
+index 033239b..47c487c 100644
 --- a/go.mod
 +++ b/go.mod
 @@ -1,6 +1,6 @@
@@ -21,24 +21,25 @@ index 9a6ca61..f38c26f 100644
  
  require (
  	github.com/hajimehoshi/go-mp3 v0.3.4
-@@ -9,24 +9,27 @@ require (
+@@ -9,9 +9,15 @@ require (
  	github.com/pion/logging v0.2.4
  	github.com/pion/opus v0.1.0
  	github.com/pion/sctp v1.9.4
--	go.mau.fi/whatsmeow v0.0.0-20260906031440-90f9e4ec2c88
+-	github.com/polymorfa/hypermeow v0.0.0-20260906031440-90f9e4ec2c88
  	github.com/rs/zerolog v1.35.1
 -	google.golang.org/protobuf v1.36.11
-+	go.mau.fi/whatsmeow v0.0.0-20260821141805-33cfac511629
 +	google.golang.org/protobuf v1.36.12
++)
++
++require (
++	github.com/beeper/argo-go v1.1.2 // indirect
++	github.com/elliotchance/orderedmap/v3 v3.1.0 // indirect
++	github.com/vektah/gqlparser/v2 v2.5.27 // indirect
++	go.mau.fi/libsignal v0.2.2 // indirect
  )
  
  require (
- 	filippo.io/edwards25519 v1.2.0 // indirect
-+	github.com/beeper/argo-go v1.1.2 // indirect
- 	github.com/coder/websocket v1.8.15 // indirect
-+	github.com/elliotchance/orderedmap/v3 v3.1.0 // indirect
- 	github.com/google/uuid v1.6.0 // indirect
- 	github.com/mattn/go-colorable v0.1.14 // indirect
+@@ -22,11 +28,11 @@ require (
  	github.com/mattn/go-isatty v0.0.20 // indirect
  	github.com/pion/randutil v0.1.0 // indirect
  	github.com/pion/transport/v4 v4.0.1 // indirect
@@ -46,9 +47,8 @@ index 9a6ca61..f38c26f 100644
 -	go.mau.fi/util v0.9.12-0.20260717235539-f9ffa7eca58d // indirect
 -	golang.org/x/crypto v0.54.0 // indirect
 -	golang.org/x/net v0.57.0 // indirect
-+	github.com/vektah/gqlparser/v2 v2.5.27 // indirect
-+	go.mau.fi/libsignal v0.2.2 // indirect
 +	go.mau.fi/util v0.10.1-0.20260820140024-eb612d936fde // indirect
++	go.mau.fi/whatsmeow v0.0.0-20260821141805-33cfac511629
 +	golang.org/x/crypto v0.55.0 // indirect
 +	golang.org/x/net v0.58.0 // indirect
  	golang.org/x/sync v0.22.0 // indirect
@@ -57,7 +57,7 @@ index 9a6ca61..f38c26f 100644
 +	golang.org/x/text v0.41.0 // indirect
  )
 diff --git a/go.sum b/go.sum
-index ff2b13d..e5362df 100644
+index 67ea8ac..e5362df 100644
 --- a/go.sum
 +++ b/go.sum
 @@ -1,9 +1,17 @@
@@ -93,8 +93,8 @@ index ff2b13d..e5362df 100644
  github.com/pion/transport/v4 v4.0.1/go.mod h1:nEuEA4AD5lPdcIegQDpVLgNoDGreqM/YqmEx3ovP4jM=
  github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
  github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
--go.mau.fi/whatsmeow v0.0.0-20260906031440-90f9e4ec2c88 h1:HuHIp7gS/ZUrwSbWfD0ddchti9wQn4teCTY5s/1stpU=
--go.mau.fi/whatsmeow v0.0.0-20260906031440-90f9e4ec2c88/go.mod h1:PiCnzHA8H+kDlvW7XLoigDWRGRmjfZweN5WH2qiFx+s=
+-github.com/polymorfa/hypermeow v0.0.0-20260906031440-90f9e4ec2c88 h1:HuHIp7gS/ZUrwSbWfD0ddchti9wQn4teCTY5s/1stpU=
+-github.com/polymorfa/hypermeow v0.0.0-20260906031440-90f9e4ec2c88/go.mod h1:PiCnzHA8H+kDlvW7XLoigDWRGRmjfZweN5WH2qiFx+s=
 -github.com/polymorfa/libsignal-protocol-go v0.2.3-0.20260806162910-a2adef2e8a11 h1:ZeZ6sUkmZY+v6ULce+O7cuuzUmvu9d3t5sY2CTrJ2AQ=
 -github.com/polymorfa/libsignal-protocol-go v0.2.3-0.20260806162910-a2adef2e8a11/go.mod h1:B5KZPsgswdf1eCvC+PZ7z45g5OECgqy6Zb0o7I5CcNQ=
  github.com/rs/zerolog v1.35.1 h1:m7xQeoiLIiV0BCEY4Hs+j2NG4Gp2o2KPKmhnnLiazKI=
