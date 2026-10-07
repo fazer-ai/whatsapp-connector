@@ -6,6 +6,8 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+
+	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 )
 
 // The contract's normative prose has to live where a vendoring client receives it.
@@ -87,4 +89,55 @@ func TestTheUnvendoredHalfCarriesNoClientObligation(t *testing.T) {
 		"reading the contract never sees these %d sentence(s). Move them to contract/PROTOCOL.md, "+
 		"which travels and is counted in the client's checksum:\n\n  - %s",
 		len(offenders), strings.Join(offenders, "\n  - "))
+}
+
+// A caller blocks on the reply of an RPC command, so the shape of its `result` is part of
+// the contract, and PROTOCOL.md lists it under "RPC results". The schema does not describe
+// results at all, which leaves the table as the only place a client learns what to parse,
+// and nothing else noticed when a command became an RPC without a row there. Both
+// directions: every RPC command has a row, and every row names an RPC command.
+//
+// `session.update` is the one exception, and the table's own introduction says why: it
+// answers `{"ok": true}` and no result of its own.
+func TestEveryRPCCommandHasARowInTheResultsTable(t *testing.T) {
+	t.Parallel()
+
+	raw, err := os.ReadFile(filepath.Join(contractDir, "PROTOCOL.md"))
+	if err != nil {
+		t.Fatalf("read PROTOCOL.md: %v", err)
+	}
+	_, section, found := strings.Cut(string(raw), "\n## RPC results\n")
+	if !found {
+		t.Fatal("PROTOCOL.md has no \"## RPC results\" section")
+	}
+	section, _, _ = strings.Cut(section, "\n## ")
+
+	named := regexp.MustCompile("`([a-z_.]+)`")
+	listed := map[protocol.CommandType]bool{}
+	for line := range strings.SplitSeq(section, "\n") {
+		if !strings.HasPrefix(line, "| `") {
+			continue
+		}
+		cell, _, _ := strings.Cut(strings.TrimPrefix(line, "|"), "|")
+		for _, match := range named.FindAllStringSubmatch(cell, -1) {
+			listed[protocol.CommandType(match[1])] = true
+		}
+	}
+	if len(listed) == 0 {
+		t.Fatal("the RPC results table names no command: the parser no longer reads it")
+	}
+
+	for _, command := range protocol.AllCommandTypes {
+		if !protocol.IsRPC(command) || command == protocol.CommandSessionUpdate {
+			continue
+		}
+		if !listed[command] {
+			t.Errorf("%s is an RPC command with no row under \"RPC results\": a caller waits for a result nobody described", command)
+		}
+	}
+	for command := range listed {
+		if !protocol.IsRPC(command) {
+			t.Errorf("%q has a row under \"RPC results\" but is not an RPC command", command)
+		}
+	}
 }

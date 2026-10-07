@@ -434,7 +434,7 @@ func TestCallCommandsAreRefusedAsUnsupported(t *testing.T) {
 	h.manager.Dispatch(delivery(&protocol.Command{
 		V: protocol.Version, ID: "start", Type: protocol.CommandCallStart, SID: "s1",
 		ReplyTo: "start", IdempotencyKey: "call-start:1",
-		Payload: json.RawMessage(`{"to":{"kind":"user","id":"5511999990000"},"sdp":"v=0"}`),
+		Payload: json.RawMessage(`{"to":{"kind":"phone","id":"5511999990000"},"sdp":"v=0"}`),
 	}, &acked))
 	waitFor(t, "the reply", func() bool { _, ok := h.recorder.reply("start"); return ok })
 	reply, _ := h.recorder.reply("start")
