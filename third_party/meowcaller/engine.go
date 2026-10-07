@@ -1195,7 +1195,10 @@ func (e *engine) onCallRaw(callNode *waBinary.Node) bool {
 	if len(kids) == 0 {
 		return false
 	}
-	if kids[0].Tag == "offer" {
+	// Only a lone <offer> becomes a CallOffer (whatsmeow dispatches anything
+	// with more children as UnknownCallEvent), and only a CallOffer consumes
+	// the mark.
+	if len(kids) == 1 && kids[0].Tag == "offer" {
 		e.markStaleOffer(callNode, &kids[0])
 	}
 	switch kids[0].Tag {

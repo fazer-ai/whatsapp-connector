@@ -8,7 +8,8 @@ Why, defects in the PR #26 code on the inbound call path:
   seconds the server held it) is over the caller's 90 s ring timeout, but reads `e`
   off the node CallOffer carries, and whatsmeow hands CallOffer only the <offer>
   child: `e` is on the <call> wrapper, so the check never fired and expired offers
-  still rang. onCallRaw now reads the wrapper on the way in and marks the call;
+  still rang. onCallRaw now reads the wrapper of a lone <offer> (the only shape
+  whatsmeow dispatches as CallOffer) on the way in and marks the call;
   onOffer consumes the mark before any of its early returns and drops a marked one.
 - rtpReplayFilter recorded (ssrc, seq) before SRTP authentication: a forged copy
   arriving through one relay suppressed the authentic one arriving through another,
@@ -16,10 +17,10 @@ Why, defects in the PR #26 code on the inbound call path:
   (Seen) still runs first, the record (Record) now runs only once the packet
   authenticated, and at most 64 streams are tracked.
 
-Found in the review of fazer-ai/whatsapp-connector#387, rounds 5 and 6.
+Found in the review of fazer-ai/whatsapp-connector#387, rounds 5, 6 and 11.
 
 diff --git a/engine.go b/engine.go
-index f6d2ec5..248852f 100644
+index f6d2ec5..8b38d7f 100644
 --- a/engine.go
 +++ b/engine.go
 @@ -34,6 +34,7 @@ type engine struct {
@@ -61,17 +62,20 @@ index f6d2ec5..248852f 100644
  	}
  
  	callKey, err := decryptInboundCallKey(context.Background(), e.c.wa, ev)
-@@ -1162,6 +1170,9 @@ func (e *engine) onCallRaw(callNode *waBinary.Node) bool {
+@@ -1162,6 +1170,12 @@ func (e *engine) onCallRaw(callNode *waBinary.Node) bool {
  	if len(kids) == 0 {
  		return false
  	}
-+	if kids[0].Tag == "offer" {
++	// Only a lone <offer> becomes a CallOffer (whatsmeow dispatches anything
++	// with more children as UnknownCallEvent), and only a CallOffer consumes
++	// the mark.
++	if len(kids) == 1 && kids[0].Tag == "offer" {
 +		e.markStaleOffer(callNode, &kids[0])
 +	}
  	switch kids[0].Tag {
  	case "group_update", "enc_rekey", "waiting_room_update", "user_action", "screen_share":
  		// Source of truth: https://github.com/purpshell/meowcaller/blob/36d54857c74e45ccb08f6444a32d2afa13f20be9/datasheets/group-video-reactions.md#L31-L56
-@@ -1474,6 +1485,28 @@ func (e *engine) installCallAckHook() error {
+@@ -1474,6 +1488,28 @@ func (e *engine) installCallAckHook() error {
  	return nil
  }
  
