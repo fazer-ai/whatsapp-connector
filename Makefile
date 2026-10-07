@@ -43,7 +43,7 @@ test-redis_RUN := docker run -d --rm -p 56379:6379 redis:8-alpine
 test-redis_URL := redis://localhost:56379/0
 
 .DEFAULT_GOAL := help
-.PHONY: help setup deps hooks fmt lint test test-postgres test-postgres-server test-redis test-cover contract tidy check check-offline check-servers offline-passes bench-fleet clean
+.PHONY: help setup deps hooks fmt lint test test-postgres test-postgres-server test-redis test-cover contract tidy check check-offline check-servers offline-passes bench-fleet meowcaller meowcaller-check clean
 
 help: ## List the available targets
 	@grep -hE '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -187,7 +187,7 @@ bench-fleet: ## Fleet bench with WAC_ENGINE=fake: 2+ connector processes on real
 # exported from a shell profile, a direnv file or an agent's configuration and then never
 # appear again in any command anybody typed or any round recorded. A target has to be
 # named where it is run.
-check: check-servers offline-passes $(SERVER_PASSES) ## Everything CI enforces; needs both servers (see check-offline)
+check: check-servers offline-passes $(SERVER_PASSES) meowcaller-check ## Everything CI enforces; needs both servers and GitHub (see check-offline)
 
 # Every missing server at once, before anything runs.
 #
@@ -237,8 +237,19 @@ check-offline: offline-passes ## Lint, tidy and the SQLite pass: everything that
 	@echo
 	@echo "check-offline is done. It does not run the passes that need a server:"
 	@$(foreach t,$(SERVER_PASSES),echo "  $(t) ($($(t)_VAR))"; )
+	@echo "  meowcaller-check (fetches upstream from GitHub)"
 	@echo
 	@echo "make check runs those too, and says how to start each server."
+
+# third_party/meowcaller is derived from the pin and the patches next to it, and the check
+# is what keeps it that way: it rebuilds the copy from upstream in a scratch directory and
+# fails when the committed tree differs. It fetches from GitHub, so it lives in `check`
+# and not in the offline half.
+meowcaller: ## Rewrite third_party/meowcaller from third_party/meowcaller.pin plus its patches
+	@./third_party/meowcaller.sh sync
+
+meowcaller-check: ## Fail when third_party/meowcaller is not exactly the pin plus its patches
+	@./third_party/meowcaller.sh check
 
 clean: ## Remove build and coverage output
 	rm -rf bin dist coverage.txt

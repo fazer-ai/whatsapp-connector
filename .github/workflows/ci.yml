@@ -32,6 +32,11 @@ jobs:
       - name: Check go.mod/go.sum are tidy
         run: make tidy
 
+      # third_party/meowcaller is derived from its pin and patches; this rebuilds it from
+      # upstream and fails when the committed copy was edited by hand.
+      - name: Check the vendored meowcaller
+        run: make meowcaller-check
+
       # The one step that stays a direct invocation, and deliberately: the action brings
       # its own caching and turns findings into annotations on the diff, which `make lint`
       # cannot do from here. Same binary, same version, same config.

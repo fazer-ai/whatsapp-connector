@@ -1,0 +1,35 @@
+Address an outgoing call's offer to the peer's primary phone only.
+
+Origin: fazer-ai/whatsapp-connector, not upstream.
+
+Why: when the peer has WhatsApp Desktop (or Web) open, that companion preaccepts first,
+and after the phone answers no audio from the phone ever reaches us. Sending the offer
+and the encrypted call key to device 0 alone keeps the companion out of the call, and
+audio then flows both ways. The same failure reproduces with oxidezap/whatsapp-rust, so
+it is not a meowcaller defect we could fix in place. The cost: the peer's companion
+devices do not ring for calls the connector places. Measured in
+fazer-ai/whatsapp-connector#380 (comment of 2026-10-07).
+
+diff --git a/engine.go b/engine.go
+index b7684b4..f6d2ec5 100644
+--- a/engine.go
++++ b/engine.go
+@@ -460,6 +460,18 @@ func (e *engine) placeCall(ctx context.Context, target string, opts CallOptions)
+ 	if len(devices) == 0 {
+ 		return nil, fmt.Errorf("peer %s has no devices (unreachable / not on WhatsApp)", peerLID)
+ 	}
++	// Ring only the peer's primary phone. When a companion device (WhatsApp Desktop,
++	// Web) is online it preaccepts first and, once the phone answers, the phone's media
++	// never reaches our relays. A peer without device 0 listed keeps the old fanout.
++	primary := devices[:0:0]
++	for _, d := range devices {
++		if d.Device == 0 {
++			primary = append(primary, d)
++		}
++	}
++	if len(primary) > 0 {
++		devices = primary
++	}
+ 
+ 	var callKey [32]byte
+ 	if _, err := rand.Read(callKey[:]); err != nil {
