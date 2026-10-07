@@ -551,6 +551,9 @@ func (e *engine) placeCall(ctx context.Context, target string, opts CallOptions)
 	})
 
 	if err := cli.DangerousInternals().SendNode(ctx, offer); err != nil {
+		// The caller gets no Call to hang up, so the registration and its key
+		// material would otherwise stay in e.calls for the client's lifetime.
+		e.finishCall(callID, "offer_failed")
 		return nil, fmt.Errorf("send offer: %w", err)
 	}
 	e.c.log.Info().Str("call_id", callID).Bool("video", opts.Video).Msg("offer sent; media starts when the relay endpoint arrives")

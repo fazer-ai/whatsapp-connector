@@ -753,11 +753,15 @@ func (c *Call) onMuteStateFn() func(bool) {
 }
 
 // setPhase advances the call's phase and fires OnStateChange (used by the engine).
-func (c *Call) setPhase(next CallPhase) {
+//
+// Ended is terminal: a call that ended does not move to any other phase, so a
+// media loop that reaches "first audio" while a hangup is finishing the call
+// cannot bring it back. It reports whether the phase changed.
+func (c *Call) setPhase(next CallPhase) bool {
 	c.mu.Lock()
-	if c.phase == next {
+	if c.phase == next || c.phase == CallPhaseEnded {
 		c.mu.Unlock()
-		return
+		return false
 	}
 	c.phase = next
 	fn := c.onState
@@ -765,4 +769,5 @@ func (c *Call) setPhase(next CallPhase) {
 	if fn != nil {
 		fn(next)
 	}
+	return true
 }
