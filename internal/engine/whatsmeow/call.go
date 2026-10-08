@@ -18,6 +18,11 @@ import (
 // no longer exists.
 const callWriteTimeout = 10 * time.Second
 
+// offerAfterNotice is how long an `offer_notice` waits for its `offer` on a session that
+// answers calls. The two are sent together, so the wait is for one that is not coming at
+// all, and a call rings for tens of seconds.
+const offerAfterNotice = 2 * time.Second
+
 // answeredCalls is how many call ids a session remembers to tell a second announcement of
 // one call from a second call.
 //
@@ -117,6 +122,26 @@ type rejectRequest struct {
 // callOffered publishes a call this account is being rung for, and refuses it when the
 // client asked for that.
 //
+// callNoticed is an `offer_notice`. On a session that carries the voice of calls, a
+// notice for a call that could be engaged waits a little for the call's `offer`: published
+// first, it would take the call's one `call.offer`, without the SDP that only the engaged
+// offer can be given, and the client would be left with a call it cannot answer. The offer
+// arriving first publishes it, and the notice's turn then finds the call already offered;
+// an offer that never arrives leaves the notice to publish the call without SDP, unless
+// the call ended in the meantime and its end is already out.
+func (s *Session) callNoticed(meta *waTypes.BasicCallMeta, media callMedia, group bool) bool {
+	if s.callMedia == nil || group || (media.known && media.video) || !s.answersCalls() {
+		return s.callOffered(meta, media, group)
+	}
+	held := *meta
+	time.AfterFunc(s.offerWait, func() {
+		if s.ctx.Err() == nil && !s.endPublished(held.CallID) {
+			s.callOffered(&held, media, group)
+		}
+	})
+	return true
+}
+
 // Acknowledged whatever happens, which is the presence rule rather than the message rule:
 // WhatsApp does not redeliver a call offer, so withholding the acknowledgement buys no
 // second chance and leaves a node unacknowledged for a call that has already ended.

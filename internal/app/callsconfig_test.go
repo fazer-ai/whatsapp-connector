@@ -22,11 +22,11 @@ func TestTheCallsPortAndAddressAreReadAtStartup(t *testing.T) {
 	}
 
 	t.Setenv("WAC_CALLS_UDP_PORT", "40000")
-	t.Setenv("WAC_CALLS_PUBLIC_IP", " 203.0.113.7, 2001:db8::7 ")
+	t.Setenv("WAC_CALLS_PUBLIC_IP", " 203.0.113.7, 198.51.100.7 ")
 	if cfg, err = app.LoadConfig("host"); err != nil {
 		t.Fatalf("LoadConfig: %v", err)
 	}
-	if cfg.CallsUDPPort != 40000 || !slices.Equal(cfg.CallsPublicIPs, []string{"203.0.113.7", "2001:db8::7"}) {
+	if cfg.CallsUDPPort != 40000 || !slices.Equal(cfg.CallsPublicIPs, []string{"203.0.113.7", "198.51.100.7"}) {
 		t.Fatalf("calls read as port %d, %v", cfg.CallsUDPPort, cfg.CallsPublicIPs)
 	}
 
@@ -36,6 +36,8 @@ func TestTheCallsPortAndAddressAreReadAtStartup(t *testing.T) {
 		"a negative port":         {"-1", ""},
 		"a port that is a word":   {"forty", ""},
 		"an address that is not":  {"40000", "calls.example.com"},
+		"an IPv6 address":         {"40000", "2001:db8::7"},
+		"IPv6 beside IPv4":        {"40000", "203.0.113.7,2001:db8::7"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Setenv("WAC_CALLS_UDP_PORT", env[0])

@@ -36,7 +36,10 @@ type Leg struct {
 	toBrowser []int16
 	toWA      []int16
 	started   bool
-	onFailed  func()
+	// pending is the answer to a browser's offer, made when the call was placed and
+	// applied when the callee picks up.
+	pending *webrtc.SessionDescription
+	onLost  func()
 
 	closeOnce sync.Once
 }
@@ -57,14 +60,23 @@ func (m *Media) newLeg(log zerolog.Logger) (*Leg, error) {
 	pc.OnTrack(leg.listen)
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
 		leg.log.Debug().Str("state", state.String()).Msg("browser peer")
-		if state != webrtc.PeerConnectionStateFailed {
+		switch state {
+		case webrtc.PeerConnectionStateFailed:
+		case webrtc.PeerConnectionStateClosed:
+			// Closed by the browser, which ends DTLS with a close_notify and leaves pion
+			// to close this side: the browser hung up. Closed by this side, the leg's
+			// context went first, and whoever closed it is already ending the call.
+			if leg.ctx.Err() != nil {
+				return
+			}
+		default:
 			return
 		}
 		leg.mu.Lock()
-		failed := leg.onFailed
+		lost := leg.onLost
 		leg.mu.Unlock()
-		if failed != nil {
-			failed()
+		if lost != nil {
+			lost()
 		}
 	})
 	return leg, nil
@@ -83,6 +95,25 @@ func (l *Leg) gathered(ctx context.Context) (string, error) {
 	return l.pc.LocalDescription().SDP, nil
 }
 
+// Answer applies the answer to the browser's offer that Media.Answer made, and returns it
+// with its candidates, for the browser. Only once the callee has picked up: applying it is
+// what starts ICE on this side, and the browser, which gets the answer only then, would
+// not answer a single check before it, so a callee who let the phone ring past pion's
+// first checking deadline (~30 s) would find the call already hung up.
+func (l *Leg) Answer(ctx context.Context) (string, error) {
+	l.mu.Lock()
+	answer := l.pending
+	l.pending = nil
+	l.mu.Unlock()
+	if answer == nil {
+		return "", errors.New("calls: this leg has no answer to make")
+	}
+	if err := l.pc.SetLocalDescription(*answer); err != nil {
+		return "", fmt.Errorf("calls: apply the answer: %w", err)
+	}
+	return l.gathered(ctx)
+}
+
 // Accept applies the browser's answer to the connector's offer.
 func (l *Leg) Accept(answer string) error {
 	if err := l.pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: answer}); err != nil {
@@ -91,11 +122,12 @@ func (l *Leg) Accept(answer string) error {
 	return nil
 }
 
-// OnFailed is called once the browser peer is lost for good: ICE gave up, so nothing the
-// connector sends reaches the browser and nothing comes back.
-func (l *Leg) OnFailed(fn func()) {
+// OnLost is called once the browser peer is gone for good: ICE gave up, so nothing the
+// connector sends reaches the browser and nothing comes back, or the browser closed its
+// peer connection.
+func (l *Leg) OnLost(fn func()) {
 	l.mu.Lock()
-	l.onFailed = fn
+	l.onLost = fn
 	l.mu.Unlock()
 }
 

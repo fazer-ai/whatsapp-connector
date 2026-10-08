@@ -51,6 +51,13 @@ type fakeCall struct {
 	onEnd    func(string)
 	onAccept func()
 	fail     error
+	// ended is a call meowcaller already ended, before anybody listened for it.
+	ended bool
+	// stall, when set, holds every hang-up and rejection until it is closed: a node
+	// write the socket does not take.
+	stall chan struct{}
+	// signalled receives one value each time a hang-up or a rejection is attempted.
+	signalled chan struct{}
 }
 
 func (c *fakeCall) ID() string { return c.id }
@@ -67,10 +74,7 @@ func (c *fakeCall) Reject() error {
 	c.rejected++
 	end := c.onEnd
 	c.mu.Unlock()
-	if end != nil {
-		end("rejected")
-	}
-	return nil
+	return c.signal(end, "rejected")
 }
 
 func (c *fakeCall) Hangup() error {
@@ -78,10 +82,29 @@ func (c *fakeCall) Hangup() error {
 	c.hungUp++
 	end := c.onEnd
 	c.mu.Unlock()
+	return c.signal(end, "hangup")
+}
+
+func (c *fakeCall) signal(end func(string), reason string) error {
+	if c.signalled != nil {
+		c.signalled <- struct{}{}
+	}
+	if c.stall != nil {
+		<-c.stall
+	}
 	if end != nil {
-		end("hangup")
+		end(reason)
 	}
 	return nil
+}
+
+func (c *fakeCall) State() meowcaller.CallPhase {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.ended {
+		return meowcaller.CallPhaseEnded
+	}
+	return meowcaller.CallPhaseRinging
 }
 
 func (c *fakeCall) Receive(sink meowcaller.AudioSink) {
@@ -548,21 +571,217 @@ func TestTheCallCommandsAreRefusedWithoutCalls(t *testing.T) {
 	}
 }
 
-// A session that closes hangs up every call it carries: the media is this instance's and
-// cannot follow the account.
-func TestClosingTheSessionHangsUpItsCalls(t *testing.T) {
-	t.Parallel()
-	session := newCallSession(t)
-	call, offer := ringCall(t, session, "call-1")
-	accept := `{"call_id":"call-1","sdp":` + mustJSON(t, browserAnswer(t, offer)) + `}`
+// answeredCall is a received call the browser answered, whose hang-up and rejection stall
+// until the returned function is called.
+func answeredCall(t *testing.T, session *Session, callID string) (call *fakeCall, release func()) {
+	t.Helper()
+	call = &fakeCall{id: callID, stall: make(chan struct{}), signalled: make(chan struct{}, 4)}
+	session.ringing(call)
+	session.handle(audioOffer(callID))
+	offer, _ := published(t, session, protocol.EventCallOffer, "event_call_offer")["sdp"].(string)
+	accept := `{"call_id":"` + callID + `","sdp":` + mustJSON(t, browserAnswer(t, offer)) + `}`
 	if _, err := session.Execute(t.Context(), command(protocol.CommandCallAccept, accept)); err != nil {
 		t.Fatal(err)
 	}
+	var once sync.Once
+	release = func() { once.Do(func() { close(call.stall) }) }
+	t.Cleanup(release)
+	return call, release
+}
 
-	if err := session.Close(); err != nil {
-		t.Fatalf("close: %v", err)
+func hungUpWithin(t *testing.T, call *fakeCall) {
+	t.Helper()
+	select {
+	case <-call.signalled:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the call was never hung up")
 	}
+}
+
+// A session that closes hangs up every call it carries, since the media is this
+// instance's and cannot follow the account, and does not wait for the hang-up to be
+// written: a close is also the lease being lost, and that socket has to go now.
+func TestClosingTheSessionHangsUpItsCallsWithoutWaiting(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	call, release := answeredCall(t, session, "call-1")
+
+	closed := make(chan error, 1)
+	go func() { closed <- session.Close() }()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("close: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		release()
+		t.Fatal("close waited on a hang-up the socket did not take")
+	}
+	hungUpWithin(t, call)
+}
+
+// An operator's disconnect ends the calls too, before the socket goes, and waits for the
+// hang-ups as long as the command may.
+func TestDisconnectingTheSessionHangsUpItsCalls(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	call, release := answeredCall(t, session, "call-1")
+	release()
+
+	if err := session.Disconnect(t.Context()); err != nil {
+		t.Fatalf("disconnect: %v", err)
+	}
+	hungUpWithin(t, call)
 	if _, _, hungUp, _ := call.counts(); hungUp != 1 {
-		t.Fatalf("the call was hung up %d times on close, want once", hungUp)
+		t.Fatalf("the call was hung up %d times on disconnect, want once", hungUp)
 	}
+}
+
+// A call.terminate whose hang-up the socket does not take gives the executor back when
+// the command's deadline passes, rather than holding every command behind it.
+func TestATerminateThatStallsHonoursItsDeadline(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	call, _ := answeredCall(t, session, "call-1")
+
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+	returned := make(chan error, 1)
+	go func() {
+		_, err := session.Execute(ctx, command(protocol.CommandCallTerminate, `{"call_id":"call-1"}`))
+		returned <- err
+	}()
+	select {
+	case err := <-returned:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("a stalled terminate returned %v, want the deadline", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a stalled terminate held the executor past its deadline")
+	}
+	hungUpWithin(t, call)
+}
+
+// meowcaller does not replay an end that happened before OnEnd was set. A placed call
+// refused between the offer going out and the listener going on is reported over, and
+// nothing of it is left behind.
+func TestAPlacedCallThatEndedBeforeItsListenerIsReportedOver(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	session.onWhatsApp = func(_ context.Context, _ *wm.Client, phones []string) ([]waTypes.IsOnWhatsAppResponse, error) {
+		return []waTypes.IsOnWhatsAppResponse{{Query: phones[0], IsIn: true,
+			JID: waTypes.NewJID("5541999990000", waTypes.DefaultUserServer)}}, nil
+	}
+	call := &fakeCall{id: "CALLOUT1", ended: true}
+	session.dialCall = func(context.Context, string) (bridgedCall, error) { return call, nil }
+	start := &protocol.Command{
+		ID: "c1", Type: protocol.CommandCallStart, IdempotencyKey: "k1",
+		Payload: json.RawMessage(`{"to":{"kind":"phone","id":"5541999990000"},"sdp":` + mustJSON(t, browserOffer(t)) + `}`),
+	}
+	if _, err := session.Execute(t.Context(), start); err != nil {
+		t.Fatalf("call.start: %v", err)
+	}
+	if end := published(t, session, protocol.EventCallTerminate, "event_call_terminate"); end["call_id"] != "CALLOUT1" {
+		t.Fatalf("the end names %v", end["call_id"])
+	}
+	session.bridge.mu.Lock()
+	left := len(session.bridge.live)
+	session.bridge.mu.Unlock()
+	if left != 0 {
+		t.Fatalf("%d calls are still carried after the call ended", left)
+	}
+}
+
+// The callee picks up a placed call only after the browser's offer has waited however
+// long the phone rang, and the answer is made then, not when the call was placed.
+func TestAPlacedCallIsAnsweredOnlyWhenTheCalleePicksUp(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	session.onWhatsApp = func(_ context.Context, _ *wm.Client, phones []string) ([]waTypes.IsOnWhatsAppResponse, error) {
+		return []waTypes.IsOnWhatsAppResponse{{Query: phones[0], IsIn: true,
+			JID: waTypes.NewJID("5541999990000", waTypes.DefaultUserServer)}}, nil
+	}
+	call := &fakeCall{id: "CALLOUT1"}
+	session.dialCall = func(context.Context, string) (bridgedCall, error) { return call, nil }
+	start := &protocol.Command{
+		ID: "c1", Type: protocol.CommandCallStart, IdempotencyKey: "k1",
+		Payload: json.RawMessage(`{"to":{"kind":"phone","id":"5541999990000"},"sdp":` + mustJSON(t, browserOffer(t)) + `}`),
+	}
+	if _, err := session.Execute(t.Context(), start); err != nil {
+		t.Fatalf("call.start: %v", err)
+	}
+	session.bridge.mu.Lock()
+	leg := session.bridge.live["CALLOUT1"].leg
+	session.bridge.mu.Unlock()
+	if leg.Codec() != "" {
+		t.Fatal("the browser's offer was answered while the callee was still being rung")
+	}
+	call.peerAccepts()
+	published(t, session, protocol.EventCallAnswered, "event_call_answered")
+}
+
+func callNotice(callID string) *waEvents.CallOfferNotice {
+	return &waEvents.CallOfferNotice{BasicCallMeta: callMeta(callID), Media: "audio", Type: "1:1"}
+}
+
+// WhatsApp sends `offer_notice` and `offer` for one call in either order, and only the
+// offer is engaged. A notice first does not take the call's one `call.offer` from the
+// offer that can carry the SDP; a notice whose offer never comes still publishes the call.
+func TestANoticeBeforeTheOfferLeavesTheSDPToTheOffer(t *testing.T) {
+	t.Parallel()
+
+	t.Run("the offer follows", func(t *testing.T) {
+		t.Parallel()
+		session := newCallSession(t)
+		session.offerWait = 200 * time.Millisecond
+		session.handle(callNotice("call-1"))
+		session.ringing(&fakeCall{id: "call-1"})
+		session.handle(audioOffer("call-1"))
+		offer := published(t, session, protocol.EventCallOffer, "event_call_offer")
+		if sdp, _ := offer["sdp"].(string); !strings.HasPrefix(sdp, "v=0") {
+			t.Fatalf("the offer that followed a notice carries %q, want the connector's SDP", sdp)
+		}
+		select {
+		case emission := <-session.Events():
+			t.Fatalf("published %s for a call already offered", emission.Type)
+		case <-time.After(600 * time.Millisecond):
+		}
+	})
+
+	t.Run("no offer comes", func(t *testing.T) {
+		t.Parallel()
+		session := newCallSession(t)
+		session.offerWait = 10 * time.Millisecond
+		session.handle(callNotice("call-1"))
+		offer := published(t, session, protocol.EventCallOffer, "event_call_offer")
+		if offer["call_id"] != "call-1" {
+			t.Fatalf("the offer names %v", offer["call_id"])
+		}
+		if _, carries := offer["sdp"]; carries {
+			t.Fatal("a call announced only by its notice was offered with SDP")
+		}
+	})
+
+	t.Run("the call ends first", func(t *testing.T) {
+		t.Parallel()
+		session := newCallSession(t)
+		session.offerWait = 50 * time.Millisecond
+		session.handle(callNotice("call-1"))
+		session.handle(&waEvents.CallTerminate{BasicCallMeta: callMeta("call-1"), Reason: "timeout"})
+		published(t, session, protocol.EventCallTerminate, "event_call_terminate")
+		select {
+		case emission := <-session.Events():
+			t.Fatalf("published %s for a call whose end was already out", emission.Type)
+		case <-time.After(400 * time.Millisecond):
+		}
+	})
+
+	t.Run("a session that does not answer", func(t *testing.T) {
+		t.Parallel()
+		session := newCallSession(t)
+		session.setCallPolicy(false, false)
+		session.offerWait = time.Hour
+		session.handle(callNotice("call-1"))
+		published(t, session, protocol.EventCallOffer, "event_call_offer")
+	})
 }

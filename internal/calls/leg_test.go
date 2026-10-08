@@ -13,6 +13,8 @@ import (
 	"github.com/pion/webrtc/v4"
 	"github.com/pion/webrtc/v4/pkg/media"
 	"github.com/rs/zerolog"
+
+	"github.com/fazer-ai/whatsapp-connector/internal/testwait"
 )
 
 // browser is a second pion peer in the same process, standing in for the agent's browser:
@@ -243,8 +245,17 @@ func feed(ctx context.Context, sink Sink) {
 // heardFromBrowser drains the leg's Source until a frame carries the browser's tone.
 func heardFromBrowser(t *testing.T, source Source) float64 {
 	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(testwait.Budget)
 	for time.Now().Before(deadline) {
+		// A whole frame queued before it is read: one read short of it would come back
+		// padded with silence and measure the tone as quieter than it is.
+		source.l.mu.Lock()
+		queued := len(source.l.toWA)
+		source.l.mu.Unlock()
+		if queued < frameSamples {
+			time.Sleep(testwait.Poll)
+			continue
+		}
 		frame, err := source.ReadFrame()
 		if err != nil {
 			t.Fatalf("read from the browser: %v", err)
@@ -256,7 +267,6 @@ func heardFromBrowser(t *testing.T, source Source) float64 {
 		if level := rms(pcm); level > 3000 {
 			return level
 		}
-		time.Sleep(60 * time.Millisecond)
 	}
 	t.Fatal("nothing the browser said reached the WhatsApp side")
 	return 0
@@ -302,11 +312,15 @@ func TestAReceivedCallCarriesVoiceBothWaysInG722(t *testing.T) {
 func TestAPlacedCallFallsBackToPCMU(t *testing.T) {
 	m := openMedia(t)
 	b := newBrowser(t, webrtc.MimeTypePCMU)
-	leg, answer, err := m.Answer(t.Context(), b.offer(), zerolog.Nop())
+	leg, err := m.Answer(b.offer(), zerolog.Nop())
 	if err != nil {
 		t.Fatalf("answer: %v", err)
 	}
 	t.Cleanup(func() { _ = leg.Close() })
+	answer, err := leg.Answer(t.Context())
+	if err != nil {
+		t.Fatalf("apply the answer: %v", err)
+	}
 	if strings.Contains(answer, "G722") {
 		t.Fatalf("the answer names G.722 to a browser that did not offer it:\n%s", answer)
 	}
@@ -363,7 +377,7 @@ func TestAnSDPTheConnectorCannotUseIsRefused(t *testing.T) {
 		t.Fatalf("accept of garbage = %v, want ErrBadSDP", err)
 	}
 
-	if _, _, err := m.Answer(t.Context(), "this is not an sdp", zerolog.Nop()); !errors.Is(err, ErrBadSDP) {
+	if _, err := m.Answer("this is not an sdp", zerolog.Nop()); !errors.Is(err, ErrBadSDP) {
 		t.Fatalf("answer to garbage = %v, want ErrBadSDP", err)
 	}
 
@@ -387,7 +401,7 @@ func TestAnSDPTheConnectorCannotUseIsRefused(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if leg, _, err := m.Answer(t.Context(), offer.SDP, zerolog.Nop()); err == nil {
+	if leg, err := m.Answer(offer.SDP, zerolog.Nop()); err == nil {
 		_ = leg.Close()
 		t.Fatal("an Opus-only offer was answered, and no voice could cross it")
 	} else if !errors.Is(err, ErrBadSDP) {
@@ -407,5 +421,77 @@ func TestTheMediaSocketIsTheOneAskedFor(t *testing.T) {
 	}
 	if _, err := Open(Config{PublicIPs: []string{"not-an-ip"}}, zerolog.Nop()); err == nil {
 		t.Fatal("a public IP that is not an address was accepted")
+	}
+}
+
+// A placed call rings for as long as the callee takes, and ICE on this side does not start
+// until the callee picks up: started with the call, pion's first checking deadline (~30 s)
+// would fail the leg of a call still ringing, since the browser gets the answer and starts
+// checking only then.
+func TestAPlacedCallStartsICEOnlyWhenAnswered(t *testing.T) {
+	m := openMedia(t)
+	b := newBrowser(t, webrtc.MimeTypeG722)
+	leg, err := m.Answer(b.offer(), zerolog.Nop())
+	if err != nil {
+		t.Fatalf("answer: %v", err)
+	}
+	t.Cleanup(func() { _ = leg.Close() })
+	if leg.pc.LocalDescription() != nil {
+		t.Fatal("the answer was applied while the callee was still being rung")
+	}
+	if got := leg.pc.ICEGatheringState(); got != webrtc.ICEGatheringStateNew {
+		t.Fatalf("ICE gathering is %s before the callee answered, want new", got)
+	}
+
+	answer, err := leg.Answer(t.Context())
+	if err != nil {
+		t.Fatalf("apply the answer: %v", err)
+	}
+	if !strings.Contains(answer, "a=candidate") {
+		t.Fatalf("the answer carries no candidate:\n%s", answer)
+	}
+	b.accept(answer)
+	waitConnected(t, leg.pc, b.pc)
+	if _, err := leg.Answer(t.Context()); err == nil {
+		t.Fatal("a second Answer was taken")
+	}
+}
+
+// The browser hanging up closes its peer connection, and the leg reports itself lost; the
+// connector closing the leg does not, since whoever closed it is already ending the call.
+func TestABrowserThatClosesItsPeerIsLost(t *testing.T) {
+	for _, closer := range []string{"browser", "connector"} {
+		t.Run(closer, func(t *testing.T) {
+			m := openMedia(t)
+			leg, offer, err := m.Offer(t.Context(), zerolog.Nop())
+			if err != nil {
+				t.Fatalf("offer: %v", err)
+			}
+			t.Cleanup(func() { _ = leg.Close() })
+			lost := make(chan struct{}, 1)
+			leg.OnLost(func() { lost <- struct{}{} })
+			b := newBrowser(t, webrtc.MimeTypeG722)
+			if err := leg.Accept(b.answer(offer)); err != nil {
+				t.Fatalf("accept: %v", err)
+			}
+			waitConnected(t, leg.pc, b.pc)
+
+			if closer == "browser" {
+				_ = b.pc.Close()
+				select {
+				case <-lost:
+				case <-time.After(10 * time.Second):
+					t.Fatal("the browser closed its peer and the leg was not reported lost")
+				}
+				return
+			}
+			_ = leg.Close()
+			_ = b.pc.Close()
+			select {
+			case <-lost:
+				t.Fatal("the connector closed the leg and it reported itself lost")
+			case <-time.After(500 * time.Millisecond):
+			}
+		})
 	}
 }

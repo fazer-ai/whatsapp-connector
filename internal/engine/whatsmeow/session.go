@@ -570,6 +570,11 @@ type Session struct {
 	// same #74 caveat about the socket lock it cannot reach past.
 	callWait time.Duration
 
+	// offerWait is how long a session that answers calls holds a `call.offer` announced
+	// by `offer_notice` for the `offer` of the same call, which is the one meowcaller
+	// engages and the only one the browser's SDP can be built for.
+	offerWait time.Duration
+
 	// transition serialises a change to the socket's state with the event announcing
 	// it. It is not mu: emit can block on a full inbox, and holding the session's own
 	// lock across that would stop everything that reads state, Close included.
@@ -868,6 +873,7 @@ func newSession(
 		presenceWrite:       make(chan struct{}, 1),
 		presenceWait:        presenceWriteTimeout,
 		callWait:            callWriteTimeout,
+		offerWait:           offerAfterNotice,
 		board:               make(map[string]posted),
 		owedPlaces:          make(map[string]owedPlace),
 		downloadWait:        downloadTimeout,
@@ -2508,6 +2514,8 @@ func (s *Session) Disconnect(ctx context.Context) error {
 	defer s.endCommand()
 
 	s.cancelPairing()
+	// Before the socket goes, while the hang-ups still have it to be written on.
+	s.endCalls(ctx)
 	// That the operator asked this session to stay down is recorded a layer up, before
 	// this call, for the same reason as in Connect and with the same ordering: before the
 	// socket goes, so an instance that dies in between does not leave an account somebody
@@ -2524,6 +2532,7 @@ func (s *Session) Logout(ctx context.Context) error {
 	defer s.endCommand()
 
 	s.cancelPairing()
+	s.endCalls(ctx)
 	ask, _ := s.askToUnlink(ctx)
 	if err := ask(ctx, s.current()); err != nil {
 		if sentNothing(err) || unanswered(err) {
@@ -3680,11 +3689,15 @@ func (s *Session) Close() error {
 	if run != nil {
 		run.cancel()
 	}
-	// Before the socket goes, and bounded: a call's media lives on this instance and
-	// cannot follow the account to another one, and a call left up would go on playing
-	// silence to the person on the phone. meowcaller ends each call locally before it
-	// writes the terminate, so the voice stops here even when the write cannot land.
-	s.hangUpEverything()
+	// A call's media lives on this instance and cannot follow the account to another
+	// one, and a call left up would go on playing silence to the person on the phone. The
+	// hang-ups are sent and not waited for: this is also the lease being lost, and the
+	// socket of an instance that lost it has to go now, not after a write. A hang-up that
+	// does not make it before the disconnect leaves the call to end on the phone's side
+	// when the media stops.
+	gone, stop := context.WithCancel(context.Background())
+	stop()
+	s.endCalls(gone)
 
 	// Cancelled first, and that order is the whole point: whatsmeow holds its socket
 	// lock for the length of a dial, and Disconnect waits for the same lock. Cancelling
@@ -4876,7 +4889,7 @@ func (s *Session) handle(rawEvent any) bool {
 		// `type` says it is a group call and `group-jid` is optional, so the attribute is
 		// the one that has to decide: a notice without the id would otherwise read as a
 		// direct call from whoever started it.
-		return s.callOffered(&event.BasicCallMeta,
+		return s.callNoticed(&event.BasicCallMeta,
 			callMedia{known: event.Media != "", video: event.Media == "video"},
 			!event.GroupJID.IsEmpty() || event.Type == "group")
 	case *waEvents.CallTerminate:

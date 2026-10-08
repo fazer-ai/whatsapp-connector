@@ -56,8 +56,8 @@ func Open(cfg Config, log zerolog.Logger) (*Media, error) {
 		return nil, fmt.Errorf("calls: UDP port %d is out of range", cfg.UDPPort)
 	}
 	for _, ip := range cfg.PublicIPs {
-		if net.ParseIP(ip) == nil {
-			return nil, fmt.Errorf("calls: %q is not an IP address", ip)
+		if parsed := net.ParseIP(ip); parsed == nil || parsed.To4() == nil {
+			return nil, fmt.Errorf("calls: %q is not an IPv4 address", ip)
 		}
 	}
 	conn, err := net.ListenUDP("udp4", &net.UDPAddr{Port: cfg.UDPPort})
@@ -133,35 +133,29 @@ func (m *Media) Offer(ctx context.Context, log zerolog.Logger) (*Leg, string, er
 	return leg, sdp, nil
 }
 
-// Answer builds the leg of a call the client is placing: the browser's offer, answered
-// here. The answer is the connector's to hand back once the callee picks up.
+// Answer builds the leg of a call the client is placing from the browser's offer, and
+// checks that it can be answered. The answer itself is made by Leg.Answer once the callee
+// picks up.
 //
 //nolint:gocritic // zerolog.Logger is designed to be copied; every With() returns one by value
-func (m *Media) Answer(ctx context.Context, offer string, log zerolog.Logger) (*Leg, string, error) {
+func (m *Media) Answer(offer string, log zerolog.Logger) (*Leg, error) {
 	leg, err := m.newLeg(log)
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
 	if err := leg.pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: offer}); err != nil {
 		_ = leg.Close()
-		return nil, "", fmt.Errorf("%w: %w", ErrBadSDP, err)
+		return nil, fmt.Errorf("%w: %w", ErrBadSDP, err)
 	}
 	answer, err := leg.pc.CreateAnswer(nil)
-	if err == nil {
-		err = leg.pc.SetLocalDescription(answer)
-	}
 	if err != nil {
 		_ = leg.Close()
 		// An offer pion takes and cannot answer is one with no codec in common, which is
 		// the browser's offer being unusable, not this side failing.
-		return nil, "", fmt.Errorf("%w: %w", ErrBadSDP, err)
+		return nil, fmt.Errorf("%w: %w", ErrBadSDP, err)
 	}
-	sdp, err := leg.gathered(ctx)
-	if err != nil {
-		_ = leg.Close()
-		return nil, "", err
-	}
-	return leg, sdp, nil
+	leg.pending = &answer
+	return leg, nil
 }
 
 // ErrBadSDP is an SDP from the browser this side cannot use: unreadable, or with no codec

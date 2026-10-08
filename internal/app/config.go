@@ -373,8 +373,14 @@ func LoadConfig(hostname string) (Config, error) {
 		return Config{}, fmt.Errorf("app: WAC_CALLS_PUBLIC_IP is set and WAC_CALLS_UDP_PORT is not, so calls are off")
 	}
 	for _, ip := range cfg.CallsPublicIPs {
-		if net.ParseIP(ip) == nil {
+		parsed := net.ParseIP(ip)
+		if parsed == nil {
 			return Config{}, fmt.Errorf("app: WAC_CALLS_PUBLIC_IP %q is not an IP address", ip)
+		}
+		if parsed.To4() == nil {
+			// The media socket is IPv4 only, so an IPv6 address would be announced to
+			// browsers for a socket that is not listening on it.
+			return Config{}, fmt.Errorf("app: WAC_CALLS_PUBLIC_IP %q is IPv6, and call media is carried over IPv4 only", ip)
 		}
 	}
 	if cfg.MediaRoot != "" && cfg.MediaToken == "" {

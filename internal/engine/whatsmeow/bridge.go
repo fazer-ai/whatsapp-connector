@@ -4,22 +4,18 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
-	"time"
 
 	"github.com/purpshell/meowcaller"
 	"github.com/purpshell/meowcaller/signaling"
+	"github.com/rs/zerolog"
 	waEvents "go.mau.fi/whatsmeow/types/events"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/calls"
 	"github.com/fazer-ai/whatsapp-connector/internal/engine"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 )
-
-// hangupWait bounds how long a session that is closing waits for the calls it carries to
-// be hung up. The hang-up is a node on a socket that may already be going, and a close
-// held behind it is a lease held by an instance that has stopped serving it.
-const hangupWait = 2 * time.Second
 
 // bridgedCall is the part of a meowcaller call this session drives. *meowcaller.Call is
 // the one implementation outside the tests, which cannot build one: its fields are the
@@ -33,6 +29,7 @@ type bridgedCall interface {
 	Play(meowcaller.AudioSource) *meowcaller.Player
 	OnEnd(func(reason string))
 	OnPeerAccept(func())
+	State() meowcaller.CallPhase
 }
 
 // liveCall is one call this session carries the voice of, from the moment meowcaller
@@ -44,7 +41,6 @@ type liveCall struct {
 	leg *calls.Leg
 	// outbound is a call the client placed; its answer waits for the callee.
 	outbound bool
-	answer   string
 	accepted bool
 }
 
@@ -145,7 +141,7 @@ func (s *Session) offerToBrowser(callID string) string {
 		log.Warn().Err(err).Msg("could not build the browser's half of a call; offering it without sdp")
 		return ""
 	}
-	leg.OnFailed(func() { s.browserLost(callID) })
+	leg.OnLost(func() { s.browserLost(callID) })
 	s.bridge.mu.Lock()
 	if current := s.bridge.live[callID]; current == live {
 		live.leg = leg
@@ -194,6 +190,14 @@ func (s *Session) callFinished(callID, reason string) {
 		payload.Reason = &reason
 	}
 	s.emitEnd(protocol.EventCallTerminate, payload)
+}
+
+// endPublished reports whether the end of a call has been published.
+func (s *Session) endPublished(callID string) bool {
+	s.bridge.mu.Lock()
+	defer s.bridge.mu.Unlock()
+	_, told := s.bridge.told.seen[callID]
+	return told
 }
 
 // firstEndOf reports whether the end of a call has not been published yet, and records
@@ -303,7 +307,7 @@ func (s *Session) startCall(ctx context.Context, command *protocol.Command) (jso
 	}
 
 	log := s.log.With().Str("cmd_id", command.ID).Logger()
-	leg, answer, err := s.callMedia.Answer(ctx, req.SDP, log)
+	leg, err := s.callMedia.Answer(req.SDP, log)
 	if err != nil {
 		if errors.Is(err, calls.ErrBadSDP) {
 			return nil, protocol.NewError(protocol.ErrorInvalidPayload, "the browser's offer is not an SDP this connector can use")
@@ -317,21 +321,42 @@ func (s *Session) startCall(ctx context.Context, command *protocol.Command) (jso
 		return nil, protocol.NewError(protocol.ErrorWaError, "WhatsApp did not take the call")
 	}
 	id := call.ID()
-	live := &liveCall{call: call, leg: leg, outbound: true, answer: answer}
+	live := &liveCall{call: call, leg: leg, outbound: true}
 	s.bridge.mu.Lock()
 	if s.bridge.live == nil {
 		s.bridge.live = make(map[string]*liveCall)
 	}
 	s.bridge.live[id] = live
 	s.bridge.mu.Unlock()
-	leg.OnFailed(func() { s.browserLost(id) })
+	leg.OnLost(func() { s.browserLost(id) })
 	call.OnEnd(func(reason string) { s.callFinished(id, reason) })
-	call.OnPeerAccept(func() {
-		s.wire(live)
-		s.emit(protocol.EventCallAnswered, callAnswered{CallID: id, SDP: answer})
-	})
+	if call.State() == meowcaller.CallPhaseEnded {
+		// Refused or ended between the offer going out and OnEnd above, which meowcaller
+		// does not replay: the end already happened and nobody was listening for it.
+		// Reported here, and once even if OnEnd did catch it after all.
+		s.callFinished(id, "")
+	}
+	call.OnPeerAccept(func() { s.calleeAnswered(live, log) })
 	log.Info().Str("call_id", id).Msg("placed a call")
 	return json.Marshal(map[string]string{"call_id": id})
+}
+
+// calleeAnswered is the callee picking up a call the client placed: the browser's offer is
+// answered only now, and the answer goes to the client as `call.answered`.
+//
+//nolint:gocritic // zerolog.Logger is designed to be copied; every With() returns one by value
+func (s *Session) calleeAnswered(live *liveCall, log zerolog.Logger) {
+	id := live.call.ID()
+	answer, err := live.leg.Answer(s.ctx)
+	if err != nil {
+		log.Warn().Err(err).Str("call_id", id).Msg("could not answer the browser once the callee picked up; hanging up")
+		if err := live.call.Hangup(); err != nil {
+			log.Warn().Err(err).Str("call_id", id).Msg("could not hang up a call the browser cannot carry")
+		}
+		return
+	}
+	s.wire(live)
+	s.emit(protocol.EventCallAnswered, callAnswered{CallID: id, SDP: answer})
 }
 
 // dialOverCaller places a call through meowcaller on the current client.
@@ -349,7 +374,7 @@ func (s *Session) dialOverCaller(ctx context.Context, target string) (bridgedCal
 
 // terminateCall carries out `call.terminate`: a call answered or placed is hung up, and
 // one still ringing is refused. A call this session does not carry is nothing new.
-func (s *Session) terminateCall(_ context.Context, command *protocol.Command) (json.RawMessage, error) {
+func (s *Session) terminateCall(ctx context.Context, command *protocol.Command) (json.RawMessage, error) {
 	if !s.answersCalls() {
 		return nil, engine.ErrNotSupported
 	}
@@ -363,22 +388,39 @@ func (s *Session) terminateCall(_ context.Context, command *protocol.Command) (j
 	if live == nil {
 		return nil, nil
 	}
-	var err error
+	end := live.call.Reject
 	if live.outbound || live.accepted {
-		err = live.call.Hangup()
-	} else {
-		err = live.call.Reject()
+		end = live.call.Hangup
 	}
-	if err != nil {
+	if err := signal(ctx, end); err != nil {
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("end call %s: %w", req.CallID, ctx.Err())
+		}
 		return nil, protocol.NewError(protocol.ErrorWaError, "WhatsApp did not take the end of the call")
 	}
 	return nil, nil
 }
 
-// hangUpEverything ends every call this session carries, for a session that is closing:
-// the socket and the media are this instance's, and a call cannot follow the account to
-// another one.
-func (s *Session) hangUpEverything() {
+// signal runs one of meowcaller's call signals, which write their node with a context of
+// their own and cannot be cancelled, and stops waiting for it when ctx is done. The write
+// itself goes on until the socket takes it or fails it.
+func signal(ctx context.Context, send func() error) error {
+	done := make(chan error, 1)
+	go func() { done <- send() }()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// endCalls hangs up every call this session carries, for a socket that is going: the
+// socket and the media are this instance's, and a call cannot follow the account to
+// another one. It waits for the hang-ups to be written until ctx is done, and a context
+// already done sends them without waiting at all. meowcaller ends each call locally before
+// it writes the terminate, so the voice stops here whether or not the write lands.
+func (s *Session) endCalls(ctx context.Context) {
 	s.bridge.mu.Lock()
 	live := make([]*liveCall, 0, len(s.bridge.live))
 	for _, call := range s.bridge.live {
@@ -388,19 +430,13 @@ func (s *Session) hangUpEverything() {
 	if len(live) == 0 {
 		return
 	}
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		var wg sync.WaitGroup
-		for _, call := range live {
-			wg.Go(func() { _ = call.call.Hangup() })
-		}
-		wg.Wait()
-	}()
-	select {
-	case <-done:
-	case <-time.After(hangupWait):
-		s.log.Warn().Int("calls", len(live)).Msg("calls were still being hung up when the session closed")
+	var wg sync.WaitGroup
+	for _, call := range live {
+		wg.Go(func() { _ = signal(ctx, call.call.Hangup) })
+	}
+	wg.Wait()
+	if ctx.Err() != nil {
+		s.log.Debug().Int("calls", len(live)).Msg("hung up the calls of a session without waiting for the writes")
 	}
 	for _, call := range live {
 		if call.leg != nil {
