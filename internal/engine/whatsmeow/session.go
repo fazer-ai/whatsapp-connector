@@ -1928,9 +1928,7 @@ func (s *Session) Connect(ctx context.Context, req engine.ConnectRequest) error 
 		s.endCalls(ctx)
 	}
 	s.setCallPolicy(req.Calls != nil && req.Calls.AutoReject, req.Calls != nil && req.Calls.Answer)
-	s.bridge.mu.Lock()
-	s.bridge.offline = false
-	s.bridge.mu.Unlock()
+	s.backOnline()
 
 	// A hang-up an earlier command left running is waited for first: the move below may
 	// start one of its own, and awaitHangUp only knows about the latest.
@@ -2582,7 +2580,9 @@ func (s *Session) Logout(ctx context.Context) error {
 			// A guard raised now would have this session close the socket that comes
 			// back, and calling it offline would have `session.status` answer `close`
 			// for a reconnect that is going perfectly well — and a resume start a second
-			// dial alongside it.
+			// dial alongside it. So is calls registering again: the calls it carried are
+			// over, and the next one is the session's like any other.
+			s.backOnline()
 			return fmt.Errorf("whatsmeow: log %s out: %w", s.sid, neverSent(err))
 		}
 		s.settleLogout()

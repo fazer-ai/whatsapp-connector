@@ -1277,3 +1277,19 @@ func TestAConnectAfterADisconnectCarriesCallsAgain(t *testing.T) {
 		t.Fatal("a call after the session was connected again was offered without SDP")
 	}
 }
+
+// A logout that failed with the device untouched -- nothing was sent, or nothing came
+// back -- leaves the session as it was, and calls register on it again. One that went
+// through keeps them off.
+func TestALogoutThatFailedLeavesCallsOn(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	session.logout = func(context.Context, *wm.Client) error { return wm.ErrNotConnected }
+	if err := session.Logout(t.Context()); err == nil {
+		t.Fatal("a logout over no socket succeeded")
+	}
+	drain(t, session)
+	if _, sdp := ringCall(t, session, "call-1"); sdp == "" {
+		t.Fatal("after a logout that changed nothing, a call was offered without SDP")
+	}
+}

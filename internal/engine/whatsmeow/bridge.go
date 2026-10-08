@@ -569,6 +569,14 @@ func (s *Session) goOffline(ctx context.Context) {
 	s.endCalls(ctx)
 }
 
+// backOnline lets calls register again, on a session that connects or whose logout
+// failed with the device untouched.
+func (s *Session) backOnline() {
+	s.bridge.mu.Lock()
+	s.bridge.offline = false
+	s.bridge.mu.Unlock()
+}
+
 // endCalls hangs up every call this session carries, for a socket that is going: the
 // socket and the media are this instance's, and a call cannot follow the account to
 // another one. It waits for the hang-ups to be written until ctx is done, and a context
