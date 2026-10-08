@@ -1344,3 +1344,31 @@ func TestARebuildDoesNotWaitOnAStalledHandlerPastItsBound(t *testing.T) {
 		t.Fatal("a rebuild waited on a stalled handler past its bound")
 	}
 }
+
+// A call.start stopped by its own deadline is answered with the deadline and keeps no
+// attempt, as the contract says of every command stopped that way, even when meowcaller
+// reports the stop as a failed offer write.
+func TestACallStartStoppedByItsDeadlineIsLeftForTheResend(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	session.onWhatsApp = func(_ context.Context, _ *wm.Client, phones []string) ([]waTypes.IsOnWhatsAppResponse, error) {
+		return []waTypes.IsOnWhatsAppResponse{{Query: phones[0], IsIn: true,
+			JID: waTypes.NewJID("5541999990000", waTypes.DefaultUserServer)}}, nil
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	session.dialCall = func(context.Context, string) (bridgedCall, error) {
+		cancel()
+		return nil, fmt.Errorf("%w: %w", meowcaller.ErrSendOffer, context.Canceled)
+	}
+	start := &protocol.Command{
+		ID: "c1", Type: protocol.CommandCallStart, IdempotencyKey: "k1",
+		Payload: json.RawMessage(`{"to":{"kind":"phone","id":"5541999990000"},"sdp":` + mustJSON(t, browserOffer(t)) + `}`),
+	}
+	_, err := session.Execute(ctx, start)
+	if errors.Is(err, engine.ErrMayHaveLanded) {
+		t.Fatalf("a call.start stopped by its deadline = %v, marked as maybe landed", err)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("a call.start stopped by its deadline = %v, want the deadline's error", err)
+	}
+}

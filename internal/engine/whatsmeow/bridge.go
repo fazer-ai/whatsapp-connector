@@ -432,10 +432,16 @@ func (s *Session) startCall(ctx context.Context, command *protocol.Command) (jso
 		_ = leg.Close()
 		log.Warn().Err(err).Msg("meowcaller could not place the call")
 		failure := protocol.NewError(protocol.ErrorWaError, "WhatsApp did not take the call")
-		if offerMayHaveRung(err) {
+		if ctx.Err() == nil && offerMayHaveRung(err) {
 			// The callee's phone may be ringing, and a retry under the same key must
 			// not ring it again.
 			return nil, engine.MayHaveLanded(failure)
+		}
+		if ctx.Err() != nil {
+			// Stopped by its own deadline, which can end it before the write as easily
+			// as after: the contract has a resend run it again, so the attempt is not
+			// held, and the answer is the deadline's.
+			return nil, fmt.Errorf("call %s: %w", req.To.ID, ctx.Err())
 		}
 		// Failed before the offer was written: nothing rang, and the retry places
 		// the call.
