@@ -42,6 +42,9 @@ type liveCall struct {
 	// outbound is a call the client placed; its answer waits for the callee.
 	outbound bool
 	accepted bool
+	// accepting is a call.accept whose browser answer is applied and whose answer on
+	// WhatsApp may still be on its way: a repeat has nothing left to do.
+	accepting bool
 	// answered is closed once `call.answered` for a placed call has been queued, or
 	// given up on. Nil until the callee picks up. The call's end waits for it, so the
 	// client never reads the end of a call before its answer.
@@ -62,6 +65,9 @@ type bridgeState struct {
 	// decrypts the offer and preaccepts it, which can take a while, so this is what says
 	// an `offer` is on its way to callOffered before the call is registered as live.
 	engaged ring
+	// closed is a session that is closing: a call registered after its calls were ended
+	// would escape that, so none is.
+	closed bool
 }
 
 // callOfferPayload is `call.offer` as this session publishes it once it carries calls.
@@ -140,14 +146,27 @@ func (s *Session) offerOnItsWay(callID string) bool {
 func (s *Session) callRinging(call *meowcaller.Call) { s.ringing(call) }
 
 func (s *Session) ringing(call bridgedCall) {
+	if !s.register(call.ID(), &liveCall{call: call}) {
+		// Rang as the session closed: left to ring on the account's other devices,
+		// as it would on a session that does not carry calls.
+		return
+	}
+	id := call.ID()
+	call.OnEnd(func(reason string) { s.callFinished(id, reason) })
+}
+
+// register records a call this session carries, unless the session is closing.
+func (s *Session) register(id string, live *liveCall) bool {
 	s.bridge.mu.Lock()
+	defer s.bridge.mu.Unlock()
+	if s.bridge.closed {
+		return false
+	}
 	if s.bridge.live == nil {
 		s.bridge.live = make(map[string]*liveCall)
 	}
-	s.bridge.live[call.ID()] = &liveCall{call: call}
-	s.bridge.mu.Unlock()
-	id := call.ID()
-	call.OnEnd(func(reason string) { s.callFinished(id, reason) })
+	s.bridge.live[id] = live
+	return true
 }
 
 // offerToBrowser builds the browser leg of a received call meowcaller engaged, and
@@ -202,29 +221,49 @@ func (s *Session) browserLost(callID string) {
 func (s *Session) callFinished(callID, reason string) {
 	s.bridge.mu.Lock()
 	live := s.bridge.live[callID]
+	first, answered := s.claimEndLocked(callID)
 	delete(s.bridge.live, callID)
 	s.bridge.ended.add(callID)
-	var answered chan struct{}
-	if live != nil {
-		answered = live.answered
-	}
 	s.bridge.mu.Unlock()
 	if live != nil && live.leg != nil {
 		_ = live.leg.Close()
 	}
-	if !s.firstEndOf(callID) {
+	if !first {
 		return
 	}
 	payload := callTerminate{CallID: callID}
 	if reason != "" {
 		payload.Reason = &reason
 	}
+	s.publishEnd(payload, answered)
+}
+
+// claimEnd records that the end of a call is being published, and reports whether it
+// was not already, with the barrier of a placed call's answer that the end has to follow.
+func (s *Session) claimEnd(callID string) (first bool, answered chan struct{}) {
+	s.bridge.mu.Lock()
+	defer s.bridge.mu.Unlock()
+	return s.claimEndLocked(callID)
+}
+
+func (s *Session) claimEndLocked(callID string) (first bool, answered chan struct{}) {
+	if live := s.bridge.live[callID]; live != nil {
+		answered = live.answered
+	}
+	if callID == "" {
+		return true, answered
+	}
+	return s.bridge.told.add(callID), answered
+}
+
+// publishEnd publishes the end of a call, after the call's answer when one is still
+// waiting for room. Off whatever goroutine ended the call, which can be whatsmeow's
+// dispatch.
+func (s *Session) publishEnd(payload callTerminate, answered chan struct{}) {
 	if answered == nil {
 		s.emitEnd(protocol.EventCallTerminate, payload)
 		return
 	}
-	// After the answer, which may still be waiting for room. Off whatever goroutine
-	// ended the call, which can be whatsmeow's dispatch.
 	go func() {
 		// The answer gives up after callWait on its own, and a session that closes
 		// takes both with it.
@@ -242,17 +281,6 @@ func (s *Session) endPublished(callID string) bool {
 	defer s.bridge.mu.Unlock()
 	_, told := s.bridge.told.seen[callID]
 	return told
-}
-
-// firstEndOf reports whether the end of a call has not been published yet, and records
-// it either way.
-func (s *Session) firstEndOf(callID string) bool {
-	if callID == "" {
-		return true
-	}
-	s.bridge.mu.Lock()
-	defer s.bridge.mu.Unlock()
-	return s.bridge.told.add(callID)
 }
 
 // acceptCall carries out `call.accept`: the browser's answer is applied, and only then is
@@ -274,7 +302,10 @@ func (s *Session) acceptCall(ctx context.Context, command *protocol.Command) (js
 	// from its own goroutine.
 	var accepted, outbound, hasLeg bool
 	if live != nil {
-		accepted, outbound, hasLeg = live.accepted, live.outbound, live.leg != nil
+		accepted, outbound, hasLeg = live.accepted || live.accepting, live.outbound, live.leg != nil
+		if !accepted && !outbound && hasLeg {
+			live.accepting = true
+		}
 	}
 	s.bridge.mu.Unlock()
 	switch {
@@ -293,6 +324,9 @@ func (s *Session) acceptCall(ctx context.Context, command *protocol.Command) (js
 			"this call was offered without sdp, so there is no offer to answer")
 	}
 	if err := live.leg.Accept(req.SDP); err != nil {
+		s.bridge.mu.Lock()
+		live.accepting = false
+		s.bridge.mu.Unlock()
 		return nil, protocol.NewError(protocol.ErrorInvalidPayload, "the browser's answer is not an SDP this connector can use")
 	}
 	// The voice is wired by whoever sees the answer go through, which is not this
@@ -391,12 +425,13 @@ func (s *Session) startCall(ctx context.Context, command *protocol.Command) (jso
 	}
 	id := call.ID()
 	live := &liveCall{call: call, leg: leg, outbound: true}
-	s.bridge.mu.Lock()
-	if s.bridge.live == nil {
-		s.bridge.live = make(map[string]*liveCall)
+	if !s.register(id, live) {
+		// The session closed while the callee was being rung, after its calls were
+		// ended: this one is ended here, or it would ring with nobody behind it.
+		_ = leg.Close()
+		go func() { _ = call.Hangup() }()
+		return nil, engine.MayHaveLanded(protocol.NewError(protocol.ErrorWaError, "the session closed as the call was placed"))
 	}
-	s.bridge.live[id] = live
-	s.bridge.mu.Unlock()
 	leg.OnLost(func() { s.browserLost(id) })
 	call.OnEnd(func(reason string) { s.callFinished(id, reason) })
 	if call.State() == meowcaller.CallPhaseEnded {

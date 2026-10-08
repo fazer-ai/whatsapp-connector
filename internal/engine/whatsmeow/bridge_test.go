@@ -1093,3 +1093,125 @@ func TestAProxiedSessionDoesNotCarryCalls(t *testing.T) {
 		}
 	}
 }
+
+// A connect that stops the session carrying calls ends the calls it carries before it
+// changes anything: with a proxy their UDP media would go on leaving from this host, and
+// with the policy off no call.terminate could reach them any more.
+func TestAConnectThatTurnsCallsOffEndsThem(t *testing.T) {
+	t.Parallel()
+	for name, req := range map[string]engine.ConnectRequest{
+		"auto_reject": {Pairing: "resume", Calls: &engine.CallsRequest{AutoReject: true, Answer: true}},
+		"no answer":   {Pairing: "resume"},
+		"a proxy": {Pairing: "resume", Calls: &engine.CallsRequest{Answer: true},
+			Proxy: &engine.ProxyRequest{URL: "socks5://127.0.0.1:2"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			session := newCallSession(t)
+			call, release := answeredCall(t, session, "call-1")
+			release()
+			_ = session.Connect(t.Context(), req)
+			hungUpWithin(t, call)
+		})
+	}
+}
+
+// A session that closes ends its calls, and a call registered after that -- a placed one
+// whose dial was still under way -- is hung up rather than left ringing outside the
+// teardown.
+func TestACallPlacedAsTheSessionClosesIsHungUp(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	session.onWhatsApp = func(_ context.Context, _ *wm.Client, phones []string) ([]waTypes.IsOnWhatsAppResponse, error) {
+		return []waTypes.IsOnWhatsAppResponse{{Query: phones[0], IsIn: true,
+			JID: waTypes.NewJID("5541999990000", waTypes.DefaultUserServer)}}, nil
+	}
+	call := &fakeCall{id: "CALLOUT1", signalled: make(chan struct{}, 4)}
+	session.dialCall = func(context.Context, string) (bridgedCall, error) {
+		// The close lands while the offer is on its way.
+		session.bridge.mu.Lock()
+		session.bridge.closed = true
+		session.bridge.mu.Unlock()
+		return call, nil
+	}
+	start := &protocol.Command{
+		ID: "c1", Type: protocol.CommandCallStart, IdempotencyKey: "k1",
+		Payload: json.RawMessage(`{"to":{"kind":"phone","id":"5541999990000"},"sdp":` + mustJSON(t, browserOffer(t)) + `}`),
+	}
+	_, err := session.Execute(t.Context(), start)
+	if !errors.Is(err, engine.ErrMayHaveLanded) {
+		t.Fatalf("a call placed as the session closed = %v, want a failure that may have rung", err)
+	}
+	hungUpWithin(t, call)
+	session.bridge.mu.Lock()
+	left := len(session.bridge.live)
+	session.bridge.mu.Unlock()
+	if left != 0 {
+		t.Fatalf("%d calls registered on a closing session", left)
+	}
+}
+
+// A call.accept repeated while the first one's answer is still on its way is nothing
+// new: the browser's answer is applied once, and the repeat is not refused.
+func TestAnAcceptRepeatedWhileTheAnswerIsPendingIsNothingNew(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	call := &fakeCall{id: "call-1", answerStall: make(chan struct{})}
+	t.Cleanup(func() {
+		select {
+		case <-call.answerStall:
+		default:
+			close(call.answerStall)
+		}
+	})
+	session.ringing(call)
+	session.handle(audioOffer("call-1"))
+	offer, _ := published(t, session, protocol.EventCallOffer, "event_call_offer")["sdp"].(string)
+	accept := `{"call_id":"call-1","sdp":` + mustJSON(t, browserAnswer(t, offer)) + `}`
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := session.Execute(ctx, command(protocol.CommandCallAccept, accept)); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("a stalled accept returned %v, want the deadline", err)
+	}
+	if _, err := session.Execute(t.Context(), command(protocol.CommandCallAccept, accept)); err != nil {
+		t.Fatalf("the repeat of an accept still being answered = %v, want nothing new", err)
+	}
+}
+
+// The end of a placed call reported by WhatsApp's own terminate also waits for the
+// call's answer, when the answer is still waiting for room.
+func TestWhatsAppsTerminateOfAnAnsweredCallFollowsItsAnswer(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	call := &fakeCall{id: "CALLOUT1"}
+	placeCall(t, session, call)
+	drain(t, session)
+	filled := 0
+fill:
+	for {
+		select {
+		case session.inbox <- pending{}:
+			filled++
+		default:
+			break fill
+		}
+	}
+	call.peerAccepts()
+	session.handle(&waEvents.CallTerminate{BasicCallMeta: callMeta("CALLOUT1"), Reason: "hangup"})
+
+	var order []protocol.EventType
+	deadline := time.After(testwait.Budget)
+	for len(order) < 2 {
+		select {
+		case emission := <-session.Events():
+			if emission.Type == protocol.EventCallAnswered || emission.Type == protocol.EventCallTerminate {
+				order = append(order, emission.Type)
+			}
+		case <-deadline:
+			t.Fatalf("published %v and nothing more", order)
+		}
+	}
+	if order[0] != protocol.EventCallAnswered {
+		t.Fatalf("published %v, want the answer before the end", order)
+	}
+}

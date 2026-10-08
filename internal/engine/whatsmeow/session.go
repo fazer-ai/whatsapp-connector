@@ -1906,6 +1906,12 @@ func (s *Session) Connect(ctx context.Context, req engine.ConnectRequest) error 
 	// next connect that happened to succeed.
 	s.setGroups(req.Groups)
 	s.setHistory(req.HistorySync)
+	if req.Calls == nil || !req.Calls.Answer || req.Calls.AutoReject || req.ProxyURL() != "" {
+		// A connect that stops this session carrying calls ends the ones it carries
+		// first: on a proxy their media would go on leaving from this host's address,
+		// and with the policy off nothing could end them any more.
+		s.endCalls(ctx)
+	}
 	s.setCallPolicy(req.Calls != nil && req.Calls.AutoReject, req.Calls != nil && req.Calls.Answer)
 
 	// A hang-up an earlier command left running is waited for first: the move below may
@@ -3703,6 +3709,9 @@ func (s *Session) Close() error {
 	// socket of an instance that lost it has to go now, not after a write. A hang-up that
 	// does not make it before the disconnect leaves the call to end on the phone's side
 	// when the media stops.
+	s.bridge.mu.Lock()
+	s.bridge.closed = true
+	s.bridge.mu.Unlock()
 	gone, stop := context.WithCancel(context.Background())
 	stop()
 	s.endCalls(gone)

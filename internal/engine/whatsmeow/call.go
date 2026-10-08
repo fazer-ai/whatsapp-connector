@@ -261,7 +261,8 @@ func (s *Session) callEnded(event *waEvents.CallTerminate) bool {
 	}
 	// Once per call. A call this session carries the voice of is also ended by
 	// meowcaller, which publishes it from its own side when it gets there first.
-	if !s.firstEndOf(event.CallID) {
+	first, answered := s.claimEnd(event.CallID)
+	if !first {
 		return true
 	}
 
@@ -281,7 +282,7 @@ func (s *Session) callEnded(event *waEvents.CallTerminate) bool {
 		reason := event.Reason
 		payload.Reason = &reason
 	}
-	s.emitEnd(protocol.EventCallTerminate, payload)
+	s.publishEnd(payload, answered)
 	return true
 }
 
