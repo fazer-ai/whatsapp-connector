@@ -982,6 +982,24 @@ func TestAPlacedCallThatEndsAsItIsAnsweredIsNotReportedAnswered(t *testing.T) {
 	}
 }
 
+// A notice's wait outlives the dispatch it came from. A rebuild during it retires the
+// client the notice arrived on, and the call it announced is not published on the session
+// the replacement owns.
+func TestANoticeWaitingOutARebuildIsNotPublished(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	session.offerWait = 200 * time.Millisecond
+	session.handle(callNotice("call-1"))
+	if err := session.rebuild(t.Context()); err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	select {
+	case emission := <-session.Events():
+		t.Fatalf("published %s from a client the rebuild retired", emission.Type)
+	case <-time.After(600 * time.Millisecond):
+	}
+}
+
 // meowcaller can take a while between engaging an offer and handing the call over. A
 // notice whose wait runs out in that window leaves the call's one call.offer to the offer.
 func TestANoticeDoesNotTakeTheOfferMeowcallerIsStillWorkingThrough(t *testing.T) {

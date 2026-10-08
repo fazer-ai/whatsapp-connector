@@ -135,8 +135,12 @@ func (s *Session) callNoticed(meta *waTypes.BasicCallMeta, media callMedia, grou
 		return s.callOffered(meta, media, group)
 	}
 	held := *meta
+	// The wait outlives the dispatch it came from, so it carries that client's fence: a
+	// rebuild in the meantime retires the client the notice arrived on, and its call is not
+	// published on the session the replacement owns.
+	retired := s.currentRetirement()
 	time.AfterFunc(s.offerWait, func() {
-		if s.ctx.Err() == nil && !s.endPublished(held.CallID) && !s.offerOnItsWay(held.CallID) {
+		if s.ctx.Err() == nil && !retired.Load() && !s.endPublished(held.CallID) && !s.offerOnItsWay(held.CallID) {
 			s.callOffered(&held, media, group)
 		}
 	})

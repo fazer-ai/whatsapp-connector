@@ -162,6 +162,14 @@ func (s *Session) offerOnItsWay(callID string) bool {
 	return engaged
 }
 
+// currentRetirement is the fence of the client this session runs on now, which a rebuild
+// sets as it retires that client.
+func (s *Session) currentRetirement() *atomic.Bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.retiredHandler
+}
+
 // engagesOfferFrom is the gate as the client it was installed on asks it: nothing is
 // engaged once that client is retired.
 func (s *Session) engagesOfferFrom(retired *atomic.Bool, event *waEvents.CallOffer) bool {
