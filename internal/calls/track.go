@@ -38,7 +38,8 @@ func (t *audioTrack) Bind(ctx webrtc.TrackLocalContext) (webrtc.RTPCodecParamete
 		if _, _, ok := codecFor(codec.MimeType); !ok {
 			continue
 		}
-		t.bound, t.mime, t.pt, t.ssrc, t.stream = true, codec.MimeType, uint8(codec.PayloadType), uint32(ctx.SSRC()), ctx.WriteStream()
+		mime, _ := canonical(codec.MimeType)
+		t.bound, t.mime, t.pt, t.ssrc, t.stream = true, mime, uint8(codec.PayloadType), uint32(ctx.SSRC()), ctx.WriteStream()
 		return codec, nil
 	}
 	return webrtc.RTPCodecParameters{}, errNoCodecInCommon

@@ -70,3 +70,33 @@ func TestAReceivedCallAnsweredInPCMUIsTaken(t *testing.T) {
 		t.Fatalf("negotiated %q, want PCMU", got)
 	}
 }
+
+// SDP compares codec names without case, and so does this side: a browser that writes
+// `g722` or `pcmu` is answered in it, and its voice is carried.
+func TestACodecNamedInLowerCaseIsStillTheCodec(t *testing.T) {
+	t.Parallel()
+	for mime, name := range map[string]string{webrtc.MimeTypeG722: "G722/8000", webrtc.MimeTypePCMU: "PCMU/8000"} {
+		t.Run(mime, func(t *testing.T) {
+			t.Parallel()
+			m := openMedia(t)
+			leg, offer, err := m.Offer(t.Context(), zerolog.Nop())
+			if err != nil {
+				t.Fatalf("offer: %v", err)
+			}
+			t.Cleanup(func() { _ = leg.Close() })
+			b := newBrowser(t, mime)
+			answer := b.answer(offer)
+			lower := strings.ReplaceAll(answer, name, strings.ToLower(name))
+			if lower == answer {
+				t.Fatalf("the answer does not name %s, so the case tests nothing:\n%s", name, answer)
+			}
+			if err := leg.Accept(lower); err != nil {
+				t.Fatalf("an answer naming %s in lower case was refused: %v", name, err)
+			}
+			waitConnected(t, leg.pc, b.pc)
+			if got := leg.Codec(); got != mime {
+				t.Fatalf("negotiated %q, want %q", got, mime)
+			}
+		})
+	}
+}
