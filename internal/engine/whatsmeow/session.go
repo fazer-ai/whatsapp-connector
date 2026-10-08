@@ -77,6 +77,9 @@ type Session struct {
 	mu        sync.Mutex
 	client    *wm.Client
 	handlerID uint32
+	// retiredHandler is set once the client handlerID belongs to is being replaced, and
+	// from then on that handler drops what it is handed. See adopt.
+	retiredHandler *atomic.Bool
 
 	// detach removes the event handler from a client. It is a field only so the
 	// teardown order can be held to: whatsmeow runs a handler under a lock that
@@ -1062,7 +1065,19 @@ func (s *Session) adopt(ctx context.Context, client *wm.Client) bool {
 	// Subscribed before the swap, so the client is never live with nobody listening,
 	// and both halves are one lifecycle step: a Close that lands between them would
 	// otherwise leave a handler on a client the session no longer knows about.
-	handlerID := client.AddEventHandlerWithSuccessStatus(s.handle)
+	//
+	// Fenced, because removing the handler is not always waited for: a rebuild gives up on
+	// a removal stalled behind meowcaller's handler and adopts the next client anyway, and
+	// whatsmeow runs its whole handler list under one lock, so this one would still be
+	// called when the stalled one returns, with an event from the retired account, on the
+	// session the replacement now owns. A fenced event is left unacknowledged.
+	retiredHandler := new(atomic.Bool)
+	handlerID := client.AddEventHandlerWithSuccessStatus(func(event any) bool {
+		if retiredHandler.Load() {
+			return false
+		}
+		return s.handle(event)
+	})
 
 	s.mu.Lock()
 	if s.closed {
@@ -1080,6 +1095,7 @@ func (s *Session) adopt(ctx context.Context, client *wm.Client) bool {
 	// swallowed for good.
 	s.dropAnnounced = false
 	s.handlerID = handlerID
+	s.retiredHandler = retiredHandler
 	s.phone = named.phone
 	s.lid = named.lid
 	// A rebuilt client brings the device record's copy of these names back, and the marker
@@ -3365,8 +3381,9 @@ func (s *Session) rebuild(ctx context.Context) error {
 	}
 
 	s.mu.Lock()
-	previous, handlerID := s.client, s.handlerID
+	previous, handlerID, retiredHandler := s.client, s.handlerID, s.retiredHandler
 	s.mu.Unlock()
+	retiredHandler.Store(true)
 	// The handler is removed first, so nothing the old client does from here is heard,
 	// and on the same bound as the disconnect below: RemoveEventHandler waits for every
 	// handler that is running, meowcaller's included, and a write meowcaller stalled on with

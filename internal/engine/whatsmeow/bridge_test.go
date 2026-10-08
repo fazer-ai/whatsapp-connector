@@ -1366,6 +1366,55 @@ func TestARebuildDoesNotWaitOnAStalledHandlerPastItsBound(t *testing.T) {
 	}
 }
 
+// A rebuild that gave up on a stalled handler removal has adopted the next client with
+// the old one's handler still installed, and whatsmeow calls it again as soon as the stall
+// lets go. What the retired client hands it from then on is dropped, unacknowledged, and
+// nothing reaches the session the replacement owns; the replacement's own events still do.
+func TestARetiredClientsHandlerIsFencedOffTheReplacement(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	stalled := make(chan struct{})
+	t.Cleanup(func() { close(stalled) })
+	session.detach = func(*wm.Client, uint32) { <-stalled }
+	retired := session.current()
+	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+	defer cancel()
+	if err := session.rebuild(ctx); err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	replacement := session.current()
+	if replacement == retired {
+		t.Fatal("the rebuild kept the retired client")
+	}
+
+	// Dispatched the way whatsmeow dispatches what arrives on the socket, which is the one
+	// way to reach the handlers a client holds.
+	//nolint:staticcheck // SA1019: the dispatch a real socket drives is this one
+	if failed := retired.DangerousInternals().DispatchEvent(textMessage("from-the-retired", "hi")); !failed {
+		t.Fatal("an event from the retired client was acknowledged")
+	}
+	select {
+	case emission := <-session.Events():
+		t.Fatalf("the retired client's event reached the replacement's session as %s", emission.Type)
+	default:
+	}
+
+	handled := make(chan bool, 1)
+	go func() {
+		//nolint:staticcheck // SA1019: as above
+		handled <- !replacement.DangerousInternals().DispatchEvent(textMessage("from-the-replacement", "hi"))
+	}()
+	next(t, session).Settle(nil)
+	select {
+	case ok := <-handled:
+		if !ok {
+			t.Fatal("the replacement's own event was left unacknowledged")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the replacement's own event was never handled")
+	}
+}
+
 // A call.start stopped by its own deadline is answered with the deadline and keeps no
 // attempt, as the contract says of every command stopped that way, even when meowcaller
 // reports the stop as a failed offer write.
