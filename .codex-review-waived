@@ -586,3 +586,12 @@ internal/engine/whatsmeow/wireonce.go: Distinguish pre-send cancellation from an
 third_party/meowcaller/engine_media.go: Refresh allocations using the current call mode  # PR#387, group calls out of #380
 third_party/meowcaller/engine.go: Drain deferred video controls before allowing live updates  # PR#387, video out of #380
 third_party/meowcaller/engine.go: Preserve orientation set before the video sender exists  # PR#387, video out of #380
+
+# PR#393: measured, and it does not happen on this pin. pion matches the codec an answer
+# names against the MediaEngine's table without case and hands the track the table's own
+# spelling, so `codecFor` sees `audio/G722` and `audio/PCMU` however the browser wrote them.
+# `TestACodecNamedInLowerCaseIsStillTheCodec` answers in `g722/8000` and `pcmu/8000` and
+# passes with the case-sensitive switch (and failed to tell the difference when the
+# case-insensitive match was added, which is why it was taken back as dead code). The test
+# stays as the pin: a pion bump that stopped normalizing would fail it.
+internal/calls/codec.go: Match codec MIME types case-insensitively  # PR#393
