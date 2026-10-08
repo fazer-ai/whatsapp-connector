@@ -71,8 +71,10 @@ func TestAReceivedCallAnsweredInPCMUIsTaken(t *testing.T) {
 	}
 }
 
-// SDP compares codec names without case, and so does this side: a browser that writes
-// `g722` or `pcmu` is answered in it, and its voice is carried.
+// SDP compares codec names without case: a browser that writes `g722` or `pcmu` is
+// answered in it. pion matches the name against the codec table and hands this side the
+// table's own spelling, which is what this pins; a pin bump that stopped doing that would
+// leave the track unable to bind.
 func TestACodecNamedInLowerCaseIsStillTheCodec(t *testing.T) {
 	t.Parallel()
 	for mime, name := range map[string]string{webrtc.MimeTypeG722: "G722/8000", webrtc.MimeTypePCMU: "PCMU/8000"} {

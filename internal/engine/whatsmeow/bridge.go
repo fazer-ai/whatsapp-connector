@@ -165,6 +165,11 @@ func (s *Session) ringing(call bridgedCall) {
 	}
 	id := call.ID()
 	call.OnEnd(func(reason string) { s.callFinished(id, reason) })
+	if call.State() == meowcaller.CallPhaseEnded {
+		// Ended between the registration and OnEnd above -- a connect turning calls off
+		// hangs up what is registered -- which meowcaller does not replay.
+		s.callFinished(id, "")
+	}
 }
 
 // register records a call this session carries, unless the session is closing, a

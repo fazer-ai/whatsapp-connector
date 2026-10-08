@@ -1293,3 +1293,21 @@ func TestALogoutThatFailedLeavesCallsOn(t *testing.T) {
 		t.Fatal("after a logout that changed nothing, a call was offered without SDP")
 	}
 }
+
+// meowcaller does not replay an end that happened before OnEnd was set, and a received
+// call can be ended in that window: it is reported over, and no browser offer is built
+// for it.
+func TestAReceivedCallThatEndedBeforeItsListenerIsReportedOver(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	session.ringing(&fakeCall{id: "call-1", ended: true})
+	if end := published(t, session, protocol.EventCallTerminate, "event_call_terminate"); end["call_id"] != "call-1" {
+		t.Fatalf("the end names %v", end["call_id"])
+	}
+	session.bridge.mu.Lock()
+	left := len(session.bridge.live)
+	session.bridge.mu.Unlock()
+	if left != 0 {
+		t.Fatalf("%d calls are still carried after the call ended", left)
+	}
+}

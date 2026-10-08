@@ -1,8 +1,6 @@
 package calls
 
 import (
-	"strings"
-
 	"github.com/gotranspile/g722"
 	"github.com/pion/webrtc/v4"
 )
@@ -88,20 +86,7 @@ func (d *pcmuDecoder) decode(payload []byte) []int16 {
 	return out
 }
 
-// canonical is a codec's MIME type as this package spells it. SDP compares them without
-// case, pion keeps whatever spelling the other side wrote, and a browser writing `pcmu` is
-// still speaking PCMU.
-func canonical(mime string) (string, bool) {
-	for _, codec := range browserCodecs {
-		if strings.EqualFold(mime, codec.MimeType) {
-			return codec.MimeType, true
-		}
-	}
-	return "", false
-}
-
 func codecFor(mime string) (encoder, decoder, bool) {
-	mime, _ = canonical(mime)
 	switch mime {
 	case webrtc.MimeTypeG722:
 		return g722Encoder{g722.NewEncoder(g722BitRate, 0)}, &g722Decoder{dec: g722.NewDecoder(g722BitRate, 0)}, true
