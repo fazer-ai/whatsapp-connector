@@ -42,6 +42,10 @@ type liveCall struct {
 	// outbound is a call the client placed; its answer waits for the callee.
 	outbound bool
 	accepted bool
+	// answered is closed once `call.answered` for a placed call has been queued, or
+	// given up on. Nil until the callee picks up. The call's end waits for it, so the
+	// client never reads the end of a call before its answer.
+	answered chan struct{}
 }
 
 // bridgeState is what the session keeps about the calls it carries. Its own lock, because
@@ -197,6 +201,10 @@ func (s *Session) callFinished(callID, reason string) {
 	live := s.bridge.live[callID]
 	delete(s.bridge.live, callID)
 	s.bridge.ended.add(callID)
+	var answered chan struct{}
+	if live != nil {
+		answered = live.answered
+	}
 	s.bridge.mu.Unlock()
 	if live != nil && live.leg != nil {
 		_ = live.leg.Close()
@@ -208,7 +216,21 @@ func (s *Session) callFinished(callID, reason string) {
 	if reason != "" {
 		payload.Reason = &reason
 	}
-	s.emitEnd(protocol.EventCallTerminate, payload)
+	if answered == nil {
+		s.emitEnd(protocol.EventCallTerminate, payload)
+		return
+	}
+	// After the answer, which may still be waiting for room. Off whatever goroutine
+	// ended the call, which can be whatsmeow's dispatch.
+	go func() {
+		// The answer gives up after callWait on its own, and a session that closes
+		// takes both with it.
+		select {
+		case <-answered:
+		case <-s.done:
+		}
+		s.emitEnd(protocol.EventCallTerminate, payload)
+	}()
 }
 
 // endPublished reports whether the end of a call has been published.
@@ -245,6 +267,12 @@ func (s *Session) acceptCall(ctx context.Context, command *protocol.Command) (js
 	s.bridge.mu.Lock()
 	live := s.bridge.live[req.CallID]
 	_, wasEnded := s.bridge.ended.seen[req.CallID]
+	// Read under the lock: an accept whose deadline passed may still be wiring this call
+	// from its own goroutine.
+	var accepted, outbound, hasLeg bool
+	if live != nil {
+		accepted, outbound, hasLeg = live.accepted, live.outbound, live.leg != nil
+	}
 	s.bridge.mu.Unlock()
 	switch {
 	case live == nil && wasEnded:
@@ -252,12 +280,12 @@ func (s *Session) acceptCall(ctx context.Context, command *protocol.Command) (js
 		return nil, nil
 	case live == nil:
 		return nil, protocol.NewError(protocol.ErrorInvalidPayload, "no call with that id is ringing on this session")
-	case live.accepted:
+	case accepted:
 		return nil, nil
-	case live.outbound:
+	case outbound:
 		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
 			"a call the client placed is answered by the callee, not accepted")
-	case live.leg == nil:
+	case !hasLeg:
 		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
 			"this call was offered without sdp, so there is no offer to answer")
 	}
@@ -400,10 +428,16 @@ func (s *Session) calleeAnswered(live *liveCall, log zerolog.Logger) {
 	}
 	// Off the dispatch: this runs inside meowcaller's handler of the callee's accept, and
 	// an inbox with no room must not hold up whatever WhatsApp sends next, the end of
-	// this same call included.
-	if !s.offer(&engine.Emission{Type: protocol.EventCallAnswered}, callAnswered{CallID: id, SDP: answer}, offDispatch) {
-		log.Warn().Str("call_id", id).Msg("could not queue call.answered, with too many events already waiting for room")
-	}
+	// this same call included. The end waits on `answered` instead, which is what keeps
+	// the two in order when both have to wait for room.
+	sent := make(chan struct{})
+	live.answered = sent
+	go func() {
+		defer close(sent)
+		if !s.offer(&engine.Emission{Type: protocol.EventCallAnswered}, callAnswered{CallID: id, SDP: answer}, s.callWait) {
+			log.Warn().Str("call_id", id).Msg("could not queue call.answered, with no room in the inbox")
+		}
+	}()
 }
 
 // dialOverCaller places a call through meowcaller on the current client.
@@ -431,12 +465,13 @@ func (s *Session) terminateCall(ctx context.Context, command *protocol.Command) 
 	}
 	s.bridge.mu.Lock()
 	live := s.bridge.live[req.CallID]
+	answered := live != nil && (live.outbound || live.accepted)
 	s.bridge.mu.Unlock()
 	if live == nil {
 		return nil, nil
 	}
 	end := live.call.Reject
-	if live.outbound || live.accepted {
+	if answered {
 		end = live.call.Hangup
 	}
 	if err := signal(ctx, end); err != nil {

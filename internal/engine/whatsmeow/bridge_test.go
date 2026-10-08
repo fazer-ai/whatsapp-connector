@@ -960,3 +960,89 @@ func TestANoticeDoesNotTakeTheOfferMeowcallerIsStillWorkingThrough(t *testing.T)
 		t.Fatalf("the offer carries %q, want the connector's SDP", sdp)
 	}
 }
+
+// A client replaced -- WhatsApp logging the device out, a rebuild after a drop -- takes its
+// calls with it: meowcaller does not see that, and a call left to it would outlive the
+// account it belonged to.
+func TestReplacingTheClientEndsItsCalls(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	call, release := answeredCall(t, session, "call-1")
+	release()
+	if !session.adopt(t.Context(), session.current()) {
+		t.Fatal("the session would not take a client")
+	}
+	hungUpWithin(t, call)
+	session.bridge.mu.Lock()
+	left := len(session.bridge.live)
+	session.bridge.mu.Unlock()
+	if left != 0 {
+		t.Fatalf("%d calls are still carried by a client that was replaced", left)
+	}
+}
+
+// With the inbox full, the callee's answer and then the call's end both wait for room, and
+// they reach the client in that order.
+func TestTheAnswerOfAPlacedCallIsPublishedBeforeItsEnd(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	call := &fakeCall{id: "CALLOUT1"}
+	placeCall(t, session, call)
+	drain(t, session)
+	filled := 0
+fill:
+	for {
+		select {
+		case session.inbox <- pending{}:
+			filled++
+		default:
+			break fill
+		}
+	}
+	call.peerAccepts()
+	call.remoteEnds("hangup")
+
+	var order []protocol.EventType
+	deadline := time.After(testwait.Budget)
+	for len(order) < 2 {
+		select {
+		case emission := <-session.Events():
+			if emission.Type == protocol.EventCallAnswered || emission.Type == protocol.EventCallTerminate {
+				order = append(order, emission.Type)
+			}
+		case <-deadline:
+			t.Fatalf("published %v and nothing more", order)
+		}
+	}
+	if order[0] != protocol.EventCallAnswered {
+		t.Fatalf("published %v, want the answer before the end", order)
+	}
+}
+
+// An accept whose deadline passed goes on wiring the call from its own goroutine while a
+// call.terminate for it runs on the executor; the two read and write the call's state
+// under one lock, which is what -race checks here, and the terminate hangs up the call
+// that the accept answered.
+func TestATerminateRacingALateAcceptHangsUp(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	call := &fakeCall{id: "call-1", answerStall: make(chan struct{})}
+	session.ringing(call)
+	session.handle(audioOffer("call-1"))
+	offer, _ := published(t, session, protocol.EventCallOffer, "event_call_offer")["sdp"].(string)
+	accept := `{"call_id":"call-1","sdp":` + mustJSON(t, browserAnswer(t, offer)) + `}`
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := session.Execute(ctx, command(protocol.CommandCallAccept, accept)); !errors.Is(err, context.DeadlineExceeded) {
+		close(call.answerStall)
+		t.Fatalf("a stalled accept returned %v, want the deadline", err)
+	}
+	close(call.answerStall)
+	if _, err := session.Execute(t.Context(), command(protocol.CommandCallTerminate, `{"call_id":"call-1"}`)); err != nil {
+		t.Fatal(err)
+	}
+	answered, rejected, hungUp, _ := call.counts()
+	if answered != 1 || rejected+hungUp != 1 {
+		t.Fatalf("answered %d, rejected %d, hung up %d", answered, rejected, hungUp)
+	}
+}

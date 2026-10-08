@@ -1045,6 +1045,14 @@ func (s *Session) adopt(ctx context.Context, client *wm.Client) bool {
 		caller.OnIncomingCall(s.callRinging)
 	}
 
+	// The calls of the client being replaced end with it: meowcaller's media runs on a
+	// context of its own and does not see the logout or the drop that brought this
+	// rebuild, so a call left to it would outlive the account it belonged to. Not waited
+	// for, since the socket they would be written on is the one being retired.
+	retired, stop := context.WithCancel(context.Background())
+	stop()
+	s.endCalls(retired)
+
 	// Subscribed before the swap, so the client is never live with nobody listening,
 	// and both halves are one lifecycle step: a Close that lands between them would
 	// otherwise leave a handler on a client the session no longer knows about.
