@@ -36,9 +36,9 @@ type Leg struct {
 	toBrowser []int16
 	toWA      []int16
 	started   bool
-	// pending is the answer to a browser's offer, made when the call was placed and
-	// applied when the callee picks up.
-	pending *webrtc.SessionDescription
+	// pending is the browser's offer for a call the client placed, held from the moment
+	// the call was placed until the callee picks up.
+	pending string
 	onLost  func()
 
 	closeOnce sync.Once
@@ -95,21 +95,26 @@ func (l *Leg) gathered(ctx context.Context) (string, error) {
 	return l.pc.LocalDescription().SDP, nil
 }
 
-// Answer applies the answer to the browser's offer that Media.Answer made, and returns it
-// with its candidates, for the browser. Only once the callee has picked up: applying it is
-// what starts ICE on this side, and the browser, which gets the answer only then, would
-// not answer a single check before it, so a callee who let the phone ring past pion's
-// first checking deadline (~30 s) would find the call already hung up.
+// Answer applies the browser's offer that Media.Answer took, answers it, and returns the
+// answer with its candidates, for the browser. Only once the callee has picked up; see
+// Media.Answer for why.
 func (l *Leg) Answer(ctx context.Context) (string, error) {
 	l.mu.Lock()
-	answer := l.pending
-	l.pending = nil
+	offer := l.pending
+	l.pending = ""
 	l.mu.Unlock()
-	if answer == nil {
-		return "", errors.New("calls: this leg has no answer to make")
+	if offer == "" {
+		return "", errors.New("calls: this leg has no offer to answer")
 	}
-	if err := l.pc.SetLocalDescription(*answer); err != nil {
-		return "", fmt.Errorf("calls: apply the answer: %w", err)
+	if err := l.pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: offer}); err != nil {
+		return "", fmt.Errorf("%w: %w", ErrBadSDP, err)
+	}
+	answer, err := l.pc.CreateAnswer(nil)
+	if err == nil {
+		err = l.pc.SetLocalDescription(answer)
+	}
+	if err != nil {
+		return "", fmt.Errorf("calls: answer the browser: %w", err)
 	}
 	return l.gathered(ctx)
 }

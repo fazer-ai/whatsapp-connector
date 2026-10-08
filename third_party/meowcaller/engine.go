@@ -602,12 +602,17 @@ func (e *engine) placeCall(ctx context.Context, target string, opts CallOptions)
 		// The caller gets no Call to hang up, so the registration and its key
 		// material would otherwise stay in e.calls for the client's lifetime.
 		e.finishCall(callID, "offer_failed")
-		return nil, fmt.Errorf("send offer: %w", err)
+		return nil, fmt.Errorf("%w: %w", ErrSendOffer, err)
 	}
 	e.c.log.Info().Str("call_id", callID).Bool("video", opts.Video).Msg("offer sent; media starts when the relay endpoint arrives")
 	e.c.diag.Emit("meta", map[string]any{"event": "offer_sent", "call_id": callID, "peer_lid": peerLID.String(), "direction": "out", "video": opts.Video})
 	return call, nil
 }
+
+// ErrSendOffer is a placed call whose offer write failed: the offer may have reached
+// WhatsApp, and the callee's phone may be ringing. Every other error Call returns comes
+// before that write.
+var ErrSendOffer = errors.New("send offer")
 
 // onOffer handles an inbound <offer> event: it decrypts the callKey, captures any relay
 // data, registers the Call in the Ringing phase, sends the <preaccept> eagerly (a

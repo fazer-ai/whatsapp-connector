@@ -91,14 +91,17 @@ type terminateRequest struct {
 
 // answersCalls is whether this session carries the voice of calls: the deployment opened
 // the media socket, and the last connect asked for `calls.answer` without
-// `calls.auto_reject`, which wins.
+// `calls.auto_reject`, which wins, and without a proxy. meowcaller sends a call's media to
+// WhatsApp's relays over UDP sockets of its own, which a proxy does not carry, so on a
+// proxied session the call would leave from this host's own address, the one the proxy was
+// asked to keep out of it.
 func (s *Session) answersCalls() bool {
 	if s.callMedia == nil {
 		return false
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.answerCalls && !s.autoRejectCalls
+	return s.answerCalls && !s.autoRejectCalls && s.proxy == ""
 }
 
 // engagesOffer is meowcaller's gate. Only a 1:1 voice call on a session that answers
@@ -376,10 +379,15 @@ func (s *Session) startCall(ctx context.Context, command *protocol.Command) (jso
 	if err != nil {
 		_ = leg.Close()
 		log.Warn().Err(err).Msg("meowcaller could not place the call")
-		// The offer is the write, and meowcaller can fail after it went out: the
-		// callee's phone may be ringing, and a retry under the same key must not ring
-		// it again.
-		return nil, engine.MayHaveLanded(protocol.NewError(protocol.ErrorWaError, "WhatsApp did not take the call"))
+		failure := protocol.NewError(protocol.ErrorWaError, "WhatsApp did not take the call")
+		if offerMayHaveRung(err) {
+			// The callee's phone may be ringing, and a retry under the same key must
+			// not ring it again.
+			return nil, engine.MayHaveLanded(failure)
+		}
+		// Failed before the offer was written: nothing rang, and the retry places
+		// the call.
+		return nil, failure
 	}
 	id := call.ID()
 	live := &liveCall{call: call, leg: leg, outbound: true}
@@ -438,6 +446,12 @@ func (s *Session) calleeAnswered(live *liveCall, log zerolog.Logger) {
 			log.Warn().Str("call_id", id).Msg("could not queue call.answered, with no room in the inbox")
 		}
 	}()
+}
+
+// offerMayHaveRung reports whether a failed dial got as far as writing the offer, which is
+// the one write that rings the callee. A socket that was not there to write on sent nothing.
+func offerMayHaveRung(err error) bool {
+	return errors.Is(err, meowcaller.ErrSendOffer) && !sentNothing(err)
 }
 
 // dialOverCaller places a call through meowcaller on the current client.

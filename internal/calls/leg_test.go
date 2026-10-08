@@ -436,11 +436,10 @@ func TestAPlacedCallStartsICEOnlyWhenAnswered(t *testing.T) {
 		t.Fatalf("answer: %v", err)
 	}
 	t.Cleanup(func() { _ = leg.Close() })
-	if leg.pc.LocalDescription() != nil {
-		t.Fatal("the answer was applied while the callee was still being rung")
-	}
-	if got := leg.pc.ICEGatheringState(); got != webrtc.ICEGatheringStateNew {
-		t.Fatalf("ICE gathering is %s before the callee answered, want new", got)
+	// Nothing of the call's peer has started: pion starts ICE, and its first checking
+	// deadline, on the remote description.
+	if leg.pc.RemoteDescription() != nil || leg.pc.LocalDescription() != nil {
+		t.Fatal("the browser's offer was applied while the callee was still being rung")
 	}
 
 	answer, err := leg.Answer(t.Context())

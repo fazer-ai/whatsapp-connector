@@ -56,10 +56,11 @@ services:
       <<: *chatwoot-env
       # The voice of WhatsApp calls answered or placed in the browser goes through this one
       # UDP port, which the agents' browsers have to reach. WAC_CALLS_PUBLIC_IP is the
-      # address they reach it at, for a host behind NAT; empty announces the host's own.
+      # address they reach it at, and it is required here: inside a container the
+      # connector only knows the container's own address, which no browser can reach.
       # Remove both, and the port below, to leave calls off.
       WAC_CALLS_UDP_PORT: '40000'
-      WAC_CALLS_PUBLIC_IP: ${WAC_CALLS_PUBLIC_IP:-}
+      WAC_CALLS_PUBLIC_IP: ${WAC_CALLS_PUBLIC_IP:?set WAC_CALLS_PUBLIC_IP to the address the browsers reach this host at, or remove the calls settings}
     ports:
       - '40000:40000/udp'
     depends_on:

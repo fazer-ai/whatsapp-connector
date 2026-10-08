@@ -47,3 +47,9 @@ Nothing on the wire tells such a number apart. Its `<pair-success>` carries the 
 cannot detect it and does not guess: inferring it from an absence would mark a healthy new
 inbox as limited. A client that onboarded the number knows which path it came in by, and
 that is where the warning belongs.
+
+## Calls the connector does not carry
+
+A session connected with `proxy` does not carry the voice of calls, whatever its `calls.answer` says: the call commands are answered `unsupported` and `call.offer` comes without `sdp`. The voice of a call goes to WhatsApp's relays over UDP sockets meowcaller opens itself, which no HTTP or SOCKS5 proxy here carries, so the call would leave from the connector's own address, the one the proxy exists to keep out of it.
+
+Another linked device of the same account can end a call before anybody answers it. Measured on the live bench of #383: a linked device of the called account declined every call 175 ms after the offer, and WhatsApp then ended the call for every device, the caller's phone included, with a terminate whose reason is `rejected_elsewhere`, 0.4 s after the offer. The connector publishes that `call.terminate`, and there is nothing for it to answer. An account whose calls an agent is meant to take should not have a linked device that refuses calls on its own, such as another integration with its own auto-reject.

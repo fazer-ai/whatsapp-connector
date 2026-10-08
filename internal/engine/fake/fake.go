@@ -576,12 +576,13 @@ func (s *Session) Execute(ctx context.Context, command *protocol.Command) (json.
 // call answers the three call commands the way the whatsmeow engine does on a session
 // that carries calls, with nothing on the other end: there is no call to ring, so
 // call.start hands back an id and the other two have nothing to change. A session whose
-// last connect did not ask for `calls.answer` refuses all three, as the contract says.
+// last connect did not ask for `calls.answer`, or asked for a proxy, refuses all three, as
+// the contract says.
 func (s *Session) call(command *protocol.Command, connected bool) (json.RawMessage, error) {
 	s.mu.Lock()
-	calls := s.asked.Calls
+	calls, proxied := s.asked.Calls, s.asked.Proxy != nil && s.asked.Proxy.URL != ""
 	s.mu.Unlock()
-	if calls == nil || !calls.Answer || calls.AutoReject {
+	if calls == nil || !calls.Answer || calls.AutoReject || proxied {
 		return nil, engine.ErrNotSupported
 	}
 	if command.Type != protocol.CommandCallStart {

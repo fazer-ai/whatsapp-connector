@@ -134,28 +134,46 @@ func (m *Media) Offer(ctx context.Context, log zerolog.Logger) (*Leg, string, er
 }
 
 // Answer builds the leg of a call the client is placing from the browser's offer, and
-// checks that it can be answered. The answer itself is made by Leg.Answer once the callee
-// picks up.
+// checks that it can be answered. The offer is applied, and answered, by Leg.Answer once
+// the callee picks up: applying it is what starts ICE on this side (pion starts its
+// transports on the remote description), and the browser, which gets the answer only then,
+// would not answer a single check before it, so a callee who let the phone ring past
+// pion's first checking deadline (~30 s) would find the call already hung up. The check is
+// made on a peer of its own, thrown away, which starts and stops nothing the call uses.
 //
 //nolint:gocritic // zerolog.Logger is designed to be copied; every With() returns one by value
 func (m *Media) Answer(offer string, log zerolog.Logger) (*Leg, error) {
+	if err := m.answerable(offer); err != nil {
+		return nil, err
+	}
 	leg, err := m.newLeg(log)
 	if err != nil {
 		return nil, err
 	}
-	if err := leg.pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: offer}); err != nil {
-		_ = leg.Close()
-		return nil, fmt.Errorf("%w: %w", ErrBadSDP, err)
-	}
-	answer, err := leg.pc.CreateAnswer(nil)
+	leg.pending = offer
+	return leg, nil
+}
+
+// answerable is whether an offer can be answered here at all.
+func (m *Media) answerable(offer string) error {
+	probe, err := m.api.NewPeerConnection(webrtc.Configuration{})
 	if err != nil {
-		_ = leg.Close()
+		return fmt.Errorf("calls: new peer: %w", err)
+	}
+	defer func() { _ = probe.Close() }()
+	if _, err := probe.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio,
+		webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionSendrecv}); err != nil {
+		return fmt.Errorf("calls: add the audio track: %w", err)
+	}
+	if err := probe.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: offer}); err != nil {
+		return fmt.Errorf("%w: %w", ErrBadSDP, err)
+	}
+	if _, err := probe.CreateAnswer(nil); err != nil {
 		// An offer pion takes and cannot answer is one with no codec in common, which is
 		// the browser's offer being unusable, not this side failing.
-		return nil, fmt.Errorf("%w: %w", ErrBadSDP, err)
+		return fmt.Errorf("%w: %w", ErrBadSDP, err)
 	}
-	leg.pending = &answer
-	return leg, nil
+	return nil
 }
 
 // ErrBadSDP is an SDP from the browser this side cannot use: unreadable, or with no codec

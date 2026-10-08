@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -815,25 +816,38 @@ func placeCall(t *testing.T, session *Session, call *fakeCall) {
 	}
 }
 
-// A dial that fails may have rung the phone already: the failure carries the mark that
-// keeps the command's attempt standing, so a redelivery under the same key does not ring
-// it again.
+// A dial whose offer write failed may have rung the phone already: the failure carries
+// the mark that keeps the command's attempt standing, so a redelivery under the same key
+// does not ring it again. One that failed before the write, or on a socket that was not
+// there, rang nothing, and is left for the retry to place.
 func TestAFailedDialMayHaveRungThePhone(t *testing.T) {
 	t.Parallel()
-	session := newCallSession(t)
-	session.onWhatsApp = func(_ context.Context, _ *wm.Client, phones []string) ([]waTypes.IsOnWhatsAppResponse, error) {
-		return []waTypes.IsOnWhatsAppResponse{{Query: phones[0], IsIn: true,
-			JID: waTypes.NewJID("5541999990000", waTypes.DefaultUserServer)}}, nil
-	}
-	session.dialCall = func(context.Context, string) (bridgedCall, error) { return nil, errors.New("socket went") }
-	start := &protocol.Command{
-		ID: "c1", Type: protocol.CommandCallStart, IdempotencyKey: "k1",
-		Payload: json.RawMessage(`{"to":{"kind":"phone","id":"5541999990000"},"sdp":` + mustJSON(t, browserOffer(t)) + `}`),
-	}
-	_, err := session.Execute(t.Context(), start)
-	assertCode(t, err, protocol.ErrorWaError)
-	if !errors.Is(err, engine.ErrMayHaveLanded) {
-		t.Fatalf("a failed dial = %v, without the mark that keeps its attempt", err)
+	for name, test := range map[string]struct {
+		err    error
+		landed bool
+	}{
+		"the offer write failed": {fmt.Errorf("%w: %w", meowcaller.ErrSendOffer, errors.New("write: broken pipe")), true},
+		"no socket to write on":  {fmt.Errorf("%w: %w", meowcaller.ErrSendOffer, wm.ErrNotConnected), false},
+		"before the offer":       {errors.New("device discovery: timed out"), false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			session := newCallSession(t)
+			session.onWhatsApp = func(_ context.Context, _ *wm.Client, phones []string) ([]waTypes.IsOnWhatsAppResponse, error) {
+				return []waTypes.IsOnWhatsAppResponse{{Query: phones[0], IsIn: true,
+					JID: waTypes.NewJID("5541999990000", waTypes.DefaultUserServer)}}, nil
+			}
+			session.dialCall = func(context.Context, string) (bridgedCall, error) { return nil, test.err }
+			start := &protocol.Command{
+				ID: "c1", Type: protocol.CommandCallStart, IdempotencyKey: "k1",
+				Payload: json.RawMessage(`{"to":{"kind":"phone","id":"5541999990000"},"sdp":` + mustJSON(t, browserOffer(t)) + `}`),
+			}
+			_, err := session.Execute(t.Context(), start)
+			assertCode(t, err, protocol.ErrorWaError)
+			if landed := errors.Is(err, engine.ErrMayHaveLanded); landed != test.landed {
+				t.Fatalf("a dial that failed with %v is marked as maybe landed: %v, want %v", test.err, landed, test.landed)
+			}
+		})
 	}
 }
 
@@ -1041,8 +1055,41 @@ func TestATerminateRacingALateAcceptHangsUp(t *testing.T) {
 	if _, err := session.Execute(t.Context(), command(protocol.CommandCallTerminate, `{"call_id":"call-1"}`)); err != nil {
 		t.Fatal(err)
 	}
-	answered, rejected, hungUp, _ := call.counts()
-	if answered != 1 || rejected+hungUp != 1 {
-		t.Fatalf("answered %d, rejected %d, hung up %d", answered, rejected, hungUp)
+	// The late answer runs on its own goroutine, and releasing it does not say when it ran.
+	deadline := time.Now().Add(testwait.Budget)
+	for {
+		answered, rejected, hungUp, _ := call.counts()
+		if answered == 1 {
+			if rejected+hungUp != 1 {
+				t.Fatalf("rejected %d, hung up %d, want the call ended once", rejected, hungUp)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the late answer never ran: answered %d", answered)
+		}
+		time.Sleep(testwait.Poll)
+	}
+}
+
+// A session connected through a proxy does not carry calls: their voice goes to WhatsApp
+// over UDP the proxy does not carry, and would leave from this host's own address. Its
+// offers come without SDP, meowcaller does not engage them, and the commands are refused.
+func TestAProxiedSessionDoesNotCarryCalls(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	session.setProxy("http://proxy.example:3128")
+
+	if session.engagesOffer(audioOffer("call-1")) {
+		t.Fatal("meowcaller engaged a call on a proxied session")
+	}
+	session.handle(audioOffer("call-1"))
+	if _, carries := published(t, session, protocol.EventCallOffer, "event_call_offer")["sdp"]; carries {
+		t.Fatal("a proxied session offered a call with SDP")
+	}
+	for _, kind := range []protocol.CommandType{protocol.CommandCallAccept, protocol.CommandCallStart, protocol.CommandCallTerminate} {
+		if _, err := session.Execute(t.Context(), command(kind, `{"call_id":"c","sdp":"v=0"}`)); !errors.Is(err, engine.ErrNotSupported) {
+			t.Errorf("%s answered %v on a proxied session, want ErrNotSupported", kind, err)
+		}
 	}
 }
