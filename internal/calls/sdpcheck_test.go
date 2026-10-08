@@ -50,3 +50,23 @@ func TestAnAnswerWithoutAVoiceBothWaysLeavesThePeerAsItWas(t *testing.T) {
 	}
 	waitConnected(t, leg.pc, b.pc)
 }
+
+// A browser that answers a received call in PCMU only is answered in PCMU, the fallback
+// the connector offers.
+func TestAReceivedCallAnsweredInPCMUIsTaken(t *testing.T) {
+	t.Parallel()
+	m := openMedia(t)
+	leg, offer, err := m.Offer(t.Context(), zerolog.Nop())
+	if err != nil {
+		t.Fatalf("offer: %v", err)
+	}
+	t.Cleanup(func() { _ = leg.Close() })
+	b := newBrowser(t, webrtc.MimeTypePCMU)
+	if err := leg.Accept(b.answer(offer)); err != nil {
+		t.Fatalf("a PCMU-only answer was refused: %v", err)
+	}
+	waitConnected(t, leg.pc, b.pc)
+	if got := leg.Codec(); got != webrtc.MimeTypePCMU {
+		t.Fatalf("negotiated %q, want PCMU", got)
+	}
+}

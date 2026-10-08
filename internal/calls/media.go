@@ -224,13 +224,15 @@ func (m *Media) acceptable(answer string) error {
 	return nil
 }
 
-// probePeer is a throwaway peer with the one audio section a call's has.
+// probePeer is a throwaway peer with the one audio section a call's has, on the same
+// track: pion's own audio track binds to the first codec in the table and would refuse an
+// SDP in the other, which a call's track takes.
 func (m *Media) probePeer() (*webrtc.PeerConnection, error) {
 	probe, err := m.probe.NewPeerConnection(webrtc.Configuration{})
 	if err != nil {
 		return nil, fmt.Errorf("calls: new peer: %w", err)
 	}
-	if _, err := probe.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio,
+	if _, err := probe.AddTransceiverFromTrack(&audioTrack{},
 		webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionSendrecv}); err != nil {
 		_ = probe.Close()
 		return nil, fmt.Errorf("calls: add the audio track: %w", err)
