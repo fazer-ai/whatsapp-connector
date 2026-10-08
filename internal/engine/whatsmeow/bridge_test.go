@@ -1311,3 +1311,36 @@ func TestAReceivedCallThatEndedBeforeItsListenerIsReportedOver(t *testing.T) {
 		t.Fatalf("%d calls are still carried after the call ended", left)
 	}
 }
+
+// WhatsApp logging the device out ends the calls at once, whatever the cleanup that
+// follows makes of the device: here the store cannot be reached in time, so the cleanup
+// fails and no rebuild comes to retire the client.
+func TestALoggedOutDeviceEndsItsCalls(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	call, release := answeredCall(t, session, "call-1")
+	release()
+	session.storeLimit = time.Nanosecond
+	session.handle(&waEvents.LoggedOut{OnConnect: false, Reason: waEvents.ConnectFailureLoggedOut})
+	hungUpWithin(t, call)
+}
+
+// A rebuild whose handler removal stalls -- meowcaller held inside its own handler by a
+// write the socket does not take -- gives up on it at its bound and goes on to the
+// disconnect, which is what releases that write.
+func TestARebuildDoesNotWaitOnAStalledHandlerPastItsBound(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	stalled := make(chan struct{})
+	t.Cleanup(func() { close(stalled) })
+	session.detach = func(*wm.Client, uint32) { <-stalled }
+	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- session.rebuild(ctx) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a rebuild waited on a stalled handler past its bound")
+	}
+}

@@ -3365,13 +3365,26 @@ func (s *Session) rebuild(ctx context.Context) error {
 	s.mu.Lock()
 	previous, handlerID := s.client, s.handlerID
 	s.mu.Unlock()
-	s.detach(previous, handlerID)
+	// The handler is removed first, so nothing the old client does from here is heard,
+	// and on the same bound as the disconnect below: RemoveEventHandler waits for every
+	// handler that is running, meowcaller's included, and a write meowcaller stalled on with
+	// a context nothing here can cancel gives up only when the socket closes. Past the bound
+	// the disconnect goes ahead, which is what releases that write, and the removal lands
+	// then.
+	detached := make(chan struct{})
+	go func() {
+		defer close(detached)
+		s.detach(previous, handlerID)
+	}()
+	select {
+	case <-detached:
+	case <-ctx.Done():
+	}
 	// Waited for no longer than the bound this runs on. Disconnect takes the socket lock, and
 	// a dial holds that lock for as long as the dial lasts with no context to end it: a
 	// teardown whose unlink went through while the socket dropped underneath it would answer
-	// when the dial did, which is the wait #187 is about, one step later. The client is
-	// detached already, so nothing it does from here is heard, and the disconnect still lands
-	// the moment the dial lets go.
+	// when the dial did, which is the wait #187 is about, one step later. The disconnect
+	// still lands the moment the dial lets go.
 	closed := make(chan struct{})
 	go func() {
 		defer close(closed)
@@ -5275,6 +5288,13 @@ func (s *Session) loggedOut(event *waEvents.LoggedOut) {
 	// `open` after session.logged_out, over an account WhatsApp has revoked, with nothing
 	// arriving later to correct it.
 	s.settleLogout()
+
+	// The calls go with the device, whatever becomes of the cleanup below: their media
+	// runs on contexts of their own, and nothing else would stop it if the rebuild that
+	// retires this client never comes. Not waited for, on a socket WhatsApp has revoked.
+	revoked, stop := context.WithCancel(context.Background())
+	stop()
+	s.goOffline(revoked)
 
 	// The credentials are gone on WhatsApp's side, so keeping them here would have
 	// every reconnect fail with a session that looks resumable and is not.
