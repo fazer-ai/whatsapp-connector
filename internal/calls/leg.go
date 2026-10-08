@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
 	"github.com/rs/zerolog"
 )
@@ -188,12 +189,27 @@ func (l *Leg) listen(remote *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
 		l.log.Warn().Str("codec", remote.Codec().MimeType).Msg("the browser sent a track in a codec this side does not speak")
 		return
 	}
+	var order reorder
 	for {
 		packet, _, err := remote.ReadRTP()
 		if err != nil {
 			return
 		}
-		pcm := dec.decode(packet.Payload)
+		l.take(&order, dec, packet)
+	}
+}
+
+// lostPacket is the silence a packet given up as lost leaves: 20 ms, which is what a
+// browser sends per packet.
+var lostPacket = make([]int16, packetSamples)
+
+// take queues one packet from the browser for WhatsApp, in sequence.
+func (l *Leg) take(order *reorder, dec decoder, packet *rtp.Packet) {
+	for _, ready := range order.push(packet) {
+		pcm := lostPacket
+		if ready != nil {
+			pcm = dec.decode(ready.Payload)
+		}
 		l.mu.Lock()
 		l.toWA = append(l.toWA, pcm...)
 		if over := len(l.toWA) - maxToWhatsApp; over > 0 {

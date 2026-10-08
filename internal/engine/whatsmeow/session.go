@@ -91,6 +91,11 @@ type Session struct {
 	// reach the path where a disconnect outlives its deadline.
 	disconnect func(*wm.Client)
 
+	// closeSocket is the disconnect Close makes, apart from the one above so that a test
+	// holding a hang-up's disconnect does not hold every Close with it. A field so a test
+	// can tell that Close disconnects before it waits on the handlers.
+	closeSocket func(*wm.Client)
+
 	// logout ends the session on WhatsApp's side. A field for the same reason as the two
 	// above: whatsmeow refuses to log out a client that never connected, so nothing
 	// outside the library can reach the path where WhatsApp has revoked the device and
@@ -762,25 +767,26 @@ func newSession(
 ) *Session {
 	lifetime, cancel := context.WithCancel(context.Background())
 	s := &Session{
-		sid:        sid,
-		route:      newEgressRoute(),
-		aliases:    newAlias(),
-		store:      scoped,
-		log:        log.With().Str("sid", sid).Logger(),
-		waLog:      wa,
-		inbox:      make(chan pending, inboxDepth),
-		ends:       make(chan struct{}, owedEnds),
-		events:     make(chan engine.Emission),
-		done:       make(chan struct{}),
-		inFlight:   map[*groupWrite]struct{}{},
-		queueing:   queueing,
-		ctx:        lifetime,
-		cancel:     cancel,
-		detach:     func(client *wm.Client, id uint32) { client.RemoveEventHandler(id) },
-		disconnect: func(client *wm.Client) { client.Disconnect() },
-		nonce:      sessionNonce(),
-		logout:     func(ctx context.Context, client *wm.Client) error { return client.Logout(ctx) },
-		download:   downloadOverClient,
+		sid:         sid,
+		route:       newEgressRoute(),
+		aliases:     newAlias(),
+		store:       scoped,
+		log:         log.With().Str("sid", sid).Logger(),
+		waLog:       wa,
+		inbox:       make(chan pending, inboxDepth),
+		ends:        make(chan struct{}, owedEnds),
+		events:      make(chan engine.Emission),
+		done:        make(chan struct{}),
+		inFlight:    map[*groupWrite]struct{}{},
+		queueing:    queueing,
+		ctx:         lifetime,
+		cancel:      cancel,
+		detach:      func(client *wm.Client, id uint32) { client.RemoveEventHandler(id) },
+		disconnect:  func(client *wm.Client) { client.Disconnect() },
+		closeSocket: func(client *wm.Client) { client.Disconnect() },
+		nonce:       sessionNonce(),
+		logout:      func(ctx context.Context, client *wm.Client) error { return client.Logout(ctx) },
+		download:    downloadOverClient,
 		retrieve: func(ctx context.Context, address string, headers map[string]string) (source, error) {
 			return retrieveOverHTTP(ctx, address, headers, blobs.FetchHosts)
 		},
@@ -3732,8 +3738,13 @@ func (s *Session) Close() error {
 	// the socket still open and the lease already gone.
 	close(s.done)
 
+	// The socket goes before the handler is removed, for the handler that is not this
+	// session's: meowcaller writes from inside its own handler (a call's preaccept) with
+	// a context nothing here can cancel, RemoveEventHandler waits for every handler that
+	// is running, and only a closed socket makes a stalled write give up. The other way
+	// round, a lost lease could wait on that write with the socket still open.
+	s.closeSocket(client)
 	s.detach(client, handlerID)
-	client.Disconnect()
 
 	s.drain()
 	return nil

@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/pion/ice/v4"
@@ -168,12 +169,29 @@ func (m *Media) answerable(offer string) error {
 	if err := probe.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: offer}); err != nil {
 		return fmt.Errorf("%w: %w", ErrBadSDP, err)
 	}
-	if _, err := probe.CreateAnswer(nil); err != nil {
+	answer, err := probe.CreateAnswer(nil)
+	if err != nil {
 		// An offer pion takes and cannot answer is one with no codec in common, which is
 		// the browser's offer being unusable, not this side failing.
 		return fmt.Errorf("%w: %w", ErrBadSDP, err)
 	}
+	// And one pion answers without audio: an offer with no audio section at all, a data
+	// channel only, is answered with nothing to carry a voice on.
+	if !answersAudio(answer.SDP) {
+		return fmt.Errorf("%w: the offer has no audio to answer", ErrBadSDP)
+	}
 	return nil
+}
+
+// answersAudio is whether an SDP has an audio section that was not rejected (port 0).
+func answersAudio(sdp string) bool {
+	for line := range strings.SplitSeq(sdp, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "m=audio ") && !strings.HasPrefix(line, "m=audio 0 ") {
+			return true
+		}
+	}
+	return false
 }
 
 // ErrBadSDP is an SDP from the browser this side cannot use: unreadable, or with no codec

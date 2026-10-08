@@ -407,6 +407,26 @@ func TestAnSDPTheConnectorCannotUseIsRefused(t *testing.T) {
 	} else if !errors.Is(err, ErrBadSDP) {
 		t.Fatalf("answer to an Opus-only offer = %v, want ErrBadSDP", err)
 	}
+
+	// An offer with a data channel and no audio at all.
+	data, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = data.Close() })
+	if _, err := data.CreateDataChannel("chat", nil); err != nil {
+		t.Fatal(err)
+	}
+	dataOffer, err := data.CreateOffer(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if leg, err := m.Answer(dataOffer.SDP, zerolog.Nop()); err == nil {
+		_ = leg.Close()
+		t.Fatal("an offer with no audio was answered, and no voice could cross it")
+	} else if !errors.Is(err, ErrBadSDP) {
+		t.Fatalf("answer to an offer with no audio = %v, want ErrBadSDP", err)
+	}
 }
 
 // The socket is bound when the process starts, on the port asked for.

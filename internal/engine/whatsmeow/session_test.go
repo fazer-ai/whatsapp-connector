@@ -1214,6 +1214,28 @@ func TestCloseReleasesABlockedHandlerBeforeWaitingOnIt(t *testing.T) {
 	}
 }
 
+// Close disconnects the socket before it removes its handler: meowcaller writes from inside
+// its own handler with a context nothing here can cancel, RemoveEventHandler waits for it,
+// and only a closed socket ends a write that stalled. This stands in for the library the
+// same way the test above does.
+func TestCloseDisconnectsBeforeWaitingOnHandlers(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "")
+	disconnected := make(chan struct{})
+	session.closeSocket = func(*wm.Client) { close(disconnected) }
+	session.detach = func(*wm.Client, uint32) {
+		select {
+		case <-disconnected:
+		case <-time.After(5 * time.Second):
+			t.Error("Close waited on the handlers with the socket still open")
+		}
+	}
+	if err := session.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
 // waitForBlockedInbox waits until the session cannot take another emission without
 // blocking, which is the state the test above needs before it starts.
 func waitForBlockedInbox(t *testing.T, session *Session) {
