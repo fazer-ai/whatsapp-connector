@@ -74,6 +74,9 @@ type bridgeState struct {
 	// offer meowcaller engaged under the old policy would otherwise register after the
 	// end, on the new route.
 	pausing int
+	// offline is a session an operator disconnected or logged out: no call registers on
+	// it until the next connect, or one engaged as the socket went would outlive it.
+	offline bool
 }
 
 // callOfferPayload is `call.offer` as this session publishes it once it carries calls.
@@ -169,7 +172,7 @@ func (s *Session) ringing(call bridgedCall) {
 func (s *Session) register(id string, live *liveCall) bool {
 	s.bridge.mu.Lock()
 	defer s.bridge.mu.Unlock()
-	if s.bridge.closed || s.bridge.pausing > 0 || !s.answersCalls() {
+	if s.bridge.closed || s.bridge.offline || s.bridge.pausing > 0 || !s.answersCalls() {
 		return false
 	}
 	if s.bridge.live == nil {
@@ -555,6 +558,15 @@ func signal(ctx context.Context, send func() error) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// goOffline stops calls registering on this session until the next connect, and ends the
+// ones it carries, for a session an operator is taking down.
+func (s *Session) goOffline(ctx context.Context) {
+	s.bridge.mu.Lock()
+	s.bridge.offline = true
+	s.bridge.mu.Unlock()
+	s.endCalls(ctx)
 }
 
 // endCalls hangs up every call this session carries, for a socket that is going: the

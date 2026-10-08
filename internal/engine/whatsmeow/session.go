@@ -1928,6 +1928,9 @@ func (s *Session) Connect(ctx context.Context, req engine.ConnectRequest) error 
 		s.endCalls(ctx)
 	}
 	s.setCallPolicy(req.Calls != nil && req.Calls.AutoReject, req.Calls != nil && req.Calls.Answer)
+	s.bridge.mu.Lock()
+	s.bridge.offline = false
+	s.bridge.mu.Unlock()
 
 	// A hang-up an earlier command left running is waited for first: the move below may
 	// start one of its own, and awaitHangUp only knows about the latest.
@@ -2544,7 +2547,7 @@ func (s *Session) Disconnect(ctx context.Context) error {
 
 	s.cancelPairing()
 	// Before the socket goes, while the hang-ups still have it to be written on.
-	s.endCalls(ctx)
+	s.goOffline(ctx)
 	// That the operator asked this session to stay down is recorded a layer up, before
 	// this call, for the same reason as in Connect and with the same ordering: before the
 	// socket goes, so an instance that dies in between does not leave an account somebody
@@ -2561,7 +2564,7 @@ func (s *Session) Logout(ctx context.Context) error {
 	defer s.endCommand()
 
 	s.cancelPairing()
-	s.endCalls(ctx)
+	s.goOffline(ctx)
 	ask, _ := s.askToUnlink(ctx)
 	if err := ask(ctx, s.current()); err != nil {
 		if sentNothing(err) || unanswered(err) {

@@ -1230,9 +1230,10 @@ fill:
 func TestAnOfferEngagedBeforeCallsWereTurnedOffIsNotCarried(t *testing.T) {
 	t.Parallel()
 	for name, turnOff := range map[string]func(*Session){
-		"the policy":  func(s *Session) { s.setCallPolicy(false, false) },
-		"a proxy":     func(s *Session) { s.setProxy("http://proxy.example:3128") },
-		"mid-connect": func(s *Session) { s.bridge.mu.Lock(); s.bridge.pausing++; s.bridge.mu.Unlock() },
+		"the policy":   func(s *Session) { s.setCallPolicy(false, false) },
+		"a proxy":      func(s *Session) { s.setProxy("http://proxy.example:3128") },
+		"mid-connect":  func(s *Session) { s.bridge.mu.Lock(); s.bridge.pausing++; s.bridge.mu.Unlock() },
+		"a disconnect": func(s *Session) { _ = s.Disconnect(context.Background()) },
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -1241,6 +1242,7 @@ func TestAnOfferEngagedBeforeCallsWereTurnedOffIsNotCarried(t *testing.T) {
 				t.Fatal("the gate did not engage a voice call")
 			}
 			turnOff(session)
+			drain(t, session)
 			call := &fakeCall{id: "call-1"}
 			session.ringing(call)
 			call.mu.Lock()
@@ -1260,5 +1262,18 @@ func TestAnOfferEngagedBeforeCallsWereTurnedOffIsNotCarried(t *testing.T) {
 				t.Fatalf("%d calls carried after calls were turned off", left)
 			}
 		})
+	}
+}
+
+// A connect after a disconnect lets calls register again.
+func TestAConnectAfterADisconnectCarriesCallsAgain(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	_ = session.Disconnect(t.Context())
+	session.setConnected(true)
+	_ = session.Connect(t.Context(), engine.ConnectRequest{Pairing: "resume", Calls: &engine.CallsRequest{Answer: true}})
+	drain(t, session)
+	if _, sdp := ringCall(t, session, "call-1"); sdp == "" {
+		t.Fatal("a call after the session was connected again was offered without SDP")
 	}
 }
