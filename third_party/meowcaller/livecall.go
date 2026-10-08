@@ -49,6 +49,8 @@ type Call struct {
 	handRaises                map[types.JID]bool
 	onScreenShare             func(ScreenShareState)
 	screenShares              map[types.JID]ScreenShareState
+	// endTo and endCreator address the call's <terminate>, kept for HangupAgain.
+	endTo, endCreator types.JID
 }
 
 // GroupCallState is a sanitized group-call roster. Transaction zero may contain
@@ -289,6 +291,12 @@ func (c *Call) Reject() error { return c.eng.reject(c) }
 
 // Hangup ends the call (either direction) and tears down media.
 func (c *Call) Hangup() error { return c.eng.hangup(c) }
+
+// HangupAgain writes the hangup of a call whose Hangup failed to send it. Hangup ends the
+// call here before it writes, so the call is already gone on this client and the peer is
+// still on it; this sends the same <terminate> again and changes nothing locally. It fails
+// for a call that was never hung up.
+func (c *Call) HangupAgain() error { return c.eng.hangupAgain(c) }
 
 // StartVideo requests an audio-to-video upgrade. Outbound video remains gated until
 // the peer acknowledges the transition with state 4 or state 1.

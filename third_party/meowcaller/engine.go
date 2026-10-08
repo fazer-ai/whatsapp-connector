@@ -723,9 +723,16 @@ func (e *engine) onOffer(ev *events.CallOffer) {
 	// Answer/Reject decision. It keeps the offer alive and joins the relay election while
 	// the integrator decides — even a call the user goes on to decline has usually already
 	// been preaccepted.
-	if err := e.sendPreaccept(ev.CallID, ev.From, ev.CallCreator, isVideo); err != nil {
-		e.c.log.Warn().Err(err).Str("call_id", ev.CallID).Msg("preaccept failed")
-	}
+	//
+	// The write goes out on a goroutine of its own: onOffer runs on whatsmeow's event
+	// dispatch, and a socket that stops draining would hold this offer, and every node
+	// behind it, for as long as the write blocks. The call is registered above, before
+	// the integrator hears of it, so nothing that follows depends on the write's order.
+	go func(callID string, to, creator types.JID) {
+		if err := e.sendPreaccept(callID, to, creator, isVideo); err != nil {
+			e.c.log.Warn().Err(err).Str("call_id", callID).Msg("preaccept failed")
+		}
+	}(ev.CallID, ev.From, ev.CallCreator)
 
 	if fn := e.c.incomingCallHandler(); fn != nil {
 		fn(call)
@@ -916,13 +923,33 @@ func (e *engine) terminate(c *Call, reason string) error {
 	if m != nil {
 		to, creator = m.from, m.creator
 	}
-	term := signaling.BuildTerminate(&signaling.TerminateParams{CallID: c.id, To: to, CallCreator: creator})
-	term.Attrs["id"] = e.nextCallNodeID()
+	c.mu.Lock()
+	c.endTo, c.endCreator = to, creator
+	c.mu.Unlock()
 	e.finishCall(c.id, reason)
+	return e.sendTerminate(c.id, to, creator)
+}
+
+// sendTerminate writes a call's <terminate>, under a node id of its own.
+func (e *engine) sendTerminate(callID string, to, creator types.JID) error {
+	term := signaling.BuildTerminate(&signaling.TerminateParams{CallID: callID, To: to, CallCreator: creator})
+	term.Attrs["id"] = e.nextCallNodeID()
 	if err := e.transmitCallNode(context.Background(), term); err != nil {
 		return fmt.Errorf("send terminate: %w", err)
 	}
 	return nil
+}
+
+// hangupAgain writes the <terminate> of a call already ended here, to whom the first one
+// was addressed.
+func (e *engine) hangupAgain(c *Call) error {
+	c.mu.Lock()
+	to, creator := c.endTo, c.endCreator
+	c.mu.Unlock()
+	if to.IsEmpty() {
+		return fmt.Errorf("meowcaller: call %s was never hung up", c.id)
+	}
+	return e.sendTerminate(c.id, to, creator)
 }
 
 // onRelay records relay data from a relaylatency/transport/ack stanza and starts media

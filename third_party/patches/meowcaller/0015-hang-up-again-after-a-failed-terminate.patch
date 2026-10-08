@@ -1,0 +1,76 @@
+Let the integrator write a call's hangup again when the first one did not go out.
+
+Origin: fazer-ai/whatsapp-connector, upstream meowcaller code (not from a pull request).
+
+Why: terminate runs finishCall before it writes the <terminate>, so a write that fails leaves the call ended on this client and still up for the peer, and nothing to address a second <terminate> with: the call's entry, which holds who the node goes to, is gone with finishCall. The connector answers a client's retried call.terminate, and without this it could only report success on a call the other phone never heard hung up.
+
+terminate keeps the addressing on the Call before it ends it, and HangupAgain writes the same <terminate> again from it, under a new node id, without touching anything local. A call that was never hung up has nothing to resend and HangupAgain says so.
+
+diff --git a/engine.go b/engine.go
+index 73d8ff0..457f8df 100644
+--- a/engine.go
++++ b/engine.go
+@@ -923,15 +923,35 @@ func (e *engine) terminate(c *Call, reason string) error {
+ 	if m != nil {
+ 		to, creator = m.from, m.creator
+ 	}
+-	term := signaling.BuildTerminate(&signaling.TerminateParams{CallID: c.id, To: to, CallCreator: creator})
+-	term.Attrs["id"] = e.nextCallNodeID()
++	c.mu.Lock()
++	c.endTo, c.endCreator = to, creator
++	c.mu.Unlock()
+ 	e.finishCall(c.id, reason)
++	return e.sendTerminate(c.id, to, creator)
++}
++
++// sendTerminate writes a call's <terminate>, under a node id of its own.
++func (e *engine) sendTerminate(callID string, to, creator types.JID) error {
++	term := signaling.BuildTerminate(&signaling.TerminateParams{CallID: callID, To: to, CallCreator: creator})
++	term.Attrs["id"] = e.nextCallNodeID()
+ 	if err := e.transmitCallNode(context.Background(), term); err != nil {
+ 		return fmt.Errorf("send terminate: %w", err)
+ 	}
+ 	return nil
+ }
+ 
++// hangupAgain writes the <terminate> of a call already ended here, to whom the first one
++// was addressed.
++func (e *engine) hangupAgain(c *Call) error {
++	c.mu.Lock()
++	to, creator := c.endTo, c.endCreator
++	c.mu.Unlock()
++	if to.IsEmpty() {
++		return fmt.Errorf("meowcaller: call %s was never hung up", c.id)
++	}
++	return e.sendTerminate(c.id, to, creator)
++}
++
+ // onRelay records relay data from a relaylatency/transport/ack stanza and starts media
+ // once both the callKey and the relay endpoint are known.
+ func (e *engine) onRelay(callID string, data *waBinary.Node) {
+diff --git a/livecall.go b/livecall.go
+index 9347c2f..a3cc08e 100644
+--- a/livecall.go
++++ b/livecall.go
+@@ -49,6 +49,8 @@ type Call struct {
+ 	handRaises                map[types.JID]bool
+ 	onScreenShare             func(ScreenShareState)
+ 	screenShares              map[types.JID]ScreenShareState
++	// endTo and endCreator address the call's <terminate>, kept for HangupAgain.
++	endTo, endCreator types.JID
+ }
+ 
+ // GroupCallState is a sanitized group-call roster. Transaction zero may contain
+@@ -290,6 +292,12 @@ func (c *Call) Reject() error { return c.eng.reject(c) }
+ // Hangup ends the call (either direction) and tears down media.
+ func (c *Call) Hangup() error { return c.eng.hangup(c) }
+ 
++// HangupAgain writes the hangup of a call whose Hangup failed to send it. Hangup ends the
++// call here before it writes, so the call is already gone on this client and the peer is
++// still on it; this sends the same <terminate> again and changes nothing locally. It fails
++// for a call that was never hung up.
++func (c *Call) HangupAgain() error { return c.eng.hangupAgain(c) }
++
+ // StartVideo requests an audio-to-video upgrade. Outbound video remains gated until
+ // the peer acknowledges the transition with state 4 or state 1.
+ func (c *Call) StartVideo() error {

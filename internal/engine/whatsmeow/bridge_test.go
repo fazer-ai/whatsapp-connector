@@ -68,6 +68,11 @@ type fakeCall struct {
 	discarded bool
 	// rejectFail is what Reject returns, after ending the call locally as meowcaller does.
 	rejectFail error
+	// hangupFail is what Hangup returns, after ending the call locally as meowcaller does.
+	hangupFail error
+	// hungUpAgain counts HangupAgain, which fails with hangupAgainFail.
+	hungUpAgain     int
+	hangupAgainFail error
 }
 
 func (c *fakeCall) ID() string { return c.id }
@@ -96,9 +101,19 @@ func (c *fakeCall) Reject() error {
 func (c *fakeCall) Hangup() error {
 	c.mu.Lock()
 	c.hungUp++
-	end := c.onEnd
+	end, fail := c.onEnd, c.hangupFail
 	c.mu.Unlock()
-	return c.signal(end, "hangup")
+	if err := c.signal(end, "hangup"); err != nil {
+		return err
+	}
+	return fail
+}
+
+func (c *fakeCall) HangupAgain() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.hungUpAgain++
+	return c.hangupAgainFail
 }
 
 func (c *fakeCall) signal(end func(string), reason string) error {
@@ -1390,6 +1405,44 @@ func TestDeletingASessionEndsItsCalls(t *testing.T) {
 	session.storeLimit = time.Nanosecond
 	_ = session.Delete(t.Context())
 	hungUpWithin(t, call)
+}
+
+// A hangup is the same: meowcaller ends an answered call here before it writes the
+// terminate, so a retried call.terminate writes the terminate again, as many times as it
+// takes, and once one lands a further retry is nothing new.
+func TestAHangupThatDidNotGoOutIsSentAgain(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	call, release := answeredCall(t, session, "call-1")
+	release()
+	call.mu.Lock()
+	call.hangupFail = errors.New("write: broken pipe")
+	call.mu.Unlock()
+
+	_, err := session.Execute(t.Context(), command(protocol.CommandCallTerminate, `{"call_id":"call-1"}`))
+	assertCode(t, err, protocol.ErrorWaError)
+	call.mu.Lock()
+	call.hangupAgainFail = errors.New("write: broken pipe")
+	call.mu.Unlock()
+	_, err = session.Execute(t.Context(), command(protocol.CommandCallTerminate, `{"call_id":"call-1"}`))
+	assertCode(t, err, protocol.ErrorWaError)
+	call.mu.Lock()
+	call.hangupAgainFail = nil
+	call.mu.Unlock()
+	if _, err := session.Execute(t.Context(), command(protocol.CommandCallTerminate, `{"call_id":"call-1"}`)); err != nil {
+		t.Fatalf("the retried hangup = %v", err)
+	}
+	if _, err := session.Execute(t.Context(), command(protocol.CommandCallTerminate, `{"call_id":"call-1"}`)); err != nil {
+		t.Fatal(err)
+	}
+	call.mu.Lock()
+	defer call.mu.Unlock()
+	if call.hungUp != 1 || call.hungUpAgain != 2 {
+		t.Fatalf("hung up %d times and again %d times, want once and twice", call.hungUp, call.hungUpAgain)
+	}
+	if call.rejected != 0 {
+		t.Fatalf("an answered call was rejected %d times", call.rejected)
+	}
 }
 
 // meowcaller ends a call here before it writes the rejection, so a rejection that did not

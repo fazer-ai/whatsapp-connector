@@ -26,6 +26,7 @@ type bridgedCall interface {
 	Answer() error
 	Reject() error
 	Hangup() error
+	HangupAgain() error
 	Receive(meowcaller.AudioSink)
 	Play(meowcaller.AudioSource) *meowcaller.Player
 	OnEnd(func(reason string))
@@ -85,6 +86,9 @@ type bridgeState struct {
 	// nothing of the call to retry with, and the call ringing on the account's other
 	// devices; a retried call.terminate rejects it again from this.
 	unrejected map[string]waTypes.JID
+	// unended is the answered and placed calls whose hangup did not go out, for the same
+	// reason: the call is gone here and the other phone is still on it.
+	unended map[string]bridgedCall
 }
 
 // callOfferPayload is `call.offer` as this session publishes it once it carries calls.
@@ -556,9 +560,13 @@ func (s *Session) terminateCall(ctx context.Context, command *protocol.Command) 
 		creator = live.creator
 	}
 	unrejected, retry := s.bridge.unrejected[req.CallID]
+	unended := s.bridge.unended[req.CallID]
 	s.bridge.mu.Unlock()
 	if live == nil && retry {
 		return s.rejectAgain(ctx, req.CallID, unrejected)
+	}
+	if live == nil && unended != nil {
+		return s.hangupAgain(ctx, req.CallID, unended)
 	}
 	if live == nil {
 		return nil, nil
@@ -568,7 +576,10 @@ func (s *Session) terminateCall(ctx context.Context, command *protocol.Command) 
 		end = live.call.Hangup
 	}
 	if err := signal(ctx, end); err != nil {
-		if !answered && !creator.IsEmpty() {
+		switch {
+		case answered:
+			s.rememberUnended(req.CallID, live.call)
+		case !creator.IsEmpty():
 			s.rememberUnrejected(req.CallID, creator)
 		}
 		if ctx.Err() != nil {
@@ -594,7 +605,36 @@ func (s *Session) rememberUnrejected(callID string, creator waTypes.JID) {
 	s.bridge.unrejected[callID] = creator
 }
 
-// unrejectedLimit bounds the calls kept for a retried rejection. A failed rejection is a
+// rememberUnended keeps an answered or placed call whose hangup did not go out, for a
+// retry, bounded like unrejected.
+func (s *Session) rememberUnended(callID string, call bridgedCall) {
+	s.bridge.mu.Lock()
+	defer s.bridge.mu.Unlock()
+	if s.bridge.unended == nil {
+		s.bridge.unended = make(map[string]bridgedCall)
+	}
+	if len(s.bridge.unended) >= unrejectedLimit {
+		clear(s.bridge.unended)
+	}
+	s.bridge.unended[callID] = call
+}
+
+// hangupAgain is a retried call.terminate of a call whose hangup did not go out: the same
+// terminate is written again, and once it lands a further retry is nothing new.
+func (s *Session) hangupAgain(ctx context.Context, callID string, call bridgedCall) (json.RawMessage, error) {
+	if err := signal(ctx, call.HangupAgain); err != nil {
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("end call %s: %w", callID, ctx.Err())
+		}
+		return nil, protocol.NewError(protocol.ErrorWaError, "WhatsApp did not take the end of the call")
+	}
+	s.bridge.mu.Lock()
+	delete(s.bridge.unended, callID)
+	s.bridge.mu.Unlock()
+	return nil, nil
+}
+
+// unrejectedLimit bounds the calls kept for a retried rejection or hangup. A failed rejection is a
 // socket going, and a handful is what a burst of those leaves.
 const unrejectedLimit = 64
 
