@@ -305,6 +305,10 @@ type CallsRequest struct {
 	// The call is still published either way: a client whose policy is to refuse still
 	// wants to know somebody rang, which is the whole reason the event reaches an inbox.
 	AutoReject bool `json:"auto_reject,omitempty"`
+	// Answer has the connector carry the voice of a 1:1 call between WhatsApp and the
+	// client's browser: the offer carries an SDP, and call.accept answers it. It takes
+	// effect only on a deployment with a media port, and AutoReject wins over it.
+	Answer bool `json:"answer,omitempty"`
 }
 
 // ProxyRequest is the proxy half of `session.connect`: the address a session's traffic

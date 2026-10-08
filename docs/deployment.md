@@ -48,6 +48,10 @@ Every Sidekiq replica runs a connector of its own, and they share the database t
 
 Set `WHATSAPP_CONNECTOR_EMBEDDED=false` on the Chatwoot containers and run the connector as a service of its own. This is the arrangement for updating the connector without waiting for a Chatwoot release, for running it on another host, or for scaling it apart from Sidekiq. The configuration is the operator's, with [operations.md](operations.md#configuration) as the reference; the example keeps pairings in SQLite on a volume, which is enough for one instance.
 
+## WhatsApp calls
+
+Calls answered or placed in the agent's browser carry their voice through one UDP port of the connector, `WAC_CALLS_UDP_PORT`, and the agents' browsers send to it directly. Both examples use port `40000` and publish it as `40000:40000/udp`: in the embedded mode on the Sidekiq container, which is where the connector runs, and in the separate mode on the connector's own service. A firewall in front of the host has to let that UDP port in as well. When the browsers reach the host at an address other than its own, behind NAT, set `WAC_CALLS_PUBLIC_IP` to that address. Leaving `WAC_CALLS_UDP_PORT` unset leaves calls off, and nothing else changes. Each instance of a fleet needs a port of its own that the browsers can reach, because a call is carried by the instance that owns the session. [operations.md](operations.md#configuration) has the details.
+
 ## Switching an existing installation
 
 An installation that already runs the connector as a separate service and upgrades to a Chatwoot image that embeds it **must set `WHATSAPP_CONNECTOR_EMBEDDED=false` before the upgrade**. Without it, the Sidekiq container starts a second connector with an empty database of its own, and the two compete for the same sessions through the same Redis.

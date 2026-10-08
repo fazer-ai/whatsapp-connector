@@ -351,7 +351,7 @@ theirs, and the connector is always upgraded first.
   - **A call the client places.** `call.start {to, sdp}` carries the browser's WebRTC offer and is an RPC whose result is `{call_id}`, the id `call.answered` and `call.terminate` are matched by. It rings somebody's phone, which is not a side effect that repeats harmlessly, so it **requires an `idempotency_key`**: a `call.start` redelivered with the same key answers the same `call_id` and does not ring again. When the callee answers, `call.answered {call_id, sdp}` brings the connector's WebRTC answer for the browser.
   - **The end of a call.** `call.terminate {call_id}` hangs up a call the client answered or placed. The `call.terminate` event, which already reported a call that ended before anybody answered it, also reports the end of a call that was answered or placed, whichever side ended it.
   - **Repeats and late commands.** `call.accept` and `call.terminate` are idempotent by `call_id` and are fire and forget: accepting a call that was already accepted or has ended, or ending one that already ended, does nothing new, and a failure arrives as `command.failed`.
-  - **Where this connector stands.** The three commands are answered `unsupported` on a session without `calls.answer`. In this build they are answered `unsupported` on every session, with `calls.answer` or without it, and no `call.offer` carries `sdp` yet: the media bridge that implements them is a later change, and a client can rely on the refusal until it lands.
+  - **Where this connector stands.** The three commands are answered `unsupported` on a session without `calls.answer`, and on every session of a deployment that did not open a port for call media: there `calls.answer` is accepted and has no effect, so no `call.offer` carries `sdp`. The connector offers the browser G.722 and PCMU, in that order, and answers a browser's offer in whichever of the two it prefers. A call is carried by the instance that owns the session and cannot follow it: when the session moves to another instance or closes, the call is hung up, and the `call.terminate` that reports it may not reach the client. The browser's peer connection closing is then what says the call is over. `call.start` dials a `phone` address only, and is answered `recipient_not_on_whatsapp` for a number WhatsApp does not know. A `call.accept` for a call that was offered without `sdp`, or whose `sdp` is not one the connector can use, fails with `invalid_payload` and the call goes on ringing.
 - `presence.set` takes effect when WhatsApp says so, not when the reply comes back: the
   node is written and acknowledged locally, and a `chat.presence` sent in the same breath
   as the `available` before it has been observed not to render on the other phone, while
@@ -434,17 +434,16 @@ theirs, and the connector is always upgraded first.
   as a reply. They stay in the enum because
   removing one narrows what a client may already match on, and each is marked in
   `internal/protocol/errors.go` with what arrives in its place.
-- Five command types have no handler here -- `session.update`, `contact.info`, and the
-  three call commands `call.accept`, `call.start` and `call.terminate` -- and a client
-  that sends one is answered `unsupported`. That answer only reaches a client whose
+- Two command types have no handler here -- `session.update` and `contact.info` -- and a
+  client that sends one is answered `unsupported`. That answer only reaches a client whose
   session some instance owns: a command for a session nobody is running is delivered to
-  nobody, so the caller waits out its own deadline instead. Which five is marked in `internal/protocol/types.go` and held
+  nobody, so the caller waits out its own deadline instead. Which two is marked in `internal/protocol/types.go` and held
   there by a test, so wiring one up without saying so fails the build.
-- Seven of the event types have no producer in this connector either, and the same
+- Six of the event types have no producer in this connector either, and the same
   reasoning holds: a client may match on one and never see it. Unlike a command, nothing
   says so at the time -- a command it does not implement comes back `unsupported`, while
   an event that is never published is indistinguishable from one that has not happened.
-  Which seven is marked in `internal/protocol/types.go` and held there by a test, so
+  Which six is marked in `internal/protocol/types.go` and held there by a test, so
   the marking is what the build does rather than what it did when somebody last looked.
   An unproduced type stays only while some producer could emit it one day:
   `account.reachout_timelock` and `account.new_chat_cap` were removed because none can.
@@ -480,7 +479,7 @@ result of its own to list.
 | `contact.profile_picture` | `{ "url": string\|null }` |
 | `contact.resolve` | `party`. Both of WhatsApp's namespaces for one person, out of what the connector already holds, plus the display names it has learned. Local: no round trip, and a session that is paired but not connected still answers it. It answers out of what this account was shown -- see the party rule under Conventions -- so a pairing nothing has shown it is answered with the half the caller already had |
 | `contact.info` | `party` |
-| `call.start` | `{ "call_id": string }`, the id `call.answered` and `call.terminate` carry for this call. Answered `unsupported` by this build |
+| `call.start` | `{ "call_id": string }`, the id `call.answered` and `call.terminate` carry for this call. Given once the callee's phone is ringing, not once it is answered |
 | `group.create`, `group.info` | `group_info`. `topic_id` is WhatsApp's own id for the description, passed on as it arrives and never interpreted: a group whose description came back with the literal string `undefined` refuses every later edit with a conflict, and this is the only reading that says so. The connector does not turn it into an error code, because a conflict is genuinely ambiguous between a frozen description and another admin writing in between, and what to tell an operator is the client's to decide. `participants` is absent when the connector cannot account for every one of them -- an anonymous participant it has no address for, or a list shorter than `size` -- because a roster reads as the whole of the group and half of one takes people out of it. Absent means *not answered*, never *empty*: `size` is what says how many there are |
 | `group.list` | array of `group_info`, empty when the account is in no groups, and **without `participants`**: an account can be in hundreds of groups of hundreds of people, and a listing that carried every membership would answer with the whole address book of every conversation to say which conversations exist. `size` still says how big each one is, and `group.info` answers the roster for the group a caller opens |
 | `group.invite.get` | `{ "code": string, "url": string\|null }` |

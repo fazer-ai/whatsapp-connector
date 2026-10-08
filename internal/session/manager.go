@@ -1577,11 +1577,11 @@ func resumeRequest(wants store.Wants) engine.ConnectRequest {
 	// what this writes and what reads it cannot drift: they are the same struct, and a
 	// field renamed on one side stops compiling instead of quietly setting nothing.
 	request := engine.ConnectRequest{Pairing: "resume", Groups: wants.Groups, HistorySync: wants.History}
-	if wants.CallAutoReject {
+	if wants.CallAutoReject || wants.CallAnswer {
 		// Omitted rather than sent as `{auto_reject: false}`: a client that never asked
 		// about calls and one that asked for them to ring are the same request, and the
 		// contract spells the first as an absent object.
-		request.Calls = &engine.CallsRequest{AutoReject: true}
+		request.Calls = &engine.CallsRequest{AutoReject: wants.CallAutoReject, Answer: wants.CallAnswer}
 	}
 	if wants.Proxy != "" {
 		// Omitted for the same reason, and with more riding on it than the call policy:

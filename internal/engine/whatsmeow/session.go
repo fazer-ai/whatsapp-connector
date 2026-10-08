@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/purpshell/meowcaller"
 	"github.com/rs/zerolog"
 	qrcode "github.com/skip2/go-qrcode"
 	wm "go.mau.fi/whatsmeow"
@@ -26,6 +27,7 @@ import (
 	waEvents "go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 
+	"github.com/fazer-ai/whatsapp-connector/internal/calls"
 	"github.com/fazer-ai/whatsapp-connector/internal/engine"
 	"github.com/fazer-ai/whatsapp-connector/internal/media"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
@@ -524,6 +526,19 @@ type Session struct {
 	// autoRejectCalls is the last connect's `calls.auto_reject`. Guarded by mu, written
 	// by Connect and read by the handler for every call that arrives.
 	autoRejectCalls bool
+	// answerCalls is the last connect's `calls.answer`. Guarded by mu. It only takes
+	// effect where callMedia is set, and `calls.auto_reject` wins over it.
+	answerCalls bool
+	// callMedia is the deployment's media socket for calls, nil when calls are off.
+	// Set in newSession and never replaced.
+	callMedia *calls.Media
+	// caller is meowcaller on the current client, nil when calls are off. Guarded by mu,
+	// and replaced with the client: it is installed on one client and cannot move.
+	caller *meowcaller.Client
+	// bridge is the calls this session carries the voice of.
+	bridge bridgeState
+	// dialCall places a call; a seam so a test can stand in for meowcaller.
+	dialCall func(ctx context.Context, target string) (bridgedCall, error)
 
 	// history is the last connect's `history_sync`: whether the client wants the phone's
 	// history published. Guarded by mu, written by Connect and read for every dump.
@@ -863,8 +878,10 @@ func newSession(
 		historyReplayBudget: historyReplayBudget,
 		sending:             make(chan struct{}, 1),
 		uploadWait:          uploadTimeout,
+		callMedia:           blobs.Calls,
 	}
 	s.route.notify = s.proxyOutcome
+	s.dialCall = s.dialOverCaller
 	s.readPendingHistory = s.store.PendingHistory
 	s.declineCall = func(ctx context.Context, client *wm.Client, caller waTypes.JID, callID string) error {
 		if client == nil {
@@ -1009,6 +1026,19 @@ func (s *Session) adopt(ctx context.Context, client *wm.Client) bool {
 	// holds it yet, so whatsmeow's own goroutines are not writing to it.
 	named := identityOf(client)
 
+	// meowcaller before this session's own handler, and on every client rather than when
+	// a connect asks for calls: it has to be installed before the client connects, and
+	// its handler has to run first, so a call it engages is known by the time callOffered
+	// builds the offer for it. Its gate is what keeps it out of every call a session did
+	// not ask to answer.
+	var caller *meowcaller.Client
+	if s.callMedia != nil {
+		caller = meowcaller.NewClient(client,
+			meowcaller.WithLogger(s.log.With().Str("sub", "calls").Logger()),
+			meowcaller.WithOfferGate(s.engagesOffer))
+		caller.OnIncomingCall(s.callRinging)
+	}
+
 	// Subscribed before the swap, so the client is never live with nobody listening,
 	// and both halves are one lifecycle step: a Close that lands between them would
 	// otherwise leave a handler on a client the session no longer knows about.
@@ -1022,6 +1052,7 @@ func (s *Session) adopt(ctx context.Context, client *wm.Client) bool {
 		return false
 	}
 	s.client = client
+	s.caller = caller
 	// A mark about the client being replaced describes a drop from a socket this session no
 	// longer holds, and the argument for keeping one otherwise does not survive here: it
 	// rests on whatsmeow announcing its own reconnect, and a client adopted after a logout
@@ -1279,10 +1310,18 @@ func (s *Session) wantsGroups() bool {
 	return s.groups
 }
 
-func (s *Session) setCallPolicy(autoReject bool) {
+func (s *Session) setCallPolicy(autoReject, answer bool) {
 	s.mu.Lock()
 	s.autoRejectCalls = autoReject
+	s.answerCalls = answer
 	s.mu.Unlock()
+}
+
+// callPolicy is the last connect's `calls`, as it was asked.
+func (s *Session) callPolicy() (autoReject, answer bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.autoRejectCalls, s.answerCalls
 }
 
 func (s *Session) rejectsCalls() bool {
@@ -1853,7 +1892,7 @@ func (s *Session) Connect(ctx context.Context, req engine.ConnectRequest) error 
 	// next connect that happened to succeed.
 	s.setGroups(req.Groups)
 	s.setHistory(req.HistorySync)
-	s.setCallPolicy(req.Calls != nil && req.Calls.AutoReject)
+	s.setCallPolicy(req.Calls != nil && req.Calls.AutoReject, req.Calls != nil && req.Calls.Answer)
 
 	// A hang-up an earlier command left running is waited for first: the move below may
 	// start one of its own, and awaitHangUp only knows about the latest.
@@ -1945,7 +1984,7 @@ func (s *Session) standOnWhatWasAsked(ctx context.Context) error {
 	}
 	s.setGroups(standing.Groups)
 	s.setHistory(standing.History)
-	s.setCallPolicy(standing.CallAutoReject)
+	s.setCallPolicy(standing.CallAutoReject, standing.CallAnswer)
 	// Nothing is dialled yet, so there is no socket to hang up: moving the route is all a
 	// proxy needs here.
 	if err := s.route.set(standing.Proxy); err != nil {
@@ -3457,6 +3496,12 @@ func (s *Session) Execute(ctx context.Context, command *protocol.Command) (json.
 		return s.markUnread(ctx, command)
 	case protocol.CommandCallReject:
 		return s.rejectCall(ctx, command)
+	case protocol.CommandCallAccept:
+		return s.acceptCall(ctx, command)
+	case protocol.CommandCallStart:
+		return s.startCall(ctx, command)
+	case protocol.CommandCallTerminate:
+		return s.terminateCall(ctx, command)
 	case protocol.CommandHistoryRequest:
 		return s.requestHistory(ctx, command)
 	case protocol.CommandGroupLeave, protocol.CommandGroupPhotoSet, protocol.CommandGroupNameSet,
@@ -3588,8 +3633,8 @@ func (s *Session) requestCode(ctx context.Context, command *protocol.Command) er
 	request := engine.ConnectRequest{
 		Pairing: "code", Phone: body.Phone, Groups: s.wantsGroups(), HistorySync: s.wantsHistory(),
 	}
-	if s.rejectsCalls() {
-		request.Calls = &engine.CallsRequest{AutoReject: true}
+	if autoReject, answer := s.callPolicy(); autoReject || answer {
+		request.Calls = &engine.CallsRequest{AutoReject: autoReject, Answer: answer}
 	}
 	// And the proxy most of all: a connect without one is a request to go out directly,
 	// so leaving it off would move the account to this instance's address at the moment
@@ -3635,6 +3680,12 @@ func (s *Session) Close() error {
 	if run != nil {
 		run.cancel()
 	}
+	// Before the socket goes, and bounded: a call's media lives on this instance and
+	// cannot follow the account to another one, and a call left up would go on playing
+	// silence to the person on the phone. meowcaller ends each call locally before it
+	// writes the terminate, so the voice stops here even when the write cannot land.
+	s.hangUpEverything()
+
 	// Cancelled first, and that order is the whole point: whatsmeow holds its socket
 	// lock for the length of a dial, and Disconnect waits for the same lock. Cancelling
 	// afterwards would never run, and a lease handover would wait out the handshake.

@@ -620,6 +620,13 @@ func (e *engine) onOffer(ev *events.CallOffer) {
 	delete(e.staleOffers, ev.CallID)
 	e.mu.Unlock()
 
+	// Before anything is sent or recorded: an offer the integrator does not want engaged
+	// must leave no trace, or a preaccept from this device changes how the call rings
+	// on every other one.
+	if gate := e.c.offerGate; gate != nil && !gate(ev) {
+		return
+	}
+
 	// Source of truth: https://github.com/purpshell/meowcaller/blob/33854919e64bdd4b053054ac9764d8fc63027b57/datasheets/voip-group-invite-accept.md#L28-L40
 	groupSnapshot, isGroup, groupErr := signaling.ParseGroupInviteSnapshot(ev.Data)
 	if groupErr != nil {

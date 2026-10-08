@@ -1580,7 +1580,8 @@ func (s *Session) lifecycle(ctx context.Context, command *protocol.Command, inte
 func (s *Session) recordAsked(ctx context.Context, request engine.ConnectRequest) error {
 	wants := store.Wants{
 		Groups: request.Groups, CallAutoReject: request.Calls != nil && request.Calls.AutoReject,
-		Proxy: request.ProxyURL(), History: request.HistorySync,
+		CallAnswer: request.Calls != nil && request.Calls.Answer,
+		Proxy:      request.ProxyURL(), History: request.HistorySync,
 	}
 	err := s.writeWanted(ctx, wants)
 	if err != nil && wants.Proxy != "" {

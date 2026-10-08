@@ -3,15 +3,18 @@ package meowcaller
 import (
 	"github.com/purpshell/meowcaller/diag"
 	"github.com/rs/zerolog"
+	"go.mau.fi/whatsmeow/types/events"
 )
 
-// Option configures optional, non-behavioral aspects of the call/media types —
-// currently the diagnostic logger. The zero configuration logs nothing.
+// Option configures optional aspects of the call/media types: the diagnostic logger, and
+// the gate on which inbound offers are engaged. The zero configuration logs nothing and
+// engages every offer.
 type Option func(*config)
 
 type config struct {
-	log  zerolog.Logger
-	diag *diag.Recorder
+	log       zerolog.Logger
+	diag      *diag.Recorder
+	offerGate func(*events.CallOffer) bool
 }
 
 func resolveConfig(opts []Option) config {
@@ -36,4 +39,12 @@ func WithLogger(l zerolog.Logger) Option {
 // diag emit is a no-op at zero cost.
 func WithDiagnostics(rec *diag.Recorder) Option {
 	return func(c *config) { c.diag = rec }
+}
+
+// WithOfferGate decides, per inbound offer, whether this client takes part in the call
+// at all. An offer the gate refuses is left alone: no preaccept, no per-call state and
+// no OnIncomingCall, so the call rings on the account's other devices exactly as it
+// would without this client. Without a gate every offer is engaged.
+func WithOfferGate(gate func(*events.CallOffer) bool) Option {
+	return func(c *config) { c.offerGate = gate }
 }

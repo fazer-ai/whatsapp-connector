@@ -186,12 +186,20 @@ func (s *Session) callOffered(meta *waTypes.BasicCallMeta, media callMedia, grou
 		return true
 	}
 
-	s.emitMoment(protocol.EventCallOffer, callOffer{
+	offer := callOffer{
 		CallID:    meta.CallID,
 		From:      from,
 		Video:     media.known && media.video,
 		Timestamp: meta.Timestamp.UnixMilli(),
-	})
+	}
+	if s.callMedia == nil {
+		s.emitMoment(protocol.EventCallOffer, offer)
+		return true
+	}
+	// Only a call meowcaller engaged gets an SDP, and its gate is what decided that: a
+	// session that does not answer calls, a group call and a video call are offered the
+	// way they always were.
+	s.emitMoment(protocol.EventCallOffer, callOfferPayload{callOffer: offer, SDP: s.offerToBrowser(meta.CallID)})
 	return true
 }
 
@@ -223,6 +231,11 @@ func (s *Session) refuse(meta *waTypes.BasicCallMeta) {
 // some other way still has a ringing conversation to close.
 func (s *Session) callEnded(event *waEvents.CallTerminate) bool {
 	if !event.GroupJID.IsEmpty() && !s.wantsGroups() {
+		return true
+	}
+	// Once per call. A call this session carries the voice of is also ended by
+	// meowcaller, which publishes it from its own side when it gets there first.
+	if !s.firstEndOf(event.CallID) {
 		return true
 	}
 

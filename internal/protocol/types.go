@@ -96,7 +96,7 @@ const (
 	CommandCallTerminate           CommandType = "call.terminate"
 )
 
-// AllEventTypes lists every event type in the contract. Seven of them have no producer
+// AllEventTypes lists every event type in the contract. Six of them have no producer
 // in this build, and they are marked below: a client may match on one and never see it,
 // the way it may branch on a reserved error code in errors.go. They stay in the catalog
 // because some producer could emit each of them one day, and because Valid and the
@@ -142,10 +142,8 @@ var AllEventTypes = []EventType{
 	EventGroupActivity, // produced
 	EventCallOffer,     // produced
 	EventCallTerminate, // produced
-	// No producer yet: the media bridge that answers a call.start is #383's, and until
-	// it lands every call.start is answered `unsupported` instead.
-	EventCallAnswered,
-	EventHistorySync, // produced
+	EventCallAnswered,  // produced
+	EventHistorySync,   // produced
 	// No producer either, and this one waits on nothing: `raw` is the escape hatch for a
 	// provider node the catalog has no shape for, and this connector publishes what it
 	// understands or an `unsupported` placeholder instead. It is in the contract for a
@@ -153,7 +151,7 @@ var AllEventTypes = []EventType{
 	EventRaw,
 }
 
-// AllCommandTypes lists every command type in the contract. Five of them have no handler
+// AllCommandTypes lists every command type in the contract. Two of them have no handler
 // in this build and are marked below: a client that sends one is answered `unsupported`,
 // which is the difference between these and the unproduced events -- a command says so at
 // the time, an event that never arrives says nothing.
@@ -203,8 +201,6 @@ var AllCommandTypes = []CommandType{
 	CommandGroupJoinRequestsList,
 	CommandGroupJoinRequestsUpdate,
 	CommandCallReject,
-	// No handler yet, the three of them: answering and placing a call need the media
-	// bridge of #383, and until it lands each is answered `unsupported`.
 	CommandCallAccept,
 	CommandCallStart,
 	CommandCallTerminate,

@@ -32,6 +32,10 @@ type Wants struct {
 	// lets the account ring on the operator's phone after they asked for the opposite,
 	// and nothing about the session says it changed its mind.
 	CallAutoReject bool
+	// CallAnswer is the connect's `calls.answer`. A resumed session that dropped it
+	// would publish every call without an SDP, and a client waiting to answer them in the
+	// browser would see an account that rings and cannot be picked up.
+	CallAnswer bool
 	// Proxy is the address the session's traffic with WhatsApp left through, empty for a
 	// session that went out directly. The sharpest of them: a resumed session that
 	// dropped it would dial WhatsApp from this instance's own address, which is the one
@@ -95,15 +99,16 @@ func (c *Container) putDesiredConnected(ctx context.Context, sid string, wants W
 	}
 	const upsert = `
 		INSERT INTO wac_session_desired
-			(sid, desired, wants_groups, wants_call_auto_reject, wants_proxy, wants_history, asked_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
+			(sid, desired, wants_groups, wants_call_auto_reject, wants_call_answer, wants_proxy, wants_history, asked_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (sid) DO UPDATE SET
 			desired = excluded.desired, wants_groups = excluded.wants_groups,
 			wants_call_auto_reject = excluded.wants_call_auto_reject,
+			wants_call_answer = excluded.wants_call_answer,
 			wants_proxy = excluded.wants_proxy, wants_history = excluded.wants_history,
 			asked_at = excluded.asked_at`
 	if _, err := c.db.ExecContext(ctx, c.rebind(upsert),
-		sid, DesiredConnected, asFlag(wants.Groups), asFlag(wants.CallAutoReject), wants.Proxy,
+		sid, DesiredConnected, asFlag(wants.Groups), asFlag(wants.CallAutoReject), asFlag(wants.CallAnswer), wants.Proxy,
 		asFlag(wants.History), now.UnixMilli()); err != nil {
 		return fmt.Errorf("store: record the desired state of %s: %w", sid, err)
 	}
@@ -115,18 +120,21 @@ func (c *Container) putDesiredConnected(ctx context.Context, sid string, wants W
 // disconnect leaves the request standing (see putDesiredDisconnected).
 func (c *Container) standing(ctx context.Context, sid string) (Wants, bool, error) {
 	const query = `
-		SELECT d.wants_groups, d.wants_call_auto_reject, d.wants_proxy, d.wants_history
+		SELECT d.wants_groups, d.wants_call_auto_reject, d.wants_call_answer, d.wants_proxy, d.wants_history
 		FROM wac_session_desired d WHERE d.sid = ?`
 	var proxy string
-	var groups, autoReject, history int64
-	err := c.db.QueryRowContext(ctx, c.rebind(query), sid).Scan(&groups, &autoReject, &proxy, &history)
+	var groups, autoReject, answer, history int64
+	err := c.db.QueryRowContext(ctx, c.rebind(query), sid).Scan(&groups, &autoReject, &answer, &proxy, &history)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Wants{}, false, nil
 	}
 	if err != nil {
 		return Wants{}, false, fmt.Errorf("store: read what %s was asked to be: %w", sid, err)
 	}
-	return Wants{Groups: groups != 0, CallAutoReject: autoReject != 0, Proxy: proxy, History: history != 0}, true, nil
+	return Wants{
+		Groups: groups != 0, CallAutoReject: autoReject != 0, CallAnswer: answer != 0,
+		Proxy: proxy, History: history != 0,
+	}, true, nil
 }
 
 // WantedSession is Wanted for one session: what its client asked for, and whether the
@@ -139,20 +147,23 @@ func (c *Container) standing(ctx context.Context, sid string) (Wants, bool, erro
 // finished is left out here for the reason it is left out there.
 func (c *Container) WantedSession(ctx context.Context, sid string) (Wants, bool, error) {
 	const query = `
-		SELECT d.wants_groups, d.wants_call_auto_reject, d.wants_proxy, d.wants_history
+		SELECT d.wants_groups, d.wants_call_auto_reject, d.wants_call_answer, d.wants_proxy, d.wants_history
 		FROM wac_session_desired d
 		JOIN wac_session_device v ON v.sid = d.sid
 		WHERE d.sid = ? AND d.desired = ?`
 	var proxy string
-	var groups, autoReject, history int64
-	err := c.db.QueryRowContext(ctx, c.rebind(query), sid, DesiredConnected).Scan(&groups, &autoReject, &proxy, &history)
+	var groups, autoReject, answer, history int64
+	err := c.db.QueryRowContext(ctx, c.rebind(query), sid, DesiredConnected).Scan(&groups, &autoReject, &answer, &proxy, &history)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Wants{}, false, nil
 	}
 	if err != nil {
 		return Wants{}, false, fmt.Errorf("store: read whether %s should be connected: %w", sid, err)
 	}
-	return Wants{Groups: groups != 0, CallAutoReject: autoReject != 0, Proxy: proxy, History: history != 0}, true, nil
+	return Wants{
+		Groups: groups != 0, CallAutoReject: autoReject != 0, CallAnswer: answer != 0,
+		Proxy: proxy, History: history != 0,
+	}, true, nil
 }
 
 // dropDesired forgets what was asked for, which is what a session that no longer exists
@@ -180,7 +191,7 @@ func (c *Container) dropDesired(ctx context.Context, sid string) error {
 // caller cannot reason about at all.
 func (c *Container) Wanted(ctx context.Context) ([]Wanted, error) {
 	const query = `
-		SELECT d.sid, d.wants_groups, d.wants_call_auto_reject, d.wants_proxy, d.wants_history
+		SELECT d.sid, d.wants_groups, d.wants_call_auto_reject, d.wants_call_answer, d.wants_proxy, d.wants_history
 		FROM wac_session_desired d
 		JOIN wac_session_device v ON v.sid = d.sid
 		WHERE d.desired = ?
@@ -194,13 +205,16 @@ func (c *Container) Wanted(ctx context.Context) ([]Wanted, error) {
 	var wanted []Wanted
 	for rows.Next() {
 		var sid, proxy string
-		var groups, autoReject, history int64
-		if err := rows.Scan(&sid, &groups, &autoReject, &proxy, &history); err != nil {
+		var groups, autoReject, answer, history int64
+		if err := rows.Scan(&sid, &groups, &autoReject, &answer, &proxy, &history); err != nil {
 			return nil, fmt.Errorf("store: read the sessions that should be connected: %w", err)
 		}
 		wanted = append(wanted, Wanted{
-			SID:   sid,
-			Wants: Wants{Groups: groups != 0, CallAutoReject: autoReject != 0, Proxy: proxy, History: history != 0},
+			SID: sid,
+			Wants: Wants{
+				Groups: groups != 0, CallAutoReject: autoReject != 0, CallAnswer: answer != 0,
+				Proxy: proxy, History: history != 0,
+			},
 		})
 	}
 	if err := rows.Err(); err != nil {

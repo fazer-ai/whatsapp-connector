@@ -19,6 +19,7 @@ import (
 	waEvents "go.mau.fi/whatsmeow/types/events"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/fazer-ai/whatsapp-connector/internal/calls"
 	"github.com/fazer-ai/whatsapp-connector/internal/media"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 	"github.com/fazer-ai/whatsapp-connector/internal/store"
@@ -117,6 +118,10 @@ type MediaOptions struct {
 	SendMax int64
 	// FetchHosts is the hosts a file to send may be fetched from. Empty is any host.
 	FetchHosts FetchHosts
+	// Calls is the media socket the voice of calls goes through. Nil turns calls off:
+	// meowcaller is not installed, no offer carries an SDP, and the call commands are
+	// answered `unsupported` whatever a connect asked for.
+	Calls *calls.Media
 }
 
 // attachment is the media part of a message: what the contract says about the file, the

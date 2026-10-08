@@ -481,6 +481,55 @@ func TestCallCommandsAreRefusedAsUnsupported(t *testing.T) {
 	}
 }
 
+// call.start rings somebody's phone, so a redelivery with the same idempotency_key has
+// to answer the call it already placed rather than ring again, and a new key is a new
+// call. The engine hands out a new id every time it is asked, so the same id twice is the
+// session answering from its record.
+func TestACallStartRedeliveredWithTheSameKeyAnswersTheSameCall(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	ctx := context.Background()
+	if _, err := h.manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	var acked atomic.Bool
+	h.manager.Dispatch(delivery(&protocol.Command{
+		V: protocol.Version, ID: "connect", Type: protocol.CommandSessionConnect, SID: "s1", ReplyTo: "connect",
+		Payload: json.RawMessage(`{"pairing":"resume","calls":{"answer":true}}`),
+	}, &acked))
+	waitFor(t, "the connect", func() bool { _, ok := h.recorder.reply("connect"); return ok })
+
+	start := func(id, key string) string {
+		t.Helper()
+		var acked atomic.Bool
+		h.manager.Dispatch(delivery(&protocol.Command{
+			V: protocol.Version, ID: id, Type: protocol.CommandCallStart, SID: "s1", ReplyTo: id, IdempotencyKey: key,
+			Payload: json.RawMessage(`{"to":{"kind":"phone","id":"5541999990000"},"sdp":"v=0"}`),
+		}, &acked))
+		waitFor(t, "the reply to "+id, func() bool { _, ok := h.recorder.reply(id); return ok })
+		reply, _ := h.recorder.reply(id)
+		if !reply.OK {
+			t.Fatalf("%s answered %+v", id, reply)
+		}
+		var result struct {
+			CallID string `json:"call_id"`
+		}
+		if err := json.Unmarshal(reply.Result, &result); err != nil || result.CallID == "" {
+			t.Fatalf("%s answered no call_id: %s", id, reply.Result)
+		}
+		return result.CallID
+	}
+
+	first := start("start-1", "k1")
+	if again := start("start-2", "k1"); again != first {
+		t.Fatalf("the same key answered %q and then %q", first, again)
+	}
+	if other := start("start-3", "k2"); other == first {
+		t.Fatalf("a new key answered the first call's id %q", first)
+	}
+}
+
 // The caller stopped waiting, so running the command is a side effect nobody will read
 // the outcome of.
 func TestExpiredCommandIsRefusedWithoutRunning(t *testing.T) {
@@ -3623,13 +3672,15 @@ func TestAResumeConnectsWithWhatItsClientAskedFor(t *testing.T) {
 	t.Parallel()
 
 	for name, wants := range map[string]store.Wants{
-		"nothing":             {},
-		"groups":              {Groups: true},
-		"auto-rejected calls": {CallAutoReject: true},
-		"both":                {Groups: true, CallAutoReject: true},
-		"a proxy":             {Proxy: "socks5://user:secret@10.0.0.1:1080"},
-		"all three":           {Groups: true, CallAutoReject: true, Proxy: "http://10.0.0.1:3128"},
-		"history":             {History: true},
+		"nothing":              {},
+		"groups":               {Groups: true},
+		"auto-rejected calls":  {CallAutoReject: true},
+		"both":                 {Groups: true, CallAutoReject: true},
+		"a proxy":              {Proxy: "socks5://user:secret@10.0.0.1:1080"},
+		"all three":            {Groups: true, CallAutoReject: true, Proxy: "http://10.0.0.1:3128"},
+		"history":              {History: true},
+		"answered calls":       {CallAnswer: true},
+		"answered and refused": {CallAutoReject: true, CallAnswer: true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -3657,8 +3708,8 @@ func TestAResumeConnectsWithWhatItsClientAskedFor(t *testing.T) {
 			// Compared as the rendered command rather than field by field, because the
 			// request now holds a pointer and two equal requests are not `==`.
 			want := engine.ConnectRequest{Pairing: "resume", Groups: wants.Groups, HistorySync: wants.History}
-			if wants.CallAutoReject {
-				want.Calls = &engine.CallsRequest{AutoReject: true}
+			if wants.CallAutoReject || wants.CallAnswer {
+				want.Calls = &engine.CallsRequest{AutoReject: wants.CallAutoReject, Answer: wants.CallAnswer}
 			}
 			if wants.Proxy != "" {
 				want.Proxy = &engine.ProxyRequest{URL: wants.Proxy}

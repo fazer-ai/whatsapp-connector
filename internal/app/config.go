@@ -77,6 +77,13 @@ type Config struct {
 	// healthy instance spends carrying one command out, or a slow adoption gets stolen
 	// from underneath itself.
 	ClaimMinIdle time.Duration
+	// CallsUDPPort is the one UDP port the media of every answered or placed call goes
+	// through. Zero turns calls off: no socket is opened, meowcaller is not installed,
+	// and a session asking for `calls.answer` is treated as one that did not.
+	CallsUDPPort int
+	// CallsPublicIPs are the addresses announced to a browser for that port, for an
+	// instance behind a 1:1 NAT. Empty announces the host's own interface addresses.
+	CallsPublicIPs []string
 }
 
 // The engines this build can run.
@@ -187,6 +194,16 @@ func LoadConfig(hostname string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	callsPort, err := envInt("WAC_CALLS_UDP_PORT", 0)
+	if err != nil {
+		return Config{}, err
+	}
+	var callsIPs []string
+	for _, ip := range strings.Split(envString("WAC_CALLS_PUBLIC_IP", ""), ",") {
+		if ip = strings.TrimSpace(ip); ip != "" {
+			callsIPs = append(callsIPs, ip)
+		}
+	}
 
 	cfg := Config{
 		Instance:        envString("WAC_INSTANCE", hostname),
@@ -213,6 +230,8 @@ func LoadConfig(hostname string) (Config, error) {
 		LeaseTTL:        leaseTTL,
 		Heartbeat:       heartbeat,
 		ClaimMinIdle:    claimMinIdle,
+		CallsUDPPort:    callsPort,
+		CallsPublicIPs:  callsIPs,
 	}
 	if cfg.Instance == "" {
 		return Config{}, fmt.Errorf("app: WAC_INSTANCE is empty and the hostname is unknown")
@@ -343,6 +362,20 @@ func LoadConfig(hostname string) (Config, error) {
 		return Config{}, fmt.Errorf(
 			"app: WAC_MEDIA_MAX_BLOB (%d) is larger than WAC_MEDIA_QUOTA (%d), so a blob at the cap "+
 				"evicts the whole cache and then itself", cfg.MediaMaxBlob, cfg.MediaQuota)
+	}
+	if cfg.CallsUDPPort < 0 || cfg.CallsUDPPort > 65535 {
+		return Config{}, fmt.Errorf("app: WAC_CALLS_UDP_PORT %d is not a port", cfg.CallsUDPPort)
+	}
+	if cfg.CallsUDPPort == 0 && len(cfg.CallsPublicIPs) > 0 {
+		// An address to announce for media that has no port is a deployment that meant
+		// to turn calls on and forgot half of it. Running with calls off would answer
+		// every call.accept `unsupported` with nothing in the logs to say why.
+		return Config{}, fmt.Errorf("app: WAC_CALLS_PUBLIC_IP is set and WAC_CALLS_UDP_PORT is not, so calls are off")
+	}
+	for _, ip := range cfg.CallsPublicIPs {
+		if net.ParseIP(ip) == nil {
+			return Config{}, fmt.Errorf("app: WAC_CALLS_PUBLIC_IP %q is not an IP address", ip)
+		}
 	}
 	if cfg.MediaRoot != "" && cfg.MediaToken == "" {
 		// The endpoint hands out message contents, and its only guard is the token. A

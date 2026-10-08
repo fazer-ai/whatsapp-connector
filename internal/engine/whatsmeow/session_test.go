@@ -145,10 +145,6 @@ var (
 	commandsNoHandlerCarriesOut = []protocol.CommandType{
 		protocol.CommandSessionUpdate,
 		protocol.CommandContactInfo,
-		// The call bridge is #383's; until then a client is told so at the time.
-		protocol.CommandCallAccept,
-		protocol.CommandCallStart,
-		protocol.CommandCallTerminate,
 	}
 
 	// Reached now, which is a different thing from being carried out: an empty payload
@@ -197,6 +193,16 @@ var (
 		{protocol.CommandGroupDescriptionSet, protocol.ErrorInvalidPayload},
 		{protocol.CommandGroupSettingsSet, protocol.ErrorInvalidPayload},
 	}
+
+	// Carried out only by a session that carries calls: a deployment with a media port
+	// and a connect that asked for `calls.answer`. Anywhere else the contract says they
+	// are refused, so both halves are asserted: `unsupported` on a session without
+	// calls, and reached, refusing the empty payload, on one with them.
+	commandsCarriedOutWithCalls = []protocol.CommandType{
+		protocol.CommandCallAccept,
+		protocol.CommandCallStart,
+		protocol.CommandCallTerminate,
+	}
 )
 
 func TestEveryCommandInTheContractIsClassified(t *testing.T) {
@@ -221,6 +227,9 @@ func TestEveryCommandInTheContractIsClassified(t *testing.T) {
 	}
 	for _, reached := range commandsExecuteCarriesOut {
 		place(reached.command, "commandsExecuteCarriesOut")
+	}
+	for _, command := range commandsCarriedOutWithCalls {
+		place(command, "commandsCarriedOutWithCalls")
 	}
 	for _, command := range protocol.AllCommandTypes {
 		if _, ok := classified[command]; !ok {
@@ -263,6 +272,15 @@ func TestEveryCommandInTheContractIsClassified(t *testing.T) {
 				return
 			}
 			assertCode(t, err, reached.onNoPayload)
+		})
+	}
+
+	carrying := newCallSession(t)
+	for _, command := range commandsCarriedOutWithCalls {
+		t.Run(string(command)+" without calls", func(t *testing.T) { refused(t, command) })
+		t.Run(string(command)+" with calls", func(t *testing.T) {
+			_, err := carrying.Execute(t.Context(), &protocol.Command{Type: command, Payload: json.RawMessage(`{}`)})
+			assertCode(t, err, protocol.ErrorInvalidPayload)
 		})
 	}
 }
