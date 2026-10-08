@@ -51,20 +51,28 @@ func TestWhatTheBrowserSaysIsQueuedInSequence(t *testing.T) {
 	t.Parallel()
 	leg := &Leg{}
 	var order reorder
-	// Each packet is one µ-law value, so where each one landed can be read back.
+	// Each packet is one value, and the decoder hands it over as it is, so where each one
+	// landed can be read back.
 	packet := func(seq uint16, value byte) *rtp.Packet {
-		return &rtp.Packet{Header: rtp.Header{SequenceNumber: seq}, Payload: []byte{value, value}}
+		return &rtp.Packet{Header: rtp.Header{SequenceNumber: seq}, Payload: []byte{value}}
 	}
 	for _, p := range []*rtp.Packet{packet(1, 0x10), packet(3, 0x30), packet(2, 0x20)} {
-		leg.take(&order, &pcmuDecoder{}, p)
+		leg.take(&order, verbatim{}, p)
 	}
-	// Each two-byte payload decodes to four samples, the second and fourth the value.
-	var got []int16
-	for i := 3; i < len(leg.toWA); i += 4 {
-		got = append(got, leg.toWA[i])
-	}
-	want := []int16{ulawDecode(0x10), ulawDecode(0x20), ulawDecode(0x30)}
+	got := leg.toWA
+	want := []int16{0x10, 0x20, 0x30}
 	if !slices.Equal(got, want) {
 		t.Fatalf("queued %v, want %v in the order they were said", got, want)
 	}
+}
+
+// verbatim is a decoder that turns each byte into one sample of that value.
+type verbatim struct{}
+
+func (verbatim) decode(payload []byte) []int16 {
+	out := make([]int16, len(payload))
+	for i, b := range payload {
+		out[i] = int16(b)
+	}
+	return out
 }

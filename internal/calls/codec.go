@@ -1,6 +1,8 @@
 package calls
 
 import (
+	"math"
+
 	"github.com/gotranspile/g722"
 	"github.com/pion/webrtc/v4"
 )
@@ -61,29 +63,80 @@ func (d *g722Decoder) decode(payload []byte) []int16 {
 	return d.buf[:d.dec.Decode(d.buf[:cap(d.buf)], payload)]
 }
 
-// pcmuEncoder narrows 16 kHz to 8 kHz by averaging each pair, which is a crude low-pass
-// and enough for a fallback whose band ends at 4 kHz anyway.
-type pcmuEncoder struct{}
+// pcmuEncoder narrows 16 kHz to 8 kHz: the voice is low-passed below 4 kHz first, or
+// what WhatsApp carries above it folds back into the band as a tone that was never said.
+type pcmuEncoder struct{ filter halfBand }
 
-func (pcmuEncoder) encode(pcm []int16) []byte {
-	out := make([]byte, len(pcm)/2)
-	for i := range out {
-		out[i] = ulawEncode(int16((int32(pcm[2*i]) + int32(pcm[2*i+1])) / 2)) //nolint:gosec // the mean of two int16 is an int16
+func (e *pcmuEncoder) encode(pcm []int16) []byte {
+	out := make([]byte, 0, len(pcm)/2)
+	for i, s := range pcm {
+		y := e.filter.push(float32(s))
+		if i%2 == 1 {
+			out = append(out, ulawEncode(clip16(y)))
+		}
 	}
 	return out
 }
 
-// pcmuDecoder widens 8 kHz to 16 kHz by putting the midpoint between each pair.
-type pcmuDecoder struct{ last int16 }
+// pcmuDecoder widens 8 kHz to 16 kHz: a zero between each pair of samples, low-passed.
+// Without the filter, or with a straight line between neighbours, a mirror of the voice
+// stays above 4 kHz and a person hears it as a whistle over everything.
+type pcmuDecoder struct{ filter halfBand }
 
 func (d *pcmuDecoder) decode(payload []byte) []int16 {
 	out := make([]int16, 0, len(payload)*2)
 	for _, u := range payload {
-		v := ulawDecode(u)
-		out = append(out, int16((int32(d.last)+int32(v))/2), v) //nolint:gosec // the mean of two int16 is an int16
-		d.last = v
+		// Doubled, since half the samples going into the filter are the zeros.
+		out = append(out, clip16(d.filter.push(2*float32(ulawDecode(u)))), clip16(d.filter.push(0)))
 	}
 	return out
+}
+
+// lowPassTaps is a windowed-sinc low-pass at 16 kHz with its cutoff at 3.7 kHz, under
+// the 4 kHz that 8 kHz can carry. Sixty-three taps put the stopband past 4.4 kHz, at
+// two milliseconds of delay.
+const lowPassLen = 63
+
+var lowPassTaps = func() []float32 {
+	const n, cutoff = lowPassLen, 3700.0 / sampleRate
+	taps := make([]float32, n)
+	var sum float64
+	for i := range taps {
+		x := float64(i) - (n-1)/2.0
+		h := 2 * cutoff
+		if x != 0 {
+			h = math.Sin(2*math.Pi*cutoff*x) / (math.Pi * x)
+		}
+		// Blackman window.
+		w := 0.42 - 0.5*math.Cos(2*math.Pi*float64(i)/(n-1)) + 0.08*math.Cos(4*math.Pi*float64(i)/(n-1))
+		taps[i] = float32(h * w)
+		sum += h * w
+	}
+	for i := range taps {
+		taps[i] /= float32(sum)
+	}
+	return taps
+}()
+
+// halfBand runs lowPassTaps over a stream of 16 kHz samples, one at a time. It keeps its
+// history between packets, so the filter does not restart on every 20 ms.
+type halfBand struct {
+	history [lowPassLen]float32
+	at      int
+}
+
+func (f *halfBand) push(x float32) float32 {
+	f.history[f.at] = x
+	var y float32
+	for k, tap := range lowPassTaps {
+		y += tap * f.history[(f.at-k+len(f.history))%len(f.history)]
+	}
+	f.at = (f.at + 1) % len(f.history)
+	return y
+}
+
+func clip16(x float32) int16 {
+	return int16(max(-maxAmplitude-1, min(maxAmplitude, x)))
 }
 
 func codecFor(mime string) (encoder, decoder, bool) {
@@ -91,7 +144,7 @@ func codecFor(mime string) (encoder, decoder, bool) {
 	case webrtc.MimeTypeG722:
 		return g722Encoder{g722.NewEncoder(g722BitRate, 0)}, &g722Decoder{dec: g722.NewDecoder(g722BitRate, 0)}, true
 	case webrtc.MimeTypePCMU:
-		return pcmuEncoder{}, &pcmuDecoder{}, true
+		return &pcmuEncoder{}, &pcmuDecoder{}, true
 	}
 	return nil, nil, false
 }
