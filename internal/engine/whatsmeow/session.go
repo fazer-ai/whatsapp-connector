@@ -1046,12 +1046,19 @@ func (s *Session) adopt(ctx context.Context, client *wm.Client) bool {
 	// its handler has to run first, so a call it engages is known by the time callOffered
 	// builds the offer for it. Its gate is what keeps it out of every call a session did
 	// not ask to answer.
+	//
+	// Both of its callbacks are fenced with this client, like the session's own handler
+	// below: an offer meowcaller is still working through when a rebuild retires the client
+	// would otherwise be engaged, and registered, on the session its replacement owns.
+	retiredHandler := new(atomic.Bool)
 	var caller *meowcaller.Client
 	if s.callMedia != nil {
 		caller = meowcaller.NewClient(client,
 			meowcaller.WithLogger(s.log.With().Str("sub", "calls").Logger()),
-			meowcaller.WithOfferGate(s.engagesOffer))
-		caller.OnIncomingCall(s.callRinging)
+			meowcaller.WithOfferGate(func(event *waEvents.CallOffer) bool {
+				return s.engagesOfferFrom(retiredHandler, event)
+			}))
+		caller.OnIncomingCall(func(call *meowcaller.Call) { s.ringingFrom(retiredHandler, call) })
 	}
 
 	// The calls of the client being replaced end with it: meowcaller's media runs on a
@@ -1071,7 +1078,6 @@ func (s *Session) adopt(ctx context.Context, client *wm.Client) bool {
 	// whatsmeow runs its whole handler list under one lock, so this one would still be
 	// called when the stalled one returns, with an event from the retired account, on the
 	// session the replacement now owns. A fenced event is left unacknowledged.
-	retiredHandler := new(atomic.Bool)
 	handlerID := client.AddEventHandlerWithSuccessStatus(func(event any) bool {
 		if retiredHandler.Load() {
 			return false

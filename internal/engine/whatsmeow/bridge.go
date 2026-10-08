@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"github.com/purpshell/meowcaller"
 	"github.com/purpshell/meowcaller/signaling"
@@ -161,10 +162,24 @@ func (s *Session) offerOnItsWay(callID string) bool {
 	return engaged
 }
 
-// callRinging is meowcaller handing over a call it engaged. It runs on the dispatch,
+// engagesOfferFrom is the gate as the client it was installed on asks it: nothing is
+// engaged once that client is retired.
+func (s *Session) engagesOfferFrom(retired *atomic.Bool, event *waEvents.CallOffer) bool {
+	return !retired.Load() && s.engagesOffer(event)
+}
+
+// ringingFrom is meowcaller handing over a call it engaged. It runs on the dispatch,
 // before this session's own handler sees the same offer, so by the time callOffered runs
-// the call is here to build the browser's offer for.
-func (s *Session) callRinging(call *meowcaller.Call) { s.ringing(call) }
+// the call is here to build the browser's offer for. A call from a client already retired
+// belongs to an account this session no longer runs on that socket, and is dropped there
+// alone.
+func (s *Session) ringingFrom(retired *atomic.Bool, call bridgedCall) {
+	if retired.Load() {
+		call.Discard()
+		return
+	}
+	s.ringing(call)
+}
 
 func (s *Session) ringing(call bridgedCall) {
 	if !s.register(call.ID(), &liveCall{call: call}) {

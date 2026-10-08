@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1415,6 +1416,77 @@ func TestARetiredClientsHandlerIsFencedOffTheReplacement(t *testing.T) {
 	}
 }
 
+// The fence is wired to the meowcaller each client carries: an offer dispatched on the
+// retired client after a rebuild is not engaged, and the same offer on the replacement is.
+func TestARetiredClientsMeowcallerEngagesNothing(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	// The test session's first client was adopted before it had call media, so it carries
+	// no meowcaller; one rebuild gives it a client that does, which is the one retired.
+	if err := session.rebuild(t.Context()); err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	stalled := make(chan struct{})
+	t.Cleanup(func() { close(stalled) })
+	session.detach = func(*wm.Client, uint32) { <-stalled }
+	retired := session.current()
+	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+	defer cancel()
+	if err := session.rebuild(ctx); err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	replacement := session.current()
+
+	//nolint:staticcheck // SA1019: the dispatch a real socket drives is this one
+	retired.DangerousInternals().DispatchEvent(audioOffer("from-the-retired"))
+	if session.offerOnItsWay("from-the-retired") {
+		t.Fatal("the retired client's meowcaller engaged an offer")
+	}
+
+	//nolint:staticcheck // SA1019: as above
+	go replacement.DangerousInternals().DispatchEvent(audioOffer("from-the-replacement"))
+	deadline := time.Now().Add(testwait.Budget)
+	for !session.offerOnItsWay("from-the-replacement") {
+		if time.Now().After(deadline) {
+			t.Fatal("the replacement's meowcaller never engaged its offer")
+		}
+		time.Sleep(testwait.Poll)
+	}
+}
+
+// meowcaller's two callbacks are fenced with the client they were installed on, like the
+// session's own handler: once a rebuild has retired that client, an offer it is still
+// working through is not engaged, and a call it hands over is dropped on that client
+// alone, never registered on the session the replacement owns.
+func TestARetiredClientsCallsAreNotTakenUp(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	var retired atomic.Bool
+
+	if !session.engagesOfferFrom(&retired, audioOffer("call-1")) {
+		t.Fatal("a live client's offer was not engaged")
+	}
+	session.ringingFrom(&retired, &fakeCall{id: "call-1"})
+	if !carried(session, "call-1") {
+		t.Fatal("a live client's call was not taken up")
+	}
+
+	retired.Store(true)
+	if session.engagesOfferFrom(&retired, audioOffer("call-2")) {
+		t.Fatal("a retired client's offer was engaged")
+	}
+	call := &fakeCall{id: "call-2"}
+	session.ringingFrom(&retired, call)
+	if carried(session, "call-2") {
+		t.Fatal("a retired client's call was registered on the session")
+	}
+	call.mu.Lock()
+	defer call.mu.Unlock()
+	if !call.discarded || call.rejected != 0 || call.hungUp != 0 {
+		t.Fatalf("a retired client's call was discarded=%v, rejected %d, hung up %d: want dropped here alone", call.discarded, call.rejected, call.hungUp)
+	}
+}
+
 // A call.start stopped by its own deadline is answered with the deadline and keeps no
 // attempt, as the contract says of every command stopped that way, even when meowcaller
 // reports the stop as a failed offer write.
@@ -1524,4 +1596,11 @@ func TestARejectionThatDidNotGoOutIsSentAgain(t *testing.T) {
 	if len(declined) != 1 {
 		t.Fatalf("a rejection that landed was sent again: %v", declined)
 	}
+}
+
+// carried reports whether the session registered the call as one it carries.
+func carried(session *Session, callID string) bool {
+	session.bridge.mu.Lock()
+	defer session.bridge.mu.Unlock()
+	return session.bridge.live[callID] != nil
 }
