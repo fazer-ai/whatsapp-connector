@@ -2662,8 +2662,10 @@ func (s *Session) Delete(ctx context.Context) error {
 		return fmt.Errorf("whatsmeow: delete %s: %w", s.sid, neverSent(unlink))
 	}
 	// Whatever WhatsApp answered, this session is not coming back. settleLogout is what
-	// keeps a reconnect from dialling on credentials that are about to be gone.
+	// keeps a reconnect from dialling on credentials that are about to be gone, and the
+	// calls go now rather than with a recovery that may not come.
 	s.settleLogout()
+	s.goOffline(ctx)
 	switch {
 	case unlink == nil:
 	case nothingToUnlink:

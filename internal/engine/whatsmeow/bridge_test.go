@@ -1372,3 +1372,16 @@ func TestACallStartStoppedByItsDeadlineIsLeftForTheResend(t *testing.T) {
 		t.Fatalf("a call.start stopped by its deadline = %v, want the deadline's error", err)
 	}
 }
+
+// A session deleted during a call ends it, whatever the local cleanup after the unlink
+// makes of the device: here the store cannot be reached in time.
+func TestDeletingASessionEndsItsCalls(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	call, release := answeredCall(t, session, "call-1")
+	release()
+	session.logout = func(context.Context, *wm.Client) error { return nil }
+	session.storeLimit = time.Nanosecond
+	_ = session.Delete(t.Context())
+	hungUpWithin(t, call)
+}
