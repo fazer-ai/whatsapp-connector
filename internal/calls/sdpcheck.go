@@ -22,10 +22,8 @@ func usableAudio(text string) error {
 		if media.MediaName.Media != "audio" || media.MediaName.Port.Value == 0 {
 			continue
 		}
-		for _, direction := range []string{sdp.AttrKeySendOnly, sdp.AttrKeyRecvOnly, sdp.AttrKeyInactive} {
-			if _, set := media.Attribute(direction); set {
-				return fmt.Errorf("%w: its audio is %s, and a call needs voice both ways", ErrBadSDP, direction)
-			}
+		if direction := directionOf(&desc, media); direction != sdp.AttrKeySendRecv {
+			return fmt.Errorf("%w: its audio is %s, and a call needs voice both ways", ErrBadSDP, direction)
 		}
 		for _, needed := range []string{"ice-ufrag", "ice-pwd", "fingerprint"} {
 			if !hasAttribute(&desc, media, needed) {
@@ -38,6 +36,23 @@ func usableAudio(text string) error {
 }
 
 var errNoAudio = errors.New("it has no audio to carry a voice on")
+
+// directionOf is the direction an audio section ends up with: its own, or the session's
+// when it has none, or sendrecv when neither says.
+func directionOf(desc *sdp.SessionDescription, media *sdp.MediaDescription) string {
+	directions := []string{sdp.AttrKeySendRecv, sdp.AttrKeySendOnly, sdp.AttrKeyRecvOnly, sdp.AttrKeyInactive}
+	for _, direction := range directions {
+		if _, set := media.Attribute(direction); set {
+			return direction
+		}
+	}
+	for _, direction := range directions {
+		if _, set := desc.Attribute(direction); set {
+			return direction
+		}
+	}
+	return sdp.AttrKeySendRecv
+}
 
 // hasAttribute is whether an attribute is set on the media section or on the session,
 // where ICE credentials and fingerprints may be written once for every section.

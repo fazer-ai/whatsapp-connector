@@ -30,6 +30,7 @@ type bridgedCall interface {
 	OnEnd(func(reason string))
 	OnPeerAccept(func())
 	State() meowcaller.CallPhase
+	Discard()
 }
 
 // liveCall is one call this session carries the voice of, from the moment meowcaller
@@ -152,9 +153,11 @@ func (s *Session) callRinging(call *meowcaller.Call) { s.ringing(call) }
 
 func (s *Session) ringing(call bridgedCall) {
 	if !s.register(call.ID(), &liveCall{call: call}) {
-		// Engaged as the session closed or stopped carrying calls: left to ring on the
-		// account's other devices, as it would on a session that does not carry them.
-		// Refusing it from here would end it for every device.
+		// Engaged as the session closed or stopped carrying calls: dropped here alone,
+		// so meowcaller starts no media for it, and left to ring on the account's other
+		// devices, as it would on a session that does not carry them. Refusing it from
+		// here would end it for every device.
+		call.Discard()
 		return
 	}
 	id := call.ID()

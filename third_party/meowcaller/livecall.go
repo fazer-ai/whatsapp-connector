@@ -279,6 +279,11 @@ func (c *Call) IsReceivingVideo() bool {
 // if the call is not in a ringing state.
 func (c *Call) Answer() error { return c.eng.answer(c) }
 
+// Discard ends the call on this client alone: its media and its state here are torn
+// down, OnEnd fires with reason "discarded", and nothing is sent. The call goes on for
+// everybody else, ringing on the account's other devices as if this one had never seen it.
+func (c *Call) Discard() { c.eng.finishCall(c.id, "discarded") }
+
 // Reject declines an inbound call.
 func (c *Call) Reject() error { return c.eng.reject(c) }
 

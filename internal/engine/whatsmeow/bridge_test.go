@@ -64,6 +64,7 @@ type fakeCall struct {
 	answerStall chan struct{}
 	// onReceive runs when the voice is wired to the call.
 	onReceive func()
+	discarded bool
 }
 
 func (c *fakeCall) ID() string { return c.id }
@@ -105,6 +106,12 @@ func (c *fakeCall) signal(end func(string), reason string) error {
 		end(reason)
 	}
 	return nil
+}
+
+func (c *fakeCall) Discard() {
+	c.mu.Lock()
+	c.discarded = true
+	c.mu.Unlock()
 }
 
 func (c *fakeCall) State() meowcaller.CallPhase {
@@ -1234,7 +1241,14 @@ func TestAnOfferEngagedBeforeCallsWereTurnedOffIsNotCarried(t *testing.T) {
 				t.Fatal("the gate did not engage a voice call")
 			}
 			turnOff(session)
-			session.ringing(&fakeCall{id: "call-1"})
+			call := &fakeCall{id: "call-1"}
+			session.ringing(call)
+			call.mu.Lock()
+			discarded, rejected, hungUp := call.discarded, call.rejected, call.hungUp
+			call.mu.Unlock()
+			if !discarded || rejected+hungUp != 0 {
+				t.Fatalf("discarded %v, rejected %d, hung up %d; want it dropped here alone", discarded, rejected, hungUp)
+			}
 			session.handle(audioOffer("call-1"))
 			if _, carries := published(t, session, protocol.EventCallOffer, "event_call_offer")["sdp"]; carries {
 				t.Fatal("a call engaged before calls were turned off was offered with SDP")

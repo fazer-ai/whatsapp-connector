@@ -40,10 +40,13 @@ type Config struct {
 // Media is the WebRTC side of every call on this instance: one UDP socket, and the codec
 // table each browser leg is negotiated from.
 type Media struct {
-	api  *webrtc.API
-	mux  ice.UDPMux
-	port int
-	log  zerolog.Logger
+	api *webrtc.API
+	// probe builds the throwaway peers an SDP from the browser is tried on before it
+	// touches a call's. They gather nothing, from no interface, so they send nothing.
+	probe *webrtc.API
+	mux   ice.UDPMux
+	port  int
+	log   zerolog.Logger
 }
 
 // Open binds the media socket. It is opened when the process starts rather than with the
@@ -87,19 +90,39 @@ func Open(cfg Config, log zerolog.Logger) (*Media, error) {
 		}
 	}
 
+	codecs, err := browserMedia()
+	if err != nil {
+		_ = mux.Close()
+		return nil, err
+	}
+	probeCodecs, err := browserMedia()
+	if err != nil {
+		_ = mux.Close()
+		return nil, err
+	}
+	silent := webrtc.SettingEngine{}
+	silent.SetInterfaceFilter(func(string) bool { return false })
+	silent.SetIncludeLoopbackCandidate(false)
+	silent.SetICEMulticastDNSMode(ice.MulticastDNSModeDisabled)
+	return &Media{
+		api:   webrtc.NewAPI(webrtc.WithMediaEngine(codecs), webrtc.WithSettingEngine(settings)),
+		probe: webrtc.NewAPI(webrtc.WithMediaEngine(probeCodecs), webrtc.WithSettingEngine(silent)),
+		mux:   mux,
+		port:  bound.Port,
+		log:   log,
+	}, nil
+}
+
+// browserMedia is the codec table of a peer facing the browser. One per API: pion keeps
+// per-connection state in it.
+func browserMedia() (*webrtc.MediaEngine, error) {
 	codecs := &webrtc.MediaEngine{}
 	for _, codec := range browserCodecs {
 		if err := codecs.RegisterCodec(codec, webrtc.RTPCodecTypeAudio); err != nil {
-			_ = mux.Close()
 			return nil, fmt.Errorf("calls: register %s: %w", codec.MimeType, err)
 		}
 	}
-	return &Media{
-		api:  webrtc.NewAPI(webrtc.WithMediaEngine(codecs), webrtc.WithSettingEngine(settings)),
-		mux:  mux,
-		port: bound.Port,
-		log:  log,
-	}, nil
+	return codecs, nil
 }
 
 // Port is the UDP port the media socket is bound to.
@@ -159,15 +182,11 @@ func (m *Media) answerable(offer string) error {
 	if err := usableAudio(offer); err != nil {
 		return err
 	}
-	probe, err := m.api.NewPeerConnection(webrtc.Configuration{})
+	probe, err := m.probePeer()
 	if err != nil {
-		return fmt.Errorf("calls: new peer: %w", err)
+		return err
 	}
 	defer func() { _ = probe.Close() }()
-	if _, err := probe.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio,
-		webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionSendrecv}); err != nil {
-		return fmt.Errorf("calls: add the audio track: %w", err)
-	}
 	if err := probe.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: offer}); err != nil {
 		return fmt.Errorf("%w: %w", ErrBadSDP, err)
 	}
@@ -177,6 +196,46 @@ func (m *Media) answerable(offer string) error {
 		return fmt.Errorf("%w: %w", ErrBadSDP, err)
 	}
 	return nil
+}
+
+// acceptable is whether the browser's answer to one of this side's offers can be applied.
+// pion commits an answer before it has finished checking it, so an answer it refuses
+// halfway leaves the peer it was applied to unable to take a corrected one: it is tried on
+// a throwaway peer first, with an offer of the same shape.
+func (m *Media) acceptable(answer string) error {
+	if err := usableAudio(answer); err != nil {
+		return err
+	}
+	probe, err := m.probePeer()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = probe.Close() }()
+	offer, err := probe.CreateOffer(nil)
+	if err == nil {
+		err = probe.SetLocalDescription(offer)
+	}
+	if err != nil {
+		return fmt.Errorf("calls: build a probe offer: %w", err)
+	}
+	if err := probe.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: answer}); err != nil {
+		return fmt.Errorf("%w: %w", ErrBadSDP, err)
+	}
+	return nil
+}
+
+// probePeer is a throwaway peer with the one audio section a call's has.
+func (m *Media) probePeer() (*webrtc.PeerConnection, error) {
+	probe, err := m.probe.NewPeerConnection(webrtc.Configuration{})
+	if err != nil {
+		return nil, fmt.Errorf("calls: new peer: %w", err)
+	}
+	if _, err := probe.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio,
+		webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionSendrecv}); err != nil {
+		_ = probe.Close()
+		return nil, fmt.Errorf("calls: add the audio track: %w", err)
+	}
+	return probe, nil
 }
 
 // ErrBadSDP is an SDP from the browser this side cannot use: unreadable, or with no codec

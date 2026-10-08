@@ -32,6 +32,11 @@ func TestAnAnswerWithoutAVoiceBothWaysLeavesThePeerAsItWas(t *testing.T) {
 		"no ice-ufrag":   drop(`(?m)^a=ice-ufrag:.*\r?\n`),
 		"no ice-pwd":     drop(`(?m)^a=ice-pwd:.*\r?\n`),
 		"audio rejected": regexp.MustCompile(`m=audio \d+`).ReplaceAllString(good, "m=audio 0"),
+		// Present and malformed: pion commits the answer before it reads this, and
+		// refuses it after.
+		"a fingerprint with no value": regexp.MustCompile(`(?m)^a=fingerprint:(\S+) \S+`).ReplaceAllString(good, "a=fingerprint:$1"),
+		// The direction set for the whole session, and none on the audio.
+		"receive only for the session": strings.Replace(strings.Replace(good, "a=sendrecv\r\n", "", 1), "t=0 0\r\n", "t=0 0\r\na=recvonly\r\n", 1),
 	} {
 		if bad == good {
 			t.Fatalf("%s: the edit changed nothing, so the case tests nothing", name)

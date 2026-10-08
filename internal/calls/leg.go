@@ -26,6 +26,7 @@ const (
 // Leg is the browser half of one call: a WebRTC peer, and the two queues between it and
 // meowcaller.
 type Leg struct {
+	media *Media
 	pc    *webrtc.PeerConnection
 	track *audioTrack
 	log   zerolog.Logger
@@ -57,7 +58,7 @@ func (m *Media) newLeg(log zerolog.Logger) (*Leg, error) {
 		return nil, fmt.Errorf("calls: add the audio track: %w", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	leg := &Leg{pc: pc, track: track, log: log, ctx: ctx, cancel: cancel}
+	leg := &Leg{media: m, pc: pc, track: track, log: log, ctx: ctx, cancel: cancel}
 	pc.OnTrack(leg.listen)
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
 		leg.log.Debug().Str("state", state.String()).Msg("browser peer")
@@ -122,7 +123,7 @@ func (l *Leg) Answer(ctx context.Context) (string, error) {
 
 // Accept applies the browser's answer to the connector's offer.
 func (l *Leg) Accept(answer string) error {
-	if err := usableAudio(answer); err != nil {
+	if err := l.media.acceptable(answer); err != nil {
 		return err
 	}
 	if err := l.pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: answer}); err != nil {
