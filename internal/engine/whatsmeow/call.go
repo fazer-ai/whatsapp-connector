@@ -225,7 +225,7 @@ func (s *Session) callOffered(meta *waTypes.BasicCallMeta, media callMedia, grou
 	// Only a call meowcaller engaged gets an SDP, and its gate is what decided that: a
 	// session that does not answer calls, a group call and a video call are offered the
 	// way they always were.
-	s.emitMoment(protocol.EventCallOffer, callOfferPayload{callOffer: offer, SDP: s.offerToBrowser(meta.CallID)})
+	s.emitMoment(protocol.EventCallOffer, callOfferPayload{callOffer: offer, SDP: s.offerToBrowser(meta.CallID, meta.CallCreator)})
 	return true
 }
 

@@ -10,6 +10,7 @@ import (
 	"github.com/purpshell/meowcaller"
 	"github.com/purpshell/meowcaller/signaling"
 	"github.com/rs/zerolog"
+	waTypes "go.mau.fi/whatsmeow/types"
 	waEvents "go.mau.fi/whatsmeow/types/events"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/calls"
@@ -46,6 +47,8 @@ type liveCall struct {
 	// accepting is a call.accept whose browser answer is applied and whose answer on
 	// WhatsApp may still be on its way: a repeat has nothing left to do.
 	accepting bool
+	// creator is who rang a received call, which is what a rejection is addressed to.
+	creator waTypes.JID
 	// answered is closed once `call.answered` for a placed call has been queued, or
 	// given up on. Nil until the callee picks up. The call's end waits for it, so the
 	// client never reads the end of a call before its answer.
@@ -77,6 +80,11 @@ type bridgeState struct {
 	// offline is a session an operator disconnected or logged out: no call registers on
 	// it until the next connect, or one engaged as the socket went would outlive it.
 	offline bool
+	// unrejected is the received calls whose rejection did not go out, by who rang them.
+	// meowcaller ends a call here before it writes the rejection, so a failed write leaves
+	// nothing of the call to retry with, and the call ringing on the account's other
+	// devices; a retried call.terminate rejects it again from this.
+	unrejected map[string]waTypes.JID
 }
 
 // callOfferPayload is `call.offer` as this session publishes it once it carries calls.
@@ -191,9 +199,12 @@ func (s *Session) register(id string, live *liveCall) bool {
 // returns the SDP the `call.offer` carries. Empty when there is no such call or the leg
 // could not be built: the offer is then published without one, and the call is left to
 // ring, which is what a client that cannot answer it sees anyway.
-func (s *Session) offerToBrowser(callID string) string {
+func (s *Session) offerToBrowser(callID string, creator waTypes.JID) string {
 	s.bridge.mu.Lock()
 	live := s.bridge.live[callID]
+	if live != nil {
+		live.creator = creator
+	}
 	s.bridge.mu.Unlock()
 	if live == nil || live.outbound {
 		return ""
@@ -540,7 +551,15 @@ func (s *Session) terminateCall(ctx context.Context, command *protocol.Command) 
 	s.bridge.mu.Lock()
 	live := s.bridge.live[req.CallID]
 	answered := live != nil && (live.outbound || live.accepted)
+	var creator waTypes.JID
+	if live != nil {
+		creator = live.creator
+	}
+	unrejected, retry := s.bridge.unrejected[req.CallID]
 	s.bridge.mu.Unlock()
+	if live == nil && retry {
+		return s.rejectAgain(ctx, req.CallID, unrejected)
+	}
 	if live == nil {
 		return nil, nil
 	}
@@ -549,11 +568,49 @@ func (s *Session) terminateCall(ctx context.Context, command *protocol.Command) 
 		end = live.call.Hangup
 	}
 	if err := signal(ctx, end); err != nil {
+		if !answered && !creator.IsEmpty() {
+			s.rememberUnrejected(req.CallID, creator)
+		}
 		if ctx.Err() != nil {
 			return nil, fmt.Errorf("end call %s: %w", req.CallID, ctx.Err())
 		}
 		return nil, protocol.NewError(protocol.ErrorWaError, "WhatsApp did not take the end of the call")
 	}
+	return nil, nil
+}
+
+// rememberUnrejected keeps a received call whose rejection did not go out, for a retry.
+// Bounded like the other per-call records: a session that runs for weeks would otherwise
+// keep every call whose rejection ever failed.
+func (s *Session) rememberUnrejected(callID string, creator waTypes.JID) {
+	s.bridge.mu.Lock()
+	defer s.bridge.mu.Unlock()
+	if s.bridge.unrejected == nil {
+		s.bridge.unrejected = make(map[string]waTypes.JID)
+	}
+	if len(s.bridge.unrejected) >= unrejectedLimit {
+		clear(s.bridge.unrejected)
+	}
+	s.bridge.unrejected[callID] = creator
+}
+
+// unrejectedLimit bounds the calls kept for a retried rejection. A failed rejection is a
+// socket going, and a handful is what a burst of those leaves.
+const unrejectedLimit = 64
+
+// rejectAgain is a retried call.terminate of a received call whose rejection did not go
+// out the first time: meowcaller has nothing of it left, so the rejection is written the
+// way calls.auto_reject writes one.
+func (s *Session) rejectAgain(ctx context.Context, callID string, creator waTypes.JID) (json.RawMessage, error) {
+	if err := s.declineCall(ctx, s.current(), creator, callID); err != nil {
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("end call %s: %w", callID, ctx.Err())
+		}
+		return nil, protocol.NewError(protocol.ErrorWaError, "WhatsApp did not take the end of the call")
+	}
+	s.bridge.mu.Lock()
+	delete(s.bridge.unrejected, callID)
+	s.bridge.mu.Unlock()
 	return nil, nil
 }
 

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -65,6 +66,8 @@ type fakeCall struct {
 	// onReceive runs when the voice is wired to the call.
 	onReceive func()
 	discarded bool
+	// rejectFail is what Reject returns, after ending the call locally as meowcaller does.
+	rejectFail error
 }
 
 func (c *fakeCall) ID() string { return c.id }
@@ -82,9 +85,12 @@ func (c *fakeCall) Answer() error {
 func (c *fakeCall) Reject() error {
 	c.mu.Lock()
 	c.rejected++
-	end := c.onEnd
+	end, fail := c.onEnd, c.rejectFail
 	c.mu.Unlock()
-	return c.signal(end, "rejected")
+	if err := c.signal(end, "rejected"); err != nil {
+		return err
+	}
+	return fail
 }
 
 func (c *fakeCall) Hangup() error {
@@ -1384,4 +1390,36 @@ func TestDeletingASessionEndsItsCalls(t *testing.T) {
 	session.storeLimit = time.Nanosecond
 	_ = session.Delete(t.Context())
 	hungUpWithin(t, call)
+}
+
+// meowcaller ends a call here before it writes the rejection, so a rejection that did not
+// go out leaves nothing of the call to retry with. A retried call.terminate rejects it
+// again, to whoever rang, and once that lands a further one is nothing new.
+func TestARejectionThatDidNotGoOutIsSentAgain(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	var declined []string
+	session.declineCall = func(_ context.Context, _ *wm.Client, caller waTypes.JID, callID string) error {
+		declined = append(declined, callID+" to "+caller.User)
+		return nil
+	}
+	call := &fakeCall{id: "call-1", rejectFail: errors.New("write: broken pipe")}
+	session.ringing(call)
+	session.handle(audioOffer("call-1"))
+	published(t, session, protocol.EventCallOffer, "event_call_offer")
+
+	_, err := session.Execute(t.Context(), command(protocol.CommandCallTerminate, `{"call_id":"call-1"}`))
+	assertCode(t, err, protocol.ErrorWaError)
+	if _, err := session.Execute(t.Context(), command(protocol.CommandCallTerminate, `{"call_id":"call-1"}`)); err != nil {
+		t.Fatalf("the retried rejection = %v", err)
+	}
+	if want := []string{"call-1 to " + callMeta("call-1").CallCreator.User}; !slices.Equal(declined, want) {
+		t.Fatalf("declined %v, want %v", declined, want)
+	}
+	if _, err := session.Execute(t.Context(), command(protocol.CommandCallTerminate, `{"call_id":"call-1"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if len(declined) != 1 {
+		t.Fatalf("a rejection that landed was sent again: %v", declined)
+	}
 }
