@@ -54,6 +54,10 @@ type bridgeState struct {
 	// told is the calls whose end has been published, whichever path published it:
 	// whatsmeow's terminate and meowcaller's end both report one call.
 	told ring
+	// engaged is the calls meowcaller's gate let through. The gate runs before meowcaller
+	// decrypts the offer and preaccepts it, which can take a while, so this is what says
+	// an `offer` is on its way to callOffered before the call is registered as live.
+	engaged ring
 }
 
 // callOfferPayload is `call.offer` as this session publishes it once it carries calls.
@@ -105,7 +109,22 @@ func (s *Session) engagesOffer(event *waEvents.CallOffer) bool {
 		return false
 	}
 	media := mediaOfOffer(event.Data)
-	return media.known && !media.video
+	if !media.known || media.video {
+		return false
+	}
+	s.bridge.mu.Lock()
+	s.bridge.engaged.add(event.CallID)
+	s.bridge.mu.Unlock()
+	return true
+}
+
+// offerOnItsWay reports whether meowcaller engaged a call's `offer`, which then reaches
+// callOffered with the browser's SDP to publish.
+func (s *Session) offerOnItsWay(callID string) bool {
+	s.bridge.mu.Lock()
+	defer s.bridge.mu.Unlock()
+	_, engaged := s.bridge.engaged.seen[callID]
+	return engaged
 }
 
 // callRinging is meowcaller handing over a call it engaged. It runs on the dispatch,
@@ -214,7 +233,7 @@ func (s *Session) firstEndOf(callID string) bool {
 // acceptCall carries out `call.accept`: the browser's answer is applied, and only then is
 // the call answered on WhatsApp, so the person never hears a connected call with nobody
 // behind it.
-func (s *Session) acceptCall(_ context.Context, command *protocol.Command) (json.RawMessage, error) {
+func (s *Session) acceptCall(ctx context.Context, command *protocol.Command) (json.RawMessage, error) {
 	if !s.answersCalls() {
 		return nil, engine.ErrNotSupported
 	}
@@ -245,10 +264,21 @@ func (s *Session) acceptCall(_ context.Context, command *protocol.Command) (json
 	if err := live.leg.Accept(req.SDP); err != nil {
 		return nil, protocol.NewError(protocol.ErrorInvalidPayload, "the browser's answer is not an SDP this connector can use")
 	}
-	if err := live.call.Answer(); err != nil {
+	// The voice is wired by whoever sees the answer go through, which is not this
+	// command when its deadline passed first: the accept can still land after that.
+	err := signal(ctx, func() error {
+		if err := live.call.Answer(); err != nil {
+			return err
+		}
+		s.wire(live)
+		return nil
+	})
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("accept call %s: %w", req.CallID, ctx.Err())
+		}
 		return nil, protocol.NewError(protocol.ErrorWaError, "WhatsApp did not take the answer to the call")
 	}
-	s.wire(live)
 	return nil, nil
 }
 
@@ -318,7 +348,10 @@ func (s *Session) startCall(ctx context.Context, command *protocol.Command) (jso
 	if err != nil {
 		_ = leg.Close()
 		log.Warn().Err(err).Msg("meowcaller could not place the call")
-		return nil, protocol.NewError(protocol.ErrorWaError, "WhatsApp did not take the call")
+		// The offer is the write, and meowcaller can fail after it went out: the
+		// callee's phone may be ringing, and a retry under the same key must not ring
+		// it again.
+		return nil, engine.MayHaveLanded(protocol.NewError(protocol.ErrorWaError, "WhatsApp did not take the call"))
 	}
 	id := call.ID()
 	live := &liveCall{call: call, leg: leg, outbound: true}
@@ -355,8 +388,22 @@ func (s *Session) calleeAnswered(live *liveCall, log zerolog.Logger) {
 		}
 		return
 	}
+	// A call that ended before this has its leg closed, and the answer above fails. One
+	// that ends from here on may be wired for nothing, which costs nothing, and is checked
+	// for, and published, under the lock callFinished ends the call under: it is not
+	// reported answered after its end.
 	s.wire(live)
-	s.emit(protocol.EventCallAnswered, callAnswered{CallID: id, SDP: answer})
+	s.bridge.mu.Lock()
+	defer s.bridge.mu.Unlock()
+	if s.bridge.live[id] != live {
+		return
+	}
+	// Off the dispatch: this runs inside meowcaller's handler of the callee's accept, and
+	// an inbox with no room must not hold up whatever WhatsApp sends next, the end of
+	// this same call included.
+	if !s.offer(&engine.Emission{Type: protocol.EventCallAnswered}, callAnswered{CallID: id, SDP: answer}, offDispatch) {
+		log.Warn().Str("call_id", id).Msg("could not queue call.answered, with too many events already waiting for room")
+	}
 }
 
 // dialOverCaller places a call through meowcaller on the current client.
@@ -421,10 +468,14 @@ func signal(ctx context.Context, send func() error) error {
 // already done sends them without waiting at all. meowcaller ends each call locally before
 // it writes the terminate, so the voice stops here whether or not the write lands.
 func (s *Session) endCalls(ctx context.Context) {
+	type carried struct {
+		call bridgedCall
+		leg  *calls.Leg
+	}
 	s.bridge.mu.Lock()
-	live := make([]*liveCall, 0, len(s.bridge.live))
+	live := make([]carried, 0, len(s.bridge.live))
 	for _, call := range s.bridge.live {
-		live = append(live, call)
+		live = append(live, carried{call.call, call.leg})
 	}
 	s.bridge.mu.Unlock()
 	if len(live) == 0 {
@@ -438,6 +489,9 @@ func (s *Session) endCalls(ctx context.Context) {
 	if ctx.Err() != nil {
 		s.log.Debug().Int("calls", len(live)).Msg("hung up the calls of a session without waiting for the writes")
 	}
+	// A leg attached after the snapshot belongs to a call that is still live, and is
+	// closed by callFinished once its hang-up lands, or by offerToBrowser if it already
+	// has.
 	for _, call := range live {
 		if call.leg != nil {
 			_ = call.leg.Close()

@@ -128,14 +128,15 @@ type rejectRequest struct {
 // offer can be given, and the client would be left with a call it cannot answer. The offer
 // arriving first publishes it, and the notice's turn then finds the call already offered;
 // an offer that never arrives leaves the notice to publish the call without SDP, unless
-// the call ended in the meantime and its end is already out.
+// the call ended in the meantime and its end is already out, or meowcaller engaged the
+// offer and is still working through it.
 func (s *Session) callNoticed(meta *waTypes.BasicCallMeta, media callMedia, group bool) bool {
 	if s.callMedia == nil || group || (media.known && media.video) || !s.answersCalls() {
 		return s.callOffered(meta, media, group)
 	}
 	held := *meta
 	time.AfterFunc(s.offerWait, func() {
-		if s.ctx.Err() == nil && !s.endPublished(held.CallID) {
+		if s.ctx.Err() == nil && !s.endPublished(held.CallID) && !s.offerOnItsWay(held.CallID) {
 			s.callOffered(&held, media, group)
 		}
 	})

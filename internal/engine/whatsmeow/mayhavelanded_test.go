@@ -46,6 +46,9 @@ func TestEveryWriteAReservedCommandMakesIsMarked(t *testing.T) {
 		protocol.CommandGroupDescriptionSet:     {{"SetGroupTopic", "session.go"}},
 		protocol.CommandGroupPhotoSet:           {{"SetGroupPhoto", "session.go"}},
 		protocol.CommandGroupInviteGet:          {{"GetGroupInviteLink", "session.go"}},
+		// The seam meowcaller's Call is reached through, which is where startCall sees
+		// the failure.
+		protocol.CommandCallStart: {{"dialCall", "bridge.go"}},
 		protocol.CommandGroupSettingsSet: {
 			{"SetGroupAnnounce", "session.go"},
 			{"SetGroupLocked", "session.go"},

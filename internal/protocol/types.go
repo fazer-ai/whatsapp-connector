@@ -316,7 +316,9 @@ var RepeatableCommands = map[CommandType]bool{
 // running it again on top of state that has since moved writes something nobody asked for.
 // A participant added or removed, a read marker set over one the user has since cleared, a
 // group's name or photo put back to what it was, an invite link rotated a second time, a
-// pairing code that invalidates the one the operator is typing.
+// pairing code that invalidates the one the operator is typing. And one that is not a value
+// but has the same cost: `call.start` rings somebody's phone, and a redelivery of one whose
+// answer was lost would ring it a second time, as a new call.
 //
 // What is deliberately absent, with the reason:
 //
@@ -347,6 +349,7 @@ var ReservedCommands = map[CommandType]bool{
 	CommandGroupPhotoSet:           true,
 	CommandGroupSettingsSet:        true,
 	CommandGroupInviteGet:          true,
+	CommandCallStart:               true,
 }
 
 // messageIDKeyed are the commands whose `message_id` names the message the command
