@@ -1215,3 +1215,36 @@ fill:
 		t.Fatalf("published %v, want the answer before the end", order)
 	}
 }
+
+// An offer meowcaller engaged under one policy and handed over after the session stopped
+// carrying calls -- a connect turned them off, or put the session on a proxy, while the
+// offer was being decrypted -- is not taken up: it is offered without SDP and nothing of
+// it is carried.
+func TestAnOfferEngagedBeforeCallsWereTurnedOffIsNotCarried(t *testing.T) {
+	t.Parallel()
+	for name, turnOff := range map[string]func(*Session){
+		"the policy":  func(s *Session) { s.setCallPolicy(false, false) },
+		"a proxy":     func(s *Session) { s.setProxy("http://proxy.example:3128") },
+		"mid-connect": func(s *Session) { s.bridge.mu.Lock(); s.bridge.pausing++; s.bridge.mu.Unlock() },
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			session := newCallSession(t)
+			if !session.engagesOffer(audioOffer("call-1")) {
+				t.Fatal("the gate did not engage a voice call")
+			}
+			turnOff(session)
+			session.ringing(&fakeCall{id: "call-1"})
+			session.handle(audioOffer("call-1"))
+			if _, carries := published(t, session, protocol.EventCallOffer, "event_call_offer")["sdp"]; carries {
+				t.Fatal("a call engaged before calls were turned off was offered with SDP")
+			}
+			session.bridge.mu.Lock()
+			left := len(session.bridge.live)
+			session.bridge.mu.Unlock()
+			if left != 0 {
+				t.Fatalf("%d calls carried after calls were turned off", left)
+			}
+		})
+	}
+}

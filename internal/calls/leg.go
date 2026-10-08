@@ -122,6 +122,9 @@ func (l *Leg) Answer(ctx context.Context) (string, error) {
 
 // Accept applies the browser's answer to the connector's offer.
 func (l *Leg) Accept(answer string) error {
+	if err := usableAudio(answer); err != nil {
+		return err
+	}
 	if err := l.pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: answer}); err != nil {
 		return fmt.Errorf("%w: %w", ErrBadSDP, err)
 	}

@@ -68,6 +68,11 @@ type bridgeState struct {
 	// closed is a session that is closing: a call registered after its calls were ended
 	// would escape that, so none is.
 	closed bool
+	// pausing counts the connects turning calls off that are under way: from the moment
+	// one ends the calls the session carries until its policy and route are in place, an
+	// offer meowcaller engaged under the old policy would otherwise register after the
+	// end, on the new route.
+	pausing int
 }
 
 // callOfferPayload is `call.offer` as this session publishes it once it carries calls.
@@ -147,19 +152,21 @@ func (s *Session) callRinging(call *meowcaller.Call) { s.ringing(call) }
 
 func (s *Session) ringing(call bridgedCall) {
 	if !s.register(call.ID(), &liveCall{call: call}) {
-		// Rang as the session closed: left to ring on the account's other devices,
-		// as it would on a session that does not carry calls.
+		// Engaged as the session closed or stopped carrying calls: left to ring on the
+		// account's other devices, as it would on a session that does not carry them.
+		// Refusing it from here would end it for every device.
 		return
 	}
 	id := call.ID()
 	call.OnEnd(func(reason string) { s.callFinished(id, reason) })
 }
 
-// register records a call this session carries, unless the session is closing.
+// register records a call this session carries, unless the session is closing, a
+// connect is turning calls off, or the policy it was engaged under has changed since.
 func (s *Session) register(id string, live *liveCall) bool {
 	s.bridge.mu.Lock()
 	defer s.bridge.mu.Unlock()
-	if s.bridge.closed {
+	if s.bridge.closed || s.bridge.pausing > 0 || !s.answersCalls() {
 		return false
 	}
 	if s.bridge.live == nil {
@@ -426,8 +433,9 @@ func (s *Session) startCall(ctx context.Context, command *protocol.Command) (jso
 	id := call.ID()
 	live := &liveCall{call: call, leg: leg, outbound: true}
 	if !s.register(id, live) {
-		// The session closed while the callee was being rung, after its calls were
-		// ended: this one is ended here, or it would ring with nobody behind it.
+		// The session closed, or stopped carrying calls, while the callee was being
+		// rung, after its calls were ended: this one is ended here, or it would ring
+		// with nobody behind it.
 		_ = leg.Close()
 		go func() { _ = call.Hangup() }()
 		return nil, engine.MayHaveLanded(protocol.NewError(protocol.ErrorWaError, "the session closed as the call was placed"))

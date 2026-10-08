@@ -1915,7 +1915,16 @@ func (s *Session) Connect(ctx context.Context, req engine.ConnectRequest) error 
 	if req.Calls == nil || !req.Calls.Answer || req.Calls.AutoReject || req.ProxyURL() != "" {
 		// A connect that stops this session carrying calls ends the ones it carries
 		// first: on a proxy their media would go on leaving from this host's address,
-		// and with the policy off nothing could end them any more.
+		// and with the policy off nothing could end them any more. No call registers
+		// from here until this connect returns, with its policy and route in place.
+		s.bridge.mu.Lock()
+		s.bridge.pausing++
+		s.bridge.mu.Unlock()
+		defer func() {
+			s.bridge.mu.Lock()
+			s.bridge.pausing--
+			s.bridge.mu.Unlock()
+		}()
 		s.endCalls(ctx)
 	}
 	s.setCallPolicy(req.Calls != nil && req.Calls.AutoReject, req.Calls != nil && req.Calls.Answer)
