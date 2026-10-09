@@ -81,14 +81,14 @@ services:
       WAC_MEDIA_ROOT: /data/media
       WAC_MEDIA_TOKEN: ${WAC_MEDIA_TOKEN:?set WAC_MEDIA_TOKEN}
       # Calls are off in this example. To carry the voice of WhatsApp calls answered or
-      # placed in the browser, uncomment the two lines below and the UDP port under
-      # `ports`, and set WAC_CALLS_PUBLIC_IP in .env to the address the agents' browsers
-      # reach this host at: inside a container the connector only knows the container's own
-      # address, which no browser can reach.
+      # placed in the browser, uncomment the two lines below and set WAC_CALLS_PUBLIC_IP in
+      # .env to the address the agents' browsers reach this host at: inside a container the
+      # connector only knows the container's own address, which no browser can reach. The
+      # UDP port below is published either way; nothing listens on it until calls are on.
       # WAC_CALLS_UDP_PORT: '40000'
       # WAC_CALLS_PUBLIC_IP: ${WAC_CALLS_PUBLIC_IP:?set WAC_CALLS_PUBLIC_IP to the address the browsers reach this host at}
-    # ports:
-    #   - '40000:40000/udp'
+    ports:
+      - '40000:40000/udp'
     volumes:
       - whatsapp-connector:/data
     # the image is distroless and carries its own HEALTHCHECK (/connector healthcheck)
