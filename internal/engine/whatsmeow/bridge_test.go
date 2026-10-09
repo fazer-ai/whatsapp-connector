@@ -1639,6 +1639,100 @@ func TestAHangupThatDidNotGoOutIsSentAgain(t *testing.T) {
 	}
 }
 
+// The hang-ups the connector makes on its own are kept for the retry the same way: a
+// browser that went away, or one that could not answer the callee, leaves a call whose
+// terminate may not have gone out, and a call.terminate from the client writes it again.
+func TestAHangupTheConnectorMadeItselfIsSentAgainWhenItDidNotGoOut(t *testing.T) {
+	t.Parallel()
+	for name, hangUp := range map[string]func(t *testing.T, session *Session) *fakeCall{
+		"the browser was lost": func(t *testing.T, session *Session) *fakeCall {
+			call, release := answeredCall(t, session, "call-1")
+			release()
+			call.mu.Lock()
+			call.hangupFail = errors.New("write: broken pipe")
+			call.mu.Unlock()
+			session.browserLost("call-1")
+			return call
+		},
+		"the browser could not answer the callee": func(t *testing.T, session *Session) *fakeCall {
+			call := &fakeCall{id: "call-1", hangupFail: errors.New("write: broken pipe")}
+			placeCall(t, session, call)
+			session.bridge.mu.Lock()
+			leg := session.bridge.live["call-1"].leg
+			session.bridge.mu.Unlock()
+			_ = leg.Close()
+			call.mu.Lock()
+			accepted := call.onAccept
+			call.mu.Unlock()
+			accepted()
+			return call
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			session := newCallSession(t)
+			call := hangUp(t, session)
+			if _, err := session.Execute(t.Context(), command(protocol.CommandCallTerminate, `{"call_id":"call-1"}`)); err != nil {
+				t.Fatalf("the retried hangup = %v", err)
+			}
+			call.mu.Lock()
+			defer call.mu.Unlock()
+			if call.hungUp != 1 || call.hungUpAgain != 1 {
+				t.Fatalf("hung up %d times and again %d times, want once each", call.hungUp, call.hungUpAgain)
+			}
+		})
+	}
+}
+
+// A call placed on a client that a rebuild retired during the dial is not registered on
+// the replacement: it is hung up, and the command answers that it may have rung.
+func TestACallPlacedAcrossARebuildIsNotKept(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	call := &fakeCall{id: "call-1", signalled: make(chan struct{}, 4)}
+	session.onWhatsApp = func(_ context.Context, _ *wm.Client, phones []string) ([]waTypes.IsOnWhatsAppResponse, error) {
+		return []waTypes.IsOnWhatsAppResponse{{Query: phones[0], IsIn: true,
+			JID: waTypes.NewJID("5541999990000", waTypes.DefaultUserServer)}}, nil
+	}
+	session.dialCall = func(ctx context.Context, _ string) (bridgedCall, error) {
+		if err := session.rebuild(ctx); err != nil {
+			t.Errorf("rebuild: %v", err)
+		}
+		return call, nil
+	}
+	start := &protocol.Command{
+		ID: "c1", Type: protocol.CommandCallStart, IdempotencyKey: "k1",
+		Payload: json.RawMessage(`{"to":{"kind":"phone","id":"5541999990000"},"sdp":` + mustJSON(t, browserOffer(t)) + `}`),
+	}
+	if _, err := session.Execute(t.Context(), start); !errors.Is(err, engine.ErrMayHaveLanded) {
+		t.Fatalf("a call placed across a rebuild = %v, want it marked as maybe rung", err)
+	}
+	if carried(session, "call-1") {
+		t.Fatal("a call placed on a retired client was registered on its replacement")
+	}
+	hungUpWithin(t, call)
+}
+
+// A call handed over just as its client was retired is not registered, even when the
+// fence was still clear on the way in: register reads it again under the lock the
+// rebuild's cleanup takes its list under.
+func TestACallFromARetiredClientIsNotRegistered(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	var retired atomic.Bool
+	retired.Store(true)
+	call := &fakeCall{id: "call-1"}
+	session.ringingOn(&retired, call)
+	if carried(session, "call-1") {
+		t.Fatal("a call from a retired client was registered")
+	}
+	call.mu.Lock()
+	defer call.mu.Unlock()
+	if !call.discarded {
+		t.Fatal("a call from a retired client was not dropped on that client")
+	}
+}
+
 // meowcaller ends a call here before it writes the rejection, so a rejection that did not
 // go out leaves nothing of the call to retry with. A retried call.terminate rejects it
 // again, to whoever rang, and once that lands a further one is nothing new.

@@ -181,16 +181,22 @@ func (s *Session) engagesOfferFrom(retired *atomic.Bool, event *waEvents.CallOff
 // the call is here to build the browser's offer for. A call from a client already retired
 // belongs to an account this session no longer runs on that socket, and is dropped there
 // alone.
+//
+// The fence is read again where the call is registered, under the lock the rebuild's
+// cleanup takes its list of calls under: read only on the way in, a call handed over just
+// as the client was retired could register after that list was taken, and outlive it.
 func (s *Session) ringingFrom(retired *atomic.Bool, call bridgedCall) {
 	if retired.Load() {
 		call.Discard()
 		return
 	}
-	s.ringing(call)
+	s.ringingOn(retired, call)
 }
 
-func (s *Session) ringing(call bridgedCall) {
-	if !s.register(call.ID(), &liveCall{call: call}) {
+func (s *Session) ringing(call bridgedCall) { s.ringingOn(s.currentRetirement(), call) }
+
+func (s *Session) ringingOn(retired *atomic.Bool, call bridgedCall) {
+	if !s.register(call.ID(), &liveCall{call: call}, retired) {
 		// Engaged as the session closed or stopped carrying calls: dropped here alone,
 		// so meowcaller starts no media for it, and left to ring on the account's other
 		// devices, as it would on a session that does not carry them. Refusing it from
@@ -208,11 +214,12 @@ func (s *Session) ringing(call bridgedCall) {
 }
 
 // register records a call this session carries, unless the session is closing, a
-// connect is turning calls off, or the policy it was engaged under has changed since.
-func (s *Session) register(id string, live *liveCall) bool {
+// connect is turning calls off, the policy it was engaged under has changed since, or the
+// client it came on has been retired.
+func (s *Session) register(id string, live *liveCall, retired *atomic.Bool) bool {
 	s.bridge.mu.Lock()
 	defer s.bridge.mu.Unlock()
-	if s.bridge.closed || s.bridge.offline || s.bridge.pausing > 0 || !s.answersCalls() {
+	if s.bridge.closed || s.bridge.offline || s.bridge.pausing > 0 || !s.answersCalls() || retired.Load() {
 		return false
 	}
 	if s.bridge.live == nil {
@@ -268,6 +275,7 @@ func (s *Session) browserLost(callID string) {
 	s.log.Warn().Str("call_id", callID).Msg("the browser peer of a call was lost; hanging up")
 	if err := live.call.Hangup(); err != nil {
 		s.log.Warn().Err(err).Str("call_id", callID).Msg("could not hang up a call whose browser was lost")
+		s.rememberUnended(callID, live.call)
 	}
 }
 
@@ -465,6 +473,9 @@ func (s *Session) startCall(ctx context.Context, command *protocol.Command) (jso
 		}
 		return nil, protocol.NewError(protocol.ErrorInternal, "the connector could not prepare the call")
 	}
+	// The client the call is placed on, taken before the dial: a rebuild during it retires
+	// that client, and the call is not registered on the one that replaced it.
+	retired := s.currentRetirement()
 	call, err := s.dialCall(ctx, target)
 	if err != nil {
 		_ = leg.Close()
@@ -487,7 +498,7 @@ func (s *Session) startCall(ctx context.Context, command *protocol.Command) (jso
 	}
 	id := call.ID()
 	live := &liveCall{call: call, leg: leg, outbound: true}
-	if !s.register(id, live) {
+	if !s.register(id, live, retired) {
 		// The session closed, or stopped carrying calls, while the callee was being
 		// rung, after its calls were ended: this one is ended here, or it would ring
 		// with nobody behind it.
@@ -519,6 +530,7 @@ func (s *Session) calleeAnswered(live *liveCall, log zerolog.Logger) {
 		log.Warn().Err(err).Str("call_id", id).Msg("could not answer the browser once the callee picked up; hanging up")
 		if err := live.call.Hangup(); err != nil {
 			log.Warn().Err(err).Str("call_id", id).Msg("could not hang up a call the browser cannot carry")
+			s.rememberUnended(id, live.call)
 		}
 		return
 	}
