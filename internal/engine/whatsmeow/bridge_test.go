@@ -673,6 +673,27 @@ func TestClosingTheSessionGivesItsHangUpsAMomentBeforeTheSocketGoes(t *testing.T
 		}
 	})
 
+	t.Run("nothing arriving is handled while it waits", func(t *testing.T) {
+		t.Parallel()
+		// The store is fenced before this wait, so a message decrypted during it could not
+		// be written down: the session's context, which whatsmeow handles what arrives
+		// under, is already cancelled when the hang-up is attempted.
+		session := newCallSession(t)
+		call, release := answeredCall(t, session, "call-1")
+		cancelledAtHangUp := make(chan bool, 1)
+		go func() {
+			<-call.signalled
+			cancelledAtHangUp <- session.ctx.Err() != nil
+			release()
+		}()
+		if err := session.Close(); err != nil {
+			t.Fatalf("close: %v", err)
+		}
+		if !<-cancelledAtHangUp {
+			t.Fatal("the session was still handling what arrives while it waited on its hang-ups")
+		}
+	})
+
 	t.Run("one that is not is given the grace", func(t *testing.T) {
 		t.Parallel()
 		session := newCallSession(t)

@@ -3763,27 +3763,26 @@ func (s *Session) Close() error {
 	if run != nil {
 		run.cancel()
 	}
+	// Cancelled first, and that order is the whole point: whatsmeow holds its socket
+	// lock for the length of a dial, and Disconnect waits for the same lock. Cancelling
+	// afterwards would never run, and a lease handover would wait out the handshake. It is
+	// also what stops whatsmeow handling what still arrives on the socket, and the store
+	// is already fenced: a message decrypted from here on could not be written down, and
+	// whatsmeow acknowledges one it cannot decrypt before anyone could publish it.
+	s.cancel()
+
 	// A call's media lives on this instance and cannot follow the account to another
 	// one, and a call left up would go on playing silence to the person on the phone. The
-	// hang-ups are sent and not waited for: this is also the lease being lost, and the
-	// socket of an instance that lost it has to go now, not after a write. A hang-up that
-	// does not make it before the disconnect leaves the call to end on the phone's side
-	// when the media stops.
+	// hang-ups get a moment before the socket goes, and no more. Not waited for at all,
+	// the socket closed under them before they were written, and the other phone was left
+	// on "Reconnecting..." instead of hearing the call end (measured on a real phone).
+	// Waited for in full, a lost lease would sit on a socket that does not drain.
 	s.bridge.mu.Lock()
 	s.bridge.closed = true
 	s.bridge.mu.Unlock()
-	// The hang-ups get a moment before the socket goes, and no more. Not waited for at
-	// all, the socket closed under them before they were written, and the other phone was
-	// left on "Reconnecting..." instead of hearing the call end (measured on a real phone).
-	// Waited for in full, a lost lease would sit on a socket that does not drain.
 	grace, stop := context.WithTimeout(context.Background(), s.hangupGrace)
 	s.endCalls(grace)
 	stop()
-
-	// Cancelled first, and that order is the whole point: whatsmeow holds its socket
-	// lock for the length of a dial, and Disconnect waits for the same lock. Cancelling
-	// afterwards would never run, and a lease handover would wait out the handshake.
-	s.cancel()
 
 	s.mu.Lock()
 	client, handlerID := s.client, s.handlerID
