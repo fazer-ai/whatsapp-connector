@@ -23,6 +23,10 @@ const callWriteTimeout = 10 * time.Second
 // all, and a call rings for tens of seconds.
 const offerAfterNotice = 2 * time.Second
 
+// closeHangupGrace bounds the wait for a closing session's hang-ups. A healthy socket
+// writes one in milliseconds; a lease handover can afford this much and no more.
+const closeHangupGrace = 500 * time.Millisecond
+
 // answeredCalls is how many call ids a session remembers to tell a second announcement of
 // one call from a second call.
 //

@@ -640,6 +640,61 @@ func hungUpWithin(t *testing.T, call *fakeCall) {
 	}
 }
 
+// A session that closes gives the hang-ups it just started a moment to be written before
+// the socket goes: closed under them, the hang-up never reached WhatsApp and the other phone
+// sat on "Reconnecting..." (measured on a real phone, with a lease taken away mid-call). A
+// write that lands ends the wait at once; one that does not is given the grace and no more.
+func TestClosingTheSessionGivesItsHangUpsAMomentBeforeTheSocketGoes(t *testing.T) {
+	t.Parallel()
+
+	t.Run("a hang-up that is written ends the wait", func(t *testing.T) {
+		t.Parallel()
+		session := newCallSession(t)
+		session.hangupGrace = time.Hour
+		call, release := answeredCall(t, session, "call-1")
+		go func() {
+			<-call.signalled
+			release()
+		}()
+		carriedAtClose := make(chan bool, 1)
+		session.closeSocket = func(*wm.Client) { carriedAtClose <- carried(session, "call-1") }
+		closed := make(chan error, 1)
+		go func() { closed <- session.Close() }()
+		select {
+		case err := <-closed:
+			if err != nil {
+				t.Fatalf("close: %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("close waited out the grace for a hang-up that had been written")
+		}
+		if <-carriedAtClose {
+			t.Fatal("the socket was closed before the hang-up was written")
+		}
+	})
+
+	t.Run("one that is not is given the grace", func(t *testing.T) {
+		t.Parallel()
+		session := newCallSession(t)
+		const grace = 300 * time.Millisecond
+		session.hangupGrace = grace
+		call, _ := answeredCall(t, session, "call-1")
+		attempted := make(chan time.Time, 1)
+		go func() {
+			<-call.signalled
+			attempted <- time.Now()
+		}()
+		closedSocket := make(chan time.Time, 1)
+		session.closeSocket = func(*wm.Client) { closedSocket <- time.Now() }
+		if err := session.Close(); err != nil {
+			t.Fatalf("close: %v", err)
+		}
+		if waited := (<-closedSocket).Sub(<-attempted); waited < grace*3/4 {
+			t.Fatalf("the socket was closed %v after the hang-up was attempted, want about %v", waited, grace)
+		}
+	})
+}
+
 // A session that closes hangs up every call it carries, since the media is this
 // instance's and cannot follow the account, and does not wait for the hang-up to be
 // written: a close is also the lease being lost, and that socket has to go now.

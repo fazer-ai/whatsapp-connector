@@ -98,6 +98,9 @@ type Session struct {
 	// holding a hang-up's disconnect does not hold every Close with it. A field so a test
 	// can tell that Close disconnects before it waits on the handlers.
 	closeSocket func(*wm.Client)
+	// hangupGrace is how long Close waits for the hang-ups of the calls it ends to be
+	// written before it closes the socket. A field so a test can tell the two apart.
+	hangupGrace time.Duration
 
 	// logout ends the session on WhatsApp's side. A field for the same reason as the two
 	// above: whatsmeow refuses to log out a client that never connected, so nothing
@@ -787,6 +790,7 @@ func newSession(
 		detach:      func(client *wm.Client, id uint32) { client.RemoveEventHandler(id) },
 		disconnect:  func(client *wm.Client) { client.Disconnect() },
 		closeSocket: func(client *wm.Client) { client.Disconnect() },
+		hangupGrace: closeHangupGrace,
 		nonce:       sessionNonce(),
 		logout:      func(ctx context.Context, client *wm.Client) error { return client.Logout(ctx) },
 		download:    downloadOverClient,
@@ -3768,9 +3772,13 @@ func (s *Session) Close() error {
 	s.bridge.mu.Lock()
 	s.bridge.closed = true
 	s.bridge.mu.Unlock()
-	gone, stop := context.WithCancel(context.Background())
+	// The hang-ups get a moment before the socket goes, and no more. Not waited for at
+	// all, the socket closed under them before they were written, and the other phone was
+	// left on "Reconnecting..." instead of hearing the call end (measured on a real phone).
+	// Waited for in full, a lost lease would sit on a socket that does not drain.
+	grace, stop := context.WithTimeout(context.Background(), s.hangupGrace)
+	s.endCalls(grace)
 	stop()
-	s.endCalls(gone)
 
 	// Cancelled first, and that order is the whole point: whatsmeow holds its socket
 	// lock for the length of a dial, and Disconnect waits for the same lock. Cancelling
