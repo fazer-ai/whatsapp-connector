@@ -84,6 +84,10 @@ type Session struct {
 	// what its handlers and meowcaller's run on. Called when that client is retired, so a
 	// store read one of them is stalled on does not outlive it. See rebuild.
 	endLifetime context.CancelFunc
+	// notices is held for reading by a call notice published after a wait, from its fence
+	// check to its publication, and taken by a rebuild to retire a client. The wait runs
+	// off whatsmeow's handler list, so removing the handler does not wait for it; this does.
+	notices sync.RWMutex
 
 	// detach removes the event handler from a client. It is a field only so the
 	// teardown order can be held to: whatsmeow runs a handler under a lock that
@@ -3402,7 +3406,12 @@ func (s *Session) rebuild(ctx context.Context) error {
 	s.mu.Lock()
 	previous, handlerID, retiredHandler, endLifetime := s.client, s.handlerID, s.retiredHandler, s.endLifetime
 	s.mu.Unlock()
+	// Under the notices lock: a call notice from the retired client that already passed its
+	// fence publishes before the client is retired, and one that has not yet finds it
+	// retired. The wait is bounded, since the notice's one lookup is on the store bound.
+	s.notices.Lock()
 	retiredHandler.Store(true)
+	s.notices.Unlock()
 	// Ended before anything waits on the retired client: a handler of its own, or
 	// meowcaller's decrypting an offer, can be stalled on a store read, and the socket
 	// closing does not end that, only the context the read was given.

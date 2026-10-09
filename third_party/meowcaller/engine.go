@@ -729,20 +729,26 @@ func (e *engine) onOffer(ev *events.CallOffer) {
 		e.c.log.Info().Str("call_id", ev.CallID).Msg("inbound call advertises video")
 	}
 
+	// The integrator is told first, so that a call it discards from the callback is gone
+	// before the preaccept is queued, and the queued preaccept is skipped for a call that
+	// is gone by the time its turn comes: Discard promises that nothing is signalled.
+	if fn := e.c.incomingCallHandler(); fn != nil {
+		fn(call)
+	}
+
 	// Preaccept eagerly: it is a preparation step, done independently of the later
 	// Answer/Reject decision. It keeps the offer alive and joins the relay election while
 	// the integrator decides — even a call the user goes on to decline has usually already
 	// been preaccepted.
 	callID, to, creator := ev.CallID, ev.From, ev.CallCreator
 	e.sendLater(func() {
+		if e.lookup(callID) == nil {
+			return
+		}
 		if err := e.sendPreaccept(callID, to, creator, isVideo); err != nil {
 			e.c.log.Warn().Err(err).Str("call_id", callID).Msg("preaccept failed")
 		}
 	})
-
-	if fn := e.c.incomingCallHandler(); fn != nil {
-		fn(call)
-	}
 }
 
 func (e *engine) onGroupOffer(ev *events.CallOffer, update groupCallUpdate) {

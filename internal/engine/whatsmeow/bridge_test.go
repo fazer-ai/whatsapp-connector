@@ -1076,6 +1076,51 @@ func TestANoticeWaitingOutARebuildIsNotPublished(t *testing.T) {
 	}
 }
 
+// A notice that passed its fence before a rebuild came, and is still on its way to the
+// publication, holds the rebuild until it is out: retired under it, the client's notice
+// would be published on the session the replacement owns.
+func TestARebuildWaitsForANoticeAlreadyOnItsWayOut(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	session.offerWait = 100 * time.Millisecond
+	// Installed before anything reads it and armed only once the notice is handed over, so
+	// the one reading it holds is the notice's own, after its wait.
+	entered, released := make(chan struct{}), make(chan struct{})
+	var armed, held atomic.Bool
+	session.wallClock = func() time.Time {
+		if armed.Load() && held.CompareAndSwap(false, true) {
+			close(entered)
+			<-released
+		}
+		return time.Now()
+	}
+	session.handle(callNotice("call-1"))
+	armed.Store(true)
+	select {
+	case <-entered:
+	case <-time.After(testwait.Budget):
+		t.Fatal("the notice's wait never ran out")
+	}
+
+	rebuilt := make(chan error, 1)
+	go func() { rebuilt <- session.rebuild(t.Context()) }()
+	select {
+	case <-rebuilt:
+		close(released)
+		t.Fatal("the rebuild retired the client with its notice still on its way out")
+	case <-time.After(300 * time.Millisecond):
+	}
+	close(released)
+	select {
+	case err := <-rebuilt:
+		if err != nil {
+			t.Fatalf("rebuild: %v", err)
+		}
+	case <-time.After(testwait.Budget):
+		t.Fatal("the rebuild did not finish once the notice was out")
+	}
+}
+
 // meowcaller can take a while between engaging an offer and handing the call over. A
 // notice whose wait runs out in that window leaves the call's one call.offer to the offer.
 func TestANoticeDoesNotTakeTheOfferMeowcallerIsStillWorkingThrough(t *testing.T) {

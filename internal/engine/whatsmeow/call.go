@@ -143,7 +143,12 @@ func (s *Session) callNoticed(meta *waTypes.BasicCallMeta, media callMedia, grou
 	// rebuild in the meantime retires the client the notice arrived on, and its call is not
 	// published on the session the replacement owns.
 	retired := s.currentRetirement()
+	// The fence is held through the publication, not only checked before it: the notice's
+	// lookup can wait, and a rebuild in that time must not see it finish on the session the
+	// replacement owns. See Session.notices.
 	time.AfterFunc(s.offerWait, func() {
+		s.notices.RLock()
+		defer s.notices.RUnlock()
 		if s.ctx.Err() == nil && !retired.Load() && !s.endPublished(held.CallID) && !s.offerOnItsWay(held.CallID) {
 			s.callOffered(&held, media, group)
 		}
