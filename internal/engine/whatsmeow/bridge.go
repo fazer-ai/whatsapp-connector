@@ -528,10 +528,15 @@ func (s *Session) calleeAnswered(live *liveCall, log zerolog.Logger) {
 	answer, err := live.leg.Answer(s.ctx)
 	if err != nil {
 		log.Warn().Err(err).Str("call_id", id).Msg("could not answer the browser once the callee picked up; hanging up")
-		if err := live.call.Hangup(); err != nil {
-			log.Warn().Err(err).Str("call_id", id).Msg("could not hang up a call the browser cannot carry")
-			s.rememberUnended(id, live.call)
-		}
+		// Off the dispatch, like every other write this handler causes: the hang-up writes a
+		// terminate on a context nothing here can cancel, and a socket that does not take it
+		// would hold whatever WhatsApp sends next. The socket closing is what ends that wait.
+		go func() {
+			if err := live.call.Hangup(); err != nil {
+				log.Warn().Err(err).Str("call_id", id).Msg("could not hang up a call the browser cannot carry")
+				s.rememberUnended(id, live.call)
+			}
+		}()
 		return
 	}
 	// A call that ended before this has its leg closed, and the answer above fails. One

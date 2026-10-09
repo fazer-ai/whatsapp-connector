@@ -1757,6 +1757,8 @@ func TestAHangupTheConnectorMadeItselfIsSentAgainWhenItDidNotGoOut(t *testing.T)
 			accepted := call.onAccept
 			call.mu.Unlock()
 			accepted()
+			// The hang-up goes out off the dispatch, so its failure is recorded a moment later.
+			unendedWithin(t, session, "call-1")
 			return call
 		},
 	} {
@@ -1774,6 +1776,62 @@ func TestAHangupTheConnectorMadeItselfIsSentAgainWhenItDidNotGoOut(t *testing.T)
 			}
 		})
 	}
+}
+
+// unendedWithin waits for a hang-up that did not go out to be recorded for a retry.
+func unendedWithin(t *testing.T, session *Session, id string) {
+	t.Helper()
+	deadline := time.Now().Add(testwait.Budget)
+	for {
+		session.bridge.mu.Lock()
+		_, recorded := session.bridge.unended[id]
+		session.bridge.mu.Unlock()
+		if recorded {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the failed hang-up of %s was never recorded", id)
+		}
+		time.Sleep(testwait.Poll)
+	}
+}
+
+// The callee picking up a call the browser can no longer carry hangs it up, and that
+// hang-up is not written from inside the dispatch that delivered the pickup: a socket that
+// does not take it would hold everything WhatsApp sends after it.
+func TestAHangupAfterAFailedAnswerDoesNotHoldTheDispatch(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	stall := make(chan struct{})
+	call := &fakeCall{id: "call-1", stall: stall, signalled: make(chan struct{}, 4), hangupFail: errors.New("write: broken pipe")}
+	placeCall(t, session, call)
+	session.bridge.mu.Lock()
+	leg := session.bridge.live["call-1"].leg
+	session.bridge.mu.Unlock()
+	_ = leg.Close()
+	call.mu.Lock()
+	accepted := call.onAccept
+	call.mu.Unlock()
+
+	returned := make(chan struct{})
+	go func() {
+		defer close(returned)
+		accepted()
+	}()
+	select {
+	case <-returned:
+	case <-time.After(testwait.Budget):
+		close(stall)
+		t.Fatal("the pickup's handler waited on a hang-up the socket did not take")
+	}
+	select {
+	case <-call.signalled:
+	case <-time.After(testwait.Budget):
+		close(stall)
+		t.Fatal("the call the browser cannot carry was never hung up")
+	}
+	close(stall)
+	unendedWithin(t, session, "call-1")
 }
 
 // A call placed on a client that a rebuild retired during the dial is not registered on

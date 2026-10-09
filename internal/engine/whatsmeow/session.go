@@ -80,6 +80,10 @@ type Session struct {
 	// retiredHandler is set once the client handlerID belongs to is being replaced, and
 	// from then on that handler drops what it is handed. See adopt.
 	retiredHandler *atomic.Bool
+	// endLifetime ends the background context of the client handlerID belongs to, which is
+	// what its handlers and meowcaller's run on. Called when that client is retired, so a
+	// store read one of them is stalled on does not outlive it. See rebuild.
+	endLifetime context.CancelFunc
 
 	// detach removes the event handler from a client. It is a field only so the
 	// teardown order can be held to: whatsmeow runs a handler under a lock that
@@ -1016,7 +1020,10 @@ func (s *Session) adopt(ctx context.Context, client *wm.Client) bool {
 	client.EnableAutoReconnect = true
 	client.PrePairCallback = s.bind
 	client.GetClientPayload = s.payloadWithHistory(client)
-	client.BackgroundEventCtx = s.ctx
+	// The client's own lifetime, inside the session's: the session closing ends it, and so
+	// does this client being replaced by a rebuild, which the session outlives.
+	lifetime, endLifetime := context.WithCancel(s.ctx)
+	client.BackgroundEventCtx = lifetime
 	// The ack for an inbound message waits for the handlers, and a handler that reports
 	// failure stops it being sent at all. That pairing is what lets this build refuse a
 	// message it cannot publish instead of telling WhatsApp it was delivered: the
@@ -1094,6 +1101,7 @@ func (s *Session) adopt(ctx context.Context, client *wm.Client) bool {
 		s.mu.Unlock()
 		client.RemoveEventHandler(handlerID)
 		client.Disconnect()
+		endLifetime()
 		return false
 	}
 	s.client = client
@@ -1106,6 +1114,7 @@ func (s *Session) adopt(ctx context.Context, client *wm.Client) bool {
 	s.dropAnnounced = false
 	s.handlerID = handlerID
 	s.retiredHandler = retiredHandler
+	s.endLifetime = endLifetime
 	s.phone = named.phone
 	s.lid = named.lid
 	// A rebuilt client brings the device record's copy of these names back, and the marker
@@ -3391,9 +3400,15 @@ func (s *Session) rebuild(ctx context.Context) error {
 	}
 
 	s.mu.Lock()
-	previous, handlerID, retiredHandler := s.client, s.handlerID, s.retiredHandler
+	previous, handlerID, retiredHandler, endLifetime := s.client, s.handlerID, s.retiredHandler, s.endLifetime
 	s.mu.Unlock()
 	retiredHandler.Store(true)
+	// Ended before anything waits on the retired client: a handler of its own, or
+	// meowcaller's decrypting an offer, can be stalled on a store read, and the socket
+	// closing does not end that, only the context the read was given.
+	if endLifetime != nil {
+		endLifetime()
+	}
 	// The socket goes first and the handler is removed after it, in full, the order Close
 	// takes. The fence above keeps out every event dispatched from here on. What it cannot
 	// reach is a handler already running, a message whose media is still downloading, and
