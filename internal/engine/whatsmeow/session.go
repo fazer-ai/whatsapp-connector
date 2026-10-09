@@ -94,9 +94,9 @@ type Session struct {
 	// reach the path where a disconnect outlives its deadline.
 	disconnect func(*wm.Client)
 
-	// closeSocket is the disconnect Close makes, apart from the one above so that a test
-	// holding a hang-up's disconnect does not hold every Close with it. A field so a test
-	// can tell that Close disconnects before it waits on the handlers.
+	// closeSocket is the disconnect Close and a rebuild make, apart from the one above so
+	// that a test holding a hang-up's disconnect does not hold every Close with it. A field
+	// so a test can tell that both disconnect before they wait on the handlers.
 	closeSocket func(*wm.Client)
 	// hangupGrace is how long Close waits for the hang-ups of the calls it ends to be
 	// written before it closes the socket. A field so a test can tell the two apart.
@@ -3394,35 +3394,32 @@ func (s *Session) rebuild(ctx context.Context) error {
 	previous, handlerID, retiredHandler := s.client, s.handlerID, s.retiredHandler
 	s.mu.Unlock()
 	retiredHandler.Store(true)
-	// The handler is removed first, so nothing the old client does from here is heard,
-	// and on the same bound as the disconnect below: RemoveEventHandler waits for every
-	// handler that is running, meowcaller's included, and a write meowcaller stalled on with
-	// a context nothing here can cancel gives up only when the socket closes. Past the bound
-	// the disconnect goes ahead, which is what releases that write, and the removal lands
-	// then.
-	detached := make(chan struct{})
-	go func() {
-		defer close(detached)
-		s.detach(previous, handlerID)
-	}()
-	select {
-	case <-detached:
-	case <-ctx.Done():
-	}
-	// Waited for no longer than the bound this runs on. Disconnect takes the socket lock, and
-	// a dial holds that lock for as long as the dial lasts with no context to end it: a
-	// teardown whose unlink went through while the socket dropped underneath it would answer
-	// when the dial did, which is the wait #187 is about, one step later. The disconnect
-	// still lands the moment the dial lets go.
+	// The socket goes first and the handler is removed after it, in full, the order Close
+	// takes. The fence above keeps out every event dispatched from here on. What it cannot
+	// reach is a handler already running, a message whose media is still downloading, and
+	// that one has to be finished before the next client is adopted: it would otherwise go
+	// on writing down and publishing, on the session the replacement owns, what the
+	// retired account received. RemoveEventHandler is what waits for it. The disconnect
+	// before it is what lets that wait end: meowcaller writes from inside its handler with a
+	// context nothing here can cancel, and such a write gives up only when the socket
+	// closes.
+	//
+	// The disconnect is waited for no longer than the bound this runs on. Disconnect takes
+	// the socket lock, and a dial holds that lock for as long as the dial lasts with no
+	// context to end it: a teardown whose unlink went through while the socket dropped
+	// underneath it would answer when the dial did, which is the wait #187 is about, one
+	// step later. A dial still in progress has no socket for a write to be stalled on, and
+	// the disconnect still lands the moment the dial lets go.
 	closed := make(chan struct{})
 	go func() {
 		defer close(closed)
-		previous.Disconnect()
+		s.closeSocket(previous)
 	}()
 	select {
 	case <-closed:
 	case <-ctx.Done():
 	}
+	s.detach(previous, handlerID)
 
 	// Dropped with the client it was filed under. Every path here has just forgotten the
 	// device, so the account that asked for it is gone, and carried over it would mark

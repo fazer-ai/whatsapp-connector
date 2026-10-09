@@ -1441,57 +1441,131 @@ func TestALoggedOutDeviceEndsItsCalls(t *testing.T) {
 	hungUpWithin(t, call)
 }
 
-// A rebuild whose handler removal stalls -- meowcaller held inside its own handler by a
-// write the socket does not take -- gives up on it at its bound and goes on to the
-// disconnect, which is what releases that write.
-func TestARebuildDoesNotWaitOnAStalledHandlerPastItsBound(t *testing.T) {
+// A rebuild disconnects the retired client before it waits on that client's handlers, the
+// order Close takes: meowcaller writes from inside its own handler with a context nothing
+// here can cancel, and only a closed socket ends a write that stalled.
+func TestARebuildDisconnectsBeforeWaitingOnHandlers(t *testing.T) {
 	t.Parallel()
 	session := newCallSession(t)
-	stalled := make(chan struct{})
-	t.Cleanup(func() { close(stalled) })
-	session.detach = func(*wm.Client, uint32) { <-stalled }
-	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
-	defer cancel()
-	done := make(chan error, 1)
-	go func() { done <- session.rebuild(ctx) }()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("a rebuild waited on a stalled handler past its bound")
+	retired := session.current()
+	disconnected := make(chan struct{})
+	session.closeSocket = func(client *wm.Client) {
+		if client == retired {
+			close(disconnected)
+		}
+	}
+	session.detach = func(*wm.Client, uint32) {
+		select {
+		case <-disconnected:
+		case <-time.After(testwait.Budget):
+			t.Error("the rebuild waited on the handlers with the socket still open")
+		}
+	}
+	if err := session.rebuild(t.Context()); err != nil {
+		t.Fatalf("rebuild: %v", err)
 	}
 }
 
-// A rebuild that gave up on a stalled handler removal has adopted the next client with
-// the old one's handler still installed, and whatsmeow calls it again as soon as the stall
-// lets go. What the retired client hands it from then on is dropped, unacknowledged, and
-// nothing reaches the session the replacement owns; the replacement's own events still do.
+// A handler the retired client is still running when the rebuild comes -- a message whose
+// media is still downloading -- is finished before the next client is adopted, however
+// long it takes past the rebuild's bound. Adopted under it, the replacement would have it
+// go on writing down and publishing, on the session the new account owns, what the
+// retired account received.
+func TestARebuildWaitsForAHandlerStillRunningOnTheRetiredClient(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	retired := session.current()
+
+	entered, released := make(chan struct{}), make(chan struct{})
+	var held atomic.Bool
+	session.wallClock = func() time.Time {
+		if held.CompareAndSwap(false, true) {
+			close(entered)
+			<-released
+		}
+		return time.Now()
+	}
+	go func() {
+		//nolint:staticcheck // SA1019: the dispatch a real socket drives is this one
+		retired.DangerousInternals().DispatchEvent(&waEvents.Presence{From: someone(theCaller)})
+	}()
+	select {
+	case <-entered:
+	case <-time.After(testwait.Budget):
+		t.Fatal("the handler never ran")
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+	rebuilt := make(chan error, 1)
+	go func() { rebuilt <- session.rebuild(ctx) }()
+	select {
+	case <-rebuilt:
+		close(released)
+		t.Fatal("the rebuild adopted the next client with the retired one's handler still running")
+	case <-time.After(300 * time.Millisecond):
+	}
+	if session.current() != retired {
+		close(released)
+		t.Fatal("the replacement was adopted with the retired client's handler still running")
+	}
+
+	close(released)
+	select {
+	case err := <-rebuilt:
+		if err != nil {
+			t.Fatalf("rebuild: %v", err)
+		}
+	case <-time.After(testwait.Budget):
+		t.Fatal("the rebuild did not finish once the handler returned")
+	}
+	if session.current() == retired {
+		t.Fatal("the rebuild kept the retired client")
+	}
+}
+
+// What the retired client dispatches once the rebuild has started is dropped,
+// unacknowledged, while its handlers are being removed, and nothing reaches the session;
+// the replacement's own events, once it is adopted, still do.
 func TestARetiredClientsHandlerIsFencedOffTheReplacement(t *testing.T) {
 	t.Parallel()
 	session := newCallSession(t)
-	stalled := make(chan struct{})
-	t.Cleanup(func() { close(stalled) })
-	session.detach = func(*wm.Client, uint32) { <-stalled }
+	removing, released := make(chan struct{}), make(chan struct{})
 	retired := session.current()
-	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
-	defer cancel()
-	if err := session.rebuild(ctx); err != nil {
-		t.Fatalf("rebuild: %v", err)
+	session.detach = func(client *wm.Client, id uint32) {
+		if client == retired {
+			close(removing)
+			<-released
+		}
+		client.RemoveEventHandler(id)
 	}
-	replacement := session.current()
-	if replacement == retired {
-		t.Fatal("the rebuild kept the retired client")
+	rebuilt := make(chan error, 1)
+	go func() { rebuilt <- session.rebuild(t.Context()) }()
+	select {
+	case <-removing:
+	case <-time.After(testwait.Budget):
+		t.Fatal("the rebuild never came to remove the handler")
 	}
 
 	// Dispatched the way whatsmeow dispatches what arrives on the socket, which is the one
 	// way to reach the handlers a client holds.
 	//nolint:staticcheck // SA1019: the dispatch a real socket drives is this one
-	if failed := retired.DangerousInternals().DispatchEvent(textMessage("from-the-retired", "hi")); !failed {
+	failed := retired.DangerousInternals().DispatchEvent(textMessage("from-the-retired", "hi"))
+	close(released)
+	if !failed {
 		t.Fatal("an event from the retired client was acknowledged")
+	}
+	if err := <-rebuilt; err != nil {
+		t.Fatalf("rebuild: %v", err)
 	}
 	select {
 	case emission := <-session.Events():
 		t.Fatalf("the retired client's event reached the replacement's session as %s", emission.Type)
 	default:
+	}
+	replacement := session.current()
+	if replacement == retired {
+		t.Fatal("the rebuild kept the retired client")
 	}
 
 	handled := make(chan bool, 1)
@@ -1520,13 +1594,10 @@ func TestARetiredClientsMeowcallerEngagesNothing(t *testing.T) {
 	if err := session.rebuild(t.Context()); err != nil {
 		t.Fatalf("rebuild: %v", err)
 	}
-	stalled := make(chan struct{})
-	t.Cleanup(func() { close(stalled) })
-	session.detach = func(*wm.Client, uint32) { <-stalled }
+	// meowcaller's handler is its own, and stays on the retired client after the rebuild
+	// removes the session's.
 	retired := session.current()
-	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
-	defer cancel()
-	if err := session.rebuild(ctx); err != nil {
+	if err := session.rebuild(t.Context()); err != nil {
 		t.Fatalf("rebuild: %v", err)
 	}
 	replacement := session.current()
