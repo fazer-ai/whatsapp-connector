@@ -51,6 +51,15 @@ type GroupCallOptions struct {
 // NewClient wraps a connected whatsmeow client and installs the call event handlers.
 // Construct it before the whatsmeow client connects so the low-level <ack>/<call>
 // interception is in place before the receive loop starts.
+// lifetime is the whatsmeow client's background event context: what the integrator
+// cancels when the client is being shut down. Unset, it never ends.
+func (c *Client) lifetime() context.Context {
+	if ctx := c.wa.BackgroundEventCtx; ctx != nil {
+		return ctx
+	}
+	return context.Background()
+}
+
 func NewClient(wa *whatsmeow.Client, opts ...Option) *Client {
 	cfg := resolveConfig(opts)
 	c := &Client{

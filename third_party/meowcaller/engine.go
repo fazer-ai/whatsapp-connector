@@ -672,7 +672,11 @@ func (e *engine) onOffer(ev *events.CallOffer) {
 		return
 	}
 
-	callKey, err := decryptInboundCallKey(context.Background(), e.c.wa, ev)
+	// On the client's own lifetime rather than a context of its own: this runs inside
+	// whatsmeow's event dispatch and reads the store, and a store that stalls would
+	// otherwise hold the dispatch, and the integrator's shutdown waiting behind it, for as
+	// long as the stall lasts.
+	callKey, err := decryptInboundCallKey(e.c.lifetime(), e.c.wa, ev)
 	if err != nil {
 		e.c.log.Warn().Err(err).Str("call_id", ev.CallID).Msg("decrypt callKey failed")
 		return
