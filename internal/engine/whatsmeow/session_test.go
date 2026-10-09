@@ -145,6 +145,10 @@ var (
 	commandsNoHandlerCarriesOut = []protocol.CommandType{
 		protocol.CommandSessionUpdate,
 		protocol.CommandContactInfo,
+		// The call bridge is #383's; until then a client is told so at the time.
+		protocol.CommandCallAccept,
+		protocol.CommandCallStart,
+		protocol.CommandCallTerminate,
 	}
 
 	// Reached now, which is a different thing from being carried out: an empty payload

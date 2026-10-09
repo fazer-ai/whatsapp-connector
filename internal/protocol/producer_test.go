@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -33,6 +34,7 @@ var eventTypesWithNoProducer = []protocol.EventType{
 	protocol.EventContactPictureChanged,
 	protocol.EventContactIdentityChanged,
 	protocol.EventGroupPictureChanged,
+	protocol.EventCallAnswered,
 	protocol.EventRaw,
 }
 
@@ -51,7 +53,7 @@ func TestEveryEventTypeIsProducedOrMarkedAsNotProduced(t *testing.T) {
 	assertProducers(t, "EventType", "types.go", "producer", catalog, marked)
 }
 
-// Two command types are in the contract with nothing in this build that carries them
+// Five command types are in the contract with nothing in this build that carries them
 // out, and types.go marks each one. A client that sends one is answered `unsupported`,
 // so unlike an unproduced event this is told at the time -- but only to a client that
 // already sent it, and only for a session some instance owns. A command for a session
@@ -60,6 +62,9 @@ func TestEveryEventTypeIsProducedOrMarkedAsNotProduced(t *testing.T) {
 var commandTypesWithNoHandler = []protocol.CommandType{
 	protocol.CommandSessionUpdate,
 	protocol.CommandContactInfo,
+	protocol.CommandCallAccept,
+	protocol.CommandCallStart,
+	protocol.CommandCallTerminate,
 }
 
 func TestEveryCommandTypeIsHandledOrMarkedAsNotHandled(t *testing.T) {
@@ -280,4 +285,67 @@ func constantNames(t *testing.T, declaredType string, values []string) map[strin
 		t.Fatalf("read %d %s constants out of the catalog, want %d", len(names), declaredType, len(values))
 	}
 	return names
+}
+
+// The marked lists are counted in prose in two places, the catalog's comments in types.go
+// and the contract a client vendors, and a number spelled out in words is invisible to
+// every other check: #382 grew both lists and left PROTOCOL.md saying "Two" and "Six".
+// So each count is read back and compared with the list it describes, and the commands
+// PROTOCOL.md names as unhandled are compared with the list by name.
+func TestTheUnmarkedCountsInProseMatchTheLists(t *testing.T) {
+	t.Parallel()
+
+	words := map[string]int{
+		"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8,
+		"nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+	}
+	read := func(path string) string {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		return strings.Join(strings.Fields(string(raw)), " ")
+	}
+	count := func(text, where string, pattern *regexp.Regexp, want int) {
+		match := pattern.FindStringSubmatch(text)
+		if match == nil {
+			t.Fatalf("%s: no sentence matches %q any more: the count it carried is unchecked", where, pattern)
+		}
+		got, ok := words[strings.ToLower(match[1])]
+		if !ok {
+			t.Fatalf("%s: %q is not a number this test reads", where, match[1])
+		}
+		if got != want {
+			t.Errorf("%s says %q, and the list has %d", where, match[0], want)
+		}
+	}
+
+	types := read("types.go")
+	protocolMD := read(filepath.Join(contractDir, "PROTOCOL.md"))
+	events, commands := len(eventTypesWithNoProducer), len(commandTypesWithNoHandler)
+
+	count(types, "types.go", regexp.MustCompile(`every event type in the contract\. (\w+) of them have no producer`), events)
+	count(types, "types.go", regexp.MustCompile(`every command type in the contract\. (\w+) of them have no handler`), commands)
+	count(protocolMD, "PROTOCOL.md", regexp.MustCompile(`- (\w+) of the event types have no producer`), events)
+	count(protocolMD, "PROTOCOL.md", regexp.MustCompile(`Which (\w+) is marked in .internal/protocol/types\.go. and held there by a test, so the marking`), events)
+	count(protocolMD, "PROTOCOL.md", regexp.MustCompile(`- (\w+) command types have no handler here`), commands)
+	count(protocolMD, "PROTOCOL.md", regexp.MustCompile(`Which (\w+) is marked in .internal/protocol/types\.go. and held there by a test, so wiring`), commands)
+
+	bullet := regexp.MustCompile(`command types have no handler here -- (.*?) -- `).FindStringSubmatch(protocolMD)
+	if bullet == nil {
+		t.Fatal("PROTOCOL.md: the bullet naming the unhandled commands no longer reads as this test expects")
+	}
+	named := map[string]bool{}
+	for _, match := range regexp.MustCompile("`([a-z_.]+)`").FindAllStringSubmatch(bullet[1], -1) {
+		named[match[1]] = true
+	}
+	for _, command := range commandTypesWithNoHandler {
+		if !named[string(command)] {
+			t.Errorf("PROTOCOL.md does not name %s among the commands with no handler", command)
+		}
+		delete(named, string(command))
+	}
+	for command := range named {
+		t.Errorf("PROTOCOL.md names %s among the commands with no handler, and it has one", command)
+	}
 }

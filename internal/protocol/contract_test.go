@@ -754,3 +754,60 @@ func TestAFieldAddedInsideAVersionStaysOptional(t *testing.T) {
 
 // protocolVersionLabel is the version this contract advertises, for the message above.
 func protocolVersionLabel() string { return "v" + strconv.Itoa(protocol.Version) }
+
+// The fixtures pin what a call frame carries; this pins what it cannot do without. Each
+// field below is what the other side acts on -- the SDP the browser or the connector
+// applies, the call_id a command is matched to -- so a frame missing it validates only if
+// the schema stopped saying so, and then a client would send one. Every case is a pair:
+// the frame that has to validate, and the same frame with one thing taken away or
+// changed, so a refusal for some other reason does not count as this one.
+func TestACallFrameMissingWhatItCarriesDoesNotValidate(t *testing.T) {
+	t.Parallel()
+
+	const (
+		accept    = `{"call_id":"CALL1","sdp":"v=0"}`
+		start     = `{"to":{"kind":"phone","id":"5511999990000"},"sdp":"v=0"}`
+		terminate = `{"call_id":"CALL1"}`
+		answered  = `{"call_id":"CALL1","sdp":"v=0"}`
+		connect   = `{"pairing":"qr","calls":{"answer":true}}`
+		offer     = `{"call_id":"CALL1","from":{"phone":"5541999990000"},"sdp":"v=0"}`
+	)
+
+	for name, test := range map[string]struct {
+		definition, valid, invalid string
+	}{
+		"call.accept without the answer":      {"command_call_accept", accept, `{"call_id":"CALL1"}`},
+		"call.accept without the call":        {"command_call_accept", accept, `{"sdp":"v=0"}`},
+		"call.start without a callee":         {"command_call_start", start, `{"sdp":"v=0"}`},
+		"call.start without the offer":        {"command_call_start", start, `{"to":{"kind":"phone","id":"5511999990000"}}`},
+		"call.start to a raw jid":             {"command_call_start", start, `{"to":"5511999990000@s.whatsapp.net","sdp":"v=0"}`},
+		"call.terminate without the call":     {"command_call_terminate", terminate, `{}`},
+		"call.answered without the answer":    {"event_call_answered", answered, `{"call_id":"CALL1"}`},
+		"call.answered without the call":      {"event_call_answered", answered, `{"sdp":"v=0"}`},
+		"call.offer with an sdp not a string": {"event_call_offer", offer, `{"call_id":"CALL1","from":{"phone":"5541999990000"},"sdp":0}`},
+		"calls.answer not a boolean":          {"command_session_connect", connect, `{"pairing":"qr","calls":{"answer":"yes"}}`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			schema := compile(t, "#/definitions/"+test.definition)
+			if test.valid == test.invalid {
+				t.Fatalf("the invalid frame is the valid one: %s", test.invalid)
+			}
+			if err := schema.Validate(decode(t, test.valid)); err != nil {
+				t.Fatalf("the frame this case starts from does not validate against %s: %v", test.definition, err)
+			}
+			if err := schema.Validate(decode(t, test.invalid)); err == nil {
+				t.Fatalf("%s validates against %s, and a client could send it", test.invalid, test.definition)
+			}
+		})
+	}
+}
+
+func decode(t *testing.T, payload string) any {
+	t.Helper()
+	var decoded any
+	if err := json.Unmarshal([]byte(payload), &decoded); err != nil {
+		t.Fatalf("unmarshal %s: %v", payload, err)
+	}
+	return decoded
+}

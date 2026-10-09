@@ -417,6 +417,70 @@ func TestUnsupportedCommandIsRefusedWithItsCode(t *testing.T) {
 	}
 }
 
+// The call commands are in the contract before this build carries them out (#383), so
+// a client that sends one is told so, in whichever of the two shapes its command has:
+// call.start is an RPC and gets a reply, the other two get a command.failed.
+func TestCallCommandsAreRefusedAsUnsupported(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	ctx := context.Background()
+
+	if _, err := h.manager.Adopt(ctx, "s1"); err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+
+	var acked atomic.Bool
+	h.manager.Dispatch(delivery(&protocol.Command{
+		V: protocol.Version, ID: "start", Type: protocol.CommandCallStart, SID: "s1",
+		ReplyTo: "start", IdempotencyKey: "call-start:1",
+		Payload: json.RawMessage(`{"to":{"kind":"phone","id":"5511999990000"},"sdp":"v=0"}`),
+	}, &acked))
+	waitFor(t, "the reply", func() bool { _, ok := h.recorder.reply("start"); return ok })
+	reply, _ := h.recorder.reply("start")
+	if reply.OK || reply.Error == nil || reply.Error.Code != protocol.ErrorUnsupported {
+		t.Fatalf("call.start reply = %+v, want an unsupported error", reply)
+	}
+
+	for _, command := range []struct {
+		id      string
+		kind    protocol.CommandType
+		payload string
+	}{
+		{"accept", protocol.CommandCallAccept, `{"call_id":"CALL1","sdp":"v=0"}`},
+		{"terminate", protocol.CommandCallTerminate, `{"call_id":"CALL1"}`},
+	} {
+		var acked atomic.Bool
+		h.manager.Dispatch(delivery(&protocol.Command{
+			V: protocol.Version, ID: command.id, Type: command.kind, SID: "s1",
+			IdempotencyKey: command.id, Payload: json.RawMessage(command.payload),
+		}, &acked))
+		waitFor(t, "the "+string(command.kind)+" to be answered", acked.Load)
+	}
+
+	codes := map[string]protocol.ErrorCode{}
+	for _, event := range h.recorder.published() {
+		if event.Type != protocol.EventCommandFailed {
+			continue
+		}
+		var body struct {
+			CommandID string `json:"command_id"`
+			Error     struct {
+				Code protocol.ErrorCode `json:"code"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal(event.Payload, &body); err != nil {
+			t.Fatalf("unmarshal a failure: %v", err)
+		}
+		codes[body.CommandID] = body.Error.Code
+	}
+	for _, id := range []string{"accept", "terminate"} {
+		if codes[id] != protocol.ErrorUnsupported {
+			t.Fatalf("command.failed for %s carries %q, want %q (all failures: %v)", id, codes[id], protocol.ErrorUnsupported, codes)
+		}
+	}
+}
+
 // The caller stopped waiting, so running the command is a side effect nobody will read
 // the outcome of.
 func TestExpiredCommandIsRefusedWithoutRunning(t *testing.T) {
