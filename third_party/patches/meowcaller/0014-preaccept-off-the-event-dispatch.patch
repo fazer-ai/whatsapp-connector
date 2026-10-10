@@ -1,0 +1,30 @@
+Write the preaccept of an inbound call on a goroutine of its own, off whatsmeow's event dispatch.
+
+Origin: fazer-ai/whatsapp-connector, upstream meowcaller code (not from a pull request).
+
+Why: onOffer runs on whatsmeow's event dispatch and wrote the preaccept there, with context.Background(). whatsmeow's socket writes with the socket's own context and not the caller's, so a socket that stops draining held the offer, and every node behind it (messages, call terminations), until the socket closed or whatsmeow's handler escape fired. The call is registered before the write and before the integrator hears of it, so moving the write out changes nothing that depends on its order: the accept is deferred until the peer's mute_v2, which follows the preaccept.
+
+diff --git a/engine.go b/engine.go
+index d75111a..73d8ff0 100644
+--- a/engine.go
++++ b/engine.go
+@@ -723,9 +723,16 @@ func (e *engine) onOffer(ev *events.CallOffer) {
+ 	// Answer/Reject decision. It keeps the offer alive and joins the relay election while
+ 	// the integrator decides — even a call the user goes on to decline has usually already
+ 	// been preaccepted.
+-	if err := e.sendPreaccept(ev.CallID, ev.From, ev.CallCreator, isVideo); err != nil {
+-		e.c.log.Warn().Err(err).Str("call_id", ev.CallID).Msg("preaccept failed")
+-	}
++	//
++	// The write goes out on a goroutine of its own: onOffer runs on whatsmeow's event
++	// dispatch, and a socket that stops draining would hold this offer, and every node
++	// behind it, for as long as the write blocks. The call is registered above, before
++	// the integrator hears of it, so nothing that follows depends on the write's order.
++	go func(callID string, to, creator types.JID) {
++		if err := e.sendPreaccept(callID, to, creator, isVideo); err != nil {
++			e.c.log.Warn().Err(err).Str("call_id", callID).Msg("preaccept failed")
++		}
++	}(ev.CallID, ev.From, ev.CallCreator)
+ 
+ 	if fn := e.c.incomingCallHandler(); fn != nil {
+ 		fn(call)

@@ -47,3 +47,11 @@ Nothing on the wire tells such a number apart. Its `<pair-success>` carries the 
 cannot detect it and does not guess: inferring it from an absence would mark a healthy new
 inbox as limited. A client that onboarded the number knows which path it came in by, and
 that is where the warning belongs.
+
+## Calls the connector does not carry
+
+A session connected with `proxy` does not carry the voice of calls, whatever its `calls.answer` says: the call commands are answered `unsupported` and `call.offer` comes without `sdp`. The voice of a call goes to WhatsApp's relays over UDP sockets meowcaller opens itself, which no HTTP or SOCKS5 proxy here carries, so the call would leave from the connector's own address, the one the proxy exists to keep out of it.
+
+Another linked device of the same account can end a call before anybody answers it. Measured on the live bench of #383: a linked device of the called account declined every call 175 ms after the offer, and WhatsApp then ended the call for every device, the caller's phone included, with a terminate whose reason is `rejected_elsewhere`, 0.4 s after the offer. The connector publishes that `call.terminate`, and there is nothing for it to answer. An account whose calls an agent is meant to take should not have a linked device that refuses calls on its own, such as another integration with its own auto-reject.
+
+A call the connector places rings the contact's phone and none of the contact's linked devices: WhatsApp Desktop and WhatsApp Web stay silent, and only the phone can answer. The offer is addressed to the phone alone on purpose (meowcaller patch 0003). With the offer sent to every device, a Desktop or Web left open preaccepts first, and after the phone answers none of the phone's audio reaches the connector. Measured in #380 on 2026-10-07, and again on the bench of #383 on 2026-10-10: a contact with WhatsApp Web open saw the connector's calls on the phone only, while an ordinary call from another phone rang that same Web client. Calls the contact places are a different path: one placed from the phone of a contact with WhatsApp Web open was answered with voice both ways on the same bench.

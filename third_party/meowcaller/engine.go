@@ -32,6 +32,12 @@ import (
 type engine struct {
 	c *Client
 
+	// later is the writes made from whatsmeow's event dispatch, in the order they were
+	// made, and laterRunning whether a goroutine is draining them; see sendLater.
+	laterMu      sync.Mutex
+	later        []func()
+	laterRunning bool
+
 	mu              sync.Mutex
 	calls           map[string]*engineCall // keyed by call-id
 	staleOffers     map[string]struct{}    // offers replayed too old to answer, by call-id; see onCallRaw
@@ -602,12 +608,17 @@ func (e *engine) placeCall(ctx context.Context, target string, opts CallOptions)
 		// The caller gets no Call to hang up, so the registration and its key
 		// material would otherwise stay in e.calls for the client's lifetime.
 		e.finishCall(callID, "offer_failed")
-		return nil, fmt.Errorf("send offer: %w", err)
+		return nil, fmt.Errorf("%w: %w", ErrSendOffer, err)
 	}
 	e.c.log.Info().Str("call_id", callID).Bool("video", opts.Video).Msg("offer sent; media starts when the relay endpoint arrives")
 	e.c.diag.Emit("meta", map[string]any{"event": "offer_sent", "call_id": callID, "peer_lid": peerLID.String(), "direction": "out", "video": opts.Video})
 	return call, nil
 }
+
+// ErrSendOffer is a placed call whose offer write failed: the offer may have reached
+// WhatsApp, and the callee's phone may be ringing. Every other error Call returns comes
+// before that write.
+var ErrSendOffer = errors.New("send offer")
 
 // onOffer handles an inbound <offer> event: it decrypts the callKey, captures any relay
 // data, registers the Call in the Ringing phase, sends the <preaccept> eagerly (a
@@ -619,6 +630,13 @@ func (e *engine) onOffer(ev *events.CallOffer) {
 	_, stale := e.staleOffers[ev.CallID]
 	delete(e.staleOffers, ev.CallID)
 	e.mu.Unlock()
+
+	// Before anything is sent or recorded: an offer the integrator does not want engaged
+	// must leave no trace, or a preaccept from this device changes how the call rings
+	// on every other one.
+	if gate := e.c.offerGate; gate != nil && !gate(ev) {
+		return
+	}
 
 	// Source of truth: https://github.com/purpshell/meowcaller/blob/33854919e64bdd4b053054ac9764d8fc63027b57/datasheets/voip-group-invite-accept.md#L28-L40
 	groupSnapshot, isGroup, groupErr := signaling.ParseGroupInviteSnapshot(ev.Data)
@@ -654,7 +672,11 @@ func (e *engine) onOffer(ev *events.CallOffer) {
 		return
 	}
 
-	callKey, err := decryptInboundCallKey(context.Background(), e.c.wa, ev)
+	// On the client's own lifetime rather than a context of its own: this runs inside
+	// whatsmeow's event dispatch and reads the store, and a store that stalls would
+	// otherwise hold the dispatch, and the integrator's shutdown waiting behind it, for as
+	// long as the stall lasts.
+	callKey, err := decryptInboundCallKey(e.c.lifetime(), e.c.wa, ev)
 	if err != nil {
 		e.c.log.Warn().Err(err).Str("call_id", ev.CallID).Msg("decrypt callKey failed")
 		return
@@ -707,17 +729,26 @@ func (e *engine) onOffer(ev *events.CallOffer) {
 		e.c.log.Info().Str("call_id", ev.CallID).Msg("inbound call advertises video")
 	}
 
+	// The integrator is told first, so that a call it discards from the callback is gone
+	// before the preaccept is queued, and the queued preaccept is skipped for a call that
+	// is gone by the time its turn comes: Discard promises that nothing is signalled.
+	if fn := e.c.incomingCallHandler(); fn != nil {
+		fn(call)
+	}
+
 	// Preaccept eagerly: it is a preparation step, done independently of the later
 	// Answer/Reject decision. It keeps the offer alive and joins the relay election while
 	// the integrator decides — even a call the user goes on to decline has usually already
 	// been preaccepted.
-	if err := e.sendPreaccept(ev.CallID, ev.From, ev.CallCreator, isVideo); err != nil {
-		e.c.log.Warn().Err(err).Str("call_id", ev.CallID).Msg("preaccept failed")
-	}
-
-	if fn := e.c.incomingCallHandler(); fn != nil {
-		fn(call)
-	}
+	callID, to, creator := ev.CallID, ev.From, ev.CallCreator
+	e.sendLater(func() {
+		if e.lookup(callID) == nil {
+			return
+		}
+		if err := e.sendPreaccept(callID, to, creator, isVideo); err != nil {
+			e.c.log.Warn().Err(err).Str("call_id", callID).Msg("preaccept failed")
+		}
+	})
 }
 
 func (e *engine) onGroupOffer(ev *events.CallOffer, update groupCallUpdate) {
@@ -842,15 +873,17 @@ func (e *engine) sendAccept(callID string, to, creator types.JID) {
 		Video:      isVideo,
 	})
 	accept.Attrs["id"] = e.c.wa.DangerousInternals().GenerateRequestID()
-	if err := e.c.wa.DangerousInternals().SendNode(context.Background(), accept); err != nil {
-		// acceptPending is already cleared, so no later mute_v2 retries this, and
-		// the peer never learns the call was answered: end it rather than leave
-		// media running for a call nobody accepted.
-		e.c.log.Error().Err(err).Str("call_id", callID).Msg("send accept failed")
-		e.finishCall(callID, "accept_failed")
-		return
-	}
-	e.c.log.Info().Str("call_id", callID).Bool("video", isVideo).Msg("accepted (after mute_v2)")
+	e.sendLater(func() {
+		if err := e.c.wa.DangerousInternals().SendNode(context.Background(), accept); err != nil {
+			// acceptPending is already cleared, so no later mute_v2 retries this, and
+			// the peer never learns the call was answered: end it rather than leave
+			// media running for a call nobody accepted.
+			e.c.log.Error().Err(err).Str("call_id", callID).Msg("send accept failed")
+			e.finishCall(callID, "accept_failed")
+			return
+		}
+		e.c.log.Info().Str("call_id", callID).Bool("video", isVideo).Msg("accepted (after mute_v2)")
+	})
 
 	// The accept is on the wire; release any camera toggle that arrived early.
 	e.mu.Lock()
@@ -904,13 +937,33 @@ func (e *engine) terminate(c *Call, reason string) error {
 	if m != nil {
 		to, creator = m.from, m.creator
 	}
-	term := signaling.BuildTerminate(&signaling.TerminateParams{CallID: c.id, To: to, CallCreator: creator})
-	term.Attrs["id"] = e.nextCallNodeID()
+	c.mu.Lock()
+	c.endTo, c.endCreator = to, creator
+	c.mu.Unlock()
 	e.finishCall(c.id, reason)
+	return e.sendTerminate(c.id, to, creator)
+}
+
+// sendTerminate writes a call's <terminate>, under a node id of its own.
+func (e *engine) sendTerminate(callID string, to, creator types.JID) error {
+	term := signaling.BuildTerminate(&signaling.TerminateParams{CallID: callID, To: to, CallCreator: creator})
+	term.Attrs["id"] = e.nextCallNodeID()
 	if err := e.transmitCallNode(context.Background(), term); err != nil {
 		return fmt.Errorf("send terminate: %w", err)
 	}
 	return nil
+}
+
+// hangupAgain writes the <terminate> of a call already ended here, to whom the first one
+// was addressed.
+func (e *engine) hangupAgain(c *Call) error {
+	c.mu.Lock()
+	to, creator := c.endTo, c.endCreator
+	c.mu.Unlock()
+	if to.IsEmpty() {
+		return fmt.Errorf("meowcaller: call %s was never hung up", c.id)
+	}
+	return e.sendTerminate(c.id, to, creator)
 }
 
 // onRelay records relay data from a relaylatency/transport/ack stanza and starts media
@@ -1016,6 +1069,7 @@ func (e *engine) onRelayLatency(ev *events.CallRelayLatency) {
 			addr:      nodeBytes(te),
 		})
 	}
+	var responses []waBinary.Node
 	for _, p := range probes {
 		resp := signaling.BuildRelayLatency(&signaling.RelayLatencyParams{
 			CallID:       ev.CallID,
@@ -1026,11 +1080,17 @@ func (e *engine) onRelayLatency(ev *events.CallRelayLatency) {
 			AddressBytes: p.addr,
 		})
 		resp.Attrs["id"] = e.c.wa.GenerateMessageID()
-		if err := e.c.wa.DangerousInternals().SendNode(context.Background(), resp); err != nil {
-			e.c.log.Error().Err(err).Str("call_id", ev.CallID).Msg("send relaylatency failed")
-			return
-		}
+		responses = append(responses, resp)
 	}
+	callID := ev.CallID
+	e.sendLater(func() {
+		for _, resp := range responses {
+			if err := e.c.wa.DangerousInternals().SendNode(context.Background(), resp); err != nil {
+				e.c.log.Error().Err(err).Str("call_id", callID).Msg("send relaylatency failed")
+				return
+			}
+		}
+	})
 }
 
 // onPreAccept records that the peer's device received and started preparing an outgoing call.
@@ -1275,12 +1335,17 @@ func (e *engine) onCallRaw(callNode *waBinary.Node) bool {
 			e.c.log.Warn().
 				Str("action", kids[0].Tag).
 				Msg("call control ack: missing id/from")
-		} else if err := e.transmitCallNode(context.Background(), ack); err != nil {
-			e.c.log.Warn().
-				Err(err).
-				Str("action", kids[0].Tag).
-				Str("id", ack.AttrGetter().String("id")).
-				Msg("send typed call control ack failed")
+		} else {
+			action := kids[0].Tag
+			e.sendLater(func() {
+				if err := e.transmitCallNode(context.Background(), ack); err != nil {
+					e.c.log.Warn().
+						Err(err).
+						Str("action", action).
+						Str("id", ack.AttrGetter().String("id")).
+						Msg("send typed call control ack failed")
+				}
+			})
 		}
 		e.onUnknownCallEvent(callNode)
 		return true
@@ -1344,11 +1409,44 @@ func (e *engine) ackVideoStanza(callNode *waBinary.Node) {
 		e.c.log.Warn().Msg("video ack: missing id/from, not acking")
 		return
 	}
-	if err := e.c.wa.DangerousInternals().SendNode(context.Background(), ack); err != nil {
-		e.c.log.Warn().Err(err).Str("id", ack.AttrGetter().String("id")).Msg("send video ack failed")
+	e.sendLater(func() {
+		if err := e.c.wa.DangerousInternals().SendNode(context.Background(), ack); err != nil {
+			e.c.log.Warn().Err(err).Str("id", ack.AttrGetter().String("id")).Msg("send video ack failed")
+			return
+		}
+		e.c.log.Debug().Str("id", ack.AttrGetter().String("id")).Msg("sent type=video ack")
+	})
+}
+
+// sendLater runs a write off whatsmeow's event dispatch, after every write queued before
+// it. A write made on the dispatch holds every node behind it for as long as it blocks,
+// and whatsmeow's socket writes with the socket's own context, so a socket that stops
+// draining held the account's messages and call terminations until it closed. The
+// writes keep their order: one goroutine drains them, started when the first is queued
+// and gone when none is left.
+func (e *engine) sendLater(send func()) {
+	e.laterMu.Lock()
+	e.later = append(e.later, send)
+	if e.laterRunning {
+		e.laterMu.Unlock()
 		return
 	}
-	e.c.log.Debug().Str("id", ack.AttrGetter().String("id")).Msg("sent type=video ack")
+	e.laterRunning = true
+	e.laterMu.Unlock()
+	go func() {
+		for {
+			e.laterMu.Lock()
+			if len(e.later) == 0 {
+				e.laterRunning = false
+				e.laterMu.Unlock()
+				return
+			}
+			next := e.later[0]
+			e.later = e.later[1:]
+			e.laterMu.Unlock()
+			next()
+		}
+	}()
 }
 
 // onVideoStanza handles an inbound standalone <video> state stanza — the peer's video

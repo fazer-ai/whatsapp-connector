@@ -1,0 +1,111 @@
+Let the integrator decide, per inbound offer, whether the client engages the call at all.
+
+Origin: fazer-ai/whatsapp-connector, upstream meowcaller code (not from a pull request).
+
+Why: the connector builds the meowcaller client when it builds the whatsmeow client,
+before it knows whether the session that is about to connect asked for calls to be
+answered (`calls.answer`), and the client cannot be installed later, once whatsmeow is
+connected. Without a gate, onOffer preaccepts every offer as soon as it arrives, which
+announces this device as ringing for every call on an account whose client never asked
+for calls: the account's phone and its other devices see a linked device join a call it
+will never answer.
+
+WithOfferGate is consulted at the top of onOffer, after the stale-offer mark is consumed
+and before anything is sent or recorded. A refused offer gets no preaccept, no engine
+entry and no OnIncomingCall, which covers group offers as well. Without the option every
+offer is engaged, as before.
+
+diff --git a/client.go b/client.go
+index c1e41d3..655c776 100644
+--- a/client.go
++++ b/client.go
+@@ -11,6 +11,7 @@ import (
+ 	"github.com/rs/zerolog"
+ 	"go.mau.fi/whatsmeow"
+ 	"go.mau.fi/whatsmeow/types"
++	"go.mau.fi/whatsmeow/types/events"
+ )
+ 
+ // Client is the managed entry point to the WhatsApp calling stack. It wraps a
+@@ -19,10 +20,11 @@ import (
+ //
+ // The library never configures logging; pass WithLogger to surface its debug/trace.
+ type Client struct {
+-	wa   *whatsmeow.Client
+-	log  zerolog.Logger
+-	diag *diag.Recorder
+-	eng  *engine
++	wa        *whatsmeow.Client
++	log       zerolog.Logger
++	diag      *diag.Recorder
++	eng       *engine
++	offerGate func(*events.CallOffer) bool
+ 
+ 	getGroupInfo func(context.Context, types.JID) (*types.GroupInfo, error)
+ 	ownGroupJIDs func() []types.JID
+@@ -52,7 +54,7 @@ type GroupCallOptions struct {
+ func NewClient(wa *whatsmeow.Client, opts ...Option) *Client {
+ 	cfg := resolveConfig(opts)
+ 	c := &Client{
+-		wa: wa, log: cfg.log, diag: cfg.diag,
++		wa: wa, log: cfg.log, diag: cfg.diag, offerGate: cfg.offerGate,
+ 		getGroupInfo: wa.GetGroupInfo,
+ 		ownGroupJIDs: func() []types.JID {
+ 			return []types.JID{wa.Store.GetJID(), wa.Store.GetLID()}
+diff --git a/engine.go b/engine.go
+index 16e5feb..0c575f9 100644
+--- a/engine.go
++++ b/engine.go
+@@ -620,6 +620,13 @@ func (e *engine) onOffer(ev *events.CallOffer) {
+ 	delete(e.staleOffers, ev.CallID)
+ 	e.mu.Unlock()
+ 
++	// Before anything is sent or recorded: an offer the integrator does not want engaged
++	// must leave no trace, or a preaccept from this device changes how the call rings
++	// on every other one.
++	if gate := e.c.offerGate; gate != nil && !gate(ev) {
++		return
++	}
++
+ 	// Source of truth: https://github.com/purpshell/meowcaller/blob/33854919e64bdd4b053054ac9764d8fc63027b57/datasheets/voip-group-invite-accept.md#L28-L40
+ 	groupSnapshot, isGroup, groupErr := signaling.ParseGroupInviteSnapshot(ev.Data)
+ 	if groupErr != nil {
+diff --git a/logging.go b/logging.go
+index 365fc49..cfbe47a 100644
+--- a/logging.go
++++ b/logging.go
+@@ -3,15 +3,18 @@ package meowcaller
+ import (
+ 	"github.com/purpshell/meowcaller/diag"
+ 	"github.com/rs/zerolog"
++	"go.mau.fi/whatsmeow/types/events"
+ )
+ 
+-// Option configures optional, non-behavioral aspects of the call/media types —
+-// currently the diagnostic logger. The zero configuration logs nothing.
++// Option configures optional aspects of the call/media types: the diagnostic logger, and
++// the gate on which inbound offers are engaged. The zero configuration logs nothing and
++// engages every offer.
+ type Option func(*config)
+ 
+ type config struct {
+-	log  zerolog.Logger
+-	diag *diag.Recorder
++	log       zerolog.Logger
++	diag      *diag.Recorder
++	offerGate func(*events.CallOffer) bool
+ }
+ 
+ func resolveConfig(opts []Option) config {
+@@ -37,3 +40,11 @@ func WithLogger(l zerolog.Logger) Option {
+ func WithDiagnostics(rec *diag.Recorder) Option {
+ 	return func(c *config) { c.diag = rec }
+ }
++
++// WithOfferGate decides, per inbound offer, whether this client takes part in the call
++// at all. An offer the gate refuses is left alone: no preaccept, no per-call state and
++// no OnIncomingCall, so the call rings on the account's other devices exactly as it
++// would without this client. Without a gate every offer is engaged.
++func WithOfferGate(gate func(*events.CallOffer) bool) Option {
++	return func(c *config) { c.offerGate = gate }
++}

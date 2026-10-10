@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/purpshell/meowcaller"
 	"github.com/rs/zerolog"
 	qrcode "github.com/skip2/go-qrcode"
 	wm "go.mau.fi/whatsmeow"
@@ -26,6 +27,7 @@ import (
 	waEvents "go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 
+	"github.com/fazer-ai/whatsapp-connector/internal/calls"
 	"github.com/fazer-ai/whatsapp-connector/internal/engine"
 	"github.com/fazer-ai/whatsapp-connector/internal/media"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
@@ -75,6 +77,17 @@ type Session struct {
 	mu        sync.Mutex
 	client    *wm.Client
 	handlerID uint32
+	// retiredHandler is set once the client handlerID belongs to is being replaced, and
+	// from then on that handler drops what it is handed. See adopt.
+	retiredHandler *atomic.Bool
+	// endLifetime ends the background context of the client handlerID belongs to, which is
+	// what its handlers and meowcaller's run on. Called when that client is retired, so a
+	// store read one of them is stalled on does not outlive it. See rebuild.
+	endLifetime context.CancelFunc
+	// notices is held for reading by a call notice published after a wait, from its fence
+	// check to its publication, and taken by a rebuild to retire a client. The wait runs
+	// off whatsmeow's handler list, so removing the handler does not wait for it; this does.
+	notices sync.RWMutex
 
 	// detach removes the event handler from a client. It is a field only so the
 	// teardown order can be held to: whatsmeow runs a handler under a lock that
@@ -88,6 +101,14 @@ type Session struct {
 	// nothing outside the library can put it in that state, so a test cannot otherwise
 	// reach the path where a disconnect outlives its deadline.
 	disconnect func(*wm.Client)
+
+	// closeSocket is the disconnect Close and a rebuild make, apart from the one above so
+	// that a test holding a hang-up's disconnect does not hold every Close with it. A field
+	// so a test can tell that both disconnect before they wait on the handlers.
+	closeSocket func(*wm.Client)
+	// hangupGrace is how long Close waits for the hang-ups of the calls it ends to be
+	// written before it closes the socket. A field so a test can tell the two apart.
+	hangupGrace time.Duration
 
 	// logout ends the session on WhatsApp's side. A field for the same reason as the two
 	// above: whatsmeow refuses to log out a client that never connected, so nothing
@@ -524,6 +545,19 @@ type Session struct {
 	// autoRejectCalls is the last connect's `calls.auto_reject`. Guarded by mu, written
 	// by Connect and read by the handler for every call that arrives.
 	autoRejectCalls bool
+	// answerCalls is the last connect's `calls.answer`. Guarded by mu. It only takes
+	// effect where callMedia is set, and `calls.auto_reject` wins over it.
+	answerCalls bool
+	// callMedia is the deployment's media socket for calls, nil when calls are off.
+	// Set in newSession and never replaced.
+	callMedia *calls.Media
+	// caller is meowcaller on the current client, nil when calls are off. Guarded by mu,
+	// and replaced with the client: it is installed on one client and cannot move.
+	caller *meowcaller.Client
+	// bridge is the calls this session carries the voice of.
+	bridge bridgeState
+	// dialCall places a call; a seam so a test can stand in for meowcaller.
+	dialCall func(ctx context.Context, target string) (bridgedCall, error)
 
 	// history is the last connect's `history_sync`: whether the client wants the phone's
 	// history published. Guarded by mu, written by Connect and read for every dump.
@@ -554,6 +588,11 @@ type Session struct {
 	// sends as the call arrives. Same shape and same limit as `presenceWait`, and the
 	// same #74 caveat about the socket lock it cannot reach past.
 	callWait time.Duration
+
+	// offerWait is how long a session that answers calls holds a `call.offer` announced
+	// by `offer_notice` for the `offer` of the same call, which is the one meowcaller
+	// engages and the only one the browser's SDP can be built for.
+	offerWait time.Duration
 
 	// transition serialises a change to the socket's state with the event announcing
 	// it. It is not mu: emit can block on a full inbox, and holding the session's own
@@ -742,25 +781,27 @@ func newSession(
 ) *Session {
 	lifetime, cancel := context.WithCancel(context.Background())
 	s := &Session{
-		sid:        sid,
-		route:      newEgressRoute(),
-		aliases:    newAlias(),
-		store:      scoped,
-		log:        log.With().Str("sid", sid).Logger(),
-		waLog:      wa,
-		inbox:      make(chan pending, inboxDepth),
-		ends:       make(chan struct{}, owedEnds),
-		events:     make(chan engine.Emission),
-		done:       make(chan struct{}),
-		inFlight:   map[*groupWrite]struct{}{},
-		queueing:   queueing,
-		ctx:        lifetime,
-		cancel:     cancel,
-		detach:     func(client *wm.Client, id uint32) { client.RemoveEventHandler(id) },
-		disconnect: func(client *wm.Client) { client.Disconnect() },
-		nonce:      sessionNonce(),
-		logout:     func(ctx context.Context, client *wm.Client) error { return client.Logout(ctx) },
-		download:   downloadOverClient,
+		sid:         sid,
+		route:       newEgressRoute(),
+		aliases:     newAlias(),
+		store:       scoped,
+		log:         log.With().Str("sid", sid).Logger(),
+		waLog:       wa,
+		inbox:       make(chan pending, inboxDepth),
+		ends:        make(chan struct{}, owedEnds),
+		events:      make(chan engine.Emission),
+		done:        make(chan struct{}),
+		inFlight:    map[*groupWrite]struct{}{},
+		queueing:    queueing,
+		ctx:         lifetime,
+		cancel:      cancel,
+		detach:      func(client *wm.Client, id uint32) { client.RemoveEventHandler(id) },
+		disconnect:  func(client *wm.Client) { client.Disconnect() },
+		closeSocket: func(client *wm.Client) { client.Disconnect() },
+		hangupGrace: closeHangupGrace,
+		nonce:       sessionNonce(),
+		logout:      func(ctx context.Context, client *wm.Client) error { return client.Logout(ctx) },
+		download:    downloadOverClient,
 		retrieve: func(ctx context.Context, address string, headers map[string]string) (source, error) {
 			return retrieveOverHTTP(ctx, address, headers, blobs.FetchHosts)
 		},
@@ -853,6 +894,7 @@ func newSession(
 		presenceWrite:       make(chan struct{}, 1),
 		presenceWait:        presenceWriteTimeout,
 		callWait:            callWriteTimeout,
+		offerWait:           offerAfterNotice,
 		board:               make(map[string]posted),
 		owedPlaces:          make(map[string]owedPlace),
 		downloadWait:        downloadTimeout,
@@ -863,8 +905,10 @@ func newSession(
 		historyReplayBudget: historyReplayBudget,
 		sending:             make(chan struct{}, 1),
 		uploadWait:          uploadTimeout,
+		callMedia:           blobs.Calls,
 	}
 	s.route.notify = s.proxyOutcome
+	s.dialCall = s.dialOverCaller
 	s.readPendingHistory = s.store.PendingHistory
 	s.declineCall = func(ctx context.Context, client *wm.Client, caller waTypes.JID, callID string) error {
 		if client == nil {
@@ -980,7 +1024,10 @@ func (s *Session) adopt(ctx context.Context, client *wm.Client) bool {
 	client.EnableAutoReconnect = true
 	client.PrePairCallback = s.bind
 	client.GetClientPayload = s.payloadWithHistory(client)
-	client.BackgroundEventCtx = s.ctx
+	// The client's own lifetime, inside the session's: the session closing ends it, and so
+	// does this client being replaced by a rebuild, which the session outlives.
+	lifetime, endLifetime := context.WithCancel(s.ctx)
+	client.BackgroundEventCtx = lifetime
 	// The ack for an inbound message waits for the handlers, and a handler that reports
 	// failure stops it being sent at all. That pairing is what lets this build refuse a
 	// message it cannot publish instead of telling WhatsApp it was delivered: the
@@ -1009,19 +1056,60 @@ func (s *Session) adopt(ctx context.Context, client *wm.Client) bool {
 	// holds it yet, so whatsmeow's own goroutines are not writing to it.
 	named := identityOf(client)
 
+	// meowcaller before this session's own handler, and on every client rather than when
+	// a connect asks for calls: it has to be installed before the client connects, and
+	// its handler has to run first, so a call it engages is known by the time callOffered
+	// builds the offer for it. Its gate is what keeps it out of every call a session did
+	// not ask to answer.
+	//
+	// Both of its callbacks are fenced with this client, like the session's own handler
+	// below: an offer meowcaller is still working through when a rebuild retires the client
+	// would otherwise be engaged, and registered, on the session its replacement owns.
+	retiredHandler := new(atomic.Bool)
+	var caller *meowcaller.Client
+	if s.callMedia != nil {
+		caller = meowcaller.NewClient(client,
+			meowcaller.WithLogger(s.log.With().Str("sub", "calls").Logger()),
+			meowcaller.WithOfferGate(func(event *waEvents.CallOffer) bool {
+				return s.engagesOfferFrom(retiredHandler, event)
+			}))
+		caller.OnIncomingCall(func(call *meowcaller.Call) { s.ringingFrom(retiredHandler, call) })
+	}
+
+	// The calls of the client being replaced end with it: meowcaller's media runs on a
+	// context of its own and does not see the logout or the drop that brought this
+	// rebuild, so a call left to it would outlive the account it belonged to. Not waited
+	// for, since the socket they would be written on is the one being retired.
+	retired, stop := context.WithCancel(context.Background())
+	stop()
+	s.endCalls(retired)
+
 	// Subscribed before the swap, so the client is never live with nobody listening,
 	// and both halves are one lifecycle step: a Close that lands between them would
 	// otherwise leave a handler on a client the session no longer knows about.
-	handlerID := client.AddEventHandlerWithSuccessStatus(s.handle)
+	//
+	// Fenced, because removing the handler is not always waited for: a rebuild gives up on
+	// a removal stalled behind meowcaller's handler and adopts the next client anyway, and
+	// whatsmeow runs its whole handler list under one lock, so this one would still be
+	// called when the stalled one returns, with an event from the retired account, on the
+	// session the replacement now owns. A fenced event is left unacknowledged.
+	handlerID := client.AddEventHandlerWithSuccessStatus(func(event any) bool {
+		if retiredHandler.Load() {
+			return false
+		}
+		return s.handle(event)
+	})
 
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
 		client.RemoveEventHandler(handlerID)
 		client.Disconnect()
+		endLifetime()
 		return false
 	}
 	s.client = client
+	s.caller = caller
 	// A mark about the client being replaced describes a drop from a socket this session no
 	// longer holds, and the argument for keeping one otherwise does not survive here: it
 	// rests on whatsmeow announcing its own reconnect, and a client adopted after a logout
@@ -1029,6 +1117,8 @@ func (s *Session) adopt(ctx context.Context, client *wm.Client) bool {
 	// swallowed for good.
 	s.dropAnnounced = false
 	s.handlerID = handlerID
+	s.retiredHandler = retiredHandler
+	s.endLifetime = endLifetime
 	s.phone = named.phone
 	s.lid = named.lid
 	// A rebuilt client brings the device record's copy of these names back, and the marker
@@ -1279,10 +1369,18 @@ func (s *Session) wantsGroups() bool {
 	return s.groups
 }
 
-func (s *Session) setCallPolicy(autoReject bool) {
+func (s *Session) setCallPolicy(autoReject, answer bool) {
 	s.mu.Lock()
 	s.autoRejectCalls = autoReject
+	s.answerCalls = answer
 	s.mu.Unlock()
+}
+
+// callPolicy is the last connect's `calls`, as it was asked.
+func (s *Session) callPolicy() (autoReject, answer bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.autoRejectCalls, s.answerCalls
 }
 
 func (s *Session) rejectsCalls() bool {
@@ -1853,7 +1951,23 @@ func (s *Session) Connect(ctx context.Context, req engine.ConnectRequest) error 
 	// next connect that happened to succeed.
 	s.setGroups(req.Groups)
 	s.setHistory(req.HistorySync)
-	s.setCallPolicy(req.Calls != nil && req.Calls.AutoReject)
+	if req.Calls == nil || !req.Calls.Answer || req.Calls.AutoReject || req.ProxyURL() != "" {
+		// A connect that stops this session carrying calls ends the ones it carries
+		// first: on a proxy their media would go on leaving from this host's address,
+		// and with the policy off nothing could end them any more. No call registers
+		// from here until this connect returns, with its policy and route in place.
+		s.bridge.mu.Lock()
+		s.bridge.pausing++
+		s.bridge.mu.Unlock()
+		defer func() {
+			s.bridge.mu.Lock()
+			s.bridge.pausing--
+			s.bridge.mu.Unlock()
+		}()
+		s.endCalls(ctx)
+	}
+	s.setCallPolicy(req.Calls != nil && req.Calls.AutoReject, req.Calls != nil && req.Calls.Answer)
+	s.backOnline()
 
 	// A hang-up an earlier command left running is waited for first: the move below may
 	// start one of its own, and awaitHangUp only knows about the latest.
@@ -1945,7 +2059,7 @@ func (s *Session) standOnWhatWasAsked(ctx context.Context) error {
 	}
 	s.setGroups(standing.Groups)
 	s.setHistory(standing.History)
-	s.setCallPolicy(standing.CallAutoReject)
+	s.setCallPolicy(standing.CallAutoReject, standing.CallAnswer)
 	// Nothing is dialled yet, so there is no socket to hang up: moving the route is all a
 	// proxy needs here.
 	if err := s.route.set(standing.Proxy); err != nil {
@@ -2469,6 +2583,8 @@ func (s *Session) Disconnect(ctx context.Context) error {
 	defer s.endCommand()
 
 	s.cancelPairing()
+	// Before the socket goes, while the hang-ups still have it to be written on.
+	s.goOffline(ctx)
 	// That the operator asked this session to stay down is recorded a layer up, before
 	// this call, for the same reason as in Connect and with the same ordering: before the
 	// socket goes, so an instance that dies in between does not leave an account somebody
@@ -2485,6 +2601,7 @@ func (s *Session) Logout(ctx context.Context) error {
 	defer s.endCommand()
 
 	s.cancelPairing()
+	s.goOffline(ctx)
 	ask, _ := s.askToUnlink(ctx)
 	if err := ask(ctx, s.current()); err != nil {
 		if sentNothing(err) || unanswered(err) {
@@ -2502,7 +2619,9 @@ func (s *Session) Logout(ctx context.Context) error {
 			// A guard raised now would have this session close the socket that comes
 			// back, and calling it offline would have `session.status` answer `close`
 			// for a reconnect that is going perfectly well — and a resume start a second
-			// dial alongside it.
+			// dial alongside it. So is calls registering again: the calls it carried are
+			// over, and the next one is the session's like any other.
+			s.backOnline()
 			return fmt.Errorf("whatsmeow: log %s out: %w", s.sid, neverSent(err))
 		}
 		s.settleLogout()
@@ -2582,8 +2701,10 @@ func (s *Session) Delete(ctx context.Context) error {
 		return fmt.Errorf("whatsmeow: delete %s: %w", s.sid, neverSent(unlink))
 	}
 	// Whatever WhatsApp answered, this session is not coming back. settleLogout is what
-	// keeps a reconnect from dialling on credentials that are about to be gone.
+	// keeps a reconnect from dialling on credentials that are about to be gone, and the
+	// calls go now rather than with a recovery that may not come.
 	s.settleLogout()
+	s.goOffline(ctx)
 	switch {
 	case unlink == nil:
 	case nothingToUnlink:
@@ -3283,24 +3404,46 @@ func (s *Session) rebuild(ctx context.Context) error {
 	}
 
 	s.mu.Lock()
-	previous, handlerID := s.client, s.handlerID
+	previous, handlerID, retiredHandler, endLifetime := s.client, s.handlerID, s.retiredHandler, s.endLifetime
 	s.mu.Unlock()
-	s.detach(previous, handlerID)
-	// Waited for no longer than the bound this runs on. Disconnect takes the socket lock, and
-	// a dial holds that lock for as long as the dial lasts with no context to end it: a
-	// teardown whose unlink went through while the socket dropped underneath it would answer
-	// when the dial did, which is the wait #187 is about, one step later. The client is
-	// detached already, so nothing it does from here is heard, and the disconnect still lands
-	// the moment the dial lets go.
+	// Under the notices lock: a call notice from the retired client that already passed its
+	// fence publishes before the client is retired, and one that has not yet finds it
+	// retired. The wait is bounded, since the notice's one lookup is on the store bound.
+	s.notices.Lock()
+	retiredHandler.Store(true)
+	s.notices.Unlock()
+	// Ended before anything waits on the retired client: a handler of its own, or
+	// meowcaller's decrypting an offer, can be stalled on a store read, and the socket
+	// closing does not end that, only the context the read was given.
+	if endLifetime != nil {
+		endLifetime()
+	}
+	// The socket goes first and the handler is removed after it, in full, the order Close
+	// takes. The fence above keeps out every event dispatched from here on. What it cannot
+	// reach is a handler already running, a message whose media is still downloading, and
+	// that one has to be finished before the next client is adopted: it would otherwise go
+	// on writing down and publishing, on the session the replacement owns, what the
+	// retired account received. RemoveEventHandler is what waits for it. The disconnect
+	// before it is what lets that wait end: meowcaller writes from inside its handler with a
+	// context nothing here can cancel, and such a write gives up only when the socket
+	// closes.
+	//
+	// The disconnect is waited for no longer than the bound this runs on. Disconnect takes
+	// the socket lock, and a dial holds that lock for as long as the dial lasts with no
+	// context to end it: a teardown whose unlink went through while the socket dropped
+	// underneath it would answer when the dial did, which is the wait #187 is about, one
+	// step later. A dial still in progress has no socket for a write to be stalled on, and
+	// the disconnect still lands the moment the dial lets go.
 	closed := make(chan struct{})
 	go func() {
 		defer close(closed)
-		previous.Disconnect()
+		s.closeSocket(previous)
 	}()
 	select {
 	case <-closed:
 	case <-ctx.Done():
 	}
+	s.detach(previous, handlerID)
 
 	// Dropped with the client it was filed under. Every path here has just forgotten the
 	// device, so the account that asked for it is gone, and carried over it would mark
@@ -3457,6 +3600,12 @@ func (s *Session) Execute(ctx context.Context, command *protocol.Command) (json.
 		return s.markUnread(ctx, command)
 	case protocol.CommandCallReject:
 		return s.rejectCall(ctx, command)
+	case protocol.CommandCallAccept:
+		return s.acceptCall(ctx, command)
+	case protocol.CommandCallStart:
+		return s.startCall(ctx, command)
+	case protocol.CommandCallTerminate:
+		return s.terminateCall(ctx, command)
 	case protocol.CommandHistoryRequest:
 		return s.requestHistory(ctx, command)
 	case protocol.CommandGroupLeave, protocol.CommandGroupPhotoSet, protocol.CommandGroupNameSet,
@@ -3588,8 +3737,8 @@ func (s *Session) requestCode(ctx context.Context, command *protocol.Command) er
 	request := engine.ConnectRequest{
 		Pairing: "code", Phone: body.Phone, Groups: s.wantsGroups(), HistorySync: s.wantsHistory(),
 	}
-	if s.rejectsCalls() {
-		request.Calls = &engine.CallsRequest{AutoReject: true}
+	if autoReject, answer := s.callPolicy(); autoReject || answer {
+		request.Calls = &engine.CallsRequest{AutoReject: autoReject, Answer: answer}
 	}
 	// And the proxy most of all: a connect without one is a request to go out directly,
 	// so leaving it off would move the account to this instance's address at the moment
@@ -3637,8 +3786,24 @@ func (s *Session) Close() error {
 	}
 	// Cancelled first, and that order is the whole point: whatsmeow holds its socket
 	// lock for the length of a dial, and Disconnect waits for the same lock. Cancelling
-	// afterwards would never run, and a lease handover would wait out the handshake.
+	// afterwards would never run, and a lease handover would wait out the handshake. It is
+	// also what stops whatsmeow handling what still arrives on the socket, and the store
+	// is already fenced: a message decrypted from here on could not be written down, and
+	// whatsmeow acknowledges one it cannot decrypt before anyone could publish it.
 	s.cancel()
+
+	// A call's media lives on this instance and cannot follow the account to another
+	// one, and a call left up would go on playing silence to the person on the phone. The
+	// hang-ups get a moment before the socket goes, and no more. Not waited for at all,
+	// the socket closed under them before they were written, and the other phone was left
+	// on "Reconnecting..." instead of hearing the call end (measured on a real phone).
+	// Waited for in full, a lost lease would sit on a socket that does not drain.
+	s.bridge.mu.Lock()
+	s.bridge.closed = true
+	s.bridge.mu.Unlock()
+	grace, stop := context.WithTimeout(context.Background(), s.hangupGrace)
+	s.endCalls(grace)
+	stop()
 
 	s.mu.Lock()
 	client, handlerID := s.client, s.handlerID
@@ -3651,8 +3816,13 @@ func (s *Session) Close() error {
 	// the socket still open and the lease already gone.
 	close(s.done)
 
+	// The socket goes before the handler is removed, for the handler that is not this
+	// session's: meowcaller writes from inside its own handler (a call's preaccept) with
+	// a context nothing here can cancel, RemoveEventHandler waits for every handler that
+	// is running, and only a closed socket makes a stalled write give up. The other way
+	// round, a lost lease could wait on that write with the socket still open.
+	s.closeSocket(client)
 	s.detach(client, handlerID)
-	client.Disconnect()
 
 	s.drain()
 	return nil
@@ -4825,7 +4995,7 @@ func (s *Session) handle(rawEvent any) bool {
 		// `type` says it is a group call and `group-jid` is optional, so the attribute is
 		// the one that has to decide: a notice without the id would otherwise read as a
 		// direct call from whoever started it.
-		return s.callOffered(&event.BasicCallMeta,
+		return s.callNoticed(&event.BasicCallMeta,
 			callMedia{known: event.Media != "", video: event.Media == "video"},
 			!event.GroupJID.IsEmpty() || event.Type == "group")
 	case *waEvents.CallTerminate:
@@ -5171,6 +5341,13 @@ func (s *Session) loggedOut(event *waEvents.LoggedOut) {
 	// `open` after session.logged_out, over an account WhatsApp has revoked, with nothing
 	// arriving later to correct it.
 	s.settleLogout()
+
+	// The calls go with the device, whatever becomes of the cleanup below: their media
+	// runs on contexts of their own, and nothing else would stop it if the rebuild that
+	// retires this client never comes. Not waited for, on a socket WhatsApp has revoked.
+	revoked, stop := context.WithCancel(context.Background())
+	stop()
+	s.goOffline(revoked)
 
 	// The credentials are gone on WhatsApp's side, so keeping them here would have
 	// every reconnect fail with a session that looks resumable and is not.

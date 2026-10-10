@@ -18,6 +18,15 @@ import (
 // no longer exists.
 const callWriteTimeout = 10 * time.Second
 
+// offerAfterNotice is how long an `offer_notice` waits for its `offer` on a session that
+// answers calls. The two are sent together, so the wait is for one that is not coming at
+// all, and a call rings for tens of seconds.
+const offerAfterNotice = 2 * time.Second
+
+// closeHangupGrace bounds the wait for a closing session's hang-ups. A healthy socket
+// writes one in milliseconds; a lease handover can afford this much and no more.
+const closeHangupGrace = 500 * time.Millisecond
+
 // answeredCalls is how many call ids a session remembers to tell a second announcement of
 // one call from a second call.
 //
@@ -117,6 +126,36 @@ type rejectRequest struct {
 // callOffered publishes a call this account is being rung for, and refuses it when the
 // client asked for that.
 //
+// callNoticed is an `offer_notice`. On a session that carries the voice of calls, a
+// notice for a call that could be engaged waits a little for the call's `offer`: published
+// first, it would take the call's one `call.offer`, without the SDP that only the engaged
+// offer can be given, and the client would be left with a call it cannot answer. The offer
+// arriving first publishes it, and the notice's turn then finds the call already offered;
+// an offer that never arrives leaves the notice to publish the call without SDP, unless
+// the call ended in the meantime and its end is already out, or meowcaller engaged the
+// offer and is still working through it.
+func (s *Session) callNoticed(meta *waTypes.BasicCallMeta, media callMedia, group bool) bool {
+	if s.callMedia == nil || group || (media.known && media.video) || !s.answersCalls() {
+		return s.callOffered(meta, media, group)
+	}
+	held := *meta
+	// The wait outlives the dispatch it came from, so it carries that client's fence: a
+	// rebuild in the meantime retires the client the notice arrived on, and its call is not
+	// published on the session the replacement owns.
+	retired := s.currentRetirement()
+	// The fence is held through the publication, not only checked before it: the notice's
+	// lookup can wait, and a rebuild in that time must not see it finish on the session the
+	// replacement owns. See Session.notices.
+	time.AfterFunc(s.offerWait, func() {
+		s.notices.RLock()
+		defer s.notices.RUnlock()
+		if s.ctx.Err() == nil && !retired.Load() && !s.endPublished(held.CallID) && !s.offerOnItsWay(held.CallID) {
+			s.callOffered(&held, media, group)
+		}
+	})
+	return true
+}
+
 // Acknowledged whatever happens, which is the presence rule rather than the message rule:
 // WhatsApp does not redeliver a call offer, so withholding the acknowledgement buys no
 // second chance and leaves a node unacknowledged for a call that has already ended.
@@ -186,12 +225,20 @@ func (s *Session) callOffered(meta *waTypes.BasicCallMeta, media callMedia, grou
 		return true
 	}
 
-	s.emitMoment(protocol.EventCallOffer, callOffer{
+	offer := callOffer{
 		CallID:    meta.CallID,
 		From:      from,
 		Video:     media.known && media.video,
 		Timestamp: meta.Timestamp.UnixMilli(),
-	})
+	}
+	if s.callMedia == nil {
+		s.emitMoment(protocol.EventCallOffer, offer)
+		return true
+	}
+	// Only a call meowcaller engaged gets an SDP, and its gate is what decided that: a
+	// session that does not answer calls, a group call and a video call are offered the
+	// way they always were.
+	s.emitMoment(protocol.EventCallOffer, callOfferPayload{callOffer: offer, SDP: s.offerToBrowser(meta.CallID, meta.CallCreator)})
 	return true
 }
 
@@ -225,6 +272,12 @@ func (s *Session) callEnded(event *waEvents.CallTerminate) bool {
 	if !event.GroupJID.IsEmpty() && !s.wantsGroups() {
 		return true
 	}
+	// Once per call. A call this session carries the voice of is also ended by
+	// meowcaller, which publishes it from its own side when it gets there first.
+	first, answered := s.claimEnd(event.CallID)
+	if !first {
+		return true
+	}
 
 	ctx, cancel := s.looking()
 	defer cancel()
@@ -242,7 +295,7 @@ func (s *Session) callEnded(event *waEvents.CallTerminate) bool {
 		reason := event.Reason
 		payload.Reason = &reason
 	}
-	s.emitEnd(protocol.EventCallTerminate, payload)
+	s.publishEnd(payload, answered)
 	return true
 }
 

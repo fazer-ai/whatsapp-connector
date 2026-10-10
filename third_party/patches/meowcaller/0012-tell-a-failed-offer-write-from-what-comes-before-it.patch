@@ -1,0 +1,32 @@
+Tell a placed call whose offer write failed from one that failed before writing anything.
+
+Origin: fazer-ai/whatsapp-connector, upstream meowcaller code (not from a pull request).
+
+Why: the connector keeps a `call.start` attempt standing when its failure may have rung the callee's phone, so a redelivery under the same idempotency key does not ring it again, and releases it otherwise, so a retry after a transient failure can still place the call. Call fails in several places before the offer goes out (no own LID, device discovery, a peer with no devices, callKey encryption, the device identity) and in one after it: the offer write. Only that one can have rung the phone, and the error text is the only thing that told them apart.
+
+The offer write's failure now wraps ErrSendOffer, exported, beside the error SendNode returned. The message is unchanged ("send offer: ..."), and no other path changes.
+
+diff --git a/engine.go b/engine.go
+index 0c575f9..d75111a 100644
+--- a/engine.go
++++ b/engine.go
+@@ -602,13 +602,18 @@ func (e *engine) placeCall(ctx context.Context, target string, opts CallOptions)
+ 		// The caller gets no Call to hang up, so the registration and its key
+ 		// material would otherwise stay in e.calls for the client's lifetime.
+ 		e.finishCall(callID, "offer_failed")
+-		return nil, fmt.Errorf("send offer: %w", err)
++		return nil, fmt.Errorf("%w: %w", ErrSendOffer, err)
+ 	}
+ 	e.c.log.Info().Str("call_id", callID).Bool("video", opts.Video).Msg("offer sent; media starts when the relay endpoint arrives")
+ 	e.c.diag.Emit("meta", map[string]any{"event": "offer_sent", "call_id": callID, "peer_lid": peerLID.String(), "direction": "out", "video": opts.Video})
+ 	return call, nil
+ }
+ 
++// ErrSendOffer is a placed call whose offer write failed: the offer may have reached
++// WhatsApp, and the callee's phone may be ringing. Every other error Call returns comes
++// before that write.
++var ErrSendOffer = errors.New("send offer")
++
+ // onOffer handles an inbound <offer> event: it decrypts the callKey, captures any relay
+ // data, registers the Call in the Ringing phase, sends the <preaccept> eagerly (a
+ // preparation step, independent of the later Answer/Reject), and fires the

@@ -1,0 +1,1968 @@
+package whatsmeow
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"slices"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/pion/webrtc/v4"
+	"github.com/purpshell/meowcaller"
+	"github.com/rs/zerolog"
+	wm "go.mau.fi/whatsmeow"
+	waBinary "go.mau.fi/whatsmeow/binary"
+	waTypes "go.mau.fi/whatsmeow/types"
+	waEvents "go.mau.fi/whatsmeow/types/events"
+
+	"github.com/fazer-ai/whatsapp-connector/internal/calls"
+	"github.com/fazer-ai/whatsapp-connector/internal/engine"
+	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
+	"github.com/fazer-ai/whatsapp-connector/internal/testwait"
+)
+
+// newCallSession is a connected test session that carries calls: a media socket of its
+// own, and a connect that asked for `calls.answer`.
+func newCallSession(t *testing.T) *Session {
+	t.Helper()
+	session, _ := newTestSession(t, "5511999990001")
+	session.setConnected(true)
+	media, err := calls.Open(calls.Config{}, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("open the call media: %v", err)
+	}
+	t.Cleanup(func() { _ = media.Close() })
+	session.callMedia = media
+	session.setCallPolicy(false, true)
+	return session
+}
+
+// fakeCall stands in for a meowcaller call, recording what the session asked of it.
+type fakeCall struct {
+	id string
+
+	mu       sync.Mutex
+	answered int
+	rejected int
+	hungUp   int
+	sink     meowcaller.AudioSink
+	source   meowcaller.AudioSource
+	onEnd    func(string)
+	onAccept func()
+	fail     error
+	// ended is a call meowcaller already ended, before anybody listened for it.
+	ended bool
+	// stall, when set, holds every hang-up and rejection until it is closed: a node
+	// write the socket does not take.
+	stall chan struct{}
+	// signalled receives one value each time a hang-up or a rejection is attempted.
+	signalled chan struct{}
+	// answerStall, when set, holds Answer until it is closed.
+	answerStall chan struct{}
+	// onReceive runs when the voice is wired to the call.
+	onReceive func()
+	discarded bool
+	// rejectFail is what Reject returns, after ending the call locally as meowcaller does.
+	rejectFail error
+	// hangupFail is what Hangup returns, after ending the call locally as meowcaller does.
+	hangupFail error
+	// hungUpAgain counts HangupAgain, which fails with hangupAgainFail.
+	hungUpAgain     int
+	hangupAgainFail error
+}
+
+func (c *fakeCall) ID() string { return c.id }
+
+func (c *fakeCall) Answer() error {
+	if c.answerStall != nil {
+		<-c.answerStall
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.answered++
+	return c.fail
+}
+
+func (c *fakeCall) Reject() error {
+	c.mu.Lock()
+	c.rejected++
+	end, fail := c.onEnd, c.rejectFail
+	c.mu.Unlock()
+	if err := c.signal(end, "rejected"); err != nil {
+		return err
+	}
+	return fail
+}
+
+func (c *fakeCall) Hangup() error {
+	c.mu.Lock()
+	c.hungUp++
+	end, fail := c.onEnd, c.hangupFail
+	c.mu.Unlock()
+	if err := c.signal(end, "hangup"); err != nil {
+		return err
+	}
+	return fail
+}
+
+func (c *fakeCall) HangupAgain() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.hungUpAgain++
+	return c.hangupAgainFail
+}
+
+func (c *fakeCall) signal(end func(string), reason string) error {
+	if c.signalled != nil {
+		c.signalled <- struct{}{}
+	}
+	if c.stall != nil {
+		<-c.stall
+	}
+	if end != nil {
+		end(reason)
+	}
+	return nil
+}
+
+func (c *fakeCall) Discard() {
+	c.mu.Lock()
+	c.discarded = true
+	c.mu.Unlock()
+}
+
+func (c *fakeCall) State() meowcaller.CallPhase {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.ended {
+		return meowcaller.CallPhaseEnded
+	}
+	return meowcaller.CallPhaseRinging
+}
+
+func (c *fakeCall) Receive(sink meowcaller.AudioSink) {
+	c.mu.Lock()
+	c.sink = sink
+	hook := c.onReceive
+	c.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+}
+
+func (c *fakeCall) Play(source meowcaller.AudioSource) *meowcaller.Player {
+	c.mu.Lock()
+	c.source = source
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *fakeCall) OnEnd(fn func(string)) {
+	c.mu.Lock()
+	c.onEnd = fn
+	c.mu.Unlock()
+}
+
+func (c *fakeCall) OnPeerAccept(fn func()) {
+	c.mu.Lock()
+	c.onAccept = fn
+	c.mu.Unlock()
+}
+
+func (c *fakeCall) counts() (answered, rejected, hungUp int, wired bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.answered, c.rejected, c.hungUp, c.sink != nil && c.source != nil
+}
+
+// peerAccepts is the callee picking up a call the client placed.
+func (c *fakeCall) peerAccepts() {
+	c.mu.Lock()
+	accept := c.onAccept
+	c.mu.Unlock()
+	accept()
+}
+
+// remoteEnds is the other side ending the call.
+func (c *fakeCall) remoteEnds(reason string) {
+	c.mu.Lock()
+	end := c.onEnd
+	c.mu.Unlock()
+	end(reason)
+}
+
+// browserPeer is a pion peer standing in for the agent's browser, offering or answering
+// in the given codecs.
+func browserPeer(t *testing.T, mimes ...string) *webrtc.PeerConnection {
+	t.Helper()
+	codecs := &webrtc.MediaEngine{}
+	for _, mime := range mimes {
+		pt := webrtc.PayloadType(9)
+		if mime == webrtc.MimeTypePCMU {
+			pt = 0
+		}
+		if err := codecs.RegisterCodec(webrtc.RTPCodecParameters{
+			RTPCodecCapability: webrtc.RTPCodecCapability{MimeType: mime, ClockRate: 8000},
+			PayloadType:        pt,
+		}, webrtc.RTPCodecTypeAudio); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pc, err := webrtc.NewAPI(webrtc.WithMediaEngine(codecs)).NewPeerConnection(webrtc.Configuration{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = pc.Close() })
+	if _, err := pc.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio); err != nil {
+		t.Fatal(err)
+	}
+	return pc
+}
+
+func gatheredSDP(t *testing.T, pc *webrtc.PeerConnection) string {
+	t.Helper()
+	select {
+	case <-webrtc.GatheringCompletePromise(pc):
+	case <-time.After(10 * time.Second):
+		t.Fatal("the browser peer never finished gathering")
+	}
+	return pc.LocalDescription().SDP
+}
+
+// browserAnswer is the browser's answer to the connector's offer.
+func browserAnswer(t *testing.T, offer string) string {
+	t.Helper()
+	pc := browserPeer(t, webrtc.MimeTypeG722, webrtc.MimeTypePCMU)
+	if err := pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: offer}); err != nil {
+		t.Fatalf("the browser applies the offer: %v", err)
+	}
+	answer, err := pc.CreateAnswer(nil)
+	if err == nil {
+		err = pc.SetLocalDescription(answer)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return gatheredSDP(t, pc)
+}
+
+// browserOffer is the browser's offer for a call the client places.
+func browserOffer(t *testing.T) string {
+	t.Helper()
+	pc := browserPeer(t, webrtc.MimeTypeG722, webrtc.MimeTypePCMU)
+	offer, err := pc.CreateOffer(nil)
+	if err == nil {
+		err = pc.SetLocalDescription(offer)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return gatheredSDP(t, pc)
+}
+
+func audioOffer(callID string) *waEvents.CallOffer {
+	return &waEvents.CallOffer{BasicCallMeta: callMeta(callID), Data: offerNode("audio")}
+}
+
+// ringCall is a call meowcaller engaged, offered: what the dispatch does with one offer.
+func ringCall(t *testing.T, session *Session, callID string) (call *fakeCall, sdp string) {
+	t.Helper()
+	call = &fakeCall{id: callID}
+	session.ringing(call)
+	session.handle(audioOffer(callID))
+	payload := published(t, session, protocol.EventCallOffer, "event_call_offer")
+	sdp, _ = payload["sdp"].(string)
+	return call, sdp
+}
+
+func command(kind protocol.CommandType, payload string) *protocol.Command {
+	return &protocol.Command{ID: "cmd-" + string(kind), Type: kind, Payload: json.RawMessage(payload)}
+}
+
+// The offer of a call the session carries has the connector's SDP in it, with both
+// codecs and G.722 first.
+func TestAReceivedCallIsOfferedWithTheConnectorsSDP(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+
+	_, sdp := ringCall(t, session, "call-1")
+	if !strings.HasPrefix(sdp, "v=0") || !strings.Contains(sdp, "m=audio") {
+		t.Fatalf("the offer carries no usable SDP: %q", sdp)
+	}
+	line := ""
+	for l := range strings.SplitSeq(sdp, "\n") {
+		if strings.HasPrefix(l, "m=audio") {
+			line = strings.TrimSpace(l)
+		}
+	}
+	if fields := strings.Fields(line); len(fields) < 5 || fields[3] != "9" || fields[4] != "0" {
+		t.Fatalf("the audio line is %q, want G.722 (9) offered before PCMU (0)", line)
+	}
+}
+
+// A call meowcaller did not engage -- a session that does not answer, a deployment with
+// no media port -- is offered the way it always was.
+func TestACallTheSessionDoesNotCarryIsOfferedWithoutSDP(t *testing.T) {
+	t.Parallel()
+
+	for name, build := range map[string]func(t *testing.T) *Session{
+		"a session that did not ask": func(t *testing.T) *Session {
+			s := newCallSession(t)
+			s.setCallPolicy(false, false)
+			return s
+		},
+		"a deployment with no media port": func(t *testing.T) *Session {
+			s, _ := callSession(t, false)
+			s.setCallPolicy(false, true)
+			return s
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			session := build(t)
+			session.handle(audioOffer("call-1"))
+			payload := published(t, session, protocol.EventCallOffer, "event_call_offer")
+			if _, has := payload["sdp"]; has {
+				t.Fatalf("the offer carries sdp: %v", payload)
+			}
+		})
+	}
+}
+
+// meowcaller's gate: only a 1:1 voice call on a session that answers calls is engaged.
+func TestOnlyADirectVoiceCallIsEngaged(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+
+	if !session.engagesOffer(audioOffer("call-1")) {
+		t.Fatal("a direct voice call on a session that answers was not engaged")
+	}
+	video := &waEvents.CallOffer{BasicCallMeta: callMeta("call-2"), Data: offerNode("video")}
+	if session.engagesOffer(video) {
+		t.Error("a video call was engaged")
+	}
+	group := audioOffer("call-3")
+	group.GroupJID = waTypes.NewJID("120363000000000000", waTypes.GroupServer)
+	if session.engagesOffer(group) {
+		t.Error("a group call was engaged")
+	}
+	bare := &waEvents.CallOffer{BasicCallMeta: callMeta("call-4"), Data: &waBinary.Node{Tag: "offer"}}
+	if session.engagesOffer(bare) {
+		t.Error("an offer that does not say it is a voice call was engaged")
+	}
+
+	session.setCallPolicy(true, true)
+	if session.engagesOffer(audioOffer("call-5")) {
+		t.Error("auto_reject did not win over answer")
+	}
+	session.setCallPolicy(false, false)
+	if session.engagesOffer(audioOffer("call-6")) {
+		t.Error("a session that did not ask for calls.answer engaged a call")
+	}
+	plain, _ := callSession(t, false)
+	plain.setCallPolicy(false, true)
+	if plain.engagesOffer(audioOffer("call-7")) {
+		t.Error("a deployment with no media port engaged a call")
+	}
+}
+
+// The browser's answer is applied before WhatsApp is told, and then the voice is wired.
+// A second accept for the same call is nothing new.
+func TestAcceptAnswersOnWhatsAppOnceTheBrowserAnswerIsApplied(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	call, offer := ringCall(t, session, "call-1")
+
+	accept := `{"call_id":"call-1","sdp":` + mustJSON(t, browserAnswer(t, offer)) + `}`
+	if _, err := session.Execute(t.Context(), command(protocol.CommandCallAccept, accept)); err != nil {
+		t.Fatalf("call.accept: %v", err)
+	}
+	answered, _, _, wired := call.counts()
+	if answered != 1 || !wired {
+		t.Fatalf("answered %d times, wired %v; want once, wired", answered, wired)
+	}
+
+	if _, err := session.Execute(t.Context(), command(protocol.CommandCallAccept, accept)); err != nil {
+		t.Fatalf("a repeated call.accept: %v", err)
+	}
+	if answered, _, _, _ := call.counts(); answered != 1 {
+		t.Fatalf("a repeated accept answered the call again: %d", answered)
+	}
+}
+
+// An answer the connector cannot use fails the command and leaves the call ringing.
+func TestAnAcceptWithABadSDPDoesNotAnswer(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	call, _ := ringCall(t, session, "call-1")
+
+	_, err := session.Execute(t.Context(), command(protocol.CommandCallAccept, `{"call_id":"call-1","sdp":"this is not an sdp"}`))
+	assertCode(t, err, protocol.ErrorInvalidPayload)
+	if answered, _, _, _ := call.counts(); answered != 0 {
+		t.Fatal("the call was answered on WhatsApp with no browser behind it")
+	}
+}
+
+func TestAcceptOfACallThatIsNotRinging(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+
+	_, err := session.Execute(t.Context(), command(protocol.CommandCallAccept, `{"call_id":"nobody","sdp":"v=0"}`))
+	assertCode(t, err, protocol.ErrorInvalidPayload)
+
+	call, _ := ringCall(t, session, "call-1")
+	call.remoteEnds("timeout")
+	published(t, session, protocol.EventCallTerminate, "event_call_terminate")
+	if _, err := session.Execute(t.Context(), command(protocol.CommandCallAccept, `{"call_id":"call-1","sdp":"v=0"}`)); err != nil {
+		t.Fatalf("accepting a call that already ended = %v, want nothing new", err)
+	}
+	if answered, _, _, _ := call.counts(); answered != 0 {
+		t.Fatal("a call that had ended was answered")
+	}
+}
+
+// A call that rang and was offered without SDP cannot be accepted: there is no offer to
+// answer.
+func TestACallOfferedWithoutSDPCannotBeAccepted(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	call := &fakeCall{id: "call-1"}
+	session.ringing(call)
+
+	_, err := session.Execute(t.Context(), command(protocol.CommandCallAccept, `{"call_id":"call-1","sdp":"v=0"}`))
+	assertCode(t, err, protocol.ErrorInvalidPayload)
+	if answered, _, _, _ := call.counts(); answered != 0 {
+		t.Fatal("a call with no browser leg was answered")
+	}
+}
+
+// call.terminate refuses a call still ringing, hangs up one that was answered, and is
+// nothing new for one that is over or was never here. The end is published once.
+func TestTerminateEndsTheCallAndIsPublishedOnce(t *testing.T) {
+	t.Parallel()
+
+	t.Run("ringing", func(t *testing.T) {
+		t.Parallel()
+		session := newCallSession(t)
+		call, _ := ringCall(t, session, "call-1")
+		if _, err := session.Execute(t.Context(), command(protocol.CommandCallTerminate, `{"call_id":"call-1"}`)); err != nil {
+			t.Fatal(err)
+		}
+		if _, rejected, hungUp, _ := call.counts(); rejected != 1 || hungUp != 0 {
+			t.Fatalf("rejected %d, hung up %d; want a rejection", rejected, hungUp)
+		}
+		published(t, session, protocol.EventCallTerminate, "event_call_terminate")
+	})
+
+	t.Run("answered", func(t *testing.T) {
+		t.Parallel()
+		session := newCallSession(t)
+		call, offer := ringCall(t, session, "call-1")
+		accept := `{"call_id":"call-1","sdp":` + mustJSON(t, browserAnswer(t, offer)) + `}`
+		if _, err := session.Execute(t.Context(), command(protocol.CommandCallAccept, accept)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := session.Execute(t.Context(), command(protocol.CommandCallTerminate, `{"call_id":"call-1"}`)); err != nil {
+			t.Fatal(err)
+		}
+		if _, rejected, hungUp, _ := call.counts(); rejected != 0 || hungUp != 1 {
+			t.Fatalf("rejected %d, hung up %d; want a hang-up", rejected, hungUp)
+		}
+		end := published(t, session, protocol.EventCallTerminate, "event_call_terminate")
+		if end["call_id"] != "call-1" {
+			t.Fatalf("the end names %v", end["call_id"])
+		}
+
+		// WhatsApp's own terminate for the same call, and a second command: neither
+		// publishes the end again.
+		session.handle(&waEvents.CallTerminate{BasicCallMeta: callMeta("call-1"), Reason: "hangup"})
+		if _, err := session.Execute(t.Context(), command(protocol.CommandCallTerminate, `{"call_id":"call-1"}`)); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, hungUp, _ := call.counts(); hungUp != 1 {
+			t.Fatalf("a call that ended was hung up again: %d", hungUp)
+		}
+		select {
+		case emission := <-session.Events():
+			t.Fatalf("published %s after the end was already out", emission.Type)
+		case <-time.After(200 * time.Millisecond):
+		}
+	})
+
+	t.Run("never here", func(t *testing.T) {
+		t.Parallel()
+		session := newCallSession(t)
+		if _, err := session.Execute(t.Context(), command(protocol.CommandCallTerminate, `{"call_id":"nobody"}`)); err != nil {
+			t.Fatalf("ending a call that is not here = %v, want nothing new", err)
+		}
+	})
+}
+
+// A call the client places: the number as WhatsApp registered it is dialled, the id comes
+// back at once, and the browser's answer goes out once the callee picks up.
+func TestStartDialsTheRegisteredNumberAndAnswersWhenTheCalleePicksUp(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	session.onWhatsApp = func(_ context.Context, _ *wm.Client, phones []string) ([]waTypes.IsOnWhatsAppResponse, error) {
+		if len(phones) != 1 || phones[0] != "+5541999990000" {
+			t.Errorf("asked WhatsApp about %v", phones)
+		}
+		// Registered without the ninth digit, and with a LID for a JID.
+		return []waTypes.IsOnWhatsAppResponse{{
+			Query: phones[0], IsIn: true,
+			JID:         waTypes.NewJID("182736451928374", waTypes.HiddenUserServer),
+			PhoneNumber: waTypes.NewJID("554199990000", waTypes.DefaultUserServer),
+		}}, nil
+	}
+	call := &fakeCall{id: "CALLOUT1"}
+	var dialled string
+	session.dialCall = func(_ context.Context, target string) (bridgedCall, error) {
+		dialled = target
+		return call, nil
+	}
+
+	start := &protocol.Command{
+		ID: "c1", Type: protocol.CommandCallStart, IdempotencyKey: "k1",
+		Payload: json.RawMessage(`{"to":{"kind":"phone","id":"5541999990000"},"sdp":` + mustJSON(t, browserOffer(t)) + `}`),
+	}
+	result, err := session.Execute(t.Context(), start)
+	if err != nil {
+		t.Fatalf("call.start: %v", err)
+	}
+	if dialled != "554199990000" {
+		t.Fatalf("dialled %q, want the number WhatsApp registered", dialled)
+	}
+	if got := decode(t, result)["call_id"]; got != "CALLOUT1" {
+		t.Fatalf("call_id is %v", got)
+	}
+
+	call.peerAccepts()
+	answered := published(t, session, protocol.EventCallAnswered, "event_call_answered")
+	if answered["call_id"] != "CALLOUT1" {
+		t.Fatalf("call.answered names %v", answered["call_id"])
+	}
+	if sdp, _ := answered["sdp"].(string); !strings.HasPrefix(sdp, "v=0") || !strings.Contains(sdp, "G722") {
+		t.Fatalf("call.answered carries %q, want the connector's G.722 answer", sdp)
+	}
+	if _, _, _, wired := call.counts(); !wired {
+		t.Fatal("the voice was not wired once the callee picked up")
+	}
+}
+
+func TestStartRefusesWhatItCannotDial(t *testing.T) {
+	t.Parallel()
+
+	offerless := `{"to":{"kind":"phone","id":"5541999990000"},"sdp":"v=0"}`
+	for name, test := range map[string]struct {
+		command *protocol.Command
+		found   []waTypes.IsOnWhatsAppResponse
+		want    protocol.ErrorCode
+	}{
+		"no idempotency key": {
+			command: &protocol.Command{Type: protocol.CommandCallStart, Payload: json.RawMessage(offerless)},
+			want:    protocol.ErrorInvalidPayload,
+		},
+		"a LID": {
+			command: &protocol.Command{Type: protocol.CommandCallStart, IdempotencyKey: "k",
+				Payload: json.RawMessage(`{"to":{"kind":"lid","id":"182736451928374"},"sdp":"v=0"}`)},
+			want: protocol.ErrorInvalidPayload,
+		},
+		"a number not on WhatsApp": {
+			command: &protocol.Command{Type: protocol.CommandCallStart, IdempotencyKey: "k", Payload: json.RawMessage(offerless)},
+			found:   []waTypes.IsOnWhatsAppResponse{{Query: "+5541999990000", IsIn: false}},
+			want:    protocol.ErrorRecipientNotOnWhatsapp,
+		},
+		"an offer that is not an SDP": {
+			command: &protocol.Command{Type: protocol.CommandCallStart, IdempotencyKey: "k", Payload: json.RawMessage(offerless)},
+			found: []waTypes.IsOnWhatsAppResponse{{Query: "+5541999990000", IsIn: true,
+				JID: waTypes.NewJID("5541999990000", waTypes.DefaultUserServer)}},
+			want: protocol.ErrorInvalidPayload,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			session := newCallSession(t)
+			session.onWhatsApp = func(context.Context, *wm.Client, []string) ([]waTypes.IsOnWhatsAppResponse, error) {
+				return test.found, nil
+			}
+			session.dialCall = func(context.Context, string) (bridgedCall, error) {
+				t.Error("a call was dialled")
+				return nil, errors.New("no")
+			}
+			_, err := session.Execute(t.Context(), test.command)
+			assertCode(t, err, test.want)
+		})
+	}
+}
+
+// Every call command is refused on a session that does not carry calls, including one
+// that asked for them on a deployment with no media port.
+func TestTheCallCommandsAreRefusedWithoutCalls(t *testing.T) {
+	t.Parallel()
+	session, _ := callSession(t, false)
+	session.setCallPolicy(false, true)
+	for _, kind := range []protocol.CommandType{protocol.CommandCallAccept, protocol.CommandCallStart, protocol.CommandCallTerminate} {
+		if _, err := session.Execute(t.Context(), command(kind, `{"call_id":"c","sdp":"v=0"}`)); !errors.Is(err, engine.ErrNotSupported) {
+			t.Errorf("%s answered %v, want ErrNotSupported", kind, err)
+		}
+	}
+}
+
+// answeredCall is a received call the browser answered, whose hang-up and rejection stall
+// until the returned function is called.
+func answeredCall(t *testing.T, session *Session, callID string) (call *fakeCall, release func()) {
+	t.Helper()
+	call = &fakeCall{id: callID, stall: make(chan struct{}), signalled: make(chan struct{}, 4)}
+	session.ringing(call)
+	session.handle(audioOffer(callID))
+	offer, _ := published(t, session, protocol.EventCallOffer, "event_call_offer")["sdp"].(string)
+	accept := `{"call_id":"` + callID + `","sdp":` + mustJSON(t, browserAnswer(t, offer)) + `}`
+	if _, err := session.Execute(t.Context(), command(protocol.CommandCallAccept, accept)); err != nil {
+		t.Fatal(err)
+	}
+	var once sync.Once
+	release = func() { once.Do(func() { close(call.stall) }) }
+	t.Cleanup(release)
+	return call, release
+}
+
+func hungUpWithin(t *testing.T, call *fakeCall) {
+	t.Helper()
+	select {
+	case <-call.signalled:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the call was never hung up")
+	}
+}
+
+// A session that closes gives the hang-ups it just started a moment to be written before
+// the socket goes: closed under them, the hang-up never reached WhatsApp and the other phone
+// sat on "Reconnecting..." (measured on a real phone, with a lease taken away mid-call). A
+// write that lands ends the wait at once; one that does not is given the grace and no more.
+func TestClosingTheSessionGivesItsHangUpsAMomentBeforeTheSocketGoes(t *testing.T) {
+	t.Parallel()
+
+	t.Run("a hang-up that is written ends the wait", func(t *testing.T) {
+		t.Parallel()
+		session := newCallSession(t)
+		session.hangupGrace = time.Hour
+		call, release := answeredCall(t, session, "call-1")
+		go func() {
+			<-call.signalled
+			release()
+		}()
+		carriedAtClose := make(chan bool, 1)
+		session.closeSocket = func(*wm.Client) { carriedAtClose <- carried(session, "call-1") }
+		closed := make(chan error, 1)
+		go func() { closed <- session.Close() }()
+		select {
+		case err := <-closed:
+			if err != nil {
+				t.Fatalf("close: %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("close waited out the grace for a hang-up that had been written")
+		}
+		if <-carriedAtClose {
+			t.Fatal("the socket was closed before the hang-up was written")
+		}
+	})
+
+	t.Run("nothing arriving is handled while it waits", func(t *testing.T) {
+		t.Parallel()
+		// The store is fenced before this wait, so a message decrypted during it could not
+		// be written down: the session's context, which whatsmeow handles what arrives
+		// under, is already cancelled when the hang-up is attempted.
+		session := newCallSession(t)
+		call, release := answeredCall(t, session, "call-1")
+		cancelledAtHangUp := make(chan bool, 1)
+		go func() {
+			<-call.signalled
+			cancelledAtHangUp <- session.ctx.Err() != nil
+			release()
+		}()
+		if err := session.Close(); err != nil {
+			t.Fatalf("close: %v", err)
+		}
+		if !<-cancelledAtHangUp {
+			t.Fatal("the session was still handling what arrives while it waited on its hang-ups")
+		}
+	})
+
+	t.Run("one that is not is given the grace", func(t *testing.T) {
+		t.Parallel()
+		session := newCallSession(t)
+		const grace = 300 * time.Millisecond
+		session.hangupGrace = grace
+		call, _ := answeredCall(t, session, "call-1")
+		attempted := make(chan time.Time, 1)
+		go func() {
+			<-call.signalled
+			attempted <- time.Now()
+		}()
+		closedSocket := make(chan time.Time, 1)
+		session.closeSocket = func(*wm.Client) { closedSocket <- time.Now() }
+		if err := session.Close(); err != nil {
+			t.Fatalf("close: %v", err)
+		}
+		if waited := (<-closedSocket).Sub(<-attempted); waited < grace*3/4 {
+			t.Fatalf("the socket was closed %v after the hang-up was attempted, want about %v", waited, grace)
+		}
+	})
+}
+
+// A session that closes hangs up every call it carries, since the media is this
+// instance's and cannot follow the account, and does not wait for the hang-up to be
+// written: a close is also the lease being lost, and that socket has to go now.
+func TestClosingTheSessionHangsUpItsCallsWithoutWaiting(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	call, release := answeredCall(t, session, "call-1")
+
+	closed := make(chan error, 1)
+	go func() { closed <- session.Close() }()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("close: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		release()
+		t.Fatal("close waited on a hang-up the socket did not take")
+	}
+	hungUpWithin(t, call)
+}
+
+// An operator's disconnect ends the calls too, before the socket goes, and waits for the
+// hang-ups as long as the command may.
+func TestDisconnectingTheSessionHangsUpItsCalls(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	call, release := answeredCall(t, session, "call-1")
+	release()
+
+	if err := session.Disconnect(t.Context()); err != nil {
+		t.Fatalf("disconnect: %v", err)
+	}
+	hungUpWithin(t, call)
+	if _, _, hungUp, _ := call.counts(); hungUp != 1 {
+		t.Fatalf("the call was hung up %d times on disconnect, want once", hungUp)
+	}
+}
+
+// A call.terminate whose hang-up the socket does not take gives the executor back when
+// the command's deadline passes, rather than holding every command behind it.
+func TestATerminateThatStallsHonoursItsDeadline(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	call, _ := answeredCall(t, session, "call-1")
+
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+	returned := make(chan error, 1)
+	go func() {
+		_, err := session.Execute(ctx, command(protocol.CommandCallTerminate, `{"call_id":"call-1"}`))
+		returned <- err
+	}()
+	select {
+	case err := <-returned:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("a stalled terminate returned %v, want the deadline", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a stalled terminate held the executor past its deadline")
+	}
+	hungUpWithin(t, call)
+}
+
+// meowcaller does not replay an end that happened before OnEnd was set. A placed call
+// refused between the offer going out and the listener going on is reported over, and
+// nothing of it is left behind.
+func TestAPlacedCallThatEndedBeforeItsListenerIsReportedOver(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	session.onWhatsApp = func(_ context.Context, _ *wm.Client, phones []string) ([]waTypes.IsOnWhatsAppResponse, error) {
+		return []waTypes.IsOnWhatsAppResponse{{Query: phones[0], IsIn: true,
+			JID: waTypes.NewJID("5541999990000", waTypes.DefaultUserServer)}}, nil
+	}
+	call := &fakeCall{id: "CALLOUT1", ended: true}
+	session.dialCall = func(context.Context, string) (bridgedCall, error) { return call, nil }
+	start := &protocol.Command{
+		ID: "c1", Type: protocol.CommandCallStart, IdempotencyKey: "k1",
+		Payload: json.RawMessage(`{"to":{"kind":"phone","id":"5541999990000"},"sdp":` + mustJSON(t, browserOffer(t)) + `}`),
+	}
+	if _, err := session.Execute(t.Context(), start); err != nil {
+		t.Fatalf("call.start: %v", err)
+	}
+	if end := published(t, session, protocol.EventCallTerminate, "event_call_terminate"); end["call_id"] != "CALLOUT1" {
+		t.Fatalf("the end names %v", end["call_id"])
+	}
+	session.bridge.mu.Lock()
+	left := len(session.bridge.live)
+	session.bridge.mu.Unlock()
+	if left != 0 {
+		t.Fatalf("%d calls are still carried after the call ended", left)
+	}
+}
+
+// The callee picks up a placed call only after the browser's offer has waited however
+// long the phone rang, and the answer is made then, not when the call was placed.
+func TestAPlacedCallIsAnsweredOnlyWhenTheCalleePicksUp(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	session.onWhatsApp = func(_ context.Context, _ *wm.Client, phones []string) ([]waTypes.IsOnWhatsAppResponse, error) {
+		return []waTypes.IsOnWhatsAppResponse{{Query: phones[0], IsIn: true,
+			JID: waTypes.NewJID("5541999990000", waTypes.DefaultUserServer)}}, nil
+	}
+	call := &fakeCall{id: "CALLOUT1"}
+	session.dialCall = func(context.Context, string) (bridgedCall, error) { return call, nil }
+	start := &protocol.Command{
+		ID: "c1", Type: protocol.CommandCallStart, IdempotencyKey: "k1",
+		Payload: json.RawMessage(`{"to":{"kind":"phone","id":"5541999990000"},"sdp":` + mustJSON(t, browserOffer(t)) + `}`),
+	}
+	if _, err := session.Execute(t.Context(), start); err != nil {
+		t.Fatalf("call.start: %v", err)
+	}
+	session.bridge.mu.Lock()
+	leg := session.bridge.live["CALLOUT1"].leg
+	session.bridge.mu.Unlock()
+	if leg.Codec() != "" {
+		t.Fatal("the browser's offer was answered while the callee was still being rung")
+	}
+	call.peerAccepts()
+	published(t, session, protocol.EventCallAnswered, "event_call_answered")
+}
+
+func callNotice(callID string) *waEvents.CallOfferNotice {
+	return &waEvents.CallOfferNotice{BasicCallMeta: callMeta(callID), Media: "audio", Type: "1:1"}
+}
+
+// WhatsApp sends `offer_notice` and `offer` for one call in either order, and only the
+// offer is engaged. A notice first does not take the call's one `call.offer` from the
+// offer that can carry the SDP; a notice whose offer never comes still publishes the call.
+func TestANoticeBeforeTheOfferLeavesTheSDPToTheOffer(t *testing.T) {
+	t.Parallel()
+
+	t.Run("the offer follows", func(t *testing.T) {
+		t.Parallel()
+		session := newCallSession(t)
+		session.offerWait = 200 * time.Millisecond
+		session.handle(callNotice("call-1"))
+		session.ringing(&fakeCall{id: "call-1"})
+		session.handle(audioOffer("call-1"))
+		offer := published(t, session, protocol.EventCallOffer, "event_call_offer")
+		if sdp, _ := offer["sdp"].(string); !strings.HasPrefix(sdp, "v=0") {
+			t.Fatalf("the offer that followed a notice carries %q, want the connector's SDP", sdp)
+		}
+		select {
+		case emission := <-session.Events():
+			t.Fatalf("published %s for a call already offered", emission.Type)
+		case <-time.After(600 * time.Millisecond):
+		}
+	})
+
+	t.Run("no offer comes", func(t *testing.T) {
+		t.Parallel()
+		session := newCallSession(t)
+		session.offerWait = 10 * time.Millisecond
+		session.handle(callNotice("call-1"))
+		offer := published(t, session, protocol.EventCallOffer, "event_call_offer")
+		if offer["call_id"] != "call-1" {
+			t.Fatalf("the offer names %v", offer["call_id"])
+		}
+		if _, carries := offer["sdp"]; carries {
+			t.Fatal("a call announced only by its notice was offered with SDP")
+		}
+	})
+
+	t.Run("the call ends first", func(t *testing.T) {
+		t.Parallel()
+		session := newCallSession(t)
+		session.offerWait = 50 * time.Millisecond
+		session.handle(callNotice("call-1"))
+		session.handle(&waEvents.CallTerminate{BasicCallMeta: callMeta("call-1"), Reason: "timeout"})
+		published(t, session, protocol.EventCallTerminate, "event_call_terminate")
+		select {
+		case emission := <-session.Events():
+			t.Fatalf("published %s for a call whose end was already out", emission.Type)
+		case <-time.After(400 * time.Millisecond):
+		}
+	})
+
+	t.Run("a session that does not answer", func(t *testing.T) {
+		t.Parallel()
+		session := newCallSession(t)
+		session.setCallPolicy(false, false)
+		session.offerWait = time.Hour
+		session.handle(callNotice("call-1"))
+		published(t, session, protocol.EventCallOffer, "event_call_offer")
+	})
+}
+
+// placeCall starts a call to a number WhatsApp knows, over the given fake.
+func placeCall(t *testing.T, session *Session, call *fakeCall) {
+	t.Helper()
+	session.onWhatsApp = func(_ context.Context, _ *wm.Client, phones []string) ([]waTypes.IsOnWhatsAppResponse, error) {
+		return []waTypes.IsOnWhatsAppResponse{{Query: phones[0], IsIn: true,
+			JID: waTypes.NewJID("5541999990000", waTypes.DefaultUserServer)}}, nil
+	}
+	session.dialCall = func(context.Context, string) (bridgedCall, error) { return call, nil }
+	start := &protocol.Command{
+		ID: "c1", Type: protocol.CommandCallStart, IdempotencyKey: "k1",
+		Payload: json.RawMessage(`{"to":{"kind":"phone","id":"5541999990000"},"sdp":` + mustJSON(t, browserOffer(t)) + `}`),
+	}
+	if _, err := session.Execute(t.Context(), start); err != nil {
+		t.Fatalf("call.start: %v", err)
+	}
+}
+
+// A dial whose offer write failed may have rung the phone already: the failure carries
+// the mark that keeps the command's attempt standing, so a redelivery under the same key
+// does not ring it again. One that failed before the write, or on a socket that was not
+// there, rang nothing, and is left for the retry to place.
+func TestAFailedDialMayHaveRungThePhone(t *testing.T) {
+	t.Parallel()
+	for name, test := range map[string]struct {
+		err    error
+		landed bool
+	}{
+		"the offer write failed": {fmt.Errorf("%w: %w", meowcaller.ErrSendOffer, errors.New("write: broken pipe")), true},
+		"no socket to write on":  {fmt.Errorf("%w: %w", meowcaller.ErrSendOffer, wm.ErrNotConnected), false},
+		"before the offer":       {errors.New("device discovery: timed out"), false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			session := newCallSession(t)
+			session.onWhatsApp = func(_ context.Context, _ *wm.Client, phones []string) ([]waTypes.IsOnWhatsAppResponse, error) {
+				return []waTypes.IsOnWhatsAppResponse{{Query: phones[0], IsIn: true,
+					JID: waTypes.NewJID("5541999990000", waTypes.DefaultUserServer)}}, nil
+			}
+			session.dialCall = func(context.Context, string) (bridgedCall, error) { return nil, test.err }
+			start := &protocol.Command{
+				ID: "c1", Type: protocol.CommandCallStart, IdempotencyKey: "k1",
+				Payload: json.RawMessage(`{"to":{"kind":"phone","id":"5541999990000"},"sdp":` + mustJSON(t, browserOffer(t)) + `}`),
+			}
+			_, err := session.Execute(t.Context(), start)
+			assertCode(t, err, protocol.ErrorWaError)
+			if landed := errors.Is(err, engine.ErrMayHaveLanded); landed != test.landed {
+				t.Fatalf("a dial that failed with %v is marked as maybe landed: %v, want %v", test.err, landed, test.landed)
+			}
+		})
+	}
+}
+
+// A call.accept whose answer the socket does not take gives the executor back at its
+// deadline, and the voice is still wired if the answer lands afterwards.
+func TestAnAcceptThatStallsHonoursItsDeadline(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	call := &fakeCall{id: "call-1", answerStall: make(chan struct{})}
+	session.ringing(call)
+	session.handle(audioOffer("call-1"))
+	offer, _ := published(t, session, protocol.EventCallOffer, "event_call_offer")["sdp"].(string)
+	accept := `{"call_id":"call-1","sdp":` + mustJSON(t, browserAnswer(t, offer)) + `}`
+
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+	returned := make(chan error, 1)
+	go func() {
+		_, err := session.Execute(ctx, command(protocol.CommandCallAccept, accept))
+		returned <- err
+	}()
+	select {
+	case err := <-returned:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			close(call.answerStall)
+			t.Fatalf("a stalled accept returned %v, want the deadline", err)
+		}
+	case <-time.After(5 * time.Second):
+		close(call.answerStall)
+		t.Fatal("a stalled accept held the executor past its deadline")
+	}
+	close(call.answerStall)
+	deadline := time.Now().Add(testwait.Budget)
+	for {
+		if _, _, _, wired := call.counts(); wired {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the answer landed after the deadline and the voice was never wired")
+		}
+		time.Sleep(testwait.Poll)
+	}
+}
+
+// call.answered is published off the dispatch: the callee's accept arrives on it, and an
+// inbox with no room must not hold it up.
+func TestTheAnswerOfAPlacedCallDoesNotWaitForRoom(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	call := &fakeCall{id: "CALLOUT1"}
+	placeCall(t, session, call)
+	drain(t, session)
+	filled := 0
+fill:
+	for {
+		select {
+		case session.inbox <- pending{}:
+			filled++
+		default:
+			break fill
+		}
+	}
+
+	accepted := make(chan struct{})
+	go func() { call.peerAccepts(); close(accepted) }()
+	select {
+	case <-accepted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the callee's accept waited for room in a full inbox")
+	}
+	for range filled {
+		<-session.Events()
+	}
+	published(t, session, protocol.EventCallAnswered, "event_call_answered")
+}
+
+// A placed call that ends while the callee's pick-up is being handled is not reported
+// answered after its end, whether it ended before the voice was wired or during it.
+func TestAPlacedCallThatEndsAsItIsAnsweredIsNotReportedAnswered(t *testing.T) {
+	t.Parallel()
+	for _, when := range []string{"before", "during"} {
+		t.Run(when, func(t *testing.T) {
+			t.Parallel()
+			session := newCallSession(t)
+			call := &fakeCall{id: "CALLOUT1"}
+			placeCall(t, session, call)
+			if when == "before" {
+				call.remoteEnds("rejected")
+			} else {
+				call.onReceive = func() { call.remoteEnds("rejected") }
+			}
+			call.peerAccepts()
+			published(t, session, protocol.EventCallTerminate, "event_call_terminate")
+			select {
+			case emission := <-session.Events():
+				t.Fatalf("published %s after the call ended", emission.Type)
+			case <-time.After(300 * time.Millisecond):
+			}
+			if _, _, _, wired := call.counts(); when == "before" && wired {
+				t.Fatal("the voice was wired to a call that had already ended")
+			}
+		})
+	}
+}
+
+// A notice's wait outlives the dispatch it came from. A rebuild during it retires the
+// client the notice arrived on, and the call it announced is not published on the session
+// the replacement owns.
+func TestANoticeWaitingOutARebuildIsNotPublished(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	session.offerWait = 200 * time.Millisecond
+	session.handle(callNotice("call-1"))
+	if err := session.rebuild(t.Context()); err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	select {
+	case emission := <-session.Events():
+		t.Fatalf("published %s from a client the rebuild retired", emission.Type)
+	case <-time.After(600 * time.Millisecond):
+	}
+}
+
+// A notice that passed its fence before a rebuild came, and is still on its way to the
+// publication, holds the rebuild until it is out: retired under it, the client's notice
+// would be published on the session the replacement owns.
+func TestARebuildWaitsForANoticeAlreadyOnItsWayOut(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	session.offerWait = 100 * time.Millisecond
+	// Installed before anything reads it and armed only once the notice is handed over, so
+	// the one reading it holds is the notice's own, after its wait.
+	entered, released := make(chan struct{}), make(chan struct{})
+	var armed, held atomic.Bool
+	session.wallClock = func() time.Time {
+		if armed.Load() && held.CompareAndSwap(false, true) {
+			close(entered)
+			<-released
+		}
+		return time.Now()
+	}
+	session.handle(callNotice("call-1"))
+	armed.Store(true)
+	select {
+	case <-entered:
+	case <-time.After(testwait.Budget):
+		t.Fatal("the notice's wait never ran out")
+	}
+
+	rebuilt := make(chan error, 1)
+	go func() { rebuilt <- session.rebuild(t.Context()) }()
+	select {
+	case <-rebuilt:
+		close(released)
+		t.Fatal("the rebuild retired the client with its notice still on its way out")
+	case <-time.After(300 * time.Millisecond):
+	}
+	close(released)
+	select {
+	case err := <-rebuilt:
+		if err != nil {
+			t.Fatalf("rebuild: %v", err)
+		}
+	case <-time.After(testwait.Budget):
+		t.Fatal("the rebuild did not finish once the notice was out")
+	}
+}
+
+// meowcaller can take a while between engaging an offer and handing the call over. A
+// notice whose wait runs out in that window leaves the call's one call.offer to the offer.
+func TestANoticeDoesNotTakeTheOfferMeowcallerIsStillWorkingThrough(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	session.offerWait = 10 * time.Millisecond
+	if !session.engagesOffer(audioOffer("call-1")) {
+		t.Fatal("the gate did not engage a voice call")
+	}
+	session.handle(callNotice("call-1"))
+	select {
+	case emission := <-session.Events():
+		t.Fatalf("published %s while meowcaller was still working through the offer", emission.Type)
+	case <-time.After(300 * time.Millisecond):
+	}
+	session.ringing(&fakeCall{id: "call-1"})
+	session.handle(audioOffer("call-1"))
+	if sdp, _ := published(t, session, protocol.EventCallOffer, "event_call_offer")["sdp"].(string); !strings.HasPrefix(sdp, "v=0") {
+		t.Fatalf("the offer carries %q, want the connector's SDP", sdp)
+	}
+}
+
+// A client replaced -- WhatsApp logging the device out, a rebuild after a drop -- takes its
+// calls with it: meowcaller does not see that, and a call left to it would outlive the
+// account it belonged to.
+func TestReplacingTheClientEndsItsCalls(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	call, release := answeredCall(t, session, "call-1")
+	release()
+	if !session.adopt(t.Context(), session.current()) {
+		t.Fatal("the session would not take a client")
+	}
+	hungUpWithin(t, call)
+	session.bridge.mu.Lock()
+	left := len(session.bridge.live)
+	session.bridge.mu.Unlock()
+	if left != 0 {
+		t.Fatalf("%d calls are still carried by a client that was replaced", left)
+	}
+}
+
+// With the inbox full, the callee's answer and then the call's end both wait for room, and
+// they reach the client in that order.
+func TestTheAnswerOfAPlacedCallIsPublishedBeforeItsEnd(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	call := &fakeCall{id: "CALLOUT1"}
+	placeCall(t, session, call)
+	drain(t, session)
+	filled := 0
+fill:
+	for {
+		select {
+		case session.inbox <- pending{}:
+			filled++
+		default:
+			break fill
+		}
+	}
+	call.peerAccepts()
+	call.remoteEnds("hangup")
+
+	var order []protocol.EventType
+	deadline := time.After(testwait.Budget)
+	for len(order) < 2 {
+		select {
+		case emission := <-session.Events():
+			if emission.Type == protocol.EventCallAnswered || emission.Type == protocol.EventCallTerminate {
+				order = append(order, emission.Type)
+			}
+		case <-deadline:
+			t.Fatalf("published %v and nothing more", order)
+		}
+	}
+	if order[0] != protocol.EventCallAnswered {
+		t.Fatalf("published %v, want the answer before the end", order)
+	}
+}
+
+// An accept whose deadline passed goes on wiring the call from its own goroutine while a
+// call.terminate for it runs on the executor; the two read and write the call's state
+// under one lock, which is what -race checks here, and the terminate hangs up the call
+// that the accept answered.
+func TestATerminateRacingALateAcceptHangsUp(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	call := &fakeCall{id: "call-1", answerStall: make(chan struct{})}
+	session.ringing(call)
+	session.handle(audioOffer("call-1"))
+	offer, _ := published(t, session, protocol.EventCallOffer, "event_call_offer")["sdp"].(string)
+	accept := `{"call_id":"call-1","sdp":` + mustJSON(t, browserAnswer(t, offer)) + `}`
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := session.Execute(ctx, command(protocol.CommandCallAccept, accept)); !errors.Is(err, context.DeadlineExceeded) {
+		close(call.answerStall)
+		t.Fatalf("a stalled accept returned %v, want the deadline", err)
+	}
+	close(call.answerStall)
+	if _, err := session.Execute(t.Context(), command(protocol.CommandCallTerminate, `{"call_id":"call-1"}`)); err != nil {
+		t.Fatal(err)
+	}
+	// The late answer runs on its own goroutine, and releasing it does not say when it ran.
+	deadline := time.Now().Add(testwait.Budget)
+	for {
+		answered, rejected, hungUp, _ := call.counts()
+		if answered == 1 {
+			if rejected+hungUp != 1 {
+				t.Fatalf("rejected %d, hung up %d, want the call ended once", rejected, hungUp)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the late answer never ran: answered %d", answered)
+		}
+		time.Sleep(testwait.Poll)
+	}
+}
+
+// A session connected through a proxy does not carry calls: their voice goes to WhatsApp
+// over UDP the proxy does not carry, and would leave from this host's own address. Its
+// offers come without SDP, meowcaller does not engage them, and the commands are refused.
+func TestAProxiedSessionDoesNotCarryCalls(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	session.setProxy("http://proxy.example:3128")
+
+	if session.engagesOffer(audioOffer("call-1")) {
+		t.Fatal("meowcaller engaged a call on a proxied session")
+	}
+	session.handle(audioOffer("call-1"))
+	if _, carries := published(t, session, protocol.EventCallOffer, "event_call_offer")["sdp"]; carries {
+		t.Fatal("a proxied session offered a call with SDP")
+	}
+	for _, kind := range []protocol.CommandType{protocol.CommandCallAccept, protocol.CommandCallStart, protocol.CommandCallTerminate} {
+		if _, err := session.Execute(t.Context(), command(kind, `{"call_id":"c","sdp":"v=0"}`)); !errors.Is(err, engine.ErrNotSupported) {
+			t.Errorf("%s answered %v on a proxied session, want ErrNotSupported", kind, err)
+		}
+	}
+}
+
+// A connect that stops the session carrying calls ends the calls it carries before it
+// changes anything: with a proxy their UDP media would go on leaving from this host, and
+// with the policy off no call.terminate could reach them any more.
+func TestAConnectThatTurnsCallsOffEndsThem(t *testing.T) {
+	t.Parallel()
+	for name, req := range map[string]engine.ConnectRequest{
+		"auto_reject": {Pairing: "resume", Calls: &engine.CallsRequest{AutoReject: true, Answer: true}},
+		"no answer":   {Pairing: "resume"},
+		"a proxy": {Pairing: "resume", Calls: &engine.CallsRequest{Answer: true},
+			Proxy: &engine.ProxyRequest{URL: "socks5://127.0.0.1:2"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			session := newCallSession(t)
+			call, release := answeredCall(t, session, "call-1")
+			release()
+			_ = session.Connect(t.Context(), req)
+			hungUpWithin(t, call)
+		})
+	}
+}
+
+// A session that closes ends its calls, and a call registered after that -- a placed one
+// whose dial was still under way -- is hung up rather than left ringing outside the
+// teardown.
+func TestACallPlacedAsTheSessionClosesIsHungUp(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	session.onWhatsApp = func(_ context.Context, _ *wm.Client, phones []string) ([]waTypes.IsOnWhatsAppResponse, error) {
+		return []waTypes.IsOnWhatsAppResponse{{Query: phones[0], IsIn: true,
+			JID: waTypes.NewJID("5541999990000", waTypes.DefaultUserServer)}}, nil
+	}
+	call := &fakeCall{id: "CALLOUT1", signalled: make(chan struct{}, 4)}
+	session.dialCall = func(context.Context, string) (bridgedCall, error) {
+		// The close lands while the offer is on its way.
+		session.bridge.mu.Lock()
+		session.bridge.closed = true
+		session.bridge.mu.Unlock()
+		return call, nil
+	}
+	start := &protocol.Command{
+		ID: "c1", Type: protocol.CommandCallStart, IdempotencyKey: "k1",
+		Payload: json.RawMessage(`{"to":{"kind":"phone","id":"5541999990000"},"sdp":` + mustJSON(t, browserOffer(t)) + `}`),
+	}
+	_, err := session.Execute(t.Context(), start)
+	if !errors.Is(err, engine.ErrMayHaveLanded) {
+		t.Fatalf("a call placed as the session closed = %v, want a failure that may have rung", err)
+	}
+	hungUpWithin(t, call)
+	session.bridge.mu.Lock()
+	left := len(session.bridge.live)
+	session.bridge.mu.Unlock()
+	if left != 0 {
+		t.Fatalf("%d calls registered on a closing session", left)
+	}
+}
+
+// A call.accept repeated while the first one's answer is still on its way is nothing
+// new: the browser's answer is applied once, and the repeat is not refused.
+func TestAnAcceptRepeatedWhileTheAnswerIsPendingIsNothingNew(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	call := &fakeCall{id: "call-1", answerStall: make(chan struct{})}
+	t.Cleanup(func() {
+		select {
+		case <-call.answerStall:
+		default:
+			close(call.answerStall)
+		}
+	})
+	session.ringing(call)
+	session.handle(audioOffer("call-1"))
+	offer, _ := published(t, session, protocol.EventCallOffer, "event_call_offer")["sdp"].(string)
+	accept := `{"call_id":"call-1","sdp":` + mustJSON(t, browserAnswer(t, offer)) + `}`
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := session.Execute(ctx, command(protocol.CommandCallAccept, accept)); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("a stalled accept returned %v, want the deadline", err)
+	}
+	if _, err := session.Execute(t.Context(), command(protocol.CommandCallAccept, accept)); err != nil {
+		t.Fatalf("the repeat of an accept still being answered = %v, want nothing new", err)
+	}
+}
+
+// The end of a placed call reported by WhatsApp's own terminate also waits for the
+// call's answer, when the answer is still waiting for room.
+func TestWhatsAppsTerminateOfAnAnsweredCallFollowsItsAnswer(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	call := &fakeCall{id: "CALLOUT1"}
+	placeCall(t, session, call)
+	drain(t, session)
+	filled := 0
+fill:
+	for {
+		select {
+		case session.inbox <- pending{}:
+			filled++
+		default:
+			break fill
+		}
+	}
+	call.peerAccepts()
+	session.handle(&waEvents.CallTerminate{BasicCallMeta: callMeta("CALLOUT1"), Reason: "hangup"})
+
+	var order []protocol.EventType
+	deadline := time.After(testwait.Budget)
+	for len(order) < 2 {
+		select {
+		case emission := <-session.Events():
+			if emission.Type == protocol.EventCallAnswered || emission.Type == protocol.EventCallTerminate {
+				order = append(order, emission.Type)
+			}
+		case <-deadline:
+			t.Fatalf("published %v and nothing more", order)
+		}
+	}
+	if order[0] != protocol.EventCallAnswered {
+		t.Fatalf("published %v, want the answer before the end", order)
+	}
+}
+
+// An offer meowcaller engaged under one policy and handed over after the session stopped
+// carrying calls -- a connect turned them off, or put the session on a proxy, while the
+// offer was being decrypted -- is not taken up: it is offered without SDP and nothing of
+// it is carried.
+func TestAnOfferEngagedBeforeCallsWereTurnedOffIsNotCarried(t *testing.T) {
+	t.Parallel()
+	for name, turnOff := range map[string]func(*Session){
+		"the policy":   func(s *Session) { s.setCallPolicy(false, false) },
+		"a proxy":      func(s *Session) { s.setProxy("http://proxy.example:3128") },
+		"mid-connect":  func(s *Session) { s.bridge.mu.Lock(); s.bridge.pausing++; s.bridge.mu.Unlock() },
+		"a disconnect": func(s *Session) { _ = s.Disconnect(context.Background()) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			session := newCallSession(t)
+			if !session.engagesOffer(audioOffer("call-1")) {
+				t.Fatal("the gate did not engage a voice call")
+			}
+			turnOff(session)
+			drain(t, session)
+			call := &fakeCall{id: "call-1"}
+			session.ringing(call)
+			call.mu.Lock()
+			discarded, rejected, hungUp := call.discarded, call.rejected, call.hungUp
+			call.mu.Unlock()
+			if !discarded || rejected+hungUp != 0 {
+				t.Fatalf("discarded %v, rejected %d, hung up %d; want it dropped here alone", discarded, rejected, hungUp)
+			}
+			session.handle(audioOffer("call-1"))
+			if _, carries := published(t, session, protocol.EventCallOffer, "event_call_offer")["sdp"]; carries {
+				t.Fatal("a call engaged before calls were turned off was offered with SDP")
+			}
+			session.bridge.mu.Lock()
+			left := len(session.bridge.live)
+			session.bridge.mu.Unlock()
+			if left != 0 {
+				t.Fatalf("%d calls carried after calls were turned off", left)
+			}
+		})
+	}
+}
+
+// A connect after a disconnect lets calls register again.
+func TestAConnectAfterADisconnectCarriesCallsAgain(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	_ = session.Disconnect(t.Context())
+	session.setConnected(true)
+	_ = session.Connect(t.Context(), engine.ConnectRequest{Pairing: "resume", Calls: &engine.CallsRequest{Answer: true}})
+	drain(t, session)
+	if _, sdp := ringCall(t, session, "call-1"); sdp == "" {
+		t.Fatal("a call after the session was connected again was offered without SDP")
+	}
+}
+
+// A logout that failed with the device untouched -- nothing was sent, or nothing came
+// back -- leaves the session as it was, and calls register on it again. One that went
+// through keeps them off.
+func TestALogoutThatFailedLeavesCallsOn(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	session.logout = func(context.Context, *wm.Client) error { return wm.ErrNotConnected }
+	if err := session.Logout(t.Context()); err == nil {
+		t.Fatal("a logout over no socket succeeded")
+	}
+	drain(t, session)
+	if _, sdp := ringCall(t, session, "call-1"); sdp == "" {
+		t.Fatal("after a logout that changed nothing, a call was offered without SDP")
+	}
+}
+
+// meowcaller does not replay an end that happened before OnEnd was set, and a received
+// call can be ended in that window: it is reported over, and no browser offer is built
+// for it.
+func TestAReceivedCallThatEndedBeforeItsListenerIsReportedOver(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	session.ringing(&fakeCall{id: "call-1", ended: true})
+	if end := published(t, session, protocol.EventCallTerminate, "event_call_terminate"); end["call_id"] != "call-1" {
+		t.Fatalf("the end names %v", end["call_id"])
+	}
+	session.bridge.mu.Lock()
+	left := len(session.bridge.live)
+	session.bridge.mu.Unlock()
+	if left != 0 {
+		t.Fatalf("%d calls are still carried after the call ended", left)
+	}
+}
+
+// WhatsApp logging the device out ends the calls at once, whatever the cleanup that
+// follows makes of the device: here the store cannot be reached in time, so the cleanup
+// fails and no rebuild comes to retire the client.
+func TestALoggedOutDeviceEndsItsCalls(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	call, release := answeredCall(t, session, "call-1")
+	release()
+	session.storeLimit = time.Nanosecond
+	session.handle(&waEvents.LoggedOut{OnConnect: false, Reason: waEvents.ConnectFailureLoggedOut})
+	hungUpWithin(t, call)
+}
+
+// A rebuild disconnects the retired client before it waits on that client's handlers, the
+// order Close takes: meowcaller writes from inside its own handler with a context nothing
+// here can cancel, and only a closed socket ends a write that stalled.
+func TestARebuildDisconnectsBeforeWaitingOnHandlers(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	retired := session.current()
+	disconnected := make(chan struct{})
+	session.closeSocket = func(client *wm.Client) {
+		if client == retired {
+			close(disconnected)
+		}
+	}
+	session.detach = func(*wm.Client, uint32) {
+		select {
+		case <-disconnected:
+		case <-time.After(testwait.Budget):
+			t.Error("the rebuild waited on the handlers with the socket still open")
+		}
+	}
+	if err := session.rebuild(t.Context()); err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+}
+
+// A handler the retired client is still running when the rebuild comes -- a message whose
+// media is still downloading -- is finished before the next client is adopted, however
+// long it takes past the rebuild's bound. Adopted under it, the replacement would have it
+// go on writing down and publishing, on the session the new account owns, what the
+// retired account received.
+func TestARebuildWaitsForAHandlerStillRunningOnTheRetiredClient(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	retired := session.current()
+
+	entered, released := make(chan struct{}), make(chan struct{})
+	var held atomic.Bool
+	session.wallClock = func() time.Time {
+		if held.CompareAndSwap(false, true) {
+			close(entered)
+			<-released
+		}
+		return time.Now()
+	}
+	go func() {
+		//nolint:staticcheck // SA1019: the dispatch a real socket drives is this one
+		retired.DangerousInternals().DispatchEvent(&waEvents.Presence{From: someone(theCaller)})
+	}()
+	select {
+	case <-entered:
+	case <-time.After(testwait.Budget):
+		t.Fatal("the handler never ran")
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+	rebuilt := make(chan error, 1)
+	go func() { rebuilt <- session.rebuild(ctx) }()
+	select {
+	case <-rebuilt:
+		close(released)
+		t.Fatal("the rebuild adopted the next client with the retired one's handler still running")
+	case <-time.After(300 * time.Millisecond):
+	}
+	if session.current() != retired {
+		close(released)
+		t.Fatal("the replacement was adopted with the retired client's handler still running")
+	}
+
+	close(released)
+	select {
+	case err := <-rebuilt:
+		if err != nil {
+			t.Fatalf("rebuild: %v", err)
+		}
+	case <-time.After(testwait.Budget):
+		t.Fatal("the rebuild did not finish once the handler returned")
+	}
+	if session.current() == retired {
+		t.Fatal("the rebuild kept the retired client")
+	}
+}
+
+// What the retired client dispatches once the rebuild has started is dropped,
+// unacknowledged, while its handlers are being removed, and nothing reaches the session;
+// the replacement's own events, once it is adopted, still do.
+func TestARetiredClientsHandlerIsFencedOffTheReplacement(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	removing, released := make(chan struct{}), make(chan struct{})
+	retired := session.current()
+	session.detach = func(client *wm.Client, id uint32) {
+		if client == retired {
+			close(removing)
+			<-released
+		}
+		client.RemoveEventHandler(id)
+	}
+	rebuilt := make(chan error, 1)
+	go func() { rebuilt <- session.rebuild(t.Context()) }()
+	select {
+	case <-removing:
+	case <-time.After(testwait.Budget):
+		t.Fatal("the rebuild never came to remove the handler")
+	}
+
+	// Dispatched the way whatsmeow dispatches what arrives on the socket, which is the one
+	// way to reach the handlers a client holds.
+	//nolint:staticcheck // SA1019: the dispatch a real socket drives is this one
+	failed := retired.DangerousInternals().DispatchEvent(textMessage("from-the-retired", "hi"))
+	close(released)
+	if !failed {
+		t.Fatal("an event from the retired client was acknowledged")
+	}
+	if err := <-rebuilt; err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	select {
+	case emission := <-session.Events():
+		t.Fatalf("the retired client's event reached the replacement's session as %s", emission.Type)
+	default:
+	}
+	replacement := session.current()
+	if replacement == retired {
+		t.Fatal("the rebuild kept the retired client")
+	}
+
+	handled := make(chan bool, 1)
+	go func() {
+		//nolint:staticcheck // SA1019: as above
+		handled <- !replacement.DangerousInternals().DispatchEvent(textMessage("from-the-replacement", "hi"))
+	}()
+	next(t, session).Settle(nil)
+	select {
+	case ok := <-handled:
+		if !ok {
+			t.Fatal("the replacement's own event was left unacknowledged")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the replacement's own event was never handled")
+	}
+}
+
+// The fence is wired to the meowcaller each client carries: an offer dispatched on the
+// retired client after a rebuild is not engaged, and the same offer on the replacement is.
+func TestARetiredClientsMeowcallerEngagesNothing(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	// The test session's first client was adopted before it had call media, so it carries
+	// no meowcaller; one rebuild gives it a client that does, which is the one retired.
+	if err := session.rebuild(t.Context()); err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	// meowcaller's handler is its own, and stays on the retired client after the rebuild
+	// removes the session's.
+	retired := session.current()
+	if err := session.rebuild(t.Context()); err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	replacement := session.current()
+
+	//nolint:staticcheck // SA1019: the dispatch a real socket drives is this one
+	retired.DangerousInternals().DispatchEvent(audioOffer("from-the-retired"))
+	if session.offerOnItsWay("from-the-retired") {
+		t.Fatal("the retired client's meowcaller engaged an offer")
+	}
+
+	//nolint:staticcheck // SA1019: as above
+	go replacement.DangerousInternals().DispatchEvent(audioOffer("from-the-replacement"))
+	deadline := time.Now().Add(testwait.Budget)
+	for !session.offerOnItsWay("from-the-replacement") {
+		if time.Now().After(deadline) {
+			t.Fatal("the replacement's meowcaller never engaged its offer")
+		}
+		time.Sleep(testwait.Poll)
+	}
+}
+
+// meowcaller's two callbacks are fenced with the client they were installed on, like the
+// session's own handler: once a rebuild has retired that client, an offer it is still
+// working through is not engaged, and a call it hands over is dropped on that client
+// alone, never registered on the session the replacement owns.
+func TestARetiredClientsCallsAreNotTakenUp(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	var retired atomic.Bool
+
+	if !session.engagesOfferFrom(&retired, audioOffer("call-1")) {
+		t.Fatal("a live client's offer was not engaged")
+	}
+	session.ringingFrom(&retired, &fakeCall{id: "call-1"})
+	if !carried(session, "call-1") {
+		t.Fatal("a live client's call was not taken up")
+	}
+
+	retired.Store(true)
+	if session.engagesOfferFrom(&retired, audioOffer("call-2")) {
+		t.Fatal("a retired client's offer was engaged")
+	}
+	call := &fakeCall{id: "call-2"}
+	session.ringingFrom(&retired, call)
+	if carried(session, "call-2") {
+		t.Fatal("a retired client's call was registered on the session")
+	}
+	call.mu.Lock()
+	defer call.mu.Unlock()
+	if !call.discarded || call.rejected != 0 || call.hungUp != 0 {
+		t.Fatalf("a retired client's call was discarded=%v, rejected %d, hung up %d: want dropped here alone", call.discarded, call.rejected, call.hungUp)
+	}
+}
+
+// A call.start stopped by its own deadline is answered with the deadline and keeps no
+// attempt, as the contract says of every command stopped that way, even when meowcaller
+// reports the stop as a failed offer write.
+func TestACallStartStoppedByItsDeadlineIsLeftForTheResend(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	session.onWhatsApp = func(_ context.Context, _ *wm.Client, phones []string) ([]waTypes.IsOnWhatsAppResponse, error) {
+		return []waTypes.IsOnWhatsAppResponse{{Query: phones[0], IsIn: true,
+			JID: waTypes.NewJID("5541999990000", waTypes.DefaultUserServer)}}, nil
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	session.dialCall = func(context.Context, string) (bridgedCall, error) {
+		cancel()
+		return nil, fmt.Errorf("%w: %w", meowcaller.ErrSendOffer, context.Canceled)
+	}
+	start := &protocol.Command{
+		ID: "c1", Type: protocol.CommandCallStart, IdempotencyKey: "k1",
+		Payload: json.RawMessage(`{"to":{"kind":"phone","id":"5541999990000"},"sdp":` + mustJSON(t, browserOffer(t)) + `}`),
+	}
+	_, err := session.Execute(ctx, start)
+	if errors.Is(err, engine.ErrMayHaveLanded) {
+		t.Fatalf("a call.start stopped by its deadline = %v, marked as maybe landed", err)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("a call.start stopped by its deadline = %v, want the deadline's error", err)
+	}
+}
+
+// A session deleted during a call ends it, whatever the local cleanup after the unlink
+// makes of the device: here the store cannot be reached in time.
+func TestDeletingASessionEndsItsCalls(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	call, release := answeredCall(t, session, "call-1")
+	release()
+	session.logout = func(context.Context, *wm.Client) error { return nil }
+	session.storeLimit = time.Nanosecond
+	_ = session.Delete(t.Context())
+	hungUpWithin(t, call)
+}
+
+// A hangup is the same: meowcaller ends an answered call here before it writes the
+// terminate, so a retried call.terminate writes the terminate again, as many times as it
+// takes, and once one lands a further retry is nothing new.
+func TestAHangupThatDidNotGoOutIsSentAgain(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	call, release := answeredCall(t, session, "call-1")
+	release()
+	call.mu.Lock()
+	call.hangupFail = errors.New("write: broken pipe")
+	call.mu.Unlock()
+
+	_, err := session.Execute(t.Context(), command(protocol.CommandCallTerminate, `{"call_id":"call-1"}`))
+	assertCode(t, err, protocol.ErrorWaError)
+	call.mu.Lock()
+	call.hangupAgainFail = errors.New("write: broken pipe")
+	call.mu.Unlock()
+	_, err = session.Execute(t.Context(), command(protocol.CommandCallTerminate, `{"call_id":"call-1"}`))
+	assertCode(t, err, protocol.ErrorWaError)
+	call.mu.Lock()
+	call.hangupAgainFail = nil
+	call.mu.Unlock()
+	if _, err := session.Execute(t.Context(), command(protocol.CommandCallTerminate, `{"call_id":"call-1"}`)); err != nil {
+		t.Fatalf("the retried hangup = %v", err)
+	}
+	if _, err := session.Execute(t.Context(), command(protocol.CommandCallTerminate, `{"call_id":"call-1"}`)); err != nil {
+		t.Fatal(err)
+	}
+	call.mu.Lock()
+	defer call.mu.Unlock()
+	if call.hungUp != 1 || call.hungUpAgain != 2 {
+		t.Fatalf("hung up %d times and again %d times, want once and twice", call.hungUp, call.hungUpAgain)
+	}
+	if call.rejected != 0 {
+		t.Fatalf("an answered call was rejected %d times", call.rejected)
+	}
+}
+
+// The hang-ups the connector makes on its own are kept for the retry the same way: a
+// browser that went away, or one that could not answer the callee, leaves a call whose
+// terminate may not have gone out, and a call.terminate from the client writes it again.
+func TestAHangupTheConnectorMadeItselfIsSentAgainWhenItDidNotGoOut(t *testing.T) {
+	t.Parallel()
+	for name, hangUp := range map[string]func(t *testing.T, session *Session) *fakeCall{
+		"the browser was lost": func(t *testing.T, session *Session) *fakeCall {
+			call, release := answeredCall(t, session, "call-1")
+			release()
+			call.mu.Lock()
+			call.hangupFail = errors.New("write: broken pipe")
+			call.mu.Unlock()
+			session.browserLost("call-1")
+			return call
+		},
+		"the browser could not answer the callee": func(t *testing.T, session *Session) *fakeCall {
+			call := &fakeCall{id: "call-1", hangupFail: errors.New("write: broken pipe")}
+			placeCall(t, session, call)
+			session.bridge.mu.Lock()
+			leg := session.bridge.live["call-1"].leg
+			session.bridge.mu.Unlock()
+			_ = leg.Close()
+			call.mu.Lock()
+			accepted := call.onAccept
+			call.mu.Unlock()
+			accepted()
+			// The hang-up goes out off the dispatch, so its failure is recorded a moment later.
+			unendedWithin(t, session, "call-1")
+			return call
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			session := newCallSession(t)
+			call := hangUp(t, session)
+			if _, err := session.Execute(t.Context(), command(protocol.CommandCallTerminate, `{"call_id":"call-1"}`)); err != nil {
+				t.Fatalf("the retried hangup = %v", err)
+			}
+			call.mu.Lock()
+			defer call.mu.Unlock()
+			if call.hungUp != 1 || call.hungUpAgain != 1 {
+				t.Fatalf("hung up %d times and again %d times, want once each", call.hungUp, call.hungUpAgain)
+			}
+		})
+	}
+}
+
+// unendedWithin waits for a hang-up that did not go out to be recorded for a retry.
+func unendedWithin(t *testing.T, session *Session, id string) {
+	t.Helper()
+	deadline := time.Now().Add(testwait.Budget)
+	for {
+		session.bridge.mu.Lock()
+		_, recorded := session.bridge.unended[id]
+		session.bridge.mu.Unlock()
+		if recorded {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the failed hang-up of %s was never recorded", id)
+		}
+		time.Sleep(testwait.Poll)
+	}
+}
+
+// The callee picking up a call the browser can no longer carry hangs it up, and that
+// hang-up is not written from inside the dispatch that delivered the pickup: a socket that
+// does not take it would hold everything WhatsApp sends after it.
+func TestAHangupAfterAFailedAnswerDoesNotHoldTheDispatch(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	stall := make(chan struct{})
+	call := &fakeCall{id: "call-1", stall: stall, signalled: make(chan struct{}, 4), hangupFail: errors.New("write: broken pipe")}
+	placeCall(t, session, call)
+	session.bridge.mu.Lock()
+	leg := session.bridge.live["call-1"].leg
+	session.bridge.mu.Unlock()
+	_ = leg.Close()
+	call.mu.Lock()
+	accepted := call.onAccept
+	call.mu.Unlock()
+
+	returned := make(chan struct{})
+	go func() {
+		defer close(returned)
+		accepted()
+	}()
+	select {
+	case <-returned:
+	case <-time.After(testwait.Budget):
+		close(stall)
+		t.Fatal("the pickup's handler waited on a hang-up the socket did not take")
+	}
+	select {
+	case <-call.signalled:
+	case <-time.After(testwait.Budget):
+		close(stall)
+		t.Fatal("the call the browser cannot carry was never hung up")
+	}
+	close(stall)
+	unendedWithin(t, session, "call-1")
+}
+
+// A call placed on a client that a rebuild retired during the dial is not registered on
+// the replacement: it is hung up, and the command answers that it may have rung.
+func TestACallPlacedAcrossARebuildIsNotKept(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	call := &fakeCall{id: "call-1", signalled: make(chan struct{}, 4)}
+	session.onWhatsApp = func(_ context.Context, _ *wm.Client, phones []string) ([]waTypes.IsOnWhatsAppResponse, error) {
+		return []waTypes.IsOnWhatsAppResponse{{Query: phones[0], IsIn: true,
+			JID: waTypes.NewJID("5541999990000", waTypes.DefaultUserServer)}}, nil
+	}
+	session.dialCall = func(ctx context.Context, _ string) (bridgedCall, error) {
+		if err := session.rebuild(ctx); err != nil {
+			t.Errorf("rebuild: %v", err)
+		}
+		return call, nil
+	}
+	start := &protocol.Command{
+		ID: "c1", Type: protocol.CommandCallStart, IdempotencyKey: "k1",
+		Payload: json.RawMessage(`{"to":{"kind":"phone","id":"5541999990000"},"sdp":` + mustJSON(t, browserOffer(t)) + `}`),
+	}
+	if _, err := session.Execute(t.Context(), start); !errors.Is(err, engine.ErrMayHaveLanded) {
+		t.Fatalf("a call placed across a rebuild = %v, want it marked as maybe rung", err)
+	}
+	if carried(session, "call-1") {
+		t.Fatal("a call placed on a retired client was registered on its replacement")
+	}
+	hungUpWithin(t, call)
+}
+
+// A call handed over just as its client was retired is not registered, even when the
+// fence was still clear on the way in: register reads it again under the lock the
+// rebuild's cleanup takes its list under.
+func TestACallFromARetiredClientIsNotRegistered(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	var retired atomic.Bool
+	retired.Store(true)
+	call := &fakeCall{id: "call-1"}
+	session.ringingOn(&retired, call)
+	if carried(session, "call-1") {
+		t.Fatal("a call from a retired client was registered")
+	}
+	call.mu.Lock()
+	defer call.mu.Unlock()
+	if !call.discarded {
+		t.Fatal("a call from a retired client was not dropped on that client")
+	}
+}
+
+// meowcaller ends a call here before it writes the rejection, so a rejection that did not
+// go out leaves nothing of the call to retry with. A retried call.terminate rejects it
+// again, to whoever rang, and once that lands a further one is nothing new.
+func TestARejectionThatDidNotGoOutIsSentAgain(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	var declined []string
+	session.declineCall = func(_ context.Context, _ *wm.Client, caller waTypes.JID, callID string) error {
+		declined = append(declined, callID+" to "+caller.User)
+		return nil
+	}
+	call := &fakeCall{id: "call-1", rejectFail: errors.New("write: broken pipe")}
+	session.ringing(call)
+	session.handle(audioOffer("call-1"))
+	published(t, session, protocol.EventCallOffer, "event_call_offer")
+
+	_, err := session.Execute(t.Context(), command(protocol.CommandCallTerminate, `{"call_id":"call-1"}`))
+	assertCode(t, err, protocol.ErrorWaError)
+	if _, err := session.Execute(t.Context(), command(protocol.CommandCallTerminate, `{"call_id":"call-1"}`)); err != nil {
+		t.Fatalf("the retried rejection = %v", err)
+	}
+	if want := []string{"call-1 to " + callMeta("call-1").CallCreator.User}; !slices.Equal(declined, want) {
+		t.Fatalf("declined %v, want %v", declined, want)
+	}
+	if _, err := session.Execute(t.Context(), command(protocol.CommandCallTerminate, `{"call_id":"call-1"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if len(declined) != 1 {
+		t.Fatalf("a rejection that landed was sent again: %v", declined)
+	}
+}
+
+// carried reports whether the session registered the call as one it carries.
+func carried(session *Session, callID string) bool {
+	session.bridge.mu.Lock()
+	defer session.bridge.mu.Unlock()
+	return session.bridge.live[callID] != nil
+}

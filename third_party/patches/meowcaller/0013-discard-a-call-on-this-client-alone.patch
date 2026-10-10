@@ -1,0 +1,24 @@
+Let the integrator drop a call on this client alone, without telling anybody.
+
+Origin: fazer-ai/whatsapp-connector, upstream meowcaller code (not from a pull request).
+
+Why: the connector's offer gate (patch 0011) decides when an offer arrives whether the client engages it, and the session's policy can change before meowcaller hands the call over: a connect that turns calls off, or that moves the session onto a proxy, lands while the offer is being decrypted and preaccepted. The connector then does not take the call up, and it cannot end it either: Reject and Hangup tell WhatsApp, which ends the call for every device of the account, the phone included. Left alone, meowcaller keeps the call's state and can start its media on relay events, over UDP the proxy does not carry.
+
+Discard runs finishCall for the call, which tears down its media and state on this client and fires OnEnd with reason "discarded", and writes nothing.
+
+diff --git a/livecall.go b/livecall.go
+index eef47a1..9347c2f 100644
+--- a/livecall.go
++++ b/livecall.go
+@@ -279,6 +279,11 @@ func (c *Call) IsReceivingVideo() bool {
+ // if the call is not in a ringing state.
+ func (c *Call) Answer() error { return c.eng.answer(c) }
+ 
++// Discard ends the call on this client alone: its media and its state here are torn
++// down, OnEnd fires with reason "discarded", and nothing is sent. The call goes on for
++// everybody else, ringing on the account's other devices as if this one had never seen it.
++func (c *Call) Discard() { c.eng.finishCall(c.id, "discarded") }
++
+ // Reject declines an inbound call.
+ func (c *Call) Reject() error { return c.eng.reject(c) }
+ 

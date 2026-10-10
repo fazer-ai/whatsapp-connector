@@ -8,11 +8,14 @@ package fake
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/fnv"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -563,9 +566,39 @@ func (s *Session) Execute(ctx context.Context, command *protocol.Command) (json.
 			return nil, errNotConnected
 		}
 		return nil, nil
+	case protocol.CommandCallStart, protocol.CommandCallAccept, protocol.CommandCallTerminate:
+		return s.call(command, connected)
 	default:
 		return nil, engine.ErrNotSupported
 	}
+}
+
+// call answers the three call commands the way the whatsmeow engine does on a session
+// that carries calls, with nothing on the other end: there is no call to ring, so
+// call.start hands back an id and the other two have nothing to change. A session whose
+// last connect did not ask for `calls.answer`, or asked for a proxy, refuses all three, as
+// the contract says.
+func (s *Session) call(command *protocol.Command, connected bool) (json.RawMessage, error) {
+	s.mu.Lock()
+	calls, proxied := s.asked.Calls, s.asked.Proxy != nil && s.asked.Proxy.URL != ""
+	s.mu.Unlock()
+	if calls == nil || !calls.Answer || calls.AutoReject || proxied {
+		return nil, engine.ErrNotSupported
+	}
+	if command.Type != protocol.CommandCallStart {
+		return nil, nil
+	}
+	if command.IdempotencyKey == "" {
+		return nil, protocol.NewError(protocol.ErrorInvalidPayload, "a call.start has to carry an idempotency_key")
+	}
+	if !connected {
+		return nil, errNotConnected
+	}
+	var raw [8]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return nil, fmt.Errorf("fake: mint a call id: %w", err)
+	}
+	return marshal(map[string]string{"call_id": "FAKECALL" + strings.ToUpper(hex.EncodeToString(raw[:]))})
 }
 
 // receiptPerSend makes this engine publish a `message.receipt` for every message it is

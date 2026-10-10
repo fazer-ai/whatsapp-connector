@@ -18,6 +18,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog"
 
+	"github.com/fazer-ai/whatsapp-connector/internal/calls"
 	"github.com/fazer-ai/whatsapp-connector/internal/cluster"
 	"github.com/fazer-ai/whatsapp-connector/internal/engine"
 	"github.com/fazer-ai/whatsapp-connector/internal/engine/fake"
@@ -1553,10 +1554,26 @@ func newEngine(
 		// and which is a fleet that does not come back on its own by construction.
 		return fake.New(fake.WithStore(devices)), devices, nil
 	case EngineWhatsmeow:
+		// Opened with the engine rather than with the first call, so a port the
+		// deployment did not leave free fails the start and not the first call somebody
+		// answers. The engine owns it from here and closes it with its sessions.
+		if cfg.CallsUDPPort != 0 {
+			callMedia, err := calls.Open(calls.Config{UDPPort: cfg.CallsUDPPort, PublicIPs: cfg.CallsPublicIPs},
+				log.With().Str("sub", "calls").Logger())
+			if err != nil {
+				_ = devices.Close()
+				return nil, nil, err
+			}
+			blobs.Calls = callMedia
+			log.Info().Int("port", callMedia.Port()).Strs("public_ips", cfg.CallsPublicIPs).Msg("calls: media socket open")
+		}
 		// Config refuses a whatsmeow engine with no database url, so devices is set.
 		waEngine, err := meow.New(devices,
 			meow.Options{DeviceName: cfg.DeviceName, Media: blobs, Queueing: queueing}, log)
 		if err != nil {
+			if blobs.Calls != nil {
+				_ = blobs.Calls.Close()
+			}
 			_ = devices.Close()
 			return nil, nil, err
 		}

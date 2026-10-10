@@ -1,0 +1,50 @@
+Decrypt an inbound offer's call key on the whatsmeow client's lifetime, not on a context of its own.
+
+Origin: fazer-ai/whatsapp-connector, upstream meowcaller code (not from a pull request).
+
+Why: onOffer runs inside whatsmeow's event dispatch, and decryptInboundCallKey reads the
+device store and decrypts in a store transaction. On context.Background() nothing can end
+that work: a store that stalls holds the dispatch, and an integrator shutting the client
+down waits behind it for as long as the stall lasts. The connector closes a session by
+cancelling the context it installs as the client's BackgroundEventCtx and then waits for
+the event handlers to finish, so a stalled decryption kept the session from closing and,
+since lost leases are stopped one at a time, the sessions after it from closing too.
+
+The decryption now runs on wa.BackgroundEventCtx, which whatsmeow already exposes for this
+purpose; a client without one keeps context.Background(), as before.
+
+diff --git a/client.go b/client.go
+--- a/client.go
++++ b/client.go
+@@ -51,6 +51,15 @@ type GroupCallOptions struct {
+ // NewClient wraps a connected whatsmeow client and installs the call event handlers.
+ // Construct it before the whatsmeow client connects so the low-level <ack>/<call>
+ // interception is in place before the receive loop starts.
++// lifetime is the whatsmeow client's background event context: what the integrator
++// cancels when the client is being shut down. Unset, it never ends.
++func (c *Client) lifetime() context.Context {
++	if ctx := c.wa.BackgroundEventCtx; ctx != nil {
++		return ctx
++	}
++	return context.Background()
++}
++
+ func NewClient(wa *whatsmeow.Client, opts ...Option) *Client {
+ 	cfg := resolveConfig(opts)
+ 	c := &Client{
+diff --git a/engine.go b/engine.go
+--- a/engine.go
++++ b/engine.go
+@@ -672,7 +672,11 @@ func (e *engine) onOffer(ev *events.CallOffer) {
+ 		return
+ 	}
+ 
+-	callKey, err := decryptInboundCallKey(context.Background(), e.c.wa, ev)
++	// On the client's own lifetime rather than a context of its own: this runs inside
++	// whatsmeow's event dispatch and reads the store, and a store that stalls would
++	// otherwise hold the dispatch, and the integrator's shutdown waiting behind it, for as
++	// long as the stall lasts.
++	callKey, err := decryptInboundCallKey(e.c.lifetime(), e.c.wa, ev)
+ 	if err != nil {
+ 		e.c.log.Warn().Err(err).Str("call_id", ev.CallID).Msg("decrypt callKey failed")
+ 		return

@@ -1,0 +1,174 @@
+Write every node meowcaller sends from whatsmeow's event dispatch through one ordered queue, off the dispatch.
+
+Origin: fazer-ai/whatsapp-connector, upstream meowcaller code (not from a pull request).
+
+Why: patch 0014 moved the preaccept off the dispatch, and four writes were still made on it: the relaylatency responses, the deferred accept that a mute_v2 sends, the typed call-control acks and the video acks. whatsmeow's socket writes with the socket's own context, so any of them blocking on a socket that stopped draining held every node behind it, the account's messages and call terminations included, until the socket closed. A goroutine per write would let them overtake each other, and the order matters (preaccept, relaylatency, accept), so they go through sendLater: a FIFO drained by one goroutine that exists only while there is something to send.
+
+The preaccept's goroutine from 0014 is replaced by the same queue, so it keeps its place ahead of the relaylatency responses.
+
+diff --git a/engine.go b/engine.go
+index 457f8df..8e5ba34 100644
+--- a/engine.go
++++ b/engine.go
+@@ -32,6 +32,12 @@ import (
+ type engine struct {
+ 	c *Client
+ 
++	// later is the writes made from whatsmeow's event dispatch, in the order they were
++	// made, and laterRunning whether a goroutine is draining them; see sendLater.
++	laterMu      sync.Mutex
++	later        []func()
++	laterRunning bool
++
+ 	mu              sync.Mutex
+ 	calls           map[string]*engineCall // keyed by call-id
+ 	staleOffers     map[string]struct{}    // offers replayed too old to answer, by call-id; see onCallRaw
+@@ -723,16 +729,12 @@ func (e *engine) onOffer(ev *events.CallOffer) {
+ 	// Answer/Reject decision. It keeps the offer alive and joins the relay election while
+ 	// the integrator decides — even a call the user goes on to decline has usually already
+ 	// been preaccepted.
+-	//
+-	// The write goes out on a goroutine of its own: onOffer runs on whatsmeow's event
+-	// dispatch, and a socket that stops draining would hold this offer, and every node
+-	// behind it, for as long as the write blocks. The call is registered above, before
+-	// the integrator hears of it, so nothing that follows depends on the write's order.
+-	go func(callID string, to, creator types.JID) {
++	callID, to, creator := ev.CallID, ev.From, ev.CallCreator
++	e.sendLater(func() {
+ 		if err := e.sendPreaccept(callID, to, creator, isVideo); err != nil {
+ 			e.c.log.Warn().Err(err).Str("call_id", callID).Msg("preaccept failed")
+ 		}
+-	}(ev.CallID, ev.From, ev.CallCreator)
++	})
+ 
+ 	if fn := e.c.incomingCallHandler(); fn != nil {
+ 		fn(call)
+@@ -861,15 +863,17 @@ func (e *engine) sendAccept(callID string, to, creator types.JID) {
+ 		Video:      isVideo,
+ 	})
+ 	accept.Attrs["id"] = e.c.wa.DangerousInternals().GenerateRequestID()
+-	if err := e.c.wa.DangerousInternals().SendNode(context.Background(), accept); err != nil {
+-		// acceptPending is already cleared, so no later mute_v2 retries this, and
+-		// the peer never learns the call was answered: end it rather than leave
+-		// media running for a call nobody accepted.
+-		e.c.log.Error().Err(err).Str("call_id", callID).Msg("send accept failed")
+-		e.finishCall(callID, "accept_failed")
+-		return
+-	}
+-	e.c.log.Info().Str("call_id", callID).Bool("video", isVideo).Msg("accepted (after mute_v2)")
++	e.sendLater(func() {
++		if err := e.c.wa.DangerousInternals().SendNode(context.Background(), accept); err != nil {
++			// acceptPending is already cleared, so no later mute_v2 retries this, and
++			// the peer never learns the call was answered: end it rather than leave
++			// media running for a call nobody accepted.
++			e.c.log.Error().Err(err).Str("call_id", callID).Msg("send accept failed")
++			e.finishCall(callID, "accept_failed")
++			return
++		}
++		e.c.log.Info().Str("call_id", callID).Bool("video", isVideo).Msg("accepted (after mute_v2)")
++	})
+ 
+ 	// The accept is on the wire; release any camera toggle that arrived early.
+ 	e.mu.Lock()
+@@ -1055,6 +1059,7 @@ func (e *engine) onRelayLatency(ev *events.CallRelayLatency) {
+ 			addr:      nodeBytes(te),
+ 		})
+ 	}
++	var responses []waBinary.Node
+ 	for _, p := range probes {
+ 		resp := signaling.BuildRelayLatency(&signaling.RelayLatencyParams{
+ 			CallID:       ev.CallID,
+@@ -1065,11 +1070,17 @@ func (e *engine) onRelayLatency(ev *events.CallRelayLatency) {
+ 			AddressBytes: p.addr,
+ 		})
+ 		resp.Attrs["id"] = e.c.wa.GenerateMessageID()
+-		if err := e.c.wa.DangerousInternals().SendNode(context.Background(), resp); err != nil {
+-			e.c.log.Error().Err(err).Str("call_id", ev.CallID).Msg("send relaylatency failed")
+-			return
++		responses = append(responses, resp)
++	}
++	callID := ev.CallID
++	e.sendLater(func() {
++		for _, resp := range responses {
++			if err := e.c.wa.DangerousInternals().SendNode(context.Background(), resp); err != nil {
++				e.c.log.Error().Err(err).Str("call_id", callID).Msg("send relaylatency failed")
++				return
++			}
+ 		}
+-	}
++	})
+ }
+ 
+ // onPreAccept records that the peer's device received and started preparing an outgoing call.
+@@ -1314,12 +1325,17 @@ func (e *engine) onCallRaw(callNode *waBinary.Node) bool {
+ 			e.c.log.Warn().
+ 				Str("action", kids[0].Tag).
+ 				Msg("call control ack: missing id/from")
+-		} else if err := e.transmitCallNode(context.Background(), ack); err != nil {
+-			e.c.log.Warn().
+-				Err(err).
+-				Str("action", kids[0].Tag).
+-				Str("id", ack.AttrGetter().String("id")).
+-				Msg("send typed call control ack failed")
++		} else {
++			action := kids[0].Tag
++			e.sendLater(func() {
++				if err := e.transmitCallNode(context.Background(), ack); err != nil {
++					e.c.log.Warn().
++						Err(err).
++						Str("action", action).
++						Str("id", ack.AttrGetter().String("id")).
++						Msg("send typed call control ack failed")
++				}
++			})
+ 		}
+ 		e.onUnknownCallEvent(callNode)
+ 		return true
+@@ -1383,11 +1399,44 @@ func (e *engine) ackVideoStanza(callNode *waBinary.Node) {
+ 		e.c.log.Warn().Msg("video ack: missing id/from, not acking")
+ 		return
+ 	}
+-	if err := e.c.wa.DangerousInternals().SendNode(context.Background(), ack); err != nil {
+-		e.c.log.Warn().Err(err).Str("id", ack.AttrGetter().String("id")).Msg("send video ack failed")
++	e.sendLater(func() {
++		if err := e.c.wa.DangerousInternals().SendNode(context.Background(), ack); err != nil {
++			e.c.log.Warn().Err(err).Str("id", ack.AttrGetter().String("id")).Msg("send video ack failed")
++			return
++		}
++		e.c.log.Debug().Str("id", ack.AttrGetter().String("id")).Msg("sent type=video ack")
++	})
++}
++
++// sendLater runs a write off whatsmeow's event dispatch, after every write queued before
++// it. A write made on the dispatch holds every node behind it for as long as it blocks,
++// and whatsmeow's socket writes with the socket's own context, so a socket that stops
++// draining held the account's messages and call terminations until it closed. The
++// writes keep their order: one goroutine drains them, started when the first is queued
++// and gone when none is left.
++func (e *engine) sendLater(send func()) {
++	e.laterMu.Lock()
++	e.later = append(e.later, send)
++	if e.laterRunning {
++		e.laterMu.Unlock()
+ 		return
+ 	}
+-	e.c.log.Debug().Str("id", ack.AttrGetter().String("id")).Msg("sent type=video ack")
++	e.laterRunning = true
++	e.laterMu.Unlock()
++	go func() {
++		for {
++			e.laterMu.Lock()
++			if len(e.later) == 0 {
++				e.laterRunning = false
++				e.laterMu.Unlock()
++				return
++			}
++			next := e.later[0]
++			e.later = e.later[1:]
++			e.laterMu.Unlock()
++			next()
++		}
++	}()
+ }
+ 
+ // onVideoStanza handles an inbound standalone <video> state stanza — the peer's video

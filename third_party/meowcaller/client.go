@@ -11,6 +11,7 @@ import (
 	"github.com/rs/zerolog"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/types"
+	"go.mau.fi/whatsmeow/types/events"
 )
 
 // Client is the managed entry point to the WhatsApp calling stack. It wraps a
@@ -19,10 +20,11 @@ import (
 //
 // The library never configures logging; pass WithLogger to surface its debug/trace.
 type Client struct {
-	wa   *whatsmeow.Client
-	log  zerolog.Logger
-	diag *diag.Recorder
-	eng  *engine
+	wa        *whatsmeow.Client
+	log       zerolog.Logger
+	diag      *diag.Recorder
+	eng       *engine
+	offerGate func(*events.CallOffer) bool
 
 	getGroupInfo func(context.Context, types.JID) (*types.GroupInfo, error)
 	ownGroupJIDs func() []types.JID
@@ -49,10 +51,19 @@ type GroupCallOptions struct {
 // NewClient wraps a connected whatsmeow client and installs the call event handlers.
 // Construct it before the whatsmeow client connects so the low-level <ack>/<call>
 // interception is in place before the receive loop starts.
+// lifetime is the whatsmeow client's background event context: what the integrator
+// cancels when the client is being shut down. Unset, it never ends.
+func (c *Client) lifetime() context.Context {
+	if ctx := c.wa.BackgroundEventCtx; ctx != nil {
+		return ctx
+	}
+	return context.Background()
+}
+
 func NewClient(wa *whatsmeow.Client, opts ...Option) *Client {
 	cfg := resolveConfig(opts)
 	c := &Client{
-		wa: wa, log: cfg.log, diag: cfg.diag,
+		wa: wa, log: cfg.log, diag: cfg.diag, offerGate: cfg.offerGate,
 		getGroupInfo: wa.GetGroupInfo,
 		ownGroupJIDs: func() []types.JID {
 			return []types.JID{wa.Store.GetJID(), wa.Store.GetLID()}

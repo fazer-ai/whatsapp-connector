@@ -900,6 +900,9 @@ func (c *Container) migrate(ctx context.Context) error {
 	// `wants_history` defaults to 0 on the same ground: the connect refused `history_sync`
 	// until #348, so no row written before the column can have asked for it.
 	//
+	// `wants_call_answer` defaults to 0 for the same reason: the connect had no
+	// `calls.answer` before #383.
+	//
 	// `rev` defaults to 0 and counts writes from there, so a row that predates it is a
 	// row nobody has written since -- which is true, and is the only thing a caller
 	// comparing against it needs.
@@ -928,6 +931,7 @@ func (c *Container) migrate(ctx context.Context) error {
 		{"wac_session_desired", "wants_call_auto_reject", "BIGINT NOT NULL DEFAULT 0"},
 		{"wac_session_desired", "wants_proxy", "TEXT NOT NULL DEFAULT ''"},
 		{"wac_session_desired", "wants_history", "BIGINT NOT NULL DEFAULT 0"},
+		{"wac_session_desired", "wants_call_answer", "BIGINT NOT NULL DEFAULT 0"},
 	} {
 		if err := c.addColumn(ctx, column.table, column.name, column.definition); err != nil {
 			return err

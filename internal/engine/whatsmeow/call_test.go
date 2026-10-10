@@ -51,7 +51,7 @@ func callSession(t *testing.T, autoReject bool) (*Session, *refusals) {
 	session, _ := newTestSession(t, "5511999990001")
 	session.setConnected(true)
 	session.setGroups(true)
-	session.setCallPolicy(autoReject)
+	session.setCallPolicy(autoReject, false)
 
 	watched := &refusals{}
 	session.declineCall = func(_ context.Context, _ *wm.Client, _ waTypes.JID, callID string) error {
@@ -183,7 +183,7 @@ func TestADirectVideoCallSaysSoFromItsOwnNode(t *testing.T) {
 func TestAGroupCallIsRecognisedFromTheNoticeType(t *testing.T) {
 	t.Parallel()
 	session := silentSession(t, false)
-	session.setCallPolicy(false)
+	session.setCallPolicy(false, false)
 
 	// No GroupJID on purpose: the attribute is the only thing saying this is a group.
 	if !session.handle(&waEvents.CallOfferNotice{BasicCallMeta: callMeta("call-1"), Media: "audio", Type: "group"}) {
@@ -215,7 +215,7 @@ func refusalOnlySession(t *testing.T) (*Session, *refusals) {
 		log:      zerolog.Nop(),
 		callWait: callWriteTimeout,
 	}
-	session.setCallPolicy(true)
+	session.setCallPolicy(true, false)
 	session.declineCall = func(_ context.Context, _ *wm.Client, _ waTypes.JID, callID string) error {
 		return watched.record(callID)
 	}
@@ -397,7 +397,7 @@ func TestAGroupCallIsNotPublishedToASessionThatDidNotAskForGroups(t *testing.T) 
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			session := silentSession(t, false)
-			session.setCallPolicy(false)
+			session.setCallPolicy(false, false)
 
 			if !session.handle(event) {
 				t.Fatal("a group call must be acknowledged even when it is not published")
@@ -574,7 +574,7 @@ func TestAskingForAPairingCodeKeepsTheCallPolicy(t *testing.T) {
 	// on a session whatsmeow is already holding open returns without dialling, and what
 	// is being asserted here is decided well before the dial either way.
 	session.setConnected(true)
-	session.setCallPolicy(true)
+	session.setCallPolicy(true, false)
 	session.setGroups(true)
 
 	payload, err := json.Marshal(map[string]string{"phone": "5511999990001"})

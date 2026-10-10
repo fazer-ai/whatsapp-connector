@@ -308,5 +308,9 @@ func (e *Engine) Close() error {
 	for _, session := range sessions {
 		errs = append(errs, session.Close())
 	}
+	// After the sessions, which hang up their calls over it.
+	if e.media.Calls != nil {
+		errs = append(errs, e.media.Calls.Close())
+	}
 	return errors.Join(errs...)
 }

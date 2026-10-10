@@ -138,7 +138,11 @@ func TestTheCallPolicyComesBackWithTheSession(t *testing.T) {
 
 	pair(t, container, "sid-quiet", "5511999990001")
 	pair(t, container, "sid-ringing", "5511999990002")
+	pair(t, container, "sid-answering", "5511999990003")
 	if err := container.For("sid-quiet").PutDesiredConnected(ctx, store.Wants{CallAutoReject: true}); err != nil {
+		t.Fatalf("PutDesiredConnected: %v", err)
+	}
+	if err := container.For("sid-answering").PutDesiredConnected(ctx, store.Wants{CallAnswer: true}); err != nil {
 		t.Fatalf("PutDesiredConnected: %v", err)
 	}
 	if err := container.For("sid-ringing").PutDesiredConnected(ctx, store.Wants{Groups: true}); err != nil {
@@ -156,8 +160,21 @@ func TestTheCallPolicyComesBackWithTheSession(t *testing.T) {
 	if got := policy["sid-quiet"]; !got.CallAutoReject || got.Groups {
 		t.Fatalf("the session that asked for calls to be refused would come back as %+v", got)
 	}
-	if got := policy["sid-ringing"]; got.CallAutoReject || !got.Groups {
+	if got := policy["sid-ringing"]; got.CallAutoReject || got.CallAnswer || !got.Groups {
 		t.Fatalf("the session that asked for groups and left calls alone would come back as %+v", got)
+	}
+	if got := policy["sid-answering"]; !got.CallAnswer || got.CallAutoReject {
+		t.Fatalf("the session that asked for calls to be answered would come back as %+v", got)
+	}
+	// The two other readers of the row, which a column left out of one query would
+	// leave answering a call policy nobody asked for.
+	standing, asked, err := container.For("sid-answering").Standing(ctx)
+	if err != nil || !asked || !standing.CallAnswer {
+		t.Fatalf("Standing = %+v, %v, %v; want calls.answer", standing, asked, err)
+	}
+	one, wantedNow, err := container.WantedSession(ctx, "sid-answering")
+	if err != nil || !wantedNow || !one.CallAnswer {
+		t.Fatalf("WantedSession = %+v, %v, %v; want calls.answer", one, wantedNow, err)
 	}
 }
 
