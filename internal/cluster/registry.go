@@ -29,6 +29,11 @@ type Presence struct {
 	AdvertiseURL string
 	MediaToken   string
 	Sessions     int
+	// Calls is whether the instance carries the voice of calls: it opened the UDP
+	// socket the media goes through (WAC_CALLS_UDP_PORT). Always written, true or
+	// false, so an instance that restarts without the port does not keep the value a
+	// previous run under the same name left in the hash.
+	Calls bool
 }
 
 // Registry keeps the fleet's view of who is running.
@@ -57,6 +62,7 @@ func (r *Registry) Announce(ctx context.Context, presence *Presence) error {
 		"protocol_min": presence.ProtocolMin,
 		"protocol_max": presence.ProtocolMax,
 		"sessions":     presence.Sessions,
+		"calls":        strconv.FormatBool(presence.Calls),
 		"updated_at":   time.Now().UnixMilli(),
 	}
 	if presence.AdvertiseURL != "" {
@@ -126,6 +132,7 @@ func (r *Registry) Live(ctx context.Context) ([]Presence, error) {
 			AdvertiseURL: fields["advertise_url"],
 			MediaToken:   fields["media_token"],
 			Sessions:     atoi(fields["sessions"]),
+			Calls:        fields["calls"] == "true",
 		})
 	}
 

@@ -78,6 +78,9 @@ type Connector struct {
 	seen   map[seenLabel]time.Time
 	http   *httpserver.Server
 	blobs  *media.Store
+	// carriesCalls is whether this instance opened the socket the voice of calls goes
+	// through, which is what the registry tells clients (see cluster.Presence.Calls).
+	carriesCalls bool
 
 	// reclaimCursor is where the next reclaim pass starts. Read and written only by the
 	// loop goroutine, which is also the only one that reclaims.
@@ -181,7 +184,7 @@ func New(cfg *Config, log zerolog.Logger) (connector *Connector, err error) {
 	// lives in Redis and that package deliberately knows about nothing but Prometheus.
 	metrics.Registry.MustRegister(redisx.NewStreamLag(client))
 
-	waEngine, devices, err := newEngine(
+	waEngine, devices, carriesCalls, err := newEngine(
 		startupCtx, cfg, leases.Owns, mediaOpts, queueingInto(metrics), log)
 	if err != nil {
 		return nil, err
@@ -207,7 +210,7 @@ func New(cfg *Config, log zerolog.Logger) (connector *Connector, err error) {
 	c := &Connector{
 		cfg: *cfg, log: log, metrics: metrics, client: client, leases: leases, quarantine: quarantine,
 		registry: cluster.NewRegistry(client, 3*cfg.Heartbeat), manager: manager, engine: waEngine,
-		store: devices, blobs: blobs,
+		store: devices, blobs: blobs, carriesCalls: carriesCalls,
 	}
 	watch.owner = c
 
@@ -1406,7 +1409,7 @@ func (c *Connector) announce(ctx context.Context) {
 		Instance: c.cfg.Instance, Version: Version,
 		ProtocolMin: protocol.MinVersion, ProtocolMax: protocol.Version,
 		AdvertiseURL: c.cfg.AdvertiseURL, MediaToken: c.cfg.MediaToken,
-		Sessions: c.manager.Count(),
+		Sessions: c.manager.Count(), Calls: c.carriesCalls,
 	})
 	if err != nil && ctx.Err() == nil {
 		c.log.Warn().Err(err).Msg("failed to announce this instance")
@@ -1530,13 +1533,13 @@ return 1
 func newEngine(
 	ctx context.Context, cfg *Config, owned store.Ownership, blobs meow.MediaOptions,
 	queueing meow.Queueing, log zerolog.Logger,
-) (engine.Engine, *store.Container, error) {
+) (engine.Engine, *store.Container, bool, error) {
 	var devices *store.Container
 	if cfg.DatabaseURL != "" {
 		opened, err := store.OpenWith(ctx, cfg.DatabaseURL, owned, log,
 			store.Options{MaxConns: cfg.DatabaseConns})
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, false, err
 		}
 		devices = opened
 	}
@@ -1552,7 +1555,8 @@ func newEngine(
 		// row against, and without it an account that paired is one nothing can resume.
 		// A nil container is a `serve` with no database url, which this engine allows
 		// and which is a fleet that does not come back on its own by construction.
-		return fake.New(fake.WithStore(devices)), devices, nil
+		// The fake opens no call socket whatever the port says, so it never carries calls.
+		return fake.New(fake.WithStore(devices)), devices, false, nil
 	case EngineWhatsmeow:
 		// Opened with the engine rather than with the first call, so a port the
 		// deployment did not leave free fails the start and not the first call somebody
@@ -1562,7 +1566,7 @@ func newEngine(
 				log.With().Str("sub", "calls").Logger())
 			if err != nil {
 				_ = devices.Close()
-				return nil, nil, err
+				return nil, nil, false, err
 			}
 			blobs.Calls = callMedia
 			log.Info().Int("port", callMedia.Port()).Strs("public_ips", cfg.CallsPublicIPs).Msg("calls: media socket open")
@@ -1575,14 +1579,14 @@ func newEngine(
 				_ = blobs.Calls.Close()
 			}
 			_ = devices.Close()
-			return nil, nil, err
+			return nil, nil, false, err
 		}
-		return waEngine, devices, nil
+		return waEngine, devices, blobs.Calls != nil, nil
 	default:
 		if devices != nil {
 			_ = devices.Close()
 		}
-		return nil, nil, fmt.Errorf("app: unknown engine %q", cfg.Engine)
+		return nil, nil, false, fmt.Errorf("app: unknown engine %q", cfg.Engine)
 	}
 }
 
