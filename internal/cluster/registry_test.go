@@ -2,6 +2,7 @@ package cluster_test
 
 import (
 	"context"
+	"maps"
 	"testing"
 	"time"
 
@@ -118,5 +119,54 @@ func TestLiveListsEveryRunningInstance(t *testing.T) {
 	}
 	if len(live) != 2 {
 		t.Fatalf("Live returned %d instances, want 2", len(live))
+	}
+}
+
+// Whether an instance carries the voice of calls is what a client reads before it offers
+// them, so the hash says it in both directions, and a run under the same name that came
+// back without the port overwrites what the previous one said rather than inheriting it.
+func TestAnnounceSaysWhetherTheInstanceCarriesCalls(t *testing.T) {
+	t.Parallel()
+
+	server, registry := newRegistry(t)
+	ctx := context.Background()
+
+	with := presence("inst-a")
+	with.Calls = true
+	if err := registry.Announce(ctx, with); err != nil {
+		t.Fatalf("Announce: %v", err)
+	}
+	if got := server.HGet("wa:instance:inst-a", "calls"); got != "true" {
+		t.Fatalf("calls = %q after announcing with the socket open, want \"true\"", got)
+	}
+
+	if err := registry.Announce(ctx, presence("inst-a")); err != nil {
+		t.Fatalf("Announce: %v", err)
+	}
+	if got := server.HGet("wa:instance:inst-a", "calls"); got != "false" {
+		t.Fatalf("calls = %q after the same instance announced without the socket, want \"false\"", got)
+	}
+	live, err := registry.Live(ctx)
+	if err != nil {
+		t.Fatalf("Live: %v", err)
+	}
+	if len(live) != 1 || live[0].Calls {
+		t.Fatalf("Live = %+v, want one instance that does not carry calls", live)
+	}
+
+	with.Instance = "inst-b"
+	if err := registry.Announce(ctx, with); err != nil {
+		t.Fatalf("Announce: %v", err)
+	}
+	live, err = registry.Live(ctx)
+	if err != nil {
+		t.Fatalf("Live: %v", err)
+	}
+	carries := map[string]bool{}
+	for _, p := range live {
+		carries[p.Instance] = p.Calls
+	}
+	if want := map[string]bool{"inst-a": false, "inst-b": true}; !maps.Equal(carries, want) {
+		t.Fatalf("calls per instance = %v, want %v", carries, want)
 	}
 }
