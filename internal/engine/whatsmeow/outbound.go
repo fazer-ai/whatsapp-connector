@@ -1051,12 +1051,36 @@ func mimeToSend(content *mediaContent, served string) string {
 // base types, in a proxy, in a header -- and WhatsApp does not render the one without
 // it: it drops the message and says nothing, which is how this was found. Where the two
 // name different formats the stated one is saying something, and it keeps saying it: a
-// caller that calls a sticker a PNG is not to be corrected here.
+// caller that calls a sticker a PNG is not to be corrected here, and neither is one that
+// names a codec, since `audio/ogg; codecs=vorbis` is a different format in the same box.
 func canonical(stated, only string) string {
-	if base, _, err := mime.ParseMediaType(stated); err == nil && sameFormat(base, only) {
-		return only
+	base, params, err := mime.ParseMediaType(stated)
+	if err != nil || !sameFormat(base, only) {
+		return stated
 	}
-	return stated
+	if codec, named := params["codecs"]; named && !strings.EqualFold(codec, codecOf(only)) {
+		return stated
+	}
+	return only
+}
+
+// codecOf is the codec a type names, or empty when it names none.
+func codecOf(mimetype string) string {
+	_, params, err := mime.ParseMediaType(mimetype)
+	if err != nil {
+		return ""
+	}
+	return params["codecs"]
+}
+
+// playsAsVoiceNote reports whether a file of this type is one WhatsApp's clients play as
+// a voice note. Android plays only opus in an Ogg container, and answers anything else
+// sent with the flag with "something is wrong with the audio file" while WhatsApp Web
+// plays it -- which is how a Safari recording, an MP3, was found. The type is the one
+// about to be sent, so an `audio/ogg` that lost its codec has already been read as opus.
+func playsAsVoiceNote(mimetype string) bool {
+	base, _, err := mime.ParseMediaType(mimetype)
+	return err == nil && strings.EqualFold(base, "audio/ogg") && strings.EqualFold(codecOf(mimetype), "opus")
 }
 
 // unknownType reports whether a stated type says nothing about what the file is.
@@ -1199,6 +1223,14 @@ func renderMedia(
 			ContextInfo:   alongside,
 		}}
 	case protocol.MediaAudio:
+		// This connector does not transcode, so a voice note in any other format goes out
+		// as the ordinary audio file every client plays, without the flag and without the
+		// waveform only a voice note's bubble draws.
+		voice := content.VoiceNote && playsAsVoiceNote(mimetype)
+		var waveform []byte
+		if voice || !content.VoiceNote {
+			waveform = samples(content.Waveform)
+		}
 		return &waE2E.Message{AudioMessage: &waE2E.AudioMessage{
 			URL: &uploaded.URL, DirectPath: &uploaded.DirectPath, MediaKey: uploaded.MediaKey,
 			FileEncSHA256: uploaded.FileEncSHA256, FileSHA256: uploaded.FileSHA256,
@@ -1208,8 +1240,8 @@ func renderMedia(
 			// Only ever set when true. WhatsApp reads a false the same as an absent one,
 			// and every voice note this connector publishes on the way in was recognised
 			// by this field being there at all.
-			PTT:         optionalTrue(content.VoiceNote),
-			Waveform:    samples(content.Waveform),
+			PTT:         optionalTrue(voice),
+			Waveform:    waveform,
 			ContextInfo: alongside,
 		}}
 	case protocol.MediaDocument:
