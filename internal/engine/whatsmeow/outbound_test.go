@@ -2150,6 +2150,74 @@ func TestAStickerAndAVoiceNoteAreLabelledWithWhatTheyCanOnlyBe(t *testing.T) {
 	}
 }
 
+// Android plays a voice note only when it is opus in an Ogg container, and shows "something
+// is wrong with the audio file" for any other format sent with the flag, while WhatsApp Web
+// plays it. The connector does not transcode, so a note in another format goes out as the
+// ordinary audio file every client can play, without the flag and without the waveform
+// that only a voice note's bubble draws.
+func TestOnlyAnOpusVoiceNoteGoesOutAsOne(t *testing.T) {
+	t.Parallel()
+
+	sixtyFour := make([]int, 64)
+	for i := range sixtyFour {
+		sixtyFour[i] = i + 20
+	}
+
+	for _, tc := range []struct {
+		name, content string
+		voice         bool
+	}{
+		{"opus in ogg", `"mime":"audio/ogg; codecs=opus"`, true},
+		{"opus in ogg, spelled without the space", `"mime":"audio/ogg;codecs=opus"`, true},
+		{"ogg without the codec, which this connector reads as opus", `"mime":"audio/ogg"`, true},
+		{"nothing named", ``, true},
+		{"an mp3, which a Safari recording falls back to", `"mime":"audio/mpeg"`, false},
+		{"an mp4", `"mime":"audio/mp4"`, false},
+		{"an aac", `"mime":"audio/aac"`, false},
+		{"vorbis in ogg", `"mime":"audio/ogg; codecs=vorbis"`, false},
+		{"opus in webm", `"mime":"audio/webm; codecs=opus"`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			content := `"type":"media","kind":"audio","voice_note":true,"waveform":` + asJSON(t, sixtyFour)
+			if tc.content != "" {
+				content += "," + tc.content
+			}
+			session, serving, _ := outboundSession(t)
+			serving.answer([]byte("audio"), "")
+			audio := mustSendBody(t, session, `{"message_id":"3EB0","to":{"kind":"phone","id":"5511999990001"},
+				"content":{`+content+`,"ref":{"kind":"url","url":"http://rails:3000/blob"}}}`).GetAudioMessage()
+			if audio == nil {
+				t.Fatal("the note did not go out as an audio")
+			}
+			if tc.voice {
+				if !audio.GetPTT() || len(audio.GetWaveform()) != 64 {
+					t.Fatalf("an opus note went out as %q with ptt=%v and %d samples",
+						audio.GetMimetype(), audio.GetPTT(), len(audio.GetWaveform()))
+				}
+				return
+			}
+			// Absent rather than false, the same as any ordinary audio file.
+			if audio.PTT != nil || audio.Waveform != nil {
+				t.Fatalf("a %q note went out with ptt=%v and %d samples, which Android cannot play",
+					audio.GetMimetype(), audio.PTT, len(audio.GetWaveform()))
+			}
+		})
+	}
+
+	// The rule is about notes. An ordinary audio file in the very format a note needs stays
+	// an ordinary file, and keeps the waveform its caller drew for it.
+	session, serving, _ := outboundSession(t)
+	serving.answer([]byte("audio"), "")
+	audio := mustSendBody(t, session, `{"message_id":"3EB0","to":{"kind":"phone","id":"5511999990001"},
+		"content":{"type":"media","kind":"audio","mime":"audio/ogg; codecs=opus","waveform":`+asJSON(t, sixtyFour)+`,
+		"ref":{"kind":"url","url":"http://rails:3000/blob"}}}`).GetAudioMessage()
+	if audio.PTT != nil || len(audio.GetWaveform()) != 64 {
+		t.Fatalf("an ordinary opus file went out with ptt=%v and %d samples", audio.PTT, len(audio.GetWaveform()))
+	}
+}
+
 // Two names that differ only in case are one header on the wire, and which of them
 // survives is decided by the order Go happens to walk the map in, which is deliberately
 // not the same twice. A reference carrying both would send one credential on one attempt
