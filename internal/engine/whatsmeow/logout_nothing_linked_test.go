@@ -207,3 +207,36 @@ func TestALogoutWithNothingLinkedSettlesTheStateAtClose(t *testing.T) {
 		}
 	}
 }
+
+// An empty mapping is not the same as an unpaired client. When the same phone pairs under
+// another session, the store moves the account's mapping there and leaves this session
+// running on credentials it still holds in memory, linked on the phone. Its logout is a
+// real one: WhatsApp is asked to unlink, or the companion stays listed with nothing left
+// that could ever remove it once the next connect discards those credentials.
+func TestALogoutOfADisplacedSessionStillAsksWhatsAppToUnlink(t *testing.T) {
+	t.Parallel()
+
+	session, container := newTestSession(t, "")
+	jid, err := waTypes.ParseJID("5511999990004:12@" + waTypes.DefaultUserServer)
+	if err != nil {
+		t.Fatalf("ParseJID: %v", err)
+	}
+	// The live client's identity, with no mapping behind it: what a displaced session
+	// holds.
+	session.current().Store.ID = &jid
+	if _, bound, err := container.For(session.sid).JID(t.Context()); err != nil || bound {
+		t.Fatalf("the bench has a mapping (bound=%v, err=%v); the case needs none", bound, err)
+	}
+	var asked atomic.Int32
+	session.logout = func(context.Context, *wm.Client) error {
+		asked.Add(1)
+		return nil
+	}
+
+	if err := session.Logout(t.Context()); err != nil {
+		t.Fatalf("Logout of a displaced session: %v", err)
+	}
+	if n := asked.Load(); n != 1 {
+		t.Fatalf("WhatsApp was asked %d time(s) to unlink a device the live client still holds, want once", n)
+	}
+}
