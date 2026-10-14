@@ -278,6 +278,12 @@ func TestALogoutRightAfterWhatsAppRevokedTheSessionIsAnsweredDone(t *testing.T) 
 	if n := asked.Load(); n != 0 {
 		t.Fatalf("WhatsApp was asked %d time(s) to unlink credentials it had already revoked", n)
 	}
+	// The recovery the revocation started is what replaces the client. Marked stale here,
+	// the next connect would start a second rebuild beside it, and the older one could
+	// retire the client that connect is already pairing on.
+	if session.isStale() {
+		t.Fatal("the logout asked for a repair beside the recovery the revocation already started")
+	}
 }
 
 // Two logouts in a row while a dial holds the socket: the first one's hang-up is still out
