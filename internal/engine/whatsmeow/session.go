@@ -2611,6 +2611,15 @@ func (s *Session) Logout(ctx context.Context) error {
 		// marks the client revoked, and with nothing to forget no rebuild follows, so the
 		// next pairing would reuse a client that goes on answering not_paired. The pairing
 		// in progress and the presence were already put down above.
+		//
+		// What the client asked for does go, as the contract has every logout do: an answer
+		// of success says the session was ended, and the row is the connector's record that
+		// it was wanted. With no device bound, that row is all the forget has to delete.
+		ctx, cancel := context.WithTimeout(s.ctx, s.storeLimit)
+		defer cancel()
+		if err := s.store.ForgetCredentialsAndDesired(ctx); err != nil {
+			return fmt.Errorf("whatsmeow: log %s out: %w", s.sid, err)
+		}
 		return nil
 	}
 	if err := ask(ctx, s.current()); err != nil {
