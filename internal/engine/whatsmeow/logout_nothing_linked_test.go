@@ -228,13 +228,10 @@ func TestALogoutOfADisplacedSessionStillAsksWhatsAppToUnlink(t *testing.T) {
 	t.Parallel()
 
 	session, container := newTestSession(t, "")
-	jid, err := waTypes.ParseJID("5511999990004:12@" + waTypes.DefaultUserServer)
-	if err != nil {
-		t.Fatalf("ParseJID: %v", err)
-	}
-	// The live client's identity, with no mapping behind it: what a displaced session
-	// holds.
-	session.current().Store.ID = &jid
+	// The identity the session learned when it connected, with no mapping behind it: what
+	// a displaced session holds. Set on the session and not on whatsmeow's device record,
+	// which whatsmeow writes from its own goroutines.
+	session.setIdentity("5511999990004", "")
 	if _, bound, err := container.For(session.sid).JID(t.Context()); err != nil || bound {
 		t.Fatalf("the bench has a mapping (bound=%v, err=%v); the case needs none", bound, err)
 	}
@@ -249,5 +246,58 @@ func TestALogoutOfADisplacedSessionStillAsksWhatsAppToUnlink(t *testing.T) {
 	}
 	if n := asked.Load(); n != 1 {
 		t.Fatalf("WhatsApp was asked %d time(s) to unlink a device the live client still holds, want once", n)
+	}
+}
+
+// A session WhatsApp has just logged out still names the account until the rebuild after it
+// lands, and its credentials are already gone: a logout arriving in between has nothing to
+// unlink, and is answered done like any other.
+func TestALogoutRightAfterWhatsAppRevokedTheSessionIsAnsweredDone(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "")
+	session.setIdentity("5511999990005", "")
+	session.setRevoked()
+	var asked atomic.Int32
+	session.logout = func(context.Context, *wm.Client) error {
+		asked.Add(1)
+		return wm.ErrNotLoggedIn
+	}
+
+	if err := session.Logout(t.Context()); err != nil {
+		t.Fatalf("Logout of a revoked session: %v, want success", err)
+	}
+	if n := asked.Load(); n != 0 {
+		t.Fatalf("WhatsApp was asked %d time(s) to unlink credentials it had already revoked", n)
+	}
+}
+
+// Two logouts in a row while a dial holds the socket: the first one's hang-up is still out
+// when the second arrives. A second hang-up beside it would leave the next connect waiting
+// on only one of them, and the other could settle the session at close on top of the
+// client that connect builds.
+func TestASecondLogoutReusesTheHangUpStillOut(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "")
+	holdTheDial(t, session)
+	pending := func() chan struct{} {
+		session.mu.Lock()
+		defer session.mu.Unlock()
+		return session.hangingUp
+	}
+
+	if err := session.Logout(t.Context()); err != nil {
+		t.Fatalf("the first logout: %v", err)
+	}
+	first := pending()
+	if first == nil {
+		t.Fatal("the first logout started no hang-up")
+	}
+	if err := session.Logout(t.Context()); err != nil {
+		t.Fatalf("the second logout: %v", err)
+	}
+	if second := pending(); second != first {
+		t.Fatal("the second logout started a hang-up beside the one still out")
 	}
 }
