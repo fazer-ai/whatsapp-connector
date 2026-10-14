@@ -438,7 +438,9 @@ func TestALogoutWithNothingPairedDoesNotWaitOnADial(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("the logout waited on a dial for an account that has no device to unlink")
 	}
-	saysNothing(t, session, "for a logout on an account with nothing paired")
+	if reasons := loggedOutReasons(t, session); len(reasons) != 0 {
+		t.Fatalf("published logged_out %v for an account with nothing paired", reasons)
+	}
 }
 
 // A read that failed is not an answer, and the side it is read on is the side that decides
