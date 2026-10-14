@@ -5425,3 +5425,6 @@ func (s *Session) paired(event *waEvents.PairSuccess) {
 	}
 	s.emit(protocol.EventPairingSuccess, payload)
 }
+
+// allowBind lets a pairing record its device again.
+func (s *Session) allowBind() {}

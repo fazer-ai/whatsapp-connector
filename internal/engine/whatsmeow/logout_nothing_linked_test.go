@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	wm "go.mau.fi/whatsmeow"
+	waTypes "go.mau.fi/whatsmeow/types"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/store"
 )
@@ -52,5 +53,36 @@ func TestALogoutWithNothingLinkedSucceedsWithoutAskingWhatsApp(t *testing.T) {
 	}
 	if desired != 0 {
 		t.Fatal("the desired state outlived a logout answered as done")
+	}
+}
+
+// A scan the phone was finishing while the logout ran must not land after it: the store
+// was read empty, the logout answered done, and a pairing that binds afterwards would
+// leave the account linked under a session its client has just ended. Refused here,
+// whatsmeow cancels that pairing; a later connect is the operator asking again, and
+// pairs normally.
+func TestAPairingThatLandsAfterALogoutWithNothingLinkedIsRefused(t *testing.T) {
+	t.Parallel()
+
+	session, container := newTestSession(t, "")
+	session.logout = func(context.Context, *wm.Client) error { return wm.ErrNotLoggedIn }
+	if err := session.Logout(t.Context()); err != nil {
+		t.Fatalf("Logout with nothing linked failed with %v, want success", err)
+	}
+
+	jid, err := waTypes.ParseJID("5511999990002:12@" + waTypes.DefaultUserServer)
+	if err != nil {
+		t.Fatalf("ParseJID: %v", err)
+	}
+	if session.bind(jid, "", "") {
+		t.Fatal("a pairing finishing after the logout was let bind the device")
+	}
+	if _, bound, err := container.For(session.sid).JID(t.Context()); err != nil || bound {
+		t.Fatalf("the refused pairing left a device mapped (bound=%v, err=%v)", bound, err)
+	}
+
+	session.allowBind()
+	if !session.bind(jid, "", "") {
+		t.Fatal("the pairing of the next connect was refused as well")
 	}
 }
