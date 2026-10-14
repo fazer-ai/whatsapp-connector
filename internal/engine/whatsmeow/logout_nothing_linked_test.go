@@ -309,3 +309,31 @@ func TestASecondLogoutReusesTheHangUpStillOut(t *testing.T) {
 		t.Fatal("the second logout started a hang-up beside the one still out")
 	}
 }
+
+// The same for a disconnect after the logout: it takes down the same client the hang-up
+// still out is taking down, and a second hang-up beside it is the same hazard.
+func TestADisconnectAfterALogoutReusesTheHangUpStillOut(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "")
+	holdTheDial(t, session)
+	pending := func() chan struct{} {
+		session.mu.Lock()
+		defer session.mu.Unlock()
+		return session.hangingUp
+	}
+
+	if err := session.Logout(t.Context()); err != nil {
+		t.Fatalf("the logout: %v", err)
+	}
+	first := pending()
+	if first == nil {
+		t.Fatal("the logout started no hang-up")
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+	defer cancel()
+	_ = session.Disconnect(ctx)
+	if second := pending(); second != first {
+		t.Fatal("the disconnect started a hang-up beside the one the logout left out")
+	}
+}
