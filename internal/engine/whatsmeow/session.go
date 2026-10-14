@@ -2372,10 +2372,25 @@ func (s *Session) hangUp(ctx context.Context, client *wm.Client, move bool) erro
 // beginHangUp starts the hang-up and hands back what to wait on, for the callers that wait
 // and for the one that does not: the socket goes down and the state settles at close
 // whether or not anyone is still there for it.
+//
+// A plain hang-up joins one still out rather than starting a second. Both take down the same
+// client -- a connect in between waits for the first -- and two beside each other leave the
+// next connect waiting on only one, while the other can settle the session at close on top
+// of the client that connect builds. A move has a reconnect of its own to report, so it
+// always starts one.
 func (s *Session) beginHangUp(client *wm.Client, move bool) (chan struct{}, *moveClaim) {
+	s.mu.Lock()
+	if pending := s.hangingUp; !move && pending != nil {
+		select {
+		case <-pending:
+		default:
+			claim := s.hangUpClaim
+			s.mu.Unlock()
+			return pending, claim
+		}
+	}
 	done := make(chan struct{})
 	claim := new(moveClaim)
-	s.mu.Lock()
 	s.hangingUp = done
 	s.hangUpClaim = claim
 	s.mu.Unlock()
@@ -2673,9 +2688,7 @@ func (s *Session) Logout(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("whatsmeow: log %s out: %w", s.sid, err)
 		}
-		if !s.hangUpPending() {
-			s.beginHangUp(s.current(), false)
-		}
+		s.beginHangUp(s.current(), false)
 		return nil
 	}
 	s.releaseBinding()
@@ -4959,24 +4972,6 @@ func (s *Session) holdsCredentials() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.phone != "" && !s.revoked
-}
-
-// hangUpPending reports whether a hang-up this session started has not finished. A second
-// one beside it would leave the next connect waiting on only one, and the other could
-// settle the session at close on top of the client that connect builds.
-func (s *Session) hangUpPending() bool {
-	s.mu.Lock()
-	pending := s.hangingUp
-	s.mu.Unlock()
-	if pending == nil {
-		return false
-	}
-	select {
-	case <-pending:
-		return false
-	default:
-		return true
-	}
 }
 
 // holdBinding takes the slot that orders a bind against a logout, or reports that ctx ran
