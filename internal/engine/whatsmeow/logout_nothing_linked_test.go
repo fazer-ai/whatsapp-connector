@@ -4,10 +4,12 @@ import (
 	"context"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	wm "go.mau.fi/whatsmeow"
 	waTypes "go.mau.fi/whatsmeow/types"
 
+	"github.com/fazer-ai/whatsapp-connector/internal/engine"
 	"github.com/fazer-ai/whatsapp-connector/internal/store"
 )
 
@@ -87,8 +89,57 @@ func TestAPairingThatLandsAfterALogoutWithNothingLinkedIsRefused(t *testing.T) {
 		t.Fatalf("the refused pairing left a device mapped (bound=%v, err=%v)", bound, err)
 	}
 
-	session.allowBind()
+	// A resume, which refuses on a session that never paired without dialling: what is
+	// under test is the connect lifting the refusal on its way in, not the pairing.
+	_ = session.Connect(t.Context(), engine.ConnectRequest{Pairing: "resume"})
 	if !session.bind(jid, "", "") {
 		t.Fatal("the pairing of the next connect was refused as well")
+	}
+}
+
+// The other order: a pairing recording its device while the logout reads the store. The read
+// waits for the record, and the logout then has a device to unlink and asks WhatsApp to.
+// Read first, it would find the store empty, answer done, and leave the device the pairing
+// was writing linked under a session its client has ended.
+func TestALogoutWaitsForAPairingThatIsRecordingItsDevice(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "")
+	var asked atomic.Int32
+	session.logout = func(context.Context, *wm.Client) error {
+		asked.Add(1)
+		return nil
+	}
+	jid, err := waTypes.ParseJID("5511999990003:12@" + waTypes.DefaultUserServer)
+	if err != nil {
+		t.Fatalf("ParseJID: %v", err)
+	}
+
+	// Held the way bind holds it, around the write.
+	session.binding.Lock()
+	answered := make(chan error, 1)
+	go func() { answered <- session.Logout(t.Context()) }()
+	select {
+	case err := <-answered:
+		session.binding.Unlock()
+		t.Fatalf("the logout answered (%v) while a pairing was still recording its device", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	if err := session.store.Bind(t.Context(), jid); err != nil {
+		session.binding.Unlock()
+		t.Fatalf("Bind: %v", err)
+	}
+	session.binding.Unlock()
+
+	select {
+	case err := <-answered:
+		if err != nil {
+			t.Fatalf("the logout of the device the pairing recorded: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the logout never answered after the pairing finished recording")
+	}
+	if n := asked.Load(); n != 1 {
+		t.Fatalf("WhatsApp was asked %d time(s) to unlink the device the pairing recorded, want once", n)
 	}
 }
