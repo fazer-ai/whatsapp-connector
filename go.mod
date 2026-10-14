@@ -3,7 +3,7 @@ module github.com/fazer-ai/whatsapp-connector
 go 1.26.0
 
 require (
-	github.com/alicebob/miniredis/v2 v2.39.0
+	github.com/alicebob/miniredis/v2 v2.40.0
 	github.com/coder/websocket v1.8.15
 	github.com/gotranspile/g722 v0.0.0-20240123003956-384a1bb16a19
 	github.com/lib/pq v1.12.3
@@ -11,16 +11,16 @@ require (
 	github.com/pion/rtp v1.10.5
 	github.com/pion/sdp/v3 v3.0.20
 	github.com/pion/webrtc/v4 v4.2.23
-	github.com/prometheus/client_golang v1.24.1
+	github.com/prometheus/client_golang v1.25.0
 	github.com/purpshell/meowcaller v0.0.0-00010101000000-000000000000
-	github.com/redis/go-redis/v9 v9.22.0
+	github.com/redis/go-redis/v9 v9.23.0
 	github.com/rs/zerolog v1.35.1
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.3
 	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
 	go.mau.fi/libsignal v0.2.2
 	go.mau.fi/whatsmeow v0.0.0-20260821141805-33cfac511629
-	golang.org/x/net v0.59.0
-	golang.org/x/tools v0.50.0
+	golang.org/x/net v0.61.0
+	golang.org/x/tools v0.51.0
 	google.golang.org/protobuf v1.36.12
 	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.60.1
@@ -54,21 +54,21 @@ require (
 	github.com/pion/stun/v4 v4.0.1 // indirect
 	github.com/pion/transport/v5 v5.1.1 // indirect
 	github.com/pion/turn/v5 v5.1.2 // indirect
-	github.com/prometheus/client_model v0.6.2 // indirect
-	github.com/prometheus/common v0.70.1 // indirect
-	github.com/prometheus/procfs v0.21.1 // indirect
+	github.com/prometheus/client_model v0.6.3 // indirect
+	github.com/prometheus/common v0.72.0 // indirect
+	github.com/prometheus/procfs v0.22.0 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/vektah/gqlparser/v2 v2.5.27 // indirect
 	github.com/wlynxg/anet v0.0.5 // indirect
 	github.com/yuin/gopher-lua v1.1.1 // indirect
 	go.mau.fi/util v0.10.1-0.20260820140024-eb612d936fde // indirect
-	go.uber.org/atomic v1.11.0 // indirect
-	golang.org/x/crypto v0.57.0 // indirect
+	go.uber.org/atomic v1.12.0 // indirect
+	golang.org/x/crypto v0.58.0 // indirect
 	golang.org/x/exp v0.0.0-20260813180055-c1d0aacb2297 // indirect
 	golang.org/x/mod v0.41.0 // indirect
-	golang.org/x/sync v0.23.0 // indirect
-	golang.org/x/sys v0.48.0 // indirect
-	golang.org/x/text v0.42.0 // indirect
+	golang.org/x/sync v0.24.0 // indirect
+	golang.org/x/sys v0.49.0 // indirect
+	golang.org/x/text v0.43.0 // indirect
 	golang.org/x/time v0.14.0 // indirect
 	modernc.org/libc v1.77.1 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
