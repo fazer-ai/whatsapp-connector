@@ -599,6 +599,17 @@ type Session struct {
 	// lock across that would stop everything that reads state, Close included.
 	transition sync.Mutex
 	closed     bool
+	// binding orders a pairing recording its device against a logout that found none to
+	// remove. Whichever goes first, the other sees it: a bind that landed puts the logout
+	// on the unlink path, and a logout that read the store empty marks the client stale,
+	// which refuses every bind of that client from then on. A slot rather than a mutex so
+	// the logout can stop waiting at its deadline; made on first use, so a Session built
+	// without its constructor still has one.
+	binding     chan struct{}
+	bindingOnce sync.Once
+	// bindingBusy, when set, is called by a caller about to wait for the slot. A test seam:
+	// it lets a test know the wait has begun without sleeping on it.
+	bindingBusy func()
 	// dialing is true while a connect is in flight. whatsmeow holds its socket lock for
 	// the length of one, and every question asked of the client takes that lock for
 	// read, so a dial that outlived its command would block the next command on a
@@ -737,6 +748,9 @@ type Session struct {
 	// hangUpClaim is how the latest hang-up gets reported, decided between the hang-up
 	// and the command waiting on it (see moveClaim).
 	hangUpClaim *moveClaim
+	// hangUpMoves says the latest hang-up is a move, which ends in a redial: a plain
+	// hang-up must not join that one.
+	hangUpMoves bool
 	// runs counts the conversations this session has started. Paired with nonce it is
 	// what gives each one a name the client can answer to.
 	runs uint64
@@ -1022,7 +1036,9 @@ func (s *Session) adopt(ctx context.Context, client *wm.Client) bool {
 	// session the moment the lease is gone, which is what keeps two instances off one
 	// account.
 	client.EnableAutoReconnect = true
-	client.PrePairCallback = s.bind
+	client.PrePairCallback = func(jid waTypes.JID, platform, businessName string) bool {
+		return s.bind(client, jid, platform, businessName)
+	}
 	client.GetClientPayload = s.payloadWithHistory(client)
 	// The client's own lifetime, inside the session's: the session closing ends it, and so
 	// does this client being replaced by a rebuild, which the session outlives.
@@ -2330,29 +2346,7 @@ func (s *Session) giveUpOn(ctx context.Context, run *pairingRun, client *wm.Clie
 // past its deadline and then report success. Cancelling the session context is what
 // actually interrupts the dial; this is the part that stops waiting.
 func (s *Session) hangUp(ctx context.Context, client *wm.Client, move bool) error {
-	done := make(chan struct{})
-	claim := new(moveClaim)
-	s.mu.Lock()
-	s.hangingUp = done
-	s.hangUpClaim = claim
-	s.mu.Unlock()
-	go func() {
-		defer close(done)
-		s.disconnect(client)
-		// Settled here rather than by the caller, because a disconnect that outlives its
-		// deadline still happens. The caller is told it failed and stops; the socket goes
-		// down a moment later regardless, and a session that never recorded it would go
-		// on reporting itself open over a connection that no longer exists, with no close
-		// event to correct it.
-		//
-		// A move is a reconnect only while its command is still there to make it: one the
-		// caller gave up on is followed by no redial, and the socket is down for good.
-		var moving *moveClaim
-		if move && claim.settle() {
-			moving = claim
-		}
-		s.settleHangUp(moving)
-	}()
+	done, claim := s.beginHangUp(client, move)
 
 	select {
 	case <-done:
@@ -2376,6 +2370,52 @@ func (s *Session) hangUp(ctx context.Context, client *wm.Client, move bool) erro
 	case <-s.done:
 		return nil
 	}
+}
+
+// beginHangUp starts the hang-up and hands back what to wait on, for the callers that wait
+// and for the one that does not: the socket goes down and the state settles at close
+// whether or not anyone is still there for it.
+//
+// A plain hang-up joins one still out rather than starting a second. Both take down the same
+// client -- a connect in between waits for the first -- and two beside each other leave the
+// next connect waiting on only one, while the other can settle the session at close on top
+// of the client that connect builds. A move has a reconnect of its own to report, so it
+// always starts one, and a plain hang-up never joins a move, which ends in a redial.
+func (s *Session) beginHangUp(client *wm.Client, move bool) (chan struct{}, *moveClaim) {
+	s.mu.Lock()
+	if pending := s.hangingUp; !move && !s.hangUpMoves && pending != nil {
+		select {
+		case <-pending:
+		default:
+			claim := s.hangUpClaim
+			s.mu.Unlock()
+			return pending, claim
+		}
+	}
+	done := make(chan struct{})
+	claim := new(moveClaim)
+	s.hangingUp = done
+	s.hangUpClaim = claim
+	s.hangUpMoves = move
+	s.mu.Unlock()
+	go func() {
+		defer close(done)
+		s.disconnect(client)
+		// Settled here rather than by the caller, because a disconnect that outlives its
+		// deadline still happens. The caller is told it failed and stops; the socket goes
+		// down a moment later regardless, and a session that never recorded it would go
+		// on reporting itself open over a connection that no longer exists, with no close
+		// event to correct it.
+		//
+		// A move is a reconnect only while its command is still there to make it: one the
+		// caller gave up on is followed by no redial, and the socket is down for good.
+		var moving *moveClaim
+		if move && claim.settle() {
+			moving = claim
+		}
+		s.settleHangUp(moving)
+	}()
+	return done, claim
 }
 
 // moveClaim is how the hang-up of a move is reported, decided between the hang-up and
@@ -2602,7 +2642,65 @@ func (s *Session) Logout(ctx context.Context) error {
 
 	s.cancelPairing()
 	s.goOffline(ctx)
-	ask, _ := s.askToUnlink(ctx)
+	if !s.holdBinding(ctx) {
+		// Nothing was sent to WhatsApp: the time ran out on a pairing recording its device,
+		// before the store was even read. The contract answers that not_attempted, the
+		// teardown a client retries. Calls come back on with it, as on the other paths that
+		// sent nothing: the pairing it waited on can still finish, and a session that
+		// connects with calls switched off rejects every one.
+		s.backOnline()
+		return fmt.Errorf("whatsmeow: log %s out: waiting for a pairing to record its device: %w: %w", s.sid,
+			protocol.NewError(protocol.ErrorNotAttempted, "the request was never sent to WhatsApp"), ctx.Err())
+	}
+	ask, nothingToUnlink := s.askToUnlink(ctx)
+	// The session is asked as well as the store. One the same phone displaced by pairing
+	// under another sid has lost its mapping and still holds credentials in memory, linked
+	// on the phone: that logout is a real one, and answering it done would leave a
+	// companion listed that nothing can remove once the next connect discards them. Asked
+	// of the identity the session keeps under its own lock rather than of whatsmeow's
+	// device record, which whatsmeow clears from its own goroutine when WhatsApp logs the
+	// account out; that case is the revoked mark, and it has nothing left to unlink.
+	if nothingToUnlink && !s.holdsCredentials() {
+		// The store holds no device: unlinked from the phone, or never paired. The state the
+		// logout asks for is the one the session is already in, so it is answered as done
+		// (#398). WhatsApp is not asked, since there are no credentials to sign the request
+		// with, and no session.logged_out is published, since nothing was linked to end.
+		// Not settled either: that marks the client revoked, and with nothing to forget no
+		// rebuild follows, so the next pairing would reuse a client that goes on answering
+		// not_paired. The pairing in progress and the presence were already put down above.
+		//
+		// What the client asked for does go, as the contract has every logout do: an answer
+		// of success says the session was ended, and the row is the connector's record that
+		// it was wanted. With no device bound, that row is all the forget has to delete.
+		//
+		// The read and the forget happen under binding, and the client is marked stale
+		// before the slot is let go: the store was empty when this logout decided, so a
+		// pairing finishing on the phone right now is refused, rather than linking the
+		// account under a session its client has ended. Stale is also what has the next
+		// connect replace the client, which cancelling the pairing does not make usable
+		// again: whatsmeow's QR channel stays open.
+		//
+		// The socket is hung up the way a disconnect hangs it up, which settles the state
+		// at close and refuses a Connected the pairing socket had queued. Not waited for: a
+		// dial holds the socket for as long as it lasts, and the state settles when it lets
+		// go.
+		// Not when WhatsApp revoked the session: the recovery that started is already
+		// replacing the client, and a second repair beside it could retire the client the
+		// next connect is pairing on.
+		if !s.isRevoked() {
+			s.markStale()
+		}
+		forgetting, forgot := context.WithTimeout(s.ctx, s.storeLimit)
+		err := s.store.ForgetCredentialsAndDesired(forgetting)
+		forgot()
+		s.releaseBinding()
+		if err != nil {
+			return fmt.Errorf("whatsmeow: log %s out: %w", s.sid, err)
+		}
+		s.beginHangUp(s.current(), false)
+		return nil
+	}
+	s.releaseBinding()
 	if err := ask(ctx, s.current()); err != nil {
 		if sentNothing(err) || unanswered(err) {
 			// Nothing WhatsApp said has revoked the device, and it is untouched on both
@@ -4848,17 +4946,70 @@ func (s *Session) finishPairing(run *pairingRun, reason string, err error) {
 // crash between the two from leaving credentials no session claims. Refusing here
 // cancels the pairing, which is the right outcome: a device we cannot attribute is one
 // no restart can find again.
-func (s *Session) bind(jid waTypes.JID, _, _ string) bool {
+//
+// Only for the client the session is on, and only while it is usable. A pairing finishes on
+// whatsmeow's own goroutine, which nothing here waits for, so its callback can arrive after
+// a logout put the client down or after a connect replaced it: recording that device would
+// link the account under a session its client ended, or overwrite the mapping the
+// replacement's pairing wrote.
+func (s *Session) bind(client *wm.Client, jid waTypes.JID, _, _ string) bool {
 	// From the session's own lifetime: a pairing that lands after this instance lost
 	// the account would otherwise overwrite the mapping the new owner is writing.
 	ctx, cancel := context.WithTimeout(s.ctx, bindTimeout)
 	defer cancel()
+
+	if !s.holdBinding(ctx) {
+		s.log.Error().Msg("failed to record a pairing in time; refusing it")
+		return false
+	}
+	defer s.releaseBinding()
+	if client != s.current() || s.isStale() {
+		s.log.Info().Msg("refusing a pairing on a client this session has put down")
+		return false
+	}
 
 	if err := s.store.Bind(ctx, jid); err != nil {
 		s.log.Error().Err(err).Msg("failed to record a pairing; refusing it")
 		return false
 	}
 	return true
+}
+
+// holdsCredentials reports whether the session names an account WhatsApp has not taken
+// away: one it paired, or one it connected as.
+func (s *Session) holdsCredentials() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.phone != "" && !s.revoked
+}
+
+// holdBinding takes the slot that orders a bind against a logout, or reports that ctx ran
+// out first.
+func (s *Session) holdBinding(ctx context.Context) bool {
+	s.bindingOnce.Do(func() { s.binding = make(chan struct{}, 1) })
+	select {
+	case s.binding <- struct{}{}:
+		return true
+	default:
+	}
+	if s.bindingBusy != nil {
+		s.bindingBusy()
+	}
+	select {
+	case s.binding <- struct{}{}:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// releaseBinding gives the slot back. It is held by the caller, so the receive is there to
+// take; the default only keeps a release without a hold from blocking forever.
+func (s *Session) releaseBinding() {
+	select {
+	case <-s.binding:
+	default:
+	}
 }
 
 // bindTimeout bounds the write that stands between a scanned code and a paired

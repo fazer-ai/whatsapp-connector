@@ -128,7 +128,10 @@ func TestEveryEngineRecordsThePairingBeforeItAnnouncesIt(t *testing.T) {
 		source := readEngineSource(t, "whatsmeow")
 		// Two clauses and not one: the wiring says the callback is reached, the call says
 		// it records. Either alone is satisfied by a callback that does nothing.
-		if !strings.Contains(source, "PrePairCallback = s.bind") {
+		// The callback is a closure over the client it is wired to, so `bind` can refuse a
+		// pairing that finishes on a client the session has put down (#398).
+		if !strings.Contains(source, "client.PrePairCallback = func(") ||
+			!strings.Contains(source, "return s.bind(client, jid,") {
 			t.Error("whatsmeow no longer wires `bind` to `PrePairCallback`.\n" +
 				"That wiring is what makes the order true for this engine: the callback " +
 				"runs before WhatsApp is told the pairing succeeded, and returning false " +
