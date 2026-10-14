@@ -2624,7 +2624,11 @@ func (s *Session) Logout(ctx context.Context) error {
 		return fmt.Errorf("whatsmeow: log %s out: waiting for a pairing to record its device: %w", s.sid, ctx.Err())
 	}
 	ask, nothingToUnlink := s.askToUnlink(ctx)
-	if nothingToUnlink {
+	// The live client is asked as well as the store. A session the same phone displaced by
+	// pairing under another sid has lost its mapping and still holds credentials in memory,
+	// linked on the phone: that logout is a real one, and answering it done would leave a
+	// companion listed that nothing can remove once the next connect discards them.
+	if nothingToUnlink && s.current().Store.ID == nil {
 		// The store holds no device: unlinked from the phone, or never paired. The state the
 		// logout asks for is the one the session is already in, so it is answered as done
 		// (#398). WhatsApp is not asked, since there are no credentials to sign the request
