@@ -418,9 +418,9 @@ func TestADeleteWithNothingPairedDoesNotWaitOnADial(t *testing.T) {
 	}
 }
 
-// The same for a logout, which reaches whatsmeow the same way and has the same nothing to
-// ask it. Refused is all it can be for an account with no device, and it costs the session's
-// command queue nothing to be refused now rather than a deadline from now.
+// The same for a logout, which has the same nothing to ask WhatsApp. It is answered as done
+// (#398), and it costs the session's command queue nothing to be answered now rather than a
+// deadline from now.
 func TestALogoutWithNothingPairedDoesNotWaitOnADial(t *testing.T) {
 	t.Parallel()
 
@@ -432,8 +432,8 @@ func TestALogoutWithNothingPairedDoesNotWaitOnADial(t *testing.T) {
 	go func() { answered <- session.Logout(t.Context()) }()
 	select {
 	case err := <-answered:
-		if !errors.Is(err, wm.ErrNotLoggedIn) {
-			t.Fatalf("Logout failed with %v, want whatsmeow refusing an account with no device", err)
+		if err != nil {
+			t.Fatalf("Logout failed with %v, want it done: there is no device to unlink", err)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("the logout waited on a dial for an account that has no device to unlink")
