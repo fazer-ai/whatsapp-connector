@@ -29,4 +29,10 @@ func TestALogoutWithNothingLinkedSucceedsWithoutAskingWhatsApp(t *testing.T) {
 	if n := asked.Load(); n != 0 {
 		t.Fatalf("WhatsApp was asked %d time(s) to unlink a device the store does not hold", n)
 	}
+	// Nothing was revoked, and the client is the one the next pairing reuses: marked
+	// revoked, it would go on answering not_paired after that pairing succeeds, since
+	// pairing does not rebuild it and nothing else clears the mark.
+	if session.isRevoked() {
+		t.Fatal("a session with nothing linked was marked revoked, and the next pairing would inherit the mark")
+	}
 }
