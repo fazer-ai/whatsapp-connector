@@ -2626,7 +2626,10 @@ func (s *Session) Logout(ctx context.Context) error {
 	if !s.holdBinding(ctx) {
 		// Nothing was sent to WhatsApp: the time ran out on a pairing recording its device,
 		// before the store was even read. The contract answers that not_attempted, the
-		// teardown a client retries.
+		// teardown a client retries. Calls come back on with it, as on the other paths that
+		// sent nothing: the pairing it waited on can still finish, and a session that
+		// connects with calls switched off rejects every one.
+		s.backOnline()
 		return fmt.Errorf("whatsmeow: log %s out: waiting for a pairing to record its device: %w: %w", s.sid,
 			protocol.NewError(protocol.ErrorNotAttempted, "the request was never sent to WhatsApp"), ctx.Err())
 	}
