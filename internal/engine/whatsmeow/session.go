@@ -2624,7 +2624,11 @@ func (s *Session) Logout(ctx context.Context) error {
 	s.cancelPairing()
 	s.goOffline(ctx)
 	if !s.holdBinding(ctx) {
-		return fmt.Errorf("whatsmeow: log %s out: waiting for a pairing to record its device: %w", s.sid, ctx.Err())
+		// Nothing was sent to WhatsApp: the time ran out on a pairing recording its device,
+		// before the store was even read. The contract answers that not_attempted, the
+		// teardown a client retries.
+		return fmt.Errorf("whatsmeow: log %s out: waiting for a pairing to record its device: %w: %w", s.sid,
+			protocol.NewError(protocol.ErrorNotAttempted, "the request was never sent to WhatsApp"), ctx.Err())
 	}
 	ask, nothingToUnlink := s.askToUnlink(ctx)
 	// The live client is asked as well as the store. A session the same phone displaced by
@@ -4945,6 +4949,14 @@ func (s *Session) bind(client *wm.Client, jid waTypes.JID, _, _ string) bool {
 // out first.
 func (s *Session) holdBinding(ctx context.Context) bool {
 	s.bindingOnce.Do(func() { s.binding = make(chan struct{}, 1) })
+	select {
+	case s.binding <- struct{}{}:
+		return true
+	default:
+	}
+	if s.bindingBusy != nil {
+		s.bindingBusy()
+	}
 	select {
 	case s.binding <- struct{}{}:
 		return true
