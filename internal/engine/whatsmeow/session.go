@@ -2631,11 +2631,14 @@ func (s *Session) Logout(ctx context.Context) error {
 			protocol.NewError(protocol.ErrorNotAttempted, "the request was never sent to WhatsApp"), ctx.Err())
 	}
 	ask, nothingToUnlink := s.askToUnlink(ctx)
-	// The live client is asked as well as the store. A session the same phone displaced by
-	// pairing under another sid has lost its mapping and still holds credentials in memory,
-	// linked on the phone: that logout is a real one, and answering it done would leave a
-	// companion listed that nothing can remove once the next connect discards them.
-	if nothingToUnlink && s.current().Store.ID == nil {
+	// The session is asked as well as the store. One the same phone displaced by pairing
+	// under another sid has lost its mapping and still holds credentials in memory, linked
+	// on the phone: that logout is a real one, and answering it done would leave a
+	// companion listed that nothing can remove once the next connect discards them. Asked
+	// of the identity the session keeps under its own lock rather than of whatsmeow's
+	// device record, which whatsmeow clears from its own goroutine when WhatsApp logs the
+	// account out; that case is the revoked mark, and it has nothing left to unlink.
+	if nothingToUnlink && !s.holdsCredentials() {
 		// The store holds no device: unlinked from the phone, or never paired. The state the
 		// logout asks for is the one the session is already in, so it is answered as done
 		// (#398). WhatsApp is not asked, since there are no credentials to sign the request
@@ -2667,7 +2670,9 @@ func (s *Session) Logout(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("whatsmeow: log %s out: %w", s.sid, err)
 		}
-		s.beginHangUp(s.current(), false)
+		if !s.hangUpPending() {
+			s.beginHangUp(s.current(), false)
+		}
 		return nil
 	}
 	s.releaseBinding()
@@ -4943,6 +4948,32 @@ func (s *Session) bind(client *wm.Client, jid waTypes.JID, _, _ string) bool {
 		return false
 	}
 	return true
+}
+
+// holdsCredentials reports whether the session names an account WhatsApp has not taken
+// away: one it paired, or one it connected as.
+func (s *Session) holdsCredentials() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.phone != "" && !s.revoked
+}
+
+// hangUpPending reports whether a hang-up this session started has not finished. A second
+// one beside it would leave the next connect waiting on only one, and the other could
+// settle the session at close on top of the client that connect builds.
+func (s *Session) hangUpPending() bool {
+	s.mu.Lock()
+	pending := s.hangingUp
+	s.mu.Unlock()
+	if pending == nil {
+		return false
+	}
+	select {
+	case <-pending:
+		return false
+	default:
+		return true
+	}
 }
 
 // holdBinding takes the slot that orders a bind against a logout, or reports that ctx ran
