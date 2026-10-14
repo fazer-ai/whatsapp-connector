@@ -748,6 +748,9 @@ type Session struct {
 	// hangUpClaim is how the latest hang-up gets reported, decided between the hang-up
 	// and the command waiting on it (see moveClaim).
 	hangUpClaim *moveClaim
+	// hangUpMoves says the latest hang-up is a move, which ends in a redial: a plain
+	// hang-up must not join that one.
+	hangUpMoves bool
 	// runs counts the conversations this session has started. Paired with nonce it is
 	// what gives each one a name the client can answer to.
 	runs uint64
@@ -2377,10 +2380,10 @@ func (s *Session) hangUp(ctx context.Context, client *wm.Client, move bool) erro
 // client -- a connect in between waits for the first -- and two beside each other leave the
 // next connect waiting on only one, while the other can settle the session at close on top
 // of the client that connect builds. A move has a reconnect of its own to report, so it
-// always starts one.
+// always starts one, and a plain hang-up never joins a move, which ends in a redial.
 func (s *Session) beginHangUp(client *wm.Client, move bool) (chan struct{}, *moveClaim) {
 	s.mu.Lock()
-	if pending := s.hangingUp; !move && pending != nil {
+	if pending := s.hangingUp; !move && !s.hangUpMoves && pending != nil {
 		select {
 		case <-pending:
 		default:
@@ -2393,6 +2396,7 @@ func (s *Session) beginHangUp(client *wm.Client, move bool) (chan struct{}, *mov
 	claim := new(moveClaim)
 	s.hangingUp = done
 	s.hangUpClaim = claim
+	s.hangUpMoves = move
 	s.mu.Unlock()
 	go func() {
 		defer close(done)

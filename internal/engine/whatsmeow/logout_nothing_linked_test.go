@@ -337,3 +337,25 @@ func TestADisconnectAfterALogoutReusesTheHangUpStillOut(t *testing.T) {
 		t.Fatal("the disconnect started a hang-up beside the one the logout left out")
 	}
 }
+
+// A move is a hang-up that ends in a redial, so a disconnect arriving while one is out does
+// not join it: joined, the operator who asked for the session to go down would get it back.
+func TestADisconnectDoesNotJoinAMoveStillOut(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "")
+	holdTheDial(t, session)
+	pending := func() chan struct{} {
+		session.mu.Lock()
+		defer session.mu.Unlock()
+		return session.hangingUp
+	}
+
+	moving, _ := session.beginHangUp(session.current(), true)
+	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+	defer cancel()
+	_ = session.Disconnect(ctx)
+	if pending() == moving {
+		t.Fatal("the disconnect joined a move, which ends in a redial")
+	}
+}
