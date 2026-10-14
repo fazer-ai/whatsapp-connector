@@ -70,6 +70,12 @@ func TestAPairingThatLandsAfterALogoutWithNothingLinkedIsRefused(t *testing.T) {
 		t.Fatalf("Logout with nothing linked failed with %v, want success", err)
 	}
 
+	// The pairing's client goes with it: cancelling the pairing leaves whatsmeow's QR
+	// channel open, so the next connect has to start on a fresh client.
+	if !session.isStale() {
+		t.Fatal("the client of the pairing the logout put down was left for the next connect to reuse")
+	}
+
 	jid, err := waTypes.ParseJID("5511999990002:12@" + waTypes.DefaultUserServer)
 	if err != nil {
 		t.Fatalf("ParseJID: %v", err)

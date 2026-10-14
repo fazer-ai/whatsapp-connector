@@ -599,6 +599,12 @@ type Session struct {
 	// lock across that would stop everything that reads state, Close included.
 	transition sync.Mutex
 	closed     bool
+	// binding orders a pairing recording its device against a logout that found none to
+	// remove. Whichever goes first, the other sees it: a bind that landed puts the logout
+	// on the unlink path, and a logout that read the store empty refuses the bind that
+	// comes after it, until the next connect. bindRefused is that refusal.
+	binding     sync.Mutex
+	bindRefused bool
 	// dialing is true while a connect is in flight. whatsmeow holds its socket lock for
 	// the length of one, and every question asked of the client takes that lock for
 	// read, so a dial that outlived its command would block the next command on a
@@ -2009,6 +2015,7 @@ func (s *Session) Connect(ctx context.Context, req engine.ConnectRequest) error 
 	// back here: a request refused below never dialled anything, and a session left
 	// looking as though it had something to try is one nothing hands back.
 	standing, gaveUp := s.dropHangUp()
+	s.allowBind()
 
 	var err error
 	switch req.Pairing {
@@ -2602,26 +2609,42 @@ func (s *Session) Logout(ctx context.Context) error {
 
 	s.cancelPairing()
 	s.goOffline(ctx)
+	s.binding.Lock()
 	ask, nothingToUnlink := s.askToUnlink(ctx)
 	if nothingToUnlink {
 		// The store holds no device: unlinked from the phone, or never paired. The state the
 		// logout asks for is the one the session is already in, so it is answered as done
 		// (#398). WhatsApp is not asked, since there are no credentials to sign the request
-		// with, and nothing is published, since nothing changed. Not settled either: that
-		// marks the client revoked, and with nothing to forget no rebuild follows, so the
-		// next pairing would reuse a client that goes on answering not_paired. The pairing
-		// in progress and the presence were already put down above.
+		// with, and no session.logged_out is published, since nothing was linked to end.
+		// Not settled either: that marks the client revoked, and with nothing to forget no
+		// rebuild follows, so the next pairing would reuse a client that goes on answering
+		// not_paired. The pairing in progress and the presence were already put down above.
 		//
 		// What the client asked for does go, as the contract has every logout do: an answer
 		// of success says the session was ended, and the row is the connector's record that
 		// it was wanted. With no device bound, that row is all the forget has to delete.
-		ctx, cancel := context.WithTimeout(s.ctx, s.storeLimit)
-		defer cancel()
-		if err := s.store.ForgetCredentialsAndDesired(ctx); err != nil {
+		//
+		// The read and the forget happen under binding, and a pairing finishing on the phone
+		// right now is refused from here on: the store was empty when this logout decided,
+		// so a device bound after it would be an account linked under a session its client
+		// has ended. The pairing socket goes too, the way an abandoned pairing's does:
+		// disconnected, and the client marked for the next connect to replace, since
+		// cancelling the pairing does not close whatsmeow's QR channel. Not waited for: a
+		// dial holds the socket for as long as it lasts, and nothing here needs it gone
+		// before answering.
+		s.bindRefused = true
+		forgetting, forgot := context.WithTimeout(s.ctx, s.storeLimit)
+		err := s.store.ForgetCredentialsAndDesired(forgetting)
+		forgot()
+		s.binding.Unlock()
+		if err != nil {
 			return fmt.Errorf("whatsmeow: log %s out: %w", s.sid, err)
 		}
+		go s.current().Disconnect()
+		s.markStale()
 		return nil
 	}
+	s.binding.Unlock()
 	if err := ask(ctx, s.current()); err != nil {
 		if sentNothing(err) || unanswered(err) {
 			// Nothing WhatsApp said has revoked the device, and it is untouched on both
@@ -4868,6 +4891,13 @@ func (s *Session) finishPairing(run *pairingRun, reason string, err error) {
 // cancels the pairing, which is the right outcome: a device we cannot attribute is one
 // no restart can find again.
 func (s *Session) bind(jid waTypes.JID, _, _ string) bool {
+	s.binding.Lock()
+	defer s.binding.Unlock()
+	if s.bindRefused {
+		s.log.Info().Msg("refusing a pairing that finished after the session was logged out")
+		return false
+	}
+
 	// From the session's own lifetime: a pairing that lands after this instance lost
 	// the account would otherwise overwrite the mapping the new owner is writing.
 	ctx, cancel := context.WithTimeout(s.ctx, bindTimeout)
@@ -4878,6 +4908,14 @@ func (s *Session) bind(jid waTypes.JID, _, _ string) bool {
 		return false
 	}
 	return true
+}
+
+// allowBind lets a pairing record its device again, for a connect: the operator asking
+// for a session is what ends the refusal a logout left.
+func (s *Session) allowBind() {
+	s.binding.Lock()
+	s.bindRefused = false
+	s.binding.Unlock()
 }
 
 // bindTimeout bounds the write that stands between a scanned code and a paired
@@ -5425,6 +5463,3 @@ func (s *Session) paired(event *waEvents.PairSuccess) {
 	}
 	s.emit(protocol.EventPairingSuccess, payload)
 }
-
-// allowBind lets a pairing record its device again.
-func (s *Session) allowBind() {}
