@@ -2607,9 +2607,10 @@ func (s *Session) Logout(ctx context.Context) error {
 		// The store holds no device: unlinked from the phone, or never paired. The state the
 		// logout asks for is the one the session is already in, so it is answered as done
 		// (#398). WhatsApp is not asked, since there are no credentials to sign the request
-		// with, and nothing is published, since nothing changed. Settled all the same, so a
-		// connect the library had queued is refused the way it is after any logout.
-		s.settleLogout()
+		// with, and nothing is published, since nothing changed. Not settled either: that
+		// marks the client revoked, and with nothing to forget no rebuild follows, so the
+		// next pairing would reuse a client that goes on answering not_paired. The pairing
+		// in progress and the presence were already put down above.
 		return nil
 	}
 	if err := ask(ctx, s.current()); err != nil {
