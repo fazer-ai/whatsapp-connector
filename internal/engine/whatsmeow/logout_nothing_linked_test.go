@@ -121,17 +121,23 @@ func TestALogoutWaitsForAPairingThatIsRecordingItsDevice(t *testing.T) {
 		t.Fatalf("ParseJID: %v", err)
 	}
 
-	// Held the way bind holds it, around the write.
+	// Held the way bind holds it, around the write. The logout says when it is waiting,
+	// so the record below lands while it waits and not merely before it started.
 	if !session.holdBinding(t.Context()) {
 		t.Fatal("could not take the binding slot")
 	}
+	waiting := make(chan struct{})
+	session.bindingBusy = func() { close(waiting) }
 	answered := make(chan error, 1)
 	go func() { answered <- session.Logout(t.Context()) }()
 	select {
+	case <-waiting:
 	case err := <-answered:
 		session.releaseBinding()
-		t.Fatalf("the logout answered (%v) while a pairing was still recording its device", err)
-	case <-time.After(200 * time.Millisecond):
+		t.Fatalf("the logout answered (%v) without waiting for a pairing still recording its device", err)
+	case <-time.After(10 * time.Second):
+		session.releaseBinding()
+		t.Fatal("the logout neither waited for the binding slot nor answered")
 	}
 	if err := session.store.Bind(t.Context(), jid); err != nil {
 		session.releaseBinding()
@@ -172,6 +178,11 @@ func TestALogoutStopsWaitingForABindAtItsDeadline(t *testing.T) {
 	case err := <-answered:
 		if !errors.Is(err, context.DeadlineExceeded) {
 			t.Fatalf("the logout answered %v, want the caller's deadline", err)
+		}
+		// Nothing was sent to WhatsApp while it waited, and the contract has a teardown
+		// that ran out of time before sending anything say so: a retry is then safe.
+		if got := codeOf(err); got != protocol.ErrorNotAttempted {
+			t.Fatalf("the logout answered the code %q, want %q", got, protocol.ErrorNotAttempted)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("the logout went on waiting for a bind past its deadline")

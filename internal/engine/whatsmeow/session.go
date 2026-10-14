@@ -607,6 +607,9 @@ type Session struct {
 	// without its constructor still has one.
 	binding     chan struct{}
 	bindingOnce sync.Once
+	// bindingBusy, when set, is called by a caller about to wait for the slot. A test seam:
+	// it lets a test know the wait has begun without sleeping on it.
+	bindingBusy func()
 	// dialing is true while a connect is in flight. whatsmeow holds its socket lock for
 	// the length of one, and every question asked of the client takes that lock for
 	// read, so a dial that outlived its command would block the next command on a
