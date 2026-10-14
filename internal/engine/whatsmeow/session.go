@@ -2684,7 +2684,12 @@ func (s *Session) Logout(ctx context.Context) error {
 		// at close and refuses a Connected the pairing socket had queued. Not waited for: a
 		// dial holds the socket for as long as it lasts, and the state settles when it lets
 		// go.
-		s.markStale()
+		// Not when WhatsApp revoked the session: the recovery that started is already
+		// replacing the client, and a second repair beside it could retire the client the
+		// next connect is pairing on.
+		if !s.isRevoked() {
+			s.markStale()
+		}
 		forgetting, forgot := context.WithTimeout(s.ctx, s.storeLimit)
 		err := s.store.ForgetCredentialsAndDesired(forgetting)
 		forgot()
