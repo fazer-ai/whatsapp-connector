@@ -184,6 +184,14 @@ func TestALogoutStopsWaitingForABindAtItsDeadline(t *testing.T) {
 		if got := codeOf(err); got != protocol.ErrorNotAttempted {
 			t.Fatalf("the logout answered the code %q, want %q", got, protocol.ErrorNotAttempted)
 		}
+		// And the session is left as it was: the pairing it waited on can still finish,
+		// and a session that connects with calls still switched off rejects every one.
+		session.bridge.mu.Lock()
+		offline := session.bridge.offline
+		session.bridge.mu.Unlock()
+		if offline {
+			t.Fatal("a logout that was never attempted left calls switched off")
+		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("the logout went on waiting for a bind past its deadline")
 	}
