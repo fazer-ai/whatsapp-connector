@@ -667,10 +667,27 @@ func TestWhatNothingWillEverPublishIsAcknowledgedRatherThanKeptOnThePhone(t *tes
 	}
 }
 
-// The opposite half: what a later build could publish stays on the phone, which is the
-// same trade the message path makes.
-func TestWhatALaterBuildCouldPublishIsKeptOnThePhone(t *testing.T) {
+// What this build cannot carry is acknowledged too, and not kept for a later one. WhatsApp
+// does not wait for a later build: fifty minutes after delivering a message nobody
+// acknowledged, it closes the stream with an `ack` error naming that message, and the
+// redelivery on the next connection starts the clock again. Measured on a live session
+// for fifteen hours (#402). Keeping one of these costs a dropped socket every fifty
+// minutes for as long as WhatsApp keeps sending it, which no later build pays back.
+func TestWhatNoRedeliveryWillChangeIsAcknowledged(t *testing.T) {
 	t.Parallel()
+
+	from := func(jid waTypes.JID, event *waEvents.Message) *waEvents.Message {
+		event.Info.Chat = jid
+		event.Info.Sender = jid
+		event.Info.SenderAlt = waTypes.EmptyJID
+		event.Info.RecipientAlt = waTypes.EmptyJID
+		return event
+	}
+	unknown := waTypes.NewJID("someone", "unknown.server")
+	bot := waTypes.NewJID("13135550002", waTypes.BotServer)
+	edit := func() *waEvents.Message {
+		return editEvent(carrier, subject, &waE2E.Message{Conversation: proto.String("x")}, 1755000009000)
+	}
 
 	for _, tc := range []struct {
 		name  string
@@ -682,18 +699,31 @@ func TestWhatALaterBuildCouldPublishIsKeptOnThePhone(t *testing.T) {
 			event.Message = &waE2E.Message{}
 			return event
 		}},
-		{"an edit whose new body has no arm in this build", func() *waEvents.Message {
-			corrected := &waE2E.Message{LocationMessage: &waE2E.LocationMessage{
-				DegreesLatitude:  proto.Float64(-23.5),
-				DegreesLongitude: proto.Float64(-46.6),
-			}}
-			return editEvent(carrier, subject, corrected, 1755000009000)
-		}},
 		{"a reaction from somebody the contract cannot name", func() *waEvents.Message {
 			event := reactionEvent(carrier, subject, "👍", 1755000009000)
-			event.Info.Sender = waTypes.NewJID("someone", "unknown.server")
+			event.Info.Sender = unknown
 			event.Info.SenderAlt = waTypes.EmptyJID
 			return event
+		}},
+		{"a reaction in a chat on a server this build does not know", func() *waEvents.Message {
+			return from(unknown, reactionEvent(carrier, subject, "👍", 1755000009000))
+		}},
+		{"a reaction from one of Meta's assistants", func() *waEvents.Message {
+			return from(bot, reactionEvent(carrier, subject, "👍", 1755000009000))
+		}},
+		{"an edit on a server this build does not know", func() *waEvents.Message { return from(unknown, edit()) }},
+		{"an edit from one of Meta's assistants", func() *waEvents.Message { return from(bot, edit()) }},
+		{"a deletion on a server this build does not know", func() *waEvents.Message {
+			return from(unknown, revokeEvent(carrier, subject))
+		}},
+		{"a deletion from one of Meta's assistants", func() *waEvents.Message {
+			return from(bot, revokeEvent(carrier, subject))
+		}},
+		{"a sealed correction on a server this build does not know", func() *waEvents.Message {
+			return from(unknown, sealedEditEvent(carrier, subject))
+		}},
+		{"a sealed correction from one of Meta's assistants", func() *waEvents.Message {
+			return from(bot, sealedEditEvent(carrier, subject))
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -701,8 +731,65 @@ func TestWhatALaterBuildCouldPublishIsKeptOnThePhone(t *testing.T) {
 
 			session, _ := newTestSession(t, "5511999990001")
 			session.deliverWait = 50 * time.Millisecond
-			if publishedNothing(t, session, tc.build()) {
-				t.Fatal("something nothing published was acknowledged, so WhatsApp will not send it again")
+			// Opens to a body this build renders, so only the address can stop it.
+			session.unseal = func(context.Context, *waEvents.Message) (*waE2E.Message, error) {
+				return &waE2E.Message{Conversation: proto.String("x")}, nil
+			}
+			if !publishedNothing(t, session, tc.build()) {
+				t.Fatal("WhatsApp was left redelivering something no redelivery will let this build publish")
+			}
+		})
+	}
+}
+
+// An edit whose new body has no arm in this build goes out as the unsupported placeholder,
+// the same answer the message path gives a body it cannot render. The client learns the
+// message was corrected and keeps the bubble it has; withholding it instead had WhatsApp
+// drop the socket every fifty minutes over it (#402).
+func TestAnEditWhoseNewBodyHasNoArmIsPublishedAsUnsupported(t *testing.T) {
+	t.Parallel()
+
+	location := func() *waE2E.Message {
+		return &waE2E.Message{LocationMessage: &waE2E.LocationMessage{
+			DegreesLatitude:  proto.Float64(-23.5),
+			DegreesLongitude: proto.Float64(-46.6),
+		}}
+	}
+	for _, tc := range []struct {
+		name  string
+		event func() *waEvents.Message
+		want  protocol.UnsupportedReason
+	}{
+		{"an edit", func() *waEvents.Message {
+			return editEvent(carrier, subject, location(), 1755000009000)
+		}, protocol.UnsupportedUnknownType},
+		{"a sealed correction", func() *waEvents.Message {
+			return sealedEditEvent(carrier, subject)
+		}, protocol.UnsupportedUnknownType},
+		{"an edit with no body at all", func() *waEvents.Message {
+			return editEvent(carrier, subject, nil, 1755000009000)
+		}, protocol.UnsupportedEmpty},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			session, _ := newTestSession(t, "5511999990001")
+			session.unseal = func(context.Context, *waEvents.Message) (*waE2E.Message, error) {
+				return location(), nil
+			}
+
+			emission := publishedBy(t, session, tc.event())
+			if emission.Type != protocol.EventMessageEdited {
+				t.Fatalf("published %s, want %s", emission.Type, protocol.EventMessageEdited)
+			}
+			validateAgainstContract(t, "event_message_edited", emission.Payload)
+			payload := decode(t, emission.Payload)
+			if payload["message_id"] != subject {
+				t.Fatalf("the edit corrects %v, want %q", payload["message_id"], subject)
+			}
+			content, _ := payload["content"].(map[string]any)
+			if content["type"] != "unsupported" || content["reason"] != string(tc.want) {
+				t.Fatalf("an edit this build cannot render reads %v, want the %s placeholder", content, tc.want)
 			}
 		})
 	}
