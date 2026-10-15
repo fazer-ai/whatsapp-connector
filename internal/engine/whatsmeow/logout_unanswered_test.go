@@ -429,3 +429,44 @@ func TestWhatsmeowStillWordsAFailedLogoutRequestTheSameWay(t *testing.T) {
 		t.Fatalf("whatsmeow words a failed logout request as %q, which no longer starts with %q", err, logoutRequestFailed)
 	}
 }
+
+// A logout that went out and heard nothing back is one whose outcome nobody here can
+// tell, and the contract has a word for that: `timeout`, which tells a client the device
+// may be gone. Left uncoded, a dropped socket or WhatsApp's own wait running out reached
+// the client as `internal`, which says nothing about the device at all (#400). The
+// caller's own deadline already reads as `timeout` further up, and a logout called off
+// is the session going away rather than an answer about the device.
+func TestALogoutThatLostItsAnswerSaysItsOutcomeIsUnknown(t *testing.T) {
+	t.Parallel()
+
+	want := map[string]protocol.ErrorCode{
+		"the socket dropped before the answer":     protocol.ErrorTimeout,
+		"the socket dropped again on the retry":    protocol.ErrorTimeout,
+		"the answer never came in time":            protocol.ErrorTimeout,
+		"the command ran out of time waiting":      "",
+		"the command was called off while waiting": "",
+	}
+	for name, logout := range unansweredLogouts {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			code, known := want[name]
+			if !known {
+				t.Fatalf("no expected code for %q", name)
+			}
+			session, _ := newTestSession(t, "5511999990001")
+			session.logout = func(ctx context.Context, _ *wm.Client) error {
+				return fmt.Errorf("one more layer: %w", logout(ctx))
+			}
+
+			err := logoutWithin(t, session)
+			if got := codeOf(err); got != code {
+				t.Fatalf("a logout that %s answered %q, want %q (%v)", name, got, code, err)
+			}
+			var disconnected *wm.DisconnectedError
+			if strings.Contains(name, "socket dropped") && !errors.As(err, &disconnected) {
+				t.Fatalf("the dropped socket is no longer in the chain: %v", err)
+			}
+		})
+	}
+}

@@ -2720,7 +2720,7 @@ func (s *Session) Logout(ctx context.Context) error {
 			// dial alongside it. So is calls registering again: the calls it carried are
 			// over, and the next one is the session's like any other.
 			s.backOnline()
-			return fmt.Errorf("whatsmeow: log %s out: %w", s.sid, neverSent(err))
+			return fmt.Errorf("whatsmeow: log %s out: %w", s.sid, lostAnswer(neverSent(err)))
 		}
 		s.settleLogout()
 		// The request went out. whatsmeow unlinks the device before it deletes the local
@@ -3357,6 +3357,24 @@ func neverSent(err error) error {
 	}
 	return fmt.Errorf("%w: %w",
 		protocol.NewError(protocol.ErrorNotAttempted, "the request was never sent to WhatsApp"), err)
+}
+
+// lostAnswer gives an unlink that went out and heard nothing back the word for an outcome
+// nobody here can tell, and leaves everything else exactly as it was.
+//
+// A dropped socket and WhatsApp's own wait running out both come after the request was
+// written, so WhatsApp may have revoked the device or may not. `timeout` is the contract's
+// word for exactly that, and the one that tells a client the device may be gone; uncoded,
+// either reached the client as `internal`, which says nothing about the device (#400). The
+// caller's own deadline is left alone because `asProtocolError` already answers `timeout`
+// for it, and a logout called off is the session going away, not an answer about the device.
+func lostAnswer(err error) error {
+	var disconnected *wm.DisconnectedError
+	if !errors.As(err, &disconnected) && !errors.Is(err, wm.ErrIQTimedOut) {
+		return err
+	}
+	return fmt.Errorf("%w: %w",
+		protocol.NewError(protocol.ErrorTimeout, "the request went out and no answer came back"), err)
 }
 
 // unlink asks WhatsApp to remove this device, on the caller's time.
