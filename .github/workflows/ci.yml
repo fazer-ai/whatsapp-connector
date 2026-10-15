@@ -37,12 +37,18 @@ jobs:
       - name: Check the vendored meowcaller
         run: make meowcaller-check
 
-      # The one step that stays a direct invocation, and deliberately: the action brings
-      # its own caching and turns findings into annotations on the diff, which `make lint`
-      # cannot do from here. Same binary, same version, same config.
+      # The one step that stays a direct invocation, and deliberately: the action turns
+      # findings into annotations on the diff, which `make lint` cannot do from here. Same
+      # binary, same version, same config.
+      #
+      # Without the action's cache. An entry saved by a green run left the next run's
+      # staticcheck without the facts of `testing` and of whatsmeow's deprecations, and it
+      # reported a dozen findings in files the PR did not touch; deleting the entry made the
+      # same job on the same commit green (#392). Every run starts cold instead.
       - uses: golangci/golangci-lint-action@v9
         with:
           version: v2.12
+          skip-cache: true
 
   test:
     name: Test
