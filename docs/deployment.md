@@ -54,6 +54,8 @@ Calls answered or placed in the agent's browser carry their voice through one UD
 
 A call costs the connector about a tenth of a CPU core while it lasts, for the transcoding between WhatsApp's codec and the browser's in both directions. Measured on the live bench of #383, on an Apple M5 Pro already under heavy load: 2.5 s of CPU over 30 s of one call with the browser sending a tone and G.722 negotiated, against 0.01 s over 20 s with the session idle. Size a host for its expected number of simultaneous calls on that figure.
 
+On Coolify, an application deployed from a single image cannot publish the UDP port: its port mappings accept `host:container` pairs only, and a `/udp` suffix is refused, so the port has to reach the container another way. A Docker Compose resource takes the examples' `ports` instead, though that path was not measured here. One that works is giving the container a fixed address on its network with `--ip` in the custom Docker options, and forwarding the host's UDP port to that address with a `DNAT` rule in the `nat` table's `PREROUTING` chain and an `ACCEPT` for it in `DOCKER-USER`, made persistent on the host (a systemd unit that applies them at boot). The rules live on the host, outside Coolify, so a redeploy keeps them only because the address is fixed.
+
 ## Switching an existing installation
 
 An installation that already runs the connector as a separate service and upgrades to a Chatwoot image that embeds it **must set `WHATSAPP_CONNECTOR_EMBEDDED=false` before the upgrade**. Without it, the Sidekiq container starts a second connector with an empty database of its own, and the two compete for the same sessions through the same Redis.

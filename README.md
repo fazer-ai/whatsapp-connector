@@ -64,7 +64,8 @@ A sessão do WhatsApp mantém um socket aberto por longos períodos e cuida da p
 ### Contatos e chamadas
 
 - Verificação de número com WhatsApp, consulta de perfil e foto do contato.
-- Chamadas recebidas aparecem na caixa de entrada, com recusa automática opcional.
+- O atendente atende chamadas recebidas e liga para o contato com a voz pelo navegador, no mesmo fluxo da API oficial do WhatsApp no Chatwoot: cartão que toca e registro da chamada na conversa. São chamadas de voz 1:1, sem vídeo nem chamadas de grupo. A opção é ligada por caixa e precisa da instalação preparada, como descrito em [Chamadas de voz](#chamadas-de-voz).
+- Numa caixa com chamadas ligadas e “Permitir chamadas de entrada” desligado, o Chatwoot não toca, o celular pareado continua tocando e a conversa ganha uma linha de atividade com o registro da chamada. A recusa automática opcional continua disponível para quem não quer receber chamadas.
 
 ## Feito para não perder mensagem
 
@@ -128,7 +129,7 @@ No Chatwoot, configure:
 WHATSAPP_CONNECTOR_EMBEDDED=false
 ```
 
-Use a imagem pública `ghcr.io/fazer-ai/whatsapp-connector:latest`. Há tags por release, como `0.5.1` e `0.5`. Para fixar a versão, use a tag correspondente.
+Use a imagem pública `ghcr.io/fazer-ai/whatsapp-connector:latest`. Há tags por release, como `0.8.5` e `0.8`. Para fixar a versão, use a tag correspondente.
 
 No conector, configure no mínimo estas variáveis com os valores da sua instalação:
 
@@ -147,6 +148,17 @@ WAC_MEDIA_TOKEN=um-token-longo-e-aleatorio
 - Use um banco PostgreSQL próprio do conector para várias instâncias ou SQLite para uma instância só. O compose de exemplo usa SQLite num volume.
 - Use armazenamento persistente para o banco e para `WAC_MEDIA_ROOT`.
 - A tabela completa de variáveis está em [docs/operations.md](docs/operations.md).
+
+### Chamadas de voz
+
+A voz passa por uma porta UDP do conector, e o navegador do atendente envia áudio diretamente para ela. Cada chamada consome cerca de um décimo de um núcleo de CPU do conector enquanto dura.
+
+- Use o Chatwoot fazer.ai a partir de `v4.18.0-fazer-ai.130` ou, na edição Pro, `v4.18.0-fazer-ai-pro.149`, com o recurso de voz liberado na instalação.
+- Nos composes de exemplo, descomente as duas linhas de configuração de chamadas. `WAC_CALLS_UDP_PORT` define a porta, que nos exemplos é `40000`, já publicada como `40000:40000/udp` no container do Sidekiq no modo embutido e no serviço do conector no modo separado. Sem essa variável, as chamadas ficam desligadas e nada mais muda.
+- Libere essa porta UDP no firewall do servidor e defina `WAC_CALLS_PUBLIC_IP` no `.env` com o IP pelo qual os navegadores alcançam o servidor. Essa variável é obrigatória dentro de container, porque o conector só conhece o endereço interno dele. Os exemplos se recusam a subir com chamadas ligadas e essa variável vazia.
+- Nas configurações de cada caixa do Chatwoot, abra a aba **Chamadas** e ligue **Ativar chamadas do WhatsApp** e **Permitir chamadas de entrada** para fazer e receber chamadas pelo navegador. A aba só oferece o interruptor quando o conector anuncia que carrega a voz.
+
+Os detalhes de configuração estão em [docs/deployment.md](docs/deployment.md#whatsapp-calls).
 
 ### Atualizar uma instalação com o conector separado
 
@@ -183,6 +195,10 @@ Para instalar pelo Coolify, siga o [guia de deploy do Chatwoot fazer.ai](https:/
 - A recusa automática de chamada não silencia quem liga pelo WhatsApp Web. O navegador de quem ligou continua chamando.
 - Números em Coexistence, com app WhatsApp Business e API oficial no mesmo número, não recebem chamadas, grupos, listas de transmissão, mensagens temporárias, visualização única nem localização em tempo real. É uma regra da plataforma.
 - Mensagens de tipos que esta versão ainda não reconhece, como uma enquete, aparecem na conversa como um aviso de que algo foi enviado, sem o conteúdo.
+- Sessões conectadas por proxy não carregam a voz das chamadas. O áudio vai por UDP direto aos servidores do WhatsApp, e nenhum proxy http ou socks5 carrega esse tráfego: a chamada sairia pelo endereço do próprio conector, que o proxy existe para esconder.
+- Chamadas feitas pelo atendente tocam só no celular do contato, sem tocar no WhatsApp Desktop nem no WhatsApp Web dele. É uma escolha deliberada: com o Desktop ou o Web aberto, o áudio do celular não chegava ao conector.
+- Outro aparelho vinculado à mesma conta que recusa chamadas sozinho, como outra integração com recusa automática, encerra a chamada para todos antes que alguém atenda.
+- Mensagens de voz em formatos diferentes de opus em Ogg, como um MP3 ou o áudio gravado pelo Safari, são enviadas como arquivos de áudio comuns, sem o balão de mensagem de voz. O conector não converte formatos.
 - Veja os detalhes em [docs/limitations.md](docs/limitations.md). As limitações abertas e os próximos recursos estão nas [issues do repositório](https://github.com/fazer-ai/whatsapp-connector/issues) e em [docs/roadmap.md](docs/roadmap.md).
 
 ## Documentação
