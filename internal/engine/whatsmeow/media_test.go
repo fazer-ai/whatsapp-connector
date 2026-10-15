@@ -880,8 +880,9 @@ func TestAMessageThisBuildRefusesIsNeverDownloadedFirst(t *testing.T) {
 	session, downloads := mediaSession(t, media.Options{})
 	downloads.answer([]byte("bytes"), nil)
 
-	// Somebody the contract has no way to name, which inboundOf refuses on the envelope
-	// alone -- before anything asks what the message says.
+	// Somebody the contract has no way to name, which is refused on the envelope alone --
+	// before anything asks what the message says -- and dropped, since no redelivery
+	// changes the answer (#403).
 	event := imageEvent("3EB0NAMELESS")
 	event.Info.Sender = waTypes.NewJID("someone", "unknown.server")
 	event.Info.SenderAlt = waTypes.EmptyJID
@@ -891,8 +892,8 @@ func TestAMessageThisBuildRefusesIsNeverDownloadedFirst(t *testing.T) {
 
 	select {
 	case got := <-acknowledged:
-		if got {
-			t.Fatal("a message nothing published was acknowledged")
+		if !got {
+			t.Fatal("a message no redelivery will let this build publish was withheld")
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("the handler never came back")

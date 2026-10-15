@@ -136,9 +136,7 @@ func (m missingFile) said() bool { return m.reason != "" }
 type renderBody func(*waEvents.Message) (body, bool)
 
 // inboundOf renders an inbound message the way the contract carries it, and reports
-// whether this build can carry it at all. A false is not an error: it is this
-// milestone saying the message is somebody else's to deliver, which upstream turns
-// into a withheld acknowledgement, so WhatsApp keeps it and sends it again.
+// whether this build can carry it at all.
 //
 // The second return is the failure to announce once the message itself is out, zero for
 // a message with nothing missing.
@@ -147,17 +145,28 @@ func (s *Session) inboundOf(event *waEvents.Message, render renderBody) (protoco
 	if !ok {
 		return protocol.InboundMessage{}, missingFile{}, false
 	}
+	missing, ok := withBody(&message, event, render)
+	if !ok {
+		return protocol.InboundMessage{}, missingFile{}, false
+	}
+	return message, missing, true
+}
+
+// withBody fills an envelope in with what the message says. A false is the renderer
+// saying the body may render next time, which a live message answers by withholding its
+// acknowledgement so WhatsApp sends it again.
+func withBody(message *protocol.InboundMessage, event *waEvents.Message, render renderBody) (missingFile, bool) {
 	// Asked for last, once every question about the envelope has been answered.
 	said, ok := render(event)
 	if !ok {
-		return protocol.InboundMessage{}, missingFile{}, false
+		return missingFile{}, false
 	}
 
 	message.Content = said.content
 	message.QuotedID = said.context.GetStanzaID()
 	message.Mentions = mentionsOf(said.context)
 	message.Ephemeral = said.context.GetExpiration()
-	return message, said.missing, true
+	return said.missing, true
 }
 
 // envelopeOf is everything about an inbound message except what was said in it, which is
@@ -291,10 +300,8 @@ func (s *Session) bodyOf(ctx context.Context) renderBody {
 
 // unreadableBody is the placeholder for a message this build cannot render.
 //
-// It is what closes the last of the redelivery loops. Refusing the acknowledgement is
-// the right answer for an envelope that cannot be addressed, because a later build with
-// the same message can still publish it -- but for a body with no arm it buys nothing: a
-// poll is a poll on every redelivery, and the agent sees neither the message nor the
+// It is what closes the last of the redelivery loops. Refusing the acknowledgement buys
+// nothing for a body with no arm: a poll is a poll on every redelivery, and the agent sees neither the message nor the
 // reason nothing arrived. A bubble they cannot read still says somebody sent something,
 // which is enough to ask.
 //
@@ -591,10 +598,19 @@ func (s *Session) receive(event *waEvents.Message) bool {
 		return false
 	}
 
-	message, missing, ok := s.inboundOf(event, s.bodyOf(s.ctx))
+	message, addressed := s.envelopeOf(&event.Info)
+	if !addressed {
+		// A chat or a sender on a server the contract does not name, or a stanza with no id
+		// to publish it under. The answer comes from the stanza and this build alone, so a
+		// redelivery brings back the same refusal, and withholding the acknowledgement only
+		// had WhatsApp drop the socket over it every fifty minutes (#403). Warned rather
+		// than kept quiet: it is a message nobody will see, and the operator should know.
+		s.log.Warn().Str("message_id", event.Info.ID).
+			Msg("dropping an inbound message this build cannot address")
+		return true
+	}
+	missing, ok := withBody(&message, event, s.bodyOf(s.ctx))
 	if !ok {
-		s.log.Debug().Str("message_id", event.Info.ID).
-			Msg("refusing to acknowledge an inbound message this build cannot publish")
 		return false
 	}
 	if !s.deliver(protocol.EventMessageReceived, map[string]any{"message": message}, learned, on) {

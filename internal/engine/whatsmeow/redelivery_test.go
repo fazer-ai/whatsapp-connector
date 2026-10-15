@@ -213,16 +213,19 @@ func TestAWithheldAcknowledgementANewConnectionAlreadyAnsweredIsLeftAlone(t *tes
 	}
 }
 
-// Withheld for a reason that is not the stream -- something this build cannot publish at
-// all -- is a message a reconnect would only bring back to be withheld again.
+// Withheld for a reason that is not the stream -- a file that may download next time --
+// is a message a reconnect would only bring back to be withheld again.
 func TestAnAcknowledgementWithheldForAnythingButThePublishTakesNothingDown(t *testing.T) {
 	t.Parallel()
 
-	session, _ := redeliveringSession(t)
-	unpublishable := textMessage("", "sem id")
+	session, downloads := mediaSession(t, media.Options{})
+	session.redeliveryProbe = 5 * time.Millisecond
+	newSocket(session)
+	dialedAndConnected(session)
+	downloads.answer(nil, errors.New("dial tcp: connection refused"))
 	session.deliverWait = 50 * time.Millisecond
-	if session.receive(unpublishable) {
-		t.Fatal("the test needs a message this build cannot publish, and this one was acknowledged")
+	if session.receive(imageEvent("3EB0LATER")) {
+		t.Fatal("the test needs a message withheld for something else than its publish, and this one was acknowledged")
 	}
 	quiet(t, session, "a message withheld for a reason the stream has nothing to do with started a takedown")
 }
