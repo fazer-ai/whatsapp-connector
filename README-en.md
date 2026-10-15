@@ -64,7 +64,8 @@ A WhatsApp session keeps a socket open for long periods and handles its own reco
 ### Contacts and calls
 
 - Check whether a number is on WhatsApp and retrieve a contact's profile and photo.
-- Incoming calls appear in the inbox, with optional automatic rejection.
+- Agents answer incoming calls and call contacts with audio through their browser, using the same Chatwoot flow as the official WhatsApp API: a ringing call card and a call record in the conversation. Calls are voice-only and 1:1, with no video or group calls. Enable them per inbox after preparing the installation as described in [Voice calls](#voice-calls).
+- With calls enabled for an inbox and “Allow incoming calls” off, Chatwoot does not ring, the paired phone keeps ringing, and an activity entry records the call in the conversation. Optional automatic rejection remains available for those who do not want incoming calls.
 
 ## Built to keep messages from getting lost
 
@@ -128,7 +129,7 @@ Set this variable in Chatwoot:
 WHATSAPP_CONNECTOR_EMBEDDED=false
 ```
 
-Use the public `ghcr.io/fazer-ai/whatsapp-connector:latest` image. Release tags such as `0.5.1` and `0.5` are also available. To pin a version, use its corresponding tag.
+Use the public `ghcr.io/fazer-ai/whatsapp-connector:latest` image. Release tags such as `0.8.5` and `0.8` are also available. To pin a version, use its corresponding tag.
 
 For the connector, set at least these variables to match your installation:
 
@@ -147,6 +148,17 @@ WAC_MEDIA_TOKEN=a-long-random-token
 - Use a dedicated PostgreSQL database for the connector when running multiple instances, or SQLite for a single instance. The example compose file uses SQLite on a volume.
 - Use persistent storage for the database and `WAC_MEDIA_ROOT`.
 - The full variable table is in [docs/operations.md](docs/operations.md).
+
+### Voice calls
+
+Call audio passes through one UDP port on the connector, and agents' browsers send audio directly to it. Each active call uses about a tenth of a CPU core on the connector.
+
+- Use Chatwoot fazer.ai `v4.18.0-fazer-ai.130` or later, or `v4.18.0-fazer-ai-pro.149` or later for Pro, with the voice feature enabled for the installation.
+- In the example compose files, uncomment the two call settings. `WAC_CALLS_UDP_PORT` sets the port, which is `40000` in the examples, already published as `40000:40000/udp` on the Sidekiq container in embedded mode and on the connector service in separate mode. Leaving this variable unset keeps calls off and changes nothing else.
+- Allow that UDP port through the server's firewall and set `WAC_CALLS_PUBLIC_IP` in `.env` to the IP address browsers use to reach the server. This variable is required inside a container because the connector only knows its internal container address. The examples refuse to start with calls enabled and this variable empty.
+- Open the **Calls** tab in each Chatwoot inbox's settings and turn on **Enable WhatsApp Calling** and **Allow incoming calls** to place and receive browser calls. The tab only offers the switch when the connector reports that it can carry call audio.
+
+See [docs/deployment.md](docs/deployment.md#whatsapp-calls) for configuration details.
 
 ### Update an installation with a separate connector
 
@@ -183,6 +195,10 @@ To install through Coolify, follow the [Chatwoot fazer.ai deployment guide](http
 - Automatic call rejection does not stop ringing for someone calling through WhatsApp Web. The caller's browser keeps ringing.
 - Numbers using Coexistence, with the WhatsApp Business app and official API on the same number, do not receive calls, groups, broadcast lists, disappearing messages, view-once media, or live locations. This is a platform restriction.
 - Message types this version does not yet recognize, such as polls, appear in the conversation as a notice that something was sent, without the content.
+- Sessions connected through a proxy cannot carry call audio. Audio goes directly to WhatsApp's servers over UDP, which no HTTP or SOCKS5 proxy here carries, so a call would expose the connector's own address that the proxy is meant to hide.
+- Calls placed by an agent ring only the contact's phone, leaving their WhatsApp Desktop and WhatsApp Web clients silent. This is deliberate: when Desktop or Web was open, audio from the phone did not reach the connector.
+- Another device linked to the same account that rejects calls automatically, such as another integration with automatic rejection enabled, ends the call for everyone before anyone can answer.
+- Voice notes in formats other than opus in Ogg, such as an MP3 or audio recorded in Safari, are sent as ordinary audio files without the voice message bubble. The connector does not convert formats.
 - See [docs/limitations.md](docs/limitations.md) for details. Unresolved limitations and upcoming features are tracked in the [repository's issues](https://github.com/fazer-ai/whatsapp-connector/issues) and [docs/roadmap.md](docs/roadmap.md).
 
 ## Documentation
