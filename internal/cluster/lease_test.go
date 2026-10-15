@@ -292,7 +292,13 @@ func TestRenewManyRenewsEverySessionInOneRoundTrip(t *testing.T) {
 		}
 	}
 
-	// Counted from here, so the acquisitions above are not part of the measurement.
+	// Counted from here, so the acquisitions above are not part of the measurement. The
+	// client keeps pipelines on a pool of their own, and the connection it dials for the
+	// first one runs its handshake through the hooks: dialled here, so the count is the
+	// renewal's and not the connection's.
+	if _, err := rdb.Pipelined(ctx, func(pipe redis.Pipeliner) error { return pipe.Ping(ctx).Err() }); err != nil {
+		t.Fatalf("warming the pipeline connection: %v", err)
+	}
 	var trips roundTrips
 	rdb.AddHook(&trips)
 
