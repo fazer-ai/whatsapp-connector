@@ -39,9 +39,12 @@ const (
 	// build. Acknowledged rather than refused, because withholding would leave WhatsApp
 	// redelivering it for as long as the session is up.
 	dropChange
-	// withholdChange is one this build cannot publish and a later one could. The
-	// acknowledgement is withheld so the account keeps it, which is the same trade the
-	// message path makes.
+	// withholdChange is one this session cannot publish yet and the same stanza
+	// redelivered could: the keys to open it were out of reach for a moment. Nothing that
+	// only a later build could publish is kept this way, because WhatsApp does not wait
+	// for one -- fifty minutes after delivering a message nobody acknowledged it closes
+	// the stream with an `ack` error naming it, and every redelivery starts that clock
+	// again (#402).
 	withholdChange
 )
 
@@ -115,7 +118,7 @@ func (s *Session) unsealedCorrection(event *waEvents.Message, sealed *waE2E.Secr
 	}
 	chat, sender, addressed := s.whereAndWho(event)
 	if !addressed {
-		return withholding("withholding an acknowledgement for a sealed correction this build cannot address")
+		return dropping("dropping a sealed correction this build cannot address")
 	}
 
 	open := s.unseal
@@ -137,16 +140,12 @@ func (s *Session) unsealedCorrection(event *waEvents.Message, sealed *waE2E.Secr
 	}
 
 	corrected, at := theSealedBody(plain, event)
-	content, renderable := correctedContent(corrected)
-	if !renderable {
-		return withholding("withholding an acknowledgement for a sealed correction whose new body this build cannot render")
-	}
 	return publishing(protocol.EventMessageEdited, protocol.MessageEdited{
 		Chat:      chat,
 		Sender:    sender,
 		MessageID: target,
 		FromMe:    event.Info.IsFromMe,
-		Content:   content,
+		Content:   correctedContent(corrected),
 		Timestamp: at,
 	})
 }
@@ -230,10 +229,9 @@ func (s *Session) changeOf(event *waEvents.Message) change {
 		return dropping("dropping a protocol message that is the account's own plumbing")
 
 	case event.Info.Edit != waTypes.EditAttributeEmpty:
-		// WhatsApp added something. Loud rather than silent, and kept on the phone: a
-		// build that learns what it is can still publish it, and guessing from the body
-		// would file it as whichever of the three it happens to look like.
-		return withholding("withholding an acknowledgement for a way of changing a message this build does not know")
+		// WhatsApp added something. Logged and acknowledged rather than guessed at from
+		// the body, which would file it as whichever of the three it happens to look like.
+		return dropping("dropping a way of changing a message this build does not know")
 	}
 	return change{verdict: notAChange}
 }
@@ -428,7 +426,7 @@ func (s *Session) reactionOf(event *waEvents.Message, reaction *waE2E.ReactionMe
 	}
 	chat, sender, addressed := s.whereAndWho(event)
 	if !addressed {
-		return withholding("withholding an acknowledgement for a reaction this build cannot address")
+		return dropping("dropping a reaction this build cannot address")
 	}
 	return publishing(protocol.EventMessageReaction, protocol.MessageReaction{
 		ID:        event.Info.ID,
@@ -449,20 +447,14 @@ func (s *Session) editOf(event *waEvents.Message) change {
 	}
 	chat, sender, addressed := s.whereAndWho(event)
 	if !addressed {
-		return withholding("withholding an acknowledgement for an edit this build cannot address")
-	}
-	content, renderable := correctedContent(corrected)
-	if !renderable {
-		// A body this build has no arm for. Kept on the phone rather than published
-		// empty, which would blank the bubble it was meant to correct.
-		return withholding("withholding an acknowledgement for an edit whose new body this build cannot render")
+		return dropping("dropping an edit this build cannot address")
 	}
 	return publishing(protocol.EventMessageEdited, protocol.MessageEdited{
 		Chat:      chat,
 		Sender:    sender,
 		MessageID: target,
 		FromMe:    event.Info.IsFromMe,
-		Content:   content,
+		Content:   correctedContent(corrected),
 		Timestamp: at,
 	})
 }
@@ -544,9 +536,13 @@ func theResentCorrection(event *waEvents.Message) *waE2E.ProtocolMessage {
 // rewritten and nothing else. The bytes are the ones the client already holds a
 // reference to, so fetching them again would mint a second blob for the same file and
 // charge the account's bandwidth for a caption.
-func correctedContent(corrected *waE2E.Message) (any, bool) {
+//
+// A body with no arm here is the unsupported placeholder, as it is on the message path,
+// and not a withheld acknowledgement (#402): the client learns the message was corrected
+// into something this build cannot show and keeps the bubble it has.
+func correctedContent(corrected *waE2E.Message) any {
 	if corrected == nil {
-		return nil, false
+		return protocol.Unsupported(protocol.UnsupportedEmpty)
 	}
 	// A document that gains a caption is sent in its own envelope, and inside an edit
 	// whatsmeow unwraps the edit and not that envelope: this connector sends one for a
@@ -555,20 +551,20 @@ func correctedContent(corrected *waE2E.Message) (any, bool) {
 		corrected = inner
 	}
 	if text, _, ok := textOf(corrected); ok {
-		return protocol.Text(text), true
+		return protocol.Text(text)
 	}
 	if part, ok := attachmentOf(corrected); ok {
 		// No Ref, on purpose: see protocol.MessageEdited.
-		return part.content, true
+		return part.content
 	}
-	return nil, false
+	return protocol.Unsupported(protocol.UnsupportedUnknownType)
 }
 
 // revokeOf renders `message.revoked`.
 func (s *Session) revokeOf(event *waEvents.Message) change {
 	chat, sender, addressed := s.whereAndWho(event)
 	if !addressed {
-		return withholding("withholding an acknowledgement for a deletion this build cannot address")
+		return dropping("dropping a deletion this build cannot address")
 	}
 	target := event.Message.GetProtocolMessage().GetKey().GetID()
 	if target == "" && chat.Kind == protocol.AddressNewsletter {
