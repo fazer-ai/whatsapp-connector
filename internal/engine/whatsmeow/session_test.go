@@ -806,16 +806,17 @@ func TestAPairingSessionReportsConnecting(t *testing.T) {
 	}
 }
 
-// An acknowledged message nobody published is a message that is gone. Until M2 can put
-// one on the stream, refusing the ack is what leaves it on the phone, which is the
-// invariant: losing an event costs a redelivery, never a message.
+// An acknowledged message nobody published is a message that is gone. Refusing the ack
+// when the publish fails is what leaves it on the phone, which is the invariant: losing
+// an event costs a redelivery, never a message.
 func TestAnEventThisSessionPublishedNothingForIsNotAcknowledged(t *testing.T) {
 	t.Parallel()
 	session, _ := newTestSession(t, "5511999990001")
 
-	// A message with no chat, no id and no content: the shape whatsmeow delivers when a
-	// node arrives without anything this session can address or render.
-	if session.handle(&waEvents.Message{}) {
+	acknowledged := make(chan bool, 1)
+	go func() { acknowledged <- session.handle(textMessage("3EB0LOST", "bom dia")) }()
+	next(t, session).Settle(errors.New("redis is gone"))
+	if <-acknowledged {
 		t.Fatal("the session let WhatsApp mark a message it published nothing for delivered")
 	}
 
