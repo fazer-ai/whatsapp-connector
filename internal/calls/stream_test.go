@@ -75,9 +75,9 @@ func (m *streamServer) next(t *testing.T) map[string]any {
 }
 
 // dialed is a stream to m, with every end it reports.
-func dialed(t *testing.T, m *streamServer) (*Stream, chan StreamEnd) {
+func dialed(t *testing.T, m *streamServer) (s *Stream, end chan StreamEnd) {
 	t.Helper()
-	end := make(chan StreamEnd, 4)
+	end = make(chan StreamEnd, 4)
 	s, err := DialStream(context.Background(), StreamTarget{URL: m.url}, StreamStart{CallID: "c1", Direction: "inbound", Peer: "5511988887777"},
 		func(e StreamEnd) { end <- e }, zerolog.Nop())
 	if err != nil {
