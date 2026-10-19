@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -103,9 +102,6 @@ type Stream struct {
 //
 //nolint:gocritic // zerolog.Logger is designed to be copied; every With() returns one by value
 func DialStream(ctx context.Context, target StreamTarget, start StreamStart, log zerolog.Logger) (*Stream, error) {
-	if target.URL == "" {
-		return nil, errors.New("calls: a media stream needs a url")
-	}
 	dialCtx, cancelDial := context.WithTimeout(ctx, streamDialTimeout)
 	defer cancelDial()
 	conn, _, err := websocket.Dial(dialCtx, target.URL, nil) //nolint:bodyclose // the response body is the library's
