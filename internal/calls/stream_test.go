@@ -287,6 +287,65 @@ func TestClosingAStreamSendsStop(t *testing.T) {
 	}
 }
 
+// Closing does not wait on a server that stopped answering: a call is ended from paths a
+// session's shutdown waits on. Nothing more goes out once it returned.
+func TestClosingAStreamDoesNotWaitOnAMuteServer(t *testing.T) {
+	t.Parallel()
+	hold := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		<-hold
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(hold) })
+	s, err := DialStream(context.Background(), StreamTarget{URL: "ws" + strings.TrimPrefix(srv.URL, "http")}, StreamStart{Direction: "inbound"}, nil, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Enough to fill the socket's buffers on both ends, so the next write blocks the way
+	// it does on a server that stopped reading.
+	big := &streamFrame{Event: "media", Payload: strings.Repeat("A", 1<<20)}
+	for range streamOutQueue {
+		s.send(big)
+	}
+	waitBlocked(t, s)
+	began := time.Now()
+	_ = s.Close()
+	if took := time.Since(began); took > 100*time.Millisecond {
+		t.Fatalf("Close took %v on a server that does not answer", took)
+	}
+	queued := len(s.out)
+	s.send(&streamFrame{Event: "media"})
+	if n := len(s.out); n > queued {
+		t.Fatalf("a frame was queued after Close: %d, was %d", n, queued)
+	}
+}
+
+// waitBlocked waits for the writer to stop draining the queue: the socket took all it
+// will.
+func waitBlocked(t *testing.T, s *Stream) {
+	t.Helper()
+	deadline := time.Now().Add(testwait.Budget)
+	last, still := -1, 0
+	for still < 20 {
+		if time.Now().After(deadline) {
+			t.Fatal("the socket kept taking writes")
+		}
+		n := len(s.out)
+		if n == last && n > 0 {
+			still++
+		} else {
+			still = 0
+		}
+		last = n
+		time.Sleep(testwait.Poll)
+	}
+}
+
 // A stream without a url, or whose server is not there, is not dialled.
 func TestAStreamThatCannotBeDialled(t *testing.T) {
 	t.Parallel()

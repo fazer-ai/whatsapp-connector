@@ -221,6 +221,9 @@ func (s *Stream) write() {
 // send queues one frame for the media server, dropping it when the socket is behind:
 // audio that arrives late is worse than audio that does not.
 func (s *Stream) send(frame *streamFrame) {
+	if s.closing.Load() {
+		return
+	}
 	body, err := json.Marshal(frame)
 	if err != nil {
 		return
@@ -271,19 +274,24 @@ func (s *Stream) clock() {
 	}
 }
 
-// Close tells the media server the call is over and closes the socket. Safe to call more
-// than once, and after the server ended the stream.
+// Close tells the media server the call is over and closes the socket. It returns at
+// once: nothing more is sent from here on, and the `stop` and the closing handshake run on
+// their own goroutine, since a server that stopped reading would hold them for seconds and
+// the call is ended from paths that a session's shutdown waits on. Safe to call more than
+// once, and after the server ended the stream.
 func (s *Stream) Close() error {
 	s.closeOnce.Do(func() {
 		s.closing.Store(true)
-		// `stop` before the cancel: a context cancelled under a read or a write closes
-		// the connection, and the frame would never go out.
-		body, _ := json.Marshal(streamFrame{Event: "stop"})
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-		_ = s.conn.Write(ctx, websocket.MessageText, body)
-		cancel()
-		s.cancel()
-		_ = s.conn.Close(websocket.StatusNormalClosure, "call ended")
+		go func() {
+			// `stop` before the cancel: a context cancelled under a read or a write
+			// closes the connection, and the frame would never go out.
+			body, _ := json.Marshal(streamFrame{Event: "stop"})
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			_ = s.conn.Write(ctx, websocket.MessageText, body)
+			cancel()
+			s.cancel()
+			_ = s.conn.Close(websocket.StatusNormalClosure, "call ended")
+		}()
 	})
 	return nil
 }
