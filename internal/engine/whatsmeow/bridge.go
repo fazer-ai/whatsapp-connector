@@ -43,6 +43,13 @@ type liveCall struct {
 	// leg is the browser's half. Nil for a received call until the offer is built, and
 	// for one whose offer could not be built at all, which is then never accepted.
 	leg *calls.Leg
+	// stream is the half a media server carries in the browser's place, for a received
+	// call the client accepted with one. The leg is closed once it is set.
+	stream *calls.Stream
+	// endReason, when set, is the reason the end of this call is published with: the
+	// connector hung it up because its stream ended, and meowcaller's own reason for a
+	// local hangup would not say why.
+	endReason string
 	// outbound is a call the client placed; its answer waits for the callee.
 	outbound bool
 	accepted bool
@@ -51,6 +58,9 @@ type liveCall struct {
 	accepting bool
 	// creator is who rang a received call, which is what a rejection is addressed to.
 	creator waTypes.JID
+	// peer is who rang it as the `call.offer` named them, the number when it is known:
+	// what a media stream is told it is talking to.
+	peer string
 	// answered is closed once `call.answered` for a placed call has been queued, or
 	// given up on. Nil until the callee picks up. The call's end waits for it, so the
 	// client never reads the end of a call before its answer.
@@ -104,9 +114,19 @@ type callAnswered struct {
 }
 
 type acceptRequest struct {
-	CallID string `json:"call_id"`
-	SDP    string `json:"sdp"`
+	CallID string              `json:"call_id"`
+	SDP    string              `json:"sdp"`
+	Stream *calls.StreamTarget `json:"stream"`
 }
+
+// The reasons the end of a call carries when the connector hung it up because of its
+// media stream.
+const (
+	// reasonStreamHangup is the media server hanging up.
+	reasonStreamHangup = "stream_hangup"
+	// reasonStreamLost is the media server's socket closing or breaking without a hangup.
+	reasonStreamLost = "stream_lost"
+)
 
 type startRequest struct {
 	To  *protocol.Address `json:"to"`
@@ -233,11 +253,15 @@ func (s *Session) register(id string, live *liveCall, retired *atomic.Bool) bool
 // returns the SDP the `call.offer` carries. Empty when there is no such call or the leg
 // could not be built: the offer is then published without one, and the call is left to
 // ring, which is what a client that cannot answer it sees anyway.
-func (s *Session) offerToBrowser(callID string, creator waTypes.JID) string {
+func (s *Session) offerToBrowser(callID string, creator waTypes.JID, from protocol.Party) string {
 	s.bridge.mu.Lock()
 	live := s.bridge.live[callID]
 	if live != nil {
 		live.creator = creator
+		live.peer = from.Phone
+		if live.peer == "" {
+			live.peer = from.LID
+		}
 	}
 	s.bridge.mu.Unlock()
 	if live == nil || live.outbound {
@@ -288,9 +312,20 @@ func (s *Session) callFinished(callID, reason string) {
 	first, answered := s.claimEndLocked(callID)
 	delete(s.bridge.live, callID)
 	s.bridge.ended.add(callID)
+	var leg *calls.Leg
+	var stream *calls.Stream
+	if live != nil {
+		leg, stream = live.leg, live.stream
+		if live.endReason != "" {
+			reason = live.endReason
+		}
+	}
 	s.bridge.mu.Unlock()
-	if live != nil && live.leg != nil {
-		_ = live.leg.Close()
+	if leg != nil {
+		_ = leg.Close()
+	}
+	if stream != nil {
+		_ = stream.Close()
 	}
 	if !first {
 		return
@@ -355,10 +390,12 @@ func (s *Session) acceptCall(ctx context.Context, command *protocol.Command) (js
 		return nil, engine.ErrNotSupported
 	}
 	var req acceptRequest
-	if err := json.Unmarshal(command.Payload, &req); err != nil || req.CallID == "" || req.SDP == "" {
+	if err := json.Unmarshal(command.Payload, &req); err != nil || req.CallID == "" ||
+		(req.Stream == nil && req.SDP == "") || (req.Stream != nil && req.Stream.URL == "") {
 		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
-			"a call accept has to name the call and carry the browser's answer")
+			"a call accept has to name the call and carry the browser's answer or a media stream")
 	}
+	onStream := req.Stream != nil
 	s.bridge.mu.Lock()
 	live := s.bridge.live[req.CallID]
 	_, wasEnded := s.bridge.ended.seen[req.CallID]
@@ -367,7 +404,7 @@ func (s *Session) acceptCall(ctx context.Context, command *protocol.Command) (js
 	var accepted, outbound, hasLeg bool
 	if live != nil {
 		accepted, outbound, hasLeg = live.accepted || live.accepting, live.outbound, live.leg != nil
-		if !accepted && !outbound && hasLeg {
+		if !accepted && !outbound && (hasLeg || onStream) {
 			live.accepting = true
 		}
 	}
@@ -383,11 +420,23 @@ func (s *Session) acceptCall(ctx context.Context, command *protocol.Command) (js
 	case outbound:
 		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
 			"a call the client placed is answered by the callee, not accepted")
-	case !hasLeg:
+	case !hasLeg && !onStream:
 		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
 			"this call was offered without sdp, so there is no offer to answer")
 	}
-	if err := live.leg.Accept(req.SDP); err != nil {
+	if onStream {
+		ringing, err := s.streamCall(ctx, live, req.CallID, *req.Stream)
+		if err != nil {
+			s.bridge.mu.Lock()
+			live.accepting = false
+			s.bridge.mu.Unlock()
+			return nil, err
+		}
+		if !ringing {
+			// Ended while the stream was dialled: late, like an accept of a call that is over.
+			return nil, nil
+		}
+	} else if err := live.leg.Accept(req.SDP); err != nil {
 		s.bridge.mu.Lock()
 		live.accepting = false
 		s.bridge.mu.Unlock()
@@ -406,6 +455,15 @@ func (s *Session) acceptCall(ctx context.Context, command *protocol.Command) (js
 		if ctx.Err() != nil {
 			return nil, fmt.Errorf("accept call %s: %w", req.CallID, ctx.Err())
 		}
+		if onStream {
+			// Nothing will be played to the media server, which would otherwise wait on
+			// a call that was never answered; a retry dials it again.
+			s.bridge.mu.Lock()
+			stream := live.stream
+			live.stream, live.accepting = nil, false
+			s.bridge.mu.Unlock()
+			_ = stream.Close()
+		}
 		return nil, protocol.NewError(protocol.ErrorWaError, "WhatsApp did not take the answer to the call")
 	}
 	return nil, nil
@@ -415,10 +473,76 @@ func (s *Session) acceptCall(ctx context.Context, command *protocol.Command) (js
 func (s *Session) wire(live *liveCall) {
 	s.bridge.mu.Lock()
 	live.accepted = true
+	stream := live.stream
 	s.bridge.mu.Unlock()
+	if stream != nil {
+		live.call.Receive(stream.Sink())
+		live.call.Play(stream.Source())
+		stream.Start(live.call.ID())
+		return
+	}
 	live.call.Receive(live.leg.Sink())
 	live.call.Play(live.leg.Source())
 	live.leg.Start()
+}
+
+// streamCall dials the media server a received call is accepted with and puts it in the
+// browser's place, closing the leg built for the browser's offer. It reports false, with
+// the stream closed, for a call that ended while the stream was dialled.
+func (s *Session) streamCall(ctx context.Context, live *liveCall, callID string, target calls.StreamTarget) (bool, error) {
+	s.bridge.mu.Lock()
+	peer := live.peer
+	s.bridge.mu.Unlock()
+	log := s.log.With().Str("call_id", callID).Logger()
+	stream, err := calls.DialStream(ctx, target, calls.StreamStart{CallID: callID, Direction: "inbound", Peer: peer}, log)
+	if err != nil {
+		log.Warn().Err(err).Msg("could not reach the media stream of a call; leaving it ringing")
+		return false, protocol.NewError(protocol.ErrorInvalidPayload, "the connector could not reach that media stream")
+	}
+	stream.OnEnd(func(end calls.StreamEnd) { s.streamEnded(callID, end) })
+	s.bridge.mu.Lock()
+	if s.bridge.live[callID] != live {
+		s.bridge.mu.Unlock()
+		_ = stream.Close()
+		return false, nil
+	}
+	leg := live.leg
+	live.leg, live.stream = nil, stream
+	s.bridge.mu.Unlock()
+	if leg != nil {
+		_ = leg.Close()
+	}
+	return true, nil
+}
+
+// streamEnded hangs up a call whose media server hung up or went away: nobody is on the
+// connector's side of it any more, and a call left up would keep the person talking to
+// silence.
+func (s *Session) streamEnded(callID string, end calls.StreamEnd) {
+	reason := reasonStreamLost
+	if end.Hangup {
+		reason = reasonStreamHangup
+	}
+	s.bridge.mu.Lock()
+	live := s.bridge.live[callID]
+	var stream *calls.Stream
+	if live != nil {
+		live.endReason = reason
+		stream = live.stream
+	}
+	s.bridge.mu.Unlock()
+	if live == nil {
+		return
+	}
+	s.log.Info().Str("call_id", callID).Str("reason", reason).Str("by", end.By).Str("stream_reason", end.Reason).
+		Msg("the media stream of a call ended; hanging up")
+	if stream != nil {
+		_ = stream.Close()
+	}
+	if err := live.call.Hangup(); err != nil {
+		s.log.Warn().Err(err).Str("call_id", callID).Msg("could not hang up a call whose media stream ended")
+		s.rememberUnended(callID, live.call)
+	}
 }
 
 // startCall carries out `call.start`. The callee is rung before this returns, so its
@@ -732,13 +856,14 @@ func (s *Session) backOnline() {
 // it writes the terminate, so the voice stops here whether or not the write lands.
 func (s *Session) endCalls(ctx context.Context) {
 	type carried struct {
-		call bridgedCall
-		leg  *calls.Leg
+		call   bridgedCall
+		leg    *calls.Leg
+		stream *calls.Stream
 	}
 	s.bridge.mu.Lock()
 	live := make([]carried, 0, len(s.bridge.live))
 	for _, call := range s.bridge.live {
-		live = append(live, carried{call.call, call.leg})
+		live = append(live, carried{call.call, call.leg, call.stream})
 	}
 	s.bridge.mu.Unlock()
 	if len(live) == 0 {
@@ -758,6 +883,9 @@ func (s *Session) endCalls(ctx context.Context) {
 	for _, call := range live {
 		if call.leg != nil {
 			_ = call.leg.Close()
+		}
+		if call.stream != nil {
+			_ = call.stream.Close()
 		}
 	}
 }
