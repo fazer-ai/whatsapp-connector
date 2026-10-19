@@ -74,14 +74,17 @@ func (m *streamServer) next(t *testing.T) map[string]any {
 	}
 }
 
-func dialed(t *testing.T, m *streamServer) *Stream {
+// dialed is a stream to m, with every end it reports.
+func dialed(t *testing.T, m *streamServer) (*Stream, chan StreamEnd) {
 	t.Helper()
-	s, err := DialStream(context.Background(), StreamTarget{URL: m.url}, StreamStart{CallID: "c1", Direction: "inbound", Peer: "5511988887777"}, zerolog.Nop())
+	end := make(chan StreamEnd, 4)
+	s, err := DialStream(context.Background(), StreamTarget{URL: m.url}, StreamStart{CallID: "c1", Direction: "inbound", Peer: "5511988887777"},
+		func(e StreamEnd) { end <- e }, zerolog.Nop())
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
-	return s
+	return s, end
 }
 
 func pcmFrame(samples int, first int16) string {
@@ -107,13 +110,6 @@ func waitQueued(t *testing.T, s *Stream, want int) {
 	}
 }
 
-func ends(t *testing.T, s *Stream) chan StreamEnd {
-	t.Helper()
-	ch := make(chan StreamEnd, 4)
-	s.OnEnd(func(end StreamEnd) { ch <- end })
-	return ch
-}
-
 func endOf(t *testing.T, ch chan StreamEnd) StreamEnd {
 	t.Helper()
 	select {
@@ -130,7 +126,7 @@ func endOf(t *testing.T, ch chan StreamEnd) StreamEnd {
 func TestAStreamAnnouncesTheCallAndCarriesThePersonsVoice(t *testing.T) {
 	t.Parallel()
 	m := newStreamServer(t)
-	s := dialed(t, m)
+	s, _ := dialed(t, m)
 
 	start := m.next(t)
 	format, _ := start["format"].(map[string]any)
@@ -181,8 +177,7 @@ func TestAStreamAnnouncesTheCallAndCarriesThePersonsVoice(t *testing.T) {
 func TestAStreamPlaysWhatTheServerSaysUntilItClears(t *testing.T) {
 	t.Parallel()
 	m := newStreamServer(t)
-	s := dialed(t, m)
-	end := ends(t, s)
+	s, end := dialed(t, m)
 
 	m.send <- pcmFrame(frameSamples*3/2, 16384)
 	waitQueued(t, s, frameSamples*3/2)
@@ -213,7 +208,7 @@ func TestAStreamPlaysWhatTheServerSaysUntilItClears(t *testing.T) {
 func TestAStreamBoundsWhatWaitsToBePlayed(t *testing.T) {
 	t.Parallel()
 	m := newStreamServer(t)
-	s := dialed(t, m)
+	s, _ := dialed(t, m)
 
 	s.mu.Lock()
 	s.toWA = make([]int16, maxStreamToWhatsApp)
@@ -241,8 +236,7 @@ func TestAStreamBoundsWhatWaitsToBePlayed(t *testing.T) {
 func TestAHangupEndsTheStreamOnce(t *testing.T) {
 	t.Parallel()
 	m := newStreamServer(t)
-	s := dialed(t, m)
-	end := ends(t, s)
+	s, end := dialed(t, m)
 
 	m.send <- `{"event":"hangup","by":"agent","reason":"farewell","x_future":{"a":1}}`
 	m.send <- `{"event":"hangup","by":"agent","reason":"again"}`
@@ -261,8 +255,7 @@ func TestAHangupEndsTheStreamOnce(t *testing.T) {
 func TestASocketThatDropsEndsTheStream(t *testing.T) {
 	t.Parallel()
 	m := newStreamServer(t)
-	s := dialed(t, m)
-	end := ends(t, s)
+	_, end := dialed(t, m)
 
 	m.next(t)
 	close(m.drop)
@@ -275,8 +268,7 @@ func TestASocketThatDropsEndsTheStream(t *testing.T) {
 func TestClosingAStreamSendsStop(t *testing.T) {
 	t.Parallel()
 	m := newStreamServer(t)
-	s := dialed(t, m)
-	end := ends(t, s)
+	s, end := dialed(t, m)
 
 	m.next(t)
 	if err := s.Close(); err != nil {
@@ -299,8 +291,32 @@ func TestClosingAStreamSendsStop(t *testing.T) {
 func TestAStreamThatCannotBeDialled(t *testing.T) {
 	t.Parallel()
 	for _, url := range []string{"", "ws://127.0.0.1:1"} {
-		if _, err := DialStream(context.Background(), StreamTarget{URL: url}, StreamStart{Direction: "inbound"}, zerolog.Nop()); err == nil {
+		if _, err := DialStream(context.Background(), StreamTarget{URL: url}, StreamStart{Direction: "inbound"}, nil, zerolog.Nop()); err == nil {
 			t.Fatalf("dialled %q", url)
 		}
+	}
+}
+
+// A dial error names where the stream is and not the rest of its url, which carries the
+// token a voice agent admits the connector with.
+func TestADialErrorDoesNotCarryTheStreamsToken(t *testing.T) {
+	t.Parallel()
+	for _, url := range []string{"ws://127.0.0.1:1/api/v1/voice/stream/secret-token?k=secret-key", "ws://no-such-host.invalid/voice/secret-token"} {
+		_, err := DialStream(context.Background(), StreamTarget{URL: url}, StreamStart{Direction: "inbound"}, nil, zerolog.Nop())
+		if err == nil || strings.Contains(err.Error(), "secret") {
+			t.Fatalf("dial of %q: %v", url, err)
+		}
+	}
+}
+
+// A server that hangs up the moment it reads `start` still ends the stream: the end is
+// not lost to a callback set after the reader started.
+func TestAHangupRightAfterStartIsNotMissed(t *testing.T) {
+	t.Parallel()
+	m := newStreamServer(t)
+	m.send <- `{"event":"hangup","by":"agent","reason":"busy"}`
+	_, end := dialed(t, m)
+	if got := endOf(t, end); !got.Hangup || got.Reason != "busy" {
+		t.Fatalf("end = %+v", got)
 	}
 }

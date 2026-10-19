@@ -493,12 +493,12 @@ func (s *Session) streamCall(ctx context.Context, live *liveCall, callID string,
 	peer := live.peer
 	s.bridge.mu.Unlock()
 	log := s.log.With().Str("call_id", callID).Logger()
-	stream, err := calls.DialStream(ctx, target, calls.StreamStart{CallID: callID, Direction: "inbound", Peer: peer}, log)
+	stream, err := calls.DialStream(ctx, target, calls.StreamStart{CallID: callID, Direction: "inbound", Peer: peer},
+		func(end calls.StreamEnd) { s.streamEnded(callID, end) }, log)
 	if err != nil {
 		log.Warn().Err(err).Msg("could not reach the media stream of a call; leaving it ringing")
 		return false, protocol.NewError(protocol.ErrorInvalidPayload, "the connector could not reach that media stream")
 	}
-	stream.OnEnd(func(end calls.StreamEnd) { s.streamEnded(callID, end) })
 	s.bridge.mu.Lock()
 	if s.bridge.live[callID] != live {
 		s.bridge.mu.Unlock()

@@ -5,7 +5,9 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/url"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -85,11 +87,11 @@ type Stream struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	out    chan []byte
+	onEnd  func(StreamEnd)
 
 	mu       sync.Mutex
 	toWA     []int16
 	toServer []int16
-	onEnd    func(StreamEnd)
 	started  bool
 
 	// closing is a stream this side is closing: what the server does from then on is
@@ -98,15 +100,18 @@ type Stream struct {
 	closeOnce sync.Once
 }
 
-// DialStream connects to a media server and announces the call to it.
+// DialStream connects to a media server and announces the call to it. onEnd is called
+// when the server ends the stream: it hung up, closed the socket, or the socket broke; not
+// for a stream this side closed. It is in place before anything is read, so a server that
+// hangs up as soon as it reads `start` is not missed.
 //
 //nolint:gocritic // zerolog.Logger is designed to be copied; every With() returns one by value
-func DialStream(ctx context.Context, target StreamTarget, start StreamStart, log zerolog.Logger) (*Stream, error) {
+func DialStream(ctx context.Context, target StreamTarget, start StreamStart, onEnd func(StreamEnd), log zerolog.Logger) (*Stream, error) {
 	dialCtx, cancelDial := context.WithTimeout(ctx, streamDialTimeout)
 	defer cancelDial()
 	conn, _, err := websocket.Dial(dialCtx, target.URL, nil) //nolint:bodyclose // the response body is the library's
 	if err != nil {
-		return nil, fmt.Errorf("calls: dial the media stream: %w", err)
+		return nil, fmt.Errorf("calls: dial the media stream at %s: %w", streamHost(target.URL), withoutURL(err))
 	}
 	conn.SetReadLimit(streamReadLimit)
 	body, err := json.Marshal(startFrame{
@@ -122,30 +127,37 @@ func DialStream(ctx context.Context, target StreamTarget, start StreamStart, log
 		return nil, fmt.Errorf("calls: announce the call to the media stream: %w", err)
 	}
 	streamCtx, cancel := context.WithCancel(context.Background())
-	s := &Stream{conn: conn, log: log, ctx: streamCtx, cancel: cancel, out: make(chan []byte, streamOutQueue)}
+	s := &Stream{conn: conn, log: log, ctx: streamCtx, cancel: cancel, out: make(chan []byte, streamOutQueue), onEnd: onEnd}
 	go s.read()
 	go s.write()
 	return s, nil
 }
 
-// OnEnd is called when the media server ends the stream: it hung up, closed the
-// socket, or the socket broke. Not called for a stream this side closed.
-func (s *Stream) OnEnd(fn func(StreamEnd)) {
-	s.mu.Lock()
-	s.onEnd = fn
-	s.mu.Unlock()
+// streamHost is where a stream URL points, without its path and query: a voice agent's
+// URL carries the token that admits the connector, and an error is logged.
+func streamHost(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return "an unparsable url"
+	}
+	return u.Scheme + "://" + u.Host
+}
+
+// withoutURL is a dial error without the request URL net/http wraps it in, for the same
+// reason.
+func withoutURL(err error) error {
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		return ue.Err
+	}
+	return err
 }
 
 func (s *Stream) ended(end StreamEnd) {
-	if s.closing.Load() {
+	if s.closing.Load() || s.onEnd == nil {
 		return
 	}
-	s.mu.Lock()
-	fn := s.onEnd
-	s.mu.Unlock()
-	if fn != nil {
-		fn(end)
-	}
+	s.onEnd(end)
 }
 
 // read is the one goroutine that reads the socket, and it returns once the stream ended,
