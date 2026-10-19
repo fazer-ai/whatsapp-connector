@@ -167,6 +167,13 @@ func TestAStreamAnnouncesTheCallAndCarriesThePersonsVoice(t *testing.T) {
 			break
 		}
 	}
+	after := m.next(t)
+	raw, _ = base64.StdEncoding.DecodeString(after["payload"].(string))
+	for i := 0; i+1 < len(raw); i += 2 {
+		if raw[i] != 0 || raw[i+1] != 0 {
+			t.Fatal("the frame after the person's was not silence")
+		}
+	}
 }
 
 // What the server says is played in frames padded with silence, and a `clear` drops what

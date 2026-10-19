@@ -2,6 +2,7 @@ package whatsmeow
 
 import (
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -397,6 +398,35 @@ func TestACallOfferedWithoutSDPCanBeAcceptedOnAStream(t *testing.T) {
 	}
 	if answered, _, _, wired := call.counts(); answered != 1 || !wired {
 		t.Fatalf("answered %d times, wired %v; want once, wired", answered, wired)
+	}
+}
+
+// An answer WhatsApp does not take tells the media server the call is over, rather than
+// leaving it waiting on a call nobody answered, and a retry dials it again.
+func TestAStreamAcceptWhatsAppRefusesStopsTheStream(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	call, _ := ringCall(t, session, "call-1")
+	call.fail = errors.New("no ack")
+	server := newMediaServer(t, nil)
+
+	_, err := session.Execute(t.Context(), streamAccept(t, "call-1", server.url))
+	assertCode(t, err, protocol.ErrorWaError)
+	if start := server.next(t); start["event"] != "start" {
+		t.Fatalf("first frame = %v, want start", start)
+	}
+	if stop := server.next(t); stop["event"] != "stop" {
+		t.Fatalf("frame after the refused answer = %v, want stop", stop)
+	}
+
+	call.mu.Lock()
+	call.fail = nil
+	call.mu.Unlock()
+	if _, err := session.Execute(t.Context(), streamAccept(t, "call-1", server.url)); err != nil {
+		t.Fatalf("a retried call.accept: %v", err)
+	}
+	if n := server.conns.Load(); n != 2 {
+		t.Fatalf("opened %d streams, want the retry to open a second", n)
 	}
 }
 

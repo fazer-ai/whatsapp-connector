@@ -96,7 +96,6 @@ type Stream struct {
 	// closing is a stream this side is closing: what the server does from then on is
 	// not the server ending it.
 	closing   atomic.Bool
-	endOnce   sync.Once
 	closeOnce sync.Once
 }
 
@@ -133,7 +132,7 @@ func DialStream(ctx context.Context, target StreamTarget, start StreamStart, log
 	return s, nil
 }
 
-// OnEnd is called once, when the media server ends the stream: it hung up, closed the
+// OnEnd is called when the media server ends the stream: it hung up, closed the
 // socket, or the socket broke. Not called for a stream this side closed.
 func (s *Stream) OnEnd(fn func(StreamEnd)) {
 	s.mu.Lock()
@@ -145,16 +144,16 @@ func (s *Stream) ended(end StreamEnd) {
 	if s.closing.Load() {
 		return
 	}
-	s.endOnce.Do(func() {
-		s.mu.Lock()
-		fn := s.onEnd
-		s.mu.Unlock()
-		if fn != nil {
-			fn(end)
-		}
-	})
+	s.mu.Lock()
+	fn := s.onEnd
+	s.mu.Unlock()
+	if fn != nil {
+		fn(end)
+	}
 }
 
+// read is the one goroutine that reads the socket, and it returns once the stream ended,
+// so the stream ends once.
 func (s *Stream) read() {
 	for {
 		_, data, err := s.conn.Read(s.ctx)

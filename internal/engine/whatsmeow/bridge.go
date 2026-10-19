@@ -390,8 +390,7 @@ func (s *Session) acceptCall(ctx context.Context, command *protocol.Command) (js
 		return nil, engine.ErrNotSupported
 	}
 	var req acceptRequest
-	if err := json.Unmarshal(command.Payload, &req); err != nil || req.CallID == "" ||
-		(req.Stream == nil && req.SDP == "") || (req.Stream != nil && req.Stream.URL == "") {
+	if err := json.Unmarshal(command.Payload, &req); err != nil || req.CallID == "" || (req.Stream == nil && req.SDP == "") {
 		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
 			"a call accept has to name the call and carry the browser's answer or a media stream")
 	}
@@ -525,20 +524,16 @@ func (s *Session) streamEnded(callID string, end calls.StreamEnd) {
 	}
 	s.bridge.mu.Lock()
 	live := s.bridge.live[callID]
-	var stream *calls.Stream
 	if live != nil {
 		live.endReason = reason
-		stream = live.stream
 	}
 	s.bridge.mu.Unlock()
 	if live == nil {
 		return
 	}
+	// The stream is closed with the rest of the call, once meowcaller reports it over.
 	s.log.Info().Str("call_id", callID).Str("reason", reason).Str("by", end.By).Str("stream_reason", end.Reason).
 		Msg("the media stream of a call ended; hanging up")
-	if stream != nil {
-		_ = stream.Close()
-	}
 	if err := live.call.Hangup(); err != nil {
 		s.log.Warn().Err(err).Str("call_id", callID).Msg("could not hang up a call whose media stream ended")
 		s.rememberUnended(callID, live.call)
