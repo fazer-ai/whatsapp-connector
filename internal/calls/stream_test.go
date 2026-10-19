@@ -17,6 +17,8 @@ import (
 	"github.com/fazer-ai/whatsapp-connector/internal/testwait"
 )
 
+const socketGone = "socket gone"
+
 // streamServer is a media server for one connection: what the connector sends arrives on
 // got, decoded, and what a test puts on send goes to the connector.
 type streamServer struct {
@@ -51,6 +53,7 @@ func newStreamServer(t *testing.T) *streamServer {
 		for {
 			_, data, err := conn.Read(ctx)
 			if err != nil {
+				m.got <- map[string]any{"event": socketGone}
 				return
 			}
 			var frame map[string]any
@@ -79,7 +82,7 @@ func dialed(t *testing.T, m *streamServer) (s *Stream, end chan StreamEnd) {
 	t.Helper()
 	end = make(chan StreamEnd, 4)
 	s, err := DialStream(context.Background(), StreamTarget{URL: m.url}, StreamStart{CallID: "c1", Direction: "inbound", Peer: "5511988887777"},
-		func(e StreamEnd) { end <- e }, zerolog.Nop())
+		func(e StreamEnd) { end <- e }, nil, zerolog.Nop())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -302,7 +305,7 @@ func TestClosingAStreamDoesNotWaitOnAMuteServer(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 	t.Cleanup(func() { close(hold) })
-	s, err := DialStream(context.Background(), StreamTarget{URL: "ws" + strings.TrimPrefix(srv.URL, "http")}, StreamStart{Direction: "inbound"}, nil, zerolog.Nop())
+	s, err := DialStream(context.Background(), StreamTarget{URL: "ws" + strings.TrimPrefix(srv.URL, "http")}, StreamStart{Direction: "inbound"}, nil, nil, zerolog.Nop())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -346,11 +349,40 @@ func waitBlocked(t *testing.T, s *Stream) {
 	}
 }
 
+// Audio still queued when the stream is closed is dropped, and `stop` is the last frame
+// the server reads.
+func TestStopIsTheLastFrameAStreamSends(t *testing.T) {
+	t.Parallel()
+	for range 20 {
+		m := newStreamServer(t)
+		s, _ := dialed(t, m)
+		m.next(t)
+		for range streamOutQueue {
+			s.send(&streamFrame{Event: "media", Payload: strings.Repeat("A", 4096)})
+		}
+		_ = s.Close()
+		stopped := false
+		for {
+			frame := m.next(t)
+			if frame["event"] == socketGone {
+				break
+			}
+			if stopped {
+				t.Fatalf("%v after stop", frame["event"])
+			}
+			stopped = frame["event"] == "stop"
+		}
+		if !stopped {
+			t.Fatal("no stop before the socket closed")
+		}
+	}
+}
+
 // A stream without a url, or whose server is not there, is not dialled.
 func TestAStreamThatCannotBeDialled(t *testing.T) {
 	t.Parallel()
 	for _, url := range []string{"", "ws://127.0.0.1:1"} {
-		if _, err := DialStream(context.Background(), StreamTarget{URL: url}, StreamStart{Direction: "inbound"}, nil, zerolog.Nop()); err == nil {
+		if _, err := DialStream(context.Background(), StreamTarget{URL: url}, StreamStart{Direction: "inbound"}, nil, nil, zerolog.Nop()); err == nil {
 			t.Fatalf("dialled %q", url)
 		}
 	}
@@ -361,7 +393,7 @@ func TestAStreamThatCannotBeDialled(t *testing.T) {
 func TestADialErrorDoesNotCarryTheStreamsToken(t *testing.T) {
 	t.Parallel()
 	for _, url := range []string{"ws://127.0.0.1:1/api/v1/voice/stream/secret-token?k=secret-key", "ws://no-such-host.invalid/voice/secret-token"} {
-		_, err := DialStream(context.Background(), StreamTarget{URL: url}, StreamStart{Direction: "inbound"}, nil, zerolog.Nop())
+		_, err := DialStream(context.Background(), StreamTarget{URL: url}, StreamStart{Direction: "inbound"}, nil, nil, zerolog.Nop())
 		if err == nil || strings.Contains(err.Error(), "secret") {
 			t.Fatalf("dial of %q: %v", url, err)
 		}

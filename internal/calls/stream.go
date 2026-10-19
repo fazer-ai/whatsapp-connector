@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"sync"
 	"sync/atomic"
@@ -26,6 +27,8 @@ const (
 	maxStreamToWhatsApp = sampleRate * 120
 	// streamOutQueue is how many frames for the media server may wait for the socket.
 	streamOutQueue = 64
+	// streamStopTimeout bounds the `stop` frame, on a server that may have stopped reading.
+	streamStopTimeout = time.Second
 	// streamReadLimit is the largest frame read from the media server: a few seconds of
 	// audio, base64 inside JSON.
 	streamReadLimit = 1 << 22
@@ -88,6 +91,10 @@ type Stream struct {
 	cancel context.CancelFunc
 	out    chan []byte
 	onEnd  func(StreamEnd)
+	// stopping is closed by Close, to wake the writer for the `stop`; written is closed
+	// once the writer is done.
+	stopping chan struct{}
+	written  chan struct{}
 
 	mu       sync.Mutex
 	toWA     []int16
@@ -100,16 +107,17 @@ type Stream struct {
 	closeOnce sync.Once
 }
 
-// DialStream connects to a media server and announces the call to it. onEnd is called
+// DialStream connects to a media server over client, nil for net/http's default, and
+// announces the call to it. onEnd is called
 // when the server ends the stream: it hung up, closed the socket, or the socket broke; not
 // for a stream this side closed. It is in place before anything is read, so a server that
 // hangs up as soon as it reads `start` is not missed.
 //
 //nolint:gocritic // zerolog.Logger is designed to be copied; every With() returns one by value
-func DialStream(ctx context.Context, target StreamTarget, start StreamStart, onEnd func(StreamEnd), log zerolog.Logger) (*Stream, error) {
+func DialStream(ctx context.Context, target StreamTarget, start StreamStart, onEnd func(StreamEnd), client *http.Client, log zerolog.Logger) (*Stream, error) {
 	dialCtx, cancelDial := context.WithTimeout(ctx, streamDialTimeout)
 	defer cancelDial()
-	conn, _, err := websocket.Dial(dialCtx, target.URL, nil) //nolint:bodyclose // the response body is the library's
+	conn, _, err := websocket.Dial(dialCtx, target.URL, &websocket.DialOptions{HTTPClient: client}) //nolint:bodyclose // the response body is the library's
 	if err != nil {
 		return nil, fmt.Errorf("calls: dial the media stream at %s: %w", streamHost(target.URL), withoutURL(err))
 	}
@@ -127,7 +135,10 @@ func DialStream(ctx context.Context, target StreamTarget, start StreamStart, onE
 		return nil, fmt.Errorf("calls: announce the call to the media stream: %w", err)
 	}
 	streamCtx, cancel := context.WithCancel(context.Background())
-	s := &Stream{conn: conn, log: log, ctx: streamCtx, cancel: cancel, out: make(chan []byte, streamOutQueue), onEnd: onEnd}
+	s := &Stream{
+		conn: conn, log: log, ctx: streamCtx, cancel: cancel, onEnd: onEnd,
+		out: make(chan []byte, streamOutQueue), stopping: make(chan struct{}), written: make(chan struct{}),
+	}
 	go s.read()
 	go s.write()
 	return s, nil
@@ -202,11 +213,23 @@ func (s *Stream) read() {
 	}
 }
 
+// write is the one goroutine that writes to the socket once the stream is dialled, so the
+// `stop` it ends with is the last frame the server reads: whatever audio was still queued
+// when the stream was closed is dropped.
 func (s *Stream) write() {
+	defer close(s.written)
 	for {
+		if s.closing.Load() {
+			body, _ := json.Marshal(streamFrame{Event: "stop"})
+			ctx, cancel := context.WithTimeout(s.ctx, streamStopTimeout)
+			_ = s.conn.Write(ctx, websocket.MessageText, body)
+			cancel()
+			return
+		}
 		select {
 		case <-s.ctx.Done():
 			return
+		case <-s.stopping:
 		case body := <-s.out:
 			if err := s.conn.Write(s.ctx, websocket.MessageText, body); err != nil {
 				if s.ctx.Err() == nil {
@@ -282,13 +305,15 @@ func (s *Stream) clock() {
 func (s *Stream) Close() error {
 	s.closeOnce.Do(func() {
 		s.closing.Store(true)
+		close(s.stopping)
 		go func() {
-			// `stop` before the cancel: a context cancelled under a read or a write
-			// closes the connection, and the frame would never go out.
-			body, _ := json.Marshal(streamFrame{Event: "stop"})
-			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-			_ = s.conn.Write(ctx, websocket.MessageText, body)
-			cancel()
+			// The writer's `stop` before the cancel: a context cancelled under a read or
+			// a write closes the connection, and the frame would never go out. Bounded,
+			// for a writer stuck on a server that stopped reading.
+			select {
+			case <-s.written:
+			case <-time.After(2 * streamStopTimeout):
+			}
 			s.cancel()
 			_ = s.conn.Close(websocket.StatusNormalClosure, "call ended")
 		}()

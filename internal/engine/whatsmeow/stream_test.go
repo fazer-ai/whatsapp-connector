@@ -13,7 +13,9 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/rs/zerolog"
 
+	"github.com/fazer-ai/whatsapp-connector/internal/calls"
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
 	"github.com/fazer-ai/whatsapp-connector/internal/testwait"
 )
@@ -481,6 +483,23 @@ func TestAStreamAcceptOfACallWithoutSDPRepeatedWhileDiallingIsNothingNew(t *test
 	}
 	if n := server.conns.Load(); n != 1 {
 		t.Fatalf("opened %d streams, want 1", n)
+	}
+}
+
+// A stream URL is the client's, and is dialled the way a media URL is fetched: never to
+// an address a cloud's metadata service answers on, whether named directly or reached
+// through a redirect.
+func TestAStreamIsNeverDialledToAMetadataAddress(t *testing.T) {
+	t.Parallel()
+	redirect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "http://169.254.169.254/latest/meta-data/", http.StatusFound)
+	}))
+	t.Cleanup(redirect.Close)
+	for _, url := range []string{"ws://169.254.169.254/latest/meta-data/", "ws" + strings.TrimPrefix(redirect.URL, "http")} {
+		_, err := dialStream(t.Context(), calls.StreamTarget{URL: url}, calls.StreamStart{Direction: "inbound"}, nil, zerolog.Nop())
+		if !errors.Is(err, errMetadataAddress) {
+			t.Fatalf("dial of %s = %v, want it refused as a metadata address", url, err)
+		}
 	}
 }
 

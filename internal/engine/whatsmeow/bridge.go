@@ -5,8 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"net/http"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/purpshell/meowcaller"
 	"github.com/purpshell/meowcaller/signaling"
@@ -485,6 +488,26 @@ func (s *Session) wire(live *liveCall) {
 	live.leg.Start()
 }
 
+// streamClient is what a media stream is dialled over: the URL is the client's, like a
+// media URL to fetch, so the dial refuses a metadata address the way fetchTransport does,
+// at every redirect hop. HTTP/1.1 only, which is what a WebSocket upgrade is made on, and
+// no proxy from the environment, for fetchTransport's reason.
+var streamClient = &http.Client{Transport: &http.Transport{
+	DialContext: (&net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+		Control:   refuseMetadataAddress,
+	}).DialContext,
+	TLSHandshakeTimeout: 10 * time.Second,
+}}
+
+// dialStream dials a media stream over streamClient.
+//
+//nolint:gocritic // zerolog.Logger is designed to be copied; every With() returns one by value
+func dialStream(ctx context.Context, target calls.StreamTarget, start calls.StreamStart, onEnd func(calls.StreamEnd), log zerolog.Logger) (*calls.Stream, error) {
+	return calls.DialStream(ctx, target, start, onEnd, streamClient, log)
+}
+
 // streamCall dials the media server a received call is accepted with and puts it in the
 // browser's place, closing the leg built for the browser's offer. It reports false, with
 // the stream closed, for a call that ended while the stream was dialled.
@@ -493,7 +516,7 @@ func (s *Session) streamCall(ctx context.Context, live *liveCall, callID string,
 	peer := live.peer
 	s.bridge.mu.Unlock()
 	log := s.log.With().Str("call_id", callID).Logger()
-	stream, err := calls.DialStream(ctx, target, calls.StreamStart{CallID: callID, Direction: "inbound", Peer: peer},
+	stream, err := dialStream(ctx, target, calls.StreamStart{CallID: callID, Direction: "inbound", Peer: peer},
 		func(end calls.StreamEnd) { s.streamEnded(callID, end) }, log)
 	if err != nil {
 		log.Warn().Err(err).Msg("could not reach the media stream of a call; leaving it ringing")
