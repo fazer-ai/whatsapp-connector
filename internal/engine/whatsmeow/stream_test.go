@@ -56,11 +56,13 @@ func newMediaServer(t *testing.T, gate chan struct{}) *mediaServer {
 		if m.gate != nil {
 			<-m.gate
 		}
+		// Counted before the handshake completes: the connector's dial returns as soon as
+		// it reads the response, which can be before this handler goes on.
+		m.conns.Add(1)
 		conn, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			return
 		}
-		m.conns.Add(1)
 		ctx := r.Context()
 		go func() {
 			for {
