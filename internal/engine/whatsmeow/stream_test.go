@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -26,8 +27,9 @@ type mediaServer struct {
 	conns atomic.Int32
 	// requested receives one value per upgrade request, before the handshake.
 	requested chan struct{}
-	// gate, when set, holds every handshake until it is closed.
-	gate chan struct{}
+	// gate, when set, holds every handshake until release.
+	gate    chan struct{}
+	release func()
 	// frames is every text frame from the connector, decoded, then `closed` once the
 	// socket is gone.
 	frames chan map[string]any
@@ -83,6 +85,15 @@ func newMediaServer(t *testing.T, gate chan struct{}) *mediaServer {
 		}
 	}))
 	t.Cleanup(srv.Close)
+	var once sync.Once
+	m.release = func() {
+		if gate != nil {
+			once.Do(func() { close(gate) })
+		}
+	}
+	// Before the server closes, which waits on every handler: a test that failed with a
+	// handshake held would otherwise never end.
+	t.Cleanup(m.release)
 	m.url = "ws" + strings.TrimPrefix(srv.URL, "http")
 	return m
 }
@@ -210,7 +221,7 @@ func TestACallIsAnsweredOnlyOnceItsStreamIsOpen(t *testing.T) {
 	if answered, _, _, _ := call.counts(); answered != 0 {
 		t.Fatal("the call was answered before its stream was open")
 	}
-	close(gate)
+	server.release()
 	if err := finished(t, done); err != nil {
 		t.Fatalf("call.accept with a stream: %v", err)
 	}
@@ -331,10 +342,16 @@ func TestAStreamAcceptRepeatedWhileDiallingIsNothingNew(t *testing.T) {
 		done <- err
 	}()
 	server.dialled(t)
-	if _, err := session.Execute(t.Context(), streamAccept(t, "call-1", server.url)); err != nil {
+	repeat := make(chan error, 1)
+	go func() {
+		_, err := session.Execute(t.Context(), streamAccept(t, "call-1", server.url))
+		repeat <- err
+	}()
+	// Before the handshake is let through: a repeat that dials again waits on it too.
+	if err := finished(t, repeat); err != nil {
 		t.Fatalf("a repeated call.accept: %v", err)
 	}
-	close(gate)
+	server.release()
 	if err := finished(t, done); err != nil {
 		t.Fatalf("call.accept with a stream: %v", err)
 	}
@@ -366,7 +383,7 @@ func TestACallThatEndsWhileItsStreamIsDialledClosesTheStream(t *testing.T) {
 	server.dialled(t)
 	call.remoteEnds("timeout")
 	published(t, session, protocol.EventCallTerminate, "event_call_terminate")
-	close(gate)
+	server.release()
 	if err := finished(t, done); err != nil {
 		t.Fatalf("an accept of a call that ended while it was dialled = %v, want nothing new", err)
 	}
@@ -427,6 +444,43 @@ func TestAStreamAcceptWhatsAppRefusesStopsTheStream(t *testing.T) {
 	}
 	if n := server.conns.Load(); n != 2 {
 		t.Fatalf("opened %d streams, want the retry to open a second", n)
+	}
+}
+
+// A call offered without sdp has no browser leg, and an accept redelivered while its
+// stream is dialled still opens no second one.
+func TestAStreamAcceptOfACallWithoutSDPRepeatedWhileDiallingIsNothingNew(t *testing.T) {
+	t.Parallel()
+	session := newCallSession(t)
+	call := &fakeCall{id: "call-1"}
+	session.ringing(call)
+	gate := make(chan struct{})
+	server := newMediaServer(t, gate)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := session.Execute(t.Context(), streamAccept(t, "call-1", server.url))
+		done <- err
+	}()
+	server.dialled(t)
+	repeat := make(chan error, 1)
+	go func() {
+		_, err := session.Execute(t.Context(), streamAccept(t, "call-1", server.url))
+		repeat <- err
+	}()
+	// Before the handshake is let through: a repeat that dials again waits on it too.
+	if err := finished(t, repeat); err != nil {
+		t.Fatalf("a repeated call.accept: %v", err)
+	}
+	server.release()
+	if err := finished(t, done); err != nil {
+		t.Fatalf("call.accept with a stream: %v", err)
+	}
+	if answered, _, _, _ := call.counts(); answered != 1 {
+		t.Fatalf("answered %d times, want once", answered)
+	}
+	if n := server.conns.Load(); n != 1 {
+		t.Fatalf("opened %d streams, want 1", n)
 	}
 }
 
