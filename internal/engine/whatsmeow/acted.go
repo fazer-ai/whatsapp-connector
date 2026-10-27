@@ -228,6 +228,11 @@ func (s *Session) changeOf(event *waEvents.Message) change {
 		// would otherwise give them is a bubble in an agent's thread once per sync.
 		return dropping("dropping a protocol message that is the account's own plumbing")
 
+	case unseen(event.Message.GetProtocolMessage()):
+		// Somebody's client talking to this one, and nothing the phone shows: a placeholder
+		// for it is a bubble the agent cannot answer and the contact never saw.
+		return dropping("dropping a protocol message the phone shows nothing for")
+
 	case event.Info.Edit != waTypes.EditAttributeEmpty:
 		// WhatsApp added something. Logged and acknowledged rather than guessed at from
 		// the body, which would file it as whichever of the three it happens to look like.
@@ -312,6 +317,39 @@ func keyMaterial(message *waE2E.Message) bool {
 		message.GetRootSecretDistributeMessage() != nil
 }
 
+// unseen reports whether a protocol message is one a person's client sends and the phone
+// shows nothing for.
+//
+// Not plumbing, which is why it is not on housekeeping's list: these come from the
+// contact's side, or from Meta AI. A phone number shared with a business, the request for
+// its welcome message when a chat is opened, feedback on and the machinery of Meta AI, a
+// scheduled message being called off. None is a bubble on either phone, and mautrix-whatsapp,
+// which renders every protocol message it can, renders none of them.
+//
+// What stays out is what the phone does show, as a line of its own in the chat: a
+// disappearing timer, a reminder, a theme, advanced chat privacy, a member's label. Those
+// keep the `protocol` placeholder, and so does every type nobody has looked at yet.
+func unseen(message *waE2E.ProtocolMessage) bool {
+	if message == nil {
+		return false
+	}
+	switch message.GetType() {
+	case waE2E.ProtocolMessage_SHARE_PHONE_NUMBER,
+		waE2E.ProtocolMessage_REQUEST_WELCOME_MESSAGE,
+		waE2E.ProtocolMessage_BOT_FEEDBACK_MESSAGE,
+		waE2E.ProtocolMessage_BOT_MEMU_ONBOARDING_MESSAGE,
+		waE2E.ProtocolMessage_STOP_GENERATION_MESSAGE,
+		waE2E.ProtocolMessage_AI_PSI_METADATA,
+		waE2E.ProtocolMessage_AI_QUERY_FANOUT,
+		waE2E.ProtocolMessage_AI_MEDIA_COLLECTION_MESSAGE,
+		waE2E.ProtocolMessage_MESSAGE_UNSCHEDULE,
+		waE2E.ProtocolMessage_AI_METADATA_OPERATION:
+		return true
+	default:
+		return false
+	}
+}
+
 // housekeeping reports whether a protocol message is the account's own plumbing rather
 // than something a person did.
 //
@@ -322,9 +360,10 @@ func keyMaterial(message *waE2E.Message) bool {
 // bubble an agent can see and ask about. So an unknown type falls through to the
 // placeholder, and only what has been looked at and found to be plumbing is dropped.
 //
-// What is deliberately not here: sharing a phone number, setting a disappearing timer, a
-// reminder, a chat theme, a label change. Each is somebody acting in the conversation,
-// and the contract has an `unsupported` reason -- `protocol` -- that says exactly that.
+// What is deliberately not here is what a person's client sends: unseen takes what the
+// phone shows nothing for, and the rest -- a disappearing timer, a reminder, a chat theme,
+// a label change -- is somebody acting in the conversation, which the contract's
+// `protocol` reason says exactly.
 func housekeeping(message *waE2E.ProtocolMessage) bool {
 	if message == nil {
 		return false

@@ -419,9 +419,9 @@ func whyUnreadable(event *waEvents.Message) protocol.UnsupportedReason {
 		// no build will ever render it.
 		return protocol.UnsupportedMasked
 	case event.Message.GetProtocolMessage() != nil:
-		// One that is not the account's own plumbing, which changeOf already dropped.
+		// One that is neither the account's own plumbing nor unseen: changeOf dropped those.
 		// What is left is somebody acting in the conversation in a way the contract does
-		// not carry -- sharing their phone number, putting a timer on the chat -- and
+		// not carry -- putting a timer on the chat, setting a reminder -- and
 		// this reason is what the contract has for saying so.
 		return protocol.UnsupportedProtocol
 	default:

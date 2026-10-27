@@ -635,13 +635,11 @@ func TestAProtocolMessageSomebodySentIsShownRatherThanDropped(t *testing.T) {
 		name string
 		kind waE2E.ProtocolMessage_Type
 	}{
-		// The answer to WhatsApp's "share your phone number" prompt: a contact deciding
-		// to be reachable, dropped by a blanket rule and gone.
-		{"a contact sharing their phone number", waE2E.ProtocolMessage_SHARE_PHONE_NUMBER},
 		{"a disappearing timer being set", waE2E.ProtocolMessage_EPHEMERAL_SETTING},
+		{"a reminder", waE2E.ProtocolMessage_REMINDER_MESSAGE},
 		// Nobody has looked at this one, which is the point of the list running the
 		// other way: an unread type is visible rather than silently gone.
-		{"a type nobody has looked at yet", waE2E.ProtocolMessage_REMINDER_MESSAGE},
+		{"a type this build's enum does not name", waE2E.ProtocolMessage_Type(99)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -653,6 +651,40 @@ func TestAProtocolMessageSomebodySentIsShownRatherThanDropped(t *testing.T) {
 			content := inboundContentOf(t, publishedBy(t, session, event))
 			if content["type"] != "unsupported" || content["reason"] != "protocol" {
 				t.Fatalf("something somebody did was published as %v, want the protocol placeholder", content)
+			}
+		})
+	}
+}
+
+// A protocol message the phone shows nothing for is not somebody acting in the
+// conversation either, whatever its type says. A placeholder for one is a bubble the
+// agent cannot answer and the contact never saw: a self-hosted install found them in
+// 1:1 chats with no counterpart on the phone, incoming and outgoing.
+func TestAProtocolMessageThePhoneDoesNotShowIsAcknowledgedRatherThanShown(t *testing.T) {
+	t.Parallel()
+
+	for _, kind := range []waE2E.ProtocolMessage_Type{
+		waE2E.ProtocolMessage_SHARE_PHONE_NUMBER,
+		waE2E.ProtocolMessage_REQUEST_WELCOME_MESSAGE,
+		waE2E.ProtocolMessage_BOT_FEEDBACK_MESSAGE,
+		waE2E.ProtocolMessage_BOT_MEMU_ONBOARDING_MESSAGE,
+		waE2E.ProtocolMessage_STOP_GENERATION_MESSAGE,
+		waE2E.ProtocolMessage_AI_PSI_METADATA,
+		waE2E.ProtocolMessage_AI_QUERY_FANOUT,
+		waE2E.ProtocolMessage_AI_MEDIA_COLLECTION_MESSAGE,
+		waE2E.ProtocolMessage_MESSAGE_UNSCHEDULE,
+		waE2E.ProtocolMessage_AI_METADATA_OPERATION,
+	} {
+		t.Run(kind.String(), func(t *testing.T) {
+			t.Parallel()
+
+			session, _ := newTestSession(t, "5511999990001")
+			session.deliverWait = 50 * time.Millisecond
+			event := textMessage("3EB0UNSEEN", "")
+			event.Message = &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{Type: kind.Enum()}}
+
+			if !publishedNothing(t, session, event) {
+				t.Fatalf("%s was published, or left for WhatsApp to redeliver for good", kind)
 			}
 		})
 	}
