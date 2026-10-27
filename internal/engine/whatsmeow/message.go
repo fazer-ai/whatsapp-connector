@@ -296,7 +296,14 @@ func (s *Session) bodyOf(ctx context.Context) renderBody {
 			// the redelivery the retry was for.
 			return s.mediaBody(ctx, event)
 		}
-		return unreadableBody(event)
+		placeholder, ok := unreadableBody(event)
+		if content, _ := placeholder.content.(protocol.UnsupportedContent); content.Detail != "" {
+			// The one place an install's log says what WhatsApp sent in its stead, for
+			// whoever investigates a placeholder without the event stream.
+			s.log.Info().Str("message_id", event.Info.ID).Str("reason", string(content.Reason)).
+				Str("detail", content.Detail).Msg("publishing a placeholder for a message this build cannot render")
+		}
+		return placeholder, ok
 	}
 }
 

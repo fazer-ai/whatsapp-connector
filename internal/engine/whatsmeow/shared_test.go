@@ -1,6 +1,7 @@
 package whatsmeow
 
 import (
+	"encoding/json"
 	"math"
 	"strings"
 	"testing"
@@ -770,4 +771,41 @@ func inboundContentOf(t *testing.T, emission *engine.Emission) map[string]any {
 		t.Fatalf("the message was published with no content: %s", emission.Payload)
 	}
 	return content
+}
+
+// Whoever reads the log of an install has no event stream to look at, so the detail a
+// placeholder was published with is in the line that says it was, under the message's id.
+func TestAPlaceholdersDetailIsLoggedWithTheMessage(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name   string
+		body   *waE2E.Message
+		detail string
+	}{
+		{"a protocol message", &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{
+			Type: waE2E.ProtocolMessage_EPHEMERAL_SETTING.Enum(),
+		}}, "EPHEMERAL_SETTING"},
+		{"a body with no arm", &waE2E.Message{ButtonsMessage: &waE2E.ButtonsMessage{}}, "buttonsMessage"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			session, written := newLoggedTestSession(t, "5511999990001")
+			event := textMessage("3EB0LOGGED", "")
+			event.Message = tc.body
+			inboundContentOf(t, publishedBy(t, session, event))
+
+			for _, line := range strings.Split(written.String(), "\n") {
+				var entry map[string]any
+				if json.Unmarshal([]byte(line), &entry) != nil {
+					continue
+				}
+				if entry["level"] == "info" && entry["message_id"] == "3EB0LOGGED" && entry["detail"] == tc.detail {
+					return
+				}
+			}
+			t.Fatalf("no info line names the placeholder's detail %q:\n%s", tc.detail, written.String())
+		})
+	}
 }
