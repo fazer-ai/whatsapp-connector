@@ -756,19 +756,20 @@ func TestAnEditWhoseNewBodyHasNoArmIsPublishedAsUnsupported(t *testing.T) {
 		}}
 	}
 	for _, tc := range []struct {
-		name  string
-		event func() *waEvents.Message
-		want  protocol.UnsupportedReason
+		name   string
+		event  func() *waEvents.Message
+		want   protocol.UnsupportedReason
+		detail string
 	}{
 		{"an edit", func() *waEvents.Message {
 			return editEvent(carrier, subject, location(), 1755000009000)
-		}, protocol.UnsupportedUnknownType},
+		}, protocol.UnsupportedUnknownType, "locationMessage"},
 		{"a sealed correction", func() *waEvents.Message {
 			return sealedEditEvent(carrier, subject)
-		}, protocol.UnsupportedUnknownType},
+		}, protocol.UnsupportedUnknownType, "locationMessage"},
 		{"an edit with no body at all", func() *waEvents.Message {
 			return editEvent(carrier, subject, nil, 1755000009000)
-		}, protocol.UnsupportedEmpty},
+		}, protocol.UnsupportedEmpty, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -791,6 +792,7 @@ func TestAnEditWhoseNewBodyHasNoArmIsPublishedAsUnsupported(t *testing.T) {
 			if content["type"] != "unsupported" || content["reason"] != string(tc.want) {
 				t.Fatalf("an edit this build cannot render reads %v, want the %s placeholder", content, tc.want)
 			}
+			assertDetail(t, content, tc.detail)
 		})
 	}
 }

@@ -3,11 +3,13 @@ package whatsmeow
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"time"
 
 	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
 	waTypes "go.mau.fi/whatsmeow/types"
 	waEvents "go.mau.fi/whatsmeow/types/events"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/reflect/protoreflect"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/engine"
@@ -312,7 +314,53 @@ func unreadableBody(event *waEvents.Message) (body, bool) {
 	// that never learns what it answered cannot thread it -- the placeholder is the one
 	// renderer that cannot lose this, because it is the one that runs for every arm
 	// nobody has written a renderer for.
-	return body{content: protocol.Unsupported(whyUnreadable(event)), context: alongside(event.Message)}, true
+	reason := whyUnreadable(event)
+	return body{content: protocol.Unsupported(reason).Detailed(whatArrived(event.Message, reason)), context: alongside(event.Message)}, true
+}
+
+// whatArrived names what a placeholder stands for, which is what lets somebody reading it
+// later tell a poll from a card, or a reminder from a timer, without the stanza.
+//
+// Only for the two reasons where something did arrive and has a name. The others are a
+// body that was never opened, never sent here, or not there at all.
+func whatArrived(message *waE2E.Message, reason protocol.UnsupportedReason) string {
+	switch reason {
+	case protocol.UnsupportedProtocol:
+		kind := message.GetProtocolMessage().GetType()
+		if name, known := waE2E.ProtocolMessage_Type_name[int32(kind)]; known {
+			return name
+		}
+		// A type newer than this build's enum. The number is what the next build's
+		// enum will be read against.
+		return fmt.Sprintf("TYPE_%d", kind)
+	case protocol.UnsupportedUnknownType:
+		return armOf(message)
+	default:
+		return ""
+	}
+}
+
+// armOf is the name of the field a message's body arrived in: the first one set, in the
+// order the descriptor declares them, past what rides along with a body rather than being
+// one. The context info is declared before almost every arm, so without the skip nearly
+// every placeholder would be named after it.
+//
+// An arm newer than the descriptor is not a field here at all, only bytes protobuf kept
+// aside; its number is the one thing that can be said about it.
+func armOf(message *waE2E.Message) string {
+	reflected := message.ProtoReflect()
+	fields := reflected.Descriptor().Fields()
+	for i := range fields.Len() {
+		field := fields.Get(i)
+		if _, along := ridesAlong[field.Name()]; along || !reflected.Has(field) {
+			continue
+		}
+		return string(field.Name())
+	}
+	if number, _, n := protowire.ConsumeTag(reflected.GetUnknown()); n > 0 {
+		return fmt.Sprintf("FIELD_%d", number)
+	}
+	return ""
 }
 
 // alongside is the annotation a message carries, whichever arm it arrived in: the quote

@@ -811,3 +811,32 @@ func decode(t *testing.T, payload string) any {
 	}
 	return decoded
 }
+
+// The detail is a name a client stores and reads back, so it is a non-empty string or it
+// is not there. A null would have a client store "no subtype" next to a placeholder that
+// had one, and a number would be the enum's value on the wire, which is the one thing a
+// newer WhatsApp is free to change.
+func TestAPlaceholdersDetailIsANameOrAbsent(t *testing.T) {
+	schema := compile(t, "#/definitions/content_unsupported")
+	for _, tc := range []struct {
+		name    string
+		content map[string]any
+		valid   bool
+	}{
+		{"absent", map[string]any{"type": "unsupported", "reason": "undecryptable"}, true},
+		{"a name", map[string]any{"type": "unsupported", "reason": "protocol", "detail": "SHARE_PHONE_NUMBER"}, true},
+		{"a number", map[string]any{"type": "unsupported", "reason": "protocol", "detail": 11}, false},
+		{"null", map[string]any{"type": "unsupported", "reason": "protocol", "detail": nil}, false},
+		{"empty", map[string]any{"type": "unsupported", "reason": "unknown_type", "detail": ""}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := schema.Validate(tc.content)
+			if tc.valid && err != nil {
+				t.Fatalf("rejected: %v", err)
+			}
+			if !tc.valid && err == nil {
+				t.Fatal("accepted")
+			}
+		})
+	}
+}

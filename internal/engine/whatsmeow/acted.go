@@ -596,7 +596,7 @@ func correctedContent(corrected *waE2E.Message) any {
 		// No Ref, on purpose: see protocol.MessageEdited.
 		return part.content
 	}
-	return protocol.Unsupported(protocol.UnsupportedUnknownType)
+	return protocol.Unsupported(protocol.UnsupportedUnknownType).Detailed(armOf(corrected))
 }
 
 // revokeOf renders `message.revoked`.

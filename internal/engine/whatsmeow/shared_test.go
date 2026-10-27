@@ -8,6 +8,7 @@ import (
 
 	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
 	waEvents "go.mau.fi/whatsmeow/types/events"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/engine"
@@ -481,18 +482,40 @@ func TestABodyWithNoArmIsPublishedAsAPlaceholderRatherThanRedeliveredForGood(t *
 		name   string
 		body   *waE2E.Message
 		reason string
+		// The arm that arrived, which is what somebody reading the placeholder in a
+		// database needs to tell a poll from a card. Empty means the key is absent.
+		detail string
 	}{
 		{"a poll", &waE2E.Message{PollCreationMessage: &waE2E.PollCreationMessage{
 			Name: proto.String("almoço?"),
-		}}, "unknown_type"},
-		{"a stanza carrying nothing", &waE2E.Message{}, "empty"},
+		}}, "unknown_type", "pollCreationMessage"},
+		// The context info is declared before every body WhatsApp sends with it, so a
+		// detail read off the first field set would name it on almost every placeholder.
+		{"a poll carrying what rides along", &waE2E.Message{
+			MessageContextInfo:    &waE2E.MessageContextInfo{MessageSecret: []byte("segredo")},
+			PollCreationMessageV3: &waE2E.PollCreationMessage{Name: proto.String("almoço?")},
+		}, "unknown_type", "pollCreationMessageV3"},
+		{"two arms, named by the first the descriptor declares", &waE2E.Message{
+			ButtonsMessage: &waE2E.ButtonsMessage{},
+			ListMessage:    &waE2E.ListMessage{},
+		}, "unknown_type", "listMessage"},
+		// An arm newer than this build's descriptor has no name here, only its number.
+		{"an arm this build's descriptor does not have", func() *waE2E.Message {
+			message := &waE2E.Message{}
+			message.ProtoReflect().SetUnknown(protowire.AppendBytes(protowire.AppendTag(nil, 9001, protowire.BytesType), []byte{0x0a, 0x01, 0x61}))
+			return message
+		}(), "unknown_type", "FIELD_9001"},
+		{"a verification code WhatsApp masked", &waE2E.Message{
+			PlaceholderMessage: &waE2E.PlaceholderMessage{Type: waE2E.PlaceholderMessage_MASK_LINKED_DEVICES.Enum()},
+		}, "masked", ""},
+		{"a stanza carrying nothing", &waE2E.Message{}, "empty", ""},
 		// Context info rides along on a message rather than being one, and WhatsApp
 		// attaches it to stanzas whose body is genuinely absent. Counted as content, all
 		// of those would be published as an unknown type instead of as the empty thing
 		// they are.
 		{"a stanza carrying only what rides along", &waE2E.Message{
 			MessageContextInfo: &waE2E.MessageContextInfo{MessageSecret: []byte("segredo")},
-		}, "empty"},
+		}, "empty", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -508,7 +531,22 @@ func TestABodyWithNoArmIsPublishedAsAPlaceholderRatherThanRedeliveredForGood(t *
 			if content["reason"] != tc.reason {
 				t.Fatalf("the placeholder says %v, want %q", content["reason"], tc.reason)
 			}
+			assertDetail(t, content, tc.detail)
 		})
+	}
+}
+
+// assertDetail holds the placeholder's detail to want, and to its absence when want is
+// empty: a client tells "nothing to say" from "an empty name" by the key being there.
+func assertDetail(t *testing.T, content map[string]any, want string) {
+	t.Helper()
+
+	detail, present := content["detail"]
+	switch {
+	case want == "" && present:
+		t.Fatalf("the placeholder carries detail %v, want none", detail)
+	case want != "" && detail != want:
+		t.Fatalf("the placeholder's detail is %v, want %q", detail, want)
 	}
 }
 
@@ -632,14 +670,17 @@ func TestAProtocolMessageSomebodySentIsShownRatherThanDropped(t *testing.T) {
 	t.Parallel()
 
 	for _, tc := range []struct {
-		name string
-		kind waE2E.ProtocolMessage_Type
+		name   string
+		kind   waE2E.ProtocolMessage_Type
+		detail string
 	}{
-		{"a disappearing timer being set", waE2E.ProtocolMessage_EPHEMERAL_SETTING},
-		{"a reminder", waE2E.ProtocolMessage_REMINDER_MESSAGE},
+		{"a disappearing timer being set", waE2E.ProtocolMessage_EPHEMERAL_SETTING, "EPHEMERAL_SETTING"},
+		{"a reminder", waE2E.ProtocolMessage_REMINDER_MESSAGE, "REMINDER_MESSAGE"},
 		// Nobody has looked at this one, which is the point of the list running the
-		// other way: an unread type is visible rather than silently gone.
-		{"a type this build's enum does not name", waE2E.ProtocolMessage_Type(99)},
+		// other way: an unread type is visible rather than silently gone. The enum has no
+		// name for it in this build, and the number is what a later one will be looked
+		// up by.
+		{"a type this build's enum does not name", waE2E.ProtocolMessage_Type(99), "TYPE_99"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -652,6 +693,7 @@ func TestAProtocolMessageSomebodySentIsShownRatherThanDropped(t *testing.T) {
 			if content["type"] != "unsupported" || content["reason"] != "protocol" {
 				t.Fatalf("something somebody did was published as %v, want the protocol placeholder", content)
 			}
+			assertDetail(t, content, tc.detail)
 		})
 	}
 }
