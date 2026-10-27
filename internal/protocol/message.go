@@ -416,11 +416,21 @@ const (
 type UnsupportedContent struct {
 	Type   string            `json:"type"`
 	Reason UnsupportedReason `json:"reason"`
+	// Detail names what WhatsApp actually sent, for whoever reads the placeholder later:
+	// the protocol message's type for `protocol`, the message's arm for `unknown_type`.
+	// Absent for every other reason, and when nothing could be named.
+	Detail string `json:"detail,omitempty"`
 }
 
 // Unsupported returns the content of a message nothing here can render.
 func Unsupported(reason UnsupportedReason) UnsupportedContent {
 	return UnsupportedContent{Type: "unsupported", Reason: reason}
+}
+
+// Detailed is the same placeholder, naming what arrived.
+func (c UnsupportedContent) Detailed(detail string) UnsupportedContent {
+	c.Detail = detail
+	return c
 }
 
 // The catalogues below are what TestPayloadEnumsMatchSchema walks. A value added to one
