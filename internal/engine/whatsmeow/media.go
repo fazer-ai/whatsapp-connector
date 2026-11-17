@@ -240,7 +240,15 @@ func (s *Session) mediaBody(ctx context.Context, event *waEvents.Message) (body,
 	if !ok {
 		return body{}, false
 	}
-	if viewOnce(event) {
+	return s.fileBody(ctx, event, &part, viewOnce(event))
+}
+
+// fileBody is mediaBody for a file already read out of its message, which is also how
+// the file at the top of a card is fetched. Whether the sender meant it to be seen once
+// is the caller's to say, because only the caller knows which part of the message the
+// flag on the event is about.
+func (s *Session) fileBody(ctx context.Context, event *waEvents.Message, part *attachment, once bool) (body, bool) {
+	if once {
 		// Never fetched, so there is nothing to keep. A blob is served for as long as
 		// anybody keeps asking for it — every hand-out puts its clock back — so storing
 		// one of these turns a file the sender expected to disappear into one the
@@ -266,7 +274,7 @@ func (s *Session) mediaBody(ctx context.Context, event *waEvents.Message) (body,
 	download, cancel := context.WithTimeout(ctx, s.downloadWait)
 	defer cancel()
 
-	ref, err := s.fetch(download, &part)
+	ref, err := s.fetch(download, part)
 	var giveUp refused
 	switch {
 	case errors.As(err, &giveUp):
@@ -285,7 +293,7 @@ func (s *Session) mediaBody(ctx context.Context, event *waEvents.Message) (body,
 		// The size recorded here is the sender's claim rather than a measurement, because
 		// nothing was measured. It only decides whether a refetch starts at all; a sender
 		// who understated is still caught by the cap on the way in.
-		recoverable := agedOffTheCDN(err) && s.remember(event, &part)
+		recoverable := agedOffTheCDN(err) && s.remember(event, part)
 		s.log.Warn().Err(err).Str("kind", string(part.content.Kind)).Bool("recoverable", recoverable).
 			Msg("publishing a media message whose file did not arrive with it")
 		return body{
@@ -308,7 +316,7 @@ func (s *Session) mediaBody(ctx context.Context, event *waEvents.Message) (body,
 	// against the cap rather than the one the sender announced. The two only differ for
 	// a sender who understated, and that is exactly the file a lowered cap should stop
 	// before it is downloaded rather than after.
-	s.remember(event, &part)
+	s.remember(event, part)
 	return body{content: part.content, context: part.context}, true
 }
 

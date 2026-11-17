@@ -728,6 +728,20 @@ func (r *dumpRun) pastBody(event *waEvents.Message) (body, bool) {
 	if shared, ok := sharedBody(event); ok {
 		return shared, true
 	}
+	if found, isACard := cardOf(event.Message); isACard {
+		if found.header != nil {
+			// Kept the way a file out of a dump is, so the client can ask for it later.
+			if r.replaced() || !s.rememberPast(r.ctx, event, found.header, r.device, r.chat) {
+				r.unkept = true
+			}
+			file := found.header.content
+			found.content.Media = &file
+		}
+		return body{content: found.content, context: found.context}, true
+	}
+	if answer, ok := cardAnswerOf(event.Message); ok {
+		return answer, true
+	}
 	if part, isAFile := attachmentOf(event.Message); isAFile {
 		if viewOnce(event) {
 			// Neither kept nor previewed, for the reason the live path gives.

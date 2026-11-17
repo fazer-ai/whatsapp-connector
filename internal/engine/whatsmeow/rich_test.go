@@ -103,6 +103,8 @@ func TestACardIsPublishedWithEveryPartAnAgentReads(t *testing.T) {
 						{Name: proto.String("cta_call"), ButtonParamsJSON: proto.String(`{"display_text":"Ligar","phone_number":"+5541988887777"}`)},
 						{Name: proto.String("open_webview"), ButtonParamsJSON: proto.String(`{"title":"Ver no site","link":{"url":"https://exemplo.com/site"}}`)},
 						{Name: proto.String("single_select"), ButtonParamsJSON: proto.String(`{"title":"Opções","sections":[{"rows":[{"title":"Plano A"},{"title":"Plano B"}]}]}`)},
+						// A button with no label is nothing anybody can read.
+						{Name: proto.String("quick_reply"), ButtonParamsJSON: proto.String(`{"id":"sem-rotulo"}`)},
 						// Not JSON at all: the button is lost, the card is not.
 						{Name: proto.String("quick_reply"), ButtonParamsJSON: proto.String(`{não é json`)},
 					},
@@ -207,7 +209,7 @@ func TestACardSentInsideAViewOnceEnvelopeIsStillACard(t *testing.T) {
 
 	session, _ := newTestSession(t, "5511999990001")
 	event := textMessage("3EB0VOCARD", "")
-	event.Message = &waE2E.Message{ViewOnceMessage: &waE2E.FutureProofMessage{Message: &waE2E.Message{
+	event.RawMessage = &waE2E.Message{ViewOnceMessage: &waE2E.FutureProofMessage{Message: &waE2E.Message{
 		InteractiveMessage: &waE2E.InteractiveMessage{
 			Body: &waE2E.InteractiveMessage_Body{Text: proto.String("Oferta da semana")},
 			InteractiveMessage: &waE2E.InteractiveMessage_NativeFlowMessage_{NativeFlowMessage: &waE2E.InteractiveMessage_NativeFlowMessage{
