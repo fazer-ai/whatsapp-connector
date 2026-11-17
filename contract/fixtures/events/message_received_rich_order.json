@@ -49,7 +49,7 @@
               "price_1000": 10000,
               "currency": "EUR",
               "variant": "Tamanho: M",
-              "image": "https://mmg.whatsapp.net/v/t45.5328-4/camiseta.jpg"
+              "image": "https://example.invalid/catalog/camiseta.jpg"
             },
             {
               "product_id": "7310825967413",

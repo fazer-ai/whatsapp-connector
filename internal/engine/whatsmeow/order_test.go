@@ -84,11 +84,11 @@ func (q *orderQuery) calls() []map[string]any {
 // catalogAnswer is the catalog's answer for the two-item order, in the shape WhatsApp
 // Web was measured receiving, with the prices multiplied by scale and the given total.
 func catalogAnswer(scale, total int64) string {
-	return fmt.Sprintf(`{"data":{"xwa_checkout_get_order_info":{"order":{"creation_time_stamp":1794948016,
+	return fmt.Sprintf(`{"data":{"xwa_checkout_get_order_info":{"order":{"creation_time_stamp":1790000000,
 		"products":[
 			{"id":"P1","name":"Camiseta","price":"%d","currency":"EUR","quantity":1,
 			 "variant_info":{"variant_properties":[{"name":"Tamanho","value":"M"}]},
-			 "media":{"images":[{"id":"1","request_image_url":"https://mmg.whatsapp.net/p1.jpg"}]}},
+			 "media":{"images":[{"id":"1","request_image_url":"https://example.invalid/catalog/p1.jpg"}]}},
 			{"id":"P2","name":"Caneca","price":"%d","currency":"EUR","quantity":1,
 			 "variant_info":{"variant_properties":[]},"media":{"images":[]}}],
 		"price_details":{"subtotal_amount":%d,"currency":"EUR","total_amount":%d}}}},"extensions":{"is_final":true}}`,
@@ -173,7 +173,7 @@ func TestACatalogOrderIsPublishedWithItsItems(t *testing.T) {
 	second, _ := items[1].(map[string]any)
 	for field, want := range map[string]any{
 		"product_id": "P1", "name": "Camiseta", "quantity": float64(1), "price_1000": float64(10000), "currency": "EUR",
-		"variant": "Tamanho: M", "image": "https://mmg.whatsapp.net/p1.jpg",
+		"variant": "Tamanho: M", "image": "https://example.invalid/catalog/p1.jpg",
 	} {
 		if first[field] != want {
 			t.Errorf("items[0].%s is %v, want %v", field, first[field], want)
@@ -524,16 +524,16 @@ func TestTheMeasuredOrderIsAskedAndReadAsWhatsAppWebDoes(t *testing.T) {
 	t.Parallel()
 
 	session, _ := newTestSession(t, "5511999990001")
-	query := &orderQuery{answer: `{"data":{"xwa_checkout_get_order_info":{"order":{"creation_time_stamp":1794948016,
-		"products":[{"id":"70000000000000001","name":"Produto exemplo","price":"12500","currency":"EUR",
-		"variant_info":{"variant_properties":[]},"media":{"images":[{"id":"70000000000000002","request_image_url":"https://mmg.whatsapp.net/v/t45.jpg"}]},"quantity":1}],
-		"price_details":{"subtotal_amount":12500,"currency":"EUR","total_amount":12500}}}},"extensions":{"is_final":true}}`}
+	query := &orderQuery{answer: `{"data":{"xwa_checkout_get_order_info":{"order":{"creation_time_stamp":1790000000,
+		"products":[{"id":"70000000000000001","name":"Caneca","price":"34900","currency":"EUR",
+		"variant_info":{"variant_properties":[]},"media":{"images":[{"id":"70000000000000002","request_image_url":"https://example.invalid/catalog/caneca.jpg"}]},"quantity":1}],
+		"price_details":{"subtotal_amount":34900,"currency":"EUR","total_amount":34900}}}},"extensions":{"is_final":true}}`}
 	query.install(t, session)
 	sent := &waE2E.OrderMessage{
 		OrderID: proto.String("70000000000000003"), Token: proto.String("dG9rZW4="), ItemCount: proto.Int32(1),
 		Status: waE2E.OrderMessage_INQUIRY.Enum(), Surface: waE2E.OrderMessage_CATALOG.Enum(),
 		OrderTitle: proto.String("Loja Exemplo"), SellerJID: proto.String("10000000000001@lid"),
-		TotalAmount1000: proto.Int64(12500), TotalCurrencyCode: proto.String("EUR"),
+		TotalAmount1000: proto.Int64(34900), TotalCurrencyCode: proto.String("EUR"),
 	}
 
 	order := orderOf(t, inboundContentOf(t, publishedBy(t, session, orderEvent("3EB0MEASURED", sent))))
@@ -542,7 +542,7 @@ func TestTheMeasuredOrderIsAskedAndReadAsWhatsAppWebDoes(t *testing.T) {
 		t.Fatalf("the order lists %v", order["items"])
 	}
 	item, _ := items[0].(map[string]any)
-	if item["name"] != "Produto exemplo" || item["price_1000"] != float64(12500) || item["image"] != "https://mmg.whatsapp.net/v/t45.jpg" {
+	if item["name"] != "Caneca" || item["price_1000"] != float64(34900) || item["image"] != "https://example.invalid/catalog/caneca.jpg" {
 		t.Errorf("the item went out as %v", item)
 	}
 	if seller, _ := order["seller"].(map[string]any); seller["kind"] != "lid" || seller["id"] != "10000000000001" || order["title"] != "Loja Exemplo" {
