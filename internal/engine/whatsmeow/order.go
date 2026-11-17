@@ -119,11 +119,16 @@ func amountLabel(thousandths int64, code string) string {
 	if negative {
 		thousandths = -thousandths
 	}
-	// From thousandths to the currency's minor unit: down, rounding half up, for one
-	// with fewer than three decimals, and up for one with more.
+	// From thousandths to the currency's minor unit: down for one with fewer than three
+	// decimals, rounding half up once at the target precision (rounding digit by digit
+	// turns 1.490 yen into 2), and up for one with more.
 	minor := thousandths
-	for range max(3-digits, 0) {
-		minor = (minor + 5) / 10
+	if digits < 3 {
+		divisor := int64(1)
+		for range 3 - digits {
+			divisor *= 10
+		}
+		minor = (thousandths + divisor/2) / divisor
 	}
 	for range max(digits-3, 0) {
 		minor *= 10
