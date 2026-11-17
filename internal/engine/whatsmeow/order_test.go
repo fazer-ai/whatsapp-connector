@@ -590,3 +590,25 @@ func TestAnOrderWithNoSellerIsNotLookedUp(t *testing.T) {
 		t.Errorf("the catalog was asked about an order with no seller: %v", calls)
 	}
 }
+
+// What the contract cannot carry is left out of the order rather than published for a
+// client to refuse along with the message: a count below zero, a line with a negative
+// quantity.
+func TestAnOrderLeavesOutCountsTheContractCannotCarry(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	(&orderQuery{answer: `{"data":{"xwa_checkout_get_order_info":{"order":{
+		"products":[{"id":"A","name":"Certo","price":"10000","currency":"EUR","quantity":1},
+		            {"id":"B","name":"Errado","price":"10000","currency":"EUR","quantity":-1}],
+		"price_details":{"subtotal_amount":25000,"total_amount":25000}}}}}`}).install(t, session)
+	sent := catalogOrder()
+	sent.ItemCount = proto.Int32(-2)
+
+	content := inboundContentOf(t, publishedBy(t, session, orderEvent("3EB0NEGATIVE", sent)))
+	order := orderOf(t, content)
+	items, _ := order["items"].([]any)
+	if order["item_count"] != nil || content["title"] != nil || len(items) != 1 {
+		t.Errorf("the order went out with count %v, title %v and items %v", order["item_count"], content["title"], order["items"])
+	}
+}

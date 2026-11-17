@@ -70,8 +70,14 @@ const orderDetailsWait = 5 * time.Second
 // own language from the numbers.
 func orderCard(sent *waE2E.OrderMessage) protocol.RichContent {
 	content := protocol.Rich(protocol.RichOrder)
-	if sent.ItemCount != nil {
-		content.Title = itemCountLabel(sent.GetItemCount())
+	// A count below zero is nothing WhatsApp shows and nothing the contract carries, so it
+	// is left out rather than published for a client to refuse with the message.
+	count := sent.ItemCount
+	if count != nil && *count < 0 {
+		count = nil
+	}
+	if count != nil {
+		content.Title = itemCountLabel(*count)
 	}
 	content.Body = sent.GetMessage()
 	if sent.TotalAmount1000 != nil {
@@ -82,7 +88,7 @@ func orderCard(sent *waE2E.OrderMessage) protocol.RichContent {
 	order := &protocol.Order{
 		ID:        sent.GetOrderID(),
 		Title:     sent.GetOrderTitle(),
-		ItemCount: sent.ItemCount,
+		ItemCount: count,
 		Total1000: sent.TotalAmount1000,
 		Currency:  sent.GetTotalCurrencyCode(),
 		Seller:    sellerOf(sent.GetSellerJID()),
@@ -322,6 +328,10 @@ func itemize(order *protocol.Order, details *orderDetails) bool {
 	}
 	for i := range details.products {
 		product := &details.products[i]
+		if product.Quantity < 0 {
+			// Not a line anybody bought, and not one the contract carries.
+			continue
+		}
 		item := protocol.OrderItem{
 			ProductID: product.ID,
 			Name:      product.Name,
