@@ -73,7 +73,7 @@ func catalogOrder() *waE2E.OrderMessage {
 	}
 }
 
-func orderDetailsAt(scale int64, total int64) *waTypes.OrderDetails {
+func orderDetailsAt(scale, total int64) *waTypes.OrderDetails {
 	return &waTypes.OrderDetails{
 		ID: "ORD-1",
 		Products: []waTypes.OrderProduct{
@@ -168,6 +168,8 @@ func TestAnOrdersPricesAreReadInTheScaleTheMessagesTotalProves(t *testing.T) {
 		{name: "in whole units", details: orderDetailsAt(1, 25), prices: []any{float64(10000), float64(15000)}},
 		{name: "in neither", details: orderDetailsAt(1000, 999), prices: []any{nil, nil}},
 		{name: "with no total on the message to compare", details: orderDetailsAt(1000, 25000), total: proto.Int64(0), prices: []any{nil, nil}},
+		// Zero against zero matches either way, and proves nothing about the prices.
+		{name: "with both totals zero", details: orderDetailsAt(1000, 0), total: proto.Int64(0), prices: []any{nil, nil}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -277,6 +279,11 @@ func TestAnOrderWithNothingButItsIDIsStillAnOrder(t *testing.T) {
 	order := orderOf(t, content)
 	if order["id"] != "ORD-3" {
 		t.Errorf("order.id is %v", order["id"])
+	}
+	// A status WhatsApp did not send reads as the first of its values, which would say the
+	// customer asked for something nobody asked for.
+	if order["status"] != nil || order["surface"] != nil {
+		t.Errorf("a bare order went out with status %v and surface %v", order["status"], order["surface"])
 	}
 	if content["title"] != nil || content["body"] != nil || order["thumbnail"] != nil {
 		t.Errorf("a bare order was dressed up: title %v, body %v, thumbnail %v", content["title"], content["body"], order["thumbnail"])
