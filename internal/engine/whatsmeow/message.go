@@ -287,6 +287,12 @@ func (s *Session) bodyOf(ctx context.Context) renderBody {
 		if shared, ok := sharedBody(event); ok {
 			return shared, true
 		}
+		if found, isACard := cardOf(event.Message); isACard {
+			return s.cardBody(ctx, event, &found)
+		}
+		if answer, ok := cardAnswerOf(event.Message); ok {
+			return answer, true
+		}
 		if _, isAFile := attachmentOf(event.Message); isAFile {
 			// Asked before mediaBody rather than after it, and the difference is the
 			// whole reason the placeholder below is safe. A false from mediaBody means

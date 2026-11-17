@@ -371,6 +371,50 @@ func Contacts(cards []Contact) ContactsContent {
 	return ContactsContent{Type: "contacts", Contacts: cards}
 }
 
+// RichButton is one button on a card, as the card shows it.
+//
+// URL and Phone are what a link button and a call button do. A reply button does
+// neither, and a client draws it as a label, because tapping it here would answer
+// nothing: the answer is the customer's to give.
+type RichButton struct {
+	Text  string `json:"text"`
+	URL   string `json:"url,omitempty"`
+	Phone string `json:"phone,omitempty"`
+}
+
+// Kinds of card, named after the WhatsApp shape each one arrived in. A client renders
+// every kind the same way, so the name is for whoever reads the stored card later.
+const (
+	RichTemplate    = "template"
+	RichInteractive = "interactive"
+	RichButtons     = "buttons"
+	RichList        = "list"
+)
+
+// RichContent is a card a business sent: a template, a message with buttons, a list.
+//
+// It carries the parts the way the sender laid them out rather than as one text, because
+// a client renders a card as a card, and its preview text is derived from the parts. The
+// buttons are what the customer was offered; the one they tapped arrives later as their
+// own message.
+type RichContent struct {
+	Type    string       `json:"type"`
+	Kind    string       `json:"kind,omitempty"`
+	Title   string       `json:"title,omitempty"`
+	Body    string       `json:"body,omitempty"`
+	Footer  string       `json:"footer,omitempty"`
+	Buttons []RichButton `json:"buttons,omitempty"`
+	// Media is the file at the top of the card, if it has one. It is a file like any
+	// other, with the reference a client fetches it by.
+	Media *MediaContent `json:"media,omitempty"`
+}
+
+// Rich returns the content of a card of the given kind, for a caller that fills in the
+// parts it has.
+func Rich(kind string) RichContent {
+	return RichContent{Type: "rich", Kind: kind}
+}
+
 // UnsupportedReason is why a message arrived without a body a client can render.
 type UnsupportedReason string
 
