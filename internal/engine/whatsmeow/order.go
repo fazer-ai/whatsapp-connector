@@ -291,15 +291,15 @@ func (s *Session) orderItems(ctx context.Context, orderID, token, seller string)
 				} `json:"order"`
 			} `json:"xwa_checkout_get_order_info"`
 		} `json:"data"`
-		Errors []struct {
-			Message string `json:"message"`
-		} `json:"errors"`
+		Errors []json.RawMessage `json:"errors"`
 	}
 	if err := json.Unmarshal(raw, &answer); err != nil {
 		return nil, fmt.Errorf("decode the catalog's answer: %w", err)
 	}
 	if len(answer.Errors) > 0 {
-		return nil, fmt.Errorf("the catalog refused the query: %s", answer.Errors[0].Message)
+		// Counted and not quoted: an error can echo the query back, and the query carries
+		// the order's token.
+		return nil, fmt.Errorf("the catalog refused the query with %d error(s)", len(answer.Errors))
 	}
 	order := answer.Data.Info.Order
 	if order == nil {
