@@ -144,7 +144,7 @@ func TestACatalogOrderIsPublishedWithItsItems(t *testing.T) {
 	// What WhatsApp shows on the order in the chat: the count, the estimated total and the
 	// customer's words. The seller's name is not on WhatsApp's card.
 	for field, want := range map[string]any{
-		"title": "🛒 2 items", "body": "Quero entregar amanhã", "footer": "€25.00 (estimated total)",
+		"title": "2 items", "body": "Quero entregar amanhã", "footer": "€25.00 (estimated total)",
 	} {
 		if content[field] != want {
 			t.Errorf("the card's %s is %v, want %v", field, content[field], want)
@@ -490,14 +490,14 @@ func TestAnOrdersCardReadsTheWayWhatsAppShowsIt(t *testing.T) {
 		currency      string
 		title, footer any
 	}{
-		{name: "one item", count: proto.Int32(1), total: proto.Int64(12500), currency: "EUR", title: "🛒 1 item", footer: "€12.50 (estimated total)"},
-		{name: "a currency with no cents", count: proto.Int32(3), total: proto.Int64(1500000), currency: "JPY", title: "🛒 3 items", footer: "¥1500 (estimated total)"},
+		{name: "one item", count: proto.Int32(1), total: proto.Int64(12500), currency: "EUR", title: "1 item", footer: "€12.50 (estimated total)"},
+		{name: "a currency with no cents", count: proto.Int32(3), total: proto.Int64(1500000), currency: "JPY", title: "3 items", footer: "¥1500 (estimated total)"},
 		// Rounded once at the yen, not digit by digit: 1.490 is 1, not 2.
-		{name: "a fraction of a yen", count: proto.Int32(1), total: proto.Int64(1490), currency: "JPY", title: "🛒 1 item", footer: "¥1 (estimated total)"},
-		{name: "a total in fractions of a cent", count: proto.Int32(2), total: proto.Int64(12345), currency: "USD", title: "🛒 2 items", footer: "$12.35 (estimated total)"},
-		{name: "a currency with four decimals", count: proto.Int32(1), total: proto.Int64(12500), currency: "CLF", title: "🛒 1 item", footer: "CLF12.5000 (estimated total)"},
-		{name: "a currency nothing here knows", count: proto.Int32(2), total: proto.Int64(12500), currency: "ZZZ", title: "🛒 2 items", footer: nil},
-		{name: "no total", count: proto.Int32(2), currency: "EUR", title: "🛒 2 items", footer: nil},
+		{name: "a fraction of a yen", count: proto.Int32(1), total: proto.Int64(1490), currency: "JPY", title: "1 item", footer: "¥1 (estimated total)"},
+		{name: "a total in fractions of a cent", count: proto.Int32(2), total: proto.Int64(12345), currency: "USD", title: "2 items", footer: "$12.35 (estimated total)"},
+		{name: "a currency with four decimals", count: proto.Int32(1), total: proto.Int64(12500), currency: "CLF", title: "1 item", footer: "CLF12.5000 (estimated total)"},
+		{name: "a currency nothing here knows", count: proto.Int32(2), total: proto.Int64(12500), currency: "ZZZ", title: "2 items", footer: nil},
+		{name: "no total", count: proto.Int32(2), currency: "EUR", title: "2 items", footer: nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()

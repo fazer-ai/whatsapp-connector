@@ -62,7 +62,8 @@ const orderDetailsWait = 5 * time.Second
 // orderCard is the card an order is published as, before anything is asked about it.
 //
 // The parts are what WhatsApp shows in the chat, on both sides: the item count, the
-// estimated total, and the customer's own words. The order's title, which is the seller
+// estimated total, and the customer's own words. WhatsApp draws a cart icon beside the
+// count, which is the client's to draw, so the count goes out as words alone. The order's title, which is the seller
 // account's name, is not on WhatsApp's card, so it stays inside the order for whoever
 // wants it rather than on top of the card. The count and the total are written the way
 // WhatsApp Web writes them in English, which is the language the items are asked in, for
@@ -106,9 +107,9 @@ func orderCard(sent *waE2E.OrderMessage) protocol.RichContent {
 
 func itemCountLabel(count int32) string {
 	if count == 1 {
-		return "🛒 1 item"
+		return "1 item"
 	}
-	return fmt.Sprintf("🛒 %d items", count)
+	return fmt.Sprintf("%d items", count)
 }
 
 // amountLabel is an amount in thousandths written as WhatsApp Web writes a price: the

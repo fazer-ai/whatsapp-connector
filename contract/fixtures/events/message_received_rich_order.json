@@ -24,7 +24,7 @@
       "content": {
         "type": "rich",
         "kind": "order",
-        "title": "🛒 2 items",
+        "title": "2 items",
         "body": "Pode entregar amanhã?",
         "footer": "€25.00 (estimated total)",
         "order": {
