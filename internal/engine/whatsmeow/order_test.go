@@ -270,6 +270,11 @@ func TestAnOrderWhoseItemsCannotBeReadStillArrives(t *testing.T) {
 	}{
 		{name: "the query fails", query: &orderQuery{status: http.StatusInternalServerError}},
 		{name: "the query is refused", query: &orderQuery{answer: `{"errors":[{"message":"bad token"}]}`}},
+		// An answer is only an answer with a 200 and no errors, whatever else it carries.
+		{name: "the query fails with an order in the body", query: &orderQuery{status: http.StatusInternalServerError, answer: catalogAnswer(1000, 25000)}},
+		{name: "the query is refused with an order beside the errors", query: &orderQuery{
+			answer: strings.Replace(catalogAnswer(1000, 25000), `"extensions"`, `"errors":[{"message":"bad token"}],"extensions"`, 1),
+		}},
 		{name: "the query never answers", query: &orderQuery{blocked: true}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
