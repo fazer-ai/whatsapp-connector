@@ -166,6 +166,7 @@ func withBody(message *protocol.InboundMessage, event *waEvents.Message, render 
 
 	message.Content = said.content
 	message.QuotedID = said.context.GetStanzaID()
+	message.QuotedProduct = quotedProductOf(said.context)
 	message.Mentions = mentionsOf(said.context)
 	message.Ephemeral = said.context.GetExpiration()
 	return said.missing, true
