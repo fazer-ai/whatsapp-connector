@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -238,6 +239,15 @@ type Session struct {
 	// otherwise reach the payload this connector refuses and nothing of what it makes of
 	// an answer.
 	createTheGroup func(context.Context, *wm.Client, keyedCreate) (*waTypes.GroupInfo, error)
+
+	// orderEndpoint and orderHTTP are where a live catalog order asks for its items and
+	// the client it asks with. Fields so a test can stand a server in WhatsApp's place: the
+	// query is HTTPS to WhatsApp's catalog API, not something a fake socket answers. A nil
+	// orderHTTP goes out by the session's own route, the proxy included. orderWait is how
+	// long a live order waits for the answer before it is published without its items.
+	orderEndpoint string
+	orderHTTP     *http.Client
+	orderWait     time.Duration
 
 	onWhatsApp func(context.Context, *wm.Client, []string) ([]waTypes.IsOnWhatsAppResponse, error)
 	//nolint:lll // one line per seam reads better than a wrapped signature
@@ -828,6 +838,8 @@ func newSession(
 		groupInfo:       groupInfoOverClient,
 		joinedGroups:    joinedGroupsOverClient,
 		createTheGroup:  createKeyedGroupOverClient,
+		orderEndpoint:   orderCatalogEndpoint,
+		orderWait:       orderDetailsWait,
 		onWhatsApp: func(ctx context.Context, client *wm.Client, phones []string) ([]waTypes.IsOnWhatsAppResponse, error) {
 			return client.IsOnWhatsApp(ctx, phones) //nolint:wrapcheck // wrapped by its caller
 		},

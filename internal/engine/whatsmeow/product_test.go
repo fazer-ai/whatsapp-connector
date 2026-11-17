@@ -32,11 +32,11 @@ var productThumbnail = []byte("\xff\xd8\xff\xe0 miniatura do produto")
 
 func catalogProduct() *waE2E.ProductMessage_ProductSnapshot {
 	return &waE2E.ProductMessage_ProductSnapshot{
-		ProductID:         proto.String("29548935431457387"),
-		Title:             proto.String("Produto teste"),
-		Description:       proto.String("Item de teste, não comprar"),
+		ProductID:         proto.String("70000000000000101"),
+		Title:             proto.String("Caneca"),
+		Description:       proto.String("Caneca de cerâmica, 300 ml"),
 		CurrencyCode:      proto.String("BRL"),
-		PriceAmount1000:   proto.Int64(12500),
+		PriceAmount1000:   proto.Int64(45900),
 		ProductImageCount: proto.Uint32(1),
 		ProductImage: &waE2E.ImageMessage{
 			Mimetype: proto.String("image/jpeg"), Width: proto.Uint32(400), Height: proto.Uint32(400),
@@ -102,8 +102,8 @@ func TestAQuestionFromTheCatalogCarriesTheProductItQuotes(t *testing.T) {
 		t.Fatalf("the question was published without the product it quotes: %v", message)
 	}
 	for field, want := range map[string]any{
-		"id": "29548935431457387", "title": "Produto teste", "description": "Item de teste, não comprar",
-		"currency": "BRL", "price_1000": float64(12500), "image_count": float64(1),
+		"id": "70000000000000101", "title": "Caneca", "description": "Caneca de cerâmica, 300 ml",
+		"currency": "BRL", "price_1000": float64(45900), "image_count": float64(1),
 	} {
 		if product[field] != want {
 			t.Errorf("the quoted product's %s is %v, want %v", field, product[field], want)
@@ -136,7 +136,7 @@ func TestAQuotedProductWithPartsMissingPublishesWhatItHas(t *testing.T) {
 	if !ok {
 		t.Fatal("the question was published without the product it quotes")
 	}
-	if product["title"] != "Produto teste" || product["id"] != "29548935431457387" {
+	if product["title"] != "Caneca" || product["id"] != "70000000000000101" {
 		t.Errorf("the quoted product is %v", product)
 	}
 	for _, absent := range []string{"price_1000", "currency", "thumbnail", "owner"} {
@@ -203,12 +203,12 @@ func TestAProductSentOnItsOwnIsACardWithItsPicture(t *testing.T) {
 	if content["type"] != "rich" || content["kind"] != "product" {
 		t.Fatalf("the product was published as %v", content)
 	}
-	if content["title"] != "Produto teste" || content["body"] != "Item de teste, não comprar" {
+	if content["title"] != "Caneca" || content["body"] != "Caneca de cerâmica, 300 ml" {
 		t.Errorf("the product card reads %q / %q", content["title"], content["body"])
 	}
 	product, _ := content["product"].(map[string]any)
 	for field, want := range map[string]any{
-		"id": "29548935431457387", "currency": "BRL", "price_1000": float64(12500), "image_count": float64(1),
+		"id": "70000000000000101", "currency": "BRL", "price_1000": float64(45900), "image_count": float64(1),
 	} {
 		if product[field] != want {
 			t.Errorf("the product's %s is %v, want %v", field, product[field], want)
@@ -295,11 +295,11 @@ func TestProductsFromADumpGoOutLikeLiveOnes(t *testing.T) {
 		t.Fatalf("decode the slice: %v", err)
 	}
 	quoted, _ := messages[0]["quoted_product"].(map[string]any)
-	if quoted["title"] != "Produto teste" || quoted["price_1000"] != float64(12500) {
+	if quoted["title"] != "Caneca" || quoted["price_1000"] != float64(45900) {
 		t.Errorf("the question from the dump quotes %v", messages[0]["quoted_product"])
 	}
 	content, _ := messages[1]["content"].(map[string]any)
-	if content["type"] != "rich" || content["kind"] != "product" || content["title"] != "Produto teste" {
+	if content["type"] != "rich" || content["kind"] != "product" || content["title"] != "Caneca" {
 		t.Fatalf("the product from the dump went out as %v", content)
 	}
 	picture, _ := content["media"].(map[string]any)
