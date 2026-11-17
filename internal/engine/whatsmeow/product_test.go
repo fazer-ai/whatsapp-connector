@@ -310,3 +310,37 @@ func TestProductsFromADumpGoOutLikeLiveOnes(t *testing.T) {
 		t.Errorf("the picture was downloaded %d times while the dump was published", fetched)
 	}
 }
+
+// WhatsApp may send a product with no snapshot at all, only the account whose catalog it
+// is from. That is still a product to look up, with its owner, and never a crash.
+func TestAProductWithNoSnapshotIsStillAProductWithItsOwner(t *testing.T) {
+	t.Parallel()
+
+	t.Run("sent on its own", func(t *testing.T) {
+		t.Parallel()
+
+		session, _ := newTestSession(t, "5511999990001")
+		event := textMessage("3EB0NOSNAP", "")
+		event.Message = &waE2E.Message{ProductMessage: &waE2E.ProductMessage{BusinessOwnerJID: proto.String("5511999990001@s.whatsapp.net")}}
+
+		content := inboundContentOf(t, publishedBy(t, session, event))
+		product, _ := content["product"].(map[string]any)
+		owner, _ := product["owner"].(map[string]any)
+		if content["kind"] != "product" || owner["id"] != "5511999990001" || len(product) != 1 {
+			t.Fatalf("a product with no snapshot was published as %v", content)
+		}
+	})
+	t.Run("quoted", func(t *testing.T) {
+		t.Parallel()
+
+		session, _ := newTestSession(t, "5511999990001")
+		event := textMessage("3EB0NOSNAPQ", "")
+		event.Message = productInquiry(nil, "100000000000001@lid")
+
+		product, _ := messageMapOf(t, publishedBy(t, session, event))["quoted_product"].(map[string]any)
+		owner, _ := product["owner"].(map[string]any)
+		if owner["id"] != "100000000000001" || len(product) != 1 {
+			t.Fatalf("a quoted product with no snapshot was published as %v", product)
+		}
+	})
+}

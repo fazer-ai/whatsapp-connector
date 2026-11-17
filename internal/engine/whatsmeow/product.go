@@ -26,6 +26,12 @@ import (
 // a client there is a product to look up on the phone.
 func productOf(sent *waE2E.ProductMessage) *protocol.Product {
 	snapshot := sent.GetProduct()
+	if snapshot == nil {
+		// WhatsApp may leave the snapshot out: the getters read nil as empty, but the
+		// presence checks below read the fields directly, and a missing price is not a
+		// price of zero.
+		snapshot = &waE2E.ProductMessage_ProductSnapshot{}
+	}
 	product := &protocol.Product{
 		ID:          snapshot.GetProductID(),
 		Title:       snapshot.GetTitle(),
