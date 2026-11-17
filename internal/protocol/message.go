@@ -435,11 +435,14 @@ type RichContent struct {
 // Order is an order placed from a business's catalog, as WhatsApp describes it.
 //
 // Amounts are in thousandths of the currency's unit, the scale WhatsApp writes an order's
-// total in, so a client formats them for its own locale. The items come from a query of
-// their own, and an order whose query did not answer -- or whose prices could not be
+// total in, so a client formats them for its own locale. The items come from WhatsApp's
+// catalog API, and an order whose query did not answer -- or whose prices could not be
 // proved to be in that scale -- is published without them, or without their prices.
 type Order struct {
 	ID string `json:"id"`
+	// Title is the order's title as WhatsApp carried it, which is the seller account's
+	// name. WhatsApp does not show it on the card, so neither does the card here.
+	Title string `json:"title,omitempty"`
 	// Status and Surface are WhatsApp's own names (INQUIRY, ACCEPTED, DECLINED; CATALOG),
 	// passed through, so a value WhatsApp adds later arrives instead of vanishing.
 	Status  string `json:"status,omitempty"`
@@ -464,6 +467,8 @@ type OrderItem struct {
 	Price1000 *int64 `json:"price_1000,omitempty"`
 	Currency  string `json:"currency,omitempty"`
 	Variant   string `json:"variant,omitempty"`
+	// Image is the product's picture, a URL on WhatsApp's media host.
+	Image string `json:"image,omitempty"`
 }
 
 // Product is a product from a business's catalog, as WhatsApp carries it in a message.

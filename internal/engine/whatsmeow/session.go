@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -239,12 +240,14 @@ type Session struct {
 	// an answer.
 	createTheGroup func(context.Context, *wm.Client, keyedCreate) (*waTypes.GroupInfo, error)
 
-	// orderDetails asks WhatsApp for the items of a catalog order. A seam like the queries
-	// above it: one IQ, so without it a test reaches neither an answer nor a server that
-	// never gives one. orderWait is how long a live order waits for it before it is
-	// published without its items.
-	orderDetails func(ctx context.Context, client *wm.Client, orderID, token string) (*waTypes.OrderDetails, error)
-	orderWait    time.Duration
+	// orderEndpoint and orderHTTP are where a live catalog order asks for its items and
+	// the client it asks with. Fields so a test can stand a server in WhatsApp's place: the
+	// query is HTTPS to WhatsApp's catalog API, not something a fake socket answers. A nil
+	// orderHTTP goes out by the session's own route, the proxy included. orderWait is how
+	// long a live order waits for the answer before it is published without its items.
+	orderEndpoint string
+	orderHTTP     *http.Client
+	orderWait     time.Duration
 
 	onWhatsApp func(context.Context, *wm.Client, []string) ([]waTypes.IsOnWhatsAppResponse, error)
 	//nolint:lll // one line per seam reads better than a wrapped signature
@@ -835,13 +838,8 @@ func newSession(
 		groupInfo:       groupInfoOverClient,
 		joinedGroups:    joinedGroupsOverClient,
 		createTheGroup:  createKeyedGroupOverClient,
-		orderDetails: func(ctx context.Context, client *wm.Client, orderID, token string) (*waTypes.OrderDetails, error) {
-			if client == nil {
-				return nil, wm.ErrClientIsNil
-			}
-			return client.GetOrderDetails(ctx, orderID, token) //nolint:wrapcheck // logged by its caller, which publishes without the items
-		},
-		orderWait: orderDetailsWait,
+		orderEndpoint:   orderCatalogEndpoint,
+		orderWait:       orderDetailsWait,
 		onWhatsApp: func(ctx context.Context, client *wm.Client, phones []string) ([]waTypes.IsOnWhatsAppResponse, error) {
 			return client.IsOnWhatsApp(ctx, phones) //nolint:wrapcheck // wrapped by its caller
 		},

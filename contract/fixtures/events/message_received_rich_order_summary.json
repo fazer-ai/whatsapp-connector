@@ -24,14 +24,16 @@
       "content": {
         "type": "rich",
         "kind": "order",
-        "title": "Pedido Loja Central",
+        "title": "🛒 2 items",
+        "footer": "€25.00 (estimated total)",
         "order": {
           "id": "9847261538204715",
+          "title": "Pedido Loja Central",
           "status": "INQUIRY",
           "surface": "CATALOG",
           "item_count": 2,
           "total_1000": 25000,
-          "currency": "BRL",
+          "currency": "EUR",
           "seller": "5541988887777"
         }
       }

@@ -24,33 +24,36 @@
       "content": {
         "type": "rich",
         "kind": "order",
-        "title": "Pedido Loja Central",
+        "title": "🛒 2 items",
         "body": "Pode entregar amanhã?",
+        "footer": "€25.00 (estimated total)",
         "order": {
           "id": "9847261538204715",
+          "title": "Pedido Loja Central",
           "status": "INQUIRY",
           "surface": "CATALOG",
           "item_count": 2,
           "total_1000": 25000,
-          "currency": "BRL",
+          "currency": "EUR",
+          "subtotal_1000": 25000,
           "seller": "5541988887777",
           "thumbnail": "data:image/jpeg;base64,/9j/4A==",
-          "subtotal_1000": 25000,
           "items": [
             {
               "product_id": "7310825967412",
               "name": "Camiseta",
               "quantity": 1,
               "price_1000": 10000,
-              "currency": "BRL",
-              "variant": "M"
+              "currency": "EUR",
+              "variant": "Tamanho: M",
+              "image": "https://mmg.whatsapp.net/v/t45.5328-4/camiseta.jpg"
             },
             {
               "product_id": "7310825967413",
               "name": "Caneca",
               "quantity": 1,
               "price_1000": 15000,
-              "currency": "BRL"
+              "currency": "EUR"
             }
           ]
         }
