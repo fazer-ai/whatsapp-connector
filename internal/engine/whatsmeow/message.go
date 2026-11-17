@@ -288,6 +288,9 @@ func (s *Session) bodyOf(ctx context.Context) renderBody {
 		if shared, ok := sharedBody(event); ok {
 			return shared, true
 		}
+		if sent := catalogOrderOf(event); sent != nil {
+			return s.orderBody(ctx, sent)
+		}
 		if found, isACard := cardOf(event.Message); isACard {
 			return s.cardBody(ctx, event, &found)
 		}

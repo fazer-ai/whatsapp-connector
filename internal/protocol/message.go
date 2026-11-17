@@ -400,6 +400,9 @@ const (
 	RichInteractive = "interactive"
 	RichButtons     = "buttons"
 	RichList        = "list"
+	// RichOrder is an order a customer placed from a business's catalog. Its card carries
+	// the order itself beside the parts, in Order.
+	RichOrder = "order"
 )
 
 // RichContent is a card a business sent: a template, a message with buttons, a list.
@@ -423,6 +426,42 @@ type RichContent struct {
 	// Media is the file at the top of the card, if it has one. It is a file like any
 	// other, with the reference a client fetches it by.
 	Media *MediaContent `json:"media,omitempty"`
+	// Order is the order a card of kind `order` is about. It travels inside the card
+	// rather than as content of its own because a client refuses a content type it does
+	// not know, and would drop the message with it.
+	Order *Order `json:"order,omitempty"`
+}
+
+// Order is an order placed from a business's catalog, as WhatsApp describes it.
+//
+// Amounts are in thousandths of the currency's unit, the scale WhatsApp writes an order's
+// total in, so a client formats them for its own locale. The items come from a query of
+// their own, and an order whose query did not answer -- or whose prices could not be
+// proved to be in that scale -- is published without them, or without their prices.
+type Order struct {
+	ID string `json:"id"`
+	// Status and Surface are WhatsApp's own names (INQUIRY, ACCEPTED, DECLINED; CATALOG),
+	// passed through, so a value WhatsApp adds later arrives instead of vanishing.
+	Status       string `json:"status,omitempty"`
+	Surface      string `json:"surface,omitempty"`
+	ItemCount    int32  `json:"item_count,omitempty"`
+	Total1000    int64  `json:"total_1000,omitempty"`
+	Currency     string `json:"currency,omitempty"`
+	Subtotal1000 *int64 `json:"subtotal_1000,omitempty"`
+	// Seller is the selling account's number.
+	Seller    string      `json:"seller,omitempty"`
+	Thumbnail string      `json:"thumbnail,omitempty"`
+	Items     []OrderItem `json:"items,omitempty"`
+}
+
+// OrderItem is one line of an order.
+type OrderItem struct {
+	ProductID string `json:"product_id,omitempty"`
+	Name      string `json:"name"`
+	Quantity  int    `json:"quantity"`
+	Price1000 *int64 `json:"price_1000,omitempty"`
+	Currency  string `json:"currency,omitempty"`
+	Variant   string `json:"variant,omitempty"`
 }
 
 // Product is a product from a business's catalog, as WhatsApp carries it in a message.

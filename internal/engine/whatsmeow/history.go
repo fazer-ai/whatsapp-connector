@@ -728,6 +728,11 @@ func (r *dumpRun) pastBody(event *waEvents.Message) (body, bool) {
 	if shared, ok := sharedBody(event); ok {
 		return shared, true
 	}
+	if sent := catalogOrderOf(event); sent != nil {
+		// Its summary only: a dump makes no network call while it is published, and the
+		// items are a query of their own.
+		return body{content: orderCard(sent), context: sent.GetContextInfo()}, true
+	}
 	if found, isACard := cardOf(event.Message); isACard {
 		if found.header != nil {
 			// Kept the way a file out of a dump is, so the client can ask for it later.
