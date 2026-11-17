@@ -239,6 +239,13 @@ type Session struct {
 	// an answer.
 	createTheGroup func(context.Context, *wm.Client, keyedCreate) (*waTypes.GroupInfo, error)
 
+	// orderDetails asks WhatsApp for the items of a catalog order. A seam like the queries
+	// above it: one IQ, so without it a test reaches neither an answer nor a server that
+	// never gives one. orderWait is how long a live order waits for it before it is
+	// published without its items.
+	orderDetails func(ctx context.Context, client *wm.Client, orderID, token string) (*waTypes.OrderDetails, error)
+	orderWait    time.Duration
+
 	onWhatsApp func(context.Context, *wm.Client, []string) ([]waTypes.IsOnWhatsAppResponse, error)
 	//nolint:lll // one line per seam reads better than a wrapped signature
 	updateParticipants func(context.Context, *wm.Client, waTypes.JID, []waTypes.JID, wm.ParticipantChange) ([]waTypes.GroupParticipant, error)
@@ -828,6 +835,13 @@ func newSession(
 		groupInfo:       groupInfoOverClient,
 		joinedGroups:    joinedGroupsOverClient,
 		createTheGroup:  createKeyedGroupOverClient,
+		orderDetails: func(ctx context.Context, client *wm.Client, orderID, token string) (*waTypes.OrderDetails, error) {
+			if client == nil {
+				return nil, wm.ErrClientIsNil
+			}
+			return client.GetOrderDetails(ctx, orderID, token) //nolint:wrapcheck // logged by its caller, which publishes without the items
+		},
+		orderWait: orderDetailsWait,
 		onWhatsApp: func(ctx context.Context, client *wm.Client, phones []string) ([]waTypes.IsOnWhatsAppResponse, error) {
 			return client.IsOnWhatsApp(ctx, phones) //nolint:wrapcheck // wrapped by its caller
 		},
