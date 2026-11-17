@@ -38,6 +38,9 @@ type orderQuery struct {
 func (q *orderQuery) install(t *testing.T, session *Session) {
 	t.Helper()
 
+	// Closed before the server is: a query held past its test, which is what a missing
+	// deadline looks like, fails the test instead of hanging the server's Close.
+	release := make(chan struct{})
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var sent map[string]any
 		raw, _ := io.ReadAll(r.Body)
@@ -47,7 +50,10 @@ func (q *orderQuery) install(t *testing.T, session *Session) {
 		answer, status, blocked := q.answer, q.status, q.blocked
 		q.mu.Unlock()
 		if blocked {
-			<-r.Context().Done()
+			select {
+			case <-r.Context().Done():
+			case <-release:
+			}
 			return
 		}
 		if status == 0 {
@@ -57,6 +63,7 @@ func (q *orderQuery) install(t *testing.T, session *Session) {
 		_, _ = io.WriteString(w, answer)
 	}))
 	t.Cleanup(server.Close)
+	t.Cleanup(func() { close(release) })
 	session.orderEndpoint = server.URL
 	session.orderHTTP = server.Client()
 	// A query that answers gets the shared budget, so a slow scheduler under -race does
@@ -610,5 +617,25 @@ func TestAnOrderLeavesOutCountsTheContractCannotCarry(t *testing.T) {
 	items, _ := order["items"].([]any)
 	if order["item_count"] != nil || content["title"] != nil || len(items) != 1 {
 		t.Errorf("the order went out with count %v, title %v and items %v", order["item_count"], content["title"], order["items"])
+	}
+}
+
+// The catalog only answers with the order's token, so an order that came without one is
+// published as its summary and never asked about.
+func TestAnOrderWithNoTokenIsNotLookedUp(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	query := &orderQuery{answer: catalogAnswer(1000, 25000)}
+	query.install(t, session)
+	sent := catalogOrder()
+	sent.Token = nil
+
+	order := orderOf(t, inboundContentOf(t, publishedBy(t, session, orderEvent("3EB0NOTOKEN", sent))))
+	if order["items"] != nil {
+		t.Errorf("an order with no token went out with items: %v", order["items"])
+	}
+	if calls := query.calls(); len(calls) != 0 {
+		t.Errorf("the catalog was asked about an order with no token: %v", calls)
 	}
 }
