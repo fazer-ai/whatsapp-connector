@@ -39,8 +39,8 @@ func orderCard(sent *waE2E.OrderMessage) protocol.RichContent {
 	content.Body = sent.GetMessage()
 	order := &protocol.Order{
 		ID:        sent.GetOrderID(),
-		ItemCount: sent.GetItemCount(),
-		Total1000: sent.GetTotalAmount1000(),
+		ItemCount: sent.ItemCount,
+		Total1000: sent.TotalAmount1000,
 		Currency:  sent.GetTotalCurrencyCode(),
 		Seller:    sellerOf(sent.GetSellerJID()),
 		Thumbnail: thumbnailOf("image/jpeg", sent.GetThumbnail()),
@@ -105,10 +105,10 @@ func (s *Session) orderBody(ctx context.Context, sent *waE2E.OrderMessage) (body
 func itemize(order *protocol.Order, details *waTypes.OrderDetails) bool {
 	var scale int64
 	switch total := details.Price.Total; {
-	case order.Total1000 == 0:
-	case total == order.Total1000:
+	case order.Total1000 == nil || *order.Total1000 == 0:
+	case total == *order.Total1000:
 		scale = 1
-	case total*1000 == order.Total1000:
+	case total*1000 == *order.Total1000:
 		scale = 1000
 	}
 	for _, product := range details.Products {

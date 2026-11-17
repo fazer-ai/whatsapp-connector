@@ -442,10 +442,12 @@ type Order struct {
 	ID string `json:"id"`
 	// Status and Surface are WhatsApp's own names (INQUIRY, ACCEPTED, DECLINED; CATALOG),
 	// passed through, so a value WhatsApp adds later arrives instead of vanishing.
-	Status       string `json:"status,omitempty"`
-	Surface      string `json:"surface,omitempty"`
-	ItemCount    int32  `json:"item_count,omitempty"`
-	Total1000    int64  `json:"total_1000,omitempty"`
+	Status  string `json:"status,omitempty"`
+	Surface string `json:"surface,omitempty"`
+	// ItemCount and Total1000 are pointers because WhatsApp's zero is a value: an
+	// order it says is worth nothing is not an order it said nothing about.
+	ItemCount    *int32 `json:"item_count,omitempty"`
+	Total1000    *int64 `json:"total_1000,omitempty"`
 	Currency     string `json:"currency,omitempty"`
 	Subtotal1000 *int64 `json:"subtotal_1000,omitempty"`
 	// Seller is the selling account's number.

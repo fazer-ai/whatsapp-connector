@@ -196,6 +196,14 @@ func TestAnOrdersPricesAreReadInTheScaleTheMessagesTotalProves(t *testing.T) {
 					t.Errorf("items[%d] lost its name or quantity: %v", i, item)
 				}
 			}
+			// The message's total goes out as WhatsApp sent it, zero included.
+			wantTotal := any(float64(25000))
+			if tc.total != nil {
+				wantTotal = float64(*tc.total)
+			}
+			if order["total_1000"] != wantTotal {
+				t.Errorf("total_1000 is %v, want %v", order["total_1000"], wantTotal)
+			}
 			wantSubtotal := any(float64(25000))
 			if tc.prices[0] == nil {
 				wantSubtotal = nil
@@ -282,8 +290,8 @@ func TestAnOrderWithNothingButItsIDIsStillAnOrder(t *testing.T) {
 	}
 	// A status WhatsApp did not send reads as the first of its values, which would say the
 	// customer asked for something nobody asked for.
-	if order["status"] != nil || order["surface"] != nil {
-		t.Errorf("a bare order went out with status %v and surface %v", order["status"], order["surface"])
+	if order["status"] != nil || order["surface"] != nil || order["total_1000"] != nil || order["item_count"] != nil {
+		t.Errorf("a bare order went out with values WhatsApp never sent: %v", order)
 	}
 	if content["title"] != nil || content["body"] != nil || order["thumbnail"] != nil {
 		t.Errorf("a bare order was dressed up: title %v, body %v, thumbnail %v", content["title"], content["body"], order["thumbnail"])
