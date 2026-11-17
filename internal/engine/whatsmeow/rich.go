@@ -42,6 +42,10 @@ func cardOf(message *waE2E.Message) (card, bool) {
 	template := message.GetTemplateMessage()
 	var c card
 	switch {
+	case message.GetProductMessage() != nil:
+		// A product is shown as one even when nothing in it is readable: the agent is
+		// told there is a product to look up on the phone (#426).
+		return productCard(message.GetProductMessage()), true
 	case message.GetInteractiveMessage() != nil:
 		c = interactiveCard(message.GetInteractiveMessage())
 	case template.GetInteractiveMessageTemplate() != nil:

@@ -49,14 +49,20 @@ func Text(body string) TextContent { return TextContent{Type: "text", Body: body
 // Content is left open because the contract's `content` is a union and the engine is
 // what knows which arm it is rendering.
 type InboundMessage struct {
-	ID        string    `json:"id"`
-	Chat      Address   `json:"chat"`
-	Sender    *Party    `json:"sender,omitempty"`
-	FromMe    bool      `json:"from_me"`
-	Timestamp int64     `json:"timestamp"`
-	Content   any       `json:"content"`
-	QuotedID  string    `json:"quoted_id,omitempty"`
-	Mentions  []Address `json:"mentions,omitempty"`
+	ID        string  `json:"id"`
+	Chat      Address `json:"chat"`
+	Sender    *Party  `json:"sender,omitempty"`
+	FromMe    bool    `json:"from_me"`
+	Timestamp int64   `json:"timestamp"`
+	Content   any     `json:"content"`
+	QuotedID  string  `json:"quoted_id,omitempty"`
+	// QuotedProduct is the catalog product a message quotes, which is what a question
+	// asked from a business's catalog ("Message business") does: WhatsApp quotes the
+	// product rather than a message, under an id no message has. Present, even empty,
+	// whenever the quote is a product, so a client can say there is one to look up on
+	// the phone when nothing about it was readable.
+	QuotedProduct *Product  `json:"quoted_product,omitempty"`
+	Mentions      []Address `json:"mentions,omitempty"`
 	// Ephemeral is the disappearing-message expiration in seconds, zero when the chat
 	// is not on a timer.
 	Ephemeral uint32 `json:"ephemeral,omitempty"`
@@ -385,6 +391,11 @@ type RichButton struct {
 // Kinds of card, named after the WhatsApp shape each one arrived in. A client renders
 // every kind the same way, so the name is for whoever reads the stored card later.
 const (
+	// RichProduct is a product from a business's catalog, sent into the chat on its own.
+	// The card is its picture, name and description, and the product itself travels in
+	// Product beside them (#426).
+	RichProduct = "product"
+
 	RichTemplate    = "template"
 	RichInteractive = "interactive"
 	RichButtons     = "buttons"
@@ -404,9 +415,40 @@ type RichContent struct {
 	Body    string       `json:"body,omitempty"`
 	Footer  string       `json:"footer,omitempty"`
 	Buttons []RichButton `json:"buttons,omitempty"`
+	// Product is the catalog product a card of kind `product` is. Present, even empty,
+	// on every such card: an empty one is a product WhatsApp sent nothing readable about,
+	// which a client still shows as a product to look up on the phone.
+	Product *Product `json:"product,omitempty"`
+
 	// Media is the file at the top of the card, if it has one. It is a file like any
 	// other, with the reference a client fetches it by.
 	Media *MediaContent `json:"media,omitempty"`
+}
+
+// Product is a product from a business's catalog, as WhatsApp carries it in a message.
+//
+// Every field is what WhatsApp sent and nothing else: a price it left out is absent, not
+// zero, and a currency it did not name is absent, not a default. Amounts are in
+// thousandths of the currency's unit, the scale WhatsApp writes them in, so a client
+// formats them for its own locale.
+type Product struct {
+	ID          string `json:"id,omitempty"`
+	Title       string `json:"title,omitempty"`
+	Description string `json:"description,omitempty"`
+	// Price1000 and SalePrice1000 are pointers because a price of zero is a price.
+	Price1000     *int64 `json:"price_1000,omitempty"`
+	SalePrice1000 *int64 `json:"sale_price_1000,omitempty"`
+	Currency      string `json:"currency,omitempty"`
+	// RetailerID is the business's own code for the product, and URL its page, when the
+	// business filled them in.
+	RetailerID string `json:"retailer_id,omitempty"`
+	URL        string `json:"url,omitempty"`
+	// ImageCount is how many pictures the product has in the catalog.
+	ImageCount *uint32 `json:"image_count,omitempty"`
+	// Owner is the account whose catalog the product is from.
+	Owner *Address `json:"owner,omitempty"`
+	// Thumbnail is the inline preview of the product's picture, as a data: URI.
+	Thumbnail string `json:"thumbnail,omitempty"`
 }
 
 // Rich returns the content of a card of the given kind, for a caller that fills in the
