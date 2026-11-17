@@ -119,11 +119,15 @@ func amountLabel(thousandths int64, code string) string {
 	if negative {
 		thousandths = -thousandths
 	}
-	divisor := int64(1)
-	for range 3 - min(digits, 3) {
-		divisor *= 10
+	// From thousandths to the currency's minor unit: down, rounding half up, for one
+	// with fewer than three decimals, and up for one with more.
+	minor := thousandths
+	for range max(3-digits, 0) {
+		minor = (minor + 5) / 10
 	}
-	minor := (thousandths + divisor/2) / divisor
+	for range max(digits-3, 0) {
+		minor *= 10
+	}
 	scale := int64(1)
 	for range digits {
 		scale *= 10
@@ -138,17 +142,21 @@ func amountLabel(thousandths int64, code string) string {
 	return symbol + written
 }
 
-// sellerOf is the seller account's id out of the address WhatsApp names it by: a number
-// or a LID, whichever the order carried.
-func sellerOf(raw string) string {
+// sellerOf is the seller account's address, a number or a LID, whichever the order
+// carried. Nil when it carried none, or one the contract has no kind for.
+func sellerOf(raw string) *protocol.Address {
 	if raw == "" {
-		return ""
+		return nil
 	}
 	jid, err := waTypes.ParseJID(raw)
 	if err != nil {
-		return ""
+		return nil
 	}
-	return jid.User
+	address, ok := addressOf(jid)
+	if !ok {
+		return nil
+	}
+	return &address
 }
 
 // orderBody is a live order, with its items when WhatsApp says what they are in time.

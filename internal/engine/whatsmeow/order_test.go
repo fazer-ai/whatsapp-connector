@@ -18,6 +18,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/media"
+	"github.com/fazer-ai/whatsapp-connector/internal/testwait"
 )
 
 // An order a customer sends from a business's catalog used to reach the agent as a
@@ -58,7 +59,13 @@ func (q *orderQuery) install(t *testing.T, session *Session) {
 	t.Cleanup(server.Close)
 	session.orderEndpoint = server.URL
 	session.orderHTTP = server.Client()
-	session.orderWait = 50 * time.Millisecond
+	// A query that answers gets the shared budget, so a slow scheduler under -race does
+	// not turn a success into a summary. Only the one that never answers is held to a
+	// short wait, which is what it is there to show.
+	session.orderWait = testwait.Budget
+	if q.blocked {
+		session.orderWait = 50 * time.Millisecond
+	}
 }
 
 func (q *orderQuery) calls() []map[string]any {
@@ -138,11 +145,15 @@ func TestACatalogOrderIsPublishedWithItsItems(t *testing.T) {
 	}
 	for field, want := range map[string]any{
 		"id": "ORD-1", "title": "Pedido Loja X", "status": "INQUIRY", "surface": "CATALOG", "item_count": float64(2),
-		"total_1000": float64(25000), "currency": "EUR", "seller": "5511988887777", "subtotal_1000": float64(25000),
+		"total_1000": float64(25000), "currency": "EUR", "subtotal_1000": float64(25000),
 	} {
 		if order[field] != want {
 			t.Errorf("order.%s is %v, want %v", field, order[field], want)
 		}
+	}
+	// The seller as an address, so a number and a LID are never the same digits.
+	if seller, _ := order["seller"].(map[string]any); seller["kind"] != "phone" || seller["id"] != "5511988887777" {
+		t.Errorf("order.seller is %v", order["seller"])
 	}
 	if thumbnail, _ := order["thumbnail"].(string); thumbnail != "data:image/jpeg;base64,/9j/4A==" {
 		t.Errorf("order.thumbnail is %q", thumbnail)
@@ -468,6 +479,7 @@ func TestAnOrdersCardReadsTheWayWhatsAppShowsIt(t *testing.T) {
 		{name: "one item", count: proto.Int32(1), total: proto.Int64(12500), currency: "EUR", title: "🛒 1 item", footer: "€12.50 (estimated total)"},
 		{name: "a currency with no cents", count: proto.Int32(3), total: proto.Int64(1500000), currency: "JPY", title: "🛒 3 items", footer: "¥1500 (estimated total)"},
 		{name: "a total in fractions of a cent", count: proto.Int32(2), total: proto.Int64(12345), currency: "USD", title: "🛒 2 items", footer: "$12.35 (estimated total)"},
+		{name: "a currency with four decimals", count: proto.Int32(1), total: proto.Int64(12500), currency: "CLF", title: "🛒 1 item", footer: "CLF12.5000 (estimated total)"},
 		{name: "a currency nothing here knows", count: proto.Int32(2), total: proto.Int64(12500), currency: "ZZZ", title: "🛒 2 items", footer: nil},
 		{name: "no total", count: proto.Int32(2), currency: "EUR", title: "🛒 2 items", footer: nil},
 	} {
@@ -515,7 +527,7 @@ func TestTheMeasuredOrderIsAskedAndReadAsWhatsAppWebDoes(t *testing.T) {
 	if item["name"] != "Produto exemplo" || item["price_1000"] != float64(12500) || item["image"] != "https://mmg.whatsapp.net/v/t45.jpg" {
 		t.Errorf("the item went out as %v", item)
 	}
-	if order["seller"] != "10000000000001" || order["title"] != "Loja Exemplo" {
+	if seller, _ := order["seller"].(map[string]any); seller["kind"] != "lid" || seller["id"] != "10000000000001" || order["title"] != "Loja Exemplo" {
 		t.Errorf("the order went out as %v", order)
 	}
 	calls := query.calls()
@@ -554,5 +566,25 @@ func TestAnItemsPriceIsReadWhicheverWayTheCatalogWritesIt(t *testing.T) {
 	if first["price_1000"] != float64(10000) || second["price_1000"] != nil || second["quantity"] != float64(2) ||
 		second["variant"] != "Azul, Grande" {
 		t.Errorf("the items went out as %v / %v", first, second)
+	}
+}
+
+// The catalog is asked about an order on behalf of its seller, so an order that names
+// none is published as its summary without a query that could only be refused.
+func TestAnOrderWithNoSellerIsNotLookedUp(t *testing.T) {
+	t.Parallel()
+
+	session, _ := newTestSession(t, "5511999990001")
+	query := &orderQuery{answer: catalogAnswer(1000, 25000)}
+	query.install(t, session)
+	sent := catalogOrder()
+	sent.SellerJID = nil
+
+	order := orderOf(t, inboundContentOf(t, publishedBy(t, session, orderEvent("3EB0NOSELLER", sent))))
+	if order["items"] != nil || order["seller"] != nil {
+		t.Errorf("an order with no seller went out as %v", order)
+	}
+	if calls := query.calls(); len(calls) != 0 {
+		t.Errorf("the catalog was asked about an order with no seller: %v", calls)
 	}
 }

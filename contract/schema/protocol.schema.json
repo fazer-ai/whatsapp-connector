@@ -191,7 +191,7 @@
         "total_1000": { "type": ["integer", "null"] },
         "currency": { "type": ["string", "null"] },
         "subtotal_1000": { "type": ["integer", "null"] },
-        "seller": { "type": ["string", "null"], "description": "the seller account's id as the order names it: a number or a LID" },
+        "seller": { "description": "the seller account's address as the order names it, a number or a LID", "oneOf": [{ "$ref": "#/definitions/address" }, { "type": "null" }] },
         "thumbnail": { "type": ["string", "null"], "description": "data: URI, at most 32 KiB" },
         "items": {
           "type": ["array", "null"],

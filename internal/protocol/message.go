@@ -453,8 +453,8 @@ type Order struct {
 	Total1000    *int64 `json:"total_1000,omitempty"`
 	Currency     string `json:"currency,omitempty"`
 	Subtotal1000 *int64 `json:"subtotal_1000,omitempty"`
-	// Seller is the selling account's number.
-	Seller    string      `json:"seller,omitempty"`
+	// Seller is the seller account's address as the order names it, a number or a LID.
+	Seller    *Address    `json:"seller,omitempty"`
 	Thumbnail string      `json:"thumbnail,omitempty"`
 	Items     []OrderItem `json:"items,omitempty"`
 }

@@ -34,7 +34,10 @@
           "item_count": 2,
           "total_1000": 25000,
           "currency": "EUR",
-          "seller": "5541988887777"
+          "seller": {
+            "kind": "phone",
+            "id": "5541988887777"
+          }
         }
       }
     }
