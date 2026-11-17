@@ -294,8 +294,10 @@ func (s *Session) orderItems(ctx context.Context, orderID, token, seller string)
 		} `json:"data"`
 		Errors []json.RawMessage `json:"errors"`
 	}
-	if err := json.Unmarshal(raw, &answer); err != nil {
-		return nil, fmt.Errorf("decode the catalog's answer: %w", err)
+	if json.Unmarshal(raw, &answer) != nil {
+		// Not wrapped: a decoding error quotes the value it could not read, and a value here
+		// is a price.
+		return nil, errors.New("the catalog's answer is not in the shape it was measured with")
 	}
 	if len(answer.Errors) > 0 {
 		// Counted and not quoted: an error can echo the query back, and the query carries

@@ -420,6 +420,8 @@ func TestTheOrderLogNamesTheOrderAndNothingInIt(t *testing.T) {
 		{name: "with its items", query: &orderQuery{answer: catalogAnswer(1000, 25000)}},
 		{name: "without them", query: &orderQuery{status: http.StatusInternalServerError}},
 		// A refusal that echoes the query back would carry the order's token into the log.
+		// A decoding error quotes the value it could not read, and here that is a price.
+		{name: "an amount that does not decode", query: &orderQuery{answer: strings.Replace(catalogAnswer(1000, 25000), `"subtotal_amount":25000`, `"subtotal_amount":25000.5`, 1)}},
 		{name: "refused with the query echoed", query: &orderQuery{answer: `{"errors":[{"message":"invalid token dG9rZW4= for order ORD-1"}]}`}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -443,7 +445,7 @@ func TestTheOrderLogNamesTheOrderAndNothingInIt(t *testing.T) {
 				if entry["level"] == "debug" || entry["level"] == "trace" {
 					continue
 				}
-				for _, secret := range []string{"Camiseta", "Caneca", "25000", "10000", "15000", "Quero entregar amanhã", "dG9rZW4="} {
+				for _, secret := range []string{"Camiseta", "Caneca", "25000", "10000", "15000", "Quero entregar amanhã", "dG9rZW4=", "25000.5"} {
 					if strings.Contains(line, secret) {
 						t.Errorf("the log carries %q: %s", secret, line)
 					}
