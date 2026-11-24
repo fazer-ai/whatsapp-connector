@@ -1287,6 +1287,11 @@ func TestLiveSendMedia(t *testing.T) {
 	// refused on the payload, so a phase that added one to everything would fail before
 	// fetching anything and never exercise the file at all.
 	if os.Getenv("WAC_LIVE_VIDEO_NOTE") != "" {
+		// The built-in file is a JPEG, and sending it under the video-note field would
+		// fail on the phone for a reason that has nothing to do with the circle.
+		if os.Getenv("WAC_LIVE_FILE") == "" {
+			t.Fatal("WAC_LIVE_VIDEO_NOTE needs WAC_LIVE_FILE pointing at a video")
+		}
 		kind = "video"
 		content["kind"] = kind
 		content["video_note"] = true

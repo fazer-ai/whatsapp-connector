@@ -840,3 +840,31 @@ func TestAPlaceholdersDetailIsANameOrAbsent(t *testing.T) {
 		})
 	}
 }
+
+// The connector refuses a video note that is not a video, or that carries a caption, and
+// a client that validates a command against the schema should be told the same before it
+// sends. Each case starts from the video note that validates and changes one thing.
+func TestAVideoNoteTheConnectorRefusesDoesNotValidate(t *testing.T) {
+	t.Parallel()
+
+	const note = `{"type":"media","kind":"video","video_note":true,"caption":null}`
+	schema := compile(t, "#/definitions/content_media")
+	if err := schema.Validate(decode(t, note)); err != nil {
+		t.Fatalf("the video note this test starts from does not validate: %v", err)
+	}
+	for name, invalid := range map[string]string{
+		"on an image":    `{"type":"media","kind":"image","video_note":true}`,
+		"with a caption": `{"type":"media","kind":"video","video_note":true,"caption":"olha"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if err := schema.Validate(decode(t, invalid)); err == nil {
+				t.Fatalf("%s validates, and the connector refuses it", invalid)
+			}
+		})
+	}
+	// The flag left false is an ordinary file, and an image with a caption stays valid.
+	if err := schema.Validate(decode(t, `{"type":"media","kind":"image","video_note":false,"caption":"olha"}`)); err != nil {
+		t.Fatalf("an image with the flag false was refused: %v", err)
+	}
+}
