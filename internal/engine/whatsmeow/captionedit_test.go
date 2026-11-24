@@ -145,6 +145,9 @@ func TestACaptionEditOfAFileWithNoCaptionIsRefused(t *testing.T) {
 	for name, content := range map[string]string{
 		"a voice note":  `{"type":"media","kind":"audio","mime":"audio/ogg; codecs=opus","voice_note":true,` + ref + `}`,
 		"an audio file": `{"type":"media","kind":"audio","mime":"audio/mpeg",` + ref + `}`,
+		// A video note is a video under a field of its own, and unlike the ordinary video
+		// its caption is not WhatsApp's to show.
+		"a video note": `{"type":"media","kind":"video","mime":"video/mp4","video_note":true,` + ref + `}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()

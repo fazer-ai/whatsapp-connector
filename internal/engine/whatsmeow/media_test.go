@@ -73,6 +73,19 @@ func TestEachMediaKindIsRenderedTheWayTheContractCarriesIt(t *testing.T) {
 			},
 		},
 		{
+			// The circle: the same VideoMessage under a field of its own, read as a video
+			// so a client that does not know the flag still has one to play.
+			name: "a video note",
+			message: &waE2E.Message{PtvMessage: &waE2E.VideoMessage{
+				Mimetype:   proto.String("video/mp4"),
+				FileLength: proto.Uint64(786432), Seconds: proto.Uint32(9),
+			}},
+			want: protocol.MediaContent{
+				Type: "media", Kind: protocol.MediaVideo, Mime: "video/mp4",
+				Size: 786432, Duration: 9, VideoNote: true,
+			},
+		},
+		{
 			name: "a voice note",
 			message: &waE2E.Message{AudioMessage: &waE2E.AudioMessage{
 				Mimetype:   proto.String("audio/ogg; codecs=opus"),
@@ -805,6 +818,17 @@ func TestAFileSentToBeSeenOnceIsNeverKept(t *testing.T) {
 			name: "a video carrying the sender's own flag",
 			build: func() *waEvents.Message {
 				return mediaEvent("3EB0ONCE", &waE2E.Message{VideoMessage: &waE2E.VideoMessage{
+					Mimetype: proto.String("video/mp4"), ViewOnce: proto.Bool(true),
+					JPEGThumbnail: []byte{0xFF, 0xD8, 0xFF, 0xE0},
+				}})
+			},
+		},
+		{
+			// The circle is the same leaf under a field of its own, so the flag on the
+			// ordinary video's field says nothing about it.
+			name: "a video note carrying the sender's own flag",
+			build: func() *waEvents.Message {
+				return mediaEvent("3EB0ONCE", &waE2E.Message{PtvMessage: &waE2E.VideoMessage{
 					Mimetype: proto.String("video/mp4"), ViewOnce: proto.Bool(true),
 					JPEGThumbnail: []byte{0xFF, 0xD8, 0xFF, 0xE0},
 				}})

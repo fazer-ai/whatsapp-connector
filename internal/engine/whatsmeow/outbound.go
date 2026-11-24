@@ -80,6 +80,7 @@ type (
 		Filename  string             `json:"filename"`
 		Caption   string             `json:"caption"`
 		VoiceNote bool               `json:"voice_note"`
+		VideoNote bool               `json:"video_note"`
 		Size      int64              `json:"size"`
 		Duration  uint32             `json:"duration"`
 		Width     uint32             `json:"width"`
@@ -519,6 +520,19 @@ func planMedia(content *mediaContent, limit int64) (*mediaPlan, error) {
 		// StickerMessage nor AudioMessage has the field at all.
 		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
 			fmt.Sprintf("no caption travels with %s: send the text as its own message", content.Kind))
+	}
+	if content.VideoNote && content.Kind != protocol.MediaVideo {
+		// Only a video can be played in the circle. Ignored on anything else, the caller
+		// asked for one thing and the recipient gets another with the send reporting
+		// success.
+		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
+			fmt.Sprintf("only a video goes out as a video note, and this is %s", content.Kind))
+	}
+	if content.VideoNote && content.Caption != "" {
+		// The circle has nowhere to show a caption, and WhatsApp's own clients never put
+		// one on it: carried on the message, it is text nobody sees.
+		return nil, protocol.NewError(protocol.ErrorInvalidPayload,
+			"no caption travels with a video note: send the text as its own message")
 	}
 	address, err := fetchable(content.Ref)
 	if err != nil {
@@ -1212,7 +1226,7 @@ func renderMedia(
 			ContextInfo: alongside,
 		}}
 	case protocol.MediaVideo:
-		return &waE2E.Message{VideoMessage: &waE2E.VideoMessage{
+		video := &waE2E.VideoMessage{
 			URL: &uploaded.URL, DirectPath: &uploaded.DirectPath, MediaKey: uploaded.MediaKey,
 			FileEncSHA256: uploaded.FileEncSHA256, FileSHA256: uploaded.FileSHA256,
 			FileLength: proto.Uint64(uploaded.FileLength),
@@ -1221,7 +1235,13 @@ func renderMedia(
 			Width: optionalPixels(content.Width), Height: optionalPixels(content.Height),
 			JPEGThumbnail: thumbnail,
 			ContextInfo:   alongside,
-		}}
+		}
+		if content.VideoNote {
+			// The same leaf under the field WhatsApp plays in the circle. Nothing on the
+			// VideoMessage itself says so, which is why a flag there would not do.
+			return &waE2E.Message{PtvMessage: video}
+		}
+		return &waE2E.Message{VideoMessage: video}
 	case protocol.MediaAudio:
 		// This connector does not transcode, so a voice note in any other format goes out
 		// as the ordinary audio file every client plays, without the flag and without the

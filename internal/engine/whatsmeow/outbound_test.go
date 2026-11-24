@@ -343,6 +343,25 @@ func TestEachKindOfFileGoesOutAsItsOwnShape(t *testing.T) {
 				if m.GetVideoMessage().GetSeconds() != 42 {
 					t.Fatalf("the video runs for %ds", m.GetVideoMessage().GetSeconds())
 				}
+				if m.GetPtvMessage() != nil {
+					t.Fatal("an ordinary video went out in the circle")
+				}
+			}},
+		{"a video note", `{"type":"media","kind":"video","mime":"video/mp4","video_note":true,"duration":9,
+			"ref":{"kind":"url","url":"http://rails:3000/blob.mp4"}}`,
+			func(t *testing.T, m *waE2E.Message) {
+				// Under its own field and nowhere else: the same leaf in both would be two
+				// bubbles on a client that reads either.
+				if m.GetVideoMessage() != nil {
+					t.Fatal("a video note went out as an ordinary video")
+				}
+				note := m.GetPtvMessage()
+				if note == nil {
+					t.Fatal("a video note did not go out in the circle")
+				}
+				if note.GetSeconds() != 9 || note.GetMimetype() != "video/mp4" {
+					t.Fatalf("the video note runs for %ds as %q", note.GetSeconds(), note.GetMimetype())
+				}
 			}},
 		{"a voice note", `{"type":"media","kind":"audio","mime":"audio/ogg; codecs=opus","voice_note":true,
 			"duration":5,"ref":{"kind":"url","url":"http://rails:3000/blob.ogg"}}`,
@@ -616,6 +635,10 @@ func TestAFileThisConnectorCannotGoAndGetIsRefusedOnThePayload(t *testing.T) {
 			"ref":{"kind":"url","url":"http://rails:3000/blob.ogg"}}`},
 		{"a voice note with a caption", `{"type":"media","kind":"audio","voice_note":true,"caption":"escuta",
 			"ref":{"kind":"url","url":"http://rails:3000/blob.ogg"}}`},
+		{"a video note with a caption", `{"type":"media","kind":"video","video_note":true,"caption":"olha",
+			"ref":{"kind":"url","url":"http://rails:3000/blob.mp4"}}`},
+		{"a video note that is not a video", `{"type":"media","kind":"image","video_note":true,
+			"ref":{"kind":"url","url":"http://rails:3000/blob.jpg"}}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()

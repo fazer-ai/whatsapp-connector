@@ -145,7 +145,7 @@ func (s *Session) unsealedCorrection(event *waEvents.Message, sealed *waE2E.Secr
 		Sender:    sender,
 		MessageID: target,
 		FromMe:    event.Info.IsFromMe,
-		Content:   correctedContent(corrected),
+		Content:   correctedContent(corrected, event.IsViewOnce),
 		Timestamp: at,
 	})
 }
@@ -493,7 +493,7 @@ func (s *Session) editOf(event *waEvents.Message) change {
 		Sender:    sender,
 		MessageID: target,
 		FromMe:    event.Info.IsFromMe,
-		Content:   correctedContent(corrected),
+		Content:   correctedContent(corrected, event.IsViewOnce),
 		Timestamp: at,
 	})
 }
@@ -579,7 +579,7 @@ func theResentCorrection(event *waEvents.Message) *waE2E.ProtocolMessage {
 // A body with no arm here is the unsupported placeholder, as it is on the message path,
 // and not a withheld acknowledgement (#402): the client learns the message was corrected
 // into something this build cannot show and keeps the bubble it has.
-func correctedContent(corrected *waE2E.Message) any {
+func correctedContent(corrected *waE2E.Message, envelopedOnce bool) any {
 	if corrected == nil {
 		return protocol.Unsupported(protocol.UnsupportedEmpty)
 	}
@@ -593,7 +593,12 @@ func correctedContent(corrected *waE2E.Message) any {
 		return protocol.Text(text)
 	}
 	if part, ok := attachmentOf(corrected); ok {
-		// No Ref, on purpose: see protocol.MessageEdited.
+		// No Ref, on purpose: see protocol.MessageEdited. And no preview of a file sent to
+		// be seen once, for the reason the message path drops it. As there, either half
+		// says so: whatsmeow's flag from the envelope it unwrapped, or the leaf's own.
+		if envelopedOnce || sentToBeSeenOnce(corrected) {
+			part.content.Thumbnail = ""
+		}
 		return part.content
 	}
 	return protocol.Unsupported(protocol.UnsupportedUnknownType).Detailed(armOf(corrected))

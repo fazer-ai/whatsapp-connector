@@ -134,7 +134,13 @@ type MediaContent struct {
 	Filename  string    `json:"filename,omitempty"`
 	Caption   string    `json:"caption,omitempty"`
 	VoiceNote bool      `json:"voice_note"`
-	Size      int64     `json:"size,omitempty"`
+	// VideoNote is a video recorded to play in a circle, WhatsApp's video message (PTV).
+	// It is a video with this flag set rather than a kind of its own, the way a voice
+	// note is an audio with `voice_note`: a client that does not know the flag renders
+	// the ordinary video it also is. Left out when false, so every frame that predates
+	// it reads the same.
+	VideoNote bool  `json:"video_note,omitempty"`
+	Size      int64 `json:"size,omitempty"`
 	// Duration is how long an audio or a video runs, in seconds.
 	Duration uint32 `json:"duration,omitempty"`
 	// Width and Height are the picture's size in pixels, for an image, a video or a

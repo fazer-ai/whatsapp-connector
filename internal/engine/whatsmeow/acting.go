@@ -175,7 +175,8 @@ func recaptioned(body []byte, caption string) (*waE2E.Message, error) {
 			Message: &waE2E.Message{DocumentMessage: document},
 		}}, nil
 	default:
-		// A voice note, an audio file or a sticker: WhatsApp gives them no caption, so
+		// A voice note, a video note, an audio file or a sticker: WhatsApp gives them no
+		// caption (a video note's leaf has the field, and the circle never shows it), so
 		// there is nothing to correct, and a text correction would be acknowledged and
 		// change nothing.
 		return nil, protocol.NewError(protocol.ErrorUnsupported,
