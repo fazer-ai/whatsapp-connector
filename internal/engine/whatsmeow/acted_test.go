@@ -1175,19 +1175,28 @@ func TestAnEditOfAFileSentToBeSeenOnceCarriesNoPreview(t *testing.T) {
 	t.Parallel()
 
 	jpeg := []byte{0xFF, 0xD8, 0xFF, 0xE0}
-	for name, body := range map[string]*waE2E.Message{
-		"a video note": {PtvMessage: &waE2E.VideoMessage{
+	for name, tc := range map[string]struct {
+		body      *waE2E.Message
+		enveloped bool
+	}{
+		"a video note": {body: &waE2E.Message{PtvMessage: &waE2E.VideoMessage{
 			Mimetype: proto.String("video/mp4"), ViewOnce: proto.Bool(true), JPEGThumbnail: jpeg,
-		}},
-		"an image": {ImageMessage: &waE2E.ImageMessage{
+		}}},
+		"an image": {body: &waE2E.Message{ImageMessage: &waE2E.ImageMessage{
 			Mimetype: proto.String("image/jpeg"), ViewOnce: proto.Bool(true), JPEGThumbnail: jpeg,
-		}},
+		}}},
+		// whatsmeow unwraps the envelope and leaves only its flag on the event.
+		"a video note marked by the envelope alone": {body: &waE2E.Message{PtvMessage: &waE2E.VideoMessage{
+			Mimetype: proto.String("video/mp4"), JPEGThumbnail: jpeg,
+		}}, enveloped: true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
 			session, _ := newTestSession(t, "5511999990001")
-			emission := publishedBy(t, session, editEvent(carrier, subject, body, 1755000009000))
+			event := editEvent(carrier, subject, tc.body, 1755000009000)
+			event.IsViewOnce = tc.enveloped
+			emission := publishedBy(t, session, event)
 			if emission.Type != protocol.EventMessageEdited {
 				t.Fatalf("published %s, want %s", emission.Type, protocol.EventMessageEdited)
 			}

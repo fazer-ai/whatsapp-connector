@@ -1289,8 +1289,8 @@ func TestLiveSendMedia(t *testing.T) {
 	if os.Getenv("WAC_LIVE_VIDEO_NOTE") != "" {
 		// The built-in file is a JPEG, and sending it under the video-note field would
 		// fail on the phone for a reason that has nothing to do with the circle.
-		if os.Getenv("WAC_LIVE_FILE") == "" {
-			t.Fatal("WAC_LIVE_VIDEO_NOTE needs WAC_LIVE_FILE pointing at a video")
+		if os.Getenv("WAC_LIVE_FILE") == "" || kind != "video" {
+			t.Fatalf("WAC_LIVE_VIDEO_NOTE needs WAC_LIVE_FILE pointing at a video, and %q reads as %s", name, kind)
 		}
 		kind = "video"
 		content["kind"] = kind
