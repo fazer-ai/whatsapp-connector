@@ -644,9 +644,9 @@ func oneLiveFile(t *testing.T, events *recorder, base, token string, within time
 	if content.Ref == nil {
 		t.Fatalf("the message arrived with nothing to fetch: %s", received.Payload)
 	}
-	say("got a %s: mime=%q filename=%q size=%d duration=%d voice_note=%v thumbnail=%dB",
+	say("got a %s: mime=%q filename=%q size=%d duration=%d voice_note=%v video_note=%v thumbnail=%dB",
 		content.Kind, content.Mime, content.Filename, content.Size, content.Duration,
-		content.VoiceNote, len(content.Thumbnail))
+		content.VoiceNote, content.VideoNote, len(content.Thumbnail))
 
 	ref := content.Ref
 	if ref.Kind != protocol.MediaRefConnectorBlob || ref.ID == "" || ref.URL == "" || ref.SHA256 == "" {
@@ -1286,7 +1286,12 @@ func TestLiveSendMedia(t *testing.T) {
 	// Only where WhatsApp has somewhere to put one. A caption on an audio or a sticker is
 	// refused on the payload, so a phase that added one to everything would fail before
 	// fetching anything and never exercise the file at all.
-	if captions[protocol.MediaKind(kind)] {
+	if os.Getenv("WAC_LIVE_VIDEO_NOTE") != "" {
+		kind = "video"
+		content["kind"] = kind
+		content["video_note"] = true
+	}
+	if captions[protocol.MediaKind(kind)] && os.Getenv("WAC_LIVE_VIDEO_NOTE") == "" {
 		content["caption"] = "conector nativo, fatia de saída"
 	}
 	// WAC_LIVE_DURATION is how long the caller says an audio or a video runs. Worth being

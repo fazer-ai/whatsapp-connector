@@ -824,6 +824,17 @@ func TestAFileSentToBeSeenOnceIsNeverKept(t *testing.T) {
 			},
 		},
 		{
+			// The circle is the same leaf under a field of its own, so the flag on the
+			// ordinary video's field says nothing about it.
+			name: "a video note carrying the sender's own flag",
+			build: func() *waEvents.Message {
+				return mediaEvent("3EB0ONCE", &waE2E.Message{PtvMessage: &waE2E.VideoMessage{
+					Mimetype: proto.String("video/mp4"), ViewOnce: proto.Bool(true),
+					JPEGThumbnail: []byte{0xFF, 0xD8, 0xFF, 0xE0},
+				}})
+			},
+		},
+		{
 			name: "a voice note carrying the sender's own flag",
 			build: func() *waEvents.Message {
 				return mediaEvent("3EB0ONCE", &waE2E.Message{AudioMessage: &waE2E.AudioMessage{
