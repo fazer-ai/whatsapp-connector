@@ -160,6 +160,20 @@ func attachmentOf(message *waE2E.Message) (attachment, bool) {
 		content.Thumbnail = thumbnailOf("image/jpeg", part.GetJPEGThumbnail())
 		return attachment{content: content, context: part.GetContextInfo(), download: part}, true
 
+	case message.GetPtvMessage() != nil:
+		// A video recorded in the circle. WhatsApp carries it as the same VideoMessage
+		// under a field of its own, and the contract as a video with the flag set, so a
+		// client that does not know the flag still has a video to play. No caption: the
+		// circle has nowhere to show one.
+		part := message.GetPtvMessage()
+		content := protocol.Media(protocol.MediaVideo)
+		content.VideoNote = true
+		content.Mime = part.GetMimetype()
+		content.Size = declaredSize(part.GetFileLength())
+		content.Duration = part.GetSeconds()
+		content.Thumbnail = thumbnailOf("image/jpeg", part.GetJPEGThumbnail())
+		return attachment{content: content, context: part.GetContextInfo(), download: part}, true
+
 	case message.GetAudioMessage() != nil:
 		// No name and no caption: WhatsApp's audio message carries neither. Inventing a
 		// filename here would beat the one the client builds from the mime type and the
@@ -330,6 +344,7 @@ func viewOnce(event *waEvents.Message) bool {
 	return event.IsViewOnce ||
 		event.Message.GetImageMessage().GetViewOnce() ||
 		event.Message.GetVideoMessage().GetViewOnce() ||
+		event.Message.GetPtvMessage().GetViewOnce() ||
 		event.Message.GetAudioMessage().GetViewOnce()
 }
 

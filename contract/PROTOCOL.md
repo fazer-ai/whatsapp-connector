@@ -408,6 +408,15 @@ theirs, and the connector is always upgraded first.
   succeeds. `audio/ogg` with no codec named is read as opus, and so is a voice note nobody
   gave a type to. A client that wants the voice bubble records or converts to opus before
   it sends.
+- `video_note` marks a video recorded to play in a circle, WhatsApp's video message. It is
+  only ever set on a `video`, and it is left out rather than sent false, so a producer or
+  a client that predates it reads every frame the same. Inbound, a client that does not
+  know the flag has an ordinary video to render, which is what the file is. Outbound, it
+  is refused (`invalid_payload`) on any other kind and with a `caption`, which the circle
+  has nowhere to show. The connector does not transcode or crop: the file goes out as it
+  was given. A client forwarding one it received hands back the file WhatsApp recorded,
+  which is the safe case; what WhatsApp's clients make of any other video sent with the
+  flag has not been measured.
 - A media message published with no `ref` is followed by `media.download_failed`, and
   `recoverable` on it is what says whether that is the end. False is every reason the
   file is not coming back -- the key lapsed, the bytes did not check out, the file is
