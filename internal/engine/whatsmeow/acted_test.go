@@ -1167,3 +1167,46 @@ func TestADeletionsAuthorIsNamedByWhatTheStanzaCarried(t *testing.T) {
 		t.Errorf("the author is %+v, want the number the stanza was addressed by", author)
 	}
 }
+
+// A correction carries the whole new body, preview included, and a file sent to be seen
+// once has its preview dropped on the message path. The edit must not publish what the
+// message withheld, for any kind the sender can send that way.
+func TestAnEditOfAFileSentToBeSeenOnceCarriesNoPreview(t *testing.T) {
+	t.Parallel()
+
+	jpeg := []byte{0xFF, 0xD8, 0xFF, 0xE0}
+	for name, body := range map[string]*waE2E.Message{
+		"a video note": {PtvMessage: &waE2E.VideoMessage{
+			Mimetype: proto.String("video/mp4"), ViewOnce: proto.Bool(true), JPEGThumbnail: jpeg,
+		}},
+		"an image": {ImageMessage: &waE2E.ImageMessage{
+			Mimetype: proto.String("image/jpeg"), ViewOnce: proto.Bool(true), JPEGThumbnail: jpeg,
+		}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			session, _ := newTestSession(t, "5511999990001")
+			emission := publishedBy(t, session, editEvent(carrier, subject, body, 1755000009000))
+			if emission.Type != protocol.EventMessageEdited {
+				t.Fatalf("published %s, want %s", emission.Type, protocol.EventMessageEdited)
+			}
+			content, _ := decode(t, emission.Payload)["content"].(map[string]any)
+			if content["type"] != "media" {
+				t.Fatalf("the correction reads %v, want the file", content)
+			}
+			if thumbnail, present := content["thumbnail"]; present {
+				t.Fatalf("a file sent to be seen once was corrected with its preview: %v", thumbnail)
+			}
+		})
+	}
+	// The control: the same correction of an ordinary image keeps the preview a client draws.
+	session, _ := newTestSession(t, "5511999990001")
+	emission := publishedBy(t, session, editEvent(carrier, subject, &waE2E.Message{ImageMessage: &waE2E.ImageMessage{
+		Mimetype: proto.String("image/jpeg"), JPEGThumbnail: jpeg,
+	}}, 1755000009000))
+	content, _ := decode(t, emission.Payload)["content"].(map[string]any)
+	if content["thumbnail"] == nil {
+		t.Fatalf("an ordinary image was corrected without its preview: %v", content)
+	}
+}

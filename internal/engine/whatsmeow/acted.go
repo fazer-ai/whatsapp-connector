@@ -593,7 +593,11 @@ func correctedContent(corrected *waE2E.Message) any {
 		return protocol.Text(text)
 	}
 	if part, ok := attachmentOf(corrected); ok {
-		// No Ref, on purpose: see protocol.MessageEdited.
+		// No Ref, on purpose: see protocol.MessageEdited. And no preview of a file sent to
+		// be seen once, for the reason the message path drops it.
+		if sentToBeSeenOnce(corrected) {
+			part.content.Thumbnail = ""
+		}
 		return part.content
 	}
 	return protocol.Unsupported(protocol.UnsupportedUnknownType).Detailed(armOf(corrected))
