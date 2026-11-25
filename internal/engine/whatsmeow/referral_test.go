@@ -126,6 +126,18 @@ func TestAQuotedAdFillsInTheCreativeAndTheCaption(t *testing.T) {
 		})
 	}
 
+	// A card that says NONE has said its ad has no creative.
+	none := textMessage("3EB0NONE", "")
+	none.Message = adClick(&waE2E.ContextInfo{
+		ExternalAdReply: &waE2E.ContextInfo_ExternalAdReplyInfo{
+			CtwaClid: proto.String("ARAk"), MediaType: waE2E.ContextInfo_ExternalAdReplyInfo_NONE.Enum(),
+		},
+		QuotedAd: &waE2E.ContextInfo_AdReplyInfo{MediaType: waE2E.ContextInfo_AdReplyInfo_VIDEO.Enum()},
+	})
+	if message, _, _ := plain(t).inboundOf(none, plainBody); message.Referral == nil || message.Referral.MediaType != "" {
+		t.Errorf("the ad is %+v, want no creative, as the card said", message.Referral)
+	}
+
 	// The card's own values win over the quoted ad's.
 	event := textMessage("3EB0BOTH", "")
 	event.Message = adClick(&waE2E.ContextInfo{

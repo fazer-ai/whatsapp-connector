@@ -33,12 +33,14 @@ func referralOf(context *waE2E.ContextInfo) *protocol.Referral {
 		ThumbnailURL: ad.GetThumbnailURL(),
 	}
 	// A quoted ad is the older way WhatsApp attaches the ad, and the two fields it shares
-	// with the card fill in what the card left out.
+	// with the card fill in what the card left out. Left out means the field is absent
+	// from the card, not that it reads empty: a card that says NONE has said its ad has
+	// no creative, and the quoted ad does not get to overrule it.
 	if quoted := context.GetQuotedAd(); quoted != nil {
-		if referral.Body == "" {
+		if ad == nil || ad.Body == nil {
 			referral.Body = quoted.GetCaption()
 		}
-		if referral.MediaType == "" {
+		if ad == nil || ad.MediaType == nil {
 			referral.MediaType = quotedAdMediaTypeOf(quoted.GetMediaType())
 		}
 	}
