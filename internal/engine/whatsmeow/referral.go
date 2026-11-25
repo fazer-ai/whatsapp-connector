@@ -22,7 +22,7 @@ func referralOf(context *waE2E.ContextInfo) *protocol.Referral {
 		return nil
 	}
 	ad := context.GetExternalAdReply()
-	return &protocol.Referral{
+	referral := &protocol.Referral{
 		SourceType:   ad.GetSourceType(),
 		SourceID:     ad.GetSourceID(),
 		SourceURL:    ad.GetSourceURL(),
@@ -32,6 +32,17 @@ func referralOf(context *waE2E.ContextInfo) *protocol.Referral {
 		MediaType:    adMediaTypeOf(ad.GetMediaType()),
 		ThumbnailURL: ad.GetThumbnailURL(),
 	}
+	// A quoted ad is the older way WhatsApp attaches the ad, and the two fields it shares
+	// with the card fill in what the card left out.
+	if quoted := context.GetQuotedAd(); quoted != nil {
+		if referral.Body == "" {
+			referral.Body = quoted.GetCaption()
+		}
+		if referral.MediaType == "" {
+			referral.MediaType = quotedAdMediaTypeOf(quoted.GetMediaType())
+		}
+	}
+	return referral
 }
 
 // fromAnAd is whether anything around the message says it came from an ad. Any one
@@ -79,6 +90,19 @@ func adMediaTypeOf(kind waE2E.ContextInfo_ExternalAdReplyInfo_MediaType) protoco
 	case waE2E.ContextInfo_ExternalAdReplyInfo_IMAGE:
 		return protocol.AdMediaImage
 	case waE2E.ContextInfo_ExternalAdReplyInfo_VIDEO:
+		return protocol.AdMediaVideo
+	default:
+		return ""
+	}
+}
+
+// quotedAdMediaTypeOf is adMediaTypeOf for the quoted ad, whose enum is a separate type
+// with the same three values.
+func quotedAdMediaTypeOf(kind waE2E.ContextInfo_AdReplyInfo_MediaType) protocol.AdMediaType {
+	switch kind {
+	case waE2E.ContextInfo_AdReplyInfo_IMAGE:
+		return protocol.AdMediaImage
+	case waE2E.ContextInfo_AdReplyInfo_VIDEO:
 		return protocol.AdMediaVideo
 	default:
 		return ""

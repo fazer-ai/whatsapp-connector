@@ -1,6 +1,10 @@
 package whatsmeow
 
 import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"reflect"
 	"testing"
 
 	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
@@ -18,44 +22,124 @@ func adClick(context *waE2E.ContextInfo) *waE2E.Message {
 	}}
 }
 
+// The ad in the contract's fixture, sent the way WhatsApp sends it, comes out as the
+// fixture says. A hand-written copy of the expected fields would keep passing next to a
+// fixture that had drifted from it.
 func TestAMessageFromAnAdCarriesTheAdAndWhereItRan(t *testing.T) {
 	t.Parallel()
+
+	raw, err := os.ReadFile(filepath.Join("..", "..", "..", "contract", "fixtures", "events", "message_received_ctwa_referral.json"))
+	if err != nil {
+		t.Fatalf("read the fixture: %v", err)
+	}
+	var fixture struct {
+		Payload struct {
+			Message map[string]any `json:"message"`
+		} `json:"payload"`
+	}
+	if err := json.Unmarshal(raw, &fixture); err != nil {
+		t.Fatalf("decode the fixture: %v", err)
+	}
+	want := fixture.Payload.Message
+	ref, _ := want["referral"].(map[string]any)
+	entry, _ := want["entry_point"].(map[string]any)
+	text := func(m map[string]any, key string) *string {
+		value, _ := m[key].(string)
+		return proto.String(value)
+	}
+	if ref["media_type"] != "image" {
+		t.Fatalf("the fixture's ad is a %v, and this test sends an image", ref["media_type"])
+	}
 
 	session, _ := newTestSession(t, "5511999990001")
 	event := textMessage("3EB0ADCLICK", "")
 	event.Message = adClick(&waE2E.ContextInfo{
 		ExternalAdReply: &waE2E.ContextInfo_ExternalAdReplyInfo{
-			SourceType:   proto.String("ad"),
-			SourceID:     proto.String("120210000000000001"),
-			SourceURL:    proto.String("https://fb.me/2AbCdEfGh"),
-			CtwaClid:     proto.String("ARAkLkA8rmlFeiCktEJQ0000"),
-			Title:        proto.String("Consultoria gratuita"),
-			Body:         proto.String("Fale com a gente pelo WhatsApp"),
-			MediaType:    waE2E.ContextInfo_ExternalAdReplyInfo_VIDEO.Enum(),
-			ThumbnailURL: proto.String("https://scontent.whatsapp.net/v/t45/ad-thumbnail.jpg"),
+			SourceType:   text(ref, "source_type"),
+			SourceID:     text(ref, "source_id"),
+			SourceURL:    text(ref, "source_url"),
+			CtwaClid:     text(ref, "ctwa_clid"),
+			Title:        text(ref, "title"),
+			Body:         text(ref, "body"),
+			MediaType:    waE2E.ContextInfo_ExternalAdReplyInfo_IMAGE.Enum(),
+			ThumbnailURL: text(ref, "thumbnail_url"),
 		},
-		EntryPointConversionSource: proto.String("ctwa_ad"),
-		EntryPointConversionApp:    proto.String("instagram"),
+		EntryPointConversionSource: text(entry, "source"),
+		EntryPointConversionApp:    text(entry, "app"),
 	})
 
 	message := messageMapOf(t, publishedBy(t, session, event))
-	referral, ok := message["referral"].(map[string]any)
-	if !ok {
-		t.Fatalf("the message from the ad was published without the ad: %v", message)
-	}
-	for field, want := range map[string]any{
-		"source_type": "ad", "source_id": "120210000000000001", "source_url": "https://fb.me/2AbCdEfGh",
-		"ctwa_clid": "ARAkLkA8rmlFeiCktEJQ0000", "title": "Consultoria gratuita",
-		"body": "Fale com a gente pelo WhatsApp", "media_type": "video",
-		"thumbnail_url": "https://scontent.whatsapp.net/v/t45/ad-thumbnail.jpg",
-	} {
-		if referral[field] != want {
-			t.Errorf("the ad's %s is %v, want %v", field, referral[field], want)
+	for _, field := range []string{"referral", "entry_point"} {
+		if !reflect.DeepEqual(message[field], want[field]) {
+			t.Errorf("the %s is %v, want the fixture's %v", field, message[field], want[field])
 		}
 	}
-	entry, ok := message["entry_point"].(map[string]any)
-	if !ok || entry["source"] != "ctwa_ad" || entry["app"] != "instagram" {
-		t.Errorf("the entry point is %v, want ctwa_ad from instagram", message["entry_point"])
+}
+
+// The fixture's ad is an image, so the other creative is pinned here.
+func TestAVideoAdSaysVideo(t *testing.T) {
+	t.Parallel()
+
+	event := textMessage("3EB0ADVIDEO", "")
+	event.Message = adClick(&waE2E.ContextInfo{ExternalAdReply: &waE2E.ContextInfo_ExternalAdReplyInfo{
+		CtwaClid:  proto.String("ARAkLkA8rmlFeiCktEJQ0002"),
+		MediaType: waE2E.ContextInfo_ExternalAdReplyInfo_VIDEO.Enum(),
+	}})
+
+	message, _, ok := plain(t).inboundOf(event, plainBody)
+	if !ok {
+		t.Fatal("the message from the ad was refused")
+	}
+	if message.Referral == nil || message.Referral.MediaType != protocol.AdMediaVideo {
+		t.Fatalf("the ad is %+v, want a video", message.Referral)
+	}
+}
+
+// A quoted ad, the older way WhatsApp attaches one, fills in what the card left out.
+func TestAQuotedAdFillsInTheCreativeAndTheCaption(t *testing.T) {
+	t.Parallel()
+
+	for name, context := range map[string]*waE2E.ContextInfo{
+		"with no card": {QuotedAd: &waE2E.ContextInfo_AdReplyInfo{
+			MediaType: waE2E.ContextInfo_AdReplyInfo_VIDEO.Enum(), Caption: proto.String("Fale com a gente"),
+		}},
+		"with a card that left them out": {
+			ExternalAdReply: &waE2E.ContextInfo_ExternalAdReplyInfo{CtwaClid: proto.String("ARAk")},
+			QuotedAd: &waE2E.ContextInfo_AdReplyInfo{
+				MediaType: waE2E.ContextInfo_AdReplyInfo_VIDEO.Enum(), Caption: proto.String("Fale com a gente"),
+			},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			event := textMessage("3EB0QUOTEDAD", "")
+			event.Message = adClick(context)
+			message, _, ok := plain(t).inboundOf(event, plainBody)
+			if !ok {
+				t.Fatal("the message from the ad was refused")
+			}
+			if message.Referral == nil || message.Referral.MediaType != protocol.AdMediaVideo ||
+				message.Referral.Body != "Fale com a gente" {
+				t.Fatalf("the ad is %+v, want the quoted ad's video and caption", message.Referral)
+			}
+		})
+	}
+
+	// The card's own values win over the quoted ad's.
+	event := textMessage("3EB0BOTH", "")
+	event.Message = adClick(&waE2E.ContextInfo{
+		ExternalAdReply: &waE2E.ContextInfo_ExternalAdReplyInfo{
+			CtwaClid: proto.String("ARAk"), Body: proto.String("Do card"),
+			MediaType: waE2E.ContextInfo_ExternalAdReplyInfo_IMAGE.Enum(),
+		},
+		QuotedAd: &waE2E.ContextInfo_AdReplyInfo{
+			MediaType: waE2E.ContextInfo_AdReplyInfo_VIDEO.Enum(), Caption: proto.String("Do anúncio citado"),
+		},
+	})
+	message, _, _ := plain(t).inboundOf(event, plainBody)
+	if message.Referral == nil || message.Referral.MediaType != protocol.AdMediaImage || message.Referral.Body != "Do card" {
+		t.Errorf("the ad is %+v, want the card's image and body", message.Referral)
 	}
 }
 
