@@ -1,7 +1,6 @@
 package whatsmeow
 
 import (
-	"net"
 	"net/url"
 	"strconv"
 	"strings"
@@ -57,7 +56,9 @@ func referralOf(context *waE2E.ContextInfo) *protocol.Referral {
 //
 // The port is held to the same shapes the blob address is in engine.go: url.Parse only
 // checks that a port is digits, so 99999 and 0 come through it, and a colon with nothing
-// after it parses as no port at all.
+// after it parses as no port at all. The host is not judged past being there: whether
+// a name or an address opens is the client's to find out, as with any link, and a
+// second copy of a browser's host parser here would only disagree with the browser.
 func webURL(raw string) string {
 	parsed, err := url.Parse(raw)
 	if err != nil || parsed.Hostname() == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
@@ -65,16 +66,6 @@ func webURL(raw string) string {
 	}
 	if strings.HasSuffix(parsed.Host, ":") {
 		return ""
-	}
-	// A host written as an address has to be one. url.Parse takes 192.168.1.999 as a
-	// name, and a client handed it has a link nobody can open. A name that parses is
-	// kept: whether it resolves is the client's to find out, as with any link.
-	// A trailing dot is the fully qualified form, which browsers accept and drop.
-	host := strings.TrimSuffix(parsed.Hostname(), ".")
-	if strings.Contains(host, ":") || strings.Trim(host, "0123456789.") == "" {
-		if net.ParseIP(host) == nil {
-			return ""
-		}
 	}
 	if port := parsed.Port(); port != "" {
 		number, err := strconv.Atoi(port)
