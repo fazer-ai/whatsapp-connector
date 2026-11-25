@@ -78,8 +78,18 @@ func webURL(raw string) string {
 // the message it copies, ad card and entry point included, and those say how the
 // original conversation started, not this one: published, they would credit the ad
 // with a contact it never brought in.
+//
+// Every field of the pinned proto that says a message is a forward counts, since each
+// kind of forward (from a chat, a channel, a business, Meta AI) sets its own and none
+// of them sets all. ForwardOrigin is read off the field because UNKNOWN is its zero
+// value.
 func forwarded(context *waE2E.ContextInfo) bool {
-	return context.GetIsForwarded() || context.GetForwardingScore() > 0
+	return context.GetIsForwarded() ||
+		context.GetForwardingScore() > 0 ||
+		context.GetForwardedNewsletterMessageInfo() != nil ||
+		context.GetBusinessMessageForwardInfo() != nil ||
+		context.GetForwardedAiBotMessageInfo() != nil ||
+		(context != nil && context.ForwardOrigin != nil)
 }
 
 // fromAnAd is whether anything around the message says it came from an ad. Any one
@@ -87,7 +97,9 @@ func forwarded(context *waE2E.ContextInfo) bool {
 // every field of the pinned proto that only an ad sets, taken off the proto rather than
 // off the messages seen so far; a field a link preview also sets (title, body, URLs,
 // thumbnail, media type, source id, `ContainsAutoReply`, `RenderLargerThumbnail`) is
-// left out, because it would make every preview card an ad.
+// left out, because it would make every preview card an ad. So are `SourceApp`,
+// `OriginalImageURL`, `MediaURL`, `Thumbnail`, `Ref` and `DisableNudge`, which describe
+// the card or the link rather than saying an ad stands behind it.
 func fromAnAd(context *waE2E.ContextInfo) bool {
 	return adCard(context.GetExternalAdReply()) ||
 		context.GetEntryPointConversionSource() == "ctwa_ad" ||
@@ -117,7 +129,13 @@ func adCard(ad *waE2E.ContextInfo_ExternalAdReplyInfo) bool {
 		ad.GetCtaPayload() != "" ||
 		ad.GetWtwaAdFormat() ||
 		ad.GetAdPreviewURL() != "" ||
-		ad.GetContainsCtwaFlowsAutoReply()
+		ad.GetContainsCtwaFlowsAutoReply() ||
+		ad.GetAdContextPreviewDismissed() ||
+		ad.GetWtwaWebsiteURL() != "" ||
+		// The automated greeting strategies are read off the fields: zero is a value the
+		// ad can set, and only an ad sets them at all.
+		ad.AgmThumbnailStrategy != nil || ad.AgmTitleStrategy != nil ||
+		ad.AgmSubtitleStrategy != nil || ad.AgmHeaderInteractionStrategy != nil
 }
 
 // adMediaTypeOf names the ad's creative the way the Cloud API does. An ad with no

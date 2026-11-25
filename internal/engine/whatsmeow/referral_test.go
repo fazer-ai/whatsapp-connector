@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	waAICommon "go.mau.fi/whatsmeow/proto/waAICommon"
 	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
 	"google.golang.org/protobuf/proto"
 
@@ -321,6 +322,24 @@ func TestAnAdIsRecognisedByAnyOfItsSignals(t *testing.T) {
 		"a flows auto reply": card(func(ad *waE2E.ContextInfo_ExternalAdReplyInfo) {
 			ad.ContainsCtwaFlowsAutoReply = proto.Bool(true)
 		}),
+		"a dismissed ad preview": card(func(ad *waE2E.ContextInfo_ExternalAdReplyInfo) {
+			ad.AdContextPreviewDismissed = proto.Bool(true)
+		}),
+		"a website ad": card(func(ad *waE2E.ContextInfo_ExternalAdReplyInfo) {
+			ad.WtwaWebsiteURL = proto.String("https://example.com")
+		}),
+		"a greeting thumbnail strategy": card(func(ad *waE2E.ContextInfo_ExternalAdReplyInfo) {
+			ad.AgmThumbnailStrategy = proto.Int32(0)
+		}),
+		"a greeting title strategy": card(func(ad *waE2E.ContextInfo_ExternalAdReplyInfo) {
+			ad.AgmTitleStrategy = proto.Int32(0)
+		}),
+		"a greeting subtitle strategy": card(func(ad *waE2E.ContextInfo_ExternalAdReplyInfo) {
+			ad.AgmSubtitleStrategy = proto.Int32(0)
+		}),
+		"a greeting header strategy": card(func(ad *waE2E.ContextInfo_ExternalAdReplyInfo) {
+			ad.AgmHeaderInteractionStrategy = proto.Int32(0)
+		}),
 		"the ctwa_ad entry point": around(func(c *waE2E.ContextInfo) {
 			c.EntryPointConversionSource = proto.String("ctwa_ad")
 		}),
@@ -409,6 +428,12 @@ func TestAForwardedAdCarriesNoAttribution(t *testing.T) {
 	for name, context := range map[string]*waE2E.ContextInfo{
 		"flagged as forwarded":    {IsForwarded: proto.Bool(true)},
 		"with a forwarding score": {ForwardingScore: proto.Uint32(1)},
+		"from a channel": {
+			ForwardedNewsletterMessageInfo: &waE2E.ContextInfo_ForwardedNewsletterMessageInfo{},
+		},
+		"from a business": {BusinessMessageForwardInfo: &waE2E.ContextInfo_BusinessMessageForwardInfo{}},
+		"from Meta AI":    {ForwardedAiBotMessageInfo: &waAICommon.ForwardedAIBotMessageInfo{}},
+		"with an origin":  {ForwardOrigin: waE2E.ContextInfo_UNKNOWN.Enum()},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
