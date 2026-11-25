@@ -63,9 +63,38 @@ type InboundMessage struct {
 	// the phone when nothing about it was readable.
 	QuotedProduct *Product  `json:"quoted_product,omitempty"`
 	Mentions      []Address `json:"mentions,omitempty"`
+	// Referral is the ad a Click-to-WhatsApp conversation was opened from, carried on the
+	// message the ad's button sent. Absent on every other message.
+	Referral *Referral `json:"referral,omitempty"`
+	// EntryPoint is where WhatsApp says the conversation was started from (an ad, a
+	// click-to-chat link), which it reports on first-contact messages with or without an
+	// ad behind them.
+	EntryPoint *EntryPoint `json:"entry_point,omitempty"`
 	// Ephemeral is the disappearing-message expiration in seconds, zero when the chat
 	// is not on a timer.
 	Ephemeral uint32 `json:"ephemeral,omitempty"`
+}
+
+// Referral is the Click-to-WhatsApp ad behind a message, in the shape the WhatsApp Cloud
+// API's own `referral` has, so a client attributes a conversation the same way whichever
+// provider it came through. `ctwa_clid` is the click id Meta's Conversions API takes back.
+// Every field is what WhatsApp sent: one it left out is absent.
+type Referral struct {
+	SourceType   string `json:"source_type,omitempty"`
+	SourceID     string `json:"source_id,omitempty"`
+	SourceURL    string `json:"source_url,omitempty"`
+	CtwaClid     string `json:"ctwa_clid,omitempty"`
+	Title        string `json:"title,omitempty"`
+	Body         string `json:"body,omitempty"`
+	MediaType    string `json:"media_type,omitempty"`
+	ThumbnailURL string `json:"thumbnail_url,omitempty"`
+}
+
+// EntryPoint is WhatsApp's own label for where a conversation started (`ctwa_ad` for an
+// ad, `click_to_chat_link` for a wa.me link) and the app it started in.
+type EntryPoint struct {
+	Source string `json:"source"`
+	App    string `json:"app,omitempty"`
 }
 
 // MediaKind is what sort of file a media message carries. The contract's enum is
