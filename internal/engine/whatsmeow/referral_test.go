@@ -108,7 +108,7 @@ func TestAnAdKeepsOnlyWebAddressesInItsURLs(t *testing.T) {
 		CtwaClid: proto.String("ARAk"), SourceURL: proto.String("http://fb.me/x"),
 		ThumbnailURL: proto.String("https://scontent.whatsapp.net/t.jpg"),
 	}})
-	for _, good := range []string{"https://192.168.1.10/ad.jpg", "https://[2001:db8::1]:8443/ad.jpg"} {
+	for _, good := range []string{"https://192.168.1.10/ad.jpg", "https://192.0.2.1./ad.jpg", "https://[2001:db8::1]:8443/ad.jpg"} {
 		if webURL(good) != good {
 			t.Errorf("%s was dropped, and it is a web address", good)
 		}

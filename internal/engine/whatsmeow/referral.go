@@ -69,7 +69,8 @@ func webURL(raw string) string {
 	// A host written as an address has to be one. url.Parse takes 192.168.1.999 as a
 	// name, and a client handed it has a link nobody can open. A name that parses is
 	// kept: whether it resolves is the client's to find out, as with any link.
-	host := parsed.Hostname()
+	// A trailing dot is the fully qualified form, which browsers accept and drop.
+	host := strings.TrimSuffix(parsed.Hostname(), ".")
 	if strings.Contains(host, ":") || strings.Trim(host, "0123456789.") == "" {
 		if net.ParseIP(host) == nil {
 			return ""
