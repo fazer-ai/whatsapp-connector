@@ -1,6 +1,7 @@
 package whatsmeow
 
 import (
+	"net/url"
 	"strings"
 
 	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
@@ -25,12 +26,12 @@ func referralOf(context *waE2E.ContextInfo) *protocol.Referral {
 	referral := &protocol.Referral{
 		SourceType:   ad.GetSourceType(),
 		SourceID:     ad.GetSourceID(),
-		SourceURL:    ad.GetSourceURL(),
+		SourceURL:    webURL(ad.GetSourceURL()),
 		CtwaClid:     ad.GetCtwaClid(),
 		Title:        ad.GetTitle(),
 		Body:         ad.GetBody(),
 		MediaType:    adMediaTypeOf(ad.GetMediaType()),
-		ThumbnailURL: ad.GetThumbnailURL(),
+		ThumbnailURL: webURL(ad.GetThumbnailURL()),
 	}
 	// A quoted ad is the older way WhatsApp attaches the ad, and the two fields it shares
 	// with the card fill in what the card left out. Left out means the field is absent
@@ -45,6 +46,18 @@ func referralOf(context *waE2E.ContextInfo) *protocol.Referral {
 		}
 	}
 	return referral
+}
+
+// webURL is a URL the sender wrote, kept only when it is an http or https address with a
+// host. Anything else (a `data:` URI carrying the image itself, a `javascript:` link, a
+// path) is dropped on its own, leaving the rest of the referral: a frame carries a
+// reference to media, never the media, and a client links to what it is handed.
+func webURL(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return ""
+	}
+	return raw
 }
 
 // fromAnAd is whether anything around the message says it came from an ad. Any one

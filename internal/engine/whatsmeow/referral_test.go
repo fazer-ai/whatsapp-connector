@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
@@ -22,9 +23,9 @@ func adClick(context *waE2E.ContextInfo) *waE2E.Message {
 	}}
 }
 
-// The ad in the contract's fixture, sent the way WhatsApp sends it, comes out as the
-// fixture says. A hand-written copy of the expected fields would keep passing next to a
-// fixture that had drifted from it.
+// The ad WhatsApp sends comes out as the contract's fixture says. The input is written
+// out here and the fixture is only the expected output, so a field dropped from either
+// side is a difference rather than two absences that agree.
 func TestAMessageFromAnAdCarriesTheAdAndWhereItRan(t *testing.T) {
 	t.Parallel()
 
@@ -40,39 +41,70 @@ func TestAMessageFromAnAdCarriesTheAdAndWhereItRan(t *testing.T) {
 	if err := json.Unmarshal(raw, &fixture); err != nil {
 		t.Fatalf("decode the fixture: %v", err)
 	}
-	want := fixture.Payload.Message
-	ref, _ := want["referral"].(map[string]any)
-	entry, _ := want["entry_point"].(map[string]any)
-	text := func(m map[string]any, key string) *string {
-		value, _ := m[key].(string)
-		return proto.String(value)
-	}
-	if ref["media_type"] != "image" {
-		t.Fatalf("the fixture's ad is a %v, and this test sends an image", ref["media_type"])
-	}
 
 	session, _ := newTestSession(t, "5511999990001")
 	event := textMessage("3EB0ADCLICK", "")
 	event.Message = adClick(&waE2E.ContextInfo{
 		ExternalAdReply: &waE2E.ContextInfo_ExternalAdReplyInfo{
-			SourceType:   text(ref, "source_type"),
-			SourceID:     text(ref, "source_id"),
-			SourceURL:    text(ref, "source_url"),
-			CtwaClid:     text(ref, "ctwa_clid"),
-			Title:        text(ref, "title"),
-			Body:         text(ref, "body"),
+			SourceType:   proto.String("ad"),
+			SourceID:     proto.String("120210000000000001"),
+			SourceURL:    proto.String("https://fb.me/2AbCdEfGh"),
+			CtwaClid:     proto.String("ARAkLkA8rmlFeiCktEJQ0000"),
+			Title:        proto.String("Consultoria gratuita"),
+			Body:         proto.String("Fale com a gente pelo WhatsApp"),
 			MediaType:    waE2E.ContextInfo_ExternalAdReplyInfo_IMAGE.Enum(),
-			ThumbnailURL: text(ref, "thumbnail_url"),
+			ThumbnailURL: proto.String("https://scontent.whatsapp.net/v/t45/ad-thumbnail.jpg"),
 		},
-		EntryPointConversionSource: text(entry, "source"),
-		EntryPointConversionApp:    text(entry, "app"),
+		EntryPointConversionSource: proto.String("ctwa_ad"),
+		EntryPointConversionApp:    proto.String("instagram"),
 	})
 
 	message := messageMapOf(t, publishedBy(t, session, event))
 	for _, field := range []string{"referral", "entry_point"} {
-		if !reflect.DeepEqual(message[field], want[field]) {
-			t.Errorf("the %s is %v, want the fixture's %v", field, message[field], want[field])
+		want := fixture.Payload.Message[field]
+		if want == nil {
+			t.Fatalf("the fixture has no %s to compare with", field)
 		}
+		if !reflect.DeepEqual(message[field], want) {
+			t.Errorf("the %s is %v, want the fixture's %v", field, message[field], want)
+		}
+	}
+}
+
+// What the sender wrote into a URL field is kept only when it is a web address. The
+// rest of the ad is kept either way.
+func TestAnAdKeepsOnlyWebAddressesInItsURLs(t *testing.T) {
+	t.Parallel()
+
+	for _, bad := range []string{
+		"data:image/jpeg;base64," + strings.Repeat("A", 64*1024),
+		"javascript:alert(1)",
+		"/relative/path.jpg",
+		"https://",
+		"ftp://example.com/ad.jpg",
+	} {
+		event := textMessage("3EB0BADURL", "")
+		event.Message = adClick(&waE2E.ContextInfo{ExternalAdReply: &waE2E.ContextInfo_ExternalAdReplyInfo{
+			CtwaClid: proto.String("ARAk"), SourceURL: proto.String(bad), ThumbnailURL: proto.String(bad),
+		}})
+		message, _, ok := plain(t).inboundOf(event, plainBody)
+		if !ok {
+			t.Fatal("the message from the ad was refused")
+		}
+		if message.Referral == nil || *message.Referral != (protocol.Referral{CtwaClid: "ARAk"}) {
+			t.Errorf("with %.40q the ad is %+v, want the click id and no URL", bad, message.Referral)
+		}
+	}
+
+	event := textMessage("3EB0GOODURL", "")
+	event.Message = adClick(&waE2E.ContextInfo{ExternalAdReply: &waE2E.ContextInfo_ExternalAdReplyInfo{
+		CtwaClid: proto.String("ARAk"), SourceURL: proto.String("http://fb.me/x"),
+		ThumbnailURL: proto.String("https://scontent.whatsapp.net/t.jpg"),
+	}})
+	message, _, _ := plain(t).inboundOf(event, plainBody)
+	if message.Referral == nil || message.Referral.SourceURL != "http://fb.me/x" ||
+		message.Referral.ThumbnailURL != "https://scontent.whatsapp.net/t.jpg" {
+		t.Errorf("the ad is %+v, want both web addresses kept", message.Referral)
 	}
 }
 
