@@ -15,13 +15,13 @@ import (
 // An external ad reply is also how a link preview card is drawn, with a title, a
 // thumbnail and a URL and no ad behind it, so the card alone does not make an ad: one
 // of WhatsApp's ad signals has to say so (see fromAnAd). Once one does, the referral is
-// published even with none of its fields readable, because that it came from an ad is
-// itself the attribution.
+// published even with no card and none of its fields readable, because that it came
+// from an ad is itself the attribution.
 func referralOf(context *waE2E.ContextInfo) *protocol.Referral {
-	ad := context.GetExternalAdReply()
-	if ad == nil || !fromAnAd(context, ad) {
+	if !fromAnAd(context) {
 		return nil
 	}
+	ad := context.GetExternalAdReply()
 	return &protocol.Referral{
 		SourceType:   ad.GetSourceType(),
 		SourceID:     ad.GetSourceID(),
@@ -34,25 +34,42 @@ func referralOf(context *waE2E.ContextInfo) *protocol.Referral {
 	}
 }
 
-// fromAnAd is every signal WhatsApp gives that a card is an ad and not a link preview:
-// the click id, an ad type, an ad or post source on the card, and, on the context
-// around it, the `ctwa_ad` entry point or the `FB_Ads` conversion source. Any one is
-// enough, since WhatsApp does not send all of them every time.
-func fromAnAd(context *waE2E.ContextInfo, ad *waE2E.ContextInfo_ExternalAdReplyInfo) bool {
-	switch {
-	case ad.GetCtwaClid() != "":
-		return true
-	// Read off the field and not the getter: CTWA is the enum's zero value, so the
-	// getter says CTWA for every preview card that never set an ad type.
-	case ad.AdType != nil:
-		return true
-	case ad.GetSourceType() == "ad", ad.GetSourceType() == "post":
-		return true
-	case context.GetEntryPointConversionSource() == "ctwa_ad":
-		return true
-	default:
-		return strings.EqualFold(context.GetConversionSource(), "fb_ads")
+// fromAnAd is whether anything around the message says it came from an ad. Any one
+// signal is enough, since WhatsApp does not send all of them every time. The list is
+// every field of the pinned proto that only an ad sets, taken off the proto rather than
+// off the messages seen so far; a field a link preview also sets (title, body, URLs,
+// thumbnail, media type, source id, `ContainsAutoReply`, `RenderLargerThumbnail`) is
+// left out, because it would make every preview card an ad.
+func fromAnAd(context *waE2E.ContextInfo) bool {
+	return adCard(context.GetExternalAdReply()) ||
+		context.GetEntryPointConversionSource() == "ctwa_ad" ||
+		strings.EqualFold(context.GetConversionSource(), "fb_ads") ||
+		context.GetAlwaysShowAdAttribution() ||
+		context.GetCtwaSignals() != "" ||
+		len(context.GetCtwaPayload()) > 0 ||
+		context.GetQuotedAd() != nil
+}
+
+// adCard is whether the external ad reply says it is an ad's card, and not a link
+// preview drawn the same way.
+func adCard(ad *waE2E.ContextInfo_ExternalAdReplyInfo) bool {
+	if ad == nil {
+		return false
 	}
+	return ad.GetCtwaClid() != "" ||
+		// Read off the field and not the getter: CTWA is the enum's zero value, so the
+		// getter says CTWA for every preview card that never set an ad type.
+		ad.AdType != nil ||
+		ad.GetSourceType() == "ad" || ad.GetSourceType() == "post" ||
+		ad.GetShowAdAttribution() ||
+		ad.GetClickToWhatsappCall() ||
+		ad.GetAutomatedGreetingMessageShown() ||
+		ad.GetGreetingMessageBody() != "" ||
+		ad.GetAutomatedGreetingMessageCtaType() != "" ||
+		ad.GetCtaPayload() != "" ||
+		ad.GetWtwaAdFormat() ||
+		ad.GetAdPreviewURL() != "" ||
+		ad.GetContainsCtwaFlowsAutoReply()
 }
 
 // adMediaTypeOf names the ad's creative the way the Cloud API does. An ad with no

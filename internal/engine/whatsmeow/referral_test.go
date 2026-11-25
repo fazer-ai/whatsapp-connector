@@ -149,24 +149,56 @@ func TestALinkPreviewWithNothingSayingItIsAnAdCarriesNoReferral(t *testing.T) {
 func TestAnAdIsRecognisedByAnyOfItsSignals(t *testing.T) {
 	t.Parallel()
 
+	card := func(set func(*waE2E.ContextInfo_ExternalAdReplyInfo)) *waE2E.ContextInfo {
+		ad := &waE2E.ContextInfo_ExternalAdReplyInfo{Title: proto.String("Consultoria gratuita")}
+		set(ad)
+		return &waE2E.ContextInfo{ExternalAdReply: ad}
+	}
+	around := func(set func(*waE2E.ContextInfo)) *waE2E.ContextInfo {
+		context := &waE2E.ContextInfo{
+			ExternalAdReply: &waE2E.ContextInfo_ExternalAdReplyInfo{Title: proto.String("Consultoria gratuita")},
+		}
+		set(context)
+		return context
+	}
 	for name, context := range map[string]*waE2E.ContextInfo{
-		"an ad source": {ExternalAdReply: &waE2E.ContextInfo_ExternalAdReplyInfo{
-			SourceType: proto.String("ad"), Title: proto.String("Consultoria gratuita"),
-		}},
-		"a post source": {ExternalAdReply: &waE2E.ContextInfo_ExternalAdReplyInfo{
-			SourceType: proto.String("post"), Title: proto.String("Consultoria gratuita"),
-		}},
-		"an ad type": {ExternalAdReply: &waE2E.ContextInfo_ExternalAdReplyInfo{
-			AdType: waE2E.ContextInfo_ExternalAdReplyInfo_CTWA.Enum(), Title: proto.String("Consultoria gratuita"),
-		}},
-		"the FB_Ads conversion source": {
-			ExternalAdReply:  &waE2E.ContextInfo_ExternalAdReplyInfo{Title: proto.String("Consultoria gratuita")},
-			ConversionSource: proto.String("FB_Ads"),
-		},
-		"the ctwa_ad entry point": {
-			ExternalAdReply:            &waE2E.ContextInfo_ExternalAdReplyInfo{Title: proto.String("Consultoria gratuita")},
-			EntryPointConversionSource: proto.String("ctwa_ad"),
-		},
+		"a click id": card(func(ad *waE2E.ContextInfo_ExternalAdReplyInfo) { ad.CtwaClid = proto.String("ARAk") }),
+		"an ad type": card(func(ad *waE2E.ContextInfo_ExternalAdReplyInfo) {
+			ad.AdType = waE2E.ContextInfo_ExternalAdReplyInfo_CTWA.Enum()
+		}),
+		"an ad source":  card(func(ad *waE2E.ContextInfo_ExternalAdReplyInfo) { ad.SourceType = proto.String("ad") }),
+		"a post source": card(func(ad *waE2E.ContextInfo_ExternalAdReplyInfo) { ad.SourceType = proto.String("post") }),
+		"the ad attribution flag": card(func(ad *waE2E.ContextInfo_ExternalAdReplyInfo) {
+			ad.ShowAdAttribution = proto.Bool(true)
+		}),
+		"a call ad": card(func(ad *waE2E.ContextInfo_ExternalAdReplyInfo) { ad.ClickToWhatsappCall = proto.Bool(true) }),
+		"the ad's greeting shown": card(func(ad *waE2E.ContextInfo_ExternalAdReplyInfo) {
+			ad.AutomatedGreetingMessageShown = proto.Bool(true)
+		}),
+		"the ad's greeting": card(func(ad *waE2E.ContextInfo_ExternalAdReplyInfo) {
+			ad.GreetingMessageBody = proto.String("Olá! Como podemos ajudar?")
+		}),
+		"the greeting's call to action": card(func(ad *waE2E.ContextInfo_ExternalAdReplyInfo) {
+			ad.AutomatedGreetingMessageCtaType = proto.String("quick_reply")
+		}),
+		"a call-to-action payload": card(func(ad *waE2E.ContextInfo_ExternalAdReplyInfo) { ad.CtaPayload = proto.String("p") }),
+		"a website ad format":      card(func(ad *waE2E.ContextInfo_ExternalAdReplyInfo) { ad.WtwaAdFormat = proto.Bool(true) }),
+		"an ad preview": card(func(ad *waE2E.ContextInfo_ExternalAdReplyInfo) {
+			ad.AdPreviewURL = proto.String("https://fb.me/preview")
+		}),
+		"a flows auto reply": card(func(ad *waE2E.ContextInfo_ExternalAdReplyInfo) {
+			ad.ContainsCtwaFlowsAutoReply = proto.Bool(true)
+		}),
+		"the ctwa_ad entry point": around(func(c *waE2E.ContextInfo) {
+			c.EntryPointConversionSource = proto.String("ctwa_ad")
+		}),
+		"the FB_Ads conversion source": around(func(c *waE2E.ContextInfo) { c.ConversionSource = proto.String("FB_Ads") }),
+		"the context's ad attribution flag": around(func(c *waE2E.ContextInfo) {
+			c.AlwaysShowAdAttribution = proto.Bool(true)
+		}),
+		"ctwa signals":   around(func(c *waE2E.ContextInfo) { c.CtwaSignals = proto.String("s") }),
+		"a ctwa payload": around(func(c *waE2E.ContextInfo) { c.CtwaPayload = []byte{1} }),
+		"a quoted ad":    around(func(c *waE2E.ContextInfo) { c.QuotedAd = &waE2E.ContextInfo_AdReplyInfo{} }),
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -182,6 +214,23 @@ func TestAnAdIsRecognisedByAnyOfItsSignals(t *testing.T) {
 			}
 		})
 	}
+}
+
+// WhatsApp can say the message came from an ad and send no card for it.
+func TestAnAdWithNoCardIsStillAReferral(t *testing.T) {
+	t.Parallel()
+
+	event := textMessage("3EB0NOCARD", "")
+	event.Message = adClick(&waE2E.ContextInfo{ConversionSource: proto.String("FB_Ads")})
+
+	message, _, ok := plain(t).inboundOf(event, plainBody)
+	if !ok {
+		t.Fatal("the message from the ad was refused")
+	}
+	if message.Referral == nil || *message.Referral != (protocol.Referral{}) {
+		t.Fatalf("the ad is %+v, want an empty referral", message.Referral)
+	}
+	validateInboundAgainstContract(t, &message)
 }
 
 func TestAnEntryPointWithOnlyTheAppKeepsTheApp(t *testing.T) {
