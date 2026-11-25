@@ -595,3 +595,4 @@ third_party/meowcaller/engine.go: Preserve orientation set before the video send
 # case-insensitive match was added, which is why it was taken back as dead code). The test
 # stays as the pin: a pion bump that stopped normalizing would fail it.
 internal/calls/codec.go: Match codec MIME types case-insensitively  # PR#393
+internal/protocol/message.go: Publish the ad title under the Cloud API's `headline` key  # PR#432: Chatwoot normalizes Cloud and Baileys referrals to `title`
