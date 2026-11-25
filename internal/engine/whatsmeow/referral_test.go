@@ -119,3 +119,76 @@ func TestAnOrdinaryMessageCarriesNoAdNorEntryPoint(t *testing.T) {
 		}
 	}
 }
+
+// A link preview is drawn with the same external ad reply as an ad, and a client that
+// keeps the first referral as the campaign behind the contact must not be handed one.
+func TestALinkPreviewWithNothingSayingItIsAnAdCarriesNoReferral(t *testing.T) {
+	t.Parallel()
+
+	event := textMessage("3EB0PREVIEW", "")
+	event.Message = adClick(&waE2E.ContextInfo{
+		ExternalAdReply: &waE2E.ContextInfo_ExternalAdReplyInfo{
+			Title:        proto.String("Nosso cardápio"),
+			Body:         proto.String("Veja os pratos da semana"),
+			SourceURL:    proto.String("https://example.com/cardapio"),
+			ThumbnailURL: proto.String("https://example.com/cardapio.jpg"),
+			MediaType:    waE2E.ContextInfo_ExternalAdReplyInfo_IMAGE.Enum(),
+		},
+	})
+
+	message, _, ok := plain(t).inboundOf(event, plainBody)
+	if !ok {
+		t.Fatal("the message with a preview was refused")
+	}
+	if message.Referral != nil {
+		t.Errorf("a link preview was published as an ad: %+v", message.Referral)
+	}
+}
+
+// Any one of the signals is enough: WhatsApp does not send all of them every time.
+func TestAnAdIsRecognisedByAnyOfItsSignals(t *testing.T) {
+	t.Parallel()
+
+	for name, context := range map[string]*waE2E.ContextInfo{
+		"an ad source": {ExternalAdReply: &waE2E.ContextInfo_ExternalAdReplyInfo{
+			SourceType: proto.String("ad"), Title: proto.String("Consultoria gratuita"),
+		}},
+		"a post source": {ExternalAdReply: &waE2E.ContextInfo_ExternalAdReplyInfo{
+			SourceType: proto.String("post"), Title: proto.String("Consultoria gratuita"),
+		}},
+		"the ctwa_ad entry point": {
+			ExternalAdReply:            &waE2E.ContextInfo_ExternalAdReplyInfo{Title: proto.String("Consultoria gratuita")},
+			EntryPointConversionSource: proto.String("ctwa_ad"),
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			event := textMessage("3EB0SIGNAL", "")
+			event.Message = adClick(context)
+			message, _, ok := plain(t).inboundOf(event, plainBody)
+			if !ok {
+				t.Fatal("the message from the ad was refused")
+			}
+			if message.Referral == nil || message.Referral.Title != "Consultoria gratuita" {
+				t.Errorf("the ad is %+v, want the one WhatsApp sent", message.Referral)
+			}
+		})
+	}
+}
+
+func TestAnEntryPointWithOnlyTheAppKeepsTheApp(t *testing.T) {
+	t.Parallel()
+
+	event := textMessage("3EB0APPONLY", "")
+	event.Message = adClick(&waE2E.ContextInfo{EntryPointConversionApp: proto.String("instagram")})
+
+	message, _, ok := plain(t).inboundOf(event, plainBody)
+	if !ok {
+		t.Fatal("the message was refused")
+	}
+	if message.EntryPoint == nil || *message.EntryPoint != (protocol.EntryPoint{App: "instagram"}) {
+		t.Errorf("the entry point is %+v, want the app alone", message.EntryPoint)
+	}
+	validateInboundAgainstContract(t, &message)
+}

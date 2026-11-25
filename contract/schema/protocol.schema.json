@@ -332,7 +332,7 @@
 
     "referral": {
       "type": "object",
-      "description": "Click-to-WhatsApp ad, in the shape of the Cloud API's referral. Every field is what WhatsApp sent: one it left out is absent",
+      "description": "Click-to-WhatsApp ad, with the Cloud API referral's fields except the headline as `title` and the picture as `thumbnail_url`. Every field is what WhatsApp sent: one it left out is absent",
       "properties": {
         "source_type": { "type": "string", "description": "what was clicked, `ad` or `post`" },
         "source_id": { "type": "string", "description": "the ad's id in Meta's ads manager" },
@@ -348,12 +348,11 @@
 
     "entry_point": {
       "type": "object",
-      "description": "WhatsApp's own label for where a conversation started",
+      "description": "WhatsApp's own label for where a conversation started; source and app come separately and either can be absent",
       "properties": {
         "source": { "type": "string", "description": "e.g. `ctwa_ad` for an ad, `click_to_chat_link` for a wa.me link" },
         "app": { "type": "string", "description": "the app it started in, e.g. `instagram`" }
       },
-      "required": ["source"],
       "additionalProperties": true
     },
 

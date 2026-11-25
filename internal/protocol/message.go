@@ -75,10 +75,11 @@ type InboundMessage struct {
 	Ephemeral uint32 `json:"ephemeral,omitempty"`
 }
 
-// Referral is the Click-to-WhatsApp ad behind a message, in the shape the WhatsApp Cloud
-// API's own `referral` has, so a client attributes a conversation the same way whichever
-// provider it came through. `ctwa_clid` is the click id Meta's Conversions API takes back.
-// Every field is what WhatsApp sent: one it left out is absent.
+// Referral is the Click-to-WhatsApp ad behind a message. The fields are the Cloud API
+// referral's, except that the ad's headline is `title` and its picture is
+// `thumbnail_url`, which is the shape Chatwoot already normalizes Cloud and Baileys
+// referrals to. `ctwa_clid` is the click id Meta's Conversions API takes back. Every
+// field is what WhatsApp sent: one it left out is absent.
 type Referral struct {
 	SourceType   string `json:"source_type,omitempty"`
 	SourceID     string `json:"source_id,omitempty"`
@@ -91,9 +92,10 @@ type Referral struct {
 }
 
 // EntryPoint is WhatsApp's own label for where a conversation started (`ctwa_ad` for an
-// ad, `click_to_chat_link` for a wa.me link) and the app it started in.
+// ad, `click_to_chat_link` for a wa.me link) and the app it started in. WhatsApp sends
+// the two separately, and either can be absent.
 type EntryPoint struct {
-	Source string `json:"source"`
+	Source string `json:"source,omitempty"`
 	App    string `json:"app,omitempty"`
 }
 
