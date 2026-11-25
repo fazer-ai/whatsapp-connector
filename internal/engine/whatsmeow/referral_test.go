@@ -81,6 +81,7 @@ func TestAnAdKeepsOnlyWebAddressesInItsURLs(t *testing.T) {
 		"javascript:alert(1)",
 		"/relative/path.jpg",
 		"https://",
+		"https://:443/ad.jpg",
 		"ftp://example.com/ad.jpg",
 	} {
 		event := textMessage("3EB0BADURL", "")

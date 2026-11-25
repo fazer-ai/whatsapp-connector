@@ -54,7 +54,7 @@ func referralOf(context *waE2E.ContextInfo) *protocol.Referral {
 // reference to media, never the media, and a client links to what it is handed.
 func webURL(raw string) string {
 	parsed, err := url.Parse(raw)
-	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+	if err != nil || parsed.Hostname() == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
 		return ""
 	}
 	return raw
