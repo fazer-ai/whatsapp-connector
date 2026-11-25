@@ -370,6 +370,10 @@ func payloadEnums() map[string]payloadEnum {
 			known: asStrings(protocol.AllMediaKinds),
 			paths: [][]string{{"definitions", "content_media", "properties", "kind"}},
 		},
+		"ad media type": {
+			known: asStrings(protocol.AllAdMediaTypes),
+			paths: [][]string{{"definitions", "referral", "properties", "media_type"}},
+		},
 		"media ref kind": {
 			known: asStrings(protocol.AllMediaRefKinds),
 			paths: [][]string{{"definitions", "media_ref", "properties", "kind"}},

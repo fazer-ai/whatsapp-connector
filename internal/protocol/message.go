@@ -63,9 +63,50 @@ type InboundMessage struct {
 	// the phone when nothing about it was readable.
 	QuotedProduct *Product  `json:"quoted_product,omitempty"`
 	Mentions      []Address `json:"mentions,omitempty"`
+	// Referral is the ad a Click-to-WhatsApp conversation was opened from, carried on the
+	// message the ad's button sent. Absent on every other message.
+	Referral *Referral `json:"referral,omitempty"`
+	// EntryPoint is where WhatsApp says the conversation was started from (an ad, a
+	// click-to-chat link), which it reports on first-contact messages with or without an
+	// ad behind them.
+	EntryPoint *EntryPoint `json:"entry_point,omitempty"`
 	// Ephemeral is the disappearing-message expiration in seconds, zero when the chat
 	// is not on a timer.
 	Ephemeral uint32 `json:"ephemeral,omitempty"`
+}
+
+// Referral is the Click-to-WhatsApp ad behind a message. The fields are the Cloud API
+// referral's, except that the ad's headline is `title` and its picture is
+// `thumbnail_url`, which is the shape Chatwoot already normalizes Cloud and Baileys
+// referrals to. `ctwa_clid` is the click id Meta's Conversions API takes back. Every
+// field is what WhatsApp sent: one it left out is absent.
+type Referral struct {
+	SourceType   string      `json:"source_type,omitempty"`
+	SourceID     string      `json:"source_id,omitempty"`
+	SourceURL    string      `json:"source_url,omitempty"`
+	CtwaClid     string      `json:"ctwa_clid,omitempty"`
+	Title        string      `json:"title,omitempty"`
+	Body         string      `json:"body,omitempty"`
+	MediaType    AdMediaType `json:"media_type,omitempty"`
+	ThumbnailURL string      `json:"thumbnail_url,omitempty"`
+}
+
+// AdMediaType is the creative a Click-to-WhatsApp ad was run with. An ad with none has
+// no media type at all.
+type AdMediaType string
+
+// The ad creatives the contract defines.
+const (
+	AdMediaImage AdMediaType = "image"
+	AdMediaVideo AdMediaType = "video"
+)
+
+// EntryPoint is WhatsApp's own label for where a conversation started (`ctwa_ad` for an
+// ad, `click_to_chat_link` for a wa.me link) and the app it started in. WhatsApp sends
+// the two separately, and either can be absent.
+type EntryPoint struct {
+	Source string `json:"source,omitempty"`
+	App    string `json:"app,omitempty"`
 }
 
 // MediaKind is what sort of file a media message carries. The contract's enum is
@@ -584,6 +625,9 @@ var AllAddressKinds = []AddressKind{
 
 // AllMediaKinds lists every kind of media a message can carry.
 var AllMediaKinds = []MediaKind{MediaImage, MediaVideo, MediaAudio, MediaDocument, MediaSticker}
+
+// AllAdMediaTypes lists every creative a Click-to-WhatsApp ad can be run with.
+var AllAdMediaTypes = []AdMediaType{AdMediaImage, AdMediaVideo}
 
 // AllMediaRefKinds lists every way a media reference can say where a file is.
 var AllMediaRefKinds = []MediaRefKind{MediaRefURL, MediaRefConnectorBlob, MediaRefUazapiMessage}

@@ -595,3 +595,7 @@ third_party/meowcaller/engine.go: Preserve orientation set before the video send
 # case-insensitive match was added, which is why it was taken back as dead code). The test
 # stays as the pin: a pion bump that stopped normalizing would fail it.
 internal/calls/codec.go: Match codec MIME types case-insensitively  # PR#393
+internal/protocol/message.go: Publish the ad title under the Cloud API's `headline` key  # PR#432: Chatwoot normalizes Cloud and Baileys referrals to `title`
+contract/schema/protocol.schema.json: Keep previously valid v1 referral and entry-point objects valid  # PR#432: no v1 producer ever emitted either field
+internal/engine/whatsmeow/referral.go: Reject malformed IPv4 hosts in referral URLs  # PR#432 r13: webURL checks scheme, a host and the port; whether the host opens is the client's
+internal/engine/whatsmeow/referral.go: Match browser handling of numeric referral hosts  # PR#432 r13: same decision, no copy of a browser's host parser
