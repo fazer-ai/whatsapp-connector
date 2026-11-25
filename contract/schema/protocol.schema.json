@@ -340,7 +340,7 @@
         "ctwa_clid": { "type": "string", "description": "the click id Meta's Conversions API takes back to attribute a conversion" },
         "title": { "type": "string" },
         "body": { "type": "string" },
-        "media_type": { "type": "string", "description": "the ad's creative, `image` or `video`; absent when it has none" },
+        "media_type": { "enum": ["image", "video"], "description": "the ad's creative; absent when it has none" },
         "thumbnail_url": { "type": "string" }
       },
       "additionalProperties": true

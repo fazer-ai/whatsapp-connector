@@ -81,15 +81,25 @@ type InboundMessage struct {
 // referrals to. `ctwa_clid` is the click id Meta's Conversions API takes back. Every
 // field is what WhatsApp sent: one it left out is absent.
 type Referral struct {
-	SourceType   string `json:"source_type,omitempty"`
-	SourceID     string `json:"source_id,omitempty"`
-	SourceURL    string `json:"source_url,omitempty"`
-	CtwaClid     string `json:"ctwa_clid,omitempty"`
-	Title        string `json:"title,omitempty"`
-	Body         string `json:"body,omitempty"`
-	MediaType    string `json:"media_type,omitempty"`
-	ThumbnailURL string `json:"thumbnail_url,omitempty"`
+	SourceType   string      `json:"source_type,omitempty"`
+	SourceID     string      `json:"source_id,omitempty"`
+	SourceURL    string      `json:"source_url,omitempty"`
+	CtwaClid     string      `json:"ctwa_clid,omitempty"`
+	Title        string      `json:"title,omitempty"`
+	Body         string      `json:"body,omitempty"`
+	MediaType    AdMediaType `json:"media_type,omitempty"`
+	ThumbnailURL string      `json:"thumbnail_url,omitempty"`
 }
+
+// AdMediaType is the creative a Click-to-WhatsApp ad was run with. An ad with none has
+// no media type at all.
+type AdMediaType string
+
+// The ad creatives the contract defines.
+const (
+	AdMediaImage AdMediaType = "image"
+	AdMediaVideo AdMediaType = "video"
+)
 
 // EntryPoint is WhatsApp's own label for where a conversation started (`ctwa_ad` for an
 // ad, `click_to_chat_link` for a wa.me link) and the app it started in. WhatsApp sends
@@ -615,6 +625,9 @@ var AllAddressKinds = []AddressKind{
 
 // AllMediaKinds lists every kind of media a message can carry.
 var AllMediaKinds = []MediaKind{MediaImage, MediaVideo, MediaAudio, MediaDocument, MediaSticker}
+
+// AllAdMediaTypes lists every creative a Click-to-WhatsApp ad can be run with.
+var AllAdMediaTypes = []AdMediaType{AdMediaImage, AdMediaVideo}
 
 // AllMediaRefKinds lists every way a media reference can say where a file is.
 var AllMediaRefKinds = []MediaRefKind{MediaRefURL, MediaRefConnectorBlob, MediaRefUazapiMessage}

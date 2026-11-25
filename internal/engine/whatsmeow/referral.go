@@ -12,7 +12,8 @@ import (
 //
 // An external ad reply is also how a link preview card is drawn, with a title, a
 // thumbnail and a URL and no ad behind it. Only a card that says it came from an ad
-// (a click id, an ad or post source, or WhatsApp's own `ctwa_ad` entry point) is one,
+// (a click id, an ad type, an ad or post source, or WhatsApp's own `ctwa_ad` entry
+// point) is one,
 // since a client files the first referral it keeps as the campaign that brought the
 // contact in.
 func referralOf(context *waE2E.ContextInfo) *protocol.Referral {
@@ -40,6 +41,10 @@ func fromAnAd(context *waE2E.ContextInfo, ad *waE2E.ContextInfo_ExternalAdReplyI
 	switch {
 	case ad.GetCtwaClid() != "":
 		return true
+	// Read off the field and not the getter: CTWA is the enum's zero value, so the
+	// getter says CTWA for every preview card that never set an ad type.
+	case ad.AdType != nil:
+		return true
 	case ad.GetSourceType() == "ad", ad.GetSourceType() == "post":
 		return true
 	default:
@@ -49,12 +54,12 @@ func fromAnAd(context *waE2E.ContextInfo, ad *waE2E.ContextInfo_ExternalAdReplyI
 
 // adMediaTypeOf names the ad's creative the way the Cloud API does. An ad with no
 // creative says NONE, which is left out rather than published as a kind of media.
-func adMediaTypeOf(kind waE2E.ContextInfo_ExternalAdReplyInfo_MediaType) string {
+func adMediaTypeOf(kind waE2E.ContextInfo_ExternalAdReplyInfo_MediaType) protocol.AdMediaType {
 	switch kind {
 	case waE2E.ContextInfo_ExternalAdReplyInfo_IMAGE:
-		return "image"
+		return protocol.AdMediaImage
 	case waE2E.ContextInfo_ExternalAdReplyInfo_VIDEO:
-		return "video"
+		return protocol.AdMediaVideo
 	default:
 		return ""
 	}

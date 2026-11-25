@@ -156,6 +156,9 @@ func TestAnAdIsRecognisedByAnyOfItsSignals(t *testing.T) {
 		"a post source": {ExternalAdReply: &waE2E.ContextInfo_ExternalAdReplyInfo{
 			SourceType: proto.String("post"), Title: proto.String("Consultoria gratuita"),
 		}},
+		"an ad type": {ExternalAdReply: &waE2E.ContextInfo_ExternalAdReplyInfo{
+			AdType: waE2E.ContextInfo_ExternalAdReplyInfo_CTWA.Enum(), Title: proto.String("Consultoria gratuita"),
+		}},
 		"the ctwa_ad entry point": {
 			ExternalAdReply:            &waE2E.ContextInfo_ExternalAdReplyInfo{Title: proto.String("Consultoria gratuita")},
 			EntryPointConversionSource: proto.String("ctwa_ad"),
