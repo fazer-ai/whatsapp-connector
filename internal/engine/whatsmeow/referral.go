@@ -2,6 +2,7 @@ package whatsmeow
 
 import (
 	"net/url"
+	"strconv"
 	"strings"
 
 	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
@@ -19,7 +20,7 @@ import (
 // published even with no card and none of its fields readable, because that it came
 // from an ad is itself the attribution.
 func referralOf(context *waE2E.ContextInfo) *protocol.Referral {
-	if !fromAnAd(context) {
+	if forwarded(context) || !fromAnAd(context) {
 		return nil
 	}
 	ad := context.GetExternalAdReply()
@@ -52,12 +53,33 @@ func referralOf(context *waE2E.ContextInfo) *protocol.Referral {
 // host. Anything else (a `data:` URI carrying the image itself, a `javascript:` link, a
 // path) is dropped on its own, leaving the rest of the referral: a frame carries a
 // reference to media, never the media, and a client links to what it is handed.
+//
+// The port is held to the same shapes the blob address is in engine.go: url.Parse only
+// checks that a port is digits, so 99999 and 0 come through it, and a colon with nothing
+// after it parses as no port at all.
 func webURL(raw string) string {
 	parsed, err := url.Parse(raw)
 	if err != nil || parsed.Hostname() == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
 		return ""
 	}
+	if strings.HasSuffix(parsed.Host, ":") {
+		return ""
+	}
+	if port := parsed.Port(); port != "" {
+		number, err := strconv.Atoi(port)
+		if err != nil || number < 1 || number > 65535 {
+			return ""
+		}
+	}
 	return raw
+}
+
+// forwarded is a message passed on from another chat. A forward keeps the context of
+// the message it copies, ad card and entry point included, and those say how the
+// original conversation started, not this one: published, they would credit the ad
+// with a contact it never brought in.
+func forwarded(context *waE2E.ContextInfo) bool {
+	return context.GetIsForwarded() || context.GetForwardingScore() > 0
 }
 
 // fromAnAd is whether anything around the message says it came from an ad. Any one
@@ -127,6 +149,9 @@ func quotedAdMediaTypeOf(kind waE2E.ContextInfo_AdReplyInfo_MediaType) protocol.
 // entryPointOf is where WhatsApp says the conversation started, nil when it says
 // nothing. The source and the app are separate fields, and either can come alone.
 func entryPointOf(context *waE2E.ContextInfo) *protocol.EntryPoint {
+	if forwarded(context) {
+		return nil
+	}
 	entry := protocol.EntryPoint{
 		Source: context.GetEntryPointConversionSource(),
 		App:    context.GetEntryPointConversionApp(),

@@ -82,6 +82,9 @@ func TestAnAdKeepsOnlyWebAddressesInItsURLs(t *testing.T) {
 		"/relative/path.jpg",
 		"https://",
 		"https://:443/ad.jpg",
+		"https://example.com:99999/ad.jpg",
+		"https://example.com:0/ad.jpg",
+		"https://example.com:/ad.jpg",
 		"ftp://example.com/ad.jpg",
 	} {
 		event := textMessage("3EB0BADURL", "")
@@ -396,4 +399,32 @@ func TestAnAdWithNothingReadableIsStillAReferral(t *testing.T) {
 		t.Fatalf("the ad is %+v, want an empty referral", message.Referral)
 	}
 	validateInboundAgainstContract(t, &message)
+}
+
+// A forward keeps the context of what it copies, and that says how the original
+// conversation started, not this one.
+func TestAForwardedAdCarriesNoAttribution(t *testing.T) {
+	t.Parallel()
+
+	for name, context := range map[string]*waE2E.ContextInfo{
+		"flagged as forwarded":    {IsForwarded: proto.Bool(true)},
+		"with a forwarding score": {ForwardingScore: proto.Uint32(1)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			context.ExternalAdReply = &waE2E.ContextInfo_ExternalAdReplyInfo{CtwaClid: proto.String("ARAk")}
+			context.EntryPointConversionSource = proto.String("ctwa_ad")
+			context.EntryPointConversionApp = proto.String("instagram")
+			event := textMessage("3EB0FORWARD", "")
+			event.Message = adClick(context)
+			message, _, ok := plain(t).inboundOf(event, plainBody)
+			if !ok {
+				t.Fatal("the forwarded message was refused")
+			}
+			if message.Referral != nil || message.EntryPoint != nil {
+				t.Errorf("a forward was published with %+v and %+v", message.Referral, message.EntryPoint)
+			}
+		})
+	}
 }
