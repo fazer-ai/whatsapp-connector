@@ -159,6 +159,10 @@ func TestAnAdIsRecognisedByAnyOfItsSignals(t *testing.T) {
 		"an ad type": {ExternalAdReply: &waE2E.ContextInfo_ExternalAdReplyInfo{
 			AdType: waE2E.ContextInfo_ExternalAdReplyInfo_CTWA.Enum(), Title: proto.String("Consultoria gratuita"),
 		}},
+		"the FB_Ads conversion source": {
+			ExternalAdReply:  &waE2E.ContextInfo_ExternalAdReplyInfo{Title: proto.String("Consultoria gratuita")},
+			ConversionSource: proto.String("FB_Ads"),
+		},
 		"the ctwa_ad entry point": {
 			ExternalAdReply:            &waE2E.ContextInfo_ExternalAdReplyInfo{Title: proto.String("Consultoria gratuita")},
 			EntryPointConversionSource: proto.String("ctwa_ad"),
@@ -192,6 +196,26 @@ func TestAnEntryPointWithOnlyTheAppKeepsTheApp(t *testing.T) {
 	}
 	if message.EntryPoint == nil || *message.EntryPoint != (protocol.EntryPoint{App: "instagram"}) {
 		t.Errorf("the entry point is %+v, want the app alone", message.EntryPoint)
+	}
+	validateInboundAgainstContract(t, &message)
+}
+
+// That the message came from an ad is the attribution, even when WhatsApp sent nothing
+// else about the ad.
+func TestAnAdWithNothingReadableIsStillAReferral(t *testing.T) {
+	t.Parallel()
+
+	event := textMessage("3EB0ADEMPTY", "")
+	event.Message = adClick(&waE2E.ContextInfo{ExternalAdReply: &waE2E.ContextInfo_ExternalAdReplyInfo{
+		AdType: waE2E.ContextInfo_ExternalAdReplyInfo_CTWA.Enum(),
+	}})
+
+	message, _, ok := plain(t).inboundOf(event, plainBody)
+	if !ok {
+		t.Fatal("the message from the ad was refused")
+	}
+	if message.Referral == nil || *message.Referral != (protocol.Referral{}) {
+		t.Fatalf("the ad is %+v, want an empty referral", message.Referral)
 	}
 	validateInboundAgainstContract(t, &message)
 }

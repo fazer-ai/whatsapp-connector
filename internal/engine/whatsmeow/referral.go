@@ -1,6 +1,8 @@
 package whatsmeow
 
 import (
+	"strings"
+
 	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
 
 	"github.com/fazer-ai/whatsapp-connector/internal/protocol"
@@ -11,17 +13,16 @@ import (
 // also where the click id for Meta's Conversions API travels.
 //
 // An external ad reply is also how a link preview card is drawn, with a title, a
-// thumbnail and a URL and no ad behind it. Only a card that says it came from an ad
-// (a click id, an ad type, an ad or post source, or WhatsApp's own `ctwa_ad` entry
-// point) is one,
-// since a client files the first referral it keeps as the campaign that brought the
-// contact in.
+// thumbnail and a URL and no ad behind it, so the card alone does not make an ad: one
+// of WhatsApp's ad signals has to say so (see fromAnAd). Once one does, the referral is
+// published even with none of its fields readable, because that it came from an ad is
+// itself the attribution.
 func referralOf(context *waE2E.ContextInfo) *protocol.Referral {
 	ad := context.GetExternalAdReply()
 	if ad == nil || !fromAnAd(context, ad) {
 		return nil
 	}
-	referral := protocol.Referral{
+	return &protocol.Referral{
 		SourceType:   ad.GetSourceType(),
 		SourceID:     ad.GetSourceID(),
 		SourceURL:    ad.GetSourceURL(),
@@ -31,12 +32,12 @@ func referralOf(context *waE2E.ContextInfo) *protocol.Referral {
 		MediaType:    adMediaTypeOf(ad.GetMediaType()),
 		ThumbnailURL: ad.GetThumbnailURL(),
 	}
-	if referral == (protocol.Referral{}) {
-		return nil
-	}
-	return &referral
 }
 
+// fromAnAd is every signal WhatsApp gives that a card is an ad and not a link preview:
+// the click id, an ad type, an ad or post source on the card, and, on the context
+// around it, the `ctwa_ad` entry point or the `FB_Ads` conversion source. Any one is
+// enough, since WhatsApp does not send all of them every time.
 func fromAnAd(context *waE2E.ContextInfo, ad *waE2E.ContextInfo_ExternalAdReplyInfo) bool {
 	switch {
 	case ad.GetCtwaClid() != "":
@@ -47,8 +48,10 @@ func fromAnAd(context *waE2E.ContextInfo, ad *waE2E.ContextInfo_ExternalAdReplyI
 		return true
 	case ad.GetSourceType() == "ad", ad.GetSourceType() == "post":
 		return true
+	case context.GetEntryPointConversionSource() == "ctwa_ad":
+		return true
 	default:
-		return context.GetEntryPointConversionSource() == "ctwa_ad"
+		return strings.EqualFold(context.GetConversionSource(), "fb_ads")
 	}
 }
 
