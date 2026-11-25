@@ -86,6 +86,8 @@ func TestAnAdKeepsOnlyWebAddressesInItsURLs(t *testing.T) {
 		"https://example.com:99999/ad.jpg",
 		"https://example.com:0/ad.jpg",
 		"https://example.com:/ad.jpg",
+		"https://192.168.1.999/ad.jpg",
+		"https://[::zz]/ad.jpg",
 		"ftp://example.com/ad.jpg",
 	} {
 		event := textMessage("3EB0BADURL", "")
@@ -106,6 +108,11 @@ func TestAnAdKeepsOnlyWebAddressesInItsURLs(t *testing.T) {
 		CtwaClid: proto.String("ARAk"), SourceURL: proto.String("http://fb.me/x"),
 		ThumbnailURL: proto.String("https://scontent.whatsapp.net/t.jpg"),
 	}})
+	for _, good := range []string{"https://192.168.1.10/ad.jpg", "https://[2001:db8::1]:8443/ad.jpg"} {
+		if webURL(good) != good {
+			t.Errorf("%s was dropped, and it is a web address", good)
+		}
+	}
 	message, _, _ := plain(t).inboundOf(event, plainBody)
 	if message.Referral == nil || message.Referral.SourceURL != "http://fb.me/x" ||
 		message.Referral.ThumbnailURL != "https://scontent.whatsapp.net/t.jpg" {

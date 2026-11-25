@@ -1,6 +1,7 @@
 package whatsmeow
 
 import (
+	"net"
 	"net/url"
 	"strconv"
 	"strings"
@@ -64,6 +65,15 @@ func webURL(raw string) string {
 	}
 	if strings.HasSuffix(parsed.Host, ":") {
 		return ""
+	}
+	// A host written as an address has to be one. url.Parse takes 192.168.1.999 as a
+	// name, and a client handed it has a link nobody can open. A name that parses is
+	// kept: whether it resolves is the client's to find out, as with any link.
+	host := parsed.Hostname()
+	if strings.Contains(host, ":") || strings.Trim(host, "0123456789.") == "" {
+		if net.ParseIP(host) == nil {
+			return ""
+		}
 	}
 	if port := parsed.Port(); port != "" {
 		number, err := strconv.Atoi(port)
